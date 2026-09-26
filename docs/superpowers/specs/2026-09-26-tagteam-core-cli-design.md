@@ -79,7 +79,10 @@ tagteam is public OSS under the MIT license, built for macOS and Linux.
 | Generation | One state of a refresh-token lineage. Its fingerprint is `sha256:<hex(sha256(refreshToken))>` |
 | Vault | tagteam's per-account secret storage |
 | Profile | A per-account CC config dir used by `tagteam run` |
-| Quiescent | A profile that has no live session record and no unreadable one |
+| Launch reservation | tagteam's own record of a `run` in progress, written before `claude` starts and removed after exit handling (§12.5) |
+| Quiescent | A profile with no live launch reservation, and no live or unreadable session record |
+| Session-owned | An account whose profile is not quiescent |
+| Account lock | The per-account `flock` that every vault write for that account holds (§6.2) |
 
 ## 3. The local-state invariant (hard requirement)
 
@@ -100,6 +103,7 @@ state:
 | The `oauthAccount` value in `~/.claude.json` | switch, auto-switch |
 | `primaryApiKey`, and the `customApiKeyResponses.approved` list (append only), in `~/.claude.json` | activating or deactivating an API-key account |
 | The `projects` and `mcpServers` subtrees of `~/.claude.json`, by three-way merge (§12.4) | `tagteam run` on exit |
+| `~/.claude/projects/` and `~/.claude/history.jsonl`, created empty and **only when absent**, as CC itself would create them | `tagteam run`, before linking (§12.2) |
 
 Nothing else under `~/.claude/`, and no other key of `~/.claude.json`, is ever written. Each
 rewrite of `~/.claude.json` replaces only the byte span of the affected value (§9.5), so every
@@ -166,12 +170,16 @@ impl Engine {
   be built from a degraded read.
 - **Lock order is carried by the guards.** A provider's `LiveLocks` can only be acquired from a
   held `MutationGuard`. Inside Claude Code's implementation, a `CcCredLocks` guard is taken first
-  and a `CcConfigLock` only from a held `CcCredLocks`. Order: tagteam mutation lock → provider
-  live locks (for CC: credential locks → config lock). The one exception is a standalone
-  `CcConfigLock` for profile seeding and merge-back (§12.4), which take no credential lock while
-  holding it; taking a lone lock cannot invert the order.
-- **No network while holding a contended lock.** The single exception is the active-token
-  refresh under CC's credential locks (§7.5), bounded at 6 s.
+  and a `CcConfigLock` only from a held `CcCredLocks`. Order: tagteam mutation lock → account
+  locks (ascending account ID) → provider live locks (for CC: credential locks → config lock).
+  Any prefix may be skipped, but a lock is never taken while holding one that comes later: in
+  particular, `MutationGuard` is never taken while holding an account lock. The one exception
+  is a standalone `CcConfigLock` for profile seeding and merge-back (§12.4), which take no
+  credential lock while holding it; taking a lone lock cannot invert the order.
+- **No network while holding a contended lock.** There are two exceptions, both bounded:
+  - the refresh gate holds the account lock across its token request (§7.3, 10 s), which is
+    what makes it single-flight;
+  - the active-token refresh holds CC's credential locks across its request (§7.5, 6 s).
 
 ### 4.4 Runtime choices
 
@@ -202,6 +210,12 @@ pub trait Provider: Send + Sync {
     fn capabilities(&self) -> Capabilities;           // usage, refresh, api_keys, sessions, statusline
     fn identity_surface(&self, env: &Env) -> IdentitySurface;   // §3; drives the pinned test
 
+    // Identity and stored shapes (§6.1)
+    fn identity_key(&self, id: &Identity) -> IdentityKey;   // CC: email + org uuid
+    fn credential_kinds(&self) -> &'static [&'static str];   // CC: oauth, setup_token, api_key
+    fn primary_long_window(&self) -> Option<WindowKey>;     // CC: "7d"; ranks consume-first (§11.2)
+    fn export_login / import_login(...);                    // provider-owned export payload (§13.3)
+
     // The live login
     fn live_identity(&self, env: &Env) -> Read<LiveIdentity>;
     fn read_active(&self, env: &Env) -> Read<Credential>;        // carries provenance
@@ -215,11 +229,11 @@ pub trait Provider: Send + Sync {
     fn fingerprint(&self, cred: &Credential) -> Fingerprint;          // lineage
     fn expiry(&self, cred: &Credential) -> Expiry;
 
-    // Network (the engine supplies the Http port and owns leases, CAS and rescue)
+    // Network (the engine supplies the Http port and owns locks, leases, CAS and rescue)
     fn refresh(&self, http: &dyn Http, cred: &FreshCredential) -> RefreshResult;
     fn resolve_owner(&self, http: &dyn Http, cred: &Credential) -> Option<Identity>;
     fn fetch_usage(&self, http: &dyn Http, cred: &Credential) -> UsageResult; // generic windows
-    fn poll_budget(&self) -> PollBudget;              // the §8.6 constants for this provider
+    fn poll_budget(&self) -> PollBudget;              // the §8.6 constants and hourly request cap
 
     // Parallel sessions
     fn launch_command(&self) -> &'static str;         // "claude"
@@ -241,17 +255,21 @@ the engine degrades rather than failing:
 - Without `sessions`: `run` refuses for that provider.
 - Without `statusline`: the `statusline` command refuses for that provider.
 
-**Usage windows are generic:** `Window { key, label, kind, pct, resets_at, period_s }`, where
-`kind` is one of `Short | Long | Spend | Scoped`.
+**Usage windows are generic:** `Window { key, label, kind, pct, resets_at, period_s, detail }`,
+where `kind` is one of `Short | Long | Spend | Scoped` and `detail` is optional provider-owned
+JSON (CC's spend amounts, for example). The store persists usage only in this form (§8.2).
 - Claude Code maps `5h` → `Short`, `7d` → `Long` (period 604800 s), `spend` → `Spend`, and each
   per-model limit → `Scoped(name)`.
+- A provider need not have a `Long` window. Features that depend on one (consume-first, pace)
+  are unavailable for such a provider, and say so.
 - Pace and projection (§8.7) apply to `Long` and `Scoped` windows that have a known period.
 - Headroom and decisions (§8.2, §11) are defined over "relevant windows" rather than fixed
   names.
 
-**The engine owns every cross-provider guarantee.** Leases, the refresh gate's CAS and rescue,
-quarantine, the vault, the store, backoff, the auto-switch policy, the switch transaction's
-ordering and rollback, and the local-state test are all generic. A provider supplies only the
+**The engine owns every cross-provider guarantee.** Account locks, leases, the refresh gate's
+CAS and rescue, quarantine, the vault, the store, backoff, the request budget, the auto-switch
+policy, the switch transaction's ordering, journal and rollback, launch reservations, and the
+local-state test are all generic. A provider supplies only the
 agent-specific facts.
 
 This trait is internal API, not a public plugin interface. It is expected to change when the
@@ -271,7 +289,9 @@ mode 0700, so a command that changes nothing creates nothing.
 | Rescued successors | `$XDG_DATA_HOME/tagteam/rescue/<id>-<epoch>-<fp12>.json` |
 | Displaced foreign credentials | `$XDG_DATA_HOME/tagteam/displaced/<epoch>-<fp12>-<rand6>.json` |
 | Session profiles | `$XDG_DATA_HOME/tagteam/sessions/<id>/`, with a stale marker `sessions/.<id>.stale` beside the profile |
+| Launch reservations | `<profile>/.tagteam-launch/<pid>.json` |
 | Mutation lock | `$XDG_DATA_HOME/tagteam/.mutation.lock` |
+| Account locks | `$XDG_DATA_HOME/tagteam/locks/<id>.lock` |
 | Log | `$XDG_STATE_HOME/tagteam/tagteam.log` (1 MiB × 3) |
 
 Every file that contains secrets is created with mode 0600 at creation time (`O_EXCL`, then
@@ -297,11 +317,13 @@ CREATE TABLE accounts (
   id               TEXT PRIMARY KEY,          -- UUIDv7, immutable storage key (unique across providers)
   provider         TEXT NOT NULL,             -- ProviderId, e.g. 'claude-code'
   position         INTEGER NOT NULL,          -- user-facing number, >= 1, per provider
-  email            TEXT NOT NULL,
-  org_uuid         TEXT NOT NULL DEFAULT '',  -- org/workspace id; '' = personal
+  identity_key     TEXT NOT NULL,             -- provider-derived (CC: email + org uuid); the account's identity
+  label            TEXT NOT NULL,             -- display name (CC: the email)
+  email            TEXT,                      -- NULL for providers whose logins have none
+  org_uuid         TEXT NOT NULL DEFAULT '',  -- org/workspace id; '' = personal or none
   org_name         TEXT,
   account_uuid     TEXT,                      -- provider account id; NULL until known; backfilled only while NULL
-  kind             TEXT NOT NULL CHECK (kind IN ('oauth','setup_token','api_key')),
+  kind             TEXT NOT NULL,             -- one of the provider's credential_kinds() (CC: oauth | setup_token | api_key)
   alias            TEXT UNIQUE COLLATE NOCASE,  -- unique across providers, so an alias alone is unambiguous
   disabled         INTEGER NOT NULL DEFAULT 0,
   identity_json    TEXT NOT NULL,             -- provider-owned identity object (CC: the oauthAccount object only)
@@ -311,16 +333,16 @@ CREATE TABLE accounts (
   quarantine_at    INTEGER,
   added_at         INTEGER NOT NULL,
   UNIQUE (provider, position),
-  UNIQUE (provider, email, org_uuid)
+  UNIQUE (provider, identity_key)
 );
 
 CREATE TABLE usage_state (
   account_id        TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
-  last_good         TEXT,     -- JSON normalized usage (§8.2); never cleared by a failure
+  last_good         TEXT,     -- JSON array of generic windows (§4.5, §8.2); never cleared by a failure
   fetched_at        INTEGER,  -- epoch s, success only
   last_attempt_at   INTEGER,
   consecutive_failures INTEGER NOT NULL DEFAULT 0,
-  last_error        TEXT,     -- kind token: http-<code> | timeout | network | bad-response | refresh-failed | ...
+  last_error        TEXT,     -- kind token: http-<code> | pre-send | ambiguous | bad-response | refresh-failed | over-budget | ...
   backoff_until     INTEGER,
   next_poll_at      INTEGER,
   poll_interval_s   INTEGER,
@@ -337,10 +359,26 @@ CREATE TABLE usage_samples (
   PRIMARY KEY (account_id, window, fetched_at)
 ) WITHOUT ROWID;
 
+CREATE TABLE usage_requests (   -- one row per usage request actually sent, retries included (§8.6)
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  at         INTEGER NOT NULL   -- epoch s; rows older than 1 h are pruned on insert
+);
+
 CREATE TABLE leases (
-  name       TEXT PRIMARY KEY,  -- 'refresh:<id>' | 'usage:<id>' | 'autoswitch:<provider>'
+  name       TEXT PRIMARY KEY,  -- 'usage:<id>' | 'autoswitch:<provider>'
   holder     TEXT NOT NULL,     -- random UUID per acquisition
   expires_at INTEGER NOT NULL   -- epoch ms, wall clock
+);
+
+CREATE TABLE switch_journal (   -- a row exists only while a switch is between its first live write and its commit (§9.4)
+  provider     TEXT PRIMARY KEY,
+  holder_pid   INTEGER NOT NULL,
+  holder_start INTEGER NOT NULL, -- process start time, for liveness (§12.6)
+  from_id      TEXT,
+  to_id        TEXT NOT NULL REFERENCES accounts(id),
+  from_fp      TEXT,             -- fingerprint of the live credential being replaced
+  to_fp        TEXT NOT NULL,    -- fingerprint of the credential being written; no secret is stored
+  started_at   INTEGER NOT NULL
 );
 
 CREATE TABLE autoswitch_state (       -- one row per provider; auto-switch never crosses providers
@@ -379,19 +417,24 @@ CREATE TABLE displaced (
   at          INTEGER NOT NULL,
   reason      TEXT NOT NULL,    -- 'displaced-live-login' | 'forced-activation' | ...
   fingerprint TEXT NOT NULL,
-  identity    TEXT              -- JSON {email, orgUuid, accountUuid} if known
+  identity    TEXT              -- provider-owned identity JSON, if known (CC: {email, orgUuid, accountUuid})
 );
 
 CREATE TABLE live_identity_cache (   -- speeds up statusline and list; the file wins if it disagrees
   provider  TEXT PRIMARY KEY,
-  path TEXT, mtime_ns INTEGER, size INTEGER, email TEXT, org_uuid TEXT, account_uuid TEXT
+  path TEXT, mtime_ns INTEGER, size INTEGER, identity_key TEXT, label TEXT, account_uuid TEXT
 );
 ```
 
-**Identity.** An account's identity is `(provider, email, org_uuid)`, and `account_uuid`
-corroborates it. Attributing a credential to a *different* account requires a positive uuid
-match: an email-and-org match whose uuid conflicts is a different account, for example a
-recycled email. The same email under two providers is two accounts.
+**Identity.** An account's identity is `(provider, identity_key)`. The provider derives the key
+(CC: email and org uuid) and the engine never parses it. `account_uuid` corroborates it:
+attributing a credential to a *different* account requires a positive uuid match, so a
+key match whose uuid conflicts is a different account, for example a recycled email. The same
+email under two providers is two accounts.
+
+**Stored shapes are provider-neutral.** No column, constraint or JSON shape in the store assumes
+Claude Code: identities are keys, credential kinds are validated by the provider, and usage is
+stored as generic windows. A new provider needs no migration.
 
 **Positions** are numbered per provider. A new account gets `max(position) + 1` within its
 provider, and gaps are never reused. `move` only reorders, since storage is keyed by `id`. A
@@ -406,7 +449,12 @@ WHERE leases.expires_at <= ?now
 ```
 
 The lease is held if `changes() = 1`. A result is recorded only if the lease row still shows the
-same holder, or the write is a vault CAS that stays correct regardless (§7.3).
+same holder.
+
+Leases only bound work whose overlap is harmless (a duplicate usage fetch, a skipped auto
+tick). They never protect a refresh token: a lease can expire under a suspended holder, which
+then resumes believing it still holds it. Credentials are protected by account locks (§6.2),
+which the kernel holds for as long as the holder lives.
 
 **History retention.** Samples older than `usage.history_retention_days` are pruned, at most
 once a day, on the write path.
@@ -424,6 +472,13 @@ only.
 - **Contents.** The bytes are stored raw, in whatever form the provider defines. For CC that is
   the credential JSON, or an `sk-ant-api…` string for API-key accounts. The vault is
   provider-agnostic: it never parses what it stores.
+- **Account locks.** Every write or delete of an account's vault entries holds that account's
+  lock: `flock(LOCK_EX)` on `locks/<id>.lock`, fd `O_CLOEXEC`, released by the kernel when the
+  holder exits. Each writer compares and replaces inside one hold, so no writer can overwrite a
+  generation it has not seen. The writers are the refresh gate, the switch's outgoing capture,
+  `run` capture, lazy capture, active-token adoption, `add`, `add-token`, `import` and `remove`.
+  The refresh gate only tries the lock and returns `Busy` if it is held. Every other writer
+  waits up to 15 s, which covers the longest hold, a refresh request of up to 10 s.
 - **Writes.** A write moves the current generation to `.prev` only when the lineage fingerprint
   changes.
 - **What automatic captures may write.** A capture that tagteam makes on its own (the switch's
@@ -508,9 +563,14 @@ Appendix A.4.
 
 This procedure is the only place a stored refresh token is ever sent to the token endpoint.
 
-1. **Lease.** Acquire the lease `refresh:<id>` with a 60 s TTL. If another process holds it,
-   return `Busy`.
-2. **Re-read the vault** (`Read<Credential>`).
+1. **Account lock.** Try the account's lock (§6.2). If another process holds it, return
+   `Busy`. The lock is held until step 6 completes, across the request, so there is at most one
+   refresh per account in flight. A suspended holder keeps it, and is never preempted.
+2. **Ownership.** Under the lock, return `Owned` if the account is the live login (only §7.5
+   refreshes that token) or is session-owned (§12.5). tagteam makes an account the live login
+   or session-owned only while holding this lock, so neither can happen before the request is
+   sent.
+3. **Re-read the vault** (`Read<Credential>`).
    - `Unreadable` returns `Transient`. `Absent` returns `Transient` (the account was
      removed).
    - If a `rescue/` entry for this account holds a successor of the current fingerprint, adopt
@@ -518,32 +578,40 @@ This procedure is the only place a stored refresh token is ever sent to the toke
    - If the account's profile is quiescent and not stale-marked, and it holds a newer
      generation of the same identity, adopt that into the vault first. "Newer" means a
      different fingerprint and a later `expiresAt`.
-3. **Check whether someone already refreshed.** If the vault's access token differs from the
+4. **Check whether someone already refreshed.** If the vault's access token differs from the
    caller's snapshot and is not expired, return it without making a request.
-4. **POST** to the token endpoint (Appendix A.5). The timeout is 10 s, or 6 s on the
-   under-lock path.
-5. **Persist, compare-and-swap style.** Re-read the vault.
-   - If the fingerprint moved since step 2, write the new successor to `rescue/` and return the
-     vault's newer credential.
+5. **POST** to the token endpoint (Appendix A.5), with a 10 s timeout.
+6. **Persist, compare-and-swap style.** Re-read the vault. With every writer under the account
+   lock this comparison cannot fail; it stays as a defence.
+   - If the fingerprint moved since step 3, write the new successor to `rescue/`, log at ERROR,
+     and return the vault's newer credential.
    - Otherwise write the vault (the old generation becomes `.prev`) and update
      `login_expires_at`.
    - If the vault write fails, write to `rescue/` and return `Transient { credential, rescued:
      true }`. **The caller must not activate a credential in this state.**
    - If the rescue write also fails, return `Unpersisted`, log at ERROR, and print a stderr
      notice naming the account position.
-6. **Classify the result:**
+7. **Classify the result:**
 
    | Response | Verdict |
    |---|---|
    | 400/401/403 with top-level JSON `error == "invalid_grant"` | **Dead**, but only after re-reading the source that was sent. If its lineage moved in the meantime, record `refresh-failed` instead |
    | No `refreshToken` in a structurally complete OAuth credential | Dead |
    | `invalid_client` | Systemic. Never counts as a strike |
+   | No request sent: DNS, connect or TLS failure | Transient, kind `pre-send` |
+   | Request sent, no response read: timeout or reset | Transient, kind `ambiguous` |
    | Anything else, including unparseable bodies | Transient |
 
 The rule behind this procedure: **a successor that tagteam has received is never discarded.**
 It is either persisted to the vault or rescued, and if both writes fail, the loss is reported
 (`Unpersisted`). A successor the server issued but tagteam never received, because the
 response was lost after the request was sent, cannot be recovered by any client.
+
+**After an `ambiguous` failure, the next attempt retries the same generation.** If the server
+did consume it, the retry gets `invalid_grant` with the lineage unchanged, so the account is
+quarantined and shows `relogin_required`. That is the true state, and it is the same end
+state a forced re-login would reach. If the server never processed the request, the retry
+simply succeeds.
 
 ### 7.4 Quarantine
 
@@ -566,7 +634,7 @@ The active token normally belongs to CC, and tagteam leaves it alone. tagteam re
 when the token has expired, or when the server returned 401 on a token that is still valid
 locally (a sibling machine revoked it). The procedure:
 
-1. Take the lease `refresh:<id>` and a `MutationGuard`, then CC's credential locks.
+1. Take a `MutationGuard`, then the account lock, then CC's credential locks (§4.3 order).
 2. Re-read the live credential. It must be `Fresh`, and the live identity must still match the
    account.
 3. **If CC has already rotated the live credential, adopt it instead of making a request.**
@@ -599,26 +667,28 @@ Refreshing from a degraded read is never allowed.
 - **Inactive account with an expired token and a refresh token.** Refresh through the gate
   first.
   - A Dead verdict returns immediately and never hits the usage endpoint.
-  - A deterministic refusal returns immediately: `Busy`, `invalid_client`, or rescue
+  - A deterministic refusal returns immediately: `Busy`, `Owned`, `invalid_client`, or rescue
     unreadable.
-- **401 on an inactive account.** Refresh once, then retry once.
+- **401 on an inactive account.** Refresh once, then retry once. The retry is a request like
+  any other and needs its own slot in the hourly budget (§8.6).
 - **Active account.** Usage fetches never refresh it; only §7.5 does that.
-- **Account owned by a live `run` session.** The fetch is read-only and uses the profile's
-  token.
+- **Session-owned account** (§12.5). The fetch is read-only and uses the profile's token.
   - A 401 stamps `rejected_fp` with the access-token fingerprint and reports `token_expired`.
   - The same bytes are not sent again until they change.
 - **Retry-After** is parsed in its seconds form only.
 
 ### 8.2 Normalization
 
-The normalized usage object is stored as `last_good`:
+A fetch is normalized into generic windows (§4.5), stored as `last_good`. The rendering layer
+turns them back into each provider's output shape (for CC, cswap's, §13.2). Claude Code's
+windows:
 
-- `five_hour` and `seven_day`: `{pct, resets_at?}`.
-- `spend`: `{used, limit, pct, currency, resets_at?}`. Present only when `extra_usage.is_enabled`
-  is true and all three numbers are non-null. `used = used_credits / 100`; `limit =
-  monthly_limit / 100`.
-- `scoped`: `[{name, pct, resets_at?}]`, one entry per `limits[]` item that has a model
-  `display_name` and a numeric `percent`.
+- `5h` (`Short`) and `7d` (`Long`) from `five_hour` and `seven_day`: `pct`, `resets_at?`.
+- `spend` (`Spend`) from `extra_usage`, with `detail {used, limit, currency}`. Present only
+  when `extra_usage.is_enabled` is true and all three numbers are non-null. `used =
+  used_credits / 100`; `limit = monthly_limit / 100`.
+- `scoped:<name>` (`Scoped`), one per `limits[]` item that has a model `display_name` and a
+  numeric `percent`.
 - An empty result normalizes to `None`.
 
 Each provider declares which of its windows are relevant. For Claude Code, the **relevant
@@ -633,7 +703,9 @@ counts.
 
 1. **Reserve.** In a short transaction, check eligibility and take the lease `usage:<id>`
    (90 s TTL).
-   - Eligible means: not quarantined, not in backoff, no live lease, and either due or stale.
+   - Eligible means: not quarantined, not in backoff, no live lease, either due or stale, and
+     **within the hourly budget** (§8.6). The same transaction inserts the `usage_requests`
+     row, so the budget holds across every process.
    - On-demand callers (`list`, `status`, `switch`) also require the reading to be older than
      180 s *and* either a poll to be due or no plan to exist.
 2. **Fetch**, with no lock held.
@@ -664,12 +736,21 @@ counts.
 
 ### 8.6 Poll policy
 
-These numbers are ported verbatim from `cswap:poll_policy.py`. The endpoint allows roughly
-28–30 requests per rolling hour per identity for non-first-party User-Agents; tagteam targets
-≤ 20 per hour.
+These numbers are ported from `cswap:poll_policy.py`; the hourly budget and the post-jitter
+floor are tagteam's. The endpoint allows roughly 28–30 requests per rolling hour per identity
+for non-first-party User-Agents.
+
+**The hourly budget is enforced, not targeted.** No account is sent more than **20** usage
+requests in any rolling hour, counted in `usage_requests` across all tagteam processes. Every
+request counts: scheduled polls, on-demand fetches, forced re-checks (consume-first's
+re-fetch), and the retry after a 401. A request that would exceed the budget is not sent. The
+fetch reports `over-budget`, the account's `next_poll_at` moves to when the oldest counted
+request leaves the hour, and the existing reading keeps whatever trust §8.4 gives it. The
+schedule below decides *when* to ask; the budget decides *whether* a request may be sent.
 
 | Constant | Value |
 |---|---|
+| Hourly request budget, per account | 20 |
 | Floor / serve TTL | 180 s |
 | Urgent (active account, moving, within 15 points of threshold, no recent 429) | 60 s |
 | Active max / candidate default / candidate max | 300 / 300 / 600 s |
@@ -690,7 +771,8 @@ These numbers are ported verbatim from `cswap:poll_policy.py`. The endpoint allo
 - **Recent 429:** `min(1800, max(interval, max(base · 1.5, 360)))`. A 429 counts as recent from
   when its backoff lifts, not from when the 429 arrived.
 - **Exhausted:** at least 600 s.
-- **Then:** apply jitter, and never schedule later than the next relevant reset + 60 s.
+- **Then:** apply jitter, then clamp: never below the 180 s floor (60 s when urgent), and never
+  later than the next relevant reset + 60 s.
 
 **Auto-switch scheduling** is O(1) per tick: the active account if it's due, plus the single
 stalest due candidate. All candidates are fetched only when the active account is within 15
@@ -703,16 +785,17 @@ points of the threshold, or its usage is unknown for a reason other than an expi
 - **Rate (regression).** Least-squares slope over the samples of the current window instance
   (same `resets_at` ± 60 s) from the last 48 h. It requires ≥ 3 samples spanning ≥ 2 h and a
   positive slope.
-- **Rate (fallback).** cswap's average pace (weekly windows only):
-  - `elapsed = period − ((reset − fetched_at) mod period)`, with `period` = 604800 s
+- **Rate (fallback).** cswap's average pace, for `Long` windows with a known period (CC's 7d:
+  `period` = 604800 s):
+  - `elapsed = period − ((reset − fetched_at) mod period)`
   - suppressed when `elapsed < 86400 s`
   - `expected = min(100, elapsed / period · 100)`
   - `rate = pct / elapsed`
 - **Projections:**
   - `projectedExhaustionAt = now + (100 − pct) / rate`
   - `willLastToReset = pct + rate · (reset − now) ≤ 100`
-  - `aheadOfPace = pct − expected ≥ 15` (weekly windows only)
-- **Where they appear.** `list` shows `(ahead of pace)` on weekly windows. `history` shows the
+  - `aheadOfPace = pct − expected ≥ 15` (`Long` windows only)
+- **Where they appear.** `list` shows `(ahead of pace)` on `Long` windows. `history` shows the
   ETA. JSON carries all fields plus the additive `projectionMethod: "regression" | "average"`.
 
 ## 9. Switch
@@ -720,7 +803,7 @@ points of the threshold, or its usage is unknown for a reason other than an expi
 The engine owns the transaction's shape: special cases, classification, displacement, ordering,
 commit and rollback. The provider supplies the live locks (`lock_live`), the reads, and the
 writes of its identity surface (`activate`). Everything below is written for the Claude Code
-provider, whose `activate` is steps 5–7 of §9.4. Another provider reuses the same transaction
+provider, whose `activate` is steps 5, 7 and 8 of §9.4. Another provider reuses the same transaction
 with its own locks and surface.
 
 ### 9.1 Locks
@@ -771,9 +854,13 @@ These are decided before locking and re-checked afterwards.
     owner. In that case, reconcile by running a full switch.
   - With `--force`, re-activate the vault generation. The live credential is displaced first,
     not written to the vault.
-- **Target owned by a live `run` session** whose profile holds a newer generation than the
-  vault: refuse (activation could only fail).
-  - If the profile is quiescent, adopt its generation into the vault instead, then proceed.
+- **Session-owned target** (§12.5): refuse with reason `session-owned`, with or without
+  `--force`. Activating it would give the default profile and the running session two
+  independently locked copies of one single-use refresh token. The message names the account's
+  `tagteam run` session and says to exit it first.
+  - If the profile is quiescent and holds a newer generation of the same identity, that
+    generation is adopted into the vault before activation (lazy capture, §12.5).
+- **An interrupted switch** for the provider is recovered first (§9.6).
 
 ### 9.3 Manual strategies
 
@@ -794,9 +881,12 @@ disabled. Every strategy works within one provider: a switch never crosses provi
 - Read the live credential. If it is not the outgoing account's vault generation (compared by
   bytes, then fingerprint), call the profile oracle (§7.6).
 
-**Under locks** (`MutationGuard` → CC credential locks → CC config lock); no network:
+**Under locks** (`MutationGuard` → account locks of the outgoing and target accounts → CC
+credential locks → CC config lock); no network:
 
-1. **Recompute the live account** from `~/.claude.json`'s `oauthAccount`.
+1. **Recompute the live account** from `~/.claude.json`'s `oauthAccount`, and re-check that the
+   target is not session-owned. Launch reservations are written under `MutationGuard` and
+   refreshes run under the account lock, so neither can change until the locks are released.
 2. **Direct branch** (no live identity, unmanaged live login, or `--force`):
    - Read the target from the vault.
    - Snapshot the live credential and config.
@@ -830,7 +920,10 @@ disabled. Every strategy works within one provider: a switch never crosses provi
      their absence: a key the machine no longer holds is not resurrected.
    - With no live JSON credential, the target is used without its machine-shared keys: the
      machine holds none, so none are taken from the vault.
-6. **Write the active credential** (Appendix A.3). The auth axis is single:
+6. **Journal.** In one store transaction, write the provider's `switch_journal` row: this
+   process's pid and start time, `from_id`, `to_id`, and the fingerprints of the live and
+   target credentials. It holds no secret.
+7. **Write the active credential** (Appendix A.3). The auth axis is single:
    - **Writing OAuth** deletes the managed-key item and drops `primaryApiKey`. The `approved`
      list is kept.
    - **Writing an API key** appends the key's last 20 characters to
@@ -840,12 +933,14 @@ disabled. Every strategy works within one provider: a switch never crosses provi
      siblings) from the live credential entry and keeps its machine-shared keys, in the
      Keychain item and in `.credentials.json` alike. An entry is deleted only when no
      machine-shared key remains in it.
-7. **Splice** the target's `oauthAccount` into `~/.claude.json` (§9.5).
-8. **Commit** in one store transaction: set the active account, and insert an `events` row
-   (`source` = `cli` or `auto`).
-9. **Rollback.** Any failure in steps 6–8 restores, in reverse order, the original
-   `~/.claude.json` bytes and the original live credential. The operation fails with
-   "rolled back", or with "rollback also failed" listing what could not be restored.
+8. **Splice** the target's `oauthAccount` into `~/.claude.json` (§9.5).
+9. **Commit** in one store transaction: set the active account, insert an `events` row
+   (`source` = `cli` or `auto`), and delete the journal row.
+10. **Rollback.** Any failure in steps 7–9 restores, in reverse order, the original
+    `~/.claude.json` bytes and the original live credential, then deletes the journal row. The
+    operation fails with "rolled back", or with "rollback also failed" listing what could not be
+    restored; the journal row then stays for recovery (§9.6). This covers errors and panics,
+    through `Drop`. A killed process runs no `Drop`: §9.6 covers that.
 
 **After unlocking:**
 - Replan the new active account's poll: `next_poll_at = max(now, fetched_at + 180)`, interval
@@ -862,13 +957,33 @@ is replaced.
 - **Missing key:** it is inserted before the closing `}`, with CC's 2-space indentation.
 - **The new value** is serialized with 2-space indentation, matching `JSON.stringify(v, null, 2)`
   and nested at the correct depth.
-- **Unreadable, torn, or not a JSON object:** write a 0600 salvage copy
-  `<name>.unreadable-<epoch>[.n]` first, then write `{"oauthAccount": …}`. If the salvage copy
-  fails, abort.
+- **Missing file:** it is created containing only the new key, with mode 0600.
+- **Unreadable, torn, or not a JSON object:** abort without writing. The error says to restore
+  the file from Claude Code's backups (`~/.claude/backups/`) or repair it, then retry. tagteam
+  never replaces a file it cannot splice, because that would drop everything else in it (§3).
+  This departs from cswap, which saved a salvage copy and replaced the file.
 - **Atomic write through symlinks.** The temp file is created beside the *resolved* target, then
   fsynced and renamed. The mode is preserved, or 0600 for new files.
 
 The same primitive writes `.credentials.json` and every other file tagteam writes.
+
+### 9.6 Interrupted-switch recovery
+
+A `switch_journal` row whose holder is not live (by the pid and start-time rules of §12.6)
+means a switch died between its first live write and its commit. The next command that takes
+`MutationGuard` recovers it before doing anything else, under the same locks as a switch, using
+an oracle result taken before locking. `doctor` reports such a row.
+
+Recovery only ever rolls forward:
+
+| Live credential | Meaning | Action |
+|---|---|---|
+| Has `to_fp`, or the oracle resolves it to `to_id` | The credential write landed; CC may have rotated it since | Splice the target's `oauthAccount` and commit (steps 8–9) |
+| Has `from_fp`, or the oracle resolves it to `from_id` | The credential write never landed | Delete the row; nothing else changes |
+| Anything else | Undecidable, for example a rotation with the oracle unavailable | Keep the row. Account-changing commands for the provider refuse with `interrupted-switch` until recovery can decide; `switch --force` resolves it by displacing the live credential and activating the chosen account |
+
+Recovery never writes an old credential back: CC may have rotated the live one since the
+crash, and restoring would overwrite that rotation.
 
 ## 10. Account lifecycle commands
 
@@ -919,8 +1034,8 @@ Captures the live login.
 - **`move <ACCOUNT> <POSITION>`.** If the target position is taken, the two accounts swap
   positions.
 - **Guard.** Destructive commands (`remove`, `move`, `purge`, `add` over an occupied position,
-  and profile bootstrap) refuse while any session record for an affected profile is live **or
-  unreadable**.
+  and profile bootstrap) refuse while an affected account is session-owned: a live launch
+  reservation, or a session record that is live **or unreadable**.
 
 ### 10.4 Account references
 
@@ -973,8 +1088,8 @@ An empty alias never matches.
      trigger `failover`; before that, `active-usage-unknown n/N`.
 6. **Cooldown.** `proactive` and `consume-first` within `cooldown_seconds` of the last switch →
    `cooldown`. `at-limit` and `failover` bypass it.
-7. **Candidates** must be switchable, not the current account, not quarantined, and not owned
-   by a live `run` session. API-key accounts qualify only when enabled, and only as a last
+7. **Candidates** must be switchable, not the current account, not quarantined, and not
+   session-owned. API-key accounts qualify only when enabled, and only as a last
    resort (never for `consume-first`). No candidates → `no-candidates` (BLOCKED).
 8. **Rank:**
    - **Skip** unknown headroom, headroom ≤ 0, and the barred account (§11.3).
@@ -982,8 +1097,10 @@ An empty alias never matches.
      the threshold, unless *every* account is above it.
    - **`best`:** candidate headroom − active headroom ≥ `hysteresis_pct`. Order by most
      headroom; ties go to the lower position.
-   - **`consume-first`:** the target's 7-day reset must be strictly sooner than the active
-     account's (unknown → skip). Order by soonest weekly reset, then most headroom. Before
+   - **`consume-first`:** ranked on the provider's primary `Long` window
+     (`primary_long_window()`, CC: 7d); a provider without one does not offer the strategy.
+     The target's reset of that window must be strictly sooner than the active account's
+     (unknown → skip). Order by soonest reset, then most headroom. Before
      switching, re-fetch the current account and all candidates and re-rank; the target's
      reading must be ≤ 180 s old, else `stale-usage`.
    - **Every account above the threshold:** for each pair, pick the recovery axis when both the
@@ -1011,7 +1128,7 @@ An empty alias never matches.
       |---|---|
       | `identity_conflict` or Dead | Quarantine it and emit `account-quarantined`; try the next target |
       | Transient or systemic | Try the next target |
-      | Owned by a live session | Try the next target |
+      | `Owned` (session-owned) | Try the next target |
       | OK | Perform the switch |
 
 11. **Perform.** Take the `autoswitch` lease, re-check the cooldown inside the transaction, then
@@ -1109,6 +1226,14 @@ breaks on link-to-link, anthropics/claude-code#78162). That includes `projects/`
 and auto-memory), `history.jsonl`, `CLAUDE.md`, `settings.json`, `keybindings.json`, `skills/`,
 `agents/`, `commands/`, `plugins/`, `todos/`, and any entry a future CC version adds.
 
+**Must-share entries.** `projects/` (transcripts and auto-memory) and `history.jsonl` hold the
+memory and history that §3 protects, and CC creates both on demand. If either is absent from
+the default home, tagteam first creates it empty there (the create-only row of §3), so the
+profile always links to it and CC never starts a private copy. If a profile holds a real
+`projects/` or `history.jsonl` in place of tagteam's link, `run` refuses and names both
+paths, for the user to merge by hand. Splitting memory or history silently is never an
+option.
+
 **Private to the profile** (the denylist):
 
 | Entry | Why it's private |
@@ -1128,15 +1253,17 @@ known-private lists.
 - Create any missing links.
 - Remove only links that tagteam created (tracked in `<profile>/.tagteam-links.json`) whose
   source has disappeared.
-- A real file or directory where a link belongs is never replaced; tagteam reports it.
+- A real file or directory where a link belongs is never replaced; tagteam reports it (and
+  refuses, for a must-share entry).
 - Real history directories are never deleted.
+- `.tagteam-*` entries are tagteam's own and are never linked.
 
 ### 12.3 Bootstrap and validation
 
-This runs under `MutationGuard`, with a 30 s timeout, and only when the profile is missing,
-invalid, or stale-marked and quiescent.
+This runs within a launch (§12.5), under `MutationGuard` and the account lock, and only when
+the profile is quiescent and is missing, invalid, or stale-marked.
 
-1. Refresh the vault credential through the gate first, before taking the lock.
+1. Refresh the vault credential through the gate first, before the launch takes its locks.
    - `Transient` with `rescued`, and `Unpersisted`, abort with advice.
    - A plain `Transient` continues with the stored credential.
 2. Delete the profile's hashed Keychain item, because CC reads the Keychain first.
@@ -1166,8 +1293,10 @@ profile's current file, or `{}` if there is none, and:
 
 The write takes the profile's own config lock.
 
-**Merge back, when the session exits and the profile is quiescent.** This runs under the
-default profile's config lock (`~/.claude.json.lock`), with no `MutationGuard`.
+**Merge back, when the last session exits** (§12.5). This runs inside the exit handling,
+under `MutationGuard`, and takes the default profile's config lock (`~/.claude.json.lock`) on
+its own. If `~/.claude.json` cannot be spliced (§9.5), the merge-back aborts with a warning and
+the baseline is kept, so it runs again before the next seed.
 
 1. Diff the profile's `projects.<path>.<key>` and `mcpServers.<name>` against the baseline.
 2. Apply each changed or removed key to `~/.claude.json` with the §9.5 splice (`projects` and
@@ -1181,6 +1310,21 @@ Account-specific fields are never merged back.
 
 `tagteam` stays resident: it spawns `claude` and waits for it, holding no locks while it
 waits.
+
+**Launch reservation.** CC writes its own session record only some time after it starts, and
+removes it before its process ends. The reservation covers both gaps: the resident `tagteam`
+parent owns the profile from before `claude` starts until after its exit handling. It is
+`<profile>/.tagteam-launch/<pid>.json`, holding the parent's pid, process start time and
+`startedAt`, and it is live by the §12.6 rules. Launch and exit are serialized with every other
+ownership change by `MutationGuard` and the account lock.
+
+**Launch**, under `MutationGuard` (30 s timeout), then the account lock:
+1. Remove this profile's dead reservations. If the profile is quiescent and a baseline is left
+   from a session that never merged back, merge it back now (§12.4).
+2. Sync links (§12.2). If the profile is quiescent, bootstrap it when needed (§12.3) and seed
+   it (§12.4). If not, join the running session without seeding.
+3. Write this process's reservation.
+4. Release both locks and spawn `claude`.
 
 - The parent ignores SIGINT and SIGQUIT (the child owns the terminal) and forwards SIGTERM and
   SIGHUP to the child.
@@ -1198,14 +1342,18 @@ set to anything else, it would redirect them. Every profile credential operation
 validation, capture, and the hashed-item deletion in `remove`) resolves paths with this same
 environment.
 
-**When the child exits,** if the profile is quiescent:
-1. **Capture.** Adopt the profile's credential into the vault if it is a newer generation of the
-   same identity. This uses the refresh-gate lease and CAS (§7.3), with no network.
-2. **Merge back** `.claude.json` (§12.4).
+**When the child exits**, under `MutationGuard`, then the account lock:
+- If the profile is quiescent apart from this process's own reservation, this is the last
+  session out:
+  1. **Capture.** Adopt the profile's credential into the vault if it is a newer generation of
+     the same identity, comparing and writing under the account lock (§6.2), with no network.
+  2. **Merge back** `.claude.json` (§12.4).
+- In either case, remove this process's reservation last.
 
-**Lazy capture.** If tagteam itself was killed, the same adoption runs at the next usage
-collection, switch pre-check, or refresh gate. The conditions are the same: quiescent, newer,
-same identity, and not stale-marked.
+**Lazy capture.** If tagteam itself was killed, its reservation is dead, and the same adoption
+runs at the next usage collection, switch pre-check, or refresh gate, under the account lock.
+The conditions are the same: quiescent, newer, same identity, and not stale-marked. The
+unmerged baseline is merged back at the next launch (step 1 above).
 
 **Stale marking.** When the vault changes while a session is live (a re-add or an import),
 tagteam writes the stale marker instead of touching the running profile. The next quiescent
@@ -1229,6 +1377,11 @@ record's writer:
   treated as recycled **only if** the process started more than 120 s after the record's
   `startedAt` **and** neither its executable name nor its arguments contain `claude`. This
   mirrors cswap, whose rule is based on `ps lstart`.
+
+**tagteam's own records** (launch reservations, and the `switch_journal` holder) record the start
+time from the same source they are later compared against (`/proc/<pid>/stat` field 22 on
+Linux, `proc_pidinfo` on macOS). Liveness is then an exact match of pid and start time, with no
+heuristic.
 
 Anything that can't be determined counts as live. A malformed record (non-object JSON, a huge
 pid, deep nesting, invalid UTF-8) counts as **unreadable**, and unreadable records block
@@ -1312,7 +1465,8 @@ Each row:
 | foreign_credential | no_credentials | unavailable | unsupported`. `unsupported` is for providers
 without the `usage` capability; it never occurs for Claude Code.
 
-`usage` is decision-grade only (§8.4):
+`usage` is decision-grade only (§8.4), and is rendered by the account's provider from its generic
+windows. Claude Code renders cswap's shape:
 - `fiveHour {pct, resetsAt?}`
 - `sevenDay {pct, resetsAt?, expectedPct?, aheadOfPace?, projectedExhaustionAt?,
   willLastToReset?, projectionMethod?}`
@@ -1327,7 +1481,8 @@ without the `usage` capability; it never occurs for Claude Code.
 **`switch`** returns `{schemaVersion, switched, from, to, strategy, reason, message, warnings}`.
 - `strategy` is `rotation | best | next-available | direct`.
 - `reason` is `switched | already-active | activated | unmanaged-account | only-one-account |
-  usage-unavailable | already-best | candidates-exhausted | no-valid-target`.
+  usage-unavailable | already-best | candidates-exhausted | no-valid-target | session-owned |
+  interrupted-switch`. The last two are additive to cswap's set.
 
 `doctor` and `history` have their own `--json` shapes, documented in `--help` and snapshot
 tested.
@@ -1354,16 +1509,20 @@ tested.
 
 ```json
 { "format": "tagteam-export", "version": 1, "exportedAt": "…Z", "exportedFrom": "macos|linux",
-  "tagteamVersion": "…", "activePosition": 2,
-  "accounts": [ { "provider": "claude-code", "position": 2, "email": "…", "accountUuid": "…", "organizationUuid": "",
-                  "organizationName": null, "kind": "oauth", "alias": "dev", "disabled": false,
-                  "addedAt": "…Z", "oauthAccount": { … },
+  "tagteamVersion": "…", "active": { "claude-code": 2 },
+  "accounts": [ { "provider": "claude-code", "position": 2, "kind": "oauth", "label": "…",
+                  "alias": "dev", "disabled": false, "addedAt": "…Z",
+                  "identity":   { "email": "…", "accountUuid": "…", "organizationUuid": "",
+                                  "organizationName": null, "oauthAccount": { … } },
                   "credential": { "claudeAiOauth": { … } } } ] }
 ```
 
-- **Default contents are slim.** The credential is reduced to `{claudeAiOauth}`: the
-  machine-shared keys and the device-bound `trustedDeviceToken` stay on the source machine.
-  `--full` keeps everything.
+- **Provider-owned payload.** The engine owns `provider`, `position`, `kind`, `label`, `alias`,
+  `disabled` and `addedAt`. `identity` and `credential` are written and validated by the
+  provider (`export_login` / `import_login`), so a new provider needs no new format version.
+- **Default contents are slim.** For Claude Code the credential is reduced to
+  `{claudeAiOauth}`: the machine-shared keys and the device-bound `trustedDeviceToken` stay on
+  the source machine. `--full` keeps everything.
 - **The active account** is exported from the live store.
 - **Broken accounts.** When exporting all accounts, a broken one is skipped with a warning.
   With an explicit `--account`, a broken account is a hard error.
@@ -1377,9 +1536,10 @@ cswap accounts import as provider `claude-code`. A tagteam account whose `provid
 registered in this build is refused in pass 1, naming the provider.
 
 1. **Pass 1 validates everything** before writing anything:
-   - the email regex and integer positions ≥ 1 (a path-traversal defence)
-   - field types and alias rules
-   - no duplicate `(email, org)` pairs and no duplicate aliases
+   - the provider's identity validation (CC: the email regex) and integer positions ≥ 1 (a
+     path-traversal defence)
+   - field types, the provider's credential kinds, and alias rules
+   - no duplicate identity keys within a provider, and no duplicate aliases
    - an alias owned locally by a different identity is dropped
 2. **Pass 2 writes:**
    - **An existing identity** is skipped unless `--force` is given, or it is quarantined (it is
@@ -1441,8 +1601,13 @@ anything fails.
   - quarantined accounts
   - `login_expires_at` within 7 days → warn
 - **Pending storage:** pending `rescue/` entries → warn. `displaced/` entries → info.
-- **Session profiles:** entries in `~/.claude` that are on neither the known-shared nor the
-  known-private list (§12.2) → warn.
+- **Interrupted switch:** a `switch_journal` row whose holder is dead → warn, or fail if §9.6
+  cannot decide it.
+- **Session profiles:**
+  - entries in `~/.claude` that are on neither the known-shared nor the known-private list
+    (§12.2) → warn
+  - a real `projects/` or `history.jsonl` inside a profile (§12.2) → fail
+  - dead launch reservations, and baselines awaiting merge-back → info
 - **Online** (`--online`): TLS reachability of the token, profile and usage hosts, with no
   credentials sent.
 
@@ -1453,7 +1618,8 @@ anything fails.
 - **The binary** maps them to exit codes and human messages that give the next action (for
   example, "log in with that account and run `tagteam add --position 3`").
 - **Panics** are bugs. Lock guards release in `Drop`, and the switch transaction's rollback
-  also runs from `Drop` if the transaction didn't commit.
+  also runs from `Drop` if the transaction didn't commit. A killed process runs no `Drop`;
+  the switch journal (§9.6) and launch reservations (§12.5) cover that case.
 - **After a vault write advances an account, nothing may fail upward.** Any follow-up
   (invalidating a profile, replanning a poll) is contained: on failure it writes the stale
   marker, and if even that fails it logs at ERROR.
@@ -1477,27 +1643,41 @@ anything fails.
 
 ### 15.2 Layers
 
-- **`tagteam-core`:** unit and property tests. Poll planning, backoff (including the clamps and
-  `Infinity`), trust, pace and regression, classification, and `decide()` with the §11.5
-  simulations.
+- **`tagteam-core`:** unit and property tests. Poll planning (including the post-jitter floor),
+  backoff (including the clamps and `Infinity`), trust, pace and regression, classification,
+  and `decide()` with the §11.5 simulations.
 - **`tagteam-cc`:**
   - service and account naming vectors, including NFC normalization, trailing slashes, the
     username regex fallback, and managed-key hashing
   - `security` argv and stdin shapes, including the 4032-byte argv fallback, hex decoding, and
     rc 44/36
   - the `proper-lockfile` protocol, including staleness, touching, the legacy-contention
-    release, and cleanup on panic
+    release, cleanup on panic, and compromise: a holder suspended past staleness resumes, sees
+    the takeover, writes nothing and removes nothing
   - the splice against a corpus of `.claude.json` shapes (large files, unicode, numbers like
     `1e400` and `0.1000`, CRLF, nested `oauthAccount`, missing key, torn file)
-- **`tagteam-engine`:** fixture-home integration tests for every command. Crash injection at
-  each switch step verifies the rollback. Concurrency tests run two engines against one store
-  (double-switch prevention, lease fencing, refresh single-flight).
+- **`tagteam-engine`:** fixture-home integration tests for every command.
+  - **Crash injection** at each switch step verifies the rollback. A separate run **kills the
+    process** (SIGKILL) at each step and verifies §9.6 recovery, including a CC rotation between
+    the kill and the recovery.
+  - **Concurrency tests** run several engines, in separate processes, against one store and
+    home: double-switch prevention, lease fencing, refresh single-flight with a holder stopped
+    (SIGSTOP) past any timeout, every vault writer racing the refresh gate, launch and exit
+    racing `remove` / `switch` / the gate, and two overlapping sessions of one account.
+  - **Budget:** across any interleaving of processes and on-demand callers, no account is sent
+    more than 20 usage requests in a rolling hour.
+  - **Fresh home:** a `run` against a home with no `projects/` or `history.jsonl` leaves both
+    shared.
 - **Provider neutrality.** A test-only `FakeAgent` provider is registered alongside Claude Code.
   It has its own home layout, credential format, lock and usage windows, and some capabilities
-  switched off. Engine tests run against both providers, and assert that:
+  switched off. Its shapes differ from CC's on purpose: an identity with no email, credential
+  kinds CC doesn't have, and no `Long` window. Engine tests run against both providers, and
+  assert that:
   - positions, auto-switch state, leases and mappings stay per provider
   - a switch, refresh or auto tick on one provider never touches the other's state
   - a missing capability degrades as §4.5 specifies
+  - its accounts store, list, export and import through the same schema and format, with no
+    CC-shaped field
 
   This keeps the trait from quietly taking on Claude Code's shape before a real second provider
   exists.
@@ -1561,7 +1741,7 @@ anything fails.
 |---|---|---|
 | R1 | Keychain access control. Items created through Security.framework might make CC's `security` reads prompt or fail (rc 36) over SSH or under launchd (*inferred*) | Use only `/usr/bin/security` for every item. The first plan task is a real-Mac spike: an item written by tagteam, read by `claude` from an SSH session |
 | R2 | CC drift beyond 2.1.283. A feature-flagged storage layer ("storageV5") may bypass the `~/.claude.json` lock; new per-account files may appear in `~/.claude` | The weekly compat job, `doctor` version warnings, and the known-entries lists |
-| R3 | The usage endpoint budget is empirical (~30 requests per hour per identity) and could change | Keep the 180 s floor and AIMD. Re-derive the constants from logs, not from comments |
+| R3 | The usage endpoint budget is empirical (~30 requests per hour per identity) and could change | Enforce a hard budget of 20 per hour below it, and keep the 180 s floor and AIMD. Re-derive the constants from logs, not from comments |
 | R4 | The merge-back can conflict with concurrent edits of `~/.claude.json` | Three-way merge against the baseline, the default file wins, under CC's config lock |
 | R5 | Sharing by denylist could share a future per-account file | Unknown entries are reported by `doctor` and by the weekly compat job |
 | R6 | cswap's heuristics (§11) are complex | Named predicates, simulation tests, and a documented trace corpus |
@@ -1704,11 +1884,12 @@ Each is a one-liner, and each gets at least one test.
 9. Machine-shared credential keys come from the live credential, absence included;
    `trustedDeviceToken` stays with its account.
 10. Writing OAuth clears the managed key, and the reverse; the `approved` list is append-only.
-11. `~/.claude.json` is never overwritten without being read. An unreadable file gets a salvage
-    copy first, and a failed salvage aborts.
+11. `~/.claude.json` is never overwritten without being read. A file that is unreadable, torn,
+    or not a JSON object aborts the write; it is never replaced (changed from cswap, which
+    salvaged and replaced it).
 12. Atomic writes go through symlinks, with the temp file beside the resolved target.
 13. Lock order is fixed and matches CC's. CC's credential locks go stale only after 60 s.
-14. No network while holding a contended lock, except the bounded active refresh (§7.5).
+14. No network while holding a contended lock, except the bounded refresh requests (§4.3).
 15. A received refresh successor is never discarded; if both persistence paths fail, the loss
     is reported.
 16. A permanent (Dead) verdict requires a top-level `invalid_grant`, or a structurally complete
@@ -1720,8 +1901,8 @@ Each is a one-liner, and each gets at least one test.
 20. The backoff exponent is clamped.
 21. Usage results are fenced by lease and identity; late writers are dropped.
 22. A failure never erases `last_good`.
-23. Auto-switch never acts on an unmanaged live login, and never auto-activates an account owned
-    by a live session.
+23. Auto-switch never acts on an unmanaged live login. No switch, manual or automatic, activates
+    a session-owned account, even with `--force`.
 24. `at-limit` and `failover` bypass the anti-flap gates; `proactive` requires a landing below
     the threshold and the hysteresis margin.
 25. The cooldown is re-checked in the same transaction that records the switch.
@@ -1731,7 +1912,8 @@ Each is a one-liner, and each gets at least one test.
     marker is used instead.
 29. Only a definite `invalid` auth status deletes a profile.
 30. tagteam only removes links it created; real history directories are never deleted.
-31. Destructive operations refuse while any affected session record is live or unreadable.
+31. Destructive operations refuse while an affected account is session-owned (a live launch
+    reservation, or a session record that is live or unreadable).
 32. Commands that change accounts or the live login refuse inside a `tagteam run` shell.
 33. Secret-bearing files are created 0600 at creation, never chmod'ed afterwards.
 34. Import validates everything before writing anything; the email and position checks defend
@@ -1740,6 +1922,21 @@ Each is a one-liner, and each gets at least one test.
 36. `--json` stdout is exactly one object (or one JSONL stream for `auto`); everything else goes
     to stderr.
 37. A process that spawns `claude` holds no lock while it runs.
+
+**Added by this design** (not in cswap), each with at least one test:
+
+38. Every vault write holds the account lock and compares and replaces within one hold; the
+    refresh gate is single-flight per account, and a suspended holder is never preempted.
+39. The refresh gate never refreshes the live login's token or a session-owned account's.
+40. A lock tagteam has lost to a staleness takeover is neither written under nor removed.
+41. No account is sent more than its provider's hourly budget of usage requests, retries
+    included, across all processes.
+42. A switch killed mid-way is recovered by rolling forward only; an old credential is never
+    written back.
+43. Memory and history are never split: must-share entries are created before linking, and a
+    private copy refuses the launch.
+44. A profile is seeded only when quiescent, and a pending merge-back runs before any re-seed.
+45. The store, export and import hold no Claude Code–shaped field outside provider-owned JSON.
 
 ## Appendix C — cswap → tagteam command map
 
