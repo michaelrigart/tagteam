@@ -1334,14 +1334,21 @@ than the vault's current generation.
    - `Transient` with `rescued`, and `Unpersisted`, abort with advice.
    - A plain `Transient` continues with the stored credential.
 2. If the profile is stale-marked, displace its current credential (§6.3): it may be a live
-   generation of the login that was replaced. Then delete the profile's hashed Keychain item,
-   because CC reads the Keychain first.
-3. Write the vault credential to `<profile>/.credentials.json` (0600). CC migrates it into its
-   own hashed item on first write; tagteam never writes that item. Record the profile's
-   provenance in `<profile>/.tagteam-seed.json`: the account's current `login_epoch`, and the
-   written generation's fingerprint as the seed.
-4. Seed `<profile>/.claude.json` (§12.4).
-5. Validate with `claude auth status --json`, in exactly the session environment (§12.5), with
+   generation of the login that was replaced.
+3. **Always** delete the profile's hashed Keychain item (macOS), whatever the reason for the
+   bootstrap, and verify it `Absent` with the existence probe (Appendix A.3). CC reads the
+   Keychain first, so an item left behind, such as the consumed generation from a refresh-driven
+   re-bootstrap, would stay authoritative over the file. If the item cannot be verified
+   absent, the launch aborts.
+4. Write the vault credential to `<profile>/.credentials.json` (0600). CC migrates it into its
+   own hashed item on first write; tagteam never writes that item.
+5. **Verify the effective credential.** Re-read the profile's credential the way CC would
+   (Keychain first, then the file), and check that it is the vault's current generation.
+   Only then record the profile's provenance in `<profile>/.tagteam-seed.json`: the account's
+   current `login_epoch`, and that generation's fingerprint as the seed. A mismatch aborts
+   the launch.
+6. Seed `<profile>/.claude.json` (§12.4).
+7. Validate with `claude auth status --json`, in exactly the session environment (§12.5), with
    a 10 s timeout. The profile is
    valid when `rc == 0`, `loggedIn === true`, `authMethod == "claude.ai"`, the `email` matches,
    and the `orgId` matches when both are present.
@@ -1799,7 +1806,10 @@ anything fails.
     killed at each of its three steps: a rotation held by the profile is captured afterwards,
     never stranded.
   - **Provenance:** every row of the §12.5 table, including capture and relaunch with a
-    rotated refresh token whose `expiresAt` does not increase.
+    rotated refresh token whose `expiresAt` does not increase. On macOS with the real
+    `security` driver, the full sequence (session exit → inactive vault refresh → relaunch →
+    capture) ends with the vault's generation effective in the profile, and never captures
+    the consumed one.
   - **Concurrency tests** run several engines, in separate processes, against one store and
     home: double-switch prevention, lease fencing, refresh single-flight with a holder stopped
     (SIGSTOP) past any timeout, every vault writer racing the refresh gate, launch and exit
@@ -2083,7 +2093,9 @@ Each is a one-liner, and each gets at least one test.
     its failure aborts the launch.
 45. The store, export and import hold no Claude Code–shaped field outside provider-owned JSON.
 46. A launch reservation stays live while the parent or `claude` lives, and a session starts
-    only from the vault's current generation (or hands a newer one back first).
+    only from the vault's current generation (or hands a newer one back first). This is
+    verified on the credential CC will actually read, after any obsolete Keychain item has
+    been verified gone.
 47. Switch and launch re-derive their decisions (outgoing account, target ownership, the
     default-login fast path) after taking their locks, and restart if the lock set no longer
     fits.
