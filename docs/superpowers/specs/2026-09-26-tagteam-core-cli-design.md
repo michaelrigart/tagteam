@@ -289,7 +289,7 @@ mode 0700, so a command that changes nothing creates nothing.
 | Vault (Linux) | `$XDG_DATA_HOME/tagteam/vault/<id>.json`, `<id>.prev.json` |
 | Rescued successors | `$XDG_DATA_HOME/tagteam/rescue/<id>-<epoch>-<fp12>.json` |
 | Displaced foreign credentials | `$XDG_DATA_HOME/tagteam/displaced/<epoch>-<fp12>-<rand6>.json` |
-| Session profiles | `$XDG_DATA_HOME/tagteam/sessions/<id>/`, recording the login epoch it was bootstrapped from in `<profile>/.tagteam-epoch` |
+| Session profiles | `$XDG_DATA_HOME/tagteam/sessions/<id>/`, with its provenance (login epoch and seed generation) in `<profile>/.tagteam-seed.json` |
 | Launch reservations | `<profile>/.tagteam-launch/<pid>.lock` |
 | Mutation lock | `$XDG_DATA_HOME/tagteam/.mutation.lock` |
 | Account locks | `$XDG_DATA_HOME/tagteam/locks/<id>.lock` |
@@ -330,6 +330,7 @@ CREATE TABLE accounts (
   identity_json    TEXT NOT NULL,             -- provider-owned identity object (CC: the oauthAccount object only)
   login_expires_at INTEGER,                   -- epoch ms (CC: refreshTokenExpiresAt)
   login_epoch      INTEGER NOT NULL DEFAULT 0,  -- bumped by every explicit login replacement (§12.5)
+  replacing_fp     TEXT,                      -- set only while an explicit replacement is in flight (§12.5)
   quarantine_reason TEXT,                     -- 'invalid_grant' | 'no_refresh_token' | 'identity_conflict'
   quarantine_fp    TEXT,                      -- fingerprint the quarantine is bound to
   quarantine_at    INTEGER,
@@ -489,9 +490,13 @@ only.
   outgoing capture, `run` capture, lazy capture, and active-token adoption) never writes a
   degraded credential, and never replaces a credential that has a refresh token with one that
   lacks it. A capture from a profile (`run` capture, lazy capture, and the gate's profile
-  adoption) also requires the profile to be quiescent and **not stale-marked** (§12.5): a
-  stale profile's login was replaced by an explicit command, whether or not a session was
-  running, and the profile's other lineage must never undo that. Only the explicit commands `add`, `add-token` and `import` replace a login wholesale.
+  adoption) also requires the profile to be quiescent, and is decided by the profile's
+  provenance (§12.5), never by expiry. A stale-marked profile is never captured: its login was
+  replaced by an explicit command, whether or not a session was running, and the profile's
+  other lineage must never undo that.
+- **Pending replacements first.** Every holder of an account lock first reconciles a pending
+  explicit replacement for that account (§12.5), before it refreshes, captures, bootstraps or
+  activates anything. Only the explicit commands `add`, `add-token` and `import` replace a login wholesale.
 - **Deletes are strict.** Both generations are deleted on both backends. Errors propagate, and
   the deletion is verified with a tri-state read. A locked Keychain that still holds an item
   aborts the delete.
@@ -583,9 +588,9 @@ This procedure is the only place a stored refresh token is ever sent to the toke
      removed).
    - If a `rescue/` entry for this account holds a successor of the current fingerprint, adopt
      it: write it to the vault, verify, delete the rescue file, and use it.
-   - If the account's profile is quiescent and not stale-marked, and it holds a newer
-     generation of the same identity, adopt that into the vault first. "Newer" means a
-     different fingerprint and a later `expiresAt`.
+   - If the account's profile is quiescent, apply its provenance (§12.5). If the profile
+     rotated since its seed, adopt its generation into the vault first. If provenance reports a
+     conflict, return `Conflict` without making a request.
 4. **Check whether someone already refreshed.** If the vault's access token differs from the
    caller's snapshot and is not expired, return it without making a request.
 5. **POST** to the token endpoint (Appendix A.5), with a 10 s timeout.
@@ -692,8 +697,8 @@ Refreshing from a degraded read is never allowed.
 - **Inactive account with an expired token and a refresh token.** Refresh through the gate
   first.
   - A Dead verdict returns immediately and never hits the usage endpoint.
-  - A deterministic refusal returns immediately: `Busy`, `Owned`, `invalid_client`, or rescue
-    unreadable.
+  - A deterministic refusal returns immediately: `Busy`, `Owned`, `Conflict`,
+    `invalid_client`, or rescue unreadable.
 - **401 on an inactive account.** Refresh once, then retry once. The retry is a request like
   any other and needs its own slot in the hourly budget (§8.6).
 - **Active account.** Usage fetches never refresh it; only §7.5 does that. A 401 on an access
@@ -898,8 +903,10 @@ These are decided before locking and re-checked afterwards.
   `--force`. Activating it would give the default profile and the running session two
   independently locked copies of one single-use refresh token. The message names the account's
   `tagteam run` session and says to exit it first.
-  - If the profile is quiescent and holds a newer generation of the same identity, that
-    generation is adopted into the vault before activation (lazy capture, §12.5).
+  - If the profile is quiescent and rotated since its seed, its generation is adopted into the
+    vault before activation (lazy capture, §12.5). If its provenance reports a conflict, the
+    switch refuses with reason `profile-conflict`, because the vault's generation may be
+    consumed.
 - **An interrupted switch** for the provider is recovered first (§9.6).
 
 ### 9.3 Manual strategies
@@ -1330,8 +1337,9 @@ than the vault's current generation.
    generation of the login that was replaced. Then delete the profile's hashed Keychain item,
    because CC reads the Keychain first.
 3. Write the vault credential to `<profile>/.credentials.json` (0600). CC migrates it into its
-   own hashed item on first write; tagteam never writes that item. Record the account's
-   current `login_epoch` in `<profile>/.tagteam-epoch`.
+   own hashed item on first write; tagteam never writes that item. Record the profile's
+   provenance in `<profile>/.tagteam-seed.json`: the account's current `login_epoch`, and the
+   written generation's fingerprint as the seed.
 4. Seed `<profile>/.claude.json` (§12.4).
 5. Validate with `claude auth status --json`, in exactly the session environment (§12.5), with
    a 10 s timeout. The profile is
@@ -1402,11 +1410,10 @@ death.
    from a session that never merged back, merge it back now (§12.4); a failure aborts the
    launch.
 3. Sync links (§12.2). If the profile is quiescent:
-   - run lazy capture (below), which never adopts from a stale-marked profile;
-   - then compare the profile's credential with the vault's current generation. If they
-     differ, the profile holds an older, possibly consumed generation, so bootstrap it
-     (§12.3). A profile credential that is unreadable or degraded aborts the launch instead,
-     because tagteam never overwrites a credential it could not read;
+   - apply the profile's provenance (below). If the profile rotated, capture it. If the vault
+     moved on, or the profile is stale-marked, bootstrap it (§12.3). If there is a conflict,
+     refuse the launch. A profile credential that is unreadable or degraded also aborts the
+     launch, because tagteam never overwrites a credential it could not read;
    - bootstrap for any other §12.3 reason, then seed (§12.4).
 
    If the profile is not quiescent, join the running session without seeding.
@@ -1432,26 +1439,52 @@ environment.
 **When the child exits**, under `MutationGuard`, then the account lock:
 - If the profile is quiescent apart from this process's own reservation, this is the last
   session out:
-  1. **Capture.** Adopt the profile's credential into the vault if the profile is not
-     stale-marked and the credential is a newer generation of the same identity. The
-     comparison and write happen under the account lock (§6.2), with no network.
+  1. **Capture.** Adopt the profile's credential into the vault if its provenance (below) says
+     it rotated, and it is the same identity. The comparison and write happen under the
+     account lock (§6.2), with no network.
   2. **Merge back** `.claude.json` (§12.4).
 - In either case, unlink this process's reservation last.
 
 **Lazy capture.** If tagteam itself was killed, the same adoption runs once the profile is
 quiescent: at the next launch, usage collection, switch pre-check, or refresh gate, under the
-account lock. The conditions are the same: quiescent, newer, same identity, and not
-stale-marked. The unmerged baseline is merged back at the next launch (step 2 above).
+account lock. The conditions are the same: quiescent, rotated according to its provenance,
+and the same identity. The unmerged baseline is merged back at the next launch (step 2
+above).
 
-**Stale marking.** A profile is **stale-marked** when the login epoch recorded in
-`<profile>/.tagteam-epoch` differs from the account's `login_epoch`.
-- Every explicit login replacement (`add` over an existing account, `add-token`, `import`)
-  increments `login_epoch`. It does so in a store transaction before writing the vault, whether
-  or not a session is live, so no separate write can fail and leave the profile unfenced.
-- A running profile is never touched: it is simply stale, and is re-bootstrapped at its next
-  quiescent launch, which writes the new epoch.
-- A refresh advances the vault without changing the epoch. The next launch catches that by
-  comparing generations (launch step 3).
+**Profile provenance.** `<profile>/.tagteam-seed.json` records two things:
+- the login epoch the profile was bootstrapped under;
+- the **seed**: the fingerprint of the generation the profile last agreed on with the vault.
+
+Bootstrap writes both, and a capture moves the seed to the captured generation. A profile is
+**stale-marked** when its recorded epoch differs from the account's `login_epoch`. Every
+comparison between a profile's credential P and the vault's V is made against the seed S,
+never by expiry, because a rotated token need not expire later than the one it replaced:
+
+| State | Meaning | Outcome |
+|---|---|---|
+| P = V | In step | Nothing; the seed is set to V if it differs |
+| P ≠ V, V = S | The profile rotated; the vault has not moved since they agreed | **Capture** P into the vault (unless stale-marked); the seed becomes P |
+| P ≠ V, P = S | The vault moved on (a refresh, a switch capture, or a replacement); P is older and may be consumed | Never captured; the next launch re-bootstraps from V |
+| P ≠ V, P ≠ S, V ≠ S, stale-marked | Both moved, and the vault's move was an explicit replacement | The replacement wins: never captured; the next launch displaces P and re-bootstraps |
+| P ≠ V, P ≠ S, V ≠ S, not stale-marked | Both moved, in an unknown order | **Conflict.** Nothing is captured, refreshed or overwritten for the account: the gate returns `Conflict`, `run` and `switch` refuse, and `doctor` fails the check. An explicit replacement resolves it |
+
+**Explicit replacements are recoverable.** `add` over an existing account, `add-token` and
+`import` hold the account lock throughout, and:
+1. in one store transaction, increment `login_epoch` and set `replacing_fp` to the new
+   credential's fingerprint;
+2. write the vault;
+3. in one store transaction, clear `replacing_fp`.
+
+The epoch moves first, so no profile, running or not, is ever captured over a replacement that
+landed. The crash gap this ordering opens is closed by recovery. Any holder of the account lock
+that finds `replacing_fp` set knows the replacer died, since the replacer held that lock
+throughout, and reconciles before doing anything else:
+- if the vault holds `replacing_fp`, the replacement landed, and the marker is cleared;
+- otherwise it never landed: `login_epoch` is decremented and the marker cleared. That restores
+  the profile's eligibility, so a rotation it holds is captured rather than stranded.
+
+A running profile is never touched: it is simply stale-marked, and is re-bootstrapped at its
+next quiescent launch, which writes the new epoch and seed.
 
 **Identity drift.** If the profile's `oauthAccount` email, or its org when both are set,
 differs from the account's, the profile is ignored for that account.
@@ -1576,7 +1609,7 @@ windows. Claude Code renders cswap's shape:
 - `strategy` is `rotation | best | next-available | direct`.
 - `reason` is `switched | already-active | activated | unmanaged-account | only-one-account |
   usage-unavailable | already-best | candidates-exhausted | no-valid-target | session-owned |
-  interrupted-switch`. The last two are additive to cswap's set.
+  interrupted-switch | profile-conflict`. The last three are additive to cswap's set.
 
 `doctor` and `history` have their own `--json` shapes, documented in `--help` and snapshot
 tested.
@@ -1703,6 +1736,8 @@ anything fails.
   - a real `projects/` or `history.jsonl` inside a profile (§12.2) → fail
   - reservations whose `tagteam` parent is gone but whose lock is still held, with the
     holding processes where the OS can tell; baselines awaiting merge-back → info
+  - a provenance conflict (§12.5) → fail, naming the account and the fix; a pending
+    replacement → warn
 - **Online** (`--online`): TLS reachability of the token, profile and usage hosts, with no
   credentials sent.
 
@@ -1760,7 +1795,11 @@ anything fails.
   - **Active-refresh reconciliation** (§7.5) covers every row of its table, including a CC
     rotation after a rescue was published, and a 401 on a locally valid token.
   - **Login epoch:** an `import` or `add-token` over an account with a quiescent profile that
-    holds a later-expiring login is never undone by any capture path.
+    holds a later-expiring login is never undone by any capture path. The replacement is also
+    killed at each of its three steps: a rotation held by the profile is captured afterwards,
+    never stranded.
+  - **Provenance:** every row of the §12.5 table, including capture and relaunch with a
+    rotated refresh token whose `expiresAt` does not increase.
   - **Concurrency tests** run several engines, in separate processes, against one store and
     home: double-switch prevention, lease fencing, refresh single-flight with a holder stopped
     (SIGSTOP) past any timeout, every vault writer racing the refresh gate, launch and exit
@@ -2054,10 +2093,14 @@ Each is a one-liner, and each gets at least one test.
     advanced past it.
 49. A credential entry that cannot be read fresh is never overwritten, even with `--force`.
 50. An explicit login replacement is never undone by a capture from any profile, live or
-    quiescent (the login epoch).
+    quiescent (the login epoch). One that dies part-way is reconciled by the next holder of
+    the account lock, and never strands a profile's rotation.
 51. Every credential kind has a fingerprint (§2), so interrupted switches between accounts of
     any kind recover. Recovery never re-activates the vault on the absence of a live credential
     alone.
+52. A profile and the vault are compared only through the profile's seed, never by expiry. When
+    both have moved in an unknown order, nothing is captured, refreshed or overwritten until an
+    explicit replacement resolves it.
 
 ## Appendix C — cswap → tagteam command map
 
