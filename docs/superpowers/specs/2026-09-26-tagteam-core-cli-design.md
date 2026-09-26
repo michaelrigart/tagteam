@@ -39,8 +39,9 @@ tagteam is public OSS under the MIT license, built for macOS and Linux.
 
 1. A switch changes only the account identity. All other local Claude Code state is untouched
    (§3).
-2. A refresh-token generation is never lost, and a degraded or superseded generation is never
-   sent to the token endpoint (§7).
+2. Every refresh-token successor tagteam receives is persisted, to the vault or to `rescue/`,
+   and a degraded or superseded generation is never sent to the token endpoint (§7). The one
+   exception, both writes failing, is reported rather than silent (§7.3).
 3. Polling stays within the usage endpoint's budget across all tagteam processes on a machine
    (§8).
 4. The core commands match cswap on macOS and Linux (Appendix C), with JSON that existing
@@ -71,6 +72,8 @@ tagteam is public OSS under the MIT license, built for macOS and Linux.
 | Provider | An agent CLI that tagteam manages accounts for, identified by a `ProviderId` such as `claude-code` (§4.5) |
 | Identity surface | The exact set of provider-owned state a provider's switch may write (§3) |
 | Live login | The credential and `oauthAccount` that CC currently uses for the default profile |
+| Global config | CC's resolved global config file (Appendix A.1): `~/.claude/.config.json` where that legacy file exists, otherwise `~/.claude.json`. Written as `~/.claude.json` throughout |
+| Secure-storage dir | The directory CC keeps credentials and their locks under (Appendix A.1). Normally the config home |
 | Account | A login that tagteam stores and manages |
 | Position | The number users type to refer to an account. It is display and rotation order only |
 | Generation | One state of a refresh-token lineage. Its fingerprint is `sha256:<hex(sha256(refreshToken))>` |
@@ -93,7 +96,7 @@ state:
 
 | What is written | Written by |
 |---|---|
-| The active credential entry: Keychain `Claude Code-credentials[-hash]`, the managed-key item `Claude Code[-hash]`, or `<config_home>/.credentials.json` | switch, auto-switch, active-token refresh |
+| The account-scoped keys of the active credential entry (Keychain `Claude Code-credentials[-hash]` or `<secure-storage dir>/.credentials.json`), and the managed-key item `Claude Code[-hash]`. The entry's machine-shared keys (Appendix A.4) are carried over unchanged | switch, auto-switch, active-token refresh |
 | The `oauthAccount` value in `~/.claude.json` | switch, auto-switch |
 | `primaryApiKey`, and the `customApiKeyResponses.approved` list (append only), in `~/.claude.json` | activating or deactivating an API-key account |
 | The `projects` and `mcpServers` subtrees of `~/.claude.json`, by three-way merge (§12.4) | `tagteam run` on exit |
@@ -164,7 +167,9 @@ impl Engine {
 - **Lock order is carried by the guards.** A provider's `LiveLocks` can only be acquired from a
   held `MutationGuard`. Inside Claude Code's implementation, a `CcCredLocks` guard is taken first
   and a `CcConfigLock` only from a held `CcCredLocks`. Order: tagteam mutation lock → provider
-  live locks (for CC: credential locks → config lock).
+  live locks (for CC: credential locks → config lock). The one exception is a standalone
+  `CcConfigLock` for profile seeding and merge-back (§12.4), which take no credential lock while
+  holding it; taking a lone lock cannot invert the order.
 - **No network while holding a contended lock.** The single exception is the active-token
   refresh under CC's credential locks (§7.5), bounded at 6 s.
 
@@ -421,6 +426,11 @@ only.
   provider-agnostic: it never parses what it stores.
 - **Writes.** A write moves the current generation to `.prev` only when the lineage fingerprint
   changes.
+- **What automatic captures may write.** A capture that tagteam makes on its own (the switch's
+  outgoing capture, `run` capture, lazy capture, and active-token adoption) never writes a
+  degraded credential, and never replaces a credential that has a refresh token with one that
+  lacks it. Only the explicit commands `add`, `add-token` and `import` replace a login
+  wholesale.
 - **Deletes are strict.** Both generations are deleted on both backends. Errors propagate, and
   the deletion is verified with a tri-state read. A locked Keychain that still holds an item
   aborts the delete.
@@ -530,8 +540,10 @@ This procedure is the only place a stored refresh token is ever sent to the toke
    | `invalid_client` | Systemic. Never counts as a strike |
    | Anything else, including unparseable bodies | Transient |
 
-The rule behind this procedure: **a generation that has been consumed is never discarded.** It
-is either persisted to the vault or rescued.
+The rule behind this procedure: **a successor that tagteam has received is never discarded.**
+It is either persisted to the vault or rescued, and if both writes fail, the loss is reported
+(`Unpersisted`). A successor the server issued but tagteam never received, because the
+response was lost after the request was sent, cannot be recovered by any client.
 
 ### 7.4 Quarantine
 
@@ -716,17 +728,26 @@ with its own locks and surface.
 | Lock | Type | Path | Staleness | Acquire timeout |
 |---|---|---|---|---|
 | tagteam mutation lock | `flock(LOCK_EX)`, fd `O_CLOEXEC`, polled every 100 ms | `$XDG_DATA_HOME/tagteam/.mutation.lock` | n/a | 10 s (30 s for `run` bootstrap) |
-| CC OAuth refresh lock | `mkdir` directory lock | `<config_home>/.oauth_refresh.lock` | 60 s | 9 s |
-| CC legacy credential lock | `mkdir` | `<parent of config_home>/<basename>.lock` (`~/.claude.lock`) | 60 s | 9 s |
+| CC OAuth refresh lock | `mkdir` directory lock | `<secure-storage dir>/.oauth_refresh.lock`, symlinks not resolved | 60 s | 9 s |
+| CC legacy credential lock | `mkdir` | `<realpath(secure-storage dir)>.lock` (`~/.claude.lock`); the unresolved path if `realpath` fails | 60 s | 9 s |
 | CC config lock | `mkdir` | `<global config path>.lock` (`~/.claude.json.lock`) | 10 s | 9 s |
+
+Both credential locks are anchored at the secure-storage dir, not the config home; the two
+differ when `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set (Appendix A.1).
 
 The CC locks follow the `proper-lockfile` protocol:
 
 - `mkdir` acquires the lock.
 - On `EEXIST`, if `now − mtime > staleness`, `rmdir` it and retry. Otherwise sleep a jittered
   250–500 ms.
-- While the lock is held, a thread touches the directory's mtime every 3 s.
-- `Drop` releases it with `rmdir`, including on panic.
+- While the lock is held, a thread touches the directory's mtime every 3 s. CC touches every
+  5 s; both are well inside the staleness windows.
+- **Compromise detection.** Each touch first checks that the directory still exists and still
+  carries the mtime tagteam last set. If not, the lock has been taken over: the guard is marked
+  compromised, every write the lock protects checks that flag first and aborts, and `Drop` does
+  not remove the directory, which now belongs to someone else. This is `proper-lockfile`'s
+  `onCompromised`, which CC also honours.
+- `Drop` releases an uncompromised lock with `rmdir`, including on panic.
 - If the refresh lock is acquired but the legacy lock is contended, the refresh lock is
   released and the pair retried, as CC does.
 - tagteam **never writes `.oauth_refresh.lock.owner`**. An owner-less lock can be taken over
@@ -783,7 +804,10 @@ disabled. Every strategy works within one provider: a switch never crosses provi
      displacement aborts, except under `--force`.
    - Continue at step 5.
 3. **Read the live credential.** `Unreadable` → abort. `Present("")` → abort: never back up an
-   empty value, because a Keychain timeout can look empty.
+   empty value, because a Keychain timeout can look empty. `Degraded` → abort as well: the
+   Keychain item that could not be read may hold a newer generation than the file, and
+   overwriting it would lose that generation. Under `--force`, the degraded bytes are displaced
+   instead.
 4. **Classify the outgoing credential**, using the pre-lock oracle result only if the live bytes
    haven't changed since it was taken:
 
@@ -795,19 +819,27 @@ disabled. Every strategy works within one provider: a switch never crosses provi
    | `Foreign` | The oracle resolved it to another identity, known or not | **Displace**. This must succeed, or the switch aborts |
    | `Unresolved` | No oracle verdict, or the bytes moved since the oracle call | Write to the vault; `.prev` keeps the old generation recoverable. Log at WARN |
 
+   `OursRotated` and `Unresolved` are automatic captures, bound by §6.2: a live credential
+   without a refresh token never replaces a vault credential that has one. It is displaced
+   instead.
+
 5. **Compose the target credential.**
    - The account-scoped keys come from the vault: `claudeAiOauth`, `trustedDeviceToken`, and
      unknown sibling keys.
    - The machine-shared keys come from the **live** credential (Appendix A.4), and so does
      their absence: a key the machine no longer holds is not resurrected.
-   - With no live JSON credential, the target is used verbatim.
+   - With no live JSON credential, the target is used without its machine-shared keys: the
+     machine holds none, so none are taken from the vault.
 6. **Write the active credential** (Appendix A.3). The auth axis is single:
    - **Writing OAuth** deletes the managed-key item and drops `primaryApiKey`. The `approved`
      list is kept.
    - **Writing an API key** appends the key's last 20 characters to
      `customApiKeyResponses.approved`, stores the key in `Claude Code[-hash]` (or
-     `primaryApiKey` when the Keychain is unavailable), and clears OAuth: it deletes the
-     Keychain item and `.credentials.json`.
+     `primaryApiKey` when the Keychain is unavailable), and clears OAuth. Clearing OAuth
+     removes the account-scoped keys (`claudeAiOauth`, `trustedDeviceToken` and unknown
+     siblings) from the live credential entry and keeps its machine-shared keys, in the
+     Keychain item and in `.credentials.json` alike. An entry is deleted only when no
+     machine-shared key remains in it.
 7. **Splice** the target's `oauthAccount` into `~/.claude.json` (§9.5).
 8. **Commit** in one store transaction: set the active account, and insert an `events` row
    (`source` = `cli` or `auto`).
@@ -1083,6 +1115,7 @@ and auto-memory), `history.jsonl`, `CLAUDE.md`, `settings.json`, `keybindings.js
 |---|---|
 | `.credentials.json` | the profile's own credential |
 | `.claude.json` | the profile's own config; see §12.4 |
+| `.config.json` | CC's legacy global config, which CC prefers over `.claude.json` when it exists (Appendix A.1). Shared, it would make the profile read and write the default identity and config |
 | `sessions/`, `ide/` | per-profile process records |
 | `backups/` | CC's config backups; restoring from a shared one could cross profiles |
 | `.device-keys.json` | device key store (conservative) |
@@ -1110,7 +1143,8 @@ invalid, or stale-marked and quiescent.
 3. Write the vault credential to `<profile>/.credentials.json` (0600). CC migrates it into its
    own hashed item on first write; tagteam never writes that item.
 4. Seed `<profile>/.claude.json` (§12.4).
-5. Validate with `claude auth status --json` (probe environment, 10 s timeout). The profile is
+5. Validate with `claude auth status --json`, in exactly the session environment (§12.5), with
+   a 10 s timeout. The profile is
    valid when `rc == 0`, `loggedIn === true`, `authMethod == "claude.ai"`, the `email` matches,
    and the `orgId` matches when both are present.
    - A timeout or unparseable output is `unknown`.
@@ -1119,8 +1153,11 @@ invalid, or stale-marked and quiescent.
 
 ### 12.4 Profile `.claude.json`: seed and merge-back
 
-**Seed, on every launch.** Start from the profile's current file, or `{}` if there is none.
-Then:
+**Seed, on every launch into a quiescent profile.** A launch into a profile that already has a
+live session joins it without seeding, so a running session's changes and its baseline are
+never overwritten (Appendix B.28). If a baseline is left over from a session whose merge-back
+never ran (its `tagteam` parent was killed), that merge-back runs first. Then start from the
+profile's current file, or `{}` if there is none, and:
 - copy `projects` and top-level `mcpServers` from `~/.claude.json`
 - set `oauthAccount` from the account
 - set `hasCompletedOnboarding: true`, and set `theme` if absent (from the default file, else
@@ -1151,9 +1188,15 @@ waits.
 
 **Environment.** These variables are scrubbed from the session environment, with a warning:
 `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
-`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`. They are not
-scrubbed on the plain-`claude` fast path. A pre-set `CLAUDE_CONFIG_DIR` is overridden, with a
-warning.
+`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`,
+`CLAUDE_SECURESTORAGE_CONFIG_DIR`. They are not scrubbed on the plain-`claude` fast path. A
+pre-set `CLAUDE_CONFIG_DIR` is overridden, with a warning.
+
+Removing `CLAUDE_SECURESTORAGE_CONFIG_DIR` makes the secure-storage dir resolve to the profile
+(Appendix A.1). Set to an empty string, it would send CC to the default `~/.claude` credentials;
+set to anything else, it would redirect them. Every profile credential operation (bootstrap,
+validation, capture, and the hashed-item deletion in `remove`) resolves paths with this same
+environment.
 
 **When the child exits,** if the profile is quiescent:
 1. **Capture.** Adopt the profile's credential into the vault if it is a newer generation of the
@@ -1471,10 +1514,13 @@ anything fails.
 
   After *every* mutating command, and after `run` with merge-back disabled, the test asserts
   that every file outside the identity surface is byte-identical, and that `~/.claude.json` is
-  byte-identical outside the `oauthAccount` span. It also asserts that no provider's command
-  touches another provider's home.
-- **Refresh tokens.** For every error injected after the token POST, the successor ends up in
-  the vault or in `rescue/`, never lost.
+  byte-identical outside the `oauthAccount` span. The active credential entry is inside the
+  surface only for its account-scoped keys: its machine-shared keys are compared by value and
+  must be unchanged after every command, including API-key activation and switching back. It
+  also asserts that no provider's command touches another provider's home.
+- **Refresh tokens.** For every error injected after a token response is received, the
+  successor ends up in the vault or in `rescue/`. When both writes are made to fail, the
+  command reports `Unpersisted`.
 - **Degraded reads.** A degraded read never reaches the token endpoint. This is a compile-time
   guarantee, backed by a test that attempts it through the public API.
 
@@ -1485,6 +1531,9 @@ anything fails.
   - hot reload after a switch (file mtime, and the Keychain within 30 s)
   - CC reads tagteam-written Keychain items silently from a non-GUI (SSH) session, which covers
     risk R1
+  - the existence probe's result on a locked Keychain, which decides whether a file-fallback
+    activation can commit (Appendix A.3)
+  - CC runs on an API key while the credential entry keeps only machine-shared keys (§9.4)
   - lock interop while CC refreshes
 - **A weekly CI job** installs the latest `claude` and runs the checks that need no account:
   version, the `auth status` shape when logged out, and top-level `~/.claude` entries against
@@ -1534,7 +1583,11 @@ providers.
   `~/.claude`.
 - **Plaintext credential:** `<secure-storage dir>/.credentials.json`.
 - **Secure-storage dir:** if `CLAUDE_SECURESTORAGE_CONFIG_DIR` is *defined* (even empty), use it
-  NFC-normalized, with empty meaning `~/.claude`. Otherwise use the config home.
+  NFC-normalized, with empty meaning `~/.claude`, whatever `CLAUDE_CONFIG_DIR` says. Otherwise
+  use the config home.
+- **Credential locks:** `<secure-storage dir>/.oauth_refresh.lock` (symlinks not resolved) and
+  `<realpath(secure-storage dir)>.lock`, both `proper-lockfile` with stale 60 s and update 5 s
+  (§9.1).
 - **Session records:** `<config_home>/sessions/<pid>.json`. **IDE locks:**
   `<config_home>/ide/<port>.lock`.
 
@@ -1571,12 +1624,18 @@ providers.
 - **Delete:** `delete-generic-password -a <acct> -s <svc>`. rc 44 counts as success.
 - **Active reads** retry the Keychain twice, 300 ms apart. CC caches Keychain reads for 30 s and
   serves its stale cache on a read failure.
+- **CC's read precedence.** CC reads the Keychain first and `.credentials.json` only as a
+  fallback. Its default read treats *any* Keychain failure as absent and falls through to the
+  file; only its refresh path reads the Keychain strictly.
 - **Hot reload.** CC invalidates its memoized token when the mtime of `.credentials.json`
   changes.
   - After a Keychain write, rewrite `.credentials.json` with the same bytes if it *already
     exists*, to bump its mtime. Never create it.
-  - If a write falls back to the file, best-effort delete the Keychain item (CC reads the
-    Keychain first) and pin file mode for the rest of the process.
+  - **File fallback.** If the Keychain write fails and the write falls back to the file, the
+    old Keychain item must then be deleted and verified `Absent` with the existence probe,
+    because CC would keep reading it the moment the Keychain is readable. Only then does the
+    activation commit, and file mode is pinned for the rest of the process. If the item cannot
+    be verified absent, the switch rolls back.
 - **Vault reads on macOS.** The Keychain is primary. A Linux-style file vault is never used on
   macOS; the fallback for a failed vault write is `rescue/` (§6.3).
 
@@ -1633,7 +1692,8 @@ refreshes them itself (*inferred*).
 Each is a one-liner, and each gets at least one test.
 
 1. Reads are tri-state; "unreadable" never becomes "absent" or empty.
-2. A degraded read is never consumed or captured into the vault.
+2. A degraded read is never consumed or captured into the vault, and an automatic capture never
+   replaces a refresh token with a credential that lacks one.
 3. A check-then-use uses the bytes that were checked; it never re-reads.
 4. An empty or unreadable live read never overwrites a vault generation.
 5. Bytes that are not ours are displaced before being overwritten, and a failed displacement
@@ -1649,7 +1709,8 @@ Each is a one-liner, and each gets at least one test.
 12. Atomic writes go through symlinks, with the temp file beside the resolved target.
 13. Lock order is fixed and matches CC's. CC's credential locks go stale only after 60 s.
 14. No network while holding a contended lock, except the bounded active refresh (§7.5).
-15. A consumed refresh generation is never discarded.
+15. A received refresh successor is never discarded; if both persistence paths fail, the loss
+    is reported.
 16. A permanent (Dead) verdict requires a top-level `invalid_grant`, or a structurally complete
     credential with no refresh token, and a re-read showing the lineage unchanged.
 17. A quarantine is bound to the fingerprint that was sent; any fingerprint change clears it.
