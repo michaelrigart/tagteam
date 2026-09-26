@@ -2,8 +2,10 @@
 
 **Status:** Approved
 **Date:** 2026-09-26
-**Scope:** Sub-project 1 of 4. The daemon (2), TUI (3) and macOS menu bar (4) get their own
-specs and must not require reshaping anything defined here.
+**Scope:** Sub-project 1 of 4, plus a provider extension point. The daemon (2), TUI (3) and
+macOS menu bar (4) get their own specs and must not require reshaping anything defined here.
+The same holds for further agent CLIs added as providers (5+: Codex first, then others such as
+Gemini CLI or Grok).
 
 **Reference implementation.** [realiti4/claude-swap](https://github.com/realiti4/claude-swap)
 (MIT) at commit `9aa6d02` (v0.27.0b1). Citations take the form `cswap:<file>:<line>` and are
@@ -14,9 +16,14 @@ relative to `src/claude_swap/`. Claude Code facts were verified against Claude C
 
 ## 1. Purpose
 
-tagteam is a multi-account switcher for Claude Code. It stores several Claude logins, switches
-the active one, runs accounts side by side, and switches automatically before a rate limit. It
-is a Rust rewrite of claude-swap ("cswap"), aiming for:
+tagteam is a multi-account switcher for AI coding agent CLIs, starting with Claude Code. It
+stores several logins per agent, switches the active one, runs accounts side by side, and
+switches automatically before a rate limit.
+
+The engine is **provider-neutral**. Every agent-specific behaviour lives behind the `Provider`
+trait (§4.5), and Claude Code is the first and, in this sub-project, only implementation.
+
+For Claude Code, tagteam is a Rust rewrite of claude-swap ("cswap"), aiming for:
 
 - **A single static binary** with instant startup and no Python runtime.
 - **A cleaner architecture**: bounded crates, one transactional store, and read/provenance
@@ -51,12 +58,18 @@ tagteam is public OSS under the MIT license, built for macOS and Linux.
   menu bar (#4).
 - **Migrating a cswap store.** Only cswap *export files* can be imported.
 - **Self-upgrade and update checks.** Package managers handle upgrades.
+- **Providers other than Claude Code.** Codex, Gemini CLI, Grok and others each get their own
+  sub-project and spec. Before that spec, their storage, identity, refresh, usage and locking
+  must be verified against the real CLI. This sub-project only guarantees they can be added
+  without reshaping the store, the engine or the CLI.
 
 ## 2. Terminology
 
 | Term | Meaning |
 |---|---|
 | CC | Claude Code |
+| Provider | An agent CLI that tagteam manages accounts for, identified by a `ProviderId` such as `claude-code` (§4.5) |
+| Identity surface | The exact set of provider-owned state a provider's switch may write (§3) |
 | Live login | The credential and `oauthAccount` that CC currently uses for the default profile |
 | Account | A login that tagteam stores and manages |
 | Position | The number users type to refer to an account. It is display and rotation order only |
@@ -67,10 +80,16 @@ tagteam is public OSS under the MIT license, built for macOS and Linux.
 
 ## 3. The local-state invariant (hard requirement)
 
-Switching accounts must never affect local Claude Code state: memory, `CLAUDE.md`, history,
-projects, settings, skills, agents, commands, plugins or MCP configuration.
+Switching accounts must never affect an agent's local state: memory, instruction files,
+history, projects, settings, skills, agents, commands, plugins or MCP configuration.
 
-The complete list of writes tagteam makes to CC-owned state:
+**This holds for every provider.** Each provider declares its **identity surface**: the exact,
+closed list of provider-owned state that its switch, refresh and `run` paths may write.
+Everything outside that list is off-limits. The pinned test in §15.3 is generic: it runs once
+per provider, against that provider's fixture home and declared surface.
+
+The Claude Code identity surface is the complete list of writes tagteam makes to CC-owned
+state:
 
 | What is written | Written by |
 |---|---|
@@ -91,18 +110,28 @@ A test pins this invariant (§15.3).
 
 | Crate | Responsibility | I/O |
 |---|---|---|
-| `tagteam-cc` | Everything whose shape CC dictates: path and store resolution, Keychain naming, the `/usr/bin/security` driver, reads and writes of the active credential (OAuth and managed-key axes), CC's `proper-lockfile` lock protocol, the span-preserving `~/.claude.json` splice, session records, and pid liveness | Yes, isolated behind traits |
-| `tagteam-core` | Pure domain types and policy: identities, usage windows, headroom, poll planning, backoff, pace and projection, outgoing-credential classification, and auto-switch `decide()` | None; time is passed in |
-| `tagteam-engine` | The SQLite store, the vault, the HTTP client (token, profile and usage endpoints), and the operations built on them: switch, refresh gate, usage collector, auto-switch loop, sessions, export/import, doctor | Yes |
+| `tagteam-core` | Pure, provider-neutral domain types and policy: `ProviderId`, identities, generic usage windows, headroom, poll planning, backoff, pace and projection, outgoing-credential classification, and auto-switch `decide()` | None; time is passed in |
+| `tagteam-provider` | The `Provider` trait (§4.5) and the I/O primitives that providers share: `Read<T>` and provenance, `FreshCredential`, the atomic write-through-symlink writer, the span-preserving JSON splice, the `/usr/bin/security` driver, `mkdir` and `flock` lock helpers, pid liveness, and the `Http` and `Clock` ports | Primitives only |
+| `tagteam-cc` | `impl Provider for ClaudeCode`: everything whose shape CC dictates — path and store resolution, Keychain naming, reads and writes of the active credential (OAuth and managed-key axes), CC's `proper-lockfile` lock protocol, `~/.claude.json` handling, endpoints, poll budget, session records and profile handling | Yes, through `tagteam-provider` |
+| `tagteam-engine` | The SQLite store, the vault, the `ureq`-backed `Http` implementation, the provider registry, and the provider-generic operations: switch, refresh gate, usage collector, auto-switch loop, sessions, export/import, doctor | Yes |
 | `tagteam` | The CLI binary (clap), human and JSON rendering, and the prompts | Thin |
+
+**Dependency rules.**
+- A provider crate depends only on `tagteam-core` and `tagteam-provider`, never on
+  `tagteam-engine`.
+- The engine reaches a provider only through the trait. Nothing in `tagteam-engine` names a CC
+  path, key or endpoint.
+- A future provider is one new crate, such as `tagteam-codex`, plus one line in the registry.
 
 Later sub-projects add crates that depend on `tagteam-engine`: `tagteam-daemon`, `tagteam-tui`
 and `tagteam-menubar`.
 
 ### 4.2 Engine surface
 
-`Engine` is built from an injected `Env` and a set of ports: `Keychain`, `Clock`, `Http`,
-`ProcessProbe` and `ClaudeCli`. Its operations return typed outcomes:
+`Engine` is built from an injected `Env`, a `ProviderRegistry`, and a set of ports: `Keychain`,
+`Clock`, `Http` and `ProcessProbe`. Every account-scoped operation resolves the account's
+provider from the registry. Operations that take no account take a `ProviderId`, which
+defaults to `default_provider` (§6.4). Its operations return typed outcomes:
 
 ```rust
 impl Engine {
@@ -132,9 +161,10 @@ impl Engine {
   read is one where the Keychain lookup failed and the plaintext file covered it, so the bytes
   may be a superseded generation. The refresh gate accepts only `FreshCredential`, which cannot
   be built from a degraded read.
-- **Lock order is carried by the guards.** A `CcCredLocks` guard can only be acquired from a
-  held `MutationGuard`, and a `CcConfigLock` only from a held `CcCredLocks`. Order: tagteam
-  mutation lock → CC credential locks → CC config lock.
+- **Lock order is carried by the guards.** A provider's `LiveLocks` can only be acquired from a
+  held `MutationGuard`. Inside Claude Code's implementation, a `CcCredLocks` guard is taken first
+  and a `CcConfigLock` only from a held `CcCredLocks`. Order: tagteam mutation lock → provider
+  live locks (for CC: credential locks → config lock).
 - **No network while holding a contended lock.** The single exception is the active-token
   refresh under CC's credential locks (§7.5), bounded at 6 s.
 
@@ -153,6 +183,74 @@ impl Engine {
 - **Logging.** `tracing` to a rolling file, controlled by `--debug` or `TAGTEAM_LOG`. Log lines
   identify accounts by position and ID, never by email, because users paste logs into public
   issues.
+
+### 4.5 The `Provider` trait
+
+The trait is the only way the engine touches agent-specific state. The sketch below shows its
+shape; exact signatures are settled in the plan.
+
+```rust
+pub trait Provider: Send + Sync {
+    // Identity and capabilities
+    fn id(&self) -> ProviderId;                        // "claude-code"
+    fn display_name(&self) -> &'static str;           // "Claude Code"
+    fn capabilities(&self) -> Capabilities;           // usage, refresh, api_keys, sessions, statusline
+    fn identity_surface(&self, env: &Env) -> IdentitySurface;   // §3; drives the pinned test
+
+    // The live login
+    fn live_identity(&self, env: &Env) -> Read<LiveIdentity>;
+    fn read_active(&self, env: &Env) -> Read<Credential>;        // carries provenance
+    fn lock_live<'g>(&self, env: &Env, g: &'g MutationGuard) -> Result<LiveLocks<'g>>;
+    fn activate(&self, env: &Env, locks: &LiveLocks, target: &StoredLogin,
+                live: Read<&Credential>) -> Result<ActivationUndo>;   // compose + write surface
+    fn capture(&self, env: &Env) -> Result<CapturedLogin>;             // for `add`
+
+    // Credential semantics
+    fn classify(&self, bytes: &[u8]) -> CredentialKind;
+    fn fingerprint(&self, cred: &Credential) -> Fingerprint;          // lineage
+    fn expiry(&self, cred: &Credential) -> Expiry;
+
+    // Network (the engine supplies the Http port and owns leases, CAS and rescue)
+    fn refresh(&self, http: &dyn Http, cred: &FreshCredential) -> RefreshResult;
+    fn resolve_owner(&self, http: &dyn Http, cred: &Credential) -> Option<Identity>;
+    fn fetch_usage(&self, http: &dyn Http, cred: &Credential) -> UsageResult; // generic windows
+    fn poll_budget(&self) -> PollBudget;              // the §8.6 constants for this provider
+
+    // Parallel sessions
+    fn launch_command(&self) -> &'static str;         // "claude"
+    fn session_env(&self, profile: &Path) -> SessionEnv;   // vars to set and vars to scrub
+    fn share_policy(&self, env: &Env) -> SharePolicy;      // source home + denylist (§12.2)
+    fn seed_profile / capture_profile / merge_back(...);   // §12.3–12.5
+    fn session_records(&self, profile: &Path) -> Read<Vec<SessionRecord>>;
+    fn validate_profile(&self, profile: &Path) -> Validity;
+
+    // Diagnostics
+    fn doctor_checks(&self, env: &Env) -> Vec<Check>;
+}
+```
+
+**Capabilities are explicit.** A provider may lack a usage endpoint or refreshable tokens, and
+the engine degrades rather than failing:
+- Without `usage`: accounts show `usageStatus: unsupported`, and auto-switch can only fail over
+  on authentication failure.
+- Without `sessions`: `run` refuses for that provider.
+- Without `statusline`: the `statusline` command refuses for that provider.
+
+**Usage windows are generic:** `Window { key, label, kind, pct, resets_at, period_s }`, where
+`kind` is one of `Short | Long | Spend | Scoped`.
+- Claude Code maps `5h` → `Short`, `7d` → `Long` (period 604800 s), `spend` → `Spend`, and each
+  per-model limit → `Scoped(name)`.
+- Pace and projection (§8.7) apply to `Long` and `Scoped` windows that have a known period.
+- Headroom and decisions (§8.2, §11) are defined over "relevant windows" rather than fixed
+  names.
+
+**The engine owns every cross-provider guarantee.** Leases, the refresh gate's CAS and rescue,
+quarantine, the vault, the store, backoff, the auto-switch policy, the switch transaction's
+ordering and rollback, and the local-state test are all generic. A provider supplies only the
+agent-specific facts.
+
+This trait is internal API, not a public plugin interface. It is expected to change when the
+second provider lands (§17, R7).
 
 ## 5. Platforms and paths
 
@@ -191,22 +289,24 @@ Transactions are short. No transaction is held across a network call or a `secur
 
 ```sql
 CREATE TABLE accounts (
-  id               TEXT PRIMARY KEY,          -- UUIDv7, immutable storage key
-  position         INTEGER NOT NULL UNIQUE,   -- user-facing number, >= 1
+  id               TEXT PRIMARY KEY,          -- UUIDv7, immutable storage key (unique across providers)
+  provider         TEXT NOT NULL,             -- ProviderId, e.g. 'claude-code'
+  position         INTEGER NOT NULL,          -- user-facing number, >= 1, per provider
   email            TEXT NOT NULL,
-  org_uuid         TEXT NOT NULL DEFAULT '',  -- '' = personal
+  org_uuid         TEXT NOT NULL DEFAULT '',  -- org/workspace id; '' = personal
   org_name         TEXT,
-  account_uuid     TEXT,                      -- NULL until known; backfilled only while NULL
+  account_uuid     TEXT,                      -- provider account id; NULL until known; backfilled only while NULL
   kind             TEXT NOT NULL CHECK (kind IN ('oauth','setup_token','api_key')),
-  alias            TEXT UNIQUE COLLATE NOCASE,
+  alias            TEXT UNIQUE COLLATE NOCASE,  -- unique across providers, so an alias alone is unambiguous
   disabled         INTEGER NOT NULL DEFAULT 0,
-  oauth_account    TEXT NOT NULL,             -- JSON: the oauthAccount object only
-  login_expires_at INTEGER,                   -- epoch ms, from refreshTokenExpiresAt
+  identity_json    TEXT NOT NULL,             -- provider-owned identity object (CC: the oauthAccount object only)
+  login_expires_at INTEGER,                   -- epoch ms (CC: refreshTokenExpiresAt)
   quarantine_reason TEXT,                     -- 'invalid_grant' | 'no_refresh_token' | 'identity_conflict'
   quarantine_fp    TEXT,                      -- fingerprint the quarantine is bound to
   quarantine_at    INTEGER,
   added_at         INTEGER NOT NULL,
-  UNIQUE (email, org_uuid)
+  UNIQUE (provider, position),
+  UNIQUE (provider, email, org_uuid)
 );
 
 CREATE TABLE usage_state (
@@ -225,7 +325,7 @@ CREATE TABLE usage_state (
 
 CREATE TABLE usage_samples (
   account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-  window     TEXT NOT NULL,   -- '5h' | '7d' | 'spend' | 'scoped:<model display name>'
+  window     TEXT NOT NULL,   -- provider window key; CC: '5h' | '7d' | 'spend' | 'scoped:<model display name>'
   fetched_at INTEGER NOT NULL,
   pct        REAL NOT NULL,
   resets_at  INTEGER,
@@ -233,13 +333,13 @@ CREATE TABLE usage_samples (
 ) WITHOUT ROWID;
 
 CREATE TABLE leases (
-  name       TEXT PRIMARY KEY,  -- 'refresh:<id>' | 'usage:<id>' | 'autoswitch'
+  name       TEXT PRIMARY KEY,  -- 'refresh:<id>' | 'usage:<id>' | 'autoswitch:<provider>'
   holder     TEXT NOT NULL,     -- random UUID per acquisition
   expires_at INTEGER NOT NULL   -- epoch ms, wall clock
 );
 
-CREATE TABLE autoswitch_state (
-  singleton         INTEGER PRIMARY KEY CHECK (singleton = 1),
+CREATE TABLE autoswitch_state (       -- one row per provider; auto-switch never crosses providers
+  provider          TEXT PRIMARY KEY,
   last_switch_at    INTEGER,
   last_switch_from  TEXT,
   last_switch_to    TEXT,
@@ -252,6 +352,7 @@ CREATE TABLE autoswitch_state (
 
 CREATE TABLE events (
   at        INTEGER NOT NULL,
+  provider  TEXT NOT NULL,
   kind      TEXT NOT NULL,      -- 'switch' | 'quarantine' | 'unquarantine' | 'add' | 'remove' | ...
   from_id   TEXT, to_id TEXT,
   trigger   TEXT,               -- 'manual' | 'proactive' | 'at-limit' | 'failover' | 'consume-first'
@@ -259,14 +360,17 @@ CREATE TABLE events (
   detail    TEXT                -- JSON
 );
 
-CREATE TABLE mappings (
-  path       TEXT PRIMARY KEY,  -- canonical absolute directory path
+CREATE TABLE mappings (         -- one directory can map to one account per provider
+  path       TEXT NOT NULL,     -- canonical absolute directory path
+  provider   TEXT NOT NULL,
   account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-  added_at   INTEGER NOT NULL
+  added_at   INTEGER NOT NULL,
+  PRIMARY KEY (path, provider)
 );
 
 CREATE TABLE displaced (
   id          TEXT PRIMARY KEY, -- file stem
+  provider    TEXT NOT NULL,
   at          INTEGER NOT NULL,
   reason      TEXT NOT NULL,    -- 'displaced-live-login' | 'forced-activation' | ...
   fingerprint TEXT NOT NULL,
@@ -274,17 +378,19 @@ CREATE TABLE displaced (
 );
 
 CREATE TABLE live_identity_cache (   -- speeds up statusline and list; the file wins if it disagrees
-  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  provider  TEXT PRIMARY KEY,
   path TEXT, mtime_ns INTEGER, size INTEGER, email TEXT, org_uuid TEXT, account_uuid TEXT
 );
 ```
 
-**Identity.** An account's identity is `(email, org_uuid)`, and `account_uuid` corroborates it.
-Attributing a credential to a *different* account requires a positive uuid match: an
-email-and-org match whose uuid conflicts is a different account, for example a recycled email.
+**Identity.** An account's identity is `(provider, email, org_uuid)`, and `account_uuid`
+corroborates it. Attributing a credential to a *different* account requires a positive uuid
+match: an email-and-org match whose uuid conflicts is a different account, for example a
+recycled email. The same email under two providers is two accounts.
 
-**Positions.** A new account gets `max(position) + 1`, and gaps are never reused. `move` only
-reorders, since storage is keyed by `id`. A move target must be ≤ `max(99, max(position))`.
+**Positions** are numbered per provider. A new account gets `max(position) + 1` within its
+provider, and gaps are never reused. `move` only reorders, since storage is keyed by `id`. A
+move target must be ≤ `max(99, max(position))` within the provider.
 
 **Leases.** A lease is taken with a single statement:
 
@@ -310,8 +416,9 @@ only.
 | macOS | Keychain generic password, service `tagteam`, account `<id>` | account `<id>.prev` |
 | Linux | `vault/<id>.json` (0600, directory 0700) | `vault/<id>.prev.json` |
 
-- **Contents.** The bytes are stored raw: the CC credential JSON, or an `sk-ant-api…` string for
-  API-key accounts.
+- **Contents.** The bytes are stored raw, in whatever form the provider defines. For CC that is
+  the credential JSON, or an `sk-ant-api…` string for API-key accounts. The vault is
+  provider-agnostic: it never parses what it stores.
 - **Writes.** A write moves the current generation to `.prev` only when the lineage fingerprint
   changes.
 - **Deletes are strict.** Both generations are deleted on both backends. Errors propagate, and
@@ -343,8 +450,15 @@ frozen into the file.
 - **`set` and `unset` are strict.** They refuse to write to a corrupt file.
 - **Booleans** parse only `true/false/1/0/yes/no`.
 
+**Provider overrides.** The `[autoswitch]` table holds defaults for every provider. A
+`[provider.<id>.autoswitch]` table overrides individual keys for one provider, for example
+`tagteam config set provider.claude-code.autoswitch.models Fable`. Keys that only make sense for
+one provider (`models`, `statusline.*`) are read from that provider's table first, then from
+the global table.
+
 | Key | Default | Valid |
 |---|---|---|
+| `default_provider` | `claude-code` | a registered `ProviderId` |
 | `autoswitch.threshold` | 90.0 | 50–99.9 |
 | `autoswitch.interval_seconds` | 60 | 15–3600 |
 | `autoswitch.cooldown_seconds` | 300 | 0–86400 |
@@ -495,7 +609,8 @@ The normalized usage object is stored as `last_good`:
   `display_name` and a numeric `percent`.
 - An empty result normalizes to `None`.
 
-The **relevant windows** for decisions are 5h and 7d, plus any scoped windows whose names
+Each provider declares which of its windows are relevant. For Claude Code, the **relevant
+windows** for decisions are 5h and 7d, plus any scoped windows whose names
 match `autoswitch.models` case-insensitively (`all` matches every scoped window). Spend never
 counts.
 
@@ -590,6 +705,12 @@ points of the threshold, or its usage is unknown for a reason other than an expi
 
 ## 9. Switch
 
+The engine owns the transaction's shape: special cases, classification, displacement, ordering,
+commit and rollback. The provider supplies the live locks (`lock_live`), the reads, and the
+writes of its identity surface (`activate`). Everything below is written for the Claude Code
+provider, whose `activate` is steps 5–7 of §9.4. Another provider reuses the same transaction
+with its own locks and surface.
+
 ### 9.1 Locks
 
 | Lock | Type | Path | Staleness | Acquire timeout |
@@ -642,8 +763,8 @@ These are decided before locking and re-checked afterwards.
 | `switch --strategy best` | best | the live account | Switch only if some switchable account has strictly more headroom. Ties stay put |
 | `switch <ACCOUNT>` | direct | — | Disabled accounts are allowed as explicit targets |
 
-"Switchable" means the account has a vault credential and an `oauth_account`, and is not
-disabled. `best` and `next-available` also exclude quarantined accounts.
+"Switchable" means the account has a vault credential and an `identity_json`, and is not
+disabled. Every strategy works within one provider: a switch never crosses providers. `best` and `next-available` also exclude quarantined accounts.
 
 ### 9.4 Transaction
 
@@ -773,11 +894,11 @@ Captures the live login.
 
 An `ACCOUNT` argument is resolved in this order:
 
-1. All digits: a position.
-2. An alias.
-3. An exact email.
+1. All digits: a position within the chosen provider (§13.1).
+2. An alias. Aliases are unique across providers, so an alias alone identifies the provider.
+3. An exact email, within `--provider` if given, otherwise across all providers.
 
-If an email matches several orgs, it is ambiguous:
+If an email matches several orgs, or several providers, it is ambiguous:
 - On a terminal, prompt with the candidates.
 - With `--json`, or with no terminal, fail with an error listing the candidates.
 
@@ -792,6 +913,13 @@ An empty alias never matches.
   `beats_by_hysteresis`, `recovered_since_departure`, `recovery_axis_useful`, …), each unit
   tested.
 - **`tagteam-engine`:** fetch, freshen, switch, record and emit.
+- **Per provider.** `tagteam auto` runs one independent engine per provider that has at least
+  two switchable accounts, or only the provider given with `--provider`. Each has its own
+  `autoswitch_state` row, `autoswitch:<provider>` lease, settings (§6.4) and poll budget.
+  Nothing on one provider ever triggers a switch on another. Every JSONL event carries an
+  additive `provider` field.
+- **`--once` with several providers** exits with the most severe outcome: `1` if any provider
+  errored, else `0` if any switched, else `3` if any was blocked, else `2`.
 
 ### 11.2 Tick
 
@@ -923,10 +1051,14 @@ rates, 5h and 7d resets, 429s, dead tokens, and unknown readings. It asserts:
 
 ### 12.1 Invocation
 
-`tagteam run [ACCOUNT] [--require-session] [-- <claude args>]`
+`tagteam run [ACCOUNT] [--provider P] [--require-session] [-- <agent args>]`
+
+The command launched is the provider's `launch_command` (`claude` for Claude Code). The rest of
+this section describes the Claude Code provider; the sharing, liveness and capture rules are
+engine-generic, with the provider supplying paths, the denylist and the env vars.
 
 - **With no `ACCOUNT`,** use the nearest mapped ancestor of the current directory's canonical
-  path.
+  path, for the provider given with `--provider` (default: `default_provider`).
   - A mapping to a removed account: warn and run plain `claude`.
   - No mapping: run plain `claude` with an untouched environment.
 - **API-key accounts** are refused.
@@ -1061,20 +1193,34 @@ destructive operations.
 
 ### 12.7 Mappings and the shell wrapper
 
-- **`tagteam map [ACCOUNT] [PATH]`** maps a directory. `PATH` defaults to the current directory
-  and is stored as its canonical absolute path. With no arguments, `map` lists the mappings.
-- **`tagteam unmap [PATH]`** removes a mapping.
-- Subdirectories inherit the nearest mapped ancestor.
-- **`tagteam shell-init zsh|bash|fish`** prints a `claude` wrapper function. In a mapped
-  directory it runs `tagteam run -- "$@"`; elsewhere it runs `command claude "$@"`. It's opt-in,
-  added by the user to their shell rc.
+- **`tagteam map [ACCOUNT] [PATH]`** maps a directory for the account's provider. `PATH`
+  defaults to the current directory and is stored as its canonical absolute path. With no
+  arguments, `map` lists the mappings. A directory can hold one mapping per provider.
+- **`tagteam unmap [PATH] [--provider P]`** removes a mapping (all providers' mappings for that
+  path if `--provider` is omitted).
+- Subdirectories inherit the nearest mapped ancestor, per provider.
+- **`tagteam shell-init zsh|bash|fish`** prints one wrapper function per registered provider
+  that supports sessions (for now, `claude`). In a directory mapped for that provider, the
+  wrapper runs `tagteam run --provider <id> -- "$@"`; elsewhere it runs
+  `command <launch_command> "$@"`. It's opt-in, added by the user to their shell rc.
 
 ## 13. CLI
 
 ### 13.1 Commands
 
-`tagteam [--json] [--debug] [--no-color] <command>`. A bare `tagteam` runs `list`, until the
-TUI lands in sub-project 3.
+`tagteam [--json] [--debug] [--no-color] [--provider P | -p P] <command>`. A bare `tagteam` runs
+`list`, until the TUI lands in sub-project 3.
+
+**Which provider a command acts on:**
+1. an explicit `--provider`
+2. the provider of the account the command references, when the reference is an alias or an
+   email that is unique across providers
+3. `default_provider` (`claude-code`)
+
+A bare position (`switch 2`) always means that position within the provider chosen by rule 1
+or 3. `list`, `status` and `doctor` cover every provider that has accounts, grouped by
+provider, unless `--provider` narrows them. With a single provider in use, the output looks
+exactly as it would without providers.
 
 | Command | Notes |
 |---|---|
@@ -1090,15 +1236,21 @@ TUI lands in sub-project 3.
 | `displaced [--purge ID]` | §6.3 |
 | `config` | §6.4 |
 | `doctor [--online]` | §13.6 |
-| `completions <shell>`, `purge` | `purge` deletes all tagteam data, including the vault Keychain items and the profiles' hashed items, after a confirmation (or `--yes`). It never touches CC's live login |
+| `completions <shell>`, `purge` | `purge` deletes all tagteam data, including the vault Keychain items and the profiles' hashed items, after a confirmation (or `--yes`). It never touches any provider's live login. `--provider` limits it to one provider's accounts |
 
 **Exit codes:** `0` OK · `1` error · `2` usage error · `130` interrupted. `auto --once` uses
 0–3.
 
 ### 13.2 JSON output (`schemaVersion: 1`)
 
-**Compatibility.** The field names are cswap-compatible so existing scripts port unchanged. Two
-fields are added: `id` and `position` (`number` equals `position`).
+**Compatibility.** The field names are cswap-compatible so existing scripts port unchanged. Three
+fields are added: `id`, `position` (`number` equals `position`) and `provider`.
+
+**Several providers.** Every row, `status` object, `switch` result and auto event carries
+`provider`. At the top level, `activeAccountNumber` refers to `default_provider` (for cswap
+compatibility), and the additive `activeByProvider: {"<provider>": <number>|null}` covers all
+of them. `status --json` with more than one provider returns the default provider's object plus
+an additive `others: [ … ]` array.
 
 **Rules:**
 - The output is one JSON object on stdout; warnings and notices go to stderr.
@@ -1114,7 +1266,8 @@ Each row:
   `usageStatus` is `unavailable`, also `usageError` and `usageRetryAt`.
 
 `usageStatus` is one of `ok | token_expired | api_key | keychain_unavailable | relogin_required
-| foreign_credential | no_credentials | unavailable`.
+| foreign_credential | no_credentials | unavailable | unsupported`. `unsupported` is for providers
+without the `usage` capability; it never occurs for Claude Code.
 
 `usage` is decision-grade only (§8.4):
 - `fiveHour {pct, resetsAt?}`
@@ -1159,7 +1312,7 @@ tested.
 ```json
 { "format": "tagteam-export", "version": 1, "exportedAt": "…Z", "exportedFrom": "macos|linux",
   "tagteamVersion": "…", "activePosition": 2,
-  "accounts": [ { "position": 2, "email": "…", "accountUuid": "…", "organizationUuid": "",
+  "accounts": [ { "provider": "claude-code", "position": 2, "email": "…", "accountUuid": "…", "organizationUuid": "",
                   "organizationName": null, "kind": "oauth", "alias": "dev", "disabled": false,
                   "addedAt": "…Z", "oauthAccount": { … },
                   "credential": { "claudeAiOauth": { … } } } ] }
@@ -1177,6 +1330,8 @@ tested.
 The format is detected automatically: armored or binary age (prompting for a passphrase, or
 using `--identity F`), tagteam plaintext, or a **cswap v1 export** (`version: 1`,
 `swapVersion`, `encrypted: false`, `accounts[].{number, credentials, config.oauthAccount}`).
+cswap accounts import as provider `claude-code`. A tagteam account whose `provider` is not
+registered in this build is refused in pass 1, naming the provider.
 
 1. **Pass 1 validates everything** before writing anything:
    - the email regex and integer positions ≥ 1 (a path-traversal defence)
@@ -1199,7 +1354,10 @@ an ETA with its projection method. `--csv` and `--json` dump the raw samples.
 
 ### 13.5 Statusline
 
-`tagteam statusline` is built for CC's `statusLine` command and meant to be fast.
+`tagteam statusline` is built for CC's `statusLine` command and meant to be fast. It is a
+provider capability: the command resolves the provider from `--provider`, else from the
+environment it runs in (a `CLAUDE_CONFIG_DIR` or a CC-invoked process means Claude Code), else
+`default_provider`. It refuses for a provider without the capability.
 
 - It drains piped stdin (up to 64 KiB) and ignores the contents.
 - It does **no network and no Keychain access**.
@@ -1291,18 +1449,30 @@ anything fails.
 - **`tagteam-engine`:** fixture-home integration tests for every command. Crash injection at
   each switch step verifies the rollback. Concurrency tests run two engines against one store
   (double-switch prevention, lease fencing, refresh single-flight).
+- **Provider neutrality.** A test-only `FakeAgent` provider is registered alongside Claude Code.
+  It has its own home layout, credential format, lock and usage windows, and some capabilities
+  switched off. Engine tests run against both providers, and assert that:
+  - positions, auto-switch state, leases and mappings stay per provider
+  - a switch, refresh or auto tick on one provider never touches the other's state
+  - a missing capability degrades as §4.5 specifies
+
+  This keeps the trait from quietly taking on Claude Code's shape before a real second provider
+  exists.
 - **`tagteam` (CLI):** snapshot tests (`insta`) of human and JSON output, and of the exit codes.
 
 ### 15.3 Pinned invariants
 
-- **Local state.** A fixture home contains:
+- **Local state.** The test is generic and runs once per registered provider, using the
+  provider's fixture home and its declared identity surface (§3). For Claude Code, the fixture
+  home contains:
   - `~/.claude/projects/-x/memory/MEMORY.md`, `CLAUDE.md`, `history.jsonl`, `settings.json`,
     `skills/`, `plugins/`
   - a `~/.claude.json` with `projects`, `mcpServers`, `userID` and unknown keys
 
   After *every* mutating command, and after `run` with merge-back disabled, the test asserts
-  that every file other than the §3 targets is byte-identical, and that `~/.claude.json` is
-  byte-identical outside the `oauthAccount` span.
+  that every file outside the identity surface is byte-identical, and that `~/.claude.json` is
+  byte-identical outside the `oauthAccount` span. It also asserts that no provider's command
+  touches another provider's home.
 - **Refresh tokens.** For every error injected after the token POST, the successor ends up in
   the vault or in `rescue/`, never lost.
 - **Degraded reads.** A degraded read never reaches the token endpoint. This is a compile-time
@@ -1346,11 +1516,15 @@ anything fails.
 | R4 | The merge-back can conflict with concurrent edits of `~/.claude.json` | Three-way merge against the baseline, the default file wins, under CC's config lock |
 | R5 | Sharing by denylist could share a future per-account file | Unknown entries are reported by `doctor` and by the weekly compat job |
 | R6 | cswap's heuristics (§11) are complex | Named predicates, simulation tests, and a documented trace corpus |
+| R7 | The `Provider` trait is designed from one real implementation, so it may not fit Codex, Gemini CLI or Grok (different auth models, API-key-only logins, no usage endpoint, no session isolation variable) | Keep the trait internal, not a public API. Use explicit capability flags. Exercise the engine with the `FakeAgent` provider (§15.2). Revise the trait in the first real second-provider spec rather than guessing now |
 | O1 | Whether `.device-keys.json` should be shared | Private until verified; revisit in the compat suite |
 
 ---
 
-## Appendix A — Claude Code interop contract (verified against CC 2.1.283)
+## Appendix A — Claude Code provider: interop contract (verified against CC 2.1.283)
+
+This appendix is the contract that `tagteam-cc` implements. Nothing in it applies to other
+providers.
 
 ### A.1 Paths
 
