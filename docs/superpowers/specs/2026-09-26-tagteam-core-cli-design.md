@@ -339,6 +339,11 @@ CREATE TABLE accounts (
   UNIQUE (provider, identity_key)
 );
 
+CREATE TABLE active_accounts (  -- the store's active account per provider (§9.4 step 9); the live identity wins if they disagree
+  provider   TEXT PRIMARY KEY,
+  account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL
+);
+
 CREATE TABLE usage_state (
   account_id        TEXT PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
   last_good         TEXT,     -- JSON array of generic windows (§4.5, §8.2); never cleared by a failure
