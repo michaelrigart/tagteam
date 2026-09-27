@@ -6,6 +6,7 @@ pub mod flock;
 pub mod keychain;
 pub mod mkdir_lock;
 pub mod process;
+pub mod provider;
 pub mod read;
 pub mod security;
 pub mod splice;
@@ -19,4 +20,8 @@ pub use keychain::FileKeychain;
 pub use keychain::{FakeKeychain, Keychain, KeychainError, LockState};
 pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 pub use process::ProcessStamp;
+pub use provider::{
+    CapturedLogin, Identity, IdentitySurface, LiveAuth, LiveLockSet, LiveLocks, Provider,
+    ProviderError, StoredLogin, Undo,
+};
 pub use read::{Read, ReadError};
