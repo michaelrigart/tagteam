@@ -1911,7 +1911,7 @@ anything fails.
 
 | # | Risk / item | Mitigation |
 |---|---|---|
-| R1 | Keychain access control. Items created through Security.framework might make CC's `security` reads prompt or fail (rc 36) over SSH or under launchd (*inferred*) | Verified on 2026-09-27, macOS 27.0, CC 2.1.283: `claude` silently reads tagteam-written items from SSH and GUI sessions alike. An SSH session's login keychain stays locked (rc 36) until `security unlock-keychain`, for Claude Code's own items as much as for tagteam's. |
+| R1 | Keychain access control. Items created through Security.framework might make CC's `security` reads prompt or fail (rc 36) over SSH or under launchd (*inferred*) | Verified on 2026-09-27, macOS 27.0, CC 2.1.283: `claude` silently reads tagteam-written items from SSH and GUI sessions alike. An SSH session's login keychain stays locked (rc 36) until `security unlock-keychain`, for Claude Code's own items as much as for tagteam's. Use only `/usr/bin/security` for every item. |
 | R2 | CC drift beyond 2.1.283. A feature-flagged storage layer ("storageV5") may bypass the `~/.claude.json` lock; new per-account files may appear in `~/.claude` | The weekly compat job, `doctor` version warnings, and the known-entries lists |
 | R3 | The usage endpoint budget is empirical (~30 requests per hour per identity) and could change | Enforce a hard budget of 20 per hour below it, and keep the 180 s floor and AIMD. Re-derive the constants from logs, not from comments |
 | R4 | The merge-back can conflict with concurrent edits of `~/.claude.json` | Three-way merge against the baseline, the default file wins, under CC's config lock |
