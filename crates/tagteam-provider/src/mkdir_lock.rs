@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -68,16 +69,30 @@ impl MkdirLock {
                             if age <= spec.stale {
                                 return Ok(None);
                             }
-                            let _ = fs::remove_dir(&spec.path); // stale: take it over
+                            // Stale: take it over. `NotFound` just means another taker won
+                            // the race; any other failure (`ENOTEMPTY`, `EACCES`, ...) is a
+                            // real fault and must not be swallowed into a spin-to-timeout.
+                            match fs::remove_dir(&spec.path) {
+                                Ok(()) => {}
+                                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                                Err(e) => return Err(e.into()),
+                            }
                         }
                         Err(e) if e.kind() == io::ErrorKind::NotFound => {} // vanished: retry
                         Err(e) => return Err(e.into()),
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    // The directory that holds the lock does not exist yet.
+                    // The directory that holds the lock does not exist yet. Create only its
+                    // immediate parent, non-recursively: this path can sit under CC-owned
+                    // state (e.g. `CLAUDE_SECURESTORAGE_CONFIG_DIR`), and a typo'd env var
+                    // must fail loudly instead of growing a whole directory chain there.
                     if let Some(parent) = spec.path.parent() {
-                        crate::atomic::ensure_private_dir(parent)?;
+                        match fs::DirBuilder::new().mode(0o700).create(parent) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                            Err(e) => return Err(e.into()),
+                        }
                     }
                 }
                 Err(e) => return Err(e.into()),
@@ -100,38 +115,48 @@ impl MkdirLock {
     }
 
     fn start(spec: &MkdirLockSpec) -> Result<Self, LockError> {
-        let set = set_dir_mtime(&spec.path, SystemTime::now())?;
-        let state = Arc::new(State {
-            last_set: Mutex::new(set),
-            compromised: AtomicBool::new(false),
-            stop: Mutex::new(false),
-            wake: Condvar::new(),
-        });
-        let (st, path, every) = (state.clone(), spec.path.clone(), spec.touch_every);
-        let heartbeat = thread::spawn(move || {
-            let mut stop = st.stop.lock().unwrap();
-            loop {
-                let (guard, _) = st.wake.wait_timeout(stop, every).unwrap();
-                stop = guard;
-                if *stop {
-                    return;
-                }
-                // Check and touch as one step under the mutex, so a concurrent check never
-                // compares a stale timestamp with the heartbeat's fresh one.
-                let mut last = st.last_set.lock().unwrap();
-                if check_with(&path, &st, *last).is_ok() {
-                    match set_dir_mtime(&path, SystemTime::now()) {
-                        Ok(t) => *last = t,
-                        Err(_) => st.compromised.store(true, Ordering::SeqCst),
+        let result = (|| -> Result<Self, LockError> {
+            let set = set_dir_mtime(&spec.path, SystemTime::now())?;
+            let state = Arc::new(State {
+                last_set: Mutex::new(set),
+                compromised: AtomicBool::new(false),
+                stop: Mutex::new(false),
+                wake: Condvar::new(),
+            });
+            let (st, path, every) = (state.clone(), spec.path.clone(), spec.touch_every);
+            // `Builder::spawn` (not `thread::spawn`) so a failure to spawn is an error we
+            // can clean up after, not a panic.
+            let heartbeat = thread::Builder::new().spawn(move || {
+                let mut stop = st.stop.lock().unwrap();
+                loop {
+                    let (guard, _) = st.wake.wait_timeout(stop, every).unwrap();
+                    stop = guard;
+                    if *stop {
+                        return;
+                    }
+                    // Check and touch as one step under the mutex, so a concurrent check
+                    // never compares a stale timestamp with the heartbeat's fresh one.
+                    let mut last = st.last_set.lock().unwrap();
+                    if check_with(&path, &st, *last).is_ok() {
+                        match set_dir_mtime(&path, SystemTime::now()) {
+                            Ok(t) => *last = t,
+                            Err(_) => st.compromised.store(true, Ordering::SeqCst),
+                        }
                     }
                 }
-            }
-        });
-        Ok(Self {
-            path: spec.path.clone(),
-            state,
-            heartbeat: Some(heartbeat),
-        })
+            })?;
+            Ok(Self {
+                path: spec.path.clone(),
+                state,
+                heartbeat: Some(heartbeat),
+            })
+        })();
+        if result.is_err() {
+            // `mkdir` already succeeded but the lock never actually started: remove it
+            // now, rather than blocking CC for the whole staleness window.
+            let _ = fs::remove_dir(&spec.path);
+        }
+        result
     }
 
     pub fn path(&self) -> &Path {
@@ -183,6 +208,7 @@ impl Drop for MkdirLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::SystemTime;
 
     fn spec(dir: &Path, stale_ms: u64, timeout_ms: u64, touch_ms: u64) -> MkdirLockSpec {
@@ -220,6 +246,44 @@ mod tests {
         fs::create_dir(&s.path).unwrap();
         set_dir_mtime(&s.path, SystemTime::now() - Duration::from_secs(5)).unwrap();
         assert!(MkdirLock::acquire(&s).is_ok());
+    }
+
+    #[test]
+    fn a_missing_immediate_parent_is_created_non_recursively_and_the_lock_is_taken() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(&d.path().join("sub"), 60_000, 100, 3_000);
+        let l = MkdirLock::acquire(&s).unwrap();
+        assert!(s.path.is_dir());
+        let parent = s.path.parent().unwrap();
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(l);
+    }
+
+    #[test]
+    fn a_missing_grandparent_fails_and_creates_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(&d.path().join("a/b"), 60_000, 100, 3_000);
+        assert!(matches!(MkdirLock::acquire(&s), Err(LockError::Io(_))));
+        assert!(!d.path().join("a").exists(), "no directory was created");
+    }
+
+    #[test]
+    fn a_non_removable_stale_lock_reports_io_promptly_not_timeout() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 1_000, 5_000, 3_000);
+        fs::create_dir(&s.path).unwrap();
+        fs::write(s.path.join("busy"), b"x").unwrap(); // non-empty: remove_dir fails
+        set_dir_mtime(&s.path, SystemTime::now() - Duration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        assert!(matches!(MkdirLock::acquire(&s), Err(LockError::Io(_))));
+        assert!(
+            start.elapsed() < Duration::from_millis(1_000),
+            "must fail immediately on the real fault, not spin to the {:?} acquire timeout",
+            s.acquire_timeout
+        );
     }
 
     #[test]

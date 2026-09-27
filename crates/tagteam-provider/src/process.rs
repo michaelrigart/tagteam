@@ -48,6 +48,8 @@ fn start_of(pid: u32) -> io::Result<Option<u64>> {
 /// `proc_pidinfo(PROC_PIDTBSDINFO)` start time, in microseconds.
 #[cfg(target_os = "macos")]
 fn start_of(pid: u32) -> io::Result<Option<u64>> {
+    // SAFETY: `proc_bsdinfo` is a C struct of plain integers; the zeroed value is a valid
+    // bit pattern for it and is fully overwritten by `proc_pidinfo` below on success.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: `info` is a correctly sized, writable proc_bsdinfo.
