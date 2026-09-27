@@ -1,3 +1,4 @@
+pub mod atomic;
 pub mod clock;
 pub mod credential;
 pub mod env;
