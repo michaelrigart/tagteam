@@ -174,6 +174,23 @@ impl<'a> Scanner<'a> {
     }
 }
 
+/// Consumes the `}` at the scanner's current position, then checks that
+/// nothing but whitespace follows. Shared by the empty-object and
+/// member-loop exits, which both reach this with `s.peek() == Some(b'}')`.
+fn close_object(s: &mut Scanner, open: usize, members: Vec<Member>) -> Result<Object, SpliceError> {
+    let close = s.i;
+    s.i += 1;
+    s.ws();
+    if s.i != s.b.len() {
+        return Err(s.torn("trailing data"));
+    }
+    Ok(Object {
+        open,
+        close,
+        members,
+    })
+}
+
 fn scan(doc: &[u8]) -> Result<Object, SpliceError> {
     std::str::from_utf8(doc).map_err(|e| SpliceError::Torn(format!("invalid UTF-8: {e}")))?;
     let mut s = Scanner { b: doc, i: 0 };
@@ -191,55 +208,33 @@ fn scan(doc: &[u8]) -> Result<Object, SpliceError> {
     s.i += 1;
     let mut members = Vec::new();
     s.ws();
-    if s.peek() == Some(b'}') {
-        let close = s.i;
-        s.i += 1;
-        s.ws();
-        if s.i != doc.len() {
-            return Err(s.torn("trailing data"));
-        }
-        return Ok(Object {
-            open,
-            close,
-            members,
-        });
-    }
-    loop {
-        s.ws();
-        let start = s.i;
-        s.string()?;
-        let key: String = serde_json::from_slice(&doc[start..s.i])
-            .map_err(|e| SpliceError::Torn(format!("bad key: {e}")))?;
-        s.ws();
-        s.expect(b':')?;
-        s.ws();
-        let value_start = s.i;
-        s.value(1)?;
-        members.push(Member {
-            key,
-            start,
-            value_start,
-            value_end: s.i,
-        });
-        s.ws();
-        match s.peek() {
-            Some(b',') => s.i += 1,
-            Some(b'}') => {
-                let close = s.i;
-                s.i += 1;
-                s.ws();
-                if s.i != doc.len() {
-                    return Err(s.torn("trailing data"));
-                }
-                return Ok(Object {
-                    open,
-                    close,
-                    members,
-                });
+    if s.peek() != Some(b'}') {
+        loop {
+            s.ws();
+            let start = s.i;
+            s.string()?;
+            let key: String = serde_json::from_slice(&doc[start..s.i])
+                .map_err(|e| SpliceError::Torn(format!("bad key: {e}")))?;
+            s.ws();
+            s.expect(b':')?;
+            s.ws();
+            let value_start = s.i;
+            s.value(1)?;
+            members.push(Member {
+                key,
+                start,
+                value_start,
+                value_end: s.i,
+            });
+            s.ws();
+            match s.peek() {
+                Some(b',') => s.i += 1,
+                Some(b'}') => break,
+                _ => return Err(s.torn("expected ',' or '}'")),
             }
-            _ => return Err(s.torn("expected ',' or '}'")),
         }
     }
+    close_object(&mut s, open, members)
 }
 
 /// `JSON.stringify(v, null, 2)` layout, nested at `depth` (continuation lines indented).
@@ -428,6 +423,58 @@ mod tests {
                 Err(SpliceError::NotObject)
             ));
         }
+    }
+
+    #[test]
+    fn trailing_data_after_a_non_empty_object_is_torn() {
+        for torn in [&b"{\"a\":1} x"[..], b"{\"a\": 1}\0\0\0"] {
+            assert!(matches!(
+                replace_top_level(torn, "k", &json!(1)),
+                Err(SpliceError::Torn(_))
+            ));
+            assert!(matches!(
+                remove_top_level(torn, "a"),
+                Err(SpliceError::Torn(_))
+            ));
+            assert!(matches!(
+                get_top_level(torn, "a"),
+                Err(SpliceError::Torn(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn unterminated_input_is_torn() {
+        for torn in [&b"{\"a\": \"x"[..], b"{\"a\": [1}", b"{\"a\": {\"b\": 1}"] {
+            assert!(matches!(
+                replace_top_level(torn, "k", &json!(1)),
+                Err(SpliceError::Torn(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn remove_top_level_handles_adjacent_duplicates() {
+        for (doc, expected) in [
+            (&b"{\"k\":1,\"k\":2}"[..], &b"{}"[..]),
+            (b"{\"k\":1,\"k\":2,\"a\":3}", b"{\"a\":3}"),
+            (
+                b"{\"k\":1,\"a\":2,\"k\":3,\"b\":4,\"k\":5}",
+                b"{\"a\":2,\"b\":4}",
+            ),
+        ] {
+            let out = remove_top_level(doc, "k").unwrap();
+            assert_eq!(out, expected);
+            serde_json::from_slice::<Value>(&out).expect("result must still be valid JSON");
+        }
+    }
+
+    #[test]
+    fn torn_errors_never_echo_the_input() {
+        let doc = b"{\"primaryApiKey\": \"sk-ant-SECRET\"";
+        let err = replace_top_level(doc, "k", &json!(1)).unwrap_err();
+        assert!(!format!("{err}").contains("sk-ant"));
+        assert!(!format!("{err:?}").contains("sk-ant"));
     }
 
     #[test]
