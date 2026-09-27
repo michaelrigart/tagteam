@@ -31,7 +31,7 @@ write() {
 }
 read_security() {
   set +e
-  out=$("$SECURITY" find-generic-password -a "$(acct)" -w -s "$(svc)" 2>&1); rc=$?
+  out=$("$SECURITY" find-generic-password -a "$(acct)" -w -s "$(svc)" 2>/dev/null); rc=$?
   set -e
   if [ "$out" = "$CRED" ]; then m=yes; else m=no; fi
   echo "security read: rc=$rc bytes-match=$m"
@@ -43,7 +43,7 @@ probe() {
 read_claude() {
   local start=$SECONDS
   set +e
-  out=$(CLAUDE_CONFIG_DIR="$PROFILE" claude auth status --json 2>&1); rc=$?
+  out=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR -u CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR="$PROFILE" claude auth status --json 2>&1); rc=$?
   set -e
   echo "claude auth status: rc=$rc elapsed=$((SECONDS - start))s"
   echo "$out"
@@ -52,10 +52,17 @@ cleanup() {
   "$SECURITY" delete-generic-password -a "$(acct)" -s "$(svc)" >/dev/null 2>&1 || true
   rm -rf "$PROFILE"; echo "cleaned up"
 }
+negative_control() {
+  "$SECURITY" delete-generic-password -a "$(acct)" -s "$(svc)" >/dev/null 2>&1 || true
+  echo "negative control: item deleted, profile kept"
+  read_claude
+}
 # The existence probe against an explicitly locked, throwaway keychain file (never the login
 # keychain): answers what `find-generic-password` without -w returns when locked.
 locked_probe() {
-  local kc; kc="$(mktemp -d)/r1-locked.keychain"
+  local dir; dir="$(mktemp -d)"
+  local kc; kc="$dir/r1-locked.keychain"
+  trap '"$SECURITY" delete-keychain "$kc" >/dev/null 2>&1; rm -rf "$dir"' RETURN
   "$SECURITY" create-keychain -p r1 "$kc"
   "$SECURITY" add-generic-password -a probe -s tagteam-r1 -w x "$kc"
   "$SECURITY" lock-keychain "$kc"
@@ -64,11 +71,10 @@ locked_probe() {
   "$SECURITY" find-generic-password -a probe -s tagteam-r1 "$kc" >/dev/null 2>&1; echo "probe, present item: rc=$?"
   "$SECURITY" find-generic-password -a missing -s tagteam-r1 "$kc" >/dev/null 2>&1; echo "probe, absent item: rc=$?"
   set -e
-  "$SECURITY" delete-keychain "$kc"
 }
 
 case "${1:-}" in
-  keychain_state|write|read_security|probe|read_claude|cleanup|locked_probe) "$1" ;;
+  keychain_state|write|read_security|probe|read_claude|cleanup|negative_control|locked_probe) "$1" ;;
   all) keychain_state; write; read_security; probe; read_claude ;;
-  *) echo "usage: $0 all|keychain_state|write|read_security|probe|read_claude|cleanup|locked_probe" >&2; exit 2 ;;
+  *) echo "usage: $0 all|keychain_state|write|read_security|probe|read_claude|cleanup|negative_control|locked_probe" >&2; exit 2 ;;
 esac

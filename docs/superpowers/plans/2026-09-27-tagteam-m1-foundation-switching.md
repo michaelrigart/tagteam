@@ -222,7 +222,7 @@ write() {
 }
 read_security() {
   set +e
-  out=$("$SECURITY" find-generic-password -a "$(acct)" -w -s "$(svc)" 2>&1); rc=$?
+  out=$("$SECURITY" find-generic-password -a "$(acct)" -w -s "$(svc)" 2>/dev/null); rc=$?
   set -e
   if [ "$out" = "$CRED" ]; then m=yes; else m=no; fi
   echo "security read: rc=$rc bytes-match=$m"
@@ -234,7 +234,7 @@ probe() {
 read_claude() {
   local start=$SECONDS
   set +e
-  out=$(CLAUDE_CONFIG_DIR="$PROFILE" claude auth status --json 2>&1); rc=$?
+  out=$(env -u CLAUDE_SECURESTORAGE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR -u CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR="$PROFILE" claude auth status --json 2>&1); rc=$?
   set -e
   echo "claude auth status: rc=$rc elapsed=$((SECONDS - start))s"
   echo "$out"
@@ -243,10 +243,17 @@ cleanup() {
   "$SECURITY" delete-generic-password -a "$(acct)" -s "$(svc)" >/dev/null 2>&1 || true
   rm -rf "$PROFILE"; echo "cleaned up"
 }
+negative_control() {
+  "$SECURITY" delete-generic-password -a "$(acct)" -s "$(svc)" >/dev/null 2>&1 || true
+  echo "negative control: item deleted, profile kept"
+  read_claude
+}
 # The existence probe against an explicitly locked, throwaway keychain file (never the login
 # keychain): answers what `find-generic-password` without -w returns when locked.
 locked_probe() {
-  local kc; kc="$(mktemp -d)/r1-locked.keychain"
+  local dir; dir="$(mktemp -d)"
+  local kc; kc="$dir/r1-locked.keychain"
+  trap '"$SECURITY" delete-keychain "$kc" >/dev/null 2>&1; rm -rf "$dir"' RETURN
   "$SECURITY" create-keychain -p r1 "$kc"
   "$SECURITY" add-generic-password -a probe -s tagteam-r1 -w x "$kc"
   "$SECURITY" lock-keychain "$kc"
@@ -255,13 +262,12 @@ locked_probe() {
   "$SECURITY" find-generic-password -a probe -s tagteam-r1 "$kc" >/dev/null 2>&1; echo "probe, present item: rc=$?"
   "$SECURITY" find-generic-password -a missing -s tagteam-r1 "$kc" >/dev/null 2>&1; echo "probe, absent item: rc=$?"
   set -e
-  "$SECURITY" delete-keychain "$kc"
 }
 
 case "${1:-}" in
-  keychain_state|write|read_security|probe|read_claude|cleanup|locked_probe) "$1" ;;
+  keychain_state|write|read_security|probe|read_claude|cleanup|negative_control|locked_probe) "$1" ;;
   all) keychain_state; write; read_security; probe; read_claude ;;
-  *) echo "usage: $0 all|keychain_state|write|read_security|probe|read_claude|cleanup|locked_probe" >&2; exit 2 ;;
+  *) echo "usage: $0 all|keychain_state|write|read_security|probe|read_claude|cleanup|negative_control|locked_probe" >&2; exit 2 ;;
 esac
 ```
 
@@ -282,8 +288,8 @@ git commit -m "Add the R1 Keychain-over-SSH spike script"
 
 | # | Where each step runs | Commands |
 |---|---|---|
-| A | GUI Terminal | `all`, then `cleanup` |
-| B | `ssh localhost` | `all`, then `cleanup` |
+| A | GUI Terminal | `all`, then `negative_control`, then `cleanup` |
+| B | `ssh localhost` | `all`, then `negative_control`, then `cleanup` |
 | C | GUI `write`; then over SSH | SSH: `read_security`, `probe`, `read_claude`; then `cleanup` |
 | D | SSH `write`; then GUI | GUI: `read_security`, `read_claude`; then `cleanup` |
 | E | GUI Terminal | `locked_probe` (a throwaway keychain file; the login keychain is never locked) |
@@ -295,7 +301,7 @@ real secret; still, keep it out of git (paste it into the task report).
 - [ ] **Step 5: Decide and record**
 
 R1 passes when, in B and C, `security read` is `rc=0 bytes-match=yes`, `claude auth status`
-reports `loggedIn: true` with `email: r1-spike@example.com`, and no dialog appeared.
+reports `loggedIn: true` with `email: r1-spike@example.com`, and no dialog appeared. In A and B, `negative_control` reports `loggedIn: false` (proving `claude` authenticated from the spike's item, not from an ambient variable or the unsuffixed default item).
 
 - **Pass:** edit the spec. In §17 change the R1 row's mitigation cell to begin
   `Verified on <date>, macOS <version>, CC <version>: ` followed by the observed behaviour in
