@@ -1,0 +1,6 @@
+tagteam
+Copyright (c) 2026 Michaël Rigart
+
+tagteam is a Rust rewrite of claude-swap (https://github.com/realiti4/claude-swap),
+Copyright (c) Onur Cetinkol, released under the MIT license. Its behaviour, constants and
+safety rules are derived from claude-swap v0.27.0b1 (commit 9aa6d02).

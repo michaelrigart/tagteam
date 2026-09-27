@@ -1,0 +1,28 @@
+[package]
+name = "tagteam-provider"
+description = "The tagteam Provider trait and the I/O primitives providers share"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# A directory-backed fake Keychain, for tests that drive the real binary.
+file-keychain = []
+# Tests against a temporary real keychain via /usr/bin/security (macOS CI).
+real_keychain = []
+
+[dependencies]
+tagteam-core.workspace = true
+fastrand.workspace = true
+hex.workspace = true
+libc.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

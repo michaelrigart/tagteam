@@ -1,0 +1,33 @@
+[package]
+name = "tagteam"
+description = "Multi-account switcher for AI coding agent CLIs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Test support for driving the real binary: file-backed fake Keychain and crash points.
+test-support = ["tagteam-provider/file-keychain", "tagteam-engine/test-hooks"]
+
+[dependencies]
+tagteam-core.workspace = true
+tagteam-provider.workspace = true
+tagteam-cc.workspace = true
+tagteam-engine.workspace = true
+clap.workspace = true
+libc.workspace = true
+rpassword.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tagteam-provider = { workspace = true, features = ["file-keychain"] }
+assert_cmd.workspace = true
+predicates.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
