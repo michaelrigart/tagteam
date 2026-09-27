@@ -253,7 +253,7 @@ negative_control() {
 locked_probe() {
   lp_dir=$(mktemp -d)
   lp_kc=$lp_dir/r1-locked.keychain
-  trap '"$SECURITY" delete-keychain "$lp_kc" >/dev/null 2>&1; rm -rf "$lp_dir"' EXIT
+  trap '"$SECURITY" delete-keychain "$lp_kc" >/dev/null 2>&1 || true; rm -rf "$lp_dir"' EXIT
   "$SECURITY" create-keychain -p r1 "$lp_kc"
   "$SECURITY" add-generic-password -a probe -s tagteam-r1 -w x "$lp_kc"
   "$SECURITY" lock-keychain "$lp_kc"
