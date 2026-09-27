@@ -1966,12 +1966,16 @@ providers.
 
 - **Binary:** always the absolute `/usr/bin/security`, with a 5 s timeout per spawn.
 - **Read:** `find-generic-password -a <acct> -w -s <svc>`.
-  - rc 0: the bytes, with exactly one trailing `\n` stripped. `-w`'s rendering of a genuinely
-    non-printable secret and of a printable secret that happens to be all lowercase hex digits
-    of even length are byte-for-byte identical, so that shape alone is ambiguous. Resolve it
-    with one `find-generic-password -a <acct> -g -s <svc>` call on the same item: its `password:`
-    line is `0x<HEX>` for binary (decode it) or a quoted string for verbatim text (keep the `-w`
-    bytes as read). Anything else is unprintable text and is kept as read, with no `-g` call.
+  - rc 0: the bytes, with exactly one trailing `\n` stripped. `security` emits `0x<HEX>` for
+    any data it would otherwise have to escape, not only non-printable bytes, so that hex
+    rendering and a printable secret that happens to be all lowercase hex digits of even
+    length are byte-for-byte identical: that shape alone is ambiguous. Output that is not
+    hex-shaped needs no further check — it is `-w`'s verbatim rendering of printable text.
+    Resolve the ambiguous case with one `find-generic-password -a <acct> -g -s <svc>` call on
+    the same item: its `password:` line is `0x<HEX>` for binary or a quoted string for
+    verbatim text, and either decodes exactly back to the stored bytes. A failed or
+    unparseable `-g` call, or one whose decoded value disagrees with `-w`'s bytes, is
+    `Unreadable`.
   - rc 44: `Absent`. rc 36, any other rc, or a timeout: `Unreadable`.
 - **Existence probe:** the same command without `-w` (attributes only; never prompts).
   - On a locked keychain file or a locked SSH session: rc 0 for present, rc 44 for absent; never prompts.

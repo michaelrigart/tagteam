@@ -160,16 +160,19 @@ fn looks_like_hex(bytes: &[u8]) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
 }
 
-/// What `find-generic-password -g`'s `password:` line says about an ambiguous item.
-enum PasswordForm {
-    /// `0x<HEX>`: the stored data was binary.
-    Binary(Vec<u8>),
-    /// A quoted string: the stored data was the literal text `-w` already returned.
-    Verbatim,
-}
+/// A `-g` response that could not be trusted: missing, malformed, or disagreeing with
+/// `-w`. Never built from `stderr` text, which is the channel `security` prints the
+/// secret on.
+const DISAMBIGUATION_MISMATCH: &str =
+    "the -g disambiguation line was missing, malformed, or disagreed with -w";
 
-/// Parses the `password: ...` line `-g` writes to stderr.
-fn parse_password_line(stderr: &[u8]) -> Option<PasswordForm> {
+/// Parses the `password: ...` line `-g` writes to stderr and cross-checks it against
+/// `raw` (the `-w` bytes), returning the confirmed bytes: hex-decoded when `-g` says
+/// binary, or `raw` unchanged when it says verbatim. `None` when the line is missing,
+/// the hex digits are empty or odd in count, or the decoded/verbatim value disagrees
+/// with `raw` — a mismatch is never trusted, e.g. because the item changed between the
+/// two spawns.
+fn confirm_password(stderr: &[u8], raw: &[u8]) -> Option<Vec<u8>> {
     let text = String::from_utf8_lossy(stderr);
     let rest = text.lines().find_map(|l| l.strip_prefix("password: "))?;
     let rest = rest.trim_end();
@@ -178,12 +181,31 @@ fn parse_password_line(stderr: &[u8]) -> Option<PasswordForm> {
             .chars()
             .take_while(char::is_ascii_hexdigit)
             .collect();
-        return hex::decode(&digits).ok().map(PasswordForm::Binary);
+        if digits.is_empty() || digits.len() % 2 != 0 {
+            return None;
+        }
+        let bytes = hex::decode(&digits).ok()?;
+        let raw_str = std::str::from_utf8(raw).ok()?;
+        // `-g` prints uppercase hex; `hex::encode` is always lowercase.
+        return hex::encode(&bytes)
+            .eq_ignore_ascii_case(raw_str)
+            .then_some(bytes);
     }
-    if rest.starts_with('"') {
-        return Some(PasswordForm::Verbatim);
-    }
-    None
+    let body = rest.strip_prefix('"')?.strip_suffix('"')?;
+    (body.as_bytes() == raw).then(|| raw.to_vec())
+}
+
+/// `disambiguate`'s own failures (a bad rc, a timeout, a spawn failure) never surface
+/// `-g`'s stderr, unlike `describe()`/`unreadable()`: `-g`'s stderr is the channel
+/// `security` prints the secret on.
+fn disambiguation_failed(r: &RunResult) -> ReadError {
+    let detail = match r {
+        RunResult::Exited { code, .. } => format!("rc {code}: the -g disambiguation call failed"),
+        RunResult::TimedOut | RunResult::SpawnFailed(_) => {
+            "the -g disambiguation call failed".to_owned()
+        }
+    };
+    ReadError::new("keychain", detail)
 }
 
 pub struct SecurityCli {
@@ -226,7 +248,9 @@ impl SecurityCli {
 
     /// Resolves whether an item whose `-w` rendering looks like hex is actually binary
     /// (decode it) or a printable secret that happens to look like hex (keep `raw`), via
-    /// one `find-generic-password -g` call on the same item (Appendix A.3).
+    /// one `find-generic-password -g` call on the same item, cross-checked against `raw`
+    /// so a mismatch (e.g. the item changed between the two spawns) is never trusted
+    /// (Appendix A.3).
     fn disambiguate(&self, service: &str, account: &str, raw: Vec<u8>) -> Read<Vec<u8>> {
         match self.run(
             s(&["find-generic-password", "-a", account, "-g", "-s", service]),
@@ -234,15 +258,11 @@ impl SecurityCli {
         ) {
             RunResult::Exited {
                 code: 0, stderr, ..
-            } => match parse_password_line(&stderr) {
-                Some(PasswordForm::Binary(bytes)) => Read::Present(bytes),
-                Some(PasswordForm::Verbatim) => Read::Present(raw),
-                None => Read::Unreadable(ReadError::new(
-                    "keychain",
-                    "could not parse the -g password line",
-                )),
+            } => match confirm_password(&stderr, &raw) {
+                Some(bytes) => Read::Present(bytes),
+                None => Read::Unreadable(ReadError::new("keychain", DISAMBIGUATION_MISMATCH)),
             },
-            other => Read::Unreadable(unreadable(other)),
+            other => Read::Unreadable(disambiguation_failed(&other)),
         }
     }
 }
@@ -549,6 +569,99 @@ mod tests {
     #[test]
     fn a_failed_disambiguation_call_is_unreadable() {
         let s = Scripted::default().then(ok(b"cafe\n")).then(rc(1));
+        assert!(matches!(
+            cli(&s, None).find("svc", "acct"),
+            Read::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn a_dash_g_timeout_is_unreadable() {
+        let s = Scripted::default()
+            .then(ok(b"cafe\n"))
+            .then(RunResult::TimedOut);
+        assert!(matches!(
+            cli(&s, None).find("svc", "acct"),
+            Read::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn a_failed_dash_g_never_echoes_its_stderr() {
+        let s = Scripted::default()
+            .then(ok(b"cafe\n"))
+            .then(RunResult::Exited {
+                code: 1,
+                stdout: vec![],
+                stderr: b"password: \"sk-ant-secret\"\n".to_vec(),
+            });
+        let err = match cli(&s, None).find("svc", "acct") {
+            Read::Unreadable(e) => e,
+            other => panic!("expected Unreadable, got {other:?}"),
+        };
+        assert!(!err.detail.contains("sk-ant-secret"), "{}", err.detail);
+    }
+
+    #[test]
+    fn a_combined_hex_and_quoted_dash_g_line_uses_only_the_hex_part() {
+        let data = vec![0xde, 0xad, 0xbe, 0xef];
+        let s = Scripted::default()
+            .then(ok(format!("{}\n", hex::encode(&data)).as_bytes()))
+            .then(RunResult::Exited {
+                code: 0,
+                stdout: vec![],
+                stderr: b"password: 0xDEADBEEF  \"\\336\\255\\276\\357\"\n".to_vec(),
+            });
+        assert_eq!(cli(&s, None).find("svc", "acct").present().unwrap(), data);
+    }
+
+    #[test]
+    fn a_dash_g_response_with_no_password_line_is_unreadable() {
+        let s = Scripted::default()
+            .then(ok(b"cafe\n"))
+            .then(RunResult::Exited {
+                code: 0,
+                stdout: b"attributes only, no password line".to_vec(),
+                stderr: vec![],
+            });
+        assert!(matches!(
+            cli(&s, None).find("svc", "acct"),
+            Read::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn an_empty_or_odd_dash_g_hex_value_is_unreadable() {
+        let empty = Scripted::default()
+            .then(ok(b"cafe\n"))
+            .then(RunResult::Exited {
+                code: 0,
+                stdout: vec![],
+                stderr: b"password: 0x\n".to_vec(),
+            });
+        assert!(matches!(
+            cli(&empty, None).find("svc", "acct"),
+            Read::Unreadable(_)
+        ));
+
+        let odd = Scripted::default()
+            .then(ok(b"cafe\n"))
+            .then(RunResult::Exited {
+                code: 0,
+                stdout: vec![],
+                stderr: b"password: 0xABC\n".to_vec(),
+            });
+        assert!(matches!(
+            cli(&odd, None).find("svc", "acct"),
+            Read::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn a_disagreeing_dash_g_response_is_unreadable() {
+        let s = Scripted::default()
+            .then(ok(b"cafe\n"))
+            .then(og_hex("DEADBEEF"));
         assert!(matches!(
             cli(&s, None).find("svc", "acct"),
             Read::Unreadable(_)
