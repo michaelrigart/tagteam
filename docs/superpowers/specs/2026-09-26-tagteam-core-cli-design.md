@@ -331,6 +331,7 @@ CREATE TABLE accounts (
   login_expires_at INTEGER,                   -- epoch ms (CC: refreshTokenExpiresAt)
   login_epoch      INTEGER NOT NULL DEFAULT 0,  -- bumped by every explicit login replacement (§12.5)
   replacing_fp     TEXT,                      -- set only while an explicit replacement is in flight (§12.5)
+  replacing_meta   TEXT,                      -- JSON snapshot of the incoming login's metadata; installed on landing, discarded otherwise (§12.5)
   quarantine_reason TEXT,                     -- 'invalid_grant' | 'no_refresh_token' | 'identity_conflict'
   quarantine_fp    TEXT,                      -- fingerprint the quarantine is bound to
   quarantine_at    INTEGER,
@@ -388,7 +389,8 @@ CREATE TABLE switch_journal (   -- a row exists only while a switch is between i
   from_fp      TEXT,             -- fingerprint of the live credential being replaced
   from_identity TEXT,            -- the outgoing identity object (CC: oauthAccount), for recovery; not a secret
   to_fp        TEXT NOT NULL,    -- fingerprint of the credential being written; no secret is stored
-  started_at   INTEGER NOT NULL
+  started_at   INTEGER NOT NULL,
+  prior        TEXT              -- the row a forced switch superseded; restored if this one never lands (§9.6)
 );
 
 CREATE TABLE autoswitch_state (       -- one row per provider; auto-switch never crosses providers
@@ -1000,12 +1002,13 @@ here on.
 9. **Commit** in one store transaction: set the active account, insert an `events` row
    (`source` = `cli` or `auto`), and delete the journal row.
 10. **Rollback.** Any failure in steps 7–9 restores, in reverse order, the original
-    `~/.claude.json` bytes and the original live credential, then deletes the journal row.
-    Writing the original credential back is safe here, and only here: CC's credential locks
-    have been held throughout, so CC cannot have rotated it. The operation fails with "rolled
-    back", or with "rollback also failed" listing what could not be restored; the journal row
-    then stays for recovery (§9.6). This covers errors and panics, through `Drop`. A killed
-    process runs no `Drop`: §9.6 covers that.
+    `~/.claude.json` bytes and the original live credential, then restores the journal row's
+    `prior` if it carried one — a forced switch's superseded row (§9.6) — or deletes the row
+    otherwise. Writing the original credential back is safe here, and only here: CC's credential
+    locks have been held throughout, so CC cannot have rotated it. The operation fails with
+    "rolled back", or with "rollback also failed" listing what could not be restored; the
+    journal row then stays for recovery (§9.6). This covers errors and panics, through `Drop`. A
+    killed process runs no `Drop`: §9.6 covers that.
 
 **After unlocking:**
 - Replan the new active account's poll: `next_poll_at = max(now, fetched_at + 180)`, interval
@@ -1051,6 +1054,17 @@ are checked in order:
 | The target's is present (`to_fp`), or the oracle resolves it to `to_id` | The switch landed; CC may have rotated the credential since | Finish forward: clear the other auth axis (§9.4 step 7), splice the target's `oauthAccount`, and commit (step 9) |
 | The outgoing one is present (`from_fp`), or the oracle resolves it to `from_id` | The switch never landed, or its credential rollback succeeded | Finish backward, without touching the credential: splice `from_identity` back into `oauthAccount` if it differs, and keep the store's active account |
 | Anything else, including no credential on either axis | Undecidable. For example, CC rotated the credential while the oracle is unavailable; or it rotated it and then logged out, so absence does not prove the switch never published | Keep the row. Account-changing commands for the provider refuse with `interrupted-switch` until recovery can decide; `switch --force` resolves it by displacing any live credential and activating the chosen account. The vault is never re-activated on absence alone |
+
+**Account-changing commands** here are the ones that read or write credentials or the live
+login: `switch` (without `--force`), `add`, `add-token` and `remove`. `alias`, `disable`,
+`enable` and `move` change only store metadata and proceed regardless.
+
+**Forced-switch put-back.** An undecidable row is not discarded by `switch --force`: the forced
+switch's journal write replaces it (`INSERT OR REPLACE`) with a new row carrying the superseded
+row in `prior`. If that forced switch is itself rolled back (§9.4 step 10), or a later crash's
+recovery finishes backward (the row above), `prior` is restored as the journal row instead of
+being deleted — putting the undecidable case back for a future switch to settle. When the row
+being replaced had no `prior`, rollback and backward recovery just delete the row as before.
 
 The row is deleted only after every surface has been re-read and found coherent: all of them
 name the same account. Recovery never writes an old credential back. CC may have rotated the
@@ -1483,15 +1497,18 @@ never by expiry, because a rotated token need not expire later than the one it r
 **Explicit replacements are recoverable.** `add` over an existing account, `add-token` and
 `import` hold the account lock throughout, and:
 1. in one store transaction, increment `login_epoch` and set `replacing_fp` to the new
-   credential's fingerprint;
+   credential's fingerprint, with `replacing_meta` holding that login's metadata (identity,
+   kind, expiry);
 2. write the vault;
-3. in one store transaction, clear `replacing_fp`.
+3. in one store transaction, clear `replacing_fp` and `replacing_meta`.
 
 The epoch moves first, so no profile, running or not, is ever captured over a replacement that
 landed. The crash gap this ordering opens is closed by recovery. Any holder of the account lock
 that finds `replacing_fp` set knows the replacer died, since the replacer held that lock
 throughout, and reconciles before doing anything else:
-- if the vault holds `replacing_fp`, the replacement landed, and the marker is cleared;
+- if the vault holds `replacing_fp`, the replacement landed: the recorded `replacing_meta` is
+  installed onto the account (identity, kind, expiry; any quarantine is cleared with it), and
+  the marker cleared;
 - otherwise it never landed: `login_epoch` is decremented and the marker cleared. That restores
   the profile's eligibility, so a rotation it holds is captured rather than stranded.
 
@@ -1614,7 +1631,7 @@ windows. Claude Code renders cswap's shape:
 
 **`status`** returns one of:
 - `{schemaVersion, active: null}`
-- `{active: {email, managed: false}}`
+- `{active: {email, provider, managed: false}}`
 - `{active: {number, position, id, email, …row fields, managed: true}, totalManagedAccounts}`
 
 **`switch`** returns `{schemaVersion, switched, from, to, strategy, reason, message, warnings}`.
