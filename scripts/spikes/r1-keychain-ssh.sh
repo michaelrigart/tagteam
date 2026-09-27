@@ -60,16 +60,16 @@ negative_control() {
 # The existence probe against an explicitly locked, throwaway keychain file (never the login
 # keychain): answers what `find-generic-password` without -w returns when locked.
 locked_probe() {
-  local dir; dir="$(mktemp -d)"
-  local kc; kc="$dir/r1-locked.keychain"
-  trap '"$SECURITY" delete-keychain "$kc" >/dev/null 2>&1; rm -rf "$dir"' RETURN
-  "$SECURITY" create-keychain -p r1 "$kc"
-  "$SECURITY" add-generic-password -a probe -s tagteam-r1 -w x "$kc"
-  "$SECURITY" lock-keychain "$kc"
+  lp_dir=$(mktemp -d)
+  lp_kc=$lp_dir/r1-locked.keychain
+  trap '"$SECURITY" delete-keychain "$lp_kc" >/dev/null 2>&1; rm -rf "$lp_dir"' EXIT
+  "$SECURITY" create-keychain -p r1 "$lp_kc"
+  "$SECURITY" add-generic-password -a probe -s tagteam-r1 -w x "$lp_kc"
+  "$SECURITY" lock-keychain "$lp_kc"
   set +e
-  "$SECURITY" show-keychain-info "$kc" >/dev/null 2>&1; echo "locked keychain info: rc=$?"
-  "$SECURITY" find-generic-password -a probe -s tagteam-r1 "$kc" >/dev/null 2>&1; echo "probe, present item: rc=$?"
-  "$SECURITY" find-generic-password -a missing -s tagteam-r1 "$kc" >/dev/null 2>&1; echo "probe, absent item: rc=$?"
+  "$SECURITY" show-keychain-info "$lp_kc" >/dev/null 2>&1; echo "locked keychain info: rc=$?"
+  "$SECURITY" find-generic-password -a probe -s tagteam-r1 "$lp_kc" >/dev/null 2>&1; echo "probe, present item: rc=$?"
+  "$SECURITY" find-generic-password -a missing -s tagteam-r1 "$lp_kc" >/dev/null 2>&1; echo "probe, absent item: rc=$?"
   set -e
 }
 
