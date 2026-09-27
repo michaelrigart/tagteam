@@ -59,6 +59,25 @@ fn round_trips_small_large_and_binary_items() {
 }
 
 #[test]
+fn round_trips_the_hex_rendering_ambiguity_cases() {
+    // (a) printable text that is itself all lowercase hex digits, (b) genuinely binary
+    // data with the identical hex rendering, and (c) printable text with a quote and a
+    // backslash. `-w` renders (a) and (b) identically, so this exercises the real `-g`
+    // disambiguation call, not just the fake `Runner` in security.rs's unit tests.
+    let kc = TempKeychain::new();
+    let k = SecurityCli::with_runner(Box::new(ProcessRunner), Some(kc.0.clone()));
+    for (service, data) in [
+        ("case-a", b"cafe".to_vec()),
+        ("case-b", vec![0xca, 0xfe]),
+        ("case-c", br#"{"a":"b\c"}"#.to_vec()),
+    ] {
+        k.upsert(service, "id", &data).unwrap();
+        assert_eq!(k.find(service, "id").present().unwrap(), data);
+        k.delete(service, "id").unwrap();
+    }
+}
+
+#[test]
 fn an_unlocked_keychain_file_passes_the_lock_check() {
     // Only the unlocked case: `unlock` would prompt, so it is never run here.
     let kc = TempKeychain::new();
