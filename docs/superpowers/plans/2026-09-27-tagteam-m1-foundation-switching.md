@@ -96,7 +96,9 @@ pinning test in the task named.
    switch waits up to 9 s, then fails with a message naming the lock, and nothing changed.
    → Task 20.
 2. **A prompt in a non-interactive context** (a script, a pipe, `--json`). Expected: never
-   hangs; fails with a message naming `--yes`, or returns the JSON no-op. → Task 23.
+   hangs; fails with a message naming `--yes`, or returns the JSON no-op. The offer to unlock a
+   locked login keychain fails with `keychain-locked`, naming `security unlock-keychain`, and
+   never spawns it. → Task 23.
 3. **Two tagteam commands at once** (a double-fired alias, two terminals). Expected: one waits
    for the mutation lock; there is never a double switch or a torn store. → Task 21.
 4. **A fresh machine** with no `~/.claude` and no `~/.claude.json`. Expected: `list` and
@@ -2305,16 +2307,24 @@ git commit -m "Add the span-preserving JSON splice"
 
 **Interfaces:**
 - Produces:
-  - `trait Keychain: Send + Sync { fn find(&self, service: &str, account: &str) -> Read<Vec<u8>>; fn exists(&self, service: &str, account: &str) -> Read<()>; fn upsert(&self, service: &str, account: &str, data: &[u8]) -> Result<(), KeychainError>; fn delete(&self, service: &str, account: &str) -> Result<(), KeychainError>; }`
-    — `delete` of an absent item is `Ok`; `upsert` verifies by reading back
+  - `trait Keychain: Send + Sync { fn find(&self, service: &str, account: &str) -> Read<Vec<u8>>; fn exists(&self, service: &str, account: &str) -> Read<()>; fn upsert(&self, service: &str, account: &str, data: &[u8]) -> Result<(), KeychainError>; fn delete(&self, service: &str, account: &str) -> Result<(), KeychainError>; fn lock_state(&self) -> LockState; fn unlock(&self) -> bool; }`
+    — `delete` of an absent item is `Ok`; `upsert` verifies by reading back; `lock_state`
+    never prompts; `unlock` attaches the terminal, never passes a password, and is true on
+    exit 0 (Appendix A.3 "Lock check and unlock")
+  - `enum LockState { Unlocked, Locked, Unknown }` (`Debug, Clone, Copy, PartialEq, Eq`):
+    `show-keychain-info` rc 0, rc 36, anything else or a timeout
   - `impl<K: Keychain + ?Sized> Keychain for Arc<K>`
   - `struct KeychainError { rc: Option<i32>, detail: String }` (`Display`, `Error`)
   - `FakeKeychain` (in-memory): `new()`, `put`, `get`, `set_locked`, `set_unreadable(svc, acct, bool)`,
-    `set_fail_write(svc, bool)`, `set_fail_delete(svc, bool)`, `items()`
+    `set_fail_write(svc, bool)`, `set_fail_delete(svc, bool)`, `items()`,
+    `set_refuse_unlock(bool)`, `unlock_attempts() -> usize`; `lock_state` follows
+    `set_locked`, and `unlock` clears the lock unless refused
   - `FileKeychain` (feature `file-keychain`): `FileKeychain::new(dir)`; a `LOCKED` file in the
-    dir makes every call fail as a locked keychain does
+    dir makes every call fail as a locked keychain does, and `lock_state` report `Locked`; its
+    `unlock` always fails (no terminal can unlock a directory)
   - `enum RunResult { Exited { code: i32, stdout: Vec<u8>, stderr: Vec<u8> }, TimedOut, SpawnFailed(String) }`,
-    `trait Runner: Send + Sync { fn run(&self, program: &str, args: &[String], stdin: Option<&[u8]>, timeout: Duration) -> RunResult; }`,
+    `trait Runner: Send + Sync { fn run(&self, program: &str, args: &[String], stdin: Option<&[u8]>, timeout: Duration) -> RunResult; fn run_attached(&self, program: &str, args: &[String]) -> RunResult; }`
+    (`run_attached`: the terminal attached, no timeout, `Exited` with empty output),
     `ProcessRunner`
   - `SecurityCli::new()`, `SecurityCli::with_runner(runner: Box<dyn Runner>, keychain_file: Option<PathBuf>)`;
     `pub const SECURITY: &str = "/usr/bin/security"`, `pub const LINE_LIMIT: usize = 4032`,
@@ -2351,6 +2361,10 @@ mod tests {
     impl Runner for Scripted {
         fn run(&self, program: &str, args: &[String], stdin: Option<&[u8]>, _t: Duration) -> RunResult {
             self.calls.lock().unwrap().push((program.into(), args.to_vec(), stdin.map(<[u8]>::to_vec)));
+            self.results.lock().unwrap().pop_front().expect("unexpected extra call")
+        }
+        fn run_attached(&self, program: &str, args: &[String]) -> RunResult {
+            self.calls.lock().unwrap().push((format!("attached:{program}"), args.to_vec(), None));
             self.results.lock().unwrap().pop_front().expect("unexpected extra call")
         }
     }
@@ -2459,6 +2473,29 @@ mod tests {
         assert!(cli(&s, None).upsert("s\"vc", "acct", b"{}").is_err());
         assert!(s.calls().is_empty());
     }
+
+    #[test]
+    fn the_lock_check_maps_show_keychain_info() {
+        let s = Scripted::default().then(ok(b"")).then(rc(36)).then(rc(128)).then(RunResult::TimedOut);
+        let k = cli(&s, None);
+        assert_eq!(k.lock_state(), LockState::Unlocked);
+        assert_eq!(k.lock_state(), LockState::Locked);
+        assert_eq!(k.lock_state(), LockState::Unknown); // rc 128: a locked keychain file
+        assert_eq!(k.lock_state(), LockState::Unknown);
+        assert_eq!(s.calls()[0], ("/usr/bin/security".to_string(), vec!["show-keychain-info".to_string()], None));
+    }
+
+    #[test]
+    fn unlock_attaches_the_terminal_and_never_passes_a_password() {
+        let s = Scripted::default().then(ok(b"")).then(rc(1));
+        let k = cli(&s, None);
+        assert!(k.unlock());
+        assert!(!k.unlock());
+        assert_eq!(s.calls()[0], ("attached:/usr/bin/security".to_string(), vec!["unlock-keychain".to_string()], None));
+        let s = Scripted::default().then(ok(b""));
+        assert!(cli(&s, Some("/tmp/t.keychain")).unlock());
+        assert_eq!(s.calls()[0].1, vec!["unlock-keychain".to_string(), "/tmp/t.keychain".to_string()]);
+    }
 }
 ```
 
@@ -2491,6 +2528,21 @@ mod tests {
         assert!(matches!(k.find("s", "a"), Read::Absent));
     }
 
+    #[test]
+    fn fake_keychain_models_the_lock_check_and_unlock() {
+        let k = FakeKeychain::new();
+        assert_eq!(k.lock_state(), LockState::Unlocked);
+        k.set_locked(true);
+        assert_eq!(k.lock_state(), LockState::Locked);
+        k.set_refuse_unlock(true); // a wrong password, or a dismissed prompt
+        assert!(!k.unlock());
+        assert_eq!(k.lock_state(), LockState::Locked);
+        k.set_refuse_unlock(false);
+        assert!(k.unlock());
+        assert_eq!(k.lock_state(), LockState::Unlocked);
+        assert_eq!(k.unlock_attempts(), 2);
+    }
+
     #[cfg(feature = "file-keychain")]
     #[test]
     fn file_keychain_persists_across_instances() {
@@ -2498,9 +2550,12 @@ mod tests {
         FileKeychain::new(d.path()).upsert("Claude Code-credentials", "me", b"{}").unwrap();
         let k = FileKeychain::new(d.path());
         assert_eq!(k.find("Claude Code-credentials", "me").present().unwrap(), b"{}");
+        assert_eq!(k.lock_state(), LockState::Unlocked);
         std::fs::write(d.path().join("LOCKED"), "").unwrap();
         assert!(matches!(k.find("Claude Code-credentials", "me"), Read::Unreadable(_)));
         assert!(k.upsert("x", "y", b"z").is_err());
+        assert_eq!(k.lock_state(), LockState::Locked);
+        assert!(!k.unlock());
     }
 }
 ```
@@ -2512,7 +2567,7 @@ mod tests {
 
 use std::process::Command;
 
-use tagteam_provider::keychain::Keychain;
+use tagteam_provider::keychain::{Keychain, LockState};
 use tagteam_provider::security::{ProcessRunner, SecurityCli};
 use tagteam_provider::Read;
 
@@ -2549,13 +2604,21 @@ fn round_trips_small_large_and_binary_items() {
     k.delete("tagteam", "id").unwrap();
     assert!(matches!(k.exists("tagteam", "id"), Read::Absent));
 }
+
+#[test]
+fn an_unlocked_keychain_file_passes_the_lock_check() {
+    // Only the unlocked case: `unlock` would prompt, so it is never run here.
+    let kc = TempKeychain::new();
+    let k = SecurityCli::with_runner(Box::new(ProcessRunner), Some(kc.0.clone()));
+    assert_eq!(k.lock_state(), LockState::Unlocked);
+}
 ```
 
 Update `crates/tagteam-provider/src/lib.rs`:
 ```rust
 pub mod keychain;
 pub mod security;
-pub use keychain::{FakeKeychain, Keychain, KeychainError};
+pub use keychain::{FakeKeychain, Keychain, KeychainError, LockState};
 #[cfg(feature = "file-keychain")]
 pub use keychain::FileKeychain;
 ```
@@ -2571,10 +2634,20 @@ Top of `keychain.rs`:
 ```rust
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::read::{Read, ReadError};
+
+/// The default keychain's lock state, from `show-keychain-info` (Appendix A.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockState {
+    Unlocked,
+    /// rc 36: an SSH session's login keychain stays locked until it is unlocked.
+    Locked,
+    /// Any other rc, or a timeout. Callers proceed; the tri-state reads refuse safely.
+    Unknown,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeychainError {
@@ -2602,6 +2675,12 @@ pub trait Keychain: Send + Sync {
     fn upsert(&self, service: &str, account: &str, data: &[u8]) -> Result<(), KeychainError>;
     /// Deleting an absent item succeeds.
     fn delete(&self, service: &str, account: &str) -> Result<(), KeychainError>;
+    /// The default keychain's lock state. Never prompts.
+    fn lock_state(&self) -> LockState;
+    /// Asks macOS to unlock the default keychain with the terminal attached, so it prompts for
+    /// the password itself; tagteam never sees, stores or passes it. True on exit 0. Only the
+    /// CLI calls this, and only on a terminal.
+    fn unlock(&self) -> bool;
 }
 
 impl<K: Keychain + ?Sized> Keychain for Arc<K> {
@@ -2616,6 +2695,12 @@ impl<K: Keychain + ?Sized> Keychain for Arc<K> {
     }
     fn delete(&self, s: &str, a: &str) -> Result<(), KeychainError> {
         (**self).delete(s, a)
+    }
+    fn lock_state(&self) -> LockState {
+        (**self).lock_state()
+    }
+    fn unlock(&self) -> bool {
+        (**self).unlock()
     }
 }
 
@@ -2638,6 +2723,8 @@ pub struct FakeKeychain {
     fail_write: Mutex<BTreeSet<String>>,
     fail_delete: Mutex<BTreeSet<String>>,
     panic_delete: Mutex<BTreeSet<String>>,
+    refuse_unlock: AtomicBool,
+    unlock_attempts: AtomicUsize,
 }
 
 fn key(s: &str, a: &str) -> Key {
@@ -2687,6 +2774,13 @@ impl FakeKeychain {
     pub fn set_panic_on_delete(&self, s: &str, on: bool) {
         toggle(&self.panic_delete, s, on);
     }
+    /// Makes `unlock` fail, as a wrong password or a dismissed prompt does.
+    pub fn set_refuse_unlock(&self, on: bool) {
+        self.refuse_unlock.store(on, Ordering::SeqCst);
+    }
+    pub fn unlock_attempts(&self) -> usize {
+        self.unlock_attempts.load(Ordering::SeqCst)
+    }
     fn blocked(&self, s: &str, a: &str) -> bool {
         self.locked.load(Ordering::SeqCst) || self.unreadable.lock().unwrap().contains(&key(s, a))
     }
@@ -2727,6 +2821,17 @@ impl Keychain for FakeKeychain {
         }
         self.items.lock().unwrap().remove(&key(s, a));
         Ok(())
+    }
+    fn lock_state(&self) -> LockState {
+        if self.locked.load(Ordering::SeqCst) { LockState::Locked } else { LockState::Unlocked }
+    }
+    fn unlock(&self) -> bool {
+        self.unlock_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.refuse_unlock.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.set_locked(false);
+        true
     }
 }
 
@@ -2782,6 +2887,13 @@ impl Keychain for FileKeychain {
             Err(e) => Err(KeychainError { rc: None, detail: e.to_string() }),
         }
     }
+    fn lock_state(&self) -> LockState {
+        if self.locked() { LockState::Locked } else { LockState::Unlocked }
+    }
+    /// No terminal can unlock a directory; binary tests reach this only without one.
+    fn unlock(&self) -> bool {
+        false
+    }
 }
 ```
 
@@ -2795,7 +2907,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::keychain::{Keychain, KeychainError};
+use crate::keychain::{Keychain, KeychainError, LockState};
 use crate::read::{Read, ReadError};
 
 pub const SECURITY: &str = "/usr/bin/security";
@@ -2829,6 +2941,10 @@ impl std::fmt::Debug for RunResult {
 
 pub trait Runner: Send + Sync {
     fn run(&self, program: &str, args: &[String], stdin: Option<&[u8]>, timeout: Duration) -> RunResult;
+    /// Runs with the terminal attached: stdin and stderr inherited, the child's stdout sent to
+    /// stderr (stdout is reserved for command output, §14). No timeout, because a person is
+    /// answering. `Exited` carries no output.
+    fn run_attached(&self, program: &str, args: &[String]) -> RunResult;
 }
 
 pub struct ProcessRunner;
@@ -2880,6 +2996,19 @@ impl Runner for ProcessRunner {
                 Ok(None) => thread::sleep(Duration::from_millis(10)),
                 Err(e) => return RunResult::SpawnFailed(e.to_string()),
             }
+        }
+    }
+
+    fn run_attached(&self, program: &str, args: &[String]) -> RunResult {
+        match Command::new(program)
+            .args(args)
+            .stdin(Stdio::inherit())
+            .stdout(std::io::stderr())
+            .stderr(Stdio::inherit())
+            .status()
+        {
+            Ok(status) => RunResult::Exited { code: status.code().unwrap_or(-1), stdout: vec![], stderr: vec![] },
+            Err(e) => RunResult::SpawnFailed(e.to_string()),
         }
     }
 }
@@ -3019,6 +3148,23 @@ impl Keychain for SecurityCli {
             RunResult::Exited { code: 0 | 44, .. } => Ok(()),
             other => Err(failed(other)),
         }
+    }
+
+    fn lock_state(&self) -> LockState {
+        match self.run(s(&["show-keychain-info"]), None) {
+            RunResult::Exited { code: 0, .. } => LockState::Unlocked,
+            RunResult::Exited { code: 36, .. } => LockState::Locked,
+            _ => LockState::Unknown,
+        }
+    }
+
+    /// `unlock-keychain` with no `-p`: macOS reads the password from the terminal itself.
+    fn unlock(&self) -> bool {
+        let mut args = s(&["unlock-keychain"]);
+        if let Some(f) = &self.keychain_file {
+            args.push(f.to_string_lossy().into_owned());
+        }
+        matches!(self.runner.run_attached(SECURITY, &args), RunResult::Exited { code: 0, .. })
     }
 }
 ```
@@ -10811,11 +10957,14 @@ git commit -m "Pin the local-state invariant across every M1 command"
 - Test: `crates/tagteam/tests/app.rs` (in-process), `crates/tagteam/tests/cli.rs` (the binary)
 
 **Interfaces:**
-- Consumes: the whole engine; `ClaudeCode`, `LiveStore`, `Platform`; `SecurityCli`, `FileKeychain`
+- Consumes: the whole engine; `ClaudeCode`, `LiveStore`, `Platform`; `SecurityCli`, `FileKeychain`;
+  `Keychain::lock_state`, `Keychain::unlock`, `LockState`; in tests,
+  `FakeKeychain::set_locked`, `set_refuse_unlock` and `unlock_attempts` (Task 9)
 - Produces:
 ```rust
 pub mod cli { pub struct Cli { pub json: bool, pub debug: bool, pub no_color: bool,
-    pub provider: Option<String>, pub command: Option<Command> } pub enum Command { .. } }
+    pub provider: Option<String>, pub command: Option<Command> } pub enum Command { .. }
+    impl Command { pub fn touches_keychain(&self) -> bool } }
 pub mod prompt { pub trait Prompter { fn interactive(&self) -> bool;
     fn confirm(&mut self, question: &str, default_yes: bool) -> bool;
     fn choose(&mut self, question: &str, options: &[String]) -> Option<usize>;
@@ -10828,6 +10977,12 @@ pub mod app { pub struct Context { pub env: Env, pub keychain: Arc<dyn Keychain>
 With the `test-support` feature, `Context::from_process` honours `TAGTEAM_TEST_KEYCHAIN_DIR`
 (a `FileKeychain`) and `TAGTEAM_TEST_PLATFORM` (`macos` | `linux`); release builds contain
 neither.
+
+On macOS, a command whose `touches_keychain()` is true (`add`, `add-token`, `switch`,
+`remove`) first runs the lock check (Appendix A.3 "Lock check and unlock"), before any engine
+call: `Keychain::lock_state`; if `Locked` and interactive (`!json && prompter.interactive()`),
+`Prompter::confirm` and then `Keychain::unlock`; otherwise it fails with exit 1 and error type
+`keychain-locked`. Linux runs no check.
 
 - [ ] **Step 1: Write the failing in-process tests**
 
@@ -10850,14 +11005,15 @@ use tagteam_provider::{Env, FakeKeychain};
 struct Scripted {
     interactive: bool,
     answers: VecDeque<&'static str>,
+    asked: Vec<String>,
 }
 
 impl Scripted {
     fn none() -> Self {
-        Self { interactive: false, answers: VecDeque::new() }
+        Self { interactive: false, answers: VecDeque::new(), asked: Vec::new() }
     }
     fn answering(a: &[&'static str]) -> Self {
-        Self { interactive: true, answers: a.iter().copied().collect() }
+        Self { interactive: true, answers: a.iter().copied().collect(), asked: Vec::new() }
     }
 }
 
@@ -10865,7 +11021,8 @@ impl Prompter for Scripted {
     fn interactive(&self) -> bool {
         self.interactive
     }
-    fn confirm(&mut self, _q: &str, default_yes: bool) -> bool {
+    fn confirm(&mut self, q: &str, default_yes: bool) -> bool {
+        self.asked.push(q.to_owned());
         match self.answers.pop_front().expect("unexpected prompt") {
             "" => default_yes,
             a => a.starts_with('y'),
@@ -11062,6 +11219,73 @@ fn prompts_never_block_a_non_interactive_caller() {
     assert!(err.contains("`-`"), "{err}");
 }
 
+const LOCKED: &str =
+    "the login keychain is locked (common over SSH); run `security unlock-keychain ~/Library/Keychains/login.keychain-db`, then retry";
+
+#[test]
+fn a_locked_keychain_is_offered_for_unlocking_on_a_terminal() {
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    h.kc.set_locked(true);
+    let mut yes = Scripted::answering(&[""]);
+    let (code, out, err) = h.run(&["add"], &mut yes);
+    assert_eq!((code, out.as_str()), (0, "Added a@x.co at position 1.\n"), "{err}");
+    assert_eq!(yes.asked, ["The login keychain is locked (common over SSH). Unlock it now?"]);
+    assert_eq!(h.kc.unlock_attempts(), 1);
+    // Declined: no unlock is attempted, and the command does nothing.
+    h.kc.set_locked(true);
+    let (code, out, err) = h.run(&["remove", "1"], &mut Scripted::answering(&["n"]));
+    assert_eq!((code, out.as_str(), err), (1, "", format!("tagteam: {LOCKED}\n")));
+    assert_eq!(h.kc.unlock_attempts(), 1);
+    // The unlock failed (a wrong password): the same error.
+    h.kc.set_refuse_unlock(true);
+    let (code, _, err) = h.run(&["remove", "1"], &mut Scripted::answering(&["y"]));
+    assert_eq!((code, err), (1, format!("tagteam: {LOCKED}\n")));
+    assert_eq!(h.kc.unlock_attempts(), 2);
+    h.kc.set_locked(false);
+    assert_eq!(h.ok(&["list"]), "* 1  a@x.co\n");
+}
+
+#[test]
+fn the_unlock_offer_never_blocks_a_non_interactive_caller() {
+    // Review Focus 2: no terminal fails at once, before anything is touched or created.
+    let h = H::new();
+    h.kc.set_locked(true);
+    let touching: [&[&str]; 4] = [&["add"], &["add-token", "sk-ant-api03-key"], &["switch"], &["remove", "1"]];
+    for args in touching {
+        let (code, out, err) = h.run(args, &mut Scripted::none());
+        assert_eq!((code, out.as_str(), err), (1, "", format!("tagteam: {LOCKED}\n")), "{args:?}");
+    }
+    // `--json` never prompts, even on a terminal: Scripted panics on any prompt it has no answer for.
+    let (code, out, _) = h.run(&["add", "--json"], &mut Scripted::answering(&[]));
+    assert_eq!(code, 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap(),
+        json!({"schemaVersion": 1, "error": {"type": "keychain-locked", "message": LOCKED}})
+    );
+    assert_eq!(h.kc.unlock_attempts(), 0);
+    assert!(!h.env.data_dir().exists());
+}
+
+#[test]
+fn commands_that_touch_no_keychain_item_run_no_check() {
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    h.ok(&["add"]);
+    h.ok(&["add-token", "sk-ant-api03-key"]);
+    h.kc.set_locked(true);
+    // A check would find the keychain locked and prompt; this prompter has no answers and panics.
+    let mut p = Scripted::answering(&[]);
+    let store_only: [&[&str]; 7] =
+        [&[], &["list"], &["status"], &["alias", "1", "work"], &["disable", "work"], &["enable", "work"], &["move", "work", "2"]];
+    for args in store_only {
+        let (code, _, err) = h.run(args, &mut p);
+        assert_eq!(code, 0, "{args:?}: {err}");
+    }
+    assert!(p.asked.is_empty());
+    assert_eq!(h.kc.unlock_attempts(), 0);
+}
+
 #[test]
 fn alias_move_remove_and_usage_errors() {
     let h = H::new();
@@ -11134,6 +11358,28 @@ fn add_token_reads_a_line_from_stdin() {
     let out = cmd(d.path()).args(["list", "--json"]).assert().success().get_output().stdout.clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["accounts"][0]["usageStatus"], "api_key");
+}
+
+#[test]
+fn a_locked_keychain_without_a_terminal_fails_and_creates_nothing() {
+    // Appendix A.3 through the binary: no terminal, so no prompt; `list` and `status` run no check.
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join("home")).unwrap();
+    std::fs::create_dir_all(d.path().join("keychain")).unwrap();
+    std::fs::write(d.path().join("keychain/LOCKED"), "").unwrap();
+    cmd(d.path()).args(["list", "--json"]).assert().success();
+    cmd(d.path()).args(["status", "--json"]).assert().success();
+    cmd(d.path())
+        .arg("add")
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(predicates::str::contains("run `security unlock-keychain ~/Library/Keychains/login.keychain-db`"));
+    let out = cmd(d.path()).args(["add-token", "sk-ant-api03-key", "--json"]).assert().code(1).get_output().stdout.clone();
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["error"]["type"], "keychain-locked");
+    assert!(std::fs::read_dir(d.path().join("home")).unwrap().next().is_none(), "HOME must stay empty");
+    // Linux has no Keychain, so no check.
+    cmd(d.path()).args(["add-token", "sk-ant-api03-key"]).env("TAGTEAM_TEST_PLATFORM", "linux").assert().success();
 }
 ```
 
@@ -11220,6 +11466,16 @@ pub enum Command {
     },
     /// Move an account to POSITION, swapping if it is taken
     Move { account: String, position: u32 },
+}
+
+impl Command {
+    /// Whether the command reads or writes a Keychain item on macOS, and so runs the lock check
+    /// first (Appendix A.3). The rest are served from the store and `~/.claude.json`. A
+    /// recovery under their mutation lock (Task 21) only reads the Keychain, tri-state, and
+    /// leaves what it cannot decide to the next command that checks.
+    pub fn touches_keychain(&self) -> bool {
+        matches!(self, Command::Add { .. } | Command::AddToken { .. } | Command::Switch { .. } | Command::Remove { .. })
+    }
 }
 ```
 
@@ -11501,11 +11757,16 @@ use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::security::SecurityCli;
-use tagteam_provider::{Env, Keychain, SystemClock};
+use tagteam_provider::{Env, Keychain, LockState, SystemClock};
 
 use crate::cli::{Cli, Command};
 use crate::prompt::Prompter;
 use crate::{render, root_guard};
+
+/// Appendix A.3. The default keychain is the login keychain, so the hint names its file.
+const UNLOCK_QUESTION: &str = "The login keychain is locked (common over SSH). Unlock it now?";
+const KEYCHAIN_LOCKED: &str =
+    "the login keychain is locked (common over SSH); run `security unlock-keychain ~/Library/Keychains/login.keychain-db`, then retry";
 
 pub struct Context {
     pub env: Env,
@@ -11599,13 +11860,20 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     if let Err(msg) = root_guard::refuse_root() {
         return fail(io, json, "root", &msg);
     }
+    let command = cli.command.unwrap_or(Command::List);
+    // Only a command that touches a Keychain item checks its lock, and only on macOS.
+    let keychain = (ctx.platform == Platform::MacOs && command.touches_keychain()).then(|| ctx.keychain.clone());
     let mut app = App { engine: build_engine(ctx), json, provider_flag: cli.provider.map(ProviderId::new), io };
     if let Some(p) = &app.provider_flag {
         if let Err(e) = app.engine.provider(p) {
             return fail(app.io, json, e.kind(), &e.to_string());
         }
     }
-    let result = app.dispatch(cli.command.unwrap_or(Command::List));
+    let unlocked = match &keychain {
+        Some(k) => app.ensure_unlocked(k.as_ref()),
+        None => Ok(()),
+    };
+    let result = unlocked.and_then(|()| app.dispatch(command));
     match result {
         Ok(()) => 0,
         Err(Failure::Engine(e)) => fail(app.io, json, e.kind(), &e.to_string()),
@@ -11643,6 +11911,21 @@ impl App<'_, '_> {
         for n in notices {
             let _ = writeln!(self.io.err, "note: {n}");
         }
+    }
+
+    /// Appendix A.3, before the command touches anything. On a terminal, a locked keychain is
+    /// offered for unlocking and macOS asks for the password itself: tagteam never sees it.
+    /// Anywhere else the command fails at once, naming the unlock command.
+    fn ensure_unlocked(&mut self, keychain: &dyn Keychain) -> Result<(), Failure> {
+        // `Unknown` proceeds: the tri-state reads refuse safely on their own.
+        if keychain.lock_state() != LockState::Locked {
+            return Ok(());
+        }
+        let interactive = !self.json && self.io.prompter.interactive();
+        if interactive && self.io.prompter.confirm(UNLOCK_QUESTION, true) && keychain.unlock() {
+            return Ok(());
+        }
+        Err(Failure::Message("keychain-locked", KEYCHAIN_LOCKED.into()))
     }
 
     /// §10.4, with a terminal prompt for an ambiguous email.

@@ -1607,6 +1607,8 @@ an additive `others: [ … ]` array.
 **Rules:**
 - The output is one JSON object on stdout; warnings and notices go to stderr.
 - Errors produce `{"schemaVersion":1,"error":{"type":<Kind>,"message":…}}` with a non-zero exit.
+  `type` is a stable kind (§14). `keychain-locked` means the login keychain is locked and was
+  not unlocked (Appendix A.3).
 
 **`list`** returns `{schemaVersion, activeAccountNumber, accounts:[row], displacedCredentials?}`.
 
@@ -1976,6 +1978,23 @@ providers.
     An over-long `-i` line truncates silently and leaves the old entry.
   - `-U` updates the item in place and preserves its access control.
 - **Delete:** `delete-generic-password -a <acct> -s <svc>`. rc 44 counts as success.
+- **Lock check and unlock** (§17, R1). Over SSH the login keychain stays locked: reads, writes
+  and `show-keychain-info` all return rc 36.
+  - A command that will read or write a Keychain item first runs `show-keychain-info` on the
+    default keychain: rc 0 is unlocked, rc 36 locked. Any other rc (such as 128 for a locked
+    keychain file) or a timeout is unknown, and the command proceeds; its tri-state reads
+    refuse safely.
+  - A command that touches no Keychain item runs no check, so `list` and `status` with no
+    store never spawn `security`. Linux has no check. `doctor` reports the state instead
+    (§13.6).
+  - **On a terminal** (stdin and stderr are TTYs, no `--json`), a locked keychain prompts on
+    stderr: `The login keychain is locked (common over SSH). Unlock it now? [Y/n]`. Yes runs
+    `security unlock-keychain` with the terminal attached and no password argument, so macOS
+    asks for the password; tagteam never sees, stores or passes it. Exit 0 continues the
+    command.
+  - **Otherwise** (no terminal, `--json`, declined, or a failed unlock), the command fails
+    before touching anything: exit 1, `keychain-locked`, naming
+    `security unlock-keychain ~/Library/Keychains/login.keychain-db`.
 - **Active reads** retry the Keychain twice, 300 ms apart. CC caches Keychain reads for 30 s and
   serves its stale cache on a read failure.
 - **CC's read precedence.** CC reads the Keychain first and `.credentials.json` only as a
