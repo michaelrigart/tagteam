@@ -1911,7 +1911,7 @@ anything fails.
 
 | # | Risk / item | Mitigation |
 |---|---|---|
-| R1 | Keychain access control. Items created through Security.framework might make CC's `security` reads prompt or fail (rc 36) over SSH or under launchd (*inferred*) | Use only `/usr/bin/security` for every item. The first plan task is a real-Mac spike: an item written by tagteam, read by `claude` from an SSH session |
+| R1 | Keychain access control. Items created through Security.framework might make CC's `security` reads prompt or fail (rc 36) over SSH or under launchd (*inferred*) | Verified on 2026-09-27, macOS 27.0, CC 2.1.283: `claude` silently reads tagteam-written items from SSH and GUI sessions alike. An SSH session's login keychain stays locked (rc 36) until `security unlock-keychain`, for Claude Code's own items as much as for tagteam's. |
 | R2 | CC drift beyond 2.1.283. A feature-flagged storage layer ("storageV5") may bypass the `~/.claude.json` lock; new per-account files may appear in `~/.claude` | The weekly compat job, `doctor` version warnings, and the known-entries lists |
 | R3 | The usage endpoint budget is empirical (~30 requests per hour per identity) and could change | Enforce a hard budget of 20 per hour below it, and keep the 180 s floor and AIMD. Re-derive the constants from logs, not from comments |
 | R4 | The merge-back can conflict with concurrent edits of `~/.claude.json` | Three-way merge against the baseline, the default file wins, under CC's config lock |
@@ -1968,6 +1968,8 @@ providers.
     data was non-printable; decode it.
   - rc 44: `Absent`. rc 36, any other rc, or a timeout: `Unreadable`.
 - **Existence probe:** the same command without `-w` (attributes only; never prompts).
+  - On a locked keychain file or a locked SSH session: rc 0 for present, rc 44 for absent; never prompts.
+  - `show-keychain-info` on a locked keychain file returns rc 128. The argv/new-item versus `-i`/`-U` write difference does not change the item's ACL (both use the same binary).
 - **Write:** `security -i`, with the stdin line `add-generic-password -U -a "<acct>" -s "<svc>"
   -X "<hex>"`.
   - If the line exceeds 4032 bytes (the 4096-byte `-i` line limit minus 64), use argv instead.
