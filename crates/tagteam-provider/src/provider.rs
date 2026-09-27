@@ -50,31 +50,23 @@ pub struct CapturedLogin {
     pub login_expires_at: Option<i64>,
 }
 
-/// Both auth axes, each tri-state: the credential entry and the managed API key.
-#[derive(Clone)]
+/// Both auth axes, each tri-state: the credential entry and the managed API key. `Debug` is
+/// derived: `Read<T>`'s own `Debug` already redacts the payload of both fields, so a
+/// hand-written impl here would only risk diverging from it.
+#[derive(Debug, Clone)]
 pub struct LiveAuth {
     pub credential: Read<Credential>,
     pub managed_key: Read<Vec<u8>>,
-}
-
-impl fmt::Debug for LiveAuth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let key = match &self.managed_key {
-            Read::Present(k) => format!("<{} bytes>", k.len()),
-            Read::Absent => "Absent".into(),
-            Read::Unreadable(e) => format!("Unreadable({e})"),
-        };
-        f.debug_struct("LiveAuth")
-            .field("credential", &self.credential)
-            .field("managed_key", &key)
-            .finish()
-    }
 }
 
 /// The exact provider-owned state a switch may write (§3). Drives the pinned test (§15.3).
 #[derive(Debug, Clone, Default)]
 pub struct IdentitySurface {
     /// Files where only these top-level keys may change; every other byte stays identical.
+    /// This type only names which top-level keys move — nested shape and append-only rules
+    /// (§3: e.g. `customApiKeyResponses.approved` may only grow by appending) are enforced by
+    /// the §15.3 invariant test, not by this type. Per-command scoping arrives with `run` in
+    /// M4.
     pub json_keys: Vec<(PathBuf, Vec<String>)>,
     /// Credential files whose account-scoped keys may change; machine-shared keys may not.
     pub credential_files: Vec<PathBuf>,
@@ -111,6 +103,45 @@ impl<'g> LiveLocks<'g> {
 /// Restores what one write replaced, for same-process rollback (§9.4 step 10). Every restore
 /// re-checks lock ownership first: after a takeover, CC may have written since, and restoring
 /// would overwrite it (§9.1).
+///
+/// A `Provider` returns `Box<dyn Undo + 'l>` tied to the `&'l LiveLocks<'_>` borrow that
+/// produced it (§9.4 step 10: the credential locks must be "held throughout"), so the box
+/// cannot outlive the locks it must run under. Dropping the locks while an undo made from
+/// them is still alive is a borrow-checker error, not a runtime one:
+///
+/// ```compile_fail
+/// use std::time::Duration;
+/// use tagteam_provider::{Env, LiveLockSet, LiveLocks, LockError, MutationGuard, ProviderError, Undo};
+///
+/// struct AlwaysOwned;
+/// impl LiveLockSet for AlwaysOwned {
+///     fn check_owned(&self) -> Result<(), LockError> {
+///         Ok(())
+///     }
+/// }
+///
+/// struct NoopUndo;
+/// impl Undo for NoopUndo {
+///     fn undo(self: Box<Self>, _locks: &LiveLocks<'_>) -> Result<(), ProviderError> {
+///         Ok(())
+///     }
+///     fn what(&self) -> String {
+///         "noop".into()
+///     }
+/// }
+///
+/// fn write_credential<'l>(locks: &'l LiveLocks<'_>) -> Box<dyn Undo + 'l> {
+///     Box::new(NoopUndo)
+/// }
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let env = Env::for_test(dir.path());
+/// let guard = MutationGuard::acquire(&env, Duration::from_millis(100)).unwrap();
+/// let locks = LiveLocks::new(&guard, Box::new(AlwaysOwned));
+/// let undo = write_credential(&locks);
+/// drop(locks); // still borrowed by `undo`: cannot move out of `locks`
+/// undo.undo(&locks).unwrap();
+/// ```
 pub trait Undo: Send {
     fn undo(self: Box<Self>, locks: &LiveLocks<'_>) -> Result<(), ProviderError>;
     fn what(&self) -> String;
@@ -172,28 +203,30 @@ pub trait Provider: Send + Sync {
         g: &'g MutationGuard,
     ) -> Result<LiveLocks<'g>, ProviderError>;
     /// Composes the target (§9.4 step 5), writes it on its axis, then clears the other axis
-    /// (step 7). Refuses when an entry it would overwrite cannot be read fresh.
-    fn write_credential(
+    /// (step 7). Refuses when an entry it would overwrite cannot be read fresh. The returned
+    /// undo is tied to `locks`'s borrow (§9.4 step 10: the credential locks must be "held
+    /// throughout") and cannot outlive it.
+    fn write_credential<'l>(
         &self,
         env: &Env,
-        locks: &LiveLocks<'_>,
+        locks: &'l LiveLocks<'_>,
         target: &StoredLogin,
         live: &LiveAuth,
-    ) -> Result<Box<dyn Undo>, ProviderError>;
+    ) -> Result<Box<dyn Undo + 'l>, ProviderError>;
     /// Clears the auth axis other than `kept_kind`'s (§9.6 finish-forward).
-    fn clear_other_axis(
+    fn clear_other_axis<'l>(
         &self,
         env: &Env,
-        locks: &LiveLocks<'_>,
+        locks: &'l LiveLocks<'_>,
         kept_kind: &str,
-    ) -> Result<Box<dyn Undo>, ProviderError>;
+    ) -> Result<Box<dyn Undo + 'l>, ProviderError>;
     /// Splices the identity into the live config; `None` removes it (§9.4 step 8).
-    fn write_identity(
+    fn write_identity<'l>(
         &self,
         env: &Env,
-        locks: &LiveLocks<'_>,
+        locks: &'l LiveLocks<'_>,
         identity: Option<&Identity>,
-    ) -> Result<Box<dyn Undo>, ProviderError>;
+    ) -> Result<Box<dyn Undo + 'l>, ProviderError>;
     /// For the post-switch hint (§9.4 "After unlocking").
     fn uses_file_store(&self, env: &Env) -> bool;
 }
@@ -218,8 +251,34 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let env = Env::for_test(d.path());
         let g = MutationGuard::acquire(&env, std::time::Duration::from_millis(100)).unwrap();
+        let owned = LiveLocks::new(&g, Box::new(Held(std::cell::Cell::new(true))));
+        assert!(owned.check_owned().is_ok());
+        let compromised = LiveLocks::new(&g, Box::new(Held(std::cell::Cell::new(false))));
+        assert!(matches!(
+            compromised.check_owned(),
+            Err(LockError::Compromised(_))
+        ));
+    }
+
+    struct NoopUndo;
+    impl Undo for NoopUndo {
+        fn undo(self: Box<Self>, locks: &LiveLocks<'_>) -> Result<(), ProviderError> {
+            locks.check_owned()?;
+            Ok(())
+        }
+        fn what(&self) -> String {
+            "noop".into()
+        }
+    }
+
+    #[test]
+    fn an_undo_runs_while_its_locks_are_held() {
+        let d = tempfile::tempdir().unwrap();
+        let env = Env::for_test(d.path());
+        let g = MutationGuard::acquire(&env, std::time::Duration::from_millis(100)).unwrap();
         let locks = LiveLocks::new(&g, Box::new(Held(std::cell::Cell::new(true))));
-        assert!(locks.check_owned().is_ok());
+        let undo: Box<dyn Undo + '_> = Box::new(NoopUndo);
+        assert!(undo.undo(&locks).is_ok());
     }
 
     #[test]
