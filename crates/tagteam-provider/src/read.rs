@@ -2,11 +2,23 @@ use std::fmt;
 
 /// Every read of a credential, config, roster or session record (§4.3). `Unreadable` is
 /// never collapsed into `Absent` or into an empty value.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Read<T> {
     Present(T),
     Absent,
     Unreadable(ReadError),
+}
+
+/// Hand-written so a secret payload (e.g. `Read<Vec<u8>>` from a Keychain or vault read)
+/// never reaches `Debug`, regardless of whether `T` implements it.
+impl<T> fmt::Debug for Read<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Read::Present(_) => write!(f, "Present(..)"),
+            Read::Absent => write!(f, "Absent"),
+            Read::Unreadable(e) => write!(f, "Unreadable({e:?})"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,5 +83,21 @@ mod tests {
         let a: Read<u8> = Read::Absent;
         assert!(a.present().is_none());
         assert_eq!(Read::Present(2).map(|v| v * 2).present(), Some(4));
+    }
+
+    #[test]
+    fn debug_never_prints_the_payload() {
+        let shown = format!("{:?}", Read::Present(b"sk-ant-secret".to_vec()));
+        assert!(!shown.contains("sk-ant"), "{shown}");
+        assert!(!shown.contains("115, 107"), "{shown}");
+        for byte in b"sk-ant-secret" {
+            assert!(!shown.contains(&byte.to_string()), "{shown}");
+        }
+
+        let wrapped = format!(
+            "{:?}",
+            Ok::<Read<Vec<u8>>, ()>(Read::Present(b"sk".to_vec()))
+        );
+        assert!(wrapped.contains("Present(..)"), "{wrapped}");
     }
 }

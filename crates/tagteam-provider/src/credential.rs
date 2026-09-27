@@ -15,6 +15,7 @@ pub struct Credential {
 }
 
 impl Credential {
+    /// Only for bytes from a successful, authoritative Keychain or file read.
     pub fn fresh(bytes: Vec<u8>) -> Self {
         Self {
             bytes,

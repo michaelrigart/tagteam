@@ -39,7 +39,13 @@ impl Env {
 
     /// A fixture environment rooted at `root`, with the harness guard armed against the
     /// real HOME.
+    ///
+    /// Panics if the real `HOME` is unset: an unarmed guard would fail open and let a test
+    /// write under the real HOME undetected.
     pub fn for_test(root: &std::path::Path) -> Self {
+        let real_home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME must be set so Env::for_test can arm its real-HOME guard");
         Self {
             home: root.join("home"),
             user: Some("tester".into()),
@@ -48,7 +54,7 @@ impl Env {
             xdg_state_home: None,
             claude_config_dir: None,
             claude_securestorage_config_dir: None,
-            forbidden_root: std::env::var_os("HOME").map(PathBuf::from),
+            forbidden_root: Some(real_home),
         }
     }
 
@@ -135,6 +141,14 @@ mod tests {
     fn the_harness_guard_trips() {
         let env = Env::for_test(Path::new("/tmp/fixture"))
             .with_forbidden_root(PathBuf::from("/tmp/fixture/home"));
+        let _ = env.data_dir();
+    }
+
+    #[test]
+    #[should_panic(expected = "under the real HOME")]
+    fn for_test_arms_itself_against_the_real_home_by_default() {
+        let real_home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let env = Env::for_test(&real_home.join("tagteam-guard-probe"));
         let _ = env.data_dir();
     }
 
