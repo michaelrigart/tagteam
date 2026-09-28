@@ -125,6 +125,31 @@ fn check_identity_conflict(
     Ok(())
 }
 
+/// §10.2's default email, `<prefix>-<N>@token.local`, with N the position the token goes to,
+/// or the next N no account holds when that identity is taken. A defaulted identity never
+/// names an existing account, so a plain `add-token` never replaces one: only an explicit
+/// `--email` does.
+fn unused_token_identity(
+    store: &Store,
+    p: &dyn Provider,
+    provider: &ProviderId,
+    prefix: &str,
+    position: u32,
+) -> Result<Identity, EngineError> {
+    let mut n = position;
+    loop {
+        let identity = p.token_identity(&format!("{prefix}-{n}@token.local"));
+        let key = p.identity_key(&identity);
+        if store
+            .find_by_identity_key(provider, key.as_str())?
+            .is_none()
+        {
+            return Ok(identity);
+        }
+        n += 1;
+    }
+}
+
 /// What a login write will replace, decided before anything is mutated.
 struct Prepared {
     existing: Option<AccountRow>,
@@ -474,14 +499,8 @@ impl Engine {
         } else {
             "setup-token"
         };
-        let email_for = |position: u32| {
-            opts.email
-                .clone()
-                .unwrap_or_else(|| format!("{prefix}-{position}@token.local"))
-        };
-        let next = self.next_position_precheck(&opts.provider, opts.position)?;
-        let email = email_for(opts.position.unwrap_or(next));
-        if !is_valid_email(&email) {
+        self.next_position_precheck(&opts.provider, opts.position)?;
+        if let Some(email) = opts.email.as_deref().filter(|e| !is_valid_email(e)) {
             return Err(EngineError::InvalidInput(format!(
                 "{email:?} is not a valid email address"
             )));
@@ -489,12 +508,17 @@ impl Engine {
         let _guard = self.mutation_guard()?;
         self.refuse_if_interrupted(&opts.provider)?;
         let store = self.store()?;
-        // Under the lock the position is authoritative, so a default email follows it.
-        let position = match opts.position {
-            Some(pos) => pos,
-            None => store.next_position(&opts.provider)?,
+        let identity = match &opts.email {
+            Some(email) => p.token_identity(email),
+            // Under the lock the position is authoritative, so a default email follows it.
+            None => {
+                let position = match opts.position {
+                    Some(pos) => pos,
+                    None => store.next_position(&opts.provider)?,
+                };
+                unused_token_identity(&store, p.as_ref(), &opts.provider, prefix, position)?
+            }
         };
-        let identity = p.token_identity(&email_for(position));
         let claimed_uuid = identity.account_uuid.as_deref();
         let prep = self.prepare(
             &store,

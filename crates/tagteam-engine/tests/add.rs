@@ -535,6 +535,108 @@ fn add_token_stores_api_keys_and_setup_tokens() {
 }
 
 #[test]
+fn a_defaulted_email_over_a_default_named_token_needs_confirmation() {
+    // §10.1/§10.3: `--position 1` over the token already at 1 is an occupied position, even
+    // though that token's default email is the one position 1 would default to.
+    let fx = Fx::new();
+    let first = fx.add_api_key("sk-ant-api03-first-key");
+    let at1 = |yes| AddTokenOptions {
+        position: Some(1),
+        yes,
+        ..token_opts(&fx, "sk-ant-api03-second-key")
+    };
+    assert!(matches!(
+        fx.engine.add_token(at1(false)),
+        Err(EngineError::NeedsConfirmation { position: 1, .. })
+    ));
+    assert_eq!(
+        fx.vault_bytes(&first).unwrap(),
+        b"sk-ant-api03-first-key",
+        "the stored token is untouched"
+    );
+    let out = fx.engine.add_token(at1(true)).unwrap();
+    assert!(out.created);
+    assert_ne!(
+        out.account.id, first,
+        "a new account, not the old one rewritten"
+    );
+    assert_eq!(out.account.position, 1);
+    assert_eq!(
+        fx.vault_bytes(&out.account.id).unwrap(),
+        b"sk-ant-api03-second-key"
+    );
+    let store = fx.engine.store().unwrap();
+    assert!(
+        store.account(&first).unwrap().is_none(),
+        "the confirmed occupant is replaced"
+    );
+}
+
+#[test]
+fn a_defaulted_email_never_names_an_existing_token_account() {
+    // After a move and a remove, the next position's default email belongs to the account
+    // moved away from it. A plain `add-token` must add, never rewrite that account's token.
+    for (first, second, third) in [
+        (
+            "sk-ant-api03-first",
+            "sk-ant-api03-second",
+            "sk-ant-api03-third",
+        ),
+        (
+            "sk-ant-oat01-first",
+            "sk-ant-oat01-second",
+            "sk-ant-oat01-third",
+        ),
+    ] {
+        let fx = Fx::new();
+        let k1 = fx.add_api_key(first); // <prefix>-1 at 1
+        let k2 = fx.add_api_key(second); // <prefix>-2 at 2
+        fx.engine.move_to(&k2, 1).unwrap(); // k2 at 1, k1 at 2
+        fx.engine.remove(&k1).unwrap(); // the next position is 2 again
+        let k2_secret = fx.vault_bytes(&k2).unwrap();
+        let out = fx.engine.add_token(token_opts(&fx, third)).unwrap();
+        assert!(out.created, "{third}");
+        assert_ne!(out.account.id, k2, "{third}");
+        assert_eq!(out.account.position, 2, "{third}");
+        assert_eq!(fx.vault_bytes(&k2).unwrap(), k2_secret, "{third}");
+        let store = fx.engine.store().unwrap();
+        assert_eq!(store.accounts(&fx.provider()).unwrap().len(), 2, "{third}");
+        let labels: std::collections::BTreeSet<String> = store
+            .accounts(&fx.provider())
+            .unwrap()
+            .into_iter()
+            .map(|a| a.label)
+            .collect();
+        assert_eq!(labels.len(), 2, "two distinct identities: {labels:?}");
+    }
+}
+
+#[test]
+fn an_explicit_email_still_replaces_that_token_account_in_place() {
+    // §10.2: naming an existing token account's email is the way to replace its token.
+    let fx = Fx::new();
+    let first = fx.add_api_key("sk-ant-api03-first-key");
+    let label = fx
+        .engine
+        .store()
+        .unwrap()
+        .account(&first)
+        .unwrap()
+        .unwrap()
+        .label;
+    let out = fx
+        .engine
+        .add_token(AddTokenOptions {
+            email: Some(label),
+            ..token_opts(&fx, "sk-ant-api03-second-key")
+        })
+        .unwrap();
+    assert!(!out.created);
+    assert_eq!(out.account.id, first);
+    assert_eq!(fx.vault_bytes(&first).unwrap(), b"sk-ant-api03-second-key");
+}
+
+#[test]
 fn add_token_validates_its_inputs() {
     let fx = Fx::new();
     assert!(matches!(
