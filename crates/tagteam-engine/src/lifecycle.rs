@@ -535,4 +535,65 @@ impl Engine {
             notices: vec![],
         })
     }
+
+    fn managed_row(&self, id: &AccountId) -> Result<AccountRow, EngineError> {
+        self.store()?
+            .account(id)?
+            .ok_or_else(|| EngineError::NoSuchAccount(id.to_string()))
+    }
+
+    /// §10.3. The live login is never touched.
+    pub fn remove(&self, id: &AccountId) -> Result<AccountRow, EngineError> {
+        self.refuse_inside_run_shell()?;
+        let provider = self.managed_row(id)?.provider;
+        self.settle_or_refuse(&provider)?;
+        let _guard = self.mutation_guard()?;
+        self.refuse_if_interrupted(&provider)?;
+        let row = self.managed_row(id)?;
+        let lock = self.lock_account(id)?;
+        self.remove_locked(&row, &lock)?;
+        Ok(row)
+    }
+
+    /// Changes only store metadata (§9.6, amended): proceeds even while a switch for this
+    /// account's provider is undecidable, unlike `remove`.
+    pub fn set_alias(
+        &self,
+        id: &AccountId,
+        alias: Option<&str>,
+    ) -> Result<AccountRow, EngineError> {
+        self.refuse_inside_run_shell()?;
+        let alias = alias_arg(alias)?;
+        let _guard = self.mutation_guard()?;
+        self.managed_row(id)?;
+        self.store()?
+            .set_alias(id, alias.as_deref())
+            .map_err(alias_taken)?;
+        self.managed_row(id)
+    }
+
+    /// Changes only store metadata (§9.6, amended): proceeds even while a switch for this
+    /// account's provider is undecidable, unlike `remove`.
+    pub fn set_disabled(&self, id: &AccountId, disabled: bool) -> Result<AccountRow, EngineError> {
+        self.refuse_inside_run_shell()?;
+        let _guard = self.mutation_guard()?;
+        self.managed_row(id)?;
+        self.store()?.set_disabled(id, disabled)?;
+        self.managed_row(id)
+    }
+
+    /// Reorders only; if the position is taken, the two accounts swap. Changes only store
+    /// metadata (§9.6, amended): proceeds even while a switch for this account's provider is
+    /// undecidable, unlike `remove`.
+    pub fn move_to(&self, id: &AccountId, position: u32) -> Result<AccountRow, EngineError> {
+        self.refuse_inside_run_shell()?;
+        let _guard = self.mutation_guard()?;
+        let row = self.managed_row(id)?;
+        // Reuses the same pre-lock-style check `add_live`/`add_token` share, instead of
+        // repeating `check_position(position, store.next_position(&row.provider)?.saturating_sub(1))`
+        // a third time.
+        self.next_position_precheck(&row.provider, Some(position))?;
+        self.store()?.move_to(id, position)?;
+        self.managed_row(id)
+    }
 }
