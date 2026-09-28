@@ -10,7 +10,12 @@ use tagteam::app::{self, Context, Io};
 use tagteam::cli::Cli;
 use tagteam::prompt::Prompter;
 use tagteam_cc::live::Platform;
+use tagteam_cc::{ItemKind, keychain_service};
 use tagteam_provider::{Env, FakeKeychain};
+
+const UNLOCK: &str = "The login keychain is locked (common over SSH). Unlock it now?";
+/// A switch on macOS whose Keychain write fell back to Claude Code's credentials file.
+const FELL_BACK: &str = "warning: the Keychain could not be written, so the credential went to Claude Code's credentials file instead\n";
 
 struct Scripted {
     interactive: bool,
@@ -263,7 +268,7 @@ fn status_and_switch_json() {
     assert_eq!(
         h.json(&["switch", "1", "--json"]),
         json!({"schemaVersion": 1, "provider": "claude-code", "switched": true, "from": 2, "to": 1, "strategy": "direct",
-               "reason": "switched", "message": "Switched to a@x.co", "warnings": []})
+               "reason": "switched", "message": "Switched to a@x.co", "credentialStore": "keychain", "warnings": []})
     );
     assert_eq!(
         h.json(&["status", "--json"]),
@@ -308,6 +313,71 @@ fn an_unmanaged_login_is_offered_for_adding_on_a_terminal() {
         out.starts_with("Added stranger@x.co at position 2.\nSwitched to a@x.co (position 1).\n"),
         "{out}"
     );
+}
+
+#[test]
+fn with_no_store_adding_from_a_switch_checks_the_keychain_first() {
+    // No store, so `switch` itself ran no lock check; adding the live login reads the live
+    // credential and writes the vault, so the offer runs Appendix A.3's check before it.
+    let h = H::new();
+    h.login("stranger@x.co", "rt-s");
+    h.kc.set_locked(true);
+    let mut yes = Scripted::answering(&["", ""]);
+    let (code, out, err) = h.run(&["switch"], &mut yes);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(yes.asked, [ADD_STRANGER_FIRST, UNLOCK]);
+    assert_eq!(h.kc.unlock_attempts(), 1);
+    assert_eq!(
+        out,
+        "Added stranger@x.co at position 1.\nthere is only one switchable account\n"
+    );
+    // Declining the unlock refuses as the check always does, and adds nothing.
+    let h = H::new();
+    h.login("stranger@x.co", "rt-s");
+    h.kc.set_locked(true);
+    let mut no_unlock = Scripted::answering(&["", "n"]);
+    let (code, out, err) = h.run(&["switch"], &mut no_unlock);
+    assert_eq!(
+        (code, out.as_str(), err),
+        (1, "", format!("tagteam: {LOCKED}\n"))
+    );
+    assert_eq!(no_unlock.asked, [ADD_STRANGER_FIRST, UNLOCK]);
+    assert_eq!(h.kc.unlock_attempts(), 0);
+    assert!(!h.env.data_dir().exists());
+}
+
+#[test]
+fn a_keychain_write_that_falls_back_to_the_file_is_reported() {
+    // Appendix A.3: the credential went to Claude Code's credentials file instead.
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    h.ok(&["add"]);
+    h.login("b@x.co", "rt-b");
+    h.ok(&["add"]);
+    let live_item = keychain_service(&h.env, ItemKind::OAuth);
+    h.kc.set_fail_write(&live_item, true);
+    let (code, out, err) = h.run(&["switch", "1"], &mut Scripted::none());
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            0,
+            "Switched to a@x.co (position 1).\nActive on your next message.\n",
+            FELL_BACK
+        )
+    );
+    let (code, out, err) = h.run(&["switch", "2", "--json"], &mut Scripted::none());
+    assert_eq!((code, err.as_str()), (0, FELL_BACK));
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (v["switched"].clone(), v["credentialStore"].clone()),
+        (json!(true), json!("file"))
+    );
+    // Once the Keychain takes the write again, nothing is reported.
+    h.kc.set_fail_write(&live_item, false);
+    let (code, out, err) = h.run(&["switch", "1", "--json"], &mut Scripted::none());
+    assert_eq!((code, err.as_str()), (0, ""));
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["credentialStore"], "keychain");
 }
 
 #[test]
@@ -397,10 +467,7 @@ fn a_locked_keychain_is_offered_for_unlocking_on_a_terminal() {
         (0, "Added a@x.co at position 1.\n"),
         "{err}"
     );
-    assert_eq!(
-        yes.asked,
-        ["The login keychain is locked (common over SSH). Unlock it now?"]
-    );
+    assert_eq!(yes.asked, [UNLOCK]);
     assert_eq!(h.kc.unlock_attempts(), 1);
     // Declined: no unlock is attempted, and the command does nothing.
     h.kc.set_locked(true);
@@ -464,7 +531,8 @@ fn with_no_store_switch_and_remove_run_no_lock_check() {
         serde_json::from_str::<Value>(&out).unwrap(),
         json!({"schemaVersion": 1, "provider": "claude-code", "switched": false, "from": null, "to": null,
                "strategy": "rotation", "reason": "no-valid-target",
-               "message": "there are no stored accounts; add one with `tagteam add`", "warnings": []})
+               "message": "there are no stored accounts; add one with `tagteam add`",
+               "credentialStore": null, "warnings": []})
     );
     let (code, out, err) = h.run(&["remove", "1"], &mut Scripted::answering(&[]));
     assert_eq!(

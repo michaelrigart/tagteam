@@ -298,8 +298,10 @@ mode 0700, so a command that changes nothing creates nothing.
 Every file that contains secrets is created with mode 0600 at creation time (`O_EXCL`, then
 write, then rename). It is never chmod'ed afterwards.
 
-tagteam refuses to run as root unless it detects a container, using the same heuristics as
-`cswap:switcher.py:389-426`. This prevents root-owned files in user directories.
+tagteam refuses to run as root unless `/` is an overlay mount: the visible root mount in
+`/proc/self/mountinfo` has filesystem type `overlay`, as in a Docker container. On macOS, which
+has no `/proc`, it always refuses. Containers whose root is not an overlay (LXC on ext4, for
+example) are deliberately refused too. This prevents root-owned files in user directories.
 
 CC path and store resolution is specified in Appendix A.
 
@@ -1637,14 +1639,19 @@ windows. Claude Code renders cswap's shape:
 
 **`status`** returns one of:
 - `{schemaVersion, provider, active: null}`
-- `{provider, active: {email, provider, managed: false}}`
-- `{provider, active: {number, position, id, email, …row fields, managed: true}, totalManagedAccounts}`
+- `{schemaVersion, provider, active: {email, provider, managed: false}}`
+- `{schemaVersion, provider, active: {number, position, id, email, …row fields, managed: true}, totalManagedAccounts}`
+
+An account command's result is `{schemaVersion, ok, account: row, created?}`; `remove`'s reports
+`active` as it was before the removal.
 
 **`switch`** returns `{schemaVersion, switched, from, to, strategy, reason, message, warnings}`.
 - `strategy` is `rotation | best | next-available | direct`.
 - `reason` is `switched | already-active | activated | unmanaged-account | only-one-account |
   usage-unavailable | already-best | candidates-exhausted | no-valid-target | session-owned |
   interrupted-switch | profile-conflict`. The last three are additive to cswap's set.
+- `credentialStore` (additive) is `keychain | file` once a credential was written, else `null`.
+  `file` on macOS means the Keychain write failed and fell back to the file (Appendix A.3).
 
 `doctor` and `history` have their own `--json` shapes, documented in `--help` and snapshot
 tested.

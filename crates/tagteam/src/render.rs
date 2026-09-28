@@ -172,8 +172,15 @@ pub fn switch_json(o: &SwitchOutcome, provider: &str) -> Value {
         "strategy": o.strategy,
         "reason": o.reason.as_str(),
         "message": o.message,
+        "credentialStore": credential_store(o),
         "warnings": o.warnings,
     })
+}
+
+/// §13.2: where the switch wrote the credential; `None` when it wrote none (a no-op).
+fn credential_store(o: &SwitchOutcome) -> Option<&'static str> {
+    o.to.as_ref()
+        .map(|_| if o.file_store { "file" } else { "keychain" })
 }
 
 pub fn switch_human(o: &SwitchOutcome) -> String {

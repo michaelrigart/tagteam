@@ -205,9 +205,10 @@ fn a_locked_keychain_without_a_terminal_fails_and_creates_nothing() {
 }
 
 #[test]
-fn warnings_reach_stderr_by_default_and_json_stays_one_object() {
-    // Claude Code rotated the live credential, and no oracle can attribute it: the switch
-    // captures it with a WARN (§9.4 step 4), which the default log level shows, on stderr.
+fn a_routine_switch_is_quiet_and_debug_shows_the_diagnostics() {
+    // Claude Code rotated the live credential, and M1 has no oracle to attribute it, so every
+    // such switch captures it with a WARN log line (§9.4 step 4). That is a diagnostic: the
+    // default level keeps it off stderr, and `--debug` shows it.
     let d = tempfile::tempdir().unwrap();
     let env = Env::for_test(d.path());
     let kc = FileKeychain::new(d.path().join("keychain"));
@@ -221,9 +222,7 @@ fn warnings_reach_stderr_by_default_and_json_stays_one_object() {
         .args(["switch", "1", "--json"])
         .assert()
         .success()
-        .stderr(predicates::str::contains(
-            "captured an unverified live credential",
-        ))
+        .stderr("")
         .get_output()
         .stdout
         .clone();
@@ -233,4 +232,16 @@ fn warnings_reach_stderr_by_default_and_json_stays_one_object() {
         (v["switched"].clone(), v["to"].clone()),
         (json!(true), json!(1))
     );
+    login(&env, &kc, "a@x.co", "", "rt-a-rotated");
+    let out = cmd(d.path())
+        .args(["switch", "2", "--json", "--debug"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "captured an unverified live credential",
+        ))
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["to"], 2);
 }

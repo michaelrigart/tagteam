@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::live::Platform;
-use tagteam_core::{CLAUDE_CODE, ProviderId};
+use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
@@ -39,6 +39,7 @@ const KEYCHAIN_LOCKED: &str = "the login keychain is locked (common over SSH); r
 const CANCELLED: &str = "cancelled";
 const TOKEN_MISSING: &str = "pass the token as an argument, or `-` to read it from stdin";
 const ALIAS_USAGE: &str = "alias takes ACCOUNT NAME, ACCOUNT --unset, or no arguments";
+const KEYCHAIN_FELL_BACK: &str = "the Keychain could not be written, so the credential went to Claude Code's credentials file instead";
 
 /// Honoured only with the `test-support` feature: a release build never reads them.
 #[cfg(any(test, feature = "test-support"))]
@@ -110,13 +111,14 @@ fn build_engine(ctx: Context) -> Engine {
     })
 }
 
-/// Logs go to stderr: WARN and up by default, so a credential falling back to a file or a
-/// failed recovery is seen; DEBUG with `--debug`. Colour only on a terminal.
+/// Logs are diagnostics, on stderr: ERROR by default, so a routine command stays quiet (what a
+/// user must know reaches them as a notice instead), and DEBUG with `--debug`. Colour only on
+/// a terminal.
 fn init_logging(debug: bool, color: bool) {
     let level = if debug {
         tracing::Level::DEBUG
     } else {
-        tracing::Level::WARN
+        tracing::Level::ERROR
     };
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -142,6 +144,21 @@ fn cancelled() -> Failure {
     Failure::Message(KIND_CANCELLED, CANCELLED.into())
 }
 
+/// `active` for a change that has already committed: if it cannot be read, the account is
+/// reported inactive and the failure is logged (by position and ID, never by email) rather
+/// than failing a command that succeeded.
+fn or_inactive(active: Result<bool, EngineError>, position: u32, id: &AccountId) -> bool {
+    active.unwrap_or_else(|e| {
+        tracing::warn!(
+            position,
+            id = %id,
+            kind = e.kind(),
+            "could not tell whether the account is active; reporting it inactive"
+        );
+        false
+    })
+}
+
 /// §13.2: the one object `--json` prints for any error.
 pub(crate) fn error_json(kind: &str, message: &str) -> Value {
     json!({"schemaVersion": 1, "error": {"type": kind, "message": message}})
@@ -151,6 +168,8 @@ struct App<'a, 'b> {
     engine: Engine,
     json: bool,
     provider_flag: Option<ProviderId>,
+    /// The Keychain Appendix A.3's lock check asks: macOS only, since Linux has none.
+    keychain: Option<Arc<dyn Keychain>>,
     io: &'a mut Io<'b>,
 }
 
@@ -162,13 +181,12 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
         return fail(io, json, KIND_ROOT, &msg);
     }
     let command = cli.command.unwrap_or(Command::List);
-    // Only a command that touches a Keychain item checks its lock, and only on macOS.
-    let keychain = (ctx.platform == Platform::MacOs && command.touches_keychain())
-        .then(|| ctx.keychain.clone());
+    let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
     let mut app = App {
         engine: build_engine(ctx),
         json,
         provider_flag: cli.provider.map(ProviderId::new),
+        keychain,
         io,
     };
     if let Some(p) = &app.provider_flag {
@@ -176,9 +194,11 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
             return fail(app.io, json, e.kind(), &e.to_string());
         }
     }
-    let unlocked = match &keychain {
-        Some(k) => app.lock_check(&command, k.as_ref()),
-        None => Ok(()),
+    // Only a command that touches a Keychain item checks its lock.
+    let unlocked = if command.touches_keychain() {
+        app.lock_check(&command)
+    } else {
+        Ok(())
     };
     let result = unlocked.and_then(|()| app.dispatch(command));
     match result {
@@ -231,17 +251,21 @@ impl App<'_, '_> {
     /// `switch` and `remove` have no account to touch (§5), so they run none: a fresh machine
     /// gets their no-op or "no account matches" even with a locked keychain. A store created
     /// by another process meanwhile is covered too: the tri-state reads refuse on their own.
-    fn lock_check(&mut self, command: &Command, keychain: &dyn Keychain) -> Result<(), Failure> {
+    /// `switch`'s offer to add an unmanaged login checks before adding (`switch`).
+    fn lock_check(&mut self, command: &Command) -> Result<(), Failure> {
         if command.touches_keychain_only_with_a_store() && self.engine.existing_store()?.is_none() {
             return Ok(());
         }
-        self.ensure_unlocked(keychain)
+        self.ensure_unlocked()
     }
 
     /// Appendix A.3, before the command touches anything. On a terminal, a locked keychain is
     /// offered for unlocking and macOS asks for the password itself: tagteam never sees it.
-    /// Anywhere else the command fails at once, naming the unlock command.
-    fn ensure_unlocked(&mut self, keychain: &dyn Keychain) -> Result<(), Failure> {
+    /// Anywhere else the command fails at once, naming the unlock command. Linux has no check.
+    fn ensure_unlocked(&mut self) -> Result<(), Failure> {
+        let Some(keychain) = self.keychain.clone() else {
+            return Ok(());
+        };
         // `Unknown` proceeds: the tri-state reads refuse safely on their own.
         if keychain.lock_state() != LockState::Locked {
             return Ok(());
@@ -318,7 +342,7 @@ impl App<'_, '_> {
                     alias,
                     yes,
                 })?;
-                self.added(out.account, out.created)?;
+                self.added(out.account, out.created);
             }
             Command::Remove { account } => {
                 let row = self.resolve(&account)?;
@@ -336,12 +360,12 @@ impl App<'_, '_> {
             Command::Disable { account } => {
                 let row = self.resolve(&account)?;
                 let row = self.engine.set_disabled(&row.id, true)?;
-                self.print_account(&format!("{} is disabled.\n", render::name(&row)), row, None)?;
+                self.print_account(&format!("{} is disabled.\n", render::name(&row)), row, None);
             }
             Command::Enable { account } => {
                 let row = self.resolve(&account)?;
                 let row = self.engine.set_disabled(&row.id, false)?;
-                self.print_account(&format!("{} is enabled.\n", render::name(&row)), row, None)?;
+                self.print_account(&format!("{} is enabled.\n", render::name(&row)), row, None);
             }
             Command::Alias {
                 account,
@@ -377,13 +401,13 @@ impl App<'_, '_> {
                     let row = self.engine.set_alias(&row.id, Some(&name))?;
                     let alias = row.alias.clone().unwrap_or_default();
                     let human = format!("Position {} is now {alias}.\n", row.position);
-                    self.print_account(&human, row, None)?;
+                    self.print_account(&human, row, None);
                 }
                 (Some(account), None, true) => {
                     let row = self.resolve(&account)?;
                     let row = self.engine.set_alias(&row.id, None)?;
                     let human = format!("Position {} has no alias now.\n", row.position);
-                    self.print_account(&human, row, None)?;
+                    self.print_account(&human, row, None);
                 }
                 _ => return Err(Failure::Usage(ALIAS_USAGE.into())),
             },
@@ -395,7 +419,7 @@ impl App<'_, '_> {
                     render::email(&row),
                     row.position
                 );
-                self.print_account(&human, row, None)?;
+                self.print_account(&human, row, None);
             }
         }
         Ok(())
@@ -422,7 +446,7 @@ impl App<'_, '_> {
     /// Whether `row` is its provider's active account, decided as `list` decides it: by the
     /// engine's views (the live login; the store's active account while the live identity is
     /// unreadable).
-    fn is_active(&self, row: &AccountRow) -> Result<bool, Failure> {
+    fn is_active(&self, row: &AccountRow) -> Result<bool, EngineError> {
         Ok(self
             .engine
             .accounts(Some(&row.provider))?
@@ -436,25 +460,20 @@ impl App<'_, '_> {
     }
 
     /// An account command's result, with `active` as the engine sees it after the command.
-    fn print_account(
-        &mut self,
-        human: &str,
-        row: AccountRow,
-        created: Option<bool>,
-    ) -> Result<(), Failure> {
-        let active = self.is_active(&row)?;
+    /// The change has committed by now, so a failure to read `active` never fails it.
+    fn print_account(&mut self, human: &str, row: AccountRow, created: Option<bool>) {
+        let active = or_inactive(self.is_active(&row), row.position, &row.id);
         self.print_view(human, AccountView { row, active }, created);
-        Ok(())
     }
 
-    fn added(&mut self, account: AccountRow, created: bool) -> Result<(), Failure> {
+    fn added(&mut self, account: AccountRow, created: bool) {
         let verb = if created { "Added" } else { "Updated" };
         let human = format!(
             "{verb} {} at position {}.\n",
             render::name(&account),
             account.position
         );
-        self.print_account(&human, account, Some(created))
+        self.print_account(&human, account, Some(created));
     }
 
     fn add(
@@ -483,7 +502,8 @@ impl App<'_, '_> {
             other => other?,
         };
         self.notices(&out.notices);
-        self.added(out.account, out.created)
+        self.added(out.account, out.created);
+        Ok(())
     }
 
     fn switch(&mut self, account: Option<String>, force: bool) -> Result<(), Failure> {
@@ -519,11 +539,19 @@ impl App<'_, '_> {
             {
                 return Err(cancelled());
             }
+            // With no store, `lock_check` ran no check for this `switch`, and adding reads the
+            // live credential and writes the vault: Appendix A.3 applies before it does.
+            self.ensure_unlocked()?;
             self.add(provider.clone(), None, None, false)?;
             outcome = self.engine.switch(req())?;
         }
         for w in &outcome.warnings {
             let _ = writeln!(self.io.err, "warning: {w}");
+        }
+        // On macOS a file store means the Keychain write failed and fell back to the file
+        // (Appendix A.3); on Linux the file is the only store, which is routine.
+        if outcome.file_store && self.keychain.is_some() {
+            let _ = writeln!(self.io.err, "warning: {KEYCHAIN_FELL_BACK}");
         }
         self.print(
             &render::switch_human(&outcome),
@@ -554,5 +582,13 @@ mod tests {
         let honoured = cfg!(feature = "test-support");
         assert_eq!(kc.is_some(), honoured);
         assert_eq!(platform, honoured.then_some(Platform::Linux));
+    }
+
+    #[test]
+    fn an_unreadable_active_flag_after_a_commit_is_inactive_not_an_error() {
+        let id = AccountId::from_string("0192");
+        let failed = Err(EngineError::Io(std::io::Error::other("store went away")));
+        assert!(!or_inactive(failed, 1, &id));
+        assert!(or_inactive(Ok(true), 1, &id));
     }
 }
