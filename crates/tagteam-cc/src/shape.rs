@@ -31,6 +31,10 @@ fn token<'a>(o: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
     o.get(k).and_then(Value::as_str).filter(|s| !s.is_empty())
 }
 
+/// Precondition: callers must first reject bytes that [`is_wiped`] flags or that have no
+/// [`fingerprint`]. Everything that isn't an API key and isn't an OAuth blob carrying a
+/// refresh token — a wiped blob, `{}`, garbage, `{"mcpOAuth":{}}` — falls through to
+/// `KIND_SETUP_TOKEN`; this function has no "unrecognised" answer.
 pub fn classify(bytes: &[u8]) -> &'static str {
     if is_api_key(bytes) {
         return KIND_API_KEY;
@@ -79,7 +83,7 @@ pub fn compose(target: &[u8], live: Option<&Map<String, Value>>) -> Result<Vec<u
         }
     };
     for k in MACHINE_SHARED_KEYS {
-        out.remove(k);
+        out.shift_remove(k);
     }
     if let Some(live) = live {
         for k in MACHINE_SHARED_KEYS {
@@ -123,6 +127,9 @@ pub fn identity_from_oauth_account(v: &Value) -> Option<Identity> {
 }
 
 /// The identity cswap records for token accounts.
+///
+/// Precondition: `email` must be non-empty; an empty email panics (see
+/// [`identity_from_oauth_account`]'s empty-email rejection).
 pub fn token_identity(email: &str) -> Identity {
     let raw = json!({"emailAddress": email, "accountUuid": "", "organizationUuid": null, "organizationName": null});
     identity_from_oauth_account(&raw).expect("a non-empty email always parses")
@@ -254,6 +261,47 @@ mod tests {
             t.raw,
             json!({"emailAddress": "api-key-3@token.local", "accountUuid": "", "organizationUuid": null, "organizationName": null})
         );
+    }
+
+    #[test]
+    fn unrecognised_bytes_fall_through_to_setup_token() {
+        let wiped = json!({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}})
+            .to_string()
+            .into_bytes();
+        assert_eq!(classify(&wiped), KIND_SETUP_TOKEN);
+        assert_eq!(classify(b"{}"), KIND_SETUP_TOKEN);
+        assert_eq!(classify(b"garbage"), KIND_SETUP_TOKEN);
+        assert_eq!(classify(br#"{"mcpOAuth":{}}"#), KIND_SETUP_TOKEN);
+    }
+
+    #[test]
+    fn compose_preserves_the_target_s_key_order() {
+        let target = json!({
+            "claudeAiOauth": {"refreshToken": "t"},
+            "mcpOAuth": {},
+            "trustedDeviceToken": "d",
+            "futureKey": 1
+        });
+        let out = compose(target.to_string().as_bytes(), json!({}).as_object()).unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        let keys: Vec<&str> = out
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["claudeAiOauth", "trustedDeviceToken", "futureKey"]);
+    }
+
+    #[test]
+    fn compose_drops_a_target_machine_shared_key_absent_from_live() {
+        let target = json!({
+            "claudeAiOauth": {"refreshToken": "t"},
+            "mcpXaaIdp": {"stale": true}
+        });
+        let out = compose(target.to_string().as_bytes(), json!({}).as_object()).unwrap();
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(out, json!({"claudeAiOauth": {"refreshToken": "t"}}));
     }
 
     #[test]
