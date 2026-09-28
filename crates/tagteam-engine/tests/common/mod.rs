@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_engine::lifecycle::AddOptions;
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault};
@@ -217,6 +218,22 @@ impl Fx {
         v["claudeAiOauth"]["refreshToken"]
             .as_str()
             .map(str::to_owned)
+    }
+
+    /// Logs a fresh account in and captures it (§10.1). Tasks 19-21 each need only the
+    /// resulting id, so this is the one place that repeats `fx.login` + `add_live`.
+    pub fn add(&self, email: &str, rt: &str) -> AccountId {
+        self.login(email, rt);
+        self.engine
+            .add_live(AddOptions {
+                provider: self.provider(),
+                position: None,
+                alias: None,
+                yes: false,
+            })
+            .unwrap()
+            .account
+            .id
     }
 
     /// An engine over the same Keychain, oracle and clock, but a different Env.

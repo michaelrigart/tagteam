@@ -24,7 +24,6 @@ pub struct Engine {
     pub(crate) env: Env,
     pub(crate) registry: ProviderRegistry,
     pub(crate) vault: Vault,
-    #[expect(dead_code, reason = "first read by Task 18 (add_live)")]
     pub(crate) oracle: Arc<dyn Oracle>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) default_provider: ProviderId,
@@ -97,7 +96,6 @@ impl Engine {
         self.registry.all().to_vec()
     }
 
-    #[expect(dead_code, reason = "used by later commands, Task 18")]
     pub(crate) fn refuse_inside_run_shell(&self) -> Result<(), EngineError> {
         if self.env.inside_run_shell() {
             Err(EngineError::InsideRunShell)
@@ -128,13 +126,6 @@ impl Engine {
     /// simply in progress elsewhere). That ordering can't be exercised deterministically by a
     /// test without a pause hook between acquiring the guard and running the check, which does
     /// not exist yet; it is verified by reading the code above instead.
-    ///
-    /// Only `#[expect]`ed outside test builds: this crate's own tests call it directly, so it
-    /// is genuinely used under `cfg(test)`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by later commands, Task 18 and Task 20")
-    )]
     pub(crate) fn settle_or_refuse(&self, provider: &ProviderId) -> Result<(), EngineError> {
         let pending = match self.existing_store()? {
             Some(s) => s.journal(provider)?.is_some(),

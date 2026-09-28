@@ -4,6 +4,7 @@ pub mod account_lock;
 mod displace;
 pub mod engine;
 pub mod error;
+pub mod lifecycle;
 pub mod oracle;
 pub mod registry;
 pub mod store;
