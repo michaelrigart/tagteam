@@ -1,4 +1,5 @@
 use serde_json::json;
+use std::os::unix::fs::PermissionsExt;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{EventRow, JournalRow, LoginMeta, NewAccount, Store, StoreError};
 use tagteam_provider::{Identity, ProcessStamp};
@@ -231,22 +232,67 @@ fn find_by_email_spans_providers_unless_narrowed() {
 fn a_newer_schema_version_is_refused_and_the_database_is_untouched() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("t.db");
-    Store::open(&path).unwrap();
     {
+        // A file as a hypothetical newer tagteam would leave it: schema v2, still in
+        // whatever journal mode it was created with, never touched by this build's
+        // `connect`/`migrate`. Using a raw connection (rather than `Store::open` followed by
+        // bumping `user_version`) means the file starts in the default `delete` journal mode,
+        // so switching it to WAL is a real, detectable mutation, not a no-op.
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.execute_batch("CREATE TABLE accounts (id TEXT PRIMARY KEY); PRAGMA user_version = 2;")
+            .unwrap();
     }
     assert!(matches!(
         Store::open(&path),
         Err(StoreError::UnsupportedSchema(2))
     ));
-    // Refusing must not have touched the database: still v2, and still just the one table
-    // set the store itself created (no re-migration, no half-applied schema).
+    // Refusing must not have touched the database at all: same version, same journal mode
+    // (never switched to WAL), same table set (no re-migration, no half-applied schema).
     let conn = rusqlite::Connection::open(&path).unwrap();
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, 2);
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(journal_mode, "delete");
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(tables, vec!["accounts".to_string()]);
+}
+
+#[test]
+fn open_existing_reports_an_unreadable_store_instead_of_absent() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    Store::open(&path).unwrap();
+
+    // Restores the mode even if an assertion below panics, so the tempdir can still clean
+    // itself up on drop.
+    struct RestoreMode {
+        path: std::path::PathBuf,
+        mode: u32,
+    }
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ =
+                std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+    let original_mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    let _restore = RestoreMode {
+        path: path.clone(),
+        mode: original_mode,
+    };
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(Store::open_existing(&path).is_err());
 }
 
 #[test]

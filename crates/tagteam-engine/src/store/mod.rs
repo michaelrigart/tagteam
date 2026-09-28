@@ -359,10 +359,12 @@ fn set_wal_mode(conn: &Connection) -> Result<(), StoreError> {
     }
 }
 
+/// Opens the connection and its connection-scoped pragmas only. Deliberately does **not**
+/// switch the file to WAL: that is a persistent, on-disk mutation, and `migrate` must be free
+/// to refuse a newer-schema file before anything touches it at all.
 fn connect(path: &Path, create: bool) -> Result<Connection, StoreError> {
     let conn = Connection::open_with_flags(path, open_flags(create))?;
     conn.busy_timeout(Duration::from_millis(5000))?;
-    set_wal_mode(&conn)?;
     conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
     Ok(conn)
 }
@@ -384,16 +386,27 @@ impl Store {
         Ok(store)
     }
 
-    /// Never creates a file, a directory, or a WAL/SHM sidecar: it checks existence first,
-    /// then opens without `SQLITE_OPEN_CREATE`, so a database removed in between is reported
-    /// as absent rather than recreated.
+    /// Never creates the database file itself when absent: it checks existence first, then
+    /// opens without `SQLITE_OPEN_CREATE`, so a database removed in between is reported as
+    /// absent rather than recreated. (Its WAL/SHM sidecars do appear while the store is open
+    /// and are removed again on close; this only concerns the main file.)
+    ///
+    /// A `CannotOpen` failure is reported as absent only if the file has genuinely disappeared
+    /// since the check above: re-confirmed here rather than assumed, so an existing file this
+    /// process simply cannot read (wrong permissions, a stale root-owned file, ...) is reported
+    /// as an error instead of silently treated as "no store".
     pub fn open_existing(path: &Path) -> Result<Option<Self>, StoreError> {
         if !path.try_exists()? {
             return Ok(None);
         }
         let conn = match connect(path, false) {
             Ok(conn) => conn,
-            Err(e) if is_cannot_open(&e) => return Ok(None),
+            Err(e) if is_cannot_open(&e) => {
+                if path.try_exists()? {
+                    return Err(e);
+                }
+                return Ok(None);
+            }
             Err(e) => return Err(e),
         };
         let store = Self {
@@ -408,19 +421,27 @@ impl Store {
     }
 
     /// Applies the embedded schema exactly once. A stored version newer than
-    /// `SCHEMA_VERSION` is refused outright, without opening a transaction. Otherwise the
-    /// whole check-and-apply runs in one `IMMEDIATE` transaction, re-reading the version
-    /// under the write lock it grants: concurrent first opens then serialize on that lock
-    /// instead of racing `CREATE TABLE` (§6.1).
+    /// `SCHEMA_VERSION` is refused outright, before anything else runs against the
+    /// connection — including switching it to WAL, which is why that pragma is set here and
+    /// not in `connect`: a file this build refuses must be left exactly as it was found.
+    /// Otherwise the whole check-and-apply runs in one `IMMEDIATE` transaction, re-reading the
+    /// version under the write lock it grants — both to guard against a concurrent racing
+    /// `CREATE TABLE` (§6.1), and, re-checked again, against a concurrent newer binary
+    /// upgrading the file between this function's first read and the moment it takes the lock.
     fn migrate(&self) -> Result<(), StoreError> {
         let mut c = self.lock();
         let version = user_version(&c)?;
         if version > SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchema(version));
         }
+        set_wal_mode(&c)?;
         if version < SCHEMA_VERSION {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            if user_version(&tx)? < SCHEMA_VERSION {
+            let version = user_version(&tx)?;
+            if version > SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedSchema(version));
+            }
+            if version < SCHEMA_VERSION {
                 tx.execute_batch(SCHEMA_V1)?;
                 tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
             }
