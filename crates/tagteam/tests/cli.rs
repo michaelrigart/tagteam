@@ -83,6 +83,58 @@ fn usage_errors_exit_2_and_keep_the_json_contract() {
 }
 
 #[test]
+fn a_usage_error_never_echoes_an_argument() {
+    // Secrets never reach error output, and a token is an argument like any other, whatever
+    // its shape: no usage error repeats an argument's value.
+    const SENTINEL: &str = "REVIEW-SENTINEL";
+    let d = tempfile::tempdir().unwrap();
+    let cases: [&[&str]; 6] = [
+        &["add-token", "-", "sk-ant-api03-REVIEW-SENTINEL"],
+        &["add-token", "-", "plain-REVIEW-SENTINEL"],
+        &["add-token", "tok", "--position", "REVIEW-SENTINEL"],
+        &["add-token", "--REVIEW-SENTINEL"],
+        &["REVIEW-SENTINEL"],
+        &["add-token", "-", "sk-ant-api03-REVIEW-SENTINEL", "--json"],
+    ];
+    for args in cases {
+        let out = cmd(d.path())
+            .args(args)
+            .assert()
+            .code(2)
+            .get_output()
+            .clone();
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            !stdout.contains(SENTINEL) && !stderr.contains(SENTINEL),
+            "{args:?}:\n{stdout}\n{stderr}"
+        );
+        if !args.contains(&"--json") {
+            assert!(stderr.starts_with("error: "), "{args:?}: {stderr}");
+        }
+    }
+    // The kind and the usage line, which come from the command's own definition, stay.
+    cmd(d.path())
+        .args(["add-token", "-", "sk-ant-api03-REVIEW-SENTINEL"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(
+            "error: unexpected argument found\n\nUsage: tagteam add-token [OPTIONS] [TOKEN]\n\nFor more information, try '--help'.\n",
+        );
+    // So does a suggestion: it names a real name, never what was typed.
+    cmd(d.path())
+        .arg("swtich")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(
+            "a similar subcommand exists: 'switch'",
+        ));
+}
+
+#[test]
 fn help_and_version_under_json_are_a_json_usage_error() {
     // They print text, and `--json` promises exactly one JSON object on stdout.
     let d = tempfile::tempdir().unwrap();

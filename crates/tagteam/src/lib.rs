@@ -1,7 +1,8 @@
 use std::ffi::OsString;
 use std::io::Write;
 
-use clap::Parser;
+use clap::error::{ContextKind, ErrorKind};
+use clap::{CommandFactory, Parser};
 
 pub mod app;
 pub mod cli;
@@ -10,6 +11,34 @@ mod render;
 mod root_guard;
 
 const TEXT_UNDER_JSON: &str = "--help and --version print text; run them without --json";
+
+/// A usage error without the command-line values clap would repeat: any argument may be a
+/// secret (`add-token`'s token, whatever its shape), and secrets never reach error output.
+/// Only what the command's own definition supplies is kept: the kind, the did-you-mean
+/// suggestions and the usage line. Help and version are the command's own text, and pass.
+fn without_argument_values(e: clap::Error) -> clap::Error {
+    if matches!(
+        e.kind(),
+        ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        return e;
+    }
+    let mut safe = clap::Error::new(e.kind()).with_cmd(&cli::Cli::command());
+    for (kind, value) in e.context() {
+        if matches!(
+            kind,
+            ContextKind::Usage
+                | ContextKind::SuggestedArg
+                | ContextKind::SuggestedSubcommand
+                | ContextKind::SuggestedValue
+        ) {
+            safe.insert(kind, value.clone());
+        }
+    }
+    safe
+}
 
 /// Runs the CLI and returns the process exit code.
 pub fn main_with_args<I, T>(args: I) -> i32
@@ -36,7 +65,7 @@ where
         }
         Err(e) => {
             let code = if e.use_stderr() { app::EXIT_USAGE } else { 0 };
-            let _ = e.print();
+            let _ = without_argument_values(e).print();
             return code;
         }
     };
