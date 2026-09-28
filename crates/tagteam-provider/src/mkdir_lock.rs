@@ -129,7 +129,14 @@ impl MkdirLock {
             let heartbeat = thread::Builder::new().spawn(move || {
                 let mut stop = st.stop.lock().unwrap();
                 loop {
-                    let (guard, _) = st.wake.wait_timeout(stop, every).unwrap();
+                    // The standard condvar predicate loop: `wait_timeout_while` checks `*stop`
+                    // immediately, under the same lock `Drop` sets it under, before ever
+                    // blocking. Without that check-before-wait, a `Drop` that sets `stop` and
+                    // notifies before this thread reaches its first wait is lost entirely — the
+                    // notify has nothing waiting to wake, and the plain `wait_timeout` used to
+                    // block regardless for the full `every`, even though `*stop` was already
+                    // true by the time it acquired the lock.
+                    let (guard, _) = st.wake.wait_timeout_while(stop, every, |s| !*s).unwrap();
                     stop = guard;
                     if *stop {
                         return;
@@ -228,6 +235,27 @@ mod tests {
         assert!(s.path.is_dir());
         drop(l);
         assert!(!s.path.exists());
+    }
+
+    /// A drop that races the heartbeat thread's very first wait must never miss the stop
+    /// notification: if the notify happens before the thread reaches its first `wait_timeout`,
+    /// the thread must still see `stop` already set instead of blocking for a whole
+    /// `touch_every` regardless.
+    #[test]
+    fn dropping_a_freshly_acquired_lock_never_stalls_on_the_heartbeat() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 100, 3_000);
+        for i in 0..5 {
+            let l = MkdirLock::acquire(&s).unwrap();
+            let start = Instant::now();
+            drop(l);
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "drop {i} took {elapsed:?}: the heartbeat thread missed the stop notification \
+                 and blocked for close to touch_every instead"
+            );
+        }
     }
 
     #[test]

@@ -252,16 +252,26 @@ fn garbage_live_bytes_refuse_to_compose_and_write_nothing() {
     let paths = CcPaths::resolve(&f.env);
     fs::write(&paths.global_config, "{}").unwrap();
     let svc = keychain_service(&f.env, ItemKind::OAuth);
+    let managed = keychain_service(&f.env, ItemKind::ManagedKey);
     let acct = keychain_account(&f.env);
     f.kc.put(&svc, &acct, b"not json at all");
     let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
     let live = f.cc.read_live_auth(&f.env);
-    assert!(
+    let err =
         f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
-            .is_err()
+            .err()
+            .unwrap();
+    // The exact fixed message `keep_shared` already uses (`live::UNPARSABLE_ENTRY`), which
+    // is `pub(crate)` and so not nameable from this integration test crate; matched here by
+    // its known text instead.
+    assert!(
+        matches!(&err, tagteam_provider::ProviderError::Invalid(msg) if msg == "a credential entry is not a JSON object"),
+        "{err}"
     );
     assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"not json at all");
+    assert!(f.kc.get(&managed, &acct).is_none());
+    assert_eq!(fs::read_to_string(&paths.global_config).unwrap(), "{}");
 }
 
 #[test]
