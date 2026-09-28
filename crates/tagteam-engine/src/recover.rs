@@ -233,6 +233,18 @@ impl Engine {
                 &mut warnings,
             )?;
         }
+        // Clearing the entry for an API key also strips the copies of it no reader sees.
+        if own == Axis::ManagedKey {
+            self.displace_hidden_copies(
+                p,
+                &row.provider,
+                [&live.shadowed],
+                &self.held_generations(live, &target_secret),
+                false,
+                live_identity.as_ref(),
+                &mut warnings,
+            )?;
+        }
         for w in &warnings {
             tracing::warn!(provider = %row.provider, "recovering an interrupted switch: {w}");
         }

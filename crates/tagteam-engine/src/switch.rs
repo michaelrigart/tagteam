@@ -780,15 +780,15 @@ impl Engine {
                 secret
             }
         };
-        let saved = self.displace_shadowed(
+        self.displace_hidden_copies(
             p,
             provider,
-            &live,
-            &target_secret,
+            [&live.shadowed],
+            &self.held_generations(&live, &target_secret),
+            req.force,
             live_identity.as_ref(),
             &mut warnings,
-        );
-        unless_forced(saved, req.force, &mut warnings)?;
+        )?;
 
         // Step 6.
         let from_secret = outgoing
@@ -1025,38 +1025,48 @@ impl Engine {
         }
     }
 
-    /// Step 7 overwrites the entry the effective credential shadows as well
-    /// (`LiveAuth::shadowed`), and nothing restores it once the switch commits. So a generation
-    /// there that is neither the effective credential's nor the target's is saved first, like
-    /// the off-axis rule ("never lose a secret"); one with nothing account-scoped in it is not
-    /// (`displace_live`).
-    fn displace_shadowed(
+    /// The generations held somewhere a copy about to be lost is not: the effective live
+    /// credential, which the switch or recovery has already settled, and the target's.
+    pub(crate) fn held_generations(&self, live: &LiveAuth, target_secret: &[u8]) -> Vec<Vec<u8>> {
+        let mut held = vec![target_secret.to_vec()];
+        held.extend(Axis::Entry.live_secret(live));
+        held
+    }
+
+    /// §9.4 step 7: `copies` are copies of the credential entry that no reader sees but that
+    /// the activation overwrites or clears, and nothing restores them once a switch commits or
+    /// recovery finishes forward (§9.6). So a generation in one that none of `held` is saved
+    /// first, like the off-axis rule ("never lose a secret"); one with nothing account-scoped
+    /// in it is not (`displace_live`). A failed save aborts, except under `force` (B.5).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn displace_hidden_copies<'c>(
         &self,
         p: &dyn Provider,
         provider: &ProviderId,
-        live: &LiveAuth,
-        target_secret: &[u8],
+        copies: impl IntoIterator<Item = &'c Read<Vec<u8>>>,
+        held: &[Vec<u8>],
+        force: bool,
         live_identity: Option<&Identity>,
         warnings: &mut Vec<String>,
     ) -> Result<(), EngineError> {
-        let Read::Present(bytes) = &live.shadowed else {
-            return Ok(());
-        };
-        let known = |other: &[u8]| same_generation(p, bytes, other);
-        if bytes.is_empty()
-            || known(target_secret)
-            || Axis::Entry.live_secret(live).is_some_and(|e| known(&e))
-        {
-            return Ok(());
+        for copy in copies {
+            let Read::Present(bytes) = copy else {
+                continue;
+            };
+            if bytes.is_empty() || held.iter().any(|h| same_generation(p, bytes, h)) {
+                continue;
+            }
+            let saved = self.displace_live(
+                p,
+                provider,
+                bytes,
+                "displaced-live-login",
+                live_identity,
+                warnings,
+            );
+            unless_forced(saved, force, warnings)?;
         }
-        self.displace_live(
-            p,
-            provider,
-            bytes,
-            "displaced-live-login",
-            live_identity,
-            warnings,
-        )
+        Ok(())
     }
 
     /// Steps 7–9, keeping an undo for each write.

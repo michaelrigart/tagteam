@@ -276,6 +276,31 @@ fn a_cross_axis_switch_never_displaces_the_journaled_outgoing_generation() {
 }
 
 #[test]
+fn forward_recovery_to_an_api_key_saves_a_shadowed_credentials_file_before_stripping_it() {
+    // §9.4 step 7, applied by recovery: clearing the entry for an API key strips the
+    // credentials file behind the Keychain item too, and a generation there that no vault
+    // holds is saved first.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let k = fx.add_api_key(API_KEY); // leaves a live
+    crashed_switch(&fx, &a, &k);
+    fx.put_managed_key(API_KEY.as_bytes()); // died after storing the key, before the entry
+    let shadowed = Fx::credential_json("a@x.co", "rt-a-shadowed")
+        .to_string()
+        .into_bytes();
+    let file = fx.paths().credentials_file;
+    fs::write(&file, &shadowed).unwrap();
+    any_mutation(&fx, &a);
+    assert_journal_cleared(&fx);
+    assert_eq!(fx.displaced(), [shadowed]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&file).unwrap()).unwrap(),
+        serde_json::json!({"mcpOAuth": {"srv": {"token": "machine-shared"}}}),
+        "then stripped, as clearing the entry does"
+    );
+}
+
+#[test]
 fn the_reverse_cross_axis_switch_never_displaces_the_outgoing_key() {
     // API key → OAuth, killed after the entry was written and before the managed key was
     // cleared: the key left behind is the outgoing account's journaled generation.
