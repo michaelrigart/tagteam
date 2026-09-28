@@ -802,7 +802,7 @@ impl Engine {
             p,
             provider,
             hidden_copies(&live, &target.kind),
-            &self.held_generations(&live, &target_secret),
+            &self.held_generations(&live, &target_secret, outgoing.as_ref().map(|o| &o.id)),
             req.force,
             live_identity.as_ref(),
             &mut warnings,
@@ -1044,10 +1044,22 @@ impl Engine {
     }
 
     /// The generations held somewhere a copy about to be lost is not: the effective live
-    /// credential, which the switch or recovery has already settled, and the target's.
-    pub(crate) fn held_generations(&self, live: &LiveAuth, target_secret: &[u8]) -> Vec<Vec<u8>> {
+    /// credential, which the switch or recovery has already settled; the target's; and the
+    /// outgoing account's vault, current and `.prev`, which covers a stale mirror of a
+    /// generation CC has since refreshed or wiped. A vault entry that cannot be read is left
+    /// out, so what it may hold is saved rather than assumed kept.
+    pub(crate) fn held_generations(
+        &self,
+        live: &LiveAuth,
+        target_secret: &[u8],
+        outgoing: Option<&AccountId>,
+    ) -> Vec<Vec<u8>> {
         let mut held = vec![target_secret.to_vec()];
         held.extend(Axis::Entry.live_secret(live));
+        if let Some(id) = outgoing {
+            held.extend(self.vault.read(id).present());
+            held.extend(self.vault.read_prev(id).present());
+        }
         held
     }
 

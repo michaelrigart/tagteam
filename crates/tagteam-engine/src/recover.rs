@@ -239,7 +239,7 @@ impl Engine {
                 p,
                 &row.provider,
                 hidden_copies(live, &to.kind),
-                &self.held_generations(live, &target_secret),
+                &self.held_generations(live, &target_secret, row.from_id.as_ref()),
                 false,
                 live_identity.as_ref(),
                 &mut warnings,

@@ -570,6 +570,41 @@ fn an_api_key_switch_saves_a_fallback_keychain_item_before_stripping_it() {
 }
 
 #[test]
+fn a_stale_mirror_the_vault_already_holds_is_not_displaced() {
+    // The Keychain moved on without the file. CC refreshed it, so the file holds what the
+    // capture keeps as `.prev`; or CC wiped it on `invalid_grant`, so the file holds the
+    // vault's current generation. Either way the vault already holds it: nothing to save.
+    for wiped in [false, true] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b");
+        fs::write(fx.paths().credentials_file, fx.vault_bytes(&b).unwrap()).unwrap();
+        if wiped {
+            fx.set_live_credential(br#"{"claudeAiOauth":{"accessToken":"","refreshToken":""}}"#);
+        } else {
+            fx.rotate_live("rt-b2");
+        }
+        switch(&fx, to(&a), false).unwrap();
+        assert_eq!(displaced_files(&fx), 0, "wiped={wiped}");
+        assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    }
+}
+
+#[test]
+fn a_fallback_item_the_vault_already_holds_is_not_displaced() {
+    // A fallback item left from before `CLAUDE_CONFIG_DIR` was set, holding a generation of
+    // the outgoing account that CC has since refreshed past: the capture keeps it as `.prev`.
+    let fx = Fx::with_fallback_items();
+    let a = fx.add("a@x.co", "rt-a");
+    let k = fx.add_api_key(API_KEY);
+    fx.put_fallback_item(&fx.vault_bytes(&a).unwrap());
+    fx.rotate_live("rt-a2");
+    switch(&fx, to(&k), false).unwrap();
+    assert_eq!(displaced_files(&fx), 0);
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+}
+
+#[test]
 fn an_unreadable_fallback_keychain_item_aborts_before_anything_is_written() {
     // §9.4 step 3: step 7 may clear the item, and could not tell what it would lose.
     let fx = Fx::with_fallback_items();

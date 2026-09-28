@@ -301,6 +301,24 @@ fn forward_recovery_to_an_api_key_saves_a_shadowed_credentials_file_before_strip
 }
 
 #[test]
+fn forward_recovery_never_displaces_a_stale_mirror_the_vault_holds() {
+    // CC refreshed the Keychain after the crash; the file still mirrors the outgoing account's
+    // stored generation, which its vault keeps. Stripping it loses nothing.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let k = fx.add_api_key(API_KEY);
+    crashed_switch(&fx, &a, &k);
+    fx.put_managed_key(API_KEY.as_bytes());
+    fs::write(fx.paths().credentials_file, fx.vault_bytes(&a).unwrap()).unwrap();
+    fx.rotate_live("rt-a-rotated-by-cc");
+    any_mutation(&fx, &a);
+    assert_journal_cleared(&fx);
+    let displaced = fx.displaced();
+    assert_eq!(displaced.len(), 1, "only the rotated entry itself");
+    assert!(String::from_utf8_lossy(&displaced[0]).contains("rt-a-rotated-by-cc"));
+}
+
+#[test]
 fn forward_recovery_to_an_api_key_saves_a_fallback_keychain_item_before_stripping_it() {
     let fx = Fx::with_fallback_items();
     let a = fx.add("a@x.co", "rt-a");
