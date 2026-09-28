@@ -263,6 +263,7 @@ impl Provider for ClaudeCode {
             credential,
             managed_key: self.live.read_managed_key(env, &paths),
             shadowed,
+            secondary: self.live.read_secondary_items(env),
         }
     }
 

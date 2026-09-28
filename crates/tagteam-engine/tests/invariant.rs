@@ -359,13 +359,8 @@ fn fallback_keychain_items_stay_within_the_surface() {
     // switch may touch them, and the surface must say so. The planted item holds a real
     // account-scoped credential (not just machine-shared keys) — a comparison that failed to
     // recognize this service as part of the surface would flag its rewrite.
-    let fx = Fx::with(Platform::MacOs, |e| {
-        e.claude_config_dir = Some(e.home.join(".claude").into_os_string())
-    });
-    let acct = tagteam_cc::keychain_account(&fx.env);
-    fx.kc.put(
-        "Claude Code-credentials",
-        &acct,
+    let fx = Fx::with_fallback_items();
+    fx.put_fallback_item(
         Fx::credential_json("old@x.co", "rt-old")
             .to_string()
             .as_bytes(),

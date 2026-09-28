@@ -179,6 +179,21 @@ fn same_generation(p: &dyn Provider, a: &[u8], b: &[u8]) -> bool {
     a == b || (fp.is_some() && fp == p.fingerprint(b))
 }
 
+/// The copies of the credential entry that no reader sees but that writing a `kind` account
+/// over the entry overwrites or clears (§9.4 step 7): the shadowed copy always (mirrored over
+/// for OAuth, stripped for an API key), and the fallback copies only when an API key strips
+/// the entry.
+pub(crate) fn hidden_copies<'l>(
+    live: &'l LiveAuth,
+    kind: &str,
+) -> impl Iterator<Item = &'l Read<Vec<u8>>> {
+    let secondary: &[Read<Vec<u8>>] = match Axis::of(kind) {
+        Axis::ManagedKey => &live.secondary,
+        Axis::Entry => &[],
+    };
+    std::iter::once(&live.shadowed).chain(secondary)
+}
+
 /// B.5: a failed displacement aborts the switch, except under --force, where it is a warning.
 fn unless_forced(
     saved: Result<(), EngineError>,
@@ -721,9 +736,12 @@ impl Engine {
         let target_identity = p.parse_identity(&target.identity_json)?;
         let live = p.read_live_auth(&self.env);
         refuse_unsafe_live_reads(&live)?;
-        // Step 3 holds for the entry the effective one shadows too, since step 7 overwrites it.
-        if let Read::Unreadable(e) = &live.shadowed {
-            return Err(EngineError::Unreadable(e.clone()));
+        // Step 3 holds for the copies of the entry no reader sees too: step 7 may overwrite or
+        // clear them, and its snapshot reads every one of them.
+        for copy in std::iter::once(&live.shadowed).chain(&live.secondary) {
+            if let Read::Unreadable(e) = copy {
+                return Err(EngineError::Unreadable(e.clone()));
+            }
         }
 
         let mut warnings = Vec::new();
@@ -783,7 +801,7 @@ impl Engine {
         self.displace_hidden_copies(
             p,
             provider,
-            [&live.shadowed],
+            hidden_copies(&live, &target.kind),
             &self.held_generations(&live, &target_secret),
             req.force,
             live_identity.as_ref(),

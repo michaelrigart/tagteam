@@ -62,6 +62,10 @@ pub struct LiveAuth {
     /// behind the Keychain item, mirrored over for hot reload, Appendix A.3). `Absent` when
     /// there is none.
     pub shadowed: Read<Vec<u8>>,
+    /// The further copies of the credential entry that readers fall back to, which activating
+    /// an API key clears along with the entry (CC on macOS: the fallback Keychain items,
+    /// Appendix A.2). One of them may be the entry `credential` read. Empty when none exist.
+    pub secondary: Vec<Read<Vec<u8>>>,
 }
 
 /// The exact provider-owned state a switch may write (§3). Drives the pinned test (§15.3).
@@ -328,6 +332,7 @@ mod tests {
             credential: Read::Present(Credential::fresh(SENTINEL.as_bytes().to_vec())),
             managed_key: Read::Present(SENTINEL.as_bytes().to_vec()),
             shadowed: Read::Present(SENTINEL.as_bytes().to_vec()),
+            secondary: vec![Read::Present(SENTINEL.as_bytes().to_vec())],
         };
         assert!(!format!("{auth:?}").contains("SENTINEL"));
     }

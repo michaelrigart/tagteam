@@ -60,6 +60,8 @@ pub const CLAUDE_JSON: &str = r#"{
 pub const API_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
 /// A managed key that no stored account holds.
 pub const STRAY_API_KEY: &str = "sk-ant-api03-stray-key-that-no-vault-holds";
+/// The unsuffixed OAuth item readers fall back to under `Fx::with_fallback_items`.
+pub const FALLBACK_ITEM: &str = "Claude Code-credentials";
 
 /// Sets one top-level key of the config at `path`, changing nothing else. A free function, so
 /// a `'static` race callback can call it without borrowing the fixture.
@@ -178,6 +180,24 @@ impl Fx {
     /// A fixture whose Env is adjusted before anything is created in it.
     pub fn with(platform: Platform, adjust: impl FnOnce(&mut Env)) -> Self {
         Self::build(platform, adjust, |cc| cc)
+    }
+
+    /// A macOS fixture with an explicit `CLAUDE_CONFIG_DIR=~/.claude`: readers also try the
+    /// unsuffixed items (Appendix A.2), so `FALLBACK_ITEM` is a second copy of the entry.
+    pub fn with_fallback_items() -> Self {
+        Self::with(Platform::MacOs, |e| {
+            e.claude_config_dir = Some(e.home.join(".claude").into_os_string())
+        })
+    }
+
+    pub fn put_fallback_item(&self, bytes: &[u8]) {
+        self.kc
+            .put(FALLBACK_ITEM, &keychain_account(&self.env), bytes);
+    }
+
+    pub fn fallback_item(&self) -> Option<Value> {
+        let bytes = self.kc.get(FALLBACK_ITEM, &keychain_account(&self.env))?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     /// A macOS fixture whose provider waits only `timeout` for CC's locks, so a held CC lock

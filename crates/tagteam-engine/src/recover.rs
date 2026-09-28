@@ -9,7 +9,7 @@ use crate::error::EngineError;
 use crate::hooks;
 use crate::oracle::verdict;
 use crate::store::{AccountRow, EventRow, JournalRow, Store};
-use crate::switch::{Axis, OracleHint, answer_for, refuse_unsafe_live_reads};
+use crate::switch::{Axis, OracleHint, answer_for, hidden_copies, refuse_unsafe_live_reads};
 
 /// Which way an interrupted switch went, as the live credential decides it (§9.6), with the
 /// fingerprint of the generation established as the chosen account's.
@@ -238,7 +238,7 @@ impl Engine {
             self.displace_hidden_copies(
                 p,
                 &row.provider,
-                [&live.shadowed],
+                hidden_copies(live, &to.kind),
                 &self.held_generations(live, &target_secret),
                 false,
                 live_identity.as_ref(),

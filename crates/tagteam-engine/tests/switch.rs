@@ -546,6 +546,45 @@ fn a_credentials_file_the_keychain_shadows_is_displaced_before_the_mirror_overwr
 }
 
 #[test]
+fn an_api_key_switch_saves_a_fallback_keychain_item_before_stripping_it() {
+    // Appendix A.2: readers also try the unsuffixed item, and activating an API key strips
+    // every item a reader tries. A generation there that no vault holds is saved first. An
+    // OAuth switch leaves the item alone, so it saves nothing.
+    let fx = Fx::with_fallback_items();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let k = fx.add_api_key(API_KEY);
+    let stale = Fx::credential_json("old@x.co", "rt-old")
+        .to_string()
+        .into_bytes();
+    fx.put_fallback_item(&stale);
+    switch(&fx, to(&a), false).unwrap();
+    assert_eq!(displaced_files(&fx), 0, "an OAuth switch");
+    switch(&fx, to(&k), false).unwrap();
+    assert_eq!(fx.displaced(), [stale]);
+    assert_eq!(
+        fx.fallback_item(),
+        Some(json!({"mcpOAuth": {"srv": {"token": "machine-shared"}}})),
+        "then stripped, as writing an API key does"
+    );
+}
+
+#[test]
+fn an_unreadable_fallback_keychain_item_aborts_before_anything_is_written() {
+    // §9.4 step 3: step 7 may clear the item, and could not tell what it would lose.
+    let fx = Fx::with_fallback_items();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.put_fallback_item(b"{}");
+    let acct = keychain_account(&fx.env);
+    fx.kc.set_unreadable(common::FALLBACK_ITEM, &acct, true);
+    let err = switch(&fx, to(&a), false).unwrap_err();
+    assert_eq!(err.kind(), "unreadable", "{err}");
+    assert!(common::journal(&fx).is_none());
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+#[test]
 fn an_unreadable_credentials_file_behind_the_keychain_aborts_before_anything_is_written() {
     // §9.4 step 3: the mirror would overwrite a file tagteam could not read.
     use std::os::unix::fs::PermissionsExt;

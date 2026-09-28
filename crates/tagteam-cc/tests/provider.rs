@@ -170,6 +170,36 @@ fn the_credentials_file_is_shadowed_only_behind_a_keychain_item() {
 }
 
 #[test]
+fn the_fallback_items_are_reported_as_secondary_copies() {
+    // Appendix A.2: only an explicit `CLAUDE_CONFIG_DIR` (here `~/.claude`) adds a fallback item.
+    let f = fx();
+    assert!(f.cc.read_live_auth(&f.env).secondary.is_empty());
+    let mut env = f.env.clone();
+    env.claude_config_dir = Some(env.home.join(".claude").into_os_string());
+    let services = read_services(&env, ItemKind::OAuth);
+    let acct = keychain_account(&env);
+    assert_eq!(services.len(), 2, "{services:?}");
+    f.kc.put(&services[0], &acct, b"primary");
+    f.kc.put(&services[1], &acct, b"fallback");
+    let live = f.cc.read_live_auth(&env);
+    assert_eq!(live.credential.present().unwrap().bytes(), b"primary");
+    assert_eq!(
+        live.secondary
+            .into_iter()
+            .map(Read::present)
+            .collect::<Vec<_>>(),
+        [Some(b"fallback".to_vec())]
+    );
+    f.kc.set_unreadable(&services[1], &acct, true);
+    assert!(matches!(
+        f.cc.read_live_auth(&env).secondary.as_slice(),
+        [Read::Unreadable(_)]
+    ));
+    let linux = ClaudeCode::with_store(LiveStore::new(f.kc.clone(), Platform::Linux));
+    assert!(linux.read_live_auth(&env).secondary.is_empty());
+}
+
+#[test]
 fn an_unreadable_live_entry_is_never_overwritten() {
     let f = fx();
     let svc = keychain_service(&f.env, ItemKind::OAuth);

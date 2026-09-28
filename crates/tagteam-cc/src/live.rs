@@ -221,6 +221,20 @@ impl LiveStore {
         }
     }
 
+    /// Every fallback OAuth item a reader tries after the primary one (Appendix A.2): clearing
+    /// the entry for an API key strips them all. Empty off macOS, and when no fallback exists.
+    pub fn read_secondary_items(&self, env: &Env) -> Vec<Read<Vec<u8>>> {
+        if !self.mac() {
+            return vec![];
+        }
+        let acct = keychain_account(env);
+        read_services(env, ItemKind::OAuth)
+            .iter()
+            .skip(1)
+            .map(|svc| self.keychain.find(svc, &acct))
+            .collect()
+    }
+
     /// The Keychain item first; then `primaryApiKey` in the config. An empty item stays
     /// `Present("")`, since a Keychain timeout can look like that. An empty `primaryApiKey` is
     /// what a successful file read really found, and it names no key, so it reads as absent;
