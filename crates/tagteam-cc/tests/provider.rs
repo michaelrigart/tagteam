@@ -8,8 +8,13 @@ use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::provider::ClaudeCode;
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service, read_services};
 use tagteam_provider::{
-    Env, FakeKeychain, MutationGuard, Provider, Read, SecretStore, StoredLogin,
+    Env, FakeKeychain, MutationGuard, Provider, ProviderError, Read, SecretStore, StoredLogin,
 };
+
+/// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
+fn save_nothing(_: &[u8]) -> Result<(), ProviderError> {
+    Ok(())
+}
 
 struct Fx {
     _d: tempfile::TempDir,
@@ -63,7 +68,9 @@ fn writes_the_composed_credential_and_the_identity_then_undoes_both() {
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
     let live = f.cc.read_live_auth(&f.env);
     let t = target(&f, "new@b.co", "rt-new");
-    let written = f.cc.write_credential(&f.env, &locks, &t, &live).unwrap();
+    let written =
+        f.cc.write_credential(&f.env, &locks, &t, &live, &mut save_nothing)
+            .unwrap();
     assert_eq!(written.stored_in, SecretStore::Keychain);
     let u1 = written.undo;
     let u2 =
@@ -114,7 +121,9 @@ fn an_api_key_target_moves_the_auth_axis() {
         secret: key.as_bytes().to_vec(),
         identity: f.cc.token_identity("api-key-2@token.local"),
     };
-    let written = f.cc.write_credential(&f.env, &locks, &t, &live).unwrap();
+    let written =
+        f.cc.write_credential(&f.env, &locks, &t, &live, &mut save_nothing)
+            .unwrap();
     assert_eq!(written.stored_in, SecretStore::Keychain);
     assert_eq!(
         f.kc.get(&keychain_service(&f.env, ItemKind::ManagedKey), &acct)
@@ -124,8 +133,14 @@ fn an_api_key_target_moves_the_auth_axis() {
     assert_eq!(oauth_item(&f).unwrap(), json!({"pluginSecrets": {"p": 1}}));
     // Back to OAuth: the managed key goes, machine-shared keys stay.
     let live = f.cc.read_live_auth(&f.env);
-    f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
-        .unwrap();
+    f.cc.write_credential(
+        &f.env,
+        &locks,
+        &target(&f, "a@b.co", "rt"),
+        &live,
+        &mut save_nothing,
+    )
+    .unwrap();
     assert!(
         f.kc.get(&keychain_service(&f.env, ItemKind::ManagedKey), &acct)
             .is_none()
@@ -199,6 +214,180 @@ fn the_fallback_items_are_reported_as_secondary_copies() {
     assert!(linux.read_live_auth(&env).secondary.is_empty());
 }
 
+/// Every entry a change can destroy, planted with a distinct secret, under an explicit
+/// `CLAUDE_CONFIG_DIR=~/.claude` so each axis also has a fallback item (Appendix A.2).
+fn plant_every_entry(f: &Fx) -> Env {
+    let mut env = f.env.clone();
+    env.claude_config_dir = Some(env.home.join(".claude").into_os_string());
+    let paths = CcPaths::resolve(&env);
+    let acct = keychain_account(&env);
+    for (i, svc) in read_services(&env, ItemKind::OAuth).iter().enumerate() {
+        let entry = json!({"claudeAiOauth": {"refreshToken": format!("rt-item-{i}")}, "mcpOAuth": {"m": 1}});
+        f.kc.put(svc, &acct, entry.to_string().as_bytes());
+    }
+    let file = json!({"claudeAiOauth": {"refreshToken": "rt-file"}});
+    fs::write(&paths.credentials_file, file.to_string()).unwrap();
+    for (i, svc) in read_services(&env, ItemKind::ManagedKey).iter().enumerate() {
+        f.kc.put(svc, &acct, format!("sk-ant-api03-item-{i}").as_bytes());
+    }
+    let config = json!({"primaryApiKey": "sk-ant-api03-plain"});
+    fs::write(&paths.global_config, config.to_string()).unwrap();
+    env
+}
+
+/// Every secret the planted entries hold now, by where it is.
+fn secrets_by_place(f: &Fx, env: &Env) -> Vec<(String, Vec<u8>)> {
+    let paths = CcPaths::resolve(env);
+    let acct = keychain_account(env);
+    let mut out: Vec<(String, Vec<u8>)> = [ItemKind::OAuth, ItemKind::ManagedKey]
+        .into_iter()
+        .flat_map(|kind| read_services(env, kind))
+        .filter_map(|svc| f.kc.get(&svc, &acct).map(|b| (svc, b)))
+        .collect();
+    if let Ok(b) = fs::read(&paths.credentials_file) {
+        out.push(("credentials file".into(), b));
+    }
+    if let Read::Present(Some(Value::String(k))) =
+        tagteam_cc::config::get_key(&paths.global_config, "primaryApiKey")
+    {
+        out.push(("primaryApiKey".into(), k.into_bytes()));
+    }
+    out
+}
+
+#[test]
+fn doomed_names_everything_each_change_destroys() {
+    use tagteam_provider::LiveChange;
+    let api_key = "sk-ant-api03-target-key-abcdefghijklmn";
+    // (change, how the Keychain treats the write: 0 takes it, 1 refuses it, 2 was pinned to
+    // the file by an earlier refusal)
+    let cases: [(LiveChange, u8); 8] = [
+        (LiveChange::Write("oauth"), 0),
+        (LiveChange::Write("oauth"), 1),
+        (LiveChange::Write("oauth"), 2),
+        (LiveChange::Write("api_key"), 0),
+        (LiveChange::Write("api_key"), 1),
+        (LiveChange::ClearOther("oauth"), 0),
+        (LiveChange::ClearOther("api_key"), 0),
+        (LiveChange::ClearOther("setup_token"), 0),
+    ];
+    for (change, keychain) in cases {
+        let f = fx();
+        let env = plant_every_entry(&f);
+        let g = MutationGuard::acquire(&env, Duration::from_secs(1)).unwrap();
+        let locks = f.cc.lock_live(&env, &g).unwrap();
+        let primary = |kind| keychain_service(&env, kind);
+        if keychain == 2 {
+            f.kc.set_fail_write(&primary(ItemKind::OAuth), true);
+            let live = f.cc.read_live_auth(&env);
+            f.cc.write_credential(
+                &env,
+                &locks,
+                &target(&f, "p@x.co", "rt-p"),
+                &live,
+                &mut save_nothing,
+            )
+            .unwrap();
+            f.kc.set_fail_write(&primary(ItemKind::OAuth), false);
+            drop(locks);
+            drop(g);
+            plant_every_entry(&f);
+            check(&f, &env, change, keychain, api_key);
+            continue;
+        }
+        drop(locks);
+        drop(g);
+        check(&f, &env, change, keychain, api_key);
+    }
+
+    fn check(f: &Fx, env: &Env, change: LiveChange, keychain: u8, api_key: &str) {
+        let g = MutationGuard::acquire(env, Duration::from_secs(1)).unwrap();
+        let locks = f.cc.lock_live(env, &g).unwrap();
+        let before = secrets_by_place(f, env);
+        let doomed = f.cc.doomed(env, &locks, change);
+        let present = |fallback: bool| -> Vec<Vec<u8>> {
+            doomed
+                .iter()
+                .filter(|d| d.on_fallback == fallback)
+                .filter_map(|d| d.bytes.clone().present())
+                .collect()
+        };
+        let (planned, conditional) = (present(false), present(true));
+        let (refused, pinned) = (keychain == 1, keychain == 2);
+        let mut reported: Vec<Vec<u8>> = Vec::new();
+        match change {
+            LiveChange::Write(kind) => {
+                let item = if kind == "api_key" {
+                    ItemKind::ManagedKey
+                } else {
+                    ItemKind::OAuth
+                };
+                f.kc.set_fail_write(&keychain_service(env, item), refused);
+                let login = if kind == "api_key" {
+                    StoredLogin {
+                        kind: kind.into(),
+                        secret: api_key.as_bytes().to_vec(),
+                        identity: f.cc.token_identity("api-key-9@token.local"),
+                    }
+                } else {
+                    target(f, "t@x.co", "rt-target")
+                };
+                let live = f.cc.read_live_auth(env);
+                let mut record = |b: &[u8]| {
+                    reported.push(b.to_vec());
+                    Ok(())
+                };
+                f.cc.write_credential(env, &locks, &login, &live, &mut record)
+                    .unwrap();
+            }
+            LiveChange::ClearOther(kind) => {
+                f.cc.clear_other_axis(env, &locks, kind).unwrap();
+            }
+        }
+        let after = secrets_by_place(f, env);
+        let case = format!("{change:?}, keychain={keychain}");
+        for (place, bytes) in &before {
+            if !after.contains(&(place.clone(), bytes.clone())) {
+                assert!(
+                    planned.contains(bytes) || reported.contains(bytes),
+                    "{case}: {place} was destroyed without being named"
+                );
+            }
+        }
+        for r in &reported {
+            assert!(
+                conditional.contains(r) || planned.contains(r),
+                "{case}: reported an entry the plan did not name"
+            );
+        }
+        for c in &conditional {
+            let survived = after.iter().any(|(_, b)| b == c);
+            assert_eq!(survived, !refused, "{case}: a conditional entry");
+        }
+        if !refused && !pinned {
+            assert!(reported.is_empty(), "{case}: nothing falls back");
+        }
+    }
+}
+
+#[test]
+fn doomed_reports_an_entry_it_cannot_read() {
+    let f = fx();
+    let env = plant_every_entry(&f);
+    let fallback = &read_services(&env, ItemKind::OAuth)[1];
+    f.kc.set_unreadable(fallback, &keychain_account(&env), true);
+    let g = MutationGuard::acquire(&env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&env, &g).unwrap();
+    let doomed =
+        f.cc.doomed(&env, &locks, tagteam_provider::LiveChange::Write("oauth"));
+    assert!(
+        doomed
+            .iter()
+            .any(|d| d.on_fallback && matches!(d.bytes, Read::Unreadable(_))),
+        "{doomed:?}"
+    );
+}
+
 #[test]
 fn an_unreadable_live_entry_is_never_overwritten() {
     let f = fx();
@@ -210,8 +399,14 @@ fn an_unreadable_live_entry_is_never_overwritten() {
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
     let live = f.cc.read_live_auth(&f.env);
     assert!(
-        f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
-            .is_err()
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "a@b.co", "rt"),
+            &live,
+            &mut save_nothing
+        )
+        .is_err()
     );
     f.kc.set_unreadable(&svc, &acct, false);
     assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"{}");
@@ -234,8 +429,14 @@ fn a_failed_write_restores_what_it_had_already_changed() {
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
     let live = f.cc.read_live_auth(&f.env);
     assert!(
-        f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
-            .is_err()
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "a@b.co", "rt"),
+            &live,
+            &mut save_nothing
+        )
+        .is_err()
     );
     assert!(oauth_item(&f).is_none(), "the OAuth write was rolled back");
     assert!(matches!(
@@ -261,9 +462,15 @@ fn a_restore_that_fails_is_reported_not_hidden() {
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
     let live = f.cc.read_live_auth(&f.env);
     let err =
-        f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
-            .err()
-            .unwrap();
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "a@b.co", "rt"),
+            &live,
+            &mut save_nothing,
+        )
+        .err()
+        .unwrap();
     assert!(
         matches!(err, tagteam_provider::ProviderError::RestoreFailed { .. }),
         "{err}"
@@ -284,7 +491,13 @@ fn a_panic_inside_one_operation_restores_its_first_write() {
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
     let live = f.cc.read_live_auth(&f.env);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "a@b.co", "rt"),
+            &live,
+            &mut save_nothing,
+        )
     }));
     assert!(r.is_err());
     f.kc.set_panic_on_delete(&managed, false);
@@ -310,8 +523,14 @@ fn a_transient_unreadable_caller_read_is_ignored_in_favor_of_a_fresh_one() {
     let live = f.cc.read_live_auth(&f.env); // the caller's read: unreadable
     assert!(matches!(live.credential, Read::Unreadable(_)));
     f.kc.set_unreadable(&svc, &acct, false); // readable again by the time the write happens
-    f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
-        .unwrap();
+    f.cc.write_credential(
+        &f.env,
+        &locks,
+        &target(&f, "a@b.co", "rt"),
+        &live,
+        &mut save_nothing,
+    )
+    .unwrap();
     assert_eq!(
         oauth_item(&f).unwrap(),
         json!({"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt"}, "mcpOAuth": {"m": 1}})
@@ -331,9 +550,15 @@ fn garbage_live_bytes_refuse_to_compose_and_write_nothing() {
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
     let live = f.cc.read_live_auth(&f.env);
     let err =
-        f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
-            .err()
-            .unwrap();
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "a@b.co", "rt"),
+            &live,
+            &mut save_nothing,
+        )
+        .err()
+        .unwrap();
     // The exact fixed message `keep_shared` already uses (`live::UNPARSABLE_ENTRY`), which
     // is `pub(crate)` and so not nameable from this integration test crate; matched here by
     // its known text instead.
@@ -358,8 +583,14 @@ fn an_empty_live_entry_refuses_to_compose_and_writes_nothing() {
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
     let live = f.cc.read_live_auth(&f.env);
     assert!(
-        f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
-            .is_err()
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "a@b.co", "rt"),
+            &live,
+            &mut save_nothing
+        )
+        .is_err()
     );
     assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"");
 }

@@ -21,7 +21,7 @@ pub use keychain::{FakeKeychain, Keychain, KeychainError, LockState};
 pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 pub use process::ProcessStamp;
 pub use provider::{
-    CapturedLogin, Identity, IdentitySurface, LiveAuth, LiveLockSet, LiveLocks, Provider,
-    ProviderError, SecretStore, StoredLogin, Undo, Written,
+    BeforeFallback, CapturedLogin, DoomedEntry, Identity, IdentitySurface, LiveAuth, LiveChange,
+    LiveLockSet, LiveLocks, Provider, ProviderError, SecretStore, StoredLogin, Undo, Written,
 };
 pub use read::{Read, ReadError};

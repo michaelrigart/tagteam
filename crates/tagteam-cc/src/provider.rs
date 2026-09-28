@@ -4,13 +4,14 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::{
-    Credential, Env, Identity, IdentitySurface, Keychain, LiveAuth, LiveLocks, MutationGuard,
-    Provider, ProviderError, Read, StoredLogin, Undo, Written,
+    BeforeFallback, Credential, DoomedEntry, Env, Identity, IdentitySurface, Keychain, LiveAuth,
+    LiveChange, LiveLocks, MutationGuard, Provider, ProviderError, Read, StoredLogin, Undo,
+    Written,
 };
 
 use crate::config;
 use crate::crash;
-use crate::live::{self, Fence, LiveStore, Platform, Snapshot};
+use crate::live::{self, Extent, Fence, LiveStore, Platform, Snapshot};
 use crate::locks;
 use crate::naming::{ItemKind, keychain_account, read_services};
 use crate::paths::CcPaths;
@@ -276,6 +277,22 @@ impl Provider for ClaudeCode {
         Ok(LiveLocks::new(g, Box::new(set)))
     }
 
+    fn doomed(
+        &self,
+        env: &Env,
+        _locks: &LiveLocks<'_>,
+        change: LiveChange<'_>,
+    ) -> Vec<DoomedEntry> {
+        let (entry, managed) = match change {
+            LiveChange::Write(kind) if kind == KIND_API_KEY => (Extent::Cleared, Extent::Written),
+            LiveChange::Write(_) => (Extent::Written, Extent::Cleared),
+            LiveChange::ClearOther(kind) if kind == KIND_API_KEY => (Extent::Cleared, Extent::None),
+            LiveChange::ClearOther(_) => (Extent::None, Extent::Cleared),
+        };
+        self.live
+            .doomed(env, &CcPaths::resolve(env), entry, managed)
+    }
+
     fn write_credential<'l>(
         &self,
         env: &Env,
@@ -285,12 +302,17 @@ impl Provider for ClaudeCode {
         // actually happens under the locks, so `write_credential` re-reads fresh instead
         // (see `fresh_live_object`).
         _live: &LiveAuth,
+        before_fallback: BeforeFallback<'_>,
     ) -> Result<Written<'l>, ProviderError> {
         let (undo, stored_in) = self.guarded(env, locks, |paths, fence| {
             let stored_in = if target.kind == KIND_API_KEY {
-                let stored_in = self
-                    .live
-                    .write_managed_key(env, paths, &target.secret, fence)?;
+                let stored_in = self.live.write_managed_key(
+                    env,
+                    paths,
+                    &target.secret,
+                    fence,
+                    before_fallback,
+                )?;
                 crash::point("after-target-axis");
                 self.live.clear_credential_account_keys(env, paths, fence)?;
                 stored_in
@@ -298,9 +320,13 @@ impl Provider for ClaudeCode {
                 let fresh = self.live.read_credential(env, paths);
                 let live_map = fresh_live_object(fresh)?;
                 let composed = shape::compose(&target.secret, live_map.as_ref())?;
-                let stored_in = self
-                    .live
-                    .write_credential_entry(env, paths, &composed, fence)?;
+                let stored_in = self.live.write_credential_entry(
+                    env,
+                    paths,
+                    &composed,
+                    fence,
+                    before_fallback,
+                )?;
                 crash::point("after-target-axis");
                 self.live.clear_managed_key(env, paths, fence)?;
                 stored_in

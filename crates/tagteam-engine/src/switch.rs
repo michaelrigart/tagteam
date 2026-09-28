@@ -1114,7 +1114,7 @@ impl Engine {
         let locks = tx.locks;
         hooks::point(self, "after-journal")?;
         let stored_in = tx.write(|| {
-            p.write_credential(&self.env, locks, target_login, live)
+            p.write_credential(&self.env, locks, target_login, live, &mut |_| Ok(()))
                 .map(|w| (w.undo, w.stored_in))
         })?;
         hooks::point(self, "after-credential")?;

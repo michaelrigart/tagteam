@@ -8,7 +8,9 @@ use serde_json::{Map, Value, json};
 use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
-use tagteam_provider::{Credential, Env, Keychain, ProviderError, Read, SecretStore};
+use tagteam_provider::{
+    BeforeFallback, Credential, DoomedEntry, Env, Keychain, ProviderError, Read, SecretStore,
+};
 
 use crate::config::{self, read_bytes};
 use crate::naming::{ItemKind, keychain_account, keychain_service, read_services};
@@ -38,6 +40,19 @@ impl Platform {
     }
 }
 
+/// How much of one auth axis a change destroys (§9.4 step 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extent {
+    /// Left alone.
+    None,
+    /// Written: the primary item, and the file or `primaryApiKey` behind it. The other items a
+    /// reader tries go only if the Keychain refuses the write and it falls back (Appendix
+    /// A.3), or always once the credential entry is pinned to the file.
+    Written,
+    /// Cleared: every item a reader tries, and the file or `primaryApiKey`.
+    Cleared,
+}
+
 /// The exact prior state of every entry a switch may write, including every Keychain item a
 /// reader tries (Appendix A.2). It holds secrets, so it has no `Debug`.
 #[derive(Clone)]
@@ -61,6 +76,15 @@ fn present_or_err(r: Read<Vec<u8>>) -> Result<Option<Vec<u8>>, ProviderError> {
         Read::Present(v) => Ok(Some(v)),
         Read::Absent => Ok(None),
         Read::Unreadable(e) => Err(ProviderError::Unreadable(e)),
+    }
+}
+
+/// `primaryApiKey` in the global config. An empty one names no key, so it reads as absent.
+fn read_primary_api_key(paths: &CcPaths) -> Read<Vec<u8>> {
+    match config::get_key(&paths.global_config, "primaryApiKey") {
+        Read::Present(Some(Value::String(k))) if !k.is_empty() => Read::Present(k.into_bytes()),
+        Read::Present(_) | Read::Absent => Read::Absent,
+        Read::Unreadable(e) => Read::Unreadable(e),
     }
 }
 
@@ -159,6 +183,20 @@ impl LiveStore {
         self.platform == Platform::MacOs
     }
 
+    /// `read`, retried twice `retry_delay` apart while it is unreadable (Appendix A.3: active
+    /// reads retry the Keychain).
+    fn retrying<T>(&self, read: impl Fn() -> Read<T>) -> Read<T> {
+        let mut r = read();
+        for _ in 0..2 {
+            if !matches!(r, Read::Unreadable(_)) {
+                break;
+            }
+            thread::sleep(self.retry_delay);
+            r = read();
+        }
+        r
+    }
+
     /// The first item that answers, in reader order. An unreadable item stops the search: a
     /// later fallback might be superseded by what the unreadable one holds, so it is never
     /// returned as if it were authoritative.
@@ -194,15 +232,7 @@ impl LiveStore {
         }
         let services = read_services(env, ItemKind::OAuth);
         let acct = keychain_account(env);
-        let mut kc = self.find_first(&services, &acct);
-        for _ in 0..2 {
-            if !matches!(kc, Read::Unreadable(_)) {
-                break;
-            }
-            thread::sleep(self.retry_delay);
-            kc = self.find_first(&services, &acct);
-        }
-        match kc {
+        match self.retrying(|| self.find_first(&services, &acct)) {
             Read::Present(b) => (
                 Read::Present(Credential::fresh(b)),
                 read_bytes(&paths.credentials_file),
@@ -250,11 +280,65 @@ impl LiveStore {
                 Read::Absent => {}
             }
         }
-        match config::get_key(&paths.global_config, "primaryApiKey") {
-            Read::Present(Some(Value::String(k))) if !k.is_empty() => Read::Present(k.into_bytes()),
-            Read::Present(_) | Read::Absent => Read::Absent,
-            Read::Unreadable(e) => Read::Unreadable(e),
+        read_primary_api_key(paths)
+    }
+
+    /// Every entry holding secrets that a change of these extents destroys, read now (§9.4
+    /// step 7): on each axis the Keychain items a reader tries, in reader order, then the
+    /// plaintext entry behind them (`.credentials.json`, `primaryApiKey`). An absent entry is
+    /// listed as `Absent`.
+    pub fn doomed(
+        &self,
+        env: &Env,
+        paths: &CcPaths,
+        entry: Extent,
+        managed: Extent,
+    ) -> Vec<DoomedEntry> {
+        let mut out = Vec::new();
+        let axes = [
+            (ItemKind::OAuth, entry, self.file_mode_pinned()),
+            (ItemKind::ManagedKey, managed, false),
+        ];
+        for (kind, extent, pinned) in axes {
+            if extent == Extent::None {
+                continue;
+            }
+            if self.mac() {
+                let acct = keychain_account(env);
+                for (i, svc) in read_services(env, kind).iter().enumerate() {
+                    out.push(DoomedEntry {
+                        bytes: self.retrying(|| self.keychain.find(svc, &acct)),
+                        on_fallback: extent == Extent::Written && i > 0 && !pinned,
+                    });
+                }
+            }
+            let plain = match kind {
+                ItemKind::OAuth => read_bytes(&paths.credentials_file),
+                ItemKind::ManagedKey => read_primary_api_key(paths),
+            };
+            out.push(DoomedEntry {
+                bytes: plain,
+                on_fallback: false,
+            });
         }
+        out
+    }
+
+    /// Hands `before_fallback` the current bytes of every item a reader tries for `kind`, before
+    /// a fallback deletes them all.
+    fn report_items(
+        &self,
+        env: &Env,
+        kind: ItemKind,
+        before_fallback: BeforeFallback<'_>,
+    ) -> Result<(), ProviderError> {
+        let acct = keychain_account(env);
+        for svc in read_services(env, kind) {
+            if let Some(bytes) = present_or_err(self.keychain.find(&svc, &acct))? {
+                before_fallback(&bytes)?;
+            }
+        }
+        Ok(())
     }
 
     /// Deletes every item a reader would try for `kind`, and verifies each one gone.
@@ -286,14 +370,16 @@ impl LiveStore {
         write_atomic_private_with(&paths.credentials_file, bytes, 0o600, fence)
     }
 
-    /// Appendix A.3 write, including the verified file fallback. Returns where this write
-    /// put the credential: a file mirrored for hot reload does not make it a file store.
+    /// Appendix A.3 write, including the verified file fallback, which first reports every
+    /// item it will delete to `before_fallback`. Returns where this write put the credential:
+    /// a file mirrored for hot reload does not make it a file store.
     pub fn write_credential_entry(
         &self,
         env: &Env,
         paths: &CcPaths,
         bytes: &[u8],
         fence: Fence<'_>,
+        before_fallback: BeforeFallback<'_>,
     ) -> Result<SecretStore, ProviderError> {
         if !self.mac() {
             self.write_file(paths, bytes, fence)?;
@@ -318,6 +404,7 @@ impl LiveStore {
                 ),
             }
         }
+        self.report_items(env, ItemKind::OAuth, before_fallback)?;
         self.write_file(paths, bytes, fence)?;
         self.remove_items(env, ItemKind::OAuth, fence)?;
         self.file_mode_pinned.store(true, Ordering::SeqCst);
@@ -362,15 +449,17 @@ impl LiveStore {
     /// the key in the managed-key item, clearing any stale `primaryApiKey` a previous
     /// Keychain failure left behind (otherwise another account's plaintext key would stay
     /// live in `~/.claude.json`). When the Keychain refuses, the key goes to `primaryApiKey`
-    /// instead, and every managed-key item is removed and verified gone: CC reads the
-    /// Keychain first, so a stale item would stay the effective key. Returns where this write
-    /// put the key; the credential entry's file pin plays no part in it.
+    /// instead, and every managed-key item is removed and verified gone, after being reported
+    /// to `before_fallback`: CC reads the Keychain first, so a stale item would stay the
+    /// effective key. Returns where this write put the key; the credential entry's file pin
+    /// plays no part in it.
     pub fn write_managed_key(
         &self,
         env: &Env,
         paths: &CcPaths,
         key: &[u8],
         fence: Fence<'_>,
+        before_fallback: BeforeFallback<'_>,
     ) -> Result<SecretStore, ProviderError> {
         let key_str = String::from_utf8_lossy(key).trim().to_owned();
         let tail: String = key_str
@@ -429,6 +518,7 @@ impl LiveStore {
                     tracing::warn!("keychain write failed, storing primaryApiKey instead: {e}")
                 }
             }
+            self.report_items(env, ItemKind::ManagedKey, before_fallback)?;
         }
         config::splice_key(
             &paths.global_config,

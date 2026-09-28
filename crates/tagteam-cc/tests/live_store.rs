@@ -11,6 +11,11 @@ use tagteam_provider::{
     MutationGuard, Provenance, ProviderError, Read, SecretStore, Undo,
 };
 
+/// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
+fn save_nothing(_: &[u8]) -> Result<(), ProviderError> {
+    Ok(())
+}
+
 struct Fx {
     _dir: tempfile::TempDir,
     env: Env,
@@ -295,14 +300,20 @@ fn linux_reads_and_writes_only_the_file() {
     let f = fx();
     let s = store(&f, Platform::Linux);
     assert_eq!(
-        s.write_credential_entry(&f.env, &f.paths, b"{\"a\":1}", &open)
+        s.write_credential_entry(&f.env, &f.paths, b"{\"a\":1}", &open, &mut save_nothing)
             .unwrap(),
         SecretStore::File(f.paths.credentials_file.clone())
     );
     assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"{\"a\":1}");
     assert_eq!(
-        s.write_managed_key(&f.env, &f.paths, b"sk-ant-api03-linux", &open)
-            .unwrap(),
+        s.write_managed_key(
+            &f.env,
+            &f.paths,
+            b"sk-ant-api03-linux",
+            &open,
+            &mut save_nothing
+        )
+        .unwrap(),
         SecretStore::File(f.paths.global_config.clone())
     );
     assert!(f.kc.items().is_empty());
@@ -321,7 +332,7 @@ fn a_keychain_write_bumps_an_existing_file_but_never_creates_one() {
     let s = store(&f, Platform::MacOs);
     let (svc, acct) = oauth_svc(&f);
     assert_eq!(
-        s.write_credential_entry(&f.env, &f.paths, b"v1", &open)
+        s.write_credential_entry(&f.env, &f.paths, b"v1", &open, &mut save_nothing)
             .unwrap(),
         SecretStore::Keychain
     );
@@ -330,7 +341,7 @@ fn a_keychain_write_bumps_an_existing_file_but_never_creates_one() {
     fs::write(&f.paths.credentials_file, "old").unwrap();
     // The file only mirrors the item, for hot reload: the Keychain is still where it went.
     assert_eq!(
-        s.write_credential_entry(&f.env, &f.paths, b"v2", &open)
+        s.write_credential_entry(&f.env, &f.paths, b"v2", &open, &mut save_nothing)
             .unwrap(),
         SecretStore::Keychain
     );
@@ -343,12 +354,18 @@ fn a_failed_fence_stops_every_write() {
     let s = store(&f, Platform::MacOs);
     let lost = || Err(ProviderError::Lock(LockError::Compromised("x".into())));
     assert!(
-        s.write_credential_entry(&f.env, &f.paths, b"v1", &lost)
+        s.write_credential_entry(&f.env, &f.paths, b"v1", &lost, &mut save_nothing)
             .is_err()
     );
     assert!(
-        s.write_managed_key(&f.env, &f.paths, b"sk-ant-api03-zzzz", &lost)
-            .is_err()
+        s.write_managed_key(
+            &f.env,
+            &f.paths,
+            b"sk-ant-api03-zzzz",
+            &lost,
+            &mut save_nothing
+        )
+        .is_err()
     );
     assert!(f.kc.items().is_empty());
     assert!(!f.paths.credentials_file.exists() && !f.paths.global_config.exists());
@@ -363,13 +380,13 @@ fn file_fallback_requires_the_shadowing_item_to_be_gone() {
     f.kc.set_fail_write(&svc, true);
     f.kc.set_fail_delete(&svc, true);
     assert!(
-        s.write_credential_entry(&f.env, &f.paths, b"new", &open)
+        s.write_credential_entry(&f.env, &f.paths, b"new", &open, &mut save_nothing)
             .is_err()
     );
     f.kc.set_fail_delete(&svc, false);
     let fell_back = SecretStore::Fallback(f.paths.credentials_file.clone());
     assert_eq!(
-        s.write_credential_entry(&f.env, &f.paths, b"new", &open)
+        s.write_credential_entry(&f.env, &f.paths, b"new", &open, &mut save_nothing)
             .unwrap(),
         fell_back
     );
@@ -380,7 +397,7 @@ fn file_fallback_requires_the_shadowing_item_to_be_gone() {
     // and says so.
     f.kc.set_fail_write(&svc, false);
     assert_eq!(
-        s.write_credential_entry(&f.env, &f.paths, b"newer", &open)
+        s.write_credential_entry(&f.env, &f.paths, b"newer", &open, &mut save_nothing)
             .unwrap(),
         fell_back
     );
@@ -446,7 +463,8 @@ fn managed_keys_record_approval_and_never_leave_a_shadowing_item() {
     let key = b"sk-ant-api03-0123456789abcdefghijKLMNOPQRST";
     let tail = "abcdefghijKLMNOPQRST";
     assert_eq!(
-        s.write_managed_key(&f.env, &f.paths, key, &open).unwrap(),
+        s.write_managed_key(&f.env, &f.paths, key, &open, &mut save_nothing)
+            .unwrap(),
         SecretStore::Keychain
     );
     let managed = (
@@ -459,7 +477,8 @@ fn managed_keys_record_approval_and_never_leave_a_shadowing_item() {
         .unwrap()
         .unwrap();
     assert_eq!(approved["approved"], json!([tail]));
-    s.write_managed_key(&f.env, &f.paths, key, &open).unwrap(); // idempotent approval
+    s.write_managed_key(&f.env, &f.paths, key, &open, &mut save_nothing)
+        .unwrap(); // idempotent approval
     let approved = config::get_key(&f.paths.global_config, "customApiKeyResponses")
         .present()
         .unwrap()
@@ -472,7 +491,8 @@ fn managed_keys_record_approval_and_never_leave_a_shadowing_item() {
     f.kc.set_fail_write(&managed.0, true);
     let other = b"sk-ant-api03-other-key-000000000000";
     assert_eq!(
-        s.write_managed_key(&f.env, &f.paths, other, &open).unwrap(),
+        s.write_managed_key(&f.env, &f.paths, other, &open, &mut save_nothing)
+            .unwrap(),
         SecretStore::Fallback(f.paths.global_config.clone())
     );
     assert!(f.kc.get(&managed.0, &managed.1).is_none());
@@ -483,11 +503,12 @@ fn managed_keys_record_approval_and_never_leave_a_shadowing_item() {
 
     // And when the stale item cannot be removed, the write fails instead of lying.
     f.kc.set_fail_write(&managed.0, false);
-    s.write_managed_key(&f.env, &f.paths, key, &open).unwrap();
+    s.write_managed_key(&f.env, &f.paths, key, &open, &mut save_nothing)
+        .unwrap();
     f.kc.set_fail_write(&managed.0, true);
     f.kc.set_fail_delete(&managed.0, true);
     assert!(matches!(
-        s.write_managed_key(&f.env, &f.paths, other, &open),
+        s.write_managed_key(&f.env, &f.paths, other, &open, &mut save_nothing),
         Err(ProviderError::ShadowingItem(_))
     ));
     f.kc.set_fail_write(&managed.0, false);
@@ -518,7 +539,13 @@ fn a_null_approved_refuses_and_leaves_everything_untouched() {
     fs::write(&f.paths.global_config, &config_before).unwrap();
 
     let err = s
-        .write_managed_key(&f.env, &f.paths, b"sk-ant-api03-xyz", &open)
+        .write_managed_key(
+            &f.env,
+            &f.paths,
+            b"sk-ant-api03-xyz",
+            &open,
+            &mut save_nothing,
+        )
         .unwrap_err();
     assert!(matches!(err, ProviderError::Invalid(_)), "{err}");
 
@@ -544,7 +571,13 @@ fn an_object_approved_refuses_and_leaves_everything_untouched() {
     fs::write(&f.paths.global_config, &config_before).unwrap();
 
     let err = s
-        .write_managed_key(&f.env, &f.paths, b"sk-ant-api03-xyz", &open)
+        .write_managed_key(
+            &f.env,
+            &f.paths,
+            b"sk-ant-api03-xyz",
+            &open,
+            &mut save_nothing,
+        )
         .unwrap_err();
     assert!(matches!(err, ProviderError::Invalid(_)), "{err}");
 
@@ -570,7 +603,13 @@ fn a_non_object_custom_api_key_responses_refuses_and_leaves_everything_untouched
     fs::write(&f.paths.global_config, &config_before).unwrap();
 
     let err = s
-        .write_managed_key(&f.env, &f.paths, b"sk-ant-api03-xyz", &open)
+        .write_managed_key(
+            &f.env,
+            &f.paths,
+            b"sk-ant-api03-xyz",
+            &open,
+            &mut save_nothing,
+        )
         .unwrap_err();
     assert!(matches!(err, ProviderError::Invalid(_)), "{err}");
 
@@ -597,6 +636,7 @@ fn a_well_formed_approved_list_still_appends() {
         &f.paths,
         b"sk-ant-api03-0123456789abcdefghijKLMNOPQRST",
         &open,
+        &mut save_nothing,
     )
     .unwrap();
 
@@ -618,13 +658,14 @@ fn snapshot_and_restore_are_byte_exact() {
     f.kc.put(&svc, &acct, b"orig");
     fs::write(&f.paths.global_config, "{\"a\": 1}").unwrap();
     let snap = s.snapshot(&f.env, &f.paths).unwrap();
-    s.write_credential_entry(&f.env, &f.paths, b"new", &open)
+    s.write_credential_entry(&f.env, &f.paths, b"new", &open, &mut save_nothing)
         .unwrap();
     s.write_managed_key(
         &f.env,
         &f.paths,
         b"sk-ant-api03-zzzzzzzzzzzzzzzzzzzz",
         &open,
+        &mut save_nothing,
     )
     .unwrap();
     s.restore(&f.env, &f.paths, &snap, &open).unwrap();
@@ -737,7 +778,7 @@ fn rolling_back_through_dangling_links_keeps_the_links() {
         &open,
     )
     .unwrap();
-    s.write_credential_entry(&f.env, &f.paths, b"{}", &open)
+    s.write_credential_entry(&f.env, &f.paths, b"{}", &open, &mut save_nothing)
         .unwrap();
     let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
     Box::new(undo)
@@ -797,7 +838,7 @@ fn a_successful_keychain_write_clears_a_stale_primary_api_key() {
     // Activate key A while the Keychain is down: it lands in `primaryApiKey`.
     f.kc.set_fail_write(&managed.0, true);
     let a = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaa";
-    s.write_managed_key(&f.env, &f.paths, a.as_bytes(), &open)
+    s.write_managed_key(&f.env, &f.paths, a.as_bytes(), &open, &mut save_nothing)
         .unwrap();
     assert_eq!(
         config::get_key(&f.paths.global_config, "primaryApiKey")
@@ -810,7 +851,7 @@ fn a_successful_keychain_write_clears_a_stale_primary_api_key() {
     // must not still be live in `~/.claude.json`.
     f.kc.set_fail_write(&managed.0, false);
     let b = "sk-ant-api03-bbbbbbbbbbbbbbbbbbbb";
-    s.write_managed_key(&f.env, &f.paths, b.as_bytes(), &open)
+    s.write_managed_key(&f.env, &f.paths, b.as_bytes(), &open, &mut save_nothing)
         .unwrap();
     assert_eq!(f.kc.get(&managed.0, &managed.1).unwrap(), b.as_bytes());
     assert_eq!(
@@ -926,7 +967,7 @@ fn a_counting_fence_stops_the_hot_reload_rewrite() {
     let cf = CountingFence::new(1);
     let fence = || cf.check();
     assert!(matches!(
-        s.write_credential_entry(&f.env, &f.paths, b"new", &fence),
+        s.write_credential_entry(&f.env, &f.paths, b"new", &fence, &mut save_nothing),
         Err(ProviderError::Lock(_))
     ));
     assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"old");
@@ -948,7 +989,7 @@ fn a_counting_fence_stops_the_deletes_in_remove_items() {
     let cf = CountingFence::new(3);
     let fence = || cf.check();
     assert!(matches!(
-        s.write_credential_entry(&f.env, &f.paths, b"new", &fence),
+        s.write_credential_entry(&f.env, &f.paths, b"new", &fence, &mut save_nothing),
         Err(ProviderError::Lock(_))
     ));
     // The file fallback already landed; the shadowing Keychain item was never deleted
@@ -970,7 +1011,7 @@ fn restore_is_fenced_for_both_files_and_items_and_aborts_immediately_on_fence_fa
 
     // Change everything, so every entry needs restoring: the credential write bumps both
     // the Keychain item and the pre-existing file, and the config is spliced directly.
-    s.write_credential_entry(&f.env, &f.paths, b"changed", &open)
+    s.write_credential_entry(&f.env, &f.paths, b"changed", &open, &mut save_nothing)
         .unwrap();
     config::splice_key(&f.paths.global_config, "b", Some(&json!(2)), &open).unwrap();
 
@@ -1074,12 +1115,12 @@ fn file_fallback_verifies_every_fallback_item_is_gone_including_the_plain_one() 
     // the existence check must catch it.
     f.kc.put(&services[1], &acct, b"stale");
     f.kc.set_fail_delete(&services[1], true);
-    match s.write_credential_entry(&f.env, &f.paths, b"new", &open) {
+    match s.write_credential_entry(&f.env, &f.paths, b"new", &open, &mut save_nothing) {
         Err(ProviderError::ShadowingItem(name)) => assert_eq!(name, services[1]),
         other => panic!("expected ShadowingItem({}), got {other:?}", services[1]),
     }
     f.kc.set_fail_delete(&services[1], false);
-    s.write_credential_entry(&f.env, &f.paths, b"new", &open)
+    s.write_credential_entry(&f.env, &f.paths, b"new", &open, &mut save_nothing)
         .unwrap();
     assert!(f.kc.get(&services[0], &acct).is_none());
     assert!(f.kc.get(&services[1], &acct).is_none());
@@ -1094,7 +1135,7 @@ fn a_failed_fallback_never_pins_the_file_mode() {
     f.kc.set_fail_write(&svc, true);
     f.kc.set_fail_delete(&svc, true);
     assert!(
-        s.write_credential_entry(&f.env, &f.paths, b"new", &open)
+        s.write_credential_entry(&f.env, &f.paths, b"new", &open, &mut save_nothing)
             .is_err()
     );
     assert!(!s.file_mode_pinned());
@@ -1146,7 +1187,7 @@ fn restore_bumps_the_credentials_file_after_the_item_it_reflects() {
     f.kc.put(&svc, &acct, b"orig-item");
 
     let snap = s.snapshot(&f.env, &f.paths).unwrap();
-    s.write_credential_entry(&f.env, &f.paths, b"target", &open)
+    s.write_credential_entry(&f.env, &f.paths, b"target", &open, &mut save_nothing)
         .unwrap();
     assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"target");
     assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"target");
@@ -1235,7 +1276,7 @@ fn a_linux_credential_write_forces_the_file_to_0600() {
     fs::write(&f.paths.credentials_file, "old").unwrap();
     fs::set_permissions(&f.paths.credentials_file, fs::Permissions::from_mode(0o644)).unwrap();
 
-    s.write_credential_entry(&f.env, &f.paths, b"{\"a\":1}", &open)
+    s.write_credential_entry(&f.env, &f.paths, b"{\"a\":1}", &open, &mut save_nothing)
         .unwrap();
 
     assert_eq!(mode_of(&f.paths.credentials_file), 0o600);
@@ -1250,7 +1291,7 @@ fn the_hot_reload_mirror_forces_the_file_to_0600() {
     fs::set_permissions(&f.paths.credentials_file, fs::Permissions::from_mode(0o644)).unwrap();
 
     assert_eq!(
-        s.write_credential_entry(&f.env, &f.paths, b"v2", &open)
+        s.write_credential_entry(&f.env, &f.paths, b"v2", &open, &mut save_nothing)
             .unwrap(),
         SecretStore::Keychain
     );
@@ -1286,7 +1327,7 @@ fn a_symlinked_credentials_file_stays_a_symlink_with_its_target_at_0600() {
     fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
     std::os::unix::fs::symlink(&real, &f.paths.credentials_file).unwrap();
 
-    s.write_credential_entry(&f.env, &f.paths, b"{\"a\":1}", &open)
+    s.write_credential_entry(&f.env, &f.paths, b"{\"a\":1}", &open, &mut save_nothing)
         .unwrap();
 
     assert!(

@@ -68,6 +68,32 @@ pub struct LiveAuth {
     pub secondary: Vec<Read<Vec<u8>>>,
 }
 
+/// A change to the live login that destroys what it replaces (§9.4 step 7).
+#[derive(Debug, Clone, Copy)]
+pub enum LiveChange<'k> {
+    /// `write_credential` for a target of this kind: its axis written, the other cleared.
+    Write(&'k str),
+    /// `clear_other_axis`, keeping this kind's axis.
+    ClearOther(&'k str),
+}
+
+/// A live entry holding secrets that a `LiveChange` overwrites or deletes. `Debug` is derived:
+/// `Read<T>`'s own `Debug` redacts the bytes.
+#[derive(Debug, Clone)]
+pub struct DoomedEntry {
+    /// Its current contents.
+    pub bytes: Read<Vec<u8>>,
+    /// Destroyed only if the Keychain refuses the write and it falls back to a file (Appendix
+    /// A.3). That is decided only as the write runs, which then reports the entry to
+    /// `before_fallback` just before it deletes it.
+    pub on_fallback: bool,
+}
+
+/// Called by `write_credential` with each live entry a Keychain-refusal fallback is about to
+/// delete, immediately before it does, under the live locks. An error aborts the write, which
+/// then restores what it changed.
+pub type BeforeFallback<'a> = &'a mut dyn FnMut(&[u8]) -> Result<(), ProviderError>;
+
 /// The exact provider-owned state a switch may write (§3). Drives the pinned test (§15.3).
 #[derive(Debug, Clone, Default)]
 pub struct IdentitySurface {
@@ -235,6 +261,10 @@ pub trait Provider: Send + Sync {
         env: &Env,
         g: &'g MutationGuard,
     ) -> Result<LiveLocks<'g>, ProviderError>;
+    /// Every live entry holding secrets that `change` overwrites or deletes, on either auth
+    /// axis, read now under `locks` (§9.4 step 7): the entries it writes or clears, and the
+    /// copies of them no reader sees that go with them.
+    fn doomed(&self, env: &Env, locks: &LiveLocks<'_>, change: LiveChange<'_>) -> Vec<DoomedEntry>;
     /// Composes the target (§9.4 step 5), writes it on its axis, then clears the other axis
     /// (step 7). Refuses when an entry it would overwrite cannot be read fresh. The returned
     /// undo is tied to `locks`'s borrow (§9.4 step 10: the credential locks must be "held
@@ -245,6 +275,7 @@ pub trait Provider: Send + Sync {
         locks: &'l LiveLocks<'_>,
         target: &StoredLogin,
         live: &LiveAuth,
+        before_fallback: BeforeFallback<'_>,
     ) -> Result<Written<'l>, ProviderError>;
     /// Clears the auth axis other than `kept_kind`'s (§9.6 finish-forward).
     fn clear_other_axis<'l>(
@@ -335,6 +366,11 @@ mod tests {
             secondary: vec![Read::Present(SENTINEL.as_bytes().to_vec())],
         };
         assert!(!format!("{auth:?}").contains("SENTINEL"));
+        let doomed = DoomedEntry {
+            bytes: Read::Present(SENTINEL.as_bytes().to_vec()),
+            on_fallback: true,
+        };
+        assert!(!format!("{doomed:?}").contains("SENTINEL"));
     }
 
     #[test]
