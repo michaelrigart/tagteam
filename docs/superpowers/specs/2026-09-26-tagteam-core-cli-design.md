@@ -963,16 +963,15 @@ here on.
    - `Degraded` → abort. The Keychain item that could not be read may hold a newer generation
      than the file, plus the current machine-shared keys, and overwriting it would lose them.
 
-   The same holds for the copies of the entry that no reader sees but that step 7 overwrites or
-   clears: `.credentials.json` behind a Keychain item, and the fallback Keychain items
-   (Appendix A.2). One that is `Unreadable` aborts.
+   `Unreadable` aborts for every other live entry that step 7 overwrites or deletes as well,
+   including one it destroys only if the Keychain refuses the write.
 4. **Classify the outgoing credential**, using the pre-lock oracle result only if the live bytes
    haven't changed since it was taken:
 
    | Class | Condition | Action |
    |---|---|---|
    | `Ours` | Bytes or fingerprint equal the vault's | Nothing |
-   | `Wiped` | An OAuth blob with both tokens empty (CC's reaction to `invalid_grant`) | Nothing; the vault keeps its refresh token |
+   | `Wiped` | An OAuth blob with both tokens empty (CC's reaction to `invalid_grant`), or a credential with no token at all | Nothing; the vault keeps its refresh token |
    | `OursRotated` | The oracle resolved the token to this account (uuid-positive, org agreeing) | Write to the vault; the old generation becomes `.prev`. Backfill `account_uuid` if NULL |
    | `Foreign` | The oracle resolved it to another identity, known or not | **Displace**. This must succeed, or the switch aborts |
    | `Unresolved` | No oracle verdict, or the bytes moved since the oracle call | Write to the vault; `.prev` keeps the old generation recoverable. Log at WARN |
@@ -1005,13 +1004,15 @@ here on.
      Keychain item and in `.credentials.json` alike. An entry is deleted only when no
      machine-shared key remains in it.
 
-   An account-scoped secret on the auth axis the outgoing account is not on — which step 4 does
-   not classify — is displaced before step 7 clears or overwrites it, unless it is the target's
-   generation. The copies of the entry that step 3 names are displaced the same way, the file
-   before any write and the fallback items before an API key is written, unless their
-   generation is the live credential's, the target's, or one the outgoing account's vault
-   already holds (current or `.prev`). §9.6 recovery applies the same rule before it clears the
-   entry to finish forward.
+   Before the journal row, every live entry on either axis that step 7 will overwrite or
+   delete, and that holds an account-scoped secret, is displaced unless its generation is
+   already kept. Kept means held in the current or `.prev` vault generation of the outgoing
+   account or the target, or settled by step 2 or 4. The provider names these entries under
+   the locks. An entry that step 7 destroys only if the Keychain refuses the write (Appendix
+   A.3) is displaced as the fallback begins, not before. A failed displacement aborts, except
+   under `--force`. §9.6 recovery applies the same rule before it clears the other axis. There,
+   the accounts are the two the row names, and the outgoing generation the row journaled
+   counts as settled.
 8. **Splice** the target's `oauthAccount` into `~/.claude.json` (§9.5).
 9. **Commit** in one store transaction: set the active account, insert an `events` row
    (`source` = `cli` or `auto`), and delete the journal row.
