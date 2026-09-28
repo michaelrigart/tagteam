@@ -224,3 +224,204 @@ fn find_by_email_spans_providers_unless_narrowed() {
     assert_eq!(s.find_by_email("a@x.co", None).unwrap().len(), 2);
     assert_eq!(s.find_by_email("a@x.co", Some(&cc())).unwrap().len(), 1);
 }
+
+// --- Fix round 1 ---
+
+#[test]
+fn a_newer_schema_version_is_refused_and_the_database_is_untouched() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    Store::open(&path).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+    }
+    assert!(matches!(
+        Store::open(&path),
+        Err(StoreError::UnsupportedSchema(2))
+    ));
+    // Refusing must not have touched the database: still v2, and still just the one table
+    // set the store itself created (no re-migration, no half-applied schema).
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+}
+
+#[test]
+fn concurrent_first_opens_all_succeed() {
+    for _ in 0..5 {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("t.db");
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                std::thread::spawn(move || Store::open(&path).and_then(|s| s.schema_version()))
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap().unwrap(), 1);
+        }
+    }
+}
+
+#[test]
+fn finish_replacement_refuses_metadata_missing_required_fields() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let replacement = identity("a@x.co");
+    let meta = LoginMeta {
+        identity_key: "a@x.co\n",
+        identity: &replacement,
+        kind: "api_key",
+        login_expires_at: Some(42),
+    };
+    s.begin_replacement(&a, "sha256:x", &meta).unwrap();
+    drop(s);
+    {
+        // Corrupt the recorded metadata as if written by an incompatible version: no
+        // identity_key, label or kind at all.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE accounts SET replacing_meta = ?1 WHERE id = ?2",
+            rusqlite::params![r#"{"org_uuid":""}"#, "a"],
+        )
+        .unwrap();
+    }
+    let s = Store::open(&path).unwrap();
+    assert!(matches!(
+        s.finish_replacement(&a),
+        Err(StoreError::Corrupt(_))
+    ));
+    // Untouched: the original login and the pending marker are both still there.
+    let r = s.account(&a).unwrap().unwrap();
+    assert_eq!(r.kind, "oauth");
+    assert_eq!(r.replacing_fp.as_deref(), Some("sha256:x"));
+}
+
+#[test]
+fn begin_replacement_is_guarded_against_a_second_start() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let replacement = identity("a@x.co");
+    let meta = |kind| LoginMeta {
+        identity_key: "a@x.co\n",
+        identity: &replacement,
+        kind,
+        login_expires_at: None,
+    };
+    s.begin_replacement(&a, "sha256:x", &meta("api_key"))
+        .unwrap();
+    assert!(matches!(
+        s.begin_replacement(&a, "sha256:y", &meta("setup_token")),
+        Err(StoreError::ReplacementPending)
+    ));
+}
+
+#[test]
+fn rollback_after_rollback_leaves_the_epoch_at_its_start() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let start = s.account(&a).unwrap().unwrap().login_epoch;
+    let replacement = identity("a@x.co");
+    let meta = LoginMeta {
+        identity_key: "a@x.co\n",
+        identity: &replacement,
+        kind: "oauth",
+        login_expires_at: None,
+    };
+    s.begin_replacement(&a, "sha256:x", &meta).unwrap();
+    s.rollback_replacement(&a).unwrap();
+    s.rollback_replacement(&a).unwrap();
+    assert_eq!(s.account(&a).unwrap().unwrap().login_epoch, start);
+}
+
+#[test]
+fn a_missing_account_is_reported_by_both_replacement_entry_points() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let missing = AccountId::from_string("ghost");
+    let replacement = identity("a@x.co");
+    let meta = LoginMeta {
+        identity_key: "a@x.co\n",
+        identity: &replacement,
+        kind: "oauth",
+        login_expires_at: None,
+    };
+    assert!(matches!(
+        s.begin_replacement(&missing, "sha256:x", &meta),
+        Err(StoreError::NoSuchAccount)
+    ));
+    assert!(matches!(
+        s.finish_replacement(&missing),
+        Err(StoreError::NoSuchAccount)
+    ));
+}
+
+#[test]
+fn a_malformed_prior_journal_snapshot_is_reported_not_silently_dropped() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let j = JournalRow {
+        provider: cc(),
+        holder: ProcessStamp { pid: 1, start: 2 },
+        from_id: Some(a),
+        to_id: b,
+        from_fp: Some("sha256:a".into()),
+        from_identity: None,
+        to_fp: "sha256:b".into(),
+        started_at: 5,
+        prior: None,
+    };
+    s.insert_journal(&j).unwrap();
+    drop(s);
+    {
+        // A `prior` snapshot missing a required field: valid JSON, not a valid JournalRow.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE switch_journal SET prior = ?1 WHERE provider = ?2",
+            rusqlite::params![r#"{"provider":"claude-code"}"#, "claude-code"],
+        )
+        .unwrap();
+    }
+    let s = Store::open(&path).unwrap();
+    assert!(s.journal(&cc()).is_err());
+}
+
+#[test]
+fn next_position_reports_overflow_instead_of_wrapping() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    add(&s, &cc(), "a", "a@x.co", u32::MAX);
+    assert!(s.next_position(&cc()).is_err());
+}
+
+#[test]
+fn empty_aliases_are_refused_and_never_match() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    assert!(matches!(
+        s.set_alias(&a, Some("")),
+        Err(StoreError::InvalidAlias)
+    ));
+    assert!(s.find_by_alias("").unwrap().is_none());
+}
+
+#[test]
+fn open_existing_does_not_recreate_a_removed_database() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    Store::open(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(Store::open_existing(&path).unwrap().is_none());
+    assert!(!path.exists());
+}

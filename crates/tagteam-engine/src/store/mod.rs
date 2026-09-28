@@ -1,15 +1,21 @@
 use std::io;
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, ErrorCode, OptionalExtension, Row, params};
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Row, TransactionBehavior, params,
+};
 use serde_json::{Value, json};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::atomic::ensure_private_dir;
 use tagteam_provider::{Identity, ProcessStamp};
 
 const SCHEMA_V1: &str = include_str!("schema.sql");
+
+/// The `PRAGMA user_version` this build knows how to read and write. A stored version above
+/// this is a store written by a newer tagteam; `migrate` refuses it rather than guessing.
+const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -27,6 +33,12 @@ pub enum StoreError {
     IdentityTaken,
     #[error("no such account")]
     NoSuchAccount,
+    #[error("store schema v{0} is newer than this tagteam supports")]
+    UnsupportedSchema(i64),
+    #[error("a replacement is already pending for this account")]
+    ReplacementPending,
+    #[error("an alias cannot be empty")]
+    InvalidAlias,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,24 +127,33 @@ fn journal_to_json(j: &JournalRow) -> Value {
     })
 }
 
-fn journal_from_json(v: &Value) -> Option<JournalRow> {
-    Some(JournalRow {
-        provider: ProviderId::new(v["provider"].as_str()?),
+/// The inverse of `journal_to_json`. Returns an error rather than silently dropping a
+/// malformed `prior` snapshot: a caller (rollback or recovery) that got `None` back would
+/// delete the undecidable row instead of restoring it (§9.6).
+fn journal_from_json(v: &Value) -> rusqlite::Result<JournalRow> {
+    fn malformed() -> rusqlite::Error {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            "malformed journal snapshot".into(),
+        )
+    }
+    Ok(JournalRow {
+        provider: ProviderId::new(v["provider"].as_str().ok_or_else(malformed)?),
         holder: ProcessStamp {
-            pid: v["holder_pid"].as_u64()? as u32,
-            start: v["holder_start"].as_u64()?,
+            pid: v["holder_pid"].as_u64().ok_or_else(malformed)? as u32,
+            start: v["holder_start"].as_u64().ok_or_else(malformed)?,
         },
         from_id: v["from_id"].as_str().map(AccountId::from_string),
-        to_id: AccountId::from_string(v["to_id"].as_str()?),
+        to_id: AccountId::from_string(v["to_id"].as_str().ok_or_else(malformed)?),
         from_fp: v["from_fp"].as_str().map(str::to_owned),
         from_identity: Some(v["from_identity"].clone()).filter(|x| !x.is_null()),
-        to_fp: v["to_fp"].as_str()?.to_owned(),
-        started_at: v["started_at"].as_i64()?,
-        prior: v
-            .get("prior")
-            .filter(|x| !x.is_null())
-            .and_then(journal_from_json)
-            .map(Box::new),
+        to_fp: v["to_fp"].as_str().ok_or_else(malformed)?.to_owned(),
+        started_at: v["started_at"].as_i64().ok_or_else(malformed)?,
+        prior: match v.get("prior") {
+            Some(p) if !p.is_null() => Some(Box::new(journal_from_json(p)?)),
+            _ => None,
+        },
     })
 }
 
@@ -168,6 +189,9 @@ const SET_ACTIVE_SQL: &str = "INSERT INTO active_accounts (provider, account_id)
 /// Clears the provider's journal row: shared by `commit_switch`, which clears it as part of
 /// landing a switch, and `delete_journal`.
 const DELETE_JOURNAL_SQL: &str = "DELETE FROM switch_journal WHERE provider = ?1";
+
+/// Moves one account to a given position: shared by both sides of the swap in `move_to`.
+const SET_POSITION_SQL: &str = "UPDATE accounts SET position = ?2 WHERE id = ?1";
 
 fn json_col(r: &Row<'_>, name: &str) -> rusqlite::Result<Option<Value>> {
     let raw: Option<String> = r.get(name)?;
@@ -217,10 +241,10 @@ fn journal_from_row(r: &Row<'_>) -> rusqlite::Result<JournalRow> {
         from_identity: json_col(r, "from_identity")?,
         to_fp: r.get("to_fp")?,
         started_at: r.get("started_at")?,
-        prior: json_col(r, "prior")?
-            .as_ref()
-            .and_then(journal_from_json)
-            .map(Box::new),
+        prior: match json_col(r, "prior")? {
+            Some(v) => Some(Box::new(journal_from_json(&v)?)),
+            None => None,
+        },
     })
 }
 
@@ -297,16 +321,62 @@ fn set_active_on(
     )
 }
 
+/// Reads `PRAGMA user_version`, shared by `migrate` (both the pre-check and the re-check made
+/// under its transaction) and `schema_version`.
+fn user_version(c: &Connection) -> rusqlite::Result<i64> {
+    c.query_row("PRAGMA user_version", [], |r| r.get(0))
+}
+
+/// The flags every tagteam connection opens with, `SQLITE_OPEN_CREATE` only when the caller
+/// may create the file. `open_existing` opens without it, so a database removed between its
+/// existence check and this call is never recreated out from under the removal.
+fn open_flags(create: bool) -> OpenFlags {
+    let base = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    if create {
+        base | OpenFlags::SQLITE_OPEN_CREATE
+    } else {
+        base
+    }
+}
+
+/// `PRAGMA journal_mode = WAL` needs a brief exclusive lock to convert a database that has
+/// never been in WAL mode, and — unlike ordinary reads and writes — reports `SQLITE_BUSY`
+/// immediately rather than waiting on the connection's busy handler (sqlite.org/pragma.html
+/// #pragma_journal_mode). Concurrent first opens of the same fresh file must therefore retry
+/// it themselves; this polls for the same 5-second budget as `busy_timeout` below.
+fn set_wal_mode(conn: &Connection) -> Result<(), StoreError> {
+    let deadline = Instant::now() + Duration::from_millis(5000);
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(f, _))
+                if f.code == ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+fn connect(path: &Path, create: bool) -> Result<Connection, StoreError> {
+    let conn = Connection::open_with_flags(path, open_flags(create))?;
+    conn.busy_timeout(Duration::from_millis(5000))?;
+    set_wal_mode(&conn)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
+    Ok(conn)
+}
+
+fn is_cannot_open(e: &StoreError) -> bool {
+    matches!(e, StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _)) if f.code == ErrorCode::CannotOpen)
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(dir) = path.parent() {
             ensure_private_dir(dir)?;
         }
-        let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_millis(5000))?;
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;",
-        )?;
+        let conn = connect(path, true)?;
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -314,32 +384,53 @@ impl Store {
         Ok(store)
     }
 
+    /// Never creates a file, a directory, or a WAL/SHM sidecar: it checks existence first,
+    /// then opens without `SQLITE_OPEN_CREATE`, so a database removed in between is reported
+    /// as absent rather than recreated.
     pub fn open_existing(path: &Path) -> Result<Option<Self>, StoreError> {
-        if path.exists() {
-            Self::open(path).map(Some)
-        } else {
-            Ok(None)
+        if !path.try_exists()? {
+            return Ok(None);
         }
+        let conn = match connect(path, false) {
+            Ok(conn) => conn,
+            Err(e) if is_cannot_open(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
+        store.migrate()?;
+        Ok(Some(store))
     }
 
+    fn lock(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Applies the embedded schema exactly once. A stored version newer than
+    /// `SCHEMA_VERSION` is refused outright, without opening a transaction. Otherwise the
+    /// whole check-and-apply runs in one `IMMEDIATE` transaction, re-reading the version
+    /// under the write lock it grants: concurrent first opens then serialize on that lock
+    /// instead of racing `CREATE TABLE` (§6.1).
     fn migrate(&self) -> Result<(), StoreError> {
-        let mut c = self.conn.lock().unwrap();
-        let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 1 {
-            let tx = c.transaction()?;
-            tx.execute_batch(SCHEMA_V1)?;
-            tx.execute_batch("PRAGMA user_version = 1;")?;
+        let mut c = self.lock();
+        let version = user_version(&c)?;
+        if version > SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchema(version));
+        }
+        if version < SCHEMA_VERSION {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if user_version(&tx)? < SCHEMA_VERSION {
+                tx.execute_batch(SCHEMA_V1)?;
+                tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            }
             tx.commit()?;
         }
         Ok(())
     }
 
     pub fn schema_version(&self) -> Result<i64, StoreError> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row("PRAGMA user_version", [], |r| r.get(0))?)
+        Ok(user_version(&self.lock())?)
     }
 
     fn query_accounts(
@@ -347,7 +438,7 @@ impl Store {
         where_clause: &str,
         params: &[&dyn rusqlite::ToSql],
     ) -> Result<Vec<AccountRow>, StoreError> {
-        let c = self.conn.lock().unwrap();
+        let c = self.lock();
         let sql = format!("SELECT {ACCOUNT_COLUMNS} FROM accounts {where_clause}");
         let mut stmt = c.prepare(&sql)?;
         let rows = stmt
@@ -405,6 +496,9 @@ impl Store {
     }
 
     pub fn find_by_alias(&self, alias: &str) -> Result<Option<AccountRow>, StoreError> {
+        if alias.is_empty() {
+            return Ok(None);
+        }
         self.one("WHERE alias = ?1", &[&alias])
     }
 
@@ -423,17 +517,22 @@ impl Store {
     }
 
     pub fn next_position(&self, provider: &ProviderId) -> Result<u32, StoreError> {
-        let c = self.conn.lock().unwrap();
+        let c = self.lock();
         let max: Option<u32> = c.query_row(
             "SELECT MAX(position) FROM accounts WHERE provider = ?1",
             [provider.as_str()],
             |r| r.get(0),
         )?;
-        Ok(max.unwrap_or(0) + 1)
+        max.unwrap_or(0).checked_add(1).ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "provider {:?} has no position left to allocate",
+                provider.as_str()
+            ))
+        })
     }
 
     pub fn insert_account(&self, a: &NewAccount<'_>) -> Result<(), StoreError> {
-        let c = self.conn.lock().unwrap();
+        let c = self.lock();
         c.execute(
             "INSERT INTO accounts (id, provider, position, identity_key, label, email, org_uuid, org_name, \
              account_uuid, kind, alias, identity_json, login_expires_at, added_at) \
@@ -460,7 +559,7 @@ impl Store {
     }
 
     fn exec(&self, sql: &str, p: &[&dyn rusqlite::ToSql]) -> Result<usize, StoreError> {
-        Ok(self.conn.lock().unwrap().execute(sql, p)?)
+        Ok(self.lock().execute(sql, p)?)
     }
 
     pub fn update_login(
@@ -471,7 +570,7 @@ impl Store {
         kind: &str,
         login_expires_at: Option<i64>,
     ) -> Result<(), StoreError> {
-        let c = self.conn.lock().unwrap();
+        let c = self.lock();
         let n = apply_login(&c, id, identity_key, identity, kind, login_expires_at)?;
         if n == 0 {
             Err(StoreError::NoSuchAccount)
@@ -480,6 +579,9 @@ impl Store {
         }
     }
 
+    /// Marks the start of a replacement (§12.5): bumps the epoch and records both the
+    /// incoming fingerprint and the metadata to install once it lands. Guarded so a second
+    /// `begin` on an already-pending account is refused rather than clobbering the first.
     pub fn begin_replacement(
         &self,
         id: &AccountId,
@@ -497,39 +599,66 @@ impl Store {
             "identity_json": meta.identity.raw,
             "login_expires_at": meta.login_expires_at,
         });
-        self.exec(
-            "UPDATE accounts SET login_epoch = login_epoch + 1, replacing_fp = ?2, replacing_meta = ?3 WHERE id = ?1",
-            &[&id.as_str(), &fp, &meta.to_string()],
+        let mut c = self.lock();
+        let tx = c.transaction()?;
+        let n = tx.execute(
+            "UPDATE accounts SET login_epoch = login_epoch + 1, replacing_fp = ?2, replacing_meta = ?3 \
+             WHERE id = ?1 AND replacing_fp IS NULL",
+            params![id.as_str(), fp, meta.to_string()],
         )?;
+        if n == 0 {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1)",
+                [id.as_str()],
+                |r| r.get(0),
+            )?;
+            return Err(if exists {
+                StoreError::ReplacementPending
+            } else {
+                StoreError::NoSuchAccount
+            });
+        }
+        tx.commit()?;
         Ok(())
     }
 
     /// The replacement landed: installs its recorded metadata, clears any quarantine and the
-    /// marker, all in one transaction.
+    /// marker, all in one transaction. A missing `identity_key`, `label` or `kind` in the
+    /// recorded metadata means the account and its marker are left exactly as they were
+    /// (§12.5) rather than installing an empty identity.
     pub fn finish_replacement(&self, id: &AccountId) -> Result<(), StoreError> {
-        let mut c = self.conn.lock().unwrap();
+        let mut c = self.lock();
         let tx = c.transaction()?;
-        let meta: Option<String> = tx
+        let row: Option<Option<String>> = tx
             .query_row(
                 "SELECT replacing_meta FROM accounts WHERE id = ?1",
                 [id.as_str()],
                 |r| r.get(0),
             )
-            .optional()?
-            .flatten();
+            .optional()?;
+        let meta = match row {
+            None => return Err(StoreError::NoSuchAccount),
+            Some(meta) => meta,
+        };
         if let Some(m) = meta {
             let v: Value =
                 serde_json::from_str(&m).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+            let missing = |field: &str| {
+                StoreError::Corrupt(format!("replacement metadata is missing its {field} field"))
+            };
+            let identity_key = v["identity_key"]
+                .as_str()
+                .ok_or_else(|| missing("identity_key"))?;
+            let label = v["label"].as_str().ok_or_else(|| missing("label"))?;
+            let kind = v["kind"].as_str().ok_or_else(|| missing("kind"))?;
             let identity = Identity {
-                label: v["label"].as_str().unwrap_or_default().to_owned(),
+                label: label.to_owned(),
                 email: v["email"].as_str().map(str::to_owned),
                 org_uuid: v["org_uuid"].as_str().unwrap_or_default().to_owned(),
                 org_name: v["org_name"].as_str().map(str::to_owned),
                 account_uuid: v["account_uuid"].as_str().map(str::to_owned),
                 raw: v["identity_json"].clone(),
             };
-            let identity_key = v["identity_key"].as_str().unwrap_or_default();
-            let kind = v["kind"].as_str().unwrap_or_default();
             let login_expires_at = v["login_expires_at"].as_i64();
             apply_login(&tx, id, identity_key, &identity, kind, login_expires_at)?;
         }
@@ -559,6 +688,9 @@ impl Store {
     }
 
     pub fn set_alias(&self, id: &AccountId, alias: Option<&str>) -> Result<(), StoreError> {
+        if alias == Some("") {
+            return Err(StoreError::InvalidAlias);
+        }
         self.exec(
             "UPDATE accounts SET alias = ?2 WHERE id = ?1",
             &[&id.as_str(), &alias],
@@ -579,7 +711,7 @@ impl Store {
     }
 
     pub fn move_to(&self, id: &AccountId, position: u32) -> Result<(), StoreError> {
-        let mut c = self.conn.lock().unwrap();
+        let mut c = self.lock();
         let tx = c.transaction()?;
         let (provider, from): (String, u32) = tx
             .query_row(
@@ -599,15 +731,9 @@ impl Store {
         if let Some(other) = &occupant {
             tx.execute("UPDATE accounts SET position = 0 WHERE id = ?1", [other])?;
         }
-        tx.execute(
-            "UPDATE accounts SET position = ?2 WHERE id = ?1",
-            params![id.as_str(), position],
-        )?;
+        tx.execute(SET_POSITION_SQL, params![id.as_str(), position])?;
         if let Some(other) = &occupant {
-            tx.execute(
-                "UPDATE accounts SET position = ?2 WHERE id = ?1",
-                params![other, from],
-            )?;
+            tx.execute(SET_POSITION_SQL, params![other, from])?;
         }
         tx.commit()?;
         Ok(())
@@ -619,7 +745,7 @@ impl Store {
     }
 
     pub fn active(&self, provider: &ProviderId) -> Result<Option<AccountId>, StoreError> {
-        let c = self.conn.lock().unwrap();
+        let c = self.lock();
         let id: Option<Option<String>> = c
             .query_row(
                 "SELECT account_id FROM active_accounts WHERE provider = ?1",
@@ -635,7 +761,7 @@ impl Store {
         provider: &ProviderId,
         id: Option<&AccountId>,
     ) -> Result<(), StoreError> {
-        set_active_on(&self.conn.lock().unwrap(), provider, id)?;
+        set_active_on(&self.lock(), provider, id)?;
         Ok(())
     }
 
@@ -663,7 +789,7 @@ impl Store {
         to: &AccountId,
         event: &EventRow,
     ) -> Result<(), StoreError> {
-        let mut c = self.conn.lock().unwrap();
+        let mut c = self.lock();
         let tx = c.transaction()?;
         set_active_on(&tx, provider, Some(to))?;
         Self::insert_event_on(&tx, event)?;
@@ -673,12 +799,12 @@ impl Store {
     }
 
     pub fn insert_event(&self, e: &EventRow) -> Result<(), StoreError> {
-        Self::insert_event_on(&self.conn.lock().unwrap(), e)?;
+        Self::insert_event_on(&self.lock(), e)?;
         Ok(())
     }
 
     pub fn events(&self) -> Result<Vec<EventRow>, StoreError> {
-        let c = self.conn.lock().unwrap();
+        let c = self.lock();
         let mut stmt = c.prepare("SELECT * FROM events ORDER BY rowid")?;
         let rows = stmt
             .query_map([], event_from_row)?
@@ -687,7 +813,7 @@ impl Store {
     }
 
     pub fn journal(&self, provider: &ProviderId) -> Result<Option<JournalRow>, StoreError> {
-        let c = self.conn.lock().unwrap();
+        let c = self.lock();
         Ok(c.query_row(
             "SELECT * FROM switch_journal WHERE provider = ?1",
             [provider.as_str()],
@@ -697,7 +823,7 @@ impl Store {
     }
 
     pub fn journals(&self) -> Result<Vec<JournalRow>, StoreError> {
-        let c = self.conn.lock().unwrap();
+        let c = self.lock();
         let mut stmt = c.prepare("SELECT * FROM switch_journal ORDER BY provider")?;
         let rows = stmt
             .query_map([], journal_from_row)?
@@ -709,7 +835,7 @@ impl Store {
     /// forced switch settles an undecidable row this way without a gap in which neither
     /// row exists (§9.6).
     pub fn insert_journal(&self, j: &JournalRow) -> Result<(), StoreError> {
-        self.conn.lock().unwrap().execute(
+        self.lock().execute(
             "INSERT OR REPLACE INTO switch_journal \
              (provider, holder_pid, holder_start, from_id, to_id, from_fp, from_identity, to_fp, started_at, prior) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -735,7 +861,7 @@ impl Store {
     }
 
     pub fn insert_displaced(&self, d: &DisplacedRow) -> Result<(), StoreError> {
-        self.conn.lock().unwrap().execute(
+        self.lock().execute(
             "INSERT INTO displaced (id, provider, at, reason, fingerprint, identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![d.id, d.provider.as_str(), d.at, d.reason, d.fingerprint, d.identity.as_ref().map(Value::to_string)],
         )?;
