@@ -110,6 +110,15 @@ fn restore_file(
     }
 }
 
+/// Logs, right before a lock-loss abort, exactly which entries never got restored:
+/// those already recorded as failed, and those the abort means will never be
+/// attempted. Names only — Keychain services and file paths — never bytes.
+fn log_lock_abort(failed: &[String], never_attempted: &[String]) {
+    tracing::error!(
+        "the lock was lost mid-restore; left unrestored: {failed:?}; never attempted: {never_attempted:?}"
+    );
+}
+
 impl LiveStore {
     pub fn new(keychain: Arc<dyn Keychain>, platform: Platform) -> Self {
         Self {
@@ -432,14 +441,21 @@ impl LiveStore {
         Ok(())
     }
 
-    /// Restores every entry a switch may have touched, in the reverse of write order
-    /// (§9.4 step 10): `global_config`, then the credentials file, then the managed-key
-    /// items, then the OAuth items. An entry already equal to its snapshot is left
-    /// untouched. A fence or `Lock` failure means the caller's ownership is gone, so it
-    /// aborts the whole restore immediately; any other failure is recorded and every
-    /// remaining entry is still attempted, so one flaky Keychain write never strands the
-    /// rest of the rollback. When anything was left unrestored, the single error returned
-    /// names every one of them — Keychain services and file paths, never bytes.
+    /// Restores every entry a switch may have touched: `global_config` first, then the
+    /// managed-key and OAuth Keychain items, then the credentials file last. The file
+    /// goes last, and is rewritten even when its bytes already match the snapshot once
+    /// any Keychain item was actually restored, so its hot-reload mtime bump (Appendix
+    /// A.3, mirroring `write_credential_entry`) always lands after the item it reflects
+    /// — restoring the file first, or skipping it because it already matched, would let
+    /// CC reload and memoize the target's token before the item behind it was put back.
+    /// A file absent from the snapshot is still only removed or left absent, never
+    /// created for the sake of a bump. An entry already equal to its snapshot is
+    /// otherwise left untouched. A fence or `Lock` failure means the caller's ownership
+    /// is gone, so it aborts the whole restore immediately (after logging every entry
+    /// left unrestored); any other failure is recorded and every remaining entry is
+    /// still attempted, so one flaky Keychain write never strands the rest of the
+    /// rollback. When anything was left unrestored, the single error returned names
+    /// every one of them — Keychain services and file paths, never bytes.
     pub fn restore(
         &self,
         env: &Env,
@@ -449,31 +465,67 @@ impl LiveStore {
     ) -> Result<(), ProviderError> {
         let acct = keychain_account(env);
         let mut failed: Vec<String> = Vec::new();
+        let global_config_name = paths.global_config.display().to_string();
+        let credentials_file_name = paths.credentials_file.display().to_string();
+        let item_names: Vec<String> = snap
+            .managed_items
+            .iter()
+            .chain(&snap.oauth_items)
+            .map(|(svc, _)| svc.clone())
+            .collect();
 
-        for (path, value) in [
-            (&paths.global_config, &snap.global_config),
-            (&paths.credentials_file, &snap.credentials_file),
-        ] {
-            if file_matches(path, value) {
-                continue;
-            }
-            if let Err(e) = restore_file(path, value, fence) {
+        // 1. `global_config` first: CC's identity and managed-key axis live here.
+        if !file_matches(&paths.global_config, &snap.global_config) {
+            if let Err(e) = restore_file(&paths.global_config, &snap.global_config, fence) {
                 if matches!(e, ProviderError::Lock(_)) {
+                    let mut never_attempted = vec![global_config_name];
+                    never_attempted.extend(item_names.iter().cloned());
+                    never_attempted.push(credentials_file_name);
+                    log_lock_abort(&failed, &never_attempted);
                     return Err(e);
                 }
-                failed.push(path.display().to_string());
+                failed.push(global_config_name);
             }
         }
 
-        for (svc, value) in snap.managed_items.iter().chain(&snap.oauth_items) {
+        // 2. The Keychain items: managed-key, then OAuth.
+        let mut any_item_restored = false;
+        for (i, (svc, value)) in snap
+            .managed_items
+            .iter()
+            .chain(&snap.oauth_items)
+            .enumerate()
+        {
             if self.item_matches(svc, &acct, value) {
                 continue;
             }
-            if let Err(e) = self.restore_item(svc, &acct, value, fence) {
+            match self.restore_item(svc, &acct, value, fence) {
+                Ok(()) => any_item_restored = true,
+                Err(e) => {
+                    if matches!(e, ProviderError::Lock(_)) {
+                        let mut never_attempted = item_names[i..].to_vec();
+                        never_attempted.push(credentials_file_name);
+                        log_lock_abort(&failed, &never_attempted);
+                        return Err(e);
+                    }
+                    failed.push(svc.clone());
+                }
+            }
+        }
+
+        // 3. The credentials file last, so a Keychain item's hot-reload bump always
+        // lands after that item. Never created for a snapshot that had none.
+        let mismatched = !file_matches(&paths.credentials_file, &snap.credentials_file);
+        let bump_for_reload = any_item_restored
+            && snap.credentials_file.is_some()
+            && paths.credentials_file.try_exists().unwrap_or(false);
+        if mismatched || bump_for_reload {
+            if let Err(e) = restore_file(&paths.credentials_file, &snap.credentials_file, fence) {
                 if matches!(e, ProviderError::Lock(_)) {
+                    log_lock_abort(&failed, std::slice::from_ref(&credentials_file_name));
                     return Err(e);
                 }
-                failed.push(svc.clone());
+                failed.push(credentials_file_name);
             }
         }
 

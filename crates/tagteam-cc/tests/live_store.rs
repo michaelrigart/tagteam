@@ -1,7 +1,7 @@
 use std::fs;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
@@ -91,27 +91,27 @@ impl CountingFence {
     }
 }
 
-/// Wraps a `FakeKeychain` to count `upsert` calls, so a test can prove an entry that
-/// already matches its snapshot was never rewritten.
-struct CountingKeychain {
+/// Wraps a `FakeKeychain` and records every `upsert`/`delete` call, in order, so a test
+/// can prove both which entries were (not) touched and in what order they were.
+struct RecordingKeychain {
     inner: Arc<FakeKeychain>,
-    upserts: AtomicUsize,
+    calls: Mutex<Vec<(String, &'static str)>>,
 }
 
-impl CountingKeychain {
+impl RecordingKeychain {
     fn new(inner: Arc<FakeKeychain>) -> Self {
         Self {
             inner,
-            upserts: AtomicUsize::new(0),
+            calls: Mutex::new(Vec::new()),
         }
     }
 
-    fn upsert_count(&self) -> usize {
-        self.upserts.load(Ordering::SeqCst)
+    fn calls(&self) -> Vec<(String, &'static str)> {
+        self.calls.lock().unwrap().clone()
     }
 }
 
-impl Keychain for CountingKeychain {
+impl Keychain for RecordingKeychain {
     fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
         self.inner.find(s, a)
     }
@@ -119,10 +119,67 @@ impl Keychain for CountingKeychain {
         self.inner.exists(s, a)
     }
     fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), KeychainError> {
-        self.upserts.fetch_add(1, Ordering::SeqCst);
+        self.calls.lock().unwrap().push((s.to_owned(), "upsert"));
         self.inner.upsert(s, a, d)
     }
     fn delete(&self, s: &str, a: &str) -> Result<(), KeychainError> {
+        self.calls.lock().unwrap().push((s.to_owned(), "delete"));
+        self.inner.delete(s, a)
+    }
+    fn lock_state(&self) -> LockState {
+        self.inner.lock_state()
+    }
+    fn unlock(&self) -> bool {
+        self.inner.unlock()
+    }
+}
+
+/// Wraps a `FakeKeychain` and, on every `upsert`/`delete`, records the credentials
+/// file's mtime at that moment — so a test can prove the file's own hot-reload bump
+/// happens strictly after the Keychain item it reflects, never before or instead of it.
+struct MtimeProbeKeychain {
+    inner: Arc<FakeKeychain>,
+    credentials_file: std::path::PathBuf,
+    mtime_at_last_item_write: Mutex<Option<SystemTime>>,
+}
+
+impl MtimeProbeKeychain {
+    fn new(inner: Arc<FakeKeychain>, credentials_file: std::path::PathBuf) -> Self {
+        Self {
+            inner,
+            credentials_file,
+            mtime_at_last_item_write: Mutex::new(None),
+        }
+    }
+
+    fn mtime_at_last_item_write(&self) -> Option<SystemTime> {
+        *self.mtime_at_last_item_write.lock().unwrap()
+    }
+
+    fn record(&self) {
+        let mtime = fs::metadata(&self.credentials_file)
+            .and_then(|m| m.modified())
+            .ok();
+        *self.mtime_at_last_item_write.lock().unwrap() = mtime;
+        // A later bump must land at a strictly later mtime regardless of the
+        // filesystem's clock resolution.
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+impl Keychain for MtimeProbeKeychain {
+    fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
+        self.inner.find(s, a)
+    }
+    fn exists(&self, s: &str, a: &str) -> Read<()> {
+        self.inner.exists(s, a)
+    }
+    fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), KeychainError> {
+        self.record();
+        self.inner.upsert(s, a, d)
+    }
+    fn delete(&self, s: &str, a: &str) -> Result<(), KeychainError> {
+        self.record();
         self.inner.delete(s, a)
     }
     fn lock_state(&self) -> LockState {
@@ -636,46 +693,65 @@ fn a_successful_keychain_write_clears_a_stale_primary_api_key() {
 }
 
 #[test]
-fn restore_continues_past_a_non_lock_failure_and_names_every_unrestored_entry() {
+fn restore_continues_past_a_non_lock_failure_and_skips_an_already_matching_entry() {
     let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
-    let counting = Arc::new(CountingKeychain::new(f.kc.clone()));
-    let s = LiveStore::new(counting.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
+    let recording = Arc::new(RecordingKeychain::new(f.kc.clone()));
+    let s = LiveStore::new(recording.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
     let acct = keychain_account(&f.env);
-    let services = read_services(&f.env, ItemKind::OAuth);
-    assert_eq!(services.len(), 2);
-    // Only the plain fallback item is present; the primary is absent from the start.
-    f.kc.put(
-        &services[1],
-        &acct,
-        br#"{"claudeAiOauth":{"refreshToken":"plain"}}"#,
-    );
+    let oauth = read_services(&f.env, ItemKind::OAuth);
+    assert_eq!(oauth.len(), 2);
+    let managed = read_services(&f.env, ItemKind::ManagedKey);
+    assert_eq!(managed.len(), 2);
+
+    // Both OAuth items need restoring (a `Some` snapshot, so `upsert`, not `delete`).
+    // One managed-key item already matches its snapshot and must receive no write at
+    // all — proving the skip — while the OAuth items prove the loop does not stop at
+    // the first failure.
+    f.kc.put(&oauth[0], &acct, b"orig-primary");
+    f.kc.put(&oauth[1], &acct, b"orig-plain");
+    f.kc.put(&managed[0], &acct, b"unchanged-managed");
     let snap = s.snapshot(&f.env, &f.paths).unwrap();
 
-    // Both upserts fail, so the write falls back to the file, and `remove_items` deletes
-    // both fallback items, including the plain one.
-    f.kc.set_fail_write(&services[0], true);
-    f.kc.set_fail_write(&services[1], true);
-    s.write_credential_entry(&f.env, &f.paths, b"new", &open)
-        .unwrap();
-    assert!(f.kc.get(&services[0], &acct).is_none());
-    assert!(f.kc.get(&services[1], &acct).is_none());
+    f.kc.put(&oauth[0], &acct, b"target-primary");
+    f.kc.put(&oauth[1], &acct, b"target-plain");
+    // `managed[0]` is left untouched, so it still equals its snapshot.
 
-    // Restore: the plain item's upsert still fails.
-    let upserts_before = counting.upsert_count();
+    // The primary item is restored first (managed items come first in `restore`, but
+    // neither needs restoring here, so the OAuth pair is the first pair attempted, and
+    // the primary is first within it). Its upsert fails; the plain item must still be
+    // restored afterwards.
+    f.kc.set_fail_write(&oauth[0], true);
+
     match s.restore(&f.env, &f.paths, &snap, &open) {
-        Err(ProviderError::Incomplete { failed }) => {
-            assert_eq!(failed, vec![services[1].clone()]);
-        }
-        other => panic!("expected Incomplete naming {}, got {other:?}", services[1]),
+        Err(ProviderError::Incomplete { failed }) => assert_eq!(failed, vec![oauth[0].clone()]),
+        other => panic!("expected Incomplete naming {}, got {other:?}", oauth[0]),
     }
-    // The files were still restored despite the Keychain failure.
-    assert!(!f.paths.credentials_file.exists());
-    // The primary item was never touched: it already matched its (absent) snapshot, and
-    // so did both managed-key items, so only the plain item's upsert was attempted.
     assert_eq!(
-        counting.upsert_count(),
-        upserts_before + 1,
-        "an entry that already matched its snapshot must not be rewritten"
+        f.kc.get(&oauth[0], &acct).unwrap(),
+        b"target-primary",
+        "the failed restore must leave the target value in place, not corrupt it"
+    );
+    assert_eq!(
+        f.kc.get(&oauth[1], &acct).unwrap(),
+        b"orig-plain",
+        "the second item must still be restored after the first one failed"
+    );
+    assert_eq!(f.kc.get(&managed[0], &acct).unwrap(), b"unchanged-managed");
+
+    let calls = recording.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|(svc, op)| svc == &oauth[0] && *op == "upsert")
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(svc, op)| svc == &oauth[1] && *op == "upsert")
+    );
+    assert!(
+        !calls.iter().any(|(svc, _)| svc == &managed[0]),
+        "an entry that already matched its snapshot must receive no write at all: {calls:?}"
     );
 }
 
@@ -769,7 +845,8 @@ fn restore_is_fenced_for_both_files_and_items_and_aborts_immediately_on_fence_fa
         .unwrap();
     config::splice_key(&f.paths.global_config, "b", Some(&json!(2)), &open).unwrap();
 
-    // Two passes restore both files; the third, for the Keychain item, fails.
+    // `restore` goes global_config, then the item, then the file last: two passes
+    // restore the config and the item; the third, for the credentials file, fails.
     let cf = CountingFence::new(2);
     let fence = || cf.check();
     assert!(matches!(
@@ -777,11 +854,15 @@ fn restore_is_fenced_for_both_files_and_items_and_aborts_immediately_on_fence_fa
         Err(ProviderError::Lock(_))
     ));
     assert_eq!(fs::read(&f.paths.global_config).unwrap(), b"{\"a\": 1}");
-    assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"orig-file");
     assert_eq!(
         f.kc.get(&svc, &acct).unwrap(),
+        b"orig-item",
+        "the item must be restored before the file, and did run here"
+    );
+    assert_eq!(
+        fs::read(&f.paths.credentials_file).unwrap(),
         b"changed",
-        "the item restore never ran once the fence tripped"
+        "the credentials file restore never ran once the fence tripped"
     );
 }
 
@@ -894,5 +975,99 @@ fn clearing_account_keys_refuses_an_unparsable_credentials_file() {
     assert!(
         f.paths.credentials_file.exists(),
         "an unparsable file must not be deleted"
+    );
+}
+
+// --- Fix round 2 -----------------------------------------------------------------
+
+#[test]
+fn restore_bumps_the_credentials_file_after_the_item_it_reflects() {
+    let f = fx();
+    fs::write(&f.paths.credentials_file, "orig-file").unwrap();
+    let probe = Arc::new(MtimeProbeKeychain::new(
+        f.kc.clone(),
+        f.paths.credentials_file.clone(),
+    ));
+    let s = LiveStore::new(probe.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, b"orig-item");
+
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    s.write_credential_entry(&f.env, &f.paths, b"target", &open)
+        .unwrap();
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"target");
+    assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"target");
+
+    let mtime_before_restore = fs::metadata(&f.paths.credentials_file)
+        .unwrap()
+        .modified()
+        .unwrap();
+    s.restore(&f.env, &f.paths, &snap, &open).unwrap();
+
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"orig-item");
+    assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"orig-file");
+    let mtime_at_item_write = probe.mtime_at_last_item_write().unwrap();
+    let mtime_after_restore = fs::metadata(&f.paths.credentials_file)
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        mtime_at_item_write, mtime_before_restore,
+        "the item must be restored while the file still shows its pre-restore mtime"
+    );
+    assert!(
+        mtime_after_restore > mtime_at_item_write,
+        "the file's hot-reload bump must land strictly after the item restore"
+    );
+}
+
+#[test]
+fn restore_rewrites_a_matching_credentials_file_when_only_the_item_differed() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, b"orig-item");
+    fs::write(&f.paths.credentials_file, "same-file").unwrap();
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    let mtime_before = fs::metadata(&f.paths.credentials_file)
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    // Change only the Keychain item, directly: the file stays byte-identical to the
+    // snapshot, so a naive "skip when it already matches" would never bump it.
+    std::thread::sleep(Duration::from_millis(10));
+    f.kc.put(&svc, &acct, b"changed-item");
+
+    s.restore(&f.env, &f.paths, &snap, &open).unwrap();
+
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"orig-item");
+    assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"same-file");
+    let mtime_after = fs::metadata(&f.paths.credentials_file)
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(
+        mtime_after > mtime_before,
+        "the file must be rewritten (its mtime bumped) even though its bytes already matched"
+    );
+}
+
+#[test]
+fn restore_never_creates_a_credentials_file_the_snapshot_says_was_absent() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, b"orig-item");
+    // No credentials file at snapshot time.
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    f.kc.put(&svc, &acct, b"changed-item");
+
+    s.restore(&f.env, &f.paths, &snap, &open).unwrap();
+
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"orig-item");
+    assert!(
+        !f.paths.credentials_file.exists(),
+        "a restored item must never conjure a credentials file the snapshot never had"
     );
 }
