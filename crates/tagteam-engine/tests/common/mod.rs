@@ -2,24 +2,26 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
+use tagteam_cc::shape::compose;
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
-use tagteam_engine::store::LoginMeta;
+use tagteam_engine::store::{JournalRow, LoginMeta};
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{
-    Credential, Env, FakeClock, FakeKeychain, Identity, MutationGuard, Provider, Read,
+    Credential, Env, FakeClock, FakeKeychain, Identity, MutationGuard, ProcessStamp, Provider, Read,
 };
 
 /// An oracle that answers whatever the test sets.
@@ -74,6 +76,47 @@ pub fn splice_oauth_account(path: &Path, oauth_account: &Value) {
 /// Whether tagteam's mutation lock is free right now; takes and drops it if so.
 pub fn mutation_lock_free(env: &Env) -> bool {
     MutationGuard::acquire(env, Duration::ZERO).is_ok()
+}
+
+/// A process that has exited: its journal rows are recoverable (§12.6). Shared by `recover.rs`
+/// and `invariant.rs`, which both need to plant a crashed switch's journal row.
+pub fn dead_holder() -> ProcessStamp {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    ProcessStamp { pid, start: 0 }
+}
+
+/// The vault's fingerprint of `id`'s stored generation.
+pub fn vault_fp(fx: &Fx, id: &AccountId) -> String {
+    fx.cc
+        .fingerprint(&fx.vault_bytes(id).unwrap())
+        .unwrap()
+        .as_str()
+        .to_owned()
+}
+
+/// The row a switch from `from` to `to` writes at step 6, held by a process that has died.
+pub fn crash_row(fx: &Fx, from: &AccountId, to: &AccountId) -> JournalRow {
+    let from_row = fx.engine.store().unwrap().account(from).unwrap().unwrap();
+    JournalRow {
+        provider: fx.provider(),
+        holder: dead_holder(),
+        from_id: Some(from.clone()),
+        to_id: to.clone(),
+        from_fp: Some(vault_fp(fx, from)),
+        from_identity: Some(from_row.identity_json),
+        to_fp: vault_fp(fx, to),
+        started_at: 1,
+        prior: None,
+    }
+}
+
+/// What step 7 leaves live: the target credential, composed with the live machine-shared keys.
+pub fn write_target_credential(fx: &Fx, to: &AccountId) {
+    let live: Value = fx.live_credential().unwrap();
+    let composed = compose(&fx.vault_bytes(to).unwrap(), live.as_object()).unwrap();
+    fx.set_live_credential(&composed);
 }
 
 /// A Keychain vault that runs `on_read` with each key just before reading it: for observing
@@ -443,28 +486,63 @@ impl Fx {
     }
 }
 
-/// Every file under HOME except tagteam's own data dir, plus every Keychain item except the
-/// vault's.
+/// A path's kind, for the snapshot comparison. A symlink records its `read_link` target
+/// rather than following it: the walk never reads or descends through a link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryKind {
+    File(Vec<u8>),
+    Dir,
+    Symlink(PathBuf),
+}
+
+/// One path's kind, permission bits, and content (for a file) — everything the invariant
+/// compares. Two snapshots' entries at the same path are equal only if all three match, so a
+/// mode change, a kind swap (a symlink replaced by a regular file, say), or a new directory
+/// are all differences, not just a changed file's bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    mode: u32,
+    kind: EntryKind,
+}
+
+/// Every file, directory and symlink under HOME except tagteam's own data dir, plus every
+/// Keychain item except the vault's.
 pub struct HomeSnapshot {
-    files: BTreeMap<PathBuf, Vec<u8>>,
+    files: BTreeMap<PathBuf, Entry>,
     items: BTreeMap<(String, String), Vec<u8>>,
 }
 
-fn walk(dir: &Path, skip: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let path = e.path();
+/// Records every entry under `dir` except under `skip`, without ever following a symlink into
+/// its target. Any I/O failure here is a bug in the fixture or the walk, not a state to
+/// tolerate silently: it panics rather than treating a path as absent or empty.
+///
+/// A bare ancestor directory of `skip` (`~/.local`, say, above `~/.local/share/tagteam`) is
+/// walked through — so a sibling of the excluded subtree is still found — but never recorded
+/// itself: it is created lazily as a side effect of creating the excluded subtree, not state
+/// the invariant should have an opinion on.
+fn walk(dir: &Path, skip: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
         if path.starts_with(skip) {
             continue;
         }
         let meta = fs::symlink_metadata(&path).unwrap();
-        if meta.is_dir() {
+        let mode = meta.permissions().mode() & 0o7777;
+        let is_plain_dir = meta.is_dir() && !meta.file_type().is_symlink();
+        if is_plain_dir {
             walk(&path, skip, out);
-        } else {
-            out.insert(path.clone(), fs::read(&path).unwrap_or_default());
+            if skip.starts_with(&path) {
+                continue;
+            }
         }
+        let kind = if meta.file_type().is_symlink() {
+            EntryKind::Symlink(fs::read_link(&path).unwrap())
+        } else if is_plain_dir {
+            EntryKind::Dir
+        } else {
+            EntryKind::File(fs::read(&path).unwrap())
+        };
+        out.insert(path, Entry { mode, kind });
     }
 }
 
@@ -515,6 +593,44 @@ fn shared_keys(bytes: Option<&Vec<u8>>, keys: &[&str]) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
+/// The bytes of `path`'s entry, for a path declared in the identity surface. `None` when it
+/// does not exist yet (a credential file created on first use). Panics if it exists as
+/// something other than a plain file: a declared surface path swapping kind is itself a
+/// violation this comparison must not silently wave through.
+fn surface_file_bytes<'e>(
+    entry: Option<&'e Entry>,
+    step: &str,
+    path: &Path,
+) -> Option<&'e Vec<u8>> {
+    match entry {
+        None => None,
+        Some(Entry {
+            kind: EntryKind::File(bytes),
+            ..
+        }) => Some(bytes),
+        Some(_) => panic!(
+            "{step}: {} is declared in the identity surface but is no longer a plain file",
+            path.display()
+        ),
+    }
+}
+
+/// The real path a declared surface path's writes actually land at: the pre-mutation
+/// snapshot's `read_link` target when the surface path is itself a symlink (§9.5's
+/// write-through), or the path itself otherwise. Resolving from `before` — never `after` —
+/// means the literal surface path is then left to the default byte-for-byte rule below, so a
+/// link that gets replaced, or repointed, is still caught: it is no longer a surface path once
+/// resolved away from, so any change to it at all is a violation.
+fn resolve(snapshot: &HomeSnapshot, path: &Path) -> PathBuf {
+    match snapshot.files.get(path) {
+        Some(Entry {
+            kind: EntryKind::Symlink(target),
+            ..
+        }) => target.clone(),
+        _ => path.to_path_buf(),
+    }
+}
+
 impl Fx {
     pub fn snapshot(&self) -> HomeSnapshot {
         let mut files = BTreeMap::new();
@@ -523,13 +639,16 @@ impl Fx {
             .kc
             .items()
             .into_iter()
-            .filter(|((svc, _), _)| svc != "tagteam")
+            .filter(|((svc, _), _)| svc != SERVICE)
             .collect();
         HomeSnapshot { files, items }
     }
 
-    /// §15.3: every byte outside the identity surface is identical; inside it, only the
-    /// declared keys moved, and the machine-shared credential keys kept their values.
+    /// §15.3: every byte, mode, and kind outside the identity surface is identical; inside it,
+    /// only the declared keys moved, and the machine-shared credential keys kept their values.
+    /// A declared path's rules apply to its resolved target, not its literal name, so a
+    /// symlinked surface file is checked correctly while the link itself is held to the same
+    /// byte-for-byte rule as everything else.
     pub fn assert_only_surface_changed(
         &self,
         before: &HomeSnapshot,
@@ -537,14 +656,29 @@ impl Fx {
         step: &str,
     ) {
         let surface = self.cc.identity_surface(&self.env);
-        let json_keys: BTreeMap<PathBuf, Vec<String>> = surface.json_keys.iter().cloned().collect();
-        let cred_files: BTreeSet<PathBuf> = surface.credential_files.iter().cloned().collect();
+        let json_keys: BTreeMap<PathBuf, Vec<String>> = surface
+            .json_keys
+            .iter()
+            .map(|(p, keys)| (resolve(before, p), keys.clone()))
+            .collect();
+        let cred_files: BTreeSet<PathBuf> = surface
+            .credential_files
+            .iter()
+            .map(|p| resolve(before, p))
+            .collect();
         let paths: BTreeSet<&PathBuf> = before.files.keys().chain(after.files.keys()).collect();
         for path in paths {
             let (b, a) = (before.files.get(path), after.files.get(path));
             if let Some(keys) = json_keys.get(path) {
+                let (bb, ab) = (
+                    surface_file_bytes(b, step, path),
+                    surface_file_bytes(a, step, path),
+                );
+                if let (Some(bm), Some(am)) = (b.map(|e| e.mode), a.map(|e| e.mode)) {
+                    assert_eq!(bm, am, "{step}: {} changed mode", path.display());
+                }
                 if keys.iter().any(|k| k == "customApiKeyResponses") {
-                    check_api_key_responses(b, a, step, path);
+                    check_api_key_responses(bb, ab, step, path);
                 }
                 let strip = |doc: Option<&Vec<u8>>| {
                     doc.map(|d| {
@@ -553,15 +687,22 @@ impl Fx {
                     })
                 };
                 assert_eq!(
-                    strip(b),
-                    strip(a),
+                    strip(bb),
+                    strip(ab),
                     "{step}: {} changed outside {keys:?}",
                     path.display()
                 );
             } else if cred_files.contains(path) {
+                let (bb, ab) = (
+                    surface_file_bytes(b, step, path),
+                    surface_file_bytes(a, step, path),
+                );
+                if let (Some(bm), Some(am)) = (b.map(|e| e.mode), a.map(|e| e.mode)) {
+                    assert_eq!(bm, am, "{step}: {} changed mode", path.display());
+                }
                 assert_eq!(
-                    shared_keys(b, &surface.machine_shared_keys),
-                    shared_keys(a, &surface.machine_shared_keys),
+                    shared_keys(bb, &surface.machine_shared_keys),
+                    shared_keys(ab, &surface.machine_shared_keys),
                     "{step}: machine-shared keys changed in {}",
                     path.display()
                 );

@@ -1,58 +1,20 @@
 mod common;
 
-use common::{API_KEY, Fx, STRAY_API_KEY};
+use common::{
+    API_KEY, Fx, STRAY_API_KEY, crash_row, dead_holder, vault_fp, write_target_credential,
+};
 use serde_json::Value;
 use tagteam_cc::ItemKind;
 use tagteam_cc::live::Platform;
-use tagteam_cc::shape::compose;
 use tagteam_core::AccountId;
 use tagteam_engine::EngineError;
 use tagteam_engine::store::JournalRow;
 use tagteam_provider::{Keychain, ProcessStamp, Provider};
 
-/// A process that has exited: its journal rows are recoverable (§12.6).
-fn dead_holder() -> ProcessStamp {
-    let mut child = std::process::Command::new("true").spawn().unwrap();
-    let pid = child.id();
-    child.wait().unwrap();
-    ProcessStamp { pid, start: 0 }
-}
-
-fn vault_fp(fx: &Fx, id: &AccountId) -> String {
-    fx.cc
-        .fingerprint(&fx.vault_bytes(id).unwrap())
-        .unwrap()
-        .as_str()
-        .to_owned()
-}
-
-/// The row a switch from `from` to `to` writes at step 6, held by a process that has died.
-fn crash_row(fx: &Fx, from: &AccountId, to: &AccountId) -> JournalRow {
-    let from_row = fx.engine.store().unwrap().account(from).unwrap().unwrap();
-    JournalRow {
-        provider: fx.provider(),
-        holder: dead_holder(),
-        from_id: Some(from.clone()),
-        to_id: to.clone(),
-        from_fp: Some(vault_fp(fx, from)),
-        from_identity: Some(from_row.identity_json),
-        to_fp: vault_fp(fx, to),
-        started_at: 1,
-        prior: None,
-    }
-}
-
 /// Leaves a journal row as a switch from `from` to `to` that died after step 6.
 fn crashed_switch(fx: &Fx, from: &AccountId, to: &AccountId) {
     let row = crash_row(fx, from, to);
     fx.engine.store().unwrap().insert_journal(&row).unwrap();
-}
-
-/// What step 7 leaves live: the target credential, composed with the live machine-shared keys.
-fn write_target_credential(fx: &Fx, to: &AccountId) {
-    let live: Value = fx.live_credential().unwrap();
-    let composed = compose(&fx.vault_bytes(to).unwrap(), live.as_object()).unwrap();
-    fx.set_live_credential(&composed);
 }
 
 fn any_mutation(fx: &Fx, id: &AccountId) {
