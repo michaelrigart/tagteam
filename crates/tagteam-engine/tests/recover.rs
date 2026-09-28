@@ -200,6 +200,36 @@ fn a_stale_file_behind_an_unreadable_keychain_is_undecidable() {
 }
 
 #[test]
+fn an_unreadable_identity_never_passes_for_an_absent_one() {
+    // §9.6: a row journaled with no live identity expects none. An `oauthAccount` that cannot
+    // be read is not that absence, so the row is undecidable and stays, and nothing is written.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // the outgoing credential is live
+    let row = JournalRow {
+        from_id: None,
+        from_identity: None,
+        ..crash_row(&fx, &b, &a)
+    };
+    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    let config = fx.paths().global_config;
+    // An unpaired surrogate: the file splices, but the value does not parse.
+    let unreadable = common::CLAUDE_JSON.replacen(
+        '{',
+        r#"{"oauthAccount": {"emailAddress": "b\ud800@x.co"},"#,
+        1,
+    );
+    fs::write(&config, &unreadable).unwrap();
+    assert!(matches!(
+        fx.cc.live_identity(&fx.env),
+        tagteam_provider::Read::Unreadable(_)
+    ));
+    any_mutation(&fx, &a);
+    assert_eq!(journal(&fx), Some(row));
+    assert_eq!(fs::read_to_string(&config).unwrap(), unreadable);
+}
+
+#[test]
 fn a_conflicting_auth_axis_keeps_the_row() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");

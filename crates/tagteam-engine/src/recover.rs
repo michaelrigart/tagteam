@@ -170,7 +170,8 @@ impl Engine {
     }
 
     /// The live identity is `expected` and every auth axis names the account on `own` with
-    /// generation `fp`, on a fresh re-read, while CC's locks are still ours.
+    /// generation `fp`, on a fresh re-read, while CC's locks are still ours. An identity that
+    /// cannot be read agrees with nothing, not even an expected absence.
     fn surfaces_agree(
         &self,
         p: &dyn Provider,
@@ -179,9 +180,11 @@ impl Engine {
         fp: &str,
         expected: Option<&Value>,
     ) -> bool {
-        let identity = p.live_identity(&self.env).present().map(|i| i.raw);
+        let Ok(identity) = self.read_live_identity(p) else {
+            return false;
+        };
         locks.check_owned().is_ok()
-            && identity.as_ref() == expected
+            && identity.map(|i| i.raw).as_ref() == expected
             && axes_coherent(p, &p.read_live_auth(&self.env), own, fp)
     }
 
@@ -278,8 +281,12 @@ impl Engine {
         if !holds(p, live, own, established) {
             return Ok(());
         }
+        // An identity that cannot be read decides nothing: the row is undecidable and stays.
+        let Ok(live_identity) = self.read_live_identity(p) else {
+            return Ok(());
+        };
         let expected = row.from_identity.as_ref();
-        if p.live_identity(&self.env).present().map(|i| i.raw).as_ref() != expected {
+        if live_identity.map(|i| i.raw).as_ref() != expected {
             let identity = expected.map(|v| p.parse_identity(v)).transpose()?;
             p.write_identity(&self.env, locks, identity.as_ref())?;
         }

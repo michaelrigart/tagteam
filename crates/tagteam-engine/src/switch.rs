@@ -389,7 +389,12 @@ impl Engine {
         }
     }
 
-    fn read_live_identity(&self, p: &dyn Provider) -> Result<Option<Identity>, EngineError> {
+    /// The live identity, `None` when there is no live login; an unreadable one is an error,
+    /// never taken for an absent one.
+    pub(crate) fn read_live_identity(
+        &self,
+        p: &dyn Provider,
+    ) -> Result<Option<Identity>, EngineError> {
         match p.live_identity(&self.env) {
             Read::Present(i) => Ok(Some(i)),
             Read::Absent => Ok(None),
