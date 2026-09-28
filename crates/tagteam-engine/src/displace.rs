@@ -1,6 +1,6 @@
 use serde_json::Value;
 use tagteam_core::{Fingerprint, ProviderId};
-use tagteam_provider::atomic::{ensure_private_dir, write_atomic};
+use tagteam_provider::atomic::{ensure_private_dir, write_atomic_private};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -25,7 +25,7 @@ pub(crate) fn displace(
         .map(|_| fastrand::alphanumeric().to_ascii_lowercase())
         .collect();
     let id = format!("{}-{fp12}-{rand6}", now / 1000);
-    write_atomic(&dir.join(format!("{id}.json")), bytes, 0o600)?;
+    write_atomic_private(&dir.join(format!("{id}.json")), bytes, 0o600)?;
     engine.store()?.insert_displaced(&DisplacedRow {
         id: id.clone(),
         provider: provider.clone(),

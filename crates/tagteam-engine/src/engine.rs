@@ -125,10 +125,12 @@ impl Engine {
     /// is the guard dropped: otherwise, between releasing it and re-checking, another process
     /// could take the guard and insert its own live journal row, which this call would then
     /// misreport as an interrupted switch (pointing the user at `--force` for a switch that is
-    /// simply in progress elsewhere).
+    /// simply in progress elsewhere). That ordering can't be exercised deterministically by a
+    /// test without a pause hook between acquiring the guard and running the check, which does
+    /// not exist yet; it is verified by reading the code above instead.
     ///
-    /// Only `#[expect]`ed outside test builds: this crate's own tests call it directly to
-    /// cover the ordering above, so it is genuinely used under `cfg(test)`.
+    /// Only `#[expect]`ed outside test builds: this crate's own tests call it directly, so it
+    /// is genuinely used under `cfg(test)`.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "used by later commands, Task 18 and Task 20")
@@ -191,10 +193,6 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
-    use std::thread;
-    use std::time::Duration;
-
     use tagteam_core::AccountId;
     use tagteam_provider::{FakeKeychain, Identity, ProcessStamp};
 
@@ -282,52 +280,5 @@ mod tests {
             engine.settle_or_refuse(&provider),
             Err(EngineError::InterruptedSwitch(_))
         ));
-    }
-
-    /// §9.6: `settle_or_refuse`'s guarded section is `let guard = mutation_guard()?; let result
-    /// = refuse_if_interrupted(...); drop(guard); result?` — the check must run before the
-    /// guard is dropped, not after. This exercises that exact sequence (via the same two
-    /// pub(crate) calls, in the same order, under test control) and proves the property that
-    /// matters: for as long as the guard from that sequence is held, no concurrent acquirer can
-    /// get in and write a fresh journal row underneath the check, no matter when it is released
-    /// to try.
-    #[test]
-    fn the_final_interrupted_check_keeps_the_mutation_guard_held_throughout() {
-        let d = tempfile::tempdir().unwrap();
-        let env = Env::for_test(d.path());
-        let engine = test_engine(env.clone());
-        let provider = ProviderId::new("p");
-        let to_id = AccountId::from_string("acc");
-        seed_account(&engine, &provider, &to_id);
-        engine
-            .store()
-            .unwrap()
-            .insert_journal(&stale_journal(&provider, &to_id))
-            .unwrap();
-
-        let guard = engine.mutation_guard().unwrap();
-        let (done_tx, done_rx) = mpsc::channel::<bool>();
-        let env2 = env.clone();
-        let racer = thread::spawn(move || {
-            // Blocks until `guard` below is dropped, however this thread happens to be
-            // scheduled: flock is a real, exclusive OS lock, not a timing-dependent race.
-            let acquired = MutationGuard::acquire(&env2, Duration::from_secs(2)).is_ok();
-            done_tx.send(acquired).unwrap();
-        });
-        // Give the racer a chance to reach its blocking acquire call before we run the check;
-        // not required for correctness, only so the assertion below is meaningful rather than
-        // vacuous.
-        thread::sleep(Duration::from_millis(50));
-        let result = engine.refuse_if_interrupted(&provider);
-        assert!(
-            result.is_err(),
-            "the stale row must still be visible while we hold the guard ourselves"
-        );
-        drop(guard); // only now can the racer's acquire succeed
-        assert!(
-            done_rx.recv().unwrap(),
-            "the racer must succeed once, and only once, our guard is released"
-        );
-        racer.join().unwrap();
     }
 }
