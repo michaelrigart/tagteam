@@ -7,6 +7,10 @@ use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::store::{AccountRow, EventRow, LoginMeta, NewAccount, Store, StoreError};
 
+/// The credential kind whose secret lives on the managed-key axis rather than in the
+/// credential entry (§9.4 step 7).
+pub(crate) const KIND_API_KEY: &str = "api_key";
+
 pub struct AddOptions {
     pub provider: ProviderId,
     pub position: Option<u32>,
@@ -388,6 +392,7 @@ impl Engine {
             .and_then(|o| o.account_uuid.as_deref())
             .or(identity.account_uuid.as_deref());
         let kind = p.classify(cred.bytes());
+        crate::hooks::point(self, "add-verified")?;
         // 4. Write, under the mutation lock, the account locks and then CC's live locks.
         let guard = self.mutation_guard()?;
         self.refuse_if_interrupted(&opts.provider)?;
@@ -464,7 +469,7 @@ impl Engine {
             return Err(EngineError::InvalidInput("the token is empty".into()));
         }
         let (kind, secret) = p.token_secret(&opts.token);
-        let prefix = if kind == "api_key" {
+        let prefix = if kind == KIND_API_KEY {
             "api-key"
         } else {
             "setup-token"

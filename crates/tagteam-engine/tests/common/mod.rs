@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,7 +9,7 @@ use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
-use tagteam_engine::lifecycle::AddOptions;
+use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::store::LoginMeta;
@@ -48,6 +49,17 @@ pub const CLAUDE_JSON: &str = r#"{
   "someFutureKey": { "n": 1e400 }
 }
 "#;
+
+/// Replaces `oauthAccount` in the config at `path`, as CC does on a login. A free function, so
+/// a `'static` race callback can call it without borrowing the fixture.
+pub fn splice_oauth_account(path: &Path, oauth_account: &Value) {
+    let doc = fs::read(path).unwrap();
+    fs::write(
+        path,
+        replace_top_level(&doc, "oauthAccount", oauth_account).unwrap(),
+    )
+    .unwrap();
+}
 
 pub struct Fx {
     pub dir: tempfile::TempDir,
@@ -149,13 +161,7 @@ impl Fx {
 
     /// What `claude /login` leaves behind: `oauthAccount` plus the live credential.
     pub fn login(&self, email: &str, rt: &str) {
-        let p = self.paths();
-        let doc = fs::read(&p.global_config).unwrap();
-        fs::write(
-            &p.global_config,
-            replace_top_level(&doc, "oauthAccount", &Self::oauth_account(email)).unwrap(),
-        )
-        .unwrap();
+        splice_oauth_account(&self.paths().global_config, &Self::oauth_account(email));
         self.set_live_credential(Self::credential_json(email, rt).to_string().as_bytes());
     }
 
@@ -232,6 +238,18 @@ impl Fx {
         }
     }
 
+    /// The `AddTokenOptions` every plain `add_token` call in these tests starts from.
+    pub fn add_token_options(&self, token: &str) -> AddTokenOptions {
+        AddTokenOptions {
+            provider: self.provider(),
+            token: token.into(),
+            position: None,
+            email: None,
+            alias: None,
+            yes: false,
+        }
+    }
+
     /// Logs a fresh account in and captures it (§10.1). Tasks 19-21 each need only the
     /// resulting id, so this is the one place that repeats `fx.login` + `add_live`.
     pub fn add(&self, email: &str, rt: &str) -> AccountId {
@@ -286,29 +304,37 @@ impl Fx {
             .unwrap();
     }
 
-    /// An engine over the same Keychain, oracle and clock, but a different Env.
-    pub fn engine_with_env(&self, env: Env) -> Engine {
+    /// A second engine over this fixture's provider and clock, as another tagteam process.
+    fn engine_over(&self, env: Env, vault: Vault, oracle: Arc<dyn Oracle>) -> Engine {
         Engine::new(EngineConfig {
             env,
             registry: ProviderRegistry::new().with(self.cc.clone()),
-            vault: Vault::new(Box::new(KeychainVault::new(self.kc.clone()))),
-            oracle: self.oracle.clone(),
+            vault,
+            oracle,
             clock: self.clock.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
         })
+    }
+
+    fn keychain_vault(&self) -> Vault {
+        Vault::new(Box::new(KeychainVault::new(self.kc.clone())))
+    }
+
+    /// An engine over the same Keychain, oracle and clock, but a different Env.
+    pub fn engine_with_env(&self, env: Env) -> Engine {
+        self.engine_over(env, self.keychain_vault(), self.oracle.clone())
     }
 
     /// An engine over the same Keychain, clock and Env, but a caller-supplied oracle — for
     /// exercising the oracle-call race between the pre-lock read and the locks (Task 18's
     /// review, item 2).
     pub fn engine_with_oracle(&self, oracle: Arc<dyn Oracle>) -> Engine {
-        Engine::new(EngineConfig {
-            env: self.env.clone(),
-            registry: ProviderRegistry::new().with(self.cc.clone()),
-            vault: Vault::new(Box::new(KeychainVault::new(self.kc.clone()))),
-            oracle,
-            clock: self.clock.clone(),
-            default_provider: ProviderId::new(CLAUDE_CODE),
-        })
+        self.engine_over(self.env.clone(), self.keychain_vault(), oracle)
+    }
+
+    /// An engine over the same Env, oracle and clock, but a caller-supplied vault — for
+    /// observing what holds while the engine reads it.
+    pub fn engine_with_vault(&self, vault: Vault) -> Engine {
+        self.engine_over(self.env.clone(), vault, self.oracle.clone())
     }
 }

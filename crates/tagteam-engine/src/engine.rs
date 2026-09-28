@@ -28,6 +28,11 @@ pub struct Engine {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) default_provider: ProviderId,
     store: Mutex<Option<Arc<Store>>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fail_at: Mutex<Option<&'static str>>,
+    #[cfg(feature = "test-hooks")]
+    #[allow(clippy::type_complexity)]
+    pub(crate) on_point: Mutex<Option<(&'static str, Box<dyn Fn() + Send + Sync>)>>,
 }
 
 impl Engine {
@@ -40,6 +45,10 @@ impl Engine {
             clock: cfg.clock,
             default_provider: cfg.default_provider,
             store: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            fail_at: Mutex::new(None),
+            #[cfg(feature = "test-hooks")]
+            on_point: Mutex::new(None),
         }
     }
 
@@ -179,6 +188,19 @@ impl Engine {
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl Engine {
+    pub fn fail_at(&self, name: Option<&'static str>) {
+        *self.fail_at.lock().unwrap() = name;
+    }
+
+    /// Runs `callback` each time the switch passes the named point: a deterministic barrier
+    /// for races that are otherwise timing-dependent.
+    pub fn on_point(&self, name: &'static str, callback: Box<dyn Fn() + Send + Sync>) {
+        *self.on_point.lock().unwrap() = Some((name, callback));
     }
 }
 

@@ -8,7 +8,6 @@ use crate::store::DisplacedRow;
 
 /// Stashes live credential bytes that are about to be overwritten (§6.3). Forensic and
 /// write-only; always a plain 0600 file, never a Keychain item.
-#[expect(dead_code, reason = "first used by Task 20 (the switch)")]
 pub(crate) fn displace(
     engine: &Engine,
     provider: &ProviderId,

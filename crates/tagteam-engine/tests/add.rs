@@ -9,7 +9,6 @@ use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
-use tagteam_provider::splice::replace_top_level;
 use tagteam_provider::{Credential, Identity, Provider};
 
 fn add_opts(fx: &Fx) -> AddOptions {
@@ -37,14 +36,7 @@ fn racing_engine(
 }
 
 fn token_opts(fx: &Fx, token: &str) -> AddTokenOptions {
-    AddTokenOptions {
-        provider: fx.provider(),
-        token: token.into(),
-        position: None,
-        email: None,
-        alias: None,
-        yes: false,
-    }
+    fx.add_token_options(token)
 }
 
 #[test]
@@ -229,14 +221,9 @@ fn an_oracle_uuid_that_conflicts_with_the_stored_one_is_refused() {
     // even when the live login's own self-reported identity carries none of its own.
     let fx = Fx::new();
     let a = fx.add("me@work.co", "rt-1"); // stored account_uuid: uuid-me@work.co
-    let doc = std::fs::read(&fx.paths().global_config).unwrap();
     let no_uuid =
         json!({"emailAddress": "me@work.co", "organizationUuid": "", "organizationName": null});
-    std::fs::write(
-        &fx.paths().global_config,
-        replace_top_level(&doc, "oauthAccount", &no_uuid).unwrap(),
-    )
-    .unwrap();
+    common::splice_oauth_account(&fx.paths().global_config, &no_uuid);
     fx.set_live_credential(
         Fx::credential_json("me@work.co", "rt-2")
             .to_string()
@@ -376,12 +363,7 @@ fn add_refuses_a_live_login_whose_account_uuid_conflicts_with_the_stored_one() {
         "emailAddress": "me@work.co", "organizationUuid": "", "organizationName": null,
         "accountUuid": "uuid-different"
     });
-    let doc = std::fs::read(&fx.paths().global_config).unwrap();
-    std::fs::write(
-        &fx.paths().global_config,
-        replace_top_level(&doc, "oauthAccount", &identity).unwrap(),
-    )
-    .unwrap();
+    common::splice_oauth_account(&fx.paths().global_config, &identity);
     fx.set_live_credential(
         Fx::credential_json("me@work.co", "rt-2")
             .to_string()
@@ -752,18 +734,13 @@ fn add_live_rechecks_the_credential_is_still_fresh() {
 fn add_live_rechecks_the_identity_has_not_changed_under_the_lock() {
     let fx = Fx::new();
     fx.login("me@work.co", "rt-1");
-    let paths = fx.paths();
+    let path = fx.paths().global_config;
     let engine = racing_engine(&fx, move || {
-        let doc = std::fs::read(&paths.global_config).unwrap();
         let raced = json!({
             "emailAddress": "me@work.co", "organizationUuid": "", "organizationName": null,
             "accountUuid": "uuid-raced"
         });
-        std::fs::write(
-            &paths.global_config,
-            replace_top_level(&doc, "oauthAccount", &raced).unwrap(),
-        )
-        .unwrap();
+        common::splice_oauth_account(&path, &raced);
     });
     assert!(matches!(
         engine.add_live(add_opts(&fx)),
