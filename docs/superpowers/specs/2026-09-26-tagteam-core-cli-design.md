@@ -922,7 +922,7 @@ These are decided before locking and re-checked afterwards.
 
 | Invocation | Strategy | Anchor | Behaviour |
 |---|---|---|---|
-| `switch` (bare) | rotation | the live account if it is managed; otherwise the store's active account | Next switchable position after the anchor |
+| `switch` (bare) | rotation | the live account if it is managed; otherwise the store's active account | With a managed live anchor: the next switchable position after it. Otherwise: the anchor itself if it is switchable, else the first switchable position |
 | `switch --strategy next-available` | next-available | the live account | Like rotation, but skips candidates with headroom ≤ 0 (the message names the binding window). If every candidate is exhausted: `candidates-exhausted` |
 | `switch --strategy best` | best | the live account | Switch only if some switchable account has strictly more headroom. Ties stay put |
 | `switch <ACCOUNT>` | direct | — | Disabled accounts are allowed as explicit targets |
@@ -1106,7 +1106,10 @@ Captures the live login.
 - **Token source.** `-` reads one line from stdin; no argument prompts without echo.
 - **Classification.** `sk-ant-api…` creates an `api_key` account. Anything else is a setup token
   (`setup_token`).
-- **Default email:** `api-key-<pos>@token.local` or `setup-token-<pos>@token.local`.
+- **Default email:** `api-key-<N>@token.local` or `setup-token-<N>@token.local`, where N is the
+  target position, or the next higher N whose identity no account holds. A defaulted email never
+  names an existing account, so only an explicit `--email` replaces a token account in place, and
+  `--position` over another account needs confirmation or `--yes` as in §10.1.
 - **Validation.** A supplied email is validated with
   `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`. A collision with an account of a different
   kind under the same `(email, '')` is refused.
