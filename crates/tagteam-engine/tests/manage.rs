@@ -4,9 +4,10 @@ use common::Fx;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::AddTokenOptions;
-use tagteam_engine::store::NewAccount;
+use tagteam_engine::store::{JournalRow, NewAccount};
+use tagteam_engine::vault::SERVICE;
 use tagteam_engine::views::StatusView;
-use tagteam_provider::Provider;
+use tagteam_provider::{ProcessStamp, Provider};
 
 #[test]
 fn references_resolve_by_position_alias_and_email() {
@@ -66,11 +67,87 @@ fn an_email_in_several_providers_is_ambiguous_unless_narrowed() {
 fn remove_deletes_vault_and_row_but_never_the_live_login() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
+    // A second capture of the same account creates a `.prev` generation (§6.2), which
+    // `remove` must also delete.
+    fx.login("a@x.co", "rt-a2");
+    fx.engine.add_live(fx.add_options()).unwrap();
+    assert!(fx.kc.get(SERVICE, &format!("{a}.prev")).is_some());
+
     fx.engine.remove(&a).unwrap();
     assert!(fx.vault_bytes(&a).is_none());
+    assert!(fx.kc.get(SERVICE, &format!("{a}.prev")).is_none());
     assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
-    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+}
+
+#[test]
+fn management_commands_on_a_missing_account_create_no_store() {
+    let fx = Fx::new();
+    let id = AccountId::from_string("nope");
+
+    assert!(matches!(
+        fx.engine.remove(&id),
+        Err(EngineError::NoSuchAccount(_))
+    ));
+    assert!(!fx.env.data_dir().exists());
+
+    assert!(matches!(
+        fx.engine.set_alias(&id, Some("x")),
+        Err(EngineError::NoSuchAccount(_))
+    ));
+    assert!(!fx.env.data_dir().exists());
+
+    assert!(matches!(
+        fx.engine.set_disabled(&id, true),
+        Err(EngineError::NoSuchAccount(_))
+    ));
+    assert!(!fx.env.data_dir().exists());
+    assert!(matches!(
+        fx.engine.set_disabled(&id, false),
+        Err(EngineError::NoSuchAccount(_))
+    ));
+    assert!(!fx.env.data_dir().exists());
+
+    assert!(matches!(
+        fx.engine.move_to(&id, 1),
+        Err(EngineError::NoSuchAccount(_))
+    ));
+    assert!(!fx.env.data_dir().exists());
+}
+
+/// §9.6, amended: an interrupted switch refuses `remove` (account-changing) but never the
+/// metadata-only commands.
+#[test]
+fn metadata_commands_proceed_through_an_interrupted_switch_but_remove_refuses() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let journal = JournalRow {
+        provider: fx.provider(),
+        holder: ProcessStamp {
+            pid: 999_999,
+            start: 0,
+        },
+        from_id: None,
+        to_id: b,
+        from_fp: None,
+        from_identity: None,
+        to_fp: "sha256:stale".into(),
+        started_at: 1,
+        prior: None,
+    };
+    fx.engine.store().unwrap().insert_journal(&journal).unwrap();
+
+    assert!(matches!(
+        fx.engine.remove(&a),
+        Err(EngineError::InterruptedSwitch(_))
+    ));
+
+    fx.engine.set_alias(&a, Some("work")).unwrap();
+    assert!(fx.engine.set_disabled(&a, true).unwrap().disabled);
+    assert!(!fx.engine.set_disabled(&a, false).unwrap().disabled);
+    assert_eq!(fx.engine.move_to(&a, 2).unwrap().position, 2);
 }
 
 #[test]
@@ -121,6 +198,10 @@ fn views_follow_the_live_identity() {
     let lists = fx.engine.accounts(None).unwrap();
     assert_eq!(lists.len(), 1);
     assert!(lists[0].accounts.is_empty());
+    assert!(
+        !fx.env.data_dir().exists(),
+        "read-only views create nothing on a fresh machine (§5)"
+    );
 
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");

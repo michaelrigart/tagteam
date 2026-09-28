@@ -98,12 +98,11 @@ fn alias_taken(e: StoreError) -> EngineError {
     }
 }
 
-/// `update_login`/`finish_replacement` COALESCE a new account_uuid over a known one (Task
-/// 16's review), so a stored uuid that a different incoming uuid would overwrite is
-/// refused instead. Shared by the pre-lock fast path in `prepare` and the post-lock
-/// recheck in `add_live`/`add_token`: reconciling a pending replacement under the account
-/// lock (Task 21) can install a uuid the pre-lock read never saw, so the pre-lock check
-/// alone is not enough (Task 18's review, item 1).
+/// `update_login`/`finish_replacement` COALESCE a new account_uuid over a known one, so a
+/// stored uuid that a different incoming uuid would overwrite is refused instead. Called
+/// both by `prepare`'s pre-lock fast path and again, post-lock, by `add_live`/`add_token`:
+/// reconciling a pending replacement under the account lock can install a uuid the pre-lock
+/// read never saw, so the pre-lock check alone is not enough.
 fn check_identity_conflict(
     row: Option<&AccountRow>,
     claimed_uuid: Option<&str>,
@@ -163,11 +162,12 @@ impl Engine {
         Ok(())
     }
 
-    /// The provider's next position (1 with no store yet), and — when a target position
-    /// was given — the pre-lock validation that it could conceivably be valid (§5: never
-    /// creates anything; `prepare` re-checks the authoritative value under the lock).
-    /// Shared by `add_live` and `add_token`, which both repeated this (Task 18's review,
-    /// item 9).
+    /// The provider's next position (1 with no store yet), and — when a target position was
+    /// given — validates that it falls within the allowed bound (§5: never creates anything
+    /// when there is no store). `add_live` and `add_token` call this before the mutation
+    /// lock is taken, and each re-checks the authoritative value under the lock via
+    /// `prepare`. `move_to` calls this after the lock is already held, where this call's own
+    /// check is the authoritative one.
     fn next_position_precheck(
         &self,
         provider: &ProviderId,
@@ -536,10 +536,14 @@ impl Engine {
         })
     }
 
+    /// Never creates the store (§5): a missing store means a missing account, not an empty
+    /// one to open.
     fn managed_row(&self, id: &AccountId) -> Result<AccountRow, EngineError> {
-        self.store()?
-            .account(id)?
-            .ok_or_else(|| EngineError::NoSuchAccount(id.to_string()))
+        let row = match self.existing_store()? {
+            Some(s) => s.account(id)?,
+            None => None,
+        };
+        row.ok_or_else(|| EngineError::NoSuchAccount(id.to_string()))
     }
 
     /// §10.3. The live login is never touched.
@@ -556,7 +560,9 @@ impl Engine {
     }
 
     /// Changes only store metadata (§9.6, amended): proceeds even while a switch for this
-    /// account's provider is undecidable, unlike `remove`.
+    /// account's provider is undecidable, unlike `remove`. The existence check runs before
+    /// the mutation lock is taken (§5: a missing account must not create `.mutation.lock`
+    /// or the store), then is re-read under the lock, as `remove` already does.
     pub fn set_alias(
         &self,
         id: &AccountId,
@@ -564,6 +570,7 @@ impl Engine {
     ) -> Result<AccountRow, EngineError> {
         self.refuse_inside_run_shell()?;
         let alias = alias_arg(alias)?;
+        self.managed_row(id)?;
         let _guard = self.mutation_guard()?;
         self.managed_row(id)?;
         self.store()?
@@ -573,9 +580,12 @@ impl Engine {
     }
 
     /// Changes only store metadata (§9.6, amended): proceeds even while a switch for this
-    /// account's provider is undecidable, unlike `remove`.
+    /// account's provider is undecidable, unlike `remove`. The existence check runs before
+    /// the mutation lock is taken (§5: a missing account must not create `.mutation.lock`
+    /// or the store), then is re-read under the lock, as `remove` already does.
     pub fn set_disabled(&self, id: &AccountId, disabled: bool) -> Result<AccountRow, EngineError> {
         self.refuse_inside_run_shell()?;
+        self.managed_row(id)?;
         let _guard = self.mutation_guard()?;
         self.managed_row(id)?;
         self.store()?.set_disabled(id, disabled)?;
@@ -584,13 +594,16 @@ impl Engine {
 
     /// Reorders only; if the position is taken, the two accounts swap. Changes only store
     /// metadata (§9.6, amended): proceeds even while a switch for this account's provider is
-    /// undecidable, unlike `remove`.
+    /// undecidable, unlike `remove`. The existence check runs before the mutation lock is
+    /// taken (§5: a missing account must not create `.mutation.lock` or the store), then is
+    /// re-read under the lock, as `remove` already does.
     pub fn move_to(&self, id: &AccountId, position: u32) -> Result<AccountRow, EngineError> {
         self.refuse_inside_run_shell()?;
+        self.managed_row(id)?;
         let _guard = self.mutation_guard()?;
         let row = self.managed_row(id)?;
-        // Reuses the same pre-lock-style check `add_live`/`add_token` share, instead of
-        // repeating `check_position(position, store.next_position(&row.provider)?.saturating_sub(1))`
+        // Reuses the same check `add_live`/`add_token` share, instead of repeating
+        // `check_position(position, store.next_position(&row.provider)?.saturating_sub(1))`
         // a third time.
         self.next_position_precheck(&row.provider, Some(position))?;
         self.store()?.move_to(id, position)?;
