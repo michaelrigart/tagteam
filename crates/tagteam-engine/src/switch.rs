@@ -899,6 +899,7 @@ impl Engine {
             fp_equal_vault: fp_live.is_some()
                 && vault.as_deref().and_then(|v| p.fingerprint(v)) == fp_live,
             wiped: p.is_wiped(&bytes),
+            tokenless: fp_live.is_none(),
             oracle: verdict(resolved, out),
             lacks_refresh_over_complete: !p.has_refresh_token(&bytes)
                 && vault.as_deref().is_some_and(|v| p.has_refresh_token(v)),

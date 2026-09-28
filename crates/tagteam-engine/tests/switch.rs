@@ -109,6 +109,32 @@ fn a_wiped_outgoing_credential_never_overwrites_the_vault() {
 }
 
 #[test]
+fn a_live_entry_with_no_token_is_never_captured_over_a_setup_token() {
+    // §6.2: an entry holding only machine-shared keys has no generation. Neither side has a
+    // refresh token, so the refresh-token rule cannot keep it out; it is left alone like a
+    // wiped blob, and the vault keeps its generation.
+    let fx = Fx::new();
+    let b = fx.add("b@x.co", "rt-b");
+    let setup = fx
+        .engine
+        .add_token(fx.add_token_options("sk-ant-oat01-setup"))
+        .unwrap()
+        .account
+        .id;
+    let stored = fx.vault_bytes(&setup);
+    switch(&fx, to(&setup), false).unwrap(); // `oauthAccount` names the setup-token account
+    fx.set_live_credential(br#"{"mcpOAuth":{"srv":{"token":"machine-shared"}}}"#);
+    switch(&fx, to(&b), false).unwrap();
+    assert_eq!(fx.vault_bytes(&setup), stored);
+    assert_eq!(displaced_files(&fx), 0);
+    switch(&fx, to(&setup), false).unwrap();
+    assert_eq!(
+        fx.live_credential().unwrap()["claudeAiOauth"]["accessToken"],
+        "sk-ant-oat01-setup"
+    );
+}
+
+#[test]
 fn a_foreign_outgoing_credential_is_displaced_not_captured() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");

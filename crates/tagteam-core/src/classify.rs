@@ -13,6 +13,9 @@ pub struct OutgoingFacts {
     pub fp_equal_vault: bool,
     /// An OAuth blob with both tokens empty: CC's reaction to `invalid_grant`.
     pub wiped: bool,
+    /// The live credential carries no token at all (it has no fingerprint), for example an
+    /// entry holding only machine-shared keys: nothing account-scoped to keep.
+    pub tokenless: bool,
     pub oracle: OracleVerdict,
     /// The live credential lacks a refresh token while the vault's has one (§6.2).
     pub lacks_refresh_over_complete: bool,
@@ -34,13 +37,14 @@ pub enum OutgoingAction {
     Displace,
 }
 
-/// The §9.4 step 4 table, with the §6.2 rule that an automatic capture never replaces a
-/// refresh token with a credential that lacks one.
+/// The §9.4 step 4 table, with the §6.2 rules that an automatic capture never replaces a
+/// refresh token with a credential that lacks one, and never captures a credential with no
+/// token at all: that one is left alone like a wiped blob, and the vault keeps its generation.
 pub fn decide_outgoing(f: &OutgoingFacts) -> (OutgoingClass, OutgoingAction) {
     if f.bytes_equal_vault || f.fp_equal_vault {
         return (OutgoingClass::Ours, OutgoingAction::Nothing);
     }
-    if f.wiped {
+    if f.wiped || f.tokenless {
         return (OutgoingClass::Wiped, OutgoingAction::Nothing);
     }
     let (class, backfill_uuid) = match f.oracle {
@@ -64,6 +68,7 @@ mod tests {
             bytes_equal_vault: false,
             fp_equal_vault: false,
             wiped: false,
+            tokenless: false,
             oracle: OracleVerdict::Unavailable,
             lacks_refresh_over_complete: false,
         }
@@ -94,6 +99,37 @@ mod tests {
         let f = OutgoingFacts {
             wiped: true,
             oracle: OracleVerdict::ThisAccount,
+            ..facts()
+        };
+        assert_eq!(
+            decide_outgoing(&f),
+            (OutgoingClass::Wiped, OutgoingAction::Nothing)
+        );
+    }
+
+    #[test]
+    fn a_credential_with_no_token_is_never_captured() {
+        // Nothing account-scoped to capture, whatever the oracle says: like a wiped blob.
+        for oracle in [
+            OracleVerdict::ThisAccount,
+            OracleVerdict::OtherIdentity,
+            OracleVerdict::Unavailable,
+        ] {
+            let f = OutgoingFacts {
+                tokenless: true,
+                oracle,
+                ..facts()
+            };
+            assert_eq!(
+                decide_outgoing(&f),
+                (OutgoingClass::Wiped, OutgoingAction::Nothing),
+                "{oracle:?}"
+            );
+        }
+        // A wiped OAuth blob has no token either, and classifies as it always did.
+        let f = OutgoingFacts {
+            wiped: true,
+            tokenless: true,
             ..facts()
         };
         assert_eq!(
