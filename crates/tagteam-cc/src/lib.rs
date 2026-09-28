@@ -1,4 +1,5 @@
 pub mod config;
+mod crash;
 pub mod live;
 pub mod locks;
 pub mod naming;

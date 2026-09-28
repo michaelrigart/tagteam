@@ -9,6 +9,7 @@ use tagteam_provider::{
 };
 
 use crate::config;
+use crate::crash;
 use crate::live::{self, Fence, LiveStore, Platform, Snapshot};
 use crate::locks;
 use crate::naming::{ItemKind, keychain_account, read_services};
@@ -287,6 +288,7 @@ impl Provider for ClaudeCode {
                 let stored_in = self
                     .live
                     .write_managed_key(env, paths, &target.secret, fence)?;
+                crash::point("after-target-axis");
                 self.live.clear_credential_account_keys(env, paths, fence)?;
                 stored_in
             } else {
@@ -296,6 +298,7 @@ impl Provider for ClaudeCode {
                 let stored_in = self
                     .live
                     .write_credential_entry(env, paths, &composed, fence)?;
+                crash::point("after-target-axis");
                 self.live.clear_managed_key(env, paths, fence)?;
                 stored_in
             };

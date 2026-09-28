@@ -882,12 +882,12 @@ impl Engine {
                 )?;
                 warnings.push(if class == OutgoingClass::Foreign {
                     format!(
-                        "the live credential did not belong to position {}; it was saved as displaced/{id}",
+                        "the live credential did not belong to position {}; it was saved as displaced/{id}.json",
                         out.position
                     )
                 } else {
                     format!(
-                        "the live credential had no refresh token, so it did not replace position {}'s stored one; it was saved as displaced/{id}",
+                        "the live credential had no refresh token, so it did not replace position {}'s stored one; it was saved as displaced/{id}.json",
                         out.position
                     )
                 });
@@ -921,7 +921,7 @@ impl Engine {
             live_identity.map(|i| &i.raw),
         )?;
         warnings.push(format!(
-            "the previous live credential was saved as displaced/{id}"
+            "the previous live credential was saved as displaced/{id}.json"
         ));
         Ok(())
     }
