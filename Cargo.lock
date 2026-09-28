@@ -783,6 +783,7 @@ dependencies = [
  "tagteam-provider",
  "tempfile",
  "thiserror",
+ "tracing",
  "unicode-normalization",
 ]
 

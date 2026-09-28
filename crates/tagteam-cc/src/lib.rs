@@ -1,3 +1,5 @@
+pub mod config;
+pub mod live;
 pub mod naming;
 pub mod paths;
 pub mod shape;
