@@ -8,8 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# Test support for driving the real binary: file-backed fake Keychain and crash points.
-test-support = ["tagteam-provider/file-keychain", "tagteam-engine/test-hooks"]
+# Test support for driving the real binary: file-backed fake Keychain, crash points, and
+# an injectable CC lock timeout.
+test-support = ["tagteam-provider/file-keychain", "tagteam-engine/test-hooks", "tagteam-cc/test-hooks"]
 
 [dependencies]
 tagteam-core.workspace = true

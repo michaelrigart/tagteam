@@ -5,18 +5,16 @@ mod common;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use common::Fx;
+use common::{Fx, mutation_lock_free};
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_service};
 use tagteam_core::AccountId;
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::store::JournalRow;
 use tagteam_engine::switch::{SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget};
-use tagteam_engine::vault::{KeychainVault, Vault, VaultBackend, VaultError};
 use tagteam_engine::{Engine, EngineError};
-use tagteam_provider::{Credential, Env, Identity, MutationGuard, ProcessStamp, Provider, Read};
+use tagteam_provider::{Credential, Env, Identity, ProcessStamp, Provider};
 
 fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
     SwitchRequest {
@@ -59,11 +57,6 @@ fn three_with_a_move_while_planned(
         }),
     );
     (a, b, c)
-}
-
-/// Whether tagteam's mutation lock is free right now; takes and drops it if so.
-fn mutation_lock_free(env: &Env) -> bool {
-    MutationGuard::acquire(env, Duration::ZERO).is_ok()
 }
 
 /// An undecidable row left by a dead process (§9.6), which only `switch --force` may settle.
@@ -146,6 +139,43 @@ fn a_rotation_down_to_one_switchable_account_becomes_a_noop() {
     assert_eq!(out.reason, SwitchReason::OnlyOneAccount);
 }
 
+#[test]
+fn a_login_that_becomes_unmanaged_during_the_wait_is_planned_again_as_a_noop() {
+    // §9.2: the switch re-plans into the unmanaged-account no-op rather than failing.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let path = fx.paths().global_config;
+    fx.engine.on_point(
+        "planned",
+        Box::new(move || {
+            common::splice_oauth_account(&path, &Fx::oauth_account("stranger@x.co"));
+        }),
+    );
+    let out = switch_to(&fx, &a, false).unwrap();
+    assert_eq!(
+        (out.switched, out.reason, out.unmanaged_email.as_deref()),
+        (false, SwitchReason::UnmanagedAccount, Some("stranger@x.co"))
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("stranger@x.co"));
+}
+
+#[test]
+fn a_rotation_target_removed_during_the_wait_is_planned_again() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c"); // live and active: the rotation plans a
+    let other = fx.engine_with_env(fx.env.clone());
+    fx.engine
+        .on_point("planned", Box::new(move || drop(other.remove(&a))));
+    let out = fx
+        .engine
+        .switch(request(&fx, SwitchTarget::Rotation, false))
+        .unwrap();
+    assert_eq!(out.to.unwrap().id, b);
+}
+
 /// Records, for every oracle call, whether tagteam's mutation lock was free at the time.
 struct GuardProbe {
     env: Env,
@@ -185,33 +215,6 @@ fn a_replan_never_asks_the_oracle_under_the_mutation_lock() {
     assert_eq!(fx.vault_refresh_token(&c).as_deref(), Some("rt-c2"));
 }
 
-/// A Keychain vault that records, once armed, whether tagteam's mutation lock was free at
-/// each read.
-struct GuardProbeVault {
-    inner: KeychainVault,
-    env: Env,
-    armed: Arc<AtomicBool>,
-    free: Arc<Mutex<Vec<bool>>>,
-}
-
-impl VaultBackend for GuardProbeVault {
-    fn read(&self, key: &str) -> Read<Vec<u8>> {
-        if self.armed.load(Ordering::SeqCst) {
-            self.free
-                .lock()
-                .unwrap()
-                .push(mutation_lock_free(&self.env));
-        }
-        self.inner.read(key)
-    }
-    fn write(&self, key: &str, bytes: &[u8]) -> Result<(), VaultError> {
-        self.inner.write(key, bytes)
-    }
-    fn delete(&self, key: &str) -> Result<(), VaultError> {
-        self.inner.delete(key)
-    }
-}
-
 #[test]
 fn a_replan_keeps_the_mutation_lock() {
     // §9.4 step 1: a retry releases every lock except the mutation lock, so no other tagteam
@@ -220,12 +223,12 @@ fn a_replan_keeps_the_mutation_lock() {
     let fx = Fx::new();
     let armed = Arc::new(AtomicBool::new(false));
     let free = Arc::new(Mutex::new(vec![]));
-    let engine = fx.engine_with_vault(Vault::new(Box::new(GuardProbeVault {
-        inner: KeychainVault::new(fx.kc.clone()),
-        env: fx.env.clone(),
-        armed: armed.clone(),
-        free: free.clone(),
-    })));
+    let (env, is_armed, record) = (fx.env.clone(), armed.clone(), free.clone());
+    let engine = fx.engine_with_vault_probe(move |_| {
+        if is_armed.load(Ordering::SeqCst) {
+            record.lock().unwrap().push(mutation_lock_free(&env));
+        }
+    });
     let (_, b, _) =
         three_with_a_move_while_planned(&fx, &engine, move || armed.store(true, Ordering::SeqCst));
     let out = engine

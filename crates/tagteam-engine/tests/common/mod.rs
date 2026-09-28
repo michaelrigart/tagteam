@@ -13,10 +13,12 @@ use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::store::LoginMeta;
-use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault};
+use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
 use tagteam_engine::{Engine, EngineConfig};
 use tagteam_provider::splice::replace_top_level;
-use tagteam_provider::{Credential, Env, FakeClock, FakeKeychain, Identity, Provider, Read};
+use tagteam_provider::{
+    Credential, Env, FakeClock, FakeKeychain, Identity, MutationGuard, Provider, Read,
+};
 
 /// An oracle that answers whatever the test sets.
 #[derive(Default)]
@@ -61,6 +63,31 @@ pub fn splice_oauth_account(path: &Path, oauth_account: &Value) {
     .unwrap();
 }
 
+/// Whether tagteam's mutation lock is free right now; takes and drops it if so.
+pub fn mutation_lock_free(env: &Env) -> bool {
+    MutationGuard::acquire(env, Duration::ZERO).is_ok()
+}
+
+/// A Keychain vault that runs `on_read` with each key just before reading it: for observing
+/// what holds while the engine reads the vault.
+pub struct ProbeVault {
+    inner: KeychainVault,
+    on_read: Box<dyn Fn(&str) + Send + Sync>,
+}
+
+impl VaultBackend for ProbeVault {
+    fn read(&self, key: &str) -> Read<Vec<u8>> {
+        (self.on_read)(key);
+        self.inner.read(key)
+    }
+    fn write(&self, key: &str, bytes: &[u8]) -> Result<(), VaultError> {
+        self.inner.write(key, bytes)
+    }
+    fn delete(&self, key: &str) -> Result<(), VaultError> {
+        self.inner.delete(key)
+    }
+}
+
 pub struct Fx {
     pub dir: tempfile::TempDir,
     pub env: Env,
@@ -83,6 +110,20 @@ impl Fx {
 
     /// A fixture whose Env is adjusted before anything is created in it.
     pub fn with(platform: Platform, adjust: impl FnOnce(&mut Env)) -> Self {
+        Self::build(platform, adjust, |cc| cc)
+    }
+
+    /// A macOS fixture whose provider waits only `timeout` for CC's locks, so a held CC lock
+    /// can be tested without the real 9 s wait.
+    pub fn with_lock_timeout(timeout: Duration) -> Self {
+        Self::build(Platform::MacOs, |_| {}, |cc| cc.with_lock_timeout(timeout))
+    }
+
+    fn build(
+        platform: Platform,
+        adjust: impl FnOnce(&mut Env),
+        tune: impl FnOnce(ClaudeCode) -> ClaudeCode,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env::for_test(dir.path());
         adjust(&mut env);
@@ -106,9 +147,9 @@ impl Fx {
         let kc = Arc::new(FakeKeychain::new());
         let oracle = Arc::new(FixedOracle::default());
         let clock = Arc::new(FakeClock::new(1_790_000_000_000));
-        let cc = Arc::new(ClaudeCode::with_store(
+        let cc = Arc::new(tune(ClaudeCode::with_store(
             LiveStore::new(kc.clone(), platform).with_retry_delay(Duration::ZERO),
-        ));
+        )));
         let vault = match platform {
             Platform::MacOs => Vault::new(Box::new(KeychainVault::new(kc.clone()))),
             Platform::Linux => Vault::new(Box::new(FileVault::new(env.data_dir().join("vault")))),
@@ -332,9 +373,16 @@ impl Fx {
         self.engine_over(self.env.clone(), self.keychain_vault(), oracle)
     }
 
-    /// An engine over the same Env, oracle and clock, but a caller-supplied vault — for
-    /// observing what holds while the engine reads it.
-    pub fn engine_with_vault(&self, vault: Vault) -> Engine {
+    /// An engine over the same Env, Keychain, oracle and clock whose vault runs `on_read`
+    /// before every read (see `ProbeVault`).
+    pub fn engine_with_vault_probe(
+        &self,
+        on_read: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Engine {
+        let vault = Vault::new(Box::new(ProbeVault {
+            inner: KeychainVault::new(self.kc.clone()),
+            on_read: Box::new(on_read),
+        }));
         self.engine_over(self.env.clone(), vault, self.oracle.clone())
     }
 }

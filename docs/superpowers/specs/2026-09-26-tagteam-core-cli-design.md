@@ -998,6 +998,9 @@ here on.
      siblings) from the live credential entry and keeps its machine-shared keys, in the
      Keychain item and in `.credentials.json` alike. An entry is deleted only when no
      machine-shared key remains in it.
+
+   An account-scoped secret on the axis being cleared that no vault holds is displaced before
+   it is cleared.
 8. **Splice** the target's `oauthAccount` into `~/.claude.json` (§9.5).
 9. **Commit** in one store transaction: set the active account, insert an `events` row
    (`source` = `cli` or `auto`), and delete the journal row.

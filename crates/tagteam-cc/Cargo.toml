@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Test-only overrides, such as a short CC lock timeout. Never enabled in release builds.
+test-hooks = []
+
 [dependencies]
 tagteam-core.workspace = true
 tagteam-provider.workspace = true

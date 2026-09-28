@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
@@ -21,6 +22,8 @@ const LIVE_NOT_FRESH: &str =
 
 pub struct ClaudeCode {
     live: Arc<LiveStore>,
+    /// How long `lock_live` waits for CC's locks: `locks::ACQUIRE_TIMEOUT`, except in tests.
+    lock_timeout: Duration,
 }
 
 impl ClaudeCode {
@@ -31,7 +34,15 @@ impl ClaudeCode {
     pub fn with_store(store: LiveStore) -> Self {
         Self {
             live: Arc::new(store),
+            lock_timeout: locks::ACQUIRE_TIMEOUT,
         }
+    }
+
+    /// A shorter wait for CC's locks, so a test of a held lock need not wait the full 9 s.
+    #[cfg(feature = "test-hooks")]
+    pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = timeout;
+        self
     }
 }
 
@@ -256,7 +267,7 @@ impl Provider for ClaudeCode {
         env: &Env,
         g: &'g MutationGuard,
     ) -> Result<LiveLocks<'g>, ProviderError> {
-        let set = locks::acquire(&CcPaths::resolve(env))?;
+        let set = locks::acquire_with(&CcPaths::resolve(env), self.lock_timeout)?;
         Ok(LiveLocks::new(g, Box::new(set)))
     }
 

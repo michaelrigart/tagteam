@@ -107,18 +107,69 @@ fn noop(
     }
 }
 
-/// The live secret on `kind`'s auth axis: the managed key for an API-key account, the
-/// credential entry otherwise. A degraded read is not a secret to act on (§4.3).
-fn live_secret(kind: &str, auth: &LiveAuth) -> Option<Vec<u8>> {
-    if kind == KIND_API_KEY {
-        auth.managed_key.as_ref().present().cloned()
-    } else {
-        auth.credential
-            .as_ref()
-            .present()
-            .filter(|c| c.provenance() == Provenance::Fresh)
-            .map(|c| c.bytes().to_vec())
+/// The two auth axes a live login can be on (§9.4 step 7): the credential entry, or the
+/// managed API key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Entry,
+    ManagedKey,
+}
+
+impl Axis {
+    fn of(kind: &str) -> Self {
+        if kind == KIND_API_KEY {
+            Axis::ManagedKey
+        } else {
+            Axis::Entry
+        }
     }
+
+    fn other(self) -> Self {
+        match self {
+            Axis::Entry => Axis::ManagedKey,
+            Axis::ManagedKey => Axis::Entry,
+        }
+    }
+
+    /// The live secret on this axis. A degraded read is not a secret to act on (§4.3).
+    fn live_secret(self, auth: &LiveAuth) -> Option<Vec<u8>> {
+        match self {
+            Axis::ManagedKey => auth.managed_key.as_ref().present().cloned(),
+            Axis::Entry => auth
+                .credential
+                .as_ref()
+                .present()
+                .filter(|c| c.provenance() == Provenance::Fresh)
+                .map(|c| c.bytes().to_vec()),
+        }
+    }
+}
+
+/// §9.4 step 3, with or without --force: what could not be read fresh is never overwritten,
+/// on either axis. An empty value is never backed up, because a Keychain timeout can look
+/// empty; a degraded entry may hide a newer generation.
+fn refuse_unsafe_live_reads(live: &LiveAuth) -> Result<(), EngineError> {
+    match &live.credential {
+        Read::Unreadable(e) => return Err(EngineError::Unreadable(e.clone())),
+        Read::Present(c) if c.provenance() == Provenance::Degraded => {
+            return Err(EngineError::DegradedRead);
+        }
+        Read::Present(c) if c.is_empty() => {
+            return Err(EngineError::InvalidInput(EMPTY_LIVE_READ.into()));
+        }
+        _ => {}
+    }
+    match &live.managed_key {
+        Read::Unreadable(e) => Err(EngineError::Unreadable(e.clone())),
+        Read::Present(k) if k.is_empty() => Err(EngineError::InvalidInput(EMPTY_LIVE_READ.into())),
+        _ => Ok(()),
+    }
+}
+
+/// Two secrets of one generation: equal bytes, or the same fingerprint.
+fn same_generation(p: &dyn Provider, a: &[u8], b: &[u8]) -> bool {
+    let fp = p.fingerprint(a);
+    a == b || (fp.is_some() && fp == p.fingerprint(b))
 }
 
 /// What a row says about a login, for noticing that it changed: a finished replacement
@@ -288,10 +339,7 @@ impl Engine {
 
     fn matches_vault(&self, p: &dyn Provider, row: &AccountRow, live: &[u8]) -> bool {
         match self.vault.read(&row.id) {
-            Read::Present(v) => {
-                let fp = p.fingerprint(&v);
-                v == live || (fp.is_some() && fp == p.fingerprint(live))
-            }
+            Read::Present(v) => same_generation(p, &v, live),
             _ => false,
         }
     }
@@ -360,7 +408,7 @@ impl Engine {
     /// §9.4 "Before locking": asks the oracle about the outgoing live secret when it is not
     /// that account's vault generation. Never called under the mutation lock.
     fn oracle_hint(&self, p: &dyn Provider, out: &AccountRow) -> Option<OracleHint> {
-        let bytes = live_secret(&out.kind, &p.read_live_auth(&self.env))?;
+        let bytes = Axis::of(&out.kind).live_secret(&p.read_live_auth(&self.env))?;
         if bytes.is_empty() || self.matches_vault(p, out, &bytes) {
             return None;
         }
@@ -426,8 +474,9 @@ impl Engine {
         if self_switch && !req.force {
             // A no-op unless the live credential diverged from the vault and the oracle
             // attributed it to this very account; then a full switch reconciles it (§9.2).
-            let reconcile =
-                live_secret(&target.kind, &p.read_live_auth(&self.env)).is_some_and(|live| {
+            let reconcile = Axis::of(&target.kind)
+                .live_secret(&p.read_live_auth(&self.env))
+                .is_some_and(|live| {
                     !self.matches_vault(p, &target, &live)
                         && verdict(answer_for(hint.as_ref(), &live), &target)
                             == OracleVerdict::ThisAccount
@@ -508,8 +557,20 @@ impl Engine {
                 ids.push(&o.id);
             }
             let accounts = self.lock_accounts(&ids)?;
+            // Re-decided here rather than under CC's locks: a rotation reads every account's
+            // vault entry, which must not lengthen CC's wait. The mutation lock keeps the
+            // roster still, and `rederive` checks under CC's locks that the live row it is
+            // anchored on has not moved.
+            let rotation = match req.target {
+                SwitchTarget::Rotation => {
+                    Some(self.rotation(&store, &req.provider, outgoing.as_ref())?)
+                }
+                SwitchTarget::Account(_) => None,
+            };
             let locks = p.lock_live(&self.env, &guard)?;
-            if let Some(locked) = self.rederive(p, &store, &req, &plan, outgoing.as_ref())? {
+            if let Some(locked) =
+                self.rederive(p, &store, &req, &plan, outgoing.as_ref(), rotation)?
+            {
                 return self.transact(p, &store, &plan, locked, &accounts, &locks, &req);
             }
             // `locks`, then `accounts`, are released here; the mutation lock is kept.
@@ -519,7 +580,7 @@ impl Engine {
 
     /// §9.4 step 1: the live account, the target and the self-switch decision, all re-read
     /// under the locks. `None` when any of them moved, or the account locks held are no longer
-    /// the outgoing account's.
+    /// the outgoing account's; planning again then reaches the right outcome.
     fn rederive(
         &self,
         p: &dyn Provider,
@@ -527,20 +588,25 @@ impl Engine {
         req: &SwitchRequest,
         plan: &Plan,
         outgoing: Option<&AccountRow>,
+        rotation: Option<Rotation>,
     ) -> Result<Option<Locked>, EngineError> {
         let (live_identity, again) = self.live_row(p, store, &req.provider)?;
-        let target = store
-            .account(&plan.target.id)?
-            .ok_or_else(|| EngineError::NoSuchAccount(plan.target.id.to_string()))?;
+        // A login that became unmanaged is §9.2's no-op; a target removed meanwhile is
+        // replaced (rotation) or reported (direct).
+        if live_identity.is_some() && again.is_none() && !req.force {
+            return Ok(None);
+        }
+        let Some(target) = store.account(&plan.target.id)? else {
+            return Ok(None);
+        };
         let self_switch = again.as_ref().is_some_and(|r| r.id == target.id);
-        let same_pick = match req.target {
-            SwitchTarget::Account(_) => true,
-            // The whole rotation decision is recomputed from the current roster and anchor
-            // (§9.2, §9.3), including the fewer-than-two case.
-            SwitchTarget::Rotation => matches!(
-                self.rotation(store, &req.provider, again.as_ref())?,
-                Rotation::To(r) if r.id == target.id
-            ),
+        // The whole rotation decision, recomputed from the current roster and anchor (§9.2,
+        // §9.3), including the fewer-than-two case. Its anchor is `outgoing`, which is `again`
+        // when anything proceeds.
+        let same_pick = match rotation {
+            None => true,
+            Some(Rotation::To(r)) => r.id == target.id,
+            Some(Rotation::Stay(..)) => false,
         };
         // Account-lock acquisition may have finished a pending replacement (§12.5), changing
         // the outgoing account's kind or identity: compare the rows, not just their IDs.
@@ -585,32 +651,14 @@ impl Engine {
             outgoing,
         } = locked;
         let provider = &req.provider;
-        if live_identity.is_some() && outgoing.is_none() && !req.force {
-            return Err(EngineError::LiveMoved); // became unmanaged since planning
-        }
         let target_identity = p.parse_identity(&target.identity_json)?;
         let live = p.read_live_auth(&self.env);
-
-        // Step 3 read rules, with or without --force: never overwrite what could not be read.
-        let live_cred: Option<Credential> = match &live.credential {
-            Read::Unreadable(e) => return Err(EngineError::Unreadable(e.clone())),
-            Read::Present(c) if c.provenance() == Provenance::Degraded => {
-                return Err(EngineError::DegradedRead);
-            }
-            Read::Present(c) if c.is_empty() => {
-                return Err(EngineError::InvalidInput(EMPTY_LIVE_READ.into()));
-            }
-            Read::Present(c) => Some(c.clone()),
-            Read::Absent => None,
-        };
-        if let Read::Unreadable(e) = &live.managed_key {
-            return Err(EngineError::Unreadable(e.clone()));
-        }
+        refuse_unsafe_live_reads(&live)?;
 
         let mut warnings = Vec::new();
         let target_secret = match outgoing.as_ref().filter(|_| !req.force) {
-            // Step 2, the direct branch: displace whatever is live unless it is byte-identical
-            // to the target.
+            // Step 2, the direct branch: displace whatever is live on either axis unless it is
+            // byte-identical to the target.
             None => {
                 let secret = self.read_target(&target)?;
                 let reason = if req.force {
@@ -618,26 +666,17 @@ impl Engine {
                 } else {
                     "displaced-live-login"
                 };
-                let live_bytes = [
-                    live_cred.as_ref().map(|c| c.bytes().to_vec()),
-                    live.managed_key.as_ref().present().cloned(),
-                ];
-                for bytes in live_bytes.into_iter().flatten().filter(|b| *b != secret) {
-                    let identity = live_identity.as_ref().map(|i| &i.raw);
-                    match displace(
-                        self,
-                        provider,
-                        &bytes,
-                        p.fingerprint(&bytes).as_ref(),
-                        reason,
-                        identity,
-                    ) {
-                        Ok(id) => warnings.push(format!(
-                            "the previous live credential was saved as displaced/{id}"
-                        )),
-                        Err(e) if req.force => warnings
-                            .push(format!("could not save the previous live credential: {e}")),
-                        Err(e) => return Err(e),
+                for axis in [Axis::Entry, Axis::ManagedKey] {
+                    if let Some(bytes) = axis.live_secret(&live).filter(|b| *b != secret) {
+                        self.displace_live(
+                            p,
+                            provider,
+                            &bytes,
+                            reason,
+                            live_identity.as_ref(),
+                            req.force,
+                            &mut warnings,
+                        )?;
                     }
                 }
                 secret
@@ -655,15 +694,34 @@ impl Engine {
                 )?;
                 // Read only now: settling a self-switch may have captured a newer live
                 // generation into this very account, and that is the one to activate.
-                self.read_target(&target)?
+                let secret = self.read_target(&target)?;
+                // Step 7 clears or overwrites the axis the outgoing account is not on, which
+                // step 4 never classified: a secret there that the target does not hold is
+                // saved first.
+                if let Some(bytes) = Axis::of(&out.kind)
+                    .other()
+                    .live_secret(&live)
+                    .filter(|b| !same_generation(p, b, &secret))
+                {
+                    self.displace_live(
+                        p,
+                        provider,
+                        &bytes,
+                        "displaced-live-login",
+                        live_identity.as_ref(),
+                        req.force,
+                        &mut warnings,
+                    )?;
+                }
+                secret
             }
         };
 
         // Step 6.
         let from_secret = outgoing
             .as_ref()
-            .and_then(|o| live_secret(&o.kind, &live))
-            .or_else(|| live_cred.as_ref().map(|c| c.bytes().to_vec()));
+            .and_then(|o| Axis::of(&o.kind).live_secret(&live))
+            .or_else(|| Axis::Entry.live_secret(&live));
         // A forced switch may supersede an undecidable row; it is carried along, so a forced
         // switch that never lands puts it back instead of forgetting it (§9.6).
         let prior = if req.force {
@@ -755,14 +813,9 @@ impl Engine {
         live_identity: Option<&Identity>,
         warnings: &mut Vec<String>,
     ) -> Result<(), EngineError> {
-        let Some(bytes) = live_secret(&out.kind, live) else {
+        let Some(bytes) = Axis::of(&out.kind).live_secret(live) else {
             return Ok(());
         };
-        if bytes.is_empty() {
-            // Step 3's rule, on the managed-key axis too: capturing an empty read would leave
-            // this account with nothing to activate.
-            return Err(EngineError::InvalidInput(EMPTY_LIVE_READ.into()));
-        }
         let vault = match self.vault.read(&out.id) {
             Read::Present(v) => Some(v),
             Read::Absent => None,
@@ -830,6 +883,42 @@ impl Engine {
                     )
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Saves a live secret the switch is about to overwrite or clear (§6.3, B.5), unless it
+    /// carries nothing account-scoped: an entry holding only machine-shared keys loses nothing,
+    /// since those are carried over. A failed save aborts, except under --force.
+    #[allow(clippy::too_many_arguments)]
+    fn displace_live(
+        &self,
+        p: &dyn Provider,
+        provider: &ProviderId,
+        bytes: &[u8],
+        reason: &str,
+        live_identity: Option<&Identity>,
+        force: bool,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), EngineError> {
+        let Some(fp) = p.fingerprint(bytes) else {
+            return Ok(());
+        };
+        match displace(
+            self,
+            provider,
+            bytes,
+            Some(&fp),
+            reason,
+            live_identity.map(|i| &i.raw),
+        ) {
+            Ok(id) => warnings.push(format!(
+                "the previous live credential was saved as displaced/{id}"
+            )),
+            Err(e) if force => {
+                warnings.push(format!("could not save the previous live credential: {e}"))
+            }
+            Err(e) => return Err(e),
         }
         Ok(())
     }

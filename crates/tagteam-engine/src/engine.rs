@@ -199,6 +199,10 @@ impl Engine {
 
     /// Runs `callback` each time the switch passes the named point: a deterministic barrier
     /// for races that are otherwise timing-dependent.
+    ///
+    /// The callback runs with this engine's `on_point` mutex held, so it must never pass a
+    /// hook point on this same engine: that would deadlock. Drive the race through a second
+    /// engine instead (`Fx::engine_with_env`).
     pub fn on_point(&self, name: &'static str, callback: Box<dyn Fn() + Send + Sync>) {
         *self.on_point.lock().unwrap() = Some((name, callback));
     }
