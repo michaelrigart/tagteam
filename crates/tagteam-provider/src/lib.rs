@@ -22,6 +22,6 @@ pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 pub use process::ProcessStamp;
 pub use provider::{
     CapturedLogin, Identity, IdentitySurface, LiveAuth, LiveLockSet, LiveLocks, Provider,
-    ProviderError, StoredLogin, Undo,
+    ProviderError, SecretStore, StoredLogin, Undo, Written,
 };
 pub use read::{Read, ReadError};

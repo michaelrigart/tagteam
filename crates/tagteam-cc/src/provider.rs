@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::{
     Credential, Env, Identity, IdentitySurface, Keychain, LiveAuth, LiveLocks, MutationGuard,
-    Provider, ProviderError, Read, StoredLogin, Undo,
+    Provider, ProviderError, Read, StoredLogin, Undo, Written,
 };
 
 use crate::config;
@@ -131,13 +131,14 @@ impl ClaudeCode {
     /// when `f` fails or panics part-way. A restore that fails too is reported as
     /// `RestoreFailed`, so the engine keeps its journal instead of believing the rollback
     /// worked. The returned undo borrows `locks` for `'l` (§9.4 step 10: the credential locks
-    /// must be "held throughout"), matching the `Provider` trait's writers.
-    fn guarded<'l>(
+    /// must be "held throughout"), matching the `Provider` trait's writers; it comes with
+    /// whatever `f` reported.
+    fn guarded<'l, T>(
         &self,
         env: &Env,
         locks: &'l LiveLocks<'_>,
-        f: impl FnOnce(&CcPaths, Fence<'_>) -> Result<(), ProviderError>,
-    ) -> Result<Box<dyn Undo + 'l>, ProviderError> {
+        f: impl FnOnce(&CcPaths, Fence<'_>) -> Result<T, ProviderError>,
+    ) -> Result<(Box<dyn Undo + 'l>, T), ProviderError> {
         locks.check_owned()?;
         let paths = CcPaths::resolve(env);
         let snapshot = self.live.snapshot(env, &paths)?;
@@ -155,7 +156,7 @@ impl ClaudeCode {
         let result = f(&paths, &fence);
         let undo = armed.undo.take().expect("armed until here");
         match result {
-            Ok(()) => Ok(undo),
+            Ok(value) => Ok((undo, value)),
             Err(e) => match undo.undo(locks) {
                 Ok(()) => Err(e),
                 Err(re) => Err(ProviderError::RestoreFailed {
@@ -280,21 +281,27 @@ impl Provider for ClaudeCode {
         // actually happens under the locks, so `write_credential` re-reads fresh instead
         // (see `fresh_live_object`).
         _live: &LiveAuth,
-    ) -> Result<Box<dyn Undo + 'l>, ProviderError> {
-        self.guarded(env, locks, |paths, fence| {
-            if target.kind == KIND_API_KEY {
-                self.live
+    ) -> Result<Written<'l>, ProviderError> {
+        let (undo, stored_in) = self.guarded(env, locks, |paths, fence| {
+            let stored_in = if target.kind == KIND_API_KEY {
+                let stored_in = self
+                    .live
                     .write_managed_key(env, paths, &target.secret, fence)?;
-                self.live.clear_credential_account_keys(env, paths, fence)
+                self.live.clear_credential_account_keys(env, paths, fence)?;
+                stored_in
             } else {
                 let fresh = self.live.read_credential(env, paths);
                 let live_map = fresh_live_object(fresh)?;
                 let composed = shape::compose(&target.secret, live_map.as_ref())?;
-                self.live
+                let stored_in = self
+                    .live
                     .write_credential_entry(env, paths, &composed, fence)?;
-                self.live.clear_managed_key(env, paths, fence)
-            }
-        })
+                self.live.clear_managed_key(env, paths, fence)?;
+                stored_in
+            };
+            Ok(stored_in)
+        })?;
+        Ok(Written { undo, stored_in })
     }
 
     fn clear_other_axis<'l>(
@@ -303,13 +310,14 @@ impl Provider for ClaudeCode {
         locks: &'l LiveLocks<'_>,
         kept_kind: &str,
     ) -> Result<Box<dyn Undo + 'l>, ProviderError> {
-        self.guarded(env, locks, |paths, fence| {
+        let (undo, ()) = self.guarded(env, locks, |paths, fence| {
             if kept_kind == KIND_API_KEY {
                 self.live.clear_credential_account_keys(env, paths, fence)
             } else {
                 self.live.clear_managed_key(env, paths, fence)
             }
-        })
+        })?;
+        Ok(undo)
     }
 
     fn write_identity<'l>(
@@ -327,10 +335,6 @@ impl Provider for ClaudeCode {
             identity.map(|i| &i.raw),
             &fence,
         )?))
-    }
-
-    fn uses_file_store(&self, _env: &Env) -> bool {
-        self.live.platform() == Platform::Linux || self.live.file_mode_pinned()
     }
 }
 

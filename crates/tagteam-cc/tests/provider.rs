@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::provider::ClaudeCode;
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service, read_services};
-use tagteam_provider::{Env, FakeKeychain, MutationGuard, Provider, Read, StoredLogin};
+use tagteam_provider::{
+    Env, FakeKeychain, MutationGuard, Provider, Read, SecretStore, StoredLogin,
+};
 
 struct Fx {
     _d: tempfile::TempDir,
@@ -60,7 +62,9 @@ fn writes_the_composed_credential_and_the_identity_then_undoes_both() {
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
     let live = f.cc.read_live_auth(&f.env);
     let t = target(&f, "new@b.co", "rt-new");
-    let u1 = f.cc.write_credential(&f.env, &locks, &t, &live).unwrap();
+    let written = f.cc.write_credential(&f.env, &locks, &t, &live).unwrap();
+    assert_eq!(written.stored_in, SecretStore::Keychain);
+    let u1 = written.undo;
     let u2 =
         f.cc.write_identity(&f.env, &locks, Some(&t.identity))
             .unwrap();
@@ -109,7 +113,8 @@ fn an_api_key_target_moves_the_auth_axis() {
         secret: key.as_bytes().to_vec(),
         identity: f.cc.token_identity("api-key-2@token.local"),
     };
-    f.cc.write_credential(&f.env, &locks, &t, &live).unwrap();
+    let written = f.cc.write_credential(&f.env, &locks, &t, &live).unwrap();
+    assert_eq!(written.stored_in, SecretStore::Keychain);
     assert_eq!(
         f.kc.get(&keychain_service(&f.env, ItemKind::ManagedKey), &acct)
             .unwrap(),

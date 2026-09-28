@@ -39,7 +39,6 @@ const KEYCHAIN_LOCKED: &str = "the login keychain is locked (common over SSH); r
 const CANCELLED: &str = "cancelled";
 const TOKEN_MISSING: &str = "pass the token as an argument, or `-` to read it from stdin";
 const ALIAS_USAGE: &str = "alias takes ACCOUNT NAME, ACCOUNT --unset, or no arguments";
-const KEYCHAIN_FELL_BACK: &str = "the Keychain could not be written, so the credential went to Claude Code's credentials file instead";
 
 /// Honoured only with the `test-support` feature: a release build never reads them.
 #[cfg(any(test, feature = "test-support"))]
@@ -548,10 +547,10 @@ impl App<'_, '_> {
         for w in &outcome.warnings {
             let _ = writeln!(self.io.err, "warning: {w}");
         }
-        // On macOS a file store means the Keychain write failed and fell back to the file
-        // (Appendix A.3); on Linux the file is the only store, which is routine.
-        if outcome.file_store && self.keychain.is_some() {
-            let _ = writeln!(self.io.err, "warning: {KEYCHAIN_FELL_BACK}");
+        // As the engine reports it for this write: a file that is the platform's only store is
+        // routine and says nothing.
+        if let Some(notice) = render::fallback_notice(&outcome) {
+            let _ = writeln!(self.io.err, "warning: {notice}");
         }
         self.print(
             &render::switch_human(&outcome),

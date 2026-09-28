@@ -3,6 +3,7 @@ use tagteam_core::ProviderId;
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::SwitchOutcome;
 use tagteam_engine::views::{AccountView, ProviderAccounts, StatusView};
+use tagteam_provider::SecretStore;
 
 const NO_ACCOUNTS: &str = "No accounts yet. Log in with `claude`, then run `tagteam add`.\n";
 /// Claude Code reloads a credentials-file change on its next message (Appendix A.3).
@@ -177,19 +178,32 @@ pub fn switch_json(o: &SwitchOutcome, provider: &str) -> Value {
     })
 }
 
-/// §13.2: where the switch wrote the credential; `None` when it wrote none (a no-op).
+/// §13.2: where the switch stored the credential, as the engine reports it; `None` when it
+/// wrote none (a no-op).
 fn credential_store(o: &SwitchOutcome) -> Option<&'static str> {
-    o.to.as_ref()
-        .map(|_| if o.file_store { "file" } else { "keychain" })
+    o.stored_in.as_ref().map(|s| match s {
+        SecretStore::Keychain => "keychain",
+        SecretStore::File(_) | SecretStore::Fallback(_) => "file",
+    })
+}
+
+/// The stderr notice for a write the keychain refused, naming where the secret went.
+pub fn fallback_notice(o: &SwitchOutcome) -> Option<String> {
+    match &o.stored_in {
+        Some(SecretStore::Fallback(path)) => Some(format!(
+            "the Keychain refused the write, so the credential was stored in {} instead",
+            path.display()
+        )),
+        _ => None,
+    }
 }
 
 pub fn switch_human(o: &SwitchOutcome) -> String {
     match (&o.to, o.switched) {
         (Some(to), true) => {
-            let hint = if o.file_store {
-                FILE_STORE_HINT
-            } else {
-                KEYCHAIN_HINT
+            let hint = match o.stored_in {
+                Some(SecretStore::File(_) | SecretStore::Fallback(_)) => FILE_STORE_HINT,
+                Some(SecretStore::Keychain) | None => KEYCHAIN_HINT,
             };
             format!(
                 "Switched to {} (position {}).\n{hint}\n",
@@ -212,9 +226,54 @@ pub fn account_json(account: &AccountView, created: Option<bool>) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use tagteam_core::CLAUDE_CODE;
+    use tagteam_engine::switch::SwitchReason;
 
     use super::*;
+
+    fn stored(stored_in: Option<SecretStore>) -> SwitchOutcome {
+        SwitchOutcome {
+            switched: true,
+            from: None,
+            to: None,
+            strategy: "direct",
+            reason: SwitchReason::Switched,
+            message: String::new(),
+            warnings: vec![],
+            stored_in,
+            unmanaged_email: None,
+        }
+    }
+
+    #[test]
+    fn only_a_fallback_is_a_notice_and_either_file_is_a_file() {
+        let path = PathBuf::from("/home/u/.claude.json");
+        let linux = stored(Some(SecretStore::File(path.clone())));
+        assert_eq!(
+            (credential_store(&linux), fallback_notice(&linux)),
+            (Some("file"), None)
+        );
+        let fell_back = stored(Some(SecretStore::Fallback(path)));
+        assert_eq!(credential_store(&fell_back), Some("file"));
+        assert_eq!(
+            fallback_notice(&fell_back).as_deref(),
+            Some(
+                "the Keychain refused the write, so the credential was stored in /home/u/.claude.json instead"
+            )
+        );
+        let keychain = stored(Some(SecretStore::Keychain));
+        assert_eq!(
+            (credential_store(&keychain), fallback_notice(&keychain)),
+            (Some("keychain"), None)
+        );
+        let none = stored(None);
+        assert_eq!(
+            (credential_store(&none), fallback_notice(&none)),
+            (None, None)
+        );
+    }
 
     fn accounts(provider: &str, active: Option<u32>) -> ProviderAccounts {
         ProviderAccounts {

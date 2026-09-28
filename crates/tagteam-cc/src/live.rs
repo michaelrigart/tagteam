@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 use tagteam_provider::atomic::{ensure_private_dir, remove_target, write_atomic_with};
-use tagteam_provider::{Credential, Env, Keychain, ProviderError, Read};
+use tagteam_provider::{Credential, Env, Keychain, ProviderError, Read, SecretStore};
 
 use crate::config::{self, read_bytes};
 use crate::naming::{ItemKind, keychain_account, keychain_service, read_services};
@@ -236,16 +236,18 @@ impl LiveStore {
         write_atomic_with(&paths.credentials_file, bytes, 0o600, fence)
     }
 
-    /// Appendix A.3 write, including the verified file fallback.
+    /// Appendix A.3 write, including the verified file fallback. Returns where this write
+    /// put the credential: a file mirrored for hot reload does not make it a file store.
     pub fn write_credential_entry(
         &self,
         env: &Env,
         paths: &CcPaths,
         bytes: &[u8],
         fence: Fence<'_>,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<SecretStore, ProviderError> {
         if !self.mac() {
-            return self.write_file(paths, bytes, fence);
+            self.write_file(paths, bytes, fence)?;
+            return Ok(SecretStore::File(paths.credentials_file.clone()));
         }
         if !self.file_mode_pinned() {
             fence()?;
@@ -259,7 +261,7 @@ impl LiveStore {
                         // Bumps the mtime, so CC reloads (hot reload).
                         write_atomic_with(&paths.credentials_file, bytes, 0o600, fence)?;
                     }
-                    return Ok(());
+                    return Ok(SecretStore::Keychain);
                 }
                 Err(e) => tracing::warn!(
                     "keychain write failed, falling back to the credentials file: {e}"
@@ -269,7 +271,7 @@ impl LiveStore {
         self.write_file(paths, bytes, fence)?;
         self.remove_items(env, ItemKind::OAuth, fence)?;
         self.file_mode_pinned.store(true, Ordering::SeqCst);
-        Ok(())
+        Ok(SecretStore::Fallback(paths.credentials_file.clone()))
     }
 
     /// API-key activation: keep only the machine-shared keys of every credential entry a
@@ -311,14 +313,15 @@ impl LiveStore {
     /// Keychain failure left behind (otherwise another account's plaintext key would stay
     /// live in `~/.claude.json`). When the Keychain refuses, the key goes to `primaryApiKey`
     /// instead, and every managed-key item is removed and verified gone: CC reads the
-    /// Keychain first, so a stale item would stay the effective key.
+    /// Keychain first, so a stale item would stay the effective key. Returns where this write
+    /// put the key; the credential entry's file pin plays no part in it.
     pub fn write_managed_key(
         &self,
         env: &Env,
         paths: &CcPaths,
         key: &[u8],
         fence: Fence<'_>,
-    ) -> Result<(), ProviderError> {
+    ) -> Result<SecretStore, ProviderError> {
         let key_str = String::from_utf8_lossy(key).trim().to_owned();
         let tail: String = key_str
             .chars()
@@ -361,7 +364,7 @@ impl LiveStore {
             ) {
                 Ok(()) => {
                     config::splice_key(&paths.global_config, "primaryApiKey", None, fence)?;
-                    return Ok(());
+                    return Ok(SecretStore::Keychain);
                 }
                 Err(e) => {
                     tracing::warn!("keychain write failed, storing primaryApiKey instead: {e}")
@@ -374,10 +377,11 @@ impl LiveStore {
             Some(&Value::String(key_str)),
             fence,
         )?;
-        if self.mac() {
-            self.remove_items(env, ItemKind::ManagedKey, fence)?;
+        if !self.mac() {
+            return Ok(SecretStore::File(paths.global_config.clone()));
         }
-        Ok(())
+        self.remove_items(env, ItemKind::ManagedKey, fence)?;
+        Ok(SecretStore::Fallback(paths.global_config.clone()))
     }
 
     /// Writing OAuth clears the managed key: every managed-key item is deleted (verified) and

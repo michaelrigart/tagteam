@@ -13,7 +13,7 @@ use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::AddTokenOptions;
 use tagteam_engine::store::NewAccount;
 use tagteam_engine::switch::{SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget};
-use tagteam_provider::{Keychain, Provider};
+use tagteam_provider::{Keychain, Provider, SecretStore};
 
 fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
     SwitchRequest {
@@ -473,12 +473,74 @@ fn api_key_accounts_move_the_auth_axis_both_ways() {
 }
 
 #[test]
-fn the_file_store_reports_itself_for_the_hint() {
+fn a_switch_reports_the_linux_file_as_its_only_store() {
     let fx = Fx::with_platform(tagteam_cc::live::Platform::Linux);
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
-    assert!(switch(&fx, to(&a), false).unwrap().file_store);
+    assert_eq!(
+        switch(&fx, to(&a), false).unwrap().stored_in,
+        Some(SecretStore::File(fx.paths().credentials_file))
+    );
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+}
+
+#[test]
+fn a_switch_reports_the_fallback_it_took_on_either_axis() {
+    // Appendix A.3: an OAuth write the Keychain refuses lands in the credentials file; an API
+    // key lands in `primaryApiKey` in the global config.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let key = fx.add_api_key(API_KEY);
+    let (oauth_item, _) = fx.live_item(ItemKind::OAuth);
+    let (key_item, _) = fx.live_item(ItemKind::ManagedKey);
+    assert_eq!(
+        switch(&fx, to(&a), false).unwrap().stored_in,
+        Some(SecretStore::Keychain)
+    );
+    fx.kc.set_fail_write(&oauth_item, true);
+    assert_eq!(
+        switch(&fx, to(&b), false).unwrap().stored_in,
+        Some(SecretStore::Fallback(fx.paths().credentials_file))
+    );
+    fx.kc.set_fail_write(&key_item, true);
+    assert_eq!(
+        switch(&fx, to(&key), false).unwrap().stored_in,
+        Some(SecretStore::Fallback(fx.paths().global_config))
+    );
+}
+
+#[test]
+fn a_file_pin_from_an_earlier_switch_never_mislabels_a_later_api_key_switch() {
+    // One process: the OAuth fallback pins the credential entry to the file for the rest of
+    // it, but an API key the Keychain then takes was stored in the Keychain, and says so.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let key = fx.add_api_key(API_KEY);
+    let (oauth_item, _) = fx.live_item(ItemKind::OAuth);
+    fx.kc.set_fail_write(&oauth_item, true);
+    assert_eq!(
+        switch(&fx, to(&a), false).unwrap().stored_in,
+        Some(SecretStore::Fallback(fx.paths().credentials_file))
+    );
+    fx.kc.set_fail_write(&oauth_item, false);
+    assert_eq!(
+        switch(&fx, to(&key), false).unwrap().stored_in,
+        Some(SecretStore::Keychain)
+    );
+    assert_eq!(fx.managed_key().as_deref(), Some(API_KEY.as_bytes()));
+}
+
+#[test]
+fn a_switch_that_writes_nothing_reports_no_store() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let outcome = switch(&fx, to(&a), false).unwrap();
+    assert_eq!(
+        (outcome.reason, outcome.stored_in),
+        (SwitchReason::AlreadyActive, None)
+    );
 }
 
 #[test]

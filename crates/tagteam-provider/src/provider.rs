@@ -147,6 +147,24 @@ pub trait Undo: Send {
     fn what(&self) -> String;
 }
 
+/// Where a credential write put the secret, as that one write decided it (Appendix A.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretStore {
+    /// The OS keychain.
+    Keychain,
+    /// A file that is the platform's only store for it (Linux).
+    File(PathBuf),
+    /// A file, because the keychain refused this write or an earlier one in this process.
+    Fallback(PathBuf),
+}
+
+/// What `Provider::write_credential` did: its undo, tied to the locks' borrow, and where the
+/// secret went.
+pub struct Written<'l> {
+    pub undo: Box<dyn Undo + 'l>,
+    pub stored_in: SecretStore,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("{0}")]
@@ -211,14 +229,14 @@ pub trait Provider: Send + Sync {
     /// Composes the target (§9.4 step 5), writes it on its axis, then clears the other axis
     /// (step 7). Refuses when an entry it would overwrite cannot be read fresh. The returned
     /// undo is tied to `locks`'s borrow (§9.4 step 10: the credential locks must be "held
-    /// throughout") and cannot outlive it.
+    /// throughout") and cannot outlive it; `stored_in` is where this write put the secret.
     fn write_credential<'l>(
         &self,
         env: &Env,
         locks: &'l LiveLocks<'_>,
         target: &StoredLogin,
         live: &LiveAuth,
-    ) -> Result<Box<dyn Undo + 'l>, ProviderError>;
+    ) -> Result<Written<'l>, ProviderError>;
     /// Clears the auth axis other than `kept_kind`'s (§9.6 finish-forward).
     fn clear_other_axis<'l>(
         &self,
@@ -233,8 +251,6 @@ pub trait Provider: Send + Sync {
         locks: &'l LiveLocks<'_>,
         identity: Option<&Identity>,
     ) -> Result<Box<dyn Undo + 'l>, ProviderError>;
-    /// For the post-switch hint (§9.4 "After unlocking").
-    fn uses_file_store(&self, env: &Env) -> bool;
 }
 
 #[cfg(test)]

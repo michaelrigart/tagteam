@@ -1645,13 +1645,16 @@ windows. Claude Code renders cswap's shape:
 An account command's result is `{schemaVersion, ok, account: row, created?}`; `remove`'s reports
 `active` as it was before the removal.
 
-**`switch`** returns `{schemaVersion, switched, from, to, strategy, reason, message, warnings}`.
+**`switch`** returns `{schemaVersion, provider, switched, from, to, strategy, reason, message,
+credentialStore, warnings}`.
 - `strategy` is `rotation | best | next-available | direct`.
 - `reason` is `switched | already-active | activated | unmanaged-account | only-one-account |
   usage-unavailable | already-best | candidates-exhausted | no-valid-target | session-owned |
   interrupted-switch | profile-conflict`. The last three are additive to cswap's set.
-- `credentialStore` (additive) is `keychain | file` once a credential was written, else `null`.
-  `file` on macOS means the Keychain write failed and fell back to the file (Appendix A.3).
+- `credentialStore` (additive) is where this switch's write stored the credential, as the
+  provider reported it: `keychain`; `file`, either the platform's only store (Linux) or a
+  fallback after the keychain refused the write (Appendix A.3); or `null` when it wrote none.
+  A fallback is also a warning on stderr that names the file.
 
 `doctor` and `history` have their own `--json` shapes, documented in `--help` and snapshot
 tested.

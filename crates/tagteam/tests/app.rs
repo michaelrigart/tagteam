@@ -1,6 +1,7 @@
 mod common;
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 
 use clap::Parser;
@@ -10,12 +11,10 @@ use tagteam::app::{self, Context, Io};
 use tagteam::cli::Cli;
 use tagteam::prompt::Prompter;
 use tagteam_cc::live::Platform;
-use tagteam_cc::{ItemKind, keychain_service};
+use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
 use tagteam_provider::{Env, FakeKeychain};
 
 const UNLOCK: &str = "The login keychain is locked (common over SSH). Unlock it now?";
-/// A switch on macOS whose Keychain write fell back to Claude Code's credentials file.
-const FELL_BACK: &str = "warning: the Keychain could not be written, so the credential went to Claude Code's credentials file instead\n";
 
 struct Scripted {
     interactive: bool,
@@ -134,6 +133,13 @@ impl H {
         let (code, out, err) = self.run(args, &mut Scripted::none());
         assert_eq!(code, 0, "{args:?}: {err}");
         out
+    }
+
+    /// A successful `--json` command's object, and its stderr.
+    fn switch_json(&self, args: &[&str]) -> (Value, String) {
+        let (code, out, err) = self.run(args, &mut Scripted::none());
+        assert_eq!(code, 0, "{args:?}: {err}");
+        (serde_json::from_str(&out).unwrap(), err)
     }
 
     fn json(&self, args: &[&str]) -> Value {
@@ -346,38 +352,81 @@ fn with_no_store_adding_from_a_switch_checks_the_keychain_first() {
     assert!(!h.env.data_dir().exists());
 }
 
+/// The stderr notice for a write the Keychain refused, which went to `path` instead.
+fn fell_back(path: &Path) -> String {
+    format!(
+        "warning: the Keychain refused the write, so the credential was stored in {} instead\n",
+        path.display()
+    )
+}
+
 #[test]
-fn a_keychain_write_that_falls_back_to_the_file_is_reported() {
-    // Appendix A.3: the credential went to Claude Code's credentials file instead.
+fn an_oauth_write_the_keychain_refuses_is_reported_where_it_went() {
+    // Appendix A.3: the credential falls back to Claude Code's credentials file.
     let h = H::new();
     h.login("a@x.co", "rt-a");
     h.ok(&["add"]);
     h.login("b@x.co", "rt-b");
     h.ok(&["add"]);
-    let live_item = keychain_service(&h.env, ItemKind::OAuth);
-    h.kc.set_fail_write(&live_item, true);
+    let oauth_item = keychain_service(&h.env, ItemKind::OAuth);
+    let notice = fell_back(&CcPaths::resolve(&h.env).credentials_file);
+    h.kc.set_fail_write(&oauth_item, true);
     let (code, out, err) = h.run(&["switch", "1"], &mut Scripted::none());
     assert_eq!(
         (code, out.as_str(), err.as_str()),
         (
             0,
             "Switched to a@x.co (position 1).\nActive on your next message.\n",
-            FELL_BACK
+            notice.as_str()
         )
     );
-    let (code, out, err) = h.run(&["switch", "2", "--json"], &mut Scripted::none());
-    assert_eq!((code, err.as_str()), (0, FELL_BACK));
-    let v: Value = serde_json::from_str(&out).unwrap();
+    let (v, err) = h.switch_json(&["switch", "2", "--json"]);
     assert_eq!(
-        (v["switched"].clone(), v["credentialStore"].clone()),
-        (json!(true), json!("file"))
+        (v["switched"].clone(), v["credentialStore"].clone(), err),
+        (json!(true), json!("file"), notice)
     );
     // Once the Keychain takes the write again, nothing is reported.
-    h.kc.set_fail_write(&live_item, false);
-    let (code, out, err) = h.run(&["switch", "1", "--json"], &mut Scripted::none());
-    assert_eq!((code, err.as_str()), (0, ""));
-    let v: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["credentialStore"], "keychain");
+    h.kc.set_fail_write(&oauth_item, false);
+    let (v, err) = h.switch_json(&["switch", "1", "--json"]);
+    assert_eq!(
+        (v["credentialStore"].clone(), err.as_str()),
+        (json!("keychain"), "")
+    );
+}
+
+#[test]
+fn an_api_key_write_the_keychain_refuses_is_reported_where_it_went() {
+    // Appendix A.3: the managed key falls back to `primaryApiKey` in the global config.
+    let h = H::with_login_and_key();
+    let key_item = keychain_service(&h.env, ItemKind::ManagedKey);
+    let config = CcPaths::resolve(&h.env).global_config;
+    h.kc.set_fail_write(&key_item, true);
+    let (v, err) = h.switch_json(&["switch", "2", "--json"]);
+    assert_eq!(
+        (v["switched"].clone(), v["credentialStore"].clone(), err),
+        (json!(true), json!("file"), fell_back(&config))
+    );
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("\"primaryApiKey\"")
+    );
+    assert_eq!(h.kc.get(&key_item, &keychain_account(&h.env)), None);
+    // Back to the OAuth login with a working Keychain: nothing to report.
+    h.kc.set_fail_write(&key_item, false);
+    let (v, err) = h.switch_json(&["switch", "1", "--json"]);
+    assert_eq!(
+        (v["credentialStore"].clone(), err.as_str()),
+        (json!("keychain"), "")
+    );
+    // And in human mode.
+    h.kc.set_fail_write(&key_item, true);
+    let (code, out, err) = h.run(&["switch", "2"], &mut Scripted::none());
+    assert_eq!((code, err), (0, fell_back(&config)));
+    assert!(
+        out.starts_with("Switched to api-key-2@token.local (position 2).\n"),
+        "{out}"
+    );
 }
 
 #[test]

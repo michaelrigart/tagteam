@@ -4,7 +4,7 @@ use tagteam_core::{
 };
 use tagteam_provider::{
     Credential, Identity, LiveAuth, LiveLocks, ProcessStamp, Provenance, Provider, ProviderError,
-    Read, ReadError, StoredLogin, Undo,
+    Read, ReadError, SecretStore, StoredLogin, Undo,
 };
 
 use crate::account_lock::AccountLock;
@@ -62,7 +62,8 @@ pub struct SwitchOutcome {
     pub reason: SwitchReason,
     pub message: String,
     pub warnings: Vec<String>,
-    pub file_store: bool,
+    /// Where this switch's credential write put the secret; `None` when it wrote none.
+    pub stored_in: Option<SecretStore>,
     pub unmanaged_email: Option<String>,
 }
 
@@ -108,7 +109,7 @@ fn noop(
         reason,
         message,
         warnings: vec![],
-        file_store: false,
+        stored_in: None,
         unmanaged_email,
     }
 }
@@ -254,16 +255,17 @@ struct Rollback<'a, 'g> {
 }
 
 impl<'a> Rollback<'a, '_> {
-    /// Runs one provider write and keeps its undo.
-    fn write(
+    /// Runs one provider write and keeps its undo, handing back what else the write reported.
+    fn write<T>(
         &mut self,
-        write: impl FnOnce() -> Result<Box<dyn Undo + 'a>, ProviderError>,
-    ) -> Result<(), ProviderError> {
+        write: impl FnOnce() -> Result<(Box<dyn Undo + 'a>, T), ProviderError>,
+    ) -> Result<T, ProviderError> {
         self.in_flight = true;
-        let undo = write();
+        let written = write();
         self.in_flight = false;
-        self.undos.push(undo?);
-        Ok(())
+        let (undo, value) = written?;
+        self.undos.push(undo);
+        Ok(value)
     }
 
     fn disarm(mut self) {
@@ -766,7 +768,7 @@ impl Engine {
             in_flight: false,
             armed: true,
         };
-        match self.apply(
+        let stored_in = match self.apply(
             p,
             &target,
             &target_login,
@@ -775,9 +777,12 @@ impl Engine {
             req,
             &mut tx,
         ) {
-            Ok(()) => tx.disarm(),
+            Ok(stored_in) => {
+                tx.disarm();
+                stored_in
+            }
             Err(cause) => return Err(tx.fail(cause)),
-        }
+        };
 
         let (reason, switched) = if plan.self_switch {
             (SwitchReason::Activated, true)
@@ -799,7 +804,7 @@ impl Engine {
             reason,
             message,
             warnings,
-            file_store: p.uses_file_store(&self.env),
+            stored_in: Some(stored_in),
             unmanaged_email: None,
         })
     }
@@ -963,12 +968,18 @@ impl Engine {
         outgoing: Option<&AccountRow>,
         req: &SwitchRequest,
         tx: &mut Rollback<'a, '_>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<SecretStore, EngineError> {
         let locks = tx.locks;
         hooks::point(self, "after-journal")?;
-        tx.write(|| p.write_credential(&self.env, locks, target_login, live))?;
+        let stored_in = tx.write(|| {
+            p.write_credential(&self.env, locks, target_login, live)
+                .map(|w| (w.undo, w.stored_in))
+        })?;
         hooks::point(self, "after-credential")?;
-        tx.write(|| p.write_identity(&self.env, locks, Some(&target_login.identity)))?;
+        tx.write(|| {
+            p.write_identity(&self.env, locks, Some(&target_login.identity))
+                .map(|undo| (undo, ()))
+        })?;
         hooks::point(self, "after-identity")?;
         tx.store.commit_switch(
             &req.provider,
@@ -991,6 +1002,6 @@ impl Engine {
                 detail: None,
             },
         )?;
-        Ok(())
+        Ok(stored_in)
     }
 }

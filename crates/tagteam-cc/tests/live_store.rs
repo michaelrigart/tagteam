@@ -8,7 +8,7 @@ use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{CcPaths, ItemKind, config, keychain_account, keychain_service, read_services};
 use tagteam_provider::{
     Env, FakeKeychain, Keychain, KeychainError, LiveLockSet, LiveLocks, LockError, LockState,
-    MutationGuard, Provenance, ProviderError, Read, Undo,
+    MutationGuard, Provenance, ProviderError, Read, SecretStore, Undo,
 };
 
 struct Fx {
@@ -294,9 +294,17 @@ fn a_lock_lost_before_publication_publishes_nothing() {
 fn linux_reads_and_writes_only_the_file() {
     let f = fx();
     let s = store(&f, Platform::Linux);
-    s.write_credential_entry(&f.env, &f.paths, b"{\"a\":1}", &open)
-        .unwrap();
+    assert_eq!(
+        s.write_credential_entry(&f.env, &f.paths, b"{\"a\":1}", &open)
+            .unwrap(),
+        SecretStore::File(f.paths.credentials_file.clone())
+    );
     assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"{\"a\":1}");
+    assert_eq!(
+        s.write_managed_key(&f.env, &f.paths, b"sk-ant-api03-linux", &open)
+            .unwrap(),
+        SecretStore::File(f.paths.global_config.clone())
+    );
     assert!(f.kc.items().is_empty());
     assert_eq!(
         s.read_credential(&f.env, &f.paths)
@@ -312,13 +320,20 @@ fn a_keychain_write_bumps_an_existing_file_but_never_creates_one() {
     let f = fx();
     let s = store(&f, Platform::MacOs);
     let (svc, acct) = oauth_svc(&f);
-    s.write_credential_entry(&f.env, &f.paths, b"v1", &open)
-        .unwrap();
+    assert_eq!(
+        s.write_credential_entry(&f.env, &f.paths, b"v1", &open)
+            .unwrap(),
+        SecretStore::Keychain
+    );
     assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"v1");
     assert!(!f.paths.credentials_file.exists());
     fs::write(&f.paths.credentials_file, "old").unwrap();
-    s.write_credential_entry(&f.env, &f.paths, b"v2", &open)
-        .unwrap();
+    // The file only mirrors the item, for hot reload: the Keychain is still where it went.
+    assert_eq!(
+        s.write_credential_entry(&f.env, &f.paths, b"v2", &open)
+            .unwrap(),
+        SecretStore::Keychain
+    );
     assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"v2");
 }
 
@@ -352,15 +367,23 @@ fn file_fallback_requires_the_shadowing_item_to_be_gone() {
             .is_err()
     );
     f.kc.set_fail_delete(&svc, false);
-    s.write_credential_entry(&f.env, &f.paths, b"new", &open)
-        .unwrap();
+    let fell_back = SecretStore::Fallback(f.paths.credentials_file.clone());
+    assert_eq!(
+        s.write_credential_entry(&f.env, &f.paths, b"new", &open)
+            .unwrap(),
+        fell_back
+    );
     assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"new");
     assert!(f.kc.get(&svc, &acct).is_none());
     assert!(s.file_mode_pinned());
-    // Pinned: the next write goes straight to the file, even with the Keychain healthy again.
+    // Pinned: the next write goes straight to the file, even with the Keychain healthy again,
+    // and says so.
     f.kc.set_fail_write(&svc, false);
-    s.write_credential_entry(&f.env, &f.paths, b"newer", &open)
-        .unwrap();
+    assert_eq!(
+        s.write_credential_entry(&f.env, &f.paths, b"newer", &open)
+            .unwrap(),
+        fell_back
+    );
     assert!(f.kc.get(&svc, &acct).is_none());
 }
 
@@ -422,7 +445,10 @@ fn managed_keys_record_approval_and_never_leave_a_shadowing_item() {
     fs::write(&f.paths.global_config, "{\n  \"userID\": \"u\"\n}\n").unwrap();
     let key = b"sk-ant-api03-0123456789abcdefghijKLMNOPQRST";
     let tail = "abcdefghijKLMNOPQRST";
-    s.write_managed_key(&f.env, &f.paths, key, &open).unwrap();
+    assert_eq!(
+        s.write_managed_key(&f.env, &f.paths, key, &open).unwrap(),
+        SecretStore::Keychain
+    );
     let managed = (
         keychain_service(&f.env, ItemKind::ManagedKey),
         keychain_account(&f.env),
@@ -445,7 +471,10 @@ fn managed_keys_record_approval_and_never_leave_a_shadowing_item() {
     // so the key CC will actually use is the new one.
     f.kc.set_fail_write(&managed.0, true);
     let other = b"sk-ant-api03-other-key-000000000000";
-    s.write_managed_key(&f.env, &f.paths, other, &open).unwrap();
+    assert_eq!(
+        s.write_managed_key(&f.env, &f.paths, other, &open).unwrap(),
+        SecretStore::Fallback(f.paths.global_config.clone())
+    );
     assert!(f.kc.get(&managed.0, &managed.1).is_none());
     assert_eq!(
         s.read_managed_key(&f.env, &f.paths).present().unwrap(),
