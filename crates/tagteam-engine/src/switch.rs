@@ -237,6 +237,20 @@ struct Locked {
     outgoing: Option<AccountRow>,
 }
 
+/// What `rederive` found under the locks.
+enum Rederived {
+    /// Nothing the plan rests on moved.
+    Go(Locked),
+    /// Something moved: plan again.
+    Replan,
+    /// Another process already did this command's work.
+    Done(SwitchOutcome),
+}
+
+fn already_active(target: &AccountRow) -> String {
+    format!("{} is already active", target.label)
+}
+
 /// §9.4 step 10: puts back what the switch wrote, in reverse order, then the journal row's
 /// `prior` if it carried one, or no row at all. It runs on an error, and through `Drop` on a
 /// panic; it is disarmed once the switch commits or has rolled back. It borrows the live
@@ -490,10 +504,7 @@ impl Engine {
                             == OracleVerdict::ThisAccount
                 });
             if !reconcile {
-                return Ok(done(
-                    SwitchReason::AlreadyActive,
-                    format!("{} is already active", target.label),
-                ));
+                return Ok(done(SwitchReason::AlreadyActive, already_active(&target)));
             }
         }
         Ok(Planned::Go(Plan {
@@ -576,10 +587,12 @@ impl Engine {
                 SwitchTarget::Account(_) => None,
             };
             let locks = p.lock_live(&self.env, &guard)?;
-            if let Some(locked) =
-                self.rederive(p, &store, &req, &plan, outgoing.as_ref(), rotation)?
-            {
-                return self.transact(p, &store, &plan, locked, &accounts, &locks, &req);
+            match self.rederive(p, &store, &req, &plan, outgoing.as_ref(), rotation)? {
+                Rederived::Go(locked) => {
+                    return self.transact(p, &store, &plan, locked, &accounts, &locks, &req);
+                }
+                Rederived::Done(outcome) => return Ok(outcome),
+                Rederived::Replan => {}
             }
             // `locks`, then `accounts`, are released here; the mutation lock is kept.
         }
@@ -587,8 +600,8 @@ impl Engine {
     }
 
     /// §9.4 step 1: the live account, the target and the self-switch decision, all re-read
-    /// under the locks. `None` when any of them moved, or the account locks held are no longer
-    /// the outgoing account's; planning again then reaches the right outcome.
+    /// under the locks. `Replan` when any of them moved, or the account locks held are no
+    /// longer the outgoing account's; planning again then reaches the right outcome.
     fn rederive(
         &self,
         p: &dyn Provider,
@@ -597,17 +610,30 @@ impl Engine {
         plan: &Plan,
         outgoing: Option<&AccountRow>,
         rotation: Option<Rotation>,
-    ) -> Result<Option<Locked>, EngineError> {
+    ) -> Result<Rederived, EngineError> {
         let (live_identity, again) = self.live_row(p, store, &req.provider)?;
         // A login that became unmanaged is §9.2's no-op; a target removed meanwhile is
         // replaced (rotation) or reported (direct).
         if live_identity.is_some() && again.is_none() && !req.force {
-            return Ok(None);
+            return Ok(Rederived::Replan);
         }
         let Some(target) = store.account(&plan.target.id)? else {
-            return Ok(None);
+            return Ok(Rederived::Replan);
         };
         let self_switch = again.as_ref().is_some_and(|r| r.id == target.id);
+        // Review Focus 3: another process landed exactly this rotation's target while this one
+        // waited for the mutation lock (a double-fired `switch`). That was this command's work;
+        // rotating on from there would switch twice. A direct target needs no such rule: planning
+        // again finds the self-switch no-op.
+        if matches!(req.target, SwitchTarget::Rotation) && self_switch && !plan.self_switch {
+            return Ok(Rederived::Done(noop(
+                plan.strategy,
+                SwitchReason::AlreadyActive,
+                already_active(&target),
+                again,
+                None,
+            )));
+        }
         // The whole rotation decision, recomputed from the current roster and anchor (§9.2,
         // §9.3), including the fewer-than-two case. Its anchor is `outgoing`, which is `again`
         // when anything proceeds.
@@ -623,11 +649,15 @@ impl Engine {
             && target.identity_key == plan.target.identity_key
             && self_switch == plan.self_switch
             && same_pick;
-        Ok(unchanged.then_some(Locked {
-            live_identity,
-            target,
-            outgoing: again,
-        }))
+        Ok(if unchanged {
+            Rederived::Go(Locked {
+                live_identity,
+                target,
+                outgoing: again,
+            })
+        } else {
+            Rederived::Replan
+        })
     }
 
     fn read_target(&self, target: &AccountRow) -> Result<Vec<u8>, EngineError> {

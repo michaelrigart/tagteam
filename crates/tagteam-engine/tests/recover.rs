@@ -10,6 +10,8 @@ use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
 use tagteam_engine::EngineError;
 use tagteam_engine::store::JournalRow;
+#[cfg(feature = "test-hooks")]
+use tagteam_engine::switch::SwitchReason;
 use tagteam_provider::{Keychain, ProcessStamp, Provider};
 
 fn any_mutation(fx: &Fx, id: &AccountId) {
@@ -474,5 +476,36 @@ fn two_engines_never_double_switch() {
         (email == "a@x.co" && rt == "rt-a") || (email == "b@x.co" && rt == "rt-b"),
         "{email} / {rt}"
     );
+    assert_journal_cleared(&fx);
+}
+
+/// Review Focus 3 for a double-fired bare `switch`, which the thread race above cannot pin: two
+/// direct targets are idempotent, but a rotation that re-planned from where the other one
+/// landed would move two accounts ahead. Driven through the `planned` point so the race is
+/// deterministic: the other process lands a→b while this one waits for the mutation lock.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_double_fired_rotation_switches_once() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c");
+    fx.switch_to(&a, false).unwrap(); // a live and active: a rotation plans b
+    let other = fx.engine_with_env(fx.env.clone());
+    let req = fx.rotation_request(false);
+    let first = req.clone();
+    fx.engine.on_point(
+        "planned",
+        Box::new(move || assert!(other.switch(first.clone()).unwrap().switched)),
+    );
+    let out = fx.engine.switch(req).unwrap();
+    assert_eq!(
+        (out.switched, out.reason),
+        (false, SwitchReason::AlreadyActive)
+    );
+    assert_eq!(out.from.map(|r| r.id), Some(b.clone()));
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+    assert_eq!(active(&fx), Some(b));
     assert_journal_cleared(&fx);
 }
