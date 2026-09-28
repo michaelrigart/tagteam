@@ -175,8 +175,22 @@ impl LiveStore {
     /// Keychain first, retried twice 300 ms apart; the file covers an absent item. A failed
     /// Keychain read covered by the file is `Degraded` (§4.3).
     pub fn read_credential(&self, env: &Env, paths: &CcPaths) -> Read<Credential> {
+        self.read_credential_and_shadowed(env, paths).0
+    }
+
+    /// `read_credential`, and the file when the Keychain item shadows it: CC never reads the
+    /// file then, but a Keychain write mirrors over it (hot reload), so it may hold a
+    /// generation no reader sees. `Absent` when the file is the entry itself or does not exist.
+    pub fn read_credential_and_shadowed(
+        &self,
+        env: &Env,
+        paths: &CcPaths,
+    ) -> (Read<Credential>, Read<Vec<u8>>) {
         if !self.mac() {
-            return read_bytes(&paths.credentials_file).map(Credential::fresh);
+            return (
+                read_bytes(&paths.credentials_file).map(Credential::fresh),
+                Read::Absent,
+            );
         }
         let services = read_services(env, ItemKind::OAuth);
         let acct = keychain_account(env);
@@ -189,12 +203,21 @@ impl LiveStore {
             kc = self.find_first(&services, &acct);
         }
         match kc {
-            Read::Present(b) => Read::Present(Credential::fresh(b)),
-            Read::Absent => read_bytes(&paths.credentials_file).map(Credential::fresh),
-            Read::Unreadable(e) => match read_bytes(&paths.credentials_file) {
-                Read::Present(b) => Read::Present(Credential::degraded(b)),
-                _ => Read::Unreadable(e),
-            },
+            Read::Present(b) => (
+                Read::Present(Credential::fresh(b)),
+                read_bytes(&paths.credentials_file),
+            ),
+            Read::Absent => (
+                read_bytes(&paths.credentials_file).map(Credential::fresh),
+                Read::Absent,
+            ),
+            Read::Unreadable(e) => (
+                match read_bytes(&paths.credentials_file) {
+                    Read::Present(b) => Read::Present(Credential::degraded(b)),
+                    _ => Read::Unreadable(e),
+                },
+                Read::Absent,
+            ),
         }
     }
 

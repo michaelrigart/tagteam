@@ -258,9 +258,11 @@ impl Provider for ClaudeCode {
 
     fn read_live_auth(&self, env: &Env) -> LiveAuth {
         let paths = CcPaths::resolve(env);
+        let (credential, shadowed) = self.live.read_credential_and_shadowed(env, &paths);
         LiveAuth {
-            credential: self.live.read_credential(env, &paths),
+            credential,
             managed_key: self.live.read_managed_key(env, &paths),
+            shadowed,
         }
     }
 

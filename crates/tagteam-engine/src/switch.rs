@@ -179,6 +179,21 @@ fn same_generation(p: &dyn Provider, a: &[u8], b: &[u8]) -> bool {
     a == b || (fp.is_some() && fp == p.fingerprint(b))
 }
 
+/// B.5: a failed displacement aborts the switch, except under --force, where it is a warning.
+fn unless_forced(
+    saved: Result<(), EngineError>,
+    force: bool,
+    warnings: &mut Vec<String>,
+) -> Result<(), EngineError> {
+    match saved {
+        Err(e) if force => {
+            warnings.push(format!("could not save the previous live credential: {e}"));
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// What a row says about a login, for noticing that it changed: a finished replacement
 /// (§12.5) keeps the ID but may change the kind or the identity.
 fn login_of(row: Option<&AccountRow>) -> Option<(&AccountId, &str, &str)> {
@@ -701,6 +716,10 @@ impl Engine {
         let target_identity = p.parse_identity(&target.identity_json)?;
         let live = p.read_live_auth(&self.env);
         refuse_unsafe_live_reads(&live)?;
+        // Step 3 holds for the entry the effective one shadows too, since step 7 overwrites it.
+        if let Read::Unreadable(e) = &live.shadowed {
+            return Err(EngineError::Unreadable(e.clone()));
+        }
 
         let mut warnings = Vec::new();
         let target_secret = match outgoing.as_ref().filter(|_| !req.force) {
@@ -723,12 +742,7 @@ impl Engine {
                             live_identity.as_ref(),
                             &mut warnings,
                         );
-                        // A failed displacement aborts, except under --force (step 2).
-                        match saved {
-                            Err(e) if req.force => warnings
-                                .push(format!("could not save the previous live credential: {e}")),
-                            other => other?,
-                        }
+                        unless_forced(saved, req.force, &mut warnings)?;
                     }
                 }
                 secret
@@ -761,6 +775,15 @@ impl Engine {
                 secret
             }
         };
+        let saved = self.displace_shadowed(
+            p,
+            provider,
+            &live,
+            &target_secret,
+            live_identity.as_ref(),
+            &mut warnings,
+        );
+        unless_forced(saved, req.force, &mut warnings)?;
 
         // Step 6.
         let from_secret = outgoing
@@ -994,6 +1017,40 @@ impl Engine {
             ),
             None => Ok(()),
         }
+    }
+
+    /// Step 7 overwrites the entry the effective credential shadows as well
+    /// (`LiveAuth::shadowed`), and nothing restores it once the switch commits. So a generation
+    /// there that is neither the effective credential's nor the target's is saved first, like
+    /// the off-axis rule ("never lose a secret"); one with nothing account-scoped in it is not
+    /// (`displace_live`).
+    fn displace_shadowed(
+        &self,
+        p: &dyn Provider,
+        provider: &ProviderId,
+        live: &LiveAuth,
+        target_secret: &[u8],
+        live_identity: Option<&Identity>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), EngineError> {
+        let Read::Present(bytes) = &live.shadowed else {
+            return Ok(());
+        };
+        let known = |other: &[u8]| same_generation(p, bytes, other);
+        if bytes.is_empty()
+            || known(target_secret)
+            || Axis::Entry.live_secret(live).is_some_and(|e| known(&e))
+        {
+            return Ok(());
+        }
+        self.displace_live(
+            p,
+            provider,
+            bytes,
+            "displaced-live-login",
+            live_identity,
+            warnings,
+        )
     }
 
     /// Steps 7–9, keeping an undo for each write.

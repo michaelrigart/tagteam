@@ -492,6 +492,52 @@ fn a_stray_oauth_login_is_displaced_before_an_api_key_switch_strips_it() {
 }
 
 #[test]
+fn a_credentials_file_the_keychain_shadows_is_displaced_before_the_mirror_overwrites_it() {
+    // §9.4 "never lose a secret": the Keychain holds the effective credential (b's), and
+    // `.credentials.json` a generation no vault holds. Activating a writes the Keychain and
+    // mirrors over the file (Appendix A.3's hot reload), so the file's generation is saved first.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let shadowed = Fx::credential_json("b@x.co", "rt-shadowed")
+        .to_string()
+        .into_bytes();
+    let file = fx.paths().credentials_file;
+    fs::write(&file, &shadowed).unwrap();
+    let out = switch(&fx, to(&a), false).unwrap();
+    assert_eq!(fx.displaced(), [shadowed]);
+    assert!(out.warnings.iter().any(|w| w.contains("displaced")));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    let mirrored: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    assert_eq!(
+        Some(mirrored),
+        fx.live_credential(),
+        "the target is live in both stores"
+    );
+    // The file now mirrors the effective credential: nothing more to save.
+    switch(&fx, to(&b), false).unwrap();
+    assert_eq!(displaced_files(&fx), 1);
+}
+
+#[test]
+fn an_unreadable_credentials_file_behind_the_keychain_aborts_before_anything_is_written() {
+    // §9.4 step 3: the mirror would overwrite a file tagteam could not read.
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let file = fx.paths().credentials_file;
+    fs::write(&file, b"{}").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    let err = switch(&fx, to(&a), false).unwrap_err();
+    assert_eq!(err.kind(), "unreadable", "{err}");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(fs::read(&file).unwrap(), b"{}");
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert!(common::journal(&fx).is_none());
+}
+
+#[test]
 fn an_other_axis_secret_the_target_holds_is_not_displaced() {
     let fx = Fx::new();
     fx.add("a@x.co", "rt-a");

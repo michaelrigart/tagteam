@@ -51,12 +51,17 @@ pub struct CapturedLogin {
 }
 
 /// Both auth axes, each tri-state: the credential entry and the managed API key. `Debug` is
-/// derived: `Read<T>`'s own `Debug` already redacts the payload of both fields, so a
+/// derived: `Read<T>`'s own `Debug` already redacts the payload of every field, so a
 /// hand-written impl here would only risk diverging from it.
 #[derive(Debug, Clone)]
 pub struct LiveAuth {
     pub credential: Read<Credential>,
     pub managed_key: Read<Vec<u8>>,
+    /// A second copy of the credential entry that no reader sees, because `credential`
+    /// shadows it, but that activating a target overwrites (CC on macOS: `.credentials.json`
+    /// behind the Keychain item, mirrored over for hot reload, Appendix A.3). `Absent` when
+    /// there is none.
+    pub shadowed: Read<Vec<u8>>,
 }
 
 /// The exact provider-owned state a switch may write (§3). Drives the pinned test (§15.3).
@@ -322,6 +327,7 @@ mod tests {
         let auth = LiveAuth {
             credential: Read::Present(Credential::fresh(SENTINEL.as_bytes().to_vec())),
             managed_key: Read::Present(SENTINEL.as_bytes().to_vec()),
+            shadowed: Read::Present(SENTINEL.as_bytes().to_vec()),
         };
         assert!(!format!("{auth:?}").contains("SENTINEL"));
     }

@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -130,6 +131,42 @@ fn an_api_key_target_moves_the_auth_axis() {
             .is_none()
     );
     assert_eq!(oauth_item(&f).unwrap()["pluginSecrets"], json!({"p": 1}));
+}
+
+#[test]
+fn the_credentials_file_is_shadowed_only_behind_a_keychain_item() {
+    // Appendix A.3: CC reads the Keychain first, so the file is a second copy only while an
+    // item answers; otherwise it is the entry itself.
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    let (svc, acct) = (
+        keychain_service(&f.env, ItemKind::OAuth),
+        keychain_account(&f.env),
+    );
+    fs::write(&paths.credentials_file, b"file").unwrap();
+    let live = f.cc.read_live_auth(&f.env);
+    assert!(matches!(live.shadowed, Read::Absent), "{live:?}");
+    assert_eq!(live.credential.present().unwrap().bytes(), b"file");
+    f.kc.put(&svc, &acct, b"item");
+    let live = f.cc.read_live_auth(&f.env);
+    assert_eq!(live.shadowed.present().as_deref(), Some(&b"file"[..]));
+    assert_eq!(live.credential.present().unwrap().bytes(), b"item");
+    // A file that cannot be read is reported as such, never as absent.
+    let mode = |m| fs::set_permissions(&paths.credentials_file, fs::Permissions::from_mode(m));
+    mode(0o000).unwrap();
+    assert!(matches!(
+        f.cc.read_live_auth(&f.env).shadowed,
+        Read::Unreadable(_)
+    ));
+    mode(0o600).unwrap();
+    fs::remove_file(&paths.credentials_file).unwrap();
+    assert!(matches!(f.cc.read_live_auth(&f.env).shadowed, Read::Absent));
+    let linux = ClaudeCode::with_store(LiveStore::new(f.kc.clone(), Platform::Linux));
+    fs::write(&paths.credentials_file, b"file").unwrap();
+    assert!(matches!(
+        linux.read_live_auth(&f.env).shadowed,
+        Read::Absent
+    ));
 }
 
 #[test]
