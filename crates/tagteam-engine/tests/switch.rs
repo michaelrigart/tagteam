@@ -13,6 +13,7 @@ use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::AddTokenOptions;
 use tagteam_engine::store::NewAccount;
 use tagteam_engine::switch::{SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget};
+use tagteam_engine::vault::SERVICE;
 use tagteam_provider::{Keychain, Provider, SecretStore};
 
 fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
@@ -321,6 +322,27 @@ fn rotation_skips_disabled_accounts_but_direct_targets_may_be_disabled() {
             .id,
         b
     );
+    assert_eq!(switch(&fx, to(&a), false).unwrap().to.unwrap().id, a);
+}
+
+#[test]
+fn an_unreadable_vault_is_reported_as_unreadable_never_as_missing() {
+    // §4.3: an unreadable vault item is not an absent one. A direct target says so, and a
+    // rotation neither skips the account nor calls the other one the only switchable account.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live: b
+    fx.kc.set_unreadable(SERVICE, a.as_str(), true);
+    for target in [SwitchTarget::Rotation, to(&a)] {
+        let err = switch(&fx, target.clone(), false).unwrap_err();
+        assert!(
+            matches!(err, EngineError::Unreadable(_)),
+            "{target:?}: {err}"
+        );
+        assert!(!err.to_string().contains("no stored credential"), "{err}");
+    }
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    fx.kc.set_unreadable(SERVICE, a.as_str(), false);
     assert_eq!(switch(&fx, to(&a), false).unwrap().to.unwrap().id, a);
 }
 

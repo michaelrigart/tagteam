@@ -349,14 +349,22 @@ impl Drop for Rollback<'_, '_> {
 }
 
 impl Engine {
-    fn has_login(&self, row: &AccountRow) -> bool {
-        row.identity_json.is_object()
-            && matches!(self.vault.read(&row.id), Read::Present(b) if !b.is_empty())
+    /// An identity and a non-empty vault credential. A vault that cannot be read is reported,
+    /// never taken for a missing credential (§4.3).
+    fn has_login(&self, row: &AccountRow) -> Result<bool, EngineError> {
+        if !row.identity_json.is_object() {
+            return Ok(false);
+        }
+        match self.vault.read(&row.id) {
+            Read::Present(b) => Ok(!b.is_empty()),
+            Read::Absent => Ok(false),
+            Read::Unreadable(e) => Err(EngineError::Unreadable(e)),
+        }
     }
 
     /// "Switchable": a vault credential and an identity, and not disabled (§9.3).
-    fn is_switchable(&self, row: &AccountRow) -> bool {
-        !row.disabled && self.has_login(row)
+    fn is_switchable(&self, row: &AccountRow) -> Result<bool, EngineError> {
+        Ok(!row.disabled && self.has_login(row)?)
     }
 
     fn matches_vault(&self, p: &dyn Provider, row: &AccountRow, live: &[u8]) -> bool {
@@ -400,10 +408,10 @@ impl Engine {
         live_row: Option<&AccountRow>,
     ) -> Result<Rotation, EngineError> {
         let accounts = store.accounts(provider)?;
-        let slots: Vec<(u32, bool)> = accounts
+        let slots = accounts
             .iter()
-            .map(|a| (a.position, self.is_switchable(a)))
-            .collect();
+            .map(|a| Ok((a.position, self.is_switchable(a)?)))
+            .collect::<Result<Vec<(u32, bool)>, EngineError>>()?;
         if live_row.is_some() && slots.iter().filter(|(_, s)| *s).count() < 2 {
             return Ok(Rotation::Stay(
                 SwitchReason::OnlyOneAccount,
@@ -480,7 +488,7 @@ impl Engine {
                 }
             }
         };
-        if !self.has_login(&target) {
+        if !self.has_login(&target)? {
             return Err(EngineError::InvalidInput(format!(
                 "{} cannot be activated: it has no stored credential; log in and run `tagteam add` again",
                 target.label
