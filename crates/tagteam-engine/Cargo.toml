@@ -23,6 +23,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+libc.workspace = true
 tagteam-cc.workspace = true
 tagteam-provider = { workspace = true, features = ["file-keychain"] }
 tempfile.workspace = true

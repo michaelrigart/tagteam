@@ -37,6 +37,15 @@ fn cc() -> ProviderId {
     ProviderId::new("claude-code")
 }
 
+/// Reads the on-disk journal mode through a fresh, independent connection, so the assertion
+/// reflects what was actually persisted rather than one `Store`'s in-memory view of it.
+fn journal_mode(path: &std::path::Path) -> String {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap()
+}
+
 #[test]
 fn opening_migrates_once_and_open_existing_never_creates() {
     let d = tempfile::tempdir().unwrap();
@@ -253,10 +262,7 @@ fn a_newer_schema_version_is_refused_and_the_database_is_untouched() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(version, 2);
-    let journal_mode: String = conn
-        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(journal_mode, "delete");
+    assert_eq!(journal_mode(&path), "delete");
     let tables: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
         .unwrap()
@@ -268,7 +274,30 @@ fn a_newer_schema_version_is_refused_and_the_database_is_untouched() {
 }
 
 #[test]
+fn every_open_path_leaves_the_store_in_wal_mode() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    // A fresh file migrates from the default journal mode and is switched to WAL right after.
+    let s = Store::open(&path).unwrap();
+    assert_eq!(journal_mode(&path), "wal");
+    drop(s);
+    // Reopening an already-migrated (v1) file still calls through to set WAL; a no-op there.
+    let s = Store::open(&path).unwrap();
+    assert_eq!(journal_mode(&path), "wal");
+    drop(s);
+    let s = Store::open_existing(&path).unwrap().unwrap();
+    assert_eq!(journal_mode(&path), "wal");
+    drop(s);
+}
+
+#[test]
 fn open_existing_reports_an_unreadable_store_instead_of_absent() {
+    // Root ignores permission bits, so chmod 0000 would not actually make the file unreadable
+    // and the assertion below would fail for a reason unrelated to what this test checks.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("t.db");
     Store::open(&path).unwrap();

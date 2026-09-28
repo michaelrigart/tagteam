@@ -801,6 +801,7 @@ name = "tagteam-engine"
 version = "0.1.0"
 dependencies = [
  "fastrand",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

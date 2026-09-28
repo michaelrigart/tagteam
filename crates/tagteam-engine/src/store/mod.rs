@@ -423,18 +423,20 @@ impl Store {
     /// Applies the embedded schema exactly once. A stored version newer than
     /// `SCHEMA_VERSION` is refused outright, before anything else runs against the
     /// connection — including switching it to WAL, which is why that pragma is set here and
-    /// not in `connect`: a file this build refuses must be left exactly as it was found.
-    /// Otherwise the whole check-and-apply runs in one `IMMEDIATE` transaction, re-reading the
-    /// version under the write lock it grants — both to guard against a concurrent racing
-    /// `CREATE TABLE` (§6.1), and, re-checked again, against a concurrent newer binary
-    /// upgrading the file between this function's first read and the moment it takes the lock.
+    /// not in `connect`: a file this build refuses must be left exactly as it was found. The
+    /// check-and-apply itself runs in one `IMMEDIATE` transaction, re-reading the version under
+    /// the write lock it grants — both to guard against a concurrent racing `CREATE TABLE`
+    /// (§6.1), and, re-checked again, against a concurrent newer binary upgrading the file
+    /// between this function's first read and the moment it takes the lock. WAL mode is set
+    /// only once every such check has passed and, when the schema was applied, only after that
+    /// transaction has committed — WAL can't be switched from inside a transaction, and a file
+    /// this build ends up refusing must never have been touched at all.
     fn migrate(&self) -> Result<(), StoreError> {
         let mut c = self.lock();
         let version = user_version(&c)?;
         if version > SCHEMA_VERSION {
             return Err(StoreError::UnsupportedSchema(version));
         }
-        set_wal_mode(&c)?;
         if version < SCHEMA_VERSION {
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let version = user_version(&tx)?;
@@ -447,6 +449,7 @@ impl Store {
             }
             tx.commit()?;
         }
+        set_wal_mode(&c)?;
         Ok(())
     }
 
