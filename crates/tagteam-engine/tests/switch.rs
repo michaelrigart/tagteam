@@ -5,7 +5,7 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Fx, mutation_lock_free};
+use common::{Fx, STRAY_API_KEY, mutation_lock_free};
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, ProviderId};
@@ -34,8 +34,6 @@ fn to(id: &AccountId) -> SwitchTarget {
 
 const API_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
 const OTHER_API_KEY: &str = "sk-ant-api03-zyxwvutsrqponmlkjihgfedcba";
-/// A managed key that no stored account holds.
-const STRAY_API_KEY: &str = "sk-ant-api03-stray-key-that-no-vault-holds";
 
 fn add_api_key(fx: &Fx, key: &str) -> AccountId {
     fx.engine
@@ -45,30 +43,8 @@ fn add_api_key(fx: &Fx, key: &str) -> AccountId {
         .id
 }
 
-fn put_managed_key(fx: &Fx, key: &[u8]) {
-    fx.kc.put(
-        &keychain_service(&fx.env, ItemKind::ManagedKey),
-        &keychain_account(&fx.env),
-        key,
-    );
-}
-
-fn managed_key(fx: &Fx) -> Option<Vec<u8>> {
-    fx.kc.get(
-        &keychain_service(&fx.env, ItemKind::ManagedKey),
-        &keychain_account(&fx.env),
-    )
-}
-
-/// The contents of every file in `displaced/`.
-fn displaced(fx: &Fx) -> Vec<Vec<u8>> {
-    fs::read_dir(fx.env.data_dir().join("displaced"))
-        .map(|d| d.map(|e| fs::read(e.unwrap().path()).unwrap()).collect())
-        .unwrap_or_default()
-}
-
 fn displaced_files(fx: &Fx) -> usize {
-    displaced(fx).len()
+    fx.displaced().len()
 }
 
 /// A new machine: no `oauthAccount`, no credential, no active account.
@@ -357,7 +333,11 @@ fn assert_an_empty_read(result: Result<SwitchOutcome, EngineError>) {
 /// nor cleared.
 fn assert_an_empty_managed_key_aborts(fx: &Fx, result: Result<SwitchOutcome, EngineError>) {
     assert_an_empty_read(result);
-    assert_eq!(managed_key(fx).as_deref(), Some(&b""[..]), "left untouched");
+    assert_eq!(
+        fx.managed_key().as_deref(),
+        Some(&b""[..]),
+        "left untouched"
+    );
     assert_eq!(displaced_files(fx), 0);
 }
 
@@ -385,7 +365,7 @@ fn an_empty_managed_key_is_never_captured_over_an_api_key() {
     let a = fx.add("a@x.co", "rt-a");
     let k = add_api_key(&fx, API_KEY);
     switch(&fx, to(&k), false).unwrap();
-    put_managed_key(&fx, b"");
+    fx.put_managed_key(b"");
     assert_an_empty_managed_key_aborts(&fx, switch(&fx, to(&a), false));
     assert_eq!(fx.vault_bytes(&k).as_deref(), Some(API_KEY.as_bytes()));
 }
@@ -396,7 +376,7 @@ fn an_empty_managed_key_aborts_a_forced_switch() {
     let a = fx.add("a@x.co", "rt-a");
     let k = add_api_key(&fx, API_KEY);
     switch(&fx, to(&k), false).unwrap();
-    put_managed_key(&fx, b"");
+    fx.put_managed_key(b"");
     assert_an_empty_managed_key_aborts(&fx, switch(&fx, to(&a), true));
     assert_eq!(fx.live_email().as_deref(), Some("api-key-2@token.local"));
 }
@@ -407,7 +387,7 @@ fn an_empty_managed_key_aborts_a_switch_on_a_fresh_machine() {
     fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
     make_fresh_machine(&fx);
-    put_managed_key(&fx, b"");
+    fx.put_managed_key(b"");
     assert_an_empty_managed_key_aborts(&fx, switch(&fx, SwitchTarget::Rotation, false));
     assert_eq!(fx.live_email(), None);
 }
@@ -419,12 +399,12 @@ fn a_stray_managed_key_is_displaced_before_an_oauth_switch_clears_it() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
-    put_managed_key(&fx, STRAY_API_KEY.as_bytes());
+    fx.put_managed_key(STRAY_API_KEY.as_bytes());
     let out = switch(&fx, to(&a), false).unwrap();
-    assert_eq!(displaced(&fx), [STRAY_API_KEY.as_bytes()]);
+    assert_eq!(fx.displaced(), [STRAY_API_KEY.as_bytes()]);
     assert!(out.warnings.iter().any(|w| w.contains("displaced")));
     assert_eq!(
-        managed_key(&fx),
+        fx.managed_key(),
         None,
         "then cleared, as writing OAuth does"
     );
@@ -443,7 +423,7 @@ fn a_stray_oauth_login_is_displaced_before_an_api_key_switch_strips_it() {
         .into_bytes();
     fx.set_live_credential(&stray);
     switch(&fx, to(&k2), false).unwrap();
-    assert_eq!(displaced(&fx), [stray]);
+    assert_eq!(fx.displaced(), [stray]);
     assert_eq!(
         fx.live_credential().unwrap(),
         json!({"mcpOAuth": {"srv": {"token": "machine-shared"}}}),
@@ -456,7 +436,7 @@ fn an_other_axis_secret_the_target_holds_is_not_displaced() {
     let fx = Fx::new();
     fx.add("a@x.co", "rt-a");
     let k = add_api_key(&fx, API_KEY);
-    put_managed_key(&fx, API_KEY.as_bytes()); // k's key, left live under a's OAuth login
+    fx.put_managed_key(API_KEY.as_bytes()); // k's key, left live under a's OAuth login
     switch(&fx, to(&k), false).unwrap();
     assert_eq!(displaced_files(&fx), 0);
 }
@@ -472,7 +452,7 @@ fn forcing_never_displaces_an_entry_with_only_machine_shared_keys() {
     assert_eq!(displaced_files(&fx), 0, "a forced self-switch");
     switch(&fx, to(&a), true).unwrap();
     assert_eq!(
-        displaced(&fx),
+        fx.displaced(),
         [API_KEY.as_bytes()],
         "forcing away from an API-key account saves its key, not the entry"
     );

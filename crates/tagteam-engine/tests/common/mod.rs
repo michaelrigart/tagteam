@@ -13,8 +13,9 @@ use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::store::LoginMeta;
+use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
-use tagteam_engine::{Engine, EngineConfig};
+use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::splice::replace_top_level;
 use tagteam_provider::{
     Credential, Env, FakeClock, FakeKeychain, Identity, MutationGuard, Provider, Read,
@@ -51,6 +52,9 @@ pub const CLAUDE_JSON: &str = r#"{
   "someFutureKey": { "n": 1e400 }
 }
 "#;
+
+/// A managed key that no stored account holds.
+pub const STRAY_API_KEY: &str = "sk-ant-api03-stray-key-that-no-vault-holds";
 
 /// Sets one top-level key of the config at `path`, changing nothing else. A free function, so
 /// a `'static` race callback can call it without borrowing the fixture.
@@ -216,6 +220,45 @@ impl Fx {
             ),
             Platform::Linux => fs::write(self.paths().credentials_file, bytes).unwrap(),
         }
+    }
+
+    /// The (service, account) of the live Keychain item of `kind` that CC writes.
+    pub fn live_item(&self, kind: ItemKind) -> (String, String) {
+        (
+            keychain_service(&self.env, kind),
+            keychain_account(&self.env),
+        )
+    }
+
+    pub fn put_managed_key(&self, key: &[u8]) {
+        let (svc, acct) = self.live_item(ItemKind::ManagedKey);
+        self.kc.put(&svc, &acct, key);
+    }
+
+    pub fn managed_key(&self) -> Option<Vec<u8>> {
+        let (svc, acct) = self.live_item(ItemKind::ManagedKey);
+        self.kc.get(&svc, &acct)
+    }
+
+    /// The contents of every file in `displaced/`.
+    pub fn displaced(&self) -> Vec<Vec<u8>> {
+        fs::read_dir(self.env.data_dir().join("displaced"))
+            .map(|d| d.map(|e| fs::read(e.unwrap().path()).unwrap()).collect())
+            .unwrap_or_default()
+    }
+
+    /// A manual `switch <id>` from the CLI, optionally forced.
+    pub fn switch_request(&self, id: &AccountId, force: bool) -> SwitchRequest {
+        SwitchRequest {
+            provider: self.provider(),
+            target: SwitchTarget::Account(id.clone()),
+            force,
+            source: "cli",
+        }
+    }
+
+    pub fn switch_to(&self, id: &AccountId, force: bool) -> Result<SwitchOutcome, EngineError> {
+        self.engine.switch(self.switch_request(id, force))
     }
 
     pub fn live_credential(&self) -> Option<Value> {

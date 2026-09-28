@@ -123,6 +123,8 @@ fn metadata_commands_proceed_through_an_interrupted_switch_but_remove_refuses() 
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     let b = fx.add("b@x.co", "rt-b");
+    // Undecidable (§9.6): no live secret is `to_fp`, and it names no outgoing account, so the
+    // recovery each command runs under the mutation lock keeps it.
     let journal = JournalRow {
         provider: fx.provider(),
         holder: ProcessStamp {
@@ -148,6 +150,11 @@ fn metadata_commands_proceed_through_an_interrupted_switch_but_remove_refuses() 
     assert!(fx.engine.set_disabled(&a, true).unwrap().disabled);
     assert!(!fx.engine.set_disabled(&a, false).unwrap().disabled);
     assert_eq!(fx.engine.move_to(&a, 2).unwrap().position, 2);
+    assert_eq!(
+        fx.engine.store().unwrap().journal(&fx.provider()).unwrap(),
+        Some(journal),
+        "they proceeded through the interrupted switch, not after it was settled"
+    );
 }
 
 #[test]

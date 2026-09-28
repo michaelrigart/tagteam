@@ -7,6 +7,7 @@ pub mod error;
 mod hooks;
 pub mod lifecycle;
 pub mod oracle;
+mod recover;
 mod refs;
 pub mod registry;
 pub mod store;

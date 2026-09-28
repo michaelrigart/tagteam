@@ -116,13 +116,15 @@ fn noop(
 /// The two auth axes a live login can be on (§9.4 step 7): the credential entry, or the
 /// managed API key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Axis {
+pub(crate) enum Axis {
     Entry,
     ManagedKey,
 }
 
 impl Axis {
-    fn of(kind: &str) -> Self {
+    pub(crate) const BOTH: [Axis; 2] = [Axis::Entry, Axis::ManagedKey];
+
+    pub(crate) fn of(kind: &str) -> Self {
         if kind == KIND_API_KEY {
             Axis::ManagedKey
         } else {
@@ -130,7 +132,7 @@ impl Axis {
         }
     }
 
-    fn other(self) -> Self {
+    pub(crate) fn other(self) -> Self {
         match self {
             Axis::Entry => Axis::ManagedKey,
             Axis::ManagedKey => Axis::Entry,
@@ -138,7 +140,7 @@ impl Axis {
     }
 
     /// The live secret on this axis. A degraded read is not a secret to act on (§4.3).
-    fn live_secret(self, auth: &LiveAuth) -> Option<Vec<u8>> {
+    pub(crate) fn live_secret(self, auth: &LiveAuth) -> Option<Vec<u8>> {
         match self {
             Axis::ManagedKey => auth.managed_key.as_ref().present().cloned(),
             Axis::Entry => auth
@@ -154,7 +156,7 @@ impl Axis {
 /// §9.4 step 3, with or without --force: what could not be read fresh is never overwritten,
 /// on either axis. An empty value is never backed up, because a Keychain timeout can look
 /// empty; a degraded entry may hide a newer generation.
-fn refuse_unsafe_live_reads(live: &LiveAuth) -> Result<(), EngineError> {
+pub(crate) fn refuse_unsafe_live_reads(live: &LiveAuth) -> Result<(), EngineError> {
     match &live.credential {
         Read::Unreadable(e) => return Err(EngineError::Unreadable(e.clone())),
         Read::Present(c) if c.provenance() == Provenance::Degraded => {
@@ -185,13 +187,13 @@ fn login_of(row: Option<&AccountRow>) -> Option<(&AccountId, &str, &str)> {
 /// The pre-lock oracle answer (§9.4 "Before locking"). It is about exact live bytes, not
 /// about an account: it counts only while the live secret is still those bytes (§9.4 step 4),
 /// and is attributed to an account only through `verdict` (§7.6).
-struct OracleHint {
-    bytes: Vec<u8>,
-    resolved: Option<Identity>,
+pub(crate) struct OracleHint {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) resolved: Option<Identity>,
 }
 
 /// The oracle's answer about `bytes`, if it was asked about exactly these bytes.
-fn answer_for<'h>(hint: Option<&'h OracleHint>, bytes: &[u8]) -> Option<&'h Identity> {
+pub(crate) fn answer_for<'h>(hint: Option<&'h OracleHint>, bytes: &[u8]) -> Option<&'h Identity> {
     hint.filter(|h| h.bytes == bytes)
         .and_then(|h| h.resolved.as_ref())
 }
@@ -670,7 +672,7 @@ impl Engine {
                 } else {
                     "displaced-live-login"
                 };
-                for axis in [Axis::Entry, Axis::ManagedKey] {
+                for axis in Axis::BOTH {
                     if let Some(bytes) = axis.live_secret(&live).filter(|b| *b != secret) {
                         let saved = self.displace_live(
                             p,
@@ -705,23 +707,16 @@ impl Engine {
                 // generation into this very account, and that is the one to activate.
                 let secret = self.read_target(&target)?;
                 // Step 7 clears or overwrites the axis the outgoing account is not on, which
-                // step 4 never classified: a secret there that the target does not hold is
-                // saved first.
-                if let Some(bytes) = Axis::of(&out.kind)
-                    .other()
-                    .live_secret(&live)
-                    .filter(|b| !same_generation(p, b, &secret))
-                {
-                    // Never forced here, so a failed displacement always aborts.
-                    self.displace_live(
-                        p,
-                        provider,
-                        &bytes,
-                        "displaced-live-login",
-                        live_identity.as_ref(),
-                        &mut warnings,
-                    )?;
-                }
+                // step 4 never classified. Never forced here, so a failed displacement aborts.
+                self.displace_unless_target(
+                    p,
+                    provider,
+                    Axis::of(&out.kind).other(),
+                    &live,
+                    &secret,
+                    live_identity.as_ref(),
+                    &mut warnings,
+                )?;
                 secret
             }
         };
@@ -924,6 +919,37 @@ impl Engine {
             "the previous live credential was saved as displaced/{id}"
         ));
         Ok(())
+    }
+
+    /// §9.4 step 7's off-axis rule: an account-scoped secret live on `axis`, which is about to
+    /// be cleared or overwritten, is saved first unless it is the target's generation
+    /// (`target_secret`). Shared by the switch and by §9.6 recovery finishing forward, so a
+    /// stray secret written between the journal row and a crash is never lost either way.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn displace_unless_target(
+        &self,
+        p: &dyn Provider,
+        provider: &ProviderId,
+        axis: Axis,
+        live: &LiveAuth,
+        target_secret: &[u8],
+        live_identity: Option<&Identity>,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), EngineError> {
+        match axis
+            .live_secret(live)
+            .filter(|b| !same_generation(p, b, target_secret))
+        {
+            Some(bytes) => self.displace_live(
+                p,
+                provider,
+                &bytes,
+                "displaced-live-login",
+                live_identity,
+                warnings,
+            ),
+            None => Ok(()),
+        }
     }
 
     /// Steps 7–9, keeping an undo for each write.

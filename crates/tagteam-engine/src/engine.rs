@@ -6,6 +6,7 @@ use tagteam_provider::{Clock, Env, MutationGuard, Provider, Read};
 
 use crate::account_lock::AccountLock;
 use crate::error::EngineError;
+use crate::hooks;
 use crate::oracle::Oracle;
 use crate::registry::ProviderRegistry;
 use crate::store::Store;
@@ -125,7 +126,7 @@ impl Engine {
     }
 
     /// Run before any planning or validation: if an interrupted switch is on record, take the
-    /// mutation lock once (which recovers what it can, Task 21), then refuse if it is still
+    /// mutation lock once (which recovers what it can, §9.6), then refuse if it is still
     /// unresolved. Creates nothing when there is no store.
     ///
     /// The final check runs while the guard from this same call is still held, and only then
@@ -149,9 +150,31 @@ impl Engine {
         Ok(())
     }
 
-    /// tagteam's mutation lock. Task 21 adds interrupted-switch recovery here.
+    /// tagteam's mutation lock. Before returning it, recovers every interrupted switch whose
+    /// holder has died (§9.6). The oracle is asked before the lock is taken (§7.6).
     pub fn mutation_guard(&self) -> Result<MutationGuard, EngineError> {
-        Ok(MutationGuard::acquire(&self.env, MutationGuard::TIMEOUT)?)
+        let hints: Vec<_> = self
+            .dead_journals()?
+            .into_iter()
+            .map(|row| {
+                let hint = self.recovery_hints(&row);
+                (row, hint)
+            })
+            .collect();
+        hooks::point(self, "before-mutation-lock")?;
+        let guard = MutationGuard::acquire(&self.env, MutationGuard::TIMEOUT)?;
+        // Enumerated again under the lock: a switch may have died while this command waited,
+        // and its row is recovered now too, without a hint.
+        for row in self.dead_journals()? {
+            let hint = hints
+                .iter()
+                .find(|(r, _)| *r == row)
+                .map_or(&[][..], |(_, h)| h.as_slice());
+            if let Err(e) = self.recover_one(&guard, &row, hint) {
+                tracing::warn!(provider = %row.provider, "could not recover an interrupted switch: {e}");
+            }
+        }
+        Ok(guard)
     }
 
     /// Takes the account lock, then reconciles a pending explicit replacement (§12.5): the
@@ -256,13 +279,12 @@ mod tests {
             .unwrap();
     }
 
-    fn stale_journal(provider: &ProviderId, to_id: &AccountId) -> JournalRow {
+    /// A row recovery leaves alone (§9.6): its holder, this process, is still live. That keeps
+    /// the refusal below about the row itself, not about whether recovery could decide it.
+    fn unresolved_journal(provider: &ProviderId, to_id: &AccountId) -> JournalRow {
         JournalRow {
             provider: provider.clone(),
-            holder: ProcessStamp {
-                pid: 999_999,
-                start: 0,
-            },
+            holder: ProcessStamp::current().unwrap(),
             from_id: None,
             to_id: to_id.clone(),
             from_fp: None,
@@ -291,7 +313,7 @@ mod tests {
         engine
             .store()
             .unwrap()
-            .insert_journal(&stale_journal(&provider, &to_id))
+            .insert_journal(&unresolved_journal(&provider, &to_id))
             .unwrap();
         assert!(matches!(
             engine.settle_or_refuse(&provider),
