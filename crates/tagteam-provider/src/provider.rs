@@ -51,21 +51,12 @@ pub struct CapturedLogin {
 }
 
 /// Both auth axes, each tri-state: the credential entry and the managed API key. `Debug` is
-/// derived: `Read<T>`'s own `Debug` already redacts the payload of every field, so a
+/// derived: `Read<T>`'s own `Debug` already redacts the payload of both fields, so a
 /// hand-written impl here would only risk diverging from it.
 #[derive(Debug, Clone)]
 pub struct LiveAuth {
     pub credential: Read<Credential>,
     pub managed_key: Read<Vec<u8>>,
-    /// A second copy of the credential entry that no reader sees, because `credential`
-    /// shadows it, but that activating a target overwrites (CC on macOS: `.credentials.json`
-    /// behind the Keychain item, mirrored over for hot reload, Appendix A.3). `Absent` when
-    /// there is none.
-    pub shadowed: Read<Vec<u8>>,
-    /// The further copies of the credential entry that readers fall back to, which activating
-    /// an API key clears along with the entry (CC on macOS: the fallback Keychain items,
-    /// Appendix A.2). One of them may be the entry `credential` read. Empty when none exist.
-    pub secondary: Vec<Read<Vec<u8>>>,
 }
 
 /// A change to the live login that destroys what it replaces (§9.4 step 7).
@@ -362,8 +353,6 @@ mod tests {
         let auth = LiveAuth {
             credential: Read::Present(Credential::fresh(SENTINEL.as_bytes().to_vec())),
             managed_key: Read::Present(SENTINEL.as_bytes().to_vec()),
-            shadowed: Read::Present(SENTINEL.as_bytes().to_vec()),
-            secondary: vec![Read::Present(SENTINEL.as_bytes().to_vec())],
         };
         assert!(!format!("{auth:?}").contains("SENTINEL"));
         let doomed = DoomedEntry {

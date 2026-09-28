@@ -60,8 +60,12 @@ pub const CLAUDE_JSON: &str = r#"{
 pub const API_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
 /// A managed key that no stored account holds.
 pub const STRAY_API_KEY: &str = "sk-ant-api03-stray-key-that-no-vault-holds";
+/// A second API key no stored account starts with.
+pub const OTHER_API_KEY: &str = "sk-ant-api03-zyxwvutsrqponmlkjihgfedcba";
 /// The unsuffixed OAuth item readers fall back to under `Fx::with_fallback_items`.
 pub const FALLBACK_ITEM: &str = "Claude Code-credentials";
+/// The unsuffixed managed-key item readers fall back to under `Fx::with_fallback_items`.
+pub const FALLBACK_MANAGED_ITEM: &str = "Claude Code";
 
 /// Sets one top-level key of the config at `path`, changing nothing else. A free function, so
 /// a `'static` race callback can call it without borrowing the fixture.
@@ -198,6 +202,16 @@ impl Fx {
     pub fn fallback_item(&self) -> Option<Value> {
         let bytes = self.kc.get(FALLBACK_ITEM, &keychain_account(&self.env))?;
         serde_json::from_slice(&bytes).ok()
+    }
+
+    pub fn put_fallback_managed_item(&self, key: &[u8]) {
+        self.kc
+            .put(FALLBACK_MANAGED_ITEM, &keychain_account(&self.env), key);
+    }
+
+    pub fn fallback_managed_item(&self) -> Option<Vec<u8>> {
+        self.kc
+            .get(FALLBACK_MANAGED_ITEM, &keychain_account(&self.env))
     }
 
     /// A macOS fixture whose provider waits only `timeout` for CC's locks, so a held CC lock

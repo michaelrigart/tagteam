@@ -213,56 +213,19 @@ impl LiveStore {
     /// Keychain first, retried twice 300 ms apart; the file covers an absent item. A failed
     /// Keychain read covered by the file is `Degraded` (§4.3).
     pub fn read_credential(&self, env: &Env, paths: &CcPaths) -> Read<Credential> {
-        self.read_credential_and_shadowed(env, paths).0
-    }
-
-    /// `read_credential`, and the file when the Keychain item shadows it: CC never reads the
-    /// file then, but a Keychain write mirrors over it (hot reload), so it may hold a
-    /// generation no reader sees. `Absent` when the file is the entry itself or does not exist.
-    pub fn read_credential_and_shadowed(
-        &self,
-        env: &Env,
-        paths: &CcPaths,
-    ) -> (Read<Credential>, Read<Vec<u8>>) {
         if !self.mac() {
-            return (
-                read_bytes(&paths.credentials_file).map(Credential::fresh),
-                Read::Absent,
-            );
+            return read_bytes(&paths.credentials_file).map(Credential::fresh);
         }
         let services = read_services(env, ItemKind::OAuth);
         let acct = keychain_account(env);
         match self.retrying(|| self.find_first(&services, &acct)) {
-            Read::Present(b) => (
-                Read::Present(Credential::fresh(b)),
-                read_bytes(&paths.credentials_file),
-            ),
-            Read::Absent => (
-                read_bytes(&paths.credentials_file).map(Credential::fresh),
-                Read::Absent,
-            ),
-            Read::Unreadable(e) => (
-                match read_bytes(&paths.credentials_file) {
-                    Read::Present(b) => Read::Present(Credential::degraded(b)),
-                    _ => Read::Unreadable(e),
-                },
-                Read::Absent,
-            ),
+            Read::Present(b) => Read::Present(Credential::fresh(b)),
+            Read::Absent => read_bytes(&paths.credentials_file).map(Credential::fresh),
+            Read::Unreadable(e) => match read_bytes(&paths.credentials_file) {
+                Read::Present(b) => Read::Present(Credential::degraded(b)),
+                _ => Read::Unreadable(e),
+            },
         }
-    }
-
-    /// Every fallback OAuth item a reader tries after the primary one (Appendix A.2): clearing
-    /// the entry for an API key strips them all. Empty off macOS, and when no fallback exists.
-    pub fn read_secondary_items(&self, env: &Env) -> Vec<Read<Vec<u8>>> {
-        if !self.mac() {
-            return vec![];
-        }
-        let acct = keychain_account(env);
-        read_services(env, ItemKind::OAuth)
-            .iter()
-            .skip(1)
-            .map(|svc| self.keychain.find(svc, &acct))
-            .collect()
     }
 
     /// The Keychain item first; then `primaryApiKey` in the config. An empty item stays

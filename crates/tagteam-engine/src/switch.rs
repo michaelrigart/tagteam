@@ -3,8 +3,9 @@ use tagteam_core::{
     decide_outgoing, next_in_rotation,
 };
 use tagteam_provider::{
-    Credential, Identity, LiveAuth, LiveLocks, ProcessStamp, Provenance, Provider, ProviderError,
-    Read, ReadError, SecretStore, StoredLogin, Undo,
+    BeforeFallback, Credential, DoomedEntry, Identity, LiveAuth, LiveChange, LiveLocks,
+    ProcessStamp, Provenance, Provider, ProviderError, Read, ReadError, SecretStore, StoredLogin,
+    Undo,
 };
 
 use crate::account_lock::AccountLock;
@@ -179,19 +180,39 @@ fn same_generation(p: &dyn Provider, a: &[u8], b: &[u8]) -> bool {
     a == b || (fp.is_some() && fp == p.fingerprint(b))
 }
 
-/// The copies of the credential entry that no reader sees but that writing a `kind` account
-/// over the entry overwrites or clears (§9.4 step 7): the shadowed copy always (mirrored over
-/// for OAuth, stripped for an API key), and the fallback copies only when an API key strips
-/// the entry.
-pub(crate) fn hidden_copies<'l>(
-    live: &'l LiveAuth,
-    kind: &str,
-) -> impl Iterator<Item = &'l Read<Vec<u8>>> {
-    let secondary: &[Read<Vec<u8>>] = match Axis::of(kind) {
-        Axis::ManagedKey => &live.secondary,
-        Axis::Entry => &[],
-    };
-    std::iter::once(&live.shadowed).chain(secondary)
+/// Generations already kept somewhere, by fingerprint (§9.4 step 7): destroying a live entry
+/// of one loses nothing. An entry with no fingerprint holds nothing account-scoped to lose.
+#[derive(Default)]
+pub(crate) struct Held(Vec<String>);
+
+impl Held {
+    /// Records `fp`; false when it was already held.
+    pub(crate) fn insert(&mut self, fp: &str) -> bool {
+        if self.0.iter().any(|h| h == fp) {
+            return false;
+        }
+        self.0.push(fp.to_owned());
+        true
+    }
+
+    /// Records the generation of `secret`, if it has one.
+    pub(crate) fn hold(&mut self, p: &dyn Provider, secret: &[u8]) {
+        if let Some(fp) = p.fingerprint(secret) {
+            self.insert(fp.as_str());
+        }
+    }
+}
+
+/// §9.4 step 3, for every entry a change destroys: one that could not be read is never
+/// overwritten or deleted, with or without --force.
+pub(crate) fn refuse_unreadable(doomed: &[DoomedEntry]) -> Result<(), EngineError> {
+    match doomed.iter().find_map(|d| match &d.bytes {
+        Read::Unreadable(e) => Some(e),
+        _ => None,
+    }) {
+        Some(e) => Err(EngineError::Unreadable(e.clone())),
+        None => Ok(()),
+    }
 }
 
 /// B.5: a failed displacement aborts the switch, except under --force, where it is a warning.
@@ -736,15 +757,12 @@ impl Engine {
         let target_identity = p.parse_identity(&target.identity_json)?;
         let live = p.read_live_auth(&self.env);
         refuse_unsafe_live_reads(&live)?;
-        // Step 3 holds for the copies of the entry no reader sees too: step 7 may overwrite or
-        // clear them, and its snapshot reads every one of them.
-        for copy in std::iter::once(&live.shadowed).chain(&live.secondary) {
-            if let Read::Unreadable(e) = copy {
-                return Err(EngineError::Unreadable(e.clone()));
-            }
-        }
+        let doomed = p.doomed(&self.env, locks, LiveChange::Write(&target.kind));
+        refuse_unreadable(&doomed)?;
 
         let mut warnings = Vec::new();
+        // What steps 2 and 4 settle, and the vaults below: step 7's rule never saves it again.
+        let mut held = Held::default();
         let target_secret = match outgoing.as_ref().filter(|_| !req.force) {
             // Step 2, the direct branch: displace whatever is live on either axis unless it is
             // byte-identical to the target.
@@ -765,6 +783,7 @@ impl Engine {
                             live_identity.as_ref(),
                             &mut warnings,
                         );
+                        held.hold(p, &bytes);
                         unless_forced(saved, req.force, &mut warnings)?;
                     }
                 }
@@ -781,32 +800,34 @@ impl Engine {
                     live_identity.as_ref(),
                     &mut warnings,
                 )?;
+                // Step 4 settled the outgoing generation: kept, captured or displaced.
+                if let Some(bytes) = Axis::of(&out.kind).live_secret(&live) {
+                    held.hold(p, &bytes);
+                }
                 // Read only now: settling a self-switch may have captured a newer live
                 // generation into this very account, and that is the one to activate.
-                let secret = self.read_target(&target)?;
-                // Step 7 clears or overwrites the axis the outgoing account is not on, which
-                // step 4 never classified. Never forced here, so a failed displacement aborts.
-                self.displace_unless_target(
+                self.read_target(&target)?
+            }
+        };
+        // Step 7's rule: every entry the write surely destroys is saved first, unless a vault
+        // of either account, or steps 2 and 4, already hold its generation. What only a
+        // Keychain-refusal fallback destroys is saved by `before_fallback`, if it happens.
+        for id in outgoing.iter().map(|o| &o.id).chain([&target.id]) {
+            self.hold_vault(p, &mut held, id);
+        }
+        for entry in doomed.iter().filter(|d| !d.on_fallback) {
+            if let Read::Present(bytes) = &entry.bytes {
+                self.save_unheld(
                     p,
                     provider,
-                    Axis::of(&out.kind).other(),
-                    &live,
-                    &secret,
+                    bytes,
+                    &mut held,
+                    req.force,
                     live_identity.as_ref(),
                     &mut warnings,
                 )?;
-                secret
             }
-        };
-        self.displace_hidden_copies(
-            p,
-            provider,
-            hidden_copies(&live, &target.kind),
-            &self.held_generations(&live, &target_secret, outgoing.as_ref().map(|o| &o.id)),
-            req.force,
-            live_identity.as_ref(),
-            &mut warnings,
-        )?;
+        }
 
         // Step 6.
         let from_secret = outgoing
@@ -853,6 +874,22 @@ impl Engine {
             in_flight: false,
             armed: true,
         };
+        let mut before_fallback = |bytes: &[u8]| {
+            self.save_unheld(
+                p,
+                provider,
+                bytes,
+                &mut held,
+                req.force,
+                live_identity.as_ref(),
+                &mut warnings,
+            )
+            .map_err(|e| {
+                ProviderError::Invalid(format!(
+                    "could not save a credential the Keychain fallback would delete: {e}"
+                ))
+            })
+        };
         let stored_in = match self.apply(
             p,
             &target,
@@ -861,6 +898,7 @@ impl Engine {
             outgoing.as_ref(),
             req,
             &mut tx,
+            &mut before_fallback,
         ) {
             Ok(stored_in) => {
                 tx.disarm();
@@ -1012,91 +1050,46 @@ impl Engine {
         Ok(())
     }
 
-    /// §9.4 step 7's off-axis rule: an account-scoped secret live on `axis`, which is about to
-    /// be cleared or overwritten, is saved first unless it is the target's generation
-    /// (`target_secret`). Shared by the switch and by §9.6 recovery finishing forward, so a
-    /// stray secret written between the journal row and a crash is never lost either way.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn displace_unless_target(
-        &self,
-        p: &dyn Provider,
-        provider: &ProviderId,
-        axis: Axis,
-        live: &LiveAuth,
-        target_secret: &[u8],
-        live_identity: Option<&Identity>,
-        warnings: &mut Vec<String>,
-    ) -> Result<(), EngineError> {
-        match axis
-            .live_secret(live)
-            .filter(|b| !same_generation(p, b, target_secret))
+    /// Records the generations `id`'s vault holds, current and `.prev`. One that cannot be read
+    /// is left out, so what it may hold is saved rather than assumed kept.
+    pub(crate) fn hold_vault(&self, p: &dyn Provider, held: &mut Held, id: &AccountId) {
+        for bytes in [self.vault.read(id), self.vault.read_prev(id)]
+            .into_iter()
+            .filter_map(Read::present)
         {
-            Some(bytes) => self.displace_live(
-                p,
-                provider,
-                &bytes,
-                "displaced-live-login",
-                live_identity,
-                warnings,
-            ),
-            None => Ok(()),
+            held.hold(p, &bytes);
         }
     }
 
-    /// The generations held somewhere a copy about to be lost is not: the effective live
-    /// credential, which the switch or recovery has already settled; the target's; and the
-    /// outgoing account's vault, current and `.prev`, which covers a stale mirror of a
-    /// generation CC has since refreshed or wiped. A vault entry that cannot be read is left
-    /// out, so what it may hold is saved rather than assumed kept.
-    pub(crate) fn held_generations(
-        &self,
-        live: &LiveAuth,
-        target_secret: &[u8],
-        outgoing: Option<&AccountId>,
-    ) -> Vec<Vec<u8>> {
-        let mut held = vec![target_secret.to_vec()];
-        held.extend(Axis::Entry.live_secret(live));
-        if let Some(id) = outgoing {
-            held.extend(self.vault.read(id).present());
-            held.extend(self.vault.read_prev(id).present());
-        }
-        held
-    }
-
-    /// §9.4 step 7: `copies` are copies of the credential entry that no reader sees but that
-    /// the activation overwrites or clears, and nothing restores them once a switch commits or
-    /// recovery finishes forward (§9.6). So a copy whose generation is none of `held` is saved
-    /// first, like the off-axis rule ("never lose a secret"); one with nothing account-scoped
-    /// in it is not (`displace_live`). A failed save aborts, except under `force` (B.5).
+    /// §9.4 step 7: saves `bytes`, a live entry a change is about to overwrite or delete, unless
+    /// it holds nothing account-scoped or a generation `held` already keeps; either way the
+    /// generation is held from then on, so no entry of it is saved twice. A failed save aborts,
+    /// except under `force` (B.5).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn displace_hidden_copies<'c>(
+    pub(crate) fn save_unheld(
         &self,
         p: &dyn Provider,
         provider: &ProviderId,
-        copies: impl IntoIterator<Item = &'c Read<Vec<u8>>>,
-        held: &[Vec<u8>],
+        bytes: &[u8],
+        held: &mut Held,
         force: bool,
         live_identity: Option<&Identity>,
         warnings: &mut Vec<String>,
     ) -> Result<(), EngineError> {
-        for copy in copies {
-            let Read::Present(bytes) = copy else {
-                continue;
-            };
-            if bytes.is_empty() || held.iter().any(|h| same_generation(p, bytes, h)) {
-                continue;
+        match p.fingerprint(bytes) {
+            Some(fp) if held.insert(fp.as_str()) => {
+                let saved = self.displace_live(
+                    p,
+                    provider,
+                    bytes,
+                    "displaced-live-login",
+                    live_identity,
+                    warnings,
+                );
+                unless_forced(saved, force, warnings)
             }
-            let saved = self.displace_live(
-                p,
-                provider,
-                bytes,
-                "displaced-live-login",
-                live_identity,
-                warnings,
-            );
-            unless_forced(saved, force, warnings)?;
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// Steps 7–9, keeping an undo for each write.
@@ -1110,11 +1103,12 @@ impl Engine {
         outgoing: Option<&AccountRow>,
         req: &SwitchRequest,
         tx: &mut Rollback<'a, '_>,
+        before_fallback: BeforeFallback<'_>,
     ) -> Result<SecretStore, EngineError> {
         let locks = tx.locks;
         hooks::point(self, "after-journal")?;
         let stored_in = tx.write(|| {
-            p.write_credential(&self.env, locks, target_login, live, &mut |_| Ok(()))
+            p.write_credential(&self.env, locks, target_login, live, before_fallback)
                 .map(|w| (w.undo, w.stored_in))
         })?;
         hooks::point(self, "after-credential")?;

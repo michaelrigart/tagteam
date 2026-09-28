@@ -1,7 +1,8 @@
 use serde_json::Value;
 use tagteam_core::OracleVerdict;
 use tagteam_provider::{
-    Credential, LiveAuth, LiveLocks, LockError, MutationGuard, Provider, ProviderError,
+    Credential, LiveAuth, LiveChange, LiveLocks, LockError, MutationGuard, Provider, ProviderError,
+    Read,
 };
 
 use crate::engine::Engine;
@@ -9,7 +10,9 @@ use crate::error::EngineError;
 use crate::hooks;
 use crate::oracle::verdict;
 use crate::store::{AccountRow, EventRow, JournalRow, Store};
-use crate::switch::{Axis, OracleHint, answer_for, hidden_copies, refuse_unsafe_live_reads};
+use crate::switch::{
+    Axis, Held, OracleHint, answer_for, refuse_unreadable, refuse_unsafe_live_reads,
+};
 
 /// Which way an interrupted switch went, as the live credential decides it (§9.6), with the
 /// fingerprint of the generation established as the chosen account's.
@@ -188,8 +191,9 @@ impl Engine {
             && axes_coherent(p, &p.read_live_auth(&self.env), own, fp)
     }
 
-    /// The switch landed: clear the other auth axis (§9.4 step 7, displacing a stray secret
-    /// there first), splice the target's `oauthAccount`, and commit (step 9).
+    /// The switch landed: clear the other auth axis (§9.4 step 7, saving first whatever the
+    /// clear destroys that no vault holds), splice the target's `oauthAccount`, and commit
+    /// (step 9).
     fn finish_forward(
         &self,
         p: &dyn Provider,
@@ -214,36 +218,33 @@ impl Engine {
         let identity = p.parse_identity(&to.identity_json)?;
         let live_identity = p.live_identity(&self.env).present();
         let mut warnings = Vec::new();
-        // Step 7's off-axis rule covers only the axis the outgoing account is not on. After a
-        // cross-axis switch the axis being cleared may hold the outgoing generation the row
-        // journaled, which step 4 already settled with its vault: clearing it loses nothing.
-        // Anything else there, a generation CC rotated since the crash included, is saved.
-        let journaled_outgoing = row
-            .from_fp
-            .as_deref()
-            .is_some_and(|fp| holds(p, live, own.other(), fp));
-        if !journaled_outgoing {
-            self.displace_unless_target(
-                p,
-                &row.provider,
-                own.other(),
-                live,
-                &target_secret,
-                live_identity.as_ref(),
-                &mut warnings,
-            )?;
+        // §9.4 step 7's rule, before the other axis is cleared: every entry the clear destroys
+        // is saved first, unless its generation is held already. Held are the target's live
+        // generation, the vaults of both accounts the row names, and the outgoing generation
+        // the row journaled, which step 4 settled before the row was written. A generation CC
+        // rotated since the crash is none of these, so it is saved.
+        let doomed = p.doomed(&self.env, locks, LiveChange::ClearOther(&to.kind));
+        refuse_unreadable(&doomed)?;
+        let mut held = Held::default();
+        held.hold(p, &target_secret);
+        if let Some(fp) = &row.from_fp {
+            held.insert(fp);
         }
-        // Clearing the entry for an API key also strips the copies of it no reader sees.
-        if own == Axis::ManagedKey {
-            self.displace_hidden_copies(
-                p,
-                &row.provider,
-                hidden_copies(live, &to.kind),
-                &self.held_generations(live, &target_secret, row.from_id.as_ref()),
-                false,
-                live_identity.as_ref(),
-                &mut warnings,
-            )?;
+        for id in row.from_id.iter().chain([&to.id]) {
+            self.hold_vault(p, &mut held, id);
+        }
+        for entry in &doomed {
+            if let Read::Present(bytes) = &entry.bytes {
+                self.save_unheld(
+                    p,
+                    &row.provider,
+                    bytes,
+                    &mut held,
+                    false,
+                    live_identity.as_ref(),
+                    &mut warnings,
+                )?;
+            }
         }
         for w in &warnings {
             tracing::warn!(provider = %row.provider, "recovering an interrupted switch: {w}");

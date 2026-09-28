@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -146,72 +145,6 @@ fn an_api_key_target_moves_the_auth_axis() {
             .is_none()
     );
     assert_eq!(oauth_item(&f).unwrap()["pluginSecrets"], json!({"p": 1}));
-}
-
-#[test]
-fn the_credentials_file_is_shadowed_only_behind_a_keychain_item() {
-    // Appendix A.3: CC reads the Keychain first, so the file is a second copy only while an
-    // item answers; otherwise it is the entry itself.
-    let f = fx();
-    let paths = CcPaths::resolve(&f.env);
-    let (svc, acct) = (
-        keychain_service(&f.env, ItemKind::OAuth),
-        keychain_account(&f.env),
-    );
-    fs::write(&paths.credentials_file, b"file").unwrap();
-    let live = f.cc.read_live_auth(&f.env);
-    assert!(matches!(live.shadowed, Read::Absent), "{live:?}");
-    assert_eq!(live.credential.present().unwrap().bytes(), b"file");
-    f.kc.put(&svc, &acct, b"item");
-    let live = f.cc.read_live_auth(&f.env);
-    assert_eq!(live.shadowed.present().as_deref(), Some(&b"file"[..]));
-    assert_eq!(live.credential.present().unwrap().bytes(), b"item");
-    // A file that cannot be read is reported as such, never as absent.
-    let mode = |m| fs::set_permissions(&paths.credentials_file, fs::Permissions::from_mode(m));
-    mode(0o000).unwrap();
-    assert!(matches!(
-        f.cc.read_live_auth(&f.env).shadowed,
-        Read::Unreadable(_)
-    ));
-    mode(0o600).unwrap();
-    fs::remove_file(&paths.credentials_file).unwrap();
-    assert!(matches!(f.cc.read_live_auth(&f.env).shadowed, Read::Absent));
-    let linux = ClaudeCode::with_store(LiveStore::new(f.kc.clone(), Platform::Linux));
-    fs::write(&paths.credentials_file, b"file").unwrap();
-    assert!(matches!(
-        linux.read_live_auth(&f.env).shadowed,
-        Read::Absent
-    ));
-}
-
-#[test]
-fn the_fallback_items_are_reported_as_secondary_copies() {
-    // Appendix A.2: only an explicit `CLAUDE_CONFIG_DIR` (here `~/.claude`) adds a fallback item.
-    let f = fx();
-    assert!(f.cc.read_live_auth(&f.env).secondary.is_empty());
-    let mut env = f.env.clone();
-    env.claude_config_dir = Some(env.home.join(".claude").into_os_string());
-    let services = read_services(&env, ItemKind::OAuth);
-    let acct = keychain_account(&env);
-    assert_eq!(services.len(), 2, "{services:?}");
-    f.kc.put(&services[0], &acct, b"primary");
-    f.kc.put(&services[1], &acct, b"fallback");
-    let live = f.cc.read_live_auth(&env);
-    assert_eq!(live.credential.present().unwrap().bytes(), b"primary");
-    assert_eq!(
-        live.secondary
-            .into_iter()
-            .map(Read::present)
-            .collect::<Vec<_>>(),
-        [Some(b"fallback".to_vec())]
-    );
-    f.kc.set_unreadable(&services[1], &acct, true);
-    assert!(matches!(
-        f.cc.read_live_auth(&env).secondary.as_slice(),
-        [Read::Unreadable(_)]
-    ));
-    let linux = ClaudeCode::with_store(LiveStore::new(f.kc.clone(), Platform::Linux));
-    assert!(linux.read_live_auth(&env).secondary.is_empty());
 }
 
 /// Every entry a change can destroy, planted with a distinct secret, under an explicit

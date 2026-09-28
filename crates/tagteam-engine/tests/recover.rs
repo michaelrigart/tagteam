@@ -46,7 +46,7 @@ fn a_landed_credential_finishes_forward() {
 
 #[test]
 fn forward_recovery_displaces_a_stray_secret_on_the_axis_it_clears() {
-    // §9.4 step 7's off-axis rule, applied by recovery: a key written between the journal row
+    // §9.4 step 7's rule, applied by recovery: a key written between the journal row
     // and the crash is saved before the managed-key axis is cleared, never just lost.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");

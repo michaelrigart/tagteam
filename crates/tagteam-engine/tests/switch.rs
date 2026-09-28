@@ -5,7 +5,7 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{API_KEY, Fx, STRAY_API_KEY, mutation_lock_free};
+use common::{API_KEY, Fx, OTHER_API_KEY, STRAY_API_KEY, mutation_lock_free};
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, ProviderId};
@@ -32,8 +32,6 @@ fn switch(fx: &Fx, target: SwitchTarget, force: bool) -> Result<SwitchOutcome, E
 fn to(id: &AccountId) -> SwitchTarget {
     SwitchTarget::Account(id.clone())
 }
-
-const OTHER_API_KEY: &str = "sk-ant-api03-zyxwvutsrqponmlkjihgfedcba";
 
 fn displaced_files(fx: &Fx) -> usize {
     fx.displaced().len()
