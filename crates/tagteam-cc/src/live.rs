@@ -5,7 +5,9 @@ use std::thread;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
-use tagteam_provider::atomic::{ensure_private_dir, remove_target, write_atomic_with};
+use tagteam_provider::atomic::{
+    ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
+};
 use tagteam_provider::{Credential, Env, Keychain, ProviderError, Read, SecretStore};
 
 use crate::config::{self, read_bytes};
@@ -94,14 +96,18 @@ fn file_matches(path: &Path, expected: &Option<Vec<u8>>) -> bool {
 }
 
 /// The file half of one `restore` entry: `fence` is checked immediately before the
-/// mutation, inside `write_atomic_with` for a restored value or explicitly before a
-/// removal.
+/// mutation, inside the write for a restored value or explicitly before a removal.
+/// `private` forces mode 0600 regardless of the file's current mode (the credentials
+/// file, a secret); otherwise the file's own mode is preserved (`global_config`, which
+/// tagteam does not own — §9.5).
 fn restore_file(
     path: &Path,
     value: &Option<Vec<u8>>,
     fence: Fence<'_>,
+    private: bool,
 ) -> Result<(), ProviderError> {
     match value {
+        Some(v) if private => write_atomic_private_with(path, v, 0o600, fence),
         Some(v) => write_atomic_with(path, v, 0o600, fence),
         None => {
             fence()?;
@@ -233,7 +239,7 @@ impl LiveStore {
     ) -> Result<(), ProviderError> {
         fence()?;
         ensure_private_dir(&paths.secure_storage_dir)?;
-        write_atomic_with(&paths.credentials_file, bytes, 0o600, fence)
+        write_atomic_private_with(&paths.credentials_file, bytes, 0o600, fence)
     }
 
     /// Appendix A.3 write, including the verified file fallback. Returns where this write
@@ -259,7 +265,7 @@ impl LiveStore {
                 Ok(()) => {
                     if paths.credentials_file.try_exists()? {
                         // Bumps the mtime, so CC reloads (hot reload).
-                        write_atomic_with(&paths.credentials_file, bytes, 0o600, fence)?;
+                        write_atomic_private_with(&paths.credentials_file, bytes, 0o600, fence)?;
                     }
                     return Ok(SecretStore::Keychain);
                 }
@@ -298,7 +304,7 @@ impl LiveStore {
         if let Some(b) = present_or_err(read_bytes(&paths.credentials_file))? {
             let kept = keep_shared(&b)?;
             match kept {
-                Some(k) => write_atomic_with(&paths.credentials_file, &k, 0o600, fence)?,
+                Some(k) => write_atomic_private_with(&paths.credentials_file, &k, 0o600, fence)?,
                 None => {
                     fence()?;
                     remove_if_present(&paths.credentials_file)?
@@ -484,7 +490,7 @@ impl LiveStore {
 
         // 1. `global_config` first: CC's identity and managed-key axis live here.
         if !file_matches(&paths.global_config, &snap.global_config) {
-            if let Err(e) = restore_file(&paths.global_config, &snap.global_config, fence) {
+            if let Err(e) = restore_file(&paths.global_config, &snap.global_config, fence, false) {
                 if matches!(e, ProviderError::Lock(_)) {
                     let mut never_attempted = vec![global_config_name];
                     never_attempted.extend(item_names.iter().cloned());
@@ -528,7 +534,9 @@ impl LiveStore {
             && snap.credentials_file.is_some()
             && paths.credentials_file.try_exists().unwrap_or(false);
         if mismatched || bump_for_reload {
-            if let Err(e) = restore_file(&paths.credentials_file, &snap.credentials_file, fence) {
+            if let Err(e) =
+                restore_file(&paths.credentials_file, &snap.credentials_file, fence, true)
+            {
                 if matches!(e, ProviderError::Lock(_)) {
                     log_lock_abort(&failed, std::slice::from_ref(&credentials_file_name));
                     return Err(e);

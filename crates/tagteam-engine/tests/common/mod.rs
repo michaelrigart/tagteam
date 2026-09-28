@@ -774,7 +774,14 @@ impl Fx {
                     surface_file_bytes(a, step, path),
                 );
                 if let (Some(bm), Some(am)) = (b.map(|e| e.mode), a.map(|e| e.mode)) {
-                    assert_eq!(bm, am, "{step}: {} changed mode", path.display());
+                    // A credential file is forced to 0600 on every write (never preserved,
+                    // never chmod'ed to anything else), so a mode change is only ever
+                    // allowed when it lands exactly there.
+                    assert!(
+                        bm == am || am == 0o600,
+                        "{step}: {} changed mode from {bm:o} to {am:o}",
+                        path.display()
+                    );
                 }
                 assert_eq!(
                     shared_keys(bb, &surface.machine_shared_keys),

@@ -1124,3 +1124,78 @@ fn restore_never_creates_a_credentials_file_the_snapshot_says_was_absent() {
         "a restored item must never conjure a credentials file the snapshot never had"
     );
 }
+
+// --- Fix round 3 -----------------------------------------------------------------
+
+#[test]
+fn a_linux_credential_write_forces_the_file_to_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let s = store(&f, Platform::Linux);
+    fs::write(&f.paths.credentials_file, "old").unwrap();
+    fs::set_permissions(&f.paths.credentials_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    s.write_credential_entry(&f.env, &f.paths, b"{\"a\":1}", &open)
+        .unwrap();
+
+    assert_eq!(mode_of(&f.paths.credentials_file), 0o600);
+}
+
+#[test]
+fn the_hot_reload_mirror_forces_the_file_to_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    fs::write(&f.paths.credentials_file, "old").unwrap();
+    fs::set_permissions(&f.paths.credentials_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(
+        s.write_credential_entry(&f.env, &f.paths, b"v2", &open)
+            .unwrap(),
+        SecretStore::Keychain
+    );
+
+    assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"v2");
+    assert_eq!(mode_of(&f.paths.credentials_file), 0o600);
+}
+
+#[test]
+fn restore_forces_the_credentials_file_to_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    fs::write(&f.paths.credentials_file, "orig-file").unwrap();
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    fs::write(&f.paths.credentials_file, "tampered").unwrap();
+    fs::set_permissions(&f.paths.credentials_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    s.restore(&f.env, &f.paths, &snap, &open).unwrap();
+
+    assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"orig-file");
+    assert_eq!(mode_of(&f.paths.credentials_file), 0o600);
+}
+
+#[test]
+fn a_symlinked_credentials_file_stays_a_symlink_with_its_target_at_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let s = store(&f, Platform::Linux);
+    let real = f.env.home.join("dotfiles/credentials.json");
+    fs::create_dir_all(real.parent().unwrap()).unwrap();
+    fs::write(&real, "old").unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+    std::os::unix::fs::symlink(&real, &f.paths.credentials_file).unwrap();
+
+    s.write_credential_entry(&f.env, &f.paths, b"{\"a\":1}", &open)
+        .unwrap();
+
+    assert!(
+        fs::symlink_metadata(&f.paths.credentials_file)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the credentials file path must stay a symlink"
+    );
+    assert_eq!(fs::read(&real).unwrap(), b"{\"a\":1}");
+    assert_eq!(mode_of(&real), 0o600);
+}
