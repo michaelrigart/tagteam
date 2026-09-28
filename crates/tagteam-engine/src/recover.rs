@@ -1,6 +1,8 @@
 use serde_json::Value;
 use tagteam_core::OracleVerdict;
-use tagteam_provider::{Credential, LiveAuth, LiveLocks, MutationGuard, Provider};
+use tagteam_provider::{
+    Credential, LiveAuth, LiveLocks, LockError, MutationGuard, Provider, ProviderError,
+};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -64,7 +66,7 @@ fn axes_coherent(p: &dyn Provider, live: &LiveAuth, own: Axis, fp: &str) -> bool
 
 impl Engine {
     /// Journal rows whose holder has died (§12.6): a live holder's switch is still running, and
-    /// its row refuses through `refuse_if_interrupted` instead. Never creates the store.
+    /// its row refuses through `guard_or_refuse` instead. Never creates the store.
     pub(crate) fn dead_journals(&self) -> Result<Vec<JournalRow>, EngineError> {
         let Some(store) = self.existing_store()? else {
             return Ok(vec![]);
@@ -121,7 +123,15 @@ impl Engine {
         let mut ids = vec![&row.to_id];
         ids.extend(&row.from_id);
         let _accounts = self.lock_accounts(&ids)?;
-        let locks = p.lock_live(&self.env, guard)?;
+        // The provider is busy, or a crash left its lock behind: a retry recovers the row.
+        let locks = p.lock_live(&self.env, guard).map_err(|e| match e {
+            ProviderError::Lock(LockError::Timeout(lock)) => EngineError::RecoveryBlocked {
+                provider: row.provider.to_string(),
+                app: p.display_name(),
+                lock,
+            },
+            e => e.into(),
+        })?;
         let live = p.read_live_auth(&self.env);
         match self.direction(p, &store, row, &live, hints)? {
             Direction::Forward(fp) => self.finish_forward(p, &store, row, &locks, &live, &fp),

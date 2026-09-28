@@ -559,10 +559,11 @@ impl Engine {
         };
         // Once, before the mutation lock: a test callback here may take that lock itself.
         hooks::point(self, "planned")?;
-        let guard = self.mutation_guard()?;
-        if !req.force {
-            self.refuse_if_interrupted(&req.provider)?;
-        }
+        let guard = if req.force {
+            self.mutation_guard()?
+        } else {
+            self.guard_or_refuse(&req.provider)?
+        };
         for attempt in 1..=ATTEMPTS {
             if attempt > 1 {
                 plan = match self.plan(p, &store, &req, Ask::Reuse(plan.hint.take()))? {

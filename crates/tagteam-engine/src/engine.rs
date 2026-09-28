@@ -114,15 +114,31 @@ impl Engine {
         }
     }
 
-    /// Account-changing work refuses while an interrupted switch for the provider is
-    /// unresolved (§9.6). Never creates the store.
-    pub(crate) fn refuse_if_interrupted(&self, provider: &ProviderId) -> Result<(), EngineError> {
-        match self.existing_store()? {
-            Some(s) if s.journal(provider)?.is_some() => {
-                Err(EngineError::InterruptedSwitch(provider.to_string()))
-            }
-            _ => Ok(()),
+    /// Whether an interrupted switch for the provider is on record (§9.6). Never creates the
+    /// store.
+    fn interrupted(&self, provider: &ProviderId) -> Result<bool, EngineError> {
+        Ok(match self.existing_store()? {
+            Some(s) => s.journal(provider)?.is_some(),
+            None => false,
+        })
+    }
+
+    /// The mutation lock for account-changing work, refused while an interrupted switch for
+    /// the provider is still unresolved once recovery has run under it (§9.6). The refusal
+    /// says why: a recovery that could not take the provider's live locks names the lock and
+    /// asks for a retry; only a row recovery could not decide points at `--force`.
+    pub(crate) fn guard_or_refuse(
+        &self,
+        provider: &ProviderId,
+    ) -> Result<MutationGuard, EngineError> {
+        let (guard, blocked) = self.guard_recovering()?;
+        if self.interrupted(provider)? {
+            return Err(blocked
+                .into_iter()
+                .find_map(|(p, e)| (&p == provider).then_some(e))
+                .unwrap_or_else(|| EngineError::InterruptedSwitch(provider.to_string())));
         }
+        Ok(guard)
     }
 
     /// Run before any planning or validation: if an interrupted switch is on record, take the
@@ -135,17 +151,10 @@ impl Engine {
     /// misreport as an interrupted switch (pointing the user at `--force` for a switch that is
     /// simply in progress elsewhere). That ordering can't be exercised deterministically by a
     /// test without a pause hook between acquiring the guard and running the check, which does
-    /// not exist yet; it is verified by reading the code above instead.
+    /// not exist yet; it is verified by reading `guard_or_refuse` instead.
     pub(crate) fn settle_or_refuse(&self, provider: &ProviderId) -> Result<(), EngineError> {
-        let pending = match self.existing_store()? {
-            Some(s) => s.journal(provider)?.is_some(),
-            None => false,
-        };
-        if pending {
-            let guard = self.mutation_guard()?;
-            let result = self.refuse_if_interrupted(provider);
-            drop(guard);
-            result?;
+        if self.interrupted(provider)? {
+            drop(self.guard_or_refuse(provider)?);
         }
         Ok(())
     }
@@ -153,6 +162,14 @@ impl Engine {
     /// tagteam's mutation lock. Before returning it, recovers every interrupted switch whose
     /// holder has died (§9.6). The oracle is asked before the lock is taken (§7.6).
     pub fn mutation_guard(&self) -> Result<MutationGuard, EngineError> {
+        Ok(self.guard_recovering()?.0)
+    }
+
+    /// `mutation_guard`, with the refusal for each row whose recovery could not take its
+    /// provider's live locks (`RecoveryBlocked`), by provider.
+    fn guard_recovering(
+        &self,
+    ) -> Result<(MutationGuard, Vec<(ProviderId, EngineError)>), EngineError> {
         let hints: Vec<_> = self
             .dead_journals()?
             .into_iter()
@@ -165,6 +182,7 @@ impl Engine {
         let guard = MutationGuard::acquire(&self.env, MutationGuard::TIMEOUT)?;
         // Enumerated again under the lock: a switch may have died while this command waited,
         // and its row is recovered now too, without a hint.
+        let mut blocked = Vec::new();
         for row in self.dead_journals()? {
             let hint = hints
                 .iter()
@@ -172,9 +190,12 @@ impl Engine {
                 .map_or(&[][..], |(_, h)| h.as_slice());
             if let Err(e) = self.recover_one(&guard, &row, hint) {
                 tracing::warn!(provider = %row.provider, "could not recover an interrupted switch: {e}");
+                if matches!(e, EngineError::RecoveryBlocked { .. }) {
+                    blocked.push((row.provider.clone(), e));
+                }
             }
         }
-        Ok(guard)
+        Ok((guard, blocked))
     }
 
     /// Takes the account lock, then reconciles a pending explicit replacement (§12.5): the

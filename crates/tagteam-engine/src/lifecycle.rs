@@ -419,8 +419,7 @@ impl Engine {
         let kind = p.classify(cred.bytes());
         crate::hooks::point(self, "add-verified")?;
         // 4. Write, under the mutation lock, the account locks and then CC's live locks.
-        let guard = self.mutation_guard()?;
-        self.refuse_if_interrupted(&opts.provider)?;
+        let guard = self.guard_or_refuse(&opts.provider)?;
         let store = self.store()?;
         let prep = self.prepare(
             &store,
@@ -505,8 +504,7 @@ impl Engine {
                 "{email:?} is not a valid email address"
             )));
         }
-        let _guard = self.mutation_guard()?;
-        self.refuse_if_interrupted(&opts.provider)?;
+        let _guard = self.guard_or_refuse(&opts.provider)?;
         let store = self.store()?;
         let identity = match &opts.email {
             Some(email) => p.token_identity(email),
@@ -580,8 +578,7 @@ impl Engine {
         self.refuse_inside_run_shell()?;
         let provider = self.managed_row(id)?.provider;
         self.settle_or_refuse(&provider)?;
-        let _guard = self.mutation_guard()?;
-        self.refuse_if_interrupted(&provider)?;
+        let _guard = self.guard_or_refuse(&provider)?;
         let row = self.managed_row(id)?;
         let lock = self.lock_account(id)?;
         self.remove_locked(&row, &lock)?;

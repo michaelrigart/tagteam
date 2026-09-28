@@ -1,5 +1,8 @@
 mod common;
 
+use std::fs;
+use std::time::Duration;
+
 use common::{
     API_KEY, Fx, STRAY_API_KEY, assert_journal_cleared, crash_row, crashed_switch, dead_holder,
     journal, vault_fp, write_target_credential,
@@ -130,7 +133,7 @@ fn a_rotation_or_logout_after_the_crash_is_undecidable() {
         assert!(journal(&fx).is_some(), "logout={logout}");
         assert!(matches!(
             fx.switch_to(&b, false),
-            Err(EngineError::InterruptedSwitch(_))
+            Err(e @ EngineError::InterruptedSwitch(_)) if e.to_string().contains("--force")
         ));
         assert!(matches!(
             fx.engine.add_live(fx.add_options()),
@@ -140,6 +143,38 @@ fn a_rotation_or_logout_after_the_crash_is_undecidable() {
         assert!(journal(&fx).is_none(), "logout={logout}");
         assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
     }
+}
+
+#[test]
+fn a_recovery_that_cannot_take_cc_s_lock_names_it_instead_of_advising_force() {
+    // After a crash CC's lock directories stay behind, fresh, for up to a minute; or CC may be
+    // mid-refresh. Recovery then cannot take them, which is not an undecidable row: every
+    // refusal names the lock and says to retry, and never points at `--force`.
+    let fx = Fx::with_lock_timeout(Duration::from_millis(300));
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a); // decidable: it finishes forward once the lock is free
+    fs::create_dir(fx.paths().refresh_lock).unwrap();
+    let refusals = [
+        fx.switch_to(&b, false).map(drop),
+        fx.engine.add_live(fx.add_options()).map(drop),
+        fx.engine.add_token(fx.add_token_options(API_KEY)).map(drop),
+        fx.engine.remove(&b).map(drop),
+    ];
+    for refusal in refusals {
+        let err = refusal.unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(err.kind(), "interrupted-switch", "{msg}");
+        assert!(msg.contains(".oauth_refresh.lock"), "{msg}");
+        assert!(msg.contains("retry once Claude Code is idle"), "{msg}");
+        assert!(!msg.contains("--force"), "{msg}");
+    }
+    assert!(journal(&fx).is_some());
+    fs::remove_dir(fx.paths().refresh_lock).unwrap();
+    any_mutation(&fx, &a); // the retry the refusal advises
+    assert_journal_cleared(&fx);
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
 }
 
 #[test]

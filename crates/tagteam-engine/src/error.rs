@@ -1,4 +1,5 @@
 use std::io;
+use std::path::PathBuf;
 
 use tagteam_provider::{LockError, ProviderError, ReadError};
 
@@ -53,6 +54,17 @@ pub enum EngineError {
         "an interrupted switch for {0} could not be resolved; run `tagteam switch <account> --force` to settle it"
     )]
     InterruptedSwitch(String),
+    /// An interrupted switch whose recovery could not take the provider's live locks: not an
+    /// undecidable row, so a retry recovers it and `--force` is not the way out.
+    #[error(
+        "an interrupted switch for {provider} could not be recovered yet: timed out waiting for the lock {}; retry once {app} is idle",
+        lock.display()
+    )]
+    RecoveryBlocked {
+        provider: String,
+        app: &'static str,
+        lock: PathBuf,
+    },
     #[error("the switch failed and was rolled back: {0}")]
     RolledBack(String),
     #[error("the switch failed ({cause}) and rolling back also failed: {failed}")]
@@ -87,6 +99,7 @@ impl EngineError {
             EngineError::NoSuchAccount(_) => "no-such-account",
             EngineError::Ambiguous { .. } => "ambiguous-account",
             EngineError::InterruptedSwitch(_) => "interrupted-switch",
+            EngineError::RecoveryBlocked { .. } => "interrupted-switch",
             EngineError::RolledBack(_) => "rolled-back",
             EngineError::RollbackFailed { .. } => "rollback-failed",
             EngineError::Io(_) => "io",
@@ -96,8 +109,6 @@ impl EngineError {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
     /// Pins every variant's `kind()` string: it's part of `--json`'s stable contract (§14), so
@@ -173,6 +184,14 @@ mod tests {
             ),
             (
                 EngineError::InterruptedSwitch("p".into()),
+                "interrupted-switch",
+            ),
+            (
+                EngineError::RecoveryBlocked {
+                    provider: "p".into(),
+                    app: "a",
+                    lock: PathBuf::from("x"),
+                },
                 "interrupted-switch",
             ),
             (EngineError::RolledBack("x".into()), "rolled-back"),
