@@ -4,7 +4,7 @@ use tagteam_core::{
 };
 use tagteam_provider::{
     Credential, Identity, LiveAuth, LiveLocks, ProcessStamp, Provenance, Provider, ProviderError,
-    Read, StoredLogin, Undo,
+    Read, ReadError, StoredLogin, Undo,
 };
 
 use crate::account_lock::AccountLock;
@@ -69,8 +69,14 @@ pub struct SwitchOutcome {
 /// §9.4 step 1: after this many lock acquisitions that each found the plan outdated, abort.
 const ATTEMPTS: usize = 3;
 
-/// §9.4 step 3: never back up an empty value, because a Keychain timeout can look empty.
-const EMPTY_LIVE_READ: &str = "the live credential read back empty; a Keychain timeout can look empty, so nothing was changed";
+/// §9.4 step 3: never back up an empty value, because a Keychain timeout can look empty. It is
+/// reported as unreadable, on either axis: the value could not be read with confidence.
+fn empty_live_read(what: &str) -> EngineError {
+    EngineError::Unreadable(ReadError::new(
+        what,
+        "it read back empty, which a Keychain timeout can cause; the switch was not attempted",
+    ))
+}
 
 fn unmanaged_message(email: &str) -> String {
     format!("the live login ({email}) is not managed by tagteam; add it first, or use --force")
@@ -154,14 +160,12 @@ fn refuse_unsafe_live_reads(live: &LiveAuth) -> Result<(), EngineError> {
         Read::Present(c) if c.provenance() == Provenance::Degraded => {
             return Err(EngineError::DegradedRead);
         }
-        Read::Present(c) if c.is_empty() => {
-            return Err(EngineError::InvalidInput(EMPTY_LIVE_READ.into()));
-        }
+        Read::Present(c) if c.is_empty() => return Err(empty_live_read("the live credential")),
         _ => {}
     }
     match &live.managed_key {
         Read::Unreadable(e) => Err(EngineError::Unreadable(e.clone())),
-        Read::Present(k) if k.is_empty() => Err(EngineError::InvalidInput(EMPTY_LIVE_READ.into())),
+        Read::Present(k) if k.is_empty() => Err(empty_live_read("the live API key")),
         _ => Ok(()),
     }
 }
@@ -668,15 +672,20 @@ impl Engine {
                 };
                 for axis in [Axis::Entry, Axis::ManagedKey] {
                     if let Some(bytes) = axis.live_secret(&live).filter(|b| *b != secret) {
-                        self.displace_live(
+                        let saved = self.displace_live(
                             p,
                             provider,
                             &bytes,
                             reason,
                             live_identity.as_ref(),
-                            req.force,
                             &mut warnings,
-                        )?;
+                        );
+                        // A failed displacement aborts, except under --force (step 2).
+                        match saved {
+                            Err(e) if req.force => warnings
+                                .push(format!("could not save the previous live credential: {e}")),
+                            other => other?,
+                        }
                     }
                 }
                 secret
@@ -703,13 +712,13 @@ impl Engine {
                     .live_secret(&live)
                     .filter(|b| !same_generation(p, b, &secret))
                 {
+                    // Never forced here, so a failed displacement always aborts.
                     self.displace_live(
                         p,
                         provider,
                         &bytes,
                         "displaced-live-login",
                         live_identity.as_ref(),
-                        req.force,
                         &mut warnings,
                     )?;
                 }
@@ -889,8 +898,8 @@ impl Engine {
 
     /// Saves a live secret the switch is about to overwrite or clear (§6.3, B.5), unless it
     /// carries nothing account-scoped: an entry holding only machine-shared keys loses nothing,
-    /// since those are carried over. A failed save aborts, except under --force.
-    #[allow(clippy::too_many_arguments)]
+    /// since those are carried over. The error is the failed save; whether it aborts is the
+    /// caller's call (B.5: it does, except under --force).
     fn displace_live(
         &self,
         p: &dyn Provider,
@@ -898,28 +907,22 @@ impl Engine {
         bytes: &[u8],
         reason: &str,
         live_identity: Option<&Identity>,
-        force: bool,
         warnings: &mut Vec<String>,
     ) -> Result<(), EngineError> {
         let Some(fp) = p.fingerprint(bytes) else {
             return Ok(());
         };
-        match displace(
+        let id = displace(
             self,
             provider,
             bytes,
             Some(&fp),
             reason,
             live_identity.map(|i| &i.raw),
-        ) {
-            Ok(id) => warnings.push(format!(
-                "the previous live credential was saved as displaced/{id}"
-            )),
-            Err(e) if force => {
-                warnings.push(format!("could not save the previous live credential: {e}"))
-            }
-            Err(e) => return Err(e),
-        }
+        )?;
+        warnings.push(format!(
+            "the previous live credential was saved as displaced/{id}"
+        ));
         Ok(())
     }
 

@@ -335,23 +335,48 @@ fn unsafe_live_reads_abort_without_changing_anything() {
     fs::remove_file(fx.paths().credentials_file).unwrap();
 
     fx.set_live_credential(b"");
-    assert!(
-        matches!(switch(&fx, to(&a), false), Err(EngineError::InvalidInput(m)) if m.contains("empty"))
-    );
+    assert_an_empty_read(switch(&fx, to(&a), false));
     fx.set_live_credential(&before);
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
 }
 
-/// §9.4 step 3 on the managed-key axis, with or without --force: an empty read (a Keychain
-/// timeout can look empty) aborts, and the item it could not read is neither saved nor
-/// cleared.
-fn assert_an_empty_managed_key_aborts(fx: &Fx, result: Result<SwitchOutcome, EngineError>) {
+/// §9.4 step 3: a live value that read back empty is reported as unreadable (exit 1, never
+/// the usage-error code), and nothing is attempted.
+fn assert_an_empty_read(result: Result<SwitchOutcome, EngineError>) {
+    let err = result.unwrap_err();
+    assert_eq!(err.kind(), "unreadable", "{err}");
+    let msg = err.to_string();
     assert!(
-        matches!(&result, Err(EngineError::InvalidInput(m)) if m.contains("empty")),
-        "{result:?}"
+        msg.contains("read back empty") && msg.contains("not attempted"),
+        "{msg}"
     );
+}
+
+/// §9.4 step 3 on the managed-key axis, with or without --force: an empty Keychain item (a
+/// Keychain timeout can look empty) aborts, and the item it could not read is neither saved
+/// nor cleared.
+fn assert_an_empty_managed_key_aborts(fx: &Fx, result: Result<SwitchOutcome, EngineError>) {
+    assert_an_empty_read(result);
     assert_eq!(managed_key(fx).as_deref(), Some(&b""[..]), "left untouched");
     assert_eq!(displaced_files(fx), 0);
+}
+
+#[test]
+fn an_empty_primary_api_key_does_not_block_a_switch() {
+    // An empty `primaryApiKey` is what the config file really holds, not a timed-out read: it
+    // names no key, and writing OAuth removes it.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let config = fx.paths().global_config;
+    common::splice_config_key(&config, "primaryApiKey", &json!(""));
+    let out = switch(&fx, to(&a), false).unwrap();
+    assert_eq!(out.reason, SwitchReason::Switched);
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert!(matches!(
+        tagteam_cc::config::get_key(&config, "primaryApiKey"),
+        tagteam_provider::Read::Present(None)
+    ));
 }
 
 #[test]

@@ -52,15 +52,16 @@ pub const CLAUDE_JSON: &str = r#"{
 }
 "#;
 
-/// Replaces `oauthAccount` in the config at `path`, as CC does on a login. A free function, so
+/// Sets one top-level key of the config at `path`, changing nothing else. A free function, so
 /// a `'static` race callback can call it without borrowing the fixture.
-pub fn splice_oauth_account(path: &Path, oauth_account: &Value) {
+pub fn splice_config_key(path: &Path, key: &str, value: &Value) {
     let doc = fs::read(path).unwrap();
-    fs::write(
-        path,
-        replace_top_level(&doc, "oauthAccount", oauth_account).unwrap(),
-    )
-    .unwrap();
+    fs::write(path, replace_top_level(&doc, key, value).unwrap()).unwrap();
+}
+
+/// Replaces `oauthAccount` in the config at `path`, as CC does on a login.
+pub fn splice_oauth_account(path: &Path, oauth_account: &Value) {
+    splice_config_key(path, "oauthAccount", oauth_account);
 }
 
 /// Whether tagteam's mutation lock is free right now; takes and drops it if so.

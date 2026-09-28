@@ -889,6 +889,30 @@ fn a_counting_fence_stops_the_file_branch_of_clearing_account_keys() {
 }
 
 #[test]
+fn an_empty_primary_api_key_reads_as_no_managed_key() {
+    // The file read succeeded (a failed one is `Unreadable`), so an empty string there is what
+    // the file really holds, and it names no key. An empty Keychain item stays `Present("")`:
+    // that is what a Keychain timeout can look like.
+    for platform in [Platform::MacOs, Platform::Linux] {
+        let f = fx();
+        let s = store(&f, platform);
+        fs::write(&f.paths.global_config, r#"{"primaryApiKey": ""}"#).unwrap();
+        assert!(
+            matches!(s.read_managed_key(&f.env, &f.paths), Read::Absent),
+            "{platform:?}"
+        );
+    }
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    f.kc.put(
+        &keychain_service(&f.env, ItemKind::ManagedKey),
+        &keychain_account(&f.env),
+        b"",
+    );
+    assert!(matches!(s.read_managed_key(&f.env, &f.paths), Read::Present(k) if k.is_empty()));
+}
+
+#[test]
 fn read_managed_key_is_unreadable_when_the_keychain_item_is_unreadable_even_with_a_primary_api_key_present()
  {
     let f = fx();

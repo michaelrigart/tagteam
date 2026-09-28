@@ -185,6 +185,10 @@ impl LiveStore {
         }
     }
 
+    /// The Keychain item first; then `primaryApiKey` in the config. An empty item stays
+    /// `Present("")`, since a Keychain timeout can look like that. An empty `primaryApiKey` is
+    /// what a successful file read really found, and it names no key, so it reads as absent;
+    /// both write paths remove it anyway.
     pub fn read_managed_key(&self, env: &Env, paths: &CcPaths) -> Read<Vec<u8>> {
         if self.mac() {
             match self.find_first(
@@ -197,7 +201,7 @@ impl LiveStore {
             }
         }
         match config::get_key(&paths.global_config, "primaryApiKey") {
-            Read::Present(Some(Value::String(k))) => Read::Present(k.into_bytes()),
+            Read::Present(Some(Value::String(k))) if !k.is_empty() => Read::Present(k.into_bytes()),
             Read::Present(_) | Read::Absent => Read::Absent,
             Read::Unreadable(e) => Read::Unreadable(e),
         }

@@ -176,6 +176,22 @@ fn a_rotation_target_removed_during_the_wait_is_planned_again() {
     assert_eq!(out.to.unwrap().id, b);
 }
 
+#[test]
+fn a_direct_target_removed_during_the_wait_is_reported_after_planning_again() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let other = fx.engine_with_env(fx.env.clone());
+    let removed = a.clone();
+    fx.engine
+        .on_point("planned", Box::new(move || drop(other.remove(&removed))));
+    assert!(matches!(
+        switch_to(&fx, &a, false),
+        Err(EngineError::NoSuchAccount(id)) if id == a.as_str()
+    ));
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
 /// Records, for every oracle call, whether tagteam's mutation lock was free at the time.
 struct GuardProbe {
     env: Env,

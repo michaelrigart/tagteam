@@ -999,8 +999,9 @@ here on.
      Keychain item and in `.credentials.json` alike. An entry is deleted only when no
      machine-shared key remains in it.
 
-   An account-scoped secret on the axis being cleared that no vault holds is displaced before
-   it is cleared.
+   An account-scoped secret on the auth axis the outgoing account is not on — which step 4 does
+   not classify — is displaced before step 7 clears or overwrites it, unless it is the target's
+   generation.
 8. **Splice** the target's `oauthAccount` into `~/.claude.json` (§9.5).
 9. **Commit** in one store transaction: set the active account, insert an `events` row
    (`source` = `cli` or `auto`), and delete the journal row.
