@@ -333,13 +333,16 @@ impl App<'_, '_> {
                 yes,
             } => {
                 let token = self.token(token)?;
-                let out = self.engine.add_token(AddTokenOptions {
-                    provider: self.provider(),
-                    token,
-                    position,
-                    email,
-                    alias,
-                    yes,
+                let provider = self.provider();
+                let out = self.confirming(yes, |engine, yes| {
+                    engine.add_token(AddTokenOptions {
+                        provider: provider.clone(),
+                        token: token.clone(),
+                        position,
+                        email: email.clone(),
+                        alias: alias.clone(),
+                        yes,
+                    })
                 })?;
                 self.added(out.account, out.created);
             }
@@ -475,6 +478,26 @@ impl App<'_, '_> {
         self.print_account(&human, account, Some(created));
     }
 
+    /// §10.1: `--position` over another account needs confirmation, or `--yes`. A person is
+    /// asked, and a yes runs `write` again with `yes` set, with whatever it has already read;
+    /// anywhere else the engine's refusal, which names `--yes`, stands.
+    fn confirming<T>(
+        &mut self,
+        yes: bool,
+        write: impl Fn(&Engine, bool) -> Result<T, EngineError>,
+    ) -> Result<T, Failure> {
+        match write(&self.engine, yes) {
+            Err(EngineError::NeedsConfirmation { position, occupant }) if self.can_prompt() => {
+                let question = format!("Position {position} holds {occupant}. Replace it?");
+                if !self.io.prompter.confirm(&question, false) {
+                    return Err(cancelled());
+                }
+                Ok(write(&self.engine, true)?)
+            }
+            other => Ok(other?),
+        }
+    }
+
     fn add(
         &mut self,
         provider: ProviderId,
@@ -482,24 +505,14 @@ impl App<'_, '_> {
         alias: Option<String>,
         yes: bool,
     ) -> Result<(), Failure> {
-        let opts = |yes| AddOptions {
-            provider: provider.clone(),
-            position,
-            alias: alias.clone(),
-            yes,
-        };
-        let out = match self.engine.add_live(opts(yes)) {
-            Err(EngineError::NeedsConfirmation { position, occupant }) if self.can_prompt() => {
-                if !self.io.prompter.confirm(
-                    &format!("Position {position} holds {occupant}. Replace it?"),
-                    false,
-                ) {
-                    return Err(cancelled());
-                }
-                self.engine.add_live(opts(true))?
-            }
-            other => other?,
-        };
+        let out = self.confirming(yes, |engine, yes| {
+            engine.add_live(AddOptions {
+                provider: provider.clone(),
+                position,
+                alias: alias.clone(),
+                yes,
+            })
+        })?;
         self.notices(&out.notices);
         self.added(out.account, out.created);
         Ok(())

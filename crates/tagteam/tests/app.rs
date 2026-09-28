@@ -475,6 +475,67 @@ fn prompts_never_block_a_non_interactive_caller() {
     assert!(err.contains("`-`"), "{err}");
 }
 
+const REPLACE_A: &str = "Position 1 holds a@x.co. Replace it?";
+
+/// `a@x.co` stored at position 1, and live.
+fn with_one_login() -> H {
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    h.ok(&["add"]);
+    h
+}
+
+#[test]
+fn add_token_over_an_occupied_position_asks_on_a_terminal_and_keeps_the_token() {
+    // §10.2, as §10.1: the token is read once, before the question, and kept for the retry.
+    let h = with_one_login();
+    let mut yes = Scripted::answering(&["sk-ant-api03-key", "y"]);
+    let (code, out, err) = h.run(&["add-token", "--position", "1"], &mut yes);
+    assert_eq!(
+        (code, out.as_str()),
+        (0, "Added api-key-1@token.local at position 1.\n"),
+        "{err}"
+    );
+    assert_eq!(yes.asked, ["Token: ", REPLACE_A]);
+    assert_eq!(h.ok(&["list"]), "  1  api-key-1@token.local  api key\n");
+}
+
+#[test]
+fn declining_add_token_over_an_occupied_position_cancels_and_keeps_the_occupant() {
+    let h = with_one_login();
+    let mut no = Scripted::answering(&["n"]);
+    let (code, out, err) = h.run(
+        &["add-token", "sk-ant-api03-key", "--position", "1"],
+        &mut no,
+    );
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (1, "", "tagteam: cancelled\n")
+    );
+    assert_eq!(no.asked, [REPLACE_A]);
+    assert_eq!(h.ok(&["list"]), "* 1  a@x.co\n");
+}
+
+#[test]
+fn add_token_over_an_occupied_position_never_asks_off_a_terminal() {
+    let h = with_one_login();
+    let args = ["add-token", "sk-ant-api03-key", "--position", "1"];
+    let (code, _, err) = h.run(&args, &mut Scripted::none());
+    assert_eq!(code, 1);
+    assert!(err.contains("--yes"), "{err}");
+    // `--json` never prompts, even on a terminal: Scripted panics on any prompt it has no answer for.
+    let (code, out, _) = h.run(
+        &[&args[..], &["--json"]].concat(),
+        &mut Scripted::answering(&[]),
+    );
+    assert_eq!(code, 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["error"]["type"],
+        "needs-confirmation"
+    );
+    assert_eq!(h.ok(&["list"]), "* 1  a@x.co\n");
+}
+
 #[test]
 fn an_ambiguous_email_is_chosen_on_a_terminal_and_refused_elsewhere() {
     // §10.4: one email in two organizations.
