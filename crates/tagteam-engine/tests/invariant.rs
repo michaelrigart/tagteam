@@ -2,12 +2,15 @@ mod common;
 
 use std::any::Any;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use common::{Fx, HomeSnapshot, crash_row, splice_config_key, write_target_credential};
+use common::{
+    Fx, HomeSnapshot, assert_journal_cleared, crashed_switch, splice_config_key,
+    write_target_credential,
+};
 use serde_json::json;
 use tagteam_cc::live::Platform;
-use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
+use tagteam_engine::switch::{SwitchOutcome, SwitchRequest};
 
 fn check(fx: &Fx, step: &str, op: impl FnOnce()) {
     let before = fx.snapshot();
@@ -48,14 +51,40 @@ fn expect_violation(
     msg
 }
 
-/// Moves `real` into `home/dotfiles/<name>` and replaces it with a symlink to there — the
-/// `dotfiles`-manages-`~/.claude.json` scenario, without duplicating the setup in every test.
-fn symlink_into_dotfiles(home: &Path, real: &Path) {
+/// A relative path from directory `from` to `to`, for building a relative symlink target — the
+/// shape GNU stow creates.
+fn relative_from(from: &Path, to: &Path) -> PathBuf {
+    let from: Vec<_> = from.components().collect();
+    let to: Vec<_> = to.components().collect();
+    let common = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = PathBuf::new();
+    for _ in common..from.len() {
+        out.push("..");
+    }
+    for comp in &to[common..] {
+        out.push(comp.as_os_str());
+    }
+    out
+}
+
+/// Moves `real` into `home/dotfiles/<name>` and replaces it with a symlink to there — absolute,
+/// or relative (the GNU-stow shape) when `relative` — without duplicating the setup in every
+/// test.
+fn symlink_into_dotfiles(home: &Path, real: &Path, relative: bool) {
     let dot = home.join("dotfiles");
     std::fs::create_dir_all(&dot).unwrap();
     let target = dot.join(real.file_name().unwrap());
     std::fs::rename(real, &target).unwrap();
-    std::os::unix::fs::symlink(&target, real).unwrap();
+    let link_target = if relative {
+        relative_from(real.parent().unwrap(), &target)
+    } else {
+        target
+    };
+    std::os::unix::fs::symlink(&link_target, real).unwrap();
 }
 
 /// A starting state closer to a real `~/.claude`, so the invariant exercises the masking and
@@ -87,19 +116,53 @@ fn seed_extra_credential_keys(fx: &Fx) {
     fx.set_live_credential(v.to_string().as_bytes());
 }
 
+/// A login that also re-seeds the extra machine-shared keys `seed_extra_credential_keys`
+/// plants: `Fx::login` replaces the whole live credential with a fresh one carrying only
+/// `mcpOAuth`, so every login in the sequence must re-apply the extras or they vanish after the
+/// very next one (fix round 2, finding 1).
+fn login_with_extras(fx: &Fx, email: &str, rt: &str) {
+    fx.login(email, rt);
+    seed_extra_credential_keys(fx);
+}
+
+/// Asserts the extra machine-shared keys `seed_extra_credential_keys` planted are still present
+/// in the live credential — a positive check, on top of the invariant, that a switch actually
+/// carries the whole declared machine-shared set forward, not just the `mcpOAuth` every other
+/// scenario already happens to exercise.
+fn assert_extra_credential_keys_present(fx: &Fx) {
+    let v = fx
+        .live_credential()
+        .expect("a live credential must exist once any account has logged in");
+    assert_eq!(
+        v.get("mcpOAuthClientConfig"),
+        Some(&json!({"client": "shared-config"})),
+        "mcpOAuthClientConfig did not survive the switch"
+    );
+    assert_eq!(
+        v.get("pluginSecrets"),
+        Some(&json!({"plugin": "shared-secret"})),
+        "pluginSecrets did not survive the switch"
+    );
+}
+
 /// Switches, then asserts the switch actually took effect by comparing the live identity to
 /// the outcome's own declared target — never a hard-coded email — so a switch that silently
-/// no-ops can never hide behind an invariant check that only looks for illegal writes.
+/// no-ops can never hide behind an invariant check that only looks for illegal writes. Also
+/// asserts the extra machine-shared keys survived, on top of the invariant's own check.
 fn switch_and_verify(fx: &Fx, req: SwitchRequest) -> SwitchOutcome {
     let outcome = fx.engine.switch(req).unwrap();
-    if let Some(to) = &outcome.to {
-        assert_eq!(
-            fx.live_email(),
-            to.email.clone(),
-            "switch to {:?} did not take effect",
-            to.id
-        );
-    }
+    assert!(outcome.switched, "switch did not report switched");
+    let to = outcome
+        .to
+        .as_ref()
+        .expect("a switch outcome must always resolve a target");
+    assert_eq!(
+        fx.live_email(),
+        to.email.clone(),
+        "switch to {:?} did not take effect",
+        to.id
+    );
+    assert_extra_credential_keys_present(fx);
     outcome
 }
 
@@ -110,15 +173,14 @@ fn run_every_command(platform: Platform) {
 fn run_every_command_on(fx: &Fx) {
     seed_realistic_state(fx);
 
-    fx.login("a@x.co", "rt-a");
-    seed_extra_credential_keys(fx);
+    login_with_extras(fx, "a@x.co", "rt-a");
     let mut a = None;
     check(fx, "add a", || {
         a = Some(fx.engine.add_live(fx.add_options()).unwrap().account.id)
     });
     let a = a.unwrap();
 
-    fx.login("b@x.co", "rt-b");
+    login_with_extras(fx, "b@x.co", "rt-b");
     let mut b = None;
     check(fx, "add b", || {
         b = Some(fx.engine.add_live(fx.add_options()).unwrap().account.id)
@@ -169,15 +231,7 @@ fn run_every_command_on(fx: &Fx) {
         drop(switch_and_verify(fx, fx.switch_request(&b, true)))
     });
     check(fx, "rotation", || {
-        drop(switch_and_verify(
-            fx,
-            SwitchRequest {
-                provider: fx.provider(),
-                target: SwitchTarget::Rotation,
-                force: false,
-                source: "cli",
-            },
-        ))
+        drop(switch_and_verify(fx, fx.rotation_request(false)))
     });
     check(fx, "alias", || {
         drop(fx.engine.set_alias(&a, Some("work")).unwrap())
@@ -195,8 +249,7 @@ fn run_every_command_on(fx: &Fx) {
     check(fx, "switch before recovery", || {
         drop(switch_and_verify(fx, fx.switch_request(&b, false)))
     });
-    let row = crash_row(fx, &b, &a);
-    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    crashed_switch(fx, &b, &a);
     write_target_credential(fx, &a);
     check(fx, "recover interrupted switch", || {
         drop(fx.engine.set_disabled(&a, false).unwrap());
@@ -206,19 +259,11 @@ fn run_every_command_on(fx: &Fx) {
             "forward recovery did not land"
         );
     });
-    assert!(
-        fx.engine
-            .store()
-            .unwrap()
-            .journal(&fx.provider())
-            .unwrap()
-            .is_none(),
-        "recovery left a journal row behind"
-    );
+    assert_journal_cleared(fx);
 
     // A forced switch that displaces an unmanaged login: CC was logged into an identity
     // tagteam never captured, and the forced switch must still land.
-    fx.login("stranger@x.co", "rt-stranger");
+    login_with_extras(fx, "stranger@x.co", "rt-stranger");
     check(fx, "forced switch displaces unmanaged login", || {
         drop(switch_and_verify(fx, fx.switch_request(&b, true)))
     });
@@ -252,13 +297,18 @@ fn every_m1_command_writes_only_the_identity_surface_on_linux() {
 
 #[test]
 fn every_m1_command_writes_only_the_identity_surface_through_symlinked_config() {
-    // `~/.claude.json` and `~/.claude/settings.json` are both symlinked into a dotfiles-style
-    // location: the surface's write-through must apply to the resolved target, not the link's
-    // own literal name, and the settings.json link (outside the surface entirely) must stay
-    // completely untouched through the whole run (§15.3's resolved-path fix).
+    // `~/.claude.json` (relative, GNU-stow style) and `~/.claude/settings.json` (absolute) are
+    // both symlinked into a dotfiles-style location: the surface's write-through must apply to
+    // the resolved target, not the link's own literal name, and the settings.json link (outside
+    // the surface entirely) must stay completely untouched through the whole run (§15.3's
+    // resolved-path fix).
     let fx = Fx::with_platform(Platform::MacOs);
-    symlink_into_dotfiles(&fx.env.home, &fx.paths().global_config);
-    symlink_into_dotfiles(&fx.env.home, &fx.env.home.join(".claude/settings.json"));
+    symlink_into_dotfiles(&fx.env.home, &fx.paths().global_config, true);
+    symlink_into_dotfiles(
+        &fx.env.home,
+        &fx.env.home.join(".claude/settings.json"),
+        false,
+    );
     run_every_command_on(&fx);
     assert!(
         std::fs::symlink_metadata(&fx.paths().global_config)
@@ -273,6 +323,33 @@ fn every_m1_command_writes_only_the_identity_surface_through_symlinked_config() 
             .file_type()
             .is_symlink(),
         "the ~/.claude/settings.json link itself must survive as a link"
+    );
+}
+
+#[test]
+fn every_m1_command_writes_only_the_identity_surface_through_symlinked_config_on_linux() {
+    // Linux is the platform where a secret-file write could plausibly replace a link outright
+    // (an atomic rename onto the literal path rather than through it) — `write_atomic_with`
+    // resolves through the link first, so both links (one absolute, one relative) must still
+    // survive a full run.
+    let fx = Fx::with_platform(Platform::Linux);
+    std::fs::write(&fx.paths().credentials_file, b"{}").unwrap(); // must pre-exist to symlink
+    symlink_into_dotfiles(&fx.env.home, &fx.paths().global_config, false);
+    symlink_into_dotfiles(&fx.env.home, &fx.paths().credentials_file, true);
+    run_every_command_on(&fx);
+    assert!(
+        std::fs::symlink_metadata(&fx.paths().global_config)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the ~/.claude.json link itself must survive as a link"
+    );
+    assert!(
+        std::fs::symlink_metadata(&fx.paths().credentials_file)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the credentials-file link itself must survive as a link"
     );
 }
 
@@ -319,7 +396,7 @@ fn the_comparison_catches_a_mode_change() {
 fn the_comparison_catches_a_symlink_replaced_by_a_regular_file() {
     let fx = Fx::new();
     let p = fx.env.home.join(".claude/settings.json");
-    symlink_into_dotfiles(&fx.env.home, &p);
+    symlink_into_dotfiles(&fx.env.home, &p, false);
     let target = fx.env.home.join("dotfiles/settings.json");
     let before = fx.snapshot();
     // Same bytes, but no longer a link: a byte-only comparison would miss this entirely.

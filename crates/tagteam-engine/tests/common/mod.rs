@@ -119,6 +119,22 @@ pub fn write_target_credential(fx: &Fx, to: &AccountId) {
     fx.set_live_credential(&composed);
 }
 
+/// Leaves a journal row as a switch from `from` to `to` that died after step 6.
+pub fn crashed_switch(fx: &Fx, from: &AccountId, to: &AccountId) {
+    let row = crash_row(fx, from, to);
+    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+}
+
+/// The provider's current journal row, if any.
+pub fn journal(fx: &Fx) -> Option<JournalRow> {
+    fx.engine.store().unwrap().journal(&fx.provider()).unwrap()
+}
+
+/// Asserts the provider's journal is clear: recovery must always finish by clearing it.
+pub fn assert_journal_cleared(fx: &Fx) {
+    assert!(journal(fx).is_none(), "a journal row was left behind");
+}
+
 /// A Keychain vault that runs `on_read` with each key just before reading it: for observing
 /// what holds while the engine reads the vault.
 pub struct ProbeVault {
@@ -307,6 +323,16 @@ impl Fx {
         self.engine.switch(self.switch_request(id, force))
     }
 
+    /// A manual `switch --rotate` from the CLI, optionally forced.
+    pub fn rotation_request(&self, force: bool) -> SwitchRequest {
+        SwitchRequest {
+            provider: self.provider(),
+            target: SwitchTarget::Rotation,
+            force,
+            source: "cli",
+        }
+    }
+
     pub fn live_credential(&self) -> Option<Value> {
         let bytes = match self.platform {
             Platform::MacOs => self.kc.get(
@@ -488,11 +514,26 @@ impl Fx {
 
 /// A path's kind, for the snapshot comparison. A symlink records its `read_link` target
 /// rather than following it: the walk never reads or descends through a link.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum EntryKind {
     File(Vec<u8>),
     Dir,
     Symlink(PathBuf),
+}
+
+/// A lossy UTF-8 rendering of a file's bytes, so a violation message shows readable JSON
+/// instead of a raw byte-array dump.
+impl std::fmt::Debug for EntryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntryKind::File(bytes) => f
+                .debug_tuple("File")
+                .field(&String::from_utf8_lossy(bytes))
+                .finish(),
+            EntryKind::Dir => write!(f, "Dir"),
+            EntryKind::Symlink(target) => f.debug_tuple("Symlink").field(target).finish(),
+        }
+    }
 }
 
 /// One path's kind, permission bits, and content (for a file) — everything the invariant
@@ -517,9 +558,11 @@ pub struct HomeSnapshot {
 /// tolerate silently: it panics rather than treating a path as absent or empty.
 ///
 /// A bare ancestor directory of `skip` (`~/.local`, say, above `~/.local/share/tagteam`) is
-/// walked through — so a sibling of the excluded subtree is still found — but never recorded
-/// itself: it is created lazily as a side effect of creating the excluded subtree, not state
-/// the invariant should have an opinion on.
+/// walked through — so a sibling of the excluded subtree is still found — and IS recorded like
+/// any other entry. Its lazy first creation (a side effect of creating the excluded subtree) is
+/// tolerated by the comparison, not by omitting it here: once it exists, a later change to it
+/// (a mode change, say) must still be caught, which excluding it from the walk entirely could
+/// never do.
 fn walk(dir: &Path, skip: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -531,9 +574,6 @@ fn walk(dir: &Path, skip: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
         let is_plain_dir = meta.is_dir() && !meta.file_type().is_symlink();
         if is_plain_dir {
             walk(&path, skip, out);
-            if skip.starts_with(&path) {
-                continue;
-            }
         }
         let kind = if meta.file_type().is_symlink() {
             EntryKind::Symlink(fs::read_link(&path).unwrap())
@@ -615,20 +655,49 @@ fn surface_file_bytes<'e>(
     }
 }
 
+/// Collapses `.`/`..` components lexically (no filesystem access): a relative symlink target
+/// joined to its link's parent directory needs this before it can match one of the snapshot's
+/// own keys, which are always built without `..` segments.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// The real path a declared surface path's writes actually land at: the pre-mutation
 /// snapshot's `read_link` target when the surface path is itself a symlink (§9.5's
-/// write-through), or the path itself otherwise. Resolving from `before` — never `after` —
+/// write-through) — a relative target resolved against its link's own directory, and a chain of
+/// links followed up to 40 hops, matching `tagteam_provider::atomic::resolve_target`'s own limit
+/// — or the path itself when it is not a symlink. Resolving from `before` — never `after` —
 /// means the literal surface path is then left to the default byte-for-byte rule below, so a
 /// link that gets replaced, or repointed, is still caught: it is no longer a surface path once
 /// resolved away from, so any change to it at all is a violation.
 fn resolve(snapshot: &HomeSnapshot, path: &Path) -> PathBuf {
-    match snapshot.files.get(path) {
-        Some(Entry {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        let Some(Entry {
             kind: EntryKind::Symlink(target),
             ..
-        }) => target.clone(),
-        _ => path.to_path_buf(),
+        }) = snapshot.files.get(&current)
+        else {
+            return current;
+        };
+        let next = if target.is_absolute() {
+            target.clone()
+        } else {
+            current.parent().unwrap_or(Path::new("/")).join(target)
+        };
+        current = normalize(&next);
     }
+    current
 }
 
 impl Fx {
@@ -656,6 +725,7 @@ impl Fx {
         step: &str,
     ) {
         let surface = self.cc.identity_surface(&self.env);
+        let data_dir = self.env.data_dir();
         let json_keys: BTreeMap<PathBuf, Vec<String>> = surface
             .json_keys
             .iter()
@@ -669,6 +739,12 @@ impl Fx {
         let paths: BTreeSet<&PathBuf> = before.files.keys().chain(after.files.keys()).collect();
         for path in paths {
             let (b, a) = (before.files.get(path), after.files.get(path));
+            if b.is_none() && data_dir.starts_with(path) {
+                // A bare ancestor of tagteam's own data dir, created lazily just now: tolerated
+                // only on its first appearance. Once it exists in `before` too, it falls through
+                // to the rules below like any other path, so a later change to it is still caught.
+                continue;
+            }
             if let Some(keys) = json_keys.get(path) {
                 let (bb, ab) = (
                     surface_file_bytes(b, step, path),

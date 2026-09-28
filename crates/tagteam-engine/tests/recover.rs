@@ -1,7 +1,8 @@
 mod common;
 
 use common::{
-    API_KEY, Fx, STRAY_API_KEY, crash_row, dead_holder, vault_fp, write_target_credential,
+    API_KEY, Fx, STRAY_API_KEY, assert_journal_cleared, crash_row, crashed_switch, dead_holder,
+    journal, vault_fp, write_target_credential,
 };
 use serde_json::Value;
 use tagteam_cc::ItemKind;
@@ -11,18 +12,8 @@ use tagteam_engine::EngineError;
 use tagteam_engine::store::JournalRow;
 use tagteam_provider::{Keychain, ProcessStamp, Provider};
 
-/// Leaves a journal row as a switch from `from` to `to` that died after step 6.
-fn crashed_switch(fx: &Fx, from: &AccountId, to: &AccountId) {
-    let row = crash_row(fx, from, to);
-    fx.engine.store().unwrap().insert_journal(&row).unwrap();
-}
-
 fn any_mutation(fx: &Fx, id: &AccountId) {
     fx.engine.set_disabled(id, false).unwrap(); // takes the mutation lock, so it recovers
-}
-
-fn journal(fx: &Fx) -> Option<JournalRow> {
-    fx.engine.store().unwrap().journal(&fx.provider()).unwrap()
 }
 
 fn active(fx: &Fx) -> Option<AccountId> {
@@ -45,7 +36,7 @@ fn a_landed_credential_finishes_forward() {
     any_mutation(&fx, &a);
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
     assert_eq!(active(&fx), Some(a));
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
 }
 
 #[test]
@@ -62,7 +53,7 @@ fn forward_recovery_displaces_a_stray_secret_on_the_axis_it_clears() {
     assert_eq!(fx.displaced(), [STRAY_API_KEY.as_bytes()]);
     assert_eq!(fx.managed_key(), None);
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
 }
 
 #[test]
@@ -81,7 +72,7 @@ fn a_rotated_target_the_oracle_attributes_finishes_forward() {
         Some("rt-a-rotated-by-cc"),
         "never written back"
     );
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
 }
 
 #[test]
@@ -95,7 +86,7 @@ fn an_unlanded_credential_finishes_backward_without_touching_it() {
     any_mutation(&fx, &a);
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
     assert_eq!(active(&fx), Some(b), "kept");
 }
 
@@ -116,7 +107,7 @@ fn a_rotated_outgoing_credential_the_oracle_attributes_finishes_backward() {
         fx.live_refresh_token().as_deref(),
         Some("rt-b-rotated-by-cc")
     );
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
 }
 
 #[test]
@@ -168,7 +159,7 @@ fn a_stale_file_behind_an_unreadable_keychain_is_undecidable() {
     fx.kc.set_unreadable(&svc, &acct, false);
     any_mutation(&fx, &a);
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"), "once readable");
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
 }
 
 #[test]
@@ -229,7 +220,7 @@ fn the_reverse_cross_axis_switch_never_displaces_the_outgoing_key() {
     crashed_switch(&fx, &k, &a);
     write_target_credential(&fx, &a);
     any_mutation(&fx, &a);
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
     assert_eq!(active(&fx), Some(a));
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
     assert_eq!(fx.managed_key(), None);
@@ -246,7 +237,7 @@ fn an_api_key_outgoing_account_finishes_backward_on_its_own_axis() {
     // Nothing reached the auth axes, but the identity rollback failed.
     common::splice_oauth_account(&fx.paths().global_config, &Fx::oauth_account("a@x.co"));
     any_mutation(&fx, &a);
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
     assert_eq!(active(&fx), Some(k));
     assert_eq!(fx.live_email().as_deref(), Some("api-key-2@token.local"));
     assert_eq!(fx.managed_key().as_deref(), Some(API_KEY.as_bytes()));
@@ -260,14 +251,14 @@ fn the_linux_file_store_recovers_both_ways() {
     crashed_switch(&fx, &b, &a);
     write_target_credential(&fx, &a);
     any_mutation(&fx, &a);
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
     assert_eq!(active(&fx), Some(a.clone()));
 
     crashed_switch(&fx, &a, &b);
     common::splice_oauth_account(&fx.paths().global_config, &Fx::oauth_account("b@x.co"));
     any_mutation(&fx, &a);
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
     assert_eq!(active(&fx), Some(a));
@@ -321,7 +312,7 @@ fn a_switch_after_a_decidable_row_recovers_it_then_proceeds() {
     crashed_switch(&fx, &b, &a);
     write_target_credential(&fx, &a);
     fx.switch_to(&b, false).unwrap();
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
     assert_eq!(active(&fx), Some(b));
@@ -337,7 +328,7 @@ fn a_forced_switch_plans_again_after_its_own_lock_recovers_a_row() {
     crashed_switch(&fx, &b, &a);
     write_target_credential(&fx, &a);
     fx.switch_to(&b, true).unwrap();
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
     assert_eq!(active(&fx), Some(b));
@@ -483,5 +474,5 @@ fn two_engines_never_double_switch() {
         (email == "a@x.co" && rt == "rt-a") || (email == "b@x.co" && rt == "rt-b"),
         "{email} / {rt}"
     );
-    assert!(journal(&fx).is_none());
+    assert_journal_cleared(&fx);
 }
