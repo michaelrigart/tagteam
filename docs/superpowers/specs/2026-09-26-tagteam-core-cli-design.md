@@ -922,7 +922,7 @@ These are decided before locking and re-checked afterwards.
 
 | Invocation | Strategy | Anchor | Behaviour |
 |---|---|---|---|
-| `switch` (bare) | rotation | the store's active account | Next switchable position after the anchor |
+| `switch` (bare) | rotation | the live account if it is managed; otherwise the store's active account | Next switchable position after the anchor |
 | `switch --strategy next-available` | next-available | the live account | Like rotation, but skips candidates with headroom ≤ 0 (the message names the binding window). If every candidate is exhausted: `candidates-exhausted` |
 | `switch --strategy best` | best | the live account | Switch only if some switchable account has strictly more headroom. Ties stay put |
 | `switch <ACCOUNT>` | direct | — | Disabled accounts are allowed as explicit targets |

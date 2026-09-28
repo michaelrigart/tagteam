@@ -38,8 +38,8 @@ fn displaced_files(fx: &Fx) -> usize {
     fx.displaced().len()
 }
 
-/// A new machine: no `oauthAccount`, no credential, no active account.
-fn make_fresh_machine(fx: &Fx) {
+/// `claude /logout`: no `oauthAccount` and no credential. The store is not told.
+fn log_out(fx: &Fx) {
     fs::write(fx.paths().global_config, common::CLAUDE_JSON).unwrap();
     fx.kc
         .delete(
@@ -47,6 +47,11 @@ fn make_fresh_machine(fx: &Fx) {
             &keychain_account(&fx.env),
         )
         .unwrap();
+}
+
+/// A new machine: no `oauthAccount`, no credential, no active account.
+fn make_fresh_machine(fx: &Fx) {
+    log_out(fx);
     fx.engine
         .store()
         .unwrap()
@@ -161,6 +166,48 @@ fn a_fresh_machine_activates_the_first_switchable_account() {
         fx.live_credential().unwrap().get("mcpOAuth").is_none(),
         "no live JSON: no machine-shared keys"
     );
+}
+
+#[test]
+fn a_bare_switch_rotates_on_from_a_managed_live_login() {
+    // §9.3: a managed live account anchors the rotation, even when the store's active account
+    // disagrees because the user ran `claude /login` outside tagteam.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let c = fx.add("c@x.co", "rt-c");
+    switch(&fx, to(&a), false).unwrap(); // the store's active account: a
+    fx.login("b@x.co", "rt-b"); // live: b, while the store still says a
+    let out = switch(&fx, SwitchTarget::Rotation, false).unwrap();
+    assert_eq!((out.switched, out.reason), (true, SwitchReason::Switched));
+    assert_eq!(out.from.map(|r| r.id), Some(b));
+    assert_eq!(out.to.map(|r| r.id), Some(c.clone()));
+    assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
+    assert_eq!(
+        fx.engine.store().unwrap().active(&fx.provider()).unwrap(),
+        Some(c)
+    );
+}
+
+#[test]
+fn without_a_managed_live_login_the_rotation_falls_back_to_the_store_s_active_account() {
+    // No live login, or an unmanaged one (which only --force may switch away from, §9.2): the
+    // store's active account is the anchor, and it is not live, so it is activated.
+    for unmanaged in [false, true] {
+        let fx = Fx::new();
+        fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b");
+        fx.add("c@x.co", "rt-c");
+        switch(&fx, to(&b), false).unwrap(); // the store's active account: b
+        if unmanaged {
+            fx.login("stranger@x.co", "rt-s");
+        } else {
+            log_out(&fx);
+        }
+        let out = switch(&fx, SwitchTarget::Rotation, unmanaged).unwrap();
+        assert_eq!(out.to.map(|r| r.id), Some(b), "unmanaged={unmanaged}");
+        assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    }
 }
 
 #[test]

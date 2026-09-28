@@ -389,9 +389,10 @@ impl Engine {
         Ok((live, row))
     }
 
-    /// §9.3 rotation: the next switchable position after the store's active account; on a
-    /// fresh machine, the store's active account if switchable, else the first. §9.2: fewer
-    /// than two switchable accounts stay put.
+    /// §9.3 rotation: the next switchable position after the live account when it is managed
+    /// (`live_row`), even if the store's active account disagrees (§6.1: the live identity
+    /// wins). With no live login, or an unmanaged one, the store's active account if
+    /// switchable, else the first. §9.2: fewer than two switchable accounts stay put.
     fn rotation(
         &self,
         store: &Store,
@@ -409,12 +410,11 @@ impl Engine {
                 "there is only one switchable account",
             ));
         }
-        let stored_active = store
-            .active(provider)?
-            .and_then(|id| accounts.iter().find(|a| a.id == id));
         let position = match live_row {
-            Some(live) => next_in_rotation(&slots, Some(stored_active.unwrap_or(live).position)),
-            None => stored_active
+            Some(live) => next_in_rotation(&slots, Some(live.position)),
+            None => store
+                .active(provider)?
+                .and_then(|id| accounts.iter().find(|a| a.id == id))
                 .map(|a| a.position)
                 .filter(|pos| slots.contains(&(*pos, true)))
                 .or_else(|| next_in_rotation(&slots, None)),
