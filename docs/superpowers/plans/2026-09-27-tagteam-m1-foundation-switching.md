@@ -1,6 +1,6 @@
 # tagteam M1 — Foundation and Manual Switching Implementation Plan
 
-**Status:** In progress
+**Status:** Implemented — branch `worktree-m1-foundation` at 6f016c1; no remote or merge request yet
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
