@@ -1,8 +1,9 @@
 mod common;
 
-use common::{Fx, STRAY_API_KEY};
+use common::{API_KEY, Fx, STRAY_API_KEY};
 use serde_json::Value;
 use tagteam_cc::ItemKind;
+use tagteam_cc::live::Platform;
 use tagteam_cc::shape::compose;
 use tagteam_core::AccountId;
 use tagteam_engine::EngineError;
@@ -62,6 +63,16 @@ fn journal(fx: &Fx) -> Option<JournalRow> {
     fx.engine.store().unwrap().journal(&fx.provider()).unwrap()
 }
 
+fn active(fx: &Fx) -> Option<AccountId> {
+    fx.engine.store().unwrap().active(&fx.provider()).unwrap()
+}
+
+/// The oracle resolves every live token to `email`'s login.
+fn oracle_says(fx: &Fx, email: &str) {
+    let owner = fx.cc.parse_identity(&Fx::oauth_account(email)).unwrap();
+    fx.oracle.set(Some(owner));
+}
+
 #[test]
 fn a_landed_credential_finishes_forward() {
     let fx = Fx::new();
@@ -71,8 +82,7 @@ fn a_landed_credential_finishes_forward() {
     write_target_credential(&fx, &a); // died after writing the credential, before the identity
     any_mutation(&fx, &a);
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
-    let store = fx.engine.store().unwrap();
-    assert_eq!(store.active(&fx.provider()).unwrap(), Some(a));
+    assert_eq!(active(&fx), Some(a));
     assert!(journal(&fx).is_none());
 }
 
@@ -101,8 +111,7 @@ fn a_rotated_target_the_oracle_attributes_finishes_forward() {
     crashed_switch(&fx, &b, &a);
     write_target_credential(&fx, &a);
     fx.rotate_live("rt-a-rotated-by-cc");
-    let owner = fx.cc.parse_identity(&Fx::oauth_account("a@x.co")).unwrap();
-    fx.oracle.set(Some(owner));
+    oracle_says(&fx, "a@x.co");
     any_mutation(&fx, &a);
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
     assert_eq!(
@@ -125,8 +134,7 @@ fn an_unlanded_credential_finishes_backward_without_touching_it() {
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
     assert!(journal(&fx).is_none());
-    let store = fx.engine.store().unwrap();
-    assert_eq!(store.active(&fx.provider()).unwrap(), Some(b), "kept");
+    assert_eq!(active(&fx), Some(b), "kept");
 }
 
 #[test]
@@ -139,8 +147,7 @@ fn a_rotated_outgoing_credential_the_oracle_attributes_finishes_backward() {
     crashed_switch(&fx, &b, &a);
     common::splice_oauth_account(&fx.paths().global_config, &Fx::oauth_account("a@x.co"));
     fx.rotate_live("rt-b-rotated-by-cc");
-    let owner = fx.cc.parse_identity(&Fx::oauth_account("b@x.co")).unwrap();
-    fx.oracle.set(Some(owner));
+    oracle_says(&fx, "b@x.co");
     any_mutation(&fx, &a);
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
     assert_eq!(
@@ -214,6 +221,166 @@ fn a_conflicting_auth_axis_keeps_the_row() {
     assert_eq!(fx.managed_key().as_deref(), Some(&b"sk-ant-api03-c"[..]));
 }
 
+#[test]
+fn a_cross_axis_switch_never_displaces_the_journaled_outgoing_generation() {
+    // OAuth → API key, killed after the key was stored and before the entry was cleared. The
+    // entry still holds the outgoing account's journaled generation, which step 4 already
+    // settled with its vault: clearing it loses nothing. A generation CC rotated since the
+    // crash was never settled, so that one is saved first.
+    for rotated in [false, true] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let k = fx.add_api_key(API_KEY); // leaves a live
+        crashed_switch(&fx, &a, &k);
+        fx.put_managed_key(API_KEY.as_bytes());
+        if rotated {
+            fx.rotate_live("rt-a-rotated-by-cc");
+        }
+        any_mutation(&fx, &a);
+        assert!(journal(&fx).is_none(), "rotated={rotated}");
+        assert_eq!(active(&fx), Some(k), "rotated={rotated}");
+        assert_eq!(fx.live_email().as_deref(), Some("api-key-2@token.local"));
+        assert_eq!(
+            fx.live_refresh_token(),
+            None,
+            "only machine-shared keys remain"
+        );
+        let displaced = fx.displaced();
+        assert_eq!(displaced.len(), usize::from(rotated), "rotated={rotated}");
+        assert!(
+            displaced
+                .iter()
+                .all(|d| String::from_utf8_lossy(d).contains("rt-a-rotated-by-cc"))
+        );
+    }
+}
+
+#[test]
+fn the_reverse_cross_axis_switch_never_displaces_the_outgoing_key() {
+    // API key → OAuth, killed after the entry was written and before the managed key was
+    // cleared: the key left behind is the outgoing account's journaled generation.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let k = fx.add_api_key(API_KEY);
+    fx.switch_to(&k, false).unwrap();
+    let displaced_before = fx.displaced().len();
+    crashed_switch(&fx, &k, &a);
+    write_target_credential(&fx, &a);
+    any_mutation(&fx, &a);
+    assert!(journal(&fx).is_none());
+    assert_eq!(active(&fx), Some(a));
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert_eq!(fx.managed_key(), None);
+    assert_eq!(fx.displaced().len(), displaced_before);
+}
+
+#[test]
+fn an_api_key_outgoing_account_finishes_backward_on_its_own_axis() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let k = fx.add_api_key(API_KEY);
+    fx.switch_to(&k, false).unwrap();
+    crashed_switch(&fx, &k, &a);
+    // Nothing reached the auth axes, but the identity rollback failed.
+    common::splice_oauth_account(&fx.paths().global_config, &Fx::oauth_account("a@x.co"));
+    any_mutation(&fx, &a);
+    assert!(journal(&fx).is_none());
+    assert_eq!(active(&fx), Some(k));
+    assert_eq!(fx.live_email().as_deref(), Some("api-key-2@token.local"));
+    assert_eq!(fx.managed_key().as_deref(), Some(API_KEY.as_bytes()));
+}
+
+#[test]
+fn the_linux_file_store_recovers_both_ways() {
+    let fx = Fx::with_platform(Platform::Linux);
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    any_mutation(&fx, &a);
+    assert!(journal(&fx).is_none());
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert_eq!(active(&fx), Some(a.clone()));
+
+    crashed_switch(&fx, &a, &b);
+    common::splice_oauth_account(&fx.paths().global_config, &Fx::oauth_account("b@x.co"));
+    any_mutation(&fx, &a);
+    assert!(journal(&fx).is_none());
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    assert_eq!(active(&fx), Some(a));
+}
+
+#[test]
+fn live_bytes_beat_a_contradicting_oracle_both_ways() {
+    for landed in [false, true] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b");
+        crashed_switch(&fx, &b, &a);
+        if landed {
+            write_target_credential(&fx, &a);
+        }
+        // The oracle names the account the live bytes do not.
+        let (decided, contradicted) = if landed {
+            (&a, "b@x.co")
+        } else {
+            (&b, "a@x.co")
+        };
+        oracle_says(&fx, contradicted);
+        any_mutation(&fx, &a);
+        assert!(journal(&fx).is_none(), "landed={landed}");
+        assert_eq!(active(&fx).as_ref(), Some(decided), "landed={landed}");
+        assert_ne!(fx.live_email().as_deref(), Some(contradicted));
+    }
+}
+
+#[test]
+fn an_oracle_answer_without_a_uuid_never_decides() {
+    // §7.6: an answer with no non-empty uuid of its own attributes nothing.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    fx.rotate_live("rt-a-rotated-by-cc");
+    let mut owner = Fx::oauth_account("a@x.co");
+    owner["accountUuid"] = Value::String(String::new());
+    fx.oracle.set(Some(fx.cc.parse_identity(&owner).unwrap()));
+    any_mutation(&fx, &a);
+    assert!(journal(&fx).is_some());
+}
+
+#[test]
+fn a_switch_after_a_decidable_row_recovers_it_then_proceeds() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    fx.switch_to(&b, false).unwrap();
+    assert!(journal(&fx).is_none());
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+    assert_eq!(active(&fx), Some(b));
+}
+
+#[test]
+fn a_forced_switch_plans_again_after_its_own_lock_recovers_a_row() {
+    // The forced switch plans against b's identity, then its mutation lock finishes the row
+    // forward to a: under the lock the live login has moved, so it plans again.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    fx.switch_to(&b, true).unwrap();
+    assert!(journal(&fx).is_none());
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+    assert_eq!(active(&fx), Some(b));
+}
+
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_row_that_appears_while_waiting_for_the_lock_is_recovered() {
@@ -261,10 +428,7 @@ fn forward_recovery_keeps_the_row_if_the_credential_changes_before_commit() {
     );
     any_mutation(&fx, &a);
     assert!(journal(&fx).is_some());
-    assert_ne!(
-        fx.engine.store().unwrap().active(&fx.provider()).unwrap(),
-        Some(a)
-    );
+    assert_ne!(active(&fx), Some(a));
 }
 
 #[cfg(feature = "test-hooks")]

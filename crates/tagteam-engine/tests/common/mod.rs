@@ -53,6 +53,8 @@ pub const CLAUDE_JSON: &str = r#"{
 }
 "#;
 
+/// An API key an account is added with (`Fx::add_api_key`).
+pub const API_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
 /// A managed key that no stored account holds.
 pub const STRAY_API_KEY: &str = "sk-ant-api03-stray-key-that-no-vault-holds";
 
@@ -333,6 +335,15 @@ impl Fx {
             alias: None,
             yes: false,
         }
+    }
+
+    /// Stores an API-key account (§10.2) without touching the live login.
+    pub fn add_api_key(&self, key: &str) -> AccountId {
+        self.engine
+            .add_token(self.add_token_options(key))
+            .unwrap()
+            .account
+            .id
     }
 
     /// Logs a fresh account in and captures it (§10.1). Tasks 19-21 each need only the

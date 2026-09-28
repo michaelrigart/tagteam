@@ -201,15 +201,25 @@ impl Engine {
         let identity = p.parse_identity(&to.identity_json)?;
         let live_identity = p.live_identity(&self.env).present();
         let mut warnings = Vec::new();
-        self.displace_unless_target(
-            p,
-            &row.provider,
-            own.other(),
-            live,
-            &target_secret,
-            live_identity.as_ref(),
-            &mut warnings,
-        )?;
+        // Step 7's off-axis rule covers only the axis the outgoing account is not on. After a
+        // cross-axis switch the axis being cleared may hold the outgoing generation the row
+        // journaled, which step 4 already settled with its vault: clearing it loses nothing.
+        // Anything else there, a generation CC rotated since the crash included, is saved.
+        let journaled_outgoing = row
+            .from_fp
+            .as_deref()
+            .is_some_and(|fp| holds(p, live, own.other(), fp));
+        if !journaled_outgoing {
+            self.displace_unless_target(
+                p,
+                &row.provider,
+                own.other(),
+                live,
+                &target_secret,
+                live_identity.as_ref(),
+                &mut warnings,
+            )?;
+        }
         for w in &warnings {
             tracing::warn!(provider = %row.provider, "recovering an interrupted switch: {w}");
         }

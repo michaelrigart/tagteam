@@ -12,7 +12,7 @@ use tagteam_cc::{ItemKind, keychain_service};
 use tagteam_core::AccountId;
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::store::JournalRow;
-use tagteam_engine::switch::{SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget};
+use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget};
 use tagteam_engine::{Engine, EngineError};
 use tagteam_provider::{Credential, Env, Identity, ProcessStamp, Provider};
 
@@ -25,14 +25,9 @@ fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
     }
 }
 
-fn switch_to(fx: &Fx, id: &AccountId, force: bool) -> Result<SwitchOutcome, EngineError> {
-    fx.engine
-        .switch(request(fx, SwitchTarget::Account(id.clone()), force))
-}
-
 /// Runs a switch that is expected to panic at an injected point.
 fn switch_panicking(fx: &Fx, id: &AccountId, force: bool) {
-    let r = catch_unwind(AssertUnwindSafe(|| switch_to(fx, id, force)));
+    let r = catch_unwind(AssertUnwindSafe(|| fx.switch_to(id, force)));
     assert!(r.is_err(), "the injected panic must reach the caller");
 }
 
@@ -89,7 +84,7 @@ fn an_error_at_any_step_restores_every_byte() {
         let cfg_before = std::fs::read(fx.paths().global_config).unwrap();
         let cred_before = fx.live_credential();
         fx.engine.fail_at(Some(point));
-        let err = switch_to(&fx, &a, false).unwrap_err();
+        let err = fx.switch_to(&a, false).unwrap_err();
         assert!(matches!(err, EngineError::RolledBack(_)), "{point}: {err}");
         assert_eq!(
             std::fs::read(fx.paths().global_config).unwrap(),
@@ -152,7 +147,7 @@ fn a_login_that_becomes_unmanaged_during_the_wait_is_planned_again_as_a_noop() {
             common::splice_oauth_account(&path, &Fx::oauth_account("stranger@x.co"));
         }),
     );
-    let out = switch_to(&fx, &a, false).unwrap();
+    let out = fx.switch_to(&a, false).unwrap();
     assert_eq!(
         (out.switched, out.reason, out.unmanaged_email.as_deref()),
         (false, SwitchReason::UnmanagedAccount, Some("stranger@x.co"))
@@ -186,7 +181,7 @@ fn a_direct_target_removed_during_the_wait_is_reported_after_planning_again() {
     fx.engine
         .on_point("planned", Box::new(move || drop(other.remove(&removed))));
     assert!(matches!(
-        switch_to(&fx, &a, false),
+        fx.switch_to(&a, false),
         Err(EngineError::NoSuchAccount(id)) if id == a.as_str()
     ));
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
@@ -339,7 +334,7 @@ fn a_rolled_back_forced_switch_puts_the_superseded_row_back() {
         if point.starts_with("panic:") {
             switch_panicking(&fx, &a, true);
         } else {
-            let err = switch_to(&fx, &a, true).unwrap_err();
+            let err = fx.switch_to(&a, true).unwrap_err();
             assert!(matches!(err, EngineError::RolledBack(_)), "{point}: {err}");
         }
         let store = fx.engine.store().unwrap();
@@ -350,7 +345,7 @@ fn a_rolled_back_forced_switch_puts_the_superseded_row_back() {
         );
         // A forced switch that lands settles the undecidable row for good.
         fx.engine.fail_at(None);
-        switch_to(&fx, &a, true).unwrap();
+        fx.switch_to(&a, true).unwrap();
         assert!(store.journal(&fx.provider()).unwrap().is_none(), "{point}");
     }
 }
@@ -373,7 +368,7 @@ fn a_failed_rollback_keeps_the_journal_for_recovery() {
         if point.starts_with("panic:") {
             switch_panicking(&fx, &a, false);
         } else {
-            let err = switch_to(&fx, &a, false).unwrap_err();
+            let err = fx.switch_to(&a, false).unwrap_err();
             assert!(
                 matches!(err, EngineError::RollbackFailed { .. }),
                 "{point}: {err}"

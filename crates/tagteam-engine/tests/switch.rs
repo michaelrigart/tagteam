@@ -5,7 +5,7 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{Fx, STRAY_API_KEY, mutation_lock_free};
+use common::{API_KEY, Fx, STRAY_API_KEY, mutation_lock_free};
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, ProviderId};
@@ -32,16 +32,7 @@ fn to(id: &AccountId) -> SwitchTarget {
     SwitchTarget::Account(id.clone())
 }
 
-const API_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
 const OTHER_API_KEY: &str = "sk-ant-api03-zyxwvutsrqponmlkjihgfedcba";
-
-fn add_api_key(fx: &Fx, key: &str) -> AccountId {
-    fx.engine
-        .add_token(fx.add_token_options(key))
-        .unwrap()
-        .account
-        .id
-}
 
 fn displaced_files(fx: &Fx) -> usize {
     fx.displaced().len()
@@ -363,7 +354,7 @@ fn an_empty_primary_api_key_does_not_block_a_switch() {
 fn an_empty_managed_key_is_never_captured_over_an_api_key() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
-    let k = add_api_key(&fx, API_KEY);
+    let k = fx.add_api_key(API_KEY);
     switch(&fx, to(&k), false).unwrap();
     fx.put_managed_key(b"");
     assert_an_empty_managed_key_aborts(&fx, switch(&fx, to(&a), false));
@@ -374,7 +365,7 @@ fn an_empty_managed_key_is_never_captured_over_an_api_key() {
 fn an_empty_managed_key_aborts_a_forced_switch() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
-    let k = add_api_key(&fx, API_KEY);
+    let k = fx.add_api_key(API_KEY);
     switch(&fx, to(&k), false).unwrap();
     fx.put_managed_key(b"");
     assert_an_empty_managed_key_aborts(&fx, switch(&fx, to(&a), true));
@@ -415,8 +406,8 @@ fn a_stray_oauth_login_is_displaced_before_an_api_key_switch_strips_it() {
     // The mirror: account-scoped keys left in the credential entry under an API-key login.
     let fx = Fx::new();
     fx.add("a@x.co", "rt-a");
-    let k = add_api_key(&fx, API_KEY);
-    let k2 = add_api_key(&fx, OTHER_API_KEY);
+    let k = fx.add_api_key(API_KEY);
+    let k2 = fx.add_api_key(OTHER_API_KEY);
     switch(&fx, to(&k), false).unwrap();
     let stray = Fx::credential_json("stray@x.co", "rt-stray")
         .to_string()
@@ -435,7 +426,7 @@ fn a_stray_oauth_login_is_displaced_before_an_api_key_switch_strips_it() {
 fn an_other_axis_secret_the_target_holds_is_not_displaced() {
     let fx = Fx::new();
     fx.add("a@x.co", "rt-a");
-    let k = add_api_key(&fx, API_KEY);
+    let k = fx.add_api_key(API_KEY);
     fx.put_managed_key(API_KEY.as_bytes()); // k's key, left live under a's OAuth login
     switch(&fx, to(&k), false).unwrap();
     assert_eq!(displaced_files(&fx), 0);
@@ -446,7 +437,7 @@ fn forcing_never_displaces_an_entry_with_only_machine_shared_keys() {
     // Such an entry holds nothing account-scoped, and its machine-shared keys are carried over.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
-    let k = add_api_key(&fx, API_KEY);
+    let k = fx.add_api_key(API_KEY);
     switch(&fx, to(&k), false).unwrap(); // the entry now holds only machine-shared keys
     switch(&fx, to(&k), true).unwrap();
     assert_eq!(displaced_files(&fx), 0, "a forced self-switch");
@@ -462,7 +453,7 @@ fn forcing_never_displaces_an_entry_with_only_machine_shared_keys() {
 fn api_key_accounts_move_the_auth_axis_both_ways() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
-    let k = add_api_key(&fx, API_KEY);
+    let k = fx.add_api_key(API_KEY);
     let acct = keychain_account(&fx.env);
     let managed = keychain_service(&fx.env, ItemKind::ManagedKey);
     switch(&fx, to(&k), false).unwrap();
