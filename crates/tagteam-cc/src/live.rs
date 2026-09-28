@@ -67,7 +67,7 @@ fn remove_if_present(path: &Path) -> Result<(), ProviderError> {
     Ok(remove_target(path)?)
 }
 
-const UNPARSABLE_ENTRY: &str = "a credential entry is not a JSON object";
+pub(crate) const UNPARSABLE_ENTRY: &str = "a credential entry is not a JSON object";
 
 /// Keeps only the machine-shared keys of a credential entry; `Ok(None)` means none
 /// remain, so the entry may be dropped. An entry that fails to parse is refused rather

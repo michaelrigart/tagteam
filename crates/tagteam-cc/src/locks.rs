@@ -106,6 +106,74 @@ mod tests {
         assert!(p.legacy_lock().is_dir(), "CC's lock is left alone");
     }
 
+    /// Proves the release happens *during* the wait, not just after `acquire_with` gives up:
+    /// a background acquirer must show the refresh lock appear (its first attempt), then
+    /// disappear again (released to retry) while it is still blocked on the legacy lock, and
+    /// only then succeed once the legacy lock is freed.
+    #[test]
+    fn the_refresh_lock_is_actually_free_during_a_legacy_wait_not_only_after_it() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        fs::create_dir(p.legacy_lock()).unwrap(); // CC holds it, freshly
+        let p2 = p.clone();
+        // Generous on purpose: only the test's own polling below is time-bounded per phase;
+        // this just must outlast both phases plus the eventual release.
+        let handle = thread::spawn(move || acquire_with(&p2, Duration::from_secs(30)));
+
+        // Each phase gets its own generous budget: a slow scheduler (this runs alongside every
+        // other test's threads) eating into the first (waiting for the initial attempt) must
+        // not starve the second (waiting for the release).
+        let appeared = Instant::now() + Duration::from_secs(10);
+        while !p.refresh_lock.exists() {
+            assert!(
+                Instant::now() < appeared,
+                "the refresh lock was never taken at all"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let released = Instant::now() + Duration::from_secs(10);
+        while p.refresh_lock.exists() {
+            assert!(
+                Instant::now() < released,
+                "the refresh lock must be released while still waiting on the legacy lock"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !handle.is_finished(),
+            "it should still be waiting on the legacy lock, not have given up or succeeded"
+        );
+
+        fs::remove_dir(p.legacy_lock()).unwrap(); // CC releases its lock
+        let set = handle.join().unwrap().unwrap();
+        assert!(p.legacy_lock().is_dir());
+        drop(set);
+        assert!(!p.refresh_lock.exists() && !p.legacy_lock().exists() && !p.config_lock.exists());
+    }
+
+    #[test]
+    fn a_config_lock_timeout_releases_the_refresh_and_legacy_locks() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        fs::create_dir(&p.config_lock).unwrap(); // something else holds it, freshly
+        assert!(matches!(
+            acquire_with(&p, Duration::from_millis(500)),
+            Err(LockError::Timeout(_))
+        ));
+        assert!(
+            !p.refresh_lock.exists(),
+            "the refresh lock must be released"
+        );
+        assert!(
+            !p.legacy_lock().exists(),
+            "the legacy lock must be released"
+        );
+        assert!(
+            p.config_lock.is_dir(),
+            "the other holder's config lock is left alone"
+        );
+    }
+
     #[test]
     fn a_held_refresh_lock_times_out_without_touching_it() {
         // Review Focus 1: CC is mid-refresh.

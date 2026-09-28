@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::provider::ClaudeCode;
-use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
+use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service, read_services};
 use tagteam_provider::{Env, FakeKeychain, MutationGuard, Provider, Read, StoredLogin};
 
 struct Fx {
@@ -221,6 +221,159 @@ fn a_panic_inside_one_operation_restores_its_first_write() {
         "the OAuth write was restored during unwinding"
     );
     assert_eq!(f.kc.get(&managed, &acct).unwrap(), b"sk-ant-api03-old");
+}
+
+#[test]
+fn a_transient_unreadable_caller_read_is_ignored_in_favor_of_a_fresh_one() {
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    fs::write(&paths.global_config, "{}").unwrap();
+    let svc = keychain_service(&f.env, ItemKind::OAuth);
+    let acct = keychain_account(&f.env);
+    let live_json = json!({"claudeAiOauth": {"refreshToken": "old"}, "mcpOAuth": {"m": 1}});
+    f.kc.put(&svc, &acct, live_json.to_string().as_bytes());
+    f.kc.set_unreadable(&svc, &acct, true);
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+    let live = f.cc.read_live_auth(&f.env); // the caller's read: unreadable
+    assert!(matches!(live.credential, Read::Unreadable(_)));
+    f.kc.set_unreadable(&svc, &acct, false); // readable again by the time the write happens
+    f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
+        .unwrap();
+    assert_eq!(
+        oauth_item(&f).unwrap(),
+        json!({"claudeAiOauth": {"accessToken": "at", "refreshToken": "rt"}, "mcpOAuth": {"m": 1}})
+    );
+}
+
+#[test]
+fn garbage_live_bytes_refuse_to_compose_and_write_nothing() {
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    fs::write(&paths.global_config, "{}").unwrap();
+    let svc = keychain_service(&f.env, ItemKind::OAuth);
+    let acct = keychain_account(&f.env);
+    f.kc.put(&svc, &acct, b"not json at all");
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+    let live = f.cc.read_live_auth(&f.env);
+    assert!(
+        f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
+            .is_err()
+    );
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"not json at all");
+}
+
+#[test]
+fn an_empty_live_entry_refuses_to_compose_and_writes_nothing() {
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    fs::write(&paths.global_config, "{}").unwrap();
+    let svc = keychain_service(&f.env, ItemKind::OAuth);
+    let acct = keychain_account(&f.env);
+    f.kc.put(&svc, &acct, b"");
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+    let live = f.cc.read_live_auth(&f.env);
+    assert!(
+        f.cc.write_credential(&f.env, &locks, &target(&f, "a@b.co", "rt"), &live)
+            .is_err()
+    );
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"");
+}
+
+#[test]
+fn clear_other_axis_toward_oauth_clears_the_managed_key_and_its_undo_restores_it() {
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    fs::write(
+        &paths.global_config,
+        r#"{"primaryApiKey": "sk-ant-api03-old", "customApiKeyResponses": {"approved": ["x"]}}"#,
+    )
+    .unwrap();
+    let acct = keychain_account(&f.env);
+    let managed = keychain_service(&f.env, ItemKind::ManagedKey);
+    f.kc.put(&managed, &acct, b"sk-ant-api03-old");
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+
+    let undo = f.cc.clear_other_axis(&f.env, &locks, "oauth").unwrap();
+    assert!(f.kc.get(&managed, &acct).is_none());
+    assert!(
+        !fs::read_to_string(&paths.global_config)
+            .unwrap()
+            .contains("primaryApiKey")
+    );
+
+    undo.undo(&locks).unwrap();
+    assert_eq!(f.kc.get(&managed, &acct).unwrap(), b"sk-ant-api03-old");
+    assert!(
+        fs::read_to_string(&paths.global_config)
+            .unwrap()
+            .contains("sk-ant-api03-old")
+    );
+}
+
+#[test]
+fn clear_other_axis_toward_api_key_keeps_only_machine_shared_keys_and_its_undo_restores_the_entry()
+{
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    fs::write(&paths.global_config, "{}").unwrap();
+    let svc = keychain_service(&f.env, ItemKind::OAuth);
+    let acct = keychain_account(&f.env);
+    let full = json!({"claudeAiOauth": {"refreshToken": "r"}, "mcpOAuth": {"m": 1}});
+    f.kc.put(&svc, &acct, full.to_string().as_bytes());
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+
+    let undo = f.cc.clear_other_axis(&f.env, &locks, "api_key").unwrap();
+    assert_eq!(oauth_item(&f).unwrap(), json!({"mcpOAuth": {"m": 1}}));
+
+    undo.undo(&locks).unwrap();
+    assert_eq!(oauth_item(&f).unwrap(), full);
+}
+
+#[test]
+fn identity_surface_lists_every_macos_credential_and_managed_key_service() {
+    let f = fx();
+    let target_dir = f.env.home.join("real-profile");
+    fs::create_dir_all(&target_dir).unwrap();
+    let link = f.env.home.join("link-profile");
+    std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+    let mut env = f.env.clone();
+    env.claude_config_dir = Some(link.clone().into_os_string());
+
+    let s = f.cc.identity_surface(&env);
+    let acct = keychain_account(&env);
+    let expected_oauth: Vec<_> = read_services(&env, ItemKind::OAuth)
+        .into_iter()
+        .map(|svc| (svc, acct.clone()))
+        .collect();
+    let expected_managed: Vec<_> = read_services(&env, ItemKind::ManagedKey)
+        .into_iter()
+        .map(|svc| (svc, acct.clone()))
+        .collect();
+    assert!(
+        expected_oauth.len() > 1,
+        "the fixture must actually exercise the symlinked-profile fallback"
+    );
+    assert_eq!(s.credential_items, expected_oauth);
+    assert_eq!(s.owned_items, expected_managed);
+}
+
+#[test]
+fn identity_surface_has_no_keychain_items_on_linux() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    fs::create_dir_all(env.home.join(".claude")).unwrap();
+    let cc = ClaudeCode::with_store(LiveStore::new(
+        Arc::new(FakeKeychain::new()),
+        Platform::Linux,
+    ));
+    let s = cc.identity_surface(&env);
+    assert!(s.credential_items.is_empty());
+    assert!(s.owned_items.is_empty());
 }
 
 #[test]
