@@ -10,11 +10,10 @@ use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_servi
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
-use tagteam_engine::store::NewAccount;
-use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
+use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault};
 use tagteam_engine::{Engine, EngineConfig};
 use tagteam_provider::splice::replace_top_level;
-use tagteam_provider::{Clock, Credential, Env, FakeClock, FakeKeychain, Identity, Provider, Read};
+use tagteam_provider::{Credential, Env, FakeClock, FakeKeychain, Identity, Provider, Read};
 
 /// An oracle that answers whatever the test sets.
 #[derive(Default)]
@@ -206,7 +205,7 @@ impl Fx {
 
     fn engine_vault_read(&self, id: &AccountId) -> Option<Vec<u8>> {
         match self.platform {
-            Platform::MacOs => self.kc.get("tagteam", id.as_str()),
+            Platform::MacOs => self.kc.get(SERVICE, id.as_str()),
             Platform::Linux => {
                 fs::read(self.env.data_dir().join("vault").join(format!("{id}.json"))).ok()
             }
@@ -230,31 +229,5 @@ impl Fx {
             clock: self.clock.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
         })
-    }
-
-    /// Inserts an oauth account straight into the store, bypassing the switch/add flow (Tasks
-    /// 18-21 all need a handful of pre-existing accounts to switch between or manage).
-    /// `email` is also the `identity_key`; callers that need distinct ids and emails should
-    /// call `Store::insert_account` directly instead.
-    pub fn add_account(&self, id: &str, email: &str, position: u32) -> AccountId {
-        let aid = AccountId::from_string(id);
-        let identity = self.cc.parse_identity(&Self::oauth_account(email)).unwrap();
-        let identity_key = format!("{email}\n");
-        self.engine
-            .store()
-            .unwrap()
-            .insert_account(&NewAccount {
-                id: &aid,
-                provider: &self.provider(),
-                position,
-                identity_key: &identity_key,
-                identity: &identity,
-                kind: "oauth",
-                alias: None,
-                login_expires_at: None,
-                added_at: self.clock.now_ms(),
-            })
-            .unwrap();
-        aid
     }
 }

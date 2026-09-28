@@ -87,3 +87,96 @@ impl EngineError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// Pins every variant's `kind()` string: it's part of `--json`'s stable contract (§14), so
+    /// a change here is a breaking change, not a refactor.
+    #[test]
+    fn kind_is_pinned_for_every_variant() {
+        let cases: Vec<(EngineError, &str)> = vec![
+            (EngineError::Store(StoreError::NoSuchAccount), "store"),
+            (
+                EngineError::Provider(ProviderError::ConfigUnsplicable(PathBuf::from("x"))),
+                "config-unsplicable",
+            ),
+            (
+                EngineError::Provider(ProviderError::Lock(LockError::Timeout(PathBuf::from("x")))),
+                "lock-timeout",
+            ),
+            (
+                EngineError::Provider(ProviderError::RestoreFailed {
+                    cause: Box::new(ProviderError::Invalid("a".into())),
+                    restore: Box::new(ProviderError::Invalid("b".into())),
+                }),
+                "rollback-failed",
+            ),
+            (
+                EngineError::Provider(ProviderError::Invalid("x".into())),
+                "provider",
+            ),
+            (
+                EngineError::Lock(LockError::Timeout(PathBuf::from("x"))),
+                "lock-timeout",
+            ),
+            (
+                EngineError::Lock(LockError::Compromised(PathBuf::from("x"))),
+                "lock",
+            ),
+            (EngineError::Vault(VaultError::Verify), "vault"),
+            (
+                EngineError::Unreadable(ReadError::new("k", "d")),
+                "unreadable",
+            ),
+            (EngineError::UnknownProvider("p".into()), "unknown-provider"),
+            (EngineError::InsideRunShell, "inside-run-shell"),
+            (EngineError::NoLiveLogin, "no-live-login"),
+            (EngineError::LiveApiKey, "live-api-key"),
+            (EngineError::DegradedRead, "degraded-read"),
+            (
+                EngineError::OwnerMismatch {
+                    expected: "a".into(),
+                    found: "b".into(),
+                },
+                "owner-mismatch",
+            ),
+            (EngineError::LiveMoved, "live-moved"),
+            (
+                EngineError::NeedsConfirmation {
+                    position: 1,
+                    occupant: "a".into(),
+                },
+                "needs-confirmation",
+            ),
+            (EngineError::InvalidInput("x".into()), "invalid-input"),
+            (EngineError::NoSuchAccount("x".into()), "no-such-account"),
+            (
+                EngineError::Ambiguous {
+                    input: "x".into(),
+                    candidates: vec!["a".into()],
+                },
+                "ambiguous-account",
+            ),
+            (
+                EngineError::InterruptedSwitch("p".into()),
+                "interrupted-switch",
+            ),
+            (EngineError::RolledBack("x".into()), "rolled-back"),
+            (
+                EngineError::RollbackFailed {
+                    cause: "a".into(),
+                    failed: "b".into(),
+                },
+                "rollback-failed",
+            ),
+            (EngineError::Io(io::Error::other("x")), "io"),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.kind(), want, "{err:?}");
+        }
+    }
+}

@@ -6,6 +6,7 @@ use tagteam_core::{AccountId, OracleVerdict};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::oracle::verdict;
 use tagteam_engine::store::{LoginMeta, NewAccount};
+use tagteam_engine::vault::SERVICE;
 use tagteam_provider::{Identity, Provider};
 
 #[test]
@@ -73,7 +74,7 @@ fn a_pending_replacement_is_reconciled_by_the_next_lock_holder() {
     let cred = Fx::credential_json("t@token.local", "rt-new")
         .to_string()
         .into_bytes();
-    fx.kc.put("tagteam", id.as_str(), &cred);
+    fx.kc.put(SERVICE, id.as_str(), &cred);
     let fp = fx.cc.fingerprint(&cred).unwrap();
     store.begin_replacement(&id, fp.as_str(), &meta).unwrap();
     drop(fx.engine.lock_account(&id).unwrap());
@@ -141,5 +142,31 @@ fn oracle_verdicts_need_a_positive_uuid_match() {
     assert_eq!(
         verdict(Some(&id("z@b.co", "v")), &row_for(None)),
         OracleVerdict::OtherIdentity
+    );
+    // A resolved identity with no uuid of its own carries no attribution signal, whether or
+    // not the stored account already has one, and regardless of how well the email matches.
+    let no_uuid = Identity {
+        label: "a@b.co".into(),
+        email: Some("a@b.co".into()),
+        org_uuid: String::new(),
+        org_name: None,
+        account_uuid: None,
+        raw: json!({}),
+    };
+    let empty_uuid = Identity {
+        account_uuid: Some(String::new()),
+        ..no_uuid.clone()
+    };
+    assert_eq!(
+        verdict(Some(&no_uuid), &row_for(Some("u"))),
+        OracleVerdict::Unavailable
+    );
+    assert_eq!(
+        verdict(Some(&empty_uuid), &row_for(Some("u"))),
+        OracleVerdict::Unavailable
+    );
+    assert_eq!(
+        verdict(Some(&no_uuid), &row_for(None)),
+        OracleVerdict::Unavailable
     );
 }

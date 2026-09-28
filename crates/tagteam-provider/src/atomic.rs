@@ -26,6 +26,17 @@ pub fn resolve_target(path: &Path) -> io::Result<PathBuf> {
     )))
 }
 
+/// Whether a write should match whatever mode the file it replaces already has, or force a
+/// fixed mode regardless.
+enum ModePolicy {
+    /// The replaced file's own mode, or `new_mode` when creating it (CC's own files: tagteam
+    /// must not narrow or widen a mode it doesn't own).
+    Preserve(u32),
+    /// Always this mode, even over a file an external actor has since widened (secrets: an
+    /// externally widened mode must never survive a write).
+    Force(u32),
+}
+
 /// The primitive every tagteam file write goes through (§9.5).
 ///
 /// An error means the target was **not** replaced: everything that can fail happens before
@@ -38,6 +49,28 @@ pub fn write_atomic_with<E: From<io::Error>>(
     new_mode: u32,
     before_publish: impl Fn() -> Result<(), E>,
 ) -> Result<(), E> {
+    write_atomic_mode_with(path, bytes, ModePolicy::Preserve(new_mode), before_publish)
+}
+
+/// Like `write_atomic_with`, but always applies `mode`, ignoring whatever mode the file it
+/// replaces already has. For secrets — the vault, credential files — where a mode an external
+/// actor has widened must never survive a write, unlike `write_atomic`'s CC-file-preserving
+/// default.
+pub fn write_atomic_private_with<E: From<io::Error>>(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    before_publish: impl Fn() -> Result<(), E>,
+) -> Result<(), E> {
+    write_atomic_mode_with(path, bytes, ModePolicy::Force(mode), before_publish)
+}
+
+fn write_atomic_mode_with<E: From<io::Error>>(
+    path: &Path,
+    bytes: &[u8],
+    policy: ModePolicy,
+    before_publish: impl Fn() -> Result<(), E>,
+) -> Result<(), E> {
     let target = resolve_target(path)?;
     let dir = target
         .parent()
@@ -45,10 +78,13 @@ pub fn write_atomic_with<E: From<io::Error>>(
     let name = target
         .file_name()
         .ok_or_else(|| io::Error::other(format!("{} has no file name", target.display())))?;
-    let mode = match fs::metadata(&target) {
-        Ok(m) => m.permissions().mode() & 0o7777,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => new_mode,
-        Err(e) => return Err(e.into()),
+    let mode = match policy {
+        ModePolicy::Force(mode) => mode,
+        ModePolicy::Preserve(new_mode) => match fs::metadata(&target) {
+            Ok(m) => m.permissions().mode() & 0o7777,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => new_mode,
+            Err(e) => return Err(e.into()),
+        },
     };
     let tmp = dir.join(format!(
         ".{}.tagteam-{}-{:08x}",
@@ -94,6 +130,11 @@ pub fn write_atomic(path: &Path, bytes: &[u8], new_mode: u32) -> io::Result<()> 
     write_atomic_with(path, bytes, new_mode, || Ok::<(), io::Error>(()))
 }
 
+/// `write_atomic_private_with` with no pre-publication check.
+pub fn write_atomic_private(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    write_atomic_private_with(path, bytes, mode, || Ok::<(), io::Error>(()))
+}
+
 pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(path)
 }
@@ -125,6 +166,17 @@ mod tests {
         write_atomic(&p, b"new", 0o600).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"new");
         assert_eq!(mode(&p), 0o644);
+    }
+
+    #[test]
+    fn write_atomic_private_ignores_an_existing_widened_mode() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("secret.json");
+        fs::write(&p, "old").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic_private(&p, b"new", 0o600).unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"new");
+        assert_eq!(mode(&p), 0o600);
     }
 
     #[test]

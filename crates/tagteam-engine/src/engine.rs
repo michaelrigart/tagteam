@@ -24,7 +24,7 @@ pub struct Engine {
     pub(crate) env: Env,
     pub(crate) registry: ProviderRegistry,
     pub(crate) vault: Vault,
-    #[expect(dead_code, reason = "read by the switch, Task 20")]
+    #[expect(dead_code, reason = "first read by Task 18 (add_live)")]
     pub(crate) oracle: Arc<dyn Oracle>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) default_provider: ProviderId,
@@ -120,15 +120,29 @@ impl Engine {
     /// Run before any planning or validation: if an interrupted switch is on record, take the
     /// mutation lock once (which recovers what it can, Task 21), then refuse if it is still
     /// unresolved. Creates nothing when there is no store.
-    #[expect(dead_code, reason = "used by later commands, Task 18 and Task 20")]
+    ///
+    /// The final check runs while the guard from this same call is still held, and only then
+    /// is the guard dropped: otherwise, between releasing it and re-checking, another process
+    /// could take the guard and insert its own live journal row, which this call would then
+    /// misreport as an interrupted switch (pointing the user at `--force` for a switch that is
+    /// simply in progress elsewhere).
+    ///
+    /// Only `#[expect]`ed outside test builds: this crate's own tests call it directly to
+    /// cover the ordering above, so it is genuinely used under `cfg(test)`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "used by later commands, Task 18 and Task 20")
+    )]
     pub(crate) fn settle_or_refuse(&self, provider: &ProviderId) -> Result<(), EngineError> {
         let pending = match self.existing_store()? {
             Some(s) => s.journal(provider)?.is_some(),
             None => false,
         };
         if pending {
-            drop(self.mutation_guard()?);
-            self.refuse_if_interrupted(provider)?;
+            let guard = self.mutation_guard()?;
+            let result = self.refuse_if_interrupted(provider);
+            drop(guard);
+            result?;
         }
         Ok(())
     }
@@ -172,5 +186,148 @@ impl Engine {
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use tagteam_core::AccountId;
+    use tagteam_provider::{FakeKeychain, Identity, ProcessStamp};
+
+    use super::*;
+    use crate::oracle::NoOracle;
+    use crate::store::{JournalRow, NewAccount};
+    use crate::vault::KeychainVault;
+
+    fn test_engine(env: Env) -> Engine {
+        Engine::new(EngineConfig {
+            env,
+            registry: ProviderRegistry::new(),
+            vault: Vault::new(Box::new(KeychainVault::new(Arc::new(FakeKeychain::new())))),
+            oracle: Arc::new(NoOracle),
+            clock: Arc::new(tagteam_provider::SystemClock),
+            default_provider: ProviderId::new("p"),
+        })
+    }
+
+    /// A journal row's `to_id` is foreign-keyed to `accounts`, so a test that installs one
+    /// needs the account row it points at to already exist.
+    fn seed_account(engine: &Engine, provider: &ProviderId, id: &AccountId) {
+        engine
+            .store()
+            .unwrap()
+            .insert_account(&NewAccount {
+                id,
+                provider,
+                position: 1,
+                identity_key: "a@b.co\n",
+                identity: &Identity {
+                    label: "a@b.co".into(),
+                    email: Some("a@b.co".into()),
+                    org_uuid: String::new(),
+                    org_name: None,
+                    account_uuid: None,
+                    raw: serde_json::json!({}),
+                },
+                kind: "oauth",
+                alias: None,
+                login_expires_at: None,
+                added_at: 1,
+            })
+            .unwrap();
+    }
+
+    fn stale_journal(provider: &ProviderId, to_id: &AccountId) -> JournalRow {
+        JournalRow {
+            provider: provider.clone(),
+            holder: ProcessStamp {
+                pid: 999_999,
+                start: 0,
+            },
+            from_id: None,
+            to_id: to_id.clone(),
+            from_fp: None,
+            from_identity: None,
+            to_fp: "sha256:stale".into(),
+            started_at: 1,
+            prior: None,
+        }
+    }
+
+    #[test]
+    fn settle_or_refuse_only_errors_when_a_journal_row_is_on_record() {
+        let d = tempfile::tempdir().unwrap();
+        let env = Env::for_test(d.path());
+        let engine = test_engine(env);
+        let provider = ProviderId::new("p");
+
+        assert!(engine.settle_or_refuse(&provider).is_ok());
+        assert!(
+            !engine.env().data_dir().exists(),
+            "no journal on record: nothing is created (§5)"
+        );
+
+        let to_id = AccountId::from_string("acc");
+        seed_account(&engine, &provider, &to_id);
+        engine
+            .store()
+            .unwrap()
+            .insert_journal(&stale_journal(&provider, &to_id))
+            .unwrap();
+        assert!(matches!(
+            engine.settle_or_refuse(&provider),
+            Err(EngineError::InterruptedSwitch(_))
+        ));
+    }
+
+    /// §9.6: `settle_or_refuse`'s guarded section is `let guard = mutation_guard()?; let result
+    /// = refuse_if_interrupted(...); drop(guard); result?` — the check must run before the
+    /// guard is dropped, not after. This exercises that exact sequence (via the same two
+    /// pub(crate) calls, in the same order, under test control) and proves the property that
+    /// matters: for as long as the guard from that sequence is held, no concurrent acquirer can
+    /// get in and write a fresh journal row underneath the check, no matter when it is released
+    /// to try.
+    #[test]
+    fn the_final_interrupted_check_keeps_the_mutation_guard_held_throughout() {
+        let d = tempfile::tempdir().unwrap();
+        let env = Env::for_test(d.path());
+        let engine = test_engine(env.clone());
+        let provider = ProviderId::new("p");
+        let to_id = AccountId::from_string("acc");
+        seed_account(&engine, &provider, &to_id);
+        engine
+            .store()
+            .unwrap()
+            .insert_journal(&stale_journal(&provider, &to_id))
+            .unwrap();
+
+        let guard = engine.mutation_guard().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<bool>();
+        let env2 = env.clone();
+        let racer = thread::spawn(move || {
+            // Blocks until `guard` below is dropped, however this thread happens to be
+            // scheduled: flock is a real, exclusive OS lock, not a timing-dependent race.
+            let acquired = MutationGuard::acquire(&env2, Duration::from_secs(2)).is_ok();
+            done_tx.send(acquired).unwrap();
+        });
+        // Give the racer a chance to reach its blocking acquire call before we run the check;
+        // not required for correctness, only so the assertion below is meaningful rather than
+        // vacuous.
+        thread::sleep(Duration::from_millis(50));
+        let result = engine.refuse_if_interrupted(&provider);
+        assert!(
+            result.is_err(),
+            "the stale row must still be visible while we hold the guard ourselves"
+        );
+        drop(guard); // only now can the racer's acquire succeed
+        assert!(
+            done_rx.recv().unwrap(),
+            "the racer must succeed once, and only once, our guard is released"
+        );
+        racer.join().unwrap();
     }
 }

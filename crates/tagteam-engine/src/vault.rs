@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tagteam_core::{AccountId, Fingerprint};
-use tagteam_provider::atomic::{ensure_private_dir, write_atomic};
+use tagteam_provider::atomic::{ensure_private_dir, write_atomic_private};
 use tagteam_provider::{Keychain, Read, ReadError};
 
 use crate::account_lock::AccountLock;
@@ -80,7 +80,7 @@ impl VaultBackend for FileVault {
     }
     fn write(&self, key: &str, bytes: &[u8]) -> Result<(), VaultError> {
         ensure_private_dir(&self.dir)
-            .and_then(|()| write_atomic(&self.path(key), bytes, 0o600))
+            .and_then(|()| write_atomic_private(&self.path(key), bytes, 0o600))
             .map_err(|e| VaultError::Write(e.to_string()))
     }
     fn delete(&self, key: &str) -> Result<(), VaultError> {
@@ -140,11 +140,13 @@ impl Vault {
         }
     }
 
-    /// Strict: both generations are deleted, errors propagate, and absence is verified. A
-    /// locked Keychain that still holds an item aborts the delete (§6.2).
+    /// Strict: both generations are deleted, errors propagate, and absence is verified. `.prev`
+    /// goes first, so a failure partway through leaves the current generation — the one an
+    /// account actually needs to keep working — in place rather than gone. A locked Keychain
+    /// that still holds an item aborts the delete (§6.2).
     pub fn delete(&self, lock: &AccountLock) -> Result<(), VaultError> {
         let id = lock.id();
-        for key in [id.to_string(), prev_key(id)] {
+        for key in [prev_key(id), id.to_string()] {
             self.backend.delete(&key)?;
             match self.backend.read(&key) {
                 Read::Absent => {}
