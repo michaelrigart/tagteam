@@ -1065,7 +1065,7 @@ impl Engine {
 
     /// §9.4 step 7: `copies` are copies of the credential entry that no reader sees but that
     /// the activation overwrites or clears, and nothing restores them once a switch commits or
-    /// recovery finishes forward (§9.6). So a generation in one that none of `held` is saved
+    /// recovery finishes forward (§9.6). So a copy whose generation is none of `held` is saved
     /// first, like the off-axis rule ("never lose a secret"); one with nothing account-scoped
     /// in it is not (`displace_live`). A failed save aborts, except under `force` (B.5).
     #[allow(clippy::too_many_arguments)]
