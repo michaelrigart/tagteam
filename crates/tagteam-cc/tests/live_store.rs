@@ -1,13 +1,14 @@
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{CcPaths, ItemKind, config, keychain_account, keychain_service, read_services};
 use tagteam_provider::{
-    Env, FakeKeychain, LiveLockSet, LiveLocks, LockError, MutationGuard, Provenance, ProviderError,
-    Read, Undo,
+    Env, FakeKeychain, Keychain, KeychainError, LiveLockSet, LiveLocks, LockError, LockState,
+    MutationGuard, Provenance, ProviderError, Read, Undo,
 };
 
 struct Fx {
@@ -50,6 +51,85 @@ struct Held;
 impl LiveLockSet for Held {
     fn check_owned(&self) -> Result<(), LockError> {
         Ok(())
+    }
+}
+
+/// A lock set that always reports the lock lost, for undo calls that must refuse.
+struct Lost;
+
+impl LiveLockSet for Lost {
+    fn check_owned(&self) -> Result<(), LockError> {
+        Err(LockError::Compromised("x".into()))
+    }
+}
+
+/// A fence that passes exactly `n` times, then fails like a lost lock — for pinning down
+/// exactly which mutation a fence protects.
+struct CountingFence {
+    remaining: AtomicUsize,
+}
+
+impl CountingFence {
+    fn new(n: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(n),
+        }
+    }
+
+    fn check(&self) -> Result<(), ProviderError> {
+        let passed = self
+            .remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+            .is_ok();
+        if passed {
+            Ok(())
+        } else {
+            Err(ProviderError::Lock(LockError::Compromised(
+                "counting fence exhausted".into(),
+            )))
+        }
+    }
+}
+
+/// Wraps a `FakeKeychain` to count `upsert` calls, so a test can prove an entry that
+/// already matches its snapshot was never rewritten.
+struct CountingKeychain {
+    inner: Arc<FakeKeychain>,
+    upserts: AtomicUsize,
+}
+
+impl CountingKeychain {
+    fn new(inner: Arc<FakeKeychain>) -> Self {
+        Self {
+            inner,
+            upserts: AtomicUsize::new(0),
+        }
+    }
+
+    fn upsert_count(&self) -> usize {
+        self.upserts.load(Ordering::SeqCst)
+    }
+}
+
+impl Keychain for CountingKeychain {
+    fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
+        self.inner.find(s, a)
+    }
+    fn exists(&self, s: &str, a: &str) -> Read<()> {
+        self.inner.exists(s, a)
+    }
+    fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), KeychainError> {
+        self.upserts.fetch_add(1, Ordering::SeqCst);
+        self.inner.upsert(s, a, d)
+    }
+    fn delete(&self, s: &str, a: &str) -> Result<(), KeychainError> {
+        self.inner.delete(s, a)
+    }
+    fn lock_state(&self) -> LockState {
+        self.inner.lock_state()
+    }
+    fn unlock(&self) -> bool {
+        self.inner.unlock()
     }
 }
 
@@ -516,4 +596,303 @@ fn splicing_a_missing_config_creates_it_with_only_that_key() {
     .unwrap();
     let doc: Value = serde_json::from_slice(&fs::read(&f.paths.global_config).unwrap()).unwrap();
     assert_eq!(doc, json!({"oauthAccount": {"emailAddress": "a@b.co"}}));
+}
+
+// --- Fix round 1 -----------------------------------------------------------------
+
+#[test]
+fn a_successful_keychain_write_clears_a_stale_primary_api_key() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let managed = (
+        keychain_service(&f.env, ItemKind::ManagedKey),
+        keychain_account(&f.env),
+    );
+    // Activate key A while the Keychain is down: it lands in `primaryApiKey`.
+    f.kc.set_fail_write(&managed.0, true);
+    let a = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaa";
+    s.write_managed_key(&f.env, &f.paths, a.as_bytes(), &open)
+        .unwrap();
+    assert_eq!(
+        config::get_key(&f.paths.global_config, "primaryApiKey")
+            .present()
+            .unwrap()
+            .unwrap(),
+        json!(a)
+    );
+    // Activate B with a healthy Keychain: the item holds B, and the stale plaintext A
+    // must not still be live in `~/.claude.json`.
+    f.kc.set_fail_write(&managed.0, false);
+    let b = "sk-ant-api03-bbbbbbbbbbbbbbbbbbbb";
+    s.write_managed_key(&f.env, &f.paths, b.as_bytes(), &open)
+        .unwrap();
+    assert_eq!(f.kc.get(&managed.0, &managed.1).unwrap(), b.as_bytes());
+    assert_eq!(
+        config::get_key(&f.paths.global_config, "primaryApiKey")
+            .present()
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn restore_continues_past_a_non_lock_failure_and_names_every_unrestored_entry() {
+    let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
+    let counting = Arc::new(CountingKeychain::new(f.kc.clone()));
+    let s = LiveStore::new(counting.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
+    let acct = keychain_account(&f.env);
+    let services = read_services(&f.env, ItemKind::OAuth);
+    assert_eq!(services.len(), 2);
+    // Only the plain fallback item is present; the primary is absent from the start.
+    f.kc.put(
+        &services[1],
+        &acct,
+        br#"{"claudeAiOauth":{"refreshToken":"plain"}}"#,
+    );
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+
+    // Both upserts fail, so the write falls back to the file, and `remove_items` deletes
+    // both fallback items, including the plain one.
+    f.kc.set_fail_write(&services[0], true);
+    f.kc.set_fail_write(&services[1], true);
+    s.write_credential_entry(&f.env, &f.paths, b"new", &open)
+        .unwrap();
+    assert!(f.kc.get(&services[0], &acct).is_none());
+    assert!(f.kc.get(&services[1], &acct).is_none());
+
+    // Restore: the plain item's upsert still fails.
+    let upserts_before = counting.upsert_count();
+    match s.restore(&f.env, &f.paths, &snap, &open) {
+        Err(ProviderError::Incomplete { failed }) => {
+            assert_eq!(failed, vec![services[1].clone()]);
+        }
+        other => panic!("expected Incomplete naming {}, got {other:?}", services[1]),
+    }
+    // The files were still restored despite the Keychain failure.
+    assert!(!f.paths.credentials_file.exists());
+    // The primary item was never touched: it already matched its (absent) snapshot, and
+    // so did both managed-key items, so only the plain item's upsert was attempted.
+    assert_eq!(
+        counting.upsert_count(),
+        upserts_before + 1,
+        "an entry that already matched its snapshot must not be rewritten"
+    );
+}
+
+#[test]
+fn config_undo_checks_lock_ownership_before_restoring_or_removing() {
+    let f = fx();
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let lost = LiveLocks::new(&g, Box::new(Lost));
+
+    // Restore-bytes branch: an existing file was spliced, so undo must put its bytes back.
+    fs::write(&f.paths.global_config, "{\"a\": 1}").unwrap();
+    let undo = config::splice_key(&f.paths.global_config, "k", Some(&json!(1)), &open).unwrap();
+    let spliced = fs::read(&f.paths.global_config).unwrap();
+    assert!(matches!(
+        Box::new(undo).undo(&lost),
+        Err(ProviderError::Lock(_))
+    ));
+    assert_eq!(
+        fs::read(&f.paths.global_config).unwrap(),
+        spliced,
+        "undo must write nothing once the lock is lost"
+    );
+
+    // Remove-created-file branch: the splice created the file from nothing.
+    let created = f.paths.config_home.join("created.json");
+    let undo2 = config::splice_key(&created, "k", Some(&json!(1)), &open).unwrap();
+    assert!(created.exists());
+    assert!(matches!(
+        Box::new(undo2).undo(&lost),
+        Err(ProviderError::Lock(_))
+    ));
+    assert!(
+        created.exists(),
+        "undo must not remove the file once the lock is lost"
+    );
+}
+
+#[test]
+fn a_counting_fence_stops_the_hot_reload_rewrite() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    fs::write(&f.paths.credentials_file, "old").unwrap();
+    let cf = CountingFence::new(1);
+    let fence = || cf.check();
+    assert!(matches!(
+        s.write_credential_entry(&f.env, &f.paths, b"new", &fence),
+        Err(ProviderError::Lock(_))
+    ));
+    assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"old");
+    let (svc, acct) = oauth_svc(&f);
+    assert_eq!(
+        f.kc.get(&svc, &acct).unwrap(),
+        b"new",
+        "the keychain write itself happened before the fence tripped"
+    );
+}
+
+#[test]
+fn a_counting_fence_stops_the_deletes_in_remove_items() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, b"old");
+    f.kc.set_fail_write(&svc, true);
+    let cf = CountingFence::new(3);
+    let fence = || cf.check();
+    assert!(matches!(
+        s.write_credential_entry(&f.env, &f.paths, b"new", &fence),
+        Err(ProviderError::Lock(_))
+    ));
+    // The file fallback already landed; the shadowing Keychain item was never deleted
+    // because the fence tripped first.
+    assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"new");
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"old");
+    assert!(!s.file_mode_pinned());
+}
+
+#[test]
+fn restore_is_fenced_for_both_files_and_items_and_aborts_immediately_on_fence_failure() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, b"orig-item");
+    fs::write(&f.paths.credentials_file, "orig-file").unwrap();
+    fs::write(&f.paths.global_config, "{\"a\": 1}").unwrap();
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+
+    // Change everything, so every entry needs restoring: the credential write bumps both
+    // the Keychain item and the pre-existing file, and the config is spliced directly.
+    s.write_credential_entry(&f.env, &f.paths, b"changed", &open)
+        .unwrap();
+    config::splice_key(&f.paths.global_config, "b", Some(&json!(2)), &open).unwrap();
+
+    // Two passes restore both files; the third, for the Keychain item, fails.
+    let cf = CountingFence::new(2);
+    let fence = || cf.check();
+    assert!(matches!(
+        s.restore(&f.env, &f.paths, &snap, &fence),
+        Err(ProviderError::Lock(_))
+    ));
+    assert_eq!(fs::read(&f.paths.global_config).unwrap(), b"{\"a\": 1}");
+    assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), b"orig-file");
+    assert_eq!(
+        f.kc.get(&svc, &acct).unwrap(),
+        b"changed",
+        "the item restore never ran once the fence tripped"
+    );
+}
+
+#[test]
+fn a_counting_fence_stops_the_file_branch_of_clearing_account_keys() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    // No machine-shared keys survive, so the file branch takes the delete path.
+    fs::write(
+        &f.paths.credentials_file,
+        r#"{"claudeAiOauth":{"refreshToken":"r"}}"#,
+    )
+    .unwrap();
+    let cf = CountingFence::new(0);
+    let fence = || cf.check();
+    assert!(matches!(
+        s.clear_credential_account_keys(&f.env, &f.paths, &fence),
+        Err(ProviderError::Lock(_))
+    ));
+    assert!(
+        f.paths.credentials_file.exists(),
+        "the file must not be removed once the fence trips"
+    );
+}
+
+#[test]
+fn read_managed_key_is_unreadable_when_the_keychain_item_is_unreadable_even_with_a_primary_api_key_present()
+ {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let svc = keychain_service(&f.env, ItemKind::ManagedKey);
+    let acct = keychain_account(&f.env);
+    f.kc.put(&svc, &acct, b"sk-ant-api03-keychain");
+    f.kc.set_unreadable(&svc, &acct, true);
+    fs::write(
+        &f.paths.global_config,
+        r#"{"primaryApiKey": "sk-ant-api03-file"}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        s.read_managed_key(&f.env, &f.paths),
+        Read::Unreadable(_)
+    ));
+}
+
+#[test]
+fn file_fallback_verifies_every_fallback_item_is_gone_including_the_plain_one() {
+    let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
+    let s = store(&f, Platform::MacOs);
+    let acct = keychain_account(&f.env);
+    let services = read_services(&f.env, ItemKind::OAuth);
+    assert_eq!(services.len(), 2);
+    f.kc.set_fail_write(&services[0], true);
+    f.kc.set_fail_write(&services[1], true);
+    // The plain fallback item's delete is made to fail, so it survives the attempt and
+    // the existence check must catch it.
+    f.kc.put(&services[1], &acct, b"stale");
+    f.kc.set_fail_delete(&services[1], true);
+    match s.write_credential_entry(&f.env, &f.paths, b"new", &open) {
+        Err(ProviderError::ShadowingItem(name)) => assert_eq!(name, services[1]),
+        other => panic!("expected ShadowingItem({}), got {other:?}", services[1]),
+    }
+    f.kc.set_fail_delete(&services[1], false);
+    s.write_credential_entry(&f.env, &f.paths, b"new", &open)
+        .unwrap();
+    assert!(f.kc.get(&services[0], &acct).is_none());
+    assert!(f.kc.get(&services[1], &acct).is_none());
+}
+
+#[test]
+fn a_failed_fallback_never_pins_the_file_mode() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, b"old");
+    f.kc.set_fail_write(&svc, true);
+    f.kc.set_fail_delete(&svc, true);
+    assert!(
+        s.write_credential_entry(&f.env, &f.paths, b"new", &open)
+            .is_err()
+    );
+    assert!(!s.file_mode_pinned());
+}
+
+#[test]
+fn clearing_account_keys_refuses_an_unparsable_keychain_entry() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, b"not json");
+    assert!(matches!(
+        s.clear_credential_account_keys(&f.env, &f.paths, &open),
+        Err(ProviderError::Invalid(_))
+    ));
+    assert!(
+        f.kc.get(&svc, &acct).is_some(),
+        "an unparsable entry must not be deleted"
+    );
+}
+
+#[test]
+fn clearing_account_keys_refuses_an_unparsable_credentials_file() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    fs::write(&f.paths.credentials_file, b"not json").unwrap();
+    assert!(matches!(
+        s.clear_credential_account_keys(&f.env, &f.paths, &open),
+        Err(ProviderError::Invalid(_))
+    ));
+    assert!(
+        f.paths.credentials_file.exists(),
+        "an unparsable file must not be deleted"
+    );
 }

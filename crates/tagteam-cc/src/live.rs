@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -62,18 +63,51 @@ fn present_or_err(r: Read<Vec<u8>>) -> Result<Option<Vec<u8>>, ProviderError> {
 }
 
 /// Removes what the path resolves to; a symlink itself is never deleted (§9.5).
-fn remove_if_present(path: &std::path::Path) -> Result<(), ProviderError> {
+fn remove_if_present(path: &Path) -> Result<(), ProviderError> {
     Ok(remove_target(path)?)
 }
 
-/// Keeps only the machine-shared keys of a credential entry, or `None` when nothing remains.
-fn keep_shared(b: &[u8]) -> Option<Vec<u8>> {
+const UNPARSABLE_ENTRY: &str = "a credential entry is not a JSON object";
+
+/// Keeps only the machine-shared keys of a credential entry; `Ok(None)` means none
+/// remain, so the entry may be dropped. An entry that fails to parse is refused rather
+/// than silently treated as empty: the spec drops an entry only when no machine-shared
+/// key survives it, never because the entry could not be read (§9.4 step 7).
+fn keep_shared(b: &[u8]) -> Result<Option<Vec<u8>>, ProviderError> {
     let Ok(Value::Object(o)) = serde_json::from_slice::<Value>(b) else {
-        return None;
+        return Err(ProviderError::Invalid(UNPARSABLE_ENTRY.into()));
     };
     let shared = machine_shared_only(&o);
-    (!shared.is_empty())
-        .then(|| serde_json::to_vec(&Value::Object(shared)).expect("a Value always serializes"))
+    Ok((!shared.is_empty())
+        .then(|| serde_json::to_vec(&Value::Object(shared)).expect("a Value always serializes")))
+}
+
+/// Skips restoring an entry already in its snapshotted state. An unreadable current
+/// state is never treated as a match: it is restored anyway, rather than risk leaving it
+/// wrong because its actual contents were unknown.
+fn file_matches(path: &Path, expected: &Option<Vec<u8>>) -> bool {
+    match read_bytes(path) {
+        Read::Present(b) => expected.as_deref() == Some(b.as_slice()),
+        Read::Absent => expected.is_none(),
+        Read::Unreadable(_) => false,
+    }
+}
+
+/// The file half of one `restore` entry: `fence` is checked immediately before the
+/// mutation, inside `write_atomic_with` for a restored value or explicitly before a
+/// removal.
+fn restore_file(
+    path: &Path,
+    value: &Option<Vec<u8>>,
+    fence: Fence<'_>,
+) -> Result<(), ProviderError> {
+    match value {
+        Some(v) => write_atomic_with(path, v, 0o600, fence),
+        None => {
+            fence()?;
+            remove_if_present(path)
+        }
+    }
 }
 
 impl LiveStore {
@@ -208,7 +242,7 @@ impl LiveStore {
                 bytes,
             ) {
                 Ok(()) => {
-                    if paths.credentials_file.exists() {
+                    if paths.credentials_file.try_exists()? {
                         // Bumps the mtime, so CC reloads (hot reload).
                         write_atomic_with(&paths.credentials_file, bytes, 0o600, fence)?;
                     }
@@ -237,8 +271,9 @@ impl LiveStore {
             let acct = keychain_account(env);
             for svc in read_services(env, ItemKind::OAuth) {
                 if let Some(b) = present_or_err(self.keychain.find(&svc, &acct))? {
+                    let kept = keep_shared(&b)?;
                     fence()?;
-                    match keep_shared(&b) {
+                    match kept {
                         Some(k) => self.keychain.upsert(&svc, &acct, &k)?,
                         None => self.keychain.delete(&svc, &acct)?,
                     }
@@ -246,7 +281,8 @@ impl LiveStore {
             }
         }
         if let Some(b) = present_or_err(read_bytes(&paths.credentials_file))? {
-            match keep_shared(&b) {
+            let kept = keep_shared(&b)?;
+            match kept {
                 Some(k) => write_atomic_with(&paths.credentials_file, &k, 0o600, fence)?,
                 None => {
                     fence()?;
@@ -258,8 +294,10 @@ impl LiveStore {
     }
 
     /// Appends the key's last 20 characters to `customApiKeyResponses.approved`, then stores
-    /// the key in the managed-key item. When the Keychain refuses, the key goes to
-    /// `primaryApiKey`, and every managed-key item is removed and verified gone: CC reads the
+    /// the key in the managed-key item, clearing any stale `primaryApiKey` a previous
+    /// Keychain failure left behind (otherwise another account's plaintext key would stay
+    /// live in `~/.claude.json`). When the Keychain refuses, the key goes to `primaryApiKey`
+    /// instead, and every managed-key item is removed and verified gone: CC reads the
     /// Keychain first, so a stale item would stay the effective key.
     pub fn write_managed_key(
         &self,
@@ -308,7 +346,10 @@ impl LiveStore {
                 &keychain_account(env),
                 key_str.as_bytes(),
             ) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    config::splice_key(&paths.global_config, "primaryApiKey", None, fence)?;
+                    return Ok(());
+                }
                 Err(e) => {
                     tracing::warn!("keychain write failed, storing primaryApiKey instead: {e}")
                 }
@@ -366,6 +407,39 @@ impl LiveStore {
         })
     }
 
+    fn item_matches(&self, svc: &str, acct: &str, expected: &Option<Vec<u8>>) -> bool {
+        match self.keychain.find(svc, acct) {
+            Read::Present(v) => expected.as_deref() == Some(v.as_slice()),
+            Read::Absent => expected.is_none(),
+            Read::Unreadable(_) => false,
+        }
+    }
+
+    /// The Keychain half of one `restore` entry: `fence` is checked immediately before
+    /// the upsert or delete.
+    fn restore_item(
+        &self,
+        svc: &str,
+        acct: &str,
+        value: &Option<Vec<u8>>,
+        fence: Fence<'_>,
+    ) -> Result<(), ProviderError> {
+        fence()?;
+        match value {
+            Some(v) => self.keychain.upsert(svc, acct, v)?,
+            None => self.keychain.delete(svc, acct)?,
+        }
+        Ok(())
+    }
+
+    /// Restores every entry a switch may have touched, in the reverse of write order
+    /// (§9.4 step 10): `global_config`, then the credentials file, then the managed-key
+    /// items, then the OAuth items. An entry already equal to its snapshot is left
+    /// untouched. A fence or `Lock` failure means the caller's ownership is gone, so it
+    /// aborts the whole restore immediately; any other failure is recorded and every
+    /// remaining entry is still attempted, so one flaky Keychain write never strands the
+    /// rest of the rollback. When anything was left unrestored, the single error returned
+    /// names every one of them — Keychain services and file paths, never bytes.
     pub fn restore(
         &self,
         env: &Env,
@@ -374,25 +448,39 @@ impl LiveStore {
         fence: Fence<'_>,
     ) -> Result<(), ProviderError> {
         let acct = keychain_account(env);
-        for (svc, value) in snap.oauth_items.iter().chain(&snap.managed_items) {
-            fence()?;
-            match value {
-                Some(v) => self.keychain.upsert(svc, &acct, v)?,
-                None => self.keychain.delete(svc, &acct)?,
-            }
-        }
+        let mut failed: Vec<String> = Vec::new();
+
         for (path, value) in [
-            (&paths.credentials_file, &snap.credentials_file),
             (&paths.global_config, &snap.global_config),
+            (&paths.credentials_file, &snap.credentials_file),
         ] {
-            match value {
-                Some(v) => write_atomic_with(path, v, 0o600, fence)?,
-                None => {
-                    fence()?;
-                    remove_if_present(path)?
+            if file_matches(path, value) {
+                continue;
+            }
+            if let Err(e) = restore_file(path, value, fence) {
+                if matches!(e, ProviderError::Lock(_)) {
+                    return Err(e);
                 }
+                failed.push(path.display().to_string());
             }
         }
-        Ok(())
+
+        for (svc, value) in snap.managed_items.iter().chain(&snap.oauth_items) {
+            if self.item_matches(svc, &acct, value) {
+                continue;
+            }
+            if let Err(e) = self.restore_item(svc, &acct, value, fence) {
+                if matches!(e, ProviderError::Lock(_)) {
+                    return Err(e);
+                }
+                failed.push(svc.clone());
+            }
+        }
+
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(ProviderError::Incomplete { failed })
+        }
     }
 }

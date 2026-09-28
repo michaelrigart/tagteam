@@ -166,6 +166,12 @@ pub enum ProviderError {
         cause: Box<ProviderError>,
         restore: Box<ProviderError>,
     },
+    /// `restore` could not put back every entry a switch may have touched, having still
+    /// attempted every one of them (a fence or `Lock` failure aborts immediately instead,
+    /// and is reported as that error, not this one). Each name is a Keychain service or a
+    /// file path, never bytes.
+    #[error("the previous state could not be restored for: {}", .failed.join(", "))]
+    Incomplete { failed: Vec<String> },
     #[error(transparent)]
     Lock(#[from] LockError),
     #[error(transparent)]
@@ -302,5 +308,17 @@ mod tests {
             managed_key: Read::Present(SENTINEL.as_bytes().to_vec()),
         };
         assert!(!format!("{auth:?}").contains("SENTINEL"));
+    }
+
+    #[test]
+    fn incomplete_lists_every_unrestored_entry_by_name() {
+        let err = ProviderError::Incomplete {
+            failed: vec![
+                "Claude Code-credentials".into(),
+                "/home/x/.claude.json".into(),
+            ],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Claude Code-credentials") && msg.contains(".claude.json"));
     }
 }
