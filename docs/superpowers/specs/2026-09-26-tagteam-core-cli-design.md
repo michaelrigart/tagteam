@@ -962,6 +962,10 @@ here on.
      empty.
    - `Degraded` → abort. The Keychain item that could not be read may hold a newer generation
      than the file, plus the current machine-shared keys, and overwriting it would lose them.
+
+   The same holds for the copies of the entry that no reader sees but that step 7 overwrites or
+   clears: `.credentials.json` behind a Keychain item, and the fallback Keychain items
+   (Appendix A.2). One that is `Unreadable` aborts.
 4. **Classify the outgoing credential**, using the pre-lock oracle result only if the live bytes
    haven't changed since it was taken:
 
@@ -1003,7 +1007,11 @@ here on.
 
    An account-scoped secret on the auth axis the outgoing account is not on — which step 4 does
    not classify — is displaced before step 7 clears or overwrites it, unless it is the target's
-   generation.
+   generation. The copies of the entry that step 3 names are displaced the same way, the file
+   before any write and the fallback items before an API key is written, unless their
+   generation is the live credential's, the target's, or one the outgoing account's vault
+   already holds (current or `.prev`). §9.6 recovery applies the same rule before it clears the
+   entry to finish forward.
 8. **Splice** the target's `oauthAccount` into `~/.claude.json` (§9.5).
 9. **Commit** in one store transaction: set the active account, insert an `events` row
    (`source` = `cli` or `auto`), and delete the journal row.
