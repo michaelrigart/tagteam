@@ -3,14 +3,20 @@
 
 mod common;
 
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::Path;
+use std::process::Stdio;
 
 use assert_cmd::Command;
-use common::LOCKED;
+use assert_cmd::assert::OutputAssertExt;
+use common::{LOCKED, login, seed_home};
+use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
+use tagteam_provider::{Env, FileKeychain};
 
-fn cmd(root: &Path) -> Command {
-    let mut c = Command::cargo_bin("tagteam").unwrap();
+/// The binary in an isolated environment rooted at `root`, with its file-backed Keychain.
+fn std_cmd(root: &Path) -> std::process::Command {
+    let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("tagteam"));
     c.env_clear()
         .env("HOME", root.join("home"))
         .env("USER", "tester")
@@ -18,6 +24,20 @@ fn cmd(root: &Path) -> Command {
         .env("TAGTEAM_TEST_KEYCHAIN_DIR", root.join("keychain"))
         .env("TAGTEAM_TEST_PLATFORM", "macos");
     c
+}
+
+fn cmd(root: &Path) -> Command {
+    Command::from_std(std_cmd(root))
+}
+
+/// A stdout whose reader is already gone, so every write to it fails with EPIPE.
+fn closed_stdout() -> Stdio {
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` fills `fds` with two new descriptors on success, and each is owned once.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    drop(read);
+    Stdio::from(write)
 }
 
 fn assert_home_empty(root: &Path) {
@@ -80,6 +100,56 @@ fn usage_errors_exit_2_and_keep_the_json_contract() {
 }
 
 #[test]
+fn help_and_version_under_json_are_a_json_usage_error() {
+    // They print text, and `--json` promises exactly one JSON object on stdout.
+    let d = tempfile::tempdir().unwrap();
+    for flag in ["--help", "--version"] {
+        let out = cmd(d.path())
+            .args([flag, "--json"])
+            .assert()
+            .code(2)
+            .get_output()
+            .stdout
+            .clone();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap(),
+            json!({"schemaVersion": 1, "error": {"type": "usage",
+                   "message": "--help and --version print text; run them without --json"}}),
+            "{flag}"
+        );
+    }
+    // Without `--json`, help is the usual page on stdout.
+    cmd(d.path())
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicates::str::starts_with(
+            "Multi-account switcher for AI coding agent CLIs\n",
+        ));
+}
+
+#[test]
+fn a_closed_stdout_is_not_a_panic() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join("home")).unwrap();
+    let cases: [(&[&str], i32); 3] = [
+        (&["frobnicate", "--json"], 2),
+        (&["list", "--json"], 0),
+        (&["list"], 0),
+    ];
+    for (args, code) in cases {
+        std_cmd(d.path())
+            .args(args)
+            .stdout(closed_stdout())
+            .output()
+            .unwrap()
+            .assert()
+            .code(code)
+            .stderr(predicates::str::contains("panicked").not());
+    }
+}
+
+#[test]
 fn add_token_reads_a_line_from_stdin() {
     let d = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(d.path().join("home")).unwrap();
@@ -132,4 +202,35 @@ fn a_locked_keychain_without_a_terminal_fails_and_creates_nothing() {
         .env("TAGTEAM_TEST_PLATFORM", "linux")
         .assert()
         .success();
+}
+
+#[test]
+fn warnings_reach_stderr_by_default_and_json_stays_one_object() {
+    // Claude Code rotated the live credential, and no oracle can attribute it: the switch
+    // captures it with a WARN (§9.4 step 4), which the default log level shows, on stderr.
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let kc = FileKeychain::new(d.path().join("keychain"));
+    seed_home(&env);
+    login(&env, &kc, "a@x.co", "", "rt-a");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-b");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-b-rotated");
+    let out = cmd(d.path())
+        .args(["switch", "1", "--json"])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "captured an unverified live credential",
+        ))
+        .get_output()
+        .stdout
+        .clone();
+    // Exactly one object: anything after it would fail to parse.
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        (v["switched"].clone(), v["to"].clone()),
+        (json!(true), json!(1))
+    );
 }

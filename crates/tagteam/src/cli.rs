@@ -92,4 +92,10 @@ impl Command {
                 | Command::Remove { .. }
         )
     }
+
+    /// Of those, the ones that reach a Keychain item only through a stored account, so with
+    /// no store they touch none (§5): there is nothing to activate or delete.
+    pub fn touches_keychain_only_with_a_store(&self) -> bool {
+        matches!(self, Command::Switch { .. } | Command::Remove { .. })
+    }
 }

@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -12,6 +12,7 @@ use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
+use tagteam_engine::views::AccountView;
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::security::SecurityCli;
 use tagteam_provider::{Env, Keychain, LockState, SystemClock};
@@ -109,15 +110,17 @@ fn build_engine(ctx: Context) -> Engine {
     })
 }
 
+/// Logs go to stderr: WARN and up by default, so a credential falling back to a file or a
+/// failed recovery is seen; DEBUG with `--debug`. Colour only on a terminal.
 fn init_logging(debug: bool, color: bool) {
     let level = if debug {
         tracing::Level::DEBUG
     } else {
-        tracing::Level::ERROR
+        tracing::Level::WARN
     };
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_ansi(color)
+        .with_ansi(color && std::io::stderr().is_terminal())
         .with_target(false)
         .with_max_level(level)
         .try_init();
@@ -174,7 +177,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
         }
     }
     let unlocked = match &keychain {
-        Some(k) => app.ensure_unlocked(k.as_ref()),
+        Some(k) => app.lock_check(&command, k.as_ref()),
         None => Ok(()),
     };
     let result = unlocked.and_then(|()| app.dispatch(command));
@@ -222,6 +225,17 @@ impl App<'_, '_> {
         for n in notices {
             let _ = writeln!(self.io.err, "note: {n}");
         }
+    }
+
+    /// Appendix A.3's check, for a command that will touch a Keychain item. With no store,
+    /// `switch` and `remove` have no account to touch (§5), so they run none: a fresh machine
+    /// gets their no-op or "no account matches" even with a locked keychain. A store created
+    /// by another process meanwhile is covered too: the tri-state reads refuse on their own.
+    fn lock_check(&mut self, command: &Command, keychain: &dyn Keychain) -> Result<(), Failure> {
+        if command.touches_keychain_only_with_a_store() && self.engine.existing_store()?.is_none() {
+            return Ok(());
+        }
+        self.ensure_unlocked(keychain)
     }
 
     /// Appendix A.3, before the command touches anything. On a terminal, a locked keychain is
@@ -272,7 +286,7 @@ impl App<'_, '_> {
                         .map_or_else(|_| id.to_owned(), |p| p.display_name().to_owned())
                 };
                 let human = render::list_human(&lists, &names);
-                self.print(&human, render::list_json(&lists));
+                self.print(&human, render::list_json(&lists, &self.provider()));
             }
             Command::Status => {
                 let provider = self.provider();
@@ -304,35 +318,30 @@ impl App<'_, '_> {
                     alias,
                     yes,
                 })?;
-                self.added(&out.account, out.created);
+                self.added(out.account, out.created)?;
             }
             Command::Remove { account } => {
                 let row = self.resolve(&account)?;
+                // Decided before the row is gone. Removal never touches the live login
+                // (§10.3), so this also says whether the removed login is still the live one.
+                let active = self.is_active(&row)?;
                 let row = self.engine.remove(&row.id)?;
-                self.print(
-                    &format!(
-                        "Removed {} (position {}).\n",
-                        render::name(&row),
-                        row.position
-                    ),
-                    render::account_json(&row, None),
+                let human = format!(
+                    "Removed {} (position {}).\n",
+                    render::name(&row),
+                    row.position
                 );
+                self.print_view(&human, AccountView { row, active }, None);
             }
             Command::Disable { account } => {
                 let row = self.resolve(&account)?;
                 let row = self.engine.set_disabled(&row.id, true)?;
-                self.print(
-                    &format!("{} is disabled.\n", render::name(&row)),
-                    render::account_json(&row, None),
-                );
+                self.print_account(&format!("{} is disabled.\n", render::name(&row)), row, None)?;
             }
             Command::Enable { account } => {
                 let row = self.resolve(&account)?;
                 let row = self.engine.set_disabled(&row.id, false)?;
-                self.print(
-                    &format!("{} is enabled.\n", render::name(&row)),
-                    render::account_json(&row, None),
-                );
+                self.print_account(&format!("{} is enabled.\n", render::name(&row)), row, None)?;
             }
             Command::Alias {
                 account,
@@ -367,32 +376,26 @@ impl App<'_, '_> {
                     let row = self.resolve(&account)?;
                     let row = self.engine.set_alias(&row.id, Some(&name))?;
                     let alias = row.alias.clone().unwrap_or_default();
-                    self.print(
-                        &format!("Position {} is now {alias}.\n", row.position),
-                        render::account_json(&row, None),
-                    );
+                    let human = format!("Position {} is now {alias}.\n", row.position);
+                    self.print_account(&human, row, None)?;
                 }
                 (Some(account), None, true) => {
                     let row = self.resolve(&account)?;
                     let row = self.engine.set_alias(&row.id, None)?;
-                    self.print(
-                        &format!("Position {} has no alias now.\n", row.position),
-                        render::account_json(&row, None),
-                    );
+                    let human = format!("Position {} has no alias now.\n", row.position);
+                    self.print_account(&human, row, None)?;
                 }
                 _ => return Err(Failure::Usage(ALIAS_USAGE.into())),
             },
             Command::Move { account, position } => {
                 let row = self.resolve(&account)?;
                 let row = self.engine.move_to(&row.id, position)?;
-                self.print(
-                    &format!(
-                        "{} is now at position {}.\n",
-                        render::email(&row),
-                        row.position
-                    ),
-                    render::account_json(&row, None),
+                let human = format!(
+                    "{} is now at position {}.\n",
+                    render::email(&row),
+                    row.position
                 );
+                self.print_account(&human, row, None)?;
             }
         }
         Ok(())
@@ -416,14 +419,42 @@ impl App<'_, '_> {
         }
     }
 
-    fn added(&mut self, account: &AccountRow, created: bool) {
+    /// Whether `row` is its provider's active account, decided as `list` decides it: by the
+    /// engine's views (the live login; the store's active account while the live identity is
+    /// unreadable).
+    fn is_active(&self, row: &AccountRow) -> Result<bool, Failure> {
+        Ok(self
+            .engine
+            .accounts(Some(&row.provider))?
+            .iter()
+            .flat_map(|l| &l.accounts)
+            .any(|v| v.active && v.row.id == row.id))
+    }
+
+    fn print_view(&mut self, human: &str, view: AccountView, created: Option<bool>) {
+        self.print(human, render::account_json(&view, created));
+    }
+
+    /// An account command's result, with `active` as the engine sees it after the command.
+    fn print_account(
+        &mut self,
+        human: &str,
+        row: AccountRow,
+        created: Option<bool>,
+    ) -> Result<(), Failure> {
+        let active = self.is_active(&row)?;
+        self.print_view(human, AccountView { row, active }, created);
+        Ok(())
+    }
+
+    fn added(&mut self, account: AccountRow, created: bool) -> Result<(), Failure> {
         let verb = if created { "Added" } else { "Updated" };
         let human = format!(
             "{verb} {} at position {}.\n",
-            render::name(account),
+            render::name(&account),
             account.position
         );
-        self.print(&human, render::account_json(account, Some(created)));
+        self.print_account(&human, account, Some(created))
     }
 
     fn add(
@@ -452,8 +483,7 @@ impl App<'_, '_> {
             other => other?,
         };
         self.notices(&out.notices);
-        self.added(&out.account, out.created);
-        Ok(())
+        self.added(out.account, out.created)
     }
 
     fn switch(&mut self, account: Option<String>, force: bool) -> Result<(), Failure> {

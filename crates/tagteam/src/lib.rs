@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::Write;
 
 use clap::Parser;
 
@@ -7,6 +8,8 @@ pub mod cli;
 pub mod prompt;
 mod render;
 mod root_guard;
+
+const TEXT_UNDER_JSON: &str = "--help and --version print text; run them without --json";
 
 /// Runs the CLI and returns the process exit code.
 pub fn main_with_args<I, T>(args: I) -> i32
@@ -18,12 +21,17 @@ where
     let json = args.iter().any(|a| a == "--json");
     let cli = match cli::Cli::try_parse_from(&args) {
         Ok(c) => c,
-        // `--json` promises one JSON object on stdout even for a usage error (B.36).
-        Err(e) if json && e.use_stderr() => {
-            println!(
-                "{}",
-                app::error_json(app::KIND_USAGE, &e.kind().to_string())
-            );
+        // `--json` promises exactly one JSON object on stdout (B.36), so under it a usage
+        // error, and a request for help or the version (which are text), is a JSON usage
+        // error. A closed stdout is not a panic.
+        Err(e) if json => {
+            let message = if e.use_stderr() {
+                e.kind().to_string()
+            } else {
+                TEXT_UNDER_JSON.to_owned()
+            };
+            let error = app::error_json(app::KIND_USAGE, &message);
+            let _ = writeln!(std::io::stdout(), "{error}");
             return app::EXIT_USAGE;
         }
         Err(e) => {

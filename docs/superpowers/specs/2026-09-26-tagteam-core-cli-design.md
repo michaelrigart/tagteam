@@ -1636,9 +1636,9 @@ windows. Claude Code renders cswap's shape:
 - `scoped [{name, …same fields as sevenDay}]`
 
 **`status`** returns one of:
-- `{schemaVersion, active: null}`
-- `{active: {email, provider, managed: false}}`
-- `{active: {number, position, id, email, …row fields, managed: true}, totalManagedAccounts}`
+- `{schemaVersion, provider, active: null}`
+- `{provider, active: {email, provider, managed: false}}`
+- `{provider, active: {number, position, id, email, …row fields, managed: true}, totalManagedAccounts}`
 
 **`switch`** returns `{schemaVersion, switched, from, to, strategy, reason, message, warnings}`.
 - `strategy` is `rotation | best | next-available | direct`.

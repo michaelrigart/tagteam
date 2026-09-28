@@ -1,18 +1,15 @@
 mod common;
 
 use std::collections::VecDeque;
-use std::fs;
 use std::sync::Arc;
 
 use clap::Parser;
-use common::LOCKED;
+use common::{LOCKED, login, seed_home};
 use serde_json::{Value, json};
 use tagteam::app::{self, Context, Io};
 use tagteam::cli::Cli;
 use tagteam::prompt::Prompter;
 use tagteam_cc::live::Platform;
-use tagteam_cc::{ItemKind, keychain_account, keychain_service};
-use tagteam_provider::splice::replace_top_level;
 use tagteam_provider::{Env, FakeKeychain};
 
 struct Scripted {
@@ -78,8 +75,7 @@ impl H {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::for_test(dir.path());
-        fs::create_dir_all(env.home.join(".claude")).unwrap();
-        fs::write(env.home.join(".claude.json"), "{\n  \"userID\": \"u\"\n}\n").unwrap();
+        seed_home(&env);
         H {
             _dir: dir,
             env,
@@ -91,22 +87,17 @@ impl H {
         self.login_in(email, "", rt);
     }
 
-    /// What `claude /login` leaves behind, for a login in organization `org` ("" is personal).
     fn login_in(&self, email: &str, org: &str, rt: &str) {
-        let path = self.env.home.join(".claude.json");
-        let doc = fs::read(&path).unwrap();
-        let acct = json!({"emailAddress": email, "organizationUuid": org, "accountUuid": format!("uuid-{email}-{org}")});
-        fs::write(
-            &path,
-            replace_top_level(&doc, "oauthAccount", &acct).unwrap(),
-        )
-        .unwrap();
-        let cred = json!({"claudeAiOauth": {"accessToken": "at", "refreshToken": rt, "refreshTokenExpiresAt": 1_797_000_000_000i64}});
-        self.kc.put(
-            &keychain_service(&self.env, ItemKind::OAuth),
-            &keychain_account(&self.env),
-            cred.to_string().as_bytes(),
-        );
+        login(&self.env, &*self.kc, email, org, rt);
+    }
+
+    /// `a@x.co` stored at position 1 and live, and an API key at position 2.
+    fn with_login_and_key() -> Self {
+        let h = H::new();
+        h.login("a@x.co", "rt-a");
+        h.ok(&["add"]);
+        h.ok(&["add-token", "sk-ant-api03-key"]);
+        h
     }
 
     fn run(&self, args: &[&str], prompter: &mut Scripted) -> (i32, String, String) {
@@ -145,6 +136,37 @@ impl H {
         normalize_ids(&mut v);
         v
     }
+}
+
+/// `a@x.co`'s row as §13.2 renders it, at `position`.
+fn a_row(position: u32, active: bool) -> Value {
+    json!({"number": position, "position": position, "id": "[id]", "provider": "claude-code", "email": "a@x.co",
+           "organizationName": null, "organizationUuid": "", "isOrganization": false, "active": active,
+           "usageStatus": "unavailable", "usage": null, "lastGoodUsage": null, "lastGoodFetchedAt": null,
+           "lastGoodAgeSeconds": null, "usageError": "no-data", "usageRetryAt": null,
+           "loginExpiresAt": 1_797_000_000_000i64})
+}
+
+/// The API key `add-token sk-ant-api03-key` stores second (its default email names that
+/// position), at `position`. It is never the live login.
+fn key_row(position: u32) -> Value {
+    json!({"number": position, "position": position, "id": "[id]", "provider": "claude-code", "email": "api-key-2@token.local",
+           "organizationName": null, "organizationUuid": "", "isOrganization": false, "active": false,
+           "usageStatus": "api_key", "usage": null, "lastGoodUsage": null, "lastGoodFetchedAt": null,
+           "lastGoodAgeSeconds": null})
+}
+
+/// `v` with `extra`'s fields set.
+fn with(mut v: Value, extra: Value) -> Value {
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    v
+}
+
+/// An account command's success object.
+fn done(account: Value) -> Value {
+    json!({"schemaVersion": 1, "ok": true, "account": account})
 }
 
 fn normalize_ids(v: &mut Value) {
@@ -215,17 +237,7 @@ fn list_json_is_cswap_compatible() {
             "schemaVersion": 1,
             "activeAccountNumber": 1,
             "activeByProvider": {"claude-code": 1},
-            "accounts": [
-                {"number": 1, "position": 1, "id": "[id]", "provider": "claude-code", "email": "a@x.co",
-                 "organizationName": null, "organizationUuid": "", "isOrganization": false, "active": true,
-                 "usageStatus": "unavailable", "usage": null, "lastGoodUsage": null, "lastGoodFetchedAt": null,
-                 "lastGoodAgeSeconds": null, "usageError": "no-data", "usageRetryAt": null,
-                 "loginExpiresAt": 1_797_000_000_000i64},
-                {"number": 2, "position": 2, "id": "[id]", "provider": "claude-code", "email": "api-key-2@token.local",
-                 "organizationName": null, "organizationUuid": "", "isOrganization": false, "active": false,
-                 "usageStatus": "api_key", "usage": null, "lastGoodUsage": null, "lastGoodFetchedAt": null,
-                 "lastGoodAgeSeconds": null, "alias": "ci", "disabled": true}
-            ]
+            "accounts": [a_row(1, true), with(key_row(2), json!({"alias": "ci", "disabled": true}))]
         })
     );
 }
@@ -233,7 +245,7 @@ fn list_json_is_cswap_compatible() {
 #[test]
 fn status_and_switch_json() {
     let h = H::new();
-    // Every status object names its provider (§13.2), an empty one at the top level.
+    // Every status shape names its provider at the top level, and in `active` too (§13.2).
     assert_eq!(
         h.json(&["status", "--json"]),
         json!({"schemaVersion": 1, "provider": "claude-code", "active": null})
@@ -241,7 +253,8 @@ fn status_and_switch_json() {
     h.login("stranger@x.co", "rt-s");
     assert_eq!(
         h.json(&["status", "--json"]),
-        json!({"schemaVersion": 1, "active": {"email": "stranger@x.co", "provider": "claude-code", "managed": false}})
+        json!({"schemaVersion": 1, "provider": "claude-code",
+               "active": {"email": "stranger@x.co", "provider": "claude-code", "managed": false}})
     );
     h.login("a@x.co", "rt-a");
     h.ok(&["add"]);
@@ -252,11 +265,11 @@ fn status_and_switch_json() {
         json!({"schemaVersion": 1, "provider": "claude-code", "switched": true, "from": 2, "to": 1, "strategy": "direct",
                "reason": "switched", "message": "Switched to a@x.co", "warnings": []})
     );
-    let status = h.json(&["status", "--json"]);
-    assert_eq!(status["active"]["email"], "a@x.co");
-    assert_eq!(status["active"]["provider"], "claude-code");
-    assert_eq!(status["active"]["managed"], true);
-    assert_eq!(status["totalManagedAccounts"], 2);
+    assert_eq!(
+        h.json(&["status", "--json"]),
+        json!({"schemaVersion": 1, "provider": "claude-code",
+               "active": with(a_row(1, true), json!({"managed": true})), "totalManagedAccounts": 2})
+    );
 }
 
 #[test]
@@ -273,14 +286,24 @@ fn errors_are_one_json_object_with_a_stable_type() {
     assert_eq!(err, "tagteam: no account matches \"9\"\n");
 }
 
-#[test]
-fn an_unmanaged_login_is_offered_for_adding_on_a_terminal() {
+const ADD_STRANGER_FIRST: &str = "Add the current login (stranger@x.co) first?";
+
+/// `a@x.co` stored, and a login no account holds live.
+fn with_unmanaged_login() -> H {
     let h = H::new();
     h.login("a@x.co", "rt-a");
     h.ok(&["add"]);
     h.login("stranger@x.co", "rt-s");
-    let (code, out, _) = h.run(&["switch", "1"], &mut Scripted::answering(&[""]));
+    h
+}
+
+#[test]
+fn an_unmanaged_login_is_offered_for_adding_on_a_terminal() {
+    let h = with_unmanaged_login();
+    let mut yes = Scripted::answering(&[""]);
+    let (code, out, _) = h.run(&["switch", "1"], &mut yes);
     assert_eq!(code, 0);
+    assert_eq!(yes.asked, [ADD_STRANGER_FIRST]);
     assert!(
         out.starts_with("Added stranger@x.co at position 2.\nSwitched to a@x.co (position 1).\n"),
         "{out}"
@@ -288,12 +311,26 @@ fn an_unmanaged_login_is_offered_for_adding_on_a_terminal() {
 }
 
 #[test]
+fn declining_the_unmanaged_login_offer_cancels_and_adds_nothing() {
+    let h = with_unmanaged_login();
+    let mut no = Scripted::answering(&["n"]);
+    let (code, out, err) = h.run(&["switch", "1"], &mut no);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (1, "", "tagteam: cancelled\n")
+    );
+    assert_eq!(no.asked, [ADD_STRANGER_FIRST]);
+    assert_eq!(h.ok(&["list"]), "  1  a@x.co\n");
+    assert_eq!(
+        h.ok(&["status"]),
+        "Live: stranger@x.co (not managed by tagteam)\n"
+    );
+}
+
+#[test]
 fn prompts_never_block_a_non_interactive_caller() {
     // Review Focus 2.
-    let h = H::new();
-    h.login("a@x.co", "rt-a");
-    h.ok(&["add"]);
-    h.login("stranger@x.co", "rt-s");
+    let h = with_unmanaged_login();
     let (code, _, err) = h.run(&["switch", "1"], &mut Scripted::none());
     assert_eq!(code, 1);
     assert!(
@@ -386,21 +423,19 @@ fn a_locked_keychain_is_offered_for_unlocking_on_a_terminal() {
 fn the_unlock_offer_never_blocks_a_non_interactive_caller() {
     // Review Focus 2: no terminal fails at once, before anything is touched or created.
     let h = H::new();
+    let refused = |commands: &[&[&str]]| {
+        for args in commands {
+            let (code, out, err) = h.run(args, &mut Scripted::none());
+            assert_eq!(
+                (code, out.as_str(), err),
+                (1, "", format!("tagteam: {LOCKED}\n")),
+                "{args:?}"
+            );
+        }
+    };
     h.kc.set_locked(true);
-    let touching: [&[&str]; 4] = [
-        &["add"],
-        &["add-token", "sk-ant-api03-key"],
-        &["switch"],
-        &["remove", "1"],
-    ];
-    for args in touching {
-        let (code, out, err) = h.run(args, &mut Scripted::none());
-        assert_eq!(
-            (code, out.as_str(), err),
-            (1, "", format!("tagteam: {LOCKED}\n")),
-            "{args:?}"
-        );
-    }
+    // With no store, only the two adds would touch a Keychain item.
+    refused(&[&["add"], &["add-token", "sk-ant-api03-key"]]);
     // `--json` never prompts, even on a terminal: Scripted panics on any prompt it has no answer for.
     let (code, out, _) = h.run(&["add", "--json"], &mut Scripted::answering(&[]));
     assert_eq!(code, 1);
@@ -408,16 +443,120 @@ fn the_unlock_offer_never_blocks_a_non_interactive_caller() {
         serde_json::from_str::<Value>(&out).unwrap(),
         json!({"schemaVersion": 1, "error": {"type": "keychain-locked", "message": LOCKED}})
     );
+    assert!(!h.env.data_dir().exists());
+    // With a store, `switch` and `remove` reach its accounts' items too.
+    h.kc.set_locked(false);
+    h.ok(&["add-token", "sk-ant-api03-key"]);
+    h.kc.set_locked(true);
+    refused(&[&["switch"], &["remove", "1"]]);
+    assert_eq!(h.kc.unlock_attempts(), 0);
+}
+
+#[test]
+fn with_no_store_switch_and_remove_run_no_lock_check() {
+    // A fresh machine: there is nothing to activate or delete, so a locked keychain neither
+    // refuses nor prompts (Scripted panics on a prompt it has no answer for).
+    let h = H::new();
+    h.kc.set_locked(true);
+    let (code, out, err) = h.run(&["switch", "--json"], &mut Scripted::answering(&[]));
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap(),
+        json!({"schemaVersion": 1, "provider": "claude-code", "switched": false, "from": null, "to": null,
+               "strategy": "rotation", "reason": "no-valid-target",
+               "message": "there are no stored accounts; add one with `tagteam add`", "warnings": []})
+    );
+    let (code, out, err) = h.run(&["remove", "1"], &mut Scripted::answering(&[]));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (1, "", "tagteam: no account matches \"1\"\n")
+    );
     assert_eq!(h.kc.unlock_attempts(), 0);
     assert!(!h.env.data_dir().exists());
 }
 
+// One test per account command: its success JSON, `active` as the engine sees it.
+
 #[test]
-fn commands_that_touch_no_keychain_item_run_no_check() {
+fn add_json_reports_the_captured_live_login_as_active() {
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    let added = done(a_row(1, true));
+    assert_eq!(
+        h.json(&["add", "--json"]),
+        with(added.clone(), json!({"created": true}))
+    );
+    // The same login again is refreshed in place.
+    assert_eq!(
+        h.json(&["add", "--json"]),
+        with(added, json!({"created": false}))
+    );
+}
+
+#[test]
+fn add_token_json_reports_a_new_inactive_account() {
     let h = H::new();
     h.login("a@x.co", "rt-a");
     h.ok(&["add"]);
-    h.ok(&["add-token", "sk-ant-api03-key"]);
+    assert_eq!(
+        h.json(&["add-token", "sk-ant-api03-key", "--json"]),
+        with(done(key_row(2)), json!({"created": true}))
+    );
+}
+
+#[test]
+fn remove_json_says_whether_the_removed_login_was_live() {
+    let h = H::with_login_and_key();
+    assert_eq!(h.json(&["remove", "2", "--json"]), done(key_row(2)));
+    assert_eq!(h.json(&["remove", "1", "--json"]), done(a_row(1, true)));
+}
+
+#[test]
+fn alias_json_sets_lists_and_clears() {
+    let h = H::with_login_and_key();
+    assert_eq!(
+        h.json(&["alias", "1", "work", "--json"]),
+        done(with(a_row(1, true), json!({"alias": "work"})))
+    );
+    assert_eq!(
+        h.json(&["alias", "--json"]),
+        json!({"schemaVersion": 1, "aliases": [{"alias": "work", "number": 1, "provider": "claude-code"}]})
+    );
+    assert_eq!(
+        h.json(&["alias", "work", "--unset", "--json"]),
+        done(a_row(1, true))
+    );
+}
+
+#[test]
+fn move_json_reports_the_new_position() {
+    let h = H::with_login_and_key();
+    assert_eq!(h.json(&["move", "1", "2", "--json"]), done(a_row(2, true)));
+}
+
+#[test]
+fn disable_json_marks_the_row() {
+    let h = H::with_login_and_key();
+    assert_eq!(
+        h.json(&["disable", "1", "--json"]),
+        done(with(a_row(1, true), json!({"disabled": true})))
+    );
+    assert_eq!(
+        h.json(&["disable", "2", "--json"]),
+        done(with(key_row(2), json!({"disabled": true})))
+    );
+}
+
+#[test]
+fn enable_json_clears_the_mark() {
+    let h = H::with_login_and_key();
+    h.ok(&["disable", "1"]);
+    assert_eq!(h.json(&["enable", "1", "--json"]), done(a_row(1, true)));
+}
+
+#[test]
+fn commands_that_touch_no_keychain_item_run_no_check() {
+    let h = H::with_login_and_key();
     h.kc.set_locked(true);
     // A check would find the keychain locked and prompt; this prompter has no answers and panics.
     let mut p = Scripted::answering(&[]);
@@ -440,10 +579,7 @@ fn commands_that_touch_no_keychain_item_run_no_check() {
 
 #[test]
 fn alias_move_remove_and_usage_errors() {
-    let h = H::new();
-    h.login("a@x.co", "rt-a");
-    h.ok(&["add"]);
-    h.ok(&["add-token", "sk-ant-api03-key"]);
+    let h = H::with_login_and_key();
     assert_eq!(h.ok(&["alias", "1", "Work"]), "Position 1 is now work.\n");
     assert_eq!(h.ok(&["alias"]), "work  1  a@x.co\n");
     assert_eq!(

@@ -1,4 +1,5 @@
 use serde_json::{Value, json};
+use tagteam_core::ProviderId;
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::SwitchOutcome;
 use tagteam_engine::views::{AccountView, ProviderAccounts, StatusView};
@@ -68,7 +69,9 @@ pub fn row_json(v: &AccountView) -> Value {
     o
 }
 
-pub fn list_json(lists: &[ProviderAccounts]) -> Value {
+/// §13.2. `activeAccountNumber` is `provider`'s: the one the command queried, else the default
+/// provider (for cswap compatibility), wherever it falls among `lists`.
+pub fn list_json(lists: &[ProviderAccounts], provider: &ProviderId) -> Value {
     let active_by: serde_json::Map<String, Value> = lists
         .iter()
         .map(|l| (l.provider.to_string(), json!(l.active_position)))
@@ -77,9 +80,13 @@ pub fn list_json(lists: &[ProviderAccounts]) -> Value {
         .iter()
         .flat_map(|l| l.accounts.iter().map(row_json))
         .collect();
+    let active = lists
+        .iter()
+        .find(|l| &l.provider == provider)
+        .and_then(|l| l.active_position);
     json!({
         "schemaVersion": 1,
-        "activeAccountNumber": lists.first().and_then(|l| l.active_position),
+        "activeAccountNumber": active,
         "activeByProvider": active_by,
         "accounts": rows,
     })
@@ -121,9 +128,8 @@ pub fn list_human(lists: &[ProviderAccounts], display_names: &dyn Fn(&str) -> St
     s
 }
 
-/// §13.2. Every status object names its provider, `provider` (the one the command ran
-/// against): a managed row already carries it; an unmanaged login carries it in `active`; with
-/// no login there is no `active` object, so it sits at the top level.
+/// §13.2. Every shape names `provider` (the one the command ran against) at the top level, and
+/// again in `active` wherever there is one: a managed row carries it already.
 pub fn status_json(s: &StatusView, provider: &str) -> Value {
     match s {
         StatusView::NoLogin => {
@@ -131,12 +137,13 @@ pub fn status_json(s: &StatusView, provider: &str) -> Value {
         }
         StatusView::Unmanaged { email } => json!({
             "schemaVersion": 1,
+            "provider": provider,
             "active": {"email": email, "provider": provider, "managed": false},
         }),
         StatusView::Managed { account, total } => {
             let mut row = row_json(account);
             row["managed"] = json!(true);
-            json!({"schemaVersion": 1, "active": row, "totalManagedAccounts": total})
+            json!({"schemaVersion": 1, "provider": provider, "active": row, "totalManagedAccounts": total})
         }
     }
 }
@@ -187,10 +194,38 @@ pub fn switch_human(o: &SwitchOutcome) -> String {
     }
 }
 
-pub fn account_json(row: &AccountRow, created: Option<bool>) -> Value {
-    let mut v = json!({"schemaVersion": 1, "ok": true, "account": row_json(&AccountView { row: row.clone(), active: false })});
+/// An account command's result: the row as `list` shows it, `active` included.
+pub fn account_json(account: &AccountView, created: Option<bool>) -> Value {
+    let mut v = json!({"schemaVersion": 1, "ok": true, "account": row_json(account)});
     if let Some(c) = created {
         v["created"] = json!(c);
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use tagteam_core::CLAUDE_CODE;
+
+    use super::*;
+
+    fn accounts(provider: &str, active: Option<u32>) -> ProviderAccounts {
+        ProviderAccounts {
+            provider: ProviderId::new(provider),
+            active_position: active,
+            accounts: vec![],
+        }
+    }
+
+    #[test]
+    fn active_account_number_is_the_queried_providers_wherever_it_is_listed() {
+        let lists = [accounts("other", Some(5)), accounts(CLAUDE_CODE, Some(2))];
+        let v = list_json(&lists, &ProviderId::new(CLAUDE_CODE));
+        assert_eq!(v["activeAccountNumber"], 2);
+        assert_eq!(v["activeByProvider"], json!({"other": 5, CLAUDE_CODE: 2}));
+        let v = list_json(&lists, &ProviderId::new("other"));
+        assert_eq!(v["activeAccountNumber"], 5);
+        let v = list_json(&lists, &ProviderId::new("absent"));
+        assert_eq!(v["activeAccountNumber"], Value::Null);
+    }
 }
