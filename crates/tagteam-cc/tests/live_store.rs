@@ -511,6 +511,106 @@ fn managed_keys_record_approval_and_never_leave_a_shadowing_item() {
 }
 
 #[test]
+fn a_null_approved_refuses_and_leaves_everything_untouched() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let config_before = b"{\"customApiKeyResponses\":{\"approved\":null}}\n".to_vec();
+    fs::write(&f.paths.global_config, &config_before).unwrap();
+
+    let err = s
+        .write_managed_key(&f.env, &f.paths, b"sk-ant-api03-xyz", &open)
+        .unwrap_err();
+    assert!(matches!(err, ProviderError::Invalid(_)), "{err}");
+
+    assert!(f.kc.items().is_empty(), "the Keychain must stay untouched");
+    assert_eq!(
+        config::get_key(&f.paths.global_config, "primaryApiKey")
+            .present()
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        fs::read(&f.paths.global_config).unwrap(),
+        config_before,
+        "the config must stay byte-identical"
+    );
+}
+
+#[test]
+fn an_object_approved_refuses_and_leaves_everything_untouched() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let config_before = b"{\"customApiKeyResponses\":{\"approved\":{}}}\n".to_vec();
+    fs::write(&f.paths.global_config, &config_before).unwrap();
+
+    let err = s
+        .write_managed_key(&f.env, &f.paths, b"sk-ant-api03-xyz", &open)
+        .unwrap_err();
+    assert!(matches!(err, ProviderError::Invalid(_)), "{err}");
+
+    assert!(f.kc.items().is_empty(), "the Keychain must stay untouched");
+    assert_eq!(
+        config::get_key(&f.paths.global_config, "primaryApiKey")
+            .present()
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        fs::read(&f.paths.global_config).unwrap(),
+        config_before,
+        "the config must stay byte-identical"
+    );
+}
+
+#[test]
+fn a_non_object_custom_api_key_responses_refuses_and_leaves_everything_untouched() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let config_before = b"{\"customApiKeyResponses\":[]}\n".to_vec();
+    fs::write(&f.paths.global_config, &config_before).unwrap();
+
+    let err = s
+        .write_managed_key(&f.env, &f.paths, b"sk-ant-api03-xyz", &open)
+        .unwrap_err();
+    assert!(matches!(err, ProviderError::Invalid(_)), "{err}");
+
+    assert!(f.kc.items().is_empty(), "the Keychain must stay untouched");
+    assert_eq!(
+        fs::read(&f.paths.global_config).unwrap(),
+        config_before,
+        "the config must stay byte-identical"
+    );
+}
+
+#[test]
+fn a_well_formed_approved_list_still_appends() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    fs::write(
+        &f.paths.global_config,
+        b"{\"customApiKeyResponses\":{\"approved\":[\"existing-tail\"]}}\n",
+    )
+    .unwrap();
+
+    s.write_managed_key(
+        &f.env,
+        &f.paths,
+        b"sk-ant-api03-0123456789abcdefghijKLMNOPQRST",
+        &open,
+    )
+    .unwrap();
+
+    let approved = config::get_key(&f.paths.global_config, "customApiKeyResponses")
+        .present()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        approved["approved"],
+        json!(["existing-tail", "abcdefghijKLMNOPQRST"])
+    );
+}
+
+#[test]
 fn snapshot_and_restore_are_byte_exact() {
     let f = fx();
     let s = store(&f, Platform::MacOs);

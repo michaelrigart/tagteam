@@ -71,6 +71,13 @@ fn remove_if_present(path: &Path) -> Result<(), ProviderError> {
 
 pub(crate) const UNPARSABLE_ENTRY: &str = "a credential entry is not a JSON object";
 
+/// `write_managed_key` refuses rather than silently reinitialising either of these: a
+/// `customApiKeyResponses` that exists but is not an object, or an `approved` that exists
+/// but is not an array (for example `{"approved": null}`). Fixed message, no bytes.
+pub(crate) const MALFORMED_CUSTOM_API_KEY_RESPONSES: &str =
+    "customApiKeyResponses is not a JSON object";
+pub(crate) const MALFORMED_APPROVED: &str = "customApiKeyResponses.approved is not a JSON array";
+
 /// Keeps only the machine-shared keys of a credential entry; `Ok(None)` means none
 /// remain, so the entry may be dropped. An entry that fails to parse is refused rather
 /// than silently treated as empty: the spec drops an entry only when no machine-shared
@@ -339,7 +346,12 @@ impl LiveStore {
             .collect();
         let mut responses = match config::get_key(&paths.global_config, "customApiKeyResponses") {
             Read::Present(Some(Value::Object(o))) => o,
-            Read::Present(_) | Read::Absent => Map::new(),
+            Read::Present(None) | Read::Absent => Map::new(),
+            Read::Present(Some(_)) => {
+                return Err(ProviderError::Invalid(
+                    MALFORMED_CUSTOM_API_KEY_RESPONSES.into(),
+                ));
+            }
             Read::Unreadable(_) => {
                 return Err(ProviderError::ConfigUnsplicable(
                     paths.global_config.clone(),
@@ -347,11 +359,15 @@ impl LiveStore {
             }
         };
         let appended = match responses.entry("approved").or_insert_with(|| json!([])) {
-            Value::Array(list) if !list.iter().any(|v| v.as_str() == Some(tail.as_str())) => {
-                list.push(Value::String(tail));
-                true
+            Value::Array(list) => {
+                if list.iter().any(|v| v.as_str() == Some(tail.as_str())) {
+                    false
+                } else {
+                    list.push(Value::String(tail));
+                    true
+                }
             }
-            _ => false,
+            _ => return Err(ProviderError::Invalid(MALFORMED_APPROVED.into())),
         };
         if appended {
             config::splice_key(
