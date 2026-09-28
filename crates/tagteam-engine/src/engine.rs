@@ -160,7 +160,7 @@ impl Engine {
         sorted.into_iter().map(|id| self.lock_account(id)).collect()
     }
 
-    fn reconcile_replacement(&self, lock: &AccountLock) -> Result<(), EngineError> {
+    pub(crate) fn reconcile_replacement(&self, lock: &AccountLock) -> Result<(), EngineError> {
         let Some(store) = self.existing_store()? else {
             return Ok(());
         };

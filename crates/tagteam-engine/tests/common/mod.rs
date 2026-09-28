@@ -11,6 +11,7 @@ use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::lifecycle::AddOptions;
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
+use tagteam_engine::store::LoginMeta;
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault};
 use tagteam_engine::{Engine, EngineConfig};
 use tagteam_provider::splice::replace_top_level;
@@ -220,20 +221,69 @@ impl Fx {
             .map(str::to_owned)
     }
 
+    /// The `AddOptions` every plain `add_live` call in these tests starts from — shared by
+    /// `Fx::add` and by `add.rs`'s own `add_opts` (Task 18's review, item 8).
+    pub fn add_options(&self) -> AddOptions {
+        AddOptions {
+            provider: self.provider(),
+            position: None,
+            alias: None,
+            yes: false,
+        }
+    }
+
     /// Logs a fresh account in and captures it (§10.1). Tasks 19-21 each need only the
     /// resulting id, so this is the one place that repeats `fx.login` + `add_live`.
     pub fn add(&self, email: &str, rt: &str) -> AccountId {
         self.login(email, rt);
+        self.engine.add_live(self.add_options()).unwrap().account.id
+    }
+
+    /// A pending replacement whose vault write landed but whose metadata never did — the
+    /// crash-recovery scenario `finish_replacement`/`rollback_replacement` exist for.
+    /// `identity_json` is the raw `oauthAccount`-shaped object the replacement claims to be
+    /// (Task 18's review, item 8: shared by every test that primes this scenario, instead of
+    /// each one repeating the same four calls).
+    pub fn begin_replacement(
+        &self,
+        id: &AccountId,
+        new_bytes: &[u8],
+        identity_json: &Value,
+        kind: &str,
+    ) {
+        let identity = self.cc.parse_identity(identity_json).unwrap();
+        let identity_key = format!(
+            "{}\n{}",
+            identity.email.as_deref().unwrap_or(&identity.label),
+            identity.org_uuid
+        );
+        self.kc.put(SERVICE, id.as_str(), new_bytes);
+        let meta = LoginMeta {
+            identity_key: &identity_key,
+            identity: &identity,
+            kind,
+            login_expires_at: None,
+        };
         self.engine
-            .add_live(AddOptions {
-                provider: self.provider(),
-                position: None,
-                alias: None,
-                yes: false,
-            })
+            .store()
             .unwrap()
-            .account
-            .id
+            .begin_replacement(id, self.cc.fingerprint(new_bytes).unwrap().as_str(), &meta)
+            .unwrap();
+    }
+
+    /// Directly quarantines an account row. There is no public writer for this yet (a later
+    /// task adds one); a second connection to the same on-disk store, mirroring
+    /// `tests/store.rs`, is the only way a fixture can prime this state today.
+    pub fn quarantine(&self, id: &AccountId, reason: &str, fp: &str) {
+        self.engine.store().unwrap(); // ensures the db file exists and is migrated
+        let path = self.env.data_dir().join("tagteam.db");
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET quarantine_reason = ?2, quarantine_fp = ?3, quarantine_at = 1 WHERE id = ?1",
+                rusqlite::params![id.as_str(), reason, fp],
+            )
+            .unwrap();
     }
 
     /// An engine over the same Keychain, oracle and clock, but a different Env.
@@ -243,6 +293,20 @@ impl Fx {
             registry: ProviderRegistry::new().with(self.cc.clone()),
             vault: Vault::new(Box::new(KeychainVault::new(self.kc.clone()))),
             oracle: self.oracle.clone(),
+            clock: self.clock.clone(),
+            default_provider: ProviderId::new(CLAUDE_CODE),
+        })
+    }
+
+    /// An engine over the same Keychain, clock and Env, but a caller-supplied oracle — for
+    /// exercising the oracle-call race between the pre-lock read and the locks (Task 18's
+    /// review, item 2).
+    pub fn engine_with_oracle(&self, oracle: Arc<dyn Oracle>) -> Engine {
+        Engine::new(EngineConfig {
+            env: self.env.clone(),
+            registry: ProviderRegistry::new().with(self.cc.clone()),
+            vault: Vault::new(Box::new(KeychainVault::new(self.kc.clone()))),
+            oracle,
             clock: self.clock.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
         })

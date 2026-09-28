@@ -1,20 +1,39 @@
 mod common;
 
+use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
+
 use common::Fx;
-use serde_json::json;
+use serde_json::{Value, json};
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
-use tagteam_provider::Provider;
+use tagteam_engine::oracle::Oracle;
 use tagteam_provider::splice::replace_top_level;
+use tagteam_provider::{Credential, Identity, Provider};
 
 fn add_opts(fx: &Fx) -> AddOptions {
-    AddOptions {
-        provider: fx.provider(),
-        position: None,
-        alias: None,
-        yes: false,
+    fx.add_options()
+}
+
+/// An oracle that always resolves to `None`, but first runs a side effect against the live
+/// state it was built with — proving the §10.1 step 3.3 recheck under the lock actually
+/// re-verifies the login just captured, not just the identity read before the locks were
+/// taken (Task 18's review, item 2).
+struct Racing<F>(F);
+
+impl<F: Fn() + Send + Sync> Oracle for Racing<F> {
+    fn resolve(&self, _p: &dyn Provider, _c: &Credential) -> Option<Identity> {
+        (self.0)();
+        None
     }
+}
+
+fn racing_engine(
+    fx: &Fx,
+    side_effect: impl Fn() + Send + Sync + 'static,
+) -> tagteam_engine::Engine {
+    fx.engine_with_oracle(Arc::new(Racing(side_effect)))
 }
 
 fn token_opts(fx: &Fx, token: &str) -> AddTokenOptions {
@@ -75,12 +94,36 @@ fn adding_the_same_login_again_refreshes_it_in_place() {
 }
 
 #[test]
+fn a_failed_vault_write_during_a_rotation_is_reconciled_in_process() {
+    // Task 18's review, item 6: a vault write that fails after `begin_replacement` is
+    // reconciled immediately, rather than left dangling for the next lock holder to find.
+    let fx = Fx::new();
+    fx.login("me@work.co", "rt-1");
+    let first = fx.engine.add_live(add_opts(&fx)).unwrap().account;
+    fx.rotate_live("rt-2");
+    fx.kc.set_fail_write("tagteam", true);
+    assert!(fx.engine.add_live(add_opts(&fx)).is_err());
+    fx.kc.set_fail_write("tagteam", false);
+    let row = fx
+        .engine
+        .store()
+        .unwrap()
+        .account(&first.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.login_epoch, first.login_epoch);
+    assert!(row.replacing_fp.is_none());
+    assert_eq!(fx.vault_refresh_token(&first.id).as_deref(), Some("rt-1"));
+}
+
+#[test]
 fn add_refuses_what_it_cannot_safely_capture() {
     let fx = Fx::new();
     assert!(matches!(
         fx.engine.add_live(add_opts(&fx)),
         Err(EngineError::NoLiveLogin)
     ));
+    assert!(!fx.env.data_dir().exists());
 
     fx.login("me@work.co", "rt-1");
     let (svc, acct) = (
@@ -138,10 +181,7 @@ fn add_refuses_a_wiped_live_credential() {
             .unwrap()
             .is_none_or(|s| s.accounts(&fx.provider()).unwrap().is_empty())
     );
-    assert!(
-        fx.vault_bytes(&tagteam_core::AccountId::from_string("anything"))
-            .is_none()
-    );
+    assert!(!fx.env.data_dir().exists());
 }
 
 #[test]
@@ -164,6 +204,59 @@ fn an_oracle_naming_someone_else_refuses_the_add() {
     fx.oracle.set(Some(me));
     let out = fx.engine.add_live(add_opts(&fx)).unwrap();
     assert!(out.notices.is_empty());
+}
+
+#[test]
+fn an_oracle_answer_with_no_uuid_of_its_own_is_treated_as_unresolved() {
+    // §7.6, Task 18's review item 3: an oracle answer carries no attribution signal at all
+    // without a non-empty account_uuid, so it takes the "could not verify" notice path —
+    // never `OwnerMismatch`, even though the email disagrees.
+    let fx = Fx::new();
+    fx.login("me@work.co", "rt-1");
+    let other = fx
+        .cc
+        .parse_identity(&json!({"emailAddress": "other@x.co"}))
+        .unwrap();
+    assert_eq!(other.account_uuid, None);
+    fx.oracle.set(Some(other));
+    let out = fx.engine.add_live(add_opts(&fx)).unwrap();
+    assert!(out.notices.iter().any(|n| n.contains("could not verify")));
+}
+
+#[test]
+fn an_oracle_uuid_that_conflicts_with_the_stored_one_is_refused() {
+    // Task 18's review, item 3: the oracle's positive uuid feeds the identity-conflict check
+    // even when the live login's own self-reported identity carries none of its own.
+    let fx = Fx::new();
+    let a = fx.add("me@work.co", "rt-1"); // stored account_uuid: uuid-me@work.co
+    let doc = std::fs::read(&fx.paths().global_config).unwrap();
+    let no_uuid =
+        json!({"emailAddress": "me@work.co", "organizationUuid": "", "organizationName": null});
+    std::fs::write(
+        &fx.paths().global_config,
+        replace_top_level(&doc, "oauthAccount", &no_uuid).unwrap(),
+    )
+    .unwrap();
+    fx.set_live_credential(
+        Fx::credential_json("me@work.co", "rt-2")
+            .to_string()
+            .as_bytes(),
+    );
+    let owner = fx
+        .cc
+        .parse_identity(&json!({"emailAddress": "me@work.co", "organizationUuid": "", "accountUuid": "uuid-different"}))
+        .unwrap();
+    fx.oracle.set(Some(owner));
+    assert!(matches!(
+        fx.engine.add_live(add_opts(&fx)),
+        Err(EngineError::IdentityConflict { .. })
+    ));
+    let store = fx.engine.store().unwrap();
+    assert_eq!(
+        store.account(&a).unwrap().unwrap().account_uuid.as_deref(),
+        Some("uuid-me@work.co")
+    );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-1"));
 }
 
 #[test]
@@ -296,7 +389,7 @@ fn add_refuses_a_live_login_whose_account_uuid_conflicts_with_the_stored_one() {
     );
     assert!(matches!(
         fx.engine.add_live(add_opts(&fx)),
-        Err(EngineError::InvalidInput(_))
+        Err(EngineError::IdentityConflict { .. })
     ));
     let store = fx.engine.store().unwrap();
     assert_eq!(
@@ -304,6 +397,46 @@ fn add_refuses_a_live_login_whose_account_uuid_conflicts_with_the_stored_one() {
         Some("uuid-me@work.co")
     );
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-1"));
+}
+
+#[test]
+fn add_rechecks_the_account_uuid_after_a_pending_replacement_lands() {
+    // Task 18's review, item 1: the pre-lock check in `prepare` cannot see a uuid that a
+    // pending replacement's metadata only installs once the account lock reconciles it, so
+    // the check must run again after the lock is taken.
+    let fx = Fx::new();
+    let x = fx
+        .engine
+        .add_token(AddTokenOptions {
+            email: Some("me@work.co".into()),
+            ..token_opts(&fx, "sk-ant-api03-first")
+        })
+        .unwrap()
+        .account; // a NULL-uuid row
+    // An `add` over x landed its vault write but died before its metadata did; the metadata
+    // it left behind claims account_uuid U1.
+    let cred = Fx::credential_json("me@work.co", "rt-1")
+        .to_string()
+        .into_bytes();
+    let u1 = json!({
+        "emailAddress": "me@work.co", "organizationUuid": "", "organizationName": null,
+        "accountUuid": "U1"
+    });
+    fx.begin_replacement(&x.id, &cred, &u1, "oauth");
+    // The live login now claims a *different* uuid, U2.
+    fx.login("me@work.co", "rt-2");
+    assert!(matches!(
+        fx.engine.add_live(add_opts(&fx)),
+        Err(EngineError::IdentityConflict { .. })
+    ));
+    let store = fx.engine.store().unwrap();
+    let row = store.account(&x.id).unwrap().unwrap();
+    assert_eq!(
+        row.account_uuid.as_deref(),
+        Some("U1"),
+        "U1 landed and was not overwritten by U2"
+    );
+    assert_eq!(fx.vault_refresh_token(&x.id).as_deref(), Some("rt-1"));
 }
 
 #[test]
@@ -322,22 +455,7 @@ fn add_token_rechecks_the_kind_after_a_pending_replacement_lands() {
     let cred = Fx::credential_json("me@work.co", "rt-1")
         .to_string()
         .into_bytes();
-    fx.kc.put("tagteam", x.id.as_str(), &cred);
-    let identity = fx
-        .cc
-        .parse_identity(&Fx::oauth_account("me@work.co"))
-        .unwrap();
-    let meta = tagteam_engine::store::LoginMeta {
-        identity_key: "me@work.co\n",
-        identity: &identity,
-        kind: "oauth",
-        login_expires_at: None,
-    };
-    fx.engine
-        .store()
-        .unwrap()
-        .begin_replacement(&x.id, fx.cc.fingerprint(&cred).unwrap().as_str(), &meta)
-        .unwrap();
+    fx.begin_replacement(&x.id, &cred, &Fx::oauth_account("me@work.co"), "oauth");
     assert!(
         matches!(fx.engine.add_token(token("sk-ant-api03-second")), Err(EngineError::InvalidInput(m)) if m.contains("oauth"))
     );
@@ -355,22 +473,7 @@ fn a_landed_replacement_can_make_add_token_valid() {
     // An `add` over x with a setup-token login wrote the vault and died before its metadata.
     let setup =
         br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-old","scopes":["user:inference"]}}"#;
-    fx.kc.put("tagteam", x.as_str(), setup);
-    let identity = fx
-        .cc
-        .parse_identity(&Fx::oauth_account("me@work.co"))
-        .unwrap();
-    let meta = tagteam_engine::store::LoginMeta {
-        identity_key: "me@work.co\n",
-        identity: &identity,
-        kind: "setup_token",
-        login_expires_at: None,
-    };
-    fx.engine
-        .store()
-        .unwrap()
-        .begin_replacement(&x, fx.cc.fingerprint(setup).unwrap().as_str(), &meta)
-        .unwrap();
+    fx.begin_replacement(&x, setup, &Fx::oauth_account("me@work.co"), "setup_token");
     let token = AddTokenOptions {
         email: Some("me@work.co".into()),
         ..token_opts(&fx, "sk-ant-oat01-new")
@@ -511,4 +614,185 @@ fn account_commands_refuse_inside_a_run_shell() {
         engine.add_token(token_opts(&fx, "sk-ant-api03-x")),
         Err(EngineError::InsideRunShell)
     ));
+}
+
+#[test]
+fn add_clears_a_quarantine() {
+    // §10.1 step 4: capturing a fresh login clears any quarantine a previous failure left.
+    let fx = Fx::new();
+    let x = fx.add("me@work.co", "rt-1");
+    fx.quarantine(&x, "refresh failed", "sha256:stale");
+    assert!(
+        fx.engine
+            .store()
+            .unwrap()
+            .account(&x)
+            .unwrap()
+            .unwrap()
+            .quarantine_reason
+            .is_some()
+    );
+    fx.rotate_live("rt-2");
+    let out = fx.engine.add_live(add_opts(&fx)).unwrap();
+    assert_eq!(out.account.id, x);
+    assert!(out.account.quarantine_reason.is_none());
+    assert!(out.account.quarantine_fp.is_none());
+}
+
+// Task 18's review, item 2: pinning the §10.1 step 3.3 rechecks under the lock. Each test
+// below makes the oracle call between the pre-lock read and the locks mutate the live state,
+// and checks that `add_live` still refuses (rather than committing what it read before the
+// race) and creates no account row. The oracle itself always resolves to `None`, so nothing
+// upstream of the recheck would otherwise stop the add.
+
+#[test]
+fn add_live_rechecks_the_credential_has_not_rotated_under_the_lock() {
+    let fx = Fx::new();
+    fx.login("me@work.co", "rt-1");
+    let (env, kc) = (fx.env.clone(), fx.kc.clone());
+    let engine = racing_engine(&fx, move || {
+        let svc = keychain_service(&env, ItemKind::OAuth);
+        let acct = keychain_account(&env);
+        let mut v: Value = serde_json::from_slice(&kc.get(&svc, &acct).unwrap()).unwrap();
+        v["claudeAiOauth"]["refreshToken"] = json!("rt-race");
+        kc.put(&svc, &acct, v.to_string().as_bytes());
+    });
+    assert!(matches!(
+        engine.add_live(add_opts(&fx)),
+        Err(EngineError::LiveMoved)
+    ));
+    assert!(
+        engine
+            .existing_store()
+            .unwrap()
+            .is_none_or(|s| s.accounts(&fx.provider()).unwrap().is_empty())
+    );
+}
+
+#[test]
+fn add_live_rechecks_no_managed_key_appeared_under_the_lock() {
+    let fx = Fx::new();
+    fx.login("me@work.co", "rt-1");
+    let (env, kc) = (fx.env.clone(), fx.kc.clone());
+    let engine = racing_engine(&fx, move || {
+        kc.put(
+            &keychain_service(&env, ItemKind::ManagedKey),
+            &keychain_account(&env),
+            b"sk-ant-api03-race",
+        );
+    });
+    assert!(matches!(
+        engine.add_live(add_opts(&fx)),
+        Err(EngineError::LiveApiKey)
+    ));
+    assert!(
+        engine
+            .existing_store()
+            .unwrap()
+            .is_none_or(|s| s.accounts(&fx.provider()).unwrap().is_empty())
+    );
+}
+
+#[test]
+fn add_live_rechecks_the_credential_is_still_readable() {
+    let fx = Fx::new();
+    fx.login("me@work.co", "rt-1");
+    let (env, kc) = (fx.env.clone(), fx.kc.clone());
+    let engine = racing_engine(&fx, move || {
+        kc.set_unreadable(
+            &keychain_service(&env, ItemKind::OAuth),
+            &keychain_account(&env),
+            true,
+        );
+    });
+    assert!(matches!(
+        engine.add_live(add_opts(&fx)),
+        Err(EngineError::Unreadable(_))
+    ));
+    assert!(
+        engine
+            .existing_store()
+            .unwrap()
+            .is_none_or(|s| s.accounts(&fx.provider()).unwrap().is_empty())
+    );
+}
+
+#[test]
+fn add_live_rechecks_the_credential_is_still_fresh() {
+    let fx = Fx::new();
+    fx.login("me@work.co", "rt-1");
+    let (env, kc, paths) = (fx.env.clone(), fx.kc.clone(), fx.paths());
+    let engine = racing_engine(&fx, move || {
+        // A covering plaintext file plus a now-unreadable Keychain item is what makes the
+        // next read `Degraded` rather than `Unreadable` (see `LiveStore::read_credential`).
+        std::fs::write(
+            &paths.credentials_file,
+            Fx::credential_json("me@work.co", "rt-1").to_string(),
+        )
+        .unwrap();
+        kc.set_unreadable(
+            &keychain_service(&env, ItemKind::OAuth),
+            &keychain_account(&env),
+            true,
+        );
+    });
+    assert!(matches!(
+        engine.add_live(add_opts(&fx)),
+        Err(EngineError::DegradedRead)
+    ));
+    assert!(
+        engine
+            .existing_store()
+            .unwrap()
+            .is_none_or(|s| s.accounts(&fx.provider()).unwrap().is_empty())
+    );
+}
+
+#[test]
+fn add_live_rechecks_the_identity_has_not_changed_under_the_lock() {
+    let fx = Fx::new();
+    fx.login("me@work.co", "rt-1");
+    let paths = fx.paths();
+    let engine = racing_engine(&fx, move || {
+        let doc = std::fs::read(&paths.global_config).unwrap();
+        let raced = json!({
+            "emailAddress": "me@work.co", "organizationUuid": "", "organizationName": null,
+            "accountUuid": "uuid-raced"
+        });
+        std::fs::write(
+            &paths.global_config,
+            replace_top_level(&doc, "oauthAccount", &raced).unwrap(),
+        )
+        .unwrap();
+    });
+    assert!(matches!(
+        engine.add_live(add_opts(&fx)),
+        Err(EngineError::LiveMoved)
+    ));
+    assert!(
+        engine
+            .existing_store()
+            .unwrap()
+            .is_none_or(|s| s.accounts(&fx.provider()).unwrap().is_empty())
+    );
+}
+
+#[test]
+fn add_live_reports_an_identity_that_becomes_unreadable_under_the_lock_as_unreadable() {
+    // Task 18's review, item 9: an `Unreadable` identity on the re-read must surface as
+    // `Unreadable`, not collapse into the generic `LiveMoved`.
+    let fx = Fx::new();
+    fx.login("me@work.co", "rt-1");
+    let path = fx.paths().global_config;
+    let engine = racing_engine(&fx, move || {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    });
+    let result = engine.add_live(add_opts(&fx));
+    // Restored before any assertion can panic and leave the tempdir unreadable for cleanup.
+    std::fs::set_permissions(
+        &fx.paths().global_config,
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert!(matches!(result, Err(EngineError::Unreadable(_))));
 }

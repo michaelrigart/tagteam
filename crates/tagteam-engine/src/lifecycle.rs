@@ -48,12 +48,24 @@ pub(crate) fn check_position(position: u32, max_existing: u32) -> Result<(), Eng
     Ok(())
 }
 
-/// Uuid first, org corroborating (§10.1 guard 2).
+/// Uuid first, org corroborating (§10.1 guard 2). Only meaningful once the caller has
+/// already established that `a` (typically an oracle's answer) is itself resolved: §7.6
+/// makes an identity with no non-empty `account_uuid` carry no attribution signal at all,
+/// so that gate is applied by the caller before this is ever invoked (never inside it,
+/// since `identity_key` lookups elsewhere pass a self-reported identity here as `b`, whose
+/// own uuid may legitimately be unbackfilled yet).
 pub(crate) fn same_owner(a: &Identity, b: &Identity) -> bool {
     match (&a.account_uuid, &b.account_uuid) {
         (Some(x), Some(y)) => x == y && a.org_uuid == b.org_uuid,
         _ => a.email == b.email && a.org_uuid == b.org_uuid,
     }
+}
+
+/// §7.6: an oracle answer counts as resolved only when its own `account_uuid` is a
+/// non-empty string; without one it carries no attribution signal and is treated exactly
+/// like no answer at all (the "could not verify" notice path), never compared by email.
+fn oracle_resolved(owner: Option<Identity>) -> Option<Identity> {
+    owner.filter(|o| o.account_uuid.as_deref().is_some_and(|u| !u.is_empty()))
 }
 
 /// The managed-key guard (§10.1 guard 1), with all three read states.
@@ -84,6 +96,30 @@ fn alias_taken(e: StoreError) -> EngineError {
         }
         other => other.into(),
     }
+}
+
+/// `update_login`/`finish_replacement` COALESCE a new account_uuid over a known one (Task
+/// 16's review), so a stored uuid that a different incoming uuid would overwrite is
+/// refused instead. Shared by the pre-lock fast path in `prepare` and the post-lock
+/// recheck in `add_live`/`add_token`: reconciling a pending replacement under the account
+/// lock (Task 21) can install a uuid the pre-lock read never saw, so the pre-lock check
+/// alone is not enough (Task 18's review, item 1).
+fn check_identity_conflict(
+    row: Option<&AccountRow>,
+    claimed_uuid: Option<&str>,
+    label: &str,
+) -> Result<(), EngineError> {
+    let Some(row) = row else {
+        return Ok(());
+    };
+    if let (Some(old), Some(new)) = (row.account_uuid.as_deref(), claimed_uuid) {
+        if old != new {
+            return Err(EngineError::IdentityConflict {
+                label: label.to_owned(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// What a login write will replace, decided before anything is mutated.
@@ -127,6 +163,26 @@ impl Engine {
         Ok(())
     }
 
+    /// The provider's next position (1 with no store yet), and — when a target position
+    /// was given — the pre-lock validation that it could conceivably be valid (§5: never
+    /// creates anything; `prepare` re-checks the authoritative value under the lock).
+    /// Shared by `add_live` and `add_token`, which both repeated this (Task 18's review,
+    /// item 9).
+    fn next_position_precheck(
+        &self,
+        provider: &ProviderId,
+        position: Option<u32>,
+    ) -> Result<u32, EngineError> {
+        let next = match self.existing_store()? {
+            Some(s) => s.next_position(provider)?,
+            None => 1,
+        };
+        if let Some(pos) = position {
+            check_position(pos, next.saturating_sub(1))?;
+        }
+        Ok(next)
+    }
+
     /// Pure validation, no mutation: which account is written, which occupant it would
     /// replace, and whether that is allowed.
     #[allow(clippy::too_many_arguments)]
@@ -136,26 +192,13 @@ impl Engine {
         p: &dyn Provider,
         provider: &ProviderId,
         identity: &Identity,
+        claimed_uuid: Option<&str>,
         position: Option<u32>,
         alias: Option<&str>,
         yes: bool,
     ) -> Result<Prepared, EngineError> {
         let existing = store.find_by_identity_key(provider, p.identity_key(identity).as_str())?;
-        // `update_login`/`finish_replacement` COALESCE a new account_uuid over a known one
-        // (Task 16's review): a stored uuid that a different incoming uuid would silently
-        // overwrite is refused instead.
-        if let Some(e) = &existing {
-            if let (Some(old), Some(new)) =
-                (e.account_uuid.as_deref(), identity.account_uuid.as_deref())
-            {
-                if old != new {
-                    return Err(EngineError::InvalidInput(format!(
-                        "{} is already stored with a different account_uuid; refusing to overwrite it",
-                        identity.label
-                    )));
-                }
-            }
-        }
+        check_identity_conflict(existing.as_ref(), claimed_uuid, &identity.label)?;
         let mut occupant = None;
         if let Some(pos) = position {
             check_position(pos, store.next_position(provider)?.saturating_sub(1))?;
@@ -176,9 +219,7 @@ impl Engine {
                     .flatten()
                     .any(|r| r.id == owner.id);
                 if !freed {
-                    return Err(EngineError::InvalidInput(format!(
-                        "the alias {a:?} is already taken"
-                    )));
+                    return Err(alias_taken(StoreError::AliasTaken(a.to_owned())));
                 }
             }
         }
@@ -228,11 +269,19 @@ impl Engine {
         match &prep.existing {
             Some(row) => {
                 // The metadata travels with the marker: if this process dies after the vault
-                // write, the next lock holder installs it (§12.5).
+                // write, the next lock holder installs it (§12.5). A secret with no
+                // fingerprint is refused outright rather than recorded as an empty one
+                // (Task 18's review, item 7): every caller already guarantees a fingerprint
+                // exists by this point, so this is defensive, not a path any test reaches.
                 let new_fp = p
                     .fingerprint(secret)
-                    .map(|f| f.as_str().to_owned())
-                    .unwrap_or_default();
+                    .ok_or_else(|| {
+                        EngineError::InvalidInput(
+                            "the credential has no fingerprint to record".into(),
+                        )
+                    })?
+                    .as_str()
+                    .to_owned();
                 let meta = LoginMeta {
                     identity_key: key.as_str(),
                     identity,
@@ -240,7 +289,15 @@ impl Engine {
                     login_expires_at: p.login_expires_at(secret),
                 };
                 store.begin_replacement(&row.id, &new_fp, &meta)?;
-                self.vault.store(lock_for(&row.id), secret, &fp)?;
+                if let Err(e) = self.vault.store(lock_for(&row.id), secret, &fp) {
+                    // The write never landed: reconcile in process rather than leaving the
+                    // marker dangling for the next lock holder to find (Task 18's review,
+                    // item 6). `reconcile_replacement` reads the vault fresh, sees it still
+                    // holds the old generation, and rolls the marker back; a failure here is
+                    // swallowed since the next lock acquisition retries it regardless.
+                    let _ = self.reconcile_replacement(lock_for(&row.id));
+                    return Err(e.into());
+                }
                 store.finish_replacement(&row.id)?;
             }
             None => {
@@ -285,14 +342,8 @@ impl Engine {
         self.settle_or_refuse(&opts.provider)?;
         let p = self.provider(&opts.provider)?;
         let alias = alias_arg(opts.alias.as_deref())?;
-        if let Some(pos) = opts.position {
-            // Validated before anything exists (§5); `prepare` re-checks under the lock.
-            let max = match self.existing_store()? {
-                Some(s) => s.next_position(&opts.provider)?.saturating_sub(1),
-                None => 0,
-            };
-            check_position(pos, max)?;
-        }
+        // Validated before anything exists (§5); `prepare` re-checks under the lock.
+        self.next_position_precheck(&opts.provider, opts.position)?;
         // 1. The live identity, read once.
         let identity = match p.live_identity(&self.env) {
             Read::Present(i) => i,
@@ -311,12 +362,15 @@ impl Engine {
             return Err(EngineError::NoLiveLogin);
         }
         // 3.2 Ownership, advisory and before any lock: never refreshes, never blocks on failure.
+        // §7.6: an oracle answer with no non-empty uuid of its own is treated as unresolved,
+        // exactly like no answer at all (Task 18's review, item 3) — never compared by email.
         let mut notices = Vec::new();
-        match self.oracle.resolve(p.as_ref(), &cred) {
-            Some(owner) if !same_owner(&owner, &identity) => {
+        let resolved = oracle_resolved(self.oracle.resolve(p.as_ref(), &cred));
+        match &resolved {
+            Some(owner) if !same_owner(owner, &identity) => {
                 return Err(EngineError::OwnerMismatch {
                     expected: identity.label,
-                    found: owner.label,
+                    found: owner.label.clone(),
                 });
             }
             Some(_) => {}
@@ -325,6 +379,14 @@ impl Engine {
                 identity.label
             )),
         }
+        // The most authoritative uuid known for this login: the oracle's, when it resolved
+        // one, else the self-reported one — so a self-reported identity with no uuid of its
+        // own still benefits from an oracle-confirmed one when checking for a conflict with
+        // a stored account (Task 18's review, item 3).
+        let claimed_uuid = resolved
+            .as_ref()
+            .and_then(|o| o.account_uuid.as_deref())
+            .or(identity.account_uuid.as_deref());
         let kind = p.classify(cred.bytes());
         // 4. Write, under the mutation lock, the account locks and then CC's live locks.
         let guard = self.mutation_guard()?;
@@ -335,17 +397,33 @@ impl Engine {
             p.as_ref(),
             &opts.provider,
             &identity,
+            claimed_uuid,
             opts.position,
             alias.as_deref(),
             opts.yes,
         )?;
         let accounts = self.lock_prepared(&prep)?;
+        // Reconciling a pending replacement under the account lock just taken (§12.5) may
+        // have installed a uuid the pre-lock check in `prepare` never saw: re-run it now
+        // that the row is authoritative (Task 18's review, item 1).
+        check_identity_conflict(
+            store.account(&prep.id)?.as_ref(),
+            claimed_uuid,
+            &identity.label,
+        )?;
         let live_locks = p.lock_live(&self.env, &guard)?;
         // 3.3 The capture must be the login verified above, on both auth axes: a switch or a
         // recovery may have moved it while this command waited for the locks.
         // The complete identity is compared, not just its key: an `accountUuid` or any other
-        // `oauthAccount` field that changed means this is not the login that was verified.
-        let now_identity = p.live_identity(&self.env).present();
+        // `oauthAccount` field that changed means this is not the login that was verified. An
+        // identity that becomes unreadable is reported as such, not collapsed into `LiveMoved`
+        // (Task 18's review, item 9): only its absence — the login disappearing outright —
+        // reads as "moved".
+        let now_identity = match p.live_identity(&self.env) {
+            Read::Present(i) => Some(i),
+            Read::Absent => None,
+            Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
+        };
         let now_auth = p.read_live_auth(&self.env);
         no_live_api_key(&now_auth.managed_key)?;
         let now = live_fresh(now_auth.credential)?;
@@ -396,13 +474,7 @@ impl Engine {
                 .clone()
                 .unwrap_or_else(|| format!("{prefix}-{position}@token.local"))
         };
-        let next = match self.existing_store()? {
-            Some(s) => s.next_position(&opts.provider)?,
-            None => 1,
-        };
-        if let Some(pos) = opts.position {
-            check_position(pos, next.saturating_sub(1))?;
-        }
+        let next = self.next_position_precheck(&opts.provider, opts.position)?;
         let email = email_for(opts.position.unwrap_or(next));
         if !is_valid_email(&email) {
             return Err(EngineError::InvalidInput(format!(
@@ -418,26 +490,31 @@ impl Engine {
             None => store.next_position(&opts.provider)?,
         };
         let identity = p.token_identity(&email_for(position));
+        let claimed_uuid = identity.account_uuid.as_deref();
         let prep = self.prepare(
             &store,
             p.as_ref(),
             &opts.provider,
             &identity,
+            claimed_uuid,
             opts.position,
             alias.as_deref(),
             opts.yes,
         )?;
         let accounts = self.lock_prepared(&prep)?;
         // The different-kind collision (§10.2) is decided only now: taking the account lock
-        // may have finished a pending replacement and changed the account's kind.
-        if let Some(e) = &prep.existing {
-            if let Some(existing) = store.account(&e.id)? {
-                if existing.kind != kind {
-                    return Err(EngineError::InvalidInput(format!(
-                        "{} is already stored as a {} account",
-                        identity.label, existing.kind
-                    )));
-                }
+        // may have finished a pending replacement and changed the account's kind. The uuid
+        // conflict check is re-run here too, for the same reason (Task 18's review, item 1) —
+        // a no-op today since a token identity never claims a uuid, but it keeps the two
+        // rechecks in one place rather than only one of them surviving the next change.
+        let current = store.account(&prep.id)?;
+        check_identity_conflict(current.as_ref(), claimed_uuid, &identity.label)?;
+        if let Some(existing) = &current {
+            if existing.kind != kind {
+                return Err(EngineError::InvalidInput(format!(
+                    "{} is already stored as a {} account",
+                    identity.label, existing.kind
+                )));
             }
         }
         let (account, created) = self.commit_login(

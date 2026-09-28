@@ -35,6 +35,11 @@ pub enum EngineError {
     LiveMoved,
     #[error("position {position} holds {occupant}; confirm to replace it, or pass --yes")]
     NeedsConfirmation { position: u32, occupant: String },
+    #[error(
+        "the live login for {label} belongs to a different account than the stored {label} \
+         (for example a reused email); remove the stored account before adding this login"
+    )]
+    IdentityConflict { label: String },
     #[error("{0}")]
     InvalidInput(String),
     #[error("no account matches {0:?}")]
@@ -77,6 +82,7 @@ impl EngineError {
             EngineError::OwnerMismatch { .. } => "owner-mismatch",
             EngineError::LiveMoved => "live-moved",
             EngineError::NeedsConfirmation { .. } => "needs-confirmation",
+            EngineError::IdentityConflict { .. } => "identity-conflict",
             EngineError::InvalidInput(_) => "invalid-input",
             EngineError::NoSuchAccount(_) => "no-such-account",
             EngineError::Ambiguous { .. } => "ambiguous-account",
@@ -151,6 +157,10 @@ mod tests {
                     occupant: "a".into(),
                 },
                 "needs-confirmation",
+            ),
+            (
+                EngineError::IdentityConflict { label: "a".into() },
+                "identity-conflict",
             ),
             (EngineError::InvalidInput("x".into()), "invalid-input"),
             (EngineError::NoSuchAccount("x".into()), "no-such-account"),
