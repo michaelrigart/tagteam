@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
@@ -16,7 +17,7 @@ use tagteam_engine::store::LoginMeta;
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
-use tagteam_provider::splice::replace_top_level;
+use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{
     Credential, Env, FakeClock, FakeKeychain, Identity, MutationGuard, Provider, Read,
 };
@@ -439,5 +440,153 @@ impl Fx {
             on_read: Box::new(on_read),
         }));
         self.engine_over(self.env.clone(), vault, self.oracle.clone())
+    }
+}
+
+/// Every file under HOME except tagteam's own data dir, plus every Keychain item except the
+/// vault's.
+pub struct HomeSnapshot {
+    files: BTreeMap<PathBuf, Vec<u8>>,
+    items: BTreeMap<(String, String), Vec<u8>>,
+}
+
+fn walk(dir: &Path, skip: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.starts_with(skip) {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&path).unwrap();
+        if meta.is_dir() {
+            walk(&path, skip, out);
+        } else {
+            out.insert(path.clone(), fs::read(&path).unwrap_or_default());
+        }
+    }
+}
+
+/// §3: `customApiKeyResponses.approved` may only grow by appending; nothing else in that
+/// object may change.
+fn check_api_key_responses(
+    before: Option<&Vec<u8>>,
+    after: Option<&Vec<u8>>,
+    step: &str,
+    path: &Path,
+) {
+    let get = |d: Option<&Vec<u8>>| {
+        d.and_then(|d| get_top_level(d, "customApiKeyResponses").unwrap())
+            .unwrap_or_else(|| json!({}))
+    };
+    let (mut b, mut a) = (get(before), get(after));
+    let approved = |v: &mut Value| {
+        v.as_object_mut()
+            .and_then(|o| o.remove("approved"))
+            .and_then(|x| x.as_array().cloned())
+            .unwrap_or_default()
+    };
+    let (b_list, a_list) = (approved(&mut b), approved(&mut a));
+    assert!(
+        a_list.starts_with(&b_list),
+        "{step}: customApiKeyResponses.approved lost or reordered entries in {}",
+        path.display()
+    );
+    assert_eq!(
+        b,
+        a,
+        "{step}: customApiKeyResponses changed beyond appending to approved in {}",
+        path.display()
+    );
+}
+
+fn shared_keys(bytes: Option<&Vec<u8>>, keys: &[&str]) -> Map<String, Value> {
+    let v: Value = bytes
+        .and_then(|b| serde_json::from_slice(b).ok())
+        .unwrap_or(Value::Null);
+    v.as_object()
+        .map(|o| {
+            o.iter()
+                .filter(|(k, _)| keys.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+impl Fx {
+    pub fn snapshot(&self) -> HomeSnapshot {
+        let mut files = BTreeMap::new();
+        walk(&self.env.home, &self.env.data_dir(), &mut files);
+        let items = self
+            .kc
+            .items()
+            .into_iter()
+            .filter(|((svc, _), _)| svc != "tagteam")
+            .collect();
+        HomeSnapshot { files, items }
+    }
+
+    /// §15.3: every byte outside the identity surface is identical; inside it, only the
+    /// declared keys moved, and the machine-shared credential keys kept their values.
+    pub fn assert_only_surface_changed(
+        &self,
+        before: &HomeSnapshot,
+        after: &HomeSnapshot,
+        step: &str,
+    ) {
+        let surface = self.cc.identity_surface(&self.env);
+        let json_keys: BTreeMap<PathBuf, Vec<String>> = surface.json_keys.iter().cloned().collect();
+        let cred_files: BTreeSet<PathBuf> = surface.credential_files.iter().cloned().collect();
+        let paths: BTreeSet<&PathBuf> = before.files.keys().chain(after.files.keys()).collect();
+        for path in paths {
+            let (b, a) = (before.files.get(path), after.files.get(path));
+            if let Some(keys) = json_keys.get(path) {
+                if keys.iter().any(|k| k == "customApiKeyResponses") {
+                    check_api_key_responses(b, a, step, path);
+                }
+                let strip = |doc: Option<&Vec<u8>>| {
+                    doc.map(|d| {
+                        keys.iter()
+                            .fold(d.clone(), |acc, k| remove_top_level(&acc, k).unwrap())
+                    })
+                };
+                assert_eq!(
+                    strip(b),
+                    strip(a),
+                    "{step}: {} changed outside {keys:?}",
+                    path.display()
+                );
+            } else if cred_files.contains(path) {
+                assert_eq!(
+                    shared_keys(b, &surface.machine_shared_keys),
+                    shared_keys(a, &surface.machine_shared_keys),
+                    "{step}: machine-shared keys changed in {}",
+                    path.display()
+                );
+            } else {
+                assert_eq!(b, a, "{step}: {} changed", path.display());
+            }
+        }
+        let owned: BTreeSet<(String, String)> = surface.owned_items.iter().cloned().collect();
+        let creds: BTreeSet<(String, String)> = surface.credential_items.iter().cloned().collect();
+        let keys: BTreeSet<&(String, String)> =
+            before.items.keys().chain(after.items.keys()).collect();
+        for key in keys {
+            let (b, a) = (before.items.get(key), after.items.get(key));
+            if owned.contains(key) {
+                continue;
+            }
+            if creds.contains(key) {
+                assert_eq!(
+                    shared_keys(b, &surface.machine_shared_keys),
+                    shared_keys(a, &surface.machine_shared_keys),
+                    "{step}: machine-shared keys changed in Keychain item {key:?}"
+                );
+            } else {
+                assert_eq!(b, a, "{step}: Keychain item {key:?} changed");
+            }
+        }
     }
 }
