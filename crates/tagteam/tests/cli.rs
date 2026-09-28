@@ -7,28 +7,11 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::Path;
 use std::process::Stdio;
 
-use assert_cmd::Command;
 use assert_cmd::assert::OutputAssertExt;
-use common::{LOCKED, login, seed_home};
+use common::{LOCKED, cmd, login, seed_home, std_cmd};
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
 use tagteam_provider::{Env, FileKeychain};
-
-/// The binary in an isolated environment rooted at `root`, with its file-backed Keychain.
-fn std_cmd(root: &Path) -> std::process::Command {
-    let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("tagteam"));
-    c.env_clear()
-        .env("HOME", root.join("home"))
-        .env("USER", "tester")
-        .env("PATH", std::env::var_os("PATH").unwrap())
-        .env("TAGTEAM_TEST_KEYCHAIN_DIR", root.join("keychain"))
-        .env("TAGTEAM_TEST_PLATFORM", "macos");
-    c
-}
-
-fn cmd(root: &Path) -> Command {
-    Command::from_std(std_cmd(root))
-}
 
 /// A stdout whose reader is already gone, so every write to it fails with EPIPE.
 fn closed_stdout() -> Stdio {
