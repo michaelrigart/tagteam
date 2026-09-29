@@ -601,11 +601,23 @@ impl Engine {
     /// reach it.
     pub fn refresh_stored(&self, p: &dyn Provider, id: &AccountId, snapshot: &[u8])
         -> Result<GateOutcome, EngineError>;                                   // Tasks 10–11
-    /// The vault, else `rescue/`, else a logged loss (§7.3 step 6). Shared by the gate and
-    /// active-token refresh (Task 16).                                         // Task 11
+    /// The vault, else `rescue/`, else `Unpersisted`, which is not yet a loss: the caller
+    /// decides (§7.3 step 6, §7.5 step 5). Shared by both refresh paths.        // Task 11
     pub(crate) fn persist_received(&self, p: &dyn Provider, row: &AccountRow,
         lock: &AccountLock, received: &mut Received<'_>) -> Persisted;
+    /// An error after receipt: keep the successor (`Kept(cause)`), else record the loss
+    /// (`Lost`; the caller reports `Unpersisted`, never the error).             // Task 11
+    pub(crate) fn abandon(&self, row: &AccountRow, sent_fp: &str,
+        received: &mut Received<'_>, cause: EngineError) -> Abandoned;
+    /// §7.4 `successor_lost`: log at ERROR and quarantine bound to `sent_fp`, best effort.
+    /// Never panics (called from `Received::drop` while unwinding).             // Task 11
+    pub(crate) fn record_loss(&self, row: &AccountRow, sent_fp: &str,
+        cause: &dyn std::fmt::Display);
+    pub(crate) fn quarantine_best_effort(&self, row: &AccountRow, reason: QuarantineReason,
+        fp: &str);                                                              // Task 11
 }
+pub(crate) enum Abandoned { Kept(EngineError), Lost }                           // Task 11
+pub(crate) fn log_lost(row: &AccountRow, cause: &dyn std::fmt::Display);        // Task 11
 /// §7.4, Task 10: the token response named another account (a non-empty uuid that differs
 /// from a known one) or another organization (both non-empty and different); either alone.
 pub(crate) fn names_another_account(owner: &Identity, row: &AccountRow) -> bool;
@@ -615,8 +627,10 @@ impl Engine {
     pub(crate) fn keep_foreign(&self, row: &AccountRow, successor: &[u8],
         fp: Option<&Fingerprint>, owner: &Identity) -> Result<(), EngineError>;
 }
-/// A received successor not yet persisted; dropped while armed (a panic) it keeps itself.
-/// No `Debug`.                                                                  // Task 11
+/// A received successor not yet persisted; dropped while armed (a panic) it keeps itself,
+/// or records the loss (`record_loss`; `identity_conflict` for a foreign one). Its `Drop`
+/// never panics, and `Engine::store`'s slot lock tolerates poisoning so it cannot. No `Debug`.
+///                                                                              // Task 11
 pub(crate) struct Received<'e> { /* … */ }
 impl<'e> Received<'e> {
     /// `foreign`: the response's owner when it names another account (§7.4); fixed at receipt.
@@ -665,10 +679,16 @@ pub enum ActiveOutcome {
     /// were compromised when the response arrived, or a self-heal (or the live write) could not
     /// take the config lock. Nothing further is sent; the next pass reconciles (§7.5 step 5).
     PersistedNotPublished,
+    /// The vault and `rescue/` both failed, but the live store holds the successor: nothing
+    /// is lost, nothing is quarantined, and the next pass adopts it into the vault.
+    PublishedOnly,
     Dead(QuarantineReason),      // incl. a quarantine that still holds (§7.4): no request sent
     Systemic(String),
     Transient { kind: String },
-    Unpersisted,                 // takes precedence over a conflict or a compromised lock
+    /// Held nowhere (vault, `rescue/` and live store all failed or were skipped): logged at
+    /// ERROR and quarantined `successor_lost` (§7.5 step 5). Takes precedence over a conflict
+    /// or a compromised lock.
+    Unpersisted,
 }
 impl Engine {
     /// Unreadable vault, `.prev` or rescue reads refuse before any write or request. A pending
@@ -703,6 +723,17 @@ pub fn set_login_expires_at(&self, id: &AccountId, at: Option<i64>) -> Result<()
 /// §9.3: the positions a rotation tries, in order. With an anchor, every position after it,
 /// wrapping, and never the anchor itself; with none, every position from the first.
 pub fn rotation_order(positions: &[u32], anchor: Option<u32>) -> Vec<u32>;
+```
+
+and (Task 16, §9.4 step 4 as amended) the outgoing classification gains a class, decided
+right after `Ours`:
+
+```rust
+pub enum OutgoingClass { Ours, Superseded, Wiped, OursRotated, Foreign, Unresolved }
+pub struct OutgoingFacts { /* M1 fields */ pub equals_vault_prev: bool }
+// equals_vault_prev → (Superseded, Nothing): the live credential is the vault's `.prev`, a
+// generation an active-token refresh superseded without publishing. `settle_outgoing` reads
+// `.prev` (tri-state; Unreadable aborts) only when the live credential is not the vault's own.
 ```
 
 ### Engine test fixture (`crates/tagteam-engine/tests/common/mod.rs`)
@@ -10260,6 +10291,8 @@ git commit -m "Add the refresh gate's lock, ownership, adoption and verdict"
 **Files:**
 - Modify: `crates/tagteam-engine/src/refresh.rs`, `crates/tagteam-engine/src/rescue.rs` (a
   leftover `dead_code` allowance)
+- Modify: `crates/tagteam-engine/src/engine.rs` (the store slot's lock tolerates poisoning, so
+  `Received::drop` can record a loss while unwinding)
 - Modify: `crates/tagteam-engine/tests/common/mod.rs` (`Fx::engine_with_vault`)
 - Test: `crates/tagteam-engine/tests/gate_persist.rs`
 
@@ -10275,8 +10308,8 @@ git commit -m "Add the refresh gate's lock, ownership, adoption and verdict"
   - `Engine::fail_at` and `on_point` (M1, `test-hooks`)
 - Produces:
   - Step 6 of §7.3 inside `refresh_stored`. `persist_refreshed` and `displace_foreign` are
-    replaced by `persist_successor`, `lose` and `abandon`. The `Received` guard keeps a
-    successor on any early return or panic.
+    replaced by `persist_successor` and `lose`. `abandon` keeps a successor on an early error
+    return; the `Received` guard's `Drop` keeps it on a panic, or records its loss.
   - Shared with active-token refresh (Task 16), all in `crate::refresh`:
     - `pub(crate) struct Received<'e>` with
       `pub(crate) fn new(engine: &'e Engine, p: &dyn Provider, row: &AccountRow, predecessor_fp: &str, bytes: Vec<u8>, foreign: Option<Identity>) -> Self`,
@@ -10286,7 +10319,14 @@ git commit -m "Add the refresh gate's lock, ownership, adoption and verdict"
       nothing here is dead code;
     - `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub(crate) enum Persisted { Vault, Rescued, Unpersisted }`;
     - `pub(crate) fn Engine::persist_received(&self, p: &dyn Provider, row: &AccountRow, lock: &AccountLock, received: &mut Received<'_>) -> Persisted`
-      (never for a foreign successor).
+      (never for a foreign successor). `Persisted::Unpersisted` is not yet a loss: the caller
+      decides, and records one with `record_loss`;
+    - `pub(crate) fn Engine::abandon(&self, row: &AccountRow, sent_fp: &str, received: &mut Received<'_>, cause: EngineError) -> Abandoned`,
+      with `pub(crate) enum Abandoned { Kept(EngineError), Lost }`: an error after receipt;
+    - `pub(crate) fn Engine::record_loss(&self, row: &AccountRow, sent_fp: &str, cause: &dyn std::fmt::Display)`
+      (§7.4 `successor_lost`: logs at ERROR and quarantines, best effort, never panics) and
+      `pub(crate) fn Engine::quarantine_best_effort(&self, row: &AccountRow, reason: QuarantineReason, fp: &str)`;
+    - `pub(crate) fn log_lost(row: &AccountRow, cause: &dyn std::fmt::Display)`.
   - The hook point `gate-before-vault-write`.
   - The Transient kinds `vault-write` and `vault-unreadable` with `rescued: true`.
   - `Fx::engine_with_vault(&self, vault: Vault) -> Engine`.
@@ -10305,9 +10345,14 @@ git commit -m "Add the refresh gate's lock, ownership, adoption and verdict"
   - **An error after the response keeps the successor explicitly** (§7.3 step 6, as amended):
     `abandon` writes it to `rescue/` (or `displaced/`) and returns the error. If that write
     fails too, the gate returns `Unpersisted`, never the error, so the loss is always reported.
-    A panic is caught by the `Received` guard's `Drop`, which keeps it the same way. Only a kill
-    (SIGKILL), or a panic while `rescue/` is unwritable, loses a received successor with nothing
-    but a log line, as §7.3 already accepts for a response lost in flight.
+    A panic is caught by the `Received` guard's `Drop`, which keeps it the same way. A panic
+    while `rescue/` (or `displaced/`) is unwritable cannot return `Unpersisted`: `Drop` logs the
+    loss at ERROR, which reaches stderr, and quarantines the account `successor_lost`
+    (`identity_conflict` for a foreign successor), best effort (§7.3 step 6, as amended).
+    `Drop` must never panic itself, since a second panic while unwinding aborts the process: it
+    makes only store writes and log lines through calls that return errors, and
+    `Engine::store`'s slot lock tolerates poisoning. Only a kill (SIGKILL) loses a received
+    successor with nothing recorded.
   - **A successor that belongs to another account is marked before anything else**
     (`Received::new`'s `foreign`), so no path, `Drop` and `abandon` included, ever stores it in
     this account's vault or in `rescue/`. It is displaced, and the account is quarantined
@@ -10575,9 +10620,13 @@ mod hooked {
         /// An error after the response while `rescue/` is unwritable: the successor cannot be
         /// kept, and the gate must say so rather than return the error.
         ErrorAfterResponseRescueBlocked,
+        /// Panics while `rescue/` is unwritable: the guard's `Drop` can neither keep the
+        /// successor nor return `Unpersisted`, so it records the loss (§7.3 step 6, amended).
+        PanicAfterResponseRescueBlocked,
+        PanicBeforeVaultWriteRescueBlocked,
     }
 
-    const FAULTS: [Fault; 8] = [
+    const FAULTS: [Fault; 10] = [
         Fault::VaultWrite,
         Fault::VaultVerify,
         Fault::VaultAndRescue,
@@ -10586,16 +10635,21 @@ mod hooked {
         Fault::ErrorBeforeVaultWrite,
         Fault::PanicBeforeVaultWrite,
         Fault::ErrorAfterResponseRescueBlocked,
+        Fault::PanicAfterResponseRescueBlocked,
+        Fault::PanicBeforeVaultWriteRescueBlocked,
     ];
 
     /// §15.3 "Refresh tokens" and §1.1 criterion 2: for every fault injected after the token
     /// response is received, the successor ends up in the vault or in `rescue/`; when every
-    /// write fails, the gate reports `Unpersisted`, never the injected error.
+    /// write fails, the gate reports `Unpersisted`, never the injected error, and quarantines
+    /// the account `successor_lost`. A panic that nothing can keep the successor through still
+    /// records the loss: the same quarantine, and an ERROR log line (§7.3 step 6, §7.4).
     #[test]
     fn a_received_successor_is_never_discarded() {
         for fault in FAULTS {
             let fx = Fx::new();
             let a = due(&fx);
+            let sent = vault_fp(&fx, &a);
             let snapshot = fx.vault_bytes(&a).unwrap();
             fx.script_refresh(Some("rt-a2"));
             let garbling;
@@ -10623,6 +10677,14 @@ mod hooked {
                     engine.fail_at(Some("gate-after-response"));
                     block_rescue(&fx);
                 }
+                Fault::PanicAfterResponseRescueBlocked => {
+                    engine.fail_at(Some("panic:gate-after-response"));
+                    block_rescue(&fx);
+                }
+                Fault::PanicBeforeVaultWriteRescueBlocked => {
+                    engine.fail_at(Some("panic:gate-before-vault-write"));
+                    block_rescue(&fx);
+                }
             }
             let result = catch_unwind(AssertUnwindSafe(|| {
                 engine.refresh_stored(fx.cc.as_ref(), &a, &snapshot)
@@ -10630,10 +10692,28 @@ mod hooked {
             let unpersisted = matches!(result, Ok(Ok(GateOutcome::Unpersisted)));
             let kept = fx.vault_refresh_token(&a).as_deref() == Some("rt-a2")
                 || rescued_refresh_tokens(&fx).iter().any(|rt| rt == "rt-a2");
-            assert!(
-                kept || unpersisted,
-                "{fault:?}: the successor was discarded ({result:?})"
-            );
+            let loss_recorded =
+                quarantine_of(&fx, &a) == (Some("successor_lost".into()), Some(sent.clone()));
+            match fault {
+                Fault::PanicAfterResponseRescueBlocked
+                | Fault::PanicBeforeVaultWriteRescueBlocked => {
+                    assert!(result.is_err(), "{fault:?}: the injected panic propagates");
+                    assert!(!kept, "{fault:?}: nothing could keep the successor");
+                    assert!(
+                        loss_recorded,
+                        "{fault:?}: the loss quarantines the account (§7.4 successor_lost)"
+                    );
+                }
+                _ => {
+                    assert!(
+                        kept || unpersisted,
+                        "{fault:?}: the successor was discarded ({result:?})"
+                    );
+                    if unpersisted {
+                        assert!(loss_recorded, "{fault:?}: Unpersisted quarantines successor_lost");
+                    }
+                }
+            }
             if matches!(
                 fault,
                 Fault::VaultAndRescue | Fault::ErrorAfterResponseRescueBlocked
@@ -10777,22 +10857,32 @@ impl<'e> Received<'e> {
 }
 
 impl Drop for Received<'_> {
+    /// Runs only while armed: a panic unwound past the successor before it was stored. It
+    /// cannot return `Unpersisted`, so it keeps the successor if it can, and otherwise records
+    /// the loss: an ERROR log line, which reaches stderr, and the account's quarantine (§7.3
+    /// step 6, §7.4). It must never panic itself, since a second panic while unwinding aborts
+    /// the process, so it makes only store writes and log lines, through calls that return
+    /// errors instead of panicking.
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
-        let (position, id) = (self.row.position, self.row.id.clone());
-        match self.keep() {
+        let engine = self.engine;
+        let row = self.row.clone();
+        let sent_fp = self.predecessor_fp.clone();
+        let foreign = self.is_foreign();
+        let kept = self.keep();
+        if foreign {
+            engine.quarantine_best_effort(&row, QuarantineReason::IdentityConflict, &sent_fp);
+        }
+        match kept {
             Ok(()) => tracing::error!(
-                position,
-                account = %id,
+                position = row.position,
+                account = %row.id,
                 "a refresh was interrupted before its token was stored; the token was kept outside the vault"
             ),
-            Err(e) => tracing::error!(
-                position,
-                account = %id,
-                "a refresh was interrupted and its token was lost: {e}"
-            ),
+            Err(e) if foreign => log_lost(&row, &e),
+            Err(e) => engine.record_loss(&row, &sent_fp, &e),
         }
     }
 }
@@ -10804,17 +10894,26 @@ pub(crate) enum Persisted {
     Vault,
     /// The vault could not take it, so `rescue/` holds it. The vault's generation is consumed.
     Rescued,
-    /// Neither could: the loss is logged at ERROR by position and ID.
+    /// Neither could. Not yet a loss: the caller decides, since active-token refresh may still
+    /// publish it to the live store (§7.5 step 5), and records one with `record_loss`.
     Unpersisted,
 }
 
-/// Every write failed (§7.3 step 6). Logged here, naming the account by position and ID; the
-/// caller's refusal or notice carries it to the user.
-fn log_lost(row: &AccountRow, e: &EngineError) {
+/// What became of a successor an error interrupted before it was stored (§7.3 step 6).
+pub(crate) enum Abandoned {
+    /// Kept in `rescue/` (or `displaced/`): the caller returns the error.
+    Kept(EngineError),
+    /// Kept nowhere, and recorded: the caller reports `Unpersisted`, never the error.
+    Lost,
+}
+
+/// A successor is lost (§7.3 step 6). Logged at ERROR, naming the account by position and ID
+/// only (§4.4); the caller's refusal or notice carries it to the user.
+pub(crate) fn log_lost(row: &AccountRow, cause: &dyn std::fmt::Display) {
     tracing::error!(
         position = row.position,
         account = %row.id,
-        "a refreshed token was lost: nothing could store it: {e}"
+        "a refreshed token was lost: {cause}"
     );
 }
 ```
@@ -10843,23 +10942,30 @@ with:
                 });
                 match persisted {
                     Ok(outcome) => outcome,
-                    Err(e) if received.armed => self.abandon(&row, &sent_fp, &mut received, e)?,
+                    Err(e) if received.armed => {
+                        match self.abandon(&row, &sent_fp, &mut received, e) {
+                            Abandoned::Kept(e) => return Err(e),
+                            Abandoned::Lost => GateOutcome::Unpersisted,
+                        }
+                    }
                     Err(e) => return Err(e),
                 }
             }
 ```
 
-Replace the `persist_refreshed` and `displace_foreign` methods (Task 10) with these four.
-`persist_received` is the step both refresh paths share (Task 16 reuses it); `persist_successor`,
-`lose` and `abandon` are the gate's, around it. `keep_foreign` stays: `Received::keep` calls it.
+Replace the `persist_refreshed` and `displace_foreign` methods (Task 10) with these. Both
+refresh paths share `persist_received`, `abandon`, `record_loss` and `quarantine_best_effort`
+(Task 16 reuses them); `persist_successor` and `lose` are the gate's. `keep_foreign` stays:
+`Received::keep` calls it.
 
 ```rust
     /// §7.3 step 6 and §7.5 step 5: the received successor goes to the vault, or to `rescue/`
     /// when the vault cannot take it. A failed `persist_generation` whose vault write landed is
     /// no loss: the metadata failure is logged and the result is `Vault`. `received` is
-    /// disarmed whatever the result, so its `Drop` never writes a second copy. A successor that
-    /// belongs to another account never comes here: its caller keeps it with
-    /// `Received::keep` (§7.4).
+    /// disarmed whatever the result, so its `Drop` never writes a second copy. `Unpersisted` is
+    /// not yet a loss: the gate records one at once (`lose`); active-token refresh only when the
+    /// live store did not take the successor either (§7.5 step 5). A successor that belongs to
+    /// another account never comes here: its caller keeps it with `Received::keep` (§7.4).
     pub(crate) fn persist_received(
         &self,
         p: &dyn Provider,
@@ -10890,7 +10996,11 @@ Replace the `persist_refreshed` and `displace_foreign` methods (Task 10) with th
         match received.keep() {
             Ok(()) => Persisted::Rescued,
             Err(e) => {
-                log_lost(row, &e);
+                tracing::error!(
+                    position = row.position,
+                    account = %row.id,
+                    "neither the vault nor rescue/ could store a refreshed token: {e}"
+                );
                 Persisted::Unpersisted
             }
         }
@@ -10947,10 +11057,7 @@ Replace the `persist_refreshed` and `displace_foreign` methods (Task 10) with th
                         kind: "vault-unreadable".into(),
                         rescued: true,
                     },
-                    Err(e) => {
-                        log_lost(row, &e);
-                        self.lose(row, sent_fp)
-                    }
+                    Err(e) => self.lose(row, sent_fp, &e),
                 });
             }
         }
@@ -10961,66 +11068,104 @@ Replace the `persist_refreshed` and `displace_foreign` methods (Task 10) with th
                 kind: "vault-write".into(),
                 rescued: true,
             },
-            // Already logged by `persist_received`.
-            Persisted::Unpersisted => self.lose(row, sent_fp),
+            Persisted::Unpersisted => {
+                self.lose(row, sent_fp, &"neither the vault nor rescue/ could store it")
+            }
         })
     }
 
-    /// §7.4 `successor_lost`: the successor is gone and the vault's generation, the one sent,
-    /// is consumed. Quarantines the account, bound to it, best effort: when the store cannot
-    /// record that either, the loss is only reported.
-    fn lose(&self, row: &AccountRow, sent_fp: &str) -> GateOutcome {
-        if let Err(e) = self.quarantine(row, QuarantineReason::SuccessorLost, sent_fp) {
+    /// Quarantines `row`, best effort: a failure is logged (position and ID only), never
+    /// returned. Never panics, so `Received::drop` may call it while unwinding.
+    pub(crate) fn quarantine_best_effort(
+        &self,
+        row: &AccountRow,
+        reason: QuarantineReason,
+        fp: &str,
+    ) {
+        if let Err(e) = self.quarantine(row, reason, fp) {
             tracing::error!(
                 position = row.position,
                 account = %row.id,
-                "could not quarantine an account whose refreshed token was lost: {e}"
+                reason = reason.as_str(),
+                "could not quarantine the account: {e}"
             );
         }
+    }
+
+    /// §7.3 step 6 and §7.4 `successor_lost`: a received successor could be kept nowhere, and
+    /// the generation that was sent, still the vault's, is consumed. Logs the loss and
+    /// quarantines the account, bound to `sent_fp`, best effort: a store that cannot record it
+    /// either leaves the loss reported only. Shared by the gate, `Received::drop` and
+    /// active-token refresh (Task 16). Never panics.
+    pub(crate) fn record_loss(
+        &self,
+        row: &AccountRow,
+        sent_fp: &str,
+        cause: &dyn std::fmt::Display,
+    ) {
+        log_lost(row, cause);
+        self.quarantine_best_effort(row, QuarantineReason::SuccessorLost, sent_fp);
+    }
+
+    /// The gate's `Unpersisted`, recorded (`record_loss`).
+    fn lose(&self, row: &AccountRow, sent_fp: &str, cause: &dyn std::fmt::Display) -> GateOutcome {
+        self.record_loss(row, sent_fp, cause);
         GateOutcome::Unpersisted
     }
 
     /// §7.3 step 6: an error after the response was received, before the successor was
-    /// stored. The successor is kept first (`Received::keep`) and the error returned; if
-    /// keeping it fails too, the loss is reported as `Unpersisted` instead of the error. A
-    /// successor that belongs to another account still quarantines the account (§7.4), best
-    /// effort.
-    fn abandon(
+    /// stored. The successor is kept first (`Received::keep`) and the caller returns the error.
+    /// If keeping it fails too, the loss is recorded (`record_loss`; only logged for a foreign
+    /// successor, whose account is quarantined `identity_conflict` instead) and the caller
+    /// reports `Unpersisted`, never the error. Shared by the gate and active-token refresh
+    /// (Task 16).
+    pub(crate) fn abandon(
         &self,
         row: &AccountRow,
         sent_fp: &str,
         received: &mut Received<'_>,
         cause: EngineError,
-    ) -> Result<GateOutcome, EngineError> {
+    ) -> Abandoned {
         let foreign = received.is_foreign();
         let kept = received.keep();
         if foreign {
-            if let Err(e) = self.quarantine(row, QuarantineReason::IdentityConflict, sent_fp) {
-                tracing::error!(
-                    position = row.position,
-                    account = %row.id,
-                    "could not quarantine an account whose refreshed token belongs to another account: {e}"
-                );
-            }
+            self.quarantine_best_effort(row, QuarantineReason::IdentityConflict, sent_fp);
         }
         match kept {
-            Ok(()) => Err(cause),
+            Ok(()) => Abandoned::Kept(cause),
             Err(e) => {
-                log_lost(row, &e);
                 tracing::error!(
                     position = row.position,
                     account = %row.id,
                     "the refresh failed after its token was received: {cause}"
                 );
-                Ok(if foreign {
-                    GateOutcome::Unpersisted
+                if foreign {
+                    log_lost(row, &e);
                 } else {
-                    self.lose(row, sent_fp)
-                })
+                    self.record_loss(row, sent_fp, &e);
+                }
+                Abandoned::Lost
             }
         }
     }
 ```
+
+In `crates/tagteam-engine/src/engine.rs`, add `PoisonError` to the `std::sync` import, and in
+both `store()` and `existing_store()` replace
+
+```rust
+        let mut slot = self.store.lock().unwrap();
+```
+
+with
+
+```rust
+        let mut slot = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+```
+
+The slot only caches an `Arc<Store>`, so a poisoned lock holds nothing half-written. This keeps
+`Received::drop`'s quarantine from ever panicking a second time while unwinding (which would
+abort); `Store`'s own connection lock already tolerates poisoning.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -11122,7 +11267,7 @@ Expected: PASS (1 test; 8 in `gate_persist` in all).
 
 ```bash
 git add crates/tagteam-engine/src/refresh.rs crates/tagteam-engine/src/rescue.rs \
-  crates/tagteam-engine/tests/common/mod.rs \
+  crates/tagteam-engine/src/engine.rs crates/tagteam-engine/tests/common/mod.rs \
   crates/tagteam-engine/tests/gate_persist.rs
 git commit -m "Persist a refreshed token by compare-and-swap, rescuing it on any failure"
 ```
@@ -13219,6 +13364,9 @@ the live credential belongs to someone else.
 - Modify: `crates/tagteam-engine/src/error.rs` (the `ForeignLiveCredential` variant, its
   kind, and its row in `kind_is_pinned_for_every_variant`)
 - Modify: `crates/tagteam-engine/src/refresh.rs` (an accessor on Task 11's `Received`)
+- Modify (Steps 7–11, the `Superseded` class): `crates/tagteam-core/src/classify.rs`,
+  `crates/tagteam-engine/src/switch.rs` (`settle_outgoing`),
+  `crates/tagteam-engine/src/recover.rs` (Task 15's `OutgoingFacts` literal)
 - Test: `crates/tagteam-engine/tests/active.rs`
 
 **Interfaces:**
@@ -13235,11 +13383,14 @@ the live credential belongs to someone else.
   - Task 10: `crate::refresh::names_another_account(owner, row)`: the identity-conflict rule
     both refresh paths share (uuid compared only when both sides know one, org only when both
     are non-empty; either alone is a conflict).
-  - Task 11: `crate::refresh::{Received, Persisted}` (`Received::new(…, foreign)`,
-    `Received::is_foreign`, `Received::keep`) and
+  - Task 11: `crate::refresh::{Received, Persisted, Abandoned, log_lost}` (`Received::new(…,
+    foreign)`, `Received::is_foreign`, `Received::keep`) and
     `Engine::persist_received(p, row, lock, &mut Received) -> Persisted`: the vault → `rescue/`
     → `Unpersisted` step both refresh paths share, with the guard that keeps a received
-    successor on a panic, and displaces one that belongs to another account (§7.4).
+    successor on a panic, and displaces one that belongs to another account (§7.4). Also
+    `Engine::abandon(row, sent_fp, &mut Received, cause) -> Abandoned` for an error after
+    receipt, and `Engine::record_loss(row, sent_fp, cause)`, the §7.4 `successor_lost`
+    quarantine every loss records.
   - Task 13: `Fx::plant_rescue(&self, id, predecessor_fp: &str, successor: &[u8]) -> PathBuf`.
   - Task 14: `EngineError::NeedsRelogin { position, label }`.
   - M1: `switch::{Held, OracleHint, answer_for, refuse_unreadable}`,
@@ -13252,6 +13403,11 @@ the live credential belongs to someone else.
   - `Engine::refresh_active(&ProviderId, ActiveTrigger) -> Result<ActiveOutcome, EngineError>`.
   - `Received::bytes(&self) -> &[u8]` (`pub(crate)`, in `refresh.rs`).
   - `EngineError::ForeignLiveCredential { position: u32 }`, kind `foreign-credential`.
+  - `ActiveOutcome::PublishedOnly`: tagteam's storage failed, but the live store holds the
+    successor, so nothing is lost.
+  - `OutgoingClass::Superseded` and `OutgoingFacts::equals_vault_prev` (`tagteam-core`), and
+    `settle_outgoing` leaving a superseded live generation alone (§9.4 step 4, as amended;
+    Steps 7–11).
   - Hook points `active-before-request` (before the token request) and
     `active-after-response` (after a successor is received and guarded, before the lock
     re-check).
@@ -13272,6 +13428,18 @@ the live credential belongs to someone else.
     (§7.3 step 6, §7.4, as the gate does), and the account is quarantined, bound to the
     fingerprint that was sent. A lost successor is reported as `Unpersisted` in preference to
     the conflict or to a compromised lock.
+  - **A loss is only a successor held nowhere** (§7.5 step 5, as amended, Codex round 2). When
+    the vault and `rescue/` both fail but publication puts the successor in the live store, CC
+    holds it and the next pass adopts it into the vault (step 3's CC-rotation row). That is
+    `PublishedOnly`, and nothing is quarantined. A successor that is in none of the three
+    (persistence failed, and publication was skipped or failed) is `Unpersisted`, recorded
+    exactly as the gate records one (`record_loss`: an ERROR log and the `successor_lost`
+    quarantine, bound to the generation sent).
+  - **The next switch never captures a generation this refresh superseded** (§9.4 step 4
+    `Superseded`, Codex round 2). A successor persisted but not published leaves live A, vault
+    B and `.prev` A. The outgoing capture would otherwise take A for a rotation and put the
+    consumed token back over B. The class belongs in this task, the first that can produce
+    that state; Steps 7–11 add it in their own commit.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -13282,6 +13450,7 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::Fx;
@@ -13579,23 +13748,42 @@ fn a_failed_vault_write_rescues_the_successor_and_still_publishes_it() {
     assert_eq!(token_requests(&fx), 1);
 }
 
-#[test]
-fn when_both_writes_fail_the_loss_is_reported_and_the_live_store_still_holds_it() {
-    let fx = Fx::new();
-    fx.add("a@x.co", "rt-a");
-    expire_live(&fx);
-    fx.script_refresh(Some("rt-a2"));
-    fx.kc.set_fail_write(SERVICE, true);
-    // A `rescue/` that can be listed but not written to: reconciliation still reads it, and
-    // no rescue file can be created in it.
+/// A `rescue/` that can be listed but not written to: reconciliation still reads it, and no
+/// rescue file can be created in it. Returns it, for `unblock`.
+fn block_rescue(fx: &Fx) -> PathBuf {
     let rescue = fx.env.data_dir().join("rescue");
     fs::create_dir_all(&rescue).unwrap();
     fs::set_permissions(&rescue, fs::Permissions::from_mode(0o500)).unwrap();
+    rescue
+}
+
+fn unblock(dir: &Path) {
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn when_both_writes_fail_but_the_live_store_takes_it_nothing_is_lost() {
+    // §7.5 step 5: CC holds the successor, so it is not lost and nothing is quarantined; the
+    // next pass adopts it into the vault (step 3's CC-rotation row).
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    expire_live(&fx);
+    fx.script_refresh(Some("rt-a2"));
+    fx.kc.set_fail_write(SERVICE, true);
+    let rescue = block_rescue(&fx);
 
     let out = active(&fx, ActiveTrigger::Expired).unwrap();
+    unblock(&rescue);
 
-    assert_eq!(out, ActiveOutcome::Unpersisted);
+    assert_eq!(out, ActiveOutcome::PublishedOnly);
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
+    assert_eq!(quarantine_reason(&fx, &a), None, "a successor CC holds is not lost");
+
+    fx.kc.set_fail_write(SERVICE, false);
+    let out = active(&fx, ActiveTrigger::Expired).unwrap();
+    assert_eq!(out, ActiveOutcome::NotNeeded { reconciled: true });
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+    assert_eq!(token_requests(&fx), 1);
 }
 
 /// A 200 token reply whose owner is another account (§7.4).
@@ -13859,6 +14047,48 @@ mod hooks {
         assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
         assert_eq!(token_requests(&fx), 1);
     }
+
+    /// Makes the credential lock look taken over once the response arrives (§9.1), so the
+    /// successor is never published.
+    fn take_over_after_response(fx: &Fx) -> PathBuf {
+        let refresh = fx.paths().refresh_lock;
+        let lock_dir = refresh.clone();
+        fx.engine.on_point(
+            "active-after-response",
+            Box::new(move || {
+                fs::File::open(&lock_dir)
+                    .unwrap()
+                    .set_modified(SystemTime::now() + Duration::from_secs(60))
+                    .unwrap();
+            }),
+        );
+        refresh
+    }
+
+    #[test]
+    fn a_successor_held_nowhere_is_unpersisted_and_quarantines_the_account() {
+        // §7.5 step 5, as amended: the vault and rescue/ both fail, and the lock was taken
+        // over, so the live store is not written either. The consumed generation must never be
+        // sent again: `successor_lost`, bound to it (§7.4).
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let sent = fp(&fx, &cred("a@x.co", "rt-a"));
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        fx.kc.set_fail_write(SERVICE, true);
+        let rescue = block_rescue(&fx);
+        take_over_after_response(&fx);
+
+        let out = active(&fx, ActiveTrigger::Expired).unwrap();
+        unblock(&rescue);
+
+        assert_eq!(out, ActiveOutcome::Unpersisted);
+        let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
+        assert_eq!(row.quarantine_reason.as_deref(), Some("successor_lost"));
+        assert_eq!(row.quarantine_fp.as_deref(), Some(sent.as_str()));
+        assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"), "never published");
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    }
 }
 ```
 
@@ -13932,7 +14162,7 @@ use crate::error::EngineError;
 use crate::hooks;
 use crate::oracle::verdict;
 use crate::quarantine::QuarantineReason;
-use crate::refresh::{Persisted, Received, names_another_account};
+use crate::refresh::{Abandoned, Persisted, Received, log_lost, names_another_account};
 use crate::rescue::{RescueEntry, RescueFile};
 use crate::store::AccountRow;
 use crate::switch::{Held, OracleHint, answer_for, refuse_unreadable};
@@ -13963,9 +14193,15 @@ pub enum ActiveOutcome {
     /// CC's locks were compromised when the response arrived: persisted to the vault or
     /// `rescue/`, but not published; the next pass reconciles (§7.5 step 5).
     PersistedNotPublished,
+    /// Neither the vault nor `rescue/` could take the successor, but the live store holds it,
+    /// so nothing is lost: the next pass adopts it into the vault (§7.5 step 3). Nothing is
+    /// quarantined.
+    PublishedOnly,
     Dead(QuarantineReason),
     Systemic(String),
     Transient { kind: String },
+    /// The successor is held nowhere: logged at ERROR, and the account quarantined
+    /// `successor_lost` (§7.5 step 5, §7.4).
     Unpersisted,
 }
 
@@ -14107,10 +14343,11 @@ impl Engine {
                 // anything below unwinds before it is stored.
                 let mut received = Received::new(self, p, row, sent_fp, successor, foreign);
                 if let Err(e) = hooks::point(self, "active-after-response") {
-                    // As the gate does (Task 11): keep it, and report a loss, not the error.
-                    return match received.keep() {
-                        Ok(()) => Err(e),
-                        Err(_) => Ok(ActiveOutcome::Unpersisted),
+                    // As the gate does (Task 11): keep it and return the error, or record the
+                    // loss and report it, never the error.
+                    return match self.abandon(row, sent_fp, &mut received, e) {
+                        Abandoned::Kept(e) => Err(e),
+                        Abandoned::Lost => Ok(ActiveOutcome::Unpersisted),
                     };
                 }
                 if received.is_foreign() {
@@ -14118,8 +14355,12 @@ impl Engine {
                     let quarantined =
                         self.quarantine(row, QuarantineReason::IdentityConflict, sent_fp);
                     return match (kept, quarantined) {
-                        // A lost successor is reported first (§7.3 step 6).
-                        (Err(_), _) => Ok(ActiveOutcome::Unpersisted),
+                        // A lost successor is reported first (§7.3 step 6). The account is
+                        // quarantined `identity_conflict` already, so the loss is only logged.
+                        (Err(e), _) => {
+                            log_lost(row, &e);
+                            Ok(ActiveOutcome::Unpersisted)
+                        }
                         (Ok(()), Err(e)) => Err(e),
                         (Ok(()), Ok(())) => {
                             Ok(ActiveOutcome::Dead(QuarantineReason::IdentityConflict))
@@ -14135,9 +14376,20 @@ impl Engine {
                 } else {
                     Ok(false)
                 };
-                // A loss takes precedence over everything else (§7.3 step 6).
+                // A loss takes precedence over everything else (§7.3 step 6). But a successor
+                // the live store holds is not lost: CC has it, and the next pass adopts it into
+                // the vault (§7.5 step 3). Only one held nowhere is recorded, as the gate
+                // records it: `successor_lost`, bound to the generation sent (§7.5 step 5).
                 Ok(match (persisted, published) {
-                    (Persisted::Unpersisted, _) => ActiveOutcome::Unpersisted,
+                    (Persisted::Unpersisted, Ok(true)) => ActiveOutcome::PublishedOnly,
+                    (Persisted::Unpersisted, published) => {
+                        let cause = match &published {
+                            Err(e) => format!("the live store was not written either: {e}"),
+                            Ok(_) => "the live store was not written either".to_owned(),
+                        };
+                        self.record_loss(row, sent_fp, &cause);
+                        ActiveOutcome::Unpersisted
+                    }
                     (_, Err(e)) => return Err(e),
                     (_, Ok(true)) => ActiveOutcome::Refreshed,
                     (_, Ok(false)) => ActiveOutcome::PersistedNotPublished,
@@ -14441,7 +14693,7 @@ impl Engine {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test active`
-Expected: PASS, 24 tests.
+Expected: PASS, 25 tests.
 
 Run: `cargo test -p tagteam-engine --test active && cargo test -p tagteam-engine --lib error`
 Expected: PASS: 22 tests without the hook module; `kind_is_pinned_for_every_variant` passes.
@@ -14454,6 +14706,201 @@ Expected: no warnings.
 ```bash
 git add crates/tagteam-engine/src/active.rs crates/tagteam-engine/src/lib.rs crates/tagteam-engine/src/error.rs crates/tagteam-engine/src/refresh.rs crates/tagteam-engine/tests/active.rs
 git commit -m "Refresh the active token under CC's credential locks, reconciling first"
+```
+
+- [ ] **Step 7: Write the failing tests for the `Superseded` class**
+
+A refresh that persists B but cannot publish it leaves live A, vault B and `.prev` A. Today the
+next switch's outgoing capture (§9.4 step 4) compares live A with vault B only, takes A for a
+rotation (or `Unresolved`), and writes the consumed A back over B. §9.4 step 4 (as amended)
+leaves such a generation alone.
+
+Add to the `tests` module of `crates/tagteam-core/src/classify.rs`:
+
+```rust
+    #[test]
+    fn a_live_generation_the_vault_superseded_is_left_alone() {
+        // §9.4 step 4 `Superseded`: an active-token refresh stored a newer generation it could
+        // not publish. Capturing the live one would put a consumed token back, whatever the
+        // oracle says; `.prev` keeps it, so leaving it alone loses nothing.
+        for oracle in [
+            OracleVerdict::ThisAccount,
+            OracleVerdict::OtherIdentity,
+            OracleVerdict::Unavailable,
+        ] {
+            let f = OutgoingFacts {
+                equals_vault_prev: true,
+                oracle,
+                ..facts()
+            };
+            assert_eq!(
+                decide_outgoing(&f),
+                (OutgoingClass::Superseded, OutgoingAction::Nothing),
+                "{oracle:?}"
+            );
+        }
+        // The vault's own generation still classifies as `Ours` first.
+        let f = OutgoingFacts {
+            equals_vault_prev: true,
+            fp_equal_vault: true,
+            ..facts()
+        };
+        assert_eq!(decide_outgoing(&f).0, OutgoingClass::Ours);
+    }
+```
+
+Append to the `hooks` module of `crates/tagteam-engine/tests/active.rs`:
+
+```rust
+    #[test]
+    fn a_switch_never_captures_the_generation_an_unpublished_refresh_superseded() {
+        // Codex round 2, §9.4 step 4 `Superseded`: the refresh persists B but cannot publish
+        // it, leaving live A, vault B and `.prev` A. Switching away must leave B in the vault
+        // (no capture of the consumed A, nothing displaced); switching back activates B.
+        let fx = Fx::new();
+        let b = fx.add("b@x.co", "rt-b");
+        let a = fx.add("a@x.co", "rt-a");
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        let refresh = take_over_after_response(&fx);
+        assert_eq!(
+            active(&fx, ActiveTrigger::Expired).unwrap(),
+            ActiveOutcome::PersistedNotPublished
+        );
+        // The lock's new holder is gone; without this the switch would wait for it.
+        fs::remove_dir(&refresh).unwrap();
+        assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+        assert_eq!(prev_refresh_token(&fx, &a).as_deref(), Some("rt-a"));
+
+        fx.switch_to(&b, false).unwrap();
+        assert_eq!(
+            fx.vault_refresh_token(&a).as_deref(),
+            Some("rt-a2"),
+            "the consumed live generation is never captured over the newer one"
+        );
+        assert!(
+            fx.displaced().is_empty(),
+            "the vault's .prev already keeps it: nothing to displace"
+        );
+
+        fx.switch_to(&a, false).unwrap();
+        assert_eq!(
+            fx.live_refresh_token().as_deref(),
+            Some("rt-a2"),
+            "switching back activates B, not the consumed A"
+        );
+        assert_eq!(token_requests(&fx), 1);
+    }
+```
+
+- [ ] **Step 8: Run the tests to verify they fail**
+
+Run: `cargo test -p tagteam-core classify`
+Expected: FAIL to compile: "struct `OutgoingFacts` has no field named `equals_vault_prev`".
+
+Run: `cargo test -p tagteam-engine --features test-hooks --test active a_switch_never_captures`
+Expected: FAIL at "the consumed live generation is never captured over the newer one": the
+vault holds `rt-a` (captured as `Unresolved`, with `rt-a2` pushed to `.prev`).
+
+- [ ] **Step 9: Add the class and read `.prev` in step 4**
+
+In `crates/tagteam-core/src/classify.rs`:
+
+1. In `OutgoingFacts`, after `pub fp_equal_vault: bool,`, add:
+
+```rust
+    /// The live credential is the vault's `.prev` generation: an active-token refresh stored a
+    /// newer one it could not publish (§7.5), so capturing this one would put a consumed token
+    /// back (§9.4 step 4 `Superseded`).
+    pub equals_vault_prev: bool,
+```
+
+2. In `OutgoingClass`, after `Ours,`, add:
+
+```rust
+    /// The vault holds a newer generation than the live one (§9.4 step 4, amended).
+    Superseded,
+```
+
+3. In `decide_outgoing`, right after the `Ours` early return, add:
+
+```rust
+    if f.equals_vault_prev {
+        return (OutgoingClass::Superseded, OutgoingAction::Nothing);
+    }
+```
+
+and extend its doc comment's first sentence to "The §9.4 step 4 table, `Superseded` included,
+with …".
+
+4. In the `tests` module's `facts()`, after `fp_equal_vault: false,`, add
+   `equals_vault_prev: false,`.
+
+In `crates/tagteam-engine/src/switch.rs`, in `settle_outgoing`, replace
+
+```rust
+        let fp_live = p.fingerprint(&bytes);
+        let resolved = answer_for(hint, &bytes);
+        let facts = OutgoingFacts {
+            bytes_equal_vault: vault.as_deref() == Some(bytes.as_slice()),
+            fp_equal_vault: fp_live.is_some()
+                && vault.as_deref().and_then(|v| p.fingerprint(v)) == fp_live,
+```
+
+with
+
+```rust
+        let fp_live = p.fingerprint(&bytes);
+        let resolved = answer_for(hint, &bytes);
+        let ours = vault
+            .as_deref()
+            .is_some_and(|v| same_generation(p, v, &bytes));
+        // §9.4 step 4 `Superseded`: the vault's `.prev` is this generation, so an active-token
+        // refresh stored a newer one it could not publish (§7.5). Read only when the live
+        // credential is not the vault's own, and tri-state: an unreadable `.prev` may be
+        // exactly that generation, and capturing over the newer one would lose it (step 3).
+        let superseded = !ours
+            && match self.vault.read_prev(&out.id) {
+                Read::Present(prev) => same_generation(p, &prev, &bytes),
+                Read::Absent => false,
+                Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
+            };
+        let facts = OutgoingFacts {
+            bytes_equal_vault: vault.as_deref() == Some(bytes.as_slice()),
+            fp_equal_vault: fp_live.is_some()
+                && vault.as_deref().and_then(|v| p.fingerprint(v)) == fp_live,
+            equals_vault_prev: superseded,
+```
+
+`settle_outgoing`'s `OutgoingAction::Nothing` arm already covers the new class, and `transact`
+holds the live generation afterwards, so step 7's rule does not displace it either (the vault's
+`.prev` keeps it).
+
+In `crates/tagteam-engine/src/recover.rs`, in Task 15's `capture_rotated_outgoing`, add after
+`fp_equal_vault: …,` in its `OutgoingFacts` literal:
+
+```rust
+            // Recovery's held set covers the vault's `.prev` (`hold_vault`), so a superseded
+            // generation returned early above and never reaches this classification.
+            equals_vault_prev: false,
+```
+
+- [ ] **Step 10: Run the tests to verify they pass**
+
+Run: `cargo test -p tagteam-core && cargo test -p tagteam-engine --features test-hooks`
+Expected: PASS: the new core test, and 26 tests in `active` (`a_switch_never_captures…`
+included); the switch and recovery suites still pass unchanged.
+
+Run: `cargo clippy -p tagteam-core -p tagteam-engine --all-targets --features tagteam-engine/test-hooks -- -D warnings`
+Expected: no warnings.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add crates/tagteam-core/src/classify.rs crates/tagteam-engine/src/switch.rs \
+  crates/tagteam-engine/src/recover.rs crates/tagteam-engine/tests/active.rs
+git commit -m "Never capture a live generation the vault has already superseded"
 ```
 
 ---
