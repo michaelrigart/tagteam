@@ -123,6 +123,7 @@ A test pins this invariant (§15.3).
 | `tagteam-cc` | `impl Provider for ClaudeCode`: everything whose shape CC dictates — path and store resolution, Keychain naming, reads and writes of the active credential (OAuth and managed-key axes), CC's `proper-lockfile` lock protocol, `~/.claude.json` handling, endpoints, poll budget, session records and profile handling | Yes, through `tagteam-provider` |
 | `tagteam-engine` | The SQLite store, the vault, the `ureq`-backed `Http` implementation, the provider registry, and the provider-generic operations: switch, refresh gate, usage collector, auto-switch loop, sessions, export/import, doctor | Yes |
 | `tagteam` | The CLI binary (clap), human and JSON rendering, and the prompts | Thin |
+| `tagteam-fake` | Test-only (`publish = false`): the `FakeAgent` provider (§15.2). It obeys the provider dependency rules below, so it also proves that a new provider is one crate plus one registry line | Its own fixture home only |
 
 **Dependency rules.**
 - A provider crate depends only on `tagteam-core` and `tagteam-provider`, never on
@@ -169,13 +170,17 @@ impl Engine {
   read is one where the Keychain lookup failed and the plaintext file covered it, so the bytes
   may be a superseded generation. The refresh gate accepts only `FreshCredential`, which cannot
   be built from a degraded read.
-- **Lock order is carried by the guards.** A provider's `LiveLocks` can only be acquired from a
-  held `MutationGuard`. Inside Claude Code's implementation, a `CcCredLocks` guard is taken first
-  and a `CcConfigLock` only from a held `CcCredLocks`. Order: tagteam mutation lock → account
-  locks (ascending account ID) → provider live locks (for CC: credential locks → config lock).
-  Any prefix may be skipped, but a lock is never taken while holding one that comes later: in
-  particular, `MutationGuard` is never taken while holding an account lock. The one exception
-  is a standalone `CcConfigLock` for profile seeding and merge-back (§12.4), which take no
+- **Lock order is carried by the guards.** A provider's live locks come in two stages. Its
+  credential locks (`CredLocks`) can only be acquired from a held `MutationGuard`, and its
+  config lock (`ConfigLock`) only from held `CredLocks`. `LiveLocks` is the pair: a switch and
+  a recovery take both, while the active-token refresh (§7.5) holds only the credential locks
+  across its request and takes the config lock after it. For Claude Code the credential locks
+  are the refresh and legacy locks, and the config lock is `~/.claude.json.lock` (§9.1).
+  Order: tagteam mutation lock → account locks (ascending account ID) → provider live locks
+  (credential locks → config lock). Any prefix may be skipped, but a lock is never taken while
+  holding one that comes later: in particular, `MutationGuard` is never taken while holding an
+  account lock. The one exception is a standalone config lock for profile seeding and
+  merge-back (§12.4), which take no
   credential lock while holding it; taking a lone lock cannot invert the order.
 - **No network while holding a contended lock.** There are two exceptions, both bounded:
   - the refresh gate holds the account lock across its token request (§7.3, 10 s), which is
@@ -187,6 +192,15 @@ impl Engine {
 - **HTTP.** Blocking `ureq` with rustls and `rustls-platform-verifier` (the OS trust store, so
   corporate TLS proxies work). Fetches for several accounts run in parallel on scoped threads,
   each start staggered by 250 ms. There is no async runtime in sub-project 1.
+  - The `Http` port (in `tagteam-provider`) sends one request with its own timeout and returns
+    a response or a transport error. The error is `PreSend` only when the request provably
+    never left the machine: a DNS, connect or TLS-handshake failure. Everything else,
+    including a timeout or a reset after connecting, is `Ambiguous`. Misfiling a pre-send
+    failure as ambiguous is harmless, because both retry the same generation (§7.3); the
+    reverse would not be.
+  - The port sets `User-Agent: tagteam/<version>` on every request, so no provider can omit
+    it, and caps response bodies at 1 MiB. A request's `Debug` output never shows its
+    `Authorization` header or its body.
 - **SQLite.** `rusqlite` with the `bundled` feature.
 - **JSON.** `serde_json` with `preserve_order` and `arbitrary_precision` for anything
   round-tripped. The `~/.claude.json` splice is span-based and never re-serializes the file
@@ -214,13 +228,16 @@ pub trait Provider: Send + Sync {
     // Identity and stored shapes (§6.1)
     fn identity_key(&self, id: &Identity) -> IdentityKey;   // CC: email + org uuid
     fn credential_kinds(&self) -> &'static [&'static str];   // CC: oauth, setup_token, api_key
+    fn kind_traits(&self, kind: &str) -> KindTraits;        // refreshable? managed-key axis? default-email prefix
     fn primary_long_window(&self) -> Option<WindowKey>;     // CC: "7d"; ranks consume-first (§11.2)
     fn export_login / import_login(...);                    // provider-owned export payload (§13.3)
 
     // The live login
     fn live_identity(&self, env: &Env) -> Read<LiveIdentity>;
     fn read_active(&self, env: &Env) -> Read<Credential>;        // carries provenance
-    fn lock_live<'g>(&self, env: &Env, g: &'g MutationGuard) -> Result<LiveLocks<'g>>;
+    fn lock_credentials<'g>(&self, env: &Env, g: &'g MutationGuard) -> Result<CredLocks<'g>>;
+    fn lock_config<'c>(&self, env: &Env, cred: &'c CredLocks<'_>) -> Result<ConfigLock<'c>>;
+    fn lock_live<'g>(&self, env: &Env, g: &'g MutationGuard) -> Result<LiveLocks<'g>>; // both; one budget (§9.1)
     fn activate(&self, env: &Env, locks: &LiveLocks, target: &StoredLogin,
                 live: Read<&Credential>) -> Result<ActivationUndo>;   // compose + write surface
     fn capture(&self, env: &Env) -> Result<CapturedLogin>;             // for `add`
@@ -228,11 +245,13 @@ pub trait Provider: Send + Sync {
     // Credential semantics
     fn classify(&self, bytes: &[u8]) -> CredentialKind;
     fn fingerprint(&self, cred: &Credential) -> Fingerprint;          // §2 "Generation"; every kind
-    fn expiry(&self, cred: &Credential) -> Expiry;
+    fn expiry(&self, cred: &Credential) -> Expiry;                     // access-token expiry (§7.2)
 
     // Network (the engine supplies the Http port and owns locks, leases, CAS and rescue)
     fn refresh(&self, http: &dyn Http, cred: &FreshCredential) -> RefreshResult;
+        // Refreshed { successor, identity hint } | Dead(reason) | Systemic | Transient(kind)
     fn resolve_owner(&self, http: &dyn Http, cred: &Credential) -> Option<Identity>;
+        // None, with no request, when the credential has no token to show (§7.6)
     fn fetch_usage(&self, http: &dyn Http, cred: &Credential) -> UsageResult; // generic windows
     fn poll_budget(&self) -> PollBudget;              // the §8.6 constants and hourly request cap
 
@@ -273,6 +292,14 @@ policy, the switch transaction's ordering, journal and rollback, launch reservat
 local-state test are all generic. A provider supplies only the
 agent-specific facts.
 
+- **`refresh`** builds the token request, parses the response, and composes the successor's
+  bytes (for CC, the token fields replaced inside the stored JSON, with every other key kept).
+  It classifies the response as §7.3 step 7 does, except for the lineage re-read, which is the
+  engine's. It never touches the vault, a lock or `rescue/`.
+- **Kind traits.** The engine and the CLI never name a provider's credential kinds.
+  `kind_traits` tells them whether a kind refreshes, whether it lives on a separate
+  managed-key axis, and which prefix a defaulted `add-token` email uses (§10.2).
+
 This trait is internal API, not a public plugin interface. It is expected to change when the
 second provider lands (§17, R7).
 
@@ -311,7 +338,8 @@ CC path and store resolution is specified in Appendix A.
 
 The store opens in WAL mode with `busy_timeout = 5000`, `foreign_keys = ON` and
 `synchronous = NORMAL`. Migrations are embedded, forward-only and tracked by
-`PRAGMA user_version`.
+`PRAGMA user_version`. The database file is created with mode 0600, since it names every
+account; SQLite gives its `-wal` and `-shm` files the same mode.
 
 Transactions are short. No transaction is held across a network call or a `security` spawn.
 
@@ -520,6 +548,13 @@ the Keychain's failure modes.
 - **`rescue/`** holds a refreshed successor whose vault write failed. The next pass of the
   refresh gate for that account adopts it automatically (§7.3), and the file is deleted only
   after a verified vault write.
+  - Each file is a JSON envelope: `{"format": "tagteam-rescue", "version": 1, "accountId",
+    "loginEpoch", "predecessorFp", "credential"}`. `credential` holds the credential bytes
+    verbatim, as a UTF-8 string. `predecessorFp` is the fingerprint of the generation that was
+    sent, which is how the gate tells that a rescue succeeds the vault's current generation.
+    The filename's `<fp12>` is the successor's fingerprint.
+  - A rescue file that cannot be read or parsed makes the gate return `Transient` with kind
+    `rescue-unreadable`, without sending a request.
 - **`displaced/`** holds live credentials that were not ours, stashed before a switch
   overwrote them. The files are forensic and write-only. `tagteam displaced` lists them;
   `tagteam displaced --purge ID` deletes one.
@@ -577,7 +612,21 @@ Appendix A.4.
   not expired.
 - **Freshen before activation.** A target whose token expires within **10 min** is refreshed
   before it is activated. That is twice CC's buffer, so CC's own re-read under its lock aborts
-  its refresh rather than consuming the same generation.
+  its refresh rather than consuming the same generation. The refresh goes through the gate
+  (§7.3) after the target is resolved and before the switch takes `MutationGuard`. Auto-switch
+  acts on the gate's outcome as §11.2 step 10 says; a manual `switch` acts on it as follows:
+
+  | Gate outcome | Manual switch |
+  |---|---|
+  | Refreshed, or already refreshed by another process | Activate the new generation |
+  | Dead or `identity_conflict` | Quarantine the account (§7.4). A direct switch refuses and says to log in again. A bare rotation moves on to the next candidate |
+  | `Busy` | Proceed. The switch waits for the account lock, and its locked vault re-read picks up the other process's refresh |
+  | Transient (not rescued) or Systemic | Proceed with the vault's generation and a warning. Nothing was consumed, or it was lost either way; once the account is live, the gate leaves its refresh to CC (§7.3 step 2) |
+  | Transient with `rescued: true`, or `Unpersisted` | Refuse: the vault's generation has been consumed |
+  | `Owned` or `Conflict` | The matching §9.2 refusal: `interrupted-switch`, `session-owned` or `profile-conflict` |
+
+  A quarantined target is never refreshed (§7.4). If it would need freshening, a switch to it
+  is refused as Dead is. Otherwise it is activated with a warning that it needs a new login.
 
 ### 7.3 Refresh gate (stored tokens)
 
@@ -595,8 +644,9 @@ This procedure is the only place a stored refresh token is ever sent to the toke
 3. **Re-read the vault** (`Read<Credential>`).
    - `Unreadable` returns `Transient`. `Absent` returns `Transient` (the account was
      removed).
-   - If a `rescue/` entry for this account holds a successor of the current fingerprint, adopt
-     it: write it to the vault, verify, delete the rescue file, and use it.
+   - If a `rescue/` entry for this account holds a successor of the current fingerprint (its
+     `predecessorFp`, §6.3), adopt it: write it to the vault, verify, delete the rescue file,
+     and use it.
    - If the account's profile is quiescent, apply its provenance (§12.5). If the profile
      rotated since its seed, adopt its generation into the vault first. If provenance reports a
      conflict, return `Conflict` without making a request.
@@ -691,9 +741,22 @@ Refreshing from a degraded read is never allowed.
 
 `GET /api/oauth/profile` (Appendix A.5) resolves who owns a live access token. It is:
 
-- **advisory only**: a failure never blocks an operation and never raises an error
+- **advisory only**: a failure never blocks an operation and never raises an error. It
+  resolves to no answer and is logged at DEBUG
 - **never called while holding a lock**
 - **resolved** only when `account.uuid` is a non-empty string
+- **asked only where the answer can change the outcome:**
+  - by `switch`, when the live credential is not the outgoing account's vault generation (§9.4)
+  - by a self-switch whose live credential diverged from the vault (§9.2)
+  - by `add`, for an OAuth login (§10.1)
+  - by recovery, when fingerprints alone cannot decide a row or settle an entry it clears (§9.6)
+  - by the active-token refresh, when the live access token is still valid (§7.5)
+- **asked at most once per process for a given credential**, keyed by its fingerprint
+- **never asked without a token it can show.** The provider returns no answer, and sends no
+  request, for a credential that cannot be resolved. For Claude Code these are an expired
+  access token, a setup token (its only scope is `user:inference`) and an API key
+- **never asked by a metadata command** (`alias`, `disable`, `enable`, `move`), so those make no
+  network call (§9.6)
 
 ## 8. Usage
 
@@ -865,6 +928,10 @@ with its own locks and surface.
 Both credential locks are anchored at the secure-storage dir, not the config home; the two
 differ when `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set (Appendix A.1).
 
+When a switch or a recovery takes the three CC locks together, one 9 s budget covers all
+three. The active-token refresh takes the credential locks with that budget and, after its
+request, the config lock with a fresh 9 s budget (§7.5).
+
 The CC locks follow the `proper-lockfile` protocol:
 
 - `mkdir` acquires the lock.
@@ -902,7 +969,7 @@ These are decided before locking and re-checked afterwards.
   - With `--json`, return a no-op with reason `unmanaged-account`.
   - With `--force`, displace the live login and activate.
 - **Fewer than 2 switchable accounts**, for a bare `switch`: a no-op with reason
-  `only-one-account`.
+  `only-one-account`, counted as §9.3 says.
 - **Self-switch** (the target is the live account):
   - A no-op, unless the live credential diverged from the vault and the oracle resolved its
     owner. In that case, reconcile by running a full switch.
@@ -928,7 +995,18 @@ These are decided before locking and re-checked afterwards.
 | `switch <ACCOUNT>` | direct | — | Disabled accounts are allowed as explicit targets |
 
 "Switchable" means the account has a vault credential and an `identity_json`, and is not
-disabled. Every strategy works within one provider: a switch never crosses providers. `best` and `next-available` also exclude quarantined accounts.
+disabled or quarantined. A direct target needs only the credential and the `identity_json`:
+disabled accounts are allowed, and quarantined ones follow §7.2. Every strategy works within
+one provider: a switch never crosses providers.
+
+**Reading the vault lazily.** A bare `switch` counts its candidates from the store: enabled,
+unquarantined rows with an `identity_json`. With fewer than two, the result is
+`only-one-account`. Otherwise it walks the positions from the anchor and reads each account's
+vault only until it finds one with a credential. If the walk finds none, the result is again
+`only-one-account`. Under the locks, only the chosen account is read again.
+- An `Unreadable` vault met before the pick could have been the pick, so the switch fails and
+  names that account (position and label). Accounts after the pick are never read.
+- A Dead verdict while freshening the pick quarantines it, and the walk continues (§7.2).
 
 ### 9.4 Transaction
 
@@ -1067,12 +1145,26 @@ are checked in order:
 | Live credential (either auth axis) | Meaning | Action |
 |---|---|---|
 | The target's is present (`to_fp`), or the oracle resolves it to `to_id` | The switch landed; CC may have rotated the credential since | Finish forward: clear the other auth axis (§9.4 step 7), splice the target's `oauthAccount`, and commit (step 9) |
-| The outgoing one is present (`from_fp`), or the oracle resolves it to `from_id` | The switch never landed, or its credential rollback succeeded | Finish backward, without touching the credential: splice `from_identity` back into `oauthAccount` if it differs, and keep the store's active account |
+| The outgoing one is present (`from_fp`), or the oracle resolves it to `from_id` | The switch never landed, or its credential rollback succeeded | Finish backward, without touching the credential: splice `from_identity` back into `oauthAccount` if the live object names a different identity (by identity key; a CC-updated object for the same identity is kept), and keep the store's active account |
 | Anything else, including no credential on either axis | Undecidable. For example, CC rotated the credential while the oracle is unavailable; or it rotated it and then logged out, so absence does not prove the switch never published | Keep the row. Account-changing commands for the provider refuse with `interrupted-switch` until recovery can decide; `switch --force` resolves it by displacing any live credential and activating the chosen account. The vault is never re-activated on absence alone |
 
 **Account-changing commands** here are the ones that read or write credentials or the live
 login: `switch` (without `--force`), `add`, `add-token` and `remove`. `alias`, `disable`,
-`enable` and `move` change only store metadata and proceed regardless.
+`enable` and `move` change only store metadata and proceed regardless. They still attempt
+recovery, but from fingerprints alone: they never ask the oracle (§7.6).
+
+**What a forward finish does with the entries it clears.** Clearing the other auth axis follows
+§9.4 step 7's rule, with the generation the row journaled (`from_fp`) counting as settled. An
+entry holding any other generation is classified as §9.4 step 4 would classify it, but without
+the `Unresolved` capture:
+- If the pre-lock oracle resolved it to `from_id`, and its bytes have not changed since, it is
+  written to `from_id`'s vault under the account lock recovery already holds. §6.2 bounds the
+  write as it does `OursRotated`, and `account_uuid` is backfilled if NULL.
+- Otherwise it is displaced.
+
+The switch's `Unresolved` capture relies on the live login naming the outgoing account while
+the switch holds the locks. Recovery can run long after the crash, even after a re-login, so
+that inference no longer holds.
 
 **Forced-switch put-back.** An undecidable row is not discarded by `switch --force`: the forced
 switch's journal write replaces it (`INSERT OR REPLACE`) with a new row carrying the superseded
@@ -1825,8 +1917,14 @@ anything fails.
 - **The Keychain** is an in-memory fake by default. Tests marked `real_keychain` run the real
   `/usr/bin/security` against a temporary keychain made with `security create-keychain`; they
   run on macOS CI and never touch the login keychain.
-- **HTTP** goes to a local mock server that scripts responses: 200, 401, 429 with
-  `Retry-After`, `invalid_grant`, `invalid_client`, timeouts, and malformed bodies.
+- **HTTP** never leaves the machine in tests.
+  - Engine logic runs against a scripted in-process `Http` fake.
+  - The `ureq` adapter, and every cross-process test, run against a small `std::net` mock
+    server. It scripts 200, 401, 429 with `Retry-After`, `invalid_grant`, `invalid_client`,
+    timeouts, resets partway through a response, and malformed bodies, and it keeps one
+    request log that every process shares.
+  - Response bodies are recorded from the real endpoints and redacted before they are
+    committed: tokens, emails, uuids and organization names are replaced.
 - **The clock** is injected everywhere.
 
 ### 15.2 Layers
@@ -1868,9 +1966,11 @@ anything fails.
     more than 20 usage requests in a rolling hour.
   - **Fresh home:** a `run` against a home with no `projects/` or `history.jsonl` leaves both
     shared.
-- **Provider neutrality.** A test-only `FakeAgent` provider is registered alongside Claude Code.
-  It has its own home layout, credential format, lock and usage windows, and some capabilities
-  switched off. Its shapes differ from CC's on purpose: an identity with no email, credential
+- **Provider neutrality.** The test-only `FakeAgent` provider, in its own crate `tagteam-fake`
+  (§4.1), is registered alongside Claude Code. It has its own home layout, a file-based
+  credential store, a single live lock (its config lock is a no-op), refresh without a
+  managed-key axis, its own usage windows, and some capabilities switched off. It grows with
+  the trait: every trait method lands with its `FakeAgent` implementation. Its shapes differ from CC's on purpose: an identity with no email, credential
   kinds CC doesn't have, and no `Long` window. Engine tests run against both providers, and
   assert that:
   - positions, auto-switch state, leases and mappings stay per provider
