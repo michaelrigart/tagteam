@@ -534,6 +534,14 @@ only.
 - **Pending replacements first.** Every holder of an account lock first reconciles a pending
   explicit replacement for that account (§12.5), before it refreshes, captures, bootstraps or
   activates anything. Only the explicit commands `add`, `add-token` and `import` replace a login wholesale.
+- **Pending rescues before activation.** Anything that activates an account's vault
+  generation, whether a switch in either branch or a profile bootstrap, first settles that
+  account's `rescue/` entries under its account lock. A rescue has consumed the vault's
+  generation, so activating the vault alone would hand CC a used refresh token.
+  - A rescue whose `predecessorFp` is the vault's current fingerprint is adopted, as §7.3 step 3
+    adopts it, and the adopted generation is the one activated.
+  - If a rescue file for the account (named by its filename, §5) cannot be read or parsed, or
+    its adoption fails, the activation is refused.
 - **Deletes are strict.** Both generations are deleted on both backends. Errors propagate, and
   the deletion is verified with a tri-state read. A locked Keychain that still holds an item
   aborts the delete.
@@ -554,7 +562,8 @@ the Keychain's failure modes.
     sent, which is how the gate tells that a rescue succeeds the vault's current generation.
     The filename's `<fp12>` is the successor's fingerprint.
   - A rescue file that cannot be read or parsed makes the gate return `Transient` with kind
-    `rescue-unreadable`, without sending a request.
+    `rescue-unreadable`, without sending a request. It also blocks activating the account
+    until it is settled (§6.2).
 - **`displaced/`** holds live credentials that were not ours, stashed before a switch
   overwrote them. The files are forensic and write-only. `tagteam displaced` lists them;
   `tagteam displaced --purge ID` deletes one.
@@ -620,9 +629,9 @@ Appendix A.4.
   |---|---|
   | Refreshed, or already refreshed by another process | Activate the new generation |
   | Dead or `identity_conflict` | Quarantine the account (§7.4). A direct switch refuses and says to log in again. A bare rotation moves on to the next candidate |
-  | `Busy` | Proceed. The switch waits for the account lock, and its locked vault re-read picks up the other process's refresh |
-  | Transient (not rescued) or Systemic | Proceed with the vault's generation and a warning. Nothing was consumed, or it was lost either way; once the account is live, the gate leaves its refresh to CC (§7.3 step 2) |
-  | Transient with `rescued: true`, or `Unpersisted` | Refuse: the vault's generation has been consumed |
+  | `Busy` | Proceed. The switch waits for the account lock, and under it settles pending rescues (§6.2) and re-reads the vault, which picks up the other process's refresh whether it reached the vault or `rescue/` |
+  | Transient or Systemic, other than the rows below | Proceed with the vault's generation and a warning. Nothing was consumed, or it was lost either way; once the account is live, the gate leaves its refresh to CC (§7.3 step 2) |
+  | Transient with `rescued: true`, Transient `rescue-unreadable`, or `Unpersisted` | Refuse: the vault's generation has been consumed |
   | `Owned` or `Conflict` | The matching §9.2 refusal: `interrupted-switch`, `session-owned` or `profile-conflict` |
 
   A quarantined target is never refreshed (§7.4). If it would need freshening, a switch to it
@@ -1027,7 +1036,7 @@ here on.
    for the new pair. Taking one more account lock now could invert the lock order. After three
    attempts, abort.
 2. **Direct branch** (no live identity, unmanaged live login, or `--force`):
-   - Read the target from the vault.
+   - Settle the target's pending rescues (§6.2), then read it from the vault.
    - Read the live credential and config under step 3's rules.
    - Displace the live credential unless it is byte-identical to the target. A failed
      displacement aborts, except under `--force`.
@@ -1058,7 +1067,8 @@ here on.
    without a refresh token never replaces a vault credential that has one. It is displaced
    instead.
 
-5. **Compose the target credential.**
+5. **Compose the target credential.** The target's pending rescues are settled first (§6.2),
+   unless step 2 already did so.
    - The account-scoped keys come from the vault: `claudeAiOauth`, `trustedDeviceToken`, and
      unknown sibling keys.
    - The machine-shared keys come from the **live** credential (Appendix A.4), and so does
