@@ -99,8 +99,11 @@ Every task's requirements include these. Values are copied from the spec.
 - Only the refresh gate sends a stored refresh token (§7.3); only active-token refresh sends
   the live one (§7.5). A degraded credential can never reach either (a compile-time guarantee
   via `FreshCredential`).
-- A refresh-token successor tagteam receives is persisted to the vault or `rescue/`. If both
-  writes fail, the command reports `Unpersisted` (§1.1 criterion 2, §7.3).
+- A refresh-token successor tagteam receives is persisted to the vault or `rescue/`, or to
+  `displaced/` when the token endpoint says it belongs to another account; it never enters
+  that account's vault or `rescue/` (§7.3 step 6, §7.4). If every write fails, the command
+  reports `Unpersisted`, never a different error, and the gate quarantines the account
+  `successor_lost` (§1.1 criterion 2, §7.3, §7.4).
 - Every file that holds a secret is created 0600 at creation (`O_EXCL`, write, rename) and never
   chmod'ed afterwards. `rescue/` and `displaced/` files are always plain files (§5, §6.3).
 - Expired means `now_ms + 5 min ≥ expiresAt`; a non-numeric `expiresAt` counts as not expired.
@@ -526,13 +529,17 @@ pub fn login(env: &Env, handle: &str, workspace: &str, token: &str, renew: &str)
 
 ```rust
 // src/net.rs (Task 3)
-pub struct UreqHttp { /* ureq::Agent */ }
-impl UreqHttp { pub fn new() -> Self; }
+/// The host lookup that decides whether a DNS failure is `PreSend`; injectable so tests never
+/// ask a real resolver (§15.1).
+pub type Resolver = fn(&str, u16) -> io::Result<Vec<SocketAddr>>;
+pub struct UreqHttp { /* ureq::Agent, Resolver */ }
+impl UreqHttp { pub fn new() -> Self; pub fn with_resolver(resolver: Resolver) -> Self; }
 impl Http for UreqHttp;
 impl Default for UreqHttp;
-// UreqHttp resolves the host itself before calling ureq, so a DNS failure is a certain
-// `PreSend` (ureq reports it as a plain I/O error). It never follows redirects
-// (`max_redirects(0)`), so a token goes only where the provider sent it.
+// UreqHttp resolves the host itself (through its Resolver; `new()` uses the system one) before
+// calling ureq, so a DNS failure is a certain `PreSend` (ureq reports it as a plain I/O error).
+// It never follows redirects (`max_redirects(0)`), so a token goes only where the provider
+// sent it.
 
 // src/engine.rs (Task 3): EngineConfig and Engine gain the port
 pub struct EngineConfig { /* existing fields */ pub http: Arc<dyn Http> }
@@ -555,7 +562,7 @@ impl<O: Oracle> Oracle for CachingOracle<O>;
 
 // src/quarantine.rs (Task 9, which declares `pub mod quarantine`)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuarantineReason { InvalidGrant, NoRefreshToken, IdentityConflict }
+pub enum QuarantineReason { InvalidGrant, NoRefreshToken, IdentityConflict, SuccessorLost }
 impl QuarantineReason { pub fn as_str(self) -> &'static str; pub fn parse(s: &str) -> Option<Self>; }
 impl From<DeadReason> for QuarantineReason;
 impl Engine {
@@ -600,18 +607,35 @@ impl Engine {
         lock: &AccountLock, received: &mut Received<'_>) -> Persisted;
 }
 /// §7.4, Task 10: the token response named another account (a non-empty uuid that differs
-/// from a known one) or another organization (both non-empty and different).
+/// from a known one) or another organization (both non-empty and different); either alone.
 pub(crate) fn names_another_account(owner: &Identity, row: &AccountRow) -> bool;
-/// A received successor not yet persisted; dropped while armed (an early return or a panic)
-/// it writes itself to `rescue/`. No `Debug`.                                   // Task 11
+impl Engine {
+    /// A successor that belongs to another account, to `displaced/` (reason
+    /// `identity-conflict`, naming the response's owner).                   // Task 10
+    pub(crate) fn keep_foreign(&self, row: &AccountRow, successor: &[u8],
+        fp: Option<&Fingerprint>, owner: &Identity) -> Result<(), EngineError>;
+}
+/// A received successor not yet persisted; dropped while armed (a panic) it keeps itself.
+/// No `Debug`.                                                                  // Task 11
 pub(crate) struct Received<'e> { /* … */ }
-impl<'e> Received<'e> { pub(crate) fn new(engine: &'e Engine, p: &dyn Provider,
-    row: &AccountRow, predecessor_fp: &str, bytes: Vec<u8>) -> Self;
-    pub(crate) fn bytes(&self) -> &[u8]; pub(crate) fn fp(&self) -> &Fingerprint; }
+impl<'e> Received<'e> {
+    /// `foreign`: the response's owner when it names another account (§7.4); fixed at receipt.
+    pub(crate) fn new(engine: &'e Engine, p: &dyn Provider, row: &AccountRow,
+        predecessor_fp: &str, bytes: Vec<u8>, foreign: Option<Identity>) -> Self;
+    pub(crate) fn is_foreign(&self) -> bool;
+    /// `rescue/`, or `displaced/` for a foreign successor; disarms whatever the result.
+    pub(crate) fn keep(&mut self) -> Result<(), EngineError>;
+    pub(crate) fn bytes(&self) -> &[u8];                                     // Task 16
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Persisted { Vault, Rescued, Unpersisted }                      // Task 11
-// An identity_conflict quarantine is bound to the persisted successor's fingerprint: bound to
-// the sent one, keeping the successor would clear it at once.
+// An identity-conflicting successor is displaced, never written to the vault or rescue/, and
+// the identity_conflict quarantine is bound to the SENT fingerprint (the vault still holds it)
+// (§7.3 step 6, §7.4). Checked before any persistence, on both refresh paths.
+// Unpersisted also quarantines the account `successor_lost`, bound to the sent fingerprint,
+// best effort (§7.4); not when the vault had moved to a newer generation meanwhile.
+// Any error after receipt keeps the successor explicitly and returns the error, or returns
+// Unpersisted when keeping it fails (never the error).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnedBy { Live, Journal, Session }
 pub enum GateOutcome {
@@ -623,7 +647,7 @@ pub enum GateOutcome {
     Dead(QuarantineReason),      // quarantined, now or before
     Systemic(String),
     Transient { kind: String, rescued: bool },
-    Unpersisted,
+    Unpersisted,                 // every write failed; the account is quarantined successor_lost
 }
 // impl Debug for GateOutcome: never prints credential bytes.
 
@@ -637,15 +661,19 @@ pub enum ActiveOutcome {
     NotNeeded { reconciled: bool },
     /// The successor is in tagteam's storage and in the live store.
     Refreshed,
-    /// CC's locks were compromised when the response arrived: persisted to the vault or
-    /// `rescue/`, but not published; the next pass reconciles (§7.5 step 5).
+    /// Persisted to the vault or `rescue/`, but not published to the live store: CC's locks
+    /// were compromised when the response arrived, or a self-heal (or the live write) could not
+    /// take the config lock. Nothing further is sent; the next pass reconciles (§7.5 step 5).
     PersistedNotPublished,
-    Dead(QuarantineReason),
+    Dead(QuarantineReason),      // incl. a quarantine that still holds (§7.4): no request sent
     Systemic(String),
     Transient { kind: String },
-    Unpersisted,
+    Unpersisted,                 // takes precedence over a conflict or a compromised lock
 }
 impl Engine {
+    /// Unreadable vault, `.prev` or rescue reads refuse before any write or request. A pending
+    /// self-heal is published before the lineage advances (a second pass then refreshes). A
+    /// successor that belongs to another account is displaced, never stored or published.
     pub fn refresh_active(&self, provider: &ProviderId, trigger: ActiveTrigger)
         -> Result<ActiveOutcome, EngineError>;
 }
@@ -2080,7 +2108,9 @@ port it will hand to providers. Nothing calls it yet: the oracle (Task 7) and th
 plain `Error::Io`, indistinguishable from an I/O error after the request was sent. Resolving
 first, within the request's own timeout, makes a DNS failure a certain `PreSend`. The second
 lookup inside `ureq` is served by the OS cache. If it fails anyway (a race), the result is
-`Ambiguous`, which is the harmless direction.
+`Ambiguous`, which is the harmless direction. The lookup goes through an injectable
+`Resolver`, so the test of a failed lookup never asks the machine's real resolver (§15.1:
+tests never reach the network).
 
 **Files:**
 - Create: `crates/tagteam-engine/src/net.rs`
@@ -2099,6 +2129,8 @@ lookup inside `ureq` is served by the OS cache. If it fails anyway (a race), the
 - Produces:
   - `pub struct UreqHttp`, `UreqHttp::new() -> Self`, `impl Default`, `impl Http for UreqHttp`
     (in `tagteam_engine::net`)
+  - `pub type Resolver = fn(&str, u16) -> io::Result<Vec<SocketAddr>>` and
+    `UreqHttp::with_resolver(resolver: Resolver) -> Self` (`new()` uses the system resolver)
   - `EngineConfig { …, pub http: Arc<dyn Http> }`; `Engine` keeps it as
     `pub(crate) http: Arc<dyn Http>` and exposes `pub fn http(&self) -> &dyn Http`
   - the engine fixture's `Fx.http: Arc<ScriptedHttp>`, passed as `EngineConfig.http` and
@@ -2138,11 +2170,12 @@ Create `crates/tagteam-engine/tests/net.rs`:
 //! The production `Http` adapter against a local server (§4.4, §15.1): the User-Agent, the body
 //! cap, and which transport failures are `PreSend` and which `Ambiguous`.
 
-use std::net::TcpListener;
+use std::io;
+use std::net::{SocketAddr, TcpListener};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tagteam_engine::net::UreqHttp;
+use tagteam_engine::net::{Resolver, UreqHttp};
 use tagteam_provider::http::{MAX_BODY, USER_AGENT};
 use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Http, HttpError, HttpRequest};
@@ -2285,10 +2318,26 @@ fn a_refused_connection_is_pre_send() {
     assert!(is_pre_send(&r), "{r:?}");
 }
 
+/// A lookup that fails, injected so the machine's real resolver is never asked (§15.1).
+fn no_such_host(_: &str, _: u16) -> io::Result<Vec<SocketAddr>> {
+    Err(io::Error::new(io::ErrorKind::NotFound, "no such host"))
+}
+
+/// A lookup that answers with no address at all.
+fn no_addresses(_: &str, _: u16) -> io::Result<Vec<SocketAddr>> {
+    Ok(vec![])
+}
+
 #[test]
 fn a_host_that_does_not_resolve_is_pre_send() {
-    let r = UreqHttp::new().send(&HttpRequest::get("http://nonexistent.invalid/", T));
-    assert!(is_pre_send(&r), "{r:?}");
+    let server = MockServer::start();
+    server.on("GET", "/p", MockReply::Json { status: 200, body: json!({}) });
+    for resolver in [no_such_host as Resolver, no_addresses] {
+        let r = UreqHttp::with_resolver(resolver)
+            .send(&HttpRequest::get(format!("{}/p", server.base_url()), T));
+        assert!(is_pre_send(&r), "{r:?}");
+    }
+    assert_eq!(server.hits("GET", "/p"), 0, "nothing was sent");
 }
 ```
 
@@ -2306,7 +2355,7 @@ Create `crates/tagteam-engine/src/net.rs`:
 //! so the OS trust store (and a corporate TLS proxy's root) is honoured.
 
 use std::io;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -2317,14 +2366,28 @@ use tagteam_provider::http::{
 use ureq::Agent;
 use ureq::tls::{RootCerts, TlsConfig};
 
+/// Resolves a host and port to addresses. Injectable, so a test can fail a lookup without
+/// asking the machine's real resolver (§15.1).
+pub type Resolver = fn(&str, u16) -> io::Result<Vec<SocketAddr>>;
+
+fn system_resolver(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    Ok((host, port).to_socket_addrs()?.collect())
+}
+
 pub struct UreqHttp {
     agent: Agent,
+    resolver: Resolver,
 }
 
 impl UreqHttp {
     /// 4xx and 5xx are responses, not errors; redirects are never followed, so a request that
     /// carries a token is only ever sent where the provider addressed it.
     pub fn new() -> Self {
+        Self::with_resolver(system_resolver)
+    }
+
+    /// `new()`, with the lookup that decides whether a DNS failure is `PreSend` replaced.
+    pub fn with_resolver(resolver: Resolver) -> Self {
         let config = Agent::config_builder()
             .http_status_as_error(false)
             .max_redirects(0)
@@ -2337,6 +2400,7 @@ impl UreqHttp {
             .build();
         Self {
             agent: config.into(),
+            resolver,
         }
     }
 }
@@ -2384,7 +2448,7 @@ fn classify(e: ureq::Error) -> HttpError {
 /// Resolves the URL's host within `timeout`, so a DNS failure is a certain `PreSend`: `ureq`
 /// reports a failed lookup as a plain I/O error, which on its own could also have come after
 /// the request left.
-fn resolve(url: &str, timeout: Duration) -> Result<(), HttpError> {
+fn resolve(url: &str, timeout: Duration, resolver: Resolver) -> Result<(), HttpError> {
     let uri: ureq::http::Uri = url
         .parse()
         .map_err(|e| HttpError::PreSend(format!("invalid URL: {e}")))?;
@@ -2399,7 +2463,7 @@ fn resolve(url: &str, timeout: Duration) -> Result<(), HttpError> {
         .unwrap_or(if uri.scheme_str() == Some("http") { 80 } else { 443 });
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let _ = tx.send((host.as_str(), port).to_socket_addrs().map(Iterator::count));
+        let _ = tx.send(resolver(&host, port).map(|addrs| addrs.len()));
     });
     match rx.recv_timeout(timeout) {
         Ok(Ok(n)) if n > 0 => Ok(()),
@@ -2412,7 +2476,7 @@ fn resolve(url: &str, timeout: Duration) -> Result<(), HttpError> {
 impl Http for UreqHttp {
     fn send(&self, req: &HttpRequest) -> Result<HttpResponse, HttpError> {
         let started = Instant::now();
-        resolve(&req.url, req.timeout)?;
+        resolve(&req.url, req.timeout, self.resolver)?;
         let remaining = req.timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(HttpError::PreSend(
@@ -2522,7 +2586,7 @@ exists, and leave the rest to the `_` arm. That is the safe direction: anything 
 
 Run: `cargo test -p tagteam-engine --test net && cargo test -p tagteam-engine --lib net::`
 Expected: PASS, 9 integration tests and 1 unit test. `a_host_that_does_not_resolve_is_pre_send`
-passes offline and sandboxed alike: a blocked or failed lookup is an error either way.
+injects the failed lookup, so no test asks a real DNS resolver.
 
 - [ ] **Step 6: Give the engine its port**
 
@@ -3930,15 +3994,32 @@ mod tests {
     /// no matter how long the lock sits free between the background thread's retries — a
     /// microsecond or a second — unlike polling `exists()`, which can miss a window far
     /// narrower than its poll interval.
+    ///
+    /// The refresh lock being free proves nothing until the acquirer has actually tried it, so
+    /// the test first waits for evidence that it has: taking the refresh lock and releasing it on
+    /// the legacy contention (`mkdir`, then `rmdir`) changes the mtime of the directory holding
+    /// it. Without that, this thread could take the free lock before the acquirer ever ran.
     #[test]
     fn the_refresh_lock_is_actually_free_during_a_legacy_wait_not_only_after_it() {
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
         fs::create_dir(p.legacy_lock()).unwrap(); // CC holds it, freshly
+        let lock_dir = p.refresh_lock.parent().unwrap().to_path_buf();
+        let untouched = fs::metadata(&lock_dir).unwrap().modified().unwrap();
         let p2 = p.clone();
         // Generous on purpose: only this test's own deadline below is meant to be tight; this
         // just must outlast it plus the eventual release.
         let handle = thread::spawn(move || acquire_credentials(&p2, Duration::from_secs(30)));
+
+        let tried = Instant::now() + Duration::from_secs(10);
+        while fs::metadata(&lock_dir).unwrap().modified().unwrap() == untouched {
+            assert!(
+                Instant::now() < tried,
+                "the acquirer never reached the refresh lock"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(p.legacy_lock().is_dir(), "the legacy lock is still held: it is contended");
 
         let refresh_spec = MkdirLockSpec::new(p.refresh_lock.clone(), CRED_STALE, Duration::ZERO);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -5713,7 +5794,8 @@ test is pointed at a dead local port so nothing reaches the network.
   - `tagteam_cc::endpoints::{CLIENT_ID, Endpoints}` with `Endpoints::production()` and
     `Endpoints::with_base(base: &str)`, and `ClaudeCode::with_endpoints(self, Endpoints) -> Self`.
   - `tagteam_cc::oauth::{PROFILE_TIMEOUT, profile_request, parse_profile}`, plus the private
-    `owner_identity` helper, which Task 8 reuses for the token reply's owner.
+    `owner_identity` helper. Task 8's token reply uses its own `token_owner`, since a token reply
+    may name only an organization (§7.4), while the profile oracle needs the uuid (§7.6).
   - `Provider::resolve_owner(&self, http: &dyn Http, cred: &Credential, now_ms: i64) -> Option<Identity>`.
   - `tagteam_engine::oracle::{HttpOracle, CachingOracle}`.
   - `Engine::metadata_guard(&self) -> Result<MutationGuard, EngineError>` (`pub(crate)`),
@@ -7121,8 +7203,8 @@ names a new refresh token yields `Refreshed` even when the rest of it is incompl
   - Task 2: `tagteam_provider::http::{Http, HttpRequest, HttpResponse, HttpError, Method, ScriptedHttp}`
     (`HttpRequest::post_json(url, &Value, timeout)`, `HttpResponse::json()`).
   - Task 4: `tagteam_cc::shape::{access_token, scopes}`.
-  - Task 7: `tagteam_cc::endpoints::{CLIENT_ID, Endpoints}`, the private
-    `tagteam_cc::oauth::owner_identity`, `ClaudeCode`'s `endpoints` field, and `Fx::endpoints()`.
+  - Task 7: `tagteam_cc::endpoints::{CLIENT_ID, Endpoints}`, `ClaudeCode`'s `endpoints`
+    field, and `Fx::endpoints()`.
   - Task 6: `tagteam_fake::{FakeAgent, credential_json}`, `FakeAgent::renew_url()`.
   - Task 1: `token-200.json` (synthetic), `token-invalid-grant.json`, `token-invalid-client.json`.
 - Produces:
@@ -7131,7 +7213,9 @@ names a new refresh token yields `Refreshed` even when the rest of it is incompl
     `Debug`.
   - `Provider::refresh(&self, http: &dyn Http, cred: &FreshCredential, now_ms: i64, timeout: Duration) -> RefreshResult`.
   - `tagteam_cc::shape::{TokenFields, apply_refresh, refresh_token}`.
-  - `tagteam_cc::oauth::{TOKEN_TIMEOUT, refresh_request, parse_refresh}`.
+  - `tagteam_cc::oauth::{TOKEN_TIMEOUT, refresh_request, parse_refresh}`, and the
+    `pub(crate)` `token_owner`: a token reply names its owner by account uuid or by
+    organization alone (§7.4), unlike the profile oracle, which needs the uuid (§7.6).
   - `Fx::script_refresh(&self, new_rt: Option<&str>)`,
     `Fx::script_token_error(&self, status: u16, error: &str)`.
 
@@ -7590,6 +7674,35 @@ fn a_credential_without_a_refresh_token_is_dead_and_never_sent() {
 }
 
 #[test]
+fn an_organization_alone_names_the_owner() {
+    // §7.4: an organization that disagrees is a conflict even when the reply names no
+    // account, so the owner is built from the organization alone.
+    let r = parse_refresh(
+        &stored(),
+        Ok(reply(
+            200,
+            &json!({"access_token": "at-2", "refresh_token": "rt-2", "expires_in": 60,
+                    "organization": {"uuid": "org-other"}}),
+        )),
+        NOW,
+    );
+    let RefreshResult::Refreshed { owner, .. } = r else {
+        panic!("expected Refreshed");
+    };
+    let owner = owner.expect("the organization names an owner");
+    assert_eq!((owner.account_uuid.as_deref(), owner.org_uuid.as_str()), (None, "org-other"));
+    let r = parse_refresh(
+        &stored(),
+        Ok(reply(200, &json!({"access_token": "at-2", "refresh_token": "rt-2", "expires_in": 60}))),
+        NOW,
+    );
+    let RefreshResult::Refreshed { owner, .. } = r else {
+        panic!("expected Refreshed");
+    };
+    assert!(owner.is_none(), "a reply naming neither has no owner");
+}
+
+#[test]
 fn refresh_results_never_print_a_token() {
     let r = parse_refresh(
         &stored(),
@@ -7750,6 +7863,38 @@ pub fn refresh_request(
     HttpRequest::post_json(e.token.clone(), &body, timeout)
 }
 
+/// Who a token reply says owns the new token (Appendix A.5): its `account.uuid`,
+/// `account.email_address` and `organization.uuid`. Unlike the profile oracle (§7.6), either
+/// the account uuid or the organization alone is enough: §7.4 quarantines on an organization
+/// that disagrees even when the reply names no account. `None` only when it names neither.
+pub(crate) fn token_owner(body: &Value) -> Option<Identity> {
+    let text = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+    let uuid = text(&body["account"]["uuid"]);
+    let org_uuid = text(&body["organization"]["uuid"]);
+    if uuid.is_none() && org_uuid.is_none() {
+        return None;
+    }
+    let email = text(&body["account"]["email_address"]);
+    let org_name = text(&body["organization"]["name"]);
+    let org_uuid = org_uuid.unwrap_or_default();
+    Some(Identity {
+        label: email
+            .clone()
+            .or_else(|| uuid.clone())
+            .unwrap_or_else(|| org_uuid.clone()),
+        raw: json!({
+            "emailAddress": email,
+            "accountUuid": uuid,
+            "organizationUuid": org_uuid,
+            "organizationName": org_name,
+        }),
+        email,
+        org_uuid,
+        org_name,
+        account_uuid: uuid,
+    })
+}
+
 /// Whole seconds, whether the reply wrote them as an integer or a float.
 fn seconds(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
@@ -7829,11 +7974,7 @@ pub fn parse_refresh(
     let successor = shape::apply_refresh(old, &fields)
         .or_else(|_| shape::apply_refresh(b"{}", &fields))
         .expect("an empty object always accepts the token fields");
-    let owner: Option<Identity> = owner_identity(
-        &body["account"]["uuid"],
-        &body["account"]["email_address"],
-        &body["organization"],
-    );
+    let owner = token_owner(&body);
     RefreshResult::Refreshed { successor, owner }
 }
 ```
@@ -7998,20 +8139,17 @@ In `crates/tagteam-fake/src/provider.rs`, add to the imports
             fa["renew"] = json!(r);
         }
         fa["expires"] = json!(expires);
-        let owner = body["owner"]["uid"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(|uid| {
-                let workspace = body["owner"]["workspace"].as_str().unwrap_or_default();
-                Identity {
-                    label: uid.to_owned(),
-                    email: None,
-                    org_uuid: workspace.to_owned(),
-                    org_name: None,
-                    account_uuid: Some(uid.to_owned()),
-                    raw: json!({"uid": uid, "workspace": workspace}),
-                }
-            });
+        // Like Claude Code's (§7.4): the uid or the workspace alone names an owner.
+        let text = |k: &str| body["owner"][k].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+        let (uid, workspace) = (text("uid"), text("workspace"));
+        let owner = (uid.is_some() || workspace.is_some()).then(|| Identity {
+            label: uid.clone().or_else(|| workspace.clone()).unwrap_or_default(),
+            email: None,
+            org_uuid: workspace.clone().unwrap_or_default(),
+            org_name: None,
+            raw: json!({"uid": uid, "workspace": workspace}),
+            account_uuid: uid,
+        });
         RefreshResult::Refreshed {
             successor: serde_json::to_vec(&Value::Object(root)).expect("a Value always serializes"),
             owner,
@@ -8442,12 +8580,14 @@ mod tests {
             QuarantineReason::InvalidGrant,
             QuarantineReason::NoRefreshToken,
             QuarantineReason::IdentityConflict,
+            QuarantineReason::SuccessorLost,
         ] {
             assert_eq!(QuarantineReason::parse(r.as_str()), Some(r));
         }
         assert_eq!(QuarantineReason::InvalidGrant.as_str(), "invalid_grant");
         assert_eq!(QuarantineReason::NoRefreshToken.as_str(), "no_refresh_token");
         assert_eq!(QuarantineReason::IdentityConflict.as_str(), "identity_conflict");
+        assert_eq!(QuarantineReason::SuccessorLost.as_str(), "successor_lost");
         assert_eq!(QuarantineReason::parse("refresh failed"), None);
         assert_eq!(
             QuarantineReason::from(DeadReason::InvalidGrant),
@@ -8594,6 +8734,9 @@ pub enum QuarantineReason {
     InvalidGrant,
     NoRefreshToken,
     IdentityConflict,
+    /// A refresh received a successor and could store it nowhere (§7.3 `Unpersisted`): the
+    /// vault's generation is consumed (§7.4).
+    SuccessorLost,
 }
 
 impl QuarantineReason {
@@ -8602,6 +8745,7 @@ impl QuarantineReason {
             QuarantineReason::InvalidGrant => "invalid_grant",
             QuarantineReason::NoRefreshToken => "no_refresh_token",
             QuarantineReason::IdentityConflict => "identity_conflict",
+            QuarantineReason::SuccessorLost => "successor_lost",
         }
     }
 
@@ -8610,6 +8754,7 @@ impl QuarantineReason {
             QuarantineReason::InvalidGrant,
             QuarantineReason::NoRefreshToken,
             QuarantineReason::IdentityConflict,
+            QuarantineReason::SuccessorLost,
         ]
         .into_iter()
         .find(|r| r.as_str() == s)
@@ -8761,9 +8906,11 @@ mod tests {
         let id = AccountId::from_string("0192-acct");
         let succ = cred("rt-2", 9);
         let succ_fp = t.cc.fingerprint(&succ).unwrap();
+        // A real fingerprint: the parser accepts only the canonical `sha256:<64 hex>` form.
+        let pred = t.fp(&cred("rt-1", 9));
         let path = t
             .engine
-            .write_rescue(&id, 3, "sha256:pred", &succ, &succ_fp)
+            .write_rescue(&id, 3, &pred, &succ, &succ_fp)
             .unwrap();
         assert_eq!(
             path,
@@ -8778,7 +8925,7 @@ mod tests {
         assert_eq!(
             v,
             json!({"format": "tagteam-rescue", "version": 1, "accountId": "0192-acct",
-                "loginEpoch": 3, "predecessorFp": "sha256:pred",
+                "loginEpoch": 3, "predecessorFp": pred,
                 "credential": String::from_utf8(succ.clone()).unwrap()})
         );
         let got = entries(&t, &id);
@@ -8791,7 +8938,7 @@ mod tests {
                 got[0].predecessor_fp.as_str(),
                 &got[0].credential
             ),
-            (&path, &id, 3, "sha256:pred", &succ)
+            (&path, &id, 3, pred.as_str(), &succ)
         );
         t.engine.delete_rescue(&path).unwrap();
         assert!(entries(&t, &id).is_empty());
@@ -8812,7 +8959,8 @@ mod tests {
         let other = AccountId::from_string("other");
         let succ = cred("rt-2", 9);
         let fp = t.cc.fingerprint(&succ).unwrap();
-        t.engine.write_rescue(&other, 0, "sha256:p", &succ, &fp).unwrap();
+        let pred = t.fp(&cred("rt-1", 9));
+        t.engine.write_rescue(&other, 0, &pred, &succ, &fp).unwrap();
         let dir = t.env.data_dir().join("rescue");
         fs::write(dir.join("acct-0-truncated.json"), b"{\"format\":\"tagteam-res").unwrap();
         fs::write(
@@ -9214,7 +9362,7 @@ git commit -m "Add quarantine, rescue files and the single writer of a new gener
   - `Engine::persist_generation`, `Engine::quarantine`, `QuarantineReason` (with `parse`),
     `Engine::settle_rescues`, `EngineError::RescuePending`, the `rescue/<id>-…` file naming and
     `Fx::quarantine` (Task 9)
-  - `AccountLock::try_acquire`, `Engine::reconcile_replacement` (M1)
+  - `AccountLock::try_acquire`, `Engine::reconcile_replacement`, `displace::displace` (M1)
 - Produces:
   - `pub mod refresh` in `tagteam_engine`, with:
     - `pub enum GateOutcome` and `pub enum OwnedBy`, exactly as the Interface Contract lists
@@ -9225,18 +9373,26 @@ git commit -m "Add quarantine, rescue files and the single writer of a new gener
   - `refresh_stored` is `pub`, not `pub(crate)`. The integration tests in `tests/` call it; the
     CLI never does.
   - Hook points `gate-before-request` and `gate-after-response`
+  - `pub(crate) fn Engine::keep_foreign(&self, row: &AccountRow, successor: &[u8],
+    fp: Option<&Fingerprint>, owner: &Identity) -> Result<(), EngineError>`: a successor that
+    belongs to another account, to `displaced/`. Task 11's `Received::keep` calls it; Task 11
+    replaces this task's `displace_foreign` with its own foreign path.
   - `Fx::put_vault(&self, id, bytes)` and `Fx::expire_access(&self, id)`
   - Transient kinds this task produces: `vault-absent`, `vault-unreadable`,
     `rescue-unreadable`, `refresh-failed`, `not-refreshable`, plus `TransientKind::token()`'s
     `pre-send` / `ambiguous` / `http-<code>` / `bad-response`
 - Decisions this task fixes:
-  - **The identity conflict is persisted first, then quarantined.** A `Refreshed` response whose
-    owner names another account (§7.4) is still a successor tagteam received, and §7.3 says it
-    is never discarded. The gate persists it, then quarantines the account with reason
-    `identity_conflict`, bound to the successor's fingerprint (the one now in the vault), and
-    returns `Dead(IdentityConflict)`.
+  - **An identity-conflicting successor is displaced, never stored** (§7.3 step 6, §7.4). A
+    `Refreshed` response whose owner names another account delivered that account's token, not
+    this one's. It is checked before any persistence. The gate writes it to `displaced/` (reason
+    `identity-conflict`, naming the owner the response gave), never to this account's vault or
+    to `rescue/`, where a later switch could adopt it. The account is quarantined with reason
+    `identity_conflict`, bound to the fingerprint that was sent, which the vault still holds.
+    The gate returns `Dead(IdentityConflict)`. If the displacement fails, the successor is
+    lost: `Unpersisted`, with the quarantine still set.
   - A uuid is compared only when both sides know one; an organization only when both are
-    non-empty. A response that omits either never conflicts.
+    non-empty. Either alone is enough: a response naming only a different organization
+    conflicts (Task 8's `token_owner` builds the owner from either).
   - **An unreadable live identity counts as live.** It may be this account's login, and the gate
     never refreshes what might be the live token (§7.3 step 2).
   - **A quarantine reason that does not parse** is reported as `Dead(InvalidGrant)`: the account
@@ -9291,8 +9447,8 @@ use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::quarantine::QuarantineReason;
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
 use tagteam_engine::vault::SERVICE;
-use tagteam_provider::Keychain;
 use tagteam_provider::http::{HttpError, Method};
+use tagteam_provider::{Clock, Keychain};
 
 /// The gate on `id`, with the vault's current bytes as the caller's snapshot.
 fn gate(fx: &Fx, id: &AccountId) -> GateOutcome {
@@ -9518,10 +9674,33 @@ fn transport_failures_are_transient_and_change_nothing() {
     }
 }
 
+/// `a` as `due` makes it, but in organization `org-mine`, so an organization can disagree.
+fn due_in_org(fx: &Fx) -> AccountId {
+    common::splice_oauth_account(
+        &fx.paths().global_config,
+        &json!({"emailAddress": "a@x.co", "organizationUuid": "org-mine",
+                "organizationName": null, "accountUuid": "uuid-a@x.co"}),
+    );
+    fx.set_live_credential(Fx::credential_json("a@x.co", "rt-a").to_string().as_bytes());
+    let a = fx.engine.add_live(fx.add_options()).unwrap().account.id;
+    fx.add("b@x.co", "rt-b");
+    fx.expire_access(&a);
+    a
+}
+
+/// Every file in `displaced/`, parsed.
+fn displaced(fx: &Fx) -> Vec<Value> {
+    fx.displaced()
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect()
+}
+
 #[test]
-fn a_successor_naming_another_account_is_persisted_then_quarantined() {
+fn a_successor_naming_another_account_is_displaced_and_quarantined() {
     let fx = Fx::new();
     let a = due(&fx);
+    let sent = vault_fp(&fx, &a);
     fx.http.push_json(
         Method::Post,
         &Fx::endpoints().token,
@@ -9541,13 +9720,46 @@ fn a_successor_naming_another_account_is_persisted_then_quarantined() {
     ));
     assert_eq!(
         fx.vault_refresh_token(&a).as_deref(),
-        Some("rt-a2"),
-        "a received successor is never discarded (§7.3)"
+        Some("rt-a"),
+        "another account's token never enters this account's vault (§7.3 step 6)"
     );
     assert_eq!(
         quarantine_of(&fx, &a),
-        (Some("identity_conflict".into()), Some(vault_fp(&fx, &a)))
+        (Some("identity_conflict".into()), Some(sent)),
+        "bound to the generation that was sent, which the vault still holds"
     );
+    let kept = displaced(&fx);
+    assert_eq!(kept.len(), 1, "the successor is never discarded: it is displaced");
+    assert_eq!(kept[0]["claudeAiOauth"]["refreshToken"], "rt-a2");
+    assert!(
+        !fx.env.data_dir().join("rescue").exists(),
+        "never an adoptable rescue"
+    );
+}
+
+#[test]
+fn an_organization_alone_that_disagrees_is_a_conflict() {
+    // §7.4: either the uuid or the organization is enough; this reply names no account.
+    let fx = Fx::new();
+    let a = due_in_org(&fx);
+    let sent = vault_fp(&fx, &a);
+    fx.http.push_json(
+        Method::Post,
+        &Fx::endpoints().token,
+        200,
+        json!({"access_token": "at-a2", "refresh_token": "rt-a2", "expires_in": 28800,
+               "organization": {"uuid": "org-other"}}),
+    );
+    assert!(matches!(
+        gate(&fx, &a),
+        GateOutcome::Dead(QuarantineReason::IdentityConflict)
+    ));
+    assert_eq!(
+        quarantine_of(&fx, &a),
+        (Some("identity_conflict".into()), Some(sent))
+    );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    assert_eq!(displaced(&fx).len(), 1);
 }
 
 #[test]
@@ -9691,11 +9903,12 @@ In `crates/tagteam-engine/src/refresh.rs`, merge these imports with the ones Tas
 use std::fmt;
 use std::time::Duration;
 
-use tagteam_core::AccountId;
+use tagteam_core::{AccountId, Fingerprint};
 use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{Credential, Identity, Provider, Read};
 
 use crate::account_lock::AccountLock;
+use crate::displace::displace;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
@@ -9785,8 +9998,9 @@ fn fp_str(p: &dyn Provider, bytes: &[u8]) -> String {
 }
 
 /// §7.4 `identity_conflict`: the token response names another account. A uuid is compared
-/// only when both sides know one, and an organization only when both are non-empty, so a
-/// response that omits either never conflicts.
+/// only when both sides know one, and an organization only when both are non-empty; either
+/// disagreeing alone is a conflict. A successor that conflicts is displaced, never stored
+/// (§7.3 step 6).
 pub(crate) fn names_another_account(owner: &Identity, row: &AccountRow) -> bool {
     let uuid = match (
         owner.account_uuid.as_deref().filter(|u| !u.is_empty()),
@@ -9867,7 +10081,7 @@ impl Engine {
         let outcome = match p.refresh(self.http.as_ref(), &fresh, now, GATE_TIMEOUT) {
             RefreshResult::Refreshed { successor, owner } => {
                 hooks::point(self, "gate-after-response")?;
-                self.persist_refreshed(p, &row, &lock, successor, owner.as_ref())?
+                self.persist_refreshed(p, &row, &lock, &sent_fp, successor, owner.as_ref())?
             }
             other => {
                 hooks::point(self, "gate-after-response")?;
@@ -9945,28 +10159,74 @@ impl Engine {
         })
     }
 
-    /// A received successor: persisted, then checked against the account (§7.4). An identity
-    /// conflict is quarantined only after the successor is stored, bound to its fingerprint:
-    /// a successor tagteam received is never discarded (§7.3). Task 11 replaces this with the
-    /// compare-and-swap and rescue of step 6.
+    /// A received successor (§7.3 step 6). One the token endpoint says belongs to another
+    /// account (§7.4) is checked first, before anything is stored: it is displaced and the
+    /// account quarantined, and it never reaches this account's vault. Task 11 replaces the
+    /// rest with the compare-and-swap and rescue of step 6.
     fn persist_refreshed(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
         lock: &AccountLock,
+        sent_fp: &str,
         successor: Vec<u8>,
         owner: Option<&Identity>,
     ) -> Result<GateOutcome, EngineError> {
-        self.persist_generation(p, row, lock, &successor)?;
-        if owner.is_some_and(|o| names_another_account(o, row)) {
-            self.quarantine(
-                row,
-                QuarantineReason::IdentityConflict,
-                &fp_str(p, &successor),
-            )?;
-            return Ok(GateOutcome::Dead(QuarantineReason::IdentityConflict));
+        if let Some(owner) = owner.filter(|o| names_another_account(o, row)) {
+            return self.displace_foreign(p, row, sent_fp, &successor, owner);
         }
+        self.persist_generation(p, row, lock, &successor)?;
         Ok(GateOutcome::Refreshed(successor))
+    }
+
+    /// §7.3 step 6 and §7.4: a successor that belongs to another account is displaced, never
+    /// written to this account's vault or to `rescue/` (where a later switch could adopt it),
+    /// and the account is quarantined, bound to the generation that was sent, which the vault
+    /// still holds. If the displacement fails the successor is lost: `Unpersisted`, with the
+    /// quarantine still set.
+    pub(crate) fn displace_foreign(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        sent_fp: &str,
+        successor: &[u8],
+        owner: &Identity,
+    ) -> Result<GateOutcome, EngineError> {
+        let kept = self.keep_foreign(row, successor, p.fingerprint(successor).as_ref(), owner);
+        let quarantined = self.quarantine(row, QuarantineReason::IdentityConflict, sent_fp);
+        match (kept, quarantined) {
+            // A lost successor is reported first (§7.3 step 6).
+            (Err(e), _) => {
+                tracing::error!(
+                    position = row.position,
+                    account = %row.id,
+                    "a refreshed token that belongs to another account could not be kept: {e}"
+                );
+                Ok(GateOutcome::Unpersisted)
+            }
+            (Ok(()), Err(e)) => Err(e),
+            (Ok(()), Ok(())) => Ok(GateOutcome::Dead(QuarantineReason::IdentityConflict)),
+        }
+    }
+
+    /// Writes a successor that belongs to another account to `displaced/` (§6.3, reason
+    /// `identity-conflict`), naming the owner the token response gave.
+    pub(crate) fn keep_foreign(
+        &self,
+        row: &AccountRow,
+        successor: &[u8],
+        fp: Option<&Fingerprint>,
+        owner: &Identity,
+    ) -> Result<(), EngineError> {
+        displace(
+            self,
+            &row.provider,
+            successor,
+            fp,
+            "identity-conflict",
+            Some(&owner.raw),
+        )
+        .map(drop)
     }
 }
 ```
@@ -9974,10 +10234,10 @@ impl Engine {
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test gate`
-Expected: PASS, 17 tests.
+Expected: PASS, 18 tests.
 
 Run: `cargo test -p tagteam-engine --test gate`
-Expected: PASS, 15 tests (the `hooked` module compiles away).
+Expected: PASS, 16 tests (the `hooked` module compiles away).
 
 - [ ] **Step 7: Run the engine suite and clippy**
 
@@ -10009,18 +10269,24 @@ git commit -m "Add the refresh gate's lock, ownership, adoption and verdict"
     rescue envelope's field names (`predecessorFp`, `credential`) (Task 9)
   - `Engine::settle_rescues` adopting a rescue on the next pass (Task 9)
   - `Engine::persist_generation` (Task 9)
-  - `refresh_stored`, `GateOutcome`, `persist_refreshed` and `names_another_account` (Task 10)
+  - `refresh_stored`, `GateOutcome`, `persist_refreshed`, `displace_foreign`, `keep_foreign`
+    and `names_another_account` (Task 10)
+  - `QuarantineReason::SuccessorLost` (Task 9)
   - `Engine::fail_at` and `on_point` (M1, `test-hooks`)
 - Produces:
-  - Step 6 of §7.3 inside `refresh_stored`. `persist_refreshed` is replaced by
-    `persist_successor`, and the `Received` guard rescues a successor on any early return or
-    panic.
+  - Step 6 of §7.3 inside `refresh_stored`. `persist_refreshed` and `displace_foreign` are
+    replaced by `persist_successor`, `lose` and `abandon`. The `Received` guard keeps a
+    successor on any early return or panic.
   - Shared with active-token refresh (Task 16), all in `crate::refresh`:
     - `pub(crate) struct Received<'e>` with
-      `pub(crate) fn new(engine: &'e Engine, p: &dyn Provider, row: &AccountRow, predecessor_fp: &str, bytes: Vec<u8>) -> Self`
-      (Task 16 adds the `bytes()` and `fp()` accessors it needs, so nothing here is dead code);
+      `pub(crate) fn new(engine: &'e Engine, p: &dyn Provider, row: &AccountRow, predecessor_fp: &str, bytes: Vec<u8>, foreign: Option<Identity>) -> Self`,
+      `pub(crate) fn is_foreign(&self) -> bool` and
+      `pub(crate) fn keep(&mut self) -> Result<(), EngineError>` (`rescue/`, or `displaced/`
+      for a foreign successor). Task 16 adds the `bytes()` accessor it needs, so
+      nothing here is dead code;
     - `#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub(crate) enum Persisted { Vault, Rescued, Unpersisted }`;
-    - `pub(crate) fn Engine::persist_received(&self, p: &dyn Provider, row: &AccountRow, lock: &AccountLock, received: &mut Received<'_>) -> Persisted`.
+    - `pub(crate) fn Engine::persist_received(&self, p: &dyn Provider, row: &AccountRow, lock: &AccountLock, received: &mut Received<'_>) -> Persisted`
+      (never for a foreign successor).
   - The hook point `gate-before-vault-write`.
   - The Transient kinds `vault-write` and `vault-unreadable` with `rescued: true`.
   - `Fx::engine_with_vault(&self, vault: Vault) -> Engine`.
@@ -10036,10 +10302,22 @@ git commit -m "Add the refresh gate's lock, ownership, adoption and verdict"
   - **A failed `persist_generation` whose vault write landed is not a loss.** The vault is
     re-read, and if it holds the successor, the result is `Refreshed` and the metadata failure
     is logged at ERROR. Nothing is rescued.
-  - **A panic or early return after the response rescues the successor.** The `Received`
-    guard writes it to `rescue/` from `Drop`, so §1.1 criterion 2 holds for panics too. Only a
-    kill (SIGKILL) can lose a received successor, as §7.3 already accepts for a response lost in
-    flight.
+  - **An error after the response keeps the successor explicitly** (§7.3 step 6, as amended):
+    `abandon` writes it to `rescue/` (or `displaced/`) and returns the error. If that write
+    fails too, the gate returns `Unpersisted`, never the error, so the loss is always reported.
+    A panic is caught by the `Received` guard's `Drop`, which keeps it the same way. Only a kill
+    (SIGKILL), or a panic while `rescue/` is unwritable, loses a received successor with nothing
+    but a log line, as §7.3 already accepts for a response lost in flight.
+  - **A successor that belongs to another account is marked before anything else**
+    (`Received::new`'s `foreign`), so no path, `Drop` and `abandon` included, ever stores it in
+    this account's vault or in `rescue/`. It is displaced, and the account is quarantined
+    `identity_conflict`, bound to the fingerprint that was sent (Task 10's rule). A lost one is
+    reported as `Unpersisted`, which takes precedence over the conflict.
+  - **`Unpersisted` quarantines the account** (§7.4 `successor_lost`), bound to the fingerprint
+    that was sent: the vault's generation is consumed. This is best effort: a store write that
+    fails too is logged, and the loss is still reported. The one exception is the vault having
+    moved to a newer generation during the request: that generation was not consumed, so a loss
+    there quarantines nothing.
 
 - [ ] **Step 1: Add the fixture helper**
 
@@ -10062,6 +10340,7 @@ In `crates/tagteam-engine/tests/common/mod.rs`, add to `impl Fx`, after
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 use common::{Fx, vault_fp};
 use serde_json::{Value, json};
@@ -10110,10 +10389,26 @@ fn rescued_refresh_tokens(fx: &Fx) -> Vec<String> {
         .collect()
 }
 
-/// A `rescue/` that cannot be created: a plain file stands where the directory would.
+/// A `rescue/` that lists fine but cannot be written to (0500). The gate's step 3 still finds
+/// no rescue, so the request is sent; only the write after the response fails. (A plain file
+/// in its place would make step 3 report `rescue-unreadable` before any request.)
 fn block_rescue(fx: &Fx) {
-    fs::create_dir_all(fx.env.data_dir()).unwrap();
-    fs::write(fx.env.data_dir().join("rescue"), "not a directory").unwrap();
+    let dir = fx.env.data_dir().join("rescue");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+}
+
+/// Undoes `block_rescue`, so the temporary directory can be cleaned up.
+fn unblock_rescue(fx: &Fx) {
+    let dir = fx.env.data_dir().join("rescue");
+    if dir.is_dir() {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
+fn quarantine_of(fx: &Fx, id: &AccountId) -> (Option<String>, Option<String>) {
+    let row = fx.engine.store().unwrap().account(id).unwrap().unwrap();
+    (row.quarantine_reason, row.quarantine_fp)
 }
 
 /// A vault that stores `{}` whenever `target`'s current generation is written, as a Keychain
@@ -10192,9 +10487,10 @@ fn a_vault_that_stores_something_else_leaves_the_successor_in_rescue() {
 }
 
 #[test]
-fn both_writes_failing_is_reported_as_unpersisted() {
+fn both_writes_failing_is_reported_as_unpersisted_and_quarantines() {
     let fx = Fx::new();
     let a = due(&fx);
+    let sent = vault_fp(&fx, &a);
     let snapshot = fx.vault_bytes(&a).unwrap();
     fx.script_refresh(Some("rt-a2"));
     fx.kc.set_fail_write(SERVICE, true);
@@ -10203,7 +10499,14 @@ fn both_writes_failing_is_reported_as_unpersisted() {
         refresh(&fx, &a, &snapshot),
         GateOutcome::Unpersisted
     ));
+    unblock_rescue(&fx);
+    assert_eq!(fx.http.count(Method::Post, &Fx::endpoints().token), 1, "the request was sent");
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    assert_eq!(
+        quarantine_of(&fx, &a),
+        (Some("successor_lost".into()), Some(sent)),
+        "the vault's generation is consumed (§7.4 successor_lost)"
+    );
 }
 
 #[test]
@@ -10269,9 +10572,12 @@ mod hooked {
         PanicAfterResponse,
         ErrorBeforeVaultWrite,
         PanicBeforeVaultWrite,
+        /// An error after the response while `rescue/` is unwritable: the successor cannot be
+        /// kept, and the gate must say so rather than return the error.
+        ErrorAfterResponseRescueBlocked,
     }
 
-    const FAULTS: [Fault; 7] = [
+    const FAULTS: [Fault; 8] = [
         Fault::VaultWrite,
         Fault::VaultVerify,
         Fault::VaultAndRescue,
@@ -10279,11 +10585,12 @@ mod hooked {
         Fault::PanicAfterResponse,
         Fault::ErrorBeforeVaultWrite,
         Fault::PanicBeforeVaultWrite,
+        Fault::ErrorAfterResponseRescueBlocked,
     ];
 
     /// §15.3 "Refresh tokens" and §1.1 criterion 2: for every fault injected after the token
-    /// response is received, the successor ends up in the vault or in `rescue/`; when both
-    /// writes fail, the gate reports `Unpersisted`.
+    /// response is received, the successor ends up in the vault or in `rescue/`; when every
+    /// write fails, the gate reports `Unpersisted`, never the injected error.
     #[test]
     fn a_received_successor_is_never_discarded() {
         for fault in FAULTS {
@@ -10312,6 +10619,10 @@ mod hooked {
                 Fault::PanicBeforeVaultWrite => {
                     engine.fail_at(Some("panic:gate-before-vault-write"))
                 }
+                Fault::ErrorAfterResponseRescueBlocked => {
+                    engine.fail_at(Some("gate-after-response"));
+                    block_rescue(&fx);
+                }
             }
             let result = catch_unwind(AssertUnwindSafe(|| {
                 engine.refresh_stored(fx.cc.as_ref(), &a, &snapshot)
@@ -10323,10 +10634,46 @@ mod hooked {
                 kept || unpersisted,
                 "{fault:?}: the successor was discarded ({result:?})"
             );
-            if matches!(fault, Fault::VaultAndRescue) {
+            if matches!(
+                fault,
+                Fault::VaultAndRescue | Fault::ErrorAfterResponseRescueBlocked
+            ) {
                 assert!(unpersisted, "{fault:?}: {result:?}");
             }
+            unblock_rescue(&fx);
         }
+    }
+
+    /// §7.3 step 6 and §7.4: a successor the response says belongs to another account is never
+    /// an adoptable rescue, even when an error interrupts the gate before it could be
+    /// displaced. It is displaced instead, the account quarantined, and the error returned.
+    #[test]
+    fn a_foreign_successor_is_displaced_never_rescued_even_when_interrupted() {
+        let fx = Fx::new();
+        let a = due(&fx);
+        let sent = vault_fp(&fx, &a);
+        let snapshot = fx.vault_bytes(&a).unwrap();
+        fx.http.push_json(
+            Method::Post,
+            &Fx::endpoints().token,
+            200,
+            json!({"access_token": "at-a2", "refresh_token": "rt-a2", "expires_in": 28800,
+                   "account": {"uuid": "uuid-someone-else"}}),
+        );
+        fx.engine.fail_at(Some("gate-after-response"));
+        assert!(
+            fx.engine
+                .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
+                .is_err(),
+            "the injected error is returned once the successor is kept"
+        );
+        assert!(rescues(&fx).is_empty(), "never an adoptable rescue");
+        assert_eq!(fx.displaced().len(), 1, "displaced instead");
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+        assert_eq!(
+            quarantine_of(&fx, &a),
+            (Some("identity_conflict".into()), Some(sent))
+        );
     }
 }
 ```
@@ -10340,6 +10687,8 @@ Expected: FAIL.
   the test's `.unwrap()` panics (`vault write failed` / `the vault entry did not read back as
   written`).
 - `a_received_successor_is_never_discarded` fails at `Fault::VaultWrite`.
+- `a_foreign_successor_is_displaced_never_rescued_even_when_interrupted` fails: Task 10 returns
+  the injected error before anything keeps the successor, so nothing is displaced.
 - `a_response_without_a_refresh_token_keeps_the_lineage` already passes: `persist_generation`
   keeps `.prev` on an unchanged fingerprint (Task 9).
 
@@ -10349,66 +10698,77 @@ In `crates/tagteam-engine/src/rescue.rs`, remove the `#[cfg_attr(not(test), allo
 Task 9 (Step 9) put on `write_rescue`, if it is there: the `Received` guard below calls it. After
 this step no Task 9 item carries that attribute.
 
-In `crates/tagteam-engine/src/refresh.rs`, add to the imports:
-
-```rust
-use std::path::PathBuf;
-
-use tagteam_core::Fingerprint;
-```
-
-Add, above `impl Engine` (next to `names_another_account`):
+In `crates/tagteam-engine/src/refresh.rs` (Task 10's imports already bring in
+`Fingerprint` and `Identity`), add, above `impl Engine` (next to `names_another_account`):
 
 ```rust
 /// A successor a refresh has received and not yet persisted: the gate's (§7.3) and the
 /// active-token refresh's (§7.5, Task 16). §7.3's rule is that it is never discarded: dropped
-/// while still armed, by an early return through `?` or by a panic, it writes itself to
-/// `rescue/`. It holds a secret, so it has no `Debug`.
+/// while still armed, by a panic or an early return, it keeps itself (`keep`). It holds a
+/// secret, so it has no `Debug`.
 pub(crate) struct Received<'e> {
     engine: &'e Engine,
-    id: AccountId,
-    position: u32,
-    login_epoch: i64,
+    row: AccountRow,
     predecessor_fp: String,
     bytes: Vec<u8>,
     fp: Fingerprint,
+    /// The owner the response named, when it is another account (§7.4). Such a successor is
+    /// kept in `displaced/`, never in this account's vault or in `rescue/`.
+    foreign: Option<Identity>,
     armed: bool,
 }
 
 impl<'e> Received<'e> {
     /// Arms the guard. Build it the moment the response is parsed, before any fallible step.
+    /// `foreign` is the response's owner when `names_another_account` says it is not this
+    /// account; it is fixed here, so no later path can store the successor as this account's.
     pub(crate) fn new(
         engine: &'e Engine,
         p: &dyn Provider,
         row: &AccountRow,
         predecessor_fp: &str,
         bytes: Vec<u8>,
+        foreign: Option<Identity>,
     ) -> Self {
         let fp = p
             .fingerprint(&bytes)
             .unwrap_or_else(|| Fingerprint::of_secret(&bytes));
         Self {
             engine,
-            id: row.id.clone(),
-            position: row.position,
-            login_epoch: row.login_epoch,
+            row: row.clone(),
             predecessor_fp: predecessor_fp.to_owned(),
             bytes,
             fp,
+            foreign,
             armed: true,
         }
     }
 
-    /// One attempt at `rescue/`. It disarms whatever the result, so `Drop` never repeats it.
-    fn rescue(&mut self) -> Result<PathBuf, EngineError> {
+    /// Whether the response said the successor belongs to another account (§7.4).
+    pub(crate) fn is_foreign(&self) -> bool {
+        self.foreign.is_some()
+    }
+
+    /// One attempt to keep the successor outside the vault: `rescue/`, or `displaced/` when it
+    /// belongs to another account (§7.3 step 6). It disarms whatever the result, so `Drop`
+    /// never repeats it.
+    pub(crate) fn keep(&mut self) -> Result<(), EngineError> {
         self.armed = false;
-        self.engine.write_rescue(
-            &self.id,
-            self.login_epoch,
-            &self.predecessor_fp,
-            &self.bytes,
-            &self.fp,
-        )
+        match &self.foreign {
+            Some(owner) => self
+                .engine
+                .keep_foreign(&self.row, &self.bytes, Some(&self.fp), owner),
+            None => self
+                .engine
+                .write_rescue(
+                    &self.row.id,
+                    self.row.login_epoch,
+                    &self.predecessor_fp,
+                    &self.bytes,
+                    &self.fp,
+                )
+                .map(drop),
+        }
     }
 
     fn disarm(&mut self) {
@@ -10421,15 +10781,16 @@ impl Drop for Received<'_> {
         if !self.armed {
             return;
         }
-        match self.rescue() {
-            Ok(_) => tracing::error!(
-                position = self.position,
-                account = %self.id,
-                "a refresh was interrupted before its token was stored; the token was kept in rescue/"
+        let (position, id) = (self.row.position, self.row.id.clone());
+        match self.keep() {
+            Ok(()) => tracing::error!(
+                position,
+                account = %id,
+                "a refresh was interrupted before its token was stored; the token was kept outside the vault"
             ),
             Err(e) => tracing::error!(
-                position = self.position,
-                account = %self.id,
+                position,
+                account = %id,
                 "a refresh was interrupted and its token was lost: {e}"
             ),
         }
@@ -10447,31 +10808,14 @@ pub(crate) enum Persisted {
     Unpersisted,
 }
 
-/// Both writes failed (§7.3 step 6). Logged here, naming the account by position and ID; the
+/// Every write failed (§7.3 step 6). Logged here, naming the account by position and ID; the
 /// caller's refusal or notice carries it to the user.
 fn log_lost(row: &AccountRow, e: &EngineError) {
     tracing::error!(
         position = row.position,
         account = %row.id,
-        "a refreshed token was lost: neither the vault nor rescue/ could store it: {e}"
+        "a refreshed token was lost: nothing could store it: {e}"
     );
-}
-
-fn lost(row: &AccountRow, e: &EngineError) -> GateOutcome {
-    log_lost(row, e);
-    GateOutcome::Unpersisted
-}
-
-/// The vault could not take the successor, so `rescue/` does. The vault's generation is
-/// consumed, so the caller must not activate it (§7.3 step 6).
-fn rescue_instead(row: &AccountRow, received: &mut Received<'_>, kind: &str) -> GateOutcome {
-    match received.rescue() {
-        Ok(_) => GateOutcome::Transient {
-            kind: kind.to_owned(),
-            rescued: true,
-        },
-        Err(e) => lost(row, &e),
-    }
 }
 ```
 
@@ -10480,7 +10824,7 @@ In `refresh_stored`, replace the `Refreshed` arm:
 ```rust
             RefreshResult::Refreshed { successor, owner } => {
                 hooks::point(self, "gate-after-response")?;
-                self.persist_refreshed(p, &row, &lock, successor, owner.as_ref())?
+                self.persist_refreshed(p, &row, &lock, &sent_fp, successor, owner.as_ref())?
             }
 ```
 
@@ -10488,22 +10832,34 @@ with:
 
 ```rust
             RefreshResult::Refreshed { successor, owner } => {
-                // From here on the successor is never discarded (§7.3): `received` writes it to
-                // `rescue/` if this returns early or unwinds before it is persisted.
-                let mut received = Received::new(self, p, &row, &sent_fp, successor);
-                hooks::point(self, "gate-after-response")?;
-                self.persist_successor(p, &row, &lock, &sent_fp, &mut received, owner.as_ref())?
+                // §7.4: a successor the response says belongs to another account is marked
+                // first, so no path, `Drop` included, ever stores it as this account's.
+                let foreign = owner.filter(|o| names_another_account(o, &row));
+                // From here on the successor is never discarded (§7.3): `received` keeps it if
+                // this unwinds, and `abandon` if an error returns early.
+                let mut received = Received::new(self, p, &row, &sent_fp, successor, foreign);
+                let persisted = hooks::point(self, "gate-after-response").and_then(|()| {
+                    self.persist_successor(p, &row, &lock, &sent_fp, &mut received)
+                });
+                match persisted {
+                    Ok(outcome) => outcome,
+                    Err(e) if received.armed => self.abandon(&row, &sent_fp, &mut received, e)?,
+                    Err(e) => return Err(e),
+                }
             }
 ```
 
-Replace the whole `persist_refreshed` method with these two methods. `persist_received` is the
-step both refresh paths share (Task 16 reuses it); `persist_successor` is the gate's, around it.
+Replace the `persist_refreshed` and `displace_foreign` methods (Task 10) with these four.
+`persist_received` is the step both refresh paths share (Task 16 reuses it); `persist_successor`,
+`lose` and `abandon` are the gate's, around it. `keep_foreign` stays: `Received::keep` calls it.
 
 ```rust
     /// §7.3 step 6 and §7.5 step 5: the received successor goes to the vault, or to `rescue/`
     /// when the vault cannot take it. A failed `persist_generation` whose vault write landed is
     /// no loss: the metadata failure is logged and the result is `Vault`. `received` is
-    /// disarmed whatever the result, so its `Drop` never writes a second copy.
+    /// disarmed whatever the result, so its `Drop` never writes a second copy. A successor that
+    /// belongs to another account never comes here: its caller keeps it with
+    /// `Received::keep` (§7.4).
     pub(crate) fn persist_received(
         &self,
         p: &dyn Provider,
@@ -10511,6 +10867,7 @@ step both refresh paths share (Task 16 reuses it); `persist_successor` is the ga
         lock: &AccountLock,
         received: &mut Received<'_>,
     ) -> Persisted {
+        debug_assert!(!received.is_foreign(), "a foreign successor is never stored");
         let Err(e) = self.persist_generation(p, row, lock, &received.bytes) else {
             received.disarm();
             return Persisted::Vault;
@@ -10530,8 +10887,8 @@ step both refresh paths share (Task 16 reuses it); `persist_successor` is the ga
             account = %row.id,
             "the vault could not store a refreshed token: {e}"
         );
-        match received.rescue() {
-            Ok(_) => Persisted::Rescued,
+        match received.keep() {
+            Ok(()) => Persisted::Rescued,
             Err(e) => {
                 log_lost(row, &e);
                 Persisted::Unpersisted
@@ -10539,10 +10896,10 @@ step both refresh paths share (Task 16 reuses it); `persist_successor` is the ga
         }
     }
 
-    /// §7.3 step 6: persists a received successor, compare-and-swap style, then checks it
-    /// against the account (§7.4). Every path ends with the successor in the vault, in
-    /// `rescue/`, or reported as `Unpersisted`. An identity conflict is quarantined only after
-    /// the successor is stored, bound to its fingerprint.
+    /// §7.3 step 6 for the gate: a successor that belongs to another account is displaced and
+    /// the account quarantined; any other is persisted compare-and-swap style. Every path ends
+    /// with the successor in the vault, in `rescue/` or `displaced/`, or reported as
+    /// `Unpersisted`.
     fn persist_successor(
         &self,
         p: &dyn Provider,
@@ -10550,8 +10907,20 @@ step both refresh paths share (Task 16 reuses it); `persist_successor` is the ga
         lock: &AccountLock,
         sent_fp: &str,
         received: &mut Received<'_>,
-        owner: Option<&Identity>,
     ) -> Result<GateOutcome, EngineError> {
+        if received.is_foreign() {
+            let kept = received.keep();
+            let quarantined = self.quarantine(row, QuarantineReason::IdentityConflict, sent_fp);
+            return match (kept, quarantined) {
+                // A lost successor is reported first (§7.3 step 6).
+                (Err(e), _) => {
+                    log_lost(row, &e);
+                    Ok(GateOutcome::Unpersisted)
+                }
+                (Ok(()), Err(e)) => Err(e),
+                (Ok(()), Ok(())) => Ok(GateOutcome::Dead(QuarantineReason::IdentityConflict)),
+            };
+        }
         // Every vault writer holds the account lock, so this comparison cannot fail; it stays
         // as a defence.
         match self.vault.read(&row.id) {
@@ -10562,40 +10931,104 @@ step both refresh paths share (Task 16 reuses it); `persist_successor` is the ga
                     account = %row.id,
                     "the vault moved while its refresh was in flight; the successor was kept in rescue/"
                 );
-                return Ok(match received.rescue() {
-                    Ok(_) => GateOutcome::AlreadyFresh(now),
-                    Err(e) => lost(row, &e),
+                // The vault moved on to a generation this refresh did not consume, so losing
+                // the successor here quarantines nothing.
+                return Ok(match received.keep() {
+                    Ok(()) => GateOutcome::AlreadyFresh(now),
+                    Err(e) => {
+                        log_lost(row, &e);
+                        GateOutcome::Unpersisted
+                    }
                 });
             }
             Read::Absent | Read::Unreadable(_) => {
-                return Ok(rescue_instead(row, received, "vault-unreadable"));
+                return Ok(match received.keep() {
+                    Ok(()) => GateOutcome::Transient {
+                        kind: "vault-unreadable".into(),
+                        rescued: true,
+                    },
+                    Err(e) => {
+                        log_lost(row, &e);
+                        self.lose(row, sent_fp)
+                    }
+                });
             }
         }
         hooks::point(self, "gate-before-vault-write")?;
-        match self.persist_received(p, row, lock, received) {
-            Persisted::Vault => {}
-            Persisted::Rescued => {
-                return Ok(GateOutcome::Transient {
-                    kind: "vault-write".into(),
-                    rescued: true,
-                });
-            }
+        Ok(match self.persist_received(p, row, lock, received) {
+            Persisted::Vault => GateOutcome::Refreshed(std::mem::take(&mut received.bytes)),
+            Persisted::Rescued => GateOutcome::Transient {
+                kind: "vault-write".into(),
+                rescued: true,
+            },
             // Already logged by `persist_received`.
-            Persisted::Unpersisted => return Ok(GateOutcome::Unpersisted),
+            Persisted::Unpersisted => self.lose(row, sent_fp),
+        })
+    }
+
+    /// §7.4 `successor_lost`: the successor is gone and the vault's generation, the one sent,
+    /// is consumed. Quarantines the account, bound to it, best effort: when the store cannot
+    /// record that either, the loss is only reported.
+    fn lose(&self, row: &AccountRow, sent_fp: &str) -> GateOutcome {
+        if let Err(e) = self.quarantine(row, QuarantineReason::SuccessorLost, sent_fp) {
+            tracing::error!(
+                position = row.position,
+                account = %row.id,
+                "could not quarantine an account whose refreshed token was lost: {e}"
+            );
         }
-        let successor = std::mem::take(&mut received.bytes);
-        if owner.is_some_and(|o| names_another_account(o, row)) {
-            self.quarantine(row, QuarantineReason::IdentityConflict, received.fp.as_str())?;
-            return Ok(GateOutcome::Dead(QuarantineReason::IdentityConflict));
+        GateOutcome::Unpersisted
+    }
+
+    /// §7.3 step 6: an error after the response was received, before the successor was
+    /// stored. The successor is kept first (`Received::keep`) and the error returned; if
+    /// keeping it fails too, the loss is reported as `Unpersisted` instead of the error. A
+    /// successor that belongs to another account still quarantines the account (§7.4), best
+    /// effort.
+    fn abandon(
+        &self,
+        row: &AccountRow,
+        sent_fp: &str,
+        received: &mut Received<'_>,
+        cause: EngineError,
+    ) -> Result<GateOutcome, EngineError> {
+        let foreign = received.is_foreign();
+        let kept = received.keep();
+        if foreign {
+            if let Err(e) = self.quarantine(row, QuarantineReason::IdentityConflict, sent_fp) {
+                tracing::error!(
+                    position = row.position,
+                    account = %row.id,
+                    "could not quarantine an account whose refreshed token belongs to another account: {e}"
+                );
+            }
         }
-        Ok(GateOutcome::Refreshed(successor))
+        match kept {
+            Ok(()) => Err(cause),
+            Err(e) => {
+                log_lost(row, &e);
+                tracing::error!(
+                    position = row.position,
+                    account = %row.id,
+                    "the refresh failed after its token was received: {cause}"
+                );
+                Ok(if foreign {
+                    GateOutcome::Unpersisted
+                } else {
+                    self.lose(row, sent_fp)
+                })
+            }
+        }
     }
 ```
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test gate_persist --test gate`
-Expected: PASS: 6 tests in `gate_persist`, and Task 10's 17 in `gate` still pass.
+Expected: PASS: 7 tests in `gate_persist`, and Task 10's 18 in `gate` still pass
+(`a_successor_naming_another_account_is_displaced_and_quarantined` and
+`an_organization_alone_that_disagrees_is_a_conflict` now go through `persist_successor`'s
+foreign path).
 
 - [ ] **Step 6: Run the engine suite and clippy**
 
@@ -10683,7 +11116,7 @@ and append this test to the `hooked` module:
 ```
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test gate_persist a_vault_writer_waits`
-Expected: PASS (1 test).
+Expected: PASS (1 test; 8 in `gate_persist` in all).
 
 - [ ] **Step 8: Commit**
 
@@ -11284,6 +11717,7 @@ use common::{Fx, journal, vault_fp};
 use tagteam_core::AccountId;
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::vault::SERVICE;
+use tagteam_provider::Provider;
 
 fn credential(email: &str, rt: &str) -> Vec<u8> {
     Fx::credential_json(email, rt).to_string().into_bytes()
@@ -11491,7 +11925,11 @@ The manual-switch table in §7.2 decides what each gate outcome does:
 | `Owned`, `Conflict` | The matching §9.2 refusal |
 
 A quarantined target is never refreshed (§7.4). One that would need freshening is refused like
-Dead. Otherwise it is activated with a warning.
+Dead. Otherwise it is activated with a warning. The same rule applies to a target quarantined
+*while this switch waited for its account lock*: a concurrent refresh that lost its successor
+quarantines it `successor_lost` (§7.3 step 6, §7.4). §9.4 step 1 (amended) re-reads the
+target's quarantine under the locks, so the switch never activates the generation that refresh
+spent.
 
 **Readings of the spec this task commits to:**
 - **`--force` still freshens.** §7.2 makes no exception for it, and a forced switch still
@@ -11509,7 +11947,7 @@ Dead. Otherwise it is activated with a warning.
 
 **Files:**
 - Modify: `crates/tagteam-engine/src/switch.rs` (`Plan.warnings`, `freshen_plan`, `freshen`,
-  `switch`, `transact`)
+  `switch`, `rederive`, `Locked.warnings`, `transact`)
 - Modify: `crates/tagteam-engine/src/error.rs` (`EngineError::NeedsRelogin` and its kind)
 - Create: `crates/tagteam-engine/tests/freshen.rs`
 
@@ -11526,7 +11964,7 @@ Dead. Otherwise it is activated with a warning.
   - `EngineError::NeedsRelogin { position: u32, label: String }`, kind `"relogin-required"`
   - `SwitchOutcome.warnings` carries freshen warnings, each worded exactly:
     - `could not refresh <label> first (<kind or detail>); Claude Code will refresh it when it is online`
-    - `<label> (position <N>) needs a new login: its refresh token was rejected; it works only until its current access token expires`
+    - `<label> (position <N>) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires`
   - `const FRESHEN_WINDOW_MS: i64 = 600_000` (private to `switch.rs`)
 
 - [ ] **Step 1: Pin the new error kind (failing)**
@@ -11554,6 +11992,7 @@ after the `IdentityConflict` entry:
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::thread;
 use std::time::Duration;
 
@@ -11684,6 +12123,46 @@ fn a_busy_gate_lets_the_switch_wait_for_the_other_refresh() {
 }
 
 #[test]
+fn a_target_quarantined_while_the_switch_waits_is_never_activated_spent() {
+    // Codex round 1: another process's gate holds a's account lock, spends rt-a, and can store
+    // the successor nowhere (§7.3 `Unpersisted`), so it quarantines a `successor_lost`. This
+    // switch got `Busy`, waited for the lock, and must not activate the spent rt-a: §9.4 step 1
+    // re-reads the quarantine under the lock and applies §7.2's quarantined-target rule.
+    for due in [true, false] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        if due {
+            fx.expire_access(&a);
+        }
+        let held = AccountLock::acquire(&fx.env, &a, Duration::from_secs(1)).unwrap();
+        let spent = vault_fp(&fx, &a);
+        let (fx_ref, a_ref) = (&fx, &a);
+        let result = thread::scope(|s| {
+            s.spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                fx_ref.quarantine(a_ref, "successor_lost", &spent);
+                drop(held);
+            });
+            fx.switch_to(&a, false)
+        });
+        assert_eq!(token_requests(&fx), 0, "due: {due}");
+        if due {
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), "relogin-required", "{err}");
+            assert_eq!(fx.live_email().as_deref(), Some("b@x.co"), "the spent rt-a is never activated");
+        } else {
+            // Its access token still works: activated, with §7.2's warning.
+            let out = result.unwrap();
+            assert_eq!(
+                out.warnings,
+                ["a@x.co (position 1) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires"]
+            );
+            assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+        }
+    }
+}
+
+#[test]
 fn offline_the_switch_proceeds_with_the_vault_generation_and_a_warning() {
     // Review Focus 1, and the other transient kinds.
     let replies: [(Result<(), HttpError>, &str); 3] = [
@@ -11751,13 +12230,23 @@ fn an_unpersisted_successor_refuses_the_switch_and_asks_for_a_new_login() {
     fx.expire_access(&a);
     fx.script_refresh(Some("rt-a-2"));
     fx.kc.set_fail_write(SERVICE, true);
-    // `rescue/` cannot be created: a plain file sits where the directory would go.
-    fs::create_dir_all(fx.env.data_dir()).unwrap();
-    fs::write(fx.env.data_dir().join("rescue"), b"").unwrap();
+    // `rescue/` lists fine but cannot be written to (0500), so the gate still sends the
+    // request, then has nowhere to keep the successor. (A plain file in its place would stop
+    // the gate at step 3, before any request.)
+    let dir = fx.env.data_dir().join("rescue");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
     let err = fx.switch_to(&a, false).unwrap_err();
     fx.kc.set_fail_write(SERVICE, false);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(err.kind(), "relogin-required", "{err}");
     assert!(err.to_string().contains("can no longer be used"), "{err}");
+    assert_eq!(token_requests(&fx), 1, "the request was sent");
+    assert_eq!(
+        quarantine_of(&fx, &a).as_deref(),
+        Some("successor_lost"),
+        "the spent generation is quarantined (§7.4)"
+    );
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
 }
 
@@ -11787,7 +12276,7 @@ fn a_quarantined_target_works_until_its_access_token_expires() {
     let out = fx.switch_to(&a, false).unwrap();
     assert_eq!(
         out.warnings,
-        ["a@x.co (position 1) needs a new login: its refresh token was rejected; it works only until its current access token expires"]
+        ["a@x.co (position 1) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires"]
     );
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
 
@@ -11834,7 +12323,8 @@ variant exists, `freshen.rs` fails in:
 - `a_quarantined_target…`: no warning, and the second half succeeds.
 
 `no_request_is_made_outside_the_window…` and `a_busy_gate…` pass already. They pin that the
-fix adds no request.
+fix adds no request. `a_target_quarantined_while_the_switch_waits…` fails in both halves: the
+switch activates a without re-reading its quarantine.
 
 - [ ] **Step 4: Add `EngineError::NeedsRelogin`**
 
@@ -11933,7 +12423,7 @@ fn cannot_refresh(label: &str, why: &str) -> String {
 
 fn works_until_expiry(target: &AccountRow) -> String {
     format!(
-        "{} (position {}) needs a new login: its refresh token was rejected; it works only until its current access token expires",
+        "{} (position {}) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires",
         target.label, target.position
     )
 }
@@ -12126,10 +12616,91 @@ and the `Rederived::Done` arm becomes:
                 }
 ```
 
-- [ ] **Step 8: Run the tests to verify they pass**
+- [ ] **Step 8: Re-read the target's quarantine under the locks (§9.4 step 1, amended)**
+
+A refresh that finished while this switch waited for the target's account lock may have
+quarantined it (§7.4 `successor_lost`). `rederive` runs under every lock, so it re-reads the
+row there. A target quarantined since planning follows §7.2's rule: a rotation plans again
+(the walk skips it); a direct target is refused when it would need freshening, and otherwise
+activated with the warning. No request is made here: the mutation lock is held (§4.3).
+
+In `crates/tagteam-engine/src/switch.rs`, `struct Locked` gains a field:
+
+```rust
+/// The live login and the rows the plan was made for, re-read under every lock.
+struct Locked {
+    live_identity: Option<Identity>,
+    target: AccountRow,
+    outgoing: Option<AccountRow>,
+    /// What the locked re-read decided to tell the user (§9.4 step 1).
+    warnings: Vec<String>,
+}
+```
+
+In `fn rederive`, after
+
+```rust
+        let Some(target) = store.account(&plan.target.id)? else {
+            return Ok(Rederived::Replan);
+        };
+```
+
+insert:
+
+```rust
+        // §9.4 step 1 (amended): a refresh that finished while this switch waited for the
+        // target's account lock may have quarantined it (§7.4 `successor_lost`). A target
+        // quarantined since planning follows §7.2's quarantined-target rule: a rotation plans
+        // again, and the walk skips it.
+        let mut warnings = Vec::new();
+        if target.quarantine_reason.is_some() && plan.target.quarantine_reason.is_none() {
+            if matches!(req.target, SwitchTarget::Rotation) {
+                return Ok(Rederived::Replan);
+            }
+            let vault = self.read_target(&target)?;
+            let due = p
+                .access_expires_at(&vault)
+                .is_some_and(|at| self.now_ms() + FRESHEN_WINDOW_MS >= at);
+            if due {
+                return Err(needs_relogin(&target));
+            }
+            warnings.push(works_until_expiry(&target));
+        }
+```
+
+and the `Rederived::Go` literal at its end becomes:
+
+```rust
+            Rederived::Go(Locked {
+                live_identity,
+                target,
+                outgoing: again,
+                warnings,
+            })
+```
+
+In `fn transact`, the destructuring becomes
+
+```rust
+        let Locked {
+            live_identity,
+            target,
+            outgoing,
+            warnings: locked_warnings,
+        } = locked;
+```
+
+and the line Step 5 wrote, `let mut warnings = plan.warnings.clone();`, becomes:
+
+```rust
+        let mut warnings = plan.warnings.clone();
+        warnings.extend(locked_warnings);
+```
+
+- [ ] **Step 9: Run the tests to verify they pass**
 
 Run: `cargo test -p tagteam-engine --lib error && cargo test -p tagteam-engine --test freshen`
-Expected: PASS (12 tests in `freshen.rs`).
+Expected: PASS (13 tests in `freshen.rs`).
 
 Run: `cargo test -p tagteam-engine`
 Expected: PASS. The other suites' accounts carry `expiresAt: 1_790_003_600_000`, an hour after
@@ -12138,7 +12709,7 @@ the fixture clock, so nothing enters the freshen window and no suite gains a req
 Run: `cargo clippy -p tagteam-engine --all-targets --features test-hooks -- -D warnings`
 Expected: no warnings.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add crates/tagteam-engine/src/switch.rs crates/tagteam-engine/src/error.rs \
@@ -12647,7 +13218,7 @@ the live credential belongs to someone else.
 - Modify: `crates/tagteam-engine/src/lib.rs` (add `pub mod active;`)
 - Modify: `crates/tagteam-engine/src/error.rs` (the `ForeignLiveCredential` variant, its
   kind, and its row in `kind_is_pinned_for_every_variant`)
-- Modify: `crates/tagteam-engine/src/refresh.rs` (two accessors on Task 11's `Received`)
+- Modify: `crates/tagteam-engine/src/refresh.rs` (an accessor on Task 11's `Received`)
 - Test: `crates/tagteam-engine/tests/active.rs`
 
 **Interfaces:**
@@ -12663,11 +13234,12 @@ the live credential belongs to someone else.
     `EngineError::RescuePending`.
   - Task 10: `crate::refresh::names_another_account(owner, row)`: the identity-conflict rule
     both refresh paths share (uuid compared only when both sides know one, org only when both
-    are non-empty).
-  - Task 11: `crate::refresh::{Received, Persisted}` and
+    are non-empty; either alone is a conflict).
+  - Task 11: `crate::refresh::{Received, Persisted}` (`Received::new(…, foreign)`,
+    `Received::is_foreign`, `Received::keep`) and
     `Engine::persist_received(p, row, lock, &mut Received) -> Persisted`: the vault → `rescue/`
-    → `Unpersisted` step both refresh paths share, with the guard that rescues a received
-    successor on any early return or panic.
+    → `Unpersisted` step both refresh paths share, with the guard that keeps a received
+    successor on a panic, and displaces one that belongs to another account (§7.4).
   - Task 13: `Fx::plant_rescue(&self, id, predecessor_fp: &str, successor: &[u8]) -> PathBuf`.
   - Task 14: `EngineError::NeedsRelogin { position, label }`.
   - M1: `switch::{Held, OracleHint, answer_for, refuse_unreadable}`,
@@ -12678,12 +13250,28 @@ the live credential belongs to someone else.
 - Produces:
   - `tagteam_engine::active::{ActiveTrigger, ActiveOutcome, ACTIVE_REFRESH_TIMEOUT}`.
   - `Engine::refresh_active(&ProviderId, ActiveTrigger) -> Result<ActiveOutcome, EngineError>`.
-  - `Received::bytes(&self) -> &[u8]` and `Received::fp(&self) -> &Fingerprint`
-    (`pub(crate)`, in `refresh.rs`).
+  - `Received::bytes(&self) -> &[u8]` (`pub(crate)`, in `refresh.rs`).
   - `EngineError::ForeignLiveCredential { position: u32 }`, kind `foreign-credential`.
   - Hook points `active-before-request` (before the token request) and
     `active-after-response` (after a successor is received and guarded, before the lock
     re-check).
+- Decisions this task fixes (Codex round 1):
+  - **A quarantined generation is never sent again** (§7.4): the quarantine holds while the
+    live credential or the vault carries the fingerprint it is bound to. Checked under the
+    locks, before reconciliation and any request.
+  - **Every read reconciliation decides on is tri-state.** An unreadable vault, `.prev` or
+    rescue refuses before any write or request. An unreadable `.prev` may be the generation
+    that tells an unpublished earlier pass apart from a CC rotation.
+  - **A pending self-heal is published before the lineage advances.** When reconciliation
+    selects a recovered generation the live store does not hold yet, it is published first,
+    whether or not it then needs a refresh. If that publication fails, the operation stops with
+    `PersistedNotPublished`, never `NotNeeded`, and sends nothing. Publishing releases CC's
+    credential locks with the config lock, so a refresh still needed afterwards runs in a second
+    pass, from a fresh re-read under freshly taken locks.
+  - **A successor that belongs to another account is displaced, never stored or published**
+    (§7.3 step 6, §7.4, as the gate does), and the account is quarantined, bound to the
+    fingerprint that was sent. A lost successor is reported as `Unpersisted` in preference to
+    the conflict or to a compromised lock.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -12694,6 +13282,7 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
 
 use common::Fx;
 use serde_json::{Value, json};
@@ -13009,11 +13598,8 @@ fn when_both_writes_fail_the_loss_is_reported_and_the_live_store_still_holds_it(
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
 }
 
-#[test]
-fn a_token_response_naming_another_account_quarantines_it_and_keeps_the_successor() {
-    let fx = Fx::new();
-    let a = fx.add("a@x.co", "rt-a");
-    expire_live(&fx);
+/// A 200 token reply whose owner is another account (§7.4).
+fn reply_for_someone_else(fx: &Fx) {
     fx.http.push_json(
         Method::Post,
         &Fx::endpoints().token,
@@ -13024,16 +13610,143 @@ fn a_token_response_naming_another_account_quarantines_it_and_keeps_the_successo
             "organization": {"uuid": ""}
         }),
     );
+}
+
+#[test]
+fn a_token_response_naming_another_account_is_displaced_never_stored_or_published() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let sent = fp(&fx, &cred("a@x.co", "rt-a"));
+    expire_live(&fx);
+    reply_for_someone_else(&fx);
 
     let out = active(&fx, ActiveTrigger::Expired).unwrap();
 
     assert_eq!(out, ActiveOutcome::Dead(QuarantineReason::IdentityConflict));
-    assert_eq!(quarantine_reason(&fx, &a).as_deref(), Some("identity_conflict"));
+    let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
+    assert_eq!(row.quarantine_reason.as_deref(), Some("identity_conflict"));
+    assert_eq!(row.quarantine_fp.as_deref(), Some(sent.as_str()), "bound to the generation sent");
     assert_eq!(
         fx.vault_refresh_token(&a).as_deref(),
-        Some("rt-z"),
-        "a received successor is never discarded"
+        Some("rt-a"),
+        "another account's token never enters this account's vault (§7.3 step 6)"
     );
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"), "nor the live store");
+    let kept: Vec<Value> = fx
+        .displaced()
+        .iter()
+        .map(|b| serde_json::from_slice(b).unwrap())
+        .collect();
+    assert_eq!(kept.len(), 1, "the successor is never discarded: it is displaced");
+    assert_eq!(kept[0]["claudeAiOauth"]["refreshToken"], "rt-z");
+    assert_eq!(rescue_files(&fx), 0);
+}
+
+#[test]
+fn a_lost_conflicting_successor_is_reported_as_unpersisted() {
+    // Persistence loss takes precedence over the conflict (§7.3 step 6).
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    expire_live(&fx);
+    reply_for_someone_else(&fx);
+    let dir = fx.env.data_dir().join("displaced");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let out = active(&fx, ActiveTrigger::Expired).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(out, ActiveOutcome::Unpersisted);
+    assert_eq!(quarantine_reason(&fx, &a).as_deref(), Some("identity_conflict"));
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+}
+
+#[test]
+fn a_quarantined_active_token_is_never_sent_again() {
+    // §7.4: after `invalid_grant`, the quarantine is bound to the live (and vault) generation,
+    // so a second call sends nothing.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    expire_live(&fx);
+    fx.script_token_error(400, "invalid_grant");
+    for _ in 0..2 {
+        assert_eq!(
+            active(&fx, ActiveTrigger::Expired).unwrap(),
+            ActiveOutcome::Dead(QuarantineReason::InvalidGrant)
+        );
+    }
+    assert_eq!(token_requests(&fx), 1, "the quarantined generation is never sent again");
+}
+
+#[test]
+fn an_unreadable_prev_refuses_before_any_write_or_request() {
+    // Live A, vault B, `.prev` unreadable. `.prev` may be A (an earlier pass never published
+    // B), so A must not be adopted over B as if CC had rotated it.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.kc.put(SERVICE, a.as_str(), &cred("a@x.co", "rt-b"));
+    fx.kc.put(SERVICE, &format!("{a}.prev"), &cred("a@x.co", "rt-a"));
+    fx.kc.set_unreadable(SERVICE, &format!("{a}.prev"), true);
+    expire_live(&fx);
+
+    let err = active(&fx, ActiveTrigger::Expired).unwrap_err();
+
+    assert_eq!(err.kind(), "unreadable", "{err}");
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-b"), "B is never overwritten");
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    assert_eq!(token_requests(&fx), 0);
+}
+
+/// Live A, vault B and `.prev` A: an earlier pass persisted B but never published it. B's
+/// access token expires at `b_expires`.
+fn unpublished_b(fx: &Fx, a: &AccountId, b_expires: i64) {
+    let mut b = Fx::credential_json("a@x.co", "rt-b");
+    b["claudeAiOauth"]["expiresAt"] = json!(b_expires);
+    fx.kc.put(SERVICE, a.as_str(), &bytes(&b));
+    fx.kc.put(SERVICE, &format!("{a}.prev"), &cred("a@x.co", "rt-a"));
+}
+
+#[test]
+fn an_expired_recovered_generation_is_published_before_it_is_refreshed() {
+    // B is published first (the self-heal), then refreshed to C in a second pass, so the live
+    // store never falls two generations behind.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    unpublished_b(&fx, &a, fx.clock.now_ms());
+    fx.script_refresh(Some("rt-c"));
+
+    let out = active(&fx, ActiveTrigger::Expired).unwrap();
+
+    assert_eq!(out, ActiveOutcome::Refreshed);
+    let sent: Value =
+        serde_json::from_slice(fx.http.requests()[0].body.as_deref().unwrap()).unwrap();
+    assert_eq!(sent["refresh_token"], "rt-b", "the recovered generation is the one sent");
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-c"));
+    assert_eq!(prev_refresh_token(&fx, &a).as_deref(), Some("rt-b"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-c"));
+    assert_eq!(token_requests(&fx), 1);
+}
+
+#[test]
+fn a_self_heal_that_cannot_publish_sends_nothing_and_says_so() {
+    // CC holds its config lock, so B cannot reach the live store. Whether or not B needs a
+    // refresh, nothing is sent, and the outcome is `PersistedNotPublished`, never `NotNeeded`.
+    for b_expired in [true, false] {
+        let fx = Fx::with_lock_timeout(Duration::from_millis(300));
+        let a = fx.add("a@x.co", "rt-a");
+        let now = fx.clock.now_ms();
+        unpublished_b(&fx, &a, if b_expired { now } else { now + 3_600_000 });
+        fs::create_dir(fx.paths().config_lock).unwrap(); // CC holds it, freshly
+
+        let out = active(&fx, ActiveTrigger::Expired).unwrap();
+        fs::remove_dir(fx.paths().config_lock).unwrap();
+
+        assert_eq!(out, ActiveOutcome::PersistedNotPublished, "B expired: {b_expired}");
+        assert_eq!(token_requests(&fx), 0, "B expired: {b_expired}");
+        assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"), "B expired: {b_expired}");
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-b"), "B expired: {b_expired}");
+    }
 }
 
 #[test]
@@ -13196,11 +13909,6 @@ impl Received<'_> {
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-
-    /// The successor's fingerprint, which an identity-conflict quarantine binds to (§7.4).
-    pub(crate) fn fp(&self) -> &Fingerprint {
-        &self.fp
-    }
 }
 ```
 
@@ -13291,72 +13999,148 @@ impl Engine {
         let (row, live) = self.active_login(p, provider)?;
         let hint = self.corroborate(p, &row, &live)?;
 
-        // Step 1.
+        // Step 1: the mutation lock and the account lock, held throughout.
         let guard = self.guard_or_refuse(provider)?;
         let lock = self.lock_account(&row.id)?;
-        let cred = p.lock_credentials(&self.env, &guard, p.live_lock_budget())?;
+        // At most two passes. Publishing a recovered generation (step 3's self-heal) releases
+        // CC's credential locks along with the config lock, so a refresh that is still needed
+        // afterwards runs in a second pass, from a fresh re-read under freshly taken locks. That
+        // pass finds the live store in step with the vault, so it never publishes again.
+        for _pass in 0..2 {
+            let cred = p.lock_credentials(&self.env, &guard, p.live_lock_budget())?;
 
-        // Step 2: the same account, read fresh, now that CC cannot rotate it.
-        let (row, live) = self.active_login(p, provider)?;
-        if &row.id != lock.id() {
-            return Err(EngineError::LiveMoved);
-        }
-
-        // Step 3.
-        let rec = self.reconcile_active(p, &row, &lock, &live, hint.as_ref())?;
-
-        // Step 4: a request only if the newest generation still needs one.
-        let now = self.now_ms();
-        let rejected = match &trigger {
-            ActiveTrigger::Rejected { access_fp } => p
-                .access_fingerprint(&rec.current)
-                .is_some_and(|f| f.as_str() == access_fp),
-            ActiveTrigger::Expired => false,
-        };
-        if !rejected && !expired(p, &rec.current, now) {
-            if rec.publish {
-                self.publish(p, &row, cred, &rec.current, &rec.retire)?;
+            // Step 2: the same account, read fresh, now that CC cannot rotate it.
+            let (row, live) = self.active_login(p, provider)?;
+            if &row.id != lock.id() {
+                return Err(EngineError::LiveMoved);
             }
-            return Ok(ActiveOutcome::NotNeeded {
-                reconciled: rec.changed,
-            });
-        }
+            // §7.4: a quarantined generation is never sent again.
+            if let Some(reason) = self.active_quarantine(p, &row, &live)? {
+                return Ok(ActiveOutcome::Dead(reason));
+            }
 
-        // Step 5.
+            // Step 3.
+            let rec = self.reconcile_active(p, &row, &lock, &live, hint.as_ref())?;
+
+            // Step 4: a request only if the newest generation still needs one.
+            let now = self.now_ms();
+            let rejected = match &trigger {
+                ActiveTrigger::Rejected { access_fp } => p
+                    .access_fingerprint(&rec.current)
+                    .is_some_and(|f| f.as_str() == access_fp),
+                ActiveTrigger::Expired => false,
+            };
+            let needed = rejected || expired(p, &rec.current, now);
+            if rec.publish {
+                // The self-heal comes first, needed or not: advancing the lineage again before
+                // the live store caught up would leave it two generations behind, where no
+                // later pass could tell its generation from a CC rotation.
+                if !self.publish(p, &row, cred, &rec.current, &rec.retire)? {
+                    return Ok(ActiveOutcome::PersistedNotPublished);
+                }
+                if needed {
+                    continue;
+                }
+                return Ok(ActiveOutcome::NotNeeded { reconciled: true });
+            }
+            if !needed {
+                return Ok(ActiveOutcome::NotNeeded {
+                    reconciled: rec.changed,
+                });
+            }
+
+            // Step 5.
+            return self.request_active(p, &row, &lock, cred, &rec, now);
+        }
+        Err(EngineError::LiveMoved)
+    }
+
+    /// §7.4: the active account's quarantine holds while the live credential or the vault
+    /// still carries the generation it is bound to (a quarantine with no bound generation
+    /// always holds). Such a token is never sent again.
+    fn active_quarantine(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        live: &[u8],
+    ) -> Result<Option<QuarantineReason>, EngineError> {
+        let Some(reason) = &row.quarantine_reason else {
+            return Ok(None);
+        };
+        let reason = QuarantineReason::parse(reason).unwrap_or(QuarantineReason::InvalidGrant);
+        let Some(bound) = &row.quarantine_fp else {
+            return Ok(Some(reason));
+        };
+        let carries = |b: &[u8]| p.fingerprint(b).is_some_and(|f| f.as_str() == bound);
+        let vault_carries = match self.vault.read(&row.id) {
+            Read::Present(v) => carries(&v),
+            Read::Absent => false,
+            Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
+        };
+        Ok((carries(live) || vault_carries).then_some(reason))
+    }
+
+    /// §7.5 step 5: the request under CC's credential locks only (6 s), then persistence, then
+    /// the live write under the config lock.
+    fn request_active(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        lock: &AccountLock,
+        cred: CredLocks<'_>,
+        rec: &Reconciled,
+        now: i64,
+    ) -> Result<ActiveOutcome, EngineError> {
         cred.check_owned()?;
         hooks::point(self, "active-before-request")?;
         let sent = p.fingerprint(&rec.current);
+        let sent_fp = sent.as_ref().map(Fingerprint::as_str).unwrap_or_default();
         let fresh = Credential::fresh(rec.current.clone())
             .into_fresh()
             .expect("a credential built fresh is fresh");
-        let result = p.refresh(&*self.http, &fresh, now, ACTIVE_REFRESH_TIMEOUT);
-        match result {
+        match p.refresh(&*self.http, &fresh, now, ACTIVE_REFRESH_TIMEOUT) {
             RefreshResult::Refreshed { successor, owner } => {
-                // From here on the successor is never discarded (§7.3): `received` writes it to
-                // `rescue/` if anything below returns early or unwinds before it is persisted.
-                let sent_fp = sent.as_ref().map(Fingerprint::as_str).unwrap_or_default();
-                let mut received = Received::new(self, p, &row, sent_fp, successor);
-                hooks::point(self, "active-after-response")?;
+                // §7.4: a successor the response says belongs to another account is marked
+                // first (Task 11's rule): it is displaced, never stored or published.
+                let foreign = owner.filter(|o| names_another_account(o, row));
+                // From here on the successor is never discarded (§7.3): `received` keeps it if
+                // anything below unwinds before it is stored.
+                let mut received = Received::new(self, p, row, sent_fp, successor, foreign);
+                if let Err(e) = hooks::point(self, "active-after-response") {
+                    // As the gate does (Task 11): keep it, and report a loss, not the error.
+                    return match received.keep() {
+                        Ok(()) => Err(e),
+                        Err(_) => Ok(ActiveOutcome::Unpersisted),
+                    };
+                }
+                if received.is_foreign() {
+                    let kept = received.keep();
+                    let quarantined =
+                        self.quarantine(row, QuarantineReason::IdentityConflict, sent_fp);
+                    return match (kept, quarantined) {
+                        // A lost successor is reported first (§7.3 step 6).
+                        (Err(_), _) => Ok(ActiveOutcome::Unpersisted),
+                        (Ok(()), Err(e)) => Err(e),
+                        (Ok(()), Ok(())) => {
+                            Ok(ActiveOutcome::Dead(QuarantineReason::IdentityConflict))
+                        }
+                    };
+                }
                 let owned = cred.check_owned().is_ok();
                 // Task 11's shared step: the vault, else `rescue/`, else reported as lost.
-                let persisted = self.persist_received(p, &row, &lock, &mut received);
+                let persisted = self.persist_received(p, row, lock, &mut received);
                 // CC must hold the newest generation whatever became of tagteam's copy.
-                let published =
-                    owned && self.publish(p, &row, cred, received.bytes(), &rec.retire)?;
-                // The gate's rule (§7.4, Task 10): quarantined after the successor is stored,
-                // bound to the successor's fingerprint, since the successor is what is kept.
-                if owner.as_ref().is_some_and(|o| names_another_account(o, &row)) {
-                    self.quarantine(
-                        &row,
-                        QuarantineReason::IdentityConflict,
-                        received.fp().as_str(),
-                    )?;
-                    return Ok(ActiveOutcome::Dead(QuarantineReason::IdentityConflict));
-                }
+                let published = if owned {
+                    self.publish(p, row, cred, received.bytes(), &rec.retire)
+                } else {
+                    Ok(false)
+                };
+                // A loss takes precedence over everything else (§7.3 step 6).
                 Ok(match (persisted, published) {
                     (Persisted::Unpersisted, _) => ActiveOutcome::Unpersisted,
-                    (_, true) => ActiveOutcome::Refreshed,
-                    (_, false) => ActiveOutcome::PersistedNotPublished,
+                    (_, Err(e)) => return Err(e),
+                    (_, Ok(true)) => ActiveOutcome::Refreshed,
+                    (_, Ok(false)) => ActiveOutcome::PersistedNotPublished,
                 })
             }
             RefreshResult::Dead(reason) => {
@@ -13380,8 +14164,7 @@ impl Engine {
                     DeadReason::InvalidGrant => QuarantineReason::InvalidGrant,
                     DeadReason::NoRefreshToken => QuarantineReason::NoRefreshToken,
                 };
-                let fp = sent.as_ref().map(Fingerprint::as_str).unwrap_or_default();
-                self.quarantine(&row, reason, fp)?;
+                self.quarantine(row, reason, sent_fp)?;
                 Ok(ActiveOutcome::Dead(reason))
             }
             RefreshResult::Systemic(detail) => Ok(ActiveOutcome::Systemic(detail)),
@@ -13472,7 +14255,14 @@ impl Engine {
             Read::Absent => None,
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         };
-        let prev = self.vault.read_prev(&row.id).present();
+        // Tri-state (B.1): an unreadable `.prev` may be the generation that tells an
+        // unpublished earlier pass apart from a CC rotation, so it refuses rather than reads as
+        // absent, which would adopt a consumed token as the newest.
+        let prev = match self.vault.read_prev(&row.id) {
+            Read::Present(v) => Some(v),
+            Read::Absent => None,
+            Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
+        };
         let mut rescues: Vec<RescueEntry> = Vec::new();
         for file in self.rescues_for(&row.id) {
             match file {
@@ -13569,7 +14359,8 @@ impl Engine {
 
     /// Writes `secret` to the live store under the config lock, taken now with its own budget
     /// (§9.1), then retires `retire` once the write reads back. `false` when the live store
-    /// was not written; the next pass reconciles it (§7.5 step 3). What the write destroys is
+    /// was not written; the caller reports `PersistedNotPublished`, and the next pass
+    /// reconciles it (§7.5 step 3). What the write destroys is
     /// saved first unless a vault generation already holds it (§9.4 step 7's rule).
     fn publish(
         &self,
@@ -13650,10 +14441,10 @@ impl Engine {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test active`
-Expected: PASS, 19 tests.
+Expected: PASS, 24 tests.
 
 Run: `cargo test -p tagteam-engine --test active && cargo test -p tagteam-engine --lib error`
-Expected: PASS: 17 tests without the hook module; `kind_is_pinned_for_every_variant` passes.
+Expected: PASS: 22 tests without the hook module; `kind_is_pinned_for_every_variant` passes.
 
 Run: `cargo clippy -p tagteam-engine --all-targets --features test-hooks -- -D warnings`
 Expected: no warnings.
