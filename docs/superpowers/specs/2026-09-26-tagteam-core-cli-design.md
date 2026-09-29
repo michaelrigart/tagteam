@@ -40,8 +40,9 @@ tagteam is public OSS under the MIT license, built for macOS and Linux.
 1. A switch changes only the account identity. All other local Claude Code state is untouched
    (§3).
 2. Every refresh-token successor tagteam receives is persisted, to the vault or to `rescue/`,
-   and a degraded or superseded generation is never sent to the token endpoint (§7). The one
-   exception, both writes failing, is reported rather than silent (§7.3).
+   or to `displaced/` when the token endpoint says it belongs to another account (§7.4). A
+   degraded or superseded generation is never sent to the token endpoint (§7). The one
+   exception, every write failing, is reported rather than silent (§7.3).
 3. Polling stays within the usage endpoint's budget across all tagteam processes on a machine
    (§8).
 4. The core commands match cswap on macOS and Linux (Appendix C), with JSON that existing
@@ -362,7 +363,7 @@ CREATE TABLE accounts (
   login_epoch      INTEGER NOT NULL DEFAULT 0,  -- bumped by every explicit login replacement (§12.5)
   replacing_fp     TEXT,                      -- set only while an explicit replacement is in flight (§12.5)
   replacing_meta   TEXT,                      -- JSON snapshot of the incoming login's metadata; installed on landing, discarded otherwise (§12.5)
-  quarantine_reason TEXT,                     -- 'invalid_grant' | 'no_refresh_token' | 'identity_conflict'
+  quarantine_reason TEXT,                     -- 'invalid_grant' | 'no_refresh_token' | 'identity_conflict' | 'successor_lost'
   quarantine_fp    TEXT,                      -- fingerprint the quarantine is bound to
   quarantine_at    INTEGER,
   added_at         INTEGER NOT NULL,
@@ -457,7 +458,7 @@ CREATE TABLE displaced (
   id          TEXT PRIMARY KEY, -- file stem
   provider    TEXT NOT NULL,
   at          INTEGER NOT NULL,
-  reason      TEXT NOT NULL,    -- 'displaced-live-login' | 'forced-activation' | ...
+  reason      TEXT NOT NULL,    -- 'displaced-live-login' | 'forced-activation' | 'identity-conflict' | ...
   fingerprint TEXT NOT NULL,
   identity    TEXT              -- provider-owned identity JSON, if known (CC: {email, orgUuid, accountUuid})
 );
@@ -664,14 +665,22 @@ This procedure is the only place a stored refresh token is ever sent to the toke
 5. **POST** to the token endpoint (Appendix A.5), with a 10 s timeout.
 6. **Persist, compare-and-swap style.** Re-read the vault. With every writer under the account
    lock this comparison cannot fail; it stays as a defence.
+   - If the response names another account (§7.4 `identity_conflict`), the successor is not
+     this account's. It is displaced (reason `identity-conflict`), never written to the vault
+     or to `rescue/`. The account is quarantined, bound to the fingerprint that was sent.
    - If the fingerprint moved since step 3, write the new successor to `rescue/`, log at ERROR,
      and return the vault's newer credential.
    - Otherwise write the vault (the old generation becomes `.prev`) and update
      `login_expires_at`.
    - If the vault write fails, write to `rescue/` and return `Transient { credential, rescued:
      true }`. **The caller must not activate a credential in this state.**
-   - If the rescue write also fails, return `Unpersisted`, log at ERROR, and print a stderr
-     notice naming the account position.
+   - If the rescue write (or the displacement) also fails, return `Unpersisted`, log at ERROR,
+     and print a stderr notice naming the account position. The vault's generation has been
+     consumed, so the account is also quarantined (`successor_lost`), bound to the fingerprint
+     that was sent. That store write is best effort: if it fails too, the loss is reported
+     only.
+   - Any other error after the response is received rescues the successor first, and reports
+     `Unpersisted` if that rescue fails.
 7. **Classify the result:**
 
    | Response | Verdict |
@@ -699,7 +708,11 @@ simply succeeds.
 - **One strike quarantines an account.** A Dead verdict sets `quarantine_reason` and binds
   `quarantine_fp` to the fingerprint that was actually sent.
 - **`identity_conflict`.** The token endpoint's `account.uuid` or organization disagreeing with
-  the account also quarantines it.
+  the account also quarantines it. Either one alone is enough: an organization is compared when
+  both sides name one, and a uuid when both do. The successor is displaced, not stored (§7.3
+  step 6).
+- **`successor_lost`.** A refresh whose successor could be stored nowhere (§7.3 `Unpersisted`)
+  quarantines the account, because the vault's generation has been consumed.
 - **Quarantined accounts** are never fetched, refreshed or auto-activated. They show
   `relogin_required`.
 - **Clearing a quarantine.**
@@ -1035,6 +1048,11 @@ here on.
    the account locks were chosen, release every lock except `MutationGuard` and take them again
    for the new pair. Taking one more account lock now could invert the lock order. After three
    attempts, abort.
+
+   Re-read the target's quarantine too. A refresh that finished while this switch waited for
+   the account lock may have quarantined it (§7.4 `successor_lost`). A target quarantined since
+   planning then follows §7.2's quarantined-target rule, and a bare rotation plans again
+   without it.
 2. **Direct branch** (no live identity, unmanaged live login, or `--force`):
    - Settle the target's pending rescues (§6.2), then read it from the vault.
    - Read the live credential and config under step 3's rules.
