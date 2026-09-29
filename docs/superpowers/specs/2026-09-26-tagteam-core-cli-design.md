@@ -681,6 +681,9 @@ This procedure is the only place a stored refresh token is ever sent to the toke
      only.
    - Any other error after the response is received rescues the successor first, and reports
      `Unpersisted` if that rescue fails.
+   - A panic after the response is received does the same as it unwinds. It cannot return
+     `Unpersisted`, so a loss it cannot prevent is logged at ERROR, which reaches stderr, and
+     quarantines the account (`successor_lost`), best effort.
 7. **Classify the result:**
 
    | Response | Verdict |
@@ -755,7 +758,9 @@ locally (a sibling machine revoked it). The procedure:
    case, so CC always holds the newest generation; the config lock is taken only around the
    live write. If CC's locks turn out to be compromised when the response arrives, the
    successor is still persisted to tagteam's own storage, but the live store is not written;
-   the next pass reconciles it (step 3).
+   the next pass reconciles it (step 3). A successor that ends up in none of the vault,
+   `rescue/` or the live store is lost exactly as in §7.3 step 6: `Unpersisted`, with its
+   `successor_lost` quarantine.
 
 Refreshing from a degraded read is never allowed.
 
@@ -1076,6 +1081,7 @@ here on.
    | Class | Condition | Action |
    |---|---|---|
    | `Ours` | Bytes or fingerprint equal the vault's | Nothing |
+   | `Superseded` | Bytes or fingerprint equal the vault's `.prev`: an active-token refresh stored a newer generation it could not publish (§7.5) | Nothing; the vault keeps the newer generation, and capturing this one would put a consumed token back |
    | `Wiped` | An OAuth blob with both tokens empty (CC's reaction to `invalid_grant`), or a credential with no token at all | Nothing; the vault keeps its refresh token |
    | `OursRotated` | The oracle resolved the token to this account (uuid-positive, org agreeing) | Write to the vault; the old generation becomes `.prev`. Backfill `account_uuid` if NULL |
    | `Foreign` | The oracle resolved it to another identity, known or not | **Displace**. This must succeed, or the switch aborts |
