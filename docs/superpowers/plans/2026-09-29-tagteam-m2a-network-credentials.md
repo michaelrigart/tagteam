@@ -13408,9 +13408,10 @@ the live credential belongs to someone else.
   - `OutgoingClass::Superseded` and `OutgoingFacts::equals_vault_prev` (`tagteam-core`), and
     `settle_outgoing` leaving a superseded live generation alone (§9.4 step 4, as amended;
     Steps 7–11).
-  - Hook points `active-before-request` (before the token request) and
+  - Hook points `active-before-request` (before the token request),
     `active-after-response` (after a successor is received and guarded, before the lock
-    re-check).
+    re-check), and `active-before-publish` (before the live write; a successor neither store
+    took stays guarded by `PendingLoss` across it).
 - Decisions this task fixes (Codex round 1):
   - **A quarantined generation is never sent again** (§7.4): the quarantine holds while the
     live credential or the vault carries the fingerprint it is bound to. Checked under the
@@ -14089,6 +14090,32 @@ mod hooks {
         assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"), "never published");
         assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
     }
+
+    #[test]
+    fn a_panic_while_publishing_a_successor_held_nowhere_still_records_the_loss() {
+        // Once neither the vault nor rescue/ took the successor, the live write is its last
+        // home; a panic inside that write must still record the loss (§7.3 step 6).
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let sent = fp(&fx, &cred("a@x.co", "rt-a"));
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        fx.kc.set_fail_write(SERVICE, true);
+        let rescue = block_rescue(&fx);
+        fx.engine.fail_at(Some("panic:active-before-publish"));
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            active(&fx, ActiveTrigger::Expired)
+        }));
+        fx.engine.fail_at(None);
+        unblock(&rescue);
+
+        assert!(unwound.is_err(), "the injected panic unwinds");
+        let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
+        assert_eq!(row.quarantine_reason.as_deref(), Some("successor_lost"));
+        assert_eq!(row.quarantine_fp.as_deref(), Some(sent.as_str()));
+        assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"), "never published");
+    }
 }
 ```
 
@@ -14203,6 +14230,25 @@ pub enum ActiveOutcome {
     /// The successor is held nowhere: logged at ERROR, and the account quarantined
     /// `successor_lost` (§7.5 step 5, §7.4).
     Unpersisted,
+}
+
+/// A successor neither the vault nor `rescue/` could take, while its live write is under way.
+/// If that write unwinds, dropping this records the loss (§7.3 step 6: `successor_lost`, bound
+/// to the generation sent). Disarmed once the outcome is settled.
+struct PendingLoss<'a> {
+    engine: &'a Engine,
+    row: &'a AccountRow,
+    sent_fp: &'a str,
+    armed: bool,
+}
+
+impl Drop for PendingLoss<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.engine
+                .record_loss(self.row, self.sent_fp, &"publishing it to the live store unwound");
+        }
+    }
 }
 
 /// What reconciliation (§7.5 step 3) settled: the generation the live store holds, or will
@@ -14370,12 +14416,24 @@ impl Engine {
                 let owned = cred.check_owned().is_ok();
                 // Task 11's shared step: the vault, else `rescue/`, else reported as lost.
                 let persisted = self.persist_received(p, row, lock, &mut received);
+                // `persist_received` disarmed `received`. When neither store took the
+                // successor, the live write below is its last home, so the loss stays armed
+                // until that write lands: a panic in between still records it (§7.3 step 6).
+                let mut pending = PendingLoss {
+                    engine: self,
+                    row,
+                    sent_fp,
+                    armed: persisted == Persisted::Unpersisted,
+                };
                 // CC must hold the newest generation whatever became of tagteam's copy.
                 let published = if owned {
-                    self.publish(p, row, cred, received.bytes(), &rec.retire)
+                    hooks::point(self, "active-before-publish")
+                        .and_then(|()| self.publish(p, row, cred, received.bytes(), &rec.retire))
                 } else {
                     Ok(false)
                 };
+                // Settled below either way: published, or recorded by `record_loss`.
+                pending.armed = false;
                 // A loss takes precedence over everything else (§7.3 step 6). But a successor
                 // the live store holds is not lost: CC has it, and the next pass adopts it into
                 // the vault (§7.5 step 3). Only one held nowhere is recorded, as the gate
@@ -14693,7 +14751,7 @@ impl Engine {
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test active`
-Expected: PASS, 25 tests.
+Expected: PASS, 26 tests.
 
 Run: `cargo test -p tagteam-engine --test active && cargo test -p tagteam-engine --lib error`
 Expected: PASS: 22 tests without the hook module; `kind_is_pinned_for_every_variant` passes.
