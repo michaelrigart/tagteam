@@ -778,3 +778,19 @@ fn alias_move_remove_and_usage_errors() {
         "usage"
     );
 }
+
+#[test]
+fn token_accounts_list_their_kind_from_the_provider() {
+    // M-5: the CLI names no kind strings. The provider's kind traits decide the label, the
+    // JSON `usageStatus`, and the default email.
+    let h = H::new();
+    h.ok(&["add-token", "sk-ant-oat01-setup"]);
+    h.ok(&["add-token", "sk-ant-api03-key"]);
+    assert_eq!(
+        h.ok(&["list"]),
+        "  1  setup-token-1@token.local  setup token\n  2  api-key-2@token.local  api key\n"
+    );
+    let v = h.json(&["list", "--json"]);
+    assert_eq!(v["accounts"][0]["usageStatus"], "unavailable");
+    assert_eq!(v["accounts"][1]["usageStatus"], "api_key");
+}

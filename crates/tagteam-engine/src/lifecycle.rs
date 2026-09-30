@@ -7,10 +7,6 @@ use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::store::{AccountRow, EventRow, LoginMeta, NewAccount, Store, StoreError};
 
-/// The credential kind whose secret lives on the managed-key axis rather than in the
-/// credential entry (§9.4 step 7).
-pub(crate) const KIND_API_KEY: &str = "api_key";
-
 pub struct AddOptions {
     pub provider: ProviderId,
     pub position: Option<u32>,
@@ -100,6 +96,13 @@ fn alias_taken(e: StoreError) -> EngineError {
         }
         other => other.into(),
     }
+}
+
+/// §10.2: a token kind whose provider names no default email must be given `--email`.
+fn no_default_email(kind: &str) -> EngineError {
+    EngineError::InvalidInput(format!(
+        "a {kind} token has no default email address; pass --email"
+    ))
 }
 
 /// `update_login`/`finish_replacement` COALESCE a new account_uuid over a known one, so a
@@ -493,11 +496,11 @@ impl Engine {
             return Err(EngineError::InvalidInput("the token is empty".into()));
         }
         let (kind, secret) = p.token_secret(&opts.token);
-        let prefix = if kind == KIND_API_KEY {
-            "api-key"
-        } else {
-            "setup-token"
-        };
+        let prefix = p.kind_traits(&kind).default_email_prefix;
+        // Refused before anything exists (§5): the lock-held branch below cannot need it.
+        if opts.email.is_none() && prefix.is_none() {
+            return Err(no_default_email(&kind));
+        }
         self.next_position_precheck(&opts.provider, opts.position)?;
         if let Some(email) = opts.email.as_deref().filter(|e| !is_valid_email(e)) {
             return Err(EngineError::InvalidInput(format!(
@@ -506,16 +509,17 @@ impl Engine {
         }
         let _guard = self.guard_or_refuse(&opts.provider)?;
         let store = self.store()?;
-        let identity = match &opts.email {
-            Some(email) => p.token_identity(email),
+        let identity = match (&opts.email, prefix) {
+            (Some(email), _) => p.token_identity(email),
             // Under the lock the position is authoritative, so a default email follows it.
-            None => {
+            (None, Some(prefix)) => {
                 let position = match opts.position {
                     Some(pos) => pos,
                     None => store.next_position(&opts.provider)?,
                 };
                 unused_token_identity(&store, p.as_ref(), &opts.provider, prefix, position)?
             }
+            (None, None) => return Err(no_default_email(&kind)),
         };
         let claimed_uuid = identity.account_uuid.as_deref();
         let prep = self.prepare(

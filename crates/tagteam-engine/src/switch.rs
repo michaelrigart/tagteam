@@ -13,7 +13,6 @@ use crate::displace::displace;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
-use crate::lifecycle::KIND_API_KEY;
 use crate::oracle::verdict;
 use crate::store::{AccountRow, EventRow, JournalRow, Store};
 
@@ -126,8 +125,9 @@ pub(crate) enum Axis {
 impl Axis {
     pub(crate) const BOTH: [Axis; 2] = [Axis::Entry, Axis::ManagedKey];
 
-    pub(crate) fn of(kind: &str) -> Self {
-        if kind == KIND_API_KEY {
+    /// The axis `p` keeps a credential of `kind` on (§9.4 step 7).
+    pub(crate) fn of(p: &dyn Provider, kind: &str) -> Self {
+        if p.kind_traits(kind).managed_key_axis {
             Axis::ManagedKey
         } else {
             Axis::Entry
@@ -494,7 +494,7 @@ impl Engine {
     /// §9.4 "Before locking": asks the oracle about the outgoing live secret when it is not
     /// that account's vault generation. Never called under the mutation lock.
     fn oracle_hint(&self, p: &dyn Provider, out: &AccountRow) -> Option<OracleHint> {
-        let bytes = Axis::of(&out.kind).live_secret(&p.read_live_auth(&self.env))?;
+        let bytes = Axis::of(p, &out.kind).live_secret(&p.read_live_auth(&self.env))?;
         if bytes.is_empty() || self.matches_vault(p, out, &bytes) {
             return None;
         }
@@ -560,7 +560,7 @@ impl Engine {
         if self_switch && !req.force {
             // A no-op unless the live credential diverged from the vault and the oracle
             // attributed it to this very account; then a full switch reconciles it (§9.2).
-            let reconcile = Axis::of(&target.kind)
+            let reconcile = Axis::of(p, &target.kind)
                 .live_secret(&p.read_live_auth(&self.env))
                 .is_some_and(|live| {
                     !self.matches_vault(p, &target, &live)
@@ -801,7 +801,7 @@ impl Engine {
                     &mut warnings,
                 )?;
                 // Step 4 settled the outgoing generation: kept, captured or displaced.
-                if let Some(bytes) = Axis::of(&out.kind).live_secret(&live) {
+                if let Some(bytes) = Axis::of(p, &out.kind).live_secret(&live) {
                     held.hold(p, &bytes);
                 }
                 // Read only now: settling a self-switch may have captured a newer live
@@ -832,7 +832,7 @@ impl Engine {
         // Step 6.
         let from_secret = outgoing
             .as_ref()
-            .and_then(|o| Axis::of(&o.kind).live_secret(&live))
+            .and_then(|o| Axis::of(p, &o.kind).live_secret(&live))
             .or_else(|| Axis::Entry.live_secret(&live));
         // A forced switch may supersede an undecidable row; it is carried along, so a forced
         // switch that never lands puts it back instead of forgetting it (§9.6).
@@ -944,7 +944,7 @@ impl Engine {
         live_identity: Option<&Identity>,
         warnings: &mut Vec<String>,
     ) -> Result<(), EngineError> {
-        let Some(bytes) = Axis::of(&out.kind).live_secret(live) else {
+        let Some(bytes) = Axis::of(p, &out.kind).live_secret(live) else {
             return Ok(());
         };
         let vault = match self.vault.read(&out.id) {

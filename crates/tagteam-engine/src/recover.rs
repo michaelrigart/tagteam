@@ -206,7 +206,7 @@ impl Engine {
         let to = store
             .account(&row.to_id)?
             .ok_or_else(|| EngineError::NoSuchAccount(row.to_id.to_string()))?;
-        let own = Axis::of(&to.kind);
+        let own = Axis::of(p, &to.kind);
         // Nothing can make the surfaces agree unless the target's own axis holds the
         // generation established as its.
         let Some(target_secret) = own
@@ -290,7 +290,7 @@ impl Engine {
             Some(id) => store.account(id)?,
             None => None,
         };
-        let own = from.as_ref().map_or(Axis::Entry, |r| Axis::of(&r.kind));
+        let own = from.as_ref().map_or(Axis::Entry, |r| Axis::of(p, &r.kind));
         if !holds(p, live, own, established) {
             return Ok(());
         }

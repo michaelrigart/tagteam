@@ -1,5 +1,5 @@
 use tagteam_core::ProviderId;
-use tagteam_provider::Read;
+use tagteam_provider::{KindTraits, Read};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -10,7 +10,17 @@ pub struct AccountView {
     pub row: AccountRow,
     /// The live identity wins over the store's active account.
     pub active: bool,
+    /// The row's credential kind, as its provider describes it (§4.5).
+    pub kind: KindTraits,
 }
+
+/// The kind traits of a row whose provider this build does not register: nothing special.
+const UNREGISTERED: KindTraits = KindTraits {
+    refreshable: false,
+    managed_key_axis: false,
+    default_email_prefix: None,
+    display: None,
+};
 
 #[derive(Debug, Clone)]
 pub struct ProviderAccounts {
@@ -48,7 +58,11 @@ impl Engine {
                     Read::Absent => false,
                     Read::Unreadable(_) => stored_active.as_ref() == Some(&row.id),
                 };
-                AccountView { row, active }
+                AccountView {
+                    kind: p.kind_traits(&row.kind),
+                    row,
+                    active,
+                }
             })
             .collect();
         let active_position = accounts.iter().find(|v| v.active).map(|v| v.row.position);
@@ -61,6 +75,15 @@ impl Engine {
             },
             live_label,
         ))
+    }
+
+    /// A row as the views show it, for a caller that already knows whether it is active.
+    pub fn account_view(&self, row: AccountRow, active: bool) -> AccountView {
+        let kind = self
+            .registry
+            .get(&row.provider)
+            .map_or(UNREGISTERED, |p| p.kind_traits(&row.kind));
+        AccountView { row, active, kind }
     }
 
     /// Every provider that has accounts, plus the default provider; or just `provider`.

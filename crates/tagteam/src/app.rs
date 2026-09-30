@@ -359,7 +359,8 @@ impl App<'_, '_> {
                     render::name(&row),
                     row.position
                 );
-                self.print_view(&human, AccountView { row, active }, None);
+                let view = self.engine.account_view(row, active);
+                self.print_view(&human, view, None);
             }
             Command::Disable { account } => {
                 let row = self.resolve(&account)?;
@@ -467,7 +468,8 @@ impl App<'_, '_> {
     /// The change has committed by now, so a failure to read `active` never fails it.
     fn print_account(&mut self, human: &str, row: AccountRow, created: Option<bool>) {
         let active = or_inactive(self.is_active(&row), row.position, &row.id);
-        self.print_view(human, AccountView { row, active }, created);
+        let view = self.engine.account_view(row, active);
+        self.print_view(human, view, created);
     }
 
     fn added(&mut self, account: AccountRow, created: bool) {

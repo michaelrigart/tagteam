@@ -24,10 +24,11 @@ pub fn name(r: &AccountRow) -> String {
     }
 }
 
-fn usage_status(r: &AccountRow) -> &'static str {
-    if r.kind == "api_key" {
+/// §13.2: a managed-key account has no usage to fetch, which cswap reports as `api_key`.
+fn usage_status(v: &AccountView) -> &'static str {
+    if v.kind.managed_key_axis {
         "api_key"
-    } else if r.quarantine_reason.is_some() {
+    } else if v.row.quarantine_reason.is_some() {
         "relogin_required"
     } else {
         "unavailable"
@@ -37,7 +38,7 @@ fn usage_status(r: &AccountRow) -> &'static str {
 /// One `list` row (§13.2). Until M2 fetches usage, every row reports no data.
 pub fn row_json(v: &AccountView) -> Value {
     let r = &v.row;
-    let status = usage_status(r);
+    let status = usage_status(v);
     let mut o = json!({
         "number": r.position,
         "position": r.position,
@@ -114,10 +115,8 @@ pub fn list_human(lists: &[ProviderAccounts], display_names: &dyn Fn(&str) -> St
             if let Some(org) = &r.org_name {
                 line.push_str(&format!("  [{org}]"));
             }
-            match r.kind.as_str() {
-                "api_key" => line.push_str("  api key"),
-                "setup_token" => line.push_str("  setup token"),
-                _ => {}
+            if let Some(kind) = v.kind.display {
+                line.push_str(&format!("  {kind}"));
             }
             if r.disabled {
                 line.push_str("  disabled");

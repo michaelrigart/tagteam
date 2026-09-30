@@ -170,3 +170,27 @@ fn oracle_verdicts_need_a_positive_uuid_match() {
         OracleVerdict::Unavailable
     );
 }
+
+#[test]
+fn views_carry_each_rows_kind_traits_from_its_provider() {
+    let fx = Fx::new();
+    fx.add("a@b.co", "rt-a");
+    fx.add_api_key(common::API_KEY);
+    let lists = fx.engine.accounts(None).unwrap();
+    let kinds: Vec<_> = lists[0]
+        .accounts
+        .iter()
+        .map(|v| (v.row.kind.as_str(), v.kind))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ("oauth", fx.cc.kind_traits("oauth")),
+            ("api_key", fx.cc.kind_traits("api_key")),
+        ]
+    );
+    let key_row = lists[0].accounts[1].row.clone();
+    let view = fx.engine.account_view(key_row, false);
+    assert!(view.kind.managed_key_axis);
+    assert_eq!(view.kind.display, Some("api key"));
+}
