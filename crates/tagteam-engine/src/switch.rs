@@ -799,18 +799,20 @@ impl Engine {
             // The successor is lost and the vault's generation is spent (§7.3 step 6): no
             // retry helps, and activating would hand CC a used refresh token.
             GateOutcome::Unpersisted => return Err(needs_relogin(target)),
-            // The forced switch is about to supersede the undecidable row that names it.
-            GateOutcome::Owned(OwnedBy::Journal) if req.force => {
-                Freshened::Go(vec![cannot_refresh(
-                    label,
-                    "an interrupted switch names it",
-                )])
-            }
+            // A journal row names it. The gate cannot tell a switch still in progress from an
+            // interrupted one, so this does not refuse: with `--force` the switch supersedes
+            // the row, and without it `guard_or_refuse` decides under the mutation lock (it
+            // waits for a live holder, and recovers or refuses a dead one with the right
+            // message).
             GateOutcome::Owned(OwnedBy::Journal) => {
-                return Err(EngineError::InterruptedSwitch(req.provider.to_string()));
+                Freshened::Go(vec![cannot_refresh(label, "an unfinished switch names it")])
             }
-            // It became the live login meanwhile: `rederive` plans the self-switch again.
-            GateOutcome::Owned(OwnedBy::Live) => Freshened::Go(vec![]),
+            // The gate found it live where planning did not (it became the live login, or the
+            // live identity could not be read): never refreshed here. `rederive` plans the
+            // self-switch again, and the warning is carried into its outcome.
+            GateOutcome::Owned(OwnedBy::Live) => {
+                Freshened::Go(vec![cannot_refresh(label, "it may be the live login")])
+            }
             // Unreachable before M4, which introduces sessions and provenance. M4 gives these
             // two the spec's `session-owned` and `profile-conflict` kinds (§7.2's table); until
             // then they refuse with `invalid-input`.
@@ -962,19 +964,29 @@ impl Engine {
             return Ok(Rederived::Replan);
         }
         // §9.4 step 1 (amended): a refresh that finished while this switch waited for the
-        // target's account lock may have quarantined it (§7.4 `successor_lost`). A target
-        // quarantined since planning follows §7.2's quarantined-target rule: a rotation plans
-        // again, and the walk skips it.
+        // target's account lock may have quarantined it (§7.4 `successor_lost`). This is
+        // decided from the row just read, never from what the plan saw: a plan made on an
+        // earlier attempt may already hold the quarantine, yet nothing else applies §7.2's
+        // quarantined-target rule under the locks. A rotation plans again, and the walk skips
+        // the row. A direct target is refused when its access token is due, and otherwise
+        // activated with the warning (unless freshening already gave it). A self-switch
+        // activates the live generation, which no refresh has spent, so the rule does not
+        // apply to it (§7.2: only CC refreshes a live token).
         let mut warnings = Vec::new();
-        if target.quarantine_reason.is_some() && plan.target.quarantine_reason.is_none() {
+        if target.quarantine_reason.is_some() {
             if matches!(req.target, SwitchTarget::Rotation) {
                 return Ok(Rederived::Replan);
             }
-            let vault = self.read_target(&target)?;
-            if self.due(p, &vault) {
-                return Err(needs_relogin(&target));
+            if !self_switch && p.kind_traits(&target.kind).refreshable {
+                let vault = self.read_target(&target)?;
+                if self.due(p, &vault) {
+                    return Err(needs_relogin(&target));
+                }
+                let warning = works_until_expiry(&target);
+                if !plan.warnings.contains(&warning) {
+                    warnings.push(warning);
+                }
             }
-            warnings.push(works_until_expiry(&target));
         }
         let same_pick = match req.target {
             SwitchTarget::Account(_) => true,

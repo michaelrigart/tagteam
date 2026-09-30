@@ -4,17 +4,24 @@
 mod common;
 
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use common::{
-    API_KEY, Fx, block_rescue, credential, journal, quarantine_of, rescue_files, token_requests,
-    two_accounts, unblock_rescue, vault_fp,
+    API_KEY, Fx, block_rescue, crash_row, credential, journal, quarantine_of, rescue_files,
+    token_requests, two_accounts, unblock_rescue, vault_fp,
 };
 use serde_json::json;
+use tagteam_core::AccountId;
+use tagteam_engine::EngineError;
 use tagteam_engine::account_lock::AccountLock;
+use tagteam_engine::switch::SwitchOutcome;
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::http::{HttpError, Method};
+use tagteam_provider::{Keychain, ProcessStamp};
 
 fn cannot_refresh(why: &str) -> String {
     format!("could not refresh a@x.co first ({why}); Claude Code will refresh it when it is online")
@@ -345,4 +352,175 @@ fn a_forced_switch_still_freshens_its_target() {
     fx.switch_to(&a, true).unwrap();
     assert_eq!(token_requests(&fx), 1);
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a-2"));
+}
+
+/// Runs a switch to `a` on an engine that stops at its first read of `a`'s vault after
+/// planning began (a read in `plan`, before any freshening), and runs `act` on the test thread
+/// while it is stopped. The engine shares this fixture's Env, Keychain and HTTP port, so `act`
+/// changes what the switch goes on to find.
+/// `act` may hand back a thread it started, which is joined once the switch is done.
+fn switch_after(
+    fx: &Fx,
+    a: &AccountId,
+    act: impl FnOnce(&Fx) -> Option<thread::JoinHandle<()>>,
+) -> Result<SwitchOutcome, EngineError> {
+    let (paused_tx, paused_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let waiting = Mutex::new(Some((paused_tx, go_rx)));
+    let key = a.to_string();
+    let engine = fx.engine_with_vault_probe(move |read| {
+        let taken = waiting.lock().unwrap().take();
+        if let (true, Some((paused, go))) = (read.starts_with(&key), taken) {
+            paused.send(()).unwrap();
+            go.recv().unwrap();
+        }
+    });
+    thread::scope(|s| {
+        let switching = s.spawn(|| engine.switch(fx.switch_request(a, false)));
+        paused_rx.recv().unwrap();
+        let started = act(fx);
+        go_tx.send(()).unwrap();
+        let outcome = switching.join().unwrap();
+        if let Some(t) = started {
+            t.join().unwrap();
+        }
+        outcome
+    })
+}
+
+#[test]
+fn a_quarantine_the_plan_already_saw_is_still_applied_under_the_locks() {
+    // Attempt 1 plans again for an unrelated reason (the vault reads empty for a moment) and
+    // releases the account locks. Another process's gate then quarantines a `successor_lost`,
+    // so attempt 2's plan sees the quarantine itself. Nothing but `rederive` applies §7.2's
+    // rule under the locks, so it must not skip a quarantine the plan saw.
+    for due in [true, false] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        if due {
+            fx.expire_access(&a);
+            // Offline when freshening: the switch goes on with the vault's generation.
+            let token = Fx::endpoints().token;
+            let refused = HttpError::PreSend("dns lookup failed".into());
+            fx.http.push(Method::Post, &token, Err(refused));
+        }
+        let saved = fx.vault_bytes(&a).unwrap();
+        let spent = vault_fp(&fx, &a);
+        let store = fx.engine.store().unwrap();
+        let step = Arc::new(AtomicUsize::new(0));
+        let (kc, key) = (fx.kc.clone(), a.to_string());
+        let seen = step.clone();
+        let engine = fx.engine_with_vault_probe({
+            let (kc, key, store, a) = (kc.clone(), key.clone(), store.clone(), a.clone());
+            let step = step.clone();
+            move |read| {
+                if !read.starts_with(&key) {
+                    return;
+                }
+                match step.load(Ordering::SeqCst) {
+                    // Attempt 1's locked re-read: empty, and quarantined meanwhile.
+                    1 => {
+                        kc.delete(SERVICE, &key).unwrap();
+                        store
+                            .set_quarantine(&a, "successor_lost", &spent, 1)
+                            .unwrap();
+                        step.store(2, Ordering::SeqCst);
+                    }
+                    // Attempt 2's plan: the vault is back (rt-a, spent as far as the row says).
+                    2 => {
+                        kc.put(SERVICE, &key, &saved);
+                        step.store(3, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        engine.on_point("planned", Box::new(move || seen.store(1, Ordering::SeqCst)));
+        let result = engine.switch(fx.switch_request(&a, false));
+        assert_eq!(
+            step.load(Ordering::SeqCst),
+            3,
+            "due: {due}: {:?}",
+            result.as_ref().map(|o| o.reason.as_str())
+        );
+        assert_eq!(
+            token_requests(&fx),
+            usize::from(due),
+            "only freshening sends"
+        );
+        if due {
+            let err = result.unwrap_err();
+            assert_eq!(err.kind(), "relogin-required", "{err}");
+            assert_eq!(
+                fx.live_email().as_deref(),
+                Some("b@x.co"),
+                "the spent rt-a is never activated"
+            );
+        } else {
+            let out = result.unwrap();
+            assert_eq!(
+                out.warnings,
+                [
+                    "a@x.co (position 1) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires"
+                ]
+            );
+            assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+        }
+    }
+}
+
+#[test]
+fn a_journal_row_naming_the_target_is_left_to_the_mutation_lock() {
+    // The gate cannot tell a switch still in progress from an interrupted one. Another
+    // process is mid-switch to a: it holds the mutation lock and its live journal row names
+    // a. This switch must not refuse with `interrupted-switch` from the freshen step; it
+    // warns, waits for the mutation lock, and finds the row gone.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.expire_access(&a);
+    let mut row = crash_row(&fx, &b, &a);
+    row.holder = ProcessStamp::current().unwrap();
+    let out = switch_after(&fx, &a, |fx| {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (row, other) = (row.clone(), fx.engine_with_env(fx.env.clone()));
+        let holder = thread::spawn(move || {
+            let guard = other.mutation_guard().unwrap();
+            let store = other.store().unwrap();
+            store.insert_journal(&row).unwrap();
+            ready_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(300));
+            store.delete_journal(&row.provider).unwrap();
+            drop(guard);
+        });
+        ready_rx.recv().unwrap();
+        Some(holder)
+    })
+    .unwrap();
+    assert_eq!(
+        out.warnings,
+        [cannot_refresh("an unfinished switch names it")]
+    );
+    assert_eq!(token_requests(&fx), 0);
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert!(journal(&fx).is_none());
+}
+
+#[test]
+fn a_target_the_gate_finds_live_is_left_alone_with_one_warning() {
+    // The live identity flakes between planning and the gate: the gate finds the target live
+    // (§7.3 step 2), never refreshes it, and the switch plans again as a self-switch. The
+    // warning is carried into that outcome.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    fx.expire_access(&a);
+    let out = switch_after(&fx, &a, |fx| {
+        fx.login("a@x.co", "rt-a");
+        None
+    })
+    .unwrap();
+    assert!(!out.switched, "{out:?}");
+    assert_eq!(out.reason.as_str(), "already-active");
+    assert_eq!(out.warnings, [cannot_refresh("it may be the live login")]);
+    assert_eq!(token_requests(&fx), 0);
 }
