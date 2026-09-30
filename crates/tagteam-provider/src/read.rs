@@ -42,6 +42,8 @@ impl fmt::Display for ReadError {
     }
 }
 
+impl std::error::Error for ReadError {}
+
 impl<T> Read<T> {
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Read<U> {
         match self {

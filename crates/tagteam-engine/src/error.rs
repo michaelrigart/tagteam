@@ -18,6 +18,15 @@ pub enum EngineError {
     Vault(#[from] VaultError),
     #[error("{0}")]
     Unreadable(ReadError),
+    /// A vault that could not be read where the switch needed it: a direct target, or an
+    /// account a rotation met before its pick, which could have been the pick (§9.3). It is
+    /// named, never skipped and never taken for a missing credential.
+    #[error("the stored credential for {label} (position {position}) is unreadable: {source}")]
+    UnreadableAccount {
+        position: u32,
+        label: String,
+        source: ReadError,
+    },
     #[error("unknown provider {0:?}")]
     UnknownProvider(String),
     #[error("this command cannot run inside a `tagteam run` session")]
@@ -97,6 +106,7 @@ impl EngineError {
             EngineError::Lock(_) => "lock",
             EngineError::Vault(_) => "vault",
             EngineError::Unreadable(_) => "unreadable",
+            EngineError::UnreadableAccount { .. } => "unreadable",
             EngineError::UnknownProvider(_) => "unknown-provider",
             EngineError::InsideRunShell => "inside-run-shell",
             EngineError::NoLiveLogin => "no-live-login",
@@ -162,6 +172,14 @@ mod tests {
             (EngineError::Vault(VaultError::Verify), "vault"),
             (
                 EngineError::Unreadable(ReadError::new("k", "d")),
+                "unreadable",
+            ),
+            (
+                EngineError::UnreadableAccount {
+                    position: 1,
+                    label: "a".into(),
+                    source: ReadError::new("k", "d"),
+                },
                 "unreadable",
             ),
             (EngineError::UnknownProvider("p".into()), "unknown-provider"),

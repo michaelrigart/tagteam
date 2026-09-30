@@ -1,6 +1,6 @@
 use tagteam_core::{
     AccountId, OracleVerdict, OutgoingAction, OutgoingClass, OutgoingFacts, ProviderId,
-    decide_outgoing, next_in_rotation,
+    decide_outgoing, rotation_order,
 };
 use tagteam_provider::{
     BeforeFallback, Credential, DoomedEntry, Identity, LiveAuth, LiveChange, LiveLocks,
@@ -236,6 +236,13 @@ fn login_of(row: Option<&AccountRow>) -> Option<(&AccountId, &str, &str)> {
     row.map(|r| (&r.id, r.kind.as_str(), r.identity_key.as_str()))
 }
 
+/// A rotation candidate by the store alone (§9.3 "Reading the vault lazily"): enabled, not
+/// quarantined, and with an identity. Whether its vault holds a credential is read only when
+/// the walk reaches it.
+fn is_candidate(row: &AccountRow) -> bool {
+    !row.disabled && row.quarantine_reason.is_none() && row.identity_json.is_object()
+}
+
 /// The pre-lock oracle answer (§9.4 "Before locking"). It is about exact live bytes, not
 /// about an account: it counts only while the live secret is still those bytes (§9.4 step 4),
 /// and is attributed to an account only through `verdict` (§7.6).
@@ -400,22 +407,23 @@ impl Drop for Rollback<'_, '_> {
 }
 
 impl Engine {
-    /// An identity and a non-empty vault credential. A vault that cannot be read is reported,
-    /// never taken for a missing credential (§4.3).
-    fn has_login(&self, row: &AccountRow) -> Result<bool, EngineError> {
-        if !row.identity_json.is_object() {
-            return Ok(false);
-        }
+    /// Whether `row`'s vault holds a credential. A vault that cannot be read is reported,
+    /// naming the account, never taken for a missing credential (§4.3, §9.3).
+    fn vault_holds_login(&self, row: &AccountRow) -> Result<bool, EngineError> {
         match self.vault.read(&row.id) {
             Read::Present(b) => Ok(!b.is_empty()),
             Read::Absent => Ok(false),
-            Read::Unreadable(e) => Err(EngineError::Unreadable(e)),
+            Read::Unreadable(source) => Err(EngineError::UnreadableAccount {
+                position: row.position,
+                label: row.label.clone(),
+                source,
+            }),
         }
     }
 
-    /// "Switchable": a vault credential and an identity, and not disabled (§9.3).
-    fn is_switchable(&self, row: &AccountRow) -> Result<bool, EngineError> {
-        Ok(!row.disabled && self.has_login(row)?)
+    /// An identity and a non-empty vault credential.
+    fn has_login(&self, row: &AccountRow) -> Result<bool, EngineError> {
+        Ok(row.identity_json.is_object() && self.vault_holds_login(row)?)
     }
 
     fn matches_vault(&self, p: &dyn Provider, row: &AccountRow, live: &[u8]) -> bool {
@@ -453,42 +461,58 @@ impl Engine {
         Ok((live, row))
     }
 
-    /// §9.3 rotation: the next switchable position after the live account when it is managed
-    /// (`live_row`), even if the store's active account disagrees (§6.1: the live identity
-    /// wins). With no live login, or an unmanaged one, the store's active account if
-    /// switchable, else the first. §9.2: fewer than two switchable accounts stay put.
+    /// §9.3 rotation, reading the vault lazily.
+    ///
+    /// - The candidates are counted from the store: with a managed live anchor and fewer than
+    ///   two of them, it stays put (§9.2).
+    /// - The walk starts after the live account when it is managed (`live_row`), even if the
+    ///   store's active account disagrees (§6.1: the live identity wins). With no live login,
+    ///   or an unmanaged one, it starts at the store's active account if that is a candidate,
+    ///   then goes on from the first position.
+    /// - Each vault is read only when the walk reaches it, and the walk stops at the first one
+    ///   that holds a credential. An unreadable one before that could have been the pick, so
+    ///   it fails naming the account; no account after the pick is ever read.
     fn rotation(
         &self,
         store: &Store,
         provider: &ProviderId,
         live_row: Option<&AccountRow>,
     ) -> Result<Rotation, EngineError> {
+        const ONLY_ONE: &str = "there is only one switchable account";
         let accounts = store.accounts(provider)?;
-        let slots = accounts
-            .iter()
-            .map(|a| Ok((a.position, self.is_switchable(a)?)))
-            .collect::<Result<Vec<(u32, bool)>, EngineError>>()?;
-        if live_row.is_some() && slots.iter().filter(|(_, s)| *s).count() < 2 {
-            return Ok(Rotation::Stay(
-                SwitchReason::OnlyOneAccount,
-                "there is only one switchable account",
-            ));
+        let candidates: Vec<&AccountRow> = accounts.iter().filter(|a| is_candidate(a)).collect();
+        if live_row.is_some() && candidates.len() < 2 {
+            return Ok(Rotation::Stay(SwitchReason::OnlyOneAccount, ONLY_ONE));
         }
-        let position = match live_row {
-            Some(live) => next_in_rotation(&slots, Some(live.position)),
-            None => store
-                .active(provider)?
-                .and_then(|id| accounts.iter().find(|a| a.id == id))
-                .map(|a| a.position)
-                .filter(|pos| slots.contains(&(*pos, true)))
-                .or_else(|| next_in_rotation(&slots, None)),
+        let positions: Vec<u32> = candidates.iter().map(|a| a.position).collect();
+        let order: Vec<u32> = match live_row {
+            Some(live) => rotation_order(&positions, Some(live.position)),
+            None => {
+                let rest = rotation_order(&positions, None);
+                let active = store
+                    .active(provider)?
+                    .and_then(|id| candidates.iter().find(|a| a.id == id))
+                    .map(|a| a.position);
+                match active {
+                    Some(first) => std::iter::once(first)
+                        .chain(rest.into_iter().filter(|p| *p != first))
+                        .collect(),
+                    None => rest,
+                }
+            }
         };
-        Ok(
-            match position.and_then(|pos| accounts.into_iter().find(|a| a.position == pos)) {
-                Some(a) => Rotation::To(a),
-                None => Rotation::Stay(SwitchReason::NoValidTarget, "no account can be activated"),
-            },
-        )
+        for position in order {
+            let Some(row) = candidates.iter().find(|a| a.position == position) else {
+                continue;
+            };
+            if self.vault_holds_login(row)? {
+                return Ok(Rotation::To((*row).clone()));
+            }
+        }
+        Ok(match live_row {
+            Some(_) => Rotation::Stay(SwitchReason::OnlyOneAccount, ONLY_ONE),
+            None => Rotation::Stay(SwitchReason::NoValidTarget, "no account can be activated"),
+        })
     }
 
     /// §9.4 "Before locking": asks the oracle about the outgoing live secret when it is not

@@ -1,40 +1,50 @@
-/// The next switchable position after `anchor`, wrapping around (§9.3 rotation). With no
-/// anchor, the first switchable position. `None` when no other account is switchable.
-pub fn next_in_rotation(accounts: &[(u32, bool)], anchor: Option<u32>) -> Option<u32> {
-    let mut switchable = accounts.iter().filter(|(_, s)| *s).map(|(p, _)| *p);
-    match anchor {
-        None => switchable.next(),
-        Some(a) => {
-            let all: Vec<u32> = switchable.collect();
-            all.iter()
-                .copied()
-                .find(|p| *p > a)
-                .or_else(|| all.iter().copied().find(|p| *p != a))
-        }
-    }
+/// §9.3: the positions a rotation tries, in order. With an anchor, every position after it,
+/// wrapping around, and never the anchor itself; with none, every position from the first.
+/// The input need not be sorted, and a repeated position is tried once.
+pub fn rotation_order(positions: &[u32], anchor: Option<u32>) -> Vec<u32> {
+    let mut sorted = positions.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let Some(anchor) = anchor else {
+        return sorted;
+    };
+    let (before, after): (Vec<u32>, Vec<u32>) = sorted
+        .into_iter()
+        .filter(|p| *p != anchor)
+        .partition(|p| *p < anchor);
+    after.into_iter().chain(before).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::next_in_rotation;
+    use super::rotation_order;
 
     #[test]
-    fn picks_the_next_switchable_position_and_wraps() {
-        let a = [(1, true), (2, false), (3, true), (5, true)];
-        assert_eq!(next_in_rotation(&a, Some(1)), Some(3));
-        assert_eq!(next_in_rotation(&a, Some(3)), Some(5));
-        assert_eq!(next_in_rotation(&a, Some(5)), Some(1));
-        assert_eq!(next_in_rotation(&a, Some(2)), Some(3));
+    fn positions_after_the_anchor_come_first_and_wrap() {
+        let positions = [1, 2, 3, 5];
+        assert_eq!(rotation_order(&positions, Some(1)), [2, 3, 5]);
+        assert_eq!(rotation_order(&positions, Some(3)), [5, 1, 2]);
+        assert_eq!(rotation_order(&positions, Some(5)), [1, 2, 3]);
     }
 
     #[test]
-    fn no_anchor_takes_the_first_switchable() {
-        assert_eq!(next_in_rotation(&[(2, false), (4, true)], None), Some(4));
+    fn an_anchor_outside_the_list_still_orders_from_after_it() {
+        assert_eq!(rotation_order(&[1, 3, 5], Some(4)), [5, 1, 3]);
     }
 
     #[test]
-    fn only_the_anchor_switchable_yields_none() {
-        assert_eq!(next_in_rotation(&[(1, true), (2, false)], Some(1)), None);
-        assert_eq!(next_in_rotation(&[], None), None);
+    fn no_anchor_takes_every_position_from_the_first() {
+        assert_eq!(rotation_order(&[4, 2], None), [2, 4]);
+    }
+
+    #[test]
+    fn unsorted_or_repeated_input_is_tried_once_in_order() {
+        assert_eq!(rotation_order(&[5, 1, 3, 1], Some(3)), [5, 1]);
+    }
+
+    #[test]
+    fn only_the_anchor_yields_nothing() {
+        assert!(rotation_order(&[1], Some(1)).is_empty());
+        assert!(rotation_order(&[], None).is_empty());
     }
 }

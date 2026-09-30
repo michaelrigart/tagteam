@@ -352,7 +352,8 @@ fn rotation_skips_disabled_accounts_but_direct_targets_may_be_disabled() {
 #[test]
 fn an_unreadable_vault_is_reported_as_unreadable_never_as_missing() {
     // §4.3: an unreadable vault item is not an absent one. A direct target says so, and a
-    // rotation neither skips the account nor calls the other one the only switchable account.
+    // rotation that meets it before its pick neither skips the account nor calls the other one
+    // the only switchable account: both name the account (§9.3).
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b"); // live: b
@@ -360,7 +361,7 @@ fn an_unreadable_vault_is_reported_as_unreadable_never_as_missing() {
     for target in [SwitchTarget::Rotation, to(&a)] {
         let err = switch(&fx, target.clone(), false).unwrap_err();
         assert!(
-            matches!(err, EngineError::Unreadable(_)),
+            matches!(&err, EngineError::UnreadableAccount { position: 1, label, .. } if label == "a@x.co"),
             "{target:?}: {err}"
         );
         assert!(!err.to_string().contains("no stored credential"), "{err}");
