@@ -207,7 +207,12 @@ impl Engine {
   round-tripped. The `~/.claude.json` splice is span-based and never re-serializes the file
   (§9.5).
 - **Secrets.** Keychain access goes through `/usr/bin/security` only. The Security.framework
-  is never used (§17, R1).
+  is never used for Keychain items (§17, R1). The HTTP stack's `rustls-platform-verifier` does
+  link it on macOS, but only for certificate trust evaluation, which touches no Keychain item.
+- **Proxies.** The HTTP adapter honours the standard proxy environment variables (`HTTPS_PROXY`,
+  `ALL_PROXY`, `NO_PROXY`, …). When a proxy applies to a request, tagteam does not resolve the
+  host itself; the proxy does, and a failure to reach the proxy is `PreSend`. Tests never
+  inherit the environment's proxy.
 - **Encryption.** The `age` crate: passphrase via scrypt, or X25519 and SSH recipients.
 - **Logging.** `tracing` to a rolling file, controlled by `--debug` or `TAGTEAM_LOG`. Log lines
   identify accounts by position and ID, never by email, because users paste logs into public
