@@ -126,9 +126,12 @@ Every task's requirements include these. Values are copied from the spec.
 - A usage fetch never refreshes the active account's token itself; only §7.5 does. An inactive
   account's token is refreshed only through the gate (§7.3, §8.1).
 - No lock is held during a usage fetch, other than the ones the gate or §7.5 take for their own
-  refresh (§8.3). The oracle is never called under any lock (§7.6).
-- Leases: `usage:<id>`, 90 s TTL, taken with §6.1's single statement; a result is recorded only
-  if the lease row still shows the same holder and the account's identity is unchanged (§8.3).
+  refresh (§8.3). The active path takes tagteam's mutation lock only around its read of the live
+  identity and credential, and drops it before any request (Task 11). The oracle is never called
+  under any lock (§7.6).
+- Leases: `usage:<id>`, 90 s TTL, taken with §6.1's single statement; a result is recorded, a
+  refusal stamped, and a request sent only if the lease row still shows the same holder and the
+  account's identity is unchanged (§8.3; Task 8's `authorize_send`).
 - Failure never touches `last_good` or `fetched_at` (§8.3).
 - Poll constants, trust, backoff and pace: exactly §8.4–§8.7 (as amended in `c3a735e`).
 - Secrets never reach `Debug`, logs or error messages. Log lines identify accounts by position
@@ -150,8 +153,11 @@ pinning test in the task named.
    each account is fetched at most once per lease, and the budget counts each request exactly
    once. → Task 8 (two stores on one file) and Task 10 (two engines on one data dir).
 2. **A process suspended between reserving and sending** (laptop lid closed). Expected: a slot
-   older than 60 s is discarded and a fresh one reserved before sending; a result recorded after
-   another process took the lease is dropped. → Task 8 (slot age) and Task 10 (late record).
+   older than 60 s is discarded and a fresh one reserved before sending; a slot handed back after
+   more than the count window deletes nothing, even when its rowid was reused; a sender that lost
+   its lease sends nothing, and a result recorded after another process took the lease is
+   dropped. → Task 8 (slot age, rowid reuse, `authorize_send`) and Task 10 (late send, late
+   record).
 3. **A hostile or odd `Retry-After`** (`0`, `1e400`, `inf`, `-5`, an HTTP date). Expected:
    seconds form only; non-finite values clamp to the cap and are never stored; a date is
    ignored. → Task 3.
@@ -486,10 +492,11 @@ pub struct UsageStateRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     pub account_id: AccountId,
+    pub provider: ProviderId,     // the budget's key, with identity_key
     pub identity_key: String,
     pub holder: String,           // random per acquisition (uuid v7)
-    pub slot: i64,                // usage_requests rowid
-    pub slot_at: i64,             // when the slot was reserved
+    pub slot: i64,                // the first slot's usage_requests rowid
+    pub slot_at: i64,             // when the first slot was reserved
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,22 +505,36 @@ pub enum Ineligible { Quarantined, Backoff, Leased, NotDue }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reserve { Reserved(Reservation), Ineligible(Ineligible), OverBudget { next_free_at: i64 } }
 
+/// A budget slot: its `usage_requests` rowid and reservation time. Its full identity is these
+/// plus the reservation's `provider` and `identity_key`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot { pub slot: i64, pub slot_at: i64 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendGrant { Send(Slot), Rejected, LeaseLost, OverBudget { next_free_at: i64 } }
 
 impl Store {
     pub fn usage_state(&self, id: &AccountId) -> Result<Option<UsageStateRow>, StoreError>;
     /// Phase 1 (§8.3), one IMMEDIATE transaction: eligibility (the on-demand rule when
-    /// `on_demand`), the `usage:<id>` lease, pruning and counting `usage_requests`, and the slot.
-    /// An over-budget result sets `next_poll_at` to `next_free_at` and takes no lease.
+    /// `on_demand`), the `usage:<id>` lease, pruning and counting `usage_requests`, and the
+    /// first slot (`Reservation.slot`, `slot_at`). An over-budget result sets `next_poll_at` to
+    /// `next_free_at` and takes no lease.
     pub fn reserve_usage(&self, account: &AccountRow, now_ms: i64, on_demand: bool,
                          budget: &PollBudget) -> Result<Reserve, StoreError>;
-    /// A further slot under a held reservation: the 401 retry, or a re-reservation once a slot
-    /// is older than `slot_valid_s` (§8.6). `Err(next_free_at)` when over budget.
-    pub fn reserve_slot(&self, r: &Reservation, now_ms: i64, budget: &PollBudget)
-        -> Result<Result<Slot, i64>, StoreError>;
-    /// Gives a slot back (a fetch that ended before sending, §8.3).
-    pub fn release_slot(&self, slot: i64) -> Result<(), StoreError>;
+    /// Right before each request (§8.3, §8.6), in one IMMEDIATE transaction: `r` must still hold
+    /// the `usage:<id>` lease (its row names `r.holder`, as the records' fence reads it) and the
+    /// account's identity key must be unchanged (else `LeaseLost`); `access_fp` must not equal
+    /// the durable `rejected_fp` (else `Rejected`). Then a slot to send
+    /// under: `slot` itself while it is at most `slot_valid_s` old; otherwise a fresh one, giving
+    /// the stale one back by its full identity; a fresh one when `slot` is None (the 401 retry).
+    /// `OverBudget` when no fresh slot is free (the stale one is still given back). `LeaseLost`
+    /// and `Rejected` write nothing.
+    pub fn authorize_send(&self, r: &Reservation, slot: Option<&Slot>, access_fp: Option<&str>,
+                          now_ms: i64, budget: &PollBudget) -> Result<SendGrant, StoreError>;
+    /// Gives a slot back (a fetch that ended before sending, §8.3), in one statement matching
+    /// its full identity: `rowid`, `provider`, `identity_key` and `at`. A slot whose row was
+    /// pruned deletes nothing, even when SQLite has since reused its rowid.
+    pub fn release_slot(&self, r: &Reservation, slot: &Slot) -> Result<(), StoreError>;
     /// Phase 3, success. Fenced by the lease holder and the account's identity key; `Ok(false)`
     /// when the fence failed (nothing written). Writes `last_good`, `fetched_at`,
     /// `last_attempt_at`, resets the failure fields and `rejected_fp`, stores the plan, inserts
@@ -523,13 +544,15 @@ impl Store {
                         retention_days: u32) -> Result<bool, StoreError>;
     /// Phase 3, failure. Same fence. Never touches `last_good` or `fetched_at`. Increments
     /// `consecutive_failures`, sets `last_error`, `last_attempt_at`, `backoff_until`, and
-    /// `last_429_at` when given; deletes `release` (the unused slot) in the same transaction.
+    /// `last_429_at` when given; deletes `release` (the unused slot) by its full identity in the
+    /// same transaction.
     pub fn record_usage_failure(&self, r: &Reservation, kind: &str, now_s: i64,
                                 backoff_until: i64, last_429_at: Option<i64>,
-                                release: Option<i64>) -> Result<bool, StoreError>;
+                                release: Option<&Slot>) -> Result<bool, StoreError>;
+    /// Same fence: only while `r` holds the lease; `Ok(false)` and nothing written otherwise.
     /// Creates the row if missing (a 401 can come on an account's first fetch).
     /// `record_usage_failure` leaves `rejected_fp` alone; `record_usage` clears it.
-    pub fn set_rejected_fp(&self, id: &AccountId, fp: Option<&str>) -> Result<(), StoreError>;
+    pub fn set_rejected_fp(&self, r: &Reservation, fp: Option<&str>) -> Result<bool, StoreError>;
     /// §8.3's post-switch re-plan. Task 12 calls it only for an account that has a reading,
     /// so an unread account keeps no plan and stays eligible on demand.
     pub fn set_poll_plan(&self, id: &AccountId, plan: &PollPlan) -> Result<(), StoreError>;
@@ -5831,14 +5854,15 @@ git commit -m "Add usage fetching, poll budgets and rendering to every provider"
 The usage tables have been in `schema.sql` since M1, but nothing reads or writes them. This task
 gives the store every accessor the collector (Tasks 10 and 11), the post-switch re-plan (Task 12)
 and the views (Task 13) need. It lives in a child module of `store`, so it can use `Store`'s
-private `lock()` and `exec()`. No migration: every column already exists.
+private `lock()`. No migration: every column already exists.
 
 Rulings made here, each pinned by a test:
 - **Every new transaction that reads before it writes is `IMMEDIATE`**, not only the reserve:
-  Decision 8's reasoning applies equally to the fence in `record_usage` and
-  `record_usage_failure` and to the count in `reserve_slot`. In WAL mode, a `DEFERRED`
-  transaction whose read is overtaken by another connection's commit fails at once with
-  `SQLITE_BUSY` instead of waiting out `busy_timeout`. With `DEFERRED` transactions, both
+  Decision 8's reasoning applies equally to the fence in `record_usage`,
+  `record_usage_failure` and `set_rejected_fp`, and to the fence and count in
+  `authorize_send`. In WAL mode, a `DEFERRED` transaction whose read is overtaken by another
+  connection's commit fails at once with `SQLITE_BUSY` instead of waiting out
+  `busy_timeout`. With `DEFERRED` transactions, both
   `two_stores_racing_*` tests fail (checked while writing this plan). Existing store
   transactions are unchanged.
 - **Eligibility is checked in §8.3's order:** `Quarantined`, `Backoff`, `Leased`, then the
@@ -5859,21 +5883,32 @@ Rulings made here, each pinned by a test:
 - **Recording leaves the lease to expire** (§8.3). A failed fence writes nothing, including
   the slot release, so an unsent slot stays counted for its hour. That only errs toward
   sending less.
+- **A slot is deleted only by its full identity**: `rowid`, `provider`, `identity_key` and `at`,
+  in one statement (`release_slot`, `record_usage_failure`'s `release`, and `authorize_send`'s
+  stale slot). `usage_requests` has no `AUTOINCREMENT`, so SQLite gives a pruned row's rowid to
+  a later insert, and a process that slept past the count window would otherwise delete another
+  process's slot. `Reservation` carries `provider` for this and for the budget key.
+- **Nothing is sent without `authorize_send`**, one `IMMEDIATE` transaction right before each
+  request, checked in this order: the lease and identity fence (else `LeaseLost`), the durable
+  `rejected_fp` (else `Rejected`), then the slot. `LeaseLost` and `Rejected` write nothing: a
+  lost holder's unsent slot stays counted, as after any failed fence, and a refused token's
+  slot is given back by the caller's failure record. The fence is the records' own: the lease
+  row still names the holder, expired or not (§6.1: a result is recorded "only if the lease row
+  still shows the same holder"). An expired lease that no one took over is harmless to send
+  under, and the durable `rejected_fp` check covers what a takeover could have stamped.
+- **`set_rejected_fp` is fenced like the records**, so only the lease's holder stamps or clears
+  a refusal; it still creates a missing `usage_state` row.
 - **A `live_identity_cache` row without `path`, `mtime_ns` or `size`** reads as no row (a cache
   miss), since the struct's key fields are not optional.
 
 Notes for later tasks:
-- Task 10: a slot handle is a rowid, and SQLite can reuse the rowid of a pruned row. Give a
-  slot back only while `now − slot_at < count_window_s`. A sender resumed after more than an
-  hour (Review Focus 2) just reserves a fresh slot, and that reservation's prune removes the
-  stale row.
-- Task 10: to replace a stale slot, call `release_slot(old)` first and then `reserve_slot`, so
-  that a full hour does not refuse the replacement for a slot that is about to go. For the 401
-  retry, keep the first slot: that request was sent.
-- Task 10: an account removed mid-fetch makes `reserve_slot` return
-  `Err(StoreError::NoSuchAccount)` (`Reservation` carries no provider, so the slot's provider
-  is read from the account row), and makes both record calls return `Ok(false)`, because the
-  identity fence fails.
+- Task 10: call `authorize_send` immediately before every request, the first and the 401
+  retry, with the access-token fingerprint of the exact bytes about to be sent. Pass the held
+  slot for the first request (the reservation's, as a `Slot`) and `None` for the retry, whose
+  first slot was spent on the refused request.
+- Task 10: an account removed or re-logged mid-fetch makes `authorize_send` return `LeaseLost`,
+  and `set_rejected_fp` and both record calls return `Ok(false)`, because the identity fence
+  fails.
 - Task 13: `fetched_at: Some(_)` with `last_good: None` is a successful reading with no
   windows.
 
@@ -5889,7 +5924,7 @@ Notes for later tasks:
     A row counts while `now_s − at < count_window_s`, and `next_free_at` is the moment enough
     rows have left.
   - Task 5: `tagteam_core::Sample`.
-  - Existing: `Store`'s private `lock()` and `exec()`, `AccountRow`,
+  - Existing: `Store`'s private `lock()`, `AccountRow`,
     `StoreError::NoSuchAccount`, `uuid::Uuid::now_v7` (already an engine dependency).
 - Produces (the contract's signatures, re-exported from `tagteam_engine::store`):
 ```rust
@@ -5911,10 +5946,11 @@ pub struct UsageStateRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     pub account_id: AccountId,
+    pub provider: ProviderId,     // the budget's key, with identity_key
     pub identity_key: String,
     pub holder: String,           // random per acquisition (uuid v7)
-    pub slot: i64,                // usage_requests rowid
-    pub slot_at: i64,             // when the slot was reserved
+    pub slot: i64,                // the first slot's usage_requests rowid
+    pub slot_at: i64,             // when the first slot was reserved
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5925,6 +5961,9 @@ pub enum Reserve { Reserved(Reservation), Ineligible(Ineligible), OverBudget { n
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot { pub slot: i64, pub slot_at: i64 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendGrant { Send(Slot), Rejected, LeaseLost, OverBudget { next_free_at: i64 } }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveIdentityCacheRow {
@@ -5941,15 +5980,15 @@ impl Store {
     pub fn usage_state(&self, id: &AccountId) -> Result<Option<UsageStateRow>, StoreError>;
     pub fn reserve_usage(&self, account: &AccountRow, now_ms: i64, on_demand: bool,
                          budget: &PollBudget) -> Result<Reserve, StoreError>;
-    pub fn reserve_slot(&self, r: &Reservation, now_ms: i64, budget: &PollBudget)
-        -> Result<Result<Slot, i64>, StoreError>;
-    pub fn release_slot(&self, slot: i64) -> Result<(), StoreError>;
+    pub fn authorize_send(&self, r: &Reservation, slot: Option<&Slot>, access_fp: Option<&str>,
+                          now_ms: i64, budget: &PollBudget) -> Result<SendGrant, StoreError>;
+    pub fn release_slot(&self, r: &Reservation, slot: &Slot) -> Result<(), StoreError>;
     pub fn record_usage(&self, r: &Reservation, windows: &[Window], now_s: i64, plan: &PollPlan,
                         retention_days: u32) -> Result<bool, StoreError>;
     pub fn record_usage_failure(&self, r: &Reservation, kind: &str, now_s: i64,
                                 backoff_until: i64, last_429_at: Option<i64>,
-                                release: Option<i64>) -> Result<bool, StoreError>;
-    pub fn set_rejected_fp(&self, id: &AccountId, fp: Option<&str>) -> Result<(), StoreError>;
+                                release: Option<&Slot>) -> Result<bool, StoreError>;
+    pub fn set_rejected_fp(&self, r: &Reservation, fp: Option<&str>) -> Result<bool, StoreError>;
     pub fn set_poll_plan(&self, id: &AccountId, plan: &PollPlan) -> Result<(), StoreError>;
     pub fn usage_samples(&self, id: &AccountId, window: Option<&str>, since_s: i64)
         -> Result<Vec<(String, Sample)>, StoreError>;
@@ -5976,8 +6015,8 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::json;
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Sample, Window, WindowKind};
 use tagteam_engine::store::{
-    Ineligible, LiveIdentityCacheRow, NewAccount, Reservation, Reserve, Store, StoreError,
-    UsageStateRow,
+    Ineligible, LiveIdentityCacheRow, NewAccount, Reservation, Reserve, SendGrant, Slot, Store,
+    StoreError, UsageStateRow,
 };
 use tagteam_provider::Identity;
 
@@ -6063,9 +6102,23 @@ fn reserved(s: &Store, id: &AccountId, now_ms: i64) -> Reservation {
     }
 }
 
+/// The first slot, the one `reserve_usage` took with the reservation.
+fn slot_of(r: &Reservation) -> Slot {
+    Slot {
+        slot: r.slot,
+        slot_at: r.slot_at,
+    }
+}
+
+/// A further slot under `r` at `now_ms`, as the 401 retry asks for one (no slot held, no
+/// token fingerprint).
+fn another_slot(s: &Store, r: &Reservation, now_ms: i64) -> SendGrant {
+    s.authorize_send(r, None, None, now_ms, &B).unwrap()
+}
+
 /// Takes the rest of the identity's hourly budget under `r`, at `now_ms`.
 fn spend_the_hour(s: &Store, r: &Reservation, now_ms: i64) {
-    while s.reserve_slot(r, now_ms, &B).unwrap().is_ok() {}
+    while matches!(another_slot(s, r, now_ms), SendGrant::Send(_)) {}
 }
 
 /// The reservation times `usage_requests` holds for one identity, ascending.
@@ -6143,6 +6196,7 @@ fn reserving_takes_the_lease_and_one_slot() {
     let now_ms = T_MS + 400;
     let r = reserved(&s, &a, now_ms);
     assert_eq!(r.account_id, a);
+    assert_eq!(r.provider, cc());
     assert_eq!(r.identity_key, "a@x.co\n");
     assert_eq!(r.slot_at, T, "slots are whole epoch seconds");
     assert_eq!(
@@ -6275,7 +6329,10 @@ fn over_budget_moves_the_plan_and_takes_no_lease() {
     spend_the_hour(&s, &r, T_MS);
     assert_eq!(slot_times(&path, &cc(), "a@x.co\n"), vec![T; 20]);
     let free = T + B.count_window_s;
-    assert_eq!(s.reserve_slot(&r, T_MS, &B).unwrap(), Err(free));
+    assert_eq!(
+        another_slot(&s, &r, T_MS),
+        SendGrant::OverBudget { next_free_at: free }
+    );
 
     // The lease has expired and the account is due, but its identity has spent the hour.
     let later = T_MS + 91_000;
@@ -6315,11 +6372,13 @@ fn a_row_leaves_the_count_exactly_one_window_after_it_was_reserved() {
     assert_eq!(all_slots(&path), 21);
     let edge = T + B.count_window_s;
     assert_eq!(
-        s.reserve_slot(&r, (edge - 1) * 1000, &B).unwrap(),
-        Err(edge),
+        another_slot(&s, &r, (edge - 1) * 1000),
+        SendGrant::OverBudget { next_free_at: edge },
         "one second before, every row still counts"
     );
-    let slot = s.reserve_slot(&r, edge * 1000, &B).unwrap().unwrap();
+    let SendGrant::Send(slot) = another_slot(&s, &r, edge * 1000) else {
+        panic!("a slot frees exactly one window on");
+    };
     assert_eq!(slot.slot_at, edge);
     assert_eq!(
         slot_times(&path, &cc(), "a@x.co\n"),
@@ -6330,18 +6389,126 @@ fn a_row_leaves_the_count_exactly_one_window_after_it_was_reserved() {
 }
 
 #[test]
+fn a_slot_still_valid_is_the_one_sent_under() {
+    // §8.6: a slot is valid for `slot_valid_s`; within it, the send takes no second slot.
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let r = reserved(&s, &a, T_MS);
+    let last_valid_ms = (T + B.slot_valid_s) * 1000;
+    assert_eq!(
+        s.authorize_send(&r, Some(&slot_of(&r)), Some("sha256:ok"), last_valid_ms, &B)
+            .unwrap(),
+        SendGrant::Send(slot_of(&r))
+    );
+    assert_eq!(slot_times(&path, &cc(), "a@x.co\n"), vec![T]);
+}
+
+#[test]
 fn a_stale_slot_is_given_back_and_a_fresh_one_reserved() {
     // Review Focus 2: a sender suspended past `slot_valid_s` discards its slot and reserves
-    // again, so the budget counts the request once, at its fresh time.
+    // again, in the one authorization, so the budget counts the request once, at its fresh
+    // time.
     let (_d, path, s) = open();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let r = reserved(&s, &a, T_MS);
     let resumed = T + B.slot_valid_s + 1;
     assert!(resumed - r.slot_at > B.slot_valid_s);
-    s.release_slot(r.slot).unwrap();
-    let fresh = s.reserve_slot(&r, resumed * 1000, &B).unwrap().unwrap();
+    let SendGrant::Send(fresh) = s
+        .authorize_send(&r, Some(&slot_of(&r)), Some("sha256:ok"), resumed * 1000, &B)
+        .unwrap()
+    else {
+        panic!("a stale slot is replaced");
+    };
     assert_eq!(fresh.slot_at, resumed);
-    assert_eq!(slot_times(&path, &cc(), "a@x.co\n"), vec![resumed]);
+    assert_ne!(fresh, slot_of(&r));
+    assert_eq!(slot_times(&path, &cc(), "a@x.co\n"), vec![resumed], "the stale row is gone");
+}
+
+#[test]
+fn over_budget_a_stale_slot_is_still_given_back() {
+    // The stale slot goes back before the count, and stays gone when no fresh slot is free.
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let r = reserved(&s, &a, T_MS);
+    let c = raw(&path);
+    for _ in 0..B.hourly_requests {
+        c.execute(
+            "INSERT INTO usage_requests (provider, identity_key, at) VALUES ('claude-code', ?1, ?2)",
+            params!["a@x.co\n", T + 1],
+        )
+        .unwrap();
+    }
+    let resumed = T + B.slot_valid_s + 1;
+    assert_eq!(
+        s.authorize_send(&r, Some(&slot_of(&r)), None, resumed * 1000, &B)
+            .unwrap(),
+        SendGrant::OverBudget {
+            next_free_at: T + 1 + B.count_window_s
+        }
+    );
+    assert_eq!(
+        slot_times(&path, &cc(), "a@x.co\n"),
+        vec![T + 1; B.hourly_requests as usize],
+        "the stale slot went back and no fresh one was taken"
+    );
+}
+
+#[test]
+fn a_holder_that_lost_the_lease_or_the_identity_is_not_authorized() {
+    // §8.3's fence, before every request: a sender suspended past its lease, or whose account
+    // was re-logged meanwhile, sends nothing, and nothing is written: no slot is inserted and
+    // the held one is left counted, as after any failed fence.
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let first = reserved(&s, &a, T_MS);
+    let second = reserved(&s, &a, T_MS + 90_000);
+    let later = T_MS + 91_000;
+    for slot in [Some(slot_of(&first)), None] {
+        assert_eq!(
+            s.authorize_send(&first, slot.as_ref(), Some("sha256:ok"), later, &B)
+                .unwrap(),
+            SendGrant::LeaseLost
+        );
+    }
+    assert_eq!(all_slots(&path), 2, "no slot inserted, none given back");
+
+    s.update_login(&a, "z@x.co\n", &identity("z@x.co"), "oauth", None)
+        .unwrap();
+    assert_eq!(
+        s.authorize_send(&second, Some(&slot_of(&second)), None, later, &B)
+            .unwrap(),
+        SendGrant::LeaseLost,
+        "the identity fence"
+    );
+    assert_eq!(all_slots(&path), 2);
+}
+
+#[test]
+fn a_token_the_server_refused_is_not_authorized() {
+    // §8.1: the durable `rejected_fp`, not the sender's own copy, decides, so a token refused
+    // since the sender read its state is not sent.
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let r = reserved(&s, &a, T_MS);
+    assert!(s.set_rejected_fp(&r, Some("sha256:refused")).unwrap());
+    assert_eq!(
+        s.authorize_send(&r, Some(&slot_of(&r)), Some("sha256:refused"), T_MS, &B)
+            .unwrap(),
+        SendGrant::Rejected
+    );
+    assert_eq!(
+        s.authorize_send(&r, None, Some("sha256:refused"), T_MS, &B)
+            .unwrap(),
+        SendGrant::Rejected
+    );
+    assert_eq!(all_slots(&path), 1, "nothing written");
+    for fp in [Some("sha256:other"), None] {
+        assert_eq!(
+            s.authorize_send(&r, Some(&slot_of(&r)), fp, T_MS, &B)
+                .unwrap(),
+            SendGrant::Send(slot_of(&r))
+        );
+    }
 }
 
 #[test]
@@ -6350,11 +6517,40 @@ fn a_released_slot_returns_to_the_budget() {
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let r = reserved(&s, &a, T_MS);
     spend_the_hour(&s, &r, T_MS);
-    assert!(s.reserve_slot(&r, T_MS, &B).unwrap().is_err());
-    s.release_slot(r.slot).unwrap();
+    assert!(matches!(
+        another_slot(&s, &r, T_MS),
+        SendGrant::OverBudget { .. }
+    ));
+    s.release_slot(&r, &slot_of(&r)).unwrap();
     assert_eq!(all_slots(&path), 19);
-    assert!(s.reserve_slot(&r, T_MS, &B).unwrap().is_ok());
+    assert!(matches!(another_slot(&s, &r, T_MS), SendGrant::Send(_)));
     assert_eq!(all_slots(&path), 20);
+}
+
+#[test]
+fn a_stale_release_never_deletes_the_slot_that_reused_its_rowid() {
+    // `usage_requests` has no AUTOINCREMENT: once a slot's row is pruned, SQLite gives its
+    // rowid to the next insert. A process that slept past the count window and then hands its
+    // slot back must not delete that other process's slot.
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let r = reserved(&s, &a, T_MS);
+    let later = T + B.count_window_s;
+    let other = reserved(&s, &b, later * 1000);
+    assert_eq!(other.slot, r.slot, "the pruned row's rowid was reused");
+
+    s.release_slot(&r, &slot_of(&r)).unwrap();
+    assert!(
+        s.record_usage_failure(&r, "pre-send", later, later + 30, None, Some(&slot_of(&r)))
+            .unwrap()
+    );
+    assert_eq!(
+        slot_times(&path, &cc(), "b@x.co\n"),
+        vec![later],
+        "b's slot still counts"
+    );
+    assert_eq!(all_slots(&path), 1);
 }
 
 #[test]
@@ -6372,7 +6568,7 @@ fn a_successful_record_writes_the_reading_the_plan_and_samples() {
         (1, None),
         "a first failure creates the row"
     );
-    s.set_rejected_fp(&a, Some("sha256:rejected")).unwrap();
+    assert!(s.set_rejected_fp(&r, Some("sha256:rejected")).unwrap());
 
     assert!(s.record_usage(&r, &windows(), T + 5, &plan(), 180).unwrap());
     assert_eq!(
@@ -6491,8 +6687,12 @@ fn a_record_after_another_holder_took_the_lease_is_dropped() {
             .unwrap()
     );
     assert!(
-        !s.record_usage_failure(&first, "http-500", T + 91, T + 121, None, Some(first.slot))
+        !s.record_usage_failure(&first, "http-500", T + 91, T + 121, None, Some(&slot_of(&first)))
             .unwrap()
+    );
+    assert!(
+        !s.set_rejected_fp(&first, Some("sha256:late")).unwrap(),
+        "a lost holder stamps no refusal"
     );
     assert_eq!(s.usage_state(&a).unwrap(), None, "nothing written");
     assert!(s.usage_samples(&a, None, 0).unwrap().is_empty());
@@ -6516,6 +6716,7 @@ fn a_record_for_a_changed_identity_is_dropped() {
         !s.record_usage_failure(&r, "http-500", T, T + 30, None, None)
             .unwrap()
     );
+    assert!(!s.set_rejected_fp(&r, Some("sha256:x")).unwrap());
     assert_eq!(s.usage_state(&a).unwrap(), None);
 }
 
@@ -6525,13 +6726,15 @@ fn a_failure_never_touches_the_last_good_reading() {
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let r = reserved(&s, &a, T_MS);
     assert!(s.record_usage(&r, &windows(), T, &plan(), 180).unwrap());
-    let unsent = s.reserve_slot(&r, T_MS + 1_000, &B).unwrap().unwrap();
+    let SendGrant::Send(unsent) = another_slot(&s, &r, T_MS + 1_000) else {
+        panic!("a slot is free");
+    };
     assert!(
         s.record_usage_failure(&r, "http-429", T + 1, T + 301, Some(T + 301), None)
             .unwrap()
     );
     assert!(
-        s.record_usage_failure(&r, "pre-send", T + 2, T + 62, None, Some(unsent.slot))
+        s.record_usage_failure(&r, "pre-send", T + 2, T + 62, None, Some(&unsent))
             .unwrap()
     );
     let st = s.usage_state(&a).unwrap().unwrap();
@@ -6639,12 +6842,13 @@ fn two_stores_racing_for_slots_never_exceed_the_budget() {
             scope.spawn(move || {
                 barrier.wait();
                 for _ in 0..5 {
-                    match s.reserve_slot(r, T_MS, &B).unwrap() {
-                        Ok(_) => granted.fetch_add(1, SeqCst),
-                        Err(free) => {
-                            assert_eq!(free, T + B.count_window_s);
+                    match another_slot(s, r, T_MS) {
+                        SendGrant::Send(_) => granted.fetch_add(1, SeqCst),
+                        SendGrant::OverBudget { next_free_at } => {
+                            assert_eq!(next_free_at, T + B.count_window_s);
                             refused.fetch_add(1, SeqCst)
                         }
+                        other => panic!("unexpected {other:?}"),
                     };
                 }
             });
@@ -6734,20 +6938,31 @@ fn set_poll_plan_sets_the_plan_alone_and_creates_the_row() {
 }
 
 #[test]
-fn rejected_fp_is_stamped_and_cleared() {
+fn rejected_fp_is_stamped_and_cleared_only_by_the_lease_holder() {
     let (_d, _path, s) = open();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
-    s.set_rejected_fp(&a, Some("sha256:refused")).unwrap();
+    let first = reserved(&s, &a, T_MS);
+    assert!(s.set_rejected_fp(&first, Some("sha256:refused")).unwrap());
     assert_eq!(
         s.usage_state(&a).unwrap().unwrap().rejected_fp.as_deref(),
-        Some("sha256:refused")
+        Some("sha256:refused"),
+        "a first stamp creates the row"
     );
-    s.set_rejected_fp(&a, None).unwrap();
+    assert!(s.set_rejected_fp(&first, None).unwrap());
     assert_eq!(s.usage_state(&a).unwrap().unwrap().rejected_fp, None);
-    assert!(matches!(
-        s.set_rejected_fp(&AccountId::from_string("nobody"), Some("sha256:x")),
-        Err(StoreError::NoSuchAccount)
-    ));
+
+    let second = reserved(&s, &a, T_MS + 90_000);
+    assert!(
+        !s.set_rejected_fp(&first, Some("sha256:late")).unwrap(),
+        "the lease was taken over"
+    );
+    assert_eq!(s.usage_state(&a).unwrap().unwrap().rejected_fp, None);
+
+    s.delete_account(&a).unwrap();
+    assert!(
+        !s.set_rejected_fp(&second, Some("sha256:x")).unwrap(),
+        "a removed account fails the identity fence"
+    );
 }
 
 #[test]
@@ -6798,7 +7013,8 @@ fn the_live_identity_cache_round_trips_per_provider() {
 Run: `cargo test -p tagteam-engine --test store_usage`
 Expected: FAIL to compile: ``unresolved imports `tagteam_engine::store::Ineligible`,
 `tagteam_engine::store::LiveIdentityCacheRow`, `tagteam_engine::store::Reservation`,
-`tagteam_engine::store::Reserve`, `tagteam_engine::store::UsageStateRow` `` and ``no method
+`tagteam_engine::store::Reserve`, `tagteam_engine::store::SendGrant`,
+`tagteam_engine::store::Slot`, `tagteam_engine::store::UsageStateRow` `` and ``no method
 named `reserve_usage` found for reference `&tagteam_engine::store::Store` ``.
 
 - [ ] **Step 3: Write the implementation**
@@ -6857,13 +7073,16 @@ pub struct UsageStateRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     pub account_id: AccountId,
+    /// The account's provider: with `identity_key`, the budget's key (§8.6), and part of every
+    /// slot's full identity.
+    pub provider: ProviderId,
     /// The account's identity when it was reserved; the record is fenced by it.
     pub identity_key: String,
     /// Random per acquisition (UUIDv7): the lease row names it while the lease is ours.
     pub holder: String,
-    /// The `usage_requests` rowid of the slot.
+    /// The `usage_requests` rowid of the first slot.
     pub slot: i64,
-    /// When the slot was reserved, in epoch seconds.
+    /// When the first slot was reserved, in epoch seconds.
     pub slot_at: i64,
 }
 
@@ -6887,11 +7106,29 @@ pub enum Reserve {
     },
 }
 
-/// A further budget slot under a held reservation.
+/// A budget slot under a held reservation. Its full identity is its rowid and time plus the
+/// reservation's `provider` and `identity_key`: SQLite reuses a pruned row's rowid, so the rowid
+/// alone does not name it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot {
+    /// The `usage_requests` rowid.
     pub slot: i64,
+    /// When it was reserved, in epoch seconds (the row's `at`).
     pub slot_at: i64,
+}
+
+/// What `authorize_send` allows right before a request (§8.3, §8.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendGrant {
+    /// Send now, under this slot.
+    Send(Slot),
+    /// The token about to be sent is the one the server refused (`rejected_fp`, §8.1).
+    Rejected,
+    /// The lease row no longer names this holder, or the account's identity changed: send
+    /// nothing, record nothing.
+    LeaseLost,
+    /// No slot is free in the identity's hourly budget until `next_free_at`.
+    OverBudget { next_free_at: i64 },
 }
 
 /// The live identity as of one version of the provider's source file (§13.5). The file wins
@@ -6990,8 +7227,20 @@ fn insert_slot(
     })
 }
 
-/// §8.3's fence: the lease row still names this holder, and the account still has the
-/// identity it was reserved with.
+/// Gives a slot back by its full identity, in one statement. `usage_requests` has no
+/// `AUTOINCREMENT`, so SQLite gives a pruned row's rowid to a later insert; matching the
+/// provider, identity key and reservation time as well means a stale handle deletes nothing
+/// rather than another process's slot.
+fn delete_slot(c: &Connection, r: &Reservation, slot: &Slot) -> rusqlite::Result<usize> {
+    c.execute(
+        "DELETE FROM usage_requests \
+         WHERE rowid = ?1 AND provider = ?2 AND identity_key = ?3 AND at = ?4",
+        params![slot.slot, r.provider.as_str(), r.identity_key, slot.slot_at],
+    )
+}
+
+/// §8.3's fence: the lease row still names this holder (expired or not, §6.1), and the account
+/// still has the identity it was reserved with.
 fn fenced(c: &Connection, r: &Reservation) -> rusqlite::Result<bool> {
     c.query_row(
         "SELECT EXISTS(SELECT 1 FROM leases WHERE name = ?1 AND holder = ?2) \
@@ -7128,6 +7377,7 @@ impl Store {
         tx.commit()?;
         Ok(Reserve::Reserved(Reservation {
             account_id: id.clone(),
+            provider: ProviderId::new(provider),
             identity_key,
             holder,
             slot: slot.slot,
@@ -7135,41 +7385,65 @@ impl Store {
         }))
     }
 
-    /// A further slot under a held reservation (§8.6): the retry after a 401, or a fresh slot
-    /// once the held one is older than `slot_valid_s` (give that one back first, with
-    /// `release_slot`). Counted against the reservation's identity. `Err(next_free_at)` when
-    /// over budget; nothing else changes then.
-    pub fn reserve_slot(
+    /// Right before each request (§8.3, §8.6), in one `IMMEDIATE` transaction, so nothing is
+    /// sent on a stale view of the store. In order:
+    /// - `r` must still hold the `usage:<id>` lease (its row names `r.holder`) and the account
+    ///   must still have `r.identity_key`; otherwise `LeaseLost`, and nothing is written.
+    /// - `access_fp`, the fingerprint of the exact bytes about to be sent, must not equal the
+    ///   durable `rejected_fp` (§8.1), which another holder may have stamped since the caller
+    ///   read it; otherwise `Rejected`, and nothing is written.
+    /// - Then the slot to send under: `slot` itself while it is at most `slot_valid_s` old;
+    ///   otherwise a fresh one, after giving the stale one back by its full identity; a fresh
+    ///   one when `slot` is `None` (the 401 retry, whose first slot was sent). Counted against
+    ///   the reservation's `(provider, identity_key)`. `OverBudget` when no fresh slot is free;
+    ///   the stale one has still been given back.
+    pub fn authorize_send(
         &self,
         r: &Reservation,
+        slot: Option<&Slot>,
+        access_fp: Option<&str>,
         now_ms: i64,
         budget: &PollBudget,
-    ) -> Result<Result<Slot, i64>, StoreError> {
+    ) -> Result<SendGrant, StoreError> {
         let now_s = now_ms.div_euclid(1000);
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let provider: String = tx
-            .query_row(
-                "SELECT provider FROM accounts WHERE id = ?1",
-                [r.account_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NoSuchAccount)?;
-        let slot = match next_free_at(&tx, &provider, &r.identity_key, now_s, budget)? {
-            Some(at) => Err(at),
-            None => Ok(insert_slot(&tx, &provider, &r.identity_key, now_s)?),
+        if !fenced(&tx, r)? {
+            return Ok(SendGrant::LeaseLost);
+        }
+        if let Some(fp) = access_fp {
+            let rejected: Option<String> = tx
+                .query_row(
+                    "SELECT rejected_fp FROM usage_state WHERE account_id = ?1",
+                    [r.account_id.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if rejected.as_deref() == Some(fp) {
+                return Ok(SendGrant::Rejected);
+            }
+        }
+        if let Some(held) = slot {
+            if now_s - held.slot_at <= budget.slot_valid_s {
+                return Ok(SendGrant::Send(held.clone()));
+            }
+            delete_slot(&tx, r, held)?;
+        }
+        let provider = r.provider.as_str();
+        let grant = match next_free_at(&tx, provider, &r.identity_key, now_s, budget)? {
+            Some(next_free_at) => SendGrant::OverBudget { next_free_at },
+            None => SendGrant::Send(insert_slot(&tx, provider, &r.identity_key, now_s)?),
         };
         tx.commit()?;
-        Ok(slot)
+        Ok(grant)
     }
 
-    /// Gives a slot back: a fetch that ended before sending (§8.3), or a stale slot about to
-    /// be replaced (§8.6). The handle is a rowid, and SQLite can reuse the rowid of a pruned
-    /// row, so give a slot back only while it still counts: less than `count_window_s` after
-    /// its `slot_at`.
-    pub fn release_slot(&self, slot: i64) -> Result<(), StoreError> {
-        self.exec("DELETE FROM usage_requests WHERE rowid = ?1", &[&slot])?;
+    /// Gives a slot back (a fetch that ended before sending, §8.3) by its full identity, in one
+    /// statement: a slot whose row was pruned deletes nothing, even when SQLite has since given
+    /// its rowid to another slot.
+    pub fn release_slot(&self, r: &Reservation, slot: &Slot) -> Result<(), StoreError> {
+        delete_slot(&self.lock(), r, slot)?;
         Ok(())
     }
 
@@ -7217,7 +7491,7 @@ impl Store {
     /// `fetched_at`. Counts the failure and sets `last_error` (a kind token),
     /// `last_attempt_at` and `backoff_until`, and `last_429_at` when given (Decision 2: when
     /// that 429's backoff lifts). `release`, the slot of a request that was never sent, is
-    /// given back in the same transaction. The plan is left as it was.
+    /// given back by its full identity in the same transaction. The plan is left as it was.
     pub fn record_usage_failure(
         &self,
         r: &Reservation,
@@ -7225,7 +7499,7 @@ impl Store {
         now_s: i64,
         backoff_until: i64,
         last_429_at: Option<i64>,
-        release: Option<i64>,
+        release: Option<&Slot>,
     ) -> Result<bool, StoreError> {
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -7246,23 +7520,29 @@ impl Store {
             ],
         )?;
         if let Some(slot) = release {
-            tx.execute("DELETE FROM usage_requests WHERE rowid = ?1", [slot])?;
+            delete_slot(&tx, r, slot)?;
         }
         tx.commit()?;
         Ok(true)
     }
 
-    /// Stamps (or with `None`, clears) the access-token fingerprint a 401 refused (§8.1).
-    pub fn set_rejected_fp(&self, id: &AccountId, fp: Option<&str>) -> Result<(), StoreError> {
+    /// Stamps (or with `None`, clears) the access-token fingerprint a 401 refused (§8.1), only
+    /// while `r` holds the lease, under the records' fence: `Ok(false)` and nothing written
+    /// otherwise, so a holder that lost its lease cannot overwrite the new holder's stamp.
+    /// Creates the account's row if missing (a 401 can come on its first fetch).
+    pub fn set_rejected_fp(&self, r: &Reservation, fp: Option<&str>) -> Result<bool, StoreError> {
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        ensure_state(&tx, id)?;
+        if !fenced(&tx, r)? {
+            return Ok(false);
+        }
+        ensure_state(&tx, &r.account_id)?;
         tx.execute(
             "UPDATE usage_state SET rejected_fp = ?2 WHERE account_id = ?1",
-            params![id.as_str(), fp],
+            params![r.account_id.as_str(), fp],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// §8.3's post-switch re-plan: sets the plan alone, creating the row if missing.
@@ -7381,7 +7661,9 @@ each side):
 ```rust
 mod usage;
 
-pub use usage::{Ineligible, LiveIdentityCacheRow, Reservation, Reserve, Slot, UsageStateRow};
+pub use usage::{
+    Ineligible, LiveIdentityCacheRow, Reservation, Reserve, SendGrant, Slot, UsageStateRow,
+};
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -7391,10 +7673,12 @@ Run:
 cargo test -p tagteam-engine --test store_usage
 cargo test -p tagteam-engine
 ```
-Expected: PASS, 24 tests in `store_usage`, including
+Expected: PASS, 29 tests in `store_usage`, including
 `two_stores_racing_for_slots_never_exceed_the_budget` and
 `two_stores_racing_for_one_account_reserve_it_once` (Review Focus 1),
-`a_stale_slot_is_given_back_and_a_fresh_one_reserved` (Review Focus 2) and
+`a_stale_slot_is_given_back_and_a_fresh_one_reserved`,
+`a_holder_that_lost_the_lease_or_the_identity_is_not_authorized` and
+`a_stale_release_never_deletes_the_slot_that_reused_its_rowid` (Review Focus 2), and
 `removing_and_re_adding_keeps_the_hours_count` (Review Focus 4). Every other engine suite still
 passes.
 
@@ -7420,7 +7704,7 @@ Every new item is `pub` on `Store`, so nothing is dead code before Task 10 calls
 ```bash
 git add crates/tagteam-engine/src/store/mod.rs crates/tagteam-engine/src/store/usage.rs \
   crates/tagteam-engine/tests/store_usage.rs
-git commit -m "Add usage reservations, records, samples and the live-identity cache to the store"
+git commit -m "Add usage reservations, fenced send authorization, records, samples and the live-identity cache to the store"
 ```
 
 ---
@@ -7893,12 +8177,14 @@ git commit -m "Load settings and build the HTTP client on first use in the CLI"
 §8.3's collector for the on-demand callers (`list`, `status`): every listed account on its own
 scoped thread, three phases each. Phase 1 is Task 8's `reserve_usage`: eligibility, the
 `usage:<id>` lease and the budget slot, in one IMMEDIATE transaction. Phase 2 gets a token and
-sends, holding no lock but those the gate takes for its own refresh. Phase 3 records through
-Task 8's fenced writes, so a late or superseded result is dropped. This task builds the whole
-collector and the inactive account's token path (§8.1): the vault's token, refreshed through the
-gate (§7.3) first when it has expired or was refused, and one gate refresh plus one retry after a
-401. The active account is fetched here with its live token, read fresh and never refreshed;
-Task 11 hands its expired or refused token to §7.5.
+sends, holding no lock but those the gate takes for its own refresh; every request is first
+authorized by Task 8's fenced `authorize_send`, so a sender that lost its lease sends nothing.
+Phase 3 records through Task 8's fenced writes, so a late or superseded result is dropped. This
+task builds the whole collector and the inactive account's token path (§8.1): the vault's token,
+refreshed through the gate (§7.3) first when it has expired or was refused, and one gate refresh
+plus one retry after a 401. The active account is fetched here with its live token, read fresh
+and never refreshed; Task 11 hands its expired or refused token to §7.5, and reads it under the
+mutation lock.
 
 **Readings of the spec this task commits to:**
 - **Every failure backs off (§8.5)**, including a fetch that ended before sending
@@ -7910,10 +8196,22 @@ Task 11 hands its expired or refused token to §7.5.
   bytes are not sent again until they change", costs nothing for an inactive account. A 401
   stamps the token that was sent, and a stamped vault token goes to the gate before any
   request, so a gate that fails after a 401 never leads to the refused token being sent again
-  next time. `record_usage` clears the stamp on success (Task 8).
+  next time. `record_usage` clears the stamp on success (Task 8). The stamp is fenced like the
+  records (`set_rejected_fp`): a holder that lost its lease stamps nothing and stops, `Dropped`.
 - **No token that has expired or was refused is ever sent.** Every request goes through one
   `send`, which refuses such a token as `token-expired` and gives its slot back. A token the
   collector cannot refresh (a kind that does not refresh, or no refresh token) ends there too.
+- **Every request is authorized right before it is sent**, first send and 401 retry alike:
+  `send` calls Task 8's `authorize_send` with the access-token fingerprint of the exact bytes
+  it is about to send, and the slot it holds (`None` for the retry). `send`'s own refusal
+  checks the collector's copy of `rejected_fp`, read once after reserving; the store's check
+  is the durable one, which catches a collector that paused past its 90 s lease while another
+  process took the lease over, was refused this very token (401) and stamped it. On
+  `LeaseLost` the collector sends nothing and records nothing (`Dropped`); its unsent slot
+  stays counted, as after any failed fence (Task 8). On `Rejected` it records the failure
+  `token-expired` for the active account (whose refusal is §7.5's to handle, Task 11) or
+  `http-401` for an inactive one, and gives the slot back. On `OverBudget` it records
+  `over-budget`.
 - **Budget outcomes.** Over budget in phase 1 is `Collected::OverBudget`: the store moved
   `next_poll_at` and took no lease, and nothing else is recorded (§8.6: the existing reading
   keeps whatever trust §8.4 gives it). Over budget later, for the 401 retry or for a slot
@@ -7929,10 +8227,11 @@ Task 11 hands its expired or refused token to §7.5.
 - **A live login that moved** to another account before its token was read (a switch finished
   meanwhile) records nothing, since that token is not this account's: the slot goes back and
   the outcome is `Dropped`. It is the live token's counterpart to the store's identity fence.
-- **A slot is given back only while it is still counted.** `usage_requests` has no
-  `AUTOINCREMENT`, so once a slot's row has been pruned (older than 3660 s, after a long
-  suspend), SQLite may have given its rowid to another process's slot, and deleting it would
-  under-count that identity. Such a slot is left alone; it is outside the count already.
+- **A slot is given back by its full identity** (Task 8: `rowid`, provider, identity key and
+  time, in one statement), never by rowid alone. `usage_requests` has no `AUTOINCREMENT`, so
+  once a slot's row has been pruned (older than 3660 s, after a long suspend), SQLite may have
+  given its rowid to another process's slot; the full match deletes nothing then, so the
+  collector gives a slot back without checking its age.
 - **Errors.** A store or test-hook error is `collect_usage`'s `Err`. A refresh that returns an
   error is a recorded `refresh-failed` with a warning, never a command error (§8.3). A panic in
   a collector thread resumes on the caller.
@@ -7945,13 +8244,16 @@ Task 11 hands its expired or refused token to §7.5.
 **Design, and what was rejected.** One small struct, `Collection`, carries an account from its
 reservation to its record: the reservation, the one slot reserved for the next request while
 that request is unsent, the refused fingerprint as stamped so far, and the warnings. Every
-request goes through `send`, which checks the token, takes the slot (reserving a fresh one if it
-went stale, §8.6), and puts it back only if the request never left. A slot still held at the
-record is exactly the one to give back, so "nothing is sent without a slot" and "an unsent slot
-is returned" are each enforced in one place. Rejected: a typestate slot threaded through every
-step (more types for an invariant that `send` already holds), a general retry loop (§8.1 allows
-exactly one retry, after a 401), and renewing the lease before the retry (§6.1: leases bound only
-harmless overlap; the fence drops a late result).
+request goes through `send`, which checks the token, has the store authorize it and hand over
+the slot to send under (the held one, or a fresh one if it went stale, §8.6), and puts the slot
+back only if the request never left. A slot still held at the record is exactly the one to give
+back, so "nothing is sent without a slot and a held lease" and "an unsent slot is returned" are
+each enforced in one place. Rejected: a typestate slot threaded through every step (more types
+for an invariant that `send` already holds), a general retry loop (§8.1 allows exactly one
+retry, after a 401), renewing the lease before the retry (§6.1: leases bound only harmless
+overlap; the fence drops a late result), and a lease check in its own transaction beside the
+slot call (two transactions leave a window between the check and the slot, which one IMMEDIATE
+`authorize_send` does not).
 
 **Files:**
 - Create: `crates/tagteam-engine/src/collect.rs`
@@ -7971,18 +8273,20 @@ harmless overlap; the fence drops a late result).
     `Unauthorized`, `Failed { kind: TransientKind, retry_after_s }`),
     `Provider::fetch_usage(&self, http: &dyn Http, cred: &Credential) -> UsageResult`,
     `Provider::poll_budget(&self) -> PollBudget`, `Capabilities.usage` (true for Claude Code and
-    FakeAgent); `FakeAgent::usage_url()`, its `x-fake-token` request header and its
-    `{"meters": [{"id", "used", "renews"}]}` reply (windows `daily` Short, `monthly` Long)
+    FakeAgent); `FakeAgent::usage_url()`, its `authorization: Fake <token>` request header and
+    its `{"meters": [{"id", "used", "renews"}]}` reply (windows `daily` Short, `monthly` Long)
   - Task 8, on `Store`: `reserve_usage(&self, account: &AccountRow, now_ms: i64, on_demand: bool, budget: &PollBudget) -> Result<Reserve, StoreError>`,
-    `reserve_slot(&self, r: &Reservation, now_ms: i64, budget: &PollBudget) -> Result<Result<Slot, i64>, StoreError>`,
-    `release_slot(&self, slot: i64) -> Result<(), StoreError>`,
+    `authorize_send(&self, r: &Reservation, slot: Option<&Slot>, access_fp: Option<&str>, now_ms: i64, budget: &PollBudget) -> Result<SendGrant, StoreError>`,
+    `release_slot(&self, r: &Reservation, slot: &Slot) -> Result<(), StoreError>`,
     `record_usage(&self, r: &Reservation, windows: &[Window], now_s: i64, plan: &PollPlan, retention_days: u32) -> Result<bool, StoreError>`,
-    `record_usage_failure(&self, r: &Reservation, kind: &str, now_s: i64, backoff_until: i64, last_429_at: Option<i64>, release: Option<i64>) -> Result<bool, StoreError>`,
-    `set_rejected_fp(&self, id: &AccountId, fp: Option<&str>) -> Result<(), StoreError>` (creates a
-    missing row; see the Interface Contract), `usage_state(&self, id) -> Result<Option<UsageStateRow>, StoreError>`,
+    `record_usage_failure(&self, r: &Reservation, kind: &str, now_s: i64, backoff_until: i64, last_429_at: Option<i64>, release: Option<&Slot>) -> Result<bool, StoreError>`,
+    `set_rejected_fp(&self, r: &Reservation, fp: Option<&str>) -> Result<bool, StoreError>` (fenced
+    like the records, `Ok(false)` when the lease is lost; creates a missing row; see the
+    Interface Contract), `usage_state(&self, id) -> Result<Option<UsageStateRow>, StoreError>`,
     `usage_samples(&self, id, window: Option<&str>, since_s: i64) -> Result<Vec<(String, Sample)>, StoreError>`;
-    `Reserve`, `Reservation { slot, slot_at, .. }`, `Slot { slot, slot_at }`, `Ineligible`,
-    `UsageStateRow`, all re-exported from `crate::store`
+    `Reserve`, `Reservation { provider, identity_key, holder, slot, slot_at, .. }`,
+    `Slot { slot, slot_at }`, `SendGrant::{Send(Slot), Rejected, LeaseLost, OverBudget { next_free_at }}`,
+    `Ineligible`, `UsageStateRow`, all re-exported from `crate::store`
   - Task 9: `Engine::settings(&self) -> &Settings` (`threshold`, `models`,
     `history_retention_days`); `EngineConfig.settings`; `tagteam_engine::settings::Settings`
   - M2a: `Engine::refresh_stored(&self, p: &dyn Provider, id: &AccountId, snapshot: &[u8]) -> Result<GateOutcome, EngineError>`,
@@ -7996,7 +8300,8 @@ harmless overlap; the fence drops a late result).
     `CollectReport`, `Engine::collect_usage(&self, mode: CollectMode) -> Result<CollectReport, EngineError>`
   - `pub(crate) fn jitter() -> f64` in `crate::collect`, uniform in [-1, 1) (Decision 6; Task 12
     uses it)
-  - Test-hook points `usage-reserved` (after phase 1) and `usage-before-record` (before phase 3)
+  - Test-hook points `usage-reserved` (after phase 1), `usage-before-send` (in `send`, after its
+    own token check and before `authorize_send`) and `usage-before-record` (before phase 3)
   - `last_error` tokens written: `http-<code>`, `pre-send`, `ambiguous`, `bad-response`,
     `refresh-failed`, `over-budget`, `no-access-token`, `vault-absent`,
     `keychain-unavailable`, `token-expired` (Task 11 adds `foreign-credential`)
@@ -8741,8 +9046,9 @@ fn fake_agent_usage_is_collected_through_the_same_engine_and_claude_code_is_unto
         .filter_map(|r| {
             r.headers
                 .iter()
-                .find(|(k, _)| k == "x-fake-token")
-                .map(|(_, v)| v.clone())
+                .find(|(k, _)| k == "authorization")
+                .and_then(|(_, v)| v.strip_prefix("Fake "))
+                .map(str::to_owned)
         })
         .collect();
     assert_eq!(
@@ -8856,6 +9162,49 @@ mod hooks {
     }
 
     #[test]
+    fn a_sender_that_lost_its_lease_never_resends_a_token_refused_meanwhile() {
+        // §8.3, §8.6: suspended for 91 s just before sending, past the lease. Another process
+        // takes the lease over, is refused the same token (401) and stamps rejected_fp. This
+        // process's copy of rejected_fp predates the stamp; the store's authorization, fenced
+        // by the lease it lost, sends nothing.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.script_usage(401, refused()); // the only usage reply; nothing for the token endpoint
+        let other = Arc::new(fx.engine_with_env(fx.env.clone()));
+        let seen = Arc::new(Mutex::new(None));
+        let (clock, engine, id, record) =
+            (fx.clock.clone(), other.clone(), a.clone(), seen.clone());
+        fx.engine.on_point(
+            "usage-before-send",
+            Box::new(move || {
+                clock.advance_ms(91_000);
+                *record.lock().unwrap() = Some(collect_on(&engine, &id));
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        assert_eq!(report.outcomes, [(a.clone(), Collected::Dropped)]);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(vec![(a.clone(), failed("refresh-failed"))]),
+            "the other process sent, was refused, and its gate refresh never left"
+        );
+        assert_eq!(
+            usage_bearers(&fx),
+            ["at-rt-a"],
+            "the refused token went out once, from the other process"
+        );
+        let refused_fp = access_fp(&fx, &fx.vault_bytes(&a).unwrap());
+        assert_eq!(state(&fx, &a).rejected_fp.as_deref(), Some(refused_fp.as_str()));
+        assert_eq!(
+            usage_requests(&fx),
+            2,
+            "the other's sent slot, and this one's unsent slot, left counted by the failed fence"
+        );
+    }
+
+    #[test]
     fn a_live_login_that_moves_mid_collection_records_nothing() {
         // By the time b's live token is read, the live login names a: that token is not b's.
         let fx = Fx::new();
@@ -8896,7 +9245,8 @@ Create `crates/tagteam-engine/src/collect.rs`:
 //! The usage collector (§8.3): reserve, fetch and record, one thread per account. An inactive
 //! account's token comes from the vault, through the refresh gate (§7.3) when it needs one; the
 //! active account's comes from the live store and is never refreshed by a fetch (§8.1). Nothing
-//! is sent without a slot in the identity's hourly budget (§8.6).
+//! is sent without the store's authorization right before the request: the lease still held,
+//! the token not refused, and a slot in the identity's hourly budget (§8.3, §8.6).
 
 use std::collections::HashSet;
 use std::fmt;
@@ -8914,7 +9264,8 @@ use crate::error::EngineError;
 use crate::hooks;
 use crate::refresh::{GateOutcome, expired};
 use crate::store::{
-    AccountRow, Ineligible, Reservation, Reserve, Slot, Store, StoreError, UsageStateRow,
+    AccountRow, Ineligible, Reservation, Reserve, SendGrant, Slot, Store, StoreError,
+    UsageStateRow,
 };
 
 /// Who asked for a collection, and so which accounts are collected. M3 adds `Scheduled`.
@@ -8937,9 +9288,9 @@ pub enum Collected {
     OverBudget { next_free_at: i64 },
     /// Recorded as a failure; `kind` is its `last_error` token (§8.3, Decision 10).
     Failed { kind: String },
-    /// Nothing was recorded: another process took the lease before this result arrived (the
-    /// fence failed, §8.3), or the live login moved to another account while this one's token
-    /// was being read.
+    /// Nothing was recorded: another process took the lease before this fetch sent or
+    /// recorded (the fence failed, §8.3), or the live login moved to another account while
+    /// this one's token was being read.
     Dropped,
     /// Nothing to collect: the provider lacks the `usage` capability, or the account is a
     /// managed API key, which has no usage (§13.2 `api_key`).
@@ -9065,6 +9416,7 @@ impl Engine {
             store,
             p,
             row,
+            active,
             budget,
             slot: Some(Slot {
                 slot: reservation.slot,
@@ -9078,7 +9430,7 @@ impl Engine {
         // Phase 2, holding no lock but those the gate or §7.5 take for their own refresh.
         let fetched = if active { run.active() } else { run.inactive() };
         // Phase 3.
-        run.record(fetched, active)
+        run.record(fetched)
     }
 }
 
@@ -9088,16 +9440,18 @@ struct Collection<'a> {
     store: &'a Store,
     p: &'a dyn Provider,
     row: &'a AccountRow,
+    /// Whether the live login names this account (§8.1's active account).
+    active: bool,
     budget: PollBudget,
     reservation: Reservation,
-    /// The slot reserved for the next request, while that request is unsent. `send` takes it
-    /// and puts it back only if the request never left; one still here at the record is given
-    /// back (§8.3).
+    /// The slot reserved for the next request, while that request is unsent. `send` hands it
+    /// to `authorize_send` and puts it back only if the request never left; one still here at
+    /// the record is given back (§8.3).
     slot: Option<Slot>,
     /// The state read after reserving: the previous reading, the failure count, the plan.
     state: Option<UsageStateRow>,
-    /// The access-token fingerprint the server refused (`rejected_fp`, §8.1), as stamped so
-    /// far.
+    /// The access-token fingerprint the server refused (`rejected_fp`, §8.1), as read after
+    /// reserving and stamped since. The store's copy is the one `authorize_send` checks.
     rejected: Option<String>,
     warnings: Vec<String>,
 }
@@ -9127,8 +9481,13 @@ impl Failure {
 enum Stop {
     /// Recorded as a failure.
     Failed(Failure),
-    /// The live login moved to another account: nothing is recorded.
+    /// The live login moved to another account: nothing is recorded, and the unsent slot goes
+    /// back.
     Moved,
+    /// The lease was taken over, or the account's identity changed (§8.3's fence failed at
+    /// `authorize_send` or at the `rejected_fp` stamp): nothing is sent or recorded, and the
+    /// unsent slot stays counted, as a failed fence writes nothing.
+    LeaseLost,
     /// The store or a test hook failed: returned, never recorded.
     Error(EngineError),
 }
@@ -9284,21 +9643,24 @@ impl Collection<'_> {
     }
 
     /// Stamps `rejected_fp` with the token the server just refused, so it is never sent again
-    /// until it changes (§8.1).
+    /// until it changes (§8.1). The stamp is fenced by the lease (Task 8): a holder that lost
+    /// it stops here, recording nothing.
     fn reject(&mut self, bytes: &[u8]) -> Result<(), Stop> {
         if let Some(fp) = self.access_fp(bytes) {
-            self.store.set_rejected_fp(&self.row.id, Some(fp.as_str()))?;
+            if !self
+                .store
+                .set_rejected_fp(&self.reservation, Some(fp.as_str()))?
+            {
+                return Err(Stop::LeaseLost);
+            }
             self.rejected = Some(fp);
         }
         Ok(())
     }
 
-    /// The one request after a 401, under a slot of its own (§8.1, §8.6).
+    /// The one request after a 401, under a slot of its own (§8.1, §8.6): the first slot went
+    /// with the refused request, so `send` has the store reserve a fresh one.
     fn retry(&mut self, bytes: &[u8]) -> Result<Vec<Window>, Stop> {
-        if !self.usable(bytes) {
-            return Err(failed("token-expired"));
-        }
-        self.slot = Some(self.reserve()?);
         let second = self.send(bytes)?;
         if matches!(second, UsageResult::Unauthorized) {
             self.reject(bytes)?;
@@ -9306,14 +9668,16 @@ impl Collection<'_> {
         windows(second)
     }
 
-    /// One usage request with `bytes`' access token, under the reserved slot. A token that has
-    /// expired or was refused is never sent (§8.1): the slot stays unsent. A request that never
-    /// left (no access token, or a pre-send failure) puts its slot back too.
+    /// One usage request with `bytes`' access token. A token that has expired or was refused
+    /// is never sent (§8.1): the slot stays unsent. Right before the request, the store
+    /// authorizes it and hands over the slot to send under (`authorize`). A request that never
+    /// left (no access token, or a pre-send failure) puts its slot back.
     fn send(&mut self, bytes: &[u8]) -> Result<UsageResult, Stop> {
         if !self.usable(bytes) {
             return Err(failed("token-expired"));
         }
-        let slot = self.slot_for_send()?;
+        hooks::point(self.engine, "usage-before-send")?;
+        let slot = self.authorize(bytes)?;
         let result = self
             .p
             .fetch_usage(self.engine.http(), &Credential::fresh(bytes.to_vec()));
@@ -9329,48 +9693,44 @@ impl Collection<'_> {
         Ok(result)
     }
 
-    /// The reserved slot, or a fresh one if it has outlived its validity (§8.6): a sender that
-    /// has not sent within `slot_valid_s` of reserving, after a suspend or a slow refresh, gives
-    /// the old slot back and reserves again.
-    fn slot_for_send(&mut self) -> Result<Slot, Stop> {
-        let slot = self
-            .slot
-            .take()
-            .expect("every request is sent under a reserved slot (§8.6)");
-        if self.now_s() - slot.slot_at <= self.budget.slot_valid_s {
-            return Ok(slot);
-        }
-        self.give_back(&slot)?;
-        self.reserve()
-    }
-
-    /// A further slot under this reservation. Over budget, the fetch ends as `over-budget`,
-    /// and backs off until a slot frees up.
-    fn reserve(&mut self) -> Result<Slot, Stop> {
-        match self
-            .store
-            .reserve_slot(&self.reservation, self.now_ms(), &self.budget)?
-        {
-            Ok(slot) => Ok(slot),
-            Err(next_free_at) => Err(Stop::Failed(Failure {
+    /// §8.3, §8.6: the store's one fenced authorization, immediately before the request, with
+    /// the fingerprint of the exact bytes about to be sent and the slot held (`None` for the
+    /// retry). It re-checks the lease and the account's identity, the durable `rejected_fp`
+    /// (another process may have been refused this token since this one read its state), and
+    /// the slot's validity, replacing a stale slot (a suspend or a slow refresh) or reserving
+    /// one for the retry.
+    /// - `LeaseLost`: nothing is sent or recorded, and the unsent slot stays counted.
+    /// - `Rejected`: recorded as `token-expired` for the active account (its refusal is §7.5's
+    ///   to handle, Task 11) or `http-401` for an inactive one; the slot goes back.
+    /// - `OverBudget`: recorded as `over-budget`, backing off until a slot frees up; a stale
+    ///   slot has already gone back.
+    fn authorize(&mut self, bytes: &[u8]) -> Result<Slot, Stop> {
+        let fp = self.access_fp(bytes);
+        let held = self.slot.take();
+        let grant = self.store.authorize_send(
+            &self.reservation,
+            held.as_ref(),
+            fp.as_deref(),
+            self.now_ms(),
+            &self.budget,
+        )?;
+        match grant {
+            SendGrant::Send(slot) => Ok(slot),
+            SendGrant::LeaseLost => Err(Stop::LeaseLost),
+            SendGrant::Rejected => {
+                self.slot = held;
+                self.rejected = fp;
+                Err(failed(if self.active {
+                    "token-expired"
+                } else {
+                    "http-401"
+                }))
+            }
+            SendGrant::OverBudget { next_free_at } => Err(Stop::Failed(Failure {
                 not_before: Some(next_free_at),
                 ..Failure::new("over-budget")
             })),
         }
-    }
-
-    /// Whether `slot` may still be given back. One older than the count window has been, or
-    /// will be, pruned by some insert, and SQLite may since have given its rowid to another
-    /// process's slot, which deleting it would take out of that identity's count.
-    fn releasable(&self, slot: &Slot) -> bool {
-        self.now_s() - slot.slot_at <= self.budget.count_window_s
-    }
-
-    fn give_back(&self, slot: &Slot) -> Result<(), StoreError> {
-        if self.releasable(slot) {
-            self.store.release_slot(slot.slot)?;
-        }
-        Ok(())
     }
 
     /// §8.3: a successor lost while collecting. Names the account by label and position, never
@@ -9412,17 +9772,13 @@ impl Collection<'_> {
     /// Phase 3 (§8.3), in a transaction fenced by the lease holder and the account's identity,
     /// so a late or superseded result is dropped. Success stores the reading, its samples and
     /// the next plan (§8.6). Failure never touches the last good reading, backs off (§8.5),
-    /// and gives back a slot whose request was never sent.
-    fn record(
-        mut self,
-        fetched: Result<Vec<Window>, Stop>,
-        active: bool,
-    ) -> Result<Outcome, EngineError> {
+    /// and gives back, by its full identity, a slot whose request was never sent.
+    fn record(mut self, fetched: Result<Vec<Window>, Stop>) -> Result<Outcome, EngineError> {
         hooks::point(self.engine, "usage-before-record")?;
         let now_s = self.now_s();
         let collected = match fetched {
             Ok(windows) => {
-                let plan = self.plan(&windows, active, now_s);
+                let plan = self.plan(&windows, self.active, now_s);
                 let retention = self.engine.settings().history_retention_days;
                 if self
                     .store
@@ -9443,18 +9799,13 @@ impl Collection<'_> {
                 if let Some(not_before) = f.not_before {
                     until = until.max(not_before);
                 }
-                let release = self
-                    .slot
-                    .as_ref()
-                    .filter(|s| self.releasable(s))
-                    .map(|s| s.slot);
                 let recorded = self.store.record_usage_failure(
                     &self.reservation,
                     &f.kind,
                     now_s,
                     until,
                     f.is_429.then_some(until),
-                    release,
+                    self.slot.as_ref(),
                 )?;
                 if recorded {
                     Collected::Failed { kind: f.kind }
@@ -9464,10 +9815,11 @@ impl Collection<'_> {
             }
             Err(Stop::Moved) => {
                 if let Some(slot) = self.slot.take() {
-                    self.give_back(&slot)?;
+                    self.store.release_slot(&self.reservation, &slot)?;
                 }
                 Collected::Dropped
             }
+            Err(Stop::LeaseLost) => Collected::Dropped,
             Err(Stop::Error(e)) => return Err(e),
         };
         Ok((collected, self.warnings))
@@ -9497,7 +9849,7 @@ Run: `cargo test -p tagteam-engine --test collect`
 Expected: PASS (19 tests).
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test collect`
-Expected: PASS (23 tests, including the four in `hooks`).
+Expected: PASS (24 tests, including the five in `hooks`).
 
 Run: `cargo test -p tagteam-engine --features test-hooks`
 Expected: PASS. No other suite collects usage, so no other test gains a request.
@@ -9520,7 +9872,7 @@ run compiles `tests/collect.rs` without `test-hooks`: every import at its top is
 ```bash
 git add crates/tagteam-engine/src/collect.rs crates/tagteam-engine/src/lib.rs \
   crates/tagteam-engine/tests/common/mod.rs crates/tagteam-engine/tests/collect.rs
-git commit -m "Collect usage for inactive accounts under the hourly budget"
+git commit -m "Collect usage for inactive accounts, authorizing each request under the lease and the hourly budget"
 ```
 
 ---
@@ -9541,6 +9893,14 @@ was refused. This task hands both cases to §7.5 instead, and adds the retry:
 The fetch goes on with the live token, read fresh after §7.5, and only if it is neither expired
 nor the refused one; Task 10's `send` still refuses anything else as `token-expired`, giving its
 slot back.
+
+This task also makes the live read consistent. Task 10's `live_bytes` reads the live identity
+and then the live credential as two separate reads. §9.4 writes the target's credential (step 7)
+before its identity (step 8), so a tagteam switch finishing between the reads would have this
+account's reservation send another account's token and record that account's usage as this
+one's. `live_bytes` now reads under tagteam's mutation lock, which a switch holds for its whole
+transaction: identity, credential, identity again (still this account's), then the lock is
+dropped before anything is sent.
 
 | §7.5 result | Recorded as | Warning |
 |---|---|---|
@@ -9564,13 +9924,25 @@ slot back.
   reported `token-expired`, with no request and no warning.
 - **A live login that moves during §7.5** (it may wait up to 10 s for the mutation lock and 15 s
   for the account lock) is caught when the live token is read again: Task 10's `Dropped`.
+- **The live identity and credential are read under the mutation lock** (`Engine::mutation_guard`,
+  the plain one: it recovers a dead switch first like every caller, but never refuses; the
+  collector is not a mutation, and `guard_or_refuse` would turn an unresolved switch into a
+  command error). The lock is held only for the reads, never across a request (§8.3's "no lock
+  held") and never across §7.5, which takes it itself; `live_bytes` drops it before returning.
+  A lock that cannot be had within its 10 s timeout (a switch or another mutation holding it) is
+  `Dropped`, like a live login that moved: nothing is sent or recorded, and the slot goes back.
+  Any other error from it is `collect_usage`'s `Err`, like any store error. Residual: a login
+  changed by Claude Code itself, outside tagteam's lock, between the credential read and the
+  second identity read (its credential written, its `oauthAccount` not yet) still passes both
+  identity checks, and can misattribute that one reading.
 - A usage fetch never calls `refresh_stored` for the active account: the active path has no
   call to it, and `a_usage_fetch_refreshes_the_live_generation_never_the_vault_s` pins it (the
   gate would refuse the live account and could only ever send the vault's generation, which CC
   has already spent).
 
 **Files:**
-- Modify: `crates/tagteam-engine/src/collect.rs` (`active`, new `trigger` and `refresh_live`)
+- Modify: `crates/tagteam-engine/src/collect.rs` (`active` and `live_bytes`, new `trigger`,
+  `refresh_live` and `live_names_this_account`)
 - Create: `crates/tagteam-engine/tests/collect_active.rs`
 
 **Interfaces:**
@@ -9579,15 +9951,24 @@ slot back.
     `ActiveTrigger::{Expired, Rejected { access_fp: String }}`,
     `ActiveOutcome::{NotNeeded { reconciled }, Refreshed, PersistedNotPublished, PublishedOnly, Dead(_), Systemic(String), Transient { kind: String }, Unpersisted}`,
     `EngineError::ForeignLiveCredential { position }`; its hook points `active-after-response`
+  - M1: `Engine::mutation_guard(&self) -> Result<MutationGuard, EngineError>` (the lock a switch
+    holds for its whole transaction, §9.4; 10 s timeout, `EngineError::Lock(_)` when it
+    expires), `Engine::switch(&self, req: SwitchRequest) -> Result<SwitchOutcome, EngineError>`
+    and `SwitchRequest: Clone` (tests)
   - Task 10: `Collection::{live_bytes, send, retry, reject, usable, is_rejected, access_fp, warn_lost, warn_refresh}`,
-    `failed`, `windows`, `Stop`; the fixture helpers `Fx::{script_usage, collect, usage_state}`,
-    `usage_fixture`, `usage_bearers`, `usage_requests`, `access_fp`
-  - Task 8: `Store::set_rejected_fp` (tests stamp a refused token directly)
-  - Fixture: `Fx::{with_lock_timeout, add, add_token_options, switch_to, script_refresh, script_token_error, rotate_live, live_credential, set_live_credential, live_refresh_token, vault_refresh_token, oauth_account, paths}`,
-    `Fx.oracle`, and the free `token_requests`, `quarantine_of`, `credential`, `rescue_files`,
-    `block_rescue`, `unblock_rescue`
+    `failed`, `windows`, `Stop` (its `Moved` variant); the fixture helpers
+    `Fx::{script_usage, collect, usage_state}`, `usage_fixture`, `usage_bearers`,
+    `usage_requests`, `access_fp`
+  - Tests stamp `rejected_fp` through a raw `rusqlite` connection, as an earlier collection's
+    401 would have: Task 8's `Store::set_rejected_fp` is fenced by a reservation the tests do
+    not hold.
+  - Fixture: `Fx::{with_lock_timeout, add, add_token_options, switch_to, switch_request, engine_with_env, live_email, script_refresh, script_token_error, rotate_live, live_credential, set_live_credential, live_refresh_token, vault_refresh_token, oauth_account, paths}`,
+    `Fx.oracle`, `Fx.env`, and the free `token_requests`, `quarantine_of`, `credential`,
+    `rescue_files`, `block_rescue`, `unblock_rescue`
 - Produces: the active account's collection per §8.1 as amended; no new public names. The
-  `last_error` token `foreign-credential` (Decision 10).
+  `last_error` token `foreign-credential` (Decision 10). The test-hook point
+  `usage-live-identity-read` (in `live_bytes`, under the mutation lock, between the first
+  live-identity read and the live-credential read).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -9643,14 +10024,22 @@ fn token_request(fx: &Fx) -> Value {
     serde_json::from_slice(sent.body.as_deref().unwrap()).unwrap()
 }
 
+/// Stamps `id`'s `rejected_fp` with `fp` directly, as an earlier collection's 401 would have.
+/// `Store::set_rejected_fp` is fenced by a reservation (Task 8), which these tests do not hold.
+fn stamp_rejected(fx: &Fx, id: &tagteam_core::AccountId, fp: &str) {
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO usage_state (account_id, rejected_fp) VALUES (?1, ?2) \
+             ON CONFLICT(account_id) DO UPDATE SET rejected_fp = excluded.rejected_fp",
+            rusqlite::params![id.as_str(), fp],
+        )
+        .unwrap();
+}
+
 /// Stamps `id`'s `rejected_fp` with `rt`'s access token, as an earlier 401 would have.
 fn refuse(fx: &Fx, id: &tagteam_core::AccountId, rt: &str) {
-    let fp = access_fp(fx, &credential("a@x.co", rt));
-    fx.engine
-        .store()
-        .unwrap()
-        .set_rejected_fp(id, Some(fp.as_str()))
-        .unwrap();
+    stamp_rejected(fx, id, &access_fp(fx, &credential("a@x.co", rt)));
 }
 
 #[test]
@@ -9877,11 +10266,7 @@ fn a_refused_live_setup_token_is_reported_expired_and_never_refreshed() {
         .id;
     fx.switch_to(&s, false).unwrap();
     let live = fx.live_credential().unwrap().to_string().into_bytes();
-    fx.engine
-        .store()
-        .unwrap()
-        .set_rejected_fp(&s, Some(access_fp(&fx, &live).as_str()))
-        .unwrap();
+    stamp_rejected(&fx, &s, &access_fp(&fx, &live));
     fx.http.clear();
 
     let report = fx.collect(&[&s]);
@@ -9894,7 +10279,9 @@ fn a_refused_live_setup_token_is_reported_expired_and_never_refreshed() {
 
 #[cfg(feature = "test-hooks")]
 mod hooks {
-    use std::time::SystemTime;
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::{Instant, SystemTime};
 
     use tagteam_engine::collect::CollectMode;
 
@@ -9965,21 +10352,73 @@ mod hooks {
         assert_eq!(quarantine_of(&fx, &a).0.as_deref(), Some("successor_lost"));
         assert!(usage_bearers(&fx).is_empty());
     }
+
+    #[test]
+    fn a_switch_waits_for_the_live_read_so_the_account_sends_its_own_token() {
+        // §9.4 writes a's credential before a's identity. Were the collector's reads of b's
+        // live identity and credential not under the mutation lock, a switch to a finishing
+        // between them would have b's reservation send a's token and record a's usage as b's.
+        // The hook runs a switch on another thread between the two reads and gives it up to
+        // 2 s to finish; under the lock it cannot, and it goes ahead once the reads are done.
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b"); // live
+        fx.script_usage(200, usage_fixture());
+        let other = Arc::new(fx.engine_with_env(fx.env.clone()));
+        let request = fx.switch_request(&a, false);
+        let switching: Arc<Mutex<Option<JoinHandle<bool>>>> = Arc::default();
+        let handle_slot = switching.clone();
+        fx.engine.on_point(
+            "usage-live-identity-read",
+            Box::new(move || {
+                let (engine, req) = (other.clone(), request.clone());
+                let switch = thread::spawn(move || engine.switch(req).is_ok());
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !switch.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                *handle_slot.lock().unwrap() = Some(switch);
+            }),
+        );
+
+        let report = fx.collect(&[&b]);
+        let switch = switching.lock().unwrap().take().expect("the hook ran");
+        assert!(switch.join().unwrap(), "the switch went ahead once the reads were done");
+
+        assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+        assert_eq!(report.outcomes, [(b.clone(), Collected::Recorded)]);
+        assert_eq!(
+            usage_bearers(&fx),
+            ["at-rt-b"],
+            "b's reservation sent b's own token"
+        );
+        assert!(
+            fx.usage_state(&b).is_some_and(|s| s.fetched_at.is_some()),
+            "the reading is recorded as b's"
+        );
+        assert_eq!(
+            fx.usage_state(&a).and_then(|s| s.fetched_at),
+            None,
+            "nothing is recorded as a's"
+        );
+    }
 }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test collect_active`
-Expected: FAIL: 11 of 12 tests. Task 10's active path refuses the expired or refused token
-without calling §7.5, so the expired, rotated, Dead, systemic, unreadable-`.prev` and hook
-tests see `Failed { kind: "token-expired" }` where they expect `Recorded` or
-`refresh-failed`; the 401 tests see `http-401`; the foreign one sees `token-expired`; and
+Expected: FAIL: 12 of 13 tests. Task 10's active path refuses the expired or refused token
+without calling §7.5, so the expired, rotated, Dead, systemic, unreadable-`.prev` and two §7.5
+hook tests see `Failed { kind: "token-expired" }` where they expect `Recorded` or
+`refresh-failed`; the 401 tests see `http-401`; the foreign one sees `token-expired`;
 `a_refused_token_that_active_refresh_left_live_is_never_sent` fails on `token_requests == 1`
-(it is 0). `a_refused_live_setup_token_is_reported_expired_and_never_refreshed` already passes:
-Task 10's `send` refuses a refused token, and this task must keep it passing.
+(it is 0); and `a_switch_waits_for_the_live_read_so_the_account_sends_its_own_token` panics on
+`the hook ran`, since Task 10's `live_bytes` has no `usage-live-identity-read` point.
+`a_refused_live_setup_token_is_reported_expired_and_never_refreshed` already passes: Task 10's
+`send` refuses a refused token, and this task must keep it passing.
 
-- [ ] **Step 3: Hand the live token to §7.5**
+- [ ] **Step 3: Hand the live token to §7.5, and read it under the mutation lock**
 
 In `crates/tagteam-engine/src/collect.rs`, add to the `use crate::…` lines:
 
@@ -10063,17 +10502,65 @@ Replace the whole of `fn active` (its doc comment included) with:
     }
 ```
 
+Replace the whole of `fn live_bytes` (its doc comment included) with the consistent read, and
+its identity check:
+
+```rust
+    /// The live credential, read while the live login names this account, under tagteam's
+    /// mutation lock. A switch holds that lock for its whole transaction and writes the
+    /// target's credential before its identity (§9.4), so without it a switch finishing
+    /// between the reads would have this reservation send, and record, another account's token.
+    /// Under the lock: the live identity, the live credential, then the identity again, which
+    /// must still name this account. The lock is dropped before returning, so it is never held
+    /// across a request (§8.3) or across §7.5, which takes it itself.
+    ///
+    /// A live login that moved stops the fetch (`Moved`): its token is not this account's. So
+    /// does a lock that cannot be had within its timeout (a switch or another mutation holding
+    /// it). Residual: a login changed by Claude Code itself, outside tagteam's lock, between the
+    /// credential read and the second identity read (its credential written, its `oauthAccount`
+    /// not yet) passes both checks and can misattribute that one reading.
+    fn live_bytes(&self) -> Result<Vec<u8>, Stop> {
+        let guard = match self.engine.mutation_guard() {
+            Ok(guard) => guard,
+            Err(EngineError::Lock(_)) => return Err(Stop::Moved),
+            Err(e) => return Err(e.into()),
+        };
+        self.live_names_this_account()?;
+        hooks::point(self.engine, "usage-live-identity-read")?;
+        let credential = self.p.read_live_auth(&self.engine.env).credential;
+        self.live_names_this_account()?;
+        drop(guard);
+        match credential {
+            Read::Present(c) if c.provenance() == Provenance::Degraded => {
+                Err(failed("keychain-unavailable"))
+            }
+            Read::Present(c) if !c.is_empty() => Ok(c.bytes().to_vec()),
+            Read::Present(_) | Read::Absent => Err(failed("no-access-token")),
+            Read::Unreadable(_) => Err(failed("keychain-unavailable")),
+        }
+    }
+
+    /// The live login still names this account; `Moved` otherwise.
+    fn live_names_this_account(&self) -> Result<(), Stop> {
+        match self.p.live_identity(&self.engine.env) {
+            Read::Present(i) if self.p.identity_key(&i).as_str() == self.row.identity_key => Ok(()),
+            _ => Err(Stop::Moved),
+        }
+    }
+```
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test collect_active`
-Expected: PASS (12 tests).
+Expected: PASS (13 tests).
 
 Run: `cargo test -p tagteam-engine --test collect_active`
-Expected: PASS (10 tests; the two in `hooks` need `test-hooks`).
+Expected: PASS (10 tests; the three in `hooks` need `test-hooks`).
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test collect --test active`
 Expected: PASS. Task 10's tests are unchanged by this task (none of them sends an expired or
-refused live token), and §7.5's own suite is untouched.
+refused live token, and none holds the mutation lock while an active account is collected, so
+the lock `live_bytes` now takes is always free to them), and §7.5's own suite is untouched.
 
 Run: `cargo test -p tagteam-engine --features test-hooks`
 Expected: PASS.
@@ -10089,13 +10576,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: no output from `fmt --check`, and both clippy runs finish with no warnings.
 `tests/collect_active.rs`'s top-level imports are all used outside `mod hooks`, which imports
-`SystemTime` and `CollectMode` itself.
+`Arc`, `Mutex`, `thread`, `JoinHandle`, `Instant`, `SystemTime` and `CollectMode` itself.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add crates/tagteam-engine/src/collect.rs crates/tagteam-engine/tests/collect_active.rs
-git commit -m "Hand an expired or refused live token to active-token refresh before a usage fetch"
+git commit -m "Hand an expired or refused live token to active-token refresh, and read the live login under the mutation lock"
 ```
 
 ---
