@@ -264,7 +264,7 @@ fn staged<'g, E>(
 /// let locks = LiveLocks::new(&guard, Box::new(AlwaysOwned));
 /// let undo = write_credential(&locks);
 /// drop(locks); // still borrowed by `undo`: cannot move out of `locks`
-/// undo.undo(&locks).unwrap();
+/// let _ = undo.what(); // `undo` is alive here, so the borrow conflict is the only error
 /// ```
 pub trait Undo: Send {
     fn undo(self: Box<Self>, locks: &LiveLocks<'_>) -> Result<(), ProviderError>;
