@@ -123,11 +123,12 @@ def redact(v, key="", path=()):
     k = key.lower()
     if EMAIL.fullmatch(v) or "email" in k:
         return fake("email", v)
-    if UUID.fullmatch(v) or k.endswith("uuid") or k == "id":
+    owned = any(p in ("account", "organization", "user") for p in path)
+    if UUID.fullmatch(v) or k.endswith("uuid") or (k == "id" and owned):
         return fake("uuid", v)
     if v.startswith("sk-ant-") or "token" in k or "secret" in k:
         return fake("token", v)
-    if k in NAME_KEYS:
+    if k in NAME_KEYS and owned:
         return fake("name", v)
     v = EMAIL.sub(lambda m: fake("email", m.group(0)), v)
     return UUID.sub(lambda m: fake("uuid", m.group(0)), v)
@@ -202,7 +203,7 @@ for path in (("account", "uuid"), ("account", "email")):
         problems.append(f"profile: no string at {'.'.join(path)}")
 # Appendix A.6 treats a null or empty organization as '': a personal account has none.
 org = b.get("organization")
-if org is not None and not (isinstance(org, dict) and isinstance(org.get("uuid", ""), str)):
+if org is not None and not (isinstance(org, dict) and isinstance(org.get("uuid"), str)):
     problems.append("profile: organization is neither null nor an object with a string uuid")
 u = load("usage-200")
 if u["status"] != 200: problems.append(f"usage: status {u['status']}")
