@@ -638,7 +638,8 @@ Appendix A.4.
   | `Busy` | Proceed. The switch waits for the account lock, and under it settles pending rescues (§6.2) and re-reads the vault, which picks up the other process's refresh whether it reached the vault or `rescue/` |
   | Transient or Systemic, other than the rows below | Proceed with the vault's generation and a warning. Nothing was consumed, or it was lost either way; once the account is live, the gate leaves its refresh to CC (§7.3 step 2) |
   | Transient with `rescued: true`, Transient `rescue-unreadable`, or `Unpersisted` | Refuse: the vault's generation has been consumed |
-  | `Owned` or `Conflict` | The matching §9.2 refusal: `interrupted-switch`, `session-owned` or `profile-conflict` |
+  | `Owned` by the live login or by a journal row | Proceed with a warning. The gate cannot tell a live journal row from an interrupted one, so the mutation lock decides: `guard_or_refuse` waits for a live holder, and recovers or refuses a dead one (§9.6). An account that became the live login re-plans as a self-switch |
+  | `Owned` by a session, or `Conflict` | The matching §9.2 refusal: `session-owned` or `profile-conflict` |
 
   A quarantined target is never refreshed (§7.4). If it would need freshening, a switch to it
   is refused as Dead is. Otherwise it is activated with a warning that it needs a new login.
@@ -785,7 +786,9 @@ Refreshing from a degraded read is never allowed.
   - by `add`, for an OAuth login (§10.1)
   - by recovery, when fingerprints alone cannot decide a row or settle an entry it clears (§9.6)
   - by the active-token refresh, when the live access token is still valid (§7.5)
-- **asked at most once per process for a given credential**, keyed by its fingerprint
+- **asked at most once per process for a given credential**, keyed by a hash of its exact
+  bytes. A new access token under the same refresh token is a different credential, so a
+  provider's skip for one access token never answers for another
 - **never asked without a token it can show.** The provider returns no answer, and sends no
   request, for a credential that cannot be resolved. For Claude Code these are an expired
   access token, a setup token (its only scope is `user:inference`) and an API key
