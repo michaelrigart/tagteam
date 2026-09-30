@@ -818,9 +818,11 @@ Refreshing from a degraded read is never allowed.
   - A 401 on an access token that is still valid locally stamps `rejected_fp` with that
     token's fingerprint and hands the account to §7.5 (`Rejected`). If §7.5 then leaves a
     usable token, the fetch retries once, with its own budget slot.
-  - A live access token whose fingerprint equals `rejected_fp` is never sent again.
-- **A fetch that ends before sending** (a refusal or failure while getting a token) releases
-  the budget slot it reserved (§8.3).
+  - A live access token whose fingerprint equals `rejected_fp` is never sent again. The
+    fetch hands the account to §7.5 (`Rejected`) first, as after a new 401, and goes on only
+    if §7.5 leaves a different, usable token.
+- **A fetch that ends before sending** (a refusal or failure while getting a token) is
+  recorded as a failure, and gives back the budget slot it reserved (§8.3).
 - **Session-owned account** (§12.5). The fetch is read-only and uses the profile's token.
   - A 401 stamps `rejected_fp` with the access-token fingerprint and reports `token_expired`.
   - The same bytes are not sent again until they change.
@@ -838,7 +840,7 @@ windows, read from the response shape recorded in Appendix A.5:
 | `7d` | `seven_day` | `Long`, 604800 s | as `5h` |
 | `scoped:<name>` | each `limits[]` item with a `scope.model.display_name` and a numeric `percent` | `Scoped`; 604800 s when `group` is `weekly`, otherwise no period | `pct` = `percent`, `resets_at` |
 | `spend` | `spend`, when `enabled` is true and `used` and `limit` both carry `amount_minor` | `Spend` | `detail {used, limit, currency}`, each amount `amount_minor / 10^exponent`; `pct = used / limit · 100`. A zero `limit` leaves the window out |
-| `spend` | `extra_usage`, only when there is no `spend` object, `is_enabled` is true, and `used_credits`, `monthly_limit` and `currency` are non-null | `Spend` | `used = used_credits / 10^decimal_places`, `limit = monthly_limit / 10^decimal_places` (`decimal_places` defaults to 2) |
+| `spend` | `extra_usage`, only when there is no `spend` object, `is_enabled` is true, and `used_credits`, `monthly_limit` and `currency` are non-null | `Spend` | `used = used_credits / 10^decimal_places`, `limit = monthly_limit / 10^decimal_places` (`decimal_places` defaults to 2); `detail {used, limit, currency}`; `pct = used / limit · 100`. A zero `limit` leaves the window out |
 
 - Every other field is ignored: the per-model `seven_day_*` objects, the code-named windows,
   `seven_day_breakdown`. A per-model window that becomes populated is expected in `limits[]`
@@ -866,8 +868,9 @@ counts.
      row that reserves the slot, so the budget holds across every process.
    - On-demand callers (`list`, `status`, `switch`) also require the reading to be older than
      180 s *and* either a poll to be due or no plan to exist.
-   - A fetch that ends before sending deletes the `usage_requests` row it inserted, so the
-     slot returns to the budget, and releases the lease.
+   - A fetch that ends before sending is recorded in phase 3 like any failure. The same
+     fenced transaction deletes the `usage_requests` row it inserted, so the slot returns to
+     the budget. The lease expires as it does after any record.
 2. **Fetch**, with no lock held other than the ones the gate (§7.3) or §7.5 take for their
    own refresh.
 3. **Record.** In a transaction fenced by lease holder and account identity; a late or
