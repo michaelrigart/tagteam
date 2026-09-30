@@ -810,9 +810,17 @@ Refreshing from a degraded read is never allowed.
     `invalid_client`, or rescue unreadable.
 - **401 on an inactive account.** Refresh once, then retry once. The retry is a request like
   any other and needs its own slot in the hourly budget (§8.6).
-- **Active account.** Usage fetches never refresh it; only §7.5 does that. A 401 on an access
-  token that is still valid locally stamps `rejected_fp` with that token's fingerprint and
-  hands the account to §7.5.
+- **Active account.** Usage fetches never refresh it; only §7.5 does that.
+  - An expired live access token is handed to §7.5 (`Expired`) before the fetch. The fetch
+    goes on with the live token, read fresh, when §7.5 leaves a usable one: `Refreshed`,
+    `PersistedNotPublished`, `PublishedOnly` or `NotNeeded`. `Dead` reports
+    `relogin_required`; any other outcome, or an error, reports `unavailable` with a warning.
+  - A 401 on an access token that is still valid locally stamps `rejected_fp` with that
+    token's fingerprint and hands the account to §7.5 (`Rejected`). If §7.5 then leaves a
+    usable token, the fetch retries once, with its own budget slot.
+  - A live access token whose fingerprint equals `rejected_fp` is never sent again.
+- **A fetch that ends before sending** (a refusal or failure while getting a token) releases
+  the budget slot it reserved (§8.3).
 - **Session-owned account** (§12.5). The fetch is read-only and uses the profile's token.
   - A 401 stamps `rejected_fp` with the access-token fingerprint and reports `token_expired`.
   - The same bytes are not sent again until they change.
@@ -822,14 +830,23 @@ Refreshing from a degraded read is never allowed.
 
 A fetch is normalized into generic windows (§4.5), stored as `last_good`. The rendering layer
 turns them back into each provider's output shape (for CC, cswap's, §13.2). Claude Code's
-windows:
+windows, read from the response shape recorded in Appendix A.5:
 
-- `5h` (`Short`) and `7d` (`Long`) from `five_hour` and `seven_day`: `pct`, `resets_at?`.
-- `spend` (`Spend`) from `extra_usage`, with `detail {used, limit, currency}`. Present only
-  when `extra_usage.is_enabled` is true and all three numbers are non-null. `used =
-  used_credits / 100`; `limit = monthly_limit / 100`.
-- `scoped:<name>` (`Scoped`), one per `limits[]` item that has a model `display_name` and a
-  numeric `percent`.
+| Window | Source | Kind, period | Values |
+|---|---|---|---|
+| `5h` | `five_hour` | `Short`, 18000 s | `pct` = `utilization`; `resets_at` from the ISO 8601 string, as epoch seconds |
+| `7d` | `seven_day` | `Long`, 604800 s | as `5h` |
+| `scoped:<name>` | each `limits[]` item with a `scope.model.display_name` and a numeric `percent` | `Scoped`; 604800 s when `group` is `weekly`, otherwise no period | `pct` = `percent`, `resets_at` |
+| `spend` | `spend`, when `enabled` is true and `used` and `limit` both carry `amount_minor` | `Spend` | `detail {used, limit, currency}`, each amount `amount_minor / 10^exponent`; `pct = used / limit · 100`. A zero `limit` leaves the window out |
+| `spend` | `extra_usage`, only when there is no `spend` object, `is_enabled` is true, and `used_credits`, `monthly_limit` and `currency` are non-null | `Spend` | `used = used_credits / 10^decimal_places`, `limit = monthly_limit / 10^decimal_places` (`decimal_places` defaults to 2) |
+
+- Every other field is ignored: the per-model `seven_day_*` objects, the code-named windows,
+  `seven_day_breakdown`. A per-model window that becomes populated is expected in `limits[]`
+  as a `weekly_scoped` item.
+- A missing or null source leaves its window out. A non-finite `pct` drops that window. A
+  `pct` above 100 is kept, so headroom goes negative (at the limit).
+- A body that is not JSON, or a known key with the wrong type (`five_hour` as a string, say),
+  is the failure `bad-response`.
 - An empty result normalizes to `None`.
 
 Each provider declares which of its windows are relevant. For Claude Code, the **relevant
@@ -849,12 +866,30 @@ counts.
      row that reserves the slot, so the budget holds across every process.
    - On-demand callers (`list`, `status`, `switch`) also require the reading to be older than
      180 s *and* either a poll to be due or no plan to exist.
-2. **Fetch**, with no lock held.
+   - A fetch that ends before sending deletes the `usage_requests` row it inserted, so the
+     slot returns to the budget, and releases the lease.
+2. **Fetch**, with no lock held other than the ones the gate (§7.3) or §7.5 take for their
+   own refresh.
 3. **Record.** In a transaction fenced by lease holder and account identity; a late or
    superseded result is dropped.
    - **Success** writes `last_good` and `fetched_at`, resets the failure fields, stores the
      next plan, **and inserts `usage_samples` rows**.
    - **Failure** never touches `last_good` or `fetched_at`.
+
+**Who collects on demand.**
+- `list` collects every eligible account, and `status` only the live one. The accounts are
+  collected in parallel, one thread each, and the command waits for all of them. Each request
+  is bounded by its own timeout, so one account costs at most a gate refresh, a fetch and one
+  retry.
+- `switch` collects only for the strategies that rank by usage (`best`, `next-available`,
+  §9.3). After any switch that activated an account, it re-plans polls from the last readings
+  without fetching. The incoming account's `next_poll_at` gets the active-account policy, and
+  the outgoing account's gets the candidate policy (§8.6).
+- A usage failure is never a command error. It shows as the row's `usageStatus` (§13.2), and
+  its kind is stored in `usage_state.last_error` using §6.1's tokens (`http-<code>`,
+  `pre-send`, `ambiguous`, `bad-response`, `refresh-failed`, `over-budget`), plus
+  `no-access-token` (§8.1). A successor lost while collecting (`Unpersisted`, §7.3 step 6) is also a
+  warning on stderr that names the account, which is quarantined and shows `relogin_required`.
 
 ### 8.4 Trust (can a reading drive a decision?)
 
@@ -1748,6 +1783,23 @@ exactly as it would without providers.
 **Exit codes:** `0` OK · `1` error · `2` usage error · `130` interrupted. `auto --once` uses
 0–3.
 
+**`list` text layout.** One row per account, in position order:
+
+```
+    #  ACCOUNT                  5H           7D                    SPEND         FABLE   AGE
+ *  1  michael@example.com       9%  2h40m   77%  3d09h  ▲ pace    €0 of €20      0%     2m
+    2  spare@example.com        31%  4h02m   12%  5d01h            —              —     14m
+    3  work (w@corp.com)        relogin required
+```
+
+- A window shows its `pct` and the countdown to its reset. `▲ pace` marks a `Long` window that
+  is ahead of pace (§8.7).
+- A scoped window gets a column, headed by its model name, only when some account has it.
+- `pct` is coloured by §13.5's severities, off under `NO_COLOR` and `--no-color`.
+- A row without usage shows its `usageStatus` in words (`relogin required`, `api key`,
+  `unavailable (http-429, retry 4m)`, `over budget`, …) instead of the window columns.
+- `AGE` is the last good reading's age. A stale reading is still shown, with its age.
+
 ### 13.2 JSON output (`schemaVersion: 1`)
 
 **Compatibility.** The field names are cswap-compatible so existing scripts port unchanged. Three
@@ -1876,6 +1928,10 @@ registered in this build is refused in pass 1, naming the provider.
 `tagteam history` renders per-window sparklines, the current burn rate (points per hour), and
 an ETA with its projection method. `--csv` and `--json` dump the raw samples.
 
+- **Defaults:** the live account, its relevant windows (§8.2), and `--since 7d`.
+- For each window it also says whether the window will last to its reset (§8.7).
+- It reads `usage_samples` only and never fetches.
+
 ### 13.5 Statusline
 
 `tagteam statusline` is built for CC's `statusLine` command and meant to be fast. It is a
@@ -1884,8 +1940,10 @@ environment it runs in (a `CLAUDE_CONFIG_DIR` or a CC-invoked process means Clau
 `default_provider`. It refuses for a provider without the capability.
 
 - It drains piped stdin (up to 64 KiB) and ignores the contents.
-- It does **no network and no Keychain access**.
-- **Which account.** Inside a profile (from `CLAUDE_CONFIG_DIR`), the profile's account.
+- It does **no network and no Keychain access**, and never constructs the `Http` adapter: the
+  engine builds it lazily, on first use, which keeps the command within §1.1's 10 ms p95.
+- **Which account.** Inside a profile (from `CLAUDE_CONFIG_DIR`), the profile's account. This
+  lookup lands with profiles (M4); until then `statusline` always uses the live identity.
   Otherwise, the live identity from `live_identity_cache`, re-parsing `~/.claude.json` only
   when its mtime or size changed. The parse deserializes `oauthAccount` alone and skips the
   rest.
@@ -2212,7 +2270,7 @@ providers.
 |---|---|---|
 | Token refresh | `POST https://platform.claude.com/v1/oauth/token`, JSON `{"grant_type":"refresh_token","refresh_token":…,"client_id":"9d1c250a-e61b-44d9-88ed-5944d1962f5e","scope":"<scopes joined by space>"}` | See the response handling below |
 | Profile | `GET https://api.anthropic.com/api/oauth/profile`, `Authorization: Bearer`, 5 s timeout | Returns `{uuid: account.uuid, email: account.email, organizationUuid: organization.uuid}` |
-| Usage | `GET https://api.anthropic.com/api/oauth/usage`, `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, 5 s timeout | Fields: `five_hour`, `seven_day`, `extra_usage`, `limits[]` |
+| Usage | `GET https://api.anthropic.com/api/oauth/usage`, `Authorization: Bearer`, `anthropic-beta: oauth-2025-04-20`, 5 s timeout | Fields read: `five_hour`, `seven_day`, `limits[]`, `spend`, `extra_usage` (§8.2) |
 
 **Token refresh response handling:**
 - `access_token` is used as returned. `expires_in` gives `expiresAt = now_ms + expires_in·1000`.
@@ -2231,8 +2289,16 @@ is synthetic, since a successful refresh can't be recorded without spending a re
 - An unknown client id arrives as a 400 with
   `{"type": "error", "error": {"type": "invalid_request_error", "message": "Client with id … not found"}, "request_id": …}`,
   not RFC 6749's `invalid_client`. §7.3 step 7 classifies both shapes as systemic.
-- The usage response is richer than §8.2 assumes (`utilization`, ISO `resets_at`, further
-  windows, and a `spend` object). M2b's spec work starts from `usage-200.json`.
+- The usage response carries more than tagteam reads.
+  - `five_hour` and `seven_day` are objects of `utilization` (a float percentage),
+    `resets_at` (ISO 8601 with an offset), and dollar fields that are null on a subscription.
+  - `limits[]` items carry `kind` (`session`, `weekly_all`, `weekly_scoped`), `group`, an
+    integer `percent`, `resets_at`, and `scope.model.display_name` on scoped items.
+  - `spend` gives `used` and `limit` as `{amount_minor, currency, exponent}`, plus `enabled`.
+    The older `extra_usage` gives `used_credits` and `monthly_limit` in minor units, with
+    `decimal_places`.
+  - There are also per-model `seven_day_*` objects, code-named windows (mostly null),
+    and `seven_day_breakdown`. §8.2 says which fields tagteam reads.
 
 ### A.6 `~/.claude.json` fields tagteam reads
 
