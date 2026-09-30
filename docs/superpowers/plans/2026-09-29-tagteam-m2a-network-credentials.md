@@ -351,7 +351,9 @@ pub enum RefreshResult {
     /// identity the token response named, if it named one (§7.4 identity_conflict).
     Refreshed { successor: Vec<u8>, owner: Option<Identity> },
     Dead(DeadReason),
-    /// `invalid_client`: never a strike (§7.3).
+    /// The token endpoint refused the request itself: a top-level `invalid_client`, or a 400
+    /// `invalid_request_error` (an unknown client id, Appendix A.5). Never a strike (§7.3).
+    /// The string is the server's own message, else the error code.
     Systemic(String),
     Transient(TransientKind),
 }
@@ -495,8 +497,11 @@ all `true`.
 **Recorded fixtures** (Task 1): `crates/tagteam-cc/tests/fixtures/endpoints/<name>.json`, each
 `{"status": <u16>, "headers": {"content-type": …, "retry-after": …?}, "body": <redacted JSON>,
 "synthetic": <bool>}`.
-- Recorded by the probe: `profile-200`, `usage-200`, `token-invalid-grant`,
-  `token-invalid-client`.
+- Recorded by the probe, then scrubbed (fixed fakes for ids, names, creation times and request
+  ids; the other timestamps shifted, keeping their exact format): `profile-200`, `usage-200`,
+  `token-invalid-grant`, `token-invalid-client`. `token-invalid-client` is the endpoint's real
+  answer to an unknown client id: a 400 with a nested `error.type` of `invalid_request_error`,
+  not RFC 6749's `invalid_client`.
 - Hand-built from Appendix A.5, since a successful refresh can't be recorded without spending
   a real token: `token-200`, with `"synthetic": true`.
 
@@ -822,18 +827,37 @@ no CLI test reaches the network.
 probe on his Mac against his real Claude Code login, reviews every recorded file, and commits.
 **Decision gate:** if a recorded shape disagrees with Appendix A.5 (the profile lacks
 `account.uuid` or `account.email`, its `organization` is present but not `null` and carries no
-string `uuid`, or a token error lacks a top-level `error`), stop and bring the redacted recordings to Michael before any further task — Tasks 7
-and 8 parse exactly those shapes.
+string `uuid`, the `invalid_grant` reply lacks a top-level `error == "invalid_grant"`, or the
+unknown-client reply is neither a top-level `error == "invalid_client"` nor a 400 whose nested
+`error.type` is `invalid_request_error`), stop and bring the redacted recordings to Michael
+before any further task — Tasks 7 and 8 parse exactly those shapes.
+
+**Where this stands.** Steps 1–5 ran on 2026-09-30 with Claude Code 2.1.285. The probe was
+committed at `d1dfd1d` and refined in `450c102`. The gate passed on the second shape: the
+endpoint answers an unknown client id with a 400 carrying a nested `invalid_request_error`, not
+RFC 6749's `invalid_client`, so the spec was amended (`7e96d7c`: §7.3 step 7 and Appendix A.5)
+to classify both shapes as systemic. The run's recordings sit uncommitted in the working tree,
+and their review found real values the redaction did not cover: creation times, request ids and
+the usage timestamps. Michael ruled to scrub them in place rather than re-run the probe. The
+script in Step 1 is the committed probe plus that scrubbing, the two-shape gate and a `rescrub`
+subcommand. Step 7 applies it, Step 8 rescrubs the recordings, and Step 9 commits them.
 
 What the probe spends, and why it is safe:
 - **Profile and usage:** two read-only GETs with the live access token, as Claude Code itself
   makes them. The usage call spends one request of that identity's hourly budget (§8.6).
 - **Token endpoint:** two POSTs that carry a made-up refresh token, so no real refresh token is
   ever sent. The first uses the real client id (expected: `invalid_grant`), the second a
-  made-up client id (expected: `invalid_client`).
+  made-up client id (expected: a client refusal, in either of the two shapes above; the
+  2026-09-30 run recorded the nested one).
 - **No token is ever printed, logged or put in argv.** The access token lives only in a shell
   variable and reaches curl through `--config -` on stdin, never on the command line (`ps`
   would show it). Bodies are redacted before they are written to disk or shown.
+- **Redaction keeps every key, type and format.** Emails, uuids, tokens, request ids and
+  account/organization names become numbered fakes. `created_at` and
+  `subscription_created_at` become `2020-01-01T00:00:00` plus zeros in the same fractional
+  digits and the same offset. Every other ISO timestamp moves by one whole-second delta that
+  puts the earliest at `2030-01-01T00:00:00`, keeping order, spacing, fractional digits and the
+  `+00:00` style, so M2b's parser still sees the real formats. Plan tier and amounts stay.
 - A successful refresh cannot be recorded without spending a real refresh token, so
   `token-200.json` is hand-built from Appendix A.5 and marked `"synthetic": true`.
 
@@ -842,8 +866,9 @@ What the probe spends, and why it is safe:
 - Create: `crates/tagteam-cc/tests/fixtures/endpoints/token-200.json` (synthetic)
 - Create (by the probe run): `crates/tagteam-cc/tests/fixtures/endpoints/profile-200.json`,
   `usage-200.json`, `token-invalid-grant.json`, `token-invalid-client.json`
-- Modify: `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md` (Appendix A.5: one
-  verification line)
+- Modify: `scripts/spikes/m2a-endpoints.sh` (Step 7: scrubbing, the two-shape gate, `rescrub`)
+- Modify: `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md` (§7.3 step 7 and
+  Appendix A.5's verification line; already committed in `7e96d7c`)
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
@@ -851,7 +876,8 @@ What the probe spends, and why it is safe:
   `{"status": <u16>, "headers": {"content-type": …, "retry-after": …?}, "body": <redacted JSON>, "synthetic": <bool>}`
   — at `crates/tagteam-cc/tests/fixtures/endpoints/<name>.json` for `profile-200`,
   `usage-200`, `token-invalid-grant`, `token-invalid-client` and `token-200`. Tasks 7 and 8 load
-  them with `include_str!`.
+  them with `include_str!`. `token-invalid-client` is the nested shape
+  (`{"type": "error", "error": {"type": "invalid_request_error", "message": …}, "request_id": …}`).
 
 - [ ] **Step 1: Write the probe script**
 
@@ -880,9 +906,103 @@ TOKEN_URL=https://platform.claude.com/v1/oauth/token
 PROFILE_URL=https://api.anthropic.com/api/oauth/profile
 USAGE_URL=https://api.anthropic.com/api/oauth/usage
 
-WORK=$(mktemp -d)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/tagteam-probe.XXXXXX")
 chmod 700 "$WORK"
 trap 'rm -rf "$WORK"' EXIT
+
+# The redaction, shared by `record` (fresh responses) and `rescrub` (recordings on disk).
+# Deterministic, and it keeps every key, type, array length and string format.
+export PYTHONPATH="$WORK" PYTHONDONTWRITEBYTECODE=1
+cat > "$WORK/redactor.py" <<'PYEOF'
+import re
+from datetime import datetime
+
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+ISO = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})")
+NAME_KEYS = {"name", "full_name", "display_name", "organization_name"}
+SHIFT_BASE = datetime(2030, 1, 1)
+fakes = {"email": {}, "uuid": {}, "token": {}, "name": {}, "request": {}}
+
+def fake(kind, value):
+    table = fakes[kind]
+    if value not in table:
+        n = len(table) + 1
+        table[value] = {
+            "email": f"probe{n}@example.com",
+            "uuid": f"00000000-0000-4000-8000-{n:012d}",
+            "token": f"redacted-token-{n}",
+            "name": f"Probe Name {n}",
+            "request": "req_" + str(n).zfill(max(len(value) - 4, 1)),
+        }[kind]
+    return table[value]
+
+def is_creation(key):
+    return key.lower().endswith("created_at")
+
+def wall(m):
+    return datetime(*(int(g) for g in m.groups()[:6]))
+
+def redact(v, key="", path=()):
+    if isinstance(v, dict):
+        return {k: redact(x, k, path + (k,)) for k, x in v.items()}
+    if isinstance(v, list):
+        return [redact(x, key, path) for x in v]
+    if not isinstance(v, str):
+        return v
+    k = key.lower()
+    m = ISO.fullmatch(v)
+    if m and is_creation(k):
+        # A creation time identifies the account: a fixed fake, same fractional digits and offset.
+        return "2020-01-01T00:00:00" + re.sub(r"\d", "0", m.group(7) or "") + m.group(8)
+    if k == "request_id":
+        return fake("request", v)
+    if EMAIL.fullmatch(v) or "email" in k:
+        return fake("email", v)
+    owned = any(p in ("account", "organization", "user") for p in path)
+    if UUID.fullmatch(v) or k.endswith("uuid") or (k == "id" and owned):
+        return fake("uuid", v)
+    if v.startswith("sk-ant-") or "token" in k or "secret" in k:
+        return fake("token", v)
+    if k in NAME_KEYS and owned:
+        return fake("name", v)
+    v = EMAIL.sub(lambda m: fake("email", m.group(0)), v)
+    return UUID.sub(lambda m: fake("uuid", m.group(0)), v)
+
+def shift_times(body):
+    # Every other ISO timestamp moves by one whole-second delta that puts the earliest at
+    # 2030-01-01T00:00:00: order and spacing survive, and so do the fractional digits and the
+    # offset, so a parser sees the real formats. Scrubbing a scrubbed body moves nothing.
+    seen = []
+    def collect(v, key=""):
+        if isinstance(v, dict):
+            for k, x in v.items():
+                collect(x, k)
+        elif isinstance(v, list):
+            for x in v:
+                collect(x, key)
+        elif isinstance(v, str) and not is_creation(key):
+            m = ISO.fullmatch(v)
+            if m:
+                seen.append(wall(m))
+    collect(body)
+    if not seen:
+        return body
+    delta = SHIFT_BASE - min(seen)
+    def move(v, key=""):
+        if isinstance(v, dict):
+            return {k: move(x, k) for k, x in v.items()}
+        if isinstance(v, list):
+            return [move(x, key) for x in v]
+        m = ISO.fullmatch(v) if isinstance(v, str) else None
+        if m and not is_creation(key):
+            return (wall(m) + delta).strftime("%Y-%m-%dT%H:%M:%S") + (m.group(7) or "") + m.group(8)
+        return v
+    return move(body)
+
+def scrub(body):
+    return shift_times(redact(body))
+PYEOF
 
 acct() {
   local u="${USER:-}"
@@ -934,14 +1054,16 @@ sys.stdout.write(tok)
 }
 
 # Turns $WORK/{status,headers,body} into the redacted fixture envelope at $OUT/$1.json, and
-# shows it. Redaction is deterministic and keeps every key, type and array length: emails,
-# uuids, tokens and account/organization names become fixed fakes, numbered in order of first
-# appearance, so two equal values stay equal.
+# shows it. Redaction (redactor.py above) is deterministic and keeps every key, type and array
+# length: emails, uuids, tokens, request ids and account/organization names become fixed fakes,
+# numbered in order of first appearance, so two equal values stay equal; creation times become
+# a fixed fake and every other timestamp is shifted, both keeping their exact format.
 record() {
   local name=$1
   mkdir -p "$OUT"
   "$PY" - "$WORK" "$OUT/$name.json" <<'PYEOF'
-import json, re, sys
+import json, sys
+from redactor import scrub
 work, dest = sys.argv[1], sys.argv[2]
 status = int(open(f"{work}/status").read().strip())
 headers = {}
@@ -958,41 +1080,7 @@ try:
 except ValueError:
     body = raw.decode("utf-8", "replace")
 
-EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-NAME_KEYS = {"name", "full_name", "display_name", "organization_name"}
-fakes = {"email": {}, "uuid": {}, "token": {}, "name": {}}
-def fake(kind, value):
-    table = fakes[kind]
-    if value not in table:
-        n = len(table) + 1
-        table[value] = {
-            "email": f"probe{n}@example.com",
-            "uuid": f"00000000-0000-4000-8000-{n:012d}",
-            "token": f"redacted-token-{n}",
-            "name": f"Probe Name {n}",
-        }[kind]
-    return table[value]
-def redact(v, key="", path=()):
-    if isinstance(v, dict):
-        return {k: redact(x, k, path + (k,)) for k, x in v.items()}
-    if isinstance(v, list):
-        return [redact(x, key, path) for x in v]
-    if not isinstance(v, str):
-        return v
-    k = key.lower()
-    if EMAIL.fullmatch(v) or "email" in k:
-        return fake("email", v)
-    if UUID.fullmatch(v) or k.endswith("uuid") or k == "id":
-        return fake("uuid", v)
-    if v.startswith("sk-ant-") or "token" in k or "secret" in k:
-        return fake("token", v)
-    if k in NAME_KEYS and any(p in ("account", "organization", "user") for p in path):
-        return fake("name", v)
-    v = EMAIL.sub(lambda m: fake("email", m.group(0)), v)
-    return UUID.sub(lambda m: fake("uuid", m.group(0)), v)
-
-env = {"status": status, "headers": headers, "body": redact(body), "synthetic": False}
+env = {"status": status, "headers": headers, "body": scrub(body), "synthetic": False}
 with open(dest, "w") as f:
     json.dump(env, f, indent=2)
     f.write("\n")
@@ -1062,25 +1150,57 @@ for path in (("account", "uuid"), ("account", "email")):
         problems.append(f"profile: no string at {'.'.join(path)}")
 # Appendix A.6 treats a null or empty organization as '': a personal account has none.
 org = b.get("organization")
-if org is not None and not (isinstance(org, dict) and isinstance(org.get("uuid", ""), str)):
+if org is not None and not (isinstance(org, dict) and isinstance(org.get("uuid"), str)):
     problems.append("profile: organization is neither null nor an object with a string uuid")
 u = load("usage-200")
 if u["status"] != 200: problems.append(f"usage: status {u['status']}")
-for n, want in (("token-invalid-grant", "invalid_grant"), ("token-invalid-client", "invalid_client")):
-    t = load(n)
-    err = t["body"].get("error") if isinstance(t["body"], dict) else None
-    if t["status"] not in (400, 401, 403): problems.append(f"{n}: status {t['status']}")
-    if err != want: problems.append(f"{n}: top-level error is {err!r}, expected {want!r}")
+g = load("token-invalid-grant")
+gerr = g["body"].get("error") if isinstance(g["body"], dict) else None
+if g["status"] not in (400, 401, 403): problems.append(f"token-invalid-grant: status {g['status']}")
+if gerr != "invalid_grant": problems.append(f"token-invalid-grant: top-level error is {gerr!r}, expected 'invalid_grant'")
+# An unknown client is refused in one of two shapes, and Task 8 classifies both as systemic:
+# RFC 6749's top-level "invalid_client", or a 400 whose nested error.type is
+# "invalid_request_error" (what the endpoint returned on 2026-09-30).
+c = load("token-invalid-client")
+cerr = c["body"].get("error") if isinstance(c["body"], dict) else None
+rfc = cerr == "invalid_client"
+nested = isinstance(cerr, dict) and cerr.get("type") == "invalid_request_error"
+if c["status"] not in (400, 401, 403): problems.append(f"token-invalid-client: status {c['status']}")
+if not (rfc or nested):
+    problems.append(f"token-invalid-client: error is {cerr!r}, expected 'invalid_client' or an object of type 'invalid_request_error'")
+elif nested and c["status"] != 400:
+    problems.append(f"token-invalid-client: the nested shape is only classified on a 400, got {c['status']}")
 if problems:
     print("GATE FAILS:"); [print(" -", x) for x in problems]; sys.exit(1)
-print("gate passes: every recorded shape matches Appendix A.5")
+print("gate passes: every recorded shape matches Appendix A.5 (unknown client: %s)" % ("top-level invalid_client" if rfc else "nested invalid_request_error"))
+PYEOF
+}
+
+# Re-applies the redaction, offline and in place, to recordings already on disk: no network,
+# no credential. Never touches token-200.json (synthetic). Idempotent.
+rescrub() {
+  "$PY" - "$OUT" <<'PYEOF'
+import json, sys
+from redactor import scrub
+out = sys.argv[1]
+for name in ("profile-200", "usage-200", "token-invalid-grant", "token-invalid-client"):
+    path = f"{out}/{name}.json"
+    with open(path) as f:
+        env = json.load(f)
+    if env.get("synthetic"):
+        continue
+    env["body"] = scrub(env["body"])
+    with open(path, "w") as f:
+        json.dump(env, f, indent=2)
+        f.write("\n")
+    print(f"rescrubbed {path}")
 PYEOF
 }
 
 case "${1:-}" in
-  profile|usage|invalid_grant|invalid_client|check) "$1" ;;
+  profile|usage|invalid_grant|invalid_client|check|rescrub) "$1" ;;
   all) profile; usage; invalid_grant; invalid_client; check ;;
-  *) echo "usage: $0 all|profile|usage|invalid_grant|invalid_client|check" >&2; exit 2 ;;
+  *) echo "usage: $0 all|profile|usage|invalid_grant|invalid_client|check|rescrub" >&2; exit 2 ;;
 esac
 ```
 
@@ -1134,8 +1254,9 @@ network and the login keychain), with a working Claude Code login:
 
 Run: `scripts/spikes/m2a-endpoints.sh all`
 Expected: four `--- crates/tagteam-cc/tests/fixtures/endpoints/<name>.json` blocks, then
-`gate passes: every recorded shape matches Appendix A.5`. Little Snitch may ask about `curl`
-reaching `api.anthropic.com` and `platform.claude.com`; allow it for this run.
+`gate passes: every recorded shape matches Appendix A.5`, followed by which unknown-client
+shape it saw. Little Snitch may ask about `curl` reaching `api.anthropic.com` and
+`platform.claude.com`; allow it for this run.
 
 If `profile-200` or `usage-200` recorded a 401, the live access token had expired: send
 `claude` one message (so Claude Code refreshes its own token), then re-run
@@ -1143,42 +1264,90 @@ If `profile-200` or `usage-200` recorded a 401, the live access token had expire
 hourly budget is spent; wait an hour and re-run `usage` and `check`. Never refresh the live
 token any other way — that is Claude Code's.
 
-Then review every recorded file by eye:
-
-Run: `cat crates/tagteam-cc/tests/fixtures/endpoints/{profile-200,usage-200,token-invalid-grant,token-invalid-client}.json`
-Expected: no real email, account or organization uuid, person or organization name, or token
-anywhere — only `probeN@example.com`, `00000000-0000-4000-8000-00000000000N`,
-`Probe Name N` and `redacted-token-N`. If anything real survives, extend `redact()` in the
-script to cover it, re-run `all`, and review again. Never commit a file with a real value in
-it.
+If `check` printed `GATE FAILS`, stop. Bring the printed problems and the redacted recordings
+to Michael; do not start Task 2. The fix is a spec amendment to Appendix A.5 and the matching
+change to Tasks 7 and 8 of this plan, made before either runs.
 
 Record in the task report (not in git): the `claude --version` output, the date, and the
-four `status` values.
+four `status` values. (2026-09-30, Claude Code 2.1.285: `200`, `200`, `400`, `400`.)
 
-- [ ] **Step 6: Decide and record**
+- [ ] **Step 6: Confirm the spec records the verification**
 
-- **Pass** (`check` printed `gate passes`, and the review found nothing real): in the spec,
-  directly under Appendix A.5's `All requests use User-Agent: tagteam/<version>.` line, add:
+The spec amendment landed in `7e96d7c`. No spec edit is left for this task.
 
-  ```markdown
-  Response shapes verified against the live endpoints on <YYYY-MM-DD> with Claude Code
-  <version>; redacted recordings are in `crates/tagteam-cc/tests/fixtures/endpoints/`
-  (`token-200.json` is synthetic, since a successful refresh cannot be recorded without
-  spending a real token).
-  ```
+Run: `rg -n 'Response shapes verified against the live endpoints|invalid_request_error' docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md`
+Expected: three matches: §7.3 step 7's verdict row, and Appendix A.5's verification line and
+its unknown-client bullet (the `invalid_request_error` text). If Appendix A.5 lacks the
+verification line, stop and bring it to Michael: the spec is the canonical record, and this
+task does not amend it.
 
-- **Fail** (`check` printed `GATE FAILS`): stop. Bring the printed problems and the redacted
-  recordings to Michael; do not start Task 2. The fix is a spec amendment to Appendix A.5 and
-  the matching change to Tasks 7 and 8 of this plan, made before either runs.
+- [ ] **Step 7: Bring the committed probe up to date**
 
-- [ ] **Step 7: Commit the recordings and the spec line (pass only)**
+Overwrite `scripts/spikes/m2a-endpoints.sh` with the script in Step 1. Against the committed
+copy it adds the shared `redactor.py` (written into the probe's work directory, used by
+`record` and `rescrub`), the timestamp and request-id scrubbing, the two-shape `check`, and
+the `rescrub` subcommand.
+
+Run: `bash -n scripts/spikes/m2a-endpoints.sh`
+Expected: no output, exit 0.
+
+Prove `rescrub` and `check` offline on a scratch copy, so the working files are untouched:
+
+```bash
+S=$(mktemp -d "${TMPDIR:-/tmp}/rescrub.XXXXXX")
+cp crates/tagteam-cc/tests/fixtures/endpoints/*.json "$S"/
+TAGTEAM_PROBE_OUT="$S" scripts/spikes/m2a-endpoints.sh rescrub
+TAGTEAM_PROBE_OUT="$S" scripts/spikes/m2a-endpoints.sh check
+mkdir "$S/once" && cp "$S"/*.json "$S/once"/
+TAGTEAM_PROBE_OUT="$S" scripts/spikes/m2a-endpoints.sh rescrub > /dev/null
+diff -r "$S/once" "$S" --exclude=once && echo idempotent
+rg -n '202[1-9]-' "$S"/*.json
+rm -rf "$S"
+```
+Expected: four `rescrubbed …/<name>.json` lines; `gate passes: every recorded shape matches
+Appendix A.5 (unknown client: nested invalid_request_error)`; `idempotent` (the second rescrub
+changed nothing); and no output from the `rg`, so no real date survives (the fakes are 2020,
+the shifted times are 2030 or later). `token-200.json` is untouched, since a synthetic
+envelope is skipped.
+
+```bash
+git add scripts/spikes/m2a-endpoints.sh
+git commit -m "Scrub timestamps and request ids in the endpoint probe and add rescrub"
+```
+
+- [ ] **Step 8: Rescrub the recordings and Michael re-reviews**
+
+Run: `scripts/spikes/m2a-endpoints.sh rescrub`
+Expected: four `rescrubbed crates/tagteam-cc/tests/fixtures/endpoints/<name>.json` lines. No
+network, no keychain: it rewrites the four recordings in place.
+
+Run: `scripts/spikes/m2a-endpoints.sh check`
+Expected: `gate passes: every recorded shape matches Appendix A.5 (unknown client: nested invalid_request_error)`
+
+Then Michael reviews every file by eye:
+
+Run: `cat crates/tagteam-cc/tests/fixtures/endpoints/{profile-200,usage-200,token-invalid-grant,token-invalid-client}.json`
+Expected: nothing real anywhere.
+- Only `probeN@example.com`, `00000000-0000-4000-8000-00000000000N`, `Probe Name N` and
+  `redacted-token-N`.
+- `created_at` and `subscription_created_at` are `2020-01-01T00:00:00.000000Z`, and
+  `request_id` is `req_` plus zeros ending in `1`.
+- Every usage timestamp is 2030 or later, and still looks like `2030-01-01T00:00:00.751075+00:00`
+  (six fractional digits where the live one had six, none where it had none, always `+00:00`).
+  `window_started_at` is the earliest, at `2030-01-01T00:00:00…`.
+- Kept as recorded: `rate_limit_tier`, the `utilization` and `percent` values, the dollar and
+  `amount_minor` figures, and every key and `null`.
+
+If anything real survives, extend `redact()` in the script, redo Steps 7–8, and review again.
+Never commit a file with a real value in it.
+
+- [ ] **Step 9: Commit the recordings**
 
 ```bash
 git add crates/tagteam-cc/tests/fixtures/endpoints/profile-200.json \
   crates/tagteam-cc/tests/fixtures/endpoints/usage-200.json \
   crates/tagteam-cc/tests/fixtures/endpoints/token-invalid-grant.json \
-  crates/tagteam-cc/tests/fixtures/endpoints/token-invalid-client.json \
-  docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md
+  crates/tagteam-cc/tests/fixtures/endpoints/token-invalid-client.json
 git commit -m "Record redacted responses from the live Claude Code endpoints"
 ```
 
@@ -7601,11 +7770,69 @@ fn the_recorded_error_replies_are_dead_and_systemic() {
         parse_refresh(&stored(), Ok(grant), NOW),
         RefreshResult::Dead(DeadReason::InvalidGrant)
     ));
-    let (client, _) = fixture(include_str!("fixtures/endpoints/token-invalid-client.json"));
-    assert!(matches!(
-        parse_refresh(&stored(), Ok(client), NOW),
-        RefreshResult::Systemic(_)
-    ));
+    // The real unknown-client answer: a 400 with a nested `invalid_request_error`, not RFC
+    // 6749's top-level `invalid_client` (Appendix A.5). The server's message is quoted.
+    let (client, body) = fixture(include_str!("fixtures/endpoints/token-invalid-client.json"));
+    assert_eq!(client.status, 400);
+    assert!(body["error"].is_object(), "the recording is the nested shape");
+    let RefreshResult::Systemic(message) = parse_refresh(&stored(), Ok(client), NOW) else {
+        panic!("expected Systemic");
+    };
+    assert_eq!(message, body["error"]["message"].as_str().unwrap());
+    assert!(message.starts_with("Client with id "), "{message}");
+}
+
+#[test]
+fn both_client_refusal_shapes_are_systemic_and_quote_the_server() {
+    let systemic = |status: u16, body: Value| match parse_refresh(&stored(), Ok(reply(status, &body)), NOW) {
+        RefreshResult::Systemic(m) => m,
+        other => panic!("expected Systemic, got {other:?}"),
+    };
+    // RFC 6749: top-level `invalid_client`, any status; `error_description` when present,
+    // else the code.
+    for status in [400, 401, 403] {
+        assert_eq!(
+            systemic(status, json!({"error": "invalid_client", "error_description": "bad client"})),
+            "bad client"
+        );
+        assert_eq!(systemic(status, json!({"error": "invalid_client"})), "invalid_client");
+    }
+    assert_eq!(
+        systemic(400, json!({"error": "invalid_client", "error_description": ""})),
+        "invalid_client",
+        "an empty description is no message"
+    );
+    // The endpoint's own shape: a 400 with a nested `invalid_request_error`.
+    let nested = |message: Option<&str>| {
+        let mut error = json!({"type": "invalid_request_error"});
+        if let Some(m) = message {
+            error["message"] = json!(m);
+        }
+        json!({"type": "error", "error": error, "request_id": "req_1"})
+    };
+    assert_eq!(systemic(400, nested(Some("Client with id x not found"))), "Client with id x not found");
+    assert_eq!(systemic(400, nested(None)), "invalid_request_error");
+    // Only a 400 carrying that exact nested type is a client refusal; everything else keeps
+    // its old row.
+    let transient = |status: u16, body: Value| match parse_refresh(&stored(), Ok(reply(status, &body)), NOW) {
+        RefreshResult::Transient(k) => k,
+        other => panic!("expected Transient, got {other:?}"),
+    };
+    assert_eq!(transient(401, nested(Some("m"))), TransientKind::Http(401));
+    assert_eq!(transient(500, nested(Some("m"))), TransientKind::Http(500));
+    assert_eq!(
+        transient(400, json!({"type": "error", "error": {"type": "api_error", "message": "m"}})),
+        TransientKind::Http(400),
+    );
+    assert_eq!(
+        transient(400, json!({"error": {"message": "no type"}})),
+        TransientKind::Http(400),
+    );
+    // A nested error is never a strike: it can't be `invalid_grant`.
+    assert_eq!(
+        transient(400, json!({"error": {"type": "invalid_grant"}})),
+        TransientKind::Http(400),
+    );
 }
 
 #[test]
@@ -7637,9 +7864,11 @@ fn every_row_of_the_verdict_table() {
         TransientKind::Http(429)
     );
     for status in [400, 401] {
+        // RFC 6749's top-level shape; the nested one is pinned by the recorded fixture and by
+        // `both_client_refusal_shapes_are_systemic_and_quote_the_server`.
         assert!(matches!(
             parse_refresh(&stored(), Ok(reply(status, &err("invalid_client"))), NOW),
-            RefreshResult::Systemic(_)
+            RefreshResult::Systemic(m) if m == "invalid_client"
         ));
     }
     let pre = transient(parse_refresh(
@@ -7870,7 +8099,9 @@ pub enum RefreshResult {
         owner: Option<Identity>,
     },
     Dead(DeadReason),
-    /// `invalid_client`: never a strike (§7.3).
+    /// The token endpoint refused the request itself: a top-level `invalid_client`, or a 400
+    /// `invalid_request_error` (an unknown client id, Appendix A.5). Never a strike (§7.3).
+    /// The string is the server's own message, else the error code.
     Systemic(String),
     Transient(TransientKind),
 }
@@ -7992,11 +8223,23 @@ fn seconds(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
 }
 
+/// The server's own words for a refusal: `error_description` (RFC 6749) or the nested
+/// `error.message`, else `fallback` (the error code), so the text is never empty.
+fn refusal_message(body: Option<&Value>, fallback: &str) -> String {
+    let text = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+    body.and_then(|b| text(&b["error_description"]).or_else(|| text(&b["error"]["message"])))
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
 /// §7.3 step 7, the provider's half, and Appendix A.5's reply handling.
 ///
 /// - `invalid_grant` from 400, 401 or 403 is `Dead`; the engine re-reads the source that was
 ///   sent before it quarantines anything.
-/// - `invalid_client`, whatever the status, is `Systemic`: never a strike.
+/// - A refusal of the request itself is `Systemic`, never a strike, quoting the server's
+///   message: a top-level `error == "invalid_client"` whatever the status (RFC 6749), or a 400
+///   whose nested `error.type` is `invalid_request_error` (what the endpoint answers for an
+///   unknown client id, Appendix A.5). The message is `error_description` or the nested
+///   `error.message`, else the error code.
 /// - A 200 that names an access or a refresh token is `Refreshed`. Nothing received is ever
 ///   discarded: without an access token the stored one is kept, and without `expires_in` the
 ///   successor is stamped as expiring now, so the next use refreshes again.
@@ -8012,21 +8255,24 @@ pub fn parse_refresh(
         Err(HttpError::Ambiguous(_)) => return RefreshResult::Transient(TransientKind::Ambiguous),
     };
     let body = resp.json();
-    let error = body
-        .as_ref()
-        .and_then(|b| b["error"].as_str())
-        .map(str::to_owned);
-    match (resp.status, error.as_deref()) {
-        (400 | 401 | 403, Some("invalid_grant")) => {
+    let error = body.as_ref().map(|b| &b["error"]);
+    let code = error.and_then(Value::as_str);
+    let nested_type = error.and_then(|e| e["type"].as_str());
+    match (resp.status, code, nested_type) {
+        (400 | 401 | 403, Some("invalid_grant"), _) => {
             return RefreshResult::Dead(DeadReason::InvalidGrant);
         }
-        (status, Some("invalid_client")) => {
-            return RefreshResult::Systemic(format!(
-                "the token endpoint rejected tagteam's client id (HTTP {status})"
+        (_, Some("invalid_client"), _) => {
+            return RefreshResult::Systemic(refusal_message(body.as_ref(), "invalid_client"));
+        }
+        (400, None, Some("invalid_request_error")) => {
+            return RefreshResult::Systemic(refusal_message(
+                body.as_ref(),
+                "invalid_request_error",
             ));
         }
-        (200, _) => {}
-        (status, _) => return RefreshResult::Transient(TransientKind::Http(status)),
+        (200, ..) => {}
+        (status, ..) => return RefreshResult::Transient(TransientKind::Http(status)),
     }
     let Some(body) = body else {
         return RefreshResult::Transient(TransientKind::BadResponse);
@@ -10053,7 +10299,8 @@ pub enum GateOutcome {
     Conflict,
     /// Quarantined, by this pass or an earlier one (§7.4).
     Dead(QuarantineReason),
-    /// `invalid_client`: never a strike.
+    /// The token endpoint refused the request itself (`invalid_client`, or an unknown client
+    /// id's `invalid_request_error`), quoting its message: never a strike.
     Systemic(String),
     /// Nothing decisive happened. `rescued` means a successor was received but is only in
     /// `rescue/`: the vault's generation is consumed, and the caller must not activate it.
