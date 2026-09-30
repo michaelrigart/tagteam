@@ -1,14 +1,16 @@
 mod common;
 
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use common::Fx;
+use common::{API_KEY, Fx};
 use serde_json::{Value, json};
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
+use tagteam_engine::vault::SERVICE;
 use tagteam_provider::{Credential, Identity, Provider};
 
 fn add_opts(fx: &Fx) -> AddOptions {
@@ -874,4 +876,41 @@ fn add_live_reports_an_identity_that_becomes_unreadable_under_the_lock_as_unread
     )
     .unwrap();
     assert!(matches!(result, Err(EngineError::Unreadable(_))));
+}
+
+#[test]
+fn a_new_account_whose_vault_write_fails_its_check_leaves_no_secret_behind() {
+    // L444: the write lands but reads back wrong, so the new account is rolled back. Its
+    // secret must go with it, never outliving the account it belongs to (§5).
+    let fx = Fx::new();
+    let kc = fx.kc.clone();
+    let reads = Mutex::new(HashMap::<String, usize>::new());
+    let engine = fx.engine_with_vault_probe(move |key| {
+        let mut reads = reads.lock().unwrap();
+        let n = reads.entry(key.to_owned()).or_default();
+        *n += 1;
+        // `Vault::store` reads a key before its write and again to verify it: tamper between.
+        if *n == 2 && !key.ends_with(".prev") {
+            kc.put(SERVICE, key, b"tampered");
+        }
+    });
+
+    let err = engine.add_token(fx.add_token_options(API_KEY)).unwrap_err();
+
+    assert_eq!(err.kind(), "vault");
+    let left: Vec<_> = fx
+        .kc
+        .items()
+        .into_keys()
+        .filter(|(service, _)| service == SERVICE)
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    assert!(
+        fx.engine
+            .store()
+            .unwrap()
+            .accounts(&fx.provider())
+            .unwrap()
+            .is_empty()
+    );
 }

@@ -346,6 +346,15 @@ impl Engine {
                     added_at: self.now_ms(),
                 })?;
                 if let Err(e) = self.vault.store(lock_for(&prep.id), secret, &fp) {
+                    // The write may have landed and failed only its read-back. A new account
+                    // has no earlier generation to keep, so whatever it left goes with the row:
+                    // no secret outlives its account (§5, L444).
+                    if let Err(cleanup) = self.vault.delete(lock_for(&prep.id)) {
+                        tracing::error!(
+                            id = %prep.id,
+                            "could not remove the vault entry of an account that was never added: {cleanup}"
+                        );
+                    }
                     store.delete_account(&prep.id)?;
                     return Err(e.into());
                 }
