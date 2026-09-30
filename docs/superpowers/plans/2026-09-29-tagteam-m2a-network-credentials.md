@@ -28,7 +28,8 @@ a `std::net` mock server.
 
 **Spec:** `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md`. Read §2, §3, §4, §5,
 §6.1–§6.3, §7, §9, §15 and Appendix A.5 before starting any task. Section numbers below refer
-to that spec. The amendments this plan implements landed in commits `33b97d5` and `d307d39`.
+to that spec. The amendments this plan implements landed in commits `33b97d5`, `d307d39`, `d224220`,
+`6f8bbe6` and `ac25b2d`.
 
 ## Execution notes
 
@@ -81,8 +82,8 @@ Every task's requirements include these. Values are copied from the spec.
 - HTTP: blocking `ureq` with rustls and `rustls-platform-verifier`; no async runtime (§4.4).
 - Every request carries `User-Agent: tagteam/<version>`. Response bodies are capped at 1 MiB.
   A request's `Debug` never shows its `Authorization` header or body (§4.4).
-- Transport errors: `PreSend` only when the request provably never left (a DNS, connect or
-  TLS-handshake failure); everything else is `Ambiguous` (§4.4).
+- Transport errors: `PreSend` only when the request provably never left (a DNS or connect
+  failure); everything else is `Ambiguous`, TLS errors included (§4.4).
 - Timeouts:
   - token request: 10 s from the gate (§7.3), 6 s from active-token refresh (§7.5)
   - profile request: 5 s (§7.6, Appendix A.5)
@@ -147,8 +148,10 @@ Cargo.toml                                  + ureq workspace dependency, tagteam
 scripts/spikes/m2a-endpoints.sh             Task 1 probe (human-run)
 crates/tagteam-provider/
   Cargo.toml                                + feature mock-server
+  src/lib.rs                     MOD        http and mock_server modules, re-exports
   src/http.rs                    NEW        Http port, HttpRequest/Response/Error, ScriptedHttp, NoHttp
   src/mock_server.rs             NEW        std::net MockServer (feature mock-server)
+  src/read.rs                    MOD        ReadError implements std::error::Error (Task 12)
   src/provider.rs                MOD        Capabilities, KindTraits, RefreshResult, DeadReason,
                                             TransientKind, CredLocks, LiveLocks split, trait growth
   src/atomic.rs                  MOD        temp-file cleanup guard (L319)
@@ -156,9 +159,11 @@ crates/tagteam-provider/
 crates/tagteam-cc/
   src/endpoints.rs               NEW        Endpoints (production, with_base), CLIENT_ID
   src/oauth.rs                   NEW        token request/response, profile request/response
+  src/lib.rs                     MOD        endpoints and oauth modules
   src/shape.rs                   MOD        access_token, access_expires_at, scopes, apply_refresh
   src/locks.rs                   MOD        credential locks and config lock acquired separately
   src/provider.rs                MOD        new trait methods; ConfigUnsplicable remedy (M-6)
+  src/config.rs, src/live.rs     MOD        the unsplicable-config wording moves to CONFIG_REMEDY (M-6)
   src/naming.rs                  MOD        getpwuid_r (L380)
   tests/fixtures/endpoints/*.json NEW       redacted recorded bodies from Task 1
   tests/oauth.rs                 NEW
@@ -180,12 +185,20 @@ crates/tagteam-engine/
   src/store/mod.rs               MOD        quarantine ops, set_login_expires_at, db 0600 (L421)
   src/error.rs                   MOD        NeedsRelogin, RescuePending, UnreadableAccount
   tests/common/mod.rs            MOD        Fx.http, script helpers, FakeFx
+  src/testutil.rs                NEW        in-crate test harness `T` for the unit tests (test-only)
+  tests/common/mod.rs            MOD        also the shared free helpers: token_requests, due,
+                                            quarantine_of, block_rescue, unblock_rescue, credential,
+                                            two_accounts, rescue_files, prev_refresh_token
   tests/{net,oracle,rescue_switch,gate,gate_persist,rotation,freshen,active,fake_agent}.rs NEW
 crates/tagteam-core/src/rotation.rs MOD     rotation_order replaces next_in_rotation
+crates/tagteam-core/src/classify.rs MOD     the Superseded outgoing class (Task 16); L300 test (Task 7)
 crates/tagteam/
+  Cargo.toml                                + mock-server in test-support and the dev-dependency
   src/app.rs                     MOD        UreqHttp + CachingOracle(HttpOracle); test API base
   src/render.rs                  MOD        kind display and usageStatus via kind_traits; markers
-  tests/common/mod.rs            MOD        TAGTEAM_TEST_API_BASE default
+  tests/common/mod.rs            MOD        TAGTEAM_TEST_API_BASE default; shared two_accounts,
+                                            expire_vault, live_email
+  tests/app.rs, tests/cli.rs     MOD        api_base in the in-process Context; new binary tests
   tests/gate_race.rs             NEW        SIGSTOP single-flight through the binary
 ```
 
@@ -367,7 +380,7 @@ impl<'g> LiveLocks<'g> {
 ```
 
 `Identity` keeps its fields but gets a hand-written `Debug` (Task 17, L370):
-`Identity { label: <redacted>, email: <redacted>, org_uuid, org_name: <redacted>,
+`Identity { label: <redacted>, email: Some(<redacted>) / None, org_uuid, org_name: <redacted>,
 account_uuid, raw: <redacted> }`.
 
 **`Provider` trait, final shape after M2a.** Methods marked new are added by the task named.
@@ -573,8 +586,8 @@ impl Engine {
 }
 
 // src/rescue.rs (Task 9)
-pub(crate) struct RescueEntry { pub path: PathBuf, pub account_id: AccountId, pub login_epoch: i64,
-    pub predecessor_fp: String, pub credential: Vec<u8> }   // no Debug
+pub(crate) struct RescueEntry { pub path: PathBuf, pub predecessor_fp: String,
+    pub credential: Vec<u8> }   // no Debug; the parser still validates accountId and loginEpoch
 pub(crate) enum RescueFile { Entry(RescueEntry), Unreadable { path: PathBuf, detail: String } }
 impl Engine {
     pub(crate) fn write_rescue(&self, id: &AccountId, login_epoch: i64, predecessor_fp: &str,
@@ -592,6 +605,9 @@ impl Engine {
 
 // src/refresh.rs (Tasks 9–11; Task 9 declares `pub mod refresh`)
 pub const GATE_TIMEOUT: Duration = Duration::from_secs(10);   // the engine never names CC's constants
+/// §7.2's expiry buffer and test, shared by the gate and active-token refresh (Tasks 10, 16).
+pub(crate) const EXPIRY_BUFFER_MS: i64 = 5 * 60 * 1000;
+pub(crate) fn expired(p: &dyn Provider, bytes: &[u8], now_ms: i64) -> bool;
 impl Engine {
     /// Writes a new generation under `lock` (§6.2): `.prev` rotates only on a lineage change;
     /// records `login_expires_at`; clears a quarantine when the fingerprint changed (§7.4).
@@ -617,6 +633,12 @@ impl Engine {
         fp: &str);                                                              // Task 11
 }
 pub(crate) enum Abandoned { Kept(EngineError), Lost }                           // Task 11
+/// A successor that belongs to another account: displaced, the account quarantined (§7.4).
+pub(crate) enum Displacement { Kept, Lost }                                     // Task 11
+impl Engine {
+    pub(crate) fn displace_received(&self, row: &AccountRow, sent_fp: &str,
+        received: &mut Received<'_>) -> Result<Displacement, EngineError>;      // Task 11
+}
 pub(crate) fn log_lost(row: &AccountRow, cause: &dyn std::fmt::Display);        // Task 11
 /// §7.4, Task 10: the token response named another account (a non-empty uuid that differs
 /// from a known one) or another organization (both non-empty and different); either alone.
@@ -799,8 +821,8 @@ no CLI test reaches the network.
 **Human step.** The implementer writes the script and the synthetic fixture; Michael runs the
 probe on his Mac against his real Claude Code login, reviews every recorded file, and commits.
 **Decision gate:** if a recorded shape disagrees with Appendix A.5 (the profile lacks
-`account.uuid`, `account.email` or `organization.uuid`, or a token error lacks a top-level
-`error`), stop and bring the redacted recordings to Michael before any further task — Tasks 7
+`account.uuid` or `account.email`, its `organization` is present but not `null` and carries no
+string `uuid`, or a token error lacks a top-level `error`), stop and bring the redacted recordings to Michael before any further task — Tasks 7
 and 8 parse exactly those shapes.
 
 What the probe spends, and why it is safe:
@@ -1032,12 +1054,16 @@ problems = []
 p = load("profile-200")
 b = p["body"] if isinstance(p["body"], dict) else {}
 if p["status"] != 200: problems.append(f"profile: status {p['status']}")
-for path in (("account", "uuid"), ("account", "email"), ("organization", "uuid")):
+for path in (("account", "uuid"), ("account", "email")):
     cur = b
     for part in path:
         cur = cur.get(part) if isinstance(cur, dict) else None
     if not isinstance(cur, str) or not cur:
         problems.append(f"profile: no string at {'.'.join(path)}")
+# Appendix A.6 treats a null or empty organization as '': a personal account has none.
+org = b.get("organization")
+if org is not None and not (isinstance(org, dict) and isinstance(org.get("uuid", ""), str)):
+    problems.append("profile: organization is neither null nor an object with a string uuid")
 u = load("usage-200")
 if u["status"] != 200: problems.append(f"usage: status {u['status']}")
 for n, want in (("token-invalid-grant", "invalid_grant"), ("token-invalid-client", "invalid_client")):
@@ -1333,8 +1359,8 @@ mod tests {
     }
 
     #[test]
-    fn the_user_agent_names_tagteam_and_its_version() {
-        assert_eq!(USER_AGENT, concat!("tagteam/", env!("CARGO_PKG_VERSION")));
+    fn the_response_body_cap_is_one_mebibyte() {
+        // The User-Agent is pinned on the wire by Task 3's adapter test, not against its own definition.
         assert_eq!(MAX_BODY, 1_048_576);
     }
 }
@@ -1349,8 +1375,7 @@ pub mod http;
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tagteam-provider --lib http::`
-Expected: FAIL to compile — `cannot find type HttpRequest in this scope` (and the other port
-types).
+Expected: FAIL to compile — undeclared type `HttpRequest` (and the other port types).
 
 - [ ] **Step 3: Implement the port**
 
@@ -1816,7 +1841,7 @@ pub mod mock_server;
 - [ ] **Step 6: Run the tests to verify they fail**
 
 Run: `cargo test -p tagteam-provider --features mock-server --lib mock_server::`
-Expected: FAIL to compile — `cannot find type MockServer in this scope`.
+Expected: FAIL to compile — undeclared type `MockServer`.
 
 - [ ] **Step 7: Implement the mock server**
 
@@ -2454,8 +2479,10 @@ fn connect_failure(kind: io::ErrorKind) -> bool {
     )
 }
 
-/// §4.4: `PreSend` only for failures that precede sending (resolving, connecting, the TLS
-/// handshake, a request that could not even be built); everything else is `Ambiguous`.
+/// §4.4: `PreSend` only for failures that provably precede sending (resolving, connecting, a
+/// request that could not even be built); everything else is `Ambiguous`. TLS errors are
+/// `Ambiguous` too: rustls can also surface one while the response is being read, after the
+/// request left, so a handshake failure is misfiled as `ambiguous`, the harmless direction.
 fn classify(e: ureq::Error) -> HttpError {
     use ureq::{Error, Timeout};
     let detail = e.to_string();
@@ -2464,8 +2491,6 @@ fn classify(e: ureq::Error) -> HttpError {
         | Error::ConnectionFailed
         | Error::BadUri(_)
         | Error::Http(_)
-        | Error::Tls(_)
-        | Error::Rustls(_)
         | Error::RequireHttpsOnly(_)
         | Error::InvalidProxyUrl
         | Error::ConnectProxyFailed(_)
@@ -2593,6 +2618,8 @@ mod tests {
             Error::Timeout(Timeout::RecvBody),
             Error::Io(io::Error::from(io::ErrorKind::ConnectionReset)),
             Error::Io(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            // A TLS error can surface after the request left, so it is never `PreSend`.
+            Error::Tls("handshake failed"),
         ];
         for e in ambiguous {
             let shown = e.to_string();
@@ -2805,7 +2832,7 @@ pub struct AccountView { pub row: AccountRow, pub active: bool, pub kind: KindTr
 impl Engine { pub fn account_view(&self, row: AccountRow, active: bool) -> AccountView; }  // views.rs
 ```
 
-`Engine::account_view` is not in the Interface Contract. It exists because the CLI builds
+`Engine::account_view` exists because the CLI builds
 `AccountView`s in two places (the result of `remove` and of the metadata commands), and it must
 not look up kind traits itself. An unregistered provider's row gets all-false traits.
 
@@ -3563,8 +3590,8 @@ const UNREGISTERED: KindTraits = KindTraits {
         AccountView { row, active, kind }
     }
 ```
-5. Verify: `rg -n 'KIND_API_KEY|"api_key"|"setup_token"' crates/tagteam-engine/src crates/tagteam/src`
-   prints nothing. (`engine.rs`'s own unit test keeps its literal `"oauth"` fixture kind, since
+5. Verify: `rg -n 'KIND_API_KEY|"api_key"|"setup_token"' crates/tagteam-engine/src`
+   prints nothing. (The CLI's `render.rs` still names the kinds until Step 20.) (`engine.rs`'s own unit test keeps its literal `"oauth"` fixture kind, since
    no provider is registered there.)
 
 - [ ] **Step 20: Route kinds through the provider (CLI)**
@@ -3628,7 +3655,9 @@ with:
         let view = self.engine.account_view(row, active);
         self.print_view(human, view, created);
 ```
-Then verify with `rg -n '"api_key"|"setup_token"|"oauth"' crates/tagteam/src`: nothing prints.
+Then verify with `rg -n '"setup_token"|"oauth"|kind == "' crates/tagteam/src`: nothing prints.
+`rg -n '"api_key"' crates/tagteam/src` prints exactly one line, the `usageStatus` value that
+`usage_status` returns (`"api_key"` is cswap's output string there, not a kind check).
 
 - [ ] **Step 21: Run the whole workspace to verify it passes**
 
@@ -3808,8 +3837,7 @@ its `live_locks_delegate_ownership_checks` test:
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p tagteam-provider --lib provider`
-Expected: FAIL to compile: `cannot find type 'CredLocks' in this scope` and
-`cannot find function 'staged' in this scope`.
+Expected: FAIL to compile: undeclared type `CredLocks`, and `staged` not found in this scope.
 
 - [ ] **Step 3: Split `LiveLocks` and add the stages to the trait**
 
@@ -4327,7 +4355,8 @@ pub struct ClaudeCode {
 ```
 4. Confirm that nothing else names the old functions:
    `rg -n 'CcLockSet|acquire_with|locks::acquire\b|lock_timeout' crates/` should print only
-   `with_lock_timeout` and its callers in `tests/common/mod.rs`.
+   `with_lock_timeout` (the method, its callers, and the new test that uses it) and
+   `Fx::with_lock_timeout`; no `CcLockSet`, `acquire_with`, `locks::acquire` or `lock_timeout` field.
 
 - [ ] **Step 8: Run the CC tests to verify they pass**
 
@@ -4702,7 +4731,10 @@ fn a_torn_identity_file_is_unreadable_and_never_replaced() {
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p tagteam-fake`
-Expected: FAIL: `package ID specification 'tagteam-fake' did not match any packages`.
+Expected: FAIL: `failed to load manifest for workspace member` `.../crates/tagteam-fake`, caused by
+`failed to read .../crates/tagteam-fake/Cargo.toml`. The root workspace's `members = ["crates/*"]`
+glob now matches a directory that has `tests/` but no `Cargo.toml`, so every cargo command in the
+workspace fails until Step 3 creates the manifest.
 
 - [ ] **Step 3: Create the crate**
 
@@ -5818,7 +5850,8 @@ test is pointed at a dead local port so nothing reaches the network.
     `ScriptedHttp::{push_json, count, requests}`), and
     `tagteam_provider::mock_server::{MockServer, MockReply}` (feature `mock-server`).
   - Task 3: `tagteam_engine::net::UreqHttp`, `EngineConfig.http`, `Fx.http: Arc<ScriptedHttp>`.
-  - Task 4: `tagteam_cc::shape::{access_token, is_expired, classify, KIND_OAUTH}`.
+  - Task 4: `tagteam_cc::shape::{access_token, is_expired, scopes}` (and the existing
+    `is_api_key`).
   - Task 6: `tagteam_fake::{FakeAgent, KIND_STATIC, identity_json, credential_json}`, and
     `FakeAgent::whoami_url()`.
 - Produces:
@@ -6037,6 +6070,30 @@ fn resolve_owner_never_asks_without_a_token_it_can_show() {
 }
 
 #[test]
+fn resolve_owner_asks_for_an_oauth_blob_that_has_no_refresh_token() {
+    // §7.6 skips only an expired token, a setup token and an API key. A blob with a live access
+    // token and profile scopes but no refresh token is none of those, so it is shown.
+    let http = ScriptedHttp::new();
+    let url = Endpoints::production().profile;
+    http.push_json(
+        Method::Get,
+        &url,
+        200,
+        json!({"account": {"uuid": "u-1", "email": "a@x.co"}}),
+    );
+    let blob = json!({"claudeAiOauth": {
+        "accessToken": "at-live",
+        "expiresAt": NOW + 3_600_000,
+        "scopes": ["user:inference", "user:profile"],
+    }})
+    .to_string()
+    .into_bytes();
+    let owner = cc().resolve_owner(&http, &Credential::fresh(blob), NOW);
+    assert_eq!(owner.unwrap().account_uuid.as_deref(), Some("u-1"));
+    assert_eq!(http.count(Method::Get, &url), 1);
+}
+
+#[test]
 fn a_non_numeric_expiry_counts_as_unexpired() {
     // §7.2: a non-numeric `expiresAt` is not expired, so the token may be shown.
     let http = ScriptedHttp::new();
@@ -6237,7 +6294,7 @@ use crate::endpoints::Endpoints;
 use crate::oauth;
 ```
 
-and extend the existing `use crate::shape::{…}` line with `KIND_OAUTH`.
+`shape` is already imported.
 
 2. Add a field to `pub struct ClaudeCode` (keep every existing field):
 
@@ -6268,9 +6325,13 @@ and initialise it in `with_store`'s struct literal:
 ```rust
     fn resolve_owner(&self, http: &dyn Http, cred: &Credential, now_ms: i64) -> Option<Identity> {
         let bytes = cred.bytes();
-        // Setup tokens carry only `user:inference` and API keys have no profile: neither can
-        // be resolved, so neither is sent (§7.6).
-        if shape::classify(bytes) != KIND_OAUTH || shape::is_expired(bytes, now_ms) {
+        // §7.6 skips exactly these: an API key (no profile), an expired access token, and a
+        // setup token (its only scope is `user:inference`, which the profile endpoint refuses).
+        // An OAuth blob with no refresh token is none of them, so it is shown.
+        if shape::is_api_key(bytes)
+            || shape::is_expired(bytes, now_ms)
+            || shape::scopes(bytes) == ["user:inference"]
+        {
             return None;
         }
         let token = shape::access_token(bytes)?;
@@ -6284,7 +6345,7 @@ and initialise it in `with_store`'s struct literal:
 - [ ] **Step 6: Run the Claude Code tests to verify they pass**
 
 Run: `cargo test -p tagteam-cc --test oauth`
-Expected: PASS (9 tests). `cargo build --workspace` now fails in `tagteam-fake`: `not all trait
+Expected: PASS (10 tests). `cargo build --workspace` now fails in `tagteam-fake`: `not all trait
 items implemented, missing: resolve_owner`. Step 7 fixes that.
 
 - [ ] **Step 7: Write the failing `FakeAgent` test**
@@ -6377,17 +6438,14 @@ Expected: FAIL to compile (`resolve_owner` is not implemented for `FakeAgent`).
 
 - [ ] **Step 8: Implement it for `FakeAgent`**
 
-In `crates/tagteam-fake/src/provider.rs`, add to the imports (merge with what is already
-imported):
+In `crates/tagteam-fake/src/provider.rs`, add only these two imports (`Duration`, `Value`,
+`Credential`, `Identity` and `KIND_STATIC` are already imported by Task 6, and importing them again
+is a compile error):
 
 ```rust
-use std::time::Duration;
-
-use serde_json::Value;
 use tagteam_provider::http::{Http, HttpRequest};
-use tagteam_provider::{Credential, Identity};
 
-use crate::{KIND_STATIC, identity_json};
+use crate::identity_json;
 ```
 
 Add this free function above `impl Provider for FakeAgent`:
@@ -6494,9 +6552,8 @@ First, pin L300's combined-input precedence in the pure policy. Add to the `test
 ```
 
 Then add the fixture helpers to `crates/tagteam-engine/tests/common/mod.rs`. Add
-`use tagteam_cc::endpoints::Endpoints;` and
-`use tagteam_provider::http::{Method, ScriptedHttp};` to its imports (skip whichever Task 3
-already added), and add to `impl Fx` (next to `oauth_account`):
+`use tagteam_cc::endpoints::Endpoints;` and `use tagteam_provider::http::Method;` to its imports
+(Task 3 already imported `ScriptedHttp`; do not import it again), and add to `impl Fx` (next to `oauth_account`):
 
 ```rust
     /// The endpoints the fixture's `ClaudeCode` sends to: production URLs, answered by
@@ -6656,7 +6713,9 @@ fn a_rotation_attributed_to_someone_else_is_displaced_and_the_vault_kept() {
 #[test]
 fn an_attributed_blob_without_a_refresh_token_is_displaced_not_captured() {
     // L301 for §6.2: even with a positive answer, a live credential without a refresh token
-    // never replaces the vault's complete one.
+    // never replaces the vault's complete one. §7.6 does not exempt such a blob from the profile
+    // oracle (only an expired token, a setup token and an API key), so the oracle is asked
+    // and its positive answer is what the `lacks_refresh_over_complete` rule overrides.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     let b = fx.add("b@x.co", "rt-b");
@@ -6666,6 +6725,7 @@ fn an_attributed_blob_without_a_refresh_token_is_displaced_not_captured() {
     fx.set_live_credential(v.to_string().as_bytes());
     fx.script_profile("b@x.co");
     http_engine(&fx).switch(fx.switch_request(&a, false)).unwrap();
+    assert_eq!(profile_asks(&fx), 1, "the blob is attributed, not skipped");
     assert_eq!(fx.vault_refresh_token(&b).as_deref(), Some("rt-b"));
     assert_eq!(fx.displaced().len(), 1);
 }
@@ -7033,9 +7093,9 @@ fn by_default_the_test_binary_never_reaches_the_network() {
 }
 ```
 
-In `crates/tagteam/Cargo.toml`, make sure the `test-support` feature enables the mock server
-and the dev-dependency carries it. Task 2 or 3 may already have added it; add whichever part
-is missing:
+In `crates/tagteam/Cargo.toml`, make the `test-support` feature enable the mock server and give
+the dev-dependency the same feature. No earlier task touches this file; Task 18 relies on this
+edit:
 
 ```toml
 test-support = ["tagteam-provider/file-keychain", "tagteam-provider/mock-server", "tagteam-engine/test-hooks", "tagteam-cc/test-hooks"]
@@ -7753,8 +7813,9 @@ and the other new names do not exist yet).
 
 - [ ] **Step 5: Add the refresh types and the trait method**
 
-In `crates/tagteam-provider/src/provider.rs`, add `use std::time::Duration;` to the imports and
-`use crate::credential::FreshCredential;` next to `Credential`. Then add the types, before
+In `crates/tagteam-provider/src/provider.rs`, change `use crate::credential::Credential;` to
+`use crate::credential::{Credential, FreshCredential};`. (`Duration` is already imported by
+Task 5's `use std::time::{Duration, Instant};`; do not add it again.) Then add the types, before
 `pub trait Provider`:
 
 ```rust
@@ -8102,8 +8163,8 @@ fn fake_agent_verdicts() {
 Run: `cargo test -p tagteam-fake --test network`
 Expected: FAIL to compile (`refresh` is not implemented for `FakeAgent`).
 
-In `crates/tagteam-fake/src/provider.rs`, add to the imports
-`use serde_json::json;`,
+In `crates/tagteam-fake/src/provider.rs`, add only these imports (`json`, `Value`, `Duration` and
+`HttpRequest` are already imported by Tasks 6 and 7, and importing them again is a compile error):
 `use tagteam_provider::http::HttpError;`,
 `use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind};` and
 `use tagteam_provider::FreshCredential;`. Then add to `impl Provider for FakeAgent`:
@@ -8280,7 +8341,7 @@ These are `pub(crate)`, so they are tested inside the crate, over a small in-cra
   - `Engine::quarantine(&self, row: &AccountRow, reason: QuarantineReason, fp: &str) -> Result<(), EngineError>`
     and `Engine::unquarantine(&self, row: &AccountRow) -> Result<bool, EngineError>`, both
     `pub(crate)`.
-  - `pub(crate) struct RescueEntry { path, account_id, login_epoch, predecessor_fp, credential }`
+  - `pub(crate) struct RescueEntry { path, predecessor_fp, credential }`
     and `pub(crate) enum RescueFile { Entry(RescueEntry), Unreadable { path, detail } }`.
   - Rescue methods, all `pub(crate)`:
     - `Engine::write_rescue(&self, id: &AccountId, login_epoch: i64, predecessor_fp: &str, successor: &[u8], successor_fp: &Fingerprint) -> Result<PathBuf, EngineError>`
@@ -8961,15 +9022,10 @@ mod tests {
         );
         let got = entries(&t, &id);
         assert_eq!(got.len(), 1);
+        // The envelope's accountId and loginEpoch (asserted above) are validated on read, not kept.
         assert_eq!(
-            (
-                &got[0].path,
-                &got[0].account_id,
-                got[0].login_epoch,
-                got[0].predecessor_fp.as_str(),
-                &got[0].credential
-            ),
-            (&path, &id, 3, pred.as_str(), &succ)
+            (&got[0].path, got[0].predecessor_fp.as_str(), &got[0].credential),
+            (&path, pred.as_str(), &succ)
         );
         t.engine.delete_rescue(&path).unwrap();
         assert!(entries(&t, &id).is_empty());
@@ -9156,8 +9212,6 @@ const VERSION: i64 = 1;
 /// One readable rescue envelope (§6.3). It holds a secret, so it has no `Debug`.
 pub(crate) struct RescueEntry {
     pub path: PathBuf,
-    pub account_id: AccountId,
-    pub login_epoch: i64,
     /// The generation that was sent: this rescue succeeds it.
     pub predecessor_fp: String,
     pub credential: Vec<u8>,
@@ -9178,9 +9232,9 @@ fn parse(path: &Path, bytes: &[u8], id: &AccountId) -> Result<RescueEntry, Strin
     if v["accountId"].as_str() != Some(id.as_str()) {
         return Err("it names a different account".into());
     }
-    let login_epoch = v["loginEpoch"]
-        .as_i64()
-        .ok_or_else(|| "it has no loginEpoch".to_owned())?;
+    if v["loginEpoch"].as_i64().is_none() {
+        return Err("it has no loginEpoch".into());
+    }
     let predecessor_fp = v["predecessorFp"]
         .as_str()
         .filter(|s| Fingerprint::parse(s).is_some())
@@ -9194,8 +9248,6 @@ fn parse(path: &Path, bytes: &[u8], id: &AccountId) -> Result<RescueEntry, Strin
         .to_vec();
     Ok(RescueEntry {
         path: path.to_path_buf(),
-        account_id: id.clone(),
-        login_epoch,
         predecessor_fp,
         credential,
     })
@@ -9354,11 +9406,14 @@ cargo test -p tagteam-engine --lib
 cargo test -p tagteam-engine --test store --test engine_basics --test add
 cargo clippy -p tagteam-engine --all-targets -- -D warnings
 ```
-Expected: PASS, no warnings. `write_rescue` has no production caller until Task 11, and
-neither do `rescues_for`, `settle_rescues` or `quarantine`. If rustc or clippy reports `dead_code`
-for them, or for `RescueEntry`'s fields, put `#[cfg_attr(not(test), allow(dead_code))]` on each
-item that has no caller yet, and remove those attributes in the task that first calls it (Task 10 for `settle_rescues` and
-`quarantine`, Task 11 for `write_rescue`).
+Expected: PASS, no warnings. Nothing outside the tests calls these until Task 10 (or Task 11 for
+`write_rescue`): `persist_generation`, `quarantine`, `unquarantine`, `quarantine_event`,
+`rescues_for`, `delete_rescue`, `settle_rescues` and `write_rescue`. If rustc or clippy reports
+`dead_code` for them, put `#[cfg_attr(not(test), allow(dead_code))]` on each of those items (an
+allowed item counts as used, so what it calls is live too, `RescueEntry`'s fields included), and
+remove the attributes in the task that first calls each: Task 10 for all of them but
+`write_rescue`, Task 11 for `write_rescue`. `RescueEntry` deliberately keeps no `account_id` or
+`login_epoch` field: the parser validates both, and nothing would read them.
 
 - [ ] **Step 10: Commit**
 
@@ -9378,7 +9433,8 @@ git commit -m "Add quarantine, rescue files and the single writer of a new gener
 - Modify: `crates/tagteam-engine/src/lib.rs` (confirm `pub mod refresh;`, `pub mod quarantine;`)
 - Modify: `crates/tagteam-engine/src/rescue.rs`, `crates/tagteam-engine/src/quarantine.rs` (drop
   Task 9's `dead_code` allowances on what the gate now calls)
-- Modify: `crates/tagteam-engine/tests/common/mod.rs` (`Fx::put_vault`, `Fx::expire_access`)
+- Modify: `crates/tagteam-engine/tests/common/mod.rs` (`Fx::put_vault`, `Fx::expire_access`, and
+  the shared free helpers `token_requests`, `due`, `quarantine_of`)
 - Test: `crates/tagteam-engine/tests/gate.rs`
 
 **Interfaces:**
@@ -9399,6 +9455,9 @@ git commit -m "Add quarantine, rescue files and the single writer of a new gener
     - `pub enum GateOutcome` and `pub enum OwnedBy`, exactly as the Interface Contract lists
       them
     - `pub const GATE_TIMEOUT: Duration` (10 s)
+    - `pub(crate) const EXPIRY_BUFFER_MS: i64` and
+      `pub(crate) fn expired(p: &dyn Provider, bytes: &[u8], now_ms: i64) -> bool` (§7.2's
+      test; Task 16 reuses them)
     - `pub fn Engine::refresh_stored(&self, p: &dyn Provider, id: &AccountId, snapshot: &[u8])
       -> Result<GateOutcome, EngineError>`
   - `refresh_stored` is `pub`, not `pub(crate)`. The integration tests in `tests/` call it; the
@@ -9409,6 +9468,10 @@ git commit -m "Add quarantine, rescue files and the single writer of a new gener
     belongs to another account, to `displaced/`. Task 11's `Received::keep` calls it; Task 11
     replaces this task's `displace_foreign` with its own foreign path.
   - `Fx::put_vault(&self, id, bytes)` and `Fx::expire_access(&self, id)`
+  - Shared test helpers in `tests/common/mod.rs` (free `pub fn`s, reused by Tasks 11, 14 and 16):
+    `token_requests(&Fx) -> usize`, `due(&Fx) -> AccountId` (`a` stored and inactive with a due
+    access token, `b` live), `quarantine_of(&Fx, &AccountId) -> (Option<String>, Option<String>)`
+    (reason, bound fingerprint)
   - Transient kinds this task produces: `vault-absent`, `vault-unreadable`,
     `rescue-unreadable`, `refresh-failed`, `not-refreshable`, plus `TransientKind::token()`'s
     `pre-send` / `ambiguous` / `http-<code>` / `bad-response`
@@ -9461,6 +9524,30 @@ In `crates/tagteam-engine/tests/common/mod.rs`, add to `impl Fx`, after `vault_r
 `FakeClock` needs `use tagteam_provider::Clock;` in scope for `now_ms()`; add `Clock` to the
 existing `use tagteam_provider::{…}` line of `tests/common/mod.rs` if it is not there yet.
 
+Then add these free functions at the end of `tests/common/mod.rs`. Several test files use them
+(this task's `gate.rs`, and Tasks 11, 14 and 16), so they live here, not in each file:
+
+```rust
+/// How many token-endpoint requests the fixture's scripted port has seen.
+pub fn token_requests(fx: &Fx) -> usize {
+    fx.http.count(Method::Post, &Fx::endpoints().token)
+}
+
+/// `a` stored and inactive, with an access token that is due; `b` is the live login.
+pub fn due(fx: &Fx) -> AccountId {
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.expire_access(&a);
+    a
+}
+
+/// `id`'s quarantine reason and the fingerprint it is bound to.
+pub fn quarantine_of(fx: &Fx, id: &AccountId) -> (Option<String>, Option<String>) {
+    let row = fx.engine.store().unwrap().account(id).unwrap().unwrap();
+    (row.quarantine_reason, row.quarantine_fp)
+}
+```
+
 - [ ] **Step 2: Write the failing tests**
 
 `crates/tagteam-engine/tests/gate.rs`:
@@ -9471,7 +9558,7 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use common::{Fx, crashed_switch, vault_fp};
+use common::{Fx, crashed_switch, due, quarantine_of, token_requests, vault_fp};
 use serde_json::{Value, json};
 use tagteam_core::AccountId;
 use tagteam_engine::account_lock::AccountLock;
@@ -9487,23 +9574,6 @@ fn gate(fx: &Fx, id: &AccountId) -> GateOutcome {
     fx.engine
         .refresh_stored(fx.cc.as_ref(), id, &snapshot)
         .unwrap()
-}
-
-fn token_requests(fx: &Fx) -> usize {
-    fx.http.count(Method::Post, &Fx::endpoints().token)
-}
-
-/// `a` stored and inactive, with an access token that is due; `b` is the live login.
-fn due(fx: &Fx) -> AccountId {
-    let a = fx.add("a@x.co", "rt-a");
-    fx.add("b@x.co", "rt-b");
-    fx.expire_access(&a);
-    a
-}
-
-fn quarantine_of(fx: &Fx, id: &AccountId) -> (Option<String>, Option<String>) {
-    let row = fx.engine.store().unwrap().account(id).unwrap().unwrap();
-    (row.quarantine_reason, row.quarantine_fp)
 }
 
 #[test]
@@ -9912,8 +9982,8 @@ mod hooked {
 - [ ] **Step 3: Run the tests to verify they fail**
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test gate`
-Expected: FAIL to compile: `could not find refresh in tagteam_engine` or `no method named
-refresh_stored`.
+Expected: FAIL to compile: no `GateOutcome` in `tagteam_engine::refresh` and no method named
+`refresh_stored`.
 
 - [ ] **Step 4: Make the module public**
 
@@ -9923,8 +9993,9 @@ Task 9 already declared both modules public in `crates/tagteam-engine/src/lib.rs
 Confirm both lines read exactly that; `rescue` stays private (`mod rescue;`).
 
 Then remove each `#[cfg_attr(not(test), allow(dead_code))]` that Task 9 (Step 9) put, if any,
-on an item this task now calls: `settle_rescues`, `rescues_for`, `delete_rescue`, `RescueEntry`'s
-fields, `quarantine` and `unquarantine`. `write_rescue` keeps its attribute until Task 11.
+on an item this task now calls: `settle_rescues`, `rescues_for`, `delete_rescue`,
+`persist_generation`, `quarantine`, `unquarantine` and `quarantine_event`. `write_rescue` keeps its
+attribute until Task 11.
 
 - [ ] **Step 5: Implement the gate**
 
@@ -9954,8 +10025,9 @@ Then add, below Task 9's `persist_generation`:
 /// every other vault writer waits up to 15 s (§6.2).
 pub const GATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// §7.2: an access token counts as expired this long before its `expiresAt`.
-const EXPIRY_BUFFER_MS: i64 = 5 * 60 * 1000;
+/// §7.2: an access token counts as expired this long before its `expiresAt`. Shared with
+/// active-token refresh (Task 16).
+pub(crate) const EXPIRY_BUFFER_MS: i64 = 5 * 60 * 1000;
 
 /// Who the gate left an account's token to (§7.3 step 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10016,7 +10088,8 @@ fn transient(kind: &str) -> GateOutcome {
 }
 
 /// §7.2's test for an access token, with a non-numeric `expiresAt` counting as not expired.
-fn expired(p: &dyn Provider, bytes: &[u8], now_ms: i64) -> bool {
+/// Shared with active-token refresh (Task 16).
+pub(crate) fn expired(p: &dyn Provider, bytes: &[u8], now_ms: i64) -> bool {
     p.access_expires_at(bytes)
         .is_some_and(|at| now_ms + EXPIRY_BUFFER_MS >= at)
 }
@@ -10293,7 +10366,8 @@ git commit -m "Add the refresh gate's lock, ownership, adoption and verdict"
   leftover `dead_code` allowance)
 - Modify: `crates/tagteam-engine/src/engine.rs` (the store slot's lock tolerates poisoning, so
   `Received::drop` can record a loss while unwinding)
-- Modify: `crates/tagteam-engine/tests/common/mod.rs` (`Fx::engine_with_vault`)
+- Modify: `crates/tagteam-engine/tests/common/mod.rs` (`Fx::engine_with_vault`, and the shared
+  free helpers `block_rescue`, `unblock_rescue`)
 - Test: `crates/tagteam-engine/tests/gate_persist.rs`
 
 **Interfaces:**
@@ -10326,10 +10400,17 @@ git commit -m "Add the refresh gate's lock, ownership, adoption and verdict"
     - `pub(crate) fn Engine::record_loss(&self, row: &AccountRow, sent_fp: &str, cause: &dyn std::fmt::Display)`
       (§7.4 `successor_lost`: logs at ERROR and quarantines, best effort, never panics) and
       `pub(crate) fn Engine::quarantine_best_effort(&self, row: &AccountRow, reason: QuarantineReason, fp: &str)`;
-    - `pub(crate) fn log_lost(row: &AccountRow, cause: &dyn std::fmt::Display)`.
+    - `pub(crate) fn log_lost(row: &AccountRow, cause: &dyn std::fmt::Display)`;
+    - `pub(crate) enum Displacement { Kept, Lost }` and
+      `pub(crate) fn Engine::displace_received(&self, row: &AccountRow, sent_fp: &str, received: &mut Received<'_>) -> Result<Displacement, EngineError>`:
+      the foreign-successor path (`keep`, then the `identity_conflict` quarantine), so the gate
+      and Task 16 do not each carry a copy.
   - The hook point `gate-before-vault-write`.
   - The Transient kinds `vault-write` and `vault-unreadable` with `rescued: true`.
   - `Fx::engine_with_vault(&self, vault: Vault) -> Engine`.
+  - Shared test helpers in `tests/common/mod.rs` (free `pub fn`s, reused by Task 16):
+    `block_rescue(&Fx)` and `unblock_rescue(&Fx)`.
+- Consumes, from Task 10's `tests/common/mod.rs`: `due`, `quarantine_of`, `token_requests`.
 - Decisions this task fixes:
   - **The vault moved between steps 3 and 6** (only a defence: every writer holds the account
     lock). The successor is written to `rescue/` and logged at ERROR, and the gate returns
@@ -10364,7 +10445,7 @@ git commit -m "Add the refresh gate's lock, ownership, adoption and verdict"
     moved to a newer generation during the request: that generation was not consumed, so a loss
     there quarantines nothing.
 
-- [ ] **Step 1: Add the fixture helper**
+- [ ] **Step 1: Add the fixture helpers**
 
 In `crates/tagteam-engine/tests/common/mod.rs`, add to `impl Fx`, after
 `engine_with_vault_probe`:
@@ -10377,6 +10458,27 @@ In `crates/tagteam-engine/tests/common/mod.rs`, add to `impl Fx`, after
     }
 ```
 
+and add these free functions at the end of the module (Task 16's tests reuse them):
+
+```rust
+/// A `rescue/` that lists fine but cannot be written to (0500). The gate's step 3 still finds
+/// no rescue, so the request is sent; only the write after the response fails. (A plain file
+/// in its place would make step 3 report `rescue-unreadable` before any request.)
+pub fn block_rescue(fx: &Fx) {
+    let dir = fx.env.data_dir().join("rescue");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+}
+
+/// Undoes `block_rescue`, so the temporary directory can be cleaned up.
+pub fn unblock_rescue(fx: &Fx) {
+    let dir = fx.env.data_dir().join("rescue");
+    if dir.is_dir() {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+```
+
 - [ ] **Step 2: Write the failing tests**
 
 `crates/tagteam-engine/tests/gate_persist.rs`:
@@ -10385,23 +10487,14 @@ In `crates/tagteam-engine/tests/common/mod.rs`, add to `impl Fx`, after
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 
-use common::{Fx, vault_fp};
+use common::{Fx, block_rescue, due, quarantine_of, unblock_rescue, vault_fp};
 use serde_json::{Value, json};
 use tagteam_core::AccountId;
 use tagteam_engine::refresh::GateOutcome;
 use tagteam_engine::vault::{KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
 use tagteam_provider::Read;
 use tagteam_provider::http::Method;
-
-/// `a` stored and inactive, with an access token that is due; `b` is the live login.
-fn due(fx: &Fx) -> AccountId {
-    let a = fx.add("a@x.co", "rt-a");
-    fx.add("b@x.co", "rt-b");
-    fx.expire_access(&a);
-    a
-}
 
 fn refresh(fx: &Fx, id: &AccountId, snapshot: &[u8]) -> GateOutcome {
     fx.engine
@@ -10432,28 +10525,6 @@ fn rescued_refresh_tokens(fx: &Fx) -> Vec<String> {
                 .to_owned()
         })
         .collect()
-}
-
-/// A `rescue/` that lists fine but cannot be written to (0500). The gate's step 3 still finds
-/// no rescue, so the request is sent; only the write after the response fails. (A plain file
-/// in its place would make step 3 report `rescue-unreadable` before any request.)
-fn block_rescue(fx: &Fx) {
-    let dir = fx.env.data_dir().join("rescue");
-    fs::create_dir_all(&dir).unwrap();
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
-}
-
-/// Undoes `block_rescue`, so the temporary directory can be cleaned up.
-fn unblock_rescue(fx: &Fx) {
-    let dir = fx.env.data_dir().join("rescue");
-    if dir.is_dir() {
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-}
-
-fn quarantine_of(fx: &Fx, id: &AccountId) -> (Option<String>, Option<String>) {
-    let row = fx.engine.store().unwrap().account(id).unwrap().unwrap();
-    (row.quarantine_reason, row.quarantine_fp)
 }
 
 /// A vault that stores `{}` whenever `target`'s current generation is written, as a Keychain
@@ -10907,6 +10978,14 @@ pub(crate) enum Abandoned {
     Lost,
 }
 
+/// What became of a successor that belongs to another account (§7.4).
+pub(crate) enum Displacement {
+    /// In `displaced/`, and the account quarantined `identity_conflict`.
+    Kept,
+    /// Kept nowhere: the caller reports `Unpersisted`.
+    Lost,
+}
+
 /// A successor is lost (§7.3 step 6). Logged at ERROR, naming the account by position and ID
 /// only (§4.4); the caller's refusal or notice carries it to the user.
 pub(crate) fn log_lost(row: &AccountRow, cause: &dyn std::fmt::Display) {
@@ -11019,17 +11098,10 @@ refresh paths share `persist_received`, `abandon`, `record_loss` and `quarantine
         received: &mut Received<'_>,
     ) -> Result<GateOutcome, EngineError> {
         if received.is_foreign() {
-            let kept = received.keep();
-            let quarantined = self.quarantine(row, QuarantineReason::IdentityConflict, sent_fp);
-            return match (kept, quarantined) {
-                // A lost successor is reported first (§7.3 step 6).
-                (Err(e), _) => {
-                    log_lost(row, &e);
-                    Ok(GateOutcome::Unpersisted)
-                }
-                (Ok(()), Err(e)) => Err(e),
-                (Ok(()), Ok(())) => Ok(GateOutcome::Dead(QuarantineReason::IdentityConflict)),
-            };
+            return Ok(match self.displace_received(row, sent_fp, received)? {
+                Displacement::Kept => GateOutcome::Dead(QuarantineReason::IdentityConflict),
+                Displacement::Lost => GateOutcome::Unpersisted,
+            });
         }
         // Every vault writer holds the account lock, so this comparison cannot fail; it stays
         // as a defence.
@@ -11072,6 +11144,29 @@ refresh paths share `persist_received`, `abandon`, `record_loss` and `quarantine
                 self.lose(row, sent_fp, &"neither the vault nor rescue/ could store it")
             }
         })
+    }
+
+    /// §7.3 step 6 and §7.4 for a successor that belongs to another account: it is displaced,
+    /// never stored, and the account is quarantined `identity_conflict`, bound to `sent_fp`.
+    /// A successor that could not even be displaced is reported first (`Lost`); the account is
+    /// then still quarantined, so the loss is only logged. Shared by the gate and active-token
+    /// refresh (Task 16).
+    pub(crate) fn displace_received(
+        &self,
+        row: &AccountRow,
+        sent_fp: &str,
+        received: &mut Received<'_>,
+    ) -> Result<Displacement, EngineError> {
+        let kept = received.keep();
+        let quarantined = self.quarantine(row, QuarantineReason::IdentityConflict, sent_fp);
+        match (kept, quarantined) {
+            (Err(e), _) => {
+                log_lost(row, &e);
+                Ok(Displacement::Lost)
+            }
+            (Ok(()), Err(e)) => Err(e),
+            (Ok(()), Ok(())) => Ok(Displacement::Kept),
+        }
     }
 
     /// Quarantines `row`, best effort: a failure is logged (position and ID only), never
@@ -11302,7 +11397,10 @@ git commit -m "Persist a refreshed token by compare-and-swap, rescuing it on any
     the store: enabled, unquarantined, with an `identity_json` object. The live account counts
     if it qualifies, as it did in M1. Fewer than two gives `only-one-account`.
   - **A walk that finds no credential** gives `only-one-account` with a managed live anchor,
-    and `no-valid-target` without one (M1's reason for that case).
+    and `no-valid-target` without one (M1's reason for that case). This is the spec's §9.3 as
+    clarified in `ac25b2d` (the fresh-machine case of §9.2 takes precedence when there is no
+    live login to anchor on); M1's `a_fresh_machine_activates_the_first_switchable_account`
+    pins it, and no code here changes for it.
   - **`ReadError` gains an empty `std::error::Error` impl.** `thiserror` treats a field named
     `source` as the error's source, which requires one. It is additive and harmless.
 
@@ -11793,7 +11891,8 @@ the target and before the journal row is written.
 
 **Files:**
 - Modify: `crates/tagteam-engine/src/switch.rs` (`transact`)
-- Modify: `crates/tagteam-engine/tests/common/mod.rs` (`Fx::plant_rescue`)
+- Modify: `crates/tagteam-engine/tests/common/mod.rs` (`Fx::plant_rescue`, and the shared free
+  helpers `credential`, `two_accounts`)
 - Create: `crates/tagteam-engine/tests/rescue_switch.rs`
 
 **Interfaces:**
@@ -11805,8 +11904,12 @@ the target and before the journal row is written.
   - `switch` never activates a target while a rescue for it is pending.
   - `Fx::plant_rescue(&self, id: &AccountId, predecessor_fp: &str, successor: &[u8]) -> PathBuf`
     (test fixture; Task 14 uses it too).
+  - Shared free helpers in `tests/common/mod.rs` (Task 14 reuses them):
+    `credential(email, rt) -> Vec<u8>` (`Fx::credential_json` as bytes) and
+    `two_accounts(&Fx) -> AccountId` (`a` at position 1 with `rt-a`, `b` at position 2 and live
+    with `rt-b`).
 
-- [ ] **Step 1: Add the fixture helper**
+- [ ] **Step 1: Add the fixture helpers**
 
 In `crates/tagteam-engine/tests/common/mod.rs`, add inside the first `impl Fx` block, after
 `vault_refresh_token`:
@@ -11845,6 +11948,22 @@ In `crates/tagteam-engine/tests/common/mod.rs`, add inside the first `impl Fx` b
 
 (`fs`, `PathBuf`, `PermissionsExt` and `json!` are already imported at the top of the module.)
 
+and add these free functions at the end of the module (Task 14's tests use them too):
+
+```rust
+/// `Fx::credential_json` as the bytes a vault stores.
+pub fn credential(email: &str, rt: &str) -> Vec<u8> {
+    Fx::credential_json(email, rt).to_string().into_bytes()
+}
+
+/// `a` at position 1 (`rt-a`), `b` at position 2 and live (`rt-b`).
+pub fn two_accounts(fx: &Fx) -> AccountId {
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    a
+}
+```
+
 - [ ] **Step 2: Write the failing tests**
 
 `crates/tagteam-engine/tests/rescue_switch.rs`:
@@ -11858,22 +11977,10 @@ use std::fs;
 use std::thread;
 use std::time::Duration;
 
-use common::{Fx, journal, vault_fp};
-use tagteam_core::AccountId;
+use common::{Fx, credential, journal, two_accounts, vault_fp};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::Provider;
-
-fn credential(email: &str, rt: &str) -> Vec<u8> {
-    Fx::credential_json(email, rt).to_string().into_bytes()
-}
-
-/// `a` at position 1 (`rt-a`), `b` at position 2 and live (`rt-b`).
-fn two_accounts(fx: &Fx) -> AccountId {
-    let a = fx.add("a@x.co", "rt-a");
-    fx.add("b@x.co", "rt-b");
-    a
-}
 
 #[test]
 fn a_rescued_successor_is_adopted_and_is_what_claude_code_receives() {
@@ -12094,6 +12201,7 @@ spent.
 - Modify: `crates/tagteam-engine/src/switch.rs` (`Plan.warnings`, `freshen_plan`, `freshen`,
   `switch`, `rederive`, `Locked.warnings`, `transact`)
 - Modify: `crates/tagteam-engine/src/error.rs` (`EngineError::NeedsRelogin` and its kind)
+- Modify: `crates/tagteam-engine/tests/common/mod.rs` (the shared free helper `rescue_files`)
 - Create: `crates/tagteam-engine/tests/freshen.rs`
 
 **Interfaces:**
@@ -12105,12 +12213,17 @@ spent.
   - The Task 12 rotation walk, which skips quarantined accounts
   - `AccountRow::quarantine_reason`
   - Fixture: `Fx::expire_access`, `Fx::script_refresh`, `Fx::script_token_error`, `Fx::endpoints()`, `Fx::quarantine`, `Fx.http: Arc<ScriptedHttp>` (Tasks 3, 7–10), `Fx::plant_rescue` (Task 13)
+  - Shared free helpers in `tests/common/mod.rs`: `token_requests`, `quarantine_of` (Task 10),
+    `block_rescue`, `unblock_rescue` (Task 11), `credential`, `two_accounts` (Task 13)
 - Produces:
+  - `rescue_files(&Fx) -> usize` in `tests/common/mod.rs` (a free `pub fn`, the number of files
+    in `rescue/`; Task 16 reuses it)
   - `EngineError::NeedsRelogin { position: u32, label: String }`, kind `"relogin-required"`
   - `SwitchOutcome.warnings` carries freshen warnings, each worded exactly:
     - `could not refresh <label> first (<kind or detail>); Claude Code will refresh it when it is online`
     - `<label> (position <N>) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires`
-  - `const FRESHEN_WINDOW_MS: i64 = 600_000` (private to `switch.rs`)
+  - `const FRESHEN_WINDOW_MS: i64 = 600_000` and `fn due(&self, p, vault: &[u8]) -> bool`
+    (both private to `switch.rs`; `freshen` and `rederive` share `due`)
 
 - [ ] **Step 1: Pin the new error kind (failing)**
 
@@ -12129,6 +12242,16 @@ after the `IdentityConflict` entry:
 
 - [ ] **Step 2: Write the failing behaviour tests**
 
+First add this free function at the end of `crates/tagteam-engine/tests/common/mod.rs` (Task 16's
+tests use it too):
+
+```rust
+/// How many files `rescue/` holds; 0 when it does not exist.
+pub fn rescue_files(fx: &Fx) -> usize {
+    fs::read_dir(fx.env.data_dir().join("rescue")).map_or(0, |d| d.count())
+}
+```
+
 `crates/tagteam-engine/tests/freshen.rs`:
 ```rust
 //! §7.2 freshen before activation, through a manual `switch`: every row of the manual-switch
@@ -12137,48 +12260,20 @@ after the `IdentityConflict` entry:
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::thread;
 use std::time::Duration;
 
-use common::{API_KEY, Fx, journal, vault_fp};
+use common::{
+    API_KEY, Fx, block_rescue, credential, journal, quarantine_of, rescue_files, token_requests,
+    two_accounts, unblock_rescue, vault_fp,
+};
 use serde_json::json;
-use tagteam_core::AccountId;
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::http::{HttpError, Method};
 
-fn token_requests(fx: &Fx) -> usize {
-    fx.http.count(Method::Post, &Fx::endpoints().token)
-}
-
-fn quarantine_of(fx: &Fx, id: &AccountId) -> Option<String> {
-    fx.engine
-        .store()
-        .unwrap()
-        .account(id)
-        .unwrap()
-        .unwrap()
-        .quarantine_reason
-}
-
-fn credential(email: &str, rt: &str) -> Vec<u8> {
-    Fx::credential_json(email, rt).to_string().into_bytes()
-}
-
 fn cannot_refresh(why: &str) -> String {
     format!("could not refresh a@x.co first ({why}); Claude Code will refresh it when it is online")
-}
-
-/// `a` at position 1 (`rt-a`), `b` at position 2 and live (`rt-b`).
-fn two_accounts(fx: &Fx) -> AccountId {
-    let a = fx.add("a@x.co", "rt-a");
-    fx.add("b@x.co", "rt-b");
-    a
-}
-
-fn rescue_files(fx: &Fx) -> usize {
-    fs::read_dir(fx.env.data_dir().join("rescue")).map_or(0, |d| d.count())
 }
 
 #[test]
@@ -12221,7 +12316,7 @@ fn a_dead_direct_target_is_quarantined_and_refused() {
         err.to_string(),
         "a@x.co (position 1) needs a new login: its stored refresh token can no longer be used; log in with `claude`, then run `tagteam add`"
     );
-    assert_eq!(quarantine_of(&fx, &a).as_deref(), Some("invalid_grant"));
+    assert_eq!(quarantine_of(&fx, &a).0.as_deref(), Some("invalid_grant"));
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"), "nothing activated");
     assert!(journal(&fx).is_none());
     assert!(fx.displaced().is_empty());
@@ -12238,7 +12333,7 @@ fn a_rotation_whose_pick_turns_out_dead_moves_on_to_the_next_account() {
     let out = fx.engine.switch(fx.rotation_request(false)).unwrap();
     assert_eq!(out.to.as_ref().map(|r| &r.id), Some(&b));
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
-    assert_eq!(quarantine_of(&fx, &a).as_deref(), Some("invalid_grant"));
+    assert_eq!(quarantine_of(&fx, &a).0.as_deref(), Some("invalid_grant"));
     assert_eq!(token_requests(&fx), 1, "b was not in the window");
 }
 
@@ -12329,7 +12424,7 @@ fn offline_the_switch_proceeds_with_the_vault_generation_and_a_warning() {
         assert_eq!(token_requests(&fx), 1, "{kind}");
         assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"), "{kind}");
         assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"), "{kind}");
-        assert_eq!(quarantine_of(&fx, &a), None, "{kind}");
+        assert_eq!(quarantine_of(&fx, &a).0, None, "{kind}");
         assert_eq!(rescue_files(&fx), 0, "no successor was received: {kind}");
     }
 }
@@ -12344,7 +12439,7 @@ fn a_systemic_refusal_is_never_a_strike_and_the_switch_proceeds() {
     assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
     assert!(out.warnings[0].starts_with("could not refresh a@x.co first ("));
     assert!(out.warnings[0].ends_with("); Claude Code will refresh it when it is online"));
-    assert_eq!(quarantine_of(&fx, &a), None);
+    assert_eq!(quarantine_of(&fx, &a).0, None);
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
 }
 
@@ -12376,19 +12471,16 @@ fn an_unpersisted_successor_refuses_the_switch_and_asks_for_a_new_login() {
     fx.script_refresh(Some("rt-a-2"));
     fx.kc.set_fail_write(SERVICE, true);
     // `rescue/` lists fine but cannot be written to (0500), so the gate still sends the
-    // request, then has nowhere to keep the successor. (A plain file in its place would stop
-    // the gate at step 3, before any request.)
-    let dir = fx.env.data_dir().join("rescue");
-    fs::create_dir_all(&dir).unwrap();
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    // request, then has nowhere to keep the successor.
+    block_rescue(&fx);
     let err = fx.switch_to(&a, false).unwrap_err();
     fx.kc.set_fail_write(SERVICE, false);
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    unblock_rescue(&fx);
     assert_eq!(err.kind(), "relogin-required", "{err}");
     assert!(err.to_string().contains("can no longer be used"), "{err}");
     assert_eq!(token_requests(&fx), 1, "the request was sent");
     assert_eq!(
-        quarantine_of(&fx, &a).as_deref(),
+        quarantine_of(&fx, &a).0.as_deref(),
         Some("successor_lost"),
         "the spent generation is quarantined (§7.4)"
     );
@@ -12410,6 +12502,30 @@ fn an_unreadable_rescue_refuses_without_a_request_and_names_the_file() {
     );
     assert_eq!(token_requests(&fx), 0);
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+#[test]
+fn a_rescue_the_vault_cannot_adopt_refuses_with_a_detail_that_says_so() {
+    // The gate reports a failed adoption of a readable rescue as `rescue-unreadable` too
+    // (Task 10), but no file is unreadable, so the refusal must not name an empty list.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    fx.expire_access(&a);
+    fx.plant_rescue(&a, &vault_fp(&fx, &a), &credential("a@x.co", "rt-a-2"));
+    fx.kc.set_fail_write(SERVICE, true);
+    let err = fx.switch_to(&a, false).unwrap_err();
+    fx.kc.set_fail_write(SERVICE, false);
+    assert_eq!(err.kind(), "rescue-pending", "{err}");
+    let shown = err.to_string();
+    assert!(shown.contains("a pending rescue could not be adopted"), "{shown}");
+    assert!(shown.ends_with("retry once the vault can be written"), "{shown}");
+    assert!(!shown.contains(" cannot be read"), "{shown}");
+    assert_eq!(token_requests(&fx), 0);
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    // Once the vault can be written, the next switch adopts the rescue and activates it.
+    fx.switch_to(&a, false).unwrap();
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a-2"));
+    assert_eq!(token_requests(&fx), 0);
 }
 
 #[test]
@@ -12461,15 +12577,19 @@ Expected: FAIL. `error.rs` does not compile: `no variant named NeedsRelogin`. On
 variant exists, `freshen.rs` fails in:
 - `an_expiring_target_is_refreshed…` and `a_forced_switch_still_freshens…`:
   `left: 0, right: 1` token requests.
-- `a_dead_direct_target…`, `a_rescued_successor…`, `an_unpersisted…` and `an_unreadable…`:
-  `unwrap_err` on an `Ok`.
+- `a_dead_direct_target…`, `a_rescued_successor…` and `an_unpersisted…`: `unwrap_err` on an `Ok`.
 - `a_rotation_whose_pick_turns_out_dead…`: lands on a, not b.
 - `offline…` and `a_systemic…`: no warning.
 - `a_quarantined_target…`: no warning, and the second half succeeds.
+- `a_rescue_the_vault_cannot_adopt…`: the refusal's detail names the file and the failed
+  adoption, not the phrase "a pending rescue could not be adopted".
 
-`no_request_is_made_outside_the_window…` and `a_busy_gate…` pass already. They pin that the
-fix adds no request. `a_target_quarantined_while_the_switch_waits…` fails in both halves: the
-switch activates a without re-reading its quarantine.
+`no_request_is_made_outside_the_window…`, `a_busy_gate…` and
+`an_unreadable_rescue_refuses_without_a_request_and_names_the_file` pass already. The first two
+pin that the fix adds no request. The third passes because Task 13's pending-rescue settle
+already refuses with `rescue-pending`, names the file and sends nothing.
+`a_target_quarantined_while_the_switch_waits…` fails in both halves: the switch activates a
+without re-reading its quarantine.
 
 - [ ] **Step 4: Add `EngineError::NeedsRelogin`**
 
@@ -12607,6 +12727,13 @@ In `impl Engine`, add after `fn plan`:
         ))
     }
 
+    /// §7.2: whether `vault`'s access token expires within the freshen window. An unknown or
+    /// non-numeric expiry is never due.
+    fn due(&self, p: &dyn Provider, vault: &[u8]) -> bool {
+        p.access_expires_at(vault)
+            .is_some_and(|at| self.now_ms() + FRESHEN_WINDOW_MS >= at)
+    }
+
     /// One row of §7.2's manual-switch table, for the plan's target.
     fn freshen(
         &self,
@@ -12620,9 +12747,7 @@ In `impl Engine`, add after `fn plan`:
             return Ok(Freshened::Go(vec![]));
         }
         let vault = self.read_target(target)?;
-        let due = p
-            .access_expires_at(&vault)
-            .is_some_and(|at| self.now_ms() + FRESHEN_WINDOW_MS >= at);
+        let due = self.due(p, &vault);
         let rotation = matches!(req.target, SwitchTarget::Rotation);
         if target.quarantine_reason.is_some() {
             // Never refreshed (§7.4): usable only while its current access token lasts.
@@ -12655,6 +12780,9 @@ In `impl Engine`, add after `fn plan`:
                 ));
             }
             GateOutcome::Transient { kind, .. } if kind == "rescue-unreadable" => {
+                // The gate reports both an unreadable rescue file and a failed adoption of a
+                // readable one under this kind; only unreadable files can be named. The error's
+                // own text adds "retry once the vault can be written".
                 let damaged: Vec<String> = self
                     .rescues_for(&target.id)
                     .into_iter()
@@ -12663,7 +12791,12 @@ In `impl Engine`, add after `fn plan`:
                         RescueFile::Entry(_) => None,
                     })
                     .collect();
-                return Err(pending(format!("{} cannot be read", damaged.join(", "))));
+                let detail = if damaged.is_empty() {
+                    "a pending rescue could not be adopted".to_owned()
+                } else {
+                    format!("{} cannot be read", damaged.join(", "))
+                };
+                return Err(pending(detail));
             }
             // Nothing was spent, or what was spent is lost either way; once the account is
             // live, the gate leaves its refresh to CC (§7.3 step 2).
@@ -12681,7 +12814,9 @@ In `impl Engine`, add after `fn plan`:
             }
             // It became the live login meanwhile: `rederive` plans the self-switch again.
             GateOutcome::Owned(OwnedBy::Live) => Freshened::Go(vec![]),
-            // M4: profiles, and with them these refusals, do not exist before then.
+            // Unreachable before M4, which introduces sessions and provenance. M4 gives these
+            // two the spec's `session-owned` and `profile-conflict` kinds (§7.2's table); until
+            // then they refuse with `invalid-input`.
             GateOutcome::Owned(OwnedBy::Session) => {
                 return Err(EngineError::InvalidInput(format!(
                     "{label} is in use by a `tagteam run` session; exit it first"
@@ -12803,10 +12938,7 @@ insert:
                 return Ok(Rederived::Replan);
             }
             let vault = self.read_target(&target)?;
-            let due = p
-                .access_expires_at(&vault)
-                .is_some_and(|at| self.now_ms() + FRESHEN_WINDOW_MS >= at);
-            if due {
+            if self.due(p, &vault) {
                 return Err(needs_relogin(&target));
             }
             warnings.push(works_until_expiry(&target));
@@ -12845,7 +12977,7 @@ and the line Step 5 wrote, `let mut warnings = plan.warnings.clone();`, becomes:
 - [ ] **Step 9: Run the tests to verify they pass**
 
 Run: `cargo test -p tagteam-engine --lib error && cargo test -p tagteam-engine --test freshen`
-Expected: PASS (13 tests in `freshen.rs`).
+Expected: PASS (14 tests in `freshen.rs`).
 
 Run: `cargo test -p tagteam-engine`
 Expected: PASS. The other suites' accounts carry `expiresAt: 1_790_003_600_000`, an hour after
@@ -12858,7 +12990,7 @@ Expected: no warnings.
 
 ```bash
 git add crates/tagteam-engine/src/switch.rs crates/tagteam-engine/src/error.rs \
-  crates/tagteam-engine/tests/freshen.rs
+  crates/tagteam-engine/tests/common/mod.rs crates/tagteam-engine/tests/freshen.rs
 git commit -m "Refresh an expiring switch target through the gate before activating it"
 ```
 
@@ -12885,6 +13017,7 @@ no longer overwritten by the journaled copy.
   `finish_backward`, `surfaces_agree`, new `capture_rotated_outgoing`)
 - Modify: `crates/tagteam-engine/src/switch.rs` (`Held::contains`)
 - Modify: `crates/tagteam-engine/tests/recover.rs`
+- Modify: `crates/tagteam-engine/tests/common/mod.rs` (the shared free helper `prev_refresh_token`)
 
 **Interfaces:**
 - Consumes:
@@ -12894,24 +13027,32 @@ no longer overwritten by the journaled copy.
   - `Fx::script_profile`, `Fx::endpoints()`, `Fx.http` (Tasks 3, 7)
   - `core::decide_outgoing` and `OutgoingFacts` (M1)
 - Produces:
+  - `prev_refresh_token(&Fx, &AccountId) -> Option<String>` in `tests/common/mod.rs` (a free
+    `pub fn`; Task 16 reuses it)
   - `Held::contains(&self, fp: &str) -> bool` (`pub(crate)`, `switch.rs`)
   - Forward recovery captures an attributed rotation of the outgoing account's token.
   - Backward recovery keeps a same-identity `oauthAccount`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `crates/tagteam-engine/tests/recover.rs`. Add `use std::sync::Arc;`,
-`use tagteam_engine::oracle::HttpOracle;`, `use tagteam_engine::vault::SERVICE;` and
-`use tagteam_provider::http::Method;` to its imports. `oracle_says`, `any_mutation` and
-`active` already exist in this file.
+First add this free function at the end of `crates/tagteam-engine/tests/common/mod.rs` (Task 16's
+tests use it too), and add `prev_refresh_token` to `recover.rs`'s `use common::{…}` list:
 
 ```rust
-/// Recovery as an account-changing command runs it: under a mutation guard that asks the
-/// oracle first (§7.6). `any_mutation` (a metadata command) never asks it.
-fn recover_asking_the_oracle(fx: &Fx) {
-    drop(fx.engine.mutation_guard().unwrap());
+/// The refresh token inside `id`'s `.prev` vault generation, if there is one.
+pub fn prev_refresh_token(fx: &Fx, id: &AccountId) -> Option<String> {
+    let v: Value = serde_json::from_slice(&fx.kc.get(SERVICE, &format!("{id}.prev"))?).ok()?;
+    v["claudeAiOauth"]["refreshToken"].as_str().map(str::to_owned)
 }
+```
 
+Append to `crates/tagteam-engine/tests/recover.rs`. Add `use std::sync::Arc;`,
+`use tagteam_engine::oracle::HttpOracle;` and `use tagteam_provider::http::Method;` to its
+imports. `oracle_says`, `any_mutation` and `active` already exist in this file. Task 7 made
+`any_mutation` take the mutation lock through `mutation_guard`, so it recovers as an
+account-changing command does: the oracle is asked first (§7.6).
+
+```rust
 /// OAuth `a` → API key `k`, killed after step 7 stored the key and before the credential entry
 /// was cleared; then CC rotated a's token. Returns `(a, k)`.
 fn crashed_cross_axis_switch_then_cc_rotated(fx: &Fx) -> (AccountId, AccountId) {
@@ -12923,11 +13064,6 @@ fn crashed_cross_axis_switch_then_cc_rotated(fx: &Fx) -> (AccountId, AccountId) 
     (a, k)
 }
 
-fn prev_refresh_token(fx: &Fx, id: &AccountId) -> Option<String> {
-    let v: Value = serde_json::from_slice(&fx.kc.get(SERVICE, &format!("{id}.prev"))?).ok()?;
-    v["claudeAiOauth"]["refreshToken"].as_str().map(str::to_owned)
-}
-
 #[test]
 fn forward_recovery_captures_a_rotated_outgoing_token_the_oracle_attributes() {
     // Ruling L476: the rotated generation is a's newest. Capturing it keeps a usable;
@@ -12935,7 +13071,7 @@ fn forward_recovery_captures_a_rotated_outgoing_token_the_oracle_attributes() {
     let fx = Fx::new();
     let (a, k) = crashed_cross_axis_switch_then_cc_rotated(&fx);
     oracle_says(&fx, "a@x.co");
-    recover_asking_the_oracle(&fx);
+    any_mutation(&fx, &a);
     assert_journal_cleared(&fx);
     assert_eq!(active(&fx), Some(k));
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-rotated-by-cc"));
@@ -12957,7 +13093,7 @@ fn a_captured_rotation_backfills_a_missing_account_uuid() {
         )
         .unwrap();
     oracle_says(&fx, "a@x.co");
-    recover_asking_the_oracle(&fx);
+    any_mutation(&fx, &a);
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-rotated-by-cc"));
     let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
     assert_eq!(row.account_uuid.as_deref(), Some("uuid-a@x.co"));
@@ -12973,7 +13109,7 @@ fn forward_recovery_without_an_attribution_displaces_the_rotated_token() {
         if let Some(email) = answer {
             oracle_says(&fx, email);
         }
-        recover_asking_the_oracle(&fx);
+        any_mutation(&fx, &a);
         assert_journal_cleared(&fx);
         assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"), "{answer:?}");
         let displaced = fx.displaced();
@@ -12999,7 +13135,7 @@ fn an_attributed_token_without_a_refresh_token_never_replaces_a_complete_vault()
     .into_bytes();
     fx.set_live_credential(&access_only);
     oracle_says(&fx, "a@x.co");
-    recover_asking_the_oracle(&fx);
+    any_mutation(&fx, &a);
     assert_journal_cleared(&fx);
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
     assert_eq!(fx.displaced(), [access_only]);
@@ -13332,7 +13468,9 @@ as it passed the raw comparison. The only behaviour that changes is the backward
 Run: `cargo test -p tagteam-engine --test recover`
 Expected: PASS, the new tests included.
 `a_cross_axis_switch_never_displaces_the_journaled_outgoing_generation` still displaces its
-rotated token: it recovers through `any_mutation`, a metadata command, which asks no oracle.
+rotated token, because the fixture's oracle (`FixedOracle`, which its test leaves answering
+`None`) attributes nothing. `any_mutation` does ask the oracle since Task 7; the offline path is
+pinned by `a_metadata_command_recovers_by_fingerprint_without_the_network`.
 
 Run: `cargo test -p tagteam-engine --features test-hooks`
 Expected: PASS.
@@ -13344,7 +13482,7 @@ Expected: no warnings.
 
 ```bash
 git add crates/tagteam-engine/src/recover.rs crates/tagteam-engine/src/switch.rs \
-  crates/tagteam-engine/tests/recover.rs
+  crates/tagteam-engine/tests/common/mod.rs crates/tagteam-engine/tests/recover.rs
 git commit -m "Capture an attributed rotation of the outgoing token during forward recovery"
 ```
 
@@ -13382,9 +13520,12 @@ the live credential belongs to someone else.
     `EngineError::RescuePending`.
   - Task 10: `crate::refresh::names_another_account(owner, row)`: the identity-conflict rule
     both refresh paths share (uuid compared only when both sides know one, org only when both
-    are non-empty; either alone is a conflict).
-  - Task 11: `crate::refresh::{Received, Persisted, Abandoned, log_lost}` (`Received::new(…,
-    foreign)`, `Received::is_foreign`, `Received::keep`) and
+    are non-empty; either alone is a conflict); `crate::refresh::expired(p, bytes, now_ms)`
+    (§7.2's test, which this task does not redefine).
+  - Task 11: `crate::refresh::{Received, Persisted, Abandoned, Displacement}` (`Received::new(…,
+    foreign)`, `Received::is_foreign`, `Received::keep`), `Engine::displace_received(row,
+    sent_fp, &mut Received) -> Result<Displacement, EngineError>` (the foreign-successor path)
+    and
     `Engine::persist_received(p, row, lock, &mut Received) -> Persisted`: the vault → `rescue/`
     → `Unpersisted` step both refresh paths share, with the guard that keeps a received
     successor on a panic, and displaces one that belongs to another account (§7.4). Also
@@ -13397,7 +13538,9 @@ the live credential belongs to someone else.
     `Engine::{save_unheld, hold_vault, read_live_identity, guard_or_refuse, lock_account}`,
     `oracle::verdict`.
   - Test fixture: `Fx.http`, `Fx::endpoints()` (Task 7); `Fx::script_refresh`,
-    `Fx::script_token_error` (Task 8).
+    `Fx::script_token_error` (Task 8); the shared free helpers in `tests/common/mod.rs`
+    `token_requests`, `quarantine_of` (Task 10), `block_rescue`, `unblock_rescue` (Task 11),
+    `rescue_files` (Task 14) and `prev_refresh_token` (Task 15).
 - Produces:
   - `tagteam_engine::active::{ActiveTrigger, ActiveOutcome, ACTIVE_REFRESH_TIMEOUT}`.
   - `Engine::refresh_active(&ProviderId, ActiveTrigger) -> Result<ActiveOutcome, EngineError>`.
@@ -13451,10 +13594,13 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use common::Fx;
+use common::{
+    Fx, block_rescue, prev_refresh_token, quarantine_of, rescue_files, token_requests,
+    unblock_rescue,
+};
 use serde_json::{Value, json};
 use tagteam_cc::ItemKind;
 use tagteam_core::AccountId;
@@ -13485,33 +13631,12 @@ fn expire_live(fx: &Fx) {
     fx.set_live_credential(&bytes(&v));
 }
 
-fn token_requests(fx: &Fx) -> usize {
-    fx.http.count(Method::Post, &Fx::endpoints().token)
-}
-
 fn fp(fx: &Fx, secret: &[u8]) -> String {
     fx.cc.fingerprint(secret).unwrap().as_str().to_owned()
 }
 
-fn prev_refresh_token(fx: &Fx, id: &AccountId) -> Option<String> {
-    let v: Value = serde_json::from_slice(&fx.kc.get(SERVICE, &format!("{id}.prev"))?).ok()?;
-    v["claudeAiOauth"]["refreshToken"]
-        .as_str()
-        .map(str::to_owned)
-}
-
-fn rescue_files(fx: &Fx) -> usize {
-    fs::read_dir(fx.env.data_dir().join("rescue")).map_or(0, |d| d.count())
-}
-
 fn quarantine_reason(fx: &Fx, id: &AccountId) -> Option<String> {
-    fx.engine
-        .store()
-        .unwrap()
-        .account(id)
-        .unwrap()
-        .unwrap()
-        .quarantine_reason
+    quarantine_of(fx, id).0
 }
 
 #[test]
@@ -13749,19 +13874,6 @@ fn a_failed_vault_write_rescues_the_successor_and_still_publishes_it() {
     assert_eq!(token_requests(&fx), 1);
 }
 
-/// A `rescue/` that can be listed but not written to: reconciliation still reads it, and no
-/// rescue file can be created in it. Returns it, for `unblock`.
-fn block_rescue(fx: &Fx) -> PathBuf {
-    let rescue = fx.env.data_dir().join("rescue");
-    fs::create_dir_all(&rescue).unwrap();
-    fs::set_permissions(&rescue, fs::Permissions::from_mode(0o500)).unwrap();
-    rescue
-}
-
-fn unblock(dir: &Path) {
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
-}
-
 #[test]
 fn when_both_writes_fail_but_the_live_store_takes_it_nothing_is_lost() {
     // §7.5 step 5: CC holds the successor, so it is not lost and nothing is quarantined; the
@@ -13771,10 +13883,10 @@ fn when_both_writes_fail_but_the_live_store_takes_it_nothing_is_lost() {
     expire_live(&fx);
     fx.script_refresh(Some("rt-a2"));
     fx.kc.set_fail_write(SERVICE, true);
-    let rescue = block_rescue(&fx);
+    block_rescue(&fx);
 
     let out = active(&fx, ActiveTrigger::Expired).unwrap();
-    unblock(&rescue);
+    unblock_rescue(&fx);
 
     assert_eq!(out, ActiveOutcome::PublishedOnly);
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
@@ -14077,11 +14189,11 @@ mod hooks {
         expire_live(&fx);
         fx.script_refresh(Some("rt-a2"));
         fx.kc.set_fail_write(SERVICE, true);
-        let rescue = block_rescue(&fx);
+        block_rescue(&fx);
         take_over_after_response(&fx);
 
         let out = active(&fx, ActiveTrigger::Expired).unwrap();
-        unblock(&rescue);
+        unblock_rescue(&fx);
 
         assert_eq!(out, ActiveOutcome::Unpersisted);
         let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
@@ -14101,14 +14213,14 @@ mod hooks {
         expire_live(&fx);
         fx.script_refresh(Some("rt-a2"));
         fx.kc.set_fail_write(SERVICE, true);
-        let rescue = block_rescue(&fx);
+        block_rescue(&fx);
         fx.engine.fail_at(Some("panic:active-before-publish"));
 
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             active(&fx, ActiveTrigger::Expired)
         }));
         fx.engine.fail_at(None);
-        unblock(&rescue);
+        unblock_rescue(&fx);
 
         assert!(unwound.is_err(), "the injected panic unwinds");
         let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
@@ -14179,8 +14291,8 @@ use std::time::Duration;
 
 use tagteam_core::{Fingerprint, OracleVerdict, ProviderId};
 use tagteam_provider::{
-    CredLocks, Credential, DeadReason, LiveChange, Provenance, Provider, ProviderError, Read,
-    RefreshResult, StoredLogin,
+    CredLocks, Credential, LiveChange, Provenance, Provider, ProviderError, Read, RefreshResult,
+    StoredLogin,
 };
 
 use crate::account_lock::AccountLock;
@@ -14189,7 +14301,7 @@ use crate::error::EngineError;
 use crate::hooks;
 use crate::oracle::verdict;
 use crate::quarantine::QuarantineReason;
-use crate::refresh::{Abandoned, Persisted, Received, log_lost, names_another_account};
+use crate::refresh::{Abandoned, Displacement, Persisted, Received, expired, names_another_account};
 use crate::rescue::{RescueEntry, RescueFile};
 use crate::store::AccountRow;
 use crate::switch::{Held, OracleHint, answer_for, refuse_unreadable};
@@ -14197,9 +14309,6 @@ use crate::switch::{Held, OracleHint, answer_for, refuse_unreadable};
 /// §7.5 step 5: how long the token request may take while CC's credential locks are held
 /// (§4.3's second bounded exception).
 pub const ACTIVE_REFRESH_TIMEOUT: Duration = Duration::from_secs(6);
-
-/// §7.2: expired means `now + 5 min ≥ expiresAt`.
-const EXPIRY_BUFFER_MS: i64 = 5 * 60 * 1000;
 
 /// Why the caller asks (§7.5): the only two reasons tagteam refreshes the live token.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14258,12 +14367,6 @@ struct Reconciled {
     publish: bool,
     changed: bool,
     retire: Vec<PathBuf>,
-}
-
-/// §7.2. An unknown or non-numeric expiry is never expired.
-fn expired(p: &dyn Provider, secret: &[u8], now_ms: i64) -> bool {
-    p.access_expires_at(secret)
-        .is_some_and(|at| now_ms + EXPIRY_BUFFER_MS >= at)
 }
 
 impl Engine {
@@ -14377,6 +14480,12 @@ impl Engine {
         hooks::point(self, "active-before-request")?;
         let sent = p.fingerprint(&rec.current);
         let sent_fp = sent.as_ref().map(Fingerprint::as_str).unwrap_or_default();
+        // The type cannot prove `rec.current` fresh here: it arrives as bytes through
+        // `Reconciled`, not as a `FreshCredential`. Freshness rests on the runtime check in
+        // `active_login`, which refuses a degraded or empty live read before anything is sent
+        // (§4.3); the other sources are vault reads, which are authoritative.
+        // `a_degraded_live_read_is_refused_before_any_request` pins that check, so a change to
+        // it that let a degraded token through would fail that test.
         let fresh = Credential::fresh(rec.current.clone())
             .into_fresh()
             .expect("a credential built fresh is fresh");
@@ -14397,21 +14506,14 @@ impl Engine {
                     };
                 }
                 if received.is_foreign() {
-                    let kept = received.keep();
-                    let quarantined =
-                        self.quarantine(row, QuarantineReason::IdentityConflict, sent_fp);
-                    return match (kept, quarantined) {
-                        // A lost successor is reported first (§7.3 step 6). The account is
-                        // quarantined `identity_conflict` already, so the loss is only logged.
-                        (Err(e), _) => {
-                            log_lost(row, &e);
-                            Ok(ActiveOutcome::Unpersisted)
+                    // Task 11's shared path: displaced and quarantined `identity_conflict`; a
+                    // successor that could not even be displaced is reported first (§7.3 step 6).
+                    return Ok(match self.displace_received(row, sent_fp, &mut received)? {
+                        Displacement::Kept => {
+                            ActiveOutcome::Dead(QuarantineReason::IdentityConflict)
                         }
-                        (Ok(()), Err(e)) => Err(e),
-                        (Ok(()), Ok(())) => {
-                            Ok(ActiveOutcome::Dead(QuarantineReason::IdentityConflict))
-                        }
-                    };
+                        Displacement::Lost => ActiveOutcome::Unpersisted,
+                    });
                 }
                 let owned = cred.check_owned().is_ok();
                 // Task 11's shared step: the vault, else `rescue/`, else reported as lost.
@@ -14470,10 +14572,7 @@ impl Engine {
                         kind: "refresh-failed".into(),
                     });
                 }
-                let reason = match reason {
-                    DeadReason::InvalidGrant => QuarantineReason::InvalidGrant,
-                    DeadReason::NoRefreshToken => QuarantineReason::NoRefreshToken,
-                };
+                let reason: QuarantineReason = reason.into();
                 self.quarantine(row, reason, sent_fp)?;
                 Ok(ActiveOutcome::Dead(reason))
             }
@@ -14947,7 +15046,7 @@ In `crates/tagteam-engine/src/recover.rs`, in Task 15's `capture_rotated_outgoin
 - [ ] **Step 10: Run the tests to verify they pass**
 
 Run: `cargo test -p tagteam-core && cargo test -p tagteam-engine --features test-hooks`
-Expected: PASS: the new core test, and 26 tests in `active` (`a_switch_never_captures…`
+Expected: PASS: the new core test, and 27 tests in `active` (`a_switch_never_captures…`
 included); the switch and recovery suites still pass unchanged.
 
 Run: `cargo clippy -p tagteam-core -p tagteam-engine --all-targets --features tagteam-engine/test-hooks -- -D warnings`
@@ -15192,8 +15291,9 @@ In `crates/tagteam-cc/src/naming.rs`, add to `mod tests`:
 
 Run: `cargo test -p tagteam-cc --lib naming::tests::the_passwd_name_is_this_user_s_from_any_thread`
 Expected: PASS already. `getpwuid`'s one static buffer is corrupted only by a truly
-concurrent call, which no test can provoke on demand. The test pins the behaviour the
-re-entrant call must keep, and the fix is verified by reading it.
+concurrent call, which no test can provoke on demand. This test is a pin, not a regression
+test: it fixes the behaviour the re-entrant call must keep, and the fix itself is verified by
+reading it. The commit message says so.
 
 - [ ] **Step 12: Use `getpwuid_r`**
 
@@ -15248,7 +15348,8 @@ Expected: PASS.
 
 ```bash
 git add crates/tagteam-cc/src/naming.rs
-git commit -m "Read the passwd name with the re-entrant getpwuid_r"
+git commit -m "Read the passwd name with the re-entrant getpwuid_r" \
+  -m "The added test is a pin, not a regression test: it passes on the old code, because a concurrent getpwuid call cannot be provoked on demand."
 ```
 
 - [ ] **Step 15: L421 — write the failing test**
@@ -15457,7 +15558,8 @@ Every binary test here sets `TAGTEAM_TEST_API_BASE` itself: either to `http://12
 
 **Files:**
 - Modify: `crates/tagteam/src/render.rs` (markers and their unit tests)
-- Modify: `crates/tagteam/Cargo.toml` (the `mock-server` feature on the dev-dependency)
+- Modify: `crates/tagteam/tests/common/mod.rs` (the shared helpers `two_accounts`,
+  `expire_vault`, `live_email`)
 - Test: `crates/tagteam/tests/cli.rs`
 - Create: `crates/tagteam/tests/gate_race.rs`
 
@@ -15475,7 +15577,11 @@ Every binary test here sets `TAGTEAM_TEST_API_BASE` itself: either to `http://12
   - Task 14: freshen before activation with §7.2's table; `EngineError::NeedsRelogin`; exactly
     one warning in `SwitchOutcome.warnings` for a transient freshen failure.
 - Produces: `render::list_human` and `render::status_human` markers for a quarantined account.
-  No new public API.
+  No new public API. Shared helpers in `crates/tagteam/tests/common/mod.rs`, used by `cli.rs`
+  and `gate_race.rs`: `two_accounts(root) -> (String, String)`,
+  `expire_vault(root, id, in_ms)` and `live_email(root) -> String`.
+- The mock server is already enabled for the binary's tests: Task 7 Step 16 edited
+  `crates/tagteam/Cargo.toml`.
 
 - [ ] **Step 1: Write the failing marker unit tests**
 
@@ -15552,15 +15658,55 @@ In `crates/tagteam/src/render.rs`, extend the test module's imports with
 
 - [ ] **Step 2: Write the binary tests**
 
-In `crates/tagteam/tests/cli.rs`, extend the imports with:
+First add the helpers `cli.rs` and `gate_race.rs` share to `crates/tagteam/tests/common/mod.rs`.
+Change its `serde_json` import to `use serde_json::{Value, json};` and its `tagteam_provider`
+import to `use tagteam_provider::{Env, FileKeychain, Keychain};`, and add
+`use std::time::{SystemTime, UNIX_EPOCH};` and `use tagteam_engine::vault::SERVICE;`. Then add:
 
 ```rust
-use std::time::{SystemTime, UNIX_EPOCH};
+/// `a@x.co` at position 1 and `b@x.co` at position 2, both added through the binary with every
+/// endpoint offline (`std_cmd`'s default); `b` is live. Returns their ids.
+pub fn two_accounts(root: &Path) -> (String, String) {
+    let env = Env::for_test(root);
+    let kc = FileKeychain::new(root.join("keychain"));
+    seed_home(&env);
+    login(&env, &kc, "a@x.co", "", "rt-a");
+    cmd(root).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-b");
+    cmd(root).arg("add").assert().success();
+    let out = cmd(root).args(["list", "--json"]).output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = |i: usize| v["accounts"][i]["id"].as_str().unwrap().to_owned();
+    (id(0), id(1))
+}
 
+/// Rewrites account `id`'s vault copy so its access token expires `in_ms` from now: inside
+/// the 10-minute freshen window (§7.2) when `in_ms` is below 600 000.
+pub fn expire_vault(root: &Path, id: &str, in_ms: i64) {
+    let kc = FileKeychain::new(root.join("keychain"));
+    let mut v: Value = serde_json::from_slice(&kc.find(SERVICE, id).present().unwrap()).unwrap();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+    v["claudeAiOauth"]["expiresAt"] = json!(now + in_ms);
+    kc.upsert(SERVICE, id, v.to_string().as_bytes()).unwrap();
+}
+
+/// The email of the `oauthAccount` Claude Code is logged in as.
+pub fn live_email(root: &Path) -> String {
+    let config: Value =
+        serde_json::from_slice(&fs::read(root.join("home/.claude.json")).unwrap()).unwrap();
+    config["oauthAccount"]["emailAddress"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+```
+
+In `crates/tagteam/tests/cli.rs`, add `expire_vault`, `live_email` and `two_accounts` to its
+`use common::{…}` list, and extend the imports with (`Keychain` is already imported by Task 7):
+
+```rust
 use tagteam_core::AccountId;
 use tagteam_engine::store::Store;
-use tagteam_engine::vault::SERVICE;
-use tagteam_provider::Keychain;
 ```
 
 and add:
@@ -15575,47 +15721,12 @@ fn offline(root: &Path) -> assert_cmd::Command {
     c
 }
 
-/// `a@x.co` at position 1 and `b@x.co` at position 2, both added through the binary; `b` is
-/// live. Returns their ids.
-fn two_accounts(root: &Path) -> (String, String) {
-    let env = Env::for_test(root);
-    let kc = FileKeychain::new(root.join("keychain"));
-    seed_home(&env);
-    login(&env, &kc, "a@x.co", "", "rt-a");
-    offline(root).arg("add").assert().success();
-    login(&env, &kc, "b@x.co", "", "rt-b");
-    offline(root).arg("add").assert().success();
-    let out = offline(root).args(["list", "--json"]).output().unwrap();
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let id = |i: usize| v["accounts"][i]["id"].as_str().unwrap().to_owned();
-    (id(0), id(1))
-}
-
-/// Rewrites account `id`'s vault copy so its access token expires `in_ms` from now: inside
-/// the 10-minute freshen window (§7.2) when `in_ms` is below 600 000.
-fn expire_vault(root: &Path, id: &str, in_ms: i64) {
-    let kc = FileKeychain::new(root.join("keychain"));
-    let mut v: Value = serde_json::from_slice(&kc.find(SERVICE, id).present().unwrap()).unwrap();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-    v["claudeAiOauth"]["expiresAt"] = json!(now + in_ms);
-    kc.upsert(SERVICE, id, v.to_string().as_bytes()).unwrap();
-}
-
 fn quarantine(root: &Path, id: &str) {
     Store::open_existing(&Env::for_test(root).data_dir().join("tagteam.db"))
         .unwrap()
         .unwrap()
         .set_quarantine(&AccountId::from_string(id), "invalid_grant", "sha256:0", 1)
         .unwrap();
-}
-
-fn live_email(root: &Path) -> String {
-    let config: Value =
-        serde_json::from_slice(&std::fs::read(root.join("home/.claude.json")).unwrap()).unwrap();
-    config["oauthAccount"]["emailAddress"]
-        .as_str()
-        .unwrap()
-        .to_owned()
 }
 
 #[test]
@@ -15788,21 +15899,11 @@ Expected: PASS. The `app.rs` snapshots are unchanged, since none of their accoun
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/tagteam/src/render.rs crates/tagteam/tests/cli.rs
+git add crates/tagteam/src/render.rs crates/tagteam/tests/common/mod.rs crates/tagteam/tests/cli.rs
 git commit -m "Mark quarantined accounts and pin the freshen refusals through the binary"
 ```
 
-- [ ] **Step 7: Enable the mock server for the binary's tests**
-
-In `crates/tagteam/Cargo.toml`, make the `[dev-dependencies]` line for `tagteam-provider` read:
-
-```toml
-tagteam-provider = { workspace = true, features = ["file-keychain", "mock-server"] }
-```
-
-(Task 7 may already have added `mock-server` there; if so, this step changes nothing.)
-
-- [ ] **Step 8: Write the race tests**
+- [ ] **Step 7: Write the race tests**
 
 Create `crates/tagteam/tests/gate_race.rs`:
 
@@ -15818,41 +15919,22 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Child, Stdio};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use common::{cmd, login, seed_home, std_cmd};
+use common::{cmd, expire_vault, live_email, std_cmd, two_accounts};
 use serde_json::{Value, json};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::mock_server::{MockReply, MockServer};
-use tagteam_provider::{Env, FileKeychain, Keychain};
+use tagteam_provider::{FileKeychain, Keychain};
 
 const API_BASE: &str = "TAGTEAM_TEST_API_BASE";
-const OFFLINE: &str = "http://127.0.0.1:9";
 const TOKEN: &str = "/v1/oauth/token";
 
 /// `a@x.co` at position 1 and `b@x.co` at 2, `b` live; `a`'s access token inside the freshen
 /// window (§7.2), so `switch 1` refreshes it through the gate first. Returns `a`'s id.
 fn expiring_target(root: &Path) -> String {
-    let env = Env::for_test(root);
-    let kc = FileKeychain::new(root.join("keychain"));
-    seed_home(&env);
-    login(&env, &kc, "a@x.co", "", "rt-a");
-    cmd(root).env(API_BASE, OFFLINE).arg("add").assert().success();
-    login(&env, &kc, "b@x.co", "", "rt-b");
-    cmd(root).env(API_BASE, OFFLINE).arg("add").assert().success();
-    let out = cmd(root)
-        .env(API_BASE, OFFLINE)
-        .args(["list", "--json"])
-        .output()
-        .unwrap();
-    let a = serde_json::from_slice::<Value>(&out.stdout).unwrap()["accounts"][0]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let mut v: Value = serde_json::from_slice(&kc.find(SERVICE, &a).present().unwrap()).unwrap();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-    v["claudeAiOauth"]["expiresAt"] = json!(now + 60_000);
-    kc.upsert(SERVICE, &a, v.to_string().as_bytes()).unwrap();
+    let (a, _) = two_accounts(root);
+    expire_vault(root, &a, 60_000);
     a
 }
 
@@ -15902,15 +15984,6 @@ fn vault_refresh_token(root: &Path, id: &str) -> String {
     let kc = FileKeychain::new(root.join("keychain"));
     let v: Value = serde_json::from_slice(&kc.find(SERVICE, id).present().unwrap()).unwrap();
     v["claudeAiOauth"]["refreshToken"].as_str().unwrap().to_owned()
-}
-
-fn live_email(root: &Path) -> String {
-    let config: Value =
-        serde_json::from_slice(&std::fs::read(root.join("home/.claude.json")).unwrap()).unwrap();
-    config["oauthAccount"]["emailAddress"]
-        .as_str()
-        .unwrap()
-        .to_owned()
 }
 
 #[test]
@@ -16003,7 +16076,7 @@ fn a_refresh_holder_stopped_past_every_timeout_is_never_preempted() {
 }
 ```
 
-- [ ] **Step 9: Run the race tests**
+- [ ] **Step 8: Run the race tests**
 
 Run: `cargo test -p tagteam --features test-support --test gate_race`
 Expected: PASS, 1 test in about 5 s; 1 ignored.
@@ -16014,10 +16087,10 @@ Expected: PASS, 1 test in about 17 s.
 These tests add no product code. A failure is a defect in the gate (Task 10) or in freshen
 (Task 14): fix it there and rerun.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
-git add crates/tagteam/Cargo.toml crates/tagteam/tests/gate_race.rs
+git add crates/tagteam/tests/gate_race.rs
 git commit -m "Prove the refresh gate's single flight across processes"
 ```
 
