@@ -75,6 +75,40 @@ mod tests {
     }
 
     #[test]
+    fn precedence_follows_the_table_order_when_facts_combine() {
+        // L300: a vault match outranks any oracle answer; a wiped or tokenless credential
+        // outranks the oracle; and a foreign answer is displaced whatever else holds.
+        let ours = OutgoingFacts {
+            fp_equal_vault: true,
+            oracle: OracleVerdict::OtherIdentity,
+            lacks_refresh_over_complete: true,
+            ..facts()
+        };
+        assert_eq!(
+            decide_outgoing(&ours),
+            (OutgoingClass::Ours, OutgoingAction::Nothing)
+        );
+        let wiped = OutgoingFacts {
+            wiped: true,
+            oracle: OracleVerdict::OtherIdentity,
+            ..facts()
+        };
+        assert_eq!(
+            decide_outgoing(&wiped),
+            (OutgoingClass::Wiped, OutgoingAction::Nothing)
+        );
+        let foreign = OutgoingFacts {
+            oracle: OracleVerdict::OtherIdentity,
+            lacks_refresh_over_complete: true,
+            ..facts()
+        };
+        assert_eq!(
+            decide_outgoing(&foreign),
+            (OutgoingClass::Foreign, OutgoingAction::Displace)
+        );
+    }
+
+    #[test]
     fn ours_by_bytes_or_fingerprint() {
         let f = OutgoingFacts {
             bytes_equal_vault: true,

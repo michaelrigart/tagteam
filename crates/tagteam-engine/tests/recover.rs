@@ -17,8 +17,11 @@ use tagteam_engine::store::JournalRow;
 use tagteam_engine::switch::SwitchReason;
 use tagteam_provider::{Keychain, ProcessStamp, Provider};
 
-fn any_mutation(fx: &Fx, id: &AccountId) {
-    fx.engine.set_disabled(id, false).unwrap(); // takes the mutation lock, so it recovers
+fn any_mutation(fx: &Fx, _id: &AccountId) {
+    // An account-changing command's mutation lock: it recovers, asking the oracle before it
+    // locks (§9.6, §7.6). Metadata commands recover from fingerprints alone (Task 7), which
+    // `metadata_commands_recover_without_asking_the_oracle` in tests/oracle.rs covers.
+    drop(fx.engine.mutation_guard().unwrap());
 }
 
 fn active(fx: &Fx) -> Option<AccountId> {

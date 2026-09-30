@@ -592,7 +592,8 @@ impl Engine {
     /// Changes only store metadata (§9.6, amended): proceeds even while a switch for this
     /// account's provider is undecidable, unlike `remove`. The existence check runs before
     /// the mutation lock is taken (§5: a missing account must not create `.mutation.lock`
-    /// or the store), then is re-read under the lock, as `remove` already does.
+    /// or the store), then is re-read under the lock, as `remove` already does. It never asks
+    /// the oracle (§7.6).
     pub fn set_alias(
         &self,
         id: &AccountId,
@@ -601,7 +602,7 @@ impl Engine {
         self.refuse_inside_run_shell()?;
         let alias = alias_arg(alias)?;
         self.managed_row(id)?;
-        let _guard = self.mutation_guard()?;
+        let _guard = self.metadata_guard()?;
         self.managed_row(id)?;
         self.store()?
             .set_alias(id, alias.as_deref())
@@ -612,11 +613,12 @@ impl Engine {
     /// Changes only store metadata (§9.6, amended): proceeds even while a switch for this
     /// account's provider is undecidable, unlike `remove`. The existence check runs before
     /// the mutation lock is taken (§5: a missing account must not create `.mutation.lock`
-    /// or the store), then is re-read under the lock, as `remove` already does.
+    /// or the store), then is re-read under the lock, as `remove` already does. It never asks
+    /// the oracle (§7.6).
     pub fn set_disabled(&self, id: &AccountId, disabled: bool) -> Result<AccountRow, EngineError> {
         self.refuse_inside_run_shell()?;
         self.managed_row(id)?;
-        let _guard = self.mutation_guard()?;
+        let _guard = self.metadata_guard()?;
         self.managed_row(id)?;
         self.store()?.set_disabled(id, disabled)?;
         self.managed_row(id)
@@ -626,11 +628,11 @@ impl Engine {
     /// metadata (§9.6, amended): proceeds even while a switch for this account's provider is
     /// undecidable, unlike `remove`. The existence check runs before the mutation lock is
     /// taken (§5: a missing account must not create `.mutation.lock` or the store), then is
-    /// re-read under the lock, as `remove` already does.
+    /// re-read under the lock, as `remove` already does. It never asks the oracle (§7.6).
     pub fn move_to(&self, id: &AccountId, position: u32) -> Result<AccountRow, EngineError> {
         self.refuse_inside_run_shell()?;
         self.managed_row(id)?;
-        let _guard = self.mutation_guard()?;
+        let _guard = self.metadata_guard()?;
         let row = self.managed_row(id)?;
         // Reuses the same check `add_live`/`add_token` share, instead of repeating
         // `check_position(position, store.next_position(&row.provider)?.saturating_sub(1))`

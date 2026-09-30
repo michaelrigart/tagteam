@@ -136,7 +136,7 @@ impl Engine {
         &self,
         provider: &ProviderId,
     ) -> Result<MutationGuard, EngineError> {
-        let (guard, blocked) = self.guard_recovering()?;
+        let (guard, blocked) = self.guard_recovering(true)?;
         if self.interrupted(provider)? {
             return Err(blocked
                 .into_iter()
@@ -167,19 +167,32 @@ impl Engine {
     /// tagteam's mutation lock. Before returning it, recovers every interrupted switch whose
     /// holder has died (§9.6). The oracle is asked before the lock is taken (§7.6).
     pub fn mutation_guard(&self) -> Result<MutationGuard, EngineError> {
-        Ok(self.guard_recovering()?.0)
+        Ok(self.guard_recovering(true)?.0)
+    }
+
+    /// The mutation lock for commands that change only store metadata (`alias`, `disable`,
+    /// `enable`, `move`): recovery still runs, but from fingerprints alone, so these commands
+    /// never make a network call (§7.6).
+    pub(crate) fn metadata_guard(&self) -> Result<MutationGuard, EngineError> {
+        Ok(self.guard_recovering(false)?.0)
     }
 
     /// `mutation_guard`, with the refusal for each row whose recovery could not take its
-    /// provider's live locks (`RecoveryBlocked`), by provider.
+    /// provider's live locks (`RecoveryBlocked`), by provider. With `ask_oracle` false the
+    /// rows are recovered from fingerprints alone: no network call (§7.6, §9.6).
     fn guard_recovering(
         &self,
+        ask_oracle: bool,
     ) -> Result<(MutationGuard, Vec<(ProviderId, EngineError)>), EngineError> {
         let hints: Vec<_> = self
             .dead_journals()?
             .into_iter()
             .map(|row| {
-                let hint = self.recovery_hints(&row);
+                let hint = if ask_oracle {
+                    self.recovery_hints(&row)
+                } else {
+                    Vec::new()
+                };
                 (row, hint)
             })
             .collect();

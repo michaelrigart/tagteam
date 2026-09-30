@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
+use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::shape::compose;
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
@@ -20,6 +21,7 @@ use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
+use tagteam_provider::http::Method;
 use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{
     Credential, Env, FakeClock, FakeKeychain, Identity, IdentitySurface, MutationGuard,
@@ -302,6 +304,28 @@ impl Fx {
             },
             "mcpOAuth": {"srv": {"token": "machine-shared"}}
         })
+    }
+
+    /// The endpoints the fixture's `ClaudeCode` sends to: production URLs, answered by
+    /// `self.http` (a `ScriptedHttp`), so nothing leaves the machine.
+    pub fn endpoints() -> Endpoints {
+        Endpoints::production()
+    }
+
+    /// Queues a 200 profile reply naming `email`'s login as `Fx::oauth_account` shapes it
+    /// (uuid `uuid-{email}`, personal org), built from the recorded reply so every field the
+    /// real endpoint sends is present.
+    pub fn script_profile(&self, email: &str) {
+        let recorded: Value = serde_json::from_str(include_str!(
+            "../../../tagteam-cc/tests/fixtures/endpoints/profile-200.json"
+        ))
+        .unwrap();
+        let mut body = recorded["body"].clone();
+        body["account"]["uuid"] = json!(format!("uuid-{email}"));
+        body["account"]["email"] = json!(email);
+        body["organization"]["uuid"] = json!("");
+        self.http
+            .push_json(Method::Get, &Self::endpoints().profile, 200, body);
     }
 
     pub fn oauth_account(email: &str) -> Value {
