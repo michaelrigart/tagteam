@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 
-use crate::credential::Credential;
+use crate::credential::{Credential, FreshCredential};
 use crate::env::Env;
 use crate::flock::MutationGuard;
 use crate::http::Http;
@@ -300,6 +300,83 @@ pub enum ProviderError {
     Invalid(String),
 }
 
+/// Why a stored login can never refresh again (§7.3 step 7, §7.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadReason {
+    /// The token endpoint answered `invalid_grant` for the generation that was sent.
+    InvalidGrant,
+    /// The credential has no refresh token to send.
+    NoRefreshToken,
+}
+
+impl DeadReason {
+    /// The `quarantine_reason` column's value (§6.1).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeadReason::InvalidGrant => "invalid_grant",
+            DeadReason::NoRefreshToken => "no_refresh_token",
+        }
+    }
+}
+
+/// A failure that may succeed on retry (§7.3 step 7). `PreSend` means nothing left the
+/// machine; `Ambiguous` means the request may have been processed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransientKind {
+    PreSend,
+    Ambiguous,
+    Http(u16),
+    BadResponse,
+}
+
+impl TransientKind {
+    /// `usage_state.last_error`'s kind token (§6.1).
+    pub fn token(&self) -> String {
+        match self {
+            TransientKind::PreSend => "pre-send".into(),
+            TransientKind::Ambiguous => "ambiguous".into(),
+            TransientKind::Http(code) => format!("http-{code}"),
+            TransientKind::BadResponse => "bad-response".into(),
+        }
+    }
+}
+
+/// The provider's verdict on one token request (§7.3 steps 5 and 7). The engine owns what
+/// happens next: persistence, rescue, the lineage re-read and quarantine.
+pub enum RefreshResult {
+    /// `successor` is the whole new credential in the provider's stored shape; `owner` is the
+    /// identity the reply named, if it named one (§7.4 `identity_conflict`).
+    Refreshed {
+        successor: Vec<u8>,
+        owner: Option<Identity>,
+    },
+    Dead(DeadReason),
+    /// The token endpoint refused the request itself: a top-level `invalid_client`, or a 400
+    /// `invalid_request_error` (an unknown client id, Appendix A.5). Never a strike (§7.3).
+    /// The string is the server's own message, else the error code.
+    Systemic(String),
+    Transient(TransientKind),
+}
+
+/// Never prints the successor's bytes, and names the owner by uuid only.
+impl fmt::Debug for RefreshResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RefreshResult::Refreshed { successor, owner } => f
+                .debug_struct("Refreshed")
+                .field("successor", &format_args!("<{} bytes>", successor.len()))
+                .field(
+                    "owner_uuid",
+                    &owner.as_ref().and_then(|o| o.account_uuid.as_deref()),
+                )
+                .finish(),
+            RefreshResult::Dead(r) => f.debug_tuple("Dead").field(r).finish(),
+            RefreshResult::Systemic(m) => f.debug_tuple("Systemic").field(m).finish(),
+            RefreshResult::Transient(k) => f.debug_tuple("Transient").field(k).finish(),
+        }
+    }
+}
+
 pub trait Provider: Send + Sync {
     fn id(&self) -> ProviderId;
     fn display_name(&self) -> &'static str;
@@ -392,6 +469,18 @@ pub trait Provider: Send + Sync {
     /// an expired access token (`now_ms + 5 min ≥ expiresAt`), or a kind the provider cannot
     /// resolve.
     fn resolve_owner(&self, http: &dyn Http, cred: &Credential, now_ms: i64) -> Option<Identity>;
+
+    /// §7.3 steps 5 and 7, the provider's half: sends the credential's refresh token with
+    /// `timeout`, classifies the reply, and composes the successor (`now_ms` stamps its
+    /// expiry). A credential without a refresh token is `Dead(NoRefreshToken)`, and nothing is
+    /// sent. The engine calls this only for a kind whose `KindTraits::refreshable` is true.
+    fn refresh(
+        &self,
+        http: &dyn Http,
+        cred: &FreshCredential,
+        now_ms: i64,
+        timeout: Duration,
+    ) -> RefreshResult;
 }
 
 #[cfg(test)]

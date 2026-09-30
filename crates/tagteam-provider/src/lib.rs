@@ -29,8 +29,8 @@ pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 pub use mock_server::{MockReply, MockRequest, MockServer};
 pub use process::ProcessStamp;
 pub use provider::{
-    BeforeFallback, Capabilities, CapturedLogin, CredLocks, DoomedEntry, Identity, IdentitySurface,
-    KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, Provider, ProviderError, SecretStore,
-    StoredLogin, Undo, Written,
+    BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, Identity,
+    IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, Provider,
+    ProviderError, RefreshResult, SecretStore, StoredLogin, TransientKind, Undo, Written,
 };
 pub use read::{Read, ReadError};

@@ -328,6 +328,32 @@ impl Fx {
             .push_json(Method::Get, &Self::endpoints().profile, 200, body);
     }
 
+    /// Queues a 200 token reply: a new access token `at-<rt>` (or `at-same`), 8 h of validity,
+    /// and the refresh token `new_rt` when `Some` (a reply without one keeps the lineage).
+    pub fn script_refresh(&self, new_rt: Option<&str>) {
+        let mut body = json!({
+            "token_type": "Bearer",
+            "access_token": format!("at-{}", new_rt.unwrap_or("same")),
+            "expires_in": 28800,
+            "scope": "user:inference user:profile",
+        });
+        if let Some(rt) = new_rt {
+            body["refresh_token"] = json!(rt);
+        }
+        self.http
+            .push_json(Method::Post, &Self::endpoints().token, 200, body);
+    }
+
+    /// Queues a token error reply, `{"error": error}` with `status`.
+    pub fn script_token_error(&self, status: u16, error: &str) {
+        self.http.push_json(
+            Method::Post,
+            &Self::endpoints().token,
+            status,
+            json!({"error": error}),
+        );
+    }
+
     pub fn oauth_account(email: &str) -> Value {
         json!({"emailAddress": email, "organizationUuid": "", "organizationName": null, "accountUuid": format!("uuid-{email}")})
     }

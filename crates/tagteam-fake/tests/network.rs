@@ -1,9 +1,12 @@
 //! `FakeAgent`'s network half: its own endpoints, shapes and verdicts, deliberately unlike
 //! Claude Code's (§15.2).
 
-use serde_json::json;
+use std::time::Duration;
+
+use serde_json::{Value, json};
 use tagteam_fake::{FakeAgent, credential_json, identity_json};
 use tagteam_provider::http::{Method, ScriptedHttp};
+use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{Credential, Provider};
 
 const NOW: i64 = 1_790_000_000_000;
@@ -78,4 +81,69 @@ fn a_whoami_reply_without_a_uid_resolves_nothing() {
         json!({"uid": "", "handle": "neo", "workspace": "zion"}),
     );
     assert!(fa.resolve_owner(&http, &token(None), NOW).is_none());
+}
+
+fn renewable() -> tagteam_provider::FreshCredential {
+    token(Some(NOW - 1)).into_fresh().unwrap()
+}
+
+#[test]
+fn refresh_posts_the_renew_token_and_keeps_the_machine_shared_key() {
+    let fa = FakeAgent::new();
+    let http = ScriptedHttp::new();
+    http.push_json(
+        Method::Post,
+        &fa.renew_url(),
+        200,
+        json!({"token": "fa-tok2", "renew": "fa-renew2", "expires_in": 60, "owner": {"uid": "fa-u1", "workspace": "zion"}}),
+    );
+    let r = fa.refresh(&http, &renewable(), NOW, Duration::from_secs(10));
+    let RefreshResult::Refreshed { successor, owner } = r else {
+        panic!("expected Refreshed, got {r:?}");
+    };
+    let s: Value = serde_json::from_slice(&successor).unwrap();
+    assert_eq!(s["fa"]["token"], "fa-tok2");
+    assert_eq!(s["fa"]["renew"], "fa-renew2");
+    assert_eq!(s["fa"]["expires"], json!(NOW + 60_000));
+    assert_eq!(s["device"], json!({"id": "machine-shared"}));
+    let owner = owner.unwrap();
+    assert_eq!(
+        (owner.account_uuid.as_deref(), owner.org_uuid.as_str()),
+        (Some("fa-u1"), "zion")
+    );
+    let body: Value = serde_json::from_slice(http.requests()[0].body.as_deref().unwrap()).unwrap();
+    assert_eq!(body, json!({"renew": "fa-renew"}));
+}
+
+#[test]
+fn fake_agent_verdicts() {
+    let fa = FakeAgent::new();
+    let http = ScriptedHttp::new();
+    http.push_json(
+        Method::Post,
+        &fa.renew_url(),
+        401,
+        json!({"error": "invalid_grant"}),
+    );
+    assert!(matches!(
+        fa.refresh(&http, &renewable(), NOW, Duration::from_secs(10)),
+        RefreshResult::Dead(DeadReason::InvalidGrant)
+    ));
+    let static_cred = Credential::fresh(
+        credential_json("fa-static-tok", None, None)
+            .to_string()
+            .into_bytes(),
+    )
+    .into_fresh()
+    .unwrap();
+    let before = http.count(Method::Post, &fa.renew_url());
+    assert!(matches!(
+        fa.refresh(&http, &static_cred, NOW, Duration::from_secs(10)),
+        RefreshResult::Dead(DeadReason::NoRefreshToken)
+    ));
+    assert_eq!(
+        http.count(Method::Post, &fa.renew_url()),
+        before,
+        "nothing sent"
+    );
 }

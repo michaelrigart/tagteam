@@ -4,10 +4,11 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::http::Http;
+use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
-    BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, Identity,
-    IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLocks, MutationGuard,
-    Provider, ProviderError, Read, StoredLogin, Undo, Written,
+    BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
+    Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLocks,
+    MutationGuard, Provider, ProviderError, Read, StoredLogin, Undo, Written,
 };
 
 use crate::config;
@@ -434,6 +435,21 @@ impl Provider for ClaudeCode {
             .send(&oauth::profile_request(&self.endpoints, &token))
             .ok()?;
         oauth::parse_profile(&reply)
+    }
+
+    fn refresh(
+        &self,
+        http: &dyn Http,
+        cred: &FreshCredential,
+        now_ms: i64,
+        timeout: Duration,
+    ) -> RefreshResult {
+        let old = cred.credential().bytes();
+        let Some(rt) = shape::refresh_token(old) else {
+            return RefreshResult::Dead(DeadReason::NoRefreshToken);
+        };
+        let req = oauth::refresh_request(&self.endpoints, &rt, &shape::scopes(old), timeout);
+        oauth::parse_refresh(old, http.send(&req), now_ms)
     }
 }
 

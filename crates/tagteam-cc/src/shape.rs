@@ -71,6 +71,66 @@ pub fn login_expires_at(bytes: &[u8]) -> Option<i64> {
     oauth_obj(bytes)?.get("refreshTokenExpiresAt")?.as_i64()
 }
 
+/// The stored refresh token, if the credential has one.
+pub fn refresh_token(bytes: &[u8]) -> Option<String> {
+    oauth_obj(bytes).and_then(|o| token(&o, "refreshToken").map(str::to_owned))
+}
+
+/// A refresh reply's token fields (Appendix A.5), ready to apply to the stored credential.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TokenFields {
+    pub access_token: String,
+    /// `None` when the reply carried no refresh token: the stored one is kept.
+    pub refresh_token: Option<String>,
+    pub expires_at: i64,
+    /// `None` when the reply carried no `scope`: the stored scopes are kept.
+    pub scopes: Option<Vec<String>>,
+    pub refresh_token_expires_at: Option<i64>,
+}
+
+/// Never shows a token.
+impl std::fmt::Debug for TokenFields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenFields")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_at", &self.expires_at)
+            .field("scopes", &self.scopes)
+            .field("refresh_token_expires_at", &self.refresh_token_expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Appendix A.5: the reply's fields replace the stored ones inside `claudeAiOauth`, the
+/// refresh token only when the reply carries one. Every other key, at every level, is kept
+/// where it was; new keys are appended.
+pub fn apply_refresh(old: &[u8], f: &TokenFields) -> Result<Vec<u8>, ProviderError> {
+    let not_an_object =
+        || ProviderError::Invalid("the stored credential is not a JSON object".into());
+    let mut root = match serde_json::from_slice::<Value>(old) {
+        Ok(Value::Object(o)) => o,
+        _ => return Err(not_an_object()),
+    };
+    let entry = root
+        .entry("claudeAiOauth")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let o = entry.as_object_mut().ok_or_else(not_an_object)?;
+    o.insert("accessToken".into(), json!(f.access_token));
+    if let Some(rt) = &f.refresh_token {
+        o.insert("refreshToken".into(), json!(rt));
+    }
+    o.insert("expiresAt".into(), json!(f.expires_at));
+    if let Some(s) = &f.scopes {
+        o.insert("scopes".into(), json!(s));
+    }
+    if let Some(e) = f.refresh_token_expires_at {
+        o.insert("refreshTokenExpiresAt".into(), json!(e));
+    }
+    Ok(serde_json::to_vec(&Value::Object(root)).expect("a Value always serializes"))
+}
+
 /// The access token, when the credential has a non-empty one.
 pub fn access_token(bytes: &[u8]) -> Option<String> {
     oauth_obj(bytes).and_then(|o| token(&o, "accessToken").map(str::to_owned))
@@ -440,5 +500,95 @@ mod tests {
             }
         );
         assert_eq!(kind_traits("not-a-kind"), plain);
+    }
+
+    fn fields(rt: Option<&str>) -> TokenFields {
+        TokenFields {
+            access_token: "at-new".into(),
+            refresh_token: rt.map(str::to_owned),
+            expires_at: 2_000,
+            scopes: Some(vec!["user:inference".into(), "user:profile".into()]),
+            refresh_token_expires_at: Some(9_000),
+        }
+    }
+
+    #[test]
+    fn apply_refresh_replaces_the_tokens_and_keeps_every_other_key_in_place() {
+        let old = json!({
+            "claudeAiOauth": {
+                "accessToken": "at-old",
+                "refreshToken": "rt-old",
+                "expiresAt": 1,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max",
+                "rateLimitTier": "t"
+            },
+            "trustedDeviceToken": "d",
+            "mcpOAuth": {"srv": {"token": "machine-shared"}}
+        });
+        let out: Value = serde_json::from_slice(
+            &apply_refresh(old.to_string().as_bytes(), &fields(Some("rt-new"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            json!({
+                "claudeAiOauth": {
+                    "accessToken": "at-new",
+                    "refreshToken": "rt-new",
+                    "expiresAt": 2_000,
+                    "scopes": ["user:inference", "user:profile"],
+                    "subscriptionType": "max",
+                    "rateLimitTier": "t",
+                    "refreshTokenExpiresAt": 9_000
+                },
+                "trustedDeviceToken": "d",
+                "mcpOAuth": {"srv": {"token": "machine-shared"}}
+            })
+        );
+        let keys: Vec<&str> = out["claudeAiOauth"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "accessToken",
+                "refreshToken",
+                "expiresAt",
+                "scopes",
+                "subscriptionType",
+                "rateLimitTier",
+                "refreshTokenExpiresAt"
+            ],
+            "existing keys keep their place; new ones are appended"
+        );
+    }
+
+    #[test]
+    fn a_reply_without_a_refresh_token_keeps_the_stored_one() {
+        // Review Focus 3: the lineage is unchanged, so the fingerprint is too.
+        let old = json!({"claudeAiOauth": {"accessToken": "at-old", "refreshToken": "rt-old", "expiresAt": 1}});
+        let out = apply_refresh(old.to_string().as_bytes(), &fields(None)).unwrap();
+        assert_eq!(refresh_token(&out).as_deref(), Some("rt-old"));
+        assert_eq!(fingerprint(&out), fingerprint(old.to_string().as_bytes()));
+        assert_eq!(access_token(&out).as_deref(), Some("at-new"));
+    }
+
+    #[test]
+    fn apply_refresh_refuses_a_stored_value_that_is_not_an_object() {
+        assert!(apply_refresh(b"sk-ant-api03-key", &fields(Some("rt"))).is_err());
+        assert!(apply_refresh(br#"{"claudeAiOauth": "x"}"#, &fields(Some("rt"))).is_err());
+    }
+
+    #[test]
+    fn token_fields_never_print_their_tokens() {
+        let shown = format!("{:?}", fields(Some("rt-secret-value")));
+        assert!(
+            !shown.contains("rt-secret-value") && !shown.contains("at-new"),
+            "{shown}"
+        );
     }
 }

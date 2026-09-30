@@ -8,11 +8,12 @@ use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
-use tagteam_provider::http::{Http, HttpRequest};
+use tagteam_provider::http::{Http, HttpError, HttpRequest};
+use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind};
 use tagteam_provider::splice::{self, render_nested};
 use tagteam_provider::{
-    BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, Identity,
-    IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, LockError,
+    BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
+    Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, LockError,
     MkdirLock, MkdirLockSpec, MutationGuard, Provider, ProviderError, Read, ReadError, SecretStore,
     StoredLogin, Undo, Written,
 };
@@ -425,5 +426,97 @@ impl Provider for FakeAgent {
             account_uuid: Some(uid.to_owned()),
             raw: identity_json(handle, workspace, uid),
         })
+    }
+
+    fn refresh(
+        &self,
+        http: &dyn Http,
+        cred: &FreshCredential,
+        now_ms: i64,
+        timeout: Duration,
+    ) -> RefreshResult {
+        let Ok(Value::Object(mut root)) =
+            serde_json::from_slice::<Value>(cred.credential().bytes())
+        else {
+            return RefreshResult::Dead(DeadReason::NoRefreshToken);
+        };
+        let Some(renew) = root
+            .get("fa")
+            .and_then(|fa| fa["renew"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+        else {
+            return RefreshResult::Dead(DeadReason::NoRefreshToken);
+        };
+        let req = HttpRequest::post_json(self.renew_url(), &json!({"renew": renew}), timeout);
+        let resp = match http.send(&req) {
+            Ok(r) => r,
+            Err(HttpError::PreSend(_)) => return RefreshResult::Transient(TransientKind::PreSend),
+            Err(HttpError::Ambiguous(_)) => {
+                return RefreshResult::Transient(TransientKind::Ambiguous);
+            }
+        };
+        let body = resp.json();
+        match (resp.status, body.as_ref().and_then(|b| b["error"].as_str())) {
+            (400 | 401, Some("invalid_grant")) => {
+                return RefreshResult::Dead(DeadReason::InvalidGrant);
+            }
+            (_, Some("invalid_client")) => {
+                return RefreshResult::Systemic("the renew endpoint rejected the client".into());
+            }
+            (200, _) => {}
+            (status, _) => return RefreshResult::Transient(TransientKind::Http(status)),
+        }
+        let Some(body) = body else {
+            return RefreshResult::Transient(TransientKind::BadResponse);
+        };
+        // §7.3: a reply that names a new renew token delivered a successor, so it is kept even
+        // without a new access token (the stored one stays, expiring now), as Claude Code's
+        // parser does. Only a reply naming neither is a bad response.
+        let new_token = body["token"].as_str().filter(|s| !s.is_empty());
+        let new_renew = body["renew"].as_str().filter(|s| !s.is_empty());
+        if new_token.is_none() && new_renew.is_none() {
+            return RefreshResult::Transient(TransientKind::BadResponse);
+        }
+        let expires = match new_token {
+            Some(_) => now_ms.saturating_add(
+                body["expires_in"]
+                    .as_i64()
+                    .unwrap_or(0)
+                    .saturating_mul(1000),
+            ),
+            None => now_ms,
+        };
+        let fa = root.entry("fa").or_insert_with(|| json!({}));
+        if let Some(t) = new_token {
+            fa["token"] = json!(t);
+        }
+        if let Some(r) = new_renew {
+            fa["renew"] = json!(r);
+        }
+        fa["expires"] = json!(expires);
+        // Like Claude Code's (§7.4): the uid or the workspace alone names an owner.
+        let text = |k: &str| {
+            body["owner"][k]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        let (uid, workspace) = (text("uid"), text("workspace"));
+        let owner = (uid.is_some() || workspace.is_some()).then(|| Identity {
+            label: uid
+                .clone()
+                .or_else(|| workspace.clone())
+                .unwrap_or_default(),
+            email: None,
+            org_uuid: workspace.clone().unwrap_or_default(),
+            org_name: None,
+            raw: json!({"uid": uid, "workspace": workspace}),
+            account_uuid: uid,
+        });
+        RefreshResult::Refreshed {
+            successor: serde_json::to_vec(&Value::Object(root)).expect("a Value always serializes"),
+            owner,
+        }
     }
 }
