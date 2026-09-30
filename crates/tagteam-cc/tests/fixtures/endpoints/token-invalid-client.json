@@ -1,0 +1,15 @@
+{
+  "status": 400,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "invalid_request_error",
+      "message": "Client with id 00000000-0000-4000-8000-000000000001 not found"
+    },
+    "request_id": "req_000000000000000000000001"
+  },
+  "synthetic": false
+}

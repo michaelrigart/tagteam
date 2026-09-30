@@ -1,0 +1,11 @@
+{
+  "status": 400,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "error": "invalid_grant",
+    "error_description": "Refresh token not found or invalid"
+  },
+  "synthetic": false
+}
