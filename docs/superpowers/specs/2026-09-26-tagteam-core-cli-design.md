@@ -690,7 +690,7 @@ This procedure is the only place a stored refresh token is ever sent to the toke
    |---|---|
    | 400/401/403 with top-level JSON `error == "invalid_grant"` | **Dead**, but only after re-reading the source that was sent. If its lineage moved in the meantime, record `refresh-failed` instead |
    | No `refreshToken` in a structurally complete OAuth credential | Dead |
-   | `invalid_client` | Systemic. Never counts as a strike |
+   | The server rejects the request itself: a top-level `error == "invalid_client"` (RFC 6749), or a 400 whose nested `error.type` is `invalid_request_error` (what the endpoint returns for an unknown client id, Appendix A.5) | Systemic. Never counts as a strike. The message quotes the server's text |
    | No request sent: DNS, connect or TLS failure | Transient, kind `pre-send` |
    | Request sent, no response read: timeout or reset | Transient, kind `ambiguous` |
    | Anything else, including unparseable bodies | Transient |
@@ -2213,6 +2213,16 @@ providers.
   identity-conflict check.
 
 All requests use `User-Agent: tagteam/<version>`.
+
+Response shapes verified against the live endpoints on 2026-09-30 with Claude Code 2.1.285.
+The redacted recordings are in `crates/tagteam-cc/tests/fixtures/endpoints/`. `token-200.json`
+is synthetic, since a successful refresh can't be recorded without spending a real token.
+- `invalid_grant` arrives as a 400 with `{"error": "invalid_grant", "error_description": …}`.
+- An unknown client id arrives as a 400 with
+  `{"type": "error", "error": {"type": "invalid_request_error", "message": "Client with id … not found"}, "request_id": …}`,
+  not RFC 6749's `invalid_client`. §7.3 step 7 classifies both shapes as systemic.
+- The usage response is richer than §8.2 assumes (`utilization`, ISO `resets_at`, further
+  windows, and a `spend` object). M2b's spec work starts from `usage-200.json`.
 
 ### A.6 `~/.claude.json` fields tagteam reads
 
