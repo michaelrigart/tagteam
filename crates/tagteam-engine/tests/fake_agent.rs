@@ -4,7 +4,7 @@ mod common;
 
 use std::fs;
 
-use common::FakeFx;
+use common::{FakeFx, Fx};
 use serde_json::{Value, json};
 use tagteam_core::AccountId;
 use tagteam_engine::lifecycle::AddTokenOptions;
@@ -12,7 +12,8 @@ use tagteam_engine::switch::{SwitchRequest, SwitchTarget};
 use tagteam_fake::{
     FAKE_AGENT, FakePaths, KIND_TOKEN, LOGIN_EXPIRES, credential_json, identity_json,
 };
-use tagteam_provider::{IdentitySurface, Provider};
+use tagteam_provider::http::Method;
+use tagteam_provider::{Clock, IdentitySurface, Provider};
 
 fn check(ffx: &FakeFx, surface: &IdentitySurface, step: &str, op: impl FnOnce()) {
     let before = ffx.fx.snapshot();
@@ -247,5 +248,111 @@ fn every_fake_agent_command_writes_only_its_identity_surface() {
         e.remove(&alice).unwrap();
     });
     assert_eq!(ffx.fake_live_label().as_deref(), Some("bob@ws"));
+    assert_eq!(ffx.fx.live_email().as_deref(), Some("cc@b.co"));
+}
+
+/// `id`'s stored FakeAgent access token, moved inside the freshen window (§7.2).
+fn make_due(ffx: &FakeFx, id: &AccountId) {
+    let mut v: Value = serde_json::from_slice(&ffx.fx.vault_bytes(id).unwrap()).unwrap();
+    v["fa"]["expires"] = json!(ffx.fx.clock.now_ms() + 60_000);
+    ffx.fx.put_vault(id, v.to_string().as_bytes());
+}
+
+fn renew_requests(ffx: &FakeFx) -> usize {
+    ffx.fx.http.count(Method::Post, &ffx.fake.renew_url())
+}
+
+#[test]
+fn a_fake_agent_refresh_before_a_switch_leaves_claude_code_untouched() {
+    // §15.2: a refresh on one provider never touches the other's state. The gate and freshen
+    // path run FakeAgent's own endpoint and shapes, and only FakeAgent's surface moves.
+    let ffx = FakeFx::new();
+    ffx.fx.add("cc@b.co", "rt-cc");
+    let alice = ffx.fake_add("alice", "tok-a", "renew-a");
+    ffx.fake_add("bob", "tok-b", "renew-b");
+    make_due(&ffx, &alice);
+    ffx.fx.http.push_json(
+        Method::Post,
+        &ffx.fake.renew_url(),
+        200,
+        json!({"token": "tok-a-2", "renew": "renew-a-2", "expires_in": 3600}),
+    );
+    let before = ffx.fx.snapshot();
+    let out = ffx.switch_fake(&alice);
+    let after = ffx.fx.snapshot();
+    assert!(out.switched, "{}", out.message);
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert_eq!(renew_requests(&ffx), 1);
+    let sent = ffx.fx.http.requests();
+    let body: Value = serde_json::from_slice(sent[0].body.as_deref().unwrap()).unwrap();
+    assert_eq!(body, json!({"renew": "renew-a"}));
+    let stored: Value = serde_json::from_slice(&ffx.fx.vault_bytes(&alice).unwrap()).unwrap();
+    assert_eq!(stored["fa"]["renew"], "renew-a-2");
+    assert_eq!(stored["fa"]["token"], "tok-a-2");
+    let live = read_json(&FakePaths::resolve(&ffx.fx.env).credential);
+    assert_eq!(
+        live["fa"]["renew"], "renew-a-2",
+        "the successor was activated"
+    );
+    assert_eq!(ffx.fake_live_label().as_deref(), Some("alice@ws"));
+    ffx.fx.assert_only_surface_changed_for(
+        &ffx.fake.identity_surface(&ffx.fx.env),
+        &before,
+        &after,
+        "a FakeAgent refresh and switch",
+    );
+    assert_eq!(ffx.fx.live_email().as_deref(), Some("cc@b.co"));
+    assert_eq!(
+        ffx.fx.http.count(Method::Post, &Fx::endpoints().token),
+        0,
+        "nothing was sent to Claude Code's endpoint"
+    );
+}
+
+#[test]
+fn a_dead_fake_agent_target_is_quarantined_and_refused_without_touching_claude_code() {
+    let ffx = FakeFx::new();
+    ffx.fx.add("cc@b.co", "rt-cc");
+    let alice = ffx.fake_add("alice", "tok-a", "renew-a");
+    ffx.fake_add("bob", "tok-b", "renew-b");
+    make_due(&ffx, &alice);
+    ffx.fx.http.push_json(
+        Method::Post,
+        &ffx.fake.renew_url(),
+        400,
+        json!({"error": "invalid_grant"}),
+    );
+    let before = ffx.fx.snapshot();
+    let err = ffx
+        .engine
+        .switch(SwitchRequest {
+            provider: ffx.fake_provider(),
+            target: SwitchTarget::Account(alice.clone()),
+            force: false,
+            source: "cli",
+        })
+        .unwrap_err();
+    let after = ffx.fx.snapshot();
+    assert_eq!(err.kind(), "relogin-required", "{err}");
+    assert_eq!(renew_requests(&ffx), 1);
+    let row = ffx
+        .engine
+        .store()
+        .unwrap()
+        .account(&alice)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.quarantine_reason.as_deref(), Some("invalid_grant"));
+    assert_eq!(
+        ffx.fake_live_label().as_deref(),
+        Some("bob@ws"),
+        "nothing activated"
+    );
+    ffx.fx.assert_only_surface_changed_for(
+        &ffx.fake.identity_surface(&ffx.fx.env),
+        &before,
+        &after,
+        "a refused FakeAgent switch",
+    );
     assert_eq!(ffx.fx.live_email().as_deref(), Some("cc@b.co"));
 }
