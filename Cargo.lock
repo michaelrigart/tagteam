@@ -1099,12 +1099,23 @@ dependencies = [
  "serde_json",
  "tagteam-cc",
  "tagteam-core",
+ "tagteam-fake",
  "tagteam-provider",
  "tempfile",
  "thiserror",
  "tracing",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "tagteam-fake"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tagteam-core",
+ "tagteam-provider",
+ "tempfile",
 ]
 
 [[package]]

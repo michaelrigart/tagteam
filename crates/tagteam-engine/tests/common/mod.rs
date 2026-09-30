@@ -19,10 +19,11 @@ use tagteam_engine::store::{JournalRow, LoginMeta};
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
+use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{
-    Credential, Env, FakeClock, FakeKeychain, Identity, MutationGuard, ProcessStamp, Provider,
-    Read, ScriptedHttp,
+    Credential, Env, FakeClock, FakeKeychain, Identity, IdentitySurface, MutationGuard,
+    ProcessStamp, Provider, Read, ScriptedHttp,
 };
 
 /// An oracle that answers whatever the test sets.
@@ -766,6 +767,19 @@ impl Fx {
         step: &str,
     ) {
         let surface = self.cc.identity_surface(&self.env);
+        self.assert_only_surface_changed_for(&surface, before, after, step);
+    }
+
+    /// `assert_only_surface_changed` for any provider's declared surface. Since the walk covers
+    /// all of HOME and every Keychain item, one provider's surface also proves that its
+    /// commands left every other provider's state untouched (§15.3).
+    pub fn assert_only_surface_changed_for(
+        &self,
+        surface: &IdentitySurface,
+        before: &HomeSnapshot,
+        after: &HomeSnapshot,
+        step: &str,
+    ) {
         let data_dir = self.env.data_dir();
         let json_keys: BTreeMap<PathBuf, Vec<String>> = surface
             .json_keys
@@ -853,5 +867,82 @@ impl Fx {
                 assert_eq!(b, a, "{step}: Keychain item {key:?} changed");
             }
         }
+    }
+}
+
+/// One engine with Claude Code and the test-only `FakeAgent` registered over one Env, Keychain,
+/// store and `ScriptedHttp` (§15.2). `fx` is the Claude Code fixture it is built on: `fx.engine`
+/// sees Claude Code alone but shares this engine's store and vault, so `fx.add` and
+/// `fx.login` still set up Claude Code logins.
+pub struct FakeFx {
+    pub fx: Fx,
+    pub fake: Arc<FakeAgent>,
+    pub engine: Engine,
+}
+
+impl FakeFx {
+    pub fn new() -> Self {
+        let fx = Fx::new();
+        let fake = Arc::new(FakeAgent::new().with_lock_budget(Duration::from_secs(2)));
+        let engine = Engine::new(EngineConfig {
+            env: fx.env.clone(),
+            registry: ProviderRegistry::new()
+                .with(fx.cc.clone())
+                .with(fake.clone()),
+            vault: Vault::new(Box::new(KeychainVault::new(fx.kc.clone()))),
+            oracle: fx.oracle.clone(),
+            clock: fx.clock.clone(),
+            default_provider: ProviderId::new(CLAUDE_CODE),
+            http: fx.http.clone(),
+        });
+        FakeFx { fx, fake, engine }
+    }
+
+    pub fn fake_provider(&self) -> ProviderId {
+        ProviderId::new(FAKE_AGENT)
+    }
+
+    /// What logging in to FakeAgent as `handle`, in workspace `ws`, leaves behind.
+    pub fn fake_login(&self, handle: &str, token: &str, renew: &str) {
+        tagteam_fake::login(&self.fx.env, handle, "ws", token, renew);
+    }
+
+    pub fn fake_add_options(&self) -> AddOptions {
+        AddOptions {
+            provider: self.fake_provider(),
+            position: None,
+            alias: None,
+            yes: false,
+        }
+    }
+
+    /// Logs in to FakeAgent as `handle` and captures the login (§10.1).
+    pub fn fake_add(&self, handle: &str, token: &str, renew: &str) -> AccountId {
+        self.fake_login(handle, token, renew);
+        self.engine
+            .add_live(self.fake_add_options())
+            .unwrap()
+            .account
+            .id
+    }
+
+    /// A manual `switch` to a FakeAgent account.
+    pub fn switch_fake(&self, id: &AccountId) -> SwitchOutcome {
+        self.engine
+            .switch(SwitchRequest {
+                provider: self.fake_provider(),
+                target: SwitchTarget::Account(id.clone()),
+                force: false,
+                source: "cli",
+            })
+            .unwrap()
+    }
+
+    /// The label of FakeAgent's live login, if any.
+    pub fn fake_live_label(&self) -> Option<String> {
+        self.fake
+            .live_identity(&self.fx.env)
+            .present()
+            .map(|i| i.label)
     }
 }
