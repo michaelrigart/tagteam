@@ -1,0 +1,22 @@
+{
+  "status": 200,
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": {
+    "token_type": "Bearer",
+    "access_token": "sk-ant-oat01-synthetic-access-token",
+    "expires_in": 28800,
+    "refresh_token": "sk-ant-ort01-synthetic-refresh-token",
+    "refresh_token_expires_in": 7776000,
+    "scope": "user:inference user:profile",
+    "account": {
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "email_address": "probe1@example.com"
+    },
+    "organization": {
+      "uuid": "00000000-0000-4000-8000-000000000002"
+    }
+  },
+  "synthetic": true
+}
