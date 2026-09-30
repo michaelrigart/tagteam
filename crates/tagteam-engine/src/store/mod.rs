@@ -61,6 +61,7 @@ pub struct AccountRow {
     pub replacing_fp: Option<String>,
     pub quarantine_reason: Option<String>,
     pub quarantine_fp: Option<String>,
+    pub quarantine_at: Option<i64>,
     pub added_at: i64,
 }
 
@@ -173,10 +174,14 @@ pub struct Store {
 
 const ACCOUNT_COLUMNS: &str = "id, provider, position, identity_key, label, email, org_uuid, org_name, \
     account_uuid, kind, alias, disabled, identity_json, login_expires_at, login_epoch, replacing_fp, \
-    quarantine_reason, quarantine_fp, added_at";
+    quarantine_reason, quarantine_fp, quarantine_at, added_at";
 
-/// Installs a login's identity fields and clears any quarantine (§9.3, §12.5): shared by
-/// `update_login` and the replacement `finish_replacement` records, which land the same fields.
+/// Installs a login's identity fields and clears any quarantine: shared by `update_login` and
+/// the replacement `finish_replacement` records, which land the same fields. Clearing here is
+/// §7.4's rule, not an exception to it. Every caller installs a login that replaces the vault's:
+/// `add`, `add-token` and `import` clear a quarantine explicitly, and the switch's outgoing
+/// capture only ever writes a generation whose fingerprint differs from the vault's (it is not
+/// `Ours`, §9.4 step 4).
 const APPLY_LOGIN_SQL: &str = "UPDATE accounts SET identity_key = ?2, label = ?3, email = ?4, org_uuid = ?5, \
     org_name = ?6, account_uuid = COALESCE(?7, account_uuid), kind = ?8, identity_json = ?9, \
     login_expires_at = ?10, quarantine_reason = NULL, quarantine_fp = NULL, quarantine_at = NULL WHERE id = ?1";
@@ -222,6 +227,7 @@ fn account_from_row(r: &Row<'_>) -> rusqlite::Result<AccountRow> {
         replacing_fp: r.get("replacing_fp")?,
         quarantine_reason: r.get("quarantine_reason")?,
         quarantine_fp: r.get("quarantine_fp")?,
+        quarantine_at: r.get("quarantine_at")?,
         added_at: r.get("added_at")?,
     })
 }
@@ -707,6 +713,45 @@ impl Store {
         self.exec(
             "UPDATE accounts SET account_uuid = ?2 WHERE id = ?1 AND account_uuid IS NULL",
             &[&id.as_str(), &uuid],
+        )?;
+        Ok(())
+    }
+
+    /// §7.4: one strike, bound to the fingerprint that was sent.
+    pub fn set_quarantine(
+        &self,
+        id: &AccountId,
+        reason: &str,
+        fp: &str,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        let n = self.exec(
+            "UPDATE accounts SET quarantine_reason = ?2, quarantine_fp = ?3, quarantine_at = ?4 \
+             WHERE id = ?1",
+            &[&id.as_str(), &reason, &fp, &at],
+        )?;
+        if n == 0 {
+            Err(StoreError::NoSuchAccount)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Clears the quarantine; `true` when there was one.
+    pub fn clear_quarantine(&self, id: &AccountId) -> Result<bool, StoreError> {
+        let n = self.exec(
+            "UPDATE accounts SET quarantine_reason = NULL, quarantine_fp = NULL, quarantine_at = NULL \
+             WHERE id = ?1 AND quarantine_reason IS NOT NULL",
+            &[&id.as_str()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The login's own expiry (CC: `refreshTokenExpiresAt`), after a new generation lands.
+    pub fn set_login_expires_at(&self, id: &AccountId, at: Option<i64>) -> Result<(), StoreError> {
+        self.exec(
+            "UPDATE accounts SET login_expires_at = ?2 WHERE id = ?1",
+            &[&id.as_str(), &at],
         )?;
         Ok(())
     }

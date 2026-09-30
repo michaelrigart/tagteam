@@ -546,18 +546,12 @@ impl Fx {
             .unwrap();
     }
 
-    /// Directly quarantines an account row. There is no public writer for this yet (a later
-    /// task adds one); a second connection to the same on-disk store, mirroring
-    /// `tests/store.rs`, is the only way a fixture can prime this state today.
+    /// Quarantines an account row directly, bound to `fp` (§7.4).
     pub fn quarantine(&self, id: &AccountId, reason: &str, fp: &str) {
-        self.engine.store().unwrap(); // ensures the db file exists and is migrated
-        let path = self.env.data_dir().join("tagteam.db");
-        rusqlite::Connection::open(path)
+        self.engine
+            .store()
             .unwrap()
-            .execute(
-                "UPDATE accounts SET quarantine_reason = ?2, quarantine_fp = ?3, quarantine_at = 1 WHERE id = ?1",
-                rusqlite::params![id.as_str(), reason, fp],
-            )
+            .set_quarantine(id, reason, fp, 1)
             .unwrap();
     }
 

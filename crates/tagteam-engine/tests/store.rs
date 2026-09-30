@@ -500,3 +500,51 @@ fn open_existing_does_not_recreate_a_removed_database() {
     assert!(Store::open_existing(&path).unwrap().is_none());
     assert!(!path.exists());
 }
+
+#[test]
+fn quarantines_are_set_bound_to_a_fingerprint_and_cleared() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    s.set_quarantine(&a, "invalid_grant", "sha256:sent", 42)
+        .unwrap();
+    let row = s.account(&a).unwrap().unwrap();
+    assert_eq!(
+        (
+            row.quarantine_reason.as_deref(),
+            row.quarantine_fp.as_deref(),
+            row.quarantine_at
+        ),
+        (Some("invalid_grant"), Some("sha256:sent"), Some(42))
+    );
+    assert!(s.clear_quarantine(&a).unwrap(), "one was set");
+    assert!(!s.clear_quarantine(&a).unwrap(), "nothing left to clear");
+    let row = s.account(&a).unwrap().unwrap();
+    assert_eq!(
+        (row.quarantine_reason, row.quarantine_fp, row.quarantine_at),
+        (None, None, None)
+    );
+    assert!(matches!(
+        s.set_quarantine(
+            &AccountId::from_string("nobody"),
+            "invalid_grant",
+            "sha256:x",
+            1
+        ),
+        Err(StoreError::NoSuchAccount)
+    ));
+}
+
+#[test]
+fn login_expiry_is_recorded_on_its_own() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    s.set_login_expires_at(&a, Some(1_797_000_000_000)).unwrap();
+    assert_eq!(
+        s.account(&a).unwrap().unwrap().login_expires_at,
+        Some(1_797_000_000_000)
+    );
+    s.set_login_expires_at(&a, None).unwrap();
+    assert_eq!(s.account(&a).unwrap().unwrap().login_expires_at, None);
+}

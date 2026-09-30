@@ -111,6 +111,7 @@ fn oracle_verdicts_need_a_positive_uuid_match() {
         replacing_fp: None,
         quarantine_reason: None,
         quarantine_fp: None,
+        quarantine_at: None,
         added_at: 0,
     };
     let id = |email: &str, uuid: &str| Identity {
