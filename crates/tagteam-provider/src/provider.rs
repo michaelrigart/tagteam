@@ -17,7 +17,7 @@ use crate::read::{Read, ReadError};
 
 /// A login's identity. `raw` is the provider-owned object stored in `identity_json`
 /// (CC: the `oauthAccount` object).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Identity {
     pub label: String,
     pub email: Option<String>,
@@ -25,6 +25,30 @@ pub struct Identity {
     pub org_name: Option<String>,
     pub account_uuid: Option<String>,
     pub raw: Value,
+}
+
+/// Stands in for a value `Debug` must not show.
+struct Redacted;
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// Emails, labels (CC: the email), organization names and the provider's raw object never reach
+/// `Debug`: logs identify accounts by position and ID (§4.4). Uuids name no one.
+impl fmt::Debug for Identity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Identity")
+            .field("label", &Redacted)
+            .field("email", &self.email.as_ref().map(|_| Redacted))
+            .field("org_uuid", &self.org_uuid)
+            .field("org_name", &self.org_name.as_ref().map(|_| Redacted))
+            .field("account_uuid", &self.account_uuid)
+            .field("raw", &Redacted)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -39,7 +63,7 @@ impl fmt::Debug for StoredLogin {
         f.debug_struct("StoredLogin")
             .field("kind", &self.kind)
             .field("secret", &format_args!("<{} bytes>", self.secret.len()))
-            .field("identity", &self.identity.label)
+            .field("identity", &self.identity)
             .finish()
     }
 }
@@ -486,6 +510,33 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_debug_shows_no_email_label_or_name() {
+        // L370, §4.4: logs identify accounts by position and ID, never by email.
+        let id = Identity {
+            label: "who@example.com".into(),
+            email: Some("who@example.com".into()),
+            org_uuid: "org-1".into(),
+            org_name: Some("Acme Holdings".into()),
+            account_uuid: Some("uuid-1".into()),
+            raw: serde_json::json!({"emailAddress": "who@example.com", "organizationName": "Acme Holdings"}),
+        };
+        let login = StoredLogin {
+            kind: "oauth".into(),
+            secret: b"s".to_vec(),
+            identity: id.clone(),
+        };
+        for shown in [format!("{id:?}"), format!("{login:?}")] {
+            assert!(!shown.contains("who@example.com"), "{shown}");
+            assert!(!shown.contains("Acme"), "{shown}");
+        }
+        let shown = format!("{id:?}");
+        assert!(
+            shown.contains("uuid-1") && shown.contains("org-1"),
+            "{shown}"
+        );
+    }
 
     #[test]
     fn an_unsplicable_config_names_the_file_and_the_providers_remedy() {
