@@ -344,10 +344,8 @@ fn needs_relogin(target: &AccountRow) -> EngineError {
     }
 }
 
-fn cannot_refresh(label: &str, why: &str) -> String {
-    format!(
-        "could not refresh {label} first ({why}); Claude Code will refresh it when it is online"
-    )
+fn cannot_refresh(app: &str, label: &str, why: &str) -> String {
+    format!("could not refresh {label} first ({why}); {app} will refresh it when it is online")
 }
 
 fn works_until_expiry(target: &AccountRow) -> String {
@@ -798,9 +796,11 @@ impl Engine {
             // Nothing was spent, or what was spent is lost either way; once the account is
             // live, the gate leaves its refresh to CC (§7.3 step 2).
             GateOutcome::Transient { kind, .. } => {
-                Freshened::Go(vec![cannot_refresh(label, &kind)])
+                Freshened::Go(vec![cannot_refresh(p.display_name(), label, &kind)])
             }
-            GateOutcome::Systemic(detail) => Freshened::Go(vec![cannot_refresh(label, &detail)]),
+            GateOutcome::Systemic(detail) => {
+                Freshened::Go(vec![cannot_refresh(p.display_name(), label, &detail)])
+            }
             // The successor is lost and the vault's generation is spent (§7.3 step 6): no
             // retry helps, and activating would hand CC a used refresh token.
             GateOutcome::Unpersisted => return Err(needs_relogin(target)),
@@ -809,15 +809,19 @@ impl Engine {
             // the row, and without it `guard_or_refuse` decides under the mutation lock (it
             // waits for a live holder, and recovers or refuses a dead one with the right
             // message).
-            GateOutcome::Owned(OwnedBy::Journal) => {
-                Freshened::Go(vec![cannot_refresh(label, "an unfinished switch names it")])
-            }
+            GateOutcome::Owned(OwnedBy::Journal) => Freshened::Go(vec![cannot_refresh(
+                p.display_name(),
+                label,
+                "an unfinished switch names it",
+            )]),
             // The gate found it live where planning did not (it became the live login, or the
             // live identity could not be read): never refreshed here. `rederive` plans the
             // self-switch again, and the warning is carried into its outcome.
-            GateOutcome::Owned(OwnedBy::Live) => {
-                Freshened::Go(vec![cannot_refresh(label, "it may be the live login")])
-            }
+            GateOutcome::Owned(OwnedBy::Live) => Freshened::Go(vec![cannot_refresh(
+                p.display_name(),
+                label,
+                "it may be the live login",
+            )]),
             // Unreachable before M4, which introduces sessions and provenance. M4 gives these
             // two the spec's `session-owned` and `profile-conflict` kinds (§7.2's table); until
             // then they refuse with `invalid-input`.

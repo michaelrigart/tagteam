@@ -356,3 +356,25 @@ fn a_dead_fake_agent_target_is_quarantined_and_refused_without_touching_claude_c
     );
     assert_eq!(ffx.fx.live_email().as_deref(), Some("cc@b.co"));
 }
+
+#[test]
+fn the_freshen_warning_names_the_provider_that_will_refresh() {
+    let ffx = FakeFx::new();
+    let alice = ffx.fake_add("alice", "tok-a", "renew-a");
+    ffx.fake_add("bob", "tok-b", "renew-b");
+    make_due(&ffx, &alice);
+    ffx.fx.http.push_json(
+        Method::Post,
+        &ffx.fake.renew_url(),
+        400,
+        json!({"error": "invalid_client"}),
+    );
+    let out = ffx.switch_fake(&alice);
+    assert!(out.switched, "{}", out.message);
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(
+        out.warnings[0].ends_with("); FakeAgent will refresh it when it is online"),
+        "{:?}",
+        out.warnings
+    );
+}
