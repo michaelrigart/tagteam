@@ -14,6 +14,8 @@ use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
 use crate::oracle::verdict;
+use crate::refresh::{GateOutcome, OwnedBy};
+use crate::rescue::RescueFile;
 use crate::store::{AccountRow, EventRow, JournalRow, Store};
 
 #[derive(Debug, Clone)]
@@ -69,6 +71,10 @@ pub struct SwitchOutcome {
 
 /// §9.4 step 1: after this many lock acquisitions that each found the plan outdated, abort.
 const ATTEMPTS: usize = 3;
+
+/// §7.2: a target whose access token expires within this many milliseconds is refreshed
+/// before it is activated. Twice CC's own 5-minute buffer.
+const FRESHEN_WINDOW_MS: i64 = 10 * 60 * 1000;
 
 /// §9.4 step 3: never back up an empty value, because a Keychain timeout can look empty. It is
 /// reported as unreadable, on either axis: the value could not be read with confidence.
@@ -276,6 +282,8 @@ struct Plan {
     /// A rotation's accounts the walk read and passed over before its pick (§9.3). Empty for a
     /// direct target.
     walked: Vec<AccountId>,
+    /// What freshening the target decided to tell the user (§7.2), carried into the outcome.
+    warnings: Vec<String>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -297,6 +305,8 @@ struct Locked {
     live_identity: Option<Identity>,
     target: AccountRow,
     outgoing: Option<AccountRow>,
+    /// What the locked re-read decided to tell the user (§9.4 step 1).
+    warnings: Vec<String>,
 }
 
 /// What `rederive` found under the locks.
@@ -311,6 +321,35 @@ enum Rederived {
 
 fn already_active(target: &AccountRow) -> String {
     format!("{} is already active", target.label)
+}
+
+/// What freshening a plan's target decided (§7.2, the manual-switch table).
+enum Freshened {
+    /// Go ahead, with these warnings for the outcome.
+    Go(Vec<String>),
+    /// A rotation's pick turned out dead and is quarantined now: plan again; the walk skips
+    /// it (§9.3).
+    Replan,
+}
+
+fn needs_relogin(target: &AccountRow) -> EngineError {
+    EngineError::NeedsRelogin {
+        position: target.position,
+        label: target.label.clone(),
+    }
+}
+
+fn cannot_refresh(label: &str, why: &str) -> String {
+    format!(
+        "could not refresh {label} first ({why}); Claude Code will refresh it when it is online"
+    )
+}
+
+fn works_until_expiry(target: &AccountRow) -> String {
+    format!(
+        "{} (position {}) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires",
+        target.label, target.position
+    )
 }
 
 /// §9.4 step 10: puts back what the switch wrote, in reverse order, then the journal row's
@@ -646,7 +685,146 @@ impl Engine {
             self_switch,
             hint,
             walked,
+            warnings: vec![],
         }))
+    }
+
+    /// §7.2: refreshes the plan's target through the gate when its access token is about to
+    /// expire. This runs before any lock is taken (§4.3). A rotation whose pick turns out dead
+    /// plans again from the current roster, which now skips it; every round quarantines one
+    /// more account, so the rounds are bounded by the roster.
+    fn freshen_plan(
+        &self,
+        p: &dyn Provider,
+        store: &Store,
+        req: &SwitchRequest,
+        mut plan: Plan,
+    ) -> Result<Planned, EngineError> {
+        for _ in 0..=store.accounts(&req.provider)?.len() {
+            match self.freshen(p, req, &plan)? {
+                Freshened::Go(warnings) => {
+                    plan.warnings.extend(warnings);
+                    return Ok(Planned::Go(plan));
+                }
+                Freshened::Replan => {
+                    plan = match self.plan(p, store, req, Ask::Reuse(plan.hint.take()))? {
+                        Planned::Done(outcome) => return Ok(Planned::Done(outcome)),
+                        Planned::Go(next) => next,
+                    };
+                }
+            }
+        }
+        Err(EngineError::InvalidInput(
+            "no account in the rotation could be refreshed".into(),
+        ))
+    }
+
+    /// §7.2: whether `vault`'s access token expires within the freshen window. An unknown or
+    /// non-numeric expiry is never due.
+    fn due(&self, p: &dyn Provider, vault: &[u8]) -> bool {
+        p.access_expires_at(vault)
+            .is_some_and(|at| self.now_ms() + FRESHEN_WINDOW_MS >= at)
+    }
+
+    /// One row of §7.2's manual-switch table, for the plan's target.
+    fn freshen(
+        &self,
+        p: &dyn Provider,
+        req: &SwitchRequest,
+        plan: &Plan,
+    ) -> Result<Freshened, EngineError> {
+        let target = &plan.target;
+        // A self-switch activates what is already live: only CC, or §7.5, refreshes that token.
+        if plan.self_switch || !p.kind_traits(&target.kind).refreshable {
+            return Ok(Freshened::Go(vec![]));
+        }
+        let vault = self.read_target(target)?;
+        let due = self.due(p, &vault);
+        let rotation = matches!(req.target, SwitchTarget::Rotation);
+        if target.quarantine_reason.is_some() {
+            // Never refreshed (§7.4): usable only while its current access token lasts.
+            return match (due, rotation) {
+                (false, _) => Ok(Freshened::Go(vec![works_until_expiry(target)])),
+                (true, true) => Ok(Freshened::Replan),
+                (true, false) => Err(needs_relogin(target)),
+            };
+        }
+        if !due {
+            return Ok(Freshened::Go(vec![]));
+        }
+        let label = target.label.as_str();
+        let pending = |detail: String| EngineError::RescuePending {
+            position: target.position,
+            label: target.label.clone(),
+            detail,
+        };
+        Ok(match self.refresh_stored(p, &target.id, &vault)? {
+            // Busy: another process is refreshing it now. The account lock this switch waits
+            // for, and the pending-rescue settle under it (§6.2), pick up that refresh.
+            GateOutcome::Refreshed(_) | GateOutcome::AlreadyFresh(_) | GateOutcome::Busy => {
+                Freshened::Go(vec![])
+            }
+            GateOutcome::Dead(_) if rotation => Freshened::Replan,
+            GateOutcome::Dead(_) => return Err(needs_relogin(target)),
+            GateOutcome::Transient { rescued: true, .. } => {
+                return Err(pending(
+                    "the refresh succeeded, but the vault could not be written; the new token is in rescue/".into(),
+                ));
+            }
+            GateOutcome::Transient { kind, .. } if kind == "rescue-unreadable" => {
+                // The gate reports both an unreadable rescue file and a failed adoption of a
+                // readable one under this kind; only unreadable files can be named. The error's
+                // own text adds "retry once the vault can be written".
+                let damaged: Vec<String> = self
+                    .rescues_for(&target.id)
+                    .into_iter()
+                    .filter_map(|r| match r {
+                        RescueFile::Unreadable { path, .. } => Some(path.display().to_string()),
+                        RescueFile::Entry(_) => None,
+                    })
+                    .collect();
+                let detail = if damaged.is_empty() {
+                    "a pending rescue could not be adopted".to_owned()
+                } else {
+                    format!("{} cannot be read", damaged.join(", "))
+                };
+                return Err(pending(detail));
+            }
+            // Nothing was spent, or what was spent is lost either way; once the account is
+            // live, the gate leaves its refresh to CC (§7.3 step 2).
+            GateOutcome::Transient { kind, .. } => {
+                Freshened::Go(vec![cannot_refresh(label, &kind)])
+            }
+            GateOutcome::Systemic(detail) => Freshened::Go(vec![cannot_refresh(label, &detail)]),
+            // The successor is lost and the vault's generation is spent (§7.3 step 6): no
+            // retry helps, and activating would hand CC a used refresh token.
+            GateOutcome::Unpersisted => return Err(needs_relogin(target)),
+            // The forced switch is about to supersede the undecidable row that names it.
+            GateOutcome::Owned(OwnedBy::Journal) if req.force => {
+                Freshened::Go(vec![cannot_refresh(
+                    label,
+                    "an interrupted switch names it",
+                )])
+            }
+            GateOutcome::Owned(OwnedBy::Journal) => {
+                return Err(EngineError::InterruptedSwitch(req.provider.to_string()));
+            }
+            // It became the live login meanwhile: `rederive` plans the self-switch again.
+            GateOutcome::Owned(OwnedBy::Live) => Freshened::Go(vec![]),
+            // Unreachable before M4, which introduces sessions and provenance. M4 gives these
+            // two the spec's `session-owned` and `profile-conflict` kinds (§7.2's table); until
+            // then they refuse with `invalid-input`.
+            GateOutcome::Owned(OwnedBy::Session) => {
+                return Err(EngineError::InvalidInput(format!(
+                    "{label} is in use by a `tagteam run` session; exit it first"
+                )));
+            }
+            GateOutcome::Conflict => {
+                return Err(EngineError::InvalidInput(format!(
+                    "{label}'s session profile holds a login that conflicts with the vault; refusing to activate it"
+                )));
+            }
+        })
     }
 
     /// §5: with no store there is nothing to activate, and nothing is created; an unmanaged
@@ -687,9 +865,13 @@ impl Engine {
         let Some(store) = self.existing_store()? else {
             return self.without_store(p, &req);
         };
+        // §7.2: before the mutation lock, the only place a manual switch may use the network.
         let mut plan = match self.plan(p, &store, &req, Ask::Oracle)? {
             Planned::Done(outcome) => return Ok(outcome),
-            Planned::Go(plan) => plan,
+            Planned::Go(plan) => match self.freshen_plan(p, &store, &req, plan)? {
+                Planned::Done(outcome) => return Ok(outcome),
+                Planned::Go(plan) => plan,
+            },
         };
         // Once, before the mutation lock: a test callback here may take that lock itself.
         hooks::point(self, "planned")?;
@@ -700,9 +882,19 @@ impl Engine {
         };
         for attempt in 1..=ATTEMPTS {
             if attempt > 1 {
+                // No freshen here: this runs under the mutation lock, where no network is
+                // allowed (§4.3). A pick that changed is activated with the vault's
+                // generation, and CC refreshes it.
+                let warnings = std::mem::take(&mut plan.warnings);
                 plan = match self.plan(p, &store, &req, Ask::Reuse(plan.hint.take()))? {
-                    Planned::Done(outcome) => return Ok(outcome),
-                    Planned::Go(plan) => plan,
+                    Planned::Done(mut outcome) => {
+                        outcome.warnings.extend(warnings);
+                        return Ok(outcome);
+                    }
+                    Planned::Go(mut next) => {
+                        next.warnings = warnings;
+                        next
+                    }
                 };
             }
             let (_, outgoing) = self.live_row(p, &store, &req.provider)?;
@@ -716,7 +908,10 @@ impl Engine {
                 Rederived::Go(locked) => {
                     return self.transact(p, &store, &plan, locked, &accounts, &locks, &req);
                 }
-                Rederived::Done(outcome) => return Ok(outcome),
+                Rederived::Done(mut outcome) => {
+                    outcome.warnings.extend(plan.warnings.clone());
+                    return Ok(outcome);
+                }
                 Rederived::Replan => {}
             }
             // `locks`, then `accounts`, are released here; the mutation lock is kept.
@@ -766,6 +961,21 @@ impl Engine {
         if !self.has_login(&target)? {
             return Ok(Rederived::Replan);
         }
+        // §9.4 step 1 (amended): a refresh that finished while this switch waited for the
+        // target's account lock may have quarantined it (§7.4 `successor_lost`). A target
+        // quarantined since planning follows §7.2's quarantined-target rule: a rotation plans
+        // again, and the walk skips it.
+        let mut warnings = Vec::new();
+        if target.quarantine_reason.is_some() && plan.target.quarantine_reason.is_none() {
+            if matches!(req.target, SwitchTarget::Rotation) {
+                return Ok(Rederived::Replan);
+            }
+            let vault = self.read_target(&target)?;
+            if self.due(p, &vault) {
+                return Err(needs_relogin(&target));
+            }
+            warnings.push(works_until_expiry(&target));
+        }
         let same_pick = match req.target {
             SwitchTarget::Account(_) => true,
             SwitchTarget::Rotation => self.rotation_pick_stands(store, plan, again.as_ref())?,
@@ -782,6 +992,7 @@ impl Engine {
                 live_identity,
                 target,
                 outgoing: again,
+                warnings,
             })
         } else {
             Rederived::Replan
@@ -819,6 +1030,7 @@ impl Engine {
             live_identity,
             target,
             outgoing,
+            warnings: locked_warnings,
         } = locked;
         let provider = &req.provider;
         let target_identity = p.parse_identity(&target.identity_json)?;
@@ -838,7 +1050,8 @@ impl Engine {
             .expect("the target is locked");
         self.settle_rescues(p, &target, target_lock)?;
 
-        let mut warnings = Vec::new();
+        let mut warnings = plan.warnings.clone();
+        warnings.extend(locked_warnings);
         // What steps 2 and 4 settle, and the vaults below: step 7's rule never saves it again.
         let mut held = Held::default();
         let target_secret = match outgoing.as_ref().filter(|_| !req.force) {

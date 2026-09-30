@@ -1095,3 +1095,8 @@ pub fn two_accounts(fx: &Fx) -> AccountId {
     fx.add("b@x.co", "rt-b");
     a
 }
+
+/// How many files `rescue/` holds; 0 when it does not exist.
+pub fn rescue_files(fx: &Fx) -> usize {
+    fs::read_dir(fx.env.data_dir().join("rescue")).map_or(0, |d| d.count())
+}

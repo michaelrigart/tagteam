@@ -50,6 +50,13 @@ pub enum EngineError {
          (for example a reused email); remove the stored account before adding this login"
     )]
     IdentityConflict { label: String },
+    /// A target whose stored refresh token can no longer be used: rejected (§7.4, it is
+    /// quarantined), or spent by a refresh whose successor could be stored nowhere (§7.3
+    /// step 6, `Unpersisted`). Only a new login brings it back.
+    #[error(
+        "{label} (position {position}) needs a new login: its stored refresh token can no longer be used; log in with `claude`, then run `tagteam add`"
+    )]
+    NeedsRelogin { position: u32, label: String },
     #[error("{0}")]
     InvalidInput(String),
     #[error("no account matches {0:?}")]
@@ -116,6 +123,7 @@ impl EngineError {
             EngineError::LiveMoved => "live-moved",
             EngineError::NeedsConfirmation { .. } => "needs-confirmation",
             EngineError::IdentityConflict { .. } => "identity-conflict",
+            EngineError::NeedsRelogin { .. } => "relogin-required",
             EngineError::InvalidInput(_) => "invalid-input",
             EngineError::NoSuchAccount(_) => "no-such-account",
             EngineError::Ambiguous { .. } => "ambiguous-account",
@@ -205,6 +213,13 @@ mod tests {
             (
                 EngineError::IdentityConflict { label: "a".into() },
                 "identity-conflict",
+            ),
+            (
+                EngineError::NeedsRelogin {
+                    position: 1,
+                    label: "a@b.co".into(),
+                },
+                "relogin-required",
             ),
             (EngineError::InvalidInput("x".into()), "invalid-input"),
             (EngineError::NoSuchAccount("x".into()), "no-such-account"),
