@@ -573,8 +573,8 @@ fn profile_requests(fx: &Fx) -> usize {
 
 #[test]
 fn an_expired_call_leaves_no_cached_skip_to_shadow_a_later_corroboration() {
-    // Task 7's carried check: `CachingOracle` remembers a no-answer under the lineage
-    // fingerprint. An active refresh of an expired token never asks the oracle, so it caches
+    // Task 7's carried check: `CachingOracle` remembers a no-answer under the exact credential
+    // bytes. An active refresh of an expired token never asks the oracle, so it caches
     // nothing; a later call for the same refresh token (a reply that keeps the lineage) with a
     // valid access token still gets its own corroboration.
     let fx = Fx::new();

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tagteam_core::OracleVerdict;
+use tagteam_core::{Fingerprint, OracleVerdict};
 use tagteam_provider::http::Http;
 use tagteam_provider::{Clock, Credential, Identity, Provider};
 
@@ -44,8 +44,10 @@ impl Oracle for HttpOracle {
     }
 }
 
-/// Asks `inner` at most once per process for a given credential (§7.6), keyed by provider and
-/// fingerprint. No answer is remembered too: a retry within one command would only repeat a
+/// Asks `inner` at most once per process for a given credential (§7.6), keyed by provider and a
+/// hash of the credential's exact bytes, never the raw bytes. It keys on the exact bytes, not the
+/// generation, because a skip for one access token must not answer for another under the same
+/// refresh token. No answer is remembered too: a retry within one command would only repeat a
 /// failure the command already treats as advisory. The lock is never held across `inner`.
 pub struct CachingOracle<O: Oracle> {
     inner: O,
@@ -63,10 +65,12 @@ impl<O: Oracle> CachingOracle<O> {
 
 impl<O: Oracle> Oracle for CachingOracle<O> {
     fn resolve(&self, provider: &dyn Provider, credential: &Credential) -> Option<Identity> {
-        let Some(fp) = provider.fingerprint(credential.bytes()) else {
-            return self.inner.resolve(provider, credential);
-        };
-        let key = (provider.id().to_string(), fp.as_str().to_owned());
+        let key = (
+            provider.id().to_string(),
+            Fingerprint::of_secret(credential.bytes())
+                .as_str()
+                .to_owned(),
+        );
         if let Some(answer) = self.answers.lock().unwrap().get(&key) {
             return answer.clone();
         }

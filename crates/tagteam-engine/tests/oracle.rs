@@ -73,7 +73,7 @@ impl Oracle for Counting {
 
 #[test]
 fn a_process_asks_at_most_once_per_credential() {
-    // §7.6: keyed by the credential's fingerprint; no answer is remembered too.
+    // §7.6: keyed by the credential's exact bytes; no answer is remembered too.
     let fx = Fx::new();
     let calls = Arc::new(AtomicUsize::new(0));
     let cache = CachingOracle::new(Counting(calls.clone()));
@@ -91,6 +91,30 @@ fn a_process_asks_at_most_once_per_credential() {
     assert!(cache.resolve(fx.cc.as_ref(), &one).is_none());
     assert!(cache.resolve(fx.cc.as_ref(), &two).is_none());
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn a_new_access_token_under_the_same_refresh_token_is_asked_again() {
+    // A skip for one access token must not answer for another: the key is the exact bytes.
+    let fx = Fx::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let cache = CachingOracle::new(Counting(calls.clone()));
+    let with_access = |at: &str| {
+        let mut json = Fx::credential_json("a@x.co", "rt-1");
+        json["claudeAiOauth"]["accessToken"] = at.into();
+        Credential::fresh(json.to_string().into_bytes())
+    };
+    let old = with_access("at-old");
+    let new = with_access("at-new");
+    assert!(cache.resolve(fx.cc.as_ref(), &old).is_none());
+    assert!(cache.resolve(fx.cc.as_ref(), &new).is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        cache
+            .resolve(fx.cc.as_ref(), &with_access("at-new"))
+            .is_none()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "identical bytes ask once");
 }
 
 #[test]
