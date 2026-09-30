@@ -1030,7 +1030,8 @@ one provider: a switch never crosses providers.
 unquarantined rows with an `identity_json`. With fewer than two, the result is
 `only-one-account`. Otherwise it walks the positions from the anchor and reads each account's
 vault only until it finds one with a credential. If the walk finds none, the result is again
-`only-one-account`. Under the locks, only the chosen account is read again.
+`only-one-account`, or `no-valid-target` when there is no live login to anchor on (a fresh
+machine, §9.2). Under the locks, only the chosen account is read again.
 - An `Unreadable` vault met before the pick could have been the pick, so the switch fails and
   names that account (position and label). Accounts after the pick are never read.
 - A Dead verdict while freshening the pick quarantines it, and the walk continues (§7.2).
