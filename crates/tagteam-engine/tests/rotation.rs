@@ -139,3 +139,26 @@ fn with_no_live_login_a_quarantined_active_account_is_skipped() {
     log_out(&fx);
     assert_eq!(rotate(&fx).unwrap().to.unwrap().id, a);
 }
+
+#[test]
+fn an_account_the_walk_skipped_is_not_read_again_under_the_locks() {
+    // §9.3: under the locks only the chosen account is read again. a's vault is empty, so the
+    // walk reads it once while planning and passes over it; re-deriving the rotation under the
+    // locks decides from the store alone and does not read it a second time.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c"); // live
+    fx.kc.delete(SERVICE, a.as_str()).unwrap();
+    let reads = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = reads.clone();
+    let engine = fx.engine_with_vault_probe(move |key| seen.lock().unwrap().push(key.to_owned()));
+    let out = engine.switch(fx.rotation_request(false)).unwrap();
+    assert_eq!(out.to.unwrap().id, b);
+    let reads = reads.lock().unwrap();
+    let of_a = reads
+        .iter()
+        .filter(|key| key.starts_with(a.as_str()))
+        .count();
+    assert_eq!(of_a, 1, "{reads:?}");
+}

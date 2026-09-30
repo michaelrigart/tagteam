@@ -273,6 +273,9 @@ struct Plan {
     strategy: &'static str,
     self_switch: bool,
     hint: Option<OracleHint>,
+    /// A rotation's accounts the walk read and passed over before its pick (§9.3). Empty for a
+    /// direct target.
+    walked: Vec<AccountId>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -284,7 +287,8 @@ enum Planned {
 /// A bare `switch` (§9.2, §9.3): where the rotation goes, or why it stays.
 #[allow(clippy::large_enum_variant)]
 enum Rotation {
-    To(AccountRow),
+    /// The pick, and the accounts the walk read and passed over before it.
+    To(AccountRow, Vec<AccountId>),
     Stay(SwitchReason, &'static str),
 }
 
@@ -461,28 +465,22 @@ impl Engine {
         Ok((live, row))
     }
 
-    /// §9.3 rotation, reading the vault lazily.
-    ///
-    /// - The candidates are counted from the store: with a managed live anchor and fewer than
-    ///   two of them, it stays put (§9.2).
-    /// - The walk starts after the live account when it is managed (`live_row`), even if the
-    ///   store's active account disagrees (§6.1: the live identity wins). With no live login,
-    ///   or an unmanaged one, it starts at the store's active account if that is a candidate,
-    ///   then goes on from the first position.
-    /// - Each vault is read only when the walk reaches it, and the walk stops at the first one
-    ///   that holds a credential. An unreadable one before that could have been the pick, so
-    ///   it fails naming the account; no account after the pick is ever read.
-    fn rotation(
+    /// §9.3: the rotation's candidates in walk order, from the store alone. `None` when the
+    /// live anchor is managed and fewer than two accounts qualify (§9.2). The walk starts after
+    /// the live account when it is managed (`live_row`), even if the store's active account
+    /// disagrees (§6.1: the live identity wins). With no live login, or an unmanaged one, it
+    /// starts at the store's active account if that is a candidate, then goes on from the first
+    /// position.
+    fn candidate_order(
         &self,
         store: &Store,
         provider: &ProviderId,
         live_row: Option<&AccountRow>,
-    ) -> Result<Rotation, EngineError> {
-        const ONLY_ONE: &str = "there is only one switchable account";
+    ) -> Result<Option<Vec<AccountRow>>, EngineError> {
         let accounts = store.accounts(provider)?;
-        let candidates: Vec<&AccountRow> = accounts.iter().filter(|a| is_candidate(a)).collect();
+        let candidates: Vec<AccountRow> = accounts.into_iter().filter(is_candidate).collect();
         if live_row.is_some() && candidates.len() < 2 {
-            return Ok(Rotation::Stay(SwitchReason::OnlyOneAccount, ONLY_ONE));
+            return Ok(None);
         }
         let positions: Vec<u32> = candidates.iter().map(|a| a.position).collect();
         let order: Vec<u32> = match live_row {
@@ -501,18 +499,61 @@ impl Engine {
                 }
             }
         };
-        for position in order {
-            let Some(row) = candidates.iter().find(|a| a.position == position) else {
-                continue;
-            };
-            if self.vault_holds_login(row)? {
-                return Ok(Rotation::To((*row).clone()));
+        Ok(Some(
+            order
+                .into_iter()
+                .filter_map(|pos| candidates.iter().find(|a| a.position == pos).cloned())
+                .collect(),
+        ))
+    }
+
+    /// §9.3 rotation, reading the vault lazily.
+    ///
+    /// - The candidates are counted from the store: with a managed live anchor and fewer than
+    ///   two of them, it stays put (§9.2).
+    /// - Each vault is read only when the walk reaches it, and the walk stops at the first one
+    ///   that holds a credential. An unreadable one before that could have been the pick, so
+    ///   it fails naming the account; no account after the pick is ever read.
+    fn rotation(
+        &self,
+        store: &Store,
+        provider: &ProviderId,
+        live_row: Option<&AccountRow>,
+    ) -> Result<Rotation, EngineError> {
+        const ONLY_ONE: &str = "there is only one switchable account";
+        let Some(order) = self.candidate_order(store, provider, live_row)? else {
+            return Ok(Rotation::Stay(SwitchReason::OnlyOneAccount, ONLY_ONE));
+        };
+        let mut walked = Vec::new();
+        for row in order {
+            if self.vault_holds_login(&row)? {
+                return Ok(Rotation::To(row, walked));
             }
+            walked.push(row.id);
         }
         Ok(match live_row {
             Some(_) => Rotation::Stay(SwitchReason::OnlyOneAccount, ONLY_ONE),
             None => Rotation::Stay(SwitchReason::NoValidTarget, "no account can be activated"),
         })
+    }
+
+    /// Under the locks: whether the plan's rotation pick still stands, decided from the store
+    /// alone (§9.3 "under the locks only the chosen account is read again"). It does when the
+    /// pick is still a candidate and every candidate the new walk order puts before it is one
+    /// the planning walk already read and passed over.
+    fn rotation_pick_stands(
+        &self,
+        store: &Store,
+        plan: &Plan,
+        anchor: Option<&AccountRow>,
+    ) -> Result<bool, EngineError> {
+        let Some(order) = self.candidate_order(store, &plan.target.provider, anchor)? else {
+            return Ok(false);
+        };
+        Ok(order
+            .iter()
+            .position(|r| r.id == plan.target.id)
+            .is_some_and(|at| order[..at].iter().all(|r| plan.walked.contains(&r.id))))
     }
 
     /// §9.4 "Before locking": asks the oracle about the outgoing live secret when it is not
@@ -555,6 +596,7 @@ impl Engine {
                 unmanaged_message(email),
             ));
         }
+        let mut walked = Vec::new();
         let target = match &req.target {
             // A switch never crosses providers (§9.3).
             SwitchTarget::Account(id) => store
@@ -563,7 +605,10 @@ impl Engine {
                 .ok_or_else(|| EngineError::NoSuchAccount(id.to_string()))?,
             SwitchTarget::Rotation => {
                 match self.rotation(store, &req.provider, live_row.as_ref())? {
-                    Rotation::To(a) => a,
+                    Rotation::To(a, passed) => {
+                        walked = passed;
+                        a
+                    }
                     Rotation::Stay(reason, message) => return Ok(done(reason, message.into())),
                 }
             }
@@ -600,6 +645,7 @@ impl Engine {
             strategy,
             self_switch,
             hint,
+            walked,
         }))
     }
 
@@ -665,18 +711,8 @@ impl Engine {
                 ids.push(&o.id);
             }
             let accounts = self.lock_accounts(&ids)?;
-            // Re-decided here rather than under CC's locks: a rotation reads every account's
-            // vault entry, which must not lengthen CC's wait. The mutation lock keeps the
-            // roster still, and `rederive` checks under CC's locks that the live row it is
-            // anchored on has not moved.
-            let rotation = match req.target {
-                SwitchTarget::Rotation => {
-                    Some(self.rotation(&store, &req.provider, outgoing.as_ref())?)
-                }
-                SwitchTarget::Account(_) => None,
-            };
             let locks = p.lock_live(&self.env, &guard)?;
-            match self.rederive(p, &store, &req, &plan, outgoing.as_ref(), rotation)? {
+            match self.rederive(p, &store, &req, &plan, outgoing.as_ref())? {
                 Rederived::Go(locked) => {
                     return self.transact(p, &store, &plan, locked, &accounts, &locks, &req);
                 }
@@ -698,7 +734,6 @@ impl Engine {
         req: &SwitchRequest,
         plan: &Plan,
         outgoing: Option<&AccountRow>,
-        rotation: Option<Rotation>,
     ) -> Result<Rederived, EngineError> {
         let (live_identity, again) = self.live_row(p, store, &req.provider)?;
         // A login that became unmanaged is §9.2's no-op; a target removed meanwhile is
@@ -723,13 +758,12 @@ impl Engine {
                 None,
             )));
         }
-        // The whole rotation decision, recomputed from the current roster and anchor (§9.2,
-        // §9.3), including the fewer-than-two case. Its anchor is `outgoing`, which is `again`
-        // when anything proceeds.
-        let same_pick = match rotation {
-            None => true,
-            Some(Rotation::To(r)) => r.id == target.id,
-            Some(Rotation::Stay(..)) => false,
+        // The rotation decision, recomputed from the store alone (§9.2, §9.3), including the
+        // fewer-than-two case; no vault but the target's is read here. Its anchor is `again`,
+        // which is `outgoing` when anything proceeds.
+        let same_pick = match req.target {
+            SwitchTarget::Account(_) => true,
+            SwitchTarget::Rotation => self.rotation_pick_stands(store, plan, again.as_ref())?,
         };
         // Account-lock acquisition may have finished a pending replacement (§12.5), changing
         // the outgoing account's kind or identity: compare the rows, not just their IDs.
