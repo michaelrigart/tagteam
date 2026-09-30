@@ -1,6 +1,6 @@
 use std::fs;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
@@ -8,8 +8,8 @@ use tagteam_cc::provider::ClaudeCode;
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service, read_services};
 use tagteam_core::Fingerprint;
 use tagteam_provider::{
-    Capabilities, Env, FakeKeychain, KindTraits, MutationGuard, Provider, ProviderError, Read,
-    SecretStore, StoredLogin,
+    Capabilities, Env, FakeKeychain, KindTraits, LockError, MutationGuard, Provider, ProviderError,
+    Read, SecretStore, StoredLogin,
 };
 
 /// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
@@ -675,4 +675,92 @@ fn access_token_facts_come_from_the_access_token_not_the_lineage() {
     assert_eq!(f.cc.access_fingerprint(&setup), f.cc.fingerprint(&setup));
     assert_eq!(f.cc.access_expires_at(&setup), None);
     assert_eq!(f.cc.access_fingerprint(b"sk-ant-api03-k"), None);
+}
+
+#[test]
+fn claude_code_s_live_locks_share_the_nine_second_budget_of_section_9_1() {
+    assert_eq!(fx().cc.live_lock_budget(), Duration::from_secs(9));
+}
+
+#[test]
+fn the_stages_are_taken_separately_and_released_config_first() {
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let cred =
+        f.cc.lock_credentials(&f.env, &g, Duration::from_secs(1))
+            .unwrap();
+    assert!(paths.refresh_lock.is_dir() && paths.legacy_lock().is_dir());
+    assert!(
+        !paths.config_lock.exists(),
+        "credential locks alone never take it"
+    );
+    let live =
+        f.cc.lock_config(&f.env, cred, Duration::from_secs(1))
+            .unwrap();
+    assert!(paths.config_lock.is_dir());
+    assert!(live.check_owned().is_ok());
+    drop(live);
+    assert!(
+        !paths.refresh_lock.exists()
+            && !paths.legacy_lock().exists()
+            && !paths.config_lock.exists()
+    );
+}
+
+#[test]
+fn a_held_config_lock_releases_the_credential_locks_it_was_given() {
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    fs::create_dir(&paths.config_lock).unwrap(); // someone else holds it, freshly
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let cred =
+        f.cc.lock_credentials(&f.env, &g, Duration::from_millis(500))
+            .unwrap();
+    let start = Instant::now();
+    assert!(matches!(
+        f.cc.lock_config(&f.env, cred, Duration::from_millis(500)),
+        Err(ProviderError::Lock(LockError::Timeout(_)))
+    ));
+    assert!(start.elapsed() < Duration::from_millis(1500));
+    assert!(!paths.refresh_lock.exists() && !paths.legacy_lock().exists());
+    assert!(
+        paths.config_lock.is_dir(),
+        "the other holder's lock is left alone"
+    );
+}
+
+/// §9.1: one budget covers both stages. The legacy lock is held for most of a 2 s budget and a
+/// config lock for good, so the credential stage spends about 1.5 s. With one shared budget the
+/// config stage gets what remains, and `lock_live` gives up by ~2.5 s. A fresh budget per
+/// stage would take at least 3.5 s.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn lock_live_spends_one_budget_across_both_stages() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    fs::create_dir_all(env.home.join(".claude")).unwrap();
+    let kc = Arc::new(FakeKeychain::new());
+    let cc = ClaudeCode::with_store(
+        LiveStore::new(kc, Platform::MacOs).with_retry_delay(Duration::ZERO),
+    )
+    .with_lock_timeout(Duration::from_secs(2));
+    let paths = CcPaths::resolve(&env);
+    fs::create_dir(&paths.config_lock).unwrap();
+    fs::create_dir(paths.legacy_lock()).unwrap();
+    let legacy = paths.legacy_lock();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1500));
+        fs::remove_dir(legacy).unwrap();
+    });
+    let g = MutationGuard::acquire(&env, Duration::from_secs(1)).unwrap();
+    let start = Instant::now();
+    assert!(matches!(
+        cc.lock_live(&env, &g),
+        Err(ProviderError::Lock(LockError::Timeout(_)))
+    ));
+    let spent = start.elapsed();
+    release.join().unwrap();
+    assert!(spent < Duration::from_millis(3000), "{spent:?}");
+    assert!(!paths.refresh_lock.exists() && !paths.legacy_lock().exists());
 }

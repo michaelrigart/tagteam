@@ -2,6 +2,7 @@ use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
@@ -132,13 +133,14 @@ pub trait LiveLockSet: Send {
     fn check_owned(&self) -> Result<(), LockError>;
 }
 
-/// A provider's live locks. Only constructible from a held `MutationGuard` (§4.3).
-pub struct LiveLocks<'g> {
+/// A provider's credential locks, the first stage of its live locks (§4.3). Only
+/// constructible from a held `MutationGuard`.
+pub struct CredLocks<'g> {
     set: Box<dyn LiveLockSet + 'g>,
     _guard: PhantomData<&'g MutationGuard>,
 }
 
-impl<'g> LiveLocks<'g> {
+impl<'g> CredLocks<'g> {
     pub fn new(_guard: &'g MutationGuard, set: Box<dyn LiveLockSet + 'g>) -> Self {
         Self {
             set,
@@ -149,6 +151,52 @@ impl<'g> LiveLocks<'g> {
     pub fn check_owned(&self) -> Result<(), LockError> {
         self.set.check_owned()
     }
+
+    /// The config lock can only be added to held credential locks (§4.3).
+    pub fn with_config(self, config: Box<dyn LiveLockSet + 'g>) -> LiveLocks<'g> {
+        LiveLocks {
+            config: Some(config),
+            cred: self,
+        }
+    }
+}
+
+/// A provider's live locks: its credential locks plus its config lock (§4.3). Fields drop in
+/// declaration order, so the config lock is released before the credential locks.
+pub struct LiveLocks<'g> {
+    config: Option<Box<dyn LiveLockSet + 'g>>,
+    cred: CredLocks<'g>,
+}
+
+impl<'g> LiveLocks<'g> {
+    /// One lock set covering both stages: a provider with a single live lock, and tests.
+    pub fn new(guard: &'g MutationGuard, set: Box<dyn LiveLockSet + 'g>) -> Self {
+        Self {
+            config: None,
+            cred: CredLocks::new(guard, set),
+        }
+    }
+
+    /// The credential locks, then the config lock.
+    pub fn check_owned(&self) -> Result<(), LockError> {
+        self.cred.check_owned()?;
+        match &self.config {
+            Some(config) => config.check_owned(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `lock_live`'s two stages under one budget (§9.1): whatever the credential stage spends is
+/// gone from the config stage's share.
+fn staged<'g, E>(
+    budget: Duration,
+    credentials: impl FnOnce(Duration) -> Result<CredLocks<'g>, E>,
+    config: impl FnOnce(CredLocks<'g>, Duration) -> Result<LiveLocks<'g>, E>,
+) -> Result<LiveLocks<'g>, E> {
+    let deadline = Instant::now() + budget;
+    let held = credentials(budget)?;
+    config(held, deadline.saturating_duration_since(Instant::now()))
 }
 
 /// Restores what one write replaced, for same-process rollback (§9.4 step 10). Every restore
@@ -279,11 +327,35 @@ pub trait Provider: Send + Sync {
     /// `Absent` means there is no live login.
     fn live_identity(&self, env: &Env) -> Read<Identity>;
     fn read_live_auth(&self, env: &Env) -> LiveAuth;
+    /// How long the live locks may take, both stages together (§9.1: CC 9 s).
+    fn live_lock_budget(&self) -> Duration;
+    /// The first stage of the live locks (for CC: the refresh lock, then the legacy lock).
+    fn lock_credentials<'g>(
+        &self,
+        env: &Env,
+        g: &'g MutationGuard,
+        budget: Duration,
+    ) -> Result<CredLocks<'g>, ProviderError>;
+    /// The second stage, taken only from held credential locks. On failure `cred` is dropped,
+    /// which releases it.
+    fn lock_config<'g>(
+        &self,
+        env: &Env,
+        cred: CredLocks<'g>,
+        budget: Duration,
+    ) -> Result<LiveLocks<'g>, ProviderError>;
+    /// Both stages under one budget (§9.1). Provided; providers do not override it.
     fn lock_live<'g>(
         &self,
         env: &Env,
         g: &'g MutationGuard,
-    ) -> Result<LiveLocks<'g>, ProviderError>;
+    ) -> Result<LiveLocks<'g>, ProviderError> {
+        staged(
+            self.live_lock_budget(),
+            |budget| self.lock_credentials(env, g, budget),
+            |cred, budget| self.lock_config(env, cred, budget),
+        )
+    }
     /// Every live entry holding secrets that `change` overwrites or deletes, on either auth
     /// axis, read now under `locks` (§9.4 step 7): the entries it writes or clears, and the
     /// copies of them no reader sees that go with them.
@@ -354,6 +426,112 @@ mod tests {
             compromised.check_owned(),
             Err(LockError::Compromised(_))
         ));
+    }
+
+    /// A lock set that records when it is released.
+    struct Recorded(
+        &'static str,
+        std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    );
+    impl LiveLockSet for Recorded {
+        fn check_owned(&self) -> Result<(), LockError> {
+            Ok(())
+        }
+    }
+    impl Drop for Recorded {
+        fn drop(&mut self) {
+            self.1.lock().unwrap().push(self.0);
+        }
+    }
+
+    fn guard(d: &tempfile::TempDir) -> (Env, MutationGuard) {
+        let env = Env::for_test(d.path());
+        let g = MutationGuard::acquire(&env, std::time::Duration::from_millis(100)).unwrap();
+        (env, g)
+    }
+
+    fn owned(on: bool) -> Box<Held> {
+        Box::new(Held(std::cell::Cell::new(on)))
+    }
+
+    #[test]
+    fn the_config_lock_is_released_before_the_credential_locks() {
+        let d = tempfile::tempdir().unwrap();
+        let (_env, g) = guard(&d);
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let locks = CredLocks::new(&g, Box::new(Recorded("credentials", log.clone())))
+            .with_config(Box::new(Recorded("config", log.clone())));
+        drop(locks);
+        assert_eq!(*log.lock().unwrap(), ["config", "credentials"]);
+    }
+
+    #[test]
+    fn a_compromised_config_lock_or_credential_lock_is_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let (_env, g) = guard(&d);
+        let config_lost = CredLocks::new(&g, owned(true)).with_config(owned(false));
+        assert!(matches!(
+            config_lost.check_owned(),
+            Err(LockError::Compromised(_))
+        ));
+        let cred_lost = CredLocks::new(&g, owned(false)).with_config(owned(true));
+        assert!(matches!(
+            cred_lost.check_owned(),
+            Err(LockError::Compromised(_))
+        ));
+        assert!(CredLocks::new(&g, owned(true)).check_owned().is_ok());
+        assert!(
+            CredLocks::new(&g, owned(true))
+                .with_config(owned(true))
+                .check_owned()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn both_stages_share_one_budget() {
+        // §9.1: what the credential stage spends is gone from the config stage's share.
+        let d = tempfile::tempdir().unwrap();
+        let (_env, g) = guard(&d);
+        let budget = std::time::Duration::from_millis(500);
+        let given = std::cell::Cell::new(None);
+        let locks = staged(
+            budget,
+            |b| {
+                assert_eq!(
+                    b, budget,
+                    "the credential stage starts with the whole budget"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok::<_, ProviderError>(CredLocks::new(&g, owned(true)))
+            },
+            |cred, b| {
+                given.set(Some(b));
+                Ok(cred.with_config(owned(true)))
+            },
+        );
+        assert!(locks.is_ok());
+        let left = given.get().unwrap();
+        assert!(left <= std::time::Duration::from_millis(300), "{left:?}");
+    }
+
+    #[test]
+    fn a_spent_budget_leaves_the_config_stage_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let (_env, g) = guard(&d);
+        let given = std::cell::Cell::new(None);
+        let _ = staged(
+            std::time::Duration::from_millis(100),
+            |_| {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                Ok::<_, ProviderError>(CredLocks::new(&g, owned(true)))
+            },
+            |cred, b| {
+                given.set(Some(b));
+                Ok(cred.with_config(owned(true)))
+            },
+        );
+        assert_eq!(given.get(), Some(std::time::Duration::ZERO));
     }
 
     struct NoopUndo;

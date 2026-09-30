@@ -9,30 +9,34 @@ pub const CRED_STALE: Duration = Duration::from_secs(60);
 pub const CONFIG_STALE: Duration = Duration::from_secs(10);
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(9);
 
-/// CC's credential locks and config lock (§9.1). Fields drop in declaration order, so the
-/// config lock is released first and the refresh lock last.
-pub struct CcLockSet {
-    config: MkdirLock,
+/// CC's credential locks (§9.1): the refresh lock, then the legacy lock. Fields drop in
+/// declaration order, so the legacy lock is released first and the refresh lock last.
+pub struct CcCredSet {
     legacy: MkdirLock,
     refresh: MkdirLock,
 }
 
-impl LiveLockSet for CcLockSet {
+impl LiveLockSet for CcCredSet {
     fn check_owned(&self) -> Result<(), LockError> {
         self.refresh.check_owned()?;
-        self.legacy.check_owned()?;
+        self.legacy.check_owned()
+    }
+}
+
+/// CC's config lock (§9.1), the second stage of its live locks.
+pub struct CcConfigSet {
+    config: MkdirLock,
+}
+
+impl LiveLockSet for CcConfigSet {
+    fn check_owned(&self) -> Result<(), LockError> {
         self.config.check_owned()
     }
 }
 
-pub fn acquire(paths: &CcPaths) -> Result<CcLockSet, LockError> {
-    acquire_with(paths, ACQUIRE_TIMEOUT)
-}
-
-/// Refresh lock, then the legacy lock; if the legacy lock is contended the refresh lock is
-/// released and the pair retried, as CC does. Then the config lock. tagteam never writes
-/// `.oauth_refresh.lock.owner`.
-pub fn acquire_with(paths: &CcPaths, timeout: Duration) -> Result<CcLockSet, LockError> {
+/// The refresh lock, then the legacy lock. If the legacy lock is contended the refresh lock is
+/// released and the pair retried, as CC does. tagteam never writes `.oauth_refresh.lock.owner`.
+pub fn acquire_credentials(paths: &CcPaths, timeout: Duration) -> Result<CcCredSet, LockError> {
     let deadline = Instant::now() + timeout;
     let remaining = || deadline.saturating_duration_since(Instant::now());
     loop {
@@ -43,18 +47,7 @@ pub fn acquire_with(paths: &CcPaths, timeout: Duration) -> Result<CcLockSet, Loc
         ))?;
         let legacy_spec = MkdirLockSpec::new(paths.legacy_lock(), CRED_STALE, Duration::ZERO);
         match MkdirLock::try_acquire(&legacy_spec)? {
-            Some(legacy) => {
-                let config = MkdirLock::acquire(&MkdirLockSpec::new(
-                    paths.config_lock.clone(),
-                    CONFIG_STALE,
-                    remaining(),
-                ))?;
-                return Ok(CcLockSet {
-                    config,
-                    legacy,
-                    refresh,
-                });
-            }
+            Some(legacy) => return Ok(CcCredSet { legacy, refresh }),
             None => {
                 drop(refresh);
                 if Instant::now() >= deadline {
@@ -64,6 +57,18 @@ pub fn acquire_with(paths: &CcPaths, timeout: Duration) -> Result<CcLockSet, Loc
             }
         }
     }
+}
+
+/// The config lock alone. A caller takes it only while holding the credential locks
+/// (`CredLocks::with_config`, §4.3).
+pub fn acquire_config(paths: &CcPaths, timeout: Duration) -> Result<CcConfigSet, LockError> {
+    Ok(CcConfigSet {
+        config: MkdirLock::acquire(&MkdirLockSpec::new(
+            paths.config_lock.clone(),
+            CONFIG_STALE,
+            timeout,
+        ))?,
+    })
 }
 
 #[cfg(test)]
@@ -79,15 +84,28 @@ mod tests {
     }
 
     #[test]
-    fn takes_all_three_and_releases_them() {
+    fn the_credential_locks_never_touch_the_config_lock() {
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
-        let set = acquire(&p).unwrap();
-        assert!(p.refresh_lock.is_dir() && p.legacy_lock().is_dir() && p.config_lock.is_dir());
+        let set = acquire_credentials(&p, ACQUIRE_TIMEOUT).unwrap();
+        assert!(p.refresh_lock.is_dir() && p.legacy_lock().is_dir());
+        assert!(!p.config_lock.exists(), "only the config stage takes it");
         assert!(set.check_owned().is_ok());
         assert!(!p.config_home.join(".oauth_refresh.lock.owner").exists());
         drop(set);
-        assert!(!p.refresh_lock.exists() && !p.legacy_lock().exists() && !p.config_lock.exists());
+        assert!(!p.refresh_lock.exists() && !p.legacy_lock().exists());
+    }
+
+    #[test]
+    fn the_config_lock_is_taken_and_released_on_its_own() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        let set = acquire_config(&p, ACQUIRE_TIMEOUT).unwrap();
+        assert!(p.config_lock.is_dir());
+        assert!(!p.refresh_lock.exists() && !p.legacy_lock().exists());
+        assert!(set.check_owned().is_ok());
+        drop(set);
+        assert!(!p.config_lock.exists());
     }
 
     #[test]
@@ -96,7 +114,7 @@ mod tests {
         let p = paths(d.path());
         fs::create_dir(p.legacy_lock()).unwrap(); // CC holds it, freshly
         assert!(matches!(
-            acquire_with(&p, Duration::from_millis(700)),
+            acquire_credentials(&p, Duration::from_millis(700)),
             Err(LockError::Timeout(_))
         ));
         assert!(
@@ -106,21 +124,41 @@ mod tests {
         assert!(p.legacy_lock().is_dir(), "CC's lock is left alone");
     }
 
-    /// Proves the release happens *during* the wait, not just after `acquire_with` gives up:
-    /// while a background acquirer is genuinely still blocked on the (still-held) legacy lock,
-    /// this thread must itself be able to actually acquire the refresh lock. That's true no
-    /// matter how long the lock sits free between the background thread's retries — a
+    /// Proves the release happens *during* the wait, not just after `acquire_credentials` gives
+    /// up: while a background acquirer is genuinely still blocked on the (still-held) legacy
+    /// lock, this thread must itself be able to actually acquire the refresh lock. That's true
+    /// no matter how long the lock sits free between the background thread's retries — a
     /// microsecond or a second — unlike polling `exists()`, which can miss a window far
     /// narrower than its poll interval.
+    ///
+    /// The refresh lock being free proves nothing until the acquirer has actually tried it, so
+    /// the test first waits for evidence that it has: taking the refresh lock and releasing it on
+    /// the legacy contention (`mkdir`, then `rmdir`) changes the mtime of the directory holding
+    /// it. Without that, this thread could take the free lock before the acquirer ever ran.
     #[test]
     fn the_refresh_lock_is_actually_free_during_a_legacy_wait_not_only_after_it() {
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
         fs::create_dir(p.legacy_lock()).unwrap(); // CC holds it, freshly
+        let lock_dir = p.refresh_lock.parent().unwrap().to_path_buf();
+        let untouched = fs::metadata(&lock_dir).unwrap().modified().unwrap();
         let p2 = p.clone();
         // Generous on purpose: only this test's own deadline below is meant to be tight; this
         // just must outlast it plus the eventual release.
-        let handle = thread::spawn(move || acquire_with(&p2, Duration::from_secs(30)));
+        let handle = thread::spawn(move || acquire_credentials(&p2, Duration::from_secs(30)));
+
+        let tried = Instant::now() + Duration::from_secs(10);
+        while fs::metadata(&lock_dir).unwrap().modified().unwrap() == untouched {
+            assert!(
+                Instant::now() < tried,
+                "the acquirer never reached the refresh lock"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            p.legacy_lock().is_dir(),
+            "the legacy lock is still held: it is contended"
+        );
 
         let refresh_spec = MkdirLockSpec::new(p.refresh_lock.clone(), CRED_STALE, Duration::ZERO);
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -147,40 +185,32 @@ mod tests {
     }
 
     #[test]
-    fn a_config_lock_timeout_releases_the_refresh_and_legacy_locks() {
-        let d = tempfile::tempdir().unwrap();
-        let p = paths(d.path());
-        fs::create_dir(&p.config_lock).unwrap(); // something else holds it, freshly
-        assert!(matches!(
-            acquire_with(&p, Duration::from_millis(500)),
-            Err(LockError::Timeout(_))
-        ));
-        assert!(
-            !p.refresh_lock.exists(),
-            "the refresh lock must be released"
-        );
-        assert!(
-            !p.legacy_lock().exists(),
-            "the legacy lock must be released"
-        );
-        assert!(
-            p.config_lock.is_dir(),
-            "the other holder's config lock is left alone"
-        );
-    }
-
-    #[test]
     fn a_held_refresh_lock_times_out_without_touching_it() {
-        // Review Focus 1: CC is mid-refresh.
+        // Review Focus 1 (M1): CC is mid-refresh.
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
         fs::create_dir(&p.refresh_lock).unwrap();
         let start = std::time::Instant::now();
         assert!(matches!(
-            acquire_with(&p, Duration::from_millis(500)),
+            acquire_credentials(&p, Duration::from_millis(500)),
             Err(LockError::Timeout(_))
         ));
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(p.refresh_lock.is_dir());
+    }
+
+    #[test]
+    fn a_held_config_lock_times_out_without_touching_it() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        fs::create_dir(&p.config_lock).unwrap(); // something else holds it, freshly
+        assert!(matches!(
+            acquire_config(&p, Duration::from_millis(500)),
+            Err(LockError::Timeout(_))
+        ));
+        assert!(
+            p.config_lock.is_dir(),
+            "the other holder's lock is left alone"
+        );
     }
 }

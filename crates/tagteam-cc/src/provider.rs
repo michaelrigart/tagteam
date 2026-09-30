@@ -4,9 +4,9 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::{
-    BeforeFallback, Capabilities, Credential, DoomedEntry, Env, Identity, IdentitySurface,
-    Keychain, KindTraits, LiveAuth, LiveChange, LiveLocks, MutationGuard, Provider, ProviderError,
-    Read, StoredLogin, Undo, Written,
+    BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, Identity,
+    IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLocks, MutationGuard,
+    Provider, ProviderError, Read, StoredLogin, Undo, Written,
 };
 
 use crate::config;
@@ -28,8 +28,9 @@ pub const CONFIG_REMEDY: &str =
 
 pub struct ClaudeCode {
     live: Arc<LiveStore>,
-    /// How long `lock_live` waits for CC's locks: `locks::ACQUIRE_TIMEOUT`, except in tests.
-    lock_timeout: Duration,
+    /// How long CC's live locks may take, both stages together (§9.1):
+    /// `locks::ACQUIRE_TIMEOUT`, except in tests.
+    lock_budget: Duration,
 }
 
 impl ClaudeCode {
@@ -40,14 +41,14 @@ impl ClaudeCode {
     pub fn with_store(store: LiveStore) -> Self {
         Self {
             live: Arc::new(store),
-            lock_timeout: locks::ACQUIRE_TIMEOUT,
+            lock_budget: locks::ACQUIRE_TIMEOUT,
         }
     }
 
-    /// A shorter wait for CC's locks, so a test of a held lock need not wait the full 9 s.
+    /// A shorter budget for CC's locks, so a test of a held lock need not wait the full 9 s.
     #[cfg(feature = "test-hooks")]
     pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
-        self.lock_timeout = timeout;
+        self.lock_budget = timeout;
         self
     }
 }
@@ -291,13 +292,29 @@ impl Provider for ClaudeCode {
         }
     }
 
-    fn lock_live<'g>(
+    fn live_lock_budget(&self) -> Duration {
+        self.lock_budget
+    }
+
+    fn lock_credentials<'g>(
         &self,
         env: &Env,
         g: &'g MutationGuard,
+        budget: Duration,
+    ) -> Result<CredLocks<'g>, ProviderError> {
+        let set = locks::acquire_credentials(&CcPaths::resolve(env), budget)?;
+        Ok(CredLocks::new(g, Box::new(set)))
+    }
+
+    fn lock_config<'g>(
+        &self,
+        env: &Env,
+        cred: CredLocks<'g>,
+        budget: Duration,
     ) -> Result<LiveLocks<'g>, ProviderError> {
-        let set = locks::acquire_with(&CcPaths::resolve(env), self.lock_timeout)?;
-        Ok(LiveLocks::new(g, Box::new(set)))
+        // On a timeout `cred` is dropped as this returns, releasing the credential locks.
+        let set = locks::acquire_config(&CcPaths::resolve(env), budget)?;
+        Ok(cred.with_config(Box::new(set)))
     }
 
     fn doomed(
