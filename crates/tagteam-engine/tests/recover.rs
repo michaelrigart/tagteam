@@ -1,20 +1,23 @@
 mod common;
 
 use std::fs;
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
     API_KEY, Fx, STRAY_API_KEY, assert_journal_cleared, crash_row, crashed_switch, dead_holder,
-    journal, vault_fp, write_target_credential,
+    journal, prev_refresh_token, vault_fp, write_target_credential,
 };
 use serde_json::Value;
 use tagteam_cc::ItemKind;
 use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
 use tagteam_engine::EngineError;
+use tagteam_engine::oracle::HttpOracle;
 use tagteam_engine::store::JournalRow;
 #[cfg(feature = "test-hooks")]
 use tagteam_engine::switch::SwitchReason;
+use tagteam_provider::http::Method;
 use tagteam_provider::{Keychain, ProcessStamp, Provider};
 
 fn any_mutation(fx: &Fx, _id: &AccountId) {
@@ -639,4 +642,169 @@ fn a_double_fired_rotation_switches_once() {
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
     assert_eq!(active(&fx), Some(b));
     assert_journal_cleared(&fx);
+}
+
+/// OAuth `a` → API key `k`, killed after step 7 stored the key and before the credential entry
+/// was cleared; then CC rotated a's token. Returns `(a, k)`.
+fn crashed_cross_axis_switch_then_cc_rotated(fx: &Fx) -> (AccountId, AccountId) {
+    let a = fx.add("a@x.co", "rt-a");
+    let k = fx.add_api_key(API_KEY); // leaves a live
+    crashed_switch(fx, &a, &k);
+    fx.put_managed_key(API_KEY.as_bytes());
+    fx.rotate_live("rt-a-rotated-by-cc");
+    (a, k)
+}
+
+#[test]
+fn forward_recovery_captures_a_rotated_outgoing_token_the_oracle_attributes() {
+    // Ruling L476: the rotated generation is a's newest. Capturing it keeps a usable;
+    // displacing it would leave a's vault holding the spent rt-a.
+    let fx = Fx::new();
+    let (a, k) = crashed_cross_axis_switch_then_cc_rotated(&fx);
+    oracle_says(&fx, "a@x.co");
+    any_mutation(&fx, &a);
+    assert_journal_cleared(&fx);
+    assert_eq!(active(&fx), Some(k));
+    assert_eq!(
+        fx.vault_refresh_token(&a).as_deref(),
+        Some("rt-a-rotated-by-cc")
+    );
+    assert_eq!(
+        prev_refresh_token(&fx, &a).as_deref(),
+        Some("rt-a"),
+        ".prev keeps the old one"
+    );
+    assert!(
+        fx.displaced().is_empty(),
+        "captured, so nothing to displace"
+    );
+    assert_eq!(
+        fx.live_refresh_token(),
+        None,
+        "the entry is still cleared for the API key"
+    );
+}
+
+#[test]
+fn a_captured_rotation_backfills_a_missing_account_uuid() {
+    let fx = Fx::new();
+    let (a, _) = crashed_cross_axis_switch_then_cc_rotated(&fx);
+    // No uuid recorded yet: attribution falls back to email and org (§7.6, oracle.rs).
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute(
+            "UPDATE accounts SET account_uuid = NULL WHERE id = ?1",
+            [a.as_str()],
+        )
+        .unwrap();
+    oracle_says(&fx, "a@x.co");
+    any_mutation(&fx, &a);
+    assert_eq!(
+        fx.vault_refresh_token(&a).as_deref(),
+        Some("rt-a-rotated-by-cc")
+    );
+    let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
+    assert_eq!(row.account_uuid.as_deref(), Some("uuid-a@x.co"));
+}
+
+#[test]
+fn forward_recovery_without_an_attribution_displaces_the_rotated_token() {
+    // No answer, and an answer naming someone else: displaced, as before the amendment.
+    // Step 4's Unresolved capture does not apply to recovery.
+    for answer in [None, Some("stranger@x.co")] {
+        let fx = Fx::new();
+        let (a, _) = crashed_cross_axis_switch_then_cc_rotated(&fx);
+        if let Some(email) = answer {
+            oracle_says(&fx, email);
+        }
+        any_mutation(&fx, &a);
+        assert_journal_cleared(&fx);
+        assert_eq!(
+            fx.vault_refresh_token(&a).as_deref(),
+            Some("rt-a"),
+            "{answer:?}"
+        );
+        let displaced = fx.displaced();
+        assert_eq!(displaced.len(), 1, "{answer:?}");
+        assert!(String::from_utf8_lossy(&displaced[0]).contains("rt-a-rotated-by-cc"));
+    }
+}
+
+#[test]
+fn an_attributed_token_without_a_refresh_token_never_replaces_a_complete_vault() {
+    // §6.2: an automatic capture never replaces a refresh token with a credential that lacks
+    // one. Such an entry is displaced instead.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let k = fx.add_api_key(API_KEY);
+    crashed_switch(&fx, &a, &k);
+    fx.put_managed_key(API_KEY.as_bytes());
+    let access_only = serde_json::json!({
+        "claudeAiOauth": {"accessToken": "at-a-only", "expiresAt": 1_790_003_600_000i64},
+        "mcpOAuth": {"srv": {"token": "machine-shared"}}
+    })
+    .to_string()
+    .into_bytes();
+    fx.set_live_credential(&access_only);
+    oracle_says(&fx, "a@x.co");
+    any_mutation(&fx, &a);
+    assert_journal_cleared(&fx);
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    assert_eq!(fx.displaced(), [access_only]);
+}
+
+#[test]
+fn a_metadata_command_recovers_by_fingerprint_without_the_network() {
+    // The row is decidable by fingerprint: the managed key is the target's. A metadata command
+    // settles it without asking the oracle (§7.6, §9.6), so the rotated token has no
+    // attribution and is displaced. The same row under an account-changing command asks the
+    // oracle over HTTP once, and captures it.
+    for asks in [false, true] {
+        let fx = Fx::new();
+        let (a, _) = crashed_cross_axis_switch_then_cc_rotated(&fx);
+        fx.script_profile("a@x.co");
+        let engine =
+            fx.engine_with_oracle(Arc::new(HttpOracle::new(fx.http.clone(), fx.clock.clone())));
+        if asks {
+            drop(engine.mutation_guard().unwrap());
+        } else {
+            engine.set_disabled(&a, false).unwrap();
+        }
+        assert_journal_cleared(&fx);
+        let profile_requests = fx.http.count(Method::Get, &Fx::endpoints().profile);
+        assert_eq!(profile_requests, usize::from(asks), "asks={asks}");
+        if asks {
+            assert_eq!(
+                fx.vault_refresh_token(&a).as_deref(),
+                Some("rt-a-rotated-by-cc")
+            );
+            assert!(fx.displaced().is_empty());
+        } else {
+            assert!(fx.http.requests().is_empty(), "no request of any kind");
+            assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+            assert_eq!(fx.displaced().len(), 1);
+        }
+    }
+}
+
+#[test]
+fn backward_recovery_keeps_a_cc_updated_oauth_account_of_the_same_identity() {
+    // The switch never landed; since the crash, CC refreshed a field of b's own oauthAccount.
+    // That object still names b, so recovery keeps it rather than splicing the journaled copy
+    // back over it.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    let mut updated = Fx::oauth_account("b@x.co");
+    updated["displayName"] = Value::String("B".into());
+    common::splice_oauth_account(&fx.paths().global_config, &updated);
+    any_mutation(&fx, &a);
+    assert_journal_cleared(&fx);
+    assert_eq!(active(&fx), Some(b));
+    let doc: Value = serde_json::from_slice(&fs::read(fx.paths().global_config).unwrap()).unwrap();
+    assert_eq!(
+        doc["oauthAccount"], updated,
+        "the CC-updated object is kept"
+    );
 }

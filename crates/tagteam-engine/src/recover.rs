@@ -1,10 +1,11 @@
 use serde_json::Value;
-use tagteam_core::OracleVerdict;
+use tagteam_core::{OracleVerdict, OutgoingAction, OutgoingFacts, decide_outgoing};
 use tagteam_provider::{
     Credential, LiveAuth, LiveChange, LiveLocks, LockError, MutationGuard, Provider, ProviderError,
     Read,
 };
 
+use crate::account_lock::AccountLock;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
@@ -125,7 +126,7 @@ impl Engine {
         let store = self.store()?;
         let mut ids = vec![&row.to_id];
         ids.extend(&row.from_id);
-        let _accounts = self.lock_accounts(&ids)?;
+        let accounts = self.lock_accounts(&ids)?;
         // The provider is busy, or a crash left its lock behind: a retry recovers the row.
         let locks = p.lock_live(&self.env, guard).map_err(|e| match e {
             ProviderError::Lock(LockError::Timeout(lock)) => EngineError::RecoveryBlocked {
@@ -137,7 +138,9 @@ impl Engine {
         })?;
         let live = p.read_live_auth(&self.env);
         match self.direction(p, &store, row, &live, hints)? {
-            Direction::Forward(fp) => self.finish_forward(p, &store, row, &locks, &live, &fp),
+            Direction::Forward(fp) => {
+                self.finish_forward(p, &store, row, &accounts, &locks, &live, hints, &fp)
+            }
             Direction::Backward(fp) => self.finish_backward(p, &store, row, &locks, &live, &fp),
             Direction::Undecidable => Ok(()),
         }
@@ -172,7 +175,7 @@ impl Engine {
         )
     }
 
-    /// The live identity is `expected` and every auth axis names the account on `own` with
+    /// The live identity names the same identity as `expected`, by identity key, and every auth axis names the account on `own` with
     /// generation `fp`, on a fresh re-read, while CC's locks are still ours. An identity that
     /// cannot be read agrees with nothing, not even an expected absence.
     fn surfaces_agree(
@@ -186,21 +189,28 @@ impl Engine {
         let Ok(identity) = self.read_live_identity(p) else {
             return false;
         };
+        // A stored identity that no longer parses agrees with nothing.
+        let Ok(expected) = expected.map(|v| p.parse_identity(v)).transpose() else {
+            return false;
+        };
         locks.check_owned().is_ok()
-            && identity.map(|i| i.raw).as_ref() == expected
+            && identity.map(|i| p.identity_key(&i)) == expected.map(|i| p.identity_key(&i))
             && axes_coherent(p, &p.read_live_auth(&self.env), own, fp)
     }
 
     /// The switch landed: clear the other auth axis (§9.4 step 7, saving first whatever the
     /// clear destroys that no vault holds), splice the target's `oauthAccount`, and commit
     /// (step 9).
+    #[allow(clippy::too_many_arguments)]
     fn finish_forward(
         &self,
         p: &dyn Provider,
         store: &Store,
         row: &JournalRow,
+        accounts: &[AccountLock],
         locks: &LiveLocks<'_>,
         live: &LiveAuth,
+        hints: &[OracleHint],
         established: &str,
     ) -> Result<(), EngineError> {
         let to = store
@@ -219,10 +229,11 @@ impl Engine {
         let live_identity = p.live_identity(&self.env).present();
         let mut warnings = Vec::new();
         // §9.4 step 7's rule, before the other axis is cleared: every entry the clear destroys
-        // is saved first, unless its generation is held already. Held are the target's live
+        // is kept first, unless its generation is held already. Held are the target's live
         // generation, the vaults of both accounts the row names, and the outgoing generation
         // the row journaled, which step 4 settled before the row was written. A generation CC
-        // rotated since the crash is none of these, so it is saved.
+        // rotated since the crash is none of these: it is captured when the oracle attributes
+        // it to the outgoing account, and saved to `displaced/` otherwise.
         let doomed = p.doomed(&self.env, locks, LiveChange::ClearOther(&to.kind));
         refuse_unreadable(&doomed)?;
         let mut held = Held::default();
@@ -233,18 +244,33 @@ impl Engine {
         for id in row.from_id.iter().chain([&to.id]) {
             self.hold_vault(p, &mut held, id);
         }
+        // §9.6 (amended): an entry holding a generation no set above holds is the outgoing
+        // account's only when the pre-lock oracle attributed exactly those bytes to it. It is
+        // then captured into that account's vault; anything else is saved to `displaced/`.
+        let from = match &row.from_id {
+            Some(id) => store.account(id)?,
+            None => None,
+        };
         for entry in &doomed {
-            if let Read::Present(bytes) = &entry.bytes {
-                self.save_unheld(
-                    p,
-                    &row.provider,
-                    bytes,
-                    &mut held,
-                    false,
-                    live_identity.as_ref(),
-                    &mut warnings,
-                )?;
+            let Read::Present(bytes) = &entry.bytes else {
+                continue;
+            };
+            if let Some(from) = &from {
+                if self
+                    .capture_rotated_outgoing(p, store, from, bytes, hints, accounts, &mut held)?
+                {
+                    continue;
+                }
             }
+            self.save_unheld(
+                p,
+                &row.provider,
+                bytes,
+                &mut held,
+                false,
+                live_identity.as_ref(),
+                &mut warnings,
+            )?;
         }
         for w in &warnings {
             tracing::warn!(provider = %row.provider, "recovering an interrupted switch: {w}");
@@ -273,6 +299,66 @@ impl Engine {
         Ok(())
     }
 
+    /// §9.6 (amended): an entry a forward finish is about to clear, holding a generation that
+    /// none of the held sets does, is classified as §9.4 step 4 would classify it, but
+    /// without step 4's `Unresolved` capture. Recovery can run long after the crash, even after
+    /// a re-login, so a live login naming the outgoing account no longer implies the credential
+    /// is its. It is captured into the outgoing account's vault only when the pre-lock oracle
+    /// resolved exactly these bytes to it. The hints are asked only about fresh live reads
+    /// (`Axis::live_secret`), so a degraded read can never be captured, and §6.2's
+    /// refresh-token bound applies through `decide_outgoing`. Returns whether the entry was
+    /// captured, and so is held now.
+    #[allow(clippy::too_many_arguments)]
+    fn capture_rotated_outgoing(
+        &self,
+        p: &dyn Provider,
+        store: &Store,
+        from: &AccountRow,
+        bytes: &[u8],
+        hints: &[OracleHint],
+        accounts: &[AccountLock],
+        held: &mut Held,
+    ) -> Result<bool, EngineError> {
+        let Some(fp) = p.fingerprint(bytes) else {
+            return Ok(false);
+        };
+        if held.contains(fp.as_str()) {
+            return Ok(false);
+        }
+        let resolved = hints.iter().find_map(|h| answer_for(Some(h), bytes));
+        let oracle = verdict(resolved, from);
+        if oracle != OracleVerdict::ThisAccount {
+            return Ok(false);
+        }
+        let vault = match self.vault.read(&from.id) {
+            Read::Present(v) => Some(v),
+            Read::Absent => None,
+            Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
+        };
+        let facts = OutgoingFacts {
+            bytes_equal_vault: vault.as_deref() == Some(bytes),
+            fp_equal_vault: vault.as_deref().and_then(|v| p.fingerprint(v)).as_ref() == Some(&fp),
+            wiped: p.is_wiped(bytes),
+            tokenless: false,
+            oracle,
+            lacks_refresh_over_complete: !p.has_refresh_token(bytes)
+                && vault.as_deref().is_some_and(|v| p.has_refresh_token(v)),
+        };
+        let OutgoingAction::CaptureToVault { .. } = decide_outgoing(&facts).1 else {
+            return Ok(false);
+        };
+        let lock = accounts
+            .iter()
+            .find(|l| l.id() == &from.id)
+            .expect("recovery locks both accounts the row names");
+        self.persist_generation(p, from, lock, bytes)?;
+        if let Some(uuid) = resolved.and_then(|i| i.account_uuid.as_deref()) {
+            store.backfill_account_uuid(&from.id, uuid)?;
+        }
+        held.insert(fp.as_str());
+        Ok(true)
+    }
+
     /// The switch never landed, or its credential rollback succeeded: without touching the
     /// credential, splice `from_identity` back if it differs and keep the store's active
     /// account. Then put back the row a forced switch superseded, or delete the row.
@@ -298,10 +384,14 @@ impl Engine {
         let Ok(live_identity) = self.read_live_identity(p) else {
             return Ok(());
         };
+        // §9.6 (amended): splice the journaled identity back only when the live one names a
+        // different identity. CC may have updated other fields of the same identity's object
+        // since the crash, and that object is kept.
         let expected = row.from_identity.as_ref();
-        if live_identity.map(|i| i.raw).as_ref() != expected {
-            let identity = expected.map(|v| p.parse_identity(v)).transpose()?;
-            p.write_identity(&self.env, locks, identity.as_ref())?;
+        let expected_identity = expected.map(|v| p.parse_identity(v)).transpose()?;
+        let key = |i: &tagteam_provider::Identity| p.identity_key(i);
+        if live_identity.as_ref().map(key) != expected_identity.as_ref().map(key) {
+            p.write_identity(&self.env, locks, expected_identity.as_ref())?;
         }
         if !self.surfaces_agree(p, locks, own, established, expected) {
             return Ok(());

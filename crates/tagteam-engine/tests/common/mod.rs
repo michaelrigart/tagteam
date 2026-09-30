@@ -1100,3 +1100,11 @@ pub fn two_accounts(fx: &Fx) -> AccountId {
 pub fn rescue_files(fx: &Fx) -> usize {
     fs::read_dir(fx.env.data_dir().join("rescue")).map_or(0, |d| d.count())
 }
+
+/// The refresh token inside `id`'s `.prev` vault generation, if there is one.
+pub fn prev_refresh_token(fx: &Fx, id: &AccountId) -> Option<String> {
+    let v: Value = serde_json::from_slice(&fx.kc.get(SERVICE, &format!("{id}.prev"))?).ok()?;
+    v["claudeAiOauth"]["refreshToken"]
+        .as_str()
+        .map(str::to_owned)
+}

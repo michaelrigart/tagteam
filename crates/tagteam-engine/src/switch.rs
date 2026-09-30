@@ -201,6 +201,11 @@ impl Held {
         true
     }
 
+    /// Whether `fp` is held already, without recording it.
+    pub(crate) fn contains(&self, fp: &str) -> bool {
+        self.0.iter().any(|h| h == fp)
+    }
+
     /// Records the generation of `secret`, if it has one.
     pub(crate) fn hold(&mut self, p: &dyn Provider, secret: &[u8]) {
         if let Some(fp) = p.fingerprint(secret) {
