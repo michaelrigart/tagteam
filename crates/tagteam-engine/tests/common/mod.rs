@@ -24,7 +24,7 @@ use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::http::Method;
 use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{
-    Credential, Env, FakeClock, FakeKeychain, Identity, IdentitySurface, MutationGuard,
+    Clock, Credential, Env, FakeClock, FakeKeychain, Identity, IdentitySurface, MutationGuard,
     ProcessStamp, Provider, Read, ScriptedHttp,
 };
 
@@ -473,6 +473,27 @@ impl Fx {
         v["claudeAiOauth"]["refreshToken"]
             .as_str()
             .map(str::to_owned)
+    }
+
+    /// Replaces `id`'s current vault generation directly, as another tagteam process would.
+    pub fn put_vault(&self, id: &AccountId, bytes: &[u8]) {
+        match self.platform {
+            Platform::MacOs => self.kc.put(SERVICE, id.as_str(), bytes),
+            Platform::Linux => {
+                let dir = self.env.data_dir().join("vault");
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(dir.join(format!("{id}.json")), bytes).unwrap();
+            }
+        }
+    }
+
+    /// Moves `id`'s stored access token to expire one minute from the fixture clock's now:
+    /// inside the 10-minute freshen window (§7.2), and already "expired" by §7.2's 5-minute
+    /// buffer. The refresh token, and so the fingerprint, are unchanged.
+    pub fn expire_access(&self, id: &AccountId) {
+        let mut v: Value = serde_json::from_slice(&self.vault_bytes(id).unwrap()).unwrap();
+        v["claudeAiOauth"]["expiresAt"] = json!(self.clock.now_ms() + 60_000);
+        self.put_vault(id, v.to_string().as_bytes());
     }
 
     /// The `AddOptions` every plain `add_live` call in these tests starts from — shared by
@@ -989,4 +1010,23 @@ impl FakeFx {
             .present()
             .map(|i| i.label)
     }
+}
+
+/// How many token-endpoint requests the fixture's scripted port has seen.
+pub fn token_requests(fx: &Fx) -> usize {
+    fx.http.count(Method::Post, &Fx::endpoints().token)
+}
+
+/// `a` stored and inactive, with an access token that is due; `b` is the live login.
+pub fn due(fx: &Fx) -> AccountId {
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.expire_access(&a);
+    a
+}
+
+/// `id`'s quarantine reason and the fingerprint it is bound to.
+pub fn quarantine_of(fx: &Fx, id: &AccountId) -> (Option<String>, Option<String>) {
+    let row = fx.engine.store().unwrap().account(id).unwrap().unwrap();
+    (row.quarantine_reason, row.quarantine_fp)
 }

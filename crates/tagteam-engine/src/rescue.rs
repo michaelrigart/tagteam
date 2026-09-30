@@ -111,7 +111,6 @@ impl Engine {
 
     /// Every rescue file for `id` (named `<id>-…json`), in name order. Never creates
     /// `rescue/`. A directory that cannot be listed is itself unreadable: it may hide one.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn rescues_for(&self, id: &AccountId) -> Vec<RescueFile> {
         let dir = self.rescue_dir();
         let listing = match fs::read_dir(&dir) {
@@ -150,7 +149,6 @@ impl Engine {
     }
 
     /// Absent is success.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn delete_rescue(&self, path: &Path) -> Result<(), EngineError> {
         match fs::remove_file(path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
@@ -164,7 +162,6 @@ impl Engine {
     /// read might be that one, so it refuses, as does a failed adoption. A rescue whose
     /// predecessor is any other generation is superseded and left alone. The caller holds
     /// `lock`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn settle_rescues(
         &self,
         p: &dyn Provider,

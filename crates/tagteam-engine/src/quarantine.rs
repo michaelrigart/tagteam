@@ -50,7 +50,6 @@ impl From<DeadReason> for QuarantineReason {
 }
 
 impl Engine {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn quarantine_event(
         &self,
         row: &AccountRow,
@@ -72,7 +71,6 @@ impl Engine {
 
     /// Sets the quarantine bound to `fp`, the fingerprint that was actually sent, and records a
     /// `quarantine` event (§7.4). The log names the position and ID only (§4.4).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn quarantine(
         &self,
         row: &AccountRow,
@@ -92,7 +90,6 @@ impl Engine {
     }
 
     /// Clears the quarantine and records `unquarantine`; `false` when there was none.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn unquarantine(&self, row: &AccountRow) -> Result<bool, EngineError> {
         let cleared = self.store()?.clear_quarantine(&row.id)?;
         if cleared {
