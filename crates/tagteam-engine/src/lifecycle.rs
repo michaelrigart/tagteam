@@ -5,6 +5,7 @@ use tagteam_provider::{Credential, Identity, Provenance, Provider, Read};
 use crate::account_lock::AccountLock;
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::rescue::{RescueEntry, RescueFile};
 use crate::store::{AccountRow, EventRow, LoginMeta, NewAccount, Store, StoreError};
 
 pub struct AddOptions {
@@ -181,14 +182,22 @@ impl Engine {
         Ok(())
     }
 
-    /// Deletes the vault entries (strict), then the row (which cascades). The caller holds the
-    /// mutation lock and this account's lock. The live login is never touched.
+    /// Deletes the vault entries (strict), then the account's rescue files (§6.3: each holds a
+    /// live refresh token, readable or not, and none is left behind), then the row (which
+    /// cascades). A rescue that cannot be deleted fails the remove before the row goes, so it
+    /// can be retried. The caller holds the mutation lock and this account's lock. The live
+    /// login is never touched.
     pub(crate) fn remove_locked(
         &self,
         row: &AccountRow,
         lock: &AccountLock,
     ) -> Result<(), EngineError> {
         self.vault.delete(lock)?;
+        for rescue in self.rescues_for(&row.id) {
+            let (RescueFile::Entry(RescueEntry { path, .. }) | RescueFile::Unreadable { path, .. }) =
+                rescue;
+            self.delete_rescue(&path)?;
+        }
         self.store()?.delete_account(&row.id)?;
         self.event(&row.provider, "remove", Some(&row.id), None)?;
         Ok(())

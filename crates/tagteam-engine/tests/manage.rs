@@ -1,6 +1,8 @@
 mod common;
 
-use common::Fx;
+use std::fs;
+
+use common::{Fx, block_rescue, credential, unblock_rescue, vault_fp};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::AddTokenOptions;
@@ -235,4 +237,60 @@ fn views_follow_the_live_identity() {
     assert!(
         matches!(fx.engine.status(&fx.provider()).unwrap(), StatusView::Unmanaged { email } if email == "stranger@x.co")
     );
+}
+
+#[test]
+fn remove_deletes_the_accounts_rescue_files_and_nobody_elses() {
+    // A rescue holds a live refresh token (§6.3): it must not outlive its account.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let rescue = |id: &AccountId, rt: &str| {
+        fx.plant_rescue(id, &vault_fp(&fx, id), &credential("a@x.co", rt))
+    };
+    let readable = rescue(&a, "rt-a-2");
+    let garbage = fx
+        .env
+        .data_dir()
+        .join("rescue")
+        .join(format!("{a}-junk.json"));
+    fs::write(&garbage, "not json").unwrap();
+    let others = rescue(&b, "rt-b-2");
+
+    fx.engine.remove(&a).unwrap();
+    assert!(!readable.exists());
+    assert!(
+        !garbage.exists(),
+        "an unreadable rescue is deleted by name too"
+    );
+    assert!(others.exists(), "another account's rescue is untouched");
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
+    assert!(fx.vault_bytes(&a).is_none());
+}
+
+#[test]
+fn remove_never_creates_the_rescue_directory() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.engine.remove(&a).unwrap();
+    assert!(!fx.env.data_dir().join("rescue").exists());
+}
+
+#[test]
+fn a_rescue_that_cannot_be_deleted_fails_remove_before_the_row_goes() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let rescue = fx.plant_rescue(&a, &vault_fp(&fx, &a), &credential("a@x.co", "rt-a-2"));
+    block_rescue(&fx);
+    let result = fx.engine.remove(&a);
+    unblock_rescue(&fx);
+    assert!(result.is_err(), "the refresh token is still on disk");
+    assert!(rescue.exists());
+    assert!(
+        fx.engine.store().unwrap().account(&a).unwrap().is_some(),
+        "the row stays, so the remove can be retried"
+    );
+    fx.engine.remove(&a).unwrap();
+    assert!(!rescue.exists());
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
 }
