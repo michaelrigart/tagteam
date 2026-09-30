@@ -543,6 +543,31 @@ fn a_success_reply_with_nothing_usable_is_a_bad_response() {
 }
 
 #[test]
+fn a_200_that_delivers_tokens_is_refreshed_even_beside_invalid_client() {
+    // §7.3: nothing received is discarded. The `invalid_client` refusal never applies to a 200.
+    let s = successor(parse_refresh(
+        &stored(),
+        Ok(reply(
+            200,
+            &json!({"error": "invalid_client", "access_token": "at-new", "refresh_token": "rt-new",
+                    "expires_in": 3600}),
+        )),
+        NOW,
+    ));
+    assert_eq!(s["claudeAiOauth"]["accessToken"], "at-new");
+    assert_eq!(s["claudeAiOauth"]["refreshToken"], "rt-new");
+    let s = successor(parse_refresh(
+        &stored(),
+        Ok(reply(
+            200,
+            &json!({"error": "invalid_client", "refresh_token": "rt-only"}),
+        )),
+        NOW,
+    ));
+    assert_eq!(s["claudeAiOauth"]["refreshToken"], "rt-only");
+}
+
+#[test]
 fn a_reply_naming_a_refresh_token_is_never_discarded() {
     // §7.3: a successor tagteam received is persisted, even from an incomplete reply. Without
     // an access token or an expiry, it is stamped expired, so the next use refreshes again.

@@ -147,3 +147,48 @@ fn fake_agent_verdicts() {
         "nothing sent"
     );
 }
+
+#[test]
+fn a_200_that_delivers_tokens_is_refreshed_even_beside_invalid_client() {
+    // §7.3: nothing received is discarded. `invalid_client` never applies to a 200, though a
+    // refusal on any other status is still systemic.
+    let fa = FakeAgent::new();
+    let http = ScriptedHttp::new();
+    http.push_json(
+        Method::Post,
+        &fa.renew_url(),
+        200,
+        json!({"error": "invalid_client", "token": "fa-tok2", "renew": "fa-renew2", "expires_in": 60}),
+    );
+    http.push_json(
+        Method::Post,
+        &fa.renew_url(),
+        200,
+        json!({"error": "invalid_client", "renew": "fa-renew3"}),
+    );
+    http.push_json(
+        Method::Post,
+        &fa.renew_url(),
+        400,
+        json!({"error": "invalid_client"}),
+    );
+    let first = fa.refresh(&http, &renewable(), NOW, Duration::from_secs(10));
+    let RefreshResult::Refreshed { successor, .. } = first else {
+        panic!("expected Refreshed, got {first:?}");
+    };
+    let s: Value = serde_json::from_slice(&successor).unwrap();
+    assert_eq!(
+        (s["fa"]["token"].as_str(), s["fa"]["renew"].as_str()),
+        (Some("fa-tok2"), Some("fa-renew2"))
+    );
+    let second = fa.refresh(&http, &renewable(), NOW, Duration::from_secs(10));
+    let RefreshResult::Refreshed { successor, .. } = second else {
+        panic!("expected Refreshed, got {second:?}");
+    };
+    let s: Value = serde_json::from_slice(&successor).unwrap();
+    assert_eq!(s["fa"]["renew"], "fa-renew3");
+    assert!(matches!(
+        fa.refresh(&http, &renewable(), NOW, Duration::from_secs(10)),
+        RefreshResult::Systemic(_)
+    ));
+}

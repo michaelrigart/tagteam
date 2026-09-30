@@ -461,7 +461,7 @@ impl Provider for FakeAgent {
             (400 | 401, Some("invalid_grant")) => {
                 return RefreshResult::Dead(DeadReason::InvalidGrant);
             }
-            (_, Some("invalid_client")) => {
+            (status, Some("invalid_client")) if status != 200 => {
                 return RefreshResult::Systemic("the renew endpoint rejected the client".into());
             }
             (200, _) => {}

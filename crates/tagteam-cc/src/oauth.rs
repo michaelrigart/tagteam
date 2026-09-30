@@ -132,7 +132,8 @@ fn refusal_message(body: Option<&Value>, fallback: &str) -> String {
 /// - `invalid_grant` from 400, 401 or 403 is `Dead`; the engine re-reads the source that was
 ///   sent before it quarantines anything.
 /// - A refusal of the request itself is `Systemic`, never a strike, quoting the server's
-///   message: a top-level `error == "invalid_client"` whatever the status (RFC 6749), or a 400
+///   message: a top-level `error == "invalid_client"` on any status but 200 (RFC 6749; a 200
+///   is not a refusal, and what it delivers is kept), or a 400
 ///   whose nested `error.type` is `invalid_request_error` (what the endpoint answers for an
 ///   unknown client id, Appendix A.5). The message is `error_description` or the nested
 ///   `error.message`, else the error code.
@@ -158,7 +159,7 @@ pub fn parse_refresh(
         (400 | 401 | 403, Some("invalid_grant"), _) => {
             return RefreshResult::Dead(DeadReason::InvalidGrant);
         }
-        (_, Some("invalid_client"), _) => {
+        (status, Some("invalid_client"), _) if status != 200 => {
             return RefreshResult::Systemic(refusal_message(body.as_ref(), "invalid_client"));
         }
         (400, None, Some("invalid_request_error")) => {
