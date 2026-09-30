@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::{Clock, Env, Http, MutationGuard, Provider, Read};
@@ -80,7 +80,7 @@ impl Engine {
 
     /// Opens the store, creating it (and its directory, 0700) when needed.
     pub fn store(&self) -> Result<Arc<Store>, EngineError> {
-        let mut slot = self.store.lock().unwrap();
+        let mut slot = self.store.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(s) = slot.as_ref() {
             return Ok(s.clone());
         }
@@ -91,7 +91,7 @@ impl Engine {
 
     /// For read-only commands: never creates anything (§5).
     pub fn existing_store(&self) -> Result<Option<Arc<Store>>, EngineError> {
-        let mut slot = self.store.lock().unwrap();
+        let mut slot = self.store.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(s) = slot.as_ref() {
             return Ok(Some(s.clone()));
         }

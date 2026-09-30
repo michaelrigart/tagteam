@@ -617,6 +617,12 @@ impl Fx {
         }));
         self.engine_over(self.env.clone(), vault, self.oracle.clone())
     }
+
+    /// An engine over the same Env, Keychain, oracle, clock and HTTP port, with a
+    /// caller-supplied vault: for making the vault itself misbehave.
+    pub fn engine_with_vault(&self, vault: Vault) -> Engine {
+        self.engine_over(self.env.clone(), vault, self.oracle.clone())
+    }
 }
 
 /// A path's kind, for the snapshot comparison. A symlink records its `read_link` target
@@ -1029,4 +1035,21 @@ pub fn due(fx: &Fx) -> AccountId {
 pub fn quarantine_of(fx: &Fx, id: &AccountId) -> (Option<String>, Option<String>) {
     let row = fx.engine.store().unwrap().account(id).unwrap().unwrap();
     (row.quarantine_reason, row.quarantine_fp)
+}
+
+/// A `rescue/` that lists fine but cannot be written to (0500). The gate's step 3 still finds
+/// no rescue, so the request is sent; only the write after the response fails. (A plain file
+/// in its place would make step 3 report `rescue-unreadable` before any request.)
+pub fn block_rescue(fx: &Fx) {
+    let dir = fx.env.data_dir().join("rescue");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+}
+
+/// Undoes `block_rescue`, so the temporary directory can be cleaned up.
+pub fn unblock_rescue(fx: &Fx) {
+    let dir = fx.env.data_dir().join("rescue");
+    if dir.is_dir() {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
 }

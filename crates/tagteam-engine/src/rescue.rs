@@ -75,7 +75,6 @@ impl Engine {
     /// never a Keychain item, created beside its final name and renamed into place (§6.3). The
     /// directory is created 0700 on first use. The credential is stored verbatim as a UTF-8
     /// string, which every provider's credential is.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn write_rescue(
         &self,
         id: &AccountId,
