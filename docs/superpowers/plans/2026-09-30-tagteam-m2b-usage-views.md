@@ -9931,7 +9931,11 @@ dropped before anything is sent.
   held") and never across §7.5, which takes it itself; `live_bytes` drops it before returning.
   A lock that cannot be had within its 10 s timeout (a switch or another mutation holding it) is
   `Dropped`, like a live login that moved: nothing is sent or recorded, and the slot goes back.
-  Any other error from it is `collect_usage`'s `Err`, like any store error. Residual: a login
+  So is a provider whose `switch_journal` row is still there once the guard is held: the guard
+  returns successfully even when its recovery of a dead switch failed (it could not take the
+  provider's live locks), and a switch that died after writing the target's credential but
+  before its identity passes both identity checks (still this account) while the live token is
+  the target's. Any other error from it is `collect_usage`'s `Err`, like any store error. Residual: a login
   changed by Claude Code itself, outside tagteam's lock, between the credential read and the
   second identity read (its credential written, its `oauthAccount` not yet) still passes both
   identity checks, and can misattribute that one reading.
@@ -9964,7 +9968,11 @@ dropped before anything is sent.
     not hold.
   - Fixture: `Fx::{with_lock_timeout, add, add_token_options, switch_to, switch_request, engine_with_env, live_email, script_refresh, script_token_error, rotate_live, live_credential, set_live_credential, live_refresh_token, vault_refresh_token, oauth_account, paths}`,
     `Fx.oracle`, `Fx.env`, and the free `token_requests`, `quarantine_of`, `credential`,
-    `rescue_files`, `block_rescue`, `unblock_rescue`
+    `rescue_files`, `block_rescue`, `unblock_rescue`, and, for the unresolved-journal test,
+    the M2a helpers `crashed_switch`, `write_target_credential` and `journal` (all `pub` in
+    `tests/common/mod.rs`, as `tests/recover.rs` uses them)
+  - M1: `Store::journal(&self, provider: &ProviderId) -> Result<Option<JournalRow>, StoreError>`
+    (the switch journal row; one per provider, present while a switch is unresolved)
 - Produces: the active account's collection per §8.1 as amended; no new public names. The
   `last_error` token `foreign-credential` (Decision 10). The test-hook point
   `usage-live-identity-read` (in `live_bytes`, under the mutation lock, between the first
@@ -9984,8 +9992,8 @@ use std::fs;
 use std::time::Duration;
 
 use common::{
-    Fx, access_fp, credential, quarantine_of, token_requests, usage_bearers, usage_fixture,
-    usage_requests,
+    Fx, access_fp, crashed_switch, credential, journal, quarantine_of, token_requests,
+    usage_bearers, usage_fixture, usage_requests, write_target_credential,
 };
 use serde_json::{Value, json};
 use tagteam_engine::collect::Collected;
@@ -10277,6 +10285,34 @@ fn a_refused_live_setup_token_is_reported_expired_and_never_refreshed() {
     assert_eq!(usage_requests(&fx), 0);
 }
 
+#[test]
+fn an_unresolved_switch_journal_stops_the_active_collection_before_any_request() {
+    // A switch from b to a died after writing a's credential (step 7) but before a's identity
+    // (step 8): the live login still names b, the live credential is a's. Recovery cannot take
+    // CC's refresh lock, so `mutation_guard` returns anyway and the journal row stays. Both
+    // identity checks pass (still b), so without the journal check b's reservation would send
+    // a's token and record a's usage as b's.
+    let fx = Fx::with_lock_timeout(Duration::from_millis(300));
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    fs::create_dir(fx.paths().refresh_lock).unwrap();
+    fx.script_usage(200, usage_fixture());
+
+    let report = fx.collect(&[&b]);
+    fs::remove_dir(fx.paths().refresh_lock).unwrap();
+
+    assert!(journal(&fx).is_some(), "recovery could not finish, so the row is still there");
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(report.outcomes, [(b.clone(), Collected::Dropped)]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(fx.http.requests().is_empty(), "a's token was not sent as b's");
+    assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    assert_eq!(fx.usage_state(&b).and_then(|s| s.fetched_at), None, "no reading for b");
+    assert_eq!(fx.usage_state(&a).and_then(|s| s.fetched_at), None, "nor for a");
+}
+
 #[cfg(feature = "test-hooks")]
 mod hooks {
     use std::sync::{Arc, Mutex};
@@ -10408,13 +10444,16 @@ mod hooks {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test collect_active`
-Expected: FAIL: 12 of 13 tests. Task 10's active path refuses the expired or refused token
+Expected: FAIL: 13 of 14 tests. Task 10's active path refuses the expired or refused token
 without calling §7.5, so the expired, rotated, Dead, systemic, unreadable-`.prev` and two §7.5
 hook tests see `Failed { kind: "token-expired" }` where they expect `Recorded` or
 `refresh-failed`; the 401 tests see `http-401`; the foreign one sees `token-expired`;
 `a_refused_token_that_active_refresh_left_live_is_never_sent` fails on `token_requests == 1`
 (it is 0); and `a_switch_waits_for_the_live_read_so_the_account_sends_its_own_token` panics on
 `the hook ran`, since Task 10's `live_bytes` has no `usage-live-identity-read` point.
+`an_unresolved_switch_journal_stops_the_active_collection_before_any_request` sees
+`Recorded` where it expects `Dropped`, and a usage request where it expects none: Task 10's
+`live_bytes` does not look at the journal, so b's reservation sends a's token.
 `a_refused_live_setup_token_is_reported_expired_and_never_refreshed` already passes: Task 10's
 `send` refuses a refused token, and this task must keep it passing.
 
@@ -10516,7 +10555,10 @@ its identity check:
     ///
     /// A live login that moved stops the fetch (`Moved`): its token is not this account's. So
     /// does a lock that cannot be had within its timeout (a switch or another mutation holding
-    /// it). Residual: a login changed by Claude Code itself, outside tagteam's lock, between the
+    /// it. So does a switch journal row still present once the guard is held: the guard returns
+    /// even when its recovery of a dead switch failed, and that switch may have written another
+    /// account's credential before its identity, which both identity checks would pass.
+    /// Residual: a login changed by Claude Code itself, outside tagteam's lock, between the
     /// credential read and the second identity read (its credential written, its `oauthAccount`
     /// not yet) passes both checks and can misattribute that one reading.
     fn live_bytes(&self) -> Result<Vec<u8>, Stop> {
@@ -10525,6 +10567,10 @@ its identity check:
             Err(EngineError::Lock(_)) => return Err(Stop::Moved),
             Err(e) => return Err(e.into()),
         };
+        if self.store.journal(&self.row.provider)?.is_some() {
+            drop(guard);
+            return Err(Stop::Moved);
+        }
         self.live_names_this_account()?;
         hooks::point(self.engine, "usage-live-identity-read")?;
         let credential = self.p.read_live_auth(&self.engine.env).credential;
@@ -10552,10 +10598,10 @@ its identity check:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test collect_active`
-Expected: PASS (13 tests).
+Expected: PASS (14 tests).
 
 Run: `cargo test -p tagteam-engine --test collect_active`
-Expected: PASS (10 tests; the three in `hooks` need `test-hooks`).
+Expected: PASS (11 tests; the three in `hooks` need `test-hooks`).
 
 Run: `cargo test -p tagteam-engine --features test-hooks --test collect --test active`
 Expected: PASS. Task 10's tests are unchanged by this task (none of them sends an expired or
@@ -10582,7 +10628,7 @@ Expected: no output from `fmt --check`, and both clippy runs finish with no warn
 
 ```bash
 git add crates/tagteam-engine/src/collect.rs crates/tagteam-engine/tests/collect_active.rs
-git commit -m "Hand an expired or refused live token to active-token refresh, and read the live login under the mutation lock"
+git commit -m "Hand an expired or refused live token to active-token refresh, and read the live login under the mutation lock, stopping while a switch is unresolved"
 ```
 
 ---
@@ -17078,7 +17124,7 @@ are unchanged and would still pass.)
 In `crates/tagteam-provider/src/security.rs`, change the imports at the top:
 
 ```rust
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
