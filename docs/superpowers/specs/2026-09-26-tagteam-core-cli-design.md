@@ -683,7 +683,9 @@ This procedure is the only place a stored refresh token is ever sent to the toke
      and print a stderr notice naming the account position. The vault's generation has been
      consumed, so the account is also quarantined (`successor_lost`), bound to the fingerprint
      that was sent. That store write is best effort: if it fails too, the loss is reported
-     only.
+     only. A successor that belonged to another account keeps its `identity_conflict`
+     quarantine instead: that is the account's real problem, and both reasons are bound to the
+     same fingerprint.
    - Any other error after the response is received rescues the successor first, and reports
      `Unpersisted` if that rescue fails.
    - A panic after the response is received does the same as it unwinds. It cannot return
