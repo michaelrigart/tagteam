@@ -88,13 +88,16 @@ pub fn mutation_lock_free(env: &Env) -> bool {
     MutationGuard::acquire(env, Duration::ZERO).is_ok()
 }
 
-/// A process that has exited: its journal rows are recoverable (§12.6). Shared by `recover.rs`
-/// and `invariant.rs`, which both need to plant a crashed switch's journal row.
+/// A process that is gone: its journal rows are recoverable (§12.6). Shared by `recover.rs`
+/// and `invariant.rs`, which both need to plant a crashed switch's journal row. The pid is one
+/// no process can hold (above any pid_max), so `is_live()` is false on macOS (ESRCH) and on
+/// Linux (no `/proc` entry). It must not spawn: a child forked while another test holds an
+/// account lock keeps a duplicate of that lock's file description and makes a re-lock Busy.
 pub fn dead_holder() -> ProcessStamp {
-    let mut child = std::process::Command::new("true").spawn().unwrap();
-    let pid = child.id();
-    child.wait().unwrap();
-    ProcessStamp { pid, start: 0 }
+    ProcessStamp {
+        pid: i32::MAX as u32,
+        start: 0,
+    }
 }
 
 /// The vault's fingerprint of `id`'s stored generation.

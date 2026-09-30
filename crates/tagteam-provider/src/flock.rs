@@ -91,6 +91,9 @@ mod tests {
 
     #[test]
     fn a_second_lock_on_the_same_file_is_refused_until_release() {
+        let _fork = crate::FORK_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("sub/x.lock");
         let g = FlockGuard::try_lock(&p).unwrap().unwrap();
@@ -113,6 +116,9 @@ mod tests {
 
     #[test]
     fn the_mutation_guard_lives_in_the_data_dir() {
+        let _fork = crate::FORK_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let d = tempfile::tempdir().unwrap();
         let env = Env::for_test(d.path());
         let g = MutationGuard::acquire(&env, Duration::from_millis(100)).unwrap();

@@ -94,6 +94,9 @@ mod tests {
 
     #[test]
     fn an_exited_child_is_not_live() {
+        let _fork = crate::FORK_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let stamp = ProcessStamp {
             pid: child.id(),

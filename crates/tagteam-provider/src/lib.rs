@@ -14,6 +14,12 @@ pub mod read;
 pub mod security;
 pub mod splice;
 
+/// Serialises the lib tests that fork a child or drop a flock and re-lock it: a child forked in
+/// that window briefly holds a duplicate of the lock's open file description, so the re-lock
+/// would spuriously see it held.
+#[cfg(test)]
+pub(crate) static FORK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use credential::{Credential, FreshCredential, Provenance};
 pub use env::Env;
