@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
+use tagteam_provider::http::Http;
 use tagteam_provider::{
     BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, Identity,
     IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLocks, MutationGuard,
@@ -11,9 +12,11 @@ use tagteam_provider::{
 
 use crate::config;
 use crate::crash;
+use crate::endpoints::Endpoints;
 use crate::live::{self, Extent, Fence, LiveStore, Platform, Snapshot};
 use crate::locks;
 use crate::naming::{ItemKind, keychain_account, read_services};
+use crate::oauth;
 use crate::paths::CcPaths;
 use crate::shape::{self, KIND_API_KEY, KINDS, MACHINE_SHARED_KEYS};
 
@@ -31,6 +34,9 @@ pub struct ClaudeCode {
     /// How long CC's live locks may take, both stages together (§9.1):
     /// `locks::ACQUIRE_TIMEOUT`, except in tests.
     lock_budget: Duration,
+    /// Appendix A.5's URLs; `Endpoints::production()` except when the CLI's test-support
+    /// build points them at a local server.
+    endpoints: Endpoints,
 }
 
 impl ClaudeCode {
@@ -42,7 +48,14 @@ impl ClaudeCode {
         Self {
             live: Arc::new(store),
             lock_budget: locks::ACQUIRE_TIMEOUT,
+            endpoints: Endpoints::production(),
         }
+    }
+
+    /// Sends every request to `endpoints` instead of production (the CLI's test-support build).
+    pub fn with_endpoints(mut self, endpoints: Endpoints) -> Self {
+        self.endpoints = endpoints;
+        self
     }
 
     /// A shorter budget for CC's locks, so a test of a held lock need not wait the full 9 s.
@@ -403,6 +416,24 @@ impl Provider for ClaudeCode {
             identity.map(|i| &i.raw),
             &fence,
         )?))
+    }
+
+    fn resolve_owner(&self, http: &dyn Http, cred: &Credential, now_ms: i64) -> Option<Identity> {
+        let bytes = cred.bytes();
+        // §7.6 skips exactly these: an API key (no profile), an expired access token, and a
+        // setup token (its only scope is `user:inference`, which the profile endpoint refuses).
+        // An OAuth blob with no refresh token is none of them, so it is shown.
+        if shape::is_api_key(bytes)
+            || shape::is_expired(bytes, now_ms)
+            || shape::scopes(bytes) == ["user:inference"]
+        {
+            return None;
+        }
+        let token = shape::access_token(bytes)?;
+        let reply = http
+            .send(&oauth::profile_request(&self.endpoints, &token))
+            .ok()?;
+        oauth::parse_profile(&reply)
     }
 }
 

@@ -1,8 +1,10 @@
 pub mod config;
 mod crash;
+pub mod endpoints;
 pub mod live;
 pub mod locks;
 pub mod naming;
+pub mod oauth;
 pub mod paths;
 pub mod provider;
 pub mod shape;

@@ -8,6 +8,7 @@ use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
+use tagteam_provider::http::{Http, HttpRequest};
 use tagteam_provider::splice::{self, render_nested};
 use tagteam_provider::{
     BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, Identity,
@@ -17,6 +18,7 @@ use tagteam_provider::{
 };
 
 use crate::FAKE_AGENT;
+use crate::identity_json;
 use crate::paths::FakePaths;
 use crate::shape::{self, DEVICE, KIND_STATIC, KINDS};
 
@@ -136,6 +138,22 @@ impl Undo for NothingToUndo {
     fn what(&self) -> String {
         "nothing".into()
     }
+}
+
+/// `fa.token`, unless the credential has expired by §7.2's rule (`now + 5 min ≥ expires`).
+/// A non-numeric or absent `expires` never expires.
+fn showable_token(bytes: &[u8], now_ms: i64) -> Option<String> {
+    let v: Value = serde_json::from_slice(bytes).ok()?;
+    if v["fa"]["expires"]
+        .as_i64()
+        .is_some_and(|e| now_ms + 300_000 >= e)
+    {
+        return None;
+    }
+    v["fa"]["token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
 }
 
 impl Provider for FakeAgent {
@@ -382,5 +400,30 @@ impl Provider for FakeAgent {
             before,
             private: false,
         }))
+    }
+
+    fn resolve_owner(&self, http: &dyn Http, cred: &Credential, now_ms: i64) -> Option<Identity> {
+        // A static credential has no owner endpoint behind it: nothing is sent (§7.6).
+        if self.classify(cred.bytes()) == KIND_STATIC {
+            return None;
+        }
+        let token = showable_token(cred.bytes(), now_ms)?;
+        let req = HttpRequest::get(self.whoami_url(), Duration::from_secs(5)).bearer(&token);
+        let reply = http.send(&req).ok()?;
+        if reply.status != 200 {
+            return None;
+        }
+        let body = reply.json()?;
+        let uid = body["uid"].as_str().filter(|s| !s.is_empty())?;
+        let handle = body["handle"].as_str().unwrap_or_default();
+        let workspace = body["workspace"].as_str().unwrap_or_default();
+        Some(Identity {
+            label: format!("{handle}@{workspace}"),
+            email: None,
+            org_uuid: workspace.to_owned(),
+            org_name: None,
+            account_uuid: Some(uid.to_owned()),
+            raw: identity_json(handle, workspace, uid),
+        })
     }
 }

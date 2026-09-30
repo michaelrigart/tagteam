@@ -10,6 +10,7 @@ use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 use crate::credential::Credential;
 use crate::env::Env;
 use crate::flock::MutationGuard;
+use crate::http::Http;
 use crate::keychain::KeychainError;
 use crate::mkdir_lock::LockError;
 use crate::read::{Read, ReadError};
@@ -385,6 +386,12 @@ pub trait Provider: Send + Sync {
         locks: &'l LiveLocks<'_>,
         identity: Option<&Identity>,
     ) -> Result<Box<dyn Undo + 'l>, ProviderError>;
+
+    /// Who owns this credential's access token (§7.6). Advisory: a failure is `None`, never an
+    /// error. `None`, with no request sent, when the credential has no token it can show:
+    /// an expired access token (`now_ms + 5 min ≥ expiresAt`), or a kind the provider cannot
+    /// resolve.
+    fn resolve_owner(&self, http: &dyn Http, cred: &Credential, now_ms: i64) -> Option<Identity>;
 }
 
 #[cfg(test)]
