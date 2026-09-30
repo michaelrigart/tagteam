@@ -65,6 +65,22 @@ pub fn write_atomic_private_with<E: From<io::Error>>(
     write_atomic_mode_with(path, bytes, ModePolicy::Force(mode), before_publish)
 }
 
+/// The temporary file of one write, removed unless it was published: after an error and while
+/// unwinding from a panic alike. A killed process still leaves it behind; nothing in-process
+/// can prevent that, and its name (`.<name>.tagteam-<pid>-<rand>`) marks it as tagteam's.
+struct Temp<'a> {
+    path: &'a Path,
+    published: bool,
+}
+
+impl Drop for Temp<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(self.path);
+        }
+    }
+}
+
 fn write_atomic_mode_with<E: From<io::Error>>(
     path: &Path,
     bytes: &[u8],
@@ -97,20 +113,21 @@ fn write_atomic_mode_with<E: From<io::Error>>(
         .create_new(true)
         .mode(mode)
         .open(&tmp)?;
+    let mut temp = Temp {
+        path: &tmp,
+        published: false,
+    };
     let prepared = (|| {
         // Before any byte is written, so the umask can never widen a secret file.
         file.set_permissions(Permissions::from_mode(mode))?;
         file.write_all(bytes)?;
         file.sync_all()
     })();
-    let published = prepared
+    prepared
         .map_err(E::from)
         .and_then(|()| before_publish())
-        .and_then(|()| fs::rename(&tmp, &target).map_err(E::from));
-    if published.is_err() {
-        let _ = fs::remove_file(&tmp);
-        return published;
-    }
+        .and_then(|()| fs::rename(&tmp, &target).map_err(E::from))?;
+    temp.published = true;
     // Published: from here on nothing may report failure.
     let _ = File::open(dir).and_then(|d| d.sync_all());
     Ok(())
@@ -256,6 +273,26 @@ mod tests {
         fs::write(&p, "old").unwrap();
         let r = write_atomic_with(&p, b"new", 0o600, || Err(io::Error::other("lock lost")));
         assert!(r.is_err());
+        assert_eq!(fs::read(&p).unwrap(), b"old");
+        assert_eq!(
+            fs::read_dir(d.path()).unwrap().count(),
+            1,
+            "no temp file left"
+        );
+    }
+
+    #[test]
+    fn a_panic_before_publication_leaves_no_temp_file() {
+        // L319: a write that unwinds must not leave its 0600 temp file behind.
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.json");
+        fs::write(&p, "old").unwrap();
+        let unwound = std::panic::catch_unwind(|| {
+            let _ = write_atomic_with(&p, b"new", 0o600, || -> io::Result<()> {
+                panic!("the ownership check panicked")
+            });
+        });
+        assert!(unwound.is_err());
         assert_eq!(fs::read(&p).unwrap(), b"old");
         assert_eq!(
             fs::read_dir(d.path()).unwrap().count(),
