@@ -761,6 +761,11 @@ impl Engine {
         // The rotation decision, recomputed from the store alone (§9.2, §9.3), including the
         // fewer-than-two case; no vault but the target's is read here. Its anchor is `again`,
         // which is `outgoing` when anything proceeds.
+        // Only the target's vault is read here (§9.3): if it emptied while this command waited,
+        // a rotation plans again and rotates on, and a direct switch reports it.
+        if !self.has_login(&target)? {
+            return Ok(Rederived::Replan);
+        }
         let same_pick = match req.target {
             SwitchTarget::Account(_) => true,
             SwitchTarget::Rotation => self.rotation_pick_stands(store, plan, again.as_ref())?,
@@ -786,7 +791,11 @@ impl Engine {
     fn read_target(&self, target: &AccountRow) -> Result<Vec<u8>, EngineError> {
         match self.vault.read(&target.id) {
             Read::Present(b) if !b.is_empty() => Ok(b),
-            Read::Unreadable(e) => Err(EngineError::Unreadable(e)),
+            Read::Unreadable(source) => Err(EngineError::UnreadableAccount {
+                position: target.position,
+                label: target.label.clone(),
+                source,
+            }),
             _ => Err(EngineError::InvalidInput(format!(
                 "{} has no stored credential",
                 target.label
@@ -817,6 +826,17 @@ impl Engine {
         refuse_unsafe_live_reads(&live)?;
         let doomed = p.doomed(&self.env, locks, LiveChange::Write(&target.kind));
         refuse_unreadable(&doomed)?;
+
+        // §6.2 "Pending rescues before activation": a rescue has already spent the vault's
+        // generation. It is settled here, under the target's account lock and before anything
+        // is written, so neither branch below reads the spent generation (§9.4 steps 2 and 5).
+        // A rescue that cannot be read or adopted refuses the switch before its journal row
+        // exists, so there is nothing to roll back.
+        let target_lock = account_locks
+            .iter()
+            .find(|l| l.id() == &target.id)
+            .expect("the target is locked");
+        self.settle_rescues(p, &target, target_lock)?;
 
         let mut warnings = Vec::new();
         // What steps 2 and 4 settle, and the vaults below: step 7's rule never saves it again.

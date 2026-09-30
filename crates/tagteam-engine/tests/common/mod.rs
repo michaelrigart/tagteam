@@ -475,6 +475,36 @@ impl Fx {
             .map(str::to_owned)
     }
 
+    /// Leaves a rescue file for `id` exactly as a gate whose vault write failed would (§6.3):
+    /// the envelope names the generation that was sent (`predecessor_fp`) and holds
+    /// `successor` verbatim. Written directly, as another tagteam process's gate would have.
+    pub fn plant_rescue(&self, id: &AccountId, predecessor_fp: &str, successor: &[u8]) -> PathBuf {
+        let epoch = self
+            .engine
+            .store()
+            .unwrap()
+            .account(id)
+            .unwrap()
+            .expect("a rescue belongs to a stored account")
+            .login_epoch;
+        let dir = self.env.data_dir().join("rescue");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let fp = self.cc.fingerprint(successor).unwrap();
+        let path = dir.join(format!("{id}-{epoch}-{}.json", fp.short12()));
+        let envelope = json!({
+            "format": "tagteam-rescue",
+            "version": 1,
+            "accountId": id.as_str(),
+            "loginEpoch": epoch,
+            "predecessorFp": predecessor_fp,
+            "credential": String::from_utf8(successor.to_vec()).unwrap(),
+        });
+        fs::write(&path, envelope.to_string()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
     /// Replaces `id`'s current vault generation directly, as another tagteam process would.
     pub fn put_vault(&self, id: &AccountId, bytes: &[u8]) {
         match self.platform {
@@ -1052,4 +1082,16 @@ pub fn unblock_rescue(fx: &Fx) {
     if dir.is_dir() {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
+}
+
+/// `Fx::credential_json` as the bytes a vault stores.
+pub fn credential(email: &str, rt: &str) -> Vec<u8> {
+    Fx::credential_json(email, rt).to_string().into_bytes()
+}
+
+/// `a` at position 1 (`rt-a`), `b` at position 2 and live (`rt-b`).
+pub fn two_accounts(fx: &Fx) -> AccountId {
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    a
 }

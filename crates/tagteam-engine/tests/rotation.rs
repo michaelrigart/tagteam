@@ -162,3 +162,59 @@ fn an_account_the_walk_skipped_is_not_read_again_under_the_locks() {
         .count();
     assert_eq!(of_a, 1, "{reads:?}");
 }
+
+/// Empties `id`'s vault once planning is done, while the switch waits for the mutation lock.
+fn empty_vault_while_waiting(fx: &Fx, id: &AccountId) {
+    let (kc, id) = (fx.kc.clone(), id.clone());
+    fx.engine.on_point(
+        "planned",
+        Box::new(move || kc.delete(SERVICE, id.as_str()).unwrap()),
+    );
+}
+
+#[test]
+fn a_target_emptied_while_a_rotation_waits_lands_on_the_next_candidate() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c"); // live: the walk picks a
+    empty_vault_while_waiting(&fx, &a);
+    let out = rotate(&fx).unwrap();
+    assert!(out.switched, "{out:?}");
+    assert_eq!(out.to.unwrap().label, "b@x.co");
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+}
+
+#[test]
+fn a_target_emptied_while_a_direct_switch_waits_reports_no_stored_credential() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live
+    empty_vault_while_waiting(&fx, &a);
+    let err = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(err.kind(), "invalid-input", "{err}");
+    assert!(err.to_string().contains("no stored credential"), "{err}");
+    assert!(common::journal(&fx).is_none());
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+#[test]
+fn a_target_that_turns_unreadable_while_the_switch_waits_names_the_account() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live
+    let kc = fx.kc.clone();
+    let id = a.clone();
+    fx.engine.on_point(
+        "planned",
+        Box::new(move || kc.set_unreadable(SERVICE, id.as_str(), true)),
+    );
+    let err = fx.switch_to(&a, false).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::UnreadableAccount { position: 1, label, .. } if label == "a@x.co"),
+        "{err}"
+    );
+    assert!(common::journal(&fx).is_none());
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
