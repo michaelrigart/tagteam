@@ -970,18 +970,18 @@ points of the threshold, or its usage is unknown for a reason other than an expi
 - **Rate (regression).** Least-squares slope over the samples of the current window instance
   (same `resets_at` ± 60 s) from the last 48 h. It requires ≥ 3 samples spanning ≥ 2 h and a
   positive slope.
-- **Rate (fallback).** cswap's average pace, for `Long` windows with a known period (CC's 7d:
-  `period` = 604800 s):
+- **Rate (fallback).** cswap's average pace, for `Long` and `Scoped` windows with a known
+  period (§4.5; CC's 7d and weekly scoped windows: `period` = 604800 s):
   - `elapsed = period − ((reset − fetched_at) mod period)`
   - suppressed when `elapsed < 86400 s`
   - `expected = min(100, elapsed / period · 100)`
   - `rate = pct / elapsed`
-- **Projections:**
-  - `projectedExhaustionAt = now + (100 − pct) / rate`
-  - `willLastToReset = pct + rate · (reset − now) ≤ 100`
-  - `aheadOfPace = pct − expected ≥ 15` (`Long` windows only)
-- **Where they appear.** `list` shows `(ahead of pace)` on `Long` windows. `history` shows the
-  ETA. JSON carries all fields plus the additive `projectionMethod: "regression" | "average"`.
+- **Projections**, measured from the reading's `fetched_at`, since `pct` is as of then:
+  - `projectedExhaustionAt = fetched_at + (100 − pct) / rate` (`fetched_at` when `pct ≥ 100`)
+  - `willLastToReset = pct + rate · (reset − fetched_at) ≤ 100`
+  - `aheadOfPace = pct − expected ≥ 15`, for the windows the fallback covers (never `Short`)
+- **Where they appear.** `list` marks a window that is ahead of pace (`▲ pace`, §13.1).
+  `history` shows the ETA. JSON carries all fields plus the additive `projectionMethod: "regression" | "average"`.
 
 ## 9. Switch
 
@@ -1795,8 +1795,8 @@ exactly as it would without providers.
     3  work (w@corp.com)        relogin required
 ```
 
-- A window shows its `pct` and the countdown to its reset. `▲ pace` marks a `Long` window that
-  is ahead of pace (§8.7).
+- A window shows its `pct` and the countdown to its reset. `▲ pace` marks a window that is
+  ahead of pace (§8.7).
 - A scoped window gets a column, headed by its model name, only when some account has it.
 - `pct` is coloured by §13.5's severities, off under `NO_COLOR` and `--no-color`.
 - A row without usage shows its `usageStatus` in words (`relogin required`, `api key`,
