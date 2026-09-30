@@ -5,12 +5,14 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
-use serde_json::json;
+use serde_json::{Value, json};
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
+use tagteam_engine::vault::SERVICE;
 use tagteam_provider::splice::replace_top_level;
-use tagteam_provider::{Env, Keychain};
+use tagteam_provider::{Env, FileKeychain, Keychain};
 
 /// Appendix A.3's refusal, pinned verbatim: its wording is part of the user-facing contract.
 pub const LOCKED: &str = "the login keychain is locked (common over SSH); run `security unlock-keychain ~/Library/Keychains/login.keychain-db`, then retry";
@@ -61,4 +63,43 @@ pub fn login(env: &Env, kc: &dyn Keychain, email: &str, org: &str, rt: &str) {
         cred.to_string().as_bytes(),
     )
     .unwrap();
+}
+
+/// `a@x.co` at position 1 and `b@x.co` at position 2, both added through the binary with every
+/// endpoint offline (`std_cmd`'s default); `b` is live. Returns their ids.
+pub fn two_accounts(root: &Path) -> (String, String) {
+    let env = Env::for_test(root);
+    let kc = FileKeychain::new(root.join("keychain"));
+    seed_home(&env);
+    login(&env, &kc, "a@x.co", "", "rt-a");
+    cmd(root).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-b");
+    cmd(root).arg("add").assert().success();
+    let out = cmd(root).args(["list", "--json"]).output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let id = |i: usize| v["accounts"][i]["id"].as_str().unwrap().to_owned();
+    (id(0), id(1))
+}
+
+/// Rewrites account `id`'s vault copy so its access token expires `in_ms` from now: inside
+/// the 10-minute freshen window (§7.2) when `in_ms` is below 600 000.
+pub fn expire_vault(root: &Path, id: &str, in_ms: i64) {
+    let kc = FileKeychain::new(root.join("keychain"));
+    let mut v: Value = serde_json::from_slice(&kc.find(SERVICE, id).present().unwrap()).unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    v["claudeAiOauth"]["expiresAt"] = json!(now + in_ms);
+    kc.upsert(SERVICE, id, v.to_string().as_bytes()).unwrap();
+}
+
+/// The email of the `oauthAccount` Claude Code is logged in as.
+pub fn live_email(root: &Path) -> String {
+    let config: Value =
+        serde_json::from_slice(&fs::read(root.join("home/.claude.json")).unwrap()).unwrap();
+    config["oauthAccount"]["emailAddress"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }

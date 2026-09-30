@@ -121,6 +121,9 @@ pub fn list_human(lists: &[ProviderAccounts], display_names: &dyn Fn(&str) -> St
             if r.disabled {
                 line.push_str("  disabled");
             }
+            if r.quarantine_reason.is_some() {
+                line.push_str("  relogin required");
+            }
             s.push_str(&line);
             s.push('\n');
         }
@@ -153,8 +156,13 @@ pub fn status_human(s: &StatusView) -> String {
         StatusView::NoLogin => "No live login.\n".into(),
         StatusView::Unmanaged { email } => format!("Live: {email} (not managed by tagteam)\n"),
         StatusView::Managed { account, total } => {
+            let marker = if account.row.quarantine_reason.is_some() {
+                ", relogin required"
+            } else {
+                ""
+            };
             format!(
-                "Live: {} (position {} of {total})\n",
+                "Live: {} (position {} of {total}){marker}\n",
                 name(&account.row),
                 account.row.position
             )
@@ -227,8 +235,9 @@ pub fn account_json(account: &AccountView, created: Option<bool>) -> Value {
 mod tests {
     use std::path::PathBuf;
 
-    use tagteam_core::CLAUDE_CODE;
+    use tagteam_core::{AccountId, CLAUDE_CODE};
     use tagteam_engine::switch::SwitchReason;
+    use tagteam_provider::KindTraits;
 
     use super::*;
 
@@ -292,5 +301,71 @@ mod tests {
         assert_eq!(v["activeAccountNumber"], 5);
         let v = list_json(&lists, &ProviderId::new("absent"));
         assert_eq!(v["activeAccountNumber"], Value::Null);
+    }
+
+    /// `a@x.co`, the live OAuth account at position 1, quarantined or not.
+    fn a_view(quarantined: bool) -> AccountView {
+        AccountView {
+            row: AccountRow {
+                id: AccountId::from_string("0192"),
+                provider: ProviderId::new(CLAUDE_CODE),
+                position: 1,
+                identity_key: "a@x.co\n".into(),
+                label: "a@x.co".into(),
+                email: Some("a@x.co".into()),
+                org_uuid: String::new(),
+                org_name: None,
+                account_uuid: None,
+                kind: "oauth".into(),
+                alias: None,
+                disabled: false,
+                identity_json: json!({}),
+                login_expires_at: None,
+                login_epoch: 0,
+                replacing_fp: None,
+                quarantine_reason: quarantined.then(|| "invalid_grant".into()),
+                quarantine_fp: None,
+                quarantine_at: None,
+                added_at: 1,
+            },
+            active: true,
+            kind: KindTraits {
+                refreshable: true,
+                managed_key_axis: false,
+                default_email_prefix: None,
+                display: None,
+            },
+        }
+    }
+
+    fn one(view: AccountView) -> [ProviderAccounts; 1] {
+        [ProviderAccounts {
+            provider: ProviderId::new(CLAUDE_CODE),
+            active_position: Some(1),
+            accounts: vec![view],
+        }]
+    }
+
+    #[test]
+    fn a_quarantined_account_is_marked_for_a_new_login() {
+        let names = |id: &str| id.to_owned();
+        assert_eq!(
+            list_human(&one(a_view(true)), &names),
+            "* 1  a@x.co  relogin required\n"
+        );
+        assert_eq!(list_human(&one(a_view(false)), &names), "* 1  a@x.co\n");
+        let status = StatusView::Managed {
+            account: a_view(true),
+            total: 1,
+        };
+        assert_eq!(
+            status_human(&status),
+            "Live: a@x.co (position 1 of 1), relogin required\n"
+        );
+        let status = StatusView::Managed {
+            account: a_view(false),
+            total: 1,
+        };
+        assert_eq!(status_human(&status), "Live: a@x.co (position 1 of 1)\n");
     }
 }

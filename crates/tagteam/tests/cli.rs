@@ -8,9 +8,11 @@ use std::path::Path;
 use std::process::Stdio;
 
 use assert_cmd::assert::OutputAssertExt;
-use common::{LOCKED, cmd, login, seed_home, std_cmd};
+use common::{LOCKED, cmd, expire_vault, live_email, login, seed_home, std_cmd, two_accounts};
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
+use tagteam_core::AccountId;
+use tagteam_engine::store::Store;
 use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Env, FileKeychain, Keychain};
 
@@ -388,4 +390,141 @@ fn a_test_base_never_goes_through_the_environment_proxy() {
         "asked directly"
     );
     assert_eq!(proxy.requests().len(), 0, "the proxy was never consulted");
+}
+
+/// The binary with every endpoint pointed at Task 7's `common::OFFLINE_API_BASE` (connection
+/// refused: every endpoint fails `PreSend`, and nothing reaches the network). `cmd` already sets
+/// it; naming it here keeps each test's reliance on it visible.
+fn offline(root: &Path) -> assert_cmd::Command {
+    let mut c = cmd(root);
+    c.env("TAGTEAM_TEST_API_BASE", common::OFFLINE_API_BASE);
+    c
+}
+
+fn quarantine(root: &Path, id: &str) {
+    Store::open_existing(&Env::for_test(root).data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap()
+        .set_quarantine(&AccountId::from_string(id), "invalid_grant", "sha256:0", 1)
+        .unwrap();
+}
+
+#[test]
+fn list_and_status_mark_quarantined_accounts() {
+    let d = tempfile::tempdir().unwrap();
+    let (a, b) = two_accounts(d.path());
+    quarantine(d.path(), &a);
+    quarantine(d.path(), &b);
+    offline(d.path())
+        .arg("list")
+        .assert()
+        .success()
+        .stdout("  1  a@x.co  relogin required\n* 2  b@x.co  relogin required\n");
+    offline(d.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout("Live: b@x.co (position 2 of 2), relogin required\n");
+    let out = offline(d.path()).args(["list", "--json"]).output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["accounts"][0]["usageStatus"], "relogin_required");
+}
+
+#[test]
+fn a_quarantined_target_that_needs_a_refresh_is_refused_with_a_relogin_message() {
+    // §7.2: a quarantined target is never refreshed; one that would need it is refused as
+    // Dead is, before anything is locked or written.
+    const MESSAGE: &str = "a@x.co (position 1) needs a new login: its stored refresh token can no longer be used; log in with `claude`, then run `tagteam add`";
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_accounts(d.path());
+    quarantine(d.path(), &a);
+    expire_vault(d.path(), &a, 60_000);
+    offline(d.path())
+        .args(["switch", "1"])
+        .assert()
+        .code(1)
+        .stderr(format!("tagteam: {MESSAGE}\n"));
+    let out = offline(d.path())
+        .args(["switch", "1", "--json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap(),
+        json!({"schemaVersion": 1, "error": {"type": "relogin-required", "message": MESSAGE}})
+    );
+    assert_eq!(live_email(d.path()), "b@x.co");
+}
+
+#[test]
+fn an_unreadable_rescue_blocks_the_switch_and_names_the_file() {
+    // Review Focus 4, through the binary: the vault's generation may be consumed, so it is
+    // never activated while a rescue for the account cannot be read (§6.2).
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_accounts(d.path());
+    let dir = Env::for_test(d.path()).data_dir().join("rescue");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = format!("{a}-0-000000000000.json");
+    std::fs::write(dir.join(&name), "{ truncated").unwrap();
+
+    let out = offline(d.path())
+        .args(["switch", "1", "--json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["error"]["type"], "rescue-pending");
+    let message = v["error"]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with(
+            "a@x.co (position 1) has a refreshed token that is not in the vault yet: "
+        ),
+        "{message}"
+    );
+    assert!(message.contains(&name), "{message}");
+    assert!(
+        message.ends_with("; retry once the vault can be written"),
+        "{message}"
+    );
+    offline(d.path())
+        .args(["switch", "1"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::starts_with(
+            "tagteam: a@x.co (position 1) has a refreshed token that is not in the vault yet: ",
+        ));
+    assert_eq!(live_email(d.path()), "b@x.co");
+}
+
+#[test]
+fn an_offline_refresh_before_a_switch_warns_once_and_still_switches() {
+    // Review Focus 1, through the binary: a transient failure proceeds with the vault's
+    // generation and a warning (§7.2), on stderr and in `warnings`, and never names a token.
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_accounts(d.path());
+    expire_vault(d.path(), &a, 60_000);
+
+    let out = offline(d.path())
+        .args(["switch", "1", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        (v["switched"].clone(), v["to"].clone()),
+        (json!(true), json!(1))
+    );
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stderr.matches("warning: ").count(), 1, "{stderr}");
+    assert!(stderr.contains(warnings[0].as_str().unwrap()), "{stderr}");
+    assert!(!stderr.contains("rt-a"), "never a token: {stderr}");
+    assert_eq!(live_email(d.path()), "a@x.co");
 }
