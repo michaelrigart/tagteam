@@ -4,9 +4,9 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::{
-    BeforeFallback, Credential, DoomedEntry, Env, Identity, IdentitySurface, Keychain, LiveAuth,
-    LiveChange, LiveLocks, MutationGuard, Provider, ProviderError, Read, StoredLogin, Undo,
-    Written,
+    BeforeFallback, Capabilities, Credential, DoomedEntry, Env, Identity, IdentitySurface,
+    Keychain, KindTraits, LiveAuth, LiveChange, LiveLocks, MutationGuard, Provider, ProviderError,
+    Read, StoredLogin, Undo, Written,
 };
 
 use crate::config;
@@ -179,6 +179,16 @@ impl Provider for ClaudeCode {
         "Claude Code"
     }
 
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            usage: true,
+            refresh: true,
+            api_keys: true,
+            sessions: true,
+            statusline: true,
+        }
+    }
+
     fn identity_surface(&self, env: &Env) -> IdentitySurface {
         let paths = CcPaths::resolve(env);
         let acct = keychain_account(env);
@@ -209,6 +219,10 @@ impl Provider for ClaudeCode {
 
     fn credential_kinds(&self) -> &'static [&'static str] {
         &KINDS
+    }
+
+    fn kind_traits(&self, kind: &str) -> KindTraits {
+        shape::kind_traits(kind)
     }
 
     fn parse_identity(&self, raw: &Value) -> Result<Identity, ProviderError> {
@@ -251,6 +265,14 @@ impl Provider for ClaudeCode {
 
     fn login_expires_at(&self, secret: &[u8]) -> Option<i64> {
         shape::login_expires_at(secret)
+    }
+
+    fn access_expires_at(&self, secret: &[u8]) -> Option<i64> {
+        shape::access_expires_at(secret)
+    }
+
+    fn access_fingerprint(&self, secret: &[u8]) -> Option<Fingerprint> {
+        shape::access_token(secret).map(|t| Fingerprint::of_secret(t.as_bytes()))
     }
 
     fn live_identity(&self, env: &Env) -> Read<Identity> {

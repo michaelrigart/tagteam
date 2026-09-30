@@ -1,6 +1,6 @@
 use serde_json::{Map, Value, json};
 use tagteam_core::Fingerprint;
-use tagteam_provider::{Identity, ProviderError};
+use tagteam_provider::{Identity, KindTraits, ProviderError};
 
 /// Taken from the live credential on activation, absence included (Appendix A.4, B.9).
 pub const MACHINE_SHARED_KEYS: [&str; 5] = [
@@ -69,6 +69,63 @@ pub fn is_wiped(bytes: &[u8]) -> bool {
 
 pub fn login_expires_at(bytes: &[u8]) -> Option<i64> {
     oauth_obj(bytes)?.get("refreshTokenExpiresAt")?.as_i64()
+}
+
+/// The access token, when the credential has a non-empty one.
+pub fn access_token(bytes: &[u8]) -> Option<String> {
+    oauth_obj(bytes).and_then(|o| token(&o, "accessToken").map(str::to_owned))
+}
+
+/// `claudeAiOauth.expiresAt` in epoch ms; `None` when it is missing or not an integer (§7.2: a
+/// non-numeric `expiresAt` counts as not expired).
+pub fn access_expires_at(bytes: &[u8]) -> Option<i64> {
+    oauth_obj(bytes)?.get("expiresAt")?.as_i64()
+}
+
+/// The credential's recorded scopes; empty when it records none.
+pub fn scopes(bytes: &[u8]) -> Vec<String> {
+    oauth_obj(bytes)
+        .and_then(|o| o.get("scopes").and_then(Value::as_array).cloned())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// §7.2: expired means `now_ms + 5 min >= expiresAt`; an unknown expiry never is.
+pub fn is_expired(bytes: &[u8], now_ms: i64) -> bool {
+    access_expires_at(bytes).is_some_and(|at| now_ms.saturating_add(300_000) >= at)
+}
+
+/// Claude Code's kind traits (§4.5). A kind this provider never stores has none.
+pub fn kind_traits(kind: &str) -> KindTraits {
+    let plain = KindTraits {
+        refreshable: false,
+        managed_key_axis: false,
+        default_email_prefix: None,
+        display: None,
+    };
+    match kind {
+        KIND_OAUTH => KindTraits {
+            refreshable: true,
+            ..plain
+        },
+        KIND_SETUP_TOKEN => KindTraits {
+            default_email_prefix: Some("setup-token"),
+            display: Some("setup token"),
+            ..plain
+        },
+        KIND_API_KEY => KindTraits {
+            managed_key_axis: true,
+            default_email_prefix: Some("api-key"),
+            display: Some("api key"),
+            ..plain
+        },
+        _ => plain,
+    }
 }
 
 /// §9.4 step 5: account-scoped keys from the target, machine-shared keys from the live
@@ -310,5 +367,78 @@ mod tests {
         let err = compose(malformed, None).unwrap_err();
         let msg = err.to_string();
         assert!(!msg.contains("sk-ant-secret"), "{msg}");
+    }
+
+    #[test]
+    fn access_token_facts_read_the_access_token() {
+        let c = json!({"claudeAiOauth": {
+            "accessToken": "at-1", "refreshToken": "rt", "expiresAt": 1_000_000i64,
+            "scopes": ["user:inference", "user:profile"]
+        }})
+        .to_string()
+        .into_bytes();
+        assert_eq!(access_token(&c).as_deref(), Some("at-1"));
+        assert_eq!(access_expires_at(&c), Some(1_000_000));
+        assert_eq!(scopes(&c), vec!["user:inference", "user:profile"]);
+        // §7.2: expired once `now + 5 min >= expiresAt`.
+        assert!(!is_expired(&c, 1_000_000 - 300_001));
+        assert!(is_expired(&c, 1_000_000 - 300_000));
+    }
+
+    #[test]
+    fn a_missing_or_non_numeric_expiry_is_unknown_and_never_expired() {
+        for exp in [json!(null), json!("1790000000000"), json!({"at": 1})] {
+            let c = json!({"claudeAiOauth": {"accessToken": "at", "expiresAt": exp}})
+                .to_string()
+                .into_bytes();
+            assert_eq!(access_expires_at(&c), None, "{exp}");
+            assert!(!is_expired(&c, i64::MAX - 1), "{exp}");
+        }
+        let bare = json!({"claudeAiOauth": {"accessToken": "at"}})
+            .to_string()
+            .into_bytes();
+        assert_eq!(access_expires_at(&bare), None);
+        assert!(scopes(&bare).is_empty());
+        assert_eq!(access_token(b"sk-ant-api03-k"), None);
+        assert_eq!(access_expires_at(b"sk-ant-api03-k"), None);
+        let empty = json!({"claudeAiOauth": {"accessToken": ""}})
+            .to_string()
+            .into_bytes();
+        assert_eq!(access_token(&empty), None, "an empty token is no token");
+    }
+
+    #[test]
+    fn kind_traits_follow_the_plan_table() {
+        let plain = KindTraits {
+            refreshable: false,
+            managed_key_axis: false,
+            default_email_prefix: None,
+            display: None,
+        };
+        assert_eq!(
+            kind_traits(KIND_OAUTH),
+            KindTraits {
+                refreshable: true,
+                ..plain
+            }
+        );
+        assert_eq!(
+            kind_traits(KIND_SETUP_TOKEN),
+            KindTraits {
+                default_email_prefix: Some("setup-token"),
+                display: Some("setup token"),
+                ..plain
+            }
+        );
+        assert_eq!(
+            kind_traits(KIND_API_KEY),
+            KindTraits {
+                managed_key_axis: true,
+                default_email_prefix: Some("api-key"),
+                display: Some("api key"),
+                ..plain
+            }
+        );
+        assert_eq!(kind_traits("not-a-kind"), plain);
     }
 }

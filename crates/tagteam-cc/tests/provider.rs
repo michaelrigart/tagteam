@@ -6,8 +6,10 @@ use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::provider::ClaudeCode;
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service, read_services};
+use tagteam_core::Fingerprint;
 use tagteam_provider::{
-    Env, FakeKeychain, MutationGuard, Provider, ProviderError, Read, SecretStore, StoredLogin,
+    Capabilities, Env, FakeKeychain, KindTraits, MutationGuard, Provider, ProviderError, Read,
+    SecretStore, StoredLogin,
 };
 
 /// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
@@ -644,4 +646,53 @@ fn identity_surface_names_the_section_3_writes() {
         f.cc.identity_key(&f.cc.token_identity("a@b.co")).as_str(),
         "a@b.co\n"
     );
+}
+
+#[test]
+fn claude_code_has_every_capability_and_the_kind_table() {
+    let f = fx();
+    assert_eq!(
+        f.cc.capabilities(),
+        Capabilities {
+            usage: true,
+            refresh: true,
+            api_keys: true,
+            sessions: true,
+            statusline: true,
+        }
+    );
+    for kind in f.cc.credential_kinds() {
+        assert_eq!(f.cc.kind_traits(kind), tagteam_cc::shape::kind_traits(kind));
+    }
+    assert_eq!(
+        f.cc.kind_traits("api_key"),
+        KindTraits {
+            refreshable: false,
+            managed_key_axis: true,
+            default_email_prefix: Some("api-key"),
+            display: Some("api key"),
+        }
+    );
+    assert!(f.cc.kind_traits("oauth").refreshable);
+}
+
+#[test]
+fn access_token_facts_come_from_the_access_token_not_the_lineage() {
+    let f = fx();
+    let bytes = json!({"claudeAiOauth": {
+        "accessToken": "at-1", "refreshToken": "rt-1", "expiresAt": 1_790_003_600_000i64
+    }})
+    .to_string()
+    .into_bytes();
+    assert_eq!(f.cc.access_expires_at(&bytes), Some(1_790_003_600_000));
+    assert_eq!(
+        f.cc.access_fingerprint(&bytes),
+        Some(Fingerprint::of_secret(b"at-1"))
+    );
+    assert_ne!(f.cc.access_fingerprint(&bytes), f.cc.fingerprint(&bytes));
+    // A setup token's lineage is its access token; an API key has no access token.
+    let setup = tagteam_cc::shape::setup_token_credential("tok");
+    assert_eq!(f.cc.access_fingerprint(&setup), f.cc.fingerprint(&setup));
+    assert_eq!(f.cc.access_expires_at(&setup), None);
+    assert_eq!(f.cc.access_fingerprint(b"sk-ant-api03-k"), None);
 }

@@ -103,6 +103,31 @@ pub struct IdentitySurface {
     pub machine_shared_keys: Vec<&'static str>,
 }
 
+/// What a provider can do at all (§4.5). A missing capability degrades the engine rather than
+/// failing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Capabilities {
+    pub usage: bool,
+    pub refresh: bool,
+    pub api_keys: bool,
+    pub sessions: bool,
+    pub statusline: bool,
+}
+
+/// What the engine and the CLI need to know about one credential kind, so neither ever names a
+/// provider's kind strings (§4.5 "Kind traits").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KindTraits {
+    /// The gate may refresh a credential of this kind (§7.3).
+    pub refreshable: bool,
+    /// Lives on the separate managed-key axis, not in the credential entry (§9.4 step 7).
+    pub managed_key_axis: bool,
+    /// The prefix of a defaulted `add-token` email (§10.2): `<prefix>-<N>@token.local`.
+    pub default_email_prefix: Option<&'static str>,
+    /// What `list` prints after the account ("api key"); `None` prints nothing.
+    pub display: Option<&'static str>,
+}
+
 pub trait LiveLockSet: Send {
     fn check_owned(&self) -> Result<(), LockError>;
 }
@@ -229,9 +254,11 @@ pub enum ProviderError {
 pub trait Provider: Send + Sync {
     fn id(&self) -> ProviderId;
     fn display_name(&self) -> &'static str;
+    fn capabilities(&self) -> Capabilities;
     fn identity_surface(&self, env: &Env) -> IdentitySurface;
     fn identity_key(&self, id: &Identity) -> IdentityKey;
     fn credential_kinds(&self) -> &'static [&'static str];
+    fn kind_traits(&self, kind: &str) -> KindTraits;
     fn parse_identity(&self, raw: &Value) -> Result<Identity, ProviderError>;
     /// The identity recorded for a token-only account (`add-token`, §10.2).
     fn token_identity(&self, email: &str) -> Identity;
@@ -243,6 +270,11 @@ pub trait Provider: Send + Sync {
     fn has_refresh_token(&self, secret: &[u8]) -> bool;
     fn is_wiped(&self, secret: &[u8]) -> bool;
     fn login_expires_at(&self, secret: &[u8]) -> Option<i64>;
+    /// Epoch ms of the access token's expiry; `None` when absent or not an integer (§7.2).
+    fn access_expires_at(&self, secret: &[u8]) -> Option<i64>;
+    /// The access token's own fingerprint. The gate's "someone already refreshed" check
+    /// (§7.3 step 4) and M2b's `rejected_fp` compare access tokens, not lineages.
+    fn access_fingerprint(&self, secret: &[u8]) -> Option<Fingerprint>;
 
     /// `Absent` means there is no live login.
     fn live_identity(&self, env: &Env) -> Read<Identity>;
