@@ -12,6 +12,8 @@ repository.workspace = true
 file-keychain = []
 # Tests against a temporary real keychain via /usr/bin/security (macOS CI).
 real_keychain = []
+# A local std::net HTTP server for adapter and cross-process tests. Never in release builds.
+mock-server = []
 
 [dependencies]
 tagteam-core.workspace = true

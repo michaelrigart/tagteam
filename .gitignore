@@ -1,3 +1,5 @@
 /target/
 .superpowers/
 docs/superpowers/runs/
+# The global gitignore ignores *.sql; migrations must never be skipped silently.
+!*.sql
