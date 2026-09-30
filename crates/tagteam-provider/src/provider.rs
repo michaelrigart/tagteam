@@ -220,10 +220,10 @@ pub struct Written<'l> {
 pub enum ProviderError {
     #[error("{0}")]
     Unreadable(ReadError),
-    #[error(
-        "{0} is torn or not a JSON object; restore it from Claude Code's backups (~/.claude/backups/) or repair it, then retry"
-    )]
-    ConfigUnsplicable(PathBuf),
+    /// A config file that is torn or not a JSON object is never replaced (§9.5). `remedy` is
+    /// the provider's advice on repairing it.
+    #[error("{} is torn or not a JSON object; {remedy}", path.display())]
+    ConfigUnsplicable { path: PathBuf, remedy: &'static str },
     #[error(
         "the credential was written to the file, but the Keychain item {0} that shadows it could not be verified gone"
     )]
@@ -297,7 +297,6 @@ pub trait Provider: Send + Sync {
         env: &Env,
         locks: &'l LiveLocks<'_>,
         target: &StoredLogin,
-        live: &LiveAuth,
         before_fallback: BeforeFallback<'_>,
     ) -> Result<Written<'l>, ProviderError>;
     /// Clears the auth axis other than `kept_kind`'s (§9.6 finish-forward).
@@ -319,6 +318,18 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unsplicable_config_names_the_file_and_the_providers_remedy() {
+        let e = ProviderError::ConfigUnsplicable {
+            path: PathBuf::from("/h/.agent.json"),
+            remedy: "repair it, then retry",
+        };
+        assert_eq!(
+            e.to_string(),
+            "/h/.agent.json is torn or not a JSON object; repair it, then retry"
+        );
+    }
 
     struct Held(std::cell::Cell<bool>);
     impl LiveLockSet for Held {

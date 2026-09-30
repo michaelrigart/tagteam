@@ -78,7 +78,7 @@ impl EngineError {
     pub fn kind(&self) -> &'static str {
         match self {
             EngineError::Store(_) => "store",
-            EngineError::Provider(ProviderError::ConfigUnsplicable(_)) => "config-unsplicable",
+            EngineError::Provider(ProviderError::ConfigUnsplicable { .. }) => "config-unsplicable",
             EngineError::Provider(ProviderError::Lock(LockError::Timeout(_))) => "lock-timeout",
             EngineError::Provider(ProviderError::RestoreFailed { .. }) => "rollback-failed",
             EngineError::Provider(_) => "provider",
@@ -118,7 +118,10 @@ mod tests {
         let cases: Vec<(EngineError, &str)> = vec![
             (EngineError::Store(StoreError::NoSuchAccount), "store"),
             (
-                EngineError::Provider(ProviderError::ConfigUnsplicable(PathBuf::from("x"))),
+                EngineError::Provider(ProviderError::ConfigUnsplicable {
+                    path: PathBuf::from("x"),
+                    remedy: "r",
+                }),
                 "config-unsplicable",
             ),
             (

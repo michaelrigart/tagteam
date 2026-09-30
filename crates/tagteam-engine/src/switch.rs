@@ -894,7 +894,6 @@ impl Engine {
             p,
             &target,
             &target_login,
-            &live,
             outgoing.as_ref(),
             req,
             &mut tx,
@@ -1099,7 +1098,6 @@ impl Engine {
         p: &dyn Provider,
         target: &AccountRow,
         target_login: &StoredLogin,
-        live: &LiveAuth,
         outgoing: Option<&AccountRow>,
         req: &SwitchRequest,
         tx: &mut Rollback<'a, '_>,
@@ -1108,7 +1106,7 @@ impl Engine {
         let locks = tx.locks;
         hooks::point(self, "after-journal")?;
         let stored_in = tx.write(|| {
-            p.write_credential(&self.env, locks, target_login, live, before_fallback)
+            p.write_credential(&self.env, locks, target_login, before_fallback)
                 .map(|w| (w.undo, w.stored_in))
         })?;
         hooks::point(self, "after-credential")?;

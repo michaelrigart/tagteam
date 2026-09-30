@@ -111,10 +111,6 @@ impl Engine {
             .ok_or_else(|| EngineError::UnknownProvider(id.to_string()))
     }
 
-    pub fn providers(&self) -> Vec<Arc<dyn Provider>> {
-        self.registry.all().to_vec()
-    }
-
     pub(crate) fn refuse_inside_run_shell(&self) -> Result<(), EngineError> {
         if self.env.inside_run_shell() {
             Err(EngineError::InsideRunShell)

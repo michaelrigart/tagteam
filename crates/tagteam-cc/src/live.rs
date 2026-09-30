@@ -15,6 +15,7 @@ use tagteam_provider::{
 use crate::config::{self, read_bytes};
 use crate::naming::{ItemKind, keychain_account, keychain_service, read_services};
 use crate::paths::CcPaths;
+use crate::provider::CONFIG_REMEDY;
 use crate::shape::machine_shared_only;
 
 /// Checked immediately before every protected mutation (§9.1). Production passes the live
@@ -442,9 +443,10 @@ impl LiveStore {
                 ));
             }
             Read::Unreadable(_) => {
-                return Err(ProviderError::ConfigUnsplicable(
-                    paths.global_config.clone(),
-                ));
+                return Err(ProviderError::ConfigUnsplicable {
+                    path: paths.global_config.clone(),
+                    remedy: CONFIG_REMEDY,
+                });
             }
         };
         let appended = match responses.entry("approved").or_insert_with(|| json!([])) {

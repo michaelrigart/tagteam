@@ -67,10 +67,9 @@ fn writes_the_composed_credential_and_the_identity_then_undoes_both() {
 
     let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
-    let live = f.cc.read_live_auth(&f.env);
     let t = target(&f, "new@b.co", "rt-new");
     let written =
-        f.cc.write_credential(&f.env, &locks, &t, &live, &mut save_nothing)
+        f.cc.write_credential(&f.env, &locks, &t, &mut save_nothing)
             .unwrap();
     assert_eq!(written.stored_in, SecretStore::Keychain);
     let u1 = written.undo;
@@ -115,7 +114,6 @@ fn an_api_key_target_moves_the_auth_axis() {
     );
     let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
-    let live = f.cc.read_live_auth(&f.env);
     let key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
     let t = StoredLogin {
         kind: "api_key".into(),
@@ -123,7 +121,7 @@ fn an_api_key_target_moves_the_auth_axis() {
         identity: f.cc.token_identity("api-key-2@token.local"),
     };
     let written =
-        f.cc.write_credential(&f.env, &locks, &t, &live, &mut save_nothing)
+        f.cc.write_credential(&f.env, &locks, &t, &mut save_nothing)
             .unwrap();
     assert_eq!(written.stored_in, SecretStore::Keychain);
     assert_eq!(
@@ -133,12 +131,10 @@ fn an_api_key_target_moves_the_auth_axis() {
     );
     assert_eq!(oauth_item(&f).unwrap(), json!({"pluginSecrets": {"p": 1}}));
     // Back to OAuth: the managed key goes, machine-shared keys stay.
-    let live = f.cc.read_live_auth(&f.env);
     f.cc.write_credential(
         &f.env,
         &locks,
         &target(&f, "a@b.co", "rt"),
-        &live,
         &mut save_nothing,
     )
     .unwrap();
@@ -214,12 +210,10 @@ fn doomed_names_everything_each_change_destroys() {
         let primary = |kind| keychain_service(&env, kind);
         if keychain == 2 {
             f.kc.set_fail_write(&primary(ItemKind::OAuth), true);
-            let live = f.cc.read_live_auth(&env);
             f.cc.write_credential(
                 &env,
                 &locks,
                 &target(&f, "p@x.co", "rt-p"),
-                &live,
                 &mut save_nothing,
             )
             .unwrap();
@@ -267,12 +261,11 @@ fn doomed_names_everything_each_change_destroys() {
                 } else {
                     target(f, "t@x.co", "rt-target")
                 };
-                let live = f.cc.read_live_auth(env);
                 let mut record = |b: &[u8]| {
                     reported.push(b.to_vec());
                     Ok(())
                 };
-                f.cc.write_credential(env, &locks, &login, &live, &mut record)
+                f.cc.write_credential(env, &locks, &login, &mut record)
                     .unwrap();
             }
             LiveChange::ClearOther(kind) => {
@@ -332,13 +325,11 @@ fn an_unreadable_live_entry_is_never_overwritten() {
     f.kc.set_unreadable(&svc, &acct, true);
     let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
-    let live = f.cc.read_live_auth(&f.env);
     assert!(
         f.cc.write_credential(
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &live,
             &mut save_nothing
         )
         .is_err()
@@ -362,13 +353,11 @@ fn a_failed_write_restores_what_it_had_already_changed() {
     f.kc.set_fail_delete(&managed, true); // clearing the managed key will fail after the OAuth write
     let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
-    let live = f.cc.read_live_auth(&f.env);
     assert!(
         f.cc.write_credential(
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &live,
             &mut save_nothing
         )
         .is_err()
@@ -395,13 +384,11 @@ fn a_restore_that_fails_is_reported_not_hidden() {
     f.kc.set_fail_delete(&oauth, true); // and so does restoring the OAuth item's absence
     let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
-    let live = f.cc.read_live_auth(&f.env);
     let err =
         f.cc.write_credential(
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &live,
             &mut save_nothing,
         )
         .err()
@@ -424,13 +411,11 @@ fn a_panic_inside_one_operation_restores_its_first_write() {
     f.kc.set_panic_on_delete(&managed, true); // panics while clearing the managed key, after the OAuth write
     let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
-    let live = f.cc.read_live_auth(&f.env);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         f.cc.write_credential(
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &live,
             &mut save_nothing,
         )
     }));
@@ -462,7 +447,6 @@ fn a_transient_unreadable_caller_read_is_ignored_in_favor_of_a_fresh_one() {
         &f.env,
         &locks,
         &target(&f, "a@b.co", "rt"),
-        &live,
         &mut save_nothing,
     )
     .unwrap();
@@ -483,13 +467,11 @@ fn garbage_live_bytes_refuse_to_compose_and_write_nothing() {
     f.kc.put(&svc, &acct, b"not json at all");
     let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
-    let live = f.cc.read_live_auth(&f.env);
     let err =
         f.cc.write_credential(
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &live,
             &mut save_nothing,
         )
         .err()
@@ -516,13 +498,11 @@ fn an_empty_live_entry_refuses_to_compose_and_writes_nothing() {
     f.kc.put(&svc, &acct, b"");
     let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
     let locks = f.cc.lock_live(&f.env, &g).unwrap();
-    let live = f.cc.read_live_auth(&f.env);
     assert!(
         f.cc.write_credential(
             &f.env,
             &locks,
             &target(&f, "a@b.co", "rt"),
-            &live,
             &mut save_nothing
         )
         .is_err()

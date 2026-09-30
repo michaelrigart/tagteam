@@ -11,6 +11,7 @@ use tagteam_provider::{Identity, LiveLocks, ProviderError, Read, ReadError, Undo
 use crate::live::Fence;
 
 use crate::paths::CcPaths;
+use crate::provider::CONFIG_REMEDY;
 use crate::shape::identity_from_oauth_account;
 
 pub fn read_bytes(path: &Path) -> Read<Vec<u8>> {
@@ -88,11 +89,12 @@ pub fn splice_key(
     fence: Fence<'_>,
 ) -> Result<ConfigUndo, ProviderError> {
     let before = read_bytes(path);
-    let unsplicable = |_| ProviderError::ConfigUnsplicable(path.to_path_buf());
+    let unsplicable = || ProviderError::ConfigUnsplicable {
+        path: path.to_path_buf(),
+        remedy: CONFIG_REMEDY,
+    };
     let new = match (&before, value) {
-        (Read::Unreadable(_), _) => {
-            return Err(ProviderError::ConfigUnsplicable(path.to_path_buf()));
-        }
+        (Read::Unreadable(_), _) => return Err(unsplicable()),
         (Read::Absent, None) => {
             return Ok(ConfigUndo {
                 path: path.to_path_buf(),
@@ -103,8 +105,10 @@ pub fn splice_key(
             let key_json = serde_json::to_string(key).expect("a string always serializes");
             format!("{{\n  {key_json}: {}\n}}\n", render_nested(v, 1)).into_bytes()
         }
-        (Read::Present(b), Some(v)) => splice::replace_top_level(b, key, v).map_err(unsplicable)?,
-        (Read::Present(b), None) => splice::remove_top_level(b, key).map_err(unsplicable)?,
+        (Read::Present(b), Some(v)) => {
+            splice::replace_top_level(b, key, v).map_err(|_| unsplicable())?
+        }
+        (Read::Present(b), None) => splice::remove_top_level(b, key).map_err(|_| unsplicable())?,
     };
     let before = before.present();
     if before.as_deref() != Some(new.as_slice()) {

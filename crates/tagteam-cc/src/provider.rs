@@ -22,6 +22,10 @@ use crate::shape::{self, KIND_API_KEY, KINDS, MACHINE_SHARED_KEYS};
 const LIVE_NOT_FRESH: &str =
     "the live credential could not be read fresh; refusing to overwrite it";
 
+/// What to do about a `~/.claude.json` that cannot be spliced (§9.5).
+pub const CONFIG_REMEDY: &str =
+    "restore it from Claude Code's backups (~/.claude/backups/) or repair it, then retry";
+
 pub struct ClaudeCode {
     live: Arc<LiveStore>,
     /// How long `lock_live` waits for CC's locks: `locks::ACQUIRE_TIMEOUT`, except in tests.
@@ -317,10 +321,6 @@ impl Provider for ClaudeCode {
         env: &Env,
         locks: &'l LiveLocks<'_>,
         target: &StoredLogin,
-        // Never composed from: a caller's read may have gone stale by the time the write
-        // actually happens under the locks, so `write_credential` re-reads fresh instead
-        // (see `fresh_live_object`).
-        _live: &LiveAuth,
         before_fallback: BeforeFallback<'_>,
     ) -> Result<Written<'l>, ProviderError> {
         let (undo, stored_in) = self.guarded(env, locks, |paths, fence| {
