@@ -1,4 +1,6 @@
+use std::fs::{OpenOptions, Permissions};
 use std::io;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -379,11 +381,29 @@ fn is_cannot_open(e: &StoreError) -> bool {
     matches!(e, StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _)) if f.code == ErrorCode::CannotOpen)
 }
 
+/// Creates the database file with mode 0600 before SQLite first opens it (§6.1): it names
+/// every account. SQLite gives its `-wal` and `-shm` files the database's own mode. A file
+/// that already exists is left exactly as it is; an empty one is a valid empty database.
+fn create_private(path: &Path) -> io::Result<()> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        // At creation, before any byte, so the umask can never widen it.
+        Ok(file) => file.set_permissions(Permissions::from_mode(0o600)),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         if let Some(dir) = path.parent() {
             ensure_private_dir(dir)?;
         }
+        create_private(path)?;
         let conn = connect(path, true)?;
         let store = Self {
             conn: Mutex::new(conn),

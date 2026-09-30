@@ -548,3 +548,21 @@ fn login_expiry_is_recorded_on_its_own() {
     s.set_login_expires_at(&a, None).unwrap();
     assert_eq!(s.account(&a).unwrap().unwrap().login_expires_at, None);
 }
+
+/// `path` with SQLite's sidecar suffix (`-wal`, `-shm`).
+fn sidecar(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+}
+
+#[test]
+fn the_database_and_its_sidecars_are_created_0600() {
+    // L421, §6.1: the store names every account, so it is private from creation.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("data/tagteam.db");
+    let s = Store::open(&path).unwrap();
+    s.set_active(&cc(), None).unwrap(); // a write: the WAL is in use
+    for p in [path.clone(), sidecar(&path, "-wal"), sidecar(&path, "-shm")] {
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{}", p.display());
+    }
+}
