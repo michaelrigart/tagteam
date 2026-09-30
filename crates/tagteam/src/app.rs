@@ -122,7 +122,13 @@ fn build_engine(ctx: Context) -> Engine {
         Platform::Linux => Vault::new(Box::new(FileVault::new(ctx.env.data_dir().join("vault")))),
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let http: Arc<dyn Http> = Arc::new(UreqHttp::new());
+    // `api_base` only ever carries a test base: it is sent to directly, never through whatever
+    // proxy the machine's environment names, so test traffic cannot leave the machine.
+    let http: Arc<dyn Http> = Arc::new(if ctx.api_base.is_some() {
+        UreqHttp::direct()
+    } else {
+        UreqHttp::new()
+    });
     Engine::new(EngineConfig {
         env: ctx.env,
         registry: ProviderRegistry::new().with(Arc::new(cc)),

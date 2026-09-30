@@ -349,3 +349,43 @@ fn by_default_the_test_binary_never_reaches_the_network() {
     cmd(d.path()).args(["switch", "1"]).assert().success();
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
+
+#[test]
+fn a_test_base_never_goes_through_the_environment_proxy() {
+    // A test build with an API base sends direct: even with a proxy in the environment (and
+    // no NO_PROXY), the oracle request never reaches it, so no test traffic leaves the machine.
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let kc = FileKeychain::new(d.path().join("keychain"));
+    seed_home(&env);
+    login(&env, &kc, "a@x.co", "", "rt-a");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-b");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-b2"); // the switch asks the oracle about this token
+    let proxy = MockServer::start();
+    let proxy_url = proxy.base_url();
+    let target = MockServer::start();
+    target.on(
+        "GET",
+        "/api/oauth/profile",
+        MockReply::Json {
+            status: 200,
+            body: json!({"account": {"uuid": "uuid-b@x.co-", "email": "b@x.co"}}),
+        },
+    );
+    cmd(d.path())
+        .env("TAGTEAM_TEST_API_BASE", target.base_url())
+        .env("ALL_PROXY", &proxy_url)
+        .env("HTTP_PROXY", &proxy_url)
+        .env("HTTPS_PROXY", &proxy_url)
+        .args(["switch", "1"])
+        .assert()
+        .success();
+    assert_eq!(
+        target.hits("GET", "/api/oauth/profile"),
+        1,
+        "asked directly"
+    );
+    assert_eq!(proxy.requests().len(), 0, "the proxy was never consulted");
+}
