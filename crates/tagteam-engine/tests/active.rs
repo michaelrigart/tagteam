@@ -2,6 +2,7 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(feature = "test-hooks")]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

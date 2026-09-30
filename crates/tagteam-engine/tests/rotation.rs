@@ -163,6 +163,7 @@ fn an_account_the_walk_skipped_is_not_read_again_under_the_locks() {
     assert_eq!(of_a, 1, "{reads:?}");
 }
 
+#[cfg(feature = "test-hooks")]
 /// Empties `id`'s vault once planning is done, while the switch waits for the mutation lock.
 fn empty_vault_while_waiting(fx: &Fx, id: &AccountId) {
     let (kc, id) = (fx.kc.clone(), id.clone());
@@ -172,6 +173,7 @@ fn empty_vault_while_waiting(fx: &Fx, id: &AccountId) {
     );
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn a_target_emptied_while_a_rotation_waits_lands_on_the_next_candidate() {
     let fx = Fx::new();
@@ -186,6 +188,7 @@ fn a_target_emptied_while_a_rotation_waits_lands_on_the_next_candidate() {
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn a_target_emptied_while_a_direct_switch_waits_reports_no_stored_credential() {
     let fx = Fx::new();
@@ -199,6 +202,7 @@ fn a_target_emptied_while_a_direct_switch_waits_reports_no_stored_credential() {
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn a_target_that_turns_unreadable_while_the_switch_waits_names_the_account() {
     let fx = Fx::new();

@@ -4,9 +4,12 @@
 mod common;
 
 use std::fs;
+#[cfg(feature = "test-hooks")]
+use std::sync::Arc;
+use std::sync::Mutex;
+#[cfg(feature = "test-hooks")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -20,8 +23,10 @@ use tagteam_engine::EngineError;
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::switch::SwitchOutcome;
 use tagteam_engine::vault::SERVICE;
+#[cfg(feature = "test-hooks")]
+use tagteam_provider::Keychain;
+use tagteam_provider::ProcessStamp;
 use tagteam_provider::http::{HttpError, Method};
-use tagteam_provider::{Keychain, ProcessStamp};
 
 fn cannot_refresh(why: &str) -> String {
     format!("could not refresh a@x.co first ({why}); Claude Code will refresh it when it is online")
@@ -388,6 +393,7 @@ fn switch_after(
     })
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
 fn a_quarantine_the_plan_already_saw_is_still_applied_under_the_locks() {
     // Attempt 1 plans again for an unrelated reason (the vault reads empty for a moment) and
