@@ -783,4 +783,45 @@ mod hooks {
             "never published"
         );
     }
+
+    #[test]
+    fn a_switch_never_captures_the_generation_an_unpublished_refresh_superseded() {
+        // Codex round 2, §9.4 step 4 `Superseded`: the refresh persists B but cannot publish
+        // it, leaving live A, vault B and `.prev` A. Switching away must leave B in the vault
+        // (no capture of the consumed A, nothing displaced); switching back activates B.
+        let fx = Fx::new();
+        let b = fx.add("b@x.co", "rt-b");
+        let a = fx.add("a@x.co", "rt-a");
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        let refresh = take_over_after_response(&fx);
+        assert_eq!(
+            active(&fx, ActiveTrigger::Expired).unwrap(),
+            ActiveOutcome::PersistedNotPublished
+        );
+        // The lock's new holder is gone; without this the switch would wait for it.
+        fs::remove_dir(&refresh).unwrap();
+        assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+        assert_eq!(prev_refresh_token(&fx, &a).as_deref(), Some("rt-a"));
+
+        fx.switch_to(&b, false).unwrap();
+        assert_eq!(
+            fx.vault_refresh_token(&a).as_deref(),
+            Some("rt-a2"),
+            "the consumed live generation is never captured over the newer one"
+        );
+        assert!(
+            fx.displaced().is_empty(),
+            "the vault's .prev already keeps it: nothing to displace"
+        );
+
+        fx.switch_to(&a, false).unwrap();
+        assert_eq!(
+            fx.live_refresh_token().as_deref(),
+            Some("rt-a2"),
+            "switching back activates B, not the consumed A"
+        );
+        assert_eq!(token_requests(&fx), 1);
+    }
 }

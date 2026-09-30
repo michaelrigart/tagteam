@@ -338,6 +338,9 @@ impl Engine {
         let facts = OutgoingFacts {
             bytes_equal_vault: vault.as_deref() == Some(bytes),
             fp_equal_vault: vault.as_deref().and_then(|v| p.fingerprint(v)).as_ref() == Some(&fp),
+            // Recovery's held set covers the vault's `.prev` (`hold_vault`), so a superseded
+            // generation returned early above and never reaches this classification.
+            equals_vault_prev: false,
             wiped: p.is_wiped(bytes),
             tokenless: false,
             oracle,

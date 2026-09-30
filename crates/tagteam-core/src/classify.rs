@@ -11,6 +11,10 @@ pub enum OracleVerdict {
 pub struct OutgoingFacts {
     pub bytes_equal_vault: bool,
     pub fp_equal_vault: bool,
+    /// The live credential is the vault's `.prev` generation: an active-token refresh stored a
+    /// newer one it could not publish (§7.5), so capturing this one would put a consumed token
+    /// back (§9.4 step 4 `Superseded`).
+    pub equals_vault_prev: bool,
     /// An OAuth blob with both tokens empty: CC's reaction to `invalid_grant`.
     pub wiped: bool,
     /// The live credential carries no token at all (it has no fingerprint), for example an
@@ -24,6 +28,8 @@ pub struct OutgoingFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutgoingClass {
     Ours,
+    /// The vault holds a newer generation than the live one (§9.4 step 4, amended).
+    Superseded,
     Wiped,
     OursRotated,
     Foreign,
@@ -37,12 +43,15 @@ pub enum OutgoingAction {
     Displace,
 }
 
-/// The §9.4 step 4 table, with the §6.2 rules that an automatic capture never replaces a
+/// The §9.4 step 4 table, `Superseded` included, with the §6.2 rules that an automatic capture never replaces a
 /// refresh token with a credential that lacks one, and never captures a credential with no
 /// token at all: that one is left alone like a wiped blob, and the vault keeps its generation.
 pub fn decide_outgoing(f: &OutgoingFacts) -> (OutgoingClass, OutgoingAction) {
     if f.bytes_equal_vault || f.fp_equal_vault {
         return (OutgoingClass::Ours, OutgoingAction::Nothing);
+    }
+    if f.equals_vault_prev {
+        return (OutgoingClass::Superseded, OutgoingAction::Nothing);
     }
     if f.wiped || f.tokenless {
         return (OutgoingClass::Wiped, OutgoingAction::Nothing);
@@ -67,6 +76,7 @@ mod tests {
         OutgoingFacts {
             bytes_equal_vault: false,
             fp_equal_vault: false,
+            equals_vault_prev: false,
             wiped: false,
             tokenless: false,
             oracle: OracleVerdict::Unavailable,
@@ -126,6 +136,36 @@ mod tests {
             decide_outgoing(&f),
             (OutgoingClass::Ours, OutgoingAction::Nothing)
         );
+    }
+
+    #[test]
+    fn a_live_generation_the_vault_superseded_is_left_alone() {
+        // §9.4 step 4 `Superseded`: an active-token refresh stored a newer generation it could
+        // not publish. Capturing the live one would put a consumed token back, whatever the
+        // oracle says; `.prev` keeps it, so leaving it alone loses nothing.
+        for oracle in [
+            OracleVerdict::ThisAccount,
+            OracleVerdict::OtherIdentity,
+            OracleVerdict::Unavailable,
+        ] {
+            let f = OutgoingFacts {
+                equals_vault_prev: true,
+                oracle,
+                ..facts()
+            };
+            assert_eq!(
+                decide_outgoing(&f),
+                (OutgoingClass::Superseded, OutgoingAction::Nothing),
+                "{oracle:?}"
+            );
+        }
+        // The vault's own generation still classifies as `Ours` first.
+        let f = OutgoingFacts {
+            equals_vault_prev: true,
+            fp_equal_vault: true,
+            ..facts()
+        };
+        assert_eq!(decide_outgoing(&f).0, OutgoingClass::Ours);
     }
 
     #[test]

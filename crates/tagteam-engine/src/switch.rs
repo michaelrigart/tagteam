@@ -1262,10 +1262,24 @@ impl Engine {
         };
         let fp_live = p.fingerprint(&bytes);
         let resolved = answer_for(hint, &bytes);
+        let ours = vault
+            .as_deref()
+            .is_some_and(|v| same_generation(p, v, &bytes));
+        // §9.4 step 4 `Superseded`: the vault's `.prev` is this generation, so an active-token
+        // refresh stored a newer one it could not publish (§7.5). Read only when the live
+        // credential is not the vault's own, and tri-state: an unreadable `.prev` may be
+        // exactly that generation, and capturing over the newer one would lose it (step 3).
+        let superseded = !ours
+            && match self.vault.read_prev(&out.id) {
+                Read::Present(prev) => same_generation(p, &prev, &bytes),
+                Read::Absent => false,
+                Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
+            };
         let facts = OutgoingFacts {
             bytes_equal_vault: vault.as_deref() == Some(bytes.as_slice()),
             fp_equal_vault: fp_live.is_some()
                 && vault.as_deref().and_then(|v| p.fingerprint(v)) == fp_live,
+            equals_vault_prev: superseded,
             wiped: p.is_wiped(&bytes),
             tokenless: fp_live.is_none(),
             oracle: verdict(resolved, out),
