@@ -96,6 +96,12 @@ pub enum EngineError {
     RolledBack(String),
     #[error("the switch failed ({cause}) and rolling back also failed: {failed}")]
     RollbackFailed { cause: String, failed: String },
+    /// §7.5: the oracle attributed the live credential to another identity, so tagteam neither
+    /// adopts nor refreshes it. `usageStatus` calls this `foreign_credential` (§13.2).
+    #[error(
+        "the live credential does not belong to the account at position {position}; tagteam will not refresh it"
+    )]
+    ForeignLiveCredential { position: u32 },
     #[error(transparent)]
     Io(#[from] io::Error),
 }
@@ -132,6 +138,7 @@ impl EngineError {
             EngineError::RescuePending { .. } => "rescue-pending",
             EngineError::RolledBack(_) => "rolled-back",
             EngineError::RollbackFailed { .. } => "rollback-failed",
+            EngineError::ForeignLiveCredential { .. } => "foreign-credential",
             EngineError::Io(_) => "io",
         }
     }
@@ -257,6 +264,10 @@ mod tests {
                     failed: "b".into(),
                 },
                 "rollback-failed",
+            ),
+            (
+                EngineError::ForeignLiveCredential { position: 1 },
+                "foreign-credential",
             ),
             (EngineError::Io(io::Error::other("x")), "io"),
         ];

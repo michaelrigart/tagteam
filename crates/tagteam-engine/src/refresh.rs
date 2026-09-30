@@ -191,6 +191,14 @@ impl<'e> Received<'e> {
     }
 }
 
+impl Received<'_> {
+    /// The successor's bytes, for publishing it to the live store once persisted (§7.5
+    /// step 5).
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 impl Drop for Received<'_> {
     /// Runs only while armed: a panic unwound past the successor before it was stored. It
     /// cannot return `Unpersisted`, so it keeps the successor if it can, and otherwise records
