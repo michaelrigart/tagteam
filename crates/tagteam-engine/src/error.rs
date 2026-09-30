@@ -65,6 +65,17 @@ pub enum EngineError {
         app: &'static str,
         lock: PathBuf,
     },
+    /// §6.2: a refreshed successor sits in `rescue/` and could not be adopted, or a rescue file
+    /// for the account cannot be read. Activating or refreshing the vault's generation would
+    /// use a token the server has already consumed.
+    #[error(
+        "{label} (position {position}) has a refreshed token that is not in the vault yet: {detail}; retry once the vault can be written"
+    )]
+    RescuePending {
+        position: u32,
+        label: String,
+        detail: String,
+    },
     #[error("the switch failed and was rolled back: {0}")]
     RolledBack(String),
     #[error("the switch failed ({cause}) and rolling back also failed: {failed}")]
@@ -100,6 +111,7 @@ impl EngineError {
             EngineError::Ambiguous { .. } => "ambiguous-account",
             EngineError::InterruptedSwitch(_) => "interrupted-switch",
             EngineError::RecoveryBlocked { .. } => "interrupted-switch",
+            EngineError::RescuePending { .. } => "rescue-pending",
             EngineError::RolledBack(_) => "rolled-back",
             EngineError::RollbackFailed { .. } => "rollback-failed",
             EngineError::Io(_) => "io",
@@ -196,6 +208,14 @@ mod tests {
                     lock: PathBuf::from("x"),
                 },
                 "interrupted-switch",
+            ),
+            (
+                EngineError::RescuePending {
+                    position: 1,
+                    label: "a".into(),
+                    detail: "d".into(),
+                },
+                "rescue-pending",
             ),
             (EngineError::RolledBack("x".into()), "rolled-back"),
             (
