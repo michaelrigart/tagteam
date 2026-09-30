@@ -738,7 +738,8 @@ impl Engine {
     ) -> Result<Freshened, EngineError> {
         let target = &plan.target;
         // A self-switch activates what is already live: only CC, or §7.5, refreshes that token.
-        if plan.self_switch || !p.kind_traits(&target.kind).refreshable {
+        // A forced one re-activates the vault's generation (§9.2), so it freshens like any other.
+        if (plan.self_switch && !req.force) || !p.kind_traits(&target.kind).refreshable {
             return Ok(Freshened::Go(vec![]));
         }
         let vault = self.read_target(target)?;
@@ -978,15 +979,16 @@ impl Engine {
         // earlier attempt may already hold the quarantine, yet nothing else applies §7.2's
         // quarantined-target rule under the locks. A rotation plans again, and the walk skips
         // the row. A direct target is refused when its access token is due, and otherwise
-        // activated with the warning (unless freshening already gave it). A self-switch
-        // activates the live generation, which no refresh has spent, so the rule does not
-        // apply to it (§7.2: only CC refreshes a live token).
+        // activated with the warning (unless freshening already gave it). An unforced
+        // self-switch activates the live generation, which no refresh has spent, so the rule
+        // does not apply to it (§7.2: only CC refreshes a live token); a forced one re-activates
+        // the vault's generation (§9.2), so it does.
         let mut warnings = Vec::new();
         if target.quarantine_reason.is_some() {
             if matches!(req.target, SwitchTarget::Rotation) {
                 return Ok(Rederived::Replan);
             }
-            if !self_switch && p.kind_traits(&target.kind).refreshable {
+            if (!self_switch || req.force) && p.kind_traits(&target.kind).refreshable {
                 let vault = self.read_target(&target)?;
                 if self.due(p, &vault) {
                     return Err(needs_relogin(&target));

@@ -359,6 +359,43 @@ fn a_forced_switch_still_freshens_its_target() {
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a-2"));
 }
 
+#[test]
+fn a_forced_self_switch_follows_the_quarantined_target_rule() {
+    // `--force` on the live account re-activates the vault's generation (§9.2), not the live
+    // one, so §7.2's quarantined-target rule applies to it as to any other target.
+    let works = "a@x.co (position 1) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires";
+    for due in [true, false] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.switch_to(&a, false).unwrap();
+        fx.quarantine(&a, "successor_lost", &vault_fp(&fx, &a));
+        fx.login("a@x.co", "rt-a-new"); // a newer login tagteam never stored
+        if due {
+            fx.expire_access(&a);
+            let err = fx.switch_to(&a, true).unwrap_err();
+            assert_eq!(err.kind(), "relogin-required", "{err}");
+            assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a-new"));
+        } else {
+            let out = fx.switch_to(&a, true).unwrap();
+            assert!(
+                out.warnings.iter().any(|w| w == works),
+                "{:?}",
+                out.warnings
+            );
+        }
+        assert_eq!(token_requests(&fx), 0);
+    }
+
+    // Not quarantined and due: the gate leaves the live account's refresh to CC (§7.3 step 2).
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    fx.switch_to(&a, false).unwrap();
+    fx.expire_access(&a);
+    fx.switch_to(&a, true).unwrap();
+    assert_eq!(token_requests(&fx), 0);
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+}
+
 /// Runs a switch to `a` on an engine that stops at its first read of `a`'s vault after
 /// planning began (a read in `plan`, before any freshening), and runs `act` on the test thread
 /// while it is stopped. The engine shares this fixture's Env, Keychain and HTTP port, so `act`
