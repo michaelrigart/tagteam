@@ -11,7 +11,8 @@ use assert_cmd::assert::OutputAssertExt;
 use common::{LOCKED, cmd, login, seed_home, std_cmd};
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
-use tagteam_provider::{Env, FileKeychain};
+use tagteam_provider::mock_server::{MockReply, MockServer};
+use tagteam_provider::{Env, FileKeychain, Keychain};
 
 /// A stdout whose reader is already gone, so every write to it fails with EPIPE.
 fn closed_stdout() -> Stdio {
@@ -279,4 +280,72 @@ fn a_routine_switch_is_quiet_and_debug_shows_the_diagnostics() {
         .stdout
         .clone();
     assert_eq!(serde_json::from_slice::<Value>(&out).unwrap()["to"], 2);
+}
+
+#[test]
+fn a_switch_asks_the_configured_profile_endpoint() {
+    // §7.6 through the binary: the oracle answer attributes b's rotation to b, so the switch
+    // captures it into b's vault; the request carried the bearer and tagteam's User-Agent.
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let kc = FileKeychain::new(d.path().join("keychain"));
+    seed_home(&env);
+    login(&env, &kc, "a@x.co", "", "rt-a");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-b");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-b2"); // CC rotated b in place
+    let server = MockServer::start();
+    server.on(
+        "GET",
+        "/api/oauth/profile",
+        MockReply::Json {
+            status: 200,
+            body: json!({"account": {"uuid": "uuid-b@x.co-", "email": "b@x.co"}, "organization": {"uuid": ""}}),
+        },
+    );
+    cmd(d.path())
+        .env("TAGTEAM_TEST_API_BASE", server.base_url())
+        .args(["switch", "1", "--json"])
+        .assert()
+        .success();
+    assert_eq!(server.hits("GET", "/api/oauth/profile"), 1);
+    let req = &server.requests()[0];
+    let header = |name: &str| {
+        req.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(header("authorization").as_deref(), Some("Bearer at"));
+    assert!(header("user-agent").unwrap().starts_with("tagteam/"));
+    let list: Value = serde_json::from_slice(
+        &cmd(d.path())
+            .args(["list", "--json"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let b_id = list["accounts"][1]["id"].as_str().unwrap().to_owned();
+    let stored = kc.find("tagteam", &b_id).present().unwrap();
+    assert!(String::from_utf8(stored).unwrap().contains("rt-b2"));
+}
+
+#[test]
+fn by_default_the_test_binary_never_reaches_the_network() {
+    // The harness points every endpoint at OFFLINE_API_BASE: a switch that asks the oracle
+    // gets `PreSend` at once and still completes (the oracle is advisory, §7.6).
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let kc = FileKeychain::new(d.path().join("keychain"));
+    seed_home(&env);
+    login(&env, &kc, "a@x.co", "", "rt-a");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-b");
+    cmd(d.path()).arg("add").assert().success();
+    login(&env, &kc, "b@x.co", "", "rt-b2");
+    let started = std::time::Instant::now();
+    cmd(d.path()).args(["switch", "1"]).assert().success();
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }

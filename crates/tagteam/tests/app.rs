@@ -111,6 +111,7 @@ impl H {
             env: self.env.clone(),
             keychain: self.kc.clone(),
             platform: Platform::MacOs,
+            api_base: Some(common::OFFLINE_API_BASE.into()),
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = app::run(

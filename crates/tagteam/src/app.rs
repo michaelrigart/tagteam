@@ -4,19 +4,21 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tagteam_cc::ClaudeCode;
+use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::Platform;
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::net::UreqHttp;
-use tagteam_engine::oracle::NoOracle;
+use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::views::AccountView;
 use tagteam_engine::{Engine, EngineConfig, EngineError};
+use tagteam_provider::http::Http;
 use tagteam_provider::security::SecurityCli;
-use tagteam_provider::{Env, Keychain, LockState, SystemClock};
+use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
 
 use crate::cli::{Cli, Command};
 use crate::prompt::Prompter;
@@ -46,20 +48,29 @@ const ALIAS_USAGE: &str = "alias takes ACCOUNT NAME, ACCOUNT --unset, or no argu
 const TEST_KEYCHAIN_DIR: &str = "TAGTEAM_TEST_KEYCHAIN_DIR";
 #[cfg(any(test, feature = "test-support"))]
 const TEST_PLATFORM: &str = "TAGTEAM_TEST_PLATFORM";
+#[cfg(any(test, feature = "test-support"))]
+const TEST_API_BASE: &str = "TAGTEAM_TEST_API_BASE";
 
 pub struct Context {
     pub env: Env,
     pub keychain: Arc<dyn Keychain>,
     pub platform: Platform,
+    /// Every endpoint under this base instead of production; only a test-support build sets it.
+    pub api_base: Option<String>,
 }
 
-type Overrides = (Option<Arc<dyn Keychain>>, Option<Platform>);
+#[derive(Default)]
+struct Overrides {
+    keychain: Option<Arc<dyn Keychain>>,
+    platform: Option<Platform>,
+    api_base: Option<String>,
+}
 
-/// The test harness's keychain and platform, read through `var` so a test can supply the
-/// environment without mutating the process's.
+/// The test harness's keychain, platform and endpoint base, read through `var` so a test can
+/// supply the environment without mutating the process's.
 #[cfg(feature = "test-support")]
 fn test_overrides(var: &dyn Fn(&str) -> Option<OsString>) -> Overrides {
-    let kc = var(TEST_KEYCHAIN_DIR).map(|d| {
+    let keychain = var(TEST_KEYCHAIN_DIR).map(|d| {
         Arc::new(tagteam_provider::FileKeychain::new(
             std::path::PathBuf::from(d),
         )) as Arc<dyn Keychain>
@@ -69,22 +80,28 @@ fn test_overrides(var: &dyn Fn(&str) -> Option<OsString>) -> Overrides {
         Some("macos") => Some(Platform::MacOs),
         _ => None,
     };
-    (kc, platform)
+    let api_base = var(TEST_API_BASE).and_then(|v| v.into_string().ok());
+    Overrides {
+        keychain,
+        platform,
+        api_base,
+    }
 }
 
 /// A release build has no test overrides, whatever the environment holds.
 #[cfg(not(feature = "test-support"))]
 fn test_overrides(_var: &dyn Fn(&str) -> Option<OsString>) -> Overrides {
-    (None, None)
+    Overrides::default()
 }
 
 impl Context {
     pub fn from_process() -> Self {
-        let (kc, platform) = test_overrides(&|k| std::env::var_os(k));
+        let o = test_overrides(&|k| std::env::var_os(k));
         Self {
             env: Env::from_process(),
-            keychain: kc.unwrap_or_else(|| Arc::new(SecurityCli::new())),
-            platform: platform.unwrap_or_else(Platform::current),
+            keychain: o.keychain.unwrap_or_else(|| Arc::new(SecurityCli::new())),
+            platform: o.platform.unwrap_or_else(Platform::current),
+            api_base: o.api_base,
         }
     }
 }
@@ -96,18 +113,27 @@ pub struct Io<'a> {
 }
 
 fn build_engine(ctx: Context) -> Engine {
-    let cc = Arc::new(ClaudeCode::new(ctx.keychain.clone(), ctx.platform));
+    let mut cc = ClaudeCode::new(ctx.keychain.clone(), ctx.platform);
+    if let Some(base) = &ctx.api_base {
+        cc = cc.with_endpoints(Endpoints::with_base(base));
+    }
     let vault = match ctx.platform {
         Platform::MacOs => Vault::new(Box::new(KeychainVault::new(ctx.keychain))),
         Platform::Linux => Vault::new(Box::new(FileVault::new(ctx.env.data_dir().join("vault")))),
     };
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let http: Arc<dyn Http> = Arc::new(UreqHttp::new());
     Engine::new(EngineConfig {
         env: ctx.env,
-        registry: ProviderRegistry::new().with(cc),
+        registry: ProviderRegistry::new().with(Arc::new(cc)),
         vault,
-        oracle: Arc::new(NoOracle),
-        clock: Arc::new(SystemClock),
-        http: Arc::new(UreqHttp::new()),
+        // §7.6: asked at most once per credential within one command.
+        oracle: Arc::new(CachingOracle::new(HttpOracle::new(
+            http.clone(),
+            clock.clone(),
+        ))),
+        clock,
+        http,
         default_provider: ProviderId::new(CLAUDE_CODE),
     })
 }
@@ -581,11 +607,12 @@ impl App<'_, '_> {
 mod tests {
     use super::*;
 
-    /// An environment that sets both test overrides.
-    fn both_set(k: &str) -> Option<OsString> {
+    /// An environment that sets every test override.
+    fn all_set(k: &str) -> Option<OsString> {
         match k {
             TEST_KEYCHAIN_DIR => Some("/nonexistent/keychain".into()),
             TEST_PLATFORM => Some("linux".into()),
+            TEST_API_BASE => Some("http://127.0.0.1:9".into()),
             _ => None,
         }
     }
@@ -594,10 +621,14 @@ mod tests {
     /// release build) they are ignored, whatever the environment holds.
     #[test]
     fn the_test_overrides_exist_only_with_test_support() {
-        let (kc, platform) = test_overrides(&both_set);
+        let o = test_overrides(&all_set);
         let honoured = cfg!(feature = "test-support");
-        assert_eq!(kc.is_some(), honoured);
-        assert_eq!(platform, honoured.then_some(Platform::Linux));
+        assert_eq!(o.keychain.is_some(), honoured);
+        assert_eq!(o.platform, honoured.then_some(Platform::Linux));
+        assert_eq!(
+            o.api_base.as_deref(),
+            honoured.then_some("http://127.0.0.1:9")
+        );
     }
 
     #[test]

@@ -15,6 +15,10 @@ use tagteam_provider::{Env, Keychain};
 /// Appendix A.3's refusal, pinned verbatim: its wording is part of the user-facing contract.
 pub const LOCKED: &str = "the login keychain is locked (common over SSH); run `security unlock-keychain ~/Library/Keychains/login.keychain-db`, then retry";
 
+/// Where every endpoint points unless a test starts a `MockServer`: a local port nothing
+/// listens on, so a request fails at once as `PreSend` and no test reaches the network.
+pub const OFFLINE_API_BASE: &str = "http://127.0.0.1:9";
+
 /// The binary in an isolated environment rooted at `root`, with its file-backed Keychain.
 pub fn std_cmd(root: &Path) -> std::process::Command {
     let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("tagteam"));
@@ -23,7 +27,8 @@ pub fn std_cmd(root: &Path) -> std::process::Command {
         .env("USER", "tester")
         .env("PATH", std::env::var_os("PATH").unwrap())
         .env("TAGTEAM_TEST_KEYCHAIN_DIR", root.join("keychain"))
-        .env("TAGTEAM_TEST_PLATFORM", "macos");
+        .env("TAGTEAM_TEST_PLATFORM", "macos")
+        .env("TAGTEAM_TEST_API_BASE", OFFLINE_API_BASE);
     c
 }
 
