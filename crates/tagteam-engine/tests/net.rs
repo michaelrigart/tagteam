@@ -38,7 +38,7 @@ fn every_request_carries_tagteams_user_agent_and_only_it() {
     );
     let req =
         HttpRequest::get(format!("{}/p", server.base_url()), T).header("user-agent", "evil/1");
-    let resp = UreqHttp::new().send(&req).unwrap();
+    let resp = UreqHttp::direct().send(&req).unwrap();
     assert_eq!(resp.status, 200);
     assert_eq!(resp.header("x-thing"), Some("v"));
     assert!(
@@ -71,7 +71,7 @@ fn a_json_post_round_trips_with_its_headers() {
     );
     let req = HttpRequest::post_json(format!("{}/t", server.base_url()), &json!({"a": 1}), T)
         .bearer("tok");
-    let resp = UreqHttp::default().send(&req).unwrap();
+    let resp = UreqHttp::direct().send(&req).unwrap();
     assert_eq!(resp.json(), Some(json!({"ok": true})));
     let seen = &server.requests()[0];
     assert_eq!(seen.body, br#"{"a":1}"#);
@@ -97,7 +97,7 @@ fn a_4xx_is_a_response_not_an_error() {
         },
     );
     let req = HttpRequest::post_json(format!("{}/t", server.base_url()), &json!({}), T);
-    let resp = UreqHttp::new().send(&req).unwrap();
+    let resp = UreqHttp::direct().send(&req).unwrap();
     assert_eq!(resp.status, 400);
     assert_eq!(resp.json(), Some(json!({"error": "invalid_grant"})));
 }
@@ -118,7 +118,7 @@ fn redirects_are_returned_not_followed() {
         },
     );
     let req = HttpRequest::get(format!("{}/moved", server.base_url()), T).bearer("tok");
-    let resp = UreqHttp::new().send(&req).unwrap();
+    let resp = UreqHttp::direct().send(&req).unwrap();
     assert_eq!(resp.status, 302);
     assert_eq!(
         server.hits("GET", "/elsewhere"),
@@ -139,7 +139,7 @@ fn a_body_over_one_mebibyte_is_ambiguous() {
             body: vec![b'x'; MAX_BODY + 1],
         },
     );
-    let r = UreqHttp::new().send(&HttpRequest::get(format!("{}/big", server.base_url()), T));
+    let r = UreqHttp::direct().send(&HttpRequest::get(format!("{}/big", server.base_url()), T));
     assert!(is_ambiguous(&r), "{r:?}");
 }
 
@@ -147,7 +147,7 @@ fn a_body_over_one_mebibyte_is_ambiguous() {
 fn a_connection_closed_without_a_reply_is_ambiguous() {
     let server = MockServer::start();
     server.on("POST", "/t", MockReply::Close);
-    let r = UreqHttp::new().send(&HttpRequest::post_json(
+    let r = UreqHttp::direct().send(&HttpRequest::post_json(
         format!("{}/t", server.base_url()),
         &json!({"refresh_token": "x"}),
         T,
@@ -165,7 +165,7 @@ fn a_server_that_never_answers_times_out_as_ambiguous() {
     let server = MockServer::start();
     server.on("GET", "/h", MockReply::Hang);
     let t = Instant::now();
-    let r = UreqHttp::new().send(&HttpRequest::get(
+    let r = UreqHttp::direct().send(&HttpRequest::get(
         format!("{}/h", server.base_url()),
         Duration::from_millis(300),
     ));
@@ -182,7 +182,7 @@ fn a_refused_connection_is_pre_send() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
-    let r = UreqHttp::new().send(&HttpRequest::get(format!("http://127.0.0.1:{port}/"), T));
+    let r = UreqHttp::direct().send(&HttpRequest::get(format!("http://127.0.0.1:{port}/"), T));
     assert!(is_pre_send(&r), "{r:?}");
 }
 
@@ -208,9 +208,72 @@ fn a_host_that_does_not_resolve_is_pre_send() {
         },
     );
     for resolver in [no_such_host as Resolver, no_addresses] {
-        let r = UreqHttp::with_resolver(resolver)
+        let r = UreqHttp::with_proxy(resolver, None)
             .send(&HttpRequest::get(format!("{}/p", server.base_url()), T));
         assert!(is_pre_send(&r), "{r:?}");
     }
     assert_eq!(server.hits("GET", "/p"), 0, "nothing was sent");
+}
+
+/// The proxy resolves the host, so tagteam must not: the request reaches a proxy that answers,
+/// though the injected resolver cannot resolve the host it names.
+#[test]
+fn a_proxy_resolves_the_host_so_tagteam_does_not() {
+    let proxy = MockServer::start();
+    // ureq asks an HTTP proxy to CONNECT; whatever it answers, the request reached it.
+    proxy.on(
+        "CONNECT",
+        "unresolvable.invalid:80",
+        MockReply::Raw {
+            status: 502,
+            headers: vec![],
+            body: vec![],
+        },
+    );
+    let proxy_url = ureq::Proxy::new(&proxy.base_url()).unwrap();
+    let r = UreqHttp::with_proxy(no_such_host, Some(proxy_url))
+        .send(&HttpRequest::get("http://unresolvable.invalid/p", T));
+    assert_eq!(proxy.hits("CONNECT", "unresolvable.invalid:80"), 1, "{r:?}");
+    let not_resolve = match &r {
+        Err(HttpError::PreSend(m)) => !m.contains("resolve"),
+        _ => true,
+    };
+    assert!(not_resolve, "the host was resolved by tagteam: {r:?}");
+}
+
+/// A host the proxy is told not to handle is resolved by tagteam as usual.
+#[test]
+fn a_host_covered_by_no_proxy_is_still_resolved_by_tagteam() {
+    let proxy = MockServer::start();
+    let proxy_url = ureq::Proxy::builder(ureq::ProxyProtocol::Http)
+        .host("127.0.0.1")
+        .port(
+            proxy
+                .base_url()
+                .rsplit(':')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap(),
+        )
+        .no_proxy("unresolvable.invalid")
+        .build()
+        .unwrap();
+    let r = UreqHttp::with_proxy(no_such_host, Some(proxy_url))
+        .send(&HttpRequest::get("http://unresolvable.invalid/p", T));
+    assert!(is_pre_send(&r), "{r:?}");
+    assert_eq!(proxy.requests().len(), 0, "the proxy was never asked");
+}
+
+/// A proxy that cannot be reached is `PreSend`: nothing was sent.
+#[test]
+fn an_unreachable_proxy_is_pre_send() {
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let proxy = ureq::Proxy::new(&format!("http://127.0.0.1:{port}")).unwrap();
+    let r = UreqHttp::with_proxy(no_such_host, Some(proxy))
+        .send(&HttpRequest::get("http://unresolvable.invalid/p", T));
+    assert!(is_pre_send(&r), "{r:?}");
 }

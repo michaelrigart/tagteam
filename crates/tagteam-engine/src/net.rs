@@ -10,8 +10,9 @@ use std::time::{Duration, Instant};
 use tagteam_provider::http::{
     Http, HttpError, HttpRequest, HttpResponse, MAX_BODY, Method, USER_AGENT,
 };
-use ureq::Agent;
+use ureq::http::Uri;
 use ureq::tls::{RootCerts, TlsConfig};
+use ureq::{Agent, Proxy};
 
 /// Resolves a host and port to addresses. Injectable, so a test can fail a lookup without
 /// asking the machine's real resolver (§15.1).
@@ -28,17 +29,35 @@ pub struct UreqHttp {
 
 impl UreqHttp {
     /// 4xx and 5xx are responses, not errors; redirects are never followed, so a request that
-    /// carries a token is only ever sent where the provider addressed it.
+    /// carries a token is only ever sent where the provider addressed it. Honours the standard
+    /// proxy environment variables (§4.4).
     pub fn new() -> Self {
         Self::with_resolver(system_resolver)
     }
 
-    /// `new()`, with the lookup that decides whether a DNS failure is `PreSend` replaced.
+    /// `new()`, with the lookup that decides whether a DNS failure is `PreSend` replaced. The
+    /// proxy still comes from the environment.
     pub fn with_resolver(resolver: Resolver) -> Self {
+        Self::build(resolver, Proxy::try_from_env())
+    }
+
+    /// `with_resolver`, with the proxy given explicitly instead of read from the environment:
+    /// `None` sends direct. Tests use this so they never inherit the machine's proxy (§15.1).
+    pub fn with_proxy(resolver: Resolver, proxy: Option<Proxy>) -> Self {
+        Self::build(resolver, proxy)
+    }
+
+    /// The system resolver, no proxy: a test's adapter for a local server.
+    pub fn direct() -> Self {
+        Self::build(system_resolver, None)
+    }
+
+    fn build(resolver: Resolver, proxy: Option<Proxy>) -> Self {
         let config = Agent::config_builder()
             .http_status_as_error(false)
             .max_redirects(0)
             .user_agent(USER_AGENT)
+            .proxy(proxy)
             .tls_config(
                 TlsConfig::builder()
                     .root_certs(RootCerts::PlatformVerifier)
@@ -49,6 +68,16 @@ impl UreqHttp {
             agent: config.into(),
             resolver,
         }
+    }
+
+    /// Whether a proxy resolves `uri`'s host for us: one is configured, `no_proxy` does not
+    /// cover the URI, and the proxy does not ask its client to resolve (SOCKS4). Then tagteam
+    /// must not look the host up itself, since a proxied network may have no external DNS.
+    fn proxy_resolves(&self, uri: &Uri) -> bool {
+        self.agent
+            .config()
+            .proxy()
+            .is_some_and(|p| !p.is_no_proxy(uri) && !p.resolve_target())
     }
 }
 
@@ -95,10 +124,7 @@ fn classify(e: ureq::Error) -> HttpError {
 /// Resolves the URL's host within `timeout`, so a DNS failure is a certain `PreSend`: `ureq`
 /// reports a failed lookup as a plain I/O error, which on its own could also have come after
 /// the request left.
-fn resolve(url: &str, timeout: Duration, resolver: Resolver) -> Result<(), HttpError> {
-    let uri: ureq::http::Uri = url
-        .parse()
-        .map_err(|e| HttpError::PreSend(format!("invalid URL: {e}")))?;
+fn resolve(uri: &Uri, timeout: Duration, resolver: Resolver) -> Result<(), HttpError> {
     let host = uri
         .host()
         .ok_or_else(|| HttpError::PreSend("the URL has no host".into()))?
@@ -129,7 +155,13 @@ fn resolve(url: &str, timeout: Duration, resolver: Resolver) -> Result<(), HttpE
 impl Http for UreqHttp {
     fn send(&self, req: &HttpRequest) -> Result<HttpResponse, HttpError> {
         let started = Instant::now();
-        resolve(&req.url, req.timeout, self.resolver)?;
+        let uri: Uri = req
+            .url
+            .parse()
+            .map_err(|e| HttpError::PreSend(format!("invalid URL: {e}")))?;
+        if !self.proxy_resolves(&uri) {
+            resolve(&uri, req.timeout, self.resolver)?;
+        }
         let remaining = req.timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(HttpError::PreSend(
