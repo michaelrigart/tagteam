@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_provider::{Clock, Env, MutationGuard, Provider, Read};
+use tagteam_provider::{Clock, Env, Http, MutationGuard, Provider, Read};
 
 use crate::account_lock::AccountLock;
 use crate::error::EngineError;
@@ -18,6 +18,8 @@ pub struct EngineConfig {
     pub vault: Vault,
     pub oracle: Arc<dyn Oracle>,
     pub clock: Arc<dyn Clock>,
+    /// Every network request goes through this port (§4.4).
+    pub http: Arc<dyn Http>,
     pub default_provider: ProviderId,
 }
 
@@ -27,6 +29,7 @@ pub struct Engine {
     pub(crate) vault: Vault,
     pub(crate) oracle: Arc<dyn Oracle>,
     pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) http: Arc<dyn Http>,
     pub(crate) default_provider: ProviderId,
     store: Mutex<Option<Arc<Store>>>,
     #[cfg(feature = "test-hooks")]
@@ -44,6 +47,7 @@ impl Engine {
             vault: cfg.vault,
             oracle: cfg.oracle,
             clock: cfg.clock,
+            http: cfg.http,
             default_provider: cfg.default_provider,
             store: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
@@ -63,6 +67,11 @@ impl Engine {
 
     pub fn now_ms(&self) -> i64 {
         self.clock.now_ms()
+    }
+
+    /// The port providers send their requests through (§4.4).
+    pub fn http(&self) -> &dyn Http {
+        self.http.as_ref()
     }
 
     fn store_path(&self) -> PathBuf {
@@ -269,6 +278,7 @@ mod tests {
             vault: Vault::new(Box::new(KeychainVault::new(Arc::new(FakeKeychain::new())))),
             oracle: Arc::new(NoOracle),
             clock: Arc::new(tagteam_provider::SystemClock),
+            http: Arc::new(tagteam_provider::NoHttp),
             default_provider: ProviderId::new("p"),
         })
     }

@@ -7,6 +7,7 @@ use tagteam_cc::ClaudeCode;
 use tagteam_cc::live::Platform;
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
+use tagteam_engine::net::UreqHttp;
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::store::AccountRow;
@@ -106,6 +107,7 @@ fn build_engine(ctx: Context) -> Engine {
         vault,
         oracle: Arc::new(NoOracle),
         clock: Arc::new(SystemClock),
+        http: Arc::new(UreqHttp::new()),
         default_provider: ProviderId::new(CLAUDE_CODE),
     })
 }

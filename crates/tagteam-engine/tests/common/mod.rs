@@ -21,7 +21,8 @@ use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBacke
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{
-    Credential, Env, FakeClock, FakeKeychain, Identity, MutationGuard, ProcessStamp, Provider, Read,
+    Credential, Env, FakeClock, FakeKeychain, Identity, MutationGuard, ProcessStamp, Provider,
+    Read, ScriptedHttp,
 };
 
 /// An oracle that answers whatever the test sets.
@@ -168,6 +169,8 @@ pub struct Fx {
     pub kc: Arc<FakeKeychain>,
     pub oracle: Arc<FixedOracle>,
     pub clock: Arc<FakeClock>,
+    /// Every engine this fixture builds sends through this one scripted port.
+    pub http: Arc<ScriptedHttp>,
     pub cc: Arc<ClaudeCode>,
     pub engine: Engine,
 }
@@ -248,6 +251,7 @@ impl Fx {
         let kc = Arc::new(FakeKeychain::new());
         let oracle = Arc::new(FixedOracle::default());
         let clock = Arc::new(FakeClock::new(1_790_000_000_000));
+        let http = Arc::new(ScriptedHttp::new());
         let cc = Arc::new(tune(ClaudeCode::with_store(
             LiveStore::new(kc.clone(), platform).with_retry_delay(Duration::ZERO),
         )));
@@ -261,6 +265,7 @@ impl Fx {
             vault,
             oracle: oracle.clone(),
             clock: clock.clone(),
+            http: http.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
         });
         Fx {
@@ -270,6 +275,7 @@ impl Fx {
             kc,
             oracle,
             clock,
+            http,
             cc,
             engine,
         }
@@ -512,6 +518,7 @@ impl Fx {
             vault,
             oracle,
             clock: self.clock.clone(),
+            http: self.http.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
         })
     }
