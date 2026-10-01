@@ -115,6 +115,22 @@ fn a_managed_login_prints_its_line_from_the_stored_reading() {
 }
 
 #[test]
+fn an_empty_colour_variable_is_as_good_as_unset() {
+    let (d, _, _) = managed(0);
+    statusline(d.path())
+        .env("NO_COLOR", "")
+        .assert()
+        .success()
+        .stdout(format!("b · 5h 9% · 7d {YELLOW_77}%\n"));
+    write_config(d.path(), "[ui]\ncolor = \"never\"\n");
+    statusline(d.path())
+        .env("FORCE_COLOR", "")
+        .assert()
+        .success()
+        .stdout("b · 5h 9% · 7d 77%\n");
+}
+
+#[test]
 fn the_format_and_colour_come_from_config_toml() {
     let (d, _, _) = managed(0);
     write_config(

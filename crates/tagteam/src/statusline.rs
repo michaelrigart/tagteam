@@ -10,9 +10,7 @@ use tagteam_core::{CLAUDE_CODE, ProviderId, Window, WindowKind};
 use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
-use tagteam_engine::settings::{
-    ColorMode, STATUSLINE_MODEL_PREFIX, Settings, is_statusline_placeholder,
-};
+use tagteam_engine::settings::{STATUSLINE_MODEL_PREFIX, Settings, is_statusline_placeholder};
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, StatuslineView};
 use tagteam_engine::{Engine, EngineConfig};
@@ -40,22 +38,6 @@ pub(crate) fn drain(input: impl std::io::Read, terminal: bool) -> u64 {
         return 0;
     }
     std::io::copy(&mut input.take(STDIN_CAP), &mut std::io::sink()).unwrap_or(0)
-}
-
-/// Whether the line is coloured. `--no-color` and `NO_COLOR` switch colour off, and
-/// `FORCE_COLOR` switches it on. Otherwise only `ui.color = never` switches it off: the line
-/// goes to Claude Code, which renders ANSI colour but is never a terminal, so `auto`'s terminal
-/// test would turn colour off exactly where it is shown.
-pub(crate) fn colour(
-    no_color_flag: bool,
-    no_color_env: bool,
-    force_color_env: bool,
-    setting: ColorMode,
-) -> bool {
-    if no_color_flag || no_color_env {
-        return false;
-    }
-    force_color_env || setting != ColorMode::Never
 }
 
 /// §4.5: the command refuses for a provider without the `statusline` capability.
@@ -450,25 +432,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn colour_follows_the_flag_the_environment_then_the_setting() {
-        assert!(colour(false, false, false, ColorMode::Auto), "auto colours");
-        assert!(colour(false, false, false, ColorMode::Always));
-        assert!(!colour(false, false, false, ColorMode::Never));
-        assert!(
-            !colour(true, false, true, ColorMode::Always),
-            "--no-color wins"
-        );
-        assert!(
-            !colour(false, true, true, ColorMode::Always),
-            "NO_COLOR wins"
-        );
-        assert!(
-            colour(false, false, true, ColorMode::Never),
-            "FORCE_COLOR outranks never"
-        );
-    }
-
     /// A reader that fails the test if it is ever read.
     struct Untouchable;
 
@@ -567,6 +530,7 @@ mod tests {
             keychain: kc,
             platform: Platform::MacOs,
             api_base: Some("http://127.0.0.1:9".into()),
+            stdout_terminal: false,
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = run(
@@ -638,6 +602,7 @@ mod tests {
             keychain: Arc::new(FakeKeychain::new()),
             platform: Platform::MacOs,
             api_base: None,
+            stdout_terminal: false,
         };
         let (built, http, keychain) = engine(ctx, &provider);
         let view = built.statusline(&provider).unwrap();
