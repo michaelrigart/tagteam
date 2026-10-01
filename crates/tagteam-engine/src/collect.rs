@@ -81,8 +81,8 @@ impl Engine {
     /// store failing under it): every thread is joined and kept, and that account's outcome is
     /// `Failed { kind: "error" }` with one warning naming it, so one account never costs the
     /// others' outcomes. `Err` only for an error before any thread starts (opening the store,
-    /// reading the listed accounts). IDs that name no account are skipped. Never creates the
-    /// store.
+    /// reading the listed accounts, reading each provider's recorded active account). IDs
+    /// that name no account are skipped. Never creates the store.
     pub fn collect_usage(&self, mode: CollectMode) -> Result<CollectReport, EngineError> {
         let CollectMode::OnDemand { accounts } = mode;
         hooks::point(self, "usage-collect-start")?;
@@ -105,6 +105,7 @@ impl Engine {
                 recorded.insert(row.provider.clone(), store.active(&row.provider)?);
             }
         }
+        hooks::point(self, "usage-roles-between-reads")?;
         let live = self.live_accounts(&rows);
         let results: Vec<Result<Outcome, EngineError>> = thread::scope(|s| {
             let running: Vec<_> = rows

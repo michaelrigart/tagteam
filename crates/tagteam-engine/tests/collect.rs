@@ -1315,4 +1315,30 @@ mod hooks {
         assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
         assert_eq!(state(&fx, &a).poll_interval_s, Some(270));
     }
+
+    #[test]
+    fn a_switch_between_the_record_read_and_the_live_read_keeps_its_plan() {
+        // Pins the read order: the recorded active account is read before the live login. A
+        // switch to a commits between the two reads, so the live read already names a and a
+        // is planned as the active account (270), not the candidate (450). Were the live
+        // login read first, it would name b, the record read after the switch would name a on
+        // both ends of the collection, and the pre-switch role would be planned.
+        let fx = Fx::new();
+        let a = two_accounts(&fx); // b is live and recorded
+        fx.script_usage(200, usage_fixture());
+        let other = Arc::new(fx.engine_with_env(fx.env.clone()));
+        let request = fx.switch_request(&a, false);
+        fx.engine.on_point(
+            "usage-roles-between-reads",
+            Box::new(move || {
+                other.switch(request.clone()).unwrap();
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        assert_eq!(report.outcomes, [(a.clone(), Collected::Recorded)]);
+        assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+        assert_eq!(state(&fx, &a).poll_interval_s, Some(270));
+    }
 }
