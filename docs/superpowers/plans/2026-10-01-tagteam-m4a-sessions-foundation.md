@@ -34,7 +34,7 @@
 
 **Tech Stack:** Rust (edition 2024), rusqlite (bundled), serde_json (`preserve_order`, `arbitrary_precision`), libc, `unicode-normalization` (already in `tagteam-cc`), clap 4, thiserror, tracing. Tests use tempfile, assert_cmd, `FakeKeychain`, `FakeClock`, `ScriptedHttp`, the new `FakeProcessProbe`, and `MockServer`.
 
-**Spec:** `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md`, signed off at `f686839` (M4 amendments `1e79bb9`, storage-write marking `59d5104`, rollback restore `f686839`). Decision 16 amends §12.6 and awaits Michael's sign-off before execution. Read these before starting any task:
+**Spec:** `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md`, signed off at `f686839` (M4 amendments `1e79bb9`, storage-write marking `59d5104`, rollback restore `f686839`). Decision 16 amends §12.6; Michael signed it off on 2026-10-01, and Task 17 writes it into the spec. Read these before starting any task:
 - §2, §3, §4.2, §4.3, §4.5, §5, §6.1, §6.2;
 - §7.2, §7.3, §7.5, §8.1;
 - §9.2, §9.4, §9.6, §10.1, §10.3;
@@ -106,7 +106,7 @@ Rulings made while planning. Each names what it would cost if wrong.
 13. **The statusline's provider order is** `--provider`, the run shell's marker, any provider that says the process was invoked by it (`Provider::invoked_by`), then `default_provider` (§13.5). With one statusline-capable provider registered, all four agree today.
 14. **Link sync is engine-generic.** The provider supplies the policy: the source home, the allowlist, the must-share entries and the known-private patterns. `run.share_extra` adds names. Each `*` in a private pattern matches any run of characters. Cost if wrong: a richer matcher.
 15. **`DoomedEntry.on_fallback` and `read_services` are removed.** With one Keychain item per spelling, `on_fallback` was constantly false, and its filters were dead code. Cost if wrong: none, the behaviour is unchanged.
-16. **An `lstart` mismatch on its own is not proof of recycling** (amends §12.6; flagged for Michael's sign-off with this plan). A record whose `procStart` is `lstart` text and whose pid exists is judged by the start-time match within ±1 s. A mismatch counts as recycled only when the process also does not mention the provider's launch command. A mismatch on a process that mentions it counts as live, and so does one whose `mentions` is unknown.
+16. **An `lstart` mismatch on its own is not proof of recycling** (amends §12.6; signed off by Michael on 2026-10-01). A record whose `procStart` is `lstart` text and whose pid exists is judged by the start-time match within ±1 s. A mismatch counts as recycled only when the process also does not mention the provider's launch command. A mismatch on a process that mentions it counts as live, and so does one whose `mentions` is unknown.
     - **Why:** on Linux the start time is computed from `/proc/stat` `btime`, which moves with the wall clock, and procps may compute its own `lstart` from the uptime clock. After a suspend or a clock step, a live session could otherwise read as recycled, which is the unsafe direction (§12.6: anything undetermined counts as live).
     - **Cost if wrong:** an account stays session-owned while an unrelated `claude` process holds its old pid. That is the safe direction.
     - Task 6's `record_is_live` and its tests implement it. Task 17 adds the spec edit to §12.6.
