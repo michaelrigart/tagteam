@@ -81,6 +81,13 @@ pub enum EngineError {
         app: &'static str,
         lock: PathBuf,
     },
+    /// An interrupted switch whose recovery found its agent writing the credential entry it was
+    /// clearing (§9.1's `EntryMoved`): nothing was cleared and the row stays, so a plain retry
+    /// settles it. Not an undecidable row, so `--force` is not the way out either.
+    #[error(
+        "an interrupted switch for {provider} could not be recovered yet: {app} changed its credential while it was being recovered; retry to settle it"
+    )]
+    RecoveryMoved { provider: String, app: &'static str },
     /// §6.2: a refreshed successor sits in `rescue/` and could not be adopted, or a rescue file
     /// for the account cannot be read. Activating or refreshing the vault's generation would
     /// use a token the server has already consumed.
@@ -142,7 +149,9 @@ impl EngineError {
             EngineError::NoSuchAccount(_) => "no-such-account",
             EngineError::Ambiguous { .. } => "ambiguous-account",
             EngineError::InterruptedSwitch(_) => "interrupted-switch",
-            EngineError::RecoveryBlocked { .. } => "interrupted-switch",
+            EngineError::RecoveryBlocked { .. } | EngineError::RecoveryMoved { .. } => {
+                "interrupted-switch"
+            }
             EngineError::RescuePending { .. } => "rescue-pending",
             EngineError::RolledBack(_) => "rolled-back",
             EngineError::RollbackFailed { .. } => "rollback-failed",
@@ -266,6 +275,13 @@ mod tests {
                     provider: "p".into(),
                     app: "a",
                     lock: PathBuf::from("x"),
+                },
+                "interrupted-switch",
+            ),
+            (
+                EngineError::RecoveryMoved {
+                    provider: "p".into(),
+                    app: "a",
                 },
                 "interrupted-switch",
             ),

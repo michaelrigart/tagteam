@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_provider::{Cancel, Clock, Env, Http, MutationGuard, Provider, Read};
+use tagteam_provider::{Cancel, Clock, Env, Http, MutationGuard, Provider, ProviderError, Read};
 
 use crate::account_lock::AccountLock;
 use crate::error::EngineError;
@@ -212,7 +212,8 @@ impl Engine {
     }
 
     /// `mutation_guard`, with the refusal for each row whose recovery could not take its
-    /// provider's live locks (`RecoveryBlocked`), by provider. With `ask_oracle` false the
+    /// provider's live locks or whose entry its agent wrote meanwhile (`RecoveryBlocked`,
+    /// `RecoveryMoved`), by provider. With `ask_oracle` false the
     /// rows are recovered from fingerprints alone: no network call (§7.6, §9.6). A recovery
     /// interrupted at one of its lock waits ends the command with that interruption (§14.1).
     fn guard_recovering(
@@ -242,13 +243,30 @@ impl Engine {
                 .find(|(r, _)| *r == row)
                 .map_or(&[][..], |(_, h)| h.as_slice());
             if let Err(e) = self.recover_one(&guard, &row, hint) {
+                // CC wrote the entry recovery was clearing: nothing was cleared, the row stays,
+                // and a plain retry settles it.
+                let e = match e {
+                    EngineError::Provider(ProviderError::EntryMoved(_)) => {
+                        match self.provider(&row.provider) {
+                            Ok(p) => EngineError::RecoveryMoved {
+                                provider: row.provider.to_string(),
+                                app: p.display_name(),
+                            },
+                            Err(e) => e,
+                        }
+                    }
+                    e => e,
+                };
                 // Interrupted at a lock wait, the recovery wrote nothing and its row stays for
                 // the next command. Reported as itself, never as a switch it could not settle.
                 if e.signal().is_some() {
                     return Err(e);
                 }
                 tracing::warn!(provider = %row.provider, "could not recover an interrupted switch: {e}");
-                if matches!(e, EngineError::RecoveryBlocked { .. }) {
+                if matches!(
+                    e,
+                    EngineError::RecoveryBlocked { .. } | EngineError::RecoveryMoved { .. }
+                ) {
                     blocked.push((row.provider.clone(), e));
                 }
             }
