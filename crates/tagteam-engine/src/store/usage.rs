@@ -378,7 +378,9 @@ impl Store {
     /// - `access_fp`, the fingerprint of the exact bytes about to be sent, must not equal the
     ///   durable `rejected_fp` (§8.1), which another holder may have stamped since the caller
     ///   read it; otherwise `Rejected`, and nothing is written.
-    /// - Then the slot to send under: `slot` itself while it is at most `slot_valid_s` old;
+    /// - Then the slot to send under: `slot` itself while it is less than `slot_valid_s` old
+    ///   in whole seconds, so the request leaves less than `slot_valid_s` after the instant it
+    ///   was reserved, and stays counted for at least the hour after it is sent (§8.6);
     ///   otherwise a fresh one, after giving the stale one back by its full identity; a fresh
     ///   one when `slot` is `None` (the 401 retry, whose first slot was sent). Counted against
     ///   the reservation's `(provider, identity_key)`. `OverBudget` when no fresh slot is free;
@@ -411,7 +413,7 @@ impl Store {
             }
         }
         if let Some(held) = slot {
-            if now_s - held.slot_at <= budget.slot_valid_s {
+            if now_s - held.slot_at < budget.slot_valid_s {
                 return Ok(SendGrant::Send(held.clone()));
             }
             delete_slot(&tx, r, held)?;

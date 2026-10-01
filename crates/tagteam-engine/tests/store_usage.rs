@@ -357,13 +357,48 @@ fn a_slot_still_valid_is_the_one_sent_under() {
     let (_d, path, s) = open();
     let a = add(&s, &cc(), "a", "a@x.co", 1);
     let r = reserved(&s, &a, T_MS);
-    let last_valid_ms = (T + B.slot_valid_s) * 1000;
+    let last_valid_ms = (T + B.slot_valid_s) * 1000 - 1;
     assert_eq!(
         s.authorize_send(&r, Some(&slot_of(&r)), Some("sha256:ok"), last_valid_ms, &B)
             .unwrap(),
         SendGrant::Send(slot_of(&r))
     );
     assert_eq!(slot_times(&path, &cc(), "a@x.co\n"), vec![T]);
+}
+
+#[test]
+fn a_slot_is_stale_once_its_whole_second_age_reaches_slot_valid_s() {
+    // §8.6: the count covers the hour plus the slot validity so that send times stay within
+    // the budget, so a send must leave less than `slot_valid_s` after the reservation instant.
+    // Slots hold whole seconds: one reserved late in its second (T.999 reads as T) is valid at
+    // age 59 and stale at age 60, which is only just over 59 s of real time.
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let r = reserved(&s, &a, T_MS + 999);
+    assert_eq!(r.slot_at, T);
+    let age = |secs: i64| (T + secs) * 1000;
+    assert_eq!(
+        s.authorize_send(&r, Some(&slot_of(&r)), None, age(B.slot_valid_s - 1), &B)
+            .unwrap(),
+        SendGrant::Send(slot_of(&r)),
+        "age 59: still the held slot"
+    );
+    let SendGrant::Send(fresh) = s
+        .authorize_send(&r, Some(&slot_of(&r)), None, age(B.slot_valid_s), &B)
+        .unwrap()
+    else {
+        panic!("a slot is free");
+    };
+    assert_eq!(
+        fresh.slot_at,
+        T + B.slot_valid_s,
+        "age 60: a fresh slot, never the held one"
+    );
+    assert_eq!(
+        slot_times(&path, &cc(), "a@x.co\n"),
+        vec![T + B.slot_valid_s],
+        "the stale slot went back"
+    );
 }
 
 #[test]
