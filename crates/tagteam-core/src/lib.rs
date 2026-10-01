@@ -4,9 +4,11 @@ pub mod classify;
 pub mod fingerprint;
 pub mod ids;
 pub mod rotation;
+pub mod usage;
 pub mod validate;
 
 pub use classify::{OracleVerdict, OutgoingAction, OutgoingClass, OutgoingFacts, decide_outgoing};
 pub use fingerprint::Fingerprint;
 pub use ids::{AccountId, CLAUDE_CODE, IdentityKey, ProviderId};
 pub use rotation::rotation_order;
+pub use usage::{Window, WindowKind};
