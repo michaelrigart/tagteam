@@ -769,8 +769,9 @@ impl Engine {
 
     /// §9.3 `best`: the known candidate with the most headroom, if it beats the live
     /// account's; every known one, with a warning, when the live headroom is unknown or there
-    /// is no managed live login. A candidate whose headroom is unknown is never picked, and a
-    /// warning counts them. A better candidate whose vault holds nothing is not switchable, so
+    /// is no managed live login, but with a managed live login of unknown headroom never one
+    /// known to be at its limit (`candidates-exhausted` when all are). A candidate whose
+    /// headroom is unknown is never picked, and a warning counts them. A better candidate whose vault holds nothing is not switchable, so
     /// a walk that finds none to activate is `already-best` (or `usage-unavailable` when the
     /// live headroom is unknown).
     fn best_pick(
@@ -819,6 +820,27 @@ impl Engine {
                 Ranked::Stay(SwitchReason::AlreadyBest, message, notes)
             }
             BestOrder::Try(order) => {
+                // §9.3: a managed live login of unknown usage is switched away from, but never
+                // to a candidate known to be at its limit. With no live login at all, the best
+                // known is picked as it is.
+                let (order, exhausted): (Vec<u32>, Vec<u32>) =
+                    if live_row.is_some() && live_headroom.is_none() {
+                        order.into_iter().partition(|position| {
+                            at(position)
+                                .and_then(|r| r.headroom(models))
+                                .is_none_or(|h| h > 0.0)
+                        })
+                    } else {
+                        (order, Vec::new())
+                    };
+                if order.is_empty() {
+                    let exhausted: Vec<&Rated> = exhausted.iter().filter_map(at).collect();
+                    return Ok(Ranked::Stay(
+                        SwitchReason::CandidatesExhausted,
+                        self.exhausted_message(&exhausted, models),
+                        notes,
+                    ));
+                }
                 match self.walk(order.iter().filter_map(at).map(|r| r.row.clone()))? {
                     Some((pick, _)) => {
                         if live_headroom.is_none() {

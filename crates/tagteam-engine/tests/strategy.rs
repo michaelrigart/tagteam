@@ -354,6 +354,62 @@ fn best_with_the_live_usage_unknown_switches_to_the_best_known_with_a_warning() 
 }
 
 #[test]
+fn best_with_the_live_usage_unknown_never_picks_a_candidate_known_to_be_at_its_limit() {
+    // §9.3: a managed live login of unknown usage may be switched away from, but never to an
+    // account known to be exhausted. Here a is exhausted and b is not: b is the pick.
+    let fx = Fx::new();
+    let (a, b, _c) = three(&fx); // c is live and never read
+    read(&fx, &a, &reading(100.0, 20.0, 0.0));
+    read(&fx, &b, &reading(10.0, 95.0, 0.0));
+    let out = best(&fx).unwrap();
+    assert_eq!((out.switched, out.to.unwrap().id), (true, b));
+    assert_eq!(
+        out.warnings,
+        ["switching to the best known candidate; the live account's usage is unknown"]
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+#[test]
+fn best_with_the_live_usage_unknown_and_every_known_candidate_exhausted_switches_nowhere() {
+    let fx = Fx::new();
+    let (a, b, _c) = three(&fx); // c is live and never read
+    read(&fx, &a, &reading(10.0, 100.0, 0.0));
+    read(&fx, &b, &reading(104.0, 100.0, 0.0));
+    let out = best(&fx).unwrap();
+    assert_eq!(
+        (out.switched, out.reason, out.strategy),
+        (false, SwitchReason::CandidatesExhausted, "best")
+    );
+    assert_eq!(
+        out.message,
+        "every candidate is at its limit: a@x.co (7d at 100%), b@x.co (5h at 104%); the earliest reset is in 3d09h"
+    );
+    assert_eq!(
+        fx.live_email().as_deref(),
+        Some("c@x.co"),
+        "nothing switched"
+    );
+}
+
+#[test]
+fn best_with_no_live_login_still_switches_to_an_exhausted_candidate_with_a_warning() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    read(&fx, &a, &reading(10.0, 100.0, 0.0));
+    read(&fx, &b, &reading(104.0, 100.0, 0.0));
+    log_out(&fx);
+    let out = best(&fx).unwrap();
+    assert_eq!((out.switched, out.reason), (true, SwitchReason::Switched));
+    assert_eq!(out.to.unwrap().id, a, "the most headroom of those known");
+    assert_eq!(
+        out.warnings,
+        ["switching to the best known candidate; there is no managed live login to compare with"]
+    );
+}
+
+#[test]
 fn best_with_no_live_login_switches_to_the_best_known_with_a_warning() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
