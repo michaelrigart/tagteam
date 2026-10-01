@@ -99,7 +99,10 @@ where
         );
     }
     let mut prompter = prompt::TtyPrompter::new(ctx.env.cancel.clone());
-    let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
+    // Unlocked on purpose: each write locks for itself. Holding the locks across `run` would
+    // block any other thread's write to the same stream (a collector thread's tracing event on
+    // stderr) while this one waits to join it.
+    let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
     app::run(
         cli,
         ctx,
