@@ -106,9 +106,14 @@ impl H {
         h
     }
 
+    /// Runs `tagteam <args>` in-process. `--no-color` is always added: whether this test
+    /// process's own stdout is a terminal, or `FORCE_COLOR` is set around it, must not colour
+    /// the output the tests compare.
     fn run(&self, args: &[&str], prompter: &mut Scripted) -> (i32, String, String) {
-        let cli =
-            Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied())).unwrap();
+        let argv = std::iter::once("tagteam")
+            .chain(args.iter().copied())
+            .chain(["--no-color"]);
+        let cli = Cli::try_parse_from(argv).unwrap();
         let ctx = Context {
             env: self.env.clone(),
             keychain: self.kc.clone(),
@@ -147,7 +152,7 @@ impl H {
 
     fn json(&self, args: &[&str]) -> Value {
         let mut v: Value = serde_json::from_str(&self.ok(args)).unwrap();
-        normalize_ids(&mut v);
+        normalize(&mut v);
         v
     }
 }
@@ -183,20 +188,30 @@ fn done(account: Value) -> Value {
     json!({"schemaVersion": 1, "ok": true, "account": account})
 }
 
-fn normalize_ids(v: &mut Value) {
+/// Ids, and the retry time a collection records, as placeholders, so rows compare exactly.
+fn normalize(v: &mut Value) {
     match v {
         Value::Object(o) => {
             for (k, x) in o.iter_mut() {
-                if k == "id" && x.is_string() {
-                    *x = json!("[id]");
-                } else {
-                    normalize_ids(x);
+                match k.as_str() {
+                    "id" if x.is_string() => *x = json!("[id]"),
+                    "usageRetryAt" if x.is_string() => *x = json!("[time]"),
+                    _ => normalize(x),
                 }
             }
         }
-        Value::Array(a) => a.iter_mut().for_each(normalize_ids),
+        Value::Array(a) => a.iter_mut().for_each(normalize),
         _ => {}
     }
+}
+
+/// `a@x.co`'s row once `list` or `status` has tried to collect it with every endpoint offline
+/// (§8.3): the request never left, so it is `unavailable` for `pre-send`, retried later.
+fn a_row_offline(position: u32, active: bool) -> Value {
+    with(
+        a_row(position, active),
+        json!({"usageError": "pre-send", "usageRetryAt": "[time]"}),
+    )
 }
 
 #[test]
@@ -224,13 +239,33 @@ fn add_list_status_and_switch_read_like_this() {
     );
     h.login("b@x.co", "rt-b");
     assert_eq!(h.ok(&["add"]), "Added b@x.co at position 2.\n");
-    assert_eq!(h.ok(&["list"]), "  1  work (a@x.co)\n* 2  b@x.co\n");
-    assert_eq!(h.ok(&["status"]), "Live: b@x.co (position 2 of 2)\n");
+    // Every endpoint is offline: each account's fetch fails before sending (§8.3).
+    assert_eq!(
+        h.ok(&["list"]),
+        concat!(
+            "    #  ACCOUNT\n",
+            "    1  work (a@x.co)  unavailable (pre-send, retry <1m)\n",
+            " *  2  b@x.co         unavailable (pre-send, retry <1m)\n",
+        )
+    );
+    assert_eq!(
+        h.ok(&["status"]),
+        "Live: b@x.co (position 2 of 2)\n  unavailable (pre-send, retry <1m)\n"
+    );
     assert_eq!(
         h.ok(&["switch", "work"]),
         "Switched to work (a@x.co) (position 1).\nClaude Code picks this up within about 30 s; restart it to apply now.\n"
     );
-    assert_eq!(h.ok(&["ls"]), "* 1  work (a@x.co)\n  2  b@x.co\n");
+    // The switch re-planned nothing: neither account has a reading, so both stay as the
+    // `list` above left them, inside the 30 s backoff of their failed fetch.
+    assert_eq!(
+        h.ok(&["ls"]),
+        concat!(
+            "    #  ACCOUNT\n",
+            " *  1  work (a@x.co)  unavailable (pre-send, retry <1m)\n",
+            "    2  b@x.co         unavailable (pre-send, retry <1m)\n",
+        )
+    );
     assert_eq!(
         h.ok(&["switch"]),
         "Switched to b@x.co (position 2).\nClaude Code picks this up within about 30 s; restart it to apply now.\n"
@@ -251,7 +286,7 @@ fn list_json_is_cswap_compatible() {
             "schemaVersion": 1,
             "activeAccountNumber": 1,
             "activeByProvider": {"claude-code": 1},
-            "accounts": [a_row(1, true), with(key_row(2), json!({"alias": "ci", "disabled": true}))]
+            "accounts": [a_row_offline(1, true), with(key_row(2), json!({"alias": "ci", "disabled": true}))]
         })
     );
 }
@@ -279,10 +314,13 @@ fn status_and_switch_json() {
         json!({"schemaVersion": 1, "provider": "claude-code", "switched": true, "from": 2, "to": 1, "strategy": "direct",
                "reason": "switched", "message": "Switched to a@x.co", "credentialStore": "keychain", "warnings": []})
     );
+    // a has no reading, so the switch left it without a plan (§8.3) and `status` fetches it on
+    // demand: offline, that fails before it is sent.
     assert_eq!(
         h.json(&["status", "--json"]),
         json!({"schemaVersion": 1, "provider": "claude-code",
-               "active": with(a_row(1, true), json!({"managed": true})), "totalManagedAccounts": 2})
+               "active": with(a_row_offline(1, true), json!({"managed": true})),
+               "totalManagedAccounts": 2})
     );
 }
 
@@ -442,7 +480,10 @@ fn declining_the_unmanaged_login_offer_cancels_and_adds_nothing() {
         (1, "", "tagteam: cancelled\n")
     );
     assert_eq!(no.asked, [ADD_STRANGER_FIRST]);
-    assert_eq!(h.ok(&["list"]), "  1  a@x.co\n");
+    assert_eq!(
+        h.ok(&["list"]),
+        "    #  ACCOUNT\n    1  a@x.co   unavailable (pre-send, retry <1m)\n"
+    );
     assert_eq!(
         h.ok(&["status"]),
         "Live: stranger@x.co (not managed by tagteam)\n"
@@ -472,13 +513,19 @@ fn prompts_never_block_a_non_interactive_caller() {
         &mut Scripted::answering(&["y"]),
     );
     assert_eq!(code, 0);
-    assert_eq!(h.ok(&["list"]), "* 1  stranger@x.co\n");
+    assert_eq!(
+        h.ok(&["list"]),
+        "    #  ACCOUNT\n *  1  stranger@x.co  unavailable (pre-send, retry <1m)\n"
+    );
     let (code, _, err) = h.run(&["add-token"], &mut Scripted::none());
     assert_eq!(code, 1);
     assert!(err.contains("`-`"), "{err}");
 }
 
 const REPLACE_A: &str = "Position 1 holds a@x.co. Replace it?";
+
+/// `list` with `a@x.co` alone and live, its fetch failed offline.
+const LIVE_A_OFFLINE: &str = "    #  ACCOUNT\n *  1  a@x.co   unavailable (pre-send, retry <1m)\n";
 
 /// `a@x.co` stored at position 1, and live.
 fn with_one_login() -> H {
@@ -500,7 +547,10 @@ fn add_token_over_an_occupied_position_asks_on_a_terminal_and_keeps_the_token() 
         "{err}"
     );
     assert_eq!(yes.asked, ["Token: ", REPLACE_A]);
-    assert_eq!(h.ok(&["list"]), "  1  api-key-1@token.local  api key\n");
+    assert_eq!(
+        h.ok(&["list"]),
+        "    #  ACCOUNT\n    1  api-key-1@token.local  api key\n"
+    );
 }
 
 #[test]
@@ -516,7 +566,7 @@ fn declining_add_token_over_an_occupied_position_cancels_and_keeps_the_occupant(
         (1, "", "tagteam: cancelled\n")
     );
     assert_eq!(no.asked, [REPLACE_A]);
-    assert_eq!(h.ok(&["list"]), "* 1  a@x.co\n");
+    assert_eq!(h.ok(&["list"]), LIVE_A_OFFLINE);
 }
 
 #[test]
@@ -536,7 +586,7 @@ fn add_token_over_an_occupied_position_never_asks_off_a_terminal() {
         serde_json::from_str::<Value>(&out).unwrap()["error"]["type"],
         "needs-confirmation"
     );
-    assert_eq!(h.ok(&["list"]), "* 1  a@x.co\n");
+    assert_eq!(h.ok(&["list"]), LIVE_A_OFFLINE);
 }
 
 #[test]
@@ -596,7 +646,7 @@ fn a_locked_keychain_is_offered_for_unlocking_on_a_terminal() {
     assert_eq!((code, err), (1, format!("tagteam: {LOCKED}\n")));
     assert_eq!(h.kc.unlock_attempts(), 2);
     h.kc.set_locked(false);
-    assert_eq!(h.ok(&["list"]), "* 1  a@x.co\n");
+    assert_eq!(h.ok(&["list"]), LIVE_A_OFFLINE);
 }
 
 #[test]
@@ -756,6 +806,16 @@ fn commands_that_touch_no_keychain_item_run_no_check() {
     }
     assert!(p.asked.is_empty());
     assert_eq!(h.kc.unlock_attempts(), 0);
+    // `list` and `status` do read Keychain items, to collect usage (§8.3), but run no lock
+    // check: a locked keychain is the row's `keychain_unavailable`, never a prompt or an error.
+    let v = h.json(&["list", "--json"]);
+    let a = v["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["email"] == "a@x.co")
+        .unwrap();
+    assert_eq!(a["usageStatus"], "keychain_unavailable");
 }
 
 #[test]
@@ -791,7 +851,11 @@ fn token_accounts_list_their_kind_from_the_provider() {
     h.ok(&["add-token", "sk-ant-api03-key"]);
     assert_eq!(
         h.ok(&["list"]),
-        "  1  setup-token-1@token.local  setup token\n  2  api-key-2@token.local  api key\n"
+        concat!(
+            "    #  ACCOUNT\n",
+            "    1  setup-token-1@token.local  unavailable (pre-send, retry <1m)  setup token\n",
+            "    2  api-key-2@token.local      api key\n",
+        )
     );
     let v = h.json(&["list", "--json"]);
     assert_eq!(v["accounts"][0]["usageStatus"], "unavailable");

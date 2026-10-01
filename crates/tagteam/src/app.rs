@@ -6,17 +6,18 @@ use serde_json::{Value, json};
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::Platform;
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Window};
+use tagteam_engine::collect::CollectMode;
 use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::net::UreqHttp;
 use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::registry::ProviderRegistry;
-use tagteam_engine::settings::Settings;
+use tagteam_engine::settings::{ColorMode, Settings};
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
-use tagteam_engine::views::AccountView;
+use tagteam_engine::views::{AccountView, StatusView};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::http::Http;
 use tagteam_provider::security::SecurityCli;
@@ -204,6 +205,38 @@ fn or_inactive(active: Result<bool, EngineError>, position: u32, id: &AccountId)
     })
 }
 
+/// `Provider::render_usage` for a row's provider (§13.2); null for a provider this build does
+/// not register, whose rows no view lists.
+fn render_usage(engine: &Engine) -> impl Fn(&ProviderId, &[(Window, Pace)]) -> Value + '_ {
+    move |provider, windows| {
+        engine
+            .provider(provider)
+            .map_or(Value::Null, |p| p.render_usage(windows))
+    }
+}
+
+/// §13.1 and §6.4: `--no-color` and `NO_COLOR` always turn colour off, `FORCE_COLOR` turns it
+/// on, and otherwise `ui.color` decides, `auto` meaning "stdout is a terminal".
+fn color_enabled(
+    flag_off: bool,
+    no_color: bool,
+    force_color: bool,
+    setting: ColorMode,
+    stdout_terminal: bool,
+) -> bool {
+    if flag_off || no_color {
+        return false;
+    }
+    if force_color {
+        return true;
+    }
+    match setting {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => stdout_terminal,
+    }
+}
+
 /// §13.2: the one object `--json` prints for any error.
 pub(crate) fn error_json(kind: &str, message: &str) -> Value {
     json!({"schemaVersion": 1, "error": {"type": kind, "message": message}})
@@ -212,6 +245,8 @@ pub(crate) fn error_json(kind: &str, message: &str) -> Value {
 struct App<'a, 'b> {
     engine: Engine,
     json: bool,
+    /// `--no-color`.
+    no_color: bool,
     provider_flag: Option<ProviderId>,
     /// The Keychain Appendix A.3's lock check asks: macOS only, since Linux has none.
     keychain: Option<Arc<dyn Keychain>>,
@@ -234,6 +269,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     let mut app = App {
         engine,
         json,
+        no_color: cli.no_color,
         provider_flag: cli.provider.map(ProviderId::new),
         keychain,
         io,
@@ -296,6 +332,42 @@ impl App<'_, '_> {
         }
     }
 
+    /// §8.3's on-demand collection, which the command waits for. A usage failure is never a
+    /// command error: it shows in the account's row. The collector's warnings, and its error
+    /// should collecting fail as a whole, go to stderr. With nothing to collect nothing is
+    /// opened, so `list` on a fresh machine still creates nothing (§5).
+    fn collect(&mut self, accounts: Vec<AccountId>) {
+        if accounts.is_empty() {
+            return;
+        }
+        let warnings = match self
+            .engine
+            .collect_usage(CollectMode::OnDemand { accounts })
+        {
+            Ok(report) => report.warnings,
+            Err(e) => vec![format!("usage was not collected: {e}")],
+        };
+        for w in warnings {
+            let _ = writeln!(self.io.err, "warning: {w}");
+        }
+    }
+
+    /// Now, in epoch seconds, by the engine's clock: what countdowns and ages count from.
+    fn now_s(&self) -> i64 {
+        self.engine.now_ms().div_euclid(1000)
+    }
+
+    /// Whether `list` and `status` colour their percentages (§13.1).
+    fn color(&self) -> bool {
+        color_enabled(
+            self.no_color,
+            std::env::var_os("NO_COLOR").is_some(),
+            std::env::var_os("FORCE_COLOR").is_some(),
+            self.engine.settings().color,
+            std::io::stdout().is_terminal(),
+        )
+    }
+
     /// Appendix A.3's check, for a command that will touch a Keychain item. With no store,
     /// `switch` and `remove` have no account to touch (§5), so they run none: a fresh machine
     /// gets their no-op or "no account matches" even with a locked keychain. A store created
@@ -351,23 +423,37 @@ impl App<'_, '_> {
     fn dispatch(&mut self, command: Command) -> Result<(), Failure> {
         match command {
             Command::List => {
+                // §8.3: every listed account is offered to the collector, which fetches only
+                // those that are due; the views are then read with whatever it recorded.
+                let listed = self.engine.accounts(self.provider_flag.as_ref())?;
+                let ids: Vec<AccountId> = listed
+                    .iter()
+                    .flat_map(|l| l.accounts.iter().map(|v| v.row.id.clone()))
+                    .collect();
+                self.collect(ids);
                 let lists = self.engine.accounts(self.provider_flag.as_ref())?;
+                let (now_s, color) = (self.now_s(), self.color());
                 let engine = &self.engine;
                 let names = |id: &str| {
                     engine
                         .provider(&ProviderId::new(id))
                         .map_or_else(|_| id.to_owned(), |p| p.display_name().to_owned())
                 };
-                let human = render::list_human(&lists, &names);
-                self.print(&human, render::list_json(&lists, &self.provider()));
+                let human = render::list_human(&lists, &names, now_s, color);
+                let json = render::list_json(&lists, &self.provider(), &render_usage(engine));
+                self.print(&human, json);
             }
             Command::Status => {
                 let provider = self.provider();
+                // §8.3: `status` collects the live account only.
+                if let StatusView::Managed { account, .. } = self.engine.status(&provider)? {
+                    self.collect(vec![account.row.id]);
+                }
                 let s = self.engine.status(&provider)?;
-                self.print(
-                    &render::status_human(&s),
-                    render::status_json(&s, provider.as_str()),
-                );
+                let (now_s, color) = (self.now_s(), self.color());
+                let human = render::status_human(&s, now_s, color);
+                let json = render::status_json(&s, provider.as_str(), &render_usage(&self.engine));
+                self.print(&human, json);
             }
             Command::Switch { account, force } => self.switch(account, force)?,
             Command::Add {
@@ -509,7 +595,8 @@ impl App<'_, '_> {
     }
 
     fn print_view(&mut self, human: &str, view: AccountView, created: Option<bool>) {
-        self.print(human, render::account_json(&view, created));
+        let json = render::account_json(&view, created, &render_usage(&self.engine));
+        self.print(human, json);
     }
 
     /// An account command's result, with `active` as the engine sees it after the command.
@@ -651,6 +738,28 @@ mod tests {
             o.api_base.as_deref(),
             honoured.then_some("http://127.0.0.1:9")
         );
+    }
+
+    #[test]
+    fn colour_is_off_under_no_color_forced_by_force_color_and_else_the_settings() {
+        use ColorMode::{Always, Auto, Never};
+        // (--no-color, NO_COLOR, FORCE_COLOR, ui.color, stdout is a terminal) → colour
+        let cases = [
+            ((false, false, false, Auto, true), true),
+            ((false, false, false, Auto, false), false),
+            ((false, false, false, Always, false), true),
+            ((false, false, false, Never, true), false),
+            ((false, false, true, Never, false), true),
+            ((false, true, true, Always, true), false),
+            ((true, false, true, Always, true), false),
+        ];
+        for ((flag, no, force, setting, terminal), want) in cases {
+            assert_eq!(
+                color_enabled(flag, no, force, setting, terminal),
+                want,
+                "{flag} {no} {force} {setting:?} {terminal}"
+            );
+        }
     }
 
     #[test]
