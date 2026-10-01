@@ -237,6 +237,7 @@ mod tests {
 
     use tagteam_core::{AccountId, CLAUDE_CODE};
     use tagteam_engine::switch::SwitchReason;
+    use tagteam_engine::views::{UsageStatus, UsageView};
     use tagteam_provider::KindTraits;
 
     use super::*;
@@ -334,6 +335,19 @@ mod tests {
                 managed_key_axis: false,
                 default_email_prefix: None,
                 display: None,
+            },
+            usage: UsageView {
+                status: if quarantined {
+                    UsageStatus::ReloginRequired
+                } else {
+                    UsageStatus::Unavailable
+                },
+                windows: None,
+                decision_grade: false,
+                fetched_at: None,
+                age_s: None,
+                error: (!quarantined).then(|| "no-data".into()),
+                retry_at: None,
             },
         }
     }
