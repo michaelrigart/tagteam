@@ -437,28 +437,27 @@ impl Collection<'_> {
     /// A live login that moved stops the fetch (`Moved`): its token is not this account's. So
     /// does a lock that cannot be had within its timeout (a switch or another mutation holding
     /// it); any other lock error (the lock file cannot be opened) is the collection's error,
-    /// never a silent drop. So does a switch journal row still present once the guard is held
-    /// (with a warning, since nothing else on `list` says so): the guard returns even when its
-    /// recovery of a dead switch failed, and that switch may have written another account's
-    /// credential before its identity, which both identity checks would pass.
+    /// never a silent drop. So does a switch journal row still present once recovery has run
+    /// under the guard: that switch may have written another account's credential before its
+    /// identity, which both identity checks would pass. `guard_or_refuse`'s refusal becomes a
+    /// warning, since nothing else on `list` says so: a retry when recovery could not take the
+    /// provider's live locks, `--force` only for a row recovery could not decide.
     /// Residual: a login changed by Claude Code itself, outside tagteam's lock, between the
     /// credential read and the second identity read (its credential written, its `oauthAccount`
     /// not yet) passes both checks and can misattribute that one reading.
     fn live_bytes(&mut self) -> Result<Vec<u8>, Stop> {
-        let guard = match self.engine.mutation_guard() {
+        let guard = match self.engine.guard_or_refuse(&self.row.provider) {
             Ok(guard) => guard,
             Err(EngineError::Lock(LockError::Timeout(_))) => return Err(Stop::Moved),
+            Err(e @ (EngineError::InterruptedSwitch(_) | EngineError::RecoveryBlocked { .. })) => {
+                self.warnings.push(format!(
+                    "usage for the live {} account was not collected: {e}",
+                    self.row.provider
+                ));
+                return Err(Stop::Moved);
+            }
             Err(e) => return Err(e.into()),
         };
-        if self.store.journal(&self.row.provider)?.is_some() {
-            drop(guard);
-            self.warnings.push(format!(
-                "usage for the live {} account was not collected: {}",
-                self.row.provider,
-                EngineError::InterruptedSwitch(self.row.provider.to_string())
-            ));
-            return Err(Stop::Moved);
-        }
         self.live_names_this_account()?;
         hooks::point(self.engine, "usage-live-identity-read")?;
         let credential = self.p.read_live_auth(&self.engine.env).credential;

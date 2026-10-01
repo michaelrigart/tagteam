@@ -11,6 +11,7 @@ use common::{
     token_requests, usage_bearers, usage_fixture, usage_requests, write_target_credential,
 };
 use serde_json::{Value, json};
+use tagteam_cc::ItemKind;
 use tagteam_engine::EngineError;
 use tagteam_engine::collect::{CollectMode, Collected};
 use tagteam_engine::vault::SERVICE;
@@ -335,9 +336,9 @@ fn a_refused_live_setup_token_is_reported_expired_and_never_refreshed() {
 fn an_unresolved_switch_journal_stops_the_active_collection_before_any_request() {
     // A switch from b to a died after writing a's credential (step 7) but before a's identity
     // (step 8): the live login still names b, the live credential is a's. Recovery cannot take
-    // CC's refresh lock, so `mutation_guard` returns anyway and the journal row stays. Both
-    // identity checks pass (still b), so without the journal check b's reservation would send
-    // a's token and record a's usage as b's.
+    // CC's refresh lock, so the journal row stays. Both identity checks pass (still b), so
+    // without the journal check b's reservation would send a's token and record a's usage as
+    // b's.
     let fx = Fx::with_lock_timeout(Duration::from_millis(300));
     let a = fx.add("a@x.co", "rt-a");
     let b = fx.add("b@x.co", "rt-b"); // live
@@ -355,12 +356,16 @@ fn an_unresolved_switch_journal_stops_the_active_collection_before_any_request()
     );
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
     assert_eq!(report.outcomes, [(b.clone(), Collected::Dropped)]);
+    // Recovery was blocked by CC's lock, not undecided: the warning names the lock and asks
+    // for a retry, as every refusal does, and never points at `--force`.
     assert_eq!(
         report.warnings,
-        [
-            "usage for the live claude-code account was not collected: an interrupted switch for claude-code could not be resolved; run `tagteam switch <account> --force` to settle it"
-        ]
+        [format!(
+            "usage for the live claude-code account was not collected: an interrupted switch for claude-code could not be recovered yet: timed out waiting for the lock {}; retry once Claude Code is idle",
+            fx.paths().refresh_lock.display()
+        )]
     );
+    assert!(!report.warnings[0].contains("--force"));
     assert!(
         !report.warnings[0].contains("@x.co"),
         "the warning names no email"
@@ -380,6 +385,41 @@ fn an_unresolved_switch_journal_stops_the_active_collection_before_any_request()
         None,
         "nor for a"
     );
+}
+
+#[test]
+fn a_switch_journal_recovery_cannot_decide_points_the_warning_at_force() {
+    // The same crash, but recovery took CC's locks and could not decide the row: the
+    // Keychain holding a's credential cannot be read, and a stale file says b. Only `--force`
+    // settles such a row, so that is what the warning says.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    let (svc, acct) = fx.live_item(ItemKind::OAuth);
+    fx.kc.set_unreadable(&svc, &acct, true);
+    fs::write(
+        fx.paths().credentials_file,
+        Fx::credential_json("b@x.co", "rt-b").to_string(),
+    )
+    .unwrap();
+    fx.script_usage(200, usage_fixture());
+
+    let report = fx.collect(&[&b]);
+
+    assert!(journal(&fx).is_some(), "recovery could not decide the row");
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(report.outcomes, [(b.clone(), Collected::Dropped)]);
+    assert_eq!(
+        report.warnings,
+        [
+            "usage for the live claude-code account was not collected: an interrupted switch for claude-code could not be resolved; run `tagteam switch <account> --force` to settle it"
+        ]
+    );
+    assert!(fx.http.requests().is_empty(), "nothing was sent");
+    assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    assert_eq!(fx.usage_state(&b).and_then(|s| s.fetched_at), None);
 }
 
 #[test]
