@@ -261,6 +261,20 @@ mod tests {
     const B: PollBudget = PollBudget::STANDARD;
     const NOW: i64 = 1_000_000;
 
+    #[test]
+    fn the_hourly_count_window_covers_the_longest_jittered_post_429_plan() {
+        // The store's reserve eligibility calls a `next_poll_at` further ahead than
+        // `count_window_s` plus the slack clock skew. That is only sound while the window
+        // covers the longest plan any rule makes: a post-429 interval at its cap, jittered up.
+        let longest = B.post_429_max_s as f64 * (1.0 + B.jitter_frac);
+        assert!(B.count_window_s as f64 >= longest, "{longest}");
+        let mut i = inputs();
+        i.last_429_at = Some(NOW);
+        i.prev_interval_s = Some(100_000);
+        let p = plan_after_fetch(&B, &i, 1.0);
+        assert!(p.next_poll_at - NOW <= B.count_window_s, "{p:?}");
+    }
+
     /// A candidate account that has not moved: the baseline each test adjusts.
     fn inputs() -> PollInputs {
         PollInputs {

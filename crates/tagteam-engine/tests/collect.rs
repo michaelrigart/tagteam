@@ -1290,4 +1290,29 @@ mod hooks {
         assert_eq!(report.outcomes, [(a.clone(), Collected::Recorded)]);
         assert_eq!(state(&fx, &a).poll_interval_s, Some(270));
     }
+
+    #[test]
+    fn a_switch_committing_after_the_role_reads_still_gets_its_plan_kept() {
+        // The roles are read (the record, then the live login) before the reservation; a
+        // switch to a commits right after it, while a is still a candidate in this
+        // collection. The record changed since it was read, so a's plan is the active
+        // cadence (270), not the candidate's (450) that would overwrite the switch's re-plan.
+        let fx = Fx::new();
+        let a = two_accounts(&fx); // b is live and recorded
+        fx.script_usage(200, usage_fixture());
+        let other = Arc::new(fx.engine_with_env(fx.env.clone()));
+        let request = fx.switch_request(&a, false);
+        fx.engine.on_point(
+            "usage-reserved",
+            Box::new(move || {
+                other.switch(request.clone()).unwrap();
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        assert_eq!(report.outcomes, [(a.clone(), Collected::Recorded)]);
+        assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+        assert_eq!(state(&fx, &a).poll_interval_s, Some(270));
+    }
 }
