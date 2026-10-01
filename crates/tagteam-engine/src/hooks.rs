@@ -4,7 +4,9 @@ use crate::error::EngineError;
 /// A named point in the switch transaction. With the `test-hooks` feature, the environment
 /// variable `TAGTEAM_TEST_CRASH_AT=<name>` ends the process there as a kill would: no
 /// destructor runs, so no lock guard and no rollback (the kill tests). `Engine::fail_at`
-/// injects an error there (`"<name>"`) or a panic (`"panic:<name>"`) for the rollback tests.
+/// injects an error there (`"<name>"`) or a panic (`"panic:<name>"`) for the rollback tests;
+/// `TAGTEAM_TEST_FAIL_AT=<name>` injects the error for a process whose engine a test cannot
+/// reach (the real binary).
 /// Without the feature, a no-op.
 #[cfg(feature = "test-hooks")]
 pub(crate) fn point(engine: &Engine, name: &'static str) -> Result<(), EngineError> {
@@ -17,7 +19,7 @@ pub(crate) fn point(engine: &Engine, name: &'static str) -> Result<(), EngineErr
         }
     }
     let injected = *engine.fail_at.lock().unwrap();
-    if injected == Some(name) {
+    if injected == Some(name) || std::env::var("TAGTEAM_TEST_FAIL_AT").as_deref() == Ok(name) {
         return Err(EngineError::InvalidInput(format!(
             "injected failure at {name}"
         )));

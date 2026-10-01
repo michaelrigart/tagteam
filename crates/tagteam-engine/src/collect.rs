@@ -85,6 +85,7 @@ impl Engine {
     /// store.
     pub fn collect_usage(&self, mode: CollectMode) -> Result<CollectReport, EngineError> {
         let CollectMode::OnDemand { accounts } = mode;
+        hooks::point(self, "usage-collect-start")?;
         let Some(shared) = self.existing_store()? else {
             return Ok(CollectReport::default());
         };
