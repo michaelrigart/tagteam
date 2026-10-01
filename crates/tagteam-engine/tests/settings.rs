@@ -476,7 +476,22 @@ fn the_placeholder_list_is_the_specs_section_thirteen_five() {
     assert!(is_statusline_placeholder("model:Fable"));
     assert!(is_statusline_placeholder("model:Fable Pro"));
     for name in [
-        "", "nope", "model", "model:", "Account", "5H", " 5h", "5h ", "{5h}", "5h}",
+        "",
+        "nope",
+        "model",
+        "model:",
+        "model: ",
+        "model: Fable",
+        "model:Fable ",
+        "model:{5h",
+        "model:5h}",
+        "model:{x}",
+        "Account",
+        "5H",
+        " 5h",
+        "5h ",
+        "{5h}",
+        "5h}",
     ] {
         assert!(!is_statusline_placeholder(name), "{name:?}");
     }
@@ -506,6 +521,10 @@ fn a_format_with_an_unknown_or_unclosed_placeholder_falls_back_with_one_warning(
         "{}",
         "{model}",
         "{model:}",
+        "{model: }",
+        "{model: Fable}",
+        "{model:Fable }",
+        "{model:{5h}",
         "{5H}",
         "{ 5h }",
         "{5h",

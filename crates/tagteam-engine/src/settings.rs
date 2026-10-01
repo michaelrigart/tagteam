@@ -24,12 +24,15 @@ pub const STATUSLINE_PLACEHOLDERS: &[&str] = &[
 pub const STATUSLINE_MODEL_PREFIX: &str = "model:";
 
 /// Whether `name`, the text between a placeholder's braces, is one of §13.5's placeholders:
-/// one of [`STATUSLINE_PLACEHOLDERS`], or `model:` followed by a non-empty name.
+/// one of [`STATUSLINE_PLACEHOLDERS`], or `model:` followed by a model name. A model name is
+/// non-empty, equals its trimmed form (the renderer matches it as written) and holds no brace.
 pub fn is_statusline_placeholder(name: &str) -> bool {
     STATUSLINE_PLACEHOLDERS.contains(&name)
         || name
             .strip_prefix(STATUSLINE_MODEL_PREFIX)
-            .is_some_and(|model| !model.is_empty())
+            .is_some_and(|model| {
+                !model.is_empty() && model == model.trim() && !model.contains(['{', '}'])
+            })
 }
 
 /// `ui.color`. `NO_COLOR`, `FORCE_COLOR` and `--no-color` are the CLI's to apply on top.

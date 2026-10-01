@@ -10,7 +10,9 @@ use tagteam_core::{CLAUDE_CODE, ProviderId, Window, WindowKind};
 use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
-use tagteam_engine::settings::{ColorMode, Settings};
+use tagteam_engine::settings::{
+    ColorMode, STATUSLINE_MODEL_PREFIX, Settings, is_statusline_placeholder,
+};
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, StatuslineView};
 use tagteam_engine::{Engine, EngineConfig};
@@ -99,8 +101,9 @@ fn expand(format: &str, account: &AccountView, now_s: i64, colour: bool) -> Stri
     out
 }
 
-/// One placeholder's text, or `None` for a name §13.5 does not define. The window placeholders
-/// go by kind, so they mean the same for every provider.
+/// One placeholder's text, or `None` for a name §13.5 does not define: the engine's list
+/// (`is_statusline_placeholder`) decides, the same one `statusline.format` is validated with.
+/// The window placeholders go by kind, so they mean the same for every provider.
 fn placeholder(
     name: &str,
     account: &AccountView,
@@ -108,6 +111,9 @@ fn placeholder(
     now_s: i64,
     colour: bool,
 ) -> Option<String> {
+    if !is_statusline_placeholder(name) {
+        return None;
+    }
     let row = &account.row;
     let of_kind = |kind: WindowKind| windows.iter().copied().find(|w| w.kind == kind);
     let text = match name {
@@ -124,7 +130,7 @@ fn placeholder(
         "spend" => spend(of_kind(WindowKind::Spend), colour),
         "stale" => stale(account.usage.fetched_at, now_s),
         _ => {
-            let model = name.strip_prefix("model:")?;
+            let model = name.strip_prefix(STATUSLINE_MODEL_PREFIX)?;
             let scoped = windows
                 .iter()
                 .copied()
@@ -361,6 +367,24 @@ mod tests {
         assert_eq!(
             plain(&v, "{nope} {model} {} {5h"),
             "{nope} {model} {} {5h\n"
+        );
+    }
+
+    #[test]
+    fn the_renderer_fills_exactly_the_engines_placeholders() {
+        use tagteam_engine::settings::STATUSLINE_PLACEHOLDERS;
+        let v = managed(None, reading(0));
+        for name in STATUSLINE_PLACEHOLDERS {
+            assert_ne!(
+                plain(&v, &format!("{{{name}}}")),
+                format!("{{{name}}}\n"),
+                "{name} is on the engine's list but not filled"
+            );
+        }
+        // A model name that settings would refuse is never matched: it stays as written.
+        assert_eq!(
+            plain(&v, "{model:} {model: Fable} {model:Fable } {model:{5h}"),
+            "{model:} {model: Fable} {model:Fable } {model:{5h}\n"
         );
     }
 
