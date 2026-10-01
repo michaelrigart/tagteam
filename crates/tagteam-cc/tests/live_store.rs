@@ -549,7 +549,12 @@ fn a_managed_key_item_that_will_not_delete_is_reported_as_a_removal_not_a_file_w
     let shown = err.to_string();
     assert!(shown.contains(name.as_str()), "{shown}");
     assert!(shown.contains("could not be verified gone"), "{shown}");
+    assert!(
+        shown.contains("so Claude Code may still read it"),
+        "the consequence, not a write: {shown}"
+    );
     assert!(!shown.contains("written to the file"), "{shown}");
+    assert!(!shown.contains("what tagteam wrote"), "{shown}");
 }
 
 #[test]
