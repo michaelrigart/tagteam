@@ -104,6 +104,10 @@ pub enum EngineError {
     ForeignLiveCredential { position: u32 },
     #[error(transparent)]
     Io(#[from] io::Error),
+    /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
+    /// reports its own `LockError::Interrupted`; `signal()` reads either.
+    #[error("interrupted")]
+    Interrupted(i32),
 }
 
 impl EngineError {
@@ -113,9 +117,13 @@ impl EngineError {
             EngineError::Store(_) => "store",
             EngineError::Provider(ProviderError::ConfigUnsplicable { .. }) => "config-unsplicable",
             EngineError::Provider(ProviderError::Lock(LockError::Timeout(_))) => "lock-timeout",
+            EngineError::Provider(ProviderError::Lock(LockError::Interrupted { .. })) => {
+                "interrupted"
+            }
             EngineError::Provider(ProviderError::RestoreFailed { .. }) => "rollback-failed",
             EngineError::Provider(_) => "provider",
             EngineError::Lock(LockError::Timeout(_)) => "lock-timeout",
+            EngineError::Lock(LockError::Interrupted { .. }) => "interrupted",
             EngineError::Lock(_) => "lock",
             EngineError::Vault(_) => "vault",
             EngineError::Unreadable(_) => "unreadable",
@@ -140,6 +148,18 @@ impl EngineError {
             EngineError::RollbackFailed { .. } => "rollback-failed",
             EngineError::ForeignLiveCredential { .. } => "foreign-credential",
             EngineError::Io(_) => "io",
+            EngineError::Interrupted(_) => "interrupted",
+        }
+    }
+
+    /// The signal behind an interruption, whichever carrier holds it: `Interrupted`,
+    /// `Lock(LockError::Interrupted)`, or `Provider(ProviderError::Lock(LockError::Interrupted))`
+    /// (§14.1). `None` for every other error.
+    pub fn signal(&self) -> Option<i32> {
+        match self {
+            EngineError::Interrupted(signal) => Some(*signal),
+            EngineError::Lock(e) | EngineError::Provider(ProviderError::Lock(e)) => e.signal(),
+            _ => None,
         }
     }
 }
@@ -270,9 +290,50 @@ mod tests {
                 "foreign-credential",
             ),
             (EngineError::Io(io::Error::other("x")), "io"),
+            (
+                EngineError::Provider(ProviderError::Lock(LockError::Interrupted {
+                    path: PathBuf::from("x"),
+                    signal: 2,
+                })),
+                "interrupted",
+            ),
+            (
+                EngineError::Lock(LockError::Interrupted {
+                    path: PathBuf::from("x"),
+                    signal: 15,
+                }),
+                "interrupted",
+            ),
+            (EngineError::Interrupted(1), "interrupted"),
         ];
         for (err, want) in cases {
             assert_eq!(err.kind(), want, "{err:?}");
         }
+    }
+
+    #[test]
+    fn signal_reads_every_carrier_of_an_interruption() {
+        let lock = |signal| LockError::Interrupted {
+            path: PathBuf::from("x"),
+            signal,
+        };
+        assert_eq!(EngineError::Interrupted(2).signal(), Some(2));
+        assert_eq!(EngineError::Lock(lock(15)).signal(), Some(15));
+        assert_eq!(
+            EngineError::Provider(ProviderError::Lock(lock(1))).signal(),
+            Some(1)
+        );
+        assert_eq!(
+            EngineError::Lock(LockError::Timeout(PathBuf::from("x"))).signal(),
+            None
+        );
+        assert_eq!(
+            EngineError::Provider(ProviderError::Lock(LockError::Compromised(PathBuf::from(
+                "x"
+            ))))
+            .signal(),
+            None
+        );
+        assert_eq!(EngineError::LiveMoved.signal(), None);
     }
 }
