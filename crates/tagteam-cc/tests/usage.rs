@@ -381,6 +381,55 @@ fn extra_usage_is_read_only_without_a_spend_object() {
 }
 
 #[test]
+fn a_mistyped_exponent_or_decimal_places_leaves_the_window_out_instead_of_defaulting() {
+    let without = ["5h", "7d", "scoped:Fable"];
+    let mut spend_body = recorded();
+    spend_body["spend"]["enabled"] = json!(true);
+    spend_body["spend"]["used"]["amount_minor"] = json!(500);
+    for (side, bad) in [
+        ("used", json!("3")),
+        ("limit", json!(3.0)),
+        ("used", json!(2.5)),
+        ("limit", json!(-1)),
+        ("used", json!(true)),
+        ("limit", json!([2])),
+        ("used", json!(u64::MAX)),
+    ] {
+        let mut b = spend_body.clone();
+        b["spend"][side]["exponent"] = bad.clone();
+        assert_eq!(keys(&normalize(&b).unwrap()), without, "{side} {bad}");
+    }
+    let mut null_exp = spend_body.clone();
+    null_exp["spend"]["limit"]["exponent"] = Value::Null;
+    assert_eq!(
+        normalize(&null_exp).unwrap()[2],
+        spend(25.0, 5.0, 20.0, "EUR"),
+        "a null exponent is an absent one"
+    );
+
+    let mut extra = recorded();
+    extra["extra_usage"]["is_enabled"] = json!(true);
+    extra["extra_usage"]["used_credits"] = json!(1500.0);
+    extra.as_object_mut().unwrap().shift_remove("spend");
+    assert_eq!(
+        normalize(&extra).unwrap()[2],
+        spend(75.0, 15.0, 20.0, "EUR")
+    );
+    for bad in [json!("3"), json!(3.0), json!(2.5), json!(-1), json!(true)] {
+        let mut b = extra.clone();
+        b["extra_usage"]["decimal_places"] = bad.clone();
+        assert_eq!(keys(&normalize(&b).unwrap()), without, "{bad}");
+    }
+    let mut null_places = extra.clone();
+    null_places["extra_usage"]["decimal_places"] = Value::Null;
+    assert_eq!(
+        normalize(&null_places).unwrap()[2],
+        spend(75.0, 15.0, 20.0, "EUR"),
+        "a null decimal_places is an absent one"
+    );
+}
+
+#[test]
 fn a_known_key_of_the_wrong_type_is_a_bad_response() {
     assert_eq!(normalize(&json!([])), Err(()));
     assert_eq!(normalize(&json!("usage")), Err(()));
