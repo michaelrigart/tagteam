@@ -188,16 +188,19 @@ impl Engine {
             slot: reservation.slot,
             slot_at: reservation.slot_at,
         };
-        let state = match hooks::point(self, "usage-reserved")
-            .and_then(|()| Ok(store.usage_state(&row.id)?))
+        // The store's record of the active account is read here and again at the record, to
+        // see whether a switch committed in between (`Collection::active_now`).
+        let start = match hooks::point(self, "usage-reserved")
+            .and_then(|()| Ok((store.usage_state(&row.id)?, store.active(&row.provider)?)))
         {
-            Ok(state) => state,
+            Ok(start) => start,
             Err(e) => {
                 // Nothing was sent: give the slot back, best effort, before the error.
                 let _ = store.release_slot(&reservation, &slot);
                 return Err(e);
             }
         };
+        let (state, recorded_active) = start;
         let mut run = Collection {
             engine: self,
             store,
@@ -208,6 +211,7 @@ impl Engine {
             slot: Some(slot),
             rejected: state.as_ref().and_then(|s| s.rejected_fp.clone()),
             gated: false,
+            recorded_active,
             state,
             reservation,
             warnings: Vec::new(),
@@ -238,9 +242,11 @@ struct Collection<'a> {
     /// The access-token fingerprint the server refused (`rejected_fp`, §8.1), as read after
     /// reserving and stamped since. The store's copy is the one `authorize_send` checks.
     rejected: Option<String>,
-    /// Whether this collection's own gate refresh (§7.3) has produced the token in use: a 401
-    /// on it is not refreshed again (§8.3: at most a gate refresh, a fetch and one retry).
+    /// Whether this collection's own gate refresh (§7.3, `Refreshed`, not `AlreadyFresh`) has
+    /// produced the token in use: a 401 on it is not refreshed again (§8.3: at most a gate refresh, a fetch and one retry).
     gated: bool,
+    /// The store's record of the provider's active account when the collection started.
+    recorded_active: Option<AccountId>,
     warnings: Vec<String>,
 }
 
@@ -272,9 +278,10 @@ enum Stop {
     /// The live login moved to another account: nothing is recorded, and the unsent slot goes
     /// back.
     Moved,
-    /// The lease was taken over, or the account's identity changed (§8.3's fence failed at
-    /// `authorize_send` or at the `rejected_fp` stamp): nothing is sent or recorded, and the
-    /// unsent slot stays counted, as a failed fence writes nothing.
+    /// The lease was taken over, the account's identity changed, or the account was
+    /// quarantined (§8.3's fence failed at `authorize_send` or at the `rejected_fp` stamp):
+    /// nothing is sent or recorded. A held slot that was never sent is given back, best
+    /// effort, since the fence itself writes nothing.
     LeaseLost,
     /// The store or a test hook failed: returned, never recorded. The unsent slot goes back,
     /// best effort, so a lasting fault does not spend the hourly budget (§8.6); `collect_usage`
@@ -447,11 +454,14 @@ impl Collection<'_> {
     /// Dead verdict (the gate has quarantined the account) and every deterministic refusal end
     /// the fetch before anything is sent (§8.1).
     fn gate(&mut self, snapshot: &[u8]) -> Result<Vec<u8>, Stop> {
+        hooks::point(self.engine, "usage-before-gate")?;
         match self.engine.refresh_stored(self.p, &self.row.id, snapshot) {
-            Ok(GateOutcome::Refreshed(bytes) | GateOutcome::AlreadyFresh(bytes)) => {
+            Ok(GateOutcome::Refreshed(bytes)) => {
                 self.gated = true;
                 Ok(bytes)
             }
+            // Another process's refresh produced it: this collection has not spent its one.
+            Ok(GateOutcome::AlreadyFresh(bytes)) => Ok(bytes),
             Ok(GateOutcome::Unpersisted) => {
                 self.warn_lost();
                 Err(failed("refresh-failed"))
@@ -598,7 +608,9 @@ impl Collection<'_> {
     /// (another process may have been refused this token since this one read its state), and
     /// the slot's validity, replacing a stale slot (a suspend or a slow refresh) or reserving
     /// one for the retry.
-    /// - `LeaseLost`: nothing is sent or recorded, and the unsent slot stays counted.
+    /// - `LeaseLost` (the lease was lost, the identity changed, or the account is
+    ///   quarantined): nothing is sent or recorded, and the never-sent held slot goes back,
+    ///   best effort, at the record.
     /// - `Rejected`: a stamp written by another process after this collection read its state
     ///   (the fence for `rejected_fp`): nothing is sent, and the slot goes back. Recorded as
     ///   `token-expired` for a refreshable active account (the next collection hands the token
@@ -625,7 +637,10 @@ impl Collection<'_> {
         };
         match grant {
             SendGrant::Send(slot) => Ok(slot),
-            SendGrant::LeaseLost => Err(Stop::LeaseLost),
+            SendGrant::LeaseLost => {
+                self.slot = held;
+                Err(Stop::LeaseLost)
+            }
             SendGrant::Rejected => {
                 self.slot = held;
                 self.rejected = fp;
@@ -698,17 +713,20 @@ impl Collection<'_> {
         }
     }
 
-    /// Whether the account is the provider's active one right now, by the store's record of
-    /// it, which a switch commits (§9.4 step 9). A switch can commit while the fetch is in
-    /// flight, so the role read before the fetch may be the pre-switch one, and a plan made
-    /// for it would overwrite the switch's re-plan for one cycle (§8.3). With no record, the
-    /// live login's role read before the fetch stands. A switch committing between this read
-    /// and the record is a window of a few statements, left open: the next collection plans
-    /// from the new role.
+    /// Whether the account is the provider's active one when it records. The role read
+    /// before the fetch (the live login's) stands, unless the store's record of the active
+    /// account (which `add` and a switch's commit write, §9.4 step 9) changed since the
+    /// collection started: then a switch committed while the fetch was in flight, and a plan
+    /// made for the pre-switch role would overwrite the switch's re-plan for one cycle
+    /// (§8.3). The record is not read alone: it does not follow a login made outside tagteam
+    /// (Claude Code's `/login`), so a stale one must never outrank the live login. A removed
+    /// record keeps the live role. A switch committing between this read and the record is a
+    /// window of a few statements, left open: the next collection plans from the new role.
     fn active_now(&self) -> Result<bool, StoreError> {
-        Ok(match self.store.active(&self.row.provider)? {
-            Some(id) => id == self.row.id,
-            None => self.active,
+        let recorded = self.store.active(&self.row.provider)?;
+        Ok(match recorded {
+            Some(id) if recorded != self.recorded_active => id == self.row.id,
+            _ => self.active,
         })
     }
 
@@ -761,7 +779,12 @@ impl Collection<'_> {
                 }
                 Collected::Dropped
             }
-            Err(Stop::LeaseLost) => Collected::Dropped,
+            Err(Stop::LeaseLost) => {
+                if let Some(slot) = self.slot.take() {
+                    let _ = self.store.release_slot(&self.reservation, &slot);
+                }
+                Collected::Dropped
+            }
             Err(Stop::Error(e)) => return Err(e),
         })
     }

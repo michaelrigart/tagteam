@@ -845,7 +845,7 @@ impl Store {
         tx.execute("DELETE FROM accounts WHERE id = ?1", [id.as_str()])?;
         tx.execute(
             "DELETE FROM leases WHERE name = ?1",
-            [format!("usage:{id}")],
+            [usage::lease_name(id)],
         )?;
         tx.commit()?;
         Ok(())

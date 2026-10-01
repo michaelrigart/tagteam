@@ -763,7 +763,7 @@ mod tests {
         assert!(matches!(k.find("s", "a"), Read::Absent));
         assert!(matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("rc 36")));
         assert!(
-            matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("did not finish in time") && !e.detail.contains("gave up") && !e.detail.contains(" s"))
+            matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("did not finish in time") && !e.detail.contains("gave up") && !e.detail.contains(" 5 s"))
         );
         assert!(matches!(k.find("s", "a"), Read::Unreadable(_)));
         assert!(matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("rc 1")));

@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
 use tagteam_core::backoff::failure_backoff_s;
 use tagteam_core::poll::budget_next_free;
-use tagteam_core::trust::is_future_stamped;
+use tagteam_core::trust::{FUTURE_STAMP_SLACK_S, is_future_stamped};
 use tagteam_core::usage::{windows_from_json, windows_to_json};
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Sample, Window};
 
@@ -21,6 +21,11 @@ const USAGE_LEASE_MS: i64 = 90_000;
 const PRUNE_LEASE: &str = "prune:usage_samples";
 
 const DAY_S: i64 = 86_400;
+
+/// The longest backoff any failure legally sets: §8.5's 429 cap (4500 s). A `backoff_until`
+/// further ahead than this plus `FUTURE_STAMP_SLACK_S` was written under a clock that ran
+/// ahead, so no legal schedule reaches it: reserving ignores it (§8.4).
+const MAX_BACKOFF_S: i64 = 4500;
 
 /// §8.3's `last_error` token for a request the hourly budget refused (§8.6).
 const OVER_BUDGET: &str = "over-budget";
@@ -140,7 +145,7 @@ const SAMPLES_OF_WINDOW: &str = "SELECT window, fetched_at, pct, resets_at FROM 
 const SAMPLES_OF_ALL: &str = "SELECT window, fetched_at, pct, resets_at FROM usage_samples \
      WHERE account_id = ?1 AND fetched_at >= ?2 ORDER BY fetched_at, window";
 
-fn lease_name(id: &AccountId) -> String {
+pub(super) fn lease_name(id: &AccountId) -> String {
     format!("usage:{id}")
 }
 
@@ -293,8 +298,11 @@ impl Store {
     /// Phase 1 (§8.3), one `IMMEDIATE` transaction. The account is re-read inside it.
     ///
     /// Eligibility, in this order: not quarantined, not in backoff, no live lease, then the
-    /// schedule (a `fetched_at` more than `FUTURE_STAMP_SLACK_S` ahead of now counts as no
-    /// reading). An on-demand caller (`list`, `status`) needs the reading to be older than
+    /// schedule. A clock that ran ahead when a record was written leaves times no legal
+    /// schedule reaches, which count as clock skew and are ignored: a `fetched_at` more than
+    /// `FUTURE_STAMP_SLACK_S` ahead counts as no reading, a `next_poll_at` more than
+    /// `count_window_s` plus the slack ahead counts as due, and a `backoff_until` more than
+    /// `MAX_BACKOFF_S` plus the slack ahead is no backoff (§8.4). An on-demand caller (`list`, `status`) needs the reading to be older than
     /// `floor_s` and a poll to be due, where no plan counts as due. A scheduled caller (M3)
     /// needs a poll to be due or no reading at all (§8.3's "due or stale"). An eligible
     /// account then needs a free slot in its identity's hourly budget (§8.6). Over budget, the
@@ -338,7 +346,12 @@ impl Store {
             )
             .optional()?
             .unwrap_or_default();
-        if backoff_until.is_some_and(|t| t > now_s) {
+        // Clock skew: a failure recorded while the clock ran ahead leaves a backoff no legal
+        // schedule reaches (`MAX_BACKOFF_S`), which must not lock the account out until the
+        // clock catches up.
+        if backoff_until
+            .is_some_and(|t| t > now_s && t - now_s <= MAX_BACKOFF_S + FUTURE_STAMP_SLACK_S)
+        {
             return Ok(Reserve::Ineligible(Ineligible::Backoff));
         }
         let name = lease_name(id);
@@ -353,7 +366,11 @@ impl Store {
         // A reading stamped more than the slack ahead of now has no usable age (§8.4): it
         // counts as unread, so it cannot lock the account out until the clock catches up.
         let fetched_at = fetched_at.filter(|t| !is_future_stamped(*t, now_s));
-        let due = next_poll_at.is_none_or(|t| t <= now_s);
+        // The same skew leaves a `next_poll_at` further ahead than any legal plan: the longest
+        // is an over-budget account's `next_free_at`, at most `count_window_s` away. Past that
+        // plus the slack the poll counts as due.
+        let due = next_poll_at
+            .is_none_or(|t| t <= now_s || t - now_s > budget.count_window_s + FUTURE_STAMP_SLACK_S);
         let eligible = if on_demand {
             due && fetched_at.is_none_or(|t| now_s - t > budget.floor_s)
         } else {
