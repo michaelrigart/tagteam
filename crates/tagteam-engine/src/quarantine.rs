@@ -1,8 +1,10 @@
 //! §7.4: one strike quarantines an account, bound to the fingerprint that was sent.
 
 use serde_json::json;
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::{DeadReason, Provenance, Provider, Read};
 
+use crate::account_lock::AccountLock;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::refresh::fp_str;
@@ -57,6 +59,7 @@ impl Engine {
         row: &AccountRow,
         kind: &str,
         reason: Option<&str>,
+        source: &str,
     ) -> Result<(), EngineError> {
         self.store()?.insert_event(&EventRow {
             at: self.now_ms(),
@@ -65,7 +68,7 @@ impl Engine {
             from_id: None,
             to_id: Some(row.id.clone()),
             trigger: None,
-            source: "cli".into(),
+            source: source.into(),
             detail: reason.map(|r| json!({"reason": r})),
         })?;
         Ok(())
@@ -81,7 +84,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         self.store()?
             .set_quarantine(&row.id, reason.as_str(), fp, self.now_ms())?;
-        self.quarantine_event(row, "quarantine", Some(reason.as_str()))?;
+        self.quarantine_event(row, "quarantine", Some(reason.as_str()), "cli")?;
         tracing::warn!(
             position = row.position,
             account = %row.id,
@@ -93,9 +96,14 @@ impl Engine {
 
     /// Clears the quarantine and records `unquarantine`; `false` when there was none.
     pub(crate) fn unquarantine(&self, row: &AccountRow) -> Result<bool, EngineError> {
+        self.unquarantine_from(row, "cli")
+    }
+
+    /// `unquarantine`, with the event's `source` (`cli` or `auto`).
+    fn unquarantine_from(&self, row: &AccountRow, source: &str) -> Result<bool, EngineError> {
         let cleared = self.store()?.clear_quarantine(&row.id)?;
         if cleared {
-            self.quarantine_event(row, "unquarantine", None)?;
+            self.quarantine_event(row, "unquarantine", None, source)?;
         }
         Ok(cleared)
     }
@@ -152,6 +160,47 @@ impl Engine {
             },
         };
         live.is_some_and(|bytes| fp_str(p, &bytes) == bound)
+    }
+
+    /// §7.4 / Decision 9: clears every quarantine of `provider` that no longer binds
+    /// (`quarantine_released`), each under its account lock (try-only; a busy account is
+    /// left), and records each release with `source`. Returns the released accounts.
+    pub fn release_unbound_quarantines(
+        &self,
+        provider: &ProviderId,
+        source: &'static str,
+    ) -> Result<Vec<AccountId>, EngineError> {
+        let Some(store) = self.existing_store()? else {
+            return Ok(Vec::new());
+        };
+        let p = self.provider(provider)?;
+        let mut released = Vec::new();
+        for listed in store.accounts(provider)? {
+            if listed.quarantine_reason.is_none() {
+                continue;
+            }
+            // Whoever holds it may be refreshing or writing this very account: it decides, and
+            // the next caller looks again.
+            let Some(_lock) = AccountLock::try_acquire(&self.env, &listed.id)? else {
+                continue;
+            };
+            // Read again under the lock: the row may have changed since it was listed.
+            let Some(row) = store.account(&listed.id)? else {
+                continue;
+            };
+            if row.quarantine_reason.is_none() || !self.quarantine_released(p.as_ref(), &row) {
+                continue;
+            }
+            if self.unquarantine_from(&row, source)? {
+                tracing::info!(
+                    position = row.position,
+                    account = %row.id,
+                    "released a quarantine that no longer binds"
+                );
+                released.push(row.id);
+            }
+        }
+        Ok(released)
     }
 }
 
