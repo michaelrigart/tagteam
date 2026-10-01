@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (no features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Clippy (test-support)
+        run: cargo clippy --workspace --all-targets --locked --features tagteam/test-support -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked --features tagteam/test-support
+      - name: Test (real keychain)
+        if: runner.os == 'macOS'
+        run: cargo test -p tagteam-provider --locked --features real_keychain --test real_keychain
