@@ -593,6 +593,34 @@ mod tests {
     }
 
     #[test]
+    fn the_settings_are_those_of_the_provider_the_command_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::for_test(dir.path());
+        std::fs::create_dir_all(env.config_dir()).unwrap();
+        std::fs::write(
+            env.config_dir().join("config.toml"),
+            "[statusline]\nformat = \"{5h}\"\n\n[provider.other.statusline]\nformat = \"{7d}\"\n",
+        )
+        .unwrap();
+        let format_for = |provider: &str| {
+            let ctx = Context {
+                env: env.clone(),
+                keychain: Arc::new(FakeKeychain::new()),
+                platform: Platform::MacOs,
+                api_base: None,
+                stdout_terminal: false,
+            };
+            engine(ctx, &ProviderId::new(provider))
+                .0
+                .settings()
+                .statusline_format
+                .clone()
+        };
+        assert_eq!(format_for(CLAUDE_CODE), "{5h}");
+        assert_eq!(format_for("other"), "{7d}");
+    }
+
+    #[test]
     fn the_engine_reaches_neither_the_keychain_nor_the_network() {
         // §13.5: the walls count what reaches them, so none of this may.
         let (_dir, env) = managed_home();
