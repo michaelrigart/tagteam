@@ -765,6 +765,44 @@ fn an_interrupted_config_wait_releases_the_credential_locks_it_was_given() {
     );
 }
 
+/// L356, Review Focus 5: tagteam was suspended past the staleness window, and Claude Code took
+/// the refresh lock over with a directory that carries tagteam's last mtime. The write the lock
+/// protects is refused, and releasing tagteam's locks leaves CC's directory where it is.
+#[test]
+fn a_replaced_lock_directory_aborts_the_write_and_is_left_alone() {
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    let svc = keychain_service(&f.env, ItemKind::OAuth);
+    let acct = keychain_account(&f.env);
+    let live = br#"{"claudeAiOauth":{"refreshToken":"old"}}"#;
+    f.kc.put(&svc, &acct, live);
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+    let ours = fs::metadata(&paths.refresh_lock)
+        .unwrap()
+        .modified()
+        .unwrap();
+    fs::remove_dir(&paths.refresh_lock).unwrap();
+    fs::create_dir(&paths.refresh_lock).unwrap(); // CC's
+    fs::File::open(&paths.refresh_lock)
+        .unwrap()
+        .set_modified(ours)
+        .unwrap();
+
+    let t = target(&f, "new@b.co", "rt-new");
+    assert!(matches!(
+        f.cc.write_credential(&f.env, &locks, &t, &mut save_nothing),
+        Err(ProviderError::Lock(LockError::Compromised(_)))
+    ));
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), live, "nothing was written");
+    drop(locks);
+    assert!(paths.refresh_lock.is_dir(), "CC's directory is left alone");
+    assert!(
+        !paths.legacy_lock().exists() && !paths.config_lock.exists(),
+        "tagteam's own locks are released"
+    );
+}
+
 /// §9.1: one budget covers both stages. The legacy lock is held for most of a 2 s budget and a
 /// config lock for good, so the credential stage spends about 1.5 s. With one shared budget the
 /// config stage gets what remains, and `lock_live` gives up by ~2.5 s. A fresh budget per
