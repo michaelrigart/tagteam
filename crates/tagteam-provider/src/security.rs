@@ -22,6 +22,8 @@ pub enum RunResult {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
+    /// The process did not finish in time: it hung and was killed, or it exited but never
+    /// closed its output pipes within the grace period.
     TimedOut,
     SpawnFailed(String),
 }
@@ -93,7 +95,7 @@ enum Waited {
 }
 
 /// Polls until the child exits or `deadline` passes. A timeout and a failed poll both kill and
-/// reap the child, so neither leaves a process running (L343).
+/// reap the child, so neither leaves a process running (L343), unless the kill itself fails.
 fn wait_for(child: &mut dyn Waitable, deadline: Instant) -> Waited {
     loop {
         match child.try_wait() {
@@ -111,9 +113,12 @@ fn wait_for(child: &mut dyn Waitable, deadline: Instant) -> Waited {
     }
 }
 
+/// Kills the child and waits for it. A kill that fails leaves the child running, and `wait`
+/// would block for as long as it does, so then it returns without waiting.
 fn reap(child: &mut dyn Waitable) {
-    let _ = child.kill();
-    let _ = child.wait();
+    if child.kill().is_ok() {
+        let _ = child.wait();
+    }
 }
 
 /// Reads a pipe to its end on a thread and sends what it read. The thread is detached, so a
@@ -363,7 +368,10 @@ fn describe(r: &RunResult) -> (Option<i32>, String) {
         ),
         RunResult::TimedOut => (
             None,
-            format!("security timed out after {} s", TIMEOUT.as_secs()),
+            format!(
+                "security did not finish in time (it hung or kept its output open); gave up after {} s",
+                TIMEOUT.as_secs()
+            ),
         ),
         RunResult::SpawnFailed(e) => (None, format!("could not run security: {e}")),
     }
@@ -757,7 +765,9 @@ mod tests {
         let k = cli(&s, None);
         assert!(matches!(k.find("s", "a"), Read::Absent));
         assert!(matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("rc 36")));
-        assert!(matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("timed out")));
+        assert!(
+            matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("did not finish in time"))
+        );
         assert!(matches!(k.find("s", "a"), Read::Unreadable(_)));
         assert!(matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("rc 1")));
     }
@@ -906,6 +916,7 @@ mod tests {
         polls: VecDeque<io::Result<Option<ExitStatus>>>,
         kills: usize,
         waits: usize,
+        kill_fails: bool,
     }
 
     impl FakeChild {
@@ -914,7 +925,13 @@ mod tests {
                 polls: polls.into(),
                 kills: 0,
                 waits: 0,
+                kill_fails: false,
             }
+        }
+
+        fn unkillable(mut self) -> Self {
+            self.kill_fails = true;
+            self
         }
     }
 
@@ -924,6 +941,9 @@ mod tests {
         }
         fn kill(&mut self) -> io::Result<()> {
             self.kills += 1;
+            if self.kill_fails {
+                return Err(io::Error::other("not permitted"));
+            }
             Ok(())
         }
         fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -949,6 +969,22 @@ mod tests {
         let mut child = FakeChild::new(vec![Ok(None)]);
         assert_eq!(wait_for(&mut child, Instant::now()), Waited::TimedOut);
         assert_eq!((child.kills, child.waits), (1, 1));
+    }
+
+    #[test]
+    fn a_child_that_cannot_be_killed_is_not_waited_for() {
+        // `wait` on a child that is still running would block for as long as it runs.
+        let mut past = FakeChild::new(vec![Ok(None)]).unkillable();
+        assert_eq!(wait_for(&mut past, Instant::now()), Waited::TimedOut);
+        assert_eq!((past.kills, past.waits), (1, 0));
+
+        let mut failed = FakeChild::new(vec![Err(io::Error::other("boom"))]).unkillable();
+        let waited = wait_for(&mut failed, Instant::now() + Duration::from_secs(60));
+        assert!(
+            matches!(&waited, Waited::Failed(m) if m.contains("boom")),
+            "{waited:?}"
+        );
+        assert_eq!((failed.kills, failed.waits), (1, 0));
     }
 
     #[test]
