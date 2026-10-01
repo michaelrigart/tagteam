@@ -8,6 +8,7 @@ pub mod oauth;
 pub mod paths;
 pub mod provider;
 pub mod shape;
+pub mod usage;
 
 pub use naming::{ItemKind, keychain_account, keychain_service, read_services};
 pub use paths::CcPaths;

@@ -37,6 +37,7 @@ pub use process::ProcessStamp;
 pub use provider::{
     BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, Identity,
     IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, Provider,
-    ProviderError, RefreshResult, SecretStore, StoredLogin, TransientKind, Undo, Written,
+    ProviderError, RefreshResult, SecretStore, StoredLogin, TransientKind, Undo, UsageResult,
+    Written,
 };
 pub use read::{Read, ReadError};
