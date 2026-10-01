@@ -1,3 +1,4 @@
+use tagteam_core::poll::replan_for_role;
 use tagteam_core::{
     AccountId, OracleVerdict, OutgoingAction, OutgoingClass, OutgoingFacts, ProviderId,
     decide_outgoing, rotation_order,
@@ -9,6 +10,7 @@ use tagteam_provider::{
 };
 
 use crate::account_lock::AccountLock;
+use crate::collect::jitter;
 use crate::displace::displace;
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -918,7 +920,13 @@ impl Engine {
             let locks = p.lock_live(&self.env, &guard)?;
             match self.rederive(p, &store, &req, &plan, outgoing.as_ref())? {
                 Rederived::Go(locked) => {
-                    return self.transact(p, &store, &plan, locked, &accounts, &locks, &req);
+                    let outcome =
+                        self.transact(p, &store, &plan, locked, &accounts, &locks, &req)?;
+                    // The re-plan needs no lock and never fetches (§8.3).
+                    drop(locks);
+                    drop(accounts);
+                    self.replan_polls(p, &store, &outcome);
+                    return Ok(outcome);
                 }
                 Rederived::Done(mut outcome) => {
                     outcome.warnings.extend(plan.warnings.clone());
@@ -929,6 +937,44 @@ impl Engine {
             // `locks`, then `accounts`, are released here; the mutation lock is kept.
         }
         Err(EngineError::LiveMoved)
+    }
+
+    /// §8.3: after a switch that activated an account, both accounts' polls are re-planned
+    /// for their new roles, without fetching: the incoming account gets §9.4's plan (180 s
+    /// after its reading, due at once when that is past) and the outgoing one the candidate
+    /// policy (§8.6). The readings stay as they are. An account with no reading is skipped,
+    /// so it keeps no plan and stays eligible on demand (§8.3: a plan in force would make it
+    /// not due). The switch has committed, so this is contained (§14): a failure is logged at
+    /// ERROR and never fails it.
+    fn replan_polls(&self, p: &dyn Provider, store: &Store, outcome: &SwitchOutcome) {
+        let Some(to) = &outcome.to else {
+            return;
+        };
+        if !p.capabilities().usage {
+            return;
+        }
+        let budget = p.poll_budget();
+        let now_s = self.now_ms().div_euclid(1000);
+        let outgoing = outcome.from.as_ref().filter(|from| from.id != to.id);
+        for (row, active) in [(Some(to), true), (outgoing, false)] {
+            let Some(row) = row else {
+                continue;
+            };
+            let result = store.usage_state(&row.id).and_then(|state| {
+                let Some(fetched_at) = state.and_then(|s| s.fetched_at) else {
+                    return Ok(());
+                };
+                let plan = replan_for_role(&budget, active, fetched_at, now_s, jitter());
+                store.set_poll_plan(&row.id, &plan)
+            });
+            if let Err(e) = result {
+                tracing::error!(
+                    position = row.position,
+                    account = %row.id,
+                    "could not re-plan usage polls after the switch: {e}"
+                );
+            }
+        }
     }
 
     /// §9.4 step 1: the live account, the target and the self-switch decision, all re-read
