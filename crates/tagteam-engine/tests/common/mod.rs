@@ -16,6 +16,7 @@ use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
+use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{JournalRow, LoginMeta, NewAccount, Store};
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
@@ -307,6 +308,7 @@ impl Fx {
             clock: clock.clone(),
             http: http.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
+            settings: Settings::default(),
         });
         Fx {
             dir,
@@ -653,6 +655,7 @@ impl Fx {
             clock: self.clock.clone(),
             http: self.http.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
+            settings: Settings::default(),
         })
     }
 
@@ -1031,6 +1034,7 @@ impl FakeFx {
             oracle: fx.oracle.clone(),
             clock: fx.clock.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
+            settings: Settings::default(),
             http: fx.http.clone(),
         });
         FakeFx { fx, fake, engine }

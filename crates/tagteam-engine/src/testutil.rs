@@ -15,6 +15,7 @@ use crate::account_lock::AccountLock;
 use crate::engine::{Engine, EngineConfig};
 use crate::oracle::NoOracle;
 use crate::registry::ProviderRegistry;
+use crate::settings::Settings;
 use crate::store::{AccountRow, NewAccount};
 use crate::vault::{KeychainVault, SERVICE, Vault};
 
@@ -52,6 +53,7 @@ impl T {
             clock: Arc::new(FakeClock::new(NOW)),
             http: Arc::new(NoHttp),
             default_provider: ProviderId::new(CLAUDE_CODE),
+            settings: Settings::default(),
         });
         T {
             _dir: dir,
