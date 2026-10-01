@@ -287,7 +287,8 @@ impl Provider for FakeAgent {
         g: &'g MutationGuard,
         budget: Duration,
     ) -> Result<CredLocks<'g>, ProviderError> {
-        let spec = MkdirLockSpec::new(FakePaths::resolve(env).lock, LOCK_STALE, budget);
+        let spec = MkdirLockSpec::new(FakePaths::resolve(env).lock, LOCK_STALE, budget)
+            .with_cancel(&env.cancel);
         Ok(CredLocks::new(
             g,
             Box::new(FakeLock(MkdirLock::acquire(&spec)?)),

@@ -266,6 +266,33 @@ fn its_one_live_lock_times_out_within_its_budget_and_is_left_alone() {
     assert!(p.lock.is_dir());
 }
 
+/// Any signal number: the token only carries it.
+const SIGTERM: i32 = 15;
+
+#[test]
+fn its_live_lock_wait_ends_when_the_token_is_set() {
+    // §14.1: FakeAgent's lock wait is a cancellation point like Claude Code's.
+    let f = fx();
+    login(&f.env, "alice", "ws", "tok-a", "renew-a");
+    let p = FakePaths::resolve(&f.env);
+    fs::create_dir(&p.lock).unwrap(); // another FakeAgent process holds it, freshly
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    f.env.cancel.request(SIGTERM);
+    let start = Instant::now();
+    assert!(matches!(
+        f.fake.lock_live(&f.env, &g),
+        Err(ProviderError::Lock(LockError::Interrupted {
+            signal: SIGTERM,
+            ..
+        }))
+    ));
+    assert!(
+        start.elapsed() < Duration::from_millis(100),
+        "not the 1 s budget"
+    );
+    assert!(p.lock.is_dir(), "the other holder's lock is left alone");
+}
+
 #[test]
 fn a_torn_identity_file_is_unreadable_and_never_replaced() {
     let f = fx();
