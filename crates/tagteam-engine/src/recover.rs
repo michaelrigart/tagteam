@@ -84,14 +84,15 @@ impl Engine {
 
     /// The oracle's answers about the live secrets that `row` does not already name by
     /// fingerprint, asked before the mutation lock (§9.6, §7.6). A read that cannot be trusted
-    /// decides nothing, so nothing about it is asked.
-    pub(crate) fn recovery_hints(&self, row: &JournalRow) -> Vec<OracleHint> {
+    /// decides nothing, so nothing about it is asked. A signal that has landed ends it before
+    /// the next request (§14.1).
+    pub(crate) fn recovery_hints(&self, row: &JournalRow) -> Result<Vec<OracleHint>, EngineError> {
         let Ok(p) = self.provider(&row.provider) else {
-            return vec![];
+            return Ok(vec![]);
         };
         let live = p.read_live_auth(&self.env);
         if refuse_unsafe_live_reads(&live).is_err() {
-            return vec![];
+            return Ok(vec![]);
         }
         Axis::BOTH
             .into_iter()
@@ -102,10 +103,11 @@ impl Engine {
                 })
             })
             .map(|bytes| {
+                self.check_cancel()?;
                 let resolved = self
                     .oracle
                     .resolve(p.as_ref(), &Credential::fresh(bytes.clone()));
-                OracleHint { bytes, resolved }
+                Ok(OracleHint { bytes, resolved })
             })
             .collect()
     }

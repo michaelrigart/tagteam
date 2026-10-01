@@ -72,6 +72,15 @@ impl Engine {
         &self.env.cancel
     }
 
+    /// A cancellation point outside the locks (§14.1): the interruption once the token holds a
+    /// signal, so a request about to be sent is never sent.
+    pub(crate) fn check_cancel(&self) -> Result<(), EngineError> {
+        match self.cancel().requested() {
+            Some(signal) => Err(EngineError::Interrupted(signal)),
+            None => Ok(()),
+        }
+    }
+
     /// The Env for a write inside a critical span (§14.1): the same paths, with a cancel token
     /// nothing sets, so a lock wait the write makes (CC's storage-write lock, §9.1) runs to
     /// completion or times out. A signal stays recorded for the next cancellation point.
@@ -215,13 +224,13 @@ impl Engine {
             .into_iter()
             .map(|row| {
                 let hint = if ask_oracle {
-                    self.recovery_hints(&row)
+                    self.recovery_hints(&row)?
                 } else {
                     Vec::new()
                 };
-                (row, hint)
+                Ok((row, hint))
             })
-            .collect();
+            .collect::<Result<_, EngineError>>()?;
         hooks::point(self, "before-mutation-lock")?;
         let guard = MutationGuard::acquire(&self.env, MutationGuard::TIMEOUT)?;
         // Enumerated again under the lock: a switch may have died while this command waited,

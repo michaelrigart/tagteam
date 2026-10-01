@@ -46,6 +46,23 @@ fn an_expiring_target_is_refreshed_before_it_is_activated() {
 }
 
 #[test]
+fn a_signal_before_the_gate_sends_no_refresh_request() {
+    // §14.1: planning, before any lock, is a cancellation point. A Ctrl-C that has landed stops
+    // the switch before it spends the target's refresh token, not after.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    fx.expire_access(&a);
+    fx.script_refresh(Some("rt-a-2"));
+    fx.engine.cancel().request(libc::SIGINT);
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert_eq!(err.signal(), Some(libc::SIGINT), "{err}");
+    assert_eq!(token_requests(&fx), 0, "the refresh token was not spent");
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+}
+
+#[test]
 fn no_request_is_made_outside_the_window_for_a_self_switch_or_an_unrefreshable_kind() {
     // Outside the 10-minute window.
     let fx = Fx::new();
