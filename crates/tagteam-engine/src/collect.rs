@@ -785,6 +785,11 @@ impl Collection<'_> {
                 if recorded {
                     Collected::Failed { kind: f.kind }
                 } else {
+                    // Fenced out before the record deleted it: a slot that was never sent
+                    // must not hold budget for the hour. One that was sent is not held here.
+                    if let Some(slot) = self.slot.take() {
+                        let _ = self.store.release_slot(&self.reservation, &slot);
+                    }
                     Collected::Dropped
                 }
             }

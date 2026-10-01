@@ -1341,4 +1341,34 @@ mod hooks {
         assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
         assert_eq!(state(&fx, &a).poll_interval_s, Some(270));
     }
+
+    #[test]
+    fn a_failure_record_fenced_out_gives_its_never_sent_slot_back() {
+        // The fetch failed before sending (no token); before the record, another process
+        // takes the lease. The failure record is dropped by the fence, and the slot, never
+        // sent, must not hold the hourly budget.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.kc.delete(SERVICE, a.as_str()).unwrap();
+        let path = fx.env.data_dir().join("tagteam.db");
+        let name = format!("usage:{a}");
+        fx.engine.on_point(
+            "usage-before-record",
+            Box::new(move || {
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE leases SET holder = 'other' WHERE name = ?1",
+                        [&name],
+                    )
+                    .unwrap();
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        assert_eq!(report.outcomes, [(a.clone(), Collected::Dropped)]);
+        assert!(fx.http.requests().is_empty());
+        assert_eq!(usage_requests(&fx), 0, "the never-sent slot went back");
+    }
 }
