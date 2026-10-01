@@ -17,6 +17,26 @@ use super::{AccountRow, Store, StoreError};
 /// A usage lease lives 90 s (§8.3).
 const USAGE_LEASE_MS: i64 = 90_000;
 
+/// Whether a stored `backoff_until` is further ahead of `now_s` than any legal backoff
+/// (`MAX_BACKOFF_S`) plus the slack: written under a clock that ran ahead (§8.4). Shared by
+/// `reserve_usage` and the views, so what reserving ignores is never shown as a retry time.
+pub(crate) fn backoff_is_skewed(until: i64, now_s: i64) -> bool {
+    until.saturating_sub(now_s) > MAX_BACKOFF_S + FUTURE_STAMP_SLACK_S
+}
+
+/// Whether a stored `next_poll_at` is further ahead of `now_s` than any legal plan plus the
+/// slack (§8.4), as `backoff_is_skewed` for the schedule. The longest legal plan is an
+/// over-budget `next_free_at` (`count_window_s`) or a post-429 interval with jitter
+/// (`post_429_max_s` plus `jitter_frac`); the bound is only sound while the first covers the
+/// second.
+pub(crate) fn plan_is_skewed(at: i64, now_s: i64, budget: &PollBudget) -> bool {
+    debug_assert!(
+        budget.count_window_s as f64 >= budget.post_429_max_s as f64 * (1.0 + budget.jitter_frac),
+        "the next_poll_at skew bound must cover the longest legal plan"
+    );
+    at.saturating_sub(now_s) > budget.count_window_s + FUTURE_STAMP_SLACK_S
+}
+
 /// The lease row that spaces retention prunes at least a day apart (Decision 7).
 const PRUNE_LEASE: &str = "prune:usage_samples";
 
@@ -350,9 +370,7 @@ impl Store {
         // Clock skew: a failure recorded while the clock ran ahead leaves a backoff no legal
         // schedule reaches (`MAX_BACKOFF_S`), which must not lock the account out until the
         // clock catches up.
-        if backoff_until
-            .is_some_and(|t| t > now_s && t - now_s <= MAX_BACKOFF_S + FUTURE_STAMP_SLACK_S)
-        {
+        if backoff_until.is_some_and(|t| t > now_s && !backoff_is_skewed(t, now_s)) {
             return Ok(Reserve::Ineligible(Ineligible::Backoff));
         }
         let name = lease_name(id);
@@ -367,19 +385,9 @@ impl Store {
         // A reading stamped more than the slack ahead of now has no usable age (§8.4): it
         // counts as unread, so it cannot lock the account out until the clock catches up.
         let fetched_at = fetched_at.filter(|t| !is_future_stamped(*t, now_s));
-        // The same skew leaves a `next_poll_at` further ahead than any legal plan: the longest
-        // is an over-budget account's `next_free_at`, at most `count_window_s` away. Past that
-        // plus the slack the poll counts as due.
-        // The longest legal plan is an over-budget `next_free_at` (`count_window_s`) or a
-        // post-429 interval with jitter (`post_429_max_s` plus `jitter_frac`); the bound below
-        // is only sound while the first covers the second.
-        debug_assert!(
-            budget.count_window_s as f64
-                >= budget.post_429_max_s as f64 * (1.0 + budget.jitter_frac),
-            "the next_poll_at skew bound must cover the longest legal plan"
-        );
-        let due = next_poll_at
-            .is_none_or(|t| t <= now_s || t - now_s > budget.count_window_s + FUTURE_STAMP_SLACK_S);
+        // The same skew leaves a `next_poll_at` further ahead than any legal plan: it counts
+        // as due.
+        let due = next_poll_at.is_none_or(|t| t <= now_s || plan_is_skewed(t, now_s, budget));
         let eligible = if on_demand {
             due && fetched_at.is_none_or(|t| now_s - t > budget.floor_s)
         } else {

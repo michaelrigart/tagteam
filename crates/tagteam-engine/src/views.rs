@@ -5,12 +5,14 @@ use std::time::Duration;
 use tagteam_core::pace::pace;
 use tagteam_core::trust::decision_grade;
 use tagteam_core::usage::{earliest_relevant_reset, is_relevant};
-use tagteam_core::{AccountId, Pace, ProviderId, Sample, TrustInputs, Window};
+use tagteam_core::{AccountId, Pace, PollBudget, ProviderId, Sample, TrustInputs, Window};
 use tagteam_provider::{Identity, KindTraits, Provider, Read};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::store::{AccountRow, LiveIdentityCacheRow, Store, UsageStateRow};
+use crate::store::{
+    AccountRow, LiveIdentityCacheRow, Store, UsageStateRow, backoff_is_skewed, plan_is_skewed,
+};
 
 /// §8.7: pace and projections read the samples of the 48 h before a reading.
 const PACE_LOOKBACK_S: i64 = 48 * 3600;
@@ -265,6 +267,7 @@ impl Engine {
         row: &AccountRow,
         kind: &KindTraits,
         supported: bool,
+        budget: &PollBudget,
         with_pace: bool,
     ) -> Result<UsageView, EngineError> {
         let state = match store {
@@ -332,9 +335,15 @@ impl Engine {
             fetched_at: state.fetched_at,
             age_s: state.fetched_at.map(|at| (now_s - at).max(0)),
             error,
+            // The times `reserve_usage` ignores as clock skew (§8.4) are no retry time either.
             retry_at: state
                 .backoff_until
-                .max(state.next_poll_at)
+                .filter(|&at| !backoff_is_skewed(at, now_s))
+                .max(
+                    state
+                        .next_poll_at
+                        .filter(|&at| !plan_is_skewed(at, now_s, budget)),
+                )
                 .filter(|&at| retried && at > now_s),
         })
     }
@@ -402,7 +411,7 @@ impl Engine {
         with_pace: bool,
     ) -> Result<AccountView, EngineError> {
         let kind = p.kind_traits(&row.kind);
-        let usage = self.usage_view(store, &row, &kind, supported, with_pace)?;
+        let usage = self.usage_view(store, &row, &kind, supported, &p.poll_budget(), with_pace)?;
         Ok(AccountView {
             kind,
             row,
@@ -424,10 +433,13 @@ impl Engine {
         let kind = provider
             .as_ref()
             .map_or(UNREGISTERED, |p| p.kind_traits(&row.kind));
+        let budget = provider
+            .as_ref()
+            .map_or(PollBudget::STANDARD, |p| p.poll_budget());
         let supported = provider.is_some_and(|p| p.capabilities().usage);
         let usage = self
             .existing_store()
-            .and_then(|s| self.usage_view(s.as_deref(), &row, &kind, supported, with_pace))
+            .and_then(|s| self.usage_view(s.as_deref(), &row, &kind, supported, &budget, with_pace))
             .unwrap_or_else(|e| {
                 tracing::warn!(
                     position = row.position,

@@ -409,6 +409,24 @@ fn the_retry_is_the_later_of_the_backoff_and_the_next_planned_poll() {
 }
 
 #[test]
+fn a_retry_time_the_reserve_rule_ignores_as_clock_skew_is_not_shown() {
+    // A `next_poll_at` a day ahead (a clock that ran ahead, then was corrected) is ignored by
+    // `reserve_usage` (§8.4), so it is no retry time either: the backoff 20 s ahead is.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    record(&fx, &a, &reading(T0, 9.0, 40.0), T0, T0 + 180);
+    fail(&fx, &a, "http-500", T0 + 400, T0 + 430, None);
+    replan(&fx, &a, T0 + 410 + 86_400);
+    at(&fx, T0 + 410);
+    let u = usage_of(&fx.engine, &a);
+    assert_eq!(u.status, UsageStatus::Unavailable);
+    assert_eq!(u.retry_at, Some(T0 + 430));
+    // The bound is the reserve rule's: a plan one count window out is still a retry time.
+    replan(&fx, &a, T0 + 410 + 3_660);
+    assert_eq!(usage_of(&fx.engine, &a).retry_at, Some(T0 + 410 + 3_660));
+}
+
+#[test]
 fn a_plan_in_force_never_extends_a_quarantined_accounts_trust() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");

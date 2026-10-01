@@ -18,6 +18,7 @@ mod usage;
 pub use usage::{
     Ineligible, LiveIdentityCacheRow, Reservation, Reserve, SendGrant, Slot, UsageStateRow,
 };
+pub(crate) use usage::{backoff_is_skewed, plan_is_skewed};
 
 const SCHEMA_V1: &str = include_str!("schema.sql");
 
