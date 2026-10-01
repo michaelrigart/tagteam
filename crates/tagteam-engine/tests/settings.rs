@@ -1,8 +1,12 @@
 use std::fs;
+use std::time::{Duration, SystemTime};
 
 use tagteam_core::ProviderId;
+use tagteam_core::autoswitch::Strategy;
 use tagteam_engine::settings::{
-    ColorMode, STATUSLINE_PLACEHOLDERS, Settings, is_statusline_placeholder,
+    COOLDOWN_SECONDS_RANGE, ColorMode, HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE,
+    STATUSLINE_PLACEHOLDERS, Settings, THRESHOLD_RANGE, UNHEALTHY_TICKS_RANGE,
+    is_statusline_placeholder, parse_bool,
 };
 use tagteam_provider::Env;
 
@@ -29,6 +33,12 @@ fn models(names: &[&str]) -> Vec<String> {
 fn the_defaults_are_the_specs_table() {
     let d = Settings::default();
     assert_eq!(d.threshold, 90.0);
+    assert_eq!(d.interval_seconds, 60);
+    assert_eq!(d.cooldown_seconds, 300);
+    assert_eq!(d.hysteresis_pct, 10.0);
+    assert_eq!(d.strategy, Strategy::Best);
+    assert!(!d.include_api_key_accounts);
+    assert_eq!(d.unhealthy_ticks, 3);
     assert_eq!(d.models, Vec::<String>::new());
     assert_eq!(d.history_retention_days, 180);
     assert_eq!(
@@ -64,6 +74,12 @@ fn every_key_is_read_from_a_full_file() {
         r#"
 [autoswitch]
 threshold = 75.5
+interval_seconds = 120
+cooldown_seconds = 600
+hysteresis_pct = 12.5
+strategy = "consume-first"
+include_api_key_accounts = true
+unhealthy_ticks = 5
 models = ["Fable", "Opus"]
 
 [usage]
@@ -81,6 +97,12 @@ color = "never"
         settings,
         Settings {
             threshold: 75.5,
+            interval_seconds: 120,
+            cooldown_seconds: 600,
+            hysteresis_pct: 12.5,
+            strategy: Strategy::ConsumeFirst,
+            include_api_key_accounts: true,
+            unhealthy_ticks: 5,
             models: models(&["Fable", "Opus"]),
             history_retention_days: 30,
             statusline_format: "{5h}%".to_owned(),
@@ -100,7 +122,7 @@ fn keys_written_with_dotted_names_are_read_too() {
 #[test]
 fn keys_this_milestone_does_not_read_are_ignored_without_a_warning() {
     let (settings, warnings) = load(
-        "default_provider = \"claude-code\"\n[autoswitch]\ninterval_seconds = 120\nstrategy = \"best\"\nfuture = true\n",
+        "default_provider = \"claude-code\"\n[autoswitch]\nfuture = true\n[run]\nshare_extra = [\"x\"]\n",
     );
     assert_eq!(settings, Settings::default());
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -606,4 +628,254 @@ fn duplicate_model_names_collapse_silently_keeping_the_first_spelling() {
         assert_eq!(settings.models, models(expected), "{list}");
         assert!(warnings.is_empty(), "{list}: {warnings:?}");
     }
+}
+
+#[test]
+fn the_autoswitch_ranges_are_the_specs_table() {
+    // §6.4. A file value outside its range falls back to the default (with a warning); a CLI
+    // flag is clamped into the same range.
+    assert_eq!(THRESHOLD_RANGE, 50.0..=99.9);
+    assert_eq!(INTERVAL_SECONDS_RANGE, 15..=3600);
+    assert_eq!(COOLDOWN_SECONDS_RANGE, 0..=86_400);
+    assert_eq!(HYSTERESIS_PCT_RANGE, 0.0..=50.0);
+    assert_eq!(UNHEALTHY_TICKS_RANGE, 1..=100);
+}
+
+#[test]
+fn the_autoswitch_numbers_accept_the_ends_of_their_ranges() {
+    for (text, seconds) in [("15", 15), ("3600", 3600), ("120", 120)] {
+        let (s, w) = load(&format!("[autoswitch]\ninterval_seconds = {text}\n"));
+        assert_eq!((s.interval_seconds, w.len()), (seconds, 0), "{text}: {w:?}");
+    }
+    for (text, seconds) in [("0", 0), ("86400", 86_400)] {
+        let (s, w) = load(&format!("[autoswitch]\ncooldown_seconds = {text}\n"));
+        assert_eq!((s.cooldown_seconds, w.len()), (seconds, 0), "{text}: {w:?}");
+    }
+    for (text, pct) in [("0", 0.0), ("0.0", 0.0), ("50", 50.0), ("12.5", 12.5)] {
+        let (s, w) = load(&format!("[autoswitch]\nhysteresis_pct = {text}\n"));
+        assert_eq!((s.hysteresis_pct, w.len()), (pct, 0), "{text}: {w:?}");
+    }
+    for (text, ticks) in [("1", 1), ("100", 100)] {
+        let (s, w) = load(&format!("[autoswitch]\nunhealthy_ticks = {text}\n"));
+        assert_eq!((s.unhealthy_ticks, w.len()), (ticks, 0), "{text}: {w:?}");
+    }
+}
+
+#[test]
+fn an_invalid_autoswitch_value_falls_back_to_its_default_with_one_warning_naming_the_key() {
+    // §6.4: reads are forgiving. Whole seconds and ticks are integers only, as
+    // `usage.history_retention_days` is; the percentage takes an integer or a float, as
+    // `autoswitch.threshold` does.
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "interval_seconds",
+            &["14", "3601", "0", "-60", "60.0", "\"60\"", "true", "nan"],
+        ),
+        (
+            "cooldown_seconds",
+            &["-1", "86401", "300.5", "\"300\"", "false"],
+        ),
+        (
+            "hysteresis_pct",
+            &["-0.1", "50.1", "100", "nan", "inf", "\"10\"", "true"],
+        ),
+        (
+            "strategy",
+            &[
+                "\"Best\"",
+                "\"consume_first\"",
+                "\"consumefirst\"",
+                "\"\"",
+                "1",
+                "true",
+                "[\"best\"]",
+            ],
+        ),
+        (
+            "include_api_key_accounts",
+            &[
+                "\"Yes\"", "\"TRUE\"", "\"on\"", "\"y\"", "2", "-1", "1.0", "\"\"",
+            ],
+        ),
+        (
+            "unhealthy_ticks",
+            &["0", "101", "-3", "3.0", "\"3\"", "4294967299"],
+        ),
+    ];
+    for (key, texts) in cases {
+        for text in *texts {
+            let (settings, warnings) = load(&format!("[autoswitch]\n{key} = {text}\n"));
+            assert_eq!(settings, Settings::default(), "{key} = {text}");
+            assert_eq!(warnings.len(), 1, "{key} = {text}: {warnings:?}");
+            assert!(
+                warnings[0].contains(&format!("`autoswitch.{key}`")),
+                "{warnings:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn each_autoswitch_warning_says_what_its_key_accepts() {
+    for (line, expected) in [
+        (
+            "interval_seconds = 5",
+            "`autoswitch.interval_seconds` must be a whole number of seconds from 15 to 3600 (ignored)",
+        ),
+        (
+            "cooldown_seconds = -5",
+            "`autoswitch.cooldown_seconds` must be a whole number of seconds from 0 to 86400 (ignored)",
+        ),
+        (
+            "hysteresis_pct = 60",
+            "`autoswitch.hysteresis_pct` must be a number from 0 to 50 (ignored)",
+        ),
+        (
+            "strategy = \"worst\"",
+            "`autoswitch.strategy` must be \"best\" or \"consume-first\" (ignored)",
+        ),
+        (
+            "include_api_key_accounts = \"maybe\"",
+            "`autoswitch.include_api_key_accounts` must be true, false, 1, 0, yes or no (ignored)",
+        ),
+        (
+            "unhealthy_ticks = 0",
+            "`autoswitch.unhealthy_ticks` must be a whole number of ticks from 1 to 100 (ignored)",
+        ),
+    ] {
+        let (_, warnings) = load(&format!("[autoswitch]\n{line}\n"));
+        assert_eq!(warnings.len(), 1, "{line}: {warnings:?}");
+        assert!(warnings[0].ends_with(expected), "{line}: {warnings:?}");
+    }
+}
+
+#[test]
+fn a_boolean_reads_only_true_false_one_zero_yes_and_no() {
+    // §6.4. In the file: a TOML boolean, the integers 1 and 0, or one of the six words as a
+    // string, in lower case. `parse_bool` is the words alone, for a flag's value.
+    for (text, expected) in [
+        ("true", true),
+        ("false", false),
+        ("1", true),
+        ("0", false),
+        ("\"true\"", true),
+        ("\"false\"", false),
+        ("\"1\"", true),
+        ("\"0\"", false),
+        ("\"yes\"", true),
+        ("\"no\"", false),
+    ] {
+        let (settings, warnings) = load(&format!(
+            "[autoswitch]\ninclude_api_key_accounts = {text}\n"
+        ));
+        assert_eq!(settings.include_api_key_accounts, expected, "{text}");
+        assert!(warnings.is_empty(), "{text}: {warnings:?}");
+    }
+    for (word, expected) in [
+        ("true", Some(true)),
+        ("false", Some(false)),
+        ("1", Some(true)),
+        ("0", Some(false)),
+        ("yes", Some(true)),
+        ("no", Some(false)),
+        ("Yes", None),
+        ("TRUE", None),
+        ("on", None),
+        ("off", None),
+        ("y", None),
+        ("", None),
+        (" yes", None),
+    ] {
+        assert_eq!(parse_bool(word), expected, "{word:?}");
+    }
+}
+
+#[test]
+fn the_strategy_reads_best_and_consume_first_by_their_names() {
+    assert_eq!(Strategy::Best.as_str(), "best");
+    assert_eq!(Strategy::ConsumeFirst.as_str(), "consume-first");
+    for strategy in [Strategy::Best, Strategy::ConsumeFirst] {
+        assert_eq!(Strategy::parse(strategy.as_str()), Some(strategy));
+        let (settings, warnings) = load(&format!(
+            "[autoswitch]\nstrategy = \"{}\"\n",
+            strategy.as_str()
+        ));
+        assert_eq!(settings.strategy, strategy);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+    for name in ["Best", "consume_first", "", " best"] {
+        assert_eq!(Strategy::parse(name), None, "{name:?}");
+    }
+}
+
+#[test]
+fn a_providers_autoswitch_table_comes_first_for_every_key() {
+    let global = "[autoswitch]\ninterval_seconds = 120\ncooldown_seconds = 600\nhysteresis_pct = 5\nstrategy = \"consume-first\"\ninclude_api_key_accounts = true\nunhealthy_ticks = 5\n";
+    let (settings, warnings) = load(&format!(
+        "{global}\n[provider.claude-code.autoswitch]\ninterval_seconds = 30\ncooldown_seconds = 0\nhysteresis_pct = 20\nstrategy = \"best\"\ninclude_api_key_accounts = false\nunhealthy_ticks = 1\n"
+    ));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        (
+            settings.interval_seconds,
+            settings.cooldown_seconds,
+            settings.hysteresis_pct,
+            settings.strategy,
+            settings.include_api_key_accounts,
+            settings.unhealthy_ticks
+        ),
+        (30, 0, 20.0, Strategy::Best, false, 1)
+    );
+
+    // An invalid override warns, naming the provider's key, and the global value applies.
+    let text = format!(
+        "{global}\n[provider.claude-code.autoswitch]\ninterval_seconds = 1\nstrategy = \"worst\"\n"
+    );
+    let (settings, warnings) = load(&text);
+    assert_eq!(
+        (settings.interval_seconds, settings.strategy),
+        (120, Strategy::ConsumeFirst)
+    );
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    for key in ["interval_seconds", "strategy"] {
+        let named = format!("`provider.claude-code.autoswitch.{key}`");
+        assert!(warnings.iter().any(|w| w.contains(&named)), "{warnings:?}");
+    }
+    // Another provider reads only the global table.
+    let (other, warnings) = load_as(&text, "fake-agent");
+    assert_eq!(
+        (other.interval_seconds, other.strategy),
+        (120, Strategy::ConsumeFirst)
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn the_mtime_is_the_settings_files_and_none_without_one() {
+    // §11.4: a running `auto` re-reads the file whenever this changes.
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::for_test(dir.path());
+    assert_eq!(Settings::mtime(&env), None, "no file");
+    fs::create_dir_all(env.config_dir()).unwrap();
+    let path = env.config_dir().join("config.toml");
+    fs::write(&path, "[autoswitch]\nthreshold = 80\n").unwrap();
+    let first = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+    let touch = |at: SystemTime| {
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap()
+    };
+    touch(first);
+    assert_eq!(Settings::mtime(&env), Some(first));
+    touch(first + Duration::from_secs(1));
+    assert_eq!(
+        Settings::mtime(&env),
+        Some(first + Duration::from_secs(1)),
+        "a write moves it"
+    );
+    fs::remove_file(&path).unwrap();
+    assert_eq!(Settings::mtime(&env), None, "a removed file has none");
 }
