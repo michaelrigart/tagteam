@@ -8,6 +8,8 @@ use crate::paths::CcPaths;
 pub const CRED_STALE: Duration = Duration::from_secs(60);
 pub const CONFIG_STALE: Duration = Duration::from_secs(10);
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(9);
+/// CC's storage-write lock goes stale after 15 s (§9.1, Appendix A.1).
+pub const STORAGE_WRITE_STALE: Duration = Duration::from_secs(15);
 
 /// CC's credential locks (§9.1): the refresh lock, then the legacy lock. Fields drop in
 /// declaration order, so the legacy lock is released first and the refresh lock last.
@@ -83,6 +85,25 @@ pub fn acquire_config(
                 .with_cancel(cancel),
         )?,
     })
+}
+
+/// CC's storage-write lock (§9.1), waited for up to `timeout` under `cancel` (§14.1). It is a
+/// leaf: a caller takes it only while holding the credential locks, holds it around one
+/// credential entry's write, and takes no other lock while it is held. Dropping the guard
+/// releases it.
+pub fn acquire_storage_write(
+    paths: &CcPaths,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<MkdirLock, LockError> {
+    MkdirLock::acquire(
+        &MkdirLockSpec::new(
+            paths.storage_write_lock.clone(),
+            STORAGE_WRITE_STALE,
+            timeout,
+        )
+        .with_cancel(cancel),
+    )
 }
 
 #[cfg(test)]
@@ -318,5 +339,82 @@ mod tests {
             p.config_lock.is_dir(),
             "the other holder's lock is left alone"
         );
+    }
+
+    #[test]
+    fn the_storage_write_lock_is_taken_alone_and_released_on_drop() {
+        // §9.1: a leaf, anchored at the secure-storage dir; taking it takes no other lock.
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        assert_eq!(
+            p.storage_write_lock,
+            p.secure_storage_dir.join(".storage-write")
+        );
+        let lock = acquire_storage_write(&p, ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
+        assert!(p.storage_write_lock.is_dir());
+        assert!(lock.check_owned().is_ok());
+        assert!(!p.refresh_lock.exists() && !p.legacy_lock().exists() && !p.config_lock.exists());
+        drop(lock);
+        assert!(!p.storage_write_lock.exists(), "Drop removes it");
+    }
+
+    #[test]
+    fn a_held_storage_write_lock_times_out_without_touching_it() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        fs::create_dir(&p.storage_write_lock).unwrap(); // CC holds it, freshly
+        let start = Instant::now();
+        match acquire_storage_write(&p, Duration::from_millis(500), &Cancel::new()) {
+            Err(LockError::Timeout(path)) => assert_eq!(path, p.storage_write_lock),
+            other => panic!("expected a timeout, got {:?}", other.err()),
+        }
+        assert!(start.elapsed() >= Duration::from_millis(500));
+        assert!(p.storage_write_lock.is_dir(), "CC's lock is left alone");
+    }
+
+    #[test]
+    fn a_storage_write_lock_is_stale_after_15_s() {
+        // Appendix A.1: `proper-lockfile` with stale 15 s, as CC takes it.
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        fs::create_dir(&p.storage_write_lock).unwrap();
+        let aged = |secs| {
+            fs::File::open(&p.storage_write_lock)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
+                .unwrap()
+        };
+        aged(13);
+        assert!(matches!(
+            acquire_storage_write(&p, Duration::from_millis(300), &Cancel::new()),
+            Err(LockError::Timeout(_))
+        ));
+        aged(16);
+        let lock = acquire_storage_write(&p, Duration::from_millis(300), &Cancel::new()).unwrap();
+        assert!(lock.check_owned().is_ok(), "the stale lock is taken over");
+    }
+
+    #[test]
+    fn a_signal_ends_the_storage_write_wait_and_a_set_token_takes_nothing() {
+        // §9.1: its wait is a cancellation point (§14.1); a set token makes no attempt
+        // (Decision 3).
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        let cancel = Cancel::new();
+        cancel.request(libc::SIGTERM);
+        match acquire_storage_write(&p, ACQUIRE_TIMEOUT, &cancel) {
+            Err(LockError::Interrupted { path, signal }) => {
+                assert_eq!(
+                    (path, signal),
+                    (p.storage_write_lock.clone(), libc::SIGTERM)
+                )
+            }
+            other => panic!("expected an interrupted wait, got {:?}", other.err()),
+        }
+        assert!(!p.storage_write_lock.exists(), "no attempt was made");
+        fs::create_dir(&p.storage_write_lock).unwrap(); // CC holds it, freshly
+        let named = interrupted(|c| acquire_storage_write(&p, Duration::from_secs(30), c));
+        assert_eq!(named, p.storage_write_lock);
+        assert!(p.storage_write_lock.is_dir(), "CC's lock is left alone");
     }
 }

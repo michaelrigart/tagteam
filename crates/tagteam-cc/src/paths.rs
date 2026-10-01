@@ -27,6 +27,9 @@ pub struct CcPaths {
     pub secure_storage_dir: PathBuf,
     pub credentials_file: PathBuf,
     pub refresh_lock: PathBuf,
+    /// CC's storage-write lock, `<secure-storage dir>/.storage-write`, symlinks not resolved
+    /// (§9.1).
+    pub storage_write_lock: PathBuf,
     pub config_lock: PathBuf,
 }
 
@@ -52,6 +55,7 @@ impl CcPaths {
         Self {
             credentials_file: env.guard(secure_storage_dir.join(".credentials.json")),
             refresh_lock: env.guard(secure_storage_dir.join(".oauth_refresh.lock")),
+            storage_write_lock: env.guard(secure_storage_dir.join(".storage-write")),
             config_lock: env.guard(with_suffix(&global_config, ".lock")),
             config_home: env.guard(config_home),
             global_config: env.guard(global_config),
@@ -145,5 +149,28 @@ mod tests {
         let mut expected = fs::canonicalize(&real).unwrap().into_os_string();
         expected.push(".lock");
         assert_eq!(p.legacy_lock(), PathBuf::from(expected));
+    }
+
+    #[test]
+    fn the_storage_write_lock_sits_in_the_secure_storage_dir_unresolved() {
+        // §9.1: `<secure-storage dir>/.storage-write`, symlinks not resolved, unlike the
+        // legacy lock.
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real-claude");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(d.path().join("home")).unwrap();
+        std::os::unix::fs::symlink(&real, d.path().join("home/.claude")).unwrap();
+        let p = CcPaths::resolve(&env(d.path()));
+        assert_eq!(
+            p.storage_write_lock,
+            d.path().join("home/.claude/.storage-write")
+        );
+        let mut e = env(d.path());
+        e.claude_config_dir = Some("/p".into());
+        e.claude_securestorage_config_dir = Some("/s".into());
+        assert_eq!(
+            CcPaths::resolve(&e).storage_write_lock,
+            Path::new("/s/.storage-write")
+        );
     }
 }
