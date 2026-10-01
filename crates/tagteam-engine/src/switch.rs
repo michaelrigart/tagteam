@@ -1,6 +1,10 @@
 use tagteam_core::poll::replan_for_role;
+use tagteam_core::rank::{
+    BestOrder, Candidate, NextAvailable, best_order, binding_window, next_available, span,
+};
+use tagteam_core::usage::headroom;
 use tagteam_core::{
-    AccountId, OracleVerdict, OutgoingAction, OutgoingClass, OutgoingFacts, ProviderId,
+    AccountId, OracleVerdict, OutgoingAction, OutgoingClass, OutgoingFacts, ProviderId, Window,
     decide_outgoing, rotation_order,
 };
 use tagteam_provider::{
@@ -10,7 +14,7 @@ use tagteam_provider::{
 };
 
 use crate::account_lock::AccountLock;
-use crate::collect::jitter;
+use crate::collect::{CollectMode, jitter};
 use crate::displace::displace;
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -20,10 +24,41 @@ use crate::refresh::{GateOutcome, OwnedBy};
 use crate::rescue::RescueFile;
 use crate::store::{AccountRow, EventRow, JournalRow, Store};
 
+/// §9.3's strategies that rank by usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageStrategy {
+    Best,
+    NextAvailable,
+}
+
+impl UsageStrategy {
+    /// The strategy as `switch --json` names it (§13.2).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsageStrategy::Best => "best",
+            UsageStrategy::NextAvailable => "next-available",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SwitchTarget {
     Rotation,
     Account(AccountId),
+    /// §9.3: `models` overrides `autoswitch.models` for this switch (`--model`).
+    Usage {
+        strategy: UsageStrategy,
+        models: Option<Vec<String>>,
+    },
+}
+
+impl SwitchTarget {
+    /// Rotation or a usage strategy: the engine chooses the account, so a pick that turns out
+    /// dead or quarantined is replaced by planning again, where a named target is refused or
+    /// warned about (§7.2, §9.3, §9.4 step 1).
+    fn chosen(&self) -> bool {
+        !matches!(self, SwitchTarget::Account(_))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +77,9 @@ pub enum SwitchReason {
     UnmanagedAccount,
     OnlyOneAccount,
     NoValidTarget,
+    UsageUnavailable,
+    AlreadyBest,
+    CandidatesExhausted,
 }
 
 impl SwitchReason {
@@ -53,6 +91,9 @@ impl SwitchReason {
             SwitchReason::UnmanagedAccount => "unmanaged-account",
             SwitchReason::OnlyOneAccount => "only-one-account",
             SwitchReason::NoValidTarget => "no-valid-target",
+            SwitchReason::UsageUnavailable => "usage-unavailable",
+            SwitchReason::AlreadyBest => "already-best",
+            SwitchReason::CandidatesExhausted => "candidates-exhausted",
         }
     }
 }
@@ -78,6 +119,19 @@ const ATTEMPTS: usize = 3;
 /// before it is activated. Twice CC's own 5-minute buffer.
 const FRESHEN_WINDOW_MS: i64 = 10 * 60 * 1000;
 
+/// §9.2: fewer than two candidates, for a rotation or a usage strategy.
+const ONLY_ONE: &str = "there is only one switchable account";
+/// §9.3: no live login to anchor on, and nothing in the store to activate.
+const NO_VALID: &str = "no account can be activated";
+/// §9.3 `best`: no candidate's reading can drive a decision (§8.4).
+const USAGE_UNAVAILABLE: &str = "no candidate has a usage reading recent enough to rank by";
+const ONE_UNRANKED: &str =
+    "1 candidate has no usage reading recent enough to rank by; it was not considered";
+const LIVE_UNKNOWN: &str =
+    "switching to the best known candidate; the live account's usage is unknown";
+const NO_LIVE: &str =
+    "switching to the best known candidate; there is no managed live login to compare with";
+
 /// §9.4 step 3: never back up an empty value, because a Keychain timeout can look empty. It is
 /// reported as unreadable, on either axis: the value could not be read with confidence.
 fn empty_live_read(what: &str) -> EngineError {
@@ -99,6 +153,7 @@ fn strategy_of(target: &SwitchTarget) -> &'static str {
     match target {
         SwitchTarget::Rotation => "rotation",
         SwitchTarget::Account(_) => "direct",
+        SwitchTarget::Usage { strategy, .. } => strategy.as_str(),
     }
 }
 
@@ -286,9 +341,15 @@ struct Plan {
     strategy: &'static str,
     self_switch: bool,
     hint: Option<OracleHint>,
+    /// The live account the plan was made against: a usage strategy's pick stands under the
+    /// locks only while it still is (Decision 11).
+    anchor: Option<AccountId>,
     /// A rotation's accounts the walk read and passed over before its pick (§9.3). Empty for a
-    /// direct target.
+    /// direct target and a usage strategy.
     walked: Vec<AccountId>,
+    /// What a usage strategy's ranking tells the user (§9.3): accounts it skipped, candidates
+    /// it could not rank, an unknown live headroom. Made afresh with every plan.
+    notes: Vec<String>,
     /// What freshening the target decided to tell the user (§7.2), carried into the outcome.
     warnings: Vec<String>,
 }
@@ -305,6 +366,62 @@ enum Rotation {
     /// The pick, and the accounts the walk read and passed over before it.
     To(AccountRow, Vec<AccountId>),
     Stay(SwitchReason, &'static str),
+}
+
+/// What a usage strategy decided (§9.3).
+#[allow(clippy::large_enum_variant)]
+enum Ranked {
+    /// The pick, and what the ranking tells the user.
+    To(AccountRow, Vec<String>),
+    /// A no-op: its reason, its message, and what the ranking tells the user.
+    Stay(SwitchReason, String, Vec<String>),
+}
+
+/// A candidate as a usage strategy ranks it: its row and its decision-grade windows (`None`:
+/// its reading cannot drive a decision, §8.4).
+struct Rated {
+    row: AccountRow,
+    windows: Option<Vec<Window>>,
+}
+
+impl Rated {
+    fn headroom(&self, models: &[String]) -> Option<f64> {
+        self.windows.as_deref().and_then(|w| headroom(w, models))
+    }
+
+    fn candidate(&self, models: &[String]) -> Candidate {
+        Candidate {
+            position: self.row.position,
+            headroom: self.headroom(models),
+        }
+    }
+
+    /// Its binding window as a message names it: `7d at 77%`.
+    fn binding(&self, models: &[String]) -> String {
+        binding_text(self.windows.as_deref().unwrap_or_default(), models)
+    }
+
+    /// `a@x.co (7d at 77%)`.
+    fn described(&self, models: &[String]) -> String {
+        format!("{} ({})", self.row.label, self.binding(models))
+    }
+}
+
+/// §8.2's binding window, as a strategy's message names it: its label and its pct, rounded as
+/// `list` rounds it.
+fn binding_text(windows: &[Window], models: &[String]) -> String {
+    match binding_window(windows, models) {
+        Some(w) => format!("{} at {}%", w.label, w.pct.round() as i64),
+        None => "usage unknown".to_owned(),
+    }
+}
+
+/// A walk that found no account to activate ends as a rotation's does (§9.3).
+fn nothing_to_activate(live_row: Option<&AccountRow>) -> Ranked {
+    match live_row {
+        Some(_) => Ranked::Stay(SwitchReason::OnlyOneAccount, ONLY_ONE.into(), Vec::new()),
+        None => Ranked::Stay(SwitchReason::NoValidTarget, NO_VALID.into(), Vec::new()),
+    }
 }
 
 /// The live login and the rows the plan was made for, re-read under every lock.
@@ -334,8 +451,8 @@ fn already_active(target: &AccountRow) -> String {
 enum Freshened {
     /// Go ahead, with these warnings for the outcome.
     Go(Vec<String>),
-    /// A rotation's pick turned out dead and is quarantined now: plan again; the walk skips
-    /// it (§9.3).
+    /// A rotation's or a usage strategy's pick turned out dead and is quarantined now: plan
+    /// again; the walk skips it (§9.3).
     Replan,
 }
 
@@ -551,33 +668,41 @@ impl Engine {
         ))
     }
 
-    /// §9.3 rotation, reading the vault lazily.
-    ///
-    /// - The candidates are counted from the store: with a managed live anchor and fewer than
-    ///   two of them, it stays put (§9.2).
-    /// - Each vault is read only when the walk reaches it, and the walk stops at the first one
-    ///   that holds a credential. An unreadable one before that could have been the pick, so
-    ///   it fails naming the account; no account after the pick is ever read.
+    /// §9.3's lazy walk, shared by rotation and the usage strategies: reads each vault in
+    /// `order` only until one holds a credential, and returns that pick with the accounts it
+    /// passed over. An unreadable vault before the pick could have been the pick, so the walk
+    /// fails naming the account; no vault after the pick is read.
+    fn walk(
+        &self,
+        order: impl IntoIterator<Item = AccountRow>,
+    ) -> Result<Option<(AccountRow, Vec<AccountId>)>, EngineError> {
+        let mut walked = Vec::new();
+        for row in order {
+            if self.vault_holds_login(&row)? {
+                return Ok(Some((row, walked)));
+            }
+            walked.push(row.id);
+        }
+        Ok(None)
+    }
+
+    /// §9.3 rotation, reading the vault lazily (`walk`). The candidates are counted from the
+    /// store: with a managed live anchor and fewer than two of them, it stays put (§9.2).
     fn rotation(
         &self,
         store: &Store,
         provider: &ProviderId,
         live_row: Option<&AccountRow>,
     ) -> Result<Rotation, EngineError> {
-        const ONLY_ONE: &str = "there is only one switchable account";
         let Some(order) = self.candidate_order(store, provider, live_row)? else {
             return Ok(Rotation::Stay(SwitchReason::OnlyOneAccount, ONLY_ONE));
         };
-        let mut walked = Vec::new();
-        for row in order {
-            if self.vault_holds_login(&row)? {
-                return Ok(Rotation::To(row, walked));
-            }
-            walked.push(row.id);
+        if let Some((row, walked)) = self.walk(order)? {
+            return Ok(Rotation::To(row, walked));
         }
         Ok(match live_row {
             Some(_) => Rotation::Stay(SwitchReason::OnlyOneAccount, ONLY_ONE),
-            None => Rotation::Stay(SwitchReason::NoValidTarget, "no account can be activated"),
+            None => Rotation::Stay(SwitchReason::NoValidTarget, NO_VALID),
         })
     }
 
@@ -598,6 +723,203 @@ impl Engine {
             .iter()
             .position(|r| r.id == plan.target.id)
             .is_some_and(|at| order[..at].iter().all(|r| plan.walked.contains(&r.id))))
+    }
+
+    /// §9.3's usage strategies, planned from the store alone: the candidates are a rotation's
+    /// (`candidate_order`), each ranked by its decision-grade headroom under `models` (§8.2,
+    /// §8.4), and their vaults are read lazily in the strategy's own order (`walk`).
+    fn usage_pick(
+        &self,
+        store: &Store,
+        provider: &ProviderId,
+        live_row: Option<&AccountRow>,
+        strategy: UsageStrategy,
+        models: &[String],
+    ) -> Result<Ranked, EngineError> {
+        let Some(order) = self.candidate_order(store, provider, live_row)? else {
+            return Ok(Ranked::Stay(
+                SwitchReason::OnlyOneAccount,
+                ONLY_ONE.into(),
+                Vec::new(),
+            ));
+        };
+        // Only without a managed live login: nothing in the store can be a candidate.
+        if order.is_empty() {
+            return Ok(Ranked::Stay(
+                SwitchReason::NoValidTarget,
+                NO_VALID.into(),
+                Vec::new(),
+            ));
+        }
+        let rated = order
+            .into_iter()
+            .map(|row| {
+                Ok(Rated {
+                    windows: self.decision_windows(&row, models)?,
+                    row,
+                })
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        match strategy {
+            UsageStrategy::Best => self.best_pick(&rated, live_row, models),
+            UsageStrategy::NextAvailable => self.next_available_pick(&rated, live_row, models),
+        }
+    }
+
+    /// §9.3 `best`: the known candidate with the most headroom, if it beats the live
+    /// account's; every known one, with a warning, when the live headroom is unknown or there
+    /// is no managed live login. A candidate whose headroom is unknown is never picked, and a
+    /// warning counts them. A better candidate whose vault holds nothing is not switchable, so
+    /// a walk that finds none to activate is `already-best` (or `usage-unavailable` when the
+    /// live headroom is unknown).
+    fn best_pick(
+        &self,
+        rated: &[Rated],
+        live_row: Option<&AccountRow>,
+        models: &[String],
+    ) -> Result<Ranked, EngineError> {
+        let candidates: Vec<Candidate> = rated.iter().map(|r| r.candidate(models)).collect();
+        let at = |position: &u32| rated.iter().find(|r| r.row.position == *position);
+        let live = match live_row {
+            Some(row) => Some(Rated {
+                windows: self.decision_windows(row, models)?,
+                row: row.clone(),
+            }),
+            None => None,
+        };
+        let live_headroom = live.as_ref().and_then(|l| l.headroom(models));
+        let mut notes = match candidates.iter().filter(|c| c.headroom.is_none()).count() {
+            0 => Vec::new(),
+            1 => vec![ONE_UNRANKED.to_owned()],
+            n => vec![format!(
+                "{n} candidates have no usage reading recent enough to rank by; they were not considered"
+            )],
+        };
+        Ok(match best_order(live_headroom, &candidates) {
+            BestOrder::UsageUnavailable => Ranked::Stay(
+                SwitchReason::UsageUnavailable,
+                USAGE_UNAVAILABLE.into(),
+                Vec::new(),
+            ),
+            BestOrder::AlreadyBest => {
+                let leader = match best_order(None, &candidates) {
+                    BestOrder::Try(order) => order.first().and_then(at),
+                    _ => None,
+                };
+                let message = match (&live, leader) {
+                    (Some(live), Some(leader)) => format!(
+                        "{} already has the most headroom ({}); the best candidate is {}",
+                        live.row.label,
+                        live.binding(models),
+                        leader.described(models)
+                    ),
+                    _ => "the live account already has the most headroom".to_owned(),
+                };
+                Ranked::Stay(SwitchReason::AlreadyBest, message, notes)
+            }
+            BestOrder::Try(order) => {
+                match self.walk(order.iter().filter_map(at).map(|r| r.row.clone()))? {
+                    Some((pick, _)) => {
+                        if live_headroom.is_none() {
+                            let why = if live_row.is_some() {
+                                LIVE_UNKNOWN
+                            } else {
+                                NO_LIVE
+                            };
+                            notes.push(why.to_owned());
+                        }
+                        Ranked::To(pick, notes)
+                    }
+                    None => match &live {
+                        Some(live) if live_headroom.is_some() => Ranked::Stay(
+                            SwitchReason::AlreadyBest,
+                            format!(
+                                "no candidate with more headroom than {} holds a stored credential",
+                                live.described(models)
+                            ),
+                            notes,
+                        ),
+                        _ => Ranked::Stay(
+                            SwitchReason::UsageUnavailable,
+                            "no candidate with a known usage reading holds a stored credential"
+                                .into(),
+                            notes,
+                        ),
+                    },
+                }
+            }
+        })
+    }
+
+    /// §9.3 `next-available`: the rotation's walk without the candidates known to be at their
+    /// limit (§8.2: unknown headroom is never skipped). Each skipped account is named, with its
+    /// binding window, in a warning. If every candidate is skipped, `candidates-exhausted`
+    /// names them all and when the first of those windows resets.
+    fn next_available_pick(
+        &self,
+        rated: &[Rated],
+        live_row: Option<&AccountRow>,
+        models: &[String],
+    ) -> Result<Ranked, EngineError> {
+        let walk: Vec<Candidate> = rated.iter().map(|r| r.candidate(models)).collect();
+        let at = |position: &u32| rated.iter().find(|r| r.row.position == *position);
+        let (order, skipped) = match next_available(&walk) {
+            NextAvailable::Exhausted => {
+                let all: Vec<&Rated> = rated.iter().collect();
+                return Ok(Ranked::Stay(
+                    SwitchReason::CandidatesExhausted,
+                    self.exhausted_message(&all, models),
+                    Vec::new(),
+                ));
+            }
+            NextAvailable::Try { order, skipped } => (order, skipped),
+        };
+        let skipped: Vec<&Rated> = skipped.iter().filter_map(at).collect();
+        let notes = skipped
+            .iter()
+            .map(|r| {
+                format!(
+                    "skipped {} (position {}): at its limit ({})",
+                    r.row.label,
+                    r.row.position,
+                    r.binding(models)
+                )
+            })
+            .collect();
+        Ok(
+            match self.walk(order.iter().filter_map(at).map(|r| r.row.clone()))? {
+                Some((pick, _)) => Ranked::To(pick, notes),
+                None if skipped.is_empty() => nothing_to_activate(live_row),
+                // §9.3: an account whose vault holds nothing is not switchable, so every
+                // switchable candidate was skipped.
+                None => Ranked::Stay(
+                    SwitchReason::CandidatesExhausted,
+                    self.exhausted_message(&skipped, models),
+                    Vec::new(),
+                ),
+            },
+        )
+    }
+
+    /// `candidates-exhausted`'s message: each candidate with its binding window, then how long
+    /// until the earliest of those windows resets (§9.3; §11.2 step 8: the binding window
+    /// first, then its reset). No reset is named when none of them has one.
+    fn exhausted_message(&self, rated: &[&Rated], models: &[String]) -> String {
+        let named: Vec<String> = rated.iter().map(|r| r.described(models)).collect();
+        let reset = rated
+            .iter()
+            .filter_map(|r| {
+                binding_window(r.windows.as_deref().unwrap_or_default(), models)?.resets_at
+            })
+            .min();
+        let now_s = self.now_ms().div_euclid(1000);
+        let when = reset.map_or_else(String::new, |at| {
+            format!("; the earliest reset is in {}", span(at - now_s))
+        });
+        format!(
+            "every candidate is at its limit: {}{when}",
+            named.join(", ")
+        )
     }
 
     /// §9.4 "Before locking": asks the oracle about the outgoing live secret when it is not
@@ -625,22 +947,26 @@ impl Engine {
             (Some(i), None) => Some(login_email(i)),
             _ => None,
         };
-        let done = |reason: SwitchReason, message: String| {
-            Planned::Done(noop(
+        let done = |reason: SwitchReason, message: String, warnings: Vec<String>| {
+            let mut outcome = noop(
                 strategy,
                 reason,
                 message,
                 live_row.clone(),
                 unmanaged_email.clone(),
-            ))
+            );
+            outcome.warnings = warnings;
+            Planned::Done(outcome)
         };
         if let (Some(email), false) = (&unmanaged_email, req.force) {
             return Ok(done(
                 SwitchReason::UnmanagedAccount,
                 unmanaged_message(email),
+                Vec::new(),
             ));
         }
         let mut walked = Vec::new();
+        let mut notes = Vec::new();
         let target = match &req.target {
             // A switch never crosses providers (§9.3).
             SwitchTarget::Account(id) => store
@@ -653,7 +979,27 @@ impl Engine {
                         walked = passed;
                         a
                     }
-                    Rotation::Stay(reason, message) => return Ok(done(reason, message.into())),
+                    Rotation::Stay(reason, message) => {
+                        return Ok(done(reason, message.into(), Vec::new()));
+                    }
+                }
+            }
+            // §9.3: `--model` replaces `autoswitch.models` for this switch, when given.
+            SwitchTarget::Usage {
+                strategy: by,
+                models,
+            } => {
+                let models = models
+                    .clone()
+                    .unwrap_or_else(|| self.settings().models.clone());
+                match self.usage_pick(store, &req.provider, live_row.as_ref(), *by, &models)? {
+                    Ranked::To(a, said) => {
+                        notes = said;
+                        a
+                    }
+                    Ranked::Stay(reason, message, said) => {
+                        return Ok(done(reason, message, said));
+                    }
                 }
             }
         };
@@ -681,15 +1027,21 @@ impl Engine {
                             == OracleVerdict::ThisAccount
                 });
             if !reconcile {
-                return Ok(done(SwitchReason::AlreadyActive, already_active(&target)));
+                return Ok(done(
+                    SwitchReason::AlreadyActive,
+                    already_active(&target),
+                    Vec::new(),
+                ));
             }
         }
         Ok(Planned::Go(Plan {
+            anchor: live_row.as_ref().map(|r| r.id.clone()),
             target,
             strategy,
             self_switch,
             hint,
             walked,
+            notes,
             warnings: vec![],
         }))
     }
@@ -746,10 +1098,10 @@ impl Engine {
         }
         let vault = self.read_target(target)?;
         let due = self.due(p, &vault);
-        let rotation = matches!(req.target, SwitchTarget::Rotation);
+        let chosen = req.target.chosen();
         if target.quarantine_reason.is_some() {
             // Never refreshed (§7.4): usable only while its current access token lasts.
-            return match (due, rotation) {
+            return match (due, chosen) {
                 (false, _) => Ok(Freshened::Go(vec![works_until_expiry(target)])),
                 (true, true) => Ok(Freshened::Replan),
                 (true, false) => Err(needs_relogin(target)),
@@ -770,7 +1122,7 @@ impl Engine {
             GateOutcome::Refreshed(_) | GateOutcome::AlreadyFresh(_) | GateOutcome::Busy => {
                 Freshened::Go(vec![])
             }
-            GateOutcome::Dead(_) if rotation => Freshened::Replan,
+            GateOutcome::Dead(_) if chosen => Freshened::Replan,
             GateOutcome::Dead(_) => return Err(needs_relogin(target)),
             GateOutcome::Transient { rescued: true, .. } => {
                 return Err(pending(
@@ -865,10 +1217,46 @@ impl Engine {
         ))
     }
 
+    /// §9.3, before a usage strategy plans: quarantines that no longer bind are released
+    /// (§7.4, Decision 9), then the managed live account and every candidate are collected on
+    /// demand (§8.3, Decision 8). Returns the collector's warnings. Other targets do neither,
+    /// and neither does a usage strategy over an unmanaged live login without --force:
+    /// planning reports that no-op (§9.2), and the network is not used for it.
+    fn prepare_usage(
+        &self,
+        p: &dyn Provider,
+        store: &Store,
+        req: &SwitchRequest,
+    ) -> Result<Vec<String>, EngineError> {
+        if !matches!(req.target, SwitchTarget::Usage { .. }) {
+            return Ok(Vec::new());
+        }
+        let (live, live_row) = self.live_row(p, store, &req.provider)?;
+        if live.is_some() && live_row.is_none() && !req.force {
+            return Ok(Vec::new());
+        }
+        self.release_unbound_quarantines(&req.provider, req.source)?;
+        let mut accounts: Vec<AccountId> = live_row.into_iter().map(|r| r.id).collect();
+        for row in store.accounts(&req.provider)? {
+            if is_candidate(&row) && !accounts.contains(&row.id) {
+                accounts.push(row.id);
+            }
+        }
+        // §8.3: a usage failure is never a command error. An interruption is not a usage
+        // failure, and ends the command (§14.1).
+        match self.collect_usage(CollectMode::OnDemand { accounts }) {
+            Ok(report) => Ok(report.warnings),
+            Err(e) if e.signal().is_some() => Err(e),
+            Err(e) => Ok(vec![format!("usage was not collected: {e}")]),
+        }
+    }
+
     /// §9: plan and ask the oracle without any lock; then take the mutation lock once, and
     /// under it the account locks and the live locks, and re-derive every decision. Anything
     /// that moved while this command waited releases every lock but the mutation lock and
-    /// plans again, without the network, for at most `ATTEMPTS` lock acquisitions.
+    /// plans again, without the network, for at most `ATTEMPTS` lock acquisitions. A usage
+    /// strategy first releases quarantines that no longer bind and collects (§9.3); the
+    /// collector's warnings lead the outcome's.
     pub fn switch(&self, req: SwitchRequest) -> Result<SwitchOutcome, EngineError> {
         self.refuse_inside_run_shell()?;
         let provider = self.provider(&req.provider)?;
@@ -879,10 +1267,24 @@ impl Engine {
         let Some(store) = self.existing_store()? else {
             return self.without_store(p, &req);
         };
+        let mut warnings = self.prepare_usage(p, &store, &req)?;
+        let mut outcome = self.switch_planned(p, &store, &req)?;
+        warnings.append(&mut outcome.warnings);
+        outcome.warnings = warnings;
+        Ok(outcome)
+    }
+
+    /// `switch` from its first plan on.
+    fn switch_planned(
+        &self,
+        p: &dyn Provider,
+        store: &Store,
+        req: &SwitchRequest,
+    ) -> Result<SwitchOutcome, EngineError> {
         // §7.2: before the mutation lock, the only place a manual switch may use the network.
-        let mut plan = match self.plan(p, &store, &req, Ask::Oracle)? {
+        let mut plan = match self.plan(p, store, req, Ask::Oracle)? {
             Planned::Done(outcome) => return Ok(outcome),
-            Planned::Go(plan) => match self.freshen_plan(p, &store, &req, plan)? {
+            Planned::Go(plan) => match self.freshen_plan(p, store, req, plan)? {
                 Planned::Done(outcome) => return Ok(outcome),
                 Planned::Go(plan) => plan,
             },
@@ -900,7 +1302,7 @@ impl Engine {
                 // allowed (§4.3). A pick that changed is activated with the vault's
                 // generation, and CC refreshes it.
                 let warnings = std::mem::take(&mut plan.warnings);
-                plan = match self.plan(p, &store, &req, Ask::Reuse(plan.hint.take()))? {
+                plan = match self.plan(p, store, req, Ask::Reuse(plan.hint.take()))? {
                     Planned::Done(mut outcome) => {
                         outcome.warnings.extend(warnings);
                         return Ok(outcome);
@@ -911,21 +1313,20 @@ impl Engine {
                     }
                 };
             }
-            let (_, outgoing) = self.live_row(p, &store, &req.provider)?;
+            let (_, outgoing) = self.live_row(p, store, &req.provider)?;
             let mut ids = vec![&plan.target.id];
             if let Some(o) = &outgoing {
                 ids.push(&o.id);
             }
             let accounts = self.lock_accounts(&ids)?;
             let locks = p.lock_live(&self.env, &guard)?;
-            match self.rederive(p, &store, &req, &plan, outgoing.as_ref())? {
+            match self.rederive(p, store, req, &plan, outgoing.as_ref())? {
                 Rederived::Go(locked) => {
-                    let outcome =
-                        self.transact(p, &store, &plan, locked, &accounts, &locks, &req)?;
+                    let outcome = self.transact(p, store, &plan, locked, &accounts, &locks, req)?;
                     // The re-plan needs no lock and never fetches (§8.3).
                     drop(locks);
                     drop(accounts);
-                    self.replan_polls(p, &store, &outcome);
+                    self.replan_polls(p, store, &outcome);
                     return Ok(outcome);
                 }
                 Rederived::Done(mut outcome) => {
@@ -999,11 +1400,12 @@ impl Engine {
             return Ok(Rederived::Replan);
         };
         let self_switch = again.as_ref().is_some_and(|r| r.id == target.id);
-        // Review Focus 3: another process landed exactly this rotation's target while this one
-        // waited for the mutation lock (a double-fired `switch`). That was this command's work;
-        // rotating on from there would switch twice. A direct target needs no such rule: planning
-        // again finds the self-switch no-op.
-        if matches!(req.target, SwitchTarget::Rotation) && self_switch && !plan.self_switch {
+        // M1's Review Focus 3, and M3a's Review Focus 4 for a usage strategy: another process
+        // landed exactly this plan's pick while this one waited for the mutation lock (a
+        // double-fired `switch`). That was this command's work; moving on from there would
+        // switch twice. A direct target needs no such rule: planning again finds the
+        // self-switch no-op.
+        if req.target.chosen() && self_switch && !plan.self_switch {
             return Ok(Rederived::Done(noop(
                 plan.strategy,
                 SwitchReason::AlreadyActive,
@@ -1032,7 +1434,7 @@ impl Engine {
         // the vault's generation (§9.2), so it does.
         let mut warnings = Vec::new();
         if target.quarantine_reason.is_some() {
-            if matches!(req.target, SwitchTarget::Rotation) {
+            if req.target.chosen() {
                 return Ok(Rederived::Replan);
             }
             if (!self_switch || req.force) && p.kind_traits(&target.kind).refreshable {
@@ -1049,6 +1451,12 @@ impl Engine {
         let same_pick = match req.target {
             SwitchTarget::Account(_) => true,
             SwitchTarget::Rotation => self.rotation_pick_stands(store, plan, again.as_ref())?,
+            // Decision 11: no network under the locks, so the ranking is not recomputed. The
+            // pick stands while it is still a candidate and the live login is the account it
+            // was ranked against; otherwise planning again ranks from the store's readings.
+            SwitchTarget::Usage { .. } => {
+                is_candidate(&target) && again.as_ref().map(|r| &r.id) == plan.anchor.as_ref()
+            }
         };
         // Account-lock acquisition may have finished a pending replacement (§12.5), changing
         // the outgoing account's kind or identity: compare the rows, not just their IDs.
@@ -1120,7 +1528,8 @@ impl Engine {
             .expect("the target is locked");
         self.settle_rescues(p, &target, target_lock)?;
 
-        let mut warnings = plan.warnings.clone();
+        let mut warnings = plan.notes.clone();
+        warnings.extend(plan.warnings.iter().cloned());
         warnings.extend(locked_warnings);
         // What steps 2 and 4 settle, and the vaults below: step 7's rule never saves it again.
         let mut held = Held::default();
