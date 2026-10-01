@@ -934,6 +934,7 @@ impl App<'_, '_> {
             target: target.clone(),
             force,
             source: "cli",
+            auto: None,
         };
         let mut outcome = self.engine.switch(req())?;
         // §9.2: `--json` reports the no-op as is; a terminal offers to add the login first.

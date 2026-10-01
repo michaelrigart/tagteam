@@ -3,8 +3,11 @@ mod common;
 use common::{add, cc, identity};
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
+use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_engine::store::{EventRow, JournalRow, LoginMeta, NewAccount, Store, StoreError};
+use tagteam_engine::store::{
+    AutoRecord, EventRow, JournalRow, LoginMeta, NewAccount, Store, StoreError,
+};
 use tagteam_provider::{Identity, ProcessStamp};
 
 /// Reads the on-disk journal mode through a fresh, independent connection, so the assertion
@@ -174,7 +177,7 @@ fn commit_switch_is_one_transaction_and_delete_clears_active() {
         source: "cli".into(),
         detail: None,
     };
-    s.commit_switch(&cc(), &b, &ev).unwrap();
+    s.commit_switch(&cc(), &b, &ev, None).unwrap();
     assert_eq!(s.active(&cc()).unwrap(), Some(b.clone()));
     assert!(s.journal(&cc()).unwrap().is_none());
     assert_eq!(s.events().unwrap(), vec![ev]);
@@ -535,4 +538,139 @@ fn the_database_and_its_sidecars_are_created_0600() {
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{}", p.display());
     }
+}
+
+/// The `switch` event a commit from `from` to `to` inserts.
+fn switch_event(from: &AccountId, to: &AccountId, trigger: &str, source: &str) -> EventRow {
+    EventRow {
+        at: 1_790_000_000_000,
+        provider: cc(),
+        kind: "switch".into(),
+        from_id: Some(from.clone()),
+        to_id: Some(to.clone()),
+        trigger: Some(trigger.into()),
+        source: source.into(),
+        detail: None,
+    }
+}
+
+/// What an automatic switch from `from` to `to` records (§11.2 step 11).
+fn record(from: &AccountId, to: &AccountId) -> AutoRecord {
+    AutoRecord {
+        at: 1_790_000_000,
+        from: from.clone(),
+        to: to.clone(),
+        departure: Departure {
+            left_headroom: Some(4.5),
+            left_recovery_at: Some(1_790_009_630),
+            left_trigger: Trigger::Proactive,
+        },
+    }
+}
+
+#[test]
+fn auto_switch_state_is_the_default_until_written_and_kept_per_provider() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let fake = ProviderId::new("fake-agent");
+    assert_eq!(s.autoswitch_state(&cc()).unwrap(), AutoState::default());
+    s.set_unhealthy_ticks(&cc(), 2).unwrap();
+    s.set_unhealthy_ticks(&fake, 1).unwrap();
+    assert_eq!(
+        s.autoswitch_state(&cc()).unwrap(),
+        AutoState {
+            unhealthy_ticks: 2,
+            ..AutoState::default()
+        }
+    );
+    s.set_unhealthy_ticks(&cc(), 3).unwrap();
+    assert_eq!(s.autoswitch_state(&cc()).unwrap().unhealthy_ticks, 3);
+    assert_eq!(s.autoswitch_state(&fake).unwrap().unhealthy_ticks, 1);
+}
+
+#[test]
+fn an_automatic_commit_records_its_departure_and_resets_the_count() {
+    // §9.4 step 9 and Decision 4: the record and the reset ride the switch's own commit.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    s.set_unhealthy_ticks(&cc(), 2).unwrap();
+    let ev = switch_event(&a, &b, "proactive", "auto");
+    s.commit_switch(&cc(), &b, &ev, Some(&record(&a, &b)))
+        .unwrap();
+    let recorded = AutoState {
+        last_switch_at: Some(1_790_000_000),
+        last_switch_from: Some(a.clone()),
+        last_switch_to: Some(b.clone()),
+        left_headroom: Some(4.5),
+        left_recovery_at: Some(1_790_009_630),
+        left_trigger: Some(Trigger::Proactive),
+        unhealthy_ticks: 0,
+    };
+    assert_eq!(s.autoswitch_state(&cc()).unwrap(), recorded);
+    assert_eq!(s.active(&cc()).unwrap(), Some(b.clone()));
+    assert_eq!(s.events().unwrap(), vec![ev]);
+    // A manual commit records nothing: the last automatic switch's record stands.
+    s.set_unhealthy_ticks(&cc(), 1).unwrap();
+    s.commit_switch(&cc(), &a, &switch_event(&b, &a, "manual", "cli"), None)
+        .unwrap();
+    assert_eq!(
+        s.autoswitch_state(&cc()).unwrap(),
+        AutoState {
+            unhealthy_ticks: 1,
+            ..recorded
+        }
+    );
+}
+
+#[test]
+fn the_record_lands_with_the_commit_or_not_at_all() {
+    // One transaction (§9.4 step 9): a commit whose active-account write fails, here on its
+    // foreign key, leaves no record, and the journal row stays for recovery.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    s.insert_journal(&JournalRow {
+        provider: cc(),
+        holder: ProcessStamp { pid: 1, start: 2 },
+        from_id: Some(a.clone()),
+        to_id: b.clone(),
+        from_fp: None,
+        from_identity: None,
+        to_fp: "sha256:b".into(),
+        started_at: 5,
+        prior: None,
+    })
+    .unwrap();
+    let ghost = AccountId::from_string("ghost");
+    let ev = switch_event(&a, &ghost, "proactive", "auto");
+    assert!(
+        s.commit_switch(&cc(), &ghost, &ev, Some(&record(&a, &ghost)))
+            .is_err()
+    );
+    assert_eq!(s.autoswitch_state(&cc()).unwrap(), AutoState::default());
+    assert!(s.journal(&cc()).unwrap().is_some());
+    assert!(s.events().unwrap().is_empty());
+}
+
+#[test]
+fn a_departure_trigger_this_build_does_not_know_reads_as_none() {
+    // §11.3: a missing departure snapshot lifts the no-return bar; an unknown one is missing.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let ev = switch_event(&a, &b, "proactive", "auto");
+    s.commit_switch(&cc(), &b, &ev, Some(&record(&a, &b)))
+        .unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE autoswitch_state SET left_trigger = 'idle-hold'", [])
+        .unwrap();
+    let state = s.autoswitch_state(&cc()).unwrap();
+    assert_eq!(state.left_trigger, None);
+    assert_eq!(state.last_switch_from, Some(a));
 }

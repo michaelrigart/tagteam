@@ -1,3 +1,4 @@
+use tagteam_core::autoswitch::{Departure, Trigger};
 use tagteam_core::poll::replan_for_role;
 use tagteam_core::rank::{
     BestOrder, Candidate, NextAvailable, best_order, binding_window, blocked_until, next_available,
@@ -23,7 +24,7 @@ use crate::hooks;
 use crate::oracle::verdict;
 use crate::refresh::{GateOutcome, OwnedBy};
 use crate::rescue::RescueFile;
-use crate::store::{AccountRow, EventRow, JournalRow, Store};
+use crate::store::{AccountRow, AutoRecord, EventRow, JournalRow, Store};
 
 /// §9.3's strategies that rank by usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,20 @@ pub struct SwitchRequest {
     pub target: SwitchTarget,
     pub force: bool,
     pub source: &'static str,
+    /// An automatic switch's preconditions (§11.2 step 11), checked under the locks before the
+    /// first write; `None` for every other switch. Its target is a `SwitchTarget::Account`.
+    pub auto: Option<AutoPerform>,
+}
+
+/// What an automatic switch rests on (§11.2 step 11): the live account the tick decided on,
+/// its trigger, the cooldown to judge it by, and the departure snapshot its commit records for
+/// the account it leaves (§11.3).
+#[derive(Debug, Clone)]
+pub struct AutoPerform {
+    pub expected_from: AccountId,
+    pub trigger: Trigger,
+    pub cooldown_s: i64,
+    pub departure: Departure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +96,12 @@ pub enum SwitchReason {
     UsageUnavailable,
     AlreadyBest,
     CandidatesExhausted,
+    /// An automatic switch's live account is no longer the one its tick decided on.
+    LiveChanged,
+    /// An automatic `proactive` or `consume-first` switch met the cooldown under the lock.
+    Cooldown,
+    /// An automatic switch's target is no longer a candidate (§11.2 step 7).
+    NotCandidate,
 }
 
 impl SwitchReason {
@@ -95,6 +116,9 @@ impl SwitchReason {
             SwitchReason::UsageUnavailable => "usage-unavailable",
             SwitchReason::AlreadyBest => "already-best",
             SwitchReason::CandidatesExhausted => "candidates-exhausted",
+            SwitchReason::LiveChanged => "live-changed",
+            SwitchReason::Cooldown => "cooldown",
+            SwitchReason::NotCandidate => "not-candidate",
         }
     }
 }
@@ -132,6 +156,8 @@ const LIVE_UNKNOWN: &str =
     "switching to the best known candidate; the live account's usage is unknown";
 const NO_LIVE: &str =
     "switching to the best known candidate; there is no managed live login to compare with";
+/// §11.2 step 11: the live account is no longer the one the tick decided on.
+const LIVE_CHANGED: &str = "the live login changed after this switch was decided; a switch made meanwhile is never overridden";
 
 /// §9.4 step 3: never back up an empty value, because a Keychain timeout can look empty. It is
 /// reported as unreadable, on either axis: the value could not be read with confidence.
@@ -772,8 +798,9 @@ impl Engine {
     /// is no managed live login, but with a managed live login of unknown headroom never one
     /// known to be at its limit (`candidates-exhausted` when all are). A candidate whose
     /// headroom is unknown is never picked, and a warning counts them. A better candidate whose vault holds nothing is not switchable, so
-    /// a walk that finds none to activate is `already-best` (or `usage-unavailable` when the
-    /// live headroom is unknown).
+    /// a walk that finds none to activate is `already-best`; with the live headroom unknown, it
+    /// is `candidates-exhausted` when candidates known to be at their limit were left out, and
+    /// `usage-unavailable` otherwise.
     fn best_pick(
         &self,
         rated: &[Rated],
@@ -862,6 +889,17 @@ impl Engine {
                             ),
                             notes,
                         ),
+                        // §9.3: no candidate that beat the exhausted ones holds a stored
+                        // credential, so none of them is switchable; what is left is known to
+                        // be at its limit, as `next-available` reports it.
+                        _ if !exhausted.is_empty() => {
+                            let exhausted: Vec<&Rated> = exhausted.iter().filter_map(at).collect();
+                            Ranked::Stay(
+                                SwitchReason::CandidatesExhausted,
+                                self.exhausted_message(&exhausted, models),
+                                notes,
+                            )
+                        }
                         _ => Ranked::Stay(
                             SwitchReason::UsageUnavailable,
                             "no candidate with a known usage reading holds a stored credential"
@@ -964,6 +1002,84 @@ impl Engine {
         Ok(Some(OracleHint { bytes, resolved }))
     }
 
+    /// §11.2 step 11: an automatic switch's preconditions, in the spec's order. `None` when
+    /// every one holds, or for any other switch; otherwise the no-op that says which failed.
+    /// `live_row` is the live account as just read. Planning runs it first, so a refused switch
+    /// spends no oracle request; `rederive` runs it again under every lock, where it decides
+    /// (§9.4 step 1). Nothing is written either way.
+    fn auto_refusal(
+        &self,
+        store: &Store,
+        req: &SwitchRequest,
+        live_row: Option<&AccountRow>,
+    ) -> Result<Option<SwitchOutcome>, EngineError> {
+        let Some(auto) = &req.auto else {
+            return Ok(None);
+        };
+        let SwitchTarget::Account(id) = &req.target else {
+            return Err(EngineError::InvalidInput(
+                "an automatic switch names its target".into(),
+            ));
+        };
+        let refuse = |reason: SwitchReason, message: String| {
+            Ok(Some(noop(
+                "direct",
+                reason,
+                message,
+                live_row.cloned(),
+                None,
+            )))
+        };
+        // A manual switch made meanwhile, a login made in Claude Code, or a logout.
+        if live_row.map(|r| &r.id) != Some(&auto.expected_from) {
+            return refuse(SwitchReason::LiveChanged, LIVE_CHANGED.into());
+        }
+        // §11.2 step 6, judged from the state as read now: the engine is its one writer, and
+        // the check and the record are both made under `MutationGuard`.
+        if matches!(auto.trigger, Trigger::Proactive | Trigger::ConsumeFirst) {
+            let now_s = self.now_ms().div_euclid(1000);
+            if let Some(at) = store.autoswitch_state(&req.provider)?.last_switch_at {
+                let ends = at.saturating_add(auto.cooldown_s);
+                if now_s < ends {
+                    return refuse(
+                        SwitchReason::Cooldown,
+                        format!(
+                            "the cooldown after the last automatic switch has {} left",
+                            span(ends - now_s)
+                        ),
+                    );
+                }
+            }
+        }
+        // §11.2 step 7: switchable (a vault credential and an identity, not disabled), not
+        // quarantined, not session-owned (never, before M4).
+        let Some(target) = store.account(id)?.filter(|a| a.provider == req.provider) else {
+            return refuse(
+                SwitchReason::NotCandidate,
+                "the account to switch to was removed".into(),
+            );
+        };
+        let why = if target.disabled {
+            Some("it is disabled")
+        } else if target.quarantine_reason.is_some() {
+            Some("it needs a new login")
+        } else if !self.has_login(&target)? {
+            Some("it has no stored credential")
+        } else {
+            None
+        };
+        match why {
+            Some(why) => refuse(
+                SwitchReason::NotCandidate,
+                format!(
+                    "{} (position {}) is no longer a candidate: {why}",
+                    target.label, target.position
+                ),
+            ),
+            None => Ok(None),
+        }
+    }
+
     /// The target and the §9.2 special cases, decided from the current state.
     fn plan(
         &self,
@@ -974,6 +1090,9 @@ impl Engine {
     ) -> Result<Planned, EngineError> {
         let strategy = strategy_of(&req.target);
         let (live, live_row) = self.live_row(p, store, &req.provider)?;
+        if let Some(refused) = self.auto_refusal(store, req, live_row.as_ref())? {
+            return Ok(Planned::Done(refused));
+        }
         let unmanaged_email = match (&live, &live_row) {
             (Some(i), None) => Some(login_email(i)),
             _ => None,
@@ -1321,6 +1440,9 @@ impl Engine {
         // §7.2: before the mutation lock, the only place a manual switch may use the network.
         let mut plan = match self.plan(p, store, req, Ask::Oracle)? {
             Planned::Done(outcome) => return Ok(outcome),
+            // §11.2 step 10: the tick has freshened an automatic switch's target by its own
+            // table; freshening here again would act on the manual table instead.
+            Planned::Go(plan) if req.auto.is_some() => plan,
             Planned::Go(plan) => match self.freshen_plan(p, store, req, plan)? {
                 Planned::Done(outcome) => return Ok(outcome),
                 Planned::Go(plan) => plan,
@@ -1428,6 +1550,11 @@ impl Engine {
         outgoing: Option<&AccountRow>,
     ) -> Result<Rederived, EngineError> {
         let (live_identity, again) = self.live_row(p, store, &req.provider)?;
+        // §9.4 step 1: an automatic switch re-checks its preconditions here, before anything is
+        // written. A refusal ends the switch; it never falls through to a plan made elsewhere.
+        if let Some(refused) = self.auto_refusal(store, req, again.as_ref())? {
+            return Ok(Rederived::Done(refused));
+        }
         // A login that became unmanaged is §9.2's no-op; a target removed meanwhile is
         // replaced (rotation) or reported (direct).
         if live_identity.is_some() && again.is_none() && !req.force {
@@ -1939,6 +2066,18 @@ impl Engine {
                 .map(|undo| (undo, ()))
         })?;
         hooks::point(self, "after-identity")?;
+        // §11.2 step 11: an automatic switch records its departure with the commit; its
+        // preconditions have made the outgoing account the one it decided on.
+        let record = req
+            .auto
+            .as_ref()
+            .zip(outgoing)
+            .map(|(auto, from)| AutoRecord {
+                at: self.now_ms().div_euclid(1000),
+                from: from.id.clone(),
+                to: target.id.clone(),
+                departure: auto.departure.clone(),
+            });
         tx.store.commit_switch(
             &req.provider,
             &target.id,
@@ -1949,16 +2088,15 @@ impl Engine {
                 from_id: outgoing.map(|o| o.id.clone()),
                 to_id: Some(target.id.clone()),
                 trigger: Some(
-                    if req.source == "auto" {
-                        "auto"
-                    } else {
-                        "manual"
-                    }
-                    .into(),
+                    req.auto
+                        .as_ref()
+                        .map_or("manual", |a| a.trigger.as_str())
+                        .into(),
                 ),
                 source: req.source.into(),
                 detail: None,
             },
+            record.as_ref(),
         )?;
         Ok(stored_in)
     }
