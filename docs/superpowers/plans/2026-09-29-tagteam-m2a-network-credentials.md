@@ -1,6 +1,6 @@
 # tagteam M2a — Network Layer and Credential Lifecycle Implementation Plan
 
-**Status:** In progress
+**Status:** Implemented — branch `m2a-network-credentials` at eb6b963, merged locally into `main`; no merge request
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
