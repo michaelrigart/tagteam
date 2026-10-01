@@ -14,14 +14,15 @@ use tagteam_provider::splice::{self, render_nested};
 use tagteam_provider::{
     BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
     Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, LockError,
-    MkdirLock, MkdirLockSpec, MutationGuard, Provider, ProviderError, Read, ReadError, SecretStore,
-    StoredLogin, Undo, Written,
+    MkdirLock, MkdirLockSpec, MutationGuard, Pace, PollBudget, Provider, ProviderError, Read,
+    ReadError, SecretStore, StoredLogin, Undo, UsageResult, Window, Written,
 };
 
 use crate::FAKE_AGENT;
 use crate::identity_json;
 use crate::paths::FakePaths;
 use crate::shape::{self, DEVICE, KIND_STATIC, KINDS};
+use crate::usage;
 
 /// FakeAgent's lock goes stale like Claude Code's credential locks.
 const LOCK_STALE: Duration = Duration::from_secs(60);
@@ -65,6 +66,10 @@ impl FakeAgent {
 
     pub fn whoami_url(&self) -> String {
         format!("{}/fa/whoami", self.base)
+    }
+
+    pub fn usage_url(&self) -> String {
+        format!("{}/usage", self.base)
     }
 }
 
@@ -168,6 +173,7 @@ impl Provider for FakeAgent {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            usage: true,
             refresh: true,
             ..Capabilities::default()
         }
@@ -518,5 +524,24 @@ impl Provider for FakeAgent {
             successor: serde_json::to_vec(&Value::Object(root)).expect("a Value always serializes"),
             owner,
         }
+    }
+
+    fn fetch_usage(&self, http: &dyn Http, cred: &Credential) -> UsageResult {
+        let Some(token) = shape::token(cred.bytes()) else {
+            return UsageResult::NoAccessToken;
+        };
+        usage::parse_usage(http.send(&usage::usage_request(self.usage_url(), &token)))
+    }
+
+    fn poll_budget(&self) -> PollBudget {
+        PollBudget::STANDARD
+    }
+
+    fn render_usage(&self, windows: &[(Window, Pace)]) -> Value {
+        usage::render(windows)
+    }
+
+    fn live_identity_source(&self, env: &Env) -> Option<PathBuf> {
+        Some(FakePaths::resolve(env).identity)
     }
 }

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +9,8 @@ use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
     BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
     Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLocks,
-    MutationGuard, Provider, ProviderError, Read, StoredLogin, Undo, Written,
+    MutationGuard, Pace, PollBudget, Provider, ProviderError, Read, StoredLogin, Undo, UsageResult,
+    Window, Written,
 };
 
 use crate::config;
@@ -20,6 +22,7 @@ use crate::naming::{ItemKind, keychain_account, read_services};
 use crate::oauth;
 use crate::paths::CcPaths;
 use crate::shape::{self, KIND_API_KEY, KINDS, MACHINE_SHARED_KEYS};
+use crate::usage;
 
 /// A live read that is too stale or unreliable to compose from, but that isn't itself an
 /// `Unreadable`/parse error with its own detail worth keeping (§9.4 step 3, §3).
@@ -450,6 +453,27 @@ impl Provider for ClaudeCode {
         };
         let req = oauth::refresh_request(&self.endpoints, &rt, &shape::scopes(old), timeout);
         oauth::parse_refresh(old, http.send(&req), now_ms)
+    }
+
+    fn fetch_usage(&self, http: &dyn Http, cred: &Credential) -> UsageResult {
+        // An API key has no access token, and neither has a wiped or refresh-only blob (§8.1).
+        // A setup token is sent like any OAuth access token (Decision 11).
+        let Some(token) = shape::access_token(cred.bytes()) else {
+            return UsageResult::NoAccessToken;
+        };
+        usage::parse_usage(http.send(&usage::usage_request(&self.endpoints, &token)))
+    }
+
+    fn poll_budget(&self) -> PollBudget {
+        PollBudget::STANDARD
+    }
+
+    fn render_usage(&self, windows: &[(Window, Pace)]) -> Value {
+        usage::render(windows)
+    }
+
+    fn live_identity_source(&self, env: &Env) -> Option<PathBuf> {
+        Some(CcPaths::resolve(env).global_config)
     }
 }
 

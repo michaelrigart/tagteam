@@ -4,13 +4,17 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tagteam_core::Fingerprint;
+use tagteam_core::pace::ProjectionMethod;
+use tagteam_core::usage::WindowKind;
 use tagteam_fake::{
     FAKE_AGENT, FakeAgent, FakePaths, KIND_STATIC, KIND_TOKEN, LOGIN_EXPIRES, credential_json,
     identity_json, login,
 };
+use tagteam_provider::http::{HttpError, HttpResponse, Method, RecordedRequest, ScriptedHttp};
+use tagteam_provider::provider::TransientKind;
 use tagteam_provider::{
-    Capabilities, Env, LiveChange, LockError, MutationGuard, Provider, ProviderError, Read,
-    SecretStore, StoredLogin, Written,
+    Capabilities, Credential, Env, LiveChange, LockError, MutationGuard, Pace, PollBudget,
+    Provider, ProviderError, Read, SecretStore, StoredLogin, UsageResult, Window, Written,
 };
 
 struct Fx {
@@ -107,6 +111,7 @@ fn kinds_capabilities_endpoints_and_surface() {
     assert_eq!(
         f.fake.capabilities(),
         Capabilities {
+            usage: true,
             refresh: true,
             ..Capabilities::default()
         }
@@ -132,6 +137,7 @@ fn kinds_capabilities_endpoints_and_surface() {
     assert!(s.credential_items.is_empty() && s.owned_items.is_empty());
     assert_eq!(s.machine_shared_keys, vec!["device"]);
     assert_eq!(f.fake.renew_url(), "https://fake-agent.invalid/fa/renew");
+    assert_eq!(f.fake.usage_url(), "https://fake-agent.invalid/usage");
     assert_eq!(
         FakeAgent::new()
             .with_endpoint_base("http://127.0.0.1:9/")
@@ -282,5 +288,139 @@ fn a_torn_identity_file_is_unreadable_and_never_replaced() {
     assert_eq!(
         fs::read(&p.identity).unwrap(),
         b"{\"identity\": {\"handle\": ".to_vec()
+    );
+}
+
+/// A day and 30 days after 1_790_000_000 s: FakeAgent's `renews` are epoch seconds.
+const RENEWS_DAY: i64 = 1_790_086_400;
+const RENEWS_MONTH: i64 = 1_792_592_000;
+
+fn meter_window(key: &str, kind: WindowKind, pct: f64, renews: i64, period_s: i64) -> Window {
+    Window {
+        key: key.into(),
+        label: key.into(),
+        kind,
+        pct,
+        resets_at: Some(renews),
+        period_s: Some(period_s),
+        detail: None,
+    }
+}
+
+/// One usage fetch with `fa-tok`, against a fresh `ScriptedHttp` that answers with `reply`.
+fn fetch_once(reply: Result<HttpResponse, HttpError>) -> (UsageResult, Vec<RecordedRequest>) {
+    let fake = FakeAgent::new();
+    let http = ScriptedHttp::new();
+    http.push(Method::Get, &fake.usage_url(), reply);
+    let token = Credential::fresh(
+        credential_json("fa-tok", Some("fa-renew"), None)
+            .to_string()
+            .into_bytes(),
+    );
+    (fake.fetch_usage(&http, &token), http.requests())
+}
+
+#[test]
+fn fake_agent_meters_are_fractions_under_its_own_keys() {
+    let body = json!({"meters": [
+        {"id": "daily", "used": 0.42, "renews": RENEWS_DAY},
+        {"id": "monthly", "used": 0.1, "renews": RENEWS_MONTH},
+        {"id": "hourly", "used": 0.9, "renews": RENEWS_DAY}
+    ]});
+    let (r, sent) = fetch_once(Ok(HttpResponse::json_body(200, &body)));
+    assert_eq!(
+        r,
+        UsageResult::Windows(vec![
+            meter_window("daily", WindowKind::Short, 42.0, RENEWS_DAY, 86_400),
+            meter_window("monthly", WindowKind::Long, 10.0, RENEWS_MONTH, 2_592_000),
+        ]),
+        "an unknown meter is ignored"
+    );
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        (sent[0].method, sent[0].url.as_str()),
+        (Method::Get, "https://fake-agent.invalid/usage")
+    );
+    assert_eq!(
+        sent[0].headers,
+        vec![("authorization".to_owned(), "Fake fa-tok".to_owned())]
+    );
+    assert!(
+        !format!("{:?}", sent[0]).contains("fa-tok"),
+        "the token never reaches Debug"
+    );
+}
+
+#[test]
+fn fake_agent_usage_verdicts() {
+    let failed = |kind, retry_after_s| UsageResult::Failed {
+        kind,
+        retry_after_s,
+    };
+    assert_eq!(
+        fetch_once(Ok(HttpResponse::json_body(401, &json!({})))).0,
+        UsageResult::Unauthorized
+    );
+    let limited = HttpResponse {
+        status: 429,
+        headers: vec![("retry-after".into(), "60".into())],
+        body: vec![],
+    };
+    assert_eq!(
+        fetch_once(Ok(limited)).0,
+        failed(TransientKind::Http(429), Some(60.0))
+    );
+    assert_eq!(
+        fetch_once(Ok(HttpResponse::json_body(200, &json!({"meters": "none"})))).0,
+        failed(TransientKind::BadResponse, None)
+    );
+    assert_eq!(
+        fetch_once(Ok(HttpResponse::json_body(200, &json!({"meters": []})))).0,
+        UsageResult::Windows(vec![])
+    );
+    assert_eq!(
+        fetch_once(Err(HttpError::Ambiguous("reset".into()))).0,
+        failed(TransientKind::Ambiguous, None)
+    );
+}
+
+#[test]
+fn fake_agent_without_a_token_sends_nothing() {
+    let fake = FakeAgent::new();
+    let http = ScriptedHttp::new();
+    let renew_only = Credential::fresh(br#"{"fa": {"renew": "r"}}"#.to_vec());
+    assert_eq!(
+        fake.fetch_usage(&http, &renew_only),
+        UsageResult::NoAccessToken
+    );
+    assert!(http.requests().is_empty());
+}
+
+#[test]
+fn fake_agent_renders_its_own_shape_and_names_its_identity_file() {
+    let f = fx();
+    let paced = Pace {
+        rate_per_hour: Some(2.0),
+        method: Some(ProjectionMethod::Regression),
+        ..Pace::default()
+    };
+    let windows = vec![
+        (
+            meter_window("daily", WindowKind::Short, 42.0, RENEWS_DAY, 86_400),
+            Pace::default(),
+        ),
+        (
+            meter_window("monthly", WindowKind::Long, 10.0, RENEWS_MONTH, 2_592_000),
+            paced,
+        ),
+    ];
+    assert_eq!(
+        f.fake.render_usage(&windows),
+        json!({"meters": {"daily": 42.0, "monthly": 10.0}})
+    );
+    assert_eq!(f.fake.poll_budget(), PollBudget::STANDARD);
+    assert_eq!(
+        f.fake.live_identity_source(&f.env),
+        Some(FakePaths::resolve(&f.env).identity)
     );
 }

@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tagteam_core::backoff::parse_retry_after;
+use tagteam_core::pace::Pace;
+use tagteam_core::poll::PollBudget;
 use tagteam_core::usage::Window;
 use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 
@@ -556,6 +558,20 @@ pub trait Provider: Send + Sync {
         now_ms: i64,
         timeout: Duration,
     ) -> RefreshResult;
+
+    /// §8.1, the provider's half: sends one usage request with the credential's access token
+    /// and classifies the reply into generic windows (§8.2). `NoAccessToken`, with nothing
+    /// sent, when the credential has none. It never refreshes and never checks expiry: the
+    /// engine owns the gate, §7.5, the budget slot and the lease (§8.3).
+    fn fetch_usage(&self, http: &dyn Http, cred: &Credential) -> UsageResult;
+    /// §8.6's constants and the hourly request cap of this provider's usage endpoint.
+    fn poll_budget(&self) -> PollBudget;
+    /// §13.2: the provider's JSON for a row's `usage`/`lastGoodUsage`, from windows and their
+    /// pace.
+    fn render_usage(&self, windows: &[(Window, Pace)]) -> Value;
+    /// The file whose mtime and size key `live_identity_cache` (§13.5): the one `live_identity`
+    /// reads. CC: `~/.claude.json`. `None` when no single file backs the live identity.
+    fn live_identity_source(&self, env: &Env) -> Option<PathBuf>;
 }
 
 #[cfg(test)]

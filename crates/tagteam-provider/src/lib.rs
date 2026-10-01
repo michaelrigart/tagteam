@@ -41,3 +41,6 @@ pub use provider::{
     Written,
 };
 pub use read::{Read, ReadError};
+pub use tagteam_core::pace::Pace;
+pub use tagteam_core::poll::PollBudget;
+pub use tagteam_core::usage::Window;
