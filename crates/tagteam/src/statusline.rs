@@ -153,14 +153,15 @@ fn reset(w: Option<&Window>, now_s: i64) -> String {
 }
 
 /// The spend window as money (`€3.50 of €20`) when the provider's detail says how much, else
-/// as a percentage.
+/// as a percentage; `list`'s own rule (`render::spend_shown`).
 fn spend(w: Option<&Window>, colour: bool) -> String {
     let Some(w) = w else {
         return MISSING.to_owned();
     };
-    let shown = w.pct.round();
-    let text = render::spend_text(w).unwrap_or_else(|| format!("{shown:.0}%"));
-    paint(&text, shown, colour)
+    render::spend_shown(w, colour).unwrap_or_else(|| {
+        let shown = w.pct.round();
+        paint(&format!("{shown:.0}%"), shown, colour)
+    })
 }
 
 fn stale(fetched_at: Option<i64>, now_s: i64) -> String {
@@ -531,6 +532,8 @@ mod tests {
             platform: Platform::MacOs,
             api_base: Some("http://127.0.0.1:9".into()),
             stdout_terminal: false,
+            no_color_env: false,
+            force_color_env: false,
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = run(
@@ -609,6 +612,8 @@ mod tests {
                 platform: Platform::MacOs,
                 api_base: None,
                 stdout_terminal: false,
+                no_color_env: false,
+                force_color_env: false,
             };
             engine(ctx, &ProviderId::new(provider))
                 .0
@@ -631,6 +636,8 @@ mod tests {
             platform: Platform::MacOs,
             api_base: None,
             stdout_terminal: false,
+            no_color_env: false,
+            force_color_env: false,
         };
         let (built, http, keychain) = engine(ctx, &provider);
         let view = built.statusline(&provider).unwrap();

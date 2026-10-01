@@ -107,32 +107,31 @@ impl H {
         h
     }
 
-    /// Runs `tagteam <args>` in-process, its output not a terminal. `--no-color` is always
-    /// added: a `FORCE_COLOR` set around this test process must not colour the output the
-    /// tests compare.
+    /// Runs `tagteam <args>` in-process, its output not a terminal and no colour variable set,
+    /// whatever the test process's own environment holds.
     fn run(&self, args: &[&str], prompter: &mut Scripted) -> (i32, String, String) {
-        self.run_as(args, prompter, false, true)
+        self.run_in(args, prompter, |_| {})
     }
 
-    /// `run`, with the output a terminal or not and `--no-color` or not.
-    fn run_as(
+    /// `run`, with `adjust` applied to the context first.
+    fn run_in(
         &self,
         args: &[&str],
         prompter: &mut Scripted,
-        stdout_terminal: bool,
-        no_color: bool,
+        adjust: impl FnOnce(&mut Context),
     ) -> (i32, String, String) {
-        let argv = std::iter::once("tagteam")
-            .chain(args.iter().copied())
-            .chain(no_color.then_some("--no-color"));
+        let argv = std::iter::once("tagteam").chain(args.iter().copied());
         let cli = Cli::try_parse_from(argv).unwrap();
-        let ctx = Context {
+        let mut ctx = Context {
             env: self.env.clone(),
             keychain: self.kc.clone(),
             platform: Platform::MacOs,
             api_base: Some(common::OFFLINE_API_BASE.into()),
-            stdout_terminal,
+            stdout_terminal: false,
+            no_color_env: false,
+            force_color_env: false,
         };
+        adjust(&mut ctx);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = app::run(
             cli,
@@ -252,14 +251,27 @@ fn colour_under_auto_follows_the_output_the_command_writes_to() {
     );
     common::record_reading(h._dir.path(), &id, now, &[seven]);
     const YELLOW_77: &str = "\x1b[33m77%\x1b[0m";
-    let list = |terminal: bool, no_color: bool| {
-        let (code, out, err) = h.run_as(&["list"], &mut Scripted::none(), terminal, no_color);
+    let list = |args: &[&str], adjust: fn(&mut Context)| {
+        let (code, out, err) = h.run_in(args, &mut Scripted::none(), adjust);
         assert_eq!((code, err.as_str()), (0, ""));
         out
     };
-    assert!(!list(false, false).contains('\x1b'), "not a terminal");
-    assert!(list(true, false).contains(YELLOW_77), "a terminal");
-    assert!(!list(true, true).contains('\x1b'), "--no-color wins");
+    assert!(!list(&["list"], |_| {}).contains('\x1b'), "not a terminal");
+    let terminal: fn(&mut Context) = |c| c.stdout_terminal = true;
+    assert!(list(&["list"], terminal).contains(YELLOW_77), "a terminal");
+    assert!(!list(&["list", "--no-color"], terminal).contains('\x1b'));
+    assert!(
+        !list(&["list"], |c| {
+            c.stdout_terminal = true;
+            c.no_color_env = true;
+        })
+        .contains('\x1b'),
+        "NO_COLOR wins"
+    );
+    assert!(
+        list(&["list"], |c| c.force_color_env = true).contains(YELLOW_77),
+        "FORCE_COLOR colours a pipe"
+    );
 }
 
 #[test]

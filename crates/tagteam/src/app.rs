@@ -75,6 +75,11 @@ pub struct Context {
     /// Whether the output `io.out` writes to is a terminal: `ui.color = auto` colours only then.
     /// The binary sets it from its own stdout; a harness capturing the output sets it false.
     pub stdout_terminal: bool,
+    /// `NO_COLOR` and `FORCE_COLOR` are set to a non-empty value (no-color.org, force-color.org).
+    /// The binary reads them from its environment; a harness sets them, never the test
+    /// process's own.
+    pub no_color_env: bool,
+    pub force_color_env: bool,
 }
 
 #[derive(Default)]
@@ -121,6 +126,8 @@ impl Context {
             platform: o.platform.unwrap_or_else(Platform::current),
             api_base: o.api_base,
             stdout_terminal: std::io::stdout().is_terminal(),
+            no_color_env: env_flag(NO_COLOR),
+            force_color_env: env_flag(FORCE_COLOR),
         }
     }
 }
@@ -273,8 +280,10 @@ pub(crate) fn error_json(kind: &str, message: &str) -> Value {
 struct App<'a, 'b> {
     engine: Engine,
     json: bool,
-    /// `Context::stdout_terminal`.
+    /// `Context::stdout_terminal`, `no_color_env` and `force_color_env`.
     stdout_terminal: bool,
+    no_color_env: bool,
+    force_color_env: bool,
     /// `--no-color`.
     no_color: bool,
     provider_flag: Option<ProviderId>,
@@ -284,7 +293,7 @@ struct App<'a, 'b> {
 }
 
 pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
-    let color = !cli.no_color && !env_flag(NO_COLOR);
+    let color = !cli.no_color && !ctx.no_color_env;
     init_logging(cli.debug, color);
     let json = cli.json;
     if let Err(msg) = root_guard::refuse_root() {
@@ -296,7 +305,8 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
-    let stdout_terminal = ctx.stdout_terminal;
+    let (stdout_terminal, no_color_env, force_color_env) =
+        (ctx.stdout_terminal, ctx.no_color_env, ctx.force_color_env);
     let provider_flag = cli.provider.map(ProviderId::new);
     let resolved = provider_flag
         .clone()
@@ -309,6 +319,8 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
         engine,
         json,
         stdout_terminal,
+        no_color_env,
+        force_color_env,
         no_color: cli.no_color,
         provider_flag,
         keychain,
@@ -362,6 +374,7 @@ fn run_statusline(
         return EXIT_USAGE;
     }
     let provider = provider.map_or_else(|| ProviderId::new(CLAUDE_CODE), ProviderId::new);
+    let (no_color_env, force_color_env) = (ctx.no_color_env, ctx.force_color_env);
     let (engine, _http, _keychain) = statusline::engine(ctx, &provider);
     let result = statusline_supported(&engine, &provider).and_then(|()| {
         if print_config {
@@ -374,8 +387,8 @@ fn run_statusline(
         // `auto` colours it: the same rule as `list`, with the terminal test taken as met.
         let colour = color_enabled(
             no_color,
-            env_flag(NO_COLOR),
-            env_flag(FORCE_COLOR),
+            no_color_env,
+            force_color_env,
             settings.color,
             true,
         );
@@ -465,8 +478,8 @@ impl App<'_, '_> {
     fn color(&self) -> bool {
         color_enabled(
             self.no_color,
-            env_flag(NO_COLOR),
-            env_flag(FORCE_COLOR),
+            self.no_color_env,
+            self.force_color_env,
             self.engine.settings().color,
             self.stdout_terminal,
         )

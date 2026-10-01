@@ -93,6 +93,16 @@ fn block(hw: &HistoryWindow, now_s: i64) -> String {
     format!("{head}\n  {samples}\n  {}\n", projection(hw, now_s))
 }
 
+/// A rate in points per hour with its sign: one decimal, or two below 0.1 in magnitude, where
+/// one would print a quiet window's rate as zero (`+0.03`, not `+0.0`).
+fn signed(rate: f64) -> String {
+    if rate.abs() < 0.1 {
+        format!("{rate:+.2}")
+    } else {
+        format!("{rate:+.1}")
+    }
+}
+
 /// The burn rate and where it leads (§8.7): `lasts to reset` when the window will, else when it
 /// runs out (or `should have run out` when that time has passed, `won't run out within a year`
 /// when it is further off than that), with the method that measured the rate.
@@ -104,7 +114,7 @@ fn projection(hw: &HistoryWindow, now_s: i64) -> String {
     // An exhausted window ran out when it was read, which may be long ago: no countdown applies.
     if hw.window.pct >= 100.0 {
         return match p.rate_per_hour {
-            Some(rate) => format!("{rate:+.1} pts/h · at the limit{method}"),
+            Some(rate) => format!("{} pts/h · at the limit{method}", signed(rate)),
             None => "at the limit".to_owned(),
         };
     }
@@ -123,7 +133,7 @@ fn projection(hw: &HistoryWindow, now_s: i64) -> String {
         (_, Some(at)) => format!("runs out in {}", render::duration(at - now_s)),
         _ => "no projection".to_owned(),
     };
-    format!("{rate:+.1} pts/h · {eta}{method}")
+    format!("{} pts/h · {eta}{method}", signed(rate))
 }
 
 /// `--csv`: `window,fetched_at,pct,resets_at`, one row per sample, times in ISO 8601 UTC.
@@ -372,7 +382,7 @@ mod tests {
             method: Some(ProjectionMethod::Average),
             ..Pace::default()
         };
-        assert_eq!(with(flat), "+0.0 pts/h · no projection (average)");
+        assert_eq!(with(flat), "+0.00 pts/h · no projection (average)");
     }
 
     #[test]
@@ -399,22 +409,37 @@ mod tests {
     }
 
     #[test]
+    fn a_quiet_windows_rate_keeps_two_decimals() {
+        for (rate, text) in [
+            (0.03, "+0.03"),
+            (-0.05, "-0.05"),
+            (0.0, "+0.00"),
+            (0.099, "+0.10"),
+            (0.1, "+0.1"),
+            (5.0, "+5.0"),
+            (-1.26, "-1.3"),
+        ] {
+            assert_eq!(signed(rate), text, "{rate}");
+        }
+    }
+
+    #[test]
     fn a_projection_beyond_a_year_says_it_will_not_run_out() {
         let with = |pace: Pace, reset: Option<i64>| {
             let w = window("7d", "7d", WindowKind::Long, 30.0, reset);
             projection(&history_window(w, vec![], pace), NOW)
         };
-        // A quiet window: 70 points to go at 0.001 an hour is eight years.
+        // A quiet window: 70 points to go at 0.006 an hour is well over a year.
         let tiny = Pace {
-            rate_per_hour: Some(0.001),
+            rate_per_hour: Some(0.006),
             method: Some(ProjectionMethod::Regression),
-            exhaustion_at: Some(NOW + 252_000_000),
+            exhaustion_at: Some(NOW + 42_000_000),
             will_last_to_reset: None,
             ..Pace::default()
         };
         assert_eq!(
             with(tiny, None),
-            "+0.0 pts/h · won't run out within a year (regression)"
+            "+0.01 pts/h · won't run out within a year (regression)"
         );
         // With a reset it will not reach, the reset is what counts (§8.7).
         let lasts = Pace {
@@ -423,7 +448,7 @@ mod tests {
         };
         assert_eq!(
             with(lasts, Some(HOUR)),
-            "+0.0 pts/h · lasts to reset (regression)"
+            "+0.01 pts/h · lasts to reset (regression)"
         );
         // 70 points at 0.01 an hour is 291 days: a countdown still.
         let slow = Pace {
@@ -433,7 +458,7 @@ mod tests {
         };
         assert_eq!(
             with(slow, None),
-            "+0.0 pts/h · runs out in 291d16h (regression)"
+            "+0.01 pts/h · runs out in 291d16h (regression)"
         );
         // The year itself is still a countdown; a second more is not.
         let year = |s| Pace {
@@ -442,11 +467,11 @@ mod tests {
         };
         assert_eq!(
             with(year(0), None),
-            "+0.0 pts/h · runs out in 365d00h (regression)"
+            "+0.01 pts/h · runs out in 365d00h (regression)"
         );
         assert_eq!(
             with(year(1), None),
-            "+0.0 pts/h · won't run out within a year (regression)"
+            "+0.01 pts/h · won't run out within a year (regression)"
         );
         // A saturated time must not overflow.
         let saturated = Pace {
@@ -455,7 +480,7 @@ mod tests {
         };
         assert_eq!(
             with(saturated, None),
-            "+0.0 pts/h · won't run out within a year (regression)"
+            "+0.01 pts/h · won't run out within a year (regression)"
         );
     }
 
