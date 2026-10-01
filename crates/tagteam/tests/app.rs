@@ -15,7 +15,7 @@ use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{CLAUDE_CODE, ProviderId, WindowKind};
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::Store;
-use tagteam_provider::{Env, FakeKeychain};
+use tagteam_provider::{Cancel, Env, FakeKeychain};
 
 const UNLOCK: &str = "The login keychain is locked (common over SSH). Unlock it now?";
 
@@ -23,6 +23,8 @@ struct Scripted {
     interactive: bool,
     answers: VecDeque<&'static str>,
     asked: Vec<String>,
+    /// The signal "sent" at every prompt, into this token, as a terminal's Ctrl-C would be.
+    interrupt: Option<(Cancel, i32)>,
 }
 
 impl Scripted {
@@ -31,6 +33,7 @@ impl Scripted {
             interactive: false,
             answers: VecDeque::new(),
             asked: Vec::new(),
+            interrupt: None,
         }
     }
     fn answering(a: &[&'static str]) -> Self {
@@ -38,6 +41,23 @@ impl Scripted {
             interactive: true,
             answers: a.iter().copied().collect(),
             asked: Vec::new(),
+            interrupt: None,
+        }
+    }
+    /// A person who presses Ctrl-C at every prompt: `signal` lands in `cancel` while the prompt
+    /// is up. The scripted answer is still given, where `TtyPrompter` would decline: whatever a
+    /// prompt answers, the command must stop on the signal (Decision 5).
+    fn interrupted_by(cancel: &Cancel, signal: i32, a: &[&'static str]) -> Self {
+        Self {
+            interrupt: Some((cancel.clone(), signal)),
+            ..Self::answering(a)
+        }
+    }
+    /// Notes the question, and sends the signal if this person interrupts.
+    fn record(&mut self, q: &str) {
+        self.asked.push(q.to_owned());
+        if let Some((cancel, signal)) = &self.interrupt {
+            cancel.request(*signal);
         }
     }
 }
@@ -47,14 +67,14 @@ impl Prompter for Scripted {
         self.interactive
     }
     fn confirm(&mut self, q: &str, default_yes: bool) -> bool {
-        self.asked.push(q.to_owned());
+        self.record(q);
         match self.answers.pop_front().expect("unexpected prompt") {
             "" => default_yes,
             a => a.starts_with('y'),
         }
     }
     fn choose(&mut self, q: &str, _o: &[String]) -> Option<usize> {
-        self.asked.push(q.to_owned());
+        self.record(q);
         self.answers
             .pop_front()
             .expect("unexpected prompt")
@@ -62,7 +82,7 @@ impl Prompter for Scripted {
             .ok()
     }
     fn secret(&mut self, q: &str) -> Option<String> {
-        self.asked.push(q.to_owned());
+        self.record(q);
         Some(
             self.answers
                 .pop_front()
@@ -111,6 +131,16 @@ impl H {
     /// whatever the test process's own environment holds.
     fn run(&self, args: &[&str], prompter: &mut Scripted) -> (i32, String, String) {
         self.run_in(args, prompter, |_| {})
+    }
+
+    /// `run` with `cancel` as the process's token, which a signal handler would set (§14.1).
+    fn run_with_cancel(
+        &self,
+        args: &[&str],
+        prompter: &mut Scripted,
+        cancel: &Cancel,
+    ) -> (i32, String, String) {
+        self.run_in(args, prompter, |ctx| ctx.env.cancel = cancel.clone())
     }
 
     /// `run`, with `adjust` applied to the context first.
@@ -977,4 +1007,209 @@ fn settings_are_read_for_the_provider_the_command_resolves() {
         "{err}"
     );
     assert_eq!(lines.next(), Some("tagteam: unknown provider \"other\""));
+}
+
+/// A token already set when the command starts: the signal came first.
+fn signalled(signal: i32) -> Cancel {
+    let cancel = Cancel::new();
+    cancel.request(signal);
+    cancel
+}
+
+/// `a@x.co` at position 1, and `b@x.co` at position 2 and live.
+fn two_logins() -> H {
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    h.ok(&["add"]);
+    h.login("b@x.co", "rt-b");
+    h.ok(&["add"]);
+    h
+}
+
+/// §13.2's envelope for §14.1's interruption (Decision 4).
+fn interrupted_json() -> Value {
+    json!({"schemaVersion": 1, "error": {"type": "interrupted", "message": "interrupted"}})
+}
+
+const INTERRUPTED: &str = "tagteam: interrupted\n";
+
+/// Decision 6's notice for `command`.
+fn too_late(command: &str) -> String {
+    format!("tagteam: interrupted too late to stop: {command} had already finished\n")
+}
+
+#[test]
+fn an_interrupted_command_exits_128_plus_the_signal() {
+    // §13.1, §14.1, Decision 4: the switch stops at its first lock wait, before it writes.
+    let h = two_logins();
+    let item = (
+        keychain_service(&h.env, ItemKind::OAuth),
+        keychain_account(&h.env),
+    );
+    let entry = h.kc.get(&item.0, &item.1);
+    for (signal, code) in [
+        (libc::SIGINT, 130),
+        (libc::SIGTERM, 143),
+        (libc::SIGHUP, 129),
+    ] {
+        let (got, out, err) = h.run_with_cancel(
+            &["switch", "1", "--json"],
+            &mut Scripted::none(),
+            &signalled(signal),
+        );
+        assert_eq!((got, err.as_str()), (code, ""), "signal {signal}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            interrupted_json(),
+            "signal {signal}"
+        );
+    }
+    let (code, out, err) = h.run_with_cancel(
+        &["switch", "1"],
+        &mut Scripted::none(),
+        &signalled(libc::SIGINT),
+    );
+    assert_eq!((code, out.as_str(), err.as_str()), (130, "", INTERRUPTED));
+    assert_eq!(common::live_email(h.env.home.parent().unwrap()), "b@x.co");
+    assert_eq!(h.kc.get(&item.0, &item.1), entry, "nothing was written");
+}
+
+#[test]
+fn an_interrupted_usage_collection_interrupts_list_and_status() {
+    // §14.1: collecting is a cancellation point, and an interrupted collection records nothing.
+    let h = with_one_login();
+    for args in [["list", "--json"], ["status", "--json"]] {
+        let (code, out, err) =
+            h.run_with_cancel(&args, &mut Scripted::none(), &signalled(libc::SIGINT));
+        assert_eq!((code, err.as_str()), (130, ""), "{args:?}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&out).unwrap(),
+            interrupted_json(),
+            "{args:?}"
+        );
+    }
+    let store = Store::open_existing(&h.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    let a = store.accounts(&ProviderId::new(CLAUDE_CODE)).unwrap()[0]
+        .id
+        .clone();
+    assert_eq!(
+        store.usage_state(&a).unwrap(),
+        None,
+        "nothing was recorded, not even a failure"
+    );
+}
+
+#[test]
+fn a_signal_that_meets_no_cancellation_point_is_too_late_and_changes_nothing() {
+    // Decision 6: `list` on a fresh home collects nothing, so nothing could stop it.
+    let h = H::new();
+    let (code, out, err) = h.run_with_cancel(
+        &["list", "--json"],
+        &mut Scripted::none(),
+        &signalled(libc::SIGINT),
+    );
+    assert_eq!((code, err), (0, too_late("list")));
+    assert_eq!(
+        out,
+        h.ok(&["list", "--json"]),
+        "stdout is one JSON object, as without the signal"
+    );
+    let (code, out, err) =
+        h.run_with_cancel(&["list"], &mut Scripted::none(), &signalled(libc::SIGTERM));
+    assert_eq!((code, err), (0, too_late("list")));
+    assert_eq!(out, h.ok(&["list"]));
+    // A command that failed for a reason of its own keeps its error and its exit code.
+    let (code, out, err) = h.run_with_cancel(
+        &["switch", "9"],
+        &mut Scripted::none(),
+        &signalled(libc::SIGINT),
+    );
+    assert_eq!((code, out.as_str()), (1, ""));
+    assert_eq!(
+        err,
+        format!("tagteam: no account matches \"9\"\n{}", too_late("switch"))
+    );
+}
+
+#[test]
+fn ctrl_c_at_the_offer_to_add_the_live_login_interrupts_and_adds_nothing() {
+    // Review Focus 3. The scripted answer is a yes: whatever the prompt answered, the signal
+    // stops the command.
+    let h = with_unmanaged_login();
+    let cancel = Cancel::new();
+    let mut ctrl_c = Scripted::interrupted_by(&cancel, libc::SIGINT, &["y"]);
+    let (code, out, err) = h.run_with_cancel(&["switch", "1"], &mut ctrl_c, &cancel);
+    assert_eq!((code, out.as_str(), err.as_str()), (130, "", INTERRUPTED));
+    assert_eq!(ctrl_c.asked, [ADD_STRANGER_FIRST]);
+    assert_eq!(
+        h.ok(&["status"]),
+        "Live: stranger@x.co (not managed by tagteam)\n"
+    );
+}
+
+#[test]
+fn ctrl_c_at_the_secret_prompt_interrupts_and_adds_nothing() {
+    // Review Focus 3: `add-token`'s no-echo prompt. The terminal side (echo restored, typed
+    // input discarded) is `read_secret`'s, pinned on a pty in `prompt.rs`.
+    let h = with_one_login();
+    let cancel = Cancel::new();
+    let mut ctrl_c = Scripted::interrupted_by(&cancel, libc::SIGINT, &["sk-ant-api03-key"]);
+    let (code, out, err) = h.run_with_cancel(&["add-token"], &mut ctrl_c, &cancel);
+    assert_eq!((code, out.as_str(), err.as_str()), (130, "", INTERRUPTED));
+    assert_eq!(ctrl_c.asked, ["Token: "]);
+    assert_eq!(h.ok(&["list"]), LIVE_A_OFFLINE);
+}
+
+#[test]
+fn ctrl_c_at_the_unlock_question_never_runs_the_unlock() {
+    // Appendix A.3's question is a prompt like any other: a yes typed as the signal lands does
+    // not go on to `security unlock-keychain`.
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    h.kc.set_locked(true);
+    let cancel = Cancel::new();
+    let mut ctrl_c = Scripted::interrupted_by(&cancel, libc::SIGINT, &[""]);
+    let (code, out, err) = h.run_with_cancel(&["add"], &mut ctrl_c, &cancel);
+    assert_eq!((code, out.as_str(), err.as_str()), (130, "", INTERRUPTED));
+    assert_eq!(ctrl_c.asked, [UNLOCK]);
+    assert_eq!(h.kc.unlock_attempts(), 0);
+    assert!(!h.env.data_dir().exists(), "nothing was added");
+}
+
+#[test]
+fn ctrl_c_at_a_choice_or_a_replacement_question_interrupts() {
+    // §10.4's choice of account, then §10.1's replacement question, under SIGTERM.
+    let h = H::new();
+    h.login_in("a@x.co", "", "rt-personal");
+    h.ok(&["add"]);
+    h.login_in("a@x.co", "org-1", "rt-org");
+    h.ok(&["add"]);
+    let cancel = Cancel::new();
+    let mut ctrl_c = Scripted::interrupted_by(&cancel, libc::SIGTERM, &["1"]);
+    let (code, out, err) = h.run_with_cancel(&["disable", "a@x.co"], &mut ctrl_c, &cancel);
+    assert_eq!((code, out.as_str(), err.as_str()), (143, "", INTERRUPTED));
+    assert_eq!(ctrl_c.asked, ["Which account?"]);
+    let list = h.json(&["list", "--json"]);
+    assert_eq!(
+        (
+            list["accounts"][0].get("disabled"),
+            list["accounts"][1].get("disabled")
+        ),
+        (None, None),
+        "nothing was disabled"
+    );
+
+    let h = with_one_login();
+    let cancel = Cancel::new();
+    let mut ctrl_c = Scripted::interrupted_by(&cancel, libc::SIGTERM, &["y"]);
+    let (code, out, err) = h.run_with_cancel(
+        &["add-token", "sk-ant-api03-key", "--position", "1"],
+        &mut ctrl_c,
+        &cancel,
+    );
+    assert_eq!((code, out.as_str(), err.as_str()), (143, "", INTERRUPTED));
+    assert_eq!(ctrl_c.asked, [REPLACE_A]);
+    assert_eq!(h.ok(&["list"]), LIVE_A_OFFLINE);
 }
