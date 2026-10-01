@@ -222,3 +222,60 @@ fn a_target_that_turns_unreadable_while_the_switch_waits_names_the_account() {
     assert!(common::journal(&fx).is_none());
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
 }
+
+#[test]
+fn with_every_other_account_disabled_a_live_anchor_is_only_one_account() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c"); // live
+    fx.engine.set_disabled(&a, true).unwrap();
+    fx.engine.set_disabled(&b, true).unwrap();
+    let out = rotate(&fx).unwrap();
+    assert_eq!(
+        (out.switched, out.reason),
+        (false, SwitchReason::OnlyOneAccount)
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
+}
+
+#[test]
+fn a_disabled_live_anchor_does_not_count_toward_two() {
+    // §9.3: candidates are counted from the store, and a disabled row is not one, the live
+    // account included: one other switchable account is still fewer than two.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    fx.engine.set_disabled(&b, true).unwrap();
+    let out = rotate(&fx).unwrap();
+    assert_eq!(
+        (out.switched, out.reason),
+        (false, SwitchReason::OnlyOneAccount)
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+#[test]
+fn a_disabled_live_anchor_still_anchors_the_walk() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let c = fx.add("c@x.co", "rt-c");
+    fx.switch_to(&b, false).unwrap(); // b live, at position 2
+    fx.engine.set_disabled(&b, true).unwrap();
+    assert_eq!(
+        rotate(&fx).unwrap().to.unwrap().id,
+        c,
+        "the walk starts after b, not at the first position"
+    );
+}
+
+#[test]
+fn an_anchor_above_every_other_position_wraps_to_the_first() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let c = fx.add("c@x.co", "rt-c"); // live
+    fx.engine.move_to(&c, 9).unwrap(); // positions 1, 2 and 9
+    assert_eq!(rotate(&fx).unwrap().to.unwrap().id, a);
+}
