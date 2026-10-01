@@ -12,8 +12,9 @@ use tagteam::cli::Cli;
 use tagteam::prompt::Prompter;
 use tagteam_cc::live::Platform;
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
-use tagteam_core::{CLAUDE_CODE, ProviderId};
+use tagteam_core::{CLAUDE_CODE, ProviderId, WindowKind};
 use tagteam_engine::settings::Settings;
+use tagteam_engine::store::Store;
 use tagteam_provider::{Env, FakeKeychain};
 
 const UNLOCK: &str = "The login keychain is locked (common over SSH). Unlock it now?";
@@ -106,19 +107,31 @@ impl H {
         h
     }
 
-    /// Runs `tagteam <args>` in-process. `--no-color` is always added: whether this test
-    /// process's own stdout is a terminal, or `FORCE_COLOR` is set around it, must not colour
-    /// the output the tests compare.
+    /// Runs `tagteam <args>` in-process, its output not a terminal. `--no-color` is always
+    /// added: a `FORCE_COLOR` set around this test process must not colour the output the
+    /// tests compare.
     fn run(&self, args: &[&str], prompter: &mut Scripted) -> (i32, String, String) {
+        self.run_as(args, prompter, false, true)
+    }
+
+    /// `run`, with the output a terminal or not and `--no-color` or not.
+    fn run_as(
+        &self,
+        args: &[&str],
+        prompter: &mut Scripted,
+        stdout_terminal: bool,
+        no_color: bool,
+    ) -> (i32, String, String) {
         let argv = std::iter::once("tagteam")
             .chain(args.iter().copied())
-            .chain(["--no-color"]);
+            .chain(no_color.then_some("--no-color"));
         let cli = Cli::try_parse_from(argv).unwrap();
         let ctx = Context {
             env: self.env.clone(),
             keychain: self.kc.clone(),
             platform: Platform::MacOs,
             api_base: Some(common::OFFLINE_API_BASE.into()),
+            stdout_terminal,
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = app::run(
@@ -212,6 +225,41 @@ fn a_row_offline(position: u32, active: bool) -> Value {
         a_row(position, active),
         json!({"usageError": "pre-send", "usageRetryAt": "[time]"}),
     )
+}
+
+#[test]
+fn colour_under_auto_follows_the_output_the_command_writes_to() {
+    // §13.1: `ui.color = auto` colours when the output is a terminal. That is the context's
+    // say, not the test process's own stdout.
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    h.ok(&["add"]);
+    let store = Store::open_existing(&h.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    let id = store.accounts(&ProviderId::new(CLAUDE_CODE)).unwrap()[0]
+        .id
+        .as_str()
+        .to_owned();
+    let now = common::now_epoch_s();
+    let seven = common::usage_window(
+        "7d",
+        "7d",
+        WindowKind::Long,
+        77.0,
+        Some(now + 300_000),
+        Some(604_800),
+    );
+    common::record_reading(h._dir.path(), &id, now, &[seven]);
+    const YELLOW_77: &str = "\x1b[33m77%\x1b[0m";
+    let list = |terminal: bool, no_color: bool| {
+        let (code, out, err) = h.run_as(&["list"], &mut Scripted::none(), terminal, no_color);
+        assert_eq!((code, err.as_str()), (0, ""));
+        out
+    };
+    assert!(!list(false, false).contains('\x1b'), "not a terminal");
+    assert!(list(true, false).contains(YELLOW_77), "a terminal");
+    assert!(!list(true, true).contains('\x1b'), "--no-color wins");
 }
 
 #[test]

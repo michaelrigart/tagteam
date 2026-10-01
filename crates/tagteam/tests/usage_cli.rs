@@ -306,5 +306,12 @@ fn colour_follows_the_setting_and_the_environment() {
     assert!(list(&[], &[]).contains(YELLOW_77));
     assert!(!list(&[("NO_COLOR", "1")], &[]).contains('\x1b'));
     assert!(!list(&[("FORCE_COLOR", "1")], &["--no-color"]).contains('\x1b'));
+    // An empty variable counts as unset (no-color.org, force-color.org): `NO_COLOR=` does not
+    // switch colour off, and `FORCE_COLOR=` does not switch it on.
+    assert!(list(&[("NO_COLOR", "")], &[]).contains(YELLOW_77));
+    assert!(list(&[("NO_COLOR", ""), ("FORCE_COLOR", "1")], &[]).contains(YELLOW_77));
+    std::fs::write(config.join("config.toml"), "[ui]\ncolor = \"never\"\n").unwrap();
+    assert!(!list(&[("FORCE_COLOR", "")], &[]).contains('\x1b'));
+    assert!(list(&[("FORCE_COLOR", "1")], &[]).contains(YELLOW_77));
     assert_eq!(server.hits("GET", USAGE), 1);
 }

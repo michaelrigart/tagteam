@@ -55,6 +55,9 @@ const CSV_AND_JSON: &str = "--csv and --json are two output formats; pass one";
 const BAD_SINCE: &str = "--since takes a span like 14d, 12h or 30m";
 const STATUSLINE_UNDER_JSON: &str = "statusline prints a line of text; run it without --json";
 
+const NO_COLOR: &str = "NO_COLOR";
+const FORCE_COLOR: &str = "FORCE_COLOR";
+
 /// Honoured only with the `test-support` feature: a release build never reads them.
 #[cfg(any(test, feature = "test-support"))]
 const TEST_KEYCHAIN_DIR: &str = "TAGTEAM_TEST_KEYCHAIN_DIR";
@@ -69,6 +72,9 @@ pub struct Context {
     pub platform: Platform,
     /// Every endpoint under this base instead of production; only a test-support build sets it.
     pub api_base: Option<String>,
+    /// Whether the output `io.out` writes to is a terminal: `ui.color = auto` colours only then.
+    /// The binary sets it from its own stdout; a harness capturing the output sets it false.
+    pub stdout_terminal: bool,
 }
 
 #[derive(Default)]
@@ -114,6 +120,7 @@ impl Context {
             keychain: o.keychain.unwrap_or_else(|| Arc::new(SecurityCli::new())),
             platform: o.platform.unwrap_or_else(Platform::current),
             api_base: o.api_base,
+            stdout_terminal: std::io::stdout().is_terminal(),
         }
     }
 }
@@ -224,6 +231,17 @@ fn render_usage(engine: &Engine) -> impl Fn(&ProviderId, &[(Window, Pace)]) -> V
     }
 }
 
+/// Whether a colour variable (`NO_COLOR`, `FORCE_COLOR`) is in force: set to a non-empty value
+/// (no-color.org, force-color.org). An empty one is as good as unset.
+fn is_set(value: Option<OsString>) -> bool {
+    value.is_some_and(|v| !v.is_empty())
+}
+
+/// The environment variable `name`, by `is_set`'s rule.
+pub(crate) fn env_flag(name: &str) -> bool {
+    is_set(std::env::var_os(name))
+}
+
 /// §13.1 and §6.4: `--no-color` and `NO_COLOR` always turn colour off, `FORCE_COLOR` turns it
 /// on, and otherwise `ui.color` decides, `auto` meaning "stdout is a terminal".
 fn color_enabled(
@@ -254,6 +272,8 @@ pub(crate) fn error_json(kind: &str, message: &str) -> Value {
 struct App<'a, 'b> {
     engine: Engine,
     json: bool,
+    /// `Context::stdout_terminal`.
+    stdout_terminal: bool,
     /// `--no-color`.
     no_color: bool,
     provider_flag: Option<ProviderId>,
@@ -263,7 +283,7 @@ struct App<'a, 'b> {
 }
 
 pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
-    let color = !cli.no_color && std::env::var_os("NO_COLOR").is_none();
+    let color = !cli.no_color && !env_flag(NO_COLOR);
     init_logging(cli.debug, color);
     let json = cli.json;
     if let Err(msg) = root_guard::refuse_root() {
@@ -275,6 +295,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
+    let stdout_terminal = ctx.stdout_terminal;
     let (engine, warnings) = build_engine(ctx);
     for w in &warnings {
         let _ = writeln!(io.err, "warning: {w}");
@@ -282,6 +303,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     let mut app = App {
         engine,
         json,
+        stdout_terminal,
         no_color: cli.no_color,
         provider_flag: cli.provider.map(ProviderId::new),
         keychain,
@@ -343,11 +365,14 @@ fn run_statusline(
         }
         let view = engine.statusline(&provider)?;
         let settings = engine.settings();
-        let colour = statusline::colour(
+        // The line goes to Claude Code, which renders ANSI colour but is never a terminal, so
+        // `auto` colours it: the same rule as `list`, with the terminal test taken as met.
+        let colour = color_enabled(
             no_color,
-            std::env::var_os("NO_COLOR").is_some(),
-            std::env::var_os("FORCE_COLOR").is_some(),
+            env_flag(NO_COLOR),
+            env_flag(FORCE_COLOR),
             settings.color,
+            true,
         );
         Ok(statusline::line(
             &view,
@@ -435,10 +460,10 @@ impl App<'_, '_> {
     fn color(&self) -> bool {
         color_enabled(
             self.no_color,
-            std::env::var_os("NO_COLOR").is_some(),
-            std::env::var_os("FORCE_COLOR").is_some(),
+            env_flag(NO_COLOR),
+            env_flag(FORCE_COLOR),
             self.engine.settings().color,
-            std::io::stdout().is_terminal(),
+            self.stdout_terminal,
         )
     }
 
@@ -889,6 +914,14 @@ mod tests {
                 "{flag} {no} {force} {setting:?} {terminal}"
             );
         }
+    }
+
+    #[test]
+    fn an_empty_colour_variable_is_as_good_as_unset() {
+        assert!(!is_set(None));
+        assert!(!is_set(Some(OsString::new())));
+        assert!(is_set(Some("1".into())));
+        assert!(is_set(Some("0".into())), "any non-empty value counts");
     }
 
     #[test]
