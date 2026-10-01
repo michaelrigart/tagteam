@@ -156,11 +156,13 @@ pub(crate) fn severity(pct: i64) -> Option<&'static str> {
 /// An amount with its currency's symbol (€, $, £), or its code for any other; a whole amount
 /// without cents.
 pub(crate) fn money(amount: f64, currency: &str) -> String {
-    let n = if amount.fract() == 0.0 {
-        format!("{amount:.0}")
-    } else {
-        format!("{amount:.2}")
-    };
+    let cents = format!("{amount:.2}");
+    let n = match cents.strip_suffix(".00") {
+        Some("-0") => "0",
+        Some(whole) => whole,
+        None => &cents,
+    }
+    .to_owned();
     match currency.to_ascii_uppercase().as_str() {
         "EUR" => format!("€{n}"),
         "USD" => format!("${n}"),
@@ -877,6 +879,16 @@ mod tests {
         assert_eq!(money(12.5, "USD"), "$12.50");
         assert_eq!(money(3.0, "GBP"), "£3");
         assert_eq!(money(7.25, "CHF"), "7.25 CHF");
+    }
+
+    #[test]
+    fn money_rounds_to_cents_before_dropping_a_whole_amounts_cents() {
+        assert_eq!(money(12.999, "EUR"), "€13");
+        assert_eq!(money(0.004, "EUR"), "€0");
+        assert_eq!(money(19.996, "USD"), "$20");
+        assert_eq!(money(0.006, "EUR"), "€0.01");
+        assert_eq!(money(12.994, "EUR"), "€12.99");
+        assert_eq!(money(-0.004, "EUR"), "€0");
     }
 
     #[test]
