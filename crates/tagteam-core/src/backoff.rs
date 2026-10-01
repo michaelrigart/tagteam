@@ -1,7 +1,8 @@
 //! Failure backoff (§8.5) and `Retry-After` parsing (§8.1). Pure; nothing here touches a clock.
 
-/// `min(asked, …)` ceilings (§8.5).
-const CAP_429_S: f64 = 4500.0;
+/// `min(asked, …)` ceilings (§8.5). The 429 one is also the longest backoff any failure sets,
+/// which the store's reserve eligibility uses to tell clock skew from a legal schedule.
+pub const CAP_429_S: i64 = 4500;
 const CAP_OTHER_S: f64 = 3600.0;
 /// `min(30 · 2^(n−1), 600)`, with the exponent clamped at 32.
 const BASE_S: i64 = 30;
@@ -43,7 +44,11 @@ pub fn failure_backoff_s(
 ) -> i64 {
     let exponent = consecutive_failures.saturating_sub(1).min(MAX_EXPONENT);
     let computed = (BASE_S << exponent).min(BASE_MAX_S);
-    let cap = if is_429 { CAP_429_S } else { CAP_OTHER_S };
+    let cap = if is_429 {
+        CAP_429_S as f64
+    } else {
+        CAP_OTHER_S
+    };
 
     let asked = match retry_after_s {
         Some(r) if r.is_nan() => 0.0,

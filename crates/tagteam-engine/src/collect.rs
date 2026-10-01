@@ -4,7 +4,7 @@
 //! is sent without the store's authorization right before the request: the lease still held,
 //! the token not refused, and a slot in the identity's hourly budget (§8.3, §8.6).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::thread;
 
@@ -96,13 +96,23 @@ impl Engine {
                 rows.push(row);
             }
         }
+        // Each provider's recorded active account is read before its live login: a switch
+        // writes the live login before it commits the record, so a record read first can only
+        // be older than the live role, never newer (`Collection::active_now`).
+        let mut recorded: HashMap<ProviderId, Option<AccountId>> = HashMap::new();
+        for row in &rows {
+            if !recorded.contains_key(&row.provider) {
+                recorded.insert(row.provider.clone(), store.active(&row.provider)?);
+            }
+        }
         let live = self.live_accounts(&rows);
         let results: Vec<Result<Outcome, EngineError>> = thread::scope(|s| {
             let running: Vec<_> = rows
                 .iter()
                 .map(|row| {
                     let active = live.contains(&row.id);
-                    s.spawn(move || self.collect_one(store, row, active))
+                    let started_with = recorded[&row.provider].clone();
+                    s.spawn(move || self.collect_one(store, row, active, started_with))
                 })
                 .collect();
             running
@@ -167,6 +177,7 @@ impl Engine {
         store: &Store,
         row: &AccountRow,
         active: bool,
+        recorded_active: Option<AccountId>,
     ) -> Result<Outcome, EngineError> {
         let Some(provider) = self.registry.get(&row.provider) else {
             return Ok((Collected::Unsupported, Vec::new()));
@@ -188,19 +199,16 @@ impl Engine {
             slot: reservation.slot,
             slot_at: reservation.slot_at,
         };
-        // The store's record of the active account is read here and again at the record, to
-        // see whether a switch committed in between (`Collection::active_now`).
-        let start = match hooks::point(self, "usage-reserved")
-            .and_then(|()| Ok((store.usage_state(&row.id)?, store.active(&row.provider)?)))
+        let state = match hooks::point(self, "usage-reserved")
+            .and_then(|()| Ok(store.usage_state(&row.id)?))
         {
-            Ok(start) => start,
+            Ok(state) => state,
             Err(e) => {
                 // Nothing was sent: give the slot back, best effort, before the error.
                 let _ = store.release_slot(&reservation, &slot);
                 return Err(e);
             }
         };
-        let (state, recorded_active) = start;
         let mut run = Collection {
             engine: self,
             store,
@@ -242,10 +250,12 @@ struct Collection<'a> {
     /// The access-token fingerprint the server refused (`rejected_fp`, §8.1), as read after
     /// reserving and stamped since. The store's copy is the one `authorize_send` checks.
     rejected: Option<String>,
-    /// Whether this collection's own gate refresh (§7.3, `Refreshed`, not `AlreadyFresh`) has
-    /// produced the token in use: a 401 on it is not refreshed again (§8.3: at most a gate refresh, a fetch and one retry).
+    /// Whether this collection's own gate refresh (§7.3, `Refreshed`, not `AlreadyFresh`)
+    /// has produced the token in use: a 401 on it is not refreshed again (§8.3: at most a
+    /// gate refresh, a fetch and one retry).
     gated: bool,
-    /// The store's record of the provider's active account when the collection started.
+    /// The store's record of the provider's active account, read before the live login
+    /// (`collect_usage`).
     recorded_active: Option<AccountId>,
     warnings: Vec<String>,
 }
@@ -718,10 +728,14 @@ impl Collection<'_> {
     /// account (which `add` and a switch's commit write, §9.4 step 9) changed since the
     /// collection started: then a switch committed while the fetch was in flight, and a plan
     /// made for the pre-switch role would overwrite the switch's re-plan for one cycle
-    /// (§8.3). The record is not read alone: it does not follow a login made outside tagteam
-    /// (Claude Code's `/login`), so a stale one must never outrank the live login. A removed
-    /// record keeps the live role. A switch committing between this read and the record is a
-    /// window of a few statements, left open: the next collection plans from the new role.
+    /// (§8.3). The start value is read in `collect_usage` before the live login: a switch
+    /// writes the live login before it commits the record, so no switch can fall between the
+    /// two reads unseen (one committing after the start read changes the record, and one that
+    /// committed before it is already in the live read). The record is not read alone: it
+    /// does not follow a login made outside tagteam (Claude Code's `/login`), so a stale one
+    /// must never outrank the live login. A removed record keeps the live role. A switch
+    /// committing between this read and the record is a window of a few statements, left
+    /// open: the next collection plans from the new role.
     fn active_now(&self) -> Result<bool, StoreError> {
         let recorded = self.store.active(&self.row.provider)?;
         Ok(match recorded {

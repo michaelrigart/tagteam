@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
-use tagteam_core::backoff::failure_backoff_s;
+use tagteam_core::backoff::{CAP_429_S, failure_backoff_s};
 use tagteam_core::poll::budget_next_free;
 use tagteam_core::trust::{FUTURE_STAMP_SLACK_S, is_future_stamped};
 use tagteam_core::usage::{windows_from_json, windows_to_json};
@@ -22,10 +22,10 @@ const PRUNE_LEASE: &str = "prune:usage_samples";
 
 const DAY_S: i64 = 86_400;
 
-/// The longest backoff any failure legally sets: §8.5's 429 cap (4500 s). A `backoff_until`
-/// further ahead than this plus `FUTURE_STAMP_SLACK_S` was written under a clock that ran
-/// ahead, so no legal schedule reaches it: reserving ignores it (§8.4).
-const MAX_BACKOFF_S: i64 = 4500;
+/// The longest backoff any failure legally sets: §8.5's 429 cap. A `backoff_until` further
+/// ahead than this plus `FUTURE_STAMP_SLACK_S` was written under a clock that ran ahead, so no
+/// legal schedule reaches it: reserving ignores it (§8.4).
+const MAX_BACKOFF_S: i64 = CAP_429_S;
 
 /// §8.3's `last_error` token for a request the hourly budget refused (§8.6).
 const OVER_BUDGET: &str = "over-budget";
@@ -302,8 +302,9 @@ impl Store {
     /// schedule reaches, which count as clock skew and are ignored: a `fetched_at` more than
     /// `FUTURE_STAMP_SLACK_S` ahead counts as no reading, a `next_poll_at` more than
     /// `count_window_s` plus the slack ahead counts as due, and a `backoff_until` more than
-    /// `MAX_BACKOFF_S` plus the slack ahead is no backoff (§8.4). An on-demand caller (`list`, `status`) needs the reading to be older than
-    /// `floor_s` and a poll to be due, where no plan counts as due. A scheduled caller (M3)
+    /// `MAX_BACKOFF_S` plus the slack ahead is no backoff (§8.4). An on-demand caller
+    /// (`list`, `status`) needs the reading to be older than `floor_s` and a poll to be due,
+    /// where no plan counts as due. A scheduled caller (M3)
     /// needs a poll to be due or no reading at all (§8.3's "due or stale"). An eligible
     /// account then needs a free slot in its identity's hourly budget (§8.6). Over budget, the
     /// fetch reports `over-budget`: the refusal is recorded as the collector records
@@ -369,6 +370,14 @@ impl Store {
         // The same skew leaves a `next_poll_at` further ahead than any legal plan: the longest
         // is an over-budget account's `next_free_at`, at most `count_window_s` away. Past that
         // plus the slack the poll counts as due.
+        // The longest legal plan is an over-budget `next_free_at` (`count_window_s`) or a
+        // post-429 interval with jitter (`post_429_max_s` plus `jitter_frac`); the bound below
+        // is only sound while the first covers the second.
+        debug_assert!(
+            budget.count_window_s as f64
+                >= budget.post_429_max_s as f64 * (1.0 + budget.jitter_frac),
+            "the next_poll_at skew bound must cover the longest legal plan"
+        );
         let due = next_poll_at
             .is_none_or(|t| t <= now_s || t - now_s > budget.count_window_s + FUTURE_STAMP_SLACK_S);
         let eligible = if on_demand {
