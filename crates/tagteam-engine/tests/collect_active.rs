@@ -11,9 +11,10 @@ use common::{
     token_requests, usage_bearers, usage_fixture, usage_requests, write_target_credential,
 };
 use serde_json::{Value, json};
-use tagteam_engine::collect::Collected;
+use tagteam_engine::EngineError;
+use tagteam_engine::collect::{CollectMode, Collected};
 use tagteam_engine::vault::SERVICE;
-use tagteam_provider::{Clock, Method, Provider};
+use tagteam_provider::{Clock, LockError, Method, MutationGuard, Provider};
 
 /// The live access token as §7.2 counts it expired. Only `expiresAt` changes, so the live
 /// generation is still the vault's.
@@ -354,7 +355,16 @@ fn an_unresolved_switch_journal_stops_the_active_collection_before_any_request()
     );
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
     assert_eq!(report.outcomes, [(b.clone(), Collected::Dropped)]);
-    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(
+        report.warnings,
+        [
+            "usage for the live claude-code account was not collected: an interrupted switch for claude-code could not be resolved; run `tagteam switch <account> --force` to settle it"
+        ]
+    );
+    assert!(
+        !report.warnings[0].contains("@x.co"),
+        "the warning names no email"
+    );
     assert!(
         fx.http.requests().is_empty(),
         "a's token was not sent as b's"
@@ -372,13 +382,52 @@ fn an_unresolved_switch_journal_stops_the_active_collection_before_any_request()
     );
 }
 
+#[test]
+fn a_lock_file_that_cannot_be_opened_is_the_collections_error_not_a_silent_drop() {
+    // `.mutation.lock` is a directory, so opening it for the flock fails with EISDIR: a
+    // `LockError::Io`, which is not the timeout that drops the collection. Without the
+    // distinction every `list` would skip the live account for good, with no signal.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a"); // live
+    let lock = fx.env.data_dir().join(".mutation.lock");
+    fs::remove_file(&lock).unwrap();
+    fs::create_dir(&lock).unwrap();
+    fx.script_usage(200, usage_fixture());
+
+    let result = fx.engine.collect_usage(CollectMode::OnDemand {
+        accounts: vec![a.clone()],
+    });
+
+    assert!(
+        matches!(&result, Err(EngineError::Lock(LockError::Io(_)))),
+        "{result:?}"
+    );
+    assert!(fx.http.requests().is_empty(), "nothing was sent");
+}
+
+#[test]
+#[ignore = "waits out the real 10 s mutation-lock timeout (MutationGuard::TIMEOUT)"]
+fn a_mutation_lock_held_past_its_timeout_drops_the_active_collection() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a"); // live
+    fx.script_usage(200, usage_fixture());
+    let held = MutationGuard::acquire(&fx.env, Duration::ZERO).unwrap();
+
+    let report = fx.collect(&[&a]);
+    drop(held);
+
+    assert_eq!(report.outcomes, [(a.clone(), Collected::Dropped)]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(fx.http.requests().is_empty());
+    assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    assert_eq!(fx.usage_state(&a).and_then(|s| s.fetched_at), None);
+}
+
 #[cfg(feature = "test-hooks")]
 mod hooks {
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::{Instant, SystemTime};
-
-    use tagteam_engine::collect::CollectMode;
 
     use super::*;
 
