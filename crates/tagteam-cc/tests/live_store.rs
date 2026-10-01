@@ -1575,6 +1575,107 @@ fn every_credential_entry_write_holds_the_storage_write_lock_and_releases_it() {
     );
 }
 
+/// A fence that records, at each call, whether CC's storage-write lock is held.
+fn lock_probe(lock: &Path, seen: &Mutex<Vec<bool>>) -> impl Fn() -> Result<(), ProviderError> {
+    let (lock, seen) = (lock.to_path_buf(), seen);
+    move || {
+        seen.lock().unwrap().push(lock.is_dir());
+        Ok(())
+    }
+}
+
+#[test]
+fn on_linux_the_credentials_file_alone_is_written_and_rolled_back_under_the_storage_write_lock() {
+    // §9.1, §9.4 step 10 on Linux: `.credentials.json` is the whole entry (no Keychain item, no
+    // managed-key axis). The write and the restore each hold the lock around their file
+    // writes, release it, and put the file back byte for byte while nothing else wrote it.
+    let f = fx();
+    let s = store(&f, Platform::Linux);
+    let lock = f.paths.storage_write_lock.clone();
+    let before = b"{\n  \"claudeAiOauth\": {\"accessToken\": \"at-rt-0\", \"refreshToken\": \"rt-0\"},\n  \"mcpOAuth\": {\"srv\": {\"token\": \"m0\"}}\n}\n";
+    fs::write(&f.paths.credentials_file, before).unwrap();
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    let seen = Mutex::new(Vec::new());
+    let probe = lock_probe(&lock, &seen);
+
+    let store_used = s
+        .write_credential_entry(
+            &f.env,
+            &f.paths,
+            &cc_login("rt-1", "m0"),
+            &probe,
+            &mut save_nothing,
+        )
+        .unwrap();
+
+    assert_eq!(
+        store_used,
+        SecretStore::File(f.paths.credentials_file.clone())
+    );
+    assert_eq!(
+        fs::read(&f.paths.credentials_file).unwrap(),
+        cc_login("rt-1", "m0")
+    );
+    let writes = std::mem::take(&mut *seen.lock().unwrap());
+    assert!(
+        !writes.is_empty() && writes.iter().all(|held| *held),
+        "{writes:?}"
+    );
+    assert!(!lock.exists(), "the write released the lock");
+
+    s.restore(&f.env, &f.paths, &snap, &probe).unwrap();
+
+    assert_eq!(
+        fs::read(&f.paths.credentials_file).unwrap(),
+        before,
+        "byte for byte"
+    );
+    let restores = std::mem::take(&mut *seen.lock().unwrap());
+    assert!(
+        !restores.is_empty() && restores.iter().all(|held| *held),
+        "{restores:?}"
+    );
+    assert!(!lock.exists(), "the restore released the lock");
+    assert!(
+        f.kc.items().is_empty(),
+        "no Keychain item was ever involved"
+    );
+}
+
+#[test]
+fn on_linux_a_restore_leaves_a_credentials_file_cc_wrote_since_and_names_it() {
+    let f = fx();
+    let s = store(&f, Platform::Linux);
+    fs::write(&f.paths.credentials_file, cc_login("rt-0", "m0")).unwrap();
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    fs::write(&f.paths.credentials_file, cc_wiped("m0")).unwrap(); // CC's dead-token marking
+
+    match s.restore(&f.env, &f.paths, &snap, &open) {
+        Err(ProviderError::Incomplete { failed }) => assert_eq!(
+            failed,
+            [format!(
+                "{} (changed since tagteam wrote it; left as it is)",
+                f.paths.credentials_file.display()
+            )]
+        ),
+        other => panic!("expected the file named as left, got {other:?}"),
+    }
+    assert_eq!(
+        fs::read(&f.paths.credentials_file).unwrap(),
+        cc_wiped("m0"),
+        "CC's write stands"
+    );
+    assert!(!f.paths.storage_write_lock.exists());
+}
+
 #[test]
 fn a_held_storage_write_lock_makes_every_entry_write_wait_then_time_out() {
     // §9.1: 9 s in production; this store waits 300 ms. Nothing is written, and CC's lock is

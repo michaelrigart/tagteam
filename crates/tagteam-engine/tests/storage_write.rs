@@ -185,6 +185,53 @@ fn a_rollback_leaves_a_target_cc_marked_since_and_keeps_the_row() {
 }
 
 #[test]
+fn on_linux_a_rollback_restores_the_file_untouched_and_leaves_one_cc_wrote_since() {
+    // §9.1 on Linux: `.credentials.json` is the only place of the entry. Failing right after the
+    // switch's write rolls the file back byte for byte while nothing else wrote it; once CC
+    // wrote it since, the rollback leaves CC's write and keeps the row (§9.4 step 10).
+    use tagteam_cc::live::Platform;
+    let fx = Fx::with_platform(Platform::Linux);
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live: b
+    let file = fx.paths().credentials_file;
+    let before = fs::read(&file).unwrap();
+    fx.engine.fail_at(Some("after-credential"));
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert!(matches!(err, EngineError::RolledBack(_)), "{err}");
+    assert_eq!(fs::read(&file).unwrap(), before, "byte for byte");
+    assert!(journal(&fx).is_none(), "a clean rollback leaves no row");
+    assert!(!fx.paths().storage_write_lock.exists());
+    assert_eq!(
+        fx.engine.store().unwrap().active(&fx.provider()).unwrap(),
+        Some(b)
+    );
+
+    let wiped = {
+        let mut live: Value = serde_json::from_slice(&before).unwrap();
+        cc_marks_dead(&mut live);
+        live.to_string().into_bytes()
+    };
+    let (path, cc_write) = (file.clone(), wiped.clone());
+    fx.engine.on_point(
+        "after-credential",
+        Box::new(move || fs::write(&path, &cc_write).unwrap()),
+    );
+
+    let err = fx.switch_to(&a, false).unwrap_err();
+
+    assert!(matches!(err, EngineError::RollbackFailed { .. }), "{err}");
+    assert!(
+        err.to_string().contains("changed since tagteam wrote it"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&file).unwrap(), wiped, "CC's write stands");
+    assert!(journal(&fx).is_some(), "the row stays for recovery");
+    assert!(!fx.paths().storage_write_lock.exists());
+}
+
+#[test]
 fn ctrl_c_while_the_switch_write_waits_for_cc_still_commits() {
     // §14.1: steps 7–10 are a critical span, so the storage-write wait there is not a
     // cancellation point. The signal waits for the next one.
