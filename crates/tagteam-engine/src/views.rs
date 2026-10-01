@@ -56,7 +56,8 @@ impl UsageStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageView {
     pub status: UsageStatus,
-    /// The last good reading, each window with its pace (§8.7).
+    /// The last good reading, each window with its pace (§8.7); in `statusline`'s view, which
+    /// never shows pace, every pace is `Pace::default()`.
     pub windows: Option<Vec<(Window, Pace)>>,
     /// Whether the reading may drive a decision and be shown as `usage` (§8.4).
     pub decision_grade: bool,
