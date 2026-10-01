@@ -25,8 +25,8 @@ use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::http::Method;
 use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{
-    Clock, Credential, Env, FakeClock, FakeKeychain, Identity, IdentitySurface, MutationGuard,
-    ProcessStamp, Provider, Read, ScriptedHttp,
+    Cancel, Clock, Credential, Env, FakeClock, FakeKeychain, Identity, IdentitySurface,
+    MutationGuard, ProcessStamp, Provider, Read, ScriptedHttp,
 };
 
 pub fn identity(email: &str) -> Identity {
@@ -118,9 +118,12 @@ pub fn splice_oauth_account(path: &Path, oauth_account: &Value) {
     splice_config_key(path, "oauthAccount", oauth_account);
 }
 
-/// Whether tagteam's mutation lock is free right now; takes and drops it if so.
+/// Whether tagteam's mutation lock is free right now; takes and drops it if so. It asks under a
+/// token of its own: a test that set `env`'s token would otherwise read every lock as taken.
 pub fn mutation_lock_free(env: &Env) -> bool {
-    MutationGuard::acquire(env, Duration::ZERO).is_ok()
+    let mut probe = env.clone();
+    probe.cancel = Cancel::new();
+    MutationGuard::acquire(&probe, Duration::ZERO).is_ok()
 }
 
 /// A process that is gone: its journal rows are recoverable (§12.6). Shared by `recover.rs`

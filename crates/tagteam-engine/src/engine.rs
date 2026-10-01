@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_provider::{Clock, Env, Http, MutationGuard, Provider, Read};
+use tagteam_provider::{Cancel, Clock, Env, Http, MutationGuard, Provider, Read};
 
 use crate::account_lock::AccountLock;
 use crate::error::EngineError;
@@ -64,6 +64,12 @@ impl Engine {
 
     pub fn env(&self) -> &Env {
         &self.env
+    }
+
+    /// The cancel token every cancellation point checks (§4.2, §14.1). It is the Env's, so
+    /// every clone of that Env shares it; the CLI registers its signal handlers on it.
+    pub fn cancel(&self) -> &Cancel {
+        &self.env.cancel
     }
 
     pub fn default_provider(&self) -> &ProviderId {
@@ -189,7 +195,8 @@ impl Engine {
 
     /// `mutation_guard`, with the refusal for each row whose recovery could not take its
     /// provider's live locks (`RecoveryBlocked`), by provider. With `ask_oracle` false the
-    /// rows are recovered from fingerprints alone: no network call (§7.6, §9.6).
+    /// rows are recovered from fingerprints alone: no network call (§7.6, §9.6). A recovery
+    /// interrupted at one of its lock waits ends the command with that interruption (§14.1).
     fn guard_recovering(
         &self,
         ask_oracle: bool,
@@ -217,6 +224,11 @@ impl Engine {
                 .find(|(r, _)| *r == row)
                 .map_or(&[][..], |(_, h)| h.as_slice());
             if let Err(e) = self.recover_one(&guard, &row, hint) {
+                // Interrupted at a lock wait, the recovery wrote nothing and its row stays for
+                // the next command. Reported as itself, never as a switch it could not settle.
+                if e.signal().is_some() {
+                    return Err(e);
+                }
                 tracing::warn!(provider = %row.provider, "could not recover an interrupted switch: {e}");
                 if matches!(e, EngineError::RecoveryBlocked { .. }) {
                     blocked.push((row.provider.clone(), e));
