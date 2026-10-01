@@ -1158,7 +1158,7 @@ These are decided before locking and re-checked afterwards.
 |---|---|---|---|
 | `switch` (bare) | rotation | the live account if it is managed; otherwise the store's active account | With a managed live anchor: the next switchable position after it. Otherwise: the anchor itself if it is switchable, else the first switchable position |
 | `switch --strategy next-available` | next-available | as rotation | The rotation walk, skipping candidates whose known headroom is ≤ 0 (the message names each one's binding window). Unknown headroom is never skipped (§8.2). If the walk skips every candidate: `candidates-exhausted` |
-| `switch --strategy best` | best | the live account | The candidate with the most known headroom, ties to the lower position. Switch only if it has strictly more headroom than the live account; otherwise `already-best`. If the live account's headroom is unknown, or there is no live login, switch to it with a warning. No candidate with known headroom: `usage-unavailable` |
+| `switch --strategy best` | best | the live account | The candidate with the most known headroom, ties to the lower position. Switch only if it has strictly more headroom than the live account; otherwise `already-best`. If the live account's headroom is unknown, or there is no live login, switch to it with a warning. With a managed live login whose headroom is unknown, a candidate known to be at its limit (headroom ≤ 0) is never picked; if every known candidate is, the result is `candidates-exhausted`. No candidate with known headroom: `usage-unavailable` |
 | `switch <ACCOUNT>` | direct | — | Disabled accounts are allowed as explicit targets |
 
 "Switchable" means the account has a vault credential and an `identity_json`, and is not
