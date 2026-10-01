@@ -684,7 +684,7 @@ impl Store {
     /// (§12.5) rather than installing an empty identity.
     pub fn finish_replacement(&self, id: &AccountId) -> Result<(), StoreError> {
         let mut c = self.lock();
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<Option<String>> = tx
             .query_row(
                 "SELECT replacing_meta FROM accounts WHERE id = ?1",
@@ -807,7 +807,7 @@ impl Store {
 
     pub fn move_to(&self, id: &AccountId, position: u32) -> Result<(), StoreError> {
         let mut c = self.lock();
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (provider, from): (String, u32) = tx
             .query_row(
                 "SELECT provider, position FROM accounts WHERE id = ?1",
