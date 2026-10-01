@@ -415,7 +415,15 @@ fn a_mistyped_exponent_or_decimal_places_leaves_the_window_out_instead_of_defaul
         normalize(&extra).unwrap()[2],
         spend(75.0, 15.0, 20.0, "EUR")
     );
-    for bad in [json!("3"), json!(3.0), json!(2.5), json!(-1), json!(true)] {
+    for bad in [
+        json!("3"),
+        json!(3.0),
+        json!(2.5),
+        json!(-1),
+        json!(true),
+        json!([2]),
+        json!(u64::MAX),
+    ] {
         let mut b = extra.clone();
         b["extra_usage"]["decimal_places"] = bad.clone();
         assert_eq!(keys(&normalize(&b).unwrap()), without, "{bad}");
