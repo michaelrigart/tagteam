@@ -276,7 +276,9 @@ impl Engine {
             tracing::warn!(provider = %row.provider, "recovering an interrupted switch: {w}");
         }
         // The undos are dropped, never run: undoing would write an old credential back.
-        p.clear_other_axis(&self.env, locks, &to.kind)?;
+        // Recovery's writes are a critical span (§14.1): their storage-write wait is not a
+        // cancellation point.
+        p.clear_other_axis(&self.critical_env(), locks, &to.kind)?;
         p.write_identity(&self.env, locks, Some(&identity))?;
         hooks::point(self, "recovery-before-commit")?;
         if !self.surfaces_agree(p, locks, own, established, Some(&to.identity_json)) {

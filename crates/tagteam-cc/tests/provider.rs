@@ -1,5 +1,7 @@
 use std::fs;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -13,8 +15,9 @@ use tagteam_core::usage::WindowKind;
 use tagteam_provider::http::{HttpResponse, Method, ScriptedHttp};
 use tagteam_provider::provider::TransientKind;
 use tagteam_provider::{
-    Capabilities, Credential, Env, FakeKeychain, KindTraits, LiveLocks, LockError, MutationGuard,
-    Pace, PollBudget, Provider, ProviderError, Read, SecretStore, StoredLogin, UsageResult, Window,
+    Capabilities, Credential, Env, FakeKeychain, Keychain, KeychainError, KindTraits, LiveLocks,
+    LockError, LockState, MutationGuard, Pace, PollBudget, Provider, ProviderError, Read,
+    SecretStore, StoredLogin, UsageResult, Window,
 };
 
 /// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
@@ -1175,4 +1178,180 @@ fn a_rollback_clears_the_pin_within_its_operation() {
         !paths.credentials_file.exists(),
         "a Keychain write never creates the file"
     );
+}
+
+/// Wraps a `FakeKeychain` and records, at every `upsert`/`delete`, whether CC's storage-write
+/// lock, refresh lock, legacy lock and config lock were each held at that moment (§4.3, §9.1).
+struct HeldLocksProbe {
+    inner: Arc<FakeKeychain>,
+    locks: [PathBuf; 4],
+    writes: Mutex<Vec<(String, [bool; 4])>>,
+}
+
+impl HeldLocksProbe {
+    fn record(&self, s: &str) {
+        let held = self.locks.clone().map(|l| l.is_dir());
+        self.writes.lock().unwrap().push((s.to_owned(), held));
+    }
+}
+
+impl Keychain for HeldLocksProbe {
+    fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
+        self.inner.find(s, a)
+    }
+    fn exists(&self, s: &str, a: &str) -> Read<()> {
+        self.inner.exists(s, a)
+    }
+    fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), KeychainError> {
+        self.record(s);
+        self.inner.upsert(s, a, d)
+    }
+    fn delete(&self, s: &str, a: &str) -> Result<(), KeychainError> {
+        self.record(s);
+        self.inner.delete(s, a)
+    }
+    fn lock_state(&self) -> LockState {
+        self.inner.lock_state()
+    }
+    fn unlock(&self) -> bool {
+        self.inner.unlock()
+    }
+}
+
+/// `fx()`, with the provider's Keychain behind a `HeldLocksProbe`.
+fn probed_fx() -> (Fx, Arc<HeldLocksProbe>) {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    fs::create_dir_all(env.home.join(".claude")).unwrap();
+    let paths = CcPaths::resolve(&env);
+    let kc = Arc::new(FakeKeychain::new());
+    let probe = Arc::new(HeldLocksProbe {
+        inner: kc.clone(),
+        locks: [
+            paths.storage_write_lock.clone(),
+            paths.refresh_lock.clone(),
+            paths.legacy_lock(),
+            paths.config_lock,
+        ],
+        writes: Mutex::new(Vec::new()),
+    });
+    let cc = ClaudeCode::with_store(
+        LiveStore::new(probe.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO),
+    );
+    (Fx { _d: d, env, kc, cc }, probe)
+}
+
+#[test]
+fn the_storage_write_lock_is_a_leaf_taken_only_around_each_entry_write() {
+    // §4.3, §9.1: taken only while CC's live locks are held, never by the lock stages
+    // themselves, and released after each credential entry's write, a rollback's included.
+    let (f, probe) = probed_fx();
+    let paths = CcPaths::resolve(&f.env);
+    fs::write(&paths.global_config, "{}").unwrap();
+    f.kc.put(
+        &keychain_service(&f.env, ItemKind::OAuth),
+        &keychain_account(&f.env),
+        br#"{"claudeAiOauth":{"refreshToken":"old"},"mcpOAuth":{"m":1}}"#,
+    );
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let cred =
+        f.cc.lock_credentials(&f.env, &g, Duration::from_secs(1))
+            .unwrap();
+    assert!(
+        !paths.storage_write_lock.exists(),
+        "the credential locks never take it"
+    );
+    let locks =
+        f.cc.lock_config(&f.env, cred, Duration::from_secs(1))
+            .unwrap();
+    assert!(
+        !paths.storage_write_lock.exists(),
+        "nor does the config lock"
+    );
+
+    let key = StoredLogin {
+        kind: "api_key".into(),
+        secret: b"sk-ant-api03-abcdefghijklmnopqrstuvwxyz".to_vec(),
+        identity: f.cc.token_identity("api-key-1@token.local"),
+    };
+    let undo =
+        f.cc.write_credential(&f.env, &locks, &key, &mut save_nothing)
+            .unwrap()
+            .undo;
+    assert!(!paths.storage_write_lock.exists());
+    undo.undo(&locks).unwrap();
+    assert!(!paths.storage_write_lock.exists());
+    f.cc.write_credential(
+        &f.env,
+        &locks,
+        &target(&f, "new@b.co", "rt-new"),
+        &mut save_nothing,
+    )
+    .unwrap();
+    assert!(!paths.storage_write_lock.exists());
+    drop(locks);
+
+    let writes = probe.writes.lock().unwrap().clone();
+    assert!(writes.len() >= 4, "{writes:?}");
+    assert!(
+        writes.iter().all(|(_, held)| *held == [true; 4]),
+        "a credential entry written without the storage-write lock or the live locks: {writes:?}"
+    );
+}
+
+#[test]
+fn a_write_that_finds_cc_changed_the_entry_aborts_and_leaves_everything_as_cc_left_it() {
+    // §9.1: while tagteam waits for its storage-write lock, CC changes the entry's
+    // account-scoped keys by more than a dead-token marking. tagteam's write aborts; having
+    // written nothing, it restores nothing either, so the error is the abort itself, not a
+    // failed restore.
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    fs::write(&paths.global_config, "{}").unwrap();
+    let svc = keychain_service(&f.env, ItemKind::OAuth);
+    let acct = keychain_account(&f.env);
+    f.kc.put(
+        &svc,
+        &acct,
+        br#"{"claudeAiOauth":{"refreshToken":"old"},"mcpOAuth":{"m":1}}"#,
+    );
+    let changed: &[u8] = br#"{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0},"trustedDeviceToken":"cc-device","mcpOAuth":{"m":1}}"#;
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+    fs::create_dir(&paths.storage_write_lock).unwrap(); // CC takes it
+    let (kc, cc_svc, cc_acct, lock) = (
+        f.kc.clone(),
+        svc.clone(),
+        acct.clone(),
+        paths.storage_write_lock.clone(),
+    );
+    let cc = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        kc.put(&cc_svc, &cc_acct, changed);
+        fs::remove_dir(&lock).unwrap();
+    });
+
+    let err =
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "new@b.co", "rt-new"),
+            &mut save_nothing,
+        )
+        .err()
+        .unwrap();
+    cc.join().unwrap();
+
+    assert!(
+        matches!(&err, ProviderError::EntryMoved(name) if *name == svc),
+        "{err}"
+    );
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), changed, "CC's write stands");
+    assert!(
+        f.kc.get(&keychain_service(&f.env, ItemKind::ManagedKey), &acct)
+            .is_none()
+    );
+    assert!(!paths.credentials_file.exists());
+    assert_eq!(fs::read_to_string(&paths.global_config).unwrap(), "{}");
+    assert!(!paths.storage_write_lock.exists());
 }

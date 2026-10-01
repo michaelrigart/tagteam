@@ -633,8 +633,11 @@ fn an_expired_call_leaves_no_cached_skip_to_shadow_a_later_corroboration() {
 #[cfg(feature = "test-hooks")]
 mod hooks {
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
+    use super::common::{
+        cc_holds_storage_write_from, cc_marks_dead, cc_marks_dead_and_more, cc_released,
+    };
     use super::*;
 
     #[test]
@@ -644,15 +647,17 @@ mod hooks {
         expire_live(&fx);
         fx.script_refresh(Some("rt-a2"));
         let seen = Arc::new(Mutex::new(None));
-        let (refresh, config, record) = (
+        let (refresh, config, storage_write, record) = (
             fx.paths().refresh_lock,
             fx.paths().config_lock,
+            fx.paths().storage_write_lock,
             seen.clone(),
         );
         fx.engine.on_point(
             "active-before-request",
             Box::new(move || {
-                *record.lock().unwrap() = Some((refresh.is_dir(), config.exists()));
+                *record.lock().unwrap() =
+                    Some((refresh.is_dir(), config.exists(), storage_write.exists()));
             }),
         );
 
@@ -662,8 +667,9 @@ mod hooks {
         );
         assert_eq!(
             *seen.lock().unwrap(),
-            Some((true, false)),
-            "CC's refresh lock is held; its config lock is not (§4.3)"
+            Some((true, false, false)),
+            "CC's refresh lock is held; its config lock and storage-write lock are not (§4.3, \
+             §9.1: no network call while holding it)"
         );
     }
 
@@ -753,6 +759,83 @@ mod hooks {
             "the signal waits for the next cancellation point"
         );
         assert!(!fx.paths().refresh_lock.exists() && !fx.paths().config_lock.exists());
+    }
+
+    /// §14.1, §7.5 step 5, §9.1: the successor's live write also waits for CC's storage-write
+    /// lock inside the critical span, so a Ctrl-C during that wait never leaves CC on the
+    /// generation the request consumed.
+    #[test]
+    fn a_signal_while_the_successor_waits_for_the_storage_write_lock_still_publishes_it() {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        let ctrl_c = Some(Duration::from_millis(100));
+        let cc = cc_holds_storage_write_from(&fx, "active-before-publish", ctrl_c, |_| {});
+
+        let out = active(&fx, ActiveTrigger::Expired);
+        let ended = Instant::now();
+        let released = cc_released(&cc);
+
+        assert_eq!(out.unwrap(), ActiveOutcome::Refreshed);
+        assert!(ended > released, "the live write waited for CC's lock");
+        assert_eq!(
+            fx.live_refresh_token().as_deref(),
+            Some("rt-a2"),
+            "CC holds the successor"
+        );
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+        assert_eq!(fx.engine.cancel().requested(), Some(libc::SIGINT));
+        assert!(!fx.paths().storage_write_lock.exists());
+    }
+
+    /// §9.1: CC marks the consumed generation dead while the successor waits for the
+    /// storage-write lock. A marking is no conflict: the successor is published over it, and CC
+    /// ends on the newest generation (§7.5 step 5).
+    #[test]
+    fn a_live_token_cc_marks_dead_while_the_successor_waits_gets_the_successor() {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        let cc = cc_holds_storage_write_from(&fx, "active-before-publish", None, cc_marks_dead);
+
+        let out = active(&fx, ActiveTrigger::Expired);
+        let ended = Instant::now();
+        let released = cc_released(&cc);
+
+        assert_eq!(out.unwrap(), ActiveOutcome::Refreshed);
+        assert!(ended > released, "the live write waited for CC's lock");
+        assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+        assert!(!fx.paths().storage_write_lock.exists());
+    }
+
+    /// §9.1: CC changes the live entry's account-scoped keys by more than a marking while the
+    /// successor waits. The live write aborts rather than overwrite it; the successor stays in
+    /// the vault, not published (§7.5 step 5).
+    #[test]
+    fn a_live_entry_cc_changes_while_the_successor_waits_is_left_as_cc_wrote_it() {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        let cc =
+            cc_holds_storage_write_from(&fx, "active-before-publish", None, cc_marks_dead_and_more);
+
+        let out = active(&fx, ActiveTrigger::Expired);
+        let ended = Instant::now();
+        let released = cc_released(&cc);
+
+        assert_eq!(out.unwrap(), ActiveOutcome::PersistedNotPublished);
+        assert!(ended > released, "the live write waited for CC's lock");
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+        assert_eq!(
+            fx.live_credential().unwrap()["trustedDeviceToken"],
+            json!("cc-device"),
+            "CC's write stands"
+        );
+        assert!(!fx.paths().storage_write_lock.exists());
     }
 
     /// Makes the credential lock look taken over once the response arrives (§9.1), so the

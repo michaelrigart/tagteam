@@ -1,7 +1,9 @@
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
@@ -903,13 +905,17 @@ fn restore_continues_past_a_non_lock_failure_and_skips_an_already_matching_entry
     // One managed-key item already matches its snapshot and must receive no write at
     // all — proving the skip — while the OAuth items prove the loop does not stop at
     // the first failure.
-    f.kc.put(&oauth[0], &acct, b"orig-primary");
-    f.kc.put(&oauth[1], &acct, b"orig-plain");
+    let orig_primary = br#"{"claudeAiOauth":{"refreshToken":"orig-primary"}}"#;
+    let orig_plain = br#"{"claudeAiOauth":{"refreshToken":"orig-plain"}}"#;
+    f.kc.put(&oauth[0], &acct, orig_primary);
+    f.kc.put(&oauth[1], &acct, orig_plain);
     f.kc.put(&managed[0], &acct, b"unchanged-managed");
     let snap = s.snapshot(&f.env, &f.paths).unwrap();
 
-    f.kc.put(&oauth[0], &acct, b"target-primary");
-    f.kc.put(&oauth[1], &acct, b"target-plain");
+    // This operation's own write changes both OAuth items: a restore puts back only what the
+    // operation wrote (§9.1). With nothing machine-shared in them, the clear deletes them.
+    s.clear_credential_account_keys(&f.env, &f.paths, &open)
+        .unwrap();
     // `managed[0]` is left untouched, so it still equals its snapshot.
 
     // The primary item is restored first (managed items come first in `restore`, but
@@ -923,13 +929,13 @@ fn restore_continues_past_a_non_lock_failure_and_skips_an_already_matching_entry
         other => panic!("expected Incomplete naming {}, got {other:?}", oauth[0]),
     }
     assert_eq!(
-        f.kc.get(&oauth[0], &acct).unwrap(),
-        b"target-primary",
+        f.kc.get(&oauth[0], &acct),
+        None,
         "the failed restore must leave the target value in place, not corrupt it"
     );
     assert_eq!(
         f.kc.get(&oauth[1], &acct).unwrap(),
-        b"orig-plain",
+        orig_plain,
         "the second item must still be restored after the first one failed"
     );
     assert_eq!(f.kc.get(&managed[0], &acct).unwrap(), b"unchanged-managed");
@@ -1254,10 +1260,17 @@ fn restore_rewrites_a_matching_credentials_file_when_only_the_item_differed() {
         .modified()
         .unwrap();
 
-    // Change only the Keychain item, directly: the file stays byte-identical to the
-    // snapshot, so a naive "skip when it already matches" would never bump it.
+    // This operation's write changes only the Keychain item: its fence trips before the
+    // hot-reload rewrite, so the file stays byte-identical to the snapshot, and a naive "skip
+    // when it already matches" would never bump it.
     std::thread::sleep(Duration::from_millis(10));
-    f.kc.put(&svc, &acct, b"changed-item");
+    let cf = CountingFence::new(1);
+    let fence = || cf.check();
+    assert!(
+        s.write_credential_entry(&f.env, &f.paths, b"changed-item", &fence, &mut save_nothing)
+            .is_err()
+    );
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), b"changed-item");
 
     s.restore(&f.env, &f.paths, &snap, &open).unwrap();
 
@@ -1281,7 +1294,8 @@ fn restore_never_creates_a_credentials_file_the_snapshot_says_was_absent() {
     f.kc.put(&svc, &acct, b"orig-item");
     // No credentials file at snapshot time.
     let snap = s.snapshot(&f.env, &f.paths).unwrap();
-    f.kc.put(&svc, &acct, b"changed-item");
+    s.write_credential_entry(&f.env, &f.paths, b"changed-item", &open, &mut save_nothing)
+        .unwrap();
 
     s.restore(&f.env, &f.paths, &snap, &open).unwrap();
 
@@ -1333,7 +1347,8 @@ fn restore_forces_the_credentials_file_to_0600() {
     let s = store(&f, Platform::MacOs);
     fs::write(&f.paths.credentials_file, "orig-file").unwrap();
     let snap = s.snapshot(&f.env, &f.paths).unwrap();
-    fs::write(&f.paths.credentials_file, "tampered").unwrap();
+    s.write_credential_entry(&f.env, &f.paths, b"tampered", &open, &mut save_nothing)
+        .unwrap();
     fs::set_permissions(&f.paths.credentials_file, fs::Permissions::from_mode(0o644)).unwrap();
 
     s.restore(&f.env, &f.paths, &snap, &open).unwrap();
@@ -1365,4 +1380,794 @@ fn a_symlinked_credentials_file_stays_a_symlink_with_its_target_at_0600() {
     );
     assert_eq!(fs::read(&real).unwrap(), b"{\"a\":1}");
     assert_eq!(mode_of(&real), 0o600);
+}
+
+// --- CC's storage-write lock (§9.1) ----------------------------------------------
+
+/// Wraps a `FakeKeychain` and records, at every `upsert`/`delete`, the item and whether CC's
+/// storage-write lock was held at that moment (§9.1).
+struct LockProbeKeychain {
+    inner: Arc<FakeKeychain>,
+    lock: PathBuf,
+    writes: Mutex<Vec<(String, bool)>>,
+}
+
+impl LockProbeKeychain {
+    fn new(inner: Arc<FakeKeychain>, lock: PathBuf) -> Self {
+        Self {
+            inner,
+            lock,
+            writes: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn writes(&self) -> Vec<(String, bool)> {
+        self.writes.lock().unwrap().clone()
+    }
+
+    fn record(&self, s: &str) {
+        let held = self.lock.is_dir();
+        self.writes.lock().unwrap().push((s.to_owned(), held));
+    }
+}
+
+impl Keychain for LockProbeKeychain {
+    fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
+        self.inner.find(s, a)
+    }
+    fn exists(&self, s: &str, a: &str) -> Read<()> {
+        self.inner.exists(s, a)
+    }
+    fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), KeychainError> {
+        self.record(s);
+        self.inner.upsert(s, a, d)
+    }
+    fn delete(&self, s: &str, a: &str) -> Result<(), KeychainError> {
+        self.record(s);
+        self.inner.delete(s, a)
+    }
+    fn lock_state(&self) -> LockState {
+        self.inner.lock_state()
+    }
+    fn unlock(&self) -> bool {
+        self.inner.unlock()
+    }
+}
+
+/// A live OAuth entry as CC leaves it: `rt`'s login, and an MCP server's token `mcp`, which is
+/// machine-shared (Appendix A.4).
+fn cc_login(rt: &str, mcp: &str) -> Vec<u8> {
+    json!({
+        "claudeAiOauth": {"accessToken": format!("at-{rt}"), "refreshToken": rt},
+        "mcpOAuth": {"srv": {"token": mcp}}
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// CC's dead-token marking of `cc_login(_, mcp)` (Appendix A.3): both tokens empty and
+/// `expiresAt` 0. CC makes it without the credential locks, and it is no conflict (§9.1).
+fn cc_wiped(mcp: &str) -> Vec<u8> {
+    json!({
+        "claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0},
+        "mcpOAuth": {"srv": {"token": mcp}}
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// A marking together with another account-scoped change, a new `trustedDeviceToken`: not a
+/// marking alone, so a write that finds it aborts (§9.1).
+fn cc_wiped_and_more(mcp: &str) -> Vec<u8> {
+    json!({
+        "claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0},
+        "trustedDeviceToken": "cc-device",
+        "mcpOAuth": {"srv": {"token": mcp}}
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Claude Code holding its storage-write lock (§9.1): it takes the lock now, runs `write` 300 ms
+/// later, then lets go. The thread returns the instant just before it let go.
+fn cc_writes_under_the_lock(
+    lock: &Path,
+    write: impl FnOnce() + Send + 'static,
+) -> thread::JoinHandle<Instant> {
+    fs::create_dir(lock).unwrap();
+    let lock = lock.to_path_buf();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        write();
+        let at = Instant::now();
+        fs::remove_dir(&lock).unwrap();
+        at
+    })
+}
+
+/// Runs `write` while CC holds the storage-write lock for good: it must wait at least the
+/// store's 300 ms and end with a timeout naming the lock.
+fn times_out<T: std::fmt::Debug>(
+    lock: &Path,
+    what: &str,
+    write: impl FnOnce() -> Result<T, ProviderError>,
+) {
+    let start = Instant::now();
+    match write() {
+        Err(ProviderError::Lock(LockError::Timeout(path))) => assert_eq!(path, lock, "{what}"),
+        other => panic!("{what}: expected a timeout on the storage-write lock, got {other:?}"),
+    }
+    assert!(
+        start.elapsed() >= Duration::from_millis(300),
+        "{what} gave up without waiting"
+    );
+}
+
+#[test]
+fn every_credential_entry_write_holds_the_storage_write_lock_and_releases_it() {
+    // §9.1, B #61: every write and delete of a CC credential entry holds the lock, a restore's
+    // included, and releases it when the write returns.
+    let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
+    let lock = f.paths.storage_write_lock.clone();
+    let probe = Arc::new(LockProbeKeychain::new(f.kc.clone(), lock.clone()));
+    let s = LiveStore::new(probe.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
+    let (svc, acct) = oauth_svc(&f);
+    let plain = &read_services(&f.env, ItemKind::OAuth)[1];
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    f.kc.put(plain, &acct, &cc_login("rt-old", "m0"));
+    fs::write(&f.paths.credentials_file, cc_login("rt-0", "m0")).unwrap();
+    fs::write(&f.paths.global_config, "{}").unwrap();
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    let released = |what: &str| assert!(!lock.exists(), "{what} left the lock behind");
+
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    released("an OAuth write and its hot-reload rewrite");
+    f.kc.set_fail_write(&svc, true);
+    let mut reported_under_the_lock = Vec::new();
+    let mut report = |_: &[u8]| {
+        reported_under_the_lock.push(lock.is_dir());
+        Ok(())
+    };
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-2", "m0"),
+        &open,
+        &mut report,
+    )
+    .unwrap();
+    f.kc.set_fail_write(&svc, false);
+    released("a file fallback");
+    s.clear_credential_account_keys(&f.env, &f.paths, &open)
+        .unwrap();
+    released("an OAuth clear");
+    s.write_managed_key(
+        &f.env,
+        &f.paths,
+        b"sk-ant-api03-0123456789abcdefghijKLMNOPQRST",
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    released("a managed-key write");
+    s.clear_managed_key(&f.env, &f.paths, &open).unwrap();
+    released("a managed-key delete");
+    s.restore(&f.env, &f.paths, &snap, &open).unwrap();
+    released("a restore");
+
+    assert_eq!(
+        reported_under_the_lock,
+        [true, true],
+        "a fallback reports both items it deletes under the lock"
+    );
+    let writes = probe.writes();
+    assert!(writes.len() >= 8, "{writes:?}");
+    assert!(
+        writes.iter().all(|(_, held)| *held),
+        "a Keychain write without the storage-write lock: {writes:?}"
+    );
+}
+
+#[test]
+fn a_held_storage_write_lock_makes_every_entry_write_wait_then_time_out() {
+    // §9.1: 9 s in production; this store waits 300 ms. Nothing is written, and CC's lock is
+    // left alone.
+    let f = fx();
+    let s = store(&f, Platform::MacOs).with_storage_write_timeout(Duration::from_millis(300));
+    let lock = f.paths.storage_write_lock.clone();
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    fs::write(&f.paths.global_config, "{}").unwrap();
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    let items = f.kc.items();
+    fs::create_dir(&lock).unwrap(); // CC holds it, freshly
+
+    times_out(&lock, "an OAuth write", || {
+        s.write_credential_entry(
+            &f.env,
+            &f.paths,
+            &cc_login("rt-2", "m0"),
+            &open,
+            &mut save_nothing,
+        )
+    });
+    times_out(&lock, "an OAuth clear", || {
+        s.clear_credential_account_keys(&f.env, &f.paths, &open)
+    });
+    times_out(&lock, "a managed-key write", || {
+        s.write_managed_key(
+            &f.env,
+            &f.paths,
+            b"sk-ant-api03-0123456789abcdefghijKLMNOPQRST",
+            &open,
+            &mut save_nothing,
+        )
+    });
+    times_out(&lock, "a managed-key delete", || {
+        s.clear_managed_key(&f.env, &f.paths, &open)
+    });
+    // The managed-key write's approval lands in the config first, as before (§9.4 step 7);
+    // a switch's rollback restores it. No credential entry was written.
+    assert_eq!(f.kc.items(), items, "no Keychain item was written");
+    assert!(!f.paths.credentials_file.exists());
+
+    // A restore waits for each entry this operation wrote, here the OAuth entry only, and
+    // names the one it could not restore.
+    let start = Instant::now();
+    match s.restore(&f.env, &f.paths, &snap, &open) {
+        Err(ProviderError::Incomplete { failed }) => {
+            assert_eq!(failed.len(), 1, "{failed:?}");
+            assert!(
+                failed[0].starts_with(&svc) && failed[0].contains(".storage-write"),
+                "{failed:?}"
+            );
+        }
+        other => panic!("expected the OAuth entry left unrestored, got {other:?}"),
+    }
+    assert!(start.elapsed() >= Duration::from_millis(300));
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), cc_login("rt-1", "m0"));
+    assert!(lock.is_dir(), "CC's lock is left alone");
+}
+
+#[test]
+fn a_write_waits_for_cc_and_keeps_the_machine_shared_keys_cc_wrote_meanwhile() {
+    // §9.1: the machine-shared keys are taken from the read under the lock, so CC's write made
+    // since tagteam's earlier read is never lost (B #61).
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    s.snapshot(&f.env, &f.paths).unwrap(); // tagteam's read under the credential locks
+    let (kc, cc_svc, cc_acct) = (f.kc.clone(), svc.clone(), acct.clone());
+    let cc = cc_writes_under_the_lock(&f.paths.storage_write_lock, move || {
+        kc.put(&cc_svc, &cc_acct, &cc_login("rt-0", "m1")) // CC refreshed its MCP token
+    });
+
+    // Composed from the earlier read, so it carries the old MCP token.
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    let ended = Instant::now();
+    let released = cc.join().unwrap();
+
+    assert!(ended > released, "the write waited for CC's lock");
+    assert_eq!(
+        json_of(&f.kc.get(&svc, &acct).unwrap()),
+        json_of(&cc_login("rt-1", "m1")),
+        "the target's login, with the MCP token CC wrote meanwhile"
+    );
+    assert!(!f.paths.storage_write_lock.exists());
+}
+
+#[test]
+fn a_write_after_cc_changed_the_account_scoped_keys_aborts_and_writes_nothing() {
+    // §9.1: CC changes the account-scoped keys under the credential locks tagteam holds only by
+    // refreshing, and outside them only by its dead-token marking. Any other change found under
+    // the storage-write lock aborts the write: here a marking plus a new `trustedDeviceToken`.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    fs::write(&f.paths.credentials_file, cc_login("rt-0", "m0")).unwrap();
+    s.snapshot(&f.env, &f.paths).unwrap();
+    let (kc, cc_svc, cc_acct) = (f.kc.clone(), svc.clone(), acct.clone());
+    let cc = cc_writes_under_the_lock(&f.paths.storage_write_lock, move || {
+        kc.put(&cc_svc, &cc_acct, &cc_wiped_and_more("m0"))
+    });
+
+    let written = s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    );
+    cc.join().unwrap();
+
+    match written {
+        Err(ProviderError::EntryMoved(name)) => assert_eq!(name, svc),
+        other => panic!("expected the write to abort, got {other:?}"),
+    }
+    // A clear of the same entry aborts the same way.
+    assert!(matches!(
+        s.clear_credential_account_keys(&f.env, &f.paths, &open),
+        Err(ProviderError::EntryMoved(_))
+    ));
+    assert_eq!(
+        f.kc.get(&svc, &acct).unwrap(),
+        cc_wiped_and_more("m0"),
+        "CC's write stands"
+    );
+    assert_eq!(
+        fs::read(&f.paths.credentials_file).unwrap(),
+        cc_login("rt-0", "m0"),
+        "nothing was written, the hot-reload file included"
+    );
+    assert!(!f.paths.storage_write_lock.exists());
+}
+
+#[test]
+fn a_write_goes_ahead_over_cc_s_dead_token_marking_and_keeps_cc_s_mcp_token() {
+    // §9.1: a marking is no conflict. It holds no secret, and the writer holds the generation
+    // CC marked or a newer one. The machine-shared keys still come from the read under the
+    // lock.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    s.snapshot(&f.env, &f.paths).unwrap();
+    let (kc, cc_svc, cc_acct) = (f.kc.clone(), svc.clone(), acct.clone());
+    let cc = cc_writes_under_the_lock(&f.paths.storage_write_lock, move || {
+        kc.put(&cc_svc, &cc_acct, &cc_wiped("m1"))
+    });
+
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    let ended = Instant::now();
+    let released = cc.join().unwrap();
+
+    assert!(ended > released, "the write waited for CC's lock");
+    assert_eq!(
+        json_of(&f.kc.get(&svc, &acct).unwrap()),
+        json_of(&cc_login("rt-1", "m1")),
+        "the target's login over CC's marking, with the MCP token CC wrote"
+    );
+}
+
+#[test]
+fn a_restore_leaves_an_entry_changed_since_tagteam_wrote_it_and_names_it() {
+    // A restore puts a place back only while it holds exactly what tagteam last wrote there.
+    // CC's write since stays as CC wrote it, whatever it changed: account-scoped keys, its
+    // dead-token marking alone, or only an MCP token. The restore names the place and still
+    // restores everything else, here `~/.claude.json`.
+    for cc in [
+        cc_wiped_and_more("m0"),
+        cc_wiped("m1"),
+        cc_login("rt-1", "m1"),
+    ] {
+        let f = fx();
+        let s = store(&f, Platform::MacOs);
+        let (svc, acct) = oauth_svc(&f);
+        f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+        fs::write(&f.paths.global_config, "{\"a\": 1}").unwrap();
+        let snap = s.snapshot(&f.env, &f.paths).unwrap();
+        s.write_credential_entry(
+            &f.env,
+            &f.paths,
+            &cc_login("rt-1", "m0"),
+            &open,
+            &mut save_nothing,
+        )
+        .unwrap();
+        config::splice_key(&f.paths.global_config, "b", Some(&json!(2)), &open).unwrap();
+        f.kc.put(&svc, &acct, &cc);
+
+        match s.restore(&f.env, &f.paths, &snap, &open) {
+            Err(ProviderError::Incomplete { failed }) => assert_eq!(
+                failed,
+                [format!(
+                    "{svc} (changed since tagteam wrote it; left as it is)"
+                )]
+            ),
+            other => panic!("expected the item named as left, got {other:?}"),
+        }
+        assert_eq!(f.kc.get(&svc, &acct).unwrap(), cc, "CC's write stands");
+        assert_eq!(fs::read(&f.paths.global_config).unwrap(), b"{\"a\": 1}");
+    }
+}
+
+#[test]
+fn a_restore_leaves_the_whole_entry_once_cc_wrote_to_an_item_tagteam_created() {
+    // Codex rounds 6 and 7: the login is in the file, with no Keychain item. tagteam's write
+    // creates the item and mirrors the file; CC then refreshes its MCP token in the item, the
+    // only place that holds it. The item stays as CC wrote it, and the file as tagteam wrote
+    // it: CC keeps reading the one entry it wrote to.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    fs::write(&f.paths.credentials_file, cc_login("rt-0", "m0")).unwrap(); // no item
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    let mirrored = fs::read(&f.paths.credentials_file).unwrap();
+    f.kc.put(&svc, &acct, &cc_login("rt-1", "m1")); // CC refreshed its MCP token
+
+    match s.restore(&f.env, &f.paths, &snap, &open) {
+        Err(ProviderError::Incomplete { failed }) => assert_eq!(
+            failed,
+            [format!(
+                "{svc} (changed since tagteam wrote it; left as it is)"
+            )]
+        ),
+        other => panic!("expected the item named as left, got {other:?}"),
+    }
+    assert_eq!(
+        f.kc.get(&svc, &acct).unwrap(),
+        cc_login("rt-1", "m1"),
+        "CC's write stands"
+    );
+    assert_eq!(fs::read(&f.paths.credentials_file).unwrap(), mirrored);
+}
+
+#[test]
+fn a_restore_puts_nothing_back_in_front_of_a_place_cc_changed() {
+    // tagteam's write fell back: it wrote the file and deleted the item. CC then wrote the file,
+    // its own Keychain write failing too. Putting the item back would hide CC's write, since a
+    // reader tries the item first: the whole entry stays as it is, and the file is named.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    f.kc.set_fail_write(&svc, true);
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    f.kc.set_fail_write(&svc, false);
+    fs::write(&f.paths.credentials_file, cc_login("rt-1", "m1")).unwrap(); // CC's write
+
+    match s.restore(&f.env, &f.paths, &snap, &open) {
+        Err(ProviderError::Incomplete { failed }) => assert_eq!(
+            failed,
+            [format!(
+                "{} (changed since tagteam wrote it; left as it is)",
+                f.paths.credentials_file.display()
+            )]
+        ),
+        other => panic!("expected the file named as left, got {other:?}"),
+    }
+    assert_eq!(f.kc.get(&svc, &acct), None, "no item hides CC's write");
+    assert_eq!(
+        fs::read(&f.paths.credentials_file).unwrap(),
+        cc_login("rt-1", "m1")
+    );
+}
+
+#[test]
+fn a_restore_leaves_a_place_cc_wrote_between_two_of_tagteam_s_writes() {
+    // CC refreshed its MCP token in the item between two of tagteam's writes, and the second
+    // carried it on. The item holds exactly what tagteam last wrote, but what it held before
+    // tagteam's first write predates CC's token: putting that back would lose the token, so
+    // the item is left and named.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    f.kc.put(&svc, &acct, &cc_login("rt-1", "m1")); // CC refreshed its MCP token
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-2", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    let last = f.kc.get(&svc, &acct).unwrap();
+
+    match s.restore(&f.env, &f.paths, &snap, &open) {
+        Err(ProviderError::Incomplete { failed }) => assert_eq!(
+            failed,
+            [format!(
+                "{svc} (changed since tagteam wrote it; left as it is)"
+            )]
+        ),
+        other => panic!("expected the item named as left, got {other:?}"),
+    }
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), last);
+}
+
+#[test]
+fn a_restore_leaves_alone_an_entry_this_operation_never_wrote() {
+    // A restore undoes this operation's writes only: CC's change to an entry tagteam did not
+    // write is neither overwritten nor a failure.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    let managed = keychain_service(&f.env, ItemKind::ManagedKey);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    fs::write(&f.paths.global_config, "{}").unwrap();
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    s.write_managed_key(
+        &f.env,
+        &f.paths,
+        b"sk-ant-api03-0123456789abcdefghijKLMNOPQRST",
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    f.kc.put(&svc, &acct, &cc_wiped("m0"));
+
+    s.restore(&f.env, &f.paths, &snap, &open).unwrap();
+
+    assert_eq!(f.kc.get(&managed, &acct), None, "the managed key is undone");
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), cc_wiped("m0"));
+}
+
+#[test]
+fn a_signal_ends_a_writes_wait_for_the_storage_write_lock_but_never_a_restores() {
+    // §9.1, §14.1: the wait is a cancellation point for a write given a token that is set; a
+    // restore is a rollback, so it waits under a token nothing sets and runs to completion.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let lock = f.paths.storage_write_lock.clone();
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    fs::create_dir(&lock).unwrap(); // CC holds it
+    let cancel = f.env.cancel.clone();
+    let ctrl_c = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        cancel.request(libc::SIGINT);
+    });
+
+    let start = Instant::now();
+    let written = s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-2", "m0"),
+        &open,
+        &mut save_nothing,
+    );
+    ctrl_c.join().unwrap();
+
+    match written {
+        Err(ProviderError::Lock(LockError::Interrupted { path, signal })) => {
+            assert_eq!((path, signal), (lock.clone(), libc::SIGINT))
+        }
+        other => panic!("expected an interrupted wait, got {other:?}"),
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "not the 9 s budget"
+    );
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), cc_login("rt-1", "m0"));
+    assert!(lock.is_dir(), "CC's lock is left alone");
+
+    let cc = cc_lets_go_soon(&lock);
+    s.restore(&f.env, &f.paths, &snap, &open).unwrap();
+    cc.join().unwrap();
+    assert_eq!(
+        f.kc.get(&svc, &acct).unwrap(),
+        cc_login("rt-0", "m0"),
+        "the restore waited for CC with the signal set, and ran"
+    );
+}
+
+/// CC letting go of a storage-write lock it holds, 300 ms from now.
+fn cc_lets_go_soon(lock: &Path) -> thread::JoinHandle<()> {
+    let lock = lock.to_path_buf();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(300));
+        fs::remove_dir(&lock).unwrap();
+    })
+}
+
+/// `fx()` with an explicit `CLAUDE_CONFIG_DIR=~/.claude`: readers also try the unsuffixed item
+/// (Appendix A.2), so the OAuth entry has a second item. Returns it with its service.
+fn fx_with_fallback_item() -> (Fx, String) {
+    let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
+    let plain = read_services(&f.env, ItemKind::OAuth)[1].clone();
+    (f, plain)
+}
+
+#[test]
+fn a_clear_aborts_when_another_writer_changed_a_fallback_item() {
+    // §9.1 at every place a write overwrites or deletes: the second item a reader tries changed
+    // while tagteam waited for the lock, so the clear touches no place.
+    let (f, plain) = fx_with_fallback_item();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    f.kc.put(&plain, &acct, &cc_login("rt-0", "m0"));
+    s.snapshot(&f.env, &f.paths).unwrap();
+    let (kc, other, other_acct) = (f.kc.clone(), plain.clone(), acct.clone());
+    let cc = cc_writes_under_the_lock(&f.paths.storage_write_lock, move || {
+        kc.put(&other, &other_acct, &cc_login("rt-other", "m0"))
+    });
+
+    let cleared = s.clear_credential_account_keys(&f.env, &f.paths, &open);
+    cc.join().unwrap();
+
+    match cleared {
+        Err(ProviderError::EntryMoved(name)) => assert_eq!(name, plain),
+        other => panic!("expected the clear to abort, got {other:?}"),
+    }
+    assert_eq!(f.kc.get(&plain, &acct).unwrap(), cc_login("rt-other", "m0"));
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), cc_login("rt-0", "m0"));
+}
+
+#[test]
+fn a_clear_goes_ahead_over_cc_s_marking_of_a_fallback_item() {
+    // §9.1: a marking is no conflict at any place, the second item included.
+    let (f, plain) = fx_with_fallback_item();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    f.kc.put(&plain, &acct, &cc_login("rt-0", "m0"));
+    s.snapshot(&f.env, &f.paths).unwrap();
+    let (kc, other, other_acct) = (f.kc.clone(), plain.clone(), acct.clone());
+    let cc = cc_writes_under_the_lock(&f.paths.storage_write_lock, move || {
+        kc.put(&other, &other_acct, &cc_wiped("m1"))
+    });
+
+    s.clear_credential_account_keys(&f.env, &f.paths, &open)
+        .unwrap();
+    let ended = Instant::now();
+    let released = cc.join().unwrap();
+
+    assert!(ended > released, "the clear waited for CC's lock");
+    for (place, mcp) in [(&svc, "m0"), (&plain, "m1")] {
+        assert_eq!(
+            json_of(&f.kc.get(place, &acct).unwrap()),
+            json!({"mcpOAuth": {"srv": {"token": mcp}}}),
+            "{place} keeps only its own machine-shared keys"
+        );
+    }
+}
+
+#[test]
+fn a_write_aborts_when_another_writer_changed_the_credentials_file() {
+    // The hot-reload rewrite would overwrite the file, so it is checked like the item.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    fs::write(&f.paths.credentials_file, cc_login("rt-0", "m0")).unwrap();
+    s.snapshot(&f.env, &f.paths).unwrap();
+    let file = f.paths.credentials_file.clone();
+    let cc = cc_writes_under_the_lock(&f.paths.storage_write_lock, move || {
+        fs::write(&file, cc_login("rt-other", "m0")).unwrap()
+    });
+
+    let written = s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    );
+    cc.join().unwrap();
+
+    match written {
+        Err(ProviderError::EntryMoved(name)) => {
+            assert_eq!(name, f.paths.credentials_file.display().to_string())
+        }
+        other => panic!("expected the write to abort, got {other:?}"),
+    }
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), cc_login("rt-0", "m0"));
+    assert_eq!(
+        fs::read(&f.paths.credentials_file).unwrap(),
+        cc_login("rt-other", "m0")
+    );
+}
+
+#[test]
+fn a_write_goes_ahead_over_a_marking_of_the_credentials_file() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    fs::write(&f.paths.credentials_file, cc_login("rt-0", "m0")).unwrap();
+    s.snapshot(&f.env, &f.paths).unwrap();
+    let file = f.paths.credentials_file.clone();
+    let cc = cc_writes_under_the_lock(&f.paths.storage_write_lock, move || {
+        fs::write(&file, cc_wiped("m0")).unwrap()
+    });
+
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &open,
+        &mut save_nothing,
+    )
+    .unwrap();
+    let ended = Instant::now();
+    let released = cc.join().unwrap();
+
+    assert!(ended > released, "the write waited for CC's lock");
+    let item = f.kc.get(&svc, &acct).unwrap();
+    assert_eq!(json_of(&item), json_of(&cc_login("rt-1", "m0")));
+    assert_eq!(
+        fs::read(&f.paths.credentials_file).unwrap(),
+        item,
+        "the file mirrors the item again"
+    );
+}
+
+#[test]
+fn a_restore_puts_each_place_back_byte_for_byte() {
+    // Each place goes back to exactly what it held before tagteam changed it, its own
+    // machine-shared keys included: the item and the file hold different MCP tokens, and a
+    // clear keeps each one's. Nothing else wrote in between.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "item"));
+    fs::write(&f.paths.credentials_file, cc_login("rt-0", "file")).unwrap();
+    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    s.clear_credential_account_keys(&f.env, &f.paths, &open)
+        .unwrap();
+
+    s.restore(&f.env, &f.paths, &snap, &open).unwrap();
+
+    assert_eq!(f.kc.get(&svc, &acct).unwrap(), cc_login("rt-0", "item"));
+    assert_eq!(
+        fs::read(&f.paths.credentials_file).unwrap(),
+        cc_login("rt-0", "file")
+    );
 }

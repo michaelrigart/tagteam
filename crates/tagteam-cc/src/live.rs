@@ -1,6 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -9,14 +10,16 @@ use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
 use tagteam_provider::{
-    BeforeFallback, Credential, DoomedEntry, Env, Keychain, ProviderError, Read, SecretStore,
+    BeforeFallback, Cancel, Credential, DoomedEntry, Env, Keychain, MkdirLock, ProviderError, Read,
+    SecretStore,
 };
 
 use crate::config::{self, read_bytes};
+use crate::locks;
 use crate::naming::{ItemKind, keychain_account, keychain_service, read_services};
 use crate::paths::CcPaths;
 use crate::provider::CONFIG_REMEDY;
-use crate::shape::machine_shared_only;
+use crate::shape::{MACHINE_SHARED_KEYS, machine_shared_only};
 
 /// Checked immediately before every protected mutation (§9.1). Production passes the live
 /// locks' ownership check, so a holder that lost its lock stops before writing anything.
@@ -24,6 +27,135 @@ pub type Fence<'a> = &'a dyn Fn() -> Result<(), ProviderError>;
 
 /// One Keychain item's prior value, for `Snapshot`'s item lists.
 type ItemSnapshot = (String, Option<Vec<u8>>);
+
+/// The account-scoped part of a credential entry (§9.1, Appendix A.4): every key but the
+/// machine-shared ones. Bytes that are not a JSON object, such as an API key, count whole. An
+/// absent entry and one holding only machine-shared keys have none. It holds secrets, so it has
+/// no `Debug`.
+#[derive(Clone, PartialEq)]
+enum AccountPart {
+    Keys(Map<String, Value>),
+    Raw(Vec<u8>),
+}
+
+impl AccountPart {
+    fn of(bytes: Option<&[u8]>) -> Self {
+        let Some(bytes) = bytes else {
+            return AccountPart::Keys(Map::new());
+        };
+        match object(bytes) {
+            Some(mut o) => {
+                for k in MACHINE_SHARED_KEYS {
+                    o.shift_remove(k);
+                }
+                AccountPart::Keys(o)
+            }
+            None => AccountPart::Raw(bytes.to_vec()),
+        }
+    }
+
+    /// This part as Claude Code's dead-token marking leaves it (§9.1, Appendix A.3): in
+    /// `claudeAiOauth`, both tokens empty and `expiresAt` 0, every other key as it was. `None`
+    /// when there is no `claudeAiOauth` object to mark.
+    fn marked(&self) -> Option<AccountPart> {
+        let AccountPart::Keys(keys) = self else {
+            return None;
+        };
+        let mut keys = keys.clone();
+        let Some(Value::Object(oauth)) = keys.get_mut("claudeAiOauth") else {
+            return None;
+        };
+        oauth.insert("accessToken".into(), json!(""));
+        oauth.insert("refreshToken".into(), json!(""));
+        oauth.insert("expiresAt".into(), json!(0));
+        Some(AccountPart::Keys(keys))
+    }
+}
+
+/// What one place of a credential entry held each time the current operation looked: what its
+/// latest `snapshot` read there (`None`: absent), then every value written there since.
+type Values = Vec<Option<Vec<u8>>>;
+
+/// Every place of an entry, named as `Seen` names it, with what it holds now, in reader order.
+type Places = Vec<(String, Option<Vec<u8>>)>;
+
+/// What a place of an entry actually holds, as far as the operation knows: what it read there
+/// under the storage-write lock, or what a write it saw succeed put there (`None`: absent).
+/// `Unknown` after a write that failed where a read under the same hold could not tell. It holds
+/// secrets, so it has no `Debug`.
+#[derive(Clone, PartialEq)]
+enum Held {
+    Known(Option<Vec<u8>>),
+    Unknown,
+}
+
+impl Held {
+    fn of(read: Read<Vec<u8>>) -> Self {
+        match read {
+            Read::Present(b) => Held::Known(Some(b)),
+            Read::Absent => Held::Known(None),
+            Read::Unreadable(_) => Held::Unknown,
+        }
+    }
+}
+
+/// What the current operation has seen of one credential entry under the credential locks
+/// (§9.1), place by place.
+#[derive(Default)]
+struct Seen {
+    /// By place: a Keychain service, or the credentials file's path. `None` until the
+    /// operation reads the entry.
+    places: Option<BTreeMap<String, Values>>,
+    /// What each place actually holds: read under the storage-write lock at the start of each
+    /// hold, then updated after each write. Never an attempted value that did not land.
+    held: BTreeMap<String, Held>,
+    /// What each place the operation's writes changed actually held just before the first of
+    /// those changes: what a restore puts back there.
+    first: BTreeMap<String, Held>,
+    /// The places a restore must leave as they are: changed by another writer since the
+    /// operation first changed the entry, or holding something unknown before that change.
+    leave: BTreeSet<String>,
+}
+
+impl Seen {
+    fn values(&self, place: &str) -> Option<&Values> {
+        self.places.as_ref()?.get(place)
+    }
+
+    /// §9.1: whether `now`, what `place` holds under the storage-write lock, has account-scoped
+    /// keys this operation last read or wrote there, or CC's dead-token marking of them. A place
+    /// the operation never read has nothing to compare.
+    fn known(&self, place: &str, now: Option<&[u8]>) -> bool {
+        let Some(values) = self.values(place) else {
+            return true;
+        };
+        let now = AccountPart::of(now);
+        values
+            .iter()
+            .map(|v| AccountPart::of(v.as_deref()))
+            .any(|p| p == now || p.marked().as_ref() == Some(&now))
+    }
+}
+
+/// `Seen` for both credential entries (§9.1): the OAuth entry and the managed-key item.
+#[derive(Default)]
+struct Ledger {
+    oauth: Seen,
+    managed: Seen,
+}
+
+impl Ledger {
+    fn entry(&mut self, kind: ItemKind) -> &mut Seen {
+        match kind {
+            ItemKind::OAuth => &mut self.oauth,
+            ItemKind::ManagedKey => &mut self.managed,
+        }
+    }
+}
+
+/// Why a restore left a place of an entry as it is: another writer changed the entry since this
+/// operation wrote it, so putting back what it held before could lose that write.
+const CHANGED_SINCE: &str = "changed since tagteam wrote it; left as it is";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -72,6 +204,12 @@ pub struct LiveStore {
     /// so the operation's later writes go there too. Cleared when the operation's credential
     /// locks are released (`ClaudeCode::lock_credentials`) and by `restore`.
     file_mode_pinned: AtomicBool,
+    /// §9.1: what the current operation read and wrote of each credential entry, so a write
+    /// under the storage-write lock can tell Claude Code's changes from its own. Cleared, with
+    /// the pin, when the operation's credential locks are released.
+    seen: Mutex<Ledger>,
+    /// How long one wait for CC's storage-write lock may take (§9.1: 9 s).
+    storage_write_timeout: Duration,
     retry_delay: Duration,
 }
 
@@ -95,6 +233,56 @@ fn read_primary_api_key(paths: &CcPaths) -> Read<Vec<u8>> {
 /// Removes what the path resolves to; a symlink itself is never deleted (§9.5).
 fn remove_if_present(path: &Path) -> Result<(), ProviderError> {
     Ok(remove_target(path)?)
+}
+
+/// The JSON object `bytes` hold, if they hold one.
+fn object(bytes: &[u8]) -> Option<Map<String, Value>> {
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(Value::Object(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// The credentials file as a place of the OAuth entry, named as `restore` and `EntryMoved` name
+/// it: its path.
+fn file_place(paths: &CcPaths) -> String {
+    paths.credentials_file.display().to_string()
+}
+
+/// The machine-shared keys an entry holds (Appendix A.4): none for an absent entry or bytes
+/// that are not a JSON object.
+fn shared_of(bytes: Option<&[u8]>) -> Map<String, Value> {
+    bytes
+        .and_then(object)
+        .map(|o| machine_shared_only(&o))
+        .unwrap_or_default()
+}
+
+/// `bytes` carrying `shared`, the machine-shared keys the entry holds under the storage-write
+/// lock, their absence included (§9.1), so a Claude Code write made since `bytes` were composed
+/// is kept. Bytes that already carry exactly those keys, or that are not a JSON object, are
+/// returned as they are.
+fn rebase(bytes: &[u8], shared: &Map<String, Value>) -> Vec<u8> {
+    let Some(mut o) = object(bytes) else {
+        return bytes.to_vec();
+    };
+    if machine_shared_only(&o) == *shared {
+        return bytes.to_vec();
+    }
+    for k in MACHINE_SHARED_KEYS {
+        o.shift_remove(k);
+    }
+    o.extend(shared.clone());
+    serde_json::to_vec(&Value::Object(o)).expect("a Value always serializes")
+}
+
+/// `fence`, then the storage-write lock's own ownership check: the check that runs immediately
+/// before every write the lock protects (§9.1).
+fn held<'a>(fence: Fence<'a>, lock: &'a MkdirLock) -> impl Fn() -> Result<(), ProviderError> + 'a {
+    move || {
+        fence()?;
+        Ok(lock.check_owned()?)
+    }
 }
 
 pub(crate) const UNPARSABLE_ENTRY: &str = "a credential entry is not a JSON object";
@@ -166,12 +354,20 @@ impl LiveStore {
             keychain,
             platform,
             file_mode_pinned: AtomicBool::new(false),
+            seen: Mutex::new(Ledger::default()),
+            storage_write_timeout: locks::ACQUIRE_TIMEOUT,
             retry_delay: Duration::from_millis(300),
         }
     }
 
     pub fn with_retry_delay(mut self, d: Duration) -> Self {
         self.retry_delay = d;
+        self
+    }
+
+    /// A shorter wait for CC's storage-write lock, so a test of a held lock need not wait 9 s.
+    pub fn with_storage_write_timeout(mut self, d: Duration) -> Self {
+        self.storage_write_timeout = d;
         self
     }
 
@@ -187,6 +383,172 @@ impl LiveStore {
     /// (Appendix A.3).
     pub(crate) fn unpin_file_mode(&self) {
         self.file_mode_pinned.store(false, Ordering::SeqCst);
+    }
+
+    /// Ends the operation (Appendix A.3, §9.1): the file-mode pin, and what it read and wrote of
+    /// each credential entry.
+    pub(crate) fn end_operation(&self) {
+        self.unpin_file_mode();
+        *self.seen.lock().unwrap() = Ledger::default();
+    }
+
+    /// CC's storage-write lock, for one entry's write (§9.1), waited for under `cancel`.
+    fn storage_write(&self, paths: &CcPaths, cancel: &Cancel) -> Result<MkdirLock, ProviderError> {
+        Ok(locks::acquire_storage_write(
+            paths,
+            self.storage_write_timeout,
+            cancel,
+        )?)
+    }
+
+    /// Every place of `kind`'s entry, read again under the storage-write lock, strictly (Appendix
+    /// A.3): the Keychain items a reader tries, in reader order (macOS), then, for the OAuth
+    /// entry, the credentials file. An item that exists but cannot be read refuses.
+    fn places_now(
+        &self,
+        env: &Env,
+        paths: &CcPaths,
+        kind: ItemKind,
+    ) -> Result<Places, ProviderError> {
+        let mut out = Vec::new();
+        if self.mac() {
+            let acct = keychain_account(env);
+            for svc in read_services(env, kind) {
+                let value = present_or_err(self.retrying(|| self.keychain.find(&svc, &acct)))?;
+                out.push((svc, value));
+            }
+        }
+        if kind == ItemKind::OAuth {
+            let file = present_or_err(read_bytes(&paths.credentials_file))?;
+            out.push((file_place(paths), file));
+        }
+        Ok(out)
+    }
+
+    /// §9.1, at every place of the entry: `EntryMoved`, naming the first place whose
+    /// account-scoped keys this operation neither last read nor wrote there; only another writer
+    /// can have changed them. CC's dead-token marking of what it read or wrote is no conflict:
+    /// the write goes ahead over it.
+    fn unmoved(
+        &self,
+        kind: ItemKind,
+        places: &[(String, Option<Vec<u8>>)],
+    ) -> Result<(), ProviderError> {
+        let mut seen = self.seen.lock().unwrap();
+        let seen = seen.entry(kind);
+        match places
+            .iter()
+            .find(|(place, now)| !seen.known(place, now.as_deref()))
+        {
+            Some((place, _)) => Err(ProviderError::EntryMoved(place.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Records, before a write, that this operation writes `bytes` (`None`: deletes) at `place`
+    /// of `kind`'s entry (§9.1): a later write or restore of the operation may find it there.
+    fn intend(&self, kind: ItemKind, place: &str, bytes: Option<&[u8]>) {
+        let mut seen = self.seen.lock().unwrap();
+        let entry = seen.entry(kind);
+        if let Some(places) = &mut entry.places {
+            places
+                .entry(place.to_owned())
+                .or_default()
+                .push(bytes.map(<[u8]>::to_vec));
+        }
+    }
+
+    /// Records, after a write of `bytes` to the Keychain item `svc`, what the item actually
+    /// holds: `bytes` when the write `landed`; otherwise what a read under the same hold finds,
+    /// unknown if it cannot be read.
+    fn settle_item(
+        &self,
+        env: &Env,
+        kind: ItemKind,
+        svc: &str,
+        bytes: Option<&[u8]>,
+        landed: bool,
+    ) {
+        let after = if landed {
+            Held::Known(bytes.map(<[u8]>::to_vec))
+        } else {
+            Held::of(self.keychain.find(svc, &keychain_account(env)))
+        };
+        self.settled(kind, svc, after);
+    }
+
+    /// `settle_item` for the credentials file.
+    fn settle_file(&self, paths: &CcPaths, bytes: Option<&[u8]>, landed: bool) {
+        let after = if landed {
+            Held::Known(bytes.map(<[u8]>::to_vec))
+        } else {
+            Held::of(read_bytes(&paths.credentials_file))
+        };
+        self.settled(ItemKind::OAuth, &file_place(paths), after);
+    }
+
+    /// `place` now holds `after` (§9.1). If that is the operation's first change there, what the
+    /// place held just before is kept for a restore; when that is unknown, a restore must leave
+    /// the place.
+    fn settled(&self, kind: ItemKind, place: &str, after: Held) {
+        let mut seen = self.seen.lock().unwrap();
+        let entry = seen.entry(kind);
+        let before = entry
+            .held
+            .insert(place.to_owned(), after.clone())
+            .unwrap_or(Held::Unknown);
+        if before != after && !entry.first.contains_key(place) {
+            if before == Held::Unknown {
+                entry.leave.insert(place.to_owned());
+            }
+            entry.first.insert(place.to_owned(), before);
+        }
+    }
+
+    /// What every place holds at the start of a hold of the storage-write lock (§9.1). Once the
+    /// operation has changed the entry, a place holding anything but what the operation last
+    /// knew there was changed by another writer since, so a restore must leave the entry; a
+    /// write whose outcome was unknown and that never landed left its place as it was. Returns
+    /// every place a restore must leave.
+    fn observe(&self, kind: ItemKind, places: &[(String, Option<Vec<u8>>)]) -> Vec<String> {
+        let mut seen = self.seen.lock().unwrap();
+        let seen = seen.entry(kind);
+        for (place, value) in places {
+            let now = Held::Known(value.clone());
+            if !seen.first.is_empty() {
+                let was = seen.held.get(place).unwrap_or(&Held::Unknown);
+                let unchanged =
+                    *was == now || (*was == Held::Unknown && seen.first.get(place) == Some(&now));
+                if !unchanged {
+                    seen.leave.insert(place.clone());
+                }
+            }
+            seen.held.insert(place.clone(), now);
+        }
+        seen.leave.iter().cloned().collect()
+    }
+
+    /// One write of `kind`'s entry under CC's storage-write lock (§9.1). Waits for the lock
+    /// under `env.cancel` (§14.1), reads every place of the entry again and refuses with
+    /// `EntryMoved` if the account-scoped keys moved at any of them, then runs `write` with the
+    /// entry as Claude Code reads it now (its first place that holds anything) and a fence that
+    /// also checks the lock is still this holder's. The lock is released on return, so it is
+    /// never held across anything but this one entry's write.
+    fn under_storage_write<T>(
+        &self,
+        env: &Env,
+        paths: &CcPaths,
+        kind: ItemKind,
+        fence: Fence<'_>,
+        write: impl FnOnce(Option<&[u8]>, Fence<'_>) -> Result<T, ProviderError>,
+    ) -> Result<T, ProviderError> {
+        let lock = self.storage_write(paths, &env.cancel)?;
+        let places = self.places_now(env, paths, kind)?;
+        self.observe(kind, &places);
+        self.unmoved(kind, &places)?;
+        let now = places.iter().find_map(|(_, value)| value.as_deref());
+        let fence = held(fence, &lock);
+        write(now, &fence)
     }
 
     fn mac(&self) -> bool {
@@ -323,9 +685,12 @@ impl LiveStore {
     ) -> Result<(), ProviderError> {
         let acct = keychain_account(env);
         for svc in read_services(env, kind) {
+            self.intend(kind, &svc, None);
             fence()?;
             let _ = self.keychain.delete(&svc, &acct);
-            if !matches!(self.keychain.exists(&svc, &acct), Read::Absent) {
+            let gone = matches!(self.keychain.exists(&svc, &acct), Read::Absent);
+            self.settle_item(env, kind, &svc, None, gone);
+            if !gone {
                 return Err(ProviderError::ShadowingItem(svc));
             }
         }
@@ -338,16 +703,39 @@ impl LiveStore {
         bytes: &[u8],
         fence: Fence<'_>,
     ) -> Result<(), ProviderError> {
+        self.intend(ItemKind::OAuth, &file_place(paths), Some(bytes));
         fence()?;
         ensure_private_dir(&paths.secure_storage_dir)?;
-        write_atomic_private_with(&paths.credentials_file, bytes, 0o600, fence)
+        let written = write_atomic_private_with(&paths.credentials_file, bytes, 0o600, fence);
+        self.settle_file(paths, Some(bytes), written.is_ok());
+        written
     }
 
     /// Appendix A.3 write, including the verified file fallback, which first reports every
     /// item it will delete to `before_fallback`. A fallback pins file mode, so every later
     /// write of the same operation goes straight to the file. Returns where this write put the
     /// credential: a file mirrored for hot reload does not make it a file store.
+    ///
+    /// The whole write, its hot-reload rewrite or its fallback included, holds CC's
+    /// storage-write lock (§9.1). Under it the entry is read again: its account-scoped keys must
+    /// still be what this operation last read or wrote (`ProviderError::EntryMoved` otherwise),
+    /// and the machine-shared keys written are the ones it holds now, whatever `bytes` carry.
     pub fn write_credential_entry(
+        &self,
+        env: &Env,
+        paths: &CcPaths,
+        bytes: &[u8],
+        fence: Fence<'_>,
+        before_fallback: BeforeFallback<'_>,
+    ) -> Result<SecretStore, ProviderError> {
+        self.under_storage_write(env, paths, ItemKind::OAuth, fence, |now, fence| {
+            let bytes = rebase(bytes, &shared_of(now));
+            self.write_entry(env, paths, &bytes, fence, before_fallback)
+        })
+    }
+
+    /// `write_credential_entry`'s write, under the storage-write lock.
+    fn write_entry(
         &self,
         env: &Env,
         paths: &CcPaths,
@@ -360,16 +748,20 @@ impl LiveStore {
             return Ok(SecretStore::File(paths.credentials_file.clone()));
         }
         if !self.file_mode_pinned() {
+            let svc = keychain_service(env, ItemKind::OAuth);
+            self.intend(ItemKind::OAuth, &svc, Some(bytes));
             fence()?;
-            match self.keychain.upsert(
-                &keychain_service(env, ItemKind::OAuth),
-                &keychain_account(env),
-                bytes,
-            ) {
+            let upserted = self.keychain.upsert(&svc, &keychain_account(env), bytes);
+            self.settle_item(env, ItemKind::OAuth, &svc, Some(bytes), upserted.is_ok());
+            match upserted {
                 Ok(()) => {
                     if paths.credentials_file.try_exists()? {
                         // Bumps the mtime, so CC reloads (hot reload).
-                        write_atomic_private_with(&paths.credentials_file, bytes, 0o600, fence)?;
+                        self.intend(ItemKind::OAuth, &file_place(paths), Some(bytes));
+                        let mirrored =
+                            write_atomic_private_with(&paths.credentials_file, bytes, 0o600, fence);
+                        self.settle_file(paths, Some(bytes), mirrored.is_ok());
+                        mirrored?;
                     }
                     return Ok(SecretStore::Keychain);
                 }
@@ -386,8 +778,22 @@ impl LiveStore {
     }
 
     /// API-key activation: keep only the machine-shared keys of every credential entry a
-    /// reader would try; delete an entry when none remain (§9.4 step 7).
+    /// reader would try; delete an entry when none remain (§9.4 step 7). It holds CC's
+    /// storage-write lock throughout and refuses, writing nothing, if the entry's
+    /// account-scoped keys moved (§9.1); what each place keeps is read under the lock.
     pub fn clear_credential_account_keys(
+        &self,
+        env: &Env,
+        paths: &CcPaths,
+        fence: Fence<'_>,
+    ) -> Result<(), ProviderError> {
+        self.under_storage_write(env, paths, ItemKind::OAuth, fence, |_, fence| {
+            self.clear_account_keys(env, paths, fence)
+        })
+    }
+
+    /// `clear_credential_account_keys`' clear, under the storage-write lock.
+    fn clear_account_keys(
         &self,
         env: &Env,
         paths: &CcPaths,
@@ -398,23 +804,26 @@ impl LiveStore {
             for svc in read_services(env, ItemKind::OAuth) {
                 if let Some(b) = present_or_err(self.keychain.find(&svc, &acct))? {
                     let kept = keep_shared(&b)?;
+                    self.intend(ItemKind::OAuth, &svc, kept.as_deref());
                     fence()?;
-                    match kept {
-                        Some(k) => self.keychain.upsert(&svc, &acct, &k)?,
-                        None => self.keychain.delete(&svc, &acct)?,
-                    }
+                    let cleared = match &kept {
+                        Some(k) => self.keychain.upsert(&svc, &acct, k),
+                        None => self.keychain.delete(&svc, &acct),
+                    };
+                    self.settle_item(env, ItemKind::OAuth, &svc, kept.as_deref(), cleared.is_ok());
+                    cleared?;
                 }
             }
         }
         if let Some(b) = present_or_err(read_bytes(&paths.credentials_file))? {
             let kept = keep_shared(&b)?;
-            match kept {
-                Some(k) => write_atomic_private_with(&paths.credentials_file, &k, 0o600, fence)?,
-                None => {
-                    fence()?;
-                    remove_if_present(&paths.credentials_file)?
-                }
-            }
+            self.intend(ItemKind::OAuth, &file_place(paths), kept.as_deref());
+            let cleared = match &kept {
+                Some(k) => write_atomic_private_with(&paths.credentials_file, k, 0o600, fence),
+                None => fence().and_then(|()| remove_if_present(&paths.credentials_file)),
+            };
+            self.settle_file(paths, kept.as_deref(), cleared.is_ok());
+            cleared?;
         }
         Ok(())
     }
@@ -426,7 +835,8 @@ impl LiveStore {
     /// instead, and every managed-key item is removed and verified gone, after being reported
     /// to `before_fallback`: CC reads the Keychain first, so a stale item would stay the
     /// effective key. Returns where this write put the key; the credential entry's file pin
-    /// plays no part in it.
+    /// plays no part in it. The managed-key item's write, its fallback included, holds CC's
+    /// storage-write lock and refuses if the item moved (§9.1).
     pub fn write_managed_key(
         &self,
         env: &Env,
@@ -478,38 +888,49 @@ impl LiveStore {
                 fence,
             )?;
         }
-        if self.mac() {
-            fence()?;
-            match self.keychain.upsert(
-                &keychain_service(env, ItemKind::ManagedKey),
-                &keychain_account(env),
-                key_str.as_bytes(),
-            ) {
-                Ok(()) => {
-                    config::splice_key(&paths.global_config, "primaryApiKey", None, fence)?;
-                    return Ok(SecretStore::Keychain);
-                }
-                Err(e) => {
-                    tracing::warn!("keychain write failed, storing primaryApiKey instead: {e}")
-                }
-            }
-            self.report_items(env, ItemKind::ManagedKey, before_fallback)?;
-        }
-        config::splice_key(
-            &paths.global_config,
-            "primaryApiKey",
-            Some(&Value::String(key_str)),
-            fence,
-        )?;
+        let in_primary = |fence: Fence<'_>| {
+            config::splice_key(
+                &paths.global_config,
+                "primaryApiKey",
+                Some(&Value::String(key_str.clone())),
+                fence,
+            )
+        };
         if !self.mac() {
+            in_primary(fence)?;
             return Ok(SecretStore::File(paths.global_config.clone()));
         }
-        self.remove_items(env, ItemKind::ManagedKey, fence)?;
-        Ok(SecretStore::Fallback(paths.global_config.clone()))
+        let in_keychain =
+            self.under_storage_write(env, paths, ItemKind::ManagedKey, fence, |_, fence| {
+                let svc = keychain_service(env, ItemKind::ManagedKey);
+                let key = Some(key_str.as_bytes());
+                self.intend(ItemKind::ManagedKey, &svc, key);
+                fence()?;
+                let upserted =
+                    self.keychain
+                        .upsert(&svc, &keychain_account(env), key_str.as_bytes());
+                self.settle_item(env, ItemKind::ManagedKey, &svc, key, upserted.is_ok());
+                match upserted {
+                    Ok(()) => return Ok(true),
+                    Err(e) => {
+                        tracing::warn!("keychain write failed, storing primaryApiKey instead: {e}")
+                    }
+                }
+                self.report_items(env, ItemKind::ManagedKey, before_fallback)?;
+                in_primary(fence)?;
+                self.remove_items(env, ItemKind::ManagedKey, fence)?;
+                Ok(false)
+            })?;
+        if !in_keychain {
+            return Ok(SecretStore::Fallback(paths.global_config.clone()));
+        }
+        config::splice_key(&paths.global_config, "primaryApiKey", None, fence)?;
+        Ok(SecretStore::Keychain)
     }
 
     /// Writing OAuth clears the managed key: every managed-key item is deleted (verified) and
-    /// `primaryApiKey` is dropped. `approved` is kept (B.10).
+    /// `primaryApiKey` is dropped. `approved` is kept (B.10). The deletes hold CC's
+    /// storage-write lock and refuse if the item moved (§9.1).
     pub fn clear_managed_key(
         &self,
         env: &Env,
@@ -517,7 +938,9 @@ impl LiveStore {
         fence: Fence<'_>,
     ) -> Result<(), ProviderError> {
         if self.mac() {
-            self.remove_items(env, ItemKind::ManagedKey, fence)?;
+            self.under_storage_write(env, paths, ItemKind::ManagedKey, fence, |_, fence| {
+                self.remove_items(env, ItemKind::ManagedKey, fence)
+            })?;
         }
         config::splice_key(&paths.global_config, "primaryApiKey", None, fence)?;
         Ok(())
@@ -540,20 +963,27 @@ impl LiveStore {
                 })
                 .collect()
         };
-        Ok(Snapshot {
+        let snap = Snapshot {
             oauth_items: items(ItemKind::OAuth)?,
             managed_items: items(ItemKind::ManagedKey)?,
             credentials_file: present_or_err(read_bytes(&paths.credentials_file))?,
             global_config: present_or_err(read_bytes(&paths.global_config))?,
-        })
-    }
-
-    fn item_matches(&self, svc: &str, acct: &str, expected: &Option<Vec<u8>>) -> bool {
-        match self.keychain.find(svc, acct) {
-            Read::Present(v) => expected.as_deref() == Some(v.as_slice()),
-            Read::Absent => expected.is_none(),
-            Read::Unreadable(_) => false,
-        }
+        };
+        // §9.1: this is the operation's latest read of both entries under the credential locks,
+        // place by place.
+        let places = |items: &[ItemSnapshot]| -> BTreeMap<String, Values> {
+            items
+                .iter()
+                .map(|(svc, v)| (svc.clone(), vec![v.clone()]))
+                .collect()
+        };
+        let mut oauth = places(&snap.oauth_items);
+        oauth.insert(file_place(paths), vec![snap.credentials_file.clone()]);
+        let mut seen = self.seen.lock().unwrap();
+        seen.oauth.places = Some(oauth);
+        seen.managed.places = Some(places(&snap.managed_items));
+        drop(seen);
+        Ok(snap)
     }
 
     /// The Keychain half of one `restore` entry: `fence` is checked immediately before
@@ -588,6 +1018,22 @@ impl LiveStore {
     /// still attempted, so one flaky Keychain write never strands the rest of the
     /// rollback. When anything was left unrestored, the single error returned names
     /// every one of them — Keychain services and file paths, never bytes.
+    ///
+    /// Each credential entry, the managed-key item and then the OAuth entry with its file, is
+    /// restored under its own hold of CC's storage-write lock (§9.1), and only if this
+    /// operation's writes changed it. The lock is waited for under a token nothing sets: a
+    /// rollback runs to completion (§14.1). Each place the operation changed is put back, byte
+    /// for byte, to what it actually held just before the operation's first change there, read
+    /// under the lock; for these entries that, not the snapshot, is what the paragraph above
+    /// means. It is put back only while every place of the entry still holds what the operation
+    /// last knew there (`observe`). Once another writer changed any place since, by a dead-token
+    /// marking or in its machine-shared keys as much as otherwise, or a place's state before the
+    /// operation's change is unknown, the whole entry is left as it is and each such place is
+    /// named as not restored: putting back any place could overwrite that write, or hide it
+    /// behind a place a reader tries first. A place the operation never changed is never
+    /// written, but for the credentials file's hot-reload rewrite of its own bytes. A lock that
+    /// cannot be taken, or an entry that cannot be read under it, leaves that entry unrestored
+    /// too.
     pub fn restore(
         &self,
         env: &Env,
@@ -624,46 +1070,99 @@ impl LiveStore {
             }
         }
 
-        // 2. The Keychain items: managed-key, then OAuth.
+        // 2. The Keychain items: managed-key, then OAuth; 3. the credentials file last, so a
+        // Keychain item's hot-reload bump always lands after that item. Each entry under its
+        // own hold of the storage-write lock (§9.1).
         let mut any_item_restored = false;
-        for (i, (svc, value)) in snap
-            .managed_items
-            .iter()
-            .chain(&snap.oauth_items)
-            .enumerate()
-        {
-            if self.item_matches(svc, &acct, value) {
+        let mut start = 0;
+        for kind in [ItemKind::ManagedKey, ItemKind::OAuth] {
+            let items = match kind {
+                ItemKind::ManagedKey => &snap.managed_items,
+                ItemKind::OAuth => &snap.oauth_items,
+            };
+            let at = start;
+            start += items.len();
+            // What each place this operation changed held just before its first change there.
+            let first = self.seen.lock().unwrap().entry(kind).first.clone();
+            if first.is_empty() {
                 continue;
             }
-            match self.restore_item(svc, &acct, value, fence) {
-                Ok(()) => any_item_restored = true,
+            // The entry, named by its primary item, else its file (Linux).
+            let name = items
+                .first()
+                .map_or_else(|| credentials_file_name.clone(), |(svc, _)| svc.clone());
+            let lock = match self.storage_write(paths, &Cancel::new()) {
+                Ok(lock) => lock,
                 Err(e) => {
-                    if matches!(e, ProviderError::Lock(_)) {
-                        let mut never_attempted = item_names[i..].to_vec();
-                        never_attempted.push(credentials_file_name);
-                        log_lock_abort(&failed, &never_attempted);
-                        return Err(e);
+                    failed.push(format!("{name} ({e})"));
+                    continue;
+                }
+            };
+            let now = match self.places_now(env, paths, kind) {
+                Ok(now) => now,
+                Err(e) => {
+                    failed.push(format!("{name} ({e})"));
+                    continue;
+                }
+            };
+            let changed = self.observe(kind, &now);
+            if !changed.is_empty() {
+                failed.extend(
+                    changed
+                        .into_iter()
+                        .map(|place| format!("{place} ({CHANGED_SINCE})")),
+                );
+                continue;
+            }
+            let fence = held(fence, &lock);
+            let mut file_now = None;
+            for (i, (place, value)) in now.iter().enumerate() {
+                if *place == credentials_file_name {
+                    file_now = Some(value.clone());
+                    continue;
+                }
+                let Some(Held::Known(before)) = first.get(place) else {
+                    continue;
+                };
+                if value == before {
+                    continue;
+                }
+                self.intend(kind, place, before.as_deref());
+                let restored = self.restore_item(place, &acct, before, &fence);
+                self.settle_item(env, kind, place, before.as_deref(), restored.is_ok());
+                match restored {
+                    Ok(()) => any_item_restored = true,
+                    Err(e) => {
+                        if matches!(e, ProviderError::Lock(_)) {
+                            let mut never_attempted = item_names[at + i..].to_vec();
+                            never_attempted.push(credentials_file_name);
+                            log_lock_abort(&failed, &never_attempted);
+                            return Err(e);
+                        }
+                        failed.push(place.clone());
                     }
-                    failed.push(svc.clone());
                 }
             }
-        }
-
-        // 3. The credentials file last, so a Keychain item's hot-reload bump always
-        // lands after that item. Never created for a snapshot that had none.
-        let mismatched = !file_matches(&paths.credentials_file, &snap.credentials_file);
-        let bump_for_reload = any_item_restored
-            && snap.credentials_file.is_some()
-            && paths.credentials_file.try_exists().unwrap_or(false);
-        if mismatched || bump_for_reload {
-            if let Err(e) =
-                restore_file(&paths.credentials_file, &snap.credentials_file, fence, true)
-            {
+            let Some(file_now) = file_now else {
+                continue;
+            };
+            // The file goes back to what it held before this operation's change. One it never
+            // changed is rewritten with its own bytes, if it exists, to bump its mtime after a
+            // restored item; it is never created for that.
+            let file = match first.get(&credentials_file_name) {
+                Some(Held::Known(before)) if *before != file_now => before.clone(),
+                _ if any_item_restored && file_now.is_some() => file_now,
+                _ => continue,
+            };
+            self.intend(kind, &credentials_file_name, file.as_deref());
+            let restored = restore_file(&paths.credentials_file, &file, &fence, true);
+            self.settle_file(paths, file.as_deref(), restored.is_ok());
+            if let Err(e) = restored {
                 if matches!(e, ProviderError::Lock(_)) {
                     log_lock_abort(&failed, std::slice::from_ref(&credentials_file_name));
                     return Err(e);
                 }
-                failed.push(credentials_file_name);
+                failed.push(credentials_file_name.clone());
             }
         }
 
