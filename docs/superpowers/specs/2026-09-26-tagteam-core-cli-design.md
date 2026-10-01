@@ -1078,10 +1078,16 @@ recovery (§9.6), the active-token refresh's live write (§7.5) and profile boot
   profile's own), held around one entry's write, and never across a network call; no other
   lock is taken while it is held. Its wait is a cancellation point (§14.1).
 - Under it, the entry is read again. Its account-scoped keys must still equal what the writer
-  last read or wrote under the credential locks, since only a refresh changes them and CC
-  refreshes only under those locks; otherwise the write aborts, and a switch rolls back. The
-  machine-shared keys are taken from this read, so a CC write made since the earlier read is
-  never lost.
+  last read or wrote under the credential locks; otherwise the write aborts, and a switch rolls
+  back. CC changes those keys under the credential locks only by refreshing. Outside them it
+  changes them only by its dead-token marking, which writes both tokens empty and `expiresAt`
+  0 (the `Wiped` shape, §9.4 step 4, Appendix A.3).
+  - **A marking is no conflict.** An entry that differs from what the writer last read or
+    wrote only by such a marking does not abort the write, which goes ahead over it. The
+    marking holds no secret. The writer holds the generation CC marked, or a newer one: §7.5's
+    successor, a switch's target, or a rollback's original.
+  - The machine-shared keys are taken from this read, so a CC write made since the earlier
+    read is never lost.
 
 When a switch or a recovery takes the three CC locks together, one 9 s budget covers all
 three. The active-token refresh takes the credential locks with that budget and, after its
@@ -3044,7 +3050,9 @@ Each is a one-liner, and each gets at least one test.
     machine-shared keys, so no rotating token, an account's or an MCP server's, has a copy in
     two homes (§12.3).
 61. Every write of a CC credential entry holds CC's storage-write lock, re-reads the entry under
-    it, and keeps the machine-shared keys CC wrote meanwhile (§9.1).
+    it, and keeps the machine-shared keys CC wrote meanwhile (§9.1). It aborts when the
+    account-scoped keys changed since the writer last read or wrote them, except by CC's
+    dead-token marking (§9.1), which it writes over.
 62. Every launch checks that the session will authenticate as its account. Validation deletes
     a profile only at a bootstrap, and only when CC reports it logged out or logged in as
     another account; a login that something outside the profile overrides, or that the check
