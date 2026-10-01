@@ -1109,3 +1109,119 @@ fn the_live_identity_cache_round_trips_per_provider() {
         "a row without its file key is a miss"
     );
 }
+
+#[test]
+fn a_stored_empty_reading_reads_as_none() {
+    // C5: `[]` is no reading, as a reading with no windows is stored as none (§8.2).
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let r = reserved(&s, &a, T_MS);
+    assert!(s.record_usage(&r, &windows(), T, &plan(), 180).unwrap());
+    raw(&path)
+        .execute("UPDATE usage_state SET last_good = '[]'", [])
+        .unwrap();
+    let st = s.usage_state(&a).unwrap().unwrap();
+    assert_eq!((st.last_good, st.fetched_at), (None, Some(T)));
+}
+
+#[test]
+fn a_stale_slot_is_left_alone_when_the_send_is_rejected_or_the_lease_is_lost() {
+    // C6: `Rejected` and `LeaseLost` write nothing, even for a slot that is past
+    // `slot_valid_s`: it is not deleted and no fresh one is taken.
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let r = reserved(&s, &a, T_MS);
+    let resumed_ms = (T + B.slot_valid_s + 1) * 1000;
+    assert!(s.set_rejected_fp(&r, Some("sha256:refused")).unwrap());
+    assert_eq!(
+        s.authorize_send(
+            &r,
+            Some(&slot_of(&r)),
+            Some("sha256:refused"),
+            resumed_ms,
+            &B
+        )
+        .unwrap(),
+        SendGrant::Rejected
+    );
+    assert_eq!(slot_times(&path, &cc(), "a@x.co\n"), vec![T]);
+
+    raw(&path)
+        .execute(
+            "UPDATE leases SET holder = 'other' WHERE name = 'usage:a'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        s.authorize_send(&r, Some(&slot_of(&r)), Some("sha256:ok"), resumed_ms, &B)
+            .unwrap(),
+        SendGrant::LeaseLost
+    );
+    assert_eq!(slot_times(&path, &cc(), "a@x.co\n"), vec![T]);
+}
+
+#[test]
+fn deleting_an_account_deletes_its_usage_lease_row() {
+    // C7: the `usage:<id>` row has no foreign key; the delete removes it in its transaction,
+    // and no other lease.
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    reserved(&s, &a, T_MS);
+    reserved(&s, &b, T_MS);
+    s.delete_account(&a).unwrap();
+    assert_eq!(lease(&path, &format!("usage:{a}")), None);
+    assert!(lease(&path, &format!("usage:{b}")).is_some());
+}
+
+#[test]
+fn a_quarantined_account_is_not_authorized_to_send() {
+    // C8: quarantined after the reservation (a refresh failed meanwhile): nothing is sent and
+    // nothing is written.
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let r = reserved(&s, &a, T_MS);
+    s.set_quarantine(&a, "invalid_grant", "sha256:sent", 1)
+        .unwrap();
+    for slot in [Some(slot_of(&r)), None] {
+        assert_eq!(
+            s.authorize_send(&r, slot.as_ref(), Some("sha256:ok"), T_MS, &B)
+                .unwrap(),
+            SendGrant::LeaseLost
+        );
+    }
+    assert_eq!(all_slots(&path), 1, "nothing written");
+}
+
+#[test]
+fn a_reading_stamped_in_the_future_counts_as_unread() {
+    // C9 (§8.4): more than 60 s ahead of now is not a usable age, so the account is eligible
+    // on demand and, scheduled, "no reading at all". Within the slack the stamp is an age.
+    let (_d, path, s) = open();
+    let cases = [
+        // (fetched_at, on_demand, eligible)
+        (T + 60, true, false),
+        (T + 61, true, true),
+        (T + 86_400, true, true),
+        (T + 60, false, false),
+        (T + 61, false, true),
+    ];
+    for (i, (fetched_at, on_demand, eligible)) in cases.into_iter().enumerate() {
+        let n = i as u32 + 1;
+        let id = add(&s, &cc(), &format!("a{n}"), &format!("a{n}@x.co"), n);
+        // The plan is not due yet (scheduled) or absent (on demand).
+        arrange(
+            &path,
+            &id,
+            Some(fetched_at),
+            None,
+            (!on_demand).then_some(T + 500),
+        );
+        let got = reserve(&s, &id, T_MS, on_demand);
+        assert_eq!(
+            matches!(got, Reserve::Reserved(_)),
+            eligible,
+            "case {i}: {got:?}"
+        );
+    }
+}

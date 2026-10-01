@@ -834,8 +834,17 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes the account; its usage rows cascade, and its `usage:<id>` lease row (which has
+    /// no foreign key) goes in the same transaction.
     pub fn delete_account(&self, id: &AccountId) -> Result<(), StoreError> {
-        self.exec("DELETE FROM accounts WHERE id = ?1", &[&id.as_str()])?;
+        let mut c = self.lock();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM accounts WHERE id = ?1", [id.as_str()])?;
+        tx.execute(
+            "DELETE FROM leases WHERE name = ?1",
+            [format!("usage:{id}")],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
