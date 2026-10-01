@@ -735,4 +735,67 @@ mod hooks {
             "nothing is recorded as a's"
         );
     }
+
+    /// `engine`'s cancel token, set from inside the named hook as a signal handler would set it.
+    fn signal_at(engine: &tagteam_engine::Engine, point: &'static str) {
+        let cancel = engine.cancel().clone();
+        engine.on_point(point, Box::new(move || cancel.request(libc::SIGINT)));
+    }
+
+    /// `id`'s on-demand collection through `engine` ended as SIGINT's interruption.
+    fn assert_interrupted(engine: &tagteam_engine::Engine, id: &tagteam_core::AccountId) {
+        let result = engine.collect_usage(CollectMode::OnDemand {
+            accounts: vec![id.clone()],
+        });
+        assert!(
+            matches!(
+                result,
+                Err(tagteam_engine::EngineError::Interrupted(libc::SIGINT))
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_signal_before_active_token_refresh_records_nothing_for_an_expired_live_token() {
+        // §14.1: no §7.5 starts once the token is set. A live setup token cannot refresh, so
+        // without the cancellation point at §7.5's entry its expired token would be recorded as
+        // a `token-expired` failure, backing the account off for a fetch that never happened.
+        let fx = Fx::new();
+        let s = live_setup_token(&fx);
+        let mut live = fx.live_credential().unwrap();
+        live["claudeAiOauth"]["expiresAt"] = json!(fx.clock.now_ms());
+        fx.set_live_credential(live.to_string().as_bytes());
+        signal_at(&fx.engine, "usage-live-identity-read");
+
+        assert_interrupted(&fx.engine, &s);
+
+        assert_eq!(fx.usage_state(&s), None, "nothing is recorded");
+        assert!(fx.http.requests().is_empty());
+        assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    }
+
+    #[test]
+    fn a_signal_before_active_token_refresh_asks_the_oracle_nothing() {
+        // §14.1: the live token was refused (`rejected_fp`) but is still valid locally, so §7.5
+        // asks the profile oracle about it before taking any lock (§7.6). Once the token is set
+        // that request must not leave.
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        refuse(&fx, &a, "rt-a");
+        let engine = fx.engine_with_oracle(Arc::new(tagteam_engine::oracle::HttpOracle::new(
+            fx.http.clone(),
+            fx.clock.clone(),
+        )));
+        signal_at(&engine, "usage-live-identity-read");
+
+        assert_interrupted(&engine, &a);
+
+        assert!(
+            fx.http.requests().is_empty(),
+            "no profile, token or usage request"
+        );
+        assert_eq!(fx.usage_state(&a).and_then(|s| s.last_error), None);
+        assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    }
 }

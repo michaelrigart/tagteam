@@ -281,7 +281,7 @@ mod tests {
     use tagteam_cc::{ItemKind, keychain_account, keychain_service};
     use tagteam_core::{PollBudget, PollPlan};
     use tagteam_engine::settings::DEFAULT_STATUSLINE_FORMAT;
-    use tagteam_engine::store::{Reserve, Store};
+    use tagteam_engine::store::{Eligibility, Reserve, Store};
     use tagteam_engine::views::{UsageStatus, UsageView};
     use tagteam_provider::FakeKeychain;
 
@@ -558,7 +558,12 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         let Reserve::Reserved(reservation) = store
-            .reserve_usage(&row, now * 1000, true, &PollBudget::STANDARD)
+            .reserve_usage(
+                &row,
+                now * 1000,
+                Eligibility::OnDemand,
+                &PollBudget::STANDARD,
+            )
             .unwrap()
         else {
             panic!("no reservation for the reading");

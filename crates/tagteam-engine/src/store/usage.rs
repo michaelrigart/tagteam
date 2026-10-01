@@ -96,6 +96,50 @@ pub struct Reservation {
     pub slot_at: i64,
 }
 
+/// Which §8.3 caller reserves, and so when an account's reading may be fetched again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Eligibility {
+    /// `list`, `status` and `switch`: the reading is older than the floor (180 s), and a poll
+    /// is due, where no plan counts as due.
+    OnDemand,
+    /// An auto tick (§8.6): a poll is due, or there is no reading yet.
+    Scheduled,
+    /// Consume-first's re-check (§11.2 step 8): the reading is older than the floor, whatever
+    /// the plan says.
+    Recheck,
+}
+
+impl Eligibility {
+    /// The schedule half of §8.3's eligibility, from the stored `fetched_at` and `next_poll_at`.
+    /// A reading stamped more than `FUTURE_STAMP_SLACK_S` ahead of now has no usable age
+    /// (§8.4): it counts as unread, so it cannot lock the account out until the clock catches
+    /// up. The same skew leaves a `next_poll_at` further ahead than any legal plan, which
+    /// counts as due.
+    pub(crate) fn allows(
+        self,
+        fetched_at: Option<i64>,
+        next_poll_at: Option<i64>,
+        now_s: i64,
+        budget: &PollBudget,
+    ) -> bool {
+        let fetched_at = fetched_at.filter(|t| !is_future_stamped(*t, now_s));
+        let due = next_poll_at.is_none_or(|t| t <= now_s || plan_is_skewed(t, now_s, budget));
+        let older_than_floor = fetched_at.is_none_or(|t| now_s - t > budget.floor_s);
+        match self {
+            Eligibility::OnDemand => due && older_than_floor,
+            Eligibility::Scheduled => due || fetched_at.is_none(),
+            Eligibility::Recheck => older_than_floor,
+        }
+    }
+}
+
+/// Whether a stored `backoff_until` still holds at `now_s`. A failure recorded while the clock
+/// ran ahead leaves a backoff no legal schedule reaches (`backoff_is_skewed`), which must not
+/// lock the account out until the clock catches up (§8.4).
+pub(crate) fn backoff_holds(until: Option<i64>, now_s: i64) -> bool {
+    until.is_some_and(|t| t > now_s && !backoff_is_skewed(t, now_s))
+}
+
 /// Why an account was not reserved (§8.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ineligible {
@@ -318,27 +362,25 @@ impl Store {
     /// Phase 1 (§8.3), one `IMMEDIATE` transaction. The account is re-read inside it.
     ///
     /// Eligibility, in this order: not quarantined, not in backoff, no live lease, then the
-    /// schedule. A clock that ran ahead when a record was written leaves times no legal
-    /// schedule reaches, which count as clock skew and are ignored: a `fetched_at` more than
-    /// `FUTURE_STAMP_SLACK_S` ahead counts as no reading, a `next_poll_at` more than
-    /// `count_window_s` plus the slack ahead counts as due, and a `backoff_until` more than
-    /// `MAX_BACKOFF_S` plus the slack ahead is no backoff (§8.4). An on-demand caller
-    /// (`list`, `status`) needs the reading to be older than `floor_s` and a poll to be due,
-    /// where no plan counts as due. A scheduled caller (M3)
-    /// needs a poll to be due or no reading at all (§8.3's "due or stale"). An eligible
-    /// account then needs a free slot in its identity's hourly budget (§8.6). Over budget, the
-    /// fetch reports `over-budget`: the refusal is recorded as the collector records
-    /// `authorize_send`'s, one more consecutive failure with `last_error = over-budget`,
-    /// `last_attempt_at` now and a backoff until `max(now + §8.5's base, next_free_at)`, so an
-    /// account with no reading shows why; its `next_poll_at` moves to `next_free_at`, the
-    /// reading is never touched, and no lease is taken. The backoff is checked before the
-    /// budget, so a refusal is recorded once per budget period. Otherwise the lease (§6.1's
-    /// statement, 90 s) and one `usage_requests` slot are taken together.
+    /// schedule, as `eligibility` reads it (`Eligibility::allows`). A clock that ran ahead when
+    /// a record was written leaves times no legal schedule reaches, which count as clock skew
+    /// and are ignored: a `fetched_at` more than `FUTURE_STAMP_SLACK_S` ahead counts as no
+    /// reading, a `next_poll_at` more than `count_window_s` plus the slack ahead counts as due,
+    /// and a `backoff_until` more than `MAX_BACKOFF_S` plus the slack ahead is no backoff
+    /// (§8.4). An eligible account then needs a free slot in its identity's hourly budget
+    /// (§8.6). Over budget, the fetch reports `over-budget`: the refusal is recorded as the
+    /// collector records `authorize_send`'s, one more consecutive failure with
+    /// `last_error = over-budget`, `last_attempt_at` now and a backoff until
+    /// `max(now + §8.5's base, next_free_at)`, so an account with no reading shows why; its
+    /// `next_poll_at` moves to `next_free_at`, the reading is never touched, and no lease is
+    /// taken. The backoff is checked before the budget, so a refusal is recorded once per
+    /// budget period. Otherwise the lease (§6.1's statement, 90 s) and one `usage_requests`
+    /// slot are taken together.
     pub fn reserve_usage(
         &self,
         account: &AccountRow,
         now_ms: i64,
-        on_demand: bool,
+        eligibility: Eligibility,
         budget: &PollBudget,
     ) -> Result<Reserve, StoreError> {
         let now_s = now_ms.div_euclid(1000);
@@ -367,10 +409,7 @@ impl Store {
             )
             .optional()?
             .unwrap_or_default();
-        // Clock skew: a failure recorded while the clock ran ahead leaves a backoff no legal
-        // schedule reaches (`MAX_BACKOFF_S`), which must not lock the account out until the
-        // clock catches up.
-        if backoff_until.is_some_and(|t| t > now_s && !backoff_is_skewed(t, now_s)) {
+        if backoff_holds(backoff_until, now_s) {
             return Ok(Reserve::Ineligible(Ineligible::Backoff));
         }
         let name = lease_name(id);
@@ -382,18 +421,7 @@ impl Store {
         if leased {
             return Ok(Reserve::Ineligible(Ineligible::Leased));
         }
-        // A reading stamped more than the slack ahead of now has no usable age (§8.4): it
-        // counts as unread, so it cannot lock the account out until the clock catches up.
-        let fetched_at = fetched_at.filter(|t| !is_future_stamped(*t, now_s));
-        // The same skew leaves a `next_poll_at` further ahead than any legal plan: it counts
-        // as due.
-        let due = next_poll_at.is_none_or(|t| t <= now_s || plan_is_skewed(t, now_s, budget));
-        let eligible = if on_demand {
-            due && fetched_at.is_none_or(|t| now_s - t > budget.floor_s)
-        } else {
-            due || fetched_at.is_none()
-        };
-        if !eligible {
+        if !eligibility.allows(fetched_at, next_poll_at, now_s, budget) {
             return Ok(Reserve::Ineligible(Ineligible::NotDue));
         }
         if let Some(next_free_at) = next_free_at(&tx, &provider, &identity_key, now_s, budget)? {

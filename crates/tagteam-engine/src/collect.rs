@@ -9,7 +9,8 @@ use std::fmt;
 use std::thread;
 
 use tagteam_core::backoff::failure_backoff_s;
-use tagteam_core::poll::plan_after_fetch;
+use tagteam_core::poll::{DueCandidate, escalates, plan_after_fetch, scheduled_pick};
+use tagteam_core::trust::is_future_stamped;
 use tagteam_core::usage::{earliest_relevant_reset, max_relevant_pct};
 use tagteam_core::{AccountId, PollBudget, PollInputs, PollPlan, ProviderId, Window};
 use tagteam_provider::provider::UsageResult;
@@ -21,15 +22,37 @@ use crate::error::EngineError;
 use crate::hooks;
 use crate::refresh::{GateOutcome, expired};
 use crate::store::{
-    AccountRow, Ineligible, Reservation, Reserve, SendGrant, Slot, Store, StoreError, UsageStateRow,
+    AccountRow, Eligibility, Ineligible, Reservation, Reserve, SendGrant, Slot, Store, StoreError,
+    UsageStateRow, backoff_holds,
 };
+use crate::switch::is_candidate;
 
-/// Who asked for a collection, and so which accounts are collected. M3 adds `Scheduled`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Who asked for a collection, and so which accounts are collected and when each is due (§8.3).
+#[derive(Debug, Clone, PartialEq)]
 pub enum CollectMode {
-    /// `list` and `status` (§8.3): the listed accounts, each only if its reading is older than
-    /// the 180 s floor and a poll is due or none is planned.
+    /// `list`, `status` and `switch` (§8.3): the listed accounts, each only if its reading is
+    /// older than the 180 s floor and a poll is due or none is planned. Plans follow the
+    /// settings' threshold and models.
     OnDemand { accounts: Vec<AccountId> },
+    /// An auto tick (§8.6). Phase 1: the provider's live account, when it is managed and a
+    /// poll is due or it has no reading. Phase 2, from the store as phase 1 left it: one pick
+    /// (`scheduled_pick`) among the provider's other switchable accounts, or every due one when
+    /// the live account's decision-grade max relevant pct under `models` is within the
+    /// provider's escalation margin of `threshold`, or is unknown. `threshold` and `models` are
+    /// the tick's (flags over the file), and every plan recorded after a fetch follows them.
+    Scheduled {
+        provider: ProviderId,
+        threshold: f64,
+        models: Vec<String>,
+    },
+    /// Consume-first's re-check (§8.3, §11.2 step 8): each listed account whose reading is older
+    /// than the 180 s floor, whatever its plan. Plans follow the tick's `threshold` and
+    /// `models`, as `Scheduled`'s do.
+    Recheck {
+        accounts: Vec<AccountId>,
+        threshold: f64,
+        models: Vec<String>,
+    },
 }
 
 /// What one account's collection did.
@@ -58,16 +81,83 @@ pub enum Collected {
 
 #[derive(Debug, Clone, Default)]
 pub struct CollectReport {
-    /// One entry per listed account that exists, in the order listed.
+    /// One entry per account collected. `OnDemand` and `Recheck`: each listed account that
+    /// exists, in the order listed. `Scheduled`: the live account first, when it is managed,
+    /// then each picked candidate in pick order.
     pub outcomes: Vec<(AccountId, Collected)>,
     /// Lines for stderr, each naming an account and never a token: a successor lost while
     /// collecting (§8.3), a refresh that failed with an error or, for the live token (§8.1),
     /// with any outcome but Dead, or an account whose collection ended with an error.
     pub warnings: Vec<String>,
+    /// The accounts quarantined while their collection ran, in `outcomes` order (§7.4: a Dead
+    /// verdict or an identity conflict in the gate or §7.5, or a lost successor). Only an
+    /// account this collection reserved can be named, since a quarantined one is never
+    /// reserved; a quarantine another process set meanwhile names it too.
+    pub quarantined: Vec<AccountId>,
 }
 
-/// One account's collection: what it did, and its warnings.
-type Outcome = (Collected, Vec<String>);
+impl CollectReport {
+    /// Adds each account's result, in order. An error that ended one account's collection is a
+    /// warning naming the account and a `Failed { kind: "error" }` outcome, so one account
+    /// never costs the others theirs.
+    fn add(&mut self, results: Vec<(&AccountRow, Result<Outcome, EngineError>)>) {
+        for (row, result) in results {
+            let outcome = result.unwrap_or_else(|e| Outcome {
+                collected: Collected::Failed {
+                    kind: "error".to_owned(),
+                },
+                warnings: vec![format!(
+                    "usage for {} (position {}) was not collected: {e}",
+                    row.label, row.position
+                )],
+                quarantined: false,
+            });
+            if outcome.quarantined {
+                self.quarantined.push(row.id.clone());
+            }
+            self.outcomes.push((row.id.clone(), outcome.collected));
+            self.warnings.extend(outcome.warnings);
+        }
+    }
+}
+
+/// One account's collection: what it did, its warnings, and whether the account was
+/// quarantined while it ran.
+struct Outcome {
+    collected: Collected,
+    warnings: Vec<String>,
+    quarantined: bool,
+}
+
+impl Outcome {
+    /// Nothing was reserved, so nothing was sent or recorded.
+    fn unreserved(collected: Collected) -> Self {
+        Outcome {
+            collected,
+            warnings: Vec::new(),
+            quarantined: false,
+        }
+    }
+}
+
+/// What a collection's caller sets for every account it collects: when one is eligible
+/// (§8.3), and the threshold and models its next plan is made for (§8.6: the urgent band and
+/// the relevant windows). An auto tick passes its own, flags over the file; on demand passes
+/// the settings'.
+#[derive(Clone, Copy)]
+struct Policy<'m> {
+    eligibility: Eligibility,
+    threshold: f64,
+    models: &'m [String],
+}
+
+/// The roles every thread needs, read once before any starts (`Engine::roles`).
+struct Roles {
+    /// Each provider's recorded active account.
+    recorded: HashMap<ProviderId, Option<AccountId>>,
+    /// The accounts the providers' live logins name (§8.1's active accounts).
+    live: HashSet<AccountId>,
+}
 
 /// A jitter draw for the poll policy, uniform in [-1, 1) (Decision 6).
 pub(crate) fn jitter() -> f64 {
@@ -75,80 +165,206 @@ pub(crate) fn jitter() -> f64 {
 }
 
 impl Engine {
-    /// §8.3 on demand: every listed account on its own thread, and the call waits for them
+    /// §8.3: the accounts `mode` selects, each on its own thread, and the call waits for them
     /// all. A usage failure is never an error here: it is recorded, and reported in the
     /// report's outcomes and warnings. So is an error that ends one account's collection (the
     /// store failing under it): every thread is joined and kept, and that account's outcome is
     /// `Failed { kind: "error" }` with one warning naming it, so one account never costs the
-    /// others' outcomes. `Err` only for an error before any thread starts (opening the store,
-    /// reading the listed accounts, reading each provider's recorded active account), or for
-    /// §14.1's cancel token set during the collection: `Interrupted`, once every thread has
-    /// joined and given back the slot it held unsent. IDs that name no account are skipped.
-    /// Never creates the store.
+    /// others' outcomes. `Err` only for an error outside the threads (opening the store,
+    /// reading the accounts, reading each provider's recorded active account and, for
+    /// `Scheduled`, the provider and the store between the phases), or for §14.1's cancel
+    /// token set during the collection: `Interrupted`, once every thread has joined and given
+    /// back the slot it held unsent. A `Scheduled` collection interrupted in phase 1 starts no
+    /// phase 2. IDs that name no account are skipped. Never creates the store.
     pub fn collect_usage(&self, mode: CollectMode) -> Result<CollectReport, EngineError> {
-        let CollectMode::OnDemand { accounts } = mode;
         hooks::point(self, "usage-collect-start")?;
         let Some(shared) = self.existing_store()? else {
             return Ok(CollectReport::default());
         };
         let store: &Store = &shared;
+        match mode {
+            CollectMode::OnDemand { accounts } => {
+                let settings = self.settings();
+                let policy = Policy {
+                    eligibility: Eligibility::OnDemand,
+                    threshold: settings.threshold,
+                    models: &settings.models,
+                };
+                self.collect_listed(store, &accounts, policy)
+            }
+            CollectMode::Recheck {
+                accounts,
+                threshold,
+                models,
+            } => {
+                let policy = Policy {
+                    eligibility: Eligibility::Recheck,
+                    threshold,
+                    models: &models,
+                };
+                self.collect_listed(store, &accounts, policy)
+            }
+            CollectMode::Scheduled {
+                provider,
+                threshold,
+                models,
+            } => self.collect_scheduled(store, &provider, threshold, &models),
+        }
+    }
+
+    /// `OnDemand` and `Recheck`: every listed account at once.
+    fn collect_listed(
+        &self,
+        store: &Store,
+        accounts: &[AccountId],
+        policy: Policy<'_>,
+    ) -> Result<CollectReport, EngineError> {
         let mut rows = Vec::new();
-        for id in &accounts {
+        for id in accounts {
             if let Some(row) = store.account(id)? {
                 rows.push(row);
             }
         }
-        // Each provider's recorded active account is read before its live login: a switch
-        // writes the live login before it commits the record, so a record read first can only
-        // be older than the live role, never newer (`Collection::active_now`).
+        let roles = self.roles(store, &rows)?;
+        let all: Vec<&AccountRow> = rows.iter().collect();
+        let results = self.collect_each(store, &all, &roles, policy);
+        // §14.1: a collection the token was set during is the command's interruption, whatever
+        // each account did. A request already sent was recorded as usual; nothing else was.
+        self.check_cancel()?;
+        let mut report = CollectReport::default();
+        report.add(results);
+        Ok(report)
+    }
+
+    /// `Scheduled` (§8.6): phase 1, then phase 2 once phase 1 has recorded, so the pick and
+    /// the escalation read the live account's new reading. The live login is read once, before
+    /// phase 1; a switch made meanwhile leaves its new live account a candidate, whose token
+    /// the gate refuses to refresh while it may be live (§7.3 step 2).
+    fn collect_scheduled(
+        &self,
+        store: &Store,
+        provider: &ProviderId,
+        threshold: f64,
+        models: &[String],
+    ) -> Result<CollectReport, EngineError> {
+        let p = self.provider(provider)?;
+        let policy = Policy {
+            eligibility: Eligibility::Scheduled,
+            threshold,
+            models,
+        };
+        let rows = store.accounts(provider)?;
+        let roles = self.roles(store, &rows)?;
+        let live = rows.iter().find(|r| roles.live.contains(&r.id));
+        let mut report = CollectReport::default();
+        let first: Vec<&AccountRow> = live.into_iter().collect();
+        let results = self.collect_each(store, &first, &roles, policy);
+        self.check_cancel()?;
+        report.add(results);
+        let picked =
+            self.scheduled_candidates(store, p.as_ref(), &rows, live, threshold, models)?;
+        let results = self.collect_each(store, &picked, &roles, policy);
+        self.check_cancel()?;
+        report.add(results);
+        Ok(report)
+    }
+
+    /// §8.6 phase 2's pick, read from the store. The candidates are the provider's switchable
+    /// accounts (§9.3) other than the live one, whose kind has usage (a managed key has none,
+    /// §13.2). One is due as `reserve_usage` would find it for a scheduled caller, leaving the
+    /// lease and the budget to the reservation: not in backoff, and a poll due or no reading
+    /// yet. Escalation reads the live account's decision-grade reading under `models` (§8.4);
+    /// without a managed live account, or without such a reading, the headroom is unknown and
+    /// the tick escalates.
+    fn scheduled_candidates<'r>(
+        &self,
+        store: &Store,
+        p: &dyn Provider,
+        rows: &'r [AccountRow],
+        live: Option<&AccountRow>,
+        threshold: f64,
+        models: &[String],
+    ) -> Result<Vec<&'r AccountRow>, EngineError> {
+        if !p.capabilities().usage {
+            return Ok(Vec::new());
+        }
+        let budget = p.poll_budget();
+        let now_s = self.now_ms().div_euclid(1000);
+        let mut cands = Vec::new();
+        for row in rows {
+            let is_live = live.is_some_and(|l| l.id == row.id);
+            if is_live || !is_candidate(row) || p.kind_traits(&row.kind).managed_key_axis {
+                continue;
+            }
+            let state = store.usage_state(&row.id)?;
+            let (fetched_at, backoff_until, next_poll_at) = state.map_or((None, None, None), |s| {
+                (s.fetched_at, s.backoff_until, s.next_poll_at)
+            });
+            cands.push(DueCandidate {
+                position: row.position,
+                due: !backoff_holds(backoff_until, now_s)
+                    && Eligibility::Scheduled.allows(fetched_at, next_poll_at, now_s, &budget),
+                fetched_at: fetched_at.filter(|t| !is_future_stamped(*t, now_s)),
+            });
+        }
+        let live_pct = match live {
+            Some(row) => self
+                .decision_windows(row, models)?
+                .and_then(|w| max_relevant_pct(&w, models)),
+            None => None,
+        };
+        let escalate = escalates(live_pct, threshold, budget.escalation_margin);
+        Ok(scheduled_pick(&cands, escalate)
+            .into_iter()
+            .filter_map(|position| rows.iter().find(|r| r.position == position))
+            .collect())
+    }
+
+    /// The roles every thread needs, read before any starts. Each provider's recorded active
+    /// account is read before its live login: a switch writes the live login before it commits
+    /// the record, so a record read first can only be older than the live role, never newer
+    /// (`Collection::active_now`).
+    fn roles(&self, store: &Store, rows: &[AccountRow]) -> Result<Roles, EngineError> {
         let mut recorded: HashMap<ProviderId, Option<AccountId>> = HashMap::new();
-        for row in &rows {
+        for row in rows {
             if !recorded.contains_key(&row.provider) {
                 recorded.insert(row.provider.clone(), store.active(&row.provider)?);
             }
         }
         hooks::point(self, "usage-roles-between-reads")?;
-        let live = self.live_accounts(&rows);
-        let results: Vec<Result<Outcome, EngineError>> = thread::scope(|s| {
+        Ok(Roles {
+            recorded,
+            live: self.live_accounts(rows),
+        })
+    }
+
+    /// Each of `rows` on its own thread (§8.3), waiting for them all; each result with its row.
+    fn collect_each<'r>(
+        &self,
+        store: &Store,
+        rows: &[&'r AccountRow],
+        roles: &Roles,
+        policy: Policy<'_>,
+    ) -> Vec<(&'r AccountRow, Result<Outcome, EngineError>)> {
+        thread::scope(|s| {
             let running: Vec<_> = rows
                 .iter()
-                .map(|row| {
-                    let active = live.contains(&row.id);
-                    let started_with = recorded[&row.provider].clone();
-                    s.spawn(move || self.collect_one(store, row, active, started_with))
+                .map(|&row| {
+                    let active = roles.live.contains(&row.id);
+                    let started_with = roles.recorded[&row.provider].clone();
+                    let thread =
+                        s.spawn(move || self.collect_one(store, row, active, started_with, policy));
+                    (row, thread)
                 })
                 .collect();
             running
                 .into_iter()
-                .map(|t| match t.join() {
-                    Ok(result) => result,
+                .map(|(row, t)| match t.join() {
+                    Ok(result) => (row, result),
                     Err(panic) => std::panic::resume_unwind(panic),
                 })
                 .collect()
-        });
-        // §14.1: a collection the token was set during is the command's interruption, whatever
-        // each account did. A request already sent was recorded as usual; nothing else was.
-        if let Some(signal) = self.cancel().requested() {
-            return Err(EngineError::Interrupted(signal));
-        }
-        let mut report = CollectReport::default();
-        for (row, result) in rows.iter().zip(results) {
-            let (collected, warnings) = result.unwrap_or_else(|e| {
-                let warning = format!(
-                    "usage for {} (position {}) was not collected: {e}",
-                    row.label, row.position
-                );
-                (
-                    Collected::Failed {
-                        kind: "error".to_owned(),
-                    },
-                    vec![warning],
-                )
-            });
-            report.outcomes.push((row.id.clone(), collected));
-            report.warnings.extend(warnings);
-        }
-        Ok(report)
+        })
     }
 
     /// The accounts the providers' live logins name (§8.1's active accounts), read once,
@@ -179,20 +395,23 @@ impl Engine {
         live
     }
 
-    /// One account through §8.3's three phases.
+    /// One account through §8.3's three phases. Afterwards the account is read again: a
+    /// quarantine now was set while this collection ran, since `reserve_usage` refuses a
+    /// quarantined account.
     fn collect_one(
         &self,
         store: &Store,
         row: &AccountRow,
         active: bool,
         recorded_active: Option<AccountId>,
+        policy: Policy<'_>,
     ) -> Result<Outcome, EngineError> {
         let Some(provider) = self.registry.get(&row.provider) else {
-            return Ok((Collected::Unsupported, Vec::new()));
+            return Ok(Outcome::unreserved(Collected::Unsupported));
         };
         let p = provider.as_ref();
         if !p.capabilities().usage || p.kind_traits(&row.kind).managed_key_axis {
-            return Ok((Collected::Unsupported, Vec::new()));
+            return Ok(Outcome::unreserved(Collected::Unsupported));
         }
         let budget = p.poll_budget();
         // §14.1's first cancellation point: once the token is set, nothing is reserved.
@@ -200,13 +419,16 @@ impl Engine {
             return Err(EngineError::Interrupted(signal));
         }
         // Phase 1: eligibility, the lease and the slot, in one transaction.
-        let reservation = match store.reserve_usage(row, self.now_ms(), true, &budget)? {
-            Reserve::Reserved(r) => r,
-            Reserve::Ineligible(why) => return Ok((Collected::Ineligible(why), Vec::new())),
-            Reserve::OverBudget { next_free_at } => {
-                return Ok((Collected::OverBudget { next_free_at }, Vec::new()));
-            }
-        };
+        let reservation =
+            match store.reserve_usage(row, self.now_ms(), policy.eligibility, &budget)? {
+                Reserve::Reserved(r) => r,
+                Reserve::Ineligible(why) => {
+                    return Ok(Outcome::unreserved(Collected::Ineligible(why)));
+                }
+                Reserve::OverBudget { next_free_at } => {
+                    return Ok(Outcome::unreserved(Collected::OverBudget { next_free_at }));
+                }
+            };
         let slot = Slot {
             slot: reservation.slot,
             slot_at: reservation.slot_at,
@@ -228,6 +450,8 @@ impl Engine {
             row,
             active,
             budget,
+            threshold: policy.threshold,
+            models: policy.models,
             slot: Some(slot),
             rejected: state.as_ref().and_then(|s| s.rejected_fp.clone()),
             gated: false,
@@ -239,7 +463,15 @@ impl Engine {
         // Phase 2, holding no lock but those the gate or §7.5 take for their own refresh.
         let fetched = if active { run.active() } else { run.inactive() };
         // Phase 3.
-        run.record(fetched)
+        let (collected, warnings) = run.record(fetched)?;
+        let quarantined = store
+            .account(&row.id)?
+            .is_some_and(|r| r.quarantine_reason.is_some());
+        Ok(Outcome {
+            collected,
+            warnings,
+            quarantined,
+        })
     }
 }
 
@@ -252,6 +484,9 @@ struct Collection<'a> {
     /// Whether the live login names this account (§8.1's active account).
     active: bool,
     budget: PollBudget,
+    /// The threshold and models the next plan is made for (`Policy`).
+    threshold: f64,
+    models: &'a [String],
     reservation: Reservation,
     /// The slot reserved for the next request, while that request is unsent. `send` hands it
     /// to `authorize_send` and puts it back only if the request never left; one still here at
@@ -738,10 +973,10 @@ impl Collection<'_> {
         ));
     }
 
-    /// §8.6's next plan after a success, from the previous reading and this one.
+    /// §8.6's next plan after a success, from the previous reading and this one, under the
+    /// collection's threshold and models.
     fn plan(&self, windows: &[Window], active: bool, now_s: i64) -> PollPlan {
-        let settings = self.engine.settings();
-        let models = &settings.models;
+        let models = self.models;
         let prev = self.state.as_ref();
         let inputs = PollInputs {
             now_s,
@@ -751,7 +986,7 @@ impl Collection<'_> {
                 .and_then(|s| s.last_good.as_deref())
                 .and_then(|w| max_relevant_pct(w, models)),
             prev_interval_s: prev.and_then(|s| s.poll_interval_s),
-            threshold: settings.threshold,
+            threshold: self.threshold,
             last_429_at: prev.and_then(|s| s.last_429_at),
             next_relevant_reset: earliest_relevant_reset(windows, models),
         };
@@ -764,7 +999,10 @@ impl Collection<'_> {
     /// and gives back, by its full identity, a slot whose request was never sent. So does an
     /// error, from any step, best effort: a release that fails never masks it, and the lease
     /// expires as usual.
-    fn record(mut self, fetched: Result<Vec<Window>, Stop>) -> Result<Outcome, EngineError> {
+    fn record(
+        mut self,
+        fetched: Result<Vec<Window>, Stop>,
+    ) -> Result<(Collected, Vec<String>), EngineError> {
         match self.record_to_store(fetched) {
             Ok(collected) => Ok((collected, self.warnings)),
             Err(e) => {

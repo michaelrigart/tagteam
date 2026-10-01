@@ -308,7 +308,7 @@ fn login_of(row: Option<&AccountRow>) -> Option<(&AccountId, &str, &str)> {
 /// A rotation candidate by the store alone (§9.3 "Reading the vault lazily"): enabled, not
 /// quarantined, and with an identity. Whether its vault holds a credential is read only when
 /// the walk reaches it.
-fn is_candidate(row: &AccountRow) -> bool {
+pub(crate) fn is_candidate(row: &AccountRow) -> bool {
     !row.disabled && row.quarantine_reason.is_none() && row.identity_json.is_object()
 }
 
