@@ -7,6 +7,7 @@
 mod paths;
 mod provider;
 mod shape;
+mod usage;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

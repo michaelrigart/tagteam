@@ -3,13 +3,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::provider::ClaudeCode;
+use tagteam_cc::usage;
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service, read_services};
 use tagteam_core::Fingerprint;
+use tagteam_provider::http::{HttpResponse, Method, ScriptedHttp};
+use tagteam_provider::provider::TransientKind;
 use tagteam_provider::{
-    Capabilities, Env, FakeKeychain, KindTraits, LockError, MutationGuard, Provider, ProviderError,
-    Read, SecretStore, StoredLogin,
+    Capabilities, Credential, Env, FakeKeychain, KindTraits, LockError, MutationGuard, Pace,
+    PollBudget, Provider, ProviderError, Read, SecretStore, StoredLogin, UsageResult,
 };
 
 /// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
@@ -763,4 +767,136 @@ fn lock_live_spends_one_budget_across_both_stages() {
     release.join().unwrap();
     assert!(spent < Duration::from_millis(3000), "{spent:?}");
     assert!(!paths.refresh_lock.exists() && !paths.legacy_lock().exists());
+}
+
+/// The recorded usage reply's body (`usage-200.json`, Appendix A.5).
+fn usage_body() -> Value {
+    let v: Value = serde_json::from_str(include_str!("fixtures/endpoints/usage-200.json")).unwrap();
+    v["body"].clone()
+}
+
+/// An OAuth credential whose access token expired long ago: expiry is the engine's to act on.
+fn with_access(at: &str) -> Credential {
+    Credential::fresh(
+        json!({"claudeAiOauth": {"accessToken": at, "refreshToken": "rt", "expiresAt": 1}})
+            .to_string()
+            .into_bytes(),
+    )
+}
+
+#[test]
+fn fetch_usage_sends_the_access_token_as_it_is_and_never_refreshes() {
+    let f = fx();
+    let http = ScriptedHttp::new();
+    let e = Endpoints::production();
+    http.push_json(Method::Get, &e.usage, 200, usage_body());
+    assert_eq!(
+        f.cc.fetch_usage(&http, &with_access("at-usage")),
+        UsageResult::Windows(usage::normalize(&usage_body()).unwrap())
+    );
+    let sent = http.requests();
+    assert_eq!(sent.len(), 1, "one usage request and no token request");
+    assert_eq!(
+        (sent[0].method, sent[0].url.as_str()),
+        (Method::Get, e.usage.as_str())
+    );
+    assert_eq!(
+        sent[0].headers,
+        vec![
+            ("authorization".to_owned(), "Bearer at-usage".to_owned()),
+            ("anthropic-beta".to_owned(), "oauth-2025-04-20".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn fetch_usage_sends_nothing_without_an_access_token() {
+    let f = fx();
+    let http = ScriptedHttp::new();
+    for bytes in [
+        b"sk-ant-api03-key".to_vec(),
+        json!({"claudeAiOauth": {"refreshToken": "rt"}})
+            .to_string()
+            .into_bytes(),
+        json!({"claudeAiOauth": {"accessToken": "", "refreshToken": ""}})
+            .to_string()
+            .into_bytes(),
+        b"not json".to_vec(),
+    ] {
+        assert_eq!(
+            f.cc.fetch_usage(&http, &Credential::fresh(bytes)),
+            UsageResult::NoAccessToken
+        );
+    }
+    assert!(http.requests().is_empty());
+}
+
+#[test]
+fn a_setup_token_is_fetched_like_any_access_token() {
+    // Decision 11: whether the endpoint accepts a `user:inference`-only token is unrecorded,
+    // so it is asked, and a refusal is an ordinary verdict.
+    let f = fx();
+    let http = ScriptedHttp::new();
+    http.push_json(Method::Get, &Endpoints::production().usage, 401, json!({}));
+    let setup = Credential::fresh(tagteam_cc::shape::setup_token_credential(
+        "sk-ant-oat01-setup",
+    ));
+    assert_eq!(f.cc.fetch_usage(&http, &setup), UsageResult::Unauthorized);
+    assert_eq!(
+        http.requests()[0].headers[0],
+        (
+            "authorization".to_owned(),
+            "Bearer sk-ant-oat01-setup".to_owned()
+        )
+    );
+}
+
+#[test]
+fn a_rate_limited_fetch_carries_its_retry_after() {
+    let f = fx();
+    let http = ScriptedHttp::new();
+    http.push(
+        Method::Get,
+        &Endpoints::production().usage,
+        Ok(HttpResponse {
+            status: 429,
+            headers: vec![("retry-after".into(), "90".into())],
+            body: vec![],
+        }),
+    );
+    assert_eq!(
+        f.cc.fetch_usage(&http, &with_access("at")),
+        UsageResult::Failed {
+            kind: TransientKind::Http(429),
+            retry_after_s: Some(90.0)
+        }
+    );
+}
+
+#[test]
+fn claude_code_s_budget_rendering_and_live_identity_source() {
+    let f = fx();
+    assert_eq!(f.cc.poll_budget(), PollBudget::STANDARD);
+    assert_eq!(
+        f.cc.live_identity_source(&f.env),
+        Some(f.env.home.join(".claude.json"))
+    );
+    let mut env = f.env.clone();
+    let dir = f.env.home.join("cfg");
+    env.claude_config_dir = Some(dir.clone().into_os_string());
+    assert_eq!(
+        f.cc.live_identity_source(&env),
+        Some(CcPaths::resolve(&env).global_config),
+        "the file live_identity reads"
+    );
+    assert_eq!(
+        f.cc.live_identity_source(&env),
+        Some(dir.join(".claude.json"))
+    );
+    let windows: Vec<_> = usage::normalize(&usage_body())
+        .unwrap()
+        .into_iter()
+        .map(|w| (w, Pace::default()))
+        .collect();
+    assert_eq!(f.cc.render_usage(&windows)["sevenDay"]["pct"], json!(77.0));
 }
