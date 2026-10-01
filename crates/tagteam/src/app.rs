@@ -25,7 +25,7 @@ use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
 
 use crate::cli::{Cli, Command, StrategyArg};
 use crate::prompt::Prompter;
-use crate::{history, render, root_guard, statusline};
+use crate::{history, prompt, render, root_guard, statusline};
 
 /// §13.1.
 pub(crate) const EXIT_ERROR: i32 = 1;
@@ -803,6 +803,13 @@ impl App<'_, '_> {
     /// only when a person can answer.
     fn token(&mut self, token: Option<String>) -> Result<String, Failure> {
         match token {
+            Some(t) if t == "-" && std::io::stdin().is_terminal() => {
+                // A plain read would sit through Ctrl-C until Enter (the handler restarts it).
+                let line =
+                    prompt::read_terminal_line(self.engine.cancel()).map_err(EngineError::Io)?;
+                self.after_prompt()?;
+                line.ok_or_else(cancelled)
+            }
             Some(t) if t == "-" => {
                 let mut line = String::new();
                 std::io::stdin()

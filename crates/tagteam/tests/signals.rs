@@ -402,3 +402,52 @@ fn ctrl_c_during_a_debug_collection_exits_130() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// A pseudo-terminal pair: the master end the test keeps, and the slave end a child takes as
+/// its stdin.
+fn open_pty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty(3) writes two descriptors into the integers passed; the name, termios
+    // and winsize arguments may be null.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: openpty succeeded, so both are open descriptors that nothing else owns.
+    unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) }
+}
+
+#[test]
+fn ctrl_c_while_add_token_reads_a_terminal_stdin_exits_130_without_waiting_for_enter() {
+    // `add-token -` on a terminal: the handler restarts syscalls, so a plain read_line would
+    // sit there until Enter. The line is read in slices the token ends instead.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (_a, _b) = two_fresh_accounts(root);
+    let (_master, slave) = open_pty();
+
+    let child = std_cmd(root)
+        .args(["add-token", "-"])
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(1000)); // it is waiting for a line by now
+    send(&child, libc::SIGINT);
+    let out = finish(child, Duration::from_secs(5));
+
+    assert_eq!(
+        out.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

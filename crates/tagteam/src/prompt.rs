@@ -240,6 +240,22 @@ fn answer_of(read: io::Result<LineRead>) -> Option<String> {
     }
 }
 
+/// One line from the terminal stdin is, for `add-token -`: read as a prompt reads one, in slices
+/// the token ends, so Ctrl-C does not wait for Enter (the handler restarts a plain read). `None`
+/// once a signal ended it; end of input reads as an empty line, as a plain read would.
+pub fn read_terminal_line(cancel: &Cancel) -> io::Result<Option<String>> {
+    let tty = open_prompt_terminal()?;
+    match read_line(&tty, cancel)? {
+        LineRead::Line(line) => Ok(Some(line)),
+        LineRead::End => Ok(Some(String::new())),
+        LineRead::Interrupted => {
+            // The terminal echoed no newline: end the line the `^C` is on.
+            ask("\n");
+            Ok(None)
+        }
+    }
+}
+
 /// The terminal's settings.
 fn termios(tty: BorrowedFd<'_>) -> io::Result<libc::termios> {
     let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
