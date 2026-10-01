@@ -256,6 +256,45 @@ pub fn read_terminal_line(cancel: &Cancel) -> io::Result<Option<String>> {
     }
 }
 
+/// One line from stdin when it is not a terminal (`add-token -`), without changing fd 0's file
+/// description: `wait_for_input`'s slices, with the token looked at between them, then a read of
+/// what is there (a blocking read returns at once with what a readable pipe holds, or with the
+/// end). The handler restarts a plain read, so one that waited on a writer that never sends a
+/// newline would never see a signal. `None` once a signal ended it. The line keeps its ending,
+/// as `read_line` leaves it; end of input before a newline ends the line.
+pub fn read_piped_line(cancel: &Cancel) -> io::Result<Option<String>> {
+    use io::BufRead;
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut line = Vec::new();
+    loop {
+        // Every chunk is consumed whole unless it ends the line, so nothing is buffered here.
+        if !wait_for_input(input.as_raw_fd(), cancel) {
+            return Ok(None);
+        }
+        let chunk = match input.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() {
+            break;
+        }
+        let (taken, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(end) => (end + 1, true),
+            None => (chunk.len(), false),
+        };
+        line.extend_from_slice(&chunk[..taken]);
+        input.consume(taken);
+        if done {
+            break;
+        }
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the line is not UTF-8"))
+}
+
 /// The terminal's settings.
 fn termios(tty: BorrowedFd<'_>) -> io::Result<libc::termios> {
     let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();

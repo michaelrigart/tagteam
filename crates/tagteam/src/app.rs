@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -811,12 +811,12 @@ impl App<'_, '_> {
                 line.ok_or_else(cancelled)
             }
             Some(t) if t == "-" => {
-                let mut line = String::new();
-                std::io::stdin()
-                    .lock()
-                    .read_line(&mut line)
-                    .map_err(EngineError::Io)?;
-                Ok(line)
+                // Read in slices the token ends, and checked again after the read: a signal that
+                // landed during it reports the interruption, never the input it cut short.
+                let line =
+                    prompt::read_piped_line(self.engine.cancel()).map_err(EngineError::Io)?;
+                self.after_prompt()?;
+                line.ok_or_else(cancelled)
             }
             Some(t) => Ok(t),
             None if self.can_prompt() => {

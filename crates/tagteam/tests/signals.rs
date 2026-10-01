@@ -451,3 +451,83 @@ fn ctrl_c_while_add_token_reads_a_terminal_stdin_exits_130_without_waiting_for_e
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn a_signal_while_add_token_reads_a_pipe_that_stays_open_exits_with_it_and_the_interrupted_envelope()
+ {
+    // `add-token -` from a pipe whose writer keeps it open without a newline: a plain read_line
+    // waits for the writer through the signal (the handler restarts it).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    two_fresh_accounts(root);
+
+    let mut child = std_cmd(root)
+        .args(["add-token", "-", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut writer = child.stdin.take().unwrap();
+    std::io::Write::write_all(&mut writer, b"sk-ant-api03-no-newline").unwrap();
+    thread::sleep(Duration::from_millis(500)); // it is waiting for the rest of the line
+    send(&child, libc::SIGTERM);
+    let out = finish(child, Duration::from_secs(5));
+    drop(writer);
+
+    assert_eq!(
+        out.status.code(),
+        Some(143),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({"schemaVersion": 1, "error": {"type": "interrupted", "message": "interrupted"}})
+    );
+}
+
+#[test]
+fn eof_arriving_after_a_signal_still_reports_the_interruption_and_adds_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    two_fresh_accounts(root);
+    let before = store(root)
+        .accounts(&ProviderId::new(CLAUDE_CODE))
+        .unwrap()
+        .len();
+
+    let mut child = std_cmd(root)
+        .args(["add-token", "-", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut writer = child.stdin.take().unwrap();
+    std::io::Write::write_all(&mut writer, b"sk-ant-api03-complete-but-unterminated").unwrap();
+    thread::sleep(Duration::from_millis(500));
+    send(&child, libc::SIGTERM);
+    thread::sleep(Duration::from_millis(30));
+    drop(writer); // end of input, after the signal
+    let out = finish(child, Duration::from_secs(5));
+
+    assert_eq!(
+        out.status.code(),
+        Some(143),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({"schemaVersion": 1, "error": {"type": "interrupted", "message": "interrupted"}})
+    );
+    assert_eq!(
+        store(root)
+            .accounts(&ProviderId::new(CLAUDE_CODE))
+            .unwrap()
+            .len(),
+        before,
+        "the token was not added"
+    );
+}
