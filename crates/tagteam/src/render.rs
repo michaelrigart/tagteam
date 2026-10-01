@@ -852,6 +852,28 @@ mod tests {
     }
 
     #[test]
+    fn a_usage_strategy_outcome_renders_its_strategy_reason_and_warnings() {
+        let message =
+            "every candidate is at its limit: a@x.co (7d at 100%); the earliest reset is in 3d09h";
+        let o = SwitchOutcome {
+            switched: false,
+            strategy: "next-available",
+            reason: SwitchReason::CandidatesExhausted,
+            message: message.into(),
+            warnings: vec!["usage was not collected: the store is locked".into()],
+            ..stored(None)
+        };
+        assert_eq!(
+            switch_json(&o, CLAUDE_CODE),
+            json!({"schemaVersion": 1, "provider": CLAUDE_CODE, "switched": false, "from": null,
+                   "to": null, "strategy": "next-available", "reason": "candidates-exhausted",
+                   "message": message, "credentialStore": null,
+                   "warnings": ["usage was not collected: the store is locked"]})
+        );
+        assert_eq!(switch_human(&o), format!("{message}\n"));
+    }
+
+    #[test]
     fn active_account_number_is_the_queried_providers_wherever_it_is_listed() {
         let lists = [accounts("other", Some(5)), accounts(CLAUDE_CODE, Some(2))];
         let v = list_json(&lists, &ProviderId::new(CLAUDE_CODE), &count);

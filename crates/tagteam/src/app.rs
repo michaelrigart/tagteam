@@ -15,7 +15,7 @@ use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::{ColorMode, Settings};
 use tagteam_engine::store::AccountRow;
-use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget};
+use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, StatusView};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
@@ -23,7 +23,7 @@ use tagteam_provider::http::Http;
 use tagteam_provider::security::SecurityCli;
 use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, StrategyArg};
 use crate::prompt::Prompter;
 use crate::{history, render, root_guard, statusline};
 
@@ -242,6 +242,25 @@ fn render_usage(engine: &Engine) -> impl Fn(&ProviderId, &[(Window, Pace)]) -> V
             .provider(provider)
             .map_or(Value::Null, |p| p.render_usage(windows))
     }
+}
+
+/// `--strategy`'s value as the engine names it (§9.3).
+fn usage_strategy(s: StrategyArg) -> UsageStrategy {
+    match s {
+        StrategyArg::Best => UsageStrategy::Best,
+        StrategyArg::NextAvailable => UsageStrategy::NextAvailable,
+    }
+}
+
+/// `--model` (§9.3): a comma-separated list of model names, each trimmed, empty ones dropped.
+/// `all` passes as written; §8.2's relevance matches it in any case. An empty list is still an
+/// override: no model window counts for this switch.
+fn model_list(arg: &str) -> Vec<String> {
+    arg.split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Whether a colour variable (`NO_COLOR`, `FORCE_COLOR`) is in force: set to a non-empty value
@@ -659,7 +678,12 @@ impl App<'_, '_> {
                 let json = render::status_json(&s, provider.as_str(), &render_usage(&self.engine));
                 self.print(&human, json);
             }
-            Command::Switch { account, force } => self.switch(account, force)?,
+            Command::Switch {
+                account,
+                force,
+                strategy,
+                model,
+            } => self.switch(account, force, strategy, model)?,
             Command::Add {
                 position,
                 alias,
@@ -874,13 +898,29 @@ impl App<'_, '_> {
         Ok(())
     }
 
-    fn switch(&mut self, account: Option<String>, force: bool) -> Result<(), Failure> {
-        let (target, provider) = match &account {
-            Some(a) => {
+    /// §9: a direct switch to ACCOUNT, a bare rotation, or a usage strategy (§9.3) with its
+    /// `--model` override. clap has already refused `--strategy` with an ACCOUNT and `--model`
+    /// without `--strategy` (Decision 7).
+    fn switch(
+        &mut self,
+        account: Option<String>,
+        force: bool,
+        strategy: Option<StrategyArg>,
+        model: Option<String>,
+    ) -> Result<(), Failure> {
+        let (target, provider) = match (&account, strategy) {
+            (Some(a), _) => {
                 let row = self.resolve(a)?;
                 (SwitchTarget::Account(row.id), row.provider)
             }
-            None => (SwitchTarget::Rotation, self.provider()),
+            (None, Some(s)) => (
+                SwitchTarget::Usage {
+                    strategy: usage_strategy(s),
+                    models: model.as_deref().map(model_list),
+                },
+                self.provider(),
+            ),
+            (None, None) => (SwitchTarget::Rotation, self.provider()),
         };
         let req = || SwitchRequest {
             provider: provider.clone(),
@@ -1075,5 +1115,25 @@ mod tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn model_lists_are_trimmed_and_drop_empty_names() {
+        assert_eq!(model_list("Fable"), ["Fable"]);
+        assert_eq!(
+            model_list(" Fable , opus ,, all "),
+            ["Fable", "opus", "all"]
+        );
+        assert!(model_list("").is_empty());
+        assert!(model_list(" , ").is_empty());
+    }
+
+    #[test]
+    fn each_strategy_flag_names_its_engine_strategy() {
+        assert_eq!(usage_strategy(StrategyArg::Best), UsageStrategy::Best);
+        assert_eq!(
+            usage_strategy(StrategyArg::NextAvailable),
+            UsageStrategy::NextAvailable
+        );
     }
 }

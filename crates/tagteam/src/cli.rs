@@ -31,12 +31,18 @@ pub enum Command {
     List,
     /// Show the live account
     Status,
-    /// Switch to the next account, or to ACCOUNT
+    /// Switch to the next account, to ACCOUNT, or to the one a usage strategy picks
     Switch {
         account: Option<String>,
         /// Activate even over an unmanaged live login, displacing it
         #[arg(long)]
         force: bool,
+        /// best or next-available
+        #[arg(long, value_enum, conflicts_with = "account")]
+        strategy: Option<StrategyArg>,
+        /// Model limits that count, comma-separated, or `all`
+        #[arg(long, requires = "strategy")]
+        model: Option<String>,
     },
     /// Store the current Claude Code login
     Add {
@@ -102,6 +108,15 @@ pub enum Command {
         #[arg(long = "print-config")]
         print_config: bool,
     },
+}
+
+/// `switch --strategy` (§9.3): the strategies that rank accounts by usage.
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum StrategyArg {
+    /// The candidate with the most headroom, if it has more than the live account
+    Best,
+    /// The next account in rotation that is not at its limit
+    NextAvailable,
 }
 
 impl Command {
