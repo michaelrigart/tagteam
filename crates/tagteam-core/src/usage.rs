@@ -64,10 +64,15 @@ pub struct Window {
 }
 
 /// `last_good`'s stored form: `[{"key","label","kind","pct","resetsAt"?,"periodS"?,"detail"?}]`.
+///
+/// A window whose `pct` is not finite is left out: JSON has no such number, it would be written
+/// as `null`, and a single `null` `pct` makes [`windows_from_json`] discard the whole reading.
+/// Normalizers keep `pct` finite, so this only guards the stored form.
 pub fn windows_to_json(windows: &[Window]) -> Value {
     Value::Array(
         windows
             .iter()
+            .filter(|w| w.pct.is_finite())
             .map(|w| {
                 let mut o = Map::new();
                 o.insert("key".into(), Value::from(w.key.as_str()));
@@ -326,6 +331,28 @@ mod tests {
                 json!([{"key": "5h", "label": "5h", "kind": "short", "pct": 1.0,
                         "periodS": 1.5}]),
             ),
+            (
+                "key as a number",
+                json!([{"key": 5, "label": "5h", "kind": "short", "pct": 1.0}]),
+            ),
+            (
+                "label as a number",
+                json!([{"key": "5h", "label": 5, "kind": "short", "pct": 1.0}]),
+            ),
+            (
+                "kind as a number",
+                json!([{"key": "5h", "label": "5h", "kind": 1, "pct": 1.0}]),
+            ),
+            (
+                "resetsAt as a float",
+                json!([{"key": "5h", "label": "5h", "kind": "short", "pct": 1.0,
+                        "resetsAt": 1.5e9}]),
+            ),
+            (
+                "resetsAt beyond i64::MAX",
+                json!([{"key": "5h", "label": "5h", "kind": "short", "pct": 1.0,
+                        "resetsAt": 9_223_372_036_854_775_808u64}]),
+            ),
         ];
         for (name, v) in cases {
             assert_eq!(windows_from_json(&v), None, "{name}");
@@ -336,8 +363,25 @@ mod tests {
     }
 
     #[test]
+    fn a_non_finite_pct_is_left_out_of_the_stored_form_and_the_rest_round_trips() {
+        let good_a = win("5h", "5h", WindowKind::Short, 9.0);
+        let good_b = win("7d", "7d", WindowKind::Long, 40.0);
+        let windows = vec![
+            good_a.clone(),
+            win("scoped:Fable", "Fable", WindowKind::Scoped, f64::NAN),
+            win("scoped:Opus", "Opus", WindowKind::Scoped, f64::INFINITY),
+            good_b.clone(),
+        ];
+        let json = windows_to_json(&windows);
+        assert_eq!(json.as_array().unwrap().len(), 2);
+        assert_eq!(windows_from_json(&json), Some(vec![good_a, good_b]));
+    }
+
+    #[test]
     fn a_non_finite_pct_reads_as_no_reading() {
-        // `1e999` is valid JSON that overflows an f64 (serde_json keeps the digits).
+        // `1e999` is valid JSON that overflows an f64. Parsing it as a number at all relies on
+        // serde_json's `arbitrary_precision` feature (enabled in the workspace manifest), which
+        // keeps the digits; `as_f64` then gives infinity, which must read as no reading.
         let v: Value = serde_json::from_str(
             r#"[{"key": "5h", "label": "5h", "kind": "short", "pct": 1e999}]"#,
         )
