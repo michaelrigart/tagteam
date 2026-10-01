@@ -81,8 +81,10 @@ impl Engine {
     /// store failing under it): every thread is joined and kept, and that account's outcome is
     /// `Failed { kind: "error" }` with one warning naming it, so one account never costs the
     /// others' outcomes. `Err` only for an error before any thread starts (opening the store,
-    /// reading the listed accounts, reading each provider's recorded active account). IDs
-    /// that name no account are skipped. Never creates the store.
+    /// reading the listed accounts, reading each provider's recorded active account), or for
+    /// §14.1's cancel token set during the collection: `Interrupted`, once every thread has
+    /// joined and given back the slot it held unsent. IDs that name no account are skipped.
+    /// Never creates the store.
     pub fn collect_usage(&self, mode: CollectMode) -> Result<CollectReport, EngineError> {
         let CollectMode::OnDemand { accounts } = mode;
         hooks::point(self, "usage-collect-start")?;
@@ -124,6 +126,11 @@ impl Engine {
                 })
                 .collect()
         });
+        // §14.1: a collection the token was set during is the command's interruption, whatever
+        // each account did. A request already sent was recorded as usual; nothing else was.
+        if let Some(signal) = self.cancel().requested() {
+            return Err(EngineError::Interrupted(signal));
+        }
         let mut report = CollectReport::default();
         for (row, result) in rows.iter().zip(results) {
             let (collected, warnings) = result.unwrap_or_else(|e| {
@@ -188,6 +195,10 @@ impl Engine {
             return Ok((Collected::Unsupported, Vec::new()));
         }
         let budget = p.poll_budget();
+        // §14.1's first cancellation point: once the token is set, nothing is reserved.
+        if let Some(signal) = self.cancel().requested() {
+            return Err(EngineError::Interrupted(signal));
+        }
         // Phase 1: eligibility, the lease and the slot, in one transaction.
         let reservation = match store.reserve_usage(row, self.now_ms(), true, &budget)? {
             Reserve::Reserved(r) => r,
@@ -298,11 +309,20 @@ enum Stop {
     /// best effort, so a lasting fault does not spend the hourly budget (§8.6); `collect_usage`
     /// turns it into a warning and a `Failed { kind: "error" }` outcome.
     Error(EngineError),
+    /// §14.1: the cancel token was set at a cancellation point, or a lock wait on the way met
+    /// it. Not a usage failure: nothing is recorded (no failure count, no backoff), and the
+    /// unsent slot goes back. The lease is left to expire, as after any record. `collect_usage`
+    /// reports the whole collection as interrupted, never this account as failed.
+    Interrupted(i32),
 }
 
+/// An error that carries a signal is the fetch's interruption; any other is an error.
 impl From<EngineError> for Stop {
     fn from(e: EngineError) -> Self {
-        Stop::Error(e)
+        match e.signal() {
+            Some(signal) => Stop::Interrupted(signal),
+            None => Stop::Error(e),
+        }
     }
 }
 
@@ -341,6 +361,26 @@ impl Collection<'_> {
 
     fn now_s(&self) -> i64 {
         self.now_ms().div_euclid(1000)
+    }
+
+    /// §14.1's cancellation point before a usage request, or before a refresh started for one.
+    fn interruption(&self) -> Result<(), Stop> {
+        match self.engine.cancel().requested() {
+            Some(signal) => Err(Stop::Interrupted(signal)),
+            None => Ok(()),
+        }
+    }
+
+    /// A refresh's error as the fetch's stop. A lock wait inside the refresh that met the token
+    /// is the fetch's interruption; any other error is a failure, with a warning.
+    fn refresh_error(&mut self, e: EngineError) -> Stop {
+        match e.signal() {
+            Some(signal) => Stop::Interrupted(signal),
+            None => {
+                self.warn_refresh(&e);
+                failed("refresh-failed")
+            }
+        }
     }
 
     /// §8.1 for an inactive account: the vault's token, refreshed through the gate (§7.3)
@@ -398,10 +438,13 @@ impl Collection<'_> {
     /// refused. `Dead` has quarantined the account (`relogin_required`). Any other outcome, and
     /// any error, is a failure with a warning, never a command error (M2a Task 16's
     /// carry-over), except a live credential the oracle gives to another identity, which has a
-    /// status of its own. A kind that does not refresh never reaches §7.5, which would refuse
-    /// it: its expired token is `token-expired`, and its refused one `http-401`, as on the
-    /// inactive path (Decision 11: a refusal is an ordinary failure).
+    /// status of its own, and §14.1's interruption: no refresh starts once the token is set,
+    /// and a lock wait inside §7.5 that meets it stops the fetch without a record. A kind that
+    /// does not refresh never reaches §7.5, which would refuse it: its expired token is
+    /// `token-expired`, and its refused one `http-401`, as on the inactive path (Decision 11:
+    /// a refusal is an ordinary failure).
     fn refresh_live(&mut self, trigger: ActiveTrigger) -> Result<Vec<u8>, Stop> {
+        self.interruption()?;
         if !self.p.kind_traits(&self.row.kind).refreshable {
             return Err(failed(match trigger {
                 ActiveTrigger::Rejected { .. } => "http-401",
@@ -429,10 +472,7 @@ impl Collection<'_> {
                 Err(failed("refresh-failed"))
             }
             Err(EngineError::ForeignLiveCredential { .. }) => Err(failed("foreign-credential")),
-            Err(e) => {
-                self.warn_refresh(&e);
-                Err(failed("refresh-failed"))
-            }
+            Err(e) => Err(self.refresh_error(e)),
         }
     }
 
@@ -463,9 +503,11 @@ impl Collection<'_> {
 
     /// §7.3 for an inactive account, `snapshot` being the bytes the collector decided on. A
     /// Dead verdict (the gate has quarantined the account) and every deterministic refusal end
-    /// the fetch before anything is sent (§8.1).
+    /// the fetch before anything is sent (§8.1). No refresh starts once the cancel token is set
+    /// (§14.1); one already started runs to its end, its successor persisted.
     fn gate(&mut self, snapshot: &[u8]) -> Result<Vec<u8>, Stop> {
         hooks::point(self.engine, "usage-before-gate")?;
+        self.interruption()?;
         match self.engine.refresh_stored(self.p, &self.row.id, snapshot) {
             Ok(GateOutcome::Refreshed(bytes)) => {
                 self.gated = true;
@@ -485,10 +527,7 @@ impl Collection<'_> {
                 | GateOutcome::Systemic(_)
                 | GateOutcome::Transient { .. },
             ) => Err(failed("refresh-failed")),
-            Err(e) => {
-                self.warn_refresh(&e);
-                Err(failed("refresh-failed"))
-            }
+            Err(e) => Err(self.refresh_error(e)),
         }
     }
 
@@ -593,6 +632,8 @@ impl Collection<'_> {
     /// authorizes it and hands over the slot to send under (`authorize`). A request that never
     /// left (no access token, or a pre-send failure) puts its slot back.
     fn send(&mut self, bytes: &[u8]) -> Result<UsageResult, Stop> {
+        // §14.1: every request, the 401 retry included, is preceded by a cancellation point.
+        self.interruption()?;
         if !self.usable(bytes) {
             return Err(failed("token-expired"));
         }
@@ -805,6 +846,10 @@ impl Collection<'_> {
                 }
                 Collected::Dropped
             }
+            // §14.1: no record at all. As after an error, `record` gives the slot of the
+            // request that never left back, best effort: a release that fails never masks the
+            // interruption.
+            Err(Stop::Interrupted(signal)) => return Err(EngineError::Interrupted(signal)),
             Err(Stop::Error(e)) => return Err(e),
         })
     }

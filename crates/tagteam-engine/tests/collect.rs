@@ -19,13 +19,13 @@ use tagteam_cc::ItemKind;
 use tagteam_cc::usage::normalize;
 use tagteam_core::backoff::failure_backoff_s;
 use tagteam_core::{AccountId, WindowKind};
-use tagteam_engine::Engine;
 use tagteam_engine::account_lock::AccountLock;
-use tagteam_engine::collect::{CollectMode, Collected};
+use tagteam_engine::collect::{CollectMode, CollectReport, Collected};
 use tagteam_engine::store::{Ineligible, UsageStateRow};
 use tagteam_engine::vault::SERVICE;
+use tagteam_engine::{Engine, EngineError};
 use tagteam_provider::{
-    Http, HttpError, HttpRequest, HttpResponse, Keychain, Method, Provider, ScriptedHttp,
+    Cancel, Http, HttpError, HttpRequest, HttpResponse, Keychain, Method, Provider, ScriptedHttp,
 };
 
 /// The fixture clock's start, in the seconds the usage tables hold (Decision 1).
@@ -44,6 +44,21 @@ fn collect_on(engine: &Engine, id: &AccountId) -> Vec<(AccountId, Collected)> {
         })
         .unwrap()
         .outcomes
+}
+
+/// `id`'s on-demand collection through the fixture's engine, error and all.
+fn collect_result(fx: &Fx, id: &AccountId) -> Result<CollectReport, EngineError> {
+    fx.engine.collect_usage(CollectMode::OnDemand {
+        accounts: vec![id.clone()],
+    })
+}
+
+/// §14.1: the collection ended as SIGINT's interruption.
+fn assert_interrupted(result: Result<CollectReport, EngineError>) {
+    match result {
+        Err(EngineError::Interrupted(signal)) => assert_eq!(signal, libc::SIGINT),
+        other => panic!("expected the collection to be interrupted, got {other:?}"),
+    }
 }
 
 /// Spends `n` of the hourly budget of `id`'s identity, reserved `ago` seconds before now.
@@ -103,6 +118,26 @@ fn an_inactive_account_is_fetched_with_its_stored_token_and_recorded() {
     let keys: BTreeSet<&str> = samples.iter().map(|(k, _)| k.as_str()).collect();
     assert_eq!(keys, BTreeSet::from(["5h", "7d", "scoped:Fable"]));
     assert!(samples.iter().all(|(_, s)| s.fetched_at == NOW_S));
+}
+
+#[test]
+fn a_collection_started_after_a_signal_reserves_and_sends_nothing() {
+    // §14.1: the first cancellation point comes before reserving.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    fx.script_usage(200, usage_fixture());
+    fx.engine.cancel().request(libc::SIGINT);
+
+    assert_interrupted(collect_result(&fx, &a));
+
+    assert!(fx.http.requests().is_empty(), "nothing is sent");
+    assert_eq!(fx.usage_state(&a), None, "nothing is recorded");
+    assert_eq!(usage_requests(&fx), 0, "no slot is taken");
+    // No lease either: a process that got no signal collects the account at once.
+    let mut env = fx.env.clone();
+    env.cancel = Cancel::new();
+    let other = fx.engine_with_env(env);
+    assert_eq!(collect_on(&other, &a), [(a.clone(), Collected::Recorded)]);
 }
 
 #[test]
@@ -1370,5 +1405,109 @@ mod hooks {
         assert_eq!(report.outcomes, [(a.clone(), Collected::Dropped)]);
         assert!(fx.http.requests().is_empty());
         assert_eq!(usage_requests(&fx), 0, "the never-sent slot went back");
+    }
+
+    /// The fixture's cancel token, set from inside the named hook as a signal handler would set
+    /// it while the work passes that point.
+    fn signal_at(fx: &Fx, point: &'static str) {
+        let cancel = fx.engine.cancel().clone();
+        fx.engine
+            .on_point(point, Box::new(move || cancel.request(libc::SIGINT)));
+    }
+
+    #[test]
+    fn a_signal_after_reserving_gives_the_slot_back_and_records_nothing() {
+        // §14.1, §8.3: an interrupted fetch is not a usage failure.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+        fx.collect(&[&a]);
+        let before = state(&fx, &a);
+        fx.http.clear();
+        fx.script_usage(200, usage_fixture());
+        // Past the plan (at most 660 s) and the 180 s floor: due again.
+        fx.clock.advance_ms(700_000);
+        signal_at(&fx, "usage-reserved");
+
+        assert_interrupted(collect_result(&fx, &a));
+
+        assert!(
+            fx.http.requests().is_empty(),
+            "nothing is sent once the token is set"
+        );
+        assert_eq!(
+            state(&fx, &a),
+            before,
+            "no failure, no backoff, no attempt: nothing is recorded"
+        );
+        assert_eq!(
+            usage_requests(&fx),
+            1,
+            "only the first collection's request: the reserved slot went back"
+        );
+    }
+
+    #[test]
+    fn a_gate_refresh_in_flight_when_the_signal_lands_still_persists_its_successor() {
+        // §14.1: the gate, from sending the token request to persisting the successor, is a
+        // critical span. The usage request after it is a cancellation point.
+        let fx = Fx::new();
+        let a = due(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        fx.script_usage(200, usage_fixture());
+        signal_at(&fx, "gate-after-response");
+
+        assert_interrupted(collect_result(&fx, &a));
+
+        assert_eq!(
+            methods(&fx),
+            [Method::Post],
+            "the token request only, no usage request"
+        );
+        assert_eq!(
+            fx.vault_refresh_token(&a).as_deref(),
+            Some("rt-a2"),
+            "the successor is in the vault"
+        );
+        assert_eq!(quarantine_of(&fx, &a), (None, None));
+        assert_eq!(fx.usage_state(&a), None, "nothing is recorded");
+        assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    }
+
+    #[test]
+    fn a_request_already_sent_is_recorded_though_the_collection_reports_the_interruption() {
+        // §14.1: a request sent is no cancellation point; its result is recorded as usual.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+        signal_at(&fx, "usage-before-record");
+
+        assert_interrupted(collect_result(&fx, &a));
+
+        let s = state(&fx, &a);
+        assert_eq!(
+            (s.fetched_at, s.consecutive_failures),
+            (Some(NOW_S), 0),
+            "the reading is recorded"
+        );
+        assert_eq!(s.last_good, Some(normalize(&usage_fixture()).unwrap()));
+        assert_eq!(usage_requests(&fx), 1, "the request sent keeps its slot");
+    }
+
+    #[test]
+    fn a_signal_while_the_live_account_waits_for_the_mutation_lock_records_nothing() {
+        // §14.1: the mutation lock's wait (Task 2) is a cancellation point. Reading the live
+        // token stops there; it is no `keychain-unavailable`, and no `Moved`.
+        let fx = Fx::new();
+        fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b");
+        fx.script_usage(200, usage_fixture());
+        signal_at(&fx, "before-mutation-lock");
+
+        assert_interrupted(collect_result(&fx, &b));
+
+        assert!(fx.http.requests().is_empty());
+        assert_eq!(fx.usage_state(&b), None, "nothing is recorded");
+        assert_eq!(usage_requests(&fx), 0, "the slot went back");
     }
 }
