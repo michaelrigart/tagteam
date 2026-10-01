@@ -1085,9 +1085,12 @@ recovery (§9.6), the active-token refresh's live write (§7.5) and profile boot
   - **A marking is no conflict.** An entry that differs from what the writer last read or
     wrote only by such a marking does not abort the write, which goes ahead over it. The
     marking holds no secret. The writer holds the generation CC marked, or a newer one: §7.5's
-    successor, a switch's target, or a rollback's original.
+    successor or a switch's target.
   - The machine-shared keys are taken from this read, so a CC write made since the earlier
     read is never lost.
+  - **A rollback's restore is stricter** (§9.4 step 10). It puts an entry back byte for byte,
+    and only while nothing has written any of the entry's places since tagteam first changed
+    them. A marking or any other write since leaves the whole entry as it is.
 
 When a switch or a recovery takes the three CC locks together, one 9 s budget covers all
 three. The active-token refresh takes the credential locks with that budget and, after its
@@ -1300,9 +1303,18 @@ here on.
     `~/.claude.json` bytes and the original live credential, then restores the journal row's
     `prior` if it carried one — a forced switch's superseded row (§9.6) — or deletes the row
     otherwise. Writing the original credential back is safe here, and only here: CC's credential
-    locks have been held throughout, so CC cannot have rotated it. The operation fails with
-    "rolled back", or with "rollback also failed" listing what could not be restored; the
-    journal row then stays for recovery (§9.6). This covers errors and panics, through `Drop`. A
+    locks have been held throughout, so CC cannot have rotated it.
+    - CC can still write the entry without those locks, under the storage-write lock: its
+      dead-token marking, an MCP token update (§9.1).
+    - So each credential entry is put back byte for byte, to what its places held just before
+      tagteam first changed them, and only while nothing has written them since. That is
+      re-read under the storage-write lock.
+    - Otherwise the entry is left exactly as it is. The rollback never merges, and never moves
+      keys between places.
+
+    The operation fails with "rolled back", or with "rollback also failed" listing what could
+    not be restored; the journal row then stays for recovery (§9.6), which decides from the
+    live credential. This covers errors and panics, through `Drop`. A
     killed process runs no `Drop`: §9.6 covers that.
 
 **After unlocking:**
@@ -3052,7 +3064,8 @@ Each is a one-liner, and each gets at least one test.
 61. Every write of a CC credential entry holds CC's storage-write lock, re-reads the entry under
     it, and keeps the machine-shared keys CC wrote meanwhile (§9.1). It aborts when the
     account-scoped keys changed since the writer last read or wrote them, except by CC's
-    dead-token marking (§9.1), which it writes over.
+    dead-token marking (§9.1), which it writes over. A rollback's restore writes over nothing:
+    it puts an entry back only while nothing has written it since tagteam did (§9.4 step 10).
 62. Every launch checks that the session will authenticate as its account. Validation deletes
     a profile only at a bootstrap, and only when CC reports it logged out or logged in as
     another account; a login that something outside the profile overrides, or that the check
