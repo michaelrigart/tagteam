@@ -142,7 +142,8 @@ pub fn pace(w: &Window, fetched_at: i64, samples: &[Sample]) -> Pace {
         out.expected_pct = Some(expected);
         out.ahead = Some(w.pct - expected >= AHEAD_MARGIN);
     }
-    if w.pct >= 100.0 {
+    let exhausted = w.pct >= 100.0;
+    if exhausted {
         out.exhaustion_at = Some(fetched_at);
     }
     let (rate, method) = match regression_rate(samples, w.resets_at, fetched_at) {
@@ -154,17 +155,13 @@ pub fn pace(w: &Window, fetched_at: i64, samples: &[Sample]) -> Pace {
     };
     out.rate_per_hour = Some(rate * 3600.0);
     out.method = Some(method);
-    out.exhaustion_at = if w.pct >= 100.0 {
-        Some(fetched_at)
-    } else if rate > 0.0 {
+    if !exhausted && rate > 0.0 {
         let seconds = ((100.0 - w.pct) / rate).round() as i64;
-        Some(fetched_at.saturating_add(seconds))
-    } else {
-        None
-    };
+        out.exhaustion_at = Some(fetched_at.saturating_add(seconds));
+    }
     out.will_last_to_reset = w.resets_at.map(|reset| {
         let remaining = reset.saturating_sub(fetched_at).max(0) as f64;
-        w.pct <= 0.0 || w.pct + rate * remaining <= 100.0
+        w.pct + rate * remaining <= 100.0
     });
     out
 }
@@ -534,6 +531,28 @@ mod tests {
         assert_eq!(p.rate_per_hour, Some(0.0));
         assert_eq!(p.exhaustion_at, None, "a zero rate never gets there");
         assert_eq!(p.will_last_to_reset, Some(true));
+    }
+
+    #[test]
+    fn a_window_at_zero_with_a_positive_regression_slope_and_a_distant_reset_will_not_last() {
+        // The latest reading is 0 %, but the fit over the instance still rises (0.5 points an
+        // hour): 0 + 0.5/h · 300 h = 150 > 100. §8.7's formula has no special case for 0 %.
+        let reset = Some(F + 300 * HOUR);
+        let w = window(WindowKind::Short, 0.0, reset, Some(18_000));
+        let samples = [
+            sample(-3 * HOUR, 0.0, reset),
+            sample(-2 * HOUR, 0.0, reset),
+            sample(-HOUR, 5.0, reset),
+            sample(0, 0.0, reset),
+        ];
+        let p = pace(&w, F, &samples);
+        assert_eq!(p.method, Some(ProjectionMethod::Regression));
+        assert!(
+            close(p.rate_per_hour.unwrap(), 0.5),
+            "{:?}",
+            p.rate_per_hour
+        );
+        assert_eq!(p.will_last_to_reset, Some(false));
     }
 
     #[test]
