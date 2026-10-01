@@ -207,6 +207,12 @@ impl Provider for FakeAgent {
         shape::kind_traits(kind)
     }
 
+    /// None on purpose: FakeAgent is the provider whose consume-first setting runs `best`
+    /// (§4.5, §11.5). Its `monthly` meter is still a `Long` window for pace (§8.7).
+    fn primary_long_window(&self) -> Option<&'static str> {
+        None
+    }
+
     fn parse_identity(&self, raw: &Value) -> Result<Identity, ProviderError> {
         shape::identity_from(raw).ok_or_else(|| {
             ProviderError::Invalid("the stored FakeAgent identity has no handle".into())

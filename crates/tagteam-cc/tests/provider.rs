@@ -1026,6 +1026,26 @@ fn claude_code_describes_its_window_keys_as_it_normalizes_them() {
     }
 }
 
+#[test]
+fn consume_first_ranks_on_the_key_claude_code_normalizes_as_its_long_window() {
+    // §4.5: CC's primary long window is "7d". It is the key §8.2's normalization gives the
+    // `Long` window, and the key `describe_window` describes as one, so the two cannot drift.
+    let f = fx();
+    assert_eq!(f.cc.primary_long_window(), Some("7d"));
+    let key = f.cc.primary_long_window().unwrap();
+    let long: Vec<String> = usage::normalize(&usage_body())
+        .unwrap()
+        .into_iter()
+        .filter(|w| w.kind == WindowKind::Long)
+        .map(|w| w.key)
+        .collect();
+    assert_eq!(long, [key]);
+    assert_eq!(
+        f.cc.describe_window(key).map(|w| (w.kind, w.period_s)),
+        Some((WindowKind::Long, Some(604_800)))
+    );
+}
+
 /// A live OAuth login in the Keychain, as CC leaves it; returns the item's (service, account).
 fn keychain_login(f: &Fx) -> (String, String) {
     let svc = keychain_service(&f.env, ItemKind::OAuth);

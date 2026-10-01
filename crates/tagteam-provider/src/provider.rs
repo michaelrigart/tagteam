@@ -472,6 +472,10 @@ pub trait Provider: Send + Sync {
     fn identity_key(&self, id: &Identity) -> IdentityKey;
     fn credential_kinds(&self) -> &'static [&'static str];
     fn kind_traits(&self, kind: &str) -> KindTraits;
+    /// The window consume-first ranks on (§4.5, §11.2 step 8): the key of a `Long` window this
+    /// provider's normalization produces (§8.2). `None` when it offers none; a consume-first
+    /// strategy then runs `best` for this provider.
+    fn primary_long_window(&self) -> Option<&'static str>;
     fn parse_identity(&self, raw: &Value) -> Result<Identity, ProviderError>;
     /// The identity recorded for a token-only account (`add-token`, §10.2).
     fn token_identity(&self, email: &str) -> Identity;
