@@ -12,6 +12,8 @@ use tagteam::cli::Cli;
 use tagteam::prompt::Prompter;
 use tagteam_cc::live::Platform;
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
+use tagteam_core::{CLAUDE_CODE, ProviderId};
+use tagteam_engine::settings::Settings;
 use tagteam_provider::{Env, FakeKeychain};
 
 const UNLOCK: &str = "The login keychain is locked (common over SSH). Unlock it now?";
@@ -794,4 +796,27 @@ fn token_accounts_list_their_kind_from_the_provider() {
     let v = h.json(&["list", "--json"]);
     assert_eq!(v["accounts"][0]["usageStatus"], "unavailable");
     assert_eq!(v["accounts"][1]["usageStatus"], "api_key");
+}
+
+#[test]
+fn settings_warnings_go_to_stderr_and_never_fail_the_command() {
+    // §6.4: reads are forgiving. Each warning is one stderr line; stdout is unchanged, and
+    // `--json` still prints exactly one object (§13.2).
+    let h = H::new();
+    let (code, _, err) = h.run(&["list"], &mut Scripted::none());
+    assert_eq!((code, err.as_str()), (0, ""), "no config.toml, no warning");
+
+    let dir = h.env.config_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    for text in ["[autoswitch]\nthreshold = 5\n", "[autoswitch\n"] {
+        std::fs::write(dir.join("config.toml"), text).unwrap();
+        let (_, warnings) = Settings::load(&h.env, &ProviderId::new(CLAUDE_CODE));
+        assert_eq!(warnings.len(), 1, "{text:?}: {warnings:?}");
+        let expected: String = warnings.iter().map(|w| format!("warning: {w}\n")).collect();
+        let (code, _, err) = h.run(&["list"], &mut Scripted::none());
+        assert_eq!((code, err.as_str()), (0, expected.as_str()), "{text:?}");
+        let (code, out, err) = h.run(&["--json", "list"], &mut Scripted::none());
+        assert_eq!((code, err.as_str()), (0, expected.as_str()), "{text:?}");
+        serde_json::from_str::<Value>(&out).expect("stdout stays one JSON object");
+    }
 }
