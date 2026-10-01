@@ -497,12 +497,15 @@ impl Engine {
             received.disarm();
             return Persisted::Vault;
         }
+        // Keep the successor first, then log (§7.3 step 6): nothing between receiving it and
+        // having it on disk may block, a log write included.
+        let kept = received.keep();
         tracing::error!(
             position = row.position,
             account = %row.id,
             "the vault could not store a refreshed token: {e}"
         );
-        match received.keep() {
+        match kept {
             Ok(()) => Persisted::Rescued,
             Err(e) => {
                 tracing::error!(
@@ -538,14 +541,15 @@ impl Engine {
         match self.vault.read(&row.id) {
             Read::Present(now) if fp_str(p, &now) == sent_fp => {}
             Read::Present(now) => {
+                // The vault moved on to a generation this refresh did not consume, so losing
+                // the successor here quarantines nothing. Keep it first, then log (§7.3 step 6).
+                let kept = received.keep();
                 tracing::error!(
                     position = row.position,
                     account = %row.id,
                     "the vault moved while its refresh was in flight; the successor was kept in rescue/"
                 );
-                // The vault moved on to a generation this refresh did not consume, so losing
-                // the successor here quarantines nothing.
-                return Ok(match received.keep() {
+                return Ok(match kept {
                     Ok(()) => GateOutcome::AlreadyFresh(now),
                     Err(e) => {
                         log_lost(row, &e);
