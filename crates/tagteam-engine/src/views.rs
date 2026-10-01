@@ -251,12 +251,19 @@ impl Engine {
             .last_good
             .as_deref()
             .and_then(|w| earliest_relevant_reset(w, &self.settings().models));
+        // §8.4 extends trust only while failures are being retried, and a quarantined account
+        // is never retried: it keeps the five-minute rule alone.
+        let retried = row.quarantine_reason.is_none();
         let trusted = windows.is_some()
             && decision_grade(&TrustInputs {
                 now_s,
                 fetched_at: state.fetched_at,
-                consecutive_failures: state.consecutive_failures,
-                plan_in_force: state.next_poll_at.is_some_and(|at| at > now_s),
+                consecutive_failures: if retried {
+                    state.consecutive_failures
+                } else {
+                    0
+                },
+                plan_in_force: retried && state.next_poll_at.is_some_and(|at| at > now_s),
                 live_lease: store.usage_lease_live(&row.id, now_ms)?,
                 last_429_at: state.last_429_at,
                 earliest_relevant_reset: reset,

@@ -268,6 +268,28 @@ fn after_a_429_the_reading_stays_trusted_until_the_earliest_relevant_reset() {
 }
 
 #[test]
+fn a_quarantined_account_gets_no_extended_trust() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    for id in [&a, &b] {
+        record(&fx, id, &reading(T0, 9.0, 40.0), T0, T0 + 180);
+        // A refresh that failed for good: a failure on record, as the quarantine leaves it.
+        fail(&fx, id, "refresh-failed", T0 + 400, T0 + 430, None);
+    }
+    fx.quarantine(&a, "invalid_grant", "sha256:0");
+    // Inside the hour of extended trust (§8.4), past the five-minute rule.
+    at(&fx, T0 + 3_000);
+    let (qa, ub) = (usage_of(&fx.engine, &a), usage_of(&fx.engine, &b));
+    assert_eq!(qa.status, UsageStatus::ReloginRequired);
+    assert!(!qa.decision_grade, "never retried, so never extended");
+    assert!(
+        ub.decision_grade,
+        "the same state, still retried, is extended"
+    );
+}
+
+#[test]
 fn status_and_account_view_carry_the_listed_usage() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
