@@ -159,6 +159,71 @@ pub fn record_reading(root: &Path, id: &str, at_s: i64, windows: &[Window]) {
     );
 }
 
+/// Records `readings` readings of account `id`, `spacing_s` apart, the last at `last_s`, each
+/// with the windows `windows_at(taken_at)` gives: a long history as fetches would have left it,
+/// through the store's own write path on one connection. `spacing_s` must keep inside the hourly
+/// budget (§8.6: 20 requests in 3 660 s, so at least 183 s) and the readings in time order.
+pub fn record_history(
+    root: &Path,
+    id: &str,
+    last_s: i64,
+    readings: usize,
+    spacing_s: i64,
+    windows_at: &dyn Fn(i64) -> Vec<Window>,
+) {
+    let store = Store::open_existing(&Env::for_test(root).data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    let row = store.account(&AccountId::from_string(id)).unwrap().unwrap();
+    for i in (0..readings).rev() {
+        let at_s = last_s - i as i64 * spacing_s;
+        let Reserve::Reserved(reservation) = store
+            .reserve_usage(&row, at_s * 1000, false, &PollBudget::STANDARD)
+            .unwrap()
+        else {
+            panic!("no reservation for a reading at {at_s}");
+        };
+        let plan = PollPlan {
+            interval_s: spacing_s,
+            next_poll_at: at_s + spacing_s,
+        };
+        assert!(
+            store
+                .record_usage(&reservation, &windows_at(at_s), at_s, &plan, 180)
+                .unwrap(),
+            "the record was fenced out"
+        );
+    }
+}
+
+/// Pads `~/.claude.json` with Claude Code's per-project state to about `bytes` bytes, as a
+/// machine that has run it for months has: what `statusline` must parse on a cache miss.
+pub fn bloat_claude_json(root: &Path, bytes: usize) {
+    let path = Env::for_test(root).home.join(".claude.json");
+    let entry = |n: usize| {
+        json!({
+            "allowedTools": [],
+            "history": (0..8).map(|h| json!({
+                "display": format!("a prompt typed in project {n}, number {h}, long enough to look real"),
+                "pastedContents": {},
+            })).collect::<Vec<_>>(),
+            "mcpServers": {},
+            "lastCost": 1.25,
+            "lastSessionId": format!("00000000-0000-4000-8000-{n:012}"),
+        })
+    };
+    let each = serde_json::to_vec(&entry(0)).unwrap().len() + 40;
+    let projects: serde_json::Map<String, Value> = (0..bytes / each + 1)
+        .map(|n| (format!("/Users/tester/Code/project-{n}"), entry(n)))
+        .collect();
+    let doc = fs::read(&path).unwrap();
+    fs::write(
+        &path,
+        replace_top_level(&doc, "projects", &Value::Object(projects)).unwrap(),
+    )
+    .unwrap();
+}
+
 /// Rewrites account `id`'s vault copy so its access token expires `in_ms` from now: inside
 /// the 10-minute freshen window (§7.2) when `in_ms` is below 600 000.
 pub fn expire_vault(root: &Path, id: &str, in_ms: i64) {

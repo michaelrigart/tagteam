@@ -438,8 +438,8 @@ impl App<'_, '_> {
     /// §8.3's on-demand collection, which the command waits for. A usage failure is never a
     /// command error: it shows in the account's row. The collector's warnings (an account
     /// whose own collection errored is one of them), and its error should collecting fail
-    /// before any account starts (the store cannot be opened), go to stderr. With nothing to collect nothing is
-    /// opened, so `list` on a fresh machine still creates nothing (§5).
+    /// before any account starts (the store cannot be opened), go to stderr. With nothing to
+    /// collect nothing is opened, so `list` on a fresh machine still creates nothing (§5).
     fn collect(&mut self, accounts: Vec<AccountId>) {
         if accounts.is_empty() {
             return;
