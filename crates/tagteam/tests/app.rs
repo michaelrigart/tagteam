@@ -185,7 +185,7 @@ fn key_row(position: u32) -> Value {
     json!({"number": position, "position": position, "id": "[id]", "provider": "claude-code", "email": "api-key-2@token.local",
            "organizationName": null, "organizationUuid": "", "isOrganization": false, "active": false,
            "usageStatus": "api_key", "usage": null, "lastGoodUsage": null, "lastGoodFetchedAt": null,
-           "lastGoodAgeSeconds": null})
+           "lastGoodAgeSeconds": null, "usageError": null, "usageRetryAt": null})
 }
 
 /// `v` with `extra`'s fields set.
