@@ -1,8 +1,10 @@
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tagteam_provider::Cancel;
 
@@ -14,7 +16,8 @@ pub trait Prompter {
     fn secret(&mut self, question: &str) -> Option<String>;
 }
 
-/// The controlling terminal: every prompt reads its answer there.
+/// The controlling terminal's generic name: the last resort when neither stdin nor stderr names
+/// a device (`terminal_path`).
 const TERMINAL: &str = "/dev/tty";
 
 /// The terminal's prompts. Each waits for its answer in slices the cancel token can end, and
@@ -39,8 +42,9 @@ impl TtyPrompter {
             return None;
         }
         ask(text);
-        let read = open_terminal(Path::new(TERMINAL)).and_then(|tty| read_line(&tty, &self.cancel));
-        if matches!(read, Ok(LineRead::Interrupted)) {
+        let read = open_terminal(&terminal_path()).and_then(|tty| read_line(&tty, &self.cancel));
+        // The terminal echoed no newline when the prompt was cut short or could not be read.
+        if matches!(read, Ok(LineRead::Interrupted) | Err(_)) {
             ask("\n");
         }
         answer_of(read)
@@ -51,8 +55,8 @@ impl TtyPrompter {
 /// as a controlling terminal. A fresh open is a file description of tagteam's own, so
 /// `O_NONBLOCK` never reaches fd 0's, which the shell shares (a `dup` would share it too), and
 /// nothing needs putting back: it closes with the prompt. Whether to prompt at all is still
-/// `interactive`'s call, from stdin and stderr; a person at a terminal answers on it, and it is
-/// the controlling one, which the secret prompt has always read.
+/// `interactive`'s call, from stdin and stderr; the person answers on that terminal
+/// (`terminal_path`).
 fn open_terminal(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
@@ -61,14 +65,45 @@ fn open_terminal(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// The terminal device `fd` is, by its name (`/dev/ttys003`, `/dev/pts/3`), if it is one.
+/// `ttyname_r`, never `ttyname`: its buffer is the caller's, so it is safe from any thread.
+fn device_of(fd: BorrowedFd<'_>) -> Option<PathBuf> {
+    let mut name = [0 as libc::c_char; 1024];
+    // SAFETY: `name` is writable for the length passed, and `fd` is open for the call.
+    let rc = unsafe { libc::ttyname_r(fd.as_raw_fd(), name.as_mut_ptr(), name.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: ttyname_r returned 0, so `name` holds a NUL-terminated path.
+    let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+    Some(PathBuf::from(OsStr::from_bytes(name.to_bytes())))
+}
+
+/// The terminal a prompt reads and writes: the first of `fds` that is a terminal, by its own
+/// device name, else `/dev/tty`. macOS's `poll(2)` reports `POLLNVAL` at once on `/dev/tty`, so
+/// a wait on it would never sleep; the device it stands for polls normally. `interactive` has
+/// already required stdin and stderr to be terminals, and with no controlling terminal they
+/// still name the device, so the line prompts keep working there.
+fn terminal_among(fds: &[BorrowedFd<'_>]) -> PathBuf {
+    fds.iter()
+        .find_map(|fd| device_of(*fd))
+        .unwrap_or_else(|| PathBuf::from(TERMINAL))
+}
+
+/// The terminal for a prompt: stdin's device, else stderr's (`terminal_among`).
+fn terminal_path() -> PathBuf {
+    terminal_among(&[io::stdin().as_fd(), io::stderr().as_fd()])
+}
+
 /// How long one `poll(2)` waits before the token is looked at again (Decision 5).
 const SLICE_MS: libc::c_int = 100;
 
 /// Waits until `input` has something to read, or until `cancel` holds a signal: `true` to go on
 /// and read, `false` when interrupted. The handler restarts interrupted syscalls (Decision 2),
 /// so a blocked read would never notice the signal; `poll(2)` in 100 ms slices, with the token
-/// looked at between them, does. A hang-up or an error counts as ready, so the read that
-/// follows reports it. Readiness is only a hint (`read_line_between`).
+/// looked at between them, does. Only `POLLIN` counts as ready (a closed peer reports it too, so
+/// the read that follows sees the end). A poll that returns at once for any other reason sleeps
+/// out its slice instead. Readiness is only a hint (`read_line_between`).
 fn wait_for_input(input: BorrowedFd<'_>, cancel: &Cancel) -> bool {
     loop {
         if cancel.requested().is_some() {
@@ -82,11 +117,16 @@ fn wait_for_input(input: BorrowedFd<'_>, cancel: &Cancel) -> bool {
         // SAFETY: `fds` is one valid, writable `pollfd` for the duration of the call, and
         // `input` keeps its descriptor open for at least as long.
         let ready = unsafe { libc::poll(&mut fds, 1, SLICE_MS) };
-        if ready > 0 {
+        if ready > 0 && fds.revents & libc::POLLIN != 0 {
             return true;
         }
-        if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
-            return true;
+        // A poll that returned at once without input (POLLNVAL, or a hang-up or an error with
+        // nothing to read) or failed (other than EINTR) must not become a busy loop: sleep out
+        // the slice, looking at the token between slices.
+        let returned_early = ready > 0
+            || (ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted);
+        if returned_early {
+            std::thread::sleep(std::time::Duration::from_millis(SLICE_MS as u64));
         }
     }
 }
@@ -298,7 +338,7 @@ impl Prompter for TtyPrompter {
         if self.cancel.requested().is_some() {
             return None;
         }
-        let tty = open_terminal(Path::new(TERMINAL)).ok()?;
+        let tty = open_terminal(&terminal_path()).ok()?;
         let _ = (&tty).write_all(question.as_bytes());
         let read = read_secret(&tty, &self.cancel);
         let _ = (&tty).write_all(b"\n");
@@ -394,6 +434,58 @@ mod tests {
         let started = Instant::now();
         assert!(!wait_for_input(quiet.as_fd(), &cancel));
         assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    /// A descriptor number that is not open, for a poll that answers `POLLNVAL` at once, as
+    /// macOS's does on `/dev/tty`. Taken well above any descriptor another test opens, so it
+    /// cannot be reused meanwhile.
+    fn closed_fd() -> libc::c_int {
+        // SAFETY: F_DUPFD on fd 0 only allocates a new descriptor, which is closed right after.
+        let fd = unsafe { libc::fcntl(0, libc::F_DUPFD, 500) };
+        assert!(fd >= 500, "{}", io::Error::last_os_error());
+        // SAFETY: `fd` was just opened here and nothing else owns it.
+        unsafe { libc::close(fd) };
+        fd
+    }
+
+    #[test]
+    fn a_poll_that_returns_at_once_without_input_never_spins_and_never_reads_as_ready() {
+        // macOS's poll(2) answers POLLNVAL at once on /dev/tty. Taking that for readiness made
+        // every prompt a busy loop: the read said WouldBlock, and the loop came straight back.
+        let fd = closed_fd();
+        // SAFETY: the descriptor is only passed to poll(2), which reports a closed one as
+        // POLLNVAL without touching anything.
+        let closed = unsafe { BorrowedFd::borrow_raw(fd) };
+        let cancel = Cancel::new();
+        let setter = set_after(&cancel, Duration::from_millis(250), libc::SIGINT);
+        let started = Instant::now();
+        assert!(!wait_for_input(closed, &cancel), "never ready");
+        let waited = started.elapsed();
+        setter.join().unwrap();
+        assert!(
+            waited >= Duration::from_millis(250) && waited < Duration::from_millis(700),
+            "it slept in slices until the signal: {waited:?}"
+        );
+    }
+
+    #[test]
+    fn the_terminal_a_prompt_opens_is_the_device_its_stream_is() {
+        let pty = pty();
+        // The slave, as a stream a person types at: dup'ed, as stdin or stderr would be.
+        let stream = pty.slave.try_clone().unwrap();
+        assert_eq!(device_of(stream.as_fd()), Some(pty.path.clone()));
+        let (quiet, _writer) = UnixStream::pair().unwrap();
+        assert_eq!(device_of(quiet.as_fd()), None, "a socket is no terminal");
+        // The first stream that is a terminal wins; none at all falls back to /dev/tty.
+        assert_eq!(terminal_among(&[quiet.as_fd(), stream.as_fd()]), pty.path);
+        assert_eq!(terminal_among(&[quiet.as_fd()]), PathBuf::from(TERMINAL));
+        // And it opens, as a prompt opens it, and reads what is typed.
+        let tty = open_terminal(&terminal_among(&[stream.as_fd()])).unwrap();
+        (&pty.master).write_all(b"y\n").unwrap();
+        assert_eq!(
+            read_line(&tty, &Cancel::new()).unwrap(),
+            LineRead::Line("y".into())
+        );
     }
 
     #[test]
