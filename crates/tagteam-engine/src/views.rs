@@ -278,8 +278,7 @@ impl Engine {
         let (Some(store), Some(state)) = (store, state) else {
             return Ok(UsageView::unread(status, None));
         };
-        let now_ms = self.now_ms();
-        let now_s = now_ms.div_euclid(1000);
+        let now_s = self.now_ms().div_euclid(1000);
         let windows = match state.fetched_at {
             Some(at) => {
                 let read = state.last_good.as_deref().unwrap_or_default();
@@ -291,31 +290,8 @@ impl Engine {
             }
             None => None,
         };
-        let reset = state
-            .last_good
-            .as_deref()
-            .and_then(|w| earliest_relevant_reset(w, &self.settings().models));
-        // §8.4 extends trust only while failures are being retried, and a quarantined account
-        // is never retried: it keeps the five-minute rule alone.
-        let retried = row.quarantine_reason.is_none();
         let trusted = windows.is_some()
-            && decision_grade(&TrustInputs {
-                now_s,
-                fetched_at: state.fetched_at,
-                consecutive_failures: if retried {
-                    state.consecutive_failures
-                } else {
-                    0
-                },
-                // A plan further out than any legal one is clock skew (§8.4), not a plan.
-                plan_in_force: retried
-                    && state
-                        .next_poll_at
-                        .is_some_and(|at| at > now_s && !plan_is_skewed(at, now_s, budget)),
-                live_lease: store.usage_lease_live(&row.id, now_ms)?,
-                last_429_at: state.last_429_at,
-                earliest_relevant_reset: reset,
-            });
+            && self.is_decision_grade(store, row, &state, &self.settings().models, budget)?;
         let failing = state
             .last_error
             .clone()
@@ -350,6 +326,70 @@ impl Engine {
                 )
                 .filter(|&at| retried && at > now_s),
         })
+    }
+
+    /// §8.4 for `row`'s reading in `state`: whether it may drive a decision. Relevance, which
+    /// sets the post-429 rule's earliest reset, follows `models` (§8.2), and a planned poll
+    /// further out than `budget` allows is clock skew, not a plan in force. Reads the store
+    /// only.
+    fn is_decision_grade(
+        &self,
+        store: &Store,
+        row: &AccountRow,
+        state: &UsageStateRow,
+        models: &[String],
+        budget: &PollBudget,
+    ) -> Result<bool, EngineError> {
+        let now_ms = self.now_ms();
+        let now_s = now_ms.div_euclid(1000);
+        // §8.4 extends trust only while failures are being retried, and a quarantined account
+        // is never retried: it keeps the five-minute rule alone.
+        let retried = row.quarantine_reason.is_none();
+        Ok(decision_grade(&TrustInputs {
+            now_s,
+            fetched_at: state.fetched_at,
+            consecutive_failures: if retried {
+                state.consecutive_failures
+            } else {
+                0
+            },
+            // A plan further out than any legal one is clock skew (§8.4), not a plan.
+            plan_in_force: retried
+                && state
+                    .next_poll_at
+                    .is_some_and(|at| at > now_s && !plan_is_skewed(at, now_s, budget)),
+            live_lease: store.usage_lease_live(&row.id, now_ms)?,
+            last_429_at: state.last_429_at,
+            earliest_relevant_reset: state
+                .last_good
+                .as_deref()
+                .and_then(|w| earliest_relevant_reset(w, models)),
+        }))
+    }
+
+    /// The account's last good windows if they are decision-grade (§8.4) under `models`'
+    /// relevance; `None` otherwise. Reads the store only.
+    pub fn decision_windows(
+        &self,
+        row: &AccountRow,
+        models: &[String],
+    ) -> Result<Option<Vec<Window>>, EngineError> {
+        let Some(store) = self.existing_store()? else {
+            return Ok(None);
+        };
+        let Some(state) = store.usage_state(&row.id)? else {
+            return Ok(None);
+        };
+        let budget = self
+            .registry
+            .get(&row.provider)
+            .map_or(PollBudget::STANDARD, |p| p.poll_budget());
+        if state.fetched_at.is_none()
+            || !self.is_decision_grade(&store, row, &state, models, &budget)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(state.last_good.unwrap_or_default()))
     }
 
     fn view(&self, provider: &ProviderId) -> Result<(ProviderAccounts, Read<String>), EngineError> {
