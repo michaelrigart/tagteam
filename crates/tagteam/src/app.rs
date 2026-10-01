@@ -25,7 +25,7 @@ use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
 
 use crate::cli::{Cli, Command};
 use crate::prompt::Prompter;
-use crate::{history, render, root_guard};
+use crate::{history, render, root_guard, statusline};
 
 /// §13.1.
 pub(crate) const EXIT_ERROR: i32 = 1;
@@ -40,6 +40,8 @@ const KIND_INVALID_INPUT: &str = "invalid-input";
 const KIND_UNMANAGED_ACCOUNT: &str = "unmanaged-account";
 /// The engine's kind for the same condition; the CLI raises it with its own message.
 const KIND_NO_LIVE_LOGIN: &str = "no-live-login";
+/// A provider without the capability a command needs (§4.5).
+const KIND_UNSUPPORTED: &str = "unsupported";
 
 /// Appendix A.3. The default keychain is the login keychain, so the hint names its file.
 const UNLOCK_QUESTION: &str = "The login keychain is locked (common over SSH). Unlock it now?";
@@ -51,6 +53,7 @@ const NO_LIVE_LOGIN: &str =
     "there is no live login; name an account, or log in with `claude` first";
 const CSV_AND_JSON: &str = "--csv and --json are two output formats; pass one";
 const BAD_SINCE: &str = "--since takes a span like 14d, 12h or 30m";
+const STATUSLINE_UNDER_JSON: &str = "statusline prints a line of text; run it without --json";
 
 /// Honoured only with the `test-support` feature: a release build never reads them.
 #[cfg(any(test, feature = "test-support"))]
@@ -266,6 +269,10 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     if let Err(msg) = root_guard::refuse_root() {
         return fail(io, json, KIND_ROOT, &msg);
     }
+    // §13.5: the status bar's fast path, before anything else is built.
+    if let Some(Command::Statusline { print_config }) = &cli.command {
+        return run_statusline(ctx, io, json, cli.no_color, cli.provider, *print_config);
+    }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
     let (engine, warnings) = build_engine(ctx);
@@ -310,6 +317,66 @@ fn fail(io: &mut Io<'_>, json: bool, kind: &str, message: &str) -> i32 {
         let _ = writeln!(io.err, "tagteam: {message}");
     }
     EXIT_ERROR
+}
+
+/// §13.5's fast path, taken before `build_engine`: no lock check, no settings warnings (a status
+/// bar has nowhere to show them), and an engine walled off from the Keychain and the network
+/// (`statusline::engine`). `main_with_args` has already drained stdin.
+fn run_statusline(
+    ctx: Context,
+    io: &mut Io<'_>,
+    json: bool,
+    no_color: bool,
+    provider: Option<String>,
+    print_config: bool,
+) -> i32 {
+    if json {
+        fail(io, true, KIND_USAGE, STATUSLINE_UNDER_JSON);
+        return EXIT_USAGE;
+    }
+    let provider = provider.map_or_else(|| ProviderId::new(CLAUDE_CODE), ProviderId::new);
+    let (engine, _http, _keychain) = statusline::engine(ctx, &provider);
+    let result = statusline_supported(&engine, &provider).and_then(|()| {
+        if print_config {
+            let _ = writeln!(io.err, "{}", statusline::config_hint(engine.env()));
+            return Ok(statusline::config_snippet());
+        }
+        let view = engine.statusline(&provider)?;
+        let settings = engine.settings();
+        let colour = statusline::colour(
+            no_color,
+            std::env::var_os("NO_COLOR").is_some(),
+            std::env::var_os("FORCE_COLOR").is_some(),
+            settings.color,
+        );
+        Ok(statusline::line(
+            &view,
+            &settings.statusline_format,
+            engine.now_ms() / 1000,
+            colour,
+        ))
+    });
+    match result {
+        Ok(text) => {
+            let _ = write!(io.out, "{text}");
+            0
+        }
+        Err(Failure::Engine(e)) => fail(io, false, e.kind(), &e.to_string()),
+        Err(Failure::Message(kind, m)) => fail(io, false, kind, &m),
+        Err(Failure::Usage(m)) => {
+            fail(io, false, KIND_USAGE, &m);
+            EXIT_USAGE
+        }
+    }
+}
+
+/// §4.5: `statusline` refuses for a provider without the capability.
+fn statusline_supported(engine: &Engine, provider: &ProviderId) -> Result<(), Failure> {
+    let p = engine.provider(provider)?;
+    match statusline::unsupported(p.capabilities(), p.display_name()) {
+        Some(message) => Err(Failure::Message(KIND_UNSUPPORTED, message)),
+        None => Ok(()),
+    }
 }
 
 impl App<'_, '_> {
@@ -572,6 +639,7 @@ impl App<'_, '_> {
                 since,
                 csv,
             } => self.history(account, window, &since, csv)?,
+            Command::Statusline { .. } => unreachable!("run answers statusline before dispatch"),
         }
         Ok(())
     }

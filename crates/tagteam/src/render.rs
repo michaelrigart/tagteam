@@ -135,7 +135,7 @@ pub(crate) fn duration(secs: i64) -> String {
 
 /// The time left until `at`, or `reset` once it has passed: the reading predates the window's
 /// reset, so its pct no longer applies.
-fn countdown(at: i64, now_s: i64) -> String {
+pub(crate) fn countdown(at: i64, now_s: i64) -> String {
     if at <= now_s {
         "reset".into()
     } else {
@@ -170,7 +170,7 @@ pub(crate) fn money(amount: f64, currency: &str) -> String {
 }
 
 /// `€0 of €20`, from a spend window's `detail {used, limit, currency}` (§8.2).
-fn spend_text(w: &Window) -> Option<String> {
+pub(crate) fn spend_text(w: &Window) -> Option<String> {
     let d = w.detail.as_ref().filter(|_| w.kind == WindowKind::Spend)?;
     let currency = d["currency"].as_str()?;
     Some(format!(
