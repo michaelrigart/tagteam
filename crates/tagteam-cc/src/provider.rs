@@ -72,7 +72,8 @@ impl ClaudeCode {
 
 /// CC's credential locks, held for one operation: a switch, a recovery, a §7.5 pass or an
 /// `add`. Releasing them ends the operation, and with it the Keychain file-mode pin (Appendix
-/// A.3), so the next operation tries the Keychain again.
+/// A.3), so the next operation tries the Keychain again, and what the operation read and wrote
+/// of each credential entry (§9.1), so the next one compares against its own reads.
 struct OperationLocks {
     set: locks::CcCredSet,
     live: Arc<LiveStore>,
@@ -86,8 +87,8 @@ impl LiveLockSet for OperationLocks {
 
 impl Drop for OperationLocks {
     fn drop(&mut self) {
-        // Runs before `set` is dropped, so the pin ends while the locks are still held.
-        self.live.unpin_file_mode();
+        // Runs before `set` is dropped, so the operation ends while the locks are still held.
+        self.live.end_operation();
     }
 }
 

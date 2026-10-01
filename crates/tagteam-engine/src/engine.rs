@@ -72,6 +72,15 @@ impl Engine {
         &self.env.cancel
     }
 
+    /// The Env for a write inside a critical span (§14.1): the same paths, with a cancel token
+    /// nothing sets, so a lock wait the write makes (CC's storage-write lock, §9.1) runs to
+    /// completion or times out. A signal stays recorded for the next cancellation point.
+    pub(crate) fn critical_env(&self) -> Env {
+        let mut env = self.env.clone();
+        env.cancel = Cancel::new();
+        env
+    }
+
     pub fn default_provider(&self) -> &ProviderId {
         &self.default_provider
     }

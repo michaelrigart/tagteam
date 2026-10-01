@@ -317,9 +317,17 @@ pub enum ProviderError {
     /// `restore` could not put back every entry a switch may have touched, having still
     /// attempted every one of them (a fence or `Lock` failure aborts immediately instead,
     /// and is reported as that error, not this one). Each name is a Keychain service or a
-    /// file path, never bytes.
+    /// file path, never bytes, followed in parentheses by the reason when the entry was left
+    /// alone rather than failing to write.
     #[error("the previous state could not be restored for: {}", .failed.join(", "))]
     Incomplete { failed: Vec<String> },
+    /// Under the provider's storage-write lock, a credential entry's account-scoped keys were
+    /// no longer what tagteam last read or wrote under the credential locks, and not merely by
+    /// the agent's own dead-token marking, which a write goes ahead over (§9.1). The write was
+    /// aborted before it touched the entry. The name is a Keychain service or a file path,
+    /// never bytes.
+    #[error("{0} was changed by another writer during tagteam's write; it was left as it is")]
+    EntryMoved(String),
     #[error(transparent)]
     Lock(#[from] LockError),
     #[error(transparent)]

@@ -570,8 +570,9 @@ impl Engine {
                     ))
                 })
             };
-            // The undo is dropped, never run: it would write the consumed generation back.
-            p.write_credential(&self.env, &locks, &login, &mut before_fallback)
+            // The undo is dropped, never run: it would write the consumed generation back. The
+            // storage-write wait honours `cancel`, as the config-lock wait did (§9.1, §14.1).
+            p.write_credential(&env, &locks, &login, &mut before_fallback)
                 .map(|_| ())
         };
         for w in &warnings {

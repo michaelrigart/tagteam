@@ -1324,3 +1324,90 @@ pub fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     let text = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
     (result, text.lines().map(str::to_owned).collect())
 }
+
+/// The thread `cc_holds_storage_write_from` starts; it returns the instant just before CC let go
+/// of its storage-write lock.
+#[cfg(feature = "test-hooks")]
+pub type CcWrite = Arc<Mutex<Option<std::thread::JoinHandle<std::time::Instant>>>>;
+
+/// Claude Code holding its storage-write lock (§9.1) from the engine's hook `point` on: it takes
+/// the lock there; then, on another thread, it sets the engine's cancel token to SIGINT after
+/// `ctrl_c` when given, applies `cc_write` to the live OAuth item 300 ms in, and lets go.
+#[cfg(feature = "test-hooks")]
+pub fn cc_holds_storage_write_from(
+    fx: &Fx,
+    point: &'static str,
+    ctrl_c: Option<Duration>,
+    cc_write: impl Fn(&mut Value) + Send + Sync + 'static,
+) -> CcWrite {
+    let (svc, _) = fx.live_item(ItemKind::OAuth);
+    writer_holds_storage_write_from(fx, point, ctrl_c, &svc, cc_write)
+}
+
+/// `cc_holds_storage_write_from` for the Keychain item `svc`, which need not be the one Claude
+/// Code reads first: what another writer holding the storage-write lock does to it.
+#[cfg(feature = "test-hooks")]
+pub fn writer_holds_storage_write_from(
+    fx: &Fx,
+    point: &'static str,
+    ctrl_c: Option<Duration>,
+    svc: &str,
+    cc_write: impl Fn(&mut Value) + Send + Sync + 'static,
+) -> CcWrite {
+    let lock = fx.paths().storage_write_lock;
+    let (kc, svc, acct) = (fx.kc.clone(), svc.to_owned(), keychain_account(&fx.env));
+    let cancel = fx.engine.cancel().clone();
+    let cc_write = Arc::new(cc_write);
+    let cc: CcWrite = Arc::new(Mutex::new(None));
+    let started = cc.clone();
+    fx.engine.on_point(
+        point,
+        Box::new(move || {
+            fs::create_dir(&lock).unwrap();
+            let (lock, kc, svc, acct) = (lock.clone(), kc.clone(), svc.clone(), acct.clone());
+            let (cancel, cc_write) = (cancel.clone(), cc_write.clone());
+            *started.lock().unwrap() = Some(std::thread::spawn(move || {
+                let begun = std::time::Instant::now();
+                if let Some(after) = ctrl_c {
+                    std::thread::sleep(after);
+                    cancel.request(libc::SIGINT);
+                }
+                std::thread::sleep(Duration::from_millis(300).saturating_sub(begun.elapsed()));
+                let mut live: Value =
+                    serde_json::from_slice(&kc.get(&svc, &acct).unwrap()).unwrap();
+                cc_write(&mut live);
+                kc.put(&svc, &acct, live.to_string().as_bytes());
+                let at = std::time::Instant::now();
+                fs::remove_dir(&lock).unwrap();
+                at
+            }));
+        }),
+    );
+    cc
+}
+
+/// The instant CC let go of its storage-write lock (`cc_holds_storage_write_from`).
+#[cfg(feature = "test-hooks")]
+pub fn cc_released(cc: &CcWrite) -> std::time::Instant {
+    cc.lock()
+        .unwrap()
+        .take()
+        .expect("the hook point was reached")
+        .join()
+        .unwrap()
+}
+
+/// CC's dead-token marking (Appendix A.3): both tokens empty and `expiresAt` 0, a write CC
+/// makes without its credential locks. It is no conflict (§9.1).
+pub fn cc_marks_dead(live: &mut Value) {
+    live["claudeAiOauth"]["accessToken"] = json!("");
+    live["claudeAiOauth"]["refreshToken"] = json!("");
+    live["claudeAiOauth"]["expiresAt"] = json!(0);
+}
+
+/// A marking together with another account-scoped change, a new `trustedDeviceToken`: not a
+/// marking alone, so a write that finds it aborts (§9.1).
+pub fn cc_marks_dead_and_more(live: &mut Value) {
+    cc_marks_dead(live);
+    live["trustedDeviceToken"] = json!("cc-device");
+}

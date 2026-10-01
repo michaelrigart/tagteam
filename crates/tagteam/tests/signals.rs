@@ -265,3 +265,75 @@ fn a_signal_ignored_at_startup_stays_ignored() {
         Some(AccountId::from_string(&a))
     );
 }
+
+#[test]
+fn ctrl_c_twice_while_the_switch_s_write_waits_for_claude_code_s_storage_write_lock_lets_it_commit()
+{
+    // Review Focus 2 with Claude Code holding its storage-write lock (§9.1, Task 11): the
+    // switch's step 7 write waits for it inside the critical span, and two SIGINTs land during
+    // that wait. The switch writes and commits once CC lets go, and says the signal came too
+    // late (§14.1).
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (a, _b) = two_fresh_accounts(root);
+    let paths = CcPaths::resolve(&Env::for_test(root));
+    let pause = root.join("pause");
+    fs::create_dir(&pause).unwrap();
+
+    let mut child = std_cmd(root)
+        .args(["switch", "1", "--json"])
+        .env("TAGTEAM_TEST_PAUSE_AT", "after-journal")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until(
+        &mut child,
+        Duration::from_secs(20),
+        "its journal row",
+        || pause.join("paused").exists(),
+    );
+    fs::create_dir(&paths.storage_write_lock).unwrap(); // Claude Code takes it
+    fs::write(pause.join("resume"), b"").unwrap();
+    thread::sleep(Duration::from_millis(300)); // the step 7 write now waits for CC's lock
+    send(&child, libc::SIGINT);
+    thread::sleep(Duration::from_millis(100));
+    send(&child, libc::SIGINT);
+    thread::sleep(Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the switch finished, or a Ctrl-C stopped it, before Claude Code let go of its lock"
+    );
+    fs::remove_dir(&paths.storage_write_lock).unwrap(); // Claude Code lets go
+    let out = finish(child, Duration::from_secs(20));
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        (v["switched"].clone(), v["reason"].clone()),
+        (json!(true), json!("switched")),
+        "{v}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "tagteam: interrupted too late to stop: switch had already finished\n"
+    );
+    assert_eq!(live_email(root), "a@x.co");
+    let provider = ProviderId::new(CLAUDE_CODE);
+    let s = store(root);
+    assert!(s.journal(&provider).unwrap().is_none());
+    assert_eq!(
+        s.active(&provider).unwrap(),
+        Some(AccountId::from_string(&a))
+    );
+    assert!(
+        !paths.storage_write_lock.exists(),
+        "tagteam released the storage-write lock it took"
+    );
+}

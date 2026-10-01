@@ -1889,8 +1889,11 @@ impl Engine {
     ) -> Result<SecretStore, EngineError> {
         let locks = tx.locks;
         hooks::point(self, "after-journal")?;
+        // Steps 7–10 are a critical span (§14.1): the write's storage-write wait is not a
+        // cancellation point, and neither is its rollback's.
+        let env = self.critical_env();
         let stored_in = tx.write(|| {
-            p.write_credential(&self.env, locks, target_login, before_fallback)
+            p.write_credential(&env, locks, target_login, before_fallback)
                 .map(|w| (w.undo, w.stored_in))
         })?;
         hooks::point(self, "after-credential")?;
