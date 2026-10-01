@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use tagteam_core::{Fingerprint, OracleVerdict, ProviderId};
 use tagteam_provider::{
-    CredLocks, Credential, LiveChange, Provenance, Provider, ProviderError, Read, RefreshResult,
-    StoredLogin,
+    Cancel, CredLocks, Credential, LiveChange, Provenance, Provider, ProviderError, Read,
+    RefreshResult, StoredLogin,
 };
 
 use crate::account_lock::AccountLock;
@@ -143,7 +143,8 @@ impl Engine {
                 // The self-heal comes first, needed or not: advancing the lineage again before
                 // the live store caught up would leave it two generations behind, where no
                 // later pass could tell its generation from a CC rotation.
-                if !self.publish(p, &row, cred, &rec.current, &rec.retire)? {
+                // Nothing was sent this pass, so a signal may end this wait (§14.1).
+                if !self.publish(p, &row, cred, &rec.current, &rec.retire, &self.env.cancel)? {
                     return Ok(ActiveOutcome::PersistedNotPublished);
                 }
                 if needed {
@@ -250,10 +251,15 @@ impl Engine {
                     sent_fp,
                     armed: persisted == Persisted::Unpersisted,
                 };
-                // CC must hold the newest generation whatever became of tagteam's copy.
+                // CC must hold the newest generation whatever became of tagteam's copy. The
+                // request consumed the one CC holds, so this wait is inside §7.5's critical
+                // span: it waits under a token nothing sets, and a signal waits for the next
+                // cancellation point (§14.1). A timeout still leaves it to step 3's self-heal.
                 let published = if owned {
-                    hooks::point(self, "active-before-publish")
-                        .and_then(|()| self.publish(p, row, cred, received.bytes(), &rec.retire))
+                    let uncancelled = Cancel::new();
+                    hooks::point(self, "active-before-publish").and_then(|()| {
+                        self.publish(p, row, cred, received.bytes(), &rec.retire, &uncancelled)
+                    })
                 } else {
                     Ok(false)
                 };
@@ -493,10 +499,10 @@ impl Engine {
     }
 
     /// Writes `secret` to the live store under the config lock, taken now with its own budget
-    /// (§9.1), then retires `retire` once the write reads back. `false` when the live store
-    /// was not written; the caller reports `PersistedNotPublished`, and the next pass
-    /// reconciles it (§7.5 step 3). What the write destroys is
-    /// saved first unless a vault generation already holds it (§9.4 step 7's rule).
+    /// (§9.1) and waited for under `cancel` (§14.1), then retires `retire` once the write reads
+    /// back. `false` when the live store was not written; the caller reports
+    /// `PersistedNotPublished`, and the next pass reconciles it (§7.5 step 3). What the write
+    /// destroys is saved first unless a vault generation already holds it (§9.4 step 7's rule).
     fn publish(
         &self,
         p: &dyn Provider,
@@ -504,6 +510,7 @@ impl Engine {
         cred: CredLocks<'_>,
         secret: &[u8],
         retire: &[PathBuf],
+        cancel: &Cancel,
     ) -> Result<bool, EngineError> {
         let not_published = |why: &dyn std::fmt::Display| {
             tracing::warn!(
@@ -512,7 +519,9 @@ impl Engine {
             );
             Ok(false)
         };
-        let locks = match p.lock_config(&self.env, cred, p.live_lock_budget()) {
+        let mut env = self.env.clone();
+        env.cancel = cancel.clone();
+        let locks = match p.lock_config(&env, cred, p.live_lock_budget()) {
             Ok(locks) => locks,
             Err(e) => return not_published(&e),
         };

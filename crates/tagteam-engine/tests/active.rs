@@ -709,6 +709,52 @@ mod hooks {
         assert_eq!(token_requests(&fx), 1);
     }
 
+    /// §14.1, §7.5 step 5: the live write after a request is inside the active refresh's
+    /// critical span. The request consumed the generation CC holds, so a Ctrl-C while the
+    /// write waits for CC's config lock must not stop it: CC would be left with a spent token.
+    #[test]
+    fn a_signal_while_the_successor_waits_for_the_config_lock_still_publishes_it() {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        let (config, cancel) = (fx.paths().config_lock, fx.engine.cancel().clone());
+        let cc = Arc::new(Mutex::new(None));
+        let started = cc.clone();
+        // After the request, CC holds its config lock; a Ctrl-C arrives 100 ms into the wait,
+        // and CC lets go 200 ms later.
+        fx.engine.on_point(
+            "active-before-publish",
+            Box::new(move || {
+                fs::create_dir(&config).unwrap();
+                let (config, cancel) = (config.clone(), cancel.clone());
+                *started.lock().unwrap() = Some(std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    cancel.request(libc::SIGINT);
+                    std::thread::sleep(Duration::from_millis(200));
+                    fs::remove_dir(&config).unwrap();
+                }));
+            }),
+        );
+
+        let out = active(&fx, ActiveTrigger::Expired);
+        cc.lock().unwrap().take().unwrap().join().unwrap();
+
+        assert_eq!(out.unwrap(), ActiveOutcome::Refreshed);
+        assert_eq!(
+            fx.live_refresh_token().as_deref(),
+            Some("rt-a2"),
+            "CC holds the successor"
+        );
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+        assert_eq!(
+            fx.engine.cancel().requested(),
+            Some(libc::SIGINT),
+            "the signal waits for the next cancellation point"
+        );
+        assert!(!fx.paths().refresh_lock.exists() && !fx.paths().config_lock.exists());
+    }
+
     /// Makes the credential lock look taken over once the response arrives (§9.1), so the
     /// successor is never published.
     fn take_over_after_response(fx: &Fx) -> PathBuf {
