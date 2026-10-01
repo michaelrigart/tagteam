@@ -836,6 +836,10 @@ fn an_interrupted_collection_ends_the_strategy_with_the_signal_and_no_switch() {
             .switch(request(&fx, usage(strategy, None)))
             .unwrap_err();
         assert_eq!(err.signal(), Some(libc::SIGINT), "{strategy:?}: {err}");
+        assert!(
+            fx.http.requests().is_empty(),
+            "{strategy:?}: no usage request was sent"
+        );
         assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
         assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-c"));
         assert!(

@@ -1448,6 +1448,23 @@ mod hooks {
     }
 
     #[test]
+    fn a_signal_landing_at_the_send_hook_sends_nothing_records_nothing_and_gives_the_slot_back() {
+        // §14.1: the cancellation point before the request comes after the store's
+        // authorization too: a signal that landed at `usage-before-send` (or while `authorize`
+        // waited on the store) is seen before the request leaves.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+        signal_at(&fx, "usage-before-send");
+
+        assert_interrupted(collect_result(&fx, &a));
+
+        assert!(fx.http.requests().is_empty(), "no usage request was sent");
+        assert_eq!(fx.usage_state(&a), None, "nothing is recorded");
+        assert_eq!(usage_requests(&fx), 0, "the authorized slot went back");
+    }
+
+    #[test]
     fn a_gate_refresh_in_flight_when_the_signal_lands_still_persists_its_successor() {
         // §14.1: the gate, from sending the token request to persisting the successor, is a
         // critical span. The usage request after it is a cancellation point.
