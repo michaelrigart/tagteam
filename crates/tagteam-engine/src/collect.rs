@@ -39,8 +39,9 @@ pub enum Collected {
     Recorded,
     /// Not eligible now (§8.3 phase 1): nothing was reserved or sent.
     Ineligible(Ineligible),
-    /// The identity's hourly budget is spent: nothing was sent, and the store moved the next
-    /// poll to `next_free_at` (§8.6).
+    /// The identity's hourly budget was spent when reserving: nothing was sent, and the store
+    /// recorded the refusal as an `over-budget` failure, backing off and moving the next poll
+    /// to `next_free_at` (§8.6). A refusal at the send itself is `Failed { "over-budget" }`.
     OverBudget { next_free_at: i64 },
     /// Recorded as a failure; `kind` is its `last_error` token (§8.3, Decision 10).
     Failed { kind: String },

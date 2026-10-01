@@ -9,6 +9,8 @@ use std::path::Path;
 use common::{cmd, login, now_epoch_s, seed_home};
 use serde_json::{Value, json};
 use tagteam_cc::usage::format_iso8601;
+use tagteam_core::{CLAUDE_CODE, PollBudget, ProviderId};
+use tagteam_engine::store::{Reserve, SendGrant, Store};
 use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Env, FileKeychain};
 
@@ -214,6 +216,55 @@ fn a_429_is_a_row_that_says_when_it_is_retried_never_a_command_error() {
         (earliest.as_str()..=latest.as_str()).contains(&retry),
         "{retry}"
     );
+}
+
+#[test]
+fn an_unread_account_over_its_hourly_budget_reads_as_over_budget_not_no_data() {
+    // §8.6, Review Focus 4: an account removed and re-added within the hour has no reading,
+    // but its identity's budget is spent. The fetch is refused before anything is sent, and
+    // its row says so, with when a slot frees, instead of "no data yet".
+    let d = tempfile::tempdir().unwrap();
+    accounts(d.path(), &["a@x.co"]);
+    let spent_at = now_epoch_s() - 100;
+    let store = Store::open_existing(&Env::for_test(d.path()).data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    let row = store.accounts(&ProviderId::new(CLAUDE_CODE)).unwrap()[0].clone();
+    let Reserve::Reserved(r) = store
+        .reserve_usage(&row, spent_at * 1000, false, &PollBudget::STANDARD)
+        .unwrap()
+    else {
+        panic!("the first slot is free");
+    };
+    while let SendGrant::Send(_) = store
+        .authorize_send(&r, None, None, spent_at * 1000, &PollBudget::STANDARD)
+        .unwrap()
+    {}
+    let free = spent_at + PollBudget::STANDARD.count_window_s;
+    let server = serving(recorded_reply(now_epoch_s()));
+
+    let (out, _) = run(d.path(), &server, &["list"]);
+    assert_eq!(
+        out,
+        "    #  ACCOUNT\n *  1  a@x.co   over budget (retry 59m)\n"
+    );
+    let v = json_of(d.path(), &server, &["list", "--json"]);
+    let row = &v["accounts"][0];
+    assert_eq!(
+        (
+            &row["usageStatus"],
+            &row["usage"],
+            &row["usageError"],
+            &row["usageRetryAt"]
+        ),
+        (
+            &json!("unavailable"),
+            &Value::Null,
+            &json!("over-budget"),
+            &json!(format_iso8601(free))
+        )
+    );
+    assert_eq!(server.hits("GET", USAGE), 0, "nothing was sent");
 }
 
 #[test]

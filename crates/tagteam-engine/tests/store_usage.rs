@@ -11,6 +11,7 @@ use std::time::Duration;
 use common::{add, cc, identity};
 use rusqlite::{OptionalExtension, params};
 use serde_json::json;
+use tagteam_core::backoff::failure_backoff_s;
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Sample, Window, WindowKind};
 use tagteam_engine::store::{
     Ineligible, LiveIdentityCacheRow, Reservation, Reserve, SendGrant, Slot, Store, StoreError,
@@ -312,8 +313,8 @@ fn over_budget_moves_the_plan_and_takes_no_lease() {
     assert_eq!(all_slots(&path), 20);
     assert_eq!(
         reserve(&s, &a, later + 1_000, true),
-        Reserve::Ineligible(Ineligible::NotDue),
-        "the moved plan holds on-demand callers off until a slot frees"
+        Reserve::Ineligible(Ineligible::Backoff),
+        "the recorded refusal holds callers off until a slot frees"
     );
 
     // The budget is per (provider, identity key).
@@ -321,6 +322,93 @@ fn over_budget_moves_the_plan_and_takes_no_lease() {
     assert!(matches!(reserve(&s, &b, later, true), Reserve::Reserved(_)));
     let f = add(&s, &ProviderId::new("fake-agent"), "f", "a@x.co", 1);
     assert!(matches!(reserve(&s, &f, later, true), Reserve::Reserved(_)));
+}
+
+#[test]
+fn an_over_budget_refusal_is_recorded_once_per_budget_period() {
+    // §8.6: the fetch reports `over-budget` (§8.3's `last_error` token), recorded as the
+    // authorization's refusal is: a failure that backs off until a slot frees (§8.5's base
+    // when that is later), the plan moved to the same time, and the reading left alone. The
+    // backoff is checked before the budget, so a second caller records nothing more.
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let r = reserved(&s, &a, T_MS);
+    assert!(s.record_usage(&r, &windows(), T, &plan(), 180).unwrap());
+    spend_the_hour(&s, &r, T_MS);
+    let free = T + B.count_window_s;
+    let now = T + 400;
+    assert_eq!(
+        reserve(&s, &a, now * 1000, true),
+        Reserve::OverBudget { next_free_at: free }
+    );
+    assert_eq!(
+        s.usage_state(&a).unwrap().unwrap(),
+        UsageStateRow {
+            account_id: a.clone(),
+            last_good: Some(windows()),
+            fetched_at: Some(T),
+            last_attempt_at: Some(now),
+            consecutive_failures: 1,
+            last_error: Some("over-budget".into()),
+            backoff_until: Some(free),
+            next_poll_at: Some(free),
+            poll_interval_s: Some(300),
+            last_429_at: None,
+            rejected_fp: None,
+        }
+    );
+    let recorded = s.usage_state(&a).unwrap();
+    assert_eq!(
+        reserve(&s, &a, (now + 100) * 1000, true),
+        Reserve::Ineligible(Ineligible::Backoff)
+    );
+    assert_eq!(
+        s.usage_state(&a).unwrap(),
+        recorded,
+        "one refusal per budget period: consecutive_failures stays 1"
+    );
+    assert_eq!(all_slots(&path), 20);
+    assert!(
+        matches!(reserve(&s, &a, free * 1000, true), Reserve::Reserved(_)),
+        "a slot frees when the backoff lifts"
+    );
+
+    // An unread account whose slot frees sooner than §8.5's base backoff: the backoff is
+    // `max(now + base, next_free_at)`, as the authorization records it.
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let c = raw(&path);
+    for _ in 0..B.hourly_requests {
+        c.execute(
+            "INSERT INTO usage_requests (provider, identity_key, at) VALUES ('claude-code', ?1, ?2)",
+            params!["b@x.co\n", T + 10 - B.count_window_s],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        reserve(&s, &b, T_MS, true),
+        Reserve::OverBudget {
+            next_free_at: T + 10
+        }
+    );
+    let st = s.usage_state(&b).unwrap().unwrap();
+    assert_eq!(
+        (
+            st.last_good,
+            st.fetched_at,
+            st.consecutive_failures,
+            st.last_error.as_deref(),
+            st.backoff_until,
+            st.next_poll_at
+        ),
+        (
+            None,
+            None,
+            1,
+            Some("over-budget"),
+            Some(T + failure_backoff_s(1, false, None)),
+            Some(T + 10)
+        )
+    );
 }
 
 #[test]
