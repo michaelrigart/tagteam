@@ -139,7 +139,8 @@ and `tagteam-menubar`.
 ### 4.2 Engine surface
 
 `Engine` is built from an injected `Env`, a `ProviderRegistry`, and a set of ports: `Keychain`,
-`Clock`, `Http` and `ProcessProbe`. Every account-scoped operation resolves the account's
+`Clock`, `Http`, `ProcessProbe`, and a cancel token that the CLI's signal handler sets (§14.1).
+Every account-scoped operation resolves the account's
 provider from the registry. Operations that take no account take a `ProviderId`, which
 defaults to `default_provider` (§6.4). Its operations return typed outcomes:
 
@@ -153,7 +154,8 @@ impl Engine {
     fn add_token(&self, opts: AddTokenOptions) -> Result<AddOutcome>;
     fn remove(&self, acct: AccountRef) -> Result<()>;
     fn set_alias / set_disabled / move_to(...) -> Result<()>;
-    fn auto_tick(&self, cfg: &AutoConfig, sink: &dyn EventSink) -> Result<TickOutcome>;
+    fn auto(&self, provider: &ProviderId, cfg: AutoConfig) -> Result<AutoEngine>; // holds the engine lock (§11.1)
+    // AutoEngine::tick(&mut self, sink: &dyn EventSink) -> TickOutcome; next_delay(...) (§11.4)
     fn run_session(&self, req: RunRequest) -> Result<ExitStatus>;
     fn export / import / history / doctor(...);
 }
@@ -182,7 +184,9 @@ impl Engine {
   holding one that comes later: in particular, `MutationGuard` is never taken while holding an
   account lock. The one exception is a standalone config lock for profile seeding and
   merge-back (§12.4), which take no
-  credential lock while holding it; taking a lone lock cannot invert the order.
+  credential lock while holding it; taking a lone lock cannot invert the order. The auto-switch
+  engine lock (§11.1) is outside the order altogether: it is only ever tried, never waited
+  for, and is held for an engine's lifetime.
 - **No network while holding a contended lock.** There are two exceptions, both bounded:
   - the refresh gate holds the account lock across its token request (§7.3, 10 s), which is
     what makes it single-flight;
@@ -235,7 +239,7 @@ pub trait Provider: Send + Sync {
     fn identity_key(&self, id: &Identity) -> IdentityKey;   // CC: email + org uuid
     fn credential_kinds(&self) -> &'static [&'static str];   // CC: oauth, setup_token, api_key
     fn kind_traits(&self, kind: &str) -> KindTraits;        // refreshable? managed-key axis? default-email prefix
-    fn primary_long_window(&self) -> Option<WindowKey>;     // CC: "7d"; ranks consume-first (§11.2)
+    fn primary_long_window(&self) -> Option<&'static str>;  // a window key; CC: "7d"; ranks consume-first (§11.2)
     fn export_login / import_login(...);                    // provider-owned export payload (§13.3)
 
     // The live login
@@ -286,8 +290,11 @@ where `kind` is one of `Short | Long | Spend | Scoped` and `detail` is optional 
 JSON (CC's spend amounts, for example). The store persists usage only in this form (§8.2).
 - Claude Code maps `5h` → `Short`, `7d` → `Long` (period 604800 s), `spend` → `Spend`, and each
   per-model limit → `Scoped(name)`.
-- A provider need not have a `Long` window. Features that depend on one (consume-first, pace)
-  are unavailable for such a provider, and say so.
+- A provider need not have a `Long` window. Without a `primary_long_window`, consume-first is
+  unavailable for that provider. `auto --strategy consume-first` with `--provider` naming it is
+  a usage error (exit 2). Otherwise a `consume-first` strategy, from the flag or from
+  `autoswitch.strategy`, makes that provider's engine run `best` instead, with one
+  `config-warning`.
 - Pace (§8.7: the average fallback, `expectedPct`, `aheadOfPace`) applies to `Long` and
   `Scoped` windows that have a known period. The regression rate and the projections
   (`projectedExhaustionAt`, `willLastToReset`) apply to every window.
@@ -328,6 +335,7 @@ mode 0700, so a command that changes nothing creates nothing.
 | Launch reservations | `<profile>/.tagteam-launch/<pid>.lock` |
 | Mutation lock | `$XDG_DATA_HOME/tagteam/.mutation.lock` |
 | Account locks | `$XDG_DATA_HOME/tagteam/locks/<id>.lock` |
+| Auto-switch engine locks | `$XDG_DATA_HOME/tagteam/locks/autoswitch-<provider>.lock` (§11.1) |
 | Log | `$XDG_STATE_HOME/tagteam/tagteam.log` (1 MiB × 3) |
 
 Every file that contains secrets is created with mode 0600 at creation time (`O_EXCL`, then
@@ -413,7 +421,7 @@ CREATE TABLE usage_requests (   -- one row per usage request slot, retries inclu
 );
 
 CREATE TABLE leases (
-  name       TEXT PRIMARY KEY,  -- 'usage:<id>' | 'autoswitch:<provider>'
+  name       TEXT PRIMARY KEY,  -- 'usage:<id>', plus internal markers such as the daily sample prune
   holder     TEXT NOT NULL,     -- random UUID per acquisition
   expires_at INTEGER NOT NULL   -- epoch ms, wall clock
 );
@@ -431,7 +439,7 @@ CREATE TABLE switch_journal (   -- a row exists only while a switch is between i
   prior        TEXT              -- the row a forced switch superseded; restored if this one never lands (§9.6)
 );
 
-CREATE TABLE autoswitch_state (       -- one row per provider; auto-switch never crosses providers
+CREATE TABLE autoswitch_state (       -- one row per provider; auto-switch never crosses providers; one writer (§11.1)
   provider          TEXT PRIMARY KEY,
   last_switch_at    INTEGER,
   last_switch_from  TEXT,
@@ -440,7 +448,7 @@ CREATE TABLE autoswitch_state (       -- one row per provider; auto-switch never
   left_recovery_at  INTEGER,
   left_trigger      TEXT,
   unhealthy_ticks   INTEGER NOT NULL DEFAULT 0,
-  idle_hold_since   INTEGER
+  idle_hold_since   INTEGER           -- unused: §11.2 has no idle-hold (kept to avoid a migration)
 );
 
 CREATE TABLE events (
@@ -501,8 +509,8 @@ WHERE leases.expires_at <= ?now
 The lease is held if `changes() = 1`. A result is recorded only if the lease row still shows the
 same holder.
 
-Leases only bound work whose overlap is harmless (a duplicate usage fetch, a skipped auto
-tick). They never protect a refresh token: a lease can expire under a suspended holder, which
+Leases only bound work whose overlap is harmless, such as a duplicate usage fetch. They never
+protect a refresh token: a lease can expire under a suspended holder, which
 then resumes believing it still holds it. Credentials are protected by account locks (§6.2),
 which the kernel holds for as long as the holder lives.
 
@@ -608,7 +616,8 @@ the global table.
 | `statusline.format` | `"{account} · 5h {5h}% · 7d {7d}%{stale}"` | placeholders listed in §13.5 only; `{model:<name>}` needs a trimmed, non-empty name without braces |
 | `ui.color` | `auto` | `auto`, `always`, `never` (`NO_COLOR` and `FORCE_COLOR` also honoured) |
 
-CLI flags override settings for a single invocation and are clamped to the same ranges.
+CLI flags override settings for a single invocation and are clamped to the same ranges. A
+running `auto` re-reads the file whenever its mtime changes (§11.4); its flags still win.
 
 ## 7. Credentials and the refresh gate
 
@@ -873,6 +882,10 @@ counts.
      row that reserves the slot, so the budget holds across every process.
    - On-demand callers (`list`, `status`, `switch`) also require the reading to be older than
      180 s *and* either a poll to be due or no plan to exist.
+   - Scheduled collection (an auto tick, §8.6) requires a poll to be due, or no reading yet.
+   - A re-check (consume-first's re-fetch, §11.2 step 8) requires only the reading to be older
+     than 180 s; it ignores the plan. Quarantine, backoff, the lease and the budget still
+     apply.
    - A fetch that ends before sending is recorded in phase 3 like any failure. The same
      fenced transaction deletes the `usage_requests` row it inserted, so the slot returns to
      the budget. The lease expires as it does after any record.
@@ -884,15 +897,18 @@ counts.
      next plan, **and inserts `usage_samples` rows**.
    - **Failure** never touches `last_good` or `fetched_at`.
 
-**Who collects on demand.**
+**Who collects.**
 - `list` collects every eligible account, and `status` only the live one. The accounts are
   collected in parallel, one thread each, and the command waits for all of them. Each request
   is bounded by its own timeout, so one account costs at most a gate refresh, a fetch and one
   retry.
 - `switch` collects only for the strategies that rank by usage (`best`, `next-available`,
-  §9.3). After any switch that activated an account, it re-plans polls from the last readings
+  §9.3): on demand, for the live account and every switchable candidate. After any switch that
+  activated an account, it re-plans polls from the last readings
   without fetching. The incoming account's `next_poll_at` gets the active-account policy, and
   the outgoing account's gets the candidate policy (§8.6).
+- An auto tick collects as scheduled (§8.6), and consume-first re-checks before switching
+  (§11.2 step 8). Its fetches run in parallel like `list`'s.
 - A usage failure is never a command error. It shows as the row's `usageStatus` (§13.2), and
   its kind is stored in `usage_state.last_error` using §6.1's tokens (`http-<code>`,
   `pre-send`, `ambiguous`, `bad-response`, `refresh-failed`, `over-budget`), plus
@@ -973,9 +989,16 @@ schedule below decides *when* to ask; the budget decides *whether* a request may
 - **Then:** apply jitter, then clamp: never below the 180 s floor (60 s when urgent), and never
   later than the next relevant reset + 60 s.
 
-**Auto-switch scheduling** is O(1) per tick: the active account if it's due, plus the single
-stalest due candidate. All candidates are fetched only when the active account is within 15
-points of the threshold, or its usage is unknown for a reason other than an expired token.
+**Auto-switch scheduling** is O(1) per tick, in two phases:
+1. **The active account**, if it is due. An expired or refused live token goes to §7.5 first,
+   as for any collection of the active account (§8.1).
+2. **Candidates**, chosen from the store as phase 1 left it: the single stalest due candidate
+   (never fetched first, then the oldest `fetched_at`, ties to the lower position). The tick
+   **escalates** to every due candidate when the active account's max relevant pct is within
+   15 points of the threshold (≥ threshold − 15), or its headroom is still unknown (§8.4).
+
+The candidates are the provider's switchable accounts (§9.3) other than the live one. A
+candidate that is not due keeps its reading and its trust (§8.4).
 
 ### 8.7 History and projection
 
@@ -1026,11 +1049,14 @@ The CC locks follow the `proper-lockfile` protocol:
 - `mkdir` acquires the lock.
 - On `EEXIST`, if `now − mtime > staleness`, `rmdir` it and retry. Otherwise sleep a jittered
   250–500 ms.
-- While the lock is held, a thread touches the directory's mtime every 3 s. CC touches every
+- While the lock is held, a thread touches the directory's mtime every 3 s, through a
+  directory fd opened when the lock was acquired (`futimens`), never by path. CC touches every
   5 s; both are well inside the staleness windows.
-- **Compromise detection.** An ownership check confirms that the directory still exists and
-  still carries the mtime tagteam last set. If it doesn't, the lock has been taken over, and
-  the guard is marked compromised. The check runs:
+- **Compromise detection.** An ownership check confirms that the path still names the
+  directory tagteam created (the same device and inode as the held fd) and that it still
+  carries the mtime tagteam last set. If it doesn't, the lock has been taken over, and the
+  guard is marked compromised. A directory that replaced tagteam's after a long stall, as a
+  suspended `auto` can meet, is therefore never touched or removed. The check runs:
   - on each touch;
   - **synchronously, immediately before every write the lock protects**, and before a token
     request made under the lock;
@@ -1079,8 +1105,8 @@ These are decided before locking and re-checked afterwards.
 | Invocation | Strategy | Anchor | Behaviour |
 |---|---|---|---|
 | `switch` (bare) | rotation | the live account if it is managed; otherwise the store's active account | With a managed live anchor: the next switchable position after it. Otherwise: the anchor itself if it is switchable, else the first switchable position |
-| `switch --strategy next-available` | next-available | the live account | Like rotation, but skips candidates with headroom ≤ 0 (the message names the binding window). If every candidate is exhausted: `candidates-exhausted` |
-| `switch --strategy best` | best | the live account | Switch only if some switchable account has strictly more headroom. Ties stay put |
+| `switch --strategy next-available` | next-available | as rotation | The rotation walk, skipping candidates whose known headroom is ≤ 0 (the message names each one's binding window). Unknown headroom is never skipped (§8.2). If the walk skips every candidate: `candidates-exhausted` |
+| `switch --strategy best` | best | the live account | The candidate with the most known headroom, ties to the lower position. Switch only if it has strictly more headroom than the live account; otherwise `already-best`. If the live account's headroom is unknown, or there is no live login, switch to it with a warning. No candidate with known headroom: `usage-unavailable` |
 | `switch <ACCOUNT>` | direct | — | Disabled accounts are allowed as explicit targets |
 
 "Switchable" means the account has a vault credential and an `identity_json`, and is not
@@ -1097,6 +1123,28 @@ machine, §9.2). Under the locks, only the chosen account is read again.
 - An `Unreadable` vault met before the pick could have been the pick, so the switch fails and
   names that account (position and label). Accounts after the pick are never read.
 - A Dead verdict while freshening the pick quarantines it, and the walk continues (§7.2).
+
+**Strategies that rank by usage** (`best`, `next-available`):
+- Before planning, they collect on demand (§8.3) for the live account and every switchable
+  candidate, then rank decision-grade readings only (§8.4). Relevant windows follow §8.2 and
+  `autoswitch.models`, or `--model` (a comma-separated list, or `all`) for this invocation.
+  `--model` without `--strategy` is a usage error.
+- `best` never picks a candidate whose headroom is unknown. When some were unknown, a warning
+  says how many.
+- Before candidates are counted, a quarantine that no longer binds is released: the vault's
+  fingerprint has moved past `quarantine_fp` (§7.4), as auto-switch's step 1 does (§11.2).
+- Both read vaults lazily in their own order, as rotation does: an `Unreadable` vault met
+  before the pick fails the switch and names the account.
+- **Under the locks**, the ranking is not recomputed, since no network is used there. The pick
+  stands while it is still switchable and the live account is unchanged; otherwise the
+  strategy plans again from the store's readings. If the live account under the locks is
+  already the pick, another process has done this command's work: the result is a no-op with
+  reason `already-active`. The same holds for a bare rotation.
+- A Dead verdict while freshening the pick quarantines it, and the strategy plans again
+  without it (§7.2).
+
+Every strategy, rotation included, skips session-owned candidates (§12.5). `--force` acts on
+the strategies as on a bare `switch` (§9.2).
 
 ### 9.4 Transaction
 
@@ -1119,8 +1167,11 @@ here on.
 
    Re-read the target's quarantine too. A refresh that finished while this switch waited for
    the account lock may have quarantined it (§7.4 `successor_lost`). A target quarantined since
-   planning then follows §7.2's quarantined-target rule, and a bare rotation plans again
-   without it.
+   planning then follows §7.2's quarantined-target rule, and a bare rotation or a usage
+   strategy plans again without it.
+
+   An auto-switch re-checks its preconditions here, before anything is written (§11.2 step
+   11).
 2. **Direct branch** (no live identity, unmanaged live login, or `--force`):
    - Settle the target's pending rescues (§6.2), then read it from the vault.
    - Read the live credential and config under step 3's rules.
@@ -1190,7 +1241,8 @@ here on.
    counts as settled.
 8. **Splice** the target's `oauthAccount` into `~/.claude.json` (§9.5).
 9. **Commit** in one store transaction: set the active account, insert an `events` row
-   (`source` = `cli` or `auto`), and delete the journal row.
+   (`source` = `cli` or `auto`), and delete the journal row. An auto-switch also writes its
+   `autoswitch_state` record in this transaction (§11.2 step 11).
 10. **Rollback.** Any failure in steps 7–9 restores, in reverse order, the original
     `~/.claude.json` bytes and the original live credential, then restores the journal row's
     `prior` if it carried one — a forced switch's superseded row (§9.6) — or deletes the row
@@ -1350,51 +1402,86 @@ An empty alias never matches.
 - **`tagteam-core`:** `decide(snapshot, state, config, now) -> Decision`. It is pure: no
   clock, no I/O. It is built from named predicates (`below_threshold`, `landing_ok`,
   `beats_by_hysteresis`, `recovered_since_departure`, `recovery_axis_useful`, …), each unit
-  tested.
+  tested. The scheduled-collection pick (§8.6) and the loop delay (§11.4) are pure functions
+  there too.
 - **`tagteam-engine`:** fetch, freshen, switch, record and emit.
 - **Per provider.** `tagteam auto` runs one independent engine per provider that has at least
   two switchable accounts, or only the provider given with `--provider`. Each has its own
-  `autoswitch_state` row, `autoswitch:<provider>` lease, settings (§6.4) and poll budget.
-  Nothing on one provider ever triggers a switch on another. Every JSONL event carries an
-  additive `provider` field.
+  `autoswitch_state` row, engine lock, settings (§6.4) and poll budget. Nothing on one provider
+  ever triggers a switch on another. Every JSONL event carries an additive `provider` field.
+  One process ticks its providers on independent schedules.
+- **One engine per provider per machine.** An engine holds its provider's engine lock,
+  `locks/autoswitch-<provider>.lock` (§5), for its whole life. The lock is a `flock` that is
+  only ever tried, never waited for, and that the kernel releases when the holder dies.
+  `autoswitch_state` therefore has a single writer, so no unhealthy tick or departure snapshot
+  is counted twice.
+  - A loop skips a provider whose lock another process holds, with a warning. If it gets no
+    provider's lock at all, it exits 1, saying auto-switch already runs for them.
+  - `--once` reports `no-switch` with reason `engine-running` for such a provider (NO_ACTION).
+  - `--dry-run` takes no engine lock and writes no auto-switch state: its state lives in
+    memory, it releases no quarantine (§11.2 step 1), and it freshens and switches nothing
+    (step 10). Its usage collection is the ordinary one (§8.3). Like `list`, it can finish
+    the recovery of an interrupted switch when it takes `MutationGuard` (§9.6): recovery
+    repairs a switch that has already reached the live store, and decides nothing.
+  - The daemon (sub-project 2) takes the same lock, so `auto` and the daemon never both drive
+    one provider.
+- **Where it runs.** Like every command that changes the live login, `auto` refuses inside a
+  `tagteam run` shell (§9.2), except with `--dry-run`. On macOS it runs the Keychain lock check
+  before its first tick (Appendix A.3).
 - **`--once` with several providers** exits with the most severe outcome: `1` if any provider
   errored, else `0` if any switched, else `3` if any was blocked, else `2`.
 
 ### 11.2 Tick
 
-1. **Load state.** Release any quarantine whose fingerprint or identity has since changed (not
-   in dry-run).
-2. **No managed live account:** `no-switch` with reason `unmanaged-active-account` or
-   `no-active-account`; outcome NO_ACTION. tagteam never acts on a login it doesn't manage.
-3. **Collect usage** as scheduled (§8.6) and emit `poll`. Run a one-time check that the
-   configured model names exist, emitting `config-warning` if not.
-4. **Active account is an API key** and `include_api_key_accounts` is false: `active-api-key`.
+1. **Load state.** Except in dry-run, release any quarantine that no longer binds (§7.4):
+   neither the vault's fingerprint nor, for the live account, the live credential's equals
+   `quarantine_fp`. Emit `account-unquarantined` for each. Quarantines that other processes
+   set or cleared since the previous tick are reported too, as `account-quarantined` or
+   `account-unquarantined`.
+2. **Recover, then check the live account.**
+   - An unresolved switch journal for the provider is recovered first, under `MutationGuard`
+     (§9.6); its events carry `source` = `auto`. If recovery cannot decide it yet: `no-switch`
+     with reason `interrupted-switch` (BLOCKED), whose detail carries recovery's reason.
+   - No managed live account: `no-switch` with reason `unmanaged-active-account` or
+     `no-active-account`; outcome NO_ACTION. tagteam never acts on a login it doesn't manage.
+3. **Collect usage** as scheduled (§8.6) and emit `poll`. Check that the configured model
+   names exist, once per engine and again whenever the setting changes, emitting
+   `config-warning` if not.
+4. **Active account is an API key.** With `include_api_key_accounts` false: `active-api-key`
+   (NO_ACTION). With it true, the tick looks for a way back to OAuth: the active account counts
+   as headroom 0, the trigger is `proactive`, and the landing must be below the threshold even
+   when every account is above it (step 8's exception does not apply).
 5. **Decide the trigger:**
+   - **A quarantined active account** (`relogin_required`) → trigger `failover` at once,
+     whatever its last reading says. Neither tagteam nor CC can refresh its token.
    - **Known headroom** resets the unhealthy-tick counter.
      - With `best`: usage below the threshold → `below-threshold` (NO_ACTION).
      - With `consume-first`: usage below the threshold → trigger `consume-first`.
      - Headroom ≤ 0 → `at-limit`. Otherwise → `proactive`.
-   - **Unknown headroom with an expired but owned token:** idle-hold for up to **1800 s**
-     (`active-idle`, slow cadence). CC refreshes the token on your next message.
    - **Otherwise unknown:** increment `unhealthy_ticks`. At `autoswitch.unhealthy_ticks`,
      trigger `failover`; before that, `active-usage-unknown n/N`.
+
+   There is no idle-hold. An expired live token never leaves the usage unknown by itself: the
+   tick's collection hands it to §7.5 (§8.1), so unknown usage means that refresh, or the
+   fetch, failed.
 6. **Cooldown.** `proactive` and `consume-first` within `cooldown_seconds` of the last switch →
    `cooldown`. `at-limit` and `failover` bypass it.
 7. **Candidates** must be switchable, not the current account, not quarantined, and not
-   session-owned. API-key accounts qualify only when enabled, and only as a last
-   resort (never for `consume-first`). No candidates → `no-candidates` (BLOCKED).
-8. **Rank:**
+   session-owned. API-key accounts qualify only when `include_api_key_accounts` is true, and
+   then only as a last resort (step 10), never for `consume-first`. No candidates →
+   `no-candidates` (BLOCKED); for a `consume-first` trigger, whose active account is healthy,
+   `below-threshold` (NO_ACTION) instead.
+8. **Rank** the OAuth candidates:
    - **Skip** unknown headroom, headroom ≤ 0, and the barred account (§11.3).
    - **Landing rule.** For `proactive` and `consume-first`, the landing account must be below
      the threshold, unless *every* account is above it.
    - **`best`:** candidate headroom − active headroom ≥ `hysteresis_pct`. Order by most
      headroom; ties go to the lower position.
-   - **`consume-first`:** ranked on the provider's primary `Long` window
-     (`primary_long_window()`, CC: 7d); a provider without one does not offer the strategy.
-     The target's reset of that window must be strictly sooner than the active account's
-     (unknown → skip). Order by soonest reset, then most headroom. Before
-     switching, re-fetch the current account and all candidates and re-rank; the target's
-     reading must be ≤ 180 s old, else `stale-usage`.
+   - **`consume-first`:** ranked on the provider's `primary_long_window()` (CC: 7d); a
+     provider without one runs `best` instead (§4.5). The target's reset of that window must
+     be strictly sooner than the active account's (unknown → skip). Order by soonest reset,
+     then most headroom. Before switching, re-check the current account and all candidates
+     (§8.3) and re-rank; the target's reading must be ≤ 180 s old, else `stale-usage`.
    - **Every account above the threshold:** for each pair, pick the recovery axis when both the
      active account and the candidate are within 3 points of headroom, or either one resets
      within 4 h. Otherwise use the headroom axis.
@@ -1403,7 +1490,8 @@ An empty alias never matches.
      - The headroom axis requires ≥ 2 × the active account's headroom.
      - Select the binding window first, then its reset. A past or unknown reset sorts last.
    - **`at-limit` and `failover`** skip every anti-flap gate.
-9. **Nothing ranked:**
+9. **Nothing ranked.** With an `at-limit` or `failover` trigger and API-key candidates
+   (step 7), go to step 10 with those. Otherwise:
 
    | Situation | Outcome |
    |---|---|
@@ -1423,9 +1511,25 @@ An empty alias never matches.
       | `Owned` (session-owned) | Try the next target |
       | OK | Perform the switch |
 
-11. **Perform.** Take the `autoswitch` lease, re-check the cooldown inside the transaction, then
-    call `switch` (direct). Record `last_switch_*`, `left_headroom`, `left_recovery_at` and
-    `left_trigger`, then emit `switch`.
+    When every OAuth target has failed and the trigger is `at-limit` or `failover`, the
+    API-key candidates are tried next, in position order. They do not refresh, so freshening
+    passes them.
+11. **Perform.** Call `switch` (direct) with the tick's preconditions. The switch re-checks
+    them under its locks, before its first write (§9.4 step 1):
+    - The live account is still the one this tick decided on. Otherwise: `no-switch` with
+      reason `live-changed` (NO_ACTION), and the next tick decides afresh. A manual switch made
+      meanwhile is never overridden.
+    - For `proactive` and `consume-first`, the cooldown still allows a switch, judged from
+      `autoswitch_state` as read under the lock. Otherwise: `cooldown`.
+    - The target is still a candidate (step 7): switchable, so neither disabled nor
+      quarantined, and not session-owned. A direct switch would accept a disabled or
+      quarantined target (§9.3, §7.2), so auto checks for itself. Otherwise the switch writes
+      nothing, and the tick moves on to its next target (step 10).
+
+    The switch's commit (§9.4 step 9) records `last_switch_*`, `left_headroom`,
+    `left_recovery_at` and `left_trigger` together with the switch. The check and the record
+    are both made under `MutationGuard`, which every switch holds, so no two switches can pass
+    one cooldown. Then emit `switch`.
 12. **Every target failed:**
     - Transient or systemic failures: `error` "could not freshen…" (ERROR).
     - Otherwise: `no-viable-target` (BLOCKED).
@@ -1451,11 +1555,26 @@ A missing departure snapshot lifts the bar.
 | Outcome | Delay |
 |---|---|
 | BLOCKED with a known reset | `min(max(until − now, interval), 600)` |
-| BLOCKED otherwise, or idle-hold | `max(interval, 300)` |
+| BLOCKED otherwise | `max(interval, 300)` |
 | Anything else | `interval × U(0.9, 1.1)`, shortened (never lengthened) to the active account's `next_poll_at`, floored at 60 s |
 
-A `sleep` event is emitted when the delay is more than 1.5 × `interval`. SIGINT and SIGTERM stop
-the loop cleanly; the loop exits 0.
+A `sleep` event is emitted when the delay is more than 1.5 × `interval`.
+
+- **Sleeping.** The loop sleeps toward a wall-clock deadline, in slices of at most 1 s, and
+  checks the cancel token in each slice (§14.1). A machine that was suspended therefore ticks
+  as soon as it wakes past the deadline. macOS's monotonic clock stops during sleep, so a
+  monotonic sleep would add the suspended time to the delay.
+- **Settings** are re-read before a tick whenever `config.toml`'s mtime has changed. Flags
+  still override them (§6.4).
+- **Errors.** A tick that fails emits `error`, and the loop goes on after the normal delay.
+  With `--once`, the command exits 1.
+- **Signals.** SIGINT, SIGTERM and SIGHUP stop the loop at its next cancellation point, after
+  any critical span in flight has finished (§14.1). The loop then exits 0. An interrupted
+  `--once` exits as §14.1 says.
+- **Human output.** Each tick prints one line on stdout: the local time, the active account
+  (position and label), its relevant usage, and the outcome (the reason, or the switch).
+  Quarantine changes and long sleeps get lines of their own. Errors and config warnings go to
+  stderr.
 
 **`--once` exit codes:** `0` switched · `1` error · `2` no action · `3` blocked.
 
@@ -1474,19 +1593,30 @@ must ignore unknown kinds and fields.
 | `error` | `message`, `transient` |
 | `config-warning` | `message` |
 
+- `no-switch` reasons are cswap's, plus `engine-running`, `live-changed` and
+  `interrupted-switch`. cswap's `active-idle` is never emitted (§11.2 step 5).
+- `account-unquarantined`'s reason is `account-replaced` when the account's `login_epoch`
+  moved (an explicit replacement, §12.5), else `credentials-replaced`.
+
 The flags `--once`, `--dry-run`, `--json`, `--threshold`, `--interval`, `--cooldown`,
 `--strategy`, `--model` and `--include-api-key-accounts` override the settings.
 
 ### 11.5 Simulation tests
 
 A proptest harness drives `decide()` through multi-day synthetic traces: 2–6 accounts, burn
-rates, 5h and 7d resets, 429s, dead tokens, and unknown readings. It asserts:
+rates, 5h and 7d resets, 429s, dead tokens, unknown readings, and API-key accounts. It asserts:
 
 - no A→B→A return within a cooldown unless A recovered
 - never landing on an account with headroom ≤ 0
 - never idling at the limit while a viable candidate exists
+- never landing on an API-key account unless the trigger is `at-limit` or `failover` and no
+  OAuth target was viable; a return from an API-key account always lands below the threshold
+- a quarantined active account fails over on the first tick that has a viable candidate
 - `--once` exit codes consistent with the outcome
 - deterministic results for a given seed
+
+The tick itself is tested in the engine against both providers (§15.2). `FakeAgent` has no
+`Long` window, so a `consume-first` setting runs `best` there.
 
 ## 12. Parallel sessions: `tagteam run`
 
@@ -1785,7 +1915,7 @@ exactly as it would without providers.
 |---|---|
 | `list` / `ls` | Every account with its 5h, 7d, spend and scoped usage, reset countdowns, markers (active, disabled, quarantined, ahead of pace) and data age. It fetches only when due (§8.3) |
 | `status` | The live account |
-| `switch [ACCOUNT] [--strategy best\|next-available] [--force]` | §9 |
+| `switch [ACCOUNT] [--strategy best\|next-available [--model M]] [--force]` | §9 |
 | `add`, `add-token`, `remove` / `rm`, `disable`, `enable`, `alias`, `move` | §10 |
 | `auto` | §11 |
 | `run`, `map`, `unmap`, `shell-init` | §12 |
@@ -1797,8 +1927,8 @@ exactly as it would without providers.
 | `doctor [--online]` | §13.6 |
 | `completions <shell>`, `purge` | `purge` deletes all tagteam data, including the vault Keychain items and the profiles' hashed items, after a confirmation (or `--yes`). It never touches any provider's live login. `--provider` limits it to one provider's accounts |
 
-**Exit codes:** `0` OK · `1` error · `2` usage error · `130` interrupted. `auto --once` uses
-0–3.
+**Exit codes:** `0` OK · `1` error · `2` usage error · `130` interrupted by SIGINT (128 + the
+signal number for SIGTERM and SIGHUP, §14.1). `auto --once` uses 0–3.
 
 **`list` text layout.** One row per account, in position order:
 
@@ -2020,14 +2150,56 @@ anything fails.
 - **The binary** maps them to exit codes and human messages that give the next action (for
   example, "log in with that account and run `tagteam add --position 3`").
 - **Panics** are bugs. Lock guards release in `Drop`, and the switch transaction's rollback
-  also runs from `Drop` if the transaction didn't commit. A killed process runs no `Drop`;
-  the switch journal (§9.6) and launch reservations (§12.5) cover that case.
+  also runs from `Drop` if the transaction didn't commit. The signals a user sends are caught
+  and unwind cleanly (§14.1), but a process killed by SIGKILL runs no `Drop`; the switch
+  journal (§9.6) and launch reservations (§12.5) cover that case.
 - **After a vault write advances an account, nothing may fail upward.** Any follow-up, such
   as replanning a poll, is contained: on failure it logs at ERROR. Profiles need no follow-up:
   the login epoch (bumped before the write) and the launch-time generation check (§12.5)
   cover them.
 - **stdout is reserved for command output.** Refresh-persist warnings and similar notices go to
   stderr, so `--json` output stays a single object.
+
+### 14.1 Signals and cancellation
+
+SIGINT, SIGTERM and SIGHUP never stop a command at the instruction they arrive on. The CLI's
+handler only records the signal in the engine's cancel token (§4.2), which tests set directly.
+
+- **Cancellation points.** The work checks the token, and unwinds with an `interrupted`
+  error, only where stopping loses nothing:
+  - each iteration of a lock wait: the mutation lock, account locks, and the provider's live
+    locks;
+  - before reserving or sending a usage request;
+  - at a prompt;
+  - in `auto`'s sleep, and between its ticks.
+
+  Unwinding runs every `Drop`. Locks are released, so CC's lock directories are removed, temp
+  files are deleted, and a switch that has not journaled has written nothing. An interrupted
+  usage fetch is not a usage failure: it records nothing and gives its slot back (§8.3).
+- **Critical spans run to completion.** No cancellation point lies inside:
+  - the switch transaction, from its journal row to its commit or rollback (§9.4 steps 6–10);
+  - recovery's writes (§9.6);
+  - the refresh gate (§7.3) and active-token refresh (§7.5), from sending the token request
+    to persisting the successor;
+  - an explicit replacement's three steps (§12.5);
+  - any vault, rescue or atomic write.
+
+  These spans are bounded by their request timeouts and local I/O. A signal that arrives
+  inside one, or a repeated signal, takes effect at the next cancellation point. A command
+  that reaches none, because its work finished first, reports what it did, with its normal
+  output and exit code, plus a stderr notice that the signal came too late to stop it. A
+  switch that committed is reported as switched, never as interrupted. SIGKILL cannot be
+  caught; the journal (§9.6) and launch reservations (§12.5) cover it.
+- **Child processes.** Non-interactive children (`/usr/bin/security`) run in their own process
+  group, so a Ctrl-C at the terminal reaches tagteam alone and never kills a Keychain write
+  midway. Interactive children (`security unlock-keychain`, and `claude` under `run`) stay in
+  the terminal's foreground group.
+- **Prompts.** A Ctrl-C at a prompt, including a no-echo secret prompt, restores the terminal
+  and counts as an interruption.
+- **Exit.** An interrupted command exits 130 after SIGINT, and 128 + the signal number after
+  SIGTERM or SIGHUP. With `--json`, it prints the error envelope with type `interrupted`.
+  `auto`'s loop stops cleanly and exits 0 instead (§11.4).
+- **`tagteam run`** handles signals as §12.5 says while `claude` runs.
 
 ## 15. Testing
 
@@ -2084,7 +2256,18 @@ anything fails.
   - **Concurrency tests** run several engines, in separate processes, against one store and
     home: double-switch prevention, lease fencing, refresh single-flight with a holder stopped
     (SIGSTOP) past any timeout, every vault writer racing the refresh gate, launch and exit
-    racing `remove` / `switch` / the gate, and two overlapping sessions of one account.
+    racing `remove` / `switch` / the gate, and two overlapping sessions of one account. Two
+    `auto` engines for one provider: the second skips it, or reports `engine-running`; an
+    auto-switch and a manual switch racing: the auto switch reports `live-changed`.
+  - **Cancellation** (§14.1): the token set during each lock wait ends the wait promptly,
+    leaves no CC lock directory behind, and exits 130 with nothing written. Set at each
+    switch crash point inside the critical span, it changes nothing about the switch: it
+    commits (reported as switched, exit 0, with the stderr notice), or rolls back on an
+    injected failure exactly as without the signal; either way no journal row is left. A real
+    SIGINT to the CLI during a switch's critical span ends the same way. `security` children run outside the terminal's
+    process group, and a secret prompt interrupted with Ctrl-C restores the terminal.
+  - **The auto loop** under an injected wall clock that jumps forward (a suspend) ticks once,
+    on waking, and re-reads changed settings before its next tick.
   - **Budget:** across any interleaving of processes and on-demand callers, no account is sent
     more than 20 usage requests in a rolling hour.
   - **Fresh home:** a `run` against a home with no `projects/` or `history.jsonl` leaves both
@@ -2267,8 +2450,10 @@ providers.
   - **File fallback.** If the Keychain write fails and the write falls back to the file, the
     old Keychain item must then be deleted and verified `Absent` with the existence probe,
     because CC would keep reading it the moment the Keychain is readable. Only then does the
-    activation commit, and file mode is pinned for the rest of the process. If the item cannot
-    be verified absent, the switch rolls back.
+    activation commit. If the item cannot be verified absent, the switch rolls back. File mode
+    stays pinned until the operation that fell back (one switch or one recovery) ends, so its
+    later writes go to the file too, and a rollback clears the pin. The next operation tries
+    the Keychain again, which matters for a long-lived process such as `auto` or the daemon.
 - **Vault reads on macOS.** The Keychain is primary. A Linux-style file vault is never used on
   macOS; the fallback for a failed vault write is `rescue/` (§6.3).
 
@@ -2376,7 +2561,9 @@ Each is a one-liner, and each gets at least one test.
     a session-owned account, even with `--force`.
 24. `at-limit` and `failover` bypass the anti-flap gates; `proactive` requires a landing below
     the threshold and the hysteresis margin.
-25. The cooldown is re-checked in the same transaction that records the switch.
+25. The cooldown is re-checked under the mutation lock before the switch's first write, and the
+    switch's commit records the auto-switch state in the same transaction as the switch
+    (§11.2 step 11).
 26. A healthy below-threshold tick is NO_ACTION, never BLOCKED.
 27. A sleep may be shortened by the poll plan, never lengthened.
 28. A running profile is never re-seeded or invalidated underneath its `claude`; it is left
@@ -2434,6 +2621,16 @@ Each is a one-liner, and each gets at least one test.
 52. A profile and the vault are compared only through the profile's seed, never by expiry. When
     both have moved in an unknown order, nothing is captured, refreshed or overwritten until an
     explicit replacement resolves it.
+53. A signal never stops a critical span: a journaled switch, recovery's writes, a token
+    request through the persistence of its successor, an explicit replacement, or a vault,
+    rescue or atomic write. Lock waits are cancellable, and unwinding releases every lock
+    (§14.1).
+54. Non-interactive child processes run outside the terminal's process group, so a terminal
+    Ctrl-C never kills one midway.
+55. At most one auto-switch engine drives a provider on a machine, so `autoswitch_state` has a
+    single writer (§11.1).
+56. An auto-switch never replaces a live account other than the one its tick decided on; a
+    manual switch made meanwhile wins (`live-changed`).
 
 ## Appendix C — cswap → tagteam command map
 
