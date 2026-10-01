@@ -13,8 +13,8 @@ use tagteam_core::usage::WindowKind;
 use tagteam_provider::http::{HttpResponse, Method, ScriptedHttp};
 use tagteam_provider::provider::TransientKind;
 use tagteam_provider::{
-    Capabilities, Credential, Env, FakeKeychain, KindTraits, LockError, MutationGuard, Pace,
-    PollBudget, Provider, ProviderError, Read, SecretStore, StoredLogin, UsageResult, Window,
+    Capabilities, Credential, Env, FakeKeychain, KindTraits, LiveLocks, LockError, MutationGuard,
+    Pace, PollBudget, Provider, ProviderError, Read, SecretStore, StoredLogin, UsageResult, Window,
 };
 
 /// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
@@ -196,7 +196,7 @@ fn doomed_names_everything_each_change_destroys() {
     use tagteam_provider::LiveChange;
     let api_key = "sk-ant-api03-target-key-abcdefghijklmn";
     // (change, how the Keychain treats the write: 0 takes it, 1 refuses it, 2 was pinned to
-    // the file by an earlier refusal)
+    // the file by an earlier refusal in the same operation)
     let cases: [(LiveChange, u8); 8] = [
         (LiveChange::Write("oauth"), 0),
         (LiveChange::Write("oauth"), 1),
@@ -212,9 +212,11 @@ fn doomed_names_everything_each_change_destroys() {
         let env = plant_every_entry(&f);
         let g = MutationGuard::acquire(&env, Duration::from_secs(1)).unwrap();
         let locks = f.cc.lock_live(&env, &g).unwrap();
-        let primary = |kind| keychain_service(&env, kind);
         if keychain == 2 {
-            f.kc.set_fail_write(&primary(ItemKind::OAuth), true);
+            // The pin lasts one operation (Appendix A.3), so the write that sets it runs under
+            // the same live locks as the change being checked.
+            let primary = keychain_service(&env, ItemKind::OAuth);
+            f.kc.set_fail_write(&primary, true);
             f.cc.write_credential(
                 &env,
                 &locks,
@@ -222,23 +224,22 @@ fn doomed_names_everything_each_change_destroys() {
                 &mut save_nothing,
             )
             .unwrap();
-            f.kc.set_fail_write(&primary(ItemKind::OAuth), false);
-            drop(locks);
-            drop(g);
+            f.kc.set_fail_write(&primary, false);
             plant_every_entry(&f);
-            check(&f, &env, change, keychain, api_key);
-            continue;
         }
-        drop(locks);
-        drop(g);
-        check(&f, &env, change, keychain, api_key);
+        check(&f, &env, &locks, change, keychain, api_key);
     }
 
-    fn check(f: &Fx, env: &Env, change: LiveChange, keychain: u8, api_key: &str) {
-        let g = MutationGuard::acquire(env, Duration::from_secs(1)).unwrap();
-        let locks = f.cc.lock_live(env, &g).unwrap();
+    fn check(
+        f: &Fx,
+        env: &Env,
+        locks: &LiveLocks<'_>,
+        change: LiveChange,
+        keychain: u8,
+        api_key: &str,
+    ) {
         let before = secrets_by_place(f, env);
-        let doomed = f.cc.doomed(env, &locks, change);
+        let doomed = f.cc.doomed(env, locks, change);
         let present = |fallback: bool| -> Vec<Vec<u8>> {
             doomed
                 .iter()
@@ -270,11 +271,11 @@ fn doomed_names_everything_each_change_destroys() {
                     reported.push(b.to_vec());
                     Ok(())
                 };
-                f.cc.write_credential(env, &locks, &login, &mut record)
+                f.cc.write_credential(env, locks, &login, &mut record)
                     .unwrap();
             }
             LiveChange::ClearOther(kind) => {
-                f.cc.clear_other_axis(env, &locks, kind).unwrap();
+                f.cc.clear_other_axis(env, locks, kind).unwrap();
             }
         }
         let after = secrets_by_place(f, env);
@@ -299,6 +300,12 @@ fn doomed_names_everything_each_change_destroys() {
         }
         if !refused && !pinned {
             assert!(reported.is_empty(), "{case}: nothing falls back");
+        }
+        if pinned {
+            assert!(
+                !reported.is_empty(),
+                "{case}: a pinned write goes to the file and reports the items it deletes"
+            );
         }
     }
 }
@@ -1014,4 +1021,158 @@ fn claude_code_describes_its_window_keys_as_it_normalizes_them() {
             assert_eq!(d.period_s, w.period_s, "{}", w.key);
         }
     }
+}
+
+/// A live OAuth login in the Keychain, as CC leaves it; returns the item's (service, account).
+fn keychain_login(f: &Fx) -> (String, String) {
+    let svc = keychain_service(&f.env, ItemKind::OAuth);
+    let acct = keychain_account(&f.env);
+    f.kc.put(
+        &svc,
+        &acct,
+        json!({"claudeAiOauth": {"refreshToken": "rt-live"}})
+            .to_string()
+            .as_bytes(),
+    );
+    (svc, acct)
+}
+
+#[test]
+fn a_fallback_pins_the_file_for_the_rest_of_its_operation() {
+    // Appendix A.3: once a write falls back, every later write under the same live locks goes
+    // to the file too, even with the Keychain healthy again.
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    let (svc, acct) = keychain_login(&f);
+    let fell_back = SecretStore::Fallback(paths.credentials_file.clone());
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+    f.kc.set_fail_write(&svc, true);
+    let first =
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "a@b.co", "rt-1"),
+            &mut save_nothing,
+        )
+        .unwrap();
+    assert_eq!(first.stored_in, fell_back);
+    f.kc.set_fail_write(&svc, false);
+    let second =
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "a@b.co", "rt-2"),
+            &mut save_nothing,
+        )
+        .unwrap();
+    assert_eq!(second.stored_in, fell_back);
+    assert_eq!(
+        f.kc.get(&svc, &acct),
+        None,
+        "the Keychain item stays deleted"
+    );
+    let file: Value = serde_json::from_slice(&fs::read(&paths.credentials_file).unwrap()).unwrap();
+    assert_eq!(file["claudeAiOauth"]["refreshToken"], json!("rt-2"));
+}
+
+#[test]
+fn the_next_operation_tries_the_keychain_again() {
+    // Appendix A.3 (L396): releasing the live locks ends the operation that fell back, and
+    // with it the pin. A long-lived process (`auto`, the daemon) must not stay on the file.
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    let (svc, acct) = keychain_login(&f);
+    {
+        let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+        let locks = f.cc.lock_live(&f.env, &g).unwrap();
+        f.kc.set_fail_write(&svc, true);
+        let written =
+            f.cc.write_credential(
+                &f.env,
+                &locks,
+                &target(&f, "a@b.co", "rt-1"),
+                &mut save_nothing,
+            )
+            .unwrap();
+        assert_eq!(
+            written.stored_in,
+            SecretStore::Fallback(paths.credentials_file.clone())
+        );
+    }
+    f.kc.set_fail_write(&svc, false);
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+    let written =
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "b@b.co", "rt-2"),
+            &mut save_nothing,
+        )
+        .unwrap();
+    assert_eq!(written.stored_in, SecretStore::Keychain);
+    let item = f.kc.get(&svc, &acct).unwrap();
+    assert_eq!(
+        oauth_item(&f).unwrap()["claudeAiOauth"]["refreshToken"],
+        json!("rt-2")
+    );
+    assert_eq!(
+        fs::read(&paths.credentials_file).unwrap(),
+        item,
+        "the file the fallback created is rewritten with the item's bytes, for hot reload"
+    );
+}
+
+#[test]
+fn a_rollback_clears_the_pin_within_its_operation() {
+    // Appendix A.3: the rollback puts the Keychain item back, so a later write of the same
+    // operation must not stay on the file, where the restored item would shadow it.
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    let (svc, acct) = keychain_login(&f);
+    let before = f.kc.get(&svc, &acct).unwrap();
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let locks = f.cc.lock_live(&f.env, &g).unwrap();
+    f.kc.set_fail_write(&svc, true);
+    let written =
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "a@b.co", "rt-1"),
+            &mut save_nothing,
+        )
+        .unwrap();
+    assert_eq!(
+        written.stored_in,
+        SecretStore::Fallback(paths.credentials_file.clone())
+    );
+    f.kc.set_fail_write(&svc, false);
+    written.undo.undo(&locks).unwrap();
+    assert_eq!(
+        f.kc.get(&svc, &acct).unwrap(),
+        before,
+        "the rollback put the item back"
+    );
+    assert!(
+        !paths.credentials_file.exists(),
+        "and removed the fallback's file"
+    );
+    let again =
+        f.cc.write_credential(
+            &f.env,
+            &locks,
+            &target(&f, "a@b.co", "rt-2"),
+            &mut save_nothing,
+        )
+        .unwrap();
+    assert_eq!(again.stored_in, SecretStore::Keychain);
+    assert_eq!(
+        oauth_item(&f).unwrap()["claudeAiOauth"]["refreshToken"],
+        json!("rt-2")
+    );
+    assert!(
+        !paths.credentials_file.exists(),
+        "a Keychain write never creates the file"
+    );
 }

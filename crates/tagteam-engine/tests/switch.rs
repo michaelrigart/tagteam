@@ -729,8 +729,8 @@ fn a_switch_reports_the_fallback_it_took_on_either_axis() {
 
 #[test]
 fn a_file_pin_from_an_earlier_switch_never_mislabels_a_later_api_key_switch() {
-    // One process: the OAuth fallback pins the credential entry to the file for the rest of
-    // it, but an API key the Keychain then takes was stored in the Keychain, and says so.
+    // An OAuth fallback in one switch never mislabels a later API-key switch: the key the
+    // Keychain takes was stored in the Keychain, and says so.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
@@ -747,6 +747,35 @@ fn a_file_pin_from_an_earlier_switch_never_mislabels_a_later_api_key_switch() {
         Some(SecretStore::Keychain)
     );
     assert_eq!(fx.managed_key().as_deref(), Some(API_KEY.as_bytes()));
+}
+
+#[test]
+fn the_switch_after_a_fallback_tries_the_keychain_again() {
+    // Appendix A.3 (L396): file mode lasts only as long as the switch that fell back, so a
+    // long-lived process (M3b's `auto`) is not left on the file for good.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live: b, in the Keychain
+    let (oauth_item, acct) = fx.live_item(ItemKind::OAuth);
+    fx.kc.set_fail_write(&oauth_item, true);
+    assert_eq!(
+        switch(&fx, to(&a), false).unwrap().stored_in,
+        Some(SecretStore::Fallback(fx.paths().credentials_file))
+    );
+    assert_eq!(
+        fx.kc.get(&oauth_item, &acct),
+        None,
+        "the fallback deleted the item"
+    );
+    fx.kc.set_fail_write(&oauth_item, false);
+    assert_eq!(
+        switch(&fx, to(&b), false).unwrap().stored_in,
+        Some(SecretStore::Keychain)
+    );
+    let item = fx.kc.get(&oauth_item, &acct).unwrap();
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+    // The file the fallback created now mirrors the item, rewritten for CC's hot reload.
+    assert_eq!(fs::read(fx.paths().credentials_file).unwrap(), item);
 }
 
 #[test]

@@ -282,7 +282,8 @@ pub enum SecretStore {
     Keychain,
     /// A file that is the platform's only store for it (Linux).
     File(PathBuf),
-    /// A file, because the keychain refused this write or an earlier one in this process.
+    /// A file, because the keychain refused this write or an earlier one of the same operation
+    /// (Appendix A.3).
     Fallback(PathBuf),
 }
 

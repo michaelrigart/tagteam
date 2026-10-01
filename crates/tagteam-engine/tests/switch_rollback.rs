@@ -14,7 +14,7 @@ use tagteam_engine::oracle::Oracle;
 use tagteam_engine::store::JournalRow;
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget};
 use tagteam_engine::{Engine, EngineError};
-use tagteam_provider::{Credential, Env, Identity, ProcessStamp, Provider};
+use tagteam_provider::{Credential, Env, Identity, ProcessStamp, Provider, SecretStore};
 
 fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
     SwitchRequest {
@@ -397,4 +397,40 @@ fn a_panic_inside_a_live_write_keeps_the_journal_for_recovery() {
     assert_eq!(fx.live_credential(), cred_before);
     let store = fx.engine.store().unwrap();
     assert!(store.journal(&fx.provider()).unwrap().is_some());
+}
+
+#[test]
+fn a_rolled_back_fallback_leaves_the_next_switch_on_the_keychain() {
+    // Appendix A.3 (L396): a rollback clears the file-mode pin, so the fallback a failed
+    // switch took never carries over to the next one.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live: b, in the Keychain
+    let cred_before = fx.live_credential();
+    let svc = keychain_service(&fx.env, ItemKind::OAuth);
+    fx.kc.set_fail_write(&svc, true);
+    // The write falls back; the Keychain takes writes again by the time the switch fails, so
+    // the rollback can put b's item back.
+    let (kc, healed) = (fx.kc.clone(), svc.clone());
+    fx.engine.on_point(
+        "after-credential",
+        Box::new(move || kc.set_fail_write(&healed, false)),
+    );
+    fx.engine.fail_at(Some("after-credential"));
+    let err = fx.switch_to(&a, false).unwrap_err();
+    assert!(matches!(err, EngineError::RolledBack(_)), "{err}");
+    assert_eq!(fx.live_credential(), cred_before);
+    assert!(
+        !fx.paths().credentials_file.exists(),
+        "the rollback removed the fallback's file"
+    );
+
+    fx.engine.fail_at(None);
+    let out = fx.switch_to(&a, false).unwrap();
+    assert_eq!(out.stored_in, Some(SecretStore::Keychain));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    assert!(
+        !fx.paths().credentials_file.exists(),
+        "a Keychain write never creates the file"
+    );
 }
