@@ -301,8 +301,11 @@ pub enum ProviderError {
     /// the provider's advice on repairing it.
     #[error("{} is torn or not a JSON object; {remedy}", path.display())]
     ConfigUnsplicable { path: PathBuf, remedy: &'static str },
+    /// A Keychain item `remove_items` could not verify gone: after a file fallback, after a
+    /// managed-key fallback, or when a managed key is removed. It may still be read instead
+    /// of what tagteam wrote (L397).
     #[error(
-        "the credential was written to the file, but the Keychain item {0} that shadows it could not be verified gone"
+        "the Keychain item {0} could not be verified gone, so it may still be read instead of what tagteam wrote"
     )]
     ShadowingItem(String),
     /// A write failed part-way and restoring the previous state failed too: the live state is

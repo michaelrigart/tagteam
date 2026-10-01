@@ -532,6 +532,27 @@ fn managed_keys_record_approval_and_never_leave_a_shadowing_item() {
 }
 
 #[test]
+fn a_managed_key_item_that_will_not_delete_is_reported_as_a_removal_not_a_file_write() {
+    // L397: `clear_managed_key` writes no file, so the message must not say one was written.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let svc = keychain_service(&f.env, ItemKind::ManagedKey);
+    let acct = keychain_account(&f.env);
+    f.kc.put(&svc, &acct, b"sk-ant-api03-stale");
+    f.kc.set_fail_delete(&svc, true);
+    let err = s
+        .clear_managed_key(&f.env, &f.paths, &open)
+        .expect_err("the item cannot be verified gone");
+    let ProviderError::ShadowingItem(name) = &err else {
+        panic!("expected ShadowingItem, got {err:?}");
+    };
+    let shown = err.to_string();
+    assert!(shown.contains(name.as_str()), "{shown}");
+    assert!(shown.contains("could not be verified gone"), "{shown}");
+    assert!(!shown.contains("written to the file"), "{shown}");
+}
+
+#[test]
 fn a_null_approved_refuses_and_leaves_everything_untouched() {
     let f = fx();
     let s = store(&f, Platform::MacOs);
