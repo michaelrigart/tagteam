@@ -10,6 +10,7 @@ mod history;
 pub mod prompt;
 mod render;
 mod root_guard;
+mod signals;
 mod statusline;
 
 const TEXT_UNDER_JSON: &str = "--help and --version print text; run them without --json";
@@ -87,6 +88,16 @@ where
         statusline::drain(stdin.lock(), stdin.is_terminal());
     }
     let ctx = app::Context::from_process();
+    // §14.1, at the process boundary like the drain above: in-process tests drive `run` with
+    // tokens of their own, and must never change the test runner's signal dispositions. After
+    // the drain, so a status bar command stuck on a pipe that never closes still dies on
+    // SIGTERM.
+    if let Err(e) = signals::install(&ctx.env.cancel) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: could not catch signals, so one stops tagteam where it lands: {e}"
+        );
+    }
     let mut prompter = prompt::TtyPrompter::new(ctx.env.cancel.clone());
     let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
     app::run(

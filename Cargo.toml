@@ -23,6 +23,9 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 sha2 = "0.10"
+# §14.1, Decision 2: SIGINT, SIGTERM and SIGHUP only set the cancel token; `flag` needs no
+# feature.
+signal-hook = { version = "0.3", default-features = false }
 thiserror = "2"
 # config.toml (§6.4): read in M2b, written in M5; preserves comments and formatting.
 toml_edit = "0.22"
