@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
+use std::time::Duration;
 
 use tagteam_core::pace::pace;
 use tagteam_core::trust::decision_grade;
@@ -13,6 +14,10 @@ use crate::store::{AccountRow, LiveIdentityCacheRow, Store, UsageStateRow};
 
 /// §8.7: pace and projections read the samples of the 48 h before a reading.
 const PACE_LOOKBACK_S: i64 = 48 * 3600;
+
+/// The longest `statusline` waits on the store's write lock to cache the live identity: the
+/// cache is a convenience, and the line is never held up for it (§13.5).
+const CACHE_WRITE_WAIT: Duration = Duration::from_millis(5);
 
 /// `usageError` for an account that has neither a reading nor a failure yet (§13.2).
 pub const NO_DATA: &str = "no-data";
@@ -57,9 +62,13 @@ pub struct UsageView {
     pub decision_grade: bool,
     pub fetched_at: Option<i64>,
     pub age_s: Option<i64>,
-    /// `last_error` (or `no-data`) when the status is `Unavailable`.
+    /// Why the status is not `ok`: the `last_error` of the failures being retried (§13.2), and
+    /// for `Unavailable` `no-data` when there is none. `None` when the status is `ok`, or no
+    /// failure is on record (a quarantined account, an API key).
     pub error: Option<String>,
-    /// When the next fetch may happen, `max(backoff_until, next_poll_at)`, when `Unavailable`.
+    /// When the next fetch may happen, `max(backoff_until, next_poll_at)`, while that is still
+    /// ahead and the status is one that is retried: not `ok`, and not `ReloginRequired`,
+    /// `ApiKey` or `Unsupported`, which are never fetched.
     pub retry_at: Option<i64>,
 }
 
@@ -160,7 +169,7 @@ fn pace_from(w: &Window, fetched_at: i64, samples: &[Sample]) -> Pace {
 
 /// The reading's windows, each with §8.7's pace from its own samples of the 48 h before the
 /// reading: one query per window, along the samples' key (account, window, time).
-fn with_pace(
+fn paced(
     store: &Store,
     id: &AccountId,
     windows: &[Window],
@@ -194,6 +203,8 @@ pub struct HistoryWindow {
 pub struct HistoryView {
     pub account: AccountView,
     pub windows: Vec<HistoryWindow>,
+    /// A window filter was given and the account has windows, but none is the one asked for.
+    pub unmatched_window: bool,
 }
 
 /// What `statusline` shows (§13.5).
@@ -213,6 +224,24 @@ struct LiveLogin {
     account_uuid: Option<String>,
 }
 
+/// The provider's live login as the account views read it.
+struct Liveness {
+    identity: Read<Identity>,
+    key: Read<String>,
+    /// The store's active account, read only while the live identity is unreadable.
+    stored_active: Option<AccountId>,
+}
+
+impl Liveness {
+    fn is_active(&self, row: &AccountRow) -> bool {
+        match &self.key {
+            Read::Present(k) => &row.identity_key == k,
+            Read::Absent => false,
+            Read::Unreadable(_) => self.stored_active.as_ref() == Some(&row.id),
+        }
+    }
+}
+
 impl LiveLogin {
     fn of(p: &dyn Provider, i: &Identity) -> Self {
         LiveLogin {
@@ -226,12 +255,16 @@ impl LiveLogin {
 impl Engine {
     /// §13.2's usage for one account: its status (Decision 10), its last good reading with
     /// pace, and whether that reading is decision-grade (§8.4). Reads the store only.
+    ///
+    /// `with_pace` is whether each window carries §8.7's pace, which costs a query per window
+    /// of samples; a view that never shows it asks for none (`Pace::default()`).
     fn usage_view(
         &self,
         store: Option<&Store>,
         row: &AccountRow,
         kind: &KindTraits,
         supported: bool,
+        with_pace: bool,
     ) -> Result<UsageView, EngineError> {
         let state = match store {
             Some(s) if supported => s.usage_state(&row.id)?,
@@ -246,7 +279,11 @@ impl Engine {
         let windows = match state.fetched_at {
             Some(at) => {
                 let read = state.last_good.as_deref().unwrap_or_default();
-                Some(with_pace(store, &row.id, read, at)?)
+                Some(if with_pace {
+                    paced(store, &row.id, read, at)?
+                } else {
+                    read.iter().map(|w| (w.clone(), Pace::default())).collect()
+                })
             }
             None => None,
         };
@@ -271,14 +308,22 @@ impl Engine {
                 last_429_at: state.last_429_at,
                 earliest_relevant_reset: reset,
             });
-        let unavailable = status == UsageStatus::Unavailable;
-        let error = unavailable.then(|| {
-            state
-                .last_error
-                .clone()
-                .filter(|_| state.consecutive_failures > 0)
-                .unwrap_or_else(|| NO_DATA.to_owned())
-        });
+        let failing = state
+            .last_error
+            .clone()
+            .filter(|_| state.consecutive_failures > 0);
+        let error = match status {
+            UsageStatus::Ok => None,
+            UsageStatus::Unavailable => Some(failing.unwrap_or_else(|| NO_DATA.to_owned())),
+            _ => failing,
+        };
+        let retried = !matches!(
+            status,
+            UsageStatus::Ok
+                | UsageStatus::ReloginRequired
+                | UsageStatus::ApiKey
+                | UsageStatus::Unsupported
+        );
         Ok(UsageView {
             status,
             windows,
@@ -286,11 +331,10 @@ impl Engine {
             fetched_at: state.fetched_at,
             age_s: state.fetched_at.map(|at| (now_s - at).max(0)),
             error,
-            retry_at: if unavailable {
-                state.backoff_until.max(state.next_poll_at)
-            } else {
-                None
-            },
+            retry_at: state
+                .backoff_until
+                .max(state.next_poll_at)
+                .filter(|&at| retried && at > now_s),
         })
     }
 
@@ -301,33 +345,17 @@ impl Engine {
             Some(s) => s.accounts(provider)?,
             None => vec![],
         };
-        let live = p.live_identity(&self.env);
-        let live_key = live.as_ref().map(|i| p.identity_key(i).as_str().to_owned());
-        let stored_active = match (&live_key, &store) {
-            (Read::Unreadable(_), Some(s)) => s.active(provider)?,
-            _ => None,
-        };
+        let live = self.liveness(p.as_ref(), store.as_deref(), provider)?;
         let supported = p.capabilities().usage;
         let accounts = rows
             .into_iter()
             .map(|row| {
-                let active = match &live_key {
-                    Read::Present(k) => &row.identity_key == k,
-                    Read::Absent => false,
-                    Read::Unreadable(_) => stored_active.as_ref() == Some(&row.id),
-                };
-                let kind = p.kind_traits(&row.kind);
-                let usage = self.usage_view(store.as_deref(), &row, &kind, supported)?;
-                Ok(AccountView {
-                    kind,
-                    row,
-                    active,
-                    usage,
-                })
+                let active = live.is_active(&row);
+                self.account_view_of(p.as_ref(), store.as_deref(), row, active, supported, true)
             })
             .collect::<Result<Vec<_>, EngineError>>()?;
         let active_position = accounts.iter().find(|v| v.active).map(|v| v.row.position);
-        let live_label = live.map(|i| i.email.unwrap_or(i.label));
+        let live_label = live.identity.map(|i| i.email.unwrap_or(i.label));
         Ok((
             ProviderAccounts {
                 provider: provider.clone(),
@@ -338,10 +366,59 @@ impl Engine {
         ))
     }
 
+    /// The provider's live login, and what decides which account is active: the live identity
+    /// wins, and the store's active account stands in while the live identity is unreadable.
+    fn liveness(
+        &self,
+        p: &dyn Provider,
+        store: Option<&Store>,
+        provider: &ProviderId,
+    ) -> Result<Liveness, EngineError> {
+        let identity = p.live_identity(&self.env);
+        let key = identity
+            .as_ref()
+            .map(|i| p.identity_key(i).as_str().to_owned());
+        let stored_active = match (&key, store) {
+            (Read::Unreadable(_), Some(s)) => s.active(provider)?,
+            _ => None,
+        };
+        Ok(Liveness {
+            identity,
+            key,
+            stored_active,
+        })
+    }
+
+    /// One account as the views show it, its usage read from `store` (with pace, or without:
+    /// see `usage_view`).
+    fn account_view_of(
+        &self,
+        p: &dyn Provider,
+        store: Option<&Store>,
+        row: AccountRow,
+        active: bool,
+        supported: bool,
+        with_pace: bool,
+    ) -> Result<AccountView, EngineError> {
+        let kind = p.kind_traits(&row.kind);
+        let usage = self.usage_view(store, &row, &kind, supported, with_pace)?;
+        Ok(AccountView {
+            kind,
+            row,
+            active,
+            usage,
+        })
+    }
+
     /// A row as the views show it, for a caller that already knows whether it is active. Its
     /// usage comes from the store; a store that cannot be read leaves it unread, logged, since
     /// the callers report a change that has already happened.
     pub fn account_view(&self, row: AccountRow, active: bool) -> AccountView {
+        self.account_view_with(row, active, true)
+    }
+
+    /// `account_view`, with or without pace on its windows (see `usage_view`).
+    fn account_view_with(&self, row: AccountRow, active: bool, with_pace: bool) -> AccountView {
         let provider = self.registry.get(&row.provider);
         let kind = provider
             .as_ref()
@@ -349,7 +426,7 @@ impl Engine {
         let supported = provider.is_some_and(|p| p.capabilities().usage);
         let usage = self
             .existing_store()
-            .and_then(|s| self.usage_view(s.as_deref(), &row, &kind, supported))
+            .and_then(|s| self.usage_view(s.as_deref(), &row, &kind, supported, with_pace))
             .unwrap_or_else(|e| {
                 tracing::warn!(
                     position = row.position,
@@ -425,33 +502,33 @@ impl Engine {
         let missing = || EngineError::NoSuchAccount(account.to_string());
         let store = self.existing_store()?.ok_or_else(missing)?;
         let row = store.account(account)?.ok_or_else(missing)?;
-        let view = self
-            .accounts(Some(&row.provider))?
-            .into_iter()
-            .flat_map(|l| l.accounts)
-            .find(|v| v.row.id == row.id)
-            .ok_or_else(missing)?;
         let p = self.provider(&row.provider)?;
-        // Each window with the time its `pct` is as of: the reading's fetch for its own.
-        let mut read: Vec<(Window, i64)> = match store.usage_state(&row.id)? {
-            Some(UsageStateRow {
-                last_good,
-                fetched_at: Some(at),
-                ..
-            }) => last_good
-                .unwrap_or_default()
-                .into_iter()
-                .map(|w| (w, at))
-                .collect(),
-            _ => Vec::new(),
-        };
+        let live = self.liveness(p.as_ref(), Some(&store), &row.provider)?;
+        let view = self.account_view_of(
+            p.as_ref(),
+            Some(&store),
+            row.clone(),
+            live.is_active(&row),
+            p.capabilities().usage,
+            true,
+        )?;
+        // Each window with the time its `pct` is as of, and its pace when the view has it: the
+        // last good reading's own windows are the view's, as read then.
+        let mut read: Vec<(Window, i64, Option<Pace>)> =
+            match (&view.usage.windows, view.usage.fetched_at) {
+                (Some(windows), Some(at)) => windows
+                    .iter()
+                    .map(|(w, pace)| (w.clone(), at, Some(*pace)))
+                    .collect(),
+                _ => Vec::new(),
+            };
         // Samples ascend by time, so the last one kept per key is that window's latest.
         let mut latest: BTreeMap<String, Sample> = BTreeMap::new();
         for (key, sample) in store.usage_samples(&row.id, None, since_s)? {
             latest.insert(key, sample);
         }
         for (key, s) in latest {
-            if read.iter().any(|(w, _)| w.key == key) {
+            if read.iter().any(|(w, ..)| w.key == key) {
                 continue;
             }
             if let Some(w) = p.describe_window(&key) {
@@ -460,34 +537,46 @@ impl Engine {
                     resets_at: s.resets_at,
                     ..w
                 };
-                read.push((w, s.fetched_at));
+                read.push((w, s.fetched_at, None));
             }
         }
+        let had_windows = !read.is_empty();
         let models = &self.settings().models;
         let windows = read
             .into_iter()
-            .filter(|(w, _)| match window {
+            .filter(|(w, ..)| match window {
                 Some(name) => {
                     w.key.eq_ignore_ascii_case(name) || w.label.eq_ignore_ascii_case(name)
                 }
                 None => is_relevant(w, models),
             })
-            .map(|(w, fetched_at)| {
-                // One query reaches back to the earlier of `since_s` and pace's lookback.
-                let all: Vec<Sample> = store
-                    .usage_samples(
-                        &row.id,
-                        Some(&w.key),
-                        since_s.min(fetched_at - PACE_LOOKBACK_S),
-                    )?
-                    .into_iter()
-                    .map(|(_, s)| s)
-                    .collect();
-                let pace = pace_from(&w, fetched_at, &all);
-                let samples = all
-                    .into_iter()
-                    .filter(|s| s.fetched_at >= since_s)
-                    .collect();
+            .map(|(w, fetched_at, known)| {
+                let (pace, samples) = match known {
+                    // The view's pace is as of the same reading: only the samples to show.
+                    Some(pace) => {
+                        let shown = store.usage_samples(&row.id, Some(&w.key), since_s)?;
+                        (pace, shown.into_iter().map(|(_, s)| s).collect())
+                    }
+                    // One query reaches back to the earlier of `since_s` and pace's lookback.
+                    None => {
+                        let all: Vec<Sample> = store
+                            .usage_samples(
+                                &row.id,
+                                Some(&w.key),
+                                since_s.min(fetched_at - PACE_LOOKBACK_S),
+                            )?
+                            .into_iter()
+                            .map(|(_, s)| s)
+                            .collect();
+                        let pace = pace_from(&w, fetched_at, &all);
+                        (
+                            pace,
+                            all.into_iter()
+                                .filter(|s| s.fetched_at >= since_s)
+                                .collect(),
+                        )
+                    }
+                };
                 Ok(HistoryWindow {
                     window: w,
                     samples,
@@ -497,6 +586,7 @@ impl Engine {
             .collect::<Result<Vec<_>, EngineError>>()?;
         Ok(HistoryView {
             account: view,
+            unmatched_window: window.is_some() && had_windows && windows.is_empty(),
             windows,
         })
     }
@@ -517,8 +607,9 @@ impl Engine {
             None => None,
         };
         Ok(match row {
+            // The line shows no pace, so none is computed.
             Some(row) => StatuslineView::Managed {
-                account: self.account_view(row, true),
+                account: self.account_view_with(row, true, false),
             },
             None => StatuslineView::Unmanaged { email: login.label },
         })
@@ -576,7 +667,7 @@ impl Engine {
             ..stamp
         };
         // Only a cache: a failed write costs the next run a parse, never this one its line.
-        if let Err(e) = store.put_live_identity_cache(&row) {
+        if let Err(e) = store.put_live_identity_cache_within(&row, CACHE_WRITE_WAIT) {
             tracing::debug!(error = %e, "the live identity cache was not written");
         }
         Ok(login)

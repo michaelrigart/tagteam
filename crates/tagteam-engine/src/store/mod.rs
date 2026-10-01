@@ -341,6 +341,9 @@ fn user_version(c: &Connection) -> rusqlite::Result<i64> {
     c.query_row("PRAGMA user_version", [], |r| r.get(0))
 }
 
+/// How long a connection waits on another's lock before it gives up.
+const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+
 /// The flags every tagteam connection opens with, `SQLITE_OPEN_CREATE` only when the caller
 /// may create the file. `open_existing` opens without it, so a database removed between its
 /// existence check and this call is never recreated out from under the removal.
@@ -378,7 +381,7 @@ fn set_wal_mode(conn: &Connection) -> Result<(), StoreError> {
 /// to refuse a newer-schema file before anything touches it at all.
 fn connect(path: &Path, create: bool) -> Result<Connection, StoreError> {
     let conn = Connection::open_with_flags(path, open_flags(create))?;
-    conn.busy_timeout(Duration::from_millis(5000))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
     Ok(conn)
 }

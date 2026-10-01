@@ -2,6 +2,8 @@
 //! the `usage:<id>` leases and the live-identity cache. Usage columns hold epoch seconds, and
 //! lease expiries hold epoch milliseconds (Decision 1).
 
+use std::time::Duration;
+
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
 use tagteam_core::backoff::failure_backoff_s;
@@ -654,26 +656,45 @@ impl Store {
     }
 
     pub fn put_live_identity_cache(&self, row: &LiveIdentityCacheRow) -> Result<(), StoreError> {
-        self.lock().execute(
-            "INSERT INTO live_identity_cache \
-             (provider, path, mtime_ns, size, identity_key, label, account_uuid) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-             ON CONFLICT(provider) DO UPDATE SET path = excluded.path, \
-             mtime_ns = excluded.mtime_ns, size = excluded.size, \
-             identity_key = excluded.identity_key, label = excluded.label, \
-             account_uuid = excluded.account_uuid",
-            params![
-                row.provider.as_str(),
-                row.path,
-                row.mtime_ns,
-                row.size,
-                row.identity_key,
-                row.label,
-                row.account_uuid
-            ],
-        )?;
-        Ok(())
+        put_live_identity_cache(&self.lock(), row)
     }
+
+    /// `put_live_identity_cache`, giving up after `wait` on another connection's write lock
+    /// (`SQLITE_BUSY`) instead of the connection's own, far longer, wait: for a writer that is
+    /// only a cache and must never hold its caller up.
+    pub fn put_live_identity_cache_within(
+        &self,
+        row: &LiveIdentityCacheRow,
+        wait: Duration,
+    ) -> Result<(), StoreError> {
+        let c = self.lock();
+        c.busy_timeout(wait)?;
+        let written = put_live_identity_cache(&c, row);
+        c.busy_timeout(super::BUSY_TIMEOUT)?;
+        written
+    }
+}
+
+fn put_live_identity_cache(c: &Connection, row: &LiveIdentityCacheRow) -> Result<(), StoreError> {
+    c.execute(
+        "INSERT INTO live_identity_cache \
+         (provider, path, mtime_ns, size, identity_key, label, account_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(provider) DO UPDATE SET path = excluded.path, \
+         mtime_ns = excluded.mtime_ns, size = excluded.size, \
+         identity_key = excluded.identity_key, label = excluded.label, \
+         account_uuid = excluded.account_uuid",
+        params![
+            row.provider.as_str(),
+            row.path,
+            row.mtime_ns,
+            row.size,
+            row.identity_key,
+            row.label,
+            row.account_uuid
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

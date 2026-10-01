@@ -834,17 +834,15 @@ impl App<'_, '_> {
             None => self.live_row()?,
         };
         let now_s = self.now_s();
-        let mut view =
-            self.engine
-                .history(&row.id, window.as_deref(), now_s.saturating_sub(span))?;
-        if window.is_none() {
-            history::keep_relevant(&mut view, &self.engine.settings().models);
-        }
+        // The engine's relevance filter is the one rule for which windows show (§8.2).
+        let view = self
+            .engine
+            .history(&row.id, window.as_deref(), now_s.saturating_sub(span))?;
         if csv {
             let _ = write!(self.io.out, "{}", history::csv(&view));
         } else {
             self.print(
-                &history::human(&view, since, now_s),
+                &history::human(&view, window.as_deref(), since, now_s),
                 history::json(&view, row.provider.as_str()),
             );
         }
