@@ -940,3 +940,66 @@ fn statusline_needs_no_keychain_no_network_and_creates_no_store() {
     assert!(fx.http.requests().is_empty(), "no request");
     assert_eq!(fx.kc.unlock_attempts(), 0);
 }
+
+#[test]
+fn decision_windows_are_the_reading_while_it_is_decision_grade_under_the_models_given() {
+    // §8.4 after a 429: trusted until the earliest relevant reset, capped at two hours. Fable
+    // resets first here, so it shortens that trust only when it counts (§8.2).
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let mut windows = reading(T0, 9.0, 40.0);
+    windows[2].resets_at = Some(T0 + 1_000);
+    record(&fx, &a, &windows, T0, T0 + 180);
+    fail(&fx, &a, "http-429", T0 + 200, T0 + 5_000, Some(T0 + 5_000));
+    let store = fx.engine.store().unwrap();
+    let a_row = store.account(&a).unwrap().unwrap();
+    let b_row = store.account(&b).unwrap().unwrap();
+    let fable = ["Fable".to_owned()];
+
+    at(&fx, T0 + 100);
+    assert_eq!(
+        fx.engine.decision_windows(&a_row, &fable).unwrap(),
+        Some(windows.clone()),
+        "a young reading counts under any models"
+    );
+    assert_eq!(
+        fx.engine.decision_windows(&b_row, &[]).unwrap(),
+        None,
+        "never read"
+    );
+
+    at(&fx, T0 + 4_000);
+    assert_eq!(
+        fx.engine.decision_windows(&a_row, &[]).unwrap(),
+        Some(windows),
+        "trusted until the 5h reset, capped at T0 + 7200"
+    );
+    assert_eq!(
+        fx.engine.decision_windows(&a_row, &fable).unwrap(),
+        None,
+        "Fable's reset, at T0 + 1000, has passed"
+    );
+}
+
+#[test]
+fn decision_windows_take_a_clock_skewed_plan_for_no_plan() {
+    // As the views do (§8.4): past the five-minute rule, a legal plan keeps a reading
+    // decision-grade, and a `next_poll_at` a day ahead (clock skew) does not.
+    let fx = Fx::new();
+    let legal = fx.add("a@x.co", "rt-a");
+    let skewed = fx.add("b@x.co", "rt-b");
+    record(&fx, &legal, &reading(T0, 9.0, 40.0), T0, T0 + 1_200);
+    record(&fx, &skewed, &reading(T0, 9.0, 40.0), T0, T0 + 86_400);
+    at(&fx, T0 + 600);
+    let store = fx.engine.store().unwrap();
+    for (id, grade) in [(&legal, true), (&skewed, false)] {
+        let row = store.account(id).unwrap().unwrap();
+        assert_eq!(
+            fx.engine.decision_windows(&row, &[]).unwrap().is_some(),
+            grade,
+            "{}",
+            row.label
+        );
+    }
+}
