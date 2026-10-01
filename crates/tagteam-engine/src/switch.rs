@@ -924,13 +924,21 @@ impl Engine {
 
     /// §9.4 "Before locking": asks the oracle about the outgoing live secret when it is not
     /// that account's vault generation. Never called under the mutation lock.
-    fn oracle_hint(&self, p: &dyn Provider, out: &AccountRow) -> Option<OracleHint> {
-        let bytes = Axis::of(p, &out.kind).live_secret(&p.read_live_auth(&self.env))?;
+    fn oracle_hint(
+        &self,
+        p: &dyn Provider,
+        out: &AccountRow,
+    ) -> Result<Option<OracleHint>, EngineError> {
+        let Some(bytes) = Axis::of(p, &out.kind).live_secret(&p.read_live_auth(&self.env)) else {
+            return Ok(None);
+        };
         if bytes.is_empty() || self.matches_vault(p, out, &bytes) {
-            return None;
+            return Ok(None);
         }
+        // §14.1: planning is before any lock, and a signal that has landed ends it here.
+        self.check_cancel()?;
         let resolved = self.oracle.resolve(p, &Credential::fresh(bytes.clone()));
-        Some(OracleHint { bytes, resolved })
+        Ok(Some(OracleHint { bytes, resolved }))
     }
 
     /// The target and the §9.2 special cases, decided from the current state.
@@ -1012,7 +1020,10 @@ impl Engine {
         // The direct branch displaces whatever is live, so it has nothing to ask about.
         let hint = match ask {
             _ if req.force => None,
-            Ask::Oracle => live_row.as_ref().and_then(|out| self.oracle_hint(p, out)),
+            Ask::Oracle => match live_row.as_ref() {
+                Some(out) => self.oracle_hint(p, out)?,
+                None => None,
+            },
             Ask::Reuse(hint) => hint,
         };
         let self_switch = live_row.as_ref().is_some_and(|r| r.id == target.id);
@@ -1116,6 +1127,9 @@ impl Engine {
             label: target.label.clone(),
             detail,
         };
+        // §14.1: nothing is locked yet, so a signal that has landed stops the switch before it
+        // spends the target's refresh token.
+        self.check_cancel()?;
         Ok(match self.refresh_stored(p, &target.id, &vault)? {
             // Busy: another process is refreshing it now. The account lock this switch waits
             // for, and the pending-rescue settle under it (§6.2), pick up that refresh.

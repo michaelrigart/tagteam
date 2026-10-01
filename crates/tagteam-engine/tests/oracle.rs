@@ -228,6 +228,36 @@ fn metadata_commands_recover_without_asking_the_oracle() {
 }
 
 #[test]
+fn a_signal_before_a_pre_lock_oracle_request_sends_none() {
+    // §14.1: the profile request before the locks (a switch's, a recovery's) is a cancellation
+    // point: a Ctrl-C that has landed stops the command before it makes the request.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.rotate_live("rt-b2"); // the outgoing live credential is no vault generation: it is asked
+    fx.script_profile("b@x.co");
+    fx.engine.cancel().request(libc::SIGINT);
+
+    let err = http_engine(&fx)
+        .switch(fx.switch_request(&a, false))
+        .unwrap_err();
+
+    assert_eq!(err.signal(), Some(libc::SIGINT), "{err}");
+    assert_eq!(profile_asks(&fx), 0, "a switch's oracle request");
+
+    // A command that recovers an interrupted switch first asks the oracle about the live
+    // credential the row does not name, before the mutation lock.
+    let row = crash_row(&fx, &a, &b);
+    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    fx.rotate_live("rt-unknown");
+
+    let err = http_engine(&fx).remove(&a).unwrap_err();
+
+    assert_eq!(err.signal(), Some(libc::SIGINT), "{err}");
+    assert_eq!(profile_asks(&fx), 0, "a recovery's oracle request");
+}
+
+#[test]
 fn a_hanging_profile_endpoint_delays_a_switch_by_its_timeout_and_holds_no_lock() {
     // Review Focus 5: a captive portal that never answers. The switch waits out the 5 s
     // profile timeout with no lock held, then captures the rotation as Unresolved, `.prev`
