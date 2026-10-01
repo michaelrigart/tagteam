@@ -22,6 +22,7 @@ fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
         target,
         force,
         source: "cli",
+        auto: None,
     }
 }
 

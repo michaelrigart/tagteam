@@ -223,6 +223,7 @@ fn request(fx: &Fx, target: SwitchTarget) -> SwitchRequest {
         target,
         force: false,
         source: "cli",
+        auto: None,
     }
 }
 
@@ -857,4 +858,26 @@ fn an_interrupted_collection_ends_the_strategy_with_the_signal_and_no_switch() {
                 .all(|e| e.kind != "switch")
         );
     }
+}
+
+#[test]
+fn best_names_the_exhausted_candidates_when_the_healthy_one_holds_no_credential() {
+    // M3a's parked item. The live c's usage is unknown; a is at its limit and holds a
+    // credential; b has headroom but an empty vault, so it is not switchable (§9.3). Nothing
+    // switches, and the reason says why instead of claiming no known candidate holds one.
+    let fx = Fx::new();
+    let (a, b, _c) = three(&fx); // c is live and never read
+    read(&fx, &a, &reading(100.0, 20.0, 0.0));
+    read(&fx, &b, &reading(10.0, 40.0, 0.0));
+    fx.kc.delete(SERVICE, b.as_str()).unwrap();
+    let out = best(&fx).unwrap();
+    assert_eq!(
+        (out.switched, out.reason, out.strategy),
+        (false, SwitchReason::CandidatesExhausted, "best")
+    );
+    assert_eq!(
+        out.message,
+        "every candidate is at its limit: a@x.co (5h at 100%); the earliest reset is in 2h40m"
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
 }

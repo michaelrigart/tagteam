@@ -240,6 +240,7 @@ fn every_fake_agent_command_writes_only_its_identity_surface() {
                 target: SwitchTarget::Account(bob.clone()),
                 force: true,
                 source: "cli",
+                auto: None,
             })
             .unwrap();
         assert!(out.switched);
@@ -330,6 +331,7 @@ fn a_dead_fake_agent_target_is_quarantined_and_refused_without_touching_claude_c
             target: SwitchTarget::Account(alice.clone()),
             force: false,
             source: "cli",
+            auto: None,
         })
         .unwrap_err();
     let after = ffx.fx.snapshot();

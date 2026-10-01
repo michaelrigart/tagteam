@@ -9,6 +9,7 @@ use rusqlite::{
     Connection, ErrorCode, OpenFlags, OptionalExtension, Row, TransactionBehavior, params,
 };
 use serde_json::{Value, json};
+use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::atomic::ensure_private_dir;
 use tagteam_provider::{Identity, ProcessStamp};
@@ -114,6 +115,17 @@ pub struct JournalRow {
     pub prior: Option<Box<JournalRow>>,
 }
 
+/// What an automatic switch's commit records for its provider (§9.4 step 9, §11.2 step 11):
+/// when it switched, in epoch seconds, between which accounts, and the departure snapshot of
+/// the account it left (§11.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoRecord {
+    pub at: i64,
+    pub from: AccountId,
+    pub to: AccountId,
+    pub departure: Departure,
+}
+
 /// The metadata an explicit replacement installs with its credential (§12.5). It is recorded
 /// with the marker, so the next lock holder can finish a replacement whose vault write landed.
 pub struct LoginMeta<'a> {
@@ -204,6 +216,17 @@ const SET_ACTIVE_SQL: &str = "INSERT INTO active_accounts (provider, account_id)
 /// Clears the provider's journal row: shared by `commit_switch`, which clears it as part of
 /// landing a switch, and `delete_journal`.
 const DELETE_JOURNAL_SQL: &str = "DELETE FROM switch_journal WHERE provider = ?1";
+
+/// Writes an automatic switch's record over the provider's `autoswitch_state` row, creating it
+/// if needed, and resets `unhealthy_ticks`: the count judged the account the switch left
+/// (Decision 4). `idle_hold_since` is never written (§6.1).
+const RECORD_SWITCH_SQL: &str = "INSERT INTO autoswitch_state (provider, last_switch_at, \
+    last_switch_from, last_switch_to, left_headroom, left_recovery_at, left_trigger, unhealthy_ticks) \
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0) ON CONFLICT(provider) DO UPDATE SET \
+    last_switch_at = excluded.last_switch_at, last_switch_from = excluded.last_switch_from, \
+    last_switch_to = excluded.last_switch_to, left_headroom = excluded.left_headroom, \
+    left_recovery_at = excluded.left_recovery_at, left_trigger = excluded.left_trigger, \
+    unhealthy_ticks = 0";
 
 /// Moves one account to a given position: shared by both sides of the swap in `move_to`.
 const SET_POSITION_SQL: &str = "UPDATE accounts SET position = ?2 WHERE id = ?1";
@@ -891,19 +914,80 @@ impl Store {
         )
     }
 
-    /// §9.4 step 9: the active account, the event and the journal row move together.
+    /// §9.4 step 9: the active account, the event and the journal row move together, and so
+    /// does an automatic switch's `record` (§11.2 step 11), which also resets
+    /// `unhealthy_ticks`. The record is written first, so any later statement that fails
+    /// takes it down too.
     pub fn commit_switch(
         &self,
         provider: &ProviderId,
         to: &AccountId,
         event: &EventRow,
+        record: Option<&AutoRecord>,
     ) -> Result<(), StoreError> {
         let mut c = self.lock();
         let tx = c.transaction()?;
+        if let Some(r) = record {
+            tx.execute(
+                RECORD_SWITCH_SQL,
+                params![
+                    provider.as_str(),
+                    r.at,
+                    r.from.as_str(),
+                    r.to.as_str(),
+                    r.departure.left_headroom,
+                    r.departure.left_recovery_at,
+                    r.departure.left_trigger.as_str(),
+                ],
+            )?;
+        }
         set_active_on(&tx, provider, Some(to))?;
         Self::insert_event_on(&tx, event)?;
         tx.execute(DELETE_JOURNAL_SQL, [provider.as_str()])?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The provider's auto-switch state (§6.1); a provider without a row has the default. A
+    /// `left_trigger` this build does not know reads as none, which lifts the no-return bar
+    /// (§11.3: a missing departure snapshot lifts it).
+    pub fn autoswitch_state(&self, provider: &ProviderId) -> Result<AutoState, StoreError> {
+        let c = self.lock();
+        let state = c
+            .query_row(
+                "SELECT last_switch_at, last_switch_from, last_switch_to, left_headroom, \
+                 left_recovery_at, left_trigger, unhealthy_ticks \
+                 FROM autoswitch_state WHERE provider = ?1",
+                [provider.as_str()],
+                |r| {
+                    Ok(AutoState {
+                        last_switch_at: r.get(0)?,
+                        last_switch_from: r
+                            .get::<_, Option<String>>(1)?
+                            .map(AccountId::from_string),
+                        last_switch_to: r.get::<_, Option<String>>(2)?.map(AccountId::from_string),
+                        left_headroom: r.get(3)?,
+                        left_recovery_at: r.get(4)?,
+                        left_trigger: r
+                            .get::<_, Option<String>>(5)?
+                            .as_deref()
+                            .and_then(Trigger::parse),
+                        unhealthy_ticks: r.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(state.unwrap_or_default())
+    }
+
+    /// §11.2 step 5: the engine's count of ticks in a row whose active usage was unknown. The
+    /// rest of the row is left as it is.
+    pub fn set_unhealthy_ticks(&self, provider: &ProviderId, n: u32) -> Result<(), StoreError> {
+        self.exec(
+            "INSERT INTO autoswitch_state (provider, unhealthy_ticks) VALUES (?1, ?2) \
+             ON CONFLICT(provider) DO UPDATE SET unhealthy_ticks = excluded.unhealthy_ticks",
+            &[&provider.as_str(), &n],
+        )?;
         Ok(())
     }
 

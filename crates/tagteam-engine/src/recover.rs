@@ -299,6 +299,10 @@ impl Engine {
                 source: "cli".into(),
                 detail: None,
             },
+            // Never an auto-switch record (Task 7's ruling): the row names neither the
+            // switch's source nor its trigger, and the departure snapshot was the dead tick's
+            // view of usage, which cannot be rebuilt now.
+            None,
         )?;
         Ok(())
     }

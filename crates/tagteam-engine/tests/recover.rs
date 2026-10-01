@@ -12,6 +12,7 @@ use serde_json::Value;
 use tagteam_cc::ItemKind;
 use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
+use tagteam_core::autoswitch::AutoState;
 use tagteam_engine::EngineError;
 use tagteam_engine::oracle::HttpOracle;
 use tagteam_engine::store::JournalRow;
@@ -48,6 +49,34 @@ fn a_landed_credential_finishes_forward() {
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
     assert_eq!(active(&fx), Some(a));
     assert_journal_cleared(&fx);
+}
+
+/// Task 7's ruling: recovery records no auto-switch state, even for a switch an engine began.
+/// The journal row names neither the switch's source nor its trigger, and the departure
+/// snapshot was the dead tick's view of usage, which recovery cannot rebuild.
+#[test]
+fn a_recovered_switch_records_no_auto_switch_state() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live: b
+    let store = fx.engine.store().unwrap();
+    store.set_unhealthy_ticks(&fx.provider(), 2).unwrap();
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    any_mutation(&fx, &a);
+    assert_eq!(active(&fx), Some(a));
+    assert_eq!(
+        store.autoswitch_state(&fx.provider()).unwrap(),
+        AutoState {
+            unhealthy_ticks: 2,
+            ..AutoState::default()
+        }
+    );
+    let last = store.events().unwrap().pop().unwrap();
+    assert_eq!(
+        (last.kind.as_str(), last.source.as_str()),
+        ("switch-recovered", "cli")
+    );
 }
 
 #[test]

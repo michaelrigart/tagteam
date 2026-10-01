@@ -6,16 +6,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{
-    API_KEY, Fx, OTHER_API_KEY, STRAY_API_KEY, capture_logs, mutation_lock_free, usage_fixture,
+    API_KEY, Fx, OTHER_API_KEY, STRAY_API_KEY, capture_logs, mutation_lock_free, token_requests,
+    usage_fixture,
 };
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
+use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::poll::PollPlan;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::AddTokenOptions;
-use tagteam_engine::store::NewAccount;
-use tagteam_engine::switch::{SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget};
+use tagteam_engine::store::{EventRow, NewAccount};
+use tagteam_engine::switch::{
+    AutoPerform, SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget,
+};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::{Keychain, Provider, SecretStore};
 
@@ -25,6 +29,7 @@ fn request(fx: &Fx, target: SwitchTarget, force: bool) -> SwitchRequest {
         target,
         force,
         source: "cli",
+        auto: None,
     }
 }
 
@@ -1149,4 +1154,291 @@ fn a_re_plan_that_cannot_be_stored_never_fails_the_switch() {
         logs.iter().all(|l| !l.contains("@x.co")),
         "no email in any event: {logs:?}"
     );
+}
+
+/// The fixture clock's start (`Fx`), in seconds.
+const T0: i64 = 1_790_000_000;
+
+/// An automatic switch from `from` to `target` with a 300 s cooldown, as a tick performs it
+/// (§11.2 step 11).
+fn auto_switch(fx: &Fx, from: &AccountId, target: &AccountId, trigger: Trigger) -> SwitchRequest {
+    SwitchRequest {
+        provider: fx.provider(),
+        target: to(target),
+        force: false,
+        source: "auto",
+        auto: Some(AutoPerform {
+            expected_from: from.clone(),
+            trigger,
+            cooldown_s: 300,
+            departure: Departure {
+                left_headroom: Some(4.0),
+                left_recovery_at: Some(T0 + 9_630),
+                left_trigger: trigger,
+            },
+        }),
+    }
+}
+
+fn auto_state(fx: &Fx) -> AutoState {
+    fx.engine
+        .store()
+        .unwrap()
+        .autoswitch_state(&fx.provider())
+        .unwrap()
+}
+
+fn switch_events(fx: &Fx) -> Vec<EventRow> {
+    let events = fx.engine.store().unwrap().events().unwrap();
+    events.into_iter().filter(|e| e.kind == "switch").collect()
+}
+
+#[test]
+fn the_new_reasons_carry_the_spec_s_tokens() {
+    assert_eq!(SwitchReason::LiveChanged.as_str(), "live-changed");
+    assert_eq!(SwitchReason::Cooldown.as_str(), "cooldown");
+    assert_eq!(SwitchReason::NotCandidate.as_str(), "not-candidate");
+}
+
+#[test]
+fn an_automatic_switch_records_its_departure_in_the_commit() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    let store = fx.engine.store().unwrap();
+    store.set_unhealthy_ticks(&fx.provider(), 2).unwrap();
+    let out = fx
+        .engine
+        .switch(auto_switch(&fx, &b, &a, Trigger::Proactive))
+        .unwrap();
+    assert_eq!(
+        (out.switched, out.reason, out.strategy),
+        (true, SwitchReason::Switched, "direct")
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert_eq!(
+        auto_state(&fx),
+        AutoState {
+            last_switch_at: Some(T0),
+            last_switch_from: Some(b.clone()),
+            last_switch_to: Some(a.clone()),
+            left_headroom: Some(4.0),
+            left_recovery_at: Some(T0 + 9_630),
+            left_trigger: Some(Trigger::Proactive),
+            unhealthy_ticks: 0,
+        }
+    );
+    let last = switch_events(&fx).pop().unwrap();
+    assert_eq!(
+        (
+            last.trigger.as_deref(),
+            last.source.as_str(),
+            last.from_id,
+            last.to_id
+        ),
+        (Some("proactive"), "auto", Some(b), Some(a))
+    );
+}
+
+#[test]
+fn a_manual_switch_records_no_auto_state_and_its_trigger_is_manual() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    assert!(fx.switch_to(&a, false).unwrap().switched);
+    assert_eq!(auto_state(&fx), AutoState::default());
+    let last = switch_events(&fx).pop().unwrap();
+    assert_eq!(
+        (last.trigger.as_deref(), last.source.as_str()),
+        (Some("manual"), "cli")
+    );
+}
+
+/// Review Focus 1, the precondition half: a manual `tagteam switch` lands between the tick's
+/// decision and its perform, while the automatic switch waits before the mutation lock. The
+/// automatic one finds the live account moved and writes nothing; the manual result stands.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_manual_switch_between_the_decision_and_the_perform_is_never_overridden() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let c = fx.add("c@x.co", "rt-c"); // live
+    let other = fx.engine_with_env(fx.env.clone());
+    let manual = fx.switch_request(&b, false);
+    fx.engine.on_point(
+        "planned",
+        Box::new(move || assert!(other.switch(manual.clone()).unwrap().switched)),
+    );
+    let out = fx
+        .engine
+        .switch(auto_switch(&fx, &c, &a, Trigger::Proactive))
+        .unwrap();
+    assert_eq!(
+        (out.switched, out.reason, out.reason.as_str()),
+        (false, SwitchReason::LiveChanged, "live-changed")
+    );
+    assert_eq!(out.from.map(|r| r.id), Some(b.clone()));
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+    let store = fx.engine.store().unwrap();
+    assert_eq!(store.active(&fx.provider()).unwrap(), Some(b.clone()));
+    let switches = switch_events(&fx);
+    assert_eq!(switches.len(), 1, "{switches:?}");
+    assert_eq!(
+        (switches[0].source.as_str(), switches[0].to_id.clone()),
+        ("cli", Some(b))
+    );
+    assert_eq!(auto_state(&fx), AutoState::default());
+}
+
+#[test]
+fn an_automatic_switch_never_acts_on_a_live_login_it_did_not_decide_on() {
+    // §11.2 step 11: an unmanaged login, or none at all, is a live change too. A direct switch
+    // would displace the one and activate over the other.
+    let leave: [fn(&Fx); 2] = [log_out, |fx| fx.login("stranger@x.co", "rt-s")];
+    for (n, leave) in leave.into_iter().enumerate() {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b");
+        leave(&fx);
+        let live = fx.live_credential();
+        let out = fx
+            .engine
+            .switch(auto_switch(&fx, &b, &a, Trigger::Failover))
+            .unwrap();
+        assert_eq!(
+            (out.switched, out.reason),
+            (false, SwitchReason::LiveChanged),
+            "case {n}"
+        );
+        assert_eq!(fx.live_credential(), live, "case {n}");
+        assert!(fx.displaced().is_empty(), "case {n}");
+        assert!(switch_events(&fx).is_empty(), "case {n}");
+        assert_eq!(auto_state(&fx), AutoState::default(), "case {n}");
+    }
+}
+
+#[test]
+fn the_cooldown_is_judged_again_from_the_state_under_the_lock() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    let first = fx
+        .engine
+        .switch(auto_switch(&fx, &b, &a, Trigger::Proactive))
+        .unwrap();
+    assert!(first.switched);
+    let recorded = auto_state(&fx);
+    fx.clock.advance_ms(60_000);
+    for trigger in [Trigger::Proactive, Trigger::ConsumeFirst] {
+        let out = fx.engine.switch(auto_switch(&fx, &a, &b, trigger)).unwrap();
+        assert_eq!(
+            (out.switched, out.reason, out.reason.as_str()),
+            (false, SwitchReason::Cooldown, "cooldown"),
+            "{trigger:?}"
+        );
+        assert_eq!(
+            out.message,
+            "the cooldown after the last automatic switch has 4m left"
+        );
+    }
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert_eq!(auto_state(&fx), recorded);
+    assert_eq!(switch_events(&fx).len(), 1);
+    // §11.2 step 6: at-limit and failover bypass it.
+    let out = fx
+        .engine
+        .switch(auto_switch(&fx, &a, &b, Trigger::AtLimit))
+        .unwrap();
+    assert!(out.switched, "{}", out.message);
+    assert_eq!(auto_state(&fx).last_switch_at, Some(T0 + 60));
+    // The cooldown ends 300 s after that switch, to the second.
+    fx.clock.advance_ms(299_000);
+    let out = fx
+        .engine
+        .switch(auto_switch(&fx, &b, &a, Trigger::Proactive))
+        .unwrap();
+    assert_eq!(out.reason, SwitchReason::Cooldown);
+    assert_eq!(
+        out.message,
+        "the cooldown after the last automatic switch has <1m left"
+    );
+    fx.clock.advance_ms(1_000);
+    let out = fx
+        .engine
+        .switch(auto_switch(&fx, &b, &a, Trigger::Proactive))
+        .unwrap();
+    assert!(out.switched, "{}", out.message);
+}
+
+/// What stops `a` being a candidate, in one case below.
+type Uncandidate = fn(&Fx, &AccountId);
+
+#[test]
+fn a_target_that_is_no_longer_a_candidate_writes_nothing() {
+    // §11.2 step 11: a direct switch accepts a disabled or quarantined target (§9.3, §7.2),
+    // so an automatic one checks for itself, and the tick moves on to its next target. The
+    // quarantined target's token is due: nothing is refreshed for it either.
+    let cases: [(&str, Uncandidate, &str); 4] = [
+        (
+            "disabled",
+            |fx, a| drop(fx.engine.set_disabled(a, true).unwrap()),
+            "a@x.co (position 1) is no longer a candidate: it is disabled",
+        ),
+        (
+            "quarantined",
+            |fx, a| {
+                fx.expire_access(a);
+                fx.quarantine(a, "invalid_grant", "sha256:sent");
+            },
+            "a@x.co (position 1) is no longer a candidate: it needs a new login",
+        ),
+        (
+            "vault-less",
+            |fx, a| fx.kc.delete(SERVICE, a.as_str()).unwrap(),
+            "a@x.co (position 1) is no longer a candidate: it has no stored credential",
+        ),
+        (
+            "removed",
+            |fx, a| drop(fx.engine.remove(a).unwrap()),
+            "the account to switch to was removed",
+        ),
+    ];
+    for (case, make, message) in cases {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b"); // live
+        make(&fx, &a);
+        let out = fx
+            .engine
+            .switch(auto_switch(&fx, &b, &a, Trigger::AtLimit))
+            .unwrap();
+        assert_eq!(
+            (out.switched, out.reason, out.reason.as_str()),
+            (false, SwitchReason::NotCandidate, "not-candidate"),
+            "{case}"
+        );
+        assert_eq!(out.message, message, "{case}");
+        assert_eq!(fx.live_email().as_deref(), Some("b@x.co"), "{case}");
+        assert!(switch_events(&fx).is_empty(), "{case}");
+        assert_eq!(token_requests(&fx), 0, "{case}");
+    }
+}
+
+#[test]
+fn an_automatic_switch_leaves_freshening_to_the_tick() {
+    // §11.2 step 10: the tick freshens each target by its own table before it performs; the
+    // switch does not freshen again.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    fx.expire_access(&a);
+    let out = fx
+        .engine
+        .switch(auto_switch(&fx, &b, &a, Trigger::AtLimit))
+        .unwrap();
+    assert!(out.switched, "{}", out.message);
+    assert_eq!(token_requests(&fx), 0);
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
 }

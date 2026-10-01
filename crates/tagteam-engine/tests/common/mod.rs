@@ -449,6 +449,7 @@ impl Fx {
             target: SwitchTarget::Account(id.clone()),
             force,
             source: "cli",
+            auto: None,
         }
     }
 
@@ -463,6 +464,7 @@ impl Fx {
             target: SwitchTarget::Rotation,
             force,
             source: "cli",
+            auto: None,
         }
     }
 
@@ -1079,6 +1081,7 @@ impl FakeFx {
                 target: SwitchTarget::Account(id.clone()),
                 force: false,
                 source: "cli",
+                auto: None,
             })
             .unwrap()
     }
