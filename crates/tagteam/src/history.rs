@@ -92,6 +92,16 @@ fn block(hw: &HistoryWindow, now_s: i64) -> String {
 /// runs out, with the method that measured the rate.
 fn projection(hw: &HistoryWindow, now_s: i64) -> String {
     let p = &hw.pace;
+    let method = p
+        .method
+        .map_or_else(String::new, |m| format!(" ({})", m.as_str()));
+    // An exhausted window ran out when it was read, which may be long ago: no countdown applies.
+    if hw.window.pct >= 100.0 {
+        return match p.rate_per_hour {
+            Some(rate) => format!("{rate:+.1} pts/h · at the limit{method}"),
+            None => "at the limit".to_owned(),
+        };
+    }
     let Some(rate) = p.rate_per_hour else {
         return "no rate yet".to_owned();
     };
@@ -100,9 +110,6 @@ fn projection(hw: &HistoryWindow, now_s: i64) -> String {
         (_, Some(at)) => format!("runs out in {}", render::duration(at.saturating_sub(now_s))),
         _ => "no projection".to_owned(),
     };
-    let method = p
-        .method
-        .map_or_else(String::new, |m| format!(" ({})", m.as_str()));
     format!("{rate:+.1} pts/h · {eta}{method}")
 }
 
@@ -336,6 +343,29 @@ mod tests {
             ..Pace::default()
         };
         assert_eq!(with(flat), "+0.0 pts/h · no projection (average)");
+    }
+
+    #[test]
+    fn an_exhausted_window_is_at_the_limit_with_or_without_a_rate() {
+        let exhausted = |pace: Pace| {
+            let w = window("5h", "5h", WindowKind::Short, 100.0, Some(HOUR));
+            projection(&history_window(w, vec![], pace), NOW)
+        };
+        // Read 100, 100, 100: no slope, no average for a Short window, but exhausted at the read.
+        let no_rate = Pace {
+            exhaustion_at: Some(NOW - 2 * HOUR),
+            ..Pace::default()
+        };
+        assert_eq!(exhausted(no_rate), "at the limit");
+        // With a rate the exhaustion time is the read's, hours ago: no countdown.
+        let with_rate = Pace {
+            rate_per_hour: Some(5.0),
+            method: Some(ProjectionMethod::Average),
+            exhaustion_at: Some(NOW - 2 * HOUR),
+            will_last_to_reset: Some(false),
+            ..Pace::default()
+        };
+        assert_eq!(exhausted(with_rate), "+5.0 pts/h · at the limit (average)");
     }
 
     #[test]
