@@ -288,7 +288,9 @@ JSON (CC's spend amounts, for example). The store persists usage only in this fo
   per-model limit → `Scoped(name)`.
 - A provider need not have a `Long` window. Features that depend on one (consume-first, pace)
   are unavailable for such a provider, and say so.
-- Pace and projection (§8.7) apply to `Long` and `Scoped` windows that have a known period.
+- Pace (§8.7: the average fallback, `expectedPct`, `aheadOfPace`) applies to `Long` and
+  `Scoped` windows that have a known period. The regression rate and the projections
+  (`projectedExhaustionAt`, `willLastToReset`) apply to every window.
 - Headroom and decisions (§8.2, §11) are defined over "relevant windows" rather than fixed
   names.
 
@@ -601,9 +603,9 @@ the global table.
 | `autoswitch.strategy` | `best` | `best`, `consume-first` |
 | `autoswitch.include_api_key_accounts` | false | bool |
 | `autoswitch.unhealthy_ticks` | 3 | 1–100 |
-| `autoswitch.models` | `[]` | list of model display names, or `["all"]` |
+| `autoswitch.models` | `[]` | list of model display names, or `["all"]` alone; duplicates collapse (case-insensitively) |
 | `usage.history_retention_days` | 180 | 1–3650 |
-| `statusline.format` | `"{account} · 5h {5h}% · 7d {7d}%{stale}"` | placeholders listed in §13.5 |
+| `statusline.format` | `"{account} · 5h {5h}% · 7d {7d}%{stale}"` | placeholders listed in §13.5 only; `{model:<name>}` needs a trimmed, non-empty name without braces |
 | `ui.color` | `auto` | `auto`, `always`, `never` (`NO_COLOR` and `FORCE_COLOR` also honoured) |
 
 CLI flags override settings for a single invocation and are clamped to the same ranges.
@@ -826,6 +828,9 @@ Refreshing from a degraded read is never allowed.
 - **Session-owned account** (§12.5). The fetch is read-only and uses the profile's token.
   - A 401 stamps `rejected_fp` with the access-token fingerprint and reports `token_expired`.
   - The same bytes are not sent again until they change.
+- **A token that cannot be refreshed** (a setup token): a 401 is an ordinary failure,
+  recorded as `http-401` on every path, whether the refusal is new or remembered through
+  `rejected_fp`.
 - **Retry-After** is parsed in its seconds form only.
 
 ### 8.2 Normalization
@@ -893,10 +898,18 @@ counts.
   `pre-send`, `ambiguous`, `bad-response`, `refresh-failed`, `over-budget`), plus
   `no-access-token` (§8.1). A successor lost while collecting (`Unpersisted`, §7.3 step 6) is also a
   warning on stderr that names the account, which is quarantined and shows `relogin_required`.
+- An error while collecting one account (a store or lock error, for example) is a warning on
+  stderr that names the account; the other accounts' results stand, and the command
+  succeeds. A never-sent slot is given back on every such path.
 
 ### 8.4 Trust (can a reading drive a decision?)
 
 - A reading is decision-grade when its age is ≤ **300 s**.
+- **A reading stamped more than 60 s in the future** (clock skew) has no usable age: it is
+  never decision-grade, counts as unread for on-demand eligibility, and a re-plan treats
+  its time as now. Likewise a `next_poll_at` further ahead than the budget's count window, or a
+  `backoff_until` further ahead than the 429 cap (4500 s), each plus 60 s, can only come from
+  a skewed clock and is ignored.
 - **Extended trust.** Trust extends to ≤ **3600 s** while failures are being retried, while a
   scheduled plan is in force, or while a live lease exists.
 - **After a 429.** `last_good` is trusted until the earliest relevant window reset, capped at
@@ -906,7 +919,7 @@ counts.
 ### 8.5 Failure backoff
 
 - **Base:** `min(30 · 2^(n−1), 600)` seconds, with the exponent clamped at 32.
-- **429 with `Retry-After: 0`:** at least 300 s.
+- **429 with `Retry-After` below 1 s** (`0` included): at least 300 s.
 - **429 with `Retry-After` > 600:** the value plus 900 s of margin, because retrying at the
   deadline re-arms the block.
 - **Caps:** `min(asked, 4500)` for 429s, `min(asked, 3600)` otherwise.
@@ -950,8 +963,9 @@ schedule below decides *when* to ask; the budget decides *whether* a request may
 `plan_after_fetch` works as follows:
 
 - **Unknown pct:** use the default (180 s for the active account, 300 s for others).
-- **Movement ≥ 1 point:** `max(180, base/2)`. **No movement:** `min(ceiling, max(180, base ·
-  1.5))`.
+- **Movement ≥ 1 point:** `max(180, base/2)`. **No movement:** `max(180, base · 1.5)`. Both
+  are capped at the role's maximum (300 s active, 600 s candidate); the rules below are
+  not. A non-finite pct counts as unknown.
 - **Urgent:** 60 s.
 - **Recent 429:** `min(1800, max(interval, max(base · 1.5, 360)))`. A 429 counts as recent from
   when its backoff lifts, not from when the 429 arrived.
@@ -1826,8 +1840,11 @@ Each row:
 - **Always:** `number, position, id, email, organizationName, organizationUuid, isOrganization,
   active, usageStatus, usage, alias?, disabled?: true, loginExpiresAt?`.
 - **When `usage` is non-null:** `usageFetchedAt, usageAgeSeconds`.
-- **When `usage` is null:** `lastGoodUsage, lastGoodFetchedAt, lastGoodAgeSeconds`. If
-  `usageStatus` is `unavailable`, also `usageError` and `usageRetryAt`.
+- **When `usage` is null:** `lastGoodUsage, lastGoodFetchedAt, lastGoodAgeSeconds`.
+- **When `usageStatus` is not `ok`** (whether `usage` is null or not): `usageError` (the
+  error kind, or null) and `usageRetryAt` (when the account will next be fetched, or null
+  for a status that is never retried). The human row words add `retry <countdown>` when a
+  retry is scheduled.
 
 `usageStatus` is one of `ok | token_expired | api_key | keychain_unavailable | relogin_required
 | foreign_credential | no_credentials | unavailable | unsupported`. `unsupported` is for providers
@@ -2227,6 +2244,9 @@ providers.
   - A command that touches no Keychain item runs no check, so `list` and `status` with no
     store never spawn `security`. Linux has no check. `doctor` reports the state instead
     (§13.6).
+  - Exception: `list` and `status` run no check even when collecting usage reads Keychain
+    items. A locked keychain degrades the affected rows to `keychain_unavailable` instead of
+    failing the command, so a script over SSH still gets every row.
   - **On a terminal** (stdin and stderr are TTYs, no `--json`), a locked keychain prompts on
     stderr: `The login keychain is locked (common over SSH). Unlock it now? [Y/n]`. Yes runs
     `security unlock-keychain` with the terminal attached and no password argument, so macOS
