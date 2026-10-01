@@ -315,3 +315,36 @@ fn colour_follows_the_setting_and_the_environment() {
     assert!(list(&[("FORCE_COLOR", "1")], &[]).contains(YELLOW_77));
     assert_eq!(server.hits("GET", USAGE), 1);
 }
+
+#[test]
+fn a_collection_that_fails_as_a_whole_is_one_warning_and_never_a_command_error() {
+    // §8.3: a usage failure is never a command error. The hook fails the collection before any
+    // account starts (a store that cannot be read, say), so only `collect_usage`'s `Err` can
+    // answer; the CLI warns once and lists what it has.
+    let d = tempfile::tempdir().unwrap();
+    accounts(d.path(), &["a@x.co", "b@x.co"]);
+    let server = serving(recorded_reply(now_epoch_s()));
+    let failing = |args: &[&str]| {
+        let out = cmd(d.path())
+            .env(API_BASE, server.base_url())
+            .env("TAGTEAM_TEST_FAIL_AT", "usage-collect-start")
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        (
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+    let warning = "warning: usage was not collected: injected failure at usage-collect-start\n";
+    let (out, err) = failing(&["list"]);
+    assert_eq!(err, warning);
+    assert!(out.starts_with("    #  ACCOUNT"), "{out}");
+    let (out, err) = failing(&["list", "--json"]);
+    assert_eq!(err, warning);
+    let v: Value = serde_json::from_str(&out).expect("stdout stays one JSON object");
+    assert_eq!(v["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(server.hits("GET", USAGE), 0, "nothing was collected");
+}
