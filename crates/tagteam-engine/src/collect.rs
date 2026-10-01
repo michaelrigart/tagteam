@@ -43,7 +43,9 @@ pub enum Collected {
     /// recorded the refusal as an `over-budget` failure, backing off and moving the next poll
     /// to `next_free_at` (§8.6). A refusal at the send itself is `Failed { "over-budget" }`.
     OverBudget { next_free_at: i64 },
-    /// Recorded as a failure; `kind` is its `last_error` token (§8.3, Decision 10).
+    /// Recorded as a failure; `kind` is its `last_error` token (§8.3, Decision 10). The kind
+    /// `error` is the exception: the collection ended with an error (the store or a hook), so
+    /// nothing was recorded, and the report's warnings say why.
     Failed { kind: String },
     /// Nothing was recorded: another process took the lease before this fetch sent or
     /// recorded (the fence failed, §8.3), or the live login moved to another account while
@@ -59,8 +61,8 @@ pub struct CollectReport {
     /// One entry per listed account that exists, in the order listed.
     pub outcomes: Vec<(AccountId, Collected)>,
     /// Lines for stderr, each naming an account and never a token: a successor lost while
-    /// collecting (§8.3), or a refresh that failed with an error or, for the live token (§8.1),
-    /// with any outcome but Dead.
+    /// collecting (§8.3), a refresh that failed with an error or, for the live token (§8.1),
+    /// with any outcome but Dead, or an account whose collection ended with an error.
     pub warnings: Vec<String>,
 }
 
@@ -75,8 +77,12 @@ pub(crate) fn jitter() -> f64 {
 impl Engine {
     /// §8.3 on demand: every listed account on its own thread, and the call waits for them
     /// all. A usage failure is never an error here: it is recorded, and reported in the
-    /// report's outcomes and warnings. `Err` means the store itself failed. IDs that name no
-    /// account are skipped. Never creates the store.
+    /// report's outcomes and warnings. So is an error that ends one account's collection (the
+    /// store failing under it): every thread is joined and kept, and that account's outcome is
+    /// `Failed { kind: "error" }` with one warning naming it, so one account never costs the
+    /// others' outcomes. `Err` only for an error before any thread starts (opening the store,
+    /// reading the listed accounts). IDs that name no account are skipped. Never creates the
+    /// store.
     pub fn collect_usage(&self, mode: CollectMode) -> Result<CollectReport, EngineError> {
         let CollectMode::OnDemand { accounts } = mode;
         let Some(shared) = self.existing_store()? else {
@@ -108,7 +114,18 @@ impl Engine {
         });
         let mut report = CollectReport::default();
         for (row, result) in rows.iter().zip(results) {
-            let (collected, warnings) = result?;
+            let (collected, warnings) = result.unwrap_or_else(|e| {
+                let warning = format!(
+                    "usage for {} (position {}) was not collected: {e}",
+                    row.label, row.position
+                );
+                (
+                    Collected::Failed {
+                        kind: "error".to_owned(),
+                    },
+                    vec![warning],
+                )
+            });
             report.outcomes.push((row.id.clone(), collected));
             report.warnings.extend(warnings);
         }
@@ -166,8 +183,20 @@ impl Engine {
                 return Ok((Collected::OverBudget { next_free_at }, Vec::new()));
             }
         };
-        hooks::point(self, "usage-reserved")?;
-        let state = store.usage_state(&row.id)?;
+        let slot = Slot {
+            slot: reservation.slot,
+            slot_at: reservation.slot_at,
+        };
+        let state = match hooks::point(self, "usage-reserved")
+            .and_then(|()| Ok(store.usage_state(&row.id)?))
+        {
+            Ok(state) => state,
+            Err(e) => {
+                // Nothing was sent: give the slot back, best effort, before the error.
+                let _ = store.release_slot(&reservation, &slot);
+                return Err(e);
+            }
+        };
         let mut run = Collection {
             engine: self,
             store,
@@ -175,11 +204,9 @@ impl Engine {
             row,
             active,
             budget,
-            slot: Some(Slot {
-                slot: reservation.slot,
-                slot_at: reservation.slot_at,
-            }),
+            slot: Some(slot),
             rejected: state.as_ref().and_then(|s| s.rejected_fp.clone()),
+            gated: false,
             state,
             reservation,
             warnings: Vec::new(),
@@ -210,6 +237,9 @@ struct Collection<'a> {
     /// The access-token fingerprint the server refused (`rejected_fp`, §8.1), as read after
     /// reserving and stamped since. The store's copy is the one `authorize_send` checks.
     rejected: Option<String>,
+    /// Whether this collection's own gate refresh (§7.3) has produced the token in use: a 401
+    /// on it is not refreshed again (§8.3: at most a gate refresh, a fetch and one retry).
+    gated: bool,
     warnings: Vec<String>,
 }
 
@@ -246,7 +276,8 @@ enum Stop {
     /// unsent slot stays counted, as a failed fence writes nothing.
     LeaseLost,
     /// The store or a test hook failed: returned, never recorded. The unsent slot goes back,
-    /// best effort, so a lasting fault does not spend the hourly budget (§8.6).
+    /// best effort, so a lasting fault does not spend the hourly budget (§8.6); `collect_usage`
+    /// turns it into a warning and a `Failed { kind: "error" }` outcome.
     Error(EngineError),
 }
 
@@ -303,7 +334,7 @@ impl Collection<'_> {
             return windows(first);
         }
         self.reject(&sent)?;
-        if !self.refreshable(&sent) {
+        if self.gated || !self.refreshable(&sent) {
             return Err(failed("http-401"));
         }
         let next = self.gate(&sent)?;
@@ -349,10 +380,14 @@ impl Collection<'_> {
     /// any error, is a failure with a warning, never a command error (M2a Task 16's
     /// carry-over), except a live credential the oracle gives to another identity, which has a
     /// status of its own. A kind that does not refresh never reaches §7.5, which would refuse
-    /// it: its refused token is reported expired.
+    /// it: its expired token is `token-expired`, and its refused one `http-401`, as on the
+    /// inactive path (Decision 11: a refusal is an ordinary failure).
     fn refresh_live(&mut self, trigger: ActiveTrigger) -> Result<Vec<u8>, Stop> {
         if !self.p.kind_traits(&self.row.kind).refreshable {
-            return Err(failed("token-expired"));
+            return Err(failed(match trigger {
+                ActiveTrigger::Rejected { .. } => "http-401",
+                ActiveTrigger::Expired => "token-expired",
+            }));
         }
         match self.engine.refresh_active(&self.row.provider, trigger) {
             Ok(
@@ -394,7 +429,11 @@ impl Collection<'_> {
             return Ok(bytes);
         }
         if !self.refreshable(&bytes) {
-            return Err(failed("token-expired"));
+            return Err(failed(if self.is_rejected(&bytes) {
+                "http-401"
+            } else {
+                "token-expired"
+            }));
         }
         self.gate(&bytes)
     }
@@ -408,7 +447,10 @@ impl Collection<'_> {
     /// the fetch before anything is sent (§8.1).
     fn gate(&mut self, snapshot: &[u8]) -> Result<Vec<u8>, Stop> {
         match self.engine.refresh_stored(self.p, &self.row.id, snapshot) {
-            Ok(GateOutcome::Refreshed(bytes) | GateOutcome::AlreadyFresh(bytes)) => Ok(bytes),
+            Ok(GateOutcome::Refreshed(bytes) | GateOutcome::AlreadyFresh(bytes)) => {
+                self.gated = true;
+                Ok(bytes)
+            }
             Ok(GateOutcome::Unpersisted) => {
                 self.warn_lost();
                 Err(failed("refresh-failed"))
@@ -556,27 +598,39 @@ impl Collection<'_> {
     /// the slot's validity, replacing a stale slot (a suspend or a slow refresh) or reserving
     /// one for the retry.
     /// - `LeaseLost`: nothing is sent or recorded, and the unsent slot stays counted.
-    /// - `Rejected`: recorded as `token-expired` for the active account (another process was
-    ///   refused this token since the state was read; the next collection hands it to §7.5) or `http-401` for an inactive one; the slot goes back.
+    /// - `Rejected`: a stamp written by another process after this collection read its state
+    ///   (the fence for `rejected_fp`): nothing is sent, and the slot goes back. Recorded as
+    ///   `token-expired` for a refreshable active account (the next collection hands the token
+    ///   to §7.5), otherwise `http-401`.
     /// - `OverBudget`: recorded as `over-budget`, backing off until a slot frees up; a stale
     ///   slot has already gone back.
     fn authorize(&mut self, bytes: &[u8]) -> Result<Slot, Stop> {
         let fp = self.access_fp(bytes);
         let held = self.slot.take();
-        let grant = self.store.authorize_send(
+        let grant = match self.store.authorize_send(
             &self.reservation,
             held.as_ref(),
             fp.as_deref(),
             self.now_ms(),
             &self.budget,
-        )?;
+        ) {
+            Ok(grant) => grant,
+            Err(e) => {
+                // The store's transaction rolled back, so the slot is still counted: keep it
+                // for the record to give back.
+                self.slot = held;
+                return Err(e.into());
+            }
+        };
         match grant {
             SendGrant::Send(slot) => Ok(slot),
             SendGrant::LeaseLost => Err(Stop::LeaseLost),
             SendGrant::Rejected => {
                 self.slot = held;
                 self.rejected = fp;
-                Err(failed(if self.active {
+                let handed_to_active_refresh =
+                    self.active && self.p.kind_traits(&self.row.kind).refreshable;
+                Err(failed(if handed_to_active_refresh {
                     "token-expired"
                 } else {
                     "http-401"
@@ -629,13 +683,43 @@ impl Collection<'_> {
     /// so a late or superseded result is dropped. Success stores the reading, its samples and
     /// the next plan (§8.6). Failure never touches the last good reading, backs off (§8.5),
     /// and gives back, by its full identity, a slot whose request was never sent. So does an
-    /// error, best effort: a release that fails never masks it, and the lease expires as usual.
+    /// error, from any step, best effort: a release that fails never masks it, and the lease
+    /// expires as usual.
     fn record(mut self, fetched: Result<Vec<Window>, Stop>) -> Result<Outcome, EngineError> {
+        match self.record_to_store(fetched) {
+            Ok(collected) => Ok((collected, self.warnings)),
+            Err(e) => {
+                if let Some(slot) = self.slot.take() {
+                    let _ = self.store.release_slot(&self.reservation, &slot);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether the account is the provider's active one right now, by the store's record of
+    /// it, which a switch commits (§9.4 step 9). A switch can commit while the fetch is in
+    /// flight, so the role read before the fetch may be the pre-switch one, and a plan made
+    /// for it would overwrite the switch's re-plan for one cycle (§8.3). With no record, the
+    /// live login's role read before the fetch stands. A switch committing between this read
+    /// and the record is a window of a few statements, left open: the next collection plans
+    /// from the new role.
+    fn active_now(&self) -> Result<bool, StoreError> {
+        Ok(match self.store.active(&self.row.provider)? {
+            Some(id) => id == self.row.id,
+            None => self.active,
+        })
+    }
+
+    fn record_to_store(
+        &mut self,
+        fetched: Result<Vec<Window>, Stop>,
+    ) -> Result<Collected, EngineError> {
         hooks::point(self.engine, "usage-before-record")?;
         let now_s = self.now_s();
-        let collected = match fetched {
+        Ok(match fetched {
             Ok(windows) => {
-                let plan = self.plan(&windows, self.active, now_s);
+                let plan = self.plan(&windows, self.active_now()?, now_s);
                 let retention = self.engine.settings().history_retention_days;
                 if self
                     .store
@@ -671,20 +755,14 @@ impl Collection<'_> {
                 }
             }
             Err(Stop::Moved) => {
-                if let Some(slot) = self.slot.take() {
-                    self.store.release_slot(&self.reservation, &slot)?;
+                if let Some(slot) = &self.slot {
+                    self.store.release_slot(&self.reservation, slot)?;
                 }
                 Collected::Dropped
             }
             Err(Stop::LeaseLost) => Collected::Dropped,
-            Err(Stop::Error(e)) => {
-                if let Some(slot) = self.slot.take() {
-                    let _ = self.store.release_slot(&self.reservation, &slot);
-                }
-                return Err(e);
-            }
-        };
-        Ok((collected, self.warnings))
+            Err(Stop::Error(e)) => return Err(e),
+        })
     }
 }
 

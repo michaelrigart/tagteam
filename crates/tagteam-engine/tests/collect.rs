@@ -334,6 +334,88 @@ fn a_second_401_is_recorded_and_the_refused_token_is_never_sent_again() {
 }
 
 #[test]
+fn a_token_the_gate_just_refreshed_is_not_refreshed_again_after_a_401() {
+    // §8.3: at most a gate refresh, a fetch and one retry. The expired token went through the
+    // gate; its successor's 401 is recorded, not refreshed and retried.
+    let fx = Fx::new();
+    let a = due(&fx);
+    fx.script_refresh(Some("rt-a2"));
+    fx.script_usage(401, refused());
+    fx.script_refresh(Some("rt-a3"));
+    fx.script_usage(200, usage_fixture());
+
+    let report = fx.collect(&[&a]);
+
+    assert_eq!(report.outcomes, [(a.clone(), failed("http-401"))]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(token_requests(&fx), 1, "one gate refresh in the collection");
+    assert_eq!(usage_bearers(&fx), ["at-rt-a2"], "no retry");
+    assert_eq!(usage_requests(&fx), 1);
+    let refused_fp = access_fp(&fx, &fx.vault_bytes(&a).unwrap());
+    assert_eq!(
+        state(&fx, &a).rejected_fp.as_deref(),
+        Some(refused_fp.as_str())
+    );
+}
+
+#[test]
+fn an_expired_token_that_cannot_be_refreshed_is_token_expired_and_sends_nothing() {
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    // An access token that has expired and no refresh token to renew it with.
+    fx.put_vault(
+        &a,
+        json!({"claudeAiOauth": {"accessToken": "at-old", "expiresAt": NOW_S * 1000 - 1}})
+            .to_string()
+            .as_bytes(),
+    );
+
+    let report = fx.collect(&[&a]);
+
+    assert_eq!(report.outcomes, [(a.clone(), failed("token-expired"))]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(
+        fx.http.requests().is_empty(),
+        "no refresh, no usage request"
+    );
+    assert_eq!(usage_requests(&fx), 0);
+    assert_eq!(state(&fx, &a).last_error.as_deref(), Some("token-expired"));
+}
+
+#[test]
+fn a_refused_setup_token_is_a_401_on_the_inactive_path_whether_first_or_remembered() {
+    // Decision 11: a refusal is an ordinary failure. A setup token does not refresh (§7.1), so
+    // neither its first 401 nor a remembered one reaches the gate.
+    let fx = Fx::new();
+    fx.add("b@x.co", "rt-b"); // live
+    let s = fx
+        .engine
+        .add_token(fx.add_token_options("sk-ant-oat01-setup"))
+        .unwrap()
+        .account
+        .id;
+    fx.http.clear();
+    fx.script_usage(401, refused());
+
+    let report = fx.collect(&[&s]);
+
+    assert_eq!(report.outcomes, [(s.clone(), failed("http-401"))]);
+    assert_eq!(methods(&fx), [Method::Get], "one usage request, no refresh");
+    let fp = access_fp(&fx, &fx.vault_bytes(&s).unwrap());
+    assert_eq!(state(&fx, &s).rejected_fp.as_deref(), Some(fp.as_str()));
+
+    // Remembered: past the lease and the backoff, nothing is sent at all.
+    fx.http.clear();
+    fx.clock.advance_ms(91_000);
+    let report = fx.collect(&[&s]);
+    assert_eq!(report.outcomes, [(s.clone(), failed("http-401"))]);
+    assert!(
+        fx.http.requests().is_empty(),
+        "no refresh, no usage request"
+    );
+}
+
+#[test]
 fn a_429_backs_off_as_retry_after_asks_and_records_when_the_block_lifts() {
     let fx = Fx::new();
     let a = two_accounts(&fx);
@@ -908,5 +990,224 @@ mod hooks {
         assert_eq!(report.outcomes, [(b.clone(), Collected::Dropped)]);
         assert!(fx.http.requests().is_empty());
         assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    }
+
+    fn assert_errored(report: &tagteam_engine::collect::CollectReport, a: &AccountId, why: &str) {
+        assert_eq!(report.outcomes, [(a.clone(), failed("error"))]);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        let prefix = "usage for a@x.co (position 1) was not collected: ";
+        assert!(
+            report.warnings[0].starts_with(prefix) && report.warnings[0].contains(why),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn a_stamp_written_by_another_process_after_the_read_is_rejected_at_the_send() {
+        // C10: this collection read its state with no `rejected_fp`; before the request,
+        // another process stamps the token it is about to send. The store's authorization
+        // sends nothing and the slot goes back. Inactive: an ordinary 401 failure.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+        let fp = access_fp(&fx, &fx.vault_bytes(&a).unwrap());
+        let path = fx.env.data_dir().join("tagteam.db");
+        let id = a.clone();
+        fx.engine.on_point(
+            "usage-before-send",
+            Box::new(move || {
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO usage_state (account_id, rejected_fp) VALUES (?1, ?2) \
+                         ON CONFLICT(account_id) DO UPDATE SET rejected_fp = excluded.rejected_fp",
+                        rusqlite::params![id.as_str(), fp],
+                    )
+                    .unwrap();
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        assert_eq!(report.outcomes, [(a.clone(), failed("http-401"))]);
+        assert!(fx.http.requests().is_empty(), "nothing was sent");
+        assert_eq!(usage_requests(&fx), 0, "the slot went back");
+        assert_eq!(state(&fx, &a).consecutive_failures, 1);
+    }
+
+    #[test]
+    fn an_over_budget_send_with_a_stale_slot_deletes_it_and_backs_off_past_the_free_time() {
+        // C13: suspended past `slot_valid_s` between reserving and sending, while the
+        // identity's other requests filled the rest of the hour. The stale slot is deleted
+        // (not counted again), the failure is `over-budget`, and the backoff reaches the time
+        // a slot frees.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+        let clock = fx.clock.clone();
+        let key = fx
+            .engine
+            .store()
+            .unwrap()
+            .account(&a)
+            .unwrap()
+            .unwrap()
+            .identity_key;
+        let path = fx.env.data_dir().join("tagteam.db");
+        let provider = fx.provider();
+        fx.engine.on_point(
+            "usage-reserved",
+            Box::new(move || {
+                clock.advance_ms(61_000);
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                for _ in 0..20 {
+                    conn.execute(
+                        "INSERT INTO usage_requests(provider, identity_key, at) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![provider.as_str(), key, NOW_S + 1],
+                    )
+                    .unwrap();
+                }
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        let free = NOW_S + 1 + 3600;
+        assert_eq!(report.outcomes, [(a.clone(), failed("over-budget"))]);
+        assert!(fx.http.requests().is_empty());
+        assert_eq!(
+            common::slot_times(&fx),
+            vec![NOW_S + 1; 20],
+            "the stale slot is gone and no fresh one was taken"
+        );
+        let s = state(&fx, &a);
+        assert_eq!(s.last_error.as_deref(), Some("over-budget"));
+        assert!(s.backoff_until.unwrap() >= free, "{:?}", s.backoff_until);
+    }
+
+    #[test]
+    fn an_error_from_a_gate_refresh_is_a_warning_naming_the_account() {
+        // C13: `refresh_stored` itself errors (here a hook at the gate's first step).
+        let fx = Fx::new();
+        let a = due(&fx);
+        fx.engine.fail_at(Some("gate-before-request"));
+
+        let report = fx.collect(&[&a]);
+        fx.engine.fail_at(None);
+
+        assert_eq!(report.outcomes, [(a.clone(), failed("refresh-failed"))]);
+        assert_eq!(
+            report.warnings,
+            [
+                "could not refresh a@x.co (position 1) to read its usage: injected failure at gate-before-request"
+            ]
+        );
+        assert!(fx.http.requests().is_empty());
+        assert_eq!(usage_requests(&fx), 0, "its slot went back");
+    }
+
+    #[test]
+    fn an_error_after_reserving_gives_the_slot_back_and_is_the_accounts_warning() {
+        // C12, C16: the hook after the reservation fails; `collect_usage` still returns.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+        fx.engine.fail_at(Some("usage-reserved"));
+
+        let report = fx.collect(&[&a]);
+        fx.engine.fail_at(None);
+
+        assert_errored(&report, &a, "injected failure at usage-reserved");
+        assert!(fx.http.requests().is_empty());
+        assert_eq!(usage_requests(&fx), 0, "the never-sent slot went back");
+    }
+
+    #[test]
+    fn a_store_error_at_the_authorization_gives_the_held_slot_back() {
+        // C16: `authorize` took the held slot before `authorize_send`, whose error lost it.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+        let path = fx.env.data_dir().join("tagteam.db");
+        fx.engine.on_point(
+            "usage-before-send",
+            Box::new(move || {
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute_batch("ALTER TABLE leases RENAME TO leases_broken")
+                    .unwrap();
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        assert_errored(&report, &a, "leases");
+        assert!(fx.http.requests().is_empty(), "nothing was sent");
+        assert_eq!(usage_requests(&fx), 0, "the held slot went back");
+    }
+
+    #[test]
+    fn an_error_before_the_record_gives_a_never_sent_slot_back() {
+        // C16: the `usage-before-record` hook fails after a fetch that never left (no token).
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.kc.delete(SERVICE, a.as_str()).unwrap();
+        fx.engine.fail_at(Some("usage-before-record"));
+
+        let report = fx.collect(&[&a]);
+        fx.engine.fail_at(None);
+
+        assert_errored(&report, &a, "injected failure at usage-before-record");
+        assert_eq!(usage_requests(&fx), 0, "the never-sent slot went back");
+    }
+
+    #[test]
+    fn an_error_recording_a_failure_gives_its_never_sent_slot_back() {
+        // C16: `record_usage_failure` itself fails (its table is gone), which would otherwise
+        // leave the slot counted.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.kc.delete(SERVICE, a.as_str()).unwrap();
+        let path = fx.env.data_dir().join("tagteam.db");
+        fx.engine.on_point(
+            "usage-before-record",
+            Box::new(move || {
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute_batch("ALTER TABLE usage_state RENAME TO usage_state_broken")
+                    .unwrap();
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        assert_errored(&report, &a, "usage_state");
+        assert_eq!(usage_requests(&fx), 0, "the never-sent slot went back");
+    }
+
+    #[test]
+    fn the_plan_is_made_for_the_role_the_account_has_when_it_records() {
+        // C20: a is a candidate when its collection reads its role; a switch to a commits
+        // while the fetch is in flight. The plan a records must be the active role's (180 s
+        // default, grown once to 270), not the pre-switch candidate's (300, grown to 450),
+        // which would overwrite the switch's re-plan for a cycle.
+        let fx = Fx::new();
+        let a = two_accounts(&fx); // b is live
+        fx.script_usage(200, usage_fixture());
+        let other = Arc::new(fx.engine_with_env(fx.env.clone()));
+        let request = fx.switch_request(&a, false);
+        fx.engine.on_point(
+            "usage-before-record",
+            Box::new(move || {
+                other.switch(request.clone()).unwrap();
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        assert_eq!(report.outcomes, [(a.clone(), Collected::Recorded)]);
+        assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+        assert_eq!(state(&fx, &a).poll_interval_s, Some(270));
     }
 }

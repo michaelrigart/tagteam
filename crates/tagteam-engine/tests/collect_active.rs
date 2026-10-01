@@ -12,10 +12,9 @@ use common::{
 };
 use serde_json::{Value, json};
 use tagteam_cc::ItemKind;
-use tagteam_engine::EngineError;
 use tagteam_engine::collect::{CollectMode, Collected};
 use tagteam_engine::vault::SERVICE;
-use tagteam_provider::{Clock, LockError, Method, MutationGuard, Provider};
+use tagteam_provider::{Clock, Method, MutationGuard, Provider};
 
 /// The live access token as §7.2 counts it expired. Only `expiresAt` changes, so the live
 /// generation is still the vault's.
@@ -287,6 +286,88 @@ fn an_error_from_active_refresh_is_a_failure_and_a_warning_never_a_command_error
 }
 
 #[test]
+fn a_retry_that_is_also_refused_stamps_the_second_token_and_is_a_401() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.script_usage(401, refused());
+    fx.script_refresh(Some("rt-a2"));
+    fx.script_usage(401, refused());
+
+    let report = fx.collect(&[&a]);
+
+    assert_eq!(report.outcomes, [(a.clone(), failed("http-401"))]);
+    assert_eq!(
+        usage_bearers(&fx),
+        ["at-rt-a", "at-rt-a2"],
+        "one retry, no more"
+    );
+    assert_eq!(token_requests(&fx), 1);
+    assert_eq!(usage_requests(&fx), 2);
+    let second = fx.live_credential().unwrap().to_string().into_bytes();
+    assert_eq!(
+        fx.usage_state(&a).unwrap().rejected_fp.as_deref(),
+        Some(access_fp(&fx, &second).as_str()),
+        "the stamp moved to the token the retry sent"
+    );
+}
+
+#[test]
+fn active_refresh_can_run_twice_in_one_collection() {
+    // Expired, so §7.5 first; the refreshed token is refused, so §7.5 again, then the retry.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    expire_live(&fx);
+    fx.script_refresh(Some("rt-a2"));
+    fx.script_usage(401, refused());
+    fx.script_refresh(Some("rt-a3"));
+    fx.script_usage(200, usage_fixture());
+
+    let report = fx.collect(&[&a]);
+
+    assert_eq!(report.outcomes, [(a.clone(), Collected::Recorded)]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(
+        methods(&fx),
+        [Method::Post, Method::Get, Method::Post, Method::Get]
+    );
+    assert_eq!(usage_bearers(&fx), ["at-rt-a2", "at-rt-a3"]);
+    assert_eq!(usage_requests(&fx), 2);
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a3"));
+    assert_eq!(fx.usage_state(&a).unwrap().rejected_fp, None);
+}
+
+#[test]
+fn one_accounts_error_keeps_the_others_outcomes_and_warnings() {
+    // C12: the live account's lock cannot be opened (an error); the inactive account's own
+    // thread went on, and its outcome stands beside the warning.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    let lock = fx.env.data_dir().join(".mutation.lock");
+    fs::remove_file(&lock).unwrap();
+    fs::create_dir(&lock).unwrap();
+    fx.script_usage(200, usage_fixture());
+
+    let report = fx.collect(&[&a, &b]);
+
+    assert_eq!(
+        report.outcomes,
+        [
+            (a.clone(), Collected::Recorded),
+            (b.clone(), failed("error"))
+        ]
+    );
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].starts_with("usage for b@x.co (position 2) was not collected: "),
+        "{:?}",
+        report.warnings
+    );
+    assert_eq!(usage_bearers(&fx), ["at-rt-a"]);
+    assert_eq!(usage_requests(&fx), 1, "b's unsent slot went back");
+}
+
+#[test]
 fn a_live_credential_the_oracle_gives_to_someone_else_is_recorded_as_foreign() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
@@ -304,11 +385,8 @@ fn a_live_credential_the_oracle_gives_to_someone_else_is_recorded_as_foreign() {
     assert_eq!(usage_requests(&fx), 0);
 }
 
-#[test]
-fn a_refused_live_setup_token_is_reported_expired_and_never_refreshed() {
-    // A setup token does not refresh (§7.1): §7.5 would refuse it with an error, so its
-    // refused token is reported expired, with no request and no warning.
-    let fx = Fx::new();
+/// A live setup token for a fresh account `s`, with `b` managed beside it.
+fn live_setup_token(fx: &Fx) -> tagteam_core::AccountId {
     fx.add("b@x.co", "rt-b");
     let s = fx
         .engine
@@ -317,19 +395,48 @@ fn a_refused_live_setup_token_is_reported_expired_and_never_refreshed() {
         .account
         .id;
     fx.switch_to(&s, false).unwrap();
+    fx.http.clear();
+    s
+}
+
+#[test]
+fn a_remembered_refusal_of_a_live_setup_token_is_a_401_and_never_refreshed() {
+    // A setup token does not refresh (§7.1): §7.5 would refuse it with an error, so its
+    // refused token is an ordinary 401 failure (Decision 11), as on the inactive path, with
+    // no request and no warning.
+    let fx = Fx::new();
+    let s = live_setup_token(&fx);
     let live = fx.live_credential().unwrap().to_string().into_bytes();
     stamp_rejected(&fx, &s, &access_fp(&fx, &live));
-    fx.http.clear();
 
     let report = fx.collect(&[&s]);
 
-    assert_eq!(report.outcomes, [(s.clone(), failed("token-expired"))]);
+    assert_eq!(report.outcomes, [(s.clone(), failed("http-401"))]);
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     assert!(
         fx.http.requests().is_empty(),
         "no refresh and no usage request"
     );
     assert_eq!(usage_requests(&fx), 0);
+}
+
+#[test]
+fn the_first_refusal_of_a_live_setup_token_is_a_401_and_never_refreshed() {
+    let fx = Fx::new();
+    let s = live_setup_token(&fx);
+    fx.script_usage(401, refused());
+
+    let report = fx.collect(&[&s]);
+
+    assert_eq!(report.outcomes, [(s.clone(), failed("http-401"))]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_eq!(methods(&fx), [Method::Get], "one usage request, no refresh");
+    let live = fx.live_credential().unwrap().to_string().into_bytes();
+    assert_eq!(
+        fx.usage_state(&s).unwrap().rejected_fp.as_deref(),
+        Some(access_fp(&fx, &live).as_str()),
+        "the refused token is remembered"
+    );
 }
 
 #[test]
@@ -423,10 +530,11 @@ fn a_switch_journal_recovery_cannot_decide_points_the_warning_at_force() {
 }
 
 #[test]
-fn a_lock_file_that_cannot_be_opened_is_the_collections_error_not_a_silent_drop() {
+fn a_lock_file_that_cannot_be_opened_is_the_collections_warning_not_a_silent_drop() {
     // `.mutation.lock` is a directory, so opening it for the flock fails with EISDIR: a
     // `LockError::Io`, which is not the timeout that drops the collection. Without the
-    // distinction every `list` would skip the live account for good, with no signal.
+    // distinction every `list` would skip the live account for good, with no signal. The
+    // error is that account's warning and outcome (C12), never the whole call's.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a"); // live
     let lock = fx.env.data_dir().join(".mutation.lock");
@@ -434,13 +542,19 @@ fn a_lock_file_that_cannot_be_opened_is_the_collections_error_not_a_silent_drop(
     fs::create_dir(&lock).unwrap();
     fx.script_usage(200, usage_fixture());
 
-    let result = fx.engine.collect_usage(CollectMode::OnDemand {
-        accounts: vec![a.clone()],
-    });
+    let report = fx
+        .engine
+        .collect_usage(CollectMode::OnDemand {
+            accounts: vec![a.clone()],
+        })
+        .expect("an account's error is its warning, not the call's");
 
+    assert_eq!(report.outcomes, [(a.clone(), failed("error"))]);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
     assert!(
-        matches!(&result, Err(EngineError::Lock(LockError::Io(_)))),
-        "{result:?}"
+        report.warnings[0].starts_with("usage for a@x.co (position 1) was not collected: "),
+        "{:?}",
+        report.warnings
     );
     assert!(fx.http.requests().is_empty(), "nothing was sent");
     // A lasting fault must not spend the hourly budget one `list` at a time.
@@ -472,6 +586,32 @@ mod hooks {
     use std::time::{Instant, SystemTime};
 
     use super::*;
+
+    #[test]
+    fn a_live_login_that_moves_during_active_refresh_records_nothing_and_gives_the_slot_back() {
+        // §7.5 ran for b's expired live token; by the time its successor is read, the live
+        // login names a: that token is not b's. The second identity read drops the collection.
+        let fx = Fx::new();
+        fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b"); // live
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-b2"));
+        fx.script_usage(200, usage_fixture());
+        let config = fx.paths().global_config;
+        fx.engine.on_point(
+            "active-after-response",
+            Box::new(move || {
+                common::splice_oauth_account(&config, &Fx::oauth_account("a@x.co"));
+            }),
+        );
+
+        let report = fx.collect(&[&b]);
+
+        assert_eq!(report.outcomes, [(b.clone(), Collected::Dropped)]);
+        assert!(usage_bearers(&fx).is_empty(), "no usage request was sent");
+        assert_eq!(usage_requests(&fx), 0, "the slot went back");
+        assert_eq!(fx.usage_state(&b).and_then(|s| s.fetched_at), None);
+    }
 
     #[test]
     fn an_error_after_active_refresh_kept_its_successor_is_still_only_a_failure() {

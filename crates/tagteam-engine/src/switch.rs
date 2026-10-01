@@ -971,7 +971,8 @@ impl Engine {
                 tracing::error!(
                     position = row.position,
                     account = %row.id,
-                    "could not re-plan usage polls after the switch: {e}"
+                    error = %e,
+                    "could not re-plan usage polls after the switch"
                 );
             }
         }
