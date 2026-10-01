@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 
 use clap::error::{ContextKind, ErrorKind};
 use clap::{CommandFactory, Parser};
@@ -10,6 +10,7 @@ mod history;
 pub mod prompt;
 mod render;
 mod root_guard;
+mod statusline;
 
 const TEXT_UNDER_JSON: &str = "--help and --version print text; run them without --json";
 
@@ -70,6 +71,13 @@ where
             return code;
         }
     };
+    // §13.5: Claude Code pipes its session JSON into the status bar command. It is drained
+    // here, at the process boundary, rather than in `app::run`: in-process tests drive `run`,
+    // and must never read the test runner's stdin.
+    if matches!(cli.command, Some(cli::Command::Statusline { .. })) {
+        let stdin = std::io::stdin();
+        statusline::drain(stdin.lock(), stdin.is_terminal());
+    }
     let mut prompter = prompt::TtyPrompter;
     let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
     app::run(

@@ -96,6 +96,12 @@ pub enum Command {
         #[arg(long)]
         csv: bool,
     },
+    /// One line for Claude Code's status bar
+    Statusline {
+        /// Print the settings.json snippet that sets it up
+        #[arg(long = "print-config")]
+        print_config: bool,
+    },
 }
 
 impl Command {
