@@ -93,10 +93,16 @@ fn block(hw: &HistoryWindow, now_s: i64) -> String {
     format!("{head}\n  {samples}\n  {}\n", projection(hw, now_s))
 }
 
-/// A rate in points per hour with its sign: one decimal, or two below 0.1 in magnitude, where
-/// one would print a quiet window's rate as zero (`+0.03`, not `+0.0`).
+/// A rate in points per hour with its sign: one decimal, or two below 0.05 in magnitude, where
+/// one would print a quiet window's rate as zero (`+0.03`, not `+0.0`). A rate too small for
+/// two decimals is `<0.01`, never a zero beside a finite runway; only exactly 0 is `+0.0`.
 fn signed(rate: f64) -> String {
-    if rate.abs() < 0.1 {
+    let magnitude = rate.abs();
+    if magnitude == 0.0 {
+        "+0.0".to_owned()
+    } else if magnitude < 0.005 {
+        format!("{}<0.01", if rate < 0.0 { '-' } else { '+' })
+    } else if magnitude < 0.05 {
         format!("{rate:+.2}")
     } else {
         format!("{rate:+.1}")
@@ -382,7 +388,7 @@ mod tests {
             method: Some(ProjectionMethod::Average),
             ..Pace::default()
         };
-        assert_eq!(with(flat), "+0.00 pts/h · no projection (average)");
+        assert_eq!(with(flat), "+0.0 pts/h · no projection (average)");
     }
 
     #[test]
@@ -412,9 +418,14 @@ mod tests {
     fn a_quiet_windows_rate_keeps_two_decimals() {
         for (rate, text) in [
             (0.03, "+0.03"),
-            (-0.05, "-0.05"),
-            (0.0, "+0.00"),
-            (0.099, "+0.10"),
+            (-0.049, "-0.05"),
+            (0.005, "+0.01"),
+            (0.004, "+<0.01"),
+            (-1e-9, "-<0.01"),
+            (0.0, "+0.0"),
+            (-0.0, "+0.0"),
+            (0.05, "+0.1"),
+            (0.099, "+0.1"),
             (0.1, "+0.1"),
             (5.0, "+5.0"),
             (-1.26, "-1.3"),
