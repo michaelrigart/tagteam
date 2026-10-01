@@ -281,6 +281,9 @@ fn run_every_command_on(fx: &Fx) {
     check(fx, "status", || {
         drop(fx.engine.status(&fx.provider()).unwrap())
     });
+    check(fx, "statusline", || {
+        drop(fx.engine.statusline(&fx.provider()).unwrap())
+    });
 
     check(fx, "remove", || drop(fx.engine.remove(&k).unwrap()));
 }

@@ -5,6 +5,8 @@
 
 mod common;
 
+use std::fs;
+
 use common::Fx;
 use serde_json::json;
 use tagteam_core::pace::pace;
@@ -12,8 +14,11 @@ use tagteam_core::{
     AccountId, Pace, PollBudget, PollPlan, ProjectionMethod, Sample, Window, WindowKind,
 };
 use tagteam_engine::Engine;
-use tagteam_engine::store::{Reservation, Reserve};
-use tagteam_engine::views::{NO_DATA, StatusView, UsageStatus, UsageView};
+use tagteam_engine::settings::Settings;
+use tagteam_engine::store::{LiveIdentityCacheRow, Reservation, Reserve};
+use tagteam_engine::views::{
+    HistoryView, NO_DATA, StatusView, StatuslineView, UsageStatus, UsageView,
+};
 
 /// The fixture clock's start (`Fx`), in seconds.
 const T0: i64 = 1_790_000_000;
@@ -274,4 +279,222 @@ fn status_and_account_view_carry_the_listed_usage() {
     assert_eq!(account.usage, listed);
     let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
     assert_eq!(fx.engine.account_view(row, true).usage, listed);
+}
+
+/// `a`, live, read at T0, T0 + 1 h and T0 + 2 h (7d at 60, 70 and 77 %); the clock at T0 + 2 h.
+fn with_history(fx: &Fx) -> AccountId {
+    let a = fx.add("a@x.co", "rt-a");
+    for (i, seven) in [60.0, 70.0, 77.0].into_iter().enumerate() {
+        let t = T0 + 3_600 * i as i64;
+        record(fx, &a, &reading(t, 9.0 + i as f64, seven), t, t + 180);
+    }
+    at(fx, T0 + 7_200);
+    a
+}
+
+fn keys(h: &HistoryView) -> Vec<&str> {
+    h.windows.iter().map(|w| w.window.key.as_str()).collect()
+}
+
+#[test]
+fn history_defaults_to_the_relevant_windows_and_bounds_samples_by_since() {
+    let fx = Fx::new();
+    let a = with_history(&fx);
+    let h = fx.engine.history(&a, None, T0 + 1).unwrap();
+    assert_eq!(
+        (h.account.row.id.clone(), h.account.active),
+        (a.clone(), true)
+    );
+    assert_eq!(keys(&h), ["5h", "7d"]);
+    let seven = &h.windows[1];
+    let shown: Vec<(i64, f64)> = seven
+        .samples
+        .iter()
+        .map(|s| (s.fetched_at, s.pct))
+        .collect();
+    assert_eq!(shown, [(T0 + 3_600, 70.0), (T0 + 7_200, 77.0)]);
+    // Pace reads the 48 h before the reading, whatever `since` shows: the list's own.
+    let listed = usage_of(&fx.engine, &a).windows.unwrap();
+    assert_eq!(seven.pace, listed[1].1);
+    assert_eq!(seven.pace.method, Some(ProjectionMethod::Regression));
+    assert!(
+        fx.http.requests().is_empty(),
+        "history never fetches (§13.4)"
+    );
+}
+
+#[test]
+fn history_filters_by_key_or_label_ignoring_case() {
+    let fx = Fx::new();
+    let a = with_history(&fx);
+    for name in ["FABLE", "scoped:fable"] {
+        let h = fx.engine.history(&a, Some(name), 0).unwrap();
+        assert_eq!(keys(&h), ["scoped:Fable"], "{name}");
+        assert_eq!(h.windows[0].samples.len(), 3, "{name}");
+    }
+    assert_eq!(
+        keys(&fx.engine.history(&a, Some("Spend"), 0).unwrap()),
+        ["spend"]
+    );
+    assert!(
+        fx.engine
+            .history(&a, Some("nope"), 0)
+            .unwrap()
+            .windows
+            .is_empty()
+    );
+}
+
+#[test]
+fn history_follows_the_configured_models() {
+    let fx = Fx::new();
+    let a = with_history(&fx);
+    let settings = Settings {
+        models: vec!["fable".into()],
+        ..Settings::default()
+    };
+    let engine = fx.engine_with_settings(settings);
+    assert_eq!(
+        keys(&engine.history(&a, None, 0).unwrap()),
+        ["5h", "7d", "scoped:Fable"]
+    );
+}
+
+#[test]
+fn history_of_an_account_never_read_is_empty_and_of_an_unknown_one_an_error() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    assert!(fx.engine.history(&a, None, 0).unwrap().windows.is_empty());
+    let unknown = fx.engine.history(&AccountId::from_string("nope"), None, 0);
+    assert_eq!(unknown.unwrap_err().kind(), "no-such-account");
+}
+
+fn cache(fx: &Fx) -> Option<LiveIdentityCacheRow> {
+    fx.engine
+        .store()
+        .unwrap()
+        .live_identity_cache(&fx.provider())
+        .unwrap()
+}
+
+fn managed(v: StatuslineView) -> AccountId {
+    match v {
+        StatuslineView::Managed { account } => account.row.id,
+        other => panic!("not managed: {other:?}"),
+    }
+}
+
+#[test]
+fn statusline_shows_the_live_account_with_its_usage_or_an_unmanaged_email() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    record(&fx, &b, &reading(T0, 9.0, 77.0), T0, T0 + 180);
+    match fx.engine.statusline(&fx.provider()).unwrap() {
+        StatuslineView::Managed { account } => {
+            assert_eq!((account.row.id.clone(), account.active), (b.clone(), true));
+            assert_eq!(account.usage, usage_of(&fx.engine, &b));
+        }
+        other => panic!("{other:?}"),
+    }
+    fx.login("stranger@x.co", "rt-s");
+    assert!(matches!(
+        fx.engine.statusline(&fx.provider()).unwrap(),
+        StatuslineView::Unmanaged { email } if email == "stranger@x.co"
+    ));
+}
+
+#[test]
+fn a_missing_garbled_or_rewritten_claude_json_is_read_as_it_is_now() {
+    // Review Focus 5, at the engine level.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let config = fx.paths().global_config;
+    assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), a);
+    let key_a = fx
+        .engine
+        .store()
+        .unwrap()
+        .account(&a)
+        .unwrap()
+        .unwrap()
+        .identity_key;
+    let cached = cache(&fx).unwrap();
+    assert_eq!(
+        (cached.path.as_str(), cached.identity_key.as_deref()),
+        (config.to_str().unwrap(), Some(key_a.as_str()))
+    );
+    // Rewritten, by a login of another length, so the stamp differs even where mtimes are
+    // coarse: parsed again, and the cache follows.
+    fx.login("bobby@x.co", "rt-bobby");
+    assert!(matches!(
+        fx.engine.statusline(&fx.provider()).unwrap(),
+        StatuslineView::Unmanaged { email } if email == "bobby@x.co"
+    ));
+    assert_eq!(cache(&fx).unwrap().label.as_deref(), Some("bobby@x.co"));
+    // Garbled: nothing to show, and no error.
+    fs::write(&config, "{ \"oauthAccount\": ").unwrap();
+    assert!(matches!(
+        fx.engine.statusline(&fx.provider()).unwrap(),
+        StatuslineView::NoLogin
+    ));
+    // Missing: nothing to show.
+    fs::remove_file(&config).unwrap();
+    assert!(matches!(
+        fx.engine.statusline(&fx.provider()).unwrap(),
+        StatuslineView::NoLogin
+    ));
+    // Written again: read again.
+    fs::write(&config, common::CLAUDE_JSON).unwrap();
+    fx.login("a@x.co", "rt-a");
+    assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), a);
+}
+
+#[test]
+fn an_unchanged_claude_json_is_not_parsed_again() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), b);
+    // A cache row under the file's current stamp that names a instead: only a lookup that
+    // skipped the parse can answer a.
+    let store = fx.engine.store().unwrap();
+    let key_a = store.account(&a).unwrap().unwrap().identity_key;
+    let planted = LiveIdentityCacheRow {
+        identity_key: Some(key_a),
+        label: Some("a@x.co".into()),
+        ..cache(&fx).unwrap()
+    };
+    store.put_live_identity_cache(&planted).unwrap();
+    assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), a);
+}
+
+#[test]
+fn statusline_needs_no_keychain_no_network_and_creates_no_store() {
+    let fx = Fx::new();
+    fx.login("a@x.co", "rt-a");
+    fx.kc.set_locked(true);
+    assert!(matches!(
+        fx.engine.statusline(&fx.provider()).unwrap(),
+        StatuslineView::Unmanaged { email } if email == "a@x.co"
+    ));
+    assert!(
+        !fx.env.data_dir().join("tagteam.db").exists(),
+        "§13.5: never creates the store"
+    );
+
+    fx.kc.set_locked(false);
+    let a = fx.engine.add_live(fx.add_options()).unwrap().account.id;
+    record(&fx, &a, &reading(T0, 9.0, 77.0), T0, T0 + 180);
+    fx.http.clear();
+    fx.kc.set_locked(true);
+    match fx.engine.statusline(&fx.provider()).unwrap() {
+        StatuslineView::Managed { account } => {
+            assert_eq!(account.usage.status, UsageStatus::Ok);
+            assert!(account.usage.windows.is_some());
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(fx.http.requests().is_empty(), "no request");
+    assert_eq!(fx.kc.unlock_attempts(), 0);
 }

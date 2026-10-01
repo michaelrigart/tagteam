@@ -1188,6 +1188,20 @@ impl Fx {
     /// An engine over this fixture's Env, Keychain, oracle and clock whose requests go to
     /// `http` rather than to the fixture's scripted port.
     pub fn engine_with_http(&self, http: Arc<dyn tagteam_provider::Http>) -> Engine {
+        self.engine_over_http(http, Settings::default())
+    }
+
+    /// An engine over this fixture's Env, Keychain, oracle, clock and scripted port with
+    /// `settings`, as the CLI builds one after reading `config.toml`.
+    pub fn engine_with_settings(&self, settings: Settings) -> Engine {
+        self.engine_over_http(self.http.clone(), settings)
+    }
+
+    fn engine_over_http(
+        &self,
+        http: Arc<dyn tagteam_provider::Http>,
+        settings: Settings,
+    ) -> Engine {
         Engine::new(EngineConfig {
             env: self.env.clone(),
             registry: ProviderRegistry::new().with(self.cc.clone()),
@@ -1196,7 +1210,7 @@ impl Fx {
             clock: self.clock.clone(),
             http,
             default_provider: ProviderId::new(CLAUDE_CODE),
-            settings: tagteam_engine::settings::Settings::default(),
+            settings,
         })
     }
 }
