@@ -86,6 +86,11 @@ from the reading's `fetched_at`, and pace covers `Scoped` windows with a known p
     is `collect_usage`'s error and a stderr warning. An unresolved switch journal that stops it
     adds one warning. `finish_replacement` and `move_to` take IMMEDIATE transactions.
     `statusline` drains stdin only when it will print a line.
+  - Pre-merge review: a held slot is valid while less than 60 s old (strict), so send times stay
+    within the 3660 s count; a reserve-time over-budget refusal is recorded as an `over-budget`
+    failure (backoff until a slot frees), reversing Task 10's "records nothing", so the row reads
+    `over budget` (§8.6, §13.1); `history` also lists windows that have retained samples but are
+    missing from the latest reading, described by the new `Provider::describe_window`.
 
 ## Milestones
 
@@ -451,6 +456,10 @@ fn fetch_usage(&self, http: &dyn Http, cred: &Credential) -> UsageResult;
 fn poll_budget(&self) -> PollBudget;
 /// §13.2: the provider's JSON for a row's `usage`/`lastGoodUsage`, from windows and their pace.
 fn render_usage(&self, windows: &[(Window, Pace)]) -> serde_json::Value;
+/// One of this provider's window keys as its normalization describes it (key, label, kind,
+/// `period_s`; `pct` 0), for §13.4's history of a window the last reading lacks; `None` for a
+/// key it does not produce. (Added in execution; see Execution notes.)
+fn describe_window(&self, key: &str) -> Option<Window>;
 /// The file whose mtime and size key `live_identity_cache` (§13.5). CC: `~/.claude.json`.
 fn live_identity_source(&self, env: &Env) -> Option<PathBuf>;
 ```
@@ -564,14 +573,15 @@ impl Store {
     /// Phase 1 (§8.3), one IMMEDIATE transaction: eligibility (the on-demand rule when
     /// `on_demand`), the `usage:<id>` lease, pruning and counting `usage_requests`, and the
     /// first slot (`Reservation.slot`, `slot_at`). An over-budget result sets `next_poll_at` to
-    /// `next_free_at` and takes no lease.
+    /// `next_free_at`, records an `over-budget` failure, and takes no lease. (Amended in
+    /// execution.)
     pub fn reserve_usage(&self, account: &AccountRow, now_ms: i64, on_demand: bool,
                          budget: &PollBudget) -> Result<Reserve, StoreError>;
     /// Right before each request (§8.3, §8.6), in one IMMEDIATE transaction: `r` must still hold
     /// the `usage:<id>` lease (its row names `r.holder`, as the records' fence reads it) and the
     /// account's identity key must be unchanged (else `LeaseLost`); `access_fp` must not equal
     /// the durable `rejected_fp` (else `Rejected`). Then a slot to send
-    /// under: `slot` itself while it is at most `slot_valid_s` old; otherwise a fresh one, giving
+    /// under: `slot` itself while it is less than `slot_valid_s` old (amended in execution); otherwise a fresh one, giving
     /// the stale one back by its full identity; a fresh one when `slot` is None (the 401 retry).
     /// `OverBudget` when no fresh slot is free (the stale one is still given back). `LeaseLost`
     /// and `Rejected` write nothing.
