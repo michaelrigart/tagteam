@@ -12,6 +12,11 @@ use tagteam_provider::http::{
 };
 use ureq::http::Uri;
 use ureq::tls::{RootCerts, TlsConfig};
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::time::Duration as WaitFor;
+use ureq::unversioned::transport::{
+    Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport,
+};
 use ureq::{Agent, Proxy};
 
 /// Resolves a host and port to addresses. Injectable, so a test can fail a lookup without
@@ -20,6 +25,64 @@ pub type Resolver = fn(&str, u16) -> io::Result<Vec<SocketAddr>>;
 
 fn system_resolver(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     Ok((host, port).to_socket_addrs()?.collect())
+}
+
+/// §4.4, §7.3: a suspended process that is resumed makes a Linux socket read with a receive
+/// timeout fail with `EINTR` (a stop signal interrupts the call even with no handler; macOS
+/// restarts it), and `ureq` surfaces that as an I/O error. Mapped to `Ambiguous`, it would
+/// discard a reply the server already sent to a token refresh a stopped holder was waiting on.
+/// This wraps the outermost transport, above TLS, and retries only the interrupted read with
+/// what is left of its timeout: no byte was consumed, and the request is never re-sent.
+#[derive(Debug)]
+struct ResumeInterruptedRead;
+
+impl<In: Transport> Connector<In> for ResumeInterruptedRead {
+    type Out = ResumingTransport<In>;
+
+    fn connect(
+        &self,
+        _: &ConnectionDetails,
+        chained: Option<In>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(ResumingTransport))
+    }
+}
+
+#[derive(Debug)]
+struct ResumingTransport<T>(T);
+
+impl<T: Transport> Transport for ResumingTransport<T> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.0.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.0.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let started = Instant::now();
+        let mut next = timeout;
+        loop {
+            match self.0.await_input(next) {
+                Err(ureq::Error::Io(e)) if e.kind() == io::ErrorKind::Interrupted => {
+                    next.after = match timeout.after {
+                        WaitFor::Exact(d) => WaitFor::Exact(d.saturating_sub(started.elapsed())),
+                        WaitFor::NotHappening => WaitFor::NotHappening,
+                    };
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.0.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.0.is_tls()
+    }
 }
 
 pub struct UreqHttp {
@@ -65,7 +128,11 @@ impl UreqHttp {
             )
             .build();
         Self {
-            agent: config.into(),
+            agent: Agent::with_parts(
+                config,
+                DefaultConnector::new().chain(ResumeInterruptedRead),
+                DefaultResolver::default(),
+            ),
             resolver,
         }
     }
@@ -223,7 +290,106 @@ impl Http for UreqHttp {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
+    use ureq::Timeout;
+    use ureq::unversioned::transport::LazyBuffers;
+
     use super::*;
+
+    #[derive(Debug)]
+    struct Scripted {
+        buffers: LazyBuffers,
+        replies: VecDeque<Result<bool, io::ErrorKind>>,
+        timeouts: Vec<NextTimeout>,
+    }
+
+    impl Scripted {
+        fn new(replies: impl IntoIterator<Item = Result<bool, io::ErrorKind>>) -> Self {
+            Self {
+                buffers: LazyBuffers::new(64, 64),
+                replies: replies.into_iter().collect(),
+                timeouts: Vec::new(),
+            }
+        }
+    }
+
+    impl Transport for Scripted {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(&mut self, _: usize, _: NextTimeout) -> Result<(), ureq::Error> {
+            Ok(())
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+            self.timeouts.push(timeout);
+            thread::sleep(Duration::from_millis(2));
+            self.replies
+                .pop_front()
+                .expect("the transport was read more often than scripted")
+                .map_err(|kind| ureq::Error::Io(io::Error::from(kind)))
+        }
+
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+
+    fn wait(secs: u64) -> NextTimeout {
+        NextTimeout {
+            after: WaitFor::from_secs(secs),
+            reason: Timeout::RecvResponse,
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_with_the_time_left() {
+        let mut t = ResumingTransport(Scripted::new([
+            Err(io::ErrorKind::Interrupted),
+            Err(io::ErrorKind::Interrupted),
+            Ok(true),
+        ]));
+        assert!(t.await_input(wait(30)).unwrap());
+        let seen = &t.0.timeouts;
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0], wait(30));
+        for pair in seen.windows(2) {
+            assert!(*pair[1].after <= *pair[0].after);
+            assert_eq!(pair[1].reason, Timeout::RecvResponse);
+        }
+        assert!(*seen[2].after < *seen[0].after);
+    }
+
+    #[test]
+    fn an_interrupted_read_past_its_deadline_is_retried_with_zero() {
+        let mut t = ResumingTransport(Scripted::new([Err(io::ErrorKind::Interrupted), Ok(false)]));
+        let timeout = NextTimeout {
+            after: WaitFor::from_millis(0),
+            reason: Timeout::RecvResponse,
+        };
+        assert!(!t.await_input(timeout).unwrap());
+        assert_eq!(t.0.timeouts, vec![timeout, timeout]);
+    }
+
+    #[test]
+    fn another_io_error_is_returned_after_one_read() {
+        let mut t = ResumingTransport(Scripted::new([Err(io::ErrorKind::ConnectionReset)]));
+        let err = t.await_input(wait(30)).unwrap_err();
+        assert!(
+            matches!(&err, ureq::Error::Io(e) if e.kind() == io::ErrorKind::ConnectionReset),
+            "{err}"
+        );
+        assert_eq!(t.0.timeouts.len(), 1);
+    }
+
+    #[test]
+    fn a_read_that_made_no_progress_is_passed_through() {
+        let mut t = ResumingTransport(Scripted::new([Ok(false)]));
+        assert!(!t.await_input(wait(30)).unwrap());
+        assert_eq!(t.0.timeouts.len(), 1);
+    }
 
     #[test]
     fn only_failures_before_sending_are_pre_send() {
