@@ -33,8 +33,9 @@ fn system_resolver(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 /// discard a reply the server already sent to a token refresh a stopped holder was waiting on.
 /// This wraps the outermost transport, above TLS, and retries only the interrupted read with
 /// what is left of its timeout: no byte was consumed, and the request is never re-sent. A
-/// timeout already spent still gets `LAST_LOOK`, enough to take a reply that arrived while the
-/// process was stopped; `ureq` would turn a zero into a full second.
+/// timeout already spent gets one `LAST_LOOK`, enough to take a reply that arrived while the
+/// process was stopped (`ureq` would turn a zero into a full second); interrupted again, the
+/// read times out.
 #[derive(Debug)]
 struct ResumeInterruptedRead;
 
@@ -67,15 +68,20 @@ impl<T: Transport> Transport for ResumingTransport<T> {
     fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
         let started = Instant::now();
         let mut next = timeout;
+        let mut looked = false;
         loop {
             match self.0.await_input(next) {
                 Err(ureq::Error::Io(e)) if e.kind() == io::ErrorKind::Interrupted => {
-                    next.after = match timeout.after {
-                        WaitFor::Exact(d) => {
-                            WaitFor::Exact(d.saturating_sub(started.elapsed()).max(LAST_LOOK))
+                    if let WaitFor::Exact(d) = timeout.after {
+                        let left = d.saturating_sub(started.elapsed());
+                        if left.is_zero() {
+                            if looked {
+                                return Err(ureq::Error::Timeout(timeout.reason));
+                            }
+                            looked = true;
                         }
-                        WaitFor::NotHappening => WaitFor::NotHappening,
-                    };
+                        next.after = WaitFor::Exact(left.max(LAST_LOOK));
+                    }
                 }
                 other => return other,
             }
@@ -369,12 +375,8 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_read_past_its_deadline_only_takes_a_last_look() {
-        let mut t = ResumingTransport(Scripted::new([
-            Err(io::ErrorKind::Interrupted),
-            Err(io::ErrorKind::Interrupted),
-            Ok(true),
-        ]));
+    fn a_read_resumed_past_its_deadline_takes_a_last_look() {
+        let mut t = ResumingTransport(Scripted::new([Err(io::ErrorKind::Interrupted), Ok(true)]));
         let timeout = NextTimeout {
             after: WaitFor::from_millis(1),
             reason: Timeout::RecvResponse,
@@ -384,7 +386,25 @@ mod tests {
             after: WaitFor::Exact(LAST_LOOK),
             ..timeout
         };
-        assert_eq!(t.0.timeouts, vec![timeout, last_look, last_look]);
+        assert_eq!(t.0.timeouts, vec![timeout, last_look]);
+    }
+
+    #[test]
+    fn an_interrupted_last_look_times_out() {
+        let mut t = ResumingTransport(Scripted::new([
+            Err(io::ErrorKind::Interrupted),
+            Err(io::ErrorKind::Interrupted),
+        ]));
+        let timeout = NextTimeout {
+            after: WaitFor::from_millis(1),
+            reason: Timeout::RecvResponse,
+        };
+        let err = t.await_input(timeout).unwrap_err();
+        assert!(
+            matches!(err, ureq::Error::Timeout(Timeout::RecvResponse)),
+            "{err}"
+        );
+        assert_eq!(t.0.timeouts.len(), 2);
     }
 
     #[test]
