@@ -1,6 +1,7 @@
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -58,15 +59,90 @@ pub trait Runner: Send + Sync {
     fn run_attached(&self, program: &str, args: &[String]) -> RunResult;
 }
 
+/// How long `run` waits for the output pipes to close once the child has exited. A grandchild
+/// that inherited a pipe keeps it open after the child is gone; without a bound, `run` would
+/// wait for that grandchild too (L343).
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 pub struct ProcessRunner;
 
-impl Runner for ProcessRunner {
-    fn run(
-        &self,
+/// What `wait_for` needs from a child process, so its failure paths are testable.
+trait Waitable {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
+    fn kill(&mut self) -> std::io::Result<()>;
+    fn wait(&mut self) -> std::io::Result<ExitStatus>;
+}
+
+impl Waitable for Child {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+    fn kill(&mut self) -> std::io::Result<()> {
+        Child::kill(self)
+    }
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        Child::wait(self)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Waited {
+    Exited(i32),
+    TimedOut,
+    Failed(String),
+}
+
+/// Polls until the child exits or `deadline` passes. A timeout and a failed poll both kill and
+/// reap the child, so neither leaves a process running (L343).
+fn wait_for(child: &mut dyn Waitable, deadline: Instant) -> Waited {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Waited::Exited(status.code().unwrap_or(-1)),
+            Ok(None) if Instant::now() >= deadline => {
+                reap(child);
+                return Waited::TimedOut;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(e) => {
+                reap(child);
+                return Waited::Failed(e.to_string());
+            }
+        }
+    }
+}
+
+fn reap(child: &mut dyn Waitable) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Reads a pipe to its end on a thread and sends what it read. The thread is detached, so a
+/// pipe that never closes costs one parked thread, not a hang.
+fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// The drained bytes, or `None` when the pipe had not closed by `until`.
+fn collect(rx: &mpsc::Receiver<Vec<u8>>, until: Instant) -> Option<Vec<u8>> {
+    rx.recv_timeout(until.saturating_duration_since(Instant::now()))
+        .ok()
+}
+
+impl ProcessRunner {
+    fn run_bounded(
         program: &str,
         args: &[String],
         stdin: Option<&[u8]>,
         timeout: Duration,
+        grace: Duration,
     ) -> RunResult {
         let mut child = match Command::new(program)
             .args(args)
@@ -88,36 +164,36 @@ impl Runner for ProcessRunner {
                 let _ = pipe.write_all(&data);
             });
         }
-        let drain = |p: Option<Box<dyn std::io::Read + Send>>| {
-            thread::spawn(move || {
-                let mut buf = Vec::new();
-                if let Some(mut p) = p {
-                    let _ = p.read_to_end(&mut buf);
+        let out = drain(child.stdout.take());
+        let err = drain(child.stderr.take());
+        match wait_for(&mut child, Instant::now() + timeout) {
+            Waited::Exited(code) => {
+                let until = Instant::now() + grace;
+                match (collect(&out, until), collect(&err, until)) {
+                    (Some(stdout), Some(stderr)) => RunResult::Exited {
+                        code,
+                        stdout,
+                        stderr,
+                    },
+                    // Never hand back half an output as a whole one.
+                    _ => RunResult::TimedOut,
                 }
-                buf
-            })
-        };
-        let out = drain(child.stdout.take().map(|p| Box::new(p) as _));
-        let err = drain(child.stderr.take().map(|p| Box::new(p) as _));
-        let deadline = Instant::now() + timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    return RunResult::Exited {
-                        code: status.code().unwrap_or(-1),
-                        stdout: out.join().unwrap_or_default(),
-                        stderr: err.join().unwrap_or_default(),
-                    };
-                }
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return RunResult::TimedOut;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(10)),
-                Err(e) => return RunResult::SpawnFailed(e.to_string()),
             }
+            Waited::TimedOut => RunResult::TimedOut,
+            Waited::Failed(e) => RunResult::SpawnFailed(e),
         }
+    }
+}
+
+impl Runner for ProcessRunner {
+    fn run(
+        &self,
+        program: &str,
+        args: &[String],
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+    ) -> RunResult {
+        Self::run_bounded(program, args, stdin, timeout, DRAIN_GRACE)
     }
 
     fn run_attached(&self, program: &str, args: &[String]) -> RunResult {
@@ -430,6 +506,8 @@ impl Keychain for SecurityCli {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::io;
+    use std::os::unix::process::ExitStatusExt;
     use std::sync::{Arc, Mutex};
 
     type Call = (String, Vec<String>, Option<Vec<u8>>);
@@ -820,6 +898,107 @@ mod tests {
         assert_eq!(
             s.calls()[0].1,
             vec!["unlock-keychain".to_string(), "/tmp/t.keychain".to_string()]
+        );
+    }
+
+    /// A child whose `try_wait` answers are scripted, counting the kills and reaps.
+    struct FakeChild {
+        polls: VecDeque<io::Result<Option<ExitStatus>>>,
+        kills: usize,
+        waits: usize,
+    }
+
+    impl FakeChild {
+        fn new(polls: Vec<io::Result<Option<ExitStatus>>>) -> Self {
+            Self {
+                polls: polls.into(),
+                kills: 0,
+                waits: 0,
+            }
+        }
+    }
+
+    impl Waitable for FakeChild {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            self.polls.pop_front().expect("unexpected extra poll")
+        }
+        fn kill(&mut self) -> io::Result<()> {
+            self.kills += 1;
+            Ok(())
+        }
+        fn wait(&mut self) -> io::Result<ExitStatus> {
+            self.waits += 1;
+            Ok(ExitStatus::from_raw(0))
+        }
+    }
+
+    #[test]
+    fn a_failed_try_wait_kills_and_reaps_the_child() {
+        // L343: the child used to be left running, and never reaped.
+        let mut child = FakeChild::new(vec![Err(io::Error::other("boom"))]);
+        let waited = wait_for(&mut child, Instant::now() + Duration::from_secs(60));
+        assert!(
+            matches!(&waited, Waited::Failed(m) if m.contains("boom")),
+            "{waited:?}"
+        );
+        assert_eq!((child.kills, child.waits), (1, 1));
+    }
+
+    #[test]
+    fn a_child_past_its_deadline_is_killed_and_reaped() {
+        let mut child = FakeChild::new(vec![Ok(None)]);
+        assert_eq!(wait_for(&mut child, Instant::now()), Waited::TimedOut);
+        assert_eq!((child.kills, child.waits), (1, 1));
+    }
+
+    #[test]
+    fn a_child_that_exits_in_time_is_left_alone() {
+        let mut child = FakeChild::new(vec![Ok(None), Ok(Some(ExitStatus::from_raw(3 << 8)))]);
+        let waited = wait_for(&mut child, Instant::now() + Duration::from_secs(60));
+        assert_eq!(waited, Waited::Exited(3));
+        assert_eq!((child.kills, child.waits), (0, 0));
+    }
+
+    #[test]
+    fn a_real_process_reports_its_code_and_both_streams() {
+        let r = ProcessRunner::run_bounded(
+            "/bin/sh",
+            &s(&["-c", "printf out; printf err >&2; exit 3"]),
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        match r {
+            RunResult::Exited {
+                code,
+                stdout,
+                stderr,
+            } => {
+                assert_eq!(code, 3);
+                assert_eq!(stdout, b"out");
+                assert_eq!(stderr, b"err");
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_grandchild_holding_the_pipes_cannot_hang_run() {
+        // L343: `sleep` inherits the pipes and outlives the shell, so the readers never see
+        // EOF. `run` used to join them and wait the full 8 s.
+        let started = Instant::now();
+        let r = ProcessRunner::run_bounded(
+            "/bin/sh",
+            &s(&["-c", "sleep 8 & echo done"]),
+            None,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        assert!(matches!(r, RunResult::TimedOut), "{r:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
         );
     }
 }
