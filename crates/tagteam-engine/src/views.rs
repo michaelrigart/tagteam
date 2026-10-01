@@ -1,12 +1,14 @@
+use std::os::unix::fs::MetadataExt;
+
 use tagteam_core::pace::pace;
 use tagteam_core::trust::decision_grade;
-use tagteam_core::usage::earliest_relevant_reset;
+use tagteam_core::usage::{earliest_relevant_reset, is_relevant};
 use tagteam_core::{AccountId, Pace, ProviderId, Sample, TrustInputs, Window};
-use tagteam_provider::{KindTraits, Read};
+use tagteam_provider::{Identity, KindTraits, Provider, Read};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::store::{AccountRow, Store, UsageStateRow};
+use crate::store::{AccountRow, LiveIdentityCacheRow, Store, UsageStateRow};
 
 /// §8.7: pace and projections read the samples of the 48 h before a reading.
 const PACE_LOOKBACK_S: i64 = 48 * 3600;
@@ -174,6 +176,48 @@ fn with_pace(
             Ok((w.clone(), pace_from(w, fetched_at, &samples)))
         })
         .collect()
+}
+
+/// One window of `tagteam history` (§13.4): its definition from the last good reading, its
+/// samples since the requested time, and §8.7's pace as of that reading.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistoryWindow {
+    pub window: Window,
+    pub samples: Vec<Sample>,
+    pub pace: Pace,
+}
+
+#[derive(Debug, Clone)]
+pub struct HistoryView {
+    pub account: AccountView,
+    pub windows: Vec<HistoryWindow>,
+}
+
+/// What `statusline` shows (§13.5).
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum StatuslineView {
+    NoLogin,
+    Unmanaged { email: String },
+    Managed { account: AccountView },
+}
+
+/// The live login as `statusline` needs it: its identity key and its label (the email when it
+/// has one).
+struct LiveLogin {
+    key: String,
+    label: String,
+    account_uuid: Option<String>,
+}
+
+impl LiveLogin {
+    fn of(p: &dyn Provider, i: &Identity) -> Self {
+        LiveLogin {
+            key: p.identity_key(i).as_str().to_owned(),
+            label: i.email.clone().unwrap_or_else(|| i.label.clone()),
+            account_uuid: i.account_uuid.clone(),
+        }
+    }
 }
 
 impl Engine {
@@ -354,6 +398,152 @@ impl Engine {
             Read::Absent => Ok(StatusView::NoLogin),
             Read::Unreadable(e) => Err(EngineError::Unreadable(e)),
         }
+    }
+
+    /// §13.4, reading only: the windows of `account`'s last good reading (its relevant ones,
+    /// §8.2, or those whose key or label is `window`, ignoring case), each with its samples
+    /// fetched at or after `since_s` and its pace as of the reading. An account never read has
+    /// no windows.
+    pub fn history(
+        &self,
+        account: &AccountId,
+        window: Option<&str>,
+        since_s: i64,
+    ) -> Result<HistoryView, EngineError> {
+        let missing = || EngineError::NoSuchAccount(account.to_string());
+        let store = self.existing_store()?.ok_or_else(missing)?;
+        let row = store.account(account)?.ok_or_else(missing)?;
+        let view = self
+            .accounts(Some(&row.provider))?
+            .into_iter()
+            .flat_map(|l| l.accounts)
+            .find(|v| v.row.id == row.id)
+            .ok_or_else(missing)?;
+        let state = store.usage_state(&row.id)?;
+        let reading = state.and_then(|s| Some((s.last_good.unwrap_or_default(), s.fetched_at?)));
+        let Some((last_good, fetched_at)) = reading else {
+            return Ok(HistoryView {
+                account: view,
+                windows: Vec::new(),
+            });
+        };
+        let models = &self.settings().models;
+        let windows = last_good
+            .into_iter()
+            .filter(|w| match window {
+                Some(name) => {
+                    w.key.eq_ignore_ascii_case(name) || w.label.eq_ignore_ascii_case(name)
+                }
+                None => is_relevant(w, models),
+            })
+            .map(|w| {
+                // One query reaches back to the earlier of `since_s` and pace's lookback.
+                let all: Vec<Sample> = store
+                    .usage_samples(
+                        &row.id,
+                        Some(&w.key),
+                        since_s.min(fetched_at - PACE_LOOKBACK_S),
+                    )?
+                    .into_iter()
+                    .map(|(_, s)| s)
+                    .collect();
+                let pace = pace_from(&w, fetched_at, &all);
+                let samples = all
+                    .into_iter()
+                    .filter(|s| s.fetched_at >= since_s)
+                    .collect();
+                Ok(HistoryWindow {
+                    window: w,
+                    samples,
+                    pace,
+                })
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        Ok(HistoryView {
+            account: view,
+            windows,
+        })
+    }
+
+    /// §13.5: the live login and, when tagteam manages it, its usage. No network, no Keychain,
+    /// and the store is never created. The live identity comes from `live_identity_cache`
+    /// while `Provider::live_identity_source`'s mtime and size are unchanged, and is re-parsed
+    /// only when they change. A missing, unreadable or garbled source is `NoLogin`, never an
+    /// error.
+    pub fn statusline(&self, provider: &ProviderId) -> Result<StatuslineView, EngineError> {
+        let p = self.provider(provider)?;
+        let store = self.existing_store()?;
+        let Some(login) = self.live_login(p.as_ref(), store.as_deref())? else {
+            return Ok(StatuslineView::NoLogin);
+        };
+        let row = match &store {
+            Some(s) => s.find_by_identity_key(provider, &login.key)?,
+            None => None,
+        };
+        Ok(match row {
+            Some(row) => StatuslineView::Managed {
+                account: self.account_view(row, true),
+            },
+            None => StatuslineView::Unmanaged { email: login.label },
+        })
+    }
+
+    /// The live login, through `live_identity_cache` (§13.5). Without a store nothing is
+    /// cached and the source is parsed every time.
+    fn live_login(
+        &self,
+        p: &dyn Provider,
+        store: Option<&Store>,
+    ) -> Result<Option<LiveLogin>, EngineError> {
+        let parse = || match p.live_identity(&self.env) {
+            Read::Present(i) => Some(Some(LiveLogin::of(p, &i))),
+            Read::Absent => Some(None),
+            Read::Unreadable(_) => None,
+        };
+        let (Some(path), Some(store)) = (p.live_identity_source(&self.env), store) else {
+            return Ok(parse().flatten());
+        };
+        // Stat before parsing: a rewrite in between leaves the old stamp on the new identity,
+        // which the next run's stat sees and parses again; never a new stamp on an old one.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return Ok(None);
+        };
+        let stamp = LiveIdentityCacheRow {
+            provider: p.id(),
+            path: path.to_string_lossy().into_owned(),
+            mtime_ns: meta
+                .mtime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(meta.mtime_nsec()),
+            size: i64::try_from(meta.len()).unwrap_or(i64::MAX),
+            identity_key: None,
+            label: None,
+            account_uuid: None,
+        };
+        if let Some(c) = store.live_identity_cache(&stamp.provider)? {
+            if c.path == stamp.path && c.mtime_ns == stamp.mtime_ns && c.size == stamp.size {
+                return Ok(c.identity_key.map(|key| LiveLogin {
+                    key,
+                    label: c.label.unwrap_or_default(),
+                    account_uuid: c.account_uuid,
+                }));
+            }
+        }
+        // An unreadable or garbled file is not cached: the next run parses it again.
+        let Some(login) = parse() else {
+            return Ok(None);
+        };
+        let row = LiveIdentityCacheRow {
+            identity_key: login.as_ref().map(|l| l.key.clone()),
+            label: login.as_ref().map(|l| l.label.clone()),
+            account_uuid: login.as_ref().and_then(|l| l.account_uuid.clone()),
+            ..stamp
+        };
+        // Only a cache: a failed write costs the next run a parse, never this one its line.
+        if let Err(e) = store.put_live_identity_cache(&row) {
+            tracing::debug!(error = %e, "the live identity cache was not written");
+        }
+        Ok(login)
     }
 }
 
