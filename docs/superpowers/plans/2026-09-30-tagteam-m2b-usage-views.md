@@ -91,6 +91,21 @@ from the reading's `fetched_at`, and pace covers `Scoped` windows with a known p
     failure (backoff until a slot frees), reversing Task 10's "records nothing", so the row reads
     `over budget` (§8.6, §13.1); `history` also lists windows that have retained samples but are
     missing from the latest reading, described by the new `Provider::describe_window`.
+  - Fix-everything pass (Michael, 2026-10-01: no deferred items). Every deferred minor,
+    residual and set-aside item from the task and final reviews was fixed or ruled not fixable
+    (process records, spec-mandated behaviour); the spec records the behaviour changes
+    (0004d9f). Behaviour: a reading or schedule stamped beyond any legal value (clock skew) is
+    ignored; the role's max caps the movement intervals; a sub-second `Retry-After` on a 429
+    takes the 300 s minimum; a non-refreshable token's refusal is `http-401`; one account's
+    collection error is a warning, not a command error, and a never-sent slot always goes
+    back; every non-`ok` row carries `usageError`/`usageRetryAt` and a `retry` countdown;
+    `statusline.format` and `autoswitch.models` are validated; the statusline skips pace and
+    never waits on a busy store; `history` words passed resets, past projections, quiet rates
+    and unknown windows plainly; `list` aligns wide characters. Interface additions:
+    `tagteam_core::trust::{FUTURE_STAMP_SLACK_S, is_future_stamped}`,
+    `tagteam_core::backoff::CAP_429_S` (pub), `tagteam_engine::settings::{STATUSLINE_PLACEHOLDERS,
+    STATUSLINE_MODEL_PREFIX, is_statusline_placeholder}`,
+    `Store::put_live_identity_cache_within`, `HistoryView.unmatched_window`.
 
 ## Milestones
 
