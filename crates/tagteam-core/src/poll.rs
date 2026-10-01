@@ -200,9 +200,9 @@ pub fn plan_after_fetch(b: &PollBudget, i: &PollInputs, jitter: f64) -> PollPlan
 /// The incoming (active) account follows §9.4: `next_poll_at = max(now, fetched_at + 180)` with
 /// the active default interval and no jitter, so a stale reading is fetched at once. The
 /// outgoing (candidate) account gets the candidate default interval, jittered, from `now_s`, and
-/// never below the floor. A `fetched_at` more than [`crate::trust::FUTURE_STAMP_SLACK_S`] after `now_s` (clock
-/// skew) is not a usable age and counts as `now_s`, so the plan never reaches arbitrarily far
-/// ahead.
+/// never below the floor. A `fetched_at` more than [`crate::trust::FUTURE_STAMP_SLACK_S`] after
+/// `now_s` (clock skew) is not a usable age and counts as `now_s`, so the plan never reaches
+/// arbitrarily far ahead.
 pub fn replan_for_role(
     b: &PollBudget,
     active: bool,
