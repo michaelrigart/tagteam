@@ -1,0 +1,97 @@
+name: Release smoke
+
+# Called by release.yml (dist's `global-artifacts-jobs`) after the archives are built and
+# before the host job creates the GitHub Release: a musl archive that does not run, or whose
+# TLS stack cannot verify a certificate, stops the release.
+on:
+  workflow_call:
+    inputs:
+      plan:
+        description: dist's plan manifest (JSON)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  musl:
+    name: musl (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      PLAN: ${{ inputs.plan }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Fetch the archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: artifacts-build-local-${{ matrix.target }}
+          path: archive
+      - name: Extract the binary
+        run: |
+          set -eu
+          VERSION=$(printf '%s' "$PLAN" | jq -r '.releases[] | select(.app_name == "tagteam") | .app_version')
+          test -n "$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xJf "archive/tagteam-$TARGET.tar.xz" -C "$RUNNER_TEMP/bin" --strip-components=1
+          tar -tJf "archive/tagteam-$TARGET.tar.xz"
+          ls -l "$RUNNER_TEMP/bin"
+          for f in tagteam LICENSE NOTICE; do test -f "$RUNNER_TEMP/bin/$f"; done
+      - name: Binary is a static executable
+        run: |
+          set -eu
+          file "$RUNNER_TEMP/bin/tagteam"
+          file "$RUNNER_TEMP/bin/tagteam" | grep -E 'statically linked|static-pie linked'
+      - name: Write the round-trip script
+        run: |
+          cat > "$RUNNER_TEMP/roundtrip.sh" <<'SCRIPT'
+          # Usage: roundtrip.sh <tagteam> <version>. POSIX sh: it also runs under Alpine's ash.
+          set -eu
+          bin=$1
+          want=$2
+          work=$(mktemp -d)
+          export HOME="$work/home" XDG_CONFIG_HOME="$work/config" XDG_DATA_HOME="$work/data" \
+            XDG_STATE_HOME="$work/state" XDG_CACHE_HOME="$work/cache"
+          mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME"
+          got=$("$bin" --version)
+          echo "version: $got"
+          case $got in
+            *" $want") ;;
+            *) echo "expected version $want" >&2; exit 1 ;;
+          esac
+          "$bin" add-token sk-ant-api03-smoke-dummy-token --email smoke@example.com
+          list=$("$bin" list --json)
+          echo "$list"
+          printf '%s' "$list" | grep -q 'smoke@example.com'
+          SCRIPT
+      - name: Run on the glibc runner
+        run: sh "$RUNNER_TEMP/roundtrip.sh" "$RUNNER_TEMP/bin/tagteam" "$VERSION"
+      - name: Run in an Alpine container
+        run: |
+          docker run --rm \
+            -v "$RUNNER_TEMP/bin:/smoke/bin:ro" \
+            -v "$RUNNER_TEMP/roundtrip.sh:/smoke/roundtrip.sh:ro" \
+            alpine:3 sh /smoke/roundtrip.sh /smoke/bin/tagteam "$VERSION"
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: TLS through the platform verifier
+        run: cargo test -p tagteam-engine --target "$TARGET" --test tls_live --locked -- --ignored
