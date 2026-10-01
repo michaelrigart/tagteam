@@ -68,6 +68,24 @@ from the reading's `fetched_at`, and pace covers `Scoped` windows with a known p
     helpers live once in `render.rs`; `statusline` uses them (one currency format, `—`).
   - D7: Task 16's `unreachable!` stays. D8: Task 7 drops a self-comparing assertion.
   - D9: one pace helper serves `with_pace` and `history` (Task 13).
+- **Execution rulings (2026-10-01).** Decisions taken during the run that change the task text
+  below; the code follows these, not the superseded text.
+  - Task 1: `autoswitch.threshold` is read from `[provider.<id>.autoswitch]` first, then
+    `[autoswitch]`, like `models` (§6.4: the provider table "overrides individual keys").
+  - Task 4: `replan_for_role(b, active, fetched_at, now_s, jitter)`. The incoming (active)
+    account gets §9.4's plan, interval 180 s and `next_poll_at = max(now, fetched_at + 180)`
+    without jitter; the outgoing account keeps the jittered candidate default. Task 12 passes
+    the reading's `fetched_at` and pins an old reading as due at once.
+  - Task 13: a quarantined account gets no extended trust (`consecutive_failures` 0 and
+    `plan_in_force` false in `TrustInputs`, §8.4: "while failures are being retried");
+    `Store::usage_samples` with a window uses its own statement along the primary key, so
+    per-window pace reads no other window's samples.
+  - Task 15: `history` shows a window at 100 % or more as `at the limit`, with its rate when
+    there is one, instead of `no rate yet` or `runs out in <1m`.
+  - Final review: only a mutation-lock timeout drops the active collection; any other lock error
+    is `collect_usage`'s error and a stderr warning. An unresolved switch journal that stops it
+    adds one warning. `finish_replacement` and `move_to` take IMMEDIATE transactions.
+    `statusline` drains stdin only when it will print a line.
 
 ## Milestones
 
@@ -372,9 +390,11 @@ pub struct PollPlan { pub interval_s: i64, pub next_poll_at: i64 }
 
 /// §8.6 `plan_after_fetch`, with Decision 9's clamps. `jitter` is in [-1, 1].
 pub fn plan_after_fetch(b: &PollBudget, i: &PollInputs, jitter: f64) -> PollPlan;
-/// The default plan for an account whose role changed without a fetch (§8.3's post-switch
-/// re-plan): the role's default interval, jittered, from `now_s`.
-pub fn replan_for_role(b: &PollBudget, active: bool, now_s: i64, jitter: f64) -> PollPlan;
+/// The plan for an account whose role changed without a fetch (§8.3's post-switch re-plan).
+/// Active (incoming): §9.4, interval 180 s, `next_poll_at = max(now_s, fetched_at + 180)`, no
+/// jitter. Candidate (outgoing): the role's default interval, jittered, from `now_s`.
+/// (Amended in execution: `fetched_at` added; see Execution notes.)
+pub fn replan_for_role(b: &PollBudget, active: bool, fetched_at: i64, now_s: i64, jitter: f64) -> PollPlan;
 /// When a request may next be sent, given the reservation times counted in the window
 /// (ascending): `None` if a slot is free now.
 pub fn budget_next_free(b: &PollBudget, counted_at: &[i64], now_s: i64) -> Option<i64>;
