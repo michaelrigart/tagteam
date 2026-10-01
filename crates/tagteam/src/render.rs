@@ -173,8 +173,14 @@ pub(crate) fn money(amount: f64, currency: &str) -> String {
     }
 }
 
-/// The spend window as a cell: `€0 of €20`, coloured by the severity of its percentage when
-/// `color`, the one rule `list`, `status` and the statusline share.
+/// The spend window as shown: `€0 of €20`, coloured by the severity of its percentage when
+/// `color`; `None` when the provider's detail does not say how much. The one rule `list`,
+/// `status` and the statusline share.
+pub(crate) fn spend_shown(w: &Window, color: bool) -> Option<String> {
+    spend_cell(w, color).map(|c| c.shown)
+}
+
+/// `spend_shown` as a table cell, with its plain text for the column's width.
 fn spend_cell(w: &Window, color: bool) -> Option<Cell> {
     let text = spend_text(w)?;
     let shown = match severity(w.pct.round() as i64) {

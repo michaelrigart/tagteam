@@ -848,11 +848,20 @@ fn a_busy_store_costs_the_statusline_neither_its_line_nor_its_time() {
     other.execute_batch("ROLLBACK").unwrap();
     assert_eq!(managed(view), a);
     assert!(
-        took < std::time::Duration::from_millis(500),
+        took < std::time::Duration::from_millis(100),
         "the statusline waited {took:?} on the write lock"
     );
-    // Nothing was cached meanwhile; the next, uncontended run does.
-    assert_ne!(cache(&fx).unwrap().identity_key, None);
+    // The contended write was skipped: the cache still holds b, the last file that was cached.
+    let key_b = fx
+        .engine
+        .store()
+        .unwrap()
+        .account(&b)
+        .unwrap()
+        .unwrap()
+        .identity_key;
+    assert_eq!(cache(&fx).unwrap().identity_key, Some(key_b));
+    // The next, uncontended run parses again and caches a.
     assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), a);
     let key_a = fx
         .engine
