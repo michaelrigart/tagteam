@@ -33,6 +33,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # minor: tagteam-engine wraps its transport, and `ureq::unversioned` breaks only in minors.
 ureq = { version = "~3.4", default-features = false, features = ["rustls", "platform-verifier"] }
 unicode-normalization = "0.1"
+# Display width of table cells: CJK and emoji take two columns.
+unicode-width = "0.2"
 uuid = { version = "1", features = ["v7"] }
 # test-only
 assert_cmd = "2"

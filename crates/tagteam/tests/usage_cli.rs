@@ -348,3 +348,36 @@ fn a_collection_that_fails_as_a_whole_is_one_warning_and_never_a_command_error()
     assert_eq!(v["accounts"].as_array().unwrap().len(), 2);
     assert_eq!(server.hits("GET", USAGE), 0, "nothing was collected");
 }
+
+#[test]
+fn a_locked_keychain_row_says_when_it_is_retried_in_words_and_in_json() {
+    // §13.1, §13.2: not only `unavailable` rows: any status that is retried says when.
+    let d = tempfile::tempdir().unwrap();
+    accounts(d.path(), &["a@x.co", "b@x.co"]);
+    std::fs::write(d.path().join("keychain/LOCKED"), "").unwrap();
+    let server = serving(recorded_reply(now_epoch_s()));
+    let before = now_epoch_s();
+    let (out, err) = run(d.path(), &server, &["list"]);
+    assert_eq!(err, "");
+    assert_eq!(
+        out,
+        concat!(
+            "    #  ACCOUNT\n",
+            "    1  a@x.co   keychain unavailable (retry <1m)\n",
+            " *  2  b@x.co   keychain unavailable (retry <1m)\n",
+        )
+    );
+    let v = json_of(d.path(), &server, &["list", "--json"]);
+    let after = now_epoch_s();
+    for row in v["accounts"].as_array().unwrap() {
+        assert_eq!(row["usageStatus"], "keychain_unavailable");
+        assert_eq!(row["usageError"], "keychain-unavailable");
+        let retry = row["usageRetryAt"].as_str().unwrap();
+        assert!(
+            (format_iso8601(before).as_str()..=format_iso8601(after + 60).as_str())
+                .contains(&retry),
+            "{retry}"
+        );
+    }
+    assert_eq!(server.hits("GET", USAGE), 0, "nothing could be sent");
+}

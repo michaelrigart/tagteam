@@ -7,6 +7,7 @@ use tagteam_engine::views::{
     AccountView, NO_DATA, ProviderAccounts, StatusView, UsageStatus, UsageView,
 };
 use tagteam_provider::SecretStore;
+use unicode_width::UnicodeWidthStr;
 
 const NO_ACCOUNTS: &str = "No accounts yet. Log in with `claude`, then run `tagteam add`.\n";
 /// Claude Code reloads a credentials-file change on its next message (Appendix A.3).
@@ -42,9 +43,10 @@ pub fn name(r: &AccountRow) -> String {
 }
 
 /// One `list` row (§13.2). `usage` is decision-grade only (§8.4), with its fetch time and age.
-/// Otherwise `usage` is null and the last good reading, if any, is `lastGoodUsage`; an
-/// `unavailable` row also says why and when it is retried. Times are ISO 8601 UTC, as the
-/// provider's own `resetsAt`.
+/// Otherwise `usage` is null and the last good reading, if any, is `lastGoodUsage`. Whatever
+/// the reading, a row whose status is not `ok` also says why (`usageError`) and when it is
+/// retried (`usageRetryAt`, null when it is not, or no longer, ahead). Times are ISO 8601 UTC,
+/// as the provider's own `resetsAt`.
 pub fn row_json(v: &AccountView, usage: RenderUsage<'_>) -> Value {
     let r = &v.row;
     let u = &v.usage;
@@ -73,11 +75,11 @@ pub fn row_json(v: &AccountView, usage: RenderUsage<'_>) -> Value {
             o["lastGoodUsage"] = last_good.unwrap_or(Value::Null);
             o["lastGoodFetchedAt"] = json!(fetched_at);
             o["lastGoodAgeSeconds"] = json!(u.age_s);
-            if u.status == UsageStatus::Unavailable {
-                o["usageError"] = json!(u.error);
-                o["usageRetryAt"] = json!(u.retry_at.map(format_iso8601));
-            }
         }
+    }
+    if u.status != UsageStatus::Ok {
+        o["usageError"] = json!(u.error);
+        o["usageRetryAt"] = json!(u.retry_at.map(format_iso8601));
     }
     if let Some(a) = &r.alias {
         o["alias"] = json!(a);
@@ -171,6 +173,17 @@ pub(crate) fn money(amount: f64, currency: &str) -> String {
     }
 }
 
+/// The spend window as a cell: `€0 of €20`, coloured by the severity of its percentage when
+/// `color`, the one rule `list`, `status` and the statusline share.
+fn spend_cell(w: &Window, color: bool) -> Option<Cell> {
+    let text = spend_text(w)?;
+    let shown = match severity(w.pct.round() as i64) {
+        Some(code) if color => format!("{code}{text}{RESET}"),
+        _ => text.clone(),
+    };
+    Some(Cell { plain: text, shown })
+}
+
 /// `€0 of €20`, from a spend window's `detail {used, limit, currency}` (§8.2).
 pub(crate) fn spend_text(w: &Window) -> Option<String> {
     let d = w.detail.as_ref().filter(|_| w.kind == WindowKind::Spend)?;
@@ -182,8 +195,9 @@ pub(crate) fn spend_text(w: &Window) -> Option<String> {
     ))
 }
 
+/// The columns `s` takes on a terminal: a CJK character or an emoji takes two.
 fn width(s: &str) -> usize {
-    s.chars().count()
+    UnicodeWidthStr::width(s)
 }
 
 fn pad(s: &str, w: usize) -> String {
@@ -233,10 +247,7 @@ fn pct_cell(pct: f64, color: bool) -> Cell {
 /// A window as `list` shows it: its pct (a spend window's amounts), the countdown to its
 /// reset, and `▲ pace` when it is ahead of pace.
 fn window_cell(w: &Window, p: &Pace, now_s: i64, color: bool) -> Cell {
-    let mut c = match spend_text(w) {
-        Some(t) => Cell::text(t),
-        None => pct_cell(w.pct, color),
-    };
+    let mut c = spend_cell(w, color).unwrap_or_else(|| pct_cell(w.pct, color));
     if let Some(at) = w.resets_at {
         c.push(&format!("  {}", countdown(at, now_s)));
     }
@@ -247,28 +258,33 @@ fn window_cell(w: &Window, p: &Pace, now_s: i64, color: bool) -> Cell {
 }
 
 /// A usage status in words (§13.1): in place of a row's windows when it has no reading, and
-/// beside them when its status is not `ok`.
+/// beside them when its status is not `ok`. Whatever the status, a retry still ahead is said:
+/// `keychain unavailable (retry 2m)`, `unavailable (http-429, retry 5m)`.
 fn words(u: &UsageView, now_s: i64) -> String {
+    let (head, why) = match u.status {
+        UsageStatus::Ok => ("no usage reported", None),
+        UsageStatus::TokenExpired => ("token expired", None),
+        UsageStatus::ApiKey => ("api key", None),
+        UsageStatus::KeychainUnavailable => ("keychain unavailable", None),
+        UsageStatus::ReloginRequired => ("relogin required", None),
+        UsageStatus::ForeignCredential => ("foreign credential", None),
+        UsageStatus::NoCredentials => ("no credentials", None),
+        UsageStatus::Unsupported => ("usage unsupported", None),
+        UsageStatus::Unavailable => match u.error.as_deref() {
+            None | Some(NO_DATA) => ("no data yet", None),
+            Some("over-budget") => ("over budget", None),
+            Some(e) => ("unavailable", Some(e.to_owned())),
+        },
+    };
     let retry = u
         .retry_at
         .filter(|&at| at > now_s)
         .map(|at| format!("retry {}", duration(at - now_s)));
-    match u.status {
-        UsageStatus::Ok => "no usage reported".into(),
-        UsageStatus::TokenExpired => "token expired".into(),
-        UsageStatus::ApiKey => "api key".into(),
-        UsageStatus::KeychainUnavailable => "keychain unavailable".into(),
-        UsageStatus::ReloginRequired => "relogin required".into(),
-        UsageStatus::ForeignCredential => "foreign credential".into(),
-        UsageStatus::NoCredentials => "no credentials".into(),
-        UsageStatus::Unsupported => "usage unsupported".into(),
-        UsageStatus::Unavailable => match (u.error.as_deref(), retry) {
-            (None | Some(NO_DATA), _) => "no data yet".into(),
-            (Some("over-budget"), Some(r)) => format!("over budget ({r})"),
-            (Some("over-budget"), None) => "over budget".into(),
-            (Some(e), Some(r)) => format!("unavailable ({e}, {r})"),
-            (Some(e), None) => format!("unavailable ({e})"),
-        },
+    let detail: Vec<String> = why.into_iter().chain(retry).collect();
+    if detail.is_empty() {
+        head.to_owned()
+    } else {
+        format!("{head} ({})", detail.join(", "))
     }
 }
 
@@ -495,10 +511,11 @@ fn usage_line(u: &UsageView, now_s: i64, color: bool) -> Option<String> {
     let mut parts = Vec::new();
     if let Some(ws) = u.windows.as_deref().filter(|ws| !ws.is_empty()) {
         for (w, p) in ws {
-            let mut part = match spend_text(w) {
-                Some(t) => format!("{} {t}", w.label),
-                None => format!("{} {}", w.label, pct_cell(w.pct, color).shown.trim_start()),
+            let shown = match spend_cell(w, color) {
+                Some(cell) => cell.shown,
+                None => pct_cell(w.pct, color).shown.trim_start().to_owned(),
             };
+            let mut part = format!("{} {shown}", w.label);
             if let Some(at) = w.resets_at {
                 part.push_str(&format!(" ({})", countdown(at, now_s)));
             }
@@ -971,6 +988,109 @@ mod tests {
     }
 
     #[test]
+    fn every_status_says_when_it_is_retried_while_that_is_ahead() {
+        let words_of = |status, error: Option<&str>, retry_in: Option<i64>| {
+            words(&unread(status, error, retry_in), NOW)
+        };
+        for (status, text) in [
+            (UsageStatus::KeychainUnavailable, "keychain unavailable"),
+            (UsageStatus::TokenExpired, "token expired"),
+            (UsageStatus::NoCredentials, "no credentials"),
+            (UsageStatus::ForeignCredential, "foreign credential"),
+        ] {
+            assert_eq!(
+                words_of(status, None, Some(120)),
+                format!("{text} (retry 2m)")
+            );
+            assert_eq!(words_of(status, None, None), text);
+            assert_eq!(
+                words_of(status, None, Some(-5)),
+                text,
+                "a passed retry says nothing"
+            );
+        }
+        assert_eq!(
+            words_of(UsageStatus::Unavailable, Some("over-budget"), Some(2_400)),
+            "over budget (retry 40m)"
+        );
+        assert_eq!(
+            words_of(UsageStatus::Unavailable, Some(NO_DATA), Some(30)),
+            "no data yet (retry <1m)"
+        );
+        assert_eq!(
+            words_of(UsageStatus::Unavailable, Some("http-429"), Some(330)),
+            "unavailable (http-429, retry 5m)"
+        );
+        // A row with a reading shows it, and the words beside it.
+        let mut locked = read(900, 31.0, 12.0, false, vec![]);
+        locked.status = UsageStatus::KeychainUnavailable;
+        locked.retry_at = Some(NOW + 120);
+        assert_eq!(
+            list_human(
+                &one(vec![view(1, "a@x.co", OAUTH, locked)]),
+                &names,
+                NOW,
+                false
+            ),
+            concat!(
+                "    #  ACCOUNT  5H           7D           SPEND  AGE\n",
+                "    1  a@x.co    31%  2h40m   12%  3d09h  —      15m  keychain unavailable (retry 2m)\n",
+            )
+        );
+    }
+
+    #[test]
+    fn the_spend_amount_is_coloured_by_its_severity_in_list_and_status() {
+        let rows = |pct: f64| {
+            let mut spent = spend(pct * 0.2, 20.0);
+            spent.pct = pct;
+            view(1, "a@x.co", OAUTH, read(0, 9.0, 12.0, false, vec![spent]))
+        };
+        let table = |pct, color| list_human(&one(vec![rows(pct)]), &names, NOW, color);
+        assert!(table(95.0, true).contains("\x1b[31m€19 of €20\x1b[0m"));
+        assert!(table(75.0, true).contains("\x1b[33m€15 of €20\x1b[0m"));
+        assert!(table(10.0, true).contains("  €2 of €20"));
+        assert!(!table(10.0, true).contains("\x1b[31m€2"));
+        assert!(!table(95.0, false).contains('\x1b'), "never without colour");
+        let status = |pct, color| {
+            let account = rows(pct);
+            status_human(&StatusView::Managed { account, total: 1 }, NOW, color)
+        };
+        assert!(status(95.0, true).contains("spend \x1b[31m€19 of €20\x1b[0m"));
+        assert!(status(95.0, false).contains("spend €19 of €20"));
+        // The column still lines up: colour codes take no width.
+        let plain = table(95.0, false);
+        let coloured = table(95.0, true);
+        let strip = |s: &str| s.replace("\x1b[31m", "").replace("\x1b[0m", "");
+        assert_eq!(strip(&coloured), plain);
+    }
+
+    #[test]
+    fn wide_characters_take_two_columns_so_the_table_still_lines_up() {
+        let live =
+            |position, email: &str| view(position, email, OAUTH, read(0, 9.0, 12.0, false, vec![]));
+        let out = list_human(
+            &one(vec![
+                live(1, "a@x.co"),
+                live(2, "山田太郎@x.co"),
+                live(3, "😀@x.co"),
+            ]),
+            &names,
+            NOW,
+            false,
+        );
+        assert_eq!(
+            out,
+            concat!(
+                "    #  ACCOUNT        5H           7D           SPEND  AGE\n",
+                "    1  a@x.co           9%  2h40m   12%  3d09h  —      <1m\n",
+                "    2  山田太郎@x.co    9%  2h40m   12%  3d09h  —      <1m\n",
+                "    3  😀@x.co          9%  2h40m   12%  3d09h  —      <1m\n",
+            )
+        );
+    }
+
+    #[test]
     fn percentages_are_coloured_by_severity_only_when_asked() {
         // §13.5's severities: ≥ 90 red, ≥ 70 yellow, and the columns still line up.
         let rows = || {
@@ -1127,6 +1247,49 @@ mod tests {
         );
         assert_eq!(stale["lastGoodFetchedAt"], json!(format_iso8601(NOW - 840)));
 
+        // A status that is not `ok` says why and when whatever the reading: a decision-grade
+        // one is shown, and the error beside it is not hidden.
+        let mut locked = read(120, 9.0, 77.0, true, vec![]);
+        locked.status = UsageStatus::TokenExpired;
+        locked.error = Some("token-expired".into());
+        locked.retry_at = Some(NOW + 330);
+        let beside = row_json(&view(1, "a@x.co", OAUTH, locked), &count);
+        assert_eq!(
+            keys(&beside),
+            [
+                &ALWAYS[..],
+                &[
+                    "usageFetchedAt",
+                    "usageAgeSeconds",
+                    "usageError",
+                    "usageRetryAt"
+                ]
+            ]
+            .concat()
+        );
+        assert_eq!(
+            (
+                &beside["usageStatus"],
+                &beside["usage"],
+                &beside["usageError"]
+            ),
+            (
+                &json!("token_expired"),
+                &json!({"windows": 2}),
+                &json!("token-expired")
+            )
+        );
+        assert_eq!(beside["usageRetryAt"], json!(format_iso8601(NOW + 330)));
+        // A passed or absent retry is null, not missing.
+        let mut due = read(120, 9.0, 77.0, true, vec![]);
+        due.status = UsageStatus::KeychainUnavailable;
+        due.error = Some("keychain-unavailable".into());
+        let due = row_json(&view(1, "a@x.co", OAUTH, due), &count);
+        assert_eq!(
+            (&due["usageError"], &due["usageRetryAt"]),
+            (&json!("keychain-unavailable"), &Value::Null)
+        );
+
         let failing = row_json(
             &view(
                 1,
@@ -1162,7 +1325,14 @@ mod tests {
             ),
             &count,
         );
-        assert_eq!(keys(&key), [&ALWAYS[..], &last_good].concat());
+        assert_eq!(
+            keys(&key),
+            [&ALWAYS[..], &last_good, &["usageError", "usageRetryAt"]].concat()
+        );
         assert_eq!(key["usageStatus"], "api_key");
+        assert_eq!(
+            (&key["usageError"], &key["usageRetryAt"]),
+            (&Value::Null, &Value::Null)
+        );
     }
 }
