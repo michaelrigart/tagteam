@@ -967,8 +967,8 @@ mod hooks {
         );
         assert_eq!(
             usage_requests(&fx),
-            2,
-            "the other's sent slot, and this one's unsent slot, left counted by the failed fence"
+            1,
+            "only the other's sent slot: this one's never-sent slot went back"
         );
     }
 
@@ -1208,6 +1208,86 @@ mod hooks {
 
         assert_eq!(report.outcomes, [(a.clone(), Collected::Recorded)]);
         assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+        assert_eq!(state(&fx, &a).poll_interval_s, Some(270));
+    }
+
+    #[test]
+    fn an_account_quarantined_after_the_reservation_sends_nothing_and_leaves_no_counted_slot() {
+        // `authorize_send` answers `LeaseLost` for a quarantined account (C8); the held slot
+        // was never sent, so the collector gives it back.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+        let path = fx.env.data_dir().join("tagteam.db");
+        let id = a.clone();
+        fx.engine.on_point(
+            "usage-before-send",
+            Box::new(move || {
+                rusqlite::Connection::open(&path)
+                    .unwrap()
+                    .execute(
+                        "UPDATE accounts SET quarantine_reason = 'invalid_grant', \
+                         quarantine_fp = 'sha256:x' WHERE id = ?1",
+                        [id.as_str()],
+                    )
+                    .unwrap();
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        assert_eq!(report.outcomes, [(a.clone(), Collected::Dropped)]);
+        assert!(fx.http.requests().is_empty(), "nothing was sent");
+        assert_eq!(usage_requests(&fx), 0, "the never-sent slot went back");
+    }
+
+    #[test]
+    fn a_token_another_process_just_refreshed_is_still_refreshed_once_after_its_401() {
+        // The gate found the vault already holding a fresh token (`AlreadyFresh`): this
+        // collection has not spent its one refresh, so that token's 401 still gets it (§8.3).
+        let fx = Fx::new();
+        let a = due(&fx);
+        fx.script_usage(401, refused());
+        fx.script_refresh(Some("rt-a3"));
+        fx.script_usage(200, usage_fixture());
+        let (kc, id) = (fx.kc.clone(), a.clone());
+        fx.engine.on_point(
+            "usage-before-gate",
+            Box::new(move || {
+                kc.put(SERVICE, id.as_str(), &credential("a@x.co", "rt-a2"));
+            }),
+        );
+
+        let report = fx.collect(&[&a]);
+
+        assert_eq!(report.outcomes, [(a.clone(), Collected::Recorded)]);
+        assert_eq!(usage_bearers(&fx), ["at-rt-a2", "at-rt-a3"]);
+        assert_eq!(
+            token_requests(&fx),
+            1,
+            "one refresh of this collection's own"
+        );
+    }
+
+    #[test]
+    fn a_stale_active_record_does_not_outrank_the_live_login() {
+        // After a Claude Code `/login` outside tagteam the store's record still names b while
+        // the live login names a. a's plan must use the active cadence (270), not the
+        // candidate's (450), and no switch committed meanwhile.
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b");
+        fx.engine
+            .store()
+            .unwrap()
+            .set_active(&fx.provider(), Some(&b))
+            .unwrap();
+        fx.login("a@x.co", "rt-a");
+        fx.script_usage(200, usage_fixture());
+
+        let report = fx.collect(&[&a]);
+
+        assert_eq!(report.outcomes, [(a.clone(), Collected::Recorded)]);
         assert_eq!(state(&fx, &a).poll_interval_s, Some(270));
     }
 }

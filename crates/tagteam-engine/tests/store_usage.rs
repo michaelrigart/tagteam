@@ -1225,3 +1225,48 @@ fn a_reading_stamped_in_the_future_counts_as_unread() {
         );
     }
 }
+
+#[test]
+fn a_schedule_written_under_a_clock_that_ran_ahead_does_not_lock_the_account_out() {
+    // C9 (§8.4): a reading recorded while the clock ran ahead also carries a future
+    // `next_poll_at`, and a failure a far `backoff_until`. No legal schedule reaches that far:
+    // the longest backoff is 4500 s (§8.5's 429 cap), the furthest plan an over-budget
+    // account's `next_free_at` (`count_window_s`), each plus the 60 s slack. Legal far values
+    // still block.
+    let (_d, path, s) = open();
+    let skew = B.count_window_s + 60;
+    let cases = [
+        // (fetched_at, backoff_until, next_poll_at, expected eligible)
+        (Some(T + 86_400), None, Some(T + 86_400 + 180), true),
+        (Some(T - 1_000), None, Some(T + B.count_window_s), false),
+        (Some(T - 1_000), None, Some(T + skew), false),
+        (Some(T - 1_000), None, Some(T + skew + 1), true),
+        (Some(T - 1_000), Some(T + 4_500), None, false),
+        (Some(T - 1_000), Some(T + 4_560), None, false),
+        (Some(T - 1_000), Some(T + 4_561), None, true),
+        (Some(T - 1_000), Some(T + 86_400), Some(T + 86_400), true),
+    ];
+    for (i, (fetched_at, backoff_until, next_poll_at, eligible)) in cases.into_iter().enumerate() {
+        let n = i as u32 + 1;
+        let id = add(&s, &cc(), &format!("a{n}"), &format!("a{n}@x.co"), n);
+        arrange(&path, &id, fetched_at, backoff_until, next_poll_at);
+        for on_demand in [true, false] {
+            let got = reserve(&s, &id, T_MS, on_demand);
+            assert_eq!(
+                matches!(got, Reserve::Reserved(_)),
+                eligible,
+                "case {i} on_demand {on_demand}: {got:?}"
+            );
+            if let Reserve::Reserved(r) = got {
+                // Free the lease and slot for the next mode.
+                s.release_slot(&r, &slot_of(&r)).unwrap();
+                raw(&path)
+                    .execute(
+                        "DELETE FROM leases WHERE name = ?1",
+                        [format!("usage:{id}")],
+                    )
+                    .unwrap();
+            }
+        }
+    }
+}
