@@ -2659,7 +2659,12 @@ handler only records the signal in the engine's cancel token (§4.2), which test
 - **A weekly CI job** installs the latest `claude` and runs the checks that need no account:
   version, the `auth status` shape when logged out, the top-level `~/.claude` entries against
   the known lists (§12.2), and the `CLAUDE_CODE_*` and `ANTHROPIC_*` names the binary contains
-  against the ones tagteam has classified (§12.5). It opens an issue on drift.
+  against the ones tagteam has classified (§12.5). It opens an issue on drift, or comments on
+  the open one when the report changes.
+  - A logged-out `claude` creates almost nothing in `~/.claude`. So before listing entries,
+    the job runs one headless `claude -p` with a dummy API key, which the API rejects.
+  - The tested version and the known lists live in `crates/tagteam-cc/compat/`, for `doctor`
+    to share.
 
 ## 16. Build, release, repository
 
@@ -2670,10 +2675,16 @@ handler only records the signal in the engine's cancel token (§4.2), which test
   (edition 2024, MSRV ≥ 1.85). mise respects that file.
 - **CI** (GitHub Actions) on `macos-latest` and `ubuntu-latest`: `cargo fmt --check`,
   `clippy -D warnings`, and `cargo test` (plus the `real_keychain` tests on macOS).
-- **Release.** `cargo-dist` builds `aarch64-apple-darwin` and `x86_64-apple-darwin` (merged into
-  a universal binary), `x86_64-unknown-linux-musl`, and `aarch64-unknown-linux-musl`. It
-  publishes GitHub Releases and the Homebrew tap `michaelrigart/homebrew-tap` (formula
-  `tagteam`).
+- **Release.** `cargo-dist` builds `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+  `x86_64-unknown-linux-musl`, and `aarch64-unknown-linux-musl`, one archive per target.
+  cargo-dist 0.33 cannot merge the two macOS builds into a universal binary; the Homebrew
+  formula picks the architecture. It publishes GitHub Releases and the Homebrew tap
+  `michaelrigart/homebrew-tap` (formula `tagteam`). Archives carry `LICENSE` and `NOTICE`.
+  - Every pull request builds all four targets without publishing.
+  - A smoke job gates publishing. On each musl target the binary must be statically linked,
+    run on Alpine, and round-trip the bundled SQLite store. An ignored live test, built for the
+    same target, proves the TLS platform verifier accepts a real chain and rejects an untrusted
+    root.
 - **Package names.** On crates.io, `tagteam` for the binary crate, plus the `tagteam-*` library
   crates. Name availability was checked on 2026-09-26: crates.io and Homebrew are free.
 
