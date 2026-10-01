@@ -834,6 +834,40 @@ pub fn announces_sleep(delay_s: i64, cfg: &AutoConfig) -> bool {
     delay_s as f64 > SLEEP_EVENT_INTERVALS * cfg.interval_s as f64
 }
 
+/// §11.4 `--once`: `0` switched, `2` no action, `3` blocked. A tick that failed has no
+/// decision; it exits `1`.
+pub fn once_exit_code(d: &Decision) -> i32 {
+    match d {
+        Decision::Switch { .. } => 0,
+        Decision::NoSwitch {
+            outcome: Outcome::NoAction,
+            ..
+        } => 2,
+        Decision::NoSwitch {
+            outcome: Outcome::Blocked,
+            ..
+        } => 3,
+    }
+}
+
+/// §11.1: `--once` with several providers exits with the most severe code, `1` (error) over `0`
+/// (switched) over `3` (blocked) over `2` (no action). Any other code outranks all four; no
+/// code at all is no action.
+pub fn most_severe(codes: &[i32]) -> i32 {
+    let severity = |code: i32| match code {
+        2 => 0,
+        3 => 1,
+        0 => 2,
+        1 => 3,
+        _ => 4,
+    };
+    codes
+        .iter()
+        .copied()
+        .max_by_key(|&code| severity(code))
+        .unwrap_or(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2310,5 +2344,41 @@ mod tests {
             accounts: back,
         };
         assert_eq!(stopped(&run(&s, &st, &cfg())).0, BelowThreshold);
+    }
+
+    #[test]
+    fn once_exits_0_on_a_switch_2_on_no_action_and_3_when_blocked() {
+        assert_eq!(once_exit_code(&a_switch()), 0);
+        for reason in [
+            BelowThreshold,
+            Cooldown,
+            EngineRunning,
+            LiveChanged,
+            StaleUsage,
+        ] {
+            assert_eq!(once_exit_code(&no_action(reason)), 2, "{reason:?}");
+        }
+        for reason in [
+            NoCandidates,
+            AllExhausted,
+            NoViableTarget,
+            InterruptedSwitch,
+        ] {
+            assert_eq!(once_exit_code(&blocked(reason, None)), 3, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn several_providers_exit_with_the_most_severe_code() {
+        assert_eq!(most_severe(&[2, 3, 0, 1]), 1);
+        assert_eq!(most_severe(&[2, 3, 0]), 0);
+        assert_eq!(most_severe(&[2, 3, 2]), 3);
+        assert_eq!(most_severe(&[2]), 2);
+        assert_eq!(most_severe(&[]), 2, "no provider ticked");
+        assert_eq!(
+            most_severe(&[1, 130, 0]),
+            130,
+            "an unexpected code is never hidden"
+        );
     }
 }

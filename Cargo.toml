@@ -41,6 +41,8 @@ uuid = { version = "1", features = ["v7"] }
 # test-only
 assert_cmd = "2"
 predicates = "3"
+# §11.5's simulations (tagteam-core only): std alone, without the fork and timeout features.
+proptest = { version = "1.11", default-features = false, features = ["std"] }
 tempfile = "3"
 
 [workspace.lints.rust]
