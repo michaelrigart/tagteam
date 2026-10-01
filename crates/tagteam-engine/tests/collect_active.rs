@@ -443,6 +443,8 @@ fn a_lock_file_that_cannot_be_opened_is_the_collections_error_not_a_silent_drop(
         "{result:?}"
     );
     assert!(fx.http.requests().is_empty(), "nothing was sent");
+    // A lasting fault must not spend the hourly budget one `list` at a time.
+    assert_eq!(usage_requests(&fx), 0, "the unsent slot went back");
 }
 
 #[test]

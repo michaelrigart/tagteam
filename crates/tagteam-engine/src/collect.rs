@@ -244,7 +244,8 @@ enum Stop {
     /// `authorize_send` or at the `rejected_fp` stamp): nothing is sent or recorded, and the
     /// unsent slot stays counted, as a failed fence writes nothing.
     LeaseLost,
-    /// The store or a test hook failed: returned, never recorded.
+    /// The store or a test hook failed: returned, never recorded. The unsent slot goes back,
+    /// best effort, so a lasting fault does not spend the hourly budget (§8.6).
     Error(EngineError),
 }
 
@@ -626,7 +627,8 @@ impl Collection<'_> {
     /// Phase 3 (§8.3), in a transaction fenced by the lease holder and the account's identity,
     /// so a late or superseded result is dropped. Success stores the reading, its samples and
     /// the next plan (§8.6). Failure never touches the last good reading, backs off (§8.5),
-    /// and gives back, by its full identity, a slot whose request was never sent.
+    /// and gives back, by its full identity, a slot whose request was never sent. So does an
+    /// error, best effort: a release that fails never masks it, and the lease expires as usual.
     fn record(mut self, fetched: Result<Vec<Window>, Stop>) -> Result<Outcome, EngineError> {
         hooks::point(self.engine, "usage-before-record")?;
         let now_s = self.now_s();
@@ -674,7 +676,12 @@ impl Collection<'_> {
                 Collected::Dropped
             }
             Err(Stop::LeaseLost) => Collected::Dropped,
-            Err(Stop::Error(e)) => return Err(e),
+            Err(Stop::Error(e)) => {
+                if let Some(slot) = self.slot.take() {
+                    let _ = self.store.release_slot(&self.reservation, &slot);
+                }
+                return Err(e);
+            }
         };
         Ok((collected, self.warnings))
     }
