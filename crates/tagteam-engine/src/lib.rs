@@ -2,6 +2,7 @@
 
 pub mod account_lock;
 pub mod active;
+pub mod auto;
 pub mod collect;
 mod displace;
 pub mod engine;

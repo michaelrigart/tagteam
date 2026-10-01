@@ -12,12 +12,13 @@ use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::shape::compose;
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, ProviderId, Window, WindowKind};
+use tagteam_engine::auto::{AutoEvent, EventSink};
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
-use tagteam_engine::store::{JournalRow, LoginMeta, NewAccount, Store};
+use tagteam_engine::store::{Eligibility, JournalRow, LoginMeta, NewAccount, Reserve, Store};
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
@@ -1413,4 +1414,70 @@ pub fn cc_marks_dead(live: &mut Value) {
 pub fn cc_marks_dead_and_more(live: &mut Value) {
     cc_marks_dead(live);
     live["trustedDeviceToken"] = json!("cc-device");
+}
+
+/// An auto-switch event sink that keeps every event it is given, in order (§11.4).
+#[derive(Default)]
+pub struct Recorded(Mutex<Vec<AutoEvent>>);
+
+impl EventSink for Recorded {
+    fn emit(&self, e: &AutoEvent) {
+        self.0.lock().unwrap().push(e.clone());
+    }
+}
+
+impl Recorded {
+    /// The events emitted since the last call, oldest first.
+    pub fn take(&self) -> Vec<AutoEvent> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+/// A usage window of `kind` at `pct` that resets at `resets_at`, labelled as Claude Code
+/// labels its windows (`scoped:Fable` is `Fable`).
+pub fn usage_window(key: &str, kind: WindowKind, pct: f64, resets_at: i64) -> Window {
+    Window {
+        key: key.into(),
+        label: key.strip_prefix("scoped:").unwrap_or(key).into(),
+        kind,
+        pct,
+        resets_at: Some(resets_at),
+        period_s: match kind {
+            WindowKind::Short => Some(18_000),
+            WindowKind::Spend => None,
+            _ => Some(604_800),
+        },
+        detail: None,
+    }
+}
+
+/// Records `windows` as `id`'s reading taken at `at` (epoch seconds), its next poll planned at
+/// `next_poll_at`, through `engine`'s store as the collector records one: reserve (§8.3 phase
+/// 1, which counts a slot of the hourly budget and leaves a 90 s lease), then record (phase 3).
+pub fn record_reading(
+    engine: &Engine,
+    id: &AccountId,
+    windows: &[Window],
+    at: i64,
+    next_poll_at: i64,
+) {
+    let store = engine.store().unwrap();
+    let row = store.account(id).unwrap().unwrap();
+    let r = match store
+        .reserve_usage(
+            &row,
+            at * 1000,
+            Eligibility::Scheduled,
+            &PollBudget::STANDARD,
+        )
+        .unwrap()
+    {
+        Reserve::Reserved(r) => r,
+        other => panic!("not reserved at {at}: {other:?}"),
+    };
+    let plan = PollPlan {
+        interval_s: next_poll_at - at,
+        next_poll_at,
+    };
+    assert!(store.record_usage(&r, windows, at, &plan, 180).unwrap());
 }

@@ -483,6 +483,21 @@ enum Freshened {
     Replan,
 }
 
+/// What freshening an automatic switch's target decided (§11.2 step 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AutoFreshened {
+    /// Perform the switch.
+    Ready,
+    /// A Dead verdict, an identity conflict or a lost successor: the gate has quarantined it
+    /// (§7.4). Try the next target.
+    Quarantined,
+    /// Transient or systemic, with what went wrong. Try the next target.
+    Failed(String),
+    /// Not a candidate after all: no stored credential, or owned by a session (§12.5). Try the
+    /// next target.
+    Skip,
+}
+
 fn needs_relogin(target: &AccountRow) -> EngineError {
     EngineError::NeedsRelogin {
         position: target.position,
@@ -1349,6 +1364,50 @@ impl Engine {
         })
     }
 
+    /// §11.2 step 10 for one target, before its switch takes `MutationGuard` (§7.2): a stored
+    /// token that expires within the freshen window is refreshed through the gate (§7.3),
+    /// and the gate's outcome is read by the auto-switch table. A kind that does not refresh
+    /// passes as it is, so API-key targets pass. The vault is read here, lazily (§9.3).
+    pub(crate) fn freshen_auto(
+        &self,
+        p: &dyn Provider,
+        target: &AccountRow,
+    ) -> Result<AutoFreshened, EngineError> {
+        if !p.kind_traits(&target.kind).refreshable {
+            return Ok(AutoFreshened::Ready);
+        }
+        let vault = match self.vault.read(&target.id) {
+            Read::Present(b) if !b.is_empty() => b,
+            Read::Unreadable(e) => return Ok(AutoFreshened::Failed(e.to_string())),
+            Read::Present(_) | Read::Absent => return Ok(AutoFreshened::Skip),
+        };
+        if !self.due(p, &vault) {
+            return Ok(AutoFreshened::Ready);
+        }
+        // §14.1: nothing is locked yet, so a signal that has landed stops the tick before it
+        // spends the target's refresh token.
+        self.check_cancel()?;
+        Ok(match self.refresh_stored(p, &target.id, &vault)? {
+            // Busy: another process is refreshing it now; the switch's account lock and its
+            // pending-rescue settle pick that refresh up, as for a manual switch (§7.2).
+            GateOutcome::Refreshed(_) | GateOutcome::AlreadyFresh(_) | GateOutcome::Busy => {
+                AutoFreshened::Ready
+            }
+            // It became the live login, or an unfinished switch names it: the switch's own
+            // checks under its locks decide (§9.4 step 1, §9.6).
+            GateOutcome::Owned(OwnedBy::Live | OwnedBy::Journal) => AutoFreshened::Ready,
+            GateOutcome::Dead(_) | GateOutcome::Unpersisted => AutoFreshened::Quarantined,
+            // The vault's generation is spent and its successor waits in `rescue/`: activating
+            // it would hand the agent a used refresh token. A later tick adopts the rescue.
+            GateOutcome::Transient { rescued: true, .. } => AutoFreshened::Failed(
+                "its refreshed token is in rescue/, not yet in the vault".into(),
+            ),
+            GateOutcome::Transient { kind, .. } => AutoFreshened::Failed(kind),
+            GateOutcome::Systemic(detail) => AutoFreshened::Failed(detail),
+            GateOutcome::Owned(OwnedBy::Session) | GateOutcome::Conflict => AutoFreshened::Skip,
+        })
+    }
+
     /// §5: with no store there is nothing to activate, and nothing is created; an unmanaged
     /// live login is still reported as one (§9.2).
     fn without_store(
@@ -1418,7 +1477,7 @@ impl Engine {
         let provider = self.provider(&req.provider)?;
         let p = provider.as_ref();
         if !req.force {
-            self.settle_or_refuse(&req.provider)?;
+            self.settle_or_refuse_as(&req.provider, req.source)?;
         }
         let Some(store) = self.existing_store()? else {
             return self.without_store(p, &req);
@@ -1453,7 +1512,7 @@ impl Engine {
         let guard = if req.force {
             self.mutation_guard()?
         } else {
-            self.guard_or_refuse(&req.provider)?
+            self.guard_or_refuse_as(&req.provider, req.source)?
         };
         for attempt in 1..=ATTEMPTS {
             if attempt > 1 {

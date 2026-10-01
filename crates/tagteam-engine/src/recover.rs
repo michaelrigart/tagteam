@@ -116,12 +116,13 @@ impl Engine {
     /// switch: the account locks of both accounts it names, then CC's locks. The live
     /// credential decides the direction; the row is cleared only once a fresh re-read of every
     /// surface names one account. Never writes an old credential back. An undecidable row
-    /// stays until `switch --force` settles it.
+    /// stays until `switch --force` settles it. A forward finish's event carries `source`.
     pub(crate) fn recover_one(
         &self,
         guard: &MutationGuard,
         row: &JournalRow,
         hints: &[OracleHint],
+        source: &'static str,
     ) -> Result<(), EngineError> {
         let provider = self.provider(&row.provider)?;
         let p = provider.as_ref();
@@ -141,7 +142,7 @@ impl Engine {
         let live = p.read_live_auth(&self.env);
         match self.direction(p, &store, row, &live, hints)? {
             Direction::Forward(fp) => {
-                self.finish_forward(p, &store, row, &accounts, &locks, &live, hints, &fp)
+                self.finish_forward(p, &store, row, &accounts, &locks, &live, hints, &fp, source)
             }
             Direction::Backward(fp) => self.finish_backward(p, &store, row, &locks, &live, &fp),
             Direction::Undecidable => Ok(()),
@@ -214,6 +215,7 @@ impl Engine {
         live: &LiveAuth,
         hints: &[OracleHint],
         established: &str,
+        source: &'static str,
     ) -> Result<(), EngineError> {
         let to = store
             .account(&row.to_id)?
@@ -296,7 +298,7 @@ impl Engine {
                 from_id: row.from_id.clone(),
                 to_id: Some(to.id.clone()),
                 trigger: Some("recovery".into()),
-                source: "cli".into(),
+                source: source.into(),
                 detail: None,
             },
             // Never an auto-switch record (Task 7's ruling): the row names neither the

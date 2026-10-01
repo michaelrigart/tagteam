@@ -682,6 +682,19 @@ impl Store {
         )?)
     }
 
+    /// When the account's usage lease expires, in epoch ms, while its row is there: a lease
+    /// outlives the record it fenced until it expires (§8.3).
+    pub fn usage_lease_expires_at(&self, id: &AccountId) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT expires_at FROM leases WHERE name = ?1",
+                [lease_name(id)],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// The provider's cached live identity. A row missing its path, mtime or size reads as
     /// no row: the caller re-parses the file.
     pub fn live_identity_cache(
