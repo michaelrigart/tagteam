@@ -1,0 +1,11 @@
+# Top-level entries of ~/.claude that stay private to a profile (spec 12.2).
+# Same format as known-shared: bare names, no trailing '/', '*' globs.
+.credentials.json
+.claude.json
+.config.json
+sessions
+ide
+backups
+.device-keys.json
+*.lock
+*.lock.owner
