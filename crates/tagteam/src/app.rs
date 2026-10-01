@@ -132,9 +132,10 @@ pub struct Io<'a> {
 }
 
 /// The engine for one command, and the settings warnings for the caller to print (§6.4). The
-/// HTTP adapter is built on its first request, never before (§13.5), and the oracle sends
-/// through the same one.
-fn build_engine(ctx: Context) -> (Engine, Vec<String>) {
+/// settings are those of `provider`, the one the command resolves (`--provider`, else the
+/// default): its own tables come first. The HTTP adapter is built on its first request, never
+/// before (§13.5), and the oracle sends through the same one.
+fn build_engine(ctx: Context, provider: &ProviderId) -> (Engine, Vec<String>) {
     let mut cc = ClaudeCode::new(ctx.keychain.clone(), ctx.platform);
     if let Some(base) = &ctx.api_base {
         cc = cc.with_endpoints(Endpoints::with_base(base));
@@ -155,7 +156,7 @@ fn build_engine(ctx: Context) -> (Engine, Vec<String>) {
         })
     }));
     let default_provider = ProviderId::new(CLAUDE_CODE);
-    let (settings, warnings) = Settings::load(&ctx.env, &default_provider);
+    let (settings, warnings) = Settings::load(&ctx.env, provider);
     let engine = Engine::new(EngineConfig {
         env: ctx.env,
         registry: ProviderRegistry::new().with(Arc::new(cc)),
@@ -296,7 +297,11 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
     let stdout_terminal = ctx.stdout_terminal;
-    let (engine, warnings) = build_engine(ctx);
+    let provider_flag = cli.provider.map(ProviderId::new);
+    let resolved = provider_flag
+        .clone()
+        .unwrap_or_else(|| ProviderId::new(CLAUDE_CODE));
+    let (engine, warnings) = build_engine(ctx, &resolved);
     for w in &warnings {
         let _ = writeln!(io.err, "warning: {w}");
     }
@@ -305,7 +310,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
         json,
         stdout_terminal,
         no_color: cli.no_color,
-        provider_flag: cli.provider.map(ProviderId::new),
+        provider_flag,
         keychain,
         io,
     };

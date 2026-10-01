@@ -915,7 +915,9 @@ fn settings_warnings_go_to_stderr_and_never_fail_the_command() {
     // §6.4: reads are forgiving. Each warning is one stderr line; stdout is unchanged, and
     // `--json` still prints exactly one object (§13.2).
     let h = H::new();
-    let (code, _, err) = h.run(&["list"], &mut Scripted::none());
+    h.login("a@x.co", "rt-a");
+    h.ok(&["add"]);
+    let (code, plain, err) = h.run(&["list"], &mut Scripted::none());
     assert_eq!((code, err.as_str()), (0, ""), "no config.toml, no warning");
 
     let dir = h.env.config_dir();
@@ -925,10 +927,42 @@ fn settings_warnings_go_to_stderr_and_never_fail_the_command() {
         let (_, warnings) = Settings::load(&h.env, &ProviderId::new(CLAUDE_CODE));
         assert_eq!(warnings.len(), 1, "{text:?}: {warnings:?}");
         let expected: String = warnings.iter().map(|w| format!("warning: {w}\n")).collect();
-        let (code, _, err) = h.run(&["list"], &mut Scripted::none());
+        let (code, out, err) = h.run(&["list"], &mut Scripted::none());
         assert_eq!((code, err.as_str()), (0, expected.as_str()), "{text:?}");
+        assert_eq!(out, plain, "{text:?}: stdout is unchanged");
         let (code, out, err) = h.run(&["--json", "list"], &mut Scripted::none());
         assert_eq!((code, err.as_str()), (0, expected.as_str()), "{text:?}");
         serde_json::from_str::<Value>(&out).expect("stdout stays one JSON object");
     }
+}
+
+#[test]
+fn settings_are_read_for_the_provider_the_command_resolves() {
+    // §6.4: a provider's own table comes first, and it is the resolved provider's: `--provider`,
+    // else the default. Only claude-code is registered, so another's table shows only in what
+    // is read for it: its invalid key warns, before the command refuses the provider.
+    let h = H::new();
+    let dir = h.env.config_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.toml"),
+        "[provider.other.autoswitch]\nthreshold = 5\n",
+    )
+    .unwrap();
+    let (code, _, err) = h.run(&["list"], &mut Scripted::none());
+    assert_eq!(
+        (code, err.as_str()),
+        (0, ""),
+        "the default provider's own tables only"
+    );
+    let (code, _, err) = h.run(&["list", "--provider", "other"], &mut Scripted::none());
+    assert_eq!(code, 1);
+    let mut lines = err.lines();
+    let warning = lines.next().unwrap();
+    assert!(
+        warning.starts_with("warning: ")
+            && warning.contains("`provider.other.autoswitch.threshold`"),
+        "{err}"
+    );
+    assert_eq!(lines.next(), Some("tagteam: unknown provider \"other\""));
 }
