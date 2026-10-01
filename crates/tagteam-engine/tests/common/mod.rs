@@ -1034,8 +1034,8 @@ impl FakeFx {
             oracle: fx.oracle.clone(),
             clock: fx.clock.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
-            settings: Settings::default(),
             http: fx.http.clone(),
+            settings: Settings::default(),
         });
         FakeFx { fx, fake, engine }
     }
