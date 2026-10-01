@@ -1,6 +1,7 @@
 //! Read-only `config.toml` (§6.4): the keys M2b consumes. `tagteam config` and its writes land
 //! in M5; this module only reads, and never fails: a missing file, a corrupt file and an invalid
 //! value each fall back to the default, the last two with a warning for the caller to print.
+//! Every warning names the full path of the settings file.
 
 use std::io::ErrorKind;
 
@@ -11,6 +12,25 @@ use toml_edit::{DocumentMut, Item, TableLike};
 pub const DEFAULT_THRESHOLD: f64 = 90.0;
 pub const DEFAULT_HISTORY_RETENTION_DAYS: u32 = 180;
 pub const DEFAULT_STATUSLINE_FORMAT: &str = "{account} · 5h {5h}% · 7d {7d}%{stale}";
+
+/// The statusline placeholders §13.5 defines, without their braces. `{model:<name>}` is the one
+/// parameterised placeholder; see [`is_statusline_placeholder`]. The `statusline.format` check
+/// and the statusline renderer share this list.
+pub const STATUSLINE_PLACEHOLDERS: &[&str] = &[
+    "account", "position", "email", "5h", "7d", "5h_reset", "7d_reset", "spend", "stale",
+];
+
+/// The prefix of the parameterised `{model:<name>}` placeholder.
+pub const STATUSLINE_MODEL_PREFIX: &str = "model:";
+
+/// Whether `name`, the text between a placeholder's braces, is one of §13.5's placeholders:
+/// one of [`STATUSLINE_PLACEHOLDERS`], or `model:` followed by a non-empty name.
+pub fn is_statusline_placeholder(name: &str) -> bool {
+    STATUSLINE_PLACEHOLDERS.contains(&name)
+        || name
+            .strip_prefix(STATUSLINE_MODEL_PREFIX)
+            .is_some_and(|model| !model.is_empty())
+}
 
 /// `ui.color`. `NO_COLOR`, `FORCE_COLOR` and `--no-color` are the CLI's to apply on top.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,8 +69,8 @@ impl Default for Settings {
 impl Settings {
     /// `env.config_dir()/config.toml`. Forgiving (§6.4): a missing file gives the defaults
     /// silently; a corrupt or unreadable file gives the defaults and one warning naming the
-    /// path; an invalid value gives its default and one warning naming the key. The rest of the
-    /// file still applies.
+    /// path; an invalid value gives its default and one warning naming the path and the key.
+    /// The rest of the file still applies.
     pub fn load(env: &Env, provider: &ProviderId) -> (Settings, Vec<String>) {
         let path = env.config_dir().join("config.toml");
         let text = match std::fs::read_to_string(&path) {
@@ -66,7 +86,7 @@ impl Settings {
             }
         };
         match text.parse::<DocumentMut>() {
-            Ok(doc) => from_document(&doc, provider),
+            Ok(doc) => from_document(&doc, &path.display().to_string(), provider),
             Err(_) => {
                 let warning = format!(
                     "{}: the settings file is not valid TOML; using the defaults",
@@ -80,6 +100,8 @@ impl Settings {
 
 struct Reader<'a> {
     doc: &'a DocumentMut,
+    /// The settings file's full path, which every warning starts with.
+    path: &'a str,
     warnings: Vec<String>,
 }
 
@@ -101,7 +123,10 @@ impl<'a> Reader<'a> {
                 Some(table) => current = table,
                 None => {
                     let dotted = path[..=depth].join(".");
-                    self.warn(format!("config.toml: `{dotted}` must be a table (ignored)"));
+                    self.warn(format!(
+                        "{}: `{dotted}` must be a table (ignored)",
+                        self.path
+                    ));
                     return None;
                 }
             }
@@ -134,7 +159,7 @@ impl<'a> Reader<'a> {
                         .chain([key])
                         .collect::<Vec<_>>()
                         .join(".");
-                    self.warn(format!("config.toml: `{dotted}` {expect} (ignored)"));
+                    self.warn(format!("{}: `{dotted}` {expect} (ignored)", self.path));
                 }
             }
         }
@@ -142,10 +167,11 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn from_document(doc: &DocumentMut, provider: &ProviderId) -> (Settings, Vec<String>) {
+fn from_document(doc: &DocumentMut, path: &str, provider: &ProviderId) -> (Settings, Vec<String>) {
     let defaults = Settings::default();
     let mut reader = Reader {
         doc,
+        path,
         warnings: Vec::new(),
     };
     let global_autoswitch: &[&str] = &["autoswitch"];
@@ -165,7 +191,7 @@ fn from_document(doc: &DocumentMut, provider: &ProviderId) -> (Settings, Vec<Str
         .read(
             &[&provider_autoswitch[..], global_autoswitch],
             "models",
-            "must be a model name or a list of model names",
+            "must be a model name, a list of model names, or [\"all\"] alone",
             parse_models,
         )
         .unwrap_or(defaults.models);
@@ -177,11 +203,19 @@ fn from_document(doc: &DocumentMut, provider: &ProviderId) -> (Settings, Vec<Str
             parse_retention,
         )
         .unwrap_or(defaults.history_retention_days);
+    let format_expect = format!(
+        "must be a non-empty string using only the placeholders {} and {{{STATUSLINE_MODEL_PREFIX}<name>}}, each closed",
+        STATUSLINE_PLACEHOLDERS
+            .iter()
+            .map(|name| format!("{{{name}}}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     let statusline_format = reader
         .read(
             &[&provider_statusline[..], global_statusline],
             "format",
-            "must be a non-empty string",
+            &format_expect,
             parse_format,
         )
         .unwrap_or(defaults.statusline_format);
@@ -217,14 +251,28 @@ fn parse_retention(item: &Item) -> Option<u32> {
         .filter(|days| (1..=3650).contains(days))
 }
 
+/// A model name or a list of them. Names are trimmed; a name repeated in another case collapses
+/// into its first spelling. `all` (any case) cannot be mixed with names.
 fn parse_models(item: &Item) -> Option<Vec<String>> {
-    if let Some(one) = item.as_str() {
-        return name(one).map(|n| vec![n]);
+    let names: Vec<String> = match item.as_str() {
+        Some(one) => vec![name(one)?],
+        None => item
+            .as_array()?
+            .iter()
+            .map(|v| v.as_str().and_then(name))
+            .collect::<Option<_>>()?,
+    };
+    let mut unique: Vec<String> = Vec::with_capacity(names.len());
+    for candidate in names {
+        if !unique
+            .iter()
+            .any(|n| n.to_lowercase() == candidate.to_lowercase())
+        {
+            unique.push(candidate);
+        }
     }
-    item.as_array()?
-        .iter()
-        .map(|v| v.as_str().and_then(name))
-        .collect()
+    let mixed = unique.len() > 1 && unique.iter().any(|n| n.eq_ignore_ascii_case("all"));
+    (!mixed).then_some(unique)
 }
 
 fn name(s: &str) -> Option<String> {
@@ -232,9 +280,22 @@ fn name(s: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+/// A non-empty format whose every `{…}` is one of §13.5's placeholders. The scan is the
+/// renderer's: a `{` runs to the next `}`, and an unclosed `{` is invalid.
 fn parse_format(item: &Item) -> Option<String> {
     let s = item.as_str()?;
-    (!s.trim().is_empty()).then(|| s.to_owned())
+    if s.trim().is_empty() {
+        return None;
+    }
+    let mut rest = s;
+    while let Some(open) = rest.find('{') {
+        let close = open + rest[open..].find('}')?;
+        if !is_statusline_placeholder(&rest[open + 1..close]) {
+            return None;
+        }
+        rest = &rest[close + 1..];
+    }
+    Some(s.to_owned())
 }
 
 fn parse_color(item: &Item) -> Option<ColorMode> {
