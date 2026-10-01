@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/michaelrigart/tagteam"
+homepage = "https://github.com/michaelrigart/tagteam"
 
 [workspace.dependencies]
 tagteam-core = { path = "crates/tagteam-core", version = "0.1.0" }
@@ -50,3 +51,8 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
+
+# The profile that dist builds release binaries with
+[profile.dist]
+inherits = "release"
+lto = "thin"

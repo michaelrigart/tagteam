@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 
 [features]
 # Test support for driving the real binary: file-backed fake Keychain, crash points, and
