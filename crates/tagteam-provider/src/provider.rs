@@ -5,12 +5,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use tagteam_core::backoff::parse_retry_after;
+use tagteam_core::usage::Window;
 use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 
 use crate::credential::{Credential, FreshCredential};
 use crate::env::Env;
 use crate::flock::MutationGuard;
-use crate::http::Http;
+use crate::http::{Http, HttpError, HttpResponse};
 use crate::keychain::KeychainError;
 use crate::mkdir_lock::LockError;
 use crate::read::{Read, ReadError};
@@ -397,6 +399,55 @@ impl fmt::Debug for RefreshResult {
             RefreshResult::Dead(r) => f.debug_tuple("Dead").field(r).finish(),
             RefreshResult::Systemic(m) => f.debug_tuple("Systemic").field(m).finish(),
             RefreshResult::Transient(k) => f.debug_tuple("Transient").field(k).finish(),
+        }
+    }
+}
+
+/// The provider's verdict on one usage request (§8.1). The engine owns the budget, the lease,
+/// the token and what is recorded (§8.3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsageResult {
+    /// 200 with a recognised body. Empty means "no usage" (§8.2).
+    Windows(Vec<Window>),
+    /// The credential has no access token; no request was sent (§8.1).
+    NoAccessToken,
+    /// 401 (§8.1: the caller decides between the gate and §7.5).
+    Unauthorized,
+    /// Anything else: `Http(429)` carries `retry_after_s`.
+    Failed {
+        kind: TransientKind,
+        retry_after_s: Option<f64>,
+    },
+}
+
+impl UsageResult {
+    /// §8.1's verdict on one usage reply. A 200 whose body `normalize` accepts is `Windows`,
+    /// empty when it names no window (§8.2); a 200 that is not JSON, or that `normalize`
+    /// rejects, is `bad-response`. A 401 is the caller's to handle (§8.1). Any other status is
+    /// `Http(status)` with `Retry-After` in its seconds form, when there is one (§8.1, §8.5).
+    pub fn from_reply(
+        reply: Result<HttpResponse, HttpError>,
+        normalize: impl FnOnce(&Value) -> Option<Vec<Window>>,
+    ) -> UsageResult {
+        let failed = |kind| UsageResult::Failed {
+            kind,
+            retry_after_s: None,
+        };
+        let resp = match reply {
+            Ok(r) => r,
+            Err(HttpError::PreSend(_)) => return failed(TransientKind::PreSend),
+            Err(HttpError::Ambiguous(_)) => return failed(TransientKind::Ambiguous),
+        };
+        match resp.status {
+            200 => match resp.json().as_ref().and_then(normalize) {
+                Some(windows) => UsageResult::Windows(windows),
+                None => failed(TransientKind::BadResponse),
+            },
+            401 => UsageResult::Unauthorized,
+            status => UsageResult::Failed {
+                kind: TransientKind::Http(status),
+                retry_after_s: resp.header("retry-after").and_then(parse_retry_after),
+            },
         }
     }
 }
