@@ -140,7 +140,7 @@ fn jittered(interval_s: i64, jitter: f64, frac: f64) -> i64 {
 ///    ignored. When the cap and the floor disagree, the floor wins.
 ///
 /// The urgent floor (60 s) survives rule 4 on purpose: an exhausted active account that just
-/// moved and whose window resets within a minute is polled right after the reset
+/// moved and whose window resets before `now + 120` is polled right after the reset
 /// (`reset + 60`), not 180 s later, because the reset is when it becomes usable again.
 pub fn plan_after_fetch(b: &PollBudget, i: &PollInputs, jitter: f64) -> PollPlan {
     let default_s = b.default_interval_s(i.active);
