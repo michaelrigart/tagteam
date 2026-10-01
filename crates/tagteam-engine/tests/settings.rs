@@ -212,11 +212,35 @@ fn another_providers_override_does_not_apply() {
 
 #[test]
 fn a_providers_override_without_the_key_leaves_the_global_value() {
-    let (settings, _) = load(
-        "[autoswitch]\nmodels = [\"Opus\"]\n\n[provider.claude-code.autoswitch]\nthreshold = 70\n",
+    let (settings, warnings) = load(
+        "[autoswitch]\nmodels = [\"Opus\"]\nthreshold = 80\n\n[provider.claude-code.autoswitch]\nmodels = [\"Fable\"]\n",
     );
-    assert_eq!(settings.models, models(&["Opus"]));
-    assert_eq!(settings.threshold, 90.0, "threshold is not provider-scoped");
+    assert_eq!(settings.models, models(&["Fable"]));
+    assert_eq!(settings.threshold, 80.0);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_providers_own_threshold_overrides_the_global_one() {
+    let text =
+        "[autoswitch]\nthreshold = 80\n\n[provider.claude-code.autoswitch]\nthreshold = 70\n";
+    let (settings, warnings) = load(text);
+    assert_eq!(settings.threshold, 70.0);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(load_as(text, "fake-agent").0.threshold, 80.0);
+}
+
+#[test]
+fn an_invalid_provider_threshold_warns_and_the_global_value_applies() {
+    let (settings, warnings) = load(
+        "[autoswitch]\nthreshold = 80\n\n[provider.claude-code.autoswitch]\nthreshold = 120\n",
+    );
+    assert_eq!(settings.threshold, 80.0);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`provider.claude-code.autoswitch.threshold`"),
+        "{warnings:?}"
+    );
 }
 
 #[test]

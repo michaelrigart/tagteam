@@ -22,7 +22,7 @@ pub enum ColorMode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
-    /// `autoswitch.threshold`: 50–99.9.
+    /// `autoswitch.threshold`: 50–99.9. The provider's own table first.
     pub threshold: f64,
     /// `autoswitch.models`: model display names, or `all`. The provider's own table first.
     pub models: Vec<String>,
@@ -155,7 +155,7 @@ fn from_document(doc: &DocumentMut, provider: &ProviderId) -> (Settings, Vec<Str
 
     let threshold = reader
         .read(
-            &[global_autoswitch],
+            &[&provider_autoswitch[..], global_autoswitch],
             "threshold",
             "must be a number from 50 to 99.9",
             parse_threshold,
