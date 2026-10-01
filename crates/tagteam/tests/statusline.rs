@@ -133,6 +133,30 @@ fn the_format_and_colour_come_from_config_toml() {
 }
 
 #[test]
+fn an_invalid_format_falls_back_to_the_default_line() {
+    // §6.4: the invalid value reads as its default, and a status bar has nowhere to show the
+    // warning, so stderr stays empty.
+    let (d, _, _) = managed(0);
+    for format in [
+        "{nope}",
+        "{5h",
+        "{model:}",
+        "{model: Fable}",
+        "{account} {model:{5h}",
+    ] {
+        write_config(
+            d.path(),
+            &format!("[statusline]\nformat = {format:?}\n\n[ui]\ncolor = \"never\"\n"),
+        );
+        statusline(d.path())
+            .assert()
+            .success()
+            .stdout("b · 5h 9% · 7d 77%\n")
+            .stderr("");
+    }
+}
+
+#[test]
 fn a_stale_reading_says_how_old_it_is() {
     let (d, _, _) = managed(20 * 60);
     statusline(d.path())
