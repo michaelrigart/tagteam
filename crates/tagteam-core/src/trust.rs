@@ -10,9 +10,10 @@ pub const TRUST_MAX_AGE_S: i64 = 3600;
 /// `fetched_at` plus this.
 pub const POST_429_TRUST_CAP_S: i64 = 7200;
 
-/// A `fetched_at` this far ahead of `now` is clock skew we tolerate (the reading counts as taken
-/// now); any further ahead is not a usable age (§8.4). Shared by trust, the re-plan and the
-/// store's reserve eligibility.
+/// A `fetched_at` this far ahead of `now` is clock skew we tolerate: trust counts the reading as
+/// fresh and the re-plan plans from the stamp itself. Any further ahead is not a usable age
+/// (§8.4): it is not decision-grade and the re-plan treats the stamp as `now`. Shared by trust,
+/// the re-plan and the store's reserve eligibility.
 pub const FUTURE_STAMP_SLACK_S: i64 = 60;
 
 /// Whether a reading's `fetched_at` is more than [`FUTURE_STAMP_SLACK_S`] after `now_s`.

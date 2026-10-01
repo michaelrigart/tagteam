@@ -381,7 +381,8 @@ mod tests {
     fn a_non_finite_pct_reads_as_no_reading() {
         // `1e999` is valid JSON that overflows an f64. Parsing it as a number at all relies on
         // serde_json's `arbitrary_precision` feature (enabled in the workspace manifest), which
-        // keeps the digits; `as_f64` then gives infinity, which must read as no reading.
+        // keeps the digits; `as_f64` then returns `None` for it (not infinity), so the window has
+        // no `pct` and the whole reading reads as no reading.
         let v: Value = serde_json::from_str(
             r#"[{"key": "5h", "label": "5h", "kind": "short", "pct": 1e999}]"#,
         )

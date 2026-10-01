@@ -32,9 +32,10 @@ pub fn parse_retry_after(value: &str) -> Option<f64> {
     (!seconds.is_nan()).then_some(seconds)
 }
 
-/// §8.5. `consecutive_failures` counts this failure (≥ 1; 0 is treated as 1). A non-finite
-/// `retry_after_s` is clamped to the cap; a negative or NaN one is ignored. Returns whole
-/// seconds, never negative.
+/// §8.5. `consecutive_failures` counts this failure (≥ 1; 0 is treated as 1). An infinite
+/// `retry_after_s` is clamped to the cap; a NaN one is ignored, and so is a negative one except
+/// on a 429, where any value below 1 s (negative included) takes the 300 s minimum. Returns
+/// whole seconds, never negative.
 pub fn failure_backoff_s(
     consecutive_failures: u32,
     is_429: bool,
@@ -45,9 +46,10 @@ pub fn failure_backoff_s(
     let cap = if is_429 { CAP_429_S } else { CAP_OTHER_S };
 
     let asked = match retry_after_s {
-        Some(r) if r.is_nan() || r < 0.0 => 0.0,
-        Some(r) if !r.is_finite() => cap,
+        Some(r) if r.is_nan() => 0.0,
         Some(r) if is_429 && r < 1.0 => ZERO_RETRY_AFTER_FLOOR_S,
+        Some(r) if r < 0.0 => 0.0,
+        Some(r) if !r.is_finite() => cap,
         Some(r) if is_429 && r > LONG_RETRY_AFTER_S => r + LONG_RETRY_AFTER_MARGIN_S,
         Some(r) => r,
         None => 0.0,
@@ -218,8 +220,21 @@ mod tests {
     }
 
     #[test]
+    fn on_a_429_a_negative_retry_after_below_one_second_takes_the_same_minimum() {
+        assert_eq!(failure_backoff_s(1, true, Some(-0.5)), 300);
+        assert_eq!(failure_backoff_s(1, true, Some(-5.0)), 300);
+        assert_eq!(failure_backoff_s(1, true, Some(f64::NEG_INFINITY)), 300);
+        assert_eq!(failure_backoff_s(1, false, Some(-0.5)), 30);
+    }
+
+    #[test]
+    fn a_nan_retry_after_is_ignored() {
+        assert_eq!(failure_backoff_s(1, true, Some(f64::NAN)), 30);
+        assert_eq!(failure_backoff_s(1, false, Some(f64::NAN)), 30);
+    }
+
+    #[test]
     fn a_negative_or_nan_retry_after_is_ignored() {
-        assert_eq!(failure_backoff_s(1, true, Some(-5.0)), 30);
         assert_eq!(failure_backoff_s(1, true, Some(f64::NAN)), 30);
         assert_eq!(failure_backoff_s(2, false, Some(-1.0)), 60);
     }
