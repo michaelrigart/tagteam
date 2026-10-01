@@ -1,17 +1,33 @@
-//! Read-only `config.toml` (§6.4): the keys M2b consumes. `tagteam config` and its writes land
-//! in M5; this module only reads, and never fails: a missing file, a corrupt file and an invalid
-//! value each fall back to the default, the last two with a warning for the caller to print.
-//! Every warning names the full path of the settings file.
+//! Read-only `config.toml` (§6.4): the keys M2b and M3 consume. `tagteam config` and its writes
+//! land in M5; this module only reads, and never fails: a missing file, a corrupt file and an
+//! invalid value each fall back to the default, the last two with a warning for the caller to
+//! print. Every warning names the full path of the settings file.
 
 use std::io::ErrorKind;
+use std::ops::RangeInclusive;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 use tagteam_core::ProviderId;
+use tagteam_core::autoswitch::Strategy;
 use tagteam_provider::Env;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 pub const DEFAULT_THRESHOLD: f64 = 90.0;
+pub const DEFAULT_INTERVAL_SECONDS: i64 = 60;
+pub const DEFAULT_COOLDOWN_SECONDS: i64 = 300;
+pub const DEFAULT_HYSTERESIS_PCT: f64 = 10.0;
+pub const DEFAULT_UNHEALTHY_TICKS: u32 = 3;
 pub const DEFAULT_HISTORY_RETENTION_DAYS: u32 = 180;
 pub const DEFAULT_STATUSLINE_FORMAT: &str = "{account} · 5h {5h}% · 7d {7d}%{stale}";
+
+/// §6.4's valid ranges. A value in the file outside its range falls back to the default, with a
+/// warning; a CLI flag is clamped into it.
+pub const THRESHOLD_RANGE: RangeInclusive<f64> = 50.0..=99.9;
+pub const INTERVAL_SECONDS_RANGE: RangeInclusive<i64> = 15..=3600;
+pub const COOLDOWN_SECONDS_RANGE: RangeInclusive<i64> = 0..=86_400;
+pub const HYSTERESIS_PCT_RANGE: RangeInclusive<f64> = 0.0..=50.0;
+pub const UNHEALTHY_TICKS_RANGE: RangeInclusive<u32> = 1..=100;
 
 /// The statusline placeholders §13.5 defines, without their braces. `{model:<name>}` is the one
 /// parameterised placeholder; see [`is_statusline_placeholder`]. The `statusline.format` check
@@ -43,11 +59,25 @@ pub enum ColorMode {
     Never,
 }
 
+/// Every `autoswitch.*` key is read from the provider's own table first, then from
+/// `[autoswitch]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
-    /// `autoswitch.threshold`: 50–99.9. The provider's own table first.
+    /// `autoswitch.threshold`: 50–99.9.
     pub threshold: f64,
-    /// `autoswitch.models`: model display names, or `all`. The provider's own table first.
+    /// `autoswitch.interval_seconds`: 15–3600.
+    pub interval_seconds: i64,
+    /// `autoswitch.cooldown_seconds`: 0–86400.
+    pub cooldown_seconds: i64,
+    /// `autoswitch.hysteresis_pct`: 0–50.
+    pub hysteresis_pct: f64,
+    /// `autoswitch.strategy`: `best` or `consume-first`.
+    pub strategy: Strategy,
+    /// `autoswitch.include_api_key_accounts`.
+    pub include_api_key_accounts: bool,
+    /// `autoswitch.unhealthy_ticks`: 1–100.
+    pub unhealthy_ticks: u32,
+    /// `autoswitch.models`: model display names, or `all`.
     pub models: Vec<String>,
     /// `usage.history_retention_days`: 1–3650.
     pub history_retention_days: u32,
@@ -61,6 +91,12 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             threshold: DEFAULT_THRESHOLD,
+            interval_seconds: DEFAULT_INTERVAL_SECONDS,
+            cooldown_seconds: DEFAULT_COOLDOWN_SECONDS,
+            hysteresis_pct: DEFAULT_HYSTERESIS_PCT,
+            strategy: Strategy::Best,
+            include_api_key_accounts: false,
+            unhealthy_ticks: DEFAULT_UNHEALTHY_TICKS,
             models: Vec::new(),
             history_retention_days: DEFAULT_HISTORY_RETENTION_DAYS,
             statusline_format: DEFAULT_STATUSLINE_FORMAT.to_owned(),
@@ -75,7 +111,7 @@ impl Settings {
     /// path; an invalid value gives its default and one warning naming the path and the key.
     /// The rest of the file still applies.
     pub fn load(env: &Env, provider: &ProviderId) -> (Settings, Vec<String>) {
-        let path = env.config_dir().join("config.toml");
+        let path = path(env);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == ErrorKind::NotFound => return (Settings::default(), Vec::new()),
@@ -98,6 +134,28 @@ impl Settings {
                 (Settings::default(), vec![warning])
             }
         }
+    }
+
+    /// `config.toml`'s modification time; `None` when the file is missing or its metadata
+    /// cannot be read. A running `auto` re-reads the settings before a tick whenever this
+    /// changes (§11.4). Read it before `load`, so a write landing between the two counts as
+    /// one more change at the next check rather than going unseen.
+    pub fn mtime(env: &Env) -> Option<SystemTime> {
+        std::fs::metadata(path(env)).and_then(|m| m.modified()).ok()
+    }
+}
+
+fn path(env: &Env) -> PathBuf {
+    env.config_dir().join("config.toml")
+}
+
+/// §6.4's booleans: `true`, `false`, `1`, `0`, `yes` and `no`, exactly. The file also takes a
+/// TOML boolean and the integers 1 and 0; a flag's value is the words alone.
+pub fn parse_bool(s: &str) -> Option<bool> {
+    match s {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
     }
 }
 
@@ -182,17 +240,77 @@ fn from_document(doc: &DocumentMut, path: &str, provider: &ProviderId) -> (Setti
     let provider_autoswitch = ["provider", provider.as_str(), "autoswitch"];
     let provider_statusline = ["provider", provider.as_str(), "statusline"];
 
+    let autoswitch: &[&[&str]] = &[&provider_autoswitch[..], global_autoswitch];
+
     let threshold = reader
         .read(
-            &[&provider_autoswitch[..], global_autoswitch],
+            autoswitch,
             "threshold",
             "must be a number from 50 to 99.9",
-            parse_threshold,
+            |item| number(item).filter(|v| THRESHOLD_RANGE.contains(v)),
         )
         .unwrap_or(defaults.threshold);
+    let interval_seconds = reader
+        .read(
+            autoswitch,
+            "interval_seconds",
+            "must be a whole number of seconds from 15 to 3600",
+            |item| {
+                item.as_integer()
+                    .filter(|v| INTERVAL_SECONDS_RANGE.contains(v))
+            },
+        )
+        .unwrap_or(defaults.interval_seconds);
+    let cooldown_seconds = reader
+        .read(
+            autoswitch,
+            "cooldown_seconds",
+            "must be a whole number of seconds from 0 to 86400",
+            |item| {
+                item.as_integer()
+                    .filter(|v| COOLDOWN_SECONDS_RANGE.contains(v))
+            },
+        )
+        .unwrap_or(defaults.cooldown_seconds);
+    let hysteresis_pct = reader
+        .read(
+            autoswitch,
+            "hysteresis_pct",
+            "must be a number from 0 to 50",
+            |item| number(item).filter(|v| HYSTERESIS_PCT_RANGE.contains(v)),
+        )
+        .unwrap_or(defaults.hysteresis_pct);
+    let strategy = reader
+        .read(
+            autoswitch,
+            "strategy",
+            "must be \"best\" or \"consume-first\"",
+            |item| Strategy::parse(item.as_str()?),
+        )
+        .unwrap_or(defaults.strategy);
+    let include_api_key_accounts = reader
+        .read(
+            autoswitch,
+            "include_api_key_accounts",
+            "must be true, false, 1, 0, yes or no",
+            parse_bool_item,
+        )
+        .unwrap_or(defaults.include_api_key_accounts);
+    let unhealthy_ticks = reader
+        .read(
+            autoswitch,
+            "unhealthy_ticks",
+            "must be a whole number of ticks from 1 to 100",
+            |item| {
+                u32::try_from(item.as_integer()?)
+                    .ok()
+                    .filter(|n| UNHEALTHY_TICKS_RANGE.contains(n))
+            },
+        )
+        .unwrap_or(defaults.unhealthy_ticks);
     let models = reader
         .read(
-            &[&provider_autoswitch[..], global_autoswitch],
+            autoswitch,
             "models",
             "must be a model name, a list of model names, or [\"all\"] alone",
             parse_models,
@@ -233,6 +351,12 @@ fn from_document(doc: &DocumentMut, path: &str, provider: &ProviderId) -> (Setti
 
     let settings = Settings {
         threshold,
+        interval_seconds,
+        cooldown_seconds,
+        hysteresis_pct,
+        strategy,
+        include_api_key_accounts,
+        unhealthy_ticks,
         models,
         history_retention_days,
         statusline_format,
@@ -241,11 +365,23 @@ fn from_document(doc: &DocumentMut, path: &str, provider: &ProviderId) -> (Setti
     (settings, reader.warnings)
 }
 
-fn parse_threshold(item: &Item) -> Option<f64> {
-    let value = item
-        .as_float()
-        .or_else(|| item.as_integer().map(|i| i as f64))?;
-    (50.0..=99.9).contains(&value).then_some(value)
+/// A float or an integer. A non-finite float is never in a range, so it is rejected there.
+fn number(item: &Item) -> Option<f64> {
+    item.as_float()
+        .or_else(|| item.as_integer().map(|i| i as f64))
+}
+
+/// A TOML boolean, the integer 1 or 0, or one of `parse_bool`'s words.
+fn parse_bool_item(item: &Item) -> Option<bool> {
+    if let Some(b) = item.as_bool() {
+        return Some(b);
+    }
+    match item.as_integer() {
+        Some(1) => Some(true),
+        Some(0) => Some(false),
+        Some(_) => None,
+        None => parse_bool(item.as_str()?),
+    }
 }
 
 fn parse_retention(item: &Item) -> Option<u32> {

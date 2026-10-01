@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod autoswitch;
 pub mod backoff;
 pub mod classify;
 pub mod fingerprint;
