@@ -10,7 +10,8 @@ Gemini CLI or Grok).
 **Reference implementation.** [realiti4/claude-swap](https://github.com/realiti4/claude-swap)
 (MIT) at commit `9aa6d02` (v0.27.0b1). Citations take the form `cswap:<file>:<line>` and are
 relative to `src/claude_swap/`. Claude Code facts were verified against Claude Code
-**2.1.283**, except where marked *inferred*.
+**2.1.283**, and re-verified against **2.1.286** on 2026-10-01 for parallel sessions (§12,
+Appendix A), except where marked *inferred*.
 
 ---
 
@@ -81,9 +82,12 @@ tagteam is public OSS under the MIT license, built for macOS and Linux.
 | Login epoch | A per-account counter that every explicit login replacement increments (§12.5) |
 | Vault | tagteam's per-account secret storage |
 | Profile | A per-account CC config dir used by `tagteam run` |
+| Profile marker | `<profile>/.tagteam-profile.json`: the profile's account, its exported config-dir spelling, and the outer home it shares from (§12.2) |
+| Run shell | A process whose `CLAUDE_CONFIG_DIR` names a directory holding a profile marker: `claude` under `tagteam run`, and everything it spawns (§12.8) |
 | Launch reservation | tagteam's own record of a `run` in progress, written before `claude` starts and removed after exit handling (§12.5) |
 | Quiescent | A profile with no live launch reservation, and no live or unreadable session record |
 | Session-owned | An account whose profile is not quiescent |
+| Activation epoch | The login epoch an account had when tagteam last made it the live login, kept with the store's active account (§6.1, §12.5) |
 | Account lock | The per-account `flock` that every vault write for that account holds (§6.2) |
 
 ## 3. The local-state invariant (hard requirement)
@@ -178,7 +182,9 @@ impl Engine {
   config lock (`ConfigLock`) only from held `CredLocks`. `LiveLocks` is the pair: a switch and
   a recovery take both, while the active-token refresh (§7.5) holds only the credential locks
   across its request and takes the config lock after it. For Claude Code the credential locks
-  are the refresh and legacy locks, and the config lock is `~/.claude.json.lock` (§9.1).
+  are the refresh and legacy locks, and the config lock is `~/.claude.json.lock` (§9.1). CC's
+  storage-write lock is a leaf: it is taken only under the credential locks, held only around
+  one credential entry's write, and nothing else is taken while it is held (§9.1).
   Order: tagteam mutation lock → account locks (ascending account ID) → provider live locks
   (credential locks → config lock). Any prefix may be skipped, but a lock is never taken while
   holding one that comes later: in particular, `MutationGuard` is never taken while holding an
@@ -267,11 +273,12 @@ pub trait Provider: Send + Sync {
 
     // Parallel sessions
     fn launch_command(&self) -> &'static str;         // "claude"
-    fn session_env(&self, profile: &Path) -> SessionEnv;   // vars to set and vars to scrub
-    fn share_policy(&self, env: &Env) -> SharePolicy;      // source home + denylist (§12.2)
+    fn session_env(&self, profile: &ProfileDir) -> SessionEnv;  // vars to set and to scrub (§12.5)
+    fn outer_home(&self, env: &Env) -> OuterHome;     // the home vars a profile records (§12.2, §12.8)
+    fn share_policy(&self, env: &Env) -> SharePolicy;      // source home + allowlist + private list (§12.2)
     fn seed_profile / capture_profile / merge_back(...);   // §12.3–12.5
-    fn session_records(&self, profile: &Path) -> Read<Vec<SessionRecord>>;
-    fn validate_profile(&self, profile: &Path) -> Validity;
+    fn session_records(&self, profile: &ProfileDir) -> Read<Vec<SessionRecord>>;
+    fn validate_profile(&self, profile: &ProfileDir) -> Validity;  // §12.3 step 8's outcomes
 
     // Diagnostics
     fn doctor_checks(&self, env: &Env) -> Vec<Check>;
@@ -331,7 +338,7 @@ mode 0700, so a command that changes nothing creates nothing.
 | Vault (Linux) | `$XDG_DATA_HOME/tagteam/vault/<id>.json`, `<id>.prev.json` |
 | Rescued successors | `$XDG_DATA_HOME/tagteam/rescue/<id>-<epoch>-<fp12>.json` |
 | Displaced foreign credentials | `$XDG_DATA_HOME/tagteam/displaced/<epoch>-<fp12>-<rand6>.json` |
-| Session profiles | `$XDG_DATA_HOME/tagteam/sessions/<id>/`, with its provenance (login epoch and seed generation) in `<profile>/.tagteam-seed.json` |
+| Session profiles | `$XDG_DATA_HOME/tagteam/sessions/<id>/`, with its marker in `<profile>/.tagteam-profile.json` (§12.2), its provenance (login epoch and seed generation) in `<profile>/.tagteam-seed.json`, and the links tagteam made in `<profile>/.tagteam-links.json` |
 | Launch reservations | `<profile>/.tagteam-launch/<pid>.lock` |
 | Mutation lock | `$XDG_DATA_HOME/tagteam/.mutation.lock` |
 | Account locks | `$XDG_DATA_HOME/tagteam/locks/<id>.lock` |
@@ -388,7 +395,8 @@ CREATE TABLE accounts (
 
 CREATE TABLE active_accounts (  -- the store's active account per provider (§9.4 step 9); the live identity wins if they disagree
   provider   TEXT PRIMARY KEY,
-  account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL
+  account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+  login_epoch INTEGER           -- activation epoch: account_id's login_epoch when tagteam made it live, or before a replacement superseded the live login (§12.5); NULL only with account_id
 );
 
 CREATE TABLE usage_state (
@@ -435,6 +443,7 @@ CREATE TABLE switch_journal (   -- a row exists only while a switch is between i
   from_fp      TEXT,             -- fingerprint of the live credential being replaced
   from_identity TEXT,            -- the outgoing identity object (CC: oauthAccount), for recovery; not a secret
   to_fp        TEXT NOT NULL,    -- fingerprint of the credential being written; no secret is stored
+  to_epoch     INTEGER,          -- the target's login_epoch when the row was written; the activation epoch a forward finish records (§9.6)
   started_at   INTEGER NOT NULL,
   prior        TEXT              -- the row a forced switch superseded; restored if this one never lands (§9.6)
 );
@@ -546,7 +555,9 @@ only.
   adoption) also requires the profile to be quiescent, and is decided by the profile's
   provenance (§12.5), never by expiry. A stale-marked profile is never captured: its login was
   replaced by an explicit command, whether or not a session was running, and the profile's
-  other lineage must never undo that.
+  other lineage must never undo that. The default home is held to the same rule through its
+  activation epoch: a capture from the live store (the switch's outgoing capture, recovery's
+  capture, and active-token adoption) never takes a live store that is stale-marked (§12.5).
 - **Pending replacements first.** Every holder of an account lock first reconciles a pending
   explicit replacement for that account (§12.5), before it refreshes, captures, bootstraps or
   activates anything. Only the explicit commands `add`, `add-token` and `import` replace a login wholesale.
@@ -598,8 +609,8 @@ frozen into the file.
 **Provider overrides.** The `[autoswitch]` table holds defaults for every provider. A
 `[provider.<id>.autoswitch]` table overrides individual keys for one provider, for example
 `tagteam config set provider.claude-code.autoswitch.models Fable`. Keys that only make sense for
-one provider (`models`, `statusline.*`) are read from that provider's table first, then from
-the global table.
+one provider (`models`, `statusline.*`, `run.share_extra`) are read from that provider's
+table first, then from the global table.
 
 | Key | Default | Valid |
 |---|---|---|
@@ -614,6 +625,7 @@ the global table.
 | `autoswitch.models` | `[]` | list of model display names, or `["all"]` alone; duplicates collapse (case-insensitively) |
 | `usage.history_retention_days` | 180 | 1–3650 |
 | `statusline.format` | `"{account} · 5h {5h}% · 7d {7d}%{stale}"` | placeholders listed in §13.5 only; `{model:<name>}` needs a trimmed, non-empty name without braces |
+| `run.share_extra` | `[]` | entry names of the source home to share into profiles, besides the provider's allowlist (§12.2); known-private names are ignored with a warning |
 | `ui.color` | `auto` | `auto`, `always`, `never` (`NO_COLOR` and `FORCE_COLOR` also honoured) |
 
 CLI flags override settings for a single invocation and are clamped to the same ranges. A
@@ -667,7 +679,7 @@ This procedure is the only place a stored refresh token is ever sent to the toke
    `switch_journal` row (§9.6): until recovery decides, either account of an interrupted switch
    may be what CC is running on. tagteam makes an account the live login
    or session-owned only while holding this lock, so neither can happen before the request is
-   sent.
+   sent. The live login is always the default home's, inside a run shell too (§12.8).
 3. **Re-read the vault** (`Read<Credential>`).
    - `Unreadable` returns `Transient`. `Absent` returns `Transient` (the account was
      removed).
@@ -752,7 +764,11 @@ locally (a sibling machine revoked it). The procedure:
 
 1. Take a `MutationGuard`, then the account lock, then CC's credential locks (§4.3 order).
 2. Re-read the live credential. It must be `Fresh`, and the live identity must still match the
-   account.
+   account. If the account's activation epoch is stale (§12.5), stop: an explicit command
+   replaced the account's login while CC kept the old one, and adopting or refreshing that
+   lineage would undo the replacement. Nothing is read further or sent. The outcome is
+   `Replaced`; a usage fetch reports it as `unavailable`, with a warning to run
+   `tagteam switch <N> --force`. CC goes on refreshing its own copy.
 3. **Reconcile before any request.** The account can have up to three copies: the live store,
    the vault (with its `.prev`), and a `rescue/` successor. CC rotates the live copy on its own,
    so the live store is where the lineage advances. Access-token expiry says nothing about
@@ -775,7 +791,8 @@ locally (a sibling machine revoked it). The procedure:
 5. Otherwise revalidate CC's locks (§9.1) and POST, bounded at 6 s. Persist the successor to
    the vault first, or to `rescue/` if that fails. Then write it to the live store in either
    case, so CC always holds the newest generation; the config lock is taken only around the
-   live write. If CC's locks turn out to be compromised when the response arrives, the
+   live write, and the storage-write lock around the credential entry's write (§9.1). If CC's
+   locks turn out to be compromised when the response arrives, the
    successor is still persisted to tagteam's own storage, but the live store is not written;
    the next pass reconciles it (step 3). A successor that ends up in none of the vault,
    `rescue/` or the live store is lost exactly as in §7.3 step 6: `Unpersisted`, with its
@@ -834,9 +851,19 @@ Refreshing from a degraded read is never allowed.
     if §7.5 leaves a different, usable token.
 - **A fetch that ends before sending** (a refusal or failure while getting a token) is
   recorded as a failure, and gives back the budget slot it reserved (§8.3).
-- **Session-owned account** (§12.5). The fetch is read-only and uses the profile's token.
+- **Session-owned account** (§12.5). The fetch is read-only and uses the profile's token. CC
+  in the session owns that token, so tagteam never refreshes it, never writes the profile, and
+  takes no lock to read it.
+  - The token is read the way CC reads it: the profile's hashed Keychain item for its recorded
+    spelling (§12.2), then `<profile>/.credentials.json`. A degraded read may be used, since an
+    access token sent to the usage endpoint consumes nothing. An unreadable credential reports
+    `keychain_unavailable` or `unavailable`, as for any other account.
+  - An expired access token reports `token_expired` without a request. It is recorded as a
+    fetch that ends before sending, so its budget slot is given back (§8.3). CC refreshes the
+    token on its next API call.
   - A 401 stamps `rejected_fp` with the access-token fingerprint and reports `token_expired`.
   - The same bytes are not sent again until they change.
+  - A profile whose identity drifted (§12.5) is not used: the account reports `unavailable`.
 - **A token that cannot be refreshed** (a setup token): a 401 is an ordinary failure,
   recorded as `http-401` on every path, whether the refusal is new or remembered through
   `rejected_fp`.
@@ -1036,9 +1063,25 @@ with its own locks and surface.
 | CC OAuth refresh lock | `mkdir` directory lock | `<secure-storage dir>/.oauth_refresh.lock`, symlinks not resolved | 60 s | 9 s |
 | CC legacy credential lock | `mkdir` | `<realpath(secure-storage dir)>.lock` (`~/.claude.lock`); the unresolved path if `realpath` fails | 60 s | 9 s |
 | CC config lock | `mkdir` | `<global config path>.lock` (`~/.claude.json.lock`) | 10 s | 9 s |
+| CC storage-write lock | `mkdir` | `<secure-storage dir>/.storage-write`, symlinks not resolved | 15 s | 9 s |
 
-Both credential locks are anchored at the secure-storage dir, not the config home; the two
-differ when `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set (Appendix A.1).
+Both credential locks and the storage-write lock are anchored at the secure-storage dir, not
+the config home; the two differ when `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set (Appendix A.1).
+
+**The storage-write lock** is CC's serialization of every credential write (CC 2.1.286,
+Appendix A.3). CC takes it for each write to its secure storage, including writes that take no
+refresh lock, such as MCP OAuth updates and its dead-token marking. tagteam takes it for every
+write or delete of a CC credential entry: the OAuth entry (Keychain item or
+`.credentials.json`) and the managed-key item. That covers the switch (§9.4 steps 7 and 10),
+recovery (§9.6), the active-token refresh's live write (§7.5) and profile bootstrap (§12.3).
+- It is a leaf lock. It is taken only while the credential locks are held (for a profile, the
+  profile's own), held around one entry's write, and never across a network call; no other
+  lock is taken while it is held. Its wait is a cancellation point (§14.1).
+- Under it, the entry is read again. Its account-scoped keys must still equal what the writer
+  last read or wrote under the credential locks, since only a refresh changes them and CC
+  refreshes only under those locks; otherwise the write aborts, and a switch rolls back. The
+  machine-shared keys are taken from this read, so a CC write made since the earlier read is
+  never lost.
 
 When a switch or a recovery takes the three CC locks together, one 9 s budget covers all
 three. The active-token refresh takes the credential locks with that budget and, after its
@@ -1076,8 +1119,8 @@ The CC locks follow the `proper-lockfile` protocol:
 
 These are decided before locking and re-checked afterwards.
 
-- **Inside a `tagteam run` shell** (`CLAUDE_CONFIG_DIR` under `sessions/`): every command that
-  changes accounts or the live login is refused.
+- **Inside a run shell** (§12.8): every command that changes accounts or the live login is
+  refused.
 - **No live identity** (fresh machine): activate the target directly (§9.4, direct branch).
 - **Live login not managed by tagteam:**
   - On a terminal, prompt `Add the current login (<email>) first? [Y/n]`, then continue.
@@ -1202,8 +1245,9 @@ here on.
    | `Unresolved` | No oracle verdict, or the bytes moved since the oracle call | Write to the vault; `.prev` keeps the old generation recoverable. Log at WARN |
 
    `OursRotated` and `Unresolved` are automatic captures, bound by §6.2: a live credential
-   without a refresh token never replaces a vault credential that has one. It is displaced
-   instead.
+   without a refresh token never replaces a vault credential that has one, and a live
+   credential whose activation epoch is stale (§12.5) never replaces the replacement that made
+   it stale. Either is displaced instead.
 
 5. **Compose the target credential.** The target's pending rescues are settled first (§6.2),
    unless step 2 already did so.
@@ -1215,8 +1259,10 @@ here on.
      machine holds none, so none are taken from the vault.
 6. **Journal.** In one store transaction, write the provider's `switch_journal` row: this
    process's pid and start time, `from_id`, `to_id`, the fingerprints of the live and target
-   credentials, and the outgoing `oauthAccount` object. It holds no secret.
-7. **Write the active credential** (Appendix A.3). The target's credential is always written
+   credentials, the target's `login_epoch`, and the outgoing `oauthAccount` object. It holds
+   no secret.
+7. **Write the active credential** (Appendix A.3). Each entry is written under the
+   storage-write lock (§9.1). The target's credential is always written
    first, and the other auth axis cleared after it, so a switch interrupted in between leaves
    either the outgoing credential intact or the target's in place (§9.6). The auth axis is
    single:
@@ -1240,8 +1286,9 @@ here on.
    the accounts are the two the row names, and the outgoing generation the row journaled
    counts as settled.
 8. **Splice** the target's `oauthAccount` into `~/.claude.json` (§9.5).
-9. **Commit** in one store transaction: set the active account, insert an `events` row
-   (`source` = `cli` or `auto`), and delete the journal row. An auto-switch also writes its
+9. **Commit** in one store transaction: set the active account and its activation epoch (the
+   target's `login_epoch`, which cannot move while its account lock is held), insert an
+   `events` row (`source` = `cli` or `auto`), and delete the journal row. An auto-switch also writes its
    `autoswitch_state` record in this transaction (§11.2 step 11).
 10. **Rollback.** Any failure in steps 7–9 restores, in reverse order, the original
     `~/.claude.json` bytes and the original live credential, then restores the journal row's
@@ -1293,7 +1340,7 @@ are checked in order:
 
 | Live credential (either auth axis) | Meaning | Action |
 |---|---|---|
-| The target's is present (`to_fp`), or the oracle resolves it to `to_id` | The switch landed; CC may have rotated the credential since | Finish forward: clear the other auth axis (§9.4 step 7), splice the target's `oauthAccount`, and commit (step 9) |
+| The target's is present (`to_fp`), or the oracle resolves it to `to_id` | The switch landed; CC may have rotated the credential since | Finish forward: clear the other auth axis (§9.4 step 7), splice the target's `oauthAccount`, and commit (step 9). The activation epoch recorded is the row's `to_epoch` (for a row written before that column, `to_id`'s current `login_epoch`), so a replacement that landed on `to_id` since leaves the live store stale-marked |
 | The outgoing one is present (`from_fp`), or the oracle resolves it to `from_id` | The switch never landed, or its credential rollback succeeded | Finish backward, without touching the credential: splice `from_identity` back into `oauthAccount` if the live object names a different identity (by identity key; a CC-updated object for the same identity is kept), and keep the store's active account |
 | Anything else, including no credential on either axis | Undecidable. For example, CC rotated the credential while the oracle is unavailable; or it rotated it and then logged out, so absence does not prove the switch never published | Keep the row. Account-changing commands for the provider refuse with `interrupted-switch` until recovery can decide; `switch --force` resolves it by displacing any live credential and activating the chosen account. The vault is never re-activated on absence alone |
 
@@ -1350,6 +1397,10 @@ Captures the live login.
    - **`--position` occupied by another account:** confirm, or use `--yes`.
    - **The same account at another position:** move it.
    - In every case, clear its quarantine.
+   - The live store now holds exactly what the vault holds, so the store's active account
+     becomes this account, with its current `login_epoch` as the activation epoch (§12.5),
+     written in the same transaction as the account's last store write (for a replacement, the
+     one that clears `replacing_fp`).
 
 ### 10.2 `add-token <TOKEN|-> [--position N] [--email E] [--alias A]`
 
@@ -1369,7 +1420,8 @@ Captures the live login.
 
 - **`remove <ACCOUNT>`** deletes the vault entries (strict), the store row (which cascades), the
   mappings, and the session profile. For the profile it deletes the profile's hashed Keychain
-  item first, then the directory.
+  item first, named from the spelling its marker records (§12.2), then the directory. The
+  directory's links are removed as links; nothing they point to is touched.
 - **`disable` / `enable <ACCOUNT>`** hold an account out of automatic selection. It stays a
   valid explicit `switch` target.
 - **`alias <ACCOUNT> <NAME>` / `alias <ACCOUNT> --unset` / `alias`** (list).
@@ -1377,9 +1429,10 @@ Captures the live login.
   - They cannot be all digits or start with `-`, and they are unique case-insensitively.
 - **`move <ACCOUNT> <POSITION>`.** If the target position is taken, the two accounts swap
   positions.
-- **Guard.** Destructive commands (`remove`, `move`, `purge`, `add` over an occupied position,
-  and profile bootstrap) refuse while an affected account is session-owned: a live launch
-  reservation, or a session record that is live **or unreadable**.
+- **Guard.** Destructive commands (`remove`, `purge`, `add` over an occupied position, and
+  profile bootstrap) refuse while an affected account is session-owned: a live launch
+  reservation, or a session record that is live **or unreadable**. `move` is not destructive:
+  positions are display order only, and a profile is keyed by the account's ID.
 
 ### 10.4 Account references
 
@@ -1626,7 +1679,7 @@ The tick itself is tested in the engine against both providers (§15.2). `FakeAg
 
 The command launched is the provider's `launch_command` (`claude` for Claude Code). The rest of
 this section describes the Claude Code provider; the sharing, liveness and capture rules are
-engine-generic, with the provider supplying paths, the denylist and the env vars.
+engine-generic, with the provider supplying paths, the share lists and the env vars.
 
 - **With no `ACCOUNT`,** use the nearest mapped ancestor of the current directory's canonical
   path, for the provider given with `--provider` (default: `default_provider`).
@@ -1634,19 +1687,64 @@ engine-generic, with the provider supplying paths, the denylist and the env vars
   - No mapping: run plain `claude` with an untouched environment.
 - **API-key accounts** are refused.
 - **The target is already the live default login:** run plain `claude`, so there are never two
-  copies of one rotating token. `--require-session` refuses instead.
+  copies of one rotating token.
+- **`--require-session`** refuses wherever `run` would otherwise run plain `claude`: no
+  mapping, a mapping to a removed account, or a target that is the live login.
+- **Plain `claude`** means `exec`: tagteam replaces itself with the launch command, with the
+  environment it was given. No reservation is made and no parent stays resident, so signals,
+  the terminal and the exit status are `claude`'s own. Inside a run shell, the outer home's
+  variables are first restored from the profile marker (§12.8), so plain `claude` runs in the
+  default home, as it would have outside.
+- **The launch command** is looked up on `PATH` before any lock is taken. If it is missing,
+  `run` fails with exit 1 and changes nothing.
+- **`--json`** covers only `run`'s own errors before the launch, as the usual error envelope.
+  Once the launch command starts, stdout is its own.
+- **Inside a run shell** (§12.8), `run` resolves the outer home from the profile marker and
+  launches as it would from there, so a session can start a session of another account.
 
 ### 12.2 Profile layout
 
-The profile is `$XDG_DATA_HOME/tagteam/sessions/<id>/`, and `CLAUDE_CONFIG_DIR` is set to that
-exact absolute string with no trailing slash. CC hashes that string for the profile's Keychain
-item (Appendix A.2).
+The profile is `$XDG_DATA_HOME/tagteam/sessions/<id>/`.
 
-**Shared by default.** Every top-level entry of the resolved default config home (`~/.claude`)
-is symlinked into the profile, pointing at the *fully resolved* source (CC's settings writer
-breaks on link-to-link, anthropics/claude-code#78162). That includes `projects/` (transcripts
-and auto-memory), `history.jsonl`, `CLAUDE.md`, `settings.json`, `keybindings.json`, `skills/`,
-`agents/`, `commands/`, `plugins/`, `todos/`, and any entry a future CC version adds.
+**One spelling.** `CLAUDE_CONFIG_DIR` is set to the profile's canonical path: resolved with
+`realpath`, NFC-normalized, absolute, with no trailing slash. CC names the profile's Keychain
+item from exactly that string and, since 2.1.286, tries no other spelling (Appendix A.2). The
+spelling is recorded in the profile marker, and every operation on the profile's credential
+(bootstrap, validation, capture, the session-owned usage read, and the hashed-item deletion in
+`remove` and `purge`) uses the recorded spelling, never one derived again. A profile whose
+canonical path no longer matches its recorded spelling, because the data directory moved,
+needs a bootstrap (§12.3), which also deletes the item under the old spelling.
+
+**Profile marker.** `<profile>/.tagteam-profile.json` holds `{"format": "tagteam-profile",
+"version": 1, "provider", "accountId", "configDir", "outer"}`. `configDir` is the exported
+spelling. `outer` is the provider's record of the home the profile shares from, as `run` found
+it (§4.5 `outer_home`); for Claude Code, whether `CLAUDE_CONFIG_DIR` and
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` were defined, and their values. It holds no secret. A
+profile's first launch creates it. Every quiescent launch then updates `outer` before it syncs
+links; only a bootstrap changes `configDir`, once it has deleted the item under the spelling it
+replaces (§12.3 step 5). The marker is what makes a process a run shell (§12.8).
+
+**Shared by allowlist.** The provider names the entries of the source home that a profile
+shares (§4.5 `share_policy`). Each one present in the source home is symlinked into the profile,
+pointing at the *fully resolved* source: CC follows at most one link when it writes through one
+(Appendix A.1, anthropics/claude-code#78162). Every other entry stays private to the profile,
+and CC creates its own copy there when it needs one. For Claude Code:
+
+| Shared | Holds |
+|---|---|
+| `projects/`, `history.jsonl` | transcripts, auto-memory and prompt history (must-share, below) |
+| `CLAUDE.md`, `settings.json`, `keybindings.json` | the user's instructions and settings |
+| `agents/`, `commands/`, `skills/`, `plugins/`, `hooks/`, `output-styles/`, `themes/`, `rules/`, `workflows/` | the user's customizations |
+| `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/` | per-session state keyed by session ID, which a session resumed in the other home needs |
+
+`run.share_extra` (§6.4) adds entry names to the allowlist, for a user's own files that hooks
+or settings reach through the profile. A known-private name there is ignored with a warning.
+
+**Unknown entries are private.** An entry on neither list stays private to the profile. Sharing
+by default would share any per-account state a later CC version adds, as 2.1.286 already holds
+entitlement caches, org policy and a credential-using daemon in its config home. The first
+launch that meets an unknown entry prints one notice naming it, and records it in
+`.tagteam-links.json` so the notice is not repeated; `doctor` lists them all.
 
 **Must-share entries.** `projects/` (transcripts and auto-memory) and `history.jsonl` hold the
 memory and history that §3 protects, and CC creates both on demand. If either is absent from
@@ -1656,25 +1754,41 @@ profile always links to it and CC never starts a private copy. If a profile hold
 paths, for the user to merge by hand. Splitting memory or history silently is never an
 option.
 
-**Private to the profile** (the denylist):
+**Shared files can split.** CC writes most files by renaming a temporary file over the path,
+which replaces a symlink with a regular file; only `.claude.json` and the user `settings.json`
+are written through a link (Appendix A.1). A shared directory is therefore always safe, since
+CC writes inside it. Of the shared files, `history.jsonl` is appended to and `settings.json` is
+written through its link; `CLAUDE.md` and `keybindings.json` are normally edited by the user.
+A launch that finds a shared file replaced by a regular file in the profile refuses for a
+must-share entry, as above, and otherwise warns, naming both paths. tagteam never merges or
+replaces either copy.
+
+**Private to the profile** (the known-private list, so that `doctor` can tell known entries
+from unknown ones):
 
 | Entry | Why it's private |
 |---|---|
 | `.credentials.json` | the profile's own credential |
-| `.claude.json` | the profile's own config; see §12.4 |
+| `.claude.json`, and its variants under non-production OAuth settings (`.claude-*-oauth.json`) | the profile's own config; see §12.4 |
 | `.config.json` | CC's legacy global config, which CC prefers over `.claude.json` when it exists (Appendix A.1). Shared, it would make the profile read and write the default identity and config |
-| `sessions/`, `ide/` | per-profile process records |
+| `sessions/`, `ide/`, `jobs/` | per-profile process records and background jobs |
+| `daemon/`, `daemon.json`, `daemon.lock`, `daemon.log`, `daemon.status.json`, `daemon.scheduled.status.json`, `daemon-auth-cooldown`, `daemon-auth-status.json` | CC's background daemon, which reads and refreshes the profile's credential (Appendix A.7) |
 | `backups/` | CC's config backups; restoring from a shared one could cross profiles |
-| `.device-keys.json` | device key store (conservative) |
-| `*.lock`, `*.lock.owner` | lock directories and owner files |
-
-Unknown entries are shared, and `doctor` reports any entry that is not on the known-shared or
-known-private lists.
+| `cache/`, `mcp-needs-auth-cache.json`, `stats-cache.json` | per-account model entitlements, connector state and caches |
+| `policy-limits.json` (and `.signature*`, `.stamp`), `remote-settings.json`, `remote-settings-consent.json`, `remote-settings-helper-consent` | an organization's managed policy, which must not reach another account's sessions |
+| `.session_ingress_token`, `hfi-auth.json` | tokens |
+| `state/`, `seed-admin/`, `bridge-spawn/`, `chrome/`, `debug/`, `feedback/`, `routines/`, `settings.local.json`, `.last-cleanup`, `.cc-writes/` | per-home consents, uploads, logs and housekeeping |
+| `.device-keys.json` | unused in a profile: CC keeps device keys machine-wide (Appendix A.7) |
+| `*.lock`, `*.lock.owner`, `.storage-write`, `.*_auth_refresh-*` | lock directories, owner records and refresh coordination files |
+| `.tagteam-*` | tagteam's own files |
 
 **Sync runs on every launch.**
 - Create any missing links.
 - Remove only links that tagteam created (tracked in `<profile>/.tagteam-links.json`) whose
-  source has disappeared.
+  source has disappeared, whose entry has left the allowlist, or whose source is no longer in
+  the outer home that the marker records. A link to a moved source is created again.
+- A launch that joins a running session only creates missing links: the links a running
+  session uses never change under it.
 - A real file or directory where a link belongs is never replaced; tagteam reports it (and
   refuses, for a must-share entry).
 - Real history directories are never deleted.
@@ -1683,34 +1797,71 @@ known-private lists.
 ### 12.3 Bootstrap and validation
 
 This runs within a launch (§12.5), under `MutationGuard` and the account lock, and only when
-the profile is quiescent and is missing, invalid, stale-marked, or holding a credential other
-than the vault's current generation.
+the profile is quiescent and is missing, invalid, stale-marked, holding a credential other than
+the vault's current generation, or recorded under a spelling that is no longer its canonical
+path (§12.2). Both locks are held through validation, so other commands may wait up to their
+own lock timeouts while a bootstrap runs.
 
 1. Refresh the vault credential through the gate first, before the launch takes its locks.
    - `Transient` with `rescued`, and `Unpersisted`, abort with advice.
    - A plain `Transient` continues with the stored credential.
-2. If the profile is stale-marked, displace its current credential (§6.3): it may be a live
+2. Read the profile's current credential the way CC would (the hashed Keychain item for the
+   recorded spelling, then `<profile>/.credentials.json`). An unreadable or degraded read
+   aborts the launch: tagteam never overwrites a credential it could not read. A new profile
+   has none.
+3. If the profile is stale-marked, displace that credential (§6.3): it may be a live
    generation of the login that was replaced.
-3. **Always** delete the profile's hashed Keychain item (macOS), whatever the reason for the
-   bootstrap, and verify it `Absent` with the existence probe (Appendix A.3). CC reads the
-   Keychain first, so an item left behind, such as the consumed generation from a refresh-driven
-   re-bootstrap, would stay authoritative over the file. If the item cannot be verified
-   absent, the launch aborts.
-4. Write the vault credential to `<profile>/.credentials.json` (0600). CC migrates it into its
-   own hashed item on first write; tagteam never writes that item.
-5. **Verify the effective credential.** Re-read the profile's credential the way CC would
-   (Keychain first, then the file), and check that it is the vault's current generation.
-   Only then record the profile's provenance in `<profile>/.tagteam-seed.json`: the account's
-   current `login_epoch`, and that generation's fingerprint as the seed. A mismatch aborts
-   the launch.
-6. Seed `<profile>/.claude.json` (§12.4).
-7. Validate with `claude auth status --json`, in exactly the session environment (§12.5), with
-   a 10 s timeout. The profile is
-   valid when `rc == 0`, `loggedIn === true`, `authMethod == "claude.ai"`, the `email` matches,
-   and the `orgId` matches when both are present.
-   - A timeout or unparseable output is `unknown`.
-   - A spawn failure is `unreachable`.
-   - **Only `invalid` deletes a profile.**
+4. **Compose and write** `<profile>/.credentials.json` (0600), under the profile's own
+   credential locks and storage-write lock (§9.1), as an activation composes (§9.4 step 5)
+   with the profile as the live store:
+   - the account-scoped keys come from the vault's current generation;
+   - the machine-shared keys (MCP OAuth tokens, plugin secrets; Appendix A.4) come from the
+     profile's own credential read in step 2, and their absence too. A new profile starts with
+     none: its MCP servers authenticate once in the profile, and a rotating MCP token never has
+     a copy in two homes.
+
+   CC moves the file into its own hashed item on its next credential write, and then deletes
+   the file (Appendix A.3). tagteam never writes that item.
+5. **Then always** delete the profile's hashed Keychain item (macOS), whatever the reason for
+   the bootstrap, and verify it `Absent` with the existence probe (Appendix A.3). When the
+   spelling changed, the item under the old spelling is deleted and verified too. CC reads the
+   Keychain first, so an item left behind, such as the consumed generation from a
+   refresh-driven re-bootstrap, would stay authoritative over the file. If the item cannot be
+   verified absent, the launch aborts.
+
+   The file is written before the item is deleted, so the machine-shared keys the item holds
+   are already on disk when it goes. A bootstrap that stops between the two leaves the old item
+   authoritative and the seed unchanged, so the next launch bootstraps again and reads the same
+   keys from the same item.
+6. **Verify the effective credential.** Re-read the profile's credential the way CC would
+   (Keychain first, then the file), and check that its account-scoped keys are the vault's
+   current generation. Only then record the profile's provenance in
+   `<profile>/.tagteam-seed.json` (the account's current `login_epoch`, and that generation's
+   fingerprint as the seed) and, when the spelling changed, the new spelling in the profile
+   marker (§12.2). A mismatch aborts the launch.
+7. Seed `<profile>/.claude.json` (§12.4).
+8. Validate with `claude auth status --json` (JSON is its default output since 2.1.286, and
+   `--json` is still accepted), in exactly the session environment (§12.5) and in the
+   directory `claude` will run in, with a 10 s timeout:
+
+   | Outcome | When | Action |
+   |---|---|---|
+   | `valid` | `rc == 0`, `loggedIn === true`, `authMethod` is the account's own login (`claude.ai` for CC's OAuth accounts, and for setup-token accounts, *inferred*), `configDirectory` equals the recorded spelling, the `email` matches, and the `orgId` matches when both are present | Launch |
+   | `invalid` | Not logged in (`authMethod` `none`), or logged in to `claude.ai` as another email or org | Delete the profile, and refuse with advice; the next `run` bootstraps afresh. **Only `invalid` deletes a profile** |
+   | `overridden` | Logged in by another method: `api_key`, `api_key_helper`, `oauth_token` or `third_party` | Refuse and keep the profile. The message names the method, and `apiKeySource` when present: something outside the profile, such as an `apiKeyHelper` or `env` entry in the shared `settings.json`, or a workload-identity profile, takes precedence over the account's login |
+   | `drifted` | `configDirectory` differs from the recorded spelling | Refuse and keep the profile: CC resolves another config dir than tagteam computes (Appendix A.1) |
+   | `unknown` | A timeout, or output that does not parse | Refuse and keep the profile. Step 6 verified the credential CC will read, but not that it is the source CC will use, so a login that cannot be confirmed is not launched. The message names the cause |
+   | `unreachable` | The launch command could not be spawned | Refuse |
+
+**Every launch is checked.** A login can be overridden after a profile was bootstrapped: by an
+`apiKeyHelper` or `env` entry added to the shared settings, by a project's own settings in the
+directory `claude` runs in, or by a workload-identity profile. So a launch that did not
+bootstrap runs the same command after it releases its locks and before the spawn, with its
+reservation held (§12.5); it costs about 0.1 s. `valid` launches. `overridden`, `drifted`,
+`unknown` and `unreachable` refuse as above. `invalid` refuses, keeps the profile, and records
+in its seed file that it needs a bootstrap, which the next launch performs. A launch refused
+after its reservation exists runs its exit handling (§12.5) as if `claude` had exited at once,
+and exits 1.
 
 ### 12.4 Profile `.claude.json`: seed and merge-back
 
@@ -1726,6 +1877,11 @@ unmerged changes. Then start from the profile's current file, or `{}` if there i
   `"dark"`)
 - write `<profile>/.tagteam-baseline.json`, a snapshot of the seeded `projects` and `mcpServers`
 
+`hasCompletedOnboarding` is CC's only onboarding gate. Project trust (`hasTrustDialogAccepted`)
+and the per-project MCP approvals travel inside `projects` (Appendix A.6). Nothing else is
+copied: the profile keeps the per-home identifiers CC creates on its first start (`userID`,
+`machineID` and the like), as any second config dir would.
+
 The write takes the profile's own config lock.
 
 **Merge back, when the last session exits** (§12.5). This runs inside the exit handling,
@@ -1736,8 +1892,9 @@ warns, and keeps the profile's changes and the baseline, so it is retried before
 1. Diff the profile's `projects.<path>.<key>` and `mcpServers.<name>` against the baseline.
 2. Apply each changed or removed key to `~/.claude.json` with the §9.5 splice (`projects` and
    `mcpServers` subtrees only).
-3. If the default file also changed a key since the baseline, the default wins, and tagteam
-   warns on stderr naming the key.
+3. If the default file also changed a key since the baseline, the default wins. tagteam
+   prints one summary line on stderr (how many keys changed on both sides, and that the
+   default file's values were kept), and names each key in the log.
 
 Account-specific fields are never merged back.
 
@@ -1779,25 +1936,54 @@ death.
      launch, because tagteam never overwrites a credential it could not read;
    - bootstrap for any other §12.3 reason, then seed (§12.4).
 
-   If the profile is not quiescent, join the running session without seeding.
+   If the profile is not quiescent, join the running session without seeding; the sync only
+   creates missing links (§12.2).
 4. Create this process's reservation.
-5. Release `MutationGuard` and the account lock, and spawn `claude` with the reservation fd.
+5. Release `MutationGuard` and the account lock.
+6. Unless this launch bootstrapped, check the session's login (§12.3, "Every launch is
+   checked"). A refusal runs the exit handling below as if `claude` had exited at once.
+7. Spawn `claude` with the reservation fd. It stays in the terminal's foreground process group
+   (§14.1).
 
-- The parent ignores SIGINT and SIGQUIT (the child owns the terminal) and forwards SIGTERM and
-  SIGHUP to the child.
-- The exit code mirrors the child's (`128 + signal` if the child was killed by a signal).
+**Signals** (§14.1 sets the general rules; these are `run`'s):
+- **Before the spawn**, every lock wait is a cancellation point, and so is the wait for the
+  login check (§12.3), whose process is then killed. The token is checked once more right
+  before the spawn. An interrupted launch exits as §14.1 says and launches nothing; if its
+  reservation already exists, its exit handling runs first, as for a refused launch. A signal
+  recorded after that last check, SIGINT included, is sent to `claude` as soon as it is
+  spawned: the terminal cannot deliver it to a process that did not exist yet.
+- **While `claude` runs**, the parent ignores SIGINT and SIGQUIT (the child owns the terminal,
+  and the terminal sends them to the child too) and forwards SIGTERM and SIGHUP to the child.
+  None of these cancels the exit handling below: the child's exit starts it.
+- **After `claude` exits**, a new SIGINT, SIGTERM or SIGHUP cancels the exit handling at its
+  next cancellation point, a lock wait. Its writes (the capture, the merge-back's splice and
+  the reservation's unlink) are critical spans. Exit handling that is cancelled or fails prints
+  a notice on stderr: its work is left to lazy capture and the next launch, which loses
+  nothing, because the reservation dies with this process.
+- **The exit code** is always the child's (`128 + signal` if the child was killed by a signal),
+  whatever happened in exit handling.
 
-**Environment.** These variables are scrubbed from the session environment, with a warning:
-`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
-`CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR`,
-`CLAUDE_SECURESTORAGE_CONFIG_DIR`. They are not scrubbed on the plain-`claude` fast path. A
-pre-set `CLAUDE_CONFIG_DIR` is overridden, with a warning.
+**Environment.** These variables are scrubbed from the session environment, with a warning
+naming each one that was set, because each supplies or redirects the login, or renames CC's
+config file or Keychain item (Appendix A.1, A.7):
+- `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, `CLAUDE_CODE_OAUTH_SCOPES`, `CLAUDE_CODE_OAUTH_CLIENT_ID`,
+  and every `CLAUDE_CODE_*_FILE_DESCRIPTOR`;
+- `CLAUDE_CODE_ACCOUNT_UUID`, `CLAUDE_CODE_USER_EMAIL`, `CLAUDE_CODE_ORGANIZATION_UUID`;
+- `ANTHROPIC_PROFILE`, `ANTHROPIC_CONFIG_DIR`, `ANTHROPIC_FEDERATION_RULE_ID`,
+  `ANTHROPIC_IDENTITY_TOKEN`, `ANTHROPIC_IDENTITY_TOKEN_FILE`;
+- `CLAUDE_CODE_CUSTOM_OAUTH_URL`, `USE_LOCAL_OAUTH`, `USE_STAGING_OAUTH`;
+- `CLAUDE_SECURESTORAGE_CONFIG_DIR`.
+
+They are not scrubbed on the plain-`claude` paths. A pre-set `CLAUDE_CONFIG_DIR` is
+overridden, with a warning. A login source the environment cannot express, such as a
+workload-identity profile file, is caught by validation as `overridden` (§12.3).
 
 Removing `CLAUDE_SECURESTORAGE_CONFIG_DIR` makes the secure-storage dir resolve to the profile
 (Appendix A.1). Set to an empty string, it would send CC to the default `~/.claude` credentials;
 set to anything else, it would redirect them. Every profile credential operation (bootstrap,
-validation, capture, and the hashed-item deletion in `remove`) resolves paths with this same
-environment.
+validation, capture, the session-owned usage read, and the hashed-item deletion in `remove`)
+resolves paths with this same environment and the recorded spelling (§12.2).
 
 **When the child exits**, under `MutationGuard`, then the account lock:
 - If the profile is quiescent apart from this process's own reservation, this is the last
@@ -1806,13 +1992,17 @@ environment.
      it rotated, and it is the same identity. The comparison and write happen under the
      account lock (§6.2), with no network.
   2. **Merge back** `.claude.json` (§12.4).
+- Otherwise another session still runs: another `run` of the account, or a background session
+  that `claude` left behind (a `bg` or `daemon` session record, §12.6). Capture and merge-back
+  then wait for the last of them, through lazy capture and the next launch.
 - In either case, unlink this process's reservation last.
 
-**Lazy capture.** If tagteam itself was killed, the same adoption runs once the profile is
-quiescent: at the next launch, usage collection, switch pre-check, or refresh gate, under the
-account lock. The conditions are the same: quiescent, rotated according to its provenance,
-and the same identity. The unmerged baseline is merged back at the next launch (step 2
-above).
+**Lazy capture.** If tagteam itself was killed, or a background session outlived the last
+`run`, the same adoption runs once the profile is quiescent: at the next launch, the switch
+pre-check (§9.2), or the refresh gate (§7.3 step 3), which a usage collection reaches whenever
+the account needs a refresh. Each runs under the account lock. The conditions are the same:
+quiescent, rotated according to its provenance, and the same identity. The unmerged baseline
+is merged back at the next launch (step 2 above).
 
 **Profile provenance.** `<profile>/.tagteam-seed.json` records two things:
 - the login epoch the profile was bootstrapped under;
@@ -1835,7 +2025,9 @@ never by expiry, because a rotated token need not expire later than the one it r
 `import` hold the account lock throughout, and:
 1. in one store transaction, increment `login_epoch` and set `replacing_fp` to the new
    credential's fingerprint, with `replacing_meta` holding that login's metadata (identity,
-   kind, expiry);
+   kind, expiry, and whether it was taken from the live login, as `add` takes it). When the
+   live identity or `active_accounts` names the account, the same transaction records the
+   default home's evidence (below);
 2. write the vault;
 3. in one store transaction, clear `replacing_fp` and `replacing_meta`.
 
@@ -1845,31 +2037,68 @@ that finds `replacing_fp` set knows the replacer died, since the replacer held t
 throughout, and reconciles before doing anything else:
 - if the vault holds `replacing_fp`, the replacement landed: the recorded `replacing_meta` is
   installed onto the account (identity, kind, expiry; any quarantine is cleared with it), and
-  the marker cleared;
+  the marker cleared. A replacement taken from the live login also records the account's
+  `login_epoch` as the activation epoch, as `add` would have (§10.1);
 - otherwise it never landed: `login_epoch` is decremented and the marker cleared. That restores
   the profile's eligibility, so a rotation it holds is captured rather than stranded.
 
 A running profile is never touched: it is simply stale-marked, and is re-bootstrapped at its
 next quiescent launch, which writes the new epoch and seed.
 
+**The default home's activation epoch.** The live store is held to the same rule. An `import`
+or `add-token` that replaces the live account's login writes the vault only; CC keeps the old
+login until `tagteam switch <N> --force` activates the new one (§13.3). Until then the live
+store holds a lineage the replacement superseded, and adopting it back would undo the
+replacement as surely as a stale profile's capture.
+- `active_accounts` records the **activation epoch**: the account's `login_epoch` when tagteam
+  made it the live login. A switch's commit (§9.4 step 9), recovery's forward finish (§9.6)
+  and `add` (§10.1) write it.
+- The live store is **stale-marked** when `active_accounts` names the account and its
+  activation epoch differs from the account's `login_epoch`.
+- **A replacement records its own evidence.** Its first transaction (step 1 above) sets
+  `active_accounts` to the account, with the `login_epoch` it had before the increment,
+  whenever the live identity or `active_accounts` names the account, unless `active_accounts`
+  already names it with an epoch. So the live store is stale-marked from the moment the
+  replacement begins, whoever activated it and whatever the row held before. `add`, whose new
+  login is the live one, records the new epoch in its last transaction (§10.1).
+- The migration that adds the column fills it with each named account's current
+  `login_epoch`: the live store is taken as current, the best evidence there is.
+- A stale-marked live store is never captured: the switch's outgoing capture and recovery's
+  capture displace it instead (§9.4 step 4, §9.6), and the active-token refresh neither adopts
+  nor refreshes it (§7.5 `Replaced`). CC goes on using and refreshing it, which is its own
+  business.
+- `tagteam switch <N> --force` re-activates the vault generation, as a forced self-switch
+  does (§9.2), and its commit records the current epoch.
+
 **Identity drift.** If the profile's `oauthAccount` email, or its org when both are set,
 differs from the account's, the profile is ignored for that account.
 
 ### 12.6 Process liveness
 
-Session records are read from `<profile>/sessions/*.json`, with fields `pid`, `procStart`,
-`startedAt`, and so on.
+Session records are read from `<profile>/sessions/*.json`. CC 2.1.286 writes one when a
+session starts, before its first prompt, and removes it when it exits gracefully, SIGINT,
+SIGTERM and SIGHUP included; SIGKILL leaves it behind. Its fields include `pid`, `procStart`,
+`startedAt` and `kind` (Appendix A.7).
 
 A pid is live if `kill(pid, 0)` succeeds or returns `EPERM`, **and** it still belongs to the
-record's writer:
+record's writer, as judged from `procStart`:
 
-- **Linux:** `/proc/<pid>/stat` field 22 (counted after the last `)`) must equal an all-digit
-  `procStart`.
-- **Otherwise (macOS, or a non-digit `procStart`):** get the start time from
-  `proc_pidinfo(PROC_PIDTBSDINFO)` and the arguments from `sysctl(KERN_PROCARGS2)`. The pid is
-  treated as recycled **only if** the process started more than 120 s after the record's
-  `startedAt` **and** neither its executable name nor its arguments contain `claude`. This
-  mirrors cswap, whose rule is based on `ps lstart`.
+- **`ps lstart` text**, which CC 2.1.286 writes on macOS and Linux alike (`LC_ALL=C`, `TZ=UTC`,
+  for example `Wed Oct  1 12:34:56 2026`): the process's start time from the OS
+  (`proc_pidinfo(PROC_PIDTBSDINFO)` on macOS; the boot time plus `/proc/<pid>/stat` field 22,
+  counted after the last `)`, on Linux) must equal it to the second, within ±1 s. Any other
+  start time means the pid was recycled.
+- **All digits**, as older CC versions wrote on Linux: `/proc/<pid>/stat` field 22 must equal
+  it.
+- **Absent or unparseable** (CC omits it when `ps` fails): cswap's rule applies. Get the start
+  time and the arguments (`proc_pidinfo` and `sysctl(KERN_PROCARGS2)` on macOS,
+  `/proc/<pid>/stat` and `cmdline` on Linux). The pid is treated as recycled **only if** the
+  process started more than 120 s after the record's `startedAt` **and** neither its
+  executable name nor its arguments contain `claude`.
+
+Records of every `kind` count, `bg` and `daemon` included. CC's background daemon reads and
+refreshes the profile's credential (Appendix A.7), so the account stays session-owned for as
+long as it runs.
 
 **The `switch_journal` holder** is recorded with its start time taken from the same source it
 is later compared against (`/proc/<pid>/stat` field 22 on Linux, `proc_pidinfo` on macOS).
@@ -1889,9 +2118,36 @@ destructive operations.
   path if `--provider` is omitted).
 - Subdirectories inherit the nearest mapped ancestor, per provider.
 - **`tagteam shell-init zsh|bash|fish`** prints one wrapper function per registered provider
-  that supports sessions (for now, `claude`). In a directory mapped for that provider, the
-  wrapper runs `tagteam run --provider <id> -- "$@"`; elsewhere it runs
-  `command <launch_command> "$@"`. It's opt-in, added by the user to their shell rc.
+  that supports sessions (for now, `claude`). The wrapper always runs
+  `tagteam run --provider <id> -- "$@"`, which decides from the mappings and `exec`s plain
+  `claude` where none applies (§12.1), so an unmapped directory costs one `tagteam` start. If
+  `tagteam` itself is not on `PATH`, the wrapper runs `command <launch_command> "$@"`. It's
+  opt-in, added by the user to their shell rc.
+
+### 12.8 Inside a run shell
+
+`claude` under `tagteam run`, and everything it starts (its tools, hooks, MCP servers and its
+statusline command), inherit `CLAUDE_CONFIG_DIR` set to the profile. tagteam commands run there
+must not take the profile for the default home: the refresh gate would then see the default
+login's account as inactive, and could refresh the very token CC in `~/.claude` is using.
+
+**Detection.** A process is in a run shell exactly when `CLAUDE_CONFIG_DIR` names a directory
+that holds a profile marker (§12.2). Nothing else is consulted: not the path's location, and not
+`XDG_DATA_HOME`, which a run shell may have changed.
+
+**The outer home.** In a run shell, tagteam resolves the provider's home from the marker's
+`outer` record instead of the environment, and keeps the session's account apart:
+- The live login, the gate's ownership check (§7.3 step 2), the active-token refresh and usage
+  collection all see the default home, exactly as outside the shell. The session's own
+  account is session-owned through its reservation.
+- Commands that change accounts or the live login refuse (§9.2), and so does `auto` except with
+  `--dry-run` (§11.1). Read-only commands work. `status` adds the session's account, and
+  `list` marks it (§13.1, §13.2).
+- `run` launches as it would from the outer home (§12.1).
+- `statusline` takes the account from the marker (§13.5).
+
+**An unreadable marker** (present, but not a valid marker) leaves the outer home unknown. Every
+command except `statusline` then refuses, naming the file; `statusline` prints nothing.
 
 ## 13. CLI
 
@@ -1913,7 +2169,7 @@ exactly as it would without providers.
 
 | Command | Notes |
 |---|---|
-| `list` / `ls` | Every account with its 5h, 7d, spend and scoped usage, reset countdowns, markers (active, disabled, quarantined, ahead of pace) and data age. It fetches only when due (§8.3) |
+| `list` / `ls` | Every account with its 5h, 7d, spend and scoped usage, reset countdowns, markers (active, disabled, quarantined, in a session, ahead of pace) and data age. It fetches only when due (§8.3) |
 | `status` | The live account |
 | `switch [ACCOUNT] [--strategy best\|next-available [--model M]] [--force]` | §9 |
 | `add`, `add-token`, `remove` / `rm`, `disable`, `enable`, `alias`, `move` | §10 |
@@ -1946,6 +2202,8 @@ signal number for SIGTERM and SIGHUP, §14.1). `auto --once` uses 0–3.
 - A row without usage shows its `usageStatus` in words (`relogin required`, `api key`,
   `unavailable (http-429, retry 4m)`, `over budget`, …) instead of the window columns.
 - `AGE` is the last good reading's age. A stale reading is still shown, with its age.
+- A session-owned account (§12.5) is marked `▶` after its position, and in a run shell the
+  session's own account `▶ this`.
 
 ### 13.2 JSON output (`schemaVersion: 1`)
 
@@ -1968,7 +2226,8 @@ an additive `others: [ … ]` array.
 
 Each row:
 - **Always:** `number, position, id, email, organizationName, organizationUuid, isOrganization,
-  active, usageStatus, usage, alias?, disabled?: true, loginExpiresAt?`.
+  active, usageStatus, usage, alias?, disabled?: true, loginExpiresAt?, inSession?: true`.
+  `inSession` (additive) marks a session-owned account (§12.5).
 - **When `usage` is non-null:** `usageFetchedAt, usageAgeSeconds`.
 - **When `usage` is null:** `lastGoodUsage, lastGoodFetchedAt, lastGoodAgeSeconds`.
 - **When `usageStatus` is not `ok`** (whether `usage` is null or not): `usageError` (the
@@ -1992,6 +2251,9 @@ windows. Claude Code renders cswap's shape:
 - `{schemaVersion, provider, active: null}`
 - `{schemaVersion, provider, active: {email, provider, managed: false}}`
 - `{schemaVersion, provider, active: {number, position, id, email, …row fields, managed: true}, totalManagedAccounts}`
+
+In a run shell (§12.8) each shape gains an additive `session: {number, position, id, email}`
+naming the session's account, or `session: null` when the marker's account is not managed.
 
 An account command's result is `{schemaVersion, ok, account: row, created?}`; `remove`'s reports
 `active` as it was before the removal.
@@ -2092,8 +2354,10 @@ environment it runs in (a `CLAUDE_CONFIG_DIR` or a CC-invoked process means Clau
 - It drains piped stdin (up to 64 KiB) and ignores the contents.
 - It does **no network and no Keychain access**, and never constructs the `Http` adapter: the
   engine builds it lazily, on first use, which keeps the command within §1.1's 10 ms p95.
-- **Which account.** Inside a profile (from `CLAUDE_CONFIG_DIR`), the profile's account. This
-  lookup lands with profiles (M4); until then `statusline` always uses the live identity.
+- **Which account.** In a run shell (§12.8), the session's account, named by the profile
+  marker; CC runs its statusline command with the session's environment, so the command sees
+  `CLAUDE_CONFIG_DIR` (Appendix A.7). The marker is one small file, and the profile's
+  `.claude.json` is never parsed. A marker whose account is not managed prints nothing.
   Otherwise, the live identity from `live_identity_cache`, re-parsing `~/.claude.json` only
   when its mtime or size changed. The parse deserializes `oauthAccount` alone and skips the
   rest.
@@ -2116,7 +2380,7 @@ anything fails.
 **Checks:**
 - **Claude Code:**
   - the `claude` binary was found, and its version compared against `TESTED_CC_VERSION`
-    (`2.1.283`) — newer → warn
+    (`2.1.286`) — newer → warn
   - resolved paths: config home, global config, secure-storage dir, and Keychain service and
     account names
 - **Keychain:**
@@ -2133,9 +2397,13 @@ anything fails.
 - **Interrupted switch:** a `switch_journal` row whose holder is dead → warn, or fail if §9.6
   cannot decide it.
 - **Session profiles:**
-  - entries in `~/.claude` that are on neither the known-shared nor the known-private list
-    (§12.2) → warn
-  - a real `projects/` or `history.jsonl` inside a profile (§12.2) → fail
+  - entries in `~/.claude` that are on neither the allowlist nor the known-private list, and
+    so are not shared (§12.2) → warn
+  - a real `projects/` or `history.jsonl` inside a profile (§12.2) → fail; another shared file
+    split into a regular file → warn
+  - a profile marker that is unreadable, or whose recorded spelling is no longer the
+    profile's canonical path (§12.2) → warn; a profile directory without a store account →
+    warn, naming what to delete
   - reservations whose `tagteam` parent is gone but whose lock is still held, with the
     holding processes where the OS can tell; baselines awaiting merge-back → info
   - a provenance conflict (§12.5) → fail, naming the account and the fix; a pending
@@ -2168,7 +2436,7 @@ handler only records the signal in the engine's cancel token (§4.2), which test
 - **Cancellation points.** The work checks the token, and unwinds with an `interrupted`
   error, only where stopping loses nothing:
   - each iteration of a lock wait: the mutation lock, account locks, and the provider's live
-    locks;
+    locks, CC's storage-write lock included;
   - before reserving or sending a usage request;
   - at a prompt;
   - in `auto`'s sleep, and between its ticks.
@@ -2199,14 +2467,17 @@ handler only records the signal in the engine's cancel token (§4.2), which test
 - **Exit.** An interrupted command exits 130 after SIGINT, and 128 + the signal number after
   SIGTERM or SIGHUP. With `--json`, it prints the error envelope with type `interrupted`.
   `auto`'s loop stops cleanly and exits 0 instead (§11.4).
-- **`tagteam run`** handles signals as §12.5 says while `claude` runs.
+- **`tagteam run`** handles signals as §12.5 says: before the spawn, while `claude` runs, and
+  in its exit handling.
 
 ## 15. Testing
 
 ### 15.1 Isolation
 
 - **All paths derive from an injected `Env`:** HOME, `XDG_*`, USER, `CLAUDE_CONFIG_DIR` (raw
-  string), and `CLAUDE_SECURESTORAGE_CONFIG_DIR` (defined vs. undefined).
+  string), and `CLAUDE_SECURESTORAGE_CONFIG_DIR` (defined vs. undefined). In a run shell the
+  provider's home comes from the profile marker instead (§12.8), which tests write into the
+  fixture.
 - **A harness guard** panics if any resolved path falls under the real HOME. There is also a
   test asserting the guard trips.
 - **The Keychain** is an in-memory fake by default. Tests marked `real_keychain` run the real
@@ -2272,16 +2543,53 @@ handler only records the signal in the engine's cancel token (§4.2), which test
     more than 20 usage requests in a rolling hour.
   - **Fresh home:** a `run` against a home with no `projects/` or `history.jsonl` leaves both
     shared.
+  - **Run shell** (§12.8): with `CLAUDE_CONFIG_DIR` set to a profile, the gate never refreshes
+    the default home's live account, `list` and `status` show the default login as active and
+    the session's account as in session, account-changing commands refuse, and an unreadable
+    marker refuses everything but `statusline`. Detection holds with `XDG_DATA_HOME` changed
+    inside the shell, and a directory outside `sessions/` holding a marker is a run shell.
+  - **Sharing** (§12.2): only allowlisted entries are linked, an unknown entry is noted once
+    and stays private, a link whose entry left the allowlist is removed, a split shared file
+    warns (and refuses for a must-share entry), and a joining launch only creates links.
+  - **Bootstrap** (§12.3): the composed credential carries the vault's account-scoped keys and
+    the profile's own machine-shared keys, none for a new profile; a changed spelling deletes
+    the old item first; a bootstrap stopped between writing the file and deleting the item is
+    redone with the same machine-shared keys; each validation outcome acts as its row says, and
+    only `invalid` at a bootstrap deletes a profile; an `apiKeyHelper` added to the shared
+    settings after a profile's first launch makes the next launch refuse as `overridden`.
+  - **Replacement evidence** (§12.5): an `import` over the live account stale-marks the live
+    store whatever `active_accounts` held before, including a row that named another account
+    while the live identity named this one, and an `add` that dies part-way is reconciled with
+    its activation epoch recorded.
+  - **Exit paths** under §14.1: a signal during each launch lock wait, or during the login
+    check, launches nothing and leaves no reservation; a SIGINT or SIGTERM recorded just
+    before the spawn reaches `claude` once it starts; SIGTERM and SIGHUP while `claude` runs reach the child and exit
+    handling still runs; a signal during exit handling defers it, and the next launch
+    completes the capture and merge-back. The exit code is the child's in every case.
+  - **Liveness** (§12.6): `lstart`, all-digit and absent `procStart` records, a recycled pid
+    for each, and a `daemon` record keeping the account session-owned after the last `run`.
+  - **Activation epoch** (§12.5): an `import` over the live account is never undone by the
+    active-token refresh, the switch's outgoing capture or recovery; `switch <N> --force`
+    clears the stale mark; a forward recovery after a replacement leaves the live store
+    stale-marked.
+  - **Storage-write lock** (§9.1): a CC-style writer that updates a machine-shared key under
+    that lock while a switch, recovery, active-token refresh or bootstrap waits for it loses
+    nothing, and an account-scoped change under it aborts the tagteam write.
+  - **Session-owned usage** (§8.1): the profile's token is read without a lock, an expired one
+    sends nothing and gives back its slot, and a 401 stamps `rejected_fp`.
 - **Provider neutrality.** The test-only `FakeAgent` provider, in its own crate `tagteam-fake`
   (§4.1), is registered alongside Claude Code. It has its own home layout, a file-based
   credential store, a single live lock (its config lock is a no-op), refresh without a
   managed-key axis, its own usage windows, and some capabilities switched off. It grows with
   the trait: every trait method lands with its `FakeAgent` implementation. Its shapes differ from CC's on purpose: an identity with no email, credential
-  kinds CC doesn't have, and no `Long` window. Engine tests run against both providers, and
-  assert that:
+  kinds CC doesn't have, and no `Long` window. It supports sessions, with its own config-dir
+  variable, share policy and session records, so the generic `run` machinery is exercised
+  against a second provider. Engine tests run against both providers, and assert that:
   - positions, auto-switch state, leases and mappings stay per provider
   - a switch, refresh or auto tick on one provider never touches the other's state
   - a missing capability degrades as §4.5 specifies
+  - a `run` writes nothing outside the provider's declared surface and its own profile, for
+    either provider
   - its accounts store, list, export and import through the same schema and format, with no
     CC-shaped field
 
@@ -2313,7 +2621,15 @@ handler only records the signal in the engine's cancel token (§4.2), which test
 ### 15.4 Claude Code compatibility
 
 - **`cargo xtask compat`** runs locally against the real `claude` and a real test account:
-  - `claude auth status --json` against seeded profiles
+  - `claude auth status --json` against seeded profiles: every §12.3 outcome, `configDirectory`
+    equal to the exported spelling, and the `authMethod` a setup-token account yields
+  - the profile's hashed Keychain item is the one named from the exported spelling, and CC
+    moves a bootstrapped `.credentials.json` into it on its first credential write
+  - CC writes `settings.json` through a single link, appends `history.jsonl` through one, and
+    what it does to a linked `CLAUDE.md` and `keybindings.json`
+  - session records: written at start, removed on SIGINT, SIGTERM and SIGHUP, with an `lstart`
+    `procStart` on macOS and Linux; a `claude --bg` daemon's record in a profile
+  - the storage-write lock: CC waits for tagteam's, and the reverse
   - hot reload after a switch (file mtime, and the Keychain within 30 s)
   - CC reads tagteam-written Keychain items silently from a non-GUI (SSH) session, which covers
     risk R1
@@ -2322,8 +2638,9 @@ handler only records the signal in the engine's cancel token (§4.2), which test
   - CC runs on an API key while the credential entry keeps only machine-shared keys (§9.4)
   - lock interop while CC refreshes
 - **A weekly CI job** installs the latest `claude` and runs the checks that need no account:
-  version, the `auth status` shape when logged out, and top-level `~/.claude` entries against
-  the known lists. It opens an issue on drift.
+  version, the `auth status` shape when logged out, the top-level `~/.claude` entries against
+  the known lists (§12.2), and the `CLAUDE_CODE_*` and `ANTHROPIC_*` names the binary contains
+  against the ones tagteam has classified (§12.5). It opens an issue on drift.
 
 ## 16. Build, release, repository
 
@@ -2346,36 +2663,64 @@ handler only records the signal in the engine's cancel token (§4.2), which test
 | # | Risk / item | Mitigation |
 |---|---|---|
 | R1 | Keychain access control. Items created through Security.framework might make CC's `security` reads prompt or fail (rc 36) over SSH or under launchd (*inferred*) | Verified on 2026-09-27, macOS 27.0, CC 2.1.283: `claude` silently reads tagteam-written items from SSH and GUI sessions alike. An SSH session's login keychain stays locked (rc 36) until `security unlock-keychain`, for Claude Code's own items as much as for tagteam's. Use only `/usr/bin/security` for every item. |
-| R2 | CC drift beyond 2.1.283. A feature-flagged storage layer ("storageV5") may bypass the `~/.claude.json` lock; new per-account files may appear in `~/.claude` | The weekly compat job, `doctor` version warnings, and the known-entries lists |
+| R2 | CC drift beyond 2.1.286. A feature-flagged storage layer ("storageV5") may bypass the `~/.claude.json` lock; new per-account files, locks and auth variables keep appearing (2.1.286 added a storage-write lock, a credential-using daemon, and org policy caches in the config home) | The weekly compat job, `doctor` version warnings, the known-entries lists, the scrub list, and validation's `overridden` outcome (§12.3) |
 | R3 | The usage endpoint budget is empirical (~30 requests per hour per identity) and could change | Enforce a hard budget of 20 per hour below it, and keep the 180 s floor and AIMD. Re-derive the constants from logs, not from comments |
 | R4 | The merge-back can conflict with concurrent edits of `~/.claude.json` | Three-way merge against the baseline, the default file wins, under CC's config lock |
-| R5 | Sharing by denylist could share a future per-account file | Unknown entries are reported by `doctor` and by the weekly compat job |
+| R5 | Sharing could carry one account's state into another's profile, or leave a new user-content entry unshared | Sharing is by allowlist, so an unknown entry stays private (§12.2): the failure is a feature that starts empty in a profile, never a leak. Unknown entries are reported by the launch, `doctor` and the weekly compat job; `run.share_extra` covers a user's own files |
+| R8 | CC replaces a symlinked file with a regular file when it writes it, splitting a shared file between the homes | Share directories where possible; the shared files are ones CC appends to or writes through a link, or that the user edits. A launch detects a split and refuses for a must-share entry (§12.2) |
 | R6 | cswap's heuristics (§11) are complex | Named predicates, simulation tests, and a documented trace corpus |
 | R7 | The `Provider` trait is designed from one real implementation, so it may not fit Codex, Gemini CLI or Grok (different auth models, API-key-only logins, no usage endpoint, no session isolation variable) | Keep the trait internal, not a public API. Use explicit capability flags. Exercise the engine with the `FakeAgent` provider (§15.2). Revise the trait in the first real second-provider spec rather than guessing now |
-| O1 | Whether `.device-keys.json` should be shared | Private until verified; revisit in the compat suite |
+| O1 | Whether `.device-keys.json` should be shared | Closed: CC 2.1.286 keeps device keys machine-wide, keyed by account (Appendix A.7), so a profile's copy is never used |
+| O2 | CC 2.1.286 passes `rate_limits` (five-hour, seven-day and spend percentages with resets) on the statusline command's stdin | Not used: `statusline` ignores stdin (§13.5). A later version could record them as free readings for the session's account, outside the request budget |
 
 ---
 
-## Appendix A — Claude Code provider: interop contract (verified against CC 2.1.283)
+## Appendix A — Claude Code provider: interop contract (verified against CC 2.1.283, re-verified against 2.1.286)
 
 This appendix is the contract that `tagteam-cc` implements. Nothing in it applies to other
-providers.
+providers. It was re-verified against CC 2.1.286 on 2026-10-01, by reading the JavaScript the
+binary embeds and by probing a fresh config dir; facts marked *2.1.286* are new or changed
+since 2.1.283.
 
 ### A.1 Paths
 
-- **Config home:** `$CLAUDE_CONFIG_DIR` if non-empty, else `~/.claude`.
+- **Config home:** `$CLAUDE_CONFIG_DIR` if non-empty, else `~/.claude`, NFC-normalized and
+  never resolved through `realpath`. *2.1.286:* a `CLAUDE_CONFIG_DIR` that is set but empty
+  makes some of CC's paths relative to the working directory while its Keychain naming treats
+  it as unset. tagteam treats an empty value as unset, never exports one, and `doctor` warns
+  when one is set.
 - **Global config:** `<config_home>/.config.json` if it exists (legacy). Otherwise
   `($CLAUDE_CONFIG_DIR or $HOME)/.claude.json`. By default that is `~/.claude.json`, not inside
-  `~/.claude`.
+  `~/.claude`. *2.1.286:* the non-production OAuth switches (`CLAUDE_CODE_CUSTOM_OAUTH_URL`,
+  `USE_LOCAL_OAUTH`, `USE_STAGING_OAUTH`) rename it `.claude-custom-oauth.json`,
+  `.claude-local-oauth.json` or `.claude-staging-oauth.json`, and give the Keychain services a
+  matching `OAUTH_FILE_SUFFIX`. tagteam supports production names only: `run` scrubs the
+  switches (§12.5), and `doctor` warns when one is set.
 - **Plaintext credential:** `<secure-storage dir>/.credentials.json`.
 - **Secure-storage dir:** if `CLAUDE_SECURESTORAGE_CONFIG_DIR` is *defined* (even empty), use it
   NFC-normalized, with empty meaning `~/.claude`, whatever `CLAUDE_CONFIG_DIR` says. Otherwise
   use the config home.
 - **Credential locks:** `<secure-storage dir>/.oauth_refresh.lock` (symlinks not resolved) and
   `<realpath(secure-storage dir)>.lock`, both `proper-lockfile` with stale 60 s and update 5 s
-  (§9.1).
-- **Session records:** `<config_home>/sessions/<pid>.json`. **IDE locks:**
-  `<config_home>/ide/<port>.lock`.
+  (§9.1). CC takes the refresh lock first, then the legacy one, and releases the first to retry
+  when the second is contended.
+- **Storage-write lock** (*2.1.286*): `<secure-storage dir>/.storage-write`, `proper-lockfile`
+  with stale 15 s and up to 10 retries. CC takes it around every write to its secure storage,
+  re-reading the entry strictly under it (§9.1, A.3).
+- **Refresh-lock owner record** (*2.1.286*): CC writes `.oauth_refresh.lock.owner` (its pid,
+  `procStart` and the lock directory's birth time) when it takes the refresh lock, and, behind
+  a feature flag, takes over a lock whose recorded owner is dead. It never takes over a lock
+  that has no owner record, or whose record names another birth time than the directory's, so
+  tagteam's owner-less locks (§9.1) stay safe.
+- **File writes.** CC writes `.claude.json` and the user `settings.json` through a symlink,
+  one hop only: it reads the link, resolves it against the `realpath` of the link's directory,
+  and renames a temporary file over that target, so a link to a link loses its second link
+  (anthropics/claude-code#78162). It writes `.credentials.json` and most other files by
+  renaming a temporary file over the path itself, which replaces a symlink with a regular file.
+  Project and local settings refuse symlinks altogether (*2.1.286*, not tested empirically).
+- **Session records:** `<config_home>/sessions/<pid>.json` (A.7). **IDE locks:**
+  `<config_home>/ide/<port>.lock`; with `CLAUDE_CONFIG_DIR` set, CC also reads the default
+  `~/.claude/ide`.
 
 ### A.2 Keychain naming (macOS)
 
@@ -2385,12 +2730,14 @@ providers.
   - `OAUTH_FILE_SUFFIX` is `""` for production builds.
   - `useDefault` is `!value` when `CLAUDE_SECURESTORAGE_CONFIG_DIR` is defined, else
     `!CLAUDE_CONFIG_DIR`.
-  - `dir` is the **raw exported string**, never canonicalized; a trailing slash changes the
-    hash.
-- **An explicitly set `CLAUDE_CONFIG_DIR=~/.claude` produces a suffixed item.** Readers try the
-  suffixed item first, then the unsuffixed one.
-- **A symlinked profile** is read as `hash(link)` first, then `hash(readlink target)`. A
-  relative target is joined to the link's parent.
+  - `dir` is the **raw exported string**, NFC-normalized and never canonicalized; a trailing
+    slash changes the hash.
+- **One item, no fallback** (*2.1.286*). Every read, write and delete uses that one service.
+  CC no longer falls back to the unsuffixed item for an explicitly set
+  `CLAUDE_CONFIG_DIR=~/.claude`, nor to `hash(readlink target)` for a symlinked config dir, so
+  every spelling of a directory names its own item. tagteam reads, writes and clears only that
+  item too, and exports each profile under one recorded spelling (§12.2). Items left under the
+  former fallback names are inert; `doctor` reports them.
 - **Account:** `$USER`, else the passwd name for `geteuid()`, else `claude-code-user`. It is also
   `claude-code-user` when the name fails `^[a-zA-Z0-9._-]+$`.
 
@@ -2442,9 +2789,18 @@ providers.
   serves its stale cache on a read failure.
 - **CC's read precedence.** CC reads the Keychain first and `.credentials.json` only as a
   fallback. Its default read treats *any* Keychain failure as absent and falls through to the
-  file; only its refresh path reads the Keychain strictly.
+  file. *2.1.286:* its refresh and every secure-storage write read the Keychain strictly, so an
+  item that exists but cannot be read fails the operation instead of being overwritten.
+- **Writes** (*2.1.286*) run under the storage-write lock (A.1): CC re-reads strictly, applies
+  its change, and writes. Its refresh saves compare-and-swap on the refresh token, adopting a
+  sibling's newer write. On `invalid_grant` it writes both tokens empty and `expiresAt` 0,
+  the `Wiped` shape (§9.4 step 4).
+- **Plaintext migration** (*2.1.286*). CC never migrates on a read. On its next secure-storage
+  write (a login, a refresh, any update) the Keychain write lands, and if the Keychain held no
+  item before, CC deletes `.credentials.json`. If the Keychain write fails for a lasting
+  reason, CC writes the file and deletes the Keychain item instead.
 - **Hot reload.** CC invalidates its memoized token when the mtime of `.credentials.json`
-  changes.
+  changes; *2.1.286* checks it before every pre-request refresh check.
   - After a Keychain write, rewrite `.credentials.json` with the same bytes if it *already
     exists*, to bump its mtime. Never create it.
   - **File fallback.** If the Keychain write fails and the write falls back to the file, the
@@ -2466,10 +2822,13 @@ providers.
   "trustedDeviceToken" }
 ```
 
-- **Machine-shared keys** (taken from the live credential on activation):
+- **Machine-shared keys** (taken from the live credential on activation, and from the
+  profile's own credential at a profile bootstrap, §12.3):
   `mcpOAuth, mcpOAuthClientConfig, mcpXaaIdp, mcpXaaIdpConfig, pluginSecrets`.
 - **Account-scoped keys:** `claudeAiOauth, trustedDeviceToken`. Unknown sibling keys are treated
-  as account-scoped.
+  as account-scoped. *2.1.286* also stores `designOauth`, `gatewayTrust` and
+  `enterpriseGateway` in the entry; tagteam treats them as unknown keys, so account-scoped
+  (*inferred*).
 - **Managed API key:** stored raw, not as JSON.
 
 ### A.5 Endpoints
@@ -2517,11 +2876,52 @@ is synthetic, since a successful refresh can't be recorded without spending a re
 | `oauthAccount.organizationName` | display |
 | `oauthAccount.accountUuid` | uuid corroboration |
 | `primaryApiKey`, `customApiKeyResponses.approved` | the managed-key axis |
-| `projects`, `mcpServers` | profile seeding and merge-back |
-| `theme`, `hasCompletedOnboarding` | profile seeding |
+| `projects`, `mcpServers` | profile seeding and merge-back. *2.1.286:* top-level `mcpServers` is the user scope and `projects.<path>.mcpServers` the local scope; each project also carries `allowedTools`, `hasTrustDialogAccepted`, the `.mcp.json` approvals and the external-include approvals |
+| `theme`, `hasCompletedOnboarding` | profile seeding. *2.1.286:* `hasCompletedOnboarding` is the only onboarding gate; `theme` is not one |
 
 Other flat account-dependent fields (`hasAvailableSubscription`, …) are left alone; CC
-refreshes them itself (*inferred*).
+refreshes them itself (*inferred*). *2.1.286* creates per-home identifiers on a config dir's
+first start (`userID`, `machineID`, `summonSidKey`, `firstStartTime`, `migrationVersion`), and
+caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
+`cachedGrowthBookFeatures`, …). Profile seeding copies none of them (§12.4).
+
+### A.7 Sessions, background daemon and auth status (*2.1.286*)
+
+- **Session records.** `<config_home>/sessions/<pid>.json` (directory 0700), written when a
+  session starts and before its first prompt, and removed by a graceful exit (SIGINT, SIGTERM
+  and SIGHUP all shut down gracefully); SIGKILL leaves it behind. Its fields include `pid`,
+  `sessionId`, `cwd`, `startedAt` (epoch ms), `procStart`, `version`, `kind` (`interactive`,
+  `bg`, `daemon` or `daemon-worker`) and `entrypoint`, and later `status` and `updatedAt`.
+  `procStart` is `ps -o lstart=` output with `LC_ALL=C` and `TZ=UTC`, on macOS and Linux
+  alike, and is omitted when `ps` fails. A session that CC itself spawned
+  (`CLAUDE_CODE_CHILD_SESSION`) writes no record, unless `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE`
+  is set; a `run` started from inside a session relies on its reservation (§12.5).
+- **Background daemon.** `claude --bg`, background agents and `claude daemon install` run a
+  supervisor per config home. Its state is `<config_home>/daemon/` with sibling `daemon.*`
+  files, and its sockets are under `/tmp/cc-daemon-<uid>/<sha256(config home)[..8]>/`. It reads
+  that home's credential, refreshes it proactively under the credential locks, and passes
+  access tokens to its workers. It registers a session record of kind `daemon`. The installed
+  launchd or systemd service is for the default config dir only: `claude daemon install`
+  refuses when `CLAUDE_CONFIG_DIR` is set.
+- **`claude auth status`** prints JSON by default; `--json` is accepted and changes nothing,
+  and `--text` prints text. Fields: `loggedIn`, `authMethod`, `apiProvider`,
+  `analyticsDisabled`, `projectsDirectory`, `configDirectory` always; `email`, `orgId`,
+  `orgName` and `subscriptionType` for a `claude.ai` login; `apiKeySource` and others when
+  they apply. `authMethod` is `claude.ai`, `api_key`, `api_key_helper`, `oauth_token`,
+  `third_party`, or `none` when logged out. It exits 0 only when logged in. Its source order is
+  `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, the token file descriptor, an
+  `apiKeyHelper`, a workload-identity profile, and only then the stored `claude.ai` login.
+- **Workload-identity profiles** live outside the config dir (`$ANTHROPIC_CONFIG_DIR`, else
+  `$XDG_CONFIG_HOME/anthropic` or `~/.config/anthropic`) and are selected by
+  `ANTHROPIC_PROFILE` or an `active_config` file. They are not keyed by `CLAUDE_CONFIG_DIR`.
+- **The statusline command** runs with CC's own environment (`CLAUDE_CONFIG_DIR` included) plus
+  `CLAUDE_PROJECT_DIR`, `CLAUDECODE=1`, `CLAUDE_CODE_SESSION_ID` and others, in the session's
+  working directory. Its stdin JSON carries the session, model, workspace, cost and context
+  fields, and `rate_limits` (§17 O2).
+- **Machine-wide state outside any config dir.** Device keys live in the Keychain item
+  `Claude Code-device-keys` and the fallback file `~/.claude/.device-keys.json`, keyed by
+  account uuid, whatever `CLAUDE_CONFIG_DIR` says. `~/.claude/bridge-spawn/` is fixed to the
+  default home too. A profile shares these with the default home by CC's own design.
 
 ## Appendix B — Invariants carried over from cswap
 
@@ -2613,8 +3013,9 @@ Each is a one-liner, and each gets at least one test.
     advanced past it.
 49. A credential entry that cannot be read fresh is never overwritten, even with `--force`.
 50. An explicit login replacement is never undone by a capture from any profile, live or
-    quiescent (the login epoch). One that dies part-way is reconciled by the next holder of
-    the account lock, and never strands a profile's rotation.
+    quiescent (the login epoch), nor from the default home's live store (the activation
+    epoch). One that dies part-way is reconciled by the next holder of the account lock, and
+    never strands a profile's rotation.
 51. Every credential kind has a fingerprint (§2), so interrupted switches between accounts of
     any kind recover. Recovery never re-activates the vault on the absence of a live credential
     alone.
@@ -2631,6 +3032,26 @@ Each is a one-liner, and each gets at least one test.
     single writer (§11.1).
 56. An auto-switch never replaces a live account other than the one its tick decided on; a
     manual switch made meanwhile wins (`live-changed`).
+57. A run shell is recognized from its profile marker alone, and inside one tagteam resolves
+    the provider's home from the marker: the live login it reads, refreshes or protects is
+    always the default home's (§12.8).
+58. A profile is exported under one recorded spelling, and every operation on its credential
+    uses that spelling (§12.2).
+59. A profile shares only allowlisted entries of the source home. Unknown entries stay private,
+    and known-private entries (credentials, config, daemon state, account caches, org policy,
+    tokens and locks) are never linked (§12.2).
+60. A profile's credential carries the vault's account-scoped keys and only the profile's own
+    machine-shared keys, so no rotating token, an account's or an MCP server's, has a copy in
+    two homes (§12.3).
+61. Every write of a CC credential entry holds CC's storage-write lock, re-reads the entry under
+    it, and keeps the machine-shared keys CC wrote meanwhile (§9.1).
+62. Every launch checks that the session will authenticate as its account. Validation deletes
+    a profile only at a bootstrap, and only when CC reports it logged out or logged in as
+    another account; a login that something outside the profile overrides, or that the check
+    cannot confirm, refuses the launch and keeps the profile (§12.3).
+63. `run` exits with the child's status. Signals sent while `claude` runs never cancel the exit
+    handling its exit starts, and exit handling that is cancelled later loses nothing: lazy
+    capture and the next launch complete it (§12.5).
 
 ## Appendix C — cswap → tagteam command map
 
