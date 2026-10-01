@@ -161,7 +161,7 @@ impl Engine {
     fn auto(&self, provider: &ProviderId, cfg: AutoConfig) -> Result<AutoEngine>; // holds the engine lock (§11.1)
     // AutoEngine::tick(&mut self, sink: &dyn EventSink) -> TickOutcome; next_delay(...) (§11.4)
     fn run_session(&self, req: RunRequest) -> Result<ExitStatus>;
-    fn export / import / history / doctor(...);
+    fn export / import / history / doctor / purge / displaced(...);
 }
 ```
 
@@ -192,7 +192,10 @@ impl Engine {
   merge-back (§12.4), which take no
   credential lock while holding it; taking a lone lock cannot invert the order. The auto-switch
   engine lock (§11.1) is outside the order altogether: it is only ever tried, never waited
-  for, and is held for an engine's lifetime.
+  for, and is held for an engine's lifetime. tagteam's settings lock (§6.4) and the log's
+  rotation lock (§14.2) are outside it too: each is taken alone, and nothing else is taken
+  while it is held. The displaced lock (§6.3) is a leaf, like CC's storage-write lock: it may
+  be taken under any other lock, and nothing is taken while it is held.
 - **No network while holding a contended lock.** There are two exceptions, both bounded:
   - the refresh gate holds the account lock across its token request (§7.3, 10 s), which is
     what makes it single-flight;
@@ -224,9 +227,9 @@ impl Engine {
   host itself; the proxy does, and a failure to reach the proxy is `PreSend`. Tests never
   inherit the environment's proxy.
 - **Encryption.** The `age` crate: passphrase via scrypt, or X25519 and SSH recipients.
-- **Logging.** `tracing` to a rolling file, controlled by `--debug` or `TAGTEAM_LOG`. Log lines
-  identify accounts by position and ID, never by email, because users paste logs into public
-  issues.
+- **Logging.** `tracing` to a rolling file, controlled by `--debug` or `TAGTEAM_LOG` (§14.2).
+  Log lines identify accounts by position and ID, never by email, because users paste logs
+  into public issues.
 
 ### 4.5 The `Provider` trait
 
@@ -281,7 +284,7 @@ pub trait Provider: Send + Sync {
     fn validate_profile(&self, profile: &ProfileDir) -> Validity;  // §12.3 step 8's outcomes
 
     // Diagnostics
-    fn doctor_checks(&self, env: &Env) -> Vec<Check>;
+    fn doctor_checks(&self, env: &Env) -> Vec<Check>;    // §13.6; Check { id, status, message, fix }
 }
 ```
 
@@ -342,11 +345,17 @@ mode 0700, so a command that changes nothing creates nothing.
 | Launch reservations | `<profile>/.tagteam-launch/<pid>.lock` |
 | Mutation lock | `$XDG_DATA_HOME/tagteam/.mutation.lock` |
 | Account locks | `$XDG_DATA_HOME/tagteam/locks/<id>.lock` |
-| Auto-switch engine locks | `$XDG_DATA_HOME/tagteam/locks/autoswitch-<provider>.lock` (§11.1) |
-| Log | `$XDG_STATE_HOME/tagteam/tagteam.log` (1 MiB × 3) |
+| Auto-switch engine locks | `$XDG_DATA_HOME/tagteam/locks/autoswitch-<provider>.lock`, holding the engine's pid and start time (§11.1) |
+| Settings lock | `$XDG_DATA_HOME/tagteam/locks/config.lock` (§6.4) |
+| Displaced lock | `$XDG_DATA_HOME/tagteam/locks/displaced.lock` (§6.3) |
+| Log | `$XDG_STATE_HOME/tagteam/tagteam.log`, rotated to `.1` and `.2` (1 MiB × 3), with its rotation lock `tagteam.log.lock` (§14.2) |
 
 Every file that contains secrets is created with mode 0600 at creation time (`O_EXCL`, then
 write, then rename). It is never chmod'ed afterwards.
+
+**`HOME` must be usable.** Every default path derives from it, so tagteam refuses to run, with
+exit 1 and kind `env`, when `HOME` is unset, empty or not absolute; a fallback would put state
+under `/` or the working directory. `statusline` prints nothing instead.
 
 tagteam refuses to run as root unless `/` is an overlay mount: the visible root mount in
 `/proc/self/mountinfo` has filesystem type `overlay`, as in a Docker container. On macOS, which
@@ -591,45 +600,125 @@ the Keychain's failure modes.
   - A rescue file that cannot be read or parsed makes the gate return `Transient` with kind
     `rescue-unreadable`, without sending a request. It also blocks activating the account
     until it is settled (§6.2).
-- **`displaced/`** holds live credentials that were not ours, stashed before a switch
-  overwrote them. The files are forensic and write-only. `tagteam displaced` lists them;
-  `tagteam displaced --purge ID` deletes one.
+  - A `rescue` path that is not a directory, or cannot be listed, leaves every account's
+    rescues unknown, so it counts as an unreadable rescue for every account. `remove` refuses,
+    naming the path, rather than guess which entries were the account's; `doctor` fails the
+    check (§13.6). Only a full `purge` deletes it (§10.5).
+  - A rescue file whose account no longer exists is reported by `doctor` and deleted by
+    `purge`. `remove` deletes the removed account's own.
+- **`displaced/`** holds credentials that were not tagteam's to keep: a live login that a
+  switch overwrote, a successor the token endpoint attributed to another account, and so on
+  (the row's `reason`).
+  - Each file is `<id>.json`, with `id = <epoch s>-<fp12>-<rand6>`, and holds the credential
+    bytes verbatim. The file is written first and its row second, so a failed insert leaves a
+    file with no row, never a row that names nothing.
+  - Both are written under the displaced lock (`locks/displaced.lock`, §5): a leaf `flock`,
+    held only around one entry's file and row, with nothing else taken while it is held
+    (§4.3). `displaced --purge` holds it around each deletion, so it never deletes a file
+    whose row is still to be inserted.
+  - A row's `identity` is the identity the displacing code attributed the bytes to, or null.
+    A secret found on the other auth axis (§9.4 step 7) is never attributed to the outgoing
+    login: its row carries an identity only when the bytes themselves name one.
+  - tagteam never reads a displaced credential back. Restoring one is manual; the listing
+    names the file.
+
+**`tagteam displaced [--json]`** lists the entries, newest first, joining rows and files: the
+ID, provider, time, reason, identity (and the position of the managed account it names, if
+any) and the fingerprint's first 12 hex digits. A file with no row is listed as `unrecorded`,
+with the time its name carries; a row whose file is gone is listed as `file missing`. It never
+prints a credential, and it reads only the store and the directory, under no lock.
+
+```json
+{ "schemaVersion": 1, "dir": "…/displaced",
+  "displaced": [ { "id": "…", "provider": "claude-code", "at": "…Z", "reason": "displaced-live-login",
+                   "fingerprint": "sha256:…", "identity": { … }, "account": 3,
+                   "file": "present", "recorded": true } ] }
+```
+
+`identity` and `account` are null when unknown; `file` is `present` or `missing`.
+
+**`tagteam displaced --purge ID... [--yes]`** deletes each named entry: the file first,
+verified gone, then the row. Every ID is checked before anything is deleted; an unknown one is
+an error that names it. It asks for confirmation on a terminal. Without a terminal, or with
+`--json`, it requires `--yes` and otherwise fails with `needs-confirmation`. Each deletion
+holds the displaced lock, waited for up to 5 s.
 
 ### 6.4 Settings (`config.toml`)
 
-`tagteam config list|get|set|unset|path [--json]` edits the file with `toml_edit`, which
-preserves comments and formatting. `set` writes only the key it is given, so defaults are never
-frozen into the file.
+`tagteam config list|get|set|unset|path [--json]` reads and edits the file with `toml_edit`,
+which preserves comments and formatting. `set` writes only the key it is given, so defaults are
+never frozen into the file.
 
-- **Reads are forgiving.** A corrupt file or an out-of-range value falls back to the default,
-  with a warning.
-- **`set` and `unset` are strict.** They refuse to write to a corrupt file.
-- **Booleans** parse only `true/false/1/0/yes/no`.
+**One registry.** Every key in the table below is declared once, with its type, default, valid
+values and whether a provider table may override it. Reads, `set` and `unset`, `config list`,
+`doctor` (§13.6) and completions (§13.7) all use that declaration, so none of them accepts a
+key or value that another rejects.
+
+- **Reads are forgiving.** A corrupt file or an invalid value falls back to the default, with a
+  warning. An unknown key is ignored; `config list` and `doctor` report it.
+- **`set` and `unset` are strict.** They refuse to write to a corrupt file. `set` refuses an
+  unknown key, a key that a provider table cannot override (`provider.<id>.ui.color`), a value
+  of the wrong type and a value outside its range, each with `invalid-input`; it never clamps.
+- **Values on the command line.** Numbers are written as typed. **Booleans** parse only
+  `true/false/1/0/yes/no` and are written as TOML booleans. **Lists** are comma-separated; each
+  item is trimmed, and an empty item is refused. An empty argument (`''`) writes an empty
+  list, which is how a provider table overrides a non-empty global list. `all` in
+  `autoswitch.models` must stand alone.
+- **Key-specific rules** apply on `set` exactly as on reads: `default_provider` must name a
+  registered provider; `statusline.format` takes §13.5's placeholders only; each
+  `run.share_extra` item must be a single entry name (no `/`, not `.` or `..`, not
+  `.tagteam-*`) and not on the known-private list (§12.2), where a read only ignores it with a
+  warning.
 
 **Provider overrides.** The `[autoswitch]` table holds defaults for every provider. A
 `[provider.<id>.autoswitch]` table overrides individual keys for one provider, for example
 `tagteam config set provider.claude-code.autoswitch.models Fable`. Keys that only make sense for
 one provider (`models`, `statusline.*`, `run.share_extra`) are read from that provider's
-table first, then from the global table.
+table first, then from the global table. `provider.<id>.<key>` and `<key> --provider <id>` name
+the same entry in every `config` command.
 
-| Key | Default | Valid |
-|---|---|---|
-| `default_provider` | `claude-code` | a registered `ProviderId` |
-| `autoswitch.threshold` | 90.0 | 50–99.9 |
-| `autoswitch.interval_seconds` | 60 | 15–3600 |
-| `autoswitch.cooldown_seconds` | 300 | 0–86400 |
-| `autoswitch.hysteresis_pct` | 10.0 | 0–50 |
-| `autoswitch.strategy` | `best` | `best`, `consume-first` |
-| `autoswitch.include_api_key_accounts` | false | bool |
-| `autoswitch.unhealthy_ticks` | 3 | 1–100 |
-| `autoswitch.models` | `[]` | list of model display names, or `["all"]` alone; duplicates collapse (case-insensitively) |
-| `usage.history_retention_days` | 180 | 1–3650 |
-| `statusline.format` | `"{account} · 5h {5h}% · 7d {7d}%{stale}"` | placeholders listed in §13.5 only; `{model:<name>}` needs a trimmed, non-empty name without braces |
-| `run.share_extra` | `[]` | entry names of the source home to share into profiles, besides the provider's allowlist (§12.2); known-private names are ignored with a warning |
-| `ui.color` | `auto` | `auto`, `always`, `never` (`NO_COLOR` and `FORCE_COLOR` also honoured) |
+**Commands.**
+- **`config list [--provider P]`** shows every key with its effective value for the provider
+  (`default_provider` when none is given) and its source: `default`, `global` or `provider`.
+  Unknown keys found in the file follow, flagged.
+- **`config get KEY [--provider P]`** prints the effective value alone, for scripts: a list
+  comma-separated, or as an array under `--json`.
+- **`config set KEY VALUE`** and **`config unset KEY`** change one entry. `unset` of an absent
+  key changes nothing and succeeds. `unset` also removes a table it leaves empty, unless the
+  table holds a comment.
+- **`config path`** prints the file's path, whether or not it exists.
+
+**Writing.** `set` and `unset` hold the settings lock (`locks/config.lock`, §5): a standalone
+`flock`, outside the lock order (§4.3), waited for up to 5 s, with each wait a cancellation
+point (§14.1). Under it they read the file, edit it with `toml_edit`, and replace it with the
+atomic writer (§9.5), through a symlink to its target. A new file is created 0600, as every
+tagteam file is, so its mode never depends on the umask; an existing file keeps its mode. Only
+`set` creates the file. `config` works inside a run shell (§12.8): settings are not accounts.
+
+JSON shapes: `list` returns `{schemaVersion, path, provider, keys: [{key, value, default,
+source}], unknown: [key]}`; `get` returns `{schemaVersion, key, provider, value, source}`;
+`set` and `unset` return `{schemaVersion, ok, key, value, changed}`; `path` returns
+`{schemaVersion, path, exists}`.
+
+| Key | Default | Valid | Per provider |
+|---|---|---|---|
+| `default_provider` | `claude-code` | a registered `ProviderId` | — |
+| `autoswitch.threshold` | 90.0 | 50–99.9 | yes |
+| `autoswitch.interval_seconds` | 60 | 15–3600 | yes |
+| `autoswitch.cooldown_seconds` | 300 | 0–86400 | yes |
+| `autoswitch.hysteresis_pct` | 10.0 | 0–50 | yes |
+| `autoswitch.strategy` | `best` | `best`, `consume-first` | yes |
+| `autoswitch.include_api_key_accounts` | false | bool | yes |
+| `autoswitch.unhealthy_ticks` | 3 | 1–100 | yes |
+| `autoswitch.models` | `[]` | list of model display names, or `["all"]` alone; duplicates collapse (case-insensitively) | yes |
+| `usage.history_retention_days` | 180 | 1–3650 | — |
+| `statusline.format` | `"{account} · 5h {5h}% · 7d {7d}%{stale}"` | placeholders listed in §13.5 only; `{model:<name>}` needs a trimmed, non-empty name without braces | yes |
+| `run.share_extra` | `[]` | entry names of the source home to share into profiles, besides the provider's allowlist (§12.2); known-private names are ignored with a warning | yes |
+| `ui.color` | `auto` | `auto`, `always`, `never` (`NO_COLOR` and `FORCE_COLOR` also honoured) | — |
 
 CLI flags override settings for a single invocation and are clamped to the same ranges. A
 running `auto` re-reads the file whenever its mtime changes (§11.4); its flags still win.
+Nothing else caches settings across commands.
 
 ## 7. Credentials and the refresh gate
 
@@ -753,6 +842,9 @@ simply succeeds.
   - Any vault write that changes the fingerprint clears it; no special clear path exists.
   - `add`, `add-token` and `import` clear it explicitly.
   - A plain `import` may replace a quarantined account without `--force`.
+  - Every clear records one `unquarantine` event, whichever path clears it, the switch's
+    outgoing capture included. Its reason is `account-replaced` when the account's
+    `login_epoch` moved, else `credentials-replaced` (§11.4).
 - **The active account's quarantine** holds while *either* the live credential or the vault
   matches `quarantine_fp`.
 
@@ -1338,7 +1430,9 @@ is replaced.
   never replaces a file it cannot splice, because that would drop everything else in it (§3).
   This departs from cswap, which saved a salvage copy and replaced the file.
 - **Atomic write through symlinks.** The temp file is created beside the *resolved* target, then
-  fsynced and renamed. The mode is preserved, or 0600 for new files.
+  fsynced and renamed. The mode is preserved, or 0600 for new files. The temp file is named
+  `.<name>.tagteam-<pid>-<hex8>`, so one left by a killed writer is recognizable, along with
+  whether its writer still runs (§13.6).
 
 The same primitive writes `.credentials.json` and every other file tagteam writes.
 
@@ -1363,9 +1457,11 @@ are checked in order:
 | Anything else, including no credential on either axis | Undecidable. For example, CC rotated the credential while the oracle is unavailable; or it rotated it and then logged out, so absence does not prove the switch never published | Keep the row. Account-changing commands for the provider refuse with `interrupted-switch` until recovery can decide; `switch --force` resolves it by displacing any live credential and activating the chosen account. The vault is never re-activated on absence alone |
 
 **Account-changing commands** here are the ones that read or write credentials or the live
-login: `switch` (without `--force`), `add`, `add-token` and `remove`. `alias`, `disable`,
-`enable` and `move` change only store metadata and proceed regardless. They still attempt
-recovery, but from fingerprints alone: they never ask the oracle (§7.6).
+login: `switch` (without `--force`), `add`, `add-token`, `import` and `remove`. `alias`,
+`disable`, `enable` and `move` change only store metadata and proceed regardless. They still
+attempt recovery, but from fingerprints alone: they never ask the oracle (§7.6). `purge`
+recovers what it can and otherwise deletes the row with a warning (§10.5), and `export` treats
+the accounts the row names as broken (§13.3).
 
 **What a forward finish does with the entries it clears.** Clearing the other auth axis follows
 §9.4 step 7's rule, with the generation the row journaled (`from_fp`) counting as settled. An
@@ -1436,10 +1532,16 @@ Captures the live login.
 
 ### 10.3 Other commands
 
-- **`remove <ACCOUNT>`** deletes the vault entries (strict), the store row (which cascades), the
-  mappings, and the session profile. For the profile it deletes the profile's hashed Keychain
-  item first, named from the spelling its marker records (§12.2), then the directory. The
+- **`remove <ACCOUNT>`** deletes, in this order: the vault entries (strict), the account's
+  rescue files (§6.3), the session profile, and last the store row, which cascades to the
+  mappings and usage rows. For the profile it deletes the profile's hashed Keychain item
+  first, named from the spelling its marker records (§12.2), then the directory. The
   directory's links are removed as links; nothing they point to is touched.
+  - **The order is what makes a `remove` that stops part-way safe.** The vault goes first, so
+    no generation older than a rescue or a rotated profile can outlive it: an account
+    without a vault credential is never switched to, refreshed or launched (§7.3 step 3,
+    §9.3, §12.3). The row goes last, so the account stays listed, and running `remove` again
+    finishes, since every delete treats an absent item as done.
 - **`disable` / `enable <ACCOUNT>`** hold an account out of automatic selection. It stays a
   valid explicit `switch` target.
 - **`alias <ACCOUNT> <NAME>` / `alias <ACCOUNT> --unset` / `alias`** (list).
@@ -1465,6 +1567,83 @@ If an email matches several orgs, or several providers, it is ambiguous:
 - With `--json`, or with no terminal, fail with an error listing the candidates.
 
 An empty alias never matches.
+
+### 10.5 `purge [--provider P] [--yes]`
+
+Deletes tagteam's data: every account of the provider, or with no `--provider`, everything
+tagteam stores. It never deletes or replaces a provider's live login. It writes the default
+home only to finish an interrupted switch, as every command that takes `MutationGuard` does
+(§9.6).
+
+**Order.** Inside a run shell, purge refuses at once (§12.8). Otherwise:
+1. On macOS, the Keychain lock check (Appendix A.3).
+2. The summary and confirmation, before any lock is taken, so none is held while the user
+   reads: the accounts by position and label, their profiles, orphaned profiles (step 6),
+   pending rescues (refreshed tokens not yet in the vault), displaced credentials, and for a
+   full purge the store and the log.
+   Purge asks on a terminal. Without one, or with `--json`, it requires `--yes`, and otherwise
+   fails with `needs-confirmation`.
+3. Each affected provider's engine lock (§11.1), tried and held to the end, so no auto-switch
+   engine starts while purge runs. A lock that is held refuses the purge, naming the engine's
+   pid from its record.
+4. `MutationGuard`, held to the end. Every command that adds an account, replaces a login,
+   launches a session, captures or switches takes it, so nothing is created behind purge;
+   such a command run meanwhile may fail with `lock-timeout`.
+5. Recovery of an interrupted switch (§9.6). If recovery cannot decide it, purge deletes the
+   journal row with a warning that the live login may be incoherent (its credential and
+   `oauthAccount` may name different accounts), and leaves the live login as it is: purge is
+   the way out of a state tagteam cannot repair.
+6. The refusals that need the guard:
+   - an affected account that is session-owned (§10.3's guard), naming its session;
+   - an orphaned profile that is not quiescent: a profile directory under `sessions/` whose
+     marker names no store account, or cannot be read, and that has a live launch
+     reservation or a session record that is live or unreadable (§12.5, §12.6). An orphan
+     counts as affected when its marker names the provider being purged, or cannot be read,
+     or the purge is full;
+   - a set of affected accounts that differs from the one confirmed, because another command
+     added or removed one in between, asking to run purge again.
+7. The accounts, one at a time, each under its account lock, re-checking that it is not
+   session-owned, exactly as `remove` deletes one (§10.3), vault first. In a full purge a
+   `rescue` path that cannot be listed (§6.3) does not stop it: the accounts' rescue step is
+   skipped, and the whole path goes at step 9, after every vault. A `--provider` purge refuses
+   on one, as `remove` would.
+8. The orphaned profiles that count as affected, each after deleting the hashed item its
+   marker's spelling names, or, when the marker cannot be read, the item its canonical path
+   names.
+9. The rest of the provider's data, or of all data (below).
+
+**A purge that stops part-way,** interrupted or failing on one item, can leave an account
+partly deleted. Since each account's vault goes first (§10.3), such an account has no vault
+credential, so it is never switched to, refreshed or launched, and no consumed generation is
+left where a newer one was deleted. `doctor` reports it (§13.6), and running `purge` or
+`remove` again finishes it, since every delete treats an absent item as done.
+
+**With `--provider P`,** purge then deletes P's remaining rows: its displaced entries (each
+file before its row, §6.3), events, `autoswitch_state`, `active_accounts`, `live_identity_cache`
+and `switch_journal`. Its `usage_requests` rows stay. They age out within the hour, so the
+budget (§8.6) does not reset.
+
+**Without `--provider`,** purge then deletes:
+- every Keychain item of service `tagteam`, by deleting by service until none is left
+  (Appendix A.3). This catches items whose store rows are gone, as after a store deleted by
+  hand;
+- `vault/` (Linux), the `rescue` path whatever it is, `displaced/`, and the atomic writer's
+  temp files (§9.5) whose writer is gone, in tagteam's own directories only: one beside a CC
+  file is outside the identity surface (§3), so `doctor` names it for the user to delete;
+- the store's contents: every row of every table, in one transaction with `secure_delete` on,
+  followed by a WAL checkpoint that truncates the WAL, so no deleted row survives in either
+  file. The store file itself stays, with its schema, so a process that opened it before the
+  purge goes on with a valid, empty store rather than a deleted file;
+- the log and its rotations (§14.2).
+
+It keeps `config.toml`, which the user writes, and the lock files, which hold no data:
+deleting a lock file while another process waits on it would let two holders in. A full purge
+resets the usage budget along with the store, the one exception to invariant 41; the
+endpoint's own limit and the 429 backoff (§8.5) still apply.
+
+**Result.** Purge reports what it deleted and anything it could not, and exits 1 if anything
+could not be deleted. JSON: `{schemaVersion, ok, provider, accounts: [{number, id, email}],
+displaced, rescues, storeEmptied, failures: [{what, message}]}`.
 
 ## 11. Auto-switch
 
@@ -1496,6 +1675,11 @@ An empty alias never matches.
     repairs a switch that has already reached the live store, and decides nothing.
   - The daemon (sub-project 2) takes the same lock, so `auto` and the daemon never both drive
     one provider.
+  - Once it holds the lock, the engine writes its pid and start time into the lock file, the
+    start time taken as for the `switch_journal` holder (§12.6). The record is never used for
+    exclusion. `doctor` reads it to tell whether an engine runs, by an exact pid and
+    start-time match (§13.6), instead of trying the lock, which an `auto` starting at that
+    instant would then find taken.
 - **Where it runs.** Like every command that changes the live login, `auto` refuses inside a
   `tagteam run` shell (§9.2), except with `--dry-run`. On macOS it runs the Keychain lock check
   before its first tick (Appendix A.3).
@@ -2058,7 +2242,11 @@ throughout, and reconciles before doing anything else:
   the marker cleared. A replacement taken from the live login also records the account's
   `login_epoch` as the activation epoch, as `add` would have (§10.1);
 - otherwise it never landed: `login_epoch` is decremented and the marker cleared. That restores
-  the profile's eligibility, so a rotation it holds is captured rather than stranded.
+  the profile's eligibility, so a rotation it holds is captured rather than stranded;
+- if the replacement landed but `replacing_meta` cannot be parsed, it cannot be installed:
+  the holder refuses with `replacement-unreadable`, naming the account. `remove` and `purge`
+  are the exceptions, since they delete the account either way, and `doctor` fails the check
+  with `remove` as the fix (§13.6).
 
 A running profile is never touched: it is simply stale-marked, and is re-bootstrapped at its
 next quiescent launch, which writes the new epoch and seed.
@@ -2196,10 +2384,11 @@ exactly as it would without providers.
 | `history [ACCOUNT] [--window 5h\|7d\|spend\|<model>] [--since 14d] [--csv]` | §13.4 |
 | `statusline` | §13.5 |
 | `export`, `import` | §13.3 |
-| `displaced [--purge ID]` | §6.3 |
-| `config` | §6.4 |
+| `displaced [--purge ID... [--yes]]` | §6.3 |
+| `config list\|get\|set\|unset\|path` | §6.4 |
 | `doctor [--online]` | §13.6 |
-| `completions <shell>`, `purge` | `purge` deletes all tagteam data, including the vault Keychain items and the profiles' hashed items, after a confirmation (or `--yes`). It never touches any provider's live login. `--provider` limits it to one provider's accounts |
+| `purge [--yes]` | Deletes tagteam's data, including the vault Keychain items and the profiles' hashed items, after a confirmation (or `--yes`). It never deletes or replaces any provider's live login. `--provider` limits it to one provider's accounts (§10.5) |
+| `completions bash\|zsh\|fish` | §13.7 |
 
 **Exit codes:** `0` OK · `1` error · `2` usage error · `130` interrupted by SIGINT (128 + the
 signal number for SIGTERM and SIGHUP, §14.1). `auto --once` uses 0–3.
@@ -2287,10 +2476,19 @@ credentialStore, warnings}`.
   fallback after the keychain refused the write (Appendix A.3); or `null` when it wrote none.
   A fallback is also a warning on stderr that names the file.
 
-`doctor` and `history` have their own `--json` shapes, documented in `--help` and snapshot
-tested.
+`history`'s `--json` shape is documented in `--help`. The shapes of `config` (§6.4),
+`displaced` (§6.3), `purge` (§10.5), `export` and `import` (§13.3) and `doctor` (§13.6) are
+given with each command. All of them are snapshot tested.
 
 ### 13.3 Export and import
+
+**An OAuth export hands a login over; it does not copy it.** A refresh token is single-use
+(§7.3), so whichever machine refreshes an exported account first invalidates every other copy
+of that generation: the other machine's next refresh gets `invalid_grant` and quarantines the
+account there (§7.4). Export is for moving accounts to another machine, or for a short-lived
+backup; to use one account on two machines, log in on each. Setup tokens and API keys do not
+rotate, so their copies keep working. Whenever the file holds an OAuth account, export's human
+output says so.
 
 **Command:** `tagteam export [FILE|-] [--account A]... [--full] [--recipient R]...
 [--recipient-file F]... [--plaintext]`
@@ -2306,7 +2504,56 @@ tested.
 - The output file is created 0600 with `O_EXCL` in the destination directory and then renamed
   into place.
 - A directory destination is rejected.
-- `-` writes to stdout.
+- `-` writes to stdout. With `--json` that is a usage error (exit 2), since stdout carries the
+  export.
+- The passphrase is asked for, and recipients are parsed, before any lock is taken.
+  Encryption and the write run after every lock has been released.
+
+**Which generation is exported.** Each account's newest generation, read where its lineage
+advances, so the file never carries a generation this machine has already consumed:
+- **The live login** (the account the live identity names): the live credential, read fresh
+  under the provider's credential locks, so a refresh CC has in flight completes first. The
+  generation exported is the one §7.5 step 3 would settle on among the live credential, the
+  vault, its `.prev` and a rescue, worked out without writing anything. When the live
+  credential is the vault's generation or its `.prev`, that is the vault's generation, or the
+  pending rescue that succeeds it. When the live credential is a rescue's generation, it is
+  that rescue's. Any other full token pair is CC's rotation, and is exported itself. A
+  stale-marked live store (§12.5) exports the vault's generation instead: the replacement
+  wins.
+- **A session-owned account** (§12.5): the profile's credential, read as CC reads it (§8.1),
+  fresh, under the profile's own credential locks. The provenance table (§12.5) decides
+  between it and the vault, again without writing: the profile's generation when it rotated
+  since its seed (P ≠ V, V = S); the vault's when they agree, when the vault moved on, or when
+  the profile is stale-marked. A profile whose identity drifted is ignored, as everywhere
+  (§12.5), and the vault's generation is exported.
+- **Any other account:** the vault's generation, after the work every holder of its account
+  lock does first: reconcile a pending replacement (§12.5), settle pending rescues (§6.2), and
+  capture a quiescent profile that rotated (lazy capture, §12.5).
+
+Export takes `MutationGuard`, then one account lock at a time in ascending ID order, and
+releases both between accounts. Ownership cannot change while they are held (§12.5). An
+interrupted switch is recovered first, as by any holder of `MutationGuard` (§9.6). Export
+sends no request: a live credential that is not its account's own is caught where it is used,
+by the token endpoint's identity check (§7.4). It works inside a run shell, where the live
+login is the default home's (§12.8).
+
+**In use here.** The live login and session-owned accounts are exported, and the output names
+them with a warning: this machine goes on refreshing them, so their exported copies stop
+working the next time it does.
+
+**Broken accounts.** An account is broken when its exportable generation cannot be determined,
+or is known to be dead:
+- it has no vault credential or no `identity_json`;
+- it is quarantined (§7.4);
+- a read it needs is `Unreadable` or `Degraded`, or its rescues are unreadable (§6.3);
+- its profile reports a provenance conflict (§12.5);
+- its live or profile copy is the one to export but was wiped by CC (§9.4 step 4's `Wiped`),
+  or lacks the refresh token the vault has;
+- an interrupted switch that recovery cannot decide names it (§9.6).
+
+When exporting all accounts, a broken one is skipped with a warning that names its position and
+the reason. With an explicit `--account`, a broken account is a hard error, and nothing is
+written.
 
 **Envelope** (inside the encryption):
 
@@ -2326,9 +2573,13 @@ tested.
 - **Default contents are slim.** For Claude Code the credential is reduced to
   `{claudeAiOauth}`: the machine-shared keys and the device-bound `trustedDeviceToken` stay on
   the source machine. `--full` keeps everything.
-- **The active account** is exported from the live store.
-- **Broken accounts.** When exporting all accounts, a broken one is skipped with a warning.
-  With an explicit `--account`, a broken account is a hard error.
+- **Nothing machine-local is exported:** no account ID, login epoch, activation epoch,
+  quarantine, usage state or `rejected_fp`. `active` gives the live login's position per
+  provider, for information only; import ignores it.
+
+`--json` returns `{schemaVersion, ok, file, encrypted, accounts: [{provider, number, email,
+source, inUse}], skipped: [{provider, number, email, reason}]}`, where `source` is `vault`,
+`live` or `profile`.
 
 **Command:** `tagteam import <FILE|-> [--force] [--identity F]...`
 
@@ -2336,7 +2587,12 @@ The format is detected automatically: armored or binary age (prompting for a pas
 using `--identity F`), tagteam plaintext, or a **cswap v1 export** (`version: 1`,
 `swapVersion`, `encrypted: false`, `accounts[].{number, credentials, config.oauthAccount}`).
 cswap accounts import as provider `claude-code`. A tagteam account whose `provider` is not
-registered in this build is refused in pass 1, naming the provider.
+registered in this build is refused in pass 1, naming the provider. With `-`, the file comes
+from stdin and the passphrase from the terminal.
+
+Import replaces logins, so it is an account-changing command: it refuses inside a run shell
+(§12.8), and while an interrupted switch for a provider in the file cannot be decided (§9.6).
+On macOS it runs the Keychain lock check first (Appendix A.3).
 
 1. **Pass 1 validates everything** before writing anything:
    - the provider's identity validation (CC: the email regex) and integer positions ≥ 1 (a
@@ -2344,14 +2600,29 @@ registered in this build is refused in pass 1, naming the provider.
    - field types, the provider's credential kinds, and alias rules
    - no duplicate identity keys within a provider, and no duplicate aliases
    - an alias owned locally by a different identity is dropped
-2. **Pass 2 writes:**
+   - an account ID is never read from the file: every created account gets a new one (§6.1)
+2. **Pass 2 writes,** one account at a time, under `MutationGuard` and the account's lock:
    - **An existing identity** is skipped unless `--force` is given, or it is quarantined (it is
-     then replaced automatically, with the cleared strike reported).
-   - **A new identity** goes to its exported position if free, else to the next one.
-   - Quarantines are cleared.
-   - The active account is seeded only if none is set locally.
-   - If the live login's account was rewritten, tagteam tells the user to run
-     `tagteam switch N --force`.
+     then replaced automatically, with the cleared strike reported). It is replaced as an
+     explicit replacement (§12.5 steps 1–3): its login epoch moves first, and the evidence is
+     recorded from the live identity as `add-token` records it, so neither a profile nor the
+     live store can capture the old lineage back over it. It keeps its local position, alias
+     and `disabled` flag.
+   - **A new identity** is created as `add` creates one, the store row before the vault entry
+     (§10.1), at its exported position if that is free, else at the provider's next position
+     (§6.1). Its alias and `disabled` flag come from the file.
+   - Quarantines are cleared, each with its `unquarantine` event (§7.4).
+   - The store's active account is never set from the file. It records what tagteam made live
+     (§12.5), and an import makes nothing live.
+   - If the live login's account was replaced, tagteam tells the user to run
+     `tagteam switch N --force`: CC keeps the old login until then (§12.5).
+   - If a session-owned account was replaced, it says that the session keeps its login until
+     it exits, and that the next `run` starts with the new one (§12.5).
+   - A failure on one account is reported, and the others go on. The command exits 1 if any
+     account failed.
+
+`--json` returns `{schemaVersion, ok, accounts: [{provider, number, email, outcome, message}],
+warnings}`, where `outcome` is `created`, `replaced`, `skipped` or `failed`.
 
 ### 13.4 History
 
@@ -2392,31 +2663,74 @@ old` when the data is older than 15 min, else empty).
 
 ### 13.6 Doctor
 
-`tagteam doctor [--online] [--json]` reports each check as `ok | warn | fail`. It exits 1 if
-anything fails.
+`tagteam doctor [--online] [--json]` checks tagteam's own state and its interop with each
+provider.
 
-**Checks:**
-- **Claude Code:**
-  - the `claude` binary was found, and its version compared against `TESTED_CC_VERSION`
-    (`2.1.286`) — newer → warn
-  - resolved paths: config home, global config, secure-storage dir, and Keychain service and
-    account names
-- **Keychain:**
-  - reachable, or locked (`security show-keychain-info`, rc 36)
-  - whether the account-name rule falls back to `claude-code-user`
-- **Locks:** CC lock directories present and older than their staleness window.
-- **Store:** `PRAGMA quick_check` on `tagteam.db`, and store/vault consistency (every account
-  has a vault entry; no orphaned vault items).
+**Read-only.** Doctor writes nothing and creates nothing.
+- It takes no `MutationGuard`, so it reports an interrupted switch rather than recovering it
+  (§9.6).
+- It opens the store read-only and never migrates it. With no data directory, it reports that
+  tagteam has no state yet.
+- It tests locks without waiting, and takes none that another process could wait on.
+- It asks nothing. A locked Keychain is reported (Appendix A.3), never unlocked, and the
+  checks that would read it are skipped with one `warn`. (Whether the lock check itself can
+  raise the system's unlock dialog is §17 O3.)
+- Every check that finds a problem names the fix. Doctor applies none itself.
+
+**Result.** Each check reports `ok`, `info`, `warn` or `fail`. A check whose input cannot be
+read reports `warn` and why, never `ok`. Doctor exits 1 if any check fails, else 0. Checks are
+grouped per provider, as `list` groups accounts (§13.1).
+
+JSON: `{schemaVersion, ok, checks: [{id, provider, status, message, fix}]}`. `id` is a stable
+dotted name (`store.integrity`, `accounts.quarantined`, `cc.version`, …). `provider` is null
+for a check that is not a provider's, and `fix` is null when there is nothing to do.
+
+**Engine checks:**
+- **Store:**
+  - `PRAGMA quick_check` on `tagteam.db` → fail on error
+  - the schema version: newer than this binary → fail; older → info, since the next command
+    migrates it
+  - modes: the store not 0600, a tagteam directory not 0700, a Linux vault file not 0600 →
+    warn, naming the `chmod`
+  - a temp file the atomic writer left behind (§9.5), in tagteam's directories or beside a CC
+    credential file, whose writer's pid is no longer live → warn: it may hold a secret, and is
+    safe to delete
 - **Accounts:**
-  - per-account vault readability
-  - quarantined accounts
+  - each account's vault entry is readable → fail if not; an account with no vault entry,
+    as a purge that stopped part-way leaves one (§10.5), names `tagteam remove` as the fix
+  - no orphaned vault items: on Linux, a `vault/` file naming no account; on macOS, any item
+    of service `tagteam` while the store has no account (`find-generic-password -s tagteam`,
+    attributes only, Appendix A.3) → warn, with `tagteam purge` as the fix
+  - quarantined accounts → warn, naming the reason, and the fix: log in, then `tagteam add`
   - `login_expires_at` within 7 days → warn
-- **Pending storage:** pending `rescue/` entries → warn. `displaced/` entries → info.
+  - a pending replacement (§12.5) → warn; an unparseable `replacing_meta` → fail, with
+    `tagteam remove` as the fix
+  - the live store stale-marked (§12.5) → warn: CC still runs the login an explicit command
+    replaced. The fix is `tagteam switch N --force`
+- **Usage:**
+  - an account in backoff → info, with its `last_error` and when it is retried
+  - an identity at its hourly budget (§8.6) → warn
+  - a reading, poll plan or backoff stamped further ahead than §8.4 allows → warn: the clock
+    is, or was, skewed
+- **Pending storage:**
+  - pending `rescue/` entries → warn; a `rescue` path that is not a listable directory (§6.3)
+    → fail; a rescue file whose account is gone → warn, with `tagteam purge` or deleting it
+    as the fix
+  - `displaced/` entries → info; a displaced file with no row, or a row with no file → info
 - **Interrupted switch:** a `switch_journal` row whose holder is dead → warn, or fail if §9.6
-  cannot decide it.
+  cannot decide it. A holder that reads live but may not be (an `EPERM` pid, which can be
+  another user's recycled pid) → warn, naming the pid and its start time, with
+  `tagteam switch --force` as the fix if no tagteam process is running.
+- **Auto-switch** (§11):
+  - an engine running → info, with its pid, from the engine lock's record (§11.1)
+  - `unhealthy_ticks` above zero → warn
+  - a `consume-first` strategy for a provider without a long window (§4.5) → warn
+  - `autoswitch.models` naming a model that no account's last reading has → warn, as the
+    tick's `config-warning` does
+- **Settings** (§6.4): an unparseable file → fail, since every command runs on the defaults;
+  an invalid value or an unknown key → warn, naming it.
+- **Log** (§14.2): its path and size → info; a log that cannot be written → warn.
 - **Session profiles:**
-  - entries in `~/.claude` that are on neither the allowlist nor the known-private list, and
-    so are not shared (§12.2) → warn
   - a real `projects/` or `history.jsonl` inside a profile (§12.2) → fail; another shared file
     split into a regular file → warn
   - a profile marker that is unreadable, or whose recorded spelling is no longer the
@@ -2424,10 +2738,51 @@ anything fails.
     warn, naming what to delete
   - reservations whose `tagteam` parent is gone but whose lock is still held, with the
     holding processes where the OS can tell; baselines awaiting merge-back → info
-  - a provenance conflict (§12.5) → fail, naming the account and the fix; a pending
-    replacement → warn
-- **Online** (`--online`): TLS reachability of the token, profile and usage hosts, with no
-  credentials sent.
+  - a provenance conflict (§12.5) → fail, naming the account and the fix
+  - a profile that is stale-marked, or whose seed records that it needs a bootstrap (§12.3)
+    → info: its next launch bootstraps it
+  - a profile credential that cannot be read → warn: the account cannot switch or launch
+    until it can
+
+**Claude Code checks** (`doctor_checks`, §4.5):
+- the `claude` binary was found, and its version compared against the tested version in
+  `crates/tagteam-cc/compat/tested-cc-version` (§15.4): newer → warn
+- resolved paths: config home, global config, secure-storage dir, and Keychain service and
+  account names
+- **Keychain:**
+  - reachable, locked or unknown, by the lock check (Appendix A.3)
+  - whether the account-name rule falls back to `claude-code-user`
+  - the managed-key item present but empty → fail: every switch refuses on it. The fix names
+    the `security delete-generic-password` command that removes it
+  - an item under a former fallback name of the home doctor runs in (Appendix A.2): the
+    unsuffixed item when `CLAUDE_CONFIG_DIR` names the default home, or the item named from a
+    symlinked config dir's target → info, naming the command that deletes it
+- **Environment.** The variables doctor runs with, which a `claude` started from the same
+  shell inherits:
+  - `CLAUDE_CONFIG_DIR` set but empty, or set to a spelling of the default home: CC 2.1.286
+    then reads a hashed Keychain item, not the one a switch writes (Appendix A.2) → warn
+  - a non-production OAuth switch (Appendix A.1) → warn
+  - any variable that `run` scrubs because it supplies or redirects a login (§12.5) → warn,
+    naming it
+- **The default home's login,** by `claude auth status` (Appendix A.7) with a 10 s timeout, in
+  the outer home's environment inside a run shell (§12.8):
+  - logged in by a method other than its stored `claude.ai` login (`api_key_helper`,
+    `oauth_token`, …) → warn: a switch changes nothing for `claude` started here
+  - logged in as an email or org other than the live identity's → warn
+- **Locks:** CC lock directories present and older than their staleness window → warn.
+- **Unknown entries:** entries in `~/.claude` that are on neither the allowlist nor the
+  known-private list, and so are not shared (§12.2) → warn.
+
+**Online** (`--online`): TLS reachability of the token, profile and usage hosts, with no
+credentials sent.
+
+### 13.7 Completions
+
+`tagteam completions bash|zsh|fish` prints a completion script for that shell on stdout,
+generated by `clap_complete` from the command definitions, for the user or a package manager
+to install. The script is static: commands, flags, provider IDs, settings keys (§6.4) and the
+other fixed values complete. Account references do not, since completing them would read the
+store. The command needs no store and no Keychain.
 
 ## 14. Errors and logging
 
@@ -2445,6 +2800,10 @@ anything fails.
   cover them.
 - **stdout is reserved for command output.** Refresh-persist warnings and similar notices go to
   stderr, so `--json` output stays a single object.
+- **Contained errors are logged, never discarded.** An error a command deliberately contains
+  (a cleanup that fails, a best-effort store write, a follow-up after a vault write) is logged
+  at WARN with its cause (§14.2). A timeout and a failure to spawn a process are different
+  causes, and are reported as such.
 
 ### 14.1 Signals and cancellation
 
@@ -2487,6 +2846,50 @@ handler only records the signal in the engine's cancel token (§4.2), which test
   `auto`'s loop stops cleanly and exits 0 instead (§11.4).
 - **`tagteam run`** handles signals as §12.5 says: before the spawn, while `claude` runs, and
   in its exit handling.
+
+### 14.2 Logging
+
+**The file** is `$XDG_STATE_HOME/tagteam/tagteam.log` (§5), mode 0600 in a 0700 directory. It
+is opened on the first event that passes its filter, so a command that logs nothing never
+opens it, and `statusline` stays within §1.1's budget. When it exceeds 1 MiB it is rotated:
+`.1` becomes `.2`, the file becomes `.1`, and the oldest is dropped.
+
+**Levels.**
+- The file records INFO and above by default.
+- `--debug` records DEBUG and above, in the file and on stderr.
+- `TAGTEAM_LOG` replaces the file's filter with an `EnvFilter` directive (`debug`,
+  `tagteam_engine=trace`, …), and `off` disables the file. An invalid directive keeps the
+  default, with a warning on stderr.
+- Otherwise stderr shows ERROR events only. The notices and warnings a command prints for its
+  user (§14) are separate from the log.
+
+**What INFO records:** the state changes and decisions a user may later need to reconstruct.
+These are switches and their rollbacks, recovery, quarantines and their clearing, refresh
+outcomes, captures, replacements, rescues and displacements, launches and their exit handling,
+auto-switch decisions, imports, exports (the accounts by position, never the contents), purges
+and settings writes. Routine reads, each usage fetch, and everything `statusline` does log at
+DEBUG at most.
+
+**One line per event:** a UTC timestamp to the millisecond, the pid, the level, the module, the
+message, then `key=value` fields. An account is named as `account=<id> position=<n>`, the only
+spelling. A path under the home directory is written `~/…`.
+
+**Never logged,** at any level: an email, label or organization name; a token, key or
+credential, or any part of one; a passphrase; an export's contents; a request's
+`Authorization` header or body. A fingerprint may appear as its first 12 hex digits.
+
+**Several processes** write the same file. Each event is one `write` on a descriptor opened
+with `O_APPEND`, so lines never interleave. The process that finds the file over 1 MiB rotates
+it while holding a try-only `flock` on `tagteam.log.lock`, re-checking the size under that
+lock; a process that cannot take the lock does not rotate. Before each write, a process checks
+that the path's inode still matches its descriptor, and reopens the path when it does not. A
+line written just after another process rotated lands in `.1`, which is kept. Nothing waits on
+the log, so the log is best-effort in one case: a process paused between that check and its
+write, across two rotations, writes its line to a file that is already gone.
+
+**Logging never fails a command.** A file that cannot be opened, written or rotated disables
+file logging for the rest of the process, silently unless `--debug`, and `doctor` reports it
+(§13.6). A panic is logged at ERROR, with its location, before the process unwinds.
 
 ## 15. Testing
 
@@ -2595,6 +2998,41 @@ handler only records the signal in the engine's cancel token (§4.2), which test
     nothing, and an account-scoped change under it aborts the tagteam write.
   - **Session-owned usage** (§8.1): the profile's token is read without a lock, an expired one
     sends nothing and gives back its slot, and a 401 stamps `rejected_fp`.
+  - **Export** (§13.3): the generation exported for each source and each case of its rules: a
+    live login CC rotated, one whose live copy is the vault's `.prev`, a pending rescue, a
+    stale-marked live store, a profile rotated since its seed, a stale-marked profile, a
+    drifted profile. A refresh in flight in the live store or in a profile completes before
+    the read. Each broken case is skipped from a bulk export and is an error with `--account`.
+    The file holds no machine-local field.
+  - **Import** (§13.3): a replacement of the live account stale-marks the live store and is
+    never undone by any capture path; a replacement of a session-owned account stale-marks
+    its profile; the store's active account is never set; an ID in the file is ignored; a
+    file that fails pass 1 writes nothing.
+  - **Purge and remove** (§10.3, §10.5): killed at each deletion and run again, each finishes.
+    In between, the partly deleted account is never switched to, refreshed or launched, and
+    with a pending rescue or a rotated quiescent profile, its consumed vault generation is
+    never sent or activated. An `add`, `import` or launch
+    started during a purge waits for it and lands in the emptied store, never in a deleted
+    one. Purge refuses while an account or an orphaned profile is session-owned, inside a run
+    shell, while an engine runs, and when the accounts changed after confirmation; a full
+    purge over a `rescue` file that is not a directory still finishes. A full purge leaves no `tagteam`
+    Keychain item (with the real `security` driver) and no deleted row readable in the store
+    file or its WAL, and keeps `config.toml` and the lock files. `--provider` leaves the other
+    provider's data and the usage budget alone.
+  - **Doctor** (§13.6): a fixture home in each state each check reports, snapshot tested in
+    human and JSON form. Against a missing data directory it creates nothing, and against any
+    home it leaves every file byte-identical and asks nothing.
+  - **Settings** (§6.4): `set` and `unset` change nothing outside their key, byte for byte,
+    comments included, and write through a symlink; two concurrent `set`s both land; every
+    registry key's bounds are refused by `set` and defaulted by reads; a running `auto` picks
+    a change up.
+  - **Logging** (§14.2): two processes logging past 1 MiB together leave three files whose
+    lines, read oldest first, are each process's lines in order, with no gap after the first
+    line kept; `statusline` with the default filter opens no log file; a log that cannot be
+    written fails no command.
+  - **Displaced** (§6.3): the listing joins rows and files, including a file with no row and
+    a row with no file; `--purge` deletes the file before the row, and nothing when one ID is
+    unknown.
 - **Provider neutrality.** The test-only `FakeAgent` provider, in its own crate `tagteam-fake`
   (§4.1), is registered alongside Claude Code. It has its own home layout, a file-based
   credential store, a single live lock (its config lock is a no-op), refresh without a
@@ -2613,7 +3051,8 @@ handler only records the signal in the engine's cancel token (§4.2), which test
 
   This keeps the trait from quietly taking on Claude Code's shape before a real second provider
   exists.
-- **`tagteam` (CLI):** snapshot tests (`insta`) of human and JSON output, and of the exit codes.
+- **`tagteam` (CLI):** snapshot tests (`insta`) of human and JSON output, of the exit codes,
+  and of each shell's completion script.
 
 ### 15.3 Pinned invariants
 
@@ -2635,10 +3074,33 @@ handler only records the signal in the engine's cancel token (§4.2), which test
   command reports `Unpersisted`.
 - **Degraded reads.** A degraded read never reaches the token endpoint. This is a compile-time
   guarantee, backed by a test that attempts it through the public API.
+- **Logs.** Every command, run at TRACE against the fixture home, leaves no fixture email,
+  organization name, token, key or passphrase in the log (§14.2).
 
 ### 15.4 Claude Code compatibility
 
-- **`cargo xtask compat`** runs locally against the real `claude` and a real test account:
+**Shared facts.** `crates/tagteam-cc/compat/` is the single source of the facts tagteam keeps
+about CC's layout, one file each: the tested version (`tested-cc-version`), §12.2's share
+allowlist (`known-shared`) and known-private list (`known-private`), and the classified
+environment names (`known-env`: every `CLAUDE_CODE_*` and `ANTHROPIC_*` name tagteam knows,
+with whether `run` scrubs it, §12.5). `run`, `doctor`, the weekly job and `cargo xtask compat`
+all read these files, so none can drift from another.
+
+**`cargo xtask compat`** runs locally against the real `claude` and a real test account. `xtask`
+is a workspace crate (`publish = false`) reached through a cargo alias. It drives a build of
+`tagteam` with the `test-support` feature, and the real `claude`, as a user would.
+- **Isolation.** Every CC home it uses is a scratch directory exported as
+  `CLAUDE_CONFIG_DIR`, so every CC Keychain item it reads, writes or deletes is named by the
+  hash of a scratch spelling (Appendix A.2). It refuses to start if any service name it would
+  touch lacks that hash suffix: an unsuffixed item is the user's own login. tagteam's vault
+  uses a temporary keychain, through the same `test-support` hook as the `real_keychain` tests
+  (§15.1). Everything it created is deleted when it ends; `--keep` leaves it for inspection.
+- **The test account** is dedicated to compat. `cargo xtask compat login` runs `claude` in a
+  scratch home for the user to log in once, and keeps the login in a compat store under
+  `$XDG_STATE_HOME/tagteam-compat/`. Later runs take the account from there, and tagteam's own
+  capture keeps that copy current. It is never an export of an account in daily use: compat
+  refreshes it, which would consume the user's copy (§13.3).
+- **Checks:**
   - `claude auth status --json` against seeded profiles: every §12.3 outcome, `configDirectory`
     equal to the exported spelling, and the `authMethod` a setup-token account yields
   - the profile's hashed Keychain item is the one named from the exported spelling, and CC
@@ -2655,10 +3117,30 @@ handler only records the signal in the engine's cancel token (§4.2), which test
     activation can commit (Appendix A.3)
   - CC runs on an API key while the credential entry keeps only machine-shared keys (§9.4)
   - lock interop while CC refreshes
+  - CC honours `~/.claude.json.lock` around its own writes of the global config (§9.1)
+  - CC accepts a `~/.claude.json` that tagteam created on a fresh machine (§9.5), and its own
+    next write of the file leaves the span tagteam spliced byte-identical, which pins §9.5's
+    rendering against `JSON.stringify`
+  - which of the managed-key item and `primaryApiKey` CC reads first, and whether a key in
+    `primaryApiKey` applies on the next message as §9.4's hint says
+  - CC writes `expiresAt` as an integer
+  - `claude auth status` writes nothing in the home it inspects (§13.6 relies on it)
+  - opt-in, since they need the user's own session: the lock check on a locked login keychain
+    in a GUI session (§17 O3), and CC reading tagteam-written items over SSH (`--ssh`)
+- Checks that need CC to refresh expire the scratch profile's access token and run one minimal
+  `claude -p` on the smallest model, so a run spends a few requests of the test account's
+  usage.
+- **Result.** A report in JSON and Markdown under `target/compat/`, one entry per check with
+  its evidence. It exits 0 when every check passes, 1 when one fails, and 2 when the harness
+  itself fails. `--bless`, after a full pass, writes the version of `claude` it ran against to
+  `compat/tested-cc-version`. That is the only way the tested version advances.
 - **A weekly CI job** installs the latest `claude` and runs the checks that need no account:
   version, the `auth status` shape when logged out, the top-level `~/.claude` entries against
-  the known lists (§12.2), and the `CLAUDE_CODE_*` and `ANTHROPIC_*` names the binary contains
-  against the ones tagteam has classified (§12.5). It opens an issue on drift.
+  `known-shared` and `known-private`, and the `CLAUDE_CODE_*` and `ANTHROPIC_*` names the binary
+  contains against `known-env`. It opens an issue on drift, or comments on the open one when
+  the report changes.
+  - A logged-out `claude` creates almost nothing in `~/.claude`. So before listing entries,
+    the job runs one headless `claude -p` with a dummy API key, which the API rejects.
 
 ## 16. Build, release, repository
 
@@ -2690,6 +3172,8 @@ handler only records the signal in the engine's cancel token (§4.2), which test
 | R7 | The `Provider` trait is designed from one real implementation, so it may not fit Codex, Gemini CLI or Grok (different auth models, API-key-only logins, no usage endpoint, no session isolation variable) | Keep the trait internal, not a public API. Use explicit capability flags. Exercise the engine with the `FakeAgent` provider (§15.2). Revise the trait in the first real second-provider spec rather than guessing now |
 | O1 | Whether `.device-keys.json` should be shared | Closed: CC 2.1.286 keeps device keys machine-wide, keyed by account (Appendix A.7), so a profile's copy is never used |
 | O2 | CC 2.1.286 passes `rate_limits` (five-hour, seven-day and spend percentages with resets) on the statusline command's stdin | Not used: `statusline` ignores stdin (§13.5). A later version could record them as free readings for the session's account, outside the request budget |
+| R9 | An exported OAuth login is a single-use refresh lineage, so using it on two machines quarantines it on whichever refreshes second | Export reads each account's newest generation and says that it hands logins over (§13.3); one login per machine is the supported way to share an account |
+| O3 | On a Mac whose login keychain is locked, the lock check may show a SecurityAgent dialog for up to its 5 s timeout, and whether killing `security` at the timeout dismisses it is unknown (found while planning M4a) | An opt-in `cargo xtask compat` check settles it (§15.4). Until then every command, `doctor` included, bounds the check by its timeout |
 
 ---
 
@@ -2783,6 +3267,11 @@ since 2.1.283.
     An over-long `-i` line truncates silently and leaves the old entry.
   - `-U` updates the item in place and preserves its access control.
 - **Delete:** `delete-generic-password -a <acct> -s <svc>`. rc 44 counts as success.
+- **Delete by service** (a full `purge`, §10.5): `delete-generic-password -s tagteam`, without
+  `-a`, deletes one item of that service per call and returns rc 44 once none is left
+  (*inferred*; a `real_keychain` test pins it). Purge repeats it until rc 44, at most 10 000
+  times, then verifies with `find-generic-password -s tagteam` (attributes only) that the
+  service is gone.
 - **Lock check and unlock** (§17, R1). Over SSH the login keychain stays locked: reads, writes
   and `show-keychain-info` all return rc 36.
   - A command that will read or write a Keychain item first runs `show-keychain-info` on the
@@ -3073,6 +3562,21 @@ Each is a one-liner, and each gets at least one test.
 63. `run` exits with the child's status. Signals sent while `claude` runs never cancel the exit
     handling its exit starts, and exit handling that is cancelled later loses nothing: lazy
     capture and the next launch complete it (§12.5).
+64. An export never carries a degraded generation, nor one this machine has consumed: each
+    account's generation is its newest, read where its lineage advances (§13.3).
+65. Import never takes an account ID from its file and never sets the store's active account,
+    and it replaces an existing login only as an explicit replacement (§12.5).
+66. Purge never deletes or replaces a provider's live login, and refuses while an affected
+    account is session-owned. It holds `MutationGuard` throughout, so nothing is created
+    behind it, and a purge that stops part-way is finished by running it again (§10.5).
+67. `doctor` writes nothing, creates nothing and asks nothing (§13.6).
+68. Every settings write is validated against the one key registry, and changes only the key
+    it names (§6.4).
+69. No log line, at any level, holds an email, organization name, token, key, credential or
+    passphrase (§14.2).
+70. `cargo xtask compat` never touches a CC Keychain item without a scratch hash suffix
+    (§15.4).
+71. Every quarantine that is cleared records an `unquarantine` event (§7.4).
 
 ## Appendix C — cswap → tagteam command map
 
@@ -3090,8 +3594,8 @@ Each is a one-liner, and each gets at least one test.
 | `map`, `unmap` | same | Plus `shell-init` |
 | `config …` | `config …` | TOML instead of JSON; snake_case keys |
 | `export` / `import` | same | age-encrypted by default; imports cswap v1 exports |
-| `unclaimed [--purge ID]` | `displaced [--purge ID]` | Rescued successors are adopted automatically |
+| `unclaimed [--purge ID]` | `displaced [--purge ID...]` | Rescued successors are adopted automatically |
 | `tui`, `watch`, `menubar` | — | Sub-projects 3 and 4 |
 | `upgrade`, update check | — | Dropped; package managers handle it |
-| `purge` | `purge` | — |
+| `purge` | `purge [--provider P]` | Keeps `config.toml` (§10.5) |
 | — | `history`, `statusline`, `doctor`, `completions`, `shell-init` | New |
