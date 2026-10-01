@@ -424,3 +424,30 @@ fn fake_agent_renders_its_own_shape_and_names_its_identity_file() {
         Some(FakePaths::resolve(&f.env).identity)
     );
 }
+
+#[test]
+fn fake_agent_describes_its_own_meter_keys() {
+    let f = fx();
+    let bare = |key: &str, kind, period_s| {
+        Some(Window {
+            key: key.into(),
+            label: key.into(),
+            kind,
+            pct: 0.0,
+            resets_at: None,
+            period_s: Some(period_s),
+            detail: None,
+        })
+    };
+    assert_eq!(
+        f.fake.describe_window("daily"),
+        bare("daily", WindowKind::Short, 86_400)
+    );
+    assert_eq!(
+        f.fake.describe_window("monthly"),
+        bare("monthly", WindowKind::Long, 2_592_000)
+    );
+    for key in ["hourly", "Daily", "", "5h", "7d", "spend", "scoped:Fable"] {
+        assert_eq!(f.fake.describe_window(key), None, "{key:?}");
+    }
+}

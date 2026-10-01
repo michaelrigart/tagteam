@@ -17,7 +17,7 @@ use tagteam_engine::Engine;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{LiveIdentityCacheRow, Reservation, Reserve};
 use tagteam_engine::views::{
-    HistoryView, NO_DATA, StatusView, StatuslineView, UsageStatus, UsageView,
+    HistoryView, HistoryWindow, NO_DATA, StatusView, StatuslineView, UsageStatus, UsageView,
 };
 
 /// The fixture clock's start (`Fx`), in seconds.
@@ -379,6 +379,105 @@ fn history_follows_the_configured_models() {
     assert_eq!(
         keys(&engine.history(&a, None, 0).unwrap()),
         ["5h", "7d", "scoped:Fable"]
+    );
+}
+
+/// `samples`' `(fetched_at, pct)` pairs.
+fn shown(w: &HistoryWindow) -> Vec<(i64, f64)> {
+    w.samples.iter().map(|s| (s.fetched_at, s.pct)).collect()
+}
+
+#[test]
+fn history_shows_a_sampled_window_the_latest_reading_lacks() {
+    // §13.4: `history` dumps the samples it holds. Fable was read hourly from T0 to T0 + 2 h,
+    // then the endpoint stopped reporting it: its samples are still history, its window
+    // described by the provider and read as of its latest sample.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let fable_samples = [(T0, 10.0), (T0 + 3_600, 20.0), (T0 + 7_200, 30.0)];
+    for (t, fable) in fable_samples {
+        let mut windows = reading(t, 9.0, 60.0);
+        windows[2].pct = fable;
+        record(&fx, &a, &windows, t, t + 180);
+    }
+    let last = T0 + 10_800;
+    let without_fable: Vec<Window> = reading(last, 11.0, 70.0)
+        .into_iter()
+        .filter(|w| w.kind != WindowKind::Scoped)
+        .collect();
+    record(&fx, &a, &without_fable, last, last + 180);
+    at(&fx, last);
+
+    let h = fx.engine.history(&a, Some("Fable"), 0).unwrap();
+    assert_eq!(keys(&h), ["scoped:Fable"]);
+    let fable = &h.windows[0];
+    let described = Window {
+        key: "scoped:Fable".into(),
+        label: "Fable".into(),
+        kind: WindowKind::Scoped,
+        pct: 30.0,
+        resets_at: Some(T0 + 291_630),
+        period_s: None,
+        detail: None,
+    };
+    assert_eq!(fable.window, described);
+    assert_eq!(shown(fable), fable_samples);
+    assert_eq!(
+        fable.pace,
+        expected(&described, T0 + 7_200, &fable_samples),
+        "the shared pace helper, as of the window's latest sample"
+    );
+    assert_eq!(fable.pace.method, Some(ProjectionMethod::Regression));
+    assert_eq!(
+        keys(&fx.engine.history(&a, None, 0).unwrap()),
+        ["5h", "7d"],
+        "not relevant under the default models"
+    );
+    let settings = Settings {
+        models: vec!["fable".into()],
+        ..Settings::default()
+    };
+    assert_eq!(
+        keys(
+            &fx.engine_with_settings(settings)
+                .history(&a, None, 0)
+                .unwrap()
+        ),
+        ["5h", "7d", "scoped:Fable"],
+        "relevant when the settings name it (§8.2)"
+    );
+    assert!(fx.http.requests().is_empty(), "history never fetches");
+}
+
+#[test]
+fn history_of_an_empty_latest_reading_still_shows_the_relevant_samples() {
+    // An empty reading is stored as no windows (§8.2), yet the samples before it remain.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    record(&fx, &a, &reading(T0, 9.0, 60.0), T0, T0 + 180);
+    record(
+        &fx,
+        &a,
+        &reading(T0 + 3_600, 12.0, 70.0),
+        T0 + 3_600,
+        T0 + 3_780,
+    );
+    record(&fx, &a, &[], T0 + 7_200, T0 + 7_380);
+    at(&fx, T0 + 7_200);
+
+    let h = fx.engine.history(&a, None, 0).unwrap();
+    assert_eq!(keys(&h), ["5h", "7d"]);
+    let five = &h.windows[0];
+    assert_eq!(
+        (five.window.kind, five.window.pct, five.window.period_s),
+        (WindowKind::Short, 12.0, Some(18_000))
+    );
+    assert_eq!(shown(five), [(T0, 9.0), (T0 + 3_600, 12.0)]);
+    assert_eq!(shown(&h.windows[1]), [(T0, 60.0), (T0 + 3_600, 70.0)]);
+    assert_eq!(
+        shown(&fx.engine.history(&a, None, T0 + 1).unwrap().windows[0]),
+        [(T0 + 3_600, 12.0)],
+        "since still bounds the samples"
     );
 }
 

@@ -300,6 +300,31 @@ pub fn normalize(body: &Value) -> Result<Vec<Window>, ()> {
     Ok(out)
 }
 
+/// A window key as `normalize` describes it (§8.2), with `pct` 0 and no reset or detail: `5h`,
+/// `7d`, `spend`, or `scoped:<name>` for a non-empty name. A scoped window's period comes from
+/// its `limits[]` item's `group`, which the key does not carry, so it is described without
+/// one. `None` for any other key.
+pub fn describe(key: &str) -> Option<Window> {
+    let (label, kind, period_s) = match key {
+        FIVE_HOUR => (key, WindowKind::Short, Some(FIVE_HOUR_S)),
+        SEVEN_DAY => (key, WindowKind::Long, Some(WEEK_S)),
+        SPEND => (key, WindowKind::Spend, None),
+        _ => {
+            let name = key.strip_prefix(SCOPED_PREFIX).filter(|n| !n.is_empty())?;
+            (name, WindowKind::Scoped, None)
+        }
+    };
+    Some(Window {
+        key: key.to_owned(),
+        label: label.to_owned(),
+        kind,
+        pct: 0.0,
+        resets_at: None,
+        period_s,
+        detail: None,
+    })
+}
+
 /// §8.1's verdict on one usage reply: `UsageResult::from_reply` with this module's `normalize`.
 /// A body that does not normalize is `bad-response`.
 pub fn parse_usage(reply: Result<HttpResponse, HttpError>) -> UsageResult {

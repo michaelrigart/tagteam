@@ -9,11 +9,12 @@ use tagteam_cc::provider::ClaudeCode;
 use tagteam_cc::usage;
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service, read_services};
 use tagteam_core::Fingerprint;
+use tagteam_core::usage::WindowKind;
 use tagteam_provider::http::{HttpResponse, Method, ScriptedHttp};
 use tagteam_provider::provider::TransientKind;
 use tagteam_provider::{
     Capabilities, Credential, Env, FakeKeychain, KindTraits, LockError, MutationGuard, Pace,
-    PollBudget, Provider, ProviderError, Read, SecretStore, StoredLogin, UsageResult,
+    PollBudget, Provider, ProviderError, Read, SecretStore, StoredLogin, UsageResult, Window,
 };
 
 /// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
@@ -899,4 +900,50 @@ fn claude_code_s_budget_rendering_and_live_identity_source() {
         .map(|w| (w, Pace::default()))
         .collect();
     assert_eq!(f.cc.render_usage(&windows)["sevenDay"]["pct"], json!(77.0));
+}
+
+#[test]
+fn claude_code_describes_its_window_keys_as_it_normalizes_them() {
+    // §13.4: `history` asks the provider to describe a window that a stored sample names but
+    // the last reading lacks. Each key reads as §8.2's normalization builds it, minus a reading.
+    let f = fx();
+    let bare = |key: &str, label: &str, kind, period_s| {
+        Some(Window {
+            key: key.into(),
+            label: label.into(),
+            kind,
+            pct: 0.0,
+            resets_at: None,
+            period_s,
+            detail: None,
+        })
+    };
+    let described = |key: &str| f.cc.describe_window(key);
+    assert_eq!(
+        described("5h"),
+        bare("5h", "5h", WindowKind::Short, Some(18_000))
+    );
+    assert_eq!(
+        described("7d"),
+        bare("7d", "7d", WindowKind::Long, Some(604_800))
+    );
+    assert_eq!(
+        described("spend"),
+        bare("spend", "spend", WindowKind::Spend, None)
+    );
+    assert_eq!(
+        described("scoped:Fable"),
+        bare("scoped:Fable", "Fable", WindowKind::Scoped, None),
+        "the key does not say its limit's group, so it has no period"
+    );
+    for key in ["", "5H", "1h", "scoped:", "seven_day", "Fable", "daily"] {
+        assert_eq!(described(key), None, "{key:?}");
+    }
+    for w in usage::normalize(&usage_body()).unwrap() {
+        let d = described(&w.key).unwrap();
+        assert_eq!((&d.key, &d.label, d.kind), (&w.key, &w.label, w.kind));
+        if w.kind != WindowKind::Scoped {
+            assert_eq!(d.period_s, w.period_s, "{}", w.key);
+        }
+    }
 }
