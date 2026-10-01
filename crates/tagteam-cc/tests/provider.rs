@@ -735,6 +735,36 @@ fn a_held_config_lock_releases_the_credential_locks_it_was_given() {
     );
 }
 
+/// §14.1: a lock wait is a cancellation point, and unwinding releases what is held: the
+/// credential locks `lock_config` was given are removed with the interrupted config wait.
+#[test]
+fn an_interrupted_config_wait_releases_the_credential_locks_it_was_given() {
+    let f = fx();
+    let paths = CcPaths::resolve(&f.env);
+    fs::create_dir(&paths.config_lock).unwrap(); // someone else holds it, freshly
+    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+    let cred =
+        f.cc.lock_credentials(&f.env, &g, Duration::from_secs(1))
+            .unwrap();
+    f.env.cancel.request(libc::SIGTERM);
+    let start = Instant::now();
+    match f.cc.lock_config(&f.env, cred, Duration::from_secs(2)) {
+        Err(ProviderError::Lock(LockError::Interrupted { path, signal })) => {
+            assert_eq!((path, signal), (paths.config_lock.clone(), libc::SIGTERM))
+        }
+        other => panic!("expected an interrupted wait, got {:?}", other.err()),
+    }
+    assert!(
+        start.elapsed() < Duration::from_millis(100),
+        "checked before the first attempt"
+    );
+    assert!(!paths.refresh_lock.exists() && !paths.legacy_lock().exists());
+    assert!(
+        paths.config_lock.is_dir(),
+        "the other holder's lock is left alone"
+    );
+}
+
 /// §9.1: one budget covers both stages. The legacy lock is held for most of a 2 s budget and a
 /// config lock for good, so the credential stage spends about 1.5 s. With one shared budget the
 /// config stage gets what remains, and `lock_live` gives up by ~2.5 s. A fresh budget per

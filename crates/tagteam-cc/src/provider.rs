@@ -319,7 +319,7 @@ impl Provider for ClaudeCode {
         g: &'g MutationGuard,
         budget: Duration,
     ) -> Result<CredLocks<'g>, ProviderError> {
-        let set = locks::acquire_credentials(&CcPaths::resolve(env), budget)?;
+        let set = locks::acquire_credentials(&CcPaths::resolve(env), budget, &env.cancel)?;
         Ok(CredLocks::new(g, Box::new(set)))
     }
 
@@ -329,8 +329,9 @@ impl Provider for ClaudeCode {
         cred: CredLocks<'g>,
         budget: Duration,
     ) -> Result<LiveLocks<'g>, ProviderError> {
-        // On a timeout `cred` is dropped as this returns, releasing the credential locks.
-        let set = locks::acquire_config(&CcPaths::resolve(env), budget)?;
+        // On a timeout or an interruption, `cred` is dropped as this returns, releasing the
+        // credential locks.
+        let set = locks::acquire_config(&CcPaths::resolve(env), budget, &env.cancel)?;
         Ok(cred.with_config(Box::new(set)))
     }
 

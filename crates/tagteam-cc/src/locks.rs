@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tagteam_provider::{LiveLockSet, LockError, MkdirLock, MkdirLockSpec};
+use tagteam_provider::{Cancel, LiveLockSet, LockError, MkdirLock, MkdirLockSpec};
 
 use crate::paths::CcPaths;
 
@@ -36,15 +36,20 @@ impl LiveLockSet for CcConfigSet {
 
 /// The refresh lock, then the legacy lock. If the legacy lock is contended the refresh lock is
 /// released and the pair retried, as CC does. tagteam never writes `.oauth_refresh.lock.owner`.
-pub fn acquire_credentials(paths: &CcPaths, timeout: Duration) -> Result<CcCredSet, LockError> {
+/// `cancel` is checked before every attempt (§14.1): a token set while the legacy lock is
+/// contended ends the retries naming that lock, with the refresh lock already released.
+pub fn acquire_credentials(
+    paths: &CcPaths,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<CcCredSet, LockError> {
     let deadline = Instant::now() + timeout;
     let remaining = || deadline.saturating_duration_since(Instant::now());
     loop {
-        let refresh = MkdirLock::acquire(&MkdirLockSpec::new(
-            paths.refresh_lock.clone(),
-            CRED_STALE,
-            remaining(),
-        ))?;
+        let refresh = MkdirLock::acquire(
+            &MkdirLockSpec::new(paths.refresh_lock.clone(), CRED_STALE, remaining())
+                .with_cancel(cancel),
+        )?;
         let legacy_spec = MkdirLockSpec::new(paths.legacy_lock(), CRED_STALE, Duration::ZERO);
         match MkdirLock::try_acquire(&legacy_spec)? {
             Some(legacy) => return Ok(CcCredSet { legacy, refresh }),
@@ -54,20 +59,29 @@ pub fn acquire_credentials(paths: &CcPaths, timeout: Duration) -> Result<CcCredS
                     return Err(LockError::Timeout(legacy_spec.path));
                 }
                 thread::sleep(Duration::from_millis(fastrand::u64(250..=500)).min(remaining()));
+                if let Some(signal) = cancel.requested() {
+                    return Err(LockError::Interrupted {
+                        path: legacy_spec.path,
+                        signal,
+                    });
+                }
             }
         }
     }
 }
 
-/// The config lock alone. A caller takes it only while holding the credential locks
-/// (`CredLocks::with_config`, §4.3).
-pub fn acquire_config(paths: &CcPaths, timeout: Duration) -> Result<CcConfigSet, LockError> {
+/// The config lock alone, waited for under `cancel` (§14.1). A caller takes it only while
+/// holding the credential locks (`CredLocks::with_config`, §4.3).
+pub fn acquire_config(
+    paths: &CcPaths,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<CcConfigSet, LockError> {
     Ok(CcConfigSet {
-        config: MkdirLock::acquire(&MkdirLockSpec::new(
-            paths.config_lock.clone(),
-            CONFIG_STALE,
-            timeout,
-        ))?,
+        config: MkdirLock::acquire(
+            &MkdirLockSpec::new(paths.config_lock.clone(), CONFIG_STALE, timeout)
+                .with_cancel(cancel),
+        )?,
     })
 }
 
@@ -87,7 +101,7 @@ mod tests {
     fn the_credential_locks_never_touch_the_config_lock() {
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
-        let set = acquire_credentials(&p, ACQUIRE_TIMEOUT).unwrap();
+        let set = acquire_credentials(&p, ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
         assert!(p.refresh_lock.is_dir() && p.legacy_lock().is_dir());
         assert!(!p.config_lock.exists(), "only the config stage takes it");
         assert!(set.check_owned().is_ok());
@@ -100,7 +114,7 @@ mod tests {
     fn the_config_lock_is_taken_and_released_on_its_own() {
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
-        let set = acquire_config(&p, ACQUIRE_TIMEOUT).unwrap();
+        let set = acquire_config(&p, ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
         assert!(p.config_lock.is_dir());
         assert!(!p.refresh_lock.exists() && !p.legacy_lock().exists());
         assert!(set.check_owned().is_ok());
@@ -114,7 +128,7 @@ mod tests {
         let p = paths(d.path());
         fs::create_dir(p.legacy_lock()).unwrap(); // CC holds it, freshly
         assert!(matches!(
-            acquire_credentials(&p, Duration::from_millis(700)),
+            acquire_credentials(&p, Duration::from_millis(700), &Cancel::new()),
             Err(LockError::Timeout(_))
         ));
         assert!(
@@ -145,7 +159,9 @@ mod tests {
         let p2 = p.clone();
         // Generous on purpose: only this test's own deadline below is meant to be tight; this
         // just must outlast it plus the eventual release.
-        let handle = thread::spawn(move || acquire_credentials(&p2, Duration::from_secs(30)));
+        let handle = thread::spawn(move || {
+            acquire_credentials(&p2, Duration::from_secs(30), &Cancel::new())
+        });
 
         let tried = Instant::now() + Duration::from_secs(10);
         while fs::metadata(&lock_dir).unwrap().modified().unwrap() == untouched {
@@ -192,7 +208,7 @@ mod tests {
         fs::create_dir(&p.refresh_lock).unwrap();
         let start = std::time::Instant::now();
         assert!(matches!(
-            acquire_credentials(&p, Duration::from_millis(500)),
+            acquire_credentials(&p, Duration::from_millis(500), &Cancel::new()),
             Err(LockError::Timeout(_))
         ));
         assert!(start.elapsed() < Duration::from_secs(2));
@@ -205,9 +221,99 @@ mod tests {
         let p = paths(d.path());
         fs::create_dir(&p.config_lock).unwrap(); // something else holds it, freshly
         assert!(matches!(
-            acquire_config(&p, Duration::from_millis(500)),
+            acquire_config(&p, Duration::from_millis(500), &Cancel::new()),
             Err(LockError::Timeout(_))
         ));
+        assert!(
+            p.config_lock.is_dir(),
+            "the other holder's lock is left alone"
+        );
+    }
+
+    /// Sets `cancel` to SIGINT from another thread 200 ms from now, as the CLI's handler would
+    /// (§14.1), and returns the instant just before it did.
+    fn interrupt_soon(cancel: &Cancel) -> thread::JoinHandle<Instant> {
+        let cancel = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            let at = Instant::now();
+            cancel.request(libc::SIGINT);
+            at
+        })
+    }
+
+    /// Runs `wait` while `interrupt_soon` sets the token; it must still be waiting then, and
+    /// must end within one poll (at most 500 ms) of it. Returns the lock it names.
+    fn interrupted<T>(wait: impl FnOnce(&Cancel) -> Result<T, LockError>) -> std::path::PathBuf {
+        let cancel = Cancel::new();
+        let setter = interrupt_soon(&cancel);
+        let result = wait(&cancel);
+        let ended = Instant::now();
+        let set_at = setter.join().unwrap();
+        assert!(ended >= set_at, "the wait ended before the token was set");
+        assert!(
+            ended - set_at < Duration::from_secs(1),
+            "{:?}",
+            ended - set_at
+        );
+        match result {
+            Err(LockError::Interrupted { path, signal }) => {
+                assert_eq!(signal, libc::SIGINT);
+                path
+            }
+            Err(e) => panic!("expected an interrupted wait, got {e:?}"),
+            Ok(_) => panic!("expected an interrupted wait, got the locks"),
+        }
+    }
+
+    #[test]
+    fn a_set_token_takes_neither_credential_lock() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        let cancel = Cancel::new();
+        cancel.request(libc::SIGTERM);
+        match acquire_credentials(&p, ACQUIRE_TIMEOUT, &cancel) {
+            Err(LockError::Interrupted { path, signal }) => {
+                assert_eq!((path, signal), (p.refresh_lock.clone(), libc::SIGTERM))
+            }
+            other => panic!("expected an interrupted wait, got {:?}", other.err()),
+        }
+        assert!(!p.refresh_lock.exists() && !p.legacy_lock().exists());
+    }
+
+    #[test]
+    fn a_token_set_while_cc_holds_the_refresh_lock_ends_the_wait() {
+        // Review Focus 1: CC is mid-refresh.
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        fs::create_dir(&p.refresh_lock).unwrap();
+        let named = interrupted(|c| acquire_credentials(&p, Duration::from_secs(30), c));
+        assert_eq!(named, p.refresh_lock);
+        assert!(p.refresh_lock.is_dir(), "CC's lock is left alone");
+        assert!(!p.legacy_lock().exists());
+    }
+
+    #[test]
+    fn a_token_set_during_legacy_contention_ends_the_retries_naming_the_legacy_lock() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        fs::create_dir(p.legacy_lock()).unwrap(); // CC holds it, freshly
+        let named = interrupted(|c| acquire_credentials(&p, Duration::from_secs(30), c));
+        assert_eq!(named, p.legacy_lock());
+        assert!(
+            !p.refresh_lock.exists(),
+            "the refresh lock each retry took is released"
+        );
+        assert!(p.legacy_lock().is_dir(), "CC's lock is left alone");
+    }
+
+    #[test]
+    fn a_token_set_while_the_config_lock_is_held_ends_the_wait() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        fs::create_dir(&p.config_lock).unwrap(); // something else holds it, freshly
+        let named = interrupted(|c| acquire_config(&p, Duration::from_secs(30), c));
+        assert_eq!(named, p.config_lock);
         assert!(
             p.config_lock.is_dir(),
             "the other holder's lock is left alone"
