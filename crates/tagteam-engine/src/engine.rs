@@ -9,6 +9,7 @@ use crate::error::EngineError;
 use crate::hooks;
 use crate::oracle::Oracle;
 use crate::registry::ProviderRegistry;
+use crate::settings::Settings;
 use crate::store::Store;
 use crate::vault::Vault;
 
@@ -21,6 +22,8 @@ pub struct EngineConfig {
     /// Every network request goes through this port (§4.4).
     pub http: Arc<dyn Http>,
     pub default_provider: ProviderId,
+    /// `config.toml` as read for this command (§6.4).
+    pub settings: Settings,
 }
 
 pub struct Engine {
@@ -31,6 +34,7 @@ pub struct Engine {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) http: Arc<dyn Http>,
     pub(crate) default_provider: ProviderId,
+    pub(crate) settings: Settings,
     store: Mutex<Option<Arc<Store>>>,
     #[cfg(feature = "test-hooks")]
     pub(crate) fail_at: Mutex<Option<&'static str>>,
@@ -49,6 +53,7 @@ impl Engine {
             clock: cfg.clock,
             http: cfg.http,
             default_provider: cfg.default_provider,
+            settings: cfg.settings,
             store: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
             fail_at: Mutex::new(None),
@@ -67,6 +72,11 @@ impl Engine {
 
     pub fn now_ms(&self) -> i64 {
         self.clock.now_ms()
+    }
+
+    /// The settings this engine was built with (§6.4).
+    pub fn settings(&self) -> &Settings {
+        &self.settings
     }
 
     /// The port providers send their requests through (§4.4).
@@ -280,8 +290,8 @@ mod tests {
     use crate::store::{JournalRow, NewAccount};
     use crate::vault::KeychainVault;
 
-    fn test_engine(env: Env) -> Engine {
-        Engine::new(EngineConfig {
+    fn test_config(env: Env) -> EngineConfig {
+        EngineConfig {
             env,
             registry: ProviderRegistry::new(),
             vault: Vault::new(Box::new(KeychainVault::new(Arc::new(FakeKeychain::new())))),
@@ -289,7 +299,27 @@ mod tests {
             clock: Arc::new(tagteam_provider::SystemClock),
             http: Arc::new(tagteam_provider::NoHttp),
             default_provider: ProviderId::new("p"),
-        })
+            settings: Settings::default(),
+        }
+    }
+
+    fn test_engine(env: Env) -> Engine {
+        Engine::new(test_config(env))
+    }
+
+    #[test]
+    fn the_engine_keeps_the_settings_it_was_built_with() {
+        let d = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            threshold: 75.0,
+            models: vec!["Fable".into()],
+            ..Settings::default()
+        };
+        let engine = Engine::new(EngineConfig {
+            settings: settings.clone(),
+            ..test_config(Env::for_test(d.path()))
+        });
+        assert_eq!(engine.settings(), &settings);
     }
 
     /// A journal row's `to_id` is foreign-keyed to `accounts`, so a test that installs one

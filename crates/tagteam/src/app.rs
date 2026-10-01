@@ -7,10 +7,12 @@ use tagteam_cc::ClaudeCode;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::Platform;
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::net::UreqHttp;
 use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::registry::ProviderRegistry;
+use tagteam_engine::settings::Settings;
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
@@ -112,7 +114,10 @@ pub struct Io<'a> {
     pub prompter: &'a mut dyn Prompter,
 }
 
-fn build_engine(ctx: Context) -> Engine {
+/// The engine for one command, and the settings warnings for the caller to print (§6.4). The
+/// HTTP adapter is built on its first request, never before (§13.5), and the oracle sends
+/// through the same one.
+fn build_engine(ctx: Context) -> (Engine, Vec<String>) {
     let mut cc = ClaudeCode::new(ctx.keychain.clone(), ctx.platform);
     if let Some(base) = &ctx.api_base {
         cc = cc.with_endpoints(Endpoints::with_base(base));
@@ -124,12 +129,17 @@ fn build_engine(ctx: Context) -> Engine {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     // `api_base` only ever carries a test base: it is sent to directly, never through whatever
     // proxy the machine's environment names, so test traffic cannot leave the machine.
-    let http: Arc<dyn Http> = Arc::new(if ctx.api_base.is_some() {
-        UreqHttp::direct()
-    } else {
-        UreqHttp::new()
-    });
-    Engine::new(EngineConfig {
+    let direct = ctx.api_base.is_some();
+    let http: Arc<dyn Http> = Arc::new(LazyHttp::new(move || -> Arc<dyn Http> {
+        Arc::new(if direct {
+            UreqHttp::direct()
+        } else {
+            UreqHttp::new()
+        })
+    }));
+    let default_provider = ProviderId::new(CLAUDE_CODE);
+    let (settings, warnings) = Settings::load(&ctx.env, &default_provider);
+    let engine = Engine::new(EngineConfig {
         env: ctx.env,
         registry: ProviderRegistry::new().with(Arc::new(cc)),
         vault,
@@ -140,8 +150,10 @@ fn build_engine(ctx: Context) -> Engine {
         ))),
         clock,
         http,
-        default_provider: ProviderId::new(CLAUDE_CODE),
-    })
+        default_provider,
+        settings,
+    });
+    (engine, warnings)
 }
 
 /// Logs are diagnostics, on stderr: ERROR by default, so a routine command stays quiet (what a
@@ -215,8 +227,12 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
+    let (engine, warnings) = build_engine(ctx);
+    for w in &warnings {
+        let _ = writeln!(io.err, "warning: {w}");
+    }
     let mut app = App {
-        engine: build_engine(ctx),
+        engine,
         json,
         provider_flag: cli.provider.map(ProviderId::new),
         keychain,

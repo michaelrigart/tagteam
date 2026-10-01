@@ -17,6 +17,7 @@ use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::net::UreqHttp;
 use tagteam_engine::oracle::{CachingOracle, HttpOracle, Oracle};
 use tagteam_engine::registry::ProviderRegistry;
+use tagteam_engine::settings::Settings;
 use tagteam_engine::vault::{KeychainVault, SERVICE, Vault};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::http::{Http, Method};
@@ -252,6 +253,7 @@ fn a_hanging_profile_endpoint_delays_a_switch_by_its_timeout_and_holds_no_lock()
         clock: fx.clock.clone(),
         http,
         default_provider: ProviderId::new(CLAUDE_CODE),
+        settings: Settings::default(),
     });
     let env = fx.env.clone();
     let watched = b.clone();
