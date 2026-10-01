@@ -10,6 +10,16 @@ pub const TRUST_MAX_AGE_S: i64 = 3600;
 /// `fetched_at` plus this.
 pub const POST_429_TRUST_CAP_S: i64 = 7200;
 
+/// A `fetched_at` this far ahead of `now` is clock skew we tolerate (the reading counts as taken
+/// now); any further ahead is not a usable age (§8.4). Shared by trust, the re-plan and the
+/// store's reserve eligibility.
+pub const FUTURE_STAMP_SLACK_S: i64 = 60;
+
+/// Whether a reading's `fetched_at` is more than [`FUTURE_STAMP_SLACK_S`] after `now_s`.
+pub fn is_future_stamped(fetched_at: i64, now_s: i64) -> bool {
+    fetched_at.saturating_sub(now_s) > FUTURE_STAMP_SLACK_S
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrustInputs {
     pub now_s: i64,
@@ -27,7 +37,9 @@ pub struct TrustInputs {
 
 /// §8.4: whether the reading may drive a decision (and be shown as `usage`, §13.2).
 ///
-/// - Age ≤ 300 s: trusted. A reading stamped in the future (clock skew) counts as fresh.
+/// - A reading stamped more than [`FUTURE_STAMP_SLACK_S`] (60 s) after `now_s` is clock skew
+///   beyond what we tolerate: not decision-grade, whatever else would extend trust.
+/// - Age ≤ 300 s: trusted. A reading stamped up to that slack ahead counts as fresh.
 /// - Age ≤ 3600 s: trusted while failures are retried, a plan is in force, or a lease is live.
 /// - After a 429 (`last_429_at > fetched_at`): trusted until the earliest relevant reset, capped
 ///   at `fetched_at + 7200 s`, because usage only rises within a window and the old reading is a
@@ -36,6 +48,9 @@ pub fn decision_grade(t: &TrustInputs) -> bool {
     let Some(fetched_at) = t.fetched_at else {
         return false;
     };
+    if is_future_stamped(fetched_at, t.now_s) {
+        return false;
+    }
     let age = t.now_s.saturating_sub(fetched_at);
     if age <= STALE_OK_S {
         return true;
@@ -100,8 +115,34 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_from_the_future_counts_as_fresh() {
+    fn a_reading_stamped_a_little_ahead_of_now_counts_as_fresh() {
         assert!(decision_grade(&at_age(-50)));
+        assert!(decision_grade(&at_age(-FUTURE_STAMP_SLACK_S)));
+    }
+
+    #[test]
+    fn a_reading_stamped_more_than_the_slack_ahead_of_now_is_not_decision_grade() {
+        assert!(!decision_grade(&at_age(-FUTURE_STAMP_SLACK_S - 1)));
+        assert!(!decision_grade(&at_age(-86_400)));
+        // Nothing that extends trust rescues it.
+        let t = TrustInputs {
+            consecutive_failures: 3,
+            plan_in_force: true,
+            live_lease: true,
+            last_429_at: Some(FETCHED + 10),
+            earliest_relevant_reset: Some(FETCHED + 5000),
+            ..at_age(-FUTURE_STAMP_SLACK_S - 1)
+        };
+        assert!(!decision_grade(&t));
+    }
+
+    #[test]
+    fn the_future_slack_is_a_minute() {
+        assert_eq!(FUTURE_STAMP_SLACK_S, 60);
+        assert!(!is_future_stamped(1_000, 1_060));
+        assert!(is_future_stamped(1_061, 1_000));
+        assert!(!is_future_stamped(i64::MIN, 1_000), "no overflow");
+        assert!(is_future_stamped(i64::MAX, i64::MIN), "no overflow");
     }
 
     #[test]

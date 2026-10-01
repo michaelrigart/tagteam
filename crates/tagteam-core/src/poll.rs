@@ -2,6 +2,8 @@
 //! the hourly budget lets one go out. Ported from cswap's `poll_policy.py`; the hourly budget
 //! and the post-jitter floor are tagteam's. Pure: time and jitter are passed in.
 
+use crate::trust::is_future_stamped;
+
 /// Growth applied to the previous interval while a reading is not moving (§8.6: `base · 1.5`).
 const IDLE_GROWTH: f64 = 1.5;
 
@@ -120,39 +122,50 @@ fn jittered(interval_s: i64, jitter: f64, frac: f64) -> i64 {
 
 /// §8.6 `plan_after_fetch`, with Decision 9's clamps. `jitter` is in [-1, 1].
 ///
-/// 1. Unknown pct: the role's default (180 s active, 300 s candidate). Otherwise movement of at
+/// 1. Unknown pct (absent or not finite; a non-finite `prev_pct` likewise means no movement can
+///    be measured): the role's default (180 s active, 300 s candidate). Otherwise movement of at
 ///    least `movement_delta` points (up or down; a drop is a window reset) gives
-///    `max(180, base/2)`, and no movement gives `min(ceiling, max(180, base · 1.5))`, where
-///    `base` is the previous interval or the role's default.
+///    `max(180, base/2)`, and no movement gives `max(180, base · 1.5)`, where `base` is the
+///    previous interval or the role's default. Either is capped at the role's maximum (active
+///    300 s, candidate 600 s), so a long interval left by a 429 does not carry into a moving
+///    reading.
 /// 2. Urgent (active, moving, within `escalation_margin` of the threshold, no recent 429): 60 s.
 /// 3. Recent 429: `min(1800, max(interval, max(base · 1.5, 360)))`. A 429 is recent from when
 ///    its backoff lifts (or while it has not lifted yet) for `recent_429_window_s`. This applies
 ///    with an unknown pct too: the rule protects the endpoint, not the reading.
+///    The role's maximum does not cap rules 3 and 4.
 /// 4. Exhausted (pct ≥ 100): at least 600 s.
 /// 5. Jitter, then the floor (180 s; 60 s when urgent), then the reset cap: the next poll is
 ///    `max(now + floor, min(now + interval, reset + 60))`, and a reset at or before `now` is
 ///    ignored. When the cap and the floor disagree, the floor wins.
+///
+/// The urgent floor (60 s) survives rule 4 on purpose: an exhausted active account that just
+/// moved and whose window resets within a minute is polled right after the reset
+/// (`reset + 60`), not 180 s later, because the reset is when it becomes usable again.
 pub fn plan_after_fetch(b: &PollBudget, i: &PollInputs, jitter: f64) -> PollPlan {
     let default_s = b.default_interval_s(i.active);
     let ceiling_s = b.ceiling_s(i.active);
     let base = i.prev_interval_s.unwrap_or(default_s);
-    let moving = match (i.pct, i.prev_pct) {
+    let pct = i.pct.filter(|p| p.is_finite());
+    let prev_pct = i.prev_pct.filter(|p| p.is_finite());
+    let moving = match (pct, prev_pct) {
         (Some(p), Some(q)) => (p - q).abs() >= b.movement_delta,
         _ => false,
     };
     let recent_429 = i
         .last_429_at
-        .is_some_and(|at| at > i.now_s || i.now_s - at <= b.recent_429_window_s);
+        .is_some_and(|at| at > i.now_s || i.now_s.saturating_sub(at) <= b.recent_429_window_s);
 
     let mut urgent = false;
-    let mut interval = match i.pct {
+    let mut interval = match pct {
         None => default_s,
         Some(p) => {
             let mut v = if moving {
                 (base / 2).max(b.floor_s)
             } else {
-                grow(base, IDLE_GROWTH).max(b.floor_s).min(ceiling_s)
-            };
+                grow(base, IDLE_GROWTH).max(b.floor_s)
+            }
+            .min(ceiling_s);
             if i.active && moving && !recent_429 && p >= i.threshold - b.escalation_margin {
                 urgent = true;
                 v = b.urgent_s;
@@ -164,7 +177,7 @@ pub fn plan_after_fetch(b: &PollBudget, i: &PollInputs, jitter: f64) -> PollPlan
         let grown = grow(base, b.post_429_mult).max(b.post_429_min_s);
         interval = interval.max(grown).min(b.post_429_max_s);
     }
-    if i.pct.is_some_and(|p| p >= 100.0) {
+    if pct.is_some_and(|p| p >= 100.0) {
         interval = interval.max(b.exhausted_s);
     }
 
@@ -187,7 +200,9 @@ pub fn plan_after_fetch(b: &PollBudget, i: &PollInputs, jitter: f64) -> PollPlan
 /// The incoming (active) account follows §9.4: `next_poll_at = max(now, fetched_at + 180)` with
 /// the active default interval and no jitter, so a stale reading is fetched at once. The
 /// outgoing (candidate) account gets the candidate default interval, jittered, from `now_s`, and
-/// never below the floor.
+/// never below the floor. A `fetched_at` more than [`crate::trust::FUTURE_STAMP_SLACK_S`] after `now_s` (clock
+/// skew) is not a usable age and counts as `now_s`, so the plan never reaches arbitrarily far
+/// ahead.
 pub fn replan_for_role(
     b: &PollBudget,
     active: bool,
@@ -195,6 +210,11 @@ pub fn replan_for_role(
     now_s: i64,
     jitter: f64,
 ) -> PollPlan {
+    let fetched_at = if is_future_stamped(fetched_at, now_s) {
+        now_s
+    } else {
+        fetched_at
+    };
     let interval = b.default_interval_s(active);
     let next_poll_at = if active {
         now_s.max(fetched_at.saturating_add(interval))
@@ -214,7 +234,12 @@ pub fn replan_for_role(
 /// `count_window_s` after it was reserved, and the answer is that moment for the row whose
 /// leaving brings the count under `hourly_requests`. A row stamped in the future (clock skew)
 /// still counts.
+///
+/// A budget of zero requests is never free: the answer is `now_s + count_window_s`.
 pub fn budget_next_free(b: &PollBudget, counted_at: &[i64], now_s: i64) -> Option<i64> {
+    if b.hourly_requests == 0 {
+        return Some(now_s.saturating_add(b.count_window_s));
+    }
     let mut counted: Vec<i64> = counted_at
         .iter()
         .copied()
@@ -231,6 +256,7 @@ pub fn budget_next_free(b: &PollBudget, counted_at: &[i64], now_s: i64) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trust::FUTURE_STAMP_SLACK_S;
 
     const B: PollBudget = PollBudget::STANDARD;
     const NOW: i64 = 1_000_000;
@@ -692,6 +718,148 @@ mod tests {
             assert_eq!(next(-1.0).next_poll_at, NOW + 270);
             assert_eq!(next(0.0).interval_s, 300);
         }
+    }
+
+    #[test]
+    fn a_reading_stamped_within_the_slack_ahead_of_now_is_planned_from_its_stamp() {
+        let p = replan_for_role(&B, true, NOW + FUTURE_STAMP_SLACK_S, NOW, 0.0);
+        assert_eq!(p.next_poll_at, NOW + FUTURE_STAMP_SLACK_S + 180);
+    }
+
+    #[test]
+    fn a_replan_clamps_a_reading_stamped_far_in_the_future_to_now() {
+        for fetched_at in [NOW + FUTURE_STAMP_SLACK_S + 1, NOW + 86_400, i64::MAX] {
+            let p = replan_for_role(&B, true, fetched_at, NOW, 0.0);
+            assert_eq!(
+                (p.interval_s, p.next_poll_at),
+                (180, NOW + 180),
+                "fetched_at = now {:+}",
+                fetched_at.saturating_sub(NOW)
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_finite_pct_counts_as_unknown() {
+        let unknown = PollInputs {
+            pct: None,
+            prev_pct: None,
+            ..inputs()
+        };
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let pct = PollInputs {
+                pct: Some(bad),
+                prev_pct: Some(50.0),
+                ..inputs()
+            };
+            assert_eq!(plan(pct), plan(unknown), "pct = {bad}");
+            assert_eq!(plan(pct), (300, 300), "pct = {bad}: the role's default");
+            let prev = PollInputs {
+                pct: Some(60.0),
+                prev_pct: Some(bad),
+                ..inputs()
+            };
+            assert_eq!(
+                plan(prev),
+                (450, 450),
+                "prev_pct = {bad}: not moving, so the interval grows"
+            );
+        }
+        let infinite_is_not_exhausted = PollInputs {
+            pct: Some(f64::INFINITY),
+            ..active()
+        };
+        assert_eq!(plan(infinite_is_not_exhausted), (180, 180));
+    }
+
+    #[test]
+    fn the_roles_maximum_caps_a_moving_interval() {
+        let moving = |i: PollInputs, prev_interval_s| PollInputs {
+            pct: Some(52.0),
+            prev_pct: Some(50.0),
+            prev_interval_s: Some(prev_interval_s),
+            ..i
+        };
+        assert_eq!(
+            plan(moving(active(), 900)),
+            (300, 300),
+            "max(180, 450) caps at 300"
+        );
+        assert_eq!(
+            plan(moving(inputs(), 1800)),
+            (600, 600),
+            "max(180, 900) caps at 600"
+        );
+        assert_eq!(
+            plan(moving(active(), 500)),
+            (250, 250),
+            "under the cap: unchanged"
+        );
+    }
+
+    #[test]
+    fn the_roles_maximum_caps_an_idle_interval_but_not_the_post_429_or_exhausted_rules() {
+        let idle = |i: PollInputs, prev_interval_s| PollInputs {
+            prev_interval_s: Some(prev_interval_s),
+            ..i
+        };
+        assert_eq!(plan(idle(active(), 900)), (300, 300));
+        assert_eq!(plan(idle(inputs(), 1800)), (600, 600));
+        let after_429 = PollInputs {
+            last_429_at: Some(NOW - 10),
+            ..idle(active(), 900)
+        };
+        assert_eq!(
+            plan(after_429),
+            (1350, 1350),
+            "the 429 rule is applied after the cap"
+        );
+        let exhausted = PollInputs {
+            pct: Some(100.0),
+            prev_pct: Some(100.0),
+            ..idle(active(), 900)
+        };
+        assert_eq!(
+            plan(exhausted),
+            (600, 600),
+            "the exhausted rule is applied after the cap"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_active_account_near_its_reset_is_polled_right_after_it() {
+        // 95 → 100 is urgent (60 s floor), the exhausted rule raises the interval to 600, and
+        // the reset cap still lands the poll a minute after the reset, above the urgent floor.
+        let i = PollInputs {
+            pct: Some(100.0),
+            prev_pct: Some(95.0),
+            next_relevant_reset: Some(NOW + 5),
+            ..active()
+        };
+        assert_eq!(plan(i), (600, 65));
+    }
+
+    #[test]
+    fn a_zero_hourly_budget_is_never_free() {
+        let zero = PollBudget {
+            hourly_requests: 0,
+            ..B
+        };
+        assert_eq!(budget_next_free(&zero, &[], NOW), Some(NOW + 3660));
+        assert_eq!(
+            budget_next_free(&zero, &[NOW - 10, NOW - 5000], NOW),
+            Some(NOW + 3660)
+        );
+    }
+
+    #[test]
+    fn a_429_stamped_at_the_minimum_time_is_not_recent_and_does_not_overflow() {
+        let i = PollInputs {
+            last_429_at: Some(i64::MIN),
+            prev_interval_s: Some(600),
+            ..inputs()
+        };
+        assert_eq!(plan(i), (600, 600), "no post-429 growth");
     }
 
     fn ascending(count: i64, newest: i64) -> Vec<i64> {
