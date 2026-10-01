@@ -73,8 +73,16 @@ where
     };
     // §13.5: Claude Code pipes its session JSON into the status bar command. It is drained
     // here, at the process boundary, rather than in `app::run`: in-process tests drive `run`,
-    // and must never read the test runner's stdin.
-    if matches!(cli.command, Some(cli::Command::Statusline { .. })) {
+    // and must never read the test runner's stdin. Only a line that will be printed needs it:
+    // `--print-config` and the refused `--json` return without Claude Code's JSON ever being
+    // read, so a pipe that never closes must not hang them.
+    if matches!(
+        cli.command,
+        Some(cli::Command::Statusline {
+            print_config: false
+        })
+    ) && !cli.json
+    {
         let stdin = std::io::stdin();
         statusline::drain(stdin.lock(), stdin.is_terminal());
     }

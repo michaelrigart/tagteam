@@ -6,10 +6,11 @@ mod common;
 
 use std::fs::{self, File};
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::Stdio;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{
-    cmd, login, now_epoch_s, record_reading, seed_home, two_fresh_accounts, usage_window,
+    cmd, login, now_epoch_s, record_reading, seed_home, std_cmd, two_fresh_accounts, usage_window,
 };
 use serde_json::{Value, json};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, WindowKind};
@@ -326,6 +327,41 @@ fn print_config_prints_the_snippet_and_json_is_refused() {
             json!({"schemaVersion": 1, "error": {"type": "usage",
                    "message": "statusline prints a line of text; run it without --json"}}),
             "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn print_config_and_the_json_refusal_never_wait_for_stdin() {
+    // Claude Code's session JSON is drained only for a line that will be printed: a pipe that
+    // never closes must not hang `--print-config` or the refused `--json`.
+    let d = tempfile::tempdir().unwrap();
+    fs::create_dir_all(d.path().join("home")).unwrap();
+    let cases: [&[&str]; 2] = [&["statusline", "--print-config"], &["statusline", "--json"]];
+    for args in cases {
+        let mut child = std_cmd(d.path())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _open = child.stdin.take().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            status.is_some(),
+            "{args:?} waited for a stdin that never closes"
         );
     }
 }
