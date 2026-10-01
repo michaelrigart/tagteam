@@ -1149,3 +1149,121 @@ pub fn prev_refresh_token(fx: &Fx, id: &AccountId) -> Option<String> {
         .as_str()
         .map(str::to_owned)
 }
+
+/// Usage collection (§8), shared by `collect.rs`, `collect_active.rs` and `switch.rs`.
+impl Fx {
+    /// Queues a reply from the usage endpoint (§8.1): `status` with a JSON `body`.
+    pub fn script_usage(&self, status: u16, body: Value) {
+        self.http
+            .push_json(Method::Get, &Self::endpoints().usage, status, body);
+    }
+
+    /// Queues a 429 whose `Retry-After` header is `retry_after`, verbatim (§8.1, §8.5).
+    pub fn script_usage_429(&self, retry_after: &str) {
+        let mut reply = tagteam_provider::HttpResponse::json_body(
+            429,
+            &json!({"type": "error", "error": {"type": "rate_limit_error", "message": "Rate limited"}}),
+        );
+        reply
+            .headers
+            .push(("retry-after".to_owned(), retry_after.to_owned()));
+        self.http
+            .push(Method::Get, &Self::endpoints().usage, Ok(reply));
+    }
+
+    /// `list`'s on-demand collection of `ids` through the fixture's engine (§8.3).
+    pub fn collect(&self, ids: &[&AccountId]) -> tagteam_engine::collect::CollectReport {
+        self.engine
+            .collect_usage(tagteam_engine::collect::CollectMode::OnDemand {
+                accounts: ids.iter().map(|id| (*id).clone()).collect(),
+            })
+            .unwrap()
+    }
+
+    /// `id`'s `usage_state` row, if it has one.
+    pub fn usage_state(&self, id: &AccountId) -> Option<tagteam_engine::store::UsageStateRow> {
+        self.engine.store().unwrap().usage_state(id).unwrap()
+    }
+
+    /// An engine over this fixture's Env, Keychain, oracle and clock whose requests go to
+    /// `http` rather than to the fixture's scripted port.
+    pub fn engine_with_http(&self, http: Arc<dyn tagteam_provider::Http>) -> Engine {
+        Engine::new(EngineConfig {
+            env: self.env.clone(),
+            registry: ProviderRegistry::new().with(self.cc.clone()),
+            vault: self.keychain_vault(),
+            oracle: self.oracle.clone(),
+            clock: self.clock.clone(),
+            http,
+            default_provider: ProviderId::new(CLAUDE_CODE),
+            settings: tagteam_engine::settings::Settings::default(),
+        })
+    }
+}
+
+/// The usage body recorded from the live endpoint (Appendix A.5).
+pub fn usage_fixture() -> Value {
+    let recorded: Value = serde_json::from_str(include_str!(
+        "../../../tagteam-cc/tests/fixtures/endpoints/usage-200.json"
+    ))
+    .unwrap();
+    recorded["body"].clone()
+}
+
+/// The access tokens Claude Code's usage requests carried, in the order they were sent.
+pub fn usage_bearers(fx: &Fx) -> Vec<String> {
+    let usage = Fx::endpoints().usage;
+    fx.http
+        .requests()
+        .iter()
+        .filter(|r| r.method == Method::Get && r.url == usage)
+        .filter_map(|r| {
+            r.headers
+                .iter()
+                .find(|(name, _)| name == "authorization")
+                .and_then(|(_, value)| value.strip_prefix("Bearer "))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+/// When each slot the hourly budget counts was reserved, in epoch seconds, oldest first (§8.6).
+pub fn slot_times(fx: &Fx) -> Vec<i64> {
+    let conn = rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db")).unwrap();
+    let mut rows = conn
+        .prepare("SELECT at FROM usage_requests ORDER BY at")
+        .unwrap();
+    rows.query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// How many slots the hourly budget counts: every request sent, and any reserved but unsent.
+pub fn usage_requests(fx: &Fx) -> usize {
+    slot_times(fx).len()
+}
+
+/// The access-token fingerprint `rejected_fp` holds for `secret` (§8.1).
+pub fn access_fp(fx: &Fx, secret: &[u8]) -> String {
+    fx.cc
+        .access_fingerprint(secret)
+        .unwrap()
+        .as_str()
+        .to_owned()
+}
+
+/// A usage collection that recorded `kind` as its failure.
+pub fn failed(kind: &str) -> tagteam_engine::collect::Collected {
+    tagteam_engine::collect::Collected::Failed { kind: kind.into() }
+}
+
+/// The usage endpoint refusing the token.
+pub fn refused() -> Value {
+    json!({"type": "error", "error": {"type": "authentication_error", "message": "Invalid bearer token"}})
+}
+
+/// The method of every request the fixture's scripted port has seen, in order.
+pub fn methods(fx: &Fx) -> Vec<Method> {
+    fx.http.requests().iter().map(|r| r.method).collect()
+}
