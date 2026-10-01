@@ -34,7 +34,7 @@
 
 **Tech Stack:** Rust (edition 2024), rusqlite (bundled), serde_json (`preserve_order`, `arbitrary_precision`), libc, `unicode-normalization` (already in `tagteam-cc`), clap 4, thiserror, tracing. Tests use tempfile, assert_cmd, `FakeKeychain`, `FakeClock`, `ScriptedHttp`, the new `FakeProcessProbe`, and `MockServer`.
 
-**Spec:** `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md`, signed off at `f686839` (M4 amendments `1e79bb9`, storage-write marking `59d5104`, rollback restore `f686839`). Decision 16 amends §12.6; Michael signed it off on 2026-10-01, and Task 17 writes it into the spec. Read these before starting any task:
+**Spec:** `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md`, signed off at `089b873` (M4 amendments `1e79bb9`, storage-write marking `59d5104`, rollback restore `f686839`, M5's amendments `089b873`, whose §10.3 delete order Task 9's `remove_locked` follows). Decision 16 amends §12.6; Michael signed it off on 2026-10-01, and Task 17 writes it into the spec. Read these before starting any task:
 - §2, §3, §4.2, §4.3, §4.5, §5, §6.1, §6.2;
 - §7.2, §7.3, §7.5, §8.1;
 - §9.2, §9.4, §9.6, §10.1, §10.3;
@@ -9719,10 +9719,12 @@ is live by §12.6's pid and start-time rules. This task computes that state on e
   profile, which §12.5 says is "never touched". The guard runs under the mutation lock and the
   occupant's account lock, before any write. That is the only time a reservation cannot appear
   (§12.5).
-- **The profile goes first in `remove_locked`.** Its Keychain item is the step most likely to
-  fail (a locked Keychain), so it is attempted before the vault and the row change. A failure
-  then leaves the account intact and the remove can be retried. Every later step tolerates an
-  already-deleted profile.
+- **`remove_locked` deletes in §10.3's order** (the M5 amendment, `089b873`): the vault
+  entries, then the account's rescue files, then the session profile, and last the row. The
+  vault goes first, so no generation older than a rescue or a rotated profile can outlive it.
+  An account without a vault credential is never switched to, refreshed or launched. The row
+  goes last, so a `remove` that stops part-way leaves the account listed, and running it again
+  finishes, since every delete treats an absent item as done.
 - **The warning of Decision 12** is a `WARN` log line. `remove` has no warnings channel today
   (it returns `Result<AccountRow, EngineError>`, and the CLI shows `tracing` only at ERROR by
   default), so the line reaches the log alone. That is Decision 18's ruling: it stays a WARN
@@ -10435,7 +10437,7 @@ fn move_is_not_destructive() {
 
 #[test]
 fn remove_deletes_the_profile_its_item_first_and_its_links_as_links() {
-    // §10.3.
+    // §10.3: within the profile, its hashed item goes before its directory.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
@@ -10539,7 +10541,10 @@ fn remove_never_trusts_a_marker_that_names_another_account() {
 }
 
 #[test]
-fn a_profile_item_that_cannot_be_deleted_fails_remove_before_anything_goes() {
+fn a_remove_that_stops_at_the_profile_has_already_deleted_the_vault_and_keeps_the_row() {
+    // §10.3's order: the vault (and any rescue) goes before the profile, so a stop at the
+    // profile leaves no older generation behind a newer profile one; the row goes last, so the
+    // account stays listed and running `remove` again finishes.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
@@ -10548,12 +10553,17 @@ fn a_profile_item_that_cannot_be_deleted_fails_remove_before_anything_goes() {
     fx.kc.put(&svc, &acct, &credential("a@x.co", "rt-a2"));
     fx.kc.set_fail_delete(&svc, true);
     assert!(fx.engine.remove(&a).is_err());
+    assert!(fx.vault_bytes(&a).is_none(), "the vault went first");
     assert!(dir.join(MARKER_FILE).exists(), "the directory goes only after the item");
-    assert!(fx.vault_bytes(&a).is_some(), "the vault is untouched");
-    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
+    assert!(
+        fx.engine.store().unwrap().account(&a).unwrap().is_some(),
+        "the row goes last"
+    );
     fx.kc.set_fail_delete(&svc, false);
     fx.engine.remove(&a).unwrap();
     assert_eq!(fx.kc.get(&svc, &acct), None);
+    assert!(fs::symlink_metadata(&dir).is_err());
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
 }
 
 #[test]
@@ -10582,8 +10592,8 @@ Expected: the new tests fail, each at its first assertion on the remove or add:
   there.
 - `remove_with_an_unreadable_marker_deletes_the_current_item_and_warns`: the item is still
   there.
-- `a_profile_item_that_cannot_be_deleted_fails_remove_before_anything_goes`: the remove
-  succeeds.
+- `a_remove_that_stops_at_the_profile_has_already_deleted_the_vault_and_keeps_the_row`: the
+  first remove succeeds, since nothing deletes the profile yet.
 - `on_linux_remove_deletes_the_profile_directory_and_touches_no_keychain`: the directory still
   exists.
 
@@ -10711,25 +10721,28 @@ use tagteam_provider::profile::{ProfileMarker, canonical_profile_path, profile_p
 Replace `remove_locked` (lines 185–204) with:
 
 ```rust
-    /// Deletes the session profile (§10.3; `remove_profile`), then the vault entries (strict),
-    /// then the account's rescue files (§6.3: each holds a live refresh token, readable or not,
-    /// and none is left behind), then the row (which cascades). The profile goes first because
-    /// its Keychain item is the step most likely to fail; anything that fails stops before the
-    /// row goes, so the remove can be retried. The caller holds the mutation lock and this
-    /// account's lock, and has refused a session-owned account. The live login is never touched.
+    /// §10.3's order: the vault entries (strict), then the account's rescue files (§6.3: each
+    /// holds a live refresh token, readable or not, and none is left behind), then the session
+    /// profile (`remove_profile`), and last the row (which cascades). The vault goes first, so
+    /// no generation older than a rescue or a rotated profile can outlive it: an account
+    /// without a vault credential is never switched to, refreshed or launched. Anything that
+    /// fails stops before the row goes, so the account stays listed and the remove can be run
+    /// again; every delete treats an absent item as done. The caller holds the mutation lock and
+    /// this account's lock, and has refused a session-owned account. The live login is never
+    /// touched.
     pub(crate) fn remove_locked(
         &self,
         row: &AccountRow,
         lock: &AccountLock,
     ) -> Result<(), EngineError> {
         let p = self.provider(&row.provider)?;
-        self.remove_profile(p.as_ref(), row)?;
         self.vault.delete(lock)?;
         for rescue in self.rescues_for(&row.id) {
             let (RescueFile::Entry(RescueEntry { path, .. }) | RescueFile::Unreadable { path, .. }) =
                 rescue;
             self.delete_rescue(&path)?;
         }
+        self.remove_profile(p.as_ref(), row)?;
         self.store()?.delete_account(&row.id)?;
         self.event(&row.provider, "remove", Some(&row.id), None)?;
         Ok(())
