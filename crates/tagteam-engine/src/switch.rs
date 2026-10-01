@@ -1,6 +1,7 @@
 use tagteam_core::poll::replan_for_role;
 use tagteam_core::rank::{
-    BestOrder, Candidate, NextAvailable, best_order, binding_window, next_available, span,
+    BestOrder, Candidate, NextAvailable, best_order, binding_window, blocked_until, next_available,
+    span,
 };
 use tagteam_core::usage::headroom;
 use tagteam_core::{
@@ -902,15 +903,15 @@ impl Engine {
     }
 
     /// `candidates-exhausted`'s message: each candidate with its binding window, then how long
-    /// until the earliest of those windows resets (§9.3; §11.2 step 8: the binding window
-    /// first, then its reset). No reset is named when none of them has one.
+    /// until the first of them is usable again (§9.3; §11.2 step 8: the binding window first,
+    /// then its reset). A candidate is back once every relevant window at its limit has reset,
+    /// so its time is the latest of those resets, and the message names the earliest candidate.
+    /// No reset is named when none of them has one.
     fn exhausted_message(&self, rated: &[&Rated], models: &[String]) -> String {
         let named: Vec<String> = rated.iter().map(|r| r.described(models)).collect();
         let reset = rated
             .iter()
-            .filter_map(|r| {
-                binding_window(r.windows.as_deref().unwrap_or_default(), models)?.resets_at
-            })
+            .filter_map(|r| blocked_until(r.windows.as_deref().unwrap_or_default(), models))
             .min();
         let now_s = self.now_ms().div_euclid(1000);
         let when = reset.map_or_else(String::new, |at| {
