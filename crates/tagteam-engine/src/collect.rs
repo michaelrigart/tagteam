@@ -13,7 +13,7 @@ use tagteam_core::poll::plan_after_fetch;
 use tagteam_core::usage::{earliest_relevant_reset, max_relevant_pct};
 use tagteam_core::{AccountId, PollBudget, PollInputs, PollPlan, ProviderId, Window};
 use tagteam_provider::provider::UsageResult;
-use tagteam_provider::{Credential, Provenance, Provider, Read, TransientKind};
+use tagteam_provider::{Credential, LockError, Provenance, Provider, Read, TransientKind};
 
 use crate::active::{ActiveOutcome, ActiveTrigger};
 use crate::engine::Engine;
@@ -436,20 +436,27 @@ impl Collection<'_> {
     ///
     /// A live login that moved stops the fetch (`Moved`): its token is not this account's. So
     /// does a lock that cannot be had within its timeout (a switch or another mutation holding
-    /// it). So does a switch journal row still present once the guard is held: the guard returns
-    /// even when its recovery of a dead switch failed, and that switch may have written another
-    /// account's credential before its identity, which both identity checks would pass.
+    /// it); any other lock error (the lock file cannot be opened) is the collection's error,
+    /// never a silent drop. So does a switch journal row still present once the guard is held
+    /// (with a warning, since nothing else on `list` says so): the guard returns even when its
+    /// recovery of a dead switch failed, and that switch may have written another account's
+    /// credential before its identity, which both identity checks would pass.
     /// Residual: a login changed by Claude Code itself, outside tagteam's lock, between the
     /// credential read and the second identity read (its credential written, its `oauthAccount`
     /// not yet) passes both checks and can misattribute that one reading.
-    fn live_bytes(&self) -> Result<Vec<u8>, Stop> {
+    fn live_bytes(&mut self) -> Result<Vec<u8>, Stop> {
         let guard = match self.engine.mutation_guard() {
             Ok(guard) => guard,
-            Err(EngineError::Lock(_)) => return Err(Stop::Moved),
+            Err(EngineError::Lock(LockError::Timeout(_))) => return Err(Stop::Moved),
             Err(e) => return Err(e.into()),
         };
         if self.store.journal(&self.row.provider)?.is_some() {
             drop(guard);
+            self.warnings.push(format!(
+                "usage for the live {} account was not collected: {}",
+                self.row.provider,
+                EngineError::InterruptedSwitch(self.row.provider.to_string())
+            ));
             return Err(Stop::Moved);
         }
         self.live_names_this_account()?;
