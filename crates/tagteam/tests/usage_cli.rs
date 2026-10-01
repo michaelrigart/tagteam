@@ -10,7 +10,7 @@ use common::{cmd, login, now_epoch_s, seed_home};
 use serde_json::{Value, json};
 use tagteam_cc::usage::format_iso8601;
 use tagteam_core::{CLAUDE_CODE, PollBudget, ProviderId};
-use tagteam_engine::store::{Reserve, SendGrant, Store};
+use tagteam_engine::store::{Eligibility, Reserve, SendGrant, Store};
 use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Env, FileKeychain};
 
@@ -231,7 +231,12 @@ fn an_unread_account_over_its_hourly_budget_reads_as_over_budget_not_no_data() {
         .unwrap();
     let row = store.accounts(&ProviderId::new(CLAUDE_CODE)).unwrap()[0].clone();
     let Reserve::Reserved(r) = store
-        .reserve_usage(&row, spent_at * 1000, false, &PollBudget::STANDARD)
+        .reserve_usage(
+            &row,
+            spent_at * 1000,
+            Eligibility::Scheduled,
+            &PollBudget::STANDARD,
+        )
         .unwrap()
     else {
         panic!("the first slot is free");

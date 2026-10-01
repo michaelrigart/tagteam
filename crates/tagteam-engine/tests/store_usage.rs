@@ -14,8 +14,8 @@ use serde_json::json;
 use tagteam_core::backoff::failure_backoff_s;
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Sample, Window, WindowKind};
 use tagteam_engine::store::{
-    Ineligible, LiveIdentityCacheRow, Reservation, Reserve, SendGrant, Slot, Store, StoreError,
-    UsageStateRow,
+    Eligibility, Ineligible, LiveIdentityCacheRow, Reservation, Reserve, SendGrant, Slot, Store,
+    StoreError, UsageStateRow,
 };
 
 /// Now, in epoch seconds; `T_MS` is the same instant in milliseconds.
@@ -55,8 +55,17 @@ fn arrange(
 }
 
 fn reserve(s: &Store, id: &AccountId, now_ms: i64, on_demand: bool) -> Reserve {
+    let eligibility = if on_demand {
+        Eligibility::OnDemand
+    } else {
+        Eligibility::Scheduled
+    };
+    reserve_as(s, id, now_ms, eligibility)
+}
+
+fn reserve_as(s: &Store, id: &AccountId, now_ms: i64, eligibility: Eligibility) -> Reserve {
     let row = s.account(id).unwrap().unwrap();
-    s.reserve_usage(&row, now_ms, on_demand, &B).unwrap()
+    s.reserve_usage(&row, now_ms, eligibility, &B).unwrap()
 }
 
 fn reserved(s: &Store, id: &AccountId, now_ms: i64) -> Reservation {
@@ -283,6 +292,82 @@ fn scheduled_collection_takes_a_due_plan_or_a_missing_reading() {
             None => assert!(matches!(got, Reserve::Reserved(_)), "case {i}: {got:?}"),
         }
     }
+}
+
+#[test]
+fn a_recheck_needs_only_a_reading_older_than_the_floor() {
+    // §8.3: consume-first's re-check (§11.2 step 8) ignores the plan. 180 s is not older than
+    // 180 s, and a reading stamped more than 60 s ahead counts as none (§8.4).
+    let (_d, path, s) = open();
+    let cases = [
+        // (fetched_at, next_poll_at, eligible)
+        (Some(T - 180), Some(T + 500), false),
+        (Some(T - 181), Some(T + 500), true),
+        (None, Some(T + 500), true),
+        (Some(T + 60), None, false),
+        (Some(T + 61), Some(T + 500), true),
+    ];
+    for (i, (fetched_at, next_poll_at, eligible)) in cases.into_iter().enumerate() {
+        let n = i as u32 + 1;
+        let id = add(&s, &cc(), &format!("a{n}"), &format!("a{n}@x.co"), n);
+        arrange(&path, &id, fetched_at, None, next_poll_at);
+        let got = reserve_as(&s, &id, T_MS, Eligibility::Recheck);
+        if eligible {
+            assert!(matches!(got, Reserve::Reserved(_)), "case {i}: {got:?}");
+        } else {
+            assert_eq!(got, Reserve::Ineligible(Ineligible::NotDue), "case {i}");
+        }
+    }
+}
+
+#[test]
+fn a_recheck_still_honours_quarantine_backoff_the_lease_and_the_budget() {
+    // §8.3: "Quarantine, backoff, the lease and the budget still apply." Each account's
+    // reading is old and it has no plan, so only the named rule can refuse it.
+    let (_d, path, s) = open();
+    let old = Some(T - 1_000);
+    let q = add(&s, &cc(), "q", "q@x.co", 1);
+    arrange(&path, &q, old, None, None);
+    s.set_quarantine(&q, "invalid_grant", "sha256:sent", 1)
+        .unwrap();
+    assert_eq!(
+        reserve_as(&s, &q, T_MS, Eligibility::Recheck),
+        Reserve::Ineligible(Ineligible::Quarantined)
+    );
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    arrange(&path, &b, old, Some(T + 1), None);
+    assert_eq!(
+        reserve_as(&s, &b, T_MS, Eligibility::Recheck),
+        Reserve::Ineligible(Ineligible::Backoff)
+    );
+    let l = add(&s, &cc(), "l", "l@x.co", 3);
+    arrange(&path, &l, old, None, None);
+    raw(&path)
+        .execute(
+            "INSERT INTO leases (name, holder, expires_at) VALUES ('usage:l', 'other', ?1)",
+            [T_MS + 1],
+        )
+        .unwrap();
+    assert_eq!(
+        reserve_as(&s, &l, T_MS, Eligibility::Recheck),
+        Reserve::Ineligible(Ineligible::Leased)
+    );
+    let o = add(&s, &cc(), "o", "o@x.co", 4);
+    arrange(&path, &o, old, None, None);
+    for _ in 0..20 {
+        raw(&path)
+            .execute(
+                "INSERT INTO usage_requests (provider, identity_key, at) VALUES (?1, ?2, ?3)",
+                params![cc().as_str(), "o@x.co\n", T - 100],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        reserve_as(&s, &o, T_MS, Eligibility::Recheck),
+        Reserve::OverBudget {
+            next_free_at: T - 100 + B.count_window_s
+        }
+    );
 }
 
 #[test]
@@ -977,7 +1062,10 @@ fn two_stores_racing_for_one_account_reserve_it_once() {
             let (row, barrier, won, leased) = (&row, &barrier, &won, &leased);
             scope.spawn(move || {
                 barrier.wait();
-                match s.reserve_usage(row, T_MS, true, &B).unwrap() {
+                match s
+                    .reserve_usage(row, T_MS, Eligibility::OnDemand, &B)
+                    .unwrap()
+                {
                     Reserve::Reserved(_) => won.fetch_add(1, SeqCst),
                     Reserve::Ineligible(Ineligible::Leased) => leased.fetch_add(1, SeqCst),
                     other => panic!("unexpected {other:?}"),

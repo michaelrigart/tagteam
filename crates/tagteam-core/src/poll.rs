@@ -253,6 +253,38 @@ pub fn budget_next_free(b: &PollBudget, counted_at: &[i64], now_s: i64) -> Optio
     Some(counted[counted.len() - limit].saturating_add(b.count_window_s))
 }
 
+/// One candidate as §8.6's scheduled collection sees it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DueCandidate {
+    pub position: u32,
+    /// A scheduled collection may reserve it now (§8.3): not in backoff, and a poll due or no
+    /// reading yet.
+    pub due: bool,
+    /// Its reading's `fetched_at`; `None` when it has never been read, or when the stamp has no
+    /// usable age (§8.4).
+    pub fetched_at: Option<i64>,
+}
+
+/// §8.6 phase 2: the single stalest due candidate (never fetched first, then the oldest
+/// `fetched_at`, ties to the lower position), or every due candidate, stalest first, when
+/// `escalate`. Positions; empty when none is due.
+pub fn scheduled_pick(cands: &[DueCandidate], escalate: bool) -> Vec<u32> {
+    let mut due: Vec<&DueCandidate> = cands.iter().filter(|c| c.due).collect();
+    // `None` sorts before any `Some`: never fetched first.
+    due.sort_by_key(|c| (c.fetched_at, c.position));
+    let take = if escalate { due.len() } else { 1 };
+    due.into_iter().take(take).map(|c| c.position).collect()
+}
+
+/// §8.6: whether a tick escalates to every due candidate: the active account's max relevant
+/// pct is within `margin` points of `threshold` (≥ threshold − margin), or its headroom is still
+/// unknown. A non-finite pct is unknown.
+pub fn escalates(active_max_pct: Option<f64>, threshold: f64, margin: f64) -> bool {
+    active_max_pct
+        .filter(|p| p.is_finite())
+        .is_none_or(|p| p >= threshold - margin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,5 +962,86 @@ mod tests {
         let mut counted = ascending(19, NOW - 5);
         counted.push(NOW + 100);
         assert_eq!(budget_next_free(&B, &counted, NOW), Some(counted[0] + 3660));
+    }
+
+    fn cand(position: u32, due: bool, fetched_at: Option<i64>) -> DueCandidate {
+        DueCandidate {
+            position,
+            due,
+            fetched_at,
+        }
+    }
+
+    #[test]
+    fn the_scheduled_pick_takes_a_candidate_never_fetched_first() {
+        let cands = [
+            cand(1, true, Some(NOW - 5_000)),
+            cand(2, true, None),
+            cand(3, true, Some(NOW - 9_000)),
+        ];
+        assert_eq!(scheduled_pick(&cands, false), [2]);
+    }
+
+    #[test]
+    fn the_scheduled_pick_takes_the_oldest_reading_and_a_tie_goes_to_the_lower_position() {
+        let cands = [
+            cand(3, true, Some(NOW - 900)),
+            cand(1, true, Some(NOW - 600)),
+            cand(2, true, Some(NOW - 900)),
+        ];
+        assert_eq!(scheduled_pick(&cands, false), [2]);
+        let never = [cand(4, true, None), cand(2, true, None)];
+        assert_eq!(scheduled_pick(&never, false), [2], "never fetched ties too");
+    }
+
+    #[test]
+    fn a_candidate_that_is_not_due_is_never_picked() {
+        let cands = [
+            cand(1, false, None),
+            cand(2, false, Some(NOW - 9_000)),
+            cand(3, true, Some(NOW - 10)),
+        ];
+        assert_eq!(scheduled_pick(&cands, false), [3]);
+        for escalate in [false, true] {
+            assert!(scheduled_pick(&cands[..2], escalate).is_empty());
+            assert!(scheduled_pick(&[], escalate).is_empty());
+        }
+    }
+
+    #[test]
+    fn escalation_takes_every_due_candidate_stalest_first() {
+        let cands = [
+            cand(1, true, Some(NOW - 600)),
+            cand(2, false, None),
+            cand(3, true, None),
+            cand(4, true, Some(NOW - 900)),
+        ];
+        assert_eq!(scheduled_pick(&cands, true), [3, 4, 1]);
+    }
+
+    #[test]
+    fn escalation_starts_at_exactly_the_margin_below_the_threshold() {
+        // §8.6: within 15 points of the threshold, that is ≥ threshold − 15.
+        let m = B.escalation_margin;
+        assert_eq!(m, 15.0);
+        assert!(escalates(Some(75.0), 90.0, m));
+        assert!(!escalates(Some(74.99), 90.0, m));
+        assert!(escalates(Some(77.0), 92.0, m));
+        assert!(!escalates(Some(77.0), 92.5, m));
+        assert!(escalates(Some(120.0), 90.0, m), "past the limit");
+        assert!(!escalates(Some(0.0), 50.0, m));
+    }
+
+    #[test]
+    fn an_unknown_active_headroom_escalates() {
+        // §8.6: "or its headroom is still unknown". A non-finite pct is unknown (§8.2).
+        for pct in [
+            None,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+        ] {
+            assert!(escalates(pct, 90.0, 15.0), "{pct:?}");
+        }
     }
 }

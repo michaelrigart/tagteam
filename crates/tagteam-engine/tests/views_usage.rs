@@ -15,7 +15,7 @@ use tagteam_core::{
 };
 use tagteam_engine::Engine;
 use tagteam_engine::settings::Settings;
-use tagteam_engine::store::{LiveIdentityCacheRow, Reservation, Reserve};
+use tagteam_engine::store::{Eligibility, LiveIdentityCacheRow, Reservation, Reserve};
 use tagteam_engine::views::{
     HistoryView, HistoryWindow, NO_DATA, StatusView, StatuslineView, UsageStatus, UsageView,
 };
@@ -69,7 +69,12 @@ fn reserve(fx: &Fx, id: &AccountId, at: i64) -> Reservation {
     let store = fx.engine.store().unwrap();
     let row = store.account(id).unwrap().unwrap();
     match store
-        .reserve_usage(&row, at * 1000, false, &PollBudget::STANDARD)
+        .reserve_usage(
+            &row,
+            at * 1000,
+            Eligibility::Scheduled,
+            &PollBudget::STANDARD,
+        )
         .unwrap()
     {
         Reserve::Reserved(r) => r,

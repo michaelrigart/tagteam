@@ -14,7 +14,7 @@ use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, PollBudget, PollPlan, Window, WindowKind};
 use tagteam_engine::EngineError;
 use tagteam_engine::settings::Settings;
-use tagteam_engine::store::Reserve;
+use tagteam_engine::store::{Eligibility, Reserve};
 use tagteam_engine::switch::{
     SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy,
 };
@@ -186,7 +186,12 @@ fn record_at(fx: &Fx, id: &AccountId, windows: &[Window], at: i64, next_poll_at:
     let store = fx.engine.store().unwrap();
     let row = store.account(id).unwrap().unwrap();
     let r = match store
-        .reserve_usage(&row, at * 1000, false, &PollBudget::STANDARD)
+        .reserve_usage(
+            &row,
+            at * 1000,
+            Eligibility::Scheduled,
+            &PollBudget::STANDARD,
+        )
         .unwrap()
     {
         Reserve::Reserved(r) => r,

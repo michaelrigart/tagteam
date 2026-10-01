@@ -1,6 +1,7 @@
 //! §8.1 and §8.3: the collector's reserve, token, fetch and record phases for inactive
 //! accounts (and the live token, read but never refreshed by a fetch), the hourly budget across
-//! processes (§8.6, Review Focus 1 and 2), and provider neutrality (§15.2).
+//! processes (§8.6, Review Focus 1 and 2), provider neutrality (§15.2), and an auto tick's
+//! scheduled collection and consume-first's re-check (§8.3, §8.6).
 mod common;
 
 use std::collections::BTreeSet;
@@ -18,7 +19,7 @@ use serde_json::{Value, json};
 use tagteam_cc::ItemKind;
 use tagteam_cc::usage::normalize;
 use tagteam_core::backoff::failure_backoff_s;
-use tagteam_core::{AccountId, WindowKind};
+use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, WindowKind};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::collect::{CollectMode, CollectReport, Collected};
 use tagteam_engine::store::{Ineligible, UsageStateRow};
@@ -79,6 +80,44 @@ fn spend_budget(fx: &Fx, id: &AccountId, n: usize, ago: i64) {
         )
         .unwrap();
     }
+}
+
+/// An auto tick's scheduled collection (§8.6) of the fixture's provider through `engine`, at
+/// `threshold` with `models` relevant.
+fn scheduled_on(engine: &Engine, threshold: f64, models: &[&str]) -> CollectReport {
+    engine
+        .collect_usage(CollectMode::Scheduled {
+            provider: ProviderId::new(CLAUDE_CODE),
+            threshold,
+            models: models.iter().map(|m| (*m).to_owned()).collect(),
+        })
+        .unwrap()
+}
+
+/// `scheduled_on` the fixture's engine, with no model's window relevant.
+fn scheduled(fx: &Fx, threshold: f64) -> CollectReport {
+    scheduled_on(&fx.engine, threshold, &[])
+}
+
+/// `a`, `b` and `c` at positions 1 to 3; `c` is the live login.
+fn three_accounts(fx: &Fx) -> [AccountId; 3] {
+    [
+        fx.add("a@x.co", "rt-a"),
+        fx.add("b@x.co", "rt-b"),
+        fx.add("c@x.co", "rt-c"),
+    ]
+}
+
+/// Backs `id` off until `until`, directly, as a recorded failure would.
+fn back_off(fx: &Fx, id: &AccountId, until: i64) {
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO usage_state (account_id, backoff_until) VALUES (?1, ?2) \
+             ON CONFLICT(account_id) DO UPDATE SET backoff_until = excluded.backoff_until",
+            rusqlite::params![id.as_str(), until],
+        )
+        .unwrap();
 }
 
 #[test]
@@ -866,6 +905,402 @@ fn fake_agent_usage_is_collected_through_the_same_engine_and_claude_code_is_unto
     );
 }
 
+#[test]
+fn a_scheduled_tick_reads_the_due_live_account_then_the_stalest_due_candidate() {
+    // §8.6: phase 1 the live account if it is due; phase 2, from the store as phase 1 left it,
+    // the single stalest due candidate. The live account's 77 % is below 99.9 − 15, so once
+    // phase 1 has read it the tick does not escalate.
+    let fx = Fx::new();
+    let [a, b, c] = three_accounts(&fx);
+    fx.script_usage(200, usage_fixture());
+
+    let report = scheduled(&fx, 99.9);
+
+    assert_eq!(
+        report.outcomes,
+        [
+            (c.clone(), Collected::Recorded),
+            (a.clone(), Collected::Recorded)
+        ]
+    );
+    assert_eq!(
+        usage_bearers(&fx),
+        ["at-rt-c", "at-rt-a"],
+        "phase 1, then phase 2"
+    );
+    assert_eq!(fx.usage_state(&b), None, "one candidate a tick");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(report.quarantined.is_empty());
+
+    // 100 s on, the lease of the live account's fetch (90 s) has expired but its plan (243 s
+    // at the soonest) is not due, and its reading still decides; b, never read, is the
+    // stalest.
+    fx.clock.advance_ms(100_000);
+    let report = scheduled(&fx, 99.9);
+    assert_eq!(
+        report.outcomes,
+        [
+            (c.clone(), Collected::Ineligible(Ineligible::NotDue)),
+            (b.clone(), Collected::Recorded)
+        ]
+    );
+
+    // 1000 s in, every plan has come due, and a's reading is older than b's.
+    fx.clock.advance_ms(900_000);
+    let report = scheduled(&fx, 99.9);
+    assert_eq!(
+        report.outcomes,
+        [(c, Collected::Recorded), (a, Collected::Recorded)]
+    );
+}
+
+#[test]
+fn a_candidate_in_backoff_is_not_due_so_it_cannot_starve_the_others() {
+    // §8.3: a scheduled reservation refuses an account in backoff. Were it due for the pick, a
+    // never-read account in backoff would be the stalest at every tick until its backoff
+    // lifted, and no other candidate would be read meanwhile.
+    let fx = Fx::new();
+    let [a, b, c] = three_accounts(&fx);
+    back_off(&fx, &a, NOW_S + 600);
+    fx.script_usage(200, usage_fixture());
+
+    let report = scheduled(&fx, 99.9);
+
+    assert_eq!(
+        report.outcomes,
+        [(c, Collected::Recorded), (b, Collected::Recorded)]
+    );
+}
+
+#[test]
+fn only_switchable_accounts_with_usage_are_candidates() {
+    // §8.6: the candidates are the provider's switchable accounts other than the live one
+    // (§9.3), never a quarantined or disabled one; a managed API key has no usage (§13.2). The
+    // tick escalates (77 % ≥ 50 − 15), so it reads every candidate that is due.
+    let fx = Fx::new();
+    let q = fx.add("q@x.co", "rt-q");
+    let d = fx.add("d@x.co", "rt-d");
+    let ok = fx.add("ok@x.co", "rt-ok");
+    let c = fx.add("c@x.co", "rt-c"); // live
+    fx.add_api_key(API_KEY);
+    fx.quarantine(&q, "invalid_grant", "sha256:sent");
+    fx.engine.set_disabled(&d, true).unwrap();
+    fx.script_usage(200, usage_fixture());
+
+    let report = scheduled(&fx, 50.0);
+
+    assert_eq!(
+        report.outcomes,
+        [(c, Collected::Recorded), (ok, Collected::Recorded)]
+    );
+    assert_eq!(usage_bearers(&fx), ["at-rt-c", "at-rt-ok"]);
+}
+
+#[test]
+fn a_tick_escalates_to_every_due_candidate_from_exactly_fifteen_points_below_its_threshold() {
+    // §8.6: the live account's 77 % is exactly 92 − 15, and below 92.5 − 15. The tick's own
+    // threshold decides, not the settings' 90.
+    for (threshold, escalated) in [(92.0, true), (92.5, false)] {
+        let fx = Fx::new();
+        let [a, b, c] = three_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+
+        let report = scheduled(&fx, threshold);
+
+        let mut expected = vec![(c, Collected::Recorded), (a, Collected::Recorded)];
+        if escalated {
+            expected.push((b, Collected::Recorded));
+        }
+        assert_eq!(report.outcomes, expected, "{threshold}");
+    }
+}
+
+#[test]
+fn an_unknown_live_headroom_escalates() {
+    // §8.6: the live account's fetch failed, so after phase 1 its headroom is still unknown.
+    let fx = Fx::new();
+    let [a, b, c] = three_accounts(&fx);
+    fx.script_usage(500, json!({}));
+    fx.script_usage(200, usage_fixture());
+
+    let report = scheduled(&fx, 99.9);
+
+    assert_eq!(
+        report.outcomes,
+        [
+            (c, failed("http-500")),
+            (a, Collected::Recorded),
+            (b, Collected::Recorded)
+        ]
+    );
+}
+
+#[test]
+fn the_ticks_own_models_decide_the_live_headroom() {
+    // §8.2: a scoped window counts only when the models name it. Fable's limit at 95 %
+    // escalates a tick at 99.9 only when the tick's models make it relevant.
+    let mut body = usage_fixture();
+    body["limits"][2]["percent"] = json!(95);
+    let none: &[&str] = &[];
+    for (models, escalated) in [(none, false), (&["Fable"][..], true)] {
+        let fx = Fx::new();
+        let [a, b, c] = three_accounts(&fx);
+        fx.script_usage(200, body.clone());
+
+        let report = scheduled_on(&fx.engine, 99.9, models);
+
+        let mut expected = vec![(c, Collected::Recorded), (a, Collected::Recorded)];
+        if escalated {
+            expected.push((b, Collected::Recorded));
+        }
+        assert_eq!(report.outcomes, expected, "{models:?}");
+    }
+}
+
+#[test]
+fn escalated_candidates_are_read_in_parallel() {
+    // §8.3 "Who collects": a tick's fetches run in parallel like `list`'s. The live account was
+    // read 100 s ago and is not due, so phase 1 sends nothing, and phase 2's two requests meet.
+    let fx = Fx::new();
+    let [a, b, c] = three_accounts(&fx);
+    fx.script_usage(200, usage_fixture());
+    fx.collect(&[&c]);
+    fx.clock.advance_ms(100_000);
+    let probe = Arc::new(Rendezvous {
+        inner: fx.http.clone(),
+        want: 2,
+        counts: Mutex::new((0, 0)),
+        arrived: Condvar::new(),
+    });
+    let engine = fx.engine_with_http(probe.clone());
+
+    let report = scheduled_on(&engine, 92.0, &[]);
+
+    assert_eq!(
+        report.outcomes,
+        [
+            (c, Collected::Ineligible(Ineligible::NotDue)),
+            (a, Collected::Recorded),
+            (b, Collected::Recorded)
+        ]
+    );
+    assert_eq!(
+        probe.counts.lock().unwrap().1,
+        2,
+        "both requests were in flight at once"
+    );
+}
+
+#[test]
+fn without_a_managed_live_login_every_due_candidate_is_read() {
+    // No live account for phase 1, so no headroom: phase 2 escalates (§8.6). An auto tick never
+    // collects here (§11.2 step 2 stops it first); this pins what the mode does on its own.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.login("x@x.co", "rt-x"); // a login tagteam does not manage
+    fx.script_usage(200, usage_fixture());
+
+    let report = scheduled(&fx, 99.9);
+
+    assert_eq!(
+        report.outcomes,
+        [(a, Collected::Recorded), (b, Collected::Recorded)]
+    );
+    let sent: BTreeSet<String> = usage_bearers(&fx).into_iter().collect();
+    assert_eq!(
+        sent,
+        BTreeSet::from(["at-rt-a".to_owned(), "at-rt-b".to_owned()])
+    );
+}
+
+#[test]
+fn an_account_quarantined_while_it_is_collected_is_reported() {
+    // §7.4: the gate's Dead verdict quarantines a during the tick, and the report names it for
+    // the tick's `account-quarantined` event (§11.4). An account already quarantined when the
+    // collection starts is not named: it was never reserved.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    fx.expire_access(&a);
+    fx.script_token_error(400, "invalid_grant");
+    fx.script_usage(200, usage_fixture());
+
+    let report = scheduled(&fx, 99.9);
+
+    assert_eq!(
+        report.outcomes,
+        [
+            (b, Collected::Recorded),
+            (a.clone(), failed("refresh-failed"))
+        ]
+    );
+    assert_eq!(report.quarantined, [a.clone()]);
+    assert_eq!(quarantine_of(&fx, &a).0.as_deref(), Some("invalid_grant"));
+
+    let report = fx.collect(&[&a]);
+    assert_eq!(
+        report.outcomes,
+        [(a, Collected::Ineligible(Ineligible::Quarantined))]
+    );
+    assert!(report.quarantined.is_empty());
+}
+
+#[test]
+fn a_scheduled_tick_sends_nothing_for_an_identity_whose_hour_is_spent() {
+    // §8.6, Review Focus 2: the budget decides whether a request may be sent, for a tick as for
+    // any caller. The live account's hour is spent, so its headroom stays unknown and the tick
+    // escalates; a's hour is spent too, and only b is read.
+    let fx = Fx::new();
+    let [a, b, c] = three_accounts(&fx);
+    spend_budget(&fx, &c, 20, 100);
+    spend_budget(&fx, &a, 20, 100);
+    fx.script_usage(200, usage_fixture());
+
+    let report = scheduled(&fx, 99.9);
+
+    let free = NOW_S - 100 + 3660;
+    assert_eq!(
+        report.outcomes,
+        [
+            (c, Collected::OverBudget { next_free_at: free }),
+            (a, Collected::OverBudget { next_free_at: free }),
+            (b, Collected::Recorded)
+        ]
+    );
+    assert_eq!(usage_bearers(&fx), ["at-rt-b"]);
+    assert_eq!(usage_requests(&fx), 41);
+}
+
+#[test]
+fn a_tick_after_a_long_suspend_sends_at_most_one_request_per_identity() {
+    // Review Focus 2: on wake every reading is stale and every plan is due. The tick reads each
+    // account once and never catches up on the polls it slept through. (50 minutes keeps the
+    // access tokens valid, so no refresh joins in.)
+    let fx = Fx::new();
+    let [a, b, c] = three_accounts(&fx);
+    fx.script_usage(200, usage_fixture());
+    scheduled(&fx, 90.0);
+    fx.http.clear();
+    fx.script_usage(200, usage_fixture());
+    fx.clock.advance_ms(3_000_000);
+
+    let report = scheduled(&fx, 90.0);
+
+    assert_eq!(
+        report.outcomes,
+        [
+            (c, Collected::Recorded),
+            (a, Collected::Recorded),
+            (b, Collected::Recorded)
+        ]
+    );
+    let mut sent = usage_bearers(&fx);
+    sent.sort();
+    assert_eq!(sent, ["at-rt-a", "at-rt-b", "at-rt-c"]);
+    assert_eq!(
+        usage_requests(&fx),
+        6,
+        "one request per identity at each of the two ticks"
+    );
+}
+
+#[test]
+fn a_recheck_reads_each_listed_account_older_than_180_s_whatever_its_plan() {
+    // §8.3: consume-first's re-check (§11.2 step 8). The plans made at the first read are at
+    // least 243 s out, so on demand still waits at 181 s; a re-check does not.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    fx.script_usage(200, usage_fixture());
+    fx.collect(&[&a, &b]);
+    let recheck = || {
+        fx.engine
+            .collect_usage(CollectMode::Recheck {
+                accounts: vec![a.clone(), b.clone()],
+                threshold: 90.0,
+                models: Vec::new(),
+            })
+            .unwrap()
+            .outcomes
+    };
+    let not_due = Collected::Ineligible(Ineligible::NotDue);
+
+    fx.clock.advance_ms(180_000);
+    assert_eq!(
+        recheck(),
+        [(a.clone(), not_due.clone()), (b.clone(), not_due.clone())],
+        "180 s is not older than 180 s"
+    );
+    fx.clock.advance_ms(1_000);
+    assert_eq!(
+        fx.collect(&[&a, &b]).outcomes,
+        [(a.clone(), not_due.clone()), (b.clone(), not_due)]
+    );
+    assert_eq!(
+        recheck(),
+        [
+            (a.clone(), Collected::Recorded),
+            (b.clone(), Collected::Recorded)
+        ]
+    );
+    assert_eq!(state(&fx, &a).fetched_at, Some(NOW_S + 181));
+    assert_eq!(usage_bearers(&fx).len(), 4);
+}
+
+#[test]
+fn a_ticks_collection_plans_for_the_ticks_threshold_not_the_settings() {
+    // §8.6's urgent 60 s plan is for a live account moving within 15 points of the threshold.
+    // A tick's threshold (flags over the file) makes that plan, scheduled or re-checked; the
+    // engine's settings say 90. Under 80, 70 % is urgent though 70 < 90 − 15; under 99.9, 77 %
+    // is not though 77 ≥ 90 − 15. Both readings move (≥ 1 point), so only the band decides:
+    // urgent is 60 s, otherwise half the previous 270 s, floored at 180.
+    for recheck in [false, true] {
+        for (threshold, before, after, interval) in
+            [(80.0, 60.0, 70.0, 60), (99.9, 66.0, 77.0, 180)]
+        {
+            let fx = Fx::new();
+            let a = fx.add("a@x.co", "rt-a"); // live, and the only account
+            let collect = |fx: &Fx| {
+                let mode = if recheck {
+                    CollectMode::Recheck {
+                        accounts: vec![a.clone()],
+                        threshold,
+                        models: Vec::new(),
+                    }
+                } else {
+                    CollectMode::Scheduled {
+                        provider: fx.provider(),
+                        threshold,
+                        models: Vec::new(),
+                    }
+                };
+                fx.engine.collect_usage(mode).unwrap().outcomes
+            };
+            let mut body = usage_fixture();
+            body["seven_day"]["utilization"] = json!(before);
+            fx.script_usage(200, body.clone());
+            assert_eq!(collect(&fx), [(a.clone(), Collected::Recorded)]);
+            assert_eq!(state(&fx, &a).poll_interval_s, Some(270), "a first reading");
+
+            fx.http.clear();
+            body["seven_day"]["utilization"] = json!(after);
+            fx.script_usage(200, body);
+            fx.clock.advance_ms(300_000);
+            assert_eq!(collect(&fx), [(a.clone(), Collected::Recorded)]);
+
+            let s = state(&fx, &a);
+            let case = format!("recheck {recheck}, threshold {threshold}");
+            assert_eq!(s.poll_interval_s, Some(interval), "{case}");
+            let ahead = s.next_poll_at.unwrap() - (NOW_S + 300);
+            assert!(
+                (interval..=interval * 11 / 10).contains(&ahead),
+                "{case}: {ahead}"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "test-hooks")]
 mod hooks {
     use super::*;
@@ -1526,5 +1961,52 @@ mod hooks {
         assert!(fx.http.requests().is_empty());
         assert_eq!(fx.usage_state(&b), None, "nothing is recorded");
         assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    }
+
+    #[test]
+    fn a_signal_at_the_gates_entry_starts_no_refresh() {
+        // §14.1: no refresh starts once the token is set. The gate takes its account lock with
+        // a try, which never looks at the token, so without the cancellation point at its entry
+        // the token request would leave.
+        let fx = Fx::new();
+        let a = due(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        fx.script_usage(200, usage_fixture());
+        signal_at(&fx, "usage-before-gate");
+
+        assert_interrupted(collect_result(&fx, &a));
+
+        assert!(
+            fx.http.requests().is_empty(),
+            "no token request and no usage request"
+        );
+        assert_eq!(
+            fx.vault_refresh_token(&a).as_deref(),
+            Some("rt-a"),
+            "the vault is untouched"
+        );
+        assert_eq!(fx.usage_state(&a), None, "nothing is recorded");
+        assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    }
+
+    #[test]
+    fn a_signal_during_phase_one_starts_no_phase_two() {
+        // §14.1: the live account's request had left, so its reading is recorded; no candidate
+        // is reserved once the token is set.
+        let fx = Fx::new();
+        let [a, b, c] = three_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+        signal_at(&fx, "usage-before-record");
+
+        assert_interrupted(fx.engine.collect_usage(CollectMode::Scheduled {
+            provider: fx.provider(),
+            threshold: 50.0,
+            models: Vec::new(),
+        }));
+
+        assert_eq!(usage_bearers(&fx), ["at-rt-c"]);
+        assert_eq!(state(&fx, &c).fetched_at, Some(NOW_S));
+        assert_eq!((fx.usage_state(&a), fx.usage_state(&b)), (None, None));
+        assert_eq!(usage_requests(&fx), 1);
     }
 }

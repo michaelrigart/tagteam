@@ -11,7 +11,7 @@ use assert_cmd::Command;
 use serde_json::{Value, json};
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, ProviderId, Window, WindowKind};
-use tagteam_engine::store::{Reserve, Store};
+use tagteam_engine::store::{Eligibility, Reserve, Store};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::splice::replace_top_level;
 use tagteam_provider::{Env, FileKeychain, Keychain};
@@ -141,7 +141,12 @@ pub fn record_reading(root: &Path, id: &str, at_s: i64, windows: &[Window]) {
         .unwrap();
     let row = store.account(&AccountId::from_string(id)).unwrap().unwrap();
     let reservation = match store
-        .reserve_usage(&row, at_s * 1000, true, &PollBudget::STANDARD)
+        .reserve_usage(
+            &row,
+            at_s * 1000,
+            Eligibility::OnDemand,
+            &PollBudget::STANDARD,
+        )
         .unwrap()
     {
         Reserve::Reserved(r) => r,
@@ -178,7 +183,12 @@ pub fn record_history(
     for i in (0..readings).rev() {
         let at_s = last_s - i as i64 * spacing_s;
         let Reserve::Reserved(reservation) = store
-            .reserve_usage(&row, at_s * 1000, false, &PollBudget::STANDARD)
+            .reserve_usage(
+                &row,
+                at_s * 1000,
+                Eligibility::Scheduled,
+                &PollBudget::STANDARD,
+            )
             .unwrap()
         else {
             panic!("no reservation for a reading at {at_s}");
