@@ -207,3 +207,61 @@ fn ctrl_c_twice_inside_a_switch_s_critical_span_lets_it_commit_and_reports_it_to
         Some(AccountId::from_string(&a))
     );
 }
+
+#[test]
+fn a_signal_ignored_at_startup_stays_ignored() {
+    // `nohup tagteam ...` and background jobs start with SIGHUP ignored, and tagteam keeps it
+    // that way: the switch waits for Claude Code's lock through the signal and then completes.
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (a, _b) = two_fresh_accounts(root);
+    let paths = CcPaths::resolve(&Env::for_test(root));
+    fs::create_dir(paths.legacy_lock()).unwrap();
+    let config_home = paths.refresh_lock.parent().unwrap().to_path_buf();
+    let untouched = fs::metadata(&config_home).unwrap().modified().unwrap();
+
+    let mut cmd = std_cmd(root);
+    cmd.args(["switch", "1", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: the closure runs between fork and exec and only calls signal(2), which is
+    // async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    wait_until(
+        &mut child,
+        Duration::from_secs(20),
+        "Claude Code's lock",
+        || fs::metadata(&config_home).unwrap().modified().unwrap() != untouched,
+    );
+    send(&child, libc::SIGHUP);
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the ignored SIGHUP neither killed nor stopped the switch"
+    );
+    fs::remove_dir(paths.legacy_lock()).unwrap();
+    let out = finish(child, Duration::from_secs(20));
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["switched"], json!(true), "{v}");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "", "no notice either");
+    assert_eq!(live_email(root), "a@x.co");
+    let provider = ProviderId::new(CLAUDE_CODE);
+    assert_eq!(
+        store(root).active(&provider).unwrap(),
+        Some(AccountId::from_string(&a))
+    );
+}
