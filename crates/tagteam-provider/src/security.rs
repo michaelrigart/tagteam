@@ -1,4 +1,5 @@
 use std::io::Write as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -48,6 +49,9 @@ impl std::fmt::Debug for RunResult {
 }
 
 pub trait Runner: Send + Sync {
+    /// Runs without the terminal: stdin piped (`stdin` given) or null, stdout and stderr
+    /// captured, killed after `timeout`. The child leads a process group of its own (§14.1),
+    /// so a Ctrl-C at the terminal never reaches it and never cuts a Keychain write short.
     fn run(
         &self,
         program: &str,
@@ -57,7 +61,8 @@ pub trait Runner: Send + Sync {
     ) -> RunResult;
     /// Runs with the terminal attached: stdin and stderr inherited, the child's stdout sent to
     /// stderr (stdout is reserved for command output, §14). No timeout, because a person is
-    /// answering. `Exited` carries no output.
+    /// answering. `Exited` carries no output. The child stays in tagteam's process group, the
+    /// terminal's foreground one, so a Ctrl-C there reaches it too (§14.1).
     fn run_attached(&self, program: &str, args: &[String]) -> RunResult;
 }
 
@@ -151,6 +156,10 @@ impl ProcessRunner {
     ) -> RunResult {
         let mut child = match Command::new(program)
             .args(args)
+            // §14.1: a group of its own, so a Ctrl-C at the terminal reaches tagteam alone and
+            // never kills a Keychain write midway. Its stdin is a pipe or null and its output is
+            // piped, so the background group never stops it for touching the terminal.
+            .process_group(0)
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -511,6 +520,7 @@ impl Keychain for SecurityCli {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::fs;
     use std::io;
     use std::os::unix::process::ExitStatusExt;
     use std::sync::{Arc, Mutex};
@@ -1033,5 +1043,71 @@ mod tests {
             "{:?}",
             started.elapsed()
         );
+    }
+
+    /// The pid of the shell `run` starts, and that pid's process group as the kernel reports it
+    /// from outside while the shell is still running: the shell writes its pid to a file, then
+    /// sleeps a second.
+    fn pid_and_group(
+        run: impl FnOnce(Vec<String>) -> RunResult + Send + 'static,
+    ) -> (libc::pid_t, libc::pid_t) {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("echo $$ > '{}'; sleep 1", pid_file.display());
+        let shell = thread::spawn(move || run(s(&["-c", &script])));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid: libc::pid_t = loop {
+            let written = fs::read_to_string(&pid_file).ok();
+            if let Some(pid) = written.and_then(|t| t.trim().parse().ok()) {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the shell never wrote its pid");
+            thread::sleep(Duration::from_millis(10));
+        };
+        // SAFETY: getpgid(2) only reads the process table, and `pid` is the shell, which is
+        // still sleeping and not yet reaped, so the pid names it and no other process.
+        let group = unsafe { libc::getpgid(pid) };
+        assert!(group > 0, "getpgid: {}", io::Error::last_os_error());
+        let ran = shell.join().unwrap();
+        assert!(matches!(ran, RunResult::Exited { code: 0, .. }), "{ran:?}");
+        (pid, group)
+    }
+
+    /// This test process's group: the one a terminal's Ctrl-C would reach.
+    fn own_group() -> libc::pid_t {
+        // SAFETY: getpgrp(2) takes no arguments and cannot fail.
+        unsafe { libc::getpgrp() }
+    }
+
+    #[test]
+    fn a_bounded_child_leads_a_process_group_of_its_own() {
+        // §14.1: a terminal's Ctrl-C reaches its foreground process group. A `security` write
+        // in that group would die midway; in a group of its own, it never sees the signal.
+        let _fork = crate::FORK_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (pid, group) = pid_and_group(|args| {
+            ProcessRunner::run_bounded(
+                "/bin/sh",
+                &args,
+                None,
+                Duration::from_secs(5),
+                Duration::from_secs(1),
+            )
+        });
+        assert_eq!(group, pid, "the child leads its own group");
+        assert_ne!(group, own_group(), "never the caller's group");
+    }
+
+    #[test]
+    fn an_attached_child_stays_in_the_caller_s_process_group() {
+        // §14.1: `security unlock-keychain` reads the password from the terminal, so it stays
+        // in the terminal's foreground group, where a Ctrl-C reaches it along with tagteam.
+        let _fork = crate::FORK_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (pid, group) = pid_and_group(|args| ProcessRunner.run_attached("/bin/sh", &args));
+        assert_ne!(group, pid);
+        assert_eq!(group, own_group());
     }
 }
