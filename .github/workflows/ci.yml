@@ -38,7 +38,7 @@ jobs:
       - name: Clippy (test-support)
         run: cargo clippy --workspace --all-targets --locked --features tagteam/test-support -- -D warnings
       - name: Test
-        run: cargo test --workspace --locked --features tagteam/test-support
+        run: cargo test --workspace --locked --no-fail-fast --features tagteam/test-support
       - name: Test (real keychain)
         if: runner.os == 'macOS'
         run: cargo test -p tagteam-provider --locked --features real_keychain --test real_keychain
