@@ -49,6 +49,25 @@ from the reading's `fetched_at`, and pace covers `Scoped` windows with a known p
   points every endpoint at `http://127.0.0.1:9` unless a test starts a `MockServer`.
 - Clippy must pass both with `--features tagteam/test-support` and with no features (M2a's lint
   ruling): hook-only test code is gated on `test-hooks`.
+- **Pre-flight rulings (execution, 2026-10-01).** These amend the task text below; the run's
+  ledger holds the full wording.
+  - K1: Task 15 adds only `history` to `use crate::{..}`; Task 14 already imports `StatusView`.
+  - K2: Task 12's `an_account_with_no_reading_...` test parks b's plan an hour out before the
+    switch, so its red step fails deterministically.
+  - K3: Task 12 logs a failed post-switch re-plan at ERROR (§14), not WARN.
+  - K4: Task 5 reports `exhaustion_at = fetched_at` for any window at `pct >= 100`, with or
+    without a rate (§8.7), replacing "a window at 100 % with no rate still reports none".
+  - K5: File Structure corrected (the `ShadowingItem` edit is in `tagteam-provider`; omitted
+    modified files listed).
+  - K6: every task runs `cargo fmt --all` before `cargo fmt --all --check`.
+  - D1, D2, D6: test helpers shared by two integration-test files live in `tests/common/mod.rs`
+    (Tasks 8, 10, 11, 13, 14, 15).
+  - D3: `UsageResult::from_reply` in `tagteam-provider` holds §8.1's reply verdicts; Claude
+    Code's `parse_usage` and FakeAgent's delegate to it (Tasks 6, 7).
+  - D4, D5: the `tagteam` crate's test view builder and its `money`, severity and missing-cell
+    helpers live once in `render.rs`; `statusline` uses them (one currency format, `—`).
+  - D7: Task 16's `unreachable!` stays. D8: Task 7 drops a self-comparing assertion.
+  - D9: one pace helper serves `with_pace` and `history` (Task 13).
 
 ## Milestones
 
@@ -184,15 +203,18 @@ crates/tagteam-core/
   src/pace.rs                    NEW        regression and average pace, projections (Task 5)
 crates/tagteam-provider/
   src/provider.rs                MOD        UsageResult; fetch_usage, poll_budget, render_usage,
-                                            live_identity_source (Task 7)
+                                            live_identity_source (Task 7); ShadowingItem wording
+                                            (Task 17, L397)
   src/lib.rs                     MOD        re-exports
   src/security.rs                MOD        ProcessRunner kill and join timeout (Task 17, L343)
   src/keychain.rs                MOD        FakeKeychain models rc 0/44 (Task 17, L342)
 crates/tagteam-cc/
   src/usage.rs                   NEW        usage request, ISO 8601, normalization, rendering (Task 6)
   src/lib.rs                     MOD        usage module
-  src/provider.rs                MOD        the Task 7 trait methods; ShadowingItem wording (Task 17)
+  src/provider.rs                MOD        the Task 7 trait methods
   tests/usage.rs                 NEW        fixture-driven normalization tests (Task 6)
+  tests/provider.rs              MOD        (Task 7)
+  tests/live_store.rs            MOD        (Task 17)
 crates/tagteam-fake/
   src/usage.rs                   NEW        FakeAgent's usage endpoint shape (Task 7)
   src/provider.rs, src/lib.rs    MOD        capabilities.usage = true; the Task 7 methods
@@ -208,15 +230,19 @@ crates/tagteam-engine/
   src/switch.rs                  MOD        post-switch poll re-plan (Task 12)
   src/engine.rs                  MOD        settings in EngineConfig and Engine (Task 9)
   src/lib.rs                     MOD        new modules
+  src/testutil.rs                MOD        settings (Task 9)
   tests/common/mod.rs            MOD        script_usage, usage helpers (Task 10)
   tests/{settings,store_usage,collect,collect_active,views_usage}.rs NEW
+  tests/{oracle,switch,invariant}.rs MOD    (Tasks 9, 12, 13)
 crates/tagteam/
   src/cli.rs                     MOD        History, Statusline commands (Tasks 15, 16)
   src/app.rs                     MOD        LazyHttp, settings, collect before list/status (Tasks 9, 14)
   src/render.rs                  MOD        usage JSON, list table, colours (Task 14)
   src/history.rs                 NEW        history rendering (Task 15)
   src/statusline.rs              NEW        format, --print-config (Task 16)
+  src/lib.rs                     MOD        history, statusline modules (Tasks 15, 16)
   tests/{usage_cli,history,statusline}.rs NEW; tests/perf.rs NEW (ignored timing tests, Task 16)
+  tests/{app,cli,common/mod}.rs  MOD        (Tasks 9, 14, 15, 16)
 ```
 
 ---
