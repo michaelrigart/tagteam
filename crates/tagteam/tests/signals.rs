@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::store::Store;
+use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Env, FileKeychain, Keychain};
 
 /// Sends `signal` to the child, as a terminal's Ctrl-C (SIGINT) or `kill` would.
@@ -26,14 +27,17 @@ fn send(child: &Child, signal: i32) {
 }
 
 /// Polls `ready` every 10 ms until it holds. Fails the test if the child exits first, or if
-/// `within` passes.
+/// `within` passes (killing the child, so a hung one is not left behind).
 fn wait_until(child: &mut Child, within: Duration, what: &str, ready: impl Fn() -> bool) {
     let deadline = Instant::now() + within;
     while !ready() {
         if let Some(status) = child.try_wait().unwrap() {
             panic!("tagteam exited ({status}) before {what}");
         }
-        assert!(Instant::now() < deadline, "tagteam never got to {what}");
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("tagteam never got to {what}");
+        }
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -335,5 +339,66 @@ fn ctrl_c_twice_while_the_switch_s_write_waits_for_claude_code_s_storage_write_l
     assert!(
         !paths.storage_write_lock.exists(),
         "tagteam released the storage-write lock it took"
+    );
+}
+
+/// Regression for a deadlock: `main` held the stdout and stderr locks for the whole command, so
+/// a collector thread whose tracing event wrote to stderr (`--debug`) blocked on the lock the
+/// joining main thread held, and no signal could free it.
+#[test]
+fn debug_logging_from_a_collector_thread_does_not_deadlock_the_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    two_fresh_accounts(root); // both due: `list` collects with a thread per account
+
+    let child = std_cmd(root)
+        .args(["--debug", "list"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = finish(child, Duration::from_secs(10));
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("DEBUG"),
+        "the debug log reached stderr"
+    );
+}
+
+#[test]
+fn ctrl_c_during_a_debug_collection_exits_130() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    two_fresh_accounts(root);
+    let server = MockServer::start();
+    server.on("GET", "/api/oauth/usage", MockReply::Hang);
+
+    let mut child = std_cmd(root)
+        .args(["--debug", "list"])
+        .env("TAGTEAM_TEST_API_BASE", server.base_url())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until(
+        &mut child,
+        Duration::from_secs(20),
+        "a usage request in flight",
+        || server.hits("GET", "/api/oauth/usage") > 0,
+    );
+    send(&child, libc::SIGINT);
+    let out = finish(child, Duration::from_secs(8));
+
+    assert_eq!(
+        out.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
