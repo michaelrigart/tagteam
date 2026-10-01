@@ -1,4 +1,5 @@
 pub mod atomic;
+pub mod cancel;
 pub mod clock;
 pub mod credential;
 pub mod env;
@@ -20,6 +21,7 @@ pub mod splice;
 #[cfg(test)]
 pub(crate) static FORK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+pub use cancel::{Cancel, Interrupted};
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use credential::{Credential, FreshCredential, Provenance};
 pub use env::Env;

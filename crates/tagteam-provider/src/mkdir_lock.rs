@@ -7,6 +7,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::cancel::Cancel;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
     #[error("timed out waiting for the lock {0}")]
@@ -15,6 +17,31 @@ pub enum LockError {
     Compromised(PathBuf),
     #[error("lock I/O failed: {0}")]
     Io(#[from] io::Error),
+    /// The cancel token was set while waiting (§14.1). The wait took nothing.
+    #[error("interrupted while waiting for the lock {path}")]
+    Interrupted { path: PathBuf, signal: i32 },
+}
+
+impl LockError {
+    /// The signal behind an interrupted wait; `None` for every other failure.
+    pub fn signal(&self) -> Option<i32> {
+        match self {
+            LockError::Interrupted { signal, .. } => Some(*signal),
+            _ => None,
+        }
+    }
+}
+
+/// Decision 3 (§14.1): every lock wait calls this before each attempt, the first included, so
+/// a command whose token is set never takes a new lock.
+pub(crate) fn check_cancel(cancel: &Cancel, path: &Path) -> Result<(), LockError> {
+    match cancel.requested() {
+        Some(signal) => Err(LockError::Interrupted {
+            path: path.to_path_buf(),
+            signal,
+        }),
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +50,9 @@ pub struct MkdirLockSpec {
     pub stale: Duration,
     pub acquire_timeout: Duration,
     pub touch_every: Duration,
+    /// Checked before every attempt `MkdirLock::acquire` makes (§14.1). `new` gives a token
+    /// nothing sets; `with_cancel` shares the caller's.
+    pub cancel: Cancel,
 }
 
 impl MkdirLockSpec {
@@ -32,6 +62,15 @@ impl MkdirLockSpec {
             stale,
             acquire_timeout,
             touch_every: Duration::from_secs(3),
+            cancel: Cancel::new(),
+        }
+    }
+
+    /// The same lock, waited for under `cancel`.
+    pub fn with_cancel(self, cancel: &Cancel) -> Self {
+        Self {
+            cancel: cancel.clone(),
+            ..self
         }
     }
 }
@@ -101,9 +140,12 @@ impl MkdirLock {
         Ok(None)
     }
 
+    /// Waits up to `acquire_timeout`, polling every 250–500 ms. `spec.cancel` is checked before
+    /// every attempt (§14.1); `try_acquire`, one attempt and not a wait, never checks it.
     pub fn acquire(spec: &MkdirLockSpec) -> Result<Self, LockError> {
         let deadline = Instant::now() + spec.acquire_timeout;
         loop {
+            check_cancel(&spec.cancel, &spec.path)?;
             if let Some(lock) = Self::try_acquire(spec)? {
                 return Ok(lock);
             }
@@ -224,7 +266,99 @@ mod tests {
             stale: Duration::from_millis(stale_ms),
             acquire_timeout: Duration::from_millis(timeout_ms),
             touch_every: Duration::from_millis(touch_ms),
+            cancel: Cancel::new(),
         }
+    }
+
+    /// Sets `cancel` from another thread 200 ms from now, as a signal handler would, and
+    /// returns the instant just before it did.
+    fn interrupt_soon(cancel: &Cancel, signal: i32) -> std::thread::JoinHandle<Instant> {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let at = Instant::now();
+            cancel.request(signal);
+            at
+        })
+    }
+
+    #[test]
+    fn a_set_token_ends_the_wait_before_its_first_attempt() {
+        let d = tempfile::tempdir().unwrap();
+        let cancel = Cancel::new();
+        cancel.request(2);
+        let s = spec(d.path(), 60_000, 5_000, 3_000).with_cancel(&cancel);
+        let start = Instant::now();
+        match MkdirLock::acquire(&s) {
+            Err(LockError::Interrupted { path, signal }) => {
+                assert_eq!((path, signal), (s.path.clone(), 2))
+            }
+            Err(e) => panic!("expected an interrupted wait, got {e:?}"),
+            Ok(_) => panic!("a set token took the lock"),
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "no poll was waited"
+        );
+        assert!(
+            !s.path.exists(),
+            "no attempt was made, so nothing was taken"
+        );
+    }
+
+    #[test]
+    fn an_unset_token_waits_and_acquires_as_before() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 600, 3_000).with_cancel(&Cancel::new());
+        let held = MkdirLock::acquire(&s).unwrap();
+        assert!(matches!(MkdirLock::acquire(&s), Err(LockError::Timeout(_))));
+        drop(held);
+        assert!(MkdirLock::acquire(&s).is_ok());
+    }
+
+    #[test]
+    fn a_token_set_while_another_holder_keeps_the_lock_ends_the_wait_within_one_poll() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 30_000, 3_000);
+        let holder = MkdirLock::acquire(&s).unwrap();
+        let cancel = Cancel::new();
+        let setter = interrupt_soon(&cancel, 15);
+        let result = MkdirLock::acquire(&s.clone().with_cancel(&cancel));
+        let ended = Instant::now();
+        let set_at = setter.join().unwrap();
+        assert!(
+            matches!(&result, Err(LockError::Interrupted { path, signal: 15 }) if *path == s.path),
+            "{:?}",
+            result.as_ref().err()
+        );
+        assert!(ended >= set_at, "the wait ended before the token was set");
+        // One jittered poll is at most 500 ms; the timeout is 30 s.
+        assert!(
+            ended - set_at < Duration::from_secs(1),
+            "{:?}",
+            ended - set_at
+        );
+        assert!(
+            holder.check_owned().is_ok(),
+            "the holder's lock is untouched"
+        );
+    }
+
+    #[test]
+    fn only_an_interrupted_wait_carries_a_signal() {
+        let p = PathBuf::from("/x.lock");
+        let e = LockError::Interrupted {
+            path: p.clone(),
+            signal: 1,
+        };
+        assert_eq!(e.signal(), Some(1));
+        assert_eq!(
+            e.to_string(),
+            "interrupted while waiting for the lock /x.lock"
+        );
+        assert_eq!(LockError::Timeout(p.clone()).signal(), None);
+        assert_eq!(LockError::Compromised(p).signal(), None);
+        assert_eq!(LockError::Io(io::Error::other("x")).signal(), None);
     }
 
     #[test]
