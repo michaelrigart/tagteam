@@ -30,6 +30,7 @@ tagteam-cc = { workspace = true, features = ["test-hooks"] }
 tagteam-fake.workspace = true
 tagteam-provider = { workspace = true, features = ["file-keychain", "mock-server"] }
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

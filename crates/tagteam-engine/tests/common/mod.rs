@@ -1281,3 +1281,43 @@ pub fn refused() -> Value {
 pub fn methods(fx: &Fx) -> Vec<Method> {
     fx.http.requests().iter().map(|r| r.method).collect()
 }
+
+/// A `tracing` writer that appends to a shared buffer.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = LogBuffer;
+
+    fn make_writer(&'a self) -> LogBuffer {
+        self.clone()
+    }
+}
+
+/// Runs `f` with every `tracing` event this thread emits captured, and returns `f`'s result
+/// with the captured lines: one per event, level first (`ERROR`, `WARN`, ...), then the
+/// message and its fields, without colour or timestamps.
+pub fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let buffer = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buffer.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_target(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let text = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+    (result, text.lines().map(str::to_owned).collect())
+}

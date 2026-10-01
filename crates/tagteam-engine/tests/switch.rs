@@ -5,7 +5,9 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{API_KEY, Fx, OTHER_API_KEY, STRAY_API_KEY, mutation_lock_free, usage_fixture};
+use common::{
+    API_KEY, Fx, OTHER_API_KEY, STRAY_API_KEY, capture_logs, mutation_lock_free, usage_fixture,
+};
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::poll::PollPlan;
@@ -961,6 +963,17 @@ fn an_incoming_account_with_an_old_reading_is_due_at_once_and_fetched_on_demand(
     assert_eq!(out.reason, SwitchReason::Switched);
     let now = fx.engine.now_ms() / 1000;
     assert_eq!(fx.usage_state(&a).unwrap().next_poll_at, Some(now));
+    assert!(
+        !fx.http.requests().is_empty(),
+        "the switch sent its freshen"
+    );
+    assert!(
+        fx.http
+            .requests()
+            .iter()
+            .all(|r| r.url != Fx::endpoints().usage),
+        "the switch's own requests (its §7.2 freshen) never touch the usage endpoint"
+    );
 
     fx.http.clear();
     fx.script_usage(200, usage_fixture());
@@ -1080,7 +1093,7 @@ fn a_re_plan_that_cannot_be_stored_never_fails_the_switch() {
         )
         .unwrap();
 
-    let out = switch(&fx, to(&a), false).unwrap();
+    let (out, logs) = capture_logs(|| switch(&fx, to(&a), false).unwrap());
 
     assert!(out.switched, "{}", out.message);
     assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
@@ -1088,5 +1101,23 @@ fn a_re_plan_that_cannot_be_stored_never_fails_the_switch() {
         fx.usage_state(&a).unwrap().next_poll_at,
         before,
         "the plan is as it was"
+    );
+    // The failed re-plan is logged at ERROR (§14, K3), naming the account by position and id,
+    // with the store's error as a field and never the email.
+    let errors: Vec<&String> = logs.iter().filter(|l| l.starts_with("ERROR")).collect();
+    assert_eq!(errors.len(), 1, "{logs:?}");
+    let line = errors[0];
+    assert!(
+        line.contains("could not re-plan usage polls after the switch")
+            && line.contains("position=1")
+            && line.contains(&format!("account={a}"))
+            && line.contains("error=")
+            && line.contains("usage_state is read-only"),
+        "{line}"
+    );
+    assert!(!line.contains("@x.co"), "{line}");
+    assert!(
+        logs.iter().all(|l| !l.contains("@x.co")),
+        "no email in any event: {logs:?}"
     );
 }
