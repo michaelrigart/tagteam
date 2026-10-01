@@ -15,6 +15,7 @@ use tagteam_core::{AccountId, PollBudget, PollInputs, PollPlan, ProviderId, Wind
 use tagteam_provider::provider::UsageResult;
 use tagteam_provider::{Credential, Provenance, Provider, Read, TransientKind};
 
+use crate::active::{ActiveOutcome, ActiveTrigger};
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
@@ -307,15 +308,76 @@ impl Collection<'_> {
         self.retry(&next)
     }
 
-    /// §8.1 for the active account: the live token, read fresh, and never refreshed by a usage
-    /// fetch. One that has expired or was refused is not sent (`send`); a 401 stamps it.
+    /// §8.1 for the active account. Only §7.5 refreshes the live token, never a usage fetch: an
+    /// expired or refused live token is handed to it (`Expired`, `Rejected`) before anything is
+    /// sent, and the fetch goes on with the live token, read fresh, only if §7.5 left one that
+    /// is usable and different. A 401 on a token still valid locally (the only kind `send`
+    /// sends) stamps `rejected_fp` first, then goes to §7.5 and retries once.
     fn active(&mut self) -> Result<Vec<Window>, Stop> {
-        let live = self.live_bytes()?;
-        let first = self.send(&live)?;
-        if matches!(first, UsageResult::Unauthorized) {
-            self.reject(&live)?;
+        let mut live = self.live_bytes()?;
+        if let Some(trigger) = self.trigger(&live) {
+            live = self.refresh_live(trigger)?;
         }
-        windows(first)
+        let first = self.send(&live)?;
+        if !matches!(first, UsageResult::Unauthorized) {
+            return windows(first);
+        }
+        self.reject(&live)?;
+        let Some(trigger) = self.trigger(&live) else {
+            return Err(failed("http-401"));
+        };
+        let next = self.refresh_live(trigger)?;
+        self.retry(&next)
+    }
+
+    /// Why §7.5 must see the live token before it is sent: the server refused it
+    /// (`rejected_fp`), or it has expired (§7.2).
+    fn trigger(&self, live: &[u8]) -> Option<ActiveTrigger> {
+        if self.is_rejected(live) {
+            return self
+                .access_fp(live)
+                .map(|access_fp| ActiveTrigger::Rejected { access_fp });
+        }
+        expired(self.p, live, self.now_ms()).then_some(ActiveTrigger::Expired)
+    }
+
+    /// §7.5, then the live token it leaves, read fresh. `Refreshed`, `PersistedNotPublished`,
+    /// `PublishedOnly` and `NotNeeded` go on; `send` still refuses a token that is expired or
+    /// refused. `Dead` has quarantined the account (`relogin_required`). Any other outcome, and
+    /// any error, is a failure with a warning, never a command error (M2a Task 16's
+    /// carry-over), except a live credential the oracle gives to another identity, which has a
+    /// status of its own. A kind that does not refresh never reaches §7.5, which would refuse
+    /// it: its refused token is reported expired.
+    fn refresh_live(&mut self, trigger: ActiveTrigger) -> Result<Vec<u8>, Stop> {
+        if !self.p.kind_traits(&self.row.kind).refreshable {
+            return Err(failed("token-expired"));
+        }
+        match self.engine.refresh_active(&self.row.provider, trigger) {
+            Ok(
+                ActiveOutcome::NotNeeded { .. }
+                | ActiveOutcome::Refreshed
+                | ActiveOutcome::PersistedNotPublished
+                | ActiveOutcome::PublishedOnly,
+            ) => self.live_bytes(),
+            Ok(ActiveOutcome::Dead(_)) => Err(failed("refresh-failed")),
+            Ok(ActiveOutcome::Unpersisted) => {
+                self.warn_lost();
+                Err(failed("refresh-failed"))
+            }
+            Ok(ActiveOutcome::Systemic(detail)) => {
+                self.warn_refresh(&detail);
+                Err(failed("refresh-failed"))
+            }
+            Ok(ActiveOutcome::Transient { kind }) => {
+                self.warn_refresh(&kind);
+                Err(failed("refresh-failed"))
+            }
+            Err(EngineError::ForeignLiveCredential { .. }) => Err(failed("foreign-credential")),
+            Err(e) => {
+                self.warn_refresh(&e);
+                Err(failed("refresh-failed"))
+            }
+        }
     }
 
     /// The vault's token for an inactive account, refreshed through the gate first when it
@@ -364,21 +426,52 @@ impl Collection<'_> {
         }
     }
 
-    /// The live credential, read fresh, while the live login still names this account. A live
-    /// login that moved stops the fetch: its token is not this account's.
+    /// The live credential, read while the live login names this account, under tagteam's
+    /// mutation lock. A switch holds that lock for its whole transaction and writes the
+    /// target's credential before its identity (§9.4), so without it a switch finishing
+    /// between the reads would have this reservation send, and record, another account's token.
+    /// Under the lock: the live identity, the live credential, then the identity again, which
+    /// must still name this account. The lock is dropped before returning, so it is never held
+    /// across a request (§8.3) or across §7.5, which takes it itself.
+    ///
+    /// A live login that moved stops the fetch (`Moved`): its token is not this account's. So
+    /// does a lock that cannot be had within its timeout (a switch or another mutation holding
+    /// it). So does a switch journal row still present once the guard is held: the guard returns
+    /// even when its recovery of a dead switch failed, and that switch may have written another
+    /// account's credential before its identity, which both identity checks would pass.
+    /// Residual: a login changed by Claude Code itself, outside tagteam's lock, between the
+    /// credential read and the second identity read (its credential written, its `oauthAccount`
+    /// not yet) passes both checks and can misattribute that one reading.
     fn live_bytes(&self) -> Result<Vec<u8>, Stop> {
-        let env = &self.engine.env;
-        match self.p.live_identity(env) {
-            Read::Present(i) if self.p.identity_key(&i).as_str() == self.row.identity_key => {}
-            _ => return Err(Stop::Moved),
+        let guard = match self.engine.mutation_guard() {
+            Ok(guard) => guard,
+            Err(EngineError::Lock(_)) => return Err(Stop::Moved),
+            Err(e) => return Err(e.into()),
+        };
+        if self.store.journal(&self.row.provider)?.is_some() {
+            drop(guard);
+            return Err(Stop::Moved);
         }
-        match self.p.read_live_auth(env).credential {
+        self.live_names_this_account()?;
+        hooks::point(self.engine, "usage-live-identity-read")?;
+        let credential = self.p.read_live_auth(&self.engine.env).credential;
+        self.live_names_this_account()?;
+        drop(guard);
+        match credential {
             Read::Present(c) if c.provenance() == Provenance::Degraded => {
                 Err(failed("keychain-unavailable"))
             }
             Read::Present(c) if !c.is_empty() => Ok(c.bytes().to_vec()),
             Read::Present(_) | Read::Absent => Err(failed("no-access-token")),
             Read::Unreadable(_) => Err(failed("keychain-unavailable")),
+        }
+    }
+
+    /// The live login still names this account; `Moved` otherwise.
+    fn live_names_this_account(&self) -> Result<(), Stop> {
+        match self.p.live_identity(&self.engine.env) {
+            Read::Present(i) if self.p.identity_key(&i).as_str() == self.row.identity_key => Ok(()),
+            _ => Err(Stop::Moved),
         }
     }
 
@@ -455,8 +548,8 @@ impl Collection<'_> {
     /// the slot's validity, replacing a stale slot (a suspend or a slow refresh) or reserving
     /// one for the retry.
     /// - `LeaseLost`: nothing is sent or recorded, and the unsent slot stays counted.
-    /// - `Rejected`: recorded as `token-expired` for the active account (its refusal is §7.5's
-    ///   to handle, Task 11) or `http-401` for an inactive one; the slot goes back.
+    /// - `Rejected`: recorded as `token-expired` for the active account (another process was
+    ///   refused this token since the state was read; the next collection hands it to §7.5) or `http-401` for an inactive one; the slot goes back.
     /// - `OverBudget`: recorded as `over-budget`, backing off until a slot frees up; a stale
     ///   slot has already gone back.
     fn authorize(&mut self, bytes: &[u8]) -> Result<Slot, Stop> {
