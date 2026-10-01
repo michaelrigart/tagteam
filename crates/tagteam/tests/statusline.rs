@@ -119,19 +119,17 @@ fn the_format_and_colour_come_from_config_toml() {
     let (d, _, _) = managed(0);
     write_config(
         d.path(),
-        "[statusline]\nformat = \"{position} {email} {5h_reset} {7d_reset} {model:fable} {spend} {7d} {nope} {5h\"\n\n[ui]\ncolor = \"never\"\n",
+        "[statusline]\nformat = \"{position} {email} {5h_reset} {7d_reset} {model:fable} {spend} {7d}\"\n\n[ui]\ncolor = \"never\"\n",
     );
     statusline(d.path())
         .assert()
         .success()
-        .stdout("2 b@x.co 2h40m 3d09h 0 — 77 {nope} {5h\n");
+        .stdout("2 b@x.co 2h40m 3d09h 0 — 77\n");
     statusline(d.path())
         .env("FORCE_COLOR", "1")
         .assert()
         .success()
-        .stdout(format!(
-            "2 b@x.co 2h40m 3d09h 0 — {YELLOW_77} {{nope}} {{5h\n"
-        ));
+        .stdout(format!("2 b@x.co 2h40m 3d09h 0 — {YELLOW_77}\n"));
 }
 
 #[test]

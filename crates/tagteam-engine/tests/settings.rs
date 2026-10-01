@@ -1,7 +1,9 @@
 use std::fs;
 
 use tagteam_core::ProviderId;
-use tagteam_engine::settings::{ColorMode, Settings};
+use tagteam_engine::settings::{
+    ColorMode, STATUSLINE_PLACEHOLDERS, Settings, is_statusline_placeholder,
+};
 use tagteam_provider::Env;
 
 const PROVIDER: &str = "claude-code";
@@ -162,12 +164,13 @@ fn models_take_a_list_or_a_single_name() {
     assert_eq!(settings.models, models(&["Fable"]));
     assert!(warnings.is_empty(), "{warnings:?}");
 
-    let (settings, _) = load("[autoswitch]\nmodels = [\"Fable\", \" Opus \"]\n");
+    let (settings, warnings) = load("[autoswitch]\nmodels = [\"Fable\", \" Opus \"]\n");
     assert_eq!(
         settings.models,
         models(&["Fable", "Opus"]),
         "names are trimmed"
     );
+    assert!(warnings.is_empty(), "trimming is silent: {warnings:?}");
 
     let (settings, _) = load("[autoswitch]\nmodels = [\"all\"]\n");
     assert_eq!(settings.models, models(&["all"]));
@@ -393,10 +396,16 @@ fn a_file_that_is_not_utf8_reads_as_unreadable() {
     let dir = tempfile::tempdir().unwrap();
     let env = Env::for_test(dir.path());
     fs::create_dir_all(env.config_dir()).unwrap();
-    fs::write(env.config_dir().join("config.toml"), [0xff, 0xfe, 0x00]).unwrap();
+    let path = env.config_dir().join("config.toml");
+    fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
     let (settings, warnings) = Settings::load(&env, &ProviderId::new(PROVIDER));
     assert_eq!(settings, Settings::default());
     assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains(&path.display().to_string()),
+        "{warnings:?}"
+    );
+    assert!(warnings[0].contains("cannot read"), "{warnings:?}");
 }
 
 #[test]
@@ -406,4 +415,176 @@ fn a_comment_heavy_file_with_inline_tables_reads_normally() {
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(settings.threshold, 60.0);
     assert_eq!(settings.models, models(&["all"]));
+}
+
+#[test]
+fn a_provider_key_that_is_not_a_table_warns_once_across_models_and_format() {
+    let (settings, warnings) = load("provider = 5\n");
+    assert_eq!(settings, Settings::default());
+    assert_eq!(
+        warnings.len(),
+        1,
+        "threshold, models and format share one warning: {warnings:?}"
+    );
+    assert!(
+        warnings[0].contains("`provider` must be a table"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn an_array_of_tables_is_not_a_table_and_gives_the_default_with_a_warning() {
+    let (settings, warnings) = load("[[autoswitch]]\nthreshold = 60\nmodels = [\"Fable\"]\n");
+    assert_eq!(settings, Settings::default());
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`autoswitch` must be a table"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn every_settings_warning_names_the_full_path_of_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::for_test(dir.path());
+    fs::create_dir_all(env.config_dir()).unwrap();
+    let path = env.config_dir().join("config.toml");
+    fs::write(
+        &path,
+        "autoswitch = 5\n[usage]\nhistory_retention_days = 0\n[ui]\ncolor = \"rainbow\"\n[statusline]\nformat = \"{nope}\"\n",
+    )
+    .unwrap();
+    let (_, warnings) = Settings::load(&env, &ProviderId::new(PROVIDER));
+    assert_eq!(warnings.len(), 4, "{warnings:?}");
+    let prefix = format!("{}: ", path.display());
+    for warning in &warnings {
+        assert!(warning.starts_with(&prefix), "{warning}");
+    }
+}
+
+#[test]
+fn the_placeholder_list_is_the_specs_section_thirteen_five() {
+    assert_eq!(
+        STATUSLINE_PLACEHOLDERS,
+        [
+            "account", "position", "email", "5h", "7d", "5h_reset", "7d_reset", "spend", "stale"
+        ]
+    );
+    for name in STATUSLINE_PLACEHOLDERS {
+        assert!(is_statusline_placeholder(name), "{name}");
+    }
+    assert!(is_statusline_placeholder("model:Fable"));
+    assert!(is_statusline_placeholder("model:Fable Pro"));
+    for name in [
+        "", "nope", "model", "model:", "Account", "5H", " 5h", "5h ", "{5h}", "5h}",
+    ] {
+        assert!(!is_statusline_placeholder(name), "{name:?}");
+    }
+}
+
+#[test]
+fn a_format_made_of_known_placeholders_and_plain_text_is_accepted_as_written() {
+    for format in [
+        "{account} · 5h {5h}% · 7d {7d}%{stale}",
+        "{position}:{email} {5h_reset}/{7d_reset} {spend} {model:Fable}",
+        "plain text, no placeholders",
+        "} stray close brace {5h}",
+        "{5h}{7d}",
+    ] {
+        let text = format!("[statusline]\nformat = {format:?}\n");
+        let (settings, warnings) = load(&text);
+        assert_eq!(settings.statusline_format, format);
+        assert!(warnings.is_empty(), "{format}: {warnings:?}");
+    }
+}
+
+#[test]
+fn a_format_with_an_unknown_or_unclosed_placeholder_falls_back_with_one_warning() {
+    for format in [
+        "{nope}",
+        "{account} {nope} {5h}",
+        "{}",
+        "{model}",
+        "{model:}",
+        "{5H}",
+        "{ 5h }",
+        "{5h",
+        "{account} {5h",
+        "{{5h}}",
+        "{",
+    ] {
+        let text = format!("[statusline]\nformat = {format:?}\n");
+        let (settings, warnings) = load(&text);
+        assert_eq!(
+            settings.statusline_format, "{account} · 5h {5h}% · 7d {7d}%{stale}",
+            "{format}"
+        );
+        assert_eq!(warnings.len(), 1, "{format}: {warnings:?}");
+        assert!(warnings[0].contains("`statusline.format`"), "{warnings:?}");
+    }
+}
+
+#[test]
+fn an_invalid_provider_format_warns_and_the_global_one_applies() {
+    let (settings, warnings) = load(
+        "[statusline]\nformat = \"{5h}\"\n\n[provider.claude-code.statusline]\nformat = \"{nope}\"\n",
+    );
+    assert_eq!(settings.statusline_format, "{5h}");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`provider.claude-code.statusline.format`"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn the_format_warning_lists_the_valid_placeholders() {
+    let (_, warnings) = load("[statusline]\nformat = \"{nope}\"\n");
+    for name in STATUSLINE_PLACEHOLDERS {
+        assert!(warnings[0].contains(&format!("{{{name}}}")), "{warnings:?}");
+    }
+    assert!(warnings[0].contains("{model:<name>}"), "{warnings:?}");
+}
+
+#[test]
+fn all_mixed_with_model_names_is_invalid_in_any_case_and_any_position() {
+    for list in [
+        "[\"all\", \"Fable\"]",
+        "[\"Fable\", \"all\"]",
+        "[\"ALL\", \"Fable\"]",
+        "[\"Fable\", \" All \"]",
+    ] {
+        let (settings, warnings) = load(&format!("[autoswitch]\nmodels = {list}\n"));
+        assert_eq!(settings.models, Vec::<String>::new(), "{list}");
+        assert_eq!(warnings.len(), 1, "{list}: {warnings:?}");
+        assert!(warnings[0].contains("`autoswitch.models`"), "{warnings:?}");
+    }
+}
+
+#[test]
+fn a_mixed_provider_list_warns_and_the_global_models_apply() {
+    let (settings, warnings) = load(
+        "[autoswitch]\nmodels = [\"Opus\"]\n\n[provider.claude-code.autoswitch]\nmodels = [\"all\", \"Fable\"]\n",
+    );
+    assert_eq!(settings.models, models(&["Opus"]));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`provider.claude-code.autoswitch.models`"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn duplicate_model_names_collapse_silently_keeping_the_first_spelling() {
+    for (list, expected) in [
+        ("[\"Fable\", \"fable\"]", &["Fable"][..]),
+        ("[\"fable\", \"Fable\", \"FABLE\"]", &["fable"]),
+        ("[\"Fable\", \"Opus\", \" fable \"]", &["Fable", "Opus"]),
+        ("[\"Opus\", \"Fable\", \"opus\"]", &["Opus", "Fable"]),
+        ("[\"all\", \"ALL\"]", &["all"]),
+    ] {
+        let (settings, warnings) = load(&format!("[autoswitch]\nmodels = {list}\n"));
+        assert_eq!(settings.models, models(expected), "{list}");
+        assert!(warnings.is_empty(), "{list}: {warnings:?}");
+    }
 }
