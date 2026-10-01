@@ -6,6 +6,7 @@ pub mod fingerprint;
 pub mod ids;
 pub mod pace;
 pub mod poll;
+pub mod rank;
 pub mod rotation;
 pub mod trust;
 pub mod usage;
