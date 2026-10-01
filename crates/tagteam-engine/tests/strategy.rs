@@ -423,6 +423,9 @@ fn next_available_never_skips_an_unknown_candidate() {
 
 #[test]
 fn next_available_with_every_candidate_exhausted_names_each_and_the_earliest_reset() {
+    // A candidate is back only once every window at its limit has reset: b is at its limit in
+    // both the 5h window (resets in 2h40m) and the 7d one (3d09h), so b is back in 3d09h, not
+    // 2h40m. a is at its limit in the 7d window alone. The earliest candidate is back in 3d09h.
     let fx = Fx::new();
     let (a, b, c) = three(&fx);
     read(&fx, &a, &reading(10.0, 100.0, 0.0));
@@ -435,9 +438,26 @@ fn next_available_with_every_candidate_exhausted_names_each_and_the_earliest_res
     );
     assert_eq!(
         out.message,
-        "every candidate is at its limit: a@x.co (7d at 100%), b@x.co (5h at 104%); the earliest reset is in 2h40m"
+        "every candidate is at its limit: a@x.co (7d at 100%), b@x.co (5h at 104%); the earliest reset is in 3d09h"
     );
     assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
+}
+
+#[test]
+fn the_earliest_reset_is_when_the_first_candidate_is_back_not_when_a_window_resets() {
+    // a is blocked by its 5h window alone, which resets in 2h40m; b by both its windows, so
+    // not for 3d09h. The first one back is a, in 2h40m.
+    let fx = Fx::new();
+    let (a, b, _c) = three(&fx);
+    read(&fx, &a, &reading(100.0, 20.0, 0.0));
+    read(&fx, &b, &reading(100.0, 100.0, 0.0));
+    let out = next_available(&fx).unwrap();
+    assert_eq!(out.reason, SwitchReason::CandidatesExhausted);
+    assert!(
+        out.message.ends_with("; the earliest reset is in 2h40m"),
+        "{}",
+        out.message
+    );
 }
 
 #[test]

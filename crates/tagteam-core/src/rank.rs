@@ -92,6 +92,17 @@ pub fn binding_window<'w>(windows: &'w [Window], models: &[String]) -> Option<&'
         })
 }
 
+/// When an account at its limit is usable again: the latest reset among its relevant windows
+/// that are at 100% or more, since it is blocked until every one of them has reset. `None` when
+/// none of those windows names a reset.
+pub fn blocked_until(windows: &[Window], models: &[String]) -> Option<i64> {
+    windows
+        .iter()
+        .filter(|w| is_relevant(w, models) && w.pct >= 100.0)
+        .filter_map(|w| w.resets_at)
+        .max()
+}
+
 /// A span of time as tagteam states it: `3d09h`, `2h40m`, `45m`, or `<1m`; a negative span is
 /// none. `list`'s countdowns and the strategies' messages share it.
 pub fn span(secs: i64) -> String {
@@ -322,6 +333,35 @@ mod tests {
             win("7d", "7d", WindowKind::Long, 100.0),
         ];
         assert_eq!(key(binding_window(&windows, &[])), Some("5h"));
+    }
+
+    #[test]
+    fn an_account_is_blocked_until_every_relevant_window_at_its_limit_has_reset() {
+        let at = |key: &str, kind, pct, reset| Window {
+            resets_at: Some(reset),
+            ..win(key, key.trim_start_matches("scoped:"), kind, pct)
+        };
+        let windows = vec![
+            at("5h", WindowKind::Short, 100.0, 1_000),
+            at("7d", WindowKind::Long, 100.0, 9_000),
+            at("scoped:Fable", WindowKind::Scoped, 100.0, 50_000),
+            at("spend", WindowKind::Spend, 100.0, 70_000),
+        ];
+        assert_eq!(blocked_until(&windows, &[]), Some(9_000), "the later reset");
+        assert_eq!(
+            blocked_until(&windows, &models(&["fable"])),
+            Some(50_000),
+            "a scoped window the models name counts too"
+        );
+        let one_blocking = vec![
+            at("5h", WindowKind::Short, 100.0, 1_000),
+            at("7d", WindowKind::Long, 60.0, 9_000),
+        ];
+        assert_eq!(blocked_until(&one_blocking, &[]), Some(1_000));
+        assert_eq!(
+            blocked_until(&[win("5h", "5h", WindowKind::Short, 100.0)], &[]),
+            None
+        );
     }
 
     #[test]
