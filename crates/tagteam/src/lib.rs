@@ -6,6 +6,7 @@ use clap::{CommandFactory, Parser};
 
 pub mod app;
 pub mod cli;
+mod history;
 pub mod prompt;
 mod render;
 mod root_guard;

@@ -10,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use assert_cmd::Command;
 use serde_json::{Value, json};
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
+use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, ProviderId, Window, WindowKind};
+use tagteam_engine::store::{Reserve, Store};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::splice::replace_top_level;
 use tagteam_provider::{Env, FileKeychain, Keychain};
@@ -73,9 +75,9 @@ pub fn login(env: &Env, kc: &dyn Keychain, email: &str, org: &str, rt: &str) {
     .unwrap();
 }
 
-/// `a@x.co` at position 1 and `b@x.co` at position 2, both added through the binary with every
-/// endpoint offline (`std_cmd`'s default); `b` is live. Returns their ids.
-pub fn two_accounts(root: &Path) -> (String, String) {
+/// `a@x.co` at position 1 and `b@x.co` at position 2 (live), both added through the binary with
+/// every endpoint offline (`std_cmd`'s default).
+fn add_two_accounts(root: &Path) {
     let env = Env::for_test(root);
     let kc = FileKeychain::new(root.join("keychain"));
     seed_home(&env);
@@ -83,10 +85,78 @@ pub fn two_accounts(root: &Path) -> (String, String) {
     cmd(root).arg("add").assert().success();
     login(&env, &kc, "b@x.co", "", "rt-b");
     cmd(root).arg("add").assert().success();
+}
+
+/// The two accounts of `add_two_accounts`, with their ids read from `list`.
+pub fn two_accounts(root: &Path) -> (String, String) {
+    add_two_accounts(root);
     let out = cmd(root).args(["list", "--json"]).output().unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     let id = |i: usize| v["accounts"][i]["id"].as_str().unwrap().to_owned();
     (id(0), id(1))
+}
+
+/// The accounts of `two_accounts`, with the ids read from the store rather than from `list`.
+/// `list` collects usage, and with every endpoint offline it would record a failed fetch, and
+/// its backoff, before the test seeds its readings.
+pub fn two_fresh_accounts(root: &Path) -> (String, String) {
+    add_two_accounts(root);
+    let store = Store::open_existing(&Env::for_test(root).data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    let rows = store.accounts(&ProviderId::new(CLAUDE_CODE)).unwrap();
+    (
+        rows[0].id.as_str().to_owned(),
+        rows[1].id.as_str().to_owned(),
+    )
+}
+
+/// A window as a provider reports it, without provider detail.
+pub fn usage_window(
+    key: &str,
+    label: &str,
+    kind: WindowKind,
+    pct: f64,
+    resets_at: Option<i64>,
+    period_s: Option<i64>,
+) -> Window {
+    Window {
+        key: key.to_owned(),
+        label: label.to_owned(),
+        kind,
+        pct,
+        resets_at,
+        period_s,
+        detail: None,
+    }
+}
+
+/// Records `windows` as account `id`'s reading taken at `at_s`, through the store's own write
+/// path, as a fetch would: reserve (§8.3 phase 1), then record (phase 3), which writes
+/// `usage_state` and one `usage_samples` row per window. One account's readings go in time
+/// order, at least 180 s apart (the on-demand rule's minimum age).
+pub fn record_reading(root: &Path, id: &str, at_s: i64, windows: &[Window]) {
+    let store = Store::open_existing(&Env::for_test(root).data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    let row = store.account(&AccountId::from_string(id)).unwrap().unwrap();
+    let reservation = match store
+        .reserve_usage(&row, at_s * 1000, true, &PollBudget::STANDARD)
+        .unwrap()
+    {
+        Reserve::Reserved(r) => r,
+        other => panic!("no reservation for a reading at {at_s}: {other:?}"),
+    };
+    let plan = PollPlan {
+        interval_s: 300,
+        next_poll_at: at_s + 300,
+    };
+    assert!(
+        store
+            .record_usage(&reservation, windows, at_s, &plan, 180)
+            .unwrap(),
+        "the record was fenced out"
+    );
 }
 
 /// Rewrites account `id`'s vault copy so its access token expires `in_ms` from now: inside

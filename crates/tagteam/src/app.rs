@@ -25,7 +25,7 @@ use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
 
 use crate::cli::{Cli, Command};
 use crate::prompt::Prompter;
-use crate::{render, root_guard};
+use crate::{history, render, root_guard};
 
 /// §13.1.
 pub(crate) const EXIT_ERROR: i32 = 1;
@@ -38,6 +38,8 @@ const KIND_KEYCHAIN_LOCKED: &str = "keychain-locked";
 const KIND_CANCELLED: &str = "cancelled";
 const KIND_INVALID_INPUT: &str = "invalid-input";
 const KIND_UNMANAGED_ACCOUNT: &str = "unmanaged-account";
+/// The engine's kind for the same condition; the CLI raises it with its own message.
+const KIND_NO_LIVE_LOGIN: &str = "no-live-login";
 
 /// Appendix A.3. The default keychain is the login keychain, so the hint names its file.
 const UNLOCK_QUESTION: &str = "The login keychain is locked (common over SSH). Unlock it now?";
@@ -45,6 +47,10 @@ const KEYCHAIN_LOCKED: &str = "the login keychain is locked (common over SSH); r
 const CANCELLED: &str = "cancelled";
 const TOKEN_MISSING: &str = "pass the token as an argument, or `-` to read it from stdin";
 const ALIAS_USAGE: &str = "alias takes ACCOUNT NAME, ACCOUNT --unset, or no arguments";
+const NO_LIVE_LOGIN: &str =
+    "there is no live login; name an account, or log in with `claude` first";
+const CSV_AND_JSON: &str = "--csv and --json are two output formats; pass one";
+const BAD_SINCE: &str = "--since takes a span like 14d, 12h or 30m";
 
 /// Honoured only with the `test-support` feature: a release build never reads them.
 #[cfg(any(test, feature = "test-support"))]
@@ -560,6 +566,12 @@ impl App<'_, '_> {
                 );
                 self.print_account(&human, row, None);
             }
+            Command::History {
+                account,
+                window,
+                since,
+                csv,
+            } => self.history(account, window, &since, csv)?,
         }
         Ok(())
     }
@@ -709,6 +721,54 @@ impl App<'_, '_> {
             render::switch_json(&outcome, provider.as_str()),
         );
         Ok(())
+    }
+    /// §13.4: reads `usage_samples` only, so it never fetches. ACCOUNT defaults to the live
+    /// login's account; without `--window`, only the windows that count for switching show.
+    fn history(
+        &mut self,
+        account: Option<String>,
+        window: Option<String>,
+        since: &str,
+        csv: bool,
+    ) -> Result<(), Failure> {
+        if csv && self.json {
+            return Err(Failure::Usage(CSV_AND_JSON.into()));
+        }
+        let span = history::parse_since(since).ok_or_else(|| Failure::Usage(BAD_SINCE.into()))?;
+        let row = match &account {
+            Some(a) => self.resolve(a)?,
+            None => self.live_row()?,
+        };
+        let now_s = self.now_s();
+        let mut view =
+            self.engine
+                .history(&row.id, window.as_deref(), now_s.saturating_sub(span))?;
+        if window.is_none() {
+            history::keep_relevant(&mut view, &self.engine.settings().models);
+        }
+        if csv {
+            let _ = write!(self.io.out, "{}", history::csv(&view));
+        } else {
+            self.print(
+                &history::human(&view, since, now_s),
+                history::json(&view, row.provider.as_str()),
+            );
+        }
+        Ok(())
+    }
+
+    /// The live login's account, for a command whose ACCOUNT defaults to it.
+    fn live_row(&self) -> Result<AccountRow, Failure> {
+        match self.engine.status(&self.provider())? {
+            StatusView::Managed { account, .. } => Ok(account.row),
+            StatusView::Unmanaged { email } => Err(Failure::Message(
+                KIND_UNMANAGED_ACCOUNT,
+                format!(
+                    "the live login ({email}) is not managed by tagteam; name an account, or run `tagteam add` first"
+                ),
+            )),
+            StatusView::NoLogin => Err(Failure::Message(KIND_NO_LIVE_LOGIN, NO_LIVE_LOGIN.into())),
+        }
     }
 }
 
