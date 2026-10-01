@@ -192,10 +192,12 @@ impl Engine {
   merge-back (§12.4), which take no
   credential lock while holding it; taking a lone lock cannot invert the order. The auto-switch
   engine lock (§11.1) is outside the order altogether: it is only ever tried, never waited
-  for, and is held for an engine's lifetime. tagteam's settings lock (§6.4) and the log's
-  rotation lock (§14.2) are outside it too: each is taken alone, and nothing else is taken
-  while it is held. The displaced lock (§6.3) is a leaf, like CC's storage-write lock: it may
-  be taken under any other lock, and nothing is taken while it is held.
+  for, and is held for an engine's lifetime. tagteam's settings lock (§6.4) is outside it too:
+  it is taken alone, and nothing else is taken while it is held. The displaced lock (§6.3) is a
+  leaf, like CC's storage-write lock: it may be taken under any other lock, the storage-write
+  lock included, and nothing is taken while it is held. The log's rotation lock (§14.2) is only
+  ever tried, never waited for, and nothing is taken while it is held, so a log line may try it
+  under any lock; the rules above leave it out.
 - **No network while holding a contended lock.** There are two exceptions, both bounded:
   - the refresh gate holds the account lock across its token request (§7.3, 10 s), which is
     what makes it single-flight;
@@ -1168,7 +1170,9 @@ write or delete of a CC credential entry: the OAuth entry (Keychain item or
 recovery (§9.6), the active-token refresh's live write (§7.5) and profile bootstrap (§12.3).
 - It is a leaf lock. It is taken only while the credential locks are held (for a profile, the
   profile's own), held around one entry's write, and never across a network call; no other
-  lock is taken while it is held. Its wait is a cancellation point (§14.1).
+  lock is taken while it is held, except the displaced lock (§6.3), itself a leaf, when a
+  Keychain fallback displaces the entry it is about to delete (§9.4 step 7). Its wait is a
+  cancellation point (§14.1).
 - Under it, the entry is read again. Its account-scoped keys must still equal what the writer
   last read or wrote under the credential locks; otherwise the write aborts, and a switch rolls
   back. CC changes those keys under the credential locks only by refreshing. Outside them it
