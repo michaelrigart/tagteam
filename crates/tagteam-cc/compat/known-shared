@@ -1,0 +1,17 @@
+# Top-level entries of ~/.claude that tagteam shares between profiles (spec 12.2).
+#
+# Format, for this file and known-private: one entry per line; blank lines and
+# lines starting with '#' are ignored. An entry is a bare file or directory name,
+# with no trailing '/', so a directory is listed as "projects", not "projects/".
+# Names compare exactly; an entry containing '*' is a glob matched against the
+# whole name. No path separators.
+projects
+history.jsonl
+CLAUDE.md
+settings.json
+keybindings.json
+skills
+agents
+commands
+plugins
+todos
