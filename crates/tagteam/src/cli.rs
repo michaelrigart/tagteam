@@ -76,6 +76,26 @@ pub enum Command {
     },
     /// Move an account to POSITION, swapping if it is taken
     Move { account: String, position: u32 },
+    /// Usage history: burn rate, and when each window runs out
+    ///
+    /// Reads the stored samples only; it never fetches. With no ACCOUNT it shows the live
+    /// login's account, and with no --window the windows that count for switching. --json
+    /// prints {schemaVersion, provider, account: {number, id, email}, windows: [{key, label,
+    /// kind, pct, resetsAt, samples: [{fetchedAt, pct, resetsAt}], ratePerHour, expectedPct,
+    /// aheadOfPace, projectedExhaustionAt, willLastToReset, projectionMethod}]}, with times in
+    /// ISO 8601 UTC.
+    History {
+        account: Option<String>,
+        /// One window: 5h, 7d, spend, or a model name
+        #[arg(long)]
+        window: Option<String>,
+        /// How far back: 14d, 12h or 30m
+        #[arg(long, default_value = "7d")]
+        since: String,
+        /// Print the raw samples as CSV
+        #[arg(long)]
+        csv: bool,
+    },
 }
 
 impl Command {
