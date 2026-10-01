@@ -22,7 +22,7 @@ pub enum RunResult {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
-    /// The process did not finish in time: it hung and was killed, or it exited but never
+    /// The process did not finish in time: it hung (and was killed if it could be), or it exited but never
     /// closed its output pipes within the grace period.
     TimedOut,
     SpawnFailed(String),
@@ -368,10 +368,7 @@ fn describe(r: &RunResult) -> (Option<i32>, String) {
         ),
         RunResult::TimedOut => (
             None,
-            format!(
-                "security did not finish in time (it hung or kept its output open); gave up after {} s",
-                TIMEOUT.as_secs()
-            ),
+            "security did not finish in time (it hung or kept its output open)".to_owned(),
         ),
         RunResult::SpawnFailed(e) => (None, format!("could not run security: {e}")),
     }
@@ -766,7 +763,7 @@ mod tests {
         assert!(matches!(k.find("s", "a"), Read::Absent));
         assert!(matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("rc 36")));
         assert!(
-            matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("did not finish in time"))
+            matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("did not finish in time") && !e.detail.contains("gave up") && !e.detail.contains(" s"))
         );
         assert!(matches!(k.find("s", "a"), Read::Unreadable(_)));
         assert!(matches!(k.find("s", "a"), Read::Unreadable(e) if e.detail.contains("rc 1")));
