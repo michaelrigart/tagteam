@@ -30,6 +30,8 @@ use crate::{history, render, root_guard, statusline};
 /// §13.1.
 pub(crate) const EXIT_ERROR: i32 = 1;
 pub(crate) const EXIT_USAGE: i32 = 2;
+/// §13.1: an interrupted command exits 128 + the signal (130 after SIGINT).
+const EXIT_SIGNAL_BASE: i32 = 128;
 
 /// `error.type` kinds the CLI raises itself; the engine's come from `EngineError::kind`.
 pub(crate) const KIND_USAGE: &str = "usage";
@@ -42,11 +44,14 @@ const KIND_UNMANAGED_ACCOUNT: &str = "unmanaged-account";
 const KIND_NO_LIVE_LOGIN: &str = "no-live-login";
 /// A provider without the capability a command needs (§4.5).
 const KIND_UNSUPPORTED: &str = "unsupported";
+/// §14.1, Decision 4: every interruption, whichever carrier holds its signal.
+pub(crate) const KIND_INTERRUPTED: &str = "interrupted";
 
 /// Appendix A.3. The default keychain is the login keychain, so the hint names its file.
 const UNLOCK_QUESTION: &str = "The login keychain is locked (common over SSH). Unlock it now?";
 const KEYCHAIN_LOCKED: &str = "the login keychain is locked (common over SSH); run `security unlock-keychain ~/Library/Keychains/login.keychain-db`, then retry";
 const CANCELLED: &str = "cancelled";
+const INTERRUPTED: &str = "interrupted";
 const TOKEN_MISSING: &str = "pass the token as an argument, or `-` to read it from stdin";
 const ALIAS_USAGE: &str = "alias takes ACCOUNT NAME, ACCOUNT --unset, or no arguments";
 const NO_LIVE_LOGIN: &str =
@@ -292,16 +297,56 @@ struct App<'a, 'b> {
     io: &'a mut Io<'b>,
 }
 
+/// How a command ended (§13.1, §14.1).
+enum Ended {
+    /// It finished with this exit code; its output, and any error, are written.
+    Code(i32),
+    /// It stopped at a cancellation point after this signal; nothing is reported yet.
+    Interrupted(i32),
+}
+
+/// Runs one command and returns its exit code (§13.1). A signal the command met at a
+/// cancellation point ends it with 128 + the signal and the `interrupted` error (Decision 4);
+/// one it never met leaves its output and exit code alone and is reported on stderr as too
+/// late (Decision 6).
 pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
+    let json = cli.json;
+    let name = cli.command.as_ref().map_or("list", command_name);
+    let cancel = ctx.env.cancel.clone();
+    match run_command(cli, ctx, io) {
+        Ended::Interrupted(signal) => {
+            fail(io, json, KIND_INTERRUPTED, INTERRUPTED);
+            EXIT_SIGNAL_BASE + signal
+        }
+        Ended::Code(code) => {
+            if cancel.requested().is_some() {
+                let _ = writeln!(
+                    io.err,
+                    "tagteam: interrupted too late to stop: {name} had already finished"
+                );
+            }
+            code
+        }
+    }
+}
+
+fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     let color = !cli.no_color && !ctx.no_color_env;
     init_logging(cli.debug, color);
     let json = cli.json;
     if let Err(msg) = root_guard::refuse_root() {
-        return fail(io, json, KIND_ROOT, &msg);
+        return Ended::Code(fail(io, json, KIND_ROOT, &msg));
     }
     // §13.5: the status bar's fast path, before anything else is built.
     if let Some(Command::Statusline { print_config }) = &cli.command {
-        return run_statusline(ctx, io, json, cli.no_color, cli.provider, *print_config);
+        return Ended::Code(run_statusline(
+            ctx,
+            io,
+            json,
+            cli.no_color,
+            cli.provider,
+            *print_config,
+        ));
     }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
@@ -328,7 +373,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     };
     if let Some(p) = &app.provider_flag {
         if let Err(e) = app.engine.provider(p) {
-            return fail(app.io, json, e.kind(), &e.to_string());
+            return Ended::Code(fail(app.io, json, e.kind(), &e.to_string()));
         }
     }
     // Only a command that touches a Keychain item checks its lock.
@@ -339,13 +384,34 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     };
     let result = unlocked.and_then(|()| app.dispatch(command));
     match result {
-        Ok(()) => 0,
-        Err(Failure::Engine(e)) => fail(app.io, json, e.kind(), &e.to_string()),
-        Err(Failure::Message(kind, m)) => fail(app.io, json, kind, &m),
+        Ok(()) => Ended::Code(0),
+        Err(Failure::Engine(e)) => match e.signal() {
+            Some(signal) => Ended::Interrupted(signal),
+            None => Ended::Code(fail(app.io, json, e.kind(), &e.to_string())),
+        },
+        Err(Failure::Message(kind, m)) => Ended::Code(fail(app.io, json, kind, &m)),
         Err(Failure::Usage(m)) => {
             fail(app.io, json, KIND_USAGE, &m);
-            EXIT_USAGE
+            Ended::Code(EXIT_USAGE)
         }
+    }
+}
+
+/// The command's name in its canonical spelling, for the late notice (Decision 6).
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::List => "list",
+        Command::Status => "status",
+        Command::Switch { .. } => "switch",
+        Command::Add { .. } => "add",
+        Command::AddToken { .. } => "add-token",
+        Command::Remove { .. } => "remove",
+        Command::Disable { .. } => "disable",
+        Command::Enable { .. } => "enable",
+        Command::Alias { .. } => "alias",
+        Command::Move { .. } => "move",
+        Command::History { .. } => "history",
+        Command::Statusline { .. } => "statusline",
     }
 }
 
@@ -434,6 +500,15 @@ impl App<'_, '_> {
         !self.json && self.io.prompter.interactive()
     }
 
+    /// §14.1, Decision 5: a prompt is a cancellation point. One a signal cut short has
+    /// answered as a decline, but whatever it answered, the command stops here, interrupted.
+    fn after_prompt(&self) -> Result<(), Failure> {
+        match self.engine.cancel().requested() {
+            Some(signal) => Err(EngineError::Interrupted(signal).into()),
+            None => Ok(()),
+        }
+    }
+
     fn print(&mut self, human: &str, json: Value) {
         if self.json {
             let _ = writeln!(self.io.out, "{json}");
@@ -453,20 +528,23 @@ impl App<'_, '_> {
     /// whose own collection errored is one of them), and its error should collecting fail
     /// before any account starts (the store cannot be opened), go to stderr. With nothing to
     /// collect nothing is opened, so `list` on a fresh machine still creates nothing (§5).
-    fn collect(&mut self, accounts: Vec<AccountId>) {
+    /// An interrupted collection is the command's interruption (§14.1), never a warning.
+    fn collect(&mut self, accounts: Vec<AccountId>) -> Result<(), Failure> {
         if accounts.is_empty() {
-            return;
+            return Ok(());
         }
         let warnings = match self
             .engine
             .collect_usage(CollectMode::OnDemand { accounts })
         {
             Ok(report) => report.warnings,
+            Err(e) if e.signal().is_some() => return Err(e.into()),
             Err(e) => vec![format!("usage was not collected: {e}")],
         };
         for w in warnings {
             let _ = writeln!(self.io.err, "warning: {w}");
         }
+        Ok(())
     }
 
     /// Now, in epoch seconds, by the engine's clock: what countdowns and ages count from.
@@ -508,9 +586,18 @@ impl App<'_, '_> {
         if keychain.lock_state() != LockState::Locked {
             return Ok(());
         }
-        if self.can_prompt() && self.io.prompter.confirm(UNLOCK_QUESTION, true) && keychain.unlock()
-        {
-            return Ok(());
+        if self.can_prompt() {
+            let yes = self.io.prompter.confirm(UNLOCK_QUESTION, true);
+            self.after_prompt()?;
+            // macOS asks for the password on the terminal: a Ctrl-C there ends `security`,
+            // which shares tagteam's process group (§14.1), and the command with it.
+            if yes {
+                let unlocked = keychain.unlock();
+                self.after_prompt()?;
+                if unlocked {
+                    return Ok(());
+                }
+            }
         }
         Err(Failure::Message(
             KIND_KEYCHAIN_LOCKED,
@@ -527,9 +614,9 @@ impl App<'_, '_> {
                     .iter()
                     .map(|r| format!("{} #{} {}", r.provider, r.position, render::name(r)))
                     .collect();
-                self.io
-                    .prompter
-                    .choose("Which account?", &labels)
+                let choice = self.io.prompter.choose("Which account?", &labels);
+                self.after_prompt()?;
+                choice
                     .and_then(|i| found.get(i).cloned())
                     .ok_or_else(cancelled)
             }
@@ -547,7 +634,7 @@ impl App<'_, '_> {
                     .iter()
                     .flat_map(|l| l.accounts.iter().map(|v| v.row.id.clone()))
                     .collect();
-                self.collect(ids);
+                self.collect(ids)?;
                 let lists = self.engine.accounts(self.provider_flag.as_ref())?;
                 let (now_s, color) = (self.now_s(), self.color());
                 let engine = &self.engine;
@@ -564,7 +651,7 @@ impl App<'_, '_> {
                 let provider = self.provider();
                 // §8.3: `status` collects the live account only.
                 if let StatusView::Managed { account, .. } = self.engine.status(&provider)? {
-                    self.collect(vec![account.row.id]);
+                    self.collect(vec![account.row.id])?;
                 }
                 let s = self.engine.status(&provider)?;
                 let (now_s, color) = (self.now_s(), self.color());
@@ -701,7 +788,11 @@ impl App<'_, '_> {
                 Ok(line)
             }
             Some(t) => Ok(t),
-            None if self.can_prompt() => self.io.prompter.secret("Token: ").ok_or_else(cancelled),
+            None if self.can_prompt() => {
+                let token = self.io.prompter.secret("Token: ");
+                self.after_prompt()?;
+                token.ok_or_else(cancelled)
+            }
             None => Err(Failure::Message(KIND_INVALID_INPUT, TOKEN_MISSING.into())),
         }
     }
@@ -752,7 +843,9 @@ impl App<'_, '_> {
         match write(&self.engine, yes) {
             Err(EngineError::NeedsConfirmation { position, occupant }) if self.can_prompt() => {
                 let question = format!("Position {position} holds {occupant}. Replace it?");
-                if !self.io.prompter.confirm(&question, false) {
+                let yes = self.io.prompter.confirm(&question, false);
+                self.after_prompt()?;
+                if !yes {
                     return Err(cancelled());
                 }
                 Ok(write(&self.engine, true)?)
@@ -807,11 +900,12 @@ impl App<'_, '_> {
                     ),
                 ));
             }
-            if !self
+            let add = self
                 .io
                 .prompter
-                .confirm(&format!("Add the current login ({email}) first?"), true)
-            {
+                .confirm(&format!("Add the current login ({email}) first?"), true);
+            self.after_prompt()?;
+            if !add {
                 return Err(cancelled());
             }
             // With no store, `lock_check` ran no check for this `switch`, and adding reads the
@@ -946,5 +1040,40 @@ mod tests {
         let failed = Err(EngineError::Io(std::io::Error::other("store went away")));
         assert!(!or_inactive(failed, 1, &id));
         assert!(or_inactive(Ok(true), 1, &id));
+    }
+
+    #[test]
+    fn the_late_notice_names_each_command_as_it_is_typed() {
+        use clap::Parser;
+        let cases: [&[&str]; 14] = [
+            &["list"],
+            &["ls"],
+            &["status"],
+            &["switch"],
+            &["add"],
+            &["add-token", "x"],
+            &["remove", "1"],
+            &["rm", "1"],
+            &["disable", "1"],
+            &["enable", "1"],
+            &["alias"],
+            &["move", "1", "2"],
+            &["history"],
+            &["statusline"],
+        ];
+        for args in cases {
+            let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))
+                .unwrap();
+            let expected = match args[0] {
+                "ls" => "list",
+                "rm" => "remove",
+                typed => typed,
+            };
+            assert_eq!(
+                command_name(cli.command.as_ref().unwrap()),
+                expected,
+                "{args:?}"
+            );
+        }
     }
 }
