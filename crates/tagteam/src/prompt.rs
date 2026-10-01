@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ impl TtyPrompter {
             return None;
         }
         ask(text);
-        let read = open_terminal(&terminal_path()).and_then(|tty| read_line(&tty, &self.cancel));
+        let read = open_prompt_terminal().and_then(|tty| read_line(&tty, &self.cancel));
         // The terminal echoed no newline when the prompt was cut short or could not be read.
         if matches!(read, Ok(LineRead::Interrupted) | Err(_)) {
             ask("\n");
@@ -63,6 +63,19 @@ fn open_terminal(path: &Path) -> io::Result<File> {
         .write(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)
+}
+
+/// `open_terminal` on `path`, else on `fallback`: the device a stream names may not be ours to
+/// open (after `su` in the same pty it is `crw--w----`, EACCES), where `/dev/tty` still is.
+/// The first error is the one reported.
+fn open_terminal_or(path: &Path, fallback: &Path) -> io::Result<File> {
+    open_terminal(path).or_else(|e| open_terminal(fallback).map_err(|_| e))
+}
+
+/// The terminal a prompt opens: stdin's or stderr's device by name, else `/dev/tty`
+/// (`open_terminal_or`).
+fn open_prompt_terminal() -> io::Result<File> {
+    open_terminal_or(&terminal_path(), Path::new(TERMINAL))
 }
 
 /// The terminal device `fd` is, by its name (`/dev/ttys003`, `/dev/pts/3`), if it is one.
@@ -98,35 +111,37 @@ fn terminal_path() -> PathBuf {
 /// How long one `poll(2)` waits before the token is looked at again (Decision 5).
 const SLICE_MS: libc::c_int = 100;
 
-/// Waits until `input` has something to read, or until `cancel` holds a signal: `true` to go on
-/// and read, `false` when interrupted. The handler restarts interrupted syscalls (Decision 2),
-/// so a blocked read would never notice the signal; `poll(2)` in 100 ms slices, with the token
-/// looked at between them, does. Only `POLLIN` counts as ready (a closed peer reports it too, so
-/// the read that follows sees the end). A poll that returns at once for any other reason sleeps
-/// out its slice instead. Readiness is only a hint (`read_line_between`).
-fn wait_for_input(input: BorrowedFd<'_>, cancel: &Cancel) -> bool {
+/// Waits until `input` (an open descriptor, or a number poll reports as `POLLNVAL`) has
+/// something to read, or until `cancel` holds a signal: `true` to go on and read, `false` when
+/// interrupted. The handler restarts interrupted syscalls (Decision 2), so a blocked read would
+/// never notice the signal; `poll(2)` in 100 ms slices, with the token looked at between them,
+/// does. Readiness is only a hint, and the read that follows is non-blocking (`read_line_between`).
+/// `POLLIN` is ready at once (a closed peer reports it too, so the read sees the end). A poll
+/// that returns at once for any other reason (`POLLNVAL`, a hang-up or an error with nothing to
+/// read, a failure other than EINTR) sleeps out its slice first, so the loop never spins, and
+/// then reports ready as well: the read decides. `WouldBlock` goes round again, one read per
+/// slice; end of input and a read error decline.
+fn wait_for_input(input: RawFd, cancel: &Cancel) -> bool {
     loop {
         if cancel.requested().is_some() {
             return false;
         }
         let mut fds = libc::pollfd {
-            fd: input.as_raw_fd(),
+            fd: input,
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: `fds` is one valid, writable `pollfd` for the duration of the call, and
-        // `input` keeps its descriptor open for at least as long.
+        // SAFETY: `fds` is one valid, writable `pollfd` for the duration of the call; poll(2)
+        // takes any descriptor number and reports one that is not open as POLLNVAL.
         let ready = unsafe { libc::poll(&mut fds, 1, SLICE_MS) };
         if ready > 0 && fds.revents & libc::POLLIN != 0 {
             return true;
         }
-        // A poll that returned at once without input (POLLNVAL, or a hang-up or an error with
-        // nothing to read) or failed (other than EINTR) must not become a busy loop: sleep out
-        // the slice, looking at the token between slices.
         let returned_early = ready > 0
             || (ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted);
         if returned_early {
             std::thread::sleep(std::time::Duration::from_millis(SLICE_MS as u64));
+            return cancel.requested().is_none();
         }
     }
 }
@@ -177,7 +192,7 @@ fn read_line_between(
 ) -> io::Result<LineRead> {
     let (mut line, mut chunk, mut reader) = (Vec::new(), [0u8; 256], tty);
     loop {
-        if !wait_for_input(tty.as_fd(), cancel) {
+        if !wait_for_input(tty.as_raw_fd(), cancel) {
             discard_input(tty.as_fd());
             return Ok(LineRead::Interrupted);
         }
@@ -338,7 +353,7 @@ impl Prompter for TtyPrompter {
         if self.cancel.requested().is_some() {
             return None;
         }
-        let tty = open_terminal(&terminal_path()).ok()?;
+        let tty = open_prompt_terminal().ok()?;
         let _ = (&tty).write_all(question.as_bytes());
         let read = read_secret(&tty, &self.cancel);
         let _ = (&tty).write_all(b"\n");
@@ -414,7 +429,7 @@ mod tests {
         let started = Instant::now();
         let setter = set_after(&cancel, Duration::from_millis(150), libc::SIGINT);
         assert!(
-            !wait_for_input(quiet.as_fd(), &cancel),
+            !wait_for_input(quiet.as_raw_fd(), &cancel),
             "interrupted, not ready"
         );
         let waited = started.elapsed();
@@ -432,16 +447,18 @@ mod tests {
         let cancel = Cancel::new();
         cancel.request(libc::SIGTERM);
         let started = Instant::now();
-        assert!(!wait_for_input(quiet.as_fd(), &cancel));
+        assert!(!wait_for_input(quiet.as_raw_fd(), &cancel));
         assert!(started.elapsed() < Duration::from_millis(50));
     }
 
     /// A descriptor number that is not open, for a poll that answers `POLLNVAL` at once, as
-    /// macOS's does on `/dev/tty`. Taken well above any descriptor another test opens, so it
-    /// cannot be reused meanwhile.
+    /// macOS's does on `/dev/tty`. A duplicate of a descriptor this test owns, taken well above
+    /// any descriptor another test opens and closed right away, so nothing else holds the
+    /// number meanwhile. It stays a bare number: no `BorrowedFd` or `OwnedFd` ever names it.
     fn closed_fd() -> libc::c_int {
-        // SAFETY: F_DUPFD on fd 0 only allocates a new descriptor, which is closed right after.
-        let fd = unsafe { libc::fcntl(0, libc::F_DUPFD, 500) };
+        let (own, _peer) = UnixStream::pair().unwrap();
+        // SAFETY: F_DUPFD only allocates a new descriptor, which is closed right after.
+        let fd = unsafe { libc::fcntl(own.as_raw_fd(), libc::F_DUPFD, 500) };
         assert!(fd >= 500, "{}", io::Error::last_os_error());
         // SAFETY: `fd` was just opened here and nothing else owns it.
         unsafe { libc::close(fd) };
@@ -449,22 +466,37 @@ mod tests {
     }
 
     #[test]
-    fn a_poll_that_returns_at_once_without_input_never_spins_and_never_reads_as_ready() {
+    fn a_poll_that_returns_at_once_without_input_never_spins_and_then_lets_the_read_decide() {
         // macOS's poll(2) answers POLLNVAL at once on /dev/tty. Taking that for readiness made
         // every prompt a busy loop: the read said WouldBlock, and the loop came straight back.
+        // Now the wait sleeps out its slice and reports ready, so the non-blocking read decides
+        // (WouldBlock goes round again, one read per slice; end of input and errors decline).
         let fd = closed_fd();
-        // SAFETY: the descriptor is only passed to poll(2), which reports a closed one as
-        // POLLNVAL without touching anything.
-        let closed = unsafe { BorrowedFd::borrow_raw(fd) };
         let cancel = Cancel::new();
-        let setter = set_after(&cancel, Duration::from_millis(250), libc::SIGINT);
         let started = Instant::now();
-        assert!(!wait_for_input(closed, &cancel), "never ready");
+        assert!(wait_for_input(fd, &cancel), "ready, for the read to decide");
         let waited = started.elapsed();
-        setter.join().unwrap();
         assert!(
-            waited >= Duration::from_millis(250) && waited < Duration::from_millis(700),
-            "it slept in slices until the signal: {waited:?}"
+            waited >= Duration::from_millis(SLICE_MS as u64 - 5)
+                && waited < Duration::from_millis(400),
+            "no sooner than about one slice: {waited:?}"
+        );
+        // A signal during that sleep is still seen at once: interrupted, not ready.
+        let setter = set_after(&cancel, Duration::from_millis(30), libc::SIGINT);
+        assert!(!wait_for_input(fd, &cancel), "the token is looked at again");
+        setter.join().unwrap();
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_be_opened_by_name_falls_back_to_the_generic_one() {
+        // `su` in the same pty leaves the device `crw--w----`, so opening it by name is EACCES.
+        let pty = pty();
+        let gone = Path::new("/nonexistent/ttys999");
+        assert!(open_terminal(gone).is_err());
+        assert!(open_terminal_or(gone, &pty.path).is_ok());
+        assert!(
+            open_terminal_or(gone, gone).is_err(),
+            "both failing is an error"
         );
     }
 
@@ -492,11 +524,11 @@ mod tests {
     fn input_ready_or_closed_ends_the_wait_and_the_read_decides() {
         let (ready, mut writer) = UnixStream::pair().unwrap();
         writer.write_all(b"y\n").unwrap();
-        assert!(wait_for_input(ready.as_fd(), &Cancel::new()));
+        assert!(wait_for_input(ready.as_raw_fd(), &Cancel::new()));
         let (closed, writer) = UnixStream::pair().unwrap();
         drop(writer);
         assert!(
-            wait_for_input(closed.as_fd(), &Cancel::new()),
+            wait_for_input(closed.as_raw_fd(), &Cancel::new()),
             "end of input: the read sees it and declines"
         );
     }
