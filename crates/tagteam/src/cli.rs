@@ -106,9 +106,12 @@ pub enum Command {
 
 impl Command {
     /// Whether the command reads or writes a Keychain item on macOS, and so runs the lock check
-    /// first (Appendix A.3). The rest are served from the store and `~/.claude.json`. A
-    /// recovery under their mutation lock (Task 21) only reads the Keychain, tri-state, and
-    /// leaves what it cannot decide to the next command that checks.
+    /// first (Appendix A.3). `list` and `status` are not among them although they collect usage
+    /// and may read Keychain items: by a plan ruling they degrade to `keychain_unavailable`
+    /// rows rather than run the lock check, so a script gets rows, not a `keychain-locked`
+    /// failure. `history` and `statusline` read only the store and `~/.claude.json`, and the
+    /// rest need no Keychain item. A recovery under their mutation lock (Task 21) only reads the
+    /// Keychain, tri-state, and leaves what it cannot decide to the next command that checks.
     pub fn touches_keychain(&self) -> bool {
         matches!(
             self,
