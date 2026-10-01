@@ -165,8 +165,20 @@ impl Keychain for FakeKeychain {
             None => Read::Absent,
         }
     }
+    /// Attributes only, as `security find-generic-password` without `-w` or `-g` reads them:
+    /// rc 0 when the item is there and rc 44 when it is not, locked or not (L342). Only an
+    /// item marked unreadable fails, which is how a test injects a failing `exists`.
     fn exists(&self, s: &str, a: &str) -> Read<()> {
-        self.find(s, a).map(|_| ())
+        if self.unreadable.lock().unwrap().contains(&key(s, a)) {
+            return Read::Unreadable(ReadError::new(
+                "keychain",
+                "rc 1: injected failure reading the item's attributes",
+            ));
+        }
+        match self.get(s, a) {
+            Some(_) => Read::Present(()),
+            None => Read::Absent,
+        }
     }
     fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), KeychainError> {
         if self.locked.load(Ordering::SeqCst) {
@@ -246,8 +258,13 @@ impl Keychain for FileKeychain {
             Err(e) => Read::Unreadable(ReadError::new("keychain", e.to_string())),
         }
     }
+    /// Attributes only, locked or not, like `FakeKeychain::exists` (L342).
     fn exists(&self, s: &str, a: &str) -> Read<()> {
-        self.find(s, a).map(|_| ())
+        match std::fs::metadata(self.path(s, a)) {
+            Ok(_) => Read::Present(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Read::Absent,
+            Err(e) => Read::Unreadable(ReadError::new("keychain", e.to_string())),
+        }
     }
     fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), KeychainError> {
         if self.locked() {
@@ -305,12 +322,33 @@ mod tests {
         k.set_fail_delete("s", true);
         assert!(k.delete("s", "a").is_err());
         k.set_locked(true);
-        assert!(matches!(k.exists("s", "a"), Read::Unreadable(_)));
+        // L342: `exists` reads attributes only, which `security` answers without an unlock.
+        assert!(k.exists("s", "a").is_present());
+        assert!(matches!(k.find("s", "a"), Read::Unreadable(_)));
         k.set_locked(false);
         k.set_fail_delete("s", false);
         k.delete("s", "a").unwrap();
         k.delete("s", "a").unwrap();
         assert!(matches!(k.find("s", "a"), Read::Absent));
+    }
+
+    #[test]
+    fn fake_exists_answers_present_or_absent_even_when_locked() {
+        // L342: real `security find-generic-password` (no -w, no -g) gives rc 0 or rc 44
+        // whether or not the keychain is locked; engine tests must follow reality.
+        let k = FakeKeychain::new();
+        k.put("s", "a", b"v");
+        k.set_locked(true);
+        assert!(k.exists("s", "a").is_present());
+        assert!(matches!(k.exists("s", "missing"), Read::Absent));
+        assert!(
+            matches!(k.find("s", "a"), Read::Unreadable(_)),
+            "the secret still needs it"
+        );
+        // An item marked unreadable is still the way a test injects a failing `exists`.
+        k.set_locked(false);
+        k.set_unreadable("s", "a", true);
+        assert!(matches!(k.exists("s", "a"), Read::Unreadable(_)));
     }
 
     #[test]
@@ -349,5 +387,11 @@ mod tests {
         assert!(k.upsert("x", "y", b"z").is_err());
         assert_eq!(k.lock_state(), LockState::Locked);
         assert!(!k.unlock());
+        // L342: attributes need no unlock.
+        assert!(
+            k.exists("Claude Code-credentials", "me").is_present(),
+            "present while locked"
+        );
+        assert!(matches!(k.exists("nope", "me"), Read::Absent));
     }
 }
