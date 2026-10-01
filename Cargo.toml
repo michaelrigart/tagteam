@@ -25,6 +25,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 sha2 = "0.10"
 thiserror = "2"
+# config.toml (§6.4): read in M2b, written in M5; preserves comments and formatting.
+toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Blocking HTTP over rustls with the OS trust store (§4.4); no async runtime. Held to one
