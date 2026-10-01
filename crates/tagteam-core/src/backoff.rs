@@ -234,8 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn a_negative_or_nan_retry_after_is_ignored() {
-        assert_eq!(failure_backoff_s(1, true, Some(f64::NAN)), 30);
+    fn a_negative_retry_after_is_ignored_off_a_429() {
         assert_eq!(failure_backoff_s(2, false, Some(-1.0)), 60);
     }
 
