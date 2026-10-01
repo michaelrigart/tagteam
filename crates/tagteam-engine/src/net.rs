@@ -32,9 +32,13 @@ fn system_resolver(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 /// restarts it), and `ureq` surfaces that as an I/O error. Mapped to `Ambiguous`, it would
 /// discard a reply the server already sent to a token refresh a stopped holder was waiting on.
 /// This wraps the outermost transport, above TLS, and retries only the interrupted read with
-/// what is left of its timeout: no byte was consumed, and the request is never re-sent.
+/// what is left of its timeout: no byte was consumed, and the request is never re-sent. A
+/// timeout already spent still gets `LAST_LOOK`, enough to take a reply that arrived while the
+/// process was stopped; `ureq` would turn a zero into a full second.
 #[derive(Debug)]
 struct ResumeInterruptedRead;
+
+const LAST_LOOK: Duration = Duration::from_millis(1);
 
 impl<In: Transport> Connector<In> for ResumeInterruptedRead {
     type Out = ResumingTransport<In>;
@@ -67,7 +71,9 @@ impl<T: Transport> Transport for ResumingTransport<T> {
             match self.0.await_input(next) {
                 Err(ureq::Error::Io(e)) if e.kind() == io::ErrorKind::Interrupted => {
                     next.after = match timeout.after {
-                        WaitFor::Exact(d) => WaitFor::Exact(d.saturating_sub(started.elapsed())),
+                        WaitFor::Exact(d) => {
+                            WaitFor::Exact(d.saturating_sub(started.elapsed()).max(LAST_LOOK))
+                        }
                         WaitFor::NotHappening => WaitFor::NotHappening,
                     };
                 }
@@ -363,14 +369,22 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_read_past_its_deadline_is_retried_with_zero() {
-        let mut t = ResumingTransport(Scripted::new([Err(io::ErrorKind::Interrupted), Ok(false)]));
+    fn an_interrupted_read_past_its_deadline_only_takes_a_last_look() {
+        let mut t = ResumingTransport(Scripted::new([
+            Err(io::ErrorKind::Interrupted),
+            Err(io::ErrorKind::Interrupted),
+            Ok(true),
+        ]));
         let timeout = NextTimeout {
-            after: WaitFor::from_millis(0),
+            after: WaitFor::from_millis(1),
             reason: Timeout::RecvResponse,
         };
-        assert!(!t.await_input(timeout).unwrap());
-        assert_eq!(t.0.timeouts, vec![timeout, timeout]);
+        assert!(t.await_input(timeout).unwrap());
+        let last_look = NextTimeout {
+            after: WaitFor::Exact(LAST_LOOK),
+            ..timeout
+        };
+        assert_eq!(t.0.timeouts, vec![timeout, last_look, last_look]);
     }
 
     #[test]
