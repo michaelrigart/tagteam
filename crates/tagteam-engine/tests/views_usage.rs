@@ -409,6 +409,25 @@ fn the_retry_is_the_later_of_the_backoff_and_the_next_planned_poll() {
 }
 
 #[test]
+fn a_clock_skewed_plan_is_not_a_plan_in_force_for_trust() {
+    // A 600 s-old reading with no failure, no lease and no recent 429 is decision-grade only
+    // while a poll is planned. A `next_poll_at` a day ahead (a clock that ran ahead, then was
+    // corrected) is skew, as `reserve_usage` treats it (§8.4), so it extends nothing; a legal
+    // plan still does.
+    let fx = Fx::new();
+    let legal = fx.add("a@x.co", "rt-a");
+    let skewed = fx.add("b@x.co", "rt-b");
+    record(&fx, &legal, &reading(T0, 9.0, 40.0), T0, T0 + 1_200);
+    record(&fx, &skewed, &reading(T0, 9.0, 40.0), T0, T0 + 86_400);
+    at(&fx, T0 + 600);
+    assert!(usage_of(&fx.engine, &legal).decision_grade, "a legal plan");
+    assert!(
+        !usage_of(&fx.engine, &skewed).decision_grade,
+        "a skewed plan is no plan"
+    );
+}
+
+#[test]
 fn a_retry_time_the_reserve_rule_ignores_as_clock_skew_is_not_shown() {
     // A `next_poll_at` a day ahead (a clock that ran ahead, then was corrected) is ignored by
     // `reserve_usage` (§8.4), so it is no retry time either: the backoff 20 s ahead is.

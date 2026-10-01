@@ -307,7 +307,11 @@ impl Engine {
                 } else {
                     0
                 },
-                plan_in_force: retried && state.next_poll_at.is_some_and(|at| at > now_s),
+                // A plan further out than any legal one is clock skew (§8.4), not a plan.
+                plan_in_force: retried
+                    && state
+                        .next_poll_at
+                        .is_some_and(|at| at > now_s && !plan_is_skewed(at, now_s, budget)),
                 live_lease: store.usage_lease_live(&row.id, now_ms)?,
                 last_429_at: state.last_429_at,
                 earliest_relevant_reset: reset,
