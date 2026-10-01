@@ -86,11 +86,12 @@ where
         let stdin = std::io::stdin();
         statusline::drain(stdin.lock(), stdin.is_terminal());
     }
-    let mut prompter = prompt::TtyPrompter;
+    let ctx = app::Context::from_process();
+    let mut prompter = prompt::TtyPrompter::new(ctx.env.cancel.clone());
     let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
     app::run(
         cli,
-        app::Context::from_process(),
+        ctx,
         &mut app::Io {
             out: &mut out,
             err: &mut err,
