@@ -348,6 +348,40 @@ fn a_quarantined_target_works_until_its_access_token_expires() {
 }
 
 #[test]
+fn a_strike_on_the_live_account_after_planning_holds_while_its_live_credential_is_bound() {
+    // Another process's gate quarantines b, the live account, after this forced self-switch
+    // has planned on b's unquarantined row and before this switch's own gate runs. b's vault
+    // has moved on, but the live credential is still the generation the strike is bound to
+    // (§7.4), so the gate must not release it: it reports Dead, and the direct switch refuses
+    // (§7.2) instead of activating the vault's generation.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live: rt-b
+    let bound = vault_fp(&fx, &b);
+    fx.put_vault(&b, &credential("b@x.co", "rt-b2"));
+    fx.expire_access(&b); // due: the forced self-switch freshens the vault's generation
+    let strike = Mutex::new(Some((fx.engine.store().unwrap(), b.clone(), bound.clone())));
+    let key = b.to_string();
+    // `plan` reads b's vault first (`has_login`): the strike lands there, once.
+    let engine = fx.engine_with_vault_probe(move |read| {
+        if read != key {
+            return;
+        }
+        if let Some((store, id, fp)) = strike.lock().unwrap().take() {
+            store.set_quarantine(&id, "invalid_grant", &fp, 1).unwrap();
+        }
+    });
+    let err = engine.switch(fx.switch_request(&b, true)).unwrap_err();
+    assert_eq!(err.kind(), "relogin-required", "{err}");
+    assert_eq!(
+        quarantine_of(&fx, &b),
+        (Some("invalid_grant".into()), Some(bound))
+    );
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[test]
 fn a_forced_switch_still_freshens_its_target() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");

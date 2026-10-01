@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use common::{Fx, crashed_switch, due, quarantine_of, token_requests, vault_fp};
+use common::{Fx, crashed_switch, credential, due, quarantine_of, token_requests, vault_fp};
 use serde_json::{Value, json};
 use tagteam_core::AccountId;
 use tagteam_engine::account_lock::AccountLock;
@@ -127,6 +127,55 @@ fn a_quarantine_bound_to_an_older_generation_is_released_and_the_gate_proceeds()
         1,
         "{events:?}"
     );
+}
+
+#[test]
+fn the_live_account_s_quarantine_holds_while_its_live_credential_is_bound() {
+    // §7.4: the active account's quarantine holds while either the live credential or the
+    // vault matches `quarantine_fp`. The vault has moved on; the live credential has not.
+    let fx = Fx::new();
+    fx.add("b@x.co", "rt-b");
+    let a = fx.add("a@x.co", "rt-a"); // live: rt-a
+    let bound = vault_fp(&fx, &a);
+    fx.quarantine(&a, "invalid_grant", &bound);
+    fx.put_vault(&a, &credential("a@x.co", "rt-a2"));
+    assert!(matches!(
+        gate(&fx, &a),
+        GateOutcome::Dead(QuarantineReason::InvalidGrant)
+    ));
+    assert_eq!(
+        quarantine_of(&fx, &a),
+        (Some("invalid_grant".into()), Some(bound))
+    );
+    // Once Claude Code has rotated the live credential too, neither copy is bound: the gate
+    // releases it, and leaves the live token to §7.5.
+    fx.rotate_live("rt-a3");
+    assert!(matches!(gate(&fx, &a), GateOutcome::Owned(OwnedBy::Live)));
+    assert_eq!(quarantine_of(&fx, &a), (None, None));
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[test]
+fn with_the_live_identity_unreadable_the_live_credential_still_decides() {
+    // An unreadable live identity may be this account's (§4.3), so the live credential is
+    // compared as for the live account: still the bound generation, it holds the quarantine;
+    // another generation does not.
+    let fx = Fx::new();
+    fx.add("b@x.co", "rt-b");
+    let a = fx.add("a@x.co", "rt-a"); // live: rt-a
+    let bound = vault_fp(&fx, &a);
+    fx.quarantine(&a, "invalid_grant", &bound);
+    fx.put_vault(&a, &credential("a@x.co", "rt-a2"));
+    fs::write(fx.paths().global_config, "{\n  \"oauthAccount\": ").unwrap(); // torn
+    assert!(matches!(
+        gate(&fx, &a),
+        GateOutcome::Dead(QuarantineReason::InvalidGrant)
+    ));
+    assert!(quarantine_of(&fx, &a).0.is_some());
+    fx.rotate_live("rt-a3");
+    assert!(matches!(gate(&fx, &a), GateOutcome::Owned(OwnedBy::Live)));
+    assert_eq!(quarantine_of(&fx, &a), (None, None));
+    assert_eq!(token_requests(&fx), 0);
 }
 
 #[test]

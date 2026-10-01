@@ -94,7 +94,7 @@ pub(crate) fn expired(p: &dyn Provider, bytes: &[u8], now_ms: i64) -> bool {
 }
 
 /// The lineage fingerprint as the store records it; empty for bytes that carry no token.
-fn fp_str(p: &dyn Provider, bytes: &[u8]) -> String {
+pub(crate) fn fp_str(p: &dyn Provider, bytes: &[u8]) -> String {
     p.fingerprint(bytes)
         .map(|f| f.as_str().to_owned())
         .unwrap_or_default()
@@ -318,9 +318,11 @@ impl Engine {
         let Some(row) = store.account(id)? else {
             return Ok(transient("vault-absent"));
         };
-        // §7.4: a quarantine holds only while the vault still holds the generation it is bound
-        // to. A vault that has moved on releases it (§11.2 step 1), which also heals
-        // `persist_generation`'s window between the vault write and the store update.
+        // §7.4: a quarantine holds while the vault still holds the generation it is bound to,
+        // and, for the live account, while the live credential does (`quarantine_released`,
+        // shared with `release_unbound_quarantines`). One that binds neither is released
+        // (§11.2 step 1), which also heals `persist_generation`'s window between the vault
+        // write and the store update.
         if let Some(reason) = &row.quarantine_reason {
             if !self.quarantine_released(p, &row) {
                 return Ok(GateOutcome::Dead(
@@ -394,19 +396,6 @@ impl Engine {
         };
         drop(lock);
         Ok(outcome)
-    }
-
-    /// Whether `row`'s quarantine no longer binds: the vault is readable and holds a
-    /// generation other than the one the quarantine is bound to. Anything less (unreadable,
-    /// absent, empty, or an unbound quarantine) leaves it standing.
-    fn quarantine_released(&self, p: &dyn Provider, row: &AccountRow) -> bool {
-        match self.vault.read(&row.id) {
-            Read::Present(b) if !b.is_empty() => row
-                .quarantine_fp
-                .as_deref()
-                .is_some_and(|bound| bound != fp_str(p, &b)),
-            _ => false,
-        }
     }
 
     /// §7.3 step 2: whether the account's token is someone else's to refresh.

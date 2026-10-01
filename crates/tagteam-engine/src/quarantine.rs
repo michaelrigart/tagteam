@@ -1,11 +1,13 @@
 //! §7.4: one strike quarantines an account, bound to the fingerprint that was sent.
 
 use serde_json::json;
-use tagteam_provider::DeadReason;
+use tagteam_provider::{DeadReason, Provenance, Provider, Read};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::refresh::fp_str;
 use crate::store::{AccountRow, EventRow};
+use crate::switch::Axis;
 
 /// The `quarantine_reason` column's values (§6.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +98,60 @@ impl Engine {
             self.quarantine_event(row, "unquarantine", None)?;
         }
         Ok(cleared)
+    }
+
+    /// §7.4: whether `row`'s quarantine no longer binds. The vault must hold another
+    /// generation than the one the quarantine is bound to, and, when `row` is the live
+    /// account, so must the live credential: the active account's quarantine holds while
+    /// either copy matches `quarantine_fp`. The refresh gate and `release_unbound_quarantines`
+    /// share it.
+    pub(crate) fn quarantine_released(&self, p: &dyn Provider, row: &AccountRow) -> bool {
+        self.vault_moved_past(p, row) && !self.live_still_bound(p, row)
+    }
+
+    /// The vault half: the vault is readable and holds a generation other than the one the
+    /// quarantine is bound to. Anything less (unreadable, absent, empty, or a quarantine bound
+    /// to nothing) leaves it standing.
+    fn vault_moved_past(&self, p: &dyn Provider, row: &AccountRow) -> bool {
+        match self.vault.read(&row.id) {
+            Read::Present(b) if !b.is_empty() => row
+                .quarantine_fp
+                .as_deref()
+                .is_some_and(|bound| bound != fp_str(p, &b)),
+            _ => false,
+        }
+    }
+
+    /// The live half: whether `row` is the live login and its live credential may still be
+    /// the generation the quarantine is bound to. A live identity that cannot be read may be
+    /// `row`'s, so the live credential is compared; a live credential that cannot be read, or a
+    /// degraded one, may be exactly that generation, so it counts as bound.
+    fn live_still_bound(&self, p: &dyn Provider, row: &AccountRow) -> bool {
+        let is_live = match p.live_identity(&self.env) {
+            Read::Present(i) => p.identity_key(&i).as_str() == row.identity_key,
+            Read::Absent => false,
+            Read::Unreadable(_) => true,
+        };
+        if !is_live {
+            return false;
+        }
+        let Some(bound) = row.quarantine_fp.as_deref() else {
+            return true;
+        };
+        let auth = p.read_live_auth(&self.env);
+        let live = match Axis::of(p, &row.kind) {
+            Axis::Entry => match auth.credential {
+                Read::Present(c) if c.provenance() == Provenance::Fresh => Some(c.bytes().to_vec()),
+                Read::Absent => None,
+                _ => return true,
+            },
+            Axis::ManagedKey => match auth.managed_key {
+                Read::Present(k) => Some(k),
+                Read::Absent => None,
+                Read::Unreadable(_) => return true,
+            },
+        };
+        live.is_some_and(|bytes| fp_str(p, &bytes) == bound)
     }
 }
 
