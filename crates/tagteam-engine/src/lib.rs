@@ -2,6 +2,7 @@
 
 pub mod account_lock;
 pub mod active;
+pub mod collect;
 mod displace;
 pub mod engine;
 pub mod error;
