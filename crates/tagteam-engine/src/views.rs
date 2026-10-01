@@ -666,6 +666,16 @@ mod tests {
             ..state(0, None, true)
         };
         assert_eq!(status(true, OAUTH, false, Some(empty)), Ok);
+        // Never read, but refused by the hourly budget: unavailable for that reason (§8.6).
+        assert_eq!(
+            status(
+                true,
+                OAUTH,
+                false,
+                Some(state(1, Some("over-budget"), false))
+            ),
+            Unavailable
+        );
         // Never read and never failed: no data yet.
         assert_eq!(
             status(true, OAUTH, false, Some(state(0, None, false))),

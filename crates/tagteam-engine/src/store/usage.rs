@@ -4,6 +4,7 @@
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
+use tagteam_core::backoff::failure_backoff_s;
 use tagteam_core::poll::budget_next_free;
 use tagteam_core::usage::{windows_from_json, windows_to_json};
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Sample, Window};
@@ -17,6 +18,9 @@ const USAGE_LEASE_MS: i64 = 90_000;
 const PRUNE_LEASE: &str = "prune:usage_samples";
 
 const DAY_S: i64 = 86_400;
+
+/// §8.3's `last_error` token for a request the hourly budget refused (§8.6).
+const OVER_BUDGET: &str = "over-budget";
 
 /// §6.1's lease statement. The lease is held when it changes one row: it was free, or its
 /// holder's expiry (`?4`, now in ms) has passed.
@@ -76,8 +80,9 @@ pub enum Ineligible {
 pub enum Reserve {
     Reserved(Reservation),
     Ineligible(Ineligible),
-    /// The identity has spent its hourly budget (§8.6): no lease was taken, and the
-    /// account's `next_poll_at` now says when a slot frees.
+    /// The identity has spent its hourly budget (§8.6): no lease was taken, the refusal is
+    /// recorded as an `over-budget` failure, and the account's `next_poll_at` now says when a
+    /// slot frees.
     OverBudget {
         next_free_at: i64,
     },
@@ -286,9 +291,14 @@ impl Store {
     /// schedule. An on-demand caller (`list`, `status`) needs the reading to be older than
     /// `floor_s` and a poll to be due, where no plan counts as due. A scheduled caller (M3)
     /// needs a poll to be due or no reading at all (§8.3's "due or stale"). An eligible
-    /// account then needs a free slot in its identity's hourly budget (§8.6): over budget,
-    /// its `next_poll_at` moves to `next_free_at` and no lease is taken. Otherwise the lease
-    /// (§6.1's statement, 90 s) and one `usage_requests` slot are taken together.
+    /// account then needs a free slot in its identity's hourly budget (§8.6). Over budget, the
+    /// fetch reports `over-budget`: the refusal is recorded as the collector records
+    /// `authorize_send`'s, one more consecutive failure with `last_error = over-budget`,
+    /// `last_attempt_at` now and a backoff until `max(now + §8.5's base, next_free_at)`, so an
+    /// account with no reading shows why; its `next_poll_at` moves to `next_free_at`, the
+    /// reading is never touched, and no lease is taken. The backoff is checked before the
+    /// budget, so a refusal is recorded once per budget period. Otherwise the lease (§6.1's
+    /// statement, 90 s) and one `usage_requests` slot are taken together.
     pub fn reserve_usage(
         &self,
         account: &AccountRow,
@@ -312,12 +322,13 @@ impl Store {
         if quarantined {
             return Ok(Reserve::Ineligible(Ineligible::Quarantined));
         }
-        let (fetched_at, backoff_until, next_poll_at): (Option<i64>, Option<i64>, Option<i64>) = tx
+        type Schedule = (Option<i64>, Option<i64>, Option<i64>, i64);
+        let (fetched_at, backoff_until, next_poll_at, failures): Schedule = tx
             .query_row(
-                "SELECT fetched_at, backoff_until, next_poll_at FROM usage_state \
-                 WHERE account_id = ?1",
+                "SELECT fetched_at, backoff_until, next_poll_at, consecutive_failures \
+                 FROM usage_state WHERE account_id = ?1",
                 [id.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?
             .unwrap_or_default();
@@ -343,10 +354,16 @@ impl Store {
             return Ok(Reserve::Ineligible(Ineligible::NotDue));
         }
         if let Some(next_free_at) = next_free_at(&tx, &provider, &identity_key, now_s, budget)? {
+            let n = u32::try_from(failures.max(0))
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+            let until = (now_s + failure_backoff_s(n, false, None)).max(next_free_at);
             ensure_state(&tx, id)?;
             tx.execute(
-                "UPDATE usage_state SET next_poll_at = ?2 WHERE account_id = ?1",
-                params![id.as_str(), next_free_at],
+                "UPDATE usage_state SET consecutive_failures = consecutive_failures + 1, \
+                 last_error = ?2, last_attempt_at = ?3, backoff_until = ?4, next_poll_at = ?5 \
+                 WHERE account_id = ?1",
+                params![id.as_str(), OVER_BUDGET, now_s, until, next_free_at],
             )?;
             tx.commit()?;
             return Ok(Reserve::OverBudget { next_free_at });

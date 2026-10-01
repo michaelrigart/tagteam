@@ -444,17 +444,42 @@ fn an_identity_over_its_hourly_budget_is_sent_nothing() {
 
     let report = fx.collect(&[&a]);
 
+    let free = NOW_S - 100 + 3660;
     assert_eq!(
         report.outcomes,
-        [(
-            a.clone(),
-            Collected::OverBudget {
-                next_free_at: NOW_S - 100 + 3660
-            }
-        )]
+        [(a.clone(), Collected::OverBudget { next_free_at: free })]
     );
     assert!(fx.http.requests().is_empty());
     assert_eq!(usage_requests(&fx), 20);
+    // §8.6: the fetch reports `over-budget`, even for an account never read (Review Focus 4's
+    // re-added account), so its row says so rather than "no data yet".
+    let s = state(&fx, &a);
+    assert_eq!(
+        (
+            s.last_good,
+            s.fetched_at,
+            s.last_attempt_at,
+            s.consecutive_failures,
+            s.last_error.as_deref(),
+            s.backoff_until,
+            s.next_poll_at
+        ),
+        (
+            None,
+            None,
+            Some(NOW_S),
+            1,
+            Some("over-budget"),
+            Some(free),
+            Some(free)
+        )
+    );
+    assert_eq!(
+        fx.collect(&[&a]).outcomes,
+        [(a.clone(), Collected::Ineligible(Ineligible::Backoff))],
+        "recorded once per budget period"
+    );
+    assert_eq!(state(&fx, &a).consecutive_failures, 1);
 }
 
 #[test]
