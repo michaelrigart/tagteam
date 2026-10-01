@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 
 use tagteam_core::pace::pace;
@@ -178,8 +179,10 @@ fn with_pace(
         .collect()
 }
 
-/// One window of `tagteam history` (§13.4): its definition from the last good reading, its
-/// samples since the requested time, and §8.7's pace as of that reading.
+/// One window of `tagteam history` (§13.4): its definition, its samples since the requested
+/// time, and §8.7's pace as of its reading. A window of the last good reading is as read then;
+/// one only the samples name is described by the provider (`Provider::describe_window`) and
+/// read as of its latest sample, whose `pct` and reset it carries.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistoryWindow {
     pub window: Window,
@@ -407,10 +410,12 @@ impl Engine {
         }
     }
 
-    /// §13.4, reading only: the windows of `account`'s last good reading (its relevant ones,
-    /// §8.2, or those whose key or label is `window`, ignoring case), each with its samples
-    /// fetched at or after `since_s` and its pace as of the reading. An account never read has
-    /// no windows.
+    /// §13.4, reading only: `account`'s windows, each with its samples fetched at or after
+    /// `since_s` and its pace as of its reading. The windows are those of the last good
+    /// reading, then, by key, those that only samples since `since_s` name (a window the latest
+    /// reading lacks, or every window after an empty one), as the provider describes them;
+    /// a key it does not recognise is skipped. Of these, the relevant ones (§8.2), or those
+    /// whose key or label is `window`, ignoring case. An account never read has no windows.
     pub fn history(
         &self,
         account: &AccountId,
@@ -426,24 +431,48 @@ impl Engine {
             .flat_map(|l| l.accounts)
             .find(|v| v.row.id == row.id)
             .ok_or_else(missing)?;
-        let state = store.usage_state(&row.id)?;
-        let reading = state.and_then(|s| Some((s.last_good.unwrap_or_default(), s.fetched_at?)));
-        let Some((last_good, fetched_at)) = reading else {
-            return Ok(HistoryView {
-                account: view,
-                windows: Vec::new(),
-            });
+        let p = self.provider(&row.provider)?;
+        // Each window with the time its `pct` is as of: the reading's fetch for its own.
+        let mut read: Vec<(Window, i64)> = match store.usage_state(&row.id)? {
+            Some(UsageStateRow {
+                last_good,
+                fetched_at: Some(at),
+                ..
+            }) => last_good
+                .unwrap_or_default()
+                .into_iter()
+                .map(|w| (w, at))
+                .collect(),
+            _ => Vec::new(),
         };
+        // Samples ascend by time, so the last one kept per key is that window's latest.
+        let mut latest: BTreeMap<String, Sample> = BTreeMap::new();
+        for (key, sample) in store.usage_samples(&row.id, None, since_s)? {
+            latest.insert(key, sample);
+        }
+        for (key, s) in latest {
+            if read.iter().any(|(w, _)| w.key == key) {
+                continue;
+            }
+            if let Some(w) = p.describe_window(&key) {
+                let w = Window {
+                    pct: s.pct,
+                    resets_at: s.resets_at,
+                    ..w
+                };
+                read.push((w, s.fetched_at));
+            }
+        }
         let models = &self.settings().models;
-        let windows = last_good
+        let windows = read
             .into_iter()
-            .filter(|w| match window {
+            .filter(|(w, _)| match window {
                 Some(name) => {
                     w.key.eq_ignore_ascii_case(name) || w.label.eq_ignore_ascii_case(name)
                 }
                 None => is_relevant(w, models),
             })
-            .map(|w| {
+            .map(|(w, fetched_at)| {
                 // One query reaches back to the earlier of `since_s` and pace's lookback.
                 let all: Vec<Sample> = store
                     .usage_samples(

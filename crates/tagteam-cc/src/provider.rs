@@ -472,6 +472,10 @@ impl Provider for ClaudeCode {
         usage::render(windows)
     }
 
+    fn describe_window(&self, key: &str) -> Option<Window> {
+        usage::describe(key)
+    }
+
     fn live_identity_source(&self, env: &Env) -> Option<PathBuf> {
         Some(CcPaths::resolve(env).global_config)
     }

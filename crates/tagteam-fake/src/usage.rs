@@ -20,16 +20,33 @@ pub(crate) fn usage_request(url: String, token: &str) -> HttpRequest {
     HttpRequest::get(url, USAGE_TIMEOUT).header("authorization", format!("Fake {token}"))
 }
 
+/// A meter id as FakeAgent's window: `daily` is a Short window of a day and `monthly` a Long one
+/// of 30 days, each with `pct` 0 and no reset. `None` for any other id.
+pub(crate) fn describe(id: &str) -> Option<Window> {
+    let (kind, period_s) = match id {
+        "daily" => (WindowKind::Short, DAY_S),
+        "monthly" => (WindowKind::Long, MONTH_S),
+        _ => return None,
+    };
+    Some(Window {
+        key: id.to_owned(),
+        label: id.to_owned(),
+        kind,
+        pct: 0.0,
+        resets_at: None,
+        period_s: Some(period_s),
+        detail: None,
+    })
+}
+
 /// `{"meters": [{"id", "used", "renews"}]}`: `used` is a fraction of 1 and `renews` epoch
-/// seconds. `daily` is a Short window of a day and `monthly` a Long one of 30 days; any other
-/// meter, or one without a finite `used`, is ignored. `None` without a `meters` array.
+/// seconds. A meter `describe` does not know, or one without a finite `used`, is ignored.
+/// `None` without a `meters` array.
 fn normalize(body: &Value) -> Option<Vec<Window>> {
     let mut out = Vec::new();
     for m in body.get("meters")?.as_array()? {
-        let (id, kind, period_s) = match m["id"].as_str() {
-            Some(id @ "daily") => (id, WindowKind::Short, DAY_S),
-            Some(id @ "monthly") => (id, WindowKind::Long, MONTH_S),
-            _ => continue,
+        let Some(meter) = m["id"].as_str().and_then(describe) else {
+            continue;
         };
         let Some(pct) = m["used"]
             .as_f64()
@@ -39,13 +56,9 @@ fn normalize(body: &Value) -> Option<Vec<Window>> {
             continue;
         };
         out.push(Window {
-            key: id.to_owned(),
-            label: id.to_owned(),
-            kind,
             pct,
             resets_at: m["renews"].as_i64(),
-            period_s: Some(period_s),
-            detail: None,
+            ..meter
         });
     }
     Some(out)

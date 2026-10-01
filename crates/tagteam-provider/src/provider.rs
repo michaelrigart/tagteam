@@ -572,6 +572,11 @@ pub trait Provider: Send + Sync {
     /// §13.2: the provider's JSON for a row's `usage`/`lastGoodUsage`, from windows and their
     /// pace.
     fn render_usage(&self, windows: &[(Window, Pace)]) -> Value;
+    /// One of this provider's window keys as its normalization describes it (§8.2): the key,
+    /// label, kind and `period_s`, with `pct` 0 and no reset or detail, which the engine fills
+    /// from a stored sample (§13.4's history of a window the last reading lacks). `None` for a
+    /// key this provider does not produce.
+    fn describe_window(&self, key: &str) -> Option<Window>;
     /// The file whose mtime and size key `live_identity_cache` (§13.5): the one `live_identity`
     /// reads. CC: `~/.claude.json`. `None` when no single file backs the live identity.
     fn live_identity_source(&self, env: &Env) -> Option<PathBuf>;
