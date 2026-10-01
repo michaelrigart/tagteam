@@ -7,7 +7,7 @@ const CAP_OTHER_S: f64 = 3600.0;
 const BASE_S: i64 = 30;
 const BASE_MAX_S: i64 = 600;
 const MAX_EXPONENT: u32 = 32;
-/// A 429 that says `Retry-After: 0` still waits this long.
+/// A 429 whose `Retry-After` is below one second (it counts as `0`) still waits this long.
 const ZERO_RETRY_AFTER_FLOOR_S: f64 = 300.0;
 /// A 429 that asks for more than this gets [`LONG_RETRY_AFTER_MARGIN_S`] on top, because
 /// retrying at the deadline re-arms the block.
@@ -16,6 +16,10 @@ const LONG_RETRY_AFTER_MARGIN_S: f64 = 900.0;
 
 /// `Retry-After` in its seconds form only (§8.1): an integer or decimal, possibly huge or `inf`.
 /// Negative, empty, unparseable and HTTP-date values give `None`.
+///
+/// Whatever Rust's `f64` parser accepts counts, so the odd forms are accepted too: a leading `+`
+/// (`+5`), a bare or trailing dot (`.5`, `5.`), an exponent (`1e3`), and `inf`/`infinity` in any
+/// case. They all clamp safely downstream, so they are kept rather than special-cased out.
 ///
 /// A value that overflows to infinity (`1e400`) is returned as infinity; the caller's
 /// [`failure_backoff_s`] clamps it, so it is never stored.
@@ -43,7 +47,7 @@ pub fn failure_backoff_s(
     let asked = match retry_after_s {
         Some(r) if r.is_nan() || r < 0.0 => 0.0,
         Some(r) if !r.is_finite() => cap,
-        Some(r) if is_429 && r == 0.0 => ZERO_RETRY_AFTER_FLOOR_S,
+        Some(r) if is_429 && r < 1.0 => ZERO_RETRY_AFTER_FLOOR_S,
         Some(r) if is_429 && r > LONG_RETRY_AFTER_S => r + LONG_RETRY_AFTER_MARGIN_S,
         Some(r) => r,
         None => 0.0,
@@ -69,6 +73,16 @@ mod tests {
         assert_eq!(parse_retry_after("1e400"), Some(f64::INFINITY));
         assert_eq!(parse_retry_after("inf"), Some(f64::INFINITY));
         assert_eq!(parse_retry_after("1e300"), Some(1e300));
+    }
+
+    #[test]
+    fn retry_after_accepts_the_odd_forms_rust_parses() {
+        assert_eq!(parse_retry_after("+5"), Some(5.0));
+        assert_eq!(parse_retry_after(".5"), Some(0.5));
+        assert_eq!(parse_retry_after("5."), Some(5.0));
+        assert_eq!(parse_retry_after("1e3"), Some(1000.0));
+        assert_eq!(parse_retry_after("infinity"), Some(f64::INFINITY));
+        assert_eq!(parse_retry_after("Infinity"), Some(f64::INFINITY));
     }
 
     #[test]
@@ -129,8 +143,21 @@ mod tests {
     }
 
     #[test]
+    fn on_a_429_a_retry_after_below_one_second_counts_as_zero() {
+        assert_eq!(failure_backoff_s(1, true, Some(0.0)), 300);
+        assert_eq!(failure_backoff_s(1, true, Some(0.5)), 300);
+        assert_eq!(failure_backoff_s(1, true, Some(0.999)), 300);
+        assert_eq!(
+            failure_backoff_s(1, true, Some(1.0)),
+            30,
+            "one second is a real ask, so the base wins"
+        );
+    }
+
+    #[test]
     fn retry_after_zero_on_another_status_has_no_minimum() {
         assert_eq!(failure_backoff_s(1, false, Some(0.0)), 30);
+        assert_eq!(failure_backoff_s(1, false, Some(0.5)), 30);
     }
 
     #[test]
