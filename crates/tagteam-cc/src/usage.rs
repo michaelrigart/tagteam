@@ -180,13 +180,17 @@ fn scaled(amount: f64, exponent: i64) -> Option<f64> {
         .then(|| amount / 10f64.powi(exponent as i32))
 }
 
+/// An `exponent` or `decimal_places` value: 2 when the field is absent or null (§8.2), the
+/// integer when it is one, and `None` for anything else (`"3"`, `3.0`, `true`), which leaves
+/// the amount's window out rather than guessing a scale.
+fn exponent(v: &Value) -> Option<i64> {
+    if v.is_null() { Some(2) } else { v.as_i64() }
+}
+
 /// A `{amount_minor, currency, exponent}` amount. The exponent defaults to 2, as
 /// `extra_usage`'s `decimal_places` does (§8.2).
 fn money(v: &Value) -> Option<f64> {
-    scaled(
-        v["amount_minor"].as_f64()?,
-        v["exponent"].as_i64().unwrap_or(2),
-    )
+    scaled(v["amount_minor"].as_f64()?, exponent(&v["exponent"])?)
 }
 
 /// The spend window: `pct = used / limit · 100`. A zero limit, or a pct that is not finite,
@@ -224,7 +228,7 @@ fn spend(body: &Value) -> Option<Window> {
     if e["is_enabled"].as_bool() != Some(true) {
         return None;
     }
-    let places = e["decimal_places"].as_i64().unwrap_or(2);
+    let places = exponent(&e["decimal_places"])?;
     let used = scaled(e["used_credits"].as_f64()?, places)?;
     let limit = scaled(e["monthly_limit"].as_f64()?, places)?;
     spend_window(used, limit, Some(e["currency"].as_str()?))
