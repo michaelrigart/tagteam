@@ -275,6 +275,18 @@ const PLAN_FLOOR_S: i64 = 60;
 const JITTER_FRAC: f64 = 0.1;
 /// §11.4: a delay longer than this many intervals earns a `sleep` event.
 const SLEEP_EVENT_INTERVALS: f64 = 1.5;
+/// §11.2 step 8: a re-checked target's reading is at most this old.
+const RECHECK_FRESH_S: i64 = 180;
+/// §11.3: recovery by headroom, and dominance's margin, in points.
+const RECOVERED_PTS: f64 = 3.0;
+/// §11.2 step 8 and §11.3: a recovery this much sooner counts.
+const RECOVERY_HYSTERESIS_S: i64 = 300;
+/// §11.2 step 8: headroom within this many points of none is spent.
+const SPENT_HEADROOM_PCT: f64 = 3.0;
+/// §11.2 step 8: a recovery within this horizon makes the recovery axis useful.
+const RECOVERY_HORIZON_S: i64 = 14_400;
+/// §11.2 step 8's headroom axis and §11.3's dominance: twice the active account's headroom.
+const HEADROOM_RATIO: f64 = 2.0;
 
 /// One account's figures for this tick, read once from its decision-grade windows over
 /// `cfg.models`.
@@ -355,6 +367,122 @@ fn every_candidate_exhausted(oauth: &[Rated]) -> bool {
     !oauth.is_empty() && oauth.iter().all(|c| c.headroom.is_some_and(at_limit))
 }
 
+/// §11.2 step 8: a `proactive` or `consume-first` landing is below the threshold, unless every
+/// account is above it.
+fn landing_ok(headroom: f64, threshold: f64, every_account_above: bool) -> bool {
+    every_account_above || below_threshold(headroom, threshold)
+}
+
+/// §11.2 step 8 (`best`): the candidate's headroom beats the active account's by at least
+/// `hysteresis_pct`.
+fn beats_by_hysteresis(headroom: f64, active_h: f64, hysteresis_pct: f64) -> bool {
+    headroom - active_h >= hysteresis_pct
+}
+
+/// §11.2 step 8: the active account and every candidate whose headroom is known are at or
+/// above the threshold. A candidate of unknown headroom is never ranked, so it does not count.
+fn every_account_above(active_h: Option<f64>, oauth: &[Rated], threshold: f64) -> bool {
+    let above = |h: f64| !below_threshold(h, threshold);
+    active_h.is_some_and(above) && oauth.iter().filter_map(|c| c.headroom).all(above)
+}
+
+/// §11.2 step 8, every account above the threshold: this pair is judged on the recovery axis
+/// when both are spent (headroom within 3 points of none) or either recovers within 4 h.
+fn recovery_axis_useful(
+    active_h: f64,
+    headroom: f64,
+    active_at: Option<i64>,
+    at: Option<i64>,
+    now: i64,
+) -> bool {
+    let spent = |h: f64| h <= SPENT_HEADROOM_PCT;
+    let soon = |at: Option<i64>| at.is_some_and(|at| at - now <= RECOVERY_HORIZON_S);
+    (spent(active_h) && spent(headroom)) || soon(active_at) || soon(at)
+}
+
+/// `at` is at least 300 s before `than`.
+fn sooner_by_hysteresis(at: i64, than: i64) -> bool {
+    than.saturating_sub(at) >= RECOVERY_HYSTERESIS_S
+}
+
+/// §11.2 step 8's recovery axis: the candidate's binding window recovers at least 300 s before
+/// the active account's. A past or unknown recovery sorts last: the candidate's never passes,
+/// and every known one is sooner than the active account's.
+fn recovers_sooner(at: Option<i64>, active_at: Option<i64>) -> bool {
+    match (at, active_at) {
+        (Some(at), Some(active_at)) => sooner_by_hysteresis(at, active_at),
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// §11.2 step 8's headroom axis: at least twice the active account's headroom.
+fn doubles_headroom(headroom: f64, active_h: f64) -> bool {
+    headroom >= HEADROOM_RATIO * active_h
+}
+
+/// §11.3 dominance: more than twice the active account's headroom, plus 3.
+fn dominates(headroom: f64, active_h: f64) -> bool {
+    headroom > HEADROOM_RATIO * active_h + RECOVERED_PTS
+}
+
+/// §11.2 step 8 (`consume-first`): the candidate's long window resets strictly sooner than the
+/// active account's. An unknown reset on either side never does.
+fn resets_sooner(at: Option<i64>, active_at: Option<i64>) -> bool {
+    matches!((at, active_at), (Some(at), Some(active_at)) if at < active_at)
+}
+
+/// §11.2 step 8: after the re-check, the target's reading is at most 180 s old.
+fn fresh_after_recheck(fetched_at: Option<i64>, now: i64) -> bool {
+    fetched_at.is_some_and(|at| now.saturating_sub(at) <= RECHECK_FRESH_S)
+}
+
+/// §11.3: no departure snapshot to judge a return by. A failover departure needs no headroom:
+/// it is judged on the landing and recovery legs.
+fn departure_missing(st: &AutoState) -> bool {
+    match st.left_trigger {
+        None => true,
+        Some(Trigger::Failover) => false,
+        Some(_) => st.left_headroom.is_none(),
+    }
+}
+
+/// §11.3: the account a `proactive` or `consume-first` move may not return to while the
+/// engine still sits on the account it switched to. A missing departure snapshot lifts the bar.
+fn barred<'a>(st: &'a AutoState, active: &AccountId) -> Option<&'a AccountId> {
+    if st.last_switch_to.as_ref() != Some(active) || departure_missing(st) {
+        return None;
+    }
+    st.last_switch_from.as_ref()
+}
+
+/// §11.3: the barred account has recovered against its departure snapshot. One leg is enough:
+/// headroom at least 3 points higher, the binding window recovering at least 300 s sooner, or
+/// dominance over the active account. A failover departure is judged on the landing leg (it is
+/// below the threshold now) and the recovery leg only. The recovery leg needs both recoveries
+/// known.
+fn recovered_since_departure(
+    left: &Rated,
+    st: &AutoState,
+    active_h: Option<f64>,
+    threshold: f64,
+) -> bool {
+    let h = left.headroom;
+    let recovery = matches!(
+        (left.recovery_at, st.left_recovery_at),
+        (Some(at), Some(then)) if sooner_by_hysteresis(at, then)
+    );
+    if st.left_trigger == Some(Trigger::Failover) {
+        return recovery || h.is_some_and(|h| below_threshold(h, threshold));
+    }
+    let headroom = matches!(
+        (h, st.left_headroom),
+        (Some(h), Some(then)) if h - then >= RECOVERED_PTS
+    );
+    let dominance = matches!((h, active_h), (Some(h), Some(a)) if dominates(h, a));
+    headroom || recovery || dominance
+}
+
 /// Steps 4 and 5's verdict on the active account.
 struct Triggered {
     trigger: Trigger,
@@ -415,14 +543,88 @@ fn triggered(active: &Rated, st: &AutoState, cfg: &AutoConfig) -> Result<Trigger
     }
 }
 
-/// §11.2 step 8's order alone, without its gates: known headroom above 0, most first, ties to
-/// the lower position.
-fn rank(oauth: &[Rated]) -> Vec<AccountId> {
-    let mut ranked: Vec<&Rated> = oauth
-        .iter()
-        .filter(|c| c.headroom.is_some_and(|h| !at_limit(h)))
-        .collect();
-    ranked.sort_by(|a, b| most_headroom(a, b));
+/// What step 8 compares every candidate with.
+struct Ranking<'a> {
+    cfg: &'a AutoConfig,
+    st: &'a AutoState,
+    trigger: Trigger,
+    active: &'a Rated<'a>,
+    now: i64,
+}
+
+impl Ranking<'_> {
+    /// The active account's headroom; an API key counts as 0 (step 4).
+    fn active_h(&self) -> Option<f64> {
+        if self.active.account.api_key {
+            Some(0.0)
+        } else {
+            self.active.headroom
+        }
+    }
+}
+
+/// §11.2 step 8 and §11.3: the OAuth targets, best first. Unknown headroom and headroom ≤ 0
+/// never rank. `at-limit` and `failover` skip every anti-flap gate; the bar is lifted only when
+/// the barred ranking is empty and the barred account has recovered, and then the ranking runs
+/// again without it.
+fn rank(r: &Ranking, oauth: &[Rated]) -> Vec<AccountId> {
+    if r.trigger.must_move() {
+        let usable = oauth
+            .iter()
+            .filter(|c| c.headroom.is_some_and(|h| !at_limit(h)));
+        return ordered(usable.collect(), most_headroom);
+    }
+    let bar = barred(r.st, &r.active.account.id);
+    let ranked = gated(r, oauth, bar);
+    let lifted = |left: &AccountId| {
+        oauth.iter().any(|c| {
+            &c.account.id == left
+                && recovered_since_departure(c, r.st, r.active_h(), r.cfg.threshold)
+        })
+    };
+    match bar {
+        Some(left) if ranked.is_empty() && lifted(left) => gated(r, oauth, None),
+        _ => ranked,
+    }
+}
+
+/// Step 8's gates for `proactive` and `consume-first`, with `bar` left out.
+fn gated(r: &Ranking, oauth: &[Rated], bar: Option<&AccountId>) -> Vec<AccountId> {
+    let Some(active_h) = r.active_h() else {
+        return Vec::new();
+    };
+    // Step 4: a way back from an API key lands below the threshold whatever the others show.
+    let all_above =
+        !r.active.account.api_key && every_account_above(Some(active_h), oauth, r.cfg.threshold);
+    let passing = oauth.iter().filter(|c| {
+        let Some(h) = c.headroom else {
+            return false;
+        };
+        if at_limit(h) || bar == Some(&c.account.id) || !landing_ok(h, r.cfg.threshold, all_above) {
+            return false;
+        }
+        match r.trigger {
+            Trigger::ConsumeFirst => resets_sooner(c.long_reset, r.active.long_reset),
+            _ if all_above => {
+                if recovery_axis_useful(active_h, h, r.active.recovery_at, c.recovery_at, r.now) {
+                    recovers_sooner(c.recovery_at, r.active.recovery_at)
+                } else {
+                    doubles_headroom(h, active_h)
+                }
+            }
+            _ => beats_by_hysteresis(h, active_h, r.cfg.hysteresis_pct),
+        }
+    });
+    let order = match r.trigger {
+        Trigger::ConsumeFirst => soonest_long_reset,
+        _ if all_above => soonest_recovery,
+        _ => most_headroom,
+    };
+    ordered(passing.collect(), order)
+}
+
+fn ordered(mut ranked: Vec<&Rated>, order: fn(&Rated, &Rated) -> Ordering) -> Vec<AccountId> {
+    ranked.sort_by(|a, b| order(a, b));
     ranked.into_iter().map(|c| c.account.id.clone()).collect()
 }
 
@@ -432,6 +634,20 @@ fn most_headroom(a: &Rated, b: &Rated) -> Ordering {
         .partial_cmp(&a.headroom)
         .unwrap_or(Ordering::Equal)
         .then(a.account.position.cmp(&b.account.position))
+}
+
+/// `consume-first`: the soonest long-window reset first, then most headroom.
+fn soonest_long_reset(a: &Rated, b: &Rated) -> Ordering {
+    a.long_reset
+        .cmp(&b.long_reset)
+        .then_with(|| most_headroom(a, b))
+}
+
+/// Every account above the threshold: the soonest binding-window recovery first, a past or
+/// unknown one last, then most headroom.
+fn soonest_recovery(a: &Rated, b: &Rated) -> Ordering {
+    let key = |c: &Rated| c.recovery_at.map_or((1, 0), |at| (0, at));
+    key(a).cmp(&key(b)).then_with(|| most_headroom(a, b))
 }
 
 /// §11.2 step 9: why nothing ranked.
@@ -467,7 +683,7 @@ fn nothing_ranked(t: &Triggered, active: &Rated, oauth: &[Rated], now: i64) -> D
 }
 
 /// §11.2 steps 2 and 4–9 (the engine owns steps 1, 3, 10–12). Pure.
-pub fn decide(s: &Snapshot, st: &AutoState, cfg: &AutoConfig, _phase: Phase) -> Decided {
+pub fn decide(s: &Snapshot, st: &AutoState, cfg: &AutoConfig, phase: Phase) -> Decided {
     let kept = st.unhealthy_ticks;
     // Step 2: tagteam never acts on a login it does not manage.
     let active = match &s.live {
@@ -508,15 +724,43 @@ pub fn decide(s: &Snapshot, st: &AutoState, cfg: &AutoConfig, _phase: Phase) -> 
         .filter(|a| !a.api_key)
         .map(|a| Rated::of(a, cfg, s.now))
         .collect();
-    let targets = rank(&oauth);
+    let ranking = Ranking {
+        cfg,
+        st,
+        trigger: t.trigger,
+        active: &active,
+        now: s.now,
+    };
+    let mut targets = rank(&ranking, &oauth);
+    // Steps 9 and 10: at-limit and failover fall back to the API keys, in position order.
+    if t.trigger.must_move() {
+        let mut keys: Vec<&AccountSnapshot> =
+            candidates.iter().copied().filter(|a| a.api_key).collect();
+        keys.sort_by_key(|a| a.position);
+        targets.extend(keys.into_iter().map(|a| a.id.clone()));
+    }
     if targets.is_empty() {
         return nothing_ranked(&t, &active, &oauth, s.now);
+    }
+    // Decision 2: after its re-check, a consume-first switch tries only freshly read targets. A
+    // stale first target is `stale-usage`; a stale later one is dropped. A trigger the re-check
+    // turned into another one moves as it would have without it.
+    if phase == Phase::Rechecked && t.trigger == Trigger::ConsumeFirst {
+        let stale = |id: &AccountId| {
+            oauth
+                .iter()
+                .any(|c| &c.account.id == id && !fresh_after_recheck(c.account.fetched_at, s.now))
+        };
+        if stale(&targets[0]) {
+            return no_switch(NoSwitchReason::StaleUsage, String::new(), t.unhealthy_ticks);
+        }
+        targets.retain(|id| !stale(id));
     }
     Decided {
         decision: Decision::Switch {
             trigger: t.trigger,
             targets,
-            recheck: false,
+            recheck: phase == Phase::Initial && t.trigger == Trigger::ConsumeFirst,
         },
         unhealthy_ticks: t.unhealthy_ticks,
     }
@@ -1452,5 +1696,619 @@ mod tests {
         assert!(!announces_sleep(90, &c));
         assert!(announces_sleep(91, &c));
         assert!(announces_sleep(600, &c));
+    }
+
+    /// The engine switched `from` → `to` an hour ago (past the cooldown), leaving `from` with
+    /// this departure snapshot.
+    fn left(
+        from: u32,
+        to: u32,
+        trigger: Option<Trigger>,
+        headroom: Option<f64>,
+        recovery_at: Option<i64>,
+    ) -> AutoState {
+        AutoState {
+            last_switch_at: Some(NOW - 3_600),
+            last_switch_from: Some(id(from)),
+            last_switch_to: Some(id(to)),
+            left_headroom: headroom,
+            left_recovery_at: recovery_at,
+            left_trigger: trigger,
+            unhealthy_ticks: 0,
+        }
+    }
+
+    /// `cfg()` with a 5-point hysteresis, so the bar, not the hysteresis, decides.
+    fn loose() -> AutoConfig {
+        AutoConfig {
+            hysteresis_pct: 5.0,
+            ..cfg()
+        }
+    }
+
+    fn rated(a: &AccountSnapshot) -> Rated<'_> {
+        Rated::of(a, &cfg(), NOW)
+    }
+
+    #[test]
+    fn a_landing_is_below_the_threshold_unless_every_account_is_above_it() {
+        assert!(landing_ok(11.0, 90.0, false));
+        assert!(!landing_ok(10.0, 90.0, false));
+        assert!(landing_ok(10.0, 90.0, true));
+        assert!(landing_ok(1.0, 90.0, true));
+    }
+
+    #[test]
+    fn hysteresis_is_the_candidate_minus_the_active_account_at_least_the_setting() {
+        assert!(beats_by_hysteresis(15.0, 5.0, 10.0));
+        assert!(!beats_by_hysteresis(14.9, 5.0, 10.0));
+        assert!(
+            beats_by_hysteresis(5.0, 5.0, 0.0),
+            "a zero hysteresis lets a tie through"
+        );
+    }
+
+    #[test]
+    fn every_account_above_counts_the_active_account_and_every_known_candidate() {
+        let (a, b, low, u) = (at(2, 92.0), at(3, 100.0), at(4, 80.0), unknown(5));
+        assert!(every_account_above(
+            Some(5.0),
+            &[rated(&a), rated(&b), rated(&u)],
+            90.0
+        ));
+        assert!(!every_account_above(
+            Some(5.0),
+            &[rated(&a), rated(&low)],
+            90.0
+        ));
+        assert!(!every_account_above(Some(20.0), &[rated(&a)], 90.0));
+        assert!(!every_account_above(None, &[rated(&a)], 90.0));
+    }
+
+    #[test]
+    fn the_recovery_axis_is_useful_when_both_are_spent_or_either_recovers_within_4_h() {
+        let far = Some(NOW + 86_400);
+        assert!(recovery_axis_useful(3.0, 2.0, far, far, NOW));
+        assert!(!recovery_axis_useful(3.1, 2.0, far, far, NOW));
+        assert!(!recovery_axis_useful(2.0, 3.1, far, far, NOW));
+        assert!(recovery_axis_useful(8.0, 9.0, Some(NOW + 14_400), far, NOW));
+        assert!(recovery_axis_useful(8.0, 9.0, far, Some(NOW + 14_400), NOW));
+        assert!(!recovery_axis_useful(
+            8.0,
+            9.0,
+            Some(NOW + 14_401),
+            None,
+            NOW
+        ));
+    }
+
+    #[test]
+    fn the_recovery_axis_needs_a_recovery_300_s_sooner_and_unknown_sorts_last() {
+        assert!(recovers_sooner(Some(NOW + 100), Some(NOW + 400)));
+        assert!(!recovers_sooner(Some(NOW + 101), Some(NOW + 400)));
+        assert!(recovers_sooner(Some(NOW + 100), None));
+        assert!(!recovers_sooner(None, Some(NOW + 400)));
+        assert!(!recovers_sooner(None, None));
+    }
+
+    #[test]
+    fn the_headroom_axis_needs_twice_the_active_headroom_and_dominance_three_more() {
+        assert!(doubles_headroom(8.0, 4.0));
+        assert!(!doubles_headroom(7.9, 4.0));
+        assert!(dominates(11.1, 4.0));
+        assert!(!dominates(11.0, 4.0), "more than 2 × 4 + 3");
+    }
+
+    #[test]
+    fn consume_first_needs_a_strictly_sooner_known_long_reset() {
+        assert!(resets_sooner(Some(NOW + 10), Some(NOW + 11)));
+        assert!(!resets_sooner(Some(NOW + 11), Some(NOW + 11)));
+        assert!(!resets_sooner(None, Some(NOW + 11)));
+        assert!(!resets_sooner(Some(NOW + 10), None));
+    }
+
+    #[test]
+    fn a_rechecked_reading_is_fresh_for_180_s() {
+        assert!(fresh_after_recheck(Some(NOW - 180), NOW));
+        assert!(!fresh_after_recheck(Some(NOW - 181), NOW));
+        assert!(fresh_after_recheck(Some(NOW + 30), NOW));
+        assert!(!fresh_after_recheck(None, NOW));
+    }
+
+    #[test]
+    fn best_skips_unknown_exhausted_and_short_of_hysteresis_candidates() {
+        let s = snap(
+            1,
+            vec![
+                at(1, 95.0),
+                unknown(2),
+                at(3, 100.0),
+                at(4, 86.0),
+                at(5, 85.0),
+                at(6, 70.0),
+                at(7, 70.0),
+            ],
+        );
+        let d = run(&s, &AutoState::default(), &cfg());
+        assert_eq!(switched(&d), (Trigger::Proactive, vec![6, 7, 5]));
+    }
+
+    #[test]
+    fn a_proactive_landing_is_below_the_threshold_while_any_account_is() {
+        let none = AutoConfig {
+            hysteresis_pct: 0.0,
+            ..cfg()
+        };
+        let s = snap(1, vec![at(1, 96.0), at(2, 92.0), at(3, 89.0)]);
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &none)),
+            (Trigger::Proactive, vec![3])
+        );
+    }
+
+    #[test]
+    fn with_every_account_above_spent_accounts_move_only_for_a_recovery_300_s_sooner() {
+        let st = AutoState::default();
+        let s = |reset_at| {
+            snap(
+                1,
+                vec![at(1, 98.0), reset(at(2, 97.5), "7d", Some(reset_at))],
+            )
+        };
+        assert_eq!(
+            switched(&run(&s(NOW + 86_100), &st, &cfg())),
+            (Trigger::Proactive, vec![2]),
+            "no hysteresis on this axis"
+        );
+        assert_eq!(
+            stopped(&run(&s(NOW + 86_101), &st, &cfg())),
+            (NoQualifyingCandidate, Outcome::Blocked, "")
+        );
+    }
+
+    #[test]
+    fn with_every_account_above_and_recoveries_far_off_a_candidate_needs_twice_the_headroom() {
+        let st = AutoState::default();
+        let s = |pct| snap(1, vec![at(1, 96.0), at(2, pct)]);
+        assert_eq!(
+            switched(&run(&s(92.0), &st, &cfg())),
+            (Trigger::Proactive, vec![2])
+        );
+        assert_eq!(
+            stopped(&run(&s(92.1), &st, &cfg())).0,
+            NoQualifyingCandidate
+        );
+    }
+
+    #[test]
+    fn the_binding_window_is_selected_before_its_reset() {
+        // 2's 5h (91%) resets within 4 h, but its 7d (93%) binds and resets in a day: the
+        // headroom axis judges it, and 7 is not twice 4.
+        let s = snap(1, vec![at(1, 96.0), oauth(2, 91.0, 93.0)]);
+        assert_eq!(
+            stopped(&run(&s, &AutoState::default(), &cfg())).0,
+            NoQualifyingCandidate
+        );
+    }
+
+    #[test]
+    fn with_every_account_above_the_soonest_recovery_ranks_first_and_an_unknown_one_last() {
+        let s = snap(
+            1,
+            vec![
+                at(1, 98.0),
+                reset(at(2, 97.0), "7d", Some(NOW + 50_000)),
+                reset(at(3, 98.0), "7d", Some(NOW + 40_000)),
+                reset(at(4, 97.5), "7d", Some(NOW + 40_000)),
+                reset(at(5, 91.0), "7d", None),
+            ],
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &cfg())),
+            (Trigger::Proactive, vec![4, 3, 2, 5])
+        );
+    }
+
+    #[test]
+    fn consume_first_moves_only_to_a_sooner_long_reset_soonest_first() {
+        let s = snap(
+            1,
+            vec![
+                at(1, 40.0),
+                reset(at(2, 10.0), "7d", Some(NOW + 40_000)),
+                reset(at(3, 30.0), "7d", Some(NOW + 20_000)),
+                reset(at(4, 50.0), "7d", Some(NOW + 20_000)),
+                at(5, 10.0),
+                reset(at(6, 10.0), "7d", None),
+                reset(at(7, 95.0), "7d", Some(NOW + 1_000)),
+            ],
+        );
+        let d = run(&s, &AutoState::default(), &consume_first());
+        assert_eq!(
+            d.decision,
+            Decision::Switch {
+                trigger: Trigger::ConsumeFirst,
+                targets: vec![id(3), id(4), id(2)],
+                recheck: true,
+            },
+            "no hysteresis; an equal, unknown or above-threshold reset is skipped"
+        );
+    }
+
+    #[test]
+    fn at_limit_and_failover_skip_every_anti_flap_gate() {
+        let bar = left(2, 1, Some(Trigger::Proactive), Some(5.0), None);
+        let s = snap(1, vec![at(1, 100.0), at(2, 95.0), at(3, 99.0), unknown(4)]);
+        assert_eq!(
+            switched(&run(&s, &bar, &cfg())),
+            (Trigger::AtLimit, vec![2, 3])
+        );
+        let mut dead = at(1, 50.0);
+        dead.quarantined = true;
+        let s = snap(1, vec![dead, at(2, 95.0), at(3, 99.0), unknown(4)]);
+        assert_eq!(
+            switched(&run(&s, &bar, &cfg())),
+            (Trigger::Failover, vec![2, 3])
+        );
+    }
+
+    #[test]
+    fn the_no_return_bar_holds_a_proactive_return_until_the_left_account_recovers() {
+        // The engine left 2 at 90% for 1. 1 is at 95% now.
+        let bar = left(
+            2,
+            1,
+            Some(Trigger::Proactive),
+            Some(10.0),
+            Some(NOW + 86_400),
+        );
+        let s = |pct| snap(1, vec![at(1, 95.0), at(2, pct)]);
+        assert_eq!(
+            stopped(&run(&s(87.1), &bar, &loose())),
+            (NoQualifyingCandidate, Outcome::Blocked, ""),
+            "2.9 points better is not recovered"
+        );
+        assert_eq!(
+            switched(&run(&s(87.0), &bar, &loose())),
+            (Trigger::Proactive, vec![2]),
+            "3 points better is"
+        );
+    }
+
+    #[test]
+    fn dominance_over_the_active_account_lifts_the_bar() {
+        // 1 is at 99%: more than 2 × 1 + 3 = 5 points dominates. Every account is above the
+        // threshold, so the headroom axis then judges the return.
+        let bar = left(
+            2,
+            1,
+            Some(Trigger::Proactive),
+            Some(10.0),
+            Some(NOW + 86_400),
+        );
+        let s = |pct| snap(1, vec![at(1, 99.0), at(2, pct)]);
+        assert_eq!(
+            switched(&run(&s(94.0), &bar, &loose())),
+            (Trigger::Proactive, vec![2])
+        );
+        assert_eq!(
+            stopped(&run(&s(95.1), &bar, &loose())).0,
+            NoQualifyingCandidate
+        );
+    }
+
+    #[test]
+    fn a_binding_recovery_300_s_sooner_lifts_the_bar() {
+        let s = snap(1, vec![at(1, 95.0), at(2, 88.0)]);
+        let bar = |then| left(2, 1, Some(Trigger::Proactive), Some(10.0), then);
+        assert_eq!(
+            switched(&run(&s, &bar(Some(NOW + 86_700)), &loose())).1,
+            vec![2]
+        );
+        assert_eq!(
+            stopped(&run(&s, &bar(Some(NOW + 86_699)), &loose())).0,
+            NoQualifyingCandidate
+        );
+        assert_eq!(
+            stopped(&run(&s, &bar(None), &loose())).0,
+            NoQualifyingCandidate,
+            "the recovery leg needs both recoveries known"
+        );
+    }
+
+    #[test]
+    fn the_bar_lifts_only_when_the_barred_ranking_is_empty() {
+        let bar = left(
+            2,
+            1,
+            Some(Trigger::Proactive),
+            Some(10.0),
+            Some(NOW + 86_400),
+        );
+        let s = snap(1, vec![at(1, 95.0), at(2, 70.0), at(3, 80.0)]);
+        assert_eq!(
+            switched(&run(&s, &bar, &loose())),
+            (Trigger::Proactive, vec![3]),
+            "2 has recovered and has more room, but 3 qualifies"
+        );
+    }
+
+    #[test]
+    fn the_bar_holds_only_while_the_engine_sits_where_it_switched_to() {
+        // You switched to 3 by hand: 2 is no longer barred.
+        let bar = left(
+            2,
+            1,
+            Some(Trigger::Proactive),
+            Some(10.0),
+            Some(NOW + 86_400),
+        );
+        let s = snap(3, vec![at(1, 50.0), at(2, 87.1), at(3, 95.0)]);
+        assert_eq!(
+            switched(&run(&s, &bar, &loose())),
+            (Trigger::Proactive, vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn a_missing_departure_snapshot_lifts_the_bar() {
+        let s = snap(1, vec![at(1, 95.0), at(2, 87.1), at(3, 88.0)]);
+        for bar in [
+            left(2, 1, None, Some(10.0), Some(NOW + 86_400)),
+            left(2, 1, Some(Trigger::Proactive), None, Some(NOW + 86_400)),
+        ] {
+            assert_eq!(
+                switched(&run(&s, &bar, &loose())),
+                (Trigger::Proactive, vec![2, 3]),
+                "{bar:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failover_departure_is_judged_on_the_landing_and_recovery_legs() {
+        let bar = |headroom, then| left(2, 1, Some(Trigger::Failover), headroom, then);
+        let below = snap(1, vec![at(1, 95.0), at(2, 87.1)]);
+        assert_eq!(
+            switched(&run(&below, &bar(None, None), &loose())).1,
+            vec![2],
+            "the landing leg: 2 is below the threshold now"
+        );
+        // 2 at 94% dominates 1 at 99% and is 5 points above a remembered 99%, but neither leg
+        // counts for a failover departure.
+        let above = snap(1, vec![at(1, 99.0), at(2, 94.0)]);
+        assert_eq!(
+            stopped(&run(&above, &bar(Some(1.0), None), &loose())).0,
+            NoQualifyingCandidate
+        );
+        assert_eq!(
+            switched(&run(&above, &bar(None, Some(NOW + 86_700)), &loose())).1,
+            vec![2],
+            "the recovery leg"
+        );
+    }
+
+    #[test]
+    fn the_bar_holds_a_consume_first_return_too() {
+        let bar = left(
+            2,
+            1,
+            Some(Trigger::ConsumeFirst),
+            Some(68.0),
+            Some(NOW + 20_000),
+        );
+        let s = |pct| {
+            snap(
+                1,
+                vec![at(1, 40.0), reset(at(2, pct), "7d", Some(NOW + 20_000))],
+            )
+        };
+        assert_eq!(
+            stopped(&run(&s(30.0), &bar, &consume_first())),
+            (AlreadyConsumingSoonest, Outcome::NoAction, "")
+        );
+        assert_eq!(
+            switched(&run(&s(29.0), &bar, &consume_first())),
+            (Trigger::ConsumeFirst, vec![2])
+        );
+    }
+
+    #[test]
+    fn at_limit_or_failover_with_no_oauth_target_falls_back_to_api_keys_in_position_order() {
+        let s = snap(
+            1,
+            vec![
+                at(1, 100.0),
+                unknown(2),
+                api_key(5),
+                api_key(3),
+                at(4, 100.0),
+            ],
+        );
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &with_keys())),
+            (Trigger::AtLimit, vec![3, 5])
+        );
+        let mut dead = at(1, 40.0);
+        dead.quarantined = true;
+        let s = snap(1, vec![dead, api_key(3), unknown(2)]);
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &with_keys())),
+            (Trigger::Failover, vec![3])
+        );
+    }
+
+    #[test]
+    fn api_keys_follow_every_oauth_target_and_never_a_proactive_one() {
+        let s = |active| snap(1, vec![active, api_key(3), at(2, 50.0)]);
+        assert_eq!(
+            switched(&run(&s(at(1, 100.0)), &AutoState::default(), &with_keys())),
+            (Trigger::AtLimit, vec![2, 3])
+        );
+        assert_eq!(
+            switched(&run(&s(at(1, 95.0)), &AutoState::default(), &with_keys())),
+            (Trigger::Proactive, vec![2])
+        );
+    }
+
+    #[test]
+    fn a_way_back_from_an_api_key_lands_below_the_threshold_even_when_every_account_is_above() {
+        let s = snap(1, vec![api_key(1), at(2, 95.0), at(3, 92.0)]);
+        assert_eq!(
+            stopped(&run(&s, &AutoState::default(), &with_keys())).0,
+            NoQualifyingCandidate
+        );
+        let s = snap(1, vec![api_key(1), at(2, 95.0), at(3, 92.0), at(4, 80.0)]);
+        assert_eq!(
+            switched(&run(&s, &AutoState::default(), &with_keys())),
+            (Trigger::Proactive, vec![4])
+        );
+    }
+
+    #[test]
+    fn consume_first_asks_for_a_recheck_only_in_the_initial_phase() {
+        let s = snap(
+            1,
+            vec![at(1, 40.0), reset(at(2, 10.0), "7d", Some(NOW + 600))],
+        );
+        let st = AutoState::default();
+        let recheck = |d: Decided| match d.decision {
+            Decision::Switch { recheck, .. } => recheck,
+            other => panic!("{other:?}"),
+        };
+        assert!(recheck(decide(&s, &st, &consume_first(), Phase::Initial)));
+        assert!(!recheck(decide(
+            &s,
+            &st,
+            &consume_first(),
+            Phase::Rechecked
+        )));
+        let proactive = snap(1, vec![at(1, 95.0), at(2, 10.0)]);
+        assert!(!recheck(decide(&proactive, &st, &cfg(), Phase::Initial)));
+    }
+
+    #[test]
+    fn after_a_recheck_a_consume_first_target_must_have_been_read_within_180_s() {
+        let read = |a: AccountSnapshot, at| AccountSnapshot {
+            fetched_at: Some(at),
+            ..a
+        };
+        let s = |first_read| {
+            snap(
+                1,
+                vec![
+                    at(1, 40.0),
+                    read(reset(at(2, 10.0), "7d", Some(NOW + 600)), first_read),
+                    reset(at(3, 10.0), "7d", Some(NOW + 900)),
+                ],
+            )
+        };
+        let st = AutoState::default();
+        let d = decide(&s(NOW - 180), &st, &consume_first(), Phase::Rechecked);
+        assert_eq!(switched(&d), (Trigger::ConsumeFirst, vec![2, 3]));
+        let d = decide(&s(NOW - 181), &st, &consume_first(), Phase::Rechecked);
+        assert_eq!(stopped(&d), (StaleUsage, Outcome::NoAction, ""));
+        assert_eq!(d.unhealthy_ticks, 0);
+        assert_eq!(
+            switched(&decide(
+                &s(NOW - 181),
+                &st,
+                &consume_first(),
+                Phase::Initial
+            ))
+            .0,
+            Trigger::ConsumeFirst,
+            "the initial phase ranks on stored readings"
+        );
+        // The re-check found the active account at its limit: at-limit moves at once.
+        let stale = |a: AccountSnapshot| read(a, NOW - 4_000);
+        let s = snap(1, vec![at(1, 100.0), stale(at(2, 10.0))]);
+        assert_eq!(
+            switched(&decide(&s, &st, &consume_first(), Phase::Rechecked)),
+            (Trigger::AtLimit, vec![2])
+        );
+    }
+
+    #[test]
+    fn after_a_recheck_a_stale_later_consume_first_target_is_dropped() {
+        // The re-check could not refresh 3's reading; 2's and 4's were taken within 180 s. A
+        // tick that cannot switch to 2 tries 4 next, never 3.
+        let stale = |a: AccountSnapshot| AccountSnapshot {
+            fetched_at: Some(NOW - 181),
+            ..a
+        };
+        let s = snap(
+            1,
+            vec![
+                at(1, 40.0),
+                reset(at(2, 10.0), "7d", Some(NOW + 600)),
+                stale(reset(at(3, 10.0), "7d", Some(NOW + 900))),
+                reset(at(4, 10.0), "7d", Some(NOW + 1_200)),
+            ],
+        );
+        let st = AutoState::default();
+        assert_eq!(
+            switched(&decide(&s, &st, &consume_first(), Phase::Rechecked)),
+            (Trigger::ConsumeFirst, vec![2, 4])
+        );
+        assert_eq!(
+            switched(&run(&s, &st, &consume_first())).1,
+            vec![2, 3, 4],
+            "the initial phase ranks on stored readings"
+        );
+    }
+
+    #[test]
+    fn every_account_at_its_limit_for_days_never_flaps_and_sleeps_at_most_600_s() {
+        // Review Focus 4: the weekly window is spent everywhere. 2 recovers first, in a day.
+        let spent = |p, back| reset(at(p, 100.0), "7d", Some(back));
+        let day = 86_400;
+        let accounts = vec![
+            spent(1, NOW + 2 * day),
+            spent(2, NOW + day),
+            spent(3, NOW + 3 * day),
+        ];
+        let st = AutoState::default();
+        let mut now = NOW;
+        let mut ticks = 0;
+        while now < NOW + day {
+            let s = Snapshot {
+                now,
+                live: Live::Managed(id(1)),
+                accounts: accounts.clone(),
+            };
+            let d = run(&s, &st, &cfg());
+            assert_eq!(
+                d.decision,
+                Decision::NoSwitch {
+                    reason: AllExhausted,
+                    outcome: Outcome::Blocked,
+                    detail: span(NOW + day - now),
+                    earliest_reset: Some(NOW + day),
+                },
+                "no switch between exhausted accounts"
+            );
+            let delay = next_delay(&d.decision, &cfg(), now, None, 0.0);
+            assert!((60..=600).contains(&delay), "{delay}");
+            now += delay;
+            ticks += 1;
+        }
+        assert!(ticks >= 144, "a day at no more than 600 s a tick: {ticks}");
+        // 2's week resets: the next tick moves there at once, and only there.
+        let mut back = accounts.clone();
+        back[1] = reset(at(2, 0.0), "7d", Some(NOW + 8 * day));
+        let s = Snapshot {
+            now,
+            live: Live::Managed(id(1)),
+            accounts: back.clone(),
+        };
+        assert_eq!(switched(&run(&s, &st, &cfg())), (Trigger::AtLimit, vec![2]));
+        // On 2, nothing pulls it back to an exhausted account.
+        let s = Snapshot {
+            now: now + 60,
+            live: Live::Managed(id(2)),
+            accounts: back,
+        };
+        assert_eq!(stopped(&run(&s, &st, &cfg())).0, BelowThreshold);
     }
 }
