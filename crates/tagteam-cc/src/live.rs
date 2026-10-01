@@ -68,6 +68,9 @@ pub struct Snapshot {
 pub struct LiveStore {
     keychain: Arc<dyn Keychain>,
     platform: Platform,
+    /// Appendix A.3: a credential-entry write of the current operation fell back to the file,
+    /// so the operation's later writes go there too. Cleared when the operation's credential
+    /// locks are released (`ClaudeCode::lock_credentials`) and by `restore`.
     file_mode_pinned: AtomicBool,
     retry_delay: Duration,
 }
@@ -178,6 +181,12 @@ impl LiveStore {
 
     pub fn file_mode_pinned(&self) -> bool {
         self.file_mode_pinned.load(Ordering::SeqCst)
+    }
+
+    /// Ends the file-mode pin: the next credential-entry write tries the Keychain again
+    /// (Appendix A.3).
+    pub(crate) fn unpin_file_mode(&self) {
+        self.file_mode_pinned.store(false, Ordering::SeqCst);
     }
 
     fn mac(&self) -> bool {
@@ -335,8 +344,9 @@ impl LiveStore {
     }
 
     /// Appendix A.3 write, including the verified file fallback, which first reports every
-    /// item it will delete to `before_fallback`. Returns where this write put the credential:
-    /// a file mirrored for hot reload does not make it a file store.
+    /// item it will delete to `before_fallback`. A fallback pins file mode, so every later
+    /// write of the same operation goes straight to the file. Returns where this write put the
+    /// credential: a file mirrored for hot reload does not make it a file store.
     pub fn write_credential_entry(
         &self,
         env: &Env,
@@ -585,6 +595,10 @@ impl LiveStore {
         snap: &Snapshot,
         fence: Fence<'_>,
     ) -> Result<(), ProviderError> {
+        // A rollback clears the pin (Appendix A.3): the items put back below are what CC reads
+        // first, so a later write of this operation that stayed on the file would sit behind
+        // them. Trying the Keychain first is always safe; a refusal falls back again.
+        self.unpin_file_mode();
         let acct = keychain_account(env);
         let mut failed: Vec<String> = Vec::new();
         let global_config_name = paths.global_config.display().to_string();

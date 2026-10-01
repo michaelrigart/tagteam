@@ -8,9 +8,9 @@ use tagteam_provider::http::Http;
 use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
     BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
-    Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLocks,
-    MutationGuard, Pace, PollBudget, Provider, ProviderError, Read, StoredLogin, Undo, UsageResult,
-    Window, Written,
+    Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
+    LockError, MutationGuard, Pace, PollBudget, Provider, ProviderError, Read, StoredLogin, Undo,
+    UsageResult, Window, Written,
 };
 
 use crate::config;
@@ -67,6 +67,27 @@ impl ClaudeCode {
     pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_budget = timeout;
         self
+    }
+}
+
+/// CC's credential locks, held for one operation: a switch, a recovery, a §7.5 pass or an
+/// `add`. Releasing them ends the operation, and with it the Keychain file-mode pin (Appendix
+/// A.3), so the next operation tries the Keychain again.
+struct OperationLocks {
+    set: locks::CcCredSet,
+    live: Arc<LiveStore>,
+}
+
+impl LiveLockSet for OperationLocks {
+    fn check_owned(&self) -> Result<(), LockError> {
+        self.set.check_owned()
+    }
+}
+
+impl Drop for OperationLocks {
+    fn drop(&mut self) {
+        // Runs before `set` is dropped, so the pin ends while the locks are still held.
+        self.live.unpin_file_mode();
     }
 }
 
@@ -320,7 +341,13 @@ impl Provider for ClaudeCode {
         budget: Duration,
     ) -> Result<CredLocks<'g>, ProviderError> {
         let set = locks::acquire_credentials(&CcPaths::resolve(env), budget, &env.cancel)?;
-        Ok(CredLocks::new(g, Box::new(set)))
+        Ok(CredLocks::new(
+            g,
+            Box::new(OperationLocks {
+                set,
+                live: self.live.clone(),
+            }),
+        ))
     }
 
     fn lock_config<'g>(
