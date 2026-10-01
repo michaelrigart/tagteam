@@ -179,6 +179,30 @@ fn with_the_live_identity_unreadable_the_live_credential_still_decides() {
 }
 
 #[test]
+fn a_live_credential_with_no_token_to_compare_still_holds_the_live_quarantine() {
+    // An empty live read (a Keychain timeout can look like that) or a torn credential carries
+    // no fingerprint: it may be the bound generation, so only a provably other one releases.
+    for unreadable in [&b""[..], b"{\"claudeAiOauth\": "] {
+        let fx = Fx::new();
+        fx.add("b@x.co", "rt-b");
+        let a = fx.add("a@x.co", "rt-a"); // live: rt-a
+        let bound = vault_fp(&fx, &a);
+        fx.quarantine(&a, "invalid_grant", &bound);
+        fx.put_vault(&a, &credential("a@x.co", "rt-a2"));
+        fx.set_live_credential(unreadable);
+        assert!(matches!(
+            gate(&fx, &a),
+            GateOutcome::Dead(QuarantineReason::InvalidGrant)
+        ));
+        assert_eq!(
+            quarantine_of(&fx, &a),
+            (Some("invalid_grant".into()), Some(bound))
+        );
+        assert_eq!(token_requests(&fx), 0);
+    }
+}
+
+#[test]
 fn a_token_another_process_already_refreshed_is_returned_without_a_request() {
     let fx = Fx::new();
     let a = due(&fx);

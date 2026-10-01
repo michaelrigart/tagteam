@@ -7,7 +7,9 @@ mod common;
 
 use std::fs;
 
-use common::{Fx, credential, quarantine_of, usage_bearers, usage_fixture, vault_fp};
+use common::{
+    API_KEY, Fx, OTHER_API_KEY, credential, quarantine_of, usage_bearers, usage_fixture, vault_fp,
+};
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, PollBudget, PollPlan, Window, WindowKind};
 use tagteam_engine::EngineError;
@@ -667,4 +669,107 @@ fn a_pick_that_stops_being_a_candidate_while_the_switch_waits_is_replaced_from_t
     assert_eq!((out.switched, out.to.map(|r| r.id)), (true, Some(b)));
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
     assert!(usage_bearers(&fx).is_empty());
+}
+
+#[test]
+fn a_live_credential_with_no_token_to_compare_holds_the_live_quarantine() {
+    // An empty live read, as a Keychain timeout can look, or a torn credential, may be exactly
+    // the bound generation (§7.4): only an absent one, or one carrying another, lets go.
+    for unreadable in [&b""[..], b"{\"claudeAiOauth\": "] {
+        let fx = Fx::new();
+        fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b"); // live: rt-b
+        let bound = vault_fp(&fx, &b);
+        fx.quarantine(&b, "invalid_grant", &bound);
+        fx.put_vault(&b, &credential("b@x.co", "rt-b2"));
+        fx.set_live_credential(unreadable);
+        assert!(
+            fx.engine
+                .release_unbound_quarantines(&fx.provider(), "cli")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            quarantine_of(&fx, &b),
+            (Some("invalid_grant".into()), Some(bound))
+        );
+    }
+}
+
+#[test]
+fn a_live_account_with_no_live_credential_has_nothing_the_quarantine_binds() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live: rt-b
+    fx.quarantine(&b, "invalid_grant", &vault_fp(&fx, &b));
+    fx.put_vault(&b, &credential("b@x.co", "rt-b2"));
+    fx.kc
+        .delete(
+            &keychain_service(&fx.env, ItemKind::OAuth),
+            &keychain_account(&fx.env),
+        )
+        .unwrap();
+    assert_eq!(
+        fx.engine
+            .release_unbound_quarantines(&fx.provider(), "cli")
+            .unwrap(),
+        [b]
+    );
+}
+
+#[test]
+fn a_managed_key_account_s_quarantine_follows_the_live_key_the_same_way() {
+    // The managed-key axis: an empty live key may be the bound one, another key is not.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let k = fx.add_api_key(API_KEY);
+    fx.switch_to(&k, false).unwrap(); // k is live, on its managed key
+    fx.quarantine(&k, "invalid_grant", &vault_fp(&fx, &k));
+    fx.put_vault(&k, OTHER_API_KEY.as_bytes());
+    let release = || {
+        fx.engine
+            .release_unbound_quarantines(&fx.provider(), "cli")
+            .unwrap()
+    };
+    fx.put_managed_key(b"");
+    assert!(release().is_empty(), "an empty key is not another key");
+    fx.put_managed_key(API_KEY.as_bytes());
+    assert!(release().is_empty(), "still the bound key");
+    fx.put_managed_key(OTHER_API_KEY.as_bytes());
+    assert_eq!(release(), [k]);
+}
+
+/// §14.1: an interruption while collecting ends the command with the signal. It is not a
+/// usage failure, so the strategy never goes on to rank, and nothing is switched.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_interrupted_collection_ends_the_strategy_with_the_signal_and_no_switch() {
+    for strategy in [UsageStrategy::Best, UsageStrategy::NextAvailable] {
+        let fx = Fx::new();
+        let (a, b, c) = three(&fx);
+        for id in [&a, &b, &c] {
+            record_at(&fx, id, &reading(10.0, 10.0, 0.0), T0 - 200, T0 - 200);
+        }
+        let cancel = fx.engine.cancel().clone();
+        fx.engine.on_point(
+            "usage-before-send",
+            Box::new(move || cancel.request(libc::SIGINT)),
+        );
+        let err = fx
+            .engine
+            .switch(request(&fx, usage(strategy, None)))
+            .unwrap_err();
+        assert_eq!(err.signal(), Some(libc::SIGINT), "{strategy:?}: {err}");
+        assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
+        assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-c"));
+        assert!(
+            fx.engine
+                .store()
+                .unwrap()
+                .events()
+                .unwrap()
+                .iter()
+                .all(|e| e.kind != "switch")
+        );
+    }
 }

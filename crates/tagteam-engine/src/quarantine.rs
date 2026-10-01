@@ -132,8 +132,10 @@ impl Engine {
 
     /// The live half: whether `row` is the live login and its live credential may still be
     /// the generation the quarantine is bound to. A live identity that cannot be read may be
-    /// `row`'s, so the live credential is compared; a live credential that cannot be read, or a
-    /// degraded one, may be exactly that generation, so it counts as bound.
+    /// `row`'s, so the live credential is compared. A live credential that cannot be read, a
+    /// degraded one, and one with no token to compare (an empty read, as a Keychain timeout can
+    /// look) may be exactly that generation, so each counts as bound. Only an absent credential,
+    /// or one carrying another generation, is not.
     fn live_still_bound(&self, p: &dyn Provider, row: &AccountRow) -> bool {
         let is_live = match p.live_identity(&self.env) {
             Read::Present(i) => p.identity_key(&i).as_str() == row.identity_key,
@@ -159,7 +161,13 @@ impl Engine {
                 Read::Unreadable(_) => return true,
             },
         };
-        live.is_some_and(|bytes| fp_str(p, &bytes) == bound)
+        // Only a live credential that provably carries another generation releases. Bytes with
+        // no token to compare (an empty read, as a Keychain timeout can look, or a torn file)
+        // may be exactly the bound generation, so they count as bound.
+        live.is_some_and(|bytes| {
+            let fp = fp_str(p, &bytes);
+            fp.is_empty() || fp == bound
+        })
     }
 
     /// §7.4 / Decision 9: clears every quarantine of `provider` that no longer binds
