@@ -471,3 +471,29 @@ fn a_rollback_leaves_the_item_cc_refreshed_and_recovery_finishes_forward() {
         "with CC's token kept"
     );
 }
+
+#[test]
+fn a_recovery_stopped_by_cc_writing_the_entry_meanwhile_asks_for_a_plain_retry() {
+    // §9.6: forward recovery to an API key clears the OAuth entry's account keys under CC's
+    // storage-write lock. CC holds the lock and changes the entry by more than a dead-token
+    // marking while recovery waits: the clear aborts (`EntryMoved`) and the row stays. A retry
+    // settles it, so the refusal says that, never `switch --force`, which is for a row recovery
+    // cannot decide.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let k = fx.add_api_key(API_KEY); // leaves a live
+    crashed_switch(&fx, &a, &k);
+    fx.put_managed_key(API_KEY.as_bytes()); // died after storing the key, before the entry
+    let cc = cc_holds_storage_write_from(&fx, "before-mutation-lock", None, cc_marks_dead_and_more);
+
+    let err = fx.engine.remove(&a).unwrap_err();
+    cc_released(&cc);
+
+    assert!(matches!(err, EngineError::RecoveryMoved { .. }), "{err:?}");
+    assert_eq!(err.kind(), "interrupted-switch");
+    let message = err.to_string();
+    assert!(message.contains("retry"), "{message}");
+    assert!(!message.contains("--force"), "{message}");
+    assert!(journal(&fx).is_some(), "the row stays for the retry");
+    assert!(!fx.paths().storage_write_lock.exists());
+}

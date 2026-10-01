@@ -554,7 +554,11 @@ impl Collection<'_> {
         let guard = match self.engine.guard_or_refuse(&self.row.provider) {
             Ok(guard) => guard,
             Err(EngineError::Lock(LockError::Timeout(_))) => return Err(Stop::Moved),
-            Err(e @ (EngineError::InterruptedSwitch(_) | EngineError::RecoveryBlocked { .. })) => {
+            Err(
+                e @ (EngineError::InterruptedSwitch(_)
+                | EngineError::RecoveryBlocked { .. }
+                | EngineError::RecoveryMoved { .. }),
+            ) => {
                 self.warnings.push(format!(
                     "usage for the live {} account was not collected: {e}",
                     self.row.provider
