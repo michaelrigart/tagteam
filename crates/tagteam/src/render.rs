@@ -120,20 +120,9 @@ pub fn list_json(
     })
 }
 
-/// A span of time as `list` and `status` show it: `3d09h`, `2h40m`, `45m`, or `<1m`.
-pub(crate) fn duration(secs: i64) -> String {
-    let s = secs.max(0);
-    let (days, hours, minutes) = (s / 86_400, s % 86_400 / 3_600, s % 3_600 / 60);
-    if days > 0 {
-        format!("{days}d{hours:02}h")
-    } else if hours > 0 {
-        format!("{hours}h{minutes:02}m")
-    } else if minutes > 0 {
-        format!("{minutes}m")
-    } else {
-        "<1m".into()
-    }
-}
+// A span of time as `list` and `status` show it: `3d09h`, `2h40m`, `45m`, or `<1m`. The usage
+// strategies' messages state a reset in the same words, so there is one formatter.
+pub(crate) use tagteam_core::rank::span as duration;
 
 /// The time left until `at`, or `reset` once it has passed: the reading predates the window's
 /// reset, so its pct no longer applies.
