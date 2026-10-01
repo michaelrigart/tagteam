@@ -6,16 +6,19 @@
 # Usage: scripts/cc-drift.sh [--claude PATH] --report FILE
 #
 # Writes a Markdown drift report to FILE, empty when there is no drift.
-# Exit 0: no drift. 1: drift. 2: the harness failed (claude missing, jq missing, ...).
+# Exit 0: no drift. 1: drift. 2: the harness failed (claude missing, jq missing, a probe
+# that cannot be shown to have initialised ~/.claude, ...).
 #
 # Checks (independent, so one failing does not hide another):
 #   a. `claude --version` has the known shape and is not newer than the tested version.
 #   b. `claude auth status --json`, logged out, matches the recorded fixture.
 #   c. Every top-level entry of ~/.claude, after one headless `claude -p` run with a
-#      dummy API key, is on the known-shared or known-private list.
+#      dummy API key, is on the known-shared or known-private list. The probe must have
+#      created ~/.claude/projects/*, else the check proves nothing (harness failure).
 #
 # Data files live in crates/tagteam-cc/compat/ (override: CC_DRIFT_COMPAT_DIR).
-# The probe timeout in seconds defaults to 60 (override: CC_DRIFT_PROBE_TIMEOUT).
+# The probe timeout in seconds defaults to 300 (override: CC_DRIFT_PROBE_TIMEOUT): claude
+# retries the rejected dummy key for about three minutes before it exits.
 
 set -euo pipefail
 
@@ -50,7 +53,7 @@ done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 compat="${CC_DRIFT_COMPAT_DIR:-$script_dir/../crates/tagteam-cc/compat}"
-probe_timeout="${CC_DRIFT_PROBE_TIMEOUT:-60}"
+probe_timeout="${CC_DRIFT_PROBE_TIMEOUT:-300}"
 
 command -v jq >/dev/null || die "jq not found"
 for f in tested-cc-version known-shared known-private auth-status-logged-out.json; do
@@ -84,14 +87,14 @@ HOME="$(cd "$work/home" && pwd -P)"
 export HOME
 cwd="$(cd "$work/cwd" && pwd -P)"
 
-# Portable timeout (macOS has none): run "$@" with stdout to FILE, stdin closed;
-# kill its process group after SECS. Sets run_rc (124 on timeout).
+# Portable timeout (macOS has none): run "$@" with stdout to FILE, stderr to FILE.err and
+# stdin closed; kill its process group after SECS. Sets run_rc (124 on timeout).
 run_rc=0
 run_limited() {
   local secs="$1" out="$2" pid elapsed=0
   shift 2
   set -m
-  "$@" </dev/null >"$out" 2>/dev/null &
+  "$@" </dev/null >"$out" 2>"$out.err" &
   pid=$!
   set +m
   while kill -0 "$pid" 2>/dev/null; do
@@ -200,13 +203,22 @@ fi
 # A logged-out claude creates almost nothing, so run one headless prompt with a
 # dummy key first; the API rejects it and no account is involved.
 probe_out="$work/probe.out"
+probe_rc=0
 (
   cd "$cwd"
   export ANTHROPIC_API_KEY="sk-ant-api03-cc-drift-dummy-not-a-key"
   run_limited "$probe_timeout" "$probe_out" \
     "$claude_bin" -p "Reply with the single word ok." --max-turns 1
-  echo "cc-drift: probe finished (exit $run_rc)" >&2
-) || true
+  exit "$run_rc"
+) || probe_rc=$?
+echo "cc-drift: probe finished (exit $probe_rc)" >&2
+
+# The API rejecting the dummy key (a non-zero exit) is expected, but a probe that never
+# initialised ~/.claude would make the entry check below pass vacuously.
+((probe_rc != 124)) || die "the probe did not finish within ${probe_timeout} s"
+if ! [[ -d "$HOME/.claude/projects" ]] || [[ -z "$(ls -A "$HOME/.claude/projects")" ]]; then
+  die "the probe (exit $probe_rc) did not initialise ~/.claude; stderr tail:"$'\n'"$(tail -n 5 "$probe_out.err")"
+fi
 
 known=()
 while IFS= read -r line; do known+=("$line"); done < <(
