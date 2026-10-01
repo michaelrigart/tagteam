@@ -5,9 +5,10 @@ use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{API_KEY, Fx, OTHER_API_KEY, STRAY_API_KEY, mutation_lock_free};
+use common::{API_KEY, Fx, OTHER_API_KEY, STRAY_API_KEY, mutation_lock_free, usage_fixture};
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
+use tagteam_core::poll::PollPlan;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::AddTokenOptions;
@@ -850,5 +851,242 @@ fn cc_holding_its_refresh_lock_blocks_the_switch_and_changes_nothing() {
     assert!(
         start.elapsed() >= Duration::from_secs(9),
         "the real timeout"
+    );
+}
+
+/// When `id`'s next poll is planned, in seconds from now.
+fn planned_in(fx: &Fx, id: &AccountId) -> i64 {
+    fx.usage_state(id).unwrap().next_poll_at.unwrap() - fx.engine.now_ms() / 1000
+}
+
+/// Gives each of `ids` a reading (and so a plan), then forgets the requests that took.
+fn read_each(fx: &Fx, ids: &[&AccountId]) {
+    for _ in ids {
+        fx.script_usage(200, usage_fixture());
+    }
+    fx.collect(ids);
+    for id in ids {
+        assert!(fx.usage_state(id).unwrap().fetched_at.is_some());
+    }
+    fx.http.clear();
+}
+
+/// Parks `id`'s plan an hour out, so only a re-plan can bring it back.
+fn park_plan(fx: &Fx, id: &AccountId) {
+    fx.engine
+        .store()
+        .unwrap()
+        .set_poll_plan(
+            id,
+            &PollPlan {
+                interval_s: 3_600,
+                next_poll_at: fx.engine.now_ms() / 1000 + 3_600,
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_switch_re_plans_both_accounts_polls_without_fetching() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    read_each(&fx, &[&a, &b]);
+    let (a_read, b_read) = (fx.usage_state(&a).unwrap(), fx.usage_state(&b).unwrap());
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert_eq!(out.reason, SwitchReason::Switched);
+    // §9.4: the incoming account is next due 180 s after its reading, with no jitter.
+    let incoming = fx.usage_state(&a).unwrap();
+    assert_eq!(
+        incoming.next_poll_at,
+        Some(a_read.fetched_at.unwrap() + 180)
+    );
+    assert_eq!(incoming.poll_interval_s, Some(180));
+    // §8.6's candidate default, jittered ±10%, never under the 180 s floor.
+    let outgoing = planned_in(&fx, &b);
+    assert!(
+        (270..=330).contains(&outgoing),
+        "the candidate policy: {outgoing}"
+    );
+    for (id, before) in [(&a, a_read), (&b, b_read)] {
+        let after = fx.usage_state(id).unwrap();
+        assert_eq!(
+            (&after.last_good, after.fetched_at),
+            (&before.last_good, before.fetched_at),
+            "the reading stays"
+        );
+    }
+    assert!(fx.http.requests().is_empty(), "a re-plan never fetches");
+}
+
+#[test]
+fn a_re_plan_keeps_the_last_reading() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.script_usage(200, usage_fixture());
+    fx.collect(&[&a]);
+    let before = fx.usage_state(&a).unwrap();
+    assert!(before.last_good.is_some());
+    fx.http.clear();
+
+    switch(&fx, to(&a), false).unwrap();
+
+    let after = fx.usage_state(&a).unwrap();
+    assert_eq!(
+        (
+            &after.last_good,
+            after.fetched_at,
+            after.consecutive_failures
+        ),
+        (&before.last_good, before.fetched_at, 0)
+    );
+    assert_eq!(after.next_poll_at, Some(before.fetched_at.unwrap() + 180));
+    assert!(fx.http.requests().is_empty());
+}
+
+#[test]
+fn an_incoming_account_with_an_old_reading_is_due_at_once_and_fetched_on_demand() {
+    // §9.4: `max(now, fetched_at + 180)`: a reading two hours old is overdue, not a minute out.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    read_each(&fx, &[&a]);
+    fx.clock.advance_ms(2 * 3_600 * 1_000);
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert_eq!(out.reason, SwitchReason::Switched);
+    let now = fx.engine.now_ms() / 1000;
+    assert_eq!(fx.usage_state(&a).unwrap().next_poll_at, Some(now));
+
+    fx.http.clear();
+    fx.script_usage(200, usage_fixture());
+    fx.collect(&[&a]);
+
+    assert_eq!(
+        fx.http.requests().len(),
+        1,
+        "the next on-demand collect fetches it"
+    );
+}
+
+#[test]
+fn an_account_with_no_reading_is_not_re_planned_and_is_fetched_on_demand() {
+    // §8.3's on-demand rule treats a plan in force as "not due", so a plan here would keep
+    // `list` from reading the account it most needs to read.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    read_each(&fx, &[&b]);
+    // Park b's plan far out, so only a re-plan can bring it back to the candidate policy.
+    park_plan(&fx, &b);
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert_eq!(out.reason, SwitchReason::Switched);
+    assert_eq!(
+        fx.usage_state(&a),
+        None,
+        "the incoming account has no reading: no plan"
+    );
+    let outgoing = planned_in(&fx, &b);
+    assert!(
+        (270..=330).contains(&outgoing),
+        "b has one: the candidate policy: {outgoing}"
+    );
+
+    fx.script_usage(200, usage_fixture());
+    let report = fx.collect(&[&a]);
+
+    assert_eq!(
+        fx.http.requests().len(),
+        1,
+        "the next on-demand collect fetches it"
+    );
+    assert!(
+        fx.usage_state(&a).unwrap().fetched_at.is_some(),
+        "{:?}",
+        report.outcomes
+    );
+}
+
+#[test]
+fn the_outgoing_account_without_a_reading_is_left_unplanned_too() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    read_each(&fx, &[&a]);
+    let read_at = fx.usage_state(&a).unwrap().fetched_at.unwrap();
+
+    switch(&fx, to(&a), false).unwrap();
+
+    assert_eq!(
+        fx.usage_state(&a).unwrap().next_poll_at,
+        Some(read_at + 180)
+    );
+    assert_eq!(fx.usage_state(&b), None, "b was never read: no plan");
+}
+
+#[test]
+fn a_forced_self_switch_plans_only_that_account_as_the_active_one() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    read_each(&fx, &[&b]);
+    let read_at = fx.usage_state(&b).unwrap().fetched_at.unwrap();
+    // Park b's plan far out, so only a re-plan can bring it back to the active policy.
+    park_plan(&fx, &b);
+
+    let out = switch(&fx, to(&b), true).unwrap();
+
+    assert_eq!(out.reason, SwitchReason::Activated);
+    assert_eq!(
+        fx.usage_state(&b).unwrap().next_poll_at,
+        Some(read_at + 180)
+    );
+    assert_eq!(fx.usage_state(&a), None, "a was not part of this switch");
+}
+
+#[test]
+fn a_switch_that_activates_nothing_re_plans_nothing() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+
+    let out = switch(&fx, to(&b), false).unwrap();
+
+    assert_eq!(out.reason, SwitchReason::AlreadyActive);
+    assert_eq!(fx.usage_state(&a), None);
+    assert_eq!(fx.usage_state(&b), None);
+}
+
+#[test]
+fn a_re_plan_that_cannot_be_stored_never_fails_the_switch() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    read_each(&fx, &[&a]);
+    let before = fx.usage_state(&a).unwrap().next_poll_at;
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER no_insert BEFORE INSERT ON usage_state \
+               BEGIN SELECT RAISE(ABORT, 'usage_state is read-only'); END;
+             CREATE TRIGGER no_update BEFORE UPDATE ON usage_state \
+               BEGIN SELECT RAISE(ABORT, 'usage_state is read-only'); END;",
+        )
+        .unwrap();
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert!(out.switched, "{}", out.message);
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert_eq!(
+        fx.usage_state(&a).unwrap().next_poll_at,
+        before,
+        "the plan is as it was"
     );
 }
