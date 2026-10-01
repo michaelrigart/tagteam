@@ -122,6 +122,15 @@ pub struct LiveIdentityCacheRow {
     pub account_uuid: Option<String>,
 }
 
+/// One window's samples since a time: a range on the primary key (account, window, time), so
+/// no scan and no sort.
+const SAMPLES_OF_WINDOW: &str = "SELECT window, fetched_at, pct, resets_at FROM usage_samples \
+     WHERE account_id = ?1 AND window = ?2 AND fetched_at >= ?3 ORDER BY fetched_at";
+
+/// Every window's samples since a time.
+const SAMPLES_OF_ALL: &str = "SELECT window, fetched_at, pct, resets_at FROM usage_samples \
+     WHERE account_id = ?1 AND fetched_at >= ?2 ORDER BY fetched_at, window";
+
 fn lease_name(id: &AccountId) -> String {
     format!("usage:{id}")
 }
@@ -536,7 +545,8 @@ impl Store {
     }
 
     /// The account's samples fetched at or after `since_s`, ascending by `fetched_at` (then
-    /// window key); `window = None` means every window.
+    /// window key); `window = None` means every window. One window is read along the primary
+    /// key (account, window, time), never by scanning the account's samples.
     pub fn usage_samples(
         &self,
         id: &AccountId,
@@ -544,23 +554,26 @@ impl Store {
         since_s: i64,
     ) -> Result<Vec<(String, Sample)>, StoreError> {
         let c = self.lock();
-        let mut stmt = c.prepare(
-            "SELECT window, fetched_at, pct, resets_at FROM usage_samples \
-             WHERE account_id = ?1 AND fetched_at >= ?2 AND (?3 IS NULL OR window = ?3) \
-             ORDER BY fetched_at, window",
-        )?;
-        let rows = stmt
-            .query_map(params![id.as_str(), since_s, window], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    Sample {
-                        fetched_at: r.get(1)?,
-                        pct: r.get(2)?,
-                        resets_at: r.get(3)?,
-                    },
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        let map = |r: &rusqlite::Row<'_>| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Sample {
+                    fetched_at: r.get(1)?,
+                    pct: r.get(2)?,
+                    resets_at: r.get(3)?,
+                },
+            ))
+        };
+        let rows = match window {
+            Some(w) => c
+                .prepare(SAMPLES_OF_WINDOW)?
+                .query_map(params![id.as_str(), w, since_s], map)?
+                .collect::<Result<Vec<_>, _>>()?,
+            None => c
+                .prepare(SAMPLES_OF_ALL)?
+                .query_map(params![id.as_str(), since_s], map)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         Ok(rows)
     }
 
@@ -628,5 +641,29 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_windows_samples_are_read_along_the_primary_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        let c = store.lock();
+        let mut stmt = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {SAMPLES_OF_WINDOW}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["a", "7d", 0], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join("\n");
+        assert!(plan.contains("SEARCH usage_samples"), "{plan}");
+        assert!(!plan.contains("SCAN"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
     }
 }
