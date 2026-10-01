@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use serde_json::Value;
 use tagteam_core::backoff::failure_backoff_s;
 use tagteam_core::poll::budget_next_free;
+use tagteam_core::trust::is_future_stamped;
 use tagteam_core::usage::{windows_from_json, windows_to_json};
 use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Sample, Window};
 
@@ -33,7 +34,8 @@ const TAKE_LEASE_SQL: &str = "INSERT INTO leases (name, holder, expires_at) VALU
 pub struct UsageStateRow {
     pub account_id: AccountId,
     /// The last successful reading. `None` when there is none, when the reading had no
-    /// windows (§8.2), or when the stored JSON is corrupt: a bad row reads as no reading.
+    /// windows (§8.2, including a stored `[]`), or when the stored JSON is corrupt: a bad row
+    /// reads as no reading.
     pub last_good: Option<Vec<Window>>,
     /// Set by success only.
     pub fetched_at: Option<i64>,
@@ -106,8 +108,8 @@ pub enum SendGrant {
     Send(Slot),
     /// The token about to be sent is the one the server refused (`rejected_fp`, §8.1).
     Rejected,
-    /// The lease row no longer names this holder, or the account's identity changed: send
-    /// nothing, record nothing.
+    /// The lease row no longer names this holder, the account's identity changed, or the
+    /// account is quarantined: send nothing, record nothing.
     LeaseLost,
     /// No slot is free in the identity's hourly budget until `next_free_at`.
     OverBudget { next_free_at: i64 },
@@ -147,7 +149,8 @@ fn state_from_row(r: &Row<'_>) -> rusqlite::Result<UsageStateRow> {
         account_id: AccountId::from_string(r.get::<_, String>("account_id")?),
         last_good: last_good
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| windows_from_json(&v)),
+            .and_then(|v| windows_from_json(&v))
+            .filter(|w| !w.is_empty()),
         fetched_at: r.get("fetched_at")?,
         last_attempt_at: r.get("last_attempt_at")?,
         consecutive_failures: u32::try_from(failures.max(0)).unwrap_or(u32::MAX),
@@ -288,7 +291,8 @@ impl Store {
     /// Phase 1 (§8.3), one `IMMEDIATE` transaction. The account is re-read inside it.
     ///
     /// Eligibility, in this order: not quarantined, not in backoff, no live lease, then the
-    /// schedule. An on-demand caller (`list`, `status`) needs the reading to be older than
+    /// schedule (a `fetched_at` more than `FUTURE_STAMP_SLACK_S` ahead of now counts as no
+    /// reading). An on-demand caller (`list`, `status`) needs the reading to be older than
     /// `floor_s` and a poll to be due, where no plan counts as due. A scheduled caller (M3)
     /// needs a poll to be due or no reading at all (§8.3's "due or stale"). An eligible
     /// account then needs a free slot in its identity's hourly budget (§8.6). Over budget, the
@@ -344,6 +348,9 @@ impl Store {
         if leased {
             return Ok(Reserve::Ineligible(Ineligible::Leased));
         }
+        // A reading stamped more than the slack ahead of now has no usable age (§8.4): it
+        // counts as unread, so it cannot lock the account out until the clock catches up.
+        let fetched_at = fetched_at.filter(|t| !is_future_stamped(*t, now_s));
         let due = next_poll_at.is_none_or(|t| t <= now_s);
         let eligible = if on_demand {
             due && fetched_at.is_none_or(|t| now_s - t > budget.floor_s)
@@ -391,7 +398,8 @@ impl Store {
     /// Right before each request (§8.3, §8.6), in one `IMMEDIATE` transaction, so nothing is
     /// sent on a stale view of the store. In order:
     /// - `r` must still hold the `usage:<id>` lease (its row names `r.holder`) and the account
-    ///   must still have `r.identity_key`; otherwise `LeaseLost`, and nothing is written.
+    ///   must still have `r.identity_key` and not be quarantined; otherwise `LeaseLost`, and
+    ///   nothing is written.
     /// - `access_fp`, the fingerprint of the exact bytes about to be sent, must not equal the
     ///   durable `rejected_fp` (§8.1), which another holder may have stamped since the caller
     ///   read it; otherwise `Rejected`, and nothing is written.
@@ -413,7 +421,12 @@ impl Store {
         let now_s = now_ms.div_euclid(1000);
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !fenced(&tx, r)? {
+        let quarantined: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id = ?1 AND quarantine_reason IS NOT NULL)",
+            [r.account_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if quarantined || !fenced(&tx, r)? {
             return Ok(SendGrant::LeaseLost);
         }
         if let Some(fp) = access_fp {
