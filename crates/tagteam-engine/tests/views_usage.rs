@@ -88,6 +88,15 @@ fn record(fx: &Fx, id: &AccountId, windows: &[Window], at: i64, next_poll_at: i6
     assert!(store.record_usage(&r, windows, at, &plan, 180).unwrap());
 }
 
+/// Moves `id`'s next poll to `next_poll_at`, as a re-plan after a switch does (§8.6).
+fn replan(fx: &Fx, id: &AccountId, next_poll_at: i64) {
+    let plan = PollPlan {
+        interval_s: 300,
+        next_poll_at,
+    };
+    fx.engine.store().unwrap().set_poll_plan(id, &plan).unwrap();
+}
+
 /// Records a failed fetch of `kind` at `at`, backing off until `backoff_until`.
 fn fail(
     fx: &Fx,
@@ -290,6 +299,134 @@ fn a_quarantined_account_gets_no_extended_trust() {
 }
 
 #[test]
+fn every_failing_status_says_why_and_when_it_is_retried_while_the_retry_is_ahead() {
+    // §13.2: not only `unavailable`: any status that comes of failures being retried.
+    let fx = Fx::new();
+    let cases = [
+        ("keychain-unavailable", UsageStatus::KeychainUnavailable),
+        ("no-access-token", UsageStatus::NoCredentials),
+        ("token-expired", UsageStatus::TokenExpired),
+        ("foreign-credential", UsageStatus::ForeignCredential),
+        ("http-500", UsageStatus::Unavailable),
+    ];
+    let ids: Vec<AccountId> = cases
+        .iter()
+        .enumerate()
+        .map(|(i, (kind, _))| {
+            let id = fx.add(&format!("f{i}@x.co"), &format!("rt-{i}"));
+            fail(&fx, &id, kind, T0, T0 + 30, None);
+            id
+        })
+        .collect();
+    at(&fx, T0 + 10);
+    for (id, (kind, status)) in ids.iter().zip(cases) {
+        let u = usage_of(&fx.engine, id);
+        assert_eq!(
+            (u.status, u.error.as_deref(), u.retry_at),
+            (status, Some(kind), Some(T0 + 30)),
+            "{kind}"
+        );
+    }
+    // Once the retry is due there is nothing ahead to say; why it failed still stands.
+    at(&fx, T0 + 31);
+    for (id, (kind, status)) in ids.iter().zip(cases) {
+        let u = usage_of(&fx.engine, id);
+        assert_eq!(
+            (u.status, u.error.as_deref(), u.retry_at),
+            (status, Some(kind), None),
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn an_unread_account_over_its_budget_is_retried_when_a_slot_frees() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fail(&fx, &a, "over-budget", T0, T0 + 600, None);
+    at(&fx, T0 + 60);
+    let u = usage_of(&fx.engine, &a);
+    assert_eq!(
+        (u.status, u.error.as_deref(), u.windows, u.retry_at),
+        (
+            UsageStatus::Unavailable,
+            Some("over-budget"),
+            None,
+            Some(T0 + 600)
+        )
+    );
+}
+
+#[test]
+fn only_a_status_that_is_retried_has_a_retry_time() {
+    let fx = Fx::new();
+    let ok = fx.add("o@x.co", "rt-o");
+    let quarantined = fx.add("q@x.co", "rt-q");
+    // A plan is in force for both, and a failure is on record for the quarantined one.
+    record(&fx, &ok, &reading(T0, 9.0, 40.0), T0, T0 + 180);
+    replan(&fx, &ok, T0 + 1_200);
+    record(&fx, &quarantined, &reading(T0, 9.0, 40.0), T0, T0 + 180);
+    fail(
+        &fx,
+        &quarantined,
+        "refresh-failed",
+        T0 + 200,
+        T0 + 260,
+        None,
+    );
+    replan(&fx, &quarantined, T0 + 1_200);
+    fx.quarantine(&quarantined, "invalid_grant", "sha256:0");
+    at(&fx, T0 + 220);
+    let u = usage_of(&fx.engine, &ok);
+    assert_eq!(
+        (u.status, u.error, u.retry_at),
+        (UsageStatus::Ok, None, None)
+    );
+    let u = usage_of(&fx.engine, &quarantined);
+    assert_eq!(
+        (u.status, u.retry_at),
+        (UsageStatus::ReloginRequired, None),
+        "never retried, so never a retry time"
+    );
+}
+
+#[test]
+fn the_retry_is_the_later_of_the_backoff_and_the_next_planned_poll() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    record(&fx, &a, &reading(T0, 9.0, 40.0), T0, T0 + 180);
+    fail(&fx, &a, "http-500", T0 + 400, T0 + 430, None);
+    // A switch re-plans the account's poll beyond the backoff.
+    replan(&fx, &a, T0 + 1_200);
+    let state = fx.engine.store().unwrap().usage_state(&a).unwrap().unwrap();
+    assert_eq!(
+        (state.backoff_until, state.next_poll_at),
+        (Some(T0 + 430), Some(T0 + 1_200)),
+        "the plan is the later of the two"
+    );
+    at(&fx, T0 + 410);
+    assert_eq!(usage_of(&fx.engine, &a).retry_at, Some(T0 + 1_200));
+}
+
+#[test]
+fn a_plan_in_force_never_extends_a_quarantined_accounts_trust() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    for id in [&a, &b] {
+        record(&fx, id, &reading(T0, 9.0, 40.0), T0, T0 + 1_200);
+    }
+    fx.quarantine(&a, "invalid_grant", "sha256:0");
+    // Past the five-minute rule, inside the planned poll: no failure on record at all.
+    at(&fx, T0 + 1_000);
+    assert!(usage_of(&fx.engine, &b).decision_grade, "a plan in force");
+    assert!(
+        !usage_of(&fx.engine, &a).decision_grade,
+        "a quarantined account is never polled, so a plan means nothing"
+    );
+}
+
+#[test]
 fn status_and_account_view_carry_the_listed_usage() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
@@ -482,6 +619,47 @@ fn history_of_an_empty_latest_reading_still_shows_the_relevant_samples() {
 }
 
 #[test]
+fn history_says_when_a_window_filter_matched_nothing() {
+    let fx = Fx::new();
+    let a = with_history(&fx);
+    let never = fx.add("n@x.co", "rt-n");
+    let unmatched = |id: &AccountId, window: Option<&str>| {
+        let h = fx.engine.history(id, window, 0).unwrap();
+        (h.windows.is_empty(), h.unmatched_window)
+    };
+    assert_eq!(unmatched(&a, Some("nope")), (true, true));
+    assert_eq!(unmatched(&a, Some("FABLE")), (false, false));
+    assert_eq!(unmatched(&a, None), (false, false));
+    // An account with nothing to name has nothing a filter could miss.
+    assert_eq!(unmatched(&never, Some("nope")), (true, false));
+}
+
+#[test]
+fn history_names_the_account_as_the_list_does() {
+    let fx = Fx::new();
+    let a = with_history(&fx);
+    let b = fx.add("b@x.co", "rt-b");
+    let agree = |state: &str| {
+        for l in fx.engine.accounts(None).unwrap() {
+            for v in l.accounts {
+                let h = fx.engine.history(&v.row.id, None, 0).unwrap().account;
+                assert_eq!(
+                    (h.active, h.usage, h.row.id),
+                    (v.active, v.usage, v.row.id),
+                    "{state}"
+                );
+            }
+        }
+    };
+    agree("b live");
+    assert!(!fx.engine.history(&a, None, 0).unwrap().account.active);
+    assert!(fx.engine.history(&b, None, 0).unwrap().account.active);
+    // The live identity unreadable: the store's active account stands in for both.
+    fs::write(fx.paths().global_config, "{ \"oauthAccount\": ").unwrap();
+    agree("live login unreadable");
+}
+
+#[test]
 fn history_of_an_account_never_read_is_empty_and_of_an_unknown_one_an_error() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
@@ -514,7 +692,25 @@ fn statusline_shows_the_live_account_with_its_usage_or_an_unmanaged_email() {
     match fx.engine.statusline(&fx.provider()).unwrap() {
         StatuslineView::Managed { account } => {
             assert_eq!((account.row.id.clone(), account.active), (b.clone(), true));
-            assert_eq!(account.usage, usage_of(&fx.engine, &b));
+            // The line never shows pace, so it is not computed (§13.5): everything else is the
+            // list's own.
+            let listed = usage_of(&fx.engine, &b);
+            let paceless = UsageView {
+                windows: listed
+                    .windows
+                    .clone()
+                    .map(|ws| ws.into_iter().map(|(w, _)| (w, Pace::default())).collect()),
+                ..listed.clone()
+            };
+            assert_eq!(account.usage, paceless);
+            assert!(
+                listed
+                    .windows
+                    .unwrap()
+                    .iter()
+                    .any(|(_, p)| *p != Pace::default()),
+                "the list's own pace is not empty, or this proves nothing"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -553,12 +749,17 @@ fn a_missing_garbled_or_rewritten_claude_json_is_read_as_it_is_now() {
         StatuslineView::Unmanaged { email } if email == "bobby@x.co"
     ));
     assert_eq!(cache(&fx).unwrap().label.as_deref(), Some("bobby@x.co"));
-    // Garbled: nothing to show, and no error.
+    // Garbled: nothing to show, and no error. It is not cached: the row still holds the
+    // identity and the stamp of the last file that parsed, so the next run parses again.
+    let before = cache(&fx).unwrap();
     fs::write(&config, "{ \"oauthAccount\": ").unwrap();
     assert!(matches!(
         fx.engine.statusline(&fx.provider()).unwrap(),
         StatuslineView::NoLogin
     ));
+    let after = cache(&fx).unwrap();
+    assert_eq!(after, before, "a garbled file is not cached");
+    assert_eq!(after.label.as_deref(), Some("bobby@x.co"));
     // Missing: nothing to show.
     fs::remove_file(&config).unwrap();
     assert!(matches!(
@@ -588,6 +789,80 @@ fn an_unchanged_claude_json_is_not_parsed_again() {
     };
     store.put_live_identity_cache(&planted).unwrap();
     assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), a);
+}
+
+#[test]
+fn a_new_mtime_alone_makes_the_next_run_parse_again() {
+    // §13.5 keys the cache on mtime and size together: the same size under a new mtime is a
+    // different version of the file.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let config = fx.paths().global_config;
+    assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), b);
+    let store = fx.engine.store().unwrap();
+    let key_a = store.account(&a).unwrap().unwrap().identity_key;
+    let key_b = store.account(&b).unwrap().unwrap().identity_key;
+    let planted = LiveIdentityCacheRow {
+        identity_key: Some(key_a),
+        label: Some("a@x.co".into()),
+        ..cache(&fx).unwrap()
+    };
+    store.put_live_identity_cache(&planted).unwrap();
+    // Unchanged stamp: the planted row is believed.
+    assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), a);
+    let size = fs::metadata(&config).unwrap().len();
+    let mtime = fs::metadata(&config).unwrap().modified().unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&config)
+        .unwrap()
+        .set_modified(mtime + std::time::Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(fs::metadata(&config).unwrap().len(), size);
+    assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), b);
+    let row = cache(&fx).unwrap();
+    assert_eq!(row.identity_key, Some(key_b));
+    assert_ne!(
+        row.mtime_ns, planted.mtime_ns,
+        "the cache follows the new stamp"
+    );
+}
+
+#[test]
+fn a_busy_store_costs_the_statusline_neither_its_line_nor_its_time() {
+    // §13.5: the identity cache is only a cache. Another process holds the write lock, as a
+    // collector recording a reading does; the line is still right and is not kept waiting.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), b);
+    // A login that changes the file: the next run must parse it and would write the cache.
+    fx.login("a@x.co", "rt-a");
+    let db = fx.env.data_dir().join("tagteam.db");
+    let other = rusqlite::Connection::open(&db).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    let view = fx.engine.statusline(&fx.provider()).unwrap();
+    let took = started.elapsed();
+    other.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(managed(view), a);
+    assert!(
+        took < std::time::Duration::from_millis(500),
+        "the statusline waited {took:?} on the write lock"
+    );
+    // Nothing was cached meanwhile; the next, uncontended run does.
+    assert_ne!(cache(&fx).unwrap().identity_key, None);
+    assert_eq!(managed(fx.engine.statusline(&fx.provider()).unwrap()), a);
+    let key_a = fx
+        .engine
+        .store()
+        .unwrap()
+        .account(&a)
+        .unwrap()
+        .unwrap()
+        .identity_key;
+    assert_eq!(cache(&fx).unwrap().identity_key, Some(key_a));
 }
 
 #[test]

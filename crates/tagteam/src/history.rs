@@ -4,12 +4,13 @@
 use serde_json::{Value, json};
 use tagteam_cc::usage::format_iso8601;
 use tagteam_core::ProjectionMethod;
-use tagteam_core::usage::is_relevant;
 use tagteam_engine::views::{HistoryView, HistoryWindow};
 
 use crate::render;
 
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+/// A projection further out than this is not worth a countdown: it will not run out.
+const A_YEAR_S: i64 = 365 * 86_400;
 /// The widest sparkline. A longer history is bucketed, and each bucket shows its peak.
 const SPARK_WIDTH: usize = 60;
 
@@ -32,11 +33,6 @@ pub(crate) fn parse_since(s: &str) -> Option<i64> {
         .checked_mul(unit)
 }
 
-/// §13.4's default: without `--window`, only the windows that count for switching (§8.2).
-pub(crate) fn keep_relevant(view: &mut HistoryView, models: &[String]) {
-    view.windows.retain(|w| is_relevant(&w.window, models));
-}
-
 /// Eight levels from 0 to 100 %. Bucketing keeps a short spike visible: a bucket shows its
 /// peak, never an average.
 pub(crate) fn sparkline(pcts: &[f64]) -> String {
@@ -52,11 +48,17 @@ pub(crate) fn sparkline(pcts: &[f64]) -> String {
 }
 
 /// §13.4's text: per window, its reading and reset, a sparkline of its samples, and its burn
-/// rate with the projection and the method behind it. `now_s` dates the countdowns.
-pub(crate) fn human(view: &HistoryView, since: &str, now_s: i64) -> String {
+/// rate with the projection and the method behind it. `window` is the `--window` asked for, if
+/// any. `now_s` dates the countdowns.
+pub(crate) fn human(view: &HistoryView, window: Option<&str>, since: &str, now_s: i64) -> String {
     let row = &view.account.row;
     if view.windows.is_empty() {
-        return format!("No usage history for {}.\n", render::name(row));
+        return match window {
+            Some(name) if view.unmatched_window => {
+                format!("No window named {name} for {}.\n", render::name(row))
+            }
+            _ => format!("No usage history for {}.\n", render::name(row)),
+        };
     }
     let mut s = format!(
         "{} (position {}), last {since}\n",
@@ -74,10 +76,13 @@ fn block(hw: &HistoryWindow, now_s: i64) -> String {
     let w = &hw.window;
     let mut head = format!("{}  {:.0}%", w.label, w.pct.round());
     if let Some(at) = w.resets_at {
-        head.push_str(&format!(
-            "  resets in {}",
-            render::duration(at.saturating_sub(now_s))
-        ));
+        // As `list` says it: a reset that has passed is `reset`, not a countdown to it.
+        let left = render::countdown(at, now_s);
+        if at > now_s {
+            head.push_str(&format!("  resets in {left}"));
+        } else {
+            head.push_str(&format!("  {left}"));
+        }
     }
     let pcts: Vec<f64> = hw.samples.iter().map(|x| x.pct).collect();
     let samples = match pcts.len() {
@@ -89,7 +94,8 @@ fn block(hw: &HistoryWindow, now_s: i64) -> String {
 }
 
 /// The burn rate and where it leads (§8.7): `lasts to reset` when the window will, else when it
-/// runs out, with the method that measured the rate.
+/// runs out (or `should have run out` when that time has passed, `won't run out within a year`
+/// when it is further off than that), with the method that measured the rate.
 fn projection(hw: &HistoryWindow, now_s: i64) -> String {
     let p = &hw.pace;
     let method = p
@@ -107,7 +113,14 @@ fn projection(hw: &HistoryWindow, now_s: i64) -> String {
     };
     let eta = match (p.will_last_to_reset, p.exhaustion_at) {
         (Some(true), _) => "lasts to reset".to_owned(),
-        (_, Some(at)) => format!("runs out in {}", render::duration(at.saturating_sub(now_s))),
+        (_, Some(at)) if at <= now_s => format!(
+            "should have run out {} ago",
+            render::duration(now_s.saturating_sub(at))
+        ),
+        (_, Some(at)) if at.saturating_sub(now_s) > A_YEAR_S => {
+            "won't run out within a year".to_owned()
+        }
+        (_, Some(at)) => format!("runs out in {}", render::duration(at - now_s)),
         _ => "no projection".to_owned(),
     };
     format!("{rate:+.1} pts/h · {eta}{method}")
@@ -223,6 +236,7 @@ mod tests {
         let (r5, r7) = (9_600, 266_400);
         HistoryView {
             account: account(),
+            unmatched_window: false,
             windows: vec![
                 history_window(
                     window("5h", "5h", WindowKind::Short, 9.0, Some(r5)),
@@ -304,7 +318,7 @@ mod tests {
     #[test]
     fn the_text_shows_each_windows_rate_and_projection() {
         assert_eq!(
-            human(&view(), "7d", NOW),
+            human(&view(), None, "7d", NOW),
             concat!(
                 "b@x.co (position 2), last 7d\n",
                 "\n",
@@ -336,7 +350,23 @@ mod tests {
             exhaustion_at: Some(NOW - 60),
             ..Pace::default()
         };
-        assert_eq!(with(past), "+5.0 pts/h · runs out in <1m (regression)");
+        assert_eq!(
+            with(past),
+            "+5.0 pts/h · should have run out 1m ago (regression)"
+        );
+        let just_past = Pace {
+            exhaustion_at: Some(NOW),
+            ..past
+        };
+        assert_eq!(
+            with(just_past),
+            "+5.0 pts/h · should have run out <1m ago (regression)"
+        );
+        let soon = Pace {
+            exhaustion_at: Some(NOW + 60),
+            ..past
+        };
+        assert_eq!(with(soon), "+5.0 pts/h · runs out in 1m (regression)");
         let flat = Pace {
             rate_per_hour: Some(0.0),
             method: Some(ProjectionMethod::Average),
@@ -369,26 +399,79 @@ mod tests {
     }
 
     #[test]
-    fn a_projection_far_past_the_reset_or_the_clock_still_renders() {
-        let with = |pace: Pace| {
-            let w = window("7d", "7d", WindowKind::Long, 30.0, Some(HOUR));
+    fn a_projection_beyond_a_year_says_it_will_not_run_out() {
+        let with = |pace: Pace, reset: Option<i64>| {
+            let w = window("7d", "7d", WindowKind::Long, 30.0, reset);
             projection(&history_window(w, vec![], pace), NOW)
         };
-        // A tiny rate that outlives the window: the reset is what counts (§8.7).
+        // A quiet window: 70 points to go at 0.001 an hour is eight years.
         let tiny = Pace {
-            rate_per_hour: Some(0.0),
+            rate_per_hour: Some(0.001),
             method: Some(ProjectionMethod::Regression),
-            exhaustion_at: Some(i64::MAX),
-            will_last_to_reset: Some(true),
+            exhaustion_at: Some(NOW + 252_000_000),
+            will_last_to_reset: None,
             ..Pace::default()
         };
-        assert_eq!(with(tiny), "+0.0 pts/h · lasts to reset (regression)");
-        // Without a reset to compare against, the saturated time must not overflow.
-        let unbounded = Pace {
-            will_last_to_reset: None,
+        assert_eq!(
+            with(tiny, None),
+            "+0.0 pts/h · won't run out within a year (regression)"
+        );
+        // With a reset it will not reach, the reset is what counts (§8.7).
+        let lasts = Pace {
+            will_last_to_reset: Some(true),
             ..tiny
         };
-        assert!(with(unbounded).starts_with("+0.0 pts/h · runs out in "));
+        assert_eq!(
+            with(lasts, Some(HOUR)),
+            "+0.0 pts/h · lasts to reset (regression)"
+        );
+        // 70 points at 0.01 an hour is 291 days: a countdown still.
+        let slow = Pace {
+            rate_per_hour: Some(0.01),
+            exhaustion_at: Some(NOW + 25_200_000),
+            ..tiny
+        };
+        assert_eq!(
+            with(slow, None),
+            "+0.0 pts/h · runs out in 291d16h (regression)"
+        );
+        // The year itself is still a countdown; a second more is not.
+        let year = |s| Pace {
+            exhaustion_at: Some(NOW + 365 * 86_400 + s),
+            ..tiny
+        };
+        assert_eq!(
+            with(year(0), None),
+            "+0.0 pts/h · runs out in 365d00h (regression)"
+        );
+        assert_eq!(
+            with(year(1), None),
+            "+0.0 pts/h · won't run out within a year (regression)"
+        );
+        // A saturated time must not overflow.
+        let saturated = Pace {
+            exhaustion_at: Some(i64::MAX),
+            ..tiny
+        };
+        assert_eq!(
+            with(saturated, None),
+            "+0.0 pts/h · won't run out within a year (regression)"
+        );
+    }
+
+    #[test]
+    fn a_reset_that_has_passed_says_reset_not_a_countdown() {
+        let at = |resets_in: i64| {
+            let mut v = view();
+            v.windows[0].window.resets_at = Some(NOW + resets_in);
+            human(&v, None, "7d", NOW)
+        };
+        assert!(at(60).contains("5h  9%  resets in 1m\n"), "{}", at(60));
+        for passed in [0, -10, -86_400] {
+            let text = at(passed);
+            assert!(text.contains("5h  9%  reset\n"), "{passed}: {text}");
+            assert!(!text.contains("5h  9%  resets in"), "{passed}: {text}");
+        }
     }
 
     #[test]
@@ -396,9 +479,34 @@ mod tests {
         let v = HistoryView {
             account: account(),
             windows: vec![],
+            unmatched_window: false,
         };
-        assert_eq!(human(&v, "7d", NOW), "No usage history for b@x.co.\n");
+        assert_eq!(human(&v, None, "7d", NOW), "No usage history for b@x.co.\n");
+        // A filter that names nothing of an account with no windows is not the filter's fault.
+        assert_eq!(
+            human(&v, Some("nope"), "7d", NOW),
+            "No usage history for b@x.co.\n"
+        );
         assert_eq!(csv(&v), "window,fetched_at,pct,resets_at\n");
+    }
+
+    #[test]
+    fn a_window_filter_that_matched_nothing_says_which_window() {
+        let v = HistoryView {
+            account: account(),
+            windows: vec![],
+            unmatched_window: true,
+        };
+        assert_eq!(
+            human(&v, Some("nope"), "7d", NOW),
+            "No window named nope for b@x.co.\n"
+        );
+        let mut aliased = v.clone();
+        aliased.account.row.alias = Some("work".into());
+        assert_eq!(
+            human(&aliased, Some("nope"), "7d", NOW),
+            "No window named nope for work (b@x.co).\n"
+        );
     }
 
     #[test]
@@ -423,6 +531,7 @@ mod tests {
         assert_eq!(csv_field("scoped:a,b"), "\"scoped:a,b\"");
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
         let unreset = HistoryView {
+            unmatched_window: false,
             account: account(),
             windows: vec![history_window(
                 window("spend", "spend", WindowKind::Spend, 0.0, None),
@@ -483,26 +592,5 @@ mod tests {
             ),
             (Value::Null, Value::Null, Value::Null)
         );
-    }
-
-    #[test]
-    fn without_a_window_flag_only_relevant_windows_remain() {
-        let keys = |models: &[&str]| {
-            let mut v = view();
-            v.windows.push(history_window(
-                window("spend", "spend", WindowKind::Spend, 0.0, None),
-                vec![],
-                Pace::default(),
-            ));
-            let models: Vec<String> = models.iter().map(|m| (*m).to_owned()).collect();
-            keep_relevant(&mut v, &models);
-            v.windows
-                .iter()
-                .map(|w| w.window.key.clone())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(keys(&[]), ["5h", "7d"]);
-        assert_eq!(keys(&["FABLE"]), ["5h", "7d", "scoped:Fable"]);
-        assert_eq!(keys(&["all"]), ["5h", "7d", "scoped:Fable"]);
     }
 }

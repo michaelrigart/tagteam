@@ -8,6 +8,7 @@ use std::path::Path;
 use common::{
     cmd, login, now_epoch_s, record_reading, seed_home, two_fresh_accounts, usage_window,
 };
+use predicates::prelude::*;
 use serde_json::{Value, json};
 use tagteam_cc::usage::format_iso8601 as iso;
 use tagteam_core::pace::pace;
@@ -237,6 +238,58 @@ fn an_account_without_samples_says_so() {
         .success()
         .stdout("No usage history for a@x.co.\n");
     assert_eq!(history_json(s.root(), &["1"])["windows"], json!([]));
+}
+
+#[test]
+fn a_window_that_does_not_exist_is_named_not_reported_as_no_history() {
+    let s = seeded();
+    cmd(s.root())
+        .args(["history", "--window", "nope"])
+        .assert()
+        .success()
+        .stdout("No window named nope for b@x.co.\n");
+    // JSON and CSV stay what they were: no windows, no rows.
+    assert_eq!(
+        history_json(s.root(), &["--window", "nope"])["windows"],
+        json!([])
+    );
+    cmd(s.root())
+        .args(["history", "--window", "nope", "--csv"])
+        .assert()
+        .success()
+        .stdout("window,fetched_at,pct,resets_at\n");
+    // An account with nothing at all has no window to miss.
+    cmd(s.root())
+        .args(["history", "1", "--window", "nope"])
+        .assert()
+        .success()
+        .stdout("No usage history for a@x.co.\n");
+}
+
+#[test]
+fn a_reset_that_has_passed_reads_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, b) = two_fresh_accounts(dir.path());
+    let now = now_epoch_s();
+    record_reading(
+        dir.path(),
+        &b,
+        now - HOUR,
+        &[usage_window(
+            "5h",
+            "5h",
+            WindowKind::Short,
+            9.0,
+            Some(now - 600),
+            Some(5 * HOUR),
+        )],
+    );
+    cmd(dir.path())
+        .arg("history")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("5h  9%  reset\n"))
+        .stdout(predicates::str::contains("resets in").not());
 }
 
 #[test]
