@@ -20,7 +20,8 @@ pub const USAGE_BETA: &str = "oauth-2025-04-20";
 
 /// Claude Code's window keys (§8.2). A scoped window's key is `scoped:<name>`.
 const FIVE_HOUR: &str = "5h";
-const SEVEN_DAY: &str = "7d";
+/// The `Long` window, which consume-first ranks on (`Provider::primary_long_window`).
+pub(crate) const SEVEN_DAY: &str = "7d";
 const SPEND: &str = "spend";
 const SCOPED_PREFIX: &str = "scoped:";
 

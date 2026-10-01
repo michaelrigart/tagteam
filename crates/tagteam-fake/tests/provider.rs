@@ -547,3 +547,16 @@ fn fake_agent_describes_its_own_meter_keys() {
         assert_eq!(f.fake.describe_window(key), None, "{key:?}");
     }
 }
+
+#[test]
+fn fake_agent_offers_consume_first_no_long_window() {
+    // §4.5, §11.5: without a primary long window a consume-first strategy runs `best`, and
+    // FakeAgent is the provider that exercises that path. Its `monthly` meter is a `Long`
+    // window for pace (§8.7), but it is not offered for ranking.
+    let f = fx();
+    assert_eq!(f.fake.primary_long_window(), None);
+    assert_eq!(
+        f.fake.describe_window("monthly").map(|w| w.kind),
+        Some(WindowKind::Long)
+    );
+}

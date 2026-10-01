@@ -269,6 +269,10 @@ impl Provider for ClaudeCode {
         shape::kind_traits(kind)
     }
 
+    fn primary_long_window(&self) -> Option<&'static str> {
+        Some(usage::SEVEN_DAY)
+    }
+
     fn parse_identity(&self, raw: &Value) -> Result<Identity, ProviderError> {
         shape::identity_from_oauth_account(raw).ok_or_else(|| {
             ProviderError::Invalid("the stored oauthAccount has no emailAddress".into())
