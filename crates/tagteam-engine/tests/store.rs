@@ -1,41 +1,11 @@
+mod common;
+
+use common::{add, cc, identity};
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{EventRow, JournalRow, LoginMeta, NewAccount, Store, StoreError};
 use tagteam_provider::{Identity, ProcessStamp};
-
-fn identity(email: &str) -> Identity {
-    Identity {
-        label: email.into(),
-        email: Some(email.into()),
-        org_uuid: String::new(),
-        org_name: None,
-        account_uuid: None,
-        raw: json!({"emailAddress": email}),
-    }
-}
-
-fn add(s: &Store, p: &ProviderId, id: &str, email: &str, pos: u32) -> AccountId {
-    let aid = AccountId::from_string(id);
-    let key = format!("{email}\n");
-    s.insert_account(&NewAccount {
-        id: &aid,
-        provider: p,
-        position: pos,
-        identity_key: &key,
-        identity: &identity(email),
-        kind: "oauth",
-        alias: None,
-        login_expires_at: None,
-        added_at: 1,
-    })
-    .unwrap();
-    aid
-}
-
-fn cc() -> ProviderId {
-    ProviderId::new("claude-code")
-}
 
 /// Reads the on-disk journal mode through a fresh, independent connection, so the assertion
 /// reflects what was actually persisted rather than one `Store`'s in-memory view of it.

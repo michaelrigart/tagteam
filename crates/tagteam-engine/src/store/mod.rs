@@ -13,6 +13,12 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::atomic::ensure_private_dir;
 use tagteam_provider::{Identity, ProcessStamp};
 
+mod usage;
+
+pub use usage::{
+    Ineligible, LiveIdentityCacheRow, Reservation, Reserve, SendGrant, Slot, UsageStateRow,
+};
+
 const SCHEMA_V1: &str = include_str!("schema.sql");
 
 /// The `PRAGMA user_version` this build knows how to read and write. A stored version above
