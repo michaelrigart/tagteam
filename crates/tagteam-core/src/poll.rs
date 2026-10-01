@@ -182,14 +182,28 @@ pub fn plan_after_fetch(b: &PollBudget, i: &PollInputs, jitter: f64) -> PollPlan
     }
 }
 
-/// The default plan for an account whose role changed without a fetch (§8.3's post-switch
-/// re-plan): the role's default interval, jittered, from `now_s`, and never below the floor.
-pub fn replan_for_role(b: &PollBudget, active: bool, now_s: i64, jitter: f64) -> PollPlan {
+/// The plan for an account whose role changed without a fetch (§8.3's post-switch re-plan).
+///
+/// The incoming (active) account follows §9.4: `next_poll_at = max(now, fetched_at + 180)` with
+/// the active default interval and no jitter, so a stale reading is fetched at once. The
+/// outgoing (candidate) account gets the candidate default interval, jittered, from `now_s`, and
+/// never below the floor.
+pub fn replan_for_role(
+    b: &PollBudget,
+    active: bool,
+    fetched_at: i64,
+    now_s: i64,
+    jitter: f64,
+) -> PollPlan {
     let interval = b.default_interval_s(active);
-    let wait = jittered(interval, jitter, b.jitter_frac).max(b.floor_s);
+    let next_poll_at = if active {
+        now_s.max(fetched_at.saturating_add(interval))
+    } else {
+        now_s.saturating_add(jittered(interval, jitter, b.jitter_frac).max(b.floor_s))
+    };
     PollPlan {
         interval_s: interval,
-        next_poll_at: now_s.saturating_add(wait),
+        next_poll_at,
     }
 }
 
@@ -646,21 +660,38 @@ mod tests {
 
     #[test]
     fn a_replan_uses_the_roles_default_interval() {
-        let p = replan_for_role(&B, true, NOW, 0.0);
+        let p = replan_for_role(&B, true, NOW, NOW, 0.0);
         assert_eq!((p.interval_s, p.next_poll_at), (180, NOW + 180));
-        let p = replan_for_role(&B, false, NOW, 0.0);
+        let p = replan_for_role(&B, false, NOW, NOW, 0.0);
         assert_eq!((p.interval_s, p.next_poll_at), (300, NOW + 300));
     }
 
     #[test]
-    fn a_replan_is_jittered_and_floored() {
-        assert_eq!(replan_for_role(&B, true, NOW, 1.0).next_poll_at, NOW + 198);
-        assert_eq!(replan_for_role(&B, false, NOW, 1.0).next_poll_at, NOW + 330);
-        assert_eq!(replan_for_role(&B, true, NOW, -1.0).next_poll_at, NOW + 180);
+    fn an_active_replan_is_due_a_floor_after_the_reading_and_not_jittered() {
+        let next = |fetched_at, jitter| replan_for_role(&B, true, fetched_at, NOW, jitter);
+        assert_eq!(next(NOW, 1.0).next_poll_at, NOW + 180, "recent reading");
+        assert_eq!(next(NOW, -1.0).next_poll_at, NOW + 180, "jitter ignored");
         assert_eq!(
-            replan_for_role(&B, false, NOW, -1.0).next_poll_at,
-            NOW + 270
+            next(NOW - 7200, 0.0).next_poll_at,
+            NOW,
+            "old reading: due now"
         );
+        assert_eq!(
+            next(NOW - 100, 0.0).next_poll_at,
+            NOW + 80,
+            "max(now, 180 − 100)"
+        );
+        assert_eq!(next(NOW - 100, 0.0).interval_s, 180);
+    }
+
+    #[test]
+    fn a_candidate_replan_is_jittered_and_floored_whatever_the_reading() {
+        for fetched_at in [NOW, NOW - 7200] {
+            let next = |jitter| replan_for_role(&B, false, fetched_at, NOW, jitter);
+            assert_eq!(next(1.0).next_poll_at, NOW + 330);
+            assert_eq!(next(-1.0).next_poll_at, NOW + 270);
+            assert_eq!(next(0.0).interval_s, 300);
+        }
     }
 
     fn ascending(count: i64, newest: i64) -> Vec<i64> {
