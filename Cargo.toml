@@ -27,8 +27,9 @@ sha2 = "0.10"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Blocking HTTP over rustls with the OS trust store (§4.4); no async runtime.
-ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier"] }
+# Blocking HTTP over rustls with the OS trust store (§4.4); no async runtime. Held to one
+# minor: tagteam-engine wraps its transport, and `ureq::unversioned` breaks only in minors.
+ureq = { version = "~3.4", default-features = false, features = ["rustls", "platform-verifier"] }
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v7"] }
 # test-only
