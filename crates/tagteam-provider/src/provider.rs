@@ -816,4 +816,136 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("Claude Code-credentials") && msg.contains(".claude.json"));
     }
+
+    fn stub_window() -> Window {
+        Window {
+            key: "5h".into(),
+            label: "5h".into(),
+            kind: tagteam_core::usage::WindowKind::Short,
+            pct: 12.0,
+            resets_at: None,
+            period_s: None,
+            detail: None,
+        }
+    }
+
+    /// A normalizer that accepts a JSON object with `"windows": true` and rejects any other.
+    fn stub_normalize(body: &Value) -> Option<Vec<Window>> {
+        match body["windows"].as_bool()? {
+            true => Some(vec![stub_window()]),
+            false => Some(Vec::new()),
+        }
+    }
+
+    fn reply(
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<HttpResponse, HttpError> {
+        Ok(HttpResponse {
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: body.to_vec(),
+        })
+    }
+
+    fn verdict(r: Result<HttpResponse, HttpError>) -> UsageResult {
+        UsageResult::from_reply(r, stub_normalize)
+    }
+
+    fn failed(kind: TransientKind, retry_after_s: Option<f64>) -> UsageResult {
+        UsageResult::Failed {
+            kind,
+            retry_after_s,
+        }
+    }
+
+    #[test]
+    fn a_transport_failure_is_pre_send_or_ambiguous_and_never_calls_the_normalizer() {
+        let never = |_: &Value| -> Option<Vec<Window>> { panic!("no body to normalize") };
+        assert_eq!(
+            UsageResult::from_reply(Err(HttpError::PreSend("no route".into())), never),
+            failed(TransientKind::PreSend, None)
+        );
+        assert_eq!(
+            UsageResult::from_reply(Err(HttpError::Ambiguous("reset".into())), never),
+            failed(TransientKind::Ambiguous, None)
+        );
+    }
+
+    #[test]
+    fn a_200_the_normalizer_accepts_is_its_windows_and_empty_means_no_usage() {
+        assert_eq!(
+            verdict(reply(200, &[], br#"{"windows": true}"#)),
+            UsageResult::Windows(vec![stub_window()])
+        );
+        assert_eq!(
+            verdict(reply(200, &[], br#"{"windows": false}"#)),
+            UsageResult::Windows(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_200_the_normalizer_rejects_or_that_is_not_json_is_bad_response() {
+        assert_eq!(
+            verdict(reply(200, &[], br#"{"other": 1}"#)),
+            failed(TransientKind::BadResponse, None)
+        );
+        assert_eq!(
+            verdict(reply(200, &[], b"<html>not json</html>")),
+            failed(TransientKind::BadResponse, None)
+        );
+        assert_eq!(
+            verdict(reply(200, &[], b"")),
+            failed(TransientKind::BadResponse, None)
+        );
+    }
+
+    #[test]
+    fn a_401_is_unauthorized_whatever_it_carries() {
+        assert_eq!(
+            verdict(reply(401, &[("retry-after", "5")], br#"{"windows": true}"#)),
+            UsageResult::Unauthorized
+        );
+    }
+
+    #[test]
+    fn a_429_carries_its_retry_after_in_seconds_when_it_has_one() {
+        assert_eq!(
+            verdict(reply(429, &[("retry-after", "120")], b"")),
+            failed(TransientKind::Http(429), Some(120.0))
+        );
+        assert_eq!(
+            verdict(reply(429, &[("Retry-After", "0.5")], b"")),
+            failed(TransientKind::Http(429), Some(0.5))
+        );
+        assert_eq!(
+            verdict(reply(429, &[], b"")),
+            failed(TransientKind::Http(429), None)
+        );
+        assert_eq!(
+            verdict(reply(
+                429,
+                &[("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")],
+                b""
+            )),
+            failed(TransientKind::Http(429), None),
+            "the HTTP-date form is not read"
+        );
+    }
+
+    #[test]
+    fn any_other_status_is_http_with_its_code() {
+        assert_eq!(
+            verdict(reply(500, &[], b"oops")),
+            failed(TransientKind::Http(500), None)
+        );
+        assert_eq!(
+            verdict(reply(503, &[("retry-after", "7")], b"")),
+            failed(TransientKind::Http(503), Some(7.0))
+        );
+    }
 }
