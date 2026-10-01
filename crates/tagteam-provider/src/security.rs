@@ -1047,13 +1047,19 @@ mod tests {
 
     /// The pid of the shell `run` starts, and that pid's process group as the kernel reports it
     /// from outside while the shell is still running: the shell writes its pid to a file, then
-    /// sleeps a second.
+    /// waits for a file the test creates once it has the group (capped at 10 s, so a test that
+    /// fails first leaves no shell behind).
     fn pid_and_group(
         run: impl FnOnce(Vec<String>) -> RunResult + Send + 'static,
     ) -> (libc::pid_t, libc::pid_t) {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
-        let script = format!("echo $$ > '{}'; sleep 1", pid_file.display());
+        let go_file = dir.path().join("go");
+        let script = format!(
+            "echo $$ > '{}'; i=0; while [ ! -e '{}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done",
+            pid_file.display(),
+            go_file.display()
+        );
         let shell = thread::spawn(move || run(s(&["-c", &script])));
         let deadline = Instant::now() + Duration::from_secs(5);
         let pid: libc::pid_t = loop {
@@ -1065,9 +1071,10 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         };
         // SAFETY: getpgid(2) only reads the process table, and `pid` is the shell, which is
-        // still sleeping and not yet reaped, so the pid names it and no other process.
+        // still waiting for the go file and not yet reaped, so the pid names it and no other process.
         let group = unsafe { libc::getpgid(pid) };
         assert!(group > 0, "getpgid: {}", io::Error::last_os_error());
+        fs::write(&go_file, b"").unwrap();
         let ran = shell.join().unwrap();
         assert!(matches!(ran, RunResult::Exited { code: 0, .. }), "{ran:?}");
         (pid, group)
