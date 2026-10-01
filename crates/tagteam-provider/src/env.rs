@@ -1,6 +1,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::cancel::Cancel;
+
 /// Everything tagteam resolves paths from (§15.1). Tests build one with `for_test`.
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -13,6 +15,9 @@ pub struct Env {
     pub claude_config_dir: Option<OsString>,
     /// `None` when undefined; `Some("")` when defined but empty (Appendix A.1).
     pub claude_securestorage_config_dir: Option<OsString>,
+    /// The process's cancel token (§14.1). Clones share it, so every engine and lock built
+    /// from one Env sees the same signal; each `for_test` Env has a token of its own.
+    pub cancel: Cancel,
     forbidden_root: Option<PathBuf>,
 }
 
@@ -33,6 +38,7 @@ impl Env {
             xdg_state_home: abs("XDG_STATE_HOME"),
             claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR"),
             claude_securestorage_config_dir: std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            cancel: Cancel::new(),
             forbidden_root: None,
         }
     }
@@ -54,6 +60,7 @@ impl Env {
             xdg_state_home: None,
             claude_config_dir: None,
             claude_securestorage_config_dir: None,
+            cancel: Cancel::new(),
             forbidden_root: Some(real_home),
         }
     }
@@ -150,6 +157,16 @@ mod tests {
         let real_home = PathBuf::from(std::env::var_os("HOME").unwrap());
         let env = Env::for_test(&real_home.join("tagteam-guard-probe"));
         let _ = env.data_dir();
+    }
+
+    #[test]
+    fn clones_share_the_cancel_token_and_fixtures_never_do() {
+        let env = Env::for_test(Path::new("/tmp/fixture"));
+        let clone = env.clone();
+        env.cancel.request(15);
+        assert_eq!(clone.cancel.requested(), Some(15));
+        let other = Env::for_test(Path::new("/tmp/fixture"));
+        assert_eq!(other.cancel.requested(), None);
     }
 
     #[test]

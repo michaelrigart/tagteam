@@ -18,9 +18,10 @@ impl AccountLock {
         env.data_dir().join("locks").join(format!("{id}.lock"))
     }
 
+    /// Waits up to `wait`, checking `env.cancel` before every attempt (§14.1).
     pub fn acquire(env: &Env, id: &AccountId, wait: Duration) -> Result<Self, LockError> {
         Ok(Self {
-            _guard: FlockGuard::lock(&Self::path(env, id), wait)?,
+            _guard: FlockGuard::lock(&Self::path(env, id), wait, &env.cancel)?,
             id: id.clone(),
         })
     }
