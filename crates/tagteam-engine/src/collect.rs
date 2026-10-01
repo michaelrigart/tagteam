@@ -643,6 +643,13 @@ impl Collection<'_> {
         }
         hooks::point(self.engine, "usage-before-send")?;
         let slot = self.authorize(bytes)?;
+        // §14.1: the last cancellation point, after the store's authorization (which may have
+        // waited on SQLite, and passes the `usage-before-send` hook's window). The slot was
+        // never sent: it stays held for `record` to give back.
+        if let Err(stop) = self.interruption() {
+            self.slot = Some(slot);
+            return Err(stop);
+        }
         let result = self
             .p
             .fetch_usage(self.engine.http(), &Credential::fresh(bytes.to_vec()));
