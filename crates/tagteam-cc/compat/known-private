@@ -1,11 +1,39 @@
-# Top-level entries of ~/.claude that stay private to a profile (spec 12.2).
-# Same format as known-shared: bare names, no trailing '/', '*' globs.
+# Top-level entries of ~/.claude that stay private to a profile: the known-private
+# list of spec 12.2. Same format as known-shared: bare names, no trailing '/', '*' globs.
 .credentials.json
 .claude.json
+.claude-*-oauth.json
 .config.json
 sessions
 ide
+jobs
+daemon
+daemon.*
+daemon-auth-cooldown
+daemon-auth-status.json
 backups
+cache
+mcp-needs-auth-cache.json
+stats-cache.json
+policy-limits.json*
+remote-settings.json
+remote-settings-consent.json
+remote-settings-helper-consent
+.session_ingress_token
+hfi-auth.json
+state
+seed-admin
+bridge-spawn
+chrome
+debug
+feedback
+routines
+settings.local.json
+.last-cleanup
+.cc-writes
 .device-keys.json
 *.lock
 *.lock.owner
+.storage-write
+.*_auth_refresh-*
+.tagteam-*

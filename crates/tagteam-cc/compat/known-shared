@@ -1,17 +1,26 @@
-# Top-level entries of ~/.claude that tagteam shares between profiles (spec 12.2).
+# Top-level entries of ~/.claude that tagteam shares into profiles: the share
+# allowlist of spec 12.2, the must-share entries first.
 #
 # Format, for this file and known-private: one entry per line; blank lines and
 # lines starting with '#' are ignored. An entry is a bare file or directory name,
 # with no trailing '/', so a directory is listed as "projects", not "projects/".
-# Names compare exactly; an entry containing '*' is a glob matched against the
-# whole name. No path separators.
+# Names compare exactly; each '*' in an entry matches any run of characters,
+# possibly empty, against the whole name. No path separators.
 projects
 history.jsonl
 CLAUDE.md
 settings.json
 keybindings.json
-skills
 agents
 commands
+skills
 plugins
-todos
+hooks
+output-styles
+themes
+rules
+workflows
+file-history
+paste-cache
+shell-snapshots
+session-env
