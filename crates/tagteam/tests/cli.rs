@@ -415,11 +415,9 @@ fn list_and_status_mark_quarantined_accounts() {
     let (a, b) = two_accounts(d.path());
     quarantine(d.path(), &a);
     quarantine(d.path(), &b);
-    offline(d.path())
-        .arg("list")
-        .assert()
-        .success()
-        .stdout("  1  a@x.co  relogin required\n* 2  b@x.co  relogin required\n");
+    offline(d.path()).arg("list").assert().success().stdout(
+        "    #  ACCOUNT\n    1  a@x.co   relogin required\n *  2  b@x.co   relogin required\n",
+    );
     offline(d.path())
         .arg("status")
         .assert()

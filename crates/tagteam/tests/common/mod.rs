@@ -21,6 +21,14 @@ pub const LOCKED: &str = "the login keychain is locked (common over SSH); run `s
 /// listens on, so a request fails at once as `PreSend` and no test reaches the network.
 pub const OFFLINE_API_BASE: &str = "http://127.0.0.1:9";
 
+/// Now, in epoch seconds.
+pub fn now_epoch_s() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
 /// The binary in an isolated environment rooted at `root`, with its file-backed Keychain.
 pub fn std_cmd(root: &Path) -> std::process::Command {
     let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("tagteam"));
