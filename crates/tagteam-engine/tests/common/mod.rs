@@ -16,7 +16,7 @@ use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
-use tagteam_engine::store::{JournalRow, LoginMeta};
+use tagteam_engine::store::{JournalRow, LoginMeta, NewAccount, Store};
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
@@ -27,6 +27,40 @@ use tagteam_provider::{
     Clock, Credential, Env, FakeClock, FakeKeychain, Identity, IdentitySurface, MutationGuard,
     ProcessStamp, Provider, Read, ScriptedHttp,
 };
+
+pub fn identity(email: &str) -> Identity {
+    Identity {
+        label: email.into(),
+        email: Some(email.into()),
+        org_uuid: String::new(),
+        org_name: None,
+        account_uuid: None,
+        raw: json!({"emailAddress": email}),
+    }
+}
+
+/// Inserts an account whose identity key is `"<email>\n"`.
+pub fn add(s: &Store, p: &ProviderId, id: &str, email: &str, pos: u32) -> AccountId {
+    let aid = AccountId::from_string(id);
+    let key = format!("{email}\n");
+    s.insert_account(&NewAccount {
+        id: &aid,
+        provider: p,
+        position: pos,
+        identity_key: &key,
+        identity: &identity(email),
+        kind: "oauth",
+        alias: None,
+        login_expires_at: None,
+        added_at: 1,
+    })
+    .unwrap();
+    aid
+}
+
+pub fn cc() -> ProviderId {
+    ProviderId::new("claude-code")
+}
 
 /// An oracle that answers whatever the test sets.
 #[derive(Default)]
