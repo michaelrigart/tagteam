@@ -309,11 +309,19 @@ fn meter_window(key: &str, kind: WindowKind, pct: f64, renews: i64, period_s: i6
 
 /// One usage fetch with `fa-tok`, against a fresh `ScriptedHttp` that answers with `reply`.
 fn fetch_once(reply: Result<HttpResponse, HttpError>) -> (UsageResult, Vec<RecordedRequest>) {
+    fetch_with_expiry(None, reply)
+}
+
+/// As `fetch_once`, with the credential's `expires` (epoch ms) set.
+fn fetch_with_expiry(
+    expires: Option<i64>,
+    reply: Result<HttpResponse, HttpError>,
+) -> (UsageResult, Vec<RecordedRequest>) {
     let fake = FakeAgent::new();
     let http = ScriptedHttp::new();
     http.push(Method::Get, &fake.usage_url(), reply);
     let token = Credential::fresh(
-        credential_json("fa-tok", Some("fa-renew"), None)
+        credential_json("fa-tok", Some("fa-renew"), expires)
             .to_string()
             .into_bytes(),
     );
@@ -381,6 +389,67 @@ fn fake_agent_usage_verdicts() {
     assert_eq!(
         fetch_once(Err(HttpError::Ambiguous("reset".into()))).0,
         failed(TransientKind::Ambiguous, None)
+    );
+    // The same table as Claude Code's, since both delegate to `UsageResult::from_reply`.
+    assert_eq!(
+        fetch_once(Err(HttpError::PreSend("no route".into()))).0,
+        failed(TransientKind::PreSend, None)
+    );
+    let html = HttpResponse {
+        status: 200,
+        headers: vec![],
+        body: b"<html>not json</html>".to_vec(),
+    };
+    assert_eq!(
+        fetch_once(Ok(html)).0,
+        failed(TransientKind::BadResponse, None),
+        "a 200 that is not JSON"
+    );
+    assert_eq!(
+        fetch_once(Ok(HttpResponse::json_body(500, &json!({})))).0,
+        failed(TransientKind::Http(500), None)
+    );
+    let busy = HttpResponse {
+        status: 503,
+        headers: vec![("retry-after".into(), "7".into())],
+        body: vec![],
+    };
+    assert_eq!(
+        fetch_once(Ok(busy)).0,
+        failed(TransientKind::Http(503), Some(7.0))
+    );
+}
+
+#[test]
+fn fake_agent_fetches_with_an_expired_token_and_never_refreshes() {
+    // §8.1: the usage fetch ignores expiry; a stale token is the gate's and the 401's business.
+    let fake = FakeAgent::new();
+    let body = json!({"meters": [{"id": "daily", "used": 0.5, "renews": RENEWS_DAY}]});
+    let (r, sent) = fetch_with_expiry(Some(1), Ok(HttpResponse::json_body(200, &body)));
+    assert_eq!(
+        r,
+        UsageResult::Windows(vec![meter_window(
+            "daily",
+            WindowKind::Short,
+            50.0,
+            RENEWS_DAY,
+            86_400
+        )])
+    );
+    assert_eq!(sent.len(), 1, "one request, and nothing else");
+    assert_eq!(
+        (sent[0].method, sent[0].url.as_str()),
+        (Method::Get, fake.usage_url().as_str())
+    );
+    assert_ne!(
+        sent[0].url,
+        fake.renew_url(),
+        "the renew endpoint is never called"
+    );
+    assert_eq!(
+        sent[0].headers,
+        vec![("authorization".to_owned(), "Fake fa-tok".to_owned())],
+        "the expired token is sent as it is"
     );
 }
 
