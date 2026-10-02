@@ -10,7 +10,7 @@ use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{live_email, std_cmd, two_fresh_accounts};
+use common::{Running, live_email, std_cmd, two_fresh_accounts};
 use serde_json::{Value, json};
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
@@ -351,13 +351,9 @@ fn debug_logging_from_a_collector_thread_does_not_deadlock_the_command() {
     let root = dir.path();
     two_fresh_accounts(root); // both due: `list` collects with a thread per account
 
-    let child = std_cmd(root)
-        .args(["--debug", "list"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let out = finish(child, Duration::from_secs(10));
+    let mut cmd = std_cmd(root);
+    cmd.args(["--debug", "list"]);
+    let out = Running::spawn(cmd).finish(Duration::from_secs(10));
 
     assert_eq!(
         out.status.code(),
@@ -379,21 +375,18 @@ fn ctrl_c_during_a_debug_collection_exits_130() {
     let server = MockServer::start();
     server.on("GET", "/api/oauth/usage", MockReply::Hang);
 
-    let mut child = std_cmd(root)
-        .args(["--debug", "list"])
-        .env("TAGTEAM_TEST_API_BASE", server.base_url())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut cmd = std_cmd(root);
+    cmd.args(["--debug", "list"])
+        .env("TAGTEAM_TEST_API_BASE", server.base_url());
+    let mut running = Running::spawn(cmd);
     wait_until(
-        &mut child,
+        &mut running.child,
         Duration::from_secs(20),
         "a usage request in flight",
         || server.hits("GET", "/api/oauth/usage") > 0,
     );
-    send(&child, libc::SIGINT);
-    let out = finish(child, Duration::from_secs(8));
+    send(&running.child, libc::SIGINT);
+    let out = running.finish(Duration::from_secs(8));
 
     assert_eq!(
         out.status.code(),
