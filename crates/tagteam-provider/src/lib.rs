@@ -14,6 +14,7 @@ pub mod process;
 pub mod profile;
 pub mod provider;
 pub mod read;
+pub mod reservation;
 pub mod security;
 pub mod splice;
 
@@ -56,6 +57,7 @@ pub use provider::{
     Undo, UsageResult, Written,
 };
 pub use read::{Read, ReadError};
+pub use reservation::{LaunchReservation, remove_dead_reservations};
 pub use tagteam_core::pace::Pace;
 pub use tagteam_core::poll::PollBudget;
 pub use tagteam_core::usage::Window;
