@@ -153,6 +153,10 @@ pub struct LoginMeta<'a> {
     pub identity: &'a Identity,
     pub kind: &'a str,
     pub login_expires_at: Option<i64>,
+    /// The login was taken from the live store (`add`, §10.1). Once it lands, the live store
+    /// holds exactly the vault's generation, so finishing records the new epoch as the
+    /// activation epoch (§12.5). Recorded in `replacing_meta`, so a reconciliation does too.
+    pub from_live: bool,
 }
 
 /// The store's record of the default home's live login (§12.5): the account tagteam made live,
@@ -707,14 +711,22 @@ impl Store {
         }
     }
 
-    /// Marks the start of a replacement (§12.5): bumps the epoch and records both the
+    /// Marks the start of a replacement (§12.5 step 1): bumps the epoch and records both the
     /// incoming fingerprint and the metadata to install once it lands. Guarded so a second
     /// `begin` on an already-pending account is refused rather than clobbering the first.
+    ///
+    /// The same transaction records the default home's evidence. When `live_names_account`
+    /// (the engine read the live identity) or `active_accounts` names the account, and the row
+    /// does not already name it with an epoch, the row is set to the account at the epoch it
+    /// had before the increment. The live store is then stale-marked whoever activated it and
+    /// whatever the row held before; for a login taken from the live store, `finish_replacement`
+    /// lifts the mark. A rollback restores that same epoch, so it needs no undo here.
     pub fn begin_replacement(
         &self,
         id: &AccountId,
         fp: &str,
         meta: &LoginMeta<'_>,
+        live_names_account: bool,
     ) -> Result<(), StoreError> {
         let meta = json!({
             "identity_key": meta.identity_key,
@@ -726,9 +738,10 @@ impl Store {
             "kind": meta.kind,
             "identity_json": meta.identity.raw,
             "login_expires_at": meta.login_expires_at,
+            "from_live": meta.from_live,
         });
         let mut c = self.lock();
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let n = tx.execute(
             "UPDATE accounts SET login_epoch = login_epoch + 1, replacing_fp = ?2, replacing_meta = ?3 \
              WHERE id = ?1 AND replacing_fp IS NULL",
@@ -746,6 +759,26 @@ impl Store {
                 StoreError::NoSuchAccount
             });
         }
+        let (provider, epoch): (String, i64) = tx.query_row(
+            "SELECT provider, login_epoch FROM accounts WHERE id = ?1",
+            [id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let provider = ProviderId::new(provider);
+        let active: Option<(Option<String>, Option<i64>)> = tx
+            .query_row(
+                "SELECT account_id, login_epoch FROM active_accounts WHERE provider = ?1",
+                [provider.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (names, with_epoch) = match &active {
+            Some((Some(named), recorded)) if named == id.as_str() => (true, recorded.is_some()),
+            _ => (false, false),
+        };
+        if (live_names_account || names) && !with_epoch {
+            set_active_on(&tx, &provider, Some(id), Some(epoch - 1))?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -754,6 +787,13 @@ impl Store {
     /// marker, all in one transaction. A missing `identity_key`, `label` or `kind` in the
     /// recorded metadata means the account and its marker are left exactly as they were
     /// (§12.5) rather than installing an empty identity.
+    ///
+    /// A login taken from the live store (`from_live`, `add`'s) also records the account's new
+    /// `login_epoch` as the activation epoch here (§10.1, §12.5): the live store holds exactly
+    /// the vault's generation. Only while `active_accounts` still names the account:
+    /// `begin_replacement` made it so, and a switch that committed another account after a
+    /// replacer died is the newer record. Metadata without `from_live` is not from the live
+    /// store.
     pub fn finish_replacement(&self, id: &AccountId) -> Result<(), StoreError> {
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -789,6 +829,13 @@ impl Store {
             };
             let login_expires_at = v["login_expires_at"].as_i64();
             apply_login(&tx, id, identity_key, &identity, kind, login_expires_at)?;
+            if v["from_live"].as_bool().unwrap_or(false) {
+                tx.execute(
+                    "UPDATE active_accounts SET login_epoch = \
+                     (SELECT login_epoch FROM accounts WHERE id = ?1) WHERE account_id = ?1",
+                    [id.as_str()],
+                )?;
+            }
         }
         tx.execute(
             "UPDATE accounts SET replacing_fp = NULL, replacing_meta = NULL WHERE id = ?1",

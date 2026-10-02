@@ -161,6 +161,16 @@ struct Prepared {
     id: AccountId,
 }
 
+/// Where a login comes from, for the evidence an explicit replacement records (§12.5).
+#[derive(Clone, Copy)]
+struct LoginSource {
+    /// Taken from the live store (`add`): finishing the replacement records its new epoch as
+    /// the activation epoch (§10.1).
+    from_live: bool,
+    /// The live identity names the account (§12.5 "A replacement records its own evidence").
+    live_names_account: bool,
+}
+
 impl Engine {
     pub(crate) fn event(
         &self,
@@ -284,7 +294,8 @@ impl Engine {
     }
 
     /// Writes the login under the locks `prep` names. The replacement is persisted before the
-    /// occupant it displaces is removed, so a failure never loses the occupant.
+    /// occupant it displaces is removed, so a failure never loses the occupant. `source` is the
+    /// evidence a replacement records for the default home (§12.5).
     #[allow(clippy::too_many_arguments)]
     fn commit_login(
         &self,
@@ -298,6 +309,7 @@ impl Engine {
         secret: &[u8],
         position: Option<u32>,
         alias: Option<&str>,
+        source: LoginSource,
     ) -> Result<(AccountRow, bool), EngineError> {
         let lock_for = |id: &AccountId| {
             locks
@@ -328,8 +340,10 @@ impl Engine {
                     identity,
                     kind,
                     login_expires_at: p.login_expires_at(secret),
+                    from_live: source.from_live,
                 };
-                store.begin_replacement(&row.id, &new_fp, &meta)?;
+                // §12.5 step 1, with the default home's evidence in the same transaction.
+                store.begin_replacement(&row.id, &new_fp, &meta, source.live_names_account)?;
                 if let Err(e) = self.vault.store(lock_for(&row.id), secret, &fp) {
                     // The write never landed: reconcile in process rather than leaving the
                     // marker dangling for the next lock holder to find (Task 18's review,
@@ -493,8 +507,16 @@ impl Engine {
             now.bytes(),
             opts.position,
             alias.as_deref(),
+            // `add`'s login is the live one, verified just above under the live locks.
+            LoginSource {
+                from_live: true,
+                live_names_account: true,
+            },
         )?;
         drop(live_locks);
+        // §10.1: a new account's activation, in a write of its own (no replacement can
+        // stale-mark an account that did not exist). A replacement's last transaction has
+        // already recorded this same epoch.
         store.set_active(&opts.provider, Some(&account.id), Some(account.login_epoch))?;
         Ok(AddOutcome {
             account,
@@ -566,6 +588,15 @@ impl Engine {
                 )));
             }
         }
+        // §12.5: whether the live identity names this account, read now that its lock is
+        // held: a file read, with no Keychain. One that cannot be read leaves the evidence
+        // undecidable, and either guess can cost a replacement its protection, so nothing is
+        // written (B.1).
+        let live_names_account = match p.live_identity(&self.env) {
+            Read::Present(live) => p.identity_key(&live) == p.identity_key(&identity),
+            Read::Absent => false,
+            Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
+        };
         let (account, created) = self.commit_login(
             &store,
             p.as_ref(),
@@ -577,6 +608,10 @@ impl Engine {
             &secret,
             opts.position,
             alias.as_deref(),
+            LoginSource {
+                from_live: false,
+                live_names_account,
+            },
         )?;
         Ok(AddOutcome {
             account,
