@@ -1185,8 +1185,6 @@ fn the_model_check_waits_for_a_reading_to_compare_with() {
     assert!(warned(&sink.take()));
 }
 
-/// §14.1: a signal at a collection cancellation point ends the tick with the interruption. The
-/// slot reserved for the request that never left is given back, and nothing is recorded.
 /// What a sink is given, in order: each event, and each tick's end with its provider.
 #[derive(Debug, Clone, PartialEq)]
 enum Given {
@@ -1251,6 +1249,8 @@ fn every_tick_ends_at_one_boundary_whatever_it_came_to() {
     assert_eq!(sink.take(), [done.clone()]);
 }
 
+/// §14.1: a signal at a collection cancellation point ends the tick with the interruption. The
+/// slot reserved for the request that never left is given back, and nothing is recorded.
 #[cfg(feature = "test-hooks")]
 #[test]
 fn an_interruption_during_collection_ends_the_tick_with_nothing_half_written() {
