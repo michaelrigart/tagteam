@@ -147,8 +147,6 @@ impl Undo for NothingToUndo {
     }
 }
 
-/// `fa.token`, unless the credential has expired by §7.2's rule (`now + 5 min ≥ expires`).
-/// A non-numeric or absent `expires` never expires.
 /// FakeAgent run for the profile in `dir`, its actual directory (Decision 19): its home variable
 /// names `dir`. FakeAgent keeps no Keychain item, so nothing of a profile is named after its
 /// recorded spelling, which names the old path once the data directory has moved.
@@ -158,6 +156,8 @@ fn profile_env_in(env: &Env, dir: &Path) -> Env {
     out
 }
 
+/// `fa.token`, unless the credential has expired by §7.2's rule (`now + 5 min ≥ expires`).
+/// A non-numeric or absent `expires` never expires.
 fn showable_token(bytes: &[u8], now_ms: i64) -> Option<String> {
     let v: Value = serde_json::from_slice(bytes).ok()?;
     if v["fa"]["expires"]

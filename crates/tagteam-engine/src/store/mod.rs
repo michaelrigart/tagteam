@@ -1044,11 +1044,13 @@ impl Store {
         )
     }
 
-    /// §9.4 step 9: the active account, its activation epoch (the target's `login_epoch`, which
-    /// cannot move while its account lock is held), the event and the journal row move
+    /// §9.4 step 9: the active account, its activation epoch, the event and the journal row move
     /// together, and so does an automatic switch's `record` (§11.2 step 11), which also resets
     /// `unhealthy_ticks`. The record is written first, so any later statement that fails
-    /// takes it down too.
+    /// takes it down too. The caller supplies `epoch` (§12.5): a switch passes the target's
+    /// `login_epoch`, which cannot move while its account lock is held, and recovery (§9.6) the
+    /// row's journaled `to_epoch`, so a replacement that landed since leaves the live store
+    /// stale-marked.
     pub fn commit_switch(
         &self,
         provider: &ProviderId,

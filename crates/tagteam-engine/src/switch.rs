@@ -1761,7 +1761,8 @@ impl Engine {
                 Err(session_owned(&target))
             };
         }
-        // The rotation decision, recomputed from the store alone (§9.2, §9.3), including the
+        // The rotation decision, recomputed from the store and each candidate's session state
+        // (§9.2, §9.3: every candidate list skips session-owned accounts), including the
         // fewer-than-two case; no vault but the target's is read here. Its anchor is `again`,
         // which is `outgoing` when anything proceeds.
         // Only the target's vault is read here (§9.3): if it emptied while this command waited,
