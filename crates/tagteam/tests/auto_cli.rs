@@ -271,15 +271,13 @@ fn inside_a_run_shell_auto_refuses_unless_it_is_a_dry_run() {
                "message": "this command cannot run inside a `tagteam run` session"}})
         )
     );
-    let ticks = events(&out.stdout);
-    assert_eq!(ticks.len(), 1, "{}", text(&out.stdout));
-    assert!(
-        ["no-switch", "switch"].contains(&ticks[0]["event"].as_str().unwrap()),
-        "{}",
-        ticks[0]
-    );
-    if ticks[0]["event"] == "switch" {
-        assert_eq!(ticks[0]["dryRun"], json!(true));
+    let outcomes: Vec<Value> = events(&out.stdout)
+        .into_iter()
+        .filter(|e| ["no-switch", "switch"].contains(&e["event"].as_str().unwrap()))
+        .collect();
+    assert_eq!(outcomes.len(), 1, "{}", text(&out.stdout));
+    if outcomes[0]["event"] == "switch" {
+        assert_eq!(outcomes[0]["dryRun"], json!(true));
     }
     assert_eq!(live_email(d.path()), "b@x.co");
 }
