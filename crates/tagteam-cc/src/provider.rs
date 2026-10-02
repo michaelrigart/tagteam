@@ -248,6 +248,12 @@ impl Provider for ClaudeCode {
             credential_items: keychain_items(env, ItemKind::OAuth, &acct, mac),
             owned_items: keychain_items(env, ItemKind::ManagedKey, &acct, mac),
             machine_shared_keys: MACHINE_SHARED_KEYS.to_vec(),
+            // §3's create-only row: the must-share entries, in the config home a link sync
+            // shares from (§12.2).
+            create_only: CC_MUST_SHARE
+                .iter()
+                .map(|(name, _)| paths.config_home.join(name))
+                .collect(),
         }
     }
 

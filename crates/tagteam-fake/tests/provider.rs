@@ -138,6 +138,7 @@ fn kinds_capabilities_endpoints_and_surface() {
     assert_eq!(s.credential_files, vec![p.credential.clone()]);
     assert!(s.credential_items.is_empty() && s.owned_items.is_empty());
     assert_eq!(s.machine_shared_keys, vec!["device"]);
+    assert_eq!(s.create_only, vec![p.dir.join("journal.log")]);
     assert_eq!(f.fake.renew_url(), "https://fake-agent.invalid/fa/renew");
     assert_eq!(f.fake.usage_url(), "https://fake-agent.invalid/usage");
     assert_eq!(

@@ -518,3 +518,37 @@ fn the_comparison_allows_only_appends_to_approved_api_keys() {
         "beyond appending",
     );
 }
+
+#[test]
+fn the_comparison_allows_only_an_empty_create_only_entry_where_there_was_none() {
+    let fx = Fx::new();
+    let claude = fx.env.home.join(".claude");
+    std::fs::remove_file(claude.join("history.jsonl")).unwrap();
+    std::fs::remove_dir_all(claude.join("projects")).unwrap();
+
+    // §3's create-only row: created empty where there was none.
+    let before = fx.snapshot();
+    std::fs::write(claude.join("history.jsonl"), b"").unwrap();
+    std::fs::create_dir(claude.join("projects")).unwrap();
+    let after = fx.snapshot();
+    fx.assert_only_surface_changed(&before, &after, "created empty"); // must not panic
+
+    // Once it exists, it is held to the byte-for-byte rule like anything else.
+    let before = fx.snapshot();
+    std::fs::write(claude.join("history.jsonl"), "{\"display\":\"x\"}\n").unwrap();
+    let after = fx.snapshot();
+    expect_violation(&fx, &before, &after, "existing", "history.jsonl");
+
+    // Created with content: not what the row allows.
+    std::fs::remove_file(claude.join("history.jsonl")).unwrap();
+    let before = fx.snapshot();
+    std::fs::write(claude.join("history.jsonl"), b"x").unwrap();
+    let after = fx.snapshot();
+    expect_violation(&fx, &before, &after, "content", "create-only");
+
+    // Anything inside a created directory is outside the row.
+    let before = fx.snapshot();
+    std::fs::write(claude.join("projects/new.jsonl"), b"").unwrap();
+    let after = fx.snapshot();
+    expect_violation(&fx, &before, &after, "inside", "projects/new.jsonl");
+}

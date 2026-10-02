@@ -667,6 +667,14 @@ fn identity_surface_names_the_section_3_writes() {
         )]
     );
     assert_eq!(s.credential_files, vec![paths.credentials_file]);
+    assert_eq!(
+        s.create_only,
+        vec![
+            paths.config_home.join("projects"),
+            paths.config_home.join("history.jsonl")
+        ],
+        "§3's create-only row: the must-share entries, in the config home"
+    );
     assert_eq!(s.machine_shared_keys.len(), 5);
     assert_eq!(
         f.cc.identity_key(&f.cc.token_identity("a@b.co")).as_str(),

@@ -198,6 +198,8 @@ impl Provider for FakeAgent {
             credential_items: vec![],
             owned_items: vec![],
             machine_shared_keys: vec![DEVICE],
+            // Its one must-share entry (`share_policy`), which a link sync creates empty.
+            create_only: vec![p.dir.join("journal.log")],
         }
     }
 
