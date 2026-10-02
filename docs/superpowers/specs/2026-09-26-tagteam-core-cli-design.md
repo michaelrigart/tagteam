@@ -3231,7 +3231,9 @@ since 2.1.283.
   and renames a temporary file over that target, so a link to a link loses its second link
   (anthropics/claude-code#78162). It writes `.credentials.json` and most other files by
   renaming a temporary file over the path itself, which replaces a symlink with a regular file.
-  Project and local settings refuse symlinks altogether (*2.1.286*, not tested empirically).
+  Verified on 2026-10-01 against CC 2.1.286: it wrote `.claude.json` through one symlink hop,
+  keeping the link, and replaced the middle link of a link-to-link with a regular file. Project
+  and local settings refuse symlinks altogether (*2.1.286*, not tested empirically).
 - **Session records:** `<config_home>/sessions/<pid>.json` (A.7). **IDE locks:**
   `<config_home>/ide/<port>.lock`; with `CLAUDE_CONFIG_DIR` set, CC also reads the default
   `~/.claude/ide`.
@@ -3271,8 +3273,13 @@ since 2.1.283.
     `Unreadable`.
   - rc 44: `Absent`. rc 36, any other rc, or a timeout: `Unreadable`.
 - **Existence probe:** the same command without `-w` (attributes only; never prompts).
-  - On a locked keychain file or a locked SSH session: rc 0 for present, rc 44 for absent; never prompts.
-  - `show-keychain-info` on a locked keychain file returns rc 128. The argv/new-item versus `-i`/`-U` write difference does not change the item's ACL (both use the same binary).
+  - On a locked keychain file or a locked SSH session: rc 0 for present, rc 44 for absent, at
+    once and without a prompt (the keychain-file case verified on 2026-10-01 against a
+    throwaway keychain).
+  - `show-keychain-info` on a locked keychain file in a GUI session opens a SecurityAgent
+    unlock dialog and blocks until it is answered (verified on 2026-10-01 against a throwaway
+    keychain). The argv/new-item versus `-i`/`-U` write difference does not change the item's
+    ACL (both use the same binary).
 - **Write:** `security -i`, with the stdin line `add-generic-password -U -a "<acct>" -s "<svc>"
   -X "<hex>"`.
   - If the line exceeds 4032 bytes (the 4096-byte `-i` line limit minus 64), use argv instead.
@@ -3287,9 +3294,10 @@ since 2.1.283.
 - **Lock check and unlock** (§17, R1). Over SSH the login keychain stays locked: reads, writes
   and `show-keychain-info` all return rc 36.
   - A command that will read or write a Keychain item first runs `show-keychain-info` on the
-    default keychain: rc 0 is unlocked, rc 36 locked. Any other rc (such as 128 for a locked
-    keychain file) or a timeout is unknown, and the command proceeds; its tri-state reads
-    refuse safely.
+    default keychain: rc 0 is unlocked, rc 36 locked. Any other rc, or a timeout, is unknown,
+    and the command proceeds; its tri-state reads refuse safely. A locked keychain file in a
+    GUI session is such a case: `show-keychain-info` waits on its unlock dialog (above), so
+    unless the dialog is answered within the driver's 5 s timeout, the check ends as unknown.
   - A command that touches no Keychain item runs no check, so `list` and `status` with no
     store never spawn `security`. Linux has no check. `doctor` reports the state instead
     (§13.6).

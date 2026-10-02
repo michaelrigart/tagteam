@@ -884,7 +884,7 @@ mod tests {
         let k = cli(&s, None);
         assert_eq!(k.lock_state(), LockState::Unlocked);
         assert_eq!(k.lock_state(), LockState::Locked);
-        assert_eq!(k.lock_state(), LockState::Unknown); // rc 128: a locked keychain file
+        assert_eq!(k.lock_state(), LockState::Unknown); // any other rc: unknown
         assert_eq!(k.lock_state(), LockState::Unknown);
         assert_eq!(
             s.calls()[0],
