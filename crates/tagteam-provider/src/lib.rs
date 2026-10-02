@@ -41,7 +41,10 @@ pub use liveness::{
 pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 #[cfg(feature = "mock-server")]
 pub use mock_server::{MockReply, MockRequest, MockServer};
-pub use process::ProcessStamp;
+pub use process::{
+    Captured, ProcessSpawner, ProcessStamp, ScriptedSpawner, SpawnSpec, SystemSpawner,
+    exec_command, exit_code, find_on_path, run_captured, spawn_session,
+};
 pub use profile::{
     LAUNCH_DIR, LINKS_FILE, LinksRecord, MARKER_FILE, ProfileMarker, RunShell, SEED_FILE, Seed,
     canonical_profile_path, entry_matches, launch_reservations, profile_path,
