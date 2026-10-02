@@ -11,6 +11,7 @@ mod history;
 pub mod prompt;
 mod render;
 mod root_guard;
+mod shell_init;
 mod signals;
 mod statusline;
 

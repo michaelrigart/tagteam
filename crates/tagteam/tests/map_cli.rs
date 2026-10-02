@@ -5,12 +5,12 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use common::{cc_profile, cmd, two_accounts};
 use serde_json::{Value, json};
-use tagteam_provider::Env;
+use tagteam_provider::{Env, MARKER_FILE};
 
 fn json_of(out: &[u8]) -> Value {
     serde_json::from_slice(out).unwrap()
@@ -271,4 +271,180 @@ fn map_works_inside_a_run_shell_against_the_outer_home_s_store() {
         (&rows[0]["path"], &rows[0]["number"]),
         (&json!(real), &json!(2))
     );
+}
+
+/// A stand-in for `name` in `bin`: it writes each argument it gets, one per line, to
+/// `<bin>/<name>.args`.
+fn recorder(bin: &Path, name: &str) {
+    fs::create_dir_all(bin).unwrap();
+    let path = bin.join(name);
+    let out = bin.join(format!("{name}.args"));
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n",
+            out.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The arguments the stand-in for `name` was given, if it ran.
+fn recorded(bin: &Path, name: &str) -> Option<Vec<String>> {
+    let text = fs::read_to_string(bin.join(format!("{name}.args"))).ok()?;
+    Some(text.lines().map(str::to_owned).collect())
+}
+
+/// The first `name` on this test's `PATH`: the shell, if it is installed.
+fn installed(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+/// What `tagteam shell-init <shell>` prints.
+fn wrapper(root: &Path, shell: &str) -> String {
+    let out = cmd(root).args(["shell-init", shell]).assert().success();
+    String::from_utf8(out.get_output().stdout.clone()).unwrap()
+}
+
+/// A call with the arguments a careless wrapper would split, glob, expand or drop.
+const CALL: &str = "claude 'a b' '' '*' '$HOME' --json -- \"x\"";
+const PASSED: [&str; 7] = ["a b", "", "*", "$HOME", "--json", "--", "x"];
+
+/// Each shell, its flags for running a script without reading any rc file, and the
+/// `shell-init` text it runs: POSIX `sh` runs bash's.
+const SHELLS: [(&str, &[&str], &str); 4] = [
+    ("sh", &["-c"], "bash"),
+    ("bash", &["-c"], "bash"),
+    ("zsh", &["-f", "-c"], "zsh"),
+    ("fish", &["--no-config", "-c"], "fish"),
+];
+
+/// Runs each installed shell's wrapper and then `CALL`, with only `bin-<shell>` on `PATH`;
+/// a shell that is not installed is skipped, and the test says so.
+fn through_each_shell(root: &Path, stand_ins: &[&str]) -> Vec<(&'static str, PathBuf)> {
+    let mut ran = Vec::new();
+    for (name, flags, init) in SHELLS {
+        let Some(shell) = installed(name) else {
+            eprintln!("skipped: {name} is not installed");
+            continue;
+        };
+        let bin = root.join(format!("bin-{name}"));
+        for stand_in in stand_ins {
+            recorder(&bin, stand_in);
+        }
+        let status = std::process::Command::new(&shell)
+            .args(flags)
+            .arg(format!("{}\n{CALL}\n", wrapper(root, init)))
+            .env_clear()
+            .env("PATH", &bin)
+            .env("HOME", &bin)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{name}: {status:?}");
+        ran.push((name, bin));
+    }
+    ran
+}
+
+#[test]
+fn the_wrapper_hands_every_argument_to_tagteam_run_intact() {
+    let d = tempfile::tempdir().unwrap();
+    let mut expected = vec!["run", "--provider", "claude-code", "--"];
+    expected.extend(PASSED);
+    for (name, bin) in through_each_shell(d.path(), &["tagteam", "claude"]) {
+        assert_eq!(
+            recorded(&bin, "tagteam").as_deref(),
+            Some(&expected.iter().map(|s| s.to_string()).collect::<Vec<_>>()[..]),
+            "{name}"
+        );
+        assert_eq!(
+            recorded(&bin, "claude"),
+            None,
+            "{name}: tagteam decides, so the wrapper never runs claude itself"
+        );
+    }
+}
+
+#[test]
+fn without_tagteam_on_path_the_wrapper_runs_claude_itself() {
+    let d = tempfile::tempdir().unwrap();
+    for (name, bin) in through_each_shell(d.path(), &["claude"]) {
+        assert_eq!(
+            recorded(&bin, "claude").as_deref(),
+            Some(&PASSED.map(str::to_owned)[..]),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn shell_init_prints_text_never_json_and_knows_its_shells() {
+    let d = tempfile::tempdir().unwrap();
+    let out = cmd(d.path())
+        .args(["shell-init", "zsh", "--json"])
+        .assert()
+        .code(2);
+    assert_eq!(
+        json_of(&out.get_output().stdout),
+        json!({"schemaVersion": 1, "error": {"type": "usage",
+               "message": "shell-init prints shell code; run it without --json"}})
+    );
+    cmd(d.path())
+        .args(["shell-init", "powershell"])
+        .assert()
+        .code(2);
+    cmd(d.path()).arg("shell-init").assert().code(2);
+    cmd(d.path())
+        .args(["--provider", "nope", "shell-init", "zsh"])
+        .assert()
+        .code(1)
+        .stderr("tagteam: unknown provider \"nope\"\n");
+}
+
+#[test]
+fn shell_init_needs_no_store_and_creates_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    fs::create_dir_all(d.path().join("home")).unwrap();
+    let text = wrapper(d.path(), "fish");
+    assert!(text.starts_with("function claude "), "{text}");
+    assert!(
+        fs::read_dir(d.path().join("home"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "HOME stays empty"
+    );
+}
+
+#[test]
+fn shell_init_refuses_under_a_marker_that_cannot_be_read() {
+    // §12.8, Decision 19: under an unreadable run-shell marker every command but `statusline`
+    // refuses, `shell-init` among them, and prints no wrapper.
+    let d = tempfile::tempdir().unwrap();
+    let profile = Env::for_test(d.path()).data_dir().join("sessions/0192");
+    fs::create_dir_all(&profile).unwrap();
+    fs::write(
+        profile.join(MARKER_FILE),
+        "{\"format\": \"tagteam-profile\"",
+    )
+    .unwrap();
+    let out = cmd(d.path())
+        .env("CLAUDE_CONFIG_DIR", &profile)
+        .args(["shell-init", "bash", "--json"])
+        .assert()
+        .code(1);
+    assert_eq!(
+        json_of(&out.get_output().stdout)["error"]["type"],
+        "run-shell-unreadable",
+        "the marker check runs before shell-init's own --json refusal"
+    );
+    cmd(d.path())
+        .env("CLAUDE_CONFIG_DIR", &profile)
+        .args(["shell-init", "bash"])
+        .assert()
+        .code(1)
+        .stdout("");
 }

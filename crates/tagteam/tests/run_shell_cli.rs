@@ -34,6 +34,7 @@ const COMMANDS: &[&[&str]] = &[
     &["map"],
     &["map", "1", "/"],
     &["unmap", "/"],
+    &["shell-init", "zsh"],
 ];
 
 /// `id`'s profile directory under the fixture's `sessions/`.
