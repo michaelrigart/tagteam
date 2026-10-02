@@ -15,7 +15,7 @@ use tagteam_provider::profile::{LinksRecord, MARKER_FILE, ProfileMarker, entry_m
 use tagteam_provider::{EntryKind, Provider, Read, SharePolicy};
 
 use crate::engine::Engine;
-use crate::error::EngineError;
+use crate::error::{EngineError, SplitCause};
 use crate::settings::is_share_name;
 
 /// What one sync did, by entry name, and the lines it reports.
@@ -57,10 +57,11 @@ impl Engine {
     /// quiescent launch has just updated it, and a joining one leaves it as the running session
     /// found it.
     ///
-    /// 1. Nothing is written until every must-share entry has been checked. One the profile
-    ///    holds as a real copy, or as a link tagteam did not make that resolves elsewhere,
-    ///    refuses with `ProfileSplit`, naming both paths; a must-share source that is a link to
-    ///    nothing refuses too.
+    /// 1. Nothing is written until the source home and every must-share entry have been
+    ///    checked. One the profile holds as a real copy, or as a link tagteam did not make that
+    ///    resolves elsewhere, refuses with `ProfileSplit`, naming both paths and the cause; a
+    ///    must-share source, or a source home, that is a link to nothing (or loops) refuses too,
+    ///    and so does a source home that is not a directory.
     /// 2. Unless `joining`, each link tagteam made (as recorded, and still as made) is removed
     ///    when its entry left the allowlist, its source disappeared, or its source now resolves
     ///    elsewhere (it moved, or the outer home changed). A source still there is linked again.
@@ -194,49 +195,58 @@ fn check(
     record: &LinksRecord,
     joining: bool,
 ) -> Result<Vec<String>, EngineError> {
-    if resolved(&policy.source)?
-        .is_some_and(|source| fs::canonicalize(profile).is_ok_and(|own| own == source))
-    {
-        return Err(EngineError::InvalidInput(format!(
-            "the outer home of {} is the profile itself, so it has nothing to share",
-            profile.display()
-        )));
+    match resolved(&policy.source)? {
+        // Nothing could be created in it, and nothing shared from it.
+        None if exists(&policy.source)? => return Err(link_to_nothing(&policy.source)),
+        Some(home) if !home.is_dir() => {
+            return Err(EngineError::InvalidInput(format!(
+                "{} is not a directory, so nothing in it can be shared; fix or remove it, then run again",
+                policy.source.display()
+            )));
+        }
+        Some(home) if fs::canonicalize(profile).is_ok_and(|own| own == home) => {
+            return Err(EngineError::InvalidInput(format!(
+                "the outer home of {} is the profile itself, so it has nothing to share",
+                profile.display()
+            )));
+        }
+        _ => {}
     }
     for w in wanted.iter().filter(|w| w.must.is_some()) {
         let (src, dst) = (policy.source.join(&w.name), profile.join(&w.name));
         let target = resolved(&src)?;
         if target.is_none() && exists(&src)? {
-            return Err(EngineError::InvalidInput(format!(
-                "{} is a link to nothing, so it cannot be shared; fix or remove it, then run again",
-                src.display()
-            )));
+            return Err(link_to_nothing(&src));
         }
-        let split = match held(&dst)? {
-            Held::Nothing => false,
-            Held::Real => true,
+        let cause = match held(&dst)? {
+            Held::Nothing => None,
+            Held::Real => Some(SplitCause::RealCopy),
             // tagteam's own link, which step 2 keeps or makes again; a join cannot make it
             // again, so one that no longer points where the source resolves is a split. A
             // missing source is created empty by step 2 at the source home's own path, so the
             // link stays good when it points exactly there.
             Held::Link(made) if record.links.get(&w.name) == Some(&made) => {
-                joining
-                    && match &target {
-                        Some(t) => t != &made,
-                        None => {
-                            resolved(&policy.source)?
-                                .map(|home| home.join(&w.name))
-                                .as_ref()
-                                != Some(&made)
-                        }
+                let stale = match &target {
+                    Some(t) => t != &made,
+                    None => {
+                        resolved(&policy.source)?
+                            .map(|home| home.join(&w.name))
+                            .as_ref()
+                            != Some(&made)
                     }
+                };
+                (joining && stale).then_some(SplitCause::StaleWhileRunning)
             }
             // Anyone else's is the share only if it resolves where the source does.
-            Held::Link(_) => target.is_none() || resolved(&dst)? != target,
+            Held::Link(_) => {
+                (target.is_none() || resolved(&dst)? != target).then_some(SplitCause::LinkElsewhere)
+            }
         };
-        if split {
+        if let Some(cause) = cause {
             return Err(EngineError::ProfileSplit {
                 profile: dst,
                 shared: src,
+                cause,
             });
         }
     }
@@ -366,9 +376,14 @@ fn link(
             Ok(())
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists && w.must.is_some() => {
+            let cause = match held(dst) {
+                Ok(Held::Link(_)) => SplitCause::LinkElsewhere,
+                _ => SplitCause::RealCopy,
+            };
             Err(EngineError::ProfileSplit {
                 profile: dst.to_path_buf(),
                 shared: src.to_path_buf(),
+                cause,
             })
         }
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {
@@ -415,21 +430,38 @@ fn held(path: &Path) -> io::Result<Held> {
     }
 }
 
+/// The refusal for `path`, a link that resolves to nothing: dangling, looping, or through a
+/// file.
+fn link_to_nothing(path: &Path) -> EngineError {
+    EngineError::InvalidInput(format!(
+        "{} is a link to nothing, so it cannot be shared; fix or remove it, then run again",
+        path.display()
+    ))
+}
+
+/// Whether `e` says a path names nothing: it is absent, or a link on the way to it dangles,
+/// loops (`ELOOP`) or passes through a file (`ENOTDIR`).
+fn names_nothing(e: &io::Error) -> bool {
+    matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+        || e.raw_os_error() == Some(libc::ELOOP)
+}
+
 /// The fully resolved path of `path`, or `None` when there is nothing to resolve (absent, or a
-/// link to nothing).
+/// link to nothing, `names_nothing`).
 fn resolved(path: &Path) -> io::Result<Option<PathBuf>> {
     match fs::canonicalize(path) {
         Ok(p) => Ok(Some(p)),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) if names_nothing(&e) => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-/// Whether `path` is an entry of its own, a link to nothing included.
+/// Whether `path` is an entry of its own, a link to nothing included. Under something that is
+/// not a directory there is none.
 fn exists(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+        Err(e) if names_nothing(&e) => Ok(false),
         Err(e) => Err(e),
     }
 }

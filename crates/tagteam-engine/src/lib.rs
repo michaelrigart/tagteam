@@ -30,4 +30,4 @@ pub mod vault;
 pub mod views;
 
 pub use engine::{Engine, EngineConfig};
-pub use error::EngineError;
+pub use error::{EngineError, SplitCause};

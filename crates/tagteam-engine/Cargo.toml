@@ -15,6 +15,7 @@ test-hooks = []
 tagteam-core.workspace = true
 tagteam-provider.workspace = true
 fastrand.workspace = true
+libc.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,7 +26,6 @@ ureq.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-libc.workspace = true
 tagteam-cc = { workspace = true, features = ["test-hooks"] }
 tagteam-fake.workspace = true
 tagteam-provider = { workspace = true, features = ["file-keychain", "mock-server"] }
