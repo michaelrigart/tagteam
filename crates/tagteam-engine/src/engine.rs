@@ -167,8 +167,17 @@ impl Engine {
     /// under a marker that cannot be read, which the refusal names.
     pub(crate) fn refuse_inside_run_shell(&self) -> Result<(), EngineError> {
         match &self.run_shell {
-            RunShell::Outside => Ok(()),
             RunShell::Inside { .. } => Err(EngineError::InsideRunShell),
+            RunShell::Outside | RunShell::Unreadable { .. } => self.refuse_unreadable_run_shell(),
+        }
+    }
+
+    /// §12.8: under a marker that cannot be read the outer home is unknown, so every command
+    /// but `statusline` refuses, naming it. Inside a readable run shell, `env` is already the
+    /// outer home (Decision 6), so work that §12.8 lets see the default home goes on.
+    pub(crate) fn refuse_unreadable_run_shell(&self) -> Result<(), EngineError> {
+        match &self.run_shell {
+            RunShell::Outside | RunShell::Inside { .. } => Ok(()),
             RunShell::Unreadable { marker, detail } => Err(EngineError::RunShellUnreadable {
                 marker: marker.clone(),
                 detail: detail.clone(),
@@ -497,6 +506,11 @@ mod tests {
             })
         };
         assert!(with(RunShell::Outside).refuse_inside_run_shell().is_ok());
+        assert!(
+            with(RunShell::Outside)
+                .refuse_unreadable_run_shell()
+                .is_ok()
+        );
         let inside = RunShell::Inside {
             profile: PathBuf::from("/p"),
             marker: ProfileMarker {
@@ -512,16 +526,23 @@ mod tests {
             engine.refuse_inside_run_shell(),
             Err(EngineError::InsideRunShell)
         ));
-        let err = with(RunShell::Unreadable {
+        assert!(
+            engine.refuse_unreadable_run_shell().is_ok(),
+            "a readable run shell's outer home is known"
+        );
+        let unreadable = with(RunShell::Unreadable {
             marker: PathBuf::from("/p/.tagteam-profile.json"),
             detail: "not JSON".into(),
-        })
-        .refuse_inside_run_shell()
-        .unwrap_err();
-        assert_eq!(err.kind(), "run-shell-unreadable");
-        assert_eq!(
-            err.to_string(),
-            "the run-shell marker /p/.tagteam-profile.json cannot be read (not JSON)"
-        );
+        });
+        for err in [
+            unreadable.refuse_inside_run_shell().unwrap_err(),
+            unreadable.refuse_unreadable_run_shell().unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), "run-shell-unreadable");
+            assert_eq!(
+                err.to_string(),
+                "the run-shell marker /p/.tagteam-profile.json cannot be read (not JSON)"
+            );
+        }
     }
 }
