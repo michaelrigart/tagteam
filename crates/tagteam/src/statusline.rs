@@ -10,17 +10,18 @@ use tagteam_core::{CLAUDE_CODE, ProviderId, Window, WindowKind};
 use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
+use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{STATUSLINE_MODEL_PREFIX, Settings, is_statusline_placeholder};
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, StatuslineView};
 use tagteam_engine::{Engine, EngineConfig};
 use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::{
-    Capabilities, Env, Http, Keychain, KeychainError, LockState, NoHttp, Read, ReadError,
+    Capabilities, Env, Http, Keychain, KeychainError, LockState, NoHttp, Read, ReadError, RunShell,
     SystemClock,
 };
 
-use crate::app::{Context, locate};
+use crate::app::Context;
 use crate::render::{self, MISSING, RESET};
 
 /// §13.5: at most this much piped stdin is read, and none of it is used.
@@ -193,34 +194,68 @@ pub(crate) fn config_hint(env: &Env) -> String {
     )
 }
 
-/// The engine the fast path runs on, built with walls rather than trust (§13.5): a Keychain that
-/// refuses every call, no profile oracle, and a lazy HTTP port whose adapter could send nothing
-/// even if it were built. It is located as every command is (§12.8), from the marker file
-/// alone. The settings' warnings are dropped, since a status bar has nowhere to show them. The
-/// walls are returned so a test can prove nothing reached them.
+/// Decision 13 (§13.5): `--provider`; else the run shell's marker provider; else the first
+/// registered provider that says it started this process (`Provider::invoked_by`, Claude Code's
+/// `CLAUDECODE` or `CLAUDE_CONFIG_DIR`); else `default`. `env` is the process's own
+/// environment, before any outer home is applied. An unreadable marker names no provider.
+pub(crate) fn resolve_provider(
+    flag: Option<&str>,
+    shell: &RunShell,
+    registry: &ProviderRegistry,
+    env: &Env,
+    default: &ProviderId,
+) -> ProviderId {
+    if let Some(p) = flag {
+        return ProviderId::new(p);
+    }
+    if let RunShell::Inside { marker, .. } = shell {
+        return marker.provider.clone();
+    }
+    registry
+        .all()
+        .iter()
+        .find(|p| p.invoked_by(env))
+        .map_or_else(|| default.clone(), |p| p.id())
+}
+
+/// The engine the fast path runs on, built with walls rather than trust (§13.5): a Keychain
+/// that refuses every call, no profile oracle, and a lazy HTTP port whose adapter could send
+/// nothing even if it were built. The run shell is detected over that walled registry (§12.8),
+/// which reads the marker file alone, and the provider is resolved in Decision 13's order by
+/// `resolve_provider`. This is not `app::locate`, which serves the other commands over the full
+/// registry; the variables Decision 13's third step reads were captured into `ctx.env` by
+/// `Context::from_process`. The settings are that provider's, and their warnings are dropped,
+/// since a status bar has nowhere to show them. Returns the engine, the provider, and the walls,
+/// so a test can prove nothing reached them.
 pub(crate) fn engine(
     ctx: Context,
-    provider: &ProviderId,
-) -> (Engine, Arc<LazyHttp>, Arc<NoKeychain>) {
+    flag: Option<&str>,
+) -> (Engine, ProviderId, Arc<LazyHttp>, Arc<NoKeychain>) {
     let keychain = Arc::new(NoKeychain::default());
     let http = Arc::new(LazyHttp::new(|| Arc::new(NoHttp) as Arc<dyn Http>));
     let registry =
         ProviderRegistry::new().with(Arc::new(ClaudeCode::new(keychain.clone(), ctx.platform)));
-    let (run_shell, env) = locate(ctx.env, &registry);
-    let (settings, _warnings) = Settings::load(&env, provider);
+    let (run_shell, env) = detect_run_shell(&ctx.env, &registry);
+    let default = ProviderId::new(CLAUDE_CODE);
+    // `ctx.env` is the process's own, not the effective `env`: inside a run shell the latter is
+    // the outer home, where `CLAUDE_CONFIG_DIR` is gone and `invoked_by` would lose its signal.
+    let provider = resolve_provider(flag, &run_shell, &registry, &ctx.env, &default);
+    let (settings, _warnings) = Settings::load(&env, &provider);
     let engine = Engine::new(EngineConfig {
         registry,
         vault: Vault::new(Box::new(KeychainVault::new(keychain.clone()))),
         oracle: Arc::new(NoOracle),
         clock: Arc::new(SystemClock),
         http: http.clone(),
-        default_provider: ProviderId::new(CLAUDE_CODE),
+        default_provider: default,
         settings,
         env,
+        // `EngineConfig` requires a probe. The line never judges a session record (Decision 17),
+        // so this one is never asked.
         process: Arc::new(SystemProcessProbe),
         run_shell,
     });
-    (engine, http, keychain)
+    (engine, provider, http, keychain)
 }
 
 /// The statusline engine's Keychain: every call is refused, and counted.
@@ -280,17 +315,21 @@ impl Keychain for NoKeychain {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
     use tagteam_cc::live::Platform;
     use tagteam_cc::{ItemKind, keychain_account, keychain_service};
-    use tagteam_core::{PollBudget, PollPlan};
+    use tagteam_core::{AccountId, PollBudget, PollPlan};
     use tagteam_engine::settings::DEFAULT_STATUSLINE_FORMAT;
     use tagteam_engine::store::{Eligibility, Reserve, Store};
     use tagteam_engine::views::{UsageStatus, UsageView};
-    use tagteam_provider::FakeKeychain;
-    use tagteam_provider::profile::{MARKER_FILE, RunShell};
+    use tagteam_fake::{FAKE_AGENT, FakeAgent};
+    use tagteam_provider::atomic::ensure_private_dir;
+    use tagteam_provider::{
+        FakeKeychain, MARKER_FILE, ProfileMarker, Provider, canonical_profile_path, profile_path,
+    };
 
     use super::*;
     use crate::app::{Io, run};
@@ -608,6 +647,26 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_marker_is_found_without_the_keychain() {
+        // §12.8: the status bar learns from the file alone that the marker cannot be read, and
+        // then prints nothing (`app::run_statusline`).
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::for_test(dir.path());
+        let profile = dir.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(MARKER_FILE), "not json").unwrap();
+        env.claude_config_dir = Some(profile.clone().into_os_string());
+        let (built, _, http, keychain) = engine(context(env), None);
+        assert!(
+            matches!(built.run_shell(), RunShell::Unreadable { marker, .. } if *marker == profile.join(MARKER_FILE)),
+            "{:?}",
+            built.run_shell()
+        );
+        assert!(!http.is_built());
+        assert_eq!(keychain.calls(), 0);
+    }
+
+    #[test]
     fn the_settings_are_those_of_the_provider_the_command_resolves() {
         let dir = tempfile::tempdir().unwrap();
         let env = Env::for_test(dir.path());
@@ -618,20 +677,8 @@ mod tests {
         )
         .unwrap();
         let format_for = |provider: &str| {
-            let ctx = Context {
-                env: env.clone(),
-                keychain: Arc::new(FakeKeychain::new()),
-                platform: Platform::MacOs,
-                api_base: None,
-                stdout_terminal: false,
-                no_color_env: false,
-                force_color_env: false,
-            };
-            engine(ctx, &ProviderId::new(provider))
-                .0
-                .settings()
-                .statusline_format
-                .clone()
+            let (built, _, _, _) = engine(context(env.clone()), Some(provider));
+            built.settings().statusline_format.clone()
         };
         assert_eq!(format_for(CLAUDE_CODE), "{5h}");
         assert_eq!(format_for("other"), "{7d}");
@@ -641,8 +688,19 @@ mod tests {
     fn the_engine_reaches_neither_the_keychain_nor_the_network() {
         // §13.5: the walls count what reaches them, so none of this may.
         let (_dir, env) = managed_home();
-        let provider = ProviderId::new(CLAUDE_CODE);
-        let ctx = Context {
+        let (built, provider, http, keychain) = engine(context(env), None);
+        assert_eq!(shown(&built, &provider), "a · 5h 9% · 7d 77%\n");
+        assert!(!http.is_built(), "the HTTP adapter was built");
+        assert_eq!(keychain.calls(), 0, "the Keychain was asked");
+    }
+
+    /// A context over `env`, with a Keychain the walled engine never uses. Nothing is captured
+    /// from the test process (§15.1): `env.vars` holds exactly what a test put there, and that
+    /// is all Decision 13's third step (`Provider::invoked_by`) sees. `Context::from_process`,
+    /// which captures the registered providers' variables and `CLAUDECODE` (Task 8), is not
+    /// involved.
+    fn context(env: Env) -> Context {
+        Context {
             env,
             keychain: Arc::new(FakeKeychain::new()),
             platform: Platform::MacOs,
@@ -650,46 +708,199 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
-        };
-        let (built, http, keychain) = engine(ctx, &provider);
-        let view = built.statusline(&provider).unwrap();
-        let text = line(
+        }
+    }
+
+    /// The line `built` prints for `provider`, without colour.
+    fn shown(built: &Engine, provider: &ProviderId) -> String {
+        let view = built.statusline(provider).unwrap();
+        line(
             &view,
             &built.settings().statusline_format,
             built.now_ms() / 1000,
             false,
+        )
+    }
+
+    /// The environment of a run shell for `id`'s profile: the profile and its marker as `run`
+    /// writes them (§12.2), and `CLAUDE_CONFIG_DIR` naming it by its exported spelling.
+    fn in_profile(env: &Env, id: &AccountId) -> Env {
+        let profile = profile_path(env, id);
+        ensure_private_dir(&profile).unwrap();
+        let cc = ClaudeCode::new(Arc::new(FakeKeychain::new()), Platform::MacOs);
+        let spelling = cc.profile_spelling(&canonical_profile_path(&profile).unwrap());
+        ProfileMarker {
+            provider: ProviderId::new(CLAUDE_CODE),
+            account_id: id.clone(),
+            config_dir: spelling.clone(),
+            outer: cc.outer_home(env),
+        }
+        .write(&profile)
+        .unwrap();
+        let mut inside = env.clone();
+        inside.claude_config_dir = Some(spelling.into());
+        inside
+    }
+
+    /// `managed_home` with the live login moved to a stranger, so that only a marker can name
+    /// `a@x.co`; and that account's id.
+    fn session_home() -> (tempfile::TempDir, Env, AccountId) {
+        let (dir, env) = managed_home();
+        let stranger = json!({"oauthAccount": {"emailAddress": "s@x.co", "organizationUuid": "", "accountUuid": "uuid-s"}});
+        std::fs::write(env.home.join(".claude.json"), stranger.to_string()).unwrap();
+        let store = Store::open_existing(&env.data_dir().join("tagteam.db"))
+            .unwrap()
+            .unwrap();
+        let id = store
+            .accounts(&ProviderId::new(CLAUDE_CODE))
+            .unwrap()
+            .remove(0)
+            .id;
+        (dir, env, id)
+    }
+
+    #[test]
+    fn in_a_run_shell_the_line_is_the_markers_account_and_reaches_nothing_else() {
+        let (_dir, outside, a) = session_home();
+        let (built, provider, _, _) = engine(context(outside.clone()), None);
+        assert_eq!(
+            shown(&built, &provider),
+            "s@x.co\n",
+            "outside: the live login"
         );
-        assert_eq!(text, "a · 5h 9% · 7d 77%\n");
+
+        let (built, provider, http, keychain) = engine(context(in_profile(&outside, &a)), None);
+        assert!(matches!(built.run_shell(), RunShell::Inside { .. }));
+        assert_eq!(provider.as_str(), CLAUDE_CODE, "the marker's provider");
+        assert_eq!(shown(&built, &provider), "a · 5h 9% · 7d 77%\n");
         assert!(!http.is_built(), "the HTTP adapter was built");
         assert_eq!(keychain.calls(), 0, "the Keychain was asked");
     }
 
     #[test]
-    fn an_unreadable_marker_is_found_without_the_keychain() {
-        // §12.8: the status bar learns from the file alone that the marker cannot be read, and
-        // then prints nothing (`app::run_statusline`).
-        let dir = tempfile::tempdir().unwrap();
-        let mut env = Env::for_test(dir.path());
-        let profile = dir.path().join("profile");
-        std::fs::create_dir_all(&profile).unwrap();
-        std::fs::write(profile.join(MARKER_FILE), "not json").unwrap();
-        env.claude_config_dir = Some(profile.clone().into_os_string());
-        let ctx = Context {
-            env,
-            keychain: Arc::new(FakeKeychain::new()),
-            platform: Platform::MacOs,
-            api_base: None,
-            stdout_terminal: false,
-            no_color_env: false,
-            force_color_env: false,
-        };
-        let (built, http, keychain) = engine(ctx, &ProviderId::new(CLAUDE_CODE));
-        assert!(
-            matches!(built.run_shell(), RunShell::Unreadable { marker, .. } if *marker == profile.join(MARKER_FILE)),
-            "{:?}",
-            built.run_shell()
+    fn a_run_shell_whose_account_is_gone_or_whose_marker_is_corrupt_prints_nothing() {
+        // Review Focus 4, at the unit level: never the live login's line, and no wall reached.
+        let (_dir, outside, _a) = session_home();
+        let gone = in_profile(&outside, &AccountId::from_string("0192-removed"));
+        let (built, provider, http, keychain) = engine(context(gone), None);
+        assert_eq!(shown(&built, &provider), "");
+        assert_eq!((keychain.calls(), http.is_built()), (0, false));
+
+        let corrupt = in_profile(&outside, &AccountId::from_string("0192-corrupt"));
+        let marker = PathBuf::from(corrupt.claude_config_dir.clone().unwrap()).join(MARKER_FILE);
+        std::fs::write(&marker, b"{\"format\": \"tagteam-profile\", ").unwrap();
+        let (built, provider, http, keychain) = engine(context(corrupt.clone()), None);
+        assert!(matches!(built.run_shell(), RunShell::Unreadable { .. }));
+        assert_eq!(shown(&built, &provider), "");
+        assert_eq!((keychain.calls(), http.is_built()), (0, false));
+
+        // Through the command itself: exit 0, and nothing on either stream.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(
+            Cli::try_parse_from(["tagteam", "statusline"]).unwrap(),
+            context(corrupt),
+            &mut Io {
+                out: &mut out,
+                err: &mut err,
+                prompter: &mut NoPrompts,
+            },
         );
-        assert!(!http.is_built());
-        assert_eq!(keychain.calls(), 0);
+        assert_eq!(
+            (code, out.as_slice(), err.as_slice()),
+            (0, &b""[..], &b""[..])
+        );
+    }
+
+    #[test]
+    fn the_provider_is_the_flag_then_the_marker_then_the_invoking_agent_then_the_default() {
+        // Decision 13 (§13.5). Claude Code alone has the capability today, so a second
+        // provider, FakeAgent (whose `invoked_by` is always false), tells the steps apart.
+        let dir = tempfile::tempdir().unwrap();
+        let plain = Env::for_test(dir.path());
+        let mut from_cc = plain.clone();
+        from_cc.vars.insert("CLAUDECODE".into(), "1".into());
+        let registry = ProviderRegistry::new()
+            .with(Arc::new(FakeAgent::new()))
+            .with(Arc::new(ClaudeCode::new(
+                Arc::new(NoKeychain::default()),
+                Platform::MacOs,
+            )));
+        let marker = |provider: &str| RunShell::Inside {
+            profile: PathBuf::from("/profile"),
+            marker: ProfileMarker {
+                provider: ProviderId::new(provider),
+                account_id: AccountId::from_string("0192"),
+                config_dir: "/profile".into(),
+                outer: json!({}),
+            },
+        };
+        let unreadable = RunShell::Unreadable {
+            marker: PathBuf::from("/profile").join(MARKER_FILE),
+            detail: "torn".into(),
+        };
+        let (cc, fake) = (ProviderId::new(CLAUDE_CODE), ProviderId::new(FAKE_AGENT));
+        let resolve = |flag: Option<&str>, shell: &RunShell, env: &Env, default: &ProviderId| {
+            resolve_provider(flag, shell, &registry, env, default)
+                .as_str()
+                .to_owned()
+        };
+        assert_eq!(
+            resolve(Some("other"), &marker(FAKE_AGENT), &from_cc, &fake),
+            "other"
+        );
+        assert_eq!(
+            resolve(None, &marker(FAKE_AGENT), &from_cc, &cc),
+            FAKE_AGENT,
+            "the marker beats the invoking agent"
+        );
+        assert_eq!(
+            resolve(None, &RunShell::Outside, &from_cc, &fake),
+            CLAUDE_CODE,
+            "the invoking agent beats the default"
+        );
+        assert_eq!(
+            resolve(None, &unreadable, &from_cc, &fake),
+            CLAUDE_CODE,
+            "an unreadable marker names no provider"
+        );
+        assert_eq!(
+            resolve(None, &RunShell::Outside, &plain, &fake),
+            FAKE_AGENT,
+            "nothing else: the default"
+        );
+    }
+
+    #[test]
+    fn the_invoking_agent_is_asked_with_the_process_environment_not_the_outer_one() {
+        // Controller note (Task 8): inside a run shell the engine's `Env` is the outer home, where
+        // `CLAUDE_CONFIG_DIR` is gone and Claude Code's `invoked_by` (which tests `session_dir`)
+        // is false. `engine` must hand `resolve_provider` the process's own `Env`, as it was
+        // before detection.
+        let (_dir, outside, a) = session_home();
+        let process_env = in_profile(&outside, &a);
+        let registry = ProviderRegistry::new().with(Arc::new(ClaudeCode::new(
+            Arc::new(NoKeychain::default()),
+            Platform::MacOs,
+        )));
+        let (shell, outer) = detect_run_shell(&process_env, &registry);
+        assert!(matches!(shell, RunShell::Inside { .. }));
+        let fake = ProviderId::new(FAKE_AGENT);
+        let cc = registry.all()[0].clone();
+        assert!(
+            cc.invoked_by(&process_env),
+            "the process env names the profile"
+        );
+        assert!(
+            !cc.invoked_by(&outer),
+            "the outer home has no CLAUDE_CONFIG_DIR: the signal is lost on it"
+        );
+        // The marker is what decides in a shell, so a shell is resolved without `invoked_by`;
+        // with the marker set aside, the process env still names Claude Code.
+        assert_eq!(
+            resolve_provider(None, &RunShell::Outside, &registry, &process_env, &fake).as_str(),
+            CLAUDE_CODE
+        );
+        let (_, provider, _, _) = engine(context(process_env), None);
+        assert_eq!(provider.as_str(), CLAUDE_CODE);
     }
 }

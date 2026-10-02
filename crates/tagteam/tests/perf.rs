@@ -14,7 +14,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use common::{
-    bloat_claude_json, now_epoch_s, record_history, std_cmd, two_fresh_accounts, usage_window,
+    bloat_claude_json, cc_profile, hold_launch, now_epoch_s, record_history, std_cmd,
+    two_fresh_accounts, usage_window,
 };
 use tagteam_core::{Window, WindowKind};
 use tagteam_provider::Env;
@@ -79,8 +80,8 @@ fn windows_at(now: i64) -> impl Fn(i64) -> Vec<Window> {
 
 /// Two accounts, `b` live, each with 48 hours of readings, the last taken just now, and a
 /// `~/.claude.json` of a few hundred KB. Nothing is due for 180 s (§8.3's on-demand rule), far
-/// longer than a timing run takes.
-fn nothing_due(root: &Path) {
+/// longer than a timing run takes. Returns the two ids, `a` first.
+fn nothing_due(root: &Path) -> (String, String) {
     let (a, b) = two_fresh_accounts(root);
     let now = now_epoch_s();
     let windows = windows_at(now);
@@ -88,16 +89,24 @@ fn nothing_due(root: &Path) {
         record_history(root, id, now, READINGS, SPACING_S, &windows);
     }
     bloat_claude_json(root, CLAUDE_JSON_BYTES);
+    (a, b)
 }
 
 /// The wall time of each of `RUNS` runs of `args`, after `WARM_UP` untimed ones, with every
-/// endpoint pointed at `base`. `before(n)` runs untimed ahead of run `n`.
-fn timings(root: &Path, base: &str, args: &[&str], before: &dyn Fn(usize)) -> Vec<Duration> {
+/// endpoint pointed at `base` and `envs` set. `before(n)` runs untimed ahead of run `n`.
+fn timings(
+    root: &Path,
+    base: &str,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    before: &dyn Fn(usize),
+) -> Vec<Duration> {
     let run = |n: usize| {
         before(n);
         let started = Instant::now();
         let out = std_cmd(root)
             .env("TAGTEAM_TEST_API_BASE", base)
+            .envs(envs.iter().copied())
             .args(args)
             .output()
             .unwrap();
@@ -129,7 +138,7 @@ fn statusline_p95_is_within_10_ms() {
     let d = tempfile::tempdir().unwrap();
     nothing_due(d.path());
     let server = MockServer::start();
-    let runs = timings(d.path(), &server.base_url(), &["statusline"], &|_| {});
+    let runs = timings(d.path(), &server.base_url(), &["statusline"], &[], &|_| {});
     let p = p95(&runs);
     eprintln!("statusline p95 {p:?} over {RUNS} runs");
     assert_eq!(server.requests().len(), 0, "statusline sent a request");
@@ -161,7 +170,7 @@ fn statusline_p95_on_a_cache_miss_is_within_10_ms() {
             .unwrap();
     };
     let server = MockServer::start();
-    let runs = timings(d.path(), &server.base_url(), &["statusline"], &touch);
+    let runs = timings(d.path(), &server.base_url(), &["statusline"], &[], &touch);
     let p = p95(&runs);
     eprintln!("statusline p95 on a cache miss {p:?} over {RUNS} runs ({size} byte claude.json)");
     assert_eq!(server.requests().len(), 0, "statusline sent a request");
@@ -178,7 +187,7 @@ fn list_p95_is_within_50_ms_when_nothing_is_due() {
     let d = tempfile::tempdir().unwrap();
     nothing_due(d.path());
     let server = MockServer::start();
-    let runs = timings(d.path(), &server.base_url(), &["list"], &|_| {});
+    let runs = timings(d.path(), &server.base_url(), &["list"], &[], &|_| {});
     let p = p95(&runs);
     eprintln!("list p95 {p:?} over {RUNS} runs");
     assert_eq!(
@@ -189,5 +198,46 @@ fn list_p95_is_within_50_ms_when_nothing_is_due() {
     assert!(
         p <= Duration::from_millis(50),
         "list p95 {p:?} over {RUNS} runs: {runs:?}"
+    );
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn statusline_in_a_run_shell_p95_is_within_10_ms() {
+    // §12.8, §13.5: in a run shell the line names the marker's account. The marker is one
+    // small file and the 400 KB `~/.claude.json` is never parsed. The line computes no session
+    // state (Decision 17), so the reservation held below is not part of the timed cost. It
+    // makes the timed run a real session's, and would put a regression that made `statusline`
+    // read the profile's session state (a directory listing and a non-blocking `flock`) inside
+    // the budget.
+    let _one_at_a_time = serial();
+    let d = tempfile::tempdir().unwrap();
+    let (a, _b) = nothing_due(d.path());
+    let (profile, shell) = cc_profile(d.path(), &a);
+    let _session = hold_launch(&profile);
+    let server = MockServer::start();
+    let envs = [("CLAUDE_CONFIG_DIR", shell.as_str())];
+    // The timed path is the run-shell one: the line is the session's account, a, not b.
+    let out = std_cmd(d.path())
+        .env("TAGTEAM_TEST_API_BASE", server.base_url())
+        .envs(envs)
+        .args(["statusline", "--no-color"])
+        .output()
+        .unwrap();
+    let line = String::from_utf8(out.stdout).unwrap();
+    assert!(line.starts_with("a · "), "{line:?}");
+    let runs = timings(
+        d.path(),
+        &server.base_url(),
+        &["statusline"],
+        &envs,
+        &|_| {},
+    );
+    let p = p95(&runs);
+    eprintln!("statusline in a run shell p95 {p:?} over {RUNS} runs");
+    assert_eq!(server.requests().len(), 0, "statusline sent a request");
+    assert!(
+        p <= Duration::from_millis(10),
+        "statusline in a run shell p95 {p:?} over {RUNS} runs: {runs:?}"
     );
 }

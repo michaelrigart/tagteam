@@ -322,3 +322,121 @@ mod sessions_in_list_and_status {
         assert!(v.get("session").is_none(), "{v}");
     }
 }
+
+/// Task 15: `statusline` inside a run shell (§12.8, §13.5; Review Focus 4).
+mod statusline_in_a_run_shell {
+    use std::fs;
+    use std::path::Path;
+
+    use serde_json::{Value, json};
+    use tagteam_core::{AccountId, WindowKind};
+    use tagteam_engine::store::Store;
+    use tagteam_provider::{Env, MARKER_FILE};
+
+    use crate::common::{
+        cc_profile, cmd, hold_launch, now_epoch_s, record_reading, two_fresh_accounts, usage_window,
+    };
+
+    /// `a@x.co` (position 1) read at 5h 31 % and 7d 12 %, and `b@x.co` (position 2, live) at
+    /// 9 % and 77 %, both just now.
+    fn read_now(root: &Path) -> (String, String) {
+        let (a, b) = two_fresh_accounts(root);
+        let now = now_epoch_s();
+        for (id, five, seven) in [(&a, 31.0, 12.0), (&b, 9.0, 77.0)] {
+            record_reading(
+                root,
+                id,
+                now,
+                &[
+                    usage_window("5h", "5h", WindowKind::Short, five, None, None),
+                    usage_window("7d", "7d", WindowKind::Long, seven, None, None),
+                ],
+            );
+        }
+        (a, b)
+    }
+
+    /// `tagteam statusline --no-color`, inside the run shell `shell` spells when given.
+    fn statusline(root: &Path, shell: Option<&str>) -> assert_cmd::Command {
+        let mut c = cmd(root);
+        c.args(["statusline", "--no-color"]);
+        if let Some(dir) = shell {
+            c.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        c
+    }
+
+    #[test]
+    fn the_line_is_the_sessions_account_named_by_its_marker() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b) = read_now(d.path());
+        statusline(d.path(), None)
+            .assert()
+            .success()
+            .stdout("b · 5h 9% · 7d 77%\n")
+            .stderr("");
+        let (profile, shell) = cc_profile(d.path(), &a);
+        // CC's own file in the profile, naming the default login: a line from it would be b's.
+        let login = json!({"oauthAccount": {"emailAddress": "b@x.co", "organizationUuid": ""}});
+        fs::write(profile.join(".claude.json"), login.to_string()).unwrap();
+        let _session = hold_launch(&profile);
+        statusline(d.path(), Some(&shell))
+            .assert()
+            .success()
+            .stdout("a · 5h 31% · 7d 12%\n")
+            .stderr("");
+    }
+
+    #[test]
+    fn a_run_shell_whose_account_was_removed_meanwhile_prints_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b) = read_now(d.path());
+        let (profile, shell) = cc_profile(d.path(), &a);
+        let _session = hold_launch(&profile);
+        // The row is gone and the profile stays, as a store reset leaves it.
+        Store::open_existing(&Env::for_test(d.path()).data_dir().join("tagteam.db"))
+            .unwrap()
+            .unwrap()
+            .delete_account(&AccountId::from_string(a.as_str()))
+            .unwrap();
+        statusline(d.path(), Some(&shell))
+            .assert()
+            .success()
+            .stdout("")
+            .stderr("");
+    }
+
+    #[test]
+    fn a_corrupt_marker_prints_nothing_while_every_other_command_names_it_and_refuses() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b) = read_now(d.path());
+        let (profile, shell) = cc_profile(d.path(), &a);
+        fs::write(
+            profile.join(MARKER_FILE),
+            b"{\"format\": \"tagteam-profile\", \"version\": ",
+        )
+        .unwrap();
+        statusline(d.path(), Some(&shell))
+            .assert()
+            .success()
+            .stdout("")
+            .stderr("");
+        cmd(d.path())
+            .env("CLAUDE_CONFIG_DIR", &shell)
+            .arg("status")
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(predicates::str::contains(MARKER_FILE));
+        let out = cmd(d.path())
+            .env("CLAUDE_CONFIG_DIR", &shell)
+            .args(["status", "--json"])
+            .assert()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error"]["type"], "run-shell-unreadable");
+    }
+}
