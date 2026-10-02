@@ -59,10 +59,11 @@ fn a_pending_replacement_is_reconciled_by_the_next_lock_holder() {
         identity: &oauth,
         kind: "oauth",
         login_expires_at: Some(7),
+        from_live: false,
     };
     // A replacement that died before writing the vault: rolled back, metadata untouched.
     store
-        .begin_replacement(&id, "sha256:never-written", &meta)
+        .begin_replacement(&id, "sha256:never-written", &meta, false)
         .unwrap();
     drop(fx.engine.lock_account(&id).unwrap());
     let row = store.account(&id).unwrap().unwrap();
@@ -76,7 +77,9 @@ fn a_pending_replacement_is_reconciled_by_the_next_lock_holder() {
         .into_bytes();
     fx.kc.put(SERVICE, id.as_str(), &cred);
     let fp = fx.cc.fingerprint(&cred).unwrap();
-    store.begin_replacement(&id, fp.as_str(), &meta).unwrap();
+    store
+        .begin_replacement(&id, fp.as_str(), &meta, false)
+        .unwrap();
     drop(fx.engine.lock_account(&id).unwrap());
     let row = store.account(&id).unwrap().unwrap();
     assert_eq!(

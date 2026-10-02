@@ -943,3 +943,156 @@ fn add_records_the_account_s_login_epoch_as_its_activation_epoch() {
     );
     assert!(!fx.live_store_stale(&first.id));
 }
+
+/// `add-token` with a setup token for `s@x.co`.
+fn setup_token(fx: &Fx, token: &str) -> AddTokenOptions {
+    AddTokenOptions {
+        email: Some("s@x.co".into()),
+        ..token_opts(fx, token)
+    }
+}
+
+#[test]
+fn a_dead_add_is_reconciled_with_its_activation_epoch() {
+    // §12.5, §15.2: an `add` that wrote the vault and died is finished by the next lock holder,
+    // and its login was the live one, so the activation epoch moves with it (§10.1). The live
+    // store is current again, and what Claude Code rotates next is still captured.
+    let fx = Fx::new();
+    let b = fx.add("b@work.co", "rt-b");
+    let a = fx.add("me@work.co", "rt-1"); // live
+    fx.login("me@work.co", "rt-2"); // a new lineage, as `claude /login` leaves it
+    fx.begin_replacement(
+        &a,
+        &common::credential("me@work.co", "rt-2"),
+        &Fx::oauth_account("me@work.co"),
+        "oauth",
+    );
+    assert!(
+        fx.live_store_stale(&a),
+        "stale-marked from the moment the replacement began"
+    );
+
+    drop(fx.engine.lock_account(&a).unwrap());
+
+    let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
+    assert_eq!((row.login_epoch, row.replacing_fp), (1, None));
+    assert_eq!(
+        fx.activation(),
+        Some(Activation {
+            account: a.clone(),
+            epoch: Some(1)
+        })
+    );
+    fx.rotate_live("rt-3");
+    fx.switch_to(&b, false).unwrap();
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-3"));
+}
+
+#[test]
+fn add_token_over_the_live_account_stale_marks_the_live_store_whatever_the_row_held() {
+    // §12.5, §15.2: the live identity names s while the store's record names b, as after a
+    // login made outside tagteam. The replacement's first transaction records s at its old
+    // epoch; `add-token` writes the vault only, so Claude Code keeps the old token.
+    let fx = Fx::new();
+    let b = fx.add("b@x.co", "rt-b");
+    let s = fx
+        .engine
+        .add_token(setup_token(&fx, "sk-ant-oat01-first"))
+        .unwrap()
+        .account
+        .id;
+    fx.switch_to(&s, false).unwrap(); // the live login: s
+    fx.engine
+        .store()
+        .unwrap()
+        .set_active(&fx.provider(), Some(&b), Some(0))
+        .unwrap();
+
+    let out = fx
+        .engine
+        .add_token(setup_token(&fx, "sk-ant-oat01-second"))
+        .unwrap();
+
+    assert_eq!((out.created, out.account.login_epoch), (false, 1));
+    assert_eq!(
+        fx.activation(),
+        Some(Activation {
+            account: s.clone(),
+            epoch: Some(0)
+        })
+    );
+    assert!(fx.live_store_stale(&s));
+    assert_eq!(
+        fx.live_credential().unwrap()["claudeAiOauth"]["accessToken"],
+        "sk-ant-oat01-first"
+    );
+}
+
+#[test]
+fn add_token_over_an_account_the_live_login_does_not_name_records_no_evidence() {
+    let fx = Fx::new();
+    let s = fx
+        .engine
+        .add_token(setup_token(&fx, "sk-ant-oat01-first"))
+        .unwrap()
+        .account
+        .id;
+    let b = fx.add("b@x.co", "rt-b"); // live, and the store's record
+
+    fx.engine
+        .add_token(setup_token(&fx, "sk-ant-oat01-second"))
+        .unwrap();
+
+    assert_eq!(
+        fx.activation(),
+        Some(Activation {
+            account: b,
+            epoch: Some(0)
+        })
+    );
+    assert!(!fx.live_store_stale(&s));
+}
+
+#[test]
+fn add_token_refuses_while_the_live_identity_cannot_be_read() {
+    // B.1: an identity that cannot be read decides nothing. Either guess could cost a
+    // replacement its protection: counting it as naming s would overwrite b's activation
+    // evidence (a later switch away from b would then capture b's superseded lineage), and
+    // counting it as not naming s could leave s's own superseded lineage unmarked.
+    let fx = Fx::new();
+    let s = fx
+        .engine
+        .add_token(setup_token(&fx, "sk-ant-oat01-first"))
+        .unwrap()
+        .account
+        .id;
+    fx.add("b@x.co", "rt-b");
+    // An unpaired surrogate: the file splices, but the value does not parse.
+    let unreadable = common::CLAUDE_JSON.replacen(
+        '{',
+        r#"{"oauthAccount": {"emailAddress": "b\ud800@x.co"},"#,
+        1,
+    );
+    std::fs::write(fx.paths().global_config, &unreadable).unwrap();
+    assert!(matches!(
+        fx.cc.live_identity(&fx.env),
+        tagteam_provider::Read::Unreadable(_)
+    ));
+
+    let before = fx.activation();
+    let err = fx
+        .engine
+        .add_token(setup_token(&fx, "sk-ant-oat01-second"))
+        .unwrap_err();
+
+    assert_eq!(err.kind(), "unreadable", "{err}");
+    // Nothing was written: the evidence still names b, and s keeps its first login.
+    assert_eq!(fx.activation(), before);
+    let row = fx.engine.store().unwrap().account(&s).unwrap().unwrap();
+    assert_eq!((row.login_epoch, row.replacing_fp), (0, None));
+    assert!(
+        String::from_utf8(fx.vault_bytes(&s).unwrap())
+            .unwrap()
+            .contains("sk-ant-oat01-first")
+    );
+}

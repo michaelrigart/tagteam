@@ -110,8 +110,9 @@ fn replacement_markers_move_the_epoch() {
         identity: &replacement,
         kind,
         login_expires_at: Some(42),
+        from_live: false,
     };
-    s.begin_replacement(&a, "sha256:x", &meta("api_key"))
+    s.begin_replacement(&a, "sha256:x", &meta("api_key"), false)
         .unwrap();
     let r = s.account(&a).unwrap().unwrap();
     assert_eq!(
@@ -129,7 +130,7 @@ fn replacement_markers_move_the_epoch() {
         (r.account_uuid.as_deref(), r.login_expires_at),
         (Some("u-new"), Some(42))
     );
-    s.begin_replacement(&a, "sha256:y", &meta("setup_token"))
+    s.begin_replacement(&a, "sha256:y", &meta("setup_token"), false)
         .unwrap();
     s.rollback_replacement(&a).unwrap();
     let r = s.account(&a).unwrap().unwrap();
@@ -327,8 +328,9 @@ fn finish_replacement_refuses_metadata_missing_required_fields() {
         identity: &replacement,
         kind: "api_key",
         login_expires_at: Some(42),
+        from_live: false,
     };
-    s.begin_replacement(&a, "sha256:x", &meta).unwrap();
+    s.begin_replacement(&a, "sha256:x", &meta, false).unwrap();
     drop(s);
     {
         // Corrupt the recorded metadata as if written by an incompatible version: no
@@ -362,11 +364,12 @@ fn begin_replacement_is_guarded_against_a_second_start() {
         identity: &replacement,
         kind,
         login_expires_at: None,
+        from_live: false,
     };
-    s.begin_replacement(&a, "sha256:x", &meta("api_key"))
+    s.begin_replacement(&a, "sha256:x", &meta("api_key"), false)
         .unwrap();
     assert!(matches!(
-        s.begin_replacement(&a, "sha256:y", &meta("setup_token")),
+        s.begin_replacement(&a, "sha256:y", &meta("setup_token"), false),
         Err(StoreError::ReplacementPending)
     ));
 }
@@ -383,8 +386,9 @@ fn rollback_after_rollback_leaves_the_epoch_at_its_start() {
         identity: &replacement,
         kind: "oauth",
         login_expires_at: None,
+        from_live: false,
     };
-    s.begin_replacement(&a, "sha256:x", &meta).unwrap();
+    s.begin_replacement(&a, "sha256:x", &meta, false).unwrap();
     s.rollback_replacement(&a).unwrap();
     s.rollback_replacement(&a).unwrap();
     assert_eq!(s.account(&a).unwrap().unwrap().login_epoch, start);
@@ -401,9 +405,10 @@ fn a_missing_account_is_reported_by_both_replacement_entry_points() {
         identity: &replacement,
         kind: "oauth",
         login_expires_at: None,
+        from_live: false,
     };
     assert!(matches!(
-        s.begin_replacement(&missing, "sha256:x", &meta),
+        s.begin_replacement(&missing, "sha256:x", &meta, false),
         Err(StoreError::NoSuchAccount)
     ));
     assert!(matches!(
@@ -876,4 +881,201 @@ fn a_prior_snapshot_from_before_to_epoch_reads_as_none() {
 
     assert_eq!(row.to_epoch, Some(1));
     assert_eq!(row.prior.unwrap().to_epoch, None);
+}
+
+/// A replacement of `a@x.co`'s login with `identity`, as `begin_replacement` records it.
+fn login_meta(identity: &Identity, from_live: bool) -> LoginMeta<'_> {
+    LoginMeta {
+        identity_key: "a@x.co\n",
+        identity,
+        kind: "oauth",
+        login_expires_at: None,
+        from_live,
+    }
+}
+
+/// `a` (epoch 0) and `b` stored, the provider's active row set to `active`, then a replacement
+/// of `a` begun with `live_names_account`: what the active row holds afterwards.
+fn evidence_after(
+    active: Option<(&str, Option<i64>)>,
+    live_names_account: bool,
+) -> Option<Activation> {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    add(&s, &cc(), "b", "b@x.co", 2);
+    if let Some((id, epoch)) = active {
+        s.set_active(&cc(), Some(&AccountId::from_string(id)), epoch)
+            .unwrap();
+    }
+    let incoming = identity("a@x.co");
+    s.begin_replacement(
+        &a,
+        "sha256:x",
+        &login_meta(&incoming, false),
+        live_names_account,
+    )
+    .unwrap();
+    assert_eq!(s.account(&a).unwrap().unwrap().login_epoch, 1);
+    s.activation(&cc()).unwrap()
+}
+
+#[test]
+fn a_replacement_records_the_default_home_s_evidence() {
+    // §12.5 "A replacement records its own evidence", row by row. `a` starts at epoch 0, so
+    // the evidence is 0 and the replacement moves `a` to 1: stale-marked from here on.
+    let on = |id: &str, epoch| {
+        Some(Activation {
+            account: AccountId::from_string(id),
+            epoch,
+        })
+    };
+    // The live identity names a: the row becomes a, whatever it held, including another
+    // account (§15.2).
+    assert_eq!(evidence_after(None, true), on("a", Some(0)));
+    assert_eq!(evidence_after(Some(("b", Some(0))), true), on("a", Some(0)));
+    // The row names a without an epoch: one is recorded, live identity or not.
+    assert_eq!(evidence_after(Some(("a", None)), false), on("a", Some(0)));
+    // Neither names a: nothing is recorded.
+    assert_eq!(evidence_after(None, false), None);
+    assert_eq!(
+        evidence_after(Some(("b", Some(0))), false),
+        on("b", Some(0))
+    );
+}
+
+#[test]
+fn a_row_that_already_names_the_account_with_an_epoch_is_kept() {
+    // An earlier replacement left the row at 0 while a moved to 1. A second one keeps it at 0,
+    // the lineage the live store actually holds, rather than moving the mark to 1.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    s.set_active(&cc(), Some(&a), Some(0)).unwrap();
+    let incoming = identity("a@x.co");
+    s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, false), false)
+        .unwrap();
+    s.finish_replacement(&a).unwrap();
+
+    s.begin_replacement(&a, "sha256:y", &login_meta(&incoming, false), true)
+        .unwrap();
+
+    let row = s.account(&a).unwrap().unwrap();
+    assert_eq!(row.login_epoch, 2);
+    assert_eq!(
+        s.activation(&cc()).unwrap(),
+        Some(Activation {
+            account: a.clone(),
+            epoch: Some(0)
+        })
+    );
+    assert!(s.live_store_stale(&row).unwrap());
+}
+
+#[test]
+fn a_rolled_back_replacement_leaves_its_evidence_current() {
+    // The evidence holds the epoch from before the increment, which a rollback restores: a
+    // replacement that never landed stale-marks nothing.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let incoming = identity("a@x.co");
+    s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, false), true)
+        .unwrap();
+    assert!(
+        s.live_store_stale(&s.account(&a).unwrap().unwrap())
+            .unwrap()
+    );
+
+    s.rollback_replacement(&a).unwrap();
+
+    let row = s.account(&a).unwrap().unwrap();
+    assert_eq!(row.login_epoch, 0);
+    assert!(!s.live_store_stale(&row).unwrap());
+}
+
+#[test]
+fn finishing_a_replacement_taken_from_the_live_login_records_its_epoch() {
+    // §10.1, §12.5: `add`'s new login is the live one, so its last transaction makes the live
+    // store current again. Any other replacer's leaves it stale-marked.
+    for from_live in [true, false] {
+        let d = tempfile::tempdir().unwrap();
+        let s = Store::open(&d.path().join("t.db")).unwrap();
+        let a = add(&s, &cc(), "a", "a@x.co", 1);
+        s.set_active(&cc(), Some(&a), Some(0)).unwrap();
+        let incoming = identity("a@x.co");
+        s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, from_live), true)
+            .unwrap();
+
+        s.finish_replacement(&a).unwrap();
+
+        let want = if from_live { 1 } else { 0 };
+        assert_eq!(
+            s.activation(&cc()).unwrap(),
+            Some(Activation {
+                account: a.clone(),
+                epoch: Some(want)
+            }),
+            "from_live={from_live}"
+        );
+        assert_eq!(
+            s.live_store_stale(&s.account(&a).unwrap().unwrap())
+                .unwrap(),
+            !from_live
+        );
+    }
+}
+
+#[test]
+fn a_finish_never_overwrites_a_switch_committed_since_the_replacer_died() {
+    // An `add` over a died after its vault write; a switch to b committed before anyone
+    // reconciled a. That record is newer than the one the `add` would have written.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let incoming = identity("a@x.co");
+    s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, true), true)
+        .unwrap();
+    s.commit_switch(&cc(), &b, 0, &switch_event(&b)).unwrap();
+
+    s.finish_replacement(&a).unwrap();
+
+    assert_eq!(
+        s.activation(&cc()).unwrap(),
+        Some(Activation {
+            account: b,
+            epoch: Some(0)
+        })
+    );
+}
+
+#[test]
+fn replacement_metadata_without_from_live_is_not_from_the_live_login() {
+    // A marker recorded before the field existed.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    s.set_active(&cc(), Some(&a), Some(0)).unwrap();
+    let incoming = identity("a@x.co");
+    s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, true), true)
+        .unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE accounts SET replacing_meta = ?1 WHERE id = 'a'",
+            [r#"{"identity_key":"a@x.co\n","label":"a@x.co","email":"a@x.co","org_uuid":"","kind":"oauth","identity_json":{"emailAddress":"a@x.co"}}"#],
+        )
+        .unwrap();
+
+    s.finish_replacement(&a).unwrap();
+
+    assert_eq!(
+        s.activation(&cc()).unwrap(),
+        Some(Activation {
+            account: a,
+            epoch: Some(0)
+        })
+    );
 }

@@ -616,11 +616,9 @@ impl Fx {
         self.engine.add_live(self.add_options()).unwrap().account.id
     }
 
-    /// A pending replacement whose vault write landed but whose metadata never did — the
-    /// crash-recovery scenario `finish_replacement`/`rollback_replacement` exist for.
-    /// `identity_json` is the raw `oauthAccount`-shaped object the replacement claims to be
-    /// (Task 18's review, item 8: shared by every test that primes this scenario, instead of
-    /// each one repeating the same four calls).
+    /// A pending replacement whose vault write landed but whose last transaction never did:
+    /// an `add` that died (§12.5), which `finish_replacement`/`rollback_replacement` exist for.
+    /// `identity_json` is the raw `oauthAccount`-shaped object the replacement claims to be.
     pub fn begin_replacement(
         &self,
         id: &AccountId,
@@ -628,24 +626,97 @@ impl Fx {
         identity_json: &Value,
         kind: &str,
     ) {
+        self.begin_replacement_with(id, new_bytes, identity_json, kind, true);
+    }
+
+    /// `begin_replacement` for either kind of replacer. With `from_live`, it is an `add`: its
+    /// login is the live one, so the live identity names the account by construction. Without,
+    /// it is a replacer that does not take the live login (`add-token`, M5's `import`), whose
+    /// evidence comes from the live identity as `add_token` reads it (`Fx::live_names`).
+    pub fn begin_replacement_with(
+        &self,
+        id: &AccountId,
+        new_bytes: &[u8],
+        identity_json: &Value,
+        kind: &str,
+        from_live: bool,
+    ) {
         let identity = self.cc.parse_identity(identity_json).unwrap();
-        let identity_key = format!(
-            "{}\n{}",
-            identity.email.as_deref().unwrap_or(&identity.label),
-            identity.org_uuid
-        );
-        self.kc.put(SERVICE, id.as_str(), new_bytes);
+        let identity_key = self.cc.identity_key(&identity);
+        self.put_vault(id, new_bytes);
         let meta = LoginMeta {
-            identity_key: &identity_key,
+            identity_key: identity_key.as_str(),
             identity: &identity,
             kind,
             login_expires_at: None,
+            from_live,
         };
+        let live_names_account = from_live || self.live_names(id);
         self.engine
             .store()
             .unwrap()
-            .begin_replacement(id, self.cc.fingerprint(new_bytes).unwrap().as_str(), &meta)
+            .begin_replacement(
+                id,
+                self.cc.fingerprint(new_bytes).unwrap().as_str(),
+                &meta,
+                live_names_account,
+            )
             .unwrap();
+    }
+
+    /// Whether the live identity names `id`, as `add_token` decides it (§12.5). An identity
+    /// that cannot be read has no answer, and `add_token` refuses it, so a fixture that reaches
+    /// one is a broken test.
+    pub fn live_names(&self, id: &AccountId) -> bool {
+        let row = self.engine.store().unwrap().account(id).unwrap().unwrap();
+        match self.cc.live_identity(&self.env) {
+            Read::Present(live) => self.cc.identity_key(&live).as_str() == row.identity_key,
+            Read::Absent => false,
+            Read::Unreadable(e) => panic!("fixture: the live identity cannot be read: {e:?}"),
+        }
+    }
+
+    /// An explicit replacement of `id`'s login with `new_bytes` by a replacer that does not
+    /// take the live login, carried out as `add_token` does it and M5's `import` will
+    /// (§12.5 steps 1–3):
+    /// - under the mutation lock and the account lock;
+    /// - the marker with its evidence;
+    /// - the vault write, after which the old generation is `.prev`;
+    /// - then the marker cleared.
+    ///
+    /// The identity stays the account's own. Claude Code keeps whatever it holds.
+    pub fn replace_login(&self, id: &AccountId, new_bytes: &[u8], kind: &str) {
+        let _guard = self.engine.mutation_guard().unwrap();
+        let lock = self.engine.lock_account(id).unwrap();
+        let store = self.engine.store().unwrap();
+        let row = store.account(id).unwrap().unwrap();
+        let identity = self.cc.parse_identity(&row.identity_json).unwrap();
+        let meta = LoginMeta {
+            identity_key: &row.identity_key,
+            identity: &identity,
+            kind,
+            login_expires_at: self.cc.login_expires_at(new_bytes),
+            from_live: false,
+        };
+        let fp = self.cc.fingerprint(new_bytes).unwrap();
+        store
+            .begin_replacement(id, fp.as_str(), &meta, self.live_names(id))
+            .unwrap();
+        self.fixture_vault()
+            .store(&lock, new_bytes, &|b| self.cc.fingerprint(b))
+            .unwrap();
+        store.finish_replacement(id).unwrap();
+    }
+
+    /// A vault over the fixture's own backend: the Keychain on macOS, files on Linux, as the
+    /// fixture's engine has it.
+    fn fixture_vault(&self) -> Vault {
+        match self.platform {
+            Platform::MacOs => self.keychain_vault(),
+            Platform::Linux => {
+                Vault::new(Box::new(FileVault::new(self.env.data_dir().join("vault"))))
+            }
+        }
     }
 
     /// Quarantines an account row directly, bound to `fp` (§7.4).
