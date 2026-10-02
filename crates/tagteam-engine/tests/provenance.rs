@@ -252,9 +252,13 @@ fn a_conflict_sends_nothing_and_changes_nothing() {
 #[test]
 fn a_profile_that_cannot_be_read_stops_the_gate() {
     // Decision 9: the seed, the marker, the identity, or the credential.
-    let breaks: [(&str, Break); 5] = [
+    let breaks: [(&str, Break); 6] = [
         ("seed", |_, dir| {
             fs::write(dir.join(SEED_FILE), "{").unwrap()
+        }),
+        ("seed link to nothing", |fx, dir| {
+            fs::remove_file(dir.join(SEED_FILE)).unwrap();
+            std::os::unix::fs::symlink(fx.dir.path().join("nowhere"), dir.join(SEED_FILE)).unwrap();
         }),
         ("marker", |_, dir| {
             fs::write(dir.join(MARKER_FILE), "{").unwrap()

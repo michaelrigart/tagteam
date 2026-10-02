@@ -37,9 +37,19 @@ pub fn canonical_profile_path(profile: &Path) -> io::Result<PathBuf> {
     fs::canonicalize(profile)
 }
 
-/// One of tagteam's files in `profile`: `Absent` when there is no such file, or `profile` is not
-/// a directory at all; `Unreadable` when it exists but cannot be read, or `parse` refuses it.
-/// `parse`'s detail never quotes the file's bytes.
+/// Whether `e` says nothing is at the path, or that the path crosses something that is not a
+/// directory.
+fn no_entry(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+/// One of tagteam's files in `profile`: `Absent` only when there is no entry at its path, as
+/// when `profile` is not a directory at all; `Unreadable` when it exists but cannot be read, a
+/// link that dangles or crosses a file included (§4.3), or `parse` refuses it. `parse`'s detail
+/// never quotes the file's bytes.
 fn read_own_file<T>(
     profile: &Path,
     name: &str,
@@ -50,13 +60,13 @@ fn read_own_file<T>(
         |detail: String| Read::Unreadable(ReadError::new(path.display().to_string(), detail));
     let bytes = match fs::read(&path) {
         Ok(b) => b,
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            return Read::Absent;
+        // The read found nothing; the entry itself decides whether nothing is there.
+        Err(e) if no_entry(&e) => {
+            return match fs::symlink_metadata(&path) {
+                Err(m) if no_entry(&m) => Read::Absent,
+                Ok(_) => unreadable(format!("it is a link that does not resolve: {e}")),
+                Err(m) => unreadable(m.to_string()),
+            };
         }
         Err(e) => return unreadable(e.to_string()),
     };
@@ -504,6 +514,72 @@ mod tests {
         assert!(
             matches!(ProfileMarker::read(d.path()), Read::Present(m) if m.outer == json!({"FAKEAGENT_HOME": "/h"}))
         );
+    }
+
+    /// Each of tagteam's own files, read in `profile`: `Some(true)` when absent,
+    /// `Some(false)` when unreadable, `None` when present.
+    fn own_files_absent(profile: &Path) -> Vec<(&'static str, Option<bool>)> {
+        fn state<T>(r: Read<T>) -> Option<bool> {
+            match r {
+                Read::Absent => Some(true),
+                Read::Unreadable(_) => Some(false),
+                Read::Present(_) => None,
+            }
+        }
+        vec![
+            (MARKER_FILE, state(ProfileMarker::read(profile))),
+            (SEED_FILE, state(Seed::read(profile))),
+            (LINKS_FILE, state(LinksRecord::read(profile))),
+        ]
+    }
+
+    #[test]
+    fn an_own_file_that_is_a_link_to_nothing_is_unreadable_not_absent() {
+        // §4.3: unreadable is never absent. A link at the marker's path that dangles, or that
+        // crosses a regular file, is an entry that cannot be read, so the outer home is unknown
+        // (§12.8). Only no entry at all is absence.
+        let d = tempfile::tempdir().unwrap();
+        let profile = d.path().join("profile");
+        fs::create_dir(&profile).unwrap();
+        let file = d.path().join("a-file");
+        fs::write(&file, b"").unwrap();
+        for (what, target) in [
+            ("dangling", d.path().join("nowhere")),
+            ("crossing a file", file.join("inside")),
+        ] {
+            for name in [MARKER_FILE, SEED_FILE, LINKS_FILE] {
+                let path = profile.join(name);
+                let _ = fs::remove_file(&path);
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+            }
+            for (name, absent) in own_files_absent(&profile) {
+                assert_eq!(absent, Some(false), "{what}: {name}");
+            }
+            let Read::Unreadable(e) = ProfileMarker::read(&profile) else {
+                panic!("{what}");
+            };
+            assert_eq!(e.what, profile.join(MARKER_FILE).display().to_string());
+        }
+    }
+
+    #[test]
+    fn own_files_are_absent_only_where_there_is_no_entry() {
+        let d = tempfile::tempdir().unwrap();
+        for (name, absent) in own_files_absent(d.path()) {
+            assert_eq!(absent, Some(true), "missing: {name}");
+        }
+        // F5: a profile path that is a regular file holds no entry of its own.
+        let file = d.path().join("not-a-dir");
+        fs::write(&file, b"").unwrap();
+        for (name, absent) in own_files_absent(&file) {
+            assert_eq!(absent, Some(true), "under a file: {name}");
+        }
+        // Nor does a profile path that is itself a link to nothing.
+        let gone = d.path().join("gone");
+        std::os::unix::fs::symlink(d.path().join("nowhere"), &gone).unwrap();
+        for (name, absent) in own_files_absent(&gone) {
+            assert_eq!(absent, Some(true), "under a dangling profile link: {name}");
+        }
     }
 
     #[test]
