@@ -243,8 +243,15 @@ fn remove_refuses_while_a_session_record_is_unreadable() {
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
     let dir = fx.make_profile(&a);
-    fx.plant_record(&dir, "torn", b"[1,");
-    assert_eq!(fx.engine.remove(&a).unwrap_err().kind(), "session-owned");
+    let torn = fx.plant_record(&dir, "torn", b"[1,");
+    let err = fx.engine.remove(&a).unwrap_err();
+    assert_eq!(err.kind(), "session-owned");
+    // The WARN naming the file sits below the default log level, so the refusal itself names
+    // it and why it cannot be read, rather than claiming a session.
+    let message = err.to_string();
+    assert!(message.contains(&torn.display().to_string()), "{message}");
+    assert!(message.contains("cannot be read"), "{message}");
+    assert!(!message.contains("exit that session"), "{message}");
     assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
 }
 

@@ -115,11 +115,15 @@ pub enum EngineError {
     ForeignLiveCredential { position: u32 },
     /// §9.2, §10.3: the account is session-owned (§12.5). Activating it would give the default
     /// home and the session two copies of one single-use refresh token; destroying it would
-    /// pull the login from under a running session.
-    #[error(
-        "position {position} ({label}) is in use by a `tagteam run` session; exit that session first"
-    )]
-    SessionOwned { position: u32, label: String },
+    /// pull the login from under a running session. `unreadable` is set when a reservation or a
+    /// session record could not be read (§12.6), which counts as owned: it names the file and
+    /// why, since nothing may be running at all and the user has a file to repair.
+    #[error("{}", session_owned_message(*.position, .label, .unreadable.as_deref()))]
+    SessionOwned {
+        position: u32,
+        label: String,
+        unreadable: Option<String>,
+    },
     /// §9.2, §12.5: the account's quiescent session profile and the vault both moved since they
     /// last agreed, so the vault's generation may be consumed. An explicit replacement resolves
     /// it.
@@ -142,6 +146,18 @@ pub enum EngineError {
     /// reports its own `LockError::Interrupted`; `signal()` reads either.
     #[error("interrupted")]
     Interrupted(i32),
+}
+
+/// `SessionOwned`'s message: a running session, or session state that cannot be read.
+fn session_owned_message(position: u32, label: &str, unreadable: Option<&str>) -> String {
+    match unreadable {
+        None => format!(
+            "position {position} ({label}) is in use by a `tagteam run` session; exit that session first"
+        ),
+        Some(detail) => format!(
+            "position {position} ({label}) counts as in use by a `tagteam run` session because its session state cannot be read ({detail}); repair or remove that file, then retry"
+        ),
+    }
 }
 
 impl EngineError {
@@ -347,6 +363,15 @@ mod tests {
                 EngineError::SessionOwned {
                     position: 1,
                     label: "a".into(),
+                    unreadable: None,
+                },
+                "session-owned",
+            ),
+            (
+                EngineError::SessionOwned {
+                    position: 1,
+                    label: "a".into(),
+                    unreadable: Some("/p/sessions/7.json: not JSON".into()),
                 },
                 "session-owned",
             ),

@@ -523,6 +523,7 @@ fn session_owned(target: &AccountRow) -> EngineError {
     EngineError::SessionOwned {
         position: target.position,
         label: target.label.clone(),
+        unreadable: None,
     }
 }
 
