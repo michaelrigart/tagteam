@@ -2721,8 +2721,10 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
     this Mac, and `tagteam purge --keychain-orphans` deletes them once none uses them (§10.5)
   - quarantined accounts → warn, naming the reason, and the fix: log in, then `tagteam add`
   - `login_expires_at` within 7 days → warn
-  - a pending replacement (§12.5) → warn; an unparseable `replacing_meta` → fail, with
-    `tagteam remove` as the fix
+  - a pending replacement (§12.5) → warn; an unparseable `replacing_meta` whose replacement
+    landed (the vault holds `replacing_fp`, so every lock holder refuses, §12.5) → fail, with
+    `tagteam remove` as the fix; one whose replacement never landed → warn, since the next lock
+    holder reconciles it without the record
   - the live store stale-marked (§12.5) → warn: CC still runs the login an explicit command
     replaced. The fix is `tagteam switch N --force`
 - **Usage:**
@@ -3113,9 +3115,13 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
 - **Isolation.** Every CC home it uses is a scratch directory exported as
   `CLAUDE_CONFIG_DIR`, so every CC Keychain item it reads, writes or deletes is named by the
   hash of a scratch spelling (Appendix A.2). It refuses to start if any service name it would
-  touch lacks that hash suffix: an unsuffixed item is the user's own login. tagteam's vault
-  uses a temporary keychain, through the same `test-support` hook as the `real_keychain` tests
-  (§15.1). Everything it created is deleted when it ends; `--keep` leaves it for inspection.
+  touch lacks that hash suffix: an unsuffixed item is the user's own login. The machine-wide
+  items Claude Code itself keeps whatever the config home (Appendix A.7: `Claude Code-device-keys`,
+  `~/.claude/.device-keys.json`, `bridge-spawn/`) may be touched by the real `claude` by its own
+  design; compat never names them, and its guard refuses that service. `HOME` stays the user's
+  own, since `security` finds no keychain under another. tagteam's vault uses a keychain file of
+  its own, kept in the compat store, through a `test-support` hook. What a run creates in the
+  scratch homes is deleted when it ends; `--keep` leaves it for inspection.
 - **The test account** is dedicated to compat. `cargo xtask compat login` runs `claude` in a
   scratch home for the user to log in once, and keeps the login in a compat store under
   `$XDG_STATE_HOME/tagteam-compat/`. Later runs take the account from there, and tagteam's own
@@ -3303,7 +3309,8 @@ since 2.1.283.
 - **Delete:** `delete-generic-password -a <acct> -s <svc>`. rc 44 counts as success.
 - **Delete by service** (a full `purge` with `--keychain-orphans`, §10.5): `delete-generic-password -s tagteam`, without
   `-a`, deletes one item of that service per call and returns rc 44 once none is left
-  (*inferred*; a `real_keychain` test pins it). Purge repeats it until rc 44, at most 10 000
+  (verified on 2026-10-02 against a throwaway keychain, and pinned by a `real_keychain` test).
+  `-s` matches the service name exactly. Purge repeats it until rc 44, at most 10 000
   times, then verifies with `find-generic-password -s tagteam` (attributes only) that the
   service is gone.
 - **Lock check and unlock** (§17, R1). Over SSH the login keychain stays locked: reads, writes
@@ -3610,8 +3617,8 @@ Each is a one-liner, and each gets at least one test.
     it names (§6.4).
 69. No log line, at any level, holds an email, organization name, token, key, credential or
     passphrase (§14.2).
-70. `cargo xtask compat` never touches a CC Keychain item without a scratch hash suffix
-    (§15.4).
+70. `cargo xtask compat` never names a CC Keychain item without a scratch hash suffix; only
+    the machine-wide items the real `claude` keeps by its own design may be touched (§15.4).
 71. Every quarantine that is cleared records an `unquarantine` event (§7.4).
 
 ## Appendix C — cswap → tagteam command map
