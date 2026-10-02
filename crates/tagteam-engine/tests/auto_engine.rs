@@ -200,3 +200,45 @@ fn the_next_poll_is_the_later_of_the_plan_and_the_usage_lease() {
         );
     }
 }
+
+#[test]
+fn the_next_poll_waits_out_the_live_accounts_backoff() {
+    // A failed fetch leaves the plan in the past but backs the account off: a tick that wakes
+    // inside the backoff cannot fetch (§8.3). A backoff no legal schedule reaches is ignored
+    // (§8.4).
+    let reading = |pct| {
+        vec![
+            usage_window("5h", WindowKind::Short, pct, T0 + 9_630),
+            usage_window("7d", WindowKind::Long, pct, T0 + 291_630),
+        ]
+    };
+    for (backoff, next) in [
+        (T0 + 3_600, T0 + 3_600),
+        (T0 + 30, T0 + 90),
+        (T0 + 1_000_000, T0 + 90),
+    ] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b"); // live
+        record_reading(&fx.engine, &a, &reading(10.0), T0, T0 + 300);
+        record_reading(&fx.engine, &b, &reading(20.0), T0, T0 + 60);
+        let mut engine = fx
+            .engine
+            .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+            .unwrap()
+            .unwrap();
+        engine.tick(&Recorded::default()).unwrap();
+        rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+            .unwrap()
+            .execute(
+                "UPDATE usage_state SET backoff_until = ?2 WHERE account_id = ?1",
+                rusqlite::params![b.as_str(), backoff],
+            )
+            .unwrap();
+        assert_eq!(
+            engine.active_next_poll_at(),
+            Some(next),
+            "backoff until {backoff}"
+        );
+    }
+}
