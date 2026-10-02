@@ -14,12 +14,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{
-    API_KEY, FALLBACK_ITEM, Fx, cc_holds_storage_write_from, cc_marks_dead, cc_marks_dead_and_more,
+    API_KEY, Fx, INERT_ITEM, cc_holds_storage_write_from, cc_marks_dead, cc_marks_dead_and_more,
     cc_released, crashed_switch, dead_holder, journal, mutation_lock_free, write_target_credential,
     writer_holds_storage_write_from,
 };
 use serde_json::{Value, json};
-use tagteam_cc::ItemKind;
+use tagteam_cc::{ItemKind, keychain_account};
 use tagteam_engine::EngineError;
 use tagteam_provider::Keychain;
 
@@ -299,15 +299,14 @@ fn ctrl_c_while_a_recovery_write_waits_for_cc_lets_the_recovery_finish() {
 }
 
 #[test]
-fn a_switch_rolls_back_when_another_writer_changed_a_fallback_item() {
-    // §9.1 at every place the write may overwrite or delete: the unsuffixed item a reader also
-    // tries (`with_fallback_items`) changes while the switch waits, and the switch rolls back,
-    // leaving it as the other writer wrote it.
-    let fx = Fx::with_fallback_items();
+fn another_writer_changing_an_inert_item_never_rolls_a_switch_back() {
+    // Appendix A.2 (2.1.286): the unsuffixed item of an explicit `~/.claude` is no place of the
+    // entry, and §9.1 compares only places, so another writer's change to it is no conflict.
+    let fx = Fx::with_explicit_default_config_dir();
     let a = fx.add("a@x.co", "rt-a");
-    let b = fx.add("b@x.co", "rt-b"); // live: b
-    fx.put_fallback_item(fx.live_credential().unwrap().to_string().as_bytes());
-    let cc = writer_holds_storage_write_from(&fx, "after-journal", None, FALLBACK_ITEM, |item| {
+    fx.add("b@x.co", "rt-b"); // live: b
+    fx.put_inert_items();
+    let cc = writer_holds_storage_write_from(&fx, "after-journal", None, INERT_ITEM, |item| {
         item["claudeAiOauth"]["refreshToken"] = json!("rt-other");
     });
 
@@ -315,19 +314,16 @@ fn a_switch_rolls_back_when_another_writer_changed_a_fallback_item() {
     let ended = Instant::now();
     let released = cc_released(&cc);
 
-    let err = out.unwrap_err();
+    out.unwrap();
     assert!(ended > released, "the switch waited for the lock");
-    assert!(matches!(err, EngineError::RolledBack(_)), "{err}");
-    assert!(err.to_string().contains(FALLBACK_ITEM), "{err}");
+    let inert = fx.kc.get(INERT_ITEM, &keychain_account(&fx.env)).unwrap();
     assert_eq!(
-        fx.fallback_item().unwrap()["claudeAiOauth"]["refreshToken"],
+        serde_json::from_slice::<Value>(&inert).unwrap()["claudeAiOauth"]["refreshToken"],
         json!("rt-other"),
         "the other writer's item stands"
     );
-    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
     assert!(journal(&fx).is_none());
-    let store = fx.engine.store().unwrap();
-    assert_eq!(store.active(&fx.provider()).unwrap(), Some(b));
     assert!(!fx.paths().storage_write_lock.exists());
 }
 

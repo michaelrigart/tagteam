@@ -10,6 +10,6 @@ pub mod provider;
 pub mod shape;
 pub mod usage;
 
-pub use naming::{ItemKind, keychain_account, keychain_service, read_services};
+pub use naming::{ItemKind, keychain_account, keychain_service};
 pub use paths::CcPaths;
 pub use provider::ClaudeCode;

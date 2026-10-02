@@ -553,27 +553,24 @@ fn a_credentials_file_the_keychain_shadows_is_displaced_before_the_mirror_overwr
 }
 
 #[test]
-fn an_api_key_switch_saves_a_fallback_keychain_item_before_stripping_it() {
-    // Appendix A.2: readers also try the unsuffixed item, and activating an API key strips
-    // every item a reader tries. A generation there that no vault holds is saved first. An
-    // OAuth switch leaves the item alone, so it saves nothing.
-    let fx = Fx::with_fallback_items();
+fn no_switch_reads_or_touches_an_inert_former_fallback_item() {
+    // Appendix A.2 (2.1.286): under an explicit CLAUDE_CONFIG_DIR=~/.claude, CC names only the
+    // suffixed items. The unsuffixed ones belong to another spelling: an OAuth switch, an
+    // API-key switch and the switch back neither save, strip nor delete them.
+    let fx = Fx::with_explicit_default_config_dir();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
     let k = fx.add_api_key(API_KEY);
-    let stale = Fx::credential_json("old@x.co", "rt-old")
-        .to_string()
-        .into_bytes();
-    fx.put_fallback_item(&stale);
-    switch(&fx, to(&a), false).unwrap();
-    assert_eq!(displaced_files(&fx), 0, "an OAuth switch");
-    switch(&fx, to(&k), false).unwrap();
-    assert_eq!(fx.displaced(), [stale]);
-    assert_eq!(
-        fx.fallback_item(),
-        Some(json!({"mcpOAuth": {"srv": {"token": "machine-shared"}}})),
-        "then stripped, as writing an API key does"
-    );
+    let (oauth, managed) = fx.put_inert_items();
+    for (step, target) in [("to a", &a), ("to k", &k), ("back to a", &a)] {
+        switch(&fx, to(target), false).unwrap();
+        assert_eq!(displaced_files(&fx), 0, "{step}");
+        assert_eq!(
+            fx.inert_items(),
+            (Some(oauth.clone()), Some(managed.clone())),
+            "{step}"
+        );
+    }
 }
 
 #[test]
@@ -598,32 +595,22 @@ fn a_stale_mirror_the_vault_already_holds_is_not_displaced() {
 }
 
 #[test]
-fn a_fallback_item_the_vault_already_holds_is_not_displaced() {
-    // A fallback item left from before `CLAUDE_CONFIG_DIR` was set, holding a generation of
-    // the outgoing account that CC has since refreshed past: the capture keeps it as `.prev`.
-    let fx = Fx::with_fallback_items();
-    let a = fx.add("a@x.co", "rt-a");
-    let k = fx.add_api_key(API_KEY);
-    fx.put_fallback_item(&fx.vault_bytes(&a).unwrap());
-    fx.rotate_live("rt-a2");
-    switch(&fx, to(&k), false).unwrap();
-    assert_eq!(displaced_files(&fx), 0);
-    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
-}
-
-#[test]
-fn an_unreadable_fallback_keychain_item_aborts_before_anything_is_written() {
-    // §9.4 step 3: step 7 may clear the item, and could not tell what it would lose.
-    let fx = Fx::with_fallback_items();
+fn an_unreadable_inert_item_never_blocks_a_switch() {
+    // It was a fallback that §9.4 step 3 had to read before step 7 could clear it; now no
+    // switch reads it at all (Appendix A.2).
+    let fx = Fx::with_explicit_default_config_dir();
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
-    fx.put_fallback_item(b"{}");
+    let k = fx.add_api_key(API_KEY);
+    fx.put_inert_items();
     let acct = keychain_account(&fx.env);
-    fx.kc.set_unreadable(common::FALLBACK_ITEM, &acct, true);
-    let err = switch(&fx, to(&a), false).unwrap_err();
-    assert_eq!(err.kind(), "unreadable", "{err}");
+    fx.kc.set_unreadable(common::INERT_ITEM, &acct, true);
+    fx.kc
+        .set_unreadable(common::INERT_MANAGED_ITEM, &acct, true);
+    switch(&fx, to(&k), false).unwrap();
+    switch(&fx, to(&a), false).unwrap();
     assert!(common::journal(&fx).is_none());
-    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
 }
 
 #[test]

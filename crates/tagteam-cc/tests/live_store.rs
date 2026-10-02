@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
-use tagteam_cc::{CcPaths, ItemKind, config, keychain_account, keychain_service, read_services};
+use tagteam_cc::{CcPaths, ItemKind, config, keychain_account, keychain_service};
 use tagteam_provider::{
     Env, FakeKeychain, Keychain, KeychainError, LiveLockSet, LiveLocks, LockError, LockState,
     MutationGuard, Provenance, ProviderError, Read, SecretStore, Undo,
@@ -16,6 +16,16 @@ use tagteam_provider::{
 /// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
 fn save_nothing(_: &[u8]) -> Result<(), ProviderError> {
     Ok(())
+}
+
+/// The unsuffixed items an explicit `CLAUDE_CONFIG_DIR=~/.claude` fell back to before Claude
+/// Code 2.1.286. Inert now (Appendix A.2): nothing reads, writes or clears them.
+const INERT_OAUTH: &str = "Claude Code-credentials";
+const INERT_MANAGED: &str = "Claude Code";
+
+/// A fixture with an explicit `CLAUDE_CONFIG_DIR=~/.claude`.
+fn explicit_default() -> Fx {
+    fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()))
 }
 
 struct Fx {
@@ -252,16 +262,51 @@ fn a_failed_keychain_read_covered_by_the_file_is_degraded() {
 }
 
 #[test]
-fn an_unreadable_primary_item_is_never_skipped_for_a_fallback() {
-    let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
+fn an_explicit_default_config_dir_reads_only_its_suffixed_item() {
+    // Appendix A.2 (2.1.286): `CLAUDE_CONFIG_DIR=~/.claude` names the suffixed items alone. The
+    // unsuffixed ones are never read, whatever they hold and whether or not they can be read.
+    let f = explicit_default();
     let s = store(&f, Platform::MacOs);
     let acct = keychain_account(&f.env);
-    for kind in [ItemKind::OAuth, ItemKind::ManagedKey] {
-        let services = read_services(&f.env, kind);
-        f.kc.put(&services[0], &acct, b"newer");
-        f.kc.set_unreadable(&services[0], &acct, true);
-        f.kc.put(&services[1], &acct, b"older");
+    let (oauth, managed) = (
+        keychain_service(&f.env, ItemKind::OAuth),
+        keychain_service(&f.env, ItemKind::ManagedKey),
+    );
+    assert_ne!(
+        (oauth.as_str(), managed.as_str()),
+        (INERT_OAUTH, INERT_MANAGED)
+    );
+    f.kc.put(INERT_OAUTH, &acct, b"inert");
+    f.kc.put(INERT_MANAGED, &acct, b"sk-ant-api03-inert");
+    for unreadable in [false, true] {
+        f.kc.set_unreadable(INERT_OAUTH, &acct, unreadable);
+        f.kc.set_unreadable(INERT_MANAGED, &acct, unreadable);
+        assert!(
+            matches!(s.read_credential(&f.env, &f.paths), Read::Absent),
+            "unreadable={unreadable}"
+        );
+        assert!(
+            matches!(s.read_managed_key(&f.env, &f.paths), Read::Absent),
+            "unreadable={unreadable}"
+        );
     }
+    f.kc.put(&oauth, &acct, b"suffixed");
+    f.kc.put(&managed, &acct, b"sk-ant-api03-suffixed");
+    assert_eq!(
+        s.read_credential(&f.env, &f.paths)
+            .present()
+            .unwrap()
+            .bytes(),
+        b"suffixed"
+    );
+    assert_eq!(
+        s.read_managed_key(&f.env, &f.paths).present().unwrap(),
+        b"sk-ant-api03-suffixed"
+    );
+    // The suffixed item is the only authority: unreadable is unreadable, and the file covers
+    // it only as a degraded read.
+    f.kc.set_unreadable(&oauth, &acct, true);
+    f.kc.set_unreadable(&managed, &acct, true);
     assert!(matches!(
         s.read_credential(&f.env, &f.paths),
         Read::Unreadable(_)
@@ -277,6 +322,55 @@ fn an_unreadable_primary_item_is_never_skipped_for_a_fallback() {
             .unwrap()
             .provenance(),
         Provenance::Degraded
+    );
+}
+
+#[test]
+fn a_symlinked_config_dir_is_read_and_cleared_only_under_the_link_s_spelling() {
+    // Appendix A.2 (2.1.286): no `hash(readlink target)` fallback.
+    let f = fx();
+    let real = f.env.home.join("real-profile");
+    fs::create_dir_all(&real).unwrap();
+    let link = f.env.home.join("link-profile");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut by_link = f.env.clone();
+    by_link.claude_config_dir = Some(link.into_os_string());
+    let mut by_target = f.env.clone();
+    by_target.claude_config_dir = Some(real.into_os_string());
+    let s = store(&f, Platform::MacOs);
+    let acct = keychain_account(&f.env);
+    let link_item = keychain_service(&by_link, ItemKind::OAuth);
+    let target_item = keychain_service(&by_target, ItemKind::OAuth);
+    assert_ne!(link_item, target_item);
+    let paths = CcPaths::resolve(&by_link);
+    let target_entry = br#"{"claudeAiOauth":{"refreshToken":"target"}}"#;
+    f.kc.put(&target_item, &acct, target_entry);
+    assert!(
+        matches!(s.read_credential(&by_link, &paths), Read::Absent),
+        "the target's item is never read through the link"
+    );
+    f.kc.put(
+        &link_item,
+        &acct,
+        br#"{"claudeAiOauth":{"refreshToken":"link"}}"#,
+    );
+    assert_eq!(
+        s.read_credential(&by_link, &paths)
+            .present()
+            .unwrap()
+            .bytes(),
+        br#"{"claudeAiOauth":{"refreshToken":"link"}}"#
+    );
+    s.clear_credential_account_keys(&by_link, &paths, &open)
+        .unwrap();
+    assert!(
+        f.kc.get(&link_item, &acct).is_none(),
+        "cleared under the link's item"
+    );
+    assert_eq!(
+        f.kc.get(&target_item, &acct).unwrap(),
+        target_entry,
+        "the target's item is left alone"
     );
 }
 
@@ -434,27 +528,39 @@ fn clearing_oauth_keeps_machine_shared_keys() {
 }
 
 #[test]
-fn every_fallback_item_is_cleared_snapshotted_and_restored() {
-    // An explicit CLAUDE_CONFIG_DIR=~/.claude reads the suffixed item, then the plain one.
-    let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
+fn an_explicit_default_config_dir_clears_snapshots_and_restores_only_its_suffixed_item() {
+    let f = explicit_default();
     let s = store(&f, Platform::MacOs);
     let acct = keychain_account(&f.env);
-    let services = read_services(&f.env, ItemKind::OAuth);
-    assert_eq!(services.len(), 2);
-    f.kc.put(
-        &services[1],
-        &acct,
-        br#"{"claudeAiOauth":{"refreshToken":"plain"}}"#,
-    );
-    let snap = s.snapshot(&f.env, &f.paths).unwrap();
+    let oauth = keychain_service(&f.env, ItemKind::OAuth);
+    let entry = br#"{"claudeAiOauth":{"refreshToken":"suffixed"},"mcpOAuth":{"m":1}}"#;
+    let inert = br#"{"claudeAiOauth":{"refreshToken":"plain"}}"#;
+    f.kc.put(&oauth, &acct, entry);
+    f.kc.put(INERT_OAUTH, &acct, inert);
+    f.kc.set_unreadable(INERT_OAUTH, &acct, true);
+    let snap = s
+        .snapshot(&f.env, &f.paths)
+        .expect("an unreadable inert item never blocks a snapshot");
+    f.kc.set_unreadable(INERT_OAUTH, &acct, false);
     s.clear_credential_account_keys(&f.env, &f.paths, &open)
         .unwrap();
-    assert!(
-        f.kc.get(&services[1], &acct).is_none(),
-        "the fallback item must not stay active"
+    assert_eq!(
+        json_of(&f.kc.get(&oauth, &acct).unwrap()),
+        json!({"mcpOAuth": {"m": 1}})
     );
+    assert_eq!(
+        f.kc.get(INERT_OAUTH, &acct).unwrap(),
+        inert,
+        "the inert item is never cleared"
+    );
+    f.kc.put(INERT_OAUTH, &acct, b"changed meanwhile");
     s.restore(&f.env, &f.paths, &snap, &open).unwrap();
-    assert!(f.kc.get(&services[1], &acct).is_some());
+    assert_eq!(f.kc.get(&oauth, &acct).unwrap(), entry);
+    assert_eq!(
+        f.kc.get(INERT_OAUTH, &acct).unwrap(),
+        b"changed meanwhile",
+        "nor snapshotted and restored"
+    );
 }
 
 #[test]
@@ -892,67 +998,55 @@ fn a_successful_keychain_write_clears_a_stale_primary_api_key() {
 
 #[test]
 fn restore_continues_past_a_non_lock_failure_and_skips_an_already_matching_entry() {
-    let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
+    let f = fx();
     let recording = Arc::new(RecordingKeychain::new(f.kc.clone()));
     let s = LiveStore::new(recording.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
     let acct = keychain_account(&f.env);
-    let oauth = read_services(&f.env, ItemKind::OAuth);
-    assert_eq!(oauth.len(), 2);
-    let managed = read_services(&f.env, ItemKind::ManagedKey);
-    assert_eq!(managed.len(), 2);
+    let oauth = keychain_service(&f.env, ItemKind::OAuth);
+    let managed = keychain_service(&f.env, ItemKind::ManagedKey);
 
-    // Both OAuth items need restoring (a `Some` snapshot, so `upsert`, not `delete`).
-    // One managed-key item already matches its snapshot and must receive no write at
-    // all — proving the skip — while the OAuth items prove the loop does not stop at
-    // the first failure.
-    let orig_primary = br#"{"claudeAiOauth":{"refreshToken":"orig-primary"}}"#;
-    let orig_plain = br#"{"claudeAiOauth":{"refreshToken":"orig-plain"}}"#;
-    f.kc.put(&oauth[0], &acct, orig_primary);
-    f.kc.put(&oauth[1], &acct, orig_plain);
-    f.kc.put(&managed[0], &acct, b"unchanged-managed");
+    // This operation's own write clears the OAuth item and the credentials file, with nothing
+    // machine-shared in them (it deletes both): a restore puts back only what the operation
+    // wrote (§9.1). The OAuth item's upsert fails; the file, restored last, proves the restore
+    // does not stop there. The managed-key item was never written and already matches its
+    // snapshot, so it must receive no write at all, proving the skip.
+    let orig_item = br#"{"claudeAiOauth":{"refreshToken":"orig-item"}}"#;
+    let orig_file = br#"{"claudeAiOauth":{"refreshToken":"orig-file"}}"#;
+    f.kc.put(&oauth, &acct, orig_item);
+    f.kc.put(&managed, &acct, b"unchanged-managed");
+    fs::write(&f.paths.credentials_file, orig_file).unwrap();
     let snap = s.snapshot(&f.env, &f.paths).unwrap();
 
-    // This operation's own write changes both OAuth items: a restore puts back only what the
-    // operation wrote (§9.1). With nothing machine-shared in them, the clear deletes them.
     s.clear_credential_account_keys(&f.env, &f.paths, &open)
         .unwrap();
-    // `managed[0]` is left untouched, so it still equals its snapshot.
-
-    // The primary item is restored first (managed items come first in `restore`, but
-    // neither needs restoring here, so the OAuth pair is the first pair attempted, and
-    // the primary is first within it). Its upsert fails; the plain item must still be
-    // restored afterwards.
-    f.kc.set_fail_write(&oauth[0], true);
+    assert_eq!(f.kc.get(&oauth, &acct), None);
+    assert!(!f.paths.credentials_file.exists());
+    f.kc.set_fail_write(&oauth, true);
 
     match s.restore(&f.env, &f.paths, &snap, &open) {
-        Err(ProviderError::Incomplete { failed }) => assert_eq!(failed, vec![oauth[0].clone()]),
-        other => panic!("expected Incomplete naming {}, got {other:?}", oauth[0]),
+        Err(ProviderError::Incomplete { failed }) => assert_eq!(failed, vec![oauth.clone()]),
+        other => panic!("expected Incomplete naming {oauth}, got {other:?}"),
     }
     assert_eq!(
-        f.kc.get(&oauth[0], &acct),
+        f.kc.get(&oauth, &acct),
         None,
         "the failed restore must leave the target value in place, not corrupt it"
     );
     assert_eq!(
-        f.kc.get(&oauth[1], &acct).unwrap(),
-        orig_plain,
-        "the second item must still be restored after the first one failed"
+        fs::read(&f.paths.credentials_file).unwrap(),
+        orig_file,
+        "the file must still be restored after the item failed"
     );
-    assert_eq!(f.kc.get(&managed[0], &acct).unwrap(), b"unchanged-managed");
+    assert_eq!(f.kc.get(&managed, &acct).unwrap(), b"unchanged-managed");
 
     let calls = recording.calls();
     assert!(
         calls
             .iter()
-            .any(|(svc, op)| svc == &oauth[0] && *op == "upsert")
+            .any(|(svc, op)| svc == &oauth && *op == "upsert")
     );
     assert!(
-        calls
-            .iter()
-            .any(|(svc, op)| svc == &oauth[1] && *op == "upsert")
-    );
-    assert!(
-        !calls.iter().any(|(svc, _)| svc == &managed[0]),
+        !calls.iter().any(|(svc, _)| svc == &managed),
         "an entry that already matched its snapshot must receive no write at all: {calls:?}"
     );
 }
@@ -1012,7 +1106,7 @@ fn a_counting_fence_stops_the_hot_reload_rewrite() {
 }
 
 #[test]
-fn a_counting_fence_stops_the_deletes_in_remove_items() {
+fn a_counting_fence_stops_the_delete_in_remove_item() {
     let f = fx();
     let s = store(&f, Platform::MacOs);
     let (svc, acct) = oauth_svc(&f);
@@ -1135,27 +1229,27 @@ fn read_managed_key_is_unreadable_when_the_keychain_item_is_unreadable_even_with
 }
 
 #[test]
-fn file_fallback_verifies_every_fallback_item_is_gone_including_the_plain_one() {
-    let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
+fn a_file_fallback_reports_and_deletes_only_the_suffixed_item_of_an_explicit_default_config_dir() {
+    let f = explicit_default();
     let s = store(&f, Platform::MacOs);
     let acct = keychain_account(&f.env);
-    let services = read_services(&f.env, ItemKind::OAuth);
-    assert_eq!(services.len(), 2);
-    f.kc.set_fail_write(&services[0], true);
-    f.kc.set_fail_write(&services[1], true);
-    // The plain fallback item's delete is made to fail, so it survives the attempt and
-    // the existence check must catch it.
-    f.kc.put(&services[1], &acct, b"stale");
-    f.kc.set_fail_delete(&services[1], true);
-    match s.write_credential_entry(&f.env, &f.paths, b"new", &open, &mut save_nothing) {
-        Err(ProviderError::ShadowingItem(name)) => assert_eq!(name, services[1]),
-        other => panic!("expected ShadowingItem({}), got {other:?}", services[1]),
-    }
-    f.kc.set_fail_delete(&services[1], false);
-    s.write_credential_entry(&f.env, &f.paths, b"new", &open, &mut save_nothing)
-        .unwrap();
-    assert!(f.kc.get(&services[0], &acct).is_none());
-    assert!(f.kc.get(&services[1], &acct).is_none());
+    let oauth = keychain_service(&f.env, ItemKind::OAuth);
+    f.kc.put(&oauth, &acct, b"old");
+    f.kc.put(INERT_OAUTH, &acct, b"inert");
+    f.kc.set_fail_write(&oauth, true);
+    let mut reported: Vec<Vec<u8>> = Vec::new();
+    let mut record = |b: &[u8]| {
+        reported.push(b.to_vec());
+        Ok(())
+    };
+    assert_eq!(
+        s.write_credential_entry(&f.env, &f.paths, b"new", &open, &mut record)
+            .unwrap(),
+        SecretStore::Fallback(f.paths.credentials_file.clone())
+    );
+    assert_eq!(reported, vec![b"old".to_vec()]);
+    assert!(f.kc.get(&oauth, &acct).is_none());
+    assert_eq!(f.kc.get(INERT_OAUTH, &acct).unwrap(), b"inert");
 }
 
 #[test]
@@ -1507,14 +1601,12 @@ fn times_out<T: std::fmt::Debug>(
 fn every_credential_entry_write_holds_the_storage_write_lock_and_releases_it() {
     // §9.1, B #61: every write and delete of a CC credential entry holds the lock, a restore's
     // included, and releases it when the write returns.
-    let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
+    let f = explicit_default();
     let lock = f.paths.storage_write_lock.clone();
     let probe = Arc::new(LockProbeKeychain::new(f.kc.clone(), lock.clone()));
     let s = LiveStore::new(probe.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
     let (svc, acct) = oauth_svc(&f);
-    let plain = &read_services(&f.env, ItemKind::OAuth)[1];
     f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
-    f.kc.put(plain, &acct, &cc_login("rt-old", "m0"));
     fs::write(&f.paths.credentials_file, cc_login("rt-0", "m0")).unwrap();
     fs::write(&f.paths.global_config, "{}").unwrap();
     let snap = s.snapshot(&f.env, &f.paths).unwrap();
@@ -1564,11 +1656,11 @@ fn every_credential_entry_write_holds_the_storage_write_lock_and_releases_it() {
 
     assert_eq!(
         reported_under_the_lock,
-        [true, true],
-        "a fallback reports both items it deletes under the lock"
+        [true],
+        "a fallback reports the item it deletes under the lock"
     );
     let writes = probe.writes();
-    assert!(writes.len() >= 8, "{writes:?}");
+    assert!(writes.len() >= 6, "{writes:?}");
     assert!(
         writes.iter().all(|(_, held)| *held),
         "a Keychain write without the storage-write lock: {writes:?}"
@@ -2117,52 +2209,48 @@ fn cc_lets_go_soon(lock: &Path) -> thread::JoinHandle<()> {
     })
 }
 
-/// `fx()` with an explicit `CLAUDE_CONFIG_DIR=~/.claude`: readers also try the unsuffixed item
-/// (Appendix A.2), so the OAuth entry has a second item. Returns it with its service.
-fn fx_with_fallback_item() -> (Fx, String) {
-    let f = fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()));
-    let plain = read_services(&f.env, ItemKind::OAuth)[1].clone();
-    (f, plain)
-}
-
 #[test]
-fn a_clear_aborts_when_another_writer_changed_a_fallback_item() {
-    // §9.1 at every place a write overwrites or deletes: the second item a reader tries changed
-    // while tagteam waited for the lock, so the clear touches no place.
-    let (f, plain) = fx_with_fallback_item();
+fn a_clear_never_reads_or_touches_an_inert_item_another_writer_changed() {
+    // Appendix A.2 (2.1.286): the unsuffixed item of an explicit `~/.claude` is no place of the
+    // entry, so another writer's change to it is no conflict (§9.1 compares only places), and
+    // the clear neither reads nor writes it.
+    let f = explicit_default();
     let s = store(&f, Platform::MacOs);
     let (svc, acct) = oauth_svc(&f);
     f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
-    f.kc.put(&plain, &acct, &cc_login("rt-0", "m0"));
+    f.kc.put(INERT_OAUTH, &acct, &cc_login("rt-0", "m0"));
     s.snapshot(&f.env, &f.paths).unwrap();
-    let (kc, other, other_acct) = (f.kc.clone(), plain.clone(), acct.clone());
+    let (kc, other_acct) = (f.kc.clone(), acct.clone());
     let cc = cc_writes_under_the_lock(&f.paths.storage_write_lock, move || {
-        kc.put(&other, &other_acct, &cc_login("rt-other", "m0"))
+        kc.put(INERT_OAUTH, &other_acct, &cc_login("rt-other", "m0"))
     });
 
     let cleared = s.clear_credential_account_keys(&f.env, &f.paths, &open);
     cc.join().unwrap();
 
-    match cleared {
-        Err(ProviderError::EntryMoved(name)) => assert_eq!(name, plain),
-        other => panic!("expected the clear to abort, got {other:?}"),
-    }
-    assert_eq!(f.kc.get(&plain, &acct).unwrap(), cc_login("rt-other", "m0"));
-    assert_eq!(f.kc.get(&svc, &acct).unwrap(), cc_login("rt-0", "m0"));
+    cleared.unwrap();
+    assert_eq!(
+        json_of(&f.kc.get(&svc, &acct).unwrap()),
+        json!({"mcpOAuth": {"srv": {"token": "m0"}}})
+    );
+    assert_eq!(
+        f.kc.get(INERT_OAUTH, &acct).unwrap(),
+        cc_login("rt-other", "m0")
+    );
 }
 
 #[test]
-fn a_clear_goes_ahead_over_cc_s_marking_of_a_fallback_item() {
-    // §9.1: a marking is no conflict at any place, the second item included.
-    let (f, plain) = fx_with_fallback_item();
+fn a_clear_goes_ahead_over_cc_s_marking_of_its_item() {
+    // §9.1: a marking is no conflict at any place. The clear keeps only what the marked item
+    // still holds that is machine-shared.
+    let f = explicit_default();
     let s = store(&f, Platform::MacOs);
     let (svc, acct) = oauth_svc(&f);
     f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
-    f.kc.put(&plain, &acct, &cc_login("rt-0", "m0"));
     s.snapshot(&f.env, &f.paths).unwrap();
-    let (kc, other, other_acct) = (f.kc.clone(), plain.clone(), acct.clone());
+    let (kc, item, item_acct) = (f.kc.clone(), svc.clone(), acct.clone());
     let cc = cc_writes_under_the_lock(&f.paths.storage_write_lock, move || {
-        kc.put(&other, &other_acct, &cc_wiped("m1"))
+        kc.put(&item, &item_acct, &cc_wiped("m1"))
     });
 
     s.clear_credential_account_keys(&f.env, &f.paths, &open)
@@ -2171,13 +2259,11 @@ fn a_clear_goes_ahead_over_cc_s_marking_of_a_fallback_item() {
     let released = cc.join().unwrap();
 
     assert!(ended > released, "the clear waited for CC's lock");
-    for (place, mcp) in [(&svc, "m0"), (&plain, "m1")] {
-        assert_eq!(
-            json_of(&f.kc.get(place, &acct).unwrap()),
-            json!({"mcpOAuth": {"srv": {"token": mcp}}}),
-            "{place} keeps only its own machine-shared keys"
-        );
-    }
+    assert_eq!(
+        json_of(&f.kc.get(&svc, &acct).unwrap()),
+        json!({"mcpOAuth": {"srv": {"token": "m1"}}}),
+        "the item keeps only its machine-shared keys, as the marking left them"
+    );
 }
 
 #[test]

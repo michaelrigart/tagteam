@@ -104,10 +104,11 @@ pub const API_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
 pub const STRAY_API_KEY: &str = "sk-ant-api03-stray-key-that-no-vault-holds";
 /// A second API key no stored account starts with.
 pub const OTHER_API_KEY: &str = "sk-ant-api03-zyxwvutsrqponmlkjihgfedcba";
-/// The unsuffixed OAuth item readers fall back to under `Fx::with_fallback_items`.
-pub const FALLBACK_ITEM: &str = "Claude Code-credentials";
-/// The unsuffixed managed-key item readers fall back to under `Fx::with_fallback_items`.
-pub const FALLBACK_MANAGED_ITEM: &str = "Claude Code";
+/// The unsuffixed OAuth item an explicit `CLAUDE_CONFIG_DIR=~/.claude` fell back to before
+/// Claude Code 2.1.286. Inert since (Appendix A.2): nothing may read, write or clear it.
+pub const INERT_ITEM: &str = "Claude Code-credentials";
+/// The unsuffixed managed-key item, inert in the same way.
+pub const INERT_MANAGED_ITEM: &str = "Claude Code";
 
 /// Sets one top-level key of the config at `path`, changing nothing else. A free function, so
 /// a `'static` race callback can call it without borrowing the fixture.
@@ -240,32 +241,34 @@ impl Fx {
         Self::build(platform, adjust, |cc| cc)
     }
 
-    /// A macOS fixture with an explicit `CLAUDE_CONFIG_DIR=~/.claude`: readers also try the
-    /// unsuffixed items (Appendix A.2), so `FALLBACK_ITEM` is a second copy of the entry.
-    pub fn with_fallback_items() -> Self {
+    /// A macOS fixture with an explicit `CLAUDE_CONFIG_DIR=~/.claude`. Claude Code names only
+    /// the suffixed items for it (Appendix A.2), so `INERT_ITEM` and `INERT_MANAGED_ITEM` are
+    /// another spelling's items, which no command may touch.
+    pub fn with_explicit_default_config_dir() -> Self {
         Self::with(Platform::MacOs, |e| {
             e.claude_config_dir = Some(e.home.join(".claude").into_os_string())
         })
     }
 
-    pub fn put_fallback_item(&self, bytes: &[u8]) {
-        self.kc
-            .put(FALLBACK_ITEM, &keychain_account(&self.env), bytes);
+    /// Plants both inert items with secrets no vault holds; returns what each holds.
+    pub fn put_inert_items(&self) -> (Vec<u8>, Vec<u8>) {
+        let acct = keychain_account(&self.env);
+        let oauth = Self::credential_json("old@x.co", "rt-inert")
+            .to_string()
+            .into_bytes();
+        let managed = STRAY_API_KEY.as_bytes().to_vec();
+        self.kc.put(INERT_ITEM, &acct, &oauth);
+        self.kc.put(INERT_MANAGED_ITEM, &acct, &managed);
+        (oauth, managed)
     }
 
-    pub fn fallback_item(&self) -> Option<Value> {
-        let bytes = self.kc.get(FALLBACK_ITEM, &keychain_account(&self.env))?;
-        serde_json::from_slice(&bytes).ok()
-    }
-
-    pub fn put_fallback_managed_item(&self, key: &[u8]) {
-        self.kc
-            .put(FALLBACK_MANAGED_ITEM, &keychain_account(&self.env), key);
-    }
-
-    pub fn fallback_managed_item(&self) -> Option<Vec<u8>> {
-        self.kc
-            .get(FALLBACK_MANAGED_ITEM, &keychain_account(&self.env))
+    /// What the two inert items hold now.
+    pub fn inert_items(&self) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let acct = keychain_account(&self.env);
+        (
+            self.kc.get(INERT_ITEM, &acct),
+            self.kc.get(INERT_MANAGED_ITEM, &acct),
+        )
     }
 
     /// A macOS fixture whose provider waits only `timeout` for CC's locks, so a held CC lock
