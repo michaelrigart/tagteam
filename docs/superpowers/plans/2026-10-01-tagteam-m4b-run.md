@@ -34,7 +34,7 @@
 
 ## Execution notes
 
-- **M4a's execution changed one signature this plan calls:** `Provider::delete_profile_credential(env, dir, spelling)`, where `dir` is the profile's actual directory. It takes CC's storage-write lock itself, around each delete, when `dir` is a real directory, so it is never called while that lock is held. Task 9's bootstrap step 5 passes `profile` to both calls. The re-sync checks every other call.
+- **M4a's execution changed one signature this plan calls:** `Provider::delete_profile_credential(env, dir, spelling)`, where `dir` is the profile's actual directory. When `dir` is a real directory it takes the profile's own credential locks, then CC's storage-write lock around each delete, so it is never called while either is held. Task 9's bootstrap step 5 passes `profile` to both calls; the re-sync checks every other call and the lock nesting. M4a's final review also changed `EngineError::SessionOwned` (it gains `unreadable`) and `EngineError::ProfileSplit` (it gains `cause: SplitCause`), so `launch`'s mapping of `ProfileSplit` follows its cause. `probe_lock` now takes a shared lock, which still sees a launcher's exclusive lock as held. M4a's Execution rulings list the rest.
 - **Execution starts after M4a is merged into `main`** (M3a merged at `7ee733b`). The first step rebases this branch and re-syncs this plan with M3a's and M4a's final code: names, line numbers and every interface listed under "Builds on". Record the re-sync under "Execution rulings" before Task 1.
 - When execution starts, set this plan's `**Status:**` to `In progress` in one commit.
 - Run in the `m4-run-sessions` worktree.
