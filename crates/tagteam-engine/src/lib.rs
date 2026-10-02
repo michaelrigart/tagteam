@@ -12,6 +12,7 @@ pub mod lazy_http;
 pub mod lifecycle;
 pub mod net;
 pub mod oracle;
+pub mod provenance;
 pub mod quarantine;
 mod recover;
 pub mod refresh;
