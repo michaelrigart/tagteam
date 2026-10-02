@@ -277,6 +277,12 @@ fn rebase(bytes: &[u8], shared: &Map<String, Value>) -> Vec<u8> {
 
 /// `fence`, then the storage-write lock's own ownership check: the check that runs immediately
 /// before every write the lock protects (§9.1).
+/// A real directory, not a symlink to one (`symlink_metadata`); false for anything else,
+/// including a path that cannot be read.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
 fn held<'a>(fence: Fence<'a>, lock: &'a MkdirLock) -> impl Fn() -> Result<(), ProviderError> + 'a {
     move || {
         fence()?;
@@ -939,7 +945,10 @@ impl LiveStore {
     /// delete holds CC's storage-write lock (§9.1), the lock `paths` names, alone and with no
     /// comparison against an earlier read: a profile's removal deletes whatever is there, and a
     /// per-config-dir daemon may still write the entry. `env` names the items (the recorded
-    /// spelling) and `paths` the lock (the profile's actual directory, Decision 19).
+    /// spelling) and `paths` the lock (the profile's actual directory, Decision 19). The lock is
+    /// taken only where that directory is a real directory (a symlink does not count): no Claude
+    /// Code can write through a config dir that is missing, a file or a link, and a removal is
+    /// never blocked by a stray path there.
     pub(crate) fn delete_items(&self, env: &Env, paths: &CcPaths) -> Result<(), ProviderError> {
         if !self.mac() {
             return Ok(());
@@ -947,8 +956,16 @@ impl LiveStore {
         let acct = keychain_account(env);
         for kind in [ItemKind::OAuth, ItemKind::ManagedKey] {
             let svc = keychain_service(env, kind);
-            let lock = self.storage_write(paths, &env.cancel)?;
-            if !self.delete_verified(&svc, &acct, &held(&|| Ok(()), &lock))? {
+            let lock = if is_real_dir(&paths.secure_storage_dir) {
+                Some(self.storage_write(paths, &env.cancel)?)
+            } else {
+                None
+            };
+            let gone = match &lock {
+                Some(lock) => self.delete_verified(&svc, &acct, &held(&|| Ok(()), lock))?,
+                None => self.delete_verified(&svc, &acct, &|| Ok(()))?,
+            };
+            if !gone {
                 return Err(ProviderError::ShadowingItem(svc));
             }
         }

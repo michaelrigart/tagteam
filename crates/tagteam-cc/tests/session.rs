@@ -565,6 +565,70 @@ fn deleting_a_profile_credential_holds_the_storage_write_lock_at_the_profile_s_a
     );
 }
 
+/// Deleting the profile's items with `dir` as `place` makes: nothing, a file, or a dangling link.
+fn delete_where_the_profile_is_not_a_directory(place: impl Fn(&Path)) {
+    let f = fx();
+    let (dir, spelling) = profile(&f, "0192");
+    fs::remove_dir(&dir).unwrap();
+    place(&dir);
+    let acct = keychain_account(&f.env);
+    let oauth = hashed("Claude Code-credentials", &spelling);
+    let managed = hashed("Claude Code", &spelling);
+    f.kc.put(&oauth, &acct, ENTRY);
+    f.kc.put(&managed, &acct, b"sk-ant-api03-profile");
+    f.cc.delete_profile_credential(&f.env, &dir, &spelling)
+        .expect("no lock is needed, and none may block the removal");
+    assert_eq!(
+        (f.kc.get(&oauth, &acct), f.kc.get(&managed, &acct)),
+        (None, None),
+        "both items are deleted and verified gone"
+    );
+    assert!(!dir.join(".storage-write").exists());
+}
+
+#[test]
+fn a_missing_profile_directory_still_has_its_items_deleted() {
+    delete_where_the_profile_is_not_a_directory(|_| {});
+}
+
+#[test]
+fn a_regular_file_at_the_profile_path_still_has_its_items_deleted() {
+    delete_where_the_profile_is_not_a_directory(|dir| fs::write(dir, b"stray").unwrap());
+}
+
+#[test]
+fn a_dangling_symlink_at_the_profile_path_still_has_its_items_deleted() {
+    delete_where_the_profile_is_not_a_directory(|dir| {
+        std::os::unix::fs::symlink(dir.with_file_name("nowhere"), dir).unwrap();
+    });
+}
+
+#[test]
+fn a_symlink_to_a_directory_at_the_profile_path_takes_no_lock_either() {
+    let f = fx();
+    let (dir, spelling) = profile(&f, "0192");
+    let real = f.env.home.join("real-profile");
+    fs::rename(&dir, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &dir).unwrap();
+    // A held lock behind the link would time this delete out if it took the lock.
+    fs::create_dir(real.join(".storage-write")).unwrap();
+    let cc = ClaudeCode::with_store(
+        LiveStore::new(f.kc.clone(), Platform::MacOs)
+            .with_retry_delay(Duration::ZERO)
+            .with_storage_write_timeout(Duration::from_millis(300)),
+    );
+    let acct = keychain_account(&f.env);
+    let oauth = hashed("Claude Code-credentials", &spelling);
+    f.kc.put(&oauth, &acct, ENTRY);
+    cc.delete_profile_credential(&f.env, &dir, &spelling)
+        .unwrap();
+    assert_eq!(f.kc.get(&oauth, &acct), None);
+    assert!(
+        real.join(".storage-write").is_dir(),
+        "the other holder's lock is untouched"
+    );
+}
+
 #[test]
 fn a_held_storage_write_lock_makes_a_profile_credential_delete_wait_then_time_out() {
     let f = fx();
