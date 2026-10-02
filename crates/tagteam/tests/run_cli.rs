@@ -10,7 +10,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -198,7 +198,10 @@ fn a_graceful_exit_removes_the_fake_s_session_record_and_a_kill_leaves_it() {
             .env("CLAUDE_CONFIG_DIR", &profile)
             .env("FAKE_CLAUDE_OUT", &out)
             .env("FAKE_CLAUDE_RECORD", "interactive")
-            .env("FAKE_CLAUDE_SLEEP", "30")
+            .env("FAKE_CLAUDE_HOLD", d.path().join("never"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap()
     };
@@ -245,8 +248,11 @@ fn with_continue_the_fake_claude_records_each_signal_and_runs_on() {
     let out = d.path().join("calls");
     let mut child = fake(d.path(), &[])
         .env("FAKE_CLAUDE_OUT", &out)
-        .env("FAKE_CLAUDE_SLEEP", "30")
+        .env("FAKE_CLAUDE_HOLD", d.path().join("never"))
         .env("FAKE_CLAUDE_ON_SIGNAL", "continue")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
     wait_for(&out, "running session", |c| {
