@@ -3,8 +3,12 @@
 //! them is not dead code overall.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::sync::{Arc, Mutex};
@@ -410,4 +414,230 @@ pub fn hold_launch(profile: &Path) -> FlockGuard {
     FlockGuard::try_lock(&profile.join(LAUNCH_DIR).join("4242.lock"))
         .unwrap()
         .expect("nothing else holds the reservation")
+}
+
+/// Decision 11's fake `claude`: a `/bin/sh` script, so no test ever runs the real one. See
+/// `fake_claude` for the variables that steer it.
+const FAKE_CLAUDE: &str = r##"#!/bin/sh
+# tagteam's fake `claude` for the CLI tests (tests/common/mod.rs, `fake_claude`). Every
+# FAKE_CLAUDE_* variable is optional; nothing here reaches the network or the real HOME.
+me=$$
+home=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+if [ -n "$CLAUDE_CONFIG_DIR" ]; then config=$CLAUDE_CONFIG_DIR/.claude.json; else config=$HOME/.claude.json; fi
+record=
+sleeper=
+
+note() {
+  if [ -n "$FAKE_CLAUDE_OUT" ]; then
+    printf '%s %s %s\n' "$me" "$1" "$2" >> "$FAKE_CLAUDE_OUT"
+  fi
+}
+
+finish() {
+  if [ -n "$sleeper" ]; then kill "$sleeper" 2>/dev/null; fi
+  if [ -n "$record" ]; then rm -f "$record"; fi
+  note exit "$1"
+  exit "$1"
+}
+
+caught() {
+  note signal "$1"
+  if [ "$FAKE_CLAUDE_ON_SIGNAL" != continue ]; then finish $((128 + $1)); fi
+}
+trap 'caught 1' HUP
+trap 'caught 2' INT
+trap 'caught 15' TERM
+
+pause() {
+  sleep "$1" &
+  sleeper=$!
+  while :; do
+    wait "$sleeper"
+    if [ "$?" -le 128 ] || ! kill -0 "$sleeper" 2>/dev/null; then break; fi
+  done
+  sleeper=
+}
+
+# A string field of the config's `oauthAccount`, as Claude Code pretty-prints it.
+field() {
+  sed -n "s/.*\"$1\": *\"\([^\"]*\)\".*/\1/p" "$config" 2>/dev/null | head -n 1
+}
+
+mode=session
+if [ "$1" = auth ] && [ "$2" = status ]; then mode=auth; fi
+note call "$mode"
+note ppid "$PPID"
+note cwd "$(pwd -P)"
+for a in "$@"; do note arg "$a"; done
+if [ -n "$FAKE_CLAUDE_OUT" ]; then
+  /usr/bin/env | while IFS= read -r line; do note env "$line"; done
+fi
+
+if [ "$mode" = auth ]; then
+  if [ -n "$FAKE_CLAUDE_AUTH_SLEEP" ]; then pause "$FAKE_CLAUDE_AUTH_SLEEP"; fi
+  if [ -n "$FAKE_CLAUDE_AUTH" ]; then
+    printf '%s\n' "$FAKE_CLAUDE_AUTH"
+    finish "${FAKE_CLAUDE_AUTH_EXIT:-0}"
+  fi
+  if grep -q '"apiKeyHelper"' "$home/settings.json" 2>/dev/null; then
+    printf '{"loggedIn":true,"authMethod":"api_key_helper","apiProvider":"firstParty","apiKeySource":"apiKeyHelper","configDirectory":"%s"}\n' "$home"
+    finish "${FAKE_CLAUDE_AUTH_EXIT:-0}"
+  fi
+  email=$FAKE_CLAUDE_EMAIL
+  org=$FAKE_CLAUDE_ORG
+  if [ -z "$email" ] && [ -f "$home/.credentials.json" ]; then
+    email=$(field emailAddress)
+    org=$(field organizationUuid)
+  fi
+  if [ -n "$email" ]; then
+    if [ -n "$org" ]; then org=",\"orgId\":\"$org\""; fi
+    printf '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","configDirectory":"%s","email":"%s"%s,"subscriptionType":"max"}\n' \
+      "$home" "$email" "$org"
+    finish "${FAKE_CLAUDE_AUTH_EXIT:-0}"
+  fi
+  printf '{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty","configDirectory":"%s"}\n' "$home"
+  finish "${FAKE_CLAUDE_AUTH_EXIT:-1}"
+fi
+
+if [ -n "$FAKE_CLAUDE_RECORD" ]; then
+  mkdir -p "$home/sessions" && chmod 700 "$home/sessions"
+  started=$(LC_ALL=C TZ=UTC ps -o lstart= -p "$me" 2>/dev/null | sed 's/^ *//;s/ *$//')
+  proc=
+  if [ -n "$started" ]; then proc=",\"procStart\":\"$started\""; fi
+  record="$home/sessions/$me.json"
+  printf '{"pid":%s,"sessionId":"fake-%s","cwd":"%s","startedAt":%s000,"kind":"%s"%s}\n' \
+    "$me" "$me" "$(pwd -P)" "$(date +%s)" "$FAKE_CLAUDE_RECORD" "$proc" > "$record"
+fi
+if [ -n "$FAKE_CLAUDE_ROTATE" ]; then
+  (umask 077 && printf '%s' "$FAKE_CLAUDE_ROTATE" > "$home/.credentials.json.fake" \
+    && mv -f "$home/.credentials.json.fake" "$home/.credentials.json")
+fi
+note ready
+if [ -n "$FAKE_CLAUDE_HOLD" ]; then
+  n=0
+  while [ ! -e "$FAKE_CLAUDE_HOLD" ] && [ "$n" -lt 600 ]; do
+    pause 0.05
+    n=$((n + 1))
+  done
+elif [ -n "$FAKE_CLAUDE_SLEEP" ]; then
+  pause "$FAKE_CLAUDE_SLEEP"
+fi
+finish "${FAKE_CLAUDE_EXIT:-0}"
+"##;
+
+/// Writes Decision 11's fake `claude` to `<root>/bin/claude` (0755) and returns `<root>/bin`,
+/// to put first on `PATH` (`path_with`). Its config home is `CLAUDE_CONFIG_DIR`, else
+/// `$HOME/.claude`. This is the one list of the variables that steer it, each optional; Tasks
+/// 12 and 13 use no others:
+/// - `FAKE_CLAUDE_OUT`: a file every run appends its record to (`fake_claude_calls`): its pid,
+///   parent, directory, arguments and environment, then `ready` once a session runs, the
+///   signals it caught, and its exit.
+/// - `FAKE_CLAUDE_EXIT`: the session's exit code (default 0).
+/// - `FAKE_CLAUDE_SLEEP`: seconds the session runs before it exits, when `FAKE_CLAUDE_HOLD` is
+///   unset.
+/// - `FAKE_CLAUDE_HOLD`: a path; the session runs until it exists, for at most 30 s.
+/// - `FAKE_CLAUDE_RECORD`: a session-record kind (`interactive`, `bg`, `daemon`). The session
+///   writes its record `<home>/sessions/<pid>.json` with it (Appendix A.7: `pid`, `startedAt`,
+///   `kind`, and `procStart` when `ps` answers), and a graceful exit removes it. SIGKILL leaves
+///   it behind, as for Claude Code.
+/// - `FAKE_CLAUDE_ROTATE`: credential JSON the session writes to `<home>/.credentials.json`,
+///   0600, by rename, at its start: a rotation of the profile's credential.
+/// - `FAKE_CLAUDE_ON_SIGNAL`: `continue` records SIGHUP, SIGINT and SIGTERM and keeps running;
+///   otherwise each is recorded and ends the session gracefully with 128 + its number. SIGQUIT
+///   keeps its default action.
+/// - `FAKE_CLAUDE_AUTH`: `claude auth status`'s reply, verbatim, exiting with
+///   `FAKE_CLAUDE_AUTH_EXIT` (default 0).
+/// - Without `FAKE_CLAUDE_AUTH`, `auth status` answers from its config home, as Claude Code's
+///   does, with `configDirectory` the config home it was given:
+///   - `api_key_helper` when `<home>/settings.json` names an `apiKeyHelper`;
+///   - else a `claude.ai` login as `FAKE_CLAUDE_EMAIL` (and `FAKE_CLAUDE_ORG`'s `orgId`), or,
+///     without them, as the config's `oauthAccount` email and org when `<home>/.credentials.json`
+///     exists;
+///   - else logged out, exiting 1.
+/// - `FAKE_CLAUDE_AUTH_SLEEP`: seconds `auth status` takes before it answers.
+///
+/// Paths and values go into JSON unescaped, so tests keep them free of quotes and
+/// backslashes, and records are lines, so no argument or variable may hold a newline.
+pub fn fake_claude(root: &Path) -> PathBuf {
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("claude");
+    fs::write(&path, FAKE_CLAUDE).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// `bin`, then this test process's own `PATH`: what puts the fake `claude` first.
+pub fn path_with(bin: &Path) -> OsString {
+    let mut path = bin.as_os_str().to_owned();
+    if let Some(rest) = std::env::var_os("PATH") {
+        path.push(":");
+        path.push(rest);
+    }
+    path
+}
+
+/// One run of the fake `claude`, as it recorded itself in `FAKE_CLAUDE_OUT`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FakeCall {
+    pub pid: u32,
+    /// `auth` for `claude auth status`, else `session`.
+    pub mode: String,
+    pub ppid: u32,
+    /// Its working directory, symlinks resolved.
+    pub cwd: PathBuf,
+    /// Its arguments, as the bytes it was given.
+    pub args: Vec<OsString>,
+    pub env: BTreeMap<String, String>,
+    /// The session got as far as running: its record and rotation are written.
+    pub ready: bool,
+    /// The SIGHUP, SIGINT and SIGTERM it caught, by number, in order.
+    pub signals: Vec<i32>,
+    pub exit: Option<i32>,
+}
+
+/// Every run recorded in `out`, in the order they started; a missing file is no runs. Each
+/// line is `<pid> <key> <value>`, so runs that overlap never mix. Lines are read as bytes: an
+/// argument keeps its own, and every other value is read as UTF-8, lossily.
+pub fn fake_claude_calls(out: &Path) -> Vec<FakeCall> {
+    let bytes = fs::read(out).unwrap_or_default();
+    let mut calls: Vec<FakeCall> = Vec::new();
+    for line in bytes.split(|b| *b == b'\n') {
+        let mut parts = line.splitn(3, |b| *b == b' ');
+        let (Some(pid), Some(key)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(pid) = String::from_utf8_lossy(pid).parse::<u32>() else {
+            continue;
+        };
+        let raw = parts.next().unwrap_or(b"");
+        let value = String::from_utf8_lossy(raw);
+        let key = String::from_utf8_lossy(key);
+        if key == "call" {
+            calls.push(FakeCall {
+                pid,
+                mode: value.into_owned(),
+                ..FakeCall::default()
+            });
+            continue;
+        }
+        let Some(call) = calls.iter_mut().rev().find(|c| c.pid == pid) else {
+            continue;
+        };
+        match key.as_ref() {
+            "ppid" => call.ppid = value.parse().unwrap_or(0),
+            "cwd" => call.cwd = PathBuf::from(OsString::from_vec(raw.to_vec())),
+            "arg" => call.args.push(OsString::from_vec(raw.to_vec())),
+            "env" => {
+                if let Some((k, v)) = value.split_once('=') {
+                    call.env.insert(k.to_owned(), v.to_owned());
+                }
+            }
+            "ready" => call.ready = true,
+            "signal" => call.signals.extend(value.parse::<i32>().ok()),
+            "exit" => call.exit = value.parse().ok(),
+            _ => {}
+        }
+    }
+    calls
 }
