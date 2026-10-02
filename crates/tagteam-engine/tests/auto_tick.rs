@@ -716,6 +716,50 @@ fn a_manual_switch_during_the_tick_s_perform_is_live_changed() {
     assert_eq!(auto_state(&fx), AutoState::default());
 }
 
+/// Decision 4: the unknown-usage count belongs to the account the tick judged. When a manual
+/// switch moves the live account under the tick's own failover, the refusal writes 0, not the
+/// count the old live account reached.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_live_changed_refusal_writes_no_unknown_usage_count() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c"); // live; never read
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &b, &reading(false, 10.0, 50.0));
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    for _ in 0..2 {
+        engine.tick(&sink).unwrap();
+    }
+    assert_eq!(auto_state(&fx).unhealthy_ticks, 2);
+    let other = fx.engine_with_env(fx.env.clone());
+    let manual = fx.switch_request(&b, false);
+    fx.engine.on_point(
+        "planned",
+        Box::new(move || assert!(other.switch(manual.clone()).unwrap().switched)),
+    );
+    sink.take();
+    let (outcome, decision) = engine.tick(&sink).unwrap();
+    assert_eq!(outcome, TickOutcome::NoAction);
+    assert!(
+        matches!(
+            decision,
+            Decision::NoSwitch {
+                reason: NoSwitchReason::LiveChanged,
+                ..
+            }
+        ),
+        "{decision:?}"
+    );
+    assert_eq!(auto_state(&fx).unhealthy_ticks, 0);
+}
+
 #[test]
 fn the_unknown_usage_count_starts_afresh_on_an_account_switched_to_by_hand() {
     // Decision 4: the count belongs to the account it judged. Carried over, 2 of c's unknown
