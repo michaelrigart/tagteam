@@ -971,7 +971,7 @@ impl App<'_, '_> {
     /// shell, except with `--dry-run` (§11.1); `run_command` has run the Keychain check. Events
     /// go to stdout as human lines or JSONL (§11.4), warnings and errors to stderr.
     fn auto(&mut self, run: AutoRun) -> Result<i32, Failure> {
-        if !run.dry_run && self.engine.env().inside_run_shell() {
+        if !run.dry_run && matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
             return Err(EngineError::InsideRunShell.into());
         }
         let several = auto::providers(&self.engine, run.provider.as_ref())?.len() > 1;
