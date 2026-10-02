@@ -2295,10 +2295,12 @@ A pid is live if `kill(pid, 0)` succeeds or returns `EPERM`, **and** it still be
 record's writer, as judged from `procStart`:
 
 - **`ps lstart` text**, which CC 2.1.286 writes on macOS and Linux alike (`LC_ALL=C`, `TZ=UTC`,
-  for example `Wed Oct  1 12:34:56 2026`): the process's start time from the OS
+  for example `Thu Oct  1 12:34:56 2026`): the process's start time from the OS
   (`proc_pidinfo(PROC_PIDTBSDINFO)` on macOS; the boot time plus `/proc/<pid>/stat` field 22,
-  counted after the last `)`, on Linux) must equal it to the second, within ±1 s. Any other
-  start time means the pid was recycled.
+  counted after the last `)`, on Linux) must equal it to the second, within ±1 s. A mismatch
+  counts as recycled only when the process does not mention the launch command either; a
+  mismatch on a process that mentions it counts as live, since the start time a Linux host
+  computes moves with its wall clock.
 - **All digits**, as older CC versions wrote on Linux: `/proc/<pid>/stat` field 22 must equal
   it.
 - **Absent or unparseable** (CC omits it when `ps` fails): cswap's rule applies. Get the start
