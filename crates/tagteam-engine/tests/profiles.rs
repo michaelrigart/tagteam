@@ -420,9 +420,9 @@ fn a_real_directory_where_a_shared_link_belongs_warns_and_is_left_alone() {
 }
 
 /// Plants `name` in a fresh profile with `plant`. The sync then refuses with
-/// `profile-split`, naming both paths, for a launch and for a join, and writes nothing
-/// anywhere.
-fn assert_split(name: &str, plant: impl Fn(&Fx, &Path)) {
+/// `profile-split`, naming both paths and saying `why`, for a launch and for a join, and
+/// writes nothing anywhere.
+fn assert_split(name: &str, why: &str, plant: impl Fn(&Fx, &Path)) {
     let fx = Fx::new();
     let profile = setup(&fx);
     let src = source(&fx);
@@ -452,6 +452,7 @@ fn assert_split(name: &str, plant: impl Fn(&Fx, &Path)) {
                 && text.contains(&src.join(name).display().to_string()),
             "{text}"
         );
+        assert!(text.contains(why), "{name}: {text}");
     }
     assert_eq!(
         describe(&profile.join(name)),
@@ -476,14 +477,14 @@ fn assert_split(name: &str, plant: impl Fn(&Fx, &Path)) {
 #[test]
 fn a_real_history_file_in_the_profile_refuses_with_profile_split_and_changes_nothing() {
     // Review Focus 5.
-    assert_split("history.jsonl", |_, p| {
+    assert_split("history.jsonl", "is a real copy", |_, p| {
         fs::write(p, "private history\n").unwrap()
     });
 }
 
 #[test]
 fn a_real_projects_directory_in_the_profile_refuses_with_profile_split_and_changes_nothing() {
-    assert_split("projects", |_, p| {
+    assert_split("projects", "is a real copy", |_, p| {
         fs::create_dir_all(p.join("-x/memory")).unwrap();
         fs::write(p.join("-x/memory/MEMORY.md"), "private memory\n").unwrap();
     });
@@ -491,7 +492,7 @@ fn a_real_projects_directory_in_the_profile_refuses_with_profile_split_and_chang
 
 #[test]
 fn a_must_share_link_that_resolves_elsewhere_refuses_as_a_split_too() {
-    assert_split("history.jsonl", |fx, p| {
+    assert_split("history.jsonl", "links somewhere other than", |fx, p| {
         let elsewhere = fx.env.home.join("elsewhere");
         fs::create_dir_all(&elsewhere).unwrap();
         fs::write(elsewhere.join("history.jsonl"), "elsewhere\n").unwrap();
@@ -696,6 +697,10 @@ fn a_join_refuses_a_must_share_link_that_no_longer_resolves_where_the_source_doe
         .unwrap_err();
 
     assert_eq!(err.kind(), "profile-split", "{err}");
+    // Nothing is to merge: the fix is to let the session end, then launch again.
+    let text = err.to_string();
+    assert!(text.contains("end that session"), "{text}");
+    assert!(!text.contains("merge"), "{text}");
     assert_eq!(link(&profile.join("projects")), old, "nothing was written");
     assert_eq!(record(&profile), before);
 
@@ -721,6 +726,108 @@ fn a_join_recreates_a_missing_must_share_source_its_link_points_at() {
     assert_eq!(fs::read(src.join("history.jsonl")).unwrap(), b"");
     assert_eq!(link(&profile.join("history.jsonl")), old);
     assert!(report.removed.is_empty(), "{report:?}");
+}
+
+#[test]
+fn an_optional_source_that_does_not_resolve_is_not_linked() {
+    // A link to nothing, one that loops, and one through a file: none names an entry to share.
+    let fx = Fx::new();
+    let profile = setup(&fx);
+    let src = source(&fx);
+    fs::remove_file(src.join("CLAUDE.md")).unwrap();
+    symlink(src.join("CLAUDE.md"), src.join("CLAUDE.md")).unwrap();
+    symlink(src.join("missing"), src.join("keybindings.json")).unwrap();
+    symlink(src.join("CLAUDE.md/inside"), src.join("themes")).unwrap();
+    fs::remove_file(src.join("settings.json")).unwrap();
+    symlink(src.join("history.jsonl/inside"), src.join("settings.json")).unwrap();
+
+    let report = sync(&fx, &profile);
+
+    for name in ["CLAUDE.md", "keybindings.json", "themes", "settings.json"] {
+        assert!(absent(&profile.join(name)), "{name} is not linked");
+        assert!(link(&src.join(name)).is_some(), "{name} is left as it is");
+    }
+    for name in ["projects", "history.jsonl", "skills", "plugins"] {
+        assert_eq!(
+            link(&profile.join(name)),
+            Some(resolved(&src.join(name))),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        report.created,
+        ["projects", "history.jsonl", "skills", "plugins"]
+    );
+}
+
+#[test]
+fn a_must_share_source_that_does_not_resolve_refuses_as_a_link_to_nothing() {
+    for (what, target) in [("dangling", "nowhere"), ("a self-loop", "history.jsonl")] {
+        let fx = Fx::new();
+        let profile = setup(&fx);
+        let src = source(&fx);
+        fs::remove_file(src.join("history.jsonl")).unwrap();
+        symlink(src.join(target), src.join("history.jsonl")).unwrap();
+
+        let err = fx
+            .engine
+            .sync_profile_links(fx.cc.as_ref(), &profile, false)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), "invalid-input", "{what}: {err}");
+        assert!(err.to_string().contains("link to nothing"), "{what}: {err}");
+        assert_eq!(
+            entries(&profile),
+            [MARKER_FILE],
+            "{what}: nothing was linked"
+        );
+    }
+}
+
+#[test]
+fn a_source_home_that_is_not_a_directory_refuses_before_anything_is_created() {
+    // The outer home is a link to nothing, one that loops, or a regular file: there is no
+    // directory to create the must-share entries in, nor any entry to share.
+    let fx = Fx::new();
+    let elsewhere = fx.env.home.join("not-claude");
+    type Make = fn(&Path);
+    let cases: [(&str, Make); 3] = [
+        ("a link to nothing", |home| {
+            symlink(home.with_file_name("nowhere"), home).unwrap()
+        }),
+        ("a self-loop", |home| symlink(home, home).unwrap()),
+        ("a regular file", |home| fs::write(home, "x").unwrap()),
+    ];
+    for (what, make) in cases {
+        let profile = setup(&fx);
+        let home = elsewhere.join(what.replace(' ', "-"));
+        fs::create_dir_all(&elsewhere).unwrap();
+        make(&home);
+        point_marker_at(&fx, &profile, &home);
+        let before = describe(&home);
+
+        let err = fx
+            .engine
+            .sync_profile_links(fx.cc.as_ref(), &profile, false)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), "invalid-input", "{what}: {err}");
+        assert!(
+            err.to_string().contains(&home.display().to_string()),
+            "{what}: {err}"
+        );
+        assert_eq!(
+            describe(&home),
+            before,
+            "{what}: the outer home is untouched"
+        );
+        assert_eq!(
+            entries(&profile),
+            [MARKER_FILE],
+            "{what}: nothing was linked"
+        );
+        fs::remove_dir_all(&profile).unwrap();
+    }
 }
 
 #[test]

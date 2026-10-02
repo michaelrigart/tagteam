@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tagteam_provider::{LockError, ProviderError, ReadError};
 
@@ -133,19 +133,49 @@ pub enum EngineError {
     ProfileConflict { position: u32, label: String },
     /// §12.2: the profile holds a must-share entry as a real copy, or as a link that resolves
     /// elsewhere, where tagteam's link to the shared one belongs. Splitting memory or history
-    /// silently is never an option, so the launch refuses until the user merges the two.
-    #[error(
-        "{} is a real copy where {} should be linked; merge the two by hand, then remove the copy",
-        profile.display(),
-        shared.display()
-    )]
-    ProfileSplit { profile: PathBuf, shared: PathBuf },
+    /// silently is never an option, so the launch refuses until the user merges the two, or,
+    /// when tagteam's own link went stale under a running session, until that session ends.
+    #[error("{}", split_message(.profile, .shared, *.cause))]
+    ProfileSplit {
+        profile: PathBuf,
+        shared: PathBuf,
+        cause: SplitCause,
+    },
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
     /// reports its own `LockError::Interrupted`; `signal()` reads either.
     #[error("interrupted")]
     Interrupted(i32),
+}
+
+/// Why a profile's must-share entry is split from the shared one (§12.2), which decides what
+/// the user does about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitCause {
+    /// A real file or directory in the profile.
+    RealCopy,
+    /// A link tagteam did not make, which resolves somewhere other than the shared entry.
+    LinkElsewhere,
+    /// tagteam's own link, which no longer resolves where the shared entry does while a session
+    /// still runs in the profile: a join never changes the links a running session uses.
+    StaleWhileRunning,
+}
+
+/// `ProfileSplit`'s message, by cause.
+fn split_message(profile: &Path, shared: &Path, cause: SplitCause) -> String {
+    let (profile, shared) = (profile.display(), shared.display());
+    match cause {
+        SplitCause::RealCopy => format!(
+            "{profile} is a real copy where {shared} should be linked; merge the two by hand, then remove the copy"
+        ),
+        SplitCause::LinkElsewhere => format!(
+            "{profile} links somewhere other than {shared}, where it should link; merge the two by hand, then remove the link"
+        ),
+        SplitCause::StaleWhileRunning => format!(
+            "{profile} still links where {shared} used to be, and a session in the profile uses that link; end that session, then launch again"
+        ),
+    }
 }
 
 /// `SessionOwned`'s message: a running session, or session state that cannot be read.
@@ -386,6 +416,23 @@ mod tests {
                 EngineError::ProfileSplit {
                     profile: PathBuf::from("p"),
                     shared: PathBuf::from("s"),
+                    cause: SplitCause::RealCopy,
+                },
+                "profile-split",
+            ),
+            (
+                EngineError::ProfileSplit {
+                    profile: PathBuf::from("p"),
+                    shared: PathBuf::from("s"),
+                    cause: SplitCause::LinkElsewhere,
+                },
+                "profile-split",
+            ),
+            (
+                EngineError::ProfileSplit {
+                    profile: PathBuf::from("p"),
+                    shared: PathBuf::from("s"),
+                    cause: SplitCause::StaleWhileRunning,
                 },
                 "profile-split",
             ),
