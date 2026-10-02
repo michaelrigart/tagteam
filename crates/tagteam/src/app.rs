@@ -412,7 +412,12 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
             EXIT_SIGNAL_BASE + signal
         }
         Ended::Code(code) => {
-            if cancel.requested().is_some() && !stops_on_a_signal {
+            // A SIGPIPE is the reader leaving, not a request to stop: there is nobody to tell
+            // that the command had already finished.
+            let too_late = cancel
+                .requested()
+                .is_some_and(|signal| signal != libc::SIGPIPE);
+            if too_late && !stops_on_a_signal {
                 let _ = writeln!(
                     io.err,
                     "tagteam: interrupted too late to stop: {name} had already finished"
