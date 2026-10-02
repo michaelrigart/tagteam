@@ -223,6 +223,35 @@ fn an_unreadable_marker_leaves_the_environment_alone_and_names_the_file() {
 }
 
 #[test]
+fn a_marker_that_is_a_link_to_nothing_is_unreadable() {
+    // §4.3, §12.8: an entry at the marker's path that cannot be read leaves the outer home
+    // unknown; it is never taken for "no marker", which would make the profile the home.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let marker = profile.join(MARKER_FILE);
+    let file = fx.dir.path().join("a-file");
+    fs::write(&file, b"").unwrap();
+    for target in [fx.dir.path().join("nowhere"), file.join("inside")] {
+        fs::remove_file(&marker).unwrap();
+        symlink(&target, &marker).unwrap();
+        let env = fx.shell_env(&profile);
+        let (shell, effective) = detect_run_shell(&env, &registry(&fx));
+        assert!(
+            matches!(&shell, RunShell::Unreadable { marker: m, .. } if *m == marker),
+            "{}: {shell:?}",
+            target.display()
+        );
+        assert_eq!(effective.claude_config_dir, env.claude_config_dir);
+        let engine = fx.engine_located(env);
+        assert_eq!(
+            kind(engine.switch(fx.switch_request(&a, false))),
+            Some("run-shell-unreadable")
+        );
+    }
+}
+
+#[test]
 fn a_marker_for_another_provider_is_unreadable() {
     // Its `outer` is another provider's record, so Claude Code's outer home is unknown.
     let fx = Fx::new();

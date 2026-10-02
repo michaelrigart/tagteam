@@ -504,26 +504,34 @@ fn remove_deletes_the_item_under_the_spelling_the_marker_records() {
 
 #[test]
 fn remove_with_an_unreadable_marker_deletes_the_current_item_and_warns() {
-    // Decision 12: refusing would leave an account that cannot be removed.
-    let fx = Fx::new();
-    let a = fx.add("a@x.co", "rt-a");
-    fx.add("b@x.co", "rt-b");
-    let dir = fx.make_profile(&a);
-    let canonical = fx
-        .cc
-        .profile_spelling(&canonical_profile_path(&dir).unwrap());
-    let (svc, acct) = fx.item_for_spelling(&canonical);
-    fx.kc.put(&svc, &acct, b"x");
-    fs::write(dir.join(MARKER_FILE), "{ torn").unwrap();
-    let (result, logs) = capture_logs(|| fx.engine.remove(&a));
-    result.unwrap();
-    assert_eq!(fx.kc.get(&svc, &acct), None);
-    assert!(fs::symlink_metadata(&dir).is_err());
-    assert!(
-        logs.iter()
-            .any(|l| l.contains("WARN") && l.contains("older spelling")),
-        "{logs:?}"
-    );
+    // Decision 12: refusing would leave an account that cannot be removed. A torn marker, or
+    // a link at its path that resolves to nothing (§4.3: unreadable, never absent).
+    for torn in [true, false] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        fx.add("b@x.co", "rt-b");
+        let dir = fx.make_profile(&a);
+        let canonical = fx
+            .cc
+            .profile_spelling(&canonical_profile_path(&dir).unwrap());
+        let (svc, acct) = fx.item_for_spelling(&canonical);
+        fx.kc.put(&svc, &acct, b"x");
+        if torn {
+            fs::write(dir.join(MARKER_FILE), "{ torn").unwrap();
+        } else {
+            fs::remove_file(dir.join(MARKER_FILE)).unwrap();
+            symlink(fx.dir.path().join("nowhere"), dir.join(MARKER_FILE)).unwrap();
+        }
+        let (result, logs) = capture_logs(|| fx.engine.remove(&a));
+        result.unwrap();
+        assert_eq!(fx.kc.get(&svc, &acct), None, "torn {torn}");
+        assert!(fs::symlink_metadata(&dir).is_err(), "torn {torn}");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("WARN") && l.contains("older spelling")),
+            "torn {torn}: {logs:?}"
+        );
+    }
 }
 
 #[test]

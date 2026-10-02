@@ -101,6 +101,37 @@ fn an_unreadable_marker_refuses_every_command_but_statusline() {
 }
 
 #[test]
+fn a_marker_that_is_a_link_to_nothing_refuses_like_an_unreadable_one() {
+    // §4.3, §12.8: a dangling marker link is no absent marker, so the profile is never taken
+    // for the default home. `switch` refuses naming it; the status bar shows nothing.
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_fresh_accounts(d.path());
+    let dir = profile_dir(d.path(), &a);
+    fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(d.path().join("nowhere"), dir.join(MARKER_FILE)).unwrap();
+    let marker = dir.join(MARKER_FILE).display().to_string();
+    let out = cmd(d.path())
+        .env("CLAUDE_CONFIG_DIR", &dir)
+        .args(["switch", "1", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = json_of(&out);
+    assert_eq!(v["error"]["type"], "run-shell-unreadable", "{v}");
+    assert!(
+        v["error"]["message"].as_str().unwrap().contains(&marker),
+        "{v}"
+    );
+    cmd(d.path())
+        .env("CLAUDE_CONFIG_DIR", &dir)
+        .arg("statusline")
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+}
+
+#[test]
 fn a_run_shell_sees_the_default_home_and_refuses_account_changes() {
     // §12.8: the profile has no `.claude.json`, so a CLI that took it for the default home
     // would find no live login at all.
