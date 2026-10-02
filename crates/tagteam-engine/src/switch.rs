@@ -495,8 +495,8 @@ pub(crate) enum AutoFreshened {
     Quarantined,
     /// Transient or systemic, with what went wrong. Try the next target.
     Failed(String),
-    /// Not a candidate after all: no stored credential, or owned by a session (§12.5). Try the
-    /// next target.
+    /// Not a candidate after all: no stored credential, owned by a session, or a session
+    /// profile that conflicts with the vault (§12.5). Try the next target.
     Skip,
 }
 
@@ -1435,7 +1435,8 @@ impl Engine {
     /// §11.2 step 10 for one target, before its switch takes `MutationGuard` (§7.2): a stored
     /// token that expires within the freshen window is refreshed through the gate (§7.3),
     /// and the gate's outcome is read by the auto-switch table. A kind that does not refresh
-    /// passes as it is, so API-key targets pass. The vault is read here, lazily (§9.3).
+    /// passes as it is, so API-key targets pass. The vault is read here, lazily (§9.3), once
+    /// the target's rescues and profile are settled, as `freshen` settles them.
     pub(crate) fn freshen_auto(
         &self,
         p: &dyn Provider,
@@ -1443,6 +1444,47 @@ impl Engine {
     ) -> Result<AutoFreshened, EngineError> {
         if !p.kind_traits(&target.kind).refreshable {
             return Ok(AutoFreshened::Ready);
+        }
+        // §6.2 and §9.2 lazy capture before the due check, as in `freshen`: a quiescent profile
+        // that rotated is adopted first, so `due` judges the generation this switch will
+        // activate, which may expire sooner than the vault's older one (§7.2). The account lock
+        // is taken alone, outside `MutationGuard`, nothing under it uses the network, and it is
+        // released before the gate tries it. The row is read again under it, for the stale
+        // mark. Each outcome is read by the auto-switch table: a conflict passes the target over
+        // as the gate's `Conflict` does, and what cannot be read fails it as the gate's
+        // unreadable outcomes do. `transact` settles both again under every lock.
+        {
+            let lock = self.lock_account(&target.id)?;
+            let Some(row) = self.store()?.account(&target.id)? else {
+                return Ok(AutoFreshened::Skip);
+            };
+            match self.settle_rescues(p, &row, &lock) {
+                Ok(()) => {}
+                Err(EngineError::RescuePending { detail, .. }) => {
+                    tracing::warn!(
+                        position = row.position,
+                        account = %row.id,
+                        "a pending rescue could not be settled ({detail}); the target is passed over"
+                    );
+                    return Ok(AutoFreshened::Failed("rescue-unreadable".into()));
+                }
+                Err(EngineError::Unreadable(e)) => return Ok(AutoFreshened::Failed(e.to_string())),
+                Err(e) => return Err(e),
+            }
+            match self.apply_provenance(p, &row, &lock) {
+                Ok(ProfileCheck::Conflict) => return Ok(AutoFreshened::Skip),
+                Ok(ProfileCheck::Unreadable(detail)) => {
+                    tracing::warn!(
+                        position = row.position,
+                        account = %row.id,
+                        "the session profile could not be read ({detail}); the target is passed over"
+                    );
+                    return Ok(AutoFreshened::Failed("profile-unreadable".into()));
+                }
+                Ok(_) => {}
+                Err(EngineError::Unreadable(e)) => return Ok(AutoFreshened::Failed(e.to_string())),
+                Err(e) => return Err(e),
+            }
         }
         let vault = match self.vault.read(&target.id) {
             Read::Present(b) if !b.is_empty() => b,
@@ -1452,7 +1494,7 @@ impl Engine {
         if !self.due(p, &vault) {
             return Ok(AutoFreshened::Ready);
         }
-        // §14.1: nothing is locked yet, so a signal that has landed stops the tick before it
+        // §14.1: nothing is locked now, so a signal that has landed stops the tick before it
         // spends the target's refresh token.
         self.check_cancel()?;
         Ok(match self.refresh_stored(p, &target.id, &vault)? {

@@ -9,8 +9,9 @@ use std::fs;
 use std::sync::Mutex;
 
 use common::{
-    API_KEY, FakeFx, Fx, Recorded, crashed_switch, credential, record_reading, usage_requests,
-    usage_window, vault_fp, write_target_credential,
+    API_KEY, FakeFx, Fx, Recorded, capture_logs, crashed_switch, cred_at, credential, fp,
+    quiescent, record_reading, sent_refresh_tokens, usage_requests, usage_window, vault_fp,
+    write_target_credential,
 };
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::autoswitch::{
@@ -21,7 +22,8 @@ use tagteam_engine::Engine;
 use tagteam_engine::auto::{AutoEvent, EventSink, TickOutcome};
 use tagteam_engine::vault::SERVICE;
 use tagteam_fake::FakePaths;
-use tagteam_provider::{Keychain, Provider};
+use tagteam_provider::profile::{SEED_FILE, Seed};
+use tagteam_provider::{Keychain, Provider, Read};
 
 /// The fixture clock's start (`Fx`), in seconds.
 const T0: i64 = 1_790_000_000;
@@ -1536,43 +1538,37 @@ fn a_target_a_session_takes_after_the_snapshot_is_passed_over() {
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
 }
 
-/// §12.5: a target whose quiescent profile and vault both moved since its seed cannot be
-/// activated (§9.2 `profile-conflict`). It is not due, so no gate meets the conflict first:
-/// the switch's own lazy capture does, and the tick passes over it to the next target.
-#[test]
-fn a_conflicting_profile_target_is_passed_over() {
-    let fx = Fx::new();
+/// R3's log line: the switch's own lazy capture met a conflict and the tick moved on.
+const PASSED_OVER_AT_THE_SWITCH: &str = "trying the next target";
+
+/// A tick whose live account `c` is at 95% of its long window, so it switches proactively, with
+/// `a` (best, 20%) then `b` (50%) as its targets. Returns `(a, b)`.
+fn a_then_b(fx: &Fx) -> (AccountId, AccountId) {
     let a = fx.add("a@x.co", "rt-a");
     let b = fx.add("b@x.co", "rt-b");
     let c = fx.add("c@x.co", "rt-c"); // live
     read(&fx.engine, &a, &reading(false, 10.0, 20.0));
     read(&fx.engine, &b, &reading(false, 10.0, 50.0));
     read(&fx.engine, &c, &reading(false, 10.0, 95.0));
-    let dir = fx.make_profile(&a);
-    let epoch = fx
-        .engine
-        .store()
-        .unwrap()
-        .account(&a)
-        .unwrap()
-        .unwrap()
-        .login_epoch;
-    let seed = fx.cc.fingerprint(&credential("a@x.co", "rt-old")).unwrap();
-    fx.write_seed(&dir, epoch, seed.as_str());
-    fx.set_profile_credential(&dir, &credential("a@x.co", "rt-a2"));
-    let sink = Recorded::default();
-    let mut engine = fx
-        .engine
-        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
-        .unwrap()
-        .unwrap();
-    let (outcome, decision) = engine.tick(&sink).unwrap();
+    (a, b)
+}
+
+/// Asserts that the tick switched from `c` (position 3) to `b` (position 2), past `a`, and
+/// reported no error.
+fn switched_past_a_to_b(
+    fx: &Fx,
+    sink: &Recorded,
+    ticked: (TickOutcome, Decision),
+    a: &AccountId,
+    b: &AccountId,
+) {
+    let (outcome, decision) = ticked;
     assert_eq!(outcome, TickOutcome::Switched);
     assert_eq!(
         decision,
         Decision::Switch {
             trigger: Trigger::Proactive,
-            targets: vec![a.clone(), b],
+            targets: vec![a.clone(), b.clone()],
             recheck: false,
         }
     );
@@ -1586,5 +1582,184 @@ fn a_conflicting_profile_target_is_passed_over() {
         AutoEvent::Switch { from: 3, to: 2, .. }
     ));
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+/// §12.5: a target whose quiescent profile and vault both moved since its seed cannot be
+/// activated (§9.2 `profile-conflict`). Freshening settles the profile before it judges the
+/// token, so it finds the conflict whether or not anything is due, passes the target over
+/// (`Skip`) without attempting the switch, and sends nothing: here the profile's rotation is
+/// even due.
+#[test]
+fn a_conflicting_profile_target_is_passed_over() {
+    let fx = Fx::new();
+    let (a, b) = a_then_b(&fx);
+    quiescent(&fx, &a, "rt-old", &cred_at("rt-a2", (T0 + 60) * 1000));
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    let (ticked, logs) = capture_logs(|| engine.tick(&sink).unwrap());
+    switched_past_a_to_b(&fx, &sink, ticked, &a, &b);
+    assert!(
+        !logs.iter().any(|l| l.contains(PASSED_OVER_AT_THE_SWITCH)),
+        "freshening passed a over; no switch to it was attempted: {logs:?}"
+    );
+    assert!(sent_refresh_tokens(&fx).is_empty(), "nothing is sent");
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+}
+
+/// R3: a conflict that arises after freshening, found by the switch's own lazy capture under
+/// its locks, passes the target over too. The profile is bootstrapped and rotated (from
+/// rt-old to rt-a2, while the vault holds rt-a) once a's switch has planned.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_profile_conflict_that_arises_after_freshening_passes_the_target_over() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fx = Fx::new();
+    let (a, b) = a_then_b(&fx);
+    let dir = fx.make_profile(&a); // never bootstrapped: freshening finds nothing to apply
+    let epoch = fx
+        .engine
+        .store()
+        .unwrap()
+        .account(&a)
+        .unwrap()
+        .unwrap()
+        .login_epoch;
+    let (seed_fp, rotated) = (fp(&fx, "rt-old"), credential("a@x.co", "rt-a2"));
+    fx.engine.on_point(
+        "planned",
+        Box::new(move || {
+            Seed {
+                login_epoch: epoch,
+                seed_fp: seed_fp.clone(),
+                needs_bootstrap: false,
+            }
+            .write(&dir)
+            .unwrap();
+            let file = dir.join(".credentials.json");
+            fs::write(&file, &rotated).unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        }),
+    );
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    let (ticked, logs) = capture_logs(|| engine.tick(&sink).unwrap());
+    switched_past_a_to_b(&fx, &sink, ticked, &a, &b);
+    assert!(
+        logs.iter().any(|l| l.contains(PASSED_OVER_AT_THE_SWITCH)),
+        "{logs:?}"
+    );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+}
+
+/// §7.2 and §9.2 for an automatic switch: freshening adopts the target's profile rotation
+/// before it judges whether the token is due. The vault's rt-a is not due, but the quiescent
+/// profile's rotation rt-a2 is, so rt-a2 is captured and refreshed through the gate, and its
+/// successor is what the switch activates: never the consumed rt-a, and never an access token
+/// about to expire.
+#[test]
+fn a_targets_due_profile_rotation_is_captured_and_refreshed_before_the_switch() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &b, &reading(false, 20.0, 95.0));
+    let dir = quiescent(&fx, &a, "rt-a", &cred_at("rt-a2", (T0 + 60) * 1000));
+    fx.script_refresh(Some("rt-a3"));
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    let (outcome, decision) = engine.tick(&sink).unwrap();
+    assert_eq!(outcome, TickOutcome::Switched);
+    assert_eq!(
+        decision,
+        Decision::Switch {
+            trigger: Trigger::Proactive,
+            targets: vec![a.clone()],
+            recheck: false,
+        }
+    );
+    assert_eq!(sent_refresh_tokens(&fx), ["rt-a2"]);
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a3"));
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a3"));
+    let Read::Present(seed) = Seed::read(&dir) else {
+        panic!("the profile's seed cannot be read")
+    };
+    assert_eq!(seed.seed_fp, fp(&fx, "rt-a2"), "the capture moved the seed");
+}
+
+/// Decision 9 for an automatic switch: a target whose session profile cannot be read is not
+/// freshened, sends nothing, and is never switched to. Freshening fails it as the gate fails
+/// an unreadable profile, so with no other target the tick ends as §11.2 step 12's error.
+#[test]
+fn a_target_whose_profile_cannot_be_read_fails_freshening() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let c = fx.add("c@x.co", "rt-c"); // live, at its limit
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &c, &reading(false, 100.0, 50.0));
+    let dir = quiescent(&fx, &a, "rt-a", &credential("a@x.co", "rt-a2"));
+    fs::write(dir.join(SEED_FILE), "{").unwrap();
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    let (outcome, _) = engine.tick(&sink).unwrap();
+    assert_eq!(outcome, TickOutcome::Error);
+    assert_eq!(
+        sink.take()[1..],
+        [AutoEvent::Error {
+            provider: fx.provider(),
+            message: "could not freshen a@x.co (position 1): profile-unreadable".into(),
+            transient: true,
+        }]
+    );
+    assert!(sent_refresh_tokens(&fx).is_empty());
+    assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
+}
+
+/// §6.2 for an automatic switch: a target with a rescue that cannot be read may have a spent
+/// vault generation, so freshening fails it as the gate does (`rescue-unreadable`), even
+/// though its token is not due, and it is never switched to.
+#[test]
+fn a_target_with_an_unreadable_rescue_fails_freshening() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let c = fx.add("c@x.co", "rt-c"); // live, at its limit
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &c, &reading(false, 100.0, 50.0));
+    let path = fx.plant_rescue(&a, &vault_fp(&fx, &a), &credential("a@x.co", "rt-a-2"));
+    fs::write(&path, b"{\"format\":\"tagteam-res").unwrap();
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    let (outcome, _) = engine.tick(&sink).unwrap();
+    assert_eq!(outcome, TickOutcome::Error);
+    assert_eq!(
+        sink.take()[1..],
+        [AutoEvent::Error {
+            provider: fx.provider(),
+            message: "could not freshen a@x.co (position 1): rescue-unreadable".into(),
+            transient: true,
+        }]
+    );
+    assert!(sent_refresh_tokens(&fx).is_empty());
+    assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
 }

@@ -1770,3 +1770,53 @@ impl Fx {
         )
     }
 }
+
+/// Profile provenance (§12.5), shared by `provenance.rs` and `auto_tick.rs`.
+///
+/// `rt`'s credential for a@x.co, its access token expiring at `expires_at`.
+pub fn cred_at(rt: &str, expires_at: i64) -> Vec<u8> {
+    let mut v = Fx::credential_json("a@x.co", rt);
+    v["claudeAiOauth"]["expiresAt"] = json!(expires_at);
+    v.to_string().into_bytes()
+}
+
+/// The generation fingerprint of refresh token `rt` (§2).
+pub fn fp(fx: &Fx, rt: &str) -> String {
+    fx.cc
+        .fingerprint(&credential("a@x.co", rt))
+        .unwrap()
+        .as_str()
+        .to_owned()
+}
+
+/// A quiescent, bootstrapped profile for `id`: a marker, the account's login in its
+/// `.claude.json`, a seed of `seed_rt`'s generation under the account's current epoch, and
+/// `profile` as the credential Claude Code reads there. Returns its directory.
+pub fn quiescent(fx: &Fx, id: &AccountId, seed_rt: &str, profile: &[u8]) -> PathBuf {
+    let dir = fx.make_profile(id);
+    let epoch = fx
+        .engine
+        .store()
+        .unwrap()
+        .account(id)
+        .unwrap()
+        .unwrap()
+        .login_epoch;
+    fx.write_seed(&dir, epoch, &fp(fx, seed_rt));
+    fx.set_profile_credential(&dir, profile);
+    dir
+}
+
+/// The refresh token each token request carried, in order.
+pub fn sent_refresh_tokens(fx: &Fx) -> Vec<String> {
+    let token = Fx::endpoints().token;
+    fx.http
+        .requests()
+        .iter()
+        .filter(|r| r.method == Method::Post && r.url == token)
+        .map(|r| {
+            let body: Value = serde_json::from_slice(r.body.as_deref().unwrap()).unwrap();
+            body["refresh_token"].as_str().unwrap().to_owned()
+        })
+        .collect()
+}
