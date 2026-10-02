@@ -5,13 +5,17 @@ mod common;
 
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::Path;
+use std::sync::Mutex;
 
-use common::{API_KEY, Fx, LSTART, capture_logs, credential, due, token_requests};
+use common::{API_KEY, Fx, LSTART, capture_logs, credential, due, journal, token_requests};
 use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
 use tagteam_engine::session::SessionState;
+use tagteam_engine::switch::SwitchReason;
+use tagteam_provider::FlockGuard;
 use tagteam_provider::liveness::{FakeProcess, parse_lstart};
 use tagteam_provider::profile::{LAUNCH_DIR, MARKER_FILE, ProfileMarker, canonical_profile_path};
 use tagteam_provider::{Provider, Read};
@@ -544,4 +548,159 @@ fn a_remove_with_a_profile_leaves_the_next_switch_able_to_roll_back() {
             .unwrap()
             .is_none()
     );
+}
+
+// §9.2–§9.4: switch's session rules.
+
+/// A vault probe that starts a session for `id` (a held reservation in `profile`) the first
+/// time `id`'s vault is read: after planning has checked the account, and before freshening
+/// refreshes it.
+fn start_session_on_first_read(
+    id: &AccountId,
+    profile: &Path,
+) -> impl Fn(&str) + Send + Sync + 'static {
+    let key = id.as_str().to_owned();
+    let launch = profile.join(LAUNCH_DIR).join("4242.lock");
+    let held = Mutex::new(None);
+    move |read: &str| {
+        let mut held = held.lock().unwrap();
+        if read == key && held.is_none() {
+            *held = FlockGuard::try_lock(&launch).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_session_owned_target_is_refused_with_or_without_force() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let _held = fx.hold_reservation(&fx.make_profile(&a));
+    for force in [false, true] {
+        let err = fx.switch_to(&a, force).unwrap_err();
+        assert_eq!(err.kind(), "session-owned", "force {force}: {err}");
+        assert!(err.to_string().contains("tagteam run"), "{err}");
+    }
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert!(journal(&fx).is_none());
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[test]
+fn a_target_with_an_unreadable_session_record_is_refused() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    fx.plant_record(&dir, "torn", b"{\"pid\":");
+    assert_eq!(fx.switch_to(&a, false).unwrap_err().kind(), "session-owned");
+}
+
+#[test]
+fn a_rotation_skips_a_session_owned_candidate() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c"); // live: the walk starts after it, at a
+    let _held = fx.hold_reservation(&fx.make_profile(&a));
+    let out = fx.engine.switch(fx.rotation_request(false)).unwrap();
+    assert_eq!(out.to.map(|t| t.id), Some(b));
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+#[test]
+fn a_rotation_whose_only_alternative_is_session_owned_stays_put() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let _held = fx.hold_reservation(&fx.make_profile(&a));
+    let out = fx.engine.switch(fx.rotation_request(false)).unwrap();
+    assert_eq!(out.reason, SwitchReason::OnlyOneAccount);
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+#[test]
+fn a_session_that_starts_before_the_gate_refuses_a_direct_switch_and_sends_nothing() {
+    // §7.2's table: `Owned` by a session is §9.2's refusal.
+    let fx = Fx::new();
+    let a = due(&fx); // a inactive and due, b live
+    fx.script_refresh(Some("rt-a2"));
+    let dir = fx.make_profile(&a);
+    let engine = fx.engine_with_vault_probe(start_session_on_first_read(&a, &dir));
+    let err = engine.switch(fx.switch_request(&a, false)).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    assert_eq!(
+        token_requests(&fx),
+        0,
+        "the gate left the session's token alone"
+    );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+}
+
+#[test]
+fn a_session_that_starts_before_the_gate_makes_a_rotation_move_on() {
+    // §9.3: the rotation plans again, and its walk passes over the account a session took.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c"); // live
+    fx.expire_access(&a);
+    let dir = fx.make_profile(&a);
+    let engine = fx.engine_with_vault_probe(start_session_on_first_read(&a, &dir));
+    let out = engine.switch(fx.rotation_request(false)).unwrap();
+    assert_eq!(out.to.map(|t| t.id), Some(b));
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[cfg(feature = "test-hooks")]
+mod under_the_locks {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// Starts a session for the account whose profile is `profile` once the switch has planned,
+    /// before it takes the mutation lock. The guard is kept in `slot`.
+    fn on_planned(fx: &Fx, profile: &Path) -> Arc<Mutex<Option<FlockGuard>>> {
+        let slot: Arc<Mutex<Option<FlockGuard>>> = Arc::default();
+        let (held, launch) = (slot.clone(), profile.join(LAUNCH_DIR).join("4242.lock"));
+        fx.engine.on_point(
+            "planned",
+            Box::new(move || {
+                let mut held = held.lock().unwrap();
+                if held.is_none() {
+                    *held = FlockGuard::try_lock(&launch).unwrap();
+                }
+            }),
+        );
+        slot
+    }
+
+    #[test]
+    fn a_session_that_starts_after_planning_refuses_a_direct_switch() {
+        // §9.4 step 1.
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        fx.add("b@x.co", "rt-b");
+        let held = on_planned(&fx, &fx.make_profile(&a));
+        let err = fx.switch_to(&a, false).unwrap_err();
+        assert_eq!(err.kind(), "session-owned", "{err}");
+        assert!(
+            held.lock().unwrap().is_some(),
+            "the session started after planning"
+        );
+        assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+        assert!(journal(&fx).is_none());
+    }
+
+    #[test]
+    fn a_session_that_starts_after_planning_makes_a_rotation_plan_again() {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b");
+        fx.add("c@x.co", "rt-c"); // live: the plan picks a
+        let _held = on_planned(&fx, &fx.make_profile(&a));
+        let out = fx.engine.switch(fx.rotation_request(false)).unwrap();
+        assert_eq!(out.to.map(|t| t.id), Some(b));
+        assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    }
 }

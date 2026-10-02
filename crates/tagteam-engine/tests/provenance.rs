@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::{Fx, credential, due, prev_refresh_token, token_requests, two_accounts};
+use common::{Fx, credential, due, journal, prev_refresh_token, token_requests, two_accounts};
 use serde_json::{Value, json};
 use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
@@ -389,4 +389,139 @@ fn a_running_profile_is_never_captured() {
     ));
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
     assert_eq!(seed_of(&dir).seed_fp, fp(&fx, "rt-a"));
+}
+
+// §9.2: lazy capture and the conflict refusal in `switch`.
+
+#[test]
+fn a_switch_activates_a_rotated_profiles_generation() {
+    // §12.5 "Lazy capture" at the switch: a's token is not due, so no gate runs; the
+    // transaction adopts the profile's rotation and activates it, never the consumed rt-a.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let dir = quiescent(&fx, &a, "rt-a", &credential("a@x.co", "rt-a2"));
+    fx.switch_to(&a, false).unwrap();
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+    assert_eq!(seed_of(&dir).seed_fp, fp(&fx, "rt-a2"));
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[test]
+fn a_rotated_profile_whose_access_token_is_due_is_freshened_before_activation() {
+    // §7.2 and §9.2: the vault's rt-a is not due, but the profile's rotation rt-a2 expires
+    // within the freshen window. Lazy capture runs before the freshen decision, so the gate
+    // refreshes rt-a2 and the switch activates its successor, never an access token about
+    // to expire.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let soon = fx.clock.now_ms() + 60_000;
+    quiescent(&fx, &a, "rt-a", &cred_at("rt-a2", soon));
+    fx.script_refresh(Some("rt-a3"));
+    fx.switch_to(&a, false).unwrap();
+    assert_eq!(token_requests(&fx), 1);
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a3"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a3"));
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_replacement_between_planning_and_freshening_stale_marks_the_profile() {
+    // The plan read a's row before an explicit replacement landed. The replacement installs
+    // the seed's own generation again, so the vault equals the seed while the profile holds a
+    // rotation: judged with the planning row's epoch, that would capture the profile over the
+    // replacement. Freshen reads the row again under the account lock, sees the moved epoch,
+    // and the replacement wins (§12.5).
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tagteam_engine::store::LoginMeta;
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let dir = quiescent(&fx, &a, "rt-a", &credential("a@x.co", "rt-a2"));
+    let store = fx.engine.store().unwrap();
+    let cc = fx.cc.clone();
+    let id = a.clone();
+    let seed_fp = fp(&fx, "rt-a");
+    let once = AtomicBool::new(false);
+    fx.engine.on_point(
+        "freshen-before-lock",
+        Box::new(move || {
+            if once.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let row = store.account(&id).unwrap().unwrap();
+            let identity = cc.parse_identity(&row.identity_json).unwrap();
+            let meta = LoginMeta {
+                identity_key: &row.identity_key,
+                identity: &identity,
+                kind: &row.kind,
+                login_expires_at: row.login_expires_at,
+                from_live: false,
+            };
+            // The vault already holds rt-a: the replacement's write leaves its bytes as they
+            // are, and only the epoch moves.
+            store
+                .begin_replacement(&id, &seed_fp, &meta, false)
+                .unwrap();
+            store.finish_replacement(&id).unwrap();
+        }),
+    );
+
+    fx.switch_to(&a, false).unwrap();
+
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    assert_eq!(seed_of(&dir).seed_fp, fp(&fx, "rt-a"), "never captured");
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[test]
+fn a_switch_to_a_profile_the_vault_moved_past_activates_the_vault() {
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    quiescent(&fx, &a, "rt-old", &credential("a@x.co", "rt-old"));
+    fx.switch_to(&a, false).unwrap();
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+}
+
+#[test]
+fn a_switch_to_a_conflicting_profile_refuses_with_or_without_force() {
+    for force in [false, true] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        quiescent(&fx, &a, "rt-old", &credential("a@x.co", "rt-a2"));
+        let err = fx.switch_to(&a, force).unwrap_err();
+        assert_eq!(err.kind(), "profile-conflict", "force {force}: {err}");
+        assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+        assert!(journal(&fx).is_none());
+    }
+}
+
+#[test]
+fn a_due_target_with_a_conflicting_profile_refuses_before_any_request() {
+    // §7.2's table: freshening meets the gate's `Conflict`.
+    let fx = Fx::new();
+    let a = due(&fx);
+    quiescent(&fx, &a, "rt-old", &credential("a@x.co", "rt-a2"));
+    fx.script_refresh(Some("rt-a3"));
+    let err = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(err.kind(), "profile-conflict", "{err}");
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[test]
+fn a_switch_to_an_account_whose_profile_cannot_be_read_refuses() {
+    // Decision 9, due or not: the switch refuses before any request, at the lazy capture that
+    // precedes the freshen decision.
+    for due_now in [false, true] {
+        let fx = Fx::new();
+        let a = if due_now { due(&fx) } else { two_accounts(&fx) };
+        let dir = quiescent(&fx, &a, "rt-a", &credential("a@x.co", "rt-a2"));
+        fs::write(dir.join(SEED_FILE), "{").unwrap();
+        let err = fx.switch_to(&a, false).unwrap_err();
+        assert_eq!(err.kind(), "unreadable", "due {due_now}: {err}");
+        assert!(err.to_string().contains("position 1"), "{err}");
+        assert_eq!(token_requests(&fx), 0, "due {due_now}");
+        assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    }
 }

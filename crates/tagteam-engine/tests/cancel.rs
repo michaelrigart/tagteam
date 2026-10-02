@@ -140,24 +140,32 @@ fn ctrl_c_while_the_config_lock_is_held_ends_the_switch_and_releases_the_credent
 
 #[test]
 fn ctrl_c_while_another_process_holds_an_account_lock_ends_the_switch() {
-    let fx = Fx::new();
-    let a = fx.add("a@x.co", "rt-a");
-    fx.add("b@x.co", "rt-b");
-    let before = written(&fx);
-    // Another tagteam process's gate or vault write holds a's lock.
-    let held = AccountLock::acquire(&fx.env, &a, Duration::from_secs(1)).unwrap();
+    // Another tagteam process's gate or vault write holds an account's lock: the target's,
+    // which freshening waits for before the mutation lock (§9.2's lazy capture), or the
+    // outgoing account's, which only `lock_accounts` takes, under the mutation lock.
+    for target_held in [true, false] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b");
+        let before = written(&fx);
+        let id = if target_held { &a } else { &b };
+        let held = AccountLock::acquire(&fx.env, id, Duration::from_secs(1)).unwrap();
 
-    let (err, ran_on) = interrupted(&fx, || fx.switch_to(&a, false));
-    drop(held);
+        let (err, ran_on) = interrupted(&fx, || fx.switch_to(&a, false));
+        drop(held);
 
-    assert_interrupted(&err, ran_on);
-    assert!(matches!(err, EngineError::Lock(_)), "{err:?}");
-    assert_eq!(written(&fx), before, "nothing is written");
-    assert!(
-        cc_locks(&fx).iter().all(|l| !l.exists()),
-        "CC's locks come after the account locks: none was taken"
-    );
-    assert!(mutation_lock_free(&fx.env), "the mutation lock is released");
+        assert_interrupted(&err, ran_on);
+        assert!(
+            matches!(err, EngineError::Lock(_)),
+            "{target_held}: {err:?}"
+        );
+        assert_eq!(written(&fx), before, "nothing is written");
+        assert!(
+            cc_locks(&fx).iter().all(|l| !l.exists()),
+            "CC's locks come after the account locks: none was taken"
+        );
+        assert!(mutation_lock_free(&fx.env), "the mutation lock is released");
+    }
 }
 
 #[test]
@@ -203,8 +211,7 @@ fn ctrl_c_while_recovery_waits_for_cc_reports_the_interruption() {
 }
 
 /// §14.1: recovery's writes are a critical span. A token set while they run lets them finish
-/// and commit; the command stops at its next wait, its own mutation lock, before it changes
-/// anything else.
+/// and commit; the command stops at its next lock wait, before it changes anything else.
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_token_set_during_recovery_s_writes_lets_recovery_finish() {
@@ -224,7 +231,7 @@ fn a_token_set_during_recovery_s_writes_lets_recovery_finish() {
     assert_eq!(err.signal(), Some(SIGINT), "{err}");
     assert!(
         matches!(err, EngineError::Lock(_)),
-        "stopped at the switch's own mutation lock: {err:?}"
+        "stopped at its next lock wait: {err:?}"
     );
     assert!(journal(&fx).is_none(), "recovery committed");
     let store = fx.engine.store().unwrap();
