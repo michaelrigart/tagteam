@@ -380,3 +380,33 @@ fn the_freshen_warning_names_the_provider_that_will_refresh() {
         out.warnings
     );
 }
+
+#[test]
+fn a_fake_agent_link_sync_writes_only_its_create_only_entry() {
+    // §15.3 for the sync, through FakeAgent's own policy: `journal.log` is created empty where
+    // there was none. Nothing else of FakeAgent's home changes, and nothing of Claude Code's
+    // beside it.
+    let ffx = FakeFx::new();
+    ffx.fx.add("cc@b.co", "rt-cc");
+    let alice = ffx.fake_add("alice", "tok-a", "renew-a");
+    let home = FakePaths::resolve(&ffx.fx.env).dir;
+    fs::create_dir_all(home.join("notes")).unwrap();
+    fs::write(home.join("notes/today.txt"), "note\n").unwrap();
+    fs::write(home.join("prefs.json"), "{}\n").unwrap();
+    let profile = ffx.fx.make_profile_for(ffx.fake.as_ref(), &alice);
+    let surface = ffx.fake.identity_surface(&ffx.fx.env);
+
+    check(&ffx, &surface, "fake sync", || {
+        ffx.engine
+            .sync_profile_links(ffx.fake.as_ref(), &profile, false)
+            .unwrap();
+    });
+
+    assert_eq!(fs::read(home.join("journal.log")).unwrap(), b"");
+    assert!(
+        fs::symlink_metadata(profile.join("notes"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}

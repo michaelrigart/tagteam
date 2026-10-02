@@ -1680,6 +1680,26 @@ impl Fx {
         dir
     }
 
+    /// `id`'s profile for any provider `p` with sessions, in its place under `sessions/`, as a
+    /// first launch leaves it before its sync: `profile_dir(id)`, 0700, holding only a marker
+    /// that names `p`, `id`, the exported spelling of the canonical path (§12.2 "One spelling")
+    /// and `p`'s record of the fixture's home (§4.5 `outer_home`). No identity, no seed, nothing
+    /// running. Returns its directory.
+    pub fn make_profile_for(&self, p: &dyn Provider, id: &AccountId) -> PathBuf {
+        let dir = self.profile_dir(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        ProfileMarker {
+            provider: p.id(),
+            account_id: id.clone(),
+            config_dir: p.profile_spelling(&canonical_profile_path(&dir).unwrap()),
+            outer: p.outer_home(&self.env),
+        }
+        .write(&dir)
+        .unwrap();
+        dir
+    }
+
     /// The environment every process in `profile`'s run shell inherits (§12.8):
     /// `CLAUDE_CONFIG_DIR` names the profile and `CLAUDE_SECURESTORAGE_CONFIG_DIR` is scrubbed
     /// (§12.5); everything else is the fixture's.

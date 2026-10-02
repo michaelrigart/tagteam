@@ -127,6 +127,15 @@ pub enum EngineError {
         "position {position} ({label})'s session profile and the vault both moved since they last agreed; log in again with `tagteam add` to resolve it"
     )]
     ProfileConflict { position: u32, label: String },
+    /// §12.2: the profile holds a must-share entry as a real copy, or as a link that resolves
+    /// elsewhere, where tagteam's link to the shared one belongs. Splitting memory or history
+    /// silently is never an option, so the launch refuses until the user merges the two.
+    #[error(
+        "{} is a real copy where {} should be linked; merge the two by hand, then remove the copy",
+        profile.display(),
+        shared.display()
+    )]
+    ProfileSplit { profile: PathBuf, shared: PathBuf },
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -177,6 +186,7 @@ impl EngineError {
             EngineError::ForeignLiveCredential { .. } => "foreign-credential",
             EngineError::SessionOwned { .. } => "session-owned",
             EngineError::ProfileConflict { .. } => "profile-conflict",
+            EngineError::ProfileSplit { .. } => "profile-split",
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -346,6 +356,13 @@ mod tests {
                     label: "a".into(),
                 },
                 "profile-conflict",
+            ),
+            (
+                EngineError::ProfileSplit {
+                    profile: PathBuf::from("p"),
+                    shared: PathBuf::from("s"),
+                },
+                "profile-split",
             ),
             (EngineError::Io(io::Error::other("x")), "io"),
             (

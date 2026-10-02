@@ -552,3 +552,47 @@ fn the_comparison_allows_only_an_empty_create_only_entry_where_there_was_none() 
     let after = fx.snapshot();
     expect_violation(&fx, &before, &after, "inside", "projects/new.jsonl");
 }
+
+#[test]
+fn a_link_sync_writes_only_the_create_only_entries_outside_tagteam_s_data() {
+    // §15.3 for §12.2's sync. The profile is tagteam's own, under the data dir the walk skips,
+    // so outside it the sync may only create the create-only entries, empty, where there were
+    // none. A launch, a second launch and a join, on both platforms, through a symlinked
+    // settings.json.
+    for platform in [Platform::MacOs, Platform::Linux] {
+        let fx = Fx::with_platform(platform);
+        seed_realistic_state(&fx);
+        symlink_into_dotfiles(
+            &fx.env.home,
+            &fx.env.home.join(".claude/settings.json"),
+            false,
+        );
+        let a = fx.add("a@x.co", "rt-a");
+        fx.add("b@x.co", "rt-b");
+        let claude = fx.env.home.join(".claude");
+        std::fs::remove_dir_all(claude.join("projects")).unwrap();
+        std::fs::remove_file(claude.join("history.jsonl")).unwrap();
+        let profile = fx.make_profile_for(fx.cc.as_ref(), &a);
+        let sync = |joining: bool| {
+            fx.engine
+                .sync_profile_links(fx.cc.as_ref(), &profile, joining)
+                .unwrap();
+        };
+
+        check(&fx, "first sync", || sync(false));
+        assert!(
+            claude.join("projects").is_dir(),
+            "the sync created the must-share directory"
+        );
+        assert_eq!(std::fs::read(claude.join("history.jsonl")).unwrap(), b"");
+        check(&fx, "second sync", || sync(false));
+        check(&fx, "joining sync", || sync(true));
+        assert!(
+            std::fs::symlink_metadata(claude.join("settings.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the settings.json link itself survives"
+        );
+    }
+}
