@@ -6,7 +6,7 @@ use tagteam_core::pace::pace;
 use tagteam_core::trust::decision_grade;
 use tagteam_core::usage::{earliest_relevant_reset, is_relevant};
 use tagteam_core::{AccountId, Pace, PollBudget, ProviderId, Sample, TrustInputs, Window};
-use tagteam_provider::{Identity, KindTraits, Provider, Read};
+use tagteam_provider::{Identity, KindTraits, Provider, Read, RunShell};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -100,6 +100,12 @@ pub struct AccountView {
     pub kind: KindTraits,
     /// Its usage, from the store alone (§13.2).
     pub usage: UsageView,
+    /// Session-owned (§12.5): a live launch reservation, or a session record that is live or
+    /// cannot be read (§12.6). `list` marks it `▶`, and its row says `inSession` (§13.1,
+    /// §13.2). Computed for `list`, `status` and the account commands' results; the
+    /// statusline's view leaves it `false`, so the status bar never reads a profile directory
+    /// (§13.5).
+    pub in_session: bool,
 }
 
 /// The kind traits of a row whose provider this build does not register: nothing special.
@@ -123,6 +129,19 @@ pub enum StatusView {
     NoLogin,
     Unmanaged { email: String },
     Managed { account: AccountView, total: usize },
+}
+
+/// The run shell's own account (§12.8, §13.2's `session`), as its marker names it.
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum ShellAccount {
+    /// Not in a run shell.
+    NotInShell,
+    /// The account the marker names, as the store holds it.
+    Managed(AccountRow),
+    /// The marker names an account tagteam does not manage: the store lacks it, holds it under
+    /// another provider, or does not exist.
+    Unmanaged,
 }
 
 /// Decision 10's table; the first row that matches wins. `state` is the account's
@@ -456,23 +475,39 @@ impl Engine {
     ) -> Result<AccountView, EngineError> {
         let kind = p.kind_traits(&row.kind);
         let usage = self.usage_view(store, &row, &kind, supported, &p.poll_budget(), with_pace)?;
+        let in_session = self.in_session(p, &row);
         Ok(AccountView {
             kind,
             row,
             active,
             usage,
+            in_session,
         })
     }
 
     /// A row as the views show it, for a caller that already knows whether it is active. Its
     /// usage comes from the store; a store that cannot be read leaves it unread, logged, since
-    /// the callers report a change that has already happened.
+    /// the callers report a change that has already happened. Whether it is session-owned is
+    /// computed, as for `list`.
     pub fn account_view(&self, row: AccountRow, active: bool) -> AccountView {
-        self.account_view_with(row, active, true)
+        // A provider this build does not register has no profile it could run.
+        let in_session = self
+            .registry
+            .get(&row.provider)
+            .is_some_and(|p| self.in_session(p.as_ref(), &row));
+        self.account_view_with(row, active, true, in_session)
     }
 
-    /// `account_view`, with or without pace on its windows (see `usage_view`).
-    fn account_view_with(&self, row: AccountRow, active: bool, with_pace: bool) -> AccountView {
+    /// `account_view`, with or without pace on its windows (see `usage_view`), and with
+    /// `in_session` as the caller knows it. It is never computed here: `statusline` passes
+    /// `false`, which keeps the status bar away from profile directories (§13.5, Decision 17).
+    fn account_view_with(
+        &self,
+        row: AccountRow,
+        active: bool,
+        with_pace: bool,
+        in_session: bool,
+    ) -> AccountView {
         let provider = self.registry.get(&row.provider);
         let kind = provider
             .as_ref()
@@ -501,6 +536,54 @@ impl Engine {
             active,
             kind,
             usage,
+            in_session,
+        }
+    }
+
+    /// Whether `row` is session-owned, as `list`, `status` and the account commands mark it
+    /// (§12.5, §13.1); `statusline` never asks (Decision 17). It is computed on each call
+    /// (Decision 8): `session_state` answers `NoProfile` after one look at the
+    /// profile directory, which most accounts lack. A state that cannot be determined counts as
+    /// owned, as everywhere (§12.6), and is logged.
+    fn in_session(&self, p: &dyn Provider, row: &AccountRow) -> bool {
+        if !p.capabilities().sessions {
+            return false;
+        }
+        match self.session_state(p, row) {
+            Ok(state) => state.owned(),
+            Err(e) => {
+                tracing::warn!(
+                    position = row.position,
+                    id = %row.id,
+                    kind = e.kind(),
+                    "could not tell whether the account is in a session; marking it in session"
+                );
+                true
+            }
+        }
+    }
+
+    /// The run shell's own account (§12.8), as its marker names it: by id, from the store, with
+    /// no live-identity read and no `.claude.json` parse (§13.5). `NotInShell` outside one. A
+    /// marker naming an account the store does not hold, holds under another provider, or with
+    /// no store at all, is `Unmanaged`. An unreadable marker is the refusal every command but
+    /// `statusline` gives (§12.8).
+    pub fn shell_account(&self) -> Result<ShellAccount, EngineError> {
+        match self.run_shell() {
+            RunShell::Outside => Ok(ShellAccount::NotInShell),
+            RunShell::Unreadable { marker, detail } => Err(EngineError::RunShellUnreadable {
+                marker: marker.clone(),
+                detail: detail.clone(),
+            }),
+            RunShell::Inside { marker, .. } => {
+                let Some(store) = self.existing_store()? else {
+                    return Ok(ShellAccount::Unmanaged);
+                };
+                Ok(match store.account(&marker.account_id)? {
+                    Some(row) if row.provider == marker.provider => ShellAccount::Managed(row),
+                    Some(_) | None => ShellAccount::Unmanaged,
+                })
+            }
         }
     }
 
@@ -666,7 +749,9 @@ impl Engine {
         Ok(match row {
             // The line shows no pace, so none is computed.
             Some(row) => StatuslineView::Managed {
-                account: self.account_view_with(row, true, false),
+                // Nor does it ask whether the account is in a session: the status bar stays away
+                // from profile directories (§13.5, Decision 17).
+                account: self.account_view_with(row, true, false, false),
             },
             None => StatuslineView::Unmanaged { email: login.label },
         })

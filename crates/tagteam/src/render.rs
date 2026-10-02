@@ -678,6 +678,7 @@ pub(crate) mod testutil {
             active: false,
             kind,
             usage,
+            in_session: false,
         }
     }
 
