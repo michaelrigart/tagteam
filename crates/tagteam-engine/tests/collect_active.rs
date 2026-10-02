@@ -799,3 +799,42 @@ mod hooks {
         assert_eq!(usage_requests(&fx), 0, "the slot went back");
     }
 }
+
+#[test]
+fn a_replaced_live_login_reports_live_replaced_and_names_the_forced_switch() {
+    // §7.5 step 2, §8.1, Decision 10: §7.5 stops with `Replaced`, so nothing is refreshed or
+    // fetched; the failure is `live-replaced` (unavailable), its slot goes back, and one
+    // warning says how to activate the replacement.
+    let fx = Fx::new();
+    fx.add("b@x.co", "rt-b");
+    let a = fx.add("a@x.co", "rt-a"); // live, position 2
+    fx.replace_login(&a, &credential("a@x.co", "rt-new"), "oauth");
+    fx.rotate_live("rt-a2");
+    expire_live(&fx);
+    fx.script_refresh(Some("rt-x"));
+    fx.script_usage(200, usage_fixture());
+
+    let report = fx.collect(&[&a]);
+
+    assert_eq!(report.outcomes, [(a.clone(), failed("live-replaced"))]);
+    assert_eq!(
+        report.warnings,
+        [
+            "a@x.co (position 2)'s login was replaced while Claude Code kept the old one; run `tagteam switch 2 --force` to activate the replacement"
+        ]
+    );
+    assert!(
+        fx.http.requests().is_empty(),
+        "nothing refreshed or fetched"
+    );
+    assert_eq!(
+        usage_requests(&fx),
+        0,
+        "nothing was sent: the slot went back"
+    );
+    assert_eq!(
+        fx.usage_state(&a).unwrap().last_error.as_deref(),
+        Some("live-replaced")
+    );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-new"));
+}

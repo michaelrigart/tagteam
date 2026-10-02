@@ -8,9 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    Fx, block_rescue, prev_refresh_token, quarantine_of, rescue_files, token_requests,
+    Fx, block_rescue, failed, prev_refresh_token, quarantine_of, rescue_files, token_requests,
     unblock_rescue,
 };
+
 use serde_json::{Value, json};
 use tagteam_cc::ItemKind;
 use tagteam_core::AccountId;
@@ -18,6 +19,7 @@ use tagteam_engine::EngineError;
 use tagteam_engine::active::{ActiveOutcome, ActiveTrigger};
 use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::quarantine::QuarantineReason;
+use tagteam_engine::store::Activation;
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::http::Method;
 use tagteam_provider::{Clock, Provider};
@@ -954,4 +956,102 @@ mod hooks {
         );
         assert_eq!(token_requests(&fx), 1);
     }
+}
+
+#[test]
+fn a_stale_marked_live_store_is_replaced_never_adopted_or_refreshed() {
+    // §7.5 step 2: a's login was replaced while Claude Code kept the old one and rotated it.
+    // Step 3 would adopt that rotation over the replacement and step 5 refresh it; neither
+    // happens, for either trigger, and nothing is written.
+    let fx = Fx::new();
+    fx.add("b@x.co", "rt-b");
+    let a = fx.add("a@x.co", "rt-a");
+    fx.replace_login(&a, &cred("a@x.co", "rt-new"), "oauth");
+    fx.rotate_live("rt-a2");
+    expire_live(&fx);
+    fx.script_refresh(Some("rt-x")); // what a refresh would spend, if one were sent
+    let live = bytes(&fx.live_credential().unwrap());
+    let before = fx.kc.items();
+
+    for trigger in [
+        ActiveTrigger::Expired,
+        ActiveTrigger::Rejected {
+            access_fp: fx.cc.access_fingerprint(&live).unwrap().as_str().to_owned(),
+        },
+    ] {
+        assert_eq!(
+            active(&fx, trigger.clone()).unwrap(),
+            ActiveOutcome::Replaced,
+            "{trigger:?}"
+        );
+    }
+
+    assert_eq!(token_requests(&fx), 0);
+    assert_eq!(
+        fx.kc.items(),
+        before,
+        "neither the vault nor the live store was written"
+    );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-new"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
+}
+
+#[test]
+fn a_replacement_of_the_live_login_is_never_undone() {
+    // Review Focus 3, end to end. a's login was replaced while it was live (as `import` does
+    // it, Task 4's note), and Claude Code went on refreshing its own copy.
+    let fx = Fx::new();
+    let b = fx.add("b@x.co", "rt-b");
+    let a = fx.add("a@x.co", "rt-a"); // live, position 2
+    fx.replace_login(&a, &cred("a@x.co", "rt-new"), "oauth");
+    fx.rotate_live("rt-a2");
+    expire_live(&fx);
+
+    // §7.5: Replaced, and the vault keeps the replacement.
+    assert_eq!(
+        active(&fx, ActiveTrigger::Expired).unwrap(),
+        ActiveOutcome::Replaced
+    );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-new"));
+
+    // §8.1: the usage fetch reports it, with the command that activates the replacement.
+    let report = fx.collect(&[&a]);
+    assert_eq!(report.outcomes, [(a.clone(), failed("live-replaced"))]);
+    assert!(report.warnings[0].contains("`tagteam switch 2 --force`"));
+    assert_eq!(token_requests(&fx), 0);
+
+    // §9.4 step 4: switching away displaces Claude Code's old lineage instead of capturing it.
+    let out = fx.switch_to(&b, false).unwrap();
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-new"));
+    assert!(
+        out.warnings
+            .iter()
+            .any(|w| w.starts_with("the live credential predates position 2's replacement")),
+        "{:?}",
+        out.warnings
+    );
+    assert!(
+        fx.displaced()
+            .iter()
+            .any(|d| String::from_utf8_lossy(d).contains("rt-a2"))
+    );
+
+    // Switching back activates the replacement, and the commit clears the mark: §7.5 refreshes
+    // that lineage as usual.
+    fx.switch_to(&a, false).unwrap();
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-new"));
+    assert_eq!(
+        fx.activation(),
+        Some(Activation {
+            account: a.clone(),
+            epoch: Some(1)
+        })
+    );
+    expire_live(&fx);
+    fx.script_refresh(Some("rt-new2"));
+    assert_eq!(
+        active(&fx, ActiveTrigger::Expired).unwrap(),
+        ActiveOutcome::Refreshed
+    );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-new2"));
 }

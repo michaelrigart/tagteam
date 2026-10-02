@@ -830,6 +830,7 @@ mod tests {
             ("token-expired", TokenExpired),
             ("http-429", Unavailable),
             ("refresh-failed", Unavailable),
+            ("live-replaced", Unavailable),
         ] {
             assert_eq!(status(true, OAUTH, false, failing(error)), want, "{error}");
         }
