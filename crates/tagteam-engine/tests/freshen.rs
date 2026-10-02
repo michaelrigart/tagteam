@@ -63,6 +63,34 @@ fn a_signal_before_the_gate_sends_no_refresh_request() {
 }
 
 #[test]
+fn a_signal_after_the_target_is_settled_still_sends_no_refresh_request() {
+    // §14.1: freshening's own cancellation point, right before the gate. The token is set on
+    // the target's second vault read, the one after its account lock was taken and released
+    // (§9.2's lazy capture), so no lock wait sees it: only that point can stop the switch.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    fx.expire_access(&a);
+    fx.script_refresh(Some("rt-a-2"));
+    let cancel = fx.engine.cancel().clone();
+    let key = a.as_str().to_owned();
+    let reads = std::sync::atomic::AtomicUsize::new(0);
+    let engine = fx.engine_with_vault_probe(move |read| {
+        if read == key && reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            cancel.request(libc::SIGINT);
+        }
+    });
+
+    let err = engine.switch(fx.switch_request(&a, false)).unwrap_err();
+
+    assert!(
+        matches!(err, EngineError::Interrupted(libc::SIGINT)),
+        "{err:?}"
+    );
+    assert_eq!(token_requests(&fx), 0, "the refresh token was not spent");
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+}
+
+#[test]
 fn no_request_is_made_outside_the_window_for_a_self_switch_or_an_unrefreshable_kind() {
     // Outside the 10-minute window.
     let fx = Fx::new();
@@ -310,8 +338,9 @@ fn an_unreadable_rescue_refuses_without_a_request_and_names_the_file() {
 
 #[test]
 fn a_rescue_the_vault_cannot_adopt_refuses_with_a_detail_that_says_so() {
-    // The gate reports a failed adoption of a readable rescue as `rescue-unreadable` too
-    // (Task 10), but no file is unreadable, so the refusal must not name an empty list.
+    // Freshening settles the target's rescues under its account lock before the gate runs
+    // (§6.2), so the refusal is the settle's own, naming the file it could not adopt. No file
+    // is unreadable, so it must not name an empty list of unreadable ones.
     let fx = Fx::new();
     let a = two_accounts(&fx);
     fx.expire_access(&a);
@@ -321,10 +350,7 @@ fn a_rescue_the_vault_cannot_adopt_refuses_with_a_detail_that_says_so() {
     fx.kc.set_fail_write(SERVICE, false);
     assert_eq!(err.kind(), "rescue-pending", "{err}");
     let shown = err.to_string();
-    assert!(
-        shown.contains("a pending rescue could not be adopted"),
-        "{shown}"
-    );
+    assert!(shown.contains("could not be adopted"), "{shown}");
     assert!(
         shown.ends_with("retry once the vault can be written"),
         "{shown}"

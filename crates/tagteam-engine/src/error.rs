@@ -120,6 +120,13 @@ pub enum EngineError {
         "position {position} ({label}) is in use by a `tagteam run` session; exit that session first"
     )]
     SessionOwned { position: u32, label: String },
+    /// §9.2, §12.5: the account's quiescent session profile and the vault both moved since they
+    /// last agreed, so the vault's generation may be consumed. An explicit replacement resolves
+    /// it.
+    #[error(
+        "position {position} ({label})'s session profile and the vault both moved since they last agreed; log in again with `tagteam add` to resolve it"
+    )]
+    ProfileConflict { position: u32, label: String },
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -169,6 +176,7 @@ impl EngineError {
             EngineError::RollbackFailed { .. } => "rollback-failed",
             EngineError::ForeignLiveCredential { .. } => "foreign-credential",
             EngineError::SessionOwned { .. } => "session-owned",
+            EngineError::ProfileConflict { .. } => "profile-conflict",
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -331,6 +339,13 @@ mod tests {
                     label: "a".into(),
                 },
                 "session-owned",
+            ),
+            (
+                EngineError::ProfileConflict {
+                    position: 1,
+                    label: "a".into(),
+                },
+                "profile-conflict",
             ),
             (EngineError::Io(io::Error::other("x")), "io"),
             (

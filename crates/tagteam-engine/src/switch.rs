@@ -22,6 +22,7 @@ use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
 use crate::oracle::verdict;
+use crate::provenance::ProfileCheck;
 use crate::refresh::{GateOutcome, OwnedBy};
 use crate::rescue::RescueFile;
 use crate::store::{AccountRow, AutoRecord, EventRow, JournalRow, Store};
@@ -333,7 +334,8 @@ fn login_of(row: Option<&AccountRow>) -> Option<(&AccountId, &str, &str)> {
 
 /// A rotation candidate by the store alone (§9.3 "Reading the vault lazily"): enabled, not
 /// quarantined, and with an identity. Whether its vault holds a credential is read only when
-/// the walk reaches it.
+/// the walk reaches it. `Engine::switch_candidate` adds the session rule, and every candidate
+/// list goes through that instead.
 pub(crate) fn is_candidate(row: &AccountRow) -> bool {
     !row.disabled && row.quarantine_reason.is_none() && row.identity_json.is_object()
 }
@@ -478,8 +480,8 @@ fn already_active(target: &AccountRow) -> String {
 enum Freshened {
     /// Go ahead, with these warnings for the outcome.
     Go(Vec<String>),
-    /// A rotation's or a usage strategy's pick turned out dead and is quarantined now: plan
-    /// again; the walk skips it (§9.3).
+    /// A rotation's or a usage strategy's pick turned out dead and is quarantined now, or a
+    /// session took it since planning: plan again; the walk skips it (§9.3).
     Replan,
 }
 
@@ -514,6 +516,22 @@ fn works_until_expiry(target: &AccountRow) -> String {
         "{} (position {}) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires",
         target.label, target.position
     )
+}
+
+/// §9.2's session-owned refusal, for a target a session took after planning.
+fn session_owned(target: &AccountRow) -> EngineError {
+    EngineError::SessionOwned {
+        position: target.position,
+        label: target.label.clone(),
+    }
+}
+
+/// §9.2's refusal for a target whose profile and vault both moved (§12.5).
+fn profile_conflict(target: &AccountRow) -> EngineError {
+    EngineError::ProfileConflict {
+        position: target.position,
+        label: target.label.clone(),
+    }
 }
 
 /// §9.4 step 10: puts back what the switch wrote, in reverse order, then the journal row's
@@ -668,20 +686,35 @@ impl Engine {
         Ok((live, row))
     }
 
-    /// §9.3: the rotation's candidates in walk order, from the store alone. `None` when the
-    /// live anchor is managed and fewer than two accounts qualify (§9.2). The walk starts after
-    /// the live account when it is managed (`live_row`), even if the store's active account
-    /// disagrees (§6.1: the live identity wins). With no live login, or an unmanaged one, it
-    /// starts at the store's active account if that is a candidate, then goes on from the first
-    /// position.
+    /// §9.3: a candidate for every strategy. `is_candidate`, and not session-owned (§12.5): a
+    /// live reservation, or a live or unreadable session record. The vault is not read.
+    pub(crate) fn switch_candidate(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+    ) -> Result<bool, EngineError> {
+        Ok(is_candidate(row) && !self.session_state(p, row)?.owned())
+    }
+
+    /// §9.3: the rotation's candidates in walk order, from the store and each account's session
+    /// state (`switch_candidate`). `None` when the live anchor is managed and fewer than two
+    /// accounts qualify (§9.2). The walk starts after the live account when it is managed
+    /// (`live_row`), even if the store's active account disagrees (§6.1: the live identity
+    /// wins). With no live login, or an unmanaged one, it starts at the store's active account
+    /// if that is a candidate, then goes on from the first position.
     fn candidate_order(
         &self,
+        p: &dyn Provider,
         store: &Store,
         provider: &ProviderId,
         live_row: Option<&AccountRow>,
     ) -> Result<Option<Vec<AccountRow>>, EngineError> {
-        let accounts = store.accounts(provider)?;
-        let candidates: Vec<AccountRow> = accounts.into_iter().filter(is_candidate).collect();
+        let mut candidates = Vec::new();
+        for row in store.accounts(provider)? {
+            if self.switch_candidate(p, &row)? {
+                candidates.push(row);
+            }
+        }
         if live_row.is_some() && candidates.len() < 2 {
             return Ok(None);
         }
@@ -729,14 +762,16 @@ impl Engine {
     }
 
     /// §9.3 rotation, reading the vault lazily (`walk`). The candidates are counted from the
-    /// store: with a managed live anchor and fewer than two of them, it stays put (§9.2).
+    /// store and their session state: with a managed live anchor and fewer than two of them,
+    /// it stays put (§9.2).
     fn rotation(
         &self,
+        p: &dyn Provider,
         store: &Store,
         provider: &ProviderId,
         live_row: Option<&AccountRow>,
     ) -> Result<Rotation, EngineError> {
-        let Some(order) = self.candidate_order(store, provider, live_row)? else {
+        let Some(order) = self.candidate_order(p, store, provider, live_row)? else {
             return Ok(Rotation::Stay(SwitchReason::OnlyOneAccount, ONLY_ONE));
         };
         if let Some((row, walked)) = self.walk(order)? {
@@ -749,16 +784,17 @@ impl Engine {
     }
 
     /// Under the locks: whether the plan's rotation pick still stands, decided from the store
-    /// alone (§9.3 "under the locks only the chosen account is read again"). It does when the
-    /// pick is still a candidate and every candidate the new walk order puts before it is one
-    /// the planning walk already read and passed over.
+    /// and session state alone (§9.3 "under the locks only the chosen account is read again").
+    /// It does when the pick is still a candidate and every candidate the new walk order puts
+    /// before it is one the planning walk already read and passed over.
     fn rotation_pick_stands(
         &self,
+        p: &dyn Provider,
         store: &Store,
         plan: &Plan,
         anchor: Option<&AccountRow>,
     ) -> Result<bool, EngineError> {
-        let Some(order) = self.candidate_order(store, &plan.target.provider, anchor)? else {
+        let Some(order) = self.candidate_order(p, store, &plan.target.provider, anchor)? else {
             return Ok(false);
         };
         Ok(order
@@ -767,18 +803,20 @@ impl Engine {
             .is_some_and(|at| order[..at].iter().all(|r| plan.walked.contains(&r.id))))
     }
 
-    /// §9.3's usage strategies, planned from the store alone: the candidates are a rotation's
-    /// (`candidate_order`), each ranked by its decision-grade headroom under `models` (§8.2,
-    /// §8.4), and their vaults are read lazily in the strategy's own order (`walk`).
+    /// §9.3's usage strategies, planned from the store and session state: the candidates are a
+    /// rotation's (`candidate_order`), each ranked by its decision-grade headroom under
+    /// `models` (§8.2, §8.4), and their vaults are read lazily in the strategy's own order
+    /// (`walk`).
     fn usage_pick(
         &self,
+        p: &dyn Provider,
         store: &Store,
         provider: &ProviderId,
         live_row: Option<&AccountRow>,
         strategy: UsageStrategy,
         models: &[String],
     ) -> Result<Ranked, EngineError> {
-        let Some(order) = self.candidate_order(store, provider, live_row)? else {
+        let Some(order) = self.candidate_order(p, store, provider, live_row)? else {
             return Ok(Ranked::Stay(
                 SwitchReason::OnlyOneAccount,
                 ONLY_ONE.into(),
@@ -1024,6 +1062,7 @@ impl Engine {
     /// (§9.4 step 1). Nothing is written either way.
     fn auto_refusal(
         &self,
+        p: &dyn Provider,
         store: &Store,
         req: &SwitchRequest,
         live_row: Option<&AccountRow>,
@@ -1067,7 +1106,9 @@ impl Engine {
             }
         }
         // §11.2 step 7: switchable (a vault credential and an identity, not disabled), not
-        // quarantined, not session-owned (never, before M4).
+        // quarantined, not session-owned (§12.5). A session that took the target is a
+        // `not-candidate` no-op here, never §9.2's `session-owned` error, so the tick moves on
+        // to its next target; under the locks this answer stands until they are released.
         let Some(target) = store.account(id)?.filter(|a| a.provider == req.provider) else {
             return refuse(
                 SwitchReason::NotCandidate,
@@ -1078,6 +1119,8 @@ impl Engine {
             Some("it is disabled")
         } else if target.quarantine_reason.is_some() {
             Some("it needs a new login")
+        } else if self.session_state(p, &target)?.owned() {
+            Some("it is in a `tagteam run` session")
         } else if !self.has_login(&target)? {
             Some("it has no stored credential")
         } else {
@@ -1105,7 +1148,7 @@ impl Engine {
     ) -> Result<Planned, EngineError> {
         let strategy = strategy_of(&req.target);
         let (live, live_row) = self.live_row(p, store, &req.provider)?;
-        if let Some(refused) = self.auto_refusal(store, req, live_row.as_ref())? {
+        if let Some(refused) = self.auto_refusal(p, store, req, live_row.as_ref())? {
             return Ok(Planned::Done(refused));
         }
         let unmanaged_email = match (&live, &live_row) {
@@ -1133,13 +1176,19 @@ impl Engine {
         let mut walked = Vec::new();
         let mut notes = Vec::new();
         let target = match &req.target {
-            // A switch never crosses providers (§9.3).
-            SwitchTarget::Account(id) => store
-                .account(id)?
-                .filter(|a| a.provider == req.provider)
-                .ok_or_else(|| EngineError::NoSuchAccount(id.to_string()))?,
+            SwitchTarget::Account(id) => {
+                // A switch never crosses providers (§9.3).
+                let target = store
+                    .account(id)?
+                    .filter(|a| a.provider == req.provider)
+                    .ok_or_else(|| EngineError::NoSuchAccount(id.to_string()))?;
+                // §9.2: a session-owned target is refused, with or without --force, before its
+                // vault is read. `rederive` checks again under the locks.
+                self.refuse_session_owned(p, &target)?;
+                target
+            }
             SwitchTarget::Rotation => {
-                match self.rotation(store, &req.provider, live_row.as_ref())? {
+                match self.rotation(p, store, &req.provider, live_row.as_ref())? {
                     Rotation::To(a, passed) => {
                         walked = passed;
                         a
@@ -1157,7 +1206,7 @@ impl Engine {
                 let models = models
                     .clone()
                     .unwrap_or_else(|| self.settings().models.clone());
-                match self.usage_pick(store, &req.provider, live_row.as_ref(), *by, &models)? {
+                match self.usage_pick(p, store, &req.provider, live_row.as_ref(), *by, &models)? {
                     Ranked::To(a, said) => {
                         notes = said;
                         a
@@ -1215,9 +1264,10 @@ impl Engine {
     }
 
     /// §7.2: refreshes the plan's target through the gate when its access token is about to
-    /// expire. This runs before any lock is taken (§4.3). A rotation whose pick turns out dead
-    /// plans again from the current roster, which now skips it; every round quarantines one
-    /// more account, so the rounds are bounded by the roster.
+    /// expire. This runs before the mutation lock is taken (§4.3). A rotation whose pick turns
+    /// out dead, or that a session took, plans again from the current roster, which now skips
+    /// it; every round takes one more account out of it, so the rounds are bounded by the
+    /// roster.
     fn freshen_plan(
         &self,
         p: &dyn Provider,
@@ -1264,6 +1314,29 @@ impl Engine {
         if (plan.self_switch && !req.force) || !p.kind_traits(&target.kind).refreshable {
             return Ok(Freshened::Go(vec![]));
         }
+        // §9.2 lazy capture before the freshen decision: a quiescent profile that rotated is
+        // adopted first, so `due` judges the generation this switch will activate, which may
+        // expire sooner than the vault's older one. The target's account lock is taken alone
+        // and released before the switch takes `MutationGuard` (§4.3: no lock is taken while
+        // a later one is held), and `transact` settles the profile again under every lock.
+        // The row is read again once the lock is held: a replacement that landed since
+        // planning moved `login_epoch`, and the profile's stale mark is judged against it.
+        hooks::point(self, "freshen-before-lock")?;
+        let reread;
+        let target = {
+            let lock = self.lock_account(&target.id)?;
+            let current = |store: &Store| -> Result<AccountRow, EngineError> {
+                store
+                    .account(&target.id)?
+                    .ok_or_else(|| EngineError::NoSuchAccount(target.label.clone()))
+            };
+            let store = self.store()?;
+            let row = current(&store)?;
+            self.settle_rescues(p, &row, &lock)?;
+            self.settle_profile(p, &row, &lock)?;
+            reread = current(&store)?;
+            &reread
+        };
         let vault = self.read_target(target)?;
         let due = self.due(p, &vault);
         let chosen = req.target.chosen();
@@ -1320,7 +1393,8 @@ impl Engine {
                 return Err(pending(detail));
             }
             // Nothing was spent, or what was spent is lost either way; once the account is
-            // live, the gate leaves its refresh to CC (§7.3 step 2).
+            // live, the gate leaves its refresh to CC (§7.3 step 2). A profile that cannot be
+            // read (`profile-unreadable`) lands here too, and the transaction refuses it.
             GateOutcome::Transient { kind, .. } => {
                 Freshened::Go(vec![cannot_refresh(p.display_name(), label, &kind)])
             }
@@ -1348,19 +1422,13 @@ impl Engine {
                 label,
                 "it may be the live login",
             )]),
-            // Unreachable before M4, which introduces sessions and provenance. M4 gives these
-            // two the spec's `session-owned` and `profile-conflict` kinds (§7.2's table); until
-            // then they refuse with `invalid-input`.
-            GateOutcome::Owned(OwnedBy::Session) => {
-                return Err(EngineError::InvalidInput(format!(
-                    "{label} is in use by a `tagteam run` session; exit it first"
-                )));
-            }
-            GateOutcome::Conflict => {
-                return Err(EngineError::InvalidInput(format!(
-                    "{label}'s session profile holds a login that conflicts with the vault; refusing to activate it"
-                )));
-            }
+            // §7.2's last row, §9.2's refusals. A session that started since planning owns the
+            // target: a rotation or a usage strategy plans again, and its walk now skips it
+            // (§9.3); a direct target is refused. A conflicting profile refuses either way
+            // (§12.5).
+            GateOutcome::Owned(OwnedBy::Session) if chosen => Freshened::Replan,
+            GateOutcome::Owned(OwnedBy::Session) => return Err(session_owned(target)),
+            GateOutcome::Conflict => return Err(profile_conflict(target)),
         })
     }
 
@@ -1451,9 +1519,11 @@ impl Engine {
             return Ok(Vec::new());
         }
         self.release_unbound_quarantines(&req.provider, req.source)?;
+        // §9.3: the live account, then every switchable candidate; a session-owned account is
+        // no candidate of any strategy, so it is not collected for one.
         let mut accounts: Vec<AccountId> = live_row.into_iter().map(|r| r.id).collect();
         for row in store.accounts(&req.provider)? {
-            if is_candidate(&row) && !accounts.contains(&row.id) {
+            if !accounts.contains(&row.id) && self.switch_candidate(p, &row)? {
                 accounts.push(row.id);
             }
         }
@@ -1611,7 +1681,7 @@ impl Engine {
         let (live_identity, again) = self.live_row(p, store, &req.provider)?;
         // §9.4 step 1: an automatic switch re-checks its preconditions here, before anything is
         // written. A refusal ends the switch; it never falls through to a plan made elsewhere.
-        if let Some(refused) = self.auto_refusal(store, req, again.as_ref())? {
+        if let Some(refused) = self.auto_refusal(p, store, req, again.as_ref())? {
             return Ok(Rederived::Done(refused));
         }
         // A login that became unmanaged is §9.2's no-op; a target removed meanwhile is
@@ -1636,6 +1706,18 @@ impl Engine {
                 again,
                 None,
             )));
+        }
+        // §9.4 step 1: the target is not session-owned. Launch reservations are written under
+        // `MutationGuard` and refreshes under the account lock, both held here, so the answer
+        // stands until the locks are released. A direct target is refused (§9.2); a rotation or
+        // a usage strategy plans again, and its walk skips the account (§9.3). An automatic
+        // switch never gets here with one: `auto_refusal` above answers it `not-candidate`.
+        if self.session_state(p, &target)?.owned() {
+            return if req.target.chosen() {
+                Ok(Rederived::Replan)
+            } else {
+                Err(session_owned(&target))
+            };
         }
         // The rotation decision, recomputed from the store alone (§9.2, §9.3), including the
         // fewer-than-two case; no vault but the target's is read here. Its anchor is `again`,
@@ -1673,12 +1755,13 @@ impl Engine {
         }
         let same_pick = match req.target {
             SwitchTarget::Account(_) => true,
-            SwitchTarget::Rotation => self.rotation_pick_stands(store, plan, again.as_ref())?,
+            SwitchTarget::Rotation => self.rotation_pick_stands(p, store, plan, again.as_ref())?,
             // Decision 11: no network under the locks, so the ranking is not recomputed. The
             // pick stands while it is still a candidate and the live login is the account it
             // was ranked against; otherwise planning again ranks from the store's readings.
             SwitchTarget::Usage { .. } => {
-                is_candidate(&target) && again.as_ref().map(|r| &r.id) == plan.anchor.as_ref()
+                self.switch_candidate(p, &target)?
+                    && again.as_ref().map(|r| &r.id) == plan.anchor.as_ref()
             }
         };
         // Account-lock acquisition may have finished a pending replacement (§12.5), changing
@@ -1712,6 +1795,33 @@ impl Engine {
                 "{} has no stored credential",
                 target.label
             ))),
+        }
+    }
+
+    /// §9.2 and §12.5 "Lazy capture", under the target's account lock and after its rescues
+    /// are settled (§6.2). A quiescent profile that rotated since its seed is adopted into the
+    /// vault, so the activation that follows reads its generation. A conflict refuses, since the
+    /// vault's generation may be consumed. A profile that cannot be read refuses as an
+    /// unreadable vault does, naming the account (Decision 9).
+    fn settle_profile(
+        &self,
+        p: &dyn Provider,
+        target: &AccountRow,
+        lock: &AccountLock,
+    ) -> Result<(), EngineError> {
+        let unreadable = |source: ReadError| EngineError::UnreadableAccount {
+            position: target.position,
+            label: target.label.clone(),
+            source,
+        };
+        match self.apply_provenance(p, target, lock) {
+            Ok(ProfileCheck::Conflict) => Err(profile_conflict(target)),
+            Ok(ProfileCheck::Unreadable(detail)) => {
+                Err(unreadable(ReadError::new("its session profile", detail)))
+            }
+            Ok(_) => Ok(()),
+            Err(EngineError::Unreadable(source)) => Err(unreadable(source)),
+            Err(e) => Err(e),
         }
     }
 
@@ -1750,6 +1860,11 @@ impl Engine {
             .find(|l| l.id() == &target.id)
             .expect("the target is locked");
         self.settle_rescues(p, &target, target_lock)?;
+        // §9.2 lazy capture, after the rescues and before either branch reads the target's
+        // vault: a rotation the profile holds is the generation composed and written below. A
+        // conflict or an unreadable profile refuses before the journal row exists, so there is
+        // nothing to roll back.
+        self.settle_profile(p, &target, target_lock)?;
 
         let mut warnings = plan.notes.clone();
         warnings.extend(plan.warnings.iter().cloned());

@@ -285,7 +285,7 @@ fn ctrl_c_while_a_recovery_write_waits_for_cc_lets_the_recovery_finish() {
     assert_eq!(err.signal(), Some(libc::SIGINT), "{err}");
     assert!(
         matches!(err, EngineError::Lock(_)),
-        "stopped at the switch's own mutation lock, after recovery: {err:?}"
+        "stopped at its next lock wait, after recovery: {err:?}"
     );
     assert!(journal(&fx).is_none(), "recovery committed");
     let store = fx.engine.store().unwrap();
