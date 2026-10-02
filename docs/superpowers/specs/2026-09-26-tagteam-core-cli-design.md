@@ -1572,7 +1572,7 @@ If an email matches several orgs, or several providers, it is ambiguous:
 
 An empty alias never matches.
 
-### 10.5 `purge [--provider P] [--yes]`
+### 10.5 `purge [--provider P | --keychain-orphans] [--yes]`
 
 Deletes tagteam's data: every account of the provider, or with no `--provider`, everything
 tagteam stores. It never deletes or replaces a provider's live login. It writes the default
@@ -1628,9 +1628,15 @@ and `switch_journal`. Its `usage_requests` rows stay. They age out within the ho
 budget (§8.6) does not reset.
 
 **Without `--provider`,** purge then deletes:
-- every Keychain item of service `tagteam`, by deleting by service until none is left
-  (Appendix A.3). This catches items whose store rows are gone, as after a store deleted by
-  hand;
+- on macOS, any Keychain item of service `tagteam` that is left: one that no account of this
+  store names. Every tagteam data directory on the Mac shares the login keychain's `tagteam`
+  service, so such an item may belong to another data directory's accounts (a test store under
+  another `XDG_DATA_HOME`), or be left behind by a store deleted by hand. Purge deletes them
+  only with `--keychain-orphans`, by deleting by service until none is left (Appendix A.3), and
+  its confirmation then says that this covers every tagteam data directory on the Mac. Without
+  the flag, it probes the service (`find-generic-password -s tagteam`, attributes only) once the
+  accounts are gone, and when items remain it warns, naming the flag. `--keychain-orphans` with
+  `--provider` is a usage error: vault items name no provider;
 - `vault/` (Linux), the `rescue` path whatever it is, `displaced/`, and the atomic writer's
   temp files (§9.5) whose writer is gone, in tagteam's own directories only: one beside a CC
   file is outside the identity surface (§3), so `doctor` names it for the user to delete;
@@ -2398,7 +2404,7 @@ exactly as it would without providers.
 | `displaced [--purge ID... [--yes]]` | §6.3 |
 | `config list\|get\|set\|unset\|path` | §6.4 |
 | `doctor [--online]` | §13.6 |
-| `purge [--yes]` | Deletes tagteam's data, including the vault Keychain items and the profiles' hashed items, after a confirmation (or `--yes`). It never deletes or replaces any provider's live login. `--provider` limits it to one provider's accounts (§10.5) |
+| `purge [--keychain-orphans] [--yes]` | Deletes tagteam's data, including its accounts' vault Keychain items and the profiles' hashed items, after a confirmation (or `--yes`). It never deletes or replaces any provider's live login. `--provider` limits it to one provider's accounts; `--keychain-orphans` also deletes `tagteam` items no account names (§10.5) |
 | `completions bash\|zsh\|fish` | §13.7 |
 
 **Exit codes:** `0` OK · `1` error · `2` usage error · `130` interrupted by SIGINT (128 + the
@@ -2711,7 +2717,8 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
     as a purge that stopped part-way leaves one (§10.5), names `tagteam remove` as the fix
   - no orphaned vault items: on Linux, a `vault/` file naming no account; on macOS, any item
     of service `tagteam` while the store has no account (`find-generic-password -s tagteam`,
-    attributes only, Appendix A.3) → warn, with `tagteam purge` as the fix
+    attributes only, Appendix A.3) → warn: they may belong to another tagteam data directory on
+    this Mac, and `tagteam purge --keychain-orphans` deletes them once none uses them (§10.5)
   - quarantined accounts → warn, naming the reason, and the fix: log in, then `tagteam add`
   - `login_expires_at` within 7 days → warn
   - a pending replacement (§12.5) → warn; an unparseable `replacing_meta` → fail, with
@@ -3026,10 +3033,12 @@ file logging for the rest of the process, silently unless `--debug`, and `doctor
     started during a purge waits for it and lands in the emptied store, never in a deleted
     one. Purge refuses while an account or an orphaned profile is session-owned, inside a run
     shell, while an engine runs, and when the accounts changed after confirmation; a full
-    purge over a `rescue` file that is not a directory still finishes. A full purge leaves no `tagteam`
-    Keychain item (with the real `security` driver) and no deleted row readable in the store
-    file or its WAL, and keeps `config.toml` and the lock files. `--provider` leaves the other
-    provider's data and the usage budget alone.
+    purge over a `rescue` file that is not a directory still finishes. A full purge leaves no
+    Keychain item of its accounts and none of another data directory's, warning that the latter
+    remain; with `--keychain-orphans` it leaves no `tagteam` item (with the real `security`
+    driver). It leaves no deleted row readable in the store file or its WAL, and keeps
+    `config.toml` and the lock files. `--provider` leaves the other provider's data and the
+    usage budget alone.
   - **Doctor** (§13.6): a fixture home in each state each check reports, snapshot tested in
     human and JSON form. Against a missing data directory it creates nothing, and against any
     home it leaves every file byte-identical and asks nothing.
@@ -3292,7 +3301,7 @@ since 2.1.283.
     An over-long `-i` line truncates silently and leaves the old entry.
   - `-U` updates the item in place and preserves its access control.
 - **Delete:** `delete-generic-password -a <acct> -s <svc>`. rc 44 counts as success.
-- **Delete by service** (a full `purge`, §10.5): `delete-generic-password -s tagteam`, without
+- **Delete by service** (a full `purge` with `--keychain-orphans`, §10.5): `delete-generic-password -s tagteam`, without
   `-a`, deletes one item of that service per call and returns rc 44 once none is left
   (*inferred*; a `real_keychain` test pins it). Purge repeats it until rc 44, at most 10 000
   times, then verifies with `find-generic-password -s tagteam` (attributes only) that the
