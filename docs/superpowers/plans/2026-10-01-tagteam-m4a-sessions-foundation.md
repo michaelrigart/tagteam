@@ -1,6 +1,6 @@
 # tagteam M4a — Sessions Foundation Implementation Plan
 
-**Status:** Approved
+**Status:** In progress
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -69,6 +69,33 @@ When execution starts, these names come from M3a's merged code. The task text be
 - `live.rs`'s file-mode pin (M3a Task 7) and its storage-write lock task. Task 5's removal of the Keychain fallbacks edits the same functions: re-apply its single-item reads and the `report_item`/`remove_item` renames inside M3a's versions. Task 5 adds no lock call.
 - **Whole-function replacements** in Tasks 8–11 may land on code M3a has changed: `app::run` (signal setup), `refresh_stored` (cancellation points), and `plan`, `freshen`, `rederive` and `candidate_order` (usage strategies). Re-apply each task's delta onto M3a's version; Task 11 lists what changes for the usage strategies. `rederive`'s session re-check is an exhaustive `match` on `req.target`, so `SwitchTarget::Usage` fails to compile until it is given the rotation's `Replan`. Task 9's guard in `add_live` and `add_token`, and Task 11's insertion in `transact`, are anchored edits, so that Tasks 2, 3 and 5 can rewrite the rest of those functions first.
 - M3a's new settings keys join `every_key_is_read_from_a_full_file` beside Task 13's `share_extra`.
+
+### Execution rulings
+
+**Re-sync with M3a (2026-10-02).** `m4-run-sessions` was rebased onto `main` `7ee733b`, where M3a merged as PR #4, and every task was compared with M3a's code (`3c1f458..7ee733b`). `cargo check --workspace --all-targets` passed at the plan head `f285a93`. Most differences are line numbers and anchors, which each task's implementer receives with its task. The rulings that change what a task does:
+- **Task 4.** The `Replaced` arm goes inside M3a's `refresh_live`. `self.interruption()?` stays the first statement, and `Err(e) => Err(self.refresh_error(e))` stays the catch-all.
+- **Task 5, single-item edits.** Each edit lands inside M3a's functions, and every storage-write wrapper and ledger call stays. That covers `write_entry`, `clear_account_keys`, `remove_item`, the `write_managed_key` closure, `clear_managed_key`, and `snapshot`'s ledger block.
+- **Task 5, `places_now`.** It also reads only the one item. Otherwise an unreadable inert item would block every write.
+- **Task 5, tests.**
+  - M3a's fallback-item tests are rewritten for one item per spelling: in `storage_write.rs`, `a_switch_rolls_back_when_another_writer_changed_a_fallback_item`; in `cc/tests/live_store.rs`, the write-holds-the-lock and clear tests; `fx_with_fallback_item` is deleted.
+  - `restore_continues_…` has the operation's own clear change the item and the file.
+  - `doomed_names_everything_…` keeps M3a's one-operation-per-case structure and its pinned assertion.
+- **Task 5, `delete_verified`.** Task 5 adds a ledger-free `delete_verified(svc, acct, fence)`, split out of `remove_item`. Task 7's `delete_items` calls it, never `remove_item`, whose ledger state would block a later rollback in the same process.
+- **Task 7, carried-over code.** It keeps `Env.cancel` beside `vars`, and `LiveLockSet` and `LockError` in `tagteam-cc`'s provider imports.
+- **Tasks 7 and 9, the profile-item delete.**
+  - The delete holds CC's storage-write lock, anchored at the profile's actual directory, around that one delete, with no re-read comparison.
+  - §9.1 takes the lock "for every write or delete of a CC credential entry", and a per-config-dir `--bg` daemon may write that entry.
+  - Task 9 adds a regression test: a `remove` of an account with a profile, then a switch that fails at `after-credential`, still rolls back.
+- **Task 8.** Its `run` replacement applies to M3a's `run_command`, which returns `Ended`. M3a's `run` wrapper and its interrupted-exit mapping stay.
+- **Task 11, `rederive`.** Its session re-check uses `req.target.chosen()`: a rotation or usage pick re-plans, and a direct target refuses with `SessionOwned`.
+- **Task 11, `prepare_usage`.** M3a's `prepare_usage` builds its collection list from `switch_candidate`, since §9.3 collects only switchable candidates.
+- **Task 11, `freshen`.**
+  - `freshen` keeps M3a's lock-and-settle block, and `freshen.rs`'s rescue test asserts `contains("could not be adopted")`.
+  - Task 11 re-homes the two M3a cancellation tests its lock wait would orphan: in `cancel.rs`, with the outgoing account's lock held; in `freshen.rs`, with the token set on the target's second vault read.
+- **Task 12.** The replaced collector keeps all four of M3a's cancellation points: after the join in `collect_usage`, before reserving in `collect_one`, and both in `send_credential`.
+- **Task 14.** The `List` and `Status` arms keep `?` on `self.collect(..)`, which returns `Result` since M3a.
+- **Task 15.** The statusline branch stays `return Ended::Code(run_statusline(..))`.
+- **Test counts.** Task 6's `--lib flock` passes 8 tests, and Task 13's `--test profiles` passes 21.
 
 ## Milestones
 
