@@ -23,7 +23,8 @@ pub enum ProfileCheck {
     ReplacementWins,
     Conflict,
     /// The seed, the marker, the profile credential or the profile identity could not be read,
-    /// or the marker is missing beside a seed, or names another account or provider (Decision 9).
+    /// or the marker is missing beside a seed, or names another account or provider, or the
+    /// profile rotated but names no identity (Decision 9).
     Unreadable(String),
 }
 
@@ -56,7 +57,9 @@ impl Engine {
     /// capture or a reseed is an error: going on would make the next comparison a false
     /// `Conflict`. An unreadable vault is `EngineError::Unreadable`, which the caller reports as
     /// it reports its own vault reads. Unreadable also covers a marker that is absent beside a
-    /// seed or names another account, and a profile identity that cannot be read.
+    /// seed or names another account, a profile identity that cannot be read, and an absent
+    /// one where the table says `Capture` (Decision 9: neither ignored nor captured). An absent
+    /// identity decides nothing in any other row.
     pub(crate) fn apply_provenance(
         &self,
         p: &dyn Provider,
@@ -91,12 +94,14 @@ impl Engine {
         // §12.2: the profile's Keychain item is named from the recorded spelling, never one
         // derived again; its files are read in `profile`, where the profile is now.
         let spelling = marker.config_dir.as_str();
-        match p.profile_identity(&self.env, &profile) {
-            Read::Present(login) if !identity_drifted(&login, row) => {}
-            // Another account's login, or none to compare: the profile is ignored (§12.5).
-            Read::Present(_) | Read::Absent => return Ok(ProfileCheck::NotApplicable),
+        let identity_absent = match p.profile_identity(&self.env, &profile) {
+            Read::Present(login) if !identity_drifted(&login, row) => false,
+            // Another account's login: the profile is ignored (§12.5).
+            Read::Present(_) => return Ok(ProfileCheck::NotApplicable),
+            // None to compare. Only a capture needs one (below).
+            Read::Absent => true,
             Read::Unreadable(e) => return Ok(unreadable(&e)),
-        }
+        };
         let held = match p.read_profile_credential(&self.env, &profile, spelling) {
             Read::Present(c) if c.provenance() == Provenance::Degraded => {
                 return Ok(ProfileCheck::Unreadable(format!(
@@ -121,44 +126,54 @@ impl Engine {
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         };
         let stale = seed.login_epoch != row.login_epoch;
-        Ok(
-            match provenance(p_fp.as_str(), v_fp.as_str(), &seed.seed_fp, stale) {
-                ProvenanceVerdict::InStep { reseed } => {
-                    if reseed {
-                        Seed {
-                            seed_fp: v_fp.as_str().to_owned(),
-                            ..seed
-                        }
-                        .write(&profile)?;
-                    }
-                    ProfileCheck::InStep
-                }
-                ProvenanceVerdict::Capture => {
-                    self.persist_generation(p, row, lock, &held)?;
+        let verdict = provenance(p_fp.as_str(), v_fp.as_str(), &seed.seed_fp, stale);
+        // Decision 9: by its provenance the profile rotated the vault's generation, but no
+        // identity says the rotation is the account's. Capturing it would be a guess, and
+        // ignoring it would let the gate send the generation it consumed. No other row needs
+        // the identity: in step, the vault moved on and a replacement wins, the profile holds
+        // no rotation of the vault's generation, and a conflict stops everything anyway.
+        if identity_absent && verdict == ProvenanceVerdict::Capture {
+            return Ok(ProfileCheck::Unreadable(format!(
+                "{} holds a rotated login but names no identity, so it cannot be told to be the account's",
+                profile.display()
+            )));
+        }
+        Ok(match verdict {
+            ProvenanceVerdict::InStep { reseed } => {
+                if reseed {
                     Seed {
-                        seed_fp: p_fp.as_str().to_owned(),
+                        seed_fp: v_fp.as_str().to_owned(),
                         ..seed
                     }
                     .write(&profile)?;
-                    tracing::info!(
-                        position = row.position,
-                        account = %row.id,
-                        "captured the session profile's rotated login into the vault"
-                    );
-                    ProfileCheck::Captured
                 }
-                ProvenanceVerdict::VaultMovedOn => ProfileCheck::VaultMovedOn,
-                ProvenanceVerdict::ReplacementWins => ProfileCheck::ReplacementWins,
-                ProvenanceVerdict::Conflict => {
-                    tracing::warn!(
-                        position = row.position,
-                        account = %row.id,
-                        "the session profile and the vault both moved since they last agreed; nothing is captured or refreshed until `tagteam add` replaces the login"
-                    );
-                    ProfileCheck::Conflict
+                ProfileCheck::InStep
+            }
+            ProvenanceVerdict::Capture => {
+                self.persist_generation(p, row, lock, &held)?;
+                Seed {
+                    seed_fp: p_fp.as_str().to_owned(),
+                    ..seed
                 }
-            },
-        )
+                .write(&profile)?;
+                tracing::info!(
+                    position = row.position,
+                    account = %row.id,
+                    "captured the session profile's rotated login into the vault"
+                );
+                ProfileCheck::Captured
+            }
+            ProvenanceVerdict::VaultMovedOn => ProfileCheck::VaultMovedOn,
+            ProvenanceVerdict::ReplacementWins => ProfileCheck::ReplacementWins,
+            ProvenanceVerdict::Conflict => {
+                tracing::warn!(
+                    position = row.position,
+                    account = %row.id,
+                    "the session profile and the vault both moved since they last agreed; nothing is captured or refreshed until `tagteam add` replaces the login"
+                );
+                ProfileCheck::Conflict
+            }
+        })
     }
 }
 
