@@ -260,16 +260,27 @@ fn inside_a_run_shell_auto_refuses_unless_it_is_a_dry_run() {
         .args(["enable", "1"])
         .assert()
         .success();
-    // The session's own config dir holds no login of the default home's.
+    // A dry run is not refused: it runs a tick. What it reads there (the default home's login
+    // or the session's own) is §12.8's (M4) to settle, so only that it ran is pinned.
     let out = in_shell(&["--once", "--dry-run", "--json"]);
-    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
-    assert_eq!(
-        events(&out.stdout),
-        [
-            json!({"schemaVersion": 1, "event": "no-switch", "ts": "[ts]", "provider": "claude-code",
-                   "reason": "no-active-account", "detail": ""})
-        ]
+    assert_ne!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert_ne!(
+        serde_json::from_slice::<Value>(&out.stdout).ok(),
+        Some(
+            json!({"schemaVersion": 1, "error": {"type": "inside-run-shell",
+               "message": "this command cannot run inside a `tagteam run` session"}})
+        )
     );
+    let ticks = events(&out.stdout);
+    assert_eq!(ticks.len(), 1, "{}", text(&out.stdout));
+    assert!(
+        ["no-switch", "switch"].contains(&ticks[0]["event"].as_str().unwrap()),
+        "{}",
+        ticks[0]
+    );
+    if ticks[0]["event"] == "switch" {
+        assert_eq!(ticks[0]["dryRun"], json!(true));
+    }
     assert_eq!(live_email(d.path()), "b@x.co");
 }
 
