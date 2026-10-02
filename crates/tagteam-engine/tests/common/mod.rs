@@ -17,6 +17,7 @@ use tagteam_engine::auto::{AutoEvent, EventSink};
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
+use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{
     Activation, Eligibility, JournalRow, LoginMeta, NewAccount, Reserve, Store,
@@ -26,6 +27,7 @@ use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBacke
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::http::Method;
+use tagteam_provider::profile::{ProfileMarker, RunShell, canonical_profile_path, profile_path};
 use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{
     Cancel, Clock, Credential, Env, FakeClock, FakeKeychain, Identity, IdentitySurface,
@@ -322,6 +324,7 @@ impl Fx {
             http: http.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings: Settings::default(),
+            run_shell: RunShell::Outside,
         });
         Fx {
             dir,
@@ -749,6 +752,17 @@ impl Fx {
 
     /// A second engine over this fixture's provider and clock, as another tagteam process.
     fn engine_over(&self, env: Env, vault: Vault, oracle: Arc<dyn Oracle>) -> Engine {
+        self.engine_in(env, RunShell::Outside, vault, oracle)
+    }
+
+    /// `engine_over`, for a process that stands where `run_shell` says (§12.8).
+    fn engine_in(
+        &self,
+        env: Env,
+        run_shell: RunShell,
+        vault: Vault,
+        oracle: Arc<dyn Oracle>,
+    ) -> Engine {
         Engine::new(EngineConfig {
             env,
             registry: ProviderRegistry::new().with(self.cc.clone()),
@@ -758,6 +772,7 @@ impl Fx {
             http: self.http.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings: Settings::default(),
+            run_shell,
         })
     }
 
@@ -1138,6 +1153,7 @@ impl FakeFx {
             default_provider: ProviderId::new(CLAUDE_CODE),
             http: fx.http.clone(),
             settings: Settings::default(),
+            run_shell: RunShell::Outside,
         });
         FakeFx { fx, fake, engine }
     }
@@ -1314,6 +1330,7 @@ impl Fx {
             http,
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings,
+            run_shell: RunShell::Outside,
         })
     }
 }
@@ -1576,4 +1593,63 @@ pub fn record_reading(
         next_poll_at,
     };
     assert!(store.record_usage(&r, windows, at, &plan, 180).unwrap());
+}
+
+/// Session profiles (§12.2) and the run shells they make (§12.8).
+impl Fx {
+    /// `<data_dir>/sessions/<id>`: where `run` puts `id`'s profile (§5).
+    pub fn profile_dir(&self, id: &AccountId) -> PathBuf {
+        profile_path(&self.env, id)
+    }
+
+    /// Writes `id`'s profile marker into `dir`, created 0700 if absent, as a first launch from
+    /// `outer`'s home would (§12.2): `configDir` is `dir`'s canonical spelling, and `outer` is
+    /// Claude Code's record of that home.
+    pub fn write_marker(&self, dir: &Path, id: &AccountId, outer: &Env) -> ProfileMarker {
+        fs::create_dir_all(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let marker = ProfileMarker {
+            provider: self.provider(),
+            account_id: id.clone(),
+            config_dir: self
+                .cc
+                .profile_spelling(&canonical_profile_path(dir).unwrap()),
+            outer: self.cc.outer_home(outer),
+        };
+        marker.write(dir).unwrap();
+        marker
+    }
+
+    /// `id`'s profile in its place under `sessions/`, launched from the fixture's own home: a
+    /// marker, and the account's login as the profile's `oauthAccount` (§12.4). Nothing runs in
+    /// it and it has no seed. Returns its directory.
+    pub fn make_profile(&self, id: &AccountId) -> PathBuf {
+        let dir = self.profile_dir(id);
+        self.write_marker(&dir, id, &self.env);
+        let row = self.engine.store().unwrap().account(id).unwrap().unwrap();
+        fs::write(
+            dir.join(".claude.json"),
+            json!({"oauthAccount": row.identity_json}).to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The environment every process in `profile`'s run shell inherits (§12.8):
+    /// `CLAUDE_CONFIG_DIR` names the profile and `CLAUDE_SECURESTORAGE_CONFIG_DIR` is scrubbed
+    /// (§12.5); everything else is the fixture's.
+    pub fn shell_env(&self, profile: &Path) -> Env {
+        let mut env = self.env.clone();
+        env.claude_config_dir = Some(profile.as_os_str().to_owned());
+        env.claude_securestorage_config_dir = None;
+        env
+    }
+
+    /// An engine for a process whose environment is `env`, located as the CLI locates one:
+    /// `detect_run_shell` decides the run shell and the environment the engine runs on (§12.8).
+    pub fn engine_located(&self, env: Env) -> Engine {
+        let registry = ProviderRegistry::new().with(self.cc.clone());
+        let (run_shell, env) = detect_run_shell(&env, &registry);
+        self.engine_in(env, run_shell, self.keychain_vault(), self.oracle.clone())
+    }
 }

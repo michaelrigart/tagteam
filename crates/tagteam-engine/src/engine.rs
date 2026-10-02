@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tagteam_core::{AccountId, ProviderId};
+use tagteam_provider::profile::RunShell;
 use tagteam_provider::{Cancel, Clock, Env, Http, MutationGuard, Provider, ProviderError, Read};
 
 use crate::account_lock::AccountLock;
@@ -24,6 +25,8 @@ pub struct EngineConfig {
     pub default_provider: ProviderId,
     /// `config.toml` as read for this command (§6.4).
     pub settings: Settings,
+    /// §12.8, from `detect_run_shell`; `env` is already the effective (outer) environment.
+    pub run_shell: RunShell,
 }
 
 pub struct Engine {
@@ -35,6 +38,8 @@ pub struct Engine {
     pub(crate) http: Arc<dyn Http>,
     pub(crate) default_provider: ProviderId,
     pub(crate) settings: Settings,
+    /// Where this process stands (§12.8).
+    pub(crate) run_shell: RunShell,
     store: Mutex<Option<Arc<Store>>>,
     #[cfg(feature = "test-hooks")]
     pub(crate) fail_at: Mutex<Option<&'static str>>,
@@ -54,6 +59,7 @@ impl Engine {
             http: cfg.http,
             default_provider: cfg.default_provider,
             settings: cfg.settings,
+            run_shell: cfg.run_shell,
             store: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
             fail_at: Mutex::new(None),
@@ -108,6 +114,12 @@ impl Engine {
         self.http.as_ref()
     }
 
+    /// Where this process stands (§12.8): outside a run shell, inside one (`env` is then the
+    /// outer home its marker records), or under a marker that cannot be read.
+    pub fn run_shell(&self) -> &RunShell {
+        &self.run_shell
+    }
+
     fn store_path(&self) -> PathBuf {
         self.env.data_dir().join("tagteam.db")
     }
@@ -145,11 +157,16 @@ impl Engine {
             .ok_or_else(|| EngineError::UnknownProvider(id.to_string()))
     }
 
+    /// §12.8: commands that change accounts or the live login refuse inside a run shell, and
+    /// under a marker that cannot be read, which the refusal names.
     pub(crate) fn refuse_inside_run_shell(&self) -> Result<(), EngineError> {
-        if self.env.inside_run_shell() {
-            Err(EngineError::InsideRunShell)
-        } else {
-            Ok(())
+        match &self.run_shell {
+            RunShell::Outside => Ok(()),
+            RunShell::Inside { .. } => Err(EngineError::InsideRunShell),
+            RunShell::Unreadable { marker, detail } => Err(EngineError::RunShellUnreadable {
+                marker: marker.clone(),
+                detail: detail.clone(),
+            }),
         }
     }
 
@@ -352,6 +369,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use tagteam_core::AccountId;
+    use tagteam_provider::profile::ProfileMarker;
     use tagteam_provider::{FakeKeychain, Identity, ProcessStamp};
 
     use super::*;
@@ -369,6 +387,7 @@ mod tests {
             http: Arc::new(tagteam_provider::NoHttp),
             default_provider: ProviderId::new("p"),
             settings: Settings::default(),
+            run_shell: RunShell::Outside,
         }
     }
 
@@ -459,5 +478,43 @@ mod tests {
             engine.settle_or_refuse(&provider),
             Err(EngineError::InterruptedSwitch(_))
         ));
+    }
+
+    #[test]
+    fn refuse_inside_run_shell_follows_the_three_states() {
+        let d = tempfile::tempdir().unwrap();
+        let with = |run_shell: RunShell| {
+            Engine::new(EngineConfig {
+                run_shell,
+                ..test_config(Env::for_test(d.path()))
+            })
+        };
+        assert!(with(RunShell::Outside).refuse_inside_run_shell().is_ok());
+        let inside = RunShell::Inside {
+            profile: PathBuf::from("/p"),
+            marker: ProfileMarker {
+                provider: ProviderId::new("p"),
+                account_id: AccountId::from_string("a"),
+                config_dir: "/p".into(),
+                outer: serde_json::json!({}),
+            },
+        };
+        let engine = with(inside.clone());
+        assert_eq!(engine.run_shell(), &inside);
+        assert!(matches!(
+            engine.refuse_inside_run_shell(),
+            Err(EngineError::InsideRunShell)
+        ));
+        let err = with(RunShell::Unreadable {
+            marker: PathBuf::from("/p/.tagteam-profile.json"),
+            detail: "not JSON".into(),
+        })
+        .refuse_inside_run_shell()
+        .unwrap_err();
+        assert_eq!(err.kind(), "run-shell-unreadable");
+        assert_eq!(
+            err.to_string(),
+            "the run-shell marker /p/.tagteam-profile.json cannot be read (not JSON)"
+        );
     }
 }

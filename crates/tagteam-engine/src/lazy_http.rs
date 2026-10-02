@@ -43,6 +43,7 @@ mod tests {
     use tagteam_cc::live::{LiveStore, Platform};
     use tagteam_core::{CLAUDE_CODE, ProviderId};
     use tagteam_provider::http::{Method, NoHttp, ScriptedHttp};
+    use tagteam_provider::profile::RunShell;
     use tagteam_provider::{Clock, Env, FakeClock, FakeKeychain};
 
     use super::*;
@@ -135,6 +136,7 @@ mod tests {
             http,
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings: Settings::default(),
+            run_shell: RunShell::Outside,
         });
         assert!(matches!(
             engine.status(&ProviderId::new(CLAUDE_CODE)).unwrap(),

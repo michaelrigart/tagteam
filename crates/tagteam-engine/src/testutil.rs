@@ -9,6 +9,7 @@ use tagteam_cc::ClaudeCode;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_provider::http::NoHttp;
+use tagteam_provider::profile::RunShell;
 use tagteam_provider::{Env, FakeClock, FakeKeychain, Identity, Provider};
 
 use crate::account_lock::AccountLock;
@@ -54,6 +55,7 @@ impl T {
             http: Arc::new(NoHttp),
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings: Settings::default(),
+            run_shell: RunShell::Outside,
         });
         T {
             _dir: dir,
