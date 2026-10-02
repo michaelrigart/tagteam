@@ -1769,6 +1769,29 @@ impl Fx {
             record_json(pid, "interactive").as_bytes(),
         )
     }
+
+    /// Writes `profile`'s `.claude.json` with `email`'s `oauthAccount`, where Claude Code reads
+    /// the profile's identity (§12.5). `make_profile` already wrote the stored row's own login
+    /// there; this replaces it.
+    pub fn set_profile_identity(&self, profile: &Path, email: &str) {
+        fs::write(
+            profile.join(".claude.json"),
+            json!({"oauthAccount": Self::oauth_account(email)}).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// What Claude Code's profile credential holds, if anything: the profile's hashed Keychain
+    /// item on macOS (`profile_item`), `<profile>/.credentials.json` on Linux.
+    pub fn profile_credential(&self, profile: &Path) -> Option<Vec<u8>> {
+        match self.platform {
+            Platform::MacOs => {
+                let (svc, acct) = self.profile_item(profile);
+                self.kc.get(&svc, &acct)
+            }
+            Platform::Linux => fs::read(profile.join(".credentials.json")).ok(),
+        }
+    }
 }
 
 /// Profile provenance (§12.5), shared by `provenance.rs` and `auto_tick.rs`.
