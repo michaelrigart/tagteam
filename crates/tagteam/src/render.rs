@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use tagteam_cc::usage::format_iso8601;
 use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind};
-use tagteam_engine::store::AccountRow;
+use tagteam_engine::store::{AccountRow, Mapping};
 use tagteam_engine::switch::SwitchOutcome;
 use tagteam_engine::views::{
     AccountView, NO_DATA, ProviderAccounts, ShellAccount, StatusView, UsageStatus, UsageView,
@@ -10,6 +10,7 @@ use tagteam_provider::SecretStore;
 use unicode_width::UnicodeWidthStr;
 
 const NO_ACCOUNTS: &str = "No accounts yet. Log in with `claude`, then run `tagteam add`.\n";
+const NO_MAPPINGS: &str = "No mappings yet. Map a directory with `tagteam map ACCOUNT [PATH]`.\n";
 /// Claude Code reloads a credentials-file change on its next message (Appendix A.3).
 const FILE_STORE_HINT: &str = "Active on your next message.";
 /// Claude Code caches Keychain reads for 30 s (Appendix A.3).
@@ -684,6 +685,48 @@ pub fn account_json(account: &AccountView, created: Option<bool>, usage: RenderU
         v["created"] = json!(c);
     }
     v
+}
+
+/// One mapping (§12.7) and the account it names, as `map` reports it. `addedAt` is ISO 8601
+/// UTC, as `history`'s times are.
+pub fn mapping_json(m: &Mapping, account: &AccountRow) -> Value {
+    let mut o = json!({
+        "path": m.path,
+        "provider": m.provider.as_str(),
+        "number": account.position,
+        "id": account.id.as_str(),
+        "email": email(account),
+        "addedAt": format_iso8601(m.added_at.div_euclid(1000)),
+    });
+    if let Some(a) = &account.alias {
+        o["alias"] = json!(a);
+    }
+    o
+}
+
+/// `map`'s list.
+pub fn mappings_json(rows: &[(Mapping, AccountRow)]) -> Value {
+    let mappings: Vec<Value> = rows.iter().map(|(m, a)| mapping_json(m, a)).collect();
+    json!({"schemaVersion": 1, "mappings": mappings})
+}
+
+/// `map`'s list in text: one line per mapping, in path order. The provider shows only when the
+/// mappings span more than one, so a single provider looks as it would without providers
+/// (§13.1).
+pub fn mappings_human(rows: &[(Mapping, AccountRow)]) -> String {
+    let Some((first, _)) = rows.first() else {
+        return NO_MAPPINGS.to_owned();
+    };
+    let several = rows.iter().any(|(m, _)| m.provider != first.provider);
+    rows.iter()
+        .map(|(m, a)| {
+            if several {
+                format!("{}  {}  {}  {}\n", m.path, m.provider, a.position, name(a))
+            } else {
+                format!("{}  {}  {}\n", m.path, a.position, name(a))
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1656,6 +1699,58 @@ mod tests {
             ),
             "Live: a@x.co (position 1 of 3)\n  unavailable (pre-send, retry <1m)\n",
             "outside a run shell, as before"
+        );
+    }
+
+    #[test]
+    fn a_mapping_line_names_the_provider_only_when_several_are_mapped() {
+        let row = |position, email: &str| {
+            view(position, email, OAUTH, unread(UsageStatus::Ok, None, None)).row
+        };
+        let mapping = |path: &str, account: &AccountRow| Mapping {
+            path: path.into(),
+            provider: account.provider.clone(),
+            account_id: account.id.clone(),
+            added_at: NOW * 1000,
+        };
+        let (a, b) = (row(1, "a@x.co"), row(2, "b@x.co"));
+        let one = [
+            (mapping("/w", &a), a.clone()),
+            (mapping("/x", &b), b.clone()),
+        ];
+        assert_eq!(mappings_human(&one), "/w  1  a@x.co\n/x  2  b@x.co\n");
+        let mut f = row(1, "f@x.co");
+        f.provider = ProviderId::new("fake-agent");
+        let two = [
+            (mapping("/w", &a), a.clone()),
+            (mapping("/w", &f), f.clone()),
+        ];
+        assert_eq!(
+            mappings_human(&two),
+            "/w  claude-code  1  a@x.co\n/w  fake-agent  1  f@x.co\n"
+        );
+        assert_eq!(mappings_human(&[]), NO_MAPPINGS);
+    }
+
+    #[test]
+    fn a_mapping_s_json_names_its_account_and_when_it_was_made() {
+        let mut a = view(1, "a@x.co", OAUTH, unread(UsageStatus::Ok, None, None)).row;
+        let m = Mapping {
+            path: "/w".into(),
+            provider: a.provider.clone(),
+            account_id: a.id.clone(),
+            added_at: NOW * 1000 + 999,
+        };
+        let expected = json!({"path": "/w", "provider": "claude-code", "number": 1,
+                              "id": "id-1", "email": "a@x.co", "addedAt": "2026-09-21T14:13:20Z"});
+        assert_eq!(mapping_json(&m, &a), expected);
+        a.alias = Some("work".into());
+        let mut aliased = expected.clone();
+        aliased["alias"] = json!("work");
+        assert_eq!(mapping_json(&m, &a), aliased);
+        assert_eq!(
+            mappings_json(&[(m, a)]),
+            json!({"schemaVersion": 1, "mappings": [aliased]})
         );
     }
 }
