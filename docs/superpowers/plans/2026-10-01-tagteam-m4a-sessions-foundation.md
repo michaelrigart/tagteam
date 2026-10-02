@@ -104,6 +104,21 @@ When execution starts, these names come from M3a's merged code. The task text be
   - the path is removed as a link, and the row then goes.
 - **`add_token` keeps refusing while the live identity is unreadable**, even for a new account (Task 2, Decision 18).
 
+**Rulings during Tasks 10–17:**
+- **R4, amended (Task 11).** `freshen_auto` takes the target's account lock alone and settles its rescues and profile before its due check, as `freshen` does: §7.2's "freshen before activation" holds for auto switches too. A conflict skips the target; an unreadable profile or rescue fails it.
+- **`statusline --provider <unknown>` under an unreadable marker (Task 15)** exits 1 with `unknown provider`, as outside a run shell. §12.8's "prints nothing" concerns the account to show, and the configured status-bar command passes no flag.
+
+**Rulings from the final whole-branch review (2026-10-02):**
+- **The active-token refresh runs inside a run shell** (§12.8, B.57). Only an unreadable marker refuses it; `auto` keeps its own refusal.
+- **The profile-item delete takes the profile's own credential locks, then CC's storage-write lock around each delete**, when the profile path is a real directory (§9.1).
+- **`SessionOwned` carries `unreadable`.** A refusal that rests on an unreadable reservation or record names the file and why.
+- **A profile path that is not a directory has no reservations and no records.** A regular file there no longer blocks `remove` for good.
+- **`probe_lock` takes a shared lock**, so two probes never see each other as the holder. A launcher's exclusive lock still reads as held.
+- **An absent profile identity next to a seed stops the gate only where the provenance verdict would be `Capture`.** That is the one row where refreshing the vault would send a consumed token. A seeded profile after `/logout`, or before M4b writes its `.claude.json`, is not stuck.
+- **`remove`, and `add` over an occupied position, refuse with `profile-split`** when a must-share entry in the profile is a real copy or a link to somewhere else, before anything is deleted. §12.2's "real history is never deleted silently" wins over §10.3's directory delete.
+- **`ProfileSplit` carries a `SplitCause`**, and its message fits it: a real copy, a link to somewhere else, or tagteam's own link gone stale. A looping or file-crossed link resolves to nothing, and a source home that is not a directory refuses as `invalid-input`.
+- **The effective `Env` restores `vars["CLAUDE_CONFIG_DIR"]`** with the outer home.
+
 **Rebase onto M3b and the release pipeline (2026-10-02).** After Task 9, Michael asked for the branch to be rebased onto `main` at `c6329e1`. That point includes M3b (PR #5) and the release pipeline (PR #3). The conflicts were resolved keeping both sides:
 - `commit_switch` carries both M3b's record and the activation epoch.
 - §15.4 takes M5's text.
@@ -550,8 +565,9 @@ pub trait Provider: Send + Sync {
     fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>;
     /// §10.3: deletes the agent-owned credential items for `spelling` and verifies them gone
     /// (CC macOS: the hashed Keychain item; otherwise nothing outside the directory). `dir` is the
-    /// profile's actual directory: CC's storage-write lock is anchored there, and taken around
-    /// each delete when `dir` is a real directory (execution ruling, Task 7).
+    /// profile's actual directory: when it is a real directory, the profile's own credential locks
+    /// are taken there, then CC's storage-write lock around each delete (execution rulings, Task 7
+    /// and the final review's F2). Never call it while holding either.
     fn delete_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Result<(), ProviderError>;
     /// §13.5: whether `env` is a process this agent started (CC: `CLAUDECODE` or `CLAUDE_CONFIG_DIR`).
     fn invoked_by(&self, env: &Env) -> bool;
@@ -599,7 +615,7 @@ pub(crate) fn profile_paths(env: &Env, dir: &Path) -> CcPaths;
 - `launch_command` is `"claude"`, and `session_dir_var` is `Some("CLAUDE_CONFIG_DIR")`.
 - `read_profile_credential` is `LiveStore::read_credential(&profile_env(env, spelling), &profile_paths(env, dir))`: the item named from the recorded spelling, then the file in `dir` (Decision 19).
 - `profile_identity` is `config::live_identity(&profile_paths(env, dir))`.
-- `delete_profile_credential` is `LiveStore::delete_items(&profile_env(env, spelling), &profile_paths(env, dir))`: Task 5's ledger-free `delete_verified` on the OAuth and managed-key items, each verified with the existence probe and held under CC's storage-write lock when `dir` is a real directory. On Linux it is a no-op.
+- `delete_profile_credential` is `LiveStore::delete_items(&profile_env(env, spelling), &profile_paths(env, dir))`: Task 5's ledger-free `delete_verified` on the OAuth and managed-key items, each verified with the existence probe. When `dir` is a real directory, the profile's own credential locks are held throughout and CC's storage-write lock around each delete. On Linux it is a no-op.
 - `invoked_by` is `env.var("CLAUDECODE") == Some("1") || session_dir(env).is_some()`.
 
 ### `tagteam-fake`
