@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::Platform;
+use tagteam_core::autoswitch::Strategy;
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Window};
 use tagteam_engine::collect::CollectMode;
 use tagteam_engine::lazy_http::LazyHttp;
@@ -13,7 +14,7 @@ use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::net::UreqHttp;
 use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::registry::ProviderRegistry;
-use tagteam_engine::settings::{ColorMode, Settings};
+use tagteam_engine::settings::{ColorMode, Settings, parse_bool};
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
@@ -23,9 +24,12 @@ use tagteam_provider::http::Http;
 use tagteam_provider::security::SecurityCli;
 use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
 
-use crate::cli::{Cli, Command, StrategyArg};
+use crate::auto::{
+    AutoError, AutoFlags, AutoRun, HumanSink, JsonSink, ThreadSleeper, uniform_jitter,
+};
+use crate::cli::{AutoStrategyArg, Cli, Command, StrategyArg};
 use crate::prompt::Prompter;
-use crate::{history, prompt, render, root_guard, statusline};
+use crate::{auto, history, prompt, render, root_guard, statusline};
 
 /// §13.1.
 pub(crate) const EXIT_ERROR: i32 = 1;
@@ -44,6 +48,10 @@ const KIND_UNMANAGED_ACCOUNT: &str = "unmanaged-account";
 const KIND_NO_LIVE_LOGIN: &str = "no-live-login";
 /// A provider without the capability a command needs (§4.5).
 const KIND_UNSUPPORTED: &str = "unsupported";
+/// §11.1: every provider `auto` would drive has its engine running in another process.
+const KIND_ENGINE_RUNNING: &str = "engine-running";
+/// `auto` found no provider with two switchable accounts.
+const KIND_NO_CANDIDATES: &str = "no-candidates";
 /// §14.1, Decision 4: every interruption, whichever carrier holds its signal.
 pub(crate) const KIND_INTERRUPTED: &str = "interrupted";
 
@@ -59,6 +67,10 @@ const NO_LIVE_LOGIN: &str =
 const CSV_AND_JSON: &str = "--csv and --json are two output formats; pass one";
 const BAD_SINCE: &str = "--since takes a span like 14d, 12h or 30m";
 const STATUSLINE_UNDER_JSON: &str = "statusline prints a line of text; run it without --json";
+const NOTHING_TO_SWITCH: &str =
+    "auto-switch needs two switchable accounts on a provider; add another with `tagteam add`";
+const BAD_THRESHOLD: &str = "--threshold takes a number from 50 to 99.9";
+const BAD_INCLUDE: &str = "--include-api-key-accounts takes true, false, 1, 0, yes or no";
 
 const NO_COLOR: &str = "NO_COLOR";
 const FORCE_COLOR: &str = "FORCE_COLOR";
@@ -263,6 +275,66 @@ fn model_list(arg: &str) -> Vec<String> {
         .collect()
 }
 
+/// `auto`'s flags as the loop takes them (§11.4); each is clamped there (§6.4). clap reads `nan`
+/// and `inf` as numbers, so `--threshold` must be finite. `--include-api-key-accounts` takes
+/// §6.4's booleans.
+fn auto_flags(
+    threshold: Option<f64>,
+    interval: Option<i64>,
+    cooldown: Option<i64>,
+    strategy: Option<AutoStrategyArg>,
+    model: Option<String>,
+    include_api_key_accounts: Option<String>,
+) -> Result<AutoFlags, Failure> {
+    if threshold.is_some_and(|t| !t.is_finite()) {
+        return Err(Failure::Usage(BAD_THRESHOLD.into()));
+    }
+    let include_api_key_accounts = match include_api_key_accounts.as_deref() {
+        Some(v) => Some(parse_bool(v).ok_or_else(|| Failure::Usage(BAD_INCLUDE.into()))?),
+        None => None,
+    };
+    Ok(AutoFlags {
+        threshold,
+        interval_s: interval,
+        cooldown_s: cooldown,
+        strategy: strategy.map(|s| match s {
+            AutoStrategyArg::Best => Strategy::Best,
+            AutoStrategyArg::ConsumeFirst => Strategy::ConsumeFirst,
+        }),
+        models: model.as_deref().map(model_list),
+        include_api_key_accounts,
+    })
+}
+
+/// A provider's display name, or its ID for one this build does not register.
+fn display_name(engine: &Engine, provider: &ProviderId) -> String {
+    engine
+        .provider(provider)
+        .map_or_else(|_| provider.to_string(), |p| p.display_name().to_owned())
+}
+
+/// How `auto` fails as a command, each provider named by `name`. Consume-first named for a
+/// provider without a long window is a usage error, exit 2, as every bad flag value is (§4.5).
+fn auto_failure(e: AutoError, name: &dyn Fn(&ProviderId) -> String) -> Failure {
+    match e {
+        AutoError::AlreadyRuns(providers) => {
+            let names: Vec<String> = providers.iter().map(name).collect();
+            Failure::Message(
+                KIND_ENGINE_RUNNING,
+                format!("auto-switch already runs for {}", names.join(", ")),
+            )
+        }
+        AutoError::NothingToSwitch => {
+            Failure::Message(KIND_NO_CANDIDATES, NOTHING_TO_SWITCH.into())
+        }
+        AutoError::NoLongWindow(p) => Failure::Usage(format!(
+            "--strategy consume-first needs a long usage window to rank by, and {} has none",
+            name(&p)
+        )),
+        AutoError::Engine(e) => e.into(),
+    }
+}
+
 /// Whether a colour variable (`NO_COLOR`, `FORCE_COLOR`) is in force: set to a non-empty value
 /// (no-color.org, force-color.org). An empty one is as good as unset.
 fn is_set(value: Option<OsString>) -> bool {
@@ -331,6 +403,8 @@ enum Ended {
 pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     let json = cli.json;
     let name = cli.command.as_ref().map_or("list", command_name);
+    // §11.4: a signal is how the `auto` loop ends, so it is never too late for it.
+    let stops_on_a_signal = matches!(cli.command, Some(Command::Auto { once: false, .. }));
     let cancel = ctx.env.cancel.clone();
     match run_command(cli, ctx, io) {
         Ended::Interrupted(signal) => {
@@ -338,7 +412,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
             EXIT_SIGNAL_BASE + signal
         }
         Ended::Code(code) => {
-            if cancel.requested().is_some() {
+            if cancel.requested().is_some() && !stops_on_a_signal {
                 let _ = writeln!(
                     io.err,
                     "tagteam: interrupted too late to stop: {name} had already finished"
@@ -403,7 +477,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     };
     let result = unlocked.and_then(|()| app.dispatch(command));
     match result {
-        Ok(()) => Ended::Code(0),
+        Ok(code) => Ended::Code(code),
         Err(Failure::Engine(e)) => match e.signal() {
             Some(signal) => Ended::Interrupted(signal),
             None => Ended::Code(fail(app.io, json, e.kind(), &e.to_string())),
@@ -431,6 +505,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Move { .. } => "move",
         Command::History { .. } => "history",
         Command::Statusline { .. } => "statusline",
+        Command::Auto { .. } => "auto",
     }
 }
 
@@ -643,7 +718,8 @@ impl App<'_, '_> {
         }
     }
 
-    fn dispatch(&mut self, command: Command) -> Result<(), Failure> {
+    /// Runs `command` and returns its exit code: 0, except for `auto` (§11.4).
+    fn dispatch(&mut self, command: Command) -> Result<i32, Failure> {
         match command {
             Command::List => {
                 // §8.3: every listed account is offered to the collector, which fetches only
@@ -795,8 +871,56 @@ impl App<'_, '_> {
                 csv,
             } => self.history(account, window, &since, csv)?,
             Command::Statusline { .. } => unreachable!("run answers statusline before dispatch"),
+            Command::Auto {
+                once,
+                dry_run,
+                threshold,
+                interval,
+                cooldown,
+                strategy,
+                model,
+                include_api_key_accounts,
+            } => {
+                let flags = auto_flags(
+                    threshold,
+                    interval,
+                    cooldown,
+                    strategy,
+                    model,
+                    include_api_key_accounts,
+                )?;
+                return self.auto(AutoRun {
+                    provider: self.provider_flag.clone(),
+                    flags,
+                    once,
+                    dry_run,
+                });
+            }
         }
-        Ok(())
+        Ok(0)
+    }
+
+    /// §11: `auto`. Like every command that changes the live login it refuses inside a run
+    /// shell, except with `--dry-run` (§11.1); `run_command` has run the Keychain check. Events
+    /// go to stdout as human lines or JSONL (§11.4), warnings and errors to stderr.
+    fn auto(&mut self, run: AutoRun) -> Result<i32, Failure> {
+        if !run.dry_run && self.engine.env().inside_run_shell() {
+            return Err(EngineError::InsideRunShell.into());
+        }
+        let several = auto::providers(&self.engine, run.provider.as_ref())?.len() > 1;
+        let color = self.color();
+        let engine = &self.engine;
+        let now_ms = || engine.now_ms();
+        let names = |p: &ProviderId| display_name(engine, p);
+        let Io { out, err, .. } = &mut *self.io;
+        let ended = if self.json {
+            let sink = JsonSink::new(&mut **out, &now_ms);
+            auto::run_loop(engine, &run, &sink, &ThreadSleeper, &mut uniform_jitter)
+        } else {
+            let sink = HumanSink::new(&mut **out, &mut **err, &now_ms, &names, color, several);
+            auto::run_loop(engine, &run, &sink, &ThreadSleeper, &mut uniform_jitter)
+        };
+        ended.map_err(|e| auto_failure(e, &names))
     }
 
     /// §10.2's token source: `-` reads one line from stdin; none prompts without echo, and
@@ -1093,7 +1217,7 @@ mod tests {
     #[test]
     fn the_late_notice_names_each_command_as_it_is_typed() {
         use clap::Parser;
-        let cases: [&[&str]; 14] = [
+        let cases: [&[&str]; 15] = [
             &["list"],
             &["ls"],
             &["status"],
@@ -1108,6 +1232,7 @@ mod tests {
             &["move", "1", "2"],
             &["history"],
             &["statusline"],
+            &["auto"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))
@@ -1142,6 +1267,25 @@ mod tests {
         assert_eq!(
             usage_strategy(StrategyArg::NextAvailable),
             UsageStrategy::NextAvailable
+        );
+    }
+
+    #[test]
+    fn consume_first_named_for_a_provider_without_a_long_window_is_a_usage_error() {
+        // §4.5. FakeAgent names no long window; `run_loop` refuses the combination before any
+        // engine starts, and the command exits 2 in the usage error's shape.
+        use tagteam_fake::FakeAgent;
+        use tagteam_provider::Provider;
+        let fake = FakeAgent::new();
+        assert_eq!(fake.primary_long_window(), None);
+        let name = |_: &ProviderId| fake.display_name().to_owned();
+        let Failure::Usage(message) = auto_failure(AutoError::NoLongWindow(fake.id()), &name)
+        else {
+            panic!("not a usage error");
+        };
+        assert_eq!(
+            message,
+            "--strategy consume-first needs a long usage window to rank by, and FakeAgent has none"
         );
     }
 }

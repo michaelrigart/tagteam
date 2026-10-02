@@ -773,6 +773,38 @@ fn the_unlock_offer_never_blocks_a_non_interactive_caller() {
 }
 
 #[test]
+fn auto_checks_the_keychain_before_its_first_tick_a_dry_run_too() {
+    // §11.1 and Appendix A.3. With no store there is nothing to switch between, so no check
+    // runs and nothing prompts (Scripted panics on a prompt it has no answer for).
+    let h = H::new();
+    h.kc.set_locked(true);
+    let (code, out, err) = h.run(&["auto", "--once"], &mut Scripted::answering(&[]));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            1,
+            "",
+            "tagteam: auto-switch needs two switchable accounts on a provider; add another with `tagteam add`\n"
+        )
+    );
+    h.kc.set_locked(false);
+    h.login("a@x.co", "rt-a");
+    h.ok(&["add"]);
+    h.login("b@x.co", "rt-b");
+    h.ok(&["add"]);
+    h.kc.set_locked(true);
+    for args in [&["auto", "--once"][..], &["auto", "--once", "--dry-run"]] {
+        let (code, out, err) = h.run(args, &mut Scripted::none());
+        assert_eq!(
+            (code, out.as_str(), err),
+            (1, "", format!("tagteam: {LOCKED}\n")),
+            "{args:?}"
+        );
+    }
+    assert_eq!(h.kc.unlock_attempts(), 0);
+}
+
+#[test]
 fn with_no_store_switch_and_remove_run_no_lock_check() {
     // A fresh machine: there is nothing to activate or delete, so a locked keychain neither
     // refuses nor prompts (Scripted panics on a prompt it has no answer for).
