@@ -85,6 +85,11 @@ pub struct Settings {
     pub statusline_format: String,
     /// `ui.color`.
     pub color: ColorMode,
+    /// `run.share_extra`: entry names of the source home a profile shares besides the
+    /// provider's allowlist (§6.4, §12.2). The provider's own table first. A name that is not
+    /// an entry name (`is_share_name`) is dropped here with a warning; the link sync drops a
+    /// known-private one, also with a warning.
+    pub share_extra: Vec<String>,
 }
 
 impl Default for Settings {
@@ -101,8 +106,15 @@ impl Default for Settings {
             history_retention_days: DEFAULT_HISTORY_RETENTION_DAYS,
             statusline_format: DEFAULT_STATUSLINE_FORMAT.to_owned(),
             color: ColorMode::Auto,
+            share_extra: Vec::new(),
         }
     }
+}
+
+/// One entry of the source home, as `run.share_extra` names it: not empty, not `.` or `..`,
+/// and without a `/`. A dot inside a name is fine.
+pub(crate) fn is_share_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
 }
 
 impl Settings {
@@ -226,6 +238,59 @@ impl<'a> Reader<'a> {
         }
         None
     }
+
+    /// `run.share_extra` (§6.4): the first of `tables`, most specific first, that holds the
+    /// key. Its value is a name or a list of names; any other value warns, and the next table
+    /// is tried. Within a list, an item that is not a string, or not an entry name
+    /// (`is_share_name`), warns, naming it, and is dropped; the rest stand, and a repeated name
+    /// collapses into its first.
+    fn share_extra(&mut self, tables: &[&[&str]]) -> Vec<String> {
+        for path in tables {
+            let Some(table) = self.table(path) else {
+                continue;
+            };
+            let Some(item) = table.get("share_extra") else {
+                continue;
+            };
+            let dotted = path
+                .iter()
+                .copied()
+                .chain(["share_extra"])
+                .collect::<Vec<_>>()
+                .join(".");
+            let items: Vec<Option<&str>> = match (item.as_str(), item.as_array()) {
+                (Some(one), _) => vec![Some(one)],
+                (None, Some(list)) => list.iter().map(|v| v.as_str()).collect(),
+                (None, None) => {
+                    self.warn(format!(
+                        "{}: `{dotted}` must be an entry name or a list of entry names (ignored)",
+                        self.path
+                    ));
+                    continue;
+                }
+            };
+            let mut names: Vec<String> = Vec::new();
+            for item in items {
+                match item {
+                    Some(name) if is_share_name(name) => {
+                        if !names.iter().any(|n| n == name) {
+                            names.push(name.to_owned());
+                        }
+                    }
+                    Some(name) => self.warn(format!(
+                        "{}: `{dotted}` entry {name:?} is not an entry name of the source home (ignored)",
+                        self.path
+                    )),
+                    None => self.warn(format!(
+                        "{}: `{dotted}` holds an item that is not a string (ignored)",
+                        self.path
+                    )),
+                }
+            }
+            return names;
+        }
+        Vec::new()
+    }
 }
 
 fn from_document(doc: &DocumentMut, path: &str, provider: &ProviderId) -> (Settings, Vec<String>) {
@@ -237,8 +302,10 @@ fn from_document(doc: &DocumentMut, path: &str, provider: &ProviderId) -> (Setti
     };
     let global_autoswitch: &[&str] = &["autoswitch"];
     let global_statusline: &[&str] = &["statusline"];
+    let global_run: &[&str] = &["run"];
     let provider_autoswitch = ["provider", provider.as_str(), "autoswitch"];
     let provider_statusline = ["provider", provider.as_str(), "statusline"];
+    let provider_run = ["provider", provider.as_str(), "run"];
 
     let autoswitch: &[&[&str]] = &[&provider_autoswitch[..], global_autoswitch];
 
@@ -348,6 +415,7 @@ fn from_document(doc: &DocumentMut, path: &str, provider: &ProviderId) -> (Setti
             parse_color,
         )
         .unwrap_or(defaults.color);
+    let share_extra = reader.share_extra(&[&provider_run[..], global_run]);
 
     let settings = Settings {
         threshold,
@@ -361,6 +429,7 @@ fn from_document(doc: &DocumentMut, path: &str, provider: &ProviderId) -> (Setti
         history_retention_days,
         statusline_format,
         color,
+        share_extra,
     };
     (settings, reader.warnings)
 }
