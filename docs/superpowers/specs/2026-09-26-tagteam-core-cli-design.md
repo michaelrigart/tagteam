@@ -1917,9 +1917,9 @@ spelling is recorded in the profile marker, and every operation on the profile's
 one derived again. The spelling names only the item: the profile's files, `.credentials.json`
 and `.claude.json` among them, are always found in the profile's actual directory, which is
 what `<profile>` means everywhere in this spec. Once the data directory has moved, that
-directory is no longer at the spelling. A profile whose canonical path no longer matches its recorded spelling,
-because the data directory moved, needs a bootstrap (§12.3), which also deletes the item under
-the old spelling.
+directory is no longer at the spelling. A profile whose canonical path no longer matches its
+recorded spelling, because the data directory moved, needs a bootstrap (§12.3), which also
+deletes the item under the old spelling.
 
 **Profile marker.** `<profile>/.tagteam-profile.json` holds `{"format": "tagteam-profile",
 "version": 1, "provider", "accountId", "configDir", "outer"}`. `configDir` is the exported
