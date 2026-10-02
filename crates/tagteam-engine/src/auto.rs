@@ -496,10 +496,10 @@ impl AutoEngine<'_> {
                 },
                 Err(e) if fatal(&e) => return Err(e),
                 // §12.5: the target's quiescent profile and its vault both moved, so nothing of
-                // it can be activated until an explicit replacement resolves it. A target that
-                // is due meets the conflict at freshening, a gate `Conflict` and so `Skip`; one
-                // that is not meets it in the switch's lazy capture. Either way it is passed over
-                // for the next target, never an error that ends the tick.
+                // it can be activated until an explicit replacement resolves it. Freshening
+                // finds a conflict that is already there (`Skip`); this is one that arose since,
+                // found by the switch's own lazy capture under its locks. Either way it is
+                // passed over for the next target, never an error that ends the tick.
                 Err(EngineError::ProfileConflict { .. }) => {
                     tracing::warn!(
                         position = row.position,

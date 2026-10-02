@@ -4,56 +4,24 @@
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use common::{Fx, credential, due, journal, prev_refresh_token, token_requests, two_accounts};
+use common::{
+    Fx, cred_at, credential, due, fp, journal, prev_refresh_token, quiescent, sent_refresh_tokens,
+    token_requests, two_accounts,
+};
 use serde_json::{Value, json};
 use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
 use tagteam_engine::refresh::GateOutcome;
-use tagteam_provider::http::Method;
 use tagteam_provider::profile::{
     MARKER_FILE, ProfileMarker, SEED_FILE, Seed, canonical_profile_path,
 };
 use tagteam_provider::{Clock, Provider, Read};
 
-/// `rt`'s credential for a@x.co, its access token expiring at `expires_at`.
-fn cred_at(rt: &str, expires_at: i64) -> Vec<u8> {
-    let mut v = Fx::credential_json("a@x.co", rt);
-    v["claudeAiOauth"]["expiresAt"] = json!(expires_at);
-    v.to_string().into_bytes()
-}
-
 fn expires_at(bytes: &[u8]) -> i64 {
     let v: Value = serde_json::from_slice(bytes).unwrap();
     v["claudeAiOauth"]["expiresAt"].as_i64().unwrap()
-}
-
-/// The generation fingerprint of refresh token `rt` (§2).
-fn fp(fx: &Fx, rt: &str) -> String {
-    fx.cc
-        .fingerprint(&credential("a@x.co", rt))
-        .unwrap()
-        .as_str()
-        .to_owned()
-}
-
-/// A quiescent, bootstrapped profile for `id`: a marker, the account's login in its
-/// `.claude.json`, a seed of `seed_rt`'s generation under the account's current epoch, and
-/// `profile` as the credential Claude Code reads there. Returns its directory.
-fn quiescent(fx: &Fx, id: &AccountId, seed_rt: &str, profile: &[u8]) -> PathBuf {
-    let dir = fx.make_profile(id);
-    let epoch = fx
-        .engine
-        .store()
-        .unwrap()
-        .account(id)
-        .unwrap()
-        .unwrap()
-        .login_epoch;
-    fx.write_seed(&dir, epoch, &fp(fx, seed_rt));
-    fx.set_profile_credential(&dir, profile);
-    dir
 }
 
 /// An explicit replacement that landed since `id`'s profile was bootstrapped: the account's
@@ -81,20 +49,6 @@ fn gate(fx: &Fx, id: &AccountId) -> GateOutcome {
     fx.engine
         .refresh_stored(fx.cc.as_ref(), id, &snapshot)
         .unwrap()
-}
-
-/// The refresh token each token request carried, in order.
-fn sent_refresh_tokens(fx: &Fx) -> Vec<String> {
-    let token = Fx::endpoints().token;
-    fx.http
-        .requests()
-        .iter()
-        .filter(|r| r.method == Method::Post && r.url == token)
-        .map(|r| {
-            let body: Value = serde_json::from_slice(r.body.as_deref().unwrap()).unwrap();
-            body["refresh_token"].as_str().unwrap().to_owned()
-        })
-        .collect()
 }
 
 /// A way to make a profile unreadable, applied to its directory.
@@ -395,8 +349,9 @@ fn a_running_profile_is_never_captured() {
 
 #[test]
 fn a_switch_activates_a_rotated_profiles_generation() {
-    // §12.5 "Lazy capture" at the switch: a's token is not due, so no gate runs; the
-    // transaction adopts the profile's rotation and activates it, never the consumed rt-a.
+    // §12.5 "Lazy capture" at the switch: a's token is not due, so no gate runs. Freshening
+    // adopts the profile's rotation under a's account lock, before it judges whether the token
+    // is due, and the switch activates it, never the consumed rt-a.
     let fx = Fx::new();
     let a = two_accounts(&fx);
     let dir = quiescent(&fx, &a, "rt-a", &credential("a@x.co", "rt-a2"));
@@ -422,6 +377,44 @@ fn a_rotated_profile_whose_access_token_is_due_is_freshened_before_activation() 
     assert_eq!(token_requests(&fx), 1);
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a3"));
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a3"));
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_pick_made_under_the_mutation_lock_activates_its_profiles_rotation() {
+    // §9.2 lazy capture in the transaction itself. A pick made again under the mutation lock
+    // is never freshened (§4.3: no network there), so only the transaction's own capture keeps
+    // the consumed rt-a from being activated. The rotation first picks x; a session takes x
+    // once the switch has planned, so under the locks it plans again and picks a, whose
+    // quiescent profile rotated to rt-a2.
+    use std::sync::Mutex;
+    use tagteam_provider::FlockGuard;
+    use tagteam_provider::profile::LAUNCH_DIR;
+
+    let fx = Fx::new();
+    let x = fx.add("x@x.co", "rt-x");
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("c@x.co", "rt-c"); // live: the walk starts after it, at x
+    let dir = quiescent(&fx, &a, "rt-a", &credential("a@x.co", "rt-a2"));
+    let launch = fx.make_profile(&x).join(LAUNCH_DIR).join("4242.lock");
+    let held = Mutex::new(None);
+    fx.engine.on_point(
+        "planned",
+        Box::new(move || {
+            let mut held = held.lock().unwrap();
+            if held.is_none() {
+                *held = FlockGuard::try_lock(&launch).unwrap();
+            }
+        }),
+    );
+
+    let out = fx.engine.switch(fx.rotation_request(false)).unwrap();
+
+    assert_eq!(out.to.map(|t| t.id), Some(a.clone()));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+    assert_eq!(seed_of(&dir).seed_fp, fp(&fx, "rt-a2"));
+    assert!(sent_refresh_tokens(&fx).is_empty(), "nothing is sent");
 }
 
 #[cfg(feature = "test-hooks")]
