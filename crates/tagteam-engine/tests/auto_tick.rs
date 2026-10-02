@@ -517,6 +517,58 @@ fn a_re_check_that_cannot_refresh_a_reading_is_stale_usage() {
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
 }
 
+/// Decision 2: the re-check skips a reading at most 180 s old when it begins, so the decision
+/// after it judges freshness from then. The re-check below takes 10 s on the fixture clock, in
+/// which the target's 175 s old reading turns 185 s old.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_reading_the_re_check_skipped_stays_fresh_for_the_decision_after_it() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    let soon = vec![
+        usage_window("5h", WindowKind::Short, 10.0, SHORT_RESETS),
+        usage_window("7d", WindowKind::Long, 30.0, T0 + 86_400),
+    ];
+    record_reading(&fx.engine, &a, &soon, T0 - 175, T0 + 100);
+    record_reading(
+        &fx.engine,
+        &b,
+        &reading(false, 10.0, 50.0),
+        T0 - 200,
+        T0 + 100,
+    );
+    fx.script_usage(200, common::usage_fixture());
+    // Only b is re-fetched, so only b's reservation passes the hook. The pause lets a's
+    // thread, which is not re-fetched, check its reading before the clock moves.
+    let clock = fx.clock.clone();
+    fx.engine.on_point(
+        "usage-reserved",
+        Box::new(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            clock.advance_ms(10_000);
+        }),
+    );
+    let config = AutoConfig {
+        strategy: Strategy::ConsumeFirst,
+        ..cfg(fx.cc.as_ref())
+    };
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), config, false)
+        .unwrap()
+        .unwrap();
+    let (outcome, decision) = engine.tick(&sink).unwrap();
+    assert_eq!(
+        common::usage_bearers(&fx),
+        ["at-rt-b"],
+        "only b was re-fetched"
+    );
+    assert_eq!(outcome, TickOutcome::Switched, "{decision:?}");
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+}
+
 #[test]
 fn a_target_the_re_check_left_stale_is_never_switched_to() {
     // Decision 2: a was read just now, b 200 s ago. The re-check sends for b alone and gets no
