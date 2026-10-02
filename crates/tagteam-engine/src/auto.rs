@@ -19,7 +19,7 @@ use tagteam_provider::{FlockGuard, LockError, ProcessStamp, Provider};
 use crate::collect::{CollectMode, CollectReport, Collected};
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::store::{AccountRow, Store};
+use crate::store::{AccountRow, Store, backoff_holds};
 use crate::switch::{AutoFreshened, AutoPerform, SwitchReason, SwitchRequest, SwitchTarget};
 
 /// Where a tick's events go (Decision 6). The CLI renders them as human lines or as JSONL.
@@ -265,16 +265,25 @@ impl AutoEngine<'_> {
         self.cfg = cfg;
     }
 
-    /// When the live account can next be fetched: the later of its planned poll and its usage
-    /// lease's expiry, since a lease outlives its record (§8.3) and a tick that wakes inside it
-    /// cannot fetch. `None` before a tick has seen a managed live account, or when it has no
-    /// plan; a store that cannot be read is `None` too.
+    /// When the live account can next be fetched: the latest of its planned poll, its usage
+    /// lease's expiry and its failure backoff, since a lease outlives its record (§8.3) and a
+    /// tick that wakes inside any of them cannot fetch. A backoff that no legal schedule
+    /// reaches is ignored, as reserving ignores it (§8.4). `None` before a tick has seen a
+    /// managed live account, or when it has no plan; a store that cannot be read is `None`
+    /// too.
     pub fn active_next_poll_at(&self) -> Option<i64> {
         let id = self.live.as_ref()?;
         let store = self.engine.existing_store().ok()??;
-        let next = store.usage_state(id).ok()??.next_poll_at?;
-        let lease = store.usage_lease_expires_at(id).ok().flatten();
-        Some(lease.map_or(next, |ms| next.max((ms + 999).div_euclid(1000))))
+        let state = store.usage_state(id).ok()??;
+        let mut at = state.next_poll_at?;
+        if let Some(ms) = store.usage_lease_expires_at(id).ok().flatten() {
+            at = at.max((ms + 999).div_euclid(1000));
+        }
+        let now = self.engine.now_ms().div_euclid(1000);
+        if let Some(until) = state.backoff_until.filter(|u| backoff_holds(Some(*u), now)) {
+            at = at.max(until);
+        }
+        Some(at)
     }
 
     fn run(&mut self, sink: &dyn EventSink) -> Result<(TickOutcome, Decision), EngineError> {
