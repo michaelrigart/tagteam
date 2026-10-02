@@ -2,7 +2,7 @@
 //! home, the profile spelling, and the profile credential's read and deletion under the
 //! hashed Keychain name for a recorded spelling (Appendix A.2).
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -196,7 +196,11 @@ fn the_share_policy_is_section_12_2_s_tables_from_the_resolved_home() {
 fn the_outer_home_round_trips_undefined_set_and_defined_but_empty() {
     let f = fx();
     // In a run shell, CLAUDE_CONFIG_DIR names the profile and the secure-storage dir is scrubbed.
-    let inside = with_vars(&f.env, Some("/data/sessions/0192"), None);
+    // The CLI captures the variable into `vars` too (Decision 5).
+    let mut inside = with_vars(&f.env, Some("/data/sessions/0192"), None);
+    inside
+        .vars
+        .insert("CLAUDE_CONFIG_DIR".into(), "/data/sessions/0192".into());
     for (config, secure) in [
         (None, None),
         (Some("/custom/home"), None),
@@ -214,14 +218,24 @@ fn the_outer_home_round_trips_undefined_set_and_defined_but_empty() {
         let restored = f.cc.apply_outer_home(&inside, &outer).unwrap();
         assert_eq!(
             (
-                restored.claude_config_dir,
-                restored.claude_securestorage_config_dir
+                restored.claude_config_dir.clone(),
+                restored.claude_securestorage_config_dir.clone()
             ),
             (
                 outer_env.claude_config_dir.clone(),
                 outer_env.claude_securestorage_config_dir.clone()
             ),
             "{config:?}, {secure:?}"
+        );
+        assert_eq!(
+            restored.var("CLAUDE_CONFIG_DIR"),
+            config.map(OsStr::new),
+            "{config:?}, {secure:?}: the captured variable follows, undefined included"
+        );
+        assert_eq!(
+            restored.var("CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            None,
+            "a variable never captured is not added"
         );
         assert_eq!(restored.home, inside.home, "nothing else moves");
     }

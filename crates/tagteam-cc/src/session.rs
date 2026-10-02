@@ -95,7 +95,10 @@ pub(crate) fn outer_home(env: &Env) -> Value {
 }
 
 /// `env` with both variables as `outer` records them. Anything but a string or `null` under
-/// each key is refused: the outer home would be a guess.
+/// each key is refused: the outer home would be a guess. A variable `env.vars` captured
+/// (Decision 5: `CLAUDE_CONFIG_DIR` is the session variable) follows the restored value, and is
+/// dropped where `outer` records it undefined, so nothing reading `vars` still finds the
+/// profile.
 pub(crate) fn apply_outer_home(env: &Env, outer: &Value) -> Result<Env, ProviderError> {
     let restored = |key: &str| match outer.get(key) {
         Some(Value::String(s)) => Ok(Some(OsString::from(s))),
@@ -107,6 +110,17 @@ pub(crate) fn apply_outer_home(env: &Env, outer: &Value) -> Result<Env, Provider
     let mut out = env.clone();
     out.claude_config_dir = restored(CONFIG_DIR)?;
     out.claude_securestorage_config_dir = restored(SECURE_STORAGE_DIR)?;
+    for (key, value) in [
+        (CONFIG_DIR, &out.claude_config_dir),
+        (SECURE_STORAGE_DIR, &out.claude_securestorage_config_dir),
+    ] {
+        if out.vars.contains_key(key) {
+            match value {
+                Some(v) => out.vars.insert(key.to_owned(), v.clone()),
+                None => out.vars.remove(key),
+            };
+        }
+    }
     Ok(out)
 }
 

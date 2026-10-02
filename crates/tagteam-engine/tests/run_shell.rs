@@ -94,7 +94,12 @@ fn a_marker_outside_sessions_is_a_run_shell() {
     let a = fx.add("a@x.co", "rt-a");
     let elsewhere = fx.dir.path().join("elsewhere/profile");
     let marker = fx.write_marker(&elsewhere, &a, &fx.env);
-    let (shell, effective) = detect_run_shell(&fx.shell_env(&elsewhere), &registry(&fx));
+    let mut env = fx.shell_env(&elsewhere);
+    env.vars.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        elsewhere.clone().into_os_string(),
+    );
+    let (shell, effective) = detect_run_shell(&env, &registry(&fx));
     assert_eq!(
         shell,
         RunShell::Inside {
@@ -103,6 +108,11 @@ fn a_marker_outside_sessions_is_a_run_shell() {
         }
     );
     assert_eq!(effective.claude_config_dir, None, "the outer home set none");
+    assert_eq!(
+        effective.var("CLAUDE_CONFIG_DIR"),
+        None,
+        "nor does the captured variable"
+    );
 }
 
 #[test]
@@ -174,8 +184,18 @@ fn the_engine_runs_on_the_outer_home_the_marker_records() {
     outer.claude_securestorage_config_dir = Some("".into());
     let profile = fx.profile_dir(&a);
     fx.write_marker(&profile, &a, &outer);
-    let (_, effective) = detect_run_shell(&fx.shell_env(&profile), &registry(&fx));
+    // The CLI captures the provider's variable, which names the profile here (Decision 5).
+    let mut shell = fx.shell_env(&profile);
+    shell
+        .vars
+        .insert("CLAUDE_CONFIG_DIR".into(), profile.clone().into_os_string());
+    let (_, effective) = detect_run_shell(&shell, &registry(&fx));
     assert_eq!(effective.claude_config_dir, outer.claude_config_dir);
+    assert_eq!(
+        effective.var("CLAUDE_CONFIG_DIR"),
+        outer.claude_config_dir.as_deref(),
+        "the captured variable names the outer home too"
+    );
     assert_eq!(effective.claude_securestorage_config_dir, Some("".into()));
     assert_eq!(effective.home, fx.env.home);
     assert_eq!(effective.data_dir(), fx.env.data_dir());
