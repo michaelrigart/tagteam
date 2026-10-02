@@ -1,7 +1,7 @@
 use std::fs::{OpenOptions, Permissions};
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -225,6 +225,27 @@ pub struct DisplacedRow {
     pub reason: String,
     pub fingerprint: String,
     pub identity: Option<Value>,
+}
+
+/// §12.7: a directory mapped to an account, for one provider. `path` is stored as given; the
+/// CLI gives the canonical path (§12.7). `added_at` is epoch ms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mapping {
+    pub path: String,
+    pub provider: ProviderId,
+    pub account_id: AccountId,
+    pub added_at: i64,
+}
+
+const MAPPING_COLUMNS: &str = "path, provider, account_id, added_at";
+
+fn mapping_from_row(r: &Row<'_>) -> rusqlite::Result<Mapping> {
+    Ok(Mapping {
+        path: r.get("path")?,
+        provider: ProviderId::new(r.get::<_, String>("provider")?),
+        account_id: AccountId::from_string(r.get::<_, String>("account_id")?),
+        added_at: r.get("added_at")?,
+    })
 }
 
 pub struct Store {
@@ -1195,5 +1216,90 @@ impl Store {
             params![d.id, d.provider.as_str(), d.at, d.reason, d.fingerprint, d.identity.as_ref().map(Value::to_string)],
         )?;
         Ok(())
+    }
+
+    /// §12.7: maps `path` to `account` for `provider`, replacing the mapping `path` held for
+    /// that provider (one per provider per path). `account` must be an account of `provider`;
+    /// otherwise nothing is written and the answer is `NoSuchAccount`.
+    pub fn set_mapping(
+        &self,
+        path: &str,
+        provider: &ProviderId,
+        account: &AccountId,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        // An INSERT … SELECT finds the account and writes in one statement, so an account a
+        // concurrent `remove` deletes is either mapped first, and the mapping cascades with it,
+        // or not found. Its WHERE clause also keeps SQLite from reading `ON CONFLICT` as a join.
+        let n = self.exec(
+            "INSERT INTO mappings (path, provider, account_id, added_at) \
+             SELECT ?1, provider, id, ?4 FROM accounts WHERE id = ?3 AND provider = ?2 \
+             ON CONFLICT(path, provider) DO UPDATE SET account_id = excluded.account_id, \
+             added_at = excluded.added_at",
+            &[&path, &provider.as_str(), &account.as_str(), &at],
+        )?;
+        if n == 0 {
+            Err(StoreError::NoSuchAccount)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Removes `path`'s mapping for `provider`, or for every provider when `None`. Returns the
+    /// count.
+    pub fn remove_mappings(
+        &self,
+        path: &str,
+        provider: Option<&ProviderId>,
+    ) -> Result<usize, StoreError> {
+        match provider {
+            Some(p) => self.exec(
+                "DELETE FROM mappings WHERE path = ?1 AND provider = ?2",
+                &[&path, &p.as_str()],
+            ),
+            None => self.exec("DELETE FROM mappings WHERE path = ?1", &[&path]),
+        }
+    }
+
+    /// Every mapping, by path, then provider.
+    pub fn mappings(&self) -> Result<Vec<Mapping>, StoreError> {
+        let c = self.lock();
+        let mut stmt = c.prepare(&format!(
+            "SELECT {MAPPING_COLUMNS} FROM mappings ORDER BY path, provider"
+        ))?;
+        let rows = stmt
+            .query_map([], mapping_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// §12.7: the mapping of `dir` or its nearest mapped ancestor, for `provider` (`dir`
+    /// canonical). Ancestors are whole path components, `dir` itself first: `/a/bc` never
+    /// inherits `/a/b`'s mapping, as a string prefix would. A component that is not UTF-8 can
+    /// match no stored path, so the walk passes it by and goes on to its parent.
+    pub fn nearest_mapping(
+        &self,
+        dir: &Path,
+        provider: &ProviderId,
+    ) -> Result<Option<Mapping>, StoreError> {
+        // Rebuilt from its components: a trailing `/` or a `.` would otherwise spell an
+        // ancestor no mapping is stored under.
+        let dir: PathBuf = dir.components().collect();
+        let c = self.lock();
+        let mut stmt = c.prepare(&format!(
+            "SELECT {MAPPING_COLUMNS} FROM mappings WHERE path = ?1 AND provider = ?2"
+        ))?;
+        for ancestor in dir.ancestors() {
+            let Some(path) = ancestor.to_str().filter(|p| !p.is_empty()) else {
+                continue;
+            };
+            let found = stmt
+                .query_row(params![path, provider.as_str()], mapping_from_row)
+                .optional()?;
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
     }
 }
