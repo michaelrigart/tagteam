@@ -203,7 +203,7 @@ impl Engine {
     /// without a vault credential is never switched to, refreshed or launched. Anything that
     /// fails stops before the row goes, so the account stays listed and the remove can be run
     /// again; every delete treats an absent item as done. The caller holds the mutation lock and
-    /// this account's lock, and has refused a session-owned account. The live login is never
+    /// this account's lock, and has run `refuse_destroying` on it. The live login is never
     /// touched.
     pub(crate) fn remove_locked(
         &self,
@@ -221,6 +221,14 @@ impl Engine {
         self.store()?.delete_account(&row.id)?;
         self.event(&row.provider, "remove", Some(&row.id), None)?;
         Ok(())
+    }
+
+    /// §10.3 Guard, before `remove_locked` deletes anything of `row`: it is not session-owned
+    /// (§12.5), and its profile holds no history that deleting it would delete or leave split
+    /// (§12.2, `refuse_profile_split`). Either refusal leaves everything as it was.
+    fn refuse_destroying(&self, p: &dyn Provider, row: &AccountRow) -> Result<(), EngineError> {
+        self.refuse_session_owned(p, row)?;
+        self.refuse_profile_split(p, row)
     }
 
     /// §10.3: deletes `row`'s session profile, if it has one. The agent's credential items for
@@ -547,10 +555,10 @@ impl Engine {
             claimed_uuid,
             &identity.label,
         )?;
-        // §10.3 Guard: replacing an occupant removes it. Its lock is held now, so no session can
-        // start on it before the remove.
+        // §10.3 Guard: replacing an occupant removes it, profile and all. Its lock is held now,
+        // so no session can start on it before the remove.
         if let Some(occupant) = &prep.occupant {
-            self.refuse_session_owned(p.as_ref(), occupant)?;
+            self.refuse_destroying(p.as_ref(), occupant)?;
         }
         let live_locks = p.lock_live(&self.env, &guard)?;
         // 3.3 The capture must be the login verified above, on both auth axes: a switch or a
@@ -659,7 +667,7 @@ impl Engine {
         check_identity_conflict(current.as_ref(), claimed_uuid, &identity.label)?;
         // §10.3 Guard, as in `add_live`.
         if let Some(occupant) = &prep.occupant {
-            self.refuse_session_owned(p.as_ref(), occupant)?;
+            self.refuse_destroying(p.as_ref(), occupant)?;
         }
         if let Some(existing) = &current {
             if existing.kind != kind {
@@ -722,7 +730,7 @@ impl Engine {
         // §10.3 Guard: under the mutation lock and the account lock, no session can start
         // before the remove is done (§12.5).
         let p = self.provider(&row.provider)?;
-        self.refuse_session_owned(p.as_ref(), &row)?;
+        self.refuse_destroying(p.as_ref(), &row)?;
         self.remove_locked(&row, &lock)?;
         Ok(row)
     }

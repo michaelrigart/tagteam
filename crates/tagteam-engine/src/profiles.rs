@@ -11,12 +11,15 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use tagteam_provider::atomic::ensure_private_dir;
-use tagteam_provider::profile::{LinksRecord, MARKER_FILE, ProfileMarker, entry_matches};
+use tagteam_provider::profile::{
+    LinksRecord, MARKER_FILE, ProfileMarker, entry_matches, profile_path,
+};
 use tagteam_provider::{EntryKind, Provider, Read, SharePolicy};
 
 use crate::engine::Engine;
 use crate::error::{EngineError, SplitCause};
 use crate::settings::is_share_name;
+use crate::store::AccountRow;
 
 /// What one sync did, by entry name, and the lines it reports.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -132,6 +135,63 @@ impl Engine {
         applied?;
         written?;
         Ok(report)
+    }
+}
+
+impl Engine {
+    /// §10.3 and §12.2: `remove`, and `add` over an occupied position, delete `row`'s profile
+    /// directory, and real history is never deleted or split silently. So before anything is
+    /// deleted, each of the provider's must-share entries in it is checked as the sync checks
+    /// one: a real file or directory refuses with `ProfileSplit`, naming both paths, and so does
+    /// a link that resolves anywhere other than the source home's entry, whose removal would
+    /// leave that history split for good. A link that resolves nowhere holds nothing to lose.
+    ///
+    /// The source home is the one the marker records, when the marker is the account's own and
+    /// its `outer` applies; otherwise the default home's. Only a real directory at the profile
+    /// path is checked: a link there is removed as a link, and a file holds no entry.
+    pub(crate) fn refuse_profile_split(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+    ) -> Result<(), EngineError> {
+        if !p.capabilities().sessions {
+            return Ok(());
+        }
+        let profile = profile_path(&self.env, &row.id);
+        if !fs::symlink_metadata(&profile).is_ok_and(|m| m.is_dir()) {
+            return Ok(());
+        }
+        let outer = match ProfileMarker::read(&profile) {
+            Read::Present(m) if m.account_id == row.id && m.provider == row.provider => {
+                p.apply_outer_home(&self.env, &m.outer).ok()
+            }
+            Read::Present(_) | Read::Absent | Read::Unreadable(_) => None,
+        };
+        let policy = p.share_policy(outer.as_ref().unwrap_or(&self.env));
+        for m in &policy.must_share {
+            if is_private(&policy, m.name) {
+                continue;
+            }
+            let (src, dst) = (policy.source.join(m.name), profile.join(m.name));
+            let cause = match held(&dst)? {
+                Held::Nothing => None,
+                Held::Real => Some(SplitCause::RealCopy),
+                Held::Link(_) => match resolved(&dst)? {
+                    None => None,
+                    Some(target) => {
+                        (resolved(&src)? != Some(target)).then_some(SplitCause::LinkElsewhere)
+                    }
+                },
+            };
+            if let Some(cause) = cause {
+                return Err(EngineError::ProfileSplit {
+                    profile: dst,
+                    shared: src,
+                    cause,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
