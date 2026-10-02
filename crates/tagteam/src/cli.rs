@@ -82,6 +82,38 @@ pub enum Command {
     },
     /// Move an account to POSITION, swapping if it is taken
     Move { account: String, position: u32 },
+    /// Switch automatically before a rate limit, until stopped (Ctrl-C)
+    ///
+    /// Runs one engine per provider with two switchable accounts (or only --provider's), each
+    /// on its own schedule, and prints a line per tick. --json prints one event per line:
+    /// {"schemaVersion":1,"event":<kind>,"ts":"…Z","provider":…, …}. --once ticks once and
+    /// exits 0 switched, 1 error, 2 no action, 3 blocked.
+    Auto {
+        /// Tick once per provider and exit with its outcome
+        #[arg(long)]
+        once: bool,
+        /// Decide and report, but switch nothing and write no auto-switch state
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Switch away above this percentage of usage (50–99.9)
+        #[arg(long)]
+        threshold: Option<f64>,
+        /// Seconds between ticks (15–3600)
+        #[arg(long)]
+        interval: Option<i64>,
+        /// Seconds after an automatic switch before another proactive one (0–86400)
+        #[arg(long)]
+        cooldown: Option<i64>,
+        /// best or consume-first
+        #[arg(long, value_enum)]
+        strategy: Option<AutoStrategyArg>,
+        /// Model limits that count, comma-separated, or `all`
+        #[arg(long)]
+        model: Option<String>,
+        /// Fall back to API-key accounts at the limit: true or false
+        #[arg(long = "include-api-key-accounts", value_name = "BOOL")]
+        include_api_key_accounts: Option<String>,
+    },
     /// Usage history: burn rate, and when each window runs out
     ///
     /// Reads the stored samples only; it never fetches. With no ACCOUNT it shows the live
@@ -119,6 +151,15 @@ pub enum StrategyArg {
     NextAvailable,
 }
 
+/// `auto --strategy` (§6.4's `autoswitch.strategy`).
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum AutoStrategyArg {
+    /// The candidate with the most headroom, past the hysteresis
+    Best,
+    /// The candidate whose weekly window resets soonest, while below the threshold
+    ConsumeFirst,
+}
+
 impl Command {
     /// Whether the command reads or writes a Keychain item on macOS, and so runs the lock check
     /// first (Appendix A.3). `list` and `status` are not among them although they collect usage
@@ -127,6 +168,8 @@ impl Command {
     /// failure. `history` and `statusline` read only the store and `~/.claude.json`, and the
     /// rest need no Keychain item. A recovery under their mutation lock (Task 21) only reads the
     /// Keychain, tri-state, and leaves what it cannot decide to the next command that checks.
+    /// `auto` checks before its first tick, a dry run too (§11.1): every tick reads its
+    /// accounts' items, and a real one switches.
     pub fn touches_keychain(&self) -> bool {
         matches!(
             self,
@@ -134,12 +177,16 @@ impl Command {
                 | Command::AddToken { .. }
                 | Command::Switch { .. }
                 | Command::Remove { .. }
+                | Command::Auto { .. }
         )
     }
 
     /// Of those, the ones that reach a Keychain item only through a stored account, so with
-    /// no store they touch none (§5): there is nothing to activate or delete.
+    /// no store they touch none (§5): there is nothing to activate, delete or switch between.
     pub fn touches_keychain_only_with_a_store(&self) -> bool {
-        matches!(self, Command::Switch { .. } | Command::Remove { .. })
+        matches!(
+            self,
+            Command::Switch { .. } | Command::Remove { .. } | Command::Auto { .. }
+        )
     }
 }

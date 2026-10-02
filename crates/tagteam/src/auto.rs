@@ -4,9 +4,14 @@
 //! tick when its mtime changed (Decision 9), and stops with exit 0 on a signal (Decision 8).
 //! `--once` runs one tick per provider instead.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::ops::RangeInclusive;
 use std::time::Duration;
+
+use serde_json::{Value, json};
+use tagteam_cc::usage::format_iso8601;
 
 use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::{
@@ -18,6 +23,8 @@ use tagteam_engine::settings::{
     COOLDOWN_SECONDS_RANGE, INTERVAL_SECONDS_RANGE, Settings, THRESHOLD_RANGE,
 };
 use tagteam_engine::{Engine, EngineError};
+
+use crate::render::{MISSING, RESET, duration, severity};
 
 /// §11.4: the loop checks the cancel token and re-reads the wall clock at least this often.
 const SLICE_MS: i64 = 1_000;
@@ -404,6 +411,387 @@ fn engine_running(provider: ProviderId) -> AutoEvent {
         reason: NoSwitchReason::EngineRunning.as_str().to_owned(),
         detail: String::new(),
     }
+}
+
+/// `--json` (§11.4): each event as one object on a line of its own.
+pub struct JsonSink<'a> {
+    out: RefCell<&'a mut dyn Write>,
+    /// The engine's wall clock, epoch milliseconds: each event's `ts`.
+    now_ms: &'a dyn Fn() -> i64,
+}
+
+impl<'a> JsonSink<'a> {
+    pub fn new(out: &'a mut dyn Write, now_ms: &'a dyn Fn() -> i64) -> Self {
+        JsonSink {
+            out: RefCell::new(out),
+            now_ms,
+        }
+    }
+}
+
+impl EventSink for JsonSink<'_> {
+    fn emit(&self, e: &AutoEvent) {
+        let line = event_json(e, (self.now_ms)().div_euclid(1000));
+        let mut out = self.out.borrow_mut();
+        let _ = writeln!(out, "{line}");
+    }
+}
+
+/// One event in §11.4's shape: the envelope `{"schemaVersion":1,"event":<kind>,"ts":"…Z"}`,
+/// the additive `provider` (§13.2), then the kind's fields in cswap's spelling. Accounts are
+/// keyed by position; times are ISO 8601 UTC. `fetchErrors` and `windowsPct` appear only when
+/// they hold something.
+pub fn event_json(e: &AutoEvent, now_s: i64) -> Value {
+    let (kind, provider, fields) = match e {
+        AutoEvent::Poll {
+            provider,
+            active,
+            headroom_pct,
+            threshold,
+            fetch_errors,
+            windows_pct,
+        } => {
+            let mut f = json!({
+                "active": active.as_ref().map(|(number, email)| json!({"number": number, "email": email})),
+                "headroomPct": by_position(headroom_pct, |h| json!(h)),
+                "threshold": threshold,
+            });
+            if !fetch_errors.is_empty() {
+                f["fetchErrors"] = by_position(fetch_errors, |kind| json!(kind));
+            }
+            if !windows_pct.is_empty() {
+                f["windowsPct"] = by_position(windows_pct, |w| json!(w));
+            }
+            ("poll", provider, f)
+        }
+        AutoEvent::Switch {
+            provider,
+            trigger,
+            from,
+            to,
+            warnings,
+            dry_run,
+        } => (
+            "switch",
+            provider,
+            json!({"trigger": trigger.as_str(), "from": from, "to": to, "warnings": warnings, "dryRun": dry_run}),
+        ),
+        AutoEvent::NoSwitch {
+            provider,
+            reason,
+            detail,
+        } => (
+            "no-switch",
+            provider,
+            json!({"reason": reason, "detail": detail}),
+        ),
+        AutoEvent::AccountQuarantined {
+            provider,
+            number,
+            email,
+            reason,
+        } => (
+            "account-quarantined",
+            provider,
+            json!({"number": number, "email": email, "reason": reason}),
+        ),
+        AutoEvent::AccountUnquarantined {
+            provider,
+            number,
+            email,
+            reason,
+        } => (
+            "account-unquarantined",
+            provider,
+            json!({"number": number, "email": email, "reason": reason}),
+        ),
+        AutoEvent::AllExhausted {
+            provider,
+            earliest_reset_at,
+        } => (
+            "all-exhausted",
+            provider,
+            json!({"earliestResetAt": earliest_reset_at.map(format_iso8601)}),
+        ),
+        AutoEvent::Sleep {
+            provider,
+            seconds,
+            until,
+        } => (
+            "sleep",
+            provider,
+            json!({"seconds": (seconds * 10.0).round() / 10.0, "until": format_iso8601(*until)}),
+        ),
+        AutoEvent::Error {
+            provider,
+            message,
+            transient,
+        } => (
+            "error",
+            provider,
+            json!({"message": message, "transient": transient}),
+        ),
+        AutoEvent::ConfigWarning { provider, message } => {
+            ("config-warning", provider, json!({"message": message}))
+        }
+    };
+    let mut o = json!({
+        "schemaVersion": 1,
+        "event": kind,
+        "ts": format_iso8601(now_s),
+        "provider": provider.as_str(),
+    });
+    if let Value::Object(fields) = fields {
+        for (k, v) in fields {
+            o[k] = v;
+        }
+    }
+    o
+}
+
+/// A map keyed by account position, as §11.4's objects key accounts.
+fn by_position<T>(m: &BTreeMap<u32, T>, value: impl Fn(&T) -> Value) -> Value {
+    Value::Object(
+        m.iter()
+            .map(|(position, v)| (position.to_string(), value(v)))
+            .collect(),
+    )
+}
+
+/// §11.4's human output. Each tick is one stdout line: the local time, the live account by
+/// position and email, its relevant usage (the highest relevant percentage, coloured as `list`
+/// colours it), and the outcome. Quarantine changes and long sleeps get lines of their own;
+/// errors and warnings go to stderr. With several providers, each line names its provider
+/// (§13.1).
+pub struct HumanSink<'a> {
+    out: RefCell<&'a mut dyn Write>,
+    err: RefCell<&'a mut dyn Write>,
+    /// The engine's wall clock, epoch milliseconds.
+    now_ms: &'a dyn Fn() -> i64,
+    /// Epoch seconds as a wall-clock time of day.
+    clock: fn(i64) -> String,
+    /// A provider's display name.
+    names: &'a dyn Fn(&ProviderId) -> String,
+    color: bool,
+    several: bool,
+    /// Each provider's poll in this tick, until its outcome line uses it or the tick ends.
+    polled: RefCell<BTreeMap<ProviderId, Polled>>,
+}
+
+/// What a tick's line says about the live account, from its `poll`.
+struct Polled {
+    position: u32,
+    email: String,
+    /// The highest relevant percentage (100 − headroom); `None` when unknown.
+    used: Option<f64>,
+}
+
+impl<'a> HumanSink<'a> {
+    pub fn new(
+        out: &'a mut dyn Write,
+        err: &'a mut dyn Write,
+        now_ms: &'a dyn Fn() -> i64,
+        names: &'a dyn Fn(&ProviderId) -> String,
+        color: bool,
+        several: bool,
+    ) -> Self {
+        HumanSink {
+            out: RefCell::new(out),
+            err: RefCell::new(err),
+            now_ms,
+            clock: local_time,
+            names,
+            color,
+            several,
+            polled: RefCell::new(BTreeMap::new()),
+        }
+    }
+
+    /// The time and, with several providers, the provider: how every line starts.
+    fn head(&self, now: i64, provider: &ProviderId) -> String {
+        let time = (self.clock)(now);
+        if self.several {
+            format!("{time}  {}  ", (self.names)(provider))
+        } else {
+            format!("{time}  ")
+        }
+    }
+
+    fn line(&self, now: i64, provider: &ProviderId, text: &str) {
+        let mut out = self.out.borrow_mut();
+        let _ = writeln!(out, "{}{text}", self.head(now, provider));
+    }
+
+    fn err_line(&self, now: i64, provider: &ProviderId, label: &str, text: &str) {
+        let mut err = self.err.borrow_mut();
+        let _ = writeln!(err, "{}{label}: {text}", self.head(now, provider));
+    }
+
+    /// A tick's line: the live account and its usage from this tick's poll, then `outcome`.
+    /// A tick that ended before collecting (§11.2 step 2) has no poll, and says only why.
+    fn tick(&self, now: i64, provider: &ProviderId, outcome: &str) {
+        match self.polled.borrow_mut().remove(provider) {
+            Some(p) => {
+                let used = match p.used {
+                    Some(u) => pct(u, self.color),
+                    None => MISSING.to_owned(),
+                };
+                let text = format!("#{} {}  {used}  {outcome}", p.position, p.email);
+                self.line(now, provider, &text);
+            }
+            None => self.line(now, provider, outcome),
+        }
+    }
+}
+
+/// A percentage rounded as `list` rounds it, coloured by §13.5's severities when `color`.
+fn pct(used: f64, color: bool) -> String {
+    let n = used.round() as i64;
+    match severity(n) {
+        Some(code) if color => format!("{code}{n}%{RESET}"),
+        _ => format!("{n}%"),
+    }
+}
+
+impl EventSink for HumanSink<'_> {
+    fn emit(&self, e: &AutoEvent) {
+        let now = (self.now_ms)().div_euclid(1000);
+        match e {
+            AutoEvent::Poll {
+                provider,
+                active: Some((position, email)),
+                headroom_pct,
+                ..
+            } => {
+                let used = headroom_pct.get(position).copied().flatten();
+                let polled = Polled {
+                    position: *position,
+                    email: email.clone(),
+                    used: used.map(|h| 100.0 - h),
+                };
+                self.polled.borrow_mut().insert(provider.clone(), polled);
+            }
+            AutoEvent::Poll { .. } => {}
+            AutoEvent::Switch {
+                provider,
+                trigger,
+                to,
+                warnings,
+                dry_run,
+                ..
+            } => {
+                for w in warnings {
+                    self.err_line(now, provider, "warning", w);
+                }
+                let verb = if *dry_run { "would switch" } else { "switched" };
+                self.tick(
+                    now,
+                    provider,
+                    &format!("{verb} to #{to} ({})", trigger.as_str()),
+                );
+            }
+            AutoEvent::NoSwitch {
+                provider,
+                reason,
+                detail,
+            } => {
+                if reason == NoSwitchReason::EngineRunning.as_str() {
+                    let name = (self.names)(provider);
+                    let text = format!(
+                        "auto-switch already runs for {name} in another process; skipping it"
+                    );
+                    self.err_line(now, provider, "warning", &text);
+                } else if reason != NoSwitchReason::AllExhausted.as_str() {
+                    // `all-exhausted` has its line at the event that follows, with its time.
+                    let text = if detail.is_empty() {
+                        format!("no switch: {reason}")
+                    } else {
+                        format!("no switch: {reason} ({detail})")
+                    };
+                    self.tick(now, provider, &text);
+                }
+            }
+            AutoEvent::AllExhausted {
+                provider,
+                earliest_reset_at,
+            } => {
+                let text = match earliest_reset_at {
+                    Some(at) => format!(
+                        "no switch: all-exhausted, the first back at {} ({})",
+                        (self.clock)(*at),
+                        duration(at - now)
+                    ),
+                    None => "no switch: all-exhausted".to_owned(),
+                };
+                self.tick(now, provider, &text);
+            }
+            AutoEvent::AccountQuarantined {
+                provider,
+                number,
+                email,
+                reason,
+            } => self.line(
+                now,
+                provider,
+                &format!("#{number} {email} quarantined ({reason})"),
+            ),
+            AutoEvent::AccountUnquarantined {
+                provider,
+                number,
+                email,
+                reason,
+            } => self.line(
+                now,
+                provider,
+                &format!("#{number} {email} unquarantined ({reason})"),
+            ),
+            AutoEvent::Sleep {
+                provider,
+                seconds,
+                until,
+            } => {
+                let text = format!(
+                    "sleeping {} until {}",
+                    duration(*seconds as i64),
+                    (self.clock)(*until)
+                );
+                self.line(now, provider, &text);
+            }
+            AutoEvent::Error {
+                provider, message, ..
+            } => self.err_line(now, provider, "error", message),
+            AutoEvent::ConfigWarning { provider, message } => {
+                self.err_line(now, provider, "warning", message)
+            }
+        }
+    }
+
+    /// A tick that ended in an error printed no outcome line: its poll goes with it, so a later
+    /// tick that never polls never shows that tick's account and usage.
+    fn tick_done(&self, provider: &ProviderId) {
+        self.polled.borrow_mut().remove(provider);
+    }
+}
+
+/// Epoch seconds as the local time of day, `HH:MM:SS`; UTC should the zone be unreadable.
+pub fn local_time(epoch_s: i64) -> String {
+    let t = epoch_s as libc::time_t;
+    // SAFETY: an all-zero `tm` is valid storage for `localtime_r` to fill.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are valid for the call; `localtime_r` is reentrant and keeps
+    // neither.
+    let filled = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
+    let (h, m, s) = if filled {
+        (
+            i64::from(tm.tm_hour),
+            i64::from(tm.tm_min),
+            i64::from(tm.tm_sec),
+        )
+    } else {
+        let s = epoch_s.rem_euclid(86_400);
+        (s / 3600, s % 3600 / 60, s % 60)
+    };
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 #[cfg(test)]
@@ -1339,5 +1727,299 @@ mod tests {
             let j = uniform_jitter();
             assert!((-1.0..1.0).contains(&j), "{j}");
         }
+    }
+
+    fn poll(active: u32, headroom: &[(u32, Option<f64>)]) -> AutoEvent {
+        AutoEvent::Poll {
+            provider: cc(),
+            active: Some((active, format!("{}@x.co", ["", "a", "b"][active as usize]))),
+            headroom_pct: headroom.iter().copied().collect(),
+            threshold: 90.0,
+            fetch_errors: BTreeMap::new(),
+            windows_pct: BTreeMap::new(),
+        }
+    }
+
+    fn no_switch_event(reason: &str, detail: &str) -> AutoEvent {
+        AutoEvent::NoSwitch {
+            provider: cc(),
+            reason: reason.into(),
+            detail: detail.into(),
+        }
+    }
+
+    #[test]
+    fn every_event_is_one_object_in_section_11_4_s_shape() {
+        let poll = AutoEvent::Poll {
+            provider: cc(),
+            active: Some((2, "b@x.co".into())),
+            headroom_pct: BTreeMap::from([(1, Some(80.0)), (2, None)]),
+            threshold: 90.0,
+            fetch_errors: BTreeMap::from([(2, "http-429".into())]),
+            windows_pct: BTreeMap::from([(1, BTreeMap::from([("5h".into(), 20.0)]))]),
+        };
+        let quiet = AutoEvent::Poll {
+            provider: cc(),
+            active: None,
+            headroom_pct: BTreeMap::new(),
+            threshold: 90.0,
+            fetch_errors: BTreeMap::new(),
+            windows_pct: BTreeMap::new(),
+        };
+        let cases = [
+            (
+                poll,
+                json!({"event": "poll", "active": {"number": 2, "email": "b@x.co"},
+                       "headroomPct": {"1": 80.0, "2": null}, "threshold": 90.0,
+                       "fetchErrors": {"2": "http-429"}, "windowsPct": {"1": {"5h": 20.0}}}),
+            ),
+            (
+                quiet,
+                json!({"event": "poll", "active": null, "headroomPct": {}, "threshold": 90.0}),
+            ),
+            (
+                AutoEvent::Switch {
+                    provider: cc(),
+                    trigger: tagteam_core::autoswitch::Trigger::Failover,
+                    from: 2,
+                    to: 1,
+                    warnings: vec!["w".into()],
+                    dry_run: true,
+                },
+                json!({"event": "switch", "trigger": "failover", "from": 2, "to": 1,
+                       "warnings": ["w"], "dryRun": true}),
+            ),
+            (
+                no_switch_event("cooldown", "3m"),
+                json!({"event": "no-switch", "reason": "cooldown", "detail": "3m"}),
+            ),
+            (
+                AutoEvent::AccountQuarantined {
+                    provider: cc(),
+                    number: 3,
+                    email: "w@corp.com".into(),
+                    reason: "invalid_grant".into(),
+                },
+                json!({"event": "account-quarantined", "number": 3, "email": "w@corp.com",
+                       "reason": "invalid_grant"}),
+            ),
+            (
+                AutoEvent::AccountUnquarantined {
+                    provider: cc(),
+                    number: 3,
+                    email: "w@corp.com".into(),
+                    reason: "account-replaced".into(),
+                },
+                json!({"event": "account-unquarantined", "number": 3, "email": "w@corp.com",
+                       "reason": "account-replaced"}),
+            ),
+            (
+                AutoEvent::AllExhausted {
+                    provider: cc(),
+                    earliest_reset_at: Some(T0 + 9_630),
+                },
+                json!({"event": "all-exhausted", "earliestResetAt": "2026-09-21T16:53:50Z"}),
+            ),
+            (
+                AutoEvent::AllExhausted {
+                    provider: cc(),
+                    earliest_reset_at: None,
+                },
+                json!({"event": "all-exhausted", "earliestResetAt": null}),
+            ),
+            (
+                AutoEvent::Sleep {
+                    provider: cc(),
+                    seconds: 600.0,
+                    until: T0 + 600,
+                },
+                json!({"event": "sleep", "seconds": 600.0, "until": "2026-09-21T14:23:20Z"}),
+            ),
+            (
+                AutoEvent::Error {
+                    provider: cc(),
+                    message: "m".into(),
+                    transient: true,
+                },
+                json!({"event": "error", "message": "m", "transient": true}),
+            ),
+            (
+                AutoEvent::ConfigWarning {
+                    provider: cc(),
+                    message: "m".into(),
+                },
+                json!({"event": "config-warning", "message": "m"}),
+            ),
+        ];
+        for (event, fields) in cases {
+            let mut want = json!({"schemaVersion": 1, "event": fields["event"],
+                                  "ts": "2026-09-21T14:13:20Z", "provider": "claude-code"});
+            for (k, v) in fields.as_object().unwrap() {
+                want[k] = v.clone();
+            }
+            assert_eq!(event_json(&event, T0), want);
+        }
+        let line = event_json(&no_switch_event("cooldown", ""), T0).to_string();
+        assert_eq!(
+            line,
+            r#"{"schemaVersion":1,"event":"no-switch","ts":"2026-09-21T14:13:20Z","provider":"claude-code","reason":"cooldown","detail":""}"#
+        );
+    }
+
+    /// The human sink at `T0` on a fixed clock, whose times read as seconds after `T0`.
+    fn human<'a>(
+        out: &'a mut Vec<u8>,
+        err: &'a mut Vec<u8>,
+        now: &'a dyn Fn() -> i64,
+        names: &'a dyn Fn(&ProviderId) -> String,
+        color: bool,
+        several: bool,
+    ) -> HumanSink<'a> {
+        let mut sink = HumanSink::new(out, err, now, names, color, several);
+        sink.clock = |s| format!("t+{}", s - T0);
+        sink
+    }
+
+    #[test]
+    fn a_tick_is_one_line_and_quarantines_sleeps_errors_and_warnings_are_lines_of_their_own() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let now = || T0 * 1000;
+        let names = |p: &ProviderId| format!("<{p}>");
+        let sink = human(&mut out, &mut err, &now, &names, false, false);
+        let events = [
+            AutoEvent::AccountUnquarantined {
+                provider: cc(),
+                number: 1,
+                email: "a@x.co".into(),
+                reason: "credentials-replaced".into(),
+            },
+            poll(2, &[(1, Some(80.0)), (2, Some(4.6))]),
+            AutoEvent::Switch {
+                provider: cc(),
+                trigger: tagteam_core::autoswitch::Trigger::Proactive,
+                from: 2,
+                to: 1,
+                warnings: vec!["the Keychain refused the write".into()],
+                dry_run: false,
+            },
+            poll(1, &[(1, None), (2, Some(4.6))]),
+            AutoEvent::Error {
+                provider: cc(),
+                message: "usage was not collected".into(),
+                transient: true,
+            },
+            no_switch_event("active-usage-unknown", "1/3"),
+            no_switch_event("no-active-account", ""),
+            poll(2, &[(1, Some(0.0)), (2, Some(5.0))]),
+            no_switch_event("all-exhausted", "2h40m"),
+            AutoEvent::AllExhausted {
+                provider: cc(),
+                earliest_reset_at: Some(T0 + 9_630),
+            },
+            AutoEvent::Sleep {
+                provider: cc(),
+                seconds: 600.0,
+                until: T0 + 600,
+            },
+            AutoEvent::AccountQuarantined {
+                provider: cc(),
+                number: 1,
+                email: "a@x.co".into(),
+                reason: "invalid_grant".into(),
+            },
+            AutoEvent::ConfigWarning {
+                provider: cc(),
+                message: "autoswitch.models names \"Fabel\"".into(),
+            },
+            no_switch_event("engine-running", ""),
+        ];
+        for e in &events {
+            sink.emit(e);
+        }
+        drop(sink);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "t+0  #1 a@x.co unquarantined (credentials-replaced)\n\
+             t+0  #2 b@x.co  95%  switched to #1 (proactive)\n\
+             t+0  #1 a@x.co  —  no switch: active-usage-unknown (1/3)\n\
+             t+0  no switch: no-active-account\n\
+             t+0  #2 b@x.co  95%  no switch: all-exhausted, the first back at t+9630 (2h40m)\n\
+             t+0  sleeping 10m until t+600\n\
+             t+0  #1 a@x.co quarantined (invalid_grant)\n"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "t+0  warning: the Keychain refused the write\n\
+             t+0  error: usage was not collected\n\
+             t+0  warning: autoswitch.models names \"Fabel\"\n\
+             t+0  warning: auto-switch already runs for <claude-code> in another process; skipping it\n"
+        );
+    }
+
+    #[test]
+    fn a_tick_that_ends_in_an_error_leaves_its_poll_to_no_later_line() {
+        // b at 95 % polls, then a cannot be freshened: the tick ends in an error, with no line
+        // on stdout. The live login is gone before the next tick, which has no poll: its line
+        // names no account, not b.
+        let fx = Fx::new();
+        let (a, b) = two(&fx);
+        fx.read(&a, 10.0, 10.0, T0, T0 + 300);
+        fx.read(&b, 20.0, 95.0, T0, T0 + 300);
+        let near = json!({"claudeAiOauth": {"accessToken": "at-a", "refreshToken": "rt-a", "expiresAt": T0 * 1000 + 60_000, "refreshTokenExpiresAt": FAR_MS}});
+        fx.kc.put(SERVICE, a.as_str(), near.to_string().as_bytes());
+        let live = fx.env.home.join(".claude.json");
+        let (clock, cancel) = (fx.clock.clone(), fx.engine.cancel().clone());
+        let slices = Slices::new(&fx.clock, move |_| {
+            let _ = fs::remove_file(&live);
+            if clock.now_ms() > (T0 + 60) * 1000 {
+                cancel.request(libc::SIGTERM);
+            }
+        });
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let now = || fx.clock.now_ms();
+        let names = |p: &ProviderId| format!("<{p}>");
+        let sink = human(&mut out, &mut err, &now, &names, false, false);
+        let code = run_loop(&fx.engine, &looping(), &sink, &slices, &mut || 0.0).unwrap();
+        drop(sink);
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "t+60  no switch: no-active-account\n"
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "t+0  error: could not freshen a@x.co (position 1): pre-send\n"
+        );
+    }
+
+    #[test]
+    fn usage_is_coloured_as_list_colours_it_and_several_providers_are_named() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let now = || T0 * 1000;
+        let names = |p: &ProviderId| format!("<{p}>");
+        let sink = human(&mut out, &mut err, &now, &names, true, true);
+        for (active, headroom) in [(2, 5.0), (2, 25.0), (2, 50.0)] {
+            sink.emit(&poll(active, &[(active, Some(headroom))]));
+            sink.emit(&no_switch_event("below-threshold", ""));
+        }
+        drop(sink);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "t+0  <claude-code>  #2 b@x.co  \x1b[31m95%\x1b[0m  no switch: below-threshold\n\
+             t+0  <claude-code>  #2 b@x.co  \x1b[33m75%\x1b[0m  no switch: below-threshold\n\
+             t+0  <claude-code>  #2 b@x.co  50%  no switch: below-threshold\n"
+        );
+    }
+
+    #[test]
+    fn local_time_is_a_time_of_day() {
+        let t = local_time(T0);
+        assert_eq!(t.len(), 8, "{t}");
+        assert_eq!(&t[2..3], ":");
+        assert_eq!(
+            &t[5..],
+            ":20",
+            "zones differ by whole minutes; T0 is :20 past"
+        );
     }
 }
