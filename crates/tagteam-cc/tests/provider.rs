@@ -785,33 +785,42 @@ fn a_held_config_lock_releases_the_credential_locks_it_was_given() {
 }
 
 /// §14.1: a lock wait is a cancellation point, and unwinding releases what is held: the
-/// credential locks `lock_config` was given are removed with the interrupted config wait.
+/// credential locks `lock_config` was given are removed with the interrupted config wait. No
+/// clock is read, so a loaded machine cannot fail it: a wait that is not interrupted ends in
+/// `Timeout`, and an attempt made before the token was checked takes the free lock.
 #[test]
 fn an_interrupted_config_wait_releases_the_credential_locks_it_was_given() {
-    let f = fx();
-    let paths = CcPaths::resolve(&f.env);
-    fs::create_dir(&paths.config_lock).unwrap(); // someone else holds it, freshly
-    let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
-    let cred =
-        f.cc.lock_credentials(&f.env, &g, Duration::from_secs(1))
-            .unwrap();
-    f.env.cancel.request(libc::SIGTERM);
-    let start = Instant::now();
-    match f.cc.lock_config(&f.env, cred, Duration::from_secs(2)) {
-        Err(ProviderError::Lock(LockError::Interrupted { path, signal })) => {
-            assert_eq!((path, signal), (paths.config_lock.clone(), libc::SIGTERM))
+    for held in [true, false] {
+        let f = fx();
+        let paths = CcPaths::resolve(&f.env);
+        if held {
+            fs::create_dir(&paths.config_lock).unwrap(); // someone else holds it, freshly
         }
-        other => panic!("expected an interrupted wait, got {:?}", other.err()),
+        let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+        let cred =
+            f.cc.lock_credentials(&f.env, &g, Duration::from_secs(1))
+                .unwrap();
+        f.env.cancel.request(libc::SIGTERM);
+        match f.cc.lock_config(&f.env, cred, Duration::from_secs(5)) {
+            Err(ProviderError::Lock(LockError::Interrupted { path, signal })) => {
+                assert_eq!((path, signal), (paths.config_lock.clone(), libc::SIGTERM))
+            }
+            other => panic!(
+                "held {held}: expected an interrupted wait, got {:?}",
+                other.err()
+            ),
+        }
+        assert!(
+            !paths.refresh_lock.exists() && !paths.legacy_lock().exists(),
+            "held {held}: the credential locks are released"
+        );
+        assert_eq!(
+            paths.config_lock.is_dir(),
+            held,
+            "held {held}: the other holder's lock is left alone, and a free one never taken: \
+             the token is checked before the first attempt"
+        );
     }
-    assert!(
-        start.elapsed() < Duration::from_millis(100),
-        "checked before the first attempt"
-    );
-    assert!(!paths.refresh_lock.exists() && !paths.legacy_lock().exists());
-    assert!(
-        paths.config_lock.is_dir(),
-        "the other holder's lock is left alone"
-    );
 }
 
 /// L356, Review Focus 5: tagteam was suspended past the staleness window, and Claude Code took
