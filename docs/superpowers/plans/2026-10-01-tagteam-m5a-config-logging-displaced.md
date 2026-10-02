@@ -37,7 +37,7 @@ Section numbers below refer to that spec.
 
 ## Execution notes
 
-- **Execution waits for M4a to merge into `main`.** M3a has merged (`main` at `7ee733b`, PR #4), and `m5-admin` is rebased onto it. M5a's `cli.rs`, `app.rs`, `lib.rs`, `settings.rs` and `env.rs` changes would otherwise churn against M4a, which is in flight. The first execution step rebases `m5-admin` onto the `main` M4a has merged into. The M5 spec commit `86882e3` is also on `m4-run-sessions` as `089b873`, so whichever lands second drops as already applied; `d14a860` stays. It then re-syncs this plan with the merged code: the names, line numbers and interfaces under "M3a and M4a interfaces this plan builds on". The re-sync is recorded under "Execution rulings" below before Task 1 starts.
+- **Execution waits for M4a to merge into `main`.** M3a (PR #4) and M3b (PR #5) have merged (`main` at `3e5ba2b`), and `m5-admin` is rebased onto it. M5a's `cli.rs`, `app.rs`, `lib.rs`, `settings.rs` and `env.rs` changes would otherwise churn against M4a, which is in flight. The first execution step rebases `m5-admin` onto the `main` M4a has merged into. The M5 spec commit `86882e3` is also on `m4-run-sessions` as `089b873`, so whichever lands second drops as already applied; `d14a860` stays. It then re-syncs this plan with the merged code: the names, line numbers and interfaces under "M3a, M3b and M4a interfaces this plan builds on". The re-sync is recorded under "Execution rulings" below before Task 1 starts.
 - When execution starts, set this plan's `**Status:**` to `In progress` in one commit. The spec stays `In progress` until M5b.
 - **Run this plan in the `m5-admin` worktree** (`~/Code/tagteam-m5-admin`, Michael's `wt` worktree).
 - Feature flags used by tests (unchanged): `tagteam-provider/file-keychain`, `tagteam-provider/mock-server`, `tagteam-engine/test-hooks`, `tagteam-cc/test-hooks`, and `tagteam/test-support`, which enables all of them. Binary tests (`crates/tagteam/tests/*_cli.rs`, `logging.rs`, `completions.rs`) are gated `#![cfg(feature = "test-support")]` like `tests/cli.rs`, and run with `cargo test -p tagteam --features test-support`.
@@ -45,9 +45,9 @@ Section numbers below refer to that spec.
 - Every task runs `cargo fmt --all` before `cargo fmt --all --check`.
 - Tests never reach the real network, the real HOME or the login keychain (§15.1). The binary tests run through `common::std_cmd`, which clears the environment, so a test that wants `TAGTEAM_LOG` sets it explicitly.
 
-### M3a and M4a interfaces this plan builds on
+### M3a, M3b and M4a interfaces this plan builds on
 
-The task text below is written against `main` at `3c1f458`, except where a task names an M3a or M4a interface explicitly: Task 4 throughout, and Task 8's lock call. M3a's half of the re-sync can be checked against `main` (`7ee733b`) already; M4a's waits for its merge. Each task keeps its own Re-sync note with its delta in full. This list gathers those notes by upstream task, so that the re-sync can be checked off in one pass:
+The task text below is written against `main` at `3c1f458`, except where a task names an M3a or M4a interface explicitly: Task 4 throughout, and Task 8's lock call. The M3a and M3b halves of the re-sync can be checked against `main` (`3e5ba2b`) already; M4a's waits for its merge. Each task keeps its own Re-sync note with its delta in full. This list gathers those notes by upstream task, so that the re-sync can be checked off in one pass:
 - **M3a Task 1:** `Env.cancel: Cancel` and `FlockGuard::lock(path, timeout, cancel: &Cancel)`.
   - Task 1: `Env::from_process`'s `Ok(Self { … })` keeps `cancel: Cancel::new(),`.
   - Task 4: the settings lock waits on `&self.env.cancel`.
@@ -71,6 +71,16 @@ The task text below is written against `main` at `3c1f458`, except where a task 
   - Task 7 Part D replaces `Rollback::fail` whole, anchored on `fn fail(mut self, cause: EngineError) -> EngineError {`. Task 11 changes what the rollback's undos do (they take CC's storage-write lock), not `fail`, `struct Rollback` or its literal in `transact`.
   - Task 9 edits a comment inside `refresh_stored`, which Part D's wrapper turns into `run_gate`'s body. Part D's anchor is the doc comment and signature, which Task 9 keeps.
 - **M3a Task 10:** `Command::Switch` gains `--strategy` and `--model`. The new variants follow `Command::Statusline` in task order: Task 3's `Config`, Task 9's `Displaced`, then Task 10's `Completions`, the last.
+- **M3b (merged, `3e5ba2b`):** `settings.rs` already reads every `autoswitch.*` key into `Settings`. It exports `DEFAULT_THRESHOLD`, `DEFAULT_INTERVAL_SECONDS`, `DEFAULT_COOLDOWN_SECONDS`, `DEFAULT_HYSTERESIS_PCT`, `DEFAULT_UNHEALTHY_TICKS`, the ranges `THRESHOLD_RANGE`, `INTERVAL_SECONDS_RANGE`, `COOLDOWN_SECONDS_RANGE`, `HYSTERESIS_PCT_RANGE` and `UNHEALTHY_TICKS_RANGE`, `parse_bool` and `Settings::mtime`. `auto` clamps its flags to the same ranges, and `crates/tagteam/src/auto.rs` and its tests pin the warning phrases.
+  - Task 2 is written against `settings.rs` before M3b. At the re-sync it folds M3b's reader into the registry and keeps M3b's names, types and tests:
+    - `interval_seconds` and `cooldown_seconds` are `i64`;
+    - the strategy enum is M3b's `tagteam_core::autoswitch::Strategy`, with its own `as_str` and `parse`, which `auto`'s `AutoConfig.strategy` uses. Task 2's `AutoStrategy` enum and its `impl` are dropped rather than renamed, every use becomes `Strategy`, and Task 2's tests import it from `tagteam_core::autoswitch`, since `settings` imports it privately;
+    - the registry's `Float` and `Int` bounds come from the `*_RANGE` constants, and its defaults from the `DEFAULT_*` constants, never restated;
+    - `Key::expect` returns M3b's phrases for the `autoswitch` keys, such as "must be a whole number of seconds from 15 to 3600";
+    - a boolean in the file reads through M3b's `parse_bool_item`, and `Key::parse_arg` through `parse_bool` (Decision 16).
+  - `default_provider` and `inspect` remain Task 2's own: M3b reads neither.
+  - Tasks 7 and 8: M3b threads an event source through recovery (`guard_or_refuse_as`, `settle_or_refuse_as`). Task 7's line inside `recover_one` and Task 8's `recover.rs` delta re-apply onto it, anchored on text M3b keeps.
+  - The engine-lock record M5b's doctor reads is `{"pid":<u32>,"start":<u64>}\n`, replacing the whole file under the lock (`crates/tagteam-engine/src/auto.rs`).
 - **M4a Task 7:** `Env.vars`, `Provider::share_policy(env)`, `Capabilities.sessions` and the providers' known-private lists.
   - Task 1: `Env::from_process` keeps `vars: BTreeMap::new(),`, and the `Env` unit test's `Env::from_process().vars` becomes `Env::from_process().unwrap().vars`.
   - Task 4: `config set run.share_extra` checks its names against `share_policy`, through M4a Task 13's matcher. A provider's entry is checked against that provider; the global one against every provider with `sessions`.
@@ -99,14 +109,14 @@ The task text below is written against `main` at `3c1f458`, except where a task 
 |---|---|
 | M1, M2a, M2b | Implemented (`main` at `3c1f458`) |
 | M3a | Signals, cancellation and usage strategies: implemented (`main` at `7ee733b`) |
-| M3b | Auto-switch (`m3-auto-switch`) |
+| M3b | Auto-switch: implemented (`main` at `3e5ba2b`) |
 | M4a, M4b | Sessions foundation; `tagteam run` (`m4-run-sessions`) |
 | **M5a (this plan)** | `HOME` validation; the settings registry and every §6.4 key; `config list\|get\|set\|unset\|path`; logging to a file; `displaced` listing and purge; `completions` |
 | M5b | `doctor`, `purge`, export and import, `cargo xtask compat`, §12.5's `replacement-unreadable`, the `unquarantine` event on every quarantine clear (§7.4), release |
 
 **Deliberately absent from M5a, and why that is safe:**
 - **No `doctor`.** Task 2's `settings::inspect` reports unknown keys and invalid values in the shape `doctor` (M5b) will read. Until then `config list` shows them.
-- **No consumer of the auto-switch keys.** Task 2 reads `autoswitch.interval_seconds`, `cooldown_seconds`, `hysteresis_pct`, `strategy`, `include_api_key_accounts` and `unhealthy_ticks` into `Settings`. M3b's `auto` is their first reader, and nothing in M5a changes behaviour on them.
+- **No change to the auto-switch keys' behaviour.** M3b (merged) already reads `autoswitch.interval_seconds`, `cooldown_seconds`, `hysteresis_pct`, `strategy`, `include_api_key_accounts` and `unhealthy_ticks` into `Settings`, and `auto` uses them. Task 2 folds M3b's reader into the registry and keeps its behaviour and tests ("M3b" under the interfaces below).
 - **No §7.4 `unquarantine` event for the switch's outgoing capture.** That is M5b's, next to `import`, the other path that clears a quarantine.
 - **`replacement-unreadable`** (§12.5) needs M4a's `finish_replacement`, and is M5b's.
 - **Engine errors are not yet logged by `kind()` alone.** Several `EngineError` variants carry a label, often an email, in their `Display`: `UnreadableAccount`, `NeedsRelogin`, `RescuePending`, `OwnerMismatch`, `IdentityConflict`, `NeedsConfirmation`, `Ambiguous` and `NoSuchAccount`. Task 7's audit traced every `{e}` a log line formats today, and none can be one of them, so no line leaks a label now. Nothing stops a later line from formatting one, so M5b's review takes the rule that a new log line formats an engine error by `kind()`, or only on a path that cannot carry a label.
@@ -158,7 +168,7 @@ Rulings made while planning. Each names what it would cost if wrong.
     - "Not absolute" is `Path::is_absolute`. `/` and a trailing slash pass, nothing is canonicalized, and only `HOME` is checked (Task 1).
     - Only the status bar's own call (`statusline` without `--print-config` or `--json`) answers an unusable `HOME` with silence (Task 1).
     - `EngineError::Settings` and its kinds are Task 2's; Task 4 adds only the settings arm of M3a's `signal()` (Tasks 2, 4).
-    - A boolean in the file is a TOML boolean only. `"yes"`, `"true"` or `1` there warns and falls back; the six words are the command line's (Task 2).
+    - A boolean in the file reads as M3b's `parse_bool_item` reads it: a TOML boolean, an integer `1` or `0`, or one of the six words as a string; the command line takes the six words through `parse_bool` (Task 2, after the M3b re-sync).
     - `keys_this_milestone_does_not_read_are_ignored_without_a_warning` becomes `an_unknown_key_is_ignored_without_a_warning`, since the keys it listed are read now (Task 2).
     - An unknown key is listed by `config list`, never warned about, sorted by dotted name (Task 2).
     - A float prints in Rust's shortest form (`80`), which `config set` takes back unchanged (Task 2).
@@ -914,7 +924,7 @@ git commit -m "Refuse to run when HOME is unset, empty or relative"
 §6.4: "**One registry.** Every key in the table below is declared once, with its type, default, valid values and whether a provider table may override it. Reads, `set` and `unset`, `config list`, `doctor` (§13.6) and completions (§13.7) all use that declaration, so none of them accepts a key or value that another rejects." "**Reads are forgiving.** A corrupt file or an invalid value falls back to the default, with a warning. An unknown key is ignored; `config list` and `doctor` report it." "**Values on the command line.** Numbers are written as typed. **Booleans** parse only `true/false/1/0/yes/no` and are written as TOML booleans. **Lists** are comma-separated; each item is trimmed, and an empty item is refused. An empty argument (`''`) writes an empty list, which is how a provider table overrides a non-empty global list. `all` in `autoswitch.models` must stand alone." "`provider.<id>.<key>` and `<key> --provider <id>` name the same entry in every `config` command." This task declares every §6.4 key once, in `KEYS`, with its kind, its "must be …" phrase and its per-provider flag. One per-key reader serves both `Settings::load` and the new `inspect`, which reports each key's value, default and source and the keys the file holds that the registry does not know (Decision 1). `Key::parse_arg` is the strict command-line parser that Task 4's `set` uses, and `resolve` maps a key's two spellings to one entry. `SettingsError` reaches the CLI as `EngineError::Settings`, with Decision 4's kinds. The reader learns `default_provider` and the six `autoswitch` keys M2b skipped; nothing in M5a acts on the six yet (M3b's `auto` is their first reader).
 
 **Readings of the spec this task commits to:**
-- **A boolean in the file is a TOML boolean.** §6.4 writes booleans "as TOML booleans"; the six words are the command line's spelling. A string (`"yes"`, `"true"`) or an integer in the file warns and falls back like any invalid value.
+- **A boolean in the file is a TOML boolean.** §6.4 writes booleans "as TOML booleans"; the six words are the command line's spelling. A string (`"yes"`, `"true"`) or an integer in the file warns and falls back like any invalid value. *Superseded at the re-sync by M3b's merged reader:* a TOML boolean, an integer `1` or `0`, or one of the six words as a string all read; `a_boolean_key_reads_a_toml_boolean_and_nothing_else` takes M3b's cases ("M3b" under the interfaces list).
 - **A float key reads a TOML integer** (`hysteresis_pct = 5` is 5.0), as `autoswitch.threshold` always has; an integer key refuses a float (`60.0`), as `usage.history_retention_days` always has.
 - **`default_provider` is read from the top level only,** whichever provider reads the file. The reader checks only that it is a well-formed provider id: 1 to 64 lowercase ASCII letters, digits and dashes, with no dash at either end. Whether this build has the provider is the CLI's check (Decision 2, Task 3). A `default_provider` inside a provider table is an unknown key.
 - **A key's source is the table its value came from.** An invalid provider value that falls through to a valid global value is `global`; nothing valid anywhere is `default`.
