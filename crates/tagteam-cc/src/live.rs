@@ -933,6 +933,28 @@ impl LiveStore {
         Ok(())
     }
 
+    /// Deletes both axes' Keychain items that `env` names, each verified `Absent` with the
+    /// existence probe (§10.3, §12.3 step 5). Nothing off macOS, where CC keeps no item. It is
+    /// for a profile's items, which are no part of any operation, so it touches no ledger. Each
+    /// delete holds CC's storage-write lock (§9.1), the lock `paths` names, alone and with no
+    /// comparison against an earlier read: a profile's removal deletes whatever is there, and a
+    /// per-config-dir daemon may still write the entry. `env` names the items (the recorded
+    /// spelling) and `paths` the lock (the profile's actual directory, Decision 19).
+    pub(crate) fn delete_items(&self, env: &Env, paths: &CcPaths) -> Result<(), ProviderError> {
+        if !self.mac() {
+            return Ok(());
+        }
+        let acct = keychain_account(env);
+        for kind in [ItemKind::OAuth, ItemKind::ManagedKey] {
+            let svc = keychain_service(env, kind);
+            let lock = self.storage_write(paths, &env.cancel)?;
+            if !self.delete_verified(&svc, &acct, &held(&|| Ok(()), &lock))? {
+                return Err(ProviderError::ShadowingItem(svc));
+            }
+        }
+        Ok(())
+    }
+
     /// Refuses when any entry a switch may overwrite cannot be read.
     pub fn snapshot(&self, env: &Env, paths: &CcPaths) -> Result<Snapshot, ProviderError> {
         let acct = keychain_account(env);

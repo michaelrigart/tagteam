@@ -13,8 +13,9 @@ use tagteam_fake::{
 use tagteam_provider::http::{HttpError, HttpResponse, Method, RecordedRequest, ScriptedHttp};
 use tagteam_provider::provider::TransientKind;
 use tagteam_provider::{
-    Capabilities, Credential, Env, LiveChange, LockError, MutationGuard, Pace, PollBudget,
-    Provider, ProviderError, Read, SecretStore, StoredLogin, UsageResult, Window, Written,
+    Capabilities, Credential, EntryKind, Env, LiveChange, LockError, MustShare, MutationGuard,
+    Pace, PollBudget, Provenance, Provider, ProviderError, Read, SecretStore, SharePolicy,
+    StoredLogin, UsageResult, Window, Written,
 };
 
 struct Fx {
@@ -113,6 +114,7 @@ fn kinds_capabilities_endpoints_and_surface() {
         Capabilities {
             usage: true,
             refresh: true,
+            sessions: true,
             ..Capabilities::default()
         }
     );
@@ -558,4 +560,166 @@ fn fake_agent_offers_consume_first_no_long_window() {
         f.fake.describe_window("monthly").map(|w| w.kind),
         Some(WindowKind::Long)
     );
+}
+
+/// `f.env` with `FAKEAGENT_HOME` set to `v`.
+fn with_home(f: &Fx, v: &str) -> Env {
+    let mut env = f.env.clone();
+    env.vars.insert("FAKEAGENT_HOME".into(), v.into());
+    env
+}
+
+#[test]
+fn fakeagent_home_moves_its_state_and_an_empty_one_is_unset() {
+    let f = fx();
+    let home = f.env.home.join("elsewhere");
+    let p = FakePaths::resolve(&with_home(&f, home.to_str().unwrap()));
+    assert_eq!(
+        (p.dir.clone(), p.credential, p.identity, p.lock),
+        (
+            home.clone(),
+            home.join("credential.json"),
+            home.join("identity.json"),
+            home.join(".live.lock")
+        )
+    );
+    assert_eq!(
+        FakePaths::resolve(&with_home(&f, "")).dir,
+        f.env.home.join(".fakeagent")
+    );
+    assert_eq!(
+        FakePaths::resolve(&f.env).dir,
+        f.env.home.join(".fakeagent")
+    );
+}
+
+#[test]
+fn its_session_facts_are_deliberately_unlike_claude_code_s() {
+    let f = fx();
+    assert_eq!(f.fake.launch_command(), "fakeagent");
+    assert_eq!(f.fake.session_dir_var(), Some("FAKEAGENT_HOME"));
+    assert_eq!(f.fake.session_dir(&f.env), None);
+    assert_eq!(f.fake.session_dir(&with_home(&f, "")), None);
+    assert_eq!(
+        f.fake.session_dir(&with_home(&f, "/p/0193")),
+        Some(std::path::PathBuf::from("/p/0193"))
+    );
+    assert_eq!(
+        f.fake.session_records_dir(std::path::Path::new("/p/0193")),
+        std::path::Path::new("/p/0193/procs")
+    );
+    assert_eq!(
+        f.fake
+            .profile_spelling(std::path::Path::new("/p/cafe\u{301}")),
+        "/p/cafe\u{301}",
+        "the path as it is: no NFC"
+    );
+    let mut cc_shaped = with_home(&f, "/p/0193");
+    cc_shaped.vars.insert("CLAUDECODE".into(), "1".into());
+    cc_shaped.claude_config_dir = Some("/p/0193".into());
+    assert!(!f.fake.invoked_by(&cc_shaped));
+    assert_eq!(
+        f.fake.share_policy(&f.env),
+        SharePolicy {
+            source: f.env.home.join(".fakeagent"),
+            shared: vec!["notes", "prefs.json"],
+            must_share: vec![MustShare {
+                name: "journal.log",
+                kind: EntryKind::File
+            }],
+            private: vec![
+                "credential.json",
+                "identity.json",
+                "procs",
+                ".live.lock",
+                ".tagteam-*"
+            ],
+        }
+    );
+}
+
+#[test]
+fn its_outer_home_round_trips_unset_set_and_empty() {
+    let f = fx();
+    let inside = with_home(&f, "/data/sessions/0193");
+    for home in [None, Some("/h/.fakeagent-custom"), Some("")] {
+        let outer_env = match home {
+            Some(h) => with_home(&f, h),
+            None => f.env.clone(),
+        };
+        let outer = f.fake.outer_home(&outer_env);
+        assert_eq!(outer, json!({"FAKEAGENT_HOME": home}), "{home:?}");
+        let restored = f.fake.apply_outer_home(&inside, &outer).unwrap();
+        assert_eq!(
+            restored.var("FAKEAGENT_HOME"),
+            home.map(std::ffi::OsStr::new),
+            "{home:?}"
+        );
+    }
+    for outer in [
+        json!({}),
+        json!({"FAKEAGENT_HOME": 7}),
+        json!({"CLAUDE_CONFIG_DIR": "SENTINEL"}),
+    ] {
+        match f.fake.apply_outer_home(&inside, &outer) {
+            Err(ProviderError::Invalid(msg)) => assert!(!msg.contains("SENTINEL"), "{msg}"),
+            other => panic!("{outer}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn its_profile_credential_and_identity_are_read_in_the_profile_s_directory() {
+    let f = fx();
+    let profile = f.env.data_dir().join("sessions/0193");
+    fs::create_dir_all(&profile).unwrap();
+    let spelling = profile.to_str().unwrap();
+    // Decision 19: a spelling the data directory has moved away from names nothing FakeAgent
+    // reads, since it keeps no item.
+    let gone = f.env.home.join("moved-from/sessions/0193");
+    let gone = gone.to_str().unwrap();
+    login(&f.env, "alice", "ws", "tok-live", "renew-live");
+    assert!(matches!(
+        f.fake.read_profile_credential(&f.env, &profile, spelling),
+        Read::Absent
+    ));
+    assert!(matches!(
+        f.fake.profile_identity(&f.env, &profile),
+        Read::Absent
+    ));
+    login(&with_home(&f, spelling), "bob", "ws2", "tok-p", "renew-p");
+    for recorded in [spelling, gone] {
+        let c = f
+            .fake
+            .read_profile_credential(&f.env, &profile, recorded)
+            .present()
+            .unwrap();
+        assert_eq!(c.provenance(), Provenance::Fresh, "{recorded}");
+        assert_eq!(
+            f.fake.fingerprint(c.bytes()),
+            Some(tagteam_core::Fingerprint::of_secret(b"renew-p")),
+            "{recorded}"
+        );
+    }
+    assert!(
+        f.fake
+            .read_profile_credential(&f.env, std::path::Path::new(gone), gone)
+            .present()
+            .is_none(),
+        "nothing is where the profile was"
+    );
+    let id = f.fake.profile_identity(&f.env, &profile).present().unwrap();
+    assert_eq!(id.label, "bob@ws2");
+    f.fake
+        .delete_profile_credential(&f.env, &profile, spelling)
+        .unwrap();
+    assert!(
+        profile.join("credential.json").exists(),
+        "FakeAgent keeps nothing outside the directory to delete"
+    );
+    fs::write(profile.join("identity.json"), b"{\"identity\": {").unwrap();
+    assert!(matches!(
+        f.fake.profile_identity(&f.env, &profile),
+        Read::Unreadable(_)
+    ));
 }

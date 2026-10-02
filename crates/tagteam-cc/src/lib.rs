@@ -7,6 +7,7 @@ pub mod naming;
 pub mod oauth;
 pub mod paths;
 pub mod provider;
+mod session;
 pub mod shape;
 pub mod usage;
 
