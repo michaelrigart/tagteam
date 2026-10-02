@@ -97,15 +97,24 @@ pub enum RecordEntry {
     },
 }
 
-/// Every `*.json` in `dir`, in name order. A missing `dir` is `Present(vec![])`; a `dir` that
-/// cannot be listed is `Unreadable`. A record that vanishes between the listing and its read
+/// Every `*.json` in `dir`, in name order. A missing `dir` is `Present(vec![])`, and so is one
+/// that is not a directory, or under a profile path that is not one (`ENOTDIR`): no record can
+/// be written there. A `dir` that cannot be listed is `Unreadable`. A record that vanishes between the listing and its read
 /// has been removed by its session's exit, so it is skipped.
 pub fn read_session_records(dir: &Path) -> Read<Vec<RecordEntry>> {
     let unreadable =
         |e: io::Error| Read::Unreadable(ReadError::new(dir.display().to_string(), e.to_string()));
+    // Nothing that is not a directory, the profile's own path included, holds a record.
     let listing = match fs::read_dir(dir) {
         Ok(l) => l,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Read::Present(vec![]),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Read::Present(vec![]);
+        }
         Err(e) => return unreadable(e),
     };
     let mut paths = Vec::new();
@@ -482,6 +491,7 @@ pub fn record_is_live(probe: &dyn ProcessProbe, r: &SessionRecord, launch_comman
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
 
     fn record(v: Value) -> Result<SessionRecord, String> {
         parse_session_record(v.to_string().as_bytes())
@@ -620,10 +630,28 @@ mod tests {
 
     #[test]
     fn a_records_directory_that_cannot_be_listed_is_unreadable() {
+        // Run as a non-root user: root lists a 0o000 directory.
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("sessions");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let found = read_session_records(&dir);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(found, Read::Unreadable(_)), "{found:?}");
+    }
+
+    #[test]
+    fn no_record_can_lie_under_something_that_is_not_a_directory() {
+        // A regular file at the records directory's path, or at the profile's own: none, not
+        // unreadable.
         let d = tempfile::tempdir().unwrap();
         let file = d.path().join("sessions");
         fs::write(&file, b"").unwrap();
-        assert!(matches!(read_session_records(&file), Read::Unreadable(_)));
+        assert!(matches!(read_session_records(&file), Read::Present(v) if v.is_empty()));
+        assert!(matches!(
+            read_session_records(&file.join("sessions")),
+            Read::Present(v) if v.is_empty()
+        ));
     }
 
     #[test]
