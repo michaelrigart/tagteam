@@ -26,7 +26,7 @@ impl ProcessStamp {
 
 /// `/proc/<pid>/stat` field 22, counted after the last `)`.
 #[cfg(target_os = "linux")]
-fn start_of(pid: u32) -> io::Result<Option<u64>> {
+pub(crate) fn start_of(pid: u32) -> io::Result<Option<u64>> {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -47,7 +47,7 @@ fn start_of(pid: u32) -> io::Result<Option<u64>> {
 
 /// `proc_pidinfo(PROC_PIDTBSDINFO)` start time, in microseconds.
 #[cfg(target_os = "macos")]
-fn start_of(pid: u32) -> io::Result<Option<u64>> {
+pub(crate) fn start_of(pid: u32) -> io::Result<Option<u64>> {
     // SAFETY: `proc_bsdinfo` is a C struct of plain integers; the zeroed value is a valid
     // bit pattern for it and is fully overwritten by `proc_pidinfo` below on success.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
