@@ -357,17 +357,12 @@ fn every_m1_command_writes_only_the_identity_surface_through_symlinked_config_on
 }
 
 #[test]
-fn fallback_keychain_items_stay_within_the_surface() {
-    // An explicit CLAUDE_CONFIG_DIR=~/.claude: readers also try the unsuffixed items, so a
-    // switch may touch them, and the surface must say so. The planted item holds a real
-    // account-scoped credential (not just machine-shared keys) — a comparison that failed to
-    // recognize this service as part of the surface would flag its rewrite.
-    let fx = Fx::with_fallback_items();
-    fx.put_fallback_item(
-        Fx::credential_json("old@x.co", "rt-old")
-            .to_string()
-            .as_bytes(),
-    );
+fn inert_former_fallback_items_stay_byte_identical() {
+    // An explicit CLAUDE_CONFIG_DIR=~/.claude names only the suffixed items (Appendix A.2), so
+    // the surface lists those alone, and the unsuffixed items fall under the byte-for-byte
+    // rule: any command that read-modified-wrote one would be flagged.
+    let fx = Fx::with_explicit_default_config_dir();
+    fx.put_inert_items();
     run_every_command_on(&fx);
 }
 

@@ -1802,13 +1802,13 @@ impl Engine {
                 self.read_target(&target)?
             }
         };
-        // Step 7's rule: every entry the write surely destroys is saved first, unless a vault
-        // of either account, or steps 2 and 4, already hold its generation. What only a
-        // Keychain-refusal fallback destroys is saved by `before_fallback`, if it happens.
+        // Step 7's rule: every entry the write destroys is saved first, unless a vault of
+        // either account, or steps 2 and 4, already hold its generation. A Keychain-refusal
+        // fallback reports what it deletes to `before_fallback` too, which finds it held.
         for id in outgoing.iter().map(|o| &o.id).chain([&target.id]) {
             self.hold_vault(p, &mut held, id);
         }
-        for entry in doomed.iter().filter(|d| !d.on_fallback) {
+        for entry in &doomed {
             if let Read::Present(bytes) = &entry.bytes {
                 self.save_unheld(
                     p,

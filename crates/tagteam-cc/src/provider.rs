@@ -18,7 +18,7 @@ use crate::crash;
 use crate::endpoints::Endpoints;
 use crate::live::{self, Extent, Fence, LiveStore, Platform, Snapshot};
 use crate::locks;
-use crate::naming::{ItemKind, keychain_account, read_services};
+use crate::naming::{ItemKind, keychain_account, keychain_service};
 use crate::oauth;
 use crate::paths::CcPaths;
 use crate::shape::{self, KIND_API_KEY, KINDS, MACHINE_SHARED_KEYS};
@@ -98,17 +98,14 @@ fn fence_of<'a>(locks: &'a LiveLocks<'_>) -> impl Fn() -> Result<(), ProviderErr
     move || locks.check_owned().map_err(ProviderError::from)
 }
 
-/// Every item a reader tries for `kind`, paired with the account: the credential- or
-/// managed-key half of §3's identity surface. Empty off macOS, where CC never touches the
-/// Keychain (Appendix A.3).
+/// `kind`'s one Keychain item for `env` (Appendix A.2), paired with the account: the
+/// credential- or managed-key half of §3's identity surface. Empty off macOS, where CC never
+/// touches the Keychain (Appendix A.3).
 fn keychain_items(env: &Env, kind: ItemKind, acct: &str, mac: bool) -> Vec<(String, String)> {
     if !mac {
         return vec![];
     }
-    read_services(env, kind)
-        .into_iter()
-        .map(|s| (s, acct.to_owned()))
-        .collect()
+    vec![(keychain_service(env, kind), acct.to_owned())]
 }
 
 /// The object to compose the target's machine-shared keys from (§9.4 step 3): `Absent` is a

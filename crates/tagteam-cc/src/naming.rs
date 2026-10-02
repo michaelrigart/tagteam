@@ -1,5 +1,4 @@
 use std::ffi::CStr;
-use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use tagteam_provider::Env;
@@ -42,39 +41,6 @@ fn service_for(kind: ItemKind, source: Option<&str>) -> String {
 
 pub fn keychain_service(env: &Env, kind: ItemKind) -> String {
     service_for(kind, suffix_source(env).as_deref())
-}
-
-/// Every item a reader tries, primary first (Appendix A.2): a symlinked directory is also read
-/// as the hash of its target (a relative target joins the link's parent), and an explicitly
-/// set `CLAUDE_CONFIG_DIR=~/.claude` also falls back to the unsuffixed item. Anything that
-/// snapshots, clears or restores the live credential must cover all of them.
-pub fn read_services(env: &Env, kind: ItemKind) -> Vec<String> {
-    let mut out = vec![keychain_service(env, kind)];
-    let mut push = |s: String| {
-        if !out.contains(&s) {
-            out.push(s);
-        }
-    };
-    if let Some(dir) = suffix_source(env) {
-        let link = PathBuf::from(&dir);
-        if let Ok(target) = std::fs::read_link(&link) {
-            let target = if target.is_absolute() {
-                target
-            } else {
-                link.parent().unwrap_or(Path::new("/")).join(target)
-            };
-            push(service_for(kind, Some(&nfc(target.as_os_str()))));
-        }
-    }
-    let explicit_default = env.claude_securestorage_config_dir.is_none()
-        && env.claude_config_dir.as_deref().is_some_and(|v| {
-            let s = v.to_string_lossy();
-            PathBuf::from(s.trim_end_matches('/')) == env.home.join(".claude")
-        });
-    if explicit_default {
-        push(service_for(kind, None));
-    }
-    out
 }
 
 /// The effective user's passwd name, through the re-entrant `getpwuid_r` (L380): tagteam's
@@ -228,39 +194,37 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_default_config_dir_reads_suffixed_then_plain() {
+    fn an_explicit_default_config_dir_names_only_its_suffixed_items() {
+        // Appendix A.2 (2.1.286): no fallback to the unsuffixed items for `~/.claude`.
         let mut e = env();
         e.claude_config_dir = Some("/home/tester/.claude".into());
         assert_eq!(
-            read_services(&e, ItemKind::OAuth),
-            vec![
-                "Claude Code-credentials-b2e2cf9d".to_string(),
-                "Claude Code-credentials".into()
-            ]
+            keychain_service(&e, ItemKind::OAuth),
+            "Claude Code-credentials-b2e2cf9d"
         );
-        e.claude_config_dir = Some("/home/tester/profile".into());
-        assert_eq!(read_services(&e, ItemKind::OAuth).len(), 1);
+        assert_eq!(
+            keychain_service(&e, ItemKind::ManagedKey),
+            "Claude Code-b2e2cf9d"
+        );
     }
 
     #[test]
-    fn a_symlinked_config_dir_is_also_read_by_its_target() {
+    fn a_symlinked_config_dir_is_named_by_the_link_s_spelling_alone() {
         let d = tempfile::tempdir().unwrap();
         let target = d.path().join("real");
         std::fs::create_dir(&target).unwrap();
         let link = d.path().join("link");
-        std::os::unix::fs::symlink("real", &link).unwrap(); // relative target
+        std::os::unix::fs::symlink("real", &link).unwrap();
         let mut e = env();
         e.claude_config_dir = Some(link.clone().into_os_string());
         let hash = |p: &Path| {
             hex::encode(Sha256::digest(p.to_str().unwrap().as_bytes()).as_slice())[..8].to_owned()
         };
         assert_eq!(
-            read_services(&e, ItemKind::OAuth),
-            vec![
-                format!("Claude Code-credentials-{}", hash(&link)),
-                format!("Claude Code-credentials-{}", hash(&target))
-            ]
+            keychain_service(&e, ItemKind::OAuth),
+            format!("Claude Code-credentials-{}", hash(&link))
         );
+        assert_ne!(hash(&link), hash(&target));
     }
 
     #[test]

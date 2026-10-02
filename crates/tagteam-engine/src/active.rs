@@ -543,7 +543,7 @@ impl Engine {
         held.hold(p, secret);
         self.hold_vault(p, &mut held, &row.id);
         let mut warnings = Vec::new();
-        for entry in doomed.iter().filter(|d| !d.on_fallback) {
+        for entry in &doomed {
             if let Read::Present(bytes) = &entry.bytes {
                 if let Err(e) = self.save_unheld(
                     p,

@@ -16,7 +16,7 @@ use tagteam_provider::{
 
 use crate::config::{self, read_bytes};
 use crate::locks;
-use crate::naming::{ItemKind, keychain_account, keychain_service, read_services};
+use crate::naming::{ItemKind, keychain_account, keychain_service};
 use crate::paths::CcPaths;
 use crate::provider::CONFIG_REMEDY;
 use crate::shape::{MACHINE_SHARED_KEYS, machine_shared_only};
@@ -178,16 +178,15 @@ impl Platform {
 pub enum Extent {
     /// Left alone.
     None,
-    /// Written: the primary item, and the file or `primaryApiKey` behind it. The other items a
-    /// reader tries go only if the Keychain refuses the write and it falls back (Appendix
-    /// A.3), or always once the credential entry is pinned to the file.
+    /// Written: the axis's one Keychain item (Appendix A.2), and the file or `primaryApiKey`
+    /// behind it.
     Written,
-    /// Cleared: every item a reader tries, and the file or `primaryApiKey`.
+    /// Cleared: the same entries, deleted or stripped to their machine-shared keys.
     Cleared,
 }
 
-/// The exact prior state of every entry a switch may write, including every Keychain item a
-/// reader tries (Appendix A.2). It holds secrets, so it has no `Debug`.
+/// The exact prior state of every entry a switch may write: each axis's one Keychain item
+/// (Appendix A.2; none off macOS) and the two files. It holds secrets, so it has no `Debug`.
 #[derive(Clone)]
 pub struct Snapshot {
     oauth_items: Vec<ItemSnapshot>,
@@ -402,8 +401,8 @@ impl LiveStore {
     }
 
     /// Every place of `kind`'s entry, read again under the storage-write lock, strictly (Appendix
-    /// A.3): the Keychain items a reader tries, in reader order (macOS), then, for the OAuth
-    /// entry, the credentials file. An item that exists but cannot be read refuses.
+    /// A.3): the entry's one Keychain item (Appendix A.2; macOS), then, for the OAuth entry, the
+    /// credentials file. An item that exists but cannot be read refuses.
     fn places_now(
         &self,
         env: &Env,
@@ -412,11 +411,10 @@ impl LiveStore {
     ) -> Result<Places, ProviderError> {
         let mut out = Vec::new();
         if self.mac() {
+            let svc = keychain_service(env, kind);
             let acct = keychain_account(env);
-            for svc in read_services(env, kind) {
-                let value = present_or_err(self.retrying(|| self.keychain.find(&svc, &acct)))?;
-                out.push((svc, value));
-            }
+            let value = present_or_err(self.retrying(|| self.keychain.find(&svc, &acct)))?;
+            out.push((svc, value));
         }
         if kind == ItemKind::OAuth {
             let file = present_or_err(read_bytes(&paths.credentials_file))?;
@@ -569,28 +567,16 @@ impl LiveStore {
         r
     }
 
-    /// The first item that answers, in reader order. An unreadable item stops the search: a
-    /// later fallback might be superseded by what the unreadable one holds, so it is never
-    /// returned as if it were authoritative.
-    fn find_first(&self, services: &[String], acct: &str) -> Read<Vec<u8>> {
-        for svc in services {
-            match self.keychain.find(svc, acct) {
-                Read::Absent => continue,
-                other => return other,
-            }
-        }
-        Read::Absent
-    }
-
     /// Keychain first, retried twice 300 ms apart; the file covers an absent item. A failed
-    /// Keychain read covered by the file is `Degraded` (§4.3).
+    /// Keychain read covered by the file is `Degraded` (§4.3). The one item `env` names is the
+    /// only one read (Appendix A.2): no other spelling's item is ever consulted.
     pub fn read_credential(&self, env: &Env, paths: &CcPaths) -> Read<Credential> {
         if !self.mac() {
             return read_bytes(&paths.credentials_file).map(Credential::fresh);
         }
-        let services = read_services(env, ItemKind::OAuth);
+        let svc = keychain_service(env, ItemKind::OAuth);
         let acct = keychain_account(env);
-        match self.retrying(|| self.find_first(&services, &acct)) {
+        match self.retrying(|| self.keychain.find(&svc, &acct)) {
             Read::Present(b) => Read::Present(Credential::fresh(b)),
             Read::Absent => read_bytes(&paths.credentials_file).map(Credential::fresh),
             Read::Unreadable(e) => match read_bytes(&paths.credentials_file) {
@@ -606,8 +592,8 @@ impl LiveStore {
     /// both write paths remove it anyway.
     pub fn read_managed_key(&self, env: &Env, paths: &CcPaths) -> Read<Vec<u8>> {
         if self.mac() {
-            match self.find_first(
-                &read_services(env, ItemKind::ManagedKey),
+            match self.keychain.find(
+                &keychain_service(env, ItemKind::ManagedKey),
                 &keychain_account(env),
             ) {
                 Read::Present(v) => return Read::Present(v),
@@ -619,9 +605,8 @@ impl LiveStore {
     }
 
     /// Every entry holding secrets that a change of these extents destroys, read now (§9.4
-    /// step 7): on each axis the Keychain items a reader tries, in reader order, then the
-    /// plaintext entry behind them (`.credentials.json`, `primaryApiKey`). An absent entry is
-    /// listed as `Absent`.
+    /// step 7): on each axis its Keychain item, then the plaintext entry behind it
+    /// (`.credentials.json`, `primaryApiKey`). An absent entry is listed as `Absent`.
     pub fn doomed(
         &self,
         env: &Env,
@@ -630,71 +615,72 @@ impl LiveStore {
         managed: Extent,
     ) -> Vec<DoomedEntry> {
         let mut out = Vec::new();
-        let axes = [
-            (ItemKind::OAuth, entry, self.file_mode_pinned()),
-            (ItemKind::ManagedKey, managed, false),
-        ];
-        for (kind, extent, pinned) in axes {
+        for (kind, extent) in [(ItemKind::OAuth, entry), (ItemKind::ManagedKey, managed)] {
             if extent == Extent::None {
                 continue;
             }
             if self.mac() {
-                let acct = keychain_account(env);
-                for (i, svc) in read_services(env, kind).iter().enumerate() {
-                    out.push(DoomedEntry {
-                        bytes: self.retrying(|| self.keychain.find(svc, &acct)),
-                        on_fallback: extent == Extent::Written && i > 0 && !pinned,
-                    });
-                }
+                let (svc, acct) = (keychain_service(env, kind), keychain_account(env));
+                out.push(DoomedEntry {
+                    bytes: self.retrying(|| self.keychain.find(&svc, &acct)),
+                });
             }
             let plain = match kind {
                 ItemKind::OAuth => read_bytes(&paths.credentials_file),
                 ItemKind::ManagedKey => read_primary_api_key(paths),
             };
-            out.push(DoomedEntry {
-                bytes: plain,
-                on_fallback: false,
-            });
+            out.push(DoomedEntry { bytes: plain });
         }
         out
     }
 
-    /// Hands `before_fallback` the current bytes of every item a reader tries for `kind`, before
-    /// a fallback deletes them all.
-    fn report_items(
+    /// Hands `before_fallback` the current bytes of `kind`'s item, before a fallback deletes it.
+    fn report_item(
         &self,
         env: &Env,
         kind: ItemKind,
         before_fallback: BeforeFallback<'_>,
     ) -> Result<(), ProviderError> {
-        let acct = keychain_account(env);
-        for svc in read_services(env, kind) {
-            if let Some(bytes) = present_or_err(self.keychain.find(&svc, &acct))? {
-                before_fallback(&bytes)?;
-            }
+        let found = self
+            .keychain
+            .find(&keychain_service(env, kind), &keychain_account(env));
+        if let Some(bytes) = present_or_err(found)? {
+            before_fallback(&bytes)?;
         }
         Ok(())
     }
 
-    /// Deletes every item a reader would try for `kind`, and verifies each one gone.
-    fn remove_items(
+    /// Deletes `kind`'s item and verifies it gone with the existence probe (Appendix A.3),
+    /// recording both in the operation's ledger.
+    fn remove_item(
         &self,
         env: &Env,
         kind: ItemKind,
         fence: Fence<'_>,
     ) -> Result<(), ProviderError> {
-        let acct = keychain_account(env);
-        for svc in read_services(env, kind) {
-            self.intend(kind, &svc, None);
-            fence()?;
-            let _ = self.keychain.delete(&svc, &acct);
-            let gone = matches!(self.keychain.exists(&svc, &acct), Read::Absent);
-            self.settle_item(env, kind, &svc, None, gone);
-            if !gone {
-                return Err(ProviderError::ShadowingItem(svc));
-            }
+        let (svc, acct) = (keychain_service(env, kind), keychain_account(env));
+        self.intend(kind, &svc, None);
+        let gone = self.delete_verified(&svc, &acct, fence)?;
+        self.settle_item(env, kind, &svc, None, gone);
+        if !gone {
+            return Err(ProviderError::ShadowingItem(svc));
         }
         Ok(())
+    }
+
+    /// Checks `fence`, deletes the item `svc`/`acct` and returns whether the existence probe
+    /// now finds it `Absent`. A delete that fails is not an error of its own: the probe decides.
+    /// It touches no ledger and takes no lock, so a caller that needs either wraps it
+    /// (`remove_item` does the ledger).
+    fn delete_verified(
+        &self,
+        svc: &str,
+        acct: &str,
+        fence: Fence<'_>,
+    ) -> Result<bool, ProviderError> {
+        fence()?;
+        let _ = self.keychain.delete(svc, acct);
+        Ok(matches!(self.keychain.exists(svc, acct), Read::Absent))
     }
 
     fn write_file(
@@ -711,8 +697,8 @@ impl LiveStore {
         written
     }
 
-    /// Appendix A.3 write, including the verified file fallback, which first reports every
-    /// item it will delete to `before_fallback`. A fallback pins file mode, so every later
+    /// Appendix A.3 write, including the verified file fallback, which first reports the item
+    /// it will delete to `before_fallback`. A fallback pins file mode, so every later
     /// write of the same operation goes straight to the file. Returns where this write put the
     /// credential: a file mirrored for hot reload does not make it a file store.
     ///
@@ -770,15 +756,15 @@ impl LiveStore {
                 ),
             }
         }
-        self.report_items(env, ItemKind::OAuth, before_fallback)?;
+        self.report_item(env, ItemKind::OAuth, before_fallback)?;
         self.write_file(paths, bytes, fence)?;
-        self.remove_items(env, ItemKind::OAuth, fence)?;
+        self.remove_item(env, ItemKind::OAuth, fence)?;
         self.file_mode_pinned.store(true, Ordering::SeqCst);
         Ok(SecretStore::Fallback(paths.credentials_file.clone()))
     }
 
-    /// API-key activation: keep only the machine-shared keys of every credential entry a
-    /// reader would try; delete an entry when none remain (§9.4 step 7). It holds CC's
+    /// API-key activation: keep only the machine-shared keys of the credential item and the
+    /// credentials file; delete either when none remain (§9.4 step 7). It holds CC's
     /// storage-write lock throughout and refuses, writing nothing, if the entry's
     /// account-scoped keys moved (§9.1); what each place keeps is read under the lock.
     pub fn clear_credential_account_keys(
@@ -800,19 +786,20 @@ impl LiveStore {
         fence: Fence<'_>,
     ) -> Result<(), ProviderError> {
         if self.mac() {
-            let acct = keychain_account(env);
-            for svc in read_services(env, ItemKind::OAuth) {
-                if let Some(b) = present_or_err(self.keychain.find(&svc, &acct))? {
-                    let kept = keep_shared(&b)?;
-                    self.intend(ItemKind::OAuth, &svc, kept.as_deref());
-                    fence()?;
-                    let cleared = match &kept {
-                        Some(k) => self.keychain.upsert(&svc, &acct, k),
-                        None => self.keychain.delete(&svc, &acct),
-                    };
-                    self.settle_item(env, ItemKind::OAuth, &svc, kept.as_deref(), cleared.is_ok());
-                    cleared?;
-                }
+            let (svc, acct) = (
+                keychain_service(env, ItemKind::OAuth),
+                keychain_account(env),
+            );
+            if let Some(b) = present_or_err(self.keychain.find(&svc, &acct))? {
+                let kept = keep_shared(&b)?;
+                self.intend(ItemKind::OAuth, &svc, kept.as_deref());
+                fence()?;
+                let cleared = match &kept {
+                    Some(k) => self.keychain.upsert(&svc, &acct, k),
+                    None => self.keychain.delete(&svc, &acct),
+                };
+                self.settle_item(env, ItemKind::OAuth, &svc, kept.as_deref(), cleared.is_ok());
+                cleared?;
             }
         }
         if let Some(b) = present_or_err(read_bytes(&paths.credentials_file))? {
@@ -832,7 +819,7 @@ impl LiveStore {
     /// the key in the managed-key item, clearing any stale `primaryApiKey` a previous
     /// Keychain failure left behind (otherwise another account's plaintext key would stay
     /// live in `~/.claude.json`). When the Keychain refuses, the key goes to `primaryApiKey`
-    /// instead, and every managed-key item is removed and verified gone, after being reported
+    /// instead, and the managed-key item is removed and verified gone, after being reported
     /// to `before_fallback`: CC reads the Keychain first, so a stale item would stay the
     /// effective key. Returns where this write put the key; the credential entry's file pin
     /// plays no part in it. The managed-key item's write, its fallback included, holds CC's
@@ -916,9 +903,9 @@ impl LiveStore {
                         tracing::warn!("keychain write failed, storing primaryApiKey instead: {e}")
                     }
                 }
-                self.report_items(env, ItemKind::ManagedKey, before_fallback)?;
+                self.report_item(env, ItemKind::ManagedKey, before_fallback)?;
                 in_primary(fence)?;
-                self.remove_items(env, ItemKind::ManagedKey, fence)?;
+                self.remove_item(env, ItemKind::ManagedKey, fence)?;
                 Ok(false)
             })?;
         if !in_keychain {
@@ -928,9 +915,9 @@ impl LiveStore {
         Ok(SecretStore::Keychain)
     }
 
-    /// Writing OAuth clears the managed key: every managed-key item is deleted (verified) and
-    /// `primaryApiKey` is dropped. `approved` is kept (B.10). The deletes hold CC's
-    /// storage-write lock and refuse if the item moved (§9.1).
+    /// Writing OAuth clears the managed key: the managed-key item is deleted (verified) and
+    /// `primaryApiKey` is dropped. `approved` is kept (B.10). The delete holds CC's
+    /// storage-write lock and refuses if the item moved (§9.1).
     pub fn clear_managed_key(
         &self,
         env: &Env,
@@ -939,7 +926,7 @@ impl LiveStore {
     ) -> Result<(), ProviderError> {
         if self.mac() {
             self.under_storage_write(env, paths, ItemKind::ManagedKey, fence, |_, fence| {
-                self.remove_items(env, ItemKind::ManagedKey, fence)
+                self.remove_item(env, ItemKind::ManagedKey, fence)
             })?;
         }
         config::splice_key(&paths.global_config, "primaryApiKey", None, fence)?;
@@ -953,15 +940,9 @@ impl LiveStore {
             if !self.mac() {
                 return Ok(vec![]);
             }
-            read_services(env, kind)
-                .into_iter()
-                .map(|svc| {
-                    Ok((
-                        svc.clone(),
-                        present_or_err(self.keychain.find(&svc, &acct))?,
-                    ))
-                })
-                .collect()
+            let svc = keychain_service(env, kind);
+            let value = present_or_err(self.keychain.find(&svc, &acct))?;
+            Ok(vec![(svc, value)])
         };
         let snap = Snapshot {
             oauth_items: items(ItemKind::OAuth)?,

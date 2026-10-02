@@ -104,10 +104,6 @@ pub enum LiveChange<'k> {
 pub struct DoomedEntry {
     /// Its current contents.
     pub bytes: Read<Vec<u8>>,
-    /// Destroyed only if the Keychain refuses the write and it falls back to a file (Appendix
-    /// A.3). That is decided only as the write runs, which then reports the entry to
-    /// `before_fallback` just before it deletes it.
-    pub on_fallback: bool,
 }
 
 /// Called by `write_credential` with each live entry a Keychain-refusal fallback is about to
@@ -302,7 +298,7 @@ pub enum ProviderError {
     /// the provider's advice on repairing it.
     #[error("{} is torn or not a JSON object; {remedy}", path.display())]
     ConfigUnsplicable { path: PathBuf, remedy: &'static str },
-    /// A Keychain item `remove_items` could not verify gone: after a file fallback, after a
+    /// A Keychain item `remove_item` could not verify gone: after a file fallback, after a
     /// managed-key fallback, or when a managed key is removed. Claude Code may still read it
     /// (L397); the wording holds for a removal as much as for a write.
     #[error("the Keychain item {0} could not be verified gone, so Claude Code may still read it")]
@@ -811,7 +807,6 @@ mod tests {
         assert!(!format!("{auth:?}").contains("SENTINEL"));
         let doomed = DoomedEntry {
             bytes: Read::Present(SENTINEL.as_bytes().to_vec()),
-            on_fallback: true,
         };
         assert!(!format!("{doomed:?}").contains("SENTINEL"));
     }

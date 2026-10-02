@@ -320,7 +320,6 @@ impl Provider for FakeAgent {
             // The credential file is the one entry a write replaces.
             LiveChange::Write(_) => vec![DoomedEntry {
                 bytes: read_file(&FakePaths::resolve(env).credential),
-                on_fallback: false,
             }],
             // There is no other axis to clear.
             LiveChange::ClearOther(_) => vec![],

@@ -9,7 +9,7 @@ use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::provider::ClaudeCode;
 use tagteam_cc::usage;
-use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service, read_services};
+use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
 use tagteam_core::Fingerprint;
 use tagteam_core::usage::WindowKind;
 use tagteam_provider::http::{HttpResponse, Method, ScriptedHttp};
@@ -153,36 +153,62 @@ fn an_api_key_target_moves_the_auth_axis() {
     assert_eq!(oauth_item(&f).unwrap()["pluginSecrets"], json!({"p": 1}));
 }
 
+/// The unsuffixed items an explicit `CLAUDE_CONFIG_DIR=~/.claude` fell back to before Claude
+/// Code 2.1.286. Inert now (Appendix A.2): nothing reads, writes or clears them.
+const INERT_OAUTH: &str = "Claude Code-credentials";
+const INERT_MANAGED: &str = "Claude Code";
+
+/// `"<prefix>-" + hex(sha256(dir))[..8]`: Appendix A.2's name, computed here independently of
+/// `keychain_service`.
+fn hashed(prefix: &str, dir: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{prefix}-{}",
+        &hex::encode(Sha256::digest(dir.as_bytes()).as_slice())[..8]
+    )
+}
+
 /// Every entry a change can destroy, planted with a distinct secret, under an explicit
-/// `CLAUDE_CONFIG_DIR=~/.claude` so each axis also has a fallback item (Appendix A.2).
+/// `CLAUDE_CONFIG_DIR=~/.claude`, beside the two inert former fallback items (Appendix A.2).
 fn plant_every_entry(f: &Fx) -> Env {
     let mut env = f.env.clone();
     env.claude_config_dir = Some(env.home.join(".claude").into_os_string());
     let paths = CcPaths::resolve(&env);
     let acct = keychain_account(&env);
-    for (i, svc) in read_services(&env, ItemKind::OAuth).iter().enumerate() {
-        let entry = json!({"claudeAiOauth": {"refreshToken": format!("rt-item-{i}")}, "mcpOAuth": {"m": 1}});
-        f.kc.put(svc, &acct, entry.to_string().as_bytes());
-    }
+    let entry = json!({"claudeAiOauth": {"refreshToken": "rt-item"}, "mcpOAuth": {"m": 1}});
+    f.kc.put(
+        &keychain_service(&env, ItemKind::OAuth),
+        &acct,
+        entry.to_string().as_bytes(),
+    );
+    let inert = json!({"claudeAiOauth": {"refreshToken": "rt-inert"}, "mcpOAuth": {"m": 2}});
+    f.kc.put(INERT_OAUTH, &acct, inert.to_string().as_bytes());
     let file = json!({"claudeAiOauth": {"refreshToken": "rt-file"}});
     fs::write(&paths.credentials_file, file.to_string()).unwrap();
-    for (i, svc) in read_services(&env, ItemKind::ManagedKey).iter().enumerate() {
-        f.kc.put(svc, &acct, format!("sk-ant-api03-item-{i}").as_bytes());
-    }
+    f.kc.put(
+        &keychain_service(&env, ItemKind::ManagedKey),
+        &acct,
+        b"sk-ant-api03-item",
+    );
+    f.kc.put(INERT_MANAGED, &acct, b"sk-ant-api03-inert");
     let config = json!({"primaryApiKey": "sk-ant-api03-plain"});
     fs::write(&paths.global_config, config.to_string()).unwrap();
     env
 }
 
-/// Every secret the planted entries hold now, by where it is.
+/// Every secret the planted entries hold now, by where it is, the inert items included.
 fn secrets_by_place(f: &Fx, env: &Env) -> Vec<(String, Vec<u8>)> {
     let paths = CcPaths::resolve(env);
     let acct = keychain_account(env);
-    let mut out: Vec<(String, Vec<u8>)> = [ItemKind::OAuth, ItemKind::ManagedKey]
-        .into_iter()
-        .flat_map(|kind| read_services(env, kind))
-        .filter_map(|svc| f.kc.get(&svc, &acct).map(|b| (svc, b)))
-        .collect();
+    let mut out: Vec<(String, Vec<u8>)> = [
+        keychain_service(env, ItemKind::OAuth),
+        keychain_service(env, ItemKind::ManagedKey),
+        INERT_OAUTH.to_owned(),
+        INERT_MANAGED.to_owned(),
+    ]
+    .into_iter()
+    .filter_map(|svc| f.kc.get(&svc, &acct).map(|b| (svc, b)))
+    .collect();
     if let Ok(b) = fs::read(&paths.credentials_file) {
         out.push(("credentials file".into(), b));
     }
@@ -241,16 +267,14 @@ fn doomed_names_everything_each_change_destroys() {
         keychain: u8,
         api_key: &str,
     ) {
+        let acct = keychain_account(env);
+        let inert_before = (f.kc.get(INERT_OAUTH, &acct), f.kc.get(INERT_MANAGED, &acct));
         let before = secrets_by_place(f, env);
         let doomed = f.cc.doomed(env, locks, change);
-        let present = |fallback: bool| -> Vec<Vec<u8>> {
-            doomed
-                .iter()
-                .filter(|d| d.on_fallback == fallback)
-                .filter_map(|d| d.bytes.clone().present())
-                .collect()
-        };
-        let (planned, conditional) = (present(false), present(true));
+        let planned: Vec<Vec<u8>> = doomed
+            .iter()
+            .filter_map(|d| d.bytes.clone().present())
+            .collect();
         let (refused, pinned) = (keychain == 1, keychain == 2);
         let mut reported: Vec<Vec<u8>> = Vec::new();
         match change {
@@ -286,20 +310,24 @@ fn doomed_names_everything_each_change_destroys() {
         for (place, bytes) in &before {
             if !after.contains(&(place.clone(), bytes.clone())) {
                 assert!(
-                    planned.contains(bytes) || reported.contains(bytes),
+                    planned.contains(bytes),
                     "{case}: {place} was destroyed without being named"
                 );
             }
         }
         for r in &reported {
             assert!(
-                conditional.contains(r) || planned.contains(r),
-                "{case}: reported an entry the plan did not name"
+                planned.contains(r),
+                "{case}: a fallback reported an entry the plan did not name"
             );
         }
-        for c in &conditional {
-            let survived = after.iter().any(|(_, b)| b == c);
-            assert_eq!(survived, !refused, "{case}: a conditional entry");
+        assert_eq!(
+            (f.kc.get(INERT_OAUTH, &acct), f.kc.get(INERT_MANAGED, &acct)),
+            inert_before,
+            "{case}: an inert former fallback item was touched"
+        );
+        for inert in [&inert_before.0, &inert_before.1].into_iter().flatten() {
+            assert!(!planned.contains(inert), "{case}: an inert item was named");
         }
         if !refused && !pinned {
             assert!(reported.is_empty(), "{case}: nothing falls back");
@@ -307,26 +335,35 @@ fn doomed_names_everything_each_change_destroys() {
         if pinned {
             assert!(
                 !reported.is_empty(),
-                "{case}: a pinned write goes to the file and reports the items it deletes"
+                "{case}: a pinned write goes to the file and reports the item it deletes"
             );
         }
     }
 }
 
 #[test]
-fn doomed_reports_an_entry_it_cannot_read() {
+fn doomed_reports_an_unreadable_item_and_never_reads_an_inert_one() {
     let f = fx();
     let env = plant_every_entry(&f);
-    let fallback = &read_services(&env, ItemKind::OAuth)[1];
-    f.kc.set_unreadable(fallback, &keychain_account(&env), true);
+    let acct = keychain_account(&env);
+    f.kc.set_unreadable(INERT_OAUTH, &acct, true);
+    f.kc.set_unreadable(INERT_MANAGED, &acct, true);
     let g = MutationGuard::acquire(&env, Duration::from_secs(1)).unwrap();
     let locks = f.cc.lock_live(&env, &g).unwrap();
-    let doomed =
-        f.cc.doomed(&env, &locks, tagteam_provider::LiveChange::Write("oauth"));
+    let change = tagteam_provider::LiveChange::Write("oauth");
+    let doomed = f.cc.doomed(&env, &locks, change);
     assert!(
         doomed
             .iter()
-            .any(|d| d.on_fallback && matches!(d.bytes, Read::Unreadable(_))),
+            .all(|d| !matches!(d.bytes, Read::Unreadable(_))),
+        "an inert item is never read: {doomed:?}"
+    );
+    f.kc.set_unreadable(&keychain_service(&env, ItemKind::OAuth), &acct, true);
+    let doomed = f.cc.doomed(&env, &locks, change);
+    assert!(
+        doomed
+            .iter()
+            .any(|d| matches!(d.bytes, Read::Unreadable(_))),
         "{doomed:?}"
     );
 }
@@ -578,7 +615,9 @@ fn clear_other_axis_toward_api_key_keeps_only_machine_shared_keys_and_its_undo_r
 }
 
 #[test]
-fn identity_surface_lists_every_macos_credential_and_managed_key_service() {
+fn identity_surface_lists_the_one_item_per_axis_of_the_exported_spelling() {
+    // Appendix A.2 (2.1.286): a symlinked config dir is named by the link's spelling alone,
+    // never also by its target's.
     let f = fx();
     let target_dir = f.env.home.join("real-profile");
     fs::create_dir_all(&target_dir).unwrap();
@@ -589,20 +628,12 @@ fn identity_surface_lists_every_macos_credential_and_managed_key_service() {
 
     let s = f.cc.identity_surface(&env);
     let acct = keychain_account(&env);
-    let expected_oauth: Vec<_> = read_services(&env, ItemKind::OAuth)
-        .into_iter()
-        .map(|svc| (svc, acct.clone()))
-        .collect();
-    let expected_managed: Vec<_> = read_services(&env, ItemKind::ManagedKey)
-        .into_iter()
-        .map(|svc| (svc, acct.clone()))
-        .collect();
-    assert!(
-        expected_oauth.len() > 1,
-        "the fixture must actually exercise the symlinked-profile fallback"
+    let spelling = link.to_str().unwrap();
+    assert_eq!(
+        s.credential_items,
+        vec![(hashed("Claude Code-credentials", spelling), acct.clone())]
     );
-    assert_eq!(s.credential_items, expected_oauth);
-    assert_eq!(s.owned_items, expected_managed);
+    assert_eq!(s.owned_items, vec![(hashed("Claude Code", spelling), acct)]);
 }
 
 #[test]

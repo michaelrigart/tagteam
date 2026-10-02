@@ -176,7 +176,6 @@ fn a_write_keeps_the_machines_device_key_and_undoes_exactly() {
         "the credential file, and nothing on another axis"
     );
     assert_eq!(doomed[0].bytes.clone().present(), Some(before_cred.clone()));
-    assert!(!doomed[0].on_fallback);
     assert!(
         f.fake
             .doomed(&f.env, &locks, LiveChange::ClearOther(KIND_TOKEN))
