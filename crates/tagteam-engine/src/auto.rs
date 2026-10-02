@@ -130,11 +130,13 @@ struct Seen {
 }
 
 /// One account as a tick read it from the store: its row, its decision-grade windows under
-/// the tick's models (§8.4), and when its reading was taken, as stored.
+/// the tick's models (§8.4), when its reading was taken, as stored, and whether a session
+/// owns it (§12.5), read beside them.
 struct Account {
     row: AccountRow,
     windows: Option<Vec<Window>>,
     fetched_at: Option<i64>,
+    session_owned: bool,
 }
 
 /// The auto-switch engine of one provider (§11.1).
@@ -340,7 +342,7 @@ impl AutoEngine<'_> {
             threshold: self.cfg.threshold,
             models: self.cfg.models.clone(),
         })?;
-        let mut accounts = self.read(&store)?;
+        let mut accounts = self.read(p, &store)?;
         self.report_collection(&report, &accounts, sink);
         self.poll(&report, &accounts, &live, sink);
         self.check_settings(p, &store, &accounts, sink)?;
@@ -359,7 +361,7 @@ impl AutoEngine<'_> {
                 threshold: self.cfg.threshold,
                 models: self.cfg.models.clone(),
             })?;
-            accounts = self.read(&store)?;
+            accounts = self.read(p, &store)?;
             self.report_collection(&report, &accounts, sink);
             snap = Snapshot {
                 now: began,
@@ -493,6 +495,19 @@ impl AutoEngine<'_> {
                     }
                 },
                 Err(e) if fatal(&e) => return Err(e),
+                // §12.5: the target's quiescent profile and its vault both moved, so nothing of
+                // it can be activated until an explicit replacement resolves it. A target that
+                // is due meets the conflict at freshening, a gate `Conflict` and so `Skip`; one
+                // that is not meets it in the switch's lazy capture. Either way it is passed over
+                // for the next target, never an error that ends the tick.
+                Err(EngineError::ProfileConflict { .. }) => {
+                    tracing::warn!(
+                        position = row.position,
+                        account = %row.id,
+                        "the target's session profile conflicts with its vault; trying the next target"
+                    );
+                    continue;
+                }
                 Err(e) => {
                     self.count(t)?;
                     self.error(
@@ -539,8 +554,9 @@ impl AutoEngine<'_> {
     }
 
     /// The provider's accounts as the store holds them now, each with its decision-grade
-    /// windows under the tick's models (§8.4).
-    fn read(&self, store: &Store) -> Result<Vec<Account>, EngineError> {
+    /// windows under the tick's models (§8.4) and its session state (§12.5), read as freshly as
+    /// those readings. An account whose session state cannot be read counts as session-owned.
+    fn read(&self, p: &dyn Provider, store: &Store) -> Result<Vec<Account>, EngineError> {
         store
             .accounts(&self.provider)?
             .into_iter()
@@ -548,6 +564,7 @@ impl AutoEngine<'_> {
                 Ok(Account {
                     windows: self.engine.decision_windows(&row, &self.cfg.models)?,
                     fetched_at: store.usage_state(&row.id)?.and_then(|s| s.fetched_at),
+                    session_owned: self.engine.session_state(p, &row)?.owned(),
                     row,
                 })
             })
@@ -556,7 +573,8 @@ impl AutoEngine<'_> {
 
     /// The snapshot `decide` reads. Switchable is decided from the store alone (enabled, with
     /// an identity): the vault is read lazily, at step 10 (§9.3), where a target with no
-    /// stored credential is passed over. Nothing is session-owned before M4.
+    /// stored credential is passed over. Session ownership is as `read` found it (§11.2
+    /// step 7); the switch checks it again under its locks.
     fn snapshot(&self, p: &dyn Provider, accounts: &[Account], live: &AccountId) -> Snapshot {
         Snapshot {
             now: self.engine.now_ms().div_euclid(1000),
@@ -569,7 +587,7 @@ impl AutoEngine<'_> {
                     api_key: p.kind_traits(&a.row.kind).managed_key_axis,
                     switchable: !a.row.disabled && a.row.identity_json.is_object(),
                     quarantined: a.row.quarantine_reason.is_some(),
-                    session_owned: false,
+                    session_owned: a.session_owned,
                     windows: a.windows.clone(),
                     fetched_at: a.fetched_at,
                 })

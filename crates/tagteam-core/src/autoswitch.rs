@@ -104,7 +104,7 @@ pub struct AccountSnapshot {
     /// Vault credential and identity, not disabled (§9.3).
     pub switchable: bool,
     pub quarantined: bool,
-    /// `false` until M4.
+    /// §12.5, from `Engine::session_state`.
     pub session_owned: bool,
     /// The decision-grade reading's windows (§8.4); `None` when there is none. Headroom,
     /// the binding window and the recovery time come from `usage::headroom`,
