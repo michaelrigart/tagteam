@@ -110,7 +110,7 @@ pub enum Command {
         /// Model limits that count, comma-separated, or `all`
         #[arg(long)]
         model: Option<String>,
-        /// Fall back to API-key accounts at the limit: true or false
+        /// Fall back to API-key accounts at the limit: true, false, 1, 0, yes or no
         #[arg(long = "include-api-key-accounts", value_name = "BOOL")]
         include_api_key_accounts: Option<String>,
     },
