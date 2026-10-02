@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tagteam_core::{AccountId, ProviderId};
+use tagteam_provider::liveness::ProcessProbe;
 use tagteam_provider::profile::RunShell;
 use tagteam_provider::{Cancel, Clock, Env, Http, MutationGuard, Provider, ProviderError, Read};
 
@@ -25,6 +26,8 @@ pub struct EngineConfig {
     pub default_provider: ProviderId,
     /// `config.toml` as read for this command (§6.4).
     pub settings: Settings,
+    /// §4.2's process port, for session records (§12.6).
+    pub process: Arc<dyn ProcessProbe>,
     /// §12.8, from `detect_run_shell`; `env` is already the effective (outer) environment.
     pub run_shell: RunShell,
 }
@@ -38,6 +41,8 @@ pub struct Engine {
     pub(crate) http: Arc<dyn Http>,
     pub(crate) default_provider: ProviderId,
     pub(crate) settings: Settings,
+    /// Judges session records (§12.6): `SystemProcessProbe` in production.
+    pub(crate) process: Arc<dyn ProcessProbe>,
     /// Where this process stands (§12.8).
     pub(crate) run_shell: RunShell,
     store: Mutex<Option<Arc<Store>>>,
@@ -59,6 +64,7 @@ impl Engine {
             http: cfg.http,
             default_provider: cfg.default_provider,
             settings: cfg.settings,
+            process: cfg.process,
             run_shell: cfg.run_shell,
             store: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
@@ -387,6 +393,7 @@ mod tests {
             http: Arc::new(tagteam_provider::NoHttp),
             default_provider: ProviderId::new("p"),
             settings: Settings::default(),
+            process: Arc::new(tagteam_provider::liveness::FakeProcessProbe::new()),
             run_shell: RunShell::Outside,
         }
     }

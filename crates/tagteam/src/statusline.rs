@@ -14,6 +14,7 @@ use tagteam_engine::settings::{STATUSLINE_MODEL_PREFIX, Settings, is_statusline_
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, StatuslineView};
 use tagteam_engine::{Engine, EngineConfig};
+use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::{
     Capabilities, Env, Http, Keychain, KeychainError, LockState, NoHttp, Read, ReadError,
     SystemClock,
@@ -216,6 +217,7 @@ pub(crate) fn engine(
         default_provider: ProviderId::new(CLAUDE_CODE),
         settings,
         env,
+        process: Arc::new(SystemProcessProbe),
         run_shell,
     });
     (engine, http, keychain)
