@@ -1,4 +1,5 @@
-use std::ffi::OsString;
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 use crate::cancel::Cancel;
@@ -18,6 +19,9 @@ pub struct Env {
     /// The process's cancel token (§14.1). Clones share it, so every engine and lock built
     /// from one Env sees the same signal; each `for_test` Env has a token of its own.
     pub cancel: Cancel,
+    /// Provider-owned variables the registry asked for (§4.5 `session_dir_var`, `CLAUDECODE`),
+    /// captured by `capture_vars`. Empty in `from_process` and `for_test`.
+    pub vars: BTreeMap<String, OsString>,
     forbidden_root: Option<PathBuf>,
 }
 
@@ -39,6 +43,7 @@ impl Env {
             claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR"),
             claude_securestorage_config_dir: std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR"),
             cancel: Cancel::new(),
+            vars: BTreeMap::new(),
             forbidden_root: None,
         }
     }
@@ -61,8 +66,28 @@ impl Env {
             claude_config_dir: None,
             claude_securestorage_config_dir: None,
             cancel: Cancel::new(),
+            vars: BTreeMap::new(),
             forbidden_root: Some(real_home),
         }
+    }
+
+    /// Reads each named variable from the process environment into `vars` (absent: not
+    /// inserted, and any earlier value dropped).
+    pub fn capture_vars(&mut self, names: &[&str]) {
+        for name in names {
+            match std::env::var_os(name) {
+                Some(v) => {
+                    self.vars.insert((*name).to_owned(), v);
+                }
+                None => {
+                    self.vars.remove(*name);
+                }
+            }
+        }
+    }
+
+    pub fn var(&self, name: &str) -> Option<&OsStr> {
+        self.vars.get(name).map(OsString::as_os_str)
     }
 
     pub fn with_forbidden_root(mut self, root: PathBuf) -> Self {
@@ -167,6 +192,29 @@ mod tests {
         assert_eq!(clone.cancel.requested(), Some(15));
         let other = Env::for_test(Path::new("/tmp/fixture"));
         assert_eq!(other.cancel.requested(), None);
+    }
+
+    #[test]
+    fn provider_variables_are_captured_only_when_asked_for() {
+        const NEVER: &str = "TAGTEAM_TEST_NEVER_SET_7F3A";
+        let mut env = Env::for_test(Path::new("/tmp/fixture"));
+        assert!(env.vars.is_empty());
+        assert_eq!(env.var("HOME"), None, "nothing is captured until asked");
+        env.capture_vars(&["HOME", NEVER]);
+        assert_eq!(env.var("HOME"), std::env::var_os("HOME").as_deref());
+        assert_eq!(env.var(NEVER), None);
+        assert!(
+            !env.vars.contains_key(NEVER),
+            "an unset variable is not inserted"
+        );
+        env.vars.insert(NEVER.into(), "stale".into());
+        env.capture_vars(&[NEVER]);
+        assert_eq!(
+            env.var(NEVER),
+            None,
+            "a variable gone from the process is dropped"
+        );
+        assert!(Env::from_process().vars.is_empty());
     }
 
     #[test]

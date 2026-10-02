@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,8 +9,8 @@ use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
     BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
     Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
-    LockError, MutationGuard, Pace, PollBudget, Provider, ProviderError, Read, StoredLogin, Undo,
-    UsageResult, Window, Written,
+    LockError, MustShare, MutationGuard, Pace, PollBudget, Provider, ProviderError, Read,
+    SharePolicy, StoredLogin, Undo, UsageResult, Window, Written,
 };
 
 use crate::config;
@@ -20,7 +20,8 @@ use crate::live::{self, Extent, Fence, LiveStore, Platform, Snapshot};
 use crate::locks;
 use crate::naming::{ItemKind, keychain_account, keychain_service};
 use crate::oauth;
-use crate::paths::CcPaths;
+use crate::paths::{CcPaths, nfc};
+use crate::session::{self, CC_MUST_SHARE, CC_PRIVATE, CC_SHARED};
 use crate::shape::{self, KIND_API_KEY, KINDS, MACHINE_SHARED_KEYS};
 use crate::usage;
 
@@ -508,6 +509,85 @@ impl Provider for ClaudeCode {
 
     fn live_identity_source(&self, env: &Env) -> Option<PathBuf> {
         Some(CcPaths::resolve(env).global_config)
+    }
+
+    fn launch_command(&self) -> &'static str {
+        "claude"
+    }
+
+    fn session_dir_var(&self) -> Option<&'static str> {
+        Some("CLAUDE_CONFIG_DIR")
+    }
+
+    /// Appendix A.1: an empty `CLAUDE_CONFIG_DIR` counts as unset.
+    fn session_dir(&self, env: &Env) -> Option<PathBuf> {
+        env.claude_config_dir
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+
+    fn outer_home(&self, env: &Env) -> Value {
+        session::outer_home(env)
+    }
+
+    fn apply_outer_home(&self, env: &Env, outer: &Value) -> Result<Env, ProviderError> {
+        session::apply_outer_home(env, outer)
+    }
+
+    /// §12.2 "One spelling": the canonical path, NFC-normalized.
+    fn profile_spelling(&self, canonical: &Path) -> String {
+        nfc(canonical.as_os_str())
+    }
+
+    fn share_policy(&self, env: &Env) -> SharePolicy {
+        SharePolicy {
+            source: CcPaths::resolve(env).config_home,
+            shared: CC_SHARED.to_vec(),
+            must_share: CC_MUST_SHARE
+                .iter()
+                .map(|&(name, kind)| MustShare { name, kind })
+                .collect(),
+            private: CC_PRIVATE.to_vec(),
+        }
+    }
+
+    fn session_records_dir(&self, profile: &Path) -> PathBuf {
+        profile.join("sessions")
+    }
+
+    /// The hashed Keychain item named from `spelling`, the recorded spelling, then
+    /// `.credentials.json` in `dir`, where the profile is now (Decision 19), exactly as the
+    /// live read takes them (§12.3 step 2).
+    fn read_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Read<Credential> {
+        self.live.read_credential(
+            &session::profile_env(env, spelling),
+            &session::profile_paths(env, dir),
+        )
+    }
+
+    /// The `oauthAccount` of the config in `dir`, where the profile is now (Decision 19).
+    fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity> {
+        config::live_identity(&session::profile_paths(env, dir))
+    }
+
+    /// Both axes' items for `spelling`, each delete under CC's storage-write lock in `dir`,
+    /// where the profile is now (Decision 19); the profile's `.credentials.json` goes with its
+    /// directory. Nothing on Linux.
+    fn delete_profile_credential(
+        &self,
+        env: &Env,
+        dir: &Path,
+        spelling: &str,
+    ) -> Result<(), ProviderError> {
+        self.live.delete_items(
+            &session::profile_env(env, spelling),
+            &session::profile_paths(env, dir),
+        )
+    }
+
+    fn invoked_by(&self, env: &Env) -> bool {
+        env.var("CLAUDECODE").is_some_and(|v| v == "1") || self.session_dir(env).is_some()
     }
 }
 

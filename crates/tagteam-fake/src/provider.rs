@@ -12,15 +12,16 @@ use tagteam_provider::http::{Http, HttpError, HttpRequest};
 use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind};
 use tagteam_provider::splice::{self, render_nested};
 use tagteam_provider::{
-    BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
-    Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, LockError,
-    MkdirLock, MkdirLockSpec, MutationGuard, Pace, PollBudget, Provider, ProviderError, Read,
-    ReadError, SecretStore, StoredLogin, Undo, UsageResult, Window, Written,
+    BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, EntryKind, Env,
+    FreshCredential, Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet,
+    LiveLocks, LockError, MkdirLock, MkdirLockSpec, MustShare, MutationGuard, Pace, PollBudget,
+    Provider, ProviderError, Read, ReadError, SecretStore, SharePolicy, StoredLogin, Undo,
+    UsageResult, Window, Written,
 };
 
 use crate::FAKE_AGENT;
 use crate::identity_json;
-use crate::paths::FakePaths;
+use crate::paths::{FakePaths, HOME_VAR};
 use crate::shape::{self, DEVICE, KIND_STATIC, KINDS};
 use crate::usage;
 
@@ -148,6 +149,15 @@ impl Undo for NothingToUndo {
 
 /// `fa.token`, unless the credential has expired by §7.2's rule (`now + 5 min ≥ expires`).
 /// A non-numeric or absent `expires` never expires.
+/// FakeAgent run for the profile in `dir`, its actual directory (Decision 19): its home variable
+/// names `dir`. FakeAgent keeps no Keychain item, so nothing of a profile is named after its
+/// recorded spelling, which names the old path once the data directory has moved.
+fn profile_env_in(env: &Env, dir: &Path) -> Env {
+    let mut out = env.clone();
+    out.vars.insert(HOME_VAR.into(), dir.as_os_str().to_owned());
+    out
+}
+
 fn showable_token(bytes: &[u8], now_ms: i64) -> Option<String> {
     let v: Value = serde_json::from_slice(bytes).ok()?;
     if v["fa"]["expires"]
@@ -175,6 +185,7 @@ impl Provider for FakeAgent {
         Capabilities {
             usage: true,
             refresh: true,
+            sessions: true,
             ..Capabilities::default()
         }
     }
@@ -553,5 +564,97 @@ impl Provider for FakeAgent {
 
     fn live_identity_source(&self, env: &Env) -> Option<PathBuf> {
         Some(FakePaths::resolve(env).identity)
+    }
+
+    fn launch_command(&self) -> &'static str {
+        "fakeagent"
+    }
+
+    fn session_dir_var(&self) -> Option<&'static str> {
+        Some(HOME_VAR)
+    }
+
+    fn session_dir(&self, env: &Env) -> Option<PathBuf> {
+        env.var(HOME_VAR)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// `{"FAKEAGENT_HOME": <string>|null}`: one variable, unlike Claude Code's two.
+    fn outer_home(&self, env: &Env) -> Value {
+        let home = env
+            .var(HOME_VAR)
+            .map(|v| Value::String(v.to_string_lossy().into_owned()));
+        json!({ HOME_VAR: home })
+    }
+
+    fn apply_outer_home(&self, env: &Env, outer: &Value) -> Result<Env, ProviderError> {
+        let mut out = env.clone();
+        match outer.get(HOME_VAR) {
+            Some(Value::String(s)) => {
+                out.vars.insert(HOME_VAR.into(), s.into());
+            }
+            Some(Value::Null) => {
+                out.vars.remove(HOME_VAR);
+            }
+            _ => {
+                return Err(ProviderError::Invalid(format!(
+                    "the profile marker's outer record has no valid {HOME_VAR}"
+                )));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The path as it is: FakeAgent does not normalize.
+    fn profile_spelling(&self, canonical: &Path) -> String {
+        canonical.to_string_lossy().into_owned()
+    }
+
+    fn share_policy(&self, env: &Env) -> SharePolicy {
+        SharePolicy {
+            source: FakePaths::resolve(env).dir,
+            shared: vec!["notes", "prefs.json"],
+            must_share: vec![MustShare {
+                name: "journal.log",
+                kind: EntryKind::File,
+            }],
+            private: vec![
+                "credential.json",
+                "identity.json",
+                "procs",
+                ".live.lock",
+                ".tagteam-*",
+            ],
+        }
+    }
+
+    fn session_records_dir(&self, profile: &Path) -> PathBuf {
+        profile.join("procs")
+    }
+
+    /// `<dir>/credential.json`, a plain file like the live one. FakeAgent keeps no item, so it
+    /// names nothing after the spelling (Decision 19).
+    fn read_profile_credential(&self, env: &Env, dir: &Path, _spelling: &str) -> Read<Credential> {
+        self.read_live_auth(&profile_env_in(env, dir)).credential
+    }
+
+    /// The `identity` key of `<dir>/identity.json`.
+    fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity> {
+        self.live_identity(&profile_env_in(env, dir))
+    }
+
+    /// FakeAgent keeps nothing outside the profile directory.
+    fn delete_profile_credential(
+        &self,
+        _env: &Env,
+        _dir: &Path,
+        _spelling: &str,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    fn invoked_by(&self, _env: &Env) -> bool {
+        false
     }
 }

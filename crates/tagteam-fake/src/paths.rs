@@ -2,7 +2,11 @@ use std::path::PathBuf;
 
 use tagteam_provider::Env;
 
-/// Where FakeAgent keeps its state: `<home>/.fakeagent/`.
+/// FakeAgent's home variable: a profile is a directory it names (§4.5 `session_dir_var`).
+pub(crate) const HOME_VAR: &str = "FAKEAGENT_HOME";
+
+/// Where FakeAgent keeps its state: `$FAKEAGENT_HOME` when set and non-empty, else
+/// `<home>/.fakeagent/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FakePaths {
     pub dir: PathBuf,
@@ -16,7 +20,11 @@ pub struct FakePaths {
 
 impl FakePaths {
     pub fn resolve(env: &Env) -> Self {
-        let dir = env.guard(env.home.join(".fakeagent"));
+        let dir = match env.var(HOME_VAR).filter(|v| !v.is_empty()) {
+            Some(v) => PathBuf::from(v),
+            None => env.home.join(".fakeagent"),
+        };
+        let dir = env.guard(dir);
         Self {
             identity: dir.join("identity.json"),
             credential: dir.join("credential.json"),

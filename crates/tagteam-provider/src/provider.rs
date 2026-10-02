@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -127,6 +127,33 @@ pub struct IdentitySurface {
     /// Keychain items the provider may write wholesale (CC: the managed-key item).
     pub owned_items: Vec<(String, String)>,
     pub machine_shared_keys: Vec<&'static str>,
+}
+
+/// Whether a must-share entry is a directory or a file (§12.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Dir,
+    File,
+}
+
+/// An entry every profile links, created empty in the source home when absent (§12.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MustShare {
+    pub name: &'static str,
+    pub kind: EntryKind,
+}
+
+/// §12.2: what a profile shares with the outer home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharePolicy {
+    /// The outer home's config dir (CC: the resolved default config home).
+    pub source: PathBuf,
+    /// Linked when present in `source`.
+    pub shared: Vec<&'static str>,
+    /// Created empty in `source` when absent, then linked; a real copy in a profile refuses.
+    pub must_share: Vec<MustShare>,
+    /// Never linked; patterns for `entry_matches`.
+    pub private: Vec<&'static str>,
 }
 
 /// What a provider can do at all (§4.5). A missing capability degrades the engine rather than
@@ -299,8 +326,9 @@ pub enum ProviderError {
     #[error("{} is torn or not a JSON object; {remedy}", path.display())]
     ConfigUnsplicable { path: PathBuf, remedy: &'static str },
     /// A Keychain item `remove_item` could not verify gone: after a file fallback, after a
-    /// managed-key fallback, or when a managed key is removed. Claude Code may still read it
-    /// (L397); the wording holds for a removal as much as for a write.
+    /// managed-key fallback, when a managed key is removed, or when a profile's credential is
+    /// deleted. Claude Code may still read it (L397); the wording holds for a removal as much
+    /// as for a write.
     #[error("the Keychain item {0} could not be verified gone, so Claude Code may still read it")]
     ShadowingItem(String),
     /// A write failed part-way and restoring the previous state failed too: the live state is
@@ -587,6 +615,46 @@ pub trait Provider: Send + Sync {
     /// The file whose mtime and size key `live_identity_cache` (§13.5): the one `live_identity`
     /// reads. CC: `~/.claude.json`. `None` when no single file backs the live identity.
     fn live_identity_source(&self, env: &Env) -> Option<PathBuf>;
+
+    // §4.5 "Parallel sessions" (§12). A profile's Keychain items are named from the recorded
+    // spelling, never one derived again (§12.2). Its files are found by `dir`, its actual
+    // directory, which differs from that spelling once the data directory has moved
+    // (Decision 19).
+    /// The command a session runs (CC: `claude`).
+    fn launch_command(&self) -> &'static str;
+    /// The variable that names a profile (CC: `CLAUDE_CONFIG_DIR`); `None` without sessions.
+    fn session_dir_var(&self) -> Option<&'static str>;
+    /// The directory `env` points this provider at, if set and non-empty.
+    fn session_dir(&self, env: &Env) -> Option<PathBuf>;
+    /// §12.2: the record of the home `env` resolves to, stored as the marker's `outer`.
+    fn outer_home(&self, env: &Env) -> Value;
+    /// §12.8: `env` with this provider's home variables restored from `outer`. A record that
+    /// is not this provider's shape is `Invalid`, naming no value.
+    fn apply_outer_home(&self, env: &Env, outer: &Value) -> Result<Env, ProviderError>;
+    /// §12.2: the exported spelling for a canonical profile path (CC: NFC of the path).
+    fn profile_spelling(&self, canonical: &Path) -> String;
+    /// §12.2: the source home and the share lists that link sync applies.
+    fn share_policy(&self, env: &Env) -> SharePolicy;
+    /// Where the profile's session records live (CC: `<profile>/sessions`).
+    fn session_records_dir(&self, profile: &Path) -> PathBuf;
+    /// §8.1, §12.5: the profile's credential, read as the agent reads it (Decision 19): the
+    /// Keychain item named from `spelling`, the marker's recorded spelling, then the credential
+    /// file in `dir`, the profile's actual directory.
+    fn read_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Read<Credential>;
+    /// §12.5 "Identity drift": the login identity of the profile in `dir`, its actual directory
+    /// (CC: its `.claude.json` `oauthAccount`; Decision 19).
+    fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>;
+    /// §10.3: deletes the agent-owned credential items for `spelling` and verifies them gone
+    /// (CC macOS: the hashed Keychain items, under CC's storage-write lock anchored in `dir`,
+    /// the profile's actual directory; otherwise nothing outside the directory).
+    fn delete_profile_credential(
+        &self,
+        env: &Env,
+        dir: &Path,
+        spelling: &str,
+    ) -> Result<(), ProviderError>;
+    /// §13.5: whether `env` is a process this agent started (CC: `CLAUDECODE` or `CLAUDE_CONFIG_DIR`).
+    fn invoked_by(&self, env: &Env) -> bool;
 }
 
 #[cfg(test)]

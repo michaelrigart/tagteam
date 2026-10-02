@@ -47,10 +47,10 @@ pub use profile::{
     canonical_profile_path, entry_matches, launch_reservations, profile_path,
 };
 pub use provider::{
-    BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, Identity,
-    IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, Provider,
-    ProviderError, RefreshResult, SecretStore, StoredLogin, TransientKind, Undo, UsageResult,
-    Written,
+    BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, EntryKind,
+    Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, MustShare,
+    Provider, ProviderError, RefreshResult, SecretStore, SharePolicy, StoredLogin, TransientKind,
+    Undo, UsageResult, Written,
 };
 pub use read::{Read, ReadError};
 pub use tagteam_core::pace::Pace;
