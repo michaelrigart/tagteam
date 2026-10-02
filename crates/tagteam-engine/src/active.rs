@@ -101,12 +101,16 @@ impl Engine {
     /// §7.5. The mutation lock (recovering first), the live account's lock, then CC's
     /// credential locks only; the config lock is taken after the request, around the live
     /// write alone. The oracle is asked before any lock (§7.6).
+    ///
+    /// Inside a run shell it runs as outside one (§12.8, B.57): `env` is the outer home
+    /// (Decision 6), so the live login it reads, refreshes and protects is the default home's,
+    /// never the session's profile. Only a marker that cannot be read refuses.
     pub fn refresh_active(
         &self,
         provider: &ProviderId,
         trigger: ActiveTrigger,
     ) -> Result<ActiveOutcome, EngineError> {
-        self.refuse_inside_run_shell()?;
+        self.refuse_unreadable_run_shell()?;
         let provider_arc = self.provider(provider)?;
         let p = provider_arc.as_ref();
         let (row, live) = self.active_login(p, provider)?;

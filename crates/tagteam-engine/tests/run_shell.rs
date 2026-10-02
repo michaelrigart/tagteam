@@ -3,20 +3,23 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::symlink;
+use std::path::{Path, PathBuf};
 
-use common::{API_KEY, FakeFx, Fx, token_requests};
+use common::{API_KEY, FakeFx, Fx, credential, sent_refresh_tokens, token_requests};
+use serde_json::json;
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_engine::active::ActiveTrigger;
+use tagteam_engine::active::{ActiveOutcome, ActiveTrigger};
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::views::StatusView;
 use tagteam_engine::{Engine, EngineError};
 use tagteam_fake::FAKE_AGENT;
-use tagteam_provider::Provider;
 use tagteam_provider::profile::{MARKER_FILE, ProfileMarker, RunShell};
+use tagteam_provider::{Clock, Provider};
 
 fn registry(fx: &Fx) -> ProviderRegistry {
     ProviderRegistry::new().with(fx.cc.clone())
@@ -27,7 +30,36 @@ fn kind<T>(r: Result<T, EngineError>) -> Option<&'static str> {
     r.err().map(|e| e.kind())
 }
 
-/// Every engine call that changes accounts or the live login (§9.2, §12.8), with its error kind.
+/// Every entry under `dir`, never following a link: a link's target, a file's bytes, or nothing
+/// for a directory.
+fn tree(dir: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let mut out = BTreeMap::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let held = if meta.file_type().is_symlink() {
+                Some(
+                    fs::read_link(&path)
+                        .unwrap()
+                        .into_os_string()
+                        .into_encoded_bytes(),
+                )
+            } else if meta.is_dir() {
+                dirs.push(path.clone());
+                None
+            } else {
+                Some(fs::read(&path).unwrap())
+            };
+            out.insert(path, held);
+        }
+    }
+    out
+}
+
+/// Every engine call that changes accounts or the live login (§9.2, §12.8), with its error kind,
+/// and the active-token refresh, which §12.8 lets run on the default home inside a run shell.
 fn account_changes(
     fx: &Fx,
     engine: &Engine,
@@ -299,8 +331,12 @@ fn inside_a_run_shell_every_account_change_refuses_and_changes_nothing() {
     let engine = fx.engine_located(fx.shell_env(&fx.make_profile(&a)));
     assert!(matches!(engine.run_shell(), RunShell::Inside { .. }));
     for (command, got) in account_changes(&fx, &engine, &a) {
-        assert_eq!(got, Some("inside-run-shell"), "{command}");
+        // §12.8, B.57: the active-token refresh sees the default home, exactly as outside the
+        // shell; the default login's token is valid, so it needs no request.
+        let want = (command != "active refresh").then_some("inside-run-shell");
+        assert_eq!(got, want, "{command}");
     }
+    assert_eq!(token_requests(&fx), 0);
     let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
     assert_eq!((row.position, row.alias, row.disabled), (1, None, false));
     assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
@@ -329,4 +365,42 @@ fn under_an_unreadable_marker_every_account_change_refuses_naming_it() {
         err.to_string().contains(&marker.display().to_string()),
         "{err}"
     );
+}
+
+#[test]
+fn inside_a_run_shell_an_expired_default_live_token_is_refreshed_in_the_default_home() {
+    // §12.8, B.57: the live login the active-token refresh reads, refreshes and protects is the
+    // default home's, inside a run shell exactly as outside it. The session's own profile is
+    // neither read for it nor written.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let profile = fx.make_profile(&a);
+    let held = credential("a@x.co", "rt-a-session");
+    fx.set_profile_credential(&profile, &held);
+    let (svc, acct) = fx.profile_item(&profile);
+    fx.kc.put(&svc, &acct, &held);
+    let files = tree(&profile);
+    let mut live = fx.live_credential().unwrap();
+    live["claudeAiOauth"]["expiresAt"] = json!(fx.clock.now_ms());
+    fx.set_live_credential(live.to_string().as_bytes());
+    fx.script_refresh(Some("rt-b2"));
+    let engine = fx.engine_located(fx.shell_env(&profile));
+    assert!(matches!(engine.run_shell(), RunShell::Inside { .. }));
+
+    let out = engine
+        .refresh_active(&fx.provider(), ActiveTrigger::Expired)
+        .unwrap();
+
+    assert_eq!(out, ActiveOutcome::Refreshed);
+    assert_eq!(sent_refresh_tokens(&fx), ["rt-b"]);
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b2"));
+    assert_eq!(fx.vault_refresh_token(&b).as_deref(), Some("rt-b2"));
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    assert_eq!(
+        fx.kc.get(&svc, &acct).unwrap(),
+        held,
+        "the profile's item is untouched"
+    );
+    assert_eq!(tree(&profile), files, "and so are its files");
 }
