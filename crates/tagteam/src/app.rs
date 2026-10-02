@@ -31,9 +31,10 @@ use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
 use crate::auto::{
     AutoError, AutoFlags, AutoRun, HumanSink, JsonSink, ThreadSleeper, uniform_jitter,
 };
-use crate::cli::{AutoStrategyArg, Cli, Command, StrategyArg};
+use crate::cli::{AutoStrategyArg, Cli, Command, ShellArg, StrategyArg};
 use crate::prompt::Prompter;
-use crate::{auto, history, prompt, render, root_guard, statusline};
+use crate::shell_init::Wrapped;
+use crate::{auto, history, prompt, render, root_guard, shell_init, statusline};
 
 /// §13.1.
 pub(crate) const EXIT_ERROR: i32 = 1;
@@ -71,6 +72,7 @@ const NO_LIVE_LOGIN: &str =
 const CSV_AND_JSON: &str = "--csv and --json are two output formats; pass one";
 const BAD_SINCE: &str = "--since takes a span like 14d, 12h or 30m";
 const STATUSLINE_UNDER_JSON: &str = "statusline prints a line of text; run it without --json";
+const SHELL_INIT_UNDER_JSON: &str = "shell-init prints shell code; run it without --json";
 const NOTHING_TO_SWITCH: &str =
     "auto-switch needs two switchable accounts on a provider; add another with `tagteam add`";
 const BAD_THRESHOLD: &str = "--threshold takes a number from 50 to 99.9";
@@ -504,6 +506,18 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
         };
         return Ended::Code(fail(io, json, e.kind(), &e.to_string()));
     }
+    // §12.7: the wrapper needs only the registered providers, so it reads no store and no
+    // settings. It comes after the marker check: under a marker that cannot be read it refuses,
+    // as every command but `statusline` does (§12.8, Decision 19).
+    if let Some(Command::ShellInit { shell }) = &cli.command {
+        return Ended::Code(run_shell_init(
+            &registry,
+            io,
+            json,
+            cli.provider.as_deref(),
+            *shell,
+        ));
+    }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
     let (stdout_terminal, no_color_env, force_color_env) =
@@ -569,6 +583,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::History { .. } => "history",
         Command::Map { .. } => "map",
         Command::Unmap { .. } => "unmap",
+        Command::ShellInit { .. } => "shell-init",
         Command::Statusline { .. } => "statusline",
         Command::Auto { .. } => "auto",
     }
@@ -637,6 +652,39 @@ fn run_statusline(
             EXIT_USAGE
         }
     }
+}
+
+/// §12.7's `shell-init`, answered before the engine is built: one wrapper per registered
+/// provider with sessions (`Wrapped`). `--provider` must name a registered provider, as for
+/// every command.
+fn run_shell_init(
+    registry: &ProviderRegistry,
+    io: &mut Io<'_>,
+    json: bool,
+    provider: Option<&str>,
+    shell: ShellArg,
+) -> i32 {
+    if json {
+        fail(io, true, KIND_USAGE, SHELL_INIT_UNDER_JSON);
+        return EXIT_USAGE;
+    }
+    if let Some(id) = provider {
+        if registry.get(&ProviderId::new(id)).is_none() {
+            let e = EngineError::UnknownProvider(id.to_owned());
+            return fail(io, false, e.kind(), &e.to_string());
+        }
+    }
+    let wrapped: Vec<Wrapped> = registry
+        .all()
+        .iter()
+        .filter(|p| p.capabilities().sessions)
+        .map(|p| Wrapped {
+            id: p.id().as_str().to_owned(),
+            launch: p.launch_command(),
+        })
+        .collect();
+    let _ = write!(io.out, "{}", shell_init::script(shell, &wrapped));
+    0
 }
 
 /// §4.5: `statusline` refuses for a provider without the capability.
@@ -986,6 +1034,7 @@ impl App<'_, '_> {
             },
             Command::Unmap { path } => self.unmap(path)?,
             Command::Statusline { .. } => unreachable!("run answers statusline before dispatch"),
+            Command::ShellInit { .. } => unreachable!("run answers shell-init before dispatch"),
             Command::Auto {
                 once,
                 dry_run,
@@ -1455,7 +1504,7 @@ mod tests {
     #[test]
     fn the_late_notice_names_each_command_as_it_is_typed() {
         use clap::Parser;
-        let cases: [&[&str]; 17] = [
+        let cases: [&[&str]; 18] = [
             &["list"],
             &["ls"],
             &["status"],
@@ -1473,6 +1522,7 @@ mod tests {
             &["auto"],
             &["map"],
             &["unmap"],
+            &["shell-init", "zsh"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))

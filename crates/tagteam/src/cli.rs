@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// No `Debug`: `add-token` carries a secret, and a derived `Debug` would print it.
 #[derive(Parser)]
@@ -150,6 +150,12 @@ pub enum Command {
     ///
     /// --json prints {schemaVersion, ok, path, removed}.
     Unmap { path: Option<PathBuf> },
+    /// Print the shell function that runs claude through `tagteam run`
+    ///
+    /// zsh: add `eval "$(tagteam shell-init zsh)"` to ~/.zshrc. bash: the same line, with
+    /// bash, in ~/.bashrc. fish: add `tagteam shell-init fish | source` to
+    /// ~/.config/fish/config.fish.
+    ShellInit { shell: ShellArg },
     /// One line for Claude Code's status bar
     Statusline {
         /// Print the settings.json snippet that sets it up
@@ -174,6 +180,14 @@ pub enum AutoStrategyArg {
     Best,
     /// The candidate whose weekly window resets soonest, while below the threshold
     ConsumeFirst,
+}
+
+/// The shells `shell-init` writes for (§12.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ShellArg {
+    Zsh,
+    Bash,
+    Fish,
 }
 
 impl Command {
