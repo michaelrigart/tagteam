@@ -9,8 +9,8 @@ use std::fs;
 use std::sync::Mutex;
 
 use common::{
-    API_KEY, FakeFx, Fx, Recorded, crashed_switch, record_reading, usage_requests, usage_window,
-    vault_fp, write_target_credential,
+    API_KEY, FakeFx, Fx, Recorded, crashed_switch, credential, record_reading, usage_requests,
+    usage_window, vault_fp, write_target_credential,
 };
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::autoswitch::{
@@ -1441,4 +1441,150 @@ fn a_switch_that_commits_despite_a_late_signal_is_switched() {
         engine.tick(&sink).unwrap_err().signal(),
         Some(libc::SIGTERM)
     );
+}
+
+/// §11.2 step 7: a session-owned account is not a candidate (§12.5), so the tick never names
+/// it as a target, however much headroom it has.
+#[test]
+fn a_session_owned_candidate_is_never_a_target() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let c = fx.add("c@x.co", "rt-c"); // live
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &b, &reading(false, 10.0, 50.0));
+    read(&fx.engine, &c, &reading(false, 10.0, 95.0));
+    let _held = fx.hold_reservation(&fx.make_profile(&a));
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    let (outcome, decision) = engine.tick(&sink).unwrap();
+    assert_eq!(outcome, TickOutcome::Switched);
+    assert_eq!(
+        decision,
+        Decision::Switch {
+            trigger: Trigger::Proactive,
+            targets: vec![b],
+            recheck: false,
+        }
+    );
+    assert!(matches!(
+        sink.take()[1],
+        AutoEvent::Switch { from: 3, to: 2, .. }
+    ));
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+/// §11.2 steps 7 and 11: a session that starts on a target after the snapshot makes it no
+/// longer a candidate. The switch refuses it as `not-candidate` under its locks, and the tick
+/// moves on to the next target; it never ends in an error.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_target_a_session_takes_after_the_snapshot_is_passed_over() {
+    use std::sync::Arc;
+    use tagteam_provider::FlockGuard;
+    use tagteam_provider::profile::LAUNCH_DIR;
+
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let c = fx.add("c@x.co", "rt-c"); // live
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &b, &reading(false, 10.0, 50.0));
+    read(&fx.engine, &c, &reading(false, 10.0, 95.0));
+    let launch = fx.make_profile(&a).join(LAUNCH_DIR).join("4242.lock");
+    let slot: Arc<Mutex<Option<FlockGuard>>> = Arc::default();
+    let held = slot.clone();
+    fx.engine.on_point(
+        "planned",
+        Box::new(move || {
+            let mut held = held.lock().unwrap();
+            if held.is_none() {
+                *held = FlockGuard::try_lock(&launch).unwrap();
+            }
+        }),
+    );
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    let (outcome, decision) = engine.tick(&sink).unwrap();
+    assert!(slot.lock().unwrap().is_some(), "a session took a");
+    assert_eq!(outcome, TickOutcome::Switched);
+    assert_eq!(
+        decision,
+        Decision::Switch {
+            trigger: Trigger::Proactive,
+            targets: vec![a, b],
+            recheck: false,
+        }
+    );
+    let events = sink.take();
+    assert!(
+        !events.iter().any(|e| matches!(e, AutoEvent::Error { .. })),
+        "{events:?}"
+    );
+    assert!(matches!(
+        events[1],
+        AutoEvent::Switch { from: 3, to: 2, .. }
+    ));
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+/// §12.5: a target whose quiescent profile and vault both moved since its seed cannot be
+/// activated (§9.2 `profile-conflict`). It is not due, so no gate meets the conflict first:
+/// the switch's own lazy capture does, and the tick passes over it to the next target.
+#[test]
+fn a_conflicting_profile_target_is_passed_over() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let c = fx.add("c@x.co", "rt-c"); // live
+    read(&fx.engine, &a, &reading(false, 10.0, 20.0));
+    read(&fx.engine, &b, &reading(false, 10.0, 50.0));
+    read(&fx.engine, &c, &reading(false, 10.0, 95.0));
+    let dir = fx.make_profile(&a);
+    let epoch = fx
+        .engine
+        .store()
+        .unwrap()
+        .account(&a)
+        .unwrap()
+        .unwrap()
+        .login_epoch;
+    let seed = fx.cc.fingerprint(&credential("a@x.co", "rt-old")).unwrap();
+    fx.write_seed(&dir, epoch, seed.as_str());
+    fx.set_profile_credential(&dir, &credential("a@x.co", "rt-a2"));
+    let sink = Recorded::default();
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    let (outcome, decision) = engine.tick(&sink).unwrap();
+    assert_eq!(outcome, TickOutcome::Switched);
+    assert_eq!(
+        decision,
+        Decision::Switch {
+            trigger: Trigger::Proactive,
+            targets: vec![a.clone(), b],
+            recheck: false,
+        }
+    );
+    let events = sink.take();
+    assert!(
+        !events.iter().any(|e| matches!(e, AutoEvent::Error { .. })),
+        "{events:?}"
+    );
+    assert!(matches!(
+        events[1],
+        AutoEvent::Switch { from: 3, to: 2, .. }
+    ));
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
 }
