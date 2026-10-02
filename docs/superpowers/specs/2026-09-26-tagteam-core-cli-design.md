@@ -1686,8 +1686,8 @@ rates, 5h and 7d resets, 429s, dead tokens, unknown readings, and API-key accoun
 - `--once` exit codes consistent with the outcome
 - deterministic results for a given seed
 
-The tick itself is tested in the engine against both providers (§15.2). `FakeAgent` has no
-`Long` window, so a `consume-first` setting runs `best` there.
+The tick itself is tested in the engine against both providers (§15.2). `FakeAgent` names no
+`primary_long_window`, so a `consume-first` setting runs `best` there.
 
 ## 12. Parallel sessions: `tagteam run`
 
@@ -2600,7 +2600,8 @@ handler only records the signal in the engine's cancel token (§4.2), which test
   credential store, a single live lock (its config lock is a no-op), refresh without a
   managed-key axis, its own usage windows, and some capabilities switched off. It grows with
   the trait: every trait method lands with its `FakeAgent` implementation. Its shapes differ from CC's on purpose: an identity with no email, credential
-  kinds CC doesn't have, and no `Long` window. It supports sessions, with its own config-dir
+  kinds CC doesn't have, and no primary long window (§4.5; its `monthly` window is `Long`, but
+  it names none for consume-first). It supports sessions, with its own config-dir
   variable, share policy and session records, so the generic `run` machinery is exercised
   against a second provider. Engine tests run against both providers, and assert that:
   - positions, auto-switch state, leases and mappings stay per provider
