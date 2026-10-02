@@ -1,5 +1,9 @@
+use std::fs;
+use std::io;
+
 use tagteam_core::validate::{is_valid_email, normalize_alias};
 use tagteam_core::{AccountId, ProviderId};
+use tagteam_provider::profile::{ProfileMarker, canonical_profile_path, profile_path};
 use tagteam_provider::{Credential, Identity, Provenance, Provider, Read};
 
 use crate::account_lock::AccountLock;
@@ -192,24 +196,74 @@ impl Engine {
         Ok(())
     }
 
-    /// Deletes the vault entries (strict), then the account's rescue files (§6.3: each holds a
-    /// live refresh token, readable or not, and none is left behind), then the row (which
-    /// cascades). A rescue that cannot be deleted fails the remove before the row goes, so it
-    /// can be retried. The caller holds the mutation lock and this account's lock. The live
-    /// login is never touched.
+    /// §10.3's order: the vault entries (strict), then the account's rescue files (§6.3: each
+    /// holds a live refresh token, readable or not, and none is left behind), then the session
+    /// profile (`remove_profile`), and last the row (which cascades). The vault goes first, so
+    /// no generation older than a rescue or a rotated profile can outlive it: an account
+    /// without a vault credential is never switched to, refreshed or launched. Anything that
+    /// fails stops before the row goes, so the account stays listed and the remove can be run
+    /// again; every delete treats an absent item as done. The caller holds the mutation lock and
+    /// this account's lock, and has refused a session-owned account. The live login is never
+    /// touched.
     pub(crate) fn remove_locked(
         &self,
         row: &AccountRow,
         lock: &AccountLock,
     ) -> Result<(), EngineError> {
+        let p = self.provider(&row.provider)?;
         self.vault.delete(lock)?;
         for rescue in self.rescues_for(&row.id) {
             let (RescueFile::Entry(RescueEntry { path, .. }) | RescueFile::Unreadable { path, .. }) =
                 rescue;
             self.delete_rescue(&path)?;
         }
+        self.remove_profile(p.as_ref(), row)?;
         self.store()?.delete_account(&row.id)?;
         self.event(&row.provider, "remove", Some(&row.id), None)?;
+        Ok(())
+    }
+
+    /// §10.3: deletes `row`'s session profile, if it has one. The agent's credential items for
+    /// the spelling the marker records go first (§12.2: never a spelling derived again), then
+    /// the directory, whose links are removed as links: nothing they point to is touched. A
+    /// marker is trusted only when it names this account and its provider: a marker copied from
+    /// another account's profile names that account's spelling, whose Keychain item must never
+    /// be deleted here. With no trusted marker, the items for the profile's current canonical
+    /// spelling are deleted instead, and a warning says an item under an older spelling may
+    /// remain (Decision 12). A failure stops before the directory goes. The items are found by
+    /// the recorded spelling, the files by the profile's actual directory (Decision 19).
+    fn remove_profile(&self, p: &dyn Provider, row: &AccountRow) -> Result<(), EngineError> {
+        let profile = profile_path(&self.env, &row.id);
+        let meta = match fs::symlink_metadata(&profile) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let current_spelling = |why: String| -> Result<String, EngineError> {
+            tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                "the session profile's marker could not be read ({why}); deleting its Keychain item under its current spelling, so an item under an older spelling may remain"
+            );
+            Ok(p.profile_spelling(&canonical_profile_path(&profile)?))
+        };
+        let spelling = match ProfileMarker::read(&profile) {
+            Read::Present(marker)
+                if marker.account_id == row.id && marker.provider == row.provider =>
+            {
+                marker.config_dir
+            }
+            Read::Present(_) => current_spelling("it names another account".into())?,
+            Read::Absent => current_spelling("it has none".into())?,
+            Read::Unreadable(e) => current_spelling(e.to_string())?,
+        };
+        p.delete_profile_credential(&self.env, &profile, &spelling)?;
+        // `remove_dir_all` removes a symlink inside the profile as a link, never following it.
+        if meta.is_dir() {
+            fs::remove_dir_all(&profile)?;
+        } else {
+            fs::remove_file(&profile)?;
+        }
         Ok(())
     }
 
@@ -475,6 +529,11 @@ impl Engine {
             claimed_uuid,
             &identity.label,
         )?;
+        // §10.3 Guard: replacing an occupant removes it. Its lock is held now, so no session can
+        // start on it before the remove.
+        if let Some(occupant) = &prep.occupant {
+            self.refuse_session_owned(p.as_ref(), occupant)?;
+        }
         let live_locks = p.lock_live(&self.env, &guard)?;
         // 3.3 The capture must be the login verified above, on both auth axes: a switch or a
         // recovery may have moved it while this command waited for the locks.
@@ -580,6 +639,10 @@ impl Engine {
         // rechecks in one place rather than only one of them surviving the next change.
         let current = store.account(&prep.id)?;
         check_identity_conflict(current.as_ref(), claimed_uuid, &identity.label)?;
+        // §10.3 Guard, as in `add_live`.
+        if let Some(occupant) = &prep.occupant {
+            self.refuse_session_owned(p.as_ref(), occupant)?;
+        }
         if let Some(existing) = &current {
             if existing.kind != kind {
                 return Err(EngineError::InvalidInput(format!(
@@ -638,6 +701,10 @@ impl Engine {
         let _guard = self.guard_or_refuse(&provider)?;
         let row = self.managed_row(id)?;
         let lock = self.lock_account(id)?;
+        // §10.3 Guard: under the mutation lock and the account lock, no session can start
+        // before the remove is done (§12.5).
+        let p = self.provider(&row.provider)?;
+        self.refuse_session_owned(p.as_ref(), &row)?;
         self.remove_locked(&row, &lock)?;
         Ok(row)
     }
