@@ -848,6 +848,8 @@ mod tests {
     use tagteam_engine::store::{Eligibility, Reserve};
     use tagteam_engine::vault::{KeychainVault, SERVICE, Vault};
     use tagteam_fake::{FAKE_AGENT, FakeAgent};
+    use tagteam_provider::liveness::SystemProcessProbe;
+    use tagteam_provider::profile::RunShell;
     use tagteam_provider::{Clock, Env, FakeClock, FakeKeychain, Method, ScriptedHttp};
 
     use super::*;
@@ -896,6 +898,8 @@ mod tests {
                 http: http.clone(),
                 default_provider: cc(),
                 settings: Settings::default(),
+                process: Arc::new(SystemProcessProbe),
+                run_shell: RunShell::Outside,
             });
             Fx {
                 _dir: dir,
