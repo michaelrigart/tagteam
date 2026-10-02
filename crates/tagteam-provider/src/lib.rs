@@ -6,6 +6,7 @@ pub mod env;
 pub mod flock;
 pub mod http;
 pub mod keychain;
+pub mod liveness;
 pub mod mkdir_lock;
 #[cfg(feature = "mock-server")]
 pub mod mock_server;
@@ -32,6 +33,10 @@ pub use http::{
 #[cfg(feature = "file-keychain")]
 pub use keychain::FileKeychain;
 pub use keychain::{FakeKeychain, Keychain, KeychainError, LockState};
+pub use liveness::{
+    FakeProcess, FakeProcessProbe, ProcessProbe, RecordEntry, SessionRecord, SystemProcessProbe,
+    parse_lstart, parse_session_record, read_session_records, record_is_live,
+};
 pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 #[cfg(feature = "mock-server")]
 pub use mock_server::{MockReply, MockRequest, MockServer};
