@@ -13,6 +13,7 @@ use crate::displace::displace;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
+use crate::provenance::ProfileCheck;
 use crate::quarantine::QuarantineReason;
 use crate::store::{AccountRow, Store};
 
@@ -45,7 +46,8 @@ pub enum GateOutcome {
     /// Another process holds the account lock (step 1).
     Busy,
     Owned(OwnedBy),
-    /// A session profile's provenance conflicts (§12.5). Never produced before M4.
+    /// A quiescent session profile and the vault both moved since they last agreed (§12.5):
+    /// nothing is captured, refreshed or overwritten.
     Conflict,
     /// Quarantined, by this pass or an earlier one (§7.4).
     Dead(QuarantineReason),
@@ -339,7 +341,8 @@ impl Engine {
         if let Some(by) = self.owner_of(p, &store, &row)? {
             return Ok(GateOutcome::Owned(by));
         }
-        // 3. The vault, then any rescue that succeeds it, then the vault again.
+        // 3. The vault, then any rescue that succeeds it, then a quiescent profile's
+        // provenance, then the vault again.
         match self.vault.read(id) {
             Read::Present(b) if !b.is_empty() => {}
             Read::Present(_) | Read::Absent => return Ok(transient("vault-absent")),
@@ -348,6 +351,22 @@ impl Engine {
         match self.settle_rescues(p, &row, &lock) {
             Ok(()) => {}
             Err(EngineError::RescuePending { .. }) => return Ok(transient("rescue-unreadable")),
+            Err(e) => return Err(e),
+        }
+        // §12.5 "Lazy capture": a rotation is adopted into the vault here, so the read below
+        // picks it up. A conflict, or a profile that cannot be read, sends nothing (Decision 9).
+        match self.apply_provenance(p, &row, &lock) {
+            Ok(ProfileCheck::Conflict) => return Ok(GateOutcome::Conflict),
+            Ok(ProfileCheck::Unreadable(detail)) => {
+                tracing::warn!(
+                    position = row.position,
+                    account = %row.id,
+                    "the session profile could not be read ({detail}); nothing is sent"
+                );
+                return Ok(transient("profile-unreadable"));
+            }
+            Ok(_) => {}
+            Err(EngineError::Unreadable(_)) => return Ok(transient("vault-unreadable")),
             Err(e) => return Err(e),
         }
         let current = match self.vault.read(id) {
