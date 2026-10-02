@@ -28,6 +28,17 @@ impl Cancel {
         }
     }
 
+    /// Consumes the recorded signal (§12.5's forwarding): returns it and leaves the token unset,
+    /// for every clone. Only `run`'s wait loop takes (M4b Decision 1). It forwards what arrived
+    /// while `claude` runs, and it clears what forwarding left once `claude` has exited, so the
+    /// exit handling's cancellation points see only new signals. Everything else only reads.
+    pub fn take(&self) -> Option<i32> {
+        match self.signal.swap(0, Ordering::SeqCst) {
+            0 => None,
+            n => Some(n as i32),
+        }
+    }
+
     /// `Err(Interrupted(n))` once a signal is recorded.
     pub fn check(&self) -> Result<(), Interrupted> {
         match self.requested() {
@@ -82,6 +93,29 @@ mod tests {
         let c = Cancel::new();
         c.cell().store(1, Ordering::SeqCst);
         assert_eq!(c.requested(), Some(1));
+    }
+
+    #[test]
+    fn take_returns_the_signal_once_and_clears_it_for_every_clone() {
+        let c = Cancel::new();
+        let clone = c.clone();
+        assert_eq!(c.take(), None, "nothing is recorded yet");
+        clone.request(15);
+        assert_eq!(c.take(), Some(15));
+        assert_eq!(clone.requested(), None);
+        assert_eq!(clone.check(), Ok(()));
+        assert_eq!(clone.take(), None, "a signal is taken once");
+    }
+
+    #[test]
+    fn a_signal_after_a_take_is_recorded_again() {
+        let c = Cancel::new();
+        c.request(2);
+        assert_eq!(c.take(), Some(2));
+        // What a handler does: it stores into the cell, whatever was taken before.
+        c.cell().store(1, Ordering::SeqCst);
+        assert_eq!(c.requested(), Some(1));
+        assert_eq!(c.take(), Some(1));
     }
 
     #[test]
