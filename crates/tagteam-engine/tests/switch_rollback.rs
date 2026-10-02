@@ -69,6 +69,7 @@ fn undecidable_row(fx: &Fx, to: &AccountId) -> JournalRow {
         from_fp: Some("sha256:matches-nothing".into()),
         from_identity: Some(json!({"emailAddress": "gone@x.co"})),
         to_fp: "sha256:matches-nothing-either".into(),
+        to_epoch: None,
         started_at: 1,
         prior: None,
     };

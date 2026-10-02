@@ -1848,6 +1848,9 @@ impl Engine {
                 .fingerprint(&target_secret)
                 .map(|f| f.as_str().to_owned())
                 .unwrap_or_default(),
+            // §9.4 step 6: read under the target's account lock, so it cannot move before
+            // the commit; a forward recovery records it (§9.6).
+            to_epoch: Some(target.login_epoch),
             started_at: self.now_ms(),
             prior: prior.clone(),
         })?;
@@ -2140,6 +2143,7 @@ impl Engine {
         tx.store.commit_switch(
             &req.provider,
             &target.id,
+            target.login_epoch,
             &EventRow {
                 at: self.now_ms(),
                 provider: req.provider.clone(),

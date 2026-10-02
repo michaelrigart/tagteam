@@ -1750,7 +1750,7 @@ mod hooks {
         fx.engine
             .store()
             .unwrap()
-            .set_active(&fx.provider(), Some(&b))
+            .set_active(&fx.provider(), Some(&b), Some(0))
             .unwrap();
         fx.login("a@x.co", "rt-a");
         fx.script_usage(200, usage_fixture());

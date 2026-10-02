@@ -291,6 +291,7 @@ impl Engine {
         store.commit_switch(
             &row.provider,
             &to.id,
+            to.login_epoch,
             &EventRow {
                 at: self.now_ms(),
                 provider: row.provider.clone(),

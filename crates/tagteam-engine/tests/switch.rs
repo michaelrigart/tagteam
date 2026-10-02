@@ -16,7 +16,7 @@ use tagteam_core::poll::PollPlan;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::AddTokenOptions;
-use tagteam_engine::store::{EventRow, NewAccount};
+use tagteam_engine::store::{Activation, EventRow, NewAccount};
 use tagteam_engine::switch::{
     AutoPerform, SwitchOutcome, SwitchReason, SwitchRequest, SwitchTarget,
 };
@@ -62,7 +62,7 @@ fn make_fresh_machine(fx: &Fx) {
     fx.engine
         .store()
         .unwrap()
-        .set_active(&fx.provider(), None)
+        .set_active(&fx.provider(), None, None)
         .unwrap();
 }
 
@@ -1441,4 +1441,60 @@ fn an_automatic_switch_leaves_freshening_to_the_tick() {
     assert!(out.switched, "{}", out.message);
     assert_eq!(token_requests(&fx), 0);
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+}
+
+/// Sets `id`'s `login_epoch` directly, as explicit replacements since it was added would have.
+fn set_login_epoch(fx: &Fx, id: &AccountId, epoch: i64) {
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute(
+            "UPDATE accounts SET login_epoch = ?2 WHERE id = ?1",
+            rusqlite::params![id.as_str(), epoch],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_switch_records_the_target_s_login_epoch_as_the_activation_epoch() {
+    // §9.4 step 9: the active account and its activation epoch move in the commit.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live: b
+    set_login_epoch(&fx, &a, 3);
+
+    switch(&fx, to(&a), false).unwrap();
+
+    assert_eq!(
+        fx.activation(),
+        Some(Activation {
+            account: a.clone(),
+            epoch: Some(3)
+        })
+    );
+    assert!(!fx.live_store_stale(&a));
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn the_journal_row_carries_the_target_s_login_epoch() {
+    // §9.4 step 6: the row names the target's `login_epoch`, which a forward recovery records
+    // (§9.6). Read by a second engine while the row exists, between the journal and the commit.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    set_login_epoch(&fx, &a, 3);
+    let seen: Arc<Mutex<Option<tagteam_engine::store::JournalRow>>> = Arc::default();
+    let other = fx.engine_with_env(fx.env.clone());
+    let (slot, provider) = (seen.clone(), fx.provider());
+    fx.engine.on_point(
+        "after-journal",
+        Box::new(move || {
+            *slot.lock().unwrap() = other.store().unwrap().journal(&provider).unwrap();
+        }),
+    );
+
+    switch(&fx, to(&a), false).unwrap();
+
+    let row = seen.lock().unwrap().clone().expect("the row was journaled");
+    assert_eq!((row.to_id, row.to_epoch), (a, Some(3)));
 }

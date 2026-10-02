@@ -10,6 +10,7 @@ use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
+use tagteam_engine::store::Activation;
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::{Credential, Identity, Provider};
 
@@ -913,4 +914,32 @@ fn a_new_account_whose_vault_write_fails_its_check_leaves_no_secret_behind() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn add_records_the_account_s_login_epoch_as_its_activation_epoch() {
+    // §10.1 step 4: the live store now holds exactly what the vault holds.
+    let fx = Fx::new();
+    fx.login("me@work.co", "rt-1");
+    let first = fx.engine.add_live(add_opts(&fx)).unwrap().account;
+    assert_eq!(
+        fx.activation(),
+        Some(Activation {
+            account: first.id.clone(),
+            epoch: Some(0)
+        })
+    );
+
+    fx.rotate_live("rt-2");
+    let again = fx.engine.add_live(add_opts(&fx)).unwrap().account;
+
+    assert_eq!(again.login_epoch, 1);
+    assert_eq!(
+        fx.activation(),
+        Some(Activation {
+            account: first.id.clone(),
+            epoch: Some(1)
+        })
+    );
+    assert!(!fx.live_store_stale(&first.id));
 }
