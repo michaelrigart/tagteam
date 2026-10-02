@@ -127,6 +127,9 @@ pub struct IdentitySurface {
     /// Keychain items the provider may write wholesale (CC: the managed-key item).
     pub owned_items: Vec<(String, String)>,
     pub machine_shared_keys: Vec<&'static str>,
+    /// Entries tagteam may create, empty, only when absent (§3's create-only row): the
+    /// must-share entries a link sync creates in the source home (§12.2).
+    pub create_only: Vec<PathBuf>,
 }
 
 /// Whether a must-share entry is a directory or a file (§12.2).

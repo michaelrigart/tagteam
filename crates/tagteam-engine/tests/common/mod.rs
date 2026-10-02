@@ -1040,7 +1040,9 @@ impl Fx {
 
     /// `assert_only_surface_changed` for any provider's declared surface. Since the walk covers
     /// all of HOME and every Keychain item, one provider's surface also proves that its
-    /// commands left every other provider's state untouched (§15.3).
+    /// commands left every other provider's state untouched (§15.3). A create-only entry (§3)
+    /// may appear where there was none, empty, and a source home that did not exist may appear
+    /// with it; once either exists, it is held to the byte-for-byte rule like anything else.
     pub fn assert_only_surface_changed_for(
         &self,
         surface: &IdentitySurface,
@@ -1059,6 +1061,15 @@ impl Fx {
             .iter()
             .map(|p| resolve(before, p))
             .collect();
+        // Each resolved through a linked parent directory, as the walk records it.
+        let create_only: BTreeSet<PathBuf> = surface
+            .create_only
+            .iter()
+            .map(|p| match (p.parent(), p.file_name()) {
+                (Some(dir), Some(name)) => resolve(before, dir).join(name),
+                _ => p.clone(),
+            })
+            .collect();
         let paths: BTreeSet<&PathBuf> = before.files.keys().chain(after.files.keys()).collect();
         for path in paths {
             let (b, a) = (before.files.get(path), after.files.get(path));
@@ -1066,6 +1077,28 @@ impl Fx {
                 // A bare ancestor of tagteam's own data dir, created lazily just now: tolerated
                 // only on its first appearance. Once it exists in `before` too, it falls through
                 // to the rules below like any other path, so a later change to it is still caught.
+                continue;
+            }
+            if b.is_none() && create_only.contains(path) {
+                // §3's create-only row: created where there was none, and only ever empty, a
+                // directory or a file, never a link.
+                let empty = match a.map(|e| &e.kind) {
+                    Some(EntryKind::Dir) => true,
+                    Some(EntryKind::File(bytes)) => bytes.is_empty(),
+                    _ => false,
+                };
+                assert!(
+                    empty,
+                    "{step}: the create-only {} was created with content, or as a link",
+                    path.display()
+                );
+                continue;
+            }
+            if b.is_none()
+                && matches!(a.map(|e| &e.kind), Some(EntryKind::Dir))
+                && create_only.iter().any(|c| c.starts_with(path))
+            {
+                // A source home that did not exist, created for its create-only entries.
                 continue;
             }
             if let Some(keys) = json_keys.get(path) {
