@@ -46,6 +46,7 @@ fn the_defaults_are_the_specs_table() {
         "{account} · 5h {5h}% · 7d {7d}%{stale}"
     );
     assert_eq!(d.color, ColorMode::Auto);
+    assert!(d.share_extra.is_empty());
 }
 
 #[test]
@@ -90,6 +91,9 @@ format = "{5h}%"
 
 [ui]
 color = "never"
+
+[run]
+share_extra = ["hook-data"]
 "#,
     );
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -107,6 +111,7 @@ color = "never"
             history_retention_days: 30,
             statusline_format: "{5h}%".to_owned(),
             color: ColorMode::Never,
+            share_extra: vec!["hook-data".into()],
         }
     );
 }
@@ -122,7 +127,7 @@ fn keys_written_with_dotted_names_are_read_too() {
 #[test]
 fn keys_this_milestone_does_not_read_are_ignored_without_a_warning() {
     let (settings, warnings) = load(
-        "default_provider = \"claude-code\"\n[autoswitch]\nfuture = true\n[run]\nshare_extra = [\"x\"]\n",
+        "default_provider = \"claude-code\"\n[autoswitch]\nfuture = true\n[run]\nfuture = true\n",
     );
     assert_eq!(settings, Settings::default());
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -878,4 +883,67 @@ fn the_mtime_is_the_settings_files_and_none_without_one() {
     );
     fs::remove_file(&path).unwrap();
     assert_eq!(Settings::mtime(&env), None, "a removed file has none");
+}
+
+#[test]
+fn run_share_extra_is_read_from_the_provider_s_table_first() {
+    let text = "[run]\nshare_extra = [\"global\"]\n\
+                [provider.claude-code.run]\nshare_extra = [\"hook-data\", \"tool-cache\"]\n";
+    let (settings, warnings) = load(text);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(settings.share_extra, ["hook-data", "tool-cache"]);
+    let (settings, _) = load_as(text, "fake-agent");
+    assert_eq!(
+        settings.share_extra,
+        ["global"],
+        "another provider's table does not apply"
+    );
+}
+
+#[test]
+fn run_share_extra_takes_a_name_or_a_list_and_collapses_repeats() {
+    let (settings, warnings) = load("[run]\nshare_extra = \"hook-data\"\n");
+    assert_eq!(settings.share_extra, ["hook-data"]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    let (settings, warnings) =
+        load("[run]\nshare_extra = [\"hooks.json\", \".my-tool\", \"hooks.json\"]\n");
+    assert_eq!(
+        settings.share_extra,
+        ["hooks.json", ".my-tool"],
+        "a dot inside a name is fine"
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn a_share_extra_item_that_is_not_an_entry_name_is_dropped_with_a_warning_naming_it() {
+    let (settings, warnings) =
+        load("[run]\nshare_extra = [\"hook-data\", \"\", \".\", \"..\", \"a/b\", 3]\n");
+    assert_eq!(settings.share_extra, ["hook-data"]);
+    assert_eq!(warnings.len(), 5, "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .all(|w| w.contains("`run.share_extra`") && w.contains("config.toml")),
+        "{warnings:?}"
+    );
+    for name in ["\"\"", "\".\"", "\"..\"", "\"a/b\""] {
+        assert!(
+            warnings.iter().any(|w| w.contains(name)),
+            "{name}: {warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn a_share_extra_that_is_neither_a_name_nor_a_list_warns_and_the_next_table_applies() {
+    let (settings, warnings) =
+        load("[run]\nshare_extra = [\"global\"]\n[provider.claude-code.run]\nshare_extra = 3\n");
+    assert_eq!(settings.share_extra, ["global"]);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`provider.claude-code.run.share_extra`"),
+        "{warnings:?}"
+    );
 }
