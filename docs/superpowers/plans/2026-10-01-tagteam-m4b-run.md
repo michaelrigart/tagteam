@@ -34,6 +34,7 @@
 
 ## Execution notes
 
+- **M4a's execution changed one signature this plan calls:** `Provider::delete_profile_credential(env, dir, spelling)`, where `dir` is the profile's actual directory. It takes CC's storage-write lock itself, around each delete, when `dir` is a real directory, so it is never called while that lock is held. Task 9's bootstrap step 5 passes `profile` to both calls. The re-sync checks every other call.
 - **Execution starts after M4a is merged into `main`** (M3a merged at `7ee733b`). The first step rebases this branch and re-syncs this plan with M3a's and M4a's final code: names, line numbers and every interface listed under "Builds on". Record the re-sync under "Execution rulings" before Task 1.
 - When execution starts, set this plan's `**Status:**` to `In progress` in one commit.
 - Run in the `m4-run-sessions` worktree.
@@ -10549,9 +10550,9 @@ impl Engine {
         p.write_profile_credential(&self.env, &current, guard, &composed)?;
         hooks::point(self, "bootstrap-after-credential-write")?;
         // 5. Always, whatever the reason: an item left behind stays authoritative over the file.
-        p.delete_profile_credential(&self.env, &current)?;
+        p.delete_profile_credential(&self.env, profile, &current)?;
         if recorded != current {
-            p.delete_profile_credential(&self.env, &recorded)?;
+            p.delete_profile_credential(&self.env, profile, &recorded)?;
         }
         // 6. What Claude Code will read now must be the vault's current generation.
         let effective = self.read_held(p, profile, &current)?;
