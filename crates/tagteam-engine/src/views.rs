@@ -767,10 +767,8 @@ impl Engine {
             None => None,
         };
         Ok(match row {
-            // The line shows no pace, so none is computed.
+            // The line shows no pace, so none is computed, and no session state (Decision 17).
             Some(row) => StatuslineView::Managed {
-                // Nor does it ask whether the account is in a session: the status bar stays away
-                // from profile directories (§13.5, Decision 17).
                 account: self.account_view_with(row, true, false, false),
             },
             None => StatuslineView::Unmanaged { email: login.label },

@@ -187,10 +187,10 @@ impl Engine {
     /// account the live login names is the active one, any other that a `tagteam run` session
     /// owns takes the session branch (§12.5), and the rest are inactive. A usage failure is
     /// never an error here: it is recorded, and reported in the report's outcomes and warnings.
-    /// So is an error that ends one account's collection, deciding its role included (the store
-    /// or its profile failing under it): every thread is joined and kept, and that account's
-    /// outcome is `Failed { kind: "error" }` with one warning naming it, so one account never
-    /// costs the others' outcomes. `Err` only for an error outside the threads (opening the
+    /// So is an error that ends one account's collection (the store failing under it): every
+    /// thread is joined and kept, and that account's outcome is `Failed { kind: "error" }` with
+    /// one warning naming it, so one account never costs the others' outcomes. A profile that
+    /// cannot be read is no such error: it decides a role too (`role_of`). `Err` only for an error outside the threads (opening the
     /// store, reading the accounts, reading each provider's recorded active account and, for
     /// `Scheduled`, the provider and the store between the phases), or for §14.1's cancel
     /// token set during the collection: `Interrupted`, once every thread has joined and given
@@ -363,8 +363,10 @@ impl Engine {
     }
 
     /// Each of `rows` on its own thread (§8.3), waiting for them all; each result with its row.
-    /// Every row's role (`role_of`) is decided before the first thread starts; a role that
-    /// cannot be decided is that account's error.
+    /// Every row's role (`role_of`) is decided before the first thread starts. A profile read
+    /// never fails it: `session_state` makes every I/O failure a state, and one that cannot be
+    /// read counts as session-owned (§12.6). Should `role_of` ever fail, that is the account's
+    /// error.
     fn collect_each<'r>(
         &self,
         store: &Store,
@@ -551,9 +553,9 @@ struct Collection<'a> {
     threshold: f64,
     models: &'a [String],
     reservation: Reservation,
-    /// The slot reserved for the next request, while that request is unsent. `send` hands it
-    /// to `authorize_send` and puts it back only if the request never left; one still here at
-    /// the record is given back (§8.3).
+    /// The slot reserved for the next request, while that request is unsent.
+    /// `send_credential` hands it to the store's authorization (`authorize`) and puts it back
+    /// only if the request never left; one still here at the record is given back (§8.3).
     slot: Option<Slot>,
     /// The state read after reserving: the previous reading, the failure count, the plan.
     state: Option<UsageStateRow>,

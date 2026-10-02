@@ -275,14 +275,14 @@ fn rebase(bytes: &[u8], shared: &Map<String, Value>) -> Vec<u8> {
     serde_json::to_vec(&Value::Object(o)).expect("a Value always serializes")
 }
 
-/// `fence`, then the storage-write lock's own ownership check: the check that runs immediately
-/// before every write the lock protects (§9.1).
 /// A real directory, not a symlink to one (`symlink_metadata`); false for anything else,
 /// including a path that cannot be read.
 fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
+/// `fence`, then the storage-write lock's own ownership check: the check that runs immediately
+/// before every write the lock protects (§9.1).
 fn held<'a>(fence: Fence<'a>, lock: &'a MkdirLock) -> impl Fn() -> Result<(), ProviderError> + 'a {
     move || {
         fence()?;
