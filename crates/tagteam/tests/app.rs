@@ -1166,6 +1166,17 @@ fn a_signal_that_meets_no_cancellation_point_is_too_late_and_changes_nothing() {
 }
 
 #[test]
+fn a_broken_pipe_that_meets_no_cancellation_point_prints_no_late_notice() {
+    // The reader of `auto --once`'s output left: SIGPIPE is recorded, the exit code stays, and
+    // nobody is left to read a notice that the signal came too late.
+    let h = H::new();
+    let (code, out, err) =
+        h.run_with_cancel(&["list"], &mut Scripted::none(), &signalled(libc::SIGPIPE));
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert_eq!(out, h.ok(&["list"]));
+}
+
+#[test]
 fn ctrl_c_at_the_offer_to_add_the_live_login_interrupts_and_adds_nothing() {
     // Review Focus 3. The scripted answer is a yes: whatever the prompt answered, the signal
     // stops the command.
