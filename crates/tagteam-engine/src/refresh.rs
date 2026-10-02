@@ -31,7 +31,8 @@ pub enum OwnedBy {
     Live,
     /// An unresolved switch names it: until recovery decides, CC may be running on it (§9.6).
     Journal,
-    /// A `tagteam run` session owns it (§12.5). Never produced before M4.
+    /// A `tagteam run` session owns it (§12.5): a live launch reservation, or a session record
+    /// that is live or unreadable.
     Session,
 }
 
@@ -421,16 +422,12 @@ impl Engine {
         if journaled {
             return Ok(Some(OwnedBy::Journal));
         }
-        if self.session_owned(row) {
+        // A reservation is created only under this account's lock (§12.5), which the gate holds,
+        // so no session can start before the request is sent.
+        if self.session_state(p, row)?.owned() {
             return Ok(Some(OwnedBy::Session));
         }
         Ok(None)
-    }
-
-    /// §12.5: whether a `tagteam run` session owns the account. Profiles arrive with M4; until
-    /// then nothing is session-owned.
-    fn session_owned(&self, _row: &AccountRow) -> bool {
-        false
     }
 
     /// Step 7 for every result but a successor.

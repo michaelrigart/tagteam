@@ -55,6 +55,7 @@ impl T {
             http: Arc::new(NoHttp),
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings: Settings::default(),
+            process: Arc::new(tagteam_provider::liveness::FakeProcessProbe::new()),
             run_shell: RunShell::Outside,
         });
         T {

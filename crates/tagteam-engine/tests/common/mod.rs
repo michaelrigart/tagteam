@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,10 +28,13 @@ use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBacke
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::http::Method;
-use tagteam_provider::profile::{ProfileMarker, RunShell, canonical_profile_path, profile_path};
+use tagteam_provider::liveness::{FakeProcess, FakeProcessProbe, parse_lstart};
+use tagteam_provider::profile::{
+    LAUNCH_DIR, ProfileMarker, RunShell, Seed, canonical_profile_path, profile_path,
+};
 use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{
-    Cancel, Clock, Credential, Env, FakeClock, FakeKeychain, Identity, IdentitySurface,
+    Cancel, Clock, Credential, Env, FakeClock, FakeKeychain, FlockGuard, Identity, IdentitySurface,
     MutationGuard, ProcessStamp, Provider, Read, ScriptedHttp,
 };
 
@@ -225,6 +229,8 @@ pub struct Fx {
     pub clock: Arc<FakeClock>,
     /// Every engine this fixture builds sends through this one scripted port.
     pub http: Arc<ScriptedHttp>,
+    /// Judges every session record any engine of this fixture reads (§12.6); it never looks at a real process.
+    pub process: Arc<FakeProcessProbe>,
     pub cc: Arc<ClaudeCode>,
     pub engine: Engine,
 }
@@ -308,6 +314,7 @@ impl Fx {
         let oracle = Arc::new(FixedOracle::default());
         let clock = Arc::new(FakeClock::new(1_790_000_000_000));
         let http = Arc::new(ScriptedHttp::new());
+        let process = Arc::new(FakeProcessProbe::new());
         let cc = Arc::new(tune(ClaudeCode::with_store(
             LiveStore::new(kc.clone(), platform).with_retry_delay(Duration::ZERO),
         )));
@@ -324,6 +331,7 @@ impl Fx {
             http: http.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings: Settings::default(),
+            process: process.clone(),
             run_shell: RunShell::Outside,
         });
         Fx {
@@ -334,6 +342,7 @@ impl Fx {
             oracle,
             clock,
             http,
+            process,
             cc,
             engine,
         }
@@ -772,6 +781,7 @@ impl Fx {
             http: self.http.clone(),
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings: Settings::default(),
+            process: self.process.clone(),
             run_shell,
         })
     }
@@ -1153,6 +1163,7 @@ impl FakeFx {
             default_provider: ProviderId::new(CLAUDE_CODE),
             http: fx.http.clone(),
             settings: Settings::default(),
+            process: fx.process.clone(),
             run_shell: RunShell::Outside,
         });
         FakeFx { fx, fake, engine }
@@ -1330,6 +1341,7 @@ impl Fx {
             http,
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings,
+            process: self.process.clone(),
             run_shell: RunShell::Outside,
         })
     }
@@ -1651,5 +1663,110 @@ impl Fx {
         let registry = ProviderRegistry::new().with(self.cc.clone());
         let (run_shell, env) = detect_run_shell(&env, &registry);
         self.engine_in(env, run_shell, self.keychain_vault(), self.oracle.clone())
+    }
+}
+
+/// A session record's `procStart` as CC 2.1.286 writes it (§12.6), for `Fx::live_record`.
+pub const LSTART: &str = "Thu Oct  1 12:34:56 2026";
+
+/// A session record as CC 2.1.286 writes it (Appendix A.7), with `LSTART` as its `procStart`.
+pub fn record_json(pid: u32, kind: &str) -> String {
+    json!({
+        "pid": pid,
+        "procStart": LSTART,
+        "startedAt": 1_790_000_000_000i64,
+        "kind": kind,
+        "sessionId": "s-1"
+    })
+    .to_string()
+}
+
+/// What runs in a profile, and what it holds (§12.5, §12.6).
+impl Fx {
+    /// Records `seed_fp` as the generation `profile` last agreed on with the vault, under
+    /// `login_epoch` (§12.5), as a bootstrap would.
+    pub fn write_seed(&self, profile: &Path, login_epoch: i64, seed_fp: &str) {
+        Seed {
+            login_epoch,
+            seed_fp: seed_fp.to_owned(),
+            needs_bootstrap: false,
+        }
+        .write(profile)
+        .unwrap();
+    }
+
+    /// Leaves `bytes` as the profile's `.credentials.json` (0600), the file Claude Code reads
+    /// when the profile's hashed Keychain item is absent (§12.2).
+    pub fn set_profile_credential(&self, profile: &Path, bytes: &[u8]) {
+        let path = profile.join(".credentials.json");
+        fs::write(&path, bytes).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// The (service, account) of the hashed OAuth Keychain item Claude Code names from
+    /// `spelling` (Appendix A.2), in the profile's environment: secure storage undefined.
+    pub fn item_for_spelling(&self, spelling: &str) -> (String, String) {
+        let mut env = self.env.clone();
+        env.claude_config_dir = Some(spelling.into());
+        env.claude_securestorage_config_dir = None;
+        (
+            keychain_service(&env, ItemKind::OAuth),
+            keychain_account(&env),
+        )
+    }
+
+    /// `item_for_spelling` for the spelling `profile`'s marker records.
+    pub fn profile_item(&self, profile: &Path) -> (String, String) {
+        let Read::Present(marker) = ProfileMarker::read(profile) else {
+            panic!("{} has no readable marker", profile.display())
+        };
+        self.item_for_spelling(&marker.config_dir)
+    }
+
+    /// A live launch reservation in `profile` (§12.5): a file under `.tagteam-launch/` this
+    /// test holds an exclusive `flock` on until it drops the guard.
+    pub fn hold_reservation(&self, profile: &Path) -> FlockGuard {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let name = format!(
+            "{}-{}.lock",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        );
+        FlockGuard::try_lock(&profile.join(LAUNCH_DIR).join(name))
+            .unwrap()
+            .expect("a fresh reservation file is free")
+    }
+
+    /// Writes `record` as `<name>.json` in `profile`'s session-records directory (CC:
+    /// `<profile>/sessions`, §12.6). Returns its path.
+    pub fn plant_record(&self, profile: &Path, name: &str, record: &[u8]) -> PathBuf {
+        let dir = self.cc.session_records_dir(profile);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.json"));
+        fs::write(&path, record).unwrap();
+        path
+    }
+
+    /// A `kind` record for `pid`, whose process the fixture's probe says still runs, started at
+    /// exactly `LSTART`: live (§12.6).
+    pub fn live_record(&self, profile: &Path, pid: u32, kind: &str) -> PathBuf {
+        self.process.set(
+            pid,
+            FakeProcess {
+                exists: Some(true),
+                start_time_s: parse_lstart(LSTART),
+                ..FakeProcess::default()
+            },
+        );
+        self.plant_record(profile, &pid.to_string(), record_json(pid, kind).as_bytes())
+    }
+
+    /// A record for `pid`, which the fixture's probe has never heard of: dead (§12.6).
+    pub fn dead_record(&self, profile: &Path, pid: u32) -> PathBuf {
+        self.plant_record(
+            profile,
+            &pid.to_string(),
+            record_json(pid, "interactive").as_bytes(),
+        )
     }
 }

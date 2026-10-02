@@ -1,12 +1,22 @@
 //! §12.8: where a process stands, inside a run shell or not. It is found once, before the
 //! engine is built (Decision 6), so every engine read of `env` already sees the default home.
+//! And §12.5's session state: whether a session owns an account.
 
-use std::path::Path;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
-use tagteam_provider::profile::{MARKER_FILE, ProfileMarker, RunShell};
-use tagteam_provider::{Env, Read};
+use tagteam_provider::flock::LockProbe;
+use tagteam_provider::liveness::{RecordEntry, read_session_records, record_is_live};
+use tagteam_provider::profile::{
+    MARKER_FILE, ProfileMarker, RunShell, launch_reservations, profile_path,
+};
+use tagteam_provider::{Env, Provider, Read};
 
+use crate::engine::Engine;
+use crate::error::EngineError;
 use crate::registry::ProviderRegistry;
+use crate::store::AccountRow;
 
 fn unreadable_marker(dir: &Path, env: &Env, detail: String) -> (RunShell, Env) {
     (
@@ -56,4 +66,108 @@ pub fn detect_run_shell(env: &Env, registry: &ProviderRegistry) -> (RunShell, En
         };
     }
     (RunShell::Outside, env.clone())
+}
+
+/// §12.5: whether a session owns an account, computed on each call and never cached
+/// (Decision 8).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionState {
+    NoProfile,
+    Quiescent {
+        profile: PathBuf,
+    },
+    Owned {
+        profile: PathBuf,
+    },
+    /// A reservation or a record could not be read: counts as owned (§10.3, §12.6).
+    Unreadable {
+        profile: PathBuf,
+        detail: String,
+    },
+}
+
+impl SessionState {
+    /// Session-owned (§12.5): a live reservation or record, or one that could not be read.
+    pub fn owned(&self) -> bool {
+        matches!(
+            self,
+            SessionState::Owned { .. } | SessionState::Unreadable { .. }
+        )
+    }
+
+    /// The profile directory, when the account has one.
+    pub fn profile(&self) -> Option<&Path> {
+        match self {
+            SessionState::NoProfile => None,
+            SessionState::Quiescent { profile }
+            | SessionState::Owned { profile }
+            | SessionState::Unreadable { profile, .. } => Some(profile),
+        }
+    }
+}
+
+fn unreadable_state(profile: &Path, detail: String) -> SessionState {
+    SessionState::Unreadable {
+        profile: profile.to_path_buf(),
+        detail,
+    }
+}
+
+impl Engine {
+    /// §12.5: reservations (any `Held`) and session records (`record_is_live`, any `Unreadable`).
+    ///
+    /// The profile is `profile_path(env, id)` (§5). A held reservation, then a live record,
+    /// makes the account `Owned`; failing that, anything that could not be read makes it
+    /// `Unreadable`. Every I/O failure is a state, never an error. A provider without
+    /// `sessions` has no profiles, and nothing on disk is touched for it.
+    pub fn session_state(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+    ) -> Result<SessionState, EngineError> {
+        if !p.capabilities().sessions {
+            return Ok(SessionState::NoProfile);
+        }
+        let profile = profile_path(&self.env, &row.id);
+        match fs::symlink_metadata(&profile) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SessionState::NoProfile),
+            Err(e) => {
+                let detail = format!("{}: {e}", profile.display());
+                return Ok(unreadable_state(&profile, detail));
+            }
+        }
+        match launch_reservations(&profile) {
+            Read::Present(found) => {
+                if found.iter().any(|(_, probe)| *probe == LockProbe::Held) {
+                    return Ok(SessionState::Owned { profile });
+                }
+            }
+            Read::Absent => {}
+            Read::Unreadable(e) => return Ok(unreadable_state(&profile, e.to_string())),
+        }
+        let mut damaged = None;
+        match read_session_records(&p.session_records_dir(&profile)) {
+            Read::Present(entries) => {
+                for entry in entries {
+                    match entry {
+                        RecordEntry::Record(r) => {
+                            if record_is_live(self.process.as_ref(), &r, p.launch_command()) {
+                                return Ok(SessionState::Owned { profile });
+                            }
+                        }
+                        RecordEntry::Unreadable { path, detail } => {
+                            damaged.get_or_insert_with(|| format!("{}: {detail}", path.display()));
+                        }
+                    }
+                }
+            }
+            Read::Absent => {}
+            Read::Unreadable(e) => return Ok(unreadable_state(&profile, e.to_string())),
+        }
+        Ok(match damaged {
+            Some(detail) => unreadable_state(&profile, detail),
+            None => SessionState::Quiescent { profile },
+        })
+    }
 }
