@@ -23,6 +23,9 @@ pub struct OutgoingFacts {
     pub oracle: OracleVerdict,
     /// The live credential lacks a refresh token while the vault's has one (§6.2).
     pub lacks_refresh_over_complete: bool,
+    /// §9.4 step 4 / §12.5: the live store is stale-marked for the outgoing account, so a
+    /// capture would undo an explicit replacement. Turns a capture into `Displace`.
+    pub live_store_stale: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,9 +46,11 @@ pub enum OutgoingAction {
     Displace,
 }
 
-/// The §9.4 step 4 table, `Superseded` included, with the §6.2 rules that an automatic capture never replaces a
-/// refresh token with a credential that lacks one, and never captures a credential with no
-/// token at all: that one is left alone like a wiped blob, and the vault keeps its generation.
+/// The §9.4 step 4 table, `Superseded` included, with §6.2's bounds on an automatic capture. A
+/// capture never replaces a refresh token with a credential that lacks one, and never takes a
+/// stale-marked live store (§12.5), which would undo the replacement that marked it. Either is
+/// displaced instead, under its class. A credential with no token at all is never captured
+/// either: it is left alone like a wiped blob, and the vault keeps its generation.
 pub fn decide_outgoing(f: &OutgoingFacts) -> (OutgoingClass, OutgoingAction) {
     if f.bytes_equal_vault || f.fp_equal_vault {
         return (OutgoingClass::Ours, OutgoingAction::Nothing);
@@ -61,7 +66,7 @@ pub fn decide_outgoing(f: &OutgoingFacts) -> (OutgoingClass, OutgoingAction) {
         OracleVerdict::OtherIdentity => return (OutgoingClass::Foreign, OutgoingAction::Displace),
         OracleVerdict::Unavailable => (OutgoingClass::Unresolved, false),
     };
-    if f.lacks_refresh_over_complete {
+    if f.lacks_refresh_over_complete || f.live_store_stale {
         (class, OutgoingAction::Displace)
     } else {
         (class, OutgoingAction::CaptureToVault { backfill_uuid })
@@ -81,6 +86,7 @@ mod tests {
             tokenless: false,
             oracle: OracleVerdict::Unavailable,
             lacks_refresh_over_complete: false,
+            live_store_stale: false,
         }
     }
 
@@ -259,6 +265,63 @@ mod tests {
                 ..facts()
             };
             assert_eq!(decide_outgoing(&f).1, OutgoingAction::Displace);
+        }
+    }
+
+    #[test]
+    fn a_stale_marked_live_store_is_displaced_never_captured() {
+        // §9.4 step 4, §12.5: the class stays, so the log still says which capture it was.
+        for (oracle, class) in [
+            (OracleVerdict::ThisAccount, OutgoingClass::OursRotated),
+            (OracleVerdict::Unavailable, OutgoingClass::Unresolved),
+        ] {
+            let f = OutgoingFacts {
+                oracle,
+                live_store_stale: true,
+                ..facts()
+            };
+            assert_eq!(
+                decide_outgoing(&f),
+                (class, OutgoingAction::Displace),
+                "{oracle:?}"
+            );
+        }
+        // The rows that capture nothing are as they were.
+        let stale = OutgoingFacts {
+            live_store_stale: true,
+            ..facts()
+        };
+        for (f, want) in [
+            (
+                OutgoingFacts {
+                    fp_equal_vault: true,
+                    ..stale
+                },
+                (OutgoingClass::Ours, OutgoingAction::Nothing),
+            ),
+            (
+                OutgoingFacts {
+                    equals_vault_prev: true,
+                    ..stale
+                },
+                (OutgoingClass::Superseded, OutgoingAction::Nothing),
+            ),
+            (
+                OutgoingFacts {
+                    wiped: true,
+                    ..stale
+                },
+                (OutgoingClass::Wiped, OutgoingAction::Nothing),
+            ),
+            (
+                OutgoingFacts {
+                    oracle: OracleVerdict::OtherIdentity,
+                    ..stale
+                },
+                (OutgoingClass::Foreign, OutgoingAction::Displace),
+            ),
+        ] {
+            assert_eq!(decide_outgoing(&f), want);
         }
     }
 }

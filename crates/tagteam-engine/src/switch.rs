@@ -1973,6 +1973,8 @@ impl Engine {
             oracle: verdict(resolved, out),
             lacks_refresh_over_complete: !p.has_refresh_token(&bytes)
                 && vault.as_deref().is_some_and(|v| p.has_refresh_token(v)),
+            // `out` was read under its account lock, so its epoch cannot move until the commit.
+            live_store_stale: store.live_store_stale(out)?,
         };
         let (class, action) = decide_outgoing(&facts);
         match action {
@@ -2016,6 +2018,11 @@ impl Engine {
                 warnings.push(if class == OutgoingClass::Foreign {
                     format!(
                         "the live credential did not belong to position {}; it was saved as displaced/{id}.json",
+                        out.position
+                    )
+                } else if facts.live_store_stale {
+                    format!(
+                        "the live credential predates position {}'s replacement, so it did not replace the stored one; it was saved as displaced/{id}.json",
                         out.position
                     )
                 } else {

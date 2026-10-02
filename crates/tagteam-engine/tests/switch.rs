@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{
-    API_KEY, Fx, OTHER_API_KEY, STRAY_API_KEY, capture_logs, mutation_lock_free, token_requests,
-    usage_fixture,
+    API_KEY, Fx, OTHER_API_KEY, STRAY_API_KEY, capture_logs, credential, mutation_lock_free,
+    token_requests, usage_fixture,
 };
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
@@ -1497,4 +1497,96 @@ fn the_journal_row_carries_the_target_s_login_epoch() {
 
     let row = seen.lock().unwrap().clone().expect("the row was journaled");
     assert_eq!((row.to_id, row.to_epoch), (a, Some(3)));
+}
+
+/// The warning a displaced stale live store leaves, up to the displaced file's name.
+const STALE_DISPLACED: &str = "the live credential predates position 2's replacement, so it did not replace the stored one; it was saved as displaced/";
+
+#[test]
+fn switching_away_from_a_replaced_live_login_displaces_it_instead_of_capturing() {
+    // §9.4 step 4, §12.5, Review Focus 3: b's login was replaced while Claude Code kept the old
+    // one and went on refreshing it. Attributed or not, that lineage is displaced.
+    for attributed in [false, true] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b"); // live, position 2
+        fx.replace_login(&b, &credential("b@x.co", "rt-b-new"), "oauth");
+        fx.rotate_live("rt-b2");
+        if attributed {
+            let owner = fx.cc.parse_identity(&Fx::oauth_account("b@x.co")).unwrap();
+            fx.oracle.set(Some(owner));
+        }
+
+        let out = switch(&fx, to(&a), false).unwrap();
+
+        assert_eq!(
+            fx.vault_refresh_token(&b).as_deref(),
+            Some("rt-b-new"),
+            "attributed={attributed}: the replacement stays"
+        );
+        let displaced = fx.displaced();
+        assert_eq!(displaced.len(), 1, "attributed={attributed}");
+        assert!(String::from_utf8_lossy(&displaced[0]).contains("rt-b2"));
+        assert!(
+            out.warnings.iter().any(|w| w.starts_with(STALE_DISPLACED)),
+            "{:?}",
+            out.warnings
+        );
+        assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a"));
+    }
+}
+
+#[test]
+fn a_self_switch_over_a_replaced_live_login_activates_the_replacement() {
+    // §9.2: a self-switch whose live credential diverged runs a full switch once the oracle
+    // attributes it to the account. Its step 4 displaces the old lineage instead of capturing
+    // it back, so the replacement is what gets activated, and the mark is cleared.
+    let fx = Fx::new();
+    fx.add("b@x.co", "rt-b");
+    let a = fx.add("a@x.co", "rt-a"); // live, position 2
+    fx.replace_login(&a, &credential("a@x.co", "rt-a-new"), "oauth");
+    fx.rotate_live("rt-a2");
+    let owner = fx.cc.parse_identity(&Fx::oauth_account("a@x.co")).unwrap();
+    fx.oracle.set(Some(owner));
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert_eq!(out.reason, SwitchReason::Activated);
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-new"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a-new"));
+    assert!(
+        out.warnings.iter().any(|w| w.starts_with(STALE_DISPLACED)),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(
+        fx.activation(),
+        Some(Activation {
+            account: a.clone(),
+            epoch: Some(1)
+        })
+    );
+}
+
+#[test]
+fn a_forced_switch_to_a_replaced_live_login_clears_the_stale_mark() {
+    // §12.5: `tagteam switch <N> --force` re-activates the vault's generation, as a forced
+    // self-switch does (§9.2), and its commit records the current epoch. Claude Code's old
+    // lineage is displaced, not lost.
+    let fx = Fx::new();
+    fx.add("b@x.co", "rt-b");
+    let a = fx.add("a@x.co", "rt-a");
+    fx.replace_login(&a, &credential("a@x.co", "rt-a-new"), "oauth");
+    fx.rotate_live("rt-a2");
+    assert!(fx.live_store_stale(&a));
+
+    let out = switch(&fx, to(&a), true).unwrap();
+
+    assert!(out.switched);
+    assert!(!fx.live_store_stale(&a));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a-new"));
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-new"));
+    let displaced = fx.displaced();
+    assert_eq!(displaced.len(), 1);
+    assert!(String::from_utf8_lossy(&displaced[0]).contains("rt-a2"));
 }

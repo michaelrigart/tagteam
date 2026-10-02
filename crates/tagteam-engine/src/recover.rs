@@ -288,10 +288,13 @@ impl Engine {
         if !self.surfaces_agree(p, locks, own, established, Some(&to.identity_json)) {
             return Ok(());
         }
+        // §9.6: the epoch the row journaled, so a replacement that landed on the target since
+        // leaves the live store stale-marked. A row written before the column falls back to the
+        // target's current epoch.
         store.commit_switch(
             &row.provider,
             &to.id,
-            to.login_epoch,
+            row.to_epoch.unwrap_or(to.login_epoch),
             &EventRow {
                 at: self.now_ms(),
                 provider: row.provider.clone(),
@@ -317,8 +320,8 @@ impl Engine {
     /// is its. It is captured into the outgoing account's vault only when the pre-lock oracle
     /// resolved exactly these bytes to it. The hints are asked only about fresh live reads
     /// (`Axis::live_secret`), so a degraded read can never be captured, and §6.2's
-    /// refresh-token bound applies through `decide_outgoing`. Returns whether the entry was
-    /// captured, and so is held now.
+    /// refresh-token bound and §12.5's stale mark apply through `decide_outgoing`. Returns
+    /// whether the entry was captured, and so is held now.
     #[allow(clippy::too_many_arguments)]
     fn capture_rotated_outgoing(
         &self,
@@ -357,6 +360,8 @@ impl Engine {
             oracle,
             lacks_refresh_over_complete: !p.has_refresh_token(bytes)
                 && vault.as_deref().is_some_and(|v| p.has_refresh_token(v)),
+            // Recovery holds `from`'s account lock, so its epoch cannot move under this read.
+            live_store_stale: store.live_store_stale(from)?,
         };
         let OutgoingAction::CaptureToVault { .. } = decide_outgoing(&facts).1 else {
             return Ok(false);

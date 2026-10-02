@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    API_KEY, Fx, STRAY_API_KEY, assert_journal_cleared, crash_row, crashed_switch, dead_holder,
-    journal, prev_refresh_token, vault_fp, write_target_credential,
+    API_KEY, Fx, STRAY_API_KEY, assert_journal_cleared, crash_row, crashed_switch, credential,
+    dead_holder, journal, prev_refresh_token, vault_fp, write_target_credential,
 };
 use serde_json::Value;
 use tagteam_cc::ItemKind;
@@ -15,7 +15,7 @@ use tagteam_core::AccountId;
 use tagteam_core::autoswitch::AutoState;
 use tagteam_engine::EngineError;
 use tagteam_engine::oracle::HttpOracle;
-use tagteam_engine::store::JournalRow;
+use tagteam_engine::store::{Activation, JournalRow};
 #[cfg(feature = "test-hooks")]
 use tagteam_engine::switch::SwitchReason;
 use tagteam_provider::http::Method;
@@ -837,4 +837,74 @@ fn backward_recovery_keeps_a_cc_updated_oauth_account_of_the_same_identity() {
         doc["oauthAccount"], updated,
         "the CC-updated object is kept"
     );
+}
+
+#[test]
+fn forward_recovery_never_captures_a_replaced_live_login() {
+    // §9.6, §12.5: a's login was replaced while Claude Code kept the old one; then a switch to
+    // k died after writing the key, and Claude Code rotated its copy of the old lineage. The
+    // oracle attributes that rotation to a, yet capturing it would undo the replacement: it
+    // is displaced.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let k = fx.add_api_key(API_KEY); // leaves a live
+    fx.replace_login(&a, &credential("a@x.co", "rt-a-new"), "oauth");
+    crashed_switch(&fx, &a, &k);
+    fx.put_managed_key(API_KEY.as_bytes());
+    fx.rotate_live("rt-a-rotated-by-cc");
+    oracle_says(&fx, "a@x.co");
+
+    any_mutation(&fx, &a);
+
+    assert_journal_cleared(&fx);
+    assert_eq!(active(&fx), Some(k));
+    assert_eq!(
+        fx.vault_refresh_token(&a).as_deref(),
+        Some("rt-a-new"),
+        "the replacement stays"
+    );
+    let displaced = fx.displaced();
+    assert_eq!(displaced.len(), 1);
+    assert!(String::from_utf8_lossy(&displaced[0]).contains("rt-a-rotated-by-cc"));
+}
+
+#[test]
+fn forward_recovery_records_the_row_s_epoch_so_a_later_replacement_stays_stale_marked() {
+    // §9.6: a forward finish records the row's `to_epoch`. A replacement that landed on a
+    // since the row was written then leaves the live store stale-marked. A row from before the
+    // column falls back to a's current epoch.
+    for (to_epoch, stale) in [(Some(0), true), (None, false)] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b"); // live: b
+        let row = JournalRow {
+            to_epoch,
+            ..crash_row(&fx, &b, &a)
+        };
+        fx.engine.store().unwrap().insert_journal(&row).unwrap();
+        write_target_credential(&fx, &a); // the switch landed a's credential, then died
+        // Then a replacement of a's login wrote the vault and its replacer died; recovery's
+        // own account lock finishes it before recovering the row.
+        fx.begin_replacement_with(
+            &a,
+            &credential("a@x.co", "rt-a-new"),
+            &Fx::oauth_account("a@x.co"),
+            "oauth",
+            false,
+        );
+
+        any_mutation(&fx, &a);
+
+        assert_journal_cleared(&fx);
+        let want = if stale { 0 } else { 1 };
+        assert_eq!(
+            fx.activation(),
+            Some(Activation {
+                account: a.clone(),
+                epoch: Some(want)
+            }),
+            "to_epoch={to_epoch:?}"
+        );
+        assert_eq!(fx.live_store_stale(&a), stale, "to_epoch={to_epoch:?}");
+    }
 }
