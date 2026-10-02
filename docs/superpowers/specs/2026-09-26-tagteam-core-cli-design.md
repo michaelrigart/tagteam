@@ -1641,8 +1641,8 @@ budget (§8.6) does not reset.
   temp files (§9.5) whose writer is gone, in tagteam's own directories only: one beside a CC
   file is outside the identity surface (§3), so `doctor` names it for the user to delete;
 - the store's contents: every row of every table, in one transaction with `secure_delete` on,
-  followed by a WAL checkpoint that truncates the WAL, so no deleted row survives in either
-  file. The store file itself stays, with its schema, so a process that opened it before the
+  then a `VACUUM`, which rewrites the pages that rows deleted or updated earlier left behind,
+  then a WAL checkpoint that truncates the WAL, so no deleted row survives in either file. The store file itself stays, with its schema, so a process that opened it before the
   purge goes on with a valid, empty store rather than a deleted file;
 - the log and its rotations (§14.2).
 
