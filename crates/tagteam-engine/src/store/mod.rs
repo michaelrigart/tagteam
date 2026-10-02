@@ -22,11 +22,28 @@ pub use usage::{
 };
 pub(crate) use usage::{backoff_holds, backoff_is_skewed, plan_is_skewed};
 
+/// Version 1, frozen: never edited, so a fresh file and an upgraded one end in the same schema.
 const SCHEMA_V1: &str = include_str!("schema.sql");
+
+/// Version 2 (§6.1, §12.5): the activation epoch on `active_accounts`, filled with each named
+/// account's current `login_epoch` (the live store is taken as current, the best evidence there
+/// is), and the target's epoch on the switch journal, left NULL on a row written before it
+/// (§9.6 falls back to the target's current epoch).
+const MIGRATION_V2: &str = "ALTER TABLE active_accounts ADD COLUMN login_epoch INTEGER;
+ALTER TABLE switch_journal ADD COLUMN to_epoch INTEGER;
+UPDATE active_accounts SET login_epoch =
+  (SELECT login_epoch FROM accounts WHERE accounts.id = active_accounts.account_id)
+  WHERE account_id IS NOT NULL;";
+
+/// The migration ladder: step `n` takes a file from version `n` to `n + 1`. A fresh file runs
+/// every step, and an older one only the steps above its version.
+const MIGRATIONS: [&str; 2] = [SCHEMA_V1, MIGRATION_V2];
 
 /// The `PRAGMA user_version` this build knows how to read and write. A stored version above
 /// this is a store written by a newer tagteam; `migrate` refuses it rather than guessing.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+
+const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -109,6 +126,9 @@ pub struct JournalRow {
     pub from_fp: Option<String>,
     pub from_identity: Option<Value>,
     pub to_fp: String,
+    /// The target's `login_epoch` when the row was written (§9.4 step 6): the activation epoch
+    /// a forward finish records (§9.6). `None` on a row written before the column existed.
+    pub to_epoch: Option<i64>,
     pub started_at: i64,
     /// The unresolved row a forced switch superseded. If the forced switch never lands, this
     /// is what recovery or rollback puts back, so the unresolved state is never forgotten.
@@ -135,6 +155,16 @@ pub struct LoginMeta<'a> {
     pub login_expires_at: Option<i64>,
 }
 
+/// The store's record of the default home's live login (§12.5): the account tagteam made live,
+/// and that account's `login_epoch` when it did, or from before a replacement superseded the
+/// live login. `epoch` is `None` only for a row written without one; the migration filled every
+/// named account's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activation {
+    pub account: AccountId,
+    pub epoch: Option<i64>,
+}
+
 fn journal_to_json(j: &JournalRow) -> Value {
     json!({
         "provider": j.provider.as_str(),
@@ -145,6 +175,7 @@ fn journal_to_json(j: &JournalRow) -> Value {
         "from_fp": j.from_fp,
         "from_identity": j.from_identity,
         "to_fp": j.to_fp,
+        "to_epoch": j.to_epoch,
         "started_at": j.started_at,
         "prior": j.prior.as_deref().map(journal_to_json),
     })
@@ -152,7 +183,8 @@ fn journal_to_json(j: &JournalRow) -> Value {
 
 /// The inverse of `journal_to_json`. Returns an error rather than silently dropping a
 /// malformed `prior` snapshot: a caller (rollback or recovery) that got `None` back would
-/// delete the undecidable row instead of restoring it (§9.6).
+/// delete the undecidable row instead of restoring it (§9.6). A snapshot written before
+/// `to_epoch` existed has no such key, and reads as `None`.
 fn journal_from_json(v: &Value) -> rusqlite::Result<JournalRow> {
     fn malformed() -> rusqlite::Error {
         rusqlite::Error::FromSqlConversionFailure(
@@ -172,6 +204,7 @@ fn journal_from_json(v: &Value) -> rusqlite::Result<JournalRow> {
         from_fp: v["from_fp"].as_str().map(str::to_owned),
         from_identity: Some(v["from_identity"].clone()).filter(|x| !x.is_null()),
         to_fp: v["to_fp"].as_str().ok_or_else(malformed)?.to_owned(),
+        to_epoch: v["to_epoch"].as_i64(),
         started_at: v["started_at"].as_i64().ok_or_else(malformed)?,
         prior: match v.get("prior") {
             Some(p) if !p.is_null() => Some(Box::new(journal_from_json(p)?)),
@@ -208,10 +241,13 @@ const APPLY_LOGIN_SQL: &str = "UPDATE accounts SET identity_key = ?2, label = ?3
     org_name = ?6, account_uuid = COALESCE(?7, account_uuid), kind = ?8, identity_json = ?9, \
     login_expires_at = ?10, quarantine_reason = NULL, quarantine_fp = NULL, quarantine_at = NULL WHERE id = ?1";
 
-/// Upserts the provider's active account: shared by `set_active` and `commit_switch`, which
-/// upsert the same row as part of a larger transaction.
-const SET_ACTIVE_SQL: &str = "INSERT INTO active_accounts (provider, account_id) VALUES (?1, ?2) \
-    ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id";
+/// Upserts the provider's active account and its activation epoch, both columns on conflict:
+/// an epoch left from the previous account would stale-mark the next one (§12.5). Shared by
+/// every writer of the row, each inside its own larger transaction or alone.
+const SET_ACTIVE_SQL: &str = "INSERT INTO active_accounts (provider, account_id, login_epoch) \
+    VALUES (?1, ?2, ?3) \
+    ON CONFLICT(provider) DO UPDATE SET account_id = excluded.account_id, \
+    login_epoch = excluded.login_epoch";
 
 /// Clears the provider's journal row: shared by `commit_switch`, which clears it as part of
 /// landing a switch, and `delete_journal`.
@@ -279,6 +315,7 @@ fn journal_from_row(r: &Row<'_>) -> rusqlite::Result<JournalRow> {
         from_fp: r.get("from_fp")?,
         from_identity: json_col(r, "from_identity")?,
         to_fp: r.get("to_fp")?,
+        to_epoch: r.get("to_epoch")?,
         started_at: r.get("started_at")?,
         prior: match json_col(r, "prior")? {
             Some(v) => Some(Box::new(journal_from_json(&v)?)),
@@ -349,14 +386,17 @@ fn apply_login(
     )
 }
 
+/// `SET_ACTIVE_SQL` on any connection-like handle. No account means no epoch, whatever the
+/// caller passes (§6.1: NULL only with `account_id`).
 fn set_active_on(
     c: &Connection,
     provider: &ProviderId,
     id: Option<&AccountId>,
+    epoch: Option<i64>,
 ) -> rusqlite::Result<usize> {
     c.execute(
         SET_ACTIVE_SQL,
-        params![provider.as_str(), id.map(AccountId::as_str)],
+        params![provider.as_str(), id.map(AccountId::as_str), id.and(epoch)],
     )
 }
 
@@ -480,15 +520,16 @@ impl Store {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Applies the embedded schema exactly once. A stored version newer than
-    /// `SCHEMA_VERSION` is refused outright, before anything else runs against the
-    /// connection — including switching it to WAL, which is why that pragma is set here and
-    /// not in `connect`: a file this build refuses must be left exactly as it was found. The
-    /// check-and-apply itself runs in one `IMMEDIATE` transaction, re-reading the version under
-    /// the write lock it grants — both to guard against a concurrent racing `CREATE TABLE`
-    /// (§6.1), and, re-checked again, against a concurrent newer binary upgrading the file
-    /// between this function's first read and the moment it takes the lock. WAL mode is set
-    /// only once every such check has passed and, when the schema was applied, only after that
+    /// Applies each migration step above the file's version exactly once (`MIGRATIONS`). A
+    /// stored version newer than `SCHEMA_VERSION` is refused outright, before anything else
+    /// runs against the connection — including switching it to WAL, which is why that pragma is
+    /// set here and not in `connect`: a file this build refuses must be left exactly as it was
+    /// found. The check-and-apply itself runs in one `IMMEDIATE` transaction, re-reading the
+    /// version under the write lock it grants — both to guard against a concurrent racing
+    /// first open (§6.1), and, re-checked again, against a concurrent newer binary upgrading
+    /// the file between this function's first read and the moment it takes the lock. Every step
+    /// and the version bump commit together, so a file is never left between two versions. WAL
+    /// mode is set only once every such check has passed and, when a step ran, only after that
     /// transaction has committed — WAL can't be switched from inside a transaction, and a file
     /// this build ends up refusing must never have been touched at all.
     fn migrate(&self) -> Result<(), StoreError> {
@@ -504,7 +545,10 @@ impl Store {
                 return Err(StoreError::UnsupportedSchema(version));
             }
             if version < SCHEMA_VERSION {
-                tx.execute_batch(SCHEMA_V1)?;
+                let done = usize::try_from(version).unwrap_or(0);
+                for step in &MIGRATIONS[done..] {
+                    tx.execute_batch(step)?;
+                }
                 tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
             }
             tx.commit()?;
@@ -863,7 +907,9 @@ impl Store {
     }
 
     /// Deletes the account; its usage rows cascade, and its `usage:<id>` lease row (which has
-    /// no foreign key) goes in the same transaction.
+    /// no foreign key) goes in the same transaction. `ON DELETE SET NULL` clears an
+    /// `active_accounts` row that named it, but cannot clear a second column, so the orphaned
+    /// activation epoch is cleared here too (§6.1: NULL only with `account_id`).
     pub fn delete_account(&self, id: &AccountId) -> Result<(), StoreError> {
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -871,6 +917,10 @@ impl Store {
         tx.execute(
             "DELETE FROM leases WHERE name = ?1",
             [usage::lease_name(id)],
+        )?;
+        tx.execute(
+            "UPDATE active_accounts SET login_epoch = NULL WHERE account_id IS NULL",
+            [],
         )?;
         tx.commit()?;
         Ok(())
@@ -888,13 +938,46 @@ impl Store {
         Ok(id.flatten().map(AccountId::from_string))
     }
 
+    /// The provider's active account and its activation epoch (§12.5); `None` when no account
+    /// is recorded (none was ever set, or it was removed).
+    pub fn activation(&self, provider: &ProviderId) -> Result<Option<Activation>, StoreError> {
+        let c = self.lock();
+        let row: Option<(Option<String>, Option<i64>)> = c
+            .query_row(
+                "SELECT account_id, login_epoch FROM active_accounts WHERE provider = ?1",
+                [provider.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(id, epoch)| {
+            id.map(|id| Activation {
+                account: AccountId::from_string(id),
+                epoch,
+            })
+        }))
+    }
+
+    /// `epoch` is stored with `id`; `id = None` stores `None` for both.
     pub fn set_active(
         &self,
         provider: &ProviderId,
         id: Option<&AccountId>,
+        epoch: Option<i64>,
     ) -> Result<(), StoreError> {
-        set_active_on(&self.lock(), provider, id)?;
+        set_active_on(&self.lock(), provider, id, epoch)?;
         Ok(())
+    }
+
+    /// §12.5: `active_accounts` names `row` with an epoch other than `row.login_epoch`. An
+    /// explicit replacement then superseded the lineage the live store holds, which is never
+    /// captured. A row with no epoch is no evidence, and reads as current, as the migration
+    /// takes it.
+    pub fn live_store_stale(&self, row: &AccountRow) -> Result<bool, StoreError> {
+        Ok(matches!(
+            self.activation(&row.provider)?,
+            Some(Activation { account, epoch: Some(epoch) })
+                if account == row.id && epoch != row.login_epoch
+        ))
     }
 
     fn insert_event_on(c: &Connection, e: &EventRow) -> rusqlite::Result<usize> {
@@ -914,14 +997,16 @@ impl Store {
         )
     }
 
-    /// §9.4 step 9: the active account, the event and the journal row move together, and so
-    /// does an automatic switch's `record` (§11.2 step 11), which also resets
+    /// §9.4 step 9: the active account, its activation epoch (the target's `login_epoch`, which
+    /// cannot move while its account lock is held), the event and the journal row move
+    /// together, and so does an automatic switch's `record` (§11.2 step 11), which also resets
     /// `unhealthy_ticks`. The record is written first, so any later statement that fails
     /// takes it down too.
     pub fn commit_switch(
         &self,
         provider: &ProviderId,
         to: &AccountId,
+        epoch: i64,
         event: &EventRow,
         record: Option<&AutoRecord>,
     ) -> Result<(), StoreError> {
@@ -941,7 +1026,7 @@ impl Store {
                 ],
             )?;
         }
-        set_active_on(&tx, provider, Some(to))?;
+        set_active_on(&tx, provider, Some(to), Some(epoch))?;
         Self::insert_event_on(&tx, event)?;
         tx.execute(DELETE_JOURNAL_SQL, [provider.as_str()])?;
         tx.commit()?;
@@ -1030,8 +1115,9 @@ impl Store {
     pub fn insert_journal(&self, j: &JournalRow) -> Result<(), StoreError> {
         self.lock().execute(
             "INSERT OR REPLACE INTO switch_journal \
-             (provider, holder_pid, holder_start, from_id, to_id, from_fp, from_identity, to_fp, started_at, prior) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (provider, holder_pid, holder_start, from_id, to_id, from_fp, from_identity, to_fp, \
+             to_epoch, started_at, prior) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 j.provider.as_str(),
                 j.holder.pid,
@@ -1041,6 +1127,7 @@ impl Store {
                 j.from_fp,
                 j.from_identity.as_ref().map(Value::to_string),
                 j.to_fp,
+                j.to_epoch,
                 j.started_at,
                 j.prior.as_deref().map(|p| journal_to_json(p).to_string()),
             ],

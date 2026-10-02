@@ -138,6 +138,7 @@ fn metadata_commands_proceed_through_an_interrupted_switch_but_remove_refuses() 
         from_fp: None,
         from_identity: None,
         to_fp: "sha256:stale".into(),
+        to_epoch: None,
         started_at: 1,
         prior: None,
     };

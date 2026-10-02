@@ -18,7 +18,9 @@ use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
-use tagteam_engine::store::{Eligibility, JournalRow, LoginMeta, NewAccount, Reserve, Store};
+use tagteam_engine::store::{
+    Activation, Eligibility, JournalRow, LoginMeta, NewAccount, Reserve, Store,
+};
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest, SwitchTarget};
 use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
@@ -148,9 +150,12 @@ pub fn vault_fp(fx: &Fx, id: &AccountId) -> String {
         .to_owned()
 }
 
-/// The row a switch from `from` to `to` writes at step 6, held by a process that has died.
+/// The row a switch from `from` to `to` writes at step 6, held by a process that has died. It
+/// journals the target's `login_epoch`, as the switch does (§9.4 step 6).
 pub fn crash_row(fx: &Fx, from: &AccountId, to: &AccountId) -> JournalRow {
-    let from_row = fx.engine.store().unwrap().account(from).unwrap().unwrap();
+    let store = fx.engine.store().unwrap();
+    let from_row = store.account(from).unwrap().unwrap();
+    let to_row = store.account(to).unwrap().unwrap();
     JournalRow {
         provider: fx.provider(),
         holder: dead_holder(),
@@ -159,6 +164,7 @@ pub fn crash_row(fx: &Fx, from: &AccountId, to: &AccountId) -> JournalRow {
         from_fp: Some(vault_fp(fx, from)),
         from_identity: Some(from_row.identity_json),
         to_fp: vault_fp(fx, to),
+        to_epoch: Some(to_row.login_epoch),
         started_at: 1,
         prior: None,
     }
@@ -649,6 +655,22 @@ impl Fx {
             .unwrap()
             .set_quarantine(id, reason, fp, 1)
             .unwrap();
+    }
+
+    /// The provider's active account and its activation epoch (§12.5).
+    pub fn activation(&self) -> Option<Activation> {
+        self.engine
+            .store()
+            .unwrap()
+            .activation(&self.provider())
+            .unwrap()
+    }
+
+    /// Whether the live store is stale-marked for `id` (§12.5).
+    pub fn live_store_stale(&self, id: &AccountId) -> bool {
+        let store = self.engine.store().unwrap();
+        let row = store.account(id).unwrap().unwrap();
+        store.live_store_stale(&row).unwrap()
     }
 
     /// A second engine over this fixture's provider and clock, as another tagteam process.

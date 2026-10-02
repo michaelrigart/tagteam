@@ -495,7 +495,7 @@ impl Engine {
             alias.as_deref(),
         )?;
         drop(live_locks);
-        store.set_active(&opts.provider, Some(&account.id))?;
+        store.set_active(&opts.provider, Some(&account.id), Some(account.login_epoch))?;
         Ok(AddOutcome {
             account,
             created,

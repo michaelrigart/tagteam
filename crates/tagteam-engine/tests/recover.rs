@@ -593,6 +593,7 @@ fn a_forced_switch_killed_before_landing_leaves_the_superseded_row() {
         from_fp: Some(live_fp),
         from_identity: Some(store.account(&b).unwrap().unwrap().identity_json),
         to_fp: vault_fp(&fx, &b),
+        to_epoch: Some(store.account(&b).unwrap().unwrap().login_epoch),
         started_at: 2,
         prior: Some(Box::new(unresolved.clone())),
     };
