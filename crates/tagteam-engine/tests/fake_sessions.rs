@@ -246,9 +246,11 @@ fn fake_agent_session_state_comes_from_its_own_records() {
 fn a_fake_agent_account_in_a_session_is_owned_at_the_gate_and_never_renewed() {
     let ffx = FakeFx::new();
     let (alice, _bob) = alice_and_bob(&ffx);
-    // The session rotated its token: a running profile is still never captured (§12.5).
+    // The session rotated its token: a running profile is still never captured (§12.5). The
+    // vault's own token is due, so a gate that let the account through would renew it.
     let profile = fake_profile(&ffx, &alice, "alice", "tok-a-2", "renew-a-2");
     start_session(&ffx, &profile);
+    make_due(&ffx, &alice);
     let vault = ffx.fx.vault_bytes(&alice).unwrap();
     let before = ffx.fx.snapshot();
 
@@ -339,6 +341,8 @@ fn a_fake_agent_profile_and_vault_that_both_moved_conflict_and_nothing_moves() {
         needs_bootstrap: false,
     };
     seed.write(&profile).unwrap();
+    // Due, so a gate that missed the conflict would renew the vault's token.
+    make_due(&ffx, &alice);
     let vault = ffx.fx.vault_bytes(&alice).unwrap();
 
     let out = ffx
@@ -545,7 +549,13 @@ fn fake_agent_sessions_write_nothing_outside_its_surface_and_its_profile() {
     fs::write(outer.join("notes/today.md"), "note\n").unwrap();
     fs::write(outer.join("prefs.json"), "{}\n").unwrap();
     let profile = fake_profile(&ffx, &alice, "alice", "tok-a-2", "renew-a-2");
-    let surface = ffx.fake.identity_surface(&ffx.fx.env);
+    // Only what this run may write outside tagteam's data: FakeAgent's create-only must-share
+    // entry (§3), not the rest of its switch surface (its live store), which nothing here
+    // writes.
+    let surface = IdentitySurface {
+        create_only: ffx.fake.identity_surface(&ffx.fx.env).create_only,
+        ..IdentitySurface::default()
+    };
     let sessions = ffx.fx.env.data_dir().join("sessions");
     let (before, profiles_before) = (ffx.fx.snapshot(), tree(&sessions));
 
@@ -558,7 +568,19 @@ fn fake_agent_sessions_write_nothing_outside_its_surface_and_its_profile() {
         .refresh_stored(ffx.fake.as_ref(), &alice, &vault)
         .unwrap();
     assert!(matches!(gated, GateOutcome::AlreadyFresh(_)), "{gated:?}");
+    let captured = ffx.fx.vault_bytes(&alice).unwrap();
+    assert_eq!(
+        tokens(&captured),
+        pair("tok-a-2", "renew-a-2"),
+        "the gate captured the profile's rotation"
+    );
     start_session(&ffx, &profile);
+    // The running session rotates again, so the token a usage read sends tells the profile's
+    // branch (§8.1) from the vault's.
+    let mut at = ffx.fx.env.clone();
+    at.vars
+        .insert("FAKEAGENT_HOME".into(), profile.as_os_str().to_owned());
+    tagteam_fake::login(&at, "alice", "ws", "tok-a-3", "renew-a-3");
     script_meters(&ffx);
     let report = ffx
         .engine
@@ -567,6 +589,17 @@ fn fake_agent_sessions_write_nothing_outside_its_surface_and_its_profile() {
         })
         .unwrap();
     assert_eq!(report.outcomes, [(alice.clone(), Collected::Recorded)]);
+    assert_eq!(
+        fake_bearers(&ffx),
+        ["tok-a-3"],
+        "read from the running profile"
+    );
+    assert_eq!(renew_requests(&ffx), 0);
+    assert_eq!(
+        ffx.fx.vault_bytes(&alice).unwrap(),
+        captured,
+        "a running profile is never captured"
+    );
 
     let (after, profiles_after) = (ffx.fx.snapshot(), tree(&sessions));
     ffx.fx.assert_only_surface_changed_for(
