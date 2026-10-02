@@ -473,7 +473,11 @@ impl AutoEngine<'_> {
                         return Ok(self.no_switch(sink, NoSwitchReason::Cooldown, left));
                     }
                     SwitchReason::LiveChanged => {
-                        self.count(t)?;
+                        // The count belonged to the account this tick judged, which is no
+                        // longer live: the new live account starts from 0 (Decision 4).
+                        if t.stored != 0 {
+                            t.store.set_unhealthy_ticks(&self.provider, 0)?;
+                        }
                         return Ok(self.no_switch(
                             sink,
                             NoSwitchReason::LiveChanged,
