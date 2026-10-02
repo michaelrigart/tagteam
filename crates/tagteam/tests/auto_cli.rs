@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::fs;
 use std::path::Path;
 use std::process::Output;
 use std::time::Duration;
@@ -17,9 +18,10 @@ use common::{
 use serde_json::{Value, json};
 use tagteam_cc::CcPaths;
 use tagteam_core::autoswitch::AutoState;
-use tagteam_core::{CLAUDE_CODE, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, Window, WindowKind};
 use tagteam_engine::store::Store;
 use tagteam_provider::Env;
+use tagteam_provider::profile::{ProfileMarker, canonical_profile_path};
 
 /// A reading taken at `now`: 5h at `five` and 7d at `seven`, resetting in 2h40m30s and
 /// 3d09h00m30s.
@@ -223,8 +225,20 @@ fn dry_run_says_what_it_would_switch_and_writes_nothing() {
 fn inside_a_run_shell_auto_refuses_unless_it_is_a_dry_run() {
     // §11.1, like every command that changes the live login (§9.2).
     let d = tempfile::tempdir().unwrap();
-    switching(d.path());
-    let session = Env::for_test(d.path()).data_dir().join("sessions/x");
+    let (a, _) = switching(d.path());
+    let session = Env::for_test(d.path()).data_dir().join("sessions").join(&a);
+    fs::create_dir_all(&session).unwrap();
+    ProfileMarker {
+        provider: ProviderId::new(CLAUDE_CODE),
+        account_id: AccountId::from_string(&a),
+        config_dir: canonical_profile_path(&session)
+            .unwrap()
+            .display()
+            .to_string(),
+        outer: json!({"CLAUDE_CONFIG_DIR": null, "CLAUDE_SECURESTORAGE_CONFIG_DIR": null}),
+    }
+    .write(&session)
+    .unwrap();
     let in_shell = |args: &[&str]| {
         let mut cmd = auto_cmd(d.path(), args);
         cmd.env("CLAUDE_CONFIG_DIR", &session);

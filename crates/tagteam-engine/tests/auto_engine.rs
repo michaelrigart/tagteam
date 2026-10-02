@@ -102,9 +102,8 @@ fn the_engine_lock_records_its_holder_as_one_json_line() {
 fn a_real_engine_refuses_inside_a_run_shell_and_a_dry_run_does_not() {
     // §11.1: like every command that changes the live login (§9.2).
     let fx = Fx::new();
-    let mut env = fx.env.clone();
-    env.claude_config_dir = Some(fx.env.data_dir().join("sessions/x").into_os_string());
-    let engine = fx.engine_with_env(env);
+    let a = fx.add("a@x.co", "rt-a");
+    let engine = fx.engine_located(fx.shell_env(&fx.make_profile(&a)));
     assert!(matches!(
         engine.auto(&fx.provider(), cfg(fx.cc.as_ref()), false),
         Err(EngineError::InsideRunShell)

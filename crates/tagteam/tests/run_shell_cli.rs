@@ -29,6 +29,8 @@ const COMMANDS: &[&[&str]] = &[
     &["alias", "1", "work"],
     &["move", "1", "2"],
     &["history"],
+    &["auto", "--once"],
+    &["auto", "--once", "--dry-run"],
 ];
 
 /// `id`'s profile directory under the fixture's `sessions/`.
