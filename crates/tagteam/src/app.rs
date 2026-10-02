@@ -19,7 +19,7 @@ use tagteam_engine::settings::{ColorMode, Settings, parse_bool};
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
-use tagteam_engine::views::{AccountView, StatusView};
+use tagteam_engine::views::{AccountView, ShellAccount, StatusView};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::http::Http;
 use tagteam_provider::liveness::SystemProcessProbe;
@@ -656,6 +656,39 @@ impl App<'_, '_> {
             .unwrap_or_else(|| self.engine.default_provider().clone())
     }
 
+    /// The run shell's own account id, as its marker names it (§13.1's `▶ this`).
+    fn this_account(&self) -> Option<AccountId> {
+        match self.engine.run_shell() {
+            RunShell::Inside { marker, .. } => Some(marker.account_id.clone()),
+            RunShell::Outside | RunShell::Unreadable { .. } => None,
+        }
+    }
+
+    /// §12.8: the run shell's account, for a `status` of the provider whose run shell this is.
+    /// Another provider's status has no session to name.
+    fn session_account(&self, provider: &ProviderId) -> Result<ShellAccount, EngineError> {
+        match self.engine.run_shell() {
+            RunShell::Inside { marker, .. } if &marker.provider == provider => {
+                self.engine.shell_account()
+            }
+            _ => Ok(ShellAccount::NotInShell),
+        }
+    }
+
+    /// The login the run shell's profile holds, as its provider reads it in the profile's
+    /// directory, where the marker was found (Decision 19): its email, else its label. Only
+    /// `status`'s text asks, for an account tagteam does not manage; §13.2's JSON has
+    /// `session: null`, and `statusline` never parses a profile (§13.5).
+    fn session_login(&self) -> Option<String> {
+        let RunShell::Inside { profile, marker } = self.engine.run_shell() else {
+            return None;
+        };
+        let p = self.engine.provider(&marker.provider).ok()?;
+        p.profile_identity(self.engine.env(), profile)
+            .present()
+            .map(|i| i.email.unwrap_or(i.label))
+    }
+
     /// A person can answer a prompt: never with `--json`, and only on a terminal.
     fn can_prompt(&self) -> bool {
         !self.json && self.io.prompter.interactive()
@@ -798,6 +831,7 @@ impl App<'_, '_> {
                     .collect();
                 self.collect(ids)?;
                 let lists = self.engine.accounts(self.provider_flag.as_ref())?;
+                let this = self.this_account();
                 let (now_s, color) = (self.now_s(), self.color());
                 let engine = &self.engine;
                 let names = |id: &str| {
@@ -805,7 +839,7 @@ impl App<'_, '_> {
                         .provider(&ProviderId::new(id))
                         .map_or_else(|_| id.to_owned(), |p| p.display_name().to_owned())
                 };
-                let human = render::list_human(&lists, &names, now_s, color);
+                let human = render::list_human(&lists, this.as_ref(), &names, now_s, color);
                 let json = render::list_json(&lists, &self.provider(), &render_usage(engine));
                 self.print(&human, json);
             }
@@ -816,9 +850,19 @@ impl App<'_, '_> {
                     self.collect(vec![account.row.id])?;
                 }
                 let s = self.engine.status(&provider)?;
+                let session = self.session_account(&provider)?;
+                let login = match session {
+                    ShellAccount::Unmanaged => self.session_login(),
+                    ShellAccount::NotInShell | ShellAccount::Managed(_) => None,
+                };
                 let (now_s, color) = (self.now_s(), self.color());
-                let human = render::status_human(&s, now_s, color);
-                let json = render::status_json(&s, provider.as_str(), &render_usage(&self.engine));
+                let human = render::status_human(&s, &session, login.as_deref(), now_s, color);
+                let json = render::status_json(
+                    &s,
+                    &session,
+                    provider.as_str(),
+                    &render_usage(&self.engine),
+                );
                 self.print(&human, json);
             }
             Command::Switch {

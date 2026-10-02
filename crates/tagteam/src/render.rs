@@ -1,10 +1,10 @@
 use serde_json::{Value, json};
 use tagteam_cc::usage::format_iso8601;
-use tagteam_core::{Pace, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind};
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::SwitchOutcome;
 use tagteam_engine::views::{
-    AccountView, NO_DATA, ProviderAccounts, StatusView, UsageStatus, UsageView,
+    AccountView, NO_DATA, ProviderAccounts, ShellAccount, StatusView, UsageStatus, UsageView,
 };
 use tagteam_provider::SecretStore;
 use unicode_width::UnicodeWidthStr;
@@ -25,6 +25,12 @@ pub(crate) const MISSING: &str = "—";
 const AHEAD: &str = "▲ pace";
 /// `list` always has a spend column once any account has a reading (§13.1).
 const SPEND_HEAD: &str = "SPEND";
+/// §13.1's marker of a session-owned account, in a one-column field after the position
+/// (Decision 11).
+const IN_SESSION: &str = "▶";
+/// The trailing note on the run shell's own row: §13.1's `▶ this`, kept with the notes so the
+/// columns stay aligned.
+const THIS: &str = "this";
 
 /// A row's windows in its provider's JSON shape: `Provider::render_usage` (§13.2).
 pub type RenderUsage<'a> = &'a dyn Fn(&ProviderId, &[(Window, Pace)]) -> Value;
@@ -89,6 +95,9 @@ pub fn row_json(v: &AccountView, usage: RenderUsage<'_>) -> Value {
     }
     if let Some(e) = r.login_expires_at {
         o["loginExpiresAt"] = json!(e);
+    }
+    if v.in_session {
+        o["inSession"] = json!(true);
     }
     o
 }
@@ -347,16 +356,19 @@ fn columns(accounts: &[AccountView]) -> Vec<Column> {
 }
 
 /// One account's line before alignment: its cells (the window columns and AGE) when it has a
-/// reading, and the notes that follow: its status in words, its kind, `disabled`.
+/// reading, and the notes that follow: its status in words, its kind, `disabled`, `this`.
 struct Row {
     marker: char,
     position: u32,
+    /// Session-owned (§12.5): `▶` in the session column, which the table has only then.
+    session: bool,
     account: String,
     cells: Option<Vec<Cell>>,
     notes: Vec<String>,
 }
 
-fn row(v: &AccountView, cols: &[Column], now_s: i64, color: bool) -> Row {
+/// `this`: the row is the run shell's own account (§13.1).
+fn row(v: &AccountView, cols: &[Column], this: bool, now_s: i64, color: bool) -> Row {
     let u = &v.usage;
     let mut notes = Vec::new();
     let cells = match u.windows.as_deref() {
@@ -390,6 +402,9 @@ fn row(v: &AccountView, cols: &[Column], now_s: i64, color: bool) -> Row {
     if v.row.disabled {
         notes.push("disabled".into());
     }
+    if this {
+        notes.push(THIS.into());
+    }
     let account = match &v.row.org_name {
         Some(org) => format!("{} [{org}]", name(&v.row)),
         None => name(&v.row),
@@ -397,19 +412,23 @@ fn row(v: &AccountView, cols: &[Column], now_s: i64, color: bool) -> Row {
     Row {
         marker: if v.active { '*' } else { ' ' },
         position: v.row.position,
+        session: v.in_session,
         account,
         cells,
         notes,
     }
 }
 
-/// §13.1's table for one provider's accounts.
-fn table(accounts: &[AccountView], now_s: i64, color: bool) -> String {
+/// §13.1's table for one provider's accounts. `this` is the run shell's own account (§12.8).
+fn table(accounts: &[AccountView], this: Option<&AccountId>, now_s: i64, color: bool) -> String {
     let cols = columns(accounts);
     let rows: Vec<Row> = accounts
         .iter()
-        .map(|v| row(v, &cols, now_s, color))
+        .map(|v| row(v, &cols, this == Some(&v.row.id), now_s, color))
         .collect();
+    // Decision 11: the session column exists only while some row is session-owned, so every
+    // other table keeps today's layout byte for byte.
+    let sessions = rows.iter().any(|r| r.session);
     let account_w = rows
         .iter()
         .map(|r| width(&r.account))
@@ -429,15 +448,21 @@ fn table(accounts: &[AccountView], now_s: i64, color: bool) -> String {
                 .fold(width(head), usize::max)
         })
         .collect();
-    let mut header = format!("    #  {}", pad("ACCOUNT", account_w));
+    let gap = if sessions { "    " } else { "  " };
+    let mut header = format!("    #{gap}{}", pad("ACCOUNT", account_w));
     for (head, w) in heads.iter().zip(&widths) {
         header.push_str("  ");
         header.push_str(&pad(head, *w));
     }
     let mut out = format!("{}\n", header.trim_end());
     for r in &rows {
+        let session = match (sessions, r.session) {
+            (false, _) => String::new(),
+            (true, true) => format!(" {IN_SESSION}"),
+            (true, false) => "  ".to_owned(),
+        };
         let mut line = format!(
-            " {} {:>2}  {}",
+            " {} {:>2}{session}  {}",
             r.marker,
             r.position,
             pad(&r.account, account_w)
@@ -458,9 +483,11 @@ fn table(accounts: &[AccountView], now_s: i64, color: bool) -> String {
 }
 
 /// §13.1's `list`: one table per provider that has accounts, headed by its name when there
-/// is more than one. `now_s` measures the countdowns; `color` colours percentages.
+/// is more than one. `this` is the run shell's own account (§12.8), noted `this`; `now_s`
+/// measures the countdowns; `color` colours percentages.
 pub fn list_human(
     lists: &[ProviderAccounts],
+    this: Option<&AccountId>,
     display_names: &dyn Fn(&str) -> String,
     now_s: i64,
     color: bool,
@@ -474,15 +501,23 @@ pub fn list_human(
         if shown.len() > 1 {
             s.push_str(&format!("{}\n", display_names(l.provider.as_str())));
         }
-        s.push_str(&table(&l.accounts, now_s, color));
+        s.push_str(&table(&l.accounts, this, now_s, color));
     }
     s
 }
 
 /// §13.2. Every shape names `provider` (the one the command ran against) at the top level, and
-/// again in `active` wherever there is one: a managed row carries it already.
-pub fn status_json(s: &StatusView, provider: &str, usage: RenderUsage<'_>) -> Value {
-    match s {
+/// again in `active` wherever there is one: a managed row carries it already. In a run shell
+/// (§12.8) each shape also names the session's account, last: `session: {number, position,
+/// id, email}`, or `null` for an account tagteam does not manage. Outside one there is no
+/// `session` key at all.
+pub fn status_json(
+    s: &StatusView,
+    session: &ShellAccount,
+    provider: &str,
+    usage: RenderUsage<'_>,
+) -> Value {
+    let mut v = match s {
         StatusView::NoLogin => {
             json!({"schemaVersion": 1, "provider": provider, "active": null})
         }
@@ -496,7 +531,20 @@ pub fn status_json(s: &StatusView, provider: &str, usage: RenderUsage<'_>) -> Va
             row["managed"] = json!(true);
             json!({"schemaVersion": 1, "provider": provider, "active": row, "totalManagedAccounts": total})
         }
+    };
+    match session {
+        ShellAccount::NotInShell => {}
+        ShellAccount::Managed(row) => {
+            v["session"] = json!({
+                "number": row.position,
+                "position": row.position,
+                "id": row.id.as_str(),
+                "email": email(row),
+            });
+        }
+        ShellAccount::Unmanaged => v["session"] = Value::Null,
     }
+    v
 }
 
 /// `status`'s usage line: each window of the reading with its countdown and pace, the
@@ -530,9 +578,18 @@ fn usage_line(u: &UsageView, now_s: i64, color: bool) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
-pub fn status_human(s: &StatusView, now_s: i64, color: bool) -> String {
-    match s {
-        StatusView::NoLogin => "No live login.\n".into(),
+/// `status` (§13.1): the live login and its usage, and in a run shell (§12.8) the session's own
+/// account on a last line. `session_login` names an unmanaged session's login as its profile
+/// holds it; it is read only for `ShellAccount::Unmanaged`.
+pub fn status_human(
+    s: &StatusView,
+    session: &ShellAccount,
+    session_login: Option<&str>,
+    now_s: i64,
+    color: bool,
+) -> String {
+    let mut out = match s {
+        StatusView::NoLogin => "No live login.\n".to_owned(),
         StatusView::Unmanaged { email } => format!("Live: {email} (not managed by tagteam)\n"),
         StatusView::Managed { account, total } => {
             let marker = if account.row.quarantine_reason.is_some() {
@@ -550,7 +607,22 @@ pub fn status_human(s: &StatusView, now_s: i64, color: bool) -> String {
             }
             out
         }
+    };
+    match session {
+        ShellAccount::NotInShell => {}
+        ShellAccount::Managed(row) => out.push_str(&format!(
+            "This session: {} (position {})\n",
+            name(row),
+            row.position
+        )),
+        ShellAccount::Unmanaged => match session_login {
+            Some(login) => {
+                out.push_str(&format!("This session: {login} (not managed by tagteam)\n"))
+            }
+            None => out.push_str("This session: not managed by tagteam\n"),
+        },
     }
+    out
 }
 
 pub fn switch_json(o: &SwitchOutcome, provider: &str) -> Value {
@@ -958,7 +1030,7 @@ mod tests {
             unread(UsageStatus::ApiKey, None, None),
         );
         assert_eq!(
-            list_human(&one(vec![live, spare, work, key]), &names, NOW, false),
+            list_human(&one(vec![live, spare, work, key]), None, &names, NOW, false),
             concat!(
                 "    #  ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
                 " *  1  michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",
@@ -994,7 +1066,7 @@ mod tests {
             setup,
         ];
         assert_eq!(
-            list_human(&one(rows), &names, NOW, false),
+            list_human(&one(rows), None, &names, NOW, false),
             concat!(
                 "    #  ACCOUNT                    5H           7D           SPEND  AGE\n",
                 "    1  a@x.co                      50%  reset   60%  3d09h  —      1h06m  unavailable (http-429, retry 5m)\n",
@@ -1046,6 +1118,7 @@ mod tests {
         assert_eq!(
             list_human(
                 &one(vec![view(1, "a@x.co", OAUTH, locked)]),
+                None,
                 &names,
                 NOW,
                 false
@@ -1064,7 +1137,7 @@ mod tests {
             spent.pct = pct;
             view(1, "a@x.co", OAUTH, read(0, 9.0, 12.0, false, vec![spent]))
         };
-        let table = |pct, color| list_human(&one(vec![rows(pct)]), &names, NOW, color);
+        let table = |pct, color| list_human(&one(vec![rows(pct)]), None, &names, NOW, color);
         assert!(table(95.0, true).contains("\x1b[31m€19 of €20\x1b[0m"));
         assert!(table(75.0, true).contains("\x1b[33m€15 of €20\x1b[0m"));
         assert!(table(10.0, true).contains("  €2 of €20"));
@@ -1072,7 +1145,13 @@ mod tests {
         assert!(!table(95.0, false).contains('\x1b'), "never without colour");
         let status = |pct, color| {
             let account = rows(pct);
-            status_human(&StatusView::Managed { account, total: 1 }, NOW, color)
+            status_human(
+                &StatusView::Managed { account, total: 1 },
+                &ShellAccount::NotInShell,
+                None,
+                NOW,
+                color,
+            )
         };
         assert!(status(95.0, true).contains("spend \x1b[31m€19 of €20\x1b[0m"));
         assert!(status(95.0, false).contains("spend €19 of €20"));
@@ -1093,6 +1172,7 @@ mod tests {
                 live(2, "山田太郎@x.co"),
                 live(3, "😀@x.co"),
             ]),
+            None,
             &names,
             NOW,
             false,
@@ -1120,13 +1200,13 @@ mod tests {
             )])
         };
         assert_eq!(
-            list_human(&rows(), &names, NOW, true),
+            list_human(&rows(), None, &names, NOW, true),
             concat!(
                 "    #  ACCOUNT  5H           7D           SPEND  AGE\n",
                 "    1  a@x.co    \x1b[31m95%\x1b[0m  2h40m   \x1b[33m77%\x1b[0m  3d09h  —      <1m\n",
             )
         );
-        assert!(!list_human(&rows(), &names, NOW, false).contains('\x1b'));
+        assert!(!list_human(&rows(), None, &names, NOW, false).contains('\x1b'));
     }
 
     #[test]
@@ -1144,6 +1224,8 @@ mod tests {
                     account: live,
                     total: 1
                 },
+                &ShellAccount::NotInShell,
+                None,
                 NOW,
                 false
             ),
@@ -1161,13 +1243,21 @@ mod tests {
                     account: failing,
                     total: 2
                 },
+                &ShellAccount::NotInShell,
+                None,
                 NOW,
                 false
             ),
             "Live: a@x.co (position 1 of 2)\n  unavailable (pre-send, retry <1m)\n"
         );
         assert_eq!(
-            status_human(&StatusView::NoLogin, NOW, false),
+            status_human(
+                &StatusView::NoLogin,
+                &ShellAccount::NotInShell,
+                None,
+                NOW,
+                false
+            ),
             "No live login.\n"
         );
         assert_eq!(
@@ -1175,6 +1265,8 @@ mod tests {
                 &StatusView::Unmanaged {
                     email: "s@x.co".into()
                 },
+                &ShellAccount::NotInShell,
+                None,
                 NOW,
                 false
             ),
@@ -1193,7 +1285,7 @@ mod tests {
         a.active = true;
         a.row.quarantine_reason = Some("invalid_grant".into());
         assert_eq!(
-            list_human(&one(vec![a.clone()]), &names, NOW, false),
+            list_human(&one(vec![a.clone()]), None, &names, NOW, false),
             "    #  ACCOUNT\n *  1  a@x.co   relogin required\n"
         );
         assert_eq!(
@@ -1202,6 +1294,8 @@ mod tests {
                     account: a,
                     total: 1
                 },
+                &ShellAccount::NotInShell,
+                None,
                 NOW,
                 false
             ),
@@ -1351,6 +1445,217 @@ mod tests {
         assert_eq!(
             (&key["usageError"], &key["usageRetryAt"]),
             (&Value::Null, &Value::Null)
+        );
+    }
+
+    /// The rows of `the_list_is_a_table_of_windows_countdowns_pace_and_age`, none of them in a
+    /// session, and the table they make (`PINNED`).
+    fn pinned_rows() -> Vec<AccountView> {
+        let mut live = view(
+            1,
+            "michael@example.com",
+            OAUTH,
+            read(120, 9.0, 77.0, true, vec![spend(0.0, 20.0), fable(0.0)]),
+        );
+        live.active = true;
+        let spare = view(
+            2,
+            "spare@example.com",
+            OAUTH,
+            read(840, 31.0, 12.0, false, vec![]),
+        );
+        let mut work = view(
+            3,
+            "w@corp.com",
+            OAUTH,
+            unread(UsageStatus::ReloginRequired, None, None),
+        );
+        work.row.alias = Some("work".into());
+        work.row.quarantine_reason = Some("invalid_grant".into());
+        let key = view(
+            4,
+            "api-key-4@token.local",
+            API_KEY,
+            unread(UsageStatus::ApiKey, None, None),
+        );
+        vec![live, spare, work, key]
+    }
+
+    const PINNED: &str = concat!(
+        "    #  ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
+        " *  1  michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",
+        "    2  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m\n",
+        "    3  work (w@corp.com)      relogin required\n",
+        "    4  api-key-4@token.local  api key\n",
+    );
+
+    #[test]
+    fn without_a_session_owned_row_the_table_is_byte_identical() {
+        // Decision 11: the column exists only while some row is session-owned. A run shell
+        // whose own account is not listed (one tagteam does not manage) leaves it as it was.
+        let elsewhere = AccountId::from_string("0192-unmanaged");
+        for this in [None, Some(&elsewhere)] {
+            assert_eq!(
+                list_human(&one(pinned_rows()), this, &names, NOW, false),
+                PINNED
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_owned_row_is_marked_after_its_position_and_the_run_shells_own_is_noted() {
+        // §13.1's `▶`, in a one-column field after the position, with the header moved to
+        // match; the run shell's own account gets the trailing note `this` (Decision 11).
+        let mut rows = pinned_rows();
+        rows[1].in_session = true;
+        let spare = rows[1].row.id.clone();
+        assert_eq!(
+            list_human(&one(rows.clone()), Some(&spare), &names, NOW, false),
+            concat!(
+                "    #    ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
+                " *  1    michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",
+                "    2 ▶  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m  this\n",
+                "    3    work (w@corp.com)      relogin required\n",
+                "    4    api-key-4@token.local  api key\n",
+            )
+        );
+        // Outside a run shell the same session shows, without the note.
+        assert_eq!(
+            list_human(&one(rows), None, &names, NOW, false),
+            concat!(
+                "    #    ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
+                " *  1    michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",
+                "    2 ▶  spare@example.com       31%  2h40m   12%  3d09h          —             —         14m\n",
+                "    3    work (w@corp.com)      relogin required\n",
+                "    4    api-key-4@token.local  api key\n",
+            )
+        );
+    }
+
+    #[test]
+    fn row_json_marks_a_session_owned_row_last_and_only_when_it_is() {
+        // §13.2: `alias?, disabled?: true, loginExpiresAt?, inSession?: true`.
+        let mut v = view(1, "a@x.co", OAUTH, read(120, 9.0, 77.0, true, vec![]));
+        v.row.alias = Some("w".into());
+        v.row.disabled = true;
+        v.row.login_expires_at = Some(1_797_000_000_000);
+        let tail = [
+            "usageFetchedAt",
+            "usageAgeSeconds",
+            "alias",
+            "disabled",
+            "loginExpiresAt",
+        ];
+        assert_eq!(keys(&row_json(&v, &count)), [&ALWAYS[..], &tail].concat());
+        v.in_session = true;
+        let row = row_json(&v, &count);
+        assert_eq!(keys(&row), [&ALWAYS[..], &tail, &["inSession"]].concat());
+        assert_eq!(row["inSession"], json!(true));
+        assert_eq!(
+            account_json(&v, None, &count)["account"]["inSession"],
+            json!(true),
+            "an account command's row too"
+        );
+    }
+
+    #[test]
+    fn status_names_the_run_shells_account_in_every_shape_and_only_in_a_run_shell() {
+        let mut side = view(3, "s@x.co", OAUTH, unread(UsageStatus::Ok, None, None));
+        side.row.alias = Some("side".into());
+        let session = ShellAccount::Managed(side.row.clone());
+        let named = json!({"number": 3, "position": 3, "id": "id-3", "email": "s@x.co"});
+        let mut live = view(1, "a@x.co", OAUTH, read(120, 9.0, 77.0, true, vec![]));
+        live.active = true;
+        let shapes = [
+            StatusView::NoLogin,
+            StatusView::Unmanaged {
+                email: "u@x.co".into(),
+            },
+            StatusView::Managed {
+                account: live,
+                total: 3,
+            },
+        ];
+        for shape in &shapes {
+            let outside = status_json(shape, &ShellAccount::NotInShell, CLAUDE_CODE, &count);
+            assert!(outside.get("session").is_none(), "{outside}");
+            let inside = status_json(shape, &session, CLAUDE_CODE, &count);
+            assert_eq!(keys(&inside).last(), Some(&"session"), "{inside}");
+            assert_eq!(inside["session"], named);
+            let unmanaged = status_json(shape, &ShellAccount::Unmanaged, CLAUDE_CODE, &count);
+            assert_eq!(unmanaged.get("session"), Some(&Value::Null));
+            // Everything else is as it is outside a run shell.
+            let mut rest = inside.clone();
+            rest.as_object_mut().unwrap().remove("session");
+            assert_eq!((keys(&rest), &rest), (keys(&outside), &outside));
+        }
+        assert_eq!(
+            status_json(
+                &StatusView::NoLogin,
+                &ShellAccount::NotInShell,
+                CLAUDE_CODE,
+                &count
+            ),
+            json!({"schemaVersion": 1, "provider": CLAUDE_CODE, "active": null})
+        );
+    }
+
+    #[test]
+    fn status_says_which_account_this_session_runs() {
+        let mut side = view(3, "w@corp.com", OAUTH, unread(UsageStatus::Ok, None, None));
+        side.row.alias = Some("work".into());
+        let session = ShellAccount::Managed(side.row.clone());
+        let failing = view(
+            1,
+            "a@x.co",
+            OAUTH,
+            unread(UsageStatus::Unavailable, Some("pre-send"), Some(30)),
+        );
+        let managed = StatusView::Managed {
+            account: failing,
+            total: 3,
+        };
+        assert_eq!(
+            status_human(&managed, &session, None, NOW, false),
+            "Live: a@x.co (position 1 of 3)\n  unavailable (pre-send, retry <1m)\nThis session: work (w@corp.com) (position 3)\n"
+        );
+        assert_eq!(
+            status_human(&StatusView::NoLogin, &session, None, NOW, false),
+            "No live login.\nThis session: work (w@corp.com) (position 3)\n"
+        );
+        let stranger = StatusView::Unmanaged {
+            email: "u@x.co".into(),
+        };
+        assert_eq!(
+            status_human(
+                &stranger,
+                &ShellAccount::Unmanaged,
+                Some("c@x.co"),
+                NOW,
+                false
+            ),
+            "Live: u@x.co (not managed by tagteam)\nThis session: c@x.co (not managed by tagteam)\n"
+        );
+        assert_eq!(
+            status_human(
+                &StatusView::NoLogin,
+                &ShellAccount::Unmanaged,
+                None,
+                NOW,
+                false
+            ),
+            "No live login.\nThis session: not managed by tagteam\n"
+        );
+        assert_eq!(
+            status_human(
+                &managed,
+                &ShellAccount::NotInShell,
+                Some("ignored"),
+                NOW,
+                false
+            ),
+            "Live: a@x.co (position 1 of 3)\n  unavailable (pre-send, retry <1m)\n",
+            "outside a run shell, as before"
         );
     }
 }

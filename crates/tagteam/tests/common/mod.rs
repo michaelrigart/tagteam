@@ -5,7 +5,7 @@
 
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -13,12 +13,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
-use tagteam_cc::{ItemKind, keychain_account, keychain_service};
+use tagteam_cc::live::Platform;
+use tagteam_cc::{ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, ProviderId, Window, WindowKind};
 use tagteam_engine::store::{Eligibility, Reserve, Store};
 use tagteam_engine::vault::SERVICE;
+use tagteam_provider::atomic::ensure_private_dir;
 use tagteam_provider::splice::replace_top_level;
-use tagteam_provider::{Env, FileKeychain, Keychain};
+use tagteam_provider::{
+    Env, FakeKeychain, FileKeychain, FlockGuard, Keychain, LAUNCH_DIR, ProfileMarker, Provider,
+    canonical_profile_path, profile_path,
+};
 
 /// Appendix A.3's refusal, pinned verbatim: its wording is part of the user-facing contract.
 pub const LOCKED: &str = "the login keychain is locked (common over SSH); run `security unlock-keychain ~/Library/Keychains/login.keychain-db`, then retry";
@@ -376,4 +381,33 @@ fn drain(
             }
         }
     })
+}
+
+/// `id`'s session profile under `root`, as `tagteam run` leaves it for Claude Code (§12.2): the
+/// directory and its marker, whose outer home is the default one. Returns the profile and its
+/// exported spelling, the `CLAUDE_CONFIG_DIR` its run shell sees.
+pub fn cc_profile(root: &Path, id: &str) -> (PathBuf, String) {
+    let env = Env::for_test(root);
+    let id = AccountId::from_string(id);
+    let profile = profile_path(&env, &id);
+    ensure_private_dir(&profile).unwrap();
+    let cc = ClaudeCode::new(Arc::new(FakeKeychain::new()), Platform::MacOs);
+    let spelling = cc.profile_spelling(&canonical_profile_path(&profile).unwrap());
+    ProfileMarker {
+        provider: ProviderId::new(CLAUDE_CODE),
+        account_id: id,
+        config_dir: spelling.clone(),
+        outer: cc.outer_home(&env),
+    }
+    .write(&profile)
+    .unwrap();
+    (profile, spelling)
+}
+
+/// A live launch reservation of `profile` (§12.5) while the guard lives: a locked
+/// `.tagteam-launch/4242.lock`, which the binary's non-blocking probe sees as held.
+pub fn hold_launch(profile: &Path) -> FlockGuard {
+    FlockGuard::try_lock(&profile.join(LAUNCH_DIR).join("4242.lock"))
+        .unwrap()
+        .expect("nothing else holds the reservation")
 }
