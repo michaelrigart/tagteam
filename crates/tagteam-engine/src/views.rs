@@ -831,6 +831,7 @@ mod tests {
             ("http-429", Unavailable),
             ("refresh-failed", Unavailable),
             ("live-replaced", Unavailable),
+            ("profile-drifted", Unavailable),
         ] {
             assert_eq!(status(true, OAUTH, false, failing(error)), want, "{error}");
         }

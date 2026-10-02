@@ -1,11 +1,14 @@
 //! The usage collector (§8.3): reserve, fetch and record, one thread per account. An inactive
 //! account's token comes from the vault, through the refresh gate (§7.3) when it needs one; the
-//! active account's comes from the live store and is never refreshed by a fetch (§8.1). Nothing
-//! is sent without the store's authorization right before the request: the lease still held,
-//! the token not refused, and a slot in the identity's hourly budget (§8.3, §8.6).
+//! active account's comes from the live store and is never refreshed by a fetch (§8.1); a
+//! session-owned account's comes from its profile, read without a lock and never refreshed,
+//! written or retried, because the agent in the session owns it (§8.1, §12.5). Nothing is sent
+//! without the store's authorization right before the request: the lease still held, the token
+//! not refused, and a slot in the identity's hourly budget (§8.3, §8.6).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use tagteam_core::backoff::failure_backoff_s;
@@ -13,6 +16,7 @@ use tagteam_core::poll::{DueCandidate, escalates, plan_after_fetch, scheduled_pi
 use tagteam_core::trust::is_future_stamped;
 use tagteam_core::usage::{earliest_relevant_reset, max_relevant_pct};
 use tagteam_core::{AccountId, PollBudget, PollInputs, PollPlan, ProviderId, Window};
+use tagteam_provider::profile::ProfileMarker;
 use tagteam_provider::provider::UsageResult;
 use tagteam_provider::{Credential, LockError, Provenance, Provider, Read, TransientKind};
 
@@ -20,12 +24,12 @@ use crate::active::{ActiveOutcome, ActiveTrigger};
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
+use crate::provenance::identity_drifted;
 use crate::refresh::{GateOutcome, expired};
 use crate::store::{
     AccountRow, Eligibility, Ineligible, Reservation, Reserve, SendGrant, Slot, Store, StoreError,
     UsageStateRow, backoff_holds,
 };
-use crate::switch::is_candidate;
 
 /// Who asked for a collection, and so which accounts are collected and when each is due (§8.3).
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +155,19 @@ struct Policy<'m> {
     models: &'m [String],
 }
 
+/// Which token one account's collection reads (§8.1), decided before the threads start
+/// (`Engine::role_of`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Role {
+    /// The live login names the account: the live token, which only §7.5 refreshes.
+    Active,
+    /// The vault's token, refreshed through the gate (§7.3) when it needs it.
+    Inactive,
+    /// A `tagteam run` session owns the account (§12.5): its profile's token, read as the agent
+    /// in the session reads it, and never refreshed, written or retried.
+    Session { profile: PathBuf },
+}
+
 /// The roles every thread needs, read once before any starts (`Engine::roles`).
 struct Roles {
     /// Each provider's recorded active account.
@@ -166,12 +183,15 @@ pub(crate) fn jitter() -> f64 {
 
 impl Engine {
     /// §8.3: the accounts `mode` selects, each on its own thread, and the call waits for them
-    /// all. A usage failure is never an error here: it is recorded, and reported in the
-    /// report's outcomes and warnings. So is an error that ends one account's collection (the
-    /// store failing under it): every thread is joined and kept, and that account's outcome is
-    /// `Failed { kind: "error" }` with one warning naming it, so one account never costs the
-    /// others' outcomes. `Err` only for an error outside the threads (opening the store,
-    /// reading the accounts, reading each provider's recorded active account and, for
+    /// all. Each account's role is decided before any thread starts (§8.1, `role_of`): the
+    /// account the live login names is the active one, any other that a `tagteam run` session
+    /// owns takes the session branch (§12.5), and the rest are inactive. A usage failure is
+    /// never an error here: it is recorded, and reported in the report's outcomes and warnings.
+    /// So is an error that ends one account's collection, deciding its role included (the store
+    /// or its profile failing under it): every thread is joined and kept, and that account's
+    /// outcome is `Failed { kind: "error" }` with one warning naming it, so one account never
+    /// costs the others' outcomes. `Err` only for an error outside the threads (opening the
+    /// store, reading the accounts, reading each provider's recorded active account and, for
     /// `Scheduled`, the provider and the store between the phases), or for §14.1's cancel
     /// token set during the collection: `Interrupted`, once every thread has joined and given
     /// back the slot it held unsent. A `Scheduled` collection interrupted in phase 1 starts no
@@ -270,12 +290,13 @@ impl Engine {
     }
 
     /// §8.6 phase 2's pick, read from the store. The candidates are the provider's switchable
-    /// accounts (§9.3) other than the live one, whose kind has usage (a managed key has none,
-    /// §13.2). One is due as `reserve_usage` would find it for a scheduled caller, leaving the
-    /// lease and the budget to the reservation: not in backoff, and a poll due or no reading
-    /// yet. Escalation reads the live account's decision-grade reading under `models` (§8.4);
-    /// without a managed live account, or without such a reading, the headroom is unknown and
-    /// the tick escalates.
+    /// accounts (§9.3, `switch_candidate`: never a session-owned one, which no switch may
+    /// target, §11.2 step 7) other than the live one, whose kind has usage (a managed key has
+    /// none, §13.2). One is due as `reserve_usage` would find it for a scheduled caller, leaving
+    /// the lease and the budget to the reservation: not in backoff, and a poll due or no
+    /// reading yet. Escalation reads the live account's decision-grade reading under `models`
+    /// (§8.4); without a managed live account, or without such a reading, the headroom is
+    /// unknown and the tick escalates.
     fn scheduled_candidates<'r>(
         &self,
         store: &Store,
@@ -293,7 +314,10 @@ impl Engine {
         let mut cands = Vec::new();
         for row in rows {
             let is_live = live.is_some_and(|l| l.id == row.id);
-            if is_live || !is_candidate(row) || p.kind_traits(&row.kind).managed_key_axis {
+            if is_live
+                || p.kind_traits(&row.kind).managed_key_axis
+                || !self.switch_candidate(p, row)?
+            {
                 continue;
             }
             let state = store.usage_state(&row.id)?;
@@ -339,6 +363,8 @@ impl Engine {
     }
 
     /// Each of `rows` on its own thread (§8.3), waiting for them all; each result with its row.
+    /// Every row's role (`role_of`) is decided before the first thread starts; a role that
+    /// cannot be decided is that account's error.
     fn collect_each<'r>(
         &self,
         store: &Store,
@@ -346,14 +372,21 @@ impl Engine {
         roles: &Roles,
         policy: Policy<'_>,
     ) -> Vec<(&'r AccountRow, Result<Outcome, EngineError>)> {
+        let roles_of: Vec<Result<Role, EngineError>> = rows
+            .iter()
+            .map(|row| self.role_of(row, roles.live.contains(&row.id)))
+            .collect();
         thread::scope(|s| {
             let running: Vec<_> = rows
                 .iter()
-                .map(|&row| {
-                    let active = roles.live.contains(&row.id);
+                .zip(roles_of)
+                .map(|(&row, role)| {
                     let started_with = roles.recorded[&row.provider].clone();
-                    let thread =
-                        s.spawn(move || self.collect_one(store, row, active, started_with, policy));
+                    let thread = s.spawn(move || {
+                        role.and_then(|role| {
+                            self.collect_one(store, row, role, started_with, policy)
+                        })
+                    });
                     (row, thread)
                 })
                 .collect();
@@ -395,14 +428,39 @@ impl Engine {
         live
     }
 
-    /// One account through §8.3's three phases. Afterwards the account is read again: a
-    /// quarantine now was set while this collection ran, since `reserve_usage` refuses a
-    /// quarantined account.
+    /// §8.1's role for `row`. The account the live login names is the active one, inside a run
+    /// shell too, since the live login is always the default home's (§12.8). Any other account
+    /// that a session owns, or may own (a reservation or record that cannot be read, §12.6),
+    /// takes the session branch with its profile; the rest are inactive. An account that
+    /// `collect_one` reports as unsupported needs no session state. The state is computed for
+    /// this call and never cached (Decision 8).
+    fn role_of(&self, row: &AccountRow, live: bool) -> Result<Role, EngineError> {
+        if live {
+            return Ok(Role::Active);
+        }
+        let Some(p) = self.registry.get(&row.provider) else {
+            return Ok(Role::Inactive);
+        };
+        if !p.capabilities().usage || p.kind_traits(&row.kind).managed_key_axis {
+            return Ok(Role::Inactive);
+        }
+        let state = self.session_state(p.as_ref(), row)?;
+        Ok(match state.profile() {
+            Some(profile) if state.owned() => Role::Session {
+                profile: profile.to_path_buf(),
+            },
+            _ => Role::Inactive,
+        })
+    }
+
+    /// One account through §8.3's three phases, in the role `collect_each` decided. Afterwards
+    /// the account is read again: a quarantine now was set while this collection ran, since
+    /// `reserve_usage` refuses a quarantined account.
     fn collect_one(
         &self,
         store: &Store,
         row: &AccountRow,
-        active: bool,
+        role: Role,
         recorded_active: Option<AccountId>,
         policy: Policy<'_>,
     ) -> Result<Outcome, EngineError> {
@@ -448,7 +506,7 @@ impl Engine {
             store,
             p,
             row,
-            active,
+            role,
             budget,
             threshold: policy.threshold,
             models: policy.models,
@@ -460,8 +518,13 @@ impl Engine {
             reservation,
             warnings: Vec::new(),
         };
-        // Phase 2, holding no lock but those the gate or §7.5 take for their own refresh.
-        let fetched = if active { run.active() } else { run.inactive() };
+        // Phase 2, holding no lock but those the gate or §7.5 take for their own refresh; the
+        // session branch takes none at all (§8.1).
+        let fetched = match run.role.clone() {
+            Role::Active => run.active(),
+            Role::Inactive => run.inactive(),
+            Role::Session { profile } => run.session(&profile),
+        };
         // Phase 3.
         let (collected, warnings) = run.record(fetched)?;
         let quarantined = store
@@ -481,8 +544,8 @@ struct Collection<'a> {
     store: &'a Store,
     p: &'a dyn Provider,
     row: &'a AccountRow,
-    /// Whether the live login names this account (§8.1's active account).
-    active: bool,
+    /// Which token this fetch reads (§8.1), as `collect_each` decided it.
+    role: Role,
     budget: PollBudget,
     /// The threshold and models the next plan is made for (`Policy`).
     threshold: f64,
@@ -655,6 +718,70 @@ impl Collection<'_> {
         };
         let next = self.refresh_live(trigger)?;
         self.retry(&next)
+    }
+
+    /// §8.1 for a session-owned account (§12.5). The agent in the session owns the profile's
+    /// token, so this reads it without a lock (`profile_credential`), and never refreshes,
+    /// writes or retries it. An expired token is `token-expired` with no request, and a refused
+    /// one stays refused until its bytes change. Neither leaves the machine, and the slot goes
+    /// back (§8.3). A 401 stamps `rejected_fp` and ends the fetch.
+    fn session(&mut self, profile: &Path) -> Result<Vec<Window>, Stop> {
+        let credential = self.profile_credential(profile)?;
+        if self.is_rejected(credential.bytes()) {
+            return Err(failed(self.refusal_kind()));
+        }
+        let first = self.send_credential(&credential)?;
+        if !matches!(first, UsageResult::Unauthorized) {
+            return windows(first);
+        }
+        self.reject(credential.bytes())?;
+        Err(failed(self.refusal_kind()))
+    }
+
+    /// The profile's credential as the agent in the session reads it (§8.1, §12.2), with no
+    /// lock: its hashed item under the spelling the marker records, never one derived again,
+    /// and its files in `profile`, where it is now (Decision 19).
+    /// - A marker that is missing, unreadable, or another account's names no spelling, so the
+    ///   credential cannot be read: `keychain-unavailable` (Decision 9).
+    /// - The identity comes first: the credential of a profile whose login is not the
+    ///   account's is never read (§12.5 "Identity drift"). An identity that is absent or
+    ///   cannot be read cannot be confirmed, so it counts as drifted: `profile-drifted`.
+    /// - A degraded read is used, since a usage request consumes nothing. An unreadable one is
+    ///   `keychain-unavailable`, and an absent or empty one `no-access-token`.
+    fn profile_credential(&self, profile: &Path) -> Result<Credential, Stop> {
+        let env = &self.engine.env;
+        let spelling = match ProfileMarker::read(profile) {
+            Read::Present(m) if m.provider == self.row.provider && m.account_id == self.row.id => {
+                m.config_dir
+            }
+            Read::Present(_) | Read::Absent | Read::Unreadable(_) => {
+                return Err(failed("keychain-unavailable"));
+            }
+        };
+        match self.p.profile_identity(env, profile) {
+            Read::Present(identity) if !identity_drifted(&identity, self.row) => {}
+            Read::Present(_) | Read::Absent | Read::Unreadable(_) => {
+                return Err(failed("profile-drifted"));
+            }
+        }
+        match self.p.read_profile_credential(env, profile, &spelling) {
+            Read::Present(c) if !c.is_empty() => Ok(c),
+            Read::Present(_) | Read::Absent => Err(failed("no-access-token")),
+            Read::Unreadable(_) => Err(failed("keychain-unavailable")),
+        }
+    }
+
+    /// The failure a refused token records wherever this collection may not refresh it (§8.1):
+    /// `token-expired` when its kind refreshes and someone else refreshes it (§7.5 for the
+    /// active account, the agent in the session for a session-owned one), otherwise `http-401`
+    /// (Decision 11: a setup token never refreshes).
+    fn refusal_kind(&self) -> &'static str {
+        let refreshed_elsewhere = matches!(self.role, Role::Active | Role::Session { .. });
+        if refreshed_elsewhere && self.p.kind_traits(&self.row.kind).refreshable {
+            "token-expired"
+        } else {
+            "http-401"
+        }
     }
 
     /// Why §7.5 must see the live token before it is sent: the server refused it
@@ -871,11 +998,20 @@ impl Collection<'_> {
         windows(second)
     }
 
-    /// One usage request with `bytes`' access token. A token that has expired or was refused
-    /// is never sent (§8.1): the slot stays unsent. Right before the request, the store
-    /// authorizes it and hands over the slot to send under (`authorize`). A request that never
-    /// left (no access token, or a pre-send failure) puts its slot back.
+    /// One usage request with `bytes`, which a fresh read gave: the vault, the gate or the live
+    /// store (`live_bytes` refuses a degraded one). See `send_credential`.
     fn send(&mut self, bytes: &[u8]) -> Result<UsageResult, Stop> {
+        self.send_credential(&Credential::fresh(bytes.to_vec()))
+    }
+
+    /// One usage request with `credential`'s access token, its provenance kept: only a
+    /// session's profile read may be degraded, and a usage request consumes nothing (§8.1). A
+    /// token that has expired or was refused is never sent: the slot stays unsent. Right before
+    /// the request, the store authorizes it and hands over the slot to send under
+    /// (`authorize`). A request that never left (no access token, or a pre-send failure) puts
+    /// its slot back.
+    fn send_credential(&mut self, credential: &Credential) -> Result<UsageResult, Stop> {
+        let bytes = credential.bytes();
         // §14.1: every request, the 401 retry included, is preceded by a cancellation point.
         self.interruption()?;
         if !self.usable(bytes) {
@@ -890,9 +1026,7 @@ impl Collection<'_> {
             self.slot = Some(slot);
             return Err(stop);
         }
-        let result = self
-            .p
-            .fetch_usage(self.engine.http(), &Credential::fresh(bytes.to_vec()));
+        let result = self.p.fetch_usage(self.engine.http(), credential);
         let unsent = matches!(
             result,
             UsageResult::NoAccessToken
@@ -916,8 +1050,8 @@ impl Collection<'_> {
     ///   best effort, at the record.
     /// - `Rejected`: a stamp written by another process after this collection read its state
     ///   (the fence for `rejected_fp`): nothing is sent, and the slot goes back. Recorded as
-    ///   `token-expired` for a refreshable active account (the next collection hands the token
-    ///   to §7.5), otherwise `http-401`.
+    ///   `refusal_kind` says: `token-expired` for a refreshable active or session-owned account
+    ///   (§7.5, or the agent in the session, refreshes it), otherwise `http-401`.
     /// - `OverBudget`: recorded as `over-budget`, backing off until a slot frees up; a stale
     ///   slot has already gone back.
     fn authorize(&mut self, bytes: &[u8]) -> Result<Slot, Stop> {
@@ -947,13 +1081,7 @@ impl Collection<'_> {
             SendGrant::Rejected => {
                 self.slot = held;
                 self.rejected = fp;
-                let handed_to_active_refresh =
-                    self.active && self.p.kind_traits(&self.row.kind).refreshable;
-                Err(failed(if handed_to_active_refresh {
-                    "token-expired"
-                } else {
-                    "http-401"
-                }))
+                Err(failed(self.refusal_kind()))
             }
             SendGrant::OverBudget { next_free_at } => Err(Stop::Failed(Failure {
                 not_before: Some(next_free_at),
@@ -1047,7 +1175,7 @@ impl Collection<'_> {
         let recorded = self.store.active(&self.row.provider)?;
         Ok(match recorded {
             Some(id) if recorded != self.recorded_active => id == self.row.id,
-            _ => self.active,
+            _ => self.role == Role::Active,
         })
     }
 
