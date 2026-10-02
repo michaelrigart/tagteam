@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -16,7 +17,7 @@ use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{ColorMode, Settings, parse_bool};
-use tagteam_engine::store::AccountRow;
+use tagteam_engine::store::{AccountRow, Mapping, StoreError};
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, ShellAccount, StatusView};
@@ -566,6 +567,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Alias { .. } => "alias",
         Command::Move { .. } => "move",
         Command::History { .. } => "history",
+        Command::Map { .. } => "map",
+        Command::Unmap { .. } => "unmap",
         Command::Statusline { .. } => "statusline",
         Command::Auto { .. } => "auto",
     }
@@ -977,6 +980,11 @@ impl App<'_, '_> {
                 since,
                 csv,
             } => self.history(account, window, &since, csv)?,
+            Command::Map { account, path } => match account {
+                None => self.list_mappings()?,
+                Some(account) => self.map(&account, path)?,
+            },
+            Command::Unmap { path } => self.unmap(path)?,
             Command::Statusline { .. } => unreachable!("run answers statusline before dispatch"),
             Command::Auto {
                 once,
@@ -1241,6 +1249,84 @@ impl App<'_, '_> {
         Ok(())
     }
 
+    /// §12.7: `map` with no arguments lists the mappings, only `--provider`'s when it is given.
+    /// It never creates the store (§5).
+    fn list_mappings(&mut self) -> Result<(), Failure> {
+        let mut rows = Vec::new();
+        if let Some(store) = self.engine.existing_store()? {
+            for m in store.mappings().map_err(EngineError::from)? {
+                if self
+                    .provider_flag
+                    .as_ref()
+                    .is_some_and(|p| p != &m.provider)
+                {
+                    continue;
+                }
+                // `None` only when a `remove` raced this read: its mappings went with it.
+                if let Some(account) = store.account(&m.account_id).map_err(EngineError::from)? {
+                    rows.push((m, account));
+                }
+            }
+        }
+        self.print(&render::mappings_human(&rows), render::mappings_json(&rows));
+        Ok(())
+    }
+
+    /// §12.7: maps PATH (default: the current directory), stored canonical, for the account's
+    /// own provider, replacing the mapping PATH held for that provider.
+    fn map(&mut self, account: &str, path: Option<PathBuf>) -> Result<(), Failure> {
+        let row = self.resolve(account)?;
+        let mapping = Mapping {
+            path: canonical_dir(path)?,
+            provider: row.provider.clone(),
+            account_id: row.id.clone(),
+            added_at: self.engine.now_ms(),
+        };
+        self.engine
+            .store()?
+            .set_mapping(
+                &mapping.path,
+                &mapping.provider,
+                &mapping.account_id,
+                mapping.added_at,
+            )
+            .map_err(|e| match e {
+                // A `remove` raced this command.
+                StoreError::NoSuchAccount => EngineError::NoSuchAccount(account.to_owned()),
+                e => e.into(),
+            })?;
+        let human = format!(
+            "Mapped {} to {} (position {}).\n",
+            mapping.path,
+            render::name(&row),
+            row.position
+        );
+        let mapping = render::mapping_json(&mapping, &row);
+        let json = json!({"schemaVersion": 1, "ok": true, "mapping": mapping});
+        self.print(&human, json);
+        Ok(())
+    }
+
+    /// §12.7: removes PATH's mappings (default: the current directory), only `--provider`'s
+    /// when it is given. Removing nothing is not an error, and the store is never created.
+    fn unmap(&mut self, path: Option<PathBuf>) -> Result<(), Failure> {
+        let path = unmapped_path(path)?;
+        let removed = match self.engine.existing_store()? {
+            Some(store) => store
+                .remove_mappings(&path, self.provider_flag.as_ref())
+                .map_err(EngineError::from)?,
+            None => 0,
+        };
+        let human = if removed == 0 {
+            format!("No mapping for {path}.\n")
+        } else {
+            format!("Unmapped {path}.\n")
+        };
+        let json = json!({"schemaVersion": 1, "ok": true, "path": path, "removed": removed});
+        self.print(&human, json);
+        Ok(())
+    }
+
     /// The live login's account, for a command whose ACCOUNT defaults to it.
     fn live_row(&self) -> Result<AccountRow, Failure> {
         match self.engine.status(&self.provider())? {
@@ -1254,6 +1340,48 @@ impl App<'_, '_> {
             StatusView::NoLogin => Err(Failure::Message(KIND_NO_LIVE_LOGIN, NO_LIVE_LOGIN.into())),
         }
     }
+}
+
+/// §12.7: PATH (default: the current directory) as `map` stores it: canonical (symlinks
+/// resolved, absolute), and a directory. Mappings are text, so a path that is not UTF-8 is
+/// refused.
+fn canonical_dir(path: Option<PathBuf>) -> Result<String, Failure> {
+    let given = path.unwrap_or_else(|| PathBuf::from("."));
+    let canonical =
+        std::fs::canonicalize(&given).map_err(|e| invalid_path(&given, &e.to_string()))?;
+    if !canonical.is_dir() {
+        return Err(invalid_path(&given, "not a directory"));
+    }
+    stored_path(canonical)
+}
+
+/// `unmap`'s PATH: canonical, as `map` stored it, or, for a directory that is gone, absolute as
+/// given, so the path `map` listed still unmaps.
+fn unmapped_path(path: Option<PathBuf>) -> Result<String, Failure> {
+    let given = path.unwrap_or_else(|| PathBuf::from("."));
+    let resolved = match std::fs::canonicalize(&given) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::path::absolute(&given).map_err(|e| invalid_path(&given, &e.to_string()))?
+        }
+        Err(e) => return Err(invalid_path(&given, &e.to_string())),
+    };
+    stored_path(resolved)
+}
+
+/// A path as the store holds it: rebuilt from its components (no trailing `/`), as text.
+fn stored_path(path: PathBuf) -> Result<String, Failure> {
+    let path: PathBuf = path.components().collect();
+    path.into_os_string().into_string().map_err(|raw| {
+        invalid_path(
+            Path::new(&raw),
+            "not valid UTF-8, and mappings are stored as text",
+        )
+    })
+}
+
+fn invalid_path(path: &Path, why: &str) -> Failure {
+    Failure::Message(KIND_INVALID_INPUT, format!("{}: {why}", path.display()))
 }
 
 #[cfg(test)]
@@ -1327,7 +1455,7 @@ mod tests {
     #[test]
     fn the_late_notice_names_each_command_as_it_is_typed() {
         use clap::Parser;
-        let cases: [&[&str]; 15] = [
+        let cases: [&[&str]; 17] = [
             &["list"],
             &["ls"],
             &["status"],
@@ -1343,6 +1471,8 @@ mod tests {
             &["history"],
             &["statusline"],
             &["auto"],
+            &["map"],
+            &["unmap"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))

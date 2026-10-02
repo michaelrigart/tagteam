@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 /// No `Debug`: `add-token` carries a secret, and a derived `Debug` would print it.
@@ -134,6 +136,20 @@ pub enum Command {
         #[arg(long)]
         csv: bool,
     },
+    /// Map PATH (default: here) to ACCOUNT for its provider; with no arguments, list mappings
+    ///
+    /// `tagteam run` in PATH or below it, and so the `shell-init` wrapper, launches ACCOUNT
+    /// there. PATH is stored canonical, and a directory holds one mapping per provider. --json
+    /// prints {schemaVersion, ok, mapping: {path, provider, number, id, email, alias?,
+    /// addedAt}}, and the list {schemaVersion, mappings: [...]}, with times in ISO 8601 UTC.
+    Map {
+        account: Option<String>,
+        path: Option<PathBuf>,
+    },
+    /// Remove PATH's mappings (default: here): every provider's, or only --provider's
+    ///
+    /// --json prints {schemaVersion, ok, path, removed}.
+    Unmap { path: Option<PathBuf> },
     /// One line for Claude Code's status bar
     Statusline {
         /// Print the settings.json snippet that sets it up
