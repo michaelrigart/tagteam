@@ -72,8 +72,9 @@ pub fn acquire_credentials(
     }
 }
 
-/// The config lock alone, waited for under `cancel` (§14.1). A caller takes it only while
-/// holding the credential locks (`CredLocks::with_config`, §4.3).
+/// The config lock alone, waited for under `cancel` (§14.1). A caller takes it while holding
+/// the credential locks (`CredLocks::with_config`, §4.3), or alone for seeding and merge-back,
+/// under §4.3's standalone exception, and then takes no credential lock while it is held.
 pub fn acquire_config(
     paths: &CcPaths,
     timeout: Duration,

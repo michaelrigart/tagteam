@@ -7,10 +7,10 @@ use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::http::Http;
 use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
-    BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
+    BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
     Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
-    LockError, MustShare, MutationGuard, Pace, PollBudget, Provider, ProviderError, Read,
-    SharePolicy, StoredLogin, Undo, UsageResult, Window, Written,
+    LockError, MergeReport, MustShare, MutationGuard, Pace, PollBudget, Provider, ProviderError,
+    Read, SharePolicy, StoredLogin, Undo, UsageResult, Window, Written,
 };
 
 use crate::config;
@@ -596,6 +596,28 @@ impl Provider for ClaudeCode {
 
     fn invoked_by(&self, env: &Env) -> bool {
         env.var("CLAUDECODE").is_some_and(|v| v == "1") || self.session_dir(env).is_some()
+    }
+
+    fn seed_profile(
+        &self,
+        env: &Env,
+        dir: &Path,
+        identity: &Identity,
+    ) -> Result<(), ProviderError> {
+        session::seed(env, dir, identity, self.lock_budget)
+    }
+
+    fn has_baseline(&self, dir: &Path) -> bool {
+        session::has_baseline(dir)
+    }
+
+    fn merge_back(
+        &self,
+        env: &Env,
+        dir: &Path,
+        cancel: &Cancel,
+    ) -> Result<MergeReport, ProviderError> {
+        session::merge_back(env, dir, self.lock_budget, cancel)
     }
 }
 

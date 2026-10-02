@@ -48,13 +48,13 @@ pub use process::{
 };
 pub use profile::{
     LAUNCH_DIR, LINKS_FILE, LinksRecord, MARKER_FILE, ProfileMarker, RunShell, SEED_FILE, Seed,
-    canonical_profile_path, entry_matches, launch_reservations, profile_path,
+    canonical_profile_path, entry_matches, launch_reservations, profile_path, read_own_bytes,
 };
 pub use provider::{
     BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, EntryKind,
-    Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, MustShare,
-    Provider, ProviderError, RefreshResult, SecretStore, SharePolicy, StoredLogin, TransientKind,
-    Undo, UsageResult, Written,
+    Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
+    MergeReport, MustShare, Provider, ProviderError, RefreshResult, SecretStore, SharePolicy,
+    StoredLogin, TransientKind, Undo, UsageResult, Written,
 };
 pub use read::{Read, ReadError};
 pub use reservation::{LaunchReservation, remove_dead_reservations};
