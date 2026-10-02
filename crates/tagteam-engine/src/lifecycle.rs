@@ -230,8 +230,12 @@ impl Engine {
     /// another account's profile names that account's spelling, whose Keychain item must never
     /// be deleted here. With no trusted marker, the items for the profile's current canonical
     /// spelling are deleted instead, and a warning says an item under an older spelling may
-    /// remain (Decision 12). A failure stops before the directory goes. The items are found by
-    /// the recorded spelling, the files by the profile's actual directory (Decision 19).
+    /// remain (Decision 12). If that spelling cannot be derived because the path does not
+    /// resolve (a dangling link), there is no item to name: the delete is skipped with the same
+    /// warning, and the path itself is removed as a link, so a stray path never leaves `remove`
+    /// unable to finish once the vault is gone. Any other failure stops before the directory
+    /// goes. The items are found by the recorded spelling, the files by the profile's actual
+    /// directory (Decision 19).
     fn remove_profile(&self, p: &dyn Provider, row: &AccountRow) -> Result<(), EngineError> {
         let profile = profile_path(&self.env, &row.id);
         let meta = match fs::symlink_metadata(&profile) {
@@ -239,25 +243,39 @@ impl Engine {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        let current_spelling = |why: String| -> Result<String, EngineError> {
-            tracing::warn!(
-                position = row.position,
-                account = %row.id,
-                "the session profile's marker could not be read ({why}); deleting its Keychain item under its current spelling, so an item under an older spelling may remain"
-            );
-            Ok(p.profile_spelling(&canonical_profile_path(&profile)?))
+        let current_spelling = |why: String| -> Option<String> {
+            match canonical_profile_path(&profile) {
+                Ok(canonical) => {
+                    tracing::warn!(
+                        position = row.position,
+                        account = %row.id,
+                        "the session profile's marker could not be read ({why}); deleting its Keychain item under its current spelling, so an item under an older spelling may remain"
+                    );
+                    Some(p.profile_spelling(&canonical))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        position = row.position,
+                        account = %row.id,
+                        "the session profile's marker could not be read ({why}) and its path does not resolve ({e}); skipping its Keychain item, so an item under an older spelling may remain"
+                    );
+                    None
+                }
+            }
         };
         let spelling = match ProfileMarker::read(&profile) {
             Read::Present(marker)
                 if marker.account_id == row.id && marker.provider == row.provider =>
             {
-                marker.config_dir
+                Some(marker.config_dir)
             }
-            Read::Present(_) => current_spelling("it names another account".into())?,
-            Read::Absent => current_spelling("it has none".into())?,
-            Read::Unreadable(e) => current_spelling(e.to_string())?,
+            Read::Present(_) => current_spelling("it names another account".into()),
+            Read::Absent => current_spelling("it has none".into()),
+            Read::Unreadable(e) => current_spelling(e.to_string()),
         };
-        p.delete_profile_credential(&self.env, &profile, &spelling)?;
+        if let Some(spelling) = spelling {
+            p.delete_profile_credential(&self.env, &profile, &spelling)?;
+        }
         // `remove_dir_all` removes a symlink inside the profile as a link, never following it.
         if meta.is_dir() {
             fs::remove_dir_all(&profile)?;

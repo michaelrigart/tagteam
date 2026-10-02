@@ -416,6 +416,63 @@ fn remove_never_trusts_a_marker_that_names_another_account() {
 }
 
 #[test]
+fn remove_of_a_dangling_profile_link_skips_the_item_and_removes_the_link() {
+    // The profile path resolves to nothing and has no marker, so there is no spelling to name
+    // an item from. Once the vault is gone, a stray path must not leave `remove` unable to
+    // finish: the link goes as a link, the row goes, and no Keychain item is touched.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let rescue = fx.plant_rescue(
+        &a,
+        &common::vault_fp(&fx, &a),
+        &credential("a@x.co", "rt-a2"),
+    );
+    let dir = fx.profile_dir(&a);
+    fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    let target = fx.dir.path().join("moved-away/profile");
+    symlink(&target, &dir).unwrap();
+    let (svc, acct) = fx.item_for_spelling("/some/other/spelling");
+    fx.kc.put(&svc, &acct, b"someone else's");
+    let before = fx.kc.items();
+    assert_eq!(
+        state(&fx, &a),
+        SessionState::Quiescent {
+            profile: dir.clone()
+        }
+    );
+
+    let (result, logs) = capture_logs(|| fx.engine.remove(&a));
+    result.unwrap();
+
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
+    assert!(fx.vault_bytes(&a).is_none());
+    assert!(!rescue.exists());
+    assert!(fs::symlink_metadata(&dir).is_err(), "the link is gone");
+    assert!(
+        fs::symlink_metadata(target.parent().unwrap()).is_err(),
+        "nothing was created where the link pointed"
+    );
+    // The vault's own entries went; every other item, the agent's included, is as it was.
+    let agent_items = |items: std::collections::BTreeMap<(String, String), Vec<u8>>| {
+        items
+            .into_iter()
+            .filter(|((service, _), _)| service != "tagteam")
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(agent_items(fx.kc.items()), agent_items(before));
+    assert_eq!(
+        fx.kc.get(&svc, &acct).as_deref(),
+        Some(&b"someone else's"[..])
+    );
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("WARN") && l.contains("older spelling")),
+        "{logs:?}"
+    );
+}
+
+#[test]
 fn a_remove_that_stops_at_the_profile_has_already_deleted_the_vault_and_keeps_the_row() {
     // §10.3's order: the vault (and any rescue) goes before the profile, so a stop at the
     // profile leaves no older generation behind a newer profile one; the row goes last, so the
