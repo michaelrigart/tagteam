@@ -117,7 +117,7 @@ M3b's seams with Tasks 10–17:
 - **Task 13.** M3b's unread-settings-key test moves from `share_extra` to another key.
 - **Task 15.** It skips the dev-dependency M3b already added.
 - **Task 16.** It adds a FakeAgent tick test.
-- **Task 17.** It also runs the engine's `test-hooks` suite, and skips PR #3's network tests (`tls_live`) in its `--ignored` pass.
+- **Task 17.** It also runs the engine's `test-hooks` suite, and skips PR #3's two network tests in its `--ignored` pass. They must be skipped by name (`--skip a_public_certificate_chain_is_trusted --skip an_untrusted_root_is_a_certificate_failure`): `--skip tls_live` matches neither, and one run reached the network because of it.
 - **The compat lists.** `crates/tagteam-cc/compat/known-{shared,private}` match `CC_MUST_SHARE` + `CC_SHARED` and `CC_PRIVATE`.
 
 ## Milestones
@@ -549,8 +549,10 @@ pub trait Provider: Send + Sync {
     /// (CC: its `.claude.json` `oauthAccount`; Decision 19).
     fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>;
     /// §10.3: deletes the agent-owned credential items for `spelling` and verifies them gone
-    /// (CC macOS: the hashed Keychain item; otherwise nothing outside the directory).
-    fn delete_profile_credential(&self, env: &Env, spelling: &str) -> Result<(), ProviderError>;
+    /// (CC macOS: the hashed Keychain item; otherwise nothing outside the directory). `dir` is the
+    /// profile's actual directory: CC's storage-write lock is anchored there, and taken around
+    /// each delete when `dir` is a real directory (execution ruling, Task 7).
+    fn delete_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Result<(), ProviderError>;
     /// §13.5: whether `env` is a process this agent started (CC: `CLAUDECODE` or `CLAUDE_CONFIG_DIR`).
     fn invoked_by(&self, env: &Env) -> bool;
 }
@@ -597,7 +599,7 @@ pub(crate) fn profile_paths(env: &Env, dir: &Path) -> CcPaths;
 - `launch_command` is `"claude"`, and `session_dir_var` is `Some("CLAUDE_CONFIG_DIR")`.
 - `read_profile_credential` is `LiveStore::read_credential(&profile_env(env, spelling), &profile_paths(env, dir))`: the item named from the recorded spelling, then the file in `dir` (Decision 19).
 - `profile_identity` is `config::live_identity(&profile_paths(env, dir))`.
-- `delete_profile_credential` uses `LiveStore`'s remove path on the OAuth and managed-key items of `profile_env`, verified with the existence probe. On Linux it is a no-op.
+- `delete_profile_credential` is `LiveStore::delete_items(&profile_env(env, spelling), &profile_paths(env, dir))`: Task 5's ledger-free `delete_verified` on the OAuth and managed-key items, each verified with the existence probe and held under CC's storage-write lock when `dir` is a real directory. On Linux it is a no-op.
 - `invoked_by` is `env.var("CLAUDECODE") == Some("1") || session_dir(env).is_some()`.
 
 ### `tagteam-fake`
