@@ -19,7 +19,7 @@ use tagteam_provider::{
     SystemClock,
 };
 
-use crate::app::Context;
+use crate::app::{Context, locate};
 use crate::render::{self, MISSING, RESET};
 
 /// §13.5: at most this much piped stdin is read, and none of it is used.
@@ -194,25 +194,29 @@ pub(crate) fn config_hint(env: &Env) -> String {
 
 /// The engine the fast path runs on, built with walls rather than trust (§13.5): a Keychain that
 /// refuses every call, no profile oracle, and a lazy HTTP port whose adapter could send nothing
-/// even if it were built. The settings' warnings are dropped, since a status bar has nowhere to
-/// show them. The walls are returned so a test can prove nothing reached them.
+/// even if it were built. It is located as every command is (§12.8), from the marker file
+/// alone. The settings' warnings are dropped, since a status bar has nowhere to show them. The
+/// walls are returned so a test can prove nothing reached them.
 pub(crate) fn engine(
     ctx: Context,
     provider: &ProviderId,
 ) -> (Engine, Arc<LazyHttp>, Arc<NoKeychain>) {
     let keychain = Arc::new(NoKeychain::default());
     let http = Arc::new(LazyHttp::new(|| Arc::new(NoHttp) as Arc<dyn Http>));
-    let (settings, _warnings) = Settings::load(&ctx.env, provider);
+    let registry =
+        ProviderRegistry::new().with(Arc::new(ClaudeCode::new(keychain.clone(), ctx.platform)));
+    let (run_shell, env) = locate(ctx.env, &registry);
+    let (settings, _warnings) = Settings::load(&env, provider);
     let engine = Engine::new(EngineConfig {
-        registry: ProviderRegistry::new()
-            .with(Arc::new(ClaudeCode::new(keychain.clone(), ctx.platform))),
+        registry,
         vault: Vault::new(Box::new(KeychainVault::new(keychain.clone()))),
         oracle: Arc::new(NoOracle),
         clock: Arc::new(SystemClock),
         http: http.clone(),
         default_provider: ProviderId::new(CLAUDE_CODE),
         settings,
-        env: ctx.env,
+        env,
+        run_shell,
     });
     (engine, http, keychain)
 }
@@ -284,6 +288,7 @@ mod tests {
     use tagteam_engine::store::{Eligibility, Reserve, Store};
     use tagteam_engine::views::{UsageStatus, UsageView};
     use tagteam_provider::FakeKeychain;
+    use tagteam_provider::profile::{MARKER_FILE, RunShell};
 
     use super::*;
     use crate::app::{Io, run};
@@ -655,5 +660,34 @@ mod tests {
         assert_eq!(text, "a · 5h 9% · 7d 77%\n");
         assert!(!http.is_built(), "the HTTP adapter was built");
         assert_eq!(keychain.calls(), 0, "the Keychain was asked");
+    }
+
+    #[test]
+    fn an_unreadable_marker_is_found_without_the_keychain() {
+        // §12.8: the status bar learns from the file alone that the marker cannot be read, and
+        // then prints nothing (`app::run_statusline`).
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::for_test(dir.path());
+        let profile = dir.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(MARKER_FILE), "not json").unwrap();
+        env.claude_config_dir = Some(profile.clone().into_os_string());
+        let ctx = Context {
+            env,
+            keychain: Arc::new(FakeKeychain::new()),
+            platform: Platform::MacOs,
+            api_base: None,
+            stdout_terminal: false,
+            no_color_env: false,
+            force_color_env: false,
+        };
+        let (built, http, keychain) = engine(ctx, &ProviderId::new(CLAUDE_CODE));
+        assert!(
+            matches!(built.run_shell(), RunShell::Unreadable { marker, .. } if *marker == profile.join(MARKER_FILE)),
+            "{:?}",
+            built.run_shell()
+        );
+        assert!(!http.is_built());
+        assert_eq!(keychain.calls(), 0);
     }
 }

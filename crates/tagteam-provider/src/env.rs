@@ -129,14 +129,6 @@ impl Env {
             .unwrap_or_else(|| self.home.join(".local/state"));
         self.guard(base.join("tagteam"))
     }
-
-    /// `CLAUDE_CONFIG_DIR` under tagteam's `sessions/`: every command that changes accounts or
-    /// the live login refuses there (§9.2, B.32).
-    pub fn inside_run_shell(&self) -> bool {
-        self.claude_config_dir
-            .as_ref()
-            .is_some_and(|d| PathBuf::from(d).starts_with(self.data_dir().join("sessions")))
-    }
 }
 
 #[cfg(test)]
@@ -215,13 +207,5 @@ mod tests {
             "a variable gone from the process is dropped"
         );
         assert!(Env::from_process().vars.is_empty());
-    }
-
-    #[test]
-    fn a_run_shell_is_detected_from_claude_config_dir() {
-        let mut env = Env::for_test(Path::new("/tmp/fixture"));
-        assert!(!env.inside_run_shell());
-        env.claude_config_dir = Some("/tmp/fixture/home/.local/share/tagteam/sessions/0192".into());
-        assert!(env.inside_run_shell());
     }
 }

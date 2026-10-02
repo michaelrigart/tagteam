@@ -31,6 +31,10 @@ pub enum EngineError {
     UnknownProvider(String),
     #[error("this command cannot run inside a `tagteam run` session")]
     InsideRunShell,
+    /// §12.8: a marker is present but is not a valid marker, so the outer home is unknown.
+    /// Every command but `statusline` refuses, naming it.
+    #[error("the run-shell marker {} cannot be read ({detail})", marker.display())]
+    RunShellUnreadable { marker: PathBuf, detail: String },
     #[error("there is no live login to add; log in with `claude` first")]
     NoLiveLogin,
     #[error("the live login is a managed API key; add it with `tagteam add-token`")]
@@ -137,6 +141,7 @@ impl EngineError {
             EngineError::UnreadableAccount { .. } => "unreadable",
             EngineError::UnknownProvider(_) => "unknown-provider",
             EngineError::InsideRunShell => "inside-run-shell",
+            EngineError::RunShellUnreadable { .. } => "run-shell-unreadable",
             EngineError::NoLiveLogin => "no-live-login",
             EngineError::LiveApiKey => "live-api-key",
             EngineError::DegradedRead => "degraded-read",
@@ -228,6 +233,13 @@ mod tests {
             ),
             (EngineError::UnknownProvider("p".into()), "unknown-provider"),
             (EngineError::InsideRunShell, "inside-run-shell"),
+            (
+                EngineError::RunShellUnreadable {
+                    marker: PathBuf::from("x"),
+                    detail: "d".into(),
+                },
+                "run-shell-unreadable",
+            ),
             (EngineError::NoLiveLogin, "no-live-login"),
             (EngineError::LiveApiKey, "live-api-key"),
             (EngineError::DegradedRead, "degraded-read"),

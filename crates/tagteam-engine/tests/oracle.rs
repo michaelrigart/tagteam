@@ -22,6 +22,7 @@ use tagteam_engine::vault::{KeychainVault, SERVICE, Vault};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::http::{Http, Method};
 use tagteam_provider::mock_server::{MockReply, MockServer};
+use tagteam_provider::profile::RunShell;
 use tagteam_provider::{Credential, Identity, Provider};
 
 /// An engine over the fixture whose oracle is the real `HttpOracle`, answered by `fx.http`.
@@ -284,6 +285,7 @@ fn a_hanging_profile_endpoint_delays_a_switch_by_its_timeout_and_holds_no_lock()
         http,
         default_provider: ProviderId::new(CLAUDE_CODE),
         settings: Settings::default(),
+        run_shell: RunShell::Outside,
     });
     let env = fx.env.clone();
     let watched = b.clone();

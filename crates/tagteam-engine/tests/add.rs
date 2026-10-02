@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use common::{API_KEY, Fx};
 use serde_json::{Value, json};
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
+use tagteam_core::AccountId;
 use tagteam_engine::EngineError;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;
@@ -688,11 +689,12 @@ fn add_token_validates_its_inputs() {
 
 #[test]
 fn account_commands_refuse_inside_a_run_shell() {
+    // §12.8, B.57: the marker makes the run shell, wherever the profile lies.
     let fx = Fx::new();
     fx.login("me@work.co", "rt-1");
-    let mut env = fx.env.clone();
-    env.claude_config_dir = Some(fx.env.data_dir().join("sessions/x").into_os_string());
-    let engine = fx.engine_with_env(env);
+    let profile = fx.dir.path().join("elsewhere");
+    fx.write_marker(&profile, &AccountId::from_string("0192"), &fx.env);
+    let engine = fx.engine_located(fx.shell_env(&profile));
     assert!(matches!(
         engine.add_live(add_opts(&fx)),
         Err(EngineError::InsideRunShell)

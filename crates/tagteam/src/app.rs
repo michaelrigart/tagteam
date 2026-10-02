@@ -14,6 +14,7 @@ use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::net::UreqHttp;
 use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::registry::ProviderRegistry;
+use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{ColorMode, Settings, parse_bool};
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
@@ -21,6 +22,7 @@ use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, StatusView};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::http::Http;
+use tagteam_provider::profile::RunShell;
 use tagteam_provider::security::SecurityCli;
 use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
 
@@ -74,6 +76,8 @@ const BAD_INCLUDE: &str = "--include-api-key-accounts takes true, false, 1, 0, y
 
 const NO_COLOR: &str = "NO_COLOR";
 const FORCE_COLOR: &str = "FORCE_COLOR";
+/// Set to `1` in every process Claude Code starts (§13.5, Appendix A.7).
+const CLAUDECODE: &str = "CLAUDECODE";
 
 /// Honoured only with the `test-support` feature: a release build never reads them.
 #[cfg(any(test, feature = "test-support"))]
@@ -137,7 +141,7 @@ fn test_overrides(_var: &dyn Fn(&str) -> Option<OsString>) -> Overrides {
 impl Context {
     pub fn from_process() -> Self {
         let o = test_overrides(&|k| std::env::var_os(k));
-        Self {
+        let mut ctx = Self {
             env: Env::from_process(),
             keychain: o.keychain.unwrap_or_else(|| Arc::new(SecurityCli::new())),
             platform: o.platform.unwrap_or_else(Platform::current),
@@ -145,7 +149,13 @@ impl Context {
             stdout_terminal: std::io::stdout().is_terminal(),
             no_color_env: env_flag(NO_COLOR),
             force_color_env: env_flag(FORCE_COLOR),
-        }
+        };
+        // Decision 5: the variables this build's providers asked for, captured here at the
+        // process boundary and never in `run`, so a hand-built `Context` carries exactly the
+        // `vars` its test set (§15.1). Building the registry touches no Keychain item.
+        let names = session_vars(&build_registry(&ctx));
+        ctx.env.capture_vars(&names);
+        ctx
     }
 }
 
@@ -155,18 +165,51 @@ pub struct Io<'a> {
     pub prompter: &'a mut dyn Prompter,
 }
 
-/// The engine for one command, and the settings warnings for the caller to print (§6.4). The
-/// settings are those of `provider`, the one the command resolves (`--provider`, else the
-/// default): its own tables come first. The HTTP adapter is built on its first request, never
-/// before (§13.5), and the oracle sends through the same one.
-fn build_engine(ctx: Context, provider: &ProviderId) -> (Engine, Vec<String>) {
+/// The providers this build registers (§4.5), over the context's Keychain and platform, with
+/// every endpoint under the test base when one is set.
+fn build_registry(ctx: &Context) -> ProviderRegistry {
     let mut cc = ClaudeCode::new(ctx.keychain.clone(), ctx.platform);
     if let Some(base) = &ctx.api_base {
         cc = cc.with_endpoints(Endpoints::with_base(base));
     }
+    ProviderRegistry::new().with(Arc::new(cc))
+}
+
+/// The variables `Context::from_process` captures into `Env.vars` (Decision 5): every variable
+/// `registry`'s providers name a profile with (§4.5 `session_dir_var`), then `CLAUDECODE`
+/// (§13.5).
+pub(crate) fn session_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = registry
+        .all()
+        .iter()
+        .filter_map(|p| p.session_dir_var())
+        .collect();
+    names.push(CLAUDECODE);
+    names
+}
+
+/// §12.8: where this process stands. The marker decides the run shell and the environment the
+/// engine runs on (Decision 6). It only detects: the variables are already in `env.vars`,
+/// captured at the process boundary (`Context::from_process`).
+pub(crate) fn locate(env: Env, registry: &ProviderRegistry) -> (RunShell, Env) {
+    detect_run_shell(&env, registry)
+}
+
+/// The engine for one command, and the settings warnings for the caller to print (§6.4). The
+/// settings are those of `provider`, the one the command resolves (`--provider`, else the
+/// default): its own tables come first. `env` is the effective environment `locate` returned
+/// with `run_shell`. The HTTP adapter is built on its first request, never before (§13.5), and
+/// the oracle sends through the same one.
+fn build_engine(
+    ctx: Context,
+    registry: ProviderRegistry,
+    run_shell: RunShell,
+    env: Env,
+    provider: &ProviderId,
+) -> (Engine, Vec<String>) {
     let vault = match ctx.platform {
         Platform::MacOs => Vault::new(Box::new(KeychainVault::new(ctx.keychain))),
-        Platform::Linux => Vault::new(Box::new(FileVault::new(ctx.env.data_dir().join("vault")))),
+        Platform::Linux => Vault::new(Box::new(FileVault::new(env.data_dir().join("vault")))),
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     // `api_base` only ever carries a test base: it is sent to directly, never through whatever
@@ -180,10 +223,10 @@ fn build_engine(ctx: Context, provider: &ProviderId) -> (Engine, Vec<String>) {
         })
     }));
     let default_provider = ProviderId::new(CLAUDE_CODE);
-    let (settings, warnings) = Settings::load(&ctx.env, provider);
+    let (settings, warnings) = Settings::load(&env, provider);
     let engine = Engine::new(EngineConfig {
-        env: ctx.env,
-        registry: ProviderRegistry::new().with(Arc::new(cc)),
+        env,
+        registry,
         vault,
         // §7.6: asked at most once per credential within one command.
         oracle: Arc::new(CachingOracle::new(HttpOracle::new(
@@ -194,6 +237,7 @@ fn build_engine(ctx: Context, provider: &ProviderId) -> (Engine, Vec<String>) {
         http,
         default_provider,
         settings,
+        run_shell,
     });
     (engine, warnings)
 }
@@ -446,6 +490,17 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
             *print_config,
         ));
     }
+    // §12.8: the run shell is found through the registered providers, so the registry comes
+    // first. Under a marker that cannot be read the outer home is unknown, and nothing runs.
+    let registry = build_registry(&ctx);
+    let (run_shell, env) = locate(ctx.env.clone(), &registry);
+    if let RunShell::Unreadable { marker, detail } = &run_shell {
+        let e = EngineError::RunShellUnreadable {
+            marker: marker.clone(),
+            detail: detail.clone(),
+        };
+        return Ended::Code(fail(io, json, e.kind(), &e.to_string()));
+    }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
     let (stdout_terminal, no_color_env, force_color_env) =
@@ -454,7 +509,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     let resolved = provider_flag
         .clone()
         .unwrap_or_else(|| ProviderId::new(CLAUDE_CODE));
-    let (engine, warnings) = build_engine(ctx, &resolved);
+    let (engine, warnings) = build_engine(ctx, registry, run_shell, env, &resolved);
     for w in &warnings {
         let _ = writeln!(io.err, "warning: {w}");
     }
@@ -525,7 +580,8 @@ fn fail(io: &mut Io<'_>, json: bool, kind: &str, message: &str) -> i32 {
 
 /// §13.5's fast path, taken before `build_engine`: no lock check, no settings warnings (a status
 /// bar has nowhere to show them), and an engine walled off from the Keychain and the network
-/// (`statusline::engine`). `main_with_args` has already drained stdin.
+/// (`statusline::engine`). `main_with_args` has already drained stdin. Under a marker that
+/// cannot be read it prints nothing (§12.8).
 fn run_statusline(
     ctx: Context,
     io: &mut Io<'_>,
@@ -541,6 +597,10 @@ fn run_statusline(
     let provider = provider.map_or_else(|| ProviderId::new(CLAUDE_CODE), ProviderId::new);
     let (no_color_env, force_color_env) = (ctx.no_color_env, ctx.force_color_env);
     let (engine, _http, _keychain) = statusline::engine(ctx, &provider);
+    // The outer home is unknown, so the status bar shows nothing rather than a guess.
+    if matches!(engine.run_shell(), RunShell::Unreadable { .. }) {
+        return 0;
+    }
     let result = statusline_supported(&engine, &provider).and_then(|()| {
         if print_config {
             let _ = writeln!(io.err, "{}", statusline::config_hint(engine.env()));
@@ -1156,6 +1216,8 @@ impl App<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+    use tagteam_provider::FakeKeychain;
+
     use super::*;
 
     /// An environment that sets every test override.
@@ -1322,6 +1384,30 @@ mod tests {
         assert_eq!(
             message,
             "--strategy consume-first needs a long usage window to rank by, and FakeAgent has none"
+        );
+    }
+
+    #[test]
+    fn the_process_boundary_captures_every_session_variable_and_claudecode() {
+        // Decision 5: `Context::from_process` captures these names, and only it does, so a
+        // hand-built `Context` carries exactly the `vars` its test set (§15.1).
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context {
+            env: Env::for_test(dir.path()),
+            keychain: Arc::new(FakeKeychain::new()),
+            platform: Platform::MacOs,
+            api_base: None,
+            stdout_terminal: false,
+            no_color_env: false,
+            force_color_env: false,
+        };
+        assert_eq!(
+            session_vars(&build_registry(&ctx)),
+            ["CLAUDE_CONFIG_DIR", "CLAUDECODE"]
+        );
+        assert!(
+            ctx.env.vars.is_empty(),
+            "nothing but the process boundary captures"
         );
     }
 }

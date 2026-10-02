@@ -18,6 +18,7 @@ pub mod refresh;
 mod refs;
 pub mod registry;
 mod rescue;
+pub mod session;
 pub mod settings;
 pub mod store;
 pub mod switch;
