@@ -1256,6 +1256,36 @@ mod tests {
         }
     }
 
+    /// `auto`'s flags as parsed from `args` and resolved against the default settings.
+    fn parsed_auto_config(args: &[&str]) -> (f64, i64, i64) {
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied())).unwrap();
+        let Some(Command::Auto {
+            threshold,
+            interval,
+            cooldown,
+            ..
+        }) = cli.command
+        else {
+            panic!("not auto");
+        };
+        let Ok(flags) = auto_flags(threshold, interval, cooldown, None, None, None) else {
+            panic!("bad flags");
+        };
+        let c = crate::auto::auto_config(&Settings::default(), &flags, None);
+        (c.threshold, c.interval_s, c.cooldown_s)
+    }
+
+    #[test]
+    fn negative_numeric_flags_parse_and_clamp_to_their_ranges() {
+        // §6.4: a flag is clamped to its setting's range, so a negative value reaches the
+        // clamp instead of being refused as an unexpected argument.
+        assert_eq!(parsed_auto_config(&["auto", "--cooldown", "-1"]).2, 0);
+        assert_eq!(parsed_auto_config(&["auto", "--interval", "-5"]).1, 15);
+        assert_eq!(parsed_auto_config(&["auto", "--threshold", "-3"]).0, 50.0);
+    }
+
     #[test]
     fn model_lists_are_trimmed_and_drop_empty_names() {
         assert_eq!(model_list("Fable"), ["Fable"]);

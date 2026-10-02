@@ -96,13 +96,13 @@ pub enum Command {
         #[arg(long = "dry-run")]
         dry_run: bool,
         /// Switch away above this percentage of usage (50–99.9)
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         threshold: Option<f64>,
         /// Seconds between ticks (15–3600)
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         interval: Option<i64>,
         /// Seconds after an automatic switch before another proactive one (0–86400)
-        #[arg(long)]
+        #[arg(long, allow_negative_numbers = true)]
         cooldown: Option<i64>,
         /// best or consume-first
         #[arg(long, value_enum)]
