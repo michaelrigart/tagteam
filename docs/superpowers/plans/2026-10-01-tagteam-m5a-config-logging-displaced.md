@@ -1,6 +1,6 @@
 # tagteam M5a — Settings, Logging, Displaced and Completions Implementation Plan
 
-**Status:** Approved
+**Status:** In progress
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -293,7 +293,38 @@ The five input classes or failure modes most likely to bite a user that no task'
 
 ## Execution rulings
 
-Recorded at execution time: the re-sync against merged M3a and M4a, then rulings taken during the run.
+Recorded at execution time: the re-sync against merged M3a, M3b and M4a, then rulings taken during the run.
+
+**Re-sync against merged M3a, M3b and M4a (`c690c02` = `main` `f85d2be` + the M5 spec fixes).** Verified by applying Tasks 1–10 in order to a copy of HEAD, each followed by its own tests, fmt and both clippy runs: `cargo test --workspace --features tagteam/test-support` 1895/1905, 5 ignored, the 10 failures being the `openpty` tests a sandbox refuses; the `--ignored` run 3/3; fmt and both clippy runs clean. Each task's deltas, with the code in full, are in the run workspace's `resync.md` (`.superpowers/sdd/2026-10-01-tagteam-m5a-config-logging-displaced/resync.md`, git-ignored execution scratch; the task commits are the record), whose section an implementer reads next to the task; its header holds the global facts (`run_command`/`Ended`, `build_registry`/`locate`, `Env.cancel`/`Env.vars`, `FlockGuard::lock` with a cancel token, `statusline::engine`, `account_view_with`, the kind table).
+- **Task 1:** `env.rs` keeps its five import lines; `Context::from_process` keeps M4a's `capture_vars` and ends `Ok(ctx)`; in `main_with_args` only the drain's `if` and the `let ctx` line change, M3a's tail (signals, `TtyPrompter::new(cancel)`, unlocked streams) stays; M4a's env test takes `.unwrap()`; `env::tests` runs 8.
+- **Task 2:** do not use the plan's `settings.rs`; `resync.md` gives the file. M3b's reader is folded into the registry: `Strategy` (no `AutoStrategy`), `i64` seconds, bounds from the `*_RANGE` constants, M3b's phrases (`" of ticks"`, the six-word boolean phrase), `parse_bool_item`/`parse_bool`, `mtime`, the ranges and `parse_bool` kept `pub`; the boolean test is replaced with M3b's cases; `lock_kind` gains `Interrupted`; pin rows go before the `Io` row. Counts 77/80.
+- **Task 3:** `build_engine` keeps M4a's five parameters (the last becomes `flag: Option<&ProviderId>`); `statusline::engine` keeps M4a's body, with `command_settings` wrapping `resolve_provider`; the `run_statusline` edit and two statusline test edits are already M4a's; the three import anchors moved; `command_name` gains `Config`. No E0308 at Step 7.
+- **Task 4:** no code delta; two anchors sit on Tasks 2 and 3's re-synced text.
+- **Task 5:** no code delta; the `lib.rs` anchor is at line 11, not 9.
+- **Task 6:** skip the `(out, err)` replacement (R-T6-unlocked); delete `init_logging`'s call from `run_command`, not `run`; the `hooks.rs` doc anchor is M3a's reflowed text; Step 2 is 7 of 10 failing; R-T6-bridge.
+- **Task 7:** `store/mod.rs`'s block becomes two edits (`commit_switch`, `insert_event`); `refresh_active`'s head keeps M4a's paragraph and `refuse_unreadable_run_shell`; `log_active` gains the `Replaced` arm; `account_view_with` gains `status_bar` as its fifth parameter and both `statusline` calls pass `true`; Part B's `rg` finds four `id = %` lines; the audit table's 12 newer calls are clean.
+- **Task 8:** one delta, `tests/store.rs`'s M3b import block; every displacement call site is covered as the task says.
+- **Task 9:** the crate `use` line is `use crate::{auto, config_cmd, displaced_cmd, history, prompt, render, root_guard, statusline};`; Part A adds the `command_name` arm (R-T9-unitarm); `KIND_NEEDS_CONFIRMATION` after `KIND_INTERRUPTED` (R-T9-kind); `render.rs`'s anchors at 203/207.
+- **Task 10:** the branch goes in `run_command` after the `RunShell::Unreadable` refusal, returning `Ended::Code`; the unit test compares `build_registry(&ctx).all()` with `COMPLETED_PROVIDERS` both ways; `command_name` gains `Completions`; `clap_complete` 4.6.11 may need one unsandboxed `cargo fetch`.
+- **Task 11:** the `--ignored` run skips `tls_live.rs`'s two network tests by name; expected totals are in `resync.md`.
+
+**Rulings proposed by the re-sync**
+- Ruling R-T2-phrases: `Key::expect` keeps M3b's phrases (Bool "must be true, false, 1, 0, yes or no"; Int " of ticks" for `autoswitch.unhealthy_ticks`) — M3b's and `auto.rs`'s tests pin them, and §6.4 wants one declaration — cost if wrong: two phrase strings.
+- Ruling R-T2-booltest: `a_boolean_key_reads_a_toml_boolean_and_nothing_else` becomes `a_boolean_override_reads_every_spelling_and_an_invalid_one_falls_through`, with M3b's cases — Decision 16 already takes M3b's boolean reading, under which the old name is false — cost if wrong: a test name.
+- Ruling R-T2-overlap: keep `the_auto_switch_keys_are_read_from_the_provider_s_table_first` (with `Strategy`) although M3b's `a_providers_autoswitch_table_comes_first_for_every_key` overlaps it — the smallest deviation from the plan — cost if wrong: one redundant test.
+- Ruling R-T2-noop: a `config set` whose value a non-canonical file spelling already means (`include_api_key_accounts = "yes"` against `set … true`) writes nothing and keeps that spelling — `parse_item` is the one comparison, and a set that changes nothing writes nothing (Decision 16) — cost if wrong: a normalising write in `config_set`.
+- Ruling R-T3-late: add a case per new command to `the_late_notice_names_each_command_as_it_is_typed` (`config list`, `displaced`, `completions bash`; 15 → 18 across Tasks 3, 9, 10) — the exhaustive `command_name` arms the tasks add are otherwise never exercised — cost if wrong: three test lines to drop.
+- Ruling R-T6-unlocked: skip Task 6's `(out, err)` replacement and keep M3a's unlocked `(std::io::stdout(), std::io::stderr())` — M3a already made the fix, and the plan's line would re-lock stdout — cost if wrong: none.
+- Ruling R-T6-bridge: narrow M3a's `signals.rs::debug_logging_from_a_collector_thread_does_not_deadlock_the_command` to "`--debug list` finishes", deleting its `contains("DEBUG")` assertion — the only DEBUG lines it saw were ureq's `log` records bridged by `try_init`, which Decision 5's `set_global_default` stops on purpose (B.69, §14.2), and Task 6's `a_collector_thread_s_log_line_under_debug_never_hangs_the_command` pins a collector thread's line reaching stderr — cost if wrong: one assertion moved; `--debug` no longer shows ureq/rustls records, as Decision 5 accepts.
+- Ruling R-T7-replaced: `log_active` logs `ActiveOutcome::Replaced` at DEBUG (`outcome="replaced"`) — §7.5 step 2 sends and writes nothing; the plan's Re-sync note gives the arm — cost if wrong: one level.
+- Ruling R-T7-statusline: both `account_view_with` calls in `Engine::statusline` pass `status_bar = true` — M4a Task 15 split the plan's single anchor in two — cost if wrong: comment text.
+- Ruling R-T9-unitarm: Task 9 Part A's `command_name` arm is `Command::Displaced => "displaced"`, Part B's `Command::Displaced { .. } => "displaced"` — the match is exhaustive, and clippy's `unneeded_struct_pattern` rejects `{ .. }` on a unit variant — cost if wrong: none.
+- Ruling R-T9-kind: `KIND_NEEDS_CONFIRMATION` goes directly after `KIND_INTERRUPTED` — M3b's two kinds now sit between `KIND_UNSUPPORTED` and `KIND_INTERRUPTED` — cost if wrong: placement.
+- Ruling R-T9-runshell: add `displaced` and `displaced --purge <id> --yes` to `run_shell_cli.rs`'s `COMMANDS` — §12.8 refuses every command but `statusline` under an unreadable marker, and nothing else pins it for the new command — cost if wrong: two test rows to drop.
+- Ruling R-T10-runshell: add `completions bash` to `run_shell_cli.rs`'s `COMMANDS` — §12.8 and Decision 16 say `completions` refuses there, and Task 10's own tests do not pin it — cost if wrong: one test row to drop.
+
+**Spec question SQ-1, ruled:** `completions` is refused as root (without an overlay `/`) and with an unusable `HOME` (§5), although §13.7 says a package manager installs its script; a packager generating it under `fakeroot` or without `HOME` gets exit 1. The plan matches §5 as written; exempting `completions` would be a spec change.
+  Ruling SQ-1: keep §5 as written — a package manager generates completions as the installing user with `HOME` set (Homebrew does), and a container build's overlay root passes §5's root rule — cost if wrong: a packager without `HOME` passes one in.
 
 ---
 
