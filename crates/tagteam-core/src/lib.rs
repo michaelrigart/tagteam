@@ -5,6 +5,7 @@ pub mod backoff;
 pub mod classify;
 pub mod fingerprint;
 pub mod ids;
+pub mod merge;
 pub mod pace;
 pub mod poll;
 pub mod provenance;
