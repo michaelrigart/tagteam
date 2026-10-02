@@ -335,6 +335,126 @@ fn move_is_not_destructive() {
     assert_eq!(fx.engine.move_to(&a, 2).unwrap().position, 2);
 }
 
+/// Everything under `dir`, never following a link: a link's target, a directory, or a file's
+/// bytes.
+fn tree(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut out = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let held = if meta.file_type().is_symlink() {
+                format!("link {}", fs::read_link(&path).unwrap().display())
+            } else if meta.is_dir() {
+                dirs.push(path.clone());
+                "dir".to_owned()
+            } else {
+                String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned()
+            };
+            out.push((path, held));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `remove` of `id`, whose profile `dir` holds a split must-share entry: it refuses with
+/// `profile-split`, naming both paths and saying `why`, before anything is deleted.
+fn assert_remove_refuses_a_split(fx: &Fx, id: &AccountId, dir: &Path, name: &str, why: &str) {
+    let (svc, acct) = fx.profile_item(dir);
+    fx.kc.put(&svc, &acct, &credential("a@x.co", "rt-a2"));
+    let (vault, files) = (fx.vault_bytes(id), tree(dir));
+
+    let err = fx.engine.remove(id).unwrap_err();
+
+    assert_eq!(err.kind(), "profile-split", "{err}");
+    let text = err.to_string();
+    let shared = fx.env.home.join(".claude").join(name);
+    assert!(
+        text.contains(&dir.join(name).display().to_string())
+            && text.contains(&shared.display().to_string()),
+        "{text}"
+    );
+    assert!(text.contains(why), "{text}");
+    assert!(fx.engine.store().unwrap().account(id).unwrap().is_some());
+    assert_eq!(fx.vault_bytes(id), vault, "the vault is unchanged");
+    assert!(fx.kc.get(&svc, &acct).is_some(), "so is the profile's item");
+    assert_eq!(tree(dir), files, "and its files");
+}
+
+#[test]
+fn remove_refuses_a_profile_whose_history_is_a_real_file() {
+    // §12.2: real history is never deleted or split silently, and §10.3 would delete the
+    // profile's directory with it.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    fs::write(dir.join("history.jsonl"), "{\"display\":\"only here\"}\n").unwrap();
+    assert_remove_refuses_a_split(&fx, &a, &dir, "history.jsonl", "is a real copy");
+    // Merged and removed by hand: the remove goes ahead.
+    fs::remove_file(dir.join("history.jsonl")).unwrap();
+    fx.engine.remove(&a).unwrap();
+    assert!(fs::symlink_metadata(&dir).is_err());
+}
+
+#[test]
+fn remove_refuses_a_profile_whose_memory_links_elsewhere_and_a_dangling_link_does_not() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let elsewhere = fx.dir.path().join("elsewhere/projects");
+    fs::create_dir_all(elsewhere.join("-x/memory")).unwrap();
+    symlink(&elsewhere, dir.join("projects")).unwrap();
+    assert_remove_refuses_a_split(&fx, &a, &dir, "projects", "links somewhere other than");
+    assert!(elsewhere.join("-x/memory").is_dir());
+    // A link to nothing holds nothing to lose.
+    fs::remove_file(dir.join("projects")).unwrap();
+    symlink(fx.dir.path().join("gone"), dir.join("projects")).unwrap();
+    fx.engine.remove(&a).unwrap();
+    assert!(fs::symlink_metadata(&dir).is_err());
+    assert!(
+        elsewhere.join("-x/memory").is_dir(),
+        "nothing it pointed at went"
+    );
+}
+
+#[test]
+fn add_over_an_occupant_whose_profile_holds_real_history_refuses_before_writing_anything() {
+    // §10.3: `add` over an occupied position removes the occupant, profile and all.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    fs::create_dir_all(dir.join("projects/-x/memory")).unwrap();
+    fx.login("c@x.co", "rt-c");
+    for err in [
+        fx.engine
+            .add_live(AddOptions {
+                position: Some(1),
+                yes: true,
+                ..fx.add_options()
+            })
+            .unwrap_err(),
+        fx.engine
+            .add_token(AddTokenOptions {
+                position: Some(1),
+                yes: true,
+                ..fx.add_token_options(API_KEY)
+            })
+            .unwrap_err(),
+    ] {
+        assert_eq!(err.kind(), "profile-split", "{err}");
+    }
+    let rows = fx.engine.store().unwrap().accounts(&fx.provider()).unwrap();
+    let held: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(held, ["a@x.co", "b@x.co"]);
+    assert!(fx.vault_bytes(&a).is_some());
+    assert!(dir.join("projects/-x/memory").is_dir());
+}
+
 #[test]
 fn remove_deletes_the_profile_its_item_first_and_its_links_as_links() {
     // §10.3: within the profile, its hashed item goes before its directory.
