@@ -5,6 +5,7 @@ use clap::error::{ContextKind, ErrorKind};
 use clap::{CommandFactory, Parser};
 
 pub mod app;
+pub mod auto;
 pub mod cli;
 mod history;
 pub mod prompt;

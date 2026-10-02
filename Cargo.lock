@@ -1128,6 +1128,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "fastrand",
  "libc",
  "predicates",
  "serde_json",
@@ -1135,6 +1136,7 @@ dependencies = [
  "tagteam-cc",
  "tagteam-core",
  "tagteam-engine",
+ "tagteam-fake",
  "tagteam-provider",
  "tempfile",
  "tracing",
