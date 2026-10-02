@@ -256,6 +256,23 @@ fn remove_refuses_while_a_session_record_is_unreadable() {
 }
 
 #[test]
+fn remove_of_an_account_whose_profile_path_is_a_regular_file_finishes() {
+    // Nothing can run in a file: it holds no reservation and no record, so the account is not
+    // session-owned, and `remove` deletes the file with the rest.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let path = fx.profile_dir(&a);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"stray").unwrap();
+    assert!(!state(&fx, &a).owned(), "{:?}", state(&fx, &a));
+    fx.engine.remove(&a).unwrap();
+    assert!(fs::symlink_metadata(&path).is_err(), "the file is gone");
+    assert!(fx.vault_bytes(&a).is_none());
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
+}
+
+#[test]
 fn add_over_a_session_owned_occupant_refuses_before_writing_anything() {
     // §10.3 Guard: the occupant is the account `add --position` removes.
     let fx = Fx::new();

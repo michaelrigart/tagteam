@@ -268,16 +268,26 @@ impl LinksRecord {
 }
 
 /// `<profile>/.tagteam-launch/*.lock`, each probed with `probe_lock`. A missing directory is
-/// `Present(vec![])`. A directory that cannot be listed, or a reservation that cannot be
-/// probed, makes the whole read `Unreadable`: it may hide a live session (§10.3).
+/// `Present(vec![])`, and so is one that is not a directory, or under a profile path that is
+/// not one (`ENOTDIR`): nothing can be locked there. A directory that cannot be listed, or a
+/// reservation that cannot be probed, makes the whole read `Unreadable`: it may hide a live
+/// session (§10.3).
 pub fn launch_reservations(profile: &Path) -> Read<Vec<(PathBuf, LockProbe)>> {
     let dir = profile.join(LAUNCH_DIR);
     let unreadable = |what: &Path, e: io::Error| {
         Read::Unreadable(ReadError::new(what.display().to_string(), e.to_string()))
     };
+    // Nothing that is not a directory, the profile's own path included, holds a lock file.
     let listing = match fs::read_dir(&dir) {
         Ok(l) => l,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Read::Present(vec![]),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Read::Present(vec![]);
+        }
         Err(e) => return unreadable(&dir, e),
     };
     let mut paths = Vec::new();
@@ -712,9 +722,26 @@ mod tests {
 
     #[test]
     fn a_launch_directory_that_cannot_be_listed_is_unreadable() {
+        // Run as a non-root user: root lists a 0o000 directory.
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join(LAUNCH_DIR);
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let found = launch_reservations(d.path());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(found, Read::Unreadable(_)), "{found:?}");
+    }
+
+    #[test]
+    fn no_reservation_can_lie_under_something_that_is_not_a_directory() {
+        // A regular file at the launch directory's path, or at the profile's own, holds no lock
+        // file, as `read_own_file` reads no marker there: none, not unreadable.
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join(LAUNCH_DIR), b"").unwrap();
-        assert!(matches!(launch_reservations(d.path()), Read::Unreadable(_)));
+        assert!(matches!(launch_reservations(d.path()), Read::Present(v) if v.is_empty()));
+        let file = d.path().join("profile");
+        fs::write(&file, b"").unwrap();
+        assert!(matches!(launch_reservations(&file), Read::Present(v) if v.is_empty()));
     }
 
     #[test]
