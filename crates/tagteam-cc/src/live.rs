@@ -10,8 +10,8 @@ use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
 use tagteam_provider::{
-    BeforeFallback, Cancel, Credential, DoomedEntry, Env, Keychain, MkdirLock, ProviderError, Read,
-    SecretStore,
+    BeforeFallback, Cancel, Credential, DoomedEntry, Env, Keychain, LiveLockSet, MkdirLock,
+    ProviderError, Read, SecretStore,
 };
 
 use crate::config::{self, read_bytes};
@@ -941,29 +941,48 @@ impl LiveStore {
 
     /// Deletes both axes' Keychain items that `env` names, each verified `Absent` with the
     /// existence probe (§10.3, §12.3 step 5). Nothing off macOS, where CC keeps no item. It is
-    /// for a profile's items, which are no part of any operation, so it touches no ledger. Each
-    /// delete holds CC's storage-write lock (§9.1), the lock `paths` names, alone and with no
-    /// comparison against an earlier read: a profile's removal deletes whatever is there, and a
-    /// per-config-dir daemon may still write the entry. `env` names the items (the recorded
-    /// spelling) and `paths` the lock (the profile's actual directory, Decision 19). The lock is
-    /// taken only where that directory is a real directory (a symlink does not count): no Claude
-    /// Code can write through a config dir that is missing, a file or a link, and a removal is
-    /// never blocked by a stray path there.
-    pub(crate) fn delete_items(&self, env: &Env, paths: &CcPaths) -> Result<(), ProviderError> {
+    /// for a profile's items, which are no part of any operation, so it touches no ledger. `env`
+    /// names the items (the recorded spelling) and `paths` the locks (the profile's actual
+    /// directory, Decision 19).
+    ///
+    /// Where that directory is a real directory (a symlink does not count), the deletes run under
+    /// the profile's own credential locks, waited for up to `cred_budget`, and each delete under
+    /// its storage-write lock as well, in §4.3's order (§9.1: the storage-write lock is taken
+    /// only while the credential locks are held). There is no comparison against an earlier
+    /// read: a profile's removal deletes whatever is there, and a per-config-dir daemon may
+    /// still write the entry. Both waits are cancellation points (§14.1), and a timeout or an
+    /// interruption deletes nothing more. Elsewhere no lock is taken: no Claude Code can write
+    /// through a config dir that is missing, a file or a link, and a removal is never blocked by
+    /// a stray path there.
+    pub(crate) fn delete_items(
+        &self,
+        env: &Env,
+        paths: &CcPaths,
+        cred_budget: Duration,
+    ) -> Result<(), ProviderError> {
         if !self.mac() {
             return Ok(());
         }
+        let cred = if is_real_dir(&paths.secure_storage_dir) {
+            Some(locks::acquire_credentials(paths, cred_budget, &env.cancel)?)
+        } else {
+            None
+        };
+        let owned = || -> Result<(), ProviderError> {
+            match &cred {
+                Some(cred) => Ok(cred.check_owned()?),
+                None => Ok(()),
+            }
+        };
         let acct = keychain_account(env);
         for kind in [ItemKind::OAuth, ItemKind::ManagedKey] {
             let svc = keychain_service(env, kind);
-            let lock = if is_real_dir(&paths.secure_storage_dir) {
-                Some(self.storage_write(paths, &env.cancel)?)
-            } else {
-                None
-            };
-            let gone = match &lock {
-                Some(lock) => self.delete_verified(&svc, &acct, &held(&|| Ok(()), lock))?,
-                None => self.delete_verified(&svc, &acct, &|| Ok(()))?,
+            let gone = match &cred {
+                Some(_) => {
+                    let lock = self.storage_write(paths, &env.cancel)?;
+                    self.delete_verified(&svc, &acct, &held(&owned, &lock))?
+                }
+                None => self.delete_verified(&svc, &acct, &owned)?,
             };
             if !gone {
                 return Err(ProviderError::ShadowingItem(svc));

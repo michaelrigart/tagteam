@@ -648,8 +648,11 @@ pub trait Provider: Send + Sync {
     /// (CC: its `.claude.json` `oauthAccount`; Decision 19).
     fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>;
     /// §10.3: deletes the agent-owned credential items for `spelling` and verifies them gone
-    /// (CC macOS: the hashed Keychain items, under CC's storage-write lock anchored in `dir`,
-    /// the profile's actual directory; otherwise nothing outside the directory).
+    /// (CC macOS: the hashed Keychain items; otherwise nothing outside the directory). `dir` is
+    /// the profile's actual directory. When it is a real directory, CC takes the profile's own
+    /// credential locks there, then its storage-write lock around each delete (§9.1, §4.3's
+    /// order); otherwise it takes no lock. It takes them itself, so it is never called while
+    /// they are held. Lock waits are cancellation points (§14.1).
     fn delete_profile_credential(
         &self,
         env: &Env,

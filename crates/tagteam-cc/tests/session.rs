@@ -492,12 +492,29 @@ fn deleting_a_profile_credential_on_linux_touches_nothing() {
     assert_eq!(fs::read(dir.join(".credentials.json")).unwrap(), b"file");
 }
 
-/// A Keychain that records, at each delete, whether `lock` is held, as CC's storage-write lock
-/// is while it writes (`tests/live_store.rs`' `LockProbeKeychain`).
+/// A Keychain that records, at each delete, whether each of `locks` is held, as CC's locks are
+/// while it writes (`tests/live_store.rs`' `LockProbeKeychain`).
 struct LockProbeKeychain {
     inner: Arc<FakeKeychain>,
-    lock: PathBuf,
-    deletes: Mutex<Vec<(String, bool)>>,
+    locks: Vec<PathBuf>,
+    deletes: Mutex<Vec<(String, Vec<bool>)>>,
+}
+
+impl LockProbeKeychain {
+    fn over(inner: &Arc<FakeKeychain>, locks: &[PathBuf]) -> Arc<Self> {
+        Arc::new(LockProbeKeychain {
+            inner: inner.clone(),
+            locks: locks.to_vec(),
+            deletes: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+/// The locks Claude Code takes for the profile in `dir` (§9.1): with `CLAUDE_CONFIG_DIR` naming
+/// it and secure storage undefined, its credential locks and its storage-write lock are anchored
+/// there.
+fn profile_lock_paths(f: &Fx, dir: &Path) -> CcPaths {
+    CcPaths::resolve(&with_vars(&f.env, dir.to_str(), None))
 }
 
 impl Keychain for LockProbeKeychain {
@@ -511,10 +528,8 @@ impl Keychain for LockProbeKeychain {
         self.inner.upsert(s, a, d)
     }
     fn delete(&self, s: &str, a: &str) -> Result<(), KeychainError> {
-        self.deletes
-            .lock()
-            .unwrap()
-            .push((s.to_owned(), self.lock.is_dir()));
+        let held = self.locks.iter().map(|l| l.is_dir()).collect();
+        self.deletes.lock().unwrap().push((s.to_owned(), held));
         self.inner.delete(s, a)
     }
     fn lock_state(&self) -> LockState {
@@ -535,11 +550,7 @@ fn deleting_a_profile_credential_holds_the_storage_write_lock_at_the_profile_s_a
     let gone = f.env.home.join("moved-from/sessions/0192");
     let spelling = gone.to_str().unwrap();
     let lock = dir.join(".storage-write");
-    let probe = Arc::new(LockProbeKeychain {
-        inner: f.kc.clone(),
-        lock: lock.clone(),
-        deletes: Mutex::new(Vec::new()),
-    });
+    let probe = LockProbeKeychain::over(&f.kc, &[lock.clone()]);
     let cc = ClaudeCode::with_store(
         LiveStore::new(probe.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO),
     );
@@ -554,7 +565,7 @@ fn deleting_a_profile_credential_holds_the_storage_write_lock_at_the_profile_s_a
 
     assert_eq!(
         *probe.deletes.lock().unwrap(),
-        [(oauth.clone(), true), (managed.clone(), true)],
+        [(oauth.clone(), vec![true]), (managed.clone(), vec![true])],
         "each delete runs under the lock"
     );
     assert!(!lock.exists(), "released when the delete returns");
@@ -565,12 +576,118 @@ fn deleting_a_profile_credential_holds_the_storage_write_lock_at_the_profile_s_a
     );
 }
 
+#[test]
+fn deleting_a_profile_credential_holds_the_profile_s_own_credential_locks_and_releases_them() {
+    // §9.1: the storage-write lock is taken only while the credential locks are held, for a
+    // profile the profile's own, and §4.3 orders them: the credential locks first, the
+    // storage-write lock last, around each delete.
+    let f = fx();
+    let (dir, spelling) = profile(&f, "0192");
+    let paths = profile_lock_paths(&f, &dir);
+    let locks = [
+        paths.refresh_lock.clone(),
+        paths.legacy_lock(),
+        paths.storage_write_lock.clone(),
+    ];
+    assert_eq!(locks[0], dir.join(".oauth_refresh.lock"));
+    assert_eq!(locks[2], dir.join(".storage-write"));
+    let probe = LockProbeKeychain::over(&f.kc, &locks);
+    let cc = ClaudeCode::with_store(
+        LiveStore::new(probe.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO),
+    );
+    let acct = keychain_account(&f.env);
+    let oauth = hashed("Claude Code-credentials", &spelling);
+    let managed = hashed("Claude Code", &spelling);
+    f.kc.put(&oauth, &acct, ENTRY);
+    f.kc.put(&managed, &acct, b"sk-ant-api03-profile");
+
+    cc.delete_profile_credential(&f.env, &dir, &spelling)
+        .unwrap();
+
+    assert_eq!(
+        *probe.deletes.lock().unwrap(),
+        [
+            (oauth.clone(), vec![true; 3]),
+            (managed.clone(), vec![true; 3])
+        ],
+        "each delete holds the refresh, legacy and storage-write locks"
+    );
+    for lock in &locks {
+        assert!(!lock.exists(), "{} is released", lock.display());
+    }
+    assert_eq!(
+        (f.kc.get(&oauth, &acct), f.kc.get(&managed, &acct)),
+        (None, None)
+    );
+}
+
+#[test]
+fn a_set_token_ends_a_profile_credential_delete_before_it_takes_or_deletes_anything() {
+    // §14.1: the credential-lock wait is a cancellation point; a set token makes no attempt.
+    let f = fx();
+    let (dir, spelling) = profile(&f, "0192");
+    let paths = profile_lock_paths(&f, &dir);
+    let acct = keychain_account(&f.env);
+    let oauth = hashed("Claude Code-credentials", &spelling);
+    f.kc.put(&oauth, &acct, ENTRY);
+    f.env.cancel.request(libc::SIGTERM);
+
+    match f.cc.delete_profile_credential(&f.env, &dir, &spelling) {
+        Err(ProviderError::Lock(LockError::Interrupted { path, signal })) => {
+            assert_eq!((path, signal), (paths.refresh_lock.clone(), libc::SIGTERM))
+        }
+        other => panic!("expected an interrupted wait, got {other:?}"),
+    }
+    assert_eq!(f.kc.get(&oauth, &acct).unwrap(), ENTRY, "nothing deleted");
+    for lock in [
+        paths.refresh_lock.clone(),
+        paths.legacy_lock(),
+        paths.storage_write_lock.clone(),
+    ] {
+        assert!(!lock.exists(), "{} was never taken", lock.display());
+    }
+}
+
+/// §9.1: a session in the profile is refreshing its token, so the delete waits for the
+/// profile's credential locks, then times out, deleting nothing.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_held_profile_credential_lock_makes_the_delete_wait_then_time_out() {
+    let f = fx();
+    let (dir, spelling) = profile(&f, "0192");
+    let paths = profile_lock_paths(&f, &dir);
+    let cc = ClaudeCode::with_store(
+        LiveStore::new(f.kc.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO),
+    )
+    .with_lock_timeout(Duration::from_millis(300));
+    let acct = keychain_account(&f.env);
+    let oauth = hashed("Claude Code-credentials", &spelling);
+    f.kc.put(&oauth, &acct, ENTRY);
+    fs::create_dir(&paths.refresh_lock).unwrap(); // the session's agent holds it, freshly
+
+    match cc.delete_profile_credential(&f.env, &dir, &spelling) {
+        Err(ProviderError::Lock(LockError::Timeout(path))) => assert_eq!(path, paths.refresh_lock),
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+    assert_eq!(f.kc.get(&oauth, &acct).unwrap(), ENTRY, "nothing deleted");
+    assert!(
+        paths.refresh_lock.is_dir(),
+        "the other holder's lock is left alone"
+    );
+    assert!(
+        !paths.storage_write_lock.exists(),
+        "the leaf was never reached"
+    );
+}
+
 /// Deleting the profile's items with `dir` as `place` makes: nothing, a file, or a dangling link.
 fn delete_where_the_profile_is_not_a_directory(place: impl Fn(&Path)) {
     let f = fx();
     let (dir, spelling) = profile(&f, "0192");
     fs::remove_dir(&dir).unwrap();
     place(&dir);
+    let placed = fs::symlink_metadata(&dir).ok().map(|m| m.file_type());
+    let legacy = profile_lock_paths(&f, &dir).legacy_lock();
     let acct = keychain_account(&f.env);
     let oauth = hashed("Claude Code-credentials", &spelling);
     let managed = hashed("Claude Code", &spelling);
@@ -584,6 +701,12 @@ fn delete_where_the_profile_is_not_a_directory(place: impl Fn(&Path)) {
         "both items are deleted and verified gone"
     );
     assert!(!dir.join(".storage-write").exists());
+    assert!(!dir.join(".oauth_refresh.lock").exists() && !legacy.exists());
+    assert_eq!(
+        fs::symlink_metadata(&dir).ok().map(|m| m.file_type()),
+        placed,
+        "the profile path is left as it was"
+    );
 }
 
 #[test]
@@ -610,8 +733,10 @@ fn a_symlink_to_a_directory_at_the_profile_path_takes_no_lock_either() {
     let real = f.env.home.join("real-profile");
     fs::rename(&dir, &real).unwrap();
     std::os::unix::fs::symlink(&real, &dir).unwrap();
-    // A held lock behind the link would time this delete out if it took the lock.
+    // A held lock behind the link would time this delete out if it took the lock: the
+    // storage-write lock, or the credential locks it is taken under.
     fs::create_dir(real.join(".storage-write")).unwrap();
+    fs::create_dir(real.join(".oauth_refresh.lock")).unwrap();
     let cc = ClaudeCode::with_store(
         LiveStore::new(f.kc.clone(), Platform::MacOs)
             .with_retry_delay(Duration::ZERO)
@@ -624,8 +749,8 @@ fn a_symlink_to_a_directory_at_the_profile_path_takes_no_lock_either() {
         .unwrap();
     assert_eq!(f.kc.get(&oauth, &acct), None);
     assert!(
-        real.join(".storage-write").is_dir(),
-        "the other holder's lock is untouched"
+        real.join(".storage-write").is_dir() && real.join(".oauth_refresh.lock").is_dir(),
+        "the other holder's locks are untouched"
     );
 }
 
