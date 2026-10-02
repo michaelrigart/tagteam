@@ -648,6 +648,7 @@ fn the_record_lands_with_the_commit_or_not_at_all() {
         from_identity: None,
         to_fp: "sha256:b".into(),
         started_at: 5,
+        to_epoch: None,
         prior: None,
     })
     .unwrap();
@@ -1037,7 +1038,8 @@ fn a_finish_never_overwrites_a_switch_committed_since_the_replacer_died() {
     let incoming = identity("a@x.co");
     s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, true), true)
         .unwrap();
-    s.commit_switch(&cc(), &b, 0, &switch_event(&b)).unwrap();
+    s.commit_switch(&cc(), &b, 0, &switch_event_to(&b), None)
+        .unwrap();
 
     s.finish_replacement(&a).unwrap();
 
