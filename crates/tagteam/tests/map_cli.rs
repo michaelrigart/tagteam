@@ -5,7 +5,7 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use common::{cc_profile, cmd, two_accounts};
@@ -279,15 +279,13 @@ fn recorder(bin: &Path, name: &str) {
     fs::create_dir_all(bin).unwrap();
     let path = bin.join(name);
     let out = bin.join(format!("{name}.args"));
-    fs::write(
+    common::install_script(
         &path,
-        format!(
+        &format!(
             "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\n",
             out.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 }
 
 /// The arguments the stand-in for `name` was given, if it ran.

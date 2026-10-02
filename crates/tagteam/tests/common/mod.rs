@@ -8,7 +8,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::Read;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::sync::{Arc, Mutex};
@@ -561,10 +560,27 @@ finish "${FAKE_CLAUDE_EXIT:-0}"
 pub fn fake_claude(root: &Path) -> PathBuf {
     let bin = root.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let path = bin.join("claude");
-    fs::write(&path, FAKE_CLAUDE).unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    install_script(&bin.join("claude"), FAKE_CLAUDE);
     bin
+}
+
+/// Puts an executable script at `path` without this process ever holding a write descriptor to
+/// it. Linux refuses to `exec` a file that any process has open for writing (ETXTBSY), and a
+/// child that another test thread forked keeps a copy of every descriptor this process holds
+/// until it execs. So the body goes to a scratch file that is never run, and a short-lived
+/// `install` child, waited for before this returns, is the only process to open `path`.
+pub fn install_script(path: &Path, body: &str) {
+    let name = path.file_name().unwrap().to_string_lossy();
+    let scratch = path.with_file_name(format!(".{name}.src"));
+    fs::write(&scratch, body).unwrap();
+    let status = std::process::Command::new("install")
+        .args(["-m", "755"])
+        .arg(&scratch)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install {}: {status}", path.display());
+    fs::remove_file(&scratch).unwrap();
 }
 
 /// `bin`, then this test process's own `PATH`: what puts the fake `claude` first.
