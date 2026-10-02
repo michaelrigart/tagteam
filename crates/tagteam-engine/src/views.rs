@@ -731,13 +731,33 @@ impl Engine {
         })
     }
 
-    /// §13.5: the live login and, when tagteam manages it, its usage. No network, no Keychain,
-    /// and the store is never created. The live identity comes from `live_identity_cache`
-    /// while `Provider::live_identity_source`'s mtime and size are unchanged, and is re-parsed
-    /// only when they change. A missing, unreadable or garbled source is `NoLogin`, never an
-    /// error.
+    /// §13.5: the line's account and, when tagteam manages it, its usage. No network, no
+    /// Keychain, and the store is never created.
+    /// - In a run shell for `provider` (§12.8), the account the marker names, by id
+    ///   (`shell_account`): no `.claude.json` is parsed, the profile's or the default home's,
+    ///   and one tagteam does not manage shows nothing.
+    /// - Under an unreadable marker, nothing: the outer home is unknown (§12.8).
+    /// - Otherwise the live login, from `live_identity_cache` while
+    ///   `Provider::live_identity_source`'s mtime and size are unchanged, re-parsed only when
+    ///   they change. A missing, unreadable or garbled source is `NoLogin`, never an error.
     pub fn statusline(&self, provider: &ProviderId) -> Result<StatuslineView, EngineError> {
         let p = self.provider(provider)?;
+        match self.run_shell() {
+            RunShell::Unreadable { .. } => return Ok(StatuslineView::NoLogin),
+            RunShell::Inside { marker, .. } if &marker.provider == provider => {
+                return Ok(match self.shell_account()? {
+                    // The session's login, not the default home's: not `active`. The line
+                    // shows no pace, so none is computed, and it never asks whether the
+                    // account is in a session (Decision 17): the status bar stays away from
+                    // profile directories.
+                    ShellAccount::Managed(row) => StatuslineView::Managed {
+                        account: self.account_view_with(row, false, false, false),
+                    },
+                    ShellAccount::Unmanaged | ShellAccount::NotInShell => StatuslineView::NoLogin,
+                });
+            }
+            RunShell::Inside { .. } | RunShell::Outside => {}
+        }
         let store = self.existing_store()?;
         let Some(login) = self.live_login(p.as_ref(), store.as_deref())? else {
             return Ok(StatuslineView::NoLogin);

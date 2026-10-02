@@ -6,7 +6,8 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use common::{Fx, LSTART};
+use common::{FakeFx, Fx, LSTART};
+use serde_json::json;
 use tagteam_core::AccountId;
 use tagteam_engine::Engine;
 use tagteam_engine::views::{AccountView, ShellAccount, StatusView, StatuslineView};
@@ -182,4 +183,94 @@ fn an_unreadable_marker_is_the_refusal_that_names_it() {
         err.to_string().contains(&marker.display().to_string()),
         "{err}"
     );
+}
+
+#[test]
+fn statusline_in_a_run_shell_is_the_markers_account_and_reads_no_live_identity() {
+    // §13.5: the marker names the account; neither the profile's `.claude.json` nor the
+    // default home's is parsed, and the live-identity cache is neither read nor written.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    let profile = fx.make_profile(&a);
+    // CC's own file in the profile, garbled: parsed, it would show nothing.
+    fs::write(profile.join(".claude.json"), b"{\"oauthAccount\": ").unwrap();
+    let _launch = fx.hold_reservation(&profile);
+
+    match inside(&fx, &profile).statusline(&fx.provider()).unwrap() {
+        StatuslineView::Managed { account } => assert_eq!(
+            (account.row.id, account.active, account.in_session),
+            (a, false, false),
+            "the session's account, not the live login, and no session state computed for it \
+             (Decision 17) even with a reservation held"
+        ),
+        other => panic!("{other:?}"),
+    }
+    let cache = || {
+        fx.engine
+            .store()
+            .unwrap()
+            .live_identity_cache(&fx.provider())
+            .unwrap()
+    };
+    assert!(
+        cache().is_none(),
+        "nothing went through the live-identity cache"
+    );
+
+    match fx.engine.statusline(&fx.provider()).unwrap() {
+        StatuslineView::Managed { account } => assert_eq!(account.row.id, b),
+        other => panic!("{other:?}"),
+    }
+    assert!(cache().is_some(), "outside, the live login goes through it");
+}
+
+#[test]
+fn statusline_in_a_run_shell_of_an_account_tagteam_does_not_manage_shows_nothing() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a"); // live: never shown in the session's place
+    let profile = fx.make_profile_for(fx.cc.as_ref(), &AccountId::from_string("0192-gone"));
+    assert!(matches!(
+        inside(&fx, &profile).statusline(&fx.provider()).unwrap(),
+        StatuslineView::NoLogin
+    ));
+}
+
+#[test]
+fn statusline_under_an_unreadable_marker_shows_nothing_and_parses_no_profile() {
+    // §12.8: the outer home is unknown. The environment still names the profile, whose own
+    // `.claude.json` names a: a parse of it would show a's line.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let profile = fx.make_profile(&a);
+    let login = json!({"oauthAccount": Fx::oauth_account("a@x.co")});
+    fs::write(profile.join(".claude.json"), login.to_string()).unwrap();
+    fs::write(profile.join(MARKER_FILE), b"[").unwrap();
+    assert!(matches!(
+        inside(&fx, &profile).statusline(&fx.provider()).unwrap(),
+        StatuslineView::NoLogin
+    ));
+}
+
+#[test]
+fn statusline_for_another_provider_in_a_run_shell_is_that_providers_live_login() {
+    // The marker names Claude Code's session: FakeAgent's line is still its own live login,
+    // read in the outer home.
+    let ffx = FakeFx::new();
+    let a = ffx.fx.add("a@x.co", "rt-a");
+    ffx.fx.add("b@x.co", "rt-b");
+    let alice = ffx.fake_add("alice", "tok-a", "renew-a");
+    let profile = ffx.fx.make_profile(&a);
+    let engine = ffx.engine_located(ffx.fx.shell_env(&profile));
+    match engine.statusline(&ffx.fake_provider()).unwrap() {
+        StatuslineView::Managed { account } => {
+            assert_eq!((account.row.id, account.active), (alice, true))
+        }
+        other => panic!("{other:?}"),
+    }
+    match engine.statusline(&ffx.fx.provider()).unwrap() {
+        StatuslineView::Managed { account } => assert_eq!(account.row.id, a),
+        other => panic!("{other:?}"),
+    }
 }

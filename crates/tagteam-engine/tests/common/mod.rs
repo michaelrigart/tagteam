@@ -1206,6 +1206,29 @@ impl FakeFx {
         ProviderId::new(FAKE_AGENT)
     }
 
+    /// An engine for a process whose environment is `env`, over the registry `FakeFx::new` builds
+    /// (Claude Code, then FakeAgent), located as the CLI locates one: `detect_run_shell` decides
+    /// the run shell and the environment the engine runs on (§12.8). Everything else is as
+    /// `FakeFx::new` builds its engine, including the fixture's process probe.
+    pub fn engine_located(&self, env: Env) -> Engine {
+        let registry = ProviderRegistry::new()
+            .with(self.fx.cc.clone())
+            .with(self.fake.clone());
+        let (run_shell, env) = detect_run_shell(&env, &registry);
+        Engine::new(EngineConfig {
+            env,
+            registry,
+            vault: Vault::new(Box::new(KeychainVault::new(self.fx.kc.clone()))),
+            oracle: self.fx.oracle.clone(),
+            clock: self.fx.clock.clone(),
+            default_provider: ProviderId::new(CLAUDE_CODE),
+            http: self.fx.http.clone(),
+            settings: Settings::default(),
+            process: self.fx.process.clone(),
+            run_shell,
+        })
+    }
+
     /// What logging in to FakeAgent as `handle`, in workspace `ws`, leaves behind.
     pub fn fake_login(&self, handle: &str, token: &str, renew: &str) {
         tagteam_fake::login(&self.fx.env, handle, "ws", token, renew);
