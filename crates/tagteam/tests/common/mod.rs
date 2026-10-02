@@ -4,8 +4,12 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Output, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
@@ -255,4 +259,102 @@ pub fn live_email(root: &Path) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+/// A running binary whose stdout and stderr are read on threads of their own while it runs, so
+/// one that prints without end (an `auto` loop) never blocks on a full pipe, and what it has
+/// printed so far can be read at any time.
+pub struct Running {
+    pub child: Child,
+    out: Arc<Mutex<Vec<u8>>>,
+    err: Arc<Mutex<Vec<u8>>>,
+    readers: Vec<JoinHandle<()>>,
+}
+
+impl Running {
+    /// Spawns `cmd` with its stdout and stderr piped, each drained on a thread of its own.
+    pub fn spawn(mut cmd: std::process::Command) -> Self {
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (out, err) = (Arc::default(), Arc::default());
+        let readers = vec![
+            drain(child.stdout.take().unwrap(), Arc::clone(&out)),
+            drain(child.stderr.take().unwrap(), Arc::clone(&err)),
+        ];
+        Running {
+            child,
+            out,
+            err,
+            readers,
+        }
+    }
+
+    /// Everything it has printed on stdout so far.
+    pub fn stdout(&self) -> String {
+        String::from_utf8_lossy(&self.out.lock().unwrap()).into_owned()
+    }
+
+    /// Polls every 10 ms until `ready` holds for its stdout so far. Fails the test if it exits
+    /// first, or if `within` passes (killing it, so a hung one is not left behind).
+    pub fn wait_for(&mut self, within: Duration, what: &str, ready: impl Fn(&str) -> bool) {
+        let deadline = Instant::now() + within;
+        while !ready(&self.stdout()) {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!("tagteam exited ({status}) before {what}");
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                panic!("tagteam never got to {what}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Sends `signal`, as a terminal's Ctrl-C (SIGINT) or `kill` would.
+    pub fn signal(&self, signal: i32) {
+        // SAFETY: kill(2) reads no memory of ours. The child is one this test spawned and has
+        // not reaped, so its pid names it and no other process.
+        let rc = unsafe { libc::kill(self.child.id() as libc::pid_t, signal) };
+        assert_eq!(rc, 0, "kill: {}", std::io::Error::last_os_error());
+    }
+
+    /// Its status and everything it printed, once it has exited. Fails the test, killing it,
+    /// if it is still running after `within`.
+    pub fn finish(mut self, within: Duration) -> Output {
+        let deadline = Instant::now() + within;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                panic!("tagteam was still running {within:?} later");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        for reader in self.readers.drain(..) {
+            reader.join().unwrap();
+        }
+        Output {
+            status,
+            stdout: std::mem::take(&mut *self.out.lock().unwrap()),
+            stderr: std::mem::take(&mut *self.err.lock().unwrap()),
+        }
+    }
+}
+
+/// Reads `from` until its end into `into`, on a thread of its own.
+fn drain(mut from: impl Read + Send + 'static, into: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = from.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            into.lock().unwrap().extend_from_slice(&buf[..n]);
+        }
+    })
 }
