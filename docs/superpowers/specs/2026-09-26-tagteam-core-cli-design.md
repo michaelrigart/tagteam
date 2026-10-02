@@ -1913,9 +1913,13 @@ The profile is `$XDG_DATA_HOME/tagteam/sessions/<id>/`.
 item from exactly that string and, since 2.1.286, tries no other spelling (Appendix A.2). The
 spelling is recorded in the profile marker, and every operation on the profile's credential
 (bootstrap, validation, capture, the session-owned usage read, and the hashed-item deletion in
-`remove` and `purge`) uses the recorded spelling, never one derived again. A profile whose
-canonical path no longer matches its recorded spelling, because the data directory moved,
-needs a bootstrap (§12.3), which also deletes the item under the old spelling.
+`remove` and `purge`) names the profile's Keychain item from the recorded spelling, never from
+one derived again. The spelling names only the item: the profile's files, `.credentials.json`
+and `.claude.json` among them, are always found in the profile's actual directory, which is
+what `<profile>` means everywhere in this spec. Once the data directory has moved, that
+directory is no longer at the spelling. A profile whose canonical path no longer matches its recorded spelling,
+because the data directory moved, needs a bootstrap (§12.3), which also deletes the item under
+the old spelling.
 
 **Profile marker.** `<profile>/.tagteam-profile.json` holds `{"format": "tagteam-profile",
 "version": 1, "provider", "accountId", "configDir", "outer"}`. `configDir` is the exported
@@ -2185,7 +2189,8 @@ Removing `CLAUDE_SECURESTORAGE_CONFIG_DIR` makes the secure-storage dir resolve 
 (Appendix A.1). Set to an empty string, it would send CC to the default `~/.claude` credentials;
 set to anything else, it would redirect them. Every profile credential operation (bootstrap,
 validation, capture, the session-owned usage read, and the hashed-item deletion in `remove`)
-resolves paths with this same environment and the recorded spelling (§12.2).
+resolves paths with this same environment: the Keychain item from the recorded spelling, and
+the files from the profile's actual directory (§12.2).
 
 **When the child exits**, under `MutationGuard`, then the account lock:
 - If the profile is quiescent apart from this process's own reservation, this is the last
@@ -3549,8 +3554,9 @@ Each is a one-liner, and each gets at least one test.
 57. A run shell is recognized from its profile marker alone, and inside one tagteam resolves
     the provider's home from the marker: the live login it reads, refreshes or protects is
     always the default home's (§12.8).
-58. A profile is exported under one recorded spelling, and every operation on its credential
-    uses that spelling (§12.2).
+58. A profile is exported under one recorded spelling. Every operation on its credential names
+    the Keychain item from that spelling, and finds the profile's files in its actual directory
+    (§12.2).
 59. A profile shares only allowlisted entries of the source home. Unknown entries stay private,
     and known-private entries (credentials, config, daemon state, account caches, org policy,
     tokens and locks) are never linked (§12.2).
