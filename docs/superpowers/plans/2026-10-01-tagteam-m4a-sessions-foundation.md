@@ -97,6 +97,29 @@ When execution starts, these names come from M3a's merged code. The task text be
 - **Task 15.** The statusline branch stays `return Ended::Code(run_statusline(..))`.
 - **Test counts.** Task 6's `--lib flock` passes 8 tests, and Task 13's `--test profiles` passes 21.
 
+**Rulings during Tasks 1–9:**
+- **`delete_profile_credential` takes the profile's actual directory** (Task 7). It is `delete_profile_credential(env, dir, spelling)`, and `delete_items(env, paths)` follows suit. Any delete holds the storage-write lock, anchored at the actual directory. When that path is not a real directory, the item is deleted without the lock: a missing directory, a regular file, a symlink.
+- **`remove` still finishes when the profile path resolves to nothing** (Task 9). If the marker is absent, unreadable, or names another account, and the path does not resolve:
+  - the item delete is skipped, with Decision 12's warning;
+  - the path is removed as a link, and the row then goes.
+- **`add_token` keeps refusing while the live identity is unreadable**, even for a new account (Task 2, Decision 18).
+
+**Rebase onto M3b and the release pipeline (2026-10-02).** After Task 9, Michael asked for the branch to be rebased onto `main` at `c6329e1`. That point includes M3b (PR #5) and the release pipeline (PR #3). The conflicts were resolved keeping both sides:
+- `commit_switch` carries both M3b's record and the activation epoch.
+- §15.4 takes M5's text.
+
+Three fallout commits (`216de97`, `c8cb266`, `2ee5791`) keep `auto`'s run-shell refusal working through Task 8's detection, and fit each side's tests to the other.
+
+M3b's seams with Tasks 10–17:
+- **Task 11, session-owned targets.** It fills `AccountSnapshot.session_owned` from `session_state` (§11.2 step 7). `auto_refusal` refuses a session-owned target as `NotCandidate`, so the tick moves on to the next target.
+- **Task 11, conflicted targets.** `perform` passes over a target whose switch returns `ProfileConflict`, as `freshen_auto` already does for the gate's `Conflict`. §11.2 step 10 names only `Owned`, so this extends it in the safe direction.
+- **Task 12.** Its collector goes in as a delta onto M3b's `Policy`/`Roles`/`Outcome`, keeping every cancellation point. `scheduled_candidates` uses `switch_candidate`.
+- **Task 13.** M3b's unread-settings-key test moves from `share_extra` to another key.
+- **Task 15.** It skips the dev-dependency M3b already added.
+- **Task 16.** It adds a FakeAgent tick test.
+- **Task 17.** It also runs the engine's `test-hooks` suite, and skips PR #3's network tests (`tls_live`) in its `--ignored` pass.
+- **The compat lists.** `crates/tagteam-cc/compat/known-{shared,private}` match `CC_MUST_SHARE` + `CC_SHARED` and `CC_PRIVATE`.
+
 ## Milestones
 
 | Milestone | Scope |
