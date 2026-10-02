@@ -307,6 +307,43 @@ fn the_loop_stops_cleanly_on_sigterm_and_sigint_after_a_tick() {
 }
 
 #[test]
+fn the_loop_stops_by_itself_once_its_output_has_no_reader() {
+    // `tagteam auto --json | head -n 1`: Rust ignores SIGPIPE, so the write fails instead, and
+    // that stops the command as SIGPIPE would, at the loop's next cancellation point: exit 0, no
+    // lock left behind (so a restarted consumer is not told `engine-running`). The shortest
+    // interval, so the tick after the reader left comes soon.
+    let d = tempfile::tempdir().unwrap();
+    staying(d.path());
+    let running =
+        Running::spawn_closing_stdout_after(auto_cmd(d.path(), &["--json", "--interval", "15"]), 1);
+    let out = running.finish(Duration::from_secs(40));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).starts_with(r#"{"schemaVersion":1,"event":"poll""#),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(text(&out.stderr), "");
+    let paths = CcPaths::resolve(&Env::for_test(d.path()));
+    for lock in [
+        paths.refresh_lock.clone(),
+        paths.legacy_lock(),
+        paths.config_lock.clone(),
+        paths.storage_write_lock.clone(),
+    ] {
+        assert!(!lock.exists(), "{} was left behind", lock.display());
+    }
+    // The engine lock is free: a restarted consumer's tick runs.
+    let out = auto(d.path(), &["--once", "--json"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains(r#""reason":"below-threshold""#),
+        "{}",
+        text(&out.stdout)
+    );
+}
+
+#[test]
 fn a_second_loop_refuses_and_once_reports_engine_running_while_one_runs() {
     // Review Focus 3, the CLI's half: one engine per provider per machine (§11.1). Nothing is
     // ticked twice: the refused runs never poll.
