@@ -582,8 +582,9 @@ fn fail(io: &mut Io<'_>, json: bool, kind: &str, message: &str) -> i32 {
 
 /// §13.5's fast path, taken before `build_engine`: no lock check, no settings warnings (a status
 /// bar has nowhere to show them), and an engine walled off from the Keychain and the network
-/// (`statusline::engine`). `main_with_args` has already drained stdin. Under a marker that
-/// cannot be read it prints nothing (§12.8).
+/// (`statusline::engine`), which detects the run shell itself and resolves the provider in
+/// Decision 13's order. An unreadable marker shows nothing and exits 0 (§12.8).
+/// `main_with_args` has already drained stdin.
 fn run_statusline(
     ctx: Context,
     io: &mut Io<'_>,
@@ -596,13 +597,8 @@ fn run_statusline(
         fail(io, true, KIND_USAGE, STATUSLINE_UNDER_JSON);
         return EXIT_USAGE;
     }
-    let provider = provider.map_or_else(|| ProviderId::new(CLAUDE_CODE), ProviderId::new);
     let (no_color_env, force_color_env) = (ctx.no_color_env, ctx.force_color_env);
-    let (engine, _http, _keychain) = statusline::engine(ctx, &provider);
-    // The outer home is unknown, so the status bar shows nothing rather than a guess.
-    if matches!(engine.run_shell(), RunShell::Unreadable { .. }) {
-        return 0;
-    }
+    let (engine, provider, _http, _keychain) = statusline::engine(ctx, provider.as_deref());
     let result = statusline_supported(&engine, &provider).and_then(|()| {
         if print_config {
             let _ = writeln!(io.err, "{}", statusline::config_hint(engine.env()));
