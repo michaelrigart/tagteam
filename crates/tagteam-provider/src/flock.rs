@@ -75,15 +75,16 @@ impl FlockGuard {
 pub enum LockProbe {
     /// No file at the path.
     Missing,
-    /// The file exists and nothing holds its lock.
+    /// The file exists and nothing holds an exclusive lock on it.
     Free,
-    /// Another open file description holds its lock.
+    /// Another open file description holds an exclusive lock on it, as a launcher does.
     Held,
 }
 
 /// Tests `path` with a non-blocking `flock`, opening it read-only and never creating it. A
 /// reservation is only ever tested, never waited on (§12.5), so a lock this takes is released
-/// before it returns.
+/// before it returns. The test is a shared lock: a launcher holds an exclusive one, which it
+/// still sees, and two probes of one file never see each other as a holder.
 pub fn probe_lock(path: &Path) -> io::Result<LockProbe> {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -91,7 +92,7 @@ pub fn probe_lock(path: &Path) -> io::Result<LockProbe> {
         Err(e) => return Err(e),
     };
     // SAFETY: `file` owns a valid descriptor for the duration of the call.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
     if rc == 0 {
         // SAFETY: as above; this releases the lock the probe just took.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
@@ -187,6 +188,31 @@ mod tests {
             FlockGuard::try_lock(&p).unwrap().is_some(),
             "the probe released what it took"
         );
+    }
+
+    #[test]
+    fn two_simultaneous_probes_of_a_free_lock_both_see_it_free() {
+        // One probe is between its `flock` and its unlock, as `probe_lock` is for an instant,
+        // when the other runs: neither may take the other for a launcher (§12.5).
+        let _fork = crate::FORK_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("42.lock");
+        fs::write(&p, b"").unwrap();
+        let first = File::open(&p).unwrap();
+        // SAFETY: `first` owns a valid descriptor for the duration of the call.
+        let rc = unsafe { libc::flock(first.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "a free file takes a shared lock");
+        assert_eq!(probe_lock(&p).unwrap(), LockProbe::Free);
+        drop(first);
+        let held = FlockGuard::try_lock(&p).unwrap().unwrap();
+        assert_eq!(
+            probe_lock(&p).unwrap(),
+            LockProbe::Held,
+            "a launcher's exclusive lock still shows"
+        );
+        drop(held);
     }
 
     #[test]
