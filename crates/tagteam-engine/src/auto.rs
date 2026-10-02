@@ -350,7 +350,10 @@ impl AutoEngine<'_> {
         let mut decided = decide(&snap, &state, &self.cfg, Phase::Initial);
         if let Decision::Switch { recheck: true, .. } = &decided.decision {
             // Decision 2: re-check the current account and every candidate, then decide again
-            // from what the store holds now, with the same state.
+            // from what the store holds now, with the same state. The re-check skips a reading
+            // at most 180 s old when it begins, so the decision judges freshness from then:
+            // the time the re-check itself takes must not make that reading stale (§8.3).
+            let began = snap.now;
             let report = self.engine.collect_usage(CollectMode::Recheck {
                 accounts: recheck_ids(&snap, &live.id),
                 threshold: self.cfg.threshold,
@@ -358,7 +361,10 @@ impl AutoEngine<'_> {
             })?;
             accounts = self.read(&store)?;
             self.report_collection(&report, &accounts, sink);
-            snap = self.snapshot(p, &accounts, &live.id);
+            snap = Snapshot {
+                now: began,
+                ..self.snapshot(p, &accounts, &live.id)
+            };
             decided = decide(&snap, &state, &self.cfg, Phase::Rechecked);
         }
         self.judged = Some(live.id.clone());
