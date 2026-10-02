@@ -3,12 +3,24 @@
 //! recorded spelling for its Keychain items, its actual directory for its files (Decision 19).
 
 use std::ffi::OsString;
+use std::fs;
+use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use serde_json::{Value, json};
-use tagteam_provider::{EntryKind, Env, ProviderError};
+use tagteam_core::merge::{MergeKey, three_way};
+use tagteam_provider::atomic::{write_atomic_private_with, write_atomic_with};
+use tagteam_provider::profile::read_own_bytes;
+use tagteam_provider::splice::{self, SpliceError};
+use tagteam_provider::{
+    Cancel, EntryKind, Env, Identity, LiveLockSet, MergeReport, ProviderError, Read,
+};
 
+use crate::config::read_bytes;
+use crate::locks;
 use crate::paths::CcPaths;
+use crate::provider::CONFIG_REMEDY;
 
 pub(crate) const CC_SHARED: &[&str] = &[
     "CLAUDE.md",
@@ -145,4 +157,235 @@ pub(crate) fn profile_paths(env: &Env, dir: &Path) -> CcPaths {
     at.claude_config_dir = Some(dir.as_os_str().to_owned());
     at.claude_securestorage_config_dir = None;
     CcPaths::resolve(&at)
+}
+
+/// §12.4: the seed's record of the `projects` and `mcpServers` it put in the profile.
+pub(crate) const BASELINE_FILE: &str = ".tagteam-baseline.json";
+const BASELINE_FORMAT: &str = "tagteam-baseline";
+
+/// What to do about a profile's own `.claude.json` that cannot be spliced. `CONFIG_REMEDY`
+/// names `~/.claude/backups/`, which holds the default home's backups, not the profile's.
+const PROFILE_CONFIG_REMEDY: &str =
+    "repair it, or remove it so the next launch seeds a new one, then retry";
+
+/// The `theme` a seed sets when neither the profile nor the default file has one (§12.4).
+const DEFAULT_THEME: &str = "dark";
+
+const PROJECTS: &str = "projects";
+const MCP_SERVERS: &str = "mcpServers";
+
+fn unsplicable(path: &Path, remedy: &'static str) -> ProviderError {
+    ProviderError::ConfigUnsplicable {
+        path: path.to_path_buf(),
+        remedy,
+    }
+}
+
+/// `key` set to `value` in `doc`, or removed when `value` is `None`.
+fn put(doc: &[u8], key: &str, value: Option<&Value>) -> Result<Vec<u8>, SpliceError> {
+    match value {
+        Some(v) => splice::replace_top_level(doc, key, v),
+        None => splice::remove_top_level(doc, key),
+    }
+}
+
+/// One top-level value of `doc`, `Null` when absent (`three_way`'s convention).
+fn top(doc: &[u8], key: &str) -> Result<Value, SpliceError> {
+    Ok(splice::get_top_level(doc, key)?.unwrap_or(Value::Null))
+}
+
+/// §12.4's seed of the profile in `dir`, under its own config lock. From the profile's current
+/// file, or `{}`: copy `projects` and top-level `mcpServers` from the outer home's global config
+/// (`env`), their absence included; set `oauthAccount` from `identity`, `hasCompletedOnboarding:
+/// true`, and `theme` when the profile has none (the default file's, else "dark"). Then write the
+/// baseline, exactly the `projects` and `mcpServers` the profile now holds. The config goes
+/// first, so a seed that stops between the two leaves no baseline over an unseeded file.
+pub(crate) fn seed(
+    env: &Env,
+    dir: &Path,
+    identity: &Identity,
+    budget: Duration,
+) -> Result<(), ProviderError> {
+    // CC replaces the outer file by rename, so this read sees one whole version unlocked.
+    let outer = CcPaths::resolve(env).global_config;
+    let (projects, servers, theme) = match read_bytes(&outer) {
+        Read::Present(b) => {
+            let torn = |_: SpliceError| unsplicable(&outer, CONFIG_REMEDY);
+            (
+                splice::get_top_level(&b, PROJECTS).map_err(torn)?,
+                splice::get_top_level(&b, MCP_SERVERS).map_err(torn)?,
+                splice::get_top_level(&b, "theme").map_err(torn)?,
+            )
+        }
+        Read::Absent => (None, None, None),
+        Read::Unreadable(_) => return Err(unsplicable(&outer, CONFIG_REMEDY)),
+    };
+    let paths = profile_paths(env, dir);
+    let lock = locks::acquire_config(&paths, budget, &env.cancel)?;
+    let fence = || lock.check_owned().map_err(ProviderError::from);
+    let config = &paths.global_config;
+    let torn = |_: SpliceError| unsplicable(config, PROFILE_CONFIG_REMEDY);
+    let before = match read_bytes(config) {
+        Read::Present(b) => Some(b),
+        Read::Absent => None,
+        Read::Unreadable(_) => return Err(unsplicable(config, PROFILE_CONFIG_REMEDY)),
+    };
+    let start = before.clone().unwrap_or_else(|| b"{}\n".to_vec());
+    let has_theme = splice::get_top_level(&start, "theme")
+        .map_err(torn)?
+        .is_some();
+    let mut new = put(&start, PROJECTS, projects.as_ref()).map_err(torn)?;
+    new = put(&new, MCP_SERVERS, servers.as_ref()).map_err(torn)?;
+    new = splice::replace_top_level(&new, "oauthAccount", &identity.raw).map_err(torn)?;
+    new = splice::replace_top_level(&new, "hasCompletedOnboarding", &Value::Bool(true))
+        .map_err(torn)?;
+    if !has_theme {
+        let theme = theme.unwrap_or_else(|| json!(DEFAULT_THEME));
+        new = splice::replace_top_level(&new, "theme", &theme).map_err(torn)?;
+    }
+    if before.as_deref() != Some(new.as_slice()) {
+        write_atomic_with(config, &new, 0o600, fence)?;
+    }
+    let baseline = json!({
+        "format": BASELINE_FORMAT,
+        "version": 1,
+        "projects": projects.unwrap_or(Value::Null),
+        "mcpServers": servers.unwrap_or(Value::Null),
+    });
+    let mut bytes = serde_json::to_vec_pretty(&baseline).expect("a Value always serializes");
+    bytes.push(b'\n');
+    write_atomic_private_with(&dir.join(BASELINE_FILE), &bytes, 0o600, fence)
+}
+
+/// §12.4: a baseline is waiting in `dir`, from a session whose merge-back never ran. One that
+/// cannot even be looked at counts as waiting: its merge-back then fails, and nothing seeds
+/// over it.
+pub(crate) fn has_baseline(dir: &Path) -> bool {
+    match fs::symlink_metadata(dir.join(BASELINE_FILE)) {
+        Ok(_) => true,
+        Err(e) => !matches!(
+            e.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        ),
+    }
+}
+
+/// The baseline's `projects` and `mcpServers`; `None` when there is none. One that cannot be
+/// read, or is not a version 1 tagteam baseline, is an error: the merge-back cannot run without
+/// it, and nothing may seed over it (§12.4). It is one of tagteam's own files, so a link at its
+/// path that resolves to nothing, or crosses a file, is unreadable, never absent (M4a's rule).
+fn read_baseline(dir: &Path) -> Result<Option<(Value, Value)>, ProviderError> {
+    let bytes = match read_own_bytes(dir, BASELINE_FILE) {
+        Read::Present(b) => b,
+        Read::Absent => return Ok(None),
+        Read::Unreadable(e) => return Err(ProviderError::Unreadable(e)),
+    };
+    let invalid = || {
+        ProviderError::Invalid(format!(
+            "{} is not a tagteam baseline; remove it to drop the session's unmerged changes",
+            dir.join(BASELINE_FILE).display()
+        ))
+    };
+    let v: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    if v["format"].as_str() != Some(BASELINE_FORMAT) || v["version"].as_i64() != Some(1) {
+        return Err(invalid());
+    }
+    match (v.get(PROJECTS), v.get(MCP_SERVERS)) {
+        (Some(p), Some(m)) => Ok(Some((p.clone(), m.clone()))),
+        _ => Err(invalid()),
+    }
+}
+
+fn remove_baseline(path: &Path) -> Result<(), ProviderError> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// A merged key as the summary's log names it (§12.4 step 3): the path JSON-quoted, since a
+/// path may hold dots.
+fn key_name(k: &MergeKey) -> String {
+    let quoted = |s: &str| serde_json::to_string(s).expect("a string always serializes");
+    match k {
+        MergeKey::Project { path, key } => format!("projects[{}].{key}", quoted(path)),
+        MergeKey::McpServer { name } => format!("mcpServers[{}]", quoted(name)),
+    }
+}
+
+/// §12.4's merge-back of the profile in `dir`. The profile is quiescent (the caller holds
+/// `MutationGuard` and the account lock), so its file and baseline are read without a lock. The
+/// default home's global config is then read, merged and written under its config lock alone
+/// (§4.3), waited for under `cancel`: one write replacing the `projects` and `mcpServers` spans,
+/// skipped when nothing was applied. The baseline goes last. Any failure before that leaves it,
+/// and the profile, as they were.
+pub(crate) fn merge_back(
+    env: &Env,
+    dir: &Path,
+    budget: Duration,
+    cancel: &Cancel,
+) -> Result<MergeReport, ProviderError> {
+    let Some(base) = read_baseline(dir)? else {
+        return Ok(MergeReport::default());
+    };
+    let baseline_path = dir.join(BASELINE_FILE);
+    let profile = profile_paths(env, dir).global_config;
+    let mine = match read_bytes(&profile) {
+        Read::Present(b) => {
+            let torn = |_: SpliceError| unsplicable(&profile, PROFILE_CONFIG_REMEDY);
+            (
+                top(&b, PROJECTS).map_err(torn)?,
+                top(&b, MCP_SERVERS).map_err(torn)?,
+            )
+        }
+        Read::Absent => {
+            tracing::warn!(
+                "{} is gone, so its session has nothing to merge back",
+                profile.display()
+            );
+            remove_baseline(&baseline_path)?;
+            return Ok(MergeReport::default());
+        }
+        Read::Unreadable(_) => return Err(unsplicable(&profile, PROFILE_CONFIG_REMEDY)),
+    };
+    let paths = CcPaths::resolve(env);
+    let lock = locks::acquire_config(&paths, budget, cancel)?;
+    let fence = || lock.check_owned().map_err(ProviderError::from);
+    let config = &paths.global_config;
+    let torn = |_: SpliceError| unsplicable(config, CONFIG_REMEDY);
+    let before = match read_bytes(config) {
+        Read::Present(b) => Some(b),
+        Read::Absent => None,
+        Read::Unreadable(_) => return Err(unsplicable(config, CONFIG_REMEDY)),
+    };
+    let theirs = match &before {
+        Some(b) => (
+            top(b, PROJECTS).map_err(torn)?,
+            top(b, MCP_SERVERS).map_err(torn)?,
+        ),
+        None => (Value::Null, Value::Null),
+    };
+    let merged = three_way(
+        (&base.0, &base.1),
+        (&mine.0, &mine.1),
+        (&theirs.0, &theirs.1),
+    );
+    if merged.projects.is_some() || merged.mcp_servers.is_some() {
+        // §9.5: a missing file is created holding only the merged keys.
+        let mut new = before.unwrap_or_else(|| b"{}\n".to_vec());
+        if let Some(v) = &merged.projects {
+            new = splice::replace_top_level(&new, PROJECTS, v).map_err(torn)?;
+        }
+        if let Some(v) = &merged.mcp_servers {
+            new = splice::replace_top_level(&new, MCP_SERVERS, v).map_err(torn)?;
+        }
+        write_atomic_with(config, &new, 0o600, fence)?;
+    }
+    // The config lock covers only the default file.
+    drop(lock);
+    remove_baseline(&baseline_path)?;
+    Ok(MergeReport {
+        applied: merged.applied.len(),
+        conflicts: merged.conflicts.iter().map(key_name).collect(),
+    })
 }

@@ -806,3 +806,563 @@ fn claude_code_invoked_a_process_that_has_claudecode_1_or_a_config_dir() {
     assert!(f.cc.invoked_by(&with_vars(&f.env, Some("/p"), None)));
     assert!(!f.cc.invoked_by(&with_vars(&f.env, Some(""), None)));
 }
+
+/// `path`'s permission bits.
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// Holds a `mkdir` lock at `path` for `for_ms`, as another process would, then lets it go.
+fn hold(path: &Path, for_ms: u64) -> std::thread::JoinHandle<()> {
+    fs::create_dir(path).unwrap();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(for_ms));
+        fs::remove_dir(&path).unwrap();
+    })
+}
+
+mod seed_and_merge_back {
+    //! §12.4: the seed of a profile's `.claude.json` from the default file, and the three-way
+    //! merge of its `projects` and `mcpServers` back into it (Review Focus 4).
+
+    use super::*;
+    use std::thread;
+    use std::time::Instant;
+
+    use serde_json::Value;
+    use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
+    use tagteam_provider::{Cancel, Identity, LockError, MergeReport};
+
+    /// The default home's `~/.claude.json` as CC writes it: keys before, between and after the
+    /// two subtrees a merge-back may touch, and a number serde would re-render if anything ever
+    /// re-serialized the file.
+    const DEFAULT_JSON: &str = r#"{
+  "numStartups": 3,
+  "projects": {
+    "/work/app": {
+      "allowedTools": [],
+      "hasTrustDialogAccepted": false
+    },
+    "/work/lib": {
+      "allowedTools": [
+        "Bash"
+      ]
+    }
+  },
+  "userID": "default-user",
+  "mcpServers": {
+    "local": {
+      "command": "srv"
+    },
+    "remote": {
+      "url": "https://mcp.example"
+    }
+  },
+  "theme": "light",
+  "someFutureKey": {
+    "n": 1e400
+  }
+}
+"#;
+
+    fn account(f: &Fx) -> Identity {
+        f.cc.parse_identity(
+            &json!({"emailAddress": "p@x.co", "organizationUuid": "org-1", "accountUuid": "acct-1"}),
+        )
+        .unwrap()
+    }
+
+    fn default_config(f: &Fx) -> PathBuf {
+        f.env.home.join(".claude.json")
+    }
+
+    fn json_at(path: &Path) -> Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    fn top(doc: &[u8], key: &str) -> Option<Value> {
+        get_top_level(doc, key).unwrap()
+    }
+
+    /// `doc` without these top-level keys: the bytes that must not move (§3, §9.5).
+    fn strip(doc: &[u8], keys: &[&str]) -> Vec<u8> {
+        keys.iter()
+            .fold(doc.to_vec(), |d, k| remove_top_level(&d, k).unwrap())
+    }
+
+    /// Replaces one top-level value of the file at `path`, as a CC session rewriting it does.
+    fn edit(path: &Path, key: &str, value: Value) {
+        let doc = fs::read(path).unwrap();
+        fs::write(path, replace_top_level(&doc, key, &value).unwrap()).unwrap();
+    }
+
+    /// A profile seeded over `DEFAULT_JSON`. Returns its directory.
+    fn seeded(f: &Fx) -> PathBuf {
+        fs::write(default_config(f), DEFAULT_JSON).unwrap();
+        let (dir, _) = profile(f, "0192");
+        f.cc.seed_profile(&f.env, &dir, &account(f)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_profile_with_no_file_is_seeded_from_nothing() {
+        let f = fx();
+        fs::write(default_config(&f), DEFAULT_JSON).unwrap();
+        let (dir, _) = profile(&f, "0192");
+        assert!(!f.cc.has_baseline(&dir));
+
+        f.cc.seed_profile(&f.env, &dir, &account(&f)).unwrap();
+
+        let config = dir.join(".claude.json");
+        let v = json_at(&config);
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "projects",
+                "mcpServers",
+                "oauthAccount",
+                "hasCompletedOnboarding",
+                "theme"
+            ]
+        );
+        let default = DEFAULT_JSON.as_bytes();
+        assert_eq!(Some(v["projects"].clone()), top(default, "projects"));
+        assert_eq!(Some(v["mcpServers"].clone()), top(default, "mcpServers"));
+        assert_eq!(v["oauthAccount"], account(&f).raw);
+        assert_eq!(v["hasCompletedOnboarding"], json!(true));
+        assert_eq!(v["theme"], json!("light"), "the default file's theme");
+        assert_eq!(mode(&config), 0o600);
+        assert!(f.cc.has_baseline(&dir));
+        let baseline = dir.join(".tagteam-baseline.json");
+        assert_eq!(mode(&baseline), 0o600);
+        assert_eq!(
+            json_at(&baseline),
+            json!({
+                "format": "tagteam-baseline", "version": 1,
+                "projects": v["projects"], "mcpServers": v["mcpServers"]
+            })
+        );
+        assert_eq!(
+            fs::read(default_config(&f)).unwrap(),
+            default,
+            "a seed never writes the default file"
+        );
+    }
+
+    #[test]
+    fn the_seed_overwrites_the_profile_s_own_subtrees_and_keeps_its_other_keys_and_theme() {
+        let f = fx();
+        fs::write(default_config(&f), DEFAULT_JSON).unwrap();
+        let (dir, _) = profile(&f, "0192");
+        let config = dir.join(".claude.json");
+        let own = r#"{
+  "userID": "profile-user",
+  "projects": {
+    "/stale": {
+      "allowedTools": []
+    }
+  },
+  "theme": "dark-daltonized",
+  "mcpServers": {},
+  "oauthAccount": {
+    "emailAddress": "old@x.co"
+  },
+  "machineID": "m-1"
+}
+"#;
+        fs::write(&config, own).unwrap();
+        fs::set_permissions(&config, std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+
+        f.cc.seed_profile(&f.env, &dir, &account(&f)).unwrap();
+
+        let after = fs::read(&config).unwrap();
+        let default = DEFAULT_JSON.as_bytes();
+        assert_eq!(top(&after, "projects"), top(default, "projects"));
+        assert_eq!(top(&after, "mcpServers"), top(default, "mcpServers"));
+        assert_eq!(top(&after, "oauthAccount"), Some(account(&f).raw));
+        assert_eq!(top(&after, "hasCompletedOnboarding"), Some(json!(true)));
+        assert_eq!(
+            top(&after, "theme"),
+            Some(json!("dark-daltonized")),
+            "a profile's own theme is kept"
+        );
+        let spliced = [
+            "projects",
+            "mcpServers",
+            "oauthAccount",
+            "hasCompletedOnboarding",
+        ];
+        assert_eq!(
+            strip(&after, &spliced),
+            strip(own.as_bytes(), &spliced),
+            "every other byte, userID and machineID included"
+        );
+        assert_eq!(mode(&config), 0o640, "CC's file keeps its mode (§9.5)");
+    }
+
+    #[test]
+    fn a_seed_with_no_theme_anywhere_sets_dark_and_copies_the_default_s_absence() {
+        let f = fx();
+        fs::write(default_config(&f), "{\n  \"userID\": \"u\"\n}\n").unwrap();
+        let (dir, _) = profile(&f, "0192");
+        fs::write(
+            dir.join(".claude.json"),
+            "{\n  \"projects\": {\n    \"/stale\": {}\n  },\n  \"mcpServers\": {}\n}\n",
+        )
+        .unwrap();
+
+        f.cc.seed_profile(&f.env, &dir, &account(&f)).unwrap();
+
+        let v = json_at(&dir.join(".claude.json"));
+        assert_eq!(
+            v.get("projects"),
+            None,
+            "the default has none, so the profile keeps none"
+        );
+        assert_eq!(v.get("mcpServers"), None);
+        assert_eq!(v["theme"], json!("dark"));
+        assert_eq!(
+            json_at(&dir.join(".tagteam-baseline.json")),
+            json!({"format": "tagteam-baseline", "version": 1, "projects": null, "mcpServers": null})
+        );
+    }
+
+    #[test]
+    fn the_seed_waits_for_the_profile_s_config_lock_and_never_takes_the_default_s() {
+        let f = fx();
+        fs::write(default_config(&f), DEFAULT_JSON).unwrap();
+        let (dir, _) = profile(&f, "0192");
+        // The default home's config lock stays held: a seed that took it would time out.
+        fs::create_dir(f.env.home.join(".claude.json.lock")).unwrap();
+        let cc_writing = hold(&dir.join(".claude.json.lock"), 300);
+        let start = Instant::now();
+
+        f.cc.seed_profile(&f.env, &dir, &account(&f)).unwrap();
+
+        assert!(
+            start.elapsed() >= Duration::from_millis(300),
+            "the seed waited for the profile's own lock"
+        );
+        cc_writing.join().unwrap();
+        assert!(!dir.join(".claude.json.lock").exists(), "and released it");
+        assert!(f.env.home.join(".claude.json.lock").is_dir());
+    }
+
+    #[test]
+    fn a_torn_file_on_either_side_stops_the_seed_and_writes_nothing() {
+        let f = fx();
+        let (dir, _) = profile(&f, "0192");
+        let config = dir.join(".claude.json");
+        fs::write(default_config(&f), DEFAULT_JSON).unwrap();
+        fs::write(&config, b"{\"userID\": ").unwrap();
+        match f.cc.seed_profile(&f.env, &dir, &account(&f)) {
+            Err(ProviderError::ConfigUnsplicable { path, remedy }) => {
+                assert_eq!(path, config);
+                assert!(
+                    !remedy.contains("backups"),
+                    "a profile's file has no backups: {remedy}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fs::read(&config).unwrap(), b"{\"userID\": ");
+        assert!(!f.cc.has_baseline(&dir));
+
+        fs::remove_file(&config).unwrap();
+        fs::write(default_config(&f), b"[1]").unwrap();
+        assert!(matches!(
+            f.cc.seed_profile(&f.env, &dir, &account(&f)),
+            Err(ProviderError::ConfigUnsplicable { path, .. }) if path == default_config(&f)
+        ));
+        assert!(!config.exists());
+        assert!(!f.cc.has_baseline(&dir));
+    }
+
+    /// Review Focus 4: default-home sessions edit `~/.claude.json` while the profile's session
+    /// runs, and the profile's session edits its own file.
+    #[test]
+    fn a_merge_back_keeps_the_default_where_both_changed_and_applies_the_rest() {
+        let f = fx();
+        let dir = seeded(&f);
+        let profile_config = dir.join(".claude.json");
+        // The default home: the same key changed, a project of its own, and a key outside
+        // both subtrees.
+        edit(
+            &default_config(&f),
+            "projects",
+            json!({
+                "/work/app": {"allowedTools": ["Read"], "hasTrustDialogAccepted": true},
+                "/work/lib": {"allowedTools": ["Bash"]},
+                "/work/default-new": {"allowedTools": []}
+            }),
+        );
+        edit(&default_config(&f), "numStartups", json!(4));
+        // The profile: that key changed differently, another key, a new project, and an MCP
+        // server removed.
+        edit(
+            &profile_config,
+            "projects",
+            json!({
+                "/work/app": {"allowedTools": ["Edit"], "hasTrustDialogAccepted": false},
+                "/work/lib": {"allowedTools": ["Bash", "Edit"]},
+                "/work/profile-new": {"allowedTools": [], "hasTrustDialogAccepted": true}
+            }),
+        );
+        edit(
+            &profile_config,
+            "mcpServers",
+            json!({"local": {"command": "srv"}}),
+        );
+        let before = fs::read(default_config(&f)).unwrap();
+        let profile_before = fs::read(&profile_config).unwrap();
+
+        let report = f.cc.merge_back(&f.env, &dir, &Cancel::new()).unwrap();
+
+        assert_eq!(
+            report,
+            MergeReport {
+                applied: 4,
+                conflicts: vec![r#"projects["/work/app"].allowedTools"#.to_owned()],
+            }
+        );
+        let after = fs::read(default_config(&f)).unwrap();
+        let projects = top(&after, "projects").unwrap();
+        assert_eq!(
+            projects,
+            json!({
+                "/work/app": {"allowedTools": ["Read"], "hasTrustDialogAccepted": true},
+                "/work/lib": {"allowedTools": ["Bash", "Edit"]},
+                "/work/default-new": {"allowedTools": []},
+                "/work/profile-new": {"allowedTools": [], "hasTrustDialogAccepted": true}
+            })
+        );
+        let order: Vec<&str> = projects
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "/work/app",
+                "/work/lib",
+                "/work/default-new",
+                "/work/profile-new"
+            ]
+        );
+        assert_eq!(
+            top(&after, "mcpServers"),
+            Some(json!({"local": {"command": "srv"}}))
+        );
+        assert_eq!(
+            strip(&after, &["projects", "mcpServers"]),
+            strip(&before, &["projects", "mcpServers"]),
+            "every other byte of ~/.claude.json, 1e400 and the default's numStartups included"
+        );
+        assert_eq!(
+            fs::read(&profile_config).unwrap(),
+            profile_before,
+            "the profile is left as it is"
+        );
+        assert!(
+            !f.cc.has_baseline(&dir),
+            "a merge-back that ran leaves no baseline"
+        );
+    }
+
+    #[test]
+    fn a_merge_back_with_nothing_to_merge_writes_nothing() {
+        let f = fx();
+        let dir = seeded(&f);
+        edit(&default_config(&f), "numStartups", json!(9));
+        let before = fs::read(default_config(&f)).unwrap();
+
+        let report = f.cc.merge_back(&f.env, &dir, &Cancel::new()).unwrap();
+
+        assert_eq!(report, MergeReport::default());
+        assert_eq!(
+            fs::read(default_config(&f)).unwrap(),
+            before,
+            "not one byte"
+        );
+        assert!(!f.cc.has_baseline(&dir));
+        assert_eq!(
+            f.cc.merge_back(&f.env, &dir, &Cancel::new()).unwrap(),
+            MergeReport::default(),
+            "with no baseline left, a second merge-back does nothing"
+        );
+    }
+
+    #[test]
+    fn a_torn_default_file_fails_the_merge_back_and_keeps_the_profile_and_its_baseline() {
+        let f = fx();
+        let dir = seeded(&f);
+        let profile_config = dir.join(".claude.json");
+        edit(&profile_config, "mcpServers", json!({}));
+        let profile_before = fs::read(&profile_config).unwrap();
+        let baseline_before = fs::read(dir.join(".tagteam-baseline.json")).unwrap();
+        fs::write(default_config(&f), b"{\"projects\": {").unwrap();
+
+        match f.cc.merge_back(&f.env, &dir, &Cancel::new()) {
+            Err(ProviderError::ConfigUnsplicable { path, remedy }) => {
+                assert_eq!(path, default_config(&f));
+                assert!(remedy.contains("~/.claude/backups/"), "{remedy}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(fs::read(default_config(&f)).unwrap(), b"{\"projects\": {");
+        assert_eq!(fs::read(&profile_config).unwrap(), profile_before);
+        assert_eq!(
+            fs::read(dir.join(".tagteam-baseline.json")).unwrap(),
+            baseline_before
+        );
+        assert!(f.cc.has_baseline(&dir));
+        assert!(
+            !f.env.home.join(".claude.json.lock").exists(),
+            "the default's lock is released"
+        );
+    }
+
+    #[test]
+    fn a_merge_back_waits_for_the_default_s_config_lock_alone() {
+        let f = fx();
+        let dir = seeded(&f);
+        edit(&dir.join(".claude.json"), "mcpServers", json!({}));
+        // Locks a merge-back never takes, held throughout: the profile's own config and
+        // credential locks, and the default home's credential lock.
+        for held in [
+            dir.join(".claude.json.lock"),
+            dir.join(".oauth_refresh.lock"),
+            f.env.home.join(".claude/.oauth_refresh.lock"),
+        ] {
+            fs::create_dir(held).unwrap();
+        }
+        let cc_writing = hold(&f.env.home.join(".claude.json.lock"), 300);
+        let start = Instant::now();
+
+        let report = f.cc.merge_back(&f.env, &dir, &Cancel::new()).unwrap();
+
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        cc_writing.join().unwrap();
+        assert_eq!(report.applied, 2, "both servers removed");
+        assert_eq!(
+            top(&fs::read(default_config(&f)).unwrap(), "mcpServers"),
+            Some(json!({}))
+        );
+    }
+
+    #[test]
+    fn a_signal_ends_the_merge_back_s_wait_and_keeps_the_baseline() {
+        let f = fx();
+        let dir = seeded(&f);
+        edit(&dir.join(".claude.json"), "mcpServers", json!({}));
+        fs::create_dir(f.env.home.join(".claude.json.lock")).unwrap();
+        let cancel = Cancel::new();
+        let signal = {
+            let cancel = cancel.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                cancel.request(15);
+            })
+        };
+
+        let result = f.cc.merge_back(&f.env, &dir, &cancel);
+
+        signal.join().unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(ProviderError::Lock(LockError::Interrupted {
+                    signal: 15,
+                    ..
+                }))
+            ),
+            "{result:?}"
+        );
+        assert!(f.cc.has_baseline(&dir));
+        assert_eq!(
+            fs::read(default_config(&f)).unwrap(),
+            DEFAULT_JSON.as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_default_file_that_is_gone_is_created_with_the_merged_subtree_alone() {
+        let f = fx();
+        let dir = seeded(&f);
+        edit(
+            &dir.join(".claude.json"),
+            "mcpServers",
+            json!({
+                "local": {"command": "srv"}, "remote": {"url": "https://mcp.example"},
+                "added": {"command": "new"}
+            }),
+        );
+        fs::remove_file(default_config(&f)).unwrap();
+
+        let report = f.cc.merge_back(&f.env, &dir, &Cancel::new()).unwrap();
+
+        assert_eq!(report.applied, 1);
+        assert_eq!(
+            json_at(&default_config(&f)),
+            json!({"mcpServers": {"added": {"command": "new"}}})
+        );
+        assert_eq!(mode(&default_config(&f)), 0o600);
+    }
+
+    #[test]
+    fn a_profile_whose_file_is_gone_has_nothing_to_merge_back() {
+        let f = fx();
+        let dir = seeded(&f);
+        fs::remove_file(dir.join(".claude.json")).unwrap();
+
+        assert_eq!(
+            f.cc.merge_back(&f.env, &dir, &Cancel::new()).unwrap(),
+            MergeReport::default()
+        );
+        assert_eq!(
+            fs::read(default_config(&f)).unwrap(),
+            DEFAULT_JSON.as_bytes()
+        );
+        assert!(!f.cc.has_baseline(&dir), "so the next launch can seed");
+    }
+
+    #[test]
+    fn a_baseline_that_is_not_one_fails_the_merge_back_and_stays() {
+        let f = fx();
+        let dir = seeded(&f);
+        let baseline = dir.join(".tagteam-baseline.json");
+        for bytes in [&b"{\"format\": \"tagteam-profile\"}"[..], b"{", b"[]"] {
+            fs::write(&baseline, bytes).unwrap();
+            assert!(matches!(
+                f.cc.merge_back(&f.env, &dir, &Cancel::new()),
+                Err(ProviderError::Invalid(_))
+            ));
+            assert_eq!(fs::read(&baseline).unwrap(), bytes);
+            assert!(f.cc.has_baseline(&dir));
+        }
+        // M4a's own-file rule (T5-a): a link that resolves to nothing, or crosses a file, is
+        // unreadable, never absent. The merge-back fails and the link stays.
+        let target = dir.join("nowhere/baseline.json");
+        for link_to in [target.clone(), dir.join(".claude.json/baseline.json")] {
+            fs::remove_file(&baseline).unwrap();
+            std::os::unix::fs::symlink(&link_to, &baseline).unwrap();
+            assert!(f.cc.has_baseline(&dir));
+            assert!(matches!(
+                f.cc.merge_back(&f.env, &dir, &Cancel::new()),
+                Err(ProviderError::Unreadable(_))
+            ));
+            assert_eq!(fs::read_link(&baseline).unwrap(), link_to, "it stays");
+            assert!(f.cc.has_baseline(&dir));
+        }
+        assert!(!target.exists(), "nothing was written through the link");
+        assert_eq!(
+            fs::read(default_config(&f)).unwrap(),
+            DEFAULT_JSON.as_bytes()
+        );
+    }
+}

@@ -724,3 +724,152 @@ fn its_profile_credential_and_identity_are_read_in_the_profile_s_directory() {
         Read::Unreadable(_)
     ));
 }
+
+mod seed_and_merge_back {
+    //! §12.4 in FakeAgent's shape: the flat `prefs` of its private `identity.json`.
+
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
+    use tagteam_provider::{Cancel, Identity, MergeReport};
+
+    fn profile(f: &Fx) -> (PathBuf, String) {
+        let dir = f.env.data_dir().join("sessions/0193");
+        fs::create_dir_all(&dir).unwrap();
+        let spelling = dir.to_str().unwrap().to_owned();
+        (dir, spelling)
+    }
+
+    fn bob(f: &Fx) -> Identity {
+        f.fake
+            .parse_identity(&identity_json("bob", "ws2", "uid-bob"))
+            .unwrap()
+    }
+
+    fn set_prefs(path: &Path, prefs: Value) {
+        let doc = fs::read(path).unwrap();
+        fs::write(path, replace_top_level(&doc, "prefs", &prefs).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_seed_copies_the_outer_prefs_and_sets_the_account_s_identity() {
+        let f = fx();
+        login(&f.env, "alice", "ws", "tok-a", "renew-a");
+        let (dir, _) = profile(&f);
+        assert!(!f.fake.has_baseline(&dir));
+
+        f.fake.seed_profile(&f.env, &dir, &bob(&f)).unwrap();
+
+        assert_eq!(
+            file_json(&dir.join("identity.json")),
+            json!({"prefs": {"theme": "x"}, "identity": identity_json("bob", "ws2", "uid-bob")})
+        );
+        assert_eq!(
+            f.fake
+                .profile_identity(&f.env, &dir)
+                .present()
+                .unwrap()
+                .label,
+            "bob@ws2"
+        );
+        assert!(f.fake.has_baseline(&dir));
+        let baseline = dir.join(".tagteam-baseline.json");
+        assert_eq!(
+            file_json(&baseline),
+            json!({"format": "tagteam-baseline", "version": 1, "prefs": {"theme": "x"}})
+        );
+        assert_eq!(
+            fs::metadata(&baseline).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn a_merge_back_applies_the_profile_s_prefs_and_keeps_the_outer_where_both_changed() {
+        let f = fx();
+        login(&f.env, "alice", "ws", "tok-a", "renew-a");
+        let (dir, _) = profile(&f);
+        f.fake.seed_profile(&f.env, &dir, &bob(&f)).unwrap();
+        let outer = FakePaths::resolve(&f.env).identity;
+        set_prefs(&outer, json!({"theme": "y", "font": "mono"}));
+        set_prefs(
+            &dir.join("identity.json"),
+            json!({"theme": "z", "lang": "nl"}),
+        );
+        let before = fs::read(&outer).unwrap();
+
+        let report = f.fake.merge_back(&f.env, &dir, &Cancel::new()).unwrap();
+
+        assert_eq!(
+            report,
+            MergeReport {
+                applied: 1,
+                conflicts: vec![r#"prefs["theme"]"#.to_owned()],
+            }
+        );
+        let after = fs::read(&outer).unwrap();
+        assert_eq!(
+            get_top_level(&after, "prefs").unwrap(),
+            Some(json!({"theme": "y", "font": "mono", "lang": "nl"}))
+        );
+        assert_eq!(
+            remove_top_level(&after, "prefs").unwrap(),
+            remove_top_level(&before, "prefs").unwrap(),
+            "the outer identity stays byte for byte"
+        );
+        assert!(!f.fake.has_baseline(&dir));
+    }
+
+    #[test]
+    fn a_torn_outer_file_fails_the_merge_back_and_keeps_the_baseline() {
+        let f = fx();
+        login(&f.env, "alice", "ws", "tok-a", "renew-a");
+        let (dir, _) = profile(&f);
+        f.fake.seed_profile(&f.env, &dir, &bob(&f)).unwrap();
+        set_prefs(&dir.join("identity.json"), json!({}));
+        let outer = FakePaths::resolve(&f.env).identity;
+        fs::write(&outer, b"{\"identity\": ").unwrap();
+
+        assert!(matches!(
+            f.fake.merge_back(&f.env, &dir, &Cancel::new()),
+            Err(ProviderError::ConfigUnsplicable { path, .. }) if path == outer
+        ));
+        assert_eq!(fs::read(&outer).unwrap(), b"{\"identity\": ");
+        assert!(f.fake.has_baseline(&dir));
+    }
+
+    #[test]
+    fn a_baseline_that_is_a_dangling_link_fails_the_merge_back_and_stays() {
+        // M4a's own-file rule (T5-a): a link at tagteam's own file that resolves to nothing
+        // is unreadable, never absent.
+        let f = fx();
+        login(&f.env, "alice", "ws", "tok-a", "renew-a");
+        let (dir, _) = profile(&f);
+        let outer = FakePaths::resolve(&f.env).identity;
+        let before = fs::read(&outer).unwrap();
+        let baseline = dir.join(".tagteam-baseline.json");
+        let target = dir.join("nowhere/baseline.json");
+        std::os::unix::fs::symlink(&target, &baseline).unwrap();
+        fs::write(
+            dir.join("identity.json"),
+            b"{\n  \"prefs\": {\"theme\": \"z\"}\n}\n",
+        )
+        .unwrap();
+
+        assert!(f.fake.has_baseline(&dir));
+        assert!(matches!(
+            f.fake.merge_back(&f.env, &dir, &Cancel::new()),
+            Err(ProviderError::Unreadable(_))
+        ));
+        assert_eq!(fs::read_link(&baseline).unwrap(), target, "it stays");
+        assert!(f.fake.has_baseline(&dir));
+        assert_eq!(
+            fs::read(&outer).unwrap(),
+            before,
+            "the outer file is untouched"
+        );
+
+        assert!(!target.exists(), "nothing was written through the link");
+    }
+}

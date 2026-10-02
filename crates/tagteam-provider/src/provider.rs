@@ -11,6 +11,7 @@ use tagteam_core::poll::PollBudget;
 use tagteam_core::usage::Window;
 use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 
+use crate::cancel::Cancel;
 use crate::credential::{Credential, FreshCredential};
 use crate::env::Env;
 use crate::flock::MutationGuard;
@@ -157,6 +158,14 @@ pub struct SharePolicy {
     pub must_share: Vec<MustShare>,
     /// Never linked; patterns for `entry_matches`.
     pub private: Vec<&'static str>,
+}
+
+/// What a merge-back did (§12.4 step 3): how many of the profile's changes it applied, and
+/// the keys both sides changed, where the default file's value was kept, named for the log.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MergeReport {
+    pub applied: usize,
+    pub conflicts: Vec<String>,
 }
 
 /// What a provider can do at all (§4.5). A missing capability degrades the engine rather than
@@ -661,6 +670,24 @@ pub trait Provider: Send + Sync {
     ) -> Result<(), ProviderError>;
     /// §13.5: whether `env` is a process this agent started (CC: `CLAUDECODE` or `CLAUDE_CONFIG_DIR`).
     fn invoked_by(&self, env: &Env) -> bool;
+    // Seed and merge-back find the profile's files by `dir`, its actual directory, never by its
+    // recorded spelling, which names the old path once the data directory has moved (Decision 22).
+    /// §12.4: seeds the profile's config in `dir` from the outer home (`env`), for `identity`;
+    /// writes the baseline. Takes the profile's own config lock, waiting under `env.cancel`.
+    fn seed_profile(&self, env: &Env, dir: &Path, identity: &Identity)
+    -> Result<(), ProviderError>;
+    /// §12.4: whether a baseline is waiting in `dir` (a merge-back that never ran). One that
+    /// cannot be looked at counts as waiting.
+    fn has_baseline(&self, dir: &Path) -> bool;
+    /// §12.4: merges the changes of the profile in `dir` back into the outer home's config
+    /// under its config lock, alone; removes the baseline on success. Fails without touching
+    /// the baseline.
+    fn merge_back(
+        &self,
+        env: &Env,
+        dir: &Path,
+        cancel: &Cancel,
+    ) -> Result<MergeReport, ProviderError>;
 }
 
 #[cfg(test)]

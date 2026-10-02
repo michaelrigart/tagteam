@@ -46,29 +46,44 @@ fn no_entry(e: &io::Error) -> bool {
     )
 }
 
-/// One of tagteam's files in `profile`: `Absent` only when there is no entry at its path, as
-/// when `profile` is not a directory at all; `Unreadable` when it exists but cannot be read, a
-/// link that dangles or crosses a file included (§4.3), or `parse` refuses it. `parse`'s detail
-/// never quotes the file's bytes.
+/// One of tagteam's own files in `profile`, as bytes: `Absent` only when there is no entry at
+/// its path, as when `profile` is not a directory at all; `Unreadable` when it exists but cannot
+/// be read, a link that dangles or crosses a file included (§4.3). A provider reads a tagteam
+/// file of its own (the seed's baseline) with this, so that file follows the same rule as the
+/// marker, the seed and the links record.
+pub fn read_own_bytes(profile: &Path, name: &str) -> Read<Vec<u8>> {
+    let path = profile.join(name);
+    let unreadable =
+        |detail: String| Read::Unreadable(ReadError::new(path.display().to_string(), detail));
+    match fs::read(&path) {
+        Ok(b) => Read::Present(b),
+        // The read found nothing; the entry itself decides whether nothing is there.
+        Err(e) if no_entry(&e) => match fs::symlink_metadata(&path) {
+            Err(m) if no_entry(&m) => Read::Absent,
+            Ok(_) => unreadable(format!("it is a link that does not resolve: {e}")),
+            Err(m) => unreadable(m.to_string()),
+        },
+        Err(e) => unreadable(e.to_string()),
+    }
+}
+
+/// One of tagteam's files in `profile`, parsed: as `read_own_bytes`, and `Unreadable` too when
+/// it is not JSON or `parse` refuses it. `parse`'s detail never quotes the file's bytes.
 fn read_own_file<T>(
     profile: &Path,
     name: &str,
     parse: impl FnOnce(&Value) -> Result<T, String>,
 ) -> Read<T> {
-    let path = profile.join(name);
-    let unreadable =
-        |detail: String| Read::Unreadable(ReadError::new(path.display().to_string(), detail));
-    let bytes = match fs::read(&path) {
-        Ok(b) => b,
-        // The read found nothing; the entry itself decides whether nothing is there.
-        Err(e) if no_entry(&e) => {
-            return match fs::symlink_metadata(&path) {
-                Err(m) if no_entry(&m) => Read::Absent,
-                Ok(_) => unreadable(format!("it is a link that does not resolve: {e}")),
-                Err(m) => unreadable(m.to_string()),
-            };
-        }
-        Err(e) => return unreadable(e.to_string()),
+    let unreadable = |detail: String| {
+        Read::Unreadable(ReadError::new(
+            profile.join(name).display().to_string(),
+            detail,
+        ))
+    };
+    let bytes = match read_own_bytes(profile, name) {
+        Read::Present(b) => b,
+        Read::Absent => return Read::Absent,
+        Read::Unreadable(e) => return Read::Unreadable(e),
     };
     let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
         return unreadable("it is not JSON".into());

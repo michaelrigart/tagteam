@@ -4,19 +4,21 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tagteam_core::merge::{MergeKey, three_way};
 use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
 use tagteam_provider::http::{Http, HttpError, HttpRequest};
+use tagteam_provider::profile::read_own_bytes;
 use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind};
 use tagteam_provider::splice::{self, render_nested};
 use tagteam_provider::{
-    BeforeFallback, Capabilities, CredLocks, Credential, DoomedEntry, EntryKind, Env,
+    BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, EntryKind, Env,
     FreshCredential, Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet,
-    LiveLocks, LockError, MkdirLock, MkdirLockSpec, MustShare, MutationGuard, Pace, PollBudget,
-    Provider, ProviderError, Read, ReadError, SecretStore, SharePolicy, StoredLogin, Undo,
-    UsageResult, Window, Written,
+    LiveLocks, LockError, MergeReport, MkdirLock, MkdirLockSpec, MustShare, MutationGuard, Pace,
+    PollBudget, Provider, ProviderError, Read, ReadError, SecretStore, SharePolicy, StoredLogin,
+    Undo, UsageResult, Window, Written,
 };
 
 use crate::FAKE_AGENT;
@@ -31,6 +33,12 @@ const DEFAULT_BASE: &str = "https://fake-agent.invalid";
 const DEFAULT_LOCK_BUDGET: Duration = Duration::from_secs(5);
 /// What to do about an `identity.json` that cannot be spliced.
 const REMEDY: &str = "repair or remove it, then retry";
+/// §12.4's baseline: Claude Code's stable file name, in FakeAgent's own shape.
+const BASELINE_FILE: &str = ".tagteam-baseline.json";
+const BASELINE_FORMAT: &str = "tagteam-baseline";
+/// The one subtree of `identity.json` FakeAgent seeds and merges back, `prefs.<name>`: flat,
+/// and alone, deliberately unlike Claude Code's two.
+const PREFS: &str = "prefs";
 
 pub struct FakeAgent {
     base: String,
@@ -154,6 +162,65 @@ fn profile_env_in(env: &Env, dir: &Path) -> Env {
     let mut out = env.clone();
     out.vars.insert(HOME_VAR.into(), dir.as_os_str().to_owned());
     out
+}
+
+fn unsplicable(path: &Path) -> ProviderError {
+    ProviderError::ConfigUnsplicable {
+        path: path.to_path_buf(),
+        remedy: REMEDY,
+    }
+}
+
+/// `prefs` in an `identity.json`'s bytes, `Null` when absent.
+fn prefs_of(path: &Path, doc: &[u8]) -> Result<Value, ProviderError> {
+    Ok(splice::get_top_level(doc, PREFS)
+        .map_err(|_| unsplicable(path))?
+        .unwrap_or(Value::Null))
+}
+
+/// FakeAgent's one `.live.lock` at `path`, waited for under `cancel`.
+fn live_lock(path: PathBuf, budget: Duration, cancel: &Cancel) -> Result<MkdirLock, ProviderError> {
+    Ok(MkdirLock::acquire(
+        &MkdirLockSpec::new(path, LOCK_STALE, budget).with_cancel(cancel),
+    )?)
+}
+
+/// The baseline's `prefs` in the profile directory `dir`; `None` when there is none. One of
+/// tagteam's own files, so a link at its path that resolves to nothing is unreadable, never
+/// absent (M4a's rule).
+fn read_baseline(dir: &Path) -> Result<Option<Value>, ProviderError> {
+    let bytes = match read_own_bytes(dir, BASELINE_FILE) {
+        Read::Present(b) => b,
+        Read::Absent => return Ok(None),
+        Read::Unreadable(e) => return Err(ProviderError::Unreadable(e)),
+    };
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .filter(|v| v["format"] == BASELINE_FORMAT && v["version"] == 1)
+        .and_then(|v| v.get(PREFS).cloned())
+        .map(Some)
+        .ok_or_else(|| {
+            ProviderError::Invalid(format!(
+                "{} is not a tagteam baseline",
+                dir.join(BASELINE_FILE).display()
+            ))
+        })
+}
+
+fn remove_baseline(path: &Path) -> Result<(), ProviderError> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+/// A merged key as the summary's log names it: `prefs["<name>"]`.
+fn pref_name(k: &MergeKey) -> String {
+    match k {
+        MergeKey::McpServer { name } => format!("prefs[{}]", json!(name)),
+        // Never produced: FakeAgent gives `three_way` no two-level subtree.
+        MergeKey::Project { path, key } => format!("{path}.{key}"),
+    }
 }
 
 /// `fa.token`, unless the credential has expired by §7.2's rule (`now + 5 min ≥ expires`).
@@ -658,5 +725,107 @@ impl Provider for FakeAgent {
 
     fn invoked_by(&self, _env: &Env) -> bool {
         false
+    }
+
+    /// §12.4 in FakeAgent's shape: the `identity.json` of the profile in `dir` (or `{}`) gets
+    /// the outer home's `prefs`, absence included, and the account's `identity`; then the
+    /// baseline. Under the profile's own `.live.lock`, FakeAgent's only lock.
+    fn seed_profile(
+        &self,
+        env: &Env,
+        dir: &Path,
+        identity: &Identity,
+    ) -> Result<(), ProviderError> {
+        let outer = FakePaths::resolve(env).identity;
+        let prefs = match read_file(&outer) {
+            Read::Present(b) => {
+                splice::get_top_level(&b, PREFS).map_err(|_| unsplicable(&outer))?
+            }
+            Read::Absent => None,
+            Read::Unreadable(_) => return Err(unsplicable(&outer)),
+        };
+        let p = FakePaths::resolve(&profile_env_in(env, dir));
+        let lock = live_lock(p.lock.clone(), self.lock_budget, &env.cancel)?;
+        let fence = || lock.check_owned().map_err(ProviderError::from);
+        let before =
+            present_or_err(read_file(&p.identity)).map_err(|_| unsplicable(&p.identity))?;
+        let start = before.clone().unwrap_or_else(|| b"{}\n".to_vec());
+        let new = match &prefs {
+            Some(v) => splice::replace_top_level(&start, PREFS, v),
+            None => splice::remove_top_level(&start, PREFS),
+        }
+        .and_then(|doc| splice::replace_top_level(&doc, "identity", &identity.raw))
+        .map_err(|_| unsplicable(&p.identity))?;
+        if before.as_deref() != Some(new.as_slice()) {
+            ensure_private_dir(&p.dir)?;
+            write_atomic_with(&p.identity, &new, 0o600, fence)?;
+        }
+        let baseline = json!({
+            "format": BASELINE_FORMAT,
+            "version": 1,
+            PREFS: prefs.unwrap_or(Value::Null),
+        });
+        let mut bytes = serde_json::to_vec_pretty(&baseline).expect("a Value always serializes");
+        bytes.push(b'\n');
+        write_atomic_private_with(&p.dir.join(BASELINE_FILE), &bytes, 0o600, fence)
+    }
+
+    fn has_baseline(&self, dir: &Path) -> bool {
+        match fs::symlink_metadata(dir.join(BASELINE_FILE)) {
+            Ok(_) => true,
+            Err(e) => !matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ),
+        }
+    }
+
+    /// §12.4 in FakeAgent's shape: the `prefs` of the profile in `dir` merged three ways into
+    /// the outer `identity.json`, under the outer `.live.lock` alone; the baseline removed on
+    /// success.
+    fn merge_back(
+        &self,
+        env: &Env,
+        dir: &Path,
+        cancel: &Cancel,
+    ) -> Result<MergeReport, ProviderError> {
+        let p = FakePaths::resolve(&profile_env_in(env, dir));
+        let Some(base) = read_baseline(&p.dir)? else {
+            return Ok(MergeReport::default());
+        };
+        let baseline = p.dir.join(BASELINE_FILE);
+        let mine = match read_file(&p.identity) {
+            Read::Present(b) => prefs_of(&p.identity, &b)?,
+            Read::Absent => {
+                remove_baseline(&baseline)?;
+                return Ok(MergeReport::default());
+            }
+            Read::Unreadable(_) => return Err(unsplicable(&p.identity)),
+        };
+        let outer = FakePaths::resolve(env);
+        let lock = live_lock(outer.lock.clone(), self.lock_budget, cancel)?;
+        let fence = || lock.check_owned().map_err(ProviderError::from);
+        let before =
+            present_or_err(read_file(&outer.identity)).map_err(|_| unsplicable(&outer.identity))?;
+        let theirs = match &before {
+            Some(b) => prefs_of(&outer.identity, b)?,
+            None => Value::Null,
+        };
+        let none = Value::Null;
+        // FakeAgent's one flat subtree takes `three_way`'s flat slot.
+        let merged = three_way((&none, &base), (&none, &mine), (&none, &theirs));
+        if let Some(prefs) = &merged.mcp_servers {
+            let start = before.unwrap_or_else(|| b"{}\n".to_vec());
+            let new = splice::replace_top_level(&start, PREFS, prefs)
+                .map_err(|_| unsplicable(&outer.identity))?;
+            ensure_private_dir(&outer.dir)?;
+            write_atomic_with(&outer.identity, &new, 0o600, fence)?;
+        }
+        drop(lock);
+        remove_baseline(&baseline)?;
+        Ok(MergeReport {
+            applied: merged.applied.len(),
+            conflicts: merged.conflicts.iter().map(pref_name).collect(),
+        })
     }
 }
