@@ -148,3 +148,177 @@ fn a_run_shell_sees_the_default_home_and_refuses_account_changes() {
         );
     }
 }
+
+/// Task 14: `list` and `status` in and around sessions (§12.8, §13.1, §13.2).
+mod sessions_in_list_and_status {
+    use std::fs;
+    use std::path::Path;
+
+    use serde_json::{Value, json};
+    use tagteam_core::WindowKind;
+
+    use crate::common::{
+        cc_profile, cmd, hold_launch, now_epoch_s, record_reading, two_fresh_accounts, usage_window,
+    };
+
+    /// `a@x.co` at position 1 and `b@x.co` at position 2 (live), each with a reading taken just
+    /// now: 5h at 9 % and 7d at 77 %, with no resets. Nothing is due for 180 s (§8.3), so
+    /// neither `list` nor `status` sends a request.
+    fn read_now(root: &Path) -> (String, String) {
+        let (a, b) = two_fresh_accounts(root);
+        let now = now_epoch_s();
+        for id in [&a, &b] {
+            record_reading(
+                root,
+                id,
+                now,
+                &[
+                    usage_window("5h", "5h", WindowKind::Short, 9.0, None, None),
+                    usage_window("7d", "7d", WindowKind::Long, 77.0, None, None),
+                ],
+            );
+        }
+        (a, b)
+    }
+
+    /// `tagteam <args>`, inside the run shell whose profile `shell` spells when given. It must
+    /// succeed with nothing on stderr.
+    fn run(root: &Path, shell: Option<&str>, args: &[&str]) -> String {
+        let mut c = cmd(root);
+        if let Some(dir) = shell {
+            c.env("CLAUDE_CONFIG_DIR", dir);
+        }
+        let out = c.args(args).assert().success().get_output().clone();
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "", "{args:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn json_of(root: &Path, shell: Option<&str>, args: &[&str]) -> Value {
+        serde_json::from_str(&run(root, shell, args)).unwrap()
+    }
+
+    fn keys(v: &Value) -> Vec<&str> {
+        v.as_object().unwrap().keys().map(String::as_str).collect()
+    }
+
+    /// The table with no account in a session: today's layout.
+    const QUIET: &str = concat!(
+        "    #  ACCOUNT  5H    7D    SPEND  AGE\n",
+        "    1  a@x.co     9%   77%  —      <1m\n",
+        " *  2  b@x.co     9%   77%  —      <1m\n",
+    );
+
+    #[test]
+    fn list_in_a_run_shell_marks_the_sessions_account_and_keeps_the_default_login_live() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = read_now(d.path());
+        let (profile, shell) = cc_profile(d.path(), &a);
+        assert_eq!(
+            run(d.path(), None, &["list"]),
+            QUIET,
+            "a quiescent profile changes nothing"
+        );
+
+        let _session = hold_launch(&profile);
+        assert_eq!(
+            run(d.path(), Some(&shell), &["list"]),
+            concat!(
+                "    #    ACCOUNT  5H    7D    SPEND  AGE\n",
+                "    1 ▶  a@x.co     9%   77%  —      <1m  this\n",
+                " *  2    b@x.co     9%   77%  —      <1m\n",
+            )
+        );
+        let v = json_of(d.path(), Some(&shell), &["list", "--json"]);
+        assert_eq!(
+            v["activeAccountNumber"], 2,
+            "the default home's login is live"
+        );
+        let rows = v["accounts"].as_array().unwrap();
+        let first = keys(&rows[0]);
+        assert_eq!(
+            (rows[0]["id"].as_str(), &first[first.len() - 2..]),
+            (Some(a.as_str()), &["loginExpiresAt", "inSession"][..])
+        );
+        assert_eq!(rows[0]["inSession"], json!(true));
+        assert_eq!(
+            (rows[1]["id"].as_str(), rows[1].get("inSession")),
+            (Some(b.as_str()), None)
+        );
+    }
+
+    #[test]
+    fn status_in_a_run_shell_names_the_sessions_account_in_text_and_json() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = read_now(d.path());
+        let (profile, shell) = cc_profile(d.path(), &a);
+        let _session = hold_launch(&profile);
+        assert_eq!(
+            run(d.path(), Some(&shell), &["status"]),
+            "Live: b@x.co (position 2 of 2)\n  5h 9% · 7d 77% · <1m old\nThis session: a@x.co (position 1)\n"
+        );
+        let v = json_of(d.path(), Some(&shell), &["status", "--json"]);
+        assert_eq!(
+            keys(&v),
+            [
+                "schemaVersion",
+                "provider",
+                "active",
+                "totalManagedAccounts",
+                "session"
+            ]
+        );
+        assert_eq!(
+            v["session"],
+            json!({"number": 1, "position": 1, "id": a.as_str(), "email": "a@x.co"})
+        );
+        assert_eq!(
+            (v["active"]["id"].as_str(), v["active"]["managed"].as_bool()),
+            (Some(b.as_str()), Some(true))
+        );
+        assert!(v["active"].get("inSession").is_none(), "{v}");
+    }
+
+    #[test]
+    fn a_run_shell_of_an_account_tagteam_does_not_manage_says_so() {
+        let d = tempfile::tempdir().unwrap();
+        read_now(d.path());
+        let (profile, shell) = cc_profile(d.path(), "0192-not-managed");
+        // The login Claude Code keeps in the profile: only `status`'s text reads it.
+        let login = json!({"oauthAccount": {"emailAddress": "c@x.co", "organizationUuid": "", "accountUuid": "uuid-c"}});
+        fs::write(profile.join(".claude.json"), login.to_string()).unwrap();
+        let _session = hold_launch(&profile);
+        assert_eq!(
+            run(d.path(), Some(&shell), &["status"]),
+            "Live: b@x.co (position 2 of 2)\n  5h 9% · 7d 77% · <1m old\nThis session: c@x.co (not managed by tagteam)\n"
+        );
+        let v = json_of(d.path(), Some(&shell), &["status", "--json"]);
+        assert_eq!(v.get("session"), Some(&Value::Null));
+        assert_eq!(
+            run(d.path(), Some(&shell), &["list"]),
+            QUIET,
+            "no row is this session's"
+        );
+    }
+
+    #[test]
+    fn outside_a_run_shell_a_session_shows_without_this_and_status_names_none() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, _b) = read_now(d.path());
+        let (profile, _shell) = cc_profile(d.path(), &a);
+        let _session = hold_launch(&profile);
+        assert_eq!(
+            run(d.path(), None, &["list"]),
+            concat!(
+                "    #    ACCOUNT  5H    7D    SPEND  AGE\n",
+                "    1 ▶  a@x.co     9%   77%  —      <1m\n",
+                " *  2    b@x.co     9%   77%  —      <1m\n",
+            )
+        );
+        assert_eq!(
+            run(d.path(), None, &["status"]),
+            "Live: b@x.co (position 2 of 2)\n  5h 9% · 7d 77% · <1m old\n"
+        );
+        let v = json_of(d.path(), None, &["status", "--json"]);
+        assert!(v.get("session").is_none(), "{v}");
+    }
+}
