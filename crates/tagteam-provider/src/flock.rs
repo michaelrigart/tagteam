@@ -70,6 +70,41 @@ impl FlockGuard {
     }
 }
 
+/// What a non-blocking test of a lock file found (§12.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockProbe {
+    /// No file at the path.
+    Missing,
+    /// The file exists and nothing holds its lock.
+    Free,
+    /// Another open file description holds its lock.
+    Held,
+}
+
+/// Tests `path` with a non-blocking `flock`, opening it read-only and never creating it. A
+/// reservation is only ever tested, never waited on (§12.5), so a lock this takes is released
+/// before it returns.
+pub fn probe_lock(path: &Path) -> io::Result<LockProbe> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(LockProbe::Missing),
+        Err(e) => return Err(e),
+    };
+    // SAFETY: `file` owns a valid descriptor for the duration of the call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        // SAFETY: as above; this releases the lock the probe just took.
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        return Ok(LockProbe::Free);
+    }
+    let e = io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(LockProbe::Held)
+    } else {
+        Err(e)
+    }
+}
+
 /// tagteam's mutation lock (§9.1). Provider live locks can only be taken from one.
 #[derive(Debug)]
 pub struct MutationGuard {
@@ -118,6 +153,48 @@ mod tests {
         ));
         drop(g);
         assert!(FlockGuard::try_lock(&p).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_probe_never_creates_a_missing_lock_file() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(".tagteam-launch/42.lock");
+        assert_eq!(probe_lock(&p).unwrap(), LockProbe::Missing);
+        assert!(!p.parent().unwrap().exists(), "nor its directory");
+        fs::create_dir(p.parent().unwrap()).unwrap();
+        assert_eq!(probe_lock(&p).unwrap(), LockProbe::Missing);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn a_probe_sees_a_held_lock_and_releases_a_free_one() {
+        let _fork = crate::FORK_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("42.lock");
+        let held = FlockGuard::try_lock(&p).unwrap().unwrap();
+        assert_eq!(probe_lock(&p).unwrap(), LockProbe::Held);
+        drop(held);
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o400)).unwrap();
+        assert_eq!(
+            probe_lock(&p).unwrap(),
+            LockProbe::Free,
+            "read-only is enough"
+        );
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            FlockGuard::try_lock(&p).unwrap().is_some(),
+            "the probe released what it took"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_cannot_open_the_path_is_an_error() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("not-a-dir");
+        fs::write(&file, b"").unwrap();
+        assert!(probe_lock(&file.join("42.lock")).is_err());
     }
 
     #[test]
