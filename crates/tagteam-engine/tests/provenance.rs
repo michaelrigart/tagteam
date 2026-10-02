@@ -306,6 +306,74 @@ fn a_profile_whose_login_drifted_is_ignored() {
     assert_eq!(sent_refresh_tokens(&fx), ["rt-a"]);
 }
 
+/// Ways a profile's `.claude.json` names no login: no file, or no `oauthAccount` in it.
+const NO_IDENTITY: [(&str, Break); 2] = [
+    ("no .claude.json", |_, dir| {
+        fs::remove_file(dir.join(".claude.json")).unwrap()
+    }),
+    ("no oauthAccount", |_, dir| {
+        fs::write(dir.join(".claude.json"), "{}").unwrap()
+    }),
+];
+
+#[test]
+fn a_seeded_profile_without_an_identity_stops_a_capture_and_sends_nothing() {
+    // Decision 9: the profile holds a rotation of the vault's generation by its provenance, but
+    // nothing says the login is the account's. Ignoring it would refresh rt-a, which the
+    // rotation consumed, and could quarantine a healthy lineage; capturing it would be a guess.
+    for (what, strip) in NO_IDENTITY {
+        let fx = Fx::new();
+        let a = due(&fx);
+        let dir = quiescent(&fx, &a, "rt-a", &credential("a@x.co", "rt-a2"));
+        strip(&fx, &dir);
+        fx.script_refresh(Some("rt-a3"));
+        let outcome = gate(&fx, &a);
+        assert!(profile_unreadable(&outcome), "{what}: {outcome:?}");
+        assert_eq!(token_requests(&fx), 0, "{what}");
+        assert_eq!(
+            fx.vault_refresh_token(&a).as_deref(),
+            Some("rt-a"),
+            "{what}"
+        );
+        assert_eq!(seed_of(&dir).seed_fp, fp(&fx, "rt-a"), "{what}");
+    }
+}
+
+#[test]
+fn a_seeded_profile_without_an_identity_that_holds_no_rotation_leaves_the_vault_to_the_gate() {
+    // The identity matters only to a capture. In step (a bootstrap that stopped before it seeded
+    // `.claude.json`), moved past by the vault, or logged out of: nothing in the profile can be
+    // a rotation of the vault's generation, so the gate refreshes that generation as without a
+    // profile, and the next launch bootstraps the profile again.
+    let rows: [(&str, &str, Option<&str>); 3] = [
+        ("in step", "rt-a", Some("rt-a")),
+        ("vault moved on", "rt-old", Some("rt-old")),
+        ("logged out", "rt-a", None),
+    ];
+    for (row, seed_rt, held_rt) in rows {
+        for (what, strip) in NO_IDENTITY {
+            let fx = Fx::new();
+            let a = due(&fx);
+            let held = match held_rt {
+                Some("rt-a") | None => fx.vault_bytes(&a).unwrap(),
+                Some(rt) => credential("a@x.co", rt),
+            };
+            let dir = quiescent(&fx, &a, seed_rt, &held);
+            if held_rt.is_none() {
+                fs::remove_file(dir.join(".credentials.json")).unwrap();
+            }
+            strip(&fx, &dir);
+            fx.script_refresh(Some("rt-a2"));
+            let outcome = gate(&fx, &a);
+            assert!(
+                matches!(outcome, GateOutcome::Refreshed(_)),
+                "{row}, {what}: {outcome:?}"
+            );
+            assert_eq!(sent_refresh_tokens(&fx), ["rt-a"], "{row}, {what}");
+        }
+    }
+}
+
 #[test]
 fn a_profile_never_bootstrapped_is_ignored() {
     let fx = Fx::new();
