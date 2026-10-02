@@ -34,7 +34,7 @@
 
 **Tech Stack:** Rust (edition 2024), rusqlite (bundled), serde_json (`preserve_order`, `arbitrary_precision`), libc, `unicode-normalization` (already in `tagteam-cc`), clap 4, thiserror, tracing. Tests use tempfile, assert_cmd, `FakeKeychain`, `FakeClock`, `ScriptedHttp`, the new `FakeProcessProbe`, and `MockServer`.
 
-**Spec:** `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md`, signed off at `089b873` (M4 amendments `1e79bb9`, storage-write marking `59d5104`, rollback restore `f686839`, M5's amendments `089b873`, whose §10.3 delete order Task 9's `remove_locked` follows). Decision 16 amends §12.6; Michael signed it off on 2026-10-01, and Task 17 writes it into the spec. Read these before starting any task:
+**Spec:** `docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md`, signed off at `87365a1` on `main` `7ee733b` (M4 amendments `70502d1`, storage-write marking `745f76f`, rollback restore `e359c32`, M5's amendments `ebae611`, whose §10.3 delete order Task 9's `remove_locked` follows, and the profile-read wording `87365a1`, which Decision 19 follows). Decision 16 amends §12.6; Michael signed it off on 2026-10-01, and Task 17 writes it into the spec. Read these before starting any task:
 - §2, §3, §4.2, §4.3, §4.5, §5, §6.1, §6.2;
 - §7.2, §7.3, §7.5, §8.1;
 - §9.2, §9.4, §9.6, §10.1, §10.3;
@@ -125,13 +125,18 @@ Rulings made while planning. Each names what it would cost if wrong.
     - `Engine::statusline` answers `NoLogin` under an unreadable marker (Task 15).
     - `remove`'s spelling warning stays a WARN log, and `doctor` (M5) reports orphaned items (Task 9).
     - A seed write failure after a capture stops the gate with an error (Task 10).
+19. **A profile's files are found by its actual directory, its Keychain items by its recorded spelling** (the spec's §12.2, §12.5 and B.58 say so since `87365a1`; signed off by Michael on 2026-10-02). The actual directory is where the profile is now: `profile_path(env, id)`, whose canonical path is the current spelling. The recorded spelling is the marker's `configDir`. The two differ once the data directory has moved, which §12.2 supports: the marker still names the old path, and the profile's hashed items are still named from it, until M4b's next bootstrap deletes the old item and records the new spelling.
+    - `read_profile_credential(env, dir, spelling)` reads the item named from `spelling`, then the credential file in `dir`. `profile_identity(env, dir)` reads the identity in `dir`. Claude Code's files come from `session::profile_paths(env, dir)` and its items from `session::profile_env(env, spelling)`. FakeAgent keeps no item, so it reads `dir` alone (`profile_env_in`).
+    - Their callers pass the profile's directory: the session state's `profile` in the gate's provenance (Task 10) and the session-owned usage read (Task 12), and the run shell's `profile` in `status`'s session line (Task 14).
+    - **Why:** a spelling alone assumes the two name one place. After a move, the identity and the file would be looked for under the old path, where nothing is. A quiescent profile's rotation would then go uncaptured, and the gate would refresh the vault's older generation, which that rotation consumed.
+    - **Cost if wrong** (if the two never differed): a `dir` beside the spelling on `read_profile_credential`, and one more private helper per provider (`profile_paths`, `profile_env_in`).
 
 ## Global Constraints
 
 Every task's requirements include these. Values are copied from the spec.
 
 - Platforms: macOS and Linux only (§1.2). Rust edition 2024, MSRV ≥ 1.85 (§16).
-- Keychain access only through `/usr/bin/security` (§4.4, Appendix A.3). Profile Keychain items are named from the **recorded** spelling, never a re-derived one (§12.2, Appendix A.2): `"Claude Code-credentials-" + hex(sha256(NFC(spelling)))[..8]`.
+- Keychain access only through `/usr/bin/security` (§4.4, Appendix A.3). Profile Keychain items are named from the **recorded** spelling, never a re-derived one (§12.2, Appendix A.2): `"Claude Code-credentials-" + hex(sha256(NFC(spelling)))[..8]`. A profile's files are read in its actual directory, never under the spelling (Decision 19).
 - `~/.claude.json` and other CC files are never re-serialized; only the §9.5 splice writes them. Profile files that tagteam owns (`.tagteam-*`) are written with the atomic writer, mode 0600, and their directories are created 0700 (§5).
 - Every read is tri-state (`Read<T>`); unreadable is never absent (§4.3, B.1). A malformed session record counts as **unreadable**, and an unreadable record makes the account session-owned (§10.3, §12.6).
 - Anything about liveness that cannot be determined counts as live (§12.6).
@@ -486,10 +491,13 @@ pub trait Provider: Send + Sync {
     fn share_policy(&self, env: &Env) -> SharePolicy;
     /// Where the profile's session records live (CC: `<profile>/sessions`).
     fn session_records_dir(&self, profile: &Path) -> PathBuf;
-    /// §8.1, §12.5: the profile's credential, read as the agent reads it, for `spelling`.
-    fn read_profile_credential(&self, env: &Env, spelling: &str) -> Read<Credential>;
-    /// §12.5 "Identity drift": the profile's login identity (CC: its `.claude.json` `oauthAccount`).
-    fn profile_identity(&self, env: &Env, spelling: &str) -> Read<Identity>;
+    /// §8.1, §12.5: the profile's credential, read as the agent reads it (Decision 19): the
+    /// Keychain item named from `spelling`, the marker's recorded spelling, then the credential
+    /// file in `dir`, the profile's actual directory.
+    fn read_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Read<Credential>;
+    /// §12.5 "Identity drift": the login identity of the profile in `dir`, its actual directory
+    /// (CC: its `.claude.json` `oauthAccount`; Decision 19).
+    fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>;
     /// §10.3: deletes the agent-owned credential items for `spelling` and verifies them gone
     /// (CC macOS: the hashed Keychain item; otherwise nothing outside the directory).
     fn delete_profile_credential(&self, env: &Env, spelling: &str) -> Result<(), ProviderError>;
@@ -528,13 +536,17 @@ pub(crate) const CC_PRIVATE: &[&str] = &[
 pub(crate) fn outer_home(env: &Env) -> Value;
 pub(crate) fn apply_outer_home(env: &Env, outer: &Value) -> Result<Env, ProviderError>;
 /// The profile `Env`: `claude_config_dir = Some(spelling)`, `claude_securestorage_config_dir = None`.
+/// It names the profile's Keychain items, from the recorded spelling (§12.2).
 pub(crate) fn profile_env(env: &Env, spelling: &str) -> Env;
+/// The files of the profile in `dir`, its actual directory: `CcPaths` with `CLAUDE_CONFIG_DIR`
+/// naming `dir` and secure storage undefined (Decision 19).
+pub(crate) fn profile_paths(env: &Env, dir: &Path) -> CcPaths;
 ```
 
 `ClaudeCode` implements the session methods with these helpers:
 - `launch_command` is `"claude"`, and `session_dir_var` is `Some("CLAUDE_CONFIG_DIR")`.
-- `read_profile_credential` is `LiveStore::read_credential(&profile_env, &CcPaths::resolve(&profile_env))`.
-- `profile_identity` is `config::live_identity(&CcPaths::resolve(&profile_env))`.
+- `read_profile_credential` is `LiveStore::read_credential(&profile_env(env, spelling), &profile_paths(env, dir))`: the item named from the recorded spelling, then the file in `dir` (Decision 19).
+- `profile_identity` is `config::live_identity(&profile_paths(env, dir))`.
 - `delete_profile_credential` uses `LiveStore`'s remove path on the OAuth and managed-key items of `profile_env`, verified with the existence probe. On Linux it is a no-op.
 - `invoked_by` is `env.var("CLAUDECODE") == Some("1") || session_dir(env).is_some()`.
 
@@ -546,8 +558,9 @@ pub(crate) fn profile_env(env: &Env, spelling: &str) -> Env;
 - Session records live in `<profile>/procs`.
 - `outer_home` is `{"FAKEAGENT_HOME": <string>|null}`.
 - `profile_spelling` is the path as is.
-- `read_profile_credential` reads `<spelling>/credential.json`.
-- `profile_identity` reads `<spelling>/identity.json`.
+- `read_profile_credential` reads `<dir>/credential.json`; FakeAgent keeps no item, so it names nothing after a spelling (Decision 19).
+- `profile_identity` reads `<dir>/identity.json`.
+- Both resolve the profile through a private `profile_env_in(env, dir)`, whose `FAKEAGENT_HOME` names `dir`; M4b's seed and merge-back reuse it.
 - `delete_profile_credential` is a no-op.
 - `invoked_by` is `false`.
 
@@ -6216,7 +6229,14 @@ Task 9 reads reservations and records, and Task 13 consumes `share_policy`.
 - **The profile `Env`** sets `CLAUDE_CONFIG_DIR` to the recorded spelling and drops
   `CLAUDE_SECURESTORAGE_CONFIG_DIR`, as `run`'s scrub does (§12.5). So the profile's item is
   `"Claude Code-credentials-" + hex(sha256(NFC(spelling)))[..8]` whatever the outer environment
-  holds, and its `.credentials.json` and `.claude.json` resolve inside the profile.
+  holds.
+- **The profile's files are found by its directory** (Decision 19). `profile_paths(env, dir)` is
+  the same view with `CLAUDE_CONFIG_DIR` naming `dir`, the profile's actual directory, so its
+  `.credentials.json` and `.claude.json` resolve where the profile is now. The recorded spelling
+  names the old path once the data directory has moved, and nothing is there. So
+  `read_profile_credential` takes both: the item from `spelling`, the file from `dir`.
+  `profile_identity` reads only a file, so it takes `dir` alone. FakeAgent keeps no item, and
+  reads both from `dir` (`profile_env_in`).
 - **`delete_profile_credential`** deletes the OAuth item and the managed-key item for the
   spelling, each verified `Absent` with the existence probe (Appendix A.3). An absent item counts
   as deleted. An item that survives its delete, or a probe that cannot say, is `ShadowingItem`.
@@ -6242,7 +6262,7 @@ Task 9 reads reservations and records, and Task 13 consumes `share_policy`.
 - Modify: `crates/tagteam-cc/src/provider.rs` (imports, lines 1, 9–14 and 23; the twelve methods
   at the end of `impl Provider for ClaudeCode`, after line 481)
 - Modify: `crates/tagteam-fake/src/paths.rs` (`HOME_VAR`; `FakePaths::resolve`, lines 17–26)
-- Modify: `crates/tagteam-fake/src/provider.rs` (imports, lines 14–19 and 23; `profile_env`;
+- Modify: `crates/tagteam-fake/src/provider.rs` (imports, lines 14–19 and 23; `profile_env_in`;
   `capabilities`, lines 174–180; the twelve methods at the end of `impl Provider for FakeAgent`,
   after line 550)
 - Test: `crates/tagteam-provider/src/profile.rs` and `crates/tagteam-provider/src/env.rs`
@@ -6269,11 +6289,15 @@ Task 9 reads reservations and records, and Task 13 consumes `share_policy`.
     `Env::var(&self, name: &str) -> Option<&OsStr>`
   - `EntryKind { Dir, File }`, `MustShare { name, kind }`,
     `SharePolicy { source, shared, must_share, private }`, re-exported
-  - `Provider::{launch_command, session_dir_var, session_dir, outer_home, apply_outer_home, profile_spelling, share_policy, session_records_dir, read_profile_credential, profile_identity, delete_profile_credential, invoked_by}`
-  - `tagteam_cc::session::{CC_SHARED, CC_MUST_SHARE, CC_PRIVATE, outer_home, apply_outer_home, profile_env}`
-    (`pub(crate)`)
+  - `Provider::{launch_command, session_dir_var, session_dir, outer_home, apply_outer_home, profile_spelling, share_policy, session_records_dir, read_profile_credential, profile_identity, delete_profile_credential, invoked_by}`,
+    with `read_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Read<Credential>`
+    and `profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>` (Decision 19)
+  - `tagteam_cc::session::{CC_SHARED, CC_MUST_SHARE, CC_PRIVATE, outer_home, apply_outer_home, profile_env, profile_paths}`
+    (`pub(crate)`), with `profile_paths(env: &Env, dir: &Path) -> CcPaths`
   - `LiveStore::delete_items(&self, env: &Env) -> Result<(), ProviderError>` (`pub(crate)`)
-  - FakeAgent: `FakePaths::resolve` honours `FAKEAGENT_HOME`; `capabilities().sessions` is `true`
+  - FakeAgent: `FakePaths::resolve` honours `FAKEAGENT_HOME`; `capabilities().sessions` is `true`;
+    the private `profile_env_in(env: &Env, dir: &Path) -> Env`, which M4b's seed and merge-back
+    reuse
 
 **Spec:**
 - §5: the profile is `$XDG_DATA_HOME/tagteam/sessions/<id>/`, holding the marker, the seed and
@@ -6292,7 +6316,8 @@ Task 9 reads reservations and records, and Task 13 consumes `share_policy`.
 - §4.5 "Parallel sessions": the provider supplies the launch command, the outer home, the share
   policy and the records.
 - §8.1, §12.3 step 2: a profile's credential is read the way CC reads it, from the hashed item
-  for the recorded spelling, then `<profile>/.credentials.json`.
+  for the recorded spelling, then `<profile>/.credentials.json`, the profile being where it is
+  now (Decision 19).
 - §10.3: `remove` deletes the profile's hashed item, named from its recorded spelling.
 - §13.5: a process CC invoked has `CLAUDECODE` or `CLAUDE_CONFIG_DIR`.
 - Appendix A.1: an empty `CLAUDE_CONFIG_DIR` is unset; a defined `CLAUDE_SECURESTORAGE_CONFIG_DIR`
@@ -7432,21 +7457,21 @@ fn the_profile_credential_is_read_from_the_hashed_item_of_its_spelling() {
     let item = hashed("Claude Code-credentials", &spelling);
     assert!(
         matches!(
-            f.cc.read_profile_credential(&f.env, &spelling),
+            f.cc.read_profile_credential(&f.env, &dir, &spelling),
             Read::Absent
         ),
         "a new profile has none"
     );
     f.kc.put(&item, &acct, ENTRY);
     let c =
-        f.cc.read_profile_credential(&f.env, &spelling)
+        f.cc.read_profile_credential(&f.env, &dir, &spelling)
             .present()
             .unwrap();
     assert_eq!((c.bytes(), c.provenance()), (ENTRY, Provenance::Fresh));
     // §12.5: the profile env drops the outer secure-storage dir, so it plays no part.
     let outer = with_vars(&f.env, Some("/elsewhere"), Some(""));
     assert_eq!(
-        f.cc.read_profile_credential(&outer, &spelling)
+        f.cc.read_profile_credential(&outer, &dir, &spelling)
             .present()
             .unwrap()
             .bytes(),
@@ -7454,18 +7479,18 @@ fn the_profile_credential_is_read_from_the_hashed_item_of_its_spelling() {
     );
     // Another spelling of the same directory names another item (Appendix A.2).
     assert!(matches!(
-        f.cc.read_profile_credential(&f.env, &format!("{spelling}/")),
+        f.cc.read_profile_credential(&f.env, &dir, &format!("{spelling}/")),
         Read::Absent
     ));
     // Then `<profile>/.credentials.json`: it covers an unreadable item only as a degraded read.
     f.kc.set_unreadable(&item, &acct, true);
     assert!(matches!(
-        f.cc.read_profile_credential(&f.env, &spelling),
+        f.cc.read_profile_credential(&f.env, &dir, &spelling),
         Read::Unreadable(_)
     ));
     fs::write(dir.join(".credentials.json"), b"file").unwrap();
     let c =
-        f.cc.read_profile_credential(&f.env, &spelling)
+        f.cc.read_profile_credential(&f.env, &dir, &spelling)
             .present()
             .unwrap();
     assert_eq!(
@@ -7475,7 +7500,7 @@ fn the_profile_credential_is_read_from_the_hashed_item_of_its_spelling() {
     f.kc.set_unreadable(&item, &acct, false);
     f.kc.delete(&item, &acct).unwrap();
     let c =
-        f.cc.read_profile_credential(&f.env, &spelling)
+        f.cc.read_profile_credential(&f.env, &dir, &spelling)
             .present()
             .unwrap();
     assert_eq!(
@@ -7494,12 +7519,20 @@ fn on_linux_the_profile_credential_is_its_file_alone() {
         ENTRY,
     );
     assert!(matches!(
-        f.cc.read_profile_credential(&f.env, &spelling),
+        f.cc.read_profile_credential(&f.env, &dir, &spelling),
         Read::Absent
     ));
     fs::write(dir.join(".credentials.json"), b"file").unwrap();
     assert_eq!(
-        f.cc.read_profile_credential(&f.env, &spelling)
+        f.cc.read_profile_credential(&f.env, &dir, &spelling)
+            .present()
+            .unwrap()
+            .bytes(),
+        b"file"
+    );
+    // Decision 19: the file is where the profile is, whatever spelling the marker records.
+    assert_eq!(
+        f.cc.read_profile_credential(&f.env, &dir, "/moved-from/sessions/0192")
             .present()
             .unwrap()
             .bytes(),
@@ -7508,16 +7541,73 @@ fn on_linux_the_profile_credential_is_its_file_alone() {
 }
 
 #[test]
+fn a_moved_profile_is_read_from_its_old_spelling_s_item_and_from_its_files_where_it_is() {
+    // Decision 19, §12.2: the data directory moved, so the marker's recorded spelling names a
+    // path that is gone. The profile's hashed item is still named from it, and its files are
+    // where the profile is now.
+    let f = fx();
+    let (dir, current) = profile(&f, "0192");
+    let old = f.env.home.join("moved-from/sessions/0192");
+    let old = old.to_str().unwrap();
+    let acct = keychain_account(&f.env);
+    let item = hashed("Claude Code-credentials", old);
+    f.kc.put(&item, &acct, ENTRY);
+    f.kc.put(
+        &hashed("Claude Code-credentials", &current),
+        &acct,
+        b"the current spelling's item",
+    );
+    fs::write(dir.join(".credentials.json"), b"file").unwrap();
+    fs::write(
+        dir.join(".claude.json"),
+        json!({"oauthAccount": {"emailAddress": "p@x.co"}}).to_string(),
+    )
+    .unwrap();
+
+    let c =
+        f.cc.read_profile_credential(&f.env, &dir, old)
+            .present()
+            .unwrap();
+    assert_eq!(
+        (c.bytes(), c.provenance()),
+        (ENTRY, Provenance::Fresh),
+        "the item the recorded spelling names, never one derived again"
+    );
+    f.kc.delete(&item, &acct).unwrap();
+    assert_eq!(
+        f.cc.read_profile_credential(&f.env, &dir, old)
+            .present()
+            .unwrap()
+            .bytes(),
+        b"file",
+        "then the file where the profile is"
+    );
+    assert!(
+        matches!(
+            f.cc.read_profile_credential(&f.env, Path::new(old), old),
+            Read::Absent
+        ),
+        "under the old path there is nothing"
+    );
+    let id = f.cc.profile_identity(&f.env, &dir).present().unwrap();
+    assert_eq!(id.email.as_deref(), Some("p@x.co"));
+    assert!(matches!(
+        f.cc.profile_identity(&f.env, Path::new(old)),
+        Read::Absent
+    ));
+}
+
+#[test]
 fn the_profile_identity_is_the_profile_s_own_oauth_account() {
     let f = fx();
-    let (dir, spelling) = profile(&f, "0192");
+    let (dir, _) = profile(&f, "0192");
     fs::write(
         f.env.home.join(".claude.json"),
         json!({"oauthAccount": {"emailAddress": "default@x.co"}}).to_string(),
     )
     .unwrap();
     assert!(matches!(
-        f.cc.profile_identity(&f.env, &spelling),
+        f.cc.profile_identity(&f.env, &dir),
         Read::Absent
     ));
     fs::write(
@@ -7526,14 +7616,14 @@ fn the_profile_identity_is_the_profile_s_own_oauth_account() {
             .to_string(),
     )
     .unwrap();
-    let id = f.cc.profile_identity(&f.env, &spelling).present().unwrap();
+    let id = f.cc.profile_identity(&f.env, &dir).present().unwrap();
     assert_eq!(
         (id.email.as_deref(), id.org_uuid.as_str()),
         (Some("p@x.co"), "org-1")
     );
     fs::write(dir.join(".claude.json"), b"{\"oauthAccount\": {").unwrap();
     assert!(matches!(
-        f.cc.profile_identity(&f.env, &spelling),
+        f.cc.profile_identity(&f.env, &dir),
         Read::Unreadable(_)
     ));
 }
@@ -7744,32 +7834,46 @@ fn its_outer_home_round_trips_unset_set_and_empty() {
 }
 
 #[test]
-fn its_profile_credential_and_identity_are_read_under_the_spelling() {
+fn its_profile_credential_and_identity_are_read_in_the_profile_s_directory() {
     let f = fx();
     let profile = f.env.data_dir().join("sessions/0193");
     fs::create_dir_all(&profile).unwrap();
     let spelling = profile.to_str().unwrap();
+    // Decision 19: a spelling the data directory has moved away from names nothing FakeAgent
+    // reads, since it keeps no item.
+    let gone = f.env.home.join("moved-from/sessions/0193");
+    let gone = gone.to_str().unwrap();
     login(&f.env, "alice", "ws", "tok-live", "renew-live");
     assert!(matches!(
-        f.fake.read_profile_credential(&f.env, spelling),
+        f.fake.read_profile_credential(&f.env, &profile, spelling),
         Read::Absent
     ));
     assert!(matches!(
-        f.fake.profile_identity(&f.env, spelling),
+        f.fake.profile_identity(&f.env, &profile),
         Read::Absent
     ));
     login(&with_home(&f, spelling), "bob", "ws2", "tok-p", "renew-p");
-    let c = f
-        .fake
-        .read_profile_credential(&f.env, spelling)
-        .present()
-        .unwrap();
-    assert_eq!(c.provenance(), Provenance::Fresh);
-    assert_eq!(
-        f.fake.fingerprint(c.bytes()),
-        Some(tagteam_core::Fingerprint::of_secret(b"renew-p"))
+    for recorded in [spelling, gone] {
+        let c = f
+            .fake
+            .read_profile_credential(&f.env, &profile, recorded)
+            .present()
+            .unwrap();
+        assert_eq!(c.provenance(), Provenance::Fresh, "{recorded}");
+        assert_eq!(
+            f.fake.fingerprint(c.bytes()),
+            Some(tagteam_core::Fingerprint::of_secret(b"renew-p")),
+            "{recorded}"
+        );
+    }
+    assert!(
+        f.fake
+            .read_profile_credential(&f.env, std::path::Path::new(gone), gone)
+            .present()
+            .is_none(),
+        "nothing is where the profile was"
     );
-    let id = f.fake.profile_identity(&f.env, spelling).present().unwrap();
+    let id = f.fake.profile_identity(&f.env, &profile).present().unwrap();
     assert_eq!(id.label, "bob@ws2");
     f.fake.delete_profile_credential(&f.env, spelling).unwrap();
     assert!(
@@ -7778,7 +7882,7 @@ fn its_profile_credential_and_identity_are_read_under_the_spelling() {
     );
     fs::write(profile.join("identity.json"), b"{\"identity\": {").unwrap();
     assert!(matches!(
-        f.fake.profile_identity(&f.env, spelling),
+        f.fake.profile_identity(&f.env, &profile),
         Read::Unreadable(_)
     ));
 }
@@ -7904,8 +8008,10 @@ pub struct SharePolicy {
 At the end of `trait Provider`, after `live_identity_source`, add:
 
 ```rust
-    // §4.5 "Parallel sessions" (§12). Every profile operation takes the recorded spelling,
-    // never one derived again (§12.2).
+    // §4.5 "Parallel sessions" (§12). A profile's Keychain items are named from the recorded
+    // spelling, never one derived again (§12.2). Its files are found by `dir`, its actual
+    // directory, which differs from that spelling once the data directory has moved
+    // (Decision 19).
     /// The command a session runs (CC: `claude`).
     fn launch_command(&self) -> &'static str;
     /// The variable that names a profile (CC: `CLAUDE_CONFIG_DIR`); `None` without sessions.
@@ -7923,10 +8029,13 @@ At the end of `trait Provider`, after `live_identity_source`, add:
     fn share_policy(&self, env: &Env) -> SharePolicy;
     /// Where the profile's session records live (CC: `<profile>/sessions`).
     fn session_records_dir(&self, profile: &Path) -> PathBuf;
-    /// §8.1, §12.5: the profile's credential, read as the agent reads it, for `spelling`.
-    fn read_profile_credential(&self, env: &Env, spelling: &str) -> Read<Credential>;
-    /// §12.5 "Identity drift": the profile's login identity (CC: its `.claude.json` `oauthAccount`).
-    fn profile_identity(&self, env: &Env, spelling: &str) -> Read<Identity>;
+    /// §8.1, §12.5: the profile's credential, read as the agent reads it (Decision 19): the
+    /// Keychain item named from `spelling`, the marker's recorded spelling, then the credential
+    /// file in `dir`, the profile's actual directory.
+    fn read_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Read<Credential>;
+    /// §12.5 "Identity drift": the login identity of the profile in `dir`, its actual directory
+    /// (CC: its `.claude.json` `oauthAccount`; Decision 19).
+    fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>;
     /// §10.3: deletes the agent-owned credential items for `spelling` and verifies them gone
     /// (CC macOS: the hashed Keychain item; otherwise nothing outside the directory).
     fn delete_profile_credential(&self, env: &Env, spelling: &str) -> Result<(), ProviderError>;
@@ -7949,12 +8058,16 @@ pub use provider::{
 
 ```rust
 //! Claude Code's half of §12: what a profile shares (§12.2's tables), the record of the outer
-//! home, and the environment every profile credential operation resolves paths with (§12.5).
+//! home, and the two views every profile credential operation resolves through (§12.5): the
+//! recorded spelling for its Keychain items, its actual directory for its files (Decision 19).
 
 use std::ffi::OsString;
+use std::path::Path;
 
 use serde_json::{Value, json};
 use tagteam_provider::{EntryKind, Env, ProviderError};
+
+use crate::paths::CcPaths;
 
 pub(crate) const CC_SHARED: &[&str] = &[
     "CLAUDE.md",
@@ -8058,12 +8171,25 @@ pub(crate) fn apply_outer_home(env: &Env, outer: &Value) -> Result<Env, Provider
 
 /// The profile `Env`: `claude_config_dir = Some(spelling)`, `claude_securestorage_config_dir = None`.
 /// It is the session environment's view of the profile (§12.5 scrubs the secure-storage dir),
-/// so the Keychain item, `.credentials.json` and `.claude.json` all resolve inside it.
+/// so the profile's Keychain items, named from the recorded spelling (§12.2), resolve from it.
+/// Its files resolve from it only while `spelling` still names where the profile is; a read
+/// finds them with `profile_paths` (Decision 19).
 pub(crate) fn profile_env(env: &Env, spelling: &str) -> Env {
     let mut out = env.clone();
     out.claude_config_dir = Some(OsString::from(spelling));
     out.claude_securestorage_config_dir = None;
     out
+}
+
+/// The files of the profile in `dir`, its actual directory, as Claude Code resolves them with
+/// `CLAUDE_CONFIG_DIR` naming it and secure storage undefined (Decision 19). Its Keychain items
+/// are named from the recorded spelling instead (`profile_env`), which names the old path once
+/// the data directory has moved (§12.2).
+pub(crate) fn profile_paths(env: &Env, dir: &Path) -> CcPaths {
+    let mut at = env.clone();
+    at.claude_config_dir = Some(dir.as_os_str().to_owned());
+    at.claude_securestorage_config_dir = None;
+    CcPaths::resolve(&at)
 }
 ```
 
@@ -8157,16 +8283,19 @@ At the end of `impl Provider for ClaudeCode`, after `live_identity_source`, add:
         profile.join("sessions")
     }
 
-    /// The hashed Keychain item for `spelling`, then `<spelling>/.credentials.json`, exactly
-    /// as the live read takes them (§12.3 step 2).
-    fn read_profile_credential(&self, env: &Env, spelling: &str) -> Read<Credential> {
-        let profile = session::profile_env(env, spelling);
-        self.live
-            .read_credential(&profile, &CcPaths::resolve(&profile))
+    /// The hashed Keychain item named from `spelling`, the recorded spelling, then
+    /// `.credentials.json` in `dir`, where the profile is now (Decision 19), exactly as the
+    /// live read takes them (§12.3 step 2).
+    fn read_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Read<Credential> {
+        self.live.read_credential(
+            &session::profile_env(env, spelling),
+            &session::profile_paths(env, dir),
+        )
     }
 
-    fn profile_identity(&self, env: &Env, spelling: &str) -> Read<Identity> {
-        config::live_identity(&CcPaths::resolve(&session::profile_env(env, spelling)))
+    /// The `oauthAccount` of the config in `dir`, where the profile is now (Decision 19).
+    fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity> {
+        config::live_identity(&session::profile_paths(env, dir))
     }
 
     /// Both axes' items for `spelling`; the profile's `.credentials.json` goes with its
@@ -8236,10 +8365,12 @@ and `use crate::paths::FakePaths;` (line 23) becomes `use crate::paths::{FakePat
 Before `showable_token`, add:
 
 ```rust
-/// FakeAgent run for a profile: its home variable names `spelling`.
-fn profile_env(env: &Env, spelling: &str) -> Env {
+/// FakeAgent run for the profile in `dir`, its actual directory (Decision 19): its home variable
+/// names `dir`. FakeAgent keeps no Keychain item, so nothing of a profile is named after its
+/// recorded spelling, which names the old path once the data directory has moved.
+fn profile_env_in(env: &Env, dir: &Path) -> Env {
     let mut out = env.clone();
-    out.vars.insert(HOME_VAR.into(), spelling.into());
+    out.vars.insert(HOME_VAR.into(), dir.as_os_str().to_owned());
     out
 }
 ```
@@ -8327,14 +8458,15 @@ and at the end of `impl Provider for FakeAgent`, after `live_identity_source`, a
         profile.join("procs")
     }
 
-    /// `<spelling>/credential.json`, a plain file like the live one.
-    fn read_profile_credential(&self, env: &Env, spelling: &str) -> Read<Credential> {
-        self.read_live_auth(&profile_env(env, spelling)).credential
+    /// `<dir>/credential.json`, a plain file like the live one. FakeAgent keeps no item, so it
+    /// names nothing after the spelling (Decision 19).
+    fn read_profile_credential(&self, env: &Env, dir: &Path, _spelling: &str) -> Read<Credential> {
+        self.read_live_auth(&profile_env_in(env, dir)).credential
     }
 
-    /// The `identity` key of `<spelling>/identity.json`.
-    fn profile_identity(&self, env: &Env, spelling: &str) -> Read<Identity> {
-        self.live_identity(&profile_env(env, spelling))
+    /// The `identity` key of `<dir>/identity.json`.
+    fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity> {
+        self.live_identity(&profile_env_in(env, dir))
     }
 
     /// FakeAgent keeps nothing outside the profile directory.
@@ -8352,7 +8484,7 @@ and at the end of `impl Provider for FakeAgent`, after `live_identity_source`, a
 - [ ] **Step 4: Run them and see them pass**, then the crates' whole suites
 
 Run: `cargo test -p tagteam-provider -p tagteam-cc -p tagteam-fake`
-Expected: PASS, including `session.rs`'s 11 tests and the four new FakeAgent tests.
+Expected: PASS, including `session.rs`'s 12 tests and the four new FakeAgent tests.
 
 Run: `cargo test --workspace --features tagteam/test-support`
 Expected: PASS. Nothing in the engine or the CLI calls the new methods yet, and `vars` is empty
@@ -9719,7 +9851,7 @@ is live by §12.6's pid and start-time rules. This task computes that state on e
   profile, which §12.5 says is "never touched". The guard runs under the mutation lock and the
   occupant's account lock, before any write. That is the only time a reservation cannot appear
   (§12.5).
-- **`remove_locked` deletes in §10.3's order** (the M5 amendment, `089b873`): the vault
+- **`remove_locked` deletes in §10.3's order** (the M5 amendment, `ebae611`): the vault
   entries, then the account's rescue files, then the session profile, and last the row. The
   vault goes first, so no generation older than a rescue or a rotated profile can outlive it.
   An account without a vault credential is never switched to, refreshed or launched. The row
@@ -10860,8 +10992,12 @@ further change. Task 11 applies the same check in `switch`'s transaction.
 **Readings of the spec this task commits to:**
 - **What "applies" means.** Provenance applies only to a quiescent profile that has a seed. A
   profile without one was never bootstrapped, and M4a has no bootstrap. It also needs a marker
-  for this account and provider, whose `configDir` is the spelling every credential read uses
-  (§12.2).
+  for this account and provider, whose `configDir` is the spelling that names the profile's
+  Keychain item (§12.2).
+- **The profile is read where it is** (Decision 19). Its identity and its credential file are
+  read in its actual directory, the session state's `profile`, and only the hashed item is
+  named from the marker's spelling. After the data directory moves, the marker still records
+  the old path, where nothing is, so a quiescent profile that rotated is still captured.
 - **Identity drift ignores the profile.** The profile's identity is compared with the
   account's: the email (the label, for a provider whose identities carry none), and the
   organization when both name one. If they differ, or the profile names no login, provenance
@@ -10898,8 +11034,12 @@ further change. Task 11 applies the same check in `switch`'s transaction.
 
 **Interfaces:**
 - Consumes:
-  - Task 7: `tagteam_provider::profile::{ProfileMarker, Seed, MARKER_FILE, SEED_FILE}`, `Provider::{read_profile_credential, profile_identity}`
-  - Task 9: `Engine::session_state`, `SessionState::Quiescent`; `Fx::{make_profile, write_seed, set_profile_credential, profile_item, hold_reservation}`
+  - Task 7: `tagteam_provider::profile::{ProfileMarker, Seed, MARKER_FILE, SEED_FILE, canonical_profile_path}`,
+    `Provider::read_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Read<Credential>`
+    and `Provider::profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>` (Decision 19),
+    `Provider::profile_spelling`
+  - Task 8: `Fx::{profile_dir, write_marker}`
+  - Task 9: `Engine::session_state`, `SessionState::Quiescent`; `Fx::{make_profile, write_seed, set_profile_credential, item_for_spelling, profile_item, hold_reservation}`
   - Existing: `Engine::persist_generation(&self, p, row, lock, bytes)`, `refresh.rs`'s `transient`
 - Produces:
   - `tagteam_core::provenance::{ProvenanceVerdict, provenance}`, re-exported as `tagteam_core::{ProvenanceVerdict, provenance}`
@@ -10914,6 +11054,8 @@ further change. Task 11 applies the same check in `switch`'s transaction.
 - §12.5 "Lazy capture": quiescent, rotated according to its provenance, and the same identity;
   under the account lock; at the gate.
 - §12.5 "Identity drift": a profile whose email, or org when both are set, differs is ignored.
+- §12.2 "One spelling": the item is named from the recorded spelling, which a moved data
+  directory leaves naming the old path (Decision 19).
 - §7.3 step 3, third bullet: adopt a rotated profile first; return `Conflict` without a request.
 - §6.2 "What automatic captures may write": never degraded, never a credential without a
   refresh token over one with it, a profile capture needs quiescence and provenance, never a
@@ -11166,7 +11308,9 @@ use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
 use tagteam_engine::refresh::GateOutcome;
 use tagteam_provider::http::Method;
-use tagteam_provider::profile::{MARKER_FILE, SEED_FILE, Seed};
+use tagteam_provider::profile::{
+    MARKER_FILE, ProfileMarker, SEED_FILE, Seed, canonical_profile_path,
+};
 use tagteam_provider::{Clock, Provider, Read};
 
 /// `rt`'s credential for a@x.co, its access token expiring at `expires_at`.
@@ -11325,6 +11469,64 @@ fn on_linux_a_rotated_profile_is_captured_from_its_file() {
 }
 
 #[test]
+fn a_rotated_profile_is_still_captured_after_the_data_directory_moved() {
+    // Decision 19, §12.2: the profile rotated, then moved with the data directory, so its
+    // canonical path changed while its marker keeps the old spelling. Its identity and its file
+    // are read where it is now, and on macOS its hashed item under the old spelling, into which
+    // Claude Code had moved the file (Appendix A.3). The rotation is captured, and its token is
+    // still valid, so nothing is sent.
+    for platform in [Platform::MacOs, Platform::Linux] {
+        let fx = Fx::with_platform(platform);
+        let a = two_accounts(&fx);
+        let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
+        let rotated = cred_at("rt-a2", fx.clock.now_ms() + 30 * 60_000);
+        // The quiescent profile, bootstrapped and rotated under the data directory's old path.
+        let old = fx
+            .dir
+            .path()
+            .join("old-data/tagteam/sessions")
+            .join(a.as_str());
+        let marker = fx.write_marker(&old, &a, &fx.env);
+        fs::write(
+            old.join(".claude.json"),
+            json!({"oauthAccount": row.identity_json}).to_string(),
+        )
+        .unwrap();
+        fx.write_seed(&old, row.login_epoch, &fp(&fx, "rt-a"));
+        match platform {
+            Platform::MacOs => {
+                let (svc, acct) = fx.item_for_spelling(&marker.config_dir);
+                fx.kc.put(&svc, &acct, &rotated);
+            }
+            Platform::Linux => fx.set_profile_credential(&old, &rotated),
+        }
+        // The move: the profile is now where this data directory puts it.
+        let dir = fx.profile_dir(&a);
+        fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        fs::rename(&old, &dir).unwrap();
+        let current = fx
+            .cc
+            .profile_spelling(&canonical_profile_path(&dir).unwrap());
+        assert_ne!(marker.config_dir, current, "{platform:?}: the spelling changed");
+
+        let outcome = gate(&fx, &a);
+
+        let GateOutcome::AlreadyFresh(bytes) = outcome else {
+            panic!("{platform:?}: {outcome:?}")
+        };
+        assert_eq!(bytes, rotated, "{platform:?}");
+        assert_eq!(fx.vault_bytes(&a).unwrap(), rotated, "{platform:?}");
+        assert_eq!(token_requests(&fx), 0, "{platform:?}");
+        assert_eq!(seed_of(&dir).seed_fp, fp(&fx, "rt-a2"), "{platform:?}");
+        assert_eq!(
+            ProfileMarker::read(&dir).present().map(|m| m.config_dir),
+            Some(marker.config_dir.clone()),
+            "{platform:?}: only M4b's next bootstrap records the new spelling"
+        );
+    }
+}
+
+#[test]
 fn a_profile_the_vault_moved_past_is_left_alone() {
     // P = S: the vault moved on; P may be consumed and is never captured.
     let fx = Fx::new();
@@ -11469,6 +11671,11 @@ Expected: FAIL. The gate has no step-3 provenance yet, so these fail on their fi
 - `a_rotated_profile_is_captured_when_its_token_expires_earlier`: the gate returns `Refreshed`,
   and the scripted port has no reply queued, so it is `Transient` instead of `AlreadyFresh`.
 - `on_linux_a_rotated_profile_is_captured_from_its_file`: not `AlreadyFresh`.
+- `a_rotated_profile_is_still_captured_after_the_data_directory_moved`: on its first platform,
+  `MacOs`, the gate sends the vault's token, and the scripted port has no reply queued, so it
+  is `Transient` instead of `AlreadyFresh`. The test also pins Decision 19: a body that read the
+  identity or the credential file under the marker's spelling would find nothing at the old
+  path, return `NotApplicable`, and fail it the same way.
 - `an_in_step_profile_whose_seed_lags_is_reseeded_before_the_request`: the seed is still
   `rt-old`'s.
 - `a_conflict_sends_nothing_and_changes_nothing`: `Refreshed`, not `Conflict`.
@@ -11578,15 +11785,16 @@ impl Engine {
             }
             Read::Unreadable(e) => return Ok(unreadable(&e)),
         };
-        // §12.2: every read of the profile's credential uses the recorded spelling.
+        // §12.2: the profile's Keychain item is named from the recorded spelling, never one
+        // derived again; its files are read in `profile`, where the profile is now.
         let spelling = marker.config_dir.as_str();
-        match p.profile_identity(&self.env, spelling) {
+        match p.profile_identity(&self.env, &profile) {
             Read::Present(login) if !identity_drifted(&login, row) => {}
             // Another account's login, or none to compare: the profile is ignored (§12.5).
             Read::Present(_) | Read::Absent => return Ok(ProfileCheck::NotApplicable),
             Read::Unreadable(e) => return Ok(unreadable(&e)),
         }
-        let held = match p.read_profile_credential(&self.env, spelling) {
+        let held = match p.read_profile_credential(&self.env, &profile, spelling) {
             Read::Present(c) if c.provenance() == Provenance::Degraded => {
                 return Ok(ProfileCheck::Unreadable(format!(
                     "the credential of {} could be read only from its file, which may be out of date",
@@ -12879,6 +13087,8 @@ active and inactive. `collect_usage` decides it before any thread starts, and
     is §8.1's outcome for drift (Decision 10).
   - A degraded credential is used, unreadable gives `keychain-unavailable`, and absent or empty
     gives `no-access-token`.
+  - The identity and the credential file are read in the profile's directory, the session
+    state's `profile`, and only the hashed item under the marker's spelling (Decision 19).
 - **The drift rule is §12.5's, defined once.** The email is compared, or the label for an
   identity that has no email (FakeAgent's). The organization is compared only when both sides
   name one. It is `identity_drifted` in `provenance.rs` (Task 10, `pub(crate)`), which provenance
@@ -12935,8 +13145,8 @@ active and inactive. `collect_usage` decides it before any thread starts, and
 - Consumes:
   - **Task 7:**
     - `tagteam_provider::profile::{ProfileMarker, MARKER_FILE}`;
-    - `Provider::read_profile_credential(&self, env: &Env, spelling: &str) -> Read<Credential>`;
-    - `Provider::profile_identity(&self, env: &Env, spelling: &str) -> Read<Identity>`.
+    - `Provider::read_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Read<Credential>`;
+    - `Provider::profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>` (Decision 19).
   - **Task 8:** `Fx::make_profile(&self, id: &AccountId) -> PathBuf` (the marker and the stored
     row's identity in `.claude.json`).
   - **Task 9:**
@@ -12977,7 +13187,8 @@ active and inactive. `collect_usage` decides it before any thread starts, and
   remembered.
 - §8.3: a fetch that ends before sending gives back its slot.
 - §8.6: the candidate policy for any account that is not the default home's live login.
-- §12.2 "One spelling": every profile credential operation uses the recorded spelling.
+- §12.2 "One spelling": every profile credential operation names the item from the recorded
+  spelling; the profile's files are read where it is (Decision 19).
 - §12.5 "Identity drift": compare the email, and the org when both are set.
 - §12.6: an unreadable record counts as live, so the account is session-owned.
 - §12.8: the live login is always the default home's.
@@ -13875,8 +14086,9 @@ In `impl Collection<'_>`, after `fn active` (:368-383), add:
         Err(failed(self.refusal_kind()))
     }
 
-    /// The profile's credential as the agent in the session reads it (§8.1, §12.2), under the
-    /// spelling the marker records, never one derived again, and with no lock.
+    /// The profile's credential as the agent in the session reads it (§8.1, §12.2), with no
+    /// lock: its hashed item under the spelling the marker records, never one derived again,
+    /// and its files in `profile`, where it is now (Decision 19).
     /// - A marker that is missing, unreadable, or another account's names no spelling, so the
     ///   credential cannot be read: `keychain-unavailable` (Decision 9).
     /// - The identity comes first: the credential of a profile whose login is not the
@@ -13894,13 +14106,13 @@ In `impl Collection<'_>`, after `fn active` (:368-383), add:
                 return Err(failed("keychain-unavailable"));
             }
         };
-        match self.p.profile_identity(env, &spelling) {
+        match self.p.profile_identity(env, profile) {
             Read::Present(identity) if !identity_drifted(&identity, self.row) => {}
             Read::Present(_) | Read::Absent | Read::Unreadable(_) => {
                 return Err(failed("profile-drifted"));
             }
         }
-        match self.p.read_profile_credential(env, &spelling) {
+        match self.p.read_profile_credential(env, profile, &spelling) {
             Read::Present(c) if !c.is_empty() => Ok(c),
             Read::Present(_) | Read::Absent => Err(failed("no-access-token")),
             Read::Unreadable(_) => Err(failed("keychain-unavailable")),
@@ -16338,7 +16550,8 @@ The task has two cycles: the engine's views (cycle A) and the CLI's rendering (c
   since that session is not X's.
 - **An unmanaged session** (the marker names an account the store does not hold) is
   `session: null` in JSON. The text line names the profile's own login, read with
-  `Provider::profile_identity` for the marker's recorded spelling: its email, else its label.
+  `Provider::profile_identity` in the run shell's profile directory, where the marker was found
+  (Decision 19): its email, else its label.
   When the profile holds no readable login, the line says only `not managed by tagteam`. This
   read happens in the CLI for `status` alone, never in `Engine::shell_account`, which
   `statusline` also calls and which must not parse any `.claude.json` (§13.5).
@@ -16374,7 +16587,8 @@ The task has two cycles: the engine's views (cycle A) and the CLI's rendering (c
   - Task 7: `ProfileMarker { provider, account_id, config_dir, outer }` and `ProfileMarker::{read,
     write}`, `profile_path`, `canonical_profile_path`, `MARKER_FILE`, `LAUNCH_DIR`, `RunShell`,
     `Provider::{profile_spelling, outer_home, session_dir_var, session_records_dir,
-    profile_identity}`, all re-exported at the `tagteam_provider` root.
+    profile_identity}` (`profile_identity(env, dir)` takes the profile's directory, Decision 19),
+    all re-exported at the `tagteam_provider` root.
   - Task 8: `Engine::run_shell(&self) -> &RunShell`, `EngineConfig.{process, run_shell}`,
     `EngineError::RunShellUnreadable { marker, detail }` (`run-shell-unreadable`),
     `tagteam_engine::session::detect_run_shell`; the binary detects a run shell from
@@ -17699,16 +17913,16 @@ and add to `impl App<'_, '_>`, after `fn provider`:
         }
     }
 
-    /// The login the run shell's profile holds, as its provider reads it for the marker's
-    /// recorded spelling (§12.2): its email, else its label. Only `status`'s text asks, for an
-    /// account tagteam does not manage; §13.2's JSON has `session: null`, and `statusline`
-    /// never parses a profile (§13.5).
+    /// The login the run shell's profile holds, as its provider reads it in the profile's
+    /// directory, where the marker was found (Decision 19): its email, else its label. Only
+    /// `status`'s text asks, for an account tagteam does not manage; §13.2's JSON has
+    /// `session: null`, and `statusline` never parses a profile (§13.5).
     fn session_login(&self) -> Option<String> {
-        let RunShell::Inside { marker, .. } = self.engine.run_shell() else {
+        let RunShell::Inside { profile, marker } = self.engine.run_shell() else {
             return None;
         };
         let p = self.engine.provider(&marker.provider).ok()?;
-        p.profile_identity(self.engine.env(), &marker.config_dir)
+        p.profile_identity(self.engine.env(), profile)
             .present()
             .map(|i| i.email.unwrap_or(i.label))
     }
@@ -18821,8 +19035,9 @@ record would still count as live.
     - FakeAgent: `capabilities().sessions`, `FakePaths::resolve` honouring `FAKEAGENT_HOME`,
       `Provider::session_records_dir(&self, profile: &Path) -> PathBuf` (`<profile>/procs`),
       `Provider::share_policy(&self, env: &Env) -> SharePolicy` (shared `notes`, `prefs.json`;
-      must-share `journal.log`), and `read_profile_credential` and `profile_identity`, which
-      the gate's capture reads through;
+      must-share `journal.log`), and `read_profile_credential(env, dir, spelling)` and
+      `profile_identity(env, dir)`, which the gate's capture reads through, in the profile's
+      directory (Decision 19);
     - `Seed::{read, write}` and `LinksRecord::read`, re-exported at the `tagteam_provider` root.
   - Task 9:
     - `Engine::session_state(&self, p: &dyn Provider, row: &AccountRow) -> Result<SessionState,
