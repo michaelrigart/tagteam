@@ -273,7 +273,17 @@ pub struct Running {
 
 impl Running {
     /// Spawns `cmd` with its stdout and stderr piped, each drained on a thread of its own.
-    pub fn spawn(mut cmd: std::process::Command) -> Self {
+    pub fn spawn(cmd: std::process::Command) -> Self {
+        Self::spawn_reading(cmd, None)
+    }
+
+    /// As `spawn`, but its stdout is read only until `lines` lines are in, then closed with the
+    /// reader gone: the next write to it fails, as for `tagteam auto --json | head -n 1`.
+    pub fn spawn_closing_stdout_after(cmd: std::process::Command, lines: usize) -> Self {
+        Self::spawn_reading(cmd, Some(lines))
+    }
+
+    fn spawn_reading(mut cmd: std::process::Command, stdout_lines: Option<usize>) -> Self {
         let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -281,8 +291,8 @@ impl Running {
             .unwrap();
         let (out, err) = (Arc::default(), Arc::default());
         let readers = vec![
-            drain(child.stdout.take().unwrap(), Arc::clone(&out)),
-            drain(child.stderr.take().unwrap(), Arc::clone(&err)),
+            drain(child.stdout.take().unwrap(), Arc::clone(&out), stdout_lines),
+            drain(child.stderr.take().unwrap(), Arc::clone(&err), None),
         ];
         Running {
             child,
@@ -346,15 +356,24 @@ impl Running {
     }
 }
 
-/// Reads `from` until its end into `into`, on a thread of its own.
-fn drain(mut from: impl Read + Send + 'static, into: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()> {
+/// Reads `from` into `into` until its end, or, with `lines`, until that many lines are in
+/// (the pipe is dropped then, and the writer's next write fails), on a thread of its own.
+fn drain(
+    mut from: impl Read + Send + 'static,
+    into: Arc<Mutex<Vec<u8>>>,
+    lines: Option<usize>,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
         while let Ok(n) = from.read(&mut buf) {
             if n == 0 {
                 break;
             }
-            into.lock().unwrap().extend_from_slice(&buf[..n]);
+            let mut into = into.lock().unwrap();
+            into.extend_from_slice(&buf[..n]);
+            if lines.is_some_and(|l| into.iter().filter(|b| **b == b'\n').count() >= l) {
+                break;
+            }
         }
     })
 }

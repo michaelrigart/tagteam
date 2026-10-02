@@ -914,10 +914,11 @@ impl App<'_, '_> {
         let names = |p: &ProviderId| display_name(engine, p);
         let Io { out, err, .. } = &mut *self.io;
         let ended = if self.json {
-            let sink = JsonSink::new(&mut **out, &now_ms);
+            let sink = JsonSink::new(&mut **out, &now_ms).stopping(engine.cancel());
             auto::run_loop(engine, &run, &sink, &ThreadSleeper, &mut uniform_jitter)
         } else {
-            let sink = HumanSink::new(&mut **out, &mut **err, &now_ms, &names, color, several);
+            let sink = HumanSink::new(&mut **out, &mut **err, &now_ms, &names, color, several)
+                .stopping(engine.cancel());
             auto::run_loop(engine, &run, &sink, &ThreadSleeper, &mut uniform_jitter)
         };
         ended.map_err(|e| auto_failure(e, &names))

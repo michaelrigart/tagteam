@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{self, Write};
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ use tagteam_engine::settings::{
     COOLDOWN_SECONDS_RANGE, INTERVAL_SECONDS_RANGE, Settings, THRESHOLD_RANGE,
 };
 use tagteam_engine::{Engine, EngineError};
+use tagteam_provider::Cancel;
 
 use crate::render::{MISSING, RESET, duration, severity};
 
@@ -413,11 +414,25 @@ fn engine_running(provider: ProviderId) -> AutoEvent {
     }
 }
 
+/// Rust ignores SIGPIPE, so a reader that has gone away shows as `BrokenPipe` on a write. The
+/// command stops as SIGPIPE would have stopped it, through the cancel token (§14.1), so the loop
+/// ends at its next cancellation point and never inside a critical span. Any other write error
+/// is ignored, as is every write without a token.
+fn written(result: io::Result<()>, cancel: &Option<Cancel>) {
+    if let (Err(e), Some(cancel)) = (result, cancel) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            cancel.request(libc::SIGPIPE);
+        }
+    }
+}
+
 /// `--json` (§11.4): each event as one object on a line of its own.
 pub struct JsonSink<'a> {
     out: RefCell<&'a mut dyn Write>,
     /// The engine's wall clock, epoch milliseconds: each event's `ts`.
     now_ms: &'a dyn Fn() -> i64,
+    /// What a `BrokenPipe` on `out` stops the command through.
+    cancel: Option<Cancel>,
 }
 
 impl<'a> JsonSink<'a> {
@@ -425,7 +440,14 @@ impl<'a> JsonSink<'a> {
         JsonSink {
             out: RefCell::new(out),
             now_ms,
+            cancel: None,
         }
+    }
+
+    /// A write that fails with `BrokenPipe` (the reader is gone) records SIGPIPE in `cancel`.
+    pub fn stopping(mut self, cancel: &Cancel) -> Self {
+        self.cancel = Some(cancel.clone());
+        self
     }
 }
 
@@ -433,7 +455,7 @@ impl EventSink for JsonSink<'_> {
     fn emit(&self, e: &AutoEvent) {
         let line = event_json(e, (self.now_ms)().div_euclid(1000));
         let mut out = self.out.borrow_mut();
-        let _ = writeln!(out, "{line}");
+        written(writeln!(out, "{line}"), &self.cancel);
     }
 }
 
@@ -576,6 +598,8 @@ pub struct HumanSink<'a> {
     several: bool,
     /// Each provider's poll in this tick, until its outcome line uses it or the tick ends.
     polled: RefCell<BTreeMap<ProviderId, Polled>>,
+    /// What a `BrokenPipe` on `out` or `err` stops the command through.
+    cancel: Option<Cancel>,
 }
 
 /// What a tick's line says about the live account, from its `poll`.
@@ -604,7 +628,14 @@ impl<'a> HumanSink<'a> {
             color,
             several,
             polled: RefCell::new(BTreeMap::new()),
+            cancel: None,
         }
+    }
+
+    /// A write that fails with `BrokenPipe` (the reader is gone) records SIGPIPE in `cancel`.
+    pub fn stopping(mut self, cancel: &Cancel) -> Self {
+        self.cancel = Some(cancel.clone());
+        self
     }
 
     /// The time and, with several providers, the provider: how every line starts.
@@ -619,12 +650,18 @@ impl<'a> HumanSink<'a> {
 
     fn line(&self, now: i64, provider: &ProviderId, text: &str) {
         let mut out = self.out.borrow_mut();
-        let _ = writeln!(out, "{}{text}", self.head(now, provider));
+        written(
+            writeln!(out, "{}{text}", self.head(now, provider)),
+            &self.cancel,
+        );
     }
 
     fn err_line(&self, now: i64, provider: &ProviderId, label: &str, text: &str) {
         let mut err = self.err.borrow_mut();
-        let _ = writeln!(err, "{}{label}: {text}", self.head(now, provider));
+        written(
+            writeln!(err, "{}{label}: {text}", self.head(now, provider)),
+            &self.cancel,
+        );
     }
 
     /// A tick's line: the live account and its usage from this tick's poll, then `outcome`.
@@ -2021,5 +2058,55 @@ mod tests {
             ":20",
             "zones differ by whole minutes; T0 is :20 past"
         );
+    }
+
+    /// A writer that fails every write with `kind`.
+    struct Failing(io::ErrorKind);
+
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_broken_pipe_on_either_sink_stops_the_command_as_sigpipe_would() {
+        let now = || T0 * 1000;
+        let names = |p: &ProviderId| format!("<{p}>");
+        let engine_running = no_switch_event("engine-running", "");
+        let quiet = no_switch_event("cooldown", "");
+        let cases: [(&str, bool, &AutoEvent); 3] = [
+            ("json", false, &quiet),
+            ("human stdout", false, &quiet),
+            ("human stderr", true, &engine_running),
+        ];
+        for (name, on_err, event) in cases {
+            for (kind, want) in [
+                (io::ErrorKind::BrokenPipe, Some(libc::SIGPIPE)),
+                (io::ErrorKind::PermissionDenied, None),
+                (io::ErrorKind::WouldBlock, None),
+            ] {
+                let cancel = Cancel::new();
+                let mut broken = Failing(kind);
+                let mut fine = Vec::new();
+                match name {
+                    "json" => JsonSink::new(&mut broken, &now)
+                        .stopping(&cancel)
+                        .emit(event),
+                    _ if on_err => {
+                        HumanSink::new(&mut fine, &mut broken, &now, &names, false, false)
+                            .stopping(&cancel)
+                            .emit(event)
+                    }
+                    _ => HumanSink::new(&mut broken, &mut fine, &now, &names, false, false)
+                        .stopping(&cancel)
+                        .emit(event),
+                }
+                assert_eq!(cancel.requested(), want, "{name}: {kind:?}");
+            }
+        }
     }
 }
