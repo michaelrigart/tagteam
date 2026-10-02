@@ -670,8 +670,9 @@ impl Collection<'_> {
 
     /// §7.5, then the live token it leaves, read fresh. `Refreshed`, `PersistedNotPublished`,
     /// `PublishedOnly` and `NotNeeded` go on; `send` still refuses a token that is expired or
-    /// refused. `Dead` has quarantined the account (`relogin_required`). Any other outcome, and
-    /// any error, is a failure with a warning, never a command error (M2a Task 16's
+    /// refused. `Dead` has quarantined the account (`relogin_required`). `Replaced` is
+    /// `live-replaced` (Decision 10: `unavailable`), with a warning naming the forced switch
+    /// that activates the replacement (§7.5 step 2). Any other outcome, and any error, is a failure with a warning, never a command error (M2a Task 16's
     /// carry-over), except a live credential the oracle gives to another identity, which has a
     /// status of its own, and §14.1's interruption: no refresh starts once the token is set,
     /// and a lock wait inside §7.5 that meets it stops the fetch without a record. A kind that
@@ -694,6 +695,10 @@ impl Collection<'_> {
                 | ActiveOutcome::PublishedOnly,
             ) => self.live_bytes(),
             Ok(ActiveOutcome::Dead(_)) => Err(failed("refresh-failed")),
+            Ok(ActiveOutcome::Replaced) => {
+                self.warn_replaced();
+                Err(failed("live-replaced"))
+            }
             Ok(ActiveOutcome::Unpersisted) => {
                 self.warn_lost();
                 Err(failed("refresh-failed"))
@@ -963,6 +968,17 @@ impl Collection<'_> {
         self.warnings.push(format!(
             "{} (position {}) needs a new login: a refreshed token was lost while collecting usage",
             self.row.label, self.row.position
+        ));
+    }
+
+    /// §7.5 step 2: the live store holds a lineage an explicit replacement superseded. Names
+    /// the account by label and position, never a token, and the command that activates the
+    /// replacement.
+    fn warn_replaced(&mut self) {
+        self.warnings.push(format!(
+            "{label} (position {n})'s login was replaced while Claude Code kept the old one; run `tagteam switch {n} --force` to activate the replacement",
+            label = self.row.label,
+            n = self.row.position
         ));
     }
 

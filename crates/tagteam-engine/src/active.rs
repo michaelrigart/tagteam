@@ -59,6 +59,11 @@ pub enum ActiveOutcome {
     /// The successor is held nowhere: logged at ERROR, and the account quarantined
     /// `successor_lost` (§7.5 step 5, §7.4).
     Unpersisted,
+    /// §7.5 step 2: the account's activation epoch is stale (§12.5). An explicit command
+    /// replaced its login while Claude Code kept the old one, and adopting or refreshing that
+    /// lineage would undo the replacement. Nothing was read further, sent or written; Claude
+    /// Code goes on refreshing its own copy until `tagteam switch <N> --force`.
+    Replaced,
 }
 
 /// A successor neither the vault nor `rescue/` could take, while its live write is under way.
@@ -121,6 +126,11 @@ impl Engine {
             let (row, live) = self.active_login(p, provider)?;
             if &row.id != lock.id() {
                 return Err(EngineError::LiveMoved);
+            }
+            // §12.5: a replacement superseded the lineage the live store holds. `row` was read
+            // under the account lock, so its epoch cannot move before this returns.
+            if self.store()?.live_store_stale(&row)? {
+                return Ok(ActiveOutcome::Replaced);
             }
             // §7.4: a quarantined generation is never sent again.
             if let Some(reason) = self.active_quarantine(p, &row, &live)? {
