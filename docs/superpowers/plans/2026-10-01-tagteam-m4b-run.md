@@ -1,6 +1,6 @@
 # tagteam M4b — `tagteam run` Implementation Plan
 
-**Status:** Approved
+**Status:** In progress
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -45,6 +45,29 @@
 - **Run as a non-root user.** Tasks 10 and 11's `block_home` relies on a 0500 home being unwritable, and the full suite includes M4a's unlistable `0o000` directories (its Tasks 6 and 9). Root can write and list both, so those tests would fail as root.
 - **fish's wrapper text is pinned but was never run.** Task 2's unit test pins it, and `map_cli.rs` skips a shell that is not installed; fish was not installed where this plan was drafted. Task 14's row 7 runs it where fish is installed.
 - **The Linux paths are first run by CI's ubuntu job or by the Docker recipe** (Task 14 Step 1): `/dev/fd` as `/proc/self/fd` in Task 3's descriptor test, dash as `/bin/sh` under the fake `claude`, its 50 ms background sleeps and traps, and `ps -o lstart=` in its session records. Nothing in this plan has run on Linux yet.
+
+### Execution rulings
+
+**Re-sync with the merged code (2026-10-02).** The branch is `main` at `f85d2be`, which has M3a, M3b (PR #5), the release pipeline (PR #3) and M4a (PR #6). Every task was compared with that code, and `cargo check --workspace --all-targets` passed. Anchors and line numbers go to each task's implementer. These rulings change what a task does:
+- **Tasks 1, 2 and 12, M3b's `auto`.** The late-notice test, `command_name` and `run_shell_cli.rs`'s `COMMANDS` go in as deltas that keep M3b's `auto` entries.
+  - Task 2 also adds `shell-init zsh`, and Task 12 adds `run` and `run 1`, to the commands that must refuse under an unreadable marker.
+  - `run` keeps M3b's `stops_on_a_signal` and its SIGPIPE exemption, and gains only the `Ended::Child` arm.
+  - `run_command` maps `dispatch`'s exit code with `.map(Ended::Code)`.
+- **Task 4.** `remove_dead_reservations` treats a profile path that is not a directory as having no reservations, as M4a's `launch_reservations` does.
+- **Task 5.** `.tagteam-baseline.json` is read under M4a's own-file rule. A link there that resolves to nothing is unreadable, so the merge-back fails, keeps the baseline, and the launch aborts. CC's own `.claude.json` is still written through its link.
+- **Task 8.** `plan_run` refuses an unreadable run shell first.
+- **Task 9.**
+  - Before the credential write, the bootstrap checks that the profile path is a real directory, and refuses a symlinked one.
+  - On an `invalid` login it checks for a profile split before deleting the profile.
+  - Its step-4 write releases the profile's locks before step 5's `delete_profile_credential` takes them again.
+  - Two `EngineConfig` sites the plan does not list get the new field: `FakeFx::engine_located` and M3b's unit-test engine in `crates/tagteam/src/auto.rs`.
+- **Task 10, the launch guard.** The 30 s launch guard is built on M3b's guard functions and keeps their event source and recovery mapping: `guard_recovering` gains a timeout, and `guard_or_refuse_within(provider, timeout)` wraps a private `guard_or_refuse_for`.
+- **Task 10, `freshen_for_launch`.** It checks the cancel token before the gate. It judges "due" on the raw vault, because the gate and the launch settle provenance themselves.
+- **Task 10, tests.** New tests pin `profile-split`'s two launch causes.
+- **Task 11, the provenance body.** Its exit-time copy of the provenance body is a delta onto M4a's merged body. It keeps the final review's rule that an absent identity stops only a capture.
+- **Task 11, `finish_locked`.** It runs the reservation's unlink on every path once its locks are held.
+- **Task 12.** Inside a run shell, the recorded presence of `CLAUDE_SECURESTORAGE_CONFIG_DIR` follows the outer home, because M4a's outer home rewrites it. At most one corner-case warning is affected.
+- **Task 14.** The `--ignored` pass skips PR #3's two network tests by name.
 
 ## Milestones
 
