@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::keychain::{Keychain, KeychainError, LockState};
+use crate::process::drain;
 use crate::read::{Read, ReadError};
 
 pub const SECURITY: &str = "/usr/bin/security";
@@ -124,20 +125,6 @@ fn reap(child: &mut dyn Waitable) {
     if child.kill().is_ok() {
         let _ = child.wait();
     }
-}
-
-/// Reads a pipe to its end on a thread and sends what it read. The thread is detached, so a
-/// pipe that never closes costs one parked thread, not a hang.
-fn drain<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        let _ = tx.send(buf);
-    });
-    rx
 }
 
 /// The drained bytes, or `None` when the pipe had not closed by `until`.

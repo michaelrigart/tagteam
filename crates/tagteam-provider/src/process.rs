@@ -221,7 +221,7 @@ fn kill_group(child: &mut Child) {
 
 /// Reads a pipe to its end on a thread and sends what it read. The thread is detached, so a
 /// pipe that never closes costs one parked thread, not a hang.
-fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+pub(crate) fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut buf = Vec::new();
