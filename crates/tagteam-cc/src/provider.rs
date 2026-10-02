@@ -577,9 +577,10 @@ impl Provider for ClaudeCode {
         config::live_identity(&session::profile_paths(env, dir))
     }
 
-    /// Both axes' items for `spelling`, each delete under CC's storage-write lock in `dir`,
-    /// where the profile is now (Decision 19); the profile's `.credentials.json` goes with its
-    /// directory. Nothing on Linux.
+    /// Both axes' items for `spelling`. When `dir`, where the profile is now (Decision 19), is a
+    /// real directory, the deletes hold the profile's own credential locks there, within the live
+    /// locks' budget, and each delete its storage-write lock too (§9.1); otherwise no lock is
+    /// taken. The profile's `.credentials.json` goes with its directory. Nothing on Linux.
     fn delete_profile_credential(
         &self,
         env: &Env,
@@ -589,6 +590,7 @@ impl Provider for ClaudeCode {
         self.live.delete_items(
             &session::profile_env(env, spelling),
             &session::profile_paths(env, dir),
+            self.lock_budget,
         )
     }
 
