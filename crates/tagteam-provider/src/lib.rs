@@ -11,6 +11,7 @@ pub mod mkdir_lock;
 #[cfg(feature = "mock-server")]
 pub mod mock_server;
 pub mod process;
+pub mod profile;
 pub mod provider;
 pub mod read;
 pub mod security;
@@ -41,6 +42,10 @@ pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 #[cfg(feature = "mock-server")]
 pub use mock_server::{MockReply, MockRequest, MockServer};
 pub use process::ProcessStamp;
+pub use profile::{
+    LAUNCH_DIR, LINKS_FILE, LinksRecord, MARKER_FILE, ProfileMarker, RunShell, SEED_FILE, Seed,
+    canonical_profile_path, entry_matches, launch_reservations, profile_path,
+};
 pub use provider::{
     BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, Identity,
     IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks, Provider,
