@@ -170,4 +170,29 @@ impl Engine {
             None => SessionState::Quiescent { profile },
         })
     }
+
+    /// §10.3 Guard and §9.2's session-owned target: refuses while `row` is session-owned. The
+    /// answer holds while the caller holds the mutation lock and `row`'s account lock: no
+    /// reservation is created without both (§12.5).
+    pub(crate) fn refuse_session_owned(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+    ) -> Result<(), EngineError> {
+        let state = self.session_state(p, row)?;
+        if let SessionState::Unreadable { detail, .. } = &state {
+            tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                "a session reservation or record could not be read ({detail}); the account counts as session-owned"
+            );
+        }
+        if state.owned() {
+            return Err(EngineError::SessionOwned {
+                position: row.position,
+                label: row.label.clone(),
+            });
+        }
+        Ok(())
+    }
 }

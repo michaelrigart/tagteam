@@ -4,15 +4,17 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
-use common::{Fx, LSTART, due, token_requests};
+use common::{API_KEY, Fx, LSTART, capture_logs, credential, due, token_requests};
+use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
+use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
 use tagteam_engine::session::SessionState;
-use tagteam_provider::Provider;
 use tagteam_provider::liveness::{FakeProcess, parse_lstart};
-use tagteam_provider::profile::LAUNCH_DIR;
+use tagteam_provider::profile::{LAUNCH_DIR, MARKER_FILE, ProfileMarker, canonical_profile_path};
+use tagteam_provider::{Provider, Read};
 
 fn state(fx: &Fx, id: &AccountId) -> SessionState {
     let row = fx.engine.store().unwrap().account(id).unwrap().unwrap();
@@ -210,4 +212,279 @@ fn a_session_that_ended_leaves_the_token_to_the_gate_again() {
     fx.dead_record(&dir, 4242);
     assert!(matches!(gate(&fx, &a), GateOutcome::Refreshed(_)));
     assert_eq!(token_requests(&fx), 1);
+}
+
+#[test]
+fn remove_refuses_while_a_session_owns_the_account() {
+    // §10.3 Guard.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let held = fx.hold_reservation(&dir);
+    let err = fx.engine.remove(&a).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    assert!(err.to_string().contains("tagteam run"), "{err}");
+    assert!(fx.vault_bytes(&a).is_some());
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
+    assert!(dir.join(MARKER_FILE).exists());
+    drop(held);
+    fx.engine.remove(&a).unwrap();
+}
+
+#[test]
+fn remove_refuses_while_a_session_record_is_unreadable() {
+    // §12.6: unreadable records block destructive operations.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    fx.plant_record(&dir, "torn", b"[1,");
+    assert_eq!(fx.engine.remove(&a).unwrap_err().kind(), "session-owned");
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
+}
+
+#[test]
+fn add_over_a_session_owned_occupant_refuses_before_writing_anything() {
+    // §10.3 Guard: the occupant is the account `add --position` removes.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let _held = fx.hold_reservation(&fx.make_profile(&a));
+    fx.login("c@x.co", "rt-c");
+    let err = fx
+        .engine
+        .add_live(AddOptions {
+            position: Some(1),
+            yes: true,
+            ..fx.add_options()
+        })
+        .unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    let err = fx
+        .engine
+        .add_token(AddTokenOptions {
+            position: Some(1),
+            yes: true,
+            ..fx.add_token_options(API_KEY)
+        })
+        .unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    let rows = fx.engine.store().unwrap().accounts(&fx.provider()).unwrap();
+    let held: Vec<(u32, &str)> = rows
+        .iter()
+        .map(|r| (r.position, r.label.as_str()))
+        .collect();
+    assert_eq!(held, [(1, "a@x.co"), (2, "b@x.co")]);
+    assert!(fx.vault_bytes(&a).is_some());
+}
+
+#[test]
+fn replacing_a_session_owned_accounts_login_is_not_destructive() {
+    // §10.3 lists what is destructive; an explicit replacement only stale-marks a running
+    // profile, which is never touched (§12.5).
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let _held = fx.hold_reservation(&dir);
+    fx.login("a@x.co", "rt-a2");
+    fx.engine.add_live(fx.add_options()).unwrap();
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a2"));
+    assert!(
+        dir.join(MARKER_FILE).exists(),
+        "the running profile is untouched"
+    );
+}
+
+#[test]
+fn move_is_not_destructive() {
+    // §10.3: positions are display order only, and a profile is keyed by the account's ID.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let _held = fx.hold_reservation(&fx.make_profile(&a));
+    assert_eq!(fx.engine.move_to(&a, 2).unwrap().position, 2);
+}
+
+#[test]
+fn remove_deletes_the_profile_its_item_first_and_its_links_as_links() {
+    // §10.3: within the profile, its hashed item goes before its directory.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let projects = fx.env.home.join(".claude/projects");
+    symlink(&projects, dir.join("projects")).unwrap();
+    let (svc, acct) = fx.profile_item(&dir);
+    fx.kc.put(&svc, &acct, &credential("a@x.co", "rt-a2"));
+    fx.engine.remove(&a).unwrap();
+    assert!(fs::symlink_metadata(&dir).is_err(), "the profile is gone");
+    assert_eq!(fx.kc.get(&svc, &acct), None, "its hashed item is gone");
+    assert!(
+        projects.join("-work-app/memory/MEMORY.md").exists(),
+        "nothing a link points at is touched"
+    );
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
+}
+
+#[test]
+fn remove_deletes_the_item_under_the_spelling_the_marker_records() {
+    // §12.2 "One spelling": never a spelling derived again. Here the data directory moved
+    // since the profile was exported, so the canonical spelling is another one.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let Read::Present(mut marker) = ProfileMarker::read(&dir) else {
+        panic!("the fixture wrote a marker")
+    };
+    let canonical = marker.config_dir.clone();
+    marker.config_dir = "/old/data/tagteam/sessions/a".into();
+    marker.write(&dir).unwrap();
+    let (old_svc, acct) = fx.item_for_spelling(&marker.config_dir);
+    let (canonical_svc, _) = fx.item_for_spelling(&canonical);
+    fx.kc.put(&old_svc, &acct, b"recorded");
+    fx.kc.put(&canonical_svc, &acct, b"derived");
+    fx.engine.remove(&a).unwrap();
+    assert_eq!(fx.kc.get(&old_svc, &acct), None);
+    assert_eq!(
+        fx.kc.get(&canonical_svc, &acct).as_deref(),
+        Some(&b"derived"[..])
+    );
+}
+
+#[test]
+fn remove_with_an_unreadable_marker_deletes_the_current_item_and_warns() {
+    // Decision 12: refusing would leave an account that cannot be removed.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let canonical = fx
+        .cc
+        .profile_spelling(&canonical_profile_path(&dir).unwrap());
+    let (svc, acct) = fx.item_for_spelling(&canonical);
+    fx.kc.put(&svc, &acct, b"x");
+    fs::write(dir.join(MARKER_FILE), "{ torn").unwrap();
+    let (result, logs) = capture_logs(|| fx.engine.remove(&a));
+    result.unwrap();
+    assert_eq!(fx.kc.get(&svc, &acct), None);
+    assert!(fs::symlink_metadata(&dir).is_err());
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("WARN") && l.contains("older spelling")),
+        "{logs:?}"
+    );
+}
+
+#[test]
+fn remove_never_trusts_a_marker_that_names_another_account() {
+    // A marker copied from a's profile into b's names a's spelling. Removing b must delete b's
+    // item under b's own canonical spelling, and leave a's item, which a running session of a
+    // may be using, alone.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c"); // live: c, so a and b are both removable
+    let dir_a = fx.make_profile(&a);
+    let dir_b = fx.make_profile(&b);
+    let Read::Present(marker_a) = ProfileMarker::read(&dir_a) else {
+        panic!("the fixture wrote a marker")
+    };
+    fs::copy(dir_a.join(MARKER_FILE), dir_b.join(MARKER_FILE)).unwrap();
+    let (a_svc, acct) = fx.item_for_spelling(&marker_a.config_dir);
+    let b_spelling = fx
+        .cc
+        .profile_spelling(&canonical_profile_path(&dir_b).unwrap());
+    let (b_svc, _) = fx.item_for_spelling(&b_spelling);
+    fx.kc.put(&a_svc, &acct, b"a's");
+    fx.kc.put(&b_svc, &acct, b"b's");
+
+    let (result, logs) = capture_logs(|| fx.engine.remove(&b));
+    result.unwrap();
+
+    assert_eq!(fx.kc.get(&a_svc, &acct).as_deref(), Some(&b"a's"[..]));
+    assert_eq!(fx.kc.get(&b_svc, &acct), None);
+    assert!(fs::symlink_metadata(&dir_b).is_err());
+    assert!(fs::symlink_metadata(&dir_a).is_ok());
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("WARN") && l.contains("names another account")),
+        "{logs:?}"
+    );
+}
+
+#[test]
+fn a_remove_that_stops_at_the_profile_has_already_deleted_the_vault_and_keeps_the_row() {
+    // §10.3's order: the vault (and any rescue) goes before the profile, so a stop at the
+    // profile leaves no older generation behind a newer profile one; the row goes last, so the
+    // account stays listed and running `remove` again finishes.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let (svc, acct) = fx.profile_item(&dir);
+    fx.kc.put(&svc, &acct, &credential("a@x.co", "rt-a2"));
+    fx.kc.set_fail_delete(&svc, true);
+    assert!(fx.engine.remove(&a).is_err());
+    assert!(fx.vault_bytes(&a).is_none(), "the vault went first");
+    assert!(
+        dir.join(MARKER_FILE).exists(),
+        "the directory goes only after the item"
+    );
+    assert!(
+        fx.engine.store().unwrap().account(&a).unwrap().is_some(),
+        "the row goes last"
+    );
+    fx.kc.set_fail_delete(&svc, false);
+    fx.engine.remove(&a).unwrap();
+    assert_eq!(fx.kc.get(&svc, &acct), None);
+    assert!(fs::symlink_metadata(&dir).is_err());
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
+}
+
+#[test]
+fn on_linux_remove_deletes_the_profile_directory_and_touches_no_keychain() {
+    let fx = Fx::with_platform(Platform::Linux);
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    fx.set_profile_credential(&dir, &credential("a@x.co", "rt-a2"));
+    fx.engine.remove(&a).unwrap();
+    assert!(fs::symlink_metadata(&dir).is_err());
+    assert!(fx.kc.items().is_empty(), "Linux has no Keychain");
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_remove_with_a_profile_leaves_the_next_switch_able_to_roll_back() {
+    // Task 7's ledger: deleting a profile's item must leave no stale ledger entry behind, or
+    // the next operation in this process could not roll back.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c"); // live: c
+    let dir = fx.make_profile(&a);
+    let (svc, acct) = fx.profile_item(&dir);
+    fx.kc.put(&svc, &acct, &credential("a@x.co", "rt-a2"));
+    fx.engine.remove(&a).unwrap();
+    assert_eq!(fx.kc.get(&svc, &acct), None);
+
+    fx.engine.fail_at(Some("after-credential"));
+    let err = fx.switch_to(&b, false).unwrap_err();
+    assert!(
+        matches!(err, tagteam_engine::EngineError::RolledBack(_)),
+        "{err}"
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("c@x.co"));
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-c"));
+    assert!(
+        fx.engine
+            .store()
+            .unwrap()
+            .journal(&fx.provider())
+            .unwrap()
+            .is_none()
+    );
 }

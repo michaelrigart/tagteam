@@ -113,6 +113,13 @@ pub enum EngineError {
         "the live credential does not belong to the account at position {position}; tagteam will not refresh it"
     )]
     ForeignLiveCredential { position: u32 },
+    /// §9.2, §10.3: the account is session-owned (§12.5). Activating it would give the default
+    /// home and the session two copies of one single-use refresh token; destroying it would
+    /// pull the login from under a running session.
+    #[error(
+        "position {position} ({label}) is in use by a `tagteam run` session; exit that session first"
+    )]
+    SessionOwned { position: u32, label: String },
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -161,6 +168,7 @@ impl EngineError {
             EngineError::RolledBack(_) => "rolled-back",
             EngineError::RollbackFailed { .. } => "rollback-failed",
             EngineError::ForeignLiveCredential { .. } => "foreign-credential",
+            EngineError::SessionOwned { .. } => "session-owned",
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -316,6 +324,13 @@ mod tests {
             (
                 EngineError::ForeignLiveCredential { position: 1 },
                 "foreign-credential",
+            ),
+            (
+                EngineError::SessionOwned {
+                    position: 1,
+                    label: "a".into(),
+                },
+                "session-owned",
             ),
             (EngineError::Io(io::Error::other("x")), "io"),
             (
