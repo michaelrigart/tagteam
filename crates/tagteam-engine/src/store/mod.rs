@@ -1342,6 +1342,17 @@ impl Store {
         Ok(rows)
     }
 
+    /// The ID of every displaced row, and nothing else, so a row whose other columns cannot be
+    /// read is still named (a purge needs only the ID).
+    pub fn displaced_ids(&self) -> Result<Vec<String>, StoreError> {
+        let c = self.lock();
+        let mut stmt = c.prepare("SELECT id FROM displaced")?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
     /// Deletes the displaced row `id`; `true` when there was one.
     pub fn delete_displaced(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self.exec("DELETE FROM displaced WHERE id = ?1", &[&id])? > 0)
