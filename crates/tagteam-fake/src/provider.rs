@@ -10,7 +10,9 @@ use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
 use tagteam_provider::http::{Http, HttpError, HttpRequest};
-use tagteam_provider::profile::read_own_bytes;
+use tagteam_provider::profile::{
+    has_own_file, read_own_bytes, remove_own_file, write_own_json_with,
+};
 use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind};
 use tagteam_provider::splice::{self, render_nested};
 use tagteam_provider::{
@@ -205,13 +207,6 @@ fn read_baseline(dir: &Path) -> Result<Option<Value>, ProviderError> {
                 dir.join(BASELINE_FILE).display()
             ))
         })
-}
-
-fn remove_baseline(path: &Path) -> Result<(), ProviderError> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
-    }
 }
 
 /// A merged key as the summary's log names it: `prefs["<name>"]`.
@@ -765,19 +760,11 @@ impl Provider for FakeAgent {
             "version": 1,
             PREFS: prefs.unwrap_or(Value::Null),
         });
-        let mut bytes = serde_json::to_vec_pretty(&baseline).expect("a Value always serializes");
-        bytes.push(b'\n');
-        write_atomic_private_with(&p.dir.join(BASELINE_FILE), &bytes, 0o600, fence)
+        write_own_json_with(&p.dir, BASELINE_FILE, &baseline, fence)
     }
 
     fn has_baseline(&self, dir: &Path) -> bool {
-        match fs::symlink_metadata(dir.join(BASELINE_FILE)) {
-            Ok(_) => true,
-            Err(e) => !matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ),
-        }
+        has_own_file(dir, BASELINE_FILE)
     }
 
     /// §12.4 in FakeAgent's shape: the `prefs` of the profile in `dir` merged three ways into
@@ -793,11 +780,10 @@ impl Provider for FakeAgent {
         let Some(base) = read_baseline(&p.dir)? else {
             return Ok(MergeReport::default());
         };
-        let baseline = p.dir.join(BASELINE_FILE);
         let mine = match read_file(&p.identity) {
             Read::Present(b) => prefs_of(&p.identity, &b)?,
             Read::Absent => {
-                remove_baseline(&baseline)?;
+                remove_own_file(&p.dir, BASELINE_FILE)?;
                 return Ok(MergeReport::default());
             }
             Read::Unreadable(_) => return Err(unsplicable(&p.identity)),
@@ -822,7 +808,7 @@ impl Provider for FakeAgent {
             write_atomic_with(&outer.identity, &new, 0o600, fence)?;
         }
         drop(lock);
-        remove_baseline(&baseline)?;
+        remove_own_file(&p.dir, BASELINE_FILE)?;
         Ok(MergeReport {
             applied: merged.applied.len(),
             conflicts: merged.conflicts.iter().map(pref_name).collect(),

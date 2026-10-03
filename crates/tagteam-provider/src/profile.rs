@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value, json};
 use tagteam_core::{AccountId, Fingerprint, ProviderId};
 
-use crate::atomic::{ensure_private_dir, write_atomic_private};
+use crate::atomic::{ensure_private_dir, write_atomic_private, write_atomic_private_with};
 use crate::env::Env;
 use crate::flock::{LockProbe, probe_lock};
 use crate::read::{Read, ReadError};
@@ -65,6 +65,40 @@ pub fn read_own_bytes(profile: &Path, name: &str) -> Read<Vec<u8>> {
         },
         Err(e) => unreadable(e.to_string()),
     }
+}
+
+/// Whether one of tagteam's own files is waiting in `profile`: anything at its path counts, a
+/// link that dangles included, and so does an entry that cannot even be looked at. Only no
+/// entry, or a path crossing a file, says nothing is waiting. A provider's seed baseline is
+/// looked for with this, so one that cannot be read is never seeded over.
+pub fn has_own_file(profile: &Path, name: &str) -> bool {
+    match fs::symlink_metadata(profile.join(name)) {
+        Ok(_) => true,
+        Err(e) => !no_entry(&e),
+    }
+}
+
+/// Removes one of tagteam's own files in `profile`; a link at its path goes, never its target.
+/// A file that is not there is fine, any other failure is the caller's.
+pub fn remove_own_file(profile: &Path, name: &str) -> io::Result<()> {
+    match fs::remove_file(profile.join(name)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Writes `v` as one of tagteam's own files in `profile`: pretty JSON and a newline, atomic and
+/// 0600 whatever the mode of what it replaces, and `fence` checked right before it is
+/// published. It does not create `profile`.
+pub fn write_own_json_with<E: From<io::Error>>(
+    profile: &Path,
+    name: &str,
+    v: &Value,
+    fence: impl Fn() -> Result<(), E>,
+) -> Result<(), E> {
+    let mut bytes = serde_json::to_vec_pretty(v).expect("a Value always serializes");
+    bytes.push(b'\n');
+    write_atomic_private_with(&profile.join(name), &bytes, 0o600, fence)
 }
 
 /// One of tagteam's files in `profile`, parsed: as `read_own_bytes`, and `Unreadable` too when
@@ -869,5 +903,57 @@ mod tests {
         ] {
             assert_eq!(entry_matches(pattern, name), matches, "{pattern} vs {name}");
         }
+    }
+
+    #[test]
+    fn an_own_file_is_waiting_unless_nothing_is_at_its_path() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        assert!(!has_own_file(dir, "f.json"), "nothing there");
+        assert!(!has_own_file(&dir.join("gone"), "f.json"), "no directory");
+        fs::write(dir.join("plain"), b"x").unwrap();
+        assert!(
+            !has_own_file(&dir.join("plain"), "f.json"),
+            "the profile is a file: the path crosses it"
+        );
+        fs::write(dir.join("f.json"), b"{}").unwrap();
+        assert!(has_own_file(dir, "f.json"));
+        fs::remove_file(dir.join("f.json")).unwrap();
+        std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("f.json")).unwrap();
+        assert!(has_own_file(dir, "f.json"), "a dangling link is waiting");
+    }
+
+    #[test]
+    fn removing_an_own_file_removes_a_link_itself_and_a_missing_one_is_fine() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        remove_own_file(dir, "f.json").unwrap();
+        let target = dir.join("target");
+        fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("f.json")).unwrap();
+        remove_own_file(dir, "f.json").unwrap();
+        assert!(!has_own_file(dir, "f.json"));
+        assert_eq!(fs::read(&target).unwrap(), b"keep", "the target stays");
+        fs::create_dir(dir.join("d.json")).unwrap();
+        assert!(
+            remove_own_file(dir, "d.json").is_err(),
+            "a directory is no file"
+        );
+    }
+
+    #[test]
+    fn an_own_json_file_is_written_pretty_private_and_fenced() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path();
+        let v = json!({"a": 1});
+        let refused = || Err(io::Error::other("fenced"));
+        assert!(write_own_json_with(dir, "f.json", &v, refused).is_err());
+        assert!(
+            !dir.join("f.json").exists(),
+            "a failed fence publishes nothing"
+        );
+        write_own_json_with(dir, "f.json", &v, || Ok::<(), io::Error>(())).unwrap();
+        assert_eq!(fs::read(dir.join("f.json")).unwrap(), b"{\n  \"a\": 1\n}\n");
+        assert_eq!(mode(&dir.join("f.json")), 0o600);
     }
 }
