@@ -2688,6 +2688,10 @@ provider.
   (§9.6).
 - It opens the store read-only and never migrates it. With no data directory, it reports that
   tagteam has no state yet.
+- One exception is SQLite's own, and no way of opening the store closes it: when the last
+  process writing the store exits between doctor's check for the store's `-shm` file and
+  doctor's first read, SQLite recreates an empty `-wal` and a `-shm` that holds only the WAL
+  index, never a row. The next writer's close removes both.
 - It tests locks without waiting, and takes none that another process could wait on.
 - It asks nothing. A locked Keychain is reported (Appendix A.3), never unlocked, and the
   checks that would read it are skipped with one `warn`. (Whether the lock check itself can
@@ -3612,7 +3616,8 @@ Each is a one-liner, and each gets at least one test.
 66. Purge never deletes or replaces a provider's live login, and refuses while an affected
     account is session-owned. It holds `MutationGuard` throughout, so nothing is created
     behind it, and a purge that stops part-way is finished by running it again (§10.5).
-67. `doctor` writes nothing, creates nothing and asks nothing (§13.6).
+67. `doctor` writes nothing, creates nothing apart from §13.6's SQLite exception, and asks
+    nothing (§13.6).
 68. Every settings write is validated against the one key registry, and changes only the key
     it names (§6.4).
 69. No log line, at any level, holds an email, organization name, token, key, credential or
