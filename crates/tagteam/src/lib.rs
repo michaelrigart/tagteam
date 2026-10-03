@@ -9,9 +9,8 @@ pub mod auto;
 pub mod cli;
 mod config_cmd;
 mod history;
-// Only its own tests use it until the logging setup (Task 6) writes through it.
-#[allow(dead_code)]
 mod logfile;
+mod logging;
 pub mod prompt;
 mod render;
 mod root_guard;
@@ -121,6 +120,19 @@ where
             return app::EXIT_ERROR;
         }
     };
+    // §14.2, Decision 5: logging is a process concern, set up here once and never by
+    // `app::run`, which in-process tests drive. After the HOME check, since the log's path
+    // derives from HOME, and before the command runs.
+    logging::init(
+        logging::LogConfig {
+            debug: cli.debug,
+            color: !cli.no_color && !ctx.no_color_env,
+            state_dir: ctx.env.state_dir(),
+            home: ctx.env.home.clone(),
+            filter: std::env::var_os(logging::TAGTEAM_LOG),
+        },
+        &mut std::io::stderr(),
+    );
     // §14.1, at the process boundary like the drain above: in-process tests drive `run` with
     // tokens of their own, and must never change the test runner's signal dispositions. After
     // the drain, so a status bar command stuck on a pipe that never closes still dies on
