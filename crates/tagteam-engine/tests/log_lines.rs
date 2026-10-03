@@ -495,3 +495,19 @@ mod hooks {
         no_token(&logs);
     }
 }
+
+#[test]
+fn a_purge_logs_each_entry_it_deleted_by_its_id() {
+    // §14.2 and Decision 10: a purge is a state change a user may need to reconstruct. Its
+    // line names the entry's own ID, never the identity the entry was attributed to.
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.login("stranger@x.co", "rt-s");
+    fx.switch_to(&a, true).unwrap();
+    let id = fx.engine.displaced().unwrap().entries[0].id.clone();
+    let (_, logs) = capture_logs(|| fx.engine.purge_displaced(&[id.clone()]).unwrap());
+    let line = one(&logs, "deleted a displaced credential");
+    assert_eq!(field(line, "displaced"), Some(id.as_str()), "{line}");
+    assert!(logs.iter().all(|l| !l.contains("stranger")), "{logs:#?}");
+}
