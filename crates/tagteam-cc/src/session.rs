@@ -3,15 +3,15 @@
 //! recorded spelling for its Keychain items, its actual directory for its files (Decision 19).
 
 use std::ffi::OsString;
-use std::fs;
-use std::io;
 use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tagteam_core::merge::{MergeKey, three_way};
-use tagteam_provider::atomic::{write_atomic_private_with, write_atomic_with};
-use tagteam_provider::profile::read_own_bytes;
+use tagteam_provider::atomic::write_atomic_with;
+use tagteam_provider::profile::{
+    has_own_file, read_own_bytes, remove_own_file, write_own_json_with,
+};
 use tagteam_provider::splice::{self, SpliceError};
 use tagteam_provider::{
     Cancel, EntryKind, Env, Identity, LiveLockSet, MergeReport, ProviderError, Read,
@@ -252,22 +252,14 @@ pub(crate) fn seed(
         "projects": projects.unwrap_or(Value::Null),
         "mcpServers": servers.unwrap_or(Value::Null),
     });
-    let mut bytes = serde_json::to_vec_pretty(&baseline).expect("a Value always serializes");
-    bytes.push(b'\n');
-    write_atomic_private_with(&dir.join(BASELINE_FILE), &bytes, 0o600, fence)
+    write_own_json_with(dir, BASELINE_FILE, &baseline, fence)
 }
 
 /// §12.4: a baseline is waiting in `dir`, from a session whose merge-back never ran. One that
 /// cannot even be looked at counts as waiting: its merge-back then fails, and nothing seeds
 /// over it.
 pub(crate) fn has_baseline(dir: &Path) -> bool {
-    match fs::symlink_metadata(dir.join(BASELINE_FILE)) {
-        Ok(_) => true,
-        Err(e) => !matches!(
-            e.kind(),
-            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-        ),
-    }
+    has_own_file(dir, BASELINE_FILE)
 }
 
 /// The baseline's `projects` and `mcpServers`; `None` when there is none. One that cannot be
@@ -296,13 +288,6 @@ fn read_baseline(dir: &Path) -> Result<Option<(Value, Value)>, ProviderError> {
     }
 }
 
-fn remove_baseline(path: &Path) -> Result<(), ProviderError> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e.into()),
-        _ => Ok(()),
-    }
-}
-
 /// A merged key as the summary's log names it (§12.4 step 3): the path JSON-quoted, since a
 /// path may hold dots.
 fn key_name(k: &MergeKey) -> String {
@@ -328,7 +313,6 @@ pub(crate) fn merge_back(
     let Some(base) = read_baseline(dir)? else {
         return Ok(MergeReport::default());
     };
-    let baseline_path = dir.join(BASELINE_FILE);
     let profile = profile_paths(env, dir).global_config;
     let mine = match read_bytes(&profile) {
         Read::Present(b) => {
@@ -343,7 +327,7 @@ pub(crate) fn merge_back(
                 "{} is gone, so its session has nothing to merge back",
                 profile.display()
             );
-            remove_baseline(&baseline_path)?;
+            remove_own_file(dir, BASELINE_FILE)?;
             return Ok(MergeReport::default());
         }
         Read::Unreadable(_) => return Err(unsplicable(&profile, PROFILE_CONFIG_REMEDY)),
@@ -383,7 +367,7 @@ pub(crate) fn merge_back(
     }
     // The config lock covers only the default file.
     drop(lock);
-    remove_baseline(&baseline_path)?;
+    remove_own_file(dir, BASELINE_FILE)?;
     Ok(MergeReport {
         applied: merged.applied.len(),
         conflicts: merged.conflicts.iter().map(key_name).collect(),
