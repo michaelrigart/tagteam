@@ -529,6 +529,7 @@ impl Engine {
         let not_published = |why: &dyn std::fmt::Display| {
             tracing::warn!(
                 position = row.position,
+                account = %row.id,
                 "a refreshed credential was not published to the live store: {why}"
             );
             Ok(false)
@@ -592,6 +593,7 @@ impl Engine {
         for w in &warnings {
             tracing::warn!(
                 position = row.position,
+                account = %row.id,
                 "publishing a refreshed credential: {w}"
             );
         }

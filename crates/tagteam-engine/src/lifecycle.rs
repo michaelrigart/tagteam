@@ -458,7 +458,7 @@ impl Engine {
                     // no secret outlives its account (§5, L444).
                     if let Err(cleanup) = self.vault.delete(lock_for(&prep.id)) {
                         tracing::error!(
-                            id = %prep.id,
+                            account = %prep.id,
                             "could not remove the vault entry of an account that was never added: {cleanup}"
                         );
                     }

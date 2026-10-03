@@ -192,3 +192,25 @@ fn a_recovery_logs_which_way_it_went() {
         no_email(&logs);
     }
 }
+
+#[test]
+fn an_unverified_capture_names_the_account_by_id_and_position() {
+    // §9.4 step 4's WARN line, in §14.2's one spelling: `account=<id> position=<n>`. Claude
+    // Code rotated b in place, and the fixture's oracle has no answer.
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.rotate_live("rt-b2");
+    let (out, logs) = capture_logs(|| fx.switch_to(&a, false).unwrap());
+    assert!(out.switched, "{}", out.message);
+    let found = at(&logs, "WARN", "captured an unverified live credential");
+    assert_eq!(found.len(), 1, "{logs:#?}");
+    assert_eq!(
+        (field(found[0], "account"), field(found[0], "position")),
+        (Some(b.as_str()), Some("2")),
+        "{}",
+        found[0]
+    );
+    no_email(&logs);
+}

@@ -522,7 +522,7 @@ impl Engine {
             .unwrap_or_else(|e| {
                 tracing::warn!(
                     position = row.position,
-                    id = %row.id,
+                    account = %row.id,
                     kind = e.kind(),
                     "could not read the account's usage"
                 );
@@ -554,7 +554,7 @@ impl Engine {
             Err(e) => {
                 tracing::warn!(
                     position = row.position,
-                    id = %row.id,
+                    account = %row.id,
                     kind = e.kind(),
                     "could not tell whether the account is in a session; marking it in session"
                 );
