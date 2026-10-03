@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::liveness::ProcessProbe;
+use tagteam_provider::process::ProcessSpawner;
 use tagteam_provider::profile::RunShell;
 use tagteam_provider::{Cancel, Clock, Env, Http, MutationGuard, Provider, ProviderError, Read};
 
@@ -28,6 +29,9 @@ pub struct EngineConfig {
     pub settings: Settings,
     /// §4.2's process port, for session records (§12.6).
     pub process: Arc<dyn ProcessProbe>,
+    /// The port the login check (`claude auth status`) spawns through (§12.3 step 8,
+    /// Decision 10): `SystemSpawner` in production, `ScriptedSpawner` in tests.
+    pub spawner: Arc<dyn ProcessSpawner>,
     /// §12.8, from `detect_run_shell`; `env` is already the effective (outer) environment.
     pub run_shell: RunShell,
 }
@@ -43,6 +47,10 @@ pub struct Engine {
     pub(crate) settings: Settings,
     /// Judges session records (§12.6): `SystemProcessProbe` in production.
     pub(crate) process: Arc<dyn ProcessProbe>,
+    // Read only by the bootstrap's validation, which only the `test-hooks` seam reaches until
+    // `launch` (Task 10) calls it; Task 10 removes this attribute.
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+    pub(crate) spawner: Arc<dyn ProcessSpawner>,
     /// Where this process stands (§12.8).
     pub(crate) run_shell: RunShell,
     store: Mutex<Option<Arc<Store>>>,
@@ -65,6 +73,7 @@ impl Engine {
             default_provider: cfg.default_provider,
             settings: cfg.settings,
             process: cfg.process,
+            spawner: cfg.spawner,
             run_shell: cfg.run_shell,
             store: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
@@ -403,6 +412,7 @@ mod tests {
             default_provider: ProviderId::new("p"),
             settings: Settings::default(),
             process: Arc::new(tagteam_provider::liveness::FakeProcessProbe::new()),
+            spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
             run_shell: RunShell::Outside,
         }
     }

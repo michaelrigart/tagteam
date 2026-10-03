@@ -29,6 +29,7 @@ use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::http::Method;
 use tagteam_provider::liveness::{FakeProcess, FakeProcessProbe, parse_lstart};
+use tagteam_provider::process::{Captured, ProcessSpawner, ScriptedSpawner};
 use tagteam_provider::profile::{
     LAUNCH_DIR, ProfileMarker, RunShell, Seed, canonical_profile_path, profile_path,
 };
@@ -231,6 +232,8 @@ pub struct Fx {
     pub http: Arc<ScriptedHttp>,
     /// Judges every session record any engine of this fixture reads (§12.6); it never looks at a real process.
     pub process: Arc<FakeProcessProbe>,
+    /// Answers every login check any engine of this fixture runs (§12.3 step 8); it starts no process.
+    pub spawner: Arc<ScriptedSpawner>,
     pub cc: Arc<ClaudeCode>,
     pub engine: Engine,
 }
@@ -315,6 +318,7 @@ impl Fx {
         let clock = Arc::new(FakeClock::new(1_790_000_000_000));
         let http = Arc::new(ScriptedHttp::new());
         let process = Arc::new(FakeProcessProbe::new());
+        let spawner = Arc::new(ScriptedSpawner::new());
         let cc = Arc::new(tune(ClaudeCode::with_store(
             LiveStore::new(kc.clone(), platform).with_retry_delay(Duration::ZERO),
         )));
@@ -332,6 +336,7 @@ impl Fx {
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings: Settings::default(),
             process: process.clone(),
+            spawner: spawner.clone(),
             run_shell: RunShell::Outside,
         });
         Fx {
@@ -343,6 +348,7 @@ impl Fx {
             clock,
             http,
             process,
+            spawner,
             cc,
             engine,
         }
@@ -772,6 +778,18 @@ impl Fx {
         vault: Vault,
         oracle: Arc<dyn Oracle>,
     ) -> Engine {
+        self.engine_spawning(env, run_shell, vault, oracle, self.spawner.clone())
+    }
+
+    /// `engine_in`, whose login checks spawn through `spawner` (§12.3 step 8).
+    fn engine_spawning(
+        &self,
+        env: Env,
+        run_shell: RunShell,
+        vault: Vault,
+        oracle: Arc<dyn Oracle>,
+        spawner: Arc<dyn ProcessSpawner>,
+    ) -> Engine {
         Engine::new(EngineConfig {
             env,
             registry: ProviderRegistry::new().with(self.cc.clone()),
@@ -782,8 +800,21 @@ impl Fx {
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings: Settings::default(),
             process: self.process.clone(),
+            spawner,
             run_shell,
         })
+    }
+
+    /// An engine over this fixture's Env, vault, oracle and clock whose login checks spawn
+    /// through `spawner` rather than the fixture's scripted one: for a check a signal lands in.
+    pub fn engine_with_spawner(&self, spawner: Arc<dyn ProcessSpawner>) -> Engine {
+        self.engine_spawning(
+            self.env.clone(),
+            RunShell::Outside,
+            self.fixture_vault(),
+            self.oracle.clone(),
+            spawner,
+        )
     }
 
     fn keychain_vault(&self) -> Vault {
@@ -873,10 +904,10 @@ pub struct HomeSnapshot {
 /// tolerated by the comparison, not by omitting it here: once it exists, a later change to it
 /// (a mode change, say) must still be caught, which excluding it from the walk entirely could
 /// never do.
-fn walk(dir: &Path, skip: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
+fn walk(dir: &Path, skip: Option<&Path>, out: &mut BTreeMap<PathBuf, Entry>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
-        if path.starts_with(skip) {
+        if skip.is_some_and(|s| path.starts_with(s)) {
             continue;
         }
         let meta = fs::symlink_metadata(&path).unwrap();
@@ -894,6 +925,17 @@ fn walk(dir: &Path, skip: &Path, out: &mut BTreeMap<PathBuf, Entry>) {
         };
         out.insert(path, Entry { mode, kind });
     }
+}
+
+/// Every file, directory and link under `dir`, with its mode and content, never following a
+/// link: equal before and after exactly when nothing under `dir` was written.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DirTree(BTreeMap<PathBuf, Entry>);
+
+pub fn dir_tree(dir: &Path) -> DirTree {
+    let mut out = BTreeMap::new();
+    walk(dir, None, &mut out);
+    DirTree(out)
 }
 
 /// §3: `customApiKeyResponses.approved` may only grow by appending; nothing else in that
@@ -1013,7 +1055,7 @@ fn resolve(snapshot: &HomeSnapshot, path: &Path) -> PathBuf {
 impl Fx {
     pub fn snapshot(&self) -> HomeSnapshot {
         let mut files = BTreeMap::new();
-        walk(&self.env.home, &self.env.data_dir(), &mut files);
+        walk(&self.env.home, Some(&self.env.data_dir()), &mut files);
         let items = self
             .kc
             .items()
@@ -1197,6 +1239,7 @@ impl FakeFx {
             http: fx.http.clone(),
             settings: Settings::default(),
             process: fx.process.clone(),
+            spawner: fx.spawner.clone(),
             run_shell: RunShell::Outside,
         });
         FakeFx { fx, fake, engine }
@@ -1225,6 +1268,7 @@ impl FakeFx {
             http: self.fx.http.clone(),
             settings: Settings::default(),
             process: self.fx.process.clone(),
+            spawner: self.fx.spawner.clone(),
             run_shell,
         })
     }
@@ -1398,6 +1442,7 @@ impl Fx {
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings,
             process: self.process.clone(),
+            spawner: self.spawner.clone(),
             run_shell: RunShell::Outside,
         })
     }
@@ -1950,5 +1995,154 @@ impl Fx {
         let dir = self.env.home.join("work").join(rel);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+}
+
+/// `claude auth status --json` (Appendix A.7) for a `claude.ai` login as `email`, whose config
+/// dir is `spelling`: §12.3's `valid` for that account, when `spelling` is its profile's.
+pub fn auth_status(spelling: &str, email: &str) -> Value {
+    json!({
+        "loggedIn": true,
+        "authMethod": "claude.ai",
+        "apiProvider": "firstParty",
+        "analyticsDisabled": false,
+        "projectsDirectory": format!("{spelling}/projects"),
+        "configDirectory": spelling,
+        "email": email,
+        "orgName": "Personal",
+        "subscriptionType": "max"
+    })
+}
+
+/// `claude auth status --json` logged out (`authMethod` `none`): §12.3's `invalid`.
+pub fn auth_logged_out(spelling: &str) -> Value {
+    json!({
+        "loggedIn": false,
+        "authMethod": "none",
+        "apiProvider": "firstParty",
+        "analyticsDisabled": false,
+        "projectsDirectory": format!("{spelling}/projects"),
+        "configDirectory": spelling
+    })
+}
+
+/// `claude auth status --json` logged in through an `apiKeyHelper` in the settings:
+/// §12.3's `overridden`.
+pub fn auth_helper(spelling: &str) -> Value {
+    json!({
+        "loggedIn": true,
+        "authMethod": "api_key_helper",
+        "apiKeySource": "apiKeyHelper",
+        "apiProvider": "firstParty",
+        "analyticsDisabled": false,
+        "projectsDirectory": format!("{spelling}/projects"),
+        "configDirectory": spelling
+    })
+}
+
+/// The login check's process exiting `code`, with `stdout` captured.
+pub fn auth_reply(code: i32, stdout: &[u8]) -> Captured {
+    Captured::Exited {
+        code: Some(code),
+        signal: None,
+        stdout: stdout.to_vec(),
+        stderr: Vec::new(),
+    }
+}
+
+/// A profile's credential and its login check (§12.3).
+impl Fx {
+    /// The spelling a bootstrap records for `profile` (§12.2): its canonical path, NFC. It works
+    /// before the profile exists, by resolving `sessions/`, which it creates 0700.
+    pub fn spelling_for(&self, profile: &Path) -> String {
+        let parent = profile.parent().unwrap();
+        fs::create_dir_all(parent).unwrap();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let canonical = canonical_profile_path(parent)
+            .unwrap()
+            .join(profile.file_name().unwrap());
+        self.cc.profile_spelling(&canonical)
+    }
+
+    /// Queues the next login check's reply: `claude auth status --json` exiting `code`, with
+    /// `body` on stdout.
+    pub fn script_auth(&self, code: i32, body: &Value) {
+        self.spawner
+            .push(auth_reply(code, body.to_string().as_bytes()));
+    }
+
+    /// Queues a `valid` reply for `email`'s session in `profile`.
+    pub fn script_valid(&self, profile: &Path, email: &str) {
+        self.script_auth(0, &auth_status(&self.spelling_for(profile), email));
+    }
+
+    /// The credential `profile` holds (§12.3 steps 2 and 6, Decision 22): the hashed item for
+    /// the spelling its marker records, then `.credentials.json` where the profile is.
+    pub fn held_credential(&self, profile: &Path) -> Option<Value> {
+        let Read::Present(marker) = ProfileMarker::read(profile) else {
+            return None;
+        };
+        match self
+            .cc
+            .read_profile_credential(&self.env, profile, &marker.config_dir)
+        {
+            Read::Present(c) => serde_json::from_slice(c.bytes()).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn held_refresh_token(&self, profile: &Path) -> Option<String> {
+        self.held_credential(profile)?["claudeAiOauth"]["refreshToken"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    /// Claude Code in a session at `profile` writing its credential as `edit` changes it. On
+    /// macOS the write lands in the profile's hashed item and the file it migrated from goes
+    /// (Appendix A.3 "Plaintext migration"); on Linux it rewrites the file.
+    pub fn cc_writes_profile(&self, profile: &Path, edit: impl FnOnce(&mut Value)) {
+        let mut v = self
+            .held_credential(profile)
+            .expect("the profile holds a credential");
+        edit(&mut v);
+        let bytes = v.to_string().into_bytes();
+        match self.platform {
+            Platform::MacOs => {
+                let (svc, acct) = self.profile_item(profile);
+                self.kc.put(&svc, &acct, &bytes);
+                let _ = fs::remove_file(profile.join(".credentials.json"));
+            }
+            Platform::Linux => self.set_profile_credential(profile, &bytes),
+        }
+    }
+
+    /// Claude Code in a session at `profile` refreshing its login to `new_rt`.
+    pub fn rotate_profile(&self, profile: &Path, new_rt: &str) {
+        self.cc_writes_profile(profile, |v| {
+            v["claudeAiOauth"]["refreshToken"] = json!(new_rt);
+            v["claudeAiOauth"]["accessToken"] = json!(format!("at-{new_rt}"));
+        });
+    }
+
+    /// An explicit replacement of `id`'s login that landed (§12.5 "Explicit replacements"): the
+    /// vault holds `rt`'s generation and the account's `login_epoch` moved on, so every profile
+    /// bootstrapped before it is stale-marked.
+    pub fn land_replacement(&self, id: &AccountId, rt: &str) {
+        let label = self
+            .engine
+            .store()
+            .unwrap()
+            .account(id)
+            .unwrap()
+            .unwrap()
+            .label;
+        self.put_vault(id, &credential(&label, rt));
+        rusqlite::Connection::open(self.env.data_dir().join("tagteam.db"))
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET login_epoch = login_epoch + 1 WHERE id = ?1",
+                [id.as_str()],
+            )
+            .unwrap();
     }
 }

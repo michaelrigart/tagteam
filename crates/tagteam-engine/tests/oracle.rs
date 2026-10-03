@@ -286,6 +286,7 @@ fn a_hanging_profile_endpoint_delays_a_switch_by_its_timeout_and_holds_no_lock()
         default_provider: ProviderId::new(CLAUDE_CODE),
         settings: Settings::default(),
         process: fx.process.clone(),
+        spawner: fx.spawner.clone(),
         run_shell: RunShell::Outside,
     });
     let env = fx.env.clone();

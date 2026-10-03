@@ -899,6 +899,8 @@ mod tests {
                 default_provider: cc(),
                 settings: Settings::default(),
                 process: Arc::new(SystemProcessProbe),
+                // Nothing here validates, and a scripted spawner never starts a process (§15.1).
+                spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
                 run_shell: RunShell::Outside,
             });
             Fx {

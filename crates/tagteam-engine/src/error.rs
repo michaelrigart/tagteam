@@ -6,6 +6,13 @@ use tagteam_provider::{LockError, ProviderError, ReadError};
 use crate::store::StoreError;
 use crate::vault::VaultError;
 
+/// " (from <source>)" when `claude auth status` named where the overriding key came from.
+fn from_source(source: &Option<String>) -> String {
+    source
+        .as_deref()
+        .map_or_else(String::new, |s| format!(" (from {s})"))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error(transparent)]
@@ -152,6 +159,32 @@ pub enum EngineError {
     /// §12.1 `--require-session`: `run` would have run plain `claude` instead of a session.
     #[error("--require-session: {why}, so no session would start")]
     RequiresSession { why: String },
+    /// §12.3: the session would log in by another method than the account's own login.
+    #[error(
+        "position {position}'s session would log in by {method}{} rather than with its account's login; remove what sets it (an `apiKeyHelper` or `env` entry in the shared settings, the project's own settings, or a workload-identity profile), then run again",
+        from_source(key_source)
+    )]
+    LoginOverridden {
+        position: u32,
+        method: String,
+        key_source: Option<String>,
+    },
+    /// §12.3: logged out, or logged in as another account.
+    #[error(
+        "position {position}'s session would not be logged in as its account ({detail}); the next `tagteam run` sets its profile up afresh"
+    )]
+    LoginInvalid { position: u32, detail: String },
+    /// §12.3: Claude Code resolves another config dir than the profile's recorded spelling.
+    #[error(
+        "position {position}'s session would use {reported} as its config dir, not its profile, so it was not started"
+    )]
+    LoginDrifted { position: u32, reported: String },
+    /// §12.3: the check timed out, or its output did not parse.
+    #[error("position {position}'s login could not be confirmed ({detail}), so it was not started")]
+    LoginUnknown { position: u32, detail: String },
+    /// §12.3: the launch command could not be spawned.
+    #[error("the launch command could not be started: {detail}")]
+    LaunchUnreachable { detail: String },
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -247,6 +280,11 @@ impl EngineError {
             EngineError::LaunchCommandMissing { .. } => "launch-command-missing",
             EngineError::ApiKeyAccount { .. } => "api-key-account",
             EngineError::RequiresSession { .. } => "requires-session",
+            EngineError::LoginOverridden { .. } => "login-overridden",
+            EngineError::LoginInvalid { .. } => "login-invalid",
+            EngineError::LoginDrifted { .. } => "login-drifted",
+            EngineError::LoginUnknown { .. } => "login-unknown",
+            EngineError::LaunchUnreachable { .. } => "launch-unreachable",
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -463,6 +501,39 @@ mod tests {
             (
                 EngineError::RequiresSession { why: "w".into() },
                 "requires-session",
+            ),
+            (
+                EngineError::LoginOverridden {
+                    position: 1,
+                    method: "api_key_helper".into(),
+                    key_source: Some("apiKeyHelper".into()),
+                },
+                "login-overridden",
+            ),
+            (
+                EngineError::LoginInvalid {
+                    position: 1,
+                    detail: "d".into(),
+                },
+                "login-invalid",
+            ),
+            (
+                EngineError::LoginDrifted {
+                    position: 1,
+                    reported: "/x".into(),
+                },
+                "login-drifted",
+            ),
+            (
+                EngineError::LoginUnknown {
+                    position: 1,
+                    detail: "d".into(),
+                },
+                "login-unknown",
+            ),
+            (
+                EngineError::LaunchUnreachable { detail: "d".into() },
+                "launch-unreachable",
             ),
             (EngineError::Io(io::Error::other("x")), "io"),
             (
