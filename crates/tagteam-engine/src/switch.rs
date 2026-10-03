@@ -2160,6 +2160,7 @@ impl Engine {
                 if class == OutgoingClass::Unresolved {
                     tracing::warn!(
                         position = out.position,
+                        account = %out.id,
                         "captured an unverified live credential into the vault; .prev keeps the previous generation"
                     );
                 }
