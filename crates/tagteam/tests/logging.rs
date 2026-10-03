@@ -203,21 +203,49 @@ fn an_invalid_tagteam_log_warns_once_and_keeps_the_default() {
     assert!(log_text(&state_dir(d.path())).contains(CAPTURED));
 }
 
+/// Gives `email`'s account a `usage_state` row the store cannot read: text where it keeps an
+/// integer.
+fn unreadable_usage_state(root: &Path, email: &str) {
+    rusqlite::Connection::open(Env::for_test(root).data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO usage_state (account_id, fetched_at) \
+             SELECT id, 'soon' FROM accounts WHERE email = ?1",
+            [email],
+        )
+        .unwrap();
+}
+
 #[test]
 fn statusline_with_the_default_filter_opens_no_log() {
     // §14.2, Review Focus 4: the status bar runs every few seconds and logs at DEBUG at most,
-    // so by default it never creates, opens or rotates the log.
-    let d = tempfile::tempdir().unwrap();
-    rotated_live_login(d.path());
-    let out = cmd(d.path())
-        .arg("statusline")
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    assert!(!out.is_empty());
-    assert!(!state_dir(d.path()).exists());
+    // so by default it never creates, opens or rotates the log. Nor when the live account's
+    // usage cannot be read: an account command's result logs that at WARN, the status bar at
+    // DEBUG, and its line still names the account.
+    for unreadable in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        rotated_live_login(d.path());
+        if unreadable {
+            unreadable_usage_state(d.path(), "b@x.co");
+        }
+        let out = cmd(d.path())
+            .arg("statusline")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let line = String::from_utf8(out).unwrap();
+        assert!(
+            line.starts_with("b · "),
+            "unreadable usage {unreadable}: {line:?}"
+        );
+        assert!(
+            !state_dir(d.path()).exists(),
+            "unreadable usage {unreadable}: {}",
+            log_text(&state_dir(d.path()))
+        );
+    }
 }
 
 #[test]

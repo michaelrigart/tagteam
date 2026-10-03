@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tagteam_core::{Fingerprint, OracleVerdict, ProviderId};
+use tagteam_core::{AccountId, Fingerprint, OracleVerdict, ProviderId};
 use tagteam_provider::{
     Cancel, CredLocks, Credential, LiveChange, Provenance, Provider, ProviderError, Read,
     RefreshResult, StoredLogin,
@@ -97,10 +97,87 @@ struct Reconciled {
     retire: Vec<PathBuf>,
 }
 
+/// §14.2's refresh outcome for §7.5, one line per call, naming the provider and, once it is
+/// known, the live account. INFO once a request was sent or state changed, and for an error,
+/// which is named by its `kind()` alone; DEBUG for a token that needed nothing. A systemic
+/// refusal's own words are never logged.
+fn log_active(
+    provider: &ProviderId,
+    account: Option<&AccountId>,
+    result: &Result<ActiveOutcome, EngineError>,
+) {
+    const OUTCOME: &str = "active-token refresh outcome";
+    let account = account.map(tracing::field::display);
+    match result {
+        Ok(ActiveOutcome::Refreshed) => {
+            tracing::info!(provider = %provider, account, outcome = "refreshed", "{OUTCOME}");
+        }
+        Ok(ActiveOutcome::PersistedNotPublished) => tracing::info!(
+            provider = %provider,
+            account,
+            outcome = "persisted-not-published",
+            "{OUTCOME}"
+        ),
+        Ok(ActiveOutcome::PublishedOnly) => tracing::info!(
+            provider = %provider,
+            account,
+            outcome = "published-only",
+            "{OUTCOME}"
+        ),
+        Ok(ActiveOutcome::NotNeeded { reconciled: true }) => tracing::info!(
+            provider = %provider,
+            account,
+            outcome = "not-needed",
+            reconciled = true,
+            "{OUTCOME}"
+        ),
+        Ok(ActiveOutcome::Dead(reason)) => tracing::info!(
+            provider = %provider,
+            account,
+            outcome = "dead",
+            reason = reason.as_str(),
+            "{OUTCOME}"
+        ),
+        Ok(ActiveOutcome::Systemic(_)) => {
+            tracing::info!(provider = %provider, account, outcome = "systemic", "{OUTCOME}");
+        }
+        Ok(ActiveOutcome::Transient { kind }) => tracing::info!(
+            provider = %provider,
+            account,
+            outcome = "transient",
+            kind = kind.as_str(),
+            "{OUTCOME}"
+        ),
+        Ok(ActiveOutcome::Unpersisted) => {
+            tracing::info!(provider = %provider, account, outcome = "unpersisted", "{OUTCOME}");
+        }
+        Err(e) => tracing::info!(
+            provider = %provider,
+            account,
+            outcome = "error",
+            kind = e.kind(),
+            "{OUTCOME}"
+        ),
+        Ok(ActiveOutcome::Replaced) => tracing::debug!(
+            provider = %provider,
+            account,
+            outcome = "replaced",
+            "{OUTCOME}"
+        ),
+        Ok(ActiveOutcome::NotNeeded { reconciled: false }) => tracing::debug!(
+            provider = %provider,
+            account,
+            outcome = "not-needed",
+            "{OUTCOME}"
+        ),
+    }
+}
+
 impl Engine {
     /// §7.5. The mutation lock (recovering first), the live account's lock, then CC's
     /// credential locks only; the config lock is taken after the request, around the live
-    /// write alone. The oracle is asked before any lock (§7.6).
+    /// write alone. The oracle is asked before any lock (§7.6). Whichever way it ends, its
+    /// outcome is logged once (`log_active`), after every lock is released.
     ///
     /// Inside a run shell it runs as outside one (§12.8, B.57): `env` is the outer home
     /// (Decision 6), so the live login it reads, refreshes and protects is the default home's,
@@ -110,10 +187,25 @@ impl Engine {
         provider: &ProviderId,
         trigger: ActiveTrigger,
     ) -> Result<ActiveOutcome, EngineError> {
+        let mut account = None;
+        let result = self.run_active_refresh(provider, trigger, &mut account);
+        log_active(provider, account.as_ref(), &result);
+        result
+    }
+
+    /// `refresh_active`'s steps. `account` is set as soon as the live login's account is
+    /// known, so the caller's line names it however the refresh ends.
+    fn run_active_refresh(
+        &self,
+        provider: &ProviderId,
+        trigger: ActiveTrigger,
+        account: &mut Option<AccountId>,
+    ) -> Result<ActiveOutcome, EngineError> {
         self.refuse_unreadable_run_shell()?;
         let provider_arc = self.provider(provider)?;
         let p = provider_arc.as_ref();
         let (row, live) = self.active_login(p, provider)?;
+        *account = Some(row.id.clone());
         let hint = self.corroborate(p, &row, &live)?;
 
         // Step 1: the mutation lock and the account lock, held throughout.

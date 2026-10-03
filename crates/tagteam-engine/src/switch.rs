@@ -544,6 +544,9 @@ struct Rollback<'a, 'g> {
     locks: &'a LiveLocks<'g>,
     store: &'a Store,
     provider: &'a ProviderId,
+    /// The switch's outgoing account and its target, which its log lines name (§14.2).
+    from: Option<AccountId>,
+    to: AccountId,
     prior: Option<Box<JournalRow>>,
     /// A provider write that started and has not returned. Such a write puts its own partial
     /// state back when it fails or unwinds, but after a panic the engine cannot see whether
@@ -570,7 +573,10 @@ impl<'a> Rollback<'a, '_> {
         self.armed = false;
     }
 
-    /// Rolls back after `cause`, and says whether that worked.
+    /// Rolls back after `cause`, and says whether that worked. Either way the rollback is
+    /// logged (§14.2: switches and their rollbacks), at WARN when every write was put back and
+    /// at ERROR naming what was not. The cause is named by its `kind()` alone: its text may
+    /// hold a label.
     fn fail(mut self, cause: EngineError) -> EngineError {
         let partial = match &cause {
             EngineError::Provider(ProviderError::RestoreFailed { restore, .. }) => {
@@ -579,9 +585,25 @@ impl<'a> Rollback<'a, '_> {
             _ => vec![],
         };
         let failed = self.roll_back(partial);
+        let from = self.from.as_ref().map(tracing::field::display);
         if failed.is_empty() {
+            tracing::warn!(
+                provider = %self.provider,
+                from_account = from,
+                to_account = %self.to,
+                kind = cause.kind(),
+                "rolled back a switch"
+            );
             EngineError::RolledBack(cause.to_string())
         } else {
+            tracing::error!(
+                provider = %self.provider,
+                from_account = from,
+                to_account = %self.to,
+                kind = cause.kind(),
+                "a switch was not fully rolled back; its journal row stays for recovery: {}",
+                failed.join("; ")
+            );
             EngineError::RollbackFailed {
                 cause: cause.to_string(),
                 failed: failed.join("; "),
@@ -2025,6 +2047,8 @@ impl Engine {
             locks,
             store,
             provider,
+            from: outgoing.as_ref().map(|o| o.id.clone()),
+            to: target.id.clone(),
             prior,
             in_flight: false,
             armed: true,

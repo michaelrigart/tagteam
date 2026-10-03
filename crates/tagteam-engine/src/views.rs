@@ -495,18 +495,21 @@ impl Engine {
             .registry
             .get(&row.provider)
             .is_some_and(|p| self.in_session(p.as_ref(), &row));
-        self.account_view_with(row, active, true, in_session)
+        self.account_view_with(row, active, true, in_session, false)
     }
 
     /// `account_view`, with or without pace on its windows (see `usage_view`), and with
     /// `in_session` as the caller knows it. It is never computed here: `statusline` passes
     /// `false`, which keeps the status bar away from profile directories (§13.5, Decision 17).
+    /// A usage read that fails is logged at WARN, or at DEBUG for the status bar
+    /// (`status_bar`), where everything logs at DEBUG at most (§14.2).
     fn account_view_with(
         &self,
         row: AccountRow,
         active: bool,
         with_pace: bool,
         in_session: bool,
+        status_bar: bool,
     ) -> AccountView {
         let provider = self.registry.get(&row.provider);
         let kind = provider
@@ -520,12 +523,21 @@ impl Engine {
             .existing_store()
             .and_then(|s| self.usage_view(s.as_deref(), &row, &kind, supported, &budget, with_pace))
             .unwrap_or_else(|e| {
-                tracing::warn!(
-                    position = row.position,
-                    account = %row.id,
-                    kind = e.kind(),
-                    "could not read the account's usage"
-                );
+                if status_bar {
+                    tracing::debug!(
+                        position = row.position,
+                        account = %row.id,
+                        kind = e.kind(),
+                        "could not read the account's usage"
+                    );
+                } else {
+                    tracing::warn!(
+                        position = row.position,
+                        account = %row.id,
+                        kind = e.kind(),
+                        "could not read the account's usage"
+                    );
+                }
                 UsageView::unread(
                     usage_status(supported, &kind, &row, None),
                     Some(e.kind().to_owned()),
@@ -749,9 +761,9 @@ impl Engine {
                     // The session's login, not the default home's: not `active`. The line
                     // shows no pace, so none is computed, and it never asks whether the
                     // account is in a session (Decision 17): the status bar stays away from
-                    // profile directories.
+                    // profile directories. It logs at DEBUG at most (§14.2).
                     ShellAccount::Managed(row) => StatuslineView::Managed {
-                        account: self.account_view_with(row, false, false, false),
+                        account: self.account_view_with(row, false, false, false, true),
                     },
                     ShellAccount::Unmanaged | ShellAccount::NotInShell => StatuslineView::NoLogin,
                 });
@@ -768,8 +780,9 @@ impl Engine {
         };
         Ok(match row {
             // The line shows no pace, so none is computed, and no session state (Decision 17).
+            // It logs at DEBUG at most (§14.2).
             Some(row) => StatuslineView::Managed {
-                account: self.account_view_with(row, true, false, false),
+                account: self.account_view_with(row, true, false, false, true),
             },
             None => StatuslineView::Unmanaged { email: login.label },
         })
