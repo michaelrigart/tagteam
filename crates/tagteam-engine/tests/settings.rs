@@ -1,12 +1,13 @@
 use std::fs;
 use std::time::{Duration, SystemTime};
 
+use serde_json::json;
 use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::Strategy;
 use tagteam_engine::settings::{
-    COOLDOWN_SECONDS_RANGE, ColorMode, HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE,
-    STATUSLINE_PLACEHOLDERS, Settings, THRESHOLD_RANGE, UNHEALTHY_TICKS_RANGE,
-    is_statusline_placeholder, parse_bool,
+    self, COOLDOWN_SECONDS_RANGE, ColorMode, HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE,
+    Inspection, KEYS, Key, KeyKind, KeyState, STATUSLINE_PLACEHOLDERS, Settings, Source,
+    THRESHOLD_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect, is_statusline_placeholder, parse_bool,
 };
 use tagteam_provider::Env;
 
@@ -32,6 +33,7 @@ fn models(names: &[&str]) -> Vec<String> {
 #[test]
 fn the_defaults_are_the_specs_table() {
     let d = Settings::default();
+    assert_eq!(d.default_provider, ProviderId::new("claude-code"));
     assert_eq!(d.threshold, 90.0);
     assert_eq!(d.interval_seconds, 60);
     assert_eq!(d.cooldown_seconds, 300);
@@ -73,10 +75,12 @@ fn an_empty_file_gives_the_defaults_without_a_warning() {
 fn every_key_is_read_from_a_full_file() {
     let (settings, warnings) = load(
         r#"
+default_provider = "fake-agent"
+
 [autoswitch]
 threshold = 75.5
 interval_seconds = 120
-cooldown_seconds = 600
+cooldown_seconds = 0
 hysteresis_pct = 12.5
 strategy = "consume-first"
 include_api_key_accounts = true
@@ -100,9 +104,10 @@ share_extra = ["hook-data"]
     assert_eq!(
         settings,
         Settings {
+            default_provider: ProviderId::new("fake-agent"),
             threshold: 75.5,
             interval_seconds: 120,
-            cooldown_seconds: 600,
+            cooldown_seconds: 0,
             hysteresis_pct: 12.5,
             strategy: Strategy::ConsumeFirst,
             include_api_key_accounts: true,
@@ -125,10 +130,9 @@ fn keys_written_with_dotted_names_are_read_too() {
 }
 
 #[test]
-fn keys_this_milestone_does_not_read_are_ignored_without_a_warning() {
-    let (settings, warnings) = load(
-        "default_provider = \"claude-code\"\n[autoswitch]\nfuture = true\n[run]\nfuture = true\n",
-    );
+fn an_unknown_key_is_ignored_without_a_warning() {
+    let (settings, warnings) =
+        load("colour = \"never\"\n[autoswitch]\nfuture = true\n[elsewhere]\nx = 1\n");
     assert_eq!(settings, Settings::default());
     assert!(warnings.is_empty(), "{warnings:?}");
 }
@@ -946,4 +950,824 @@ fn a_share_extra_that_is_neither_a_name_nor_a_list_warns_and_the_next_table_appl
         warnings[0].contains("`provider.claude-code.run.share_extra`"),
         "{warnings:?}"
     );
+}
+
+/// `inspect` of `text` as the `config.toml` of a fresh environment.
+fn inspect_as(text: &str, provider: &str) -> Inspection {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::for_test(dir.path());
+    fs::create_dir_all(env.config_dir()).unwrap();
+    fs::write(settings::config_path(&env), text).unwrap();
+    inspect(&env, &ProviderId::new(provider))
+}
+
+/// The registry's key `name`.
+fn reg(name: &str) -> &'static Key {
+    settings::key(name).unwrap_or_else(|| panic!("no registry key {name}"))
+}
+
+/// `name`'s line in `inspection`.
+fn state<'a>(inspection: &'a Inspection, name: &str) -> &'a KeyState {
+    inspection
+        .keys
+        .iter()
+        .find(|s| s.key.name == name)
+        .unwrap_or_else(|| panic!("{name} is not inspected"))
+}
+
+fn list(names: &[&str]) -> Value {
+    Value::List(models(names))
+}
+
+#[test]
+fn the_registry_is_section_six_four_s_table_in_order() {
+    let rows: Vec<(&str, KeyKind, bool)> = KEYS
+        .iter()
+        .map(|k| (k.name, k.kind, k.per_provider))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("default_provider", KeyKind::Provider, false),
+            (
+                "autoswitch.threshold",
+                KeyKind::Float {
+                    min: 50.0,
+                    max: 99.9
+                },
+                true
+            ),
+            (
+                "autoswitch.interval_seconds",
+                KeyKind::Int { min: 15, max: 3600 },
+                true
+            ),
+            (
+                "autoswitch.cooldown_seconds",
+                KeyKind::Int {
+                    min: 0,
+                    max: 86_400
+                },
+                true
+            ),
+            (
+                "autoswitch.hysteresis_pct",
+                KeyKind::Float {
+                    min: 0.0,
+                    max: 50.0
+                },
+                true
+            ),
+            (
+                "autoswitch.strategy",
+                KeyKind::Choice(&["best", "consume-first"]),
+                true
+            ),
+            ("autoswitch.include_api_key_accounts", KeyKind::Bool, true),
+            (
+                "autoswitch.unhealthy_ticks",
+                KeyKind::Int { min: 1, max: 100 },
+                true
+            ),
+            ("autoswitch.models", KeyKind::Models, true),
+            (
+                "usage.history_retention_days",
+                KeyKind::Int { min: 1, max: 3650 },
+                false
+            ),
+            ("statusline.format", KeyKind::Format, true),
+            ("run.share_extra", KeyKind::ShareNames, true),
+            (
+                "ui.color",
+                KeyKind::Choice(&["auto", "always", "never"]),
+                false
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_key_is_found_by_its_dotted_name_and_splits_into_table_and_leaf() {
+    for k in KEYS {
+        assert_eq!(settings::key(k.name), Some(k));
+    }
+    assert_eq!(reg("autoswitch.threshold").table(), Some("autoswitch"));
+    assert_eq!(reg("autoswitch.threshold").leaf(), "threshold");
+    assert_eq!(reg("run.share_extra").table(), Some("run"));
+    assert_eq!(reg("default_provider").table(), None);
+    assert_eq!(reg("default_provider").leaf(), "default_provider");
+    for name in [
+        "",
+        "threshold",
+        "autoswitch",
+        "Autoswitch.threshold",
+        "autoswitch.threshold ",
+        "provider.claude-code.autoswitch.threshold",
+    ] {
+        assert_eq!(settings::key(name), None, "{name:?}");
+    }
+}
+
+#[test]
+fn every_key_reads_back_its_default_from_the_settings() {
+    let d = Settings::default();
+    let defaults: Vec<(&str, Value)> = KEYS.iter().map(|k| (k.name, d.value(k))).collect();
+    assert_eq!(
+        defaults,
+        vec![
+            ("default_provider", Value::Str("claude-code".into())),
+            ("autoswitch.threshold", Value::Float(90.0)),
+            ("autoswitch.interval_seconds", Value::Int(60)),
+            ("autoswitch.cooldown_seconds", Value::Int(300)),
+            ("autoswitch.hysteresis_pct", Value::Float(10.0)),
+            ("autoswitch.strategy", Value::Str("best".into())),
+            ("autoswitch.include_api_key_accounts", Value::Bool(false)),
+            ("autoswitch.unhealthy_ticks", Value::Int(3)),
+            ("autoswitch.models", list(&[])),
+            ("usage.history_retention_days", Value::Int(180)),
+            (
+                "statusline.format",
+                Value::Str("{account} · 5h {5h}% · 7d {7d}%{stale}".into())
+            ),
+            ("run.share_extra", list(&[])),
+            ("ui.color", Value::Str("auto".into())),
+        ]
+    );
+}
+
+#[test]
+fn each_key_says_what_a_valid_value_is() {
+    let expect = |name: &str| reg(name).expect();
+    assert_eq!(
+        expect("default_provider"),
+        "must be a provider id of lowercase letters, digits and dashes, such as \"claude-code\""
+    );
+    assert_eq!(
+        expect("autoswitch.threshold"),
+        "must be a number from 50 to 99.9"
+    );
+    assert_eq!(
+        expect("autoswitch.interval_seconds"),
+        "must be a whole number of seconds from 15 to 3600"
+    );
+    assert_eq!(
+        expect("autoswitch.cooldown_seconds"),
+        "must be a whole number of seconds from 0 to 86400"
+    );
+    assert_eq!(
+        expect("autoswitch.hysteresis_pct"),
+        "must be a number from 0 to 50"
+    );
+    assert_eq!(
+        expect("autoswitch.strategy"),
+        "must be \"best\" or \"consume-first\""
+    );
+    assert_eq!(
+        expect("autoswitch.include_api_key_accounts"),
+        "must be true, false, 1, 0, yes or no"
+    );
+    assert_eq!(
+        expect("autoswitch.unhealthy_ticks"),
+        "must be a whole number of ticks from 1 to 100"
+    );
+    assert_eq!(
+        expect("autoswitch.models"),
+        "must be a model name, a list of model names, or [\"all\"] alone"
+    );
+    assert_eq!(
+        expect("usage.history_retention_days"),
+        "must be a whole number of days from 1 to 3650"
+    );
+    assert!(
+        expect("statusline.format")
+            .starts_with("must be a non-empty string using only the placeholders {account}, ")
+    );
+    assert_eq!(
+        expect("run.share_extra"),
+        "must be an entry name or a list of entry names"
+    );
+    assert_eq!(
+        expect("ui.color"),
+        "must be \"auto\", \"always\" or \"never\""
+    );
+}
+
+/// The numbers at a numeric kind's bounds, and just outside them, as TOML.
+fn bounds(kind: KeyKind) -> (Vec<String>, Vec<String>) {
+    match kind {
+        KeyKind::Float { min, max } => (
+            vec![format!("{min:?}"), format!("{max:?}")],
+            vec![format!("{:?}", min - 0.1), format!("{:?}", max + 0.1)],
+        ),
+        KeyKind::Int { min, max } => (
+            vec![min.to_string(), max.to_string()],
+            vec![(min - 1).to_string(), (max + 1).to_string()],
+        ),
+        _ => (Vec::new(), Vec::new()),
+    }
+}
+
+#[test]
+fn every_numeric_key_reads_its_bounds_and_defaults_just_outside_them() {
+    // §15.2: every registry key's bounds are defaulted by reads. The command line agrees.
+    let mut numeric = 0;
+    for key in KEYS {
+        let (inside, outside) = bounds(key.kind);
+        if inside.is_empty() {
+            continue;
+        }
+        numeric += 1;
+        let text = |v: &str| format!("[{}]\n{} = {v}\n", key.table().unwrap(), key.leaf());
+        for v in &inside {
+            let i = inspect_as(&text(v), PROVIDER);
+            let s = state(&i, key.name);
+            assert_eq!(
+                (&s.value, s.source),
+                (&key.parse_arg(v).unwrap(), Source::Global),
+                "{}: {v}",
+                key.name
+            );
+            assert!(i.warnings.is_empty(), "{}: {v}: {:?}", key.name, i.warnings);
+        }
+        for v in &outside {
+            let i = inspect_as(&text(v), PROVIDER);
+            let s = state(&i, key.name);
+            assert_eq!(
+                (&s.value, s.source),
+                (&s.default, Source::Default),
+                "{}: {v}",
+                key.name
+            );
+            assert_eq!(i.warnings.len(), 1, "{}: {v}: {:?}", key.name, i.warnings);
+            assert!(
+                i.warnings[0].contains(&format!("`{}` {} (ignored)", key.name, key.expect())),
+                "{:?}",
+                i.warnings
+            );
+            assert_eq!(key.parse_arg(v), Err(key.expect()), "{}: {v}", key.name);
+        }
+    }
+    assert_eq!(
+        numeric, 6,
+        "threshold, three seconds and ticks, hysteresis, retention"
+    );
+}
+
+#[test]
+fn the_auto_switch_keys_are_read_from_the_provider_s_table_first() {
+    let text = "[autoswitch]\ninterval_seconds = 120\ncooldown_seconds = 600\nhysteresis_pct = 5\n\
+                strategy = \"best\"\ninclude_api_key_accounts = false\nunhealthy_ticks = 2\n\n\
+                [provider.claude-code.autoswitch]\ninterval_seconds = 30\nstrategy = \"consume-first\"\n\
+                include_api_key_accounts = true\n";
+    let (s, warnings) = load(text);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        (
+            s.interval_seconds,
+            s.cooldown_seconds,
+            s.hysteresis_pct,
+            s.strategy,
+            s.include_api_key_accounts,
+            s.unhealthy_ticks
+        ),
+        (30, 600, 5.0, Strategy::ConsumeFirst, true, 2),
+        "a whole number reads as a float key's value"
+    );
+    let (s, _) = load_as(text, "fake-agent");
+    assert_eq!(
+        (s.interval_seconds, s.strategy, s.include_api_key_accounts),
+        (120, Strategy::Best, false),
+        "another provider's table does not apply"
+    );
+}
+
+#[test]
+fn a_boolean_override_reads_every_spelling_and_an_invalid_one_falls_through() {
+    // M3b's reading (§6.4): in the file a boolean is a TOML boolean, the integer 1 or 0, or one
+    // of `true/false/1/0/yes/no` as a string. Each of these overrides the global `true`.
+    for text in ["false", "0", "\"no\"", "\"false\"", "\"0\""] {
+        let (s, warnings) = load(&format!(
+            "[autoswitch]\ninclude_api_key_accounts = true\n\
+             [provider.claude-code.autoswitch]\ninclude_api_key_accounts = {text}\n"
+        ));
+        assert!(!s.include_api_key_accounts, "{text}");
+        assert!(warnings.is_empty(), "{text}: {warnings:?}");
+    }
+    // Anything else warns, naming the provider's key, and the global `true` applies.
+    for text in ["\"\"", "[false]", "\"No\"", "\"off\"", "2", "0.0"] {
+        let (s, warnings) = load(&format!(
+            "[autoswitch]\ninclude_api_key_accounts = true\n\
+             [provider.claude-code.autoswitch]\ninclude_api_key_accounts = {text}\n"
+        ));
+        assert!(s.include_api_key_accounts, "{text}");
+        assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+        assert!(
+            warnings[0].contains(
+                "`provider.claude-code.autoswitch.include_api_key_accounts` must be true, false, 1, 0, yes or no"
+            ),
+            "{warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn the_strategy_and_the_colour_read_their_values_exactly() {
+    for text in ["\"Best\"", "\"consume_first\"", "\"next-available\"", "1"] {
+        let (s, warnings) = load(&format!(
+            "[autoswitch]\nstrategy = \"consume-first\"\n\
+             [provider.claude-code.autoswitch]\nstrategy = {text}\n"
+        ));
+        assert_eq!(s.strategy, Strategy::ConsumeFirst, "{text}");
+        assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+        assert!(
+            warnings[0].contains(
+                "`provider.claude-code.autoswitch.strategy` must be \"best\" or \"consume-first\""
+            ),
+            "{warnings:?}"
+        );
+    }
+    let i = inspect_as("[provider.claude-code.ui]\ncolor = \"never\"\n", PROVIDER);
+    assert_eq!(
+        state(&i, "ui.color").source,
+        Source::Default,
+        "ui.color has no provider table"
+    );
+}
+
+#[test]
+fn default_provider_is_read_from_the_top_level_alone() {
+    for reader in [PROVIDER, "fake-agent"] {
+        let (s, warnings) = load_as("default_provider = \"fake-agent\"\n", reader);
+        assert_eq!(
+            s.default_provider,
+            ProviderId::new("fake-agent"),
+            "{reader}"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+    let i = inspect_as(
+        "[provider.claude-code]\ndefault_provider = \"fake-agent\"\n",
+        PROVIDER,
+    );
+    let s = state(&i, "default_provider");
+    assert_eq!(
+        (&s.value, s.source),
+        (&Value::Str("claude-code".into()), Source::Default)
+    );
+    assert_eq!(i.unknown, ["provider.claude-code.default_provider"]);
+}
+
+#[test]
+fn unknown_keys_are_sorted_by_dotted_name_however_the_tables_interleave() {
+    let i = inspect_as(
+        "[provider.claude-code.autoswitch]\nzeta = 1\n\
+         [ui]\nalpha = 2\n\
+         [provider.claude-code.statusline]\nbeta = 3\n",
+        PROVIDER,
+    );
+    assert_eq!(
+        i.unknown,
+        [
+            "provider.claude-code.autoswitch.zeta",
+            "provider.claude-code.statusline.beta",
+            "ui.alpha",
+        ]
+    );
+}
+
+#[test]
+fn a_malformed_default_provider_falls_back_to_claude_code_with_a_warning() {
+    for text in [
+        "\"Claude Code\"",
+        "\"claude_code\"",
+        "\"\"",
+        "\"-x\"",
+        "5",
+        "[\"claude-code\"]",
+    ] {
+        let (s, warnings) = load(&format!("default_provider = {text}\n"));
+        assert_eq!(s.default_provider, ProviderId::new("claude-code"), "{text}");
+        assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+        assert!(
+            warnings[0].contains("`default_provider` must be a provider id"),
+            "{warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn an_empty_provider_list_overrides_a_non_empty_global_one() {
+    // Review Focus 2, as a read: `[]` in the provider's table is a value, and it wins.
+    let i = inspect_as(
+        "[autoswitch]\nmodels = [\"Opus\"]\n[run]\nshare_extra = [\"hook-data\"]\n\n\
+         [provider.claude-code.autoswitch]\nmodels = []\n[provider.claude-code.run]\nshare_extra = []\n",
+        PROVIDER,
+    );
+    assert!(i.warnings.is_empty(), "{:?}", i.warnings);
+    for name in ["autoswitch.models", "run.share_extra"] {
+        let s = state(&i, name);
+        assert_eq!(
+            (&s.value, s.source),
+            (&list(&[]), Source::Provider),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn inspect_reports_each_key_s_value_default_and_source() {
+    let text = "[autoswitch]\nthreshold = 80\nmodels = [\"Opus\"]\n\n\
+                [provider.claude-code.autoswitch]\nthreshold = 70\n";
+    let i = inspect_as(text, PROVIDER);
+    assert!(i.exists);
+    assert_eq!(
+        i.keys.iter().map(|s| s.key.name).collect::<Vec<_>>(),
+        KEYS.iter().map(|k| k.name).collect::<Vec<_>>(),
+        "every key, in the registry's order"
+    );
+    let threshold = state(&i, "autoswitch.threshold");
+    assert_eq!(
+        (&threshold.value, &threshold.default, threshold.source),
+        (&Value::Float(70.0), &Value::Float(90.0), Source::Provider)
+    );
+    let models = state(&i, "autoswitch.models");
+    assert_eq!(
+        (&models.value, models.source),
+        (&list(&["Opus"]), Source::Global)
+    );
+    let color = state(&i, "ui.color");
+    assert_eq!(
+        (&color.value, color.source),
+        (&Value::Str("auto".into()), Source::Default)
+    );
+    let other = inspect_as(text, "fake-agent");
+    let threshold = state(&other, "autoswitch.threshold");
+    assert_eq!(
+        (&threshold.value, threshold.source),
+        (&Value::Float(80.0), Source::Global)
+    );
+}
+
+#[test]
+fn inspect_and_load_read_every_key_alike() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::for_test(dir.path());
+    fs::create_dir_all(env.config_dir()).unwrap();
+    fs::write(
+        settings::config_path(&env),
+        "default_provider = \"fake-agent\"\n[autoswitch]\nthreshold = 120\ninterval_seconds = 45\n\
+         models = \"Fable\"\n[provider.claude-code.autoswitch]\nstrategy = \"consume-first\"\n\
+         [provider.claude-code.statusline]\nformat = \"{7d}\"\n[ui]\ncolor = \"never\"\n",
+    )
+    .unwrap();
+    let provider = ProviderId::new(PROVIDER);
+    let (loaded, warnings) = Settings::load(&env, &provider);
+    let i = inspect(&env, &provider);
+    assert_eq!(i.warnings, warnings);
+    for s in &i.keys {
+        assert_eq!(s.value, loaded.value(s.key), "{}", s.key.name);
+    }
+}
+
+#[test]
+fn inspect_lists_the_keys_the_registry_does_not_know_sorted() {
+    let i = inspect_as(
+        r#"
+colour = "never"
+default_provider = "claude-code"
+
+[autoswitch]
+threshold = 80
+thresold = 80
+
+[usage]
+retention = 30
+
+[extra]
+anything = 1
+
+[ui]
+color = "never"
+theme = "dark"
+
+[provider.claude-code]
+default_provider = "fake-agent"
+
+[provider.claude-code.autoswitch]
+models = ["Fable"]
+future = 1
+
+[provider.claude-code.ui]
+color = "always"
+
+[provider.fake-agent.statusline]
+format = "{5h}"
+
+[provider.fake-agent.run]
+share_extra = ["x"]
+
+[provider.fake-agent.usage]
+history_retention_days = 3
+"#,
+        PROVIDER,
+    );
+    assert_eq!(
+        i.unknown,
+        [
+            "autoswitch.thresold",
+            "colour",
+            "extra.anything",
+            "provider.claude-code.autoswitch.future",
+            "provider.claude-code.default_provider",
+            "provider.claude-code.ui.color",
+            "provider.fake-agent.usage.history_retention_days",
+            "ui.theme",
+            "usage.retention",
+        ]
+    );
+    assert!(
+        i.warnings.is_empty(),
+        "an unknown key is no warning: {:?}",
+        i.warnings
+    );
+    assert_eq!(
+        state(&i, "ui.color").value,
+        Value::Str("never".into()),
+        "the provider's ui table is not read"
+    );
+}
+
+#[test]
+fn a_known_table_of_the_wrong_type_warns_and_is_not_unknown() {
+    let i = inspect_as(
+        "autoswitch = 5\n[[usage]]\nhistory_retention_days = 3\n",
+        PROVIDER,
+    );
+    assert!(i.unknown.is_empty(), "{:?}", i.unknown);
+    assert_eq!(i.warnings.len(), 2, "{:?}", i.warnings);
+}
+
+#[test]
+fn inspecting_a_missing_file_gives_every_default_and_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Env::for_test(dir.path());
+    let i = inspect(&env, &ProviderId::new(PROVIDER));
+    assert_eq!(i.path, env.config_dir().join("config.toml"));
+    assert_eq!(settings::config_path(&env), i.path);
+    assert!(!i.exists);
+    assert!(
+        i.keys
+            .iter()
+            .all(|s| s.source == Source::Default && s.value == s.default)
+    );
+    assert!(i.unknown.is_empty() && i.warnings.is_empty());
+    assert!(!env.config_dir().exists(), "inspecting creates nothing");
+}
+
+#[test]
+fn inspecting_a_corrupt_file_gives_every_default_and_one_warning() {
+    let i = inspect_as("[autoswitch\nthreshold = = 3\n", PROVIDER);
+    assert!(i.exists);
+    assert!(i.keys.iter().all(|s| s.source == Source::Default));
+    assert!(i.unknown.is_empty());
+    assert_eq!(i.warnings.len(), 1, "{:?}", i.warnings);
+    assert!(i.warnings[0].contains("not valid TOML"), "{:?}", i.warnings);
+}
+
+#[test]
+fn a_boolean_on_the_command_line_is_one_of_six_words() {
+    let key = reg("autoswitch.include_api_key_accounts");
+    for (raw, want) in [
+        ("true", true),
+        ("1", true),
+        ("yes", true),
+        ("false", false),
+        ("0", false),
+        ("no", false),
+    ] {
+        assert_eq!(key.parse_arg(raw), Ok(Value::Bool(want)), "{raw}");
+    }
+    for raw in ["True", "YES", "on", "off", "y", "", " yes", "2"] {
+        assert_eq!(
+            key.parse_arg(raw),
+            Err("must be true, false, 1, 0, yes or no".to_owned()),
+            "{raw:?}"
+        );
+    }
+}
+
+#[test]
+fn a_number_on_the_command_line_is_taken_as_typed_and_never_clamped() {
+    let threshold = reg("autoswitch.threshold");
+    assert_eq!(threshold.parse_arg("80"), Ok(Value::Float(80.0)));
+    assert_eq!(threshold.parse_arg("99.9"), Ok(Value::Float(99.9)));
+    for raw in [
+        "100", "49.9", "99.95", "nan", "inf", "-inf", "", "80%", " 80", "eighty",
+    ] {
+        assert_eq!(
+            threshold.parse_arg(raw),
+            Err("must be a number from 50 to 99.9".to_owned()),
+            "{raw:?}"
+        );
+    }
+    let interval = reg("autoswitch.interval_seconds");
+    assert_eq!(interval.parse_arg("60"), Ok(Value::Int(60)));
+    for raw in [
+        "14",
+        "3601",
+        "60.0",
+        "1e2",
+        "",
+        "-60",
+        "9223372036854775808",
+    ] {
+        assert_eq!(
+            interval.parse_arg(raw),
+            Err("must be a whole number of seconds from 15 to 3600".to_owned()),
+            "{raw:?}"
+        );
+    }
+}
+
+#[test]
+fn a_list_on_the_command_line_is_split_on_commas_and_each_item_trimmed() {
+    // Review Focus 2: lists typed the way people type them.
+    let models = reg("autoswitch.models");
+    assert_eq!(
+        models.parse_arg("Fable, opus"),
+        Ok(list(&["Fable", "opus"]))
+    );
+    assert_eq!(models.parse_arg(" Fable "), Ok(list(&["Fable"])));
+    assert_eq!(models.parse_arg(""), Ok(list(&[])), "'' is the empty list");
+    assert_eq!(models.parse_arg("all"), Ok(list(&["all"])));
+    assert_eq!(
+        models.parse_arg("Fable,fable,FABLE"),
+        Ok(list(&["Fable"])),
+        "repeats collapse, ignoring case"
+    );
+    for raw in ["Fable,,Opus", "Fable,", ",Fable", " ", " , "] {
+        let reason = models.parse_arg(raw).unwrap_err();
+        assert!(
+            reason.starts_with("must be model names separated by commas, with no empty item"),
+            "{raw:?}: {reason}"
+        );
+    }
+    for raw in ["all,Fable", "Fable,ALL", " all , Opus"] {
+        assert_eq!(
+            models.parse_arg(raw),
+            Err("must be \"all\" alone, or model names without \"all\"".to_owned()),
+            "{raw:?}"
+        );
+    }
+}
+
+#[test]
+fn share_extra_on_the_command_line_takes_entry_names_only() {
+    let share = reg("run.share_extra");
+    assert_eq!(
+        share.parse_arg("hook-data, .my-tool,hooks.json"),
+        Ok(list(&["hook-data", ".my-tool", "hooks.json"]))
+    );
+    assert_eq!(
+        share.parse_arg("hook-data,hook-data"),
+        Ok(list(&["hook-data"]))
+    );
+    assert_eq!(share.parse_arg(""), Ok(list(&[])));
+    for raw in ["a/b", ".", "..", ".tagteam-links.json", "ok,../x"] {
+        let reason = share.parse_arg(raw).unwrap_err();
+        assert!(
+            reason.starts_with("must be entry names of the source home"),
+            "{raw:?}: {reason}"
+        );
+    }
+    assert!(
+        share
+            .parse_arg("a,,b")
+            .unwrap_err()
+            .starts_with("must be entry names separated by commas")
+    );
+}
+
+#[test]
+fn a_choice_a_format_and_a_provider_on_the_command_line_are_taken_exactly() {
+    let strategy = reg("autoswitch.strategy");
+    assert_eq!(
+        strategy.parse_arg("consume-first"),
+        Ok(Value::Str("consume-first".into()))
+    );
+    for raw in ["Best", "best ", "next-available", ""] {
+        assert_eq!(strategy.parse_arg(raw), Err(strategy.expect()), "{raw:?}");
+    }
+    let color = reg("ui.color");
+    assert_eq!(color.parse_arg("never"), Ok(Value::Str("never".into())));
+    assert_eq!(color.parse_arg("Never"), Err(color.expect()));
+    let format = reg("statusline.format");
+    assert_eq!(
+        format.parse_arg("{5h}% {model:Fable}"),
+        Ok(Value::Str("{5h}% {model:Fable}".into()))
+    );
+    for raw in ["", "  ", "{nope}", "{5h", "{model: Fable}"] {
+        assert_eq!(format.parse_arg(raw), Err(format.expect()), "{raw:?}");
+    }
+    let provider = reg("default_provider");
+    for raw in ["claude-code", "fake-agent", "x1"] {
+        assert_eq!(provider.parse_arg(raw), Ok(Value::Str(raw.into())));
+    }
+    for raw in [
+        "",
+        "Claude-Code",
+        "claude code",
+        "claude_code",
+        "-x",
+        "x-",
+        "provider.x",
+    ] {
+        assert_eq!(provider.parse_arg(raw), Err(provider.expect()), "{raw:?}");
+    }
+}
+
+#[test]
+fn every_refusal_says_what_the_value_must_be() {
+    for key in KEYS {
+        for raw in [
+            "", "nope", "a,,b", "all,x", "{x}", "-1", "1e9", "a/b", "Yes",
+        ] {
+            if let Err(reason) = key.parse_arg(raw) {
+                assert!(
+                    reason.starts_with("must be "),
+                    "{}: {raw:?}: {reason}",
+                    key.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_value_survives_the_command_line_and_the_file_unchanged() {
+    // What `config get` prints, `config set` takes back; what a write stores, a read reads back.
+    let samples = [
+        ("default_provider", "fake-agent"),
+        ("autoswitch.threshold", "75.5"),
+        ("autoswitch.interval_seconds", "120"),
+        ("autoswitch.cooldown_seconds", "0"),
+        ("autoswitch.hysteresis_pct", "12.25"),
+        ("autoswitch.strategy", "consume-first"),
+        ("autoswitch.include_api_key_accounts", "yes"),
+        ("autoswitch.unhealthy_ticks", "100"),
+        ("autoswitch.models", "Fable, Opus"),
+        ("usage.history_retention_days", "3650"),
+        ("statusline.format", "{account} {5h}%"),
+        ("run.share_extra", ""),
+        ("ui.color", "always"),
+    ];
+    assert_eq!(
+        samples.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        KEYS.iter().map(|k| k.name).collect::<Vec<_>>(),
+        "one sample per key"
+    );
+    for (name, raw) in samples {
+        let key = reg(name);
+        let value = key.parse_arg(raw).unwrap();
+        assert_eq!(key.parse_arg(&value.display()), Ok(value.clone()), "{name}");
+        let mut details = Vec::new();
+        assert_eq!(
+            key.parse_item(&value.to_item(), &mut |d| details.push(d)),
+            Some(value.clone()),
+            "{name}"
+        );
+        assert!(details.is_empty(), "{name}: {details:?}");
+    }
+}
+
+#[test]
+fn a_value_is_written_as_its_toml_type_and_shown_as_its_json_type() {
+    assert_eq!(Value::Float(80.0).to_item().as_float(), Some(80.0));
+    assert_eq!(Value::Int(60).to_item().as_integer(), Some(60));
+    assert_eq!(Value::Bool(true).to_item().as_bool(), Some(true));
+    assert_eq!(Value::Str("best".into()).to_item().as_str(), Some("best"));
+    let item = list(&["Fable", "Opus"]).to_item();
+    let items: Vec<&str> = item
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(items, ["Fable", "Opus"]);
+    assert!(list(&[]).to_item().as_array().unwrap().is_empty());
+
+    assert_eq!(Value::Float(80.0).to_json(), json!(80.0));
+    assert_eq!(Value::Int(60).to_json(), json!(60));
+    assert_eq!(Value::Bool(false).to_json(), json!(false));
+    assert_eq!(Value::Str("best".into()).to_json(), json!("best"));
+    assert_eq!(list(&["Fable"]).to_json(), json!(["Fable"]));
+    assert_eq!(list(&[]).to_json(), json!([]));
+
+    assert_eq!(Value::Float(80.0).display(), "80");
+    assert_eq!(Value::Float(99.9).display(), "99.9");
+    assert_eq!(list(&["Fable", "Opus"]).display(), "Fable,Opus");
+    assert_eq!(list(&[]).display(), "");
+    assert_eq!(Source::Provider.as_str(), "provider");
+    assert_eq!(Source::Global.as_str(), "global");
+    assert_eq!(Source::Default.as_str(), "default");
 }
