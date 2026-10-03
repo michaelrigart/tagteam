@@ -181,7 +181,7 @@ fn build_registry(ctx: &Context) -> ProviderRegistry {
 
 /// The variables `Context::from_process` captures into `Env.vars` (Decision 5): every variable
 /// `registry`'s providers name a profile with (§4.5 `session_dir_var`), then `CLAUDECODE`
-/// (§13.5).
+/// (§13.5), then `PATH`, which `plan_run` looks the launch command up on (§12.1).
 pub(crate) fn session_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
     let mut names: Vec<&'static str> = registry
         .all()
@@ -189,6 +189,7 @@ pub(crate) fn session_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
         .filter_map(|p| p.session_dir_var())
         .collect();
     names.push(CLAUDECODE);
+    names.push("PATH");
     names
 }
 
@@ -1625,7 +1626,7 @@ mod tests {
         };
         assert_eq!(
             session_vars(&build_registry(&ctx)),
-            ["CLAUDE_CONFIG_DIR", "CLAUDECODE"]
+            ["CLAUDE_CONFIG_DIR", "CLAUDECODE", "PATH"]
         );
         assert!(
             ctx.env.vars.is_empty(),

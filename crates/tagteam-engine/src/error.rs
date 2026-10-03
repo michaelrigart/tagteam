@@ -141,6 +141,17 @@ pub enum EngineError {
         shared: PathBuf,
         cause: SplitCause,
     },
+    /// §12.1: the provider's launch command is not on `PATH`; `run` changed nothing.
+    #[error("`{command}` is not on PATH; install it, or add its directory to PATH")]
+    LaunchCommandMissing { command: String },
+    /// §12.1: an API-key account has no login a session could run in a profile of its own.
+    #[error(
+        "position {position} is an API-key account, which `tagteam run` cannot start a session for; `tagteam switch {position}` makes it the live login"
+    )]
+    ApiKeyAccount { position: u32 },
+    /// §12.1 `--require-session`: `run` would have run plain `claude` instead of a session.
+    #[error("--require-session: {why}, so no session would start")]
+    RequiresSession { why: String },
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -233,6 +244,9 @@ impl EngineError {
             EngineError::SessionOwned { .. } => "session-owned",
             EngineError::ProfileConflict { .. } => "profile-conflict",
             EngineError::ProfileSplit { .. } => "profile-split",
+            EngineError::LaunchCommandMissing { .. } => "launch-command-missing",
+            EngineError::ApiKeyAccount { .. } => "api-key-account",
+            EngineError::RequiresSession { .. } => "requires-session",
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -435,6 +449,20 @@ mod tests {
                     cause: SplitCause::StaleWhileRunning,
                 },
                 "profile-split",
+            ),
+            (
+                EngineError::LaunchCommandMissing {
+                    command: "claude".into(),
+                },
+                "launch-command-missing",
+            ),
+            (
+                EngineError::ApiKeyAccount { position: 1 },
+                "api-key-account",
+            ),
+            (
+                EngineError::RequiresSession { why: "w".into() },
+                "requires-session",
             ),
             (EngineError::Io(io::Error::other("x")), "io"),
             (

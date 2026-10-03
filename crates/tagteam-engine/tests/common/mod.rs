@@ -1919,3 +1919,36 @@ pub fn sent_refresh_tokens(fx: &Fx) -> Vec<String> {
         })
         .collect()
 }
+
+/// `tagteam run` (§12): its launch command on `PATH`, and the directories it starts in.
+impl Fx {
+    /// A `bin/` directory under the fixture, holding an executable `/bin/sh` stub named `name`
+    /// for `PATH` lookups (§12.1). Nothing ever runs it. Returns the directory.
+    pub fn fake_bin(&self, name: &str) -> PathBuf {
+        let bin = self.dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let path = bin.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// `env` with `PATH` set to `dir` alone, in `Env.vars`, where the CLI captures it (Task 8).
+    pub fn with_path(env: &Env, dir: &Path) -> Env {
+        let mut env = env.clone();
+        env.vars.insert("PATH".into(), dir.as_os_str().to_owned());
+        env
+    }
+
+    /// An engine for this fixture's own home whose `PATH` is `dir`.
+    pub fn engine_on_path(&self, dir: &Path) -> Engine {
+        self.engine_with_env(Self::with_path(&self.env, dir))
+    }
+
+    /// `~/<rel>` under `~/work`, created: a directory `run` starts in (§12.1).
+    pub fn work_dir(&self, rel: &str) -> PathBuf {
+        let dir = self.env.home.join("work").join(rel);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+}
