@@ -4,6 +4,7 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use tagteam_core::ProviderId;
+use tagteam_engine::config::SettingsChange;
 use tagteam_engine::settings::{Inspection, KeyState};
 
 /// How `config list` shows an empty value: as the empty argument `config set` takes.
@@ -90,4 +91,28 @@ pub(crate) fn path_human(path: &Path) -> String {
 /// `{schemaVersion, path, exists}`.
 pub(crate) fn path_json(path: &Path, exists: bool) -> Value {
     json!({"schemaVersion": 1, "path": path.display().to_string(), "exists": exists})
+}
+
+/// `config set` and `unset` for a person (§6.4). The value is shown as the file now holds it,
+/// as TOML, so a string keeps its quotes and an empty list reads `[]`. A changed file is named;
+/// with a symlinked `config.toml` that is the useful part.
+pub(crate) fn change_human(change: &SettingsChange) -> String {
+    let path = change.path.display();
+    match (&change.value, change.changed) {
+        (Some(value), true) => format!("Set {} = {} in {path}.\n", change.key, value.to_item()),
+        (Some(value), false) => format!("{} is already {}.\n", change.key, value.to_item()),
+        (None, true) => format!("Removed {} from {path}.\n", change.key),
+        (None, false) => format!("{} is not set.\n", change.key),
+    }
+}
+
+/// §6.4: `{schemaVersion, ok, key, value, changed}`, with `value` null for `unset`.
+pub(crate) fn change_json(change: &SettingsChange) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 1,
+        "ok": true,
+        "key": change.key,
+        "value": change.value.as_ref().map_or(serde_json::Value::Null, |v| v.to_json()),
+        "changed": change.changed,
+    })
 }

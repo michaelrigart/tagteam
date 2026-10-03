@@ -258,6 +258,23 @@ pub enum ConfigAction {
         #[arg(value_parser = ConfigKeyParser, hide_possible_values = true)]
         key: String,
     },
+    /// Set KEY to VALUE in config.toml
+    ///
+    /// Numbers are written as typed, and booleans (also 1/0 and yes/no) as true or false. A
+    /// list is comma-separated names, and '' is an empty list. --provider, or a provider.<id>.
+    /// prefix, names a provider's own entry.
+    Set {
+        #[arg(value_parser = ConfigKeyParser, hide_possible_values = true)]
+        key: String,
+        /// Taken as typed, even when it starts with '-'
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    /// Remove KEY from config.toml, so the global value or the default applies again
+    Unset {
+        #[arg(value_parser = ConfigKeyParser, hide_possible_values = true)]
+        key: String,
+    },
     /// Where the settings file is, whether or not it exists
     Path,
 }

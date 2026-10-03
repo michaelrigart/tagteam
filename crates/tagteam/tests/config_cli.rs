@@ -404,3 +404,308 @@ fn a_default_provider_this_build_lacks_warns_and_claude_code_is_used() {
         .stdout("")
         .stderr("");
 }
+
+/// `config set` and `config unset` through the real binary (§6.4).
+mod set_and_unset {
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
+    use std::process::Stdio;
+
+    use serde_json::{Value, json};
+    use tagteam_engine::settings::config_path;
+    use tagteam_provider::Env;
+
+    use super::common::{cmd, std_cmd};
+
+    /// The settings file of the binary's environment under `root`.
+    fn settings_file(root: &Path) -> PathBuf {
+        config_path(&Env::for_test(root))
+    }
+
+    /// The exit code of `args --json`, and the one object it printed.
+    fn run_json(root: &Path, args: &[&str]) -> (i32, Value) {
+        let out = cmd(root).args(args).arg("--json").output().unwrap();
+        (
+            out.status.code().unwrap(),
+            serde_json::from_slice(&out.stdout).unwrap(),
+        )
+    }
+
+    #[test]
+    fn set_and_unset_answer_with_the_spec_s_json_shape() {
+        // §6.4: `{schemaVersion, ok, key, value, changed}`, with `value` null for `unset`.
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let models = "provider.claude-code.autoswitch.models";
+
+        assert_eq!(
+            run_json(root, &["config", "set", models, "Fable, opus"]),
+            (
+                0,
+                json!({"schemaVersion": 1, "ok": true, "key": models, "value": ["Fable", "opus"], "changed": true})
+            )
+        );
+        // `--provider` names the same entry, which already holds the list.
+        assert_eq!(
+            run_json(
+                root,
+                &[
+                    "config",
+                    "set",
+                    "autoswitch.models",
+                    "Fable,opus",
+                    "--provider",
+                    "claude-code"
+                ]
+            ),
+            (
+                0,
+                json!({"schemaVersion": 1, "ok": true, "key": models, "value": ["Fable", "opus"], "changed": false})
+            )
+        );
+        assert_eq!(
+            run_json(root, &["config", "set", "autoswitch.threshold", "85.5"]),
+            (
+                0,
+                json!({"schemaVersion": 1, "ok": true, "key": "autoswitch.threshold", "value": 85.5, "changed": true})
+            )
+        );
+        for changed in [true, false] {
+            assert_eq!(
+                run_json(
+                    root,
+                    &["config", "unset", "autoswitch.models", "-p", "claude-code"]
+                ),
+                (
+                    0,
+                    json!({"schemaVersion": 1, "ok": true, "key": models, "value": null, "changed": changed})
+                )
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(settings_file(root)).unwrap(),
+            "[autoswitch]\nthreshold = 85.5\n"
+        );
+    }
+
+    #[test]
+    fn a_refused_value_or_key_exits_1_with_invalid_input_and_writes_nothing() {
+        // §6.4, §13.1. `ConfigKeyParser` passes any key, so an unknown key reaches the engine:
+        // exit 1, not clap's 2 (Decision 14). A value that starts with `-` reaches the engine
+        // too.
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        for args in [
+            &["config", "set", "autoswitch.threshold", "100"][..],
+            &["config", "set", "autoswitch.cooldown_seconds", "-1"],
+            &["config", "set", "autoswitch.treshold", "80"],
+            &["config", "set", "provider.claude-code.ui.color", "never"],
+            &[
+                "config",
+                "set",
+                "ui.color",
+                "never",
+                "--provider",
+                "claude-code",
+            ],
+            &[
+                "config",
+                "set",
+                "provider.claude-code.autoswitch.models",
+                "all,Fable",
+            ],
+            &["config", "set", "default_provider", "codex"],
+            &["config", "unset", "autoswitch.treshold"],
+        ] {
+            let (code, v) = run_json(root, args);
+            assert_eq!(code, 1, "{args:?}");
+            assert_eq!(v["schemaVersion"], 1, "{args:?}");
+            assert_eq!(v["error"]["type"], "invalid-input", "{args:?}: {v}");
+        }
+        // A provider this build lacks is `unknown-provider` in both spellings, as for `get`
+        // (Decision 4).
+        for args in [
+            &["config", "set", "provider.codex.autoswitch.threshold", "80"][..],
+            &[
+                "config",
+                "set",
+                "autoswitch.threshold",
+                "80",
+                "--provider",
+                "codex",
+            ],
+            &["config", "unset", "provider.codex.autoswitch.threshold"],
+        ] {
+            let (code, v) = run_json(root, args);
+            assert_eq!(code, 1, "{args:?}");
+            assert_eq!(v["error"]["type"], "unknown-provider", "{args:?}: {v}");
+        }
+        // A missing VALUE is a usage error.
+        cmd(root)
+            .args(["config", "set", "ui.color"])
+            .assert()
+            .code(2);
+        // Without `--json`, the refusal is one line on stderr.
+        cmd(root)
+            .args(["config", "set", "autoswitch.threshold", "100"])
+            .assert()
+            .code(1)
+            .stdout("")
+            .stderr(predicates::str::starts_with("tagteam: "));
+        assert!(!settings_file(root).exists());
+    }
+
+    #[test]
+    fn set_and_unset_say_what_they_changed() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let file = settings_file(root).display().to_string();
+        let says = |args: &[&str], text: String| {
+            cmd(root)
+                .args(args)
+                .assert()
+                .success()
+                .stdout(text)
+                .stderr("");
+        };
+
+        says(
+            &["config", "set", "ui.color", "never"],
+            format!("Set ui.color = \"never\" in {file}.\n"),
+        );
+        says(
+            &["config", "set", "ui.color", "never"],
+            "ui.color is already \"never\".\n".into(),
+        );
+        says(
+            &[
+                "config",
+                "set",
+                "provider.claude-code.autoswitch.models",
+                "",
+            ],
+            format!("Set provider.claude-code.autoswitch.models = [] in {file}.\n"),
+        );
+        says(
+            &["config", "unset", "ui.color"],
+            format!("Removed ui.color from {file}.\n"),
+        );
+        says(
+            &["config", "unset", "ui.color"],
+            "ui.color is not set.\n".into(),
+        );
+    }
+
+    #[test]
+    fn a_corrupt_file_is_refused_with_settings_unreadable_and_left_as_it_was() {
+        // §6.4: `set` and `unset` refuse to write to a corrupt file.
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let file = settings_file(root);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "[ui\ncolor = \"never\"\n").unwrap();
+        for args in [
+            &["config", "set", "ui.color", "auto"][..],
+            &["config", "unset", "ui.color"],
+        ] {
+            let (code, v) = run_json(root, args);
+            assert_eq!(code, 1, "{args:?}");
+            assert_eq!(v["error"]["type"], "settings-unreadable", "{args:?}: {v}");
+        }
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "[ui\ncolor = \"never\"\n"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_settings_file_is_written_through_and_stays_a_link() {
+        // Review Focus 1, through the binary, with an absolute link (the engine test uses a
+        // relative one).
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let target = root.join("dotfiles/tagteam.toml");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &target,
+            "# from my dotfiles\n[ui]\ncolor = \"auto\" # for now\n",
+        )
+        .unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = settings_file(root);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink(&target, &link).unwrap();
+
+        cmd(root)
+            .args(["config", "set", "ui.color", "never"])
+            .assert()
+            .success();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "# from my dotfiles\n[ui]\ncolor = \"never\" # for now\n"
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn processes_setting_different_keys_at_once_all_land() {
+        // §6.4: the settings lock orders each read, edit and write across processes, so no
+        // process writes over another's key.
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let writes = [
+            ("autoswitch.threshold", "85.5", "threshold = 85.5"),
+            (
+                "autoswitch.interval_seconds",
+                "120",
+                "interval_seconds = 120",
+            ),
+            (
+                "autoswitch.cooldown_seconds",
+                "600",
+                "cooldown_seconds = 600",
+            ),
+            ("autoswitch.unhealthy_ticks", "4", "unhealthy_ticks = 4"),
+            (
+                "usage.history_retention_days",
+                "30",
+                "history_retention_days = 30",
+            ),
+            ("ui.color", "never", "color = \"never\""),
+        ];
+        let children: Vec<_> = writes
+            .iter()
+            .map(|&(key, value, _)| {
+                std_cmd(root)
+                    .args(["config", "set", key, value])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in children {
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let text = fs::read_to_string(settings_file(root)).unwrap();
+        for (key, _, line) in writes {
+            assert!(text.lines().any(|l| l == line), "{key} was lost:\n{text}");
+        }
+    }
+}
