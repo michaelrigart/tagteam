@@ -38,6 +38,7 @@ const COMMANDS: &[&[&str]] = &[
     // No `--` form: the loop appends `--json`, which after `--` would be the agent's.
     &["run"],
     &["run", "1"],
+    &["displaced"],
 ];
 
 /// `id`'s profile directory under the fixture's `sessions/`.

@@ -186,6 +186,14 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// List credentials tagteam set aside rather than overwrite
+    ///
+    /// A switch saves a live login it would otherwise overwrite, and any other credential that
+    /// was not tagteam's to keep, as a file in tagteam's data directory. tagteam never reads one
+    /// back: restoring one is manual. --json prints {schemaVersion, dir, displaced: [{id,
+    /// provider, at, reason, fingerprint, identity, account, file, recorded}]}, with times in ISO
+    /// 8601 UTC.
+    Displaced,
 }
 
 /// `switch --strategy` (§9.3): the strategies that rank accounts by usage.
