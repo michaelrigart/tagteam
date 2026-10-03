@@ -193,14 +193,21 @@ impl Engine {
     /// creates nothing when the store or the directory is absent (§5).
     pub fn displaced(&self) -> Result<DisplacedList, EngineError> {
         let dir = displaced_dir(&self.env);
+        // Rows before files: a displace writes its file, then its row, so a concurrent one can
+        // only show as `unrecorded` here, never as a row whose file is falsely missing.
+        let store = self.existing_store()?;
+        let rows = match &store {
+            Some(store) => store.displaced_rows()?,
+            None => Vec::new(),
+        };
         let mut files = displaced_files(&dir)?;
         let mut entries = Vec::new();
-        if let Some(store) = self.existing_store()? {
-            for row in store.displaced_rows()? {
+        if let Some(store) = &store {
+            for row in rows {
                 // Only a displaced ID is ever in `files`, so no path is built from a row's ID.
                 let file_present = files.remove(&row.id);
                 let account =
-                    self.displaced_account(&store, &row.provider, row.identity.as_ref())?;
+                    self.displaced_account(store, &row.provider, row.identity.as_ref())?;
                 entries.push(DisplacedEntry {
                     id: row.id,
                     provider: Some(row.provider),

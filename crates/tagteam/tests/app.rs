@@ -1351,3 +1351,34 @@ fn an_unknown_id_is_refused_before_anyone_is_asked() {
     );
     assert!(file.exists());
 }
+
+#[test]
+fn a_signal_at_the_purge_question_interrupts_and_deletes_nothing() {
+    let (h, id, file) = with_a_displaced_login();
+    let cancel = Cancel::new();
+    let mut ctrl_c = Scripted::interrupted_by(&cancel, libc::SIGTERM, &["y"]);
+    let (code, out, err) =
+        h.run_with_cancel(&["displaced", "--purge", id.as_str()], &mut ctrl_c, &cancel);
+    assert_eq!((code, out.as_str(), err.as_str()), (143, "", INTERRUPTED));
+    assert_eq!(ctrl_c.asked, [DELETE_ONE]);
+    assert!(file.exists());
+    let v: Value = serde_json::from_str(&h.ok(&["displaced", "--json"])).unwrap();
+    assert_eq!(v["displaced"][0]["id"], json!(id));
+    assert_eq!(v["displaced"][0]["recorded"], json!(true));
+}
+
+#[test]
+fn a_repeated_id_counts_once_in_the_question_and_is_deleted_once() {
+    let (h, id, file) = with_a_displaced_login();
+    let mut yes = Scripted::answering(&["y"]);
+    let (code, out, err) = h.run(
+        &["displaced", "--purge", id.as_str(), id.as_str()],
+        &mut yes,
+    );
+    assert_eq!(
+        (code, out, err),
+        (0, format!("Deleted {id}.\n"), String::new())
+    );
+    assert_eq!(yes.asked, [DELETE_ONE]);
+    assert!(!file.exists());
+}
