@@ -318,12 +318,15 @@ impl EngineError {
     }
 
     /// The signal behind an interruption, whichever carrier holds it: `Interrupted`,
-    /// `Lock(LockError::Interrupted)`, or `Provider(ProviderError::Lock(LockError::Interrupted))`
-    /// (§14.1). `None` for every other error.
+    /// `Lock(LockError::Interrupted)`, `Provider(ProviderError::Lock(LockError::Interrupted))`,
+    /// or the settings lock's `Settings(SettingsError::Lock(LockError::Interrupted))` (§14.1).
+    /// `None` for every other error.
     pub fn signal(&self) -> Option<i32> {
         match self {
             EngineError::Interrupted(signal) => Some(*signal),
-            EngineError::Lock(e) | EngineError::Provider(ProviderError::Lock(e)) => e.signal(),
+            EngineError::Lock(e)
+            | EngineError::Provider(ProviderError::Lock(e))
+            | EngineError::Settings(SettingsError::Lock(e)) => e.signal(),
             _ => None,
         }
     }
@@ -647,6 +650,18 @@ mod tests {
         for (err, want) in cases {
             assert_eq!(err.kind(), want, "{err:?}");
         }
+    }
+
+    #[test]
+    fn an_interrupted_settings_lock_wait_is_an_interruption() {
+        // §14.1: the settings lock's wait is a cancellation point like any other, so its
+        // interruption carries the signal the CLI exits with.
+        let e = EngineError::Settings(SettingsError::Lock(LockError::Interrupted {
+            path: PathBuf::from("locks/config.lock"),
+            signal: 2,
+        }));
+        assert_eq!(e.signal(), Some(2));
+        assert_eq!(e.kind(), "interrupted");
     }
 
     /// Decision 4: the settings lock fails with the kinds an engine lock fails with, for every

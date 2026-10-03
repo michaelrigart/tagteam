@@ -236,7 +236,7 @@ fn allowlist(policy: &SharePolicy, extra: &[String], warnings: &mut Vec<String>)
 }
 
 /// Known-private (`entry_matches` against the policy's patterns), or tagteam's own.
-fn is_private(policy: &SharePolicy, name: &str) -> bool {
+pub(crate) fn is_private(policy: &SharePolicy, name: &str) -> bool {
     name.starts_with(OWN_PREFIX)
         || policy
             .private
