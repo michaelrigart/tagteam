@@ -1611,6 +1611,42 @@ mod profile_credential {
     }
 
     #[test]
+    fn a_credential_file_that_is_a_link_is_refused_and_its_target_left_alone() {
+        // §12.3 step 4: the atomic write would follow the link and put the vault's account keys
+        // wherever it points, such as the default home's credential file.
+        for platform in [Platform::MacOs, Platform::Linux] {
+            let (f, log) = logged(platform);
+            let (dir, spelling) = profile(&f, "0192");
+            let elsewhere = f.env.home.join(".claude/.credentials.json");
+            fs::write(&elsewhere, profile_cred("theirs")).unwrap();
+            let file = dir.join(".credentials.json");
+            std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+            let bytes = f.cc.compose_profile_credential(&vault(), None).unwrap();
+
+            let err =
+                f.cc.write_profile_credential(&f.env, &spelling, &guard(&f), &bytes)
+                    .unwrap_err();
+
+            let named = Path::new(&spelling).join(".credentials.json");
+            assert!(
+                err.to_string()
+                    .contains(&format!("{} is a link", named.display())),
+                "{platform:?}: {err}"
+            );
+            assert_eq!(
+                fs::read(&elsewhere).unwrap(),
+                profile_cred("theirs"),
+                "{platform:?}"
+            );
+            assert_eq!(fs::read_link(&file).unwrap(), elsewhere, "{platform:?}");
+            assert!(
+                log.calls.lock().unwrap().is_empty(),
+                "{platform:?}: refused before any Keychain call"
+            );
+        }
+    }
+
+    #[test]
     fn an_mcp_token_cc_wrote_since_the_composition_is_kept() {
         let f = fx_on(Platform::Linux);
         let (dir, spelling) = profile(&f, "0192");

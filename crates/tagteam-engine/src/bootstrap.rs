@@ -2,6 +2,7 @@
 //! launch (§12.5, `launch.rs`) calls it under `MutationGuard` and the account lock, which stay
 //! held through validation; step 1's gate refresh ran before it took them.
 
+use std::fs;
 use std::path::Path;
 
 #[cfg(feature = "test-hooks")]
@@ -250,6 +251,16 @@ impl Engine {
         lock: &AccountLock,
     ) -> Result<(), EngineError> {
         debug_assert_eq!(lock.id(), &row.id, "the caller holds this account's lock");
+        // Only into a profile that is a real directory, as M4a's `is_real_dir` decides it: the
+        // step 4 write resolves the profile from its canonical spelling, so through a link at
+        // the profile path it would take the locks, and write the vault's account keys, at the
+        // link's target. (The provider refuses a link at the credential file itself.)
+        if !fs::symlink_metadata(profile).is_ok_and(|m| m.is_dir()) {
+            return Err(EngineError::InvalidInput(format!(
+                "{} is not a directory of its own (a link, say), so a bootstrap would write the session's credential wherever it leads; replace it with the directory itself, then run again",
+                profile.display()
+            )));
+        }
         // §6.2 "Pending rescues before activation": a rescue consumed the vault's generation.
         self.settle_rescues(p, row, lock)?;
         let vault = self.vault_generation(row)?;
