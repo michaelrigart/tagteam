@@ -99,8 +99,9 @@ struct Reconciled {
 
 /// §14.2's refresh outcome for §7.5, one line per call, naming the provider and, once it is
 /// known, the live account. INFO once a request was sent or state changed, and for an error,
-/// which is named by its `kind()` alone; DEBUG for a token that needed nothing. A systemic
-/// refusal's own words are never logged.
+/// which is named by its `kind()` alone; DEBUG for a token that needed nothing, and for
+/// `Replaced`, since §7.5 step 2 sends and writes nothing. A systemic refusal's own words are
+/// never logged.
 fn log_active(
     provider: &ProviderId,
     account: Option<&AccountId>,
