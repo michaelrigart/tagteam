@@ -1,7 +1,10 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
+use clap::builder::{PossibleValue, StringValueParser, TypedValueParser};
 use clap::{Parser, Subcommand, ValueEnum};
+use tagteam_core::CLAUDE_CODE;
+use tagteam_engine::settings::KEYS;
 
 /// No `Debug`: `add-token` carries a secret, and a derived `Debug` would print it.
 #[derive(Parser)]
@@ -20,7 +23,7 @@ pub struct Cli {
     /// Disable colour
     #[arg(long = "no-color", global = true)]
     pub no_color: bool,
-    /// The agent CLI to act on (default: claude-code)
+    /// The agent CLI to act on (default: the default_provider setting, else claude-code)
     #[arg(short = 'p', long, global = true, value_name = "PROVIDER")]
     pub provider: Option<String>,
     #[command(subcommand)]
@@ -178,6 +181,11 @@ pub enum Command {
         #[arg(last = true)]
         args: Vec<OsString>,
     },
+    /// The settings in config.toml
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
 /// `switch --strategy` (§9.3): the strategies that rank accounts by usage.
@@ -236,5 +244,52 @@ impl Command {
             self,
             Command::Switch { .. } | Command::Remove { .. } | Command::Auto { .. }
         )
+    }
+}
+
+/// `tagteam config` (§6.4).
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Every setting, with its value and where the value comes from
+    List,
+    /// One setting's value
+    Get {
+        /// A setting, such as autoswitch.threshold or provider.claude-code.autoswitch.models
+        #[arg(value_parser = ConfigKeyParser, hide_possible_values = true)]
+        key: String,
+    },
+    /// Where the settings file is, whether or not it exists
+    Path,
+}
+
+/// The providers this build registers, as completion offers them (§13.7).
+pub(crate) const COMPLETED_PROVIDERS: &[&str] = &[CLAUDE_CODE];
+
+/// A `config` command's KEY. Any UTF-8 string parses, so a key the registry does not know reaches
+/// the engine's `invalid-input` (§6.4) rather than a usage error, while completion offers every
+/// registry key and its `provider.<id>.` spelling (§13.7, Decision 14).
+#[derive(Clone)]
+pub struct ConfigKeyParser;
+
+impl TypedValueParser for ConfigKeyParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &OsStr,
+    ) -> Result<String, clap::Error> {
+        StringValueParser::new().parse_ref(cmd, arg, value)
+    }
+
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+        let bare = KEYS.iter().map(|k| k.name.to_owned());
+        let prefixed = COMPLETED_PROVIDERS.iter().flat_map(|provider| {
+            KEYS.iter()
+                .filter(|k| k.per_provider)
+                .map(move |k| format!("provider.{provider}.{}", k.name))
+        });
+        Some(Box::new(bare.chain(prefixed).map(PossibleValue::new)))
     }
 }

@@ -17,7 +17,7 @@ use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::run::{RunPlan, RunRequest};
 use tagteam_engine::session::detect_run_shell;
-use tagteam_engine::settings::{ColorMode, Settings, parse_bool};
+use tagteam_engine::settings::{self, ColorMode, Settings, parse_bool};
 use tagteam_engine::store::{AccountRow, Mapping, StoreError};
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
@@ -33,10 +33,10 @@ use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, SystemClock};
 use crate::auto::{
     AutoError, AutoFlags, AutoRun, HumanSink, JsonSink, ThreadSleeper, uniform_jitter,
 };
-use crate::cli::{AutoStrategyArg, Cli, Command, ShellArg, StrategyArg};
+use crate::cli::{AutoStrategyArg, Cli, Command, ConfigAction, ShellArg, StrategyArg};
 use crate::prompt::Prompter;
 use crate::shell_init::Wrapped;
-use crate::{auto, history, prompt, render, root_guard, shell_init, statusline};
+use crate::{auto, config_cmd, history, prompt, render, root_guard, shell_init, statusline};
 
 /// §13.1.
 pub(crate) const EXIT_ERROR: i32 = 1;
@@ -469,6 +469,8 @@ struct App<'a, 'b> {
     /// `--no-color`.
     no_color: bool,
     provider_flag: Option<ProviderId>,
+    /// The settings warnings `run` printed from the engine's read (§6.4).
+    settings_warnings: Vec<String>,
     /// The Keychain Appendix A.3's lock check asks: macOS only, since Linux has none.
     keychain: Option<Arc<dyn Keychain>>,
     io: &'a mut Io<'b>,
@@ -579,6 +581,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
         force_color_env,
         no_color: cli.no_color,
         provider_flag,
+        settings_warnings: warnings,
         keychain,
         io,
     };
@@ -643,6 +646,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Statusline { .. } => "statusline",
         Command::Auto { .. } => "auto",
         Command::Run { .. } => "run",
+        Command::Config { .. } => "config",
     }
 }
 
@@ -1093,6 +1097,7 @@ impl App<'_, '_> {
             Command::Statusline { .. } => unreachable!("run answers statusline before dispatch"),
             Command::ShellInit { .. } => unreachable!("run answers shell-init before dispatch"),
             Command::Run { .. } => unreachable!("run_command answers run before dispatch"),
+            Command::Config { action } => self.config(action)?,
             Command::Auto {
                 once,
                 dry_run,
@@ -1120,6 +1125,66 @@ impl App<'_, '_> {
             }
         }
         Ok(0)
+    }
+
+    /// §6.4's reads. None touches the store or the Keychain, and none creates anything (§5).
+    /// `list` and `get` show a read of their own, so they print that read's warnings, less
+    /// those `run` already printed from the engine's read: the two agree unless the file
+    /// changed in between, and then the warnings match what is shown.
+    fn config(&mut self, action: ConfigAction) -> Result<(), Failure> {
+        match action {
+            ConfigAction::List => {
+                let provider = self.provider();
+                let inspection = settings::inspect(self.engine.env(), &provider);
+                self.read_warnings(&inspection.warnings);
+                self.print(
+                    &config_cmd::list_human(&inspection),
+                    config_cmd::list_json(&inspection, &provider),
+                );
+            }
+            ConfigAction::Get { key } => {
+                let resolved = settings::resolve(&key, self.provider_flag.as_ref())
+                    .map_err(EngineError::from)?;
+                // A provider named in the key is checked as `--provider` is.
+                let provider = match resolved.provider {
+                    Some(p) => {
+                        self.engine.provider(&p)?;
+                        p
+                    }
+                    None => self.provider(),
+                };
+                let inspection = settings::inspect(self.engine.env(), &provider);
+                self.read_warnings(&inspection.warnings);
+                let state = inspection
+                    .keys
+                    .iter()
+                    .find(|s| s.key.name == resolved.key.name)
+                    .expect("inspect reports every registry key");
+                self.print(
+                    &config_cmd::get_human(state),
+                    config_cmd::get_json(state, &provider),
+                );
+            }
+            ConfigAction::Path => {
+                let path = settings::config_path(self.engine.env());
+                let exists = path.exists();
+                self.print(
+                    &config_cmd::path_human(&path),
+                    config_cmd::path_json(&path, exists),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Prints the warnings of a read `run` did not make (§6.4), less those `run` printed.
+    fn read_warnings(&mut self, warnings: &[String]) {
+        for w in warnings
+            .iter()
+            .filter(|w| !self.settings_warnings.contains(w))
+        {
+            let _ = writeln!(self.io.err, "warning: {w}");
+        }
     }
 
     /// §11: `auto`. Like every command that changes the live login it refuses inside a run
@@ -1668,6 +1733,7 @@ mod tests {
             &["shell-init", "zsh"],
             &["run"],
             &["run", "2", "--", "--json"],
+            &["config", "list"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))

@@ -16,7 +16,7 @@ tagteam-provider = { path = "crates/tagteam-provider", version = "0.1.0" }
 tagteam-cc = { path = "crates/tagteam-cc", version = "0.1.0" }
 tagteam-engine = { path = "crates/tagteam-engine", version = "0.1.0" }
 tagteam-fake = { path = "crates/tagteam-fake" }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "string"] }
 fastrand = "2"
 hex = "0.4"
 libc = "0.2"

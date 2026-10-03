@@ -7,6 +7,7 @@ use clap::{CommandFactory, Parser};
 pub mod app;
 pub mod auto;
 pub mod cli;
+mod config_cmd;
 mod history;
 pub mod prompt;
 mod render;
