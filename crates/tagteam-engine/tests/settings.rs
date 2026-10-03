@@ -6,8 +6,9 @@ use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::Strategy;
 use tagteam_engine::settings::{
     self, COOLDOWN_SECONDS_RANGE, ColorMode, HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE,
-    Inspection, KEYS, Key, KeyKind, KeyState, STATUSLINE_PLACEHOLDERS, Settings, Source,
-    THRESHOLD_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect, is_statusline_placeholder, parse_bool,
+    Inspection, KEYS, Key, KeyKind, KeyState, STATUSLINE_PLACEHOLDERS, Settings, SettingsError,
+    Source, THRESHOLD_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect, is_statusline_placeholder,
+    parse_bool, resolve,
 };
 use tagteam_provider::Env;
 
@@ -1770,4 +1771,105 @@ fn a_value_is_written_as_its_toml_type_and_shown_as_its_json_type() {
     assert_eq!(Source::Provider.as_str(), "provider");
     assert_eq!(Source::Global.as_str(), "global");
     assert_eq!(Source::Default.as_str(), "default");
+}
+
+#[test]
+fn a_key_resolves_with_or_without_its_provider() {
+    let cc = ProviderId::new("claude-code");
+    let fake = ProviderId::new("fake-agent");
+    let threshold = reg("autoswitch.threshold");
+    let cases = [
+        ("autoswitch.threshold", None, None),
+        ("autoswitch.threshold", Some(&cc), Some(&cc)),
+        ("provider.claude-code.autoswitch.threshold", None, Some(&cc)),
+        (
+            "provider.claude-code.autoswitch.threshold",
+            Some(&cc),
+            Some(&cc),
+        ),
+        (
+            "provider.fake-agent.autoswitch.threshold",
+            None,
+            Some(&fake),
+        ),
+    ];
+    for (name, flag, want) in cases {
+        let r = resolve(name, flag).unwrap();
+        assert_eq!((r.key, r.provider.as_ref()), (threshold, want), "{name}");
+    }
+    let r = resolve("ui.color", None).unwrap();
+    assert_eq!((r.key.name, r.provider), ("ui.color", None));
+    let r = resolve("provider.claude-code.run.share_extra", None).unwrap();
+    assert_eq!(r.key.name, "run.share_extra");
+}
+
+#[test]
+fn a_key_that_does_not_resolve_says_why() {
+    let cc = ProviderId::new("claude-code");
+    let fake = ProviderId::new("fake-agent");
+    for name in [
+        "",
+        "nope",
+        "threshold",
+        "autoswitch",
+        "autoswitch.nope",
+        "Autoswitch.threshold",
+        "provider",
+        "provider.claude-code",
+        "provider.claude-code.nope",
+        "provider.claude-code.provider.claude-code.autoswitch.threshold",
+    ] {
+        assert!(
+            matches!(resolve(name, None), Err(SettingsError::UnknownKey(n)) if n == name),
+            "{name:?}"
+        );
+    }
+    for (name, flag) in [
+        ("ui.color", Some(&cc)),
+        ("provider.claude-code.ui.color", None),
+        ("default_provider", Some(&cc)),
+        ("provider.claude-code.default_provider", None),
+        ("usage.history_retention_days", Some(&fake)),
+    ] {
+        assert!(
+            matches!(resolve(name, flag), Err(SettingsError::NotPerProvider(_))),
+            "{name}"
+        );
+    }
+    assert!(matches!(
+        resolve("provider.claude-code.autoswitch.models", Some(&fake)),
+        Err(SettingsError::ProviderMismatch { prefix, flag })
+            if prefix == "claude-code" && flag == "fake-agent"
+    ));
+    // A provider that is no id at all is still the caller's to refuse, as `--provider` is.
+    let r = resolve("provider.Claude.autoswitch.threshold", None).unwrap();
+    assert_eq!(r.provider, Some(ProviderId::new("Claude")));
+}
+
+#[test]
+fn a_settings_error_tells_the_user_what_to_do() {
+    assert_eq!(
+        SettingsError::UnknownKey("autoswitch.thresold".into()).to_string(),
+        "there is no setting `autoswitch.thresold`; `tagteam config list` shows them all"
+    );
+    assert_eq!(
+        SettingsError::NotPerProvider("ui.color".into()).to_string(),
+        "`ui.color` is the same for every provider, so no provider table can set it; name it without `provider.<id>.` and without --provider"
+    );
+    assert_eq!(
+        SettingsError::ProviderMismatch {
+            prefix: "claude-code".into(),
+            flag: "fake-agent".into()
+        }
+        .to_string(),
+        "`provider.claude-code.…` and `--provider fake-agent` name different providers; give only one of them"
+    );
+    assert_eq!(
+        SettingsError::Invalid {
+            key: "autoswitch.threshold".into(),
+            reason: "must be a number from 50 to 99.9".into()
+        }
+        .to_string(),
+        "`autoswitch.threshold` must be a number from 50 to 99.9"
+    );
 }

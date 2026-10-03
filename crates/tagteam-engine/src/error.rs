@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use tagteam_provider::{LockError, ProviderError, ReadError};
 
+use crate::settings::SettingsError;
 use crate::store::StoreError;
 use crate::vault::VaultError;
 
@@ -198,6 +199,9 @@ pub enum EngineError {
     /// `--require-session`.
     #[error("{why}")]
     TargetChanged { why: String },
+    /// A `config` command's refusal, or its failure to write (§6.4).
+    #[error(transparent)]
+    Settings(#[from] SettingsError),
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -259,9 +263,7 @@ impl EngineError {
             }
             EngineError::Provider(ProviderError::RestoreFailed { .. }) => "rollback-failed",
             EngineError::Provider(_) => "provider",
-            EngineError::Lock(LockError::Timeout(_)) => "lock-timeout",
-            EngineError::Lock(LockError::Interrupted { .. }) => "interrupted",
-            EngineError::Lock(_) => "lock",
+            EngineError::Lock(e) | EngineError::Settings(SettingsError::Lock(e)) => lock_kind(e),
             EngineError::Vault(_) => "vault",
             EngineError::Unreadable(_) => "unreadable",
             EngineError::UnreadableAccount { .. } => "unreadable",
@@ -301,6 +303,15 @@ impl EngineError {
                 "launch-unreachable"
             }
             EngineError::TargetChanged { .. } => "target-changed",
+            EngineError::Settings(
+                SettingsError::UnknownKey(_)
+                | SettingsError::NotPerProvider(_)
+                | SettingsError::ProviderMismatch { .. }
+                | SettingsError::Invalid { .. }
+                | SettingsError::UnknownProvider(_),
+            ) => "invalid-input",
+            EngineError::Settings(SettingsError::Corrupt { .. }) => "settings-unreadable",
+            EngineError::Settings(SettingsError::Io(_)) => "io",
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -315,6 +326,16 @@ impl EngineError {
             EngineError::Lock(e) | EngineError::Provider(ProviderError::Lock(e)) => e.signal(),
             _ => None,
         }
+    }
+}
+
+/// A lock failure's kind, whichever lock it was: the settings lock's (`SettingsError::Lock`)
+/// reads exactly as an engine lock's (Decision 4).
+fn lock_kind(e: &LockError) -> &'static str {
+    match e {
+        LockError::Timeout(_) => "lock-timeout",
+        LockError::Interrupted { .. } => "interrupted",
+        LockError::Compromised(_) | LockError::Io(_) => "lock",
     }
 }
 
@@ -559,6 +580,53 @@ mod tests {
                 EngineError::TargetChanged { why: "w".into() },
                 "target-changed",
             ),
+            (
+                EngineError::Settings(SettingsError::UnknownKey("x".into())),
+                "invalid-input",
+            ),
+            (
+                EngineError::Settings(SettingsError::NotPerProvider("ui.color".into())),
+                "invalid-input",
+            ),
+            (
+                EngineError::Settings(SettingsError::ProviderMismatch {
+                    prefix: "a".into(),
+                    flag: "b".into(),
+                }),
+                "invalid-input",
+            ),
+            (
+                EngineError::Settings(SettingsError::Invalid {
+                    key: "k".into(),
+                    reason: "must be x".into(),
+                }),
+                "invalid-input",
+            ),
+            (
+                EngineError::Settings(SettingsError::UnknownProvider("p".into())),
+                "invalid-input",
+            ),
+            (
+                EngineError::Settings(SettingsError::Corrupt {
+                    path: PathBuf::from("x"),
+                    detail: "d".into(),
+                }),
+                "settings-unreadable",
+            ),
+            (
+                EngineError::Settings(SettingsError::Lock(LockError::Timeout(PathBuf::from("x")))),
+                "lock-timeout",
+            ),
+            (
+                EngineError::Settings(SettingsError::Lock(LockError::Compromised(PathBuf::from(
+                    "x",
+                )))),
+                "lock",
+            ),
+            (
+                EngineError::Settings(SettingsError::Io(io::Error::other("x"))),
+                "io",
+            ),
             (EngineError::Io(io::Error::other("x")), "io"),
             (
                 EngineError::Provider(ProviderError::Lock(LockError::Interrupted {
@@ -578,6 +646,29 @@ mod tests {
         ];
         for (err, want) in cases {
             assert_eq!(err.kind(), want, "{err:?}");
+        }
+    }
+
+    /// Decision 4: the settings lock fails with the kinds an engine lock fails with, for every
+    /// way a lock can fail.
+    #[test]
+    fn the_settings_lock_has_the_engine_lock_s_kinds() {
+        let failures = || {
+            vec![
+                LockError::Timeout(PathBuf::from("x")),
+                LockError::Compromised(PathBuf::from("x")),
+                LockError::Io(io::Error::other("x")),
+                LockError::Interrupted {
+                    path: PathBuf::from("x"),
+                    signal: 2,
+                },
+            ]
+        };
+        for (engine, settings) in failures().into_iter().zip(failures()) {
+            assert_eq!(
+                EngineError::Settings(SettingsError::Lock(settings)).kind(),
+                EngineError::Lock(engine).kind()
+            );
         }
     }
 

@@ -14,7 +14,7 @@ use std::time::SystemTime;
 
 use tagteam_core::autoswitch::Strategy;
 use tagteam_core::{CLAUDE_CODE, ProviderId};
-use tagteam_provider::Env;
+use tagteam_provider::{Env, LockError};
 use toml_edit::{DocumentMut, Item, TableLike};
 
 pub const DEFAULT_THRESHOLD: f64 = 90.0;
@@ -592,6 +592,71 @@ pub fn inspect(env: &Env, provider: &ProviderId) -> Inspection {
         unknown: read.unknown,
         warnings: read.warnings,
     }
+}
+
+/// A key as a `config` command names it, and the provider table it names, if any.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resolved {
+    pub key: &'static Key,
+    pub provider: Option<ProviderId>,
+}
+
+/// `provider.<id>.<key>`, or `<key>` with `--provider` as `flag`: the two spellings of one
+/// entry (§6.4). Both may be given only when they name the same provider, and a provider table
+/// is refused for a key no provider can override. Whether this build has the provider is the
+/// caller's to check, as it checks `--provider`, so both spellings fail alike.
+pub fn resolve(name: &str, flag: Option<&ProviderId>) -> Result<Resolved, SettingsError> {
+    let unknown = || SettingsError::UnknownKey(name.to_owned());
+    let (prefix, bare) = match name.strip_prefix("provider.") {
+        Some(rest) => {
+            let (id, bare) = rest.split_once('.').ok_or_else(unknown)?;
+            (Some(id), bare)
+        }
+        None => (None, name),
+    };
+    let key = key(bare).ok_or_else(unknown)?;
+    let provider = match (prefix, flag) {
+        (Some(id), Some(flag)) if id != flag.as_str() => {
+            return Err(SettingsError::ProviderMismatch {
+                prefix: id.to_owned(),
+                flag: flag.to_string(),
+            });
+        }
+        (Some(id), _) => Some(ProviderId::new(id)),
+        (None, flag) => flag.cloned(),
+    };
+    if provider.is_some() && !key.per_provider {
+        return Err(SettingsError::NotPerProvider(key.name.to_owned()));
+    }
+    Ok(Resolved { key, provider })
+}
+
+/// Why a `config` command refused (§6.4). The engine reports each as `EngineError::Settings`.
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsError {
+    #[error("there is no setting `{0}`; `tagteam config list` shows them all")]
+    UnknownKey(String),
+    #[error(
+        "`{0}` is the same for every provider, so no provider table can set it; name it without `provider.<id>.` and without --provider"
+    )]
+    NotPerProvider(String),
+    #[error(
+        "`provider.{prefix}.…` and `--provider {flag}` name different providers; give only one of them"
+    )]
+    ProviderMismatch { prefix: String, flag: String },
+    #[error("`{key}` {reason}")]
+    Invalid { key: String, reason: String },
+    /// A `default_provider` value naming a provider this build does not have (Decision 2).
+    #[error("unknown provider {0:?}; name one this build has, such as claude-code")]
+    UnknownProvider(String),
+    /// `set` and `unset` never edit a file that is not valid TOML (§6.4).
+    #[error("{} is not valid TOML ({detail}); fix it, then retry", path.display())]
+    Corrupt { path: PathBuf, detail: String },
+    /// The settings lock (§4.3) could not be taken.
+    #[error(transparent)]
+    Lock(#[from] LockError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug, Clone, PartialEq)]
