@@ -1976,6 +1976,44 @@ mod validation {
     }
 
     #[test]
+    fn the_table_s_edges() {
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        assert_eq!(
+            validate(&f, &spelling, exited(0, &reply_by(&spelling, true, "none"))),
+            Validity::Invalid("not logged in".into()),
+            "logged in by no method"
+        );
+        assert_eq!(
+            validate(
+                &f,
+                &spelling,
+                exited(1, &reply_by(&spelling, false, "claude.ai"))
+            ),
+            Validity::Invalid("not logged in".into())
+        );
+        for method in ["api_key_helper", "api_key", "oauth_token", "third_party"] {
+            let got = validate(
+                &f,
+                &spelling,
+                exited(1, &reply_by(&spelling, false, method)),
+            );
+            assert_eq!(
+                got,
+                Validity::Unknown("inconsistent login state".into()),
+                "{method}: not logged in, yet by another method, confirms nothing and must not delete the profile"
+            );
+        }
+        let (_, mut empty_org) = logged_in(&spelling);
+        empty_org["orgId"] = json!("");
+        assert_eq!(
+            validate(&f, &spelling, exited(0, &empty_org)),
+            Validity::Valid,
+            "an empty orgId is no org"
+        );
+    }
+
+    #[test]
     fn overridden_names_the_method_and_its_source() {
         let f = fx();
         let (_dir, spelling) = profile(&f, "0192");

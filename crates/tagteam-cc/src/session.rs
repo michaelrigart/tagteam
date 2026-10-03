@@ -476,7 +476,8 @@ impl AuthStatus {
 
 /// §12.3 step 8's table, from what `claude auth status --json` did. Rows are tried in order:
 /// 1. A reply about another config dir says nothing about this profile (`drifted`).
-/// 2. Then not logged in (`invalid`).
+/// 2. Then not logged in (`invalid`), unless another method claims not to be logged in
+///    (`unknown`: the reply contradicts itself).
 /// 3. Then another method (`overridden`).
 /// 4. Then another account or org (`invalid`), which needs the email to be there to say so.
 /// 5. Then `valid`, which also needs exit 0.
@@ -515,8 +516,17 @@ pub(crate) fn validity(reply: Captured, spelling: &str, expect: &Identity) -> Va
             reported: status.config_directory,
         };
     }
-    if !status.logged_in || status.auth_method == "none" {
+    if status.auth_method == "none" {
         return Validity::Invalid("not logged in".into());
+    }
+    if !status.logged_in {
+        // Only the account's own login (or none) says it is gone; another method that claims
+        // not to be logged in contradicts itself, and `invalid` deletes the profile.
+        return if status.auth_method == CLAUDE_AI {
+            Validity::Invalid("not logged in".into())
+        } else {
+            Validity::Unknown("inconsistent login state".into())
+        };
     }
     if status.auth_method != CLAUDE_AI {
         return Validity::Overridden {

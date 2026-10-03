@@ -1021,4 +1021,28 @@ mod validation {
         assert!(matches!(check("bob", &Cancel::new()), Validity::Unknown(_)));
         assert!(spawner.specs().is_empty(), "FakeAgent never spawns");
     }
+
+    #[test]
+    fn a_credential_without_a_token_is_not_logged_in() {
+        let f = fx();
+        let profile = f.env.data_dir().join("sessions/0194");
+        fs::create_dir_all(&profile).unwrap();
+        let spelling = profile.to_str().unwrap();
+        login(&with_home(&f, spelling), "bob", "ws2", "tok-p", "renew-p");
+        for bytes in [&br#"{"fa": {"renew": "renew-p"}}"#[..], b"{}"] {
+            fs::write(profile.join("credential.json"), bytes).unwrap();
+            let got = f.fake.validate_profile(
+                &f.env,
+                spelling,
+                &profile,
+                Path::new("/opt/fakeagent/bin/fakeagent"),
+                &f.fake
+                    .parse_identity(&identity_json("bob", "ws2", "uid-bob"))
+                    .unwrap(),
+                &ScriptedSpawner::new(),
+                &Cancel::new(),
+            );
+            assert_eq!(got, Validity::Invalid("not logged in".into()));
+        }
+    }
 }
