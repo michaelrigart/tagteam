@@ -374,17 +374,23 @@ const BRAVO_RT_ROTATED: &str = "zqrt-bravo-rotated-Gx7pKw2zRm9qTv4s";
 const BRAVO_AT_ROTATED: &str = "zqat-bravo-rotated-Fy3nVq6kWp8zXm2r";
 const API_KEY: &str = "sk-ant-api03-zqkey-Rw8pXk3mQz7vTn2sLy5h";
 const SETUP_TOKEN: &str = "sk-ant-oat01-zqsetup-Mx6kPw2zRq9vTs4nLy7j";
+const STRANGER_EMAIL: &str = "zq-stranger-7736@redact.test";
+const STRANGER_RT: &str = "zqrt-stranger-Qw4xKp9zRm2vTn7s";
+const STRANGER_AT: &str = "zqat-stranger-Hv8kWq3zPx6mRt2n";
 /// No line holds one of these whole.
-const IDENTITIES: [&str; 6] = [
+const IDENTITIES: [&str; 7] = [
     ALPHA_EMAIL,
     BRAVO_EMAIL,
     KEY_EMAIL,
     SETUP_EMAIL,
+    STRANGER_EMAIL,
     ORG_NAME,
     ORG_UUID,
 ];
 /// No line holds 13 consecutive characters of one of these.
-const SECRETS: [&str; 10] = [
+const SECRETS: [&str; 12] = [
+    STRANGER_RT,
+    STRANGER_AT,
     ALPHA_RT,
     ALPHA_AT,
     ALPHA_RT_NEXT,
@@ -527,6 +533,23 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
     run(&["config", "get", "ui.color"]);
     run(&["config", "list", "--json"]);
     run(&["config", "unset", "ui.color"]);
+    // A stranger's login that a forced switch displaces (§9.4 step 2): its row names the
+    // stranger and the organization, which `displaced` lists and `--purge` deletes.
+    login_as(root, STRANGER_EMAIL, STRANGER_RT, STRANGER_AT);
+    run(&["switch", "1", "--force"]);
+    run(&["displaced"]);
+    let shown = traced(root, &server)
+        .args(["displaced", "--json"])
+        .output()
+        .unwrap();
+    assert!(shown.status.success());
+    let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(
+        shown["displaced"][0]["identity"]["emailAddress"],
+        STRANGER_EMAIL
+    );
+    let id = shown["displaced"][0]["id"].as_str().unwrap().to_owned();
+    run(&["displaced", "--purge", &id, "--yes"]);
     run(&["list"]);
 
     // The secrets were sent: the log is clean because it never writes them.
