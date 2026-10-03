@@ -263,15 +263,16 @@ fn a_repeated_id_is_deleted_once() {
 fn an_id_that_names_no_entry_is_refused_and_nothing_is_deleted() {
     // Review Focus 3, Decision 12. An ID is checked before any path is built from it, and
     // every ID before anything is deleted, so a valid one alongside it is kept too. A file
-    // named in another case exists, and is still no entry.
+    // named in upper case exists, and is still no entry. It has no lowercase twin among the
+    // fixtures, so it is a file of its own on a case-insensitive filesystem too.
     let fx = three_entries();
-    plant_file(&fx, "1790000300-0123456789AB-aaaaaa.json");
+    plant_file(&fx, "1790000100-0123456789AB-dddddd.json");
     let before = fx.engine.displaced().unwrap();
     for bad in [
         "../../tagteam.db",
         "x",
         "",
-        "1790000300-0123456789AB-aaaaaa",
+        "1790000100-0123456789AB-dddddd",
         "1790000300-0123456789ab-AAAAAA",
         "1790000999-0123456789ab-zzzzzz",
     ] {
@@ -292,10 +293,64 @@ fn an_id_that_names_no_entry_is_refused_and_nothing_is_deleted() {
     );
     assert!(
         dir(&fx)
-            .join("1790000300-0123456789AB-aaaaaa.json")
+            .join("1790000100-0123456789AB-dddddd.json")
             .exists()
     );
     assert!(fx.env.data_dir().join("tagteam.db").exists());
+}
+
+#[test]
+fn a_purge_deletes_a_symlink_itself_and_never_what_it_points_to() {
+    // §6.3: the path is deleted, not its target.
+    let fx = three_entries();
+    let outside = fx.env.data_dir().join("outside.txt");
+    fs::write(&outside, "not a displaced credential").unwrap();
+    let link = dir(&fx).join(format!("{MIDDLE}.json"));
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    plant_row(&fx, MIDDLE, 1_790_000_250_000, None);
+    assert_eq!(
+        fx.engine.purge_displaced(&[MIDDLE.to_owned()]).unwrap(),
+        [MIDDLE]
+    );
+    assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
+    assert_eq!(fs::read(&outside).unwrap(), b"not a displaced credential");
+    assert!(
+        fx.engine
+            .store()
+            .unwrap()
+            .displaced_rows()
+            .unwrap()
+            .iter()
+            .all(|r| r.id != MIDDLE)
+    );
+}
+
+#[test]
+fn a_row_with_malformed_identity_json_can_still_be_purged_by_its_id() {
+    // The listing is strict about a row it cannot read, but the purge needs only the ID, so a
+    // damaged row never blocks its own deletion.
+    let fx = three_entries();
+    fx.engine.store().unwrap();
+    let id = "1790000050-aabbccddeeff-eeeeee";
+    let conn = rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db")).unwrap();
+    conn.execute(
+        "INSERT INTO displaced (id, provider, at, reason, fingerprint, identity) \
+         VALUES (?1, 'claude-code', 1, 'displaced-live-login', '', 'not json')",
+        [id],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(fx.engine.displaced().is_err());
+    assert_eq!(fx.engine.purge_displaced(&[id.to_owned()]).unwrap(), [id]);
+    let conn = rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db")).unwrap();
+    let left: i64 = conn
+        .query_row("SELECT count(*) FROM displaced WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(left, 0);
+    assert_eq!(fx.engine.displaced().unwrap().entries.len(), 3);
 }
 
 #[test]

@@ -265,7 +265,7 @@ impl Engine {
         }
         let mut present = displaced_files(&displaced_dir(&self.env))?;
         if let Some(store) = self.existing_store()? {
-            present.extend(store.displaced_rows()?.into_iter().map(|r| r.id));
+            present.extend(store.displaced_ids()?);
         }
         let mut known: Vec<String> = Vec::with_capacity(ids.len());
         for id in ids {
