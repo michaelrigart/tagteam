@@ -550,6 +550,9 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
     );
     let id = shown["displaced"][0]["id"].as_str().unwrap().to_owned();
     run(&["displaced", "--purge", &id, "--yes"]);
+    for shell in ["bash", "zsh", "fish"] {
+        run(&["completions", shell]);
+    }
     run(&["list"]);
 
     // The secrets were sent: the log is clean because it never writes them.
