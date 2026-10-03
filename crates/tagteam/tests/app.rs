@@ -1,7 +1,7 @@
 mod common;
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -1255,4 +1255,99 @@ fn ctrl_c_at_a_choice_or_a_replacement_question_interrupts() {
     assert_eq!((code, out.as_str(), err.as_str()), (143, "", INTERRUPTED));
     assert_eq!(ctrl_c.asked, [REPLACE_A]);
     assert_eq!(h.ok(&["list"]), LIVE_A_OFFLINE);
+}
+
+const DELETE_ONE: &str = "Delete 1 displaced credential? It cannot be recovered.";
+const NEEDS_YES: &str =
+    "displaced credentials cannot be recovered once deleted; pass --yes to delete them";
+
+/// `a@x.co` stored, and a stranger's login that `switch 1 --force` displaced (§9.4 step 2).
+/// Returns the entry's ID and its file.
+fn with_a_displaced_login() -> (H, String, PathBuf) {
+    let h = with_unmanaged_login();
+    h.ok(&["switch", "1", "--force"]);
+    let v: Value = serde_json::from_str(&h.ok(&["displaced", "--json"])).unwrap();
+    let id = v["displaced"][0]["id"].as_str().unwrap().to_owned();
+    let file = h
+        .env
+        .data_dir()
+        .join("displaced")
+        .join(format!("{id}.json"));
+    (h, id, file)
+}
+
+#[test]
+fn purging_asks_on_a_terminal_and_deletes_only_on_yes() {
+    // §6.3: the question defaults to no, so Enter keeps the entry, and so does an explicit no.
+    let (h, id, file) = with_a_displaced_login();
+    for answer in ["n", ""] {
+        let mut declined = Scripted::answering(&[answer]);
+        let (code, out, err) = h.run(&["displaced", "--purge", id.as_str()], &mut declined);
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (1, "", "tagteam: cancelled\n"),
+            "{answer:?}"
+        );
+        assert_eq!(declined.asked, [DELETE_ONE]);
+        assert!(file.exists(), "{answer:?}");
+    }
+    let mut yes = Scripted::answering(&["y"]);
+    let (code, out, err) = h.run(&["displaced", "--purge", id.as_str()], &mut yes);
+    assert_eq!(
+        (code, out, err),
+        (0, format!("Deleted {id}.\n"), String::new())
+    );
+    assert_eq!(yes.asked, [DELETE_ONE]);
+    assert!(!file.exists());
+    assert_eq!(h.ok(&["displaced"]), "No displaced credentials.\n");
+}
+
+#[test]
+fn purging_never_asks_off_a_terminal_or_under_json() {
+    // Review Focus 2's rule for every prompt: a caller that cannot answer is never asked.
+    let (h, id, file) = with_a_displaced_login();
+    let (code, out, err) = h.run(
+        &["displaced", "--purge", id.as_str()],
+        &mut Scripted::none(),
+    );
+    assert_eq!((code, out.as_str()), (1, ""));
+    assert_eq!(err, format!("tagteam: {NEEDS_YES}\n"));
+    // `--json` never prompts, even on a terminal: Scripted panics on any prompt it has no answer for.
+    let (code, out, _) = h.run(
+        &["displaced", "--purge", id.as_str(), "--json"],
+        &mut Scripted::answering(&[]),
+    );
+    assert_eq!(code, 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap(),
+        json!({"schemaVersion": 1, "error": {"type": "needs-confirmation", "message": NEEDS_YES}})
+    );
+    assert!(file.exists());
+    // `--yes` needs nobody to answer.
+    let (code, out, _) = h.run(
+        &["displaced", "--purge", id.as_str(), "--yes", "--json"],
+        &mut Scripted::answering(&[]),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap(),
+        json!({"schemaVersion": 1, "ok": true, "deleted": [id]})
+    );
+    assert!(!file.exists());
+}
+
+#[test]
+fn an_unknown_id_is_refused_before_anyone_is_asked() {
+    // §6.3: every ID is checked first. Scripted panics on any prompt it has no answer for.
+    let (h, id, file) = with_a_displaced_login();
+    let (code, out, err) = h.run(
+        &["displaced", "--purge", id.as_str(), "../../tagteam.db"],
+        &mut Scripted::answering(&[]),
+    );
+    assert_eq!((code, out.as_str()), (1, ""));
+    assert_eq!(
+        err,
+        "tagteam: no displaced credential matches \"../../tagteam.db\"; `tagteam displaced` lists them\n"
+    );
+    assert!(file.exists());
 }

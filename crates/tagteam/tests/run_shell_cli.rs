@@ -39,6 +39,12 @@ const COMMANDS: &[&[&str]] = &[
     &["run"],
     &["run", "1"],
     &["displaced"],
+    &[
+        "displaced",
+        "--purge",
+        "1790000000-0123456789ab-aaaaaa",
+        "--yes",
+    ],
 ];
 
 /// `id`'s profile directory under the fixture's `sessions/`.

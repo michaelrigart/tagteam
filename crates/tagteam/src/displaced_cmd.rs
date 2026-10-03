@@ -1,5 +1,5 @@
-//! `tagteam displaced` (§6.3): the listing, for a person and as JSON. It never prints a
-//! credential.
+//! `tagteam displaced` (§6.3): the listing, for a person and as JSON, and `--purge`'s
+//! results. It never prints a credential.
 
 use serde_json::{Value, json};
 use tagteam_cc::usage::format_iso8601;
@@ -139,6 +139,28 @@ pub(crate) fn json(list: &DisplacedList) -> Value {
     json!({"schemaVersion": 1, "dir": list.dir.to_string_lossy(), "displaced": displaced})
 }
 
+/// The question `--purge` asks on a terminal (§6.3), for `n` entries. Its default is no.
+pub(crate) fn purge_question(n: usize) -> String {
+    if n == 1 {
+        "Delete 1 displaced credential? It cannot be recovered.".into()
+    } else {
+        format!("Delete {n} displaced credentials? They cannot be recovered.")
+    }
+}
+
+/// One line per deleted entry.
+pub(crate) fn purged_human(deleted: &[String]) -> String {
+    deleted
+        .iter()
+        .map(|id| format!("Deleted {id}.\n"))
+        .collect()
+}
+
+/// `{schemaVersion, ok, deleted: [id]}`.
+pub(crate) fn purged_json(deleted: &[String]) -> Value {
+    json!({"schemaVersion": 1, "ok": true, "deleted": deleted})
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -263,6 +285,31 @@ mod tests {
         assert_eq!(
             json(&empty),
             json!({"schemaVersion": 1, "dir": "/d", "displaced": []})
+        );
+    }
+
+    #[test]
+    fn the_question_counts_the_entries() {
+        assert_eq!(
+            purge_question(1),
+            "Delete 1 displaced credential? It cannot be recovered."
+        );
+        assert_eq!(
+            purge_question(3),
+            "Delete 3 displaced credentials? They cannot be recovered."
+        );
+    }
+
+    #[test]
+    fn a_purge_reports_each_deleted_id() {
+        let deleted = [NEWEST.to_owned(), OLDEST.to_owned()];
+        assert_eq!(
+            purged_human(&deleted),
+            format!("Deleted {NEWEST}.\nDeleted {OLDEST}.\n")
+        );
+        assert_eq!(
+            purged_json(&deleted),
+            json!({"schemaVersion": 1, "ok": true, "deleted": [NEWEST, OLDEST]})
         );
     }
 }
