@@ -381,6 +381,17 @@ fn log_event(e: &EventRow) {
     );
 }
 
+fn displaced_from_row(r: &Row<'_>) -> rusqlite::Result<DisplacedRow> {
+    Ok(DisplacedRow {
+        id: r.get("id")?,
+        provider: ProviderId::new(r.get::<_, String>("provider")?),
+        at: r.get("at")?,
+        reason: r.get("reason")?,
+        fingerprint: r.get("fingerprint")?,
+        identity: json_col(r, "identity")?,
+    })
+}
+
 /// Maps UNIQUE violations to named errors.
 fn classify(e: rusqlite::Error, position: u32, alias: Option<&str>) -> StoreError {
     if let rusqlite::Error::SqliteFailure(f, Some(msg)) = &e {
@@ -1319,5 +1330,20 @@ impl Store {
             }
         }
         Ok(None)
+    }
+
+    /// Every displaced row (§6.3), newest first: by `at`, then by ID, both descending.
+    pub fn displaced_rows(&self) -> Result<Vec<DisplacedRow>, StoreError> {
+        let c = self.lock();
+        let mut stmt = c.prepare("SELECT * FROM displaced ORDER BY at DESC, id DESC")?;
+        let rows = stmt
+            .query_map([], displaced_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Deletes the displaced row `id`; `true` when there was one.
+    pub fn delete_displaced(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.exec("DELETE FROM displaced WHERE id = ?1", &[&id])? > 0)
     }
 }
