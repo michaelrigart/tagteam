@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    Fx, auth_helper, auth_logged_out, auth_reply, auth_status, credential, dir_tree, two_accounts,
-    vault_fp,
+    Fx, auth_helper, auth_logged_out, auth_reply, auth_status, credential, dir_tree,
+    splice_config_key, two_accounts, vault_fp,
 };
 use serde_json::{Value, json};
 use tagteam_cc::live::Platform;
@@ -74,6 +74,17 @@ fn bootstrapped(fx: &Fx, id: &AccountId, email: &str) -> PathBuf {
 fn moved_from(fx: &Fx, id: &AccountId) -> String {
     let old = fx.dir.path().join("moved-from/sessions").join(id.as_str());
     old.to_str().unwrap().to_owned()
+}
+
+/// What a session in `profile` leaves in its `.claude.json` when it trusts the directory `dir`
+/// (§12.4, Appendix A.6), for the merge-back to carry to the default file.
+fn session_trusts(profile: &Path, dir: &str) {
+    let config = profile.join(".claude.json");
+    let mut projects = get_top_level(&fs::read(&config).unwrap(), "projects")
+        .unwrap()
+        .unwrap_or_else(|| json!({}));
+    projects[dir] = json!({"hasTrustDialogAccepted": true});
+    splice_config_key(&config, "projects", &projects);
 }
 
 /// A login check's reply, made for the spelling of the profile it checks.
@@ -746,6 +757,78 @@ fn a_signal_during_the_login_check_interrupts_the_launch_and_keeps_the_profile()
         .unwrap_err();
 
     assert_eq!(err.kind(), "login-unknown", "{err}");
+}
+
+#[test]
+fn a_baseline_a_killed_session_left_is_merged_back_before_the_profile_is_seeded_again() {
+    // §12.4: its `tagteam` was killed, so its merge-back never ran and the session's changes
+    // wait in the profile. They reach the default file first, then the seed copies them back.
+    for due in [false, true] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let profile = bootstrapped(&fx, &a, "a@x.co");
+        session_trusts(&profile, "/work/new");
+        if due {
+            set_needs_bootstrap(&profile);
+            fx.script_valid(&profile, "a@x.co");
+        }
+
+        let trigger = bootstrap(&fx, &a);
+
+        assert_eq!(trigger, due.then_some(Trigger::Invalid));
+        let default = fs::read(fx.paths().global_config).unwrap();
+        let projects = get_top_level(&default, "projects").unwrap().unwrap();
+        assert_eq!(
+            projects["/work/new"]["hasTrustDialogAccepted"], true,
+            "due {due}: merged back"
+        );
+        let config = fs::read(profile.join(".claude.json")).unwrap();
+        let projects = get_top_level(&config, "projects").unwrap().unwrap();
+        assert_eq!(
+            projects["/work/new"]["hasTrustDialogAccepted"], true,
+            "due {due}: and seeded again"
+        );
+    }
+}
+
+#[test]
+fn a_waiting_baseline_that_cannot_be_merged_back_aborts_before_anything_is_written() {
+    // §12.4: the launch aborts with the profile and its baseline untouched. A seed over them
+    // would drop the session's changes, and its baseline write would follow the link.
+    for due in [false, true] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let profile = bootstrapped(&fx, &a, "a@x.co");
+        let baseline = profile.join(".tagteam-baseline.json");
+        let target = fx.dir.path().join("outside.json");
+        fs::remove_file(&baseline).unwrap();
+        symlink(&target, &baseline).unwrap();
+        if due {
+            set_needs_bootstrap(&profile);
+            fx.script_valid(&profile, "a@x.co");
+        }
+        let before = dir_tree(&profile);
+
+        let err = fx
+            .engine
+            .bootstrap_quiescent(&a, &fx.work_dir("app"))
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains(&baseline.display().to_string()),
+            "due {due}: {err}"
+        );
+        assert_eq!(
+            dir_tree(&profile),
+            before,
+            "due {due}: the profile is untouched"
+        );
+        assert!(
+            !target.exists(),
+            "due {due}: nothing written through the link"
+        );
+        assert_eq!(fx.spawner.specs().len(), 1, "due {due}: never validated");
+    }
 }
 
 #[test]
