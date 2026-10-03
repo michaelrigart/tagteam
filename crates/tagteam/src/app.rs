@@ -79,6 +79,7 @@ const CSV_AND_JSON: &str = "--csv and --json are two output formats; pass one";
 const BAD_SINCE: &str = "--since takes a span like 14d, 12h or 30m";
 const STATUSLINE_UNDER_JSON: &str = "statusline prints a line of text; run it without --json";
 const SHELL_INIT_UNDER_JSON: &str = "shell-init prints shell code; run it without --json";
+const COMPLETIONS_UNDER_JSON: &str = "completions prints a script; run it without --json";
 const YES_WITHOUT_PURGE: &str =
     "--yes confirms --purge; name the entries to delete with --purge ID...";
 const PURGE_NEEDS_YES: &str =
@@ -597,6 +598,17 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
             *shell,
         ));
     }
+    // §13.7: a script from the command definitions alone. It reads no settings, no store and no
+    // Keychain, so it warns about nothing and creates nothing. After the marker check: an
+    // unreadable marker refuses every command but `statusline` (§12.8).
+    if let Some(Command::Completions { shell }) = &cli.command {
+        if json {
+            fail(io, true, KIND_USAGE, COMPLETIONS_UNDER_JSON);
+            return Ended::Code(EXIT_USAGE);
+        }
+        let _ = io.out.write_all(&shell.script());
+        return Ended::Code(0);
+    }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
     let (stdout_terminal, no_color_env, force_color_env) =
@@ -681,6 +693,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Run { .. } => "run",
         Command::Config { .. } => "config",
         Command::Displaced { .. } => "displaced",
+        Command::Completions { .. } => "completions",
     }
 }
 
@@ -1133,6 +1146,7 @@ impl App<'_, '_> {
             Command::Run { .. } => unreachable!("run_command answers run before dispatch"),
             Command::Config { action } => self.config(action)?,
             Command::Displaced { purge, yes } => self.displaced(purge, yes)?,
+            Command::Completions { .. } => unreachable!("run answers completions before dispatch"),
             Command::Auto {
                 once,
                 dry_run,
@@ -1894,6 +1908,30 @@ mod tests {
     }
 
     #[test]
+    fn completion_offers_only_providers_this_build_registers() {
+        // §13.7: the provider IDs completion offers are static. They are exactly the ones this
+        // build registers: none it lacks, and none it has left out.
+        use std::collections::BTreeSet;
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context {
+            env: Env::for_test(dir.path()),
+            keychain: Arc::new(tagteam_provider::FakeKeychain::new()),
+            platform: Platform::MacOs,
+            api_base: None,
+            stdout_terminal: false,
+            no_color_env: false,
+            force_color_env: false,
+        };
+        let registered: BTreeSet<ProviderId> =
+            build_registry(&ctx).all().iter().map(|p| p.id()).collect();
+        let completed: BTreeSet<ProviderId> = crate::cli::COMPLETED_PROVIDERS
+            .iter()
+            .map(|id| ProviderId::new(*id))
+            .collect();
+        assert_eq!(completed, registered);
+    }
+
+    #[test]
     fn an_unreadable_active_flag_after_a_commit_is_inactive_not_an_error() {
         let id = AccountId::from_string("0192");
         let failed = Err(EngineError::Io(std::io::Error::other("store went away")));
@@ -1927,6 +1965,7 @@ mod tests {
             &["run", "2", "--", "--json"],
             &["config", "list"],
             &["displaced"],
+            &["completions", "bash"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))

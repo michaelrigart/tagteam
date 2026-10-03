@@ -170,10 +170,11 @@ fn help_and_version_under_json_are_a_json_usage_error() {
 fn a_closed_stdout_is_not_a_panic() {
     let d = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(d.path().join("home")).unwrap();
-    let cases: [(&[&str], i32); 3] = [
+    let cases: [(&[&str], i32); 4] = [
         (&["frobnicate", "--json"], 2),
         (&["list", "--json"], 0),
         (&["list"], 0),
+        (&["completions", "bash"], 0),
     ];
     for (args, code) in cases {
         std_cmd(d.path())
