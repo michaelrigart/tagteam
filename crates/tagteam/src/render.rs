@@ -201,11 +201,11 @@ pub(crate) fn spend_text(w: &Window) -> Option<String> {
 }
 
 /// The columns `s` takes on a terminal: a CJK character or an emoji takes two.
-fn width(s: &str) -> usize {
+pub(crate) fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
-fn pad(s: &str, w: usize) -> String {
+pub(crate) fn pad(s: &str, w: usize) -> String {
     format!("{s}{}", " ".repeat(w.saturating_sub(width(s))))
 }
 

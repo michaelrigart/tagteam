@@ -36,7 +36,9 @@ use crate::auto::{
 use crate::cli::{AutoStrategyArg, Cli, Command, ConfigAction, ShellArg, StrategyArg};
 use crate::prompt::Prompter;
 use crate::shell_init::Wrapped;
-use crate::{auto, config_cmd, history, prompt, render, root_guard, shell_init, statusline};
+use crate::{
+    auto, config_cmd, displaced_cmd, history, prompt, render, root_guard, shell_init, statusline,
+};
 
 /// §13.1.
 pub(crate) const EXIT_ERROR: i32 = 1;
@@ -672,6 +674,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Auto { .. } => "auto",
         Command::Run { .. } => "run",
         Command::Config { .. } => "config",
+        Command::Displaced => "displaced",
     }
 }
 
@@ -1123,6 +1126,7 @@ impl App<'_, '_> {
             Command::ShellInit { .. } => unreachable!("run answers shell-init before dispatch"),
             Command::Run { .. } => unreachable!("run_command answers run before dispatch"),
             Command::Config { action } => self.config(action)?,
+            Command::Displaced => self.displaced()?,
             Command::Auto {
                 once,
                 dry_run,
@@ -1627,6 +1631,14 @@ impl App<'_, '_> {
         Ok(())
     }
 
+    /// §6.3's listing: every displaced entry, newest first, and the directory the files are in.
+    fn displaced(&mut self) -> Result<(), Failure> {
+        let list = self.engine.displaced()?;
+        let human = displaced_cmd::human(&list, &|e| displaced_cmd::identity(&self.engine, e));
+        self.print(&human, displaced_cmd::json(&list));
+        Ok(())
+    }
+
     /// The live login's account, for a command whose ACCOUNT defaults to it.
     fn live_row(&self) -> Result<AccountRow, Failure> {
         match self.engine.status(&self.provider())? {
@@ -1880,6 +1892,7 @@ mod tests {
             &["run"],
             &["run", "2", "--", "--json"],
             &["config", "list"],
+            &["displaced"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))
