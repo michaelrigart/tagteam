@@ -1726,3 +1726,396 @@ mod profile_credential {
         assert_eq!(out, account_keys());
     }
 }
+
+mod validation {
+    //! §12.3 step 8 and §12.5 "Environment": the session environment, and `claude auth status`
+    //! read into a `Validity`.
+
+    use super::*;
+    use std::sync::Mutex;
+
+    use serde_json::Value;
+    use tagteam_provider::process::{Captured, ProcessSpawner, ScriptedSpawner, SpawnSpec};
+    use tagteam_provider::{Cancel, Identity, SessionEnv, Validity};
+
+    /// §12.5's list, verbatim, so a change to `CC_SCRUB` cannot hide behind itself.
+    const SCRUBBED: [&str; 18] = [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+        "CLAUDE_CODE_OAUTH_SCOPES",
+        "CLAUDE_CODE_OAUTH_CLIENT_ID",
+        "CLAUDE_CODE_ACCOUNT_UUID",
+        "CLAUDE_CODE_USER_EMAIL",
+        "CLAUDE_CODE_ORGANIZATION_UUID",
+        "ANTHROPIC_PROFILE",
+        "ANTHROPIC_CONFIG_DIR",
+        "ANTHROPIC_FEDERATION_RULE_ID",
+        "ANTHROPIC_IDENTITY_TOKEN",
+        "ANTHROPIC_IDENTITY_TOKEN_FILE",
+        "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+        "USE_LOCAL_OAUTH",
+        "USE_STAGING_OAUTH",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    ];
+
+    const EMAIL: &str = "probe1@example.com";
+    const ORG: &str = "00000000-0000-4000-8000-000000000002";
+    /// The launch command `plan_run` resolved (Decision 20); the scripted spawner never runs it.
+    const CLAUDE: &str = "/opt/claude/bin/claude";
+
+    fn account(f: &Fx) -> Identity {
+        f.cc.parse_identity(&json!({"emailAddress": EMAIL, "organizationUuid": ORG}))
+            .unwrap()
+    }
+
+    /// The recorded fields of `claude auth status --json` for a claude.ai login (Appendix
+    /// A.7), pointed at `spelling`, with the exit code the fixture records.
+    fn logged_in(spelling: &str) -> (i32, Value) {
+        let fixture: Value =
+            serde_json::from_str(include_str!("fixtures/auth-status/claude-ai.json")).unwrap();
+        let mut out = fixture["stdout"].clone();
+        out["configDirectory"] = json!(spelling);
+        out["projectsDirectory"] = json!(format!("{spelling}/projects"));
+        (fixture["rc"].as_i64().unwrap() as i32, out)
+    }
+
+    /// A reply logged in another way, or not at all, in the same config dir.
+    fn reply_by(spelling: &str, logged_in: bool, method: &str) -> Value {
+        json!({
+            "loggedIn": logged_in, "authMethod": method, "apiProvider": "firstParty",
+            "analyticsDisabled": false, "projectsDirectory": format!("{spelling}/projects"),
+            "configDirectory": spelling
+        })
+    }
+
+    fn exited(code: i32, stdout: &Value) -> Captured {
+        Captured::Exited {
+            code: Some(code),
+            signal: None,
+            stdout: serde_json::to_vec_pretty(stdout).unwrap(),
+            stderr: vec![],
+        }
+    }
+
+    /// One login check of `spelling` for `account`, with `reply` scripted.
+    fn validate(f: &Fx, spelling: &str, reply: Captured) -> Validity {
+        let spawner = ScriptedSpawner::new();
+        spawner.push(reply);
+        f.cc.validate_profile(
+            &f.env,
+            spelling,
+            Path::new("/work/app"),
+            Path::new(CLAUDE),
+            &account(f),
+            &spawner,
+            &Cancel::new(),
+        )
+    }
+
+    #[test]
+    fn the_session_environment_sets_the_spelling_and_scrubs_section_12_5_s_list() {
+        let f = fx();
+        let env = f.cc.session_env("/data/tagteam/sessions/0192");
+        assert_eq!(
+            env.set,
+            [(
+                OsString::from("CLAUDE_CONFIG_DIR"),
+                OsString::from("/data/tagteam/sessions/0192")
+            )]
+        );
+        assert_eq!(env.remove[..SCRUBBED.len()], SCRUBBED.map(OsString::from));
+        for extra in &env.remove[SCRUBBED.len()..] {
+            let name = extra.to_string_lossy();
+            assert!(
+                name.starts_with("CLAUDE_CODE_") && name.ends_with("_FILE_DESCRIPTOR"),
+                "{name}"
+            );
+            assert!(
+                std::env::var_os(extra).is_some(),
+                "only a descriptor this process holds: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_login_check_runs_auth_status_in_the_session_environment_and_directory() {
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        let spawner = ScriptedSpawner::new();
+        let (rc, reply) = logged_in(&spelling);
+        spawner.push(exited(rc, &reply));
+        let cwd = f.env.home.join("work/app");
+
+        let got = f.cc.validate_profile(
+            &f.env,
+            &spelling,
+            &cwd,
+            Path::new(CLAUDE),
+            &account(&f),
+            &spawner,
+            &Cancel::new(),
+        );
+
+        assert_eq!(got, Validity::Valid);
+        let specs = spawner.specs();
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        assert_eq!(
+            spec.program,
+            PathBuf::from(CLAUDE),
+            "the launch command plan_run resolved, never `claude` by name"
+        );
+        assert_eq!(spec.args, ["auth", "status", "--json"].map(OsString::from));
+        let SessionEnv { set, remove } = f.cc.session_env(&spelling);
+        assert_eq!(
+            (&spec.set, &spec.remove),
+            (&set, &remove),
+            "exactly the session's environment"
+        );
+        assert_eq!(spec.cwd.as_deref(), Some(cwd.as_path()));
+    }
+
+    #[test]
+    fn the_login_check_is_given_ten_seconds() {
+        #[derive(Default)]
+        struct Timed(Mutex<Vec<Duration>>);
+        impl ProcessSpawner for Timed {
+            fn run_captured(&self, _: &SpawnSpec, timeout: Duration, _: &Cancel) -> Captured {
+                self.0.lock().unwrap().push(timeout);
+                Captured::TimedOut
+            }
+        }
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        let timed = Timed::default();
+
+        let got = f.cc.validate_profile(
+            &f.env,
+            &spelling,
+            Path::new("/"),
+            Path::new(CLAUDE),
+            &account(&f),
+            &timed,
+            &Cancel::new(),
+        );
+
+        assert!(
+            matches!(&got, Validity::Unknown(why) if why.contains("10 s")),
+            "a timeout is unknown, naming it: {got:?}"
+        );
+        assert_eq!(*timed.0.lock().unwrap(), [Duration::from_secs(10)]);
+    }
+
+    #[test]
+    fn valid_needs_claude_ai_this_spelling_this_email_and_this_org_when_both_name_one() {
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        let (rc, reply) = logged_in(&spelling);
+        assert_eq!(validate(&f, &spelling, exited(rc, &reply)), Validity::Valid);
+        let mut no_org = reply.clone();
+        no_org.as_object_mut().unwrap().shift_remove("orgId");
+        assert_eq!(
+            validate(&f, &spelling, exited(0, &no_org)),
+            Validity::Valid,
+            "an org is compared only when both name one"
+        );
+        let personal =
+            f.cc.parse_identity(&json!({"emailAddress": EMAIL, "organizationUuid": null}))
+                .unwrap();
+        let spawner = ScriptedSpawner::new();
+        spawner.push(exited(0, &reply));
+        assert_eq!(
+            f.cc.validate_profile(
+                &f.env,
+                &spelling,
+                Path::new("/"),
+                Path::new(CLAUDE),
+                &personal,
+                &spawner,
+                &Cancel::new()
+            ),
+            Validity::Valid
+        );
+    }
+
+    #[test]
+    fn invalid_is_logged_out_or_another_account_or_organization() {
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        assert_eq!(
+            validate(
+                &f,
+                &spelling,
+                exited(1, &reply_by(&spelling, false, "none"))
+            ),
+            Validity::Invalid("not logged in".into())
+        );
+        let (_, mut other) = logged_in(&spelling);
+        other["email"] = json!("someone-else@example.com");
+        assert_eq!(
+            validate(&f, &spelling, exited(0, &other)),
+            Validity::Invalid("logged in to claude.ai as another account".into())
+        );
+        let (_, mut other_org) = logged_in(&spelling);
+        other_org["orgId"] = json!("00000000-0000-4000-8000-000000000099");
+        assert_eq!(
+            validate(&f, &spelling, exited(0, &other_org)),
+            Validity::Invalid("logged in to claude.ai in another organization".into())
+        );
+        for got in [
+            validate(&f, &spelling, exited(0, &other)),
+            validate(&f, &spelling, exited(0, &other_org)),
+        ] {
+            assert!(
+                !format!("{got:?}").contains("example.com"),
+                "no email: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overridden_names_the_method_and_its_source() {
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        for (method, source) in [
+            ("api_key_helper", Some("apiKeyHelper")),
+            ("api_key", Some("ANTHROPIC_API_KEY")),
+            ("oauth_token", None),
+            ("third_party", None),
+        ] {
+            let mut reply = reply_by(&spelling, true, method);
+            if let Some(s) = source {
+                reply["apiKeySource"] = json!(s);
+            }
+            assert_eq!(
+                validate(&f, &spelling, exited(0, &reply)),
+                Validity::Overridden {
+                    method: method.into(),
+                    source: source.map(str::to_owned)
+                },
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn drifted_is_another_config_directory_whatever_else_the_reply_says() {
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        let (_, mut moved) = logged_in(&spelling);
+        moved["configDirectory"] = json!(format!("{spelling}/"));
+        assert_eq!(
+            validate(&f, &spelling, exited(0, &moved)),
+            Validity::Drifted {
+                reported: format!("{spelling}/")
+            }
+        );
+        let elsewhere =
+            json!({"loggedIn": false, "authMethod": "none", "configDirectory": "/u/.claude"});
+        assert_eq!(
+            validate(&f, &spelling, exited(1, &elsewhere)),
+            Validity::Drifted {
+                reported: "/u/.claude".into()
+            },
+            "never invalid, which would delete the profile"
+        );
+    }
+
+    #[test]
+    fn unknown_is_a_reply_that_does_not_parse_or_cannot_confirm_the_login() {
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        for stdout in [
+            &b""[..],
+            b"Logged in as probe1@example.com\n",
+            b"[1]",
+            br#"{"loggedIn": true}"#,
+            br#"{"loggedIn": "yes", "authMethod": "claude.ai", "configDirectory": "/p"}"#,
+        ] {
+            let got = validate(
+                &f,
+                &spelling,
+                Captured::Exited {
+                    code: Some(0),
+                    signal: None,
+                    stdout: stdout.to_vec(),
+                    stderr: vec![],
+                },
+            );
+            assert!(matches!(got, Validity::Unknown(_)), "{got:?}");
+        }
+        let killed = validate(
+            &f,
+            &spelling,
+            Captured::Exited {
+                code: None,
+                signal: Some(9),
+                stdout: vec![],
+                stderr: vec![],
+            },
+        );
+        assert!(
+            matches!(&killed, Validity::Unknown(why) if why.contains("signal 9")),
+            "{killed:?}"
+        );
+        let (_, mut no_email) = logged_in(&spelling);
+        no_email.as_object_mut().unwrap().shift_remove("email");
+        assert!(
+            matches!(
+                validate(&f, &spelling, exited(0, &no_email)),
+                Validity::Unknown(_)
+            ),
+            "an email that is not there confirms nothing, and must not delete the profile"
+        );
+        let (_, reply) = logged_in(&spelling);
+        assert!(
+            matches!(
+                validate(&f, &spelling, exited(1, &reply)),
+                Validity::Unknown(_)
+            ),
+            "a login that did not exit 0"
+        );
+    }
+
+    #[test]
+    fn unreachable_is_a_spawn_failure() {
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        assert_eq!(
+            validate(
+                &f,
+                &spelling,
+                Captured::SpawnFailed("No such file or directory (os error 2)".into())
+            ),
+            Validity::Unreachable("No such file or directory (os error 2)".into())
+        );
+    }
+
+    #[test]
+    fn an_interrupted_check_is_unknown_interrupted_and_a_set_token_spawns_nothing() {
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        assert_eq!(
+            validate(&f, &spelling, Captured::Interrupted(2)),
+            Validity::Unknown("interrupted".into())
+        );
+        let spawner = ScriptedSpawner::new();
+        let cancel = Cancel::new();
+        cancel.request(15);
+        assert_eq!(
+            f.cc.validate_profile(
+                &f.env,
+                &spelling,
+                Path::new("/"),
+                Path::new(CLAUDE),
+                &account(&f),
+                &spawner,
+                &cancel
+            ),
+            Validity::Unknown("interrupted".into())
+        );
+        assert!(spawner.specs().is_empty(), "nothing was spawned");
+    }
+}

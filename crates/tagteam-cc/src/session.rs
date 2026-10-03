@@ -2,19 +2,22 @@
 //! home, and the two views every profile credential operation resolves through (§12.5): the
 //! recorded spelling for its Keychain items, its actual directory for its files (Decision 19).
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tagteam_core::merge::{MergeKey, three_way};
 use tagteam_provider::atomic::write_atomic_with;
+use tagteam_provider::process::Captured;
 use tagteam_provider::profile::{
     has_own_file, read_own_bytes, remove_own_file, write_own_json_with,
 };
 use tagteam_provider::splice::{self, SpliceError};
 use tagteam_provider::{
-    Cancel, EntryKind, Env, Identity, LiveLockSet, MergeReport, ProviderError, Read,
+    Cancel, EntryKind, Env, Identity, LiveLockSet, MergeReport, ProviderError, Read, SessionEnv,
+    Validity,
 };
 
 use crate::config::read_bytes;
@@ -372,4 +375,224 @@ pub(crate) fn merge_back(
         applied: merged.applied.len(),
         conflicts: merged.conflicts.iter().map(key_name).collect(),
     })
+}
+
+/// §12.5 "Environment": scrubbed from every session, because each supplies or redirects the
+/// login, or renames CC's config file or Keychain item (Appendix A.1, A.7). Every
+/// `CLAUDE_CODE_*_FILE_DESCRIPTOR` set in the process joins them (`session_env`).
+pub(crate) const CC_SCRUB: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+    "CLAUDE_CODE_OAUTH_CLIENT_ID",
+    "CLAUDE_CODE_ACCOUNT_UUID",
+    "CLAUDE_CODE_USER_EMAIL",
+    "CLAUDE_CODE_ORGANIZATION_UUID",
+    "ANTHROPIC_PROFILE",
+    "ANTHROPIC_CONFIG_DIR",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_IDENTITY_TOKEN",
+    "ANTHROPIC_IDENTITY_TOKEN_FILE",
+    "CLAUDE_CODE_CUSTOM_OAUTH_URL",
+    "USE_LOCAL_OAUTH",
+    "USE_STAGING_OAUTH",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+];
+
+const DESCRIPTOR_PREFIX: &[u8] = b"CLAUDE_CODE_";
+const DESCRIPTOR_SUFFIX: &[u8] = b"_FILE_DESCRIPTOR";
+
+/// `CLAUDE_CODE_*_FILE_DESCRIPTOR`, the `*` any run of bytes, possibly empty.
+fn is_token_descriptor(name: &OsStr) -> bool {
+    let b = name.as_bytes();
+    b.len() >= DESCRIPTOR_PREFIX.len() + DESCRIPTOR_SUFFIX.len()
+        && b.starts_with(DESCRIPTOR_PREFIX)
+        && b.ends_with(DESCRIPTOR_SUFFIX)
+}
+
+/// §12.5: `CLAUDE_CONFIG_DIR` set to the recorded spelling. `CC_SCRUB` is removed, then every
+/// name in `present` (the process environment's names) that is a token file descriptor,
+/// sorted, once each.
+pub(crate) fn session_env(
+    spelling: &str,
+    present: impl IntoIterator<Item = OsString>,
+) -> SessionEnv {
+    let mut descriptors: Vec<OsString> = present
+        .into_iter()
+        .filter(|n| is_token_descriptor(n))
+        .collect();
+    descriptors.sort();
+    descriptors.dedup();
+    SessionEnv {
+        set: vec![(OsString::from(CONFIG_DIR), OsString::from(spelling))],
+        remove: CC_SCRUB
+            .iter()
+            .map(OsString::from)
+            .chain(descriptors)
+            .collect(),
+    }
+}
+
+/// `claude auth status`'s limit (§12.3 step 8).
+pub(crate) const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+/// What an interrupted login check reports (§12.5); the caller maps it by reading the token.
+pub(crate) const INTERRUPTED: &str = "interrupted";
+/// The account's own login (§12.3 step 8): CC's OAuth accounts, and setup-token accounts
+/// (*inferred*).
+const CLAUDE_AI: &str = "claude.ai";
+
+/// The fields of `claude auth status --json` that §12.3's table reads (Appendix A.7).
+struct AuthStatus {
+    logged_in: bool,
+    auth_method: String,
+    config_directory: String,
+    email: Option<String>,
+    org_id: Option<String>,
+    api_key_source: Option<String>,
+}
+
+impl AuthStatus {
+    /// `None` unless `stdout` is one JSON object holding the three fields CC always prints.
+    fn parse(stdout: &[u8]) -> Option<Self> {
+        let v: Value = serde_json::from_slice(stdout).ok()?;
+        let text = |k: &str| {
+            v.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        Some(Self {
+            logged_in: v.get("loggedIn")?.as_bool()?,
+            auth_method: v.get("authMethod")?.as_str()?.to_owned(),
+            config_directory: v.get("configDirectory")?.as_str()?.to_owned(),
+            email: text("email"),
+            org_id: text("orgId"),
+            api_key_source: text("apiKeySource"),
+        })
+    }
+}
+
+/// §12.3 step 8's table, from what `claude auth status --json` did. Rows are tried in order:
+/// 1. A reply about another config dir says nothing about this profile (`drifted`).
+/// 2. Then not logged in (`invalid`).
+/// 3. Then another method (`overridden`).
+/// 4. Then another account or org (`invalid`), which needs the email to be there to say so.
+/// 5. Then `valid`, which also needs exit 0.
+///
+/// A login that cannot be confirmed is `unknown`, never `invalid`: only `invalid` deletes a
+/// profile. No detail names an email (§4.4).
+pub(crate) fn validity(reply: Captured, spelling: &str, expect: &Identity) -> Validity {
+    let (code, signal, stdout) = match reply {
+        Captured::Exited {
+            code,
+            signal,
+            stdout,
+            ..
+        } => (code, signal, stdout),
+        Captured::TimedOut => {
+            return Validity::Unknown(format!(
+                "`claude auth status` did not answer within {} s",
+                AUTH_STATUS_TIMEOUT.as_secs()
+            ));
+        }
+        Captured::Interrupted(_) => return Validity::Unknown(INTERRUPTED.into()),
+        Captured::SpawnFailed(e) => return Validity::Unreachable(e),
+    };
+    let ended = match (code, signal) {
+        (Some(c), _) => format!("exit {c}"),
+        (None, Some(s)) => format!("signal {s}"),
+        (None, None) => "no exit status".into(),
+    };
+    let Some(status) = AuthStatus::parse(&stdout) else {
+        return Validity::Unknown(format!(
+            "`claude auth status` printed no status tagteam can read ({ended})"
+        ));
+    };
+    if status.config_directory != spelling {
+        return Validity::Drifted {
+            reported: status.config_directory,
+        };
+    }
+    if !status.logged_in || status.auth_method == "none" {
+        return Validity::Invalid("not logged in".into());
+    }
+    if status.auth_method != CLAUDE_AI {
+        return Validity::Overridden {
+            method: status.auth_method,
+            source: status.api_key_source,
+        };
+    }
+    let Some(email) = status.email else {
+        return Validity::Unknown(
+            "`claude auth status` named no email for the claude.ai login".into(),
+        );
+    };
+    if email != expect.email.as_deref().unwrap_or(&expect.label) {
+        return Validity::Invalid("logged in to claude.ai as another account".into());
+    }
+    if status
+        .org_id
+        .as_deref()
+        .is_some_and(|org| !expect.org_uuid.is_empty() && org != expect.org_uuid)
+    {
+        return Validity::Invalid("logged in to claude.ai in another organization".into());
+    }
+    if code != Some(0) {
+        return Validity::Unknown(format!(
+            "`claude auth status` reported this login but ended with {ended}"
+        ));
+    }
+    Validity::Valid
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn every_token_file_descriptor_the_process_holds_is_scrubbed_too() {
+        let not_utf8 = OsString::from_vec(b"CLAUDE_CODE_\xff_FILE_DESCRIPTOR".to_vec());
+        let present = [
+            "PATH",
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+            "CLAUDE_CODE__FILE_DESCRIPTOR",
+            "CLAUDE_CODE_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "XCLAUDE_CODE_A_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_A_FILE_DESCRIPTOR_X",
+            "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        ]
+        .map(OsString::from)
+        .into_iter()
+        .chain([not_utf8.clone()]);
+
+        let env = session_env("/p/0192", present);
+
+        assert_eq!(
+            env.set,
+            [(
+                OsString::from("CLAUDE_CONFIG_DIR"),
+                OsString::from("/p/0192")
+            )]
+        );
+        let (literal, expanded) = env.remove.split_at(CC_SCRUB.len());
+        assert_eq!(
+            literal.to_vec(),
+            CC_SCRUB.iter().map(OsString::from).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            expanded,
+            [
+                OsString::from("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"),
+                OsString::from("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"),
+                OsString::from("CLAUDE_CODE__FILE_DESCRIPTOR"),
+                not_utf8,
+            ],
+            "sorted, once each; `CLAUDE_CODE_FILE_DESCRIPTOR` is too short to match"
+        );
+    }
 }

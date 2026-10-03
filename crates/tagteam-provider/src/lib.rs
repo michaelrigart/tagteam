@@ -54,8 +54,8 @@ pub use profile::{
 pub use provider::{
     BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, EntryKind,
     Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
-    MergeReport, MustShare, Provider, ProviderError, RefreshResult, SecretStore, SharePolicy,
-    StoredLogin, TransientKind, Undo, UsageResult, Written,
+    MergeReport, MustShare, Provider, ProviderError, RefreshResult, SecretStore, SessionEnv,
+    SharePolicy, StoredLogin, TransientKind, Undo, UsageResult, Validity, Written,
 };
 pub use read::{Read, ReadError};
 pub use reservation::{LaunchReservation, remove_dead_reservations};

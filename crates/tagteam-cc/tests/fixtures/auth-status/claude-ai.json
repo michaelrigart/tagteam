@@ -1,0 +1,17 @@
+{
+  "rc": 0,
+  "stdout": {
+    "loggedIn": true,
+    "authMethod": "claude.ai",
+    "apiProvider": "firstParty",
+    "analyticsDisabled": false,
+    "projectsDirectory": "/CONFIG_DIRECTORY/projects",
+    "configDirectory": "/CONFIG_DIRECTORY",
+    "email": "probe1@example.com",
+    "orgId": "00000000-0000-4000-8000-000000000002",
+    "orgName": "Probe Name 3",
+    "subscriptionType": "max"
+  },
+  "synthetic": true,
+  "note": "The fields of `claude auth status --json` for a claude.ai login (Appendix A.7, CC 2.1.286); the values are placeholders, and tests point configDirectory and projectsDirectory at the profile's spelling"
+}

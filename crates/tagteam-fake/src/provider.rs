@@ -10,6 +10,7 @@ use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
 use tagteam_provider::http::{Http, HttpError, HttpRequest};
+use tagteam_provider::process::ProcessSpawner;
 use tagteam_provider::profile::{
     has_own_file, read_own_bytes, remove_own_file, write_own_json_with,
 };
@@ -19,8 +20,8 @@ use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, EntryKind, Env,
     FreshCredential, Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet,
     LiveLocks, LockError, MergeReport, MkdirLock, MkdirLockSpec, MustShare, MutationGuard, Pace,
-    PollBudget, Provider, ProviderError, Read, ReadError, SecretStore, SharePolicy, StoredLogin,
-    Undo, UsageResult, Window, Written,
+    PollBudget, Provider, ProviderError, Read, ReadError, SecretStore, SessionEnv, SharePolicy,
+    StoredLogin, Undo, UsageResult, Validity, Window, Written,
 };
 
 use crate::FAKE_AGENT;
@@ -41,6 +42,8 @@ const BASELINE_FORMAT: &str = "tagteam-baseline";
 /// The one subtree of `identity.json` FakeAgent seeds and merges back, `prefs.<name>`: flat,
 /// and alone, deliberately unlike Claude Code's two.
 const PREFS: &str = "prefs";
+/// FakeAgent's token variable, the one name its session scrubs.
+const TOKEN_VAR: &str = "FAKEAGENT_TOKEN";
 
 pub struct FakeAgent {
     base: String,
@@ -856,5 +859,49 @@ impl Provider for FakeAgent {
     ) -> Result<Vec<u8>, ProviderError> {
         let live = profile.map(credential_object).transpose()?;
         shape::compose(vault, live.as_ref())
+    }
+
+    /// FakeAgent's session: its home variable names the profile, and its token variable is
+    /// scrubbed. One of each, unlike Claude Code's list.
+    fn session_env(&self, spelling: &str) -> SessionEnv {
+        SessionEnv {
+            set: vec![(HOME_VAR.into(), spelling.into())],
+            remove: vec![TOKEN_VAR.into()],
+        }
+    }
+
+    /// No spawn, from the profile's files, in the directory its spelling names as is
+    /// (`profile_spelling`):
+    /// - `valid` when it holds a credential with a token and the account's identity;
+    /// - `invalid` without either, or with another identity;
+    /// - `unknown` when a file cannot be read, or when the cancel token is set
+    ///   (`interrupted`, which the caller maps by reading the token).
+    fn validate_profile(
+        &self,
+        env: &Env,
+        spelling: &str,
+        _cwd: &Path,
+        _program: &Path,
+        expect: &Identity,
+        _spawner: &dyn ProcessSpawner,
+        cancel: &Cancel,
+    ) -> Validity {
+        if cancel.requested().is_some() {
+            return Validity::Unknown("interrupted".into());
+        }
+        let profile = profile_env_in(env, Path::new(spelling));
+        match self.read_live_auth(&profile).credential {
+            Read::Present(c) if shape::token(c.bytes()).is_some() => {}
+            Read::Present(_) | Read::Absent => return Validity::Invalid("not logged in".into()),
+            Read::Unreadable(e) => return Validity::Unknown(e.to_string()),
+        }
+        match self.live_identity(&profile) {
+            Read::Present(id) if self.identity_key(&id) == self.identity_key(expect) => {
+                Validity::Valid
+            }
+            Read::Present(_) => Validity::Invalid("logged in as another identity".into()),
+            Read::Absent => Validity::Invalid("not logged in".into()),
+            Read::Unreadable(e) => Validity::Unknown(e.to_string()),
+        }
     }
 }
