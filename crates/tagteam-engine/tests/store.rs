@@ -6,7 +6,8 @@ use std::os::unix::fs::PermissionsExt;
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{
-    Activation, AutoRecord, EventRow, JournalRow, LoginMeta, NewAccount, Store, StoreError,
+    Activation, AutoRecord, DisplacedRow, EventRow, JournalRow, LoginMeta, NewAccount, Store,
+    StoreError,
 };
 use tagteam_provider::{Identity, ProcessStamp};
 
@@ -1080,4 +1081,37 @@ fn replacement_metadata_without_from_live_is_not_from_the_live_login() {
             epoch: Some(0)
         })
     );
+}
+
+#[test]
+fn displaced_rows_are_newest_first_and_a_delete_says_whether_a_row_went() {
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let row = |id: &str, at: i64| DisplacedRow {
+        id: id.into(),
+        provider: cc(),
+        at,
+        reason: "displaced-live-login".into(),
+        fingerprint: "sha256:00".into(),
+        identity: (at == 2).then(|| json!({"emailAddress": "a@x.co"})),
+    };
+    for (id, at) in [
+        ("1-000000000000-aaaaaa", 1),
+        ("2-000000000000-bbbbbb", 2),
+        ("2-000000000000-cccccc", 2),
+    ] {
+        s.insert_displaced(&row(id, at)).unwrap();
+    }
+    // By time, then by ID, both descending.
+    assert_eq!(
+        s.displaced_rows().unwrap(),
+        [
+            row("2-000000000000-cccccc", 2),
+            row("2-000000000000-bbbbbb", 2),
+            row("1-000000000000-aaaaaa", 1),
+        ]
+    );
+    assert!(s.delete_displaced("2-000000000000-bbbbbb").unwrap());
+    assert!(!s.delete_displaced("2-000000000000-bbbbbb").unwrap());
+    assert_eq!(s.displaced_rows().unwrap().len(), 2);
 }
