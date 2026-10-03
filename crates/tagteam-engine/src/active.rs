@@ -650,6 +650,7 @@ impl Engine {
                     &mut held,
                     false,
                     None,
+                    None,
                     &mut warnings,
                 ) {
                     return not_published(&e);
@@ -669,6 +670,7 @@ impl Engine {
                     bytes,
                     &mut held,
                     false,
+                    None,
                     None,
                     &mut warnings,
                 )

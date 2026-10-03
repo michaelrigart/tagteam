@@ -326,6 +326,17 @@ fn unless_forced(
     }
 }
 
+/// §6.3, Decision 13: the live identity names only the live login's own secret,
+/// `own_secret`. A secret on the other auth axis is never attributed to the login beside it,
+/// so its row names no identity.
+fn attributed<'i>(
+    live_identity: Option<&'i Identity>,
+    own_secret: Option<&[u8]>,
+    bytes: &[u8],
+) -> Option<&'i Identity> {
+    live_identity.filter(|_| own_secret == Some(bytes))
+}
+
 /// What a row says about a login, for noticing that it changed: a finished replacement
 /// (§12.5) keeps the ID but may change the kind or the identity.
 fn login_of(row: Option<&AccountRow>) -> Option<(&AccountId, &str, &str)> {
@@ -1935,6 +1946,14 @@ impl Engine {
         let mut warnings = plan.notes.clone();
         warnings.extend(plan.warnings.iter().cloned());
         warnings.extend(locked_warnings);
+        // The live login's own secret, the only one the live identity names when a secret is
+        // displaced (§6.3, Decision 13): the live secret on a stored account's own axis, or the
+        // credential entry's for an unmanaged login, which `oauthAccount` names. Unlike step 6's
+        // `from_secret`, it never falls back to the other axis.
+        let own_secret = match &outgoing {
+            Some(o) => Axis::of(p, &o.kind).live_secret(&live),
+            None => Axis::Entry.live_secret(&live),
+        };
         // What steps 2 and 4 settle, and the vaults below: step 7's rule never saves it again.
         let mut held = Held::default();
         let target_secret = match outgoing.as_ref().filter(|_| !req.force) {
@@ -1949,12 +1968,14 @@ impl Engine {
                 };
                 for axis in Axis::BOTH {
                     if let Some(bytes) = axis.live_secret(&live).filter(|b| *b != secret) {
+                        let identity =
+                            attributed(live_identity.as_ref(), own_secret.as_deref(), &bytes);
                         let saved = self.displace_live(
                             p,
                             provider,
                             &bytes,
                             reason,
-                            live_identity.as_ref(),
+                            identity,
                             &mut warnings,
                         );
                         held.hold(p, &bytes);
@@ -1998,6 +2019,7 @@ impl Engine {
                     &mut held,
                     req.force,
                     live_identity.as_ref(),
+                    own_secret.as_deref(),
                     &mut warnings,
                 )?;
             }
@@ -2061,6 +2083,7 @@ impl Engine {
                 &mut held,
                 req.force,
                 live_identity.as_ref(),
+                own_secret.as_deref(),
                 &mut warnings,
             )
             .map_err(|e| {
@@ -2262,9 +2285,11 @@ impl Engine {
     }
 
     /// §9.4 step 7: saves `bytes`, a live entry a change is about to overwrite or delete, unless
-    /// it holds nothing account-scoped or a generation `held` already keeps; either way the
+    /// it holds nothing account-scoped or a generation `held` already keeps. Either way the
     /// generation is held from then on, so no entry of it is saved twice. A failed save aborts,
-    /// except under `force` (B.5).
+    /// except under `force` (B.5). The row names `live_identity` only when `bytes` is
+    /// `own_secret`, the live login's own (§6.3, Decision 13). A secret on the other auth axis
+    /// gets no identity.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn save_unheld(
         &self,
@@ -2274,6 +2299,7 @@ impl Engine {
         held: &mut Held,
         force: bool,
         live_identity: Option<&Identity>,
+        own_secret: Option<&[u8]>,
         warnings: &mut Vec<String>,
     ) -> Result<(), EngineError> {
         match p.fingerprint(bytes) {
@@ -2283,7 +2309,7 @@ impl Engine {
                     provider,
                     bytes,
                     "displaced-live-login",
-                    live_identity,
+                    attributed(live_identity, own_secret, bytes),
                     warnings,
                 );
                 unless_forced(saved, force, warnings)

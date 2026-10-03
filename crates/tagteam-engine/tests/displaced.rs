@@ -10,12 +10,13 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{Fx, STRAY_API_KEY};
+use common::{API_KEY, Fx, STRAY_API_KEY, crashed_switch, write_target_credential};
 use serde_json::{Value, json};
+use tagteam_cc::ItemKind;
 use tagteam_core::ProviderId;
 use tagteam_engine::displace::{DISPLACED_LOCK, DisplacedEntry, DisplacedList};
 use tagteam_engine::store::DisplacedRow;
-use tagteam_provider::FlockGuard;
+use tagteam_provider::{FlockGuard, Keychain};
 
 /// Three entries' IDs, newest first by the time each carries.
 const NEWEST: &str = "1790000300-0123456789ab-aaaaaa";
@@ -385,4 +386,114 @@ fn the_listing_takes_no_lock() {
     let started = Instant::now();
     assert_eq!(fx.engine.displaced().unwrap().entries.len(), 3);
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+/// Every entry with its file's bytes, newest first.
+fn with_bytes(fx: &Fx) -> Vec<(DisplacedEntry, Vec<u8>)> {
+    let DisplacedList { dir, entries } = fx.engine.displaced().unwrap();
+    entries
+        .into_iter()
+        .map(|e| {
+            let bytes = fs::read(dir.join(format!("{}.json", e.id))).unwrap();
+            (e, bytes)
+        })
+        .collect()
+}
+
+#[test]
+fn a_stray_key_a_switch_clears_is_displaced_with_no_identity() {
+    // §6.3, Decision 13. The managed key sits beside b's OAuth login, on the other auth axis
+    // (§9.4 step 7). It is not b's, so its row names no identity, and so no account.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live: b
+    fx.put_managed_key(STRAY_API_KEY.as_bytes());
+    fx.switch_to(&a, false).unwrap();
+    let saved = with_bytes(&fx);
+    assert_eq!(saved.len(), 1);
+    let (entry, bytes) = &saved[0];
+    assert_eq!(bytes.as_slice(), STRAY_API_KEY.as_bytes());
+    assert_eq!((entry.identity.as_ref(), entry.account), (None, None));
+    assert_eq!(entry.reason.as_deref(), Some("displaced-live-login"));
+}
+
+#[test]
+fn a_forced_switch_names_the_live_login_on_its_own_secret_only() {
+    // §9.4 step 2 displaces both axes. The stranger's OAuth credential is the live login's own,
+    // so its row keeps the live identity. The key beside it gets none.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.login("stranger@x.co", "rt-s");
+    fx.put_managed_key(STRAY_API_KEY.as_bytes());
+    fx.switch_to(&a, true).unwrap();
+    let saved = with_bytes(&fx);
+    assert_eq!(saved.len(), 2);
+    let identity_of = |secret: &[u8]| {
+        saved
+            .iter()
+            .find(|(_, bytes)| bytes.as_slice() == secret)
+            .map(|(e, _)| e.identity.clone())
+            .expect("displaced")
+    };
+    let login = Fx::credential_json("stranger@x.co", "rt-s")
+        .to_string()
+        .into_bytes();
+    assert_eq!(
+        identity_of(&login),
+        Some(Fx::oauth_account("stranger@x.co"))
+    );
+    assert_eq!(identity_of(STRAY_API_KEY.as_bytes()), None);
+    assert!(
+        saved.iter().all(|(e, _)| {
+            e.account.is_none() && e.reason.as_deref() == Some("forced-activation")
+        })
+    );
+}
+
+#[test]
+fn forward_recovery_displaces_a_stray_key_with_no_identity() {
+    // §9.6 applies §9.4 step 7's rule before clearing the other axis. The key written between
+    // the journal row and the crash is saved, attributed to no one.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    fx.put_managed_key(STRAY_API_KEY.as_bytes());
+    drop(fx.engine.mutation_guard().unwrap());
+    let saved = with_bytes(&fx);
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].1.as_slice(), STRAY_API_KEY.as_bytes());
+    assert_eq!(saved[0].0.identity, None);
+}
+
+#[test]
+fn a_stray_login_beside_an_api_key_account_whose_key_is_gone_gets_no_identity() {
+    // Decision 13. The live account is an API-key account, so its own secret is on the
+    // managed-key axis, and that key is gone. The OAuth login in the credential entry is not
+    // its own: its row names no identity, never the API-key account's. A forced switch saves
+    // it at §9.4 step 2, an unforced one at step 7.
+    for (force, reason) in [(true, "forced-activation"), (false, "displaced-live-login")] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let k = fx.add_api_key(API_KEY);
+        fx.switch_to(&k, false).unwrap();
+        let (svc, acct) = fx.live_item(ItemKind::ManagedKey);
+        fx.kc.delete(&svc, &acct).unwrap();
+        let stray = Fx::credential_json("stray@x.co", "rt-stray")
+            .to_string()
+            .into_bytes();
+        fx.set_live_credential(&stray);
+        fx.switch_to(&a, force).unwrap();
+        let saved = with_bytes(&fx);
+        assert_eq!(saved.len(), 1, "force={force}");
+        let (entry, bytes) = &saved[0];
+        assert_eq!(bytes, &stray, "force={force}");
+        assert_eq!(
+            (entry.identity.as_ref(), entry.account),
+            (None, None),
+            "force={force}"
+        );
+        assert_eq!(entry.reason.as_deref(), Some(reason));
+    }
 }
