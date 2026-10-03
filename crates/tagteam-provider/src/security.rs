@@ -274,13 +274,13 @@ fn confirm_password(stderr: &[u8], raw: &[u8]) -> Option<Vec<u8>> {
 
 /// `disambiguate`'s own failures (a bad rc, a timeout, a spawn failure) never surface
 /// `-g`'s stderr, unlike `describe()`/`unreadable()`: `-g`'s stderr is the channel
-/// `security` prints the secret on.
+/// `security` prints the secret on. A timeout and a failure to run are different causes,
+/// and say so (§14); a spawn failure's text is the operating system's, never `security`'s.
 fn disambiguation_failed(r: &RunResult) -> ReadError {
     let detail = match r {
         RunResult::Exited { code, .. } => format!("rc {code}: the -g disambiguation call failed"),
-        RunResult::TimedOut | RunResult::SpawnFailed(_) => {
-            "the -g disambiguation call failed".to_owned()
-        }
+        RunResult::TimedOut => "the -g disambiguation call did not finish in time".to_owned(),
+        RunResult::SpawnFailed(e) => format!("the -g disambiguation call could not run: {e}"),
     };
     ReadError::new("keychain", detail)
 }
@@ -664,6 +664,28 @@ mod tests {
             cli(&s, None).find("svc", "acct"),
             Read::Unreadable(_)
         ));
+    }
+
+    #[test]
+    fn a_dash_g_timeout_and_a_dash_g_that_cannot_run_are_told_apart() {
+        // §14 (L349): a timeout and a failure to spawn are different causes.
+        let detail = |r: RunResult| {
+            let s = Scripted::default().then(ok(b"cafe\n")).then(r);
+            match cli(&s, None).find("svc", "acct") {
+                Read::Unreadable(e) => e.detail,
+                other => panic!("expected Unreadable, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            detail(RunResult::TimedOut),
+            "the -g disambiguation call did not finish in time"
+        );
+        assert_eq!(
+            detail(RunResult::SpawnFailed(
+                "Resource temporarily unavailable (os error 35)".into()
+            )),
+            "the -g disambiguation call could not run: Resource temporarily unavailable (os error 35)"
+        );
     }
 
     #[test]
