@@ -9,6 +9,9 @@ pub mod auto;
 pub mod cli;
 mod config_cmd;
 mod history;
+// Only its own tests use it until the logging setup (Task 6) writes through it.
+#[allow(dead_code)]
+mod logfile;
 pub mod prompt;
 mod render;
 mod root_guard;
