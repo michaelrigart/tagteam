@@ -7,8 +7,8 @@ use crate::error::EngineError;
 /// `TAGTEAM_TEST_PAUSE_AT=<name>` parks it there instead until the test lets it go (`pause_at`),
 /// so a binary test can signal it at a known point (§14.1). `Engine::fail_at` injects an
 /// error there (`"<name>"`) or a panic (`"panic:<name>"`) for the rollback tests;
-/// `TAGTEAM_TEST_FAIL_AT=<name>` injects the error for a process whose engine a test cannot
-/// reach (the real binary).
+/// `TAGTEAM_TEST_FAIL_AT` does the same (`<name>` or `panic:<name>`) for a process whose engine
+/// a test cannot reach (the real binary).
 /// Without the feature, a no-op.
 #[cfg(feature = "test-hooks")]
 pub(crate) fn point(engine: &Engine, name: &'static str) -> Result<(), EngineError> {
@@ -22,12 +22,14 @@ pub(crate) fn point(engine: &Engine, name: &'static str) -> Result<(), EngineErr
         }
     }
     let injected = *engine.fail_at.lock().unwrap();
-    if injected == Some(name) || std::env::var("TAGTEAM_TEST_FAIL_AT").as_deref() == Ok(name) {
+    let from_env = std::env::var("TAGTEAM_TEST_FAIL_AT").ok();
+    if injected == Some(name) || from_env.as_deref() == Some(name) {
         return Err(EngineError::InvalidInput(format!(
             "injected failure at {name}"
         )));
     }
-    if injected.and_then(|n| n.strip_prefix("panic:")) == Some(name) {
+    let panic_at = |n: &str| n.strip_prefix("panic:") == Some(name);
+    if injected.is_some_and(panic_at) || from_env.as_deref().is_some_and(panic_at) {
         panic!("injected panic at {name}");
     }
     Ok(())

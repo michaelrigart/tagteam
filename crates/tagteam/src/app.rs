@@ -331,23 +331,6 @@ fn build_engine(
     (engine, chosen.warnings)
 }
 
-/// Logs are diagnostics, on stderr: ERROR by default, so a routine command stays quiet (what a
-/// user must know reaches them as a notice instead), and DEBUG with `--debug`. Colour only on
-/// a terminal.
-fn init_logging(debug: bool, color: bool) {
-    let level = if debug {
-        tracing::Level::DEBUG
-    } else {
-        tracing::Level::ERROR
-    };
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(color && std::io::stderr().is_terminal())
-        .with_target(false)
-        .with_max_level(level)
-        .try_init();
-}
-
 enum Failure {
     Engine(EngineError),
     Usage(String),
@@ -568,8 +551,6 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
 }
 
 fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
-    let color = !cli.no_color && !ctx.no_color_env;
-    init_logging(cli.debug, color);
     let json = cli.json;
     if let Err(msg) = root_guard::refuse_root() {
         return Ended::Code(fail(io, json, KIND_ROOT, &msg));

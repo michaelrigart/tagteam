@@ -344,7 +344,10 @@ fn ctrl_c_twice_while_the_switch_s_write_waits_for_claude_code_s_storage_write_l
 
 /// Regression for a deadlock: `main` held the stdout and stderr locks for the whole command, so
 /// a collector thread whose tracing event wrote to stderr (`--debug`) blocked on the lock the
-/// joining main thread held, and no signal could free it.
+/// joining main thread held, and no signal could free it. Here `--debug list` must finish. That
+/// a collector thread's own line reaches stderr meanwhile is `logging.rs`'s
+/// `a_collector_thread_s_log_line_under_debug_never_hangs_the_command`: the `DEBUG` lines this
+/// test once saw were ureq's `log` records, which the subscriber no longer bridges (Decision 5).
 #[test]
 fn debug_logging_from_a_collector_thread_does_not_deadlock_the_command() {
     let dir = tempfile::tempdir().unwrap();
@@ -360,10 +363,6 @@ fn debug_logging_from_a_collector_thread_does_not_deadlock_the_command() {
         Some(0),
         "{}",
         String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("DEBUG"),
-        "the debug log reached stderr"
     );
 }
 
