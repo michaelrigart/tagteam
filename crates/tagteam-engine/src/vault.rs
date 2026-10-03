@@ -116,7 +116,9 @@ impl Vault {
     }
 
     /// Writes under the account lock. The current generation moves to `.prev` only when the
-    /// fingerprint changes; the write is verified by reading back.
+    /// fingerprint changes; the write is verified by reading back. A verified write is logged
+    /// at INFO (§14.2, Decision 10): the account's ID, and the generation's fingerprint as its
+    /// first 12 hex digits.
     pub fn store(
         &self,
         lock: &AccountLock,
@@ -124,20 +126,30 @@ impl Vault {
         fingerprint: &dyn Fn(&[u8]) -> Option<Fingerprint>,
     ) -> Result<(), VaultError> {
         let id = lock.id();
-        match self.backend.read(id.as_str()) {
+        let fp = fingerprint(bytes);
+        let new_generation = match self.backend.read(id.as_str()) {
             Read::Present(old) => {
-                if fingerprint(&old) != fingerprint(bytes) {
+                let changed = fingerprint(&old) != fp;
+                if changed {
                     self.backend.write(&prev_key(id), &old)?;
                 }
+                changed
             }
-            Read::Absent => {}
+            Read::Absent => true,
             Read::Unreadable(e) => return Err(VaultError::Unreadable(e)),
-        }
+        };
         self.backend.write(id.as_str(), bytes)?;
         match self.backend.read(id.as_str()) {
-            Read::Present(v) if v == bytes => Ok(()),
-            _ => Err(VaultError::Verify),
+            Read::Present(v) if v == bytes => {}
+            _ => return Err(VaultError::Verify),
         }
+        tracing::info!(
+            account = %id,
+            fp = fp.as_ref().map(|f| tracing::field::display(f.short12())),
+            new_generation,
+            "stored a credential in the vault"
+        );
+        Ok(())
     }
 
     /// Strict: both generations are deleted, errors propagate, and absence is verified. `.prev`

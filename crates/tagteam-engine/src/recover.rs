@@ -23,6 +23,18 @@ enum Direction {
     Undecidable,
 }
 
+impl Direction {
+    /// As the recovery's INFO line names it (§14.2: recovery is a decision a user may need to
+    /// reconstruct).
+    fn name(&self) -> &'static str {
+        match self {
+            Direction::Forward(_) => "forward",
+            Direction::Backward(_) => "backward",
+            Direction::Undecidable => "undecidable",
+        }
+    }
+}
+
 /// The fingerprint of a live secret, on either auth axis, that is generation `fp` or that the
 /// pre-lock oracle attributed to `account` (§9.6). The oracle's answer counts only for the exact
 /// bytes it was asked about, and only through `verdict` (§7.6).
@@ -140,7 +152,15 @@ impl Engine {
             e => e.into(),
         })?;
         let live = p.read_live_auth(&self.env);
-        match self.direction(p, &store, row, &live, hints)? {
+        let direction = self.direction(p, &store, row, &live, hints)?;
+        tracing::info!(
+            provider = %row.provider,
+            from_account = row.from_id.as_ref().map(tracing::field::display),
+            to_account = %row.to_id,
+            direction = direction.name(),
+            "recovering an interrupted switch"
+        );
+        match direction {
             Direction::Forward(fp) => {
                 self.finish_forward(p, &store, row, &accounts, &locks, &live, hints, &fp, source)
             }

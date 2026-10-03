@@ -33,5 +33,12 @@ pub(crate) fn displace(
         fingerprint: fp.map(|f| f.as_str().to_owned()).unwrap_or_default(),
         identity: identity.cloned(),
     })?;
+    // The entry's own ID, never the identity it was attributed to (§14.2).
+    tracing::info!(
+        provider = %provider,
+        displaced = %id,
+        reason,
+        "saved a credential to displaced/"
+    );
     Ok(id)
 }

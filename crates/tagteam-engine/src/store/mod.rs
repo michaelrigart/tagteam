@@ -366,6 +366,21 @@ fn event_from_row(r: &Row<'_>) -> rusqlite::Result<EventRow> {
     })
 }
 
+/// §14.2 and Decision 10: every `events` row is logged at INFO once it is written, naming its
+/// accounts by ID only. `detail` is never logged: it is free-form JSON, and nothing bounds what
+/// a later kind puts in it.
+fn log_event(e: &EventRow) {
+    tracing::info!(
+        provider = %e.provider,
+        kind = e.kind.as_str(),
+        from_account = e.from_id.as_ref().map(tracing::field::display),
+        to_account = e.to_id.as_ref().map(tracing::field::display),
+        trigger = e.trigger.as_deref(),
+        source = e.source.as_str(),
+        "event recorded"
+    );
+}
+
 /// Maps UNIQUE violations to named errors.
 fn classify(e: rusqlite::Error, position: u32, alias: Option<&str>) -> StoreError {
     if let rusqlite::Error::SqliteFailure(f, Some(msg)) = &e {
@@ -1100,6 +1115,8 @@ impl Store {
         Self::insert_event_on(&tx, event)?;
         tx.execute(DELETE_JOURNAL_SQL, [provider.as_str()])?;
         tx.commit()?;
+        drop(c);
+        log_event(event);
         Ok(())
     }
 
@@ -1148,6 +1165,7 @@ impl Store {
 
     pub fn insert_event(&self, e: &EventRow) -> Result<(), StoreError> {
         Self::insert_event_on(&self.lock(), e)?;
+        log_event(e);
         Ok(())
     }
 
