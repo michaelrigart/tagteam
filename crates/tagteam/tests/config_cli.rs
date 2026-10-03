@@ -369,3 +369,38 @@ fn config_answers_inside_a_run_shell() {
     assert_eq!(inside(&["config", "path"]), format!("{}\n", path.display()));
     assert!(inside(&["config", "list"]).starts_with("KEY "));
 }
+
+#[test]
+fn a_default_provider_this_build_lacks_warns_and_claude_code_is_used() {
+    // §13.1 rule 3 and Decision 2: the setting reads as written, and the CLI falls back.
+    let d = tempfile::tempdir().unwrap();
+    let path = write_config(d.path(), "default_provider = \"fake-agent\"\n");
+    let warning = format!(
+        "warning: {}: `default_provider` names fake-agent, which this build does not have; using claude-code\n",
+        path.display()
+    );
+    let (out, err) = ok(d.path(), &["config", "get", "default_provider"]);
+    assert_eq!(
+        (out.as_str(), err.as_str()),
+        ("fake-agent\n", warning.as_str())
+    );
+    let (out, err) = ok(d.path(), &["config", "list", "--json"]);
+    assert_eq!(err, warning);
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap()["provider"],
+        "claude-code"
+    );
+    let (out, err) = ok(d.path(), &["status", "--json"]);
+    assert_eq!(err, warning);
+    assert_eq!(
+        out,
+        "{\"schemaVersion\":1,\"provider\":\"claude-code\",\"active\":null}\n"
+    );
+    // The status bar has nowhere to show the warning, and falls back alike (§13.5).
+    cmd(d.path())
+        .arg("statusline")
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+}

@@ -6,12 +6,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::json;
 use tagteam_cc::{CcPaths, ClaudeCode};
-use tagteam_core::{CLAUDE_CODE, ProviderId, Window, WindowKind};
+use tagteam_core::{ProviderId, Window, WindowKind};
 use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::session::detect_run_shell;
-use tagteam_engine::settings::{STATUSLINE_MODEL_PREFIX, Settings, is_statusline_placeholder};
+use tagteam_engine::settings::{STATUSLINE_MODEL_PREFIX, is_statusline_placeholder};
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, StatuslineView};
 use tagteam_engine::{Engine, EngineConfig};
@@ -22,7 +22,7 @@ use tagteam_provider::{
     SystemClock,
 };
 
-use crate::app::Context;
+use crate::app::{Context, command_settings};
 use crate::render::{self, MISSING, RESET};
 
 /// §13.5: at most this much piped stdin is read, and none of it is used.
@@ -223,11 +223,12 @@ pub(crate) fn resolve_provider(
 /// that refuses every call, no profile oracle, and a lazy HTTP port whose adapter could send
 /// nothing even if it were built. The run shell is detected over that walled registry (§12.8),
 /// which reads the marker file alone, and the provider is resolved in Decision 13's order by
-/// `resolve_provider`. This is not `app::locate`, which serves the other commands over the full
-/// registry; the variables Decision 13's third step reads were captured into `ctx.env` by
-/// `Context::from_process`. The settings are that provider's, and their warnings are dropped,
-/// since a status bar has nowhere to show them. Returns the engine, the provider, and the walls,
-/// so a test can prove nothing reached them.
+/// `resolve_provider`, whose last step is the default `app::command_settings` chooses:
+/// `default_provider` when this build has it, else claude-code. This is not `app::locate`,
+/// which serves the other commands over the full registry; the variables Decision 13's third
+/// step reads were captured into `ctx.env` by `Context::from_process`. The settings are that
+/// provider's, and their warnings are dropped, since a status bar has nowhere to show them.
+/// Returns the engine, the provider, and the walls, so a test can prove nothing reached them.
 pub(crate) fn engine(
     ctx: Context,
     flag: Option<&str>,
@@ -237,19 +238,19 @@ pub(crate) fn engine(
     let registry =
         ProviderRegistry::new().with(Arc::new(ClaudeCode::new(keychain.clone(), ctx.platform)));
     let (run_shell, env) = detect_run_shell(&ctx.env, &registry);
-    let default = ProviderId::new(CLAUDE_CODE);
     // `ctx.env` is the process's own, not the effective `env`: inside a run shell the latter is
     // the outer home, where `CLAUDE_CONFIG_DIR` is gone and `invoked_by` would lose its signal.
-    let provider = resolve_provider(flag, &run_shell, &registry, &ctx.env, &default);
-    let (settings, _warnings) = Settings::load(&env, &provider);
+    let chosen = command_settings(&env, &|p| registry.get(p).is_some(), |default| {
+        resolve_provider(flag, &run_shell, &registry, &ctx.env, default)
+    });
     let engine = Engine::new(EngineConfig {
         registry,
         vault: Vault::new(Box::new(KeychainVault::new(keychain.clone()))),
         oracle: Arc::new(NoOracle),
         clock: Arc::new(SystemClock),
         http: http.clone(),
-        default_provider: default,
-        settings,
+        default_provider: chosen.default,
+        settings: chosen.settings,
         env,
         // `EngineConfig` requires a probe. The line never judges a session record (Decision 17),
         // so this one is never asked.
@@ -258,7 +259,7 @@ pub(crate) fn engine(
         spawner: Arc::new(SystemSpawner),
         run_shell,
     });
-    (engine, provider, http, keychain)
+    (engine, chosen.provider, http, keychain)
 }
 
 /// The statusline engine's Keychain: every call is refused, and counted.
@@ -324,7 +325,7 @@ mod tests {
     use clap::Parser;
     use tagteam_cc::live::Platform;
     use tagteam_cc::{ItemKind, keychain_account, keychain_service};
-    use tagteam_core::{AccountId, PollBudget, PollPlan};
+    use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan};
     use tagteam_engine::settings::DEFAULT_STATUSLINE_FORMAT;
     use tagteam_engine::store::{Eligibility, Reserve, Store};
     use tagteam_engine::views::{UsageStatus, UsageView};
@@ -685,6 +686,36 @@ mod tests {
         };
         assert_eq!(format_for(CLAUDE_CODE), "{5h}");
         assert_eq!(format_for("other"), "{7d}");
+    }
+
+    #[test]
+    fn without_provider_the_line_falls_back_from_a_default_this_build_lacks() {
+        // §13.5's last step is `default_provider`; one this build lacks is claude-code, and the
+        // status bar has nowhere to show the warning.
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::for_test(dir.path());
+        std::fs::create_dir_all(env.config_dir()).unwrap();
+        std::fs::write(
+            env.config_dir().join("config.toml"),
+            "default_provider = \"other\"\n[provider.other.statusline]\nformat = \"{7d}\"\n",
+        )
+        .unwrap();
+        let ctx = Context {
+            env,
+            keychain: Arc::new(FakeKeychain::new()),
+            platform: Platform::MacOs,
+            api_base: None,
+            stdout_terminal: false,
+            no_color_env: false,
+            force_color_env: false,
+        };
+        let (built, provider, _, _) = engine(ctx, None);
+        assert_eq!(provider.as_str(), CLAUDE_CODE);
+        assert_eq!(built.default_provider().as_str(), CLAUDE_CODE);
+        assert_eq!(
+            built.settings().statusline_format,
+            DEFAULT_STATUSLINE_FORMAT
+        );
     }
 
     #[test]
