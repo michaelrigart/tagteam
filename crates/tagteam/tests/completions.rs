@@ -55,6 +55,124 @@ fn definitions(cmd: &clap::Command, names: &mut BTreeSet<String>, flags: &mut BT
     }
 }
 
+/// Whether a fish line declares `-l f`, as a whole word.
+fn fish_declares_long(script: &str, f: &str) -> bool {
+    script.lines().any(|l| {
+        l.split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w == ["-l", f])
+    })
+}
+
+/// Every value an argument under `cmd` offers (hidden ones excepted), recursively.
+fn possible_values(cmd: &clap::Command, values: &mut BTreeSet<String>) {
+    for arg in cmd.get_arguments() {
+        values.extend(
+            arg.get_possible_values()
+                .into_iter()
+                .filter(|v| !v.is_hide_set())
+                .map(|v| v.get_name().to_owned()),
+        );
+    }
+    for sub in cmd.get_subcommands() {
+        possible_values(sub, values);
+    }
+}
+
+#[test]
+fn each_shell_s_script_offers_every_possible_value_of_every_argument() {
+    // Every fixed value completes (§13.7): the ValueEnum ones, the shells, the providers and
+    // the boolean words alike.
+    let d = tempfile::tempdir().unwrap();
+    let mut values = BTreeSet::new();
+    possible_values(&Cli::command(), &mut values);
+    for expected in [
+        "best",
+        "next-available",
+        "consume-first",
+        "claude-code",
+        "bash",
+        "true",
+        "false",
+        "1",
+        "0",
+        "yes",
+        "no",
+    ] {
+        assert!(values.contains(expected), "{expected} is a fixed value");
+    }
+    for shell in SHELLS {
+        let text = script(d.path(), shell);
+        let words = words(&text);
+        let missing: Vec<&String> = values
+            .iter()
+            .filter(|v| !words.contains(v.as_str()))
+            .collect();
+        assert!(missing.is_empty(), "{shell} offers none of {missing:?}");
+    }
+}
+
+/// Whether `s` is safe to write into a fish `-a "…"` list or a condition string unescaped.
+fn fish_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Every name and spelling under `cmd` that tagteam's fish code may write into the script.
+fn fish_written(cmd: &clap::Command, names: &mut BTreeSet<String>) {
+    for arg in cmd.get_arguments() {
+        names.extend(
+            arg.get_possible_values()
+                .into_iter()
+                .filter(|v| !v.is_hide_set())
+                .map(|v| v.get_name().to_owned()),
+        );
+        if !arg.is_positional() {
+            names.extend(
+                arg.get_short_and_visible_aliases()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|s| format!("-{s}")),
+            );
+            names.extend(
+                arg.get_long_and_visible_aliases()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|l| format!("--{l}")),
+            );
+        }
+    }
+    for sub in cmd.get_subcommands() {
+        names.extend(
+            sub.get_name_and_visible_aliases()
+                .into_iter()
+                .map(str::to_owned),
+        );
+        fish_written(sub, names);
+    }
+}
+
+#[test]
+fn the_fish_script_writes_only_names_that_need_no_quoting() {
+    // tagteam's fish lines put values, subcommand names and option spellings between double
+    // quotes and into a regex without escaping them. A name with a quote, a space, a `$` or a
+    // metacharacter would corrupt the script, so it fails here first.
+    let mut names = BTreeSet::new();
+    fish_written(&Cli::command(), &mut names);
+    names.extend(KEYS.iter().map(|k| k.name.to_owned()));
+    names.extend(
+        KEYS.iter()
+            .filter(|k| k.per_provider)
+            .map(|k| format!("provider.claude-code.{}", k.name)),
+    );
+    assert!(names.contains("config") && names.contains("--provider"));
+    let unsafe_names: Vec<&String> = names.iter().filter(|n| !fish_safe(n)).collect();
+    assert!(unsafe_names.is_empty(), "{unsafe_names:?}");
+    assert!(!fish_safe("a b") && !fish_safe("a$") && !fish_safe("a\"") && !fish_safe("a|b"));
+}
+
 #[test]
 fn each_shell_s_script_offers_every_command_flag_key_and_provider() {
     // §13.7: commands, flags, provider IDs, settings keys (§6.4) and the other fixed values
@@ -88,7 +206,7 @@ fn each_shell_s_script_offers_every_command_flag_key_and_provider() {
         let missing: Vec<&String> = flags
             .iter()
             .filter(|f| match shell {
-                "fish" => !text.contains(&format!("-l {f}")),
+                "fish" => !fish_declares_long(&text, f),
                 _ => !words.contains(format!("--{f}").as_str()),
             })
             .collect();
@@ -257,6 +375,26 @@ fn fish_completes_a_positional_only_in_its_place() {
     assert!(valued.contains("-p") && valued.contains("--provider"));
     assert!(valued.is_disjoint(&flags), "{valued:?} {flags:?}");
     assert_eq!(fish.valued, valued.iter().map(String::as_str).collect());
+    // `tagteam --provider <TAB>` before any subcommand: clap_complete's own rule fails while
+    // an option waits for its value, so a line of tagteam's completes the provider ids wherever
+    // the word before the cursor is `-p` or `--provider`.
+    let helper = script
+        .split_once("function __fish_tagteam_after_provider\n")
+        .expect("the provider helper is defined")
+        .1;
+    assert_eq!(
+        helper.lines().take(3).collect::<Vec<_>>(),
+        [
+            "    set -l words (commandline -opc)",
+            "    contains -- $words[-1] -p --provider",
+            "end",
+        ]
+    );
+    assert!(
+        script.lines().any(|l| l
+            == "complete -c tagteam -n \"__fish_tagteam_after_provider\" -f -a \"claude-code\""),
+        "the provider ids complete after -p and --provider"
+    );
     // Each line names its exact word path.
     let patterns: Vec<&str> = fish.lines.iter().map(|(pattern, _)| *pattern).collect();
     assert_eq!(

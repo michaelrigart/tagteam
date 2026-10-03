@@ -127,7 +127,12 @@ pub enum Command {
         #[arg(long)]
         model: Option<String>,
         /// Fall back to API-key accounts at the limit: true, false, 1, 0, yes or no
-        #[arg(long = "include-api-key-accounts", value_name = "BOOL")]
+        #[arg(
+            long = "include-api-key-accounts",
+            value_name = "BOOL",
+            value_parser = BoolWordParser,
+            hide_possible_values = true
+        )]
         include_api_key_accounts: Option<String>,
     },
     /// Usage history: burn rate, and when each window runs out
@@ -363,6 +368,31 @@ impl TypedValueParser for ProviderParser {
     }
 }
 
+/// The words `--include-api-key-accounts` takes (`parse_bool`'s closed set).
+const BOOL_WORDS: &[&str] = &["true", "false", "1", "0", "yes", "no"];
+
+/// `--include-api-key-accounts`. Any UTF-8 string parses, so the command still refuses a bad
+/// word with its own message, while completion offers the six it takes (§13.7).
+#[derive(Clone)]
+pub struct BoolWordParser;
+
+impl TypedValueParser for BoolWordParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &OsStr,
+    ) -> Result<String, clap::Error> {
+        StringValueParser::new().parse_ref(cmd, arg, value)
+    }
+
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+        Some(Box::new(BOOL_WORDS.iter().map(|w| PossibleValue::new(*w))))
+    }
+}
+
 /// The shells `tagteam completions` writes a script for (§13.7).
 #[derive(Clone, Copy, ValueEnum)]
 pub enum CompletionShell {
@@ -432,6 +462,48 @@ end
 "#
     );
     fish_positional_lines(cmd, &mut Vec::new(), script);
+    fish_global_option_values(cmd, script);
+}
+
+/// clap_complete's `__fish_tagteam_needs_command` fails while an option still waits for its
+/// value, so a global option's values (`tagteam --provider <TAB>`) would complete as files before
+/// a subcommand. This adds, for each global option with fixed values, a helper that holds when
+/// the word before the cursor is one of its spellings, and a line completing the values there.
+fn fish_global_option_values(cmd: &clap::Command, script: &mut Vec<u8>) {
+    for arg in cmd
+        .get_arguments()
+        .filter(|a| a.is_global_set() && !a.is_positional() && a.get_action().takes_values())
+    {
+        let values: Vec<String> = arg
+            .get_possible_values()
+            .into_iter()
+            .filter(|v| !v.is_hide_set())
+            .map(|v| v.get_name().to_owned())
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+        let shorts = arg.get_short_and_visible_aliases().unwrap_or_default();
+        let longs = arg.get_long_and_visible_aliases().unwrap_or_default();
+        let spellings: Vec<String> = shorts
+            .into_iter()
+            .map(|s| format!("-{s}"))
+            .chain(longs.into_iter().map(|l| format!("--{l}")))
+            .collect();
+        let name = arg.get_id().as_str().replace('-', "_");
+        let _ = write!(
+            script,
+            r#"
+function __fish_tagteam_after_{name}
+    set -l words (commandline -opc)
+    contains -- $words[-1] {}
+end
+complete -c tagteam -n "__fish_tagteam_after_{name}" -f -a "{}"
+"#,
+            spellings.join(" "),
+            values.join(" ")
+        );
+    }
 }
 
 /// Every spelling of an option under `cmd` that takes a value, such as `-p` and `--provider`.
