@@ -6,7 +6,7 @@ pub mod auto;
 pub mod bootstrap;
 pub mod collect;
 pub mod config;
-mod displace;
+pub mod displace;
 pub mod engine;
 pub mod error;
 mod hooks;
