@@ -140,6 +140,25 @@ fn tagteam_log_off_writes_no_file() {
 }
 
 #[test]
+fn tagteam_log_off_leaves_stderr_its_debug_lines() {
+    // `off` removes the file layer only: `--debug` still shows its diagnostics on stderr.
+    let d = tempfile::tempdir().unwrap();
+    rotated_live_login(d.path());
+    let out = quiet(d.path())
+        .args(["switch", "1", "--debug"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the profile oracle gave no answer"),
+        "{stderr}"
+    );
+    assert!(!state_dir(d.path()).exists());
+}
+
+#[test]
 fn tagteam_log_replaces_the_whole_file_filter() {
     // Only the switch module, at WARN: nothing else the switch logs reaches the file.
     let d = tempfile::tempdir().unwrap();
