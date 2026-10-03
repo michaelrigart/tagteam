@@ -1,7 +1,7 @@
 //! §14.2 through the real binary: where the log is and with what modes, what its filter
 //! takes, the `statusline` fast path that never opens it, a log that cannot be written, a
-//! panic's line, and a collector thread's log line under `--debug`. Needs `--features
-//! test-support`.
+//! panic's line, a collector thread's log line under `--debug`, and that no line holds an
+//! identity or a secret (B.69). Needs `--features test-support`.
 #![cfg(feature = "test-support")]
 
 mod common;
@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 
 use common::{cmd, expire_vault, login, seed_home, std_cmd, two_fresh_accounts};
 use serde_json::{Value, json};
+use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_provider::mock_server::{MockReply, MockServer};
-use tagteam_provider::{Env, FileKeychain};
+use tagteam_provider::splice::replace_top_level;
+use tagteam_provider::{Env, FileKeychain, Keychain};
 
 const TAGTEAM_LOG: &str = "TAGTEAM_LOG";
 const API_BASE: &str = "TAGTEAM_TEST_API_BASE";
@@ -321,4 +323,219 @@ fn a_collector_thread_s_log_line_under_debug_never_hangs_the_command() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("quarantined"), "{stderr}");
     assert_eq!(server.hits("POST", "/v1/oauth/token"), 1);
+}
+
+// No identity and no secret in any line, at any level (§14.2, §15.3 "Logs", B.69).
+
+const USAGE: &str = "/api/oauth/usage";
+const PROFILE: &str = "/api/oauth/profile";
+const TOKEN: &str = "/v1/oauth/token";
+const ORG_UUID: &str = "org-zq-7735";
+const ORG_NAME: &str = "Zqorg Redaction Holdings";
+const ALPHA_EMAIL: &str = "zq-alpha-7731@redact.test";
+const BRAVO_EMAIL: &str = "zq-bravo-7732@redact.test";
+const KEY_EMAIL: &str = "zq-key-7733@redact.test";
+const SETUP_EMAIL: &str = "zq-setup-7734@redact.test";
+const ALPHA_RT: &str = "zqrt-alpha-Kp7wXr2mQv9sLt4nBy6c";
+const ALPHA_AT: &str = "zqat-alpha-Hj3kPw8xRt5vNm2qZs7d";
+const ALPHA_RT_NEXT: &str = "zqrt-alpha-next-Pz5wKq8mXr3vTn7y";
+const ALPHA_AT_NEXT: &str = "zqat-alpha-next-Lk4xWp9zQm2rVs6t";
+const BRAVO_RT: &str = "zqrt-bravo-Wq4zLp9kXv2mRt7nHs3j";
+const BRAVO_AT: &str = "zqat-bravo-Tn6yMk3wQp8xVr5zLs2h";
+const BRAVO_RT_ROTATED: &str = "zqrt-bravo-rotated-Gx7pKw2zRm9qTv4s";
+const BRAVO_AT_ROTATED: &str = "zqat-bravo-rotated-Fy3nVq6kWp8zXm2r";
+const API_KEY: &str = "sk-ant-api03-zqkey-Rw8pXk3mQz7vTn2sLy5h";
+const SETUP_TOKEN: &str = "sk-ant-oat01-zqsetup-Mx6kPw2zRq9vTs4nLy7j";
+/// No line holds one of these whole.
+const IDENTITIES: [&str; 5] = [ALPHA_EMAIL, BRAVO_EMAIL, KEY_EMAIL, SETUP_EMAIL, ORG_NAME];
+/// No line holds 13 consecutive characters of one of these.
+const SECRETS: [&str; 10] = [
+    ALPHA_RT,
+    ALPHA_AT,
+    ALPHA_RT_NEXT,
+    ALPHA_AT_NEXT,
+    BRAVO_RT,
+    BRAVO_AT,
+    BRAVO_RT_ROTATED,
+    BRAVO_AT_ROTATED,
+    API_KEY,
+    SETUP_TOKEN,
+];
+
+/// What `claude /login` leaves behind, as `common::login` writes it, but with this fixture's
+/// organization and tokens: strings that nothing else in a run could produce.
+fn login_as(root: &Path, email: &str, rt: &str, at: &str) {
+    let env = Env::for_test(root);
+    let path = env.home.join(".claude.json");
+    let account = json!({"emailAddress": email, "organizationUuid": ORG_UUID,
+                         "organizationName": ORG_NAME, "accountUuid": format!("uuid-{email}")});
+    let doc = fs::read(&path).unwrap();
+    fs::write(
+        &path,
+        replace_top_level(&doc, "oauthAccount", &account).unwrap(),
+    )
+    .unwrap();
+    let credential = json!({"claudeAiOauth": {"accessToken": at, "refreshToken": rt,
+                            "refreshTokenExpiresAt": 1_797_000_000_000i64}});
+    FileKeychain::new(root.join("keychain"))
+        .upsert(
+            &keychain_service(&env, ItemKind::OAuth),
+            &keychain_account(&env),
+            credential.to_string().as_bytes(),
+        )
+        .unwrap();
+}
+
+/// The binary at TRACE, with every endpoint on `server`.
+fn traced(root: &Path, server: &MockServer) -> assert_cmd::Command {
+    let mut c = cmd(root);
+    c.env(TAGTEAM_LOG, "trace").env(API_BASE, server.base_url());
+    c
+}
+
+/// A server for the usage fetches (the recorded reply) and for a refresh, which hands out a's
+/// next tokens. The profile oracle answers nothing until `oracle_names_bravo`.
+fn redaction_server() -> MockServer {
+    let server = MockServer::start();
+    let usage: Value = serde_json::from_str(include_str!(
+        "../../tagteam-cc/tests/fixtures/endpoints/usage-200.json"
+    ))
+    .unwrap();
+    server.on(
+        "GET",
+        USAGE,
+        MockReply::Json {
+            status: 200,
+            body: usage["body"].clone(),
+        },
+    );
+    server.on(
+        "POST",
+        TOKEN,
+        MockReply::Json {
+            status: 200,
+            body: json!({"access_token": ALPHA_AT_NEXT, "refresh_token": ALPHA_RT_NEXT,
+                         "expires_in": 28800, "scope": "user:inference user:profile"}),
+        },
+    );
+    server
+}
+
+/// From now on the profile oracle names b, with the organization's name, for any token: `add`
+/// asks it too, and would refuse a's login as b's.
+fn oracle_names_bravo(server: &MockServer) {
+    server.on(
+        "GET",
+        PROFILE,
+        MockReply::Json {
+            status: 200,
+            body: json!({"account": {"uuid": format!("uuid-{BRAVO_EMAIL}"), "email": BRAVO_EMAIL},
+                         "organization": {"uuid": ORG_UUID, "name": ORG_NAME}}),
+        },
+    );
+}
+
+#[test]
+fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
+    // §15.3 "Logs", B.69 and Review Focus 5: every command, at TRACE, against a home whose
+    // emails, organization name, tokens and keys are strings nothing else contains, while
+    // the tokens go over the wire (usage bearers, the oracle's bearer and its answer, a
+    // refresh's body and reply, `add-token`'s key and setup token).
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    let server = redaction_server();
+    let run = |args: &[&str]| {
+        traced(root, &server).args(args).assert().success();
+    };
+    seed_home(&Env::for_test(root));
+    login_as(root, ALPHA_EMAIL, ALPHA_RT, ALPHA_AT);
+    run(&["add"]);
+    login_as(root, BRAVO_EMAIL, BRAVO_RT, BRAVO_AT);
+    run(&["add", "--alias", "zqb"]);
+    // Collects both: a with its vault token, b with the live one.
+    let listed = traced(root, &server)
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let alpha = listed["accounts"][0]["id"].as_str().unwrap().to_owned();
+    run(&["list"]);
+    run(&["status"]);
+    run(&["status", "--json"]);
+    run(&["alias", "1", "zqa"]);
+    run(&["alias"]);
+    run(&["alias", "1", "--unset"]);
+    run(&["disable", ALPHA_EMAIL]);
+    run(&["enable", ALPHA_EMAIL]);
+    run(&["move", "1", "2"]);
+    run(&["move", "2", "1"]);
+    run(&["history", "1"]);
+    run(&["history", "2", "--csv"]);
+    run(&["statusline"]);
+    // Claude Code rotated b in place, and a's access token is about to expire: `switch 1`
+    // asks the oracle about b's new token, captures it, and refreshes a through the gate.
+    login_as(root, BRAVO_EMAIL, BRAVO_RT_ROTATED, BRAVO_AT_ROTATED);
+    expire_vault(root, &alpha, 60_000);
+    oracle_names_bravo(&server);
+    run(&["switch", "1"]);
+    run(&["switch", "2", "--json"]);
+    run(&["add-token", API_KEY, "--email", KEY_EMAIL, "--json"]);
+    traced(root, &server)
+        .args(["add-token", "-", "--email", SETUP_EMAIL])
+        .write_stdin(format!("{SETUP_TOKEN}\n"))
+        .assert()
+        .success();
+    run(&["remove", KEY_EMAIL]);
+    run(&["remove", SETUP_EMAIL, "--json"]);
+    run(&["config", "path"]);
+    run(&["config", "set", "ui.color", "never"]);
+    run(&["config", "get", "ui.color"]);
+    run(&["config", "list", "--json"]);
+    run(&["config", "unset", "ui.color"]);
+    run(&["list"]);
+
+    // The secrets were sent: the log is clean because it never writes them.
+    let sent = server.requests();
+    let bearer = |at: &str| {
+        sent.iter().any(|r| {
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "authorization" && *v == format!("Bearer {at}"))
+        })
+    };
+    assert!(
+        bearer(ALPHA_AT) && bearer(BRAVO_AT) && bearer(BRAVO_AT_ROTATED),
+        "usage and oracle bearers"
+    );
+    assert!(
+        sent.iter()
+            .any(|r| r.path == TOKEN && String::from_utf8_lossy(&r.body).contains(ALPHA_RT)),
+        "the refresh sent a's refresh token"
+    );
+
+    let log = log_text(&state_dir(root));
+    assert!(
+        log.contains(" INFO tagteam_engine::store: ")
+            && log.contains(" INFO tagteam_engine::vault: "),
+        "the commands logged their state changes:\n{log}"
+    );
+    for line in log.lines() {
+        let target = line.split(' ').nth(3).unwrap_or_default();
+        assert!(
+            target.starts_with("tagteam"),
+            "only tagteam's own events; no `log` record is bridged in (Decision 5): {line}"
+        );
+    }
+    for identity in IDENTITIES {
+        assert!(!log.contains(identity), "{identity} is in the log:\n{log}");
+    }
+    for secret in SECRETS {
+        for part in secret.as_bytes().windows(13) {
+            let part = std::str::from_utf8(part).unwrap();
+            assert!(
+                !log.contains(part),
+                "{part:?}, part of a secret, is in the log:\n{log}"
+            );
+        }
+    }
 }

@@ -105,6 +105,11 @@ impl Engine {
             &serde_json::to_vec(&envelope).expect("a Value always serializes"),
             0o600,
         )?;
+        tracing::info!(
+            account = %id,
+            fp = %successor_fp.short12(),
+            "kept a refreshed token in rescue/ until the vault takes it"
+        );
         Ok(path)
     }
 
