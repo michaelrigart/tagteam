@@ -223,14 +223,43 @@ impl Engine {
         }
     }
 
+    /// §12.4: a baseline waiting in `profile`, left by a session whose merge-back never ran (its
+    /// `tagteam` was killed), is merged back into the outer home's config first. A failure
+    /// aborts with the profile and its baseline as they were: a seed over them would drop the
+    /// session's changes, and its baseline write could follow a link at the baseline's path.
+    /// The merge-back takes the outer home's config lock alone (§4.3), and only after
+    /// `MutationGuard` and the account lock. The launch (Task 10) runs it before the marker and
+    /// reports its summary; this keeps every seed and bootstrap behind the same rule.
+    fn merge_back_waiting(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        profile: &Path,
+    ) -> Result<(), EngineError> {
+        if !p.has_baseline(profile) {
+            return Ok(());
+        }
+        let report = p.merge_back(&self.env, profile, self.cancel())?;
+        if !report.conflicts.is_empty() {
+            tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                conflicts = ?report.conflicts,
+                "a session's merge-back kept the default file's values where both sides changed"
+            );
+        }
+        Ok(())
+    }
+
     /// §12.4's seed of `profile`, the profile's actual directory, whatever spelling its marker
-    /// records (Decision 22).
+    /// records (Decision 22), after a waiting baseline is merged back.
     pub(crate) fn seed_of(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
         profile: &Path,
     ) -> Result<(), EngineError> {
+        self.merge_back_waiting(p, row, profile)?;
         p.seed_profile(&self.env, profile, &p.parse_identity(&row.identity_json)?)?;
         Ok(())
     }
@@ -238,7 +267,8 @@ impl Engine {
     /// §12.3 steps 2–8 for the quiescent `profile`, whose marker exists. The caller holds
     /// `guard` and `lock` (this account's) throughout, validation included. `cwd` is the
     /// directory `claude` will run in, and `program` the launch command `plan_run` resolved,
-    /// which the validation spawns (Decision 20).
+    /// which the validation spawns (Decision 20). A profile that is not a real directory
+    /// refuses, and a waiting baseline is merged back (§12.4), before anything is written.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bootstrap_profile(
         &self,
@@ -261,6 +291,8 @@ impl Engine {
                 profile.display()
             )));
         }
+        // §12.4: before anything touches the profile, so a failure leaves it as it was.
+        self.merge_back_waiting(p, row, profile)?;
         // §6.2 "Pending rescues before activation": a rescue consumed the vault's generation.
         self.settle_rescues(p, row, lock)?;
         let vault = self.vault_generation(row)?;
