@@ -131,6 +131,15 @@ fn fresh_live_object(read: Read<Credential>) -> Result<Option<Map<String, Value>
     }
 }
 
+/// A profile's own credential as §12.3 step 4 composes from it: a JSON object, else refused,
+/// as a live entry is (§9.4 step 3). Its absence is the caller's `None`.
+fn entry_object(bytes: &[u8]) -> Result<Map<String, Value>, ProviderError> {
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(Value::Object(o)) => Ok(o),
+        _ => Err(ProviderError::Invalid(live::UNPARSABLE_ENTRY.into())),
+    }
+}
+
 struct SnapshotUndo {
     live: Arc<LiveStore>,
     env: Env,
@@ -618,6 +627,37 @@ impl Provider for ClaudeCode {
         cancel: &Cancel,
     ) -> Result<MergeReport, ProviderError> {
         session::merge_back(env, dir, self.lock_budget, cancel)
+    }
+
+    /// §12.3 step 4 (Decision 6), under the profile's own credential locks:
+    /// 1. a read of its entry, the operation's last read (§9.1);
+    /// 2. then the file alone, under its storage-write lock.
+    ///
+    /// Releasing the locks ends the operation.
+    fn write_profile_credential(
+        &self,
+        env: &Env,
+        spelling: &str,
+        guard: &MutationGuard,
+        bytes: &[u8],
+    ) -> Result<(), ProviderError> {
+        let profile = session::profile_env(env, spelling);
+        let paths = CcPaths::resolve(&profile);
+        let held = self.lock_credentials(&profile, guard, self.lock_budget)?;
+        let fence = || held.check_owned().map_err(ProviderError::from);
+        // The read the storage-write lock's re-read is held to; nothing else uses it.
+        self.live.snapshot(&profile, &paths)?;
+        self.live
+            .write_credential_file(&profile, &paths, bytes, &fence)
+    }
+
+    fn compose_profile_credential(
+        &self,
+        vault: &[u8],
+        profile: Option<&[u8]>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        let live = profile.map(entry_object).transpose()?;
+        shape::compose(vault, live.as_ref())
     }
 }
 

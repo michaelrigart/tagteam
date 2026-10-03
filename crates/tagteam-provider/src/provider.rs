@@ -688,6 +688,22 @@ pub trait Provider: Send + Sync {
         dir: &Path,
         cancel: &Cancel,
     ) -> Result<MergeReport, ProviderError>;
+    /// §12.3 step 4: writes the profile's credential file, composed, under the profile's own
+    /// credential locks and storage-write lock (Decision 6). Never writes a Keychain item.
+    fn write_profile_credential(
+        &self,
+        env: &Env,
+        spelling: &str,
+        guard: &MutationGuard,
+        bytes: &[u8],
+    ) -> Result<(), ProviderError>;
+    /// §12.3 step 4's composition: account-scoped keys of `vault`, machine-shared keys of
+    /// `profile` (none for a new profile).
+    fn compose_profile_credential(
+        &self,
+        vault: &[u8],
+        profile: Option<&[u8]>,
+    ) -> Result<Vec<u8>, ProviderError>;
 }
 
 #[cfg(test)]

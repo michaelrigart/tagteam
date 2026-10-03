@@ -218,6 +218,16 @@ fn pref_name(k: &MergeKey) -> String {
     }
 }
 
+/// A FakeAgent credential as a JSON object, else refused, as `write_credential` refuses one.
+fn credential_object(bytes: &[u8]) -> Result<serde_json::Map<String, Value>, ProviderError> {
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(Value::Object(o)) => Ok(o),
+        _ => Err(ProviderError::Invalid(
+            "FakeAgent's live credential is not a JSON object".into(),
+        )),
+    }
+}
+
 /// `fa.token`, unless the credential has expired by §7.2's rule (`now + 5 min ≥ expires`).
 /// A non-numeric or absent `expires` never expires.
 fn showable_token(bytes: &[u8], now_ms: i64) -> Option<String> {
@@ -813,5 +823,38 @@ impl Provider for FakeAgent {
             applied: merged.applied.len(),
             conflicts: merged.conflicts.iter().map(pref_name).collect(),
         })
+    }
+
+    /// §12.3 step 4 in FakeAgent's shape: `<spelling>/credential.json` at 0600 under the
+    /// profile's own `.live.lock`, carrying the `device` key the profile holds now. FakeAgent's
+    /// spelling is its directory as is (`profile_spelling`). It has no storage-write lock, so it
+    /// reads the file again under that lock.
+    fn write_profile_credential(
+        &self,
+        env: &Env,
+        spelling: &str,
+        guard: &MutationGuard,
+        bytes: &[u8],
+    ) -> Result<(), ProviderError> {
+        let profile = profile_env_in(env, Path::new(spelling));
+        let held = self.lock_credentials(&profile, guard, self.lock_budget)?;
+        let p = FakePaths::resolve(&profile);
+        let now = present_or_err(read_file(&p.credential))?
+            .map(|b| credential_object(&b))
+            .transpose()?;
+        let composed = shape::compose(bytes, now.as_ref())?;
+        ensure_private_dir(&p.dir)?;
+        write_atomic_private_with(&p.credential, &composed, 0o600, || {
+            held.check_owned().map_err(ProviderError::from)
+        })
+    }
+
+    fn compose_profile_credential(
+        &self,
+        vault: &[u8],
+        profile: Option<&[u8]>,
+    ) -> Result<Vec<u8>, ProviderError> {
+        let live = profile.map(credential_object).transpose()?;
+        shape::compose(vault, live.as_ref())
     }
 }

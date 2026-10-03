@@ -769,6 +769,44 @@ impl LiveStore {
         Ok(SecretStore::Fallback(paths.credentials_file.clone()))
     }
 
+    /// §12.3 step 4: `bytes` to `<secure-storage dir>/.credentials.json` alone, at 0600 and
+    /// atomically, under CC's storage-write lock (§9.1). Under the lock the entry is read again
+    /// as CC reads it. Its account-scoped keys must still be what this operation last read or
+    /// wrote (`EntryMoved` otherwise). When the entry is there, the machine-shared keys written
+    /// are the ones it holds now, their absence included. When it is absent, and was absent at
+    /// the operation's last read, CC wrote nothing there, so the composed keys stand (Decision
+    /// 22): after a move they may come from an item an older spelling names, the only copy. It
+    /// never writes or deletes a Keychain item: a profile's item is CC's to create, and
+    /// tagteam's only to delete (§12.3 step 5). The lock wait honours `env.cancel`.
+    pub fn write_credential_file(
+        &self,
+        env: &Env,
+        paths: &CcPaths,
+        bytes: &[u8],
+        fence: Fence<'_>,
+    ) -> Result<(), ProviderError> {
+        self.under_storage_write(env, paths, ItemKind::OAuth, fence, |now, fence| {
+            let keep = now.is_none() && self.read_absent(ItemKind::OAuth);
+            let bytes = if keep {
+                bytes.to_vec()
+            } else {
+                rebase(bytes, &shared_of(now))
+            };
+            self.write_file(paths, &bytes, fence)
+        })
+    }
+
+    /// Whether everything this operation read or wrote of `kind`'s entry, at every place, was
+    /// absent (§9.1): `snapshot` found nothing, and nothing was written since. `false` when the
+    /// operation never read the entry.
+    fn read_absent(&self, kind: ItemKind) -> bool {
+        let mut seen = self.seen.lock().unwrap();
+        seen.entry(kind)
+            .places
+            .as_ref()
+            .is_some_and(|places| places.values().flatten().all(Option::is_none))
+    }
+
     /// API-key activation: keep only the machine-shared keys of the credential item and the
     /// credentials file; delete either when none remain (§9.4 step 7). It holds CC's
     /// storage-write lock throughout and refuses, writing nothing, if the entry's

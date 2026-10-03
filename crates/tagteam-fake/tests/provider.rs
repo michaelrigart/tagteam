@@ -873,3 +873,84 @@ mod seed_and_merge_back {
         assert!(!target.exists(), "nothing was written through the link");
     }
 }
+
+mod profile_credential {
+    //! §12.3 step 4 in FakeAgent's shape: the `device` key is its machine-shared one.
+
+    use super::*;
+
+    fn vault() -> Vec<u8> {
+        serde_json::to_vec(
+            &json!({"fa": {"token": "tok-v", "renew": "renew-v"}, "device": {"id": "stale-elsewhere"}}),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_composition_takes_the_device_key_from_the_profile_and_its_absence_too() {
+        let f = fx();
+        let new: Value =
+            serde_json::from_slice(&f.fake.compose_profile_credential(&vault(), None).unwrap())
+                .unwrap();
+        assert_eq!(new, json!({"fa": {"token": "tok-v", "renew": "renew-v"}}));
+        let own = serde_json::to_vec(&credential_json("tok-p", Some("renew-p"), None)).unwrap();
+        let kept: Value = serde_json::from_slice(
+            &f.fake
+                .compose_profile_credential(&vault(), Some(&own))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            json!({"fa": {"token": "tok-v", "renew": "renew-v"}, "device": {"id": "machine-shared"}})
+        );
+        assert!(matches!(
+            f.fake.compose_profile_credential(&vault(), Some(b"[1]")),
+            Err(ProviderError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn the_write_is_the_profile_s_file_at_0600_under_its_own_lock() {
+        let f = fx();
+        let profile = f.env.data_dir().join("sessions/0193");
+        fs::create_dir_all(&profile).unwrap();
+        let spelling = profile.to_str().unwrap();
+        // The outer home's lock stays held: a write that took it would time out.
+        fs::create_dir_all(FakePaths::resolve(&f.env).lock).unwrap();
+        let file = profile.join("credential.json");
+        fs::write(
+            &file,
+            serde_json::to_vec(
+                &json!({"fa": {"token": "old"}, "device": {"id": "profile-device"}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+        let bytes = f.fake.compose_profile_credential(&vault(), None).unwrap();
+
+        f.fake
+            .write_profile_credential(&f.env, spelling, &g, &bytes)
+            .unwrap();
+
+        assert_eq!(
+            file_json(&file),
+            json!({"fa": {"token": "tok-v", "renew": "renew-v"}, "device": {"id": "profile-device"}}),
+            "the device key the profile holds now"
+        );
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!profile.join(".live.lock").exists(), "its lock is released");
+        // Its own lock held: the write waits for it, then gives up.
+        fs::create_dir(profile.join(".live.lock")).unwrap();
+        assert!(matches!(
+            f.fake
+                .write_profile_credential(&f.env, spelling, &g, &bytes),
+            Err(ProviderError::Lock(LockError::Timeout(_)))
+        ));
+    }
+}
