@@ -45,6 +45,7 @@ const COMMANDS: &[&[&str]] = &[
         "1790000000-0123456789ab-aaaaaa",
         "--yes",
     ],
+    &["completions", "bash"],
 ];
 
 /// `id`'s profile directory under the fixture's `sessions/`.
