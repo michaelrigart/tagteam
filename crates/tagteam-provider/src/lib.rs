@@ -27,7 +27,7 @@ pub(crate) static FORK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub use cancel::{Cancel, Interrupted};
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use credential::{Credential, FreshCredential, Provenance};
-pub use env::Env;
+pub use env::{Env, EnvError};
 pub use flock::{FlockGuard, LockProbe, MutationGuard, probe_lock};
 pub use http::{
     Http, HttpError, HttpRequest, HttpResponse, Method, NoHttp, RecordedRequest, ScriptedHttp,

@@ -4,6 +4,41 @@ use std::path::PathBuf;
 
 use crate::cancel::Cancel;
 
+/// Why the process's environment cannot place tagteam's files (§5). Each message says what to
+/// do.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EnvError {
+    #[error("HOME is not set; set it to the absolute path of your home directory")]
+    HomeUnset,
+    #[error("HOME is empty; set it to the absolute path of your home directory")]
+    HomeEmpty,
+    #[error(
+        "HOME is {0:?}, which is not an absolute path; set it to the absolute path of your home directory"
+    )]
+    HomeRelative(String),
+}
+
+impl EnvError {
+    /// Stable `error.type` for `--json` output (§5, §14).
+    pub fn kind(&self) -> &'static str {
+        "env"
+    }
+}
+
+/// `HOME` as tagteam may use it (§5): set, non-empty and absolute. Every default path derives
+/// from it, so a fallback would put state under `/` or the working directory.
+pub fn home_from(value: Option<OsString>) -> Result<PathBuf, EnvError> {
+    let value = value.ok_or(EnvError::HomeUnset)?;
+    if value.is_empty() {
+        return Err(EnvError::HomeEmpty);
+    }
+    let home = PathBuf::from(value);
+    if !home.is_absolute() {
+        return Err(EnvError::HomeRelative(home.to_string_lossy().into_owned()));
+    }
+    Ok(home)
+}
+
 /// Everything tagteam resolves paths from (§15.1). Tests build one with `for_test`.
 #[derive(Debug, Clone)]
 pub struct Env {
@@ -26,16 +61,15 @@ pub struct Env {
 }
 
 impl Env {
-    pub fn from_process() -> Self {
+    /// The process's environment. Fails when `HOME` cannot place tagteam's files (§5).
+    pub fn from_process() -> Result<Self, EnvError> {
         let abs = |k: &str| {
             std::env::var_os(k)
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute())
         };
-        Self {
-            home: std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "/".into()),
+        Ok(Self {
+            home: home_from(std::env::var_os("HOME"))?,
             user: std::env::var("USER").ok(),
             xdg_config_home: abs("XDG_CONFIG_HOME"),
             xdg_data_home: abs("XDG_DATA_HOME"),
@@ -45,7 +79,7 @@ impl Env {
             cancel: Cancel::new(),
             vars: BTreeMap::new(),
             forbidden_root: None,
-        }
+        })
     }
 
     /// A fixture environment rooted at `root`, with the harness guard armed against the
@@ -206,6 +240,53 @@ mod tests {
             None,
             "a variable gone from the process is dropped"
         );
-        assert!(Env::from_process().vars.is_empty());
+        assert!(Env::from_process().unwrap().vars.is_empty());
+    }
+
+    #[test]
+    fn home_must_be_set_non_empty_and_absolute() {
+        // §5: every default path derives from HOME, so nothing may fall back to `/` or the
+        // working directory.
+        assert_eq!(home_from(None), Err(EnvError::HomeUnset));
+        assert_eq!(home_from(Some(OsString::new())), Err(EnvError::HomeEmpty));
+        for relative in ["rel", "./home/u", "~/u", " /home/u"] {
+            assert_eq!(
+                home_from(Some(relative.into())),
+                Err(EnvError::HomeRelative(relative.into())),
+                "{relative:?}"
+            );
+        }
+        assert_eq!(
+            home_from(Some("/home/u".into())),
+            Ok(PathBuf::from("/home/u"))
+        );
+        assert_eq!(
+            home_from(Some("/home/u/".into())),
+            Ok(PathBuf::from("/home/u/")),
+            "a trailing slash is fine"
+        );
+        assert_eq!(home_from(Some("/".into())), Ok(PathBuf::from("/")));
+    }
+
+    #[test]
+    fn each_refusal_says_what_to_do_and_is_kind_env() {
+        let cases = [
+            (
+                EnvError::HomeUnset,
+                "HOME is not set; set it to the absolute path of your home directory",
+            ),
+            (
+                EnvError::HomeEmpty,
+                "HOME is empty; set it to the absolute path of your home directory",
+            ),
+            (
+                EnvError::HomeRelative("rel\x1b[2J".into()),
+                "HOME is \"rel\\u{1b}[2J\", which is not an absolute path; set it to the absolute path of your home directory",
+            ),
+        ];
+        for (e, message) in cases {
+            assert_eq!(e.to_string(), message);
+            assert_eq!(e.kind(), "env", "{e:?}");
+        }
     }
 }
