@@ -167,6 +167,7 @@ fn without_a_terminal_or_under_json_a_purge_needs_yes() {
         .args(["displaced", "--purge", &id, "--json"])
         .assert()
         .code(1)
+        .stderr("")
         .get_output()
         .stdout
         .clone();
@@ -208,6 +209,7 @@ fn an_id_that_names_no_entry_is_refused_and_nothing_is_deleted() {
                 .args(ids)
                 .assert()
                 .code(1)
+                .stderr("")
                 .get_output()
                 .stdout
                 .clone();
