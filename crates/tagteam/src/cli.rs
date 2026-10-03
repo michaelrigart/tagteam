@@ -186,14 +186,22 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// List credentials tagteam set aside rather than overwrite
+    /// List credentials tagteam set aside rather than overwrite, or delete them
     ///
     /// A switch saves a live login it would otherwise overwrite, and any other credential that
     /// was not tagteam's to keep, as a file in tagteam's data directory. tagteam never reads one
-    /// back: restoring one is manual. --json prints {schemaVersion, dir, displaced: [{id,
-    /// provider, at, reason, fingerprint, identity, account, file, recorded}]}, with times in ISO
-    /// 8601 UTC.
-    Displaced,
+    /// back: restoring one is manual. --purge deletes the entries named, after a confirmation
+    /// or with --yes. --json prints {schemaVersion, dir, displaced: [{id, provider, at, reason,
+    /// fingerprint, identity, account, file, recorded}]}, with times in ISO 8601 UTC, and for a
+    /// purge {schemaVersion, ok, deleted: [id]}.
+    Displaced {
+        /// Delete these entries, each file and its row; they cannot be recovered
+        #[arg(long, num_args = 1.., value_name = "ID")]
+        purge: Vec<String>,
+        /// Delete without asking
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// `switch --strategy` (§9.3): the strategies that rank accounts by usage.

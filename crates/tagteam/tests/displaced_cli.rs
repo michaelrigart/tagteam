@@ -130,3 +130,141 @@ fn a_fresh_machine_lists_nothing_and_creates_nothing() {
         "HOME must stay empty"
     );
 }
+
+const NEEDS_YES: &str =
+    "displaced credentials cannot be recovered once deleted; pass --yes to delete them";
+const YES_ALONE: &str = "--yes confirms --purge; name the entries to delete with --purge ID...";
+
+#[test]
+fn purge_with_yes_deletes_the_file_and_the_row() {
+    let d = tempfile::tempdir().unwrap();
+    let id = forced_over_a_stranger(d.path());
+    cmd(d.path())
+        .args(["displaced", "--purge", &id, "--yes"])
+        .assert()
+        .success()
+        .stdout(format!("Deleted {id}.\n"));
+    assert!(!displaced_dir(d.path()).join(format!("{id}.json")).exists());
+    cmd(d.path())
+        .arg("displaced")
+        .assert()
+        .success()
+        .stdout("No displaced credentials.\n");
+}
+
+#[test]
+fn without_a_terminal_or_under_json_a_purge_needs_yes() {
+    let d = tempfile::tempdir().unwrap();
+    let id = forced_over_a_stranger(d.path());
+    let file = displaced_dir(d.path()).join(format!("{id}.json"));
+    cmd(d.path())
+        .args(["displaced", "--purge", &id])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(format!("tagteam: {NEEDS_YES}\n"));
+    let out = cmd(d.path())
+        .args(["displaced", "--purge", &id, "--json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap(),
+        json!({"schemaVersion": 1, "error": {"type": "needs-confirmation", "message": NEEDS_YES}})
+    );
+    assert!(file.exists());
+    let out = cmd(d.path())
+        .args(["displaced", "--purge", &id, "--yes", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap(),
+        json!({"schemaVersion": 1, "ok": true, "deleted": [id]})
+    );
+    assert!(!file.exists());
+}
+
+#[test]
+fn an_id_that_names_no_entry_is_refused_and_nothing_is_deleted() {
+    // Review Focus 3: refused before any path is built, even beside a valid ID. A file whose
+    // name differs only in case exists, and is still no entry.
+    let d = tempfile::tempdir().unwrap();
+    let id = forced_over_a_stranger(d.path());
+    let upper = format!("{}-{}-AAAAAA", id.split('-').next().unwrap(), fp12(&id));
+    fs::write(
+        displaced_dir(d.path()).join(format!("{upper}.json")),
+        "not an entry",
+    )
+    .unwrap();
+    for bad in ["../../tagteam.db", "x", "", upper.as_str()] {
+        for ids in [[id.as_str(), bad], [bad, id.as_str()]] {
+            let out = cmd(d.path())
+                .args(["displaced", "--json", "--yes", "--purge"])
+                .args(ids)
+                .assert()
+                .code(1)
+                .get_output()
+                .stdout
+                .clone();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out).unwrap(),
+                json!({"schemaVersion": 1, "error": {"type": "no-such-displaced",
+                       "message": format!("no displaced credential matches {bad:?}; `tagteam displaced` lists them")}}),
+                "{ids:?}"
+            );
+        }
+    }
+    cmd(d.path())
+        .args(["displaced", "--purge", "../../tagteam.db", "--yes"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr("tagteam: no displaced credential matches \"../../tagteam.db\"; `tagteam displaced` lists them\n");
+    for name in [&id, &upper] {
+        assert!(
+            displaced_dir(d.path())
+                .join(format!("{name}.json"))
+                .exists(),
+            "{name}"
+        );
+    }
+    assert!(
+        Env::for_test(d.path())
+            .data_dir()
+            .join("tagteam.db")
+            .exists()
+    );
+    assert_eq!(listing(d.path())["displaced"][0]["id"], json!(id));
+}
+
+#[test]
+fn yes_without_purge_is_a_usage_error() {
+    let d = tempfile::tempdir().unwrap();
+    cmd(d.path())
+        .args(["displaced", "--yes"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(format!("tagteam: {YES_ALONE}\n"));
+    let out = cmd(d.path())
+        .args(["displaced", "--yes", "--json"])
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap(),
+        json!({"schemaVersion": 1, "error": {"type": "usage", "message": YES_ALONE}})
+    );
+    // `--purge` takes at least one ID.
+    cmd(d.path())
+        .args(["displaced", "--purge"])
+        .assert()
+        .code(2);
+}

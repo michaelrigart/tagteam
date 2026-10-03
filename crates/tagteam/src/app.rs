@@ -63,6 +63,8 @@ const KIND_ENGINE_RUNNING: &str = "engine-running";
 const KIND_NO_CANDIDATES: &str = "no-candidates";
 /// §14.1, Decision 4: every interruption, whichever carrier holds its signal.
 pub(crate) const KIND_INTERRUPTED: &str = "interrupted";
+/// A deletion that needs a person's yes, or `--yes` (§6.3).
+const KIND_NEEDS_CONFIRMATION: &str = "needs-confirmation";
 
 /// Appendix A.3. The default keychain is the login keychain, so the hint names its file.
 const UNLOCK_QUESTION: &str = "The login keychain is locked (common over SSH). Unlock it now?";
@@ -77,6 +79,10 @@ const CSV_AND_JSON: &str = "--csv and --json are two output formats; pass one";
 const BAD_SINCE: &str = "--since takes a span like 14d, 12h or 30m";
 const STATUSLINE_UNDER_JSON: &str = "statusline prints a line of text; run it without --json";
 const SHELL_INIT_UNDER_JSON: &str = "shell-init prints shell code; run it without --json";
+const YES_WITHOUT_PURGE: &str =
+    "--yes confirms --purge; name the entries to delete with --purge ID...";
+const PURGE_NEEDS_YES: &str =
+    "displaced credentials cannot be recovered once deleted; pass --yes to delete them";
 const NOTHING_TO_SWITCH: &str =
     "auto-switch needs two switchable accounts on a provider; add another with `tagteam add`";
 const BAD_THRESHOLD: &str = "--threshold takes a number from 50 to 99.9";
@@ -674,7 +680,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Auto { .. } => "auto",
         Command::Run { .. } => "run",
         Command::Config { .. } => "config",
-        Command::Displaced => "displaced",
+        Command::Displaced { .. } => "displaced",
     }
 }
 
@@ -1126,7 +1132,7 @@ impl App<'_, '_> {
             Command::ShellInit { .. } => unreachable!("run answers shell-init before dispatch"),
             Command::Run { .. } => unreachable!("run_command answers run before dispatch"),
             Command::Config { action } => self.config(action)?,
-            Command::Displaced => self.displaced()?,
+            Command::Displaced { purge, yes } => self.displaced(purge, yes)?,
             Command::Auto {
                 once,
                 dry_run,
@@ -1631,11 +1637,39 @@ impl App<'_, '_> {
         Ok(())
     }
 
-    /// §6.3's listing: every displaced entry, newest first, and the directory the files are in.
-    fn displaced(&mut self) -> Result<(), Failure> {
-        let list = self.engine.displaced()?;
-        let human = displaced_cmd::human(&list, &|e| displaced_cmd::identity(&self.engine, e));
-        self.print(&human, displaced_cmd::json(&list));
+    /// §6.3: the listing, or `--purge`'s deletions once confirmed. Every ID is checked before
+    /// the question, so an unknown one fails without asking. A person is asked on a terminal.
+    /// Anywhere else, and under `--json`, `--yes` is required.
+    fn displaced(&mut self, purge: Vec<String>, yes: bool) -> Result<(), Failure> {
+        if purge.is_empty() {
+            if yes {
+                return Err(Failure::Usage(YES_WITHOUT_PURGE.into()));
+            }
+            let list = self.engine.displaced()?;
+            let human = displaced_cmd::human(&list, &|e| displaced_cmd::identity(&self.engine, e));
+            self.print(&human, displaced_cmd::json(&list));
+            return Ok(());
+        }
+        let ids = self.engine.known_displaced(&purge)?;
+        if !yes {
+            if !self.can_prompt() {
+                return Err(Failure::Message(
+                    KIND_NEEDS_CONFIRMATION,
+                    PURGE_NEEDS_YES.into(),
+                ));
+            }
+            let question = displaced_cmd::purge_question(ids.len());
+            let confirmed = self.io.prompter.confirm(&question, false);
+            self.after_prompt()?;
+            if !confirmed {
+                return Err(cancelled());
+            }
+        }
+        let deleted = self.engine.purge_displaced(&ids)?;
+        self.print(
+            &displaced_cmd::purged_human(&deleted),
+            displaced_cmd::purged_json(&deleted),
+        );
         Ok(())
     }
 
