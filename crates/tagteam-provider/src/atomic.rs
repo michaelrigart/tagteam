@@ -74,9 +74,18 @@ struct Temp<'a> {
 }
 
 impl Drop for Temp<'_> {
+    /// A temp file that cannot be removed is left behind: a contained error, logged at WARN
+    /// with its cause, never discarded (§14). One that is already gone was never left behind.
     fn drop(&mut self) {
-        if !self.published {
-            let _ = fs::remove_file(self.path);
+        if self.published {
+            return;
+        }
+        match fs::remove_file(self.path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => tracing::warn!(
+                path = %self.path.display(),
+                "could not remove a temporary file: {e}"
+            ),
+            _ => {}
         }
     }
 }
@@ -298,6 +307,70 @@ mod tests {
             fs::read_dir(d.path()).unwrap().count(),
             1,
             "no temp file left"
+        );
+    }
+
+    /// The `tracing` lines `f` sends on this thread, level first, without times.
+    fn logged(f: impl FnOnce()) -> Vec<String> {
+        #[derive(Clone, Default)]
+        struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Lines {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Lines {
+            type Writer = Lines;
+            fn make_writer(&'a self) -> Lines {
+                self.clone()
+            }
+        }
+        let lines = Lines::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(lines.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn a_temp_file_that_cannot_be_removed_is_logged_with_its_cause() {
+        // §14 (L323): a contained error is logged at WARN with its cause, never discarded. The
+        // check swaps the temp file for a non-empty directory of the same name, which no
+        // `remove_file` deletes, as root or not, and then refuses to publish.
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("c.json");
+        let logs = logged(|| {
+            let r = write_atomic_with(&p, b"new", 0o600, || {
+                let tmp = fs::read_dir(d.path())?
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .find(|t| {
+                        t.file_name()
+                            .is_some_and(|n| n.to_string_lossy().starts_with(".c.json.tagteam-"))
+                    })
+                    .ok_or_else(|| io::Error::other("no temp file"))?;
+                fs::remove_file(&tmp)?;
+                fs::create_dir(&tmp)?;
+                fs::write(tmp.join("keep"), "")?;
+                Err(io::Error::other("lock lost"))
+            });
+            assert!(r.is_err());
+        });
+        let warnings: Vec<&String> = logs.iter().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{logs:?}");
+        assert!(
+            warnings[0].contains("could not remove a temporary file")
+                && warnings[0].contains(".c.json.tagteam-"),
+            "{}",
+            warnings[0]
         );
     }
 

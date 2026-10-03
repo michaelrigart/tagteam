@@ -1215,6 +1215,8 @@ dependencies = [
  "tagteam-core",
  "tempfile",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
