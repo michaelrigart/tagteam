@@ -1209,6 +1209,24 @@ impl App<'_, '_> {
                     config_cmd::get_json(state, &provider),
                 );
             }
+            ConfigAction::Set { key, value } => {
+                let change = self
+                    .engine
+                    .config_set(&key, self.provider_flag.as_ref(), &value)?;
+                self.print(
+                    &config_cmd::change_human(&change),
+                    config_cmd::change_json(&change),
+                );
+            }
+            ConfigAction::Unset { key } => {
+                let change = self
+                    .engine
+                    .config_unset(&key, self.provider_flag.as_ref())?;
+                self.print(
+                    &config_cmd::change_human(&change),
+                    config_cmd::change_json(&change),
+                );
+            }
             ConfigAction::Path => {
                 let path = settings::config_path(self.engine.env());
                 let exists = path.exists();
