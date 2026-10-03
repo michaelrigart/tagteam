@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -5,12 +6,13 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::http::Http;
+use tagteam_provider::process::{ProcessSpawner, SpawnSpec};
 use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
     Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
     LockError, MergeReport, MustShare, MutationGuard, Pace, PollBudget, Provider, ProviderError,
-    Read, SharePolicy, StoredLogin, Undo, UsageResult, Window, Written,
+    Read, SessionEnv, SharePolicy, StoredLogin, Undo, UsageResult, Validity, Window, Written,
 };
 
 use crate::config;
@@ -658,6 +660,43 @@ impl Provider for ClaudeCode {
     ) -> Result<Vec<u8>, ProviderError> {
         let live = profile.map(entry_object).transpose()?;
         shape::compose(vault, live.as_ref())
+    }
+
+    /// §12.5: the process environment's names are read here, so the token file descriptors
+    /// actually set are the ones scrubbed.
+    fn session_env(&self, spelling: &str) -> SessionEnv {
+        session::session_env(spelling, std::env::vars_os().map(|(name, _)| name))
+    }
+
+    /// §12.3 step 8: `claude auth status --json` in the session's environment and `cwd`. It
+    /// spawns `program`, the launch command `plan_run` resolved on `PATH` (§12.1), so the check
+    /// runs the binary the session will (Decision 20). A token already set spawns nothing.
+    fn validate_profile(
+        &self,
+        _env: &Env,
+        spelling: &str,
+        cwd: &Path,
+        program: &Path,
+        expect: &Identity,
+        spawner: &dyn ProcessSpawner,
+        cancel: &Cancel,
+    ) -> Validity {
+        if cancel.requested().is_some() {
+            return Validity::Unknown(session::INTERRUPTED.into());
+        }
+        let SessionEnv { set, remove } = self.session_env(spelling);
+        let spec = SpawnSpec {
+            program: program.to_path_buf(),
+            args: Vec::from(["auth", "status", "--json"].map(OsString::from)),
+            set,
+            remove,
+            cwd: Some(cwd.to_path_buf()),
+        };
+        session::validity(
+            spawner.run_captured(&spec, session::AUTH_STATUS_TIMEOUT, cancel),
+            spelling,
+            expect,
+        )
     }
 }
 

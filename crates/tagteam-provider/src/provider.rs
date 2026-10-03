@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
@@ -18,6 +19,7 @@ use crate::flock::MutationGuard;
 use crate::http::{Http, HttpError, HttpResponse};
 use crate::keychain::KeychainError;
 use crate::mkdir_lock::LockError;
+use crate::process::ProcessSpawner;
 use crate::read::{Read, ReadError};
 
 /// A login's identity. `raw` is the provider-owned object stored in `identity_json`
@@ -166,6 +168,30 @@ pub struct SharePolicy {
 pub struct MergeReport {
     pub applied: usize,
     pub conflicts: Vec<String>,
+}
+
+/// §12.5 "Environment": what a session's environment sets and scrubs (§4.5 `session_env`).
+/// The engine applies it identically to the login check and to the agent (Decision 9).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionEnv {
+    pub set: Vec<(OsString, OsString)>,
+    pub remove: Vec<OsString>,
+}
+
+/// §12.3 step 8's outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Validity {
+    Valid,
+    Invalid(String),
+    Overridden {
+        method: String,
+        source: Option<String>,
+    },
+    Drifted {
+        reported: String,
+    },
+    Unknown(String),
+    Unreachable(String),
 }
 
 /// What a provider can do at all (§4.5). A missing capability degrades the engine rather than
@@ -704,6 +730,22 @@ pub trait Provider: Send + Sync {
         vault: &[u8],
         profile: Option<&[u8]>,
     ) -> Result<Vec<u8>, ProviderError>;
+    /// §12.5 "Environment": what the session's environment sets and scrubs, for `spelling`.
+    fn session_env(&self, spelling: &str) -> SessionEnv;
+    /// §12.3 step 8 / "Every launch is checked", run with `spawner` in the session's exact
+    /// environment and `cwd`, 10 s timeout, cancellable. It spawns `program`, the launch
+    /// command `plan_run` resolved, never the launch command by name (Decision 20).
+    #[allow(clippy::too_many_arguments)]
+    fn validate_profile(
+        &self,
+        env: &Env,
+        spelling: &str,
+        cwd: &Path,
+        program: &Path,
+        expect: &Identity,
+        spawner: &dyn ProcessSpawner,
+        cancel: &Cancel,
+    ) -> Validity;
 }
 
 #[cfg(test)]

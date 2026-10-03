@@ -954,3 +954,71 @@ mod profile_credential {
         ));
     }
 }
+
+mod validation {
+    //! FakeAgent's session environment, and its login check from its profile files.
+
+    use super::*;
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use tagteam_provider::process::ScriptedSpawner;
+    use tagteam_provider::{Cancel, SessionEnv, Validity};
+
+    #[test]
+    fn its_session_sets_its_home_and_scrubs_its_token() {
+        let f = fx();
+        assert_eq!(
+            f.fake.session_env("/p/0193"),
+            SessionEnv {
+                set: vec![(OsString::from("FAKEAGENT_HOME"), OsString::from("/p/0193"))],
+                remove: vec![OsString::from("FAKEAGENT_TOKEN")],
+            }
+        );
+    }
+
+    #[test]
+    fn it_validates_from_its_profile_files_without_spawning() {
+        let f = fx();
+        let profile = f.env.data_dir().join("sessions/0193");
+        fs::create_dir_all(&profile).unwrap();
+        let spelling = profile.to_str().unwrap();
+        let spawner = ScriptedSpawner::new();
+        let identity = |handle: &str| {
+            f.fake
+                .parse_identity(&identity_json(handle, "ws2", &format!("uid-{handle}")))
+                .unwrap()
+        };
+        let check = |who: &str, cancel: &Cancel| {
+            f.fake.validate_profile(
+                &f.env,
+                spelling,
+                &profile,
+                Path::new("/opt/fakeagent/bin/fakeagent"),
+                &identity(who),
+                &spawner,
+                cancel,
+            )
+        };
+
+        assert_eq!(
+            check("bob", &Cancel::new()),
+            Validity::Invalid("not logged in".into())
+        );
+        login(&with_home(&f, spelling), "bob", "ws2", "tok-p", "renew-p");
+        assert_eq!(check("bob", &Cancel::new()), Validity::Valid);
+        assert_eq!(
+            check("carol", &Cancel::new()),
+            Validity::Invalid("logged in as another identity".into())
+        );
+        let cancel = Cancel::new();
+        cancel.request(2);
+        assert_eq!(
+            check("bob", &cancel),
+            Validity::Unknown("interrupted".into())
+        );
+        fs::write(profile.join("identity.json"), b"{\"identity\": {").unwrap();
+        assert!(matches!(check("bob", &Cancel::new()), Validity::Unknown(_)));
+        assert!(spawner.specs().is_empty(), "FakeAgent never spawns");
+    }
+}
