@@ -250,7 +250,6 @@ impl Engine {
             return Ok(());
         };
         let identity = p.parse_identity(&to.identity_json)?;
-        let live_identity = p.live_identity(&self.env).present();
         let mut warnings = Vec::new();
         // §9.4 step 7's rule, before the other axis is cleared: every entry the clear destroys
         // is kept first, unless its generation is held already. Held are the target's live
@@ -286,13 +285,16 @@ impl Engine {
                     continue;
                 }
             }
+            // Every entry cleared here sits on the other auth axis, and §9.6 never takes the
+            // live identity as evidence of whose it is: attributed to no one (§6.3).
             self.save_unheld(
                 p,
                 &row.provider,
                 bytes,
                 &mut held,
                 false,
-                live_identity.as_ref(),
+                None,
+                None,
                 &mut warnings,
             )?;
         }
