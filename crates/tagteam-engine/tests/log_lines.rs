@@ -1,12 +1,21 @@
-//! §14.2's INFO lines from the engine's central sites (Decision 10): every `events` row, every
-//! vault generation written, a rescue, a displacement and a recovery decision. Each names its
+//! §14.2's lines from the engine's central sites (Decision 10): every `events` row, every
+//! vault generation written, a rescue, a displacement, a recovery decision, a switch's
+//! rollback and every refresh outcome, and the status bar's DEBUG ceiling. Each names its
 //! accounts by ID, never by email (B.35).
 mod common;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use common::{Fx, capture_logs, crashed_switch, due, vault_fp, write_target_credential};
+use serde_json::json;
+use tagteam_core::AccountId;
+use tagteam_engine::account_lock::AccountLock;
+use tagteam_engine::active::{ActiveOutcome, ActiveTrigger};
 use tagteam_engine::vault::SERVICE;
+use tagteam_engine::views::StatuslineView;
+use tagteam_provider::Clock;
+use tagteam_provider::http::{HttpError, Method};
 
 /// One test at a time: each captures through a subscriber of its own, and `tracing` caches
 /// whether a call site is enabled across every subscriber alive in the process, so a test
@@ -213,4 +222,267 @@ fn an_unverified_capture_names_the_account_by_id_and_position() {
         found[0]
     );
     no_email(&logs);
+}
+
+/// The lines one gate call on `id` logs, with the vault's bytes as the caller's snapshot.
+fn gate_logs(fx: &Fx, id: &AccountId) -> Vec<String> {
+    let snapshot = fx.vault_bytes(id).unwrap();
+    capture_logs(|| {
+        fx.engine
+            .refresh_stored(fx.cc.as_ref(), id, &snapshot)
+            .unwrap()
+    })
+    .1
+}
+
+/// The one line among `logs` whose message contains `message`, at whichever level.
+fn only<'a>(logs: &'a [String], message: &str) -> &'a str {
+    let found: Vec<&str> = logs
+        .iter()
+        .map(|l| l.trim_start())
+        .filter(|l| l.contains(message))
+        .collect();
+    assert_eq!(found.len(), 1, "one {message:?} line in {logs:#?}");
+    found[0]
+}
+
+/// No line holds any part of the fixture's tokens: `rt-a…` and `at-rt-a…`.
+fn no_token(logs: &[String]) {
+    assert!(
+        logs.iter().all(|l| !l.contains("rt-a")),
+        "a token was logged: {logs:#?}"
+    );
+}
+
+#[test]
+fn a_gate_refresh_logs_its_outcome_once_at_its_level() {
+    // §14.2: refresh outcomes are INFO once a request was sent or state changed, and a gate
+    // that did neither logs at DEBUG. No line holds a token, or a systemic refusal's own words.
+    let _serial = one_at_a_time();
+    let gate = "refresh gate outcome";
+
+    // The request was sent, and its successor stored.
+    let fx = Fx::new();
+    let a = due(&fx);
+    fx.script_refresh(Some("rt-a2"));
+    let logs = gate_logs(&fx, &a);
+    let line = only(&logs, gate);
+    assert!(line.starts_with("INFO"), "{line}");
+    assert_eq!(
+        (field(line, "account"), field(line, "outcome")),
+        (Some(a.as_str()), Some("\"refreshed\"")),
+        "{line}"
+    );
+    no_token(&logs);
+
+    // The request was sent and its reply never came.
+    let fx = Fx::new();
+    let a = due(&fx);
+    fx.http.push(
+        Method::Post,
+        &Fx::endpoints().token,
+        Err(HttpError::Ambiguous("timed out reading the reply".into())),
+    );
+    let logs = gate_logs(&fx, &a);
+    let line = only(&logs, gate);
+    assert!(line.starts_with("INFO"), "{line}");
+    assert_eq!(
+        [
+            field(line, "outcome"),
+            field(line, "kind"),
+            field(line, "rescued"),
+        ],
+        [Some("\"transient\""), Some("\"ambiguous\""), Some("false")],
+        "{line}"
+    );
+    assert!(!line.contains("timed out"), "{line}");
+    no_token(&logs);
+
+    // The endpoint refused the request itself, in words that name the account.
+    let fx = Fx::new();
+    let a = due(&fx);
+    fx.http.push_json(
+        Method::Post,
+        &Fx::endpoints().token,
+        400,
+        json!({"error": "invalid_client", "error_description": "no client for a@x.co"}),
+    );
+    let logs = gate_logs(&fx, &a);
+    let line = only(&logs, gate);
+    assert!(line.starts_with("INFO"), "{line}");
+    assert_eq!(field(line, "outcome"), Some("\"systemic\""), "{line}");
+    assert!(logs.iter().all(|l| !l.contains("no client")), "{logs:#?}");
+    no_email(&logs);
+    no_token(&logs);
+
+    // Another process holds the account lock: nothing is sent, nothing changes.
+    let fx = Fx::new();
+    let a = due(&fx);
+    fx.script_refresh(Some("rt-a2"));
+    let _held = AccountLock::acquire(&fx.env, &a, Duration::ZERO).unwrap();
+    let logs = gate_logs(&fx, &a);
+    let line = only(&logs, gate);
+    assert!(line.starts_with("DEBUG"), "{line}");
+    assert_eq!(field(line, "outcome"), Some("\"busy\""), "{line}");
+}
+
+#[test]
+fn an_active_token_refresh_logs_its_outcome_by_provider_and_account() {
+    // §14.2 and §7.5: the live token's refresh is INFO once it sent a request; one that found
+    // the token still fresh, and changed nothing, logs at DEBUG.
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let mut live = fx.live_credential().unwrap();
+    live["claudeAiOauth"]["expiresAt"] = json!(fx.clock.now_ms());
+    fx.set_live_credential(live.to_string().as_bytes());
+    fx.script_refresh(Some("rt-a2"));
+    let active = "active-token refresh outcome";
+
+    let (out, logs) = capture_logs(|| {
+        fx.engine
+            .refresh_active(&fx.provider(), ActiveTrigger::Expired)
+            .unwrap()
+    });
+    assert_eq!(out, ActiveOutcome::Refreshed);
+    let line = one(&logs, active);
+    assert_eq!(
+        [
+            field(line, "provider"),
+            field(line, "account"),
+            field(line, "outcome"),
+        ],
+        [Some("claude-code"), Some(a.as_str()), Some("\"refreshed\"")],
+        "{line}"
+    );
+    no_token(&logs);
+
+    let (out, logs) = capture_logs(|| {
+        fx.engine
+            .refresh_active(&fx.provider(), ActiveTrigger::Expired)
+            .unwrap()
+    });
+    assert_eq!(out, ActiveOutcome::NotNeeded { reconciled: false });
+    let line = only(&logs, active);
+    assert!(line.starts_with("DEBUG"), "{line}");
+    assert_eq!(field(line, "outcome"), Some("\"not-needed\""), "{line}");
+}
+
+#[test]
+fn an_unreadable_usage_row_is_a_warning_for_a_command_and_a_debug_line_for_the_status_bar() {
+    // §14.2: everything `statusline` does logs at DEBUG at most, so a status bar that cannot
+    // read the live account's usage never opens the log. An account command's result logs the
+    // same failure at WARN (§14: a contained error is logged with its cause).
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO usage_state (account_id, fetched_at) VALUES (?1, 'soon')",
+            [a.as_str()],
+        )
+        .unwrap();
+    let usage = "could not read the account's usage";
+
+    let (view, logs) = capture_logs(|| fx.engine.statusline(&fx.provider()).unwrap());
+    assert!(matches!(view, StatuslineView::Managed { .. }));
+    let line = only(&logs, usage);
+    assert!(line.starts_with("DEBUG"), "{line}");
+    assert_eq!(
+        (field(line, "account"), field(line, "kind")),
+        (Some(a.as_str()), Some("\"store\"")),
+        "{line}"
+    );
+    assert!(
+        logs.iter()
+            .all(|l| l.trim_start().starts_with("DEBUG") || l.trim_start().starts_with("TRACE")),
+        "the status bar logs at DEBUG at most: {logs:#?}"
+    );
+
+    let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
+    let (_, logs) = capture_logs(|| fx.engine.account_view(row, true));
+    assert!(only(&logs, usage).starts_with("WARN"), "{logs:#?}");
+}
+
+#[cfg(feature = "test-hooks")]
+mod hooks {
+    use tagteam_cc::{ItemKind, keychain_service};
+    use tagteam_engine::EngineError;
+
+    use super::*;
+
+    #[test]
+    fn a_rolled_back_switch_names_its_accounts_and_its_cause_s_kind() {
+        // §14.2: switches and their rollbacks. An error after the switch wrote a's credential
+        // puts every byte back; the line names the cause by its kind, never by its text, which
+        // can hold a label.
+        let _serial = one_at_a_time();
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let b = fx.add("b@x.co", "rt-b");
+        fx.engine.fail_at(Some("after-credential"));
+        let (err, logs) = capture_logs(|| fx.switch_to(&a, false).unwrap_err());
+        assert!(matches!(err, EngineError::RolledBack(_)), "{err}");
+        let found = at(&logs, "WARN", "rolled back a switch");
+        assert_eq!(found.len(), 1, "{logs:#?}");
+        assert_eq!(
+            [
+                field(found[0], "provider"),
+                field(found[0], "from_account"),
+                field(found[0], "to_account"),
+                field(found[0], "kind"),
+            ],
+            [
+                Some("claude-code"),
+                Some(b.as_str()),
+                Some(a.as_str()),
+                Some("\"invalid-input\""),
+            ],
+            "{}",
+            found[0]
+        );
+        assert!(
+            logs.iter().all(|l| !l.contains("injected failure")),
+            "the cause's text: {logs:#?}"
+        );
+        no_email(&logs);
+    }
+
+    #[test]
+    fn a_rollback_that_fails_too_is_an_error_naming_what_it_left() {
+        // §9.4 step 10: the credential undo cannot write b's credential back, so the journal
+        // row stays for recovery (§9.6), and the line says so.
+        let _serial = one_at_a_time();
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        fx.add("b@x.co", "rt-b");
+        let kc = fx.kc.clone();
+        let svc = keychain_service(&fx.env, ItemKind::OAuth);
+        fx.engine.on_point(
+            "after-identity",
+            Box::new(move || kc.set_fail_write(&svc, true)),
+        );
+        fx.engine.fail_at(Some("after-identity"));
+        let (err, logs) = capture_logs(|| fx.switch_to(&a, false).unwrap_err());
+        assert!(matches!(err, EngineError::RollbackFailed { .. }), "{err}");
+        let found = at(&logs, "ERROR", "a switch was not fully rolled back");
+        assert_eq!(found.len(), 1, "{logs:#?}");
+        assert!(
+            found[0].contains("its journal row stays for recovery: restore the live credential"),
+            "{}",
+            found[0]
+        );
+        assert_eq!(
+            field(found[0], "kind"),
+            Some("\"invalid-input\""),
+            "{}",
+            found[0]
+        );
+        assert!(
+            logs.iter().all(|l| !l.contains("injected failure")),
+            "the cause's text: {logs:#?}"
+        );
+        no_email(&logs);
+    }
 }

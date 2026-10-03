@@ -32,6 +32,7 @@ tagteam-fake.workspace = true
 tagteam-provider = { workspace = true, features = ["file-keychain", "mock-server"] }
 assert_cmd.workspace = true
 predicates.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [lints]

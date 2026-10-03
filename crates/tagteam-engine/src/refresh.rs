@@ -271,6 +271,60 @@ pub(crate) fn log_lost(row: &AccountRow, cause: &dyn std::fmt::Display) {
     );
 }
 
+/// §14.2's refresh outcome, one line per gate call, naming the account by ID. INFO once a
+/// request was sent or state changed, and for an error, which is named by its `kind()` alone;
+/// DEBUG when the gate sent nothing and changed nothing: another process holds the lock or has
+/// refreshed already, or the token is someone else's to refresh. A systemic refusal's own
+/// words are never logged.
+fn log_gate(id: &AccountId, result: &Result<GateOutcome, EngineError>) {
+    const OUTCOME: &str = "refresh gate outcome";
+    match result {
+        Ok(GateOutcome::Refreshed(_)) => {
+            tracing::info!(account = %id, outcome = "refreshed", "{OUTCOME}");
+        }
+        Ok(GateOutcome::Dead(reason)) => tracing::info!(
+            account = %id,
+            outcome = "dead",
+            reason = reason.as_str(),
+            "{OUTCOME}"
+        ),
+        Ok(GateOutcome::Systemic(_)) => {
+            tracing::info!(account = %id, outcome = "systemic", "{OUTCOME}");
+        }
+        Ok(GateOutcome::Transient { kind, rescued }) => tracing::info!(
+            account = %id,
+            outcome = "transient",
+            kind = kind.as_str(),
+            rescued,
+            "{OUTCOME}"
+        ),
+        Ok(GateOutcome::Unpersisted) => {
+            tracing::info!(account = %id, outcome = "unpersisted", "{OUTCOME}");
+        }
+        Err(e) => tracing::info!(
+            account = %id,
+            outcome = "error",
+            kind = e.kind(),
+            "{OUTCOME}"
+        ),
+        Ok(GateOutcome::AlreadyFresh(_)) => {
+            tracing::debug!(account = %id, outcome = "already-fresh", "{OUTCOME}");
+        }
+        Ok(GateOutcome::Busy) => {
+            tracing::debug!(account = %id, outcome = "busy", "{OUTCOME}");
+        }
+        Ok(GateOutcome::Owned(by)) => tracing::debug!(
+            account = %id,
+            outcome = "owned",
+            by = ?by,
+            "{OUTCOME}"
+        ),
+        Ok(GateOutcome::Conflict) => {
+            tracing::debug!(account = %id, outcome = "conflict", "{OUTCOME}");
+        }
+    }
+}
+
 impl Engine {
     /// Writes a new generation of `row`'s login under `lock` (§6.2): `.prev` rotates only when
     /// the lineage fingerprint changes, and the write is verified. Then `login_expires_at` is
@@ -304,8 +358,22 @@ impl Engine {
     /// account lock is only tried, never waited for, and is held from here until the result
     /// is persisted, across the request: at most one refresh per account is in flight, and a
     /// suspended holder is never preempted. `snapshot` is the vault bytes the caller decided
-    /// on; step 4 compares against it.
+    /// on; step 4 compares against it. Whichever way it ends, its outcome is logged once
+    /// (`log_gate`), after the account lock is released.
     pub fn refresh_stored(
+        &self,
+        p: &dyn Provider,
+        id: &AccountId,
+        snapshot: &[u8],
+    ) -> Result<GateOutcome, EngineError> {
+        let result = self.run_gate(p, id, snapshot);
+        log_gate(id, &result);
+        result
+    }
+
+    /// `refresh_stored`'s steps. Every path out of here, an early `return` and a `?` included,
+    /// is one outcome, which its caller logs.
+    fn run_gate(
         &self,
         p: &dyn Provider,
         id: &AccountId,
