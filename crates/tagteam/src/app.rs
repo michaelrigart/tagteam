@@ -1821,13 +1821,15 @@ mod tests {
             "other",
             "the setting itself reads as written"
         );
-        assert_eq!(
-            chosen.warnings,
-            [format!(
-                "{}: `default_provider` names other, which this build does not have; using claude-code",
-                settings::config_path(&env).display()
-            )]
+        let warning = format!(
+            "{}: `default_provider` names other, which this build does not have; using claude-code",
+            settings::config_path(&env).display()
         );
+        assert_eq!(chosen.warnings, [warning.clone()]);
+        // An explicit provider, as `--provider` names one, warns all the same.
+        let chosen = command_settings(&env, &claude_code_only, |_| ProviderId::new(CLAUDE_CODE));
+        assert_eq!(chosen.default.as_str(), CLAUDE_CODE);
+        assert_eq!(chosen.warnings, [warning]);
     }
 
     #[test]
