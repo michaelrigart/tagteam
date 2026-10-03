@@ -137,6 +137,7 @@ mod tests {
             default_provider: ProviderId::new(CLAUDE_CODE),
             settings: Settings::default(),
             process: Arc::new(tagteam_provider::liveness::FakeProcessProbe::new()),
+            spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
             run_shell: RunShell::Outside,
         });
         assert!(matches!(

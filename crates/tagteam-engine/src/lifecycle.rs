@@ -244,7 +244,11 @@ impl Engine {
     /// unable to finish once the vault is gone. Any other failure stops before the directory
     /// goes. The items are found by the recorded spelling, the files by the profile's actual
     /// directory (Decision 19).
-    fn remove_profile(&self, p: &dyn Provider, row: &AccountRow) -> Result<(), EngineError> {
+    pub(crate) fn remove_profile(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+    ) -> Result<(), EngineError> {
         let profile = profile_path(&self.env, &row.id);
         let meta = match fs::symlink_metadata(&profile) {
             Ok(meta) => meta,

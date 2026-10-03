@@ -24,6 +24,7 @@ use tagteam_engine::views::{AccountView, ShellAccount, StatusView};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::http::Http;
 use tagteam_provider::liveness::SystemProcessProbe;
+use tagteam_provider::process::SystemSpawner;
 use tagteam_provider::profile::RunShell;
 use tagteam_provider::security::SecurityCli;
 use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
@@ -243,6 +244,7 @@ fn build_engine(
         default_provider,
         settings,
         process: Arc::new(SystemProcessProbe),
+        spawner: Arc::new(SystemSpawner),
         run_shell,
     });
     (engine, warnings)

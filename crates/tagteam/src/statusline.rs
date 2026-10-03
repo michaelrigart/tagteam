@@ -16,6 +16,7 @@ use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, StatuslineView};
 use tagteam_engine::{Engine, EngineConfig};
 use tagteam_provider::liveness::SystemProcessProbe;
+use tagteam_provider::process::SystemSpawner;
 use tagteam_provider::{
     Capabilities, Env, Http, Keychain, KeychainError, LockState, NoHttp, Read, ReadError, RunShell,
     SystemClock,
@@ -253,6 +254,8 @@ pub(crate) fn engine(
         // `EngineConfig` requires a probe. The line never judges a session record (Decision 17),
         // so this one is never asked.
         process: Arc::new(SystemProcessProbe),
+        // Nor does it launch or validate, so its spawner is never called either.
+        spawner: Arc::new(SystemSpawner),
         run_shell,
     });
     (engine, provider, http, keychain)
