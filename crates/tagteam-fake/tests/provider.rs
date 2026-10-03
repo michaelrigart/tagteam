@@ -953,6 +953,37 @@ mod profile_credential {
             Err(ProviderError::Lock(LockError::Timeout(_)))
         ));
     }
+
+    #[test]
+    fn a_credential_file_that_is_a_link_is_refused_and_its_target_left_alone() {
+        // §12.3 step 4: the atomic write would follow the link and put the vault's account keys
+        // wherever it points, such as the outer home's credential file.
+        let f = fx();
+        let profile = f.env.data_dir().join("sessions/0193");
+        fs::create_dir_all(&profile).unwrap();
+        let spelling = profile.to_str().unwrap();
+        let elsewhere = FakePaths::resolve(&f.env).credential;
+        fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
+        let theirs = serde_json::to_vec(&json!({"fa": {"token": "theirs"}})).unwrap();
+        fs::write(&elsewhere, &theirs).unwrap();
+        let file = profile.join("credential.json");
+        std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+        let g = MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap();
+        let bytes = f.fake.compose_profile_credential(&vault(), None).unwrap();
+
+        let err = f
+            .fake
+            .write_profile_credential(&f.env, spelling, &g, &bytes)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(&format!("{} is a link", file.display())),
+            "{err}"
+        );
+        assert_eq!(fs::read(&elsewhere).unwrap(), theirs);
+        assert_eq!(fs::read_link(&file).unwrap(), elsewhere);
+    }
 }
 
 mod validation {

@@ -12,7 +12,7 @@ use tagteam_provider::atomic::{
 use tagteam_provider::http::{Http, HttpError, HttpRequest};
 use tagteam_provider::process::ProcessSpawner;
 use tagteam_provider::profile::{
-    has_own_file, read_own_bytes, remove_own_file, write_own_json_with,
+    has_own_file, read_own_bytes, refuse_linked_credential, remove_own_file, write_own_json_with,
 };
 use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind};
 use tagteam_provider::splice::{self, render_nested};
@@ -831,7 +831,8 @@ impl Provider for FakeAgent {
     /// §12.3 step 4 in FakeAgent's shape: `<spelling>/credential.json` at 0600 under the
     /// profile's own `.live.lock`, carrying the `device` key the profile holds now. FakeAgent's
     /// spelling is its directory as is (`profile_spelling`). It has no storage-write lock, so it
-    /// reads the file again under that lock.
+    /// reads the file again under that lock. A file that is a link refuses first: the write
+    /// would land wherever it points.
     fn write_profile_credential(
         &self,
         env: &Env,
@@ -840,8 +841,9 @@ impl Provider for FakeAgent {
         bytes: &[u8],
     ) -> Result<(), ProviderError> {
         let profile = profile_env_in(env, Path::new(spelling));
-        let held = self.lock_credentials(&profile, guard, self.lock_budget)?;
         let p = FakePaths::resolve(&profile);
+        refuse_linked_credential(&p.credential)?;
+        let held = self.lock_credentials(&profile, guard, self.lock_budget)?;
         let now = present_or_err(read_file(&p.credential))?
             .map(|b| credential_object(&b))
             .transpose()?;

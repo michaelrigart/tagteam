@@ -7,13 +7,14 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    Fx, auth_helper, auth_logged_out, auth_reply, auth_status, credential, two_accounts, vault_fp,
+    Fx, auth_helper, auth_logged_out, auth_reply, auth_status, credential, dir_tree, two_accounts,
+    vault_fp,
 };
 use serde_json::{Value, json};
 use tagteam_cc::live::Platform;
@@ -511,6 +512,86 @@ fn an_unreadable_or_degraded_profile_credential_aborts_without_writing() {
         1,
         "only the first bootstrap validated"
     );
+}
+
+#[test]
+fn a_profile_path_that_links_to_a_directory_refuses_the_bootstrap_and_writes_nothing_there() {
+    // Controller ruling: the credential write resolves from the canonical spelling, so through a
+    // link at the profile path it would lock, and write the credential, at the link's target.
+    // This profile was moved and linked back, so its spelling changed and a bootstrap is due.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = bootstrapped(&fx, &a, "a@x.co");
+    let target = fx.dir.path().join("elsewhere").join(a.as_str());
+    fs::create_dir(target.parent().unwrap()).unwrap();
+    fs::rename(&profile, &target).unwrap();
+    symlink(&target, &profile).unwrap();
+    let (item, acct) = fx.item_for_spelling(&fx.spelling_for(&target));
+    let before = dir_tree(&target);
+
+    let err = fx
+        .engine
+        .bootstrap_quiescent(&a, &fx.work_dir("app"))
+        .unwrap_err();
+
+    assert_eq!(err.kind(), "invalid-input", "{err}");
+    assert!(
+        err.to_string().contains(&profile.display().to_string()),
+        "{err}"
+    );
+    assert_eq!(
+        dir_tree(&target),
+        before,
+        "nothing written at the link's target"
+    );
+    assert_eq!(fx.kc.get(&item, &acct), None, "nor under its spelling");
+    assert!(
+        fs::symlink_metadata(&profile)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link stays"
+    );
+    assert_eq!(fx.spawner.specs().len(), 1, "never validated");
+}
+
+#[test]
+fn a_profile_whose_credential_file_links_elsewhere_refuses_the_bootstrap_and_leaves_the_target() {
+    // Controller ruling: the atomic write follows a link at the file, so one to the default
+    // home's credential file would put the vault's account keys there.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = bootstrapped(&fx, &a, "a@x.co");
+    let default = fx.paths().credentials_file;
+    let theirs = credential("b@x.co", "rt-b");
+    fs::write(&default, &theirs).unwrap();
+    let file = profile.join(".credentials.json");
+    fs::remove_file(&file).unwrap();
+    symlink(&default, &file).unwrap();
+    set_needs_bootstrap(&profile);
+    let seeded = seed(&profile);
+
+    let err = fx
+        .engine
+        .bootstrap_quiescent(&a, &fx.work_dir("app"))
+        .unwrap_err();
+
+    let named = fs::canonicalize(&profile)
+        .unwrap()
+        .join(".credentials.json");
+    assert!(
+        err.to_string().contains(&named.display().to_string()),
+        "{err}"
+    );
+    assert!(err.to_string().contains("is a link"), "{err}");
+    assert_eq!(
+        fs::read(&default).unwrap(),
+        theirs,
+        "the link's target is unchanged"
+    );
+    assert_eq!(fs::read_link(&file).unwrap(), default, "the link stays");
+    assert_eq!(seed(&profile), seeded, "nothing recorded");
+    assert_eq!(fx.spawner.specs().len(), 1, "never validated");
 }
 
 #[test]

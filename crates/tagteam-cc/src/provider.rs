@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::http::Http;
 use tagteam_provider::process::{ProcessSpawner, SpawnSpec};
+use tagteam_provider::profile::refuse_linked_credential;
 use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
@@ -635,7 +636,8 @@ impl Provider for ClaudeCode {
     /// 1. a read of its entry, the operation's last read (§9.1);
     /// 2. then the file alone, under its storage-write lock.
     ///
-    /// Releasing the locks ends the operation.
+    /// Releasing the locks ends the operation. A file that is a link refuses first, before any
+    /// lock or read: the write would land wherever it points.
     fn write_profile_credential(
         &self,
         env: &Env,
@@ -645,6 +647,7 @@ impl Provider for ClaudeCode {
     ) -> Result<(), ProviderError> {
         let profile = session::profile_env(env, spelling);
         let paths = CcPaths::resolve(&profile);
+        refuse_linked_credential(&paths.credentials_file)?;
         let held = self.lock_credentials(&profile, guard, self.lock_budget)?;
         let fence = || held.check_owned().map_err(ProviderError::from);
         // The read the storage-write lock's re-read is held to; nothing else uses it.

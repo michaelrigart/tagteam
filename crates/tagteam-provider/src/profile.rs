@@ -87,6 +87,23 @@ pub fn remove_own_file(profile: &Path, name: &str) -> io::Result<()> {
     }
 }
 
+/// §12.3 step 4: a profile's credential file is written only where it is, never through a link.
+/// The atomic write follows a link at the file, so it would put the vault's account keys
+/// wherever the link points, such as the default home's credential file. A link refuses,
+/// naming the file; anything else, nothing included, is the write's to judge.
+pub fn refuse_linked_credential(file: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(file) {
+        Ok(m) if m.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a link, so a session credential written there would land wherever it points; remove the link, then run again",
+                file.display()
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Writes `v` as one of tagteam's own files in `profile`: pretty JSON and a newline, atomic and
 /// 0600 whatever the mode of what it replaces, and `fence` checked right before it is
 /// published. It does not create `profile`.
