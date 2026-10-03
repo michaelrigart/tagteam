@@ -235,17 +235,63 @@ pub(crate) fn locate(env: Env, registry: &ProviderRegistry) -> (RunShell, Env) {
     detect_run_shell(&env, registry)
 }
 
+/// The settings one command runs with (§6.4), and the providers it was read for.
+pub(crate) struct CommandSettings {
+    /// The provider the command acts on. Its own tables came first.
+    pub(crate) provider: ProviderId,
+    /// `default_provider` when this build has it, else claude-code (§13.1, Decision 2).
+    pub(crate) default: ProviderId,
+    pub(crate) settings: Settings,
+    /// The settings warnings, then the CLI's own for a `default_provider` this build lacks.
+    pub(crate) warnings: Vec<String>,
+}
+
+/// §13.1's rule 3 and Decision 2: without `--provider`, a command acts on `default_provider`
+/// when `registered` has it, and on claude-code otherwise, with a warning. `choose` is given that
+/// default and names the provider the command acts on. `default_provider` sits at the top
+/// level, so any provider's read of the file gives it: the file is read for claude-code, and
+/// read again only when `choose` names another provider, whose own tables come first.
+pub(crate) fn command_settings(
+    env: &Env,
+    registered: &dyn Fn(&ProviderId) -> bool,
+    choose: impl FnOnce(&ProviderId) -> ProviderId,
+) -> CommandSettings {
+    let fallback = ProviderId::new(CLAUDE_CODE);
+    let (mut settings, mut warnings) = Settings::load(env, &fallback);
+    let configured = settings.default_provider.clone();
+    let (default, unregistered) = if registered(&configured) {
+        (configured, None)
+    } else {
+        let warning = format!(
+            "{}: `default_provider` names {configured}, which this build does not have; using {CLAUDE_CODE}",
+            settings::config_path(env).display()
+        );
+        (fallback.clone(), Some(warning))
+    };
+    let provider = choose(&default);
+    if provider != fallback {
+        (settings, warnings) = Settings::load(env, &provider);
+    }
+    warnings.extend(unregistered);
+    CommandSettings {
+        provider,
+        default,
+        settings,
+        warnings,
+    }
+}
+
 /// The engine for one command, and the settings warnings for the caller to print (§6.4). The
-/// settings are those of `provider`, the one the command resolves (`--provider`, else the
-/// default): its own tables come first. `env` is the effective environment `locate` returned
-/// with `run_shell`. The HTTP adapter is built on its first request, never before (§13.5), and
-/// the oracle sends through the same one.
+/// settings are those of the provider the command acts on (`flag`, else the default, as
+/// `command_settings` chooses it): its own tables come first. `env` is the effective
+/// environment `locate` returned with `run_shell`. The HTTP adapter is built on its first
+/// request, never before (§13.5), and the oracle sends through the same one.
 fn build_engine(
     ctx: Context,
     registry: ProviderRegistry,
     run_shell: RunShell,
     env: Env,
-    provider: &ProviderId,
+    flag: Option<&ProviderId>,
 ) -> (Engine, Vec<String>) {
     let vault = match ctx.platform {
         Platform::MacOs => Vault::new(Box::new(KeychainVault::new(ctx.keychain))),
@@ -262,8 +308,9 @@ fn build_engine(
             UreqHttp::new()
         })
     }));
-    let default_provider = ProviderId::new(CLAUDE_CODE);
-    let (settings, warnings) = Settings::load(&env, provider);
+    let chosen = command_settings(&env, &|p| registry.get(p).is_some(), |default| {
+        flag.cloned().unwrap_or_else(|| default.clone())
+    });
     let engine = Engine::new(EngineConfig {
         env,
         registry,
@@ -275,13 +322,13 @@ fn build_engine(
         ))),
         clock,
         http,
-        default_provider,
-        settings,
+        default_provider: chosen.default,
+        settings: chosen.settings,
         process: Arc::new(SystemProcessProbe),
         spawner: Arc::new(SystemSpawner),
         run_shell,
     });
-    (engine, warnings)
+    (engine, chosen.warnings)
 }
 
 /// Logs are diagnostics, on stderr: ERROR by default, so a routine command stays quiet (what a
@@ -566,10 +613,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     let (stdout_terminal, no_color_env, force_color_env) =
         (ctx.stdout_terminal, ctx.no_color_env, ctx.force_color_env);
     let provider_flag = cli.provider.map(ProviderId::new);
-    let resolved = provider_flag
-        .clone()
-        .unwrap_or_else(|| ProviderId::new(CLAUDE_CODE));
-    let (engine, warnings) = build_engine(ctx, registry, run_shell, env, &resolved);
+    let (engine, warnings) = build_engine(ctx, registry, run_shell, env, provider_flag.as_ref());
     for w in &warnings {
         let _ = writeln!(io.err, "warning: {w}");
     }
@@ -1699,6 +1743,107 @@ mod tests {
         assert!(!is_set(Some(OsString::new())));
         assert!(is_set(Some("1".into())));
         assert!(is_set(Some("0".into())), "any non-empty value counts");
+    }
+
+    /// A fresh environment under `dir` whose `config.toml` holds `text`.
+    fn env_with_config(dir: &std::path::Path, text: &str) -> Env {
+        let env = Env::for_test(dir);
+        std::fs::create_dir_all(env.config_dir()).unwrap();
+        std::fs::write(settings::config_path(&env), text).unwrap();
+        env
+    }
+
+    fn claude_code_only(p: &ProviderId) -> bool {
+        p.as_str() == CLAUDE_CODE
+    }
+
+    fn and_other(p: &ProviderId) -> bool {
+        [CLAUDE_CODE, "other"].contains(&p.as_str())
+    }
+
+    #[test]
+    fn with_no_settings_file_a_command_acts_on_claude_code_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::for_test(dir.path());
+        let chosen = command_settings(&env, &claude_code_only, |d| d.clone());
+        assert_eq!(
+            (chosen.provider.as_str(), chosen.default.as_str()),
+            (CLAUDE_CODE, CLAUDE_CODE)
+        );
+        assert!(chosen.warnings.is_empty(), "{:?}", chosen.warnings);
+        assert!(!env.config_dir().exists());
+    }
+
+    #[test]
+    fn without_provider_a_command_acts_on_a_registered_default_provider() {
+        // §13.1 rule 3: the default provider's own tables come first (§6.4).
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_config(
+            dir.path(),
+            "default_provider = \"other\"\n[statusline]\nformat = \"{5h}\"\n\
+             [provider.other.statusline]\nformat = \"{7d}\"\n",
+        );
+        let chosen = command_settings(&env, &and_other, |d| d.clone());
+        assert_eq!(
+            (chosen.provider.as_str(), chosen.default.as_str()),
+            ("other", "other")
+        );
+        assert_eq!(chosen.settings.statusline_format, "{7d}");
+        assert!(chosen.warnings.is_empty(), "{:?}", chosen.warnings);
+        // `--provider` still wins, with its own tables; the default stays what it is.
+        let chosen = command_settings(&env, &and_other, |_| ProviderId::new(CLAUDE_CODE));
+        assert_eq!(
+            (chosen.provider.as_str(), chosen.default.as_str()),
+            (CLAUDE_CODE, "other")
+        );
+        assert_eq!(chosen.settings.statusline_format, "{5h}");
+    }
+
+    #[test]
+    fn a_default_provider_this_build_lacks_falls_back_to_claude_code_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_config(
+            dir.path(),
+            "default_provider = \"other\"\n[provider.other.statusline]\nformat = \"{7d}\"\n",
+        );
+        let chosen = command_settings(&env, &claude_code_only, |d| d.clone());
+        assert_eq!(
+            (chosen.provider.as_str(), chosen.default.as_str()),
+            (CLAUDE_CODE, CLAUDE_CODE)
+        );
+        assert_eq!(
+            chosen.settings.statusline_format,
+            settings::DEFAULT_STATUSLINE_FORMAT,
+            "claude-code's tables, not other's"
+        );
+        assert_eq!(
+            chosen.settings.default_provider.as_str(),
+            "other",
+            "the setting itself reads as written"
+        );
+        assert_eq!(
+            chosen.warnings,
+            [format!(
+                "{}: `default_provider` names other, which this build does not have; using claude-code",
+                settings::config_path(&env).display()
+            )]
+        );
+    }
+
+    #[test]
+    fn the_warnings_are_those_of_the_provider_the_command_acts_on_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_config(
+            dir.path(),
+            "[autoswitch]\nthreshold = 5\n[provider.other.autoswitch]\nthreshold = 120\n",
+        );
+        let chosen = command_settings(&env, &and_other, |_| ProviderId::new("other"));
+        assert_eq!(chosen.warnings.len(), 2, "{:?}", chosen.warnings);
+        assert!(chosen.warnings[0].contains("`provider.other.autoswitch.threshold`"));
+        assert!(chosen.warnings[1].contains("`autoswitch.threshold`"));
+        let chosen = command_settings(&env, &and_other, |d| d.clone());
+        assert_eq!(chosen.warnings.len(), 1, "{:?}", chosen.warnings);
+        assert!(chosen.warnings[0].contains("`autoswitch.threshold`"));
     }
 
     #[test]
