@@ -457,4 +457,63 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn a_failing_rotation_disables_the_file_once() {
+        // §14.2: a file that cannot be rotated is disabled for the rest of the process.
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("tagteam.log.1"), "older\n").unwrap();
+        let blocked = d.path().join("tagteam.log.2");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("keep"), "").unwrap();
+        let reports = Arc::new(Mutex::new(0));
+        let seen = Arc::clone(&reports);
+        let file =
+            LogFile::with_limit(d.path().to_path_buf(), 8).on_disable(Box::new(move |_, _| {
+                *seen.lock().unwrap() += 1;
+            }));
+        log(&file, "first line\n"); // over the limit, but nothing has rotated it yet
+        log(&file, "second line\n"); // rotates: `.1` cannot become `.2`
+        assert_eq!(*reports.lock().unwrap(), 1);
+        assert!(file.disabled.load(Ordering::SeqCst));
+        let written = file.writes.load(Ordering::SeqCst);
+        let before = read(&d.path().join(FILE_NAME));
+        log(&file, "third line\n");
+        assert_eq!(*reports.lock().unwrap(), 1, "reported once");
+        assert_eq!(file.writes.load(Ordering::SeqCst), written);
+        assert_eq!(read(&d.path().join(FILE_NAME)), before);
+        assert_eq!(read(&d.path().join("tagteam.log.1")), "older\n");
+    }
+
+    #[test]
+    fn a_disable_callback_may_log_into_the_same_file_without_deadlocking() {
+        // Task 6's `--debug` callback prints through tracing, which reaches this file again.
+        // The file is marked disabled before the callback runs, so the re-entrant line returns
+        // at once instead of waiting for the mutex the disabling call holds.
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("blocker"), "").unwrap();
+        let slot: Arc<std::sync::OnceLock<Arc<LogFile>>> = Arc::default();
+        let calls = Arc::new(Mutex::new(0));
+        let (cb_slot, cb_calls) = (Arc::clone(&slot), Arc::clone(&calls));
+        let file = Arc::new(
+            LogFile::new(d.path().join("blocker/tagteam")).on_disable(Box::new(move |_, _| {
+                *cb_calls.lock().unwrap() += 1;
+                if let Some(file) = cb_slot.get() {
+                    log(file, "from the callback\n");
+                }
+            })),
+        );
+        slot.set(Arc::clone(&file)).ok().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&file);
+        std::thread::spawn(move || {
+            log(&worker, "one\n");
+            done.send(()).ok();
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the disable callback deadlocked on the file it disabled");
+        assert_eq!(*calls.lock().unwrap(), 1);
+        assert!(file.disabled.load(Ordering::SeqCst));
+    }
 }
