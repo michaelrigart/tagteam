@@ -73,6 +73,10 @@ pub enum EngineError {
     InvalidInput(String),
     #[error("no account matches {0:?}")]
     NoSuchAccount(String),
+    /// §6.3: an ID `displaced --purge` was given that names no entry, or that is not a
+    /// displaced ID at all (Decision 12).
+    #[error("no displaced credential matches {0:?}; `tagteam displaced` lists them")]
+    NoSuchDisplaced(String),
     #[error("{input:?} matches several accounts: {}", candidates.join(", "))]
     Ambiguous {
         input: String,
@@ -280,6 +284,7 @@ impl EngineError {
             EngineError::NeedsRelogin { .. } => "relogin-required",
             EngineError::InvalidInput(_) => "invalid-input",
             EngineError::NoSuchAccount(_) => "no-such-account",
+            EngineError::NoSuchDisplaced(_) => "no-such-displaced",
             EngineError::Ambiguous { .. } => "ambiguous-account",
             EngineError::InterruptedSwitch(_) => "interrupted-switch",
             EngineError::RecoveryBlocked { .. } | EngineError::RecoveryMoved { .. } => {
@@ -435,6 +440,10 @@ mod tests {
             ),
             (EngineError::InvalidInput("x".into()), "invalid-input"),
             (EngineError::NoSuchAccount("x".into()), "no-such-account"),
+            (
+                EngineError::NoSuchDisplaced("x".into()),
+                "no-such-displaced",
+            ),
             (
                 EngineError::Ambiguous {
                     input: "x".into(),

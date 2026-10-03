@@ -5,11 +5,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::Value;
 use tagteam_core::{Fingerprint, ProviderId};
-use tagteam_provider::Env;
 use tagteam_provider::atomic::{ensure_private_dir, write_atomic_private};
+use tagteam_provider::{Cancel, Env, FlockGuard};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -41,6 +42,40 @@ pub struct DisplacedEntry {
 pub struct DisplacedList {
     pub dir: PathBuf,
     pub entries: Vec<DisplacedEntry>,
+}
+
+/// The displaced lock (§5, §6.3), relative to the data directory.
+pub const DISPLACED_LOCK: &str = "locks/displaced.lock";
+/// How long the writer and a purge wait for it (§6.3).
+const DISPLACED_WAIT: Duration = Duration::from_secs(5);
+
+/// Takes the displaced lock: a leaf `flock` (§4.3), held around one entry's file and row and
+/// nothing else. Its wait is no cancellation point (Decision 11). `displace` runs inside the
+/// switch's and the gate's critical spans (§14.1), so it waits on a fresh token that nothing
+/// sets; a purge's deletion takes milliseconds.
+fn lock_displaced(env: &Env) -> Result<FlockGuard, EngineError> {
+    Ok(FlockGuard::lock(
+        &env.data_dir().join(DISPLACED_LOCK),
+        DISPLACED_WAIT,
+        &Cancel::new(),
+    )?)
+}
+
+/// Deletes `path` itself, never what a symlink there points to, and verifies that it is gone.
+/// An absent path counts as deleted.
+fn remove_verified(path: &Path) -> Result<(), EngineError> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+        Ok(_) => Err(EngineError::Io(io::Error::other(format!(
+            "{} is still there after it was deleted",
+            path.display()
+        )))),
+    }
 }
 
 /// `^[0-9]{1,19}-[0-9a-f]{12}-[a-z0-9]{6}$` (Decision 12). This is the only form of ID a path is
@@ -113,6 +148,9 @@ fn displaced_files(dir: &Path) -> Result<BTreeSet<String>, EngineError> {
 /// Stashes live credential bytes that are about to be overwritten (§6.3). Forensic and
 /// write-only: always a plain 0600 file, never a Keychain item. The file is written first and
 /// its row second, so a failed insert leaves a file with no row, never a row that names nothing.
+/// Both are written under the displaced lock, so a purge never deletes a file whose row is
+/// still to be inserted. The lock is a leaf (§4.3): the row is a SQLite write, and nothing else
+/// is taken while the lock is held, so the entry is logged once it is released.
 pub(crate) fn displace(
     engine: &Engine,
     provider: &ProviderId,
@@ -121,19 +159,23 @@ pub(crate) fn displace(
     reason: &str,
     identity: Option<&Value>,
 ) -> Result<String, EngineError> {
-    let dir = displaced_dir(engine.env());
-    ensure_private_dir(&dir)?;
+    let env = engine.env();
+    let dir = displaced_dir(env);
     let now = engine.now_ms();
     let id = new_id(now, fp);
-    write_atomic_private(&dir.join(format!("{id}.json")), bytes, 0o600)?;
-    engine.store()?.insert_displaced(&DisplacedRow {
-        id: id.clone(),
-        provider: provider.clone(),
-        at: now,
-        reason: reason.to_owned(),
-        fingerprint: fp.map(|f| f.as_str().to_owned()).unwrap_or_default(),
-        identity: identity.cloned(),
-    })?;
+    {
+        let _lock = lock_displaced(env)?;
+        ensure_private_dir(&dir)?;
+        write_atomic_private(&dir.join(format!("{id}.json")), bytes, 0o600)?;
+        engine.store()?.insert_displaced(&DisplacedRow {
+            id: id.clone(),
+            provider: provider.clone(),
+            at: now,
+            reason: reason.to_owned(),
+            fingerprint: fp.map(|f| f.as_str().to_owned()).unwrap_or_default(),
+            identity: identity.cloned(),
+        })?;
+    }
     // The entry's own ID, never the identity it was attributed to (§14.2).
     tracing::info!(
         provider = %provider,
@@ -210,6 +252,54 @@ impl Engine {
                 _ => true,
             })
             .map(|row| row.position))
+    }
+
+    /// The entries `ids` names, each once, in the order given (§6.3). Every ID is checked
+    /// before anything is deleted. Each must be a displaced ID (Decision 12), which is checked
+    /// before any path is built from it, and must name a file or a row. All the forms are
+    /// checked before any presence. The first ID that fails is `NoSuchDisplaced`. This reads
+    /// only, under no lock, and creates nothing (§5).
+    pub fn known_displaced(&self, ids: &[String]) -> Result<Vec<String>, EngineError> {
+        if let Some(bad) = ids.iter().find(|id| !is_displaced_id(id)) {
+            return Err(EngineError::NoSuchDisplaced(bad.clone()));
+        }
+        let mut present = displaced_files(&displaced_dir(&self.env))?;
+        if let Some(store) = self.existing_store()? {
+            present.extend(store.displaced_rows()?.into_iter().map(|r| r.id));
+        }
+        let mut known: Vec<String> = Vec::with_capacity(ids.len());
+        for id in ids {
+            if !present.contains(id) {
+                return Err(EngineError::NoSuchDisplaced(id.clone()));
+            }
+            if !known.contains(id) {
+                known.push(id.clone());
+            }
+        }
+        Ok(known)
+    }
+
+    /// `displaced --purge` (§6.3): deletes the entries `ids` names, once each, after
+    /// `known_displaced` has checked every one, so an unknown ID deletes nothing. Each
+    /// deletion holds the displaced lock: the file first, verified gone, then the row. Returns
+    /// the IDs, each once, in the order given.
+    pub fn purge_displaced(&self, ids: &[String]) -> Result<Vec<String>, EngineError> {
+        let ids = self.known_displaced(ids)?;
+        let dir = displaced_dir(&self.env);
+        for id in &ids {
+            {
+                let _lock = lock_displaced(&self.env)?;
+                remove_verified(&dir.join(format!("{id}.json")))?;
+                // The store is opened under the lock. A writer that created the store while
+                // this purge waited has finished its row by then.
+                if let Some(store) = self.existing_store()? {
+                    store.delete_displaced(id)?;
+                }
+            }
+            // Once the lock is released (§4.3): the entry's own ID (§14.2).
+            tracing::info!(displaced = %id, "deleted a displaced credential");
+        }
+        Ok(ids)
     }
 }
 
