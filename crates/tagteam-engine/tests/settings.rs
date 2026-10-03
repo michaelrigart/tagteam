@@ -1704,30 +1704,45 @@ fn every_refusal_says_what_the_value_must_be() {
     }
 }
 
+/// One command-line sample per registry key, in the registry's order.
+const SAMPLES: [(&str, &str); 13] = [
+    ("default_provider", "fake-agent"),
+    ("autoswitch.threshold", "75.5"),
+    ("autoswitch.interval_seconds", "120"),
+    ("autoswitch.cooldown_seconds", "0"),
+    ("autoswitch.hysteresis_pct", "12.25"),
+    ("autoswitch.strategy", "consume-first"),
+    ("autoswitch.include_api_key_accounts", "yes"),
+    ("autoswitch.unhealthy_ticks", "100"),
+    ("autoswitch.models", "Fable, Opus"),
+    ("usage.history_retention_days", "3650"),
+    ("statusline.format", "{account} {5h}%"),
+    ("run.share_extra", ""),
+    ("ui.color", "always"),
+];
+
+/// A `config.toml` holding `value` at `key`'s global spot, written as `Value::to_item` stores it.
+fn written(key: &Key, value: &Value) -> String {
+    let mut doc = toml_edit::DocumentMut::new();
+    match key.table() {
+        Some(table) => {
+            doc[table] = toml_edit::table();
+            doc[table][key.leaf()] = value.to_item();
+        }
+        None => doc[key.leaf()] = value.to_item(),
+    }
+    doc.to_string()
+}
+
 #[test]
 fn a_value_survives_the_command_line_and_the_file_unchanged() {
     // What `config get` prints, `config set` takes back; what a write stores, a read reads back.
-    let samples = [
-        ("default_provider", "fake-agent"),
-        ("autoswitch.threshold", "75.5"),
-        ("autoswitch.interval_seconds", "120"),
-        ("autoswitch.cooldown_seconds", "0"),
-        ("autoswitch.hysteresis_pct", "12.25"),
-        ("autoswitch.strategy", "consume-first"),
-        ("autoswitch.include_api_key_accounts", "yes"),
-        ("autoswitch.unhealthy_ticks", "100"),
-        ("autoswitch.models", "Fable, Opus"),
-        ("usage.history_retention_days", "3650"),
-        ("statusline.format", "{account} {5h}%"),
-        ("run.share_extra", ""),
-        ("ui.color", "always"),
-    ];
     assert_eq!(
-        samples.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        SAMPLES.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
         KEYS.iter().map(|k| k.name).collect::<Vec<_>>(),
         "one sample per key"
     );
-    for (name, raw) in samples {
+    for (name, raw) in SAMPLES {
         let key = reg(name);
         let value = key.parse_arg(raw).unwrap();
         assert_eq!(key.parse_arg(&value.display()), Ok(value.clone()), "{name}");
@@ -1739,6 +1754,53 @@ fn a_value_survives_the_command_line_and_the_file_unchanged() {
         );
         assert!(details.is_empty(), "{name}: {details:?}");
     }
+}
+
+#[test]
+fn every_key_s_written_value_is_stored_in_the_settings_it_loads_into() {
+    // `Settings::apply` has an arm per key, and a key without one would panic in every command:
+    // a written value must come back out of `Settings::load`, whatever its kind.
+    for (name, raw) in SAMPLES {
+        let key = reg(name);
+        let value = key.parse_arg(raw).unwrap();
+        let text = written(key, &value);
+        let dir = tempfile::tempdir().unwrap();
+        let env = Env::for_test(dir.path());
+        fs::create_dir_all(env.config_dir()).unwrap();
+        fs::write(settings::config_path(&env), &text).unwrap();
+        let provider = ProviderId::new(PROVIDER);
+        let (loaded, warnings) = Settings::load(&env, &provider);
+        assert!(warnings.is_empty(), "{name}: {text:?}: {warnings:?}");
+        assert_eq!(loaded.value(key), value, "{name}: {text:?}");
+        let i = inspect(&env, &provider);
+        let s = state(&i, name);
+        assert_eq!((&s.value, s.source), (&value, Source::Global), "{name}");
+    }
+}
+
+#[test]
+fn every_spelling_a_choice_key_declares_reads_back_as_itself() {
+    // `apply` falls back to a default for a spelling it does not know; no declared one may.
+    let mut spellings = 0;
+    for key in KEYS {
+        let KeyKind::Choice(values) = key.kind else {
+            continue;
+        };
+        for &spelling in values {
+            spellings += 1;
+            let value = Value::Str(spelling.to_owned());
+            let text = written(key, &value);
+            let (loaded, warnings) = load(&text);
+            assert!(
+                warnings.is_empty(),
+                "{}: {spelling}: {warnings:?}",
+                key.name
+            );
+            assert_eq!(loaded.value(key), value, "{}: {spelling}", key.name);
+            assert_eq!(key.parse_arg(spelling), Ok(value), "{}", key.name);
+        }
+    }
+    assert_eq!(spellings, 5, "strategy has two, colour three");
 }
 
 #[test]
