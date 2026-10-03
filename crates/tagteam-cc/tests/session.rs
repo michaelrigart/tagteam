@@ -1366,3 +1366,363 @@ mod seed_and_merge_back {
         );
     }
 }
+
+mod profile_credential {
+    //! §12.3 step 4: the bootstrap's credential, composed from the vault and the profile's own
+    //! credential, written to `<profile>/.credentials.json` alone.
+
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use serde_json::Value;
+    use tagteam_provider::{KeychainError, LockState, MutationGuard};
+
+    /// The vault's current generation: account-scoped keys, an unknown sibling among them
+    /// (Appendix A.4), and machine-shared keys from another home that a profile must never get.
+    fn vault() -> Vec<u8> {
+        json!({
+            "claudeAiOauth": {"accessToken": "at-v", "refreshToken": "rt-v", "expiresAt": 9},
+            "trustedDeviceToken": "device-v",
+            "designOauth": {"t": "v"},
+            "mcpOAuth": {"srv": {"token": "stale-from-another-home"}},
+            "pluginSecrets": {"p": "stale"}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// The vault's account-scoped keys alone.
+    fn account_keys() -> Value {
+        json!({
+            "claudeAiOauth": {"accessToken": "at-v", "refreshToken": "rt-v", "expiresAt": 9},
+            "trustedDeviceToken": "device-v",
+            "designOauth": {"t": "v"}
+        })
+    }
+
+    /// The profile's own credential: an older generation, and its own MCP token.
+    fn profile_cred(mcp: &str) -> Vec<u8> {
+        json!({
+            "claudeAiOauth": {"accessToken": "at-p", "refreshToken": "rt-p"},
+            "trustedDeviceToken": "device-p",
+            "mcpOAuth": {"srv": {"token": mcp}}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn parsed(b: &[u8]) -> Value {
+        serde_json::from_slice(b).unwrap()
+    }
+
+    fn guard(f: &Fx) -> MutationGuard {
+        MutationGuard::acquire(&f.env, Duration::from_secs(1)).unwrap()
+    }
+
+    /// Every Keychain call, and whether each watched lock directory was held at that moment.
+    struct CallLog {
+        inner: Arc<FakeKeychain>,
+        watch: Mutex<Vec<PathBuf>>,
+        calls: Mutex<Vec<(&'static str, String, Vec<bool>)>>,
+    }
+
+    impl CallLog {
+        fn record(&self, op: &'static str, svc: &str) {
+            let held = self
+                .watch
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|p| p.is_dir())
+                .collect();
+            self.calls.lock().unwrap().push((op, svc.to_owned(), held));
+        }
+    }
+
+    impl Keychain for CallLog {
+        fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
+            self.record("find", s);
+            self.inner.find(s, a)
+        }
+        fn exists(&self, s: &str, a: &str) -> Read<()> {
+            self.record("exists", s);
+            self.inner.exists(s, a)
+        }
+        fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), KeychainError> {
+            self.record("upsert", s);
+            self.inner.upsert(s, a, d)
+        }
+        fn delete(&self, s: &str, a: &str) -> Result<(), KeychainError> {
+            self.record("delete", s);
+            self.inner.delete(s, a)
+        }
+        fn lock_state(&self) -> LockState {
+            self.inner.lock_state()
+        }
+        fn unlock(&self) -> bool {
+            self.inner.unlock()
+        }
+    }
+
+    /// A fixture whose Claude Code logs every Keychain call it makes.
+    fn logged(platform: Platform) -> (Fx, Arc<CallLog>) {
+        let f = fx_on(platform);
+        let log = Arc::new(CallLog {
+            inner: f.kc.clone(),
+            watch: Mutex::new(vec![]),
+            calls: Mutex::new(vec![]),
+        });
+        let cc = ClaudeCode::with_store(
+            LiveStore::new(log.clone(), platform).with_retry_delay(Duration::ZERO),
+        );
+        (Fx { cc, ..f }, log)
+    }
+
+    #[test]
+    fn a_new_profile_gets_the_vault_s_account_keys_and_no_machine_shared_ones() {
+        let f = fx();
+        let out = f.cc.compose_profile_credential(&vault(), None).unwrap();
+        assert_eq!(
+            parsed(&out),
+            account_keys(),
+            "the vault's stale MCP keys never reach it"
+        );
+    }
+
+    #[test]
+    fn an_existing_profile_keeps_its_own_machine_shared_keys_and_their_absence() {
+        let f = fx();
+        let own = profile_cred("profile-mcp");
+        let out = parsed(
+            &f.cc
+                .compose_profile_credential(&vault(), Some(&own))
+                .unwrap(),
+        );
+        let mut want = account_keys();
+        want["mcpOAuth"] = json!({"srv": {"token": "profile-mcp"}});
+        assert_eq!(
+            out, want,
+            "the profile's MCP token, and no pluginSecrets, which the profile does not hold"
+        );
+    }
+
+    #[test]
+    fn a_credential_that_is_not_a_json_object_is_refused() {
+        let f = fx();
+        let v = vault();
+        for (vault, profile) in [
+            (&b"not json"[..], None),
+            (&v[..], Some(&b"[1]"[..])),
+            (&v[..], Some(&b""[..])),
+        ] {
+            assert!(matches!(
+                f.cc.compose_profile_credential(vault, profile),
+                Err(ProviderError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn the_write_takes_the_profile_s_locks_never_the_default_s_and_only_reads_the_keychain() {
+        let (f, log) = logged(Platform::MacOs);
+        let (dir, spelling) = profile(&f, "0192");
+        let acct = keychain_account(&f.env);
+        let item = hashed("Claude Code-credentials", &spelling);
+        let managed = hashed("Claude Code", &spelling);
+        // The profile's own item holds its credential: CC reads it first (§12.3 step 2).
+        f.kc.put(&item, &acct, &profile_cred("item-mcp"));
+        let canonical = PathBuf::from(&spelling);
+        let mut legacy = canonical.clone().into_os_string();
+        legacy.push(".lock");
+        let default = CcPaths::resolve(&f.env);
+        *log.watch.lock().unwrap() = vec![
+            canonical.join(".oauth_refresh.lock"),
+            PathBuf::from(legacy),
+            canonical.join(".storage-write"),
+            default.refresh_lock.clone(),
+            default.legacy_lock(),
+        ];
+        let bytes =
+            f.cc.compose_profile_credential(&vault(), Some(&profile_cred("item-mcp")))
+                .unwrap();
+
+        f.cc.write_profile_credential(&f.env, &spelling, &guard(&f), &bytes)
+            .unwrap();
+
+        let file = dir.join(".credentials.json");
+        assert_eq!(parsed(&fs::read(&file).unwrap()), parsed(&bytes));
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(
+            f.kc.get(&item, &acct).unwrap(),
+            profile_cred("item-mcp"),
+            "the profile's item is left for step 5 to delete"
+        );
+        assert_eq!(f.kc.items().len(), 1, "no item was created");
+        let calls = log.calls.lock().unwrap().clone();
+        let (last, earlier) = calls.split_last().expect("the entry was read");
+        for (op, svc, held) in &calls {
+            assert_eq!(*op, "find", "the Keychain is only ever read: {calls:?}");
+            assert!(
+                svc == &item || svc == &managed,
+                "only the profile's items: {svc}"
+            );
+            assert_eq!(
+                held[..2],
+                [true, true],
+                "under the profile's credential locks: {svc}"
+            );
+            assert_eq!(held[3..], [false, false], "never the default home's: {svc}");
+        }
+        assert_eq!(
+            (last.1.as_str(), last.2[2]),
+            (item.as_str(), true),
+            "the last read is the re-read under the storage-write lock"
+        );
+        assert!(
+            earlier.iter().all(|c| !c.2[2]),
+            "which is held for the write alone"
+        );
+        for lock in log.watch.lock().unwrap().iter() {
+            assert!(!lock.exists(), "{} is released", lock.display());
+        }
+    }
+
+    #[test]
+    fn on_linux_the_write_is_the_file_alone_at_0600() {
+        let (f, log) = logged(Platform::Linux);
+        let (dir, spelling) = profile(&f, "0192");
+        let file = dir.join(".credentials.json");
+        fs::write(&file, profile_cred("old")).unwrap();
+        fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        let bytes =
+            f.cc.compose_profile_credential(&vault(), Some(&profile_cred("old")))
+                .unwrap();
+
+        f.cc.write_profile_credential(&f.env, &spelling, &guard(&f), &bytes)
+            .unwrap();
+
+        assert_eq!(parsed(&fs::read(&file).unwrap()), parsed(&bytes));
+        assert_eq!(mode(&file), 0o600, "a secret file is 0600, whatever it was");
+        assert!(
+            log.calls.lock().unwrap().is_empty(),
+            "no Keychain call at all"
+        );
+    }
+
+    #[test]
+    fn an_mcp_token_cc_wrote_since_the_composition_is_kept() {
+        let f = fx_on(Platform::Linux);
+        let (dir, spelling) = profile(&f, "0192");
+        let file = dir.join(".credentials.json");
+        fs::write(&file, profile_cred("mcp-1")).unwrap();
+        let bytes =
+            f.cc.compose_profile_credential(&vault(), Some(&profile_cred("mcp-1")))
+                .unwrap();
+        // CC refreshes an MCP token in the profile between the read and the write (§9.1).
+        fs::write(&file, profile_cred("mcp-2")).unwrap();
+
+        f.cc.write_profile_credential(&f.env, &spelling, &guard(&f), &bytes)
+            .unwrap();
+
+        let out = parsed(&fs::read(&file).unwrap());
+        assert_eq!(out["mcpOAuth"], json!({"srv": {"token": "mcp-2"}}));
+        assert_eq!(out["claudeAiOauth"]["refreshToken"], json!("rt-v"));
+    }
+
+    #[test]
+    fn the_write_waits_for_cc_s_storage_write_lock_in_the_profile() {
+        let f = fx();
+        let (dir, spelling) = profile(&f, "0192");
+        let bytes = f.cc.compose_profile_credential(&vault(), None).unwrap();
+        let cc_writing = hold(&dir.join(".storage-write"), 300);
+        let start = Instant::now();
+
+        f.cc.write_profile_credential(&f.env, &spelling, &guard(&f), &bytes)
+            .unwrap();
+
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        cc_writing.join().unwrap();
+        assert_eq!(
+            parsed(&fs::read(dir.join(".credentials.json")).unwrap()),
+            account_keys()
+        );
+    }
+
+    #[test]
+    fn a_held_default_home_lock_never_delays_the_write() {
+        let f = fx();
+        let (_dir, spelling) = profile(&f, "0192");
+        let default = CcPaths::resolve(&f.env);
+        for lock in [
+            default.refresh_lock.clone(),
+            default.legacy_lock(),
+            default.config_lock.clone(),
+            default.storage_write_lock.clone(),
+        ] {
+            fs::create_dir(lock).unwrap();
+        }
+        let bytes = f.cc.compose_profile_credential(&vault(), None).unwrap();
+        let start = Instant::now();
+
+        f.cc.write_profile_credential(&f.env, &spelling, &guard(&f), &bytes)
+            .unwrap();
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_entry_absent_at_the_read_and_under_the_lock_keeps_the_composed_machine_shared_keys() {
+        // Decision 22: Claude Code wrote nothing there, so there is nothing to rebase from. After
+        // a move, the keys came from the old spelling's item, the only copy left.
+        for platform in [Platform::MacOs, Platform::Linux] {
+            let f = fx_on(platform);
+            let (dir, spelling) = profile(&f, "0192");
+            let bytes =
+                f.cc.compose_profile_credential(&vault(), Some(&profile_cred("old-item-mcp")))
+                    .unwrap();
+
+            f.cc.write_profile_credential(&f.env, &spelling, &guard(&f), &bytes)
+                .unwrap();
+
+            let out = parsed(&fs::read(dir.join(".credentials.json")).unwrap());
+            assert_eq!(
+                out["mcpOAuth"],
+                json!({"srv": {"token": "old-item-mcp"}}),
+                "{platform:?}"
+            );
+            assert_eq!(
+                out["claudeAiOauth"]["refreshToken"],
+                json!("rt-v"),
+                "{platform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_present_under_the_lock_still_rebases_its_machine_shared_keys_and_their_absence() {
+        // §9.1: the keys the entry holds now win over the composed ones, absence included.
+        let f = fx_on(Platform::Linux);
+        let (dir, spelling) = profile(&f, "0192");
+        let file = dir.join(".credentials.json");
+        fs::write(&file, account_keys().to_string()).unwrap();
+        let bytes =
+            f.cc.compose_profile_credential(&vault(), Some(&profile_cred("composed-mcp")))
+                .unwrap();
+
+        f.cc.write_profile_credential(&f.env, &spelling, &guard(&f), &bytes)
+            .unwrap();
+
+        let out = parsed(&fs::read(&file).unwrap());
+        assert_eq!(
+            out.get("mcpOAuth"),
+            None,
+            "the entry holds none, so none are written"
+        );
+        assert_eq!(out, account_keys());
+    }
+}
