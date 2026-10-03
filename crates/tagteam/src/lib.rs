@@ -46,6 +46,19 @@ fn without_argument_values(e: clap::Error) -> clap::Error {
     safe
 }
 
+/// The status bar's own call: `statusline` printing its line (§13.5). Only this call drains
+/// stdin, and only this call answers an unusable `HOME` with silence (§5), because a status bar
+/// has nowhere to show an error. `--print-config` and the refused `--json` print text that a
+/// person reads.
+fn status_bar_line(cli: &cli::Cli) -> bool {
+    matches!(
+        cli.command,
+        Some(cli::Command::Statusline {
+            print_config: false
+        })
+    ) && !cli.json
+}
+
 /// Runs the CLI and returns the process exit code.
 pub fn main_with_args<I, T>(args: I) -> i32
 where
@@ -85,17 +98,25 @@ where
     // and must never read the test runner's stdin. Only a line that will be printed needs it:
     // `--print-config` and the refused `--json` return without Claude Code's JSON ever being
     // read, so a pipe that never closes must not hang them.
-    if matches!(
-        cli.command,
-        Some(cli::Command::Statusline {
-            print_config: false
-        })
-    ) && !cli.json
-    {
+    if status_bar_line(&cli) {
         let stdin = std::io::stdin();
         statusline::drain(stdin.lock(), stdin.is_terminal());
     }
-    let ctx = app::Context::from_process();
+    // §5: every default path derives from `HOME`, so an unusable one refuses the command here,
+    // before any engine exists, and nothing is created under `/` or the working directory.
+    let ctx = match app::Context::from_process() {
+        Ok(ctx) => ctx,
+        Err(_) if status_bar_line(&cli) => return 0,
+        Err(e) => {
+            if cli.json {
+                let error = app::error_json(e.kind(), &e.to_string());
+                let _ = writeln!(std::io::stdout(), "{error}");
+            } else {
+                let _ = writeln!(std::io::stderr(), "tagteam: {e}");
+            }
+            return app::EXIT_ERROR;
+        }
+    };
     // §14.1, at the process boundary like the drain above: in-process tests drive `run` with
     // tokens of their own, and must never change the test runner's signal dispositions. After
     // the drain, so a status bar command stuck on a pipe that never closes still dies on

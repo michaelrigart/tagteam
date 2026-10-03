@@ -28,7 +28,7 @@ use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::{SpawnSpec, SystemSpawner, exec_command};
 use tagteam_provider::profile::RunShell;
 use tagteam_provider::security::SecurityCli;
-use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
+use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, SystemClock};
 
 use crate::auto::{
     AutoError, AutoFlags, AutoRun, HumanSink, JsonSink, ThreadSleeper, uniform_jitter,
@@ -145,10 +145,13 @@ fn test_overrides(_var: &dyn Fn(&str) -> Option<OsString>) -> Overrides {
 }
 
 impl Context {
-    pub fn from_process() -> Self {
+    /// The binary's context, read from the process. Fails when `HOME` cannot place tagteam's
+    /// files (§5), before anything else is read.
+    pub fn from_process() -> Result<Self, EnvError> {
+        let env = Env::from_process()?;
         let o = test_overrides(&|k| std::env::var_os(k));
         let mut ctx = Self {
-            env: Env::from_process(),
+            env,
             keychain: o.keychain.unwrap_or_else(|| Arc::new(SecurityCli::new())),
             platform: o.platform.unwrap_or_else(Platform::current),
             api_base: o.api_base,
@@ -170,7 +173,7 @@ impl Context {
                 ctx.env.vars.insert(name, OsString::new());
             }
         }
-        ctx
+        Ok(ctx)
     }
 }
 
