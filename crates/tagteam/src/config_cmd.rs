@@ -1,4 +1,5 @@
-//! `tagteam config list|get|path` (§6.4): the human and JSON forms of what `settings` reads.
+//! `tagteam config` (§6.4): the human and JSON forms of what `settings` reads and of what
+//! `set` and `unset` change.
 
 use std::path::Path;
 
