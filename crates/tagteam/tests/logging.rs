@@ -375,7 +375,14 @@ const BRAVO_AT_ROTATED: &str = "zqat-bravo-rotated-Fy3nVq6kWp8zXm2r";
 const API_KEY: &str = "sk-ant-api03-zqkey-Rw8pXk3mQz7vTn2sLy5h";
 const SETUP_TOKEN: &str = "sk-ant-oat01-zqsetup-Mx6kPw2zRq9vTs4nLy7j";
 /// No line holds one of these whole.
-const IDENTITIES: [&str; 5] = [ALPHA_EMAIL, BRAVO_EMAIL, KEY_EMAIL, SETUP_EMAIL, ORG_NAME];
+const IDENTITIES: [&str; 6] = [
+    ALPHA_EMAIL,
+    BRAVO_EMAIL,
+    KEY_EMAIL,
+    SETUP_EMAIL,
+    ORG_NAME,
+    ORG_UUID,
+];
 /// No line holds 13 consecutive characters of one of these.
 const SECRETS: [&str; 10] = [
     ALPHA_RT,

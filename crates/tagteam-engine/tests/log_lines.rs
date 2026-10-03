@@ -82,6 +82,7 @@ fn an_add_logs_the_generation_it_stored_and_its_event() {
         "{event}"
     );
     no_email(&logs);
+    no_token(&logs);
 }
 
 #[test]
@@ -111,6 +112,7 @@ fn a_switch_logs_its_event_naming_both_accounts() {
         "{event}"
     );
     no_email(&logs);
+    no_token(&logs);
 }
 
 #[test]
@@ -135,8 +137,8 @@ fn a_rescue_is_logged_by_account_and_fingerprint() {
         fp.len() == 12 && fp.bytes().all(|b| b.is_ascii_hexdigit()),
         "{line}"
     );
-    assert!(logs.iter().all(|l| !l.contains("rt-a2")), "{logs:#?}");
     no_email(&logs);
+    no_token(&logs);
 }
 
 #[test]
@@ -163,11 +165,9 @@ fn a_displacement_is_logged_without_the_login_it_displaced() {
         Some("\"forced-activation\""),
         "{line}"
     );
-    assert!(
-        logs.iter()
-            .all(|l| !l.contains("stranger") && !l.contains("rt-s")),
-        "{logs:#?}"
-    );
+    assert!(logs.iter().all(|l| !l.contains("stranger")), "{logs:#?}");
+    no_email(&logs);
+    no_token(&logs);
 }
 
 #[test]
@@ -199,6 +199,7 @@ fn a_recovery_logs_which_way_it_went() {
             .any(|l| field(l, "kind") == Some("\"switch-recovered\""));
         assert_eq!(recovered, landed, "{logs:#?}");
         no_email(&logs);
+        no_token(&logs);
     }
 }
 
@@ -222,6 +223,7 @@ fn an_unverified_capture_names_the_account_by_id_and_position() {
         found[0]
     );
     no_email(&logs);
+    no_token(&logs);
 }
 
 /// The lines one gate call on `id` logs, with the vault's bytes as the caller's snapshot.
@@ -246,10 +248,12 @@ fn only<'a>(logs: &'a [String], message: &str) -> &'a str {
     found[0]
 }
 
-/// No line holds any part of the fixture's tokens: `rt-a…` and `at-rt-a…`.
+/// No line holds any part of the fixtures' tokens: refresh tokens are `rt-…` and access
+/// tokens `at-…` (`at-rt-a2`, `at-same`).
 fn no_token(logs: &[String]) {
     assert!(
-        logs.iter().all(|l| !l.contains("rt-a")),
+        logs.iter()
+            .all(|l| !l.contains("rt-") && !l.contains("at-")),
         "a token was logged: {logs:#?}"
     );
 }
@@ -355,6 +359,7 @@ fn an_active_token_refresh_logs_its_outcome_by_provider_and_account() {
         [Some("claude-code"), Some(a.as_str()), Some("\"refreshed\"")],
         "{line}"
     );
+    no_email(&logs);
     no_token(&logs);
 
     let (out, logs) = capture_logs(|| {
@@ -366,6 +371,8 @@ fn an_active_token_refresh_logs_its_outcome_by_provider_and_account() {
     let line = only(&logs, active);
     assert!(line.starts_with("DEBUG"), "{line}");
     assert_eq!(field(line, "outcome"), Some("\"not-needed\""), "{line}");
+    no_email(&logs);
+    no_token(&logs);
 }
 
 #[test]
@@ -447,6 +454,7 @@ mod hooks {
             "the cause's text: {logs:#?}"
         );
         no_email(&logs);
+        no_token(&logs);
     }
 
     #[test]
@@ -484,5 +492,6 @@ mod hooks {
             "the cause's text: {logs:#?}"
         );
         no_email(&logs);
+        no_token(&logs);
     }
 }
