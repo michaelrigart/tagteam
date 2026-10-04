@@ -115,15 +115,36 @@ fn unreadable_state(profile: &Path, detail: String) -> SessionState {
 
 impl Engine {
     /// §12.5: reservations (any `Held`) and session records (`record_is_live`, any `Unreadable`).
-    ///
-    /// The profile is `profile_path(env, id)` (§5). A held reservation, then a live record,
-    /// makes the account `Owned`; failing that, anything that could not be read makes it
-    /// `Unreadable`. Every I/O failure is a state, never an error. A provider without
-    /// `sessions` has no profiles, and nothing on disk is touched for it.
     pub fn session_state(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
+    ) -> Result<SessionState, EngineError> {
+        self.session_state_leaving_out(p, row, None)
+    }
+
+    /// `session_state`, with `own` left out: this process's own launch reservation, as §12.5
+    /// "When the child exits" asks whether the profile is quiescent apart from it. It is
+    /// matched by file name inside `.tagteam-launch/`.
+    pub(crate) fn session_state_apart_from(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        own: &Path,
+    ) -> Result<SessionState, EngineError> {
+        self.session_state_leaving_out(p, row, Some(own))
+    }
+
+    /// The body of both. The profile is `profile_path(env, id)` (§5). A held reservation
+    /// other than `own`, then a live record, makes the account `Owned`; failing that, anything
+    /// that could not be read makes it `Unreadable`. Every I/O failure is a state, never an
+    /// error. A provider without `sessions` has no profiles, and nothing on disk is touched for
+    /// it.
+    fn session_state_leaving_out(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        own: Option<&Path>,
     ) -> Result<SessionState, EngineError> {
         if !p.capabilities().sessions {
             return Ok(SessionState::NoProfile);
@@ -137,9 +158,13 @@ impl Engine {
                 return Ok(unreadable_state(&profile, detail));
             }
         }
+        let is_own = |path: &Path| own.is_some_and(|own| path.file_name() == own.file_name());
         match launch_reservations(&profile) {
             Read::Present(found) => {
-                if found.iter().any(|(_, probe)| *probe == LockProbe::Held) {
+                if found
+                    .iter()
+                    .any(|(path, probe)| *probe == LockProbe::Held && !is_own(path))
+                {
                     return Ok(SessionState::Owned { profile });
                 }
             }

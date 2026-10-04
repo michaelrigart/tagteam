@@ -1,17 +1,17 @@
-//! §12.5 "Launch": a session's start under `MutationGuard` and the account lock (Task 10).
-//! Task 11 adds the per-launch login check and the exit handling.
+//! §12.5 "Launch": a session's start under `MutationGuard` and the account lock (Task 10),
+//! §12.3's per-launch login check, and §12.5's exit handling once `claude` exits (Task 11).
 
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use tagteam_provider::profile::{LAUNCH_DIR, profile_path};
-use tagteam_provider::provider::{MergeReport, SessionEnv};
+use tagteam_provider::profile::{LAUNCH_DIR, Seed, profile_path};
+use tagteam_provider::provider::{MergeReport, SessionEnv, Validity};
 use tagteam_provider::reservation::{LaunchReservation, remove_dead_reservations};
-use tagteam_provider::{MutationGuard, Provider, ReadError};
+use tagteam_provider::{MutationGuard, Provider, Read, ReadError};
 
 use crate::account_lock::AccountLock;
-use crate::bootstrap::{Trigger, refuse_linked_profile};
+use crate::bootstrap::{Trigger, refusal, refuse_linked_profile};
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
@@ -435,6 +435,199 @@ impl Engine {
         );
         self.bootstrap_profile(p, row, profile, cwd, program, guard, lock)?;
         Ok(true)
+    }
+
+    /// §12.3 "Every launch is checked", run after the launch's locks are released, with its
+    /// reservation held, in `cwd`, the directory `claude` will run in, spawning `program`, the
+    /// launch command `plan_run` resolved (Decision 20). A launch that bootstrapped was checked
+    /// under its locks, and skips it. The check's wait is a cancellation point: a signal
+    /// recorded by its end interrupts the launch (§12.5 "Signals"), as
+    /// `Err(EngineError::Interrupted(n))`, read through the token and never through the
+    /// `Validity` text. `valid` launches; `overridden`, `drifted`, `unknown` and `unreachable`
+    /// refuse and keep the profile. `invalid` refuses too, keeps it, and records that the next
+    /// launch bootstraps it. After a refusal the caller runs
+    /// `finish_run(.., LaunchEnd::Refused)`.
+    pub fn check_login(
+        &self,
+        launched: &Launched,
+        program: &Path,
+        cwd: &Path,
+    ) -> Result<(), EngineError> {
+        if launched.bootstrapped {
+            return Ok(());
+        }
+        let row = &launched.account;
+        let p = self.provider(&row.provider)?;
+        let identity = p.parse_identity(&row.identity_json)?;
+        let validity = p.validate_profile(
+            &self.env,
+            &launched.spelling,
+            cwd,
+            program,
+            &identity,
+            self.spawner.as_ref(),
+            self.cancel(),
+        );
+        if let Some(signal) = self.cancel().requested() {
+            return Err(EngineError::Interrupted(signal));
+        }
+        if matches!(validity, Validity::Invalid(_)) {
+            self.mark_needs_bootstrap(row, &launched.profile);
+        }
+        refusal(row, validity).map_or(Ok(()), Err)
+    }
+
+    /// §12.3: an `invalid` login outside a bootstrap keeps the profile and marks it for the
+    /// next launch to bootstrap. The reservation this launch holds keeps every other seed writer
+    /// away (each needs a quiescent profile), so no lock is taken. With no seed, the next launch
+    /// bootstraps anyway. A seed that cannot be written is logged: the next check finds the
+    /// same `invalid`.
+    fn mark_needs_bootstrap(&self, row: &AccountRow, profile: &Path) {
+        let result = match Seed::read(profile) {
+            Read::Present(seed) => Seed {
+                needs_bootstrap: true,
+                ..seed
+            }
+            .write(profile)
+            .map_err(EngineError::from),
+            Read::Absent => Ok(()),
+            Read::Unreadable(e) => Err(EngineError::Unreadable(e)),
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                "could not mark the session profile for a bootstrap: {e}"
+            );
+        }
+    }
+
+    /// §12.5 "When the child exits": capture and merge-back when last out, then the unlink.
+    /// Returns the notices to print; never changes the exit code (B.63).
+    ///
+    /// It runs under `MutationGuard` (30 s, as a launch) and the account lock, whose waits are
+    /// its cancellation points. `end` changes nothing: a launch refused after its reservation
+    /// exists is handled as if `claude` had exited at once (§12.3). A failed or cancelled step
+    /// gives one notice. What it left is completed by lazy capture and the next launch, which
+    /// loses nothing (§12.5 "Signals").
+    pub fn finish_run(&self, launched: Launched, end: LaunchEnd) -> Vec<String> {
+        let (position, id) = (launched.account.position, launched.account.id.clone());
+        tracing::debug!(position, account = %id, ?end, "the session ended; exit handling starts");
+        let mut notices = Vec::new();
+        if let Err(e) = self.finish_locked(launched, &mut notices) {
+            tracing::warn!(position, account = %id, "exit handling did not finish: {e}");
+            notices.push(format!(
+                "exit handling for position {position} did not finish ({e}); nothing is lost: the next launch, switch or refresh of the account completes it"
+            ));
+        }
+        notices
+    }
+
+    /// `finish_run`'s work. Without the locks, the reservation is left as it is: it dies with
+    /// this process, and the next launch removes it (§12.5 step 2). Once both are held, every
+    /// step runs that can, the unlink last whatever failed before it (R11.2), and the first
+    /// failure is returned. An unlink that fails after an earlier failure is logged.
+    fn finish_locked(
+        &self,
+        launched: Launched,
+        notices: &mut Vec<String>,
+    ) -> Result<(), EngineError> {
+        let Launched {
+            account,
+            profile,
+            reservation,
+            ..
+        } = launched;
+        let p = self.provider(&account.provider)?;
+        let p = p.as_ref();
+        hooks::point(self, "exit-before-locks")?;
+        let guard = MutationGuard::acquire(&self.env, MutationGuard::BOOTSTRAP_TIMEOUT)?;
+        let lock = self.lock_account(&account.id)?;
+        let own = reservation.path().to_path_buf();
+        let failed = self
+            .exit_under_locks(p, &account, &profile, &own, &lock, notices)
+            .err();
+        // Last, in either case.
+        let unlinked = reservation.unlink().map_err(|e| reservation_io(&own, e));
+        drop(lock);
+        drop(guard);
+        match (failed, unlinked) {
+            (Some(first), Err(unlink)) => {
+                tracing::warn!(
+                    position = account.position,
+                    account = %account.id,
+                    "the launch reservation could not be unlinked either: {unlink}"
+                );
+                Err(first)
+            }
+            (Some(first), Ok(())) => Err(first),
+            (None, unlinked) => unlinked,
+        }
+    }
+
+    /// Exit handling's steps under both locks, before the unlink. When the profile is quiescent
+    /// apart from `own`, this process's reservation, it captures a rotation through the
+    /// profile's provenance, under the account lock with no network (§6.2), then merges the
+    /// profile's config back from a waiting baseline. Otherwise another session still runs (a
+    /// `run`, or a `bg` or `daemon` record, §12.6), and nothing is done. A failed capture does
+    /// not stop the merge-back; the first failure is returned. A provenance `Conflict` or
+    /// `Unreadable` counts as one: nothing is captured, and the next launch refuses or aborts.
+    fn exit_under_locks(
+        &self,
+        p: &dyn Provider,
+        launched: &AccountRow,
+        profile: &Path,
+        own: &Path,
+        lock: &AccountLock,
+        notices: &mut Vec<String>,
+    ) -> Result<(), EngineError> {
+        hooks::point(self, "exit-locked")?;
+        // A session-owned account is never removed (§10.3), so this is a defence only.
+        let Some(row) = self.store()?.account(&launched.id)? else {
+            return Ok(());
+        };
+        match self.session_state_apart_from(p, &row, own)? {
+            SessionState::Quiescent { .. } => {}
+            SessionState::Unreadable { detail, .. } => {
+                tracing::warn!(
+                    position = row.position,
+                    account = %row.id,
+                    "a session reservation or record could not be read ({detail}); the profile counts as in use, so capture and merge-back wait"
+                );
+                return Ok(());
+            }
+            SessionState::Owned { .. } | SessionState::NoProfile => return Ok(()),
+        }
+        let mut failed: Option<EngineError> = None;
+        // 1. Capture: provenance under the account lock, with no network (§6.2).
+        match self.apply_provenance_apart_from(p, &row, lock, own) {
+            Ok(ProfileCheck::Conflict) => {
+                failed = Some(EngineError::ProfileConflict {
+                    position: row.position,
+                    label: row.label.clone(),
+                });
+            }
+            Ok(ProfileCheck::Unreadable(detail)) => {
+                failed = Some(EngineError::Unreadable(ReadError::new(
+                    profile.display().to_string(),
+                    detail,
+                )));
+            }
+            Ok(_) => {}
+            Err(e) => failed = Some(e),
+        }
+        // 2. Merge back, with the default home's config lock taken alone (§4.3), from the
+        //    baseline in the profile's actual directory (Decision 22). A session that joined
+        //    wrote none, and the last one out may have joined.
+        if p.has_baseline(profile) {
+            match p.merge_back(&self.env, profile, self.cancel()) {
+                Ok(report) => notices.extend(merge_summary(&row, &report)),
+                Err(e) => {
+                    failed.get_or_insert(e.into());
+                }
+            }
+        }
+        failed.map_or(Ok(()), Err)
     }
 }
 
