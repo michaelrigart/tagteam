@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -162,6 +163,21 @@ pub enum Command {
         #[arg(long = "print-config")]
         print_config: bool,
     },
+    /// Run the agent as ACCOUNT, in a session beside the default login
+    ///
+    /// With no ACCOUNT, the nearest mapped ancestor of this directory decides (`tagteam map`),
+    /// and with none the agent runs as it would without tagteam. Everything after `--` goes to
+    /// the agent untouched; tagteam's own options, `--json` and `--provider` included, come
+    /// before it. `--json` covers only errors before the agent starts: its output is its own.
+    Run {
+        account: Option<String>,
+        /// Refuse wherever the agent would otherwise run without a session
+        #[arg(long)]
+        require_session: bool,
+        /// Arguments for the agent, after `--`.
+        #[arg(last = true)]
+        args: Vec<OsString>,
+    },
 }
 
 /// `switch --strategy` (§9.3): the strategies that rank accounts by usage.
@@ -200,6 +216,8 @@ impl Command {
     /// Keychain, tri-state, and leaves what it cannot decide to the next command that checks.
     /// `auto` checks before its first tick, a dry run too (§11.1): every tick reads its
     /// accounts' items, and a real one switches.
+    /// `run` checks for itself, and only once it knows it launches a session: plain `claude`
+    /// touches no item, so an unmapped directory never waits on an unlock prompt (§12.7).
     pub fn touches_keychain(&self) -> bool {
         matches!(
             self,

@@ -15,6 +15,7 @@ use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::net::UreqHttp;
 use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::registry::ProviderRegistry;
+use tagteam_engine::run::{RunPlan, RunRequest};
 use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{ColorMode, Settings, parse_bool};
 use tagteam_engine::store::{AccountRow, Mapping, StoreError};
@@ -24,7 +25,7 @@ use tagteam_engine::views::{AccountView, ShellAccount, StatusView};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::http::Http;
 use tagteam_provider::liveness::SystemProcessProbe;
-use tagteam_provider::process::SystemSpawner;
+use tagteam_provider::process::{SpawnSpec, SystemSpawner, exec_command};
 use tagteam_provider::profile::RunShell;
 use tagteam_provider::security::SecurityCli;
 use tagteam_provider::{Clock, Env, Keychain, LockState, SystemClock};
@@ -158,8 +159,17 @@ impl Context {
         // Decision 5: the variables this build's providers asked for, captured here at the
         // process boundary and never in `run`, so a hand-built `Context` carries exactly the
         // `vars` its test set (§15.1). Building the registry touches no Keychain item.
-        let names = session_vars(&build_registry(&ctx));
+        let registry = build_registry(&ctx);
+        let names = session_vars(&registry);
         ctx.env.capture_vars(&names);
+        // Decision 18: which of the variables a session scrubs are set here, for the launch's
+        // warnings (§12.5). Only their presence is kept, never a value: a value may be a login,
+        // and `Env` derives `Debug`.
+        for name in scrubbed_vars(&registry) {
+            if std::env::var_os(&name).is_some() {
+                ctx.env.vars.insert(name, OsString::new());
+            }
+        }
         ctx
     }
 }
@@ -192,6 +202,27 @@ pub(crate) fn session_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
     names.push(CLAUDECODE);
     names.push("PATH");
     names
+}
+
+/// The variables a session of `registry`'s providers scrubs (§12.5), by name: the names whose
+/// presence `Context::from_process` records for the launch's warnings (Decision 18). Claude
+/// Code's `CLAUDE_CODE_*_FILE_DESCRIPTOR` names are among them as this process's environment
+/// holds them, since `session_env` expands the pattern against it. A name that is not UTF-8
+/// cannot be a key of `Env.vars`, so it is left out: it is still scrubbed, without a warning.
+///
+/// Inside a run shell, the run shell's detection rewrites a recorded
+/// `CLAUDE_SECURESTORAGE_CONFIG_DIR` to the outer home's record, or drops it where the outer
+/// home had none, so the launch warns about that variable as the outer home set it. That is
+/// accepted: `run` launches as from the outer home (Decision 13), and the variable names a
+/// directory, never a login.
+pub(crate) fn scrubbed_vars(registry: &ProviderRegistry) -> Vec<String> {
+    registry
+        .all()
+        .iter()
+        .filter(|p| p.capabilities().sessions)
+        .flat_map(|p| p.session_env("").remove)
+        .filter_map(|name| name.into_string().ok())
+        .collect()
 }
 
 /// §12.8: where this process stands. The marker decides the run shell and the environment the
@@ -446,12 +477,15 @@ enum Ended {
     Code(i32),
     /// It stopped at a cancellation point after this signal; nothing is reported yet.
     Interrupted(i32),
+    /// `run`'s child ran and exited with this code (§12.5, B.63). No late notice follows it:
+    /// every signal while the child ran was the child's, and exit handling reports for itself.
+    Child(i32),
 }
 
 /// Runs one command and returns its exit code (§13.1). A signal the command met at a
 /// cancellation point ends it with 128 + the signal and the `interrupted` error (Decision 4);
 /// one it never met leaves its output and exit code alone and is reported on stderr as too
-/// late (Decision 6).
+/// late (Decision 6). `run` ends with its child's code once the child has run.
 pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     let json = cli.json;
     let name = cli.command.as_ref().map_or("list", command_name);
@@ -477,6 +511,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
             }
             code
         }
+        Ended::Child(code) => code,
     }
 }
 
@@ -549,15 +584,30 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
             return Ended::Code(fail(app.io, json, e.kind(), &e.to_string()));
         }
     }
-    // Only a command that touches a Keychain item checks its lock.
-    let unlocked = if command.touches_keychain() {
-        app.lock_check(&command)
-    } else {
-        Ok(())
+    let result = match command {
+        // §12.5: `run` has an end of its own. It checks the Keychain's lock itself, once it
+        // knows it launches a session, and once `claude` has run, its code is the command's.
+        Command::Run {
+            account,
+            require_session,
+            args,
+        } => app
+            .run_agent(account, require_session, args)
+            .map(Ended::Child),
+        command => {
+            // Only a command that touches a Keychain item checks its lock.
+            let unlocked = if command.touches_keychain() {
+                app.lock_check(&command)
+            } else {
+                Ok(())
+            };
+            unlocked
+                .and_then(|()| app.dispatch(command))
+                .map(Ended::Code)
+        }
     };
-    let result = unlocked.and_then(|()| app.dispatch(command));
     match result {
-        Ok(code) => Ended::Code(code),
+        Ok(ended) => ended,
         Err(Failure::Engine(e)) => match e.signal() {
             Some(signal) => Ended::Interrupted(signal),
             None => Ended::Code(fail(app.io, json, e.kind(), &e.to_string())),
@@ -589,6 +639,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ShellInit { .. } => "shell-init",
         Command::Statusline { .. } => "statusline",
         Command::Auto { .. } => "auto",
+        Command::Run { .. } => "run",
     }
 }
 
@@ -1038,6 +1089,7 @@ impl App<'_, '_> {
             Command::Unmap { path } => self.unmap(path)?,
             Command::Statusline { .. } => unreachable!("run answers statusline before dispatch"),
             Command::ShellInit { .. } => unreachable!("run answers shell-init before dispatch"),
+            Command::Run { .. } => unreachable!("run_command answers run before dispatch"),
             Command::Auto {
                 once,
                 dry_run,
@@ -1268,6 +1320,90 @@ impl App<'_, '_> {
         );
         Ok(())
     }
+
+    /// §12.1 and §12.5: `run`. Whatever fails before the launch command starts is the
+    /// command's own error, as the `--json` envelope too. Once `claude` has run, its exit code
+    /// is the command's (B.63).
+    fn run_agent(
+        &mut self,
+        account: Option<String>,
+        require_session: bool,
+        args: Vec<OsString>,
+    ) -> Result<i32, Failure> {
+        let account = match &account {
+            Some(input) => Some(self.resolve(input)?.id),
+            None => None,
+        };
+        let cwd = std::env::current_dir().map_err(EngineError::Io)?;
+        let request = RunRequest {
+            account,
+            provider: self.provider_flag.clone(),
+            require_session,
+            cwd: cwd.clone(),
+            args: args.clone(),
+        };
+        let (account, launch) = match self.engine.plan_run(&request)? {
+            RunPlan::Plain { spec, warning } => return self.run_plain(&spec, warning),
+            RunPlan::Session {
+                account, launch, ..
+            } => (account, launch),
+        };
+        // Appendix A.3: a session reads the vault and the profile's Keychain item. Plain
+        // `claude` reads neither, so it never waits on this check (§12.7).
+        self.ensure_unlocked()?;
+        let (launched, launch) = match self.engine.launch(&account, &launch, &cwd) {
+            Ok(launched) => (launched, launch),
+            // Decision 14: the target changed under the launch's locks. Plan once more and act
+            // on that plan; a second change is this command's error, never a loop.
+            Err(EngineError::TargetChanged { why }) => {
+                let _ = writeln!(self.io.err, "warning: {why}");
+                match self.engine.plan_run(&request)? {
+                    RunPlan::Plain { spec, warning } => return self.run_plain(&spec, warning),
+                    RunPlan::Session {
+                        account, launch, ..
+                    } => (self.engine.launch(&account, &launch, &cwd)?, launch),
+                }
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // Decision 18: the environment warnings are among them, computed by the engine.
+        for w in &launched.warnings {
+            let _ = writeln!(self.io.err, "warning: {w}");
+        }
+        let cancel = self.engine.cancel();
+        // §12.3 "Every launch is checked"; a launch that bootstrapped skips it (Task 11). An
+        // interrupted check spends its signal on the exit handling (`abandon`), which then runs
+        // to completion, and the command exits 128 + n.
+        if let Err(e) = self.engine.check_login(&launched, &launch, &cwd) {
+            let e = crate::run::abandon(&self.engine, launched, cancel, &mut *self.io.err, e);
+            return Err(e.into());
+        }
+        Ok(crate::run::run_session(
+            &self.engine,
+            launched,
+            &launch,
+            &args,
+            &cwd,
+            cancel,
+            &mut *self.io.err,
+        )?)
+    }
+
+    /// §12.1's plain `claude`: `exec`, after the warning a plan may carry and the token's last
+    /// look. Past that look, signals are plain `claude`'s own. It returns only when the `exec`
+    /// failed.
+    fn run_plain(&mut self, spec: &SpawnSpec, warning: Option<String>) -> Result<i32, Failure> {
+        if let Some(w) = warning {
+            let _ = writeln!(self.io.err, "warning: {w}");
+        }
+        if let Some(signal) = self.engine.cancel().requested() {
+            return Err(EngineError::Interrupted(signal).into());
+        }
+        let _ = self.io.out.flush();
+        let _ = self.io.err.flush();
+        Err(crate::run::exec_failed(spec, exec_command(spec)).into())
+    }
+
     /// §13.4: reads `usage_samples` only, so it never fetches. ACCOUNT defaults to the live
     /// login's account; without `--window`, only the windows that count for switching show.
     fn history(
@@ -1507,7 +1643,7 @@ mod tests {
     #[test]
     fn the_late_notice_names_each_command_as_it_is_typed() {
         use clap::Parser;
-        let cases: [&[&str]; 18] = [
+        let cases: &[&[&str]] = &[
             &["list"],
             &["ls"],
             &["status"],
@@ -1526,6 +1662,8 @@ mod tests {
             &["map"],
             &["unmap"],
             &["shell-init", "zsh"],
+            &["run"],
+            &["run", "2", "--", "--json"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))
@@ -1633,6 +1771,94 @@ mod tests {
         assert!(
             ctx.env.vars.is_empty(),
             "nothing but the process boundary captures"
+        );
+    }
+
+    #[test]
+    fn run_hands_everything_after_the_double_dash_to_the_agent() {
+        use clap::Parser;
+        // Decision 8: tagteam's options come before `--`, and nothing after it is tagteam's.
+        let cli = Cli::try_parse_from([
+            "tagteam",
+            "run",
+            "2",
+            "--require-session",
+            "--",
+            "--json",
+            "-p",
+            "x",
+            "--",
+        ])
+        .unwrap();
+        assert!(!cli.json, "an agent's --json is not tagteam's");
+        assert_eq!(cli.provider, None, "nor is its -p");
+        let Some(Command::Run {
+            account,
+            require_session,
+            args,
+        }) = cli.command
+        else {
+            panic!("not parsed as run");
+        };
+        assert_eq!(account.as_deref(), Some("2"));
+        assert!(require_session);
+        assert_eq!(args, ["--json", "-p", "x", "--"].map(OsString::from));
+    }
+
+    #[test]
+    fn run_s_own_options_stay_its_own_before_the_double_dash() {
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(["tagteam", "--json", "run", "-p", "claude-code", "--", "hi"])
+                .unwrap();
+        assert!(cli.json);
+        assert_eq!(cli.provider.as_deref(), Some("claude-code"));
+        let Some(Command::Run {
+            account,
+            require_session,
+            args,
+        }) = cli.command
+        else {
+            panic!("not parsed as run");
+        };
+        assert_eq!((account, require_session), (None, false));
+        assert_eq!(args, [OsString::from("hi")]);
+        assert!(
+            Cli::try_parse_from(["tagteam", "run", "2", "hi"]).is_err(),
+            "an agent argument needs the --"
+        );
+    }
+
+    #[test]
+    fn the_boundary_records_the_variables_a_session_scrubs_and_never_its_home() {
+        // Decision 18: the names `Context::from_process` records the presence of, for the
+        // launch's environment warnings (§12.5).
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context {
+            env: Env::for_test(dir.path()),
+            keychain: Arc::new(FakeKeychain::new()),
+            platform: Platform::MacOs,
+            api_base: None,
+            stdout_terminal: false,
+            no_color_env: false,
+            force_color_env: false,
+        };
+        let names = scrubbed_vars(&build_registry(&ctx));
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "USE_STAGING_OAUTH",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        ] {
+            assert!(names.iter().any(|n| n == name), "{name}: {names:?}");
+        }
+        assert!(
+            !names.iter().any(|n| n == "CLAUDE_CONFIG_DIR"),
+            "a session sets its home variable, never scrubs it: {names:?}"
+        );
+        assert!(
+            ctx.env.vars.is_empty(),
+            "only the process boundary records them"
         );
     }
 }

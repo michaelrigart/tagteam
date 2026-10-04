@@ -11,6 +11,7 @@ mod history;
 pub mod prompt;
 mod render;
 mod root_guard;
+mod run;
 mod shell_init;
 mod signals;
 mod statusline;
@@ -52,7 +53,12 @@ where
     T: Into<OsString> + Clone,
 {
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
-    let json = args.iter().any(|a| a == "--json");
+    // B.36: `--json` promises one JSON object, but only tagteam's own flag does. An argument
+    // after `--` belongs to the agent `run` launches (Decision 8), and is never the flag.
+    let json = args
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "--json");
     let cli = match cli::Cli::try_parse_from(&args) {
         Ok(c) => c,
         // `--json` promises exactly one JSON object on stdout (B.36), so under it a usage

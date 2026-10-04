@@ -8,14 +8,19 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use common::{FakeCall, fake_claude, fake_claude_calls, path_with};
+use common::{
+    FakeCall, cc_profile, cmd, fake_claude, fake_claude_calls, path_with, seed_home, std_cmd,
+    two_fresh_accounts,
+};
 use serde_json::{Value, json};
+use tagteam_core::AccountId;
+use tagteam_provider::{Env, MutationGuard, ProfileMarker, Read, profile_path};
 
 /// The fake `claude` run on its own, as tagteam would find it: first on `PATH`, `HOME` under
 /// `root`, in `root`, and nothing else in its environment.
@@ -357,4 +362,878 @@ fn the_fake_claude_rotates_its_profile_credential_privately() {
     let file = profile.join(".credentials.json");
     assert_eq!(fs::read_to_string(&file).unwrap(), rotated);
     assert_eq!(mode(&file), 0o600);
+}
+
+// ---- Task 12: `tagteam run` through the binary (§12.1, §12.5, §14.1) ----
+
+/// How long one step of these tests may take before it counts as stuck.
+const LONG: Duration = Duration::from_secs(20);
+/// Six of the wait loop's 50 ms looks: long enough for anything tagteam would forward to land.
+const SETTLE: Duration = Duration::from_millis(300);
+/// §12.4's baseline: present while a merge-back is owed.
+const BASELINE: &str = ".tagteam-baseline.json";
+
+/// `a@x.co` at position 1 and `b@x.co` at position 2, the live login (`two_fresh_accounts`),
+/// with the fake `claude` in `<root>/bin` and a working directory `<root>/work`. `run 1` therefore
+/// launches a session; `run 2` would run plain `claude` (§12.1).
+struct Home {
+    dir: tempfile::TempDir,
+    /// Account `a`'s id.
+    a: String,
+}
+
+impl Home {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _b) = two_fresh_accounts(dir.path());
+        fake_claude(dir.path());
+        fs::create_dir_all(dir.path().join("work")).unwrap();
+        Home { dir, a }
+    }
+
+    fn root(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// A fresh `FAKE_CLAUDE_OUT` file for one step's runs of the fake `claude`.
+    fn out(&self, name: &str) -> PathBuf {
+        let dir = self.root().join("calls");
+        fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// The binary in `<root>/work`, with the fake `claude` first on `PATH`, recording its runs
+    /// in `out`.
+    fn tagteam(&self, out: &Path) -> Command {
+        let mut c = std_cmd(self.root());
+        c.env("PATH", path_with(&self.root().join("bin")))
+            .env("FAKE_CLAUDE_OUT", out)
+            .current_dir(self.root().join("work"));
+        c
+    }
+
+    /// Account `a`'s profile (§12.2).
+    fn profile(&self) -> PathBuf {
+        profile_path(
+            &Env::for_test(self.root()),
+            &AccountId::from_string(&self.a),
+        )
+    }
+}
+
+/// The session's run of the fake `claude` recorded in `out`, if it started.
+fn session(out: &Path) -> Option<FakeCall> {
+    fake_claude_calls(out)
+        .into_iter()
+        .find(|c| c.mode == "session")
+}
+
+/// The session recorded in `out` is running: its record and rotation are written.
+fn started(out: &Path) -> bool {
+    session(out).is_some_and(|c| c.ready)
+}
+
+/// The login checks (`claude auth status`) recorded in `out`.
+fn login_checks(out: &Path) -> Vec<FakeCall> {
+    fake_claude_calls(out)
+        .into_iter()
+        .filter(|c| c.mode == "auth")
+        .collect()
+}
+
+/// The signals the session recorded in `out` caught, in order.
+fn caught(out: &Path) -> Vec<i32> {
+    session(out).map(|c| c.signals).unwrap_or_default()
+}
+
+/// Starts `c` as a shell starts a foreground job: leading a process group of its own, so a
+/// terminal's Ctrl-C or Ctrl-\ can be sent to everything in it (`send_group`).
+fn spawn(mut c: Command) -> Child {
+    c.process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Sends `signal` to every process in the group `pgid` leads, as a terminal sends Ctrl-C or
+/// Ctrl-\ to its foreground group.
+fn send_group(pgid: u32, signal: i32) {
+    // SAFETY: kill(2) reads no memory of ours. A negative pid names the process group `spawn`
+    // made this child lead.
+    let rc = unsafe { libc::kill(-(pgid as libc::pid_t), signal) };
+    assert_eq!(rc, 0, "kill: {}", std::io::Error::last_os_error());
+}
+
+/// Polls `ready` every 10 ms until it holds. Fails if `child` exits first, or after `LONG`.
+fn wait_while_running(child: &mut Child, what: &str, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + LONG;
+    while !ready() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("tagteam exited ({status}) before {what}");
+        }
+        assert!(Instant::now() < deadline, "tagteam never got to {what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The child's output once it has exited. Kills it and fails if it still runs after `within`.
+fn finish(mut child: Child, within: Duration) -> Output {
+    let deadline = Instant::now() + within;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("tagteam was still running {within:?} later");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+fn settle() {
+    thread::sleep(SETTLE);
+}
+
+/// The reservation files in `profile` (§12.5), whoever holds them.
+fn reservations(profile: &Path) -> Vec<PathBuf> {
+    fs::read_dir(profile.join(".tagteam-launch"))
+        .map(|d| {
+            d.map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|x| x == "lock"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The spelling `profile`'s marker records: its `CLAUDE_CONFIG_DIR` (§12.2).
+fn marker_spelling(profile: &Path) -> String {
+    let Read::Present(marker) = ProfileMarker::read(profile) else {
+        panic!("{} has no readable marker", profile.display());
+    };
+    marker.config_dir
+}
+
+/// The `error.type` of the one JSON object on `stdout`.
+fn kind(stdout: &[u8]) -> String {
+    let v: Value = serde_json::from_slice(stdout).unwrap();
+    v["error"]["type"].as_str().unwrap().to_owned()
+}
+
+fn stderr(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+fn release(hold: &Path) {
+    fs::write(hold, b"").unwrap();
+}
+
+/// Creates each hold file when dropped, so a failing test never leaves a fake `claude` running
+/// out its 30 s.
+struct Release(Vec<PathBuf>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        for hold in &self.0 {
+            let _ = fs::write(hold, b"");
+        }
+    }
+}
+
+/// `tagteam run 1 -- session`: account `a`'s session, holding until `hold` exists.
+fn start(home: &Home, out: &Path, hold: &Path, extra: &[(&str, &str)]) -> Child {
+    let mut c = home.tagteam(out);
+    c.args(["run", "1", "--", "session"])
+        .env("FAKE_CLAUDE_HOLD", hold);
+    for (k, v) in extra {
+        c.env(k, v);
+    }
+    spawn(c)
+}
+
+// ---- The plain path: `exec` (§12.1) ----
+
+#[test]
+fn plain_claude_is_exec_ed_in_place_with_the_environment_and_arguments_it_was_given() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    fs::create_dir_all(root.join("home")).unwrap();
+    let bin = fake_claude(root);
+    let out = root.join("calls");
+    let mut c = std_cmd(root);
+    c.env("PATH", path_with(&bin))
+        .env("FAKE_CLAUDE_OUT", &out)
+        .env("FAKE_CLAUDE_EXIT", "5")
+        .env("ANTHROPIC_API_KEY", "sk-ant-plain")
+        .args(["run", "--"])
+        .arg("--json")
+        .arg("two words")
+        .arg(OsStr::from_bytes(b"not \xffutf-8"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = c.spawn().unwrap();
+    let pid = child.id();
+    let output = finish(child, LONG);
+
+    assert_eq!(output.status.code(), Some(5), "{}", stderr(&output));
+    let calls = fake_claude_calls(&out);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let run = &calls[0];
+    assert_eq!(
+        run.pid, pid,
+        "claude replaced tagteam: one process, one pid"
+    );
+    assert_eq!(
+        run.args,
+        [
+            OsString::from("--json"),
+            OsString::from("two words"),
+            OsString::from_vec(b"not \xffutf-8".to_vec()),
+        ]
+    );
+    assert_eq!(
+        run.env.get("ANTHROPIC_API_KEY").map(String::as_str),
+        Some("sk-ant-plain"),
+        "nothing is scrubbed on the plain path (§12.5)"
+    );
+    assert!(!run.env.contains_key("CLAUDE_CONFIG_DIR"));
+    assert!(
+        output.stdout.is_empty(),
+        "the agent's --json is not tagteam's"
+    );
+    assert!(
+        !Env::for_test(root).data_dir().exists(),
+        "an unmapped directory costs one start and writes nothing (§12.7)"
+    );
+}
+
+#[test]
+fn plain_claude_inside_a_run_shell_runs_on_the_outer_home() {
+    // §12.1, §12.8, Decision 13: from a session's shell, plain `claude` gets the default home
+    // back, not the profile the shell names.
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    seed_home(&Env::for_test(root));
+    let bin = fake_claude(root);
+    let (_profile, spelling) = cc_profile(root, "0192-shell");
+    let out = root.join("calls");
+    let mut c = std_cmd(root);
+    c.env("PATH", path_with(&bin))
+        .env("FAKE_CLAUDE_OUT", &out)
+        .env("CLAUDE_CONFIG_DIR", &spelling)
+        .args(["run", "--", "x"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = c.spawn().unwrap();
+    let pid = child.id();
+    let output = finish(child, LONG);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let calls = fake_claude_calls(&out);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].pid, pid, "exec'd in place");
+    assert!(
+        !calls[0].env.contains_key("CLAUDE_CONFIG_DIR"),
+        "the outer home defined none, so neither does plain claude"
+    );
+}
+
+#[test]
+fn a_missing_launch_command_fails_before_anything_is_written() {
+    // §12.1: looked up on PATH before any lock; missing → exit 1, nothing changed.
+    let home = Home::new();
+    let output = std_cmd(home.root())
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(home.root().join("work"))
+        .args(["--json", "run", "1", "--", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(kind(&output.stdout), "launch-command-missing");
+    assert!(!home.profile().exists(), "no profile, no reservation");
+}
+
+// ---- `--json` and the command line (§12.1, Decision 8, B.36) ----
+
+#[test]
+fn errors_before_the_launch_are_one_json_object_and_launch_nothing() {
+    let home = Home::new();
+    let out = home.out("never");
+    let cases: [(&[&str], &str); 3] = [
+        (&["--json", "run", "9", "--", "x"], "no-such-account"),
+        (
+            &["--json", "run", "--require-session", "--", "x"],
+            "requires-session",
+        ),
+        (
+            &["--json", "run", "--require-session", "2", "--", "x"],
+            "requires-session",
+        ),
+    ];
+    for (args, expected) in cases {
+        let output = home.tagteam(&out).args(args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(v["schemaVersion"], json!(1), "{args:?}");
+        assert_eq!(v["error"]["type"], json!(expected), "{args:?}");
+    }
+    assert!(
+        fake_claude_calls(&out).is_empty(),
+        "claude never ran, not even its login check"
+    );
+    assert!(!home.profile().exists());
+}
+
+#[test]
+fn an_agent_s_json_after_the_double_dash_never_turns_a_usage_error_into_json() {
+    // `main_with_args` reads `--json` before clap does, for a usage error; it stops at `--`.
+    let d = tempfile::tempdir().unwrap();
+    let out = cmd(d.path())
+        .args(["run", "--bogus", "--", "--json"])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    assert!(
+        out.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(stderr(&out).starts_with("error: "), "{}", stderr(&out));
+    // Before the double dash it is tagteam's flag, and the same error is one JSON object.
+    let out = cmd(d.path())
+        .args(["run", "--bogus", "--json", "--", "x"])
+        .assert()
+        .code(2)
+        .get_output()
+        .clone();
+    assert_eq!(kind(&out.stdout), "usage");
+}
+
+// ---- The session: environment, arguments, exit code (§12.5) ----
+
+#[test]
+fn the_session_gets_its_arguments_verbatim_and_its_own_environment() {
+    let home = Home::new();
+    let out = home.out("session");
+    let output = home
+        .tagteam(&out)
+        .args([
+            "run",
+            "1",
+            "--",
+            "--json",
+            "-p",
+            "two words",
+            "",
+            "--",
+            "ünï",
+        ])
+        .env("ANTHROPIC_API_KEY", "sk-ant-x")
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "oat")
+        .env("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", "3")
+        .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+        .env("KEEP_ME", "kept")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let run = session(&out).expect("the session ran");
+    assert_eq!(run.args, ["--json", "-p", "two words", "", "--", "ünï"]);
+    let spelling = marker_spelling(&home.profile());
+    // `CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR` is one of `CLAUDE_CODE_*_FILE_DESCRIPTOR`, which the
+    // process boundary records by its name as it finds it set (Decision 18).
+    let scrubbed = [
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    ];
+    let checks = login_checks(&out);
+    assert_eq!(
+        checks.len(),
+        1,
+        "one check, at the bootstrap (§12.3 step 8): {checks:?}"
+    );
+    let cwd = fs::canonicalize(home.root().join("work")).unwrap();
+    for (what, call) in [("the session", &run), ("its login check", &checks[0])] {
+        assert_eq!(call.env.get("CLAUDE_CONFIG_DIR"), Some(&spelling), "{what}");
+        for gone in scrubbed {
+            assert!(
+                !call.env.contains_key(gone),
+                "{what}: {gone} is scrubbed (§12.5)"
+            );
+        }
+        assert_eq!(
+            call.env.get("KEEP_ME").map(String::as_str),
+            Some("kept"),
+            "{what}"
+        );
+        assert_eq!(call.cwd, cwd, "{what}: where claude runs, as it runs");
+    }
+    let err = stderr(&output);
+    for name in scrubbed {
+        assert_eq!(
+            err.matches(name).count(),
+            1,
+            "one warning names {name}:\n{err}"
+        );
+    }
+}
+
+#[test]
+fn run_exits_with_the_session_s_code() {
+    let home = Home::new();
+    let out = home.out("seven");
+    let output = home
+        .tagteam(&out)
+        .args(["run", "1", "--", "x"])
+        .env("FAKE_CLAUDE_EXIT", "7")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert!(
+        reservations(&home.profile()).is_empty(),
+        "exit handling ran to its unlink"
+    );
+}
+
+#[test]
+fn a_session_killed_by_a_signal_exits_128_plus_the_signal() {
+    let home = Home::new();
+    let out = home.out("killed");
+    let hold = home.root().join("hold");
+    let _release = Release(vec![hold.clone()]);
+    let mut child = start(&home, &out, &hold, &[]);
+    wait_while_running(&mut child, "the session", || started(&out));
+    send(session(&out).unwrap().pid, libc::SIGKILL);
+    let output = finish(child, LONG);
+    assert_eq!(
+        output.status.code(),
+        Some(128 + libc::SIGKILL),
+        "{}",
+        stderr(&output)
+    );
+    assert!(reservations(&home.profile()).is_empty());
+}
+
+#[test]
+fn a_target_that_became_the_live_login_during_the_launch_runs_plain_claude_after_one_more_plan() {
+    // Decision 14, B.47: `launch` decides again under its locks; `run` plans once more.
+    let home = Home::new();
+    let out = home.out("raced");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _release = Release(vec![pause.join("resume")]);
+    let mut c = home.tagteam(&out);
+    c.args(["run", "1", "--", "x"])
+        .env("TAGTEAM_TEST_PAUSE_AT", "launch-before-locks")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause);
+    let mut child = spawn(c);
+    let pid = child.id();
+    wait_while_running(&mut child, "the launch", || pause.join("paused").exists());
+    cmd(home.root()).args(["switch", "1"]).assert().success();
+    fs::write(pause.join("resume"), b"").unwrap();
+    let output = finish(child, LONG);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("became the live login"),
+        "{}",
+        stderr(&output)
+    );
+    let calls = fake_claude_calls(&out);
+    assert_eq!(
+        calls.len(),
+        1,
+        "no login check, one plain claude: {calls:?}"
+    );
+    assert_eq!(calls[0].pid, pid, "exec'd in place");
+    assert!(!calls[0].env.contains_key("CLAUDE_CONFIG_DIR"));
+    assert!(!home.profile().exists(), "no session was started");
+}
+
+#[test]
+fn a_mapped_target_removed_before_the_launch_reads_it_runs_plain_claude_after_one_more_plan() {
+    // Decision 14, B.47: a `remove` that lands after `plan_run`, before the launch's first read
+    // of the account, is `TargetChanged`; the mapping went with the account (Decision 7), so the
+    // second plan runs plain `claude`.
+    let home = Home::new();
+    let out = home.out("removed");
+    cmd(home.root())
+        .current_dir(home.root().join("work"))
+        .args(["map", "1"])
+        .assert()
+        .success();
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _release = Release(vec![pause.join("resume")]);
+    let mut c = home.tagteam(&out);
+    c.args(["run", "--", "x"])
+        .env("TAGTEAM_TEST_PAUSE_AT", "launch-before-freshen")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause);
+    let mut child = spawn(c);
+    let pid = child.id();
+    wait_while_running(&mut child, "the launch", || pause.join("paused").exists());
+    cmd(home.root()).args(["remove", "1"]).assert().success();
+    fs::write(pause.join("resume"), b"").unwrap();
+    let output = finish(child, LONG);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("was removed"),
+        "warned once: {}",
+        stderr(&output)
+    );
+    let calls = fake_claude_calls(&out);
+    assert_eq!(
+        calls.len(),
+        1,
+        "no login check, one plain claude: {calls:?}"
+    );
+    assert_eq!(calls[0].pid, pid, "exec'd in place");
+    assert!(!calls[0].env.contains_key("CLAUDE_CONFIG_DIR"));
+    assert!(!home.profile().exists(), "no session was started");
+}
+
+// ---- Signals while claude runs (§12.5, Review Focus 2) ----
+
+#[test]
+fn sigterm_and_sighup_to_tagteam_reach_the_session_once_and_exit_handling_still_runs() {
+    for signal in [libc::SIGTERM, libc::SIGHUP] {
+        let home = Home::new();
+        let out = home.out("forwarded");
+        let hold = home.root().join("hold");
+        let _release = Release(vec![hold.clone()]);
+        let mut child = start(&home, &out, &hold, &[("FAKE_CLAUDE_ON_SIGNAL", "continue")]);
+        wait_while_running(&mut child, "the session", || started(&out));
+        settle();
+
+        send(child.id(), signal);
+        wait_while_running(&mut child, "the forwarded signal", || {
+            caught(&out) == [signal]
+        });
+        settle();
+        assert_eq!(caught(&out), [signal], "forwarded once, never again");
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "{signal}: tagteam waits on"
+        );
+
+        release(&hold);
+        let output = finish(child, LONG);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{signal}: the child's code: {}",
+            stderr(&output)
+        );
+        assert!(
+            !stderr(&output).contains("interrupted"),
+            "{signal}: {}",
+            stderr(&output)
+        );
+        assert!(
+            reservations(&home.profile()).is_empty(),
+            "{signal}: exit handling ran"
+        );
+        assert!(
+            !home.profile().join(BASELINE).exists(),
+            "{signal}: and merged back"
+        );
+    }
+}
+
+#[test]
+fn a_forwarded_sigterm_that_ends_the_session_exits_143() {
+    let home = Home::new();
+    let out = home.out("term");
+    let hold = home.root().join("hold");
+    let _release = Release(vec![hold.clone()]);
+    let mut child = start(&home, &out, &hold, &[]);
+    wait_while_running(&mut child, "the session", || started(&out));
+    settle();
+    send(child.id(), libc::SIGTERM);
+    let output = finish(child, LONG);
+    assert_eq!(
+        output.status.code(),
+        Some(128 + libc::SIGTERM),
+        "{}",
+        stderr(&output)
+    );
+    assert!(reservations(&home.profile()).is_empty());
+}
+
+#[test]
+fn sigint_to_tagteam_alone_never_reaches_the_session() {
+    // Only the terminal sends claude a Ctrl-C (it shares the foreground group); tagteam drops
+    // its own copy.
+    let home = Home::new();
+    let out = home.out("int");
+    let hold = home.root().join("hold");
+    let _release = Release(vec![hold.clone()]);
+    let mut child = start(&home, &out, &hold, &[("FAKE_CLAUDE_ON_SIGNAL", "continue")]);
+    wait_while_running(&mut child, "the session", || started(&out));
+    settle();
+    send(child.id(), libc::SIGINT);
+    settle();
+    settle();
+    assert!(caught(&out).is_empty(), "nothing forwarded");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "and tagteam ignored it"
+    );
+    release(&hold);
+    let output = finish(child, LONG);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("interrupted"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn ctrl_c_at_the_terminal_reaches_the_session_once_and_tagteam_ignores_it() {
+    let home = Home::new();
+    let out = home.out("ctrl-c");
+    let hold = home.root().join("hold");
+    let _release = Release(vec![hold.clone()]);
+    let mut child = start(&home, &out, &hold, &[("FAKE_CLAUDE_ON_SIGNAL", "continue")]);
+    wait_while_running(&mut child, "the session", || started(&out));
+    settle();
+
+    send_group(child.id(), libc::SIGINT);
+    wait_while_running(&mut child, "the Ctrl-C", || caught(&out) == [libc::SIGINT]);
+    settle();
+    assert_eq!(
+        caught(&out),
+        [libc::SIGINT],
+        "once: the terminal's own, never forwarded on top"
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    release(&hold);
+    let output = finish(child, LONG);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("interrupted"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn sigquit_never_stops_tagteam() {
+    let home = Home::new();
+    let out = home.out("quit");
+    let hold = home.root().join("hold");
+    let _release = Release(vec![hold.clone()]);
+    let mut child = start(&home, &out, &hold, &[]);
+    wait_while_running(&mut child, "the session", || started(&out));
+    settle();
+    send(child.id(), libc::SIGQUIT);
+    settle();
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "tagteam survives Ctrl-\\ while claude runs (Decision 1)"
+    );
+    release(&hold);
+    let output = finish(child, LONG);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
+#[test]
+fn ctrl_backslash_at_the_terminal_ends_the_session_and_tagteam_reports_its_code() {
+    // claude keeps Ctrl-\'s default action, which a handler in tagteam does not take from it
+    // (an ignored signal would): it dies of it, and tagteam lives to exit 131. The fake leaves
+    // SIGQUIT untrapped, as Claude Code does.
+    let home = Home::new();
+    let out = home.out("ctrl-backslash");
+    let hold = home.root().join("hold");
+    let _release = Release(vec![hold.clone()]);
+    let mut child = start(&home, &out, &hold, &[]);
+    wait_while_running(&mut child, "the session", || started(&out));
+    settle();
+    send_group(child.id(), libc::SIGQUIT);
+    let output = finish(child, LONG);
+    assert_eq!(
+        output.status.code(),
+        Some(128 + libc::SIGQUIT),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        reservations(&home.profile()).is_empty(),
+        "exit handling ran"
+    );
+}
+
+// ---- Before the spawn (§12.5 "Signals", §15.2 "Exit paths") ----
+
+#[test]
+fn a_signal_while_the_launch_waits_for_its_lock_launches_nothing() {
+    let home = Home::new();
+    let out = home.out("blocked");
+    let guard =
+        MutationGuard::acquire(&Env::for_test(home.root()), Duration::from_secs(5)).unwrap();
+    let mut c = home.tagteam(&out);
+    c.args(["--json", "run", "1", "--", "x"]);
+    let mut child = spawn(c);
+    // Into the launch's 30 s wait for the mutation lock (§9.1).
+    thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none(), "it waits for the lock");
+    send(child.id(), libc::SIGINT);
+    let output = finish(child, Duration::from_secs(5));
+    drop(guard);
+
+    assert_eq!(output.status.code(), Some(130), "{}", stderr(&output));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"schemaVersion": 1, "error": {"type": "interrupted", "message": "interrupted"}})
+    );
+    assert!(
+        fake_claude_calls(&out).is_empty(),
+        "nothing launched, not even a login check"
+    );
+    assert!(reservations(&home.profile()).is_empty());
+}
+
+#[test]
+fn a_signal_during_the_login_check_launches_nothing_and_still_runs_exit_handling() {
+    let home = Home::new();
+    // The first launch bootstraps, and its check runs under the locks. The second checks
+    // after its reservation exists (§12.3 "Every launch is checked").
+    let first = home.out("first");
+    let status = home
+        .tagteam(&first)
+        .args(["run", "1", "--", "x"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
+    let out = home.out("second");
+    let mut c = home.tagteam(&out);
+    c.args(["--json", "run", "1", "--", "x"])
+        .env("FAKE_CLAUDE_AUTH_SLEEP", "20");
+    let mut child = spawn(c);
+    wait_while_running(&mut child, "the login check", || {
+        !login_checks(&out).is_empty()
+    });
+    send(child.id(), libc::SIGTERM);
+    let output = finish(child, Duration::from_secs(5));
+
+    assert_eq!(
+        output.status.code(),
+        Some(128 + libc::SIGTERM),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(kind(&output.stdout), "interrupted");
+    assert!(session(&out).is_none(), "claude never started");
+    assert!(
+        reservations(&home.profile()).is_empty(),
+        "its exit handling ran, as for a refused launch, past the signal that ended it"
+    );
+    // Controller ruling (Task 11): the signal that ended the launch is spent on it, so exit
+    // handling ran to completion rather than deferring at its first lock wait.
+    assert!(
+        !stderr(&output).contains("did not finish"),
+        "nothing deferred: {}",
+        stderr(&output)
+    );
+    assert!(
+        !home.profile().join(BASELINE).exists(),
+        "the seed's baseline was merged back"
+    );
+}
+
+#[test]
+fn a_signal_recorded_after_the_last_check_reaches_the_session_once_it_starts() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let home = Home::new();
+        let out = home.out("late");
+        let hold = home.root().join("hold");
+        let pause = home.root().join("pause");
+        fs::create_dir_all(&pause).unwrap();
+        let _release = Release(vec![hold.clone(), pause.join("resume")]);
+        let mut child = start(
+            &home,
+            &out,
+            &hold,
+            &[
+                ("FAKE_CLAUDE_ON_SIGNAL", "continue"),
+                ("TAGTEAM_TEST_PAUSE_AT", "before-spawn"),
+                ("TAGTEAM_TEST_PAUSE_DIR", pause.to_str().unwrap()),
+            ],
+        );
+        wait_while_running(&mut child, "the spawn", || pause.join("paused").exists());
+        send(child.id(), signal);
+        fs::write(pause.join("resume"), b"").unwrap();
+
+        // The fake records it when its trap was set in time, or dies of it when it was not:
+        // either way the signal reached claude, not tagteam's own interruption.
+        let deadline = Instant::now() + LONG;
+        let recorded = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if caught(&out) == [signal] {
+                break true;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{signal} never reached the session"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        if recorded {
+            settle();
+            assert_eq!(caught(&out), [signal], "{signal}: forwarded once");
+        }
+        release(&hold);
+        let output = finish(child, LONG);
+        let expected = if recorded { 0 } else { 128 + signal };
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "{signal}: {}",
+            stderr(&output)
+        );
+        assert!(
+            !stderr(&output).contains("interrupted"),
+            "past the last check a signal is claude's: {}",
+            stderr(&output)
+        );
+        assert!(reservations(&home.profile()).is_empty(), "{signal}");
+    }
+}
+
+#[test]
+fn a_launch_command_gone_at_the_spawn_refuses_and_runs_exit_handling() {
+    let home = Home::new();
+    let out = home.out("gone");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _release = Release(vec![pause.join("resume")]);
+    let mut c = home.tagteam(&out);
+    c.args(["--json", "run", "1", "--", "x"])
+        .env("TAGTEAM_TEST_PAUSE_AT", "before-spawn")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause);
+    let mut child = spawn(c);
+    wait_while_running(&mut child, "the spawn", || pause.join("paused").exists());
+    fs::remove_file(home.root().join("bin/claude")).unwrap();
+    fs::write(pause.join("resume"), b"").unwrap();
+    let output = finish(child, LONG);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(kind(&output.stdout), "launch-unreachable");
+    assert!(session(&out).is_none());
+    assert!(
+        reservations(&home.profile()).is_empty(),
+        "a launch refused after its reservation exists runs its exit handling (§12.3)"
+    );
 }
