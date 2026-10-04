@@ -500,18 +500,18 @@ pub(crate) enum AutoFreshened {
     Skip,
 }
 
-fn needs_relogin(target: &AccountRow) -> EngineError {
+pub(crate) fn needs_relogin(target: &AccountRow) -> EngineError {
     EngineError::NeedsRelogin {
         position: target.position,
         label: target.label.clone(),
     }
 }
 
-fn cannot_refresh(app: &str, label: &str, why: &str) -> String {
+pub(crate) fn cannot_refresh(app: &str, label: &str, why: &str) -> String {
     format!("could not refresh {label} first ({why}); {app} will refresh it when it is online")
 }
 
-fn works_until_expiry(target: &AccountRow) -> String {
+pub(crate) fn works_until_expiry(target: &AccountRow) -> String {
     format!(
         "{} (position {}) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires",
         target.label, target.position
@@ -1297,7 +1297,7 @@ impl Engine {
 
     /// §7.2: whether `vault`'s access token expires within the freshen window. An unknown or
     /// non-numeric expiry is never due.
-    fn due(&self, p: &dyn Provider, vault: &[u8]) -> bool {
+    pub(crate) fn due(&self, p: &dyn Provider, vault: &[u8]) -> bool {
         p.access_expires_at(vault)
             .is_some_and(|at| self.now_ms() + FRESHEN_WINDOW_MS >= at)
     }
