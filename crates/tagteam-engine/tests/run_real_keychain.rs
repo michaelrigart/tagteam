@@ -260,6 +260,9 @@ fn a_relaunch_after_an_inactive_refresh_runs_on_the_vault_s_generation_and_never
     ));
     assert_eq!(refresh_token(&r.vault_bytes(&a)), "rt-a2");
 
+    // The item holding the consumed generation is still there, so step 5's deletion is its own.
+    assert!(matches!(r.kc.exists(&svc, &acct), Read::Present(())));
+
     // 5. The relaunch finds the vault moved on (§12.5's table: P = S). It bootstraps again and
     //    deletes the item holding the consumed generation, verified gone by the real probe.
     r.spawner.push(r.valid(&spelling, "a@x.co"));
