@@ -1237,3 +1237,47 @@ fn a_launch_command_gone_at_the_spawn_refuses_and_runs_exit_handling() {
         "a launch refused after its reservation exists runs its exit handling (§12.3)"
     );
 }
+
+#[test]
+fn a_signal_pending_when_the_spawn_fails_is_spent_on_the_exit_handling_and_never_too_late() {
+    // `abandon` takes the token whatever refused the launch. A signal recorded after the token's
+    // last look arrived after the decision: the refusal stands, its exit handling runs to
+    // completion, and nothing is reported as too late.
+    let home = Home::new();
+    let out = home.out("gone-signalled");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _release = Release(vec![pause.join("resume")]);
+    let mut c = home.tagteam(&out);
+    c.args(["--json", "run", "1", "--", "x"])
+        .env("TAGTEAM_TEST_PAUSE_AT", "before-spawn")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause);
+    let mut child = spawn(c);
+    wait_while_running(&mut child, "the spawn", || pause.join("paused").exists());
+    send(child.id(), libc::SIGTERM);
+    fs::remove_file(home.root().join("bin/claude")).unwrap();
+    fs::write(pause.join("resume"), b"").unwrap();
+    let output = finish(child, LONG);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(
+        kind(&output.stdout),
+        "launch-unreachable",
+        "the refusal stands"
+    );
+    assert!(session(&out).is_none());
+    assert!(!stderr(&output).contains("too late"), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("did not finish"),
+        "nothing deferred: {}",
+        stderr(&output)
+    );
+    assert!(
+        reservations(&home.profile()).is_empty(),
+        "exit handling ran"
+    );
+    assert!(
+        !home.profile().join(BASELINE).exists(),
+        "the bootstrap's baseline was merged back"
+    );
+}

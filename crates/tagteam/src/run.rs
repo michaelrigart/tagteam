@@ -89,8 +89,9 @@ pub(crate) fn run_session(
 
 /// §12.3, §12.5: a launch refused or interrupted once its reservation exists runs its exit
 /// handling as if `claude` had exited at once, then fails with `e`: exit 1, or `128 + n` for an
-/// interruption. The signal that interrupted it is spent on that, so the exit handling stops
-/// only at a new one (Decision 12).
+/// interruption. Whatever signal is pending is spent on that, so the exit handling stops only at
+/// a new one (Decision 12): the one that interrupted the launch, or one that arrived after a
+/// refusal was decided, which leaves `e` as it is and is never reported as too late.
 pub(crate) fn abandon(
     engine: &Engine,
     launched: Launched,
@@ -98,9 +99,7 @@ pub(crate) fn abandon(
     err: &mut dyn Write,
     e: EngineError,
 ) -> EngineError {
-    if e.signal().is_some() {
-        let _ = cancel.take();
-    }
+    let _ = cancel.take();
     notify(err, &engine.finish_run(launched, LaunchEnd::Refused));
     e
 }
