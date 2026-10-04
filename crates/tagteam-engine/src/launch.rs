@@ -494,10 +494,13 @@ impl Engine {
             Read::Unreadable(e) => Err(EngineError::Unreadable(e)),
         };
         if let Err(e) = result {
+            // §14.2, B.69: by its kind. An error's message may name the account's label.
             tracing::warn!(
                 position = row.position,
                 account = %row.id,
-                "could not mark the session profile for a bootstrap: {e}"
+                kind = e.kind(),
+                profile = %profile.display(),
+                "could not mark the session profile for a bootstrap"
             );
         }
     }
@@ -508,17 +511,21 @@ impl Engine {
     /// It runs under `MutationGuard` (30 s, as a launch) and the account lock, whose waits are
     /// its cancellation points. `end` changes nothing: a launch refused after its reservation
     /// exists is handled as if `claude` had exited at once (§12.3). A failed or cancelled step
-    /// gives one notice. What it left is completed by lazy capture and the next launch, which
-    /// loses nothing (§12.5 "Signals").
+    /// gives one notice (`exit_notice`). What it left is completed by lazy capture and the next
+    /// launch, which loses nothing (§12.5 "Signals"), unless the profile's provenance stopped it.
+    /// The log names the failure by its kind only (§14.2, B.69).
     pub fn finish_run(&self, launched: Launched, end: LaunchEnd) -> Vec<String> {
         let (position, id) = (launched.account.position, launched.account.id.clone());
         tracing::debug!(position, account = %id, ?end, "the session ended; exit handling starts");
         let mut notices = Vec::new();
         if let Err(e) = self.finish_locked(launched, &mut notices) {
-            tracing::warn!(position, account = %id, "exit handling did not finish: {e}");
-            notices.push(format!(
-                "exit handling for position {position} did not finish ({e}); nothing is lost: the next launch, switch or refresh of the account completes it"
-            ));
+            tracing::warn!(
+                position,
+                account = %id,
+                kind = e.kind(),
+                "exit handling did not finish"
+            );
+            notices.push(exit_notice(position, &e));
         }
         notices
     }
@@ -556,7 +563,9 @@ impl Engine {
                 tracing::warn!(
                     position = account.position,
                     account = %account.id,
-                    "the launch reservation could not be unlinked either: {unlink}"
+                    kind = unlink.kind(),
+                    reservation = %own.display(),
+                    "the launch reservation could not be unlinked either"
                 );
                 Err(first)
             }
@@ -570,12 +579,13 @@ impl Engine {
     /// profile's provenance, under the account lock with no network (§6.2), then merges the
     /// profile's config back from a waiting baseline. Otherwise another session still runs (a
     /// `run`, or a `bg` or `daemon` record, §12.6), and nothing is done. A failed capture does
-    /// not stop the merge-back; the first failure is returned. A provenance `Conflict` or
-    /// `Unreadable` counts as one: nothing is captured, and the next launch refuses or aborts.
+    /// not stop the merge-back; the first failure is returned, and a merge-back failure after
+    /// it is logged (§14). A provenance `Conflict` or `Unreadable` counts as one: nothing is
+    /// captured, and the next launch refuses or aborts.
     fn exit_under_locks(
         &self,
         p: &dyn Provider,
-        launched: &AccountRow,
+        account: &AccountRow,
         profile: &Path,
         own: &Path,
         lock: &AccountLock,
@@ -583,7 +593,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         hooks::point(self, "exit-locked")?;
         // A session-owned account is never removed (§10.3), so this is a defence only.
-        let Some(row) = self.store()?.account(&launched.id)? else {
+        let Some(row) = self.store()?.account(&account.id)? else {
             return Ok(());
         };
         match self.session_state_apart_from(p, &row, own)? {
@@ -623,11 +633,35 @@ impl Engine {
             match p.merge_back(&self.env, profile, self.cancel()) {
                 Ok(report) => notices.extend(merge_summary(&row, &report)),
                 Err(e) => {
-                    failed.get_or_insert(e.into());
+                    let e = EngineError::from(e);
+                    if failed.is_some() {
+                        tracing::warn!(
+                            position = row.position,
+                            account = %row.id,
+                            kind = e.kind(),
+                            "the session's config could not be merged back either"
+                        );
+                    }
+                    failed.get_or_insert(e);
                 }
             }
         }
         failed.map_or(Ok(()), Err)
+    }
+}
+
+/// Exit handling's notice when it did not finish (Decision 12). Most failures leave work that
+/// lazy capture and the next launch complete. A provenance conflict, or a profile that cannot be
+/// read, stops the next launch as well (§12.5 step 3), so the notice ends with the error itself,
+/// which says what is wrong and, for a conflict, what resolves it.
+fn exit_notice(position: u32, e: &EngineError) -> String {
+    match e {
+        EngineError::ProfileConflict { .. } | EngineError::Unreadable(_) => {
+            format!("exit handling for position {position} did not finish: {e}")
+        }
+        _ => format!(
+            "exit handling for position {position} did not finish ({e}); nothing is lost: the next launch, switch or refresh of the account completes it"
+        ),
     }
 }
 

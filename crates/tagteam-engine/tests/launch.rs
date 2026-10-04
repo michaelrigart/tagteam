@@ -11,8 +11,9 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use common::{
-    Fx, auth_helper, auth_logged_out, auth_reply, auth_status, claude_bin, credential, dir_tree,
-    mutation_lock_free, splice_config_key, token_requests, two_accounts, vault_fp,
+    Fx, auth_helper, auth_logged_out, auth_reply, auth_status, capture_logs, claude_bin,
+    credential, dir_tree, mutation_lock_free, splice_config_key, token_requests, two_accounts,
+    vault_fp,
 };
 use serde_json::{Value, json};
 use tagteam_core::AccountId;
@@ -1454,6 +1455,92 @@ fn an_api_key_helper_added_to_the_shared_settings_refuses_the_next_launch_and_ke
 }
 
 #[test]
+fn a_conflict_at_exit_is_one_notice_ending_with_its_remedy_and_the_merge_back_and_unlink_still_run()
+{
+    // §12.5 "When the child exits": the profile rotated and the vault moved while the session
+    // ran, so nothing is captured. The next launch refuses as well, so the notice ends with what
+    // resolves the conflict, never with "nothing is lost". No log line names the account's
+    // label (§14.2, B.69): the conflict's message does.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let launched = first_launch(&fx, &a, "a@x.co");
+    let profile = launched.profile.clone();
+    let own = launched.reservation.path().to_path_buf();
+    let label = launched.account.label.clone();
+    session_adds_project(&profile, "/work/new");
+    fx.rotate_profile(&profile, "rt-a-2");
+    fx.put_vault(&a, &credential("a@x.co", "rt-a-3"));
+
+    let (notices, logs) = capture_logs(|| fx.engine.finish_run(launched, LaunchEnd::Exited(0)));
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].starts_with("exit handling for position 1 did not finish")
+            && notices[0].ends_with("log in again with `tagteam add` to resolve it"),
+        "{}",
+        notices[0]
+    );
+    assert!(!notices[0].contains("nothing is lost"), "{}", notices[0]);
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-3"));
+    assert_eq!(fx.held_refresh_token(&profile).as_deref(), Some("rt-a-2"));
+    assert_eq!(
+        config_key(&fx.paths().global_config, "projects")["/work/new"],
+        json!({"allowedTools": ["Bash"]}),
+        "the merge-back still ran"
+    );
+    assert!(!profile.join(".tagteam-baseline.json").exists());
+    assert!(!own.exists(), "unlinked");
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("WARN") && l.contains("profile-conflict")),
+        "logged by its kind: {logs:?}"
+    );
+    assert!(
+        logs.iter()
+            .all(|l| !l.contains(label.as_str()) && !l.contains("a@x.co")),
+        "{logs:?}"
+    );
+}
+
+#[test]
+fn a_merge_back_that_fails_after_the_capture_failed_is_logged_by_its_kind() {
+    // §14: a contained error is logged, never discarded. The capture's failure is the one
+    // reported; the merge-back's is logged.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let launched = first_launch(&fx, &a, "a@x.co");
+    let profile = launched.profile.clone();
+    let own = launched.reservation.path().to_path_buf();
+    session_adds_project(&profile, "/work/new");
+    fx.rotate_profile(&profile, "rt-a-2");
+    fx.put_vault(&a, &credential("a@x.co", "rt-a-3"));
+
+    block_home(&fx);
+    let (notices, logs) = capture_logs(|| fx.engine.finish_run(launched, LaunchEnd::Exited(0)));
+    unblock_home(&fx);
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].ends_with("log in again with `tagteam add` to resolve it"),
+        "{}",
+        notices[0]
+    );
+    let merge_back = logs
+        .iter()
+        .filter(|l| l.contains("WARN") && l.contains("could not be merged back"))
+        .collect::<Vec<_>>();
+    assert_eq!(merge_back.len(), 1, "{logs:?}");
+    assert!(merge_back[0].contains("kind="), "{}", merge_back[0]);
+    assert!(
+        merge_back[0].contains(&format!("account={a}")),
+        "{}",
+        merge_back[0]
+    );
+    assert!(profile.join(".tagteam-baseline.json").exists(), "kept");
+    assert!(!own.exists(), "unlinked");
+}
+
+#[test]
 fn a_rotation_in_a_profile_that_names_no_identity_is_not_captured_at_exit() {
     // R11.1, M4a's Decision 9 at exit: a rotation no identity says is the account's is neither
     // captured nor ignored. It is the one notice; the merge-back and the unlink still run.
@@ -1471,6 +1558,11 @@ fn a_rotation_in_a_profile_that_names_no_identity_is_not_captured_at_exit() {
     let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
 
     assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(
+        notices[0].ends_with("so it cannot be told to be the account's"),
+        "the next launch stops on it too, so the notice ends with it: {}",
+        notices[0]
+    );
     assert!(notices[0].contains("names no identity"), "{}", notices[0]);
     assert_eq!(
         fx.vault_refresh_token(&a).as_deref(),
