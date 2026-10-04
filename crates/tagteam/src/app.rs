@@ -10,6 +10,7 @@ use tagteam_cc::live::Platform;
 use tagteam_core::autoswitch::Strategy;
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Window};
 use tagteam_engine::collect::CollectMode;
+use tagteam_engine::displace::PurgeError;
 use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::net::UreqHttp;
@@ -342,6 +343,9 @@ fn build_engine(
 
 enum Failure {
     Engine(EngineError),
+    /// A `--purge` that stopped part way: the entries deleted before the failure are reported
+    /// beside it (§6.3).
+    Purge(PurgeError),
     Usage(String),
     Message(&'static str, String),
 }
@@ -349,6 +353,16 @@ enum Failure {
 impl From<EngineError> for Failure {
     fn from(e: EngineError) -> Self {
         Failure::Engine(e)
+    }
+}
+
+impl From<PurgeError> for Failure {
+    fn from(e: PurgeError) -> Self {
+        if e.deleted.is_empty() {
+            Failure::Engine(e.cause)
+        } else {
+            Failure::Purge(e)
+        }
     }
 }
 
@@ -496,6 +510,13 @@ fn color_enabled(
 /// §13.2: the one object `--json` prints for any error.
 pub(crate) fn error_json(kind: &str, message: &str) -> Value {
     json!({"schemaVersion": 1, "error": {"type": kind, "message": message}})
+}
+
+/// `error_json` for a purge that stopped part way, with `deleted` added beside `error`.
+fn purge_error_json(kind: &str, message: &str, deleted: &[String]) -> Value {
+    let mut v = error_json(kind, message);
+    v["deleted"] = json!(deleted);
+    v
 }
 
 struct App<'a, 'b> {
@@ -663,6 +684,10 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
             Some(signal) => Ended::Interrupted(signal),
             None => Ended::Code(fail(app.io, json, e.kind(), &e.to_string())),
         },
+        Err(Failure::Purge(e)) => match e.signal() {
+            Some(signal) => Ended::Interrupted(signal),
+            None => Ended::Code(fail_purge(app.io, json, &e)),
+        },
         Err(Failure::Message(kind, m)) => Ended::Code(fail(app.io, json, kind, &m)),
         Err(Failure::Usage(m)) => {
             fail(app.io, json, KIND_USAGE, &m);
@@ -702,6 +727,22 @@ fn fail(io: &mut Io<'_>, json: bool, kind: &str, message: &str) -> i32 {
         let _ = writeln!(io.out, "{}", error_json(kind, message));
     } else {
         let _ = writeln!(io.err, "tagteam: {message}");
+    }
+    EXIT_ERROR
+}
+
+/// A purge's failure after it deleted something: the human form lists each deletion before the
+/// error, and `--json` carries them as `deleted` beside `error`.
+fn fail_purge(io: &mut Io<'_>, json: bool, e: &PurgeError) -> i32 {
+    if json {
+        let _ = writeln!(
+            io.out,
+            "{}",
+            purge_error_json(e.kind(), &e.to_string(), &e.deleted)
+        );
+    } else {
+        let _ = write!(io.out, "{}", displaced_cmd::purged_human(&e.deleted));
+        let _ = writeln!(io.err, "tagteam: {e}");
     }
     EXIT_ERROR
 }
@@ -754,6 +795,7 @@ fn run_statusline(
             0
         }
         Err(Failure::Engine(e)) => fail(io, false, e.kind(), &e.to_string()),
+        Err(Failure::Purge(e)) => fail_purge(io, false, &e),
         Err(Failure::Message(kind, m)) => fail(io, false, kind, &m),
         Err(Failure::Usage(m)) => {
             fail(io, false, KIND_USAGE, &m);
