@@ -49,7 +49,7 @@ const EXIT_SIGNAL_BASE: i32 = 128;
 
 /// `error.type` kinds the CLI raises itself; the engine's come from `EngineError::kind`.
 pub(crate) const KIND_USAGE: &str = "usage";
-const KIND_ROOT: &str = "root";
+pub(crate) const KIND_ROOT: &str = "root";
 const KIND_KEYCHAIN_LOCKED: &str = "keychain-locked";
 const KIND_CANCELLED: &str = "cancelled";
 const KIND_INVALID_INPUT: &str = "invalid-input";
