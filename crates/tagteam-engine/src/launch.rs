@@ -218,6 +218,9 @@ impl Engine {
             label: row.label.clone(),
             detail: detail.to_owned(),
         };
+        // §14.1 (R10.2): nothing is locked yet, and the gate has no cancellation point of its
+        // own, so a signal that has landed stops the launch before it spends the refresh token.
+        self.check_cancel()?;
         Ok(match self.refresh_stored(p, &row.id, &vault)? {
             // Busy: the account lock this launch waits for, and the rescue settlement under it,
             // pick up the other process's refresh.

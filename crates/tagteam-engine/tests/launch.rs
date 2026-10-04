@@ -561,18 +561,26 @@ fn while_a_launch_holds_its_reservation_the_account_is_session_owned() {
 
 #[test]
 fn a_signal_before_the_locks_launches_nothing() {
-    // §12.5 "Signals": every lock wait before the spawn is a cancellation point.
-    let fx = Fx::new();
-    let a = two_accounts(&fx);
-    let cwd = fx.work_dir("app");
-    fx.env.cancel.request(libc::SIGINT);
+    // §12.5 "Signals": every lock wait before the spawn is a cancellation point. So is the
+    // moment before the gate refresh (R10.2, §14.1): a signal that has landed stops the launch
+    // before it spends the vault's refresh token.
+    for due in [false, true] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let cwd = fx.work_dir("app");
+        if due {
+            fx.expire_access(&a);
+        }
+        fx.env.cancel.request(libc::SIGINT);
 
-    let err = refused(fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd));
+        let err = refused(fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd));
 
-    let _ = fx.env.cancel.take();
-    assert_eq!(err.kind(), "interrupted", "{err}");
-    assert_eq!(err.signal(), Some(libc::SIGINT));
-    assert!(!fx.profile_dir(&a).exists());
+        let _ = fx.env.cancel.take();
+        assert_eq!(err.kind(), "interrupted", "due {due}: {err}");
+        assert_eq!(err.signal(), Some(libc::SIGINT), "due {due}");
+        assert!(!fx.profile_dir(&a).exists(), "due {due}");
+        assert_eq!(token_requests(&fx), 0, "due {due}: nothing was sent");
+    }
 }
 
 #[test]
