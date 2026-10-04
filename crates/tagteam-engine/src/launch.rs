@@ -5,13 +5,13 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use tagteam_provider::profile::profile_path;
+use tagteam_provider::profile::{LAUNCH_DIR, profile_path};
 use tagteam_provider::provider::{MergeReport, SessionEnv};
 use tagteam_provider::reservation::{LaunchReservation, remove_dead_reservations};
 use tagteam_provider::{MutationGuard, Provider, ReadError};
 
 use crate::account_lock::AccountLock;
-use crate::bootstrap::Trigger;
+use crate::bootstrap::{Trigger, refuse_linked_profile};
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
@@ -72,12 +72,14 @@ pub(crate) fn merge_summary(row: &AccountRow, report: &MergeReport) -> Option<St
 impl Engine {
     /// §12.5 steps 1–5 (the gate refresh of step 1 included).
     ///
-    /// `account` is `plan_run`'s `Session` target. Before any lock, an interrupted switch is
-    /// settled (§9.6), and a vault credential about to expire is refreshed through the gate
-    /// (§12.3 step 1); a target that was removed by then is `TargetChanged`. Then, under
-    /// `MutationGuard` (30 s) and the account lock:
+    /// `account` is `plan_run`'s `Session` target. An unreadable run-shell marker refuses first
+    /// (§12.8). Before any lock, an interrupted switch is settled (§9.6), and a vault credential
+    /// about to expire is refreshed through the gate (§12.3 step 1); a target that was removed
+    /// by then is `TargetChanged`. Then, under `MutationGuard` (30 s) and the account lock:
     /// - the decision is made again (B.47): a target that was removed, or became the live
-    ///   login, is `TargetChanged`, for the CLI to plan again;
+    ///   login, is `TargetChanged`, for the CLI to plan again; one with no stored credential
+    ///   is refused, and a quarantined one follows §7.2;
+    /// - a profile path that is not a real directory refuses before anything touches it;
     /// - dead reservations go, and a quiescent profile's pending merge-back runs, from the
     ///   baseline in its actual directory (Decision 22; a failure aborts);
     /// - the marker and the links are brought up to date;
@@ -95,6 +97,9 @@ impl Engine {
         program: &Path,
         cwd: &Path,
     ) -> Result<Launched, EngineError> {
+        // §12.8, as `plan_run` refuses: under a run-shell marker that cannot be read, `env` is
+        // still the run shell's, so its profile would be taken for the default home.
+        self.refuse_unreadable_run_shell()?;
         let p = self.provider(&account.provider)?;
         let p = p.as_ref();
         if !p.capabilities().sessions {
@@ -112,9 +117,15 @@ impl Engine {
         self.locked_login(p, &row, &mut warnings)?;
         hooks::point(self, "launch-locked")?;
         let profile = profile_path(&self.env, &row.id);
+        // Through a link at the profile path, everything below would land at its target: the
+        // reservations, the merge-back, the marker, the links and the seed (controller ruling).
+        refuse_linked_profile(&profile)?;
+        let reservations = profile.join(LAUNCH_DIR);
         // 2.
         if profile.is_dir() {
-            for dead in remove_dead_reservations(&profile)? {
+            let removed =
+                remove_dead_reservations(&profile).map_err(|e| reservation_io(&reservations, e))?;
+            for dead in removed {
                 tracing::debug!(
                     position = row.position,
                     account = %row.id,
@@ -131,11 +142,14 @@ impl Engine {
                 row.position
             ));
         }
+        // A marker naming another account refuses first: that profile is neither merged back
+        // nor marked, and a join makes no link in it.
+        let marker = self.own_marker(&row, &profile)?;
         if !joining {
             // §12.4: a killed session's baseline is in the profile's actual directory, which
             // the marker's spelling no longer names once the data directory has moved
-            // (Decision 22). A marker naming another account refuses first.
-            if self.own_marker(&row, &profile)?.is_some() && p.has_baseline(&profile) {
+            // (Decision 22).
+            if marker.is_some() && p.has_baseline(&profile) {
                 let report = p.merge_back(&self.env, &profile, self.cancel())?;
                 warnings.extend(merge_summary(&row, &report));
             }
@@ -147,7 +161,8 @@ impl Engine {
             !joining && self.prepare_quiescent(p, &row, &profile, cwd, program, &guard, &lock)?;
         // 4.
         let spelling = self.recorded_spelling(&row, &profile)?;
-        let reservation = LaunchReservation::create(&profile).map_err(reservation_refused)?;
+        let reservation = LaunchReservation::create(&profile)
+            .map_err(|e| reservation_refused(&reservations, e))?;
         // 5.
         drop(lock);
         drop(guard);
@@ -430,16 +445,24 @@ fn target_removed(planned: &AccountRow) -> EngineError {
     }
 }
 
+/// The reservation calls report I/O errors without a path (Task 4), so the refusal names the
+/// reservation directory, `dir`.
+fn reservation_io(dir: &Path, e: io::Error) -> EngineError {
+    EngineError::Io(io::Error::new(e.kind(), format!("{}: {e}", dir.display())))
+}
+
 /// Interface Contract: `create` refuses a `<pid>.lock` that is live, the reservation of an
 /// orphaned `claude` of an earlier process with this pid (Task 4). Replacing it would hide a
 /// running session, so the launch is refused, naming the file; a later `run` gets a new pid.
-fn reservation_refused(e: io::Error) -> EngineError {
-    if e.kind() == io::ErrorKind::AlreadyExists {
+/// Once `dir` is a directory only that check reports `AlreadyExists`, and its message names the
+/// file. Any other failure, a file where `dir` belongs included, names `dir`.
+fn reservation_refused(dir: &Path, e: io::Error) -> EngineError {
+    if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() {
         EngineError::LaunchUnreachable {
             detail: format!("{e}; run it again"),
         }
     } else {
-        e.into()
+        reservation_io(dir, e)
     }
 }
 
