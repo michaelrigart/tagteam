@@ -15,12 +15,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use common::{
-    FakeCall, cc_profile, cmd, fake_claude, fake_claude_calls, path_with, seed_home, std_cmd,
-    two_fresh_accounts,
+    FakeCall, cc_profile, cmd, expire_vault, fake_claude, fake_claude_calls, live_email, path_with,
+    seed_home, std_cmd, two_fresh_accounts,
 };
 use serde_json::{Value, json};
+use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::AccountId;
-use tagteam_provider::{Env, MutationGuard, ProfileMarker, Read, profile_path};
+use tagteam_engine::vault::SERVICE;
+use tagteam_provider::flock::{LockProbe, probe_lock};
+use tagteam_provider::mock_server::MockServer;
+use tagteam_provider::splice::{get_top_level, replace_top_level};
+use tagteam_provider::{
+    Env, FileKeychain, Keychain, MutationGuard, ProfileMarker, Read, profile_path,
+};
 
 /// The fake `claude` run on its own, as tagteam would find it: first on `PATH`, `HOME` under
 /// `root`, in `root`, and nothing else in its environment.
@@ -1280,4 +1287,513 @@ fn a_signal_pending_when_the_spawn_fails_is_spent_on_the_exit_handling_and_never
         !home.profile().join(BASELINE).exists(),
         "the bootstrap's baseline was merged back"
     );
+}
+
+// ---- Task 13: the kill paths, two sessions, and the races (§15.2, Review Focus 1 and 3) ----
+
+/// The token endpoint's path under a test base (Appendix A.5).
+const TOKEN: &str = "/v1/oauth/token";
+
+impl Home {
+    /// The binary for a command that runs no agent.
+    fn cmd(&self) -> assert_cmd::Command {
+        cmd(self.root())
+    }
+}
+
+/// Polls `ready` every 10 ms until it holds; fails after `within`. (Task 3's `wait_for` polls
+/// one `FAKE_CLAUDE_OUT` file; this one waits on anything.)
+fn wait_until(within: Duration, what: &str, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + within;
+    while !ready() {
+        assert!(Instant::now() < deadline, "never got to {what}");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A Claude Code credential of `rt`'s lineage, for `FAKE_CLAUDE_ROTATE`: what the session's
+/// own refresh writes to its profile (Appendix A.4's account-scoped keys).
+fn rotated(rt: &str) -> String {
+    json!({"claudeAiOauth": {
+        "accessToken": format!("at-{rt}"),
+        "refreshToken": rt,
+        "expiresAt": 4_102_444_800_000i64,
+        "refreshTokenExpiresAt": 4_102_444_800_000i64,
+        "scopes": ["user:inference", "user:profile"]
+    }})
+    .to_string()
+}
+
+/// The refresh token in a credential's bytes.
+fn refresh_token(bytes: &[u8]) -> String {
+    let v: Value = serde_json::from_slice(bytes).unwrap();
+    v["claudeAiOauth"]["refreshToken"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// The refresh token of `id`'s vault generation (§6.2).
+fn vault_rt(root: &Path, id: &str) -> String {
+    let bytes = FileKeychain::new(root.join("keychain"))
+        .find(SERVICE, id)
+        .present()
+        .expect("a vault generation");
+    refresh_token(&bytes)
+}
+
+/// The refresh token of the default home's live credential, as Claude Code reads it.
+fn live_rt(root: &Path) -> String {
+    let env = Env::for_test(root);
+    let bytes = FileKeychain::new(root.join("keychain"))
+        .find(
+            &keychain_service(&env, ItemKind::OAuth),
+            &keychain_account(&env),
+        )
+        .present()
+        .expect("a live credential");
+    refresh_token(&bytes)
+}
+
+/// The refresh token in `profile`'s credential file.
+fn profile_rt(profile: &Path) -> String {
+    refresh_token(&fs::read(profile.join(".credentials.json")).unwrap())
+}
+
+/// What a session does to its own config (§12.4): it trusts the project at `path`.
+fn trust(profile: &Path, path: &str) {
+    let file = profile.join(".claude.json");
+    let doc = fs::read(&file).unwrap();
+    let mut projects = get_top_level(&doc, "projects")
+        .unwrap()
+        .unwrap_or_else(|| json!({}));
+    projects[path] = json!({"allowedTools": [], "hasTrustDialogAccepted": true});
+    fs::write(
+        &file,
+        replace_top_level(&doc, "projects", &projects).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Whether the config at `file` trusts the project at `path`.
+fn trusts(file: &Path, path: &str) -> bool {
+    let doc = fs::read(file).unwrap();
+    get_top_level(&doc, "projects")
+        .unwrap()
+        .is_some_and(|p| p[path]["hasTrustDialogAccepted"] == json!(true))
+}
+
+/// The default home's `~/.claude.json`.
+fn default_config(home: &Home) -> PathBuf {
+    home.root().join("home/.claude.json")
+}
+
+/// No reservation file in `profile` is held: whatever held one has exited (§12.5).
+fn all_free(profile: &Path) -> bool {
+    reservations(profile)
+        .iter()
+        .all(|r| probe_lock(r).unwrap() != LockProbe::Held)
+}
+
+/// `list --json`'s row for account `id`.
+fn listed(v: &Value, id: &str) -> Value {
+    v["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == json!(id))
+        .cloned()
+        .unwrap()
+}
+
+/// `tagteam <args> --json` for a command that refuses: exit 1, and the error's kind.
+fn refused(home: &Home, args: &[&str]) -> String {
+    let out = home.cmd().args(args).arg("--json").output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+    kind(&out.stdout)
+}
+
+/// Account `a` is in a session, as another process sees it: `list` marks it, sending no token
+/// request, and `switch` and `remove` refuse (§10.3, §12.5).
+fn assert_session_owned(home: &Home, server: &MockServer) {
+    let out = home
+        .cmd()
+        .env("TAGTEAM_TEST_API_BASE", server.base_url())
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(listed(&v, &home.a)["inSession"], json!(true), "{v}");
+    assert_eq!(
+        server.hits("POST", TOKEN),
+        0,
+        "the gate never refreshes a session's account"
+    );
+    assert_eq!(refused(home, &["switch", "1"]), "session-owned");
+    assert_eq!(live_email(home.root()), "b@x.co");
+    assert_eq!(refused(home, &["remove", "1"]), "session-owned");
+    assert!(home.profile().exists());
+}
+
+/// Review Focus 1's start: account `a`'s session runs, rotates its credential to `rt-a2`, and
+/// trusts `/work/killed`; then `tagteam` is killed with SIGKILL under it. Returns the hold file
+/// that lets the orphaned session go, and its guard.
+fn kill_mid_session(home: &Home) -> (PathBuf, Release) {
+    let out = home.out("killed");
+    let hold = home.root().join("hold-killed");
+    let guard = Release(vec![hold.clone()]);
+    let mut c = home.tagteam(&out);
+    c.args(["run", "1", "--", "x"])
+        .env("FAKE_CLAUDE_HOLD", &hold)
+        .env("FAKE_CLAUDE_ROTATE", rotated("rt-a2"))
+        .process_group(0)
+        .stdin(Stdio::null())
+        // The orphaned session keeps tagteam's output: never a pipe this test reads.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = c.spawn().unwrap();
+    wait_while_running(&mut child, "the session", || started(&out));
+    trust(&home.profile(), "/work/killed");
+    send(child.id(), libc::SIGKILL);
+    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    (hold, guard)
+}
+
+/// After `kill_mid_session`: `claude` holds the reservation through its inherited fd, so the
+/// account stays session-owned, and nothing is captured under it (§12.5, B.46).
+fn assert_still_owned(home: &Home) {
+    let held = reservations(&home.profile());
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(probe_lock(&held[0]).unwrap(), LockProbe::Held);
+    assert_session_owned(home, &MockServer::start());
+    assert_eq!(
+        vault_rt(home.root(), &home.a),
+        "rt-a",
+        "nothing captured under a session"
+    );
+}
+
+#[test]
+fn a_killed_tagteam_leaves_its_reservation_live_and_the_next_launch_captures_and_merges_back() {
+    let home = Home::new();
+    let profile = home.profile();
+    let (hold, _guard) = kill_mid_session(&home);
+    assert_still_owned(&home);
+
+    // A launch now joins the orphaned session: no capture, no bootstrap and no seed under it.
+    let join = home.out("join");
+    let out = home
+        .tagteam(&join)
+        .args(["run", "1", "--", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(vault_rt(home.root(), &home.a), "rt-a");
+    assert_eq!(
+        profile_rt(&profile),
+        "rt-a2",
+        "never bootstrapped over (B.28)"
+    );
+    assert!(
+        trusts(&profile.join(".claude.json"), "/work/killed"),
+        "never re-seeded (B.44)"
+    );
+    assert!(profile.join(BASELINE).exists());
+    assert!(
+        !trusts(&default_config(&home), "/work/killed"),
+        "not merged while it runs"
+    );
+
+    // The orphan exits, and its lock goes with it.
+    release(&hold);
+    wait_until(LONG, "the orphaned session's exit", || all_free(&profile));
+    let next = home.out("next");
+    let out = home
+        .tagteam(&next)
+        .args(["run", "1", "--", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        vault_rt(home.root(), &home.a),
+        "rt-a2",
+        "lazily captured at the next launch"
+    );
+    assert!(
+        trusts(&default_config(&home), "/work/killed"),
+        "the left-over baseline merged back first (§12.5 step 2)"
+    );
+    assert!(!profile.join(BASELINE).exists());
+    assert!(
+        reservations(&profile).is_empty(),
+        "the dead reservation is gone too"
+    );
+}
+
+#[test]
+fn after_a_killed_tagteam_s_session_ends_a_switch_captures_its_rotation_first() {
+    let home = Home::new();
+    let profile = home.profile();
+    let (hold, _guard) = kill_mid_session(&home);
+    assert_eq!(refused(&home, &["switch", "1"]), "session-owned");
+
+    release(&hold);
+    wait_until(LONG, "the orphaned session's exit", || all_free(&profile));
+    let out = home.cmd().args(["switch", "1", "--json"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        vault_rt(home.root(), &home.a),
+        "rt-a2",
+        "§9.2's pre-check captured it"
+    );
+    assert_eq!(
+        live_rt(home.root()),
+        "rt-a2",
+        "and the switch activated it, never the consumed rt-a"
+    );
+    assert!(
+        profile.join(BASELINE).exists(),
+        "the merge-back waits for the next launch"
+    );
+}
+
+#[test]
+fn after_a_killed_tagteam_s_session_ends_the_gate_captures_its_rotation() {
+    let home = Home::new();
+    let profile = home.profile();
+    let (hold, _guard) = kill_mid_session(&home);
+    release(&hold);
+    wait_until(LONG, "the orphaned session's exit", || all_free(&profile));
+
+    // §7.3 step 3: the next refresh `a` needs, which `list`'s collection reaches.
+    expire_vault(home.root(), &home.a, 60_000);
+    home.cmd().args(["list", "--json"]).assert().success();
+    assert_eq!(vault_rt(home.root(), &home.a), "rt-a2");
+}
+
+#[test]
+fn the_last_of_two_sessions_out_captures_a_rotation_either_made_and_merges_back() {
+    // Review Focus 3, in both orders. The session that rotates also exits first, so it is
+    // always the other, last one out that captures.
+    for first_rotates in [true, false] {
+        let home = Home::new();
+        let profile = home.profile();
+        let (o1, o2) = (home.out("one"), home.out("two"));
+        let (h1, h2) = (home.root().join("hold-one"), home.root().join("hold-two"));
+        let _guard = Release(vec![h1.clone(), h2.clone()]);
+        let rotation = rotated("rt-a2");
+        let rotate: &[(&str, &str)] = &[("FAKE_CLAUDE_ROTATE", rotation.as_str())];
+
+        let mut one = start(&home, &o1, &h1, if first_rotates { rotate } else { &[] });
+        wait_while_running(&mut one, "the first session", || started(&o1));
+        trust(&profile, "/work/shared");
+        let baseline = fs::read(profile.join(BASELINE)).unwrap();
+        let mut two = start(&home, &o2, &h2, if first_rotates { &[] } else { rotate });
+        wait_while_running(&mut two, "the second session", || started(&o2));
+
+        // The second joined: no seed over the first's changes, no bootstrap over its credential.
+        assert!(
+            trusts(&profile.join(".claude.json"), "/work/shared"),
+            "{first_rotates}"
+        );
+        assert_eq!(
+            fs::read(profile.join(BASELINE)).unwrap(),
+            baseline,
+            "{first_rotates}"
+        );
+        assert_eq!(profile_rt(&profile), "rt-a2", "{first_rotates}");
+        assert_eq!(reservations(&profile).len(), 2, "{first_rotates}");
+
+        // The first out leaves capture and merge-back to the last.
+        let (first, first_hold, last, last_hold) = if first_rotates {
+            (one, h1.clone(), two, h2.clone())
+        } else {
+            (two, h2.clone(), one, h1.clone())
+        };
+        release(&first_hold);
+        let out = finish(first, LONG);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{first_rotates}: {}",
+            stderr(&out)
+        );
+        assert_eq!(vault_rt(home.root(), &home.a), "rt-a", "{first_rotates}");
+        assert!(
+            !trusts(&default_config(&home), "/work/shared"),
+            "{first_rotates}"
+        );
+        assert!(profile.join(BASELINE).exists(), "{first_rotates}");
+        assert_eq!(reservations(&profile).len(), 1, "{first_rotates}");
+
+        release(&last_hold);
+        let out = finish(last, LONG);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{first_rotates}: {}",
+            stderr(&out)
+        );
+        assert_eq!(vault_rt(home.root(), &home.a), "rt-a2", "{first_rotates}");
+        assert!(
+            trusts(&default_config(&home), "/work/shared"),
+            "{first_rotates}"
+        );
+        assert!(!profile.join(BASELINE).exists(), "{first_rotates}");
+        assert!(reservations(&profile).is_empty(), "{first_rotates}");
+    }
+}
+
+#[test]
+fn a_reservation_owns_the_account_before_claude_starts() {
+    // §12.5: the reservation covers the gap before claude writes its own session record.
+    let home = Home::new();
+    let server = MockServer::start();
+    // Due, so the gate would refresh `a` if it were not in a session.
+    expire_vault(home.root(), &home.a, 60_000);
+    let out = home.out("racing");
+    let hold = home.root().join("hold");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _guard = Release(vec![hold.clone(), pause.join("resume")]);
+    let mut child = start(
+        &home,
+        &out,
+        &hold,
+        &[
+            ("TAGTEAM_TEST_PAUSE_AT", "before-spawn"),
+            ("TAGTEAM_TEST_PAUSE_DIR", pause.to_str().unwrap()),
+        ],
+    );
+    wait_while_running(&mut child, "the spawn", || pause.join("paused").exists());
+    assert!(session(&out).is_none(), "claude has not started");
+    assert_eq!(reservations(&home.profile()).len(), 1);
+
+    assert_session_owned(&home, &server);
+
+    fs::write(pause.join("resume"), b"").unwrap();
+    wait_while_running(&mut child, "the session", || started(&out));
+    release(&hold);
+    let output = finish(child, LONG);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
+#[test]
+fn exit_handling_finishes_before_another_process_can_take_the_account() {
+    // §12.5 "When the child exits": between claude's exit and the unlink, the reservation is
+    // still tagteam's, so remove, switch and the gate all see a session.
+    let home = Home::new();
+    let server = MockServer::start();
+    expire_vault(home.root(), &home.a, 60_000);
+    let profile = home.profile();
+    let out = home.out("exiting");
+    let hold = home.root().join("hold");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _guard = Release(vec![hold.clone(), pause.join("resume")]);
+    let rotation = rotated("rt-a2");
+    let mut child = start(
+        &home,
+        &out,
+        &hold,
+        &[
+            ("FAKE_CLAUDE_ROTATE", rotation.as_str()),
+            ("TAGTEAM_TEST_PAUSE_AT", "after-exit"),
+            ("TAGTEAM_TEST_PAUSE_DIR", pause.to_str().unwrap()),
+        ],
+    );
+    wait_while_running(&mut child, "the session", || started(&out));
+    trust(&profile, "/work/raced");
+    release(&hold);
+    wait_while_running(&mut child, "the exit handling", || {
+        pause.join("paused").exists()
+    });
+    assert!(
+        session(&out).is_some_and(|c| c.exit.is_some()),
+        "claude has exited"
+    );
+
+    assert_session_owned(&home, &server);
+    assert_eq!(
+        vault_rt(home.root(), &home.a),
+        "rt-a",
+        "nothing captured outside exit handling"
+    );
+
+    fs::write(pause.join("resume"), b"").unwrap();
+    let output = finish(child, LONG);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(vault_rt(home.root(), &home.a), "rt-a2");
+    assert!(trusts(&default_config(&home), "/work/raced"));
+    assert!(!profile.join(BASELINE).exists());
+    assert!(reservations(&profile).is_empty());
+    // Quiescent now: remove goes ahead and takes the profile with it.
+    home.cmd().args(["remove", "1"]).assert().success();
+    assert!(!profile.exists());
+}
+
+#[test]
+fn a_signal_during_exit_handling_defers_it_to_the_next_launch_and_keeps_the_child_s_code() {
+    // §12.5 "After claude exits", B.63, §15.2 "Exit paths".
+    let home = Home::new();
+    let profile = home.profile();
+    let out = home.out("deferred");
+    let hold = home.root().join("hold");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _guard = Release(vec![hold.clone(), pause.join("resume")]);
+    let rotation = rotated("rt-a2");
+    let mut child = start(
+        &home,
+        &out,
+        &hold,
+        &[
+            ("FAKE_CLAUDE_ROTATE", rotation.as_str()),
+            ("FAKE_CLAUDE_EXIT", "3"),
+            ("TAGTEAM_TEST_PAUSE_AT", "after-exit"),
+            ("TAGTEAM_TEST_PAUSE_DIR", pause.to_str().unwrap()),
+        ],
+    );
+    wait_while_running(&mut child, "the session", || started(&out));
+    trust(&profile, "/work/deferred");
+    release(&hold);
+    wait_while_running(&mut child, "the exit handling", || {
+        pause.join("paused").exists()
+    });
+    let lock = MutationGuard::acquire(&Env::for_test(home.root()), Duration::from_secs(5)).unwrap();
+    fs::write(pause.join("resume"), b"").unwrap();
+    settle(); // into exit handling's wait for the mutation lock
+    send(child.id(), libc::SIGTERM);
+    let output = finish(child, LONG);
+    drop(lock);
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "the child's code: {}",
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("note: "),
+        "a notice says what was left undone:\n{err}"
+    );
+    assert!(!err.contains("too late"), "{err}");
+    assert_eq!(vault_rt(home.root(), &home.a), "rt-a");
+    assert!(!trusts(&default_config(&home), "/work/deferred"));
+    assert!(profile.join(BASELINE).exists());
+    assert!(all_free(&profile), "what it left died with it");
+
+    let next = home.out("next");
+    let output = home
+        .tagteam(&next)
+        .args(["run", "1", "--", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(vault_rt(home.root(), &home.a), "rt-a2");
+    assert!(trusts(&default_config(&home), "/work/deferred"));
+    assert!(!profile.join(BASELINE).exists());
+    assert!(reservations(&profile).is_empty());
 }
