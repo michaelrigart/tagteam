@@ -43,7 +43,8 @@ pub enum LaunchEnd {
 }
 
 /// §12.4 step 3: one summary line when keys changed on both sides since the baseline, the
-/// default's values kept. Each key is named in the log only.
+/// default's values kept. Each key is named in the log only. The line is logged at warn as soon
+/// as it is made, so a launch that aborts after its merge-back still reports it.
 pub(crate) fn merge_summary(row: &AccountRow, report: &MergeReport) -> Option<String> {
     for key in &report.conflicts {
         tracing::info!(
@@ -61,11 +62,13 @@ pub(crate) fn merge_summary(row: &AccountRow, report: &MergeReport) -> Option<St
     );
     let n = report.conflicts.len();
     (n > 0).then(|| {
-        format!(
+        let summary = format!(
             "{n} {} of position {}'s session config changed on both sides while it ran; the default home's values were kept",
             if n == 1 { "key" } else { "keys" },
             row.position
-        )
+        );
+        tracing::warn!(position = row.position, account = %row.id, "{summary}");
+        summary
     })
 }
 
@@ -207,10 +210,11 @@ impl Engine {
     /// as §7.2's direct-target column. Returns the warnings to show. A vault read that fails
     /// because the account was removed since `plan_run` is `TargetChanged` (B.47).
     ///
-    /// Nothing else here refuses: whether the launch joins a running session is known only
-    /// under the locks. A quarantined account is never refreshed (§7.4), and one whose stored
-    /// credential cannot be read has nothing to refresh. `locked_login` judges both for a
-    /// quiescent launch, and a join, which uses no stored credential, goes on (§12.5 step 3).
+    /// Nothing about the stored login refuses here: whether the launch joins a running session
+    /// is known only under the locks. A quarantined account is never refreshed (§7.4), one whose
+    /// stored credential cannot be read has nothing to refresh, and a generation the gate finds
+    /// dead or spent goes on too. `locked_login` judges each for a quiescent launch, and a join,
+    /// which uses no stored credential, goes on (§12.5 step 3).
     fn freshen_for_launch(
         &self,
         p: &dyn Provider,
@@ -255,8 +259,12 @@ impl Engine {
                 &row.label,
                 "an unfinished switch names it",
             )],
-            // The vault's generation is dead, or spent with its successor lost (§7.3 step 6).
-            GateOutcome::Dead(_) | GateOutcome::Unpersisted => return Err(needs_relogin(row)),
+            // The vault's generation is dead, or spent with its successor lost (§7.3 step 6),
+            // and the gate has quarantined the account (for `Unpersisted`, best effort, as §7.3
+            // step 6 allows). It answers a quarantine before it asks who owns the account, so
+            // this may be a join's: `locked_login` refuses only a quiescent launch, on the row
+            // it reads under the locks (fix round 1).
+            GateOutcome::Dead(_) | GateOutcome::Unpersisted => Vec::new(),
             GateOutcome::Transient { rescued: true, .. } => {
                 return Err(pending(
                     "the refresh succeeded, but the vault could not be written; the new token is in rescue/",
