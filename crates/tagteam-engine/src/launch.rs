@@ -155,12 +155,14 @@ impl Engine {
         if profile.is_dir() {
             let removed =
                 remove_dead_reservations(&profile).map_err(|e| reservation_io(&reservations, e))?;
-            for dead in removed {
+            // Counted, never named (§14.2, B.69): a file of any name ending `.lock` counts as a
+            // reservation there, and not every one is tagteam's `<pid>.lock`.
+            if !removed.is_empty() {
                 tracing::debug!(
                     position = row.position,
                     account = %row.id,
-                    reservation = %dead.display(),
-                    "removed a dead launch reservation"
+                    removed = removed.len(),
+                    "removed dead launch reservations"
                 );
             }
         }
@@ -606,11 +608,14 @@ impl Engine {
         };
         match self.session_state_apart_from(p, &row, own)? {
             SessionState::Quiescent { .. } => {}
-            SessionState::Unreadable { detail, .. } => {
+            // §14.2, B.69: the state only. Its detail names the file, and a record's name is not
+            // tagteam's to choose; the next launch's warning names it to the user.
+            SessionState::Unreadable { .. } => {
                 tracing::warn!(
                     position = row.position,
                     account = %row.id,
-                    "a session reservation or record could not be read ({detail}); the profile counts as in use, so capture and merge-back wait"
+                    state = "unreadable",
+                    "a session reservation or record could not be read; the profile counts as in use, so capture and merge-back wait"
                 );
                 return Ok(());
             }
