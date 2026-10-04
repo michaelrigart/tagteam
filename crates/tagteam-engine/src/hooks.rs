@@ -39,17 +39,30 @@ pub(crate) fn point(engine: &Engine, name: &'static str) -> Result<(), EngineErr
 /// so a signal sent meanwhile meets the work after the point exactly as it would have met it
 /// there. The engine's points park through it, and so do the CLI's own (`tagteam run`'s
 /// `before-spawn`), so a binary test drives one protocol.
+///
+/// A point the process passes again finds `resume` there and goes on. With
+/// `TAGTEAM_TEST_PAUSE_EACH` set too, each pass parks on files of its own instead: the `n`th
+/// creates `paused-<n>` and waits for `resume-<n>`.
 #[cfg(feature = "test-hooks")]
 pub fn pause_at(name: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PASSES: AtomicUsize = AtomicUsize::new(0);
     if std::env::var("TAGTEAM_TEST_PAUSE_AT").as_deref() != Ok(name) {
         return;
     }
     let Some(dir) = std::env::var_os("TAGTEAM_TEST_PAUSE_DIR").map(std::path::PathBuf::from) else {
         return;
     };
-    let _ = std::fs::write(dir.join("paused"), b"");
+    let (paused, resume) = if std::env::var_os("TAGTEAM_TEST_PAUSE_EACH").is_some() {
+        let n = PASSES.fetch_add(1, Ordering::SeqCst) + 1;
+        (format!("paused-{n}"), format!("resume-{n}"))
+    } else {
+        ("paused".to_owned(), "resume".to_owned())
+    };
+    let _ = std::fs::write(dir.join(paused), b"");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while !dir.join("resume").exists() && std::time::Instant::now() < deadline {
+    while !dir.join(&resume).exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }

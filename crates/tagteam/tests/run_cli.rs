@@ -908,6 +908,73 @@ fn a_mapped_target_removed_before_the_launch_reads_it_runs_plain_claude_after_on
     assert!(!home.profile().exists(), "no session was started");
 }
 
+#[test]
+fn a_target_that_changes_again_under_the_second_plan_s_launch_is_the_command_s_error() {
+    // Decision 14: `run` plans once more after a `TargetChanged`, and a second one is its error,
+    // never a loop. `work` maps to b, the live login, and `work/app` to a. While the first launch
+    // waits for its locks, a becomes the live login and `work/app` is unmapped, so the second
+    // plan starts a session of b; while that launch waits, b becomes the live login again.
+    let home = Home::new();
+    let out = home.out("raced twice");
+    let (work, app) = (home.root().join("work"), home.root().join("work/app"));
+    fs::create_dir_all(&app).unwrap();
+    let map = |dir: &Path, position: &str| {
+        cmd(home.root())
+            .current_dir(dir)
+            .args(["map", position])
+            .assert()
+            .success();
+    };
+    map(&work, "2");
+    map(&app, "1");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _release = Release(vec![pause.join("resume-1"), pause.join("resume-2")]);
+    let mut c = home.tagteam(&out);
+    c.args(["--json", "run", "--", "x"])
+        .current_dir(&app)
+        .env("TAGTEAM_TEST_PAUSE_AT", "launch-before-locks")
+        .env("TAGTEAM_TEST_PAUSE_EACH", "1")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause);
+    let mut child = spawn(c);
+    wait_while_running(&mut child, "the first launch", || {
+        pause.join("paused-1").exists()
+    });
+    cmd(home.root()).args(["switch", "1"]).assert().success();
+    cmd(home.root())
+        .current_dir(&app)
+        .arg("unmap")
+        .assert()
+        .success();
+    fs::write(pause.join("resume-1"), b"").unwrap();
+    wait_while_running(&mut child, "the second launch", || {
+        pause.join("paused-2").exists()
+    });
+    cmd(home.root()).args(["switch", "2"]).assert().success();
+    fs::write(pause.join("resume-2"), b"").unwrap();
+    let output = finish(child, LONG);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(kind(&output.stdout), "target-changed");
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("position 2 became the live login")),
+        "{v}"
+    );
+    assert_eq!(
+        stderr(&output)
+            .matches("warning: position 1 became the live login")
+            .count(),
+        1,
+        "the first change is a warning, once: {}",
+        stderr(&output)
+    );
+    assert!(fake_claude_calls(&out).is_empty(), "nothing ran");
+    assert!(!home.profile().exists(), "no session was started");
+}
+
 // ---- Signals while claude runs (§12.5, Review Focus 2) ----
 
 #[test]
