@@ -34,3 +34,5 @@ pub mod views;
 
 pub use engine::{Engine, EngineConfig};
 pub use error::{EngineError, SplitCause};
+#[cfg(feature = "test-hooks")]
+pub use hooks::pause_at;

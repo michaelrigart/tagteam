@@ -175,22 +175,11 @@ fn notify(err: &mut dyn Write, notices: &[String]) {
 }
 
 /// A test-only stop at `name`: `before-spawn` is right after the token's last look. It parks
-/// as the engine's points do (M3a): with `TAGTEAM_TEST_PAUSE_AT=<name>`, it writes `paused` in
-/// `TAGTEAM_TEST_PAUSE_DIR` and waits up to 30 s for `resume` there. It never looks at the
-/// token, so a signal sent meanwhile meets the run exactly where it would have.
+/// through the engine's own protocol (`tagteam_engine::pause_at`), and never looks at the token,
+/// so a signal sent meanwhile meets the run exactly where it would have.
 #[cfg(feature = "test-support")]
 fn pause_point(name: &str) {
-    if std::env::var("TAGTEAM_TEST_PAUSE_AT").as_deref() != Ok(name) {
-        return;
-    }
-    let Some(dir) = std::env::var_os("TAGTEAM_TEST_PAUSE_DIR").map(std::path::PathBuf::from) else {
-        return;
-    };
-    let _ = std::fs::write(dir.join("paused"), b"");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !dir.join("resume").exists() && std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
+    tagteam_engine::pause_at(name);
 }
 
 #[cfg(not(feature = "test-support"))]
