@@ -743,6 +743,37 @@ mod tests {
     }
 
     #[test]
+    fn a_captured_child_inherits_no_launch_reservation() {
+        // Decision 3, the counterpart of the session's descriptor test: the login check runs
+        // through `run_captured` while the launch holds its reservation, and a check that kept
+        // the descriptor would keep the account session-owned for as long as it ran.
+        let _fork = fork_guard();
+        let d = tempfile::tempdir().unwrap();
+        let reservation = crate::reservation::LaunchReservation::create(d.path()).unwrap();
+        let fd = reservation.fd();
+        let probe = sh(&format!(
+            "if test -e /dev/fd/{fd}; then echo held; else echo none; fi"
+        ));
+
+        let got = SystemSpawner.run_captured(&probe, Duration::from_secs(5), &Cancel::new());
+
+        assert!(
+            matches!(&got, Captured::Exited { code: Some(0), stdout, .. } if stdout == b"none\n"),
+            "{got:?}"
+        );
+        // The probe sees the descriptor where it is passed on.
+        let mut session = spawn_session(
+            &SpawnSpec {
+                args: vec!["-c".into(), format!("test -e /dev/fd/{fd}").into()],
+                ..spec("/bin/sh", &[])
+            },
+            Some(fd),
+        )
+        .unwrap();
+        assert!(session.wait().unwrap().success(), "a session holds {fd}");
+    }
+
+    #[test]
     fn a_session_with_a_closed_descriptor_is_not_spawned() {
         let _fork = fork_guard();
         let err = spawn_session(&sh("exit 0"), Some(10_000)).unwrap_err();
