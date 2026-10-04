@@ -560,3 +560,46 @@ fn fish_positional_lines(cmd: &clap::Command, path: &mut Vec<String>, script: &m
         path.pop();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tagteam_engine::settings::parse_bool;
+
+    use super::BOOL_WORDS;
+
+    /// Every string of `a-z0-9`, up to `max` characters.
+    fn words_up_to(max: usize) -> Vec<String> {
+        let mut all = Vec::new();
+        let mut layer = vec![String::new()];
+        for _ in 0..max {
+            layer = layer
+                .iter()
+                .flat_map(|w| ('a'..='z').chain('0'..='9').map(move |c| format!("{w}{c}")))
+                .collect();
+            all.extend(layer.iter().cloned());
+        }
+        all
+    }
+
+    #[test]
+    fn the_completed_boolean_words_are_exactly_the_ones_parse_bool_takes() {
+        // §6.4's six. `BOOL_WORDS` restates `parse_bool`'s set for completion, so neither may
+        // drift: each word completes to a value that parses, and nothing else lowercase does.
+        assert_eq!(BOOL_WORDS, ["true", "false", "1", "0", "yes", "no"]);
+        for word in BOOL_WORDS {
+            assert!(
+                parse_bool(word).is_some(),
+                "{word:?} completes but is refused"
+            );
+        }
+        let alike = [
+            "on", "off", "y", "n", "t", "f", "enable", "disable", "enabled", "yeah",
+        ];
+        for word in words_up_to(4).iter().map(String::as_str).chain(alike) {
+            assert!(
+                parse_bool(word).is_none() || BOOL_WORDS.contains(&word),
+                "{word:?} is accepted but never completed"
+            );
+        }
+    }
+}
