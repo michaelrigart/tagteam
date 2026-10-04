@@ -1589,6 +1589,67 @@ fn a_merge_back_that_fails_after_the_capture_failed_is_logged_by_its_kind() {
 }
 
 #[test]
+fn a_malformed_record_at_exit_leaves_capture_and_merge_back_waiting_and_its_name_out_of_the_log() {
+    // §12.6: a record that cannot be read counts as a session, so the last one out is not this
+    // one. The record's file name is not tagteam's to choose, so the log gives the state only
+    // (§14.2, B.69).
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let launched = first_launch(&fx, &a, "a@x.co");
+    let profile = launched.profile.clone();
+    let own = launched.reservation.path().to_path_buf();
+    session_adds_project(&profile, "/work/new");
+    fx.plant_record(&profile, "alice@example.com", b"[1,");
+
+    let (notices, logs) = capture_logs(|| fx.engine.finish_run(launched, LaunchEnd::Exited(0)));
+
+    assert!(notices.is_empty(), "{notices:?}");
+    assert!(
+        profile.join(".tagteam-baseline.json").exists(),
+        "the merge-back waits"
+    );
+    assert!(!own.exists(), "unlinked");
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("WARN") && l.contains("state=\"unreadable\"")),
+        "{logs:?}"
+    );
+    assert!(
+        logs.iter().all(|l| !l.contains("alice@example.com")),
+        "{logs:?}"
+    );
+}
+
+#[test]
+fn a_dead_reservation_is_removed_without_its_name_in_the_log() {
+    // §12.5 step 2. Only tagteam names its own reservations `<pid>.lock`; a file of any other
+    // name there is removed all the same once it is dead, and its name is never logged.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = killed_session(&fx, &a, "a@x.co");
+    let stray = profile.join(LAUNCH_DIR).join("alice@example.com.lock");
+    fs::write(&stray, b"").unwrap();
+
+    let (launched, logs) = capture_logs(|| {
+        fx.engine
+            .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app"))
+            .unwrap()
+    });
+
+    assert!(!stray.exists(), "removed");
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("dead launch reservation") && l.contains("removed=2")),
+        "{logs:?}"
+    );
+    assert!(
+        logs.iter().all(|l| !l.contains("alice@example.com")),
+        "{logs:?}"
+    );
+    drop(launched);
+}
+
+#[test]
 fn a_rotation_in_a_profile_that_names_no_identity_is_not_captured_at_exit() {
     // R11.1, M4a's Decision 9 at exit: a rotation no identity says is the account's is neither
     // captured nor ignored. It is the one notice; the merge-back and the unlink still run.

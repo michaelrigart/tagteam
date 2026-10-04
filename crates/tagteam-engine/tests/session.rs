@@ -256,6 +256,35 @@ fn remove_refuses_while_a_session_record_is_unreadable() {
 }
 
 #[test]
+fn a_malformed_record_named_with_an_email_is_named_in_the_refusal_and_in_no_log_line() {
+    // §14.2, B.69: a record's file name is not tagteam's to choose. The refusal is the user's
+    // and names the file; the log gives the state only.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let torn = fx.plant_record(&dir, "alice@example.com", b"[1,");
+
+    let (result, logs) = capture_logs(|| fx.engine.remove(&a));
+
+    let err = result.unwrap_err();
+    assert_eq!(err.kind(), "session-owned");
+    assert!(
+        err.to_string().contains(&torn.display().to_string()),
+        "{err}"
+    );
+    assert!(
+        logs.iter()
+            .any(|l| l.contains("WARN") && l.contains("state=\"unreadable\"")),
+        "{logs:?}"
+    );
+    assert!(
+        logs.iter().all(|l| !l.contains("alice@example.com")),
+        "{logs:?}"
+    );
+}
+
+#[test]
 fn remove_of_an_account_whose_profile_path_is_a_regular_file_finishes() {
     // Nothing can run in a file: it holds no reservation and no record, so the account is not
     // session-owned, and `remove` deletes the file with the rest.

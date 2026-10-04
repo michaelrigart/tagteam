@@ -207,11 +207,14 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let state = self.session_state(p, row)?;
         let unreadable = match &state {
+            // §14.2, B.69: the log gives the state only, since the detail names the file and a
+            // record's name is not tagteam's to choose. The refusal names it to the user.
             SessionState::Unreadable { detail, .. } => {
                 tracing::warn!(
                     position = row.position,
                     account = %row.id,
-                    "a session reservation or record could not be read ({detail}); the account counts as session-owned"
+                    state = "unreadable",
+                    "a session reservation or record could not be read; the account counts as session-owned"
                 );
                 Some(detail.clone())
             }
