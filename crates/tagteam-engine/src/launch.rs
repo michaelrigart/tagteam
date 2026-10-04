@@ -34,6 +34,18 @@ pub struct Launched {
     pub warnings: Vec<String>,
 }
 
+/// What the freshen before the locks hands the launch under them (§12.3 step 1).
+#[derive(Default)]
+struct Freshened {
+    warnings: Vec<String>,
+    /// The gate's refusal of the stored login, exactly as §12.3 step 1 and §7.2 word it: the
+    /// vault's generation is consumed, or the profile conflicts with it. The gate gets that far
+    /// only for an account no session owns (§7.3 step 2), but a session can start before this
+    /// launch takes its locks. So it refuses a quiescent launch there, before anything is
+    /// written, and a join, which touches no credential, goes on (§12.5 step 3; fix round 2).
+    refusal: Option<EngineError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchEnd {
     /// `claude` ran and exited with this status code.
@@ -82,8 +94,10 @@ impl Engine {
     /// - the decision is made again (B.47): a target that was removed, or became the live
     ///   login, is `TargetChanged`, for the CLI to plan again;
     /// - a profile path that is not a real directory refuses before anything touches it;
-    /// - dead reservations go. For a quiescent profile, a target with no stored credential is
-    ///   refused and a quarantined one follows §7.2; then its pending merge-back runs, from the
+    /// - for a quiescent profile, before anything is written, the gate's refusal before the
+    ///   locks is returned, a target with no stored credential is refused, and a quarantined
+    ///   one follows §7.2; a join uses no stored credential and goes on;
+    /// - dead reservations go, and a quiescent profile's pending merge-back runs, from the
     ///   baseline in its actual directory (Decision 22; a failure aborts);
     /// - the marker and the links are brought up to date;
     /// - a quiescent profile gets its provenance, then a bootstrap or the seed, and a running
@@ -110,7 +124,10 @@ impl Engine {
         }
         self.settle_or_refuse(&account.provider)?;
         hooks::point(self, "launch-before-freshen")?;
-        let mut warnings = self.freshen_for_launch(p, account)?;
+        let Freshened {
+            mut warnings,
+            refusal,
+        } = self.freshen_for_launch(p, account)?;
         hooks::point(self, "launch-before-locks")?;
         let guard =
             self.guard_or_refuse_within(&account.provider, MutationGuard::BOOTSTRAP_TIMEOUT)?;
@@ -122,6 +139,17 @@ impl Engine {
         // Through a link at the profile path, everything below would land at its target: the
         // reservations, the merge-back, the marker, the links and the seed (controller ruling).
         refuse_linked_profile(&profile)?;
+        // A dead (free) reservation never counts (§12.5), so the state is read before step 2
+        // removes them, and a quiescent launch refused for its stored login writes nothing.
+        let state = self.session_state(p, &row)?;
+        let joining = state.owned();
+        if !joining {
+            // The stored login this launch starts the profile from, which a join never uses.
+            if let Some(refusal) = refusal {
+                return Err(refusal);
+            }
+            warnings.extend(self.locked_login(p, &row)?);
+        }
         let reservations = profile.join(LAUNCH_DIR);
         // 2.
         if profile.is_dir() {
@@ -136,8 +164,6 @@ impl Engine {
                 );
             }
         }
-        let state = self.session_state(p, &row)?;
-        let joining = state.owned();
         if let SessionState::Unreadable { detail, .. } = &state {
             warnings.push(format!(
                 "a session of position {} may be running ({detail}), so this launch joins it as it is",
@@ -148,8 +174,6 @@ impl Engine {
         // nor marked, and a join makes no link in it.
         let marker = self.own_marker(&row, &profile)?;
         if !joining {
-            // Before anything is written: the stored login this launch starts the profile from.
-            warnings.extend(self.locked_login(p, &row)?);
             // §12.4: a killed session's baseline is in the profile's actual directory, which
             // the marker's spelling no longer names once the data directory has moved
             // (Decision 22).
@@ -207,33 +231,34 @@ impl Engine {
     /// §12.3 step 1, before any lock. A vault credential about to expire is refreshed through
     /// the gate (§7.3), as a switch freshens its target (§7.2), so a bootstrap starts the
     /// profile from a fresh generation. The outcomes map as §12.3 step 1 says, and otherwise
-    /// as §7.2's direct-target column. Returns the warnings to show. A vault read that fails
-    /// because the account was removed since `plan_run` is `TargetChanged` (B.47).
+    /// as §7.2's direct-target column. Returns the warnings to show, and the gate's refusal to
+    /// carry across the locks. A vault read that fails because the account was removed since
+    /// `plan_run` is `TargetChanged` (B.47).
     ///
     /// Nothing about the stored login refuses here: whether the launch joins a running session
-    /// is known only under the locks. A quarantined account is never refreshed (§7.4), one whose
-    /// stored credential cannot be read has nothing to refresh, and a generation the gate finds
-    /// dead or spent goes on too. `locked_login` judges each for a quiescent launch, and a join,
-    /// which uses no stored credential, goes on (§12.5 step 3).
+    /// is known only under the locks, and a join uses no stored credential (§12.5 step 3). A
+    /// quarantined account is never refreshed (§7.4), and one whose stored credential cannot be
+    /// read has nothing to refresh: `locked_login` judges both for a quiescent launch. The
+    /// gate's refusals are `Freshened.refusal`.
     fn freshen_for_launch(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
-    ) -> Result<Vec<String>, EngineError> {
+    ) -> Result<Freshened, EngineError> {
         if !p.kind_traits(&row.kind).refreshable || row.quarantine_reason.is_some() {
-            return Ok(Vec::new());
+            return Ok(Freshened::default());
         }
         let vault = match self.vault_generation(row) {
             Ok(vault) => vault,
             Err(failure) => {
                 return match self.removed_or(row, failure) {
                     removed @ EngineError::TargetChanged { .. } => Err(removed),
-                    _ => Ok(Vec::new()),
+                    _ => Ok(Freshened::default()),
                 };
             }
         };
         if !self.due(p, &vault) {
-            return Ok(Vec::new());
+            return Ok(Freshened::default());
         }
         let app = p.display_name();
         let pending = |detail: &str| EngineError::RescuePending {
@@ -244,44 +269,50 @@ impl Engine {
         // §14.1 (R10.2): nothing is locked yet, and the gate has no cancellation point of its
         // own, so a signal that has landed stops the launch before it spends the refresh token.
         self.check_cancel()?;
+        let warned = |warning: String| Freshened {
+            warnings: vec![warning],
+            refusal: None,
+        };
+        let refused = |refusal: EngineError| Freshened {
+            warnings: Vec::new(),
+            refusal: Some(refusal),
+        };
         Ok(match self.refresh_stored(p, &row.id, &vault)? {
             // Busy: the account lock this launch waits for, and the rescue settlement under it,
             // pick up the other process's refresh.
             GateOutcome::Refreshed(_) | GateOutcome::AlreadyFresh(_) | GateOutcome::Busy => {
-                Vec::new()
+                Freshened::default()
             }
             // The live login: the re-check under the locks decides. A session: this launch
             // joins it, and its `claude` refreshes the token.
-            GateOutcome::Owned(OwnedBy::Live | OwnedBy::Session) => Vec::new(),
+            GateOutcome::Owned(OwnedBy::Live | OwnedBy::Session) => Freshened::default(),
             // The mutation lock decides, as it does for a switch (§7.2).
-            GateOutcome::Owned(OwnedBy::Journal) => vec![cannot_refresh(
+            GateOutcome::Owned(OwnedBy::Journal) => warned(cannot_refresh(
                 app,
                 &row.label,
                 "an unfinished switch names it",
-            )],
-            // The vault's generation is dead, or spent with its successor lost (§7.3 step 6),
-            // and the gate has quarantined the account (for `Unpersisted`, best effort, as §7.3
-            // step 6 allows). It answers a quarantine before it asks who owns the account, so
-            // this may be a join's: `locked_login` refuses only a quiescent launch, on the row
-            // it reads under the locks (fix round 1).
-            GateOutcome::Dead(_) | GateOutcome::Unpersisted => Vec::new(),
-            GateOutcome::Transient { rescued: true, .. } => {
-                return Err(pending(
-                    "the refresh succeeded, but the vault could not be written; the new token is in rescue/",
-                ));
-            }
+            )),
+            // The vault's generation is dead, and the gate has quarantined the account. It
+            // answers a quarantine before it asks who owns the account, so this may be a
+            // join's: `locked_login` refuses a quiescent launch on the row it reads under the
+            // locks (fix round 1).
+            GateOutcome::Dead(_) => Freshened::default(),
+            // Spent, its successor lost (§7.3 step 6). The gate's `successor_lost` quarantine is
+            // best effort, so the refusal itself is carried (fix round 2).
+            GateOutcome::Unpersisted => refused(needs_relogin(row)),
+            GateOutcome::Transient { rescued: true, .. } => refused(pending(
+                "the refresh succeeded, but the vault could not be written; the new token is in rescue/",
+            )),
             GateOutcome::Transient { kind, .. } if kind == "rescue-unreadable" => {
-                return Err(pending("a pending rescue could not be adopted"));
+                refused(pending("a pending rescue could not be adopted"))
             }
             // Nothing was spent: the stored credential goes on (§12.3 step 1).
-            GateOutcome::Transient { kind, .. } => vec![cannot_refresh(app, &row.label, &kind)],
-            GateOutcome::Systemic(detail) => vec![cannot_refresh(app, &row.label, &detail)],
-            GateOutcome::Conflict => {
-                return Err(EngineError::ProfileConflict {
-                    position: row.position,
-                    label: row.label.clone(),
-                });
-            }
+            GateOutcome::Transient { kind, .. } => warned(cannot_refresh(app, &row.label, &kind)),
+            GateOutcome::Systemic(detail) => warned(cannot_refresh(app, &row.label, &detail)),
+            GateOutcome::Conflict => refused(EngineError::ProfileConflict {
+                position: row.position,
+                label: row.label.clone(),
+            }),
         })
     }
 
