@@ -69,6 +69,39 @@
 - **Task 12.** Inside a run shell, the recorded presence of `CLAUDE_SECURESTORAGE_CONFIG_DIR` follows the outer home, because M4a's outer home rewrites it. At most one corner-case warning is affected.
 - **Task 14.** The `--ignored` pass skips PR #3's two network tests by name.
 
+**Rulings during the tasks (2026-10-02 to 2026-10-05):**
+- **Test hygiene.**
+  - Fake `claude` scripts are installed through a child process (`install_script`). A Linux loop showed 5 failures in 30 runs with ETXTBSY when sibling threads forked while a script was being written.
+  - Kill tests null the fake's stdio, so an orphaned `sleep` never holds the harness's pipes.
+  - The pipe `drain` is shared by `process.rs` and `security.rs`.
+  - One test pause protocol is used, the engine's `pause_at`.
+- **Task 5.** Both providers share tagteam's own-file rule: `read_own_bytes`, `has_own_file`, `remove_own_file` and `write_own_json_with`. So a baseline behind a dangling link is unreadable, not absent.
+- **Task 6.** The credential write gets the current spelling, while step 2 reads with the recorded one. A symlinked `<profile>/.credentials.json` is refused in each provider's write, through a shared `refuse_linked_credential`, which keeps the engine provider-neutral. The write is never called while the default home's credential locks are held.
+- **Task 7.** A `claude auth status` reply with `loggedIn: false` and a method other than `none` or `claude.ai` is `unknown`, not `invalid`. `invalid` deletes the profile, which holds the only copy of its MCP OAuth tokens.
+- **Task 8.** A disabled account, named or mapped, plans as a session (§9.3). A mapping re-pointed between the plan and the locks is not re-checked; §12.5 step 1 checks only the live login.
+- **Task 9.**
+  - `displace_held` aborts on an unreadable identity or seed once the held credential is not the vault's (§4.3, B.5).
+  - `mark_profile` refuses a profile path that is not a real directory, so nothing is written through a link.
+- **Task 10.**
+  - A join of a running session is exempt from the stored-login refusals; it touches no credential.
+  - Before the locks, a gate `Dead`, `Unpersisted`, rescued `Transient`, `rescue-unreadable` or `Conflict` is carried across them. A quiescent launch then refuses with the same error before anything is written (§12.3 step 1), and a join goes on.
+- **Task 11.** If the login check is interrupted, the CLI takes the signal before exit handling, so exit handling completes. It then exits 128 + n.
+- **Task 12.** `abandon` always takes a pending signal before exit handling.
+- **Task 13.** The run surfaces are built from scratch: `projects` and `mcpServers`, plus the create-only entries. Negative probes prove a stray identity write fails.
+
+**Rulings from the final whole-branch review (2026-10-05):**
+- **Log lines.** Exit handling logs an error's kind, never its message (B.69). A merge-back error after a failed capture is logged, not dropped.
+- **Exit notice.** For a `profile-conflict` or an unreadable read, it ends with the error's own remedy.
+- **Linked config.** The seed refuses a profile `.claude.json` that is a link (shared `refuse_linked_file`). FakeAgent's `identity.json` is refused the same way.
+- **Merge summary.** Bootstrap's merge-back of a waiting baseline puts its §12.4 summary in the launch's warnings. On an aborted launch it stays at WARN only.
+- **Interface changes against the contract above:**
+  - `bootstrap_profile`, `seed_of` and `prepare_quiescent` return that summary.
+  - An orphaned `<pid>.lock` is the new `EngineError::ReservationHeld` (kind `launch-unreachable`).
+- **Flaky test.** M4a's flaky log-capture test is fixed: a permanent no-op subscriber stops tracing-core caching an event as never wanted.
+- **Parked for M5's logging audit:**
+  - log lines older than M4b that interpolate error messages (`engine.rs`, `refresh.rs`, `rescue.rs`, `lifecycle.rs`, `switch.rs`, `views.rs`, and CC's `live.rs` and `provider.rs`);
+  - absolute paths in log fields, where §14.2 asks for `~/…`.
+
 ## Milestones
 
 | Milestone | Scope |
