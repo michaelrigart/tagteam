@@ -412,6 +412,38 @@ fn a_left_over_baseline_is_merged_back_before_the_seed() {
 }
 
 #[test]
+fn a_session_config_changed_on_both_sides_is_summarised_once_in_the_launch_s_warnings() {
+    // §12.4 step 3: the default home's value wins, and one summary line says so.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = killed_session(&fx, &a, "a@x.co");
+    let allow = |config: &Path, tools: Value| {
+        let mut projects = config_key(config, "projects");
+        projects["/work/app"]["allowedTools"] = tools;
+        splice_config_key(config, "projects", &projects);
+    };
+    allow(&profile.join(".claude.json"), json!(["Bash"]));
+    allow(&fx.paths().global_config, json!(["Read"]));
+
+    let launched = fx
+        .engine
+        .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app"))
+        .unwrap();
+
+    assert_eq!(
+        launched.warnings,
+        [
+            "1 key of position 1's session config changed on both sides while it ran; the default home's values were kept"
+        ]
+    );
+    assert_eq!(
+        config_key(&fx.paths().global_config, "projects")["/work/app"]["allowedTools"],
+        json!(["Read"]),
+        "the default home's value is kept"
+    );
+}
+
+#[test]
 fn a_pending_merge_back_that_fails_aborts_with_the_profile_and_its_baseline_untouched() {
     // §12.4, B.44: seeding over them would discard the session's unmerged changes.
     let fx = Fx::new();
@@ -1117,6 +1149,61 @@ mod hooked {
         assert_eq!(err.kind(), "relogin-required", "{err}");
         assert_eq!(token_requests(&fx), 0, "never refreshed");
         assert!(!fx.profile_dir(&a).exists(), "nothing was created");
+    }
+
+    #[test]
+    fn a_quarantine_landing_before_the_freshen_refuses_only_a_quiescent_launch() {
+        // Fix round 1: the gate answers a quarantine that still binds `Dead` before it asks who
+        // owns the account (§7.3), so the freshen goes on and the locks decide. A join uses no
+        // stored credential (§12.5 step 3); a quiescent launch is refused as `Dead` is (§7.2).
+        for joining in [true, false] {
+            let fx = Fx::new();
+            let a = two_accounts(&fx);
+            let running = joining.then(|| {
+                let profile = killed_session(&fx, &a, "a@x.co");
+                let other = fx.hold_reservation(&profile);
+                (profile, other)
+            });
+            let planned = row(&fx, &a);
+            let cwd = fx.work_dir("app");
+            let other = Arc::new(fx.engine_with_env(fx.env.clone()));
+            let (kc, id, fp) = (fx.kc.clone(), a.clone(), vault_fp(&fx, &a));
+            let mut expiring: Value = serde_json::from_slice(&fx.vault_bytes(&a).unwrap()).unwrap();
+            expiring["claudeAiOauth"]["expiresAt"] = json!(fx.clock.now_ms() + 60_000);
+            fx.engine.on_point(
+                "launch-before-freshen",
+                Box::new(move || {
+                    let store = other.store().unwrap();
+                    store.set_quarantine(&id, "invalid_grant", &fp, 1).unwrap();
+                    kc.put(SERVICE, id.as_str(), expiring.to_string().as_bytes());
+                }),
+            );
+            let global = fs::read(fx.paths().global_config).unwrap();
+
+            let result = fx.engine.launch(&planned, claude_bin(), &cwd);
+
+            assert_eq!(
+                token_requests(&fx),
+                0,
+                "joining {joining}: nothing was sent"
+            );
+            match running {
+                Some((profile, other)) => {
+                    let launched = result.unwrap_or_else(|e| panic!("joining: {e}"));
+                    assert!(!launched.bootstrapped);
+                    assert!(launched.warnings.is_empty(), "{:?}", launched.warnings);
+                    assert_eq!(live_reservations(&profile), 2);
+                    drop(other);
+                }
+                None => {
+                    let err = refused(result);
+                    assert_eq!(err.kind(), "relogin-required", "{err}");
+                    assert!(!fx.profile_dir(&a).exists(), "nothing was created");
+                    assert_eq!(fs::read(fx.paths().global_config).unwrap(), global);
+                    assert!(fx.spawner.specs().is_empty(), "nothing was validated");
+                }
+            }
+        }
     }
 
     #[test]
