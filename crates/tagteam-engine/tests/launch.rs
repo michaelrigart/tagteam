@@ -4,6 +4,7 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
@@ -21,13 +22,13 @@ use tagteam_engine::launch::Launched;
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::vault::SERVICE;
-use tagteam_provider::Read;
 use tagteam_provider::flock::{FlockGuard, LockProbe, probe_lock};
 use tagteam_provider::http::{HttpError, Method};
 use tagteam_provider::profile::{
     LAUNCH_DIR, MARKER_FILE, ProfileMarker, Seed, launch_reservations,
 };
 use tagteam_provider::splice::get_top_level;
+use tagteam_provider::{Keychain, Read};
 
 /// The row `plan_run` hands `launch` (Task 8), as it stands.
 fn row(fx: &Fx, id: &AccountId) -> AccountRow {
@@ -83,6 +84,19 @@ fn block_home(fx: &Fx) {
 
 fn unblock_home(fx: &Fx) {
     fs::set_permissions(&fx.env.home, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// The links in `profile`, by name, and where each points.
+fn links(profile: &Path) -> BTreeMap<String, PathBuf> {
+    fs::read_dir(profile)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|path| fs::symlink_metadata(path).unwrap().file_type().is_symlink())
+        .map(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            (name, fs::read_link(&path).unwrap())
+        })
+        .collect()
 }
 
 /// `id`'s first launch, which bootstraps (with a `valid` check queued) and seeds.
@@ -695,6 +709,66 @@ fn a_quarantined_target_launches_once_with_the_warning_that_it_needs_a_new_login
 }
 
 #[test]
+fn a_join_launches_whatever_the_vault_holds_and_touches_no_credential() {
+    // Controller ruling (Task 10): §12.5 step 3 joins a running session without seeding, and
+    // its sync only creates missing links. The running session's Claude Code owns the token, so
+    // a join reads, refreshes and writes no stored credential: a vault entry gone missing, or a
+    // quarantine (§7.4), even one whose access token is due, refuses only a quiescent launch.
+    for case in ["vault entry missing", "quarantined", "quarantined, due"] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let profile = killed_session(&fx, &a, "a@x.co");
+        let other = fx.hold_reservation(&profile);
+        let linked = links(&profile);
+        fs::remove_file(profile.join("skills")).unwrap();
+        if case == "vault entry missing" {
+            fx.kc.delete(SERVICE, a.as_str()).unwrap();
+        } else {
+            if case == "quarantined, due" {
+                fx.expire_access(&a);
+            }
+            fx.quarantine(&a, "invalid_grant", &vault_fp(&fx, &a));
+        }
+        let read = |name: &str| fs::read(profile.join(name)).unwrap();
+        let files = [
+            ".credentials.json",
+            ".claude.json",
+            ".tagteam-baseline.json",
+            ".tagteam-seed.json",
+            ".tagteam-profile.json",
+            ".tagteam-links.json",
+        ]
+        .map(|name| (name, read(name)));
+        let items = fx.kc.items();
+
+        let launched = fx
+            .engine
+            .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app"))
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+
+        assert!(!launched.bootstrapped, "{case}");
+        assert!(
+            launched.warnings.is_empty(),
+            "{case}: {:?}",
+            launched.warnings
+        );
+        assert_eq!(fx.kc.items(), items, "{case}: no Keychain item touched");
+        for (name, bytes) in &files {
+            assert_eq!(&read(name), bytes, "{case}: {name} untouched");
+        }
+        assert_eq!(token_requests(&fx), 0, "{case}: nothing refreshed");
+        assert_eq!(fx.spawner.specs().len(), 1, "{case}: nothing validated");
+        assert_eq!(
+            links(&profile),
+            linked,
+            "{case}: only the missing link made"
+        );
+        assert_eq!(live_reservations(&profile), 2, "{case}");
+        drop(other);
+    }
+}
+
+#[test]
 fn a_profile_path_linked_elsewhere_refuses_the_launch_before_anything_is_touched_there() {
     // Controller ruling (Task 9): the real-directory check comes first under the locks. Through
     // a link at the profile path, step 2 would remove the dead reservations at its target and
@@ -894,7 +968,7 @@ fn a_join_over_a_must_share_link_gone_stale_refuses_until_the_session_ends() {
 mod hooked {
     use std::sync::{Arc, Mutex};
 
-    use tagteam_provider::{Clock, Keychain};
+    use tagteam_provider::Clock;
 
     use super::*;
 
