@@ -727,13 +727,14 @@ fn reservation_io(dir: &Path, e: io::Error) -> EngineError {
 
 /// Interface Contract: `create` refuses a `<pid>.lock` that is live, the reservation of an
 /// orphaned `claude` of an earlier process with this pid (Task 4). Replacing it would hide a
-/// running session, so the launch is refused, naming the file; a later `run` gets a new pid.
-/// Once `dir` is a directory only that check reports `AlreadyExists`, and its message names the
-/// file. Any other failure, a file where `dir` belongs included, names `dir`.
+/// running session, so the launch is refused, naming the file, as `launch-unreachable`; a later
+/// `run` gets a new pid. Once `dir` is a directory only that check reports `AlreadyExists`, and
+/// its message names the file. Any other failure, a file where `dir` belongs included, names
+/// `dir`.
 fn reservation_refused(dir: &Path, e: io::Error) -> EngineError {
     if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() {
-        EngineError::LaunchUnreachable {
-            detail: format!("{e}; run it again"),
+        EngineError::ReservationHeld {
+            detail: e.to_string(),
         }
     } else {
         reservation_io(dir, e)

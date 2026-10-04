@@ -185,6 +185,13 @@ pub enum EngineError {
     /// §12.3: the launch command could not be spawned.
     #[error("the launch command could not be started: {detail}")]
     LaunchUnreachable { detail: String },
+    /// §12.5 launch step 4: a live `<pid>.lock` holds this launch's reservation, left by an
+    /// orphaned session of an earlier process with this pid (Task 4). `detail` names the file.
+    /// Its kind is `launch-unreachable`, as the launch command's own failure: nothing started.
+    #[error(
+        "the profile could not be reserved for this launch: {detail}, whose session may still be running; run it again, as a new process with a pid of its own"
+    )]
+    ReservationHeld { detail: String },
     /// §12.5 launch step 1, B.47: under the launch's locks the target is no longer one a session
     /// may start for. It was removed (Decision 7), or it became the live default login. The
     /// CLI prints `why` and plans again, which runs plain `claude` or refuses under
@@ -290,7 +297,9 @@ impl EngineError {
             EngineError::LoginInvalid { .. } => "login-invalid",
             EngineError::LoginDrifted { .. } => "login-drifted",
             EngineError::LoginUnknown { .. } => "login-unknown",
-            EngineError::LaunchUnreachable { .. } => "launch-unreachable",
+            EngineError::LaunchUnreachable { .. } | EngineError::ReservationHeld { .. } => {
+                "launch-unreachable"
+            }
             EngineError::TargetChanged { .. } => "target-changed",
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
@@ -540,6 +549,10 @@ mod tests {
             ),
             (
                 EngineError::LaunchUnreachable { detail: "d".into() },
+                "launch-unreachable",
+            ),
+            (
+                EngineError::ReservationHeld { detail: "d".into() },
                 "launch-unreachable",
             ),
             (
