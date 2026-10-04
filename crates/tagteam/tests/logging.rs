@@ -560,9 +560,12 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
         &["auto", "--once"][..],
     ] {
         let tick = traced(root, &server).args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&tick.stderr);
+        // A usage error also exits 2, and says so on stderr: only a tick that ran counts.
         assert!(
-            matches!(tick.status.code(), Some(0 | 2)),
-            "{args:?}: {:?} {}",
+            matches!(tick.status.code(), Some(0 | 2))
+                && !stderr.lines().any(|l| l.starts_with("tagteam:")),
+            "{args:?}: {:?} {} {stderr}",
             tick.status,
             String::from_utf8_lossy(&tick.stdout)
         );
