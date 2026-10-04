@@ -526,10 +526,42 @@ fn an_unreadable_or_degraded_profile_credential_aborts_without_writing() {
 }
 
 #[test]
+fn a_first_launch_through_a_linked_profile_path_refuses_before_its_marker_and_writes_nothing() {
+    // Controller ruling (fix round 1): with `sessions/<id>` linked to `~/.claude`, the marker and
+    // the links would land in the default home, and through a link anywhere else at its target.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = fx.profile_dir(&a);
+    fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    let elsewhere = fx.dir.path().join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    for target in [fx.env.home.join(".claude"), elsewhere] {
+        let _ = fs::remove_file(&profile);
+        symlink(&target, &profile).unwrap();
+        let before = dir_tree(&target);
+
+        let err = fx
+            .engine
+            .bootstrap_quiescent(&a, &fx.work_dir("app"))
+            .unwrap_err();
+
+        let at = target.display();
+        assert_eq!(err.kind(), "invalid-input", "{at}: {err}");
+        assert!(
+            err.to_string().contains(&profile.display().to_string()),
+            "{at}: {err}"
+        );
+        assert_eq!(dir_tree(&target), before, "{at}: nothing written there");
+    }
+    assert!(fx.spawner.specs().is_empty(), "never validated");
+}
+
+#[test]
 fn a_profile_path_that_links_to_a_directory_refuses_the_bootstrap_and_writes_nothing_there() {
     // Controller ruling: the credential write resolves from the canonical spelling, so through a
     // link at the profile path it would lock, and write the credential, at the link's target.
     // This profile was moved and linked back, so its spelling changed and a bootstrap is due.
+    // `mark_profile` refuses it first, before the marker's `outer` is written through the link.
     let fx = Fx::new();
     let a = two_accounts(&fx);
     let profile = bootstrapped(&fx, &a, "a@x.co");
@@ -602,6 +634,41 @@ fn a_profile_whose_credential_file_links_elsewhere_refuses_the_bootstrap_and_lea
     );
     assert_eq!(fs::read_link(&file).unwrap(), default, "the link stays");
     assert_eq!(seed(&profile), seeded, "nothing recorded");
+    assert_eq!(fx.spawner.specs().len(), 1, "never validated");
+}
+
+#[test]
+fn an_unreadable_profile_identity_aborts_before_a_credential_not_the_vault_s_is_overwritten() {
+    // Fix round 1, §4.3 and B.5: whose login a credential that is not the vault's belongs to
+    // cannot be told from an unreadable identity, so it is neither taken for this account's nor
+    // overwritten without a copy. A clean exit merged back, so no baseline waits.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = bootstrapped(&fx, &a, "a@x.co");
+    fs::remove_file(profile.join(".tagteam-baseline.json")).unwrap();
+    let config = profile.join(".claude.json");
+    fs::write(&config, "{\"oauthAccount\": ").unwrap();
+    fx.put_vault(&a, &credential("a@x.co", "rt-a-2"));
+    let file = fs::read(profile.join(".credentials.json")).unwrap();
+    let vault = fx.vault_bytes(&a);
+
+    let err = fx
+        .engine
+        .bootstrap_quiescent(&a, &fx.work_dir("app"))
+        .unwrap_err();
+
+    assert_eq!(err.kind(), "unreadable", "{err}");
+    assert!(
+        err.to_string().contains(&config.display().to_string()),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read(profile.join(".credentials.json")).unwrap(),
+        file,
+        "not overwritten"
+    );
+    assert_eq!(fx.vault_bytes(&a), vault, "the vault unchanged");
+    assert!(fx.displaced().is_empty());
     assert_eq!(fx.spawner.specs().len(), 1, "never validated");
 }
 
