@@ -189,6 +189,56 @@ models = [
 }
 
 #[test]
+fn a_new_element_never_takes_the_comment_of_a_removed_one() {
+    // The comment above `Fable` goes with `Fable`, whichever layout the list has: a new
+    // element takes the indentation and line breaks of the old list and no comment text.
+    let fx = Fx::new();
+    write_config(
+        &fx,
+        "\
+[autoswitch]
+models = [
+  # Fable only
+  \"Fable\", \"opus\"
+]
+",
+    );
+    set(&fx, "autoswitch.models", "sonnet");
+    assert_eq!(
+        config_text(&fx),
+        "\
+[autoswitch]
+models = [
+  \"sonnet\"
+]
+"
+    );
+
+    write_config(
+        &fx,
+        "\
+[autoswitch]
+models = [
+  # Fable only
+  \"Fable\", # and its line
+  \"opus\",
+]
+",
+    );
+    set(&fx, "autoswitch.models", "sonnet,opus");
+    assert_eq!(
+        config_text(&fx),
+        "\
+[autoswitch]
+models = [
+  \"sonnet\",
+  \"opus\",
+]
+"
+    );
+}
+
+#[test]
 fn replacing_a_one_line_list_keeps_it_on_one_line() {
     let fx = Fx::new();
     write_config(

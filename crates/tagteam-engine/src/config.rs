@@ -396,26 +396,20 @@ fn carry_array_decor(old: &Array, new: &mut Array) {
         })
         .collect();
 
-    let (style_breaks, style_indent) = match gaps.get(n.wrapping_sub(1)) {
-        Some(last) => (
-            last.breaks,
-            last.rest.rsplit('\n').next().unwrap_or_default().to_owned(),
-        ),
-        None => (false, String::new()),
+    // The indentation a gap's text ends in: whitespace alone, never the comments above it.
+    let indent = |text: &str| text.rsplit('\n').next().unwrap_or_default().to_owned();
+    // Where a new element goes: the line breaks and indentation of the old list, no comment.
+    let fresh = |at: usize| match (n, at) {
+        (0, 0) => (false, String::new()),
+        (0, _) => (false, " ".to_owned()),
+        (_, 0) => (gaps[0].breaks, indent(&gaps[0].rest)),
+        _ if gaps[n - 1].breaks => (true, indent(&gaps[n - 1].rest)),
+        _ if n >= 2 => (false, indent(&gaps[n - 1].rest)),
+        _ => (false, " ".to_owned()),
     };
-    let lead = |at: usize, matched: Option<usize>| match matched {
-        Some(i) => gaps[i].rest.clone(),
-        None if style_breaks => style_indent.clone(),
-        None if n == 0 => {
-            if at == 0 {
-                String::new()
-            } else {
-                " ".to_owned()
-            }
-        }
-        None if at == 0 => gaps[0].rest.clone(),
-        None if n >= 2 => gaps[n - 1].rest.clone(),
-        None => " ".to_owned(),
+    let layout = |at: usize, matched: Option<usize>| match matched {
+        Some(i) => (gaps[i].breaks, gaps[i].rest.clone()),
+        None => fresh(at),
     };
     // What precedes position `at`: the comment ending the previous line, the break, the lead.
     let before = |at: usize| {
@@ -437,11 +431,10 @@ fn carry_array_decor(old: &Array, new: &mut Array) {
     let trailing_comma = trailing_comma && count > 0;
     for (at, value) in new.iter_mut().enumerate() {
         let (same_line, forced) = before(at);
-        let breaks = forced || matched[at].map_or(style_breaks, |i| gaps[i].breaks);
+        let (breaks, lead) = layout(at, matched[at]);
         let prefix = format!(
-            "{same_line}{}{}",
-            if breaks { "\n" } else { "" },
-            lead(at, matched[at])
+            "{same_line}{}{lead}",
+            if breaks || forced { "\n" } else { "" },
         );
         let mut suffix = matched[at].map_or("", |i| own_suffix[i]).to_owned();
         if at + 1 == count && !trailing_comma {
