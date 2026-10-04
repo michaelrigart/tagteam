@@ -5,7 +5,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
@@ -1538,10 +1538,20 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
     }
 }
 
+/// A dispatcher that wants nothing, registered once and alive for the whole test process.
+///
+/// tracing caches each callsite's interest process-wide, from every registered dispatcher. While
+/// only one is registered, it asks just the subscriber of the thread that reaches a callsite
+/// first. A capture is scoped to its own thread, so another test's thread, with no capture,
+/// could reach a callsite first, cache it as never wanted, and the capture would lose its event.
+/// With this one registered too, there are always two, and every capture is asked.
+static ALWAYS_TWO: OnceLock<tracing::Dispatch> = OnceLock::new();
+
 /// Runs `f` with every `tracing` event this thread emits captured, and returns `f`'s result
 /// with the captured lines: one per event, level first (`ERROR`, `WARN`, ...), then the
 /// message and its fields, without colour or timestamps.
 pub fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    ALWAYS_TWO.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
     let buffer = LogBuffer::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(buffer.clone())
