@@ -553,6 +553,20 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
     for shell in ["bash", "zsh", "fish"] {
         run(&["completions", shell]);
     }
+    // `auto` collects and decides for every account: one tick that only reports, and one that
+    // may switch. `--once` exits 0 switched, 2 no action, 3 blocked; 1 is an error.
+    for args in [
+        &["auto", "--once", "--dry-run"][..],
+        &["auto", "--once"][..],
+    ] {
+        let tick = traced(root, &server).args(args).output().unwrap();
+        assert!(
+            matches!(tick.status.code(), Some(0 | 2)),
+            "{args:?}: {:?} {}",
+            tick.status,
+            String::from_utf8_lossy(&tick.stdout)
+        );
+    }
     run(&["list"]);
 
     // The secrets were sent: the log is clean because it never writes them.
