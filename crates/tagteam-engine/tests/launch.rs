@@ -642,6 +642,57 @@ fn each_scrubbed_variable_this_process_has_set_is_named_once_in_the_launch_s_war
 }
 
 #[test]
+fn a_quarantined_target_due_for_a_refresh_is_refused_and_never_refreshed() {
+    // §7.2, §7.4: refused as `Dead` is, before anything is created.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    fx.quarantine(&a, "invalid_grant", &vault_fp(&fx, &a));
+    fx.expire_access(&a);
+
+    let err = refused(
+        fx.engine
+            .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app")),
+    );
+
+    assert_eq!(err.kind(), "relogin-required", "{err}");
+    assert_eq!(token_requests(&fx), 0, "never refreshed");
+    assert!(!fx.profile_dir(&a).exists(), "nothing was created");
+}
+
+#[test]
+fn a_quarantined_target_launches_once_with_the_warning_that_it_needs_a_new_login() {
+    // §7.2: usable only while its access token lasts. Controller ruling (Task 8): `plan_run`
+    // never reads the quarantine, so the row read under the locks decides, and a quarantine set
+    // since planning is warned about too, once.
+    for planned_first in [false, true] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let planned_before = row(&fx, &a);
+        fx.quarantine(&a, "invalid_grant", &vault_fp(&fx, &a));
+        let planned = if planned_first {
+            planned_before
+        } else {
+            row(&fx, &a)
+        };
+        fx.script_valid(&fx.profile_dir(&a), "a@x.co");
+
+        let launched = fx
+            .engine
+            .launch(&planned, claude_bin(), &fx.work_dir("app"))
+            .unwrap();
+
+        assert_eq!(
+            launched.warnings,
+            [
+                "a@x.co (position 1) needs a new login: its stored refresh token can no longer be used; it works only until its current access token expires"
+            ],
+            "planned before the quarantine: {planned_first}"
+        );
+        assert_eq!(token_requests(&fx), 0);
+    }
+}
+
+#[test]
 fn a_real_copy_of_a_must_share_entry_refuses_a_quiescent_launch_as_a_split() {
     // R10.4, §12.2: the sync's `ProfileSplit` is the launch's refusal, worded by its cause.
     // Memory kept in the profile's own `projects/` is never linked over or seeded around.
@@ -712,6 +763,8 @@ fn a_join_over_a_must_share_link_gone_stale_refuses_until_the_session_ends() {
 #[cfg(feature = "test-hooks")]
 mod hooked {
     use std::sync::{Arc, Mutex};
+
+    use tagteam_provider::{Clock, Keychain};
 
     use super::*;
 
@@ -808,6 +861,58 @@ mod hooked {
         let err = refused(fx.engine.launch(&planned, claude_bin(), &cwd));
 
         assert_eq!(err.kind(), "api-key-account", "{err}");
+    }
+
+    #[test]
+    fn a_target_whose_stored_credential_went_away_before_the_locks_is_refused_under_them() {
+        // Controller ruling (Task 8): `plan_run` never reads the vault, and the read before the
+        // locks is behind us, so the locks read it again before anything is created.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let planned = row(&fx, &a);
+        let cwd = fx.work_dir("app");
+        let (kc, id) = (fx.kc.clone(), a.to_string());
+        fx.engine.on_point(
+            "launch-before-locks",
+            Box::new(move || {
+                kc.delete(SERVICE, &id).unwrap();
+            }),
+        );
+
+        let err = refused(fx.engine.launch(&planned, claude_bin(), &cwd));
+
+        assert_eq!(err.kind(), "invalid-input", "{err}");
+        assert!(err.to_string().contains("no stored credential"), "{err}");
+        assert!(!fx.profile_dir(&a).exists(), "nothing was created");
+    }
+
+    #[test]
+    fn a_target_quarantined_before_the_locks_whose_token_is_due_is_refused_under_them() {
+        // §9.4 step 1's rule for a switch, applied to a launch: a refresh that finished while
+        // this launch waited may have quarantined the target (§7.4). §7.2 then refuses it once
+        // its access token is due.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let planned = row(&fx, &a);
+        let cwd = fx.work_dir("app");
+        let other = Arc::new(fx.engine_with_env(fx.env.clone()));
+        let (kc, id, fp) = (fx.kc.clone(), a.clone(), vault_fp(&fx, &a));
+        let mut expiring: Value = serde_json::from_slice(&fx.vault_bytes(&a).unwrap()).unwrap();
+        expiring["claudeAiOauth"]["expiresAt"] = json!(fx.clock.now_ms() + 60_000);
+        fx.engine.on_point(
+            "launch-before-locks",
+            Box::new(move || {
+                let store = other.store().unwrap();
+                store.set_quarantine(&id, "successor_lost", &fp, 1).unwrap();
+                kc.put(SERVICE, id.as_str(), expiring.to_string().as_bytes());
+            }),
+        );
+
+        let err = refused(fx.engine.launch(&planned, claude_bin(), &cwd));
+
+        assert_eq!(err.kind(), "relogin-required", "{err}");
+        assert_eq!(token_requests(&fx), 0, "never refreshed");
+        assert!(!fx.profile_dir(&a).exists(), "nothing was created");
     }
 
     #[test]

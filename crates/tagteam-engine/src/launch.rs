@@ -109,6 +109,7 @@ impl Engine {
         let lock = self.lock_account(&account.id)?;
         // 1.
         let row = self.relocked_target(p, account)?;
+        self.locked_login(p, &row, &mut warnings)?;
         hooks::point(self, "launch-locked")?;
         let profile = profile_path(&self.env, &row.id);
         // 2.
@@ -298,6 +299,33 @@ impl Engine {
             });
         }
         Ok(row)
+    }
+
+    /// §12.5 launch step 1 for the login itself, on the row read under the locks: `plan_run`
+    /// reads neither the vault nor the quarantine, and the freshen before the locks may be out
+    /// of date (a refresh that finished meanwhile may have quarantined the account, as §9.4 step
+    /// 1 says for a switch). An account with no stored credential, or one that cannot be read,
+    /// is refused. A quarantined one is never refreshed (§7.4): once its access token is due it
+    /// is refused as `Dead` is, and otherwise it launches with the warning that it needs a new
+    /// login, unless the freshen gave that warning already (§7.2).
+    fn locked_login(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), EngineError> {
+        let vault = self.vault_generation(row)?;
+        if row.quarantine_reason.is_none() || !p.kind_traits(&row.kind).refreshable {
+            return Ok(());
+        }
+        if self.due(p, &vault) {
+            return Err(needs_relogin(row));
+        }
+        let warning = works_until_expiry(row);
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+        Ok(())
     }
 
     /// §12.5 step 3 for a quiescent profile, after its sync. Pending rescues go first (§6.2),
