@@ -1371,9 +1371,10 @@ impl App<'_, '_> {
             let _ = writeln!(self.io.err, "warning: {w}");
         }
         let cancel = self.engine.cancel();
-        // §12.3 "Every launch is checked"; a launch that bootstrapped skips it (Task 11). An
-        // interrupted check spends its signal on the exit handling (`abandon`), which then runs
-        // to completion, and the command exits 128 + n.
+        // §12.3 "Every launch is checked"; a launch that bootstrapped skips it (Task 11). A
+        // refused or interrupted check spends any pending signal on the exit handling
+        // (`abandon`), which then runs to completion. An interruption exits 128 + n, and a
+        // refusal keeps its own error.
         if let Err(e) = self.engine.check_login(&launched, &launch, &cwd) {
             let e = crate::run::abandon(&self.engine, launched, cancel, &mut *self.io.err, e);
             return Err(e.into());
