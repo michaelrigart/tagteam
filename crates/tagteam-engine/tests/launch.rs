@@ -709,6 +709,11 @@ fn a_live_reservation_already_under_this_pid_refuses_the_launch_and_is_left_alon
         err.to_string().contains(&mine.display().to_string()),
         "{err}"
     );
+    assert!(
+        err.to_string()
+            .starts_with("the profile could not be reserved for this launch"),
+        "it says what happened, never that the launch command failed: {err}"
+    );
     assert_eq!(fs::read(&mine).unwrap(), before, "never replaced");
     assert!(mutation_lock_free(&fx.env));
     drop(orphan);
