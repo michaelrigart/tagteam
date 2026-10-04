@@ -237,7 +237,7 @@ fn the_live_login_runs_plain_claude_and_any_other_account_gets_a_session() {
 }
 
 #[test]
-fn a_missing_launch_command_fails_before_anything_else_and_changes_nothing() {
+fn a_missing_launch_command_fails_before_the_mapping_and_the_live_login_and_changes_nothing() {
     let fx = Fx::new();
     let empty = fx.dir.path().join("empty-bin");
     fs::create_dir_all(&empty).unwrap();

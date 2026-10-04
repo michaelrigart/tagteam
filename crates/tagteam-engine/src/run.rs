@@ -69,12 +69,13 @@ type EnvChanges = (Vec<(OsString, OsString)>, Vec<OsString>);
 impl Engine {
     /// §12.1. It only reads: no lock, no write, and with no store none is created (§5).
     ///
-    /// The launch command is looked up first, on the `PATH` the CLI captured into `Env.vars`,
-    /// so a missing one changes nothing. Then the target: the named account, or the nearest
-    /// mapping of `cwd`'s canonical path for the provider. An API-key account is refused. Plain
-    /// `claude` runs when nothing is mapped, when the mapped account went away (with a
-    /// warning), or when the target is the default home's live login; under
-    /// `--require-session` each of those refuses instead.
+    /// The named account is resolved first, since its provider is the one whose launch command
+    /// runs. That command is looked up next, on the `PATH` the CLI captured into `Env.vars`, before
+    /// any mapping or live login is read, so a missing one changes nothing. Then the target: the
+    /// named account, or the nearest mapping of `cwd`'s canonical path for the provider. An
+    /// API-key account is refused. Plain `claude` runs when nothing is mapped, when the mapped
+    /// account went away (with a warning), or when the target is the default home's live login;
+    /// under `--require-session` each of those refuses instead.
     pub fn plan_run(&self, req: &RunRequest) -> Result<RunPlan, EngineError> {
         // §12.8: under an unreadable marker the outer home is unknown, so nothing is planned
         // against the engine's own `env`, which is still the run shell's.

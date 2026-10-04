@@ -208,8 +208,11 @@ fn capture(spec: &SpawnSpec, timeout: Duration, cancel: &Cancel, grace: Duration
 
 /// Kills the child's whole group, then reaps the child. The child leads the group
 /// (`process_group(0)`) and is not reaped yet, so its pid still names that group and no other.
-/// A kill that fails leaves the child running, and `wait` would block for as long as it does,
-/// so then it returns without waiting (as `security`'s runner does).
+/// `killpg` can fail with the child already gone: on macOS it fails (`EPERM`) once the leader
+/// has exited and nothing else is left in its group. Then the child alone is killed, which
+/// succeeds on an exited child too, and it is reaped. Only when both fail may the child still
+/// run, and `wait` would block for as long as it does, so then it returns without waiting (as
+/// `security`'s runner does).
 fn kill_group(child: &mut Child) {
     let group = child.id() as libc::pid_t;
     // SAFETY: killpg(2) takes two integers and touches no memory of ours.
