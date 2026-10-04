@@ -209,8 +209,9 @@ fn a_vault_credential_about_to_expire_is_refreshed_first_and_the_profile_starts_
 }
 
 #[test]
-fn a_refresh_whose_successor_reached_only_rescue_aborts_the_launch_before_any_lock() {
-    // §12.3 step 1: the vault's generation is consumed.
+fn a_refresh_whose_successor_reached_only_rescue_aborts_the_launch_before_anything_is_written() {
+    // §12.3 step 1: the vault's generation is consumed. The refusal is carried across the locks
+    // and refuses this quiescent launch there (fix round 2), before the profile is created.
     let fx = Fx::new();
     let a = two_accounts(&fx);
     fx.expire_access(&a);
@@ -1000,6 +1001,7 @@ fn a_join_over_a_must_share_link_gone_stale_refuses_until_the_session_ends() {
 mod hooked {
     use std::sync::{Arc, Mutex};
 
+    use common::{block_rescue, rescue_files, unblock_rescue};
     use tagteam_provider::Clock;
 
     use super::*;
@@ -1202,6 +1204,114 @@ mod hooked {
                     assert_eq!(fs::read(fx.paths().global_config).unwrap(), global);
                     assert!(fx.spawner.specs().is_empty(), "nothing was validated");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn a_gate_refusal_before_the_locks_refuses_a_quiescent_launch_before_anything_is_written() {
+        // Fix round 2, §12.3 step 1 and §7.2: the gate sends, adopts and compares only for an
+        // account no session owns (§7.3 step 2), but a session can start between its answer
+        // and this launch's locks. Its refusals are carried across them: a quiescent launch
+        // gets exactly the error and advice, before anything is written, and a join, which
+        // touches no credential (§12.5 step 3), goes on. The race session is a reservation
+        // taken at `launch-before-locks`.
+        let cases = [
+            (
+                "rescued",
+                "a@x.co (position 1) has a refreshed token that is not in the vault yet: the refresh succeeded, but the vault could not be written; the new token is in rescue/; retry once the vault can be written",
+            ),
+            (
+                "unpersisted",
+                "a@x.co (position 1) needs a new login: its stored refresh token can no longer be used; log in with `claude`, then run `tagteam add`",
+            ),
+            (
+                "rescue unreadable",
+                "a@x.co (position 1) has a refreshed token that is not in the vault yet: a pending rescue could not be adopted; retry once the vault can be written",
+            ),
+            (
+                "conflict",
+                "position 1 (a@x.co)'s session profile and the vault both moved since they last agreed; log in again with `tagteam add` to resolve it",
+            ),
+        ];
+        for (case, refusal) in cases {
+            for joining in [false, true] {
+                let at = format!("{case}, joining {joining}");
+                let fx = Fx::new();
+                let a = two_accounts(&fx);
+                let profile = killed_session(&fx, &a, "a@x.co");
+                match case {
+                    "rescue unreadable" => {
+                        let dir = fx.env.data_dir().join("rescue");
+                        fs::create_dir_all(&dir).unwrap();
+                        fs::write(dir.join(format!("{a}-0-000000000000.json")), "{ torn").unwrap();
+                    }
+                    "conflict" => {
+                        fx.rotate_profile(&profile, "rt-a-2");
+                        fx.put_vault(&a, &credential("a@x.co", "rt-a-3"));
+                    }
+                    _ => fx.script_refresh(Some("rt-a-2")),
+                }
+                fx.expire_access(&a);
+                if matches!(case, "rescued" | "unpersisted") {
+                    fx.kc.set_fail_write(SERVICE, true);
+                }
+                if case == "unpersisted" {
+                    block_rescue(&fx);
+                }
+                // Once the gate has answered: the vault can be written again, so a rescue could
+                // be adopted now, and the best-effort `successor_lost` quarantine is as if it
+                // were never recorded. Neither may let a quiescent launch through.
+                let other = Arc::new(fx.engine_with_env(fx.env.clone()));
+                let (kc, id) = (fx.kc.clone(), a.clone());
+                let race = profile
+                    .join(LAUNCH_DIR)
+                    .join(format!("{}-race.lock", std::process::id()));
+                let session = Arc::new(Mutex::new(None));
+                let started = session.clone();
+                fx.engine.on_point(
+                    "launch-before-locks",
+                    Box::new(move || {
+                        kc.set_fail_write(SERVICE, false);
+                        other.store().unwrap().clear_quarantine(&id).unwrap();
+                        if joining {
+                            *started.lock().unwrap() = FlockGuard::try_lock(&race).unwrap();
+                        }
+                    }),
+                );
+                let before = dir_tree(&profile);
+                let global = fs::read(fx.paths().global_config).unwrap();
+
+                let result = fx
+                    .engine
+                    .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app"));
+
+                unblock_rescue(&fx);
+                if joining {
+                    let launched = result.unwrap_or_else(|e| panic!("{at}: {e}"));
+                    assert!(!launched.bootstrapped, "{at}");
+                    assert_eq!(live_reservations(&profile), 2, "{at}");
+                    drop(launched);
+                } else {
+                    let err = refused(result);
+                    assert_eq!(err.to_string(), refusal, "{at}");
+                    assert_eq!(dir_tree(&profile), before, "{at}: nothing written");
+                    assert_eq!(
+                        fs::read(fx.paths().global_config).unwrap(),
+                        global,
+                        "{at}: nothing merged back"
+                    );
+                }
+                if case == "rescued" {
+                    assert_eq!(
+                        rescue_files(&fx),
+                        1,
+                        "{at}: the gate's rescue stays where it is"
+                    );
+                    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"), "{at}");
+                }
+                assert_eq!(fx.spawner.specs().len(), 1, "{at}: nothing was validated");
+                drop(session);
             }
         }
     }
