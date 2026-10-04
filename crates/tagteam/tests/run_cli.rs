@@ -1463,6 +1463,9 @@ fn kill_mid_session(home: &Home) -> (PathBuf, Release) {
 /// After `kill_mid_session`: `claude` holds the reservation through its inherited fd, so the
 /// account stays session-owned, and nothing is captured under it (§12.5, B.46).
 fn assert_still_owned(home: &Home) {
+    // Due, so the gate would refresh `a` if it were not in a session: the zero token requests
+    // `assert_session_owned` counts mean something.
+    expire_vault(home.root(), &home.a, 60_000);
     let held = reservations(&home.profile());
     assert_eq!(held.len(), 1, "{held:?}");
     assert_eq!(probe_lock(&held[0]).unwrap(), LockProbe::Held);
@@ -1508,22 +1511,32 @@ fn a_killed_tagteam_leaves_its_reservation_live_and_the_next_launch_captures_and
     // The orphan exits, and its lock goes with it.
     release(&hold);
     wait_until(LONG, "the orphaned session's exit", || all_free(&profile));
+    // §12.5 step 2: the next launch captures and merges back before it spawns, so both are
+    // done by the time it parks at `before-spawn`, ahead of its own exit handling.
     let next = home.out("next");
-    let out = home
-        .tagteam(&next)
-        .args(["run", "1", "--", "x"])
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _resume = Release(vec![pause.join("resume")]);
+    let mut c = home.tagteam(&next);
+    c.args(["run", "1", "--", "x"])
+        .env("TAGTEAM_TEST_PAUSE_AT", "before-spawn")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause);
+    let mut child = spawn(c);
+    wait_while_running(&mut child, "the spawn", || pause.join("paused").exists());
     assert_eq!(
         vault_rt(home.root(), &home.a),
         "rt-a2",
-        "lazily captured at the next launch"
+        "lazily captured at the next launch, before it spawns"
     );
     assert!(
         trusts(&default_config(&home), "/work/killed"),
-        "the left-over baseline merged back first (§12.5 step 2)"
+        "the left-over baseline merged back first (§12.5 step 2), before this launch's exit"
     );
+    fs::write(pause.join("resume"), b"").unwrap();
+    let out = finish(child, LONG);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(vault_rt(home.root(), &home.a), "rt-a2");
+    assert!(trusts(&default_config(&home), "/work/killed"));
     assert!(!profile.join(BASELINE).exists());
     assert!(
         reservations(&profile).is_empty(),

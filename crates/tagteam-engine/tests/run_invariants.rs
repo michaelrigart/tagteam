@@ -51,30 +51,30 @@ fn valid_status(fx: &Fx, id: &AccountId, email: &str) -> Captured {
     }
 }
 
-/// `run`'s surface (§3): the identity surface plus the `projects` and `mcpServers` subtrees of
-/// the global config, which a merge-back writes.
+/// `run`'s surface (§3), built from scratch rather than from the switch's: the `projects` and
+/// `mcpServers` subtrees of the global config, which a merge-back writes, and the create-only
+/// must-share entries. No account field, credential file or Keychain item is on it, so a `run`
+/// that touched one fails the check.
 fn run_surface(fx: &Fx) -> IdentitySurface {
-    let mut surface = fx.cc.identity_surface(&fx.env);
-    let config = fx.paths().global_config;
-    for (path, keys) in &mut surface.json_keys {
-        if *path == config {
-            keys.push("projects".into());
-            keys.push("mcpServers".into());
-        }
+    IdentitySurface {
+        json_keys: vec![(
+            fx.paths().global_config,
+            vec!["projects".into(), "mcpServers".into()],
+        )],
+        create_only: fx.cc.identity_surface(&fx.env).create_only,
+        ..IdentitySurface::default()
     }
-    surface
 }
 
-/// FakeAgent's `run` surface (Decision 16): its identity surface plus the `prefs` key of the
-/// outer `identity.json`, which its merge-back writes (Task 5).
+/// FakeAgent's `run` surface (Decision 16), also from scratch: the `prefs` key of the outer
+/// `identity.json`, which its merge-back writes (Task 5), and its create-only `journal.log`.
 fn fake_run_surface(ffx: &FakeFx) -> IdentitySurface {
-    let mut surface = ffx.fake.identity_surface(&ffx.fx.env);
-    for (path, keys) in &mut surface.json_keys {
-        if path.file_name().is_some_and(|n| n == "identity.json") {
-            keys.push("prefs".into());
-        }
+    let switch = ffx.fake.identity_surface(&ffx.fx.env);
+    IdentitySurface {
+        json_keys: vec![(switch.json_keys[0].0.clone(), vec!["prefs".into()])],
+        create_only: switch.create_only,
+        ..IdentitySurface::default()
     }
-    surface
 }
 
 /// Changes one top-level key of `file`, as the session's agent would.
@@ -158,7 +158,12 @@ fn a_run_whose_session_changed_nothing_leaves_the_default_config_byte_identical(
     fx.engine.finish_run(launched, LaunchEnd::Exited(0));
     let after = fx.snapshot();
 
-    fx.assert_only_surface_changed(&before, &after, "run with nothing to merge back");
+    fx.assert_only_surface_changed_for(
+        &run_surface(&fx),
+        &before,
+        &after,
+        "run with nothing to merge back",
+    );
     assert_eq!(
         fs::read(&config).unwrap(),
         bytes,
@@ -222,7 +227,12 @@ fn a_fresh_home_gets_its_memory_and_history_created_empty_and_shared() {
     fx.engine.finish_run(launched, LaunchEnd::Exited(0));
     let after = fx.snapshot();
 
-    fx.assert_only_surface_changed(&before, &after, "a fresh home's first run");
+    fx.assert_only_surface_changed_for(
+        &run_surface(&fx),
+        &before,
+        &after,
+        "a fresh home's first run",
+    );
     assert_eq!(fs::read_dir(claude.join("projects")).unwrap().count(), 0);
     assert_eq!(fs::read(claude.join("history.jsonl")).unwrap(), b"");
     for name in ["projects", "history.jsonl"] {
@@ -239,4 +249,51 @@ fn a_fresh_home_gets_its_memory_and_history_created_empty_and_shared() {
             fs::canonicalize(claude.join(name)).unwrap()
         );
     }
+}
+
+#[test]
+#[should_panic(expected = "changed outside")]
+fn a_run_that_wrote_an_account_field_of_the_default_config_fails_the_surface_check() {
+    // The probe for `run_surface`: a stray `oauthAccount` write after a run, which the switch's
+    // surface would allow, is caught by `run`'s.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.spawner.push(valid_status(&fx, &a, "a@x.co"));
+    let before = fx.snapshot();
+
+    let launched = fx
+        .engine
+        .launch(&row(&fx, &a), claude_bin(), &work(fx.dir.path()))
+        .unwrap();
+    fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+    edit_key(&fx.paths().global_config, "oauthAccount", |v| {
+        *v = json!({"emailAddress": "stray@x.co"});
+    });
+    let after = fx.snapshot();
+
+    fx.assert_only_surface_changed_for(&run_surface(&fx), &before, &after, "a stray write");
+}
+
+#[test]
+#[should_panic(expected = "changed outside")]
+fn a_fake_agent_run_that_wrote_its_identity_fails_the_surface_check() {
+    let ffx = FakeFx::new();
+    let h1 = ffx.fake_add("h1", "tok-1", "renew-1");
+    ffx.fake_add("h2", "tok-2", "renew-2");
+    let row = ffx.engine.store().unwrap().account(&h1).unwrap().unwrap();
+    let surface = fake_run_surface(&ffx);
+    let outer = surface.json_keys[0].0.clone();
+    let before = ffx.fx.snapshot();
+
+    let launched = ffx
+        .engine
+        .launch(&row, claude_bin(), &work(ffx.fx.dir.path()))
+        .unwrap();
+    ffx.engine.finish_run(launched, LaunchEnd::Exited(0));
+    edit_key(&outer, "identity", |v| *v = json!({"handle": "stray"}));
+    let after = ffx.fx.snapshot();
+
+    ffx.fx
+        .assert_only_surface_changed_for(&surface, &before, &after, "a stray write");
 }
