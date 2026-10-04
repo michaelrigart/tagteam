@@ -238,6 +238,23 @@ fn lists_are_typed_comma_separated_with_each_name_trimmed() {
 }
 
 #[test]
+fn a_negative_zero_is_stored_and_shown_as_zero() {
+    // `-0` is in 0-50's range, and as a float it keeps its sign: `-0.0` in the file and `-0` in
+    // `config get`. A zero is stored as a plain zero.
+    let fx = Fx::new();
+    for raw in ["-0", "-0.0"] {
+        let change = set(&fx, "autoswitch.hysteresis_pct", raw);
+        let Some(Value::Float(n)) = change.value else {
+            panic!("{raw:?}: {:?}", change.value);
+        };
+        assert!(n == 0.0 && n.is_sign_positive(), "{raw:?} gave {n:?}");
+        assert_eq!(Value::Float(n).display(), "0");
+        let text = config_text(&fx);
+        assert!(!text.contains("-0"), "{raw:?} wrote {text}");
+    }
+}
+
+#[test]
 fn the_spec_s_ranges_and_spellings_hold_at_both_ends_and_nothing_is_clamped() {
     // §6.4's table, end to end. Each bound is taken as typed, and one step past it refuses
     // with `invalid-input`. A refusal writes nothing, so a value is never clamped.

@@ -317,7 +317,8 @@ impl Key {
                 .parse::<f64>()
                 .ok()
                 .filter(|n| (min..=max).contains(n))
-                .map(Value::Float)
+                // `-0` is in range, and a float keeps its sign: `+ 0.0` makes it a plain zero.
+                .map(|n| Value::Float(n + 0.0))
                 .ok_or_else(|| self.expect()),
             KeyKind::Int { min, max } => raw
                 .parse::<i64>()
