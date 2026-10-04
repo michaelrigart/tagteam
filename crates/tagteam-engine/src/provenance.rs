@@ -2,6 +2,8 @@
 //! vault's, through the profile's seed, never by expiry (B.52). It runs under the account's
 //! lock, in the refresh gate (§7.3 step 3) and in `switch`'s transaction (§9.2).
 
+use std::path::Path;
+
 use tagteam_core::{ProvenanceVerdict, provenance};
 use tagteam_provider::profile::{ProfileMarker, Seed};
 use tagteam_provider::{Identity, Provenance, Provider, Read, ReadError};
@@ -50,6 +52,28 @@ impl Engine {
     /// §12.5 under `lock` (the account's): reads the seed, the marker's spelling and the
     /// profile credential; applies `tagteam_core::provenance`; captures through
     /// `persist_generation` and moves the seed on `Capture`; reseeds on `InStep { reseed: true }`.
+    pub(crate) fn apply_provenance(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        lock: &AccountLock,
+    ) -> Result<ProfileCheck, EngineError> {
+        self.apply_provenance_leaving_out(p, row, lock, None)
+    }
+
+    /// `apply_provenance` for a profile quiescent apart from `own`, this process's launch
+    /// reservation (§12.5 "When the child exits": the last session out captures).
+    pub(crate) fn apply_provenance_apart_from(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        lock: &AccountLock,
+        own: &Path,
+    ) -> Result<ProfileCheck, EngineError> {
+        self.apply_provenance_leaving_out(p, row, lock, Some(own))
+    }
+
+    /// The body of both.
     ///
     /// A capture needs a quiescent profile with a seed, the same identity, a fresh read of a
     /// credential with a refresh token (§6.2), and the table's `Capture` row, which a stale
@@ -60,14 +84,19 @@ impl Engine {
     /// seed or names another account, a profile identity that cannot be read, and an absent
     /// one where the table says `Capture` (Decision 9: neither ignored nor captured). An absent
     /// identity decides nothing in any other row.
-    pub(crate) fn apply_provenance(
+    fn apply_provenance_leaving_out(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
         lock: &AccountLock,
+        own: Option<&Path>,
     ) -> Result<ProfileCheck, EngineError> {
         debug_assert_eq!(lock.id(), &row.id, "the caller holds this account's lock");
-        let SessionState::Quiescent { profile } = self.session_state(p, row)? else {
+        let state = match own {
+            Some(own) => self.session_state_apart_from(p, row, own)?,
+            None => self.session_state(p, row)?,
+        };
+        let SessionState::Quiescent { profile } = state else {
             return Ok(ProfileCheck::NotApplicable);
         };
         let seed = match Seed::read(&profile) {

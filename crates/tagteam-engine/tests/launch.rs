@@ -1,6 +1,6 @@
 //! §12.5 "Launch": a session's start under `MutationGuard` and the account lock, what it
-//! decides again under them, and its reservation. Task 11 appends the per-launch login check
-//! and the exit handling.
+//! decides again under them, and its reservation; then the per-launch login check (§12.3) and
+//! the exit handling (§12.5 "When the child exits").
 
 mod common;
 
@@ -11,23 +11,24 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use common::{
-    Fx, claude_bin, credential, dir_tree, mutation_lock_free, splice_config_key, token_requests,
-    two_accounts, vault_fp,
+    Fx, auth_helper, auth_logged_out, auth_reply, auth_status, claude_bin, credential, dir_tree,
+    mutation_lock_free, splice_config_key, token_requests, two_accounts, vault_fp,
 };
 use serde_json::{Value, json};
 use tagteam_core::AccountId;
 use tagteam_engine::EngineError;
 use tagteam_engine::account_lock::AccountLock;
-use tagteam_engine::launch::Launched;
+use tagteam_engine::launch::{LaunchEnd, Launched};
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::flock::{FlockGuard, LockProbe, probe_lock};
 use tagteam_provider::http::{HttpError, Method};
+use tagteam_provider::process::Captured;
 use tagteam_provider::profile::{
     LAUNCH_DIR, MARKER_FILE, ProfileMarker, Seed, launch_reservations,
 };
-use tagteam_provider::splice::get_top_level;
+use tagteam_provider::splice::{get_top_level, remove_top_level};
 use tagteam_provider::{Keychain, Read};
 
 /// The row `plan_run` hands `launch` (Task 8), as it stands.
@@ -116,6 +117,15 @@ fn killed_session(fx: &Fx, id: &AccountId, email: &str) -> PathBuf {
     let launched = first_launch(fx, id, email);
     let profile = launched.profile.clone();
     drop(launched);
+    profile
+}
+
+/// A session of `id` that ran and exited cleanly, its exit handling done. Returns the profile.
+fn finished_session(fx: &Fx, id: &AccountId, email: &str) -> PathBuf {
+    let launched = first_launch(fx, id, email);
+    let profile = launched.profile.clone();
+    let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+    assert!(notices.is_empty(), "{notices:?}");
     profile
 }
 
@@ -997,6 +1007,484 @@ fn a_join_over_a_must_share_link_gone_stale_refuses_until_the_session_ends() {
     drop(other);
 }
 
+#[test]
+fn the_login_check_is_skipped_by_a_launch_that_bootstrapped() {
+    // §12.3: its validation already ran, under the locks.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let launched = first_launch(&fx, &a, "a@x.co");
+
+    fx.engine
+        .check_login(&launched, claude_bin(), &fx.work_dir("app"))
+        .unwrap();
+
+    assert_eq!(fx.spawner.specs().len(), 1);
+    assert!(
+        fx.engine
+            .finish_run(launched, LaunchEnd::Exited(0))
+            .is_empty()
+    );
+}
+
+#[test]
+fn every_other_launch_is_checked_in_its_own_directory_with_its_reservation_held() {
+    // §12.3 "Every launch is checked", §12.5 step 6: after the locks, before the spawn.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = finished_session(&fx, &a, "a@x.co");
+    let cwd = fx.work_dir("app/src");
+    let launched = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+    fx.script_valid(&profile, "a@x.co");
+
+    fx.engine
+        .check_login(&launched, claude_bin(), &cwd)
+        .unwrap();
+
+    let specs = fx.spawner.specs();
+    assert_eq!(specs.len(), 2);
+    assert_eq!(
+        specs[1].cwd.as_deref(),
+        Some(cwd.as_path()),
+        "where claude runs, so a project's own settings count"
+    );
+    assert_eq!(
+        specs[1].program,
+        claude_bin(),
+        "the binary the session will run"
+    );
+    assert!(mutation_lock_free(&fx.env));
+    assert_eq!(live_reservations(&profile), 1);
+    assert!(
+        fx.engine
+            .finish_run(launched, LaunchEnd::Exited(0))
+            .is_empty()
+    );
+}
+
+#[test]
+fn every_refusing_outcome_of_the_login_check_keeps_the_profile() {
+    // §12.3's table outside a bootstrap, B.62.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = finished_session(&fx, &a, "a@x.co");
+    let spelling = fx.spelling_for(&profile);
+    let cwd = fx.work_dir("app");
+    let rows = [
+        (
+            auth_reply(0, auth_helper(&spelling).to_string().as_bytes()),
+            "login-overridden",
+        ),
+        (
+            auth_reply(
+                0,
+                auth_status("/somewhere/else", "a@x.co")
+                    .to_string()
+                    .as_bytes(),
+            ),
+            "login-drifted",
+        ),
+        (Captured::TimedOut, "login-unknown"),
+        (auth_reply(0, b"not json"), "login-unknown"),
+        (
+            Captured::SpawnFailed("No such file or directory".into()),
+            "launch-unreachable",
+        ),
+    ];
+    for (reply, kind) in rows {
+        let launched = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+        fx.spawner.push(reply);
+
+        let err = fx
+            .engine
+            .check_login(&launched, claude_bin(), &cwd)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), kind, "{err}");
+        let notices = fx.engine.finish_run(launched, LaunchEnd::Refused);
+        assert!(notices.is_empty(), "{kind}: {notices:?}");
+        assert!(profile.join(MARKER_FILE).exists(), "{kind}: kept");
+        assert!(!seed(&profile).needs_bootstrap, "{kind}");
+    }
+}
+
+#[test]
+fn an_invalid_login_check_keeps_the_profile_and_the_next_launch_bootstraps_it() {
+    // §12.3, B.62: only a bootstrap's validation deletes a profile.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = finished_session(&fx, &a, "a@x.co");
+    let cwd = fx.work_dir("app");
+    let launched = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+    fx.script_auth(1, &auth_logged_out(&fx.spelling_for(&profile)));
+
+    let err = fx
+        .engine
+        .check_login(&launched, claude_bin(), &cwd)
+        .unwrap_err();
+
+    assert_eq!(err.kind(), "login-invalid", "{err}");
+    assert!(
+        seed(&profile).needs_bootstrap,
+        "recorded for the next launch"
+    );
+    assert!(
+        fx.engine
+            .finish_run(launched, LaunchEnd::Refused)
+            .is_empty()
+    );
+    assert!(profile.join(MARKER_FILE).exists(), "kept");
+
+    fx.script_valid(&profile, "a@x.co");
+    let next = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+    assert!(next.bootstrapped);
+    assert!(!seed(&profile).needs_bootstrap);
+    assert!(fx.engine.finish_run(next, LaunchEnd::Exited(0)).is_empty());
+}
+
+#[test]
+fn a_signal_during_the_login_check_interrupts_the_launch() {
+    // §12.5 "Signals": the wait for the check is a cancellation point, and its process killed.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = finished_session(&fx, &a, "a@x.co");
+    let cwd = fx.work_dir("app");
+    let launched = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+    fx.env.cancel.request(libc::SIGTERM);
+    fx.spawner.push(Captured::Interrupted(libc::SIGTERM));
+
+    let err = fx
+        .engine
+        .check_login(&launched, claude_bin(), &cwd)
+        .unwrap_err();
+
+    let _ = fx.env.cancel.take();
+    assert_eq!(err.kind(), "interrupted", "{err}");
+    assert_eq!(err.signal(), Some(libc::SIGTERM));
+    assert!(!seed(&profile).needs_bootstrap);
+    assert!(
+        fx.engine
+            .finish_run(launched, LaunchEnd::Refused)
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_launch_refused_by_its_login_check_runs_its_exit_handling_at_once() {
+    // §12.3, §12.5 step 6: as if `claude` had exited at once.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = finished_session(&fx, &a, "a@x.co");
+    let cwd = fx.work_dir("app");
+    let launched = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+    let own = launched.reservation.path().to_path_buf();
+    assert!(profile.join(".tagteam-baseline.json").exists(), "seeded");
+    fx.script_auth(0, &auth_helper(&fx.spelling_for(&profile)));
+    assert_eq!(
+        fx.engine
+            .check_login(&launched, claude_bin(), &cwd)
+            .unwrap_err()
+            .kind(),
+        "login-overridden"
+    );
+
+    let notices = fx.engine.finish_run(launched, LaunchEnd::Refused);
+
+    assert!(notices.is_empty(), "{notices:?}");
+    assert!(!own.exists(), "unlinked");
+    assert!(
+        !profile.join(".tagteam-baseline.json").exists(),
+        "merged back, with nothing to merge"
+    );
+    assert!(mutation_lock_free(&fx.env));
+}
+
+#[test]
+fn the_last_session_out_captures_a_rotation_and_merges_its_config_back() {
+    // §12.5 "When the child exits".
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let launched = first_launch(&fx, &a, "a@x.co");
+    let profile = launched.profile.clone();
+    let own = launched.reservation.path().to_path_buf();
+    session_adds_project(&profile, "/work/new");
+    fx.rotate_profile(&profile, "rt-a-2");
+
+    let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+
+    assert!(notices.is_empty(), "{notices:?}");
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-2"));
+    assert_eq!(
+        seed(&profile).seed_fp,
+        vault_fp(&fx, &a),
+        "the seed moves with the capture"
+    );
+    assert_eq!(
+        config_key(&fx.paths().global_config, "projects")["/work/new"],
+        json!({"allowedTools": ["Bash"]}),
+        "merged back (§12.4)"
+    );
+    assert!(!profile.join(".tagteam-baseline.json").exists());
+    assert!(!own.exists(), "unlinked last");
+    assert!(mutation_lock_free(&fx.env));
+}
+
+#[test]
+fn of_two_sessions_the_last_one_out_captures_a_rotation_either_made() {
+    // Review Focus 3: the second joins without a seed or a bootstrap; the last one out captures.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = finished_session(&fx, &a, "a@x.co");
+    // Another `tagteam run` of the account starts first, in another process.
+    let other = fx.hold_reservation(&profile);
+    let launched = fx
+        .engine
+        .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app"))
+        .unwrap();
+    assert!(!launched.bootstrapped);
+    assert!(
+        !profile.join(".tagteam-baseline.json").exists(),
+        "joined without a seed"
+    );
+    fx.rotate_profile(&profile, "rt-a-2");
+    // The other exits first. Its exit handling finds this session running, so it only unlinks.
+    let theirs = other.path().to_path_buf();
+    drop(other);
+    fs::remove_file(theirs).unwrap();
+
+    let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+
+    assert!(notices.is_empty(), "{notices:?}");
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-2"));
+    assert_eq!(seed(&profile).seed_fp, vault_fp(&fx, &a));
+}
+
+#[test]
+fn the_first_session_out_leaves_capture_and_merge_back_to_the_last() {
+    // Review Focus 3, the other order.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let cwd = fx.work_dir("app");
+    let launched = first_launch(&fx, &a, "a@x.co");
+    let profile = launched.profile.clone();
+    let own = launched.reservation.path().to_path_buf();
+    // A second session joined, in another process.
+    let other = fx.hold_reservation(&profile);
+    session_adds_project(&profile, "/work/new");
+    fx.rotate_profile(&profile, "rt-a-2");
+
+    let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+
+    assert!(notices.is_empty(), "{notices:?}");
+    assert!(!own.exists(), "only the unlink");
+    assert_eq!(
+        fx.vault_refresh_token(&a).as_deref(),
+        Some("rt-a"),
+        "nothing is captured under a running session"
+    );
+    assert!(
+        profile.join(".tagteam-baseline.json").exists(),
+        "the merge-back waits"
+    );
+    assert_eq!(
+        config_key(&fx.paths().global_config, "projects").get("/work/new"),
+        None
+    );
+
+    // The other session ends with its `tagteam` killed: the next launch completes both.
+    drop(other);
+    let next = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+    assert!(!next.bootstrapped);
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-2"));
+    assert!(
+        config_key(&fx.paths().global_config, "projects")
+            .get("/work/new")
+            .is_some()
+    );
+    drop(next);
+}
+
+#[test]
+fn a_background_session_keeps_the_profile_until_it_exits() {
+    // §12.5, §12.6: a `daemon` record counts, and capture and merge-back wait for it.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let cwd = fx.work_dir("app");
+    let launched = first_launch(&fx, &a, "a@x.co");
+    let profile = launched.profile.clone();
+    let daemon = fx.live_record(&profile, 4242, "daemon");
+    session_adds_project(&profile, "/work/new");
+    fx.rotate_profile(&profile, "rt-a-2");
+
+    let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+
+    assert!(notices.is_empty(), "{notices:?}");
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    assert!(profile.join(".tagteam-baseline.json").exists());
+    assert_eq!(
+        live_reservations(&profile),
+        0,
+        "its own reservation is gone all the same"
+    );
+
+    // The daemon shuts down gracefully and removes its record (Appendix A.7).
+    fs::remove_file(daemon).unwrap();
+    let next = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+    assert!(!next.bootstrapped);
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-2"));
+    assert!(
+        config_key(&fx.paths().global_config, "projects")
+            .get("/work/new")
+            .is_some()
+    );
+    drop(next);
+}
+
+#[test]
+fn a_failed_merge_back_keeps_the_baseline_and_the_next_launch_merges_it() {
+    // §12.4: the profile's changes and the baseline are kept, so it is retried before any re-seed.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let cwd = fx.work_dir("app");
+    let launched = first_launch(&fx, &a, "a@x.co");
+    let profile = launched.profile.clone();
+    let own = launched.reservation.path().to_path_buf();
+    session_adds_project(&profile, "/work/new");
+
+    block_home(&fx);
+    let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+    unblock_home(&fx);
+
+    assert_eq!(notices.len(), 1, "one notice: {notices:?}");
+    assert!(notices[0].contains("did not finish"), "{}", notices[0]);
+    assert!(profile.join(".tagteam-baseline.json").exists());
+    assert!(!own.exists(), "the unlink still runs, last");
+
+    let next = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+    assert_eq!(
+        config_key(&fx.paths().global_config, "projects")["/work/new"],
+        json!({"allowedTools": ["Bash"]})
+    );
+    drop(next);
+}
+
+#[test]
+fn a_merge_back_keeps_the_default_where_both_changed_and_says_so_once() {
+    // Review Focus 4 (§12.4): one key changed on both sides, a new project, a removed MCP
+    // server. Every other byte of the default file stays as it was.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let launched = first_launch(&fx, &a, "a@x.co");
+    let mine = launched.profile.join(".claude.json");
+    let theirs = fx.paths().global_config;
+    let mut projects = config_key(&mine, "projects");
+    projects["/work/app"]["allowedTools"] = json!(["Bash"]);
+    projects["/work/new"] = json!({"allowedTools": []});
+    splice_config_key(&mine, "projects", &projects);
+    splice_config_key(&mine, "mcpServers", &json!({}));
+    let mut defaults = config_key(&theirs, "projects");
+    defaults["/work/app"]["allowedTools"] = json!(["Read"]);
+    splice_config_key(&theirs, "projects", &defaults);
+    let rest = |doc: &[u8]| {
+        remove_top_level(&remove_top_level(doc, "projects").unwrap(), "mcpServers").unwrap()
+    };
+    let before = rest(&fs::read(&theirs).unwrap());
+
+    let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+
+    assert_eq!(
+        notices,
+        [
+            "1 key of position 1's session config changed on both sides while it ran; the default home's values were kept"
+        ]
+    );
+    let merged = config_key(&theirs, "projects");
+    assert_eq!(
+        merged["/work/app"]["allowedTools"],
+        json!(["Read"]),
+        "the default wins"
+    );
+    assert_eq!(merged["/work/app"]["history"], json!(["x"]), "untouched");
+    assert_eq!(merged["/work/new"], json!({"allowedTools": []}), "applied");
+    assert_eq!(
+        config_key(&theirs, "mcpServers"),
+        json!({}),
+        "the removal applied"
+    );
+    assert_eq!(
+        rest(&fs::read(&theirs).unwrap()),
+        before,
+        "every other byte as it was"
+    );
+}
+
+#[test]
+fn an_api_key_helper_added_to_the_shared_settings_refuses_the_next_launch_and_keeps_the_profile() {
+    // Review Focus 5, second half (§12.3 "Every launch is checked"). The helper is in the
+    // shared `settings.json`, which the profile reads through its link; the scripted check
+    // answers as Claude Code then does.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = finished_session(&fx, &a, "a@x.co");
+    let settings = fx.env.home.join(".claude/settings.json");
+    fs::write(&settings, r#"{"theme":"dark","apiKeyHelper":"~/bin/key"}"#).unwrap();
+    assert_eq!(
+        fs::read_link(profile.join("settings.json")).unwrap(),
+        fs::canonicalize(&settings).unwrap()
+    );
+    let cwd = fx.work_dir("app");
+    let launched = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+    fx.script_auth(0, &auth_helper(&fx.spelling_for(&profile)));
+
+    let err = fx
+        .engine
+        .check_login(&launched, claude_bin(), &cwd)
+        .unwrap_err();
+
+    assert!(
+        matches!(&err, EngineError::LoginOverridden { method, .. } if method == "api_key_helper"),
+        "{err}"
+    );
+    assert!(!seed(&profile).needs_bootstrap);
+    assert!(
+        fx.engine
+            .finish_run(launched, LaunchEnd::Refused)
+            .is_empty()
+    );
+    assert!(profile.join(MARKER_FILE).exists(), "kept");
+}
+
+#[test]
+fn a_rotation_in_a_profile_that_names_no_identity_is_not_captured_at_exit() {
+    // R11.1, M4a's Decision 9 at exit: a rotation no identity says is the account's is neither
+    // captured nor ignored. It is the one notice; the merge-back and the unlink still run.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let launched = first_launch(&fx, &a, "a@x.co");
+    let profile = launched.profile.clone();
+    let own = launched.reservation.path().to_path_buf();
+    let config = profile.join(".claude.json");
+    let without = remove_top_level(&fs::read(&config).unwrap(), "oauthAccount").unwrap();
+    fs::write(&config, without).unwrap();
+    session_adds_project(&profile, "/work/new");
+    fx.rotate_profile(&profile, "rt-a-2");
+
+    let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("names no identity"), "{}", notices[0]);
+    assert_eq!(
+        fx.vault_refresh_token(&a).as_deref(),
+        Some("rt-a"),
+        "not captured"
+    );
+    assert_eq!(
+        config_key(&fx.paths().global_config, "projects")["/work/new"],
+        json!({"allowedTools": ["Bash"]}),
+        "a failed capture does not stop the merge-back"
+    );
+    assert!(!own.exists(), "unlinked");
+}
+
 #[cfg(feature = "test-hooks")]
 mod hooked {
     use std::sync::{Arc, Mutex};
@@ -1344,5 +1832,76 @@ mod hooked {
 
         assert_eq!(*seen.lock().unwrap(), Some(true));
         drop(launched);
+    }
+
+    #[test]
+    fn a_signal_during_exit_handling_defers_it_and_loses_nothing() {
+        // §12.5 "After `claude` exits", B.63: its lock wait is a cancellation point; lazy
+        // capture and the next launch complete what it left.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let cwd = fx.work_dir("app");
+        let launched = first_launch(&fx, &a, "a@x.co");
+        let profile = launched.profile.clone();
+        let own = launched.reservation.path().to_path_buf();
+        session_adds_project(&profile, "/work/new");
+        fx.rotate_profile(&profile, "rt-a-2");
+        let cancel = fx.env.cancel.clone();
+        fx.engine.on_point(
+            "exit-before-locks",
+            Box::new(move || cancel.request(libc::SIGTERM)),
+        );
+
+        let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+
+        let _ = fx.env.cancel.take();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+        assert!(profile.join(".tagteam-baseline.json").exists());
+        assert_eq!(
+            probe_lock(&own).unwrap(),
+            LockProbe::Free,
+            "left in place; its lock went with this process's hold"
+        );
+
+        let next = fx.engine.launch(&row(&fx, &a), claude_bin(), &cwd).unwrap();
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a-2"));
+        assert!(
+            config_key(&fx.paths().global_config, "projects")
+                .get("/work/new")
+                .is_some()
+        );
+        assert_eq!(live_reservations(&profile), 1);
+        drop(next);
+    }
+
+    #[test]
+    fn a_failure_once_the_exit_locks_are_held_still_unlinks_the_reservation_last() {
+        // R11.2: the reservation is created and removed only under the locks (§12.5), and once
+        // they are held its unlink runs whatever failed before it, with one notice.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let launched = first_launch(&fx, &a, "a@x.co");
+        let profile = launched.profile.clone();
+        let own = launched.reservation.path().to_path_buf();
+        session_adds_project(&profile, "/work/new");
+        fx.engine.fail_at(Some("exit-locked"));
+
+        let notices = fx.engine.finish_run(launched, LaunchEnd::Exited(0));
+
+        fx.engine.fail_at(None);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].contains("injected failure at exit-locked"),
+            "the first cause: {}",
+            notices[0]
+        );
+        assert!(!own.exists(), "unlinked all the same");
+        assert!(
+            profile.join(".tagteam-baseline.json").exists(),
+            "nothing after the failure ran"
+        );
+        assert!(mutation_lock_free(&fx.env));
+        assert!(AccountLock::try_acquire(&fx.env, &a).unwrap().is_some());
     }
 }
