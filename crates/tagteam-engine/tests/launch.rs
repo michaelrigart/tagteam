@@ -27,7 +27,7 @@ use tagteam_provider::flock::{FlockGuard, LockProbe, probe_lock};
 use tagteam_provider::http::{HttpError, Method};
 use tagteam_provider::process::Captured;
 use tagteam_provider::profile::{
-    LAUNCH_DIR, MARKER_FILE, ProfileMarker, Seed, launch_reservations,
+    LAUNCH_DIR, MARKER_FILE, ProfileMarker, SEED_FILE, Seed, launch_reservations,
 };
 use tagteam_provider::splice::{get_top_level, remove_top_level};
 use tagteam_provider::{Keychain, Read};
@@ -453,6 +453,49 @@ fn a_session_config_changed_on_both_sides_is_summarised_once_in_the_launch_s_war
         json!(["Read"]),
         "the default home's value is kept"
     );
+}
+
+#[test]
+fn a_merge_back_the_seed_or_the_bootstrap_runs_is_summarised_once_in_the_launch_s_warnings() {
+    // §12.4 step 3. With no marker beside the baseline, the launch leaves the waiting merge-back
+    // to the seed, or to the bootstrap when one is due; its summary is the launch's all the same.
+    for bootstrap in [false, true] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let profile = killed_session(&fx, &a, "a@x.co");
+        let allow = |config: &Path, tools: Value| {
+            let mut projects = config_key(config, "projects");
+            projects["/work/app"]["allowedTools"] = tools;
+            splice_config_key(config, "projects", &projects);
+        };
+        allow(&profile.join(".claude.json"), json!(["Bash"]));
+        allow(&fx.paths().global_config, json!(["Read"]));
+        fs::remove_file(profile.join(MARKER_FILE)).unwrap();
+        if bootstrap {
+            fs::remove_file(profile.join(SEED_FILE)).unwrap();
+            fx.script_valid(&profile, "a@x.co");
+        }
+
+        let launched = fx
+            .engine
+            .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app"))
+            .unwrap();
+
+        assert_eq!(launched.bootstrapped, bootstrap);
+        assert_eq!(
+            launched.warnings,
+            [
+                "1 key of position 1's session config changed on both sides while it ran; the default home's values were kept"
+            ],
+            "bootstrap {bootstrap}"
+        );
+        assert_eq!(
+            config_key(&fx.paths().global_config, "projects")["/work/app"]["allowedTools"],
+            json!(["Read"]),
+            "bootstrap {bootstrap}: the default home's value is kept"
+        );
+        drop(launched);
+    }
 }
 
 #[test]

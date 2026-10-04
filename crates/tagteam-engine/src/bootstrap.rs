@@ -20,6 +20,7 @@ use crate::displace::displace;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
+use crate::launch::merge_summary;
 use crate::provenance::identity_drifted;
 use crate::store::AccountRow;
 
@@ -241,40 +242,35 @@ impl Engine {
     /// aborts with the profile and its baseline as they were: a seed over them would drop the
     /// session's changes, and its baseline write could follow a link at the baseline's path.
     /// The merge-back takes the outer home's config lock alone (§4.3), and only after
-    /// `MutationGuard` and the account lock. The launch (Task 10) runs it before the marker and
-    /// reports its summary; this keeps every seed and bootstrap behind the same rule.
+    /// `MutationGuard` and the account lock. The launch (Task 10) runs it before the marker when
+    /// the profile has one; this keeps every seed and bootstrap behind the same rule. Returns
+    /// §12.4 step 3's summary, for the launch's warnings; `merge_summary` has logged it already,
+    /// so a launch that aborts later still reports it.
     fn merge_back_waiting(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
         profile: &Path,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Option<String>, EngineError> {
         if !p.has_baseline(profile) {
-            return Ok(());
+            return Ok(None);
         }
         let report = p.merge_back(&self.env, profile, self.cancel())?;
-        if !report.conflicts.is_empty() {
-            tracing::warn!(
-                position = row.position,
-                account = %row.id,
-                conflicts = ?report.conflicts,
-                "a session's merge-back kept the default file's values where both sides changed"
-            );
-        }
-        Ok(())
+        Ok(merge_summary(row, &report))
     }
 
     /// §12.4's seed of `profile`, the profile's actual directory, whatever spelling its marker
-    /// records (Decision 22), after a waiting baseline is merged back.
+    /// records (Decision 22), after a waiting baseline is merged back. Returns that merge-back's
+    /// summary, if it has one.
     pub(crate) fn seed_of(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
         profile: &Path,
-    ) -> Result<(), EngineError> {
-        self.merge_back_waiting(p, row, profile)?;
+    ) -> Result<Option<String>, EngineError> {
+        let summary = self.merge_back_waiting(p, row, profile)?;
         p.seed_profile(&self.env, profile, &p.parse_identity(&row.identity_json)?)?;
-        Ok(())
+        Ok(summary)
     }
 
     /// §12.3 steps 2–8 for the quiescent `profile`, whose marker exists. The caller holds
@@ -282,6 +278,7 @@ impl Engine {
     /// directory `claude` will run in, and `program` the launch command `plan_run` resolved,
     /// which the validation spawns (Decision 20). A profile that is not a real directory
     /// refuses, and a waiting baseline is merged back (§12.4), before anything is written.
+    /// Returns that merge-back's summary, if it has one, for the launch's warnings.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bootstrap_profile(
         &self,
@@ -292,7 +289,7 @@ impl Engine {
         program: &Path,
         guard: &MutationGuard,
         lock: &AccountLock,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Option<String>, EngineError> {
         debug_assert_eq!(lock.id(), &row.id, "the caller holds this account's lock");
         // Only into a profile that is a real directory, as M4a's `is_real_dir` decides it: the
         // step 4 write resolves the profile from its canonical spelling, so through a link at
@@ -302,7 +299,7 @@ impl Engine {
             return Err(not_its_own_directory(profile));
         }
         // §12.4: before anything touches the profile, so a failure leaves it as it was.
-        self.merge_back_waiting(p, row, profile)?;
+        let summary = self.merge_back_waiting(p, row, profile)?;
         // §6.2 "Pending rescues before activation": a rescue consumed the vault's generation.
         self.settle_rescues(p, row, lock)?;
         let vault = self.vault_generation(row)?;
@@ -360,10 +357,11 @@ impl Engine {
             }
             .write(profile)?;
         }
-        // 7.
-        self.seed_of(p, row, profile)?;
+        // 7. Its own merge-back finds the baseline gone, unless something wrote one since.
+        let seeded = self.seed_of(p, row, profile)?;
         // 8.
-        self.validate_bootstrap(p, row, &current, cwd, program)
+        self.validate_bootstrap(p, row, &current, cwd, program)?;
+        Ok(summary.or(seeded))
     }
 
     /// §12.3 step 3, and B.5: a stale-marked profile's credential may be a live generation of
@@ -490,7 +488,7 @@ impl Engine {
         match trigger {
             Some(_) => self.bootstrap_profile(p, &row, &profile, cwd, program, &guard, &lock)?,
             None => self.seed_of(p, &row, &profile)?,
-        }
+        };
         Ok(trigger)
     }
 }
