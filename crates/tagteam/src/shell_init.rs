@@ -19,9 +19,11 @@ pub(crate) struct Wrapped {
 /// - `command <launch>` skips the function itself, so the fallback never recurses;
 /// - `"$@"` passes every argument as it was given, the empty ones included.
 ///
-/// A user's alias of the same name makes the definition fail when the rc file runs, rather
-/// than shadow the wrapper silently. fish's `$argv` is a list, and expands one argument per
-/// element without splitting.
+/// A user's alias of the same name keeps winning over the function. zsh refuses the definition
+/// when the rc file runs, so the conflict shows. bash expands the alias inside the definition: an
+/// alias of several words makes it fail, but one of a single word silently defines a function of
+/// that word's name instead, and the wrapper never runs. fish's `$argv` is a list, and expands
+/// one argument per element without splitting.
 pub(crate) fn script(shell: ShellArg, providers: &[Wrapped]) -> String {
     let functions: Vec<String> = providers.iter().map(|p| function(shell, p)).collect();
     functions.join("\n")

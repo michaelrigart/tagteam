@@ -29,9 +29,14 @@ impl Cancel {
     }
 
     /// Consumes the recorded signal (§12.5's forwarding): returns it and leaves the token unset,
-    /// for every clone. Only `run`'s wait loop takes (M4b Decision 1). It forwards what arrived
-    /// while `claude` runs, and it clears what forwarding left once `claude` has exited, so the
-    /// exit handling's cancellation points see only new signals. Everything else only reads.
+    /// for every clone. Only `tagteam run` takes (M4b Decision 1):
+    /// - its last look before the spawn, where a signal ends the launch;
+    /// - its wait loop, which forwards what arrived while `claude` runs;
+    /// - once `claude` has exited, to clear what forwarding left;
+    /// - `abandon`, before a refused or interrupted launch's exit handling.
+    ///
+    /// So the exit handling's cancellation points see only new signals. Everything else only
+    /// reads.
     pub fn take(&self) -> Option<i32> {
         match self.signal.swap(0, Ordering::SeqCst) {
             0 => None,
