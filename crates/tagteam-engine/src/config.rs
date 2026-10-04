@@ -13,7 +13,7 @@ use std::time::Duration;
 use tagteam_core::ProviderId;
 use tagteam_provider::FlockGuard;
 use tagteam_provider::atomic::{ensure_private_dir, write_atomic};
-use toml_edit::{Decor, DocumentMut, Item, Table, TableLike};
+use toml_edit::{Array, Decor, DocumentMut, Item, RawString, Table, TableLike, Value as TomlValue};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
@@ -318,6 +318,12 @@ fn put(table: &mut dyn TableLike, entry: &Entry, value: &Value) -> Result<bool, 
             };
             if let Some(new) = item.as_value_mut() {
                 *new.decor_mut() = decor;
+                if let (Some(old), Some(new)) = (
+                    old.as_value().and_then(TomlValue::as_array),
+                    new.as_array_mut(),
+                ) {
+                    carry_array_decor(old, new);
+                }
             }
             *old = item;
         }
@@ -326,6 +332,129 @@ fn put(table: &mut dyn TableLike, entry: &Entry, value: &Value) -> Result<bool, 
         }
     }
     Ok(true)
+}
+
+/// The text in an array between two of its elements, split at the first line break: what
+/// precedes it is on the line of the element or bracket before it.
+struct Gap {
+    same_line: String,
+    breaks: bool,
+    rest: String,
+}
+
+impl Gap {
+    fn new(text: &str) -> Self {
+        match text.split_once('\n') {
+            Some((same_line, rest)) => Gap {
+                same_line: same_line.to_owned(),
+                breaks: true,
+                rest: rest.to_owned(),
+            },
+            None => Gap {
+                same_line: String::new(),
+                breaks: false,
+                rest: text.to_owned(),
+            },
+        }
+    }
+}
+
+fn raw(text: Option<&RawString>) -> &str {
+    text.and_then(RawString::as_str).unwrap_or_default()
+}
+
+/// Lays `new`, a list of strings, out as `old` was, so a replaced list keeps its comments (§6.4):
+/// - an element also in `old` keeps its own comments, matched by value, in order, first unused
+///   one; the comment at the end of its line (which toml_edit keeps with what follows it) moves
+///   with it;
+/// - a new element gets the layout of `old`'s last element;
+/// - a comment above the closing bracket stays, and so does the trailing comma;
+/// - a removed element's comments go with it.
+fn carry_array_decor(old: &Array, new: &mut Array) {
+    let n = old.len();
+    let trailing_comma = old.trailing_comma();
+    // gaps[k] sits before element k, and gaps[n] before the closing bracket.
+    let mut gaps: Vec<Gap> = old
+        .iter()
+        .map(|v| Gap::new(raw(v.decor().prefix())))
+        .collect();
+    let mut own_suffix: Vec<&str> = old.iter().map(|v| raw(v.decor().suffix())).collect();
+    gaps.push(Gap::new(match (n, trailing_comma) {
+        (0, _) | (_, true) => old.trailing().as_str().unwrap_or_default(),
+        _ => std::mem::take(&mut own_suffix[n - 1]),
+    }));
+
+    let mut used = vec![false; n];
+    let matched: Vec<Option<usize>> = new
+        .iter()
+        .map(|v| {
+            let name = v.as_str()?;
+            let at = (0..n)
+                .find(|&i| !used[i] && old.get(i).and_then(TomlValue::as_str) == Some(name))?;
+            used[at] = true;
+            Some(at)
+        })
+        .collect();
+
+    let (style_breaks, style_indent) = match gaps.get(n.wrapping_sub(1)) {
+        Some(last) => (
+            last.breaks,
+            last.rest.rsplit('\n').next().unwrap_or_default().to_owned(),
+        ),
+        None => (false, String::new()),
+    };
+    let lead = |at: usize, matched: Option<usize>| match matched {
+        Some(i) => gaps[i].rest.clone(),
+        None if style_breaks => style_indent.clone(),
+        None if n == 0 => {
+            if at == 0 {
+                String::new()
+            } else {
+                " ".to_owned()
+            }
+        }
+        None if at == 0 => gaps[0].rest.clone(),
+        None if n >= 2 => gaps[n - 1].rest.clone(),
+        None => " ".to_owned(),
+    };
+    // What precedes position `at`: the comment ending the previous line, the break, the lead.
+    let before = |at: usize| {
+        let same_line = match at.checked_sub(1) {
+            Some(prev) => matched[prev].map_or("", |i| gaps[i + 1].same_line.as_str()),
+            None => gaps[0].same_line.as_str(),
+        };
+        (same_line, !same_line.is_empty())
+    };
+
+    let count = matched.len();
+    let (same_line, forced) = before(count);
+    let closing_breaks = forced || gaps[n].breaks;
+    let closing = format!(
+        "{same_line}{}{}",
+        if closing_breaks { "\n" } else { "" },
+        gaps[n].rest
+    );
+    let trailing_comma = trailing_comma && count > 0;
+    for (at, value) in new.iter_mut().enumerate() {
+        let (same_line, forced) = before(at);
+        let breaks = forced || matched[at].map_or(style_breaks, |i| gaps[i].breaks);
+        let prefix = format!(
+            "{same_line}{}{}",
+            if breaks { "\n" } else { "" },
+            lead(at, matched[at])
+        );
+        let mut suffix = matched[at].map_or("", |i| own_suffix[i]).to_owned();
+        if at + 1 == count && !trailing_comma {
+            suffix.push_str(&closing);
+        }
+        let decor = value.decor_mut();
+        decor.set_prefix(prefix);
+        decor.set_suffix(suffix);
+    }
+    new.set_trailing_comma(trailing_comma);
+    if trailing_comma || (count == 0 && closing.contains('#')) {
+        new.set_trailing(closing);
+    }
 }
 
 /// Whether the entry `leaf` in the table at `path` under `table` is itself a table: a table, an

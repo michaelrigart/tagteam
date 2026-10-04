@@ -97,6 +97,113 @@ fn a_set_rewrites_its_value_alone_and_every_comment_survives() {
 }
 
 #[test]
+fn replacing_a_list_keeps_the_comment_of_each_element_it_keeps() {
+    // §6.4: an element that stays keeps its own comments, even in a new place in the list, and
+    // a new element is written in the layout the list already has.
+    let fx = Fx::new();
+    write_config(
+        &fx,
+        "\
+# my models
+[autoswitch]
+models = [
+  \"Fable\", # retain this model
+]
+threshold = 80.0
+",
+    );
+
+    set(&fx, "autoswitch.models", "Fable,opus");
+    assert_eq!(
+        config_text(&fx),
+        "\
+# my models
+[autoswitch]
+models = [
+  \"Fable\", # retain this model
+  \"opus\",
+]
+threshold = 80.0
+"
+    );
+}
+
+#[test]
+fn a_comment_before_the_closing_bracket_of_a_replaced_list_survives() {
+    let fx = Fx::new();
+    write_config(
+        &fx,
+        "\
+[autoswitch]
+models = [
+  \"Fable\",
+  # the models I use
+  \"opus\", # keep opus
+  # last word
+]
+",
+    );
+
+    set(&fx, "autoswitch.models", "Fable,opus,sonnet");
+    assert_eq!(
+        config_text(&fx),
+        "\
+[autoswitch]
+models = [
+  \"Fable\",
+  # the models I use
+  \"opus\", # keep opus
+  \"sonnet\",
+  # last word
+]
+"
+    );
+}
+
+#[test]
+fn the_comment_of_an_element_a_replacement_drops_goes_with_it() {
+    let fx = Fx::new();
+    write_config(
+        &fx,
+        "\
+[autoswitch]
+models = [
+  \"Fable\", # stays
+  \"opus\", # goes with opus
+  \"sonnet\", # stays too
+]
+",
+    );
+
+    set(&fx, "autoswitch.models", "Fable,sonnet");
+    assert_eq!(
+        config_text(&fx),
+        "\
+[autoswitch]
+models = [
+  \"Fable\", # stays
+  \"sonnet\", # stays too
+]
+"
+    );
+}
+
+#[test]
+fn replacing_a_one_line_list_keeps_it_on_one_line() {
+    let fx = Fx::new();
+    write_config(
+        &fx,
+        "[autoswitch]\nmodels = [\"Fable\", \"opus\"]   # mine\n",
+    );
+
+    set(&fx, "autoswitch.models", "Fable,opus,sonnet");
+    assert_eq!(
+        config_text(&fx),
+        "[autoswitch]\nmodels = [\"Fable\", \"opus\", \"sonnet\"]   # mine\n"
+    );
+}
+
+#[test]
 fn set_creates_the_file_0600_in_a_0700_directory_and_reports_the_entry() {
     // §5, §6.4: only `set` creates the file. A new file is 0600 whatever the umask, in a
     // directory made 0700.
