@@ -92,11 +92,20 @@ pub fn remove_own_file(profile: &Path, name: &str) -> io::Result<()> {
 /// wherever the link points, such as the default home's credential file. A link refuses,
 /// naming the file; anything else, nothing included, is the write's to judge.
 pub fn refuse_linked_credential(file: &Path) -> io::Result<()> {
+    refuse_linked_file(file, "a session credential")
+}
+
+/// A file private to a profile is written only where it is, never through a link: the atomic
+/// write follows a link at the file, so it would land wherever the link points. The seed's config
+/// is one (§12.4): through a link to the default home's config, it would put the account's login
+/// there. A link refuses, naming the file and `what` would have been written; anything else,
+/// nothing included, is the write's to judge.
+pub fn refuse_linked_file(file: &Path, what: &str) -> io::Result<()> {
     match fs::symlink_metadata(file) {
         Ok(m) if m.file_type().is_symlink() => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "{} is a link, so a session credential written there would land wherever it points; remove the link, then run again",
+                "{} is a link, so {what} written there would land wherever it points; remove the link, then run again",
                 file.display()
             ),
         )),

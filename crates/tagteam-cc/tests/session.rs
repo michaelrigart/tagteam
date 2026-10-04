@@ -1052,6 +1052,38 @@ mod seed_and_merge_back {
     }
 
     #[test]
+    fn a_profile_config_that_is_a_link_refuses_the_seed_and_leaves_the_default_file_as_it_was() {
+        // The profile's `.claude.json` is its own (`CC_PRIVATE`). The write would follow a
+        // hand-made link to the default file and put this account's `oauthAccount` there. A link
+        // that resolves to nothing is refused too, before anything appears where it points.
+        let f = fx();
+        fs::write(default_config(&f), DEFAULT_JSON).unwrap();
+        let (dir, _) = profile(&f, "0192");
+        let config = dir.join(".claude.json");
+        let nowhere = f.env.home.join("elsewhere.json");
+        for target in [default_config(&f), nowhere.clone()] {
+            let _ = fs::remove_file(&config);
+            std::os::unix::fs::symlink(&target, &config).unwrap();
+
+            let err = f.cc.seed_profile(&f.env, &dir, &account(&f)).unwrap_err();
+
+            assert!(
+                err.to_string()
+                    .contains(&format!("{} is a link", config.display())),
+                "{err}"
+            );
+            assert_eq!(fs::read_link(&config).unwrap(), target, "it stays");
+            assert!(!f.cc.has_baseline(&dir));
+        }
+        assert_eq!(
+            fs::read(default_config(&f)).unwrap(),
+            DEFAULT_JSON.as_bytes(),
+            "byte for byte"
+        );
+        assert!(!nowhere.exists(), "nothing was written through the link");
+    }
+
+    #[test]
     fn a_torn_file_on_either_side_stops_the_seed_and_writes_nothing() {
         let f = fx();
         let (dir, _) = profile(&f, "0192");

@@ -49,7 +49,8 @@ pub use process::{
 pub use profile::{
     LAUNCH_DIR, LINKS_FILE, LinksRecord, MARKER_FILE, ProfileMarker, RunShell, SEED_FILE, Seed,
     canonical_profile_path, entry_matches, has_own_file, launch_reservations, profile_path,
-    read_own_bytes, refuse_linked_credential, remove_own_file, write_own_json_with,
+    read_own_bytes, refuse_linked_credential, refuse_linked_file, remove_own_file,
+    write_own_json_with,
 };
 pub use provider::{
     BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, EntryKind,

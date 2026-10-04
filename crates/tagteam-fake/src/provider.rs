@@ -12,7 +12,8 @@ use tagteam_provider::atomic::{
 use tagteam_provider::http::{Http, HttpError, HttpRequest};
 use tagteam_provider::process::ProcessSpawner;
 use tagteam_provider::profile::{
-    has_own_file, read_own_bytes, refuse_linked_credential, remove_own_file, write_own_json_with,
+    has_own_file, read_own_bytes, refuse_linked_credential, refuse_linked_file, remove_own_file,
+    write_own_json_with,
 };
 use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind};
 use tagteam_provider::splice::{self, render_nested};
@@ -737,7 +738,8 @@ impl Provider for FakeAgent {
 
     /// §12.4 in FakeAgent's shape: the `identity.json` of the profile in `dir` (or `{}`) gets
     /// the outer home's `prefs`, absence included, and the account's `identity`; then the
-    /// baseline. Under the profile's own `.live.lock`, FakeAgent's only lock.
+    /// baseline. Under the profile's own `.live.lock`, FakeAgent's only lock. As Claude Code's
+    /// `.claude.json`, the profile's `identity.json` is its own: one that is a link refuses first.
     fn seed_profile(
         &self,
         env: &Env,
@@ -753,6 +755,7 @@ impl Provider for FakeAgent {
             Read::Unreadable(_) => return Err(unsplicable(&outer)),
         };
         let p = FakePaths::resolve(&profile_env_in(env, dir));
+        refuse_linked_file(&p.identity, "a session's identity")?;
         let lock = live_lock(p.lock.clone(), self.lock_budget, &env.cancel)?;
         let fence = || lock.check_owned().map_err(ProviderError::from);
         let before =
