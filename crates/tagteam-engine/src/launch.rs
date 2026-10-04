@@ -185,8 +185,16 @@ impl Engine {
         }
         // 3.
         warnings.extend(self.sync_profile_links(p, &profile, joining)?.warnings);
-        let bootstrapped =
-            !joining && self.prepare_quiescent(p, &row, &profile, cwd, program, &guard, &lock)?;
+        let bootstrapped = if joining {
+            false
+        } else {
+            let (bootstrapped, summary) =
+                self.prepare_quiescent(p, &row, &profile, cwd, program, &guard, &lock)?;
+            // A baseline that had no marker beside it is merged back by the seed or the
+            // bootstrap, and its summary is this launch's too.
+            warnings.extend(summary);
+            bootstrapped
+        };
         // 4.
         let spelling = self.recorded_spelling(&row, &profile)?;
         let reservation = LaunchReservation::create(&profile)
@@ -391,7 +399,8 @@ impl Engine {
     /// - a vault that moved on, or a stale-marked profile, bootstraps.
     ///
     /// Any other §12.3 trigger bootstraps too; otherwise the profile is seeded (§12.4).
-    /// Returns whether it bootstrapped. A bootstrap validates in `cwd`, spawning `program`.
+    /// Returns whether it bootstrapped, and the summary of a merge-back the seed or the bootstrap
+    /// ran (§12.4 step 3). A bootstrap validates in `cwd`, spawning `program`.
     #[allow(clippy::too_many_arguments)]
     fn prepare_quiescent(
         &self,
@@ -402,7 +411,7 @@ impl Engine {
         program: &Path,
         guard: &MutationGuard,
         lock: &AccountLock,
-    ) -> Result<bool, EngineError> {
+    ) -> Result<(bool, Option<String>), EngineError> {
         self.settle_rescues(p, row, lock)?;
         let why = match self.apply_provenance(p, row, lock)? {
             ProfileCheck::Conflict => {
@@ -424,8 +433,7 @@ impl Engine {
                 .map(Trigger::as_str),
         };
         let Some(why) = why else {
-            self.seed_of(p, row, profile)?;
-            return Ok(false);
+            return Ok((false, self.seed_of(p, row, profile)?));
         };
         tracing::info!(
             position = row.position,
@@ -433,8 +441,8 @@ impl Engine {
             why,
             "bootstrapping the session profile"
         );
-        self.bootstrap_profile(p, row, profile, cwd, program, guard, lock)?;
-        Ok(true)
+        let summary = self.bootstrap_profile(p, row, profile, cwd, program, guard, lock)?;
+        Ok((true, summary))
     }
 
     /// §12.3 "Every launch is checked", run after the launch's locks are released, with its
