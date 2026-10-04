@@ -10,7 +10,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use common::{
-    Fx, claude_bin, credential, mutation_lock_free, splice_config_key, token_requests,
+    Fx, claude_bin, credential, dir_tree, mutation_lock_free, splice_config_key, token_requests,
     two_accounts, vault_fp,
 };
 use serde_json::{Value, json};
@@ -24,7 +24,9 @@ use tagteam_engine::vault::SERVICE;
 use tagteam_provider::Read;
 use tagteam_provider::flock::{FlockGuard, LockProbe, probe_lock};
 use tagteam_provider::http::{HttpError, Method};
-use tagteam_provider::profile::{LAUNCH_DIR, ProfileMarker, Seed, launch_reservations};
+use tagteam_provider::profile::{
+    LAUNCH_DIR, MARKER_FILE, ProfileMarker, Seed, launch_reservations,
+};
 use tagteam_provider::splice::get_top_level;
 
 /// The row `plan_run` hands `launch` (Task 8), as it stands.
@@ -690,6 +692,134 @@ fn a_quarantined_target_launches_once_with_the_warning_that_it_needs_a_new_login
         );
         assert_eq!(token_requests(&fx), 0);
     }
+}
+
+#[test]
+fn a_profile_path_linked_elsewhere_refuses_the_launch_before_anything_is_touched_there() {
+    // Controller ruling (Task 9): the real-directory check comes first under the locks. Through
+    // a link at the profile path, step 2 would remove the dead reservations at its target and
+    // merge back the baseline there before `mark_profile` refused.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = killed_session(&fx, &a, "a@x.co");
+    session_adds_project(&profile, "/work/new");
+    let target = fx.dir.path().join("elsewhere").join(a.as_str());
+    fs::create_dir(target.parent().unwrap()).unwrap();
+    fs::rename(&profile, &target).unwrap();
+    symlink(&target, &profile).unwrap();
+    let before = dir_tree(&target);
+    let global = fs::read(fx.paths().global_config).unwrap();
+
+    let err = refused(
+        fx.engine
+            .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app")),
+    );
+
+    assert_eq!(err.kind(), "invalid-input", "{err}");
+    assert!(
+        err.to_string().contains(&profile.display().to_string()),
+        "{err}"
+    );
+    assert_eq!(
+        dir_tree(&target),
+        before,
+        "nothing touched at the link's target"
+    );
+    assert_eq!(
+        fs::read(fx.paths().global_config).unwrap(),
+        global,
+        "nothing merged back from it"
+    );
+    assert!(mutation_lock_free(&fx.env));
+}
+
+#[test]
+fn a_join_into_a_profile_marked_for_another_account_refuses_before_its_links_are_synced() {
+    // A marker naming another account refuses first (as for a quiescent launch), so a join
+    // never makes links in a profile that is not the account's.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = killed_session(&fx, &a, "a@x.co");
+    let other = fx.hold_reservation(&profile);
+    let skills = profile.join("skills");
+    fs::remove_file(&skills).unwrap();
+    let marker = match ProfileMarker::read(&profile) {
+        Read::Present(m) => m,
+        other => panic!("{other:?}"),
+    };
+    ProfileMarker {
+        account_id: AccountId::from_string("0192-someone-else"),
+        ..marker
+    }
+    .write(&profile)
+    .unwrap();
+
+    let err = refused(
+        fx.engine
+            .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app")),
+    );
+
+    assert_eq!(err.kind(), "invalid-input", "{err}");
+    assert!(err.to_string().contains("names another account"), "{err}");
+    assert!(
+        fs::symlink_metadata(&skills).is_err(),
+        "no link was made in it"
+    );
+    assert_eq!(live_reservations(&profile), 1, "only the running session's");
+    drop(other);
+}
+
+#[test]
+fn a_reservation_directory_that_cannot_be_used_refuses_the_launch_naming_it() {
+    // Controller ruling (Task 4): the reservation calls report I/O errors without a path, so the
+    // refusal names the directory. A file in its place is no live reservation of this pid.
+    for case in ["unlistable", "a file"] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let profile = killed_session(&fx, &a, "a@x.co");
+        let dir = profile.join(LAUNCH_DIR);
+        if case == "unlistable" {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        } else {
+            fs::remove_dir_all(&dir).unwrap();
+            fs::write(&dir, "").unwrap();
+        }
+
+        let result = fx
+            .engine
+            .launch(&row(&fx, &a), claude_bin(), &fx.work_dir("app"));
+
+        if case == "unlistable" {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let err = refused(result);
+        assert_eq!(err.kind(), "io", "{case}: {err}");
+        assert!(
+            err.to_string().contains(&dir.display().to_string()),
+            "{case}: {err}"
+        );
+        assert!(mutation_lock_free(&fx.env), "{case}");
+    }
+}
+
+#[test]
+fn an_unreadable_run_shell_refuses_the_launch_before_anything_else() {
+    // §12.8, as `plan_run` (R8.1): under a marker that cannot be read the outer home is unknown,
+    // and the engine's `env` is still the run shell's. A launch would take that profile for the
+    // default home: its login for the live one, and its entries for the ones to share.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.add("c@x.co", "rt-c");
+    let shell = fx.make_profile(&a);
+    fs::write(shell.join(MARKER_FILE), "{ torn").unwrap();
+    let engine = fx.engine_located(fx.shell_env(&shell));
+
+    let err = refused(engine.launch(&row(&fx, &b), claude_bin(), &fx.work_dir("app")));
+
+    assert_eq!(err.kind(), "run-shell-unreadable", "{err}");
+    assert!(!fx.profile_dir(&b).exists(), "nothing was created");
+    assert!(fx.spawner.specs().is_empty());
 }
 
 #[test]

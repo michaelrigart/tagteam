@@ -76,6 +76,15 @@ fn not_its_own_directory(profile: &Path) -> EngineError {
     ))
 }
 
+/// Refuses a profile path that is there but is not a real directory (`not_its_own_directory`),
+/// before anything is read or written through it. A missing one is fine: it is created 0700.
+pub(crate) fn refuse_linked_profile(profile: &Path) -> Result<(), EngineError> {
+    if fs::symlink_metadata(profile).is_ok_and(|m| !m.is_dir()) {
+        return Err(not_its_own_directory(profile));
+    }
+    Ok(())
+}
+
 /// §12.3's validation table, but for `invalid`'s deletion: `None` launches.
 pub(crate) fn refusal(row: &AccountRow, validity: Validity) -> Option<EngineError> {
     let position = row.position;
@@ -123,9 +132,7 @@ impl Engine {
         row: &AccountRow,
         profile: &Path,
     ) -> Result<ProfileMarker, EngineError> {
-        if fs::symlink_metadata(profile).is_ok_and(|m| !m.is_dir()) {
-            return Err(not_its_own_directory(profile));
-        }
+        refuse_linked_profile(profile)?;
         let outer = p.outer_home(&self.env);
         let marker = match self.own_marker(row, profile)? {
             Some(m) if m.outer == outer => return Ok(m),
