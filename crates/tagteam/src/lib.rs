@@ -63,6 +63,29 @@ fn status_bar_line(cli: &cli::Cli) -> bool {
     ) && !cli.json
 }
 
+/// §5: the root refusal comes before anything is created, and logging creates the log's
+/// directory and file. `sudo` keeps the user's `HOME` on macOS, so a root process that got as
+/// far as `init` would leave root-owned files in the user's state directory. Returns the exit
+/// code when the command is refused, after printing the refusal as `--json` or a person asks.
+fn refuse_then_init_logging(
+    json: bool,
+    refuse: impl FnOnce() -> Result<(), String>,
+    init_logging: impl FnOnce(),
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> Option<i32> {
+    if let Err(message) = refuse() {
+        if json {
+            let _ = writeln!(out, "{}", app::error_json(app::KIND_ROOT, &message));
+        } else {
+            let _ = writeln!(err, "tagteam: {message}");
+        }
+        return Some(app::EXIT_ERROR);
+    }
+    init_logging();
+    None
+}
+
 /// Runs the CLI and returns the process exit code.
 pub fn main_with_args<I, T>(args: I) -> i32
 where
@@ -123,17 +146,29 @@ where
     };
     // §14.2, Decision 5: logging is a process concern, set up here once and never by
     // `app::run`, which in-process tests drive. After the HOME check, since the log's path
-    // derives from HOME, and before the command runs.
-    logging::init(
-        logging::LogConfig {
-            debug: cli.debug,
-            color: !cli.no_color && !ctx.no_color_env,
-            state_dir: ctx.env.state_dir(),
-            home: ctx.env.home.clone(),
-            filter: std::env::var_os(logging::TAGTEAM_LOG),
-        },
+    // derives from HOME, and after the root refusal, which `run` repeats for in-process callers
+    // (a refused process never reaches it), and before the command runs.
+    let init_logging = || {
+        logging::init(
+            logging::LogConfig {
+                debug: cli.debug,
+                color: !cli.no_color && !ctx.no_color_env,
+                state_dir: ctx.env.state_dir(),
+                home: ctx.env.home.clone(),
+                filter: std::env::var_os(logging::TAGTEAM_LOG),
+            },
+            &mut std::io::stderr(),
+        );
+    };
+    if let Some(code) = refuse_then_init_logging(
+        cli.json,
+        root_guard::refuse_root,
+        init_logging,
+        &mut std::io::stdout(),
         &mut std::io::stderr(),
-    );
+    ) {
+        return code;
+    }
     // §14.1, at the process boundary like the drain above: in-process tests drive `run` with
     // tokens of their own, and must never change the test runner's signal dispositions. After
     // the drain, so a status bar command stuck on a pipe that never closes still dies on
@@ -158,4 +193,60 @@ where
             prompter: &mut prompter,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    #[test]
+    fn a_refused_root_never_reaches_logging() {
+        // The log's directory and file are created by `init`, so a refusal must come first.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let inited = Cell::new(false);
+        let code = refuse_then_init_logging(
+            false,
+            || Err("no root".into()),
+            || inited.set(true),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, Some(app::EXIT_ERROR));
+        assert!(!inited.get(), "logging was initialised for a refused root");
+        assert_eq!(
+            (out.as_slice(), err.as_slice()),
+            (b"".as_slice(), b"tagteam: no root\n".as_slice())
+        );
+    }
+
+    #[test]
+    fn a_refused_root_under_json_is_one_error_object_on_stdout() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = refuse_then_init_logging(
+            true,
+            || Err("no root".into()),
+            || panic!("logging was initialised for a refused root"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, Some(app::EXIT_ERROR));
+        assert!(err.is_empty());
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "{\"schemaVersion\":1,\"error\":{\"type\":\"root\",\"message\":\"no root\"}}\n"
+        );
+    }
+
+    #[test]
+    fn an_allowed_user_gets_logging_and_no_output() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let inited = Cell::new(false);
+        let code =
+            refuse_then_init_logging(false, || Ok(()), || inited.set(true), &mut out, &mut err);
+        assert_eq!(code, None);
+        assert!(inited.get());
+        assert!(out.is_empty() && err.is_empty());
+    }
 }
