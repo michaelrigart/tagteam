@@ -786,6 +786,30 @@ mod seed_and_merge_back {
     }
 
     #[test]
+    fn a_profile_identity_that_is_a_link_refuses_the_seed_and_leaves_its_target_as_it_was() {
+        // As Claude Code's `.claude.json`: FakeAgent's `identity.json` is the profile's own, and
+        // the write would follow a link to the outer one.
+        let f = fx();
+        login(&f.env, "alice", "ws", "tok-a", "renew-a");
+        let (dir, _) = profile(&f);
+        let outer = FakePaths::resolve(&f.env).identity;
+        let before = fs::read(&outer).unwrap();
+        let file = dir.join("identity.json");
+        std::os::unix::fs::symlink(&outer, &file).unwrap();
+
+        let err = f.fake.seed_profile(&f.env, &dir, &bob(&f)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains(&format!("{} is a link", file.display())),
+            "{err}"
+        );
+        assert_eq!(fs::read(&outer).unwrap(), before, "byte for byte");
+        assert_eq!(fs::read_link(&file).unwrap(), outer);
+        assert!(!f.fake.has_baseline(&dir));
+    }
+
+    #[test]
     fn a_merge_back_applies_the_profile_s_prefs_and_keeps_the_outer_where_both_changed() {
         let f = fx();
         login(&f.env, "alice", "ws", "tok-a", "renew-a");

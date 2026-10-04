@@ -12,7 +12,7 @@ use tagteam_core::merge::{MergeKey, three_way};
 use tagteam_provider::atomic::write_atomic_with;
 use tagteam_provider::process::Captured;
 use tagteam_provider::profile::{
-    has_own_file, read_own_bytes, remove_own_file, write_own_json_with,
+    has_own_file, read_own_bytes, refuse_linked_file, remove_own_file, write_own_json_with,
 };
 use tagteam_provider::splice::{self, SpliceError};
 use tagteam_provider::{
@@ -202,7 +202,10 @@ fn top(doc: &[u8], key: &str) -> Result<Value, SpliceError> {
 /// (`env`), their absence included; set `oauthAccount` from `identity`, `hasCompletedOnboarding:
 /// true`, and `theme` when the profile has none (the default file's, else "dark"). Then write the
 /// baseline, exactly the `projects` and `mcpServers` the profile now holds. The config goes
-/// first, so a seed that stops between the two leaves no baseline over an unseeded file.
+/// first, so a seed that stops between the two leaves no baseline over an unseeded file. The
+/// profile's config is its own (`CC_PRIVATE`), so one that is a link refuses first, before any
+/// lock: written through a link to the default home's, it would put this account's login there.
+/// The default home's own config is written through its link (§9.5); a profile's never is.
 pub(crate) fn seed(
     env: &Env,
     dir: &Path,
@@ -224,6 +227,7 @@ pub(crate) fn seed(
         Read::Unreadable(_) => return Err(unsplicable(&outer, CONFIG_REMEDY)),
     };
     let paths = profile_paths(env, dir);
+    refuse_linked_file(&paths.global_config, "a session's config")?;
     let lock = locks::acquire_config(&paths, budget, &env.cancel)?;
     let fence = || lock.check_owned().map_err(ProviderError::from);
     let config = &paths.global_config;
