@@ -270,3 +270,86 @@ fn yes_without_purge_is_a_usage_error() {
         .assert()
         .code(2);
 }
+
+/// A second entry that cannot be deleted: a directory where its file belongs, so `remove_file`
+/// fails on it. Returns its ID.
+fn an_entry_that_cannot_be_deleted(root: &Path, first: &str) -> String {
+    let id = format!(
+        "{}-{}-zzzzzz",
+        first.split('-').next().unwrap(),
+        fp12(first)
+    );
+    fs::create_dir(displaced_dir(root).join(format!("{id}.json"))).unwrap();
+    id
+}
+
+#[test]
+fn a_purge_that_stops_part_way_names_what_it_deleted_and_what_failed() {
+    let d = tempfile::tempdir().unwrap();
+    let first = forced_over_a_stranger(d.path());
+    let stuck = an_entry_that_cannot_be_deleted(d.path(), &first);
+    let out = cmd(d.path())
+        .args(["displaced", "--purge", &first, &stuck, "--yes"])
+        .assert()
+        .code(1)
+        .get_output()
+        .clone();
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("Deleted {first}.\n")
+    );
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.starts_with("tagteam: "), "{err:?}");
+    assert!(err.contains(&format!("{stuck}.json")), "{err:?}");
+    assert_eq!(err.lines().count(), 1, "{err:?}");
+    assert!(
+        !displaced_dir(d.path())
+            .join(format!("{first}.json"))
+            .exists()
+    );
+}
+
+#[test]
+fn under_json_a_partial_purge_adds_the_deleted_ids_beside_the_error() {
+    let d = tempfile::tempdir().unwrap();
+    let first = forced_over_a_stranger(d.path());
+    let stuck = an_entry_that_cannot_be_deleted(d.path(), &first);
+    let out = cmd(d.path())
+        .args(["displaced", "--purge", &first, &stuck, "--yes", "--json"])
+        .assert()
+        .code(1)
+        .stderr("")
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["schemaVersion"], 1);
+    assert_eq!(v["error"]["type"], "io");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{stuck}.json")),
+        "{v}"
+    );
+    assert_eq!(v["deleted"], json!([first]));
+    assert_eq!(v.as_object().unwrap().len(), 3, "{v}");
+}
+
+#[test]
+fn a_purge_that_fails_on_its_first_entry_carries_no_deleted_key() {
+    // The envelope stays as it was when nothing was deleted.
+    let d = tempfile::tempdir().unwrap();
+    let first = forced_over_a_stranger(d.path());
+    let stuck = an_entry_that_cannot_be_deleted(d.path(), &first);
+    let out = cmd(d.path())
+        .args(["displaced", "--purge", &stuck, "--yes", "--json"])
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert!(v.get("deleted").is_none(), "{v}");
+    assert_eq!(v["error"]["type"], "io");
+}

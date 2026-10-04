@@ -378,6 +378,27 @@ fn a_file_that_cannot_be_deleted_keeps_its_row() {
 }
 
 #[test]
+fn a_purge_that_stops_part_way_reports_what_it_deleted_and_names_the_failed_path() {
+    // §6.3: a purge stops at the first failing entry; the ones before it stay deleted, and the
+    // error says which, and where it failed.
+    let fx = three_entries();
+    let stuck = dir(&fx).join(format!("{MIDDLE}.json"));
+    fs::remove_file(&stuck).unwrap();
+    fs::create_dir(&stuck).unwrap();
+    let err = fx
+        .engine
+        .purge_displaced(&[NEWEST.to_owned(), MIDDLE.to_owned(), OLDEST.to_owned()])
+        .unwrap_err();
+    assert_eq!(err.kind(), "io");
+    assert_eq!(err.deleted, [NEWEST]);
+    assert!(err.to_string().contains(&format!("{MIDDLE}.json")), "{err}");
+    assert!(!dir(&fx).join(format!("{NEWEST}.json")).exists());
+    // The entry after the failure was never reached.
+    let rows = fx.engine.store().unwrap().displaced_rows().unwrap();
+    assert!(rows.iter().any(|r| r.id == OLDEST));
+}
+
+#[test]
 fn a_purge_waits_for_the_displaced_lock() {
     // §6.3: each deletion holds the displaced lock, so a purge never deletes a file whose row
     // a writer is still to insert. Here another process holds the lock for 300 ms.

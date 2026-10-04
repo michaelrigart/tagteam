@@ -2,6 +2,7 @@
 //! before it is overwritten, and `tagteam displaced` lists the entries and purges them.
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -64,17 +65,60 @@ fn lock_displaced(env: &Env) -> Result<FlockGuard, EngineError> {
 /// Deletes `path` itself, never what a symlink there points to, and verifies that it is gone.
 /// An absent path counts as deleted.
 fn remove_verified(path: &Path) -> Result<(), EngineError> {
+    let at = |e: io::Error| {
+        EngineError::Io(io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+    };
     match fs::remove_file(path) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(at(e)),
         _ => {}
     }
     match fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(at(e)),
         Ok(_) => Err(EngineError::Io(io::Error::other(format!(
             "{} is still there after it was deleted",
             path.display()
         )))),
+    }
+}
+
+/// Why `purge_displaced` stopped, and which entries it had already deleted by then (§6.3): a
+/// purge stops at the first failure, and the ones before it stay deleted.
+#[derive(Debug)]
+pub struct PurgeError {
+    pub cause: EngineError,
+    /// The IDs deleted before the failure, in the order given. Empty when nothing was deleted.
+    pub deleted: Vec<String>,
+}
+
+impl fmt::Display for PurgeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+
+impl std::error::Error for PurgeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+impl PurgeError {
+    pub fn kind(&self) -> &'static str {
+        self.cause.kind()
+    }
+
+    pub fn signal(&self) -> Option<i32> {
+        self.cause.signal()
+    }
+}
+
+impl From<EngineError> for PurgeError {
+    fn from(cause: EngineError) -> Self {
+        PurgeError {
+            cause,
+            deleted: Vec::new(),
+        }
     }
 }
 
@@ -289,24 +333,33 @@ impl Engine {
     /// `displaced --purge` (§6.3): deletes the entries `ids` names, once each, after
     /// `known_displaced` has checked every one, so an unknown ID deletes nothing. Each
     /// deletion holds the displaced lock: the file first, verified gone, then the row. Returns
-    /// the IDs, each once, in the order given.
-    pub fn purge_displaced(&self, ids: &[String]) -> Result<Vec<String>, EngineError> {
+    /// the IDs, each once, in the order given. A deletion that fails stops the purge, and the
+    /// error carries the IDs deleted before it.
+    pub fn purge_displaced(&self, ids: &[String]) -> Result<Vec<String>, PurgeError> {
         let ids = self.known_displaced(ids)?;
         let dir = displaced_dir(&self.env);
+        let mut deleted: Vec<String> = Vec::with_capacity(ids.len());
         for id in &ids {
-            {
-                let _lock = lock_displaced(&self.env)?;
-                remove_verified(&dir.join(format!("{id}.json")))?;
-                // The store is opened under the lock. A writer that created the store while
-                // this purge waited has finished its row by then.
-                if let Some(store) = self.existing_store()? {
-                    store.delete_displaced(id)?;
-                }
-            }
+            self.purge_one(&dir, id).map_err(|cause| PurgeError {
+                cause,
+                deleted: deleted.clone(),
+            })?;
             // Once the lock is released (§4.3): the entry's own ID (§14.2).
             tracing::info!(displaced = %id, "deleted a displaced credential");
+            deleted.push(id.clone());
         }
-        Ok(ids)
+        Ok(deleted)
+    }
+
+    fn purge_one(&self, dir: &Path, id: &str) -> Result<(), EngineError> {
+        let _lock = lock_displaced(&self.env)?;
+        remove_verified(&dir.join(format!("{id}.json")))?;
+        // The store is opened under the lock. A writer that created the store while this purge
+        // waited has finished its row by then.
+        if let Some(store) = self.existing_store()? {
+            store.delete_displaced(id)?;
+        }
+        Ok(())
     }
 }
 
