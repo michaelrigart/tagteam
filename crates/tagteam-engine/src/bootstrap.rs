@@ -68,6 +68,20 @@ fn current_spelling(p: &dyn Provider, profile: &Path) -> Result<String, EngineEr
     Ok(p.profile_spelling(&canonical))
 }
 
+/// The refusal for a profile path that is there but is not a real directory, as M4a's
+/// `is_real_dir` decides it: a link, even to a directory, or a file. A profile is resolved from
+/// its canonical spelling, so through a link at its path the marker, the links, the seed and
+/// the session's credential would all land at the link's target (`~/.claude`, say).
+// Only the `test-hooks` seam reaches this until `launch` (Task 10) calls the bootstrap; Task 10
+// removes this attribute.
+#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+fn not_its_own_directory(profile: &Path) -> EngineError {
+    EngineError::InvalidInput(format!(
+        "{} is not a directory of its own (a link, say), so a session's files and credential would be written wherever it leads; replace it with the directory itself, then run again",
+        profile.display()
+    ))
+}
+
 /// §12.3's validation table, but for `invalid`'s deletion: `None` launches.
 // Only the `test-hooks` seam reaches this until `launch` (Task 10) calls the bootstrap; Task 10
 // removes this attribute.
@@ -113,13 +127,17 @@ impl Engine {
     /// §12.2 "Profile marker", for a quiescent launch: a first launch creates the profile
     /// (0700) and its marker, whose `configDir` is the current spelling; a later one updates
     /// `outer` to this launch's home, before the links are synced from it. Only a bootstrap
-    /// changes `configDir` (§12.3 step 6).
+    /// changes `configDir` (§12.3 step 6). A profile path that is there but is not a real
+    /// directory refuses first, before anything is written through it.
     pub(crate) fn mark_profile(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
         profile: &Path,
     ) -> Result<ProfileMarker, EngineError> {
+        if fs::symlink_metadata(profile).is_ok_and(|m| !m.is_dir()) {
+            return Err(not_its_own_directory(profile));
+        }
         let outer = p.outer_home(&self.env);
         let marker = match self.own_marker(row, profile)? {
             Some(m) if m.outer == outer => return Ok(m),
@@ -286,10 +304,7 @@ impl Engine {
         // the profile path it would take the locks, and write the vault's account keys, at the
         // link's target. (The provider refuses a link at the credential file itself.)
         if !fs::symlink_metadata(profile).is_ok_and(|m| m.is_dir()) {
-            return Err(EngineError::InvalidInput(format!(
-                "{} is not a directory of its own (a link, say), so a bootstrap would write the session's credential wherever it leads; replace it with the directory itself, then run again",
-                profile.display()
-            )));
+            return Err(not_its_own_directory(profile));
         }
         // §12.4: before anything touches the profile, so a failure leaves it as it was.
         self.merge_back_waiting(p, row, profile)?;
@@ -360,7 +375,9 @@ impl Engine {
     /// the login a replacement superseded, and one whose identity drifted is another login
     /// altogether. Either is saved to `displaced/` before step 4 overwrites it; a failed save
     /// aborts. The vault's own generation, or an older one of this account, is not saved. The
-    /// identity is read in `profile`, where the profile is now (Decision 22).
+    /// identity is read in `profile`, where the profile is now (Decision 22). Once the
+    /// credential is not the vault's, a seed or identity that cannot be read aborts (§4.3):
+    /// whose login it is could not be told, so it is never overwritten without a copy.
     fn displace_held(
         &self,
         p: &dyn Provider,
@@ -373,16 +390,23 @@ impl Engine {
         if held_fp.as_ref() == Some(v_fp) {
             return Ok(());
         }
-        let stale =
-            matches!(Seed::read(profile), Read::Present(s) if s.login_epoch != row.login_epoch);
-        let identity = p.profile_identity(&self.env, profile);
-        let foreign = matches!(&identity, Read::Present(i) if identity_drifted(i, row));
+        let stale = match Seed::read(profile) {
+            Read::Present(s) => s.login_epoch != row.login_epoch,
+            Read::Absent => false,
+            Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
+        };
+        let identity = match p.profile_identity(&self.env, profile) {
+            Read::Present(i) => Some(i),
+            Read::Absent => None,
+            Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
+        };
+        let foreign = identity.as_ref().is_some_and(|i| identity_drifted(i, row));
         let reason = match (stale, foreign) {
             (_, true) => "foreign-profile-login",
             (true, false) => "replaced-profile-login",
             (false, false) => return Ok(()),
         };
-        let raw = identity.present().map(|i| i.raw);
+        let raw = identity.map(|i| i.raw);
         let id = displace(
             self,
             &row.provider,
@@ -473,5 +497,65 @@ impl Engine {
             None => self.seed_of(p, &row, &profile)?,
         }
         Ok(trigger)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use tagteam_provider::profile::{MARKER_FILE, profile_path};
+
+    use super::*;
+    use crate::testutil::{NOW, T, cred};
+
+    #[test]
+    fn a_bootstrap_of_a_linked_profile_refuses_before_anything_is_written() {
+        // Behind `mark_profile`, which a launch runs first and which refuses the same path: the
+        // bootstrap itself never writes through a link at the profile path (controller ruling).
+        // The target holds the account's own marker, as a profile moved and linked back does,
+        // so nothing but the link stops the bootstrap.
+        let t = T::new();
+        let row = t.account("a@x.co", &cred("rt-a", NOW + 86_400_000));
+        let p = t.engine.provider(&row.provider).unwrap();
+        let profile = profile_path(&t.env, &row.id);
+        let target = t.env.home.join("elsewhere");
+        fs::create_dir_all(&target).unwrap();
+        ProfileMarker {
+            provider: row.provider.clone(),
+            account_id: row.id.clone(),
+            config_dir: current_spelling(p.as_ref(), &target).unwrap(),
+            outer: p.outer_home(&t.env),
+        }
+        .write(&target)
+        .unwrap();
+        fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        symlink(&target, &profile).unwrap();
+        let guard = MutationGuard::acquire(&t.env, MutationGuard::TIMEOUT).unwrap();
+        let lock = t.lock(&row.id);
+
+        let err = t
+            .engine
+            .bootstrap_profile(
+                p.as_ref(),
+                &row,
+                &profile,
+                &t.env.home,
+                Path::new("claude"),
+                &guard,
+                &lock,
+            )
+            .unwrap_err();
+
+        assert_eq!(err.kind(), "invalid-input", "{err}");
+        assert!(
+            err.to_string().contains(&profile.display().to_string()),
+            "{err}"
+        );
+        let held: Vec<_> = fs::read_dir(&target)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(held, [MARKER_FILE], "nothing written at the target");
     }
 }
