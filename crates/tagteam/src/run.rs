@@ -76,6 +76,7 @@ pub(crate) fn run_session(
     let status = wait(&mut child, cancel);
     // What forwarding left is spent, so exit handling meets only a signal sent from now on.
     let _ = cancel.take();
+    pause_point("after-exit");
     let code = match status {
         Ok(status) => exit_code(status),
         Err(e) => {
@@ -174,9 +175,11 @@ fn notify(err: &mut dyn Write, notices: &[String]) {
     }
 }
 
-/// A test-only stop at `name`: `before-spawn` is right after the token's last look. It parks
-/// through the engine's own protocol (`tagteam_engine::pause_at`), and never looks at the token,
-/// so a signal sent meanwhile meets the run exactly where it would have.
+/// A test-only stop at `name`: `before-spawn` is right after the token's last look, and
+/// `after-exit` is between `claude`'s exit and its exit handling, while the reservation is still
+/// this process's. It parks through the engine's own protocol (`tagteam_engine::pause_at`), and
+/// never looks at the token, so a signal sent meanwhile meets the run exactly where it would
+/// have.
 #[cfg(feature = "test-support")]
 fn pause_point(name: &str) {
     tagteam_engine::pause_at(name);
