@@ -10,6 +10,9 @@ repository.workspace = true
 [features]
 # Crash points for the kill tests (§15.2). Never enabled in release builds.
 test-hooks = []
+# §15.2's provenance sequence against a throwaway real keychain (macOS); gates
+# tests/run_real_keychain.rs only.
+real_keychain = []
 
 [dependencies]
 tagteam-core.workspace = true
