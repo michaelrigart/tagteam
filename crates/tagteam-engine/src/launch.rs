@@ -77,10 +77,10 @@ impl Engine {
     /// about to expire is refreshed through the gate (§12.3 step 1); a target that was removed
     /// by then is `TargetChanged`. Then, under `MutationGuard` (30 s) and the account lock:
     /// - the decision is made again (B.47): a target that was removed, or became the live
-    ///   login, is `TargetChanged`, for the CLI to plan again; one with no stored credential
-    ///   is refused, and a quarantined one follows §7.2;
+    ///   login, is `TargetChanged`, for the CLI to plan again;
     /// - a profile path that is not a real directory refuses before anything touches it;
-    /// - dead reservations go, and a quiescent profile's pending merge-back runs, from the
+    /// - dead reservations go. For a quiescent profile, a target with no stored credential is
+    ///   refused and a quarantined one follows §7.2; then its pending merge-back runs, from the
     ///   baseline in its actual directory (Decision 22; a failure aborts);
     /// - the marker and the links are brought up to date;
     /// - a quiescent profile gets its provenance, then a bootstrap or the seed, and a running
@@ -114,7 +114,6 @@ impl Engine {
         let lock = self.lock_account(&account.id)?;
         // 1.
         let row = self.relocked_target(p, account)?;
-        self.locked_login(p, &row, &mut warnings)?;
         hooks::point(self, "launch-locked")?;
         let profile = profile_path(&self.env, &row.id);
         // Through a link at the profile path, everything below would land at its target: the
@@ -146,6 +145,8 @@ impl Engine {
         // nor marked, and a join makes no link in it.
         let marker = self.own_marker(&row, &profile)?;
         if !joining {
+            // Before anything is written: the stored login this launch starts the profile from.
+            warnings.extend(self.locked_login(p, &row)?);
             // §12.4: a killed session's baseline is in the profile's actual directory, which
             // the marker's spelling no longer names once the data directory has moved
             // (Decision 22).
@@ -205,27 +206,29 @@ impl Engine {
     /// profile from a fresh generation. The outcomes map as §12.3 step 1 says, and otherwise
     /// as §7.2's direct-target column. Returns the warnings to show. A vault read that fails
     /// because the account was removed since `plan_run` is `TargetChanged` (B.47).
+    ///
+    /// Nothing else here refuses: whether the launch joins a running session is known only
+    /// under the locks. A quarantined account is never refreshed (§7.4), and one whose stored
+    /// credential cannot be read has nothing to refresh. `locked_login` judges both for a
+    /// quiescent launch, and a join, which uses no stored credential, goes on (§12.5 step 3).
     fn freshen_for_launch(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
     ) -> Result<Vec<String>, EngineError> {
-        if !p.kind_traits(&row.kind).refreshable {
+        if !p.kind_traits(&row.kind).refreshable || row.quarantine_reason.is_some() {
             return Ok(Vec::new());
         }
-        let vault = self
-            .vault_generation(row)
-            .map_err(|failure| self.removed_or(row, failure))?;
-        let due = self.due(p, &vault);
-        if row.quarantine_reason.is_some() {
-            // §7.4: never refreshed; usable only while its access token lasts.
-            return if due {
-                Err(needs_relogin(row))
-            } else {
-                Ok(vec![works_until_expiry(row)])
-            };
-        }
-        if !due {
+        let vault = match self.vault_generation(row) {
+            Ok(vault) => vault,
+            Err(failure) => {
+                return match self.removed_or(row, failure) {
+                    removed @ EngineError::TargetChanged { .. } => Err(removed),
+                    _ => Ok(Vec::new()),
+                };
+            }
+        };
+        if !self.due(p, &vault) {
             return Ok(Vec::new());
         }
         let app = p.display_name();
@@ -316,31 +319,28 @@ impl Engine {
         Ok(row)
     }
 
-    /// §12.5 launch step 1 for the login itself, on the row read under the locks: `plan_run`
-    /// reads neither the vault nor the quarantine, and the freshen before the locks may be out
-    /// of date (a refresh that finished meanwhile may have quarantined the account, as §9.4 step
-    /// 1 says for a switch). An account with no stored credential, or one that cannot be read,
-    /// is refused. A quarantined one is never refreshed (§7.4): once its access token is due it
-    /// is refused as `Dead` is, and otherwise it launches with the warning that it needs a new
-    /// login, unless the freshen gave that warning already (§7.2).
+    /// The stored login a quiescent launch bootstraps or seeds from, judged under the locks on
+    /// the row read there: `plan_run` reads neither the vault nor the quarantine, and a refresh
+    /// that finished meanwhile may have quarantined the account (as §9.4 step 1 says for a
+    /// switch). An account with no stored credential, or one that cannot be read, is refused. A
+    /// quarantined one is never refreshed (§7.4): once its access token is due it is refused as
+    /// `Dead` is, and otherwise this returns the warning that it needs a new login (§7.2).
+    ///
+    /// Only for a quiescent launch (controller ruling): a join seeds nothing and touches no
+    /// credential, since the running session's agent owns the token (§12.5 step 3).
     fn locked_login(
         &self,
         p: &dyn Provider,
         row: &AccountRow,
-        warnings: &mut Vec<String>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Option<String>, EngineError> {
         let vault = self.vault_generation(row)?;
         if row.quarantine_reason.is_none() || !p.kind_traits(&row.kind).refreshable {
-            return Ok(());
+            return Ok(None);
         }
         if self.due(p, &vault) {
             return Err(needs_relogin(row));
         }
-        let warning = works_until_expiry(row);
-        if !warnings.contains(&warning) {
-            warnings.push(warning);
-        }
-        Ok(())
+        Ok(Some(works_until_expiry(row)))
     }
 
     /// §12.5 step 3 for a quiescent profile, after its sync. Pending rescues go first (§6.2),
