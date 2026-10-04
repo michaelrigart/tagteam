@@ -2146,3 +2146,10 @@ impl Fx {
             .unwrap();
     }
 }
+
+/// The launch command a `Session` plan resolved (§12.1), as `launch`, a bootstrap's check and
+/// the per-launch check are given it (Decision 20). The scripted spawner records it and never
+/// runs it.
+pub fn claude_bin() -> &'static Path {
+    Path::new("/opt/claude/bin/claude")
+}

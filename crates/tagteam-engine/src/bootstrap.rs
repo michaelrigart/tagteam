@@ -54,9 +54,6 @@ impl Trigger {
 
 /// §12.2 "One spelling": the profile's canonical path as the provider exports it. A path that
 /// is not UTF-8 is refused: its lossy text would name another directory and Keychain item.
-// Only the `test-hooks` seam reaches this until `launch` (Task 10) calls the bootstrap; Task 10
-// removes this attribute.
-#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
 fn current_spelling(p: &dyn Provider, profile: &Path) -> Result<String, EngineError> {
     let canonical = canonical_profile_path(profile)?;
     if canonical.to_str().is_none() {
@@ -72,9 +69,6 @@ fn current_spelling(p: &dyn Provider, profile: &Path) -> Result<String, EngineEr
 /// `is_real_dir` decides it: a link, even to a directory, or a file. A profile is resolved from
 /// its canonical spelling, so through a link at its path the marker, the links, the seed and
 /// the session's credential would all land at the link's target (`~/.claude`, say).
-// Only the `test-hooks` seam reaches this until `launch` (Task 10) calls the bootstrap; Task 10
-// removes this attribute.
-#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
 fn not_its_own_directory(profile: &Path) -> EngineError {
     EngineError::InvalidInput(format!(
         "{} is not a directory of its own (a link, say), so a session's files and credential would be written wherever it leads; replace it with the directory itself, then run again",
@@ -83,9 +77,6 @@ fn not_its_own_directory(profile: &Path) -> EngineError {
 }
 
 /// §12.3's validation table, but for `invalid`'s deletion: `None` launches.
-// Only the `test-hooks` seam reaches this until `launch` (Task 10) calls the bootstrap; Task 10
-// removes this attribute.
-#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
 pub(crate) fn refusal(row: &AccountRow, validity: Validity) -> Option<EngineError> {
     let position = row.position;
     match validity {
@@ -102,9 +93,6 @@ pub(crate) fn refusal(row: &AccountRow, validity: Validity) -> Option<EngineErro
     }
 }
 
-// Only the `test-hooks` seam reaches these until `launch` (Task 10) calls the bootstrap; Task 10
-// removes this attribute.
-#[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
 impl Engine {
     /// The profile's marker, when it names `row`. A marker naming another account or provider
     /// refuses: its spelling names someone else's Keychain item, which is never touched here.

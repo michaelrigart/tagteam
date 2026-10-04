@@ -185,6 +185,12 @@ pub enum EngineError {
     /// §12.3: the launch command could not be spawned.
     #[error("the launch command could not be started: {detail}")]
     LaunchUnreachable { detail: String },
+    /// §12.5 launch step 1, B.47: under the launch's locks the target is no longer one a session
+    /// may start for. It was removed (Decision 7), or it became the live default login. The
+    /// CLI prints `why` and plans again, which runs plain `claude` or refuses under
+    /// `--require-session`.
+    #[error("{why}")]
+    TargetChanged { why: String },
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -285,6 +291,7 @@ impl EngineError {
             EngineError::LoginDrifted { .. } => "login-drifted",
             EngineError::LoginUnknown { .. } => "login-unknown",
             EngineError::LaunchUnreachable { .. } => "launch-unreachable",
+            EngineError::TargetChanged { .. } => "target-changed",
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -534,6 +541,10 @@ mod tests {
             (
                 EngineError::LaunchUnreachable { detail: "d".into() },
                 "launch-unreachable",
+            ),
+            (
+                EngineError::TargetChanged { why: "w".into() },
+                "target-changed",
             ),
             (EngineError::Io(io::Error::other("x")), "io"),
             (

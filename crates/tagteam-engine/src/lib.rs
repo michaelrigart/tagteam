@@ -9,6 +9,7 @@ mod displace;
 pub mod engine;
 pub mod error;
 mod hooks;
+pub mod launch;
 pub mod lazy_http;
 pub mod lifecycle;
 pub mod net;

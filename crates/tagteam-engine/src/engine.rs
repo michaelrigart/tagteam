@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::liveness::ProcessProbe;
@@ -47,9 +48,6 @@ pub struct Engine {
     pub(crate) settings: Settings,
     /// Judges session records (§12.6): `SystemProcessProbe` in production.
     pub(crate) process: Arc<dyn ProcessProbe>,
-    // Read only by the bootstrap's validation, which only the `test-hooks` seam reaches until
-    // `launch` (Task 10) calls it; Task 10 removes this attribute.
-    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     pub(crate) spawner: Arc<dyn ProcessSpawner>,
     /// Where this process stands (§12.8).
     pub(crate) run_shell: RunShell,
@@ -221,7 +219,27 @@ impl Engine {
         provider: &ProviderId,
         source: &'static str,
     ) -> Result<MutationGuard, EngineError> {
-        let (guard, blocked) = self.guard_recovering(true, source)?;
+        self.guard_or_refuse_for(provider, source, MutationGuard::TIMEOUT)
+    }
+
+    /// `guard_or_refuse`, waiting up to `timeout` for the lock. `run`'s launch waits 30 s
+    /// (§9.1), because another launch may hold it through a bootstrap's validation.
+    pub(crate) fn guard_or_refuse_within(
+        &self,
+        provider: &ProviderId,
+        timeout: Duration,
+    ) -> Result<MutationGuard, EngineError> {
+        self.guard_or_refuse_for(provider, "cli", timeout)
+    }
+
+    /// `guard_or_refuse_as`, waiting up to `timeout` for the lock.
+    fn guard_or_refuse_for(
+        &self,
+        provider: &ProviderId,
+        source: &'static str,
+        timeout: Duration,
+    ) -> Result<MutationGuard, EngineError> {
+        let (guard, blocked) = self.guard_recovering(true, source, timeout)?;
         if self.interrupted(provider)? {
             return Err(blocked
                 .into_iter()
@@ -261,14 +279,18 @@ impl Engine {
     /// tagteam's mutation lock. Before returning it, recovers every interrupted switch whose
     /// holder has died (§9.6). The oracle is asked before the lock is taken (§7.6).
     pub fn mutation_guard(&self) -> Result<MutationGuard, EngineError> {
-        Ok(self.guard_recovering(true, "cli")?.0)
+        Ok(self
+            .guard_recovering(true, "cli", MutationGuard::TIMEOUT)?
+            .0)
     }
 
     /// The mutation lock for commands that change only store metadata (`alias`, `disable`,
     /// `enable`, `move`): recovery still runs, but from fingerprints alone, so these commands
     /// never make a network call (§7.6).
     pub(crate) fn metadata_guard(&self) -> Result<MutationGuard, EngineError> {
-        Ok(self.guard_recovering(false, "cli")?.0)
+        Ok(self
+            .guard_recovering(false, "cli", MutationGuard::TIMEOUT)?
+            .0)
     }
 
     /// `mutation_guard`, with the refusal for each row whose recovery could not take its
@@ -276,11 +298,12 @@ impl Engine {
     /// `RecoveryMoved`), by provider. With `ask_oracle` false the
     /// rows are recovered from fingerprints alone: no network call (§7.6, §9.6). A recovery
     /// interrupted at one of its lock waits ends the command with that interruption (§14.1).
-    /// Each recovered switch is recorded with `source`.
+    /// Each recovered switch is recorded with `source`. The lock is waited for up to `timeout`.
     fn guard_recovering(
         &self,
         ask_oracle: bool,
         source: &'static str,
+        timeout: Duration,
     ) -> Result<(MutationGuard, Vec<(ProviderId, EngineError)>), EngineError> {
         let hints: Vec<_> = self
             .dead_journals()?
@@ -295,7 +318,7 @@ impl Engine {
             })
             .collect::<Result<_, EngineError>>()?;
         hooks::point(self, "before-mutation-lock")?;
-        let guard = MutationGuard::acquire(&self.env, MutationGuard::TIMEOUT)?;
+        let guard = MutationGuard::acquire(&self.env, timeout)?;
         // Enumerated again under the lock: a switch may have died while this command waited,
         // and its row is recovered now too, without a hint.
         let mut blocked = Vec::new();
