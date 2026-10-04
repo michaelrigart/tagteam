@@ -35,6 +35,9 @@ const COMMANDS: &[&[&str]] = &[
     &["map", "1", "/"],
     &["unmap", "/"],
     &["shell-init", "zsh"],
+    // No `--` form: the loop appends `--json`, which after `--` would be the agent's.
+    &["run"],
+    &["run", "1"],
 ];
 
 /// `id`'s profile directory under the fixture's `sessions/`.
