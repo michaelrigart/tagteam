@@ -534,6 +534,28 @@ fn remove_with_an_unreadable_marker_deletes_the_current_item_and_warns() {
     }
 }
 
+/// A `tracing` event with a callsite of its own, so whichever thread calls this first is the
+/// first to reach it.
+fn note_from_any_thread() {
+    tracing::warn!("a note from any thread");
+}
+
+#[test]
+fn the_log_capture_keeps_an_event_whose_callsite_another_thread_reached_first() {
+    // The flake behind the marker test below: a thread of another test, with no capture of its
+    // own, reached `remove`'s warning first while this capture was the only one in the process.
+    // tracing then cached that callsite as never wanted, and this capture lost the event.
+    let ((), logs) = capture_logs(|| {
+        std::thread::spawn(note_from_any_thread).join().unwrap();
+        note_from_any_thread();
+    });
+    let notes = logs
+        .iter()
+        .filter(|l| l.contains("a note from any thread"))
+        .count();
+    assert_eq!(notes, 1, "this thread's event only: {logs:?}");
+}
+
 #[test]
 fn remove_never_trusts_a_marker_that_names_another_account() {
     // A marker copied from a's profile into b's names a's spelling. Removing b must delete b's
