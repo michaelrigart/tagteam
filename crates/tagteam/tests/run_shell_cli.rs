@@ -38,6 +38,11 @@ const COMMANDS: &[&[&str]] = &[
     // No `--` form: the loop appends `--json`, which after `--` would be the agent's.
     &["run"],
     &["run", "1"],
+    &["config", "list"],
+    &["config", "get", "ui.color"],
+    &["config", "set", "ui.color", "always"],
+    &["config", "unset", "ui.color"],
+    &["config", "path"],
     &["displaced"],
     &[
         "displaced",
