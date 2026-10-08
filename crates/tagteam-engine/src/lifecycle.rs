@@ -437,7 +437,7 @@ impl Engine {
                     let _ = self.reconcile_replacement(lock_for(&row.id));
                     return Err(e.into());
                 }
-                store.finish_replacement(&row.id)?;
+                store.finish_replacement(&row.id, self.now_ms())?;
             }
             None => {
                 // At a free position first; it moves once any occupant is gone.

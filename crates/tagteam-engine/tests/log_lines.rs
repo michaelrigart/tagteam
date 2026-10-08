@@ -511,3 +511,22 @@ fn a_purge_logs_each_entry_it_deleted_by_its_id() {
     assert_eq!(field(line, "displaced"), Some(id.as_str()), "{line}");
     assert!(logs.iter().all(|l| !l.contains("stranger")), "{logs:#?}");
 }
+
+#[test]
+fn a_cleared_quarantine_is_logged_as_one_unquarantine_event() {
+    // §7.4, §14.2: the switch's outgoing capture clears it, and its event is logged once.
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    fx.quarantine(&b, "invalid_grant", &vault_fp(&fx, &b));
+    fx.rotate_live("rt-b2");
+    let (_, logs) = capture_logs(|| fx.switch_to(&a, false).unwrap());
+    let cleared: Vec<&str> = at(&logs, "INFO", "event recorded")
+        .into_iter()
+        .filter(|l| field(l, "kind") == Some("\"unquarantine\""))
+        .collect();
+    assert_eq!(cleared.len(), 1, "{logs:#?}");
+    assert_eq!(field(cleared[0], "to_account"), Some(b.as_str()));
+    no_email(&logs);
+}

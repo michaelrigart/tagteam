@@ -256,15 +256,22 @@ const ACCOUNT_COLUMNS: &str = "id, provider, position, identity_key, label, emai
     account_uuid, kind, alias, disabled, identity_json, login_expires_at, login_epoch, replacing_fp, \
     quarantine_reason, quarantine_fp, quarantine_at, added_at";
 
-/// Installs a login's identity fields and clears any quarantine: shared by `update_login` and
-/// the replacement `finish_replacement` records, which land the same fields. Clearing here is
-/// §7.4's rule, not an exception to it. Every caller installs a login that replaces the vault's:
-/// `add`, `add-token` and `import` clear a quarantine explicitly, and the switch's outgoing
-/// capture only ever writes a generation whose fingerprint differs from the vault's (it is not
-/// `Ours`, §9.4 step 4).
+/// Installs a login's identity fields: shared by `update_login` and the replacement
+/// `finish_replacement` records, which land the same fields. It never clears a quarantine:
+/// every clear records its `unquarantine` event (§7.4), so it goes through
+/// `clear_quarantine_on`, which `finish_replacement` calls in its own transaction and every other
+/// caller through `clear_quarantine`.
 const APPLY_LOGIN_SQL: &str = "UPDATE accounts SET identity_key = ?2, label = ?3, email = ?4, org_uuid = ?5, \
     org_name = ?6, account_uuid = COALESCE(?7, account_uuid), kind = ?8, identity_json = ?9, \
-    login_expires_at = ?10, quarantine_reason = NULL, quarantine_fp = NULL, quarantine_at = NULL WHERE id = ?1";
+    login_expires_at = ?10 WHERE id = ?1";
+
+/// §7.4, §11.4: the reason an `unquarantine` event records when the account's `login_epoch`
+/// moved, that is, an explicit replacement cleared it (§12.5).
+pub const ACCOUNT_REPLACED: &str = "account-replaced";
+
+/// §7.4, §11.4: the reason an `unquarantine` event records for every other clear: a vault write
+/// that changed the fingerprint, or a quarantine that no longer binds.
+pub const CREDENTIALS_REPLACED: &str = "credentials-replaced";
 
 /// Upserts the provider's active account and its activation epoch, both columns on conflict:
 /// an epoch left from the previous account would stale-mark the next one (§12.5). Shared by
@@ -435,6 +442,43 @@ fn apply_login(
             login_expires_at,
         ],
     )
+}
+
+/// §7.4: clears `id`'s quarantine and inserts its one `unquarantine` event, on any
+/// connection-like handle, so a caller's transaction holds both or neither. The event names the
+/// account as `to_id` and carries `{"reason": reason}`. `None`, and no event, when the account
+/// had no quarantine (or does not exist).
+fn clear_quarantine_on(
+    c: &Connection,
+    id: &AccountId,
+    reason: &str,
+    source: &str,
+    at: i64,
+) -> rusqlite::Result<Option<EventRow>> {
+    let provider: Option<String> = c
+        .query_row(
+            "UPDATE accounts SET quarantine_reason = NULL, quarantine_fp = NULL, \
+             quarantine_at = NULL WHERE id = ?1 AND quarantine_reason IS NOT NULL \
+             RETURNING provider",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(provider) = provider else {
+        return Ok(None);
+    };
+    let event = EventRow {
+        at,
+        provider: ProviderId::new(provider),
+        kind: "unquarantine".into(),
+        from_id: None,
+        to_id: Some(id.clone()),
+        trigger: None,
+        source: source.to_owned(),
+        detail: Some(json!({"reason": reason})),
+    };
+    Store::insert_event_on(c, &event)?;
+    Ok(Some(event))
 }
 
 /// `SET_ACTIVE_SQL` on any connection-like handle. No account means no epoch, whatever the
@@ -741,6 +785,8 @@ impl Store {
         Ok(self.lock().execute(sql, p)?)
     }
 
+    /// Installs a login's identity fields and expiry. It never clears a quarantine: a caller
+    /// whose write cleared one says so through `clear_quarantine`, which records it (§7.4).
     pub fn update_login(
         &self,
         id: &AccountId,
@@ -831,9 +877,12 @@ impl Store {
     }
 
     /// The replacement landed: installs its recorded metadata, clears any quarantine and the
-    /// marker, all in one transaction. A missing `identity_key`, `label` or `kind` in the
-    /// recorded metadata means the account and its marker are left exactly as they were
-    /// (§12.5) rather than installing an empty identity.
+    /// marker, all in one transaction. A quarantine it clears records its `unquarantine` event
+    /// in that transaction, at `at`, as `account-replaced` from `cli`: the epoch moved, and an
+    /// explicit replacement is a command's (§7.4, §11.4), whichever lock holder finishes it. A
+    /// missing `identity_key`, `label` or `kind` in the recorded metadata means the account and
+    /// its marker are left exactly as they were (§12.5) rather than installing an empty
+    /// identity.
     ///
     /// A login taken from the live store (`from_live`, `add`'s) also records the account's new
     /// `login_epoch` as the activation epoch here (§10.1, §12.5): the live store holds exactly
@@ -841,7 +890,7 @@ impl Store {
     /// `begin_replacement` made it so, and a switch that committed another account after a
     /// replacer died is the newer record. Metadata without `from_live` is not from the live
     /// store.
-    pub fn finish_replacement(&self, id: &AccountId) -> Result<(), StoreError> {
+    pub fn finish_replacement(&self, id: &AccountId, at: i64) -> Result<(), StoreError> {
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<Option<String>> = tx
@@ -855,6 +904,7 @@ impl Store {
             None => return Err(StoreError::NoSuchAccount),
             Some(meta) => meta,
         };
+        let mut cleared = None;
         if let Some(m) = meta {
             let v: Value =
                 serde_json::from_str(&m).map_err(|e| StoreError::Corrupt(e.to_string()))?;
@@ -876,6 +926,7 @@ impl Store {
             };
             let login_expires_at = v["login_expires_at"].as_i64();
             apply_login(&tx, id, identity_key, &identity, kind, login_expires_at)?;
+            cleared = clear_quarantine_on(&tx, id, ACCOUNT_REPLACED, "cli", at)?;
             if v["from_live"].as_bool().unwrap_or(false) {
                 tx.execute(
                     "UPDATE active_accounts SET login_epoch = \
@@ -889,6 +940,10 @@ impl Store {
             [id.as_str()],
         )?;
         tx.commit()?;
+        drop(c);
+        if let Some(e) = &cleared {
+            log_event(e);
+        }
         Ok(())
     }
 
@@ -929,14 +984,26 @@ impl Store {
         }
     }
 
-    /// Clears the quarantine; `true` when there was one.
-    pub fn clear_quarantine(&self, id: &AccountId) -> Result<bool, StoreError> {
-        let n = self.exec(
-            "UPDATE accounts SET quarantine_reason = NULL, quarantine_fp = NULL, quarantine_at = NULL \
-             WHERE id = ?1 AND quarantine_reason IS NOT NULL",
-            &[&id.as_str()],
-        )?;
-        Ok(n > 0)
+    /// §7.4: clears the quarantine and records one `unquarantine` event, with `reason`
+    /// (`ACCOUNT_REPLACED` when the account's `login_epoch` moved, else
+    /// `CREDENTIALS_REPLACED`), `source` and `at` (epoch ms), in one transaction. `true` when
+    /// there was one; with none there is no event either.
+    pub fn clear_quarantine(
+        &self,
+        id: &AccountId,
+        reason: &str,
+        source: &str,
+        at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut c = self.lock();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cleared = clear_quarantine_on(&tx, id, reason, source, at)?;
+        tx.commit()?;
+        drop(c);
+        if let Some(e) = &cleared {
+            log_event(e);
+        }
+        Ok(cleared.is_some())
     }
 
     /// The login's own expiry (CC: `refreshTokenExpiresAt`), after a new generation lands.

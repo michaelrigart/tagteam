@@ -25,7 +25,7 @@ use crate::oracle::verdict;
 use crate::provenance::ProfileCheck;
 use crate::refresh::{GateOutcome, OwnedBy};
 use crate::rescue::RescueFile;
-use crate::store::{AccountRow, AutoRecord, EventRow, JournalRow, Store};
+use crate::store::{AccountRow, AutoRecord, CREDENTIALS_REPLACED, EventRow, JournalRow, Store};
 
 /// §9.3's strategies that rank by usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1993,6 +1993,7 @@ impl Engine {
                     plan.hint.as_ref(),
                     account_locks,
                     live_identity.as_ref(),
+                    req.source,
                     &mut warnings,
                 )?;
                 // Step 4 settled the outgoing generation: kept, captured or displaced.
@@ -2133,7 +2134,9 @@ impl Engine {
         })
     }
 
-    /// Step 4: classify the outgoing credential and act on it.
+    /// Step 4: classify the outgoing credential and act on it. A capture's write changes the
+    /// vault's fingerprint (it is never `Ours`), so it clears a quarantine (§7.4) and records
+    /// the clear with the switch's `source`.
     #[allow(clippy::too_many_arguments)]
     fn settle_outgoing(
         &self,
@@ -2144,6 +2147,7 @@ impl Engine {
         hint: Option<&OracleHint>,
         account_locks: &[AccountLock],
         live_identity: Option<&Identity>,
+        source: &str,
         warnings: &mut Vec<String>,
     ) -> Result<(), EngineError> {
         let Some(bytes) = Axis::of(p, &out.kind).live_secret(live) else {
@@ -2199,6 +2203,7 @@ impl Engine {
                     &out.kind,
                     p.login_expires_at(&bytes),
                 )?;
+                self.unquarantine(out, CREDENTIALS_REPLACED, source)?;
                 if backfill_uuid {
                     if let Some(uuid) = resolved.and_then(|i| i.account_uuid.as_deref()) {
                         store.backfill_account_uuid(&out.id, uuid)?;

@@ -1086,7 +1086,9 @@ fn quarantines_other_processes_set_or_clear_are_reported_against_the_previous_ti
         .unwrap();
     engine.tick(&sink).unwrap();
     assert!(matches!(sink.take()[0], AutoEvent::Poll { .. }));
-    store.clear_quarantine(&a).unwrap();
+    store
+        .clear_quarantine(&a, "credentials-replaced", "cli", 1)
+        .unwrap();
     engine.tick(&sink).unwrap();
     assert_eq!(sink.take()[0], unquarantined("credentials-replaced"));
     fx.quarantine(&a, "invalid_grant", &bound);

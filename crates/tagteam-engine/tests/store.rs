@@ -121,7 +121,7 @@ fn replacement_markers_move_the_epoch() {
         (1, Some("sha256:x"), "oauth")
     );
     // Finishing installs the recorded metadata, kind included.
-    s.finish_replacement(&a).unwrap();
+    s.finish_replacement(&a, 0).unwrap();
     let r = s.account(&a).unwrap().unwrap();
     assert_eq!(
         (r.login_epoch, r.replacing_fp, r.kind.as_str()),
@@ -345,7 +345,7 @@ fn finish_replacement_refuses_metadata_missing_required_fields() {
     }
     let s = Store::open(&path).unwrap();
     assert!(matches!(
-        s.finish_replacement(&a),
+        s.finish_replacement(&a, 0),
         Err(StoreError::Corrupt(_))
     ));
     // Untouched: the original login and the pending marker are both still there.
@@ -413,7 +413,7 @@ fn a_missing_account_is_reported_by_both_replacement_entry_points() {
         Err(StoreError::NoSuchAccount)
     ));
     assert!(matches!(
-        s.finish_replacement(&missing),
+        s.finish_replacement(&missing, 0),
         Err(StoreError::NoSuchAccount)
     ));
 }
@@ -498,13 +498,45 @@ fn quarantines_are_set_bound_to_a_fingerprint_and_cleared() {
         ),
         (Some("invalid_grant"), Some("sha256:sent"), Some(42))
     );
-    assert!(s.clear_quarantine(&a).unwrap(), "one was set");
-    assert!(!s.clear_quarantine(&a).unwrap(), "nothing left to clear");
+    assert!(
+        s.clear_quarantine(&a, "credentials-replaced", "auto", 77)
+            .unwrap(),
+        "one was set"
+    );
+    assert!(
+        !s.clear_quarantine(&a, "credentials-replaced", "auto", 78)
+            .unwrap(),
+        "nothing left to clear"
+    );
     let row = s.account(&a).unwrap().unwrap();
     assert_eq!(
         (row.quarantine_reason, row.quarantine_fp, row.quarantine_at),
         (None, None, None)
     );
+    // §7.4: the clear, and only the clear, recorded one event.
+    assert_eq!(
+        s.events().unwrap(),
+        vec![EventRow {
+            at: 77,
+            provider: cc(),
+            kind: "unquarantine".into(),
+            from_id: None,
+            to_id: Some(a.clone()),
+            trigger: None,
+            source: "auto".into(),
+            detail: Some(json!({"reason": "credentials-replaced"})),
+        }]
+    );
+    assert!(
+        !s.clear_quarantine(
+            &AccountId::from_string("nobody"),
+            "credentials-replaced",
+            "cli",
+            79
+        )
+        .unwrap()
+    );
+    assert_eq!(s.events().unwrap().len(), 1, "no account, no event");
     assert!(matches!(
         s.set_quarantine(
             &AccountId::from_string("nobody"),
@@ -957,7 +989,7 @@ fn a_row_that_already_names_the_account_with_an_epoch_is_kept() {
     let incoming = identity("a@x.co");
     s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, false), false)
         .unwrap();
-    s.finish_replacement(&a).unwrap();
+    s.finish_replacement(&a, 0).unwrap();
 
     s.begin_replacement(&a, "sha256:y", &login_meta(&incoming, false), true)
         .unwrap();
@@ -1009,7 +1041,7 @@ fn finishing_a_replacement_taken_from_the_live_login_records_its_epoch() {
         s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, from_live), true)
             .unwrap();
 
-        s.finish_replacement(&a).unwrap();
+        s.finish_replacement(&a, 0).unwrap();
 
         let want = if from_live { 1 } else { 0 };
         assert_eq!(
@@ -1042,7 +1074,7 @@ fn a_finish_never_overwrites_a_switch_committed_since_the_replacer_died() {
     s.commit_switch(&cc(), &b, 0, &switch_event_to(&b), None)
         .unwrap();
 
-    s.finish_replacement(&a).unwrap();
+    s.finish_replacement(&a, 0).unwrap();
 
     assert_eq!(
         s.activation(&cc()).unwrap(),
@@ -1072,7 +1104,7 @@ fn replacement_metadata_without_from_live_is_not_from_the_live_login() {
         )
         .unwrap();
 
-    s.finish_replacement(&a).unwrap();
+    s.finish_replacement(&a, 0).unwrap();
 
     assert_eq!(
         s.activation(&cc()).unwrap(),
@@ -1114,4 +1146,75 @@ fn displaced_rows_are_newest_first_and_a_delete_says_whether_a_row_went() {
     assert!(s.delete_displaced("2-000000000000-bbbbbb").unwrap());
     assert!(!s.delete_displaced("2-000000000000-bbbbbb").unwrap());
     assert_eq!(s.displaced_rows().unwrap().len(), 2);
+}
+
+#[test]
+fn finishing_a_replacement_records_the_quarantine_it_clears() {
+    // §7.4, §11.4: a landed replacement moved the epoch, so its clear is `account-replaced`, in
+    // the transaction that installs the login.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let replacement = identity("a@x.co");
+    let meta = LoginMeta {
+        identity_key: "a@x.co\n",
+        identity: &replacement,
+        kind: "oauth",
+        login_expires_at: None,
+        from_live: false,
+    };
+    s.set_quarantine(&a, "invalid_grant", "sha256:sent", 1)
+        .unwrap();
+    s.begin_replacement(&a, "sha256:new", &meta, false).unwrap();
+    s.finish_replacement(&a, 500).unwrap();
+    let row = s.account(&a).unwrap().unwrap();
+    assert_eq!((row.quarantine_reason, row.replacing_fp), (None, None));
+    let events = s.events().unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        (
+            events[0].kind.as_str(),
+            events[0].to_id.as_ref(),
+            events[0].source.as_str(),
+            events[0].at,
+            events[0].detail.clone()
+        ),
+        (
+            "unquarantine",
+            Some(&a),
+            "cli",
+            500,
+            Some(json!({"reason": "account-replaced"}))
+        )
+    );
+    // An account that was not quarantined gets no event.
+    let meta = LoginMeta {
+        identity_key: "b@x.co\n",
+        identity: &identity("b@x.co"),
+        ..meta
+    };
+    s.begin_replacement(&b, "sha256:other", &meta, false)
+        .unwrap();
+    s.finish_replacement(&b, 600).unwrap();
+    assert_eq!(s.events().unwrap().len(), 1);
+}
+
+#[test]
+fn installing_a_login_never_clears_a_quarantine_behind_its_event() {
+    // §7.4: `update_login` writes identity fields only; its caller clears a quarantine through
+    // `clear_quarantine`, which records it.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    s.set_quarantine(&a, "invalid_grant", "sha256:sent", 1)
+        .unwrap();
+    s.update_login(&a, "a@x.co\n", &identity("a@x.co"), "oauth", Some(9))
+        .unwrap();
+    let row = s.account(&a).unwrap().unwrap();
+    assert_eq!(
+        (row.quarantine_reason.as_deref(), row.login_expires_at),
+        (Some("invalid_grant"), Some(9))
+    );
+    assert!(s.events().unwrap().is_empty());
 }

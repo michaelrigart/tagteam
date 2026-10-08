@@ -387,7 +387,7 @@ impl Engine {
         let provider = self.provider(&row.provider)?;
         match self.vault.read(lock.id()) {
             Read::Present(b) if provider.fingerprint(&b).is_some_and(|f| f.as_str() == fp) => {
-                store.finish_replacement(lock.id())?
+                store.finish_replacement(lock.id(), self.now_ms())?
             }
             Read::Present(_) | Read::Absent => store.rollback_replacement(lock.id())?,
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),

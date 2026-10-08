@@ -8,7 +8,7 @@ use crate::account_lock::AccountLock;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::refresh::fp_str;
-use crate::store::{AccountRow, EventRow};
+use crate::store::{ACCOUNT_REPLACED, AccountRow, CREDENTIALS_REPLACED, EventRow};
 use crate::switch::Axis;
 
 /// The `quarantine_reason` column's values (§6.1).
@@ -94,18 +94,19 @@ impl Engine {
         Ok(())
     }
 
-    /// Clears the quarantine and records `unquarantine`; `false` when there was none.
-    pub(crate) fn unquarantine(&self, row: &AccountRow) -> Result<bool, EngineError> {
-        self.unquarantine_from(row, "cli")
-    }
-
-    /// `unquarantine`, with the event's `source` (`cli` or `auto`).
-    fn unquarantine_from(&self, row: &AccountRow, source: &str) -> Result<bool, EngineError> {
-        let cleared = self.store()?.clear_quarantine(&row.id)?;
-        if cleared {
-            self.quarantine_event(row, "unquarantine", None, source)?;
-        }
-        Ok(cleared)
+    /// §7.4: clears `row`'s quarantine and records its one `unquarantine` event, with
+    /// `reason` (`ACCOUNT_REPLACED` when the account's `login_epoch` moved, else
+    /// `CREDENTIALS_REPLACED`) and `source` (`cli` or `auto`), in one store transaction.
+    /// `false`, and no event, when there was none.
+    pub(crate) fn unquarantine(
+        &self,
+        row: &AccountRow,
+        reason: &str,
+        source: &str,
+    ) -> Result<bool, EngineError> {
+        Ok(self
+            .store()?
+            .clear_quarantine(&row.id, reason, source, self.now_ms())?)
     }
 
     /// §7.4: whether `row`'s quarantine no longer binds. The vault must hold another
@@ -172,7 +173,10 @@ impl Engine {
 
     /// §7.4 / Decision 9: clears every quarantine of `provider` that no longer binds
     /// (`quarantine_released`), each under its account lock (try-only; a busy account is
-    /// left), and records each release with `source`. Returns the released accounts.
+    /// left), and records each release with `source`. A pending replacement (§12.5) has moved
+    /// the account's `login_epoch`, so its release is `account-replaced`; its reconciliation
+    /// later finds no quarantine left to clear, so the account still gets one event. Returns
+    /// the released accounts.
     pub fn release_unbound_quarantines(
         &self,
         provider: &ProviderId,
@@ -199,7 +203,12 @@ impl Engine {
             if row.quarantine_reason.is_none() || !self.quarantine_released(p.as_ref(), &row) {
                 continue;
             }
-            if self.unquarantine_from(&row, source)? {
+            let reason = if row.replacing_fp.is_some() {
+                ACCOUNT_REPLACED
+            } else {
+                CREDENTIALS_REPLACED
+            };
+            if self.unquarantine(&row, reason, source)? {
                 tracing::info!(
                     position = row.position,
                     account = %row.id,
@@ -260,13 +269,28 @@ mod tests {
             (q.quarantine_reason.as_deref(), q.quarantine_fp.as_deref()),
             (Some("invalid_grant"), Some("sha256:sent"))
         );
-        assert!(t.engine.unquarantine(&q).unwrap());
-        assert!(!t.engine.unquarantine(&q).unwrap(), "nothing left to clear");
+        assert!(
+            t.engine
+                .unquarantine(&q, CREDENTIALS_REPLACED, "auto")
+                .unwrap()
+        );
+        assert!(
+            !t.engine
+                .unquarantine(&q, CREDENTIALS_REPLACED, "auto")
+                .unwrap(),
+            "nothing left to clear"
+        );
         let events = t.engine.store().unwrap().events().unwrap();
         let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(kinds, ["quarantine", "unquarantine"]);
         assert_eq!(events[0].to_id.as_ref(), Some(&row.id));
         assert_eq!(events[0].detail, Some(json!({"reason": "invalid_grant"})));
         assert_eq!(events[0].source, "cli");
+        assert_eq!(events[1].to_id.as_ref(), Some(&row.id));
+        assert_eq!(
+            events[1].detail,
+            Some(json!({"reason": "credentials-replaced"}))
+        );
+        assert_eq!(events[1].source, "auto");
     }
 }

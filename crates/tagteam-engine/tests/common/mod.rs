@@ -726,7 +726,7 @@ impl Fx {
         self.fixture_vault()
             .store(&lock, new_bytes, &|b| self.cc.fingerprint(b))
             .unwrap();
-        store.finish_replacement(id).unwrap();
+        store.finish_replacement(id, self.clock.now_ms()).unwrap();
     }
 
     /// A vault over the fixture's own backend: the Keychain on macOS, files on Linux, as the

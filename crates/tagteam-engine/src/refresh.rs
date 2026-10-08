@@ -15,7 +15,7 @@ use crate::error::EngineError;
 use crate::hooks;
 use crate::provenance::ProfileCheck;
 use crate::quarantine::QuarantineReason;
-use crate::store::{AccountRow, Store};
+use crate::store::{AccountRow, CREDENTIALS_REPLACED, Store};
 
 /// §7.3 step 5: the token request's bound. The account lock is held across it, which is why
 /// every other vault writer waits up to 15 s (§6.2).
@@ -347,7 +347,7 @@ impl Engine {
         self.store()?
             .set_login_expires_at(&row.id, p.login_expires_at(bytes))?;
         if p.fingerprint(bytes) != before {
-            self.unquarantine(row)?;
+            self.unquarantine(row, CREDENTIALS_REPLACED, "cli")?;
         }
         Ok(())
     }
@@ -400,7 +400,7 @@ impl Engine {
                     QuarantineReason::parse(reason).unwrap_or(QuarantineReason::InvalidGrant),
                 ));
             }
-            self.unquarantine(&row)?;
+            self.unquarantine(&row, CREDENTIALS_REPLACED, "cli")?;
         }
         if !p.kind_traits(&row.kind).refreshable {
             return Ok(transient("not-refreshable"));
@@ -817,16 +817,24 @@ mod tests {
             after.quarantine_reason, None,
             "§7.4: a fingerprint change clears it"
         );
-        let kinds: Vec<String> = t
+        // §7.4: one event, `credentials-replaced`, since no replacement moved the epoch.
+        let events: Vec<(String, Option<serde_json::Value>, String)> = t
             .engine
             .store()
             .unwrap()
             .events()
             .unwrap()
             .into_iter()
-            .map(|e| e.kind)
+            .map(|e| (e.kind, e.detail, e.source))
             .collect();
-        assert_eq!(kinds, ["unquarantine"]);
+        assert_eq!(
+            events,
+            [(
+                "unquarantine".to_owned(),
+                Some(serde_json::json!({"reason": "credentials-replaced"})),
+                "cli".to_owned()
+            )]
+        );
     }
 
     #[test]
@@ -851,6 +859,10 @@ mod tests {
         let after = t.row(&row.id);
         assert_eq!(after.quarantine_fp.as_deref(), Some(fp.as_str()));
         assert_eq!(after.login_expires_at, Some(7));
+        assert!(
+            t.engine.store().unwrap().events().unwrap().is_empty(),
+            "nothing cleared, nothing recorded"
+        );
     }
 
     #[test]
