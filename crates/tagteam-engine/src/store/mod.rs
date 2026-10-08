@@ -65,6 +65,11 @@ pub enum StoreError {
     UnsupportedSchema(i64),
     #[error("a replacement is already pending for this account")]
     ReplacementPending,
+    /// §12.5: the metadata a pending replacement recorded (`replacing_meta`) is not JSON, or
+    /// lacks a field the login needs, so the replacement cannot be installed. The detail never
+    /// quotes it.
+    #[error("the pending replacement's recorded login cannot be read: {0}")]
+    ReplacementUnreadable(String),
     #[error("an alias cannot be empty")]
     InvalidAlias,
 }
@@ -882,7 +887,7 @@ impl Store {
     /// explicit replacement is a command's (§7.4, §11.4), whichever lock holder finishes it. A
     /// missing `identity_key`, `label` or `kind` in the recorded metadata means the account and
     /// its marker are left exactly as they were (§12.5) rather than installing an empty
-    /// identity.
+    /// identity: that is `ReplacementUnreadable`, as is metadata that is not JSON.
     ///
     /// A login taken from the live store (`from_live`, `add`'s) also records the account's new
     /// `login_epoch` as the activation epoch here (§10.1, §12.5): the live store holds exactly
@@ -906,11 +911,10 @@ impl Store {
         };
         let mut cleared = None;
         if let Some(m) = meta {
-            let v: Value =
-                serde_json::from_str(&m).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-            let missing = |field: &str| {
-                StoreError::Corrupt(format!("replacement metadata is missing its {field} field"))
-            };
+            let v: Value = serde_json::from_str(&m)
+                .map_err(|_| StoreError::ReplacementUnreadable("it is not JSON".into()))?;
+            let missing =
+                |field: &str| StoreError::ReplacementUnreadable(format!("it has no {field} field"));
             let identity_key = v["identity_key"]
                 .as_str()
                 .ok_or_else(|| missing("identity_key"))?;

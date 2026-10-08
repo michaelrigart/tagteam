@@ -14,8 +14,19 @@ use crate::hooks;
 use crate::oracle::Oracle;
 use crate::registry::ProviderRegistry;
 use crate::settings::Settings;
-use crate::store::Store;
+use crate::store::{Store, StoreError};
 use crate::vault::Vault;
+
+/// How a holder of an account lock treats a pending replacement it cannot install (§12.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reconcile {
+    /// Every holder but `remove` and `purge`: a replacement that landed with metadata that
+    /// cannot be read refuses with `replacement-unreadable`.
+    Strict,
+    /// `remove` and `purge`, which delete the account either way (§12.5): such a replacement
+    /// is left as it is, and the account goes with it.
+    Removing,
+}
 
 pub struct EngineConfig {
     pub env: Env,
@@ -374,20 +385,48 @@ impl Engine {
         sorted.into_iter().map(|id| self.lock_account(id)).collect()
     }
 
+    /// §12.5's reconciliation, strictly: every lock holder but `remove` and `purge` runs it.
     pub(crate) fn reconcile_replacement(&self, lock: &AccountLock) -> Result<(), EngineError> {
+        self.reconcile_replacement_as(lock, Reconcile::Strict)
+    }
+
+    /// §12.5: a pending replacement the vault holds (`replacing_fp`) landed, and its recorded
+    /// metadata is installed; one it does not hold never landed, and is rolled back, which needs
+    /// no metadata. A landed one whose metadata cannot be read refuses under `Strict`, naming
+    /// the account, and is left as it is under `Removing`.
+    pub(crate) fn reconcile_replacement_as(
+        &self,
+        lock: &AccountLock,
+        mode: Reconcile,
+    ) -> Result<(), EngineError> {
         let Some(store) = self.existing_store()? else {
             return Ok(());
         };
         let Some(row) = store.account(lock.id())? else {
             return Ok(());
         };
-        let Some(fp) = row.replacing_fp else {
+        let Some(fp) = row.replacing_fp.as_deref() else {
             return Ok(());
         };
         let provider = self.provider(&row.provider)?;
         match self.vault.read(lock.id()) {
             Read::Present(b) if provider.fingerprint(&b).is_some_and(|f| f.as_str() == fp) => {
-                store.finish_replacement(lock.id(), self.now_ms())?
+                match store.finish_replacement(lock.id(), self.now_ms()) {
+                    Ok(()) => {}
+                    Err(StoreError::ReplacementUnreadable(_)) if mode == Reconcile::Removing => {}
+                    Err(StoreError::ReplacementUnreadable(detail)) => {
+                        tracing::warn!(
+                            position = row.position,
+                            account = %row.id,
+                            "a new login landed but what its replacement recorded cannot be read ({detail})"
+                        );
+                        return Err(EngineError::ReplacementUnreadable {
+                            position: row.position,
+                            label: row.label.clone(),
+                        });
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
             Read::Present(_) | Read::Absent => store.rollback_replacement(lock.id())?,
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),

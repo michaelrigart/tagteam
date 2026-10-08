@@ -206,6 +206,13 @@ pub enum EngineError {
     /// A `config` command's refusal, or its failure to write (§6.4).
     #[error(transparent)]
     Settings(#[from] SettingsError),
+    /// §12.5: a replacement landed (the vault holds `replacing_fp`), but what it recorded about
+    /// the new login cannot be read, so it can be neither installed nor undone. Every holder of
+    /// the account's lock refuses, except `remove` and `purge`, which delete it either way.
+    #[error(
+        "position {position} ({label}) has a new login whose recorded details cannot be read, so it cannot be finished; run `tagteam remove {position}`, then add the login again"
+    )]
+    ReplacementUnreadable { position: u32, label: String },
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -317,6 +324,7 @@ impl EngineError {
             ) => "invalid-input",
             EngineError::Settings(SettingsError::Corrupt { .. }) => "settings-unreadable",
             EngineError::Settings(SettingsError::Io(_)) => "io",
+            EngineError::ReplacementUnreadable { .. } => "replacement-unreadable",
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -638,6 +646,13 @@ mod tests {
             (
                 EngineError::Settings(SettingsError::Io(io::Error::other("x"))),
                 "io",
+            ),
+            (
+                EngineError::ReplacementUnreadable {
+                    position: 1,
+                    label: "a".into(),
+                },
+                "replacement-unreadable",
             ),
             (EngineError::Io(io::Error::other("x")), "io"),
             (

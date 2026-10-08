@@ -346,7 +346,7 @@ fn finish_replacement_refuses_metadata_missing_required_fields() {
     let s = Store::open(&path).unwrap();
     assert!(matches!(
         s.finish_replacement(&a, 0),
-        Err(StoreError::Corrupt(_))
+        Err(StoreError::ReplacementUnreadable(_))
     ));
     // Untouched: the original login and the pending marker are both still there.
     let r = s.account(&a).unwrap().unwrap();

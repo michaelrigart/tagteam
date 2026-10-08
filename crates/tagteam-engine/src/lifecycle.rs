@@ -7,7 +7,7 @@ use tagteam_provider::profile::{ProfileMarker, canonical_profile_path, profile_p
 use tagteam_provider::{Credential, Identity, Provenance, Provider, Read};
 
 use crate::account_lock::AccountLock;
-use crate::engine::Engine;
+use crate::engine::{Engine, Reconcile};
 use crate::error::EngineError;
 use crate::rescue::{RescueEntry, RescueFile};
 use crate::store::{AccountRow, EventRow, LoginMeta, NewAccount, Store, StoreError};
@@ -204,12 +204,14 @@ impl Engine {
     /// fails stops before the row goes, so the account stays listed and the remove can be run
     /// again; every delete treats an absent item as done. The caller holds the mutation lock and
     /// this account's lock, and has run `refuse_destroying` on it. The live login is never
-    /// touched.
+    /// touched. A pending replacement is reconciled first (§6.2), but one that cannot be
+    /// installed does not stop it: the account goes either way (§12.5).
     pub(crate) fn remove_locked(
         &self,
         row: &AccountRow,
         lock: &AccountLock,
     ) -> Result<(), EngineError> {
+        self.reconcile_replacement_as(lock, Reconcile::Removing)?;
         let p = self.provider(&row.provider)?;
         self.vault.delete(lock)?;
         for rescue in self.rescues_for(&row.id) {
@@ -730,7 +732,9 @@ impl Engine {
         self.settle_or_refuse(&provider)?;
         let _guard = self.guard_or_refuse(&provider)?;
         let row = self.managed_row(id)?;
-        let lock = self.lock_account(id)?;
+        // Not `lock_account`: its strict reconciliation refuses a replacement that cannot be
+        // installed, which `remove_locked` deletes instead (§12.5).
+        let lock = AccountLock::acquire(&self.env, id, AccountLock::WAIT)?;
         // §10.3 Guard: under the mutation lock and the account lock, no session can start
         // before the remove is done (§12.5).
         let p = self.provider(&row.provider)?;
