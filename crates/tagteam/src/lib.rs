@@ -153,7 +153,7 @@ where
             logging::LogConfig {
                 debug: cli.debug,
                 color: !cli.no_color && !ctx.no_color_env,
-                state_dir: ctx.env.state_dir(),
+                log_file: ctx.env.log_file(),
                 home: ctx.env.home.clone(),
                 filter: std::env::var_os(logging::TAGTEAM_LOG),
             },

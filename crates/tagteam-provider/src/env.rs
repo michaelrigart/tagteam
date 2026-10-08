@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 use crate::cancel::Cancel;
 
+/// §14.2: the suffixes of the log's rotations, newest first: `tagteam.log.1`, then `.2`. The
+/// oldest is dropped at the next rotation.
+pub const LOG_ROTATIONS: &[&str] = &[".1", ".2"];
+
 /// Why the process's environment cannot place tagteam's files (§5). Each message says what to
 /// do.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -163,6 +167,12 @@ impl Env {
             .unwrap_or_else(|| self.home.join(".local/state"));
         self.guard(base.join("tagteam"))
     }
+
+    /// §5, §14.2: `$XDG_STATE_HOME/tagteam/tagteam.log`. Its rotations are this path with each
+    /// of `LOG_ROTATIONS` appended, and its rotation lock `tagteam.log.lock` sits beside it.
+    pub fn log_file(&self) -> PathBuf {
+        self.state_dir().join("tagteam.log")
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +195,18 @@ mod tests {
             env.state_dir(),
             Path::new("/tmp/fixture/home/.local/state/tagteam")
         );
+    }
+
+    #[test]
+    fn the_log_and_its_rotations_live_in_the_state_dir() {
+        let mut env = Env::for_test(Path::new("/tmp/fixture"));
+        assert_eq!(
+            env.log_file(),
+            Path::new("/tmp/fixture/home/.local/state/tagteam/tagteam.log")
+        );
+        assert_eq!(LOG_ROTATIONS, [".1", ".2"]);
+        env.xdg_state_home = Some(PathBuf::from("/state"));
+        assert_eq!(env.log_file(), Path::new("/state/tagteam/tagteam.log"));
     }
 
     #[test]

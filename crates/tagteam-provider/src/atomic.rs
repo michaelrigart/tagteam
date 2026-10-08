@@ -165,6 +165,24 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(path)
 }
 
+/// The writer's pid in the name of a temp file the atomic writer left (§9.5:
+/// `.<name>.tagteam-<pid>-<hex8>`), or `None` for any other name. Purge deletes such a file once
+/// its writer is gone (§10.5), and doctor reports one (§13.6), since it may hold a secret.
+pub fn temp_writer_pid(file_name: &str) -> Option<u32> {
+    let (target, tail) = file_name.strip_prefix('.')?.rsplit_once(".tagteam-")?;
+    let (pid, rand) = tail.split_once('-')?;
+    let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    if target.is_empty()
+        || pid.is_empty()
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+        || rand.len() != 8
+        || !rand.bytes().all(lower_hex)
+    {
+        return None;
+    }
+    pid.parse().ok().filter(|p| *p > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +190,48 @@ mod tests {
 
     fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn a_temp_name_gives_its_writer_s_pid_and_nothing_else_does() {
+        assert_eq!(
+            temp_writer_pid(".credentials.json.tagteam-4242-0a1b2c3d"),
+            Some(4242)
+        );
+        assert_eq!(
+            temp_writer_pid(".claude.json.tagteam-7-ffffffff"),
+            Some(7),
+            "a name with dots of its own"
+        );
+        for other in [
+            "credentials.json.tagteam-4242-0a1b2c3d",
+            ".credentials.json",
+            "..tagteam-4242-0a1b2c3d",
+            ".x.tagteam-4242-0A1B2C3D",
+            ".x.tagteam-4242-0a1b2c3",
+            ".x.tagteam-+42-0a1b2c3d",
+            ".x.tagteam-0-0a1b2c3d",
+            ".x.tagteam--0a1b2c3d",
+            ".x.tagteam-99999999999-0a1b2c3d",
+        ] {
+            assert_eq!(temp_writer_pid(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_temp_file_the_writer_leaves_is_one_temp_writer_pid_reads() {
+        // Its name is the writer's own (§9.5): what a killed writer leaves behind.
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("v.json");
+        let _ = write_atomic_with(&target, b"x", 0o600, || {
+            let name = fs::read_dir(d.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .find(|n| n != "v.json")
+                .unwrap();
+            assert_eq!(temp_writer_pid(&name), Some(std::process::id()));
+            Err(io::Error::other("stop before publishing"))
+        });
     }
 
     #[test]
