@@ -6,7 +6,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::keychain::{Keychain, KeychainError, LockState, locked_err};
+use crate::keychain::{
+    Keychain, KeychainError, LockState, empty_service_err, empty_service_read, locked_err,
+};
 use crate::process::drain;
 use crate::read::{Read, ReadError};
 
@@ -497,6 +499,9 @@ impl Keychain for SecurityCli {
     /// repeated until then, at most `DELETE_SERVICE_LIMIT` times, and the attributes-only probe
     /// must then find none. A locked keychain (rc 36) stops it, named as such.
     fn delete_service(&self, service: &str) -> Result<u32, KeychainError> {
+        if service.is_empty() {
+            return Err(empty_service_err());
+        }
         let mut deleted = 0;
         while deleted < DELETE_SERVICE_LIMIT {
             match self.run(s(&["delete-generic-password", "-s", service]), None) {
@@ -523,7 +528,7 @@ impl Keychain for SecurityCli {
         Err(KeychainError {
             rc: None,
             detail: format!(
-                "{service:?} still had items after {DELETE_SERVICE_LIMIT} deletions; nothing more was deleted"
+                "{service:?}: stopped after {DELETE_SERVICE_LIMIT} deletions, the limit; whether any items remain was not checked"
             ),
         })
     }
@@ -531,6 +536,9 @@ impl Keychain for SecurityCli {
     /// Appendix A.3: `find-generic-password -s <service>`, without `-a`, `-w` or `-g`: rc 0
     /// while any item of the service exists, rc 44 once none does. It never prompts.
     fn service_has_items(&self, service: &str) -> Read<bool> {
+        if service.is_empty() {
+            return empty_service_read();
+        }
         match self.run(s(&["find-generic-password", "-s", service]), None) {
             RunResult::Exited { code: 0, .. } => Read::Present(true),
             RunResult::Exited { code: 44, .. } => Read::Present(false),
@@ -716,12 +724,29 @@ mod tests {
             s = s.then(ok(b""));
         }
         let err = cli(&s, None).delete_service("tagteam").unwrap_err();
-        assert!(err.detail.contains("10000 deletions"), "{err}");
+        assert!(
+            err.detail.contains(
+                "stopped after 10000 deletions, the limit; whether any items remain was not checked"
+            ),
+            "{err}"
+        );
         assert_eq!(
             s.calls().len(),
             DELETE_SERVICE_LIMIT as usize,
             "no call past the limit"
         );
+    }
+
+    #[test]
+    fn an_empty_service_is_refused_before_any_call() {
+        // `Scripted` panics on an unexpected call, and none is scripted.
+        let s = Scripted::default();
+        assert!(cli(&s, None).delete_service("").is_err());
+        assert!(matches!(
+            cli(&s, None).service_has_items(""),
+            Read::Unreadable(_)
+        ));
+        assert!(s.calls().is_empty());
     }
 
     #[test]

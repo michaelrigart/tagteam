@@ -105,6 +105,22 @@ pub(crate) fn locked_err() -> KeychainError {
     }
 }
 
+/// An empty service is no service: `security -s ""` might mean "no filter", and the file
+/// keychain's prefix would match its writer's temporary files. Refused before anything runs.
+pub(crate) fn empty_service_err() -> KeychainError {
+    KeychainError {
+        rc: None,
+        detail: "refusing to delete the items of an empty service name".into(),
+    }
+}
+
+pub(crate) fn empty_service_read<T>() -> Read<T> {
+    Read::Unreadable(ReadError::new(
+        "keychain",
+        "refusing to probe an empty service name",
+    ))
+}
+
 type Key = (String, String);
 
 /// In-memory Keychain for tests, with failure injection.
@@ -250,6 +266,12 @@ impl Keychain for FakeKeychain {
     }
     /// A locked keychain and an injected delete failure fail it, as `delete` does.
     fn delete_service(&self, s: &str) -> Result<u32, KeychainError> {
+        if s.is_empty() {
+            return Err(empty_service_err());
+        }
+        if self.panic_delete.lock().unwrap().contains(s) {
+            panic!("injected panic deleting {s}");
+        }
         if self.locked.load(Ordering::SeqCst) {
             return Err(locked_err());
         }
@@ -267,6 +289,9 @@ impl Keychain for FakeKeychain {
     /// Attributes only, locked or not, like `exists` (L342). An item of the service marked
     /// unreadable fails it, as it fails `exists`.
     fn service_has_items(&self, s: &str) -> Read<bool> {
+        if s.is_empty() {
+            return empty_service_read();
+        }
         if self
             .unreadable
             .lock()
@@ -376,6 +401,9 @@ impl Keychain for FileKeychain {
         false
     }
     fn delete_service(&self, s: &str) -> Result<u32, KeychainError> {
+        if s.is_empty() {
+            return Err(empty_service_err());
+        }
         if self.locked() {
             return Err(locked_err());
         }
@@ -395,6 +423,9 @@ impl Keychain for FileKeychain {
     }
     /// Attributes only, locked or not, like `exists` (L342).
     fn service_has_items(&self, s: &str) -> Read<bool> {
+        if s.is_empty() {
+            return empty_service_read();
+        }
         match self.service_files(s) {
             Ok(files) => Read::Present(!files.is_empty()),
             Err(e) => Read::Unreadable(ReadError::new("keychain", e.to_string())),
@@ -483,6 +514,21 @@ mod tests {
     }
 
     #[test]
+    fn the_fake_refuses_an_empty_service_and_honours_an_injected_panic() {
+        let k = FakeKeychain::new();
+        k.put("s", "a", b"1");
+        assert!(k.delete_service("").is_err());
+        assert!(matches!(k.service_has_items(""), Read::Unreadable(_)));
+        assert_eq!(k.items().len(), 1, "nothing deleted");
+        k.set_panic_on_delete("s", true);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = k.delete_service("s");
+        }));
+        assert!(panicked.is_err(), "delete_service panics as delete does");
+        assert_eq!(k.items().len(), 1);
+    }
+
+    #[test]
     fn a_keychain_that_cannot_enumerate_a_service_refuses_both() {
         // The defaults fail closed: nothing is deleted and nothing is taken for absent.
         struct Bare;
@@ -552,6 +598,19 @@ mod tests {
             "present while locked"
         );
         assert!(matches!(k.exists("nope", "me"), Read::Absent));
+    }
+
+    #[cfg(feature = "file-keychain")]
+    #[test]
+    fn file_keychain_refuses_an_empty_service() {
+        let d = tempfile::tempdir().unwrap();
+        let k = FileKeychain::new(d.path());
+        k.upsert("s", "a", b"v").unwrap();
+        std::fs::write(d.path().join(".tmp-writer"), "x").unwrap();
+        assert!(k.delete_service("").is_err());
+        assert!(matches!(k.service_has_items(""), Read::Unreadable(_)));
+        assert!(k.exists("s", "a").is_present());
+        assert!(d.path().join(".tmp-writer").exists());
     }
 
     #[cfg(feature = "file-keychain")]
