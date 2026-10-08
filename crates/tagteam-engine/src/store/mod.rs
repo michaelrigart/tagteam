@@ -386,13 +386,8 @@ fn event_from_row(r: &Row<'_>) -> rusqlite::Result<EventRow> {
 /// accounts by ID only. `detail` is never logged: it is free-form JSON, and nothing bounds what
 /// a later kind puts in it.
 fn log_event(e: &EventRow) {
-    log_event_as(e, e.provider.as_str());
-}
-
-/// `log_event` with `provider` in place of the row's own ID.
-fn log_event_as(e: &EventRow, provider: &str) {
     tracing::info!(
-        provider,
+        provider = %e.provider,
         kind = e.kind.as_str(),
         from_account = e.from_id.as_ref().map(tracing::field::display),
         to_account = e.to_id.as_ref().map(tracing::field::display),
@@ -1257,15 +1252,6 @@ impl Store {
     pub fn insert_event(&self, e: &EventRow) -> Result<(), StoreError> {
         Self::insert_event_on(&self.lock(), e)?;
         log_event(e);
-        Ok(())
-    }
-
-    /// `insert_event` for an event of a provider this build does not register (a purge's
-    /// `remove` of its account): the line names the provider as `unregistered`, since its ID is
-    /// a string tagteam did not choose (§14.2).
-    pub fn insert_event_unregistered(&self, e: &EventRow) -> Result<(), StoreError> {
-        Self::insert_event_on(&self.lock(), e)?;
-        log_event_as(e, "unregistered");
         Ok(())
     }
 

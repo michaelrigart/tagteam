@@ -407,7 +407,7 @@ impl Engine {
                 }
                 store.delete_journal(provider)?;
                 tracing::warn!(
-                    provider = self.loggable(provider),
+                    provider = %provider,
                     "purge deleted an interrupted switch's record that recovery could not settle"
                 );
                 warnings.push(format!(

@@ -26,7 +26,7 @@ use crate::hooks;
 use crate::lifecycle::UnlistedRescues;
 use crate::rescue::RescueUnlisted;
 use crate::session::SessionState;
-use crate::store::{AccountRow, EventRow, Store};
+use crate::store::{AccountRow, Store};
 use crate::vault::Leftovers;
 
 /// §10.5: Keychain items are not a provider's, so the flag that deletes the ones no account
@@ -161,16 +161,6 @@ fn account_of(row: &AccountRow, has_profile: bool) -> PurgeAccount {
 }
 
 impl Engine {
-    /// A provider's ID for a log line: the ID of one this build registers, else a fixed word,
-    /// since an unregistered one is a string tagteam did not choose (§14.2).
-    pub(crate) fn loggable<'a>(&self, provider: &'a ProviderId) -> &'a str {
-        if self.provider(provider).is_ok() {
-            provider.as_str()
-        } else {
-            "unregistered"
-        }
-    }
-
     /// §10.5 step 2's summary. Inside a run shell it refuses at once (§12.8). It reads the
     /// store and the data directory only, takes no lock and creates nothing (§5). An account
     /// of a provider this build does not register is listed with its provider's ID.
@@ -319,7 +309,7 @@ impl Engine {
                     tracing::info!(
                         account = %row.id,
                         position = row.position,
-                        provider = self.loggable(&row.provider),
+                        provider = %row.provider,
                         "purged an account"
                     );
                     report.rescues += rescues;
@@ -422,21 +412,18 @@ impl Engine {
         let profile = profile_path(&self.env, &row.id);
         for p in self.judges(&profile, providers) {
             let state = self.session_state_at(p.as_ref(), &profile);
-            // §14.2, B.69: the log gives the state only, as `refuse_session_owned` does; the
-            // refusal names the detail to the user.
-            let unreadable = match &state {
-                SessionState::Unreadable { detail, .. } => {
-                    tracing::warn!(
-                        position = row.position,
-                        account = %row.id,
-                        state = "unreadable",
-                        "a session reservation or record could not be read; the account counts as session-owned"
-                    );
-                    Some(detail.clone())
-                }
-                _ => None,
-            };
+            if let SessionState::Unreadable { detail, .. } = &state {
+                tracing::warn!(
+                    position = row.position,
+                    account = %row.id,
+                    "a session reservation or record could not be read ({detail}); the account counts as session-owned"
+                );
+            }
             if state.owned() {
+                let unreadable = match &state {
+                    SessionState::Unreadable { detail, .. } => Some(detail.clone()),
+                    _ => None,
+                };
                 return Err(EngineError::SessionOwned {
                     position: row.position,
                     label: row.label.clone(),
@@ -479,25 +466,15 @@ impl Engine {
             Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e.into()),
         };
-        let store = self.store()?;
-        store.delete_account(&row.id)?;
-        // `event`, with the provider's ID kept out of the log line it writes (§14.2).
-        store.insert_event_unregistered(&EventRow {
-            at: self.now_ms(),
-            provider: row.provider.clone(),
-            kind: "remove".into(),
-            from_id: Some(row.id.clone()),
-            to_id: None,
-            trigger: None,
-            source: "cli".into(),
-            detail: None,
-        })?;
+        self.store()?.delete_account(&row.id)?;
+        self.event(&row.provider, "remove", Some(&row.id), None)?;
         if !had_profile {
             return Ok((rescues.len(), None));
         }
         tracing::warn!(
             account = %row.id,
             position = row.position,
+            provider = %row.provider,
             "purged the session profile of an account whose provider this build does not register; the credential item that provider keeps for it cannot be named, and may remain"
         );
         let warning = format!(
@@ -600,10 +577,10 @@ impl Engine {
     ) -> Result<(), EngineError> {
         for p in self.judges(profile, providers) {
             let state = self.session_state_at(p.as_ref(), profile);
-            if matches!(state, SessionState::Unreadable { .. }) {
+            if let SessionState::Unreadable { detail, .. } = &state {
                 tracing::warn!(
-                    state = "unreadable",
-                    "a session reservation or record of a profile no account owns could not be read; it counts as in use"
+                    profile = %profile.display(),
+                    "a session reservation or record of a profile no account owns could not be read ({detail}); it counts as in use"
                 );
             }
             if state.owned() {
@@ -652,6 +629,8 @@ impl Engine {
                 Ok(p) => p.delete_profile_credential(&self.env, profile, &marker.config_dir)?,
                 Err(_) => {
                     tracing::warn!(
+                        profile = %profile.display(),
+                        provider = %marker.provider,
                         "a session profile no account owns names a provider this build does not register; the credential item that provider keeps for it cannot be named, and may remain"
                     );
                     warning = Some(format!(
@@ -668,8 +647,9 @@ impl Engine {
                         p.delete_profile_credential(&self.env, profile, &spelling)?;
                     }
                 }
-                Err(_) => tracing::warn!(
-                    "a session profile no account owns has no readable marker and does not resolve; no Keychain item can be named for it"
+                Err(e) => tracing::warn!(
+                    profile = %profile.display(),
+                    "a session profile no account owns has no readable marker and does not resolve ({e}); no Keychain item can be named for it"
                 ),
             },
         }
@@ -679,7 +659,7 @@ impl Engine {
         } else {
             fs::remove_file(profile)?;
         }
-        tracing::info!("deleted a session profile no account owned");
+        tracing::info!(profile = %profile.display(), "deleted a session profile no account owned");
         Ok(warning)
     }
 
@@ -725,7 +705,7 @@ impl Engine {
             }
         }
         tracing::info!(
-            provider = self.loggable(provider),
+            provider = %provider,
             accounts = report.accounts.len(),
             rescues = report.rescues,
             displaced = report.displaced,
