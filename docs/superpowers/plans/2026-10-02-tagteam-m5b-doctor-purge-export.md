@@ -1,6 +1,6 @@
 # tagteam M5b — Doctor, Purge, Export and Import, and the Compat Suite Implementation Plan
 
-**Status:** Approved
+**Status:** In progress
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -420,6 +420,23 @@ integration applied them in this order.
 ## Execution rulings
 
 Recorded at execution time: the re-sync against merged M4b and M5a, then rulings taken during the run.
+
+**Re-sync against `main` at `a4dad47`** (M4b PR #9, M5a PR #8). Every task was replayed onto the merged code with no stubs. The per-task deltas, with the changed code blocks and the corrected RED/GREEN counts, are in the run's workspace (`resync.md`) and are handed to each task's implementer with its task text. The workspace suite on the replay passes 2559/2569; the 10 failures are the `openpty` tests, which pass outside the sandbox. The rulings:
+- R-T1-launch: M4b's `tests/launch.rs` race closure calls the four-argument `clear_quarantine` — cost if wrong: none (test code).
+- R-T4-timeout: `guard_recovering_from` takes M4b's `timeout`, and purge passes `MutationGuard::TIMEOUT` — cost: a purge behind a long-held mutation lock gives up after the default wait.
+- R-T4-session: the plan's own `session_state_leaving_out` re-sync is applied as written, keeping M4b's own-reservation exclusion — cost: none found.
+- R-T4-unreadable: purge's unregistered-account refusal fills M4b's `SessionOwned.unreadable`, as `remove` does — cost: the user's refusal message may name a path inside the data directory (stderr, not the log).
+- R-T4-purgeerror (overridden): a `--provider` purge whose displaced deletion fails part-way reports the count `PurgeError.deleted` carries, plus the failure — cost: none.
+- R-resync-logfile: M5a's `LogFile` takes `Env::log_file()` and `LOG_ROTATIONS` in Task 4; `tests/logging.rs` keeps its literal `tagteam.log*` names as an independent check — cost: a renamed log file needs that test's edit too.
+- R-T5-const / R-T7-name: `PURGE_DATA_NEEDS_YES` and `export_vault_generation` avoid names M5a and M4b already use — cost: none.
+- R-T8-guard: `guard_or_refuse_each` is built on M4b's `guard_or_refuse_for` through a new `guard_or_refuse_each_within` — cost: none found.
+- R-T9-rows-first: `displaced_in` keeps M5a's rows-before-files order — cost: none.
+- R-T11-order: Task 11 Part B's commands run before M5a's closing `list`, after its `auto` ticks (at the plan's place `purge --provider` leaves `auto` no accounts) — cost: none.
+- R-T14-session: M4b's `refuse_session_owned` already logs a fixed phrase, so Task 14's `session.rs` pair is dropped and its test expects M4b's wording — cost: none.
+- R-T14-fields / R-T14-rollback-test: M5a's renamed `account` fields, and M5a's rollback test asserting a count — cost: none.
+- R-T14-views: `views.rs` joins the sweep, as M4b's session asked; its `live_login` DEBUG line logs `code = e.sqlite_code()`, with a test whose trigger carries an email — cost: the status bar's DEBUG line loses SQLite's words.
+- R-T14-sweep-rows (amended): of the four new discard rows, three stay silent (a cancel `take`, statusline's silence, a `test-hooks` marker); M4b's `apply_outer_home(…).ok()` logs a WARN with a fixed phrase instead, since its fallback changes how link sync judges a profile — cost: one WARN line per such fallback.
+- R-T14-kept-rows: four more kept interpolations, each constrained by construction (M5a's `fp`, `log_active`'s registered provider and constant outcome, the panic line's source location) — cost: a future caller passing an unvalidated provider to `refresh_active` would log it.
 
 ---
 
