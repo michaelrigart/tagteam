@@ -47,6 +47,24 @@ pub trait Keychain: Send + Sync {
     /// the password itself; tagteam never sees, stores or passes it. True on exit 0. Only the
     /// CLI calls this, and only on a terminal.
     fn unlock(&self) -> bool;
+    /// Appendix A.3's delete by service (`purge --keychain-orphans`, §10.5): deletes every item
+    /// of `service`, whatever its account, then verifies that none is left. Returns how many it
+    /// deleted. The default refuses: only a keychain that can enumerate a service implements it.
+    fn delete_service(&self, service: &str) -> Result<u32, KeychainError> {
+        Err(KeychainError {
+            rc: None,
+            detail: format!("this keychain cannot delete the items of {service:?} by service"),
+        })
+    }
+    /// Appendix A.3's probe of a whole service, attributes only: `Present(true)` while any
+    /// item of `service` exists, whatever its account. It never prompts and never reads a
+    /// secret, so it answers on a locked keychain too. The default cannot tell.
+    fn service_has_items(&self, service: &str) -> Read<bool> {
+        Read::Unreadable(ReadError::new(
+            "keychain",
+            format!("this keychain cannot probe the service {service:?}"),
+        ))
+    }
 }
 
 impl<K: Keychain + ?Sized> Keychain for Arc<K> {
@@ -68,13 +86,19 @@ impl<K: Keychain + ?Sized> Keychain for Arc<K> {
     fn unlock(&self) -> bool {
         (**self).unlock()
     }
+    fn delete_service(&self, s: &str) -> Result<u32, KeychainError> {
+        (**self).delete_service(s)
+    }
+    fn service_has_items(&self, s: &str) -> Read<bool> {
+        (**self).service_has_items(s)
+    }
 }
 
 fn locked_read<T>() -> Read<T> {
     Read::Unreadable(ReadError::new("keychain", "rc 36: the keychain is locked"))
 }
 
-fn locked_err() -> KeychainError {
+pub(crate) fn locked_err() -> KeychainError {
     KeychainError {
         rc: Some(36),
         detail: "the keychain is locked".into(),
@@ -224,6 +248,39 @@ impl Keychain for FakeKeychain {
         self.set_locked(false);
         true
     }
+    /// A locked keychain and an injected delete failure fail it, as `delete` does.
+    fn delete_service(&self, s: &str) -> Result<u32, KeychainError> {
+        if self.locked.load(Ordering::SeqCst) {
+            return Err(locked_err());
+        }
+        if self.fail_delete.lock().unwrap().contains(s) {
+            return Err(KeychainError {
+                rc: Some(25),
+                detail: "injected delete failure".into(),
+            });
+        }
+        let mut items = self.items.lock().unwrap();
+        let before = items.len();
+        items.retain(|(svc, _), _| svc != s);
+        Ok(u32::try_from(before - items.len()).expect("a test keychain holds few items"))
+    }
+    /// Attributes only, locked or not, like `exists` (L342). An item of the service marked
+    /// unreadable fails it, as it fails `exists`.
+    fn service_has_items(&self, s: &str) -> Read<bool> {
+        if self
+            .unreadable
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(svc, _)| svc == s)
+        {
+            return Read::Unreadable(ReadError::new(
+                "keychain",
+                "rc 1: injected failure reading the service's attributes",
+            ));
+        }
+        Read::Present(self.items.lock().unwrap().keys().any(|(svc, _)| svc == s))
+    }
 }
 
 /// A directory-backed fake, so tests can drive the real binary across processes.
@@ -243,6 +300,23 @@ impl FileKeychain {
     }
     fn locked(&self) -> bool {
         self.dir.join("LOCKED").exists()
+    }
+    /// The files of `service`'s items: every name `path` gives one, whatever the account.
+    fn service_files(&self, s: &str) -> std::io::Result<Vec<std::path::PathBuf>> {
+        let prefix = format!("{}.", hex::encode(s));
+        let listing = match std::fs::read_dir(&self.dir) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut files = Vec::new();
+        for entry in listing {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                files.push(entry.path());
+            }
+        }
+        Ok(files)
     }
 }
 
@@ -301,6 +375,31 @@ impl Keychain for FileKeychain {
     fn unlock(&self) -> bool {
         false
     }
+    fn delete_service(&self, s: &str) -> Result<u32, KeychainError> {
+        if self.locked() {
+            return Err(locked_err());
+        }
+        let failed = |e: std::io::Error| KeychainError {
+            rc: None,
+            detail: e.to_string(),
+        };
+        let mut deleted = 0;
+        for path in self.service_files(s).map_err(failed)? {
+            match std::fs::remove_file(&path) {
+                Ok(()) => deleted += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(failed(e)),
+            }
+        }
+        Ok(deleted)
+    }
+    /// Attributes only, locked or not, like `exists` (L342).
+    fn service_has_items(&self, s: &str) -> Read<bool> {
+        match self.service_files(s) {
+            Ok(files) => Read::Present(!files.is_empty()),
+            Err(e) => Read::Unreadable(ReadError::new("keychain", e.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +451,66 @@ mod tests {
     }
 
     #[test]
+    fn the_fake_deletes_and_probes_a_whole_service_through_an_arc_too() {
+        // Appendix A.3: every item of the service, whatever its account, and nothing else.
+        let k = Arc::new(FakeKeychain::new());
+        k.put("s", "a", b"1");
+        k.put("s", "a.prev", b"2");
+        k.put("s", "b", b"3");
+        k.put("t", "a", b"4");
+        let kc: &dyn Keychain = &k;
+        assert!(matches!(kc.service_has_items("s"), Read::Present(true)));
+        k.set_locked(true);
+        assert!(
+            matches!(kc.service_has_items("s"), Read::Present(true)),
+            "attributes need no unlock (L342)"
+        );
+        assert_eq!(kc.delete_service("s").unwrap_err().rc, Some(36));
+        k.set_locked(false);
+        k.set_fail_delete("s", true);
+        assert!(kc.delete_service("s").is_err());
+        k.set_fail_delete("s", false);
+        assert_eq!(kc.delete_service("s").unwrap(), 3);
+        assert!(matches!(kc.service_has_items("s"), Read::Present(false)));
+        assert_eq!(
+            k.get("t", "a").as_deref(),
+            Some(&b"4"[..]),
+            "another service"
+        );
+        assert_eq!(kc.delete_service("s").unwrap(), 0, "absent is done");
+        k.set_unreadable("t", "a", true);
+        assert!(matches!(kc.service_has_items("t"), Read::Unreadable(_)));
+    }
+
+    #[test]
+    fn a_keychain_that_cannot_enumerate_a_service_refuses_both() {
+        // The defaults fail closed: nothing is deleted and nothing is taken for absent.
+        struct Bare;
+        impl Keychain for Bare {
+            fn find(&self, _: &str, _: &str) -> Read<Vec<u8>> {
+                Read::Absent
+            }
+            fn exists(&self, _: &str, _: &str) -> Read<()> {
+                Read::Absent
+            }
+            fn upsert(&self, _: &str, _: &str, _: &[u8]) -> Result<(), KeychainError> {
+                Ok(())
+            }
+            fn delete(&self, _: &str, _: &str) -> Result<(), KeychainError> {
+                Ok(())
+            }
+            fn lock_state(&self) -> LockState {
+                LockState::Unlocked
+            }
+            fn unlock(&self) -> bool {
+                true
+            }
+        }
+        assert!(Bare.delete_service("s").is_err());
+        assert!(matches!(Bare.service_has_items("s"), Read::Unreadable(_)));
+    }
+
+    #[test]
     fn fake_keychain_models_the_lock_check_and_unlock() {
         let k = FakeKeychain::new();
         assert_eq!(k.lock_state(), LockState::Unlocked);
@@ -393,5 +552,34 @@ mod tests {
             "present while locked"
         );
         assert!(matches!(k.exists("nope", "me"), Read::Absent));
+    }
+
+    #[cfg(feature = "file-keychain")]
+    #[test]
+    fn file_keychain_deletes_and_probes_a_whole_service() {
+        let d = tempfile::tempdir().unwrap();
+        let k = FileKeychain::new(d.path().join("kc"));
+        assert!(
+            matches!(k.service_has_items("s"), Read::Present(false)),
+            "no directory"
+        );
+        assert_eq!(k.delete_service("s").unwrap(), 0);
+        for (svc, acct) in [("s", "a"), ("s", "a.prev"), ("s", "b"), ("st", "a")] {
+            k.upsert(svc, acct, b"v").unwrap();
+        }
+        assert!(matches!(k.service_has_items("s"), Read::Present(true)));
+        std::fs::write(d.path().join("kc/LOCKED"), "").unwrap();
+        assert!(
+            matches!(k.service_has_items("s"), Read::Present(true)),
+            "L342"
+        );
+        assert_eq!(k.delete_service("s").unwrap_err().rc, Some(36));
+        std::fs::remove_file(d.path().join("kc/LOCKED")).unwrap();
+        assert_eq!(k.delete_service("s").unwrap(), 3);
+        assert!(matches!(k.service_has_items("s"), Read::Present(false)));
+        assert!(
+            k.exists("st", "a").is_present(),
+            "a service whose name starts like it is another service"
+        );
     }
 }
