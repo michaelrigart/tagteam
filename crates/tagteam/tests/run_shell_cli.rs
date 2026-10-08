@@ -51,6 +51,7 @@ const COMMANDS: &[&[&str]] = &[
         "--yes",
     ],
     &["completions", "bash"],
+    &["purge", "--yes"],
 ];
 
 /// `id`'s profile directory under the fixture's `sessions/`.

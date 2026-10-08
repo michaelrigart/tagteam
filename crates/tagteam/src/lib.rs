@@ -13,6 +13,7 @@ mod history;
 mod logfile;
 mod logging;
 pub mod prompt;
+mod purge_cmd;
 mod render;
 mod root_guard;
 mod run;

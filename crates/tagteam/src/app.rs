@@ -15,6 +15,7 @@ use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::net::UreqHttp;
 use tagteam_engine::oracle::{CachingOracle, HttpOracle};
+use tagteam_engine::purge::{KEYCHAIN_ORPHANS_WITH_PROVIDER, PurgePlan};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::run::{RunPlan, RunRequest};
 use tagteam_engine::session::detect_run_shell;
@@ -38,7 +39,8 @@ use crate::cli::{AutoStrategyArg, Cli, Command, ConfigAction, ShellArg, Strategy
 use crate::prompt::Prompter;
 use crate::shell_init::Wrapped;
 use crate::{
-    auto, config_cmd, displaced_cmd, history, prompt, render, root_guard, shell_init, statusline,
+    auto, config_cmd, displaced_cmd, history, prompt, purge_cmd, render, root_guard, shell_init,
+    statusline,
 };
 
 /// §13.1.
@@ -89,6 +91,8 @@ const NOTHING_TO_SWITCH: &str =
     "auto-switch needs two switchable accounts on a provider; add another with `tagteam add`";
 const BAD_THRESHOLD: &str = "--threshold takes a number from 50 to 99.9";
 const BAD_INCLUDE: &str = "--include-api-key-accounts takes true, false, 1, 0, yes or no";
+const PURGE_DATA_NEEDS_YES: &str =
+    "purge deletes tagteam's data for good; run it on a terminal to confirm, or pass --yes";
 
 const NO_COLOR: &str = "NO_COLOR";
 const FORCE_COLOR: &str = "FORCE_COLOR";
@@ -718,6 +722,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Run { .. } => "run",
         Command::Config { .. } => "config",
         Command::Displaced { .. } => "displaced",
+        Command::Purge { .. } => "purge",
         Command::Completions { .. } => "completions",
     }
 }
@@ -960,6 +965,18 @@ impl App<'_, '_> {
     /// by another process meanwhile is covered too: the tri-state reads refuse on their own.
     /// `switch`'s offer to add an unmanaged login checks before adding (`switch`).
     fn lock_check(&mut self, command: &Command) -> Result<(), Failure> {
+        // §10.5: a usage error, then the run shell's refusal, come before the Keychain is asked.
+        if let Command::Purge {
+            keychain_orphans, ..
+        } = command
+        {
+            if *keychain_orphans && self.provider_flag.is_some() {
+                return Err(Failure::Usage(KEYCHAIN_ORPHANS_WITH_PROVIDER.into()));
+            }
+            if matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
+                return Err(EngineError::InsideRunShell.into());
+            }
+        }
         if command.touches_keychain_only_with_a_store() && self.engine.existing_store()?.is_none() {
             return Ok(());
         }
@@ -1188,6 +1205,10 @@ impl App<'_, '_> {
             Command::Run { .. } => unreachable!("run_command answers run before dispatch"),
             Command::Config { action } => self.config(action)?,
             Command::Displaced { purge, yes } => self.displaced(purge, yes)?,
+            Command::Purge {
+                yes,
+                keychain_orphans,
+            } => return self.purge(yes, keychain_orphans),
             Command::Completions { .. } => unreachable!("run answers completions before dispatch"),
             Command::Auto {
                 once,
@@ -1318,6 +1339,52 @@ impl App<'_, '_> {
             auto::run_loop(engine, &run, &sink, &ThreadSleeper, &mut uniform_jitter)
         };
         ended.map_err(|e| auto_failure(e, &names))
+    }
+
+    /// §10.5: the plan, its summary and a person's yes (or `--yes`), then the purge. The
+    /// question comes before any lock is taken, so none is held while the user reads. Without a
+    /// terminal, and under `--json`, `--yes` is required. `run_command` has run the usage check,
+    /// the run shell's refusal and the Keychain check. `--keychain-orphans` reaches only a
+    /// Keychain: on Linux, whose `vault/` a full purge deletes anyway, it asks for nothing more.
+    /// Exits 1 if anything could not be deleted, after reporting what was.
+    fn purge(&mut self, yes: bool, keychain_orphans: bool) -> Result<i32, Failure> {
+        let plan = PurgePlan {
+            keychain_orphans: keychain_orphans && self.keychain.is_some(),
+            ..self.engine.purge_plan(self.provider_flag.as_ref())?
+        };
+        if !yes {
+            if !self.can_prompt() {
+                return Err(Failure::Message(
+                    KIND_NEEDS_CONFIRMATION,
+                    PURGE_DATA_NEEDS_YES.into(),
+                ));
+            }
+            let _ = write!(self.io.err, "{}", purge_cmd::summary(&plan));
+            let go = self.io.prompter.confirm(purge_cmd::QUESTION, false);
+            self.after_prompt()?;
+            if !go {
+                return Err(cancelled());
+            }
+        }
+        let report = self.engine.purge(&plan)?;
+        for w in &report.warnings {
+            let _ = writeln!(self.io.err, "warning: {w}");
+        }
+        if !self.json {
+            for (what, message) in &report.failures {
+                let _ = writeln!(self.io.err, "tagteam: could not delete {what}: {message}");
+            }
+        }
+        let provider = plan.provider.as_ref().map(ProviderId::as_str);
+        self.print(
+            &purge_cmd::human(&report, plan.store_and_log),
+            purge_cmd::json(&report, provider),
+        );
+        Ok(if report.failures.is_empty() {
+            0
+        } else {
+            EXIT_ERROR
+        })
     }
 
     /// §10.2's token source: `-` reads one line from stdin; none prompts without echo, and
@@ -2008,6 +2075,7 @@ mod tests {
             &["config", "list"],
             &["displaced"],
             &["completions", "bash"],
+            &["purge", "--yes"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))

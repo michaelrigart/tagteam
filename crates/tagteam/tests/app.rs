@@ -1382,3 +1382,126 @@ fn a_repeated_id_counts_once_in_the_question_and_is_deleted_once() {
     assert_eq!(yes.asked, [DELETE_ONE]);
     assert!(!file.exists());
 }
+
+/// §10.5's question, after its summary.
+const PURGE_QUESTION: &str = "Delete all of this?";
+
+/// What `with_login_and_key`'s full purge summary says before the question.
+const PURGE_SUMMARY: &str = "This deletes, for good:\n  #1  a@x.co\n  #2  api-key-2@token.local\n  the store and the log\nIt never deletes or changes a live login.\n";
+
+/// The accounts `list --json` shows, by email.
+fn stored_emails(h: &H) -> Vec<String> {
+    h.json(&["list", "--json"])["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["email"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn purge_asks_on_a_terminal_and_only_a_yes_deletes() {
+    // §10.5 step 2: the summary and the question, default no, before anything is locked.
+    let h = H::with_login_and_key();
+    let mut no = Scripted::answering(&[""]);
+    let (code, out, err) = h.run(&["purge"], &mut no);
+    assert_eq!(
+        (code, out.as_str(), err),
+        (1, "", format!("{PURGE_SUMMARY}tagteam: cancelled\n"))
+    );
+    assert_eq!(no.asked, [PURGE_QUESTION]);
+    assert_eq!(stored_emails(&h), ["a@x.co", "api-key-2@token.local"]);
+
+    let mut yes = Scripted::answering(&["y"]);
+    let (code, out, err) = h.run(&["purge"], &mut yes);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(err, PURGE_SUMMARY);
+    assert_eq!(
+        out,
+        "Purged a@x.co (position 1).\nPurged api-key-2@token.local (position 2).\nEmptied the store and deleted the log.\n"
+    );
+    assert!(stored_emails(&h).is_empty());
+}
+
+#[test]
+fn purge_without_a_terminal_or_under_json_needs_yes() {
+    let h = H::with_login_and_key();
+    let (code, out, err) = h.run(&["purge"], &mut Scripted::none());
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            1,
+            "",
+            "tagteam: purge deletes tagteam's data for good; run it on a terminal to confirm, or pass --yes\n"
+        )
+    );
+    // Even a person at a terminal is not asked under --json.
+    let mut nobody_asked = Scripted::answering(&[]);
+    let (code, out, _) = h.run(&["purge", "--json"], &mut nobody_asked);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (code, v["error"]["type"].as_str()),
+        (1, Some("needs-confirmation"))
+    );
+    assert!(nobody_asked.asked.is_empty());
+    assert_eq!(stored_emails(&h).len(), 2);
+    h.ok(&["purge", "--yes"]);
+    assert!(stored_emails(&h).is_empty());
+}
+
+#[test]
+fn a_signal_at_the_purge_question_deletes_nothing() {
+    // §14.1, Decision 5: a prompt is a cancellation point, whatever it answered.
+    let h = H::with_login_and_key();
+    let cancel = Cancel::new();
+    let mut ctrl_c = Scripted::interrupted_by(&cancel, libc::SIGINT, &["y"]);
+    let (code, out, err) = h.run_with_cancel(&["purge"], &mut ctrl_c, &cancel);
+    assert_eq!(
+        (code, out.as_str(), err),
+        (130, "", format!("{PURGE_SUMMARY}{INTERRUPTED}"))
+    );
+    assert_eq!(stored_emails(&h).len(), 2);
+}
+
+#[test]
+fn purge_checks_a_locked_keychain_before_the_question() {
+    // §10.5 step 1, Appendix A.3: a person may unlock it; declining fails before the summary.
+    let h = H::with_login_and_key();
+    h.kc.set_locked(true);
+    let mut no_unlock = Scripted::answering(&["n"]);
+    let (code, out, err) = h.run(&["purge"], &mut no_unlock);
+    assert_eq!(
+        (code, out.as_str(), err),
+        (1, "", format!("tagteam: {LOCKED}\n"))
+    );
+    assert_eq!(no_unlock.asked, [UNLOCK]);
+    h.kc.set_locked(false);
+    assert_eq!(stored_emails(&h).len(), 2);
+}
+
+#[test]
+fn keychain_orphans_is_named_in_the_summary_only_where_there_is_a_keychain() {
+    // §10.5: it deletes `tagteam` Keychain items; Linux keeps its vault in `vault/`.
+    let h = H::new();
+    let summary = |keychain: &str| {
+        format!(
+            "This deletes, for good:\n  no account\n  the store and the log\n{keychain}It never deletes or changes a live login.\ntagteam: cancelled\n"
+        )
+    };
+    let mut no = Scripted::answering(&["n"]);
+    let (code, _, err) = h.run(&["purge", "--keychain-orphans"], &mut no);
+    assert_eq!(
+        (code, err),
+        (
+            1,
+            summary(
+                "  every `tagteam` Keychain item no account names, for every tagteam data directory on this Mac\n"
+            )
+        )
+    );
+    let mut no = Scripted::answering(&["n"]);
+    let (code, _, err) = h.run_in(&["purge", "--keychain-orphans"], &mut no, |c| {
+        c.platform = Platform::Linux
+    });
+    assert_eq!((code, err), (1, summary("")));
+}

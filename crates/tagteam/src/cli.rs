@@ -217,6 +217,20 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Delete tagteam's data: every account (or only --provider's), never a live login
+    ///
+    /// Asks first on a terminal; elsewhere, and with --json, it needs --yes. --json prints
+    /// {schemaVersion, ok, provider, accounts: [{number, id, email}], displaced, rescues,
+    /// storeEmptied, failures: [{what, message}]}. Exits 1 if anything could not be deleted.
+    Purge {
+        /// Delete without asking
+        #[arg(long)]
+        yes: bool,
+        /// Also delete every `tagteam` Keychain item no account names, for every tagteam data
+        /// directory on this Mac (not with --provider)
+        #[arg(long = "keychain-orphans")]
+        keychain_orphans: bool,
+    },
     /// Print a completion script for bash, zsh or fish
     Completions { shell: CompletionShell },
 }
@@ -259,6 +273,8 @@ impl Command {
     /// accounts' items, and a real one switches.
     /// `run` checks for itself, and only once it knows it launches a session: plain `claude`
     /// touches no item, so an unmapped directory never waits on an unlock prompt (§12.7).
+    /// `purge` deletes its accounts' vault items, and with `--keychain-orphans` every `tagteam`
+    /// item, so it checks too, after its run shell's refusal (§10.5).
     pub fn touches_keychain(&self) -> bool {
         matches!(
             self,
@@ -267,6 +283,7 @@ impl Command {
                 | Command::Switch { .. }
                 | Command::Remove { .. }
                 | Command::Auto { .. }
+                | Command::Purge { .. }
         )
     }
 
