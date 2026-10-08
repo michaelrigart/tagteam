@@ -294,3 +294,58 @@ fn an_account_that_cannot_be_deleted_keeps_the_store_and_the_next_purge_finishes
         Read::Present(false)
     ));
 }
+
+#[test]
+fn a_purge_that_deleted_nothing_in_words_does_not_say_there_was_nothing() {
+    // §10.5: it reports what it could not delete; the failures are all it prints.
+    let d = tempfile::tempdir().unwrap();
+    two_fresh_accounts(d.path());
+    let items = d.path().join("keychain");
+    fs::set_permissions(&items, fs::Permissions::from_mode(0o500)).unwrap();
+    let out = purge(d.path(), &["--yes"]);
+    fs::set_permissions(&items, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("tagteam: could not delete claude-code #1 (a@x.co): "),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn keychain_orphans_with_a_provider_in_words_names_the_conflict() {
+    let d = tempfile::tempdir().unwrap();
+    two_fresh_accounts(d.path());
+    let out = purge(
+        d.path(),
+        &["--provider", "claude-code", "--keychain-orphans", "--yes"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("--keychain-orphans"), "{stderr}");
+    assert!(stderr.contains("--provider"), "{stderr}");
+}
+
+#[test]
+fn the_usage_error_comes_before_the_run_shell_refusal() {
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_fresh_accounts(d.path());
+    let (_, shell) = cc_profile(d.path(), &a);
+    let out = cmd(d.path())
+        .env("CLAUDE_CONFIG_DIR", &shell)
+        .args([
+            "purge",
+            "--provider",
+            "claude-code",
+            "--keychain-orphans",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json_of(&out)["error"]["type"], "usage");
+    assert!(keychain(d.path()).find(SERVICE, &a).is_present());
+}

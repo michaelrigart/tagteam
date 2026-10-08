@@ -94,7 +94,7 @@ pub(crate) fn human(report: &PurgeReport, full: bool) -> String {
     if full && report.store_emptied {
         out.push_str("Emptied the store and deleted the log.\n");
     }
-    if out.is_empty() {
+    if out.is_empty() && report.failures.is_empty() {
         out.push_str("There was nothing to purge.\n");
     }
     out
@@ -233,6 +233,12 @@ mod tests {
             human(&PurgeReport::default(), false),
             "There was nothing to purge.\n"
         );
+        // Failures are reported apart, so a purge that deleted nothing does not say it had none.
+        let failed = PurgeReport {
+            failures: vec![("the vault".into(), "locked".into())],
+            ..PurgeReport::default()
+        };
+        assert_eq!(human(&failed, false), "");
     }
 
     #[test]
