@@ -658,6 +658,12 @@ impl Provider for FakeAgent {
             .map(PathBuf::from)
     }
 
+    /// FakeAgent names a profile's item (when it keeps one) from its one home variable, so the
+    /// live login's is named from the same string `profile_spelling` gives that home.
+    fn live_item_spelling(&self, env: &Env) -> Option<String> {
+        self.session_dir(env).map(|dir| self.profile_spelling(&dir))
+    }
+
     /// `{"FAKEAGENT_HOME": <string>|null}`: one variable, unlike Claude Code's two.
     fn outer_home(&self, env: &Env) -> Value {
         let home = env

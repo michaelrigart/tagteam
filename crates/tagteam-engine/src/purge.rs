@@ -655,12 +655,19 @@ impl Engine {
                 self.items_by_path(profile, providers, &mut items)
             }
         }
+        // Neither the live login's item nor a stored account's is this entry's to delete: an
+        // orphan can be a link to an account's profile, or to the live config directory.
+        let stored = self.stored_spellings()?;
         for (p, spelling) in &items {
-            if p.session_dir(&self.env)
-                .is_some_and(|live| p.profile_spelling(&live) == *spelling)
-            {
+            if p.live_item_spelling(&self.env).as_deref() == Some(spelling.as_str()) {
+                let var = p.session_dir_var().unwrap_or("the home variable");
+                return Err(EngineError::Io(io::Error::other(format!(
+                    "the Keychain item it names is the live login's, since the environment ({var}, or the provider's override of it) names the same directory; it was left as it is, and so was the profile (a purge never deletes the live login)"
+                ))));
+            }
+            if stored.contains(spelling) {
                 return Err(EngineError::Io(io::Error::other(
-                    "the Keychain item it names is the live login's, since CLAUDE_CONFIG_DIR names the same directory; it was left as it is, and so was the profile (a purge never deletes the live login)",
+                    "the Keychain item it names belongs to a stored account, since this entry leads to that account's profile; it was left as it is, and so was the entry",
                 )));
             }
         }
@@ -683,6 +690,30 @@ impl Engine {
             Some(store) => store.account(id)?.is_some(),
             None => false,
         })
+    }
+
+    /// The spellings that name a stored account's profile item: the one its marker records,
+    /// and the canonical path of its profile as each registered provider with sessions spells
+    /// it.
+    fn stored_spellings(&self) -> Result<BTreeSet<String>, EngineError> {
+        let mut spellings = BTreeSet::new();
+        let Some(store) = self.existing_store()? else {
+            return Ok(spellings);
+        };
+        for row in store.all_accounts()? {
+            let profile = profile_path(&self.env, &row.id);
+            if let Read::Present(marker) = ProfileMarker::read(&profile) {
+                spellings.insert(marker.config_dir);
+            }
+            if let Ok(canonical) = canonical_profile_path(&profile) {
+                for p in self.registry.all() {
+                    if p.capabilities().sessions {
+                        spellings.insert(p.profile_spelling(&canonical));
+                    }
+                }
+            }
+        }
+        Ok(spellings)
     }
 
     /// The items an orphan with no usable marker is given: each judging provider's, named from

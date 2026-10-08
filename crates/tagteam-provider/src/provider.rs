@@ -664,6 +664,14 @@ pub trait Provider: Send + Sync {
     fn session_dir_var(&self) -> Option<&'static str>;
     /// The directory `env` points this provider at, if set and non-empty.
     fn session_dir(&self, env: &Env) -> Option<PathBuf>;
+    /// The spelling the live login's Keychain item name is derived from in `env` (§12.2), when
+    /// that name is derived from one: the string `profile_spelling` gives a profile whose item
+    /// it would be. Purge compares it with an orphaned profile's, so it never deletes the live
+    /// item (§10.5). `None` (the default) for a provider whose live item is named by no
+    /// spelling, or one that keeps no Keychain items for profiles.
+    fn live_item_spelling(&self, _env: &Env) -> Option<String> {
+        None
+    }
     /// §12.2: the record of the home `env` resolves to, stored as the marker's `outer`.
     fn outer_home(&self, env: &Env) -> Value;
     /// §12.8: `env` with this provider's home variables restored from `outer`. A record that

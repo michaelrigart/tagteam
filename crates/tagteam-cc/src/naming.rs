@@ -13,7 +13,7 @@ pub enum ItemKind {
 
 /// The directory string whose hash suffixes the item, or `None` for the default items
 /// (Appendix A.2: `useDefault`).
-fn suffix_source(env: &Env) -> Option<String> {
+pub(crate) fn suffix_source(env: &Env) -> Option<String> {
     match &env.claude_securestorage_config_dir {
         Some(v) if v.is_empty() => None,
         Some(v) => Some(nfc(v)),
@@ -128,6 +128,36 @@ mod tests {
         for name in names {
             assert_eq!(name.as_deref(), Some(expected.as_str()));
         }
+    }
+
+    #[test]
+    fn the_live_item_spelling_is_what_its_name_hashes() {
+        // Appendix A.2, through the `Provider` method purge compares an orphan's spelling with.
+        use tagteam_provider::Provider;
+
+        let cc = crate::ClaudeCode::new(
+            std::sync::Arc::new(tagteam_provider::FakeKeychain::new()),
+            crate::live::Platform::MacOs,
+        );
+        let mut e = env();
+        assert_eq!(cc.live_item_spelling(&e), None, "the default items");
+        e.claude_config_dir = Some("/cfg/e\u{301}".into());
+        assert_eq!(
+            cc.live_item_spelling(&e).as_deref(),
+            Some("/cfg/\u{e9}"),
+            "NFC"
+        );
+        e.claude_securestorage_config_dir = Some("/secure".into());
+        assert_eq!(
+            cc.live_item_spelling(&e).as_deref(),
+            Some("/secure"),
+            "first"
+        );
+        e.claude_securestorage_config_dir = Some("".into());
+        assert_eq!(cc.live_item_spelling(&e), None, "empty counts as unset");
+        e.claude_securestorage_config_dir = None;
+        e.claude_config_dir = Some("".into());
+        assert_eq!(cc.live_item_spelling(&e), None);
     }
 
     #[test]

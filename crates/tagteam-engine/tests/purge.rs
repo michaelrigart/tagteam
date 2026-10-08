@@ -1386,3 +1386,67 @@ fn on_linux_a_purge_that_leaves_an_account_keeps_the_vault_directory() {
     assert!(vault.exists(), "kept with the account that needs it");
     assert!(report.failures.iter().any(|(w, _)| w == "the store"));
 }
+
+#[test]
+fn a_link_to_an_account_s_profile_never_deletes_the_account_s_item() {
+    // Fix round 2, M3: `sessions/x -> sessions/<a>` reads `a`'s marker through the link, and
+    // its canonical path is `a`'s own profile. Its item is `a`'s, so with `a` left by step 7
+    // the orphan is skipped whole.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let (original, item) = profile_with_item(&fx, &a);
+    let link = fx.env.data_dir().join("sessions/x");
+    std::os::unix::fs::symlink(&original, &link).unwrap();
+    let plan = full_plan(&fx);
+    assert_eq!(plan.orphan_profiles, [link.clone()]);
+    fx.kc.set_fail_delete(SERVICE, true);
+    let report = fx.engine.purge(&plan).unwrap();
+    fx.kc.set_fail_delete(SERVICE, false);
+    assert!(report.accounts.is_empty(), "{report:?}");
+    assert!(fx.kc.get(&item.0, &item.1).is_some(), "a's item survives");
+    assert!(original.exists());
+    assert!(
+        fs::symlink_metadata(&link).is_ok(),
+        "the orphan is skipped whole"
+    );
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|(w, m)| w == &link.display().to_string() && m.contains("stored account")),
+        "{:?}",
+        report.failures
+    );
+}
+
+#[test]
+fn an_orphan_named_by_the_secure_storage_override_never_deletes_the_live_login() {
+    // Fix round 2, M4: `CLAUDE_SECURESTORAGE_CONFIG_DIR` names the live items before
+    // `CLAUDE_CONFIG_DIR` does (Appendix A.2), so an orphan at that spelling holds the live item.
+    let fx = Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
+        let root = e.home.parent().unwrap().to_path_buf();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let orphan = canonical_root
+            .join(e.data_dir().strip_prefix(&root).unwrap())
+            .join("sessions/secure");
+        e.claude_securestorage_config_dir = Some(orphan.into_os_string());
+    });
+    let orphan = fx.env.data_dir().join("sessions/secure");
+    fs::create_dir_all(&orphan).unwrap();
+    let live_item = fx.live_item(tagteam_cc::ItemKind::OAuth);
+    fx.kc.put(&live_item.0, &live_item.1, b"the live login");
+    let plan = full_plan(&fx);
+    assert_eq!(plan.orphan_profiles, [orphan.clone()]);
+    let report = fx.engine.purge(&plan).unwrap();
+    assert_eq!(
+        fx.kc.get(&live_item.0, &live_item.1).as_deref(),
+        Some(&b"the live login"[..])
+    );
+    assert!(orphan.exists(), "skipped whole");
+    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
+    let message = &report.failures[0].1;
+    assert!(
+        message.contains("live login") && message.contains("CLAUDE_CONFIG_DIR"),
+        "names the provider's own variable: {message}"
+    );
+}

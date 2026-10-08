@@ -545,6 +545,12 @@ impl Provider for ClaudeCode {
             .map(PathBuf::from)
     }
 
+    /// Appendix A.2: the live items are named from `CLAUDE_SECURESTORAGE_CONFIG_DIR` when it is
+    /// set, else from `CLAUDE_CONFIG_DIR`, NFC-normalised, an empty value counting as unset.
+    fn live_item_spelling(&self, env: &Env) -> Option<String> {
+        crate::naming::suffix_source(env)
+    }
+
     fn outer_home(&self, env: &Env) -> Value {
         session::outer_home(env)
     }
