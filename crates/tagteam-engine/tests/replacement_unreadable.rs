@@ -118,3 +118,34 @@ fn a_replacement_that_never_landed_rolls_back_without_its_metadata() {
         assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
     }
 }
+
+#[test]
+fn a_session_owned_account_with_an_unreadable_replacement_still_refuses_remove() {
+    // The session-owned check runs before `remove_locked` reconciles, so the refusal is the
+    // session's, and nothing is deleted or changed.
+    for meta in UNREADABLE {
+        let (fx, a) = landed_unreadable(meta);
+        let profile = fx.make_profile(&a);
+        let _reservation = fx.hold_reservation(&profile);
+        let err = fx.engine.remove(&a).expect_err("refused");
+        assert_eq!(err.kind(), "session-owned", "{meta}: {err}");
+        let row = fx.engine.store().unwrap().account(&a).unwrap().unwrap();
+        assert!(row.replacing_fp.is_some(), "{meta}");
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a9"));
+        assert!(profile.exists(), "{meta}");
+        let events = fx.engine.store().unwrap().events().unwrap();
+        assert!(events.iter().all(|e| e.kind != "remove"), "{meta}");
+    }
+}
+
+#[test]
+fn remove_records_its_event_after_leaving_an_unreadable_replacement_as_it_was() {
+    for meta in UNREADABLE {
+        let (fx, a) = landed_unreadable(meta);
+        fx.engine.remove(&a).unwrap();
+        let events = fx.engine.store().unwrap().events().unwrap();
+        let removes: Vec<_> = events.iter().filter(|e| e.kind == "remove").collect();
+        assert_eq!(removes.len(), 1, "{meta}: {events:?}");
+        assert_eq!(removes[0].from_id.as_ref(), Some(&a), "{meta}");
+    }
+}
