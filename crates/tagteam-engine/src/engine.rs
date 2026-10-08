@@ -14,7 +14,7 @@ use crate::hooks;
 use crate::oracle::Oracle;
 use crate::registry::ProviderRegistry;
 use crate::settings::Settings;
-use crate::store::{Store, StoreError};
+use crate::store::{JournalRow, Store, StoreError};
 use crate::vault::Vault;
 
 /// How a holder of an account lock treats a pending replacement it cannot install (§12.5).
@@ -316,8 +316,21 @@ impl Engine {
         source: &'static str,
         timeout: Duration,
     ) -> Result<(MutationGuard, Vec<(ProviderId, EngineError)>), EngineError> {
-        let hints: Vec<_> = self
-            .dead_journals()?
+        self.guard_recovering_from(ask_oracle, source, timeout, Self::dead_journals)
+    }
+
+    /// `guard_recovering` over the rows `journals` gives, read before the lock and again under
+    /// it. `purge_guard` passes `dead_decodable_journals`, so a row that does not decode is
+    /// left for it to delete (§10.5 step 5) rather than ending it; every other caller reads
+    /// them all, strictly.
+    fn guard_recovering_from(
+        &self,
+        ask_oracle: bool,
+        source: &'static str,
+        timeout: Duration,
+        journals: fn(&Self) -> Result<Vec<JournalRow>, EngineError>,
+    ) -> Result<(MutationGuard, Vec<(ProviderId, EngineError)>), EngineError> {
+        let hints: Vec<_> = journals(self)?
             .into_iter()
             .map(|row| {
                 let hint = if ask_oracle {
@@ -333,7 +346,7 @@ impl Engine {
         // Enumerated again under the lock: a switch may have died while this command waited,
         // and its row is recovered now too, without a hint.
         let mut blocked = Vec::new();
-        for row in self.dead_journals()? {
+        for row in journals(self)? {
             let hint = hints
                 .iter()
                 .find(|(r, _)| *r == row)
@@ -368,6 +381,56 @@ impl Engine {
             }
         }
         Ok((guard, blocked))
+    }
+
+    /// §10.5 steps 4 and 5 (Decision 7): `MutationGuard`, under which every interrupted switch
+    /// whose holder died is recovered as usual (§9.6). A journal row of an affected provider
+    /// that is still there afterwards (undecidable, blocked, or unreadable) is deleted, with a
+    /// warning that the live login may be incoherent, and the live login is left as it is: purge
+    /// is the way out of a state tagteam cannot repair, so it never refuses on one. Returns the
+    /// guard and the warnings.
+    pub(crate) fn purge_guard(
+        &self,
+        providers: &[ProviderId],
+    ) -> Result<(MutationGuard, Vec<String>), EngineError> {
+        let (guard, _blocked) = self.guard_recovering_from(
+            true,
+            "cli",
+            MutationGuard::TIMEOUT,
+            Self::dead_decodable_journals,
+        )?;
+        let mut warnings = Vec::new();
+        if let Some(store) = self.existing_store()? {
+            for provider in providers {
+                if matches!(store.journal(provider), Ok(None)) {
+                    continue;
+                }
+                store.delete_journal(provider)?;
+                tracing::warn!(
+                    provider = self.loggable(provider),
+                    "purge deleted an interrupted switch's record that recovery could not settle"
+                );
+                warnings.push(format!(
+                    "an interrupted switch for {provider} could not be recovered, so its record was deleted; the live login may be incoherent (its credential and its identity may name different accounts), and it is left as it is"
+                ));
+            }
+        }
+        Ok((guard, warnings))
+    }
+
+    /// `dead_journals` for `purge_guard`: each row decoded on its own, and one that does not
+    /// decode left out of recovery. It is one recovery cannot decide, so `purge_guard` deletes
+    /// it with the rest (§10.5 step 5, Decision 7).
+    fn dead_decodable_journals(&self) -> Result<Vec<JournalRow>, EngineError> {
+        let Some(store) = self.existing_store()? else {
+            return Ok(vec![]);
+        };
+        Ok(store
+            .journals_each()?
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|j| !j.holder.is_live())
+            .collect())
     }
 
     /// Takes the account lock, then reconciles a pending explicit replacement (§12.5): the

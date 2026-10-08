@@ -66,8 +66,15 @@ fn parse(path: &Path, bytes: &[u8], id: &AccountId) -> Result<RescueEntry, Strin
     })
 }
 
+/// §6.3: a `rescue` path that is not a directory, or cannot be listed, so every account's
+/// rescues are unknown.
+pub(crate) struct RescueUnlisted {
+    pub path: PathBuf,
+    pub detail: String,
+}
+
 impl Engine {
-    fn rescue_dir(&self) -> PathBuf {
+    pub(crate) fn rescue_dir(&self) -> PathBuf {
         self.env.data_dir().join("rescue")
     }
 
@@ -113,18 +120,19 @@ impl Engine {
         Ok(path)
     }
 
-    /// Every rescue file for `id` (named `<id>-…json`), in name order. Never creates
-    /// `rescue/`. A directory that cannot be listed is itself unreadable: it may hide one.
-    pub(crate) fn rescues_for(&self, id: &AccountId) -> Vec<RescueFile> {
+    /// The paths of `id`'s rescue files (named `<id>-…json`), readable or not, in name order.
+    /// Never creates `rescue/`. A `rescue` path that cannot be listed is `Err`: it may hide any
+    /// account's.
+    pub(crate) fn rescue_paths_for(&self, id: &AccountId) -> Result<Vec<PathBuf>, RescueUnlisted> {
         let dir = self.rescue_dir();
         let listing = match fs::read_dir(&dir) {
             Ok(l) => l,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return vec![],
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => {
-                return vec![RescueFile::Unreadable {
+                return Err(RescueUnlisted {
                     path: dir,
                     detail: e.to_string(),
-                }];
+                });
             }
         };
         let prefix = format!("{id}-");
@@ -137,6 +145,18 @@ impl Engine {
             })
             .collect();
         paths.sort();
+        Ok(paths)
+    }
+
+    /// Every rescue file for `id` (named `<id>-…json`), in name order. Never creates
+    /// `rescue/`. A directory that cannot be listed is itself unreadable: it may hide one.
+    pub(crate) fn rescues_for(&self, id: &AccountId) -> Vec<RescueFile> {
+        let paths = match self.rescue_paths_for(id) {
+            Ok(paths) => paths,
+            Err(RescueUnlisted { path, detail }) => {
+                return vec![RescueFile::Unreadable { path, detail }];
+            }
+        };
         paths
             .into_iter()
             .map(|path| match fs::read(&path) {

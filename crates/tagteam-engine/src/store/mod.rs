@@ -70,6 +70,10 @@ pub enum StoreError {
     /// quotes it.
     #[error("the pending replacement's recorded login cannot be read: {0}")]
     ReplacementUnreadable(String),
+    /// §10.5, Decision 8: the emptied store's WAL could not be truncated, because another
+    /// connection is still reading it; deleted rows may survive in the WAL until it is.
+    #[error("the store's write-ahead log could not be truncated while another process reads it")]
+    WalBusy,
     #[error("an alias cannot be empty")]
     InvalidAlias,
 }
@@ -382,8 +386,13 @@ fn event_from_row(r: &Row<'_>) -> rusqlite::Result<EventRow> {
 /// accounts by ID only. `detail` is never logged: it is free-form JSON, and nothing bounds what
 /// a later kind puts in it.
 fn log_event(e: &EventRow) {
+    log_event_as(e, e.provider.as_str());
+}
+
+/// `log_event` with `provider` in place of the row's own ID.
+fn log_event_as(e: &EventRow, provider: &str) {
     tracing::info!(
-        provider = %e.provider,
+        provider,
         kind = e.kind.as_str(),
         from_account = e.from_id.as_ref().map(tracing::field::display),
         to_account = e.to_id.as_ref().map(tracing::field::display),
@@ -1251,6 +1260,15 @@ impl Store {
         Ok(())
     }
 
+    /// `insert_event` for an event of a provider this build does not register (a purge's
+    /// `remove` of its account): the line names the provider as `unregistered`, since its ID is
+    /// a string tagteam did not choose (§14.2).
+    pub fn insert_event_unregistered(&self, e: &EventRow) -> Result<(), StoreError> {
+        Self::insert_event_on(&self.lock(), e)?;
+        log_event_as(e, "unregistered");
+        Ok(())
+    }
+
     pub fn events(&self) -> Result<Vec<EventRow>, StoreError> {
         let c = self.lock();
         let mut stmt = c.prepare("SELECT * FROM events ORDER BY rowid")?;
@@ -1427,5 +1445,74 @@ impl Store {
     /// Deletes the displaced row `id`; `true` when there was one.
     pub fn delete_displaced(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self.exec("DELETE FROM displaced WHERE id = ?1", &[&id])? > 0)
+    }
+
+    /// Every journal row, each decoded on its own: a row that does not decode is an `Err` in
+    /// its place rather than an error for the whole read. Only `purge` reads them so (§10.5
+    /// step 5): it deletes such a row as one recovery cannot decide. Every other reader takes
+    /// `journals`, which refuses one.
+    pub fn journals_each(&self) -> Result<Vec<Result<JournalRow, StoreError>>, StoreError> {
+        let c = self.lock();
+        let mut stmt = c.prepare("SELECT * FROM switch_journal ORDER BY provider")?;
+        let rows = stmt
+            .query_map([], |r| Ok(journal_from_row(r).map_err(StoreError::from)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// §10.5 with `--provider P`, once its accounts are gone: P's events, auto-switch state,
+    /// active account, live identity cache and switch journal, in one transaction. Its
+    /// `usage_requests` rows stay, so the hourly budget does not reset (§8.6), and its displaced
+    /// entries go through the displaced purge, each file before its row (§6.3).
+    pub fn delete_provider_rows(&self, provider: &ProviderId) -> Result<(), StoreError> {
+        let mut c = self.lock();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for table in [
+            "events",
+            "autoswitch_state",
+            "active_accounts",
+            "live_identity_cache",
+            "switch_journal",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE provider = ?1"),
+                [provider.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// §10.5, Decision 8: a full purge empties the store in place. With `secure_delete` on, one
+    /// transaction deletes every row of every table (foreign keys deferred to its commit). A
+    /// `VACUUM` then rebuilds the file, since a row deleted or rewritten earlier, without
+    /// `secure_delete`, leaves its bytes in the free space of a page still in use. A `TRUNCATE`
+    /// checkpoint last writes the result into the database file and empties the WAL, so no
+    /// deleted row survives in either file. The schema and `user_version` stay, so a process
+    /// that opened the store before goes on with a valid, empty one. `secure_delete` stays on
+    /// for the rest of this connection.
+    pub fn empty_all(&self) -> Result<(), StoreError> {
+        let mut c = self.lock();
+        c.pragma_update(None, "secure_delete", true)?;
+        let tables: Vec<String> = c
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+        for table in &tables {
+            tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
+        }
+        tx.commit()?;
+        // Rows deleted or rewritten before this transaction, without `secure_delete`, leave
+        // their bytes in the free space of pages still in use: only a rebuild clears those.
+        c.execute_batch("VACUUM;")?;
+        let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        if busy != 0 {
+            return Err(StoreError::WalBusy);
+        }
+        Ok(())
     }
 }

@@ -17,6 +17,7 @@ pub mod net;
 pub mod oracle;
 pub mod profiles;
 pub mod provenance;
+pub mod purge;
 pub mod quarantine;
 mod recover;
 pub mod refresh;

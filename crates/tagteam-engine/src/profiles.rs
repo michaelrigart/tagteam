@@ -154,17 +154,62 @@ impl Engine {
         p: &dyn Provider,
         row: &AccountRow,
     ) -> Result<(), EngineError> {
+        let profile = profile_path(&self.env, &row.id);
+        self.refuse_split_at(p, &profile, |m| {
+            m.account_id == row.id && m.provider == row.provider
+        })
+    }
+
+    /// The split check for a profile no known share list judges (§10.5 steps 6 to 8): an
+    /// orphan whose marker cannot be read, and the profile of an account or orphan whose
+    /// provider this build does not register. Every registered provider's must-share entries
+    /// are checked in it, and a real file or directory refuses, naming its path and that
+    /// provider's shared entry in the default home. A link, which deleting the profile removes
+    /// as a link, holds no history to lose.
+    pub(crate) fn refuse_real_copies(&self, profile: &Path) -> Result<(), EngineError> {
+        if !fs::symlink_metadata(profile).is_ok_and(|m| m.is_dir()) {
+            return Ok(());
+        }
+        for p in self.registry.all() {
+            if !p.capabilities().sessions {
+                continue;
+            }
+            let policy = p.share_policy(&self.env);
+            for m in &policy.must_share {
+                if is_private(&policy, m.name) {
+                    continue;
+                }
+                let dst = profile.join(m.name);
+                if matches!(held(&dst)?, Held::Real) {
+                    return Err(EngineError::ProfileSplit {
+                        profile: dst,
+                        shared: policy.source.join(m.name),
+                        cause: SplitCause::RealCopy,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `refuse_profile_split` for the profile directory at `profile`, whoever's it is: purge
+    /// asks it of an orphaned profile, which no account owns, whose readable marker names `p`
+    /// (§10.5 steps 6 and 8). The source home is the one the marker records when `own` trusts
+    /// the marker, otherwise the default home's.
+    pub(crate) fn refuse_split_at(
+        &self,
+        p: &dyn Provider,
+        profile: &Path,
+        own: impl Fn(&ProfileMarker) -> bool,
+    ) -> Result<(), EngineError> {
         if !p.capabilities().sessions {
             return Ok(());
         }
-        let profile = profile_path(&self.env, &row.id);
-        if !fs::symlink_metadata(&profile).is_ok_and(|m| m.is_dir()) {
+        if !fs::symlink_metadata(profile).is_ok_and(|m| m.is_dir()) {
             return Ok(());
         }
-        let outer = match ProfileMarker::read(&profile) {
-            Read::Present(m) if m.account_id == row.id && m.provider == row.provider => {
-                p.apply_outer_home(&self.env, &m.outer).ok()
-            }
+        let outer = match ProfileMarker::read(profile) {
+            Read::Present(m) if own(&m) => p.apply_outer_home(&self.env, &m.outer).ok(),
             Read::Present(_) | Read::Absent | Read::Unreadable(_) => None,
         };
         let policy = p.share_policy(outer.as_ref().unwrap_or(&self.env));

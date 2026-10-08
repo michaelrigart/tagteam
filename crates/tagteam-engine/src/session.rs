@@ -120,7 +120,10 @@ impl Engine {
         p: &dyn Provider,
         row: &AccountRow,
     ) -> Result<SessionState, EngineError> {
-        self.session_state_leaving_out(p, row, None)
+        if !p.capabilities().sessions {
+            return Ok(SessionState::NoProfile);
+        }
+        Ok(self.session_state_leaving_out(p, &profile_path(&self.env, &row.id), None))
     }
 
     /// `session_state`, with `own` left out: this process's own launch reservation, as §12.5
@@ -132,30 +135,36 @@ impl Engine {
         row: &AccountRow,
         own: &Path,
     ) -> Result<SessionState, EngineError> {
-        self.session_state_leaving_out(p, row, Some(own))
-    }
-
-    /// The body of both. The profile is `profile_path(env, id)` (§5). A held reservation
-    /// other than `own`, then a live record, makes the account `Owned`; failing that, anything
-    /// that could not be read makes it `Unreadable`. Every I/O failure is a state, never an
-    /// error. A provider without `sessions` has no profiles, and nothing on disk is touched for
-    /// it.
-    fn session_state_leaving_out(
-        &self,
-        p: &dyn Provider,
-        row: &AccountRow,
-        own: Option<&Path>,
-    ) -> Result<SessionState, EngineError> {
         if !p.capabilities().sessions {
             return Ok(SessionState::NoProfile);
         }
-        let profile = profile_path(&self.env, &row.id);
+        Ok(self.session_state_leaving_out(p, &profile_path(&self.env, &row.id), Some(own)))
+    }
+
+    /// `session_state` for the profile at `profile`, whatever account it belongs to: §10.5
+    /// step 6 asks it of a profile that no store account owns. `p` judges its session records.
+    pub(crate) fn session_state_at(&self, p: &dyn Provider, profile: &Path) -> SessionState {
+        self.session_state_leaving_out(p, profile, None)
+    }
+
+    /// The body of all three, for the profile at `profile` (for an account,
+    /// `profile_path(env, id)`, §5). A held reservation other than `own`, then a live record,
+    /// makes it `Owned`; failing that, anything that could not be read makes it `Unreadable`.
+    /// Every I/O failure is a state, never an error. The callers that take an account check
+    /// first that its provider has `sessions`, so nothing on disk is touched for one without.
+    fn session_state_leaving_out(
+        &self,
+        p: &dyn Provider,
+        profile: &Path,
+        own: Option<&Path>,
+    ) -> SessionState {
+        let profile = profile.to_path_buf();
         match fs::symlink_metadata(&profile) {
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SessionState::NoProfile),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return SessionState::NoProfile,
             Err(e) => {
                 let detail = format!("{}: {e}", profile.display());
-                return Ok(unreadable_state(&profile, detail));
+                return unreadable_state(&profile, detail);
             }
         }
         let is_own = |path: &Path| own.is_some_and(|own| path.file_name() == own.file_name());
@@ -165,11 +174,11 @@ impl Engine {
                     .iter()
                     .any(|(path, probe)| *probe == LockProbe::Held && !is_own(path))
                 {
-                    return Ok(SessionState::Owned { profile });
+                    return SessionState::Owned { profile };
                 }
             }
             Read::Absent => {}
-            Read::Unreadable(e) => return Ok(unreadable_state(&profile, e.to_string())),
+            Read::Unreadable(e) => return unreadable_state(&profile, e.to_string()),
         }
         let mut damaged = None;
         match read_session_records(&p.session_records_dir(&profile)) {
@@ -178,7 +187,7 @@ impl Engine {
                     match entry {
                         RecordEntry::Record(r) => {
                             if record_is_live(self.process.as_ref(), &r, p.launch_command()) {
-                                return Ok(SessionState::Owned { profile });
+                                return SessionState::Owned { profile };
                             }
                         }
                         RecordEntry::Unreadable { path, detail } => {
@@ -188,12 +197,12 @@ impl Engine {
                 }
             }
             Read::Absent => {}
-            Read::Unreadable(e) => return Ok(unreadable_state(&profile, e.to_string())),
+            Read::Unreadable(e) => return unreadable_state(&profile, e.to_string()),
         }
-        Ok(match damaged {
+        match damaged {
             Some(detail) => unreadable_state(&profile, detail),
             None => SessionState::Quiescent { profile },
-        })
+        }
     }
 
     /// §10.3 Guard and §9.2's session-owned target: refuses while `row` is session-owned. The

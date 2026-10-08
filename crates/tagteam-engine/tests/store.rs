@@ -1218,3 +1218,125 @@ fn installing_a_login_never_clears_a_quarantine_behind_its_event() {
     );
     assert!(s.events().unwrap().is_empty());
 }
+
+#[test]
+fn emptying_the_store_keeps_its_schema_and_leaves_no_row() {
+    // §10.5, Decision 8: the store file stays, valid and empty, for whoever opened it.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    s.set_active(&cc(), Some(&a), Some(0)).unwrap();
+    s.insert_journal(&JournalRow {
+        provider: cc(),
+        holder: ProcessStamp { pid: 1, start: 2 },
+        from_id: None,
+        to_id: a.clone(),
+        from_fp: None,
+        from_identity: None,
+        to_fp: "sha256:to".into(),
+        to_epoch: None,
+        started_at: 5,
+        prior: None,
+    })
+    .unwrap();
+    let other = Store::open(&path).unwrap(); // another process's connection, opened before
+    s.empty_all().unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(tables.len() >= 12, "{tables:?}");
+    for table in &tables {
+        let n: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "{table}");
+    }
+    assert_eq!(s.schema_version().unwrap(), 2);
+    assert!(other.all_accounts().unwrap().is_empty());
+    add(&other, &cc(), "b", "b@x.co", 1);
+    assert_eq!(
+        s.all_accounts().unwrap().len(),
+        1,
+        "a valid store, for both"
+    );
+}
+
+#[test]
+fn a_provider_s_rows_go_and_its_usage_budget_stays() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let other = ProviderId::new("fake-agent");
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let f = add(&s, &other, "f", "f@x.co", 1);
+    for (p, id) in [(cc(), &a), (other.clone(), &f)] {
+        s.set_active(&p, Some(id), Some(0)).unwrap();
+        s.set_unhealthy_ticks(&p, 2).unwrap();
+        s.insert_event(&EventRow {
+            at: 1,
+            provider: p.clone(),
+            kind: "add".into(),
+            from_id: None,
+            to_id: Some(id.clone()),
+            trigger: None,
+            source: "cli".into(),
+            detail: None,
+        })
+        .unwrap();
+    }
+    let db = rusqlite::Connection::open(&path).unwrap();
+    for p in ["claude-code", "fake-agent"] {
+        db.execute(
+            "INSERT INTO usage_requests (provider, identity_key, at) VALUES (?1, 'k', 1)",
+            [p],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO live_identity_cache (provider, identity_key) VALUES (?1, 'k')",
+            [p],
+        )
+        .unwrap();
+    }
+    s.delete_provider_rows(&cc()).unwrap();
+    let count = |table: &str, p: &str| -> i64 {
+        db.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE provider = ?1"),
+            [p],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    for table in [
+        "events",
+        "autoswitch_state",
+        "active_accounts",
+        "live_identity_cache",
+    ] {
+        assert_eq!(
+            (count(table, "claude-code"), count(table, "fake-agent")),
+            (0, 1),
+            "{table}"
+        );
+    }
+    assert_eq!(
+        (
+            count("usage_requests", "claude-code"),
+            count("usage_requests", "fake-agent")
+        ),
+        (1, 1),
+        "§8.6"
+    );
+    assert_eq!(
+        s.all_accounts().unwrap().len(),
+        2,
+        "accounts are not its to delete"
+    );
+}

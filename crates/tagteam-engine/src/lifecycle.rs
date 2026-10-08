@@ -9,7 +9,7 @@ use tagteam_provider::{Credential, Identity, Provenance, Provider, Read};
 use crate::account_lock::AccountLock;
 use crate::engine::{Engine, Reconcile};
 use crate::error::EngineError;
-use crate::rescue::{RescueEntry, RescueFile};
+use crate::rescue::RescueUnlisted;
 use crate::store::{AccountRow, EventRow, LoginMeta, NewAccount, Store, StoreError};
 
 pub struct AddOptions {
@@ -175,6 +175,17 @@ struct LoginSource {
     live_names_account: bool,
 }
 
+/// What `remove_locked` does with a `rescue` path it cannot list (§6.3, §10.5 step 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnlistedRescues {
+    /// `remove`, an `add` over an occupant, and a `--provider` purge: refuse, naming the path,
+    /// rather than guess which entries were the account's.
+    Refuse,
+    /// A full purge: skip the account's rescue step. The purge deletes the whole path once
+    /// every vault entry is gone.
+    Skip,
+}
+
 impl Engine {
     pub(crate) fn event(
         &self,
@@ -206,23 +217,33 @@ impl Engine {
     /// this account's lock, and has run `refuse_destroying` on it. The live login is never
     /// touched. A pending replacement is reconciled first (§6.2), but one that cannot be
     /// installed does not stop it: the account goes either way (§12.5).
+    ///
+    /// The rescue files are listed before anything is deleted, so a `rescue` path that cannot be
+    /// listed refuses with nothing deleted, unless `unlisted` skips it (a full purge). Returns
+    /// how many rescue files it deleted.
     pub(crate) fn remove_locked(
         &self,
         row: &AccountRow,
         lock: &AccountLock,
-    ) -> Result<(), EngineError> {
+        unlisted: UnlistedRescues,
+    ) -> Result<usize, EngineError> {
         self.reconcile_replacement_as(lock, Reconcile::Removing)?;
         let p = self.provider(&row.provider)?;
+        let rescues = match self.rescue_paths_for(&row.id) {
+            Ok(paths) => paths,
+            Err(_) if unlisted == UnlistedRescues::Skip => Vec::new(),
+            Err(RescueUnlisted { path, detail }) => {
+                return Err(EngineError::RescueUnlistable { path, detail });
+            }
+        };
         self.vault.delete(lock)?;
-        for rescue in self.rescues_for(&row.id) {
-            let (RescueFile::Entry(RescueEntry { path, .. }) | RescueFile::Unreadable { path, .. }) =
-                rescue;
-            self.delete_rescue(&path)?;
+        for path in &rescues {
+            self.delete_rescue(path)?;
         }
         self.remove_profile(p.as_ref(), row)?;
         self.store()?.delete_account(&row.id)?;
         self.event(&row.provider, "remove", Some(&row.id), None)?;
-        Ok(())
+        Ok(rescues.len())
     }
 
     /// §10.3 Guard, before `remove_locked` deletes anything of `row`: it is not session-owned
@@ -470,7 +491,7 @@ impl Engine {
             }
         }
         if let Some(occupant) = &prep.occupant {
-            self.remove_locked(occupant, lock_for(&occupant.id))?;
+            self.remove_locked(occupant, lock_for(&occupant.id), UnlistedRescues::Refuse)?;
         }
         let current = store.account(&prep.id)?.ok_or(StoreError::NoSuchAccount)?;
         if let Some(pos) = position.filter(|pos| *pos != current.position) {
@@ -739,7 +760,7 @@ impl Engine {
         // before the remove is done (§12.5).
         let p = self.provider(&row.provider)?;
         self.refuse_destroying(p.as_ref(), &row)?;
-        self.remove_locked(&row, &lock)?;
+        self.remove_locked(&row, &lock, UnlistedRescues::Refuse)?;
         Ok(row)
     }
 

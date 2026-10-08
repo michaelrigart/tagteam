@@ -295,3 +295,27 @@ fn a_rescue_that_cannot_be_deleted_fails_remove_before_the_row_goes() {
     assert!(!rescue.exists());
     assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
 }
+
+#[test]
+fn remove_refuses_a_rescue_path_it_cannot_list_before_deleting_anything() {
+    // §6.3: a `rescue` that is not a directory hides every account's rescues; `remove` refuses,
+    // naming it, rather than guess which entries were the account's.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let rescue = fx.env.data_dir().join("rescue");
+    fs::write(&rescue, "not a directory").unwrap();
+    let err = fx.engine.remove(&a).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::RescueUnlistable { path, .. } if path == &rescue),
+        "{err:?}"
+    );
+    assert_eq!(err.kind(), "rescue-unreadable");
+    assert!(
+        err.to_string().contains(&rescue.display().to_string()),
+        "{err}"
+    );
+    assert!(fx.vault_bytes(&a).is_some(), "the vault was not touched");
+    assert!(rescue.is_file(), "nor the path");
+    fs::remove_file(&rescue).unwrap();
+    fx.engine.remove(&a).unwrap();
+}

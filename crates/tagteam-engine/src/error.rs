@@ -213,6 +213,33 @@ pub enum EngineError {
         "position {position} ({label}) has a new login whose recorded details cannot be read, so it cannot be finished; run `tagteam remove {position}`, then add the login again"
     )]
     ReplacementUnreadable { position: u32, label: String },
+    /// §6.3: the `rescue` path is not a directory or cannot be listed, so every account's
+    /// rescues are unknown. `remove` and a `--provider` purge refuse rather than guess which
+    /// entries were the account's; only a full purge deletes the path (§10.5).
+    #[error(
+        "{} cannot be listed ({detail}), so it may hold any account's refreshed tokens; fix or move it, or run a full `tagteam purge`, which deletes it",
+        path.display()
+    )]
+    RescueUnlistable { path: PathBuf, detail: String },
+    /// §10.5 step 3: a provider's auto-switch engine holds its engine lock; `pid` is the one
+    /// its lock record names, when it can be read (§11.1).
+    #[error(
+        "an auto-switch engine for {provider} is running{}; stop it, then run `tagteam purge` again",
+        pid.map_or_else(String::new, |pid| format!(" (pid {pid})"))
+    )]
+    EngineRunning { provider: String, pid: Option<u32> },
+    /// §10.5 step 6: a session profile that no store account owns is in use: a live launch
+    /// reservation, or a session record that is live or cannot be read (§12.5, §12.6).
+    #[error(
+        "{} belongs to no stored account, but a `tagteam run` session is using it or its sessions cannot be checked; exit that session first",
+        profile.display()
+    )]
+    OrphanSessionRunning { profile: PathBuf },
+    /// §10.5 step 6: the accounts a purge would delete are not the ones that were confirmed.
+    #[error(
+        "the accounts changed since the purge was confirmed (another command added or removed one); run `tagteam purge` again"
+    )]
+    PurgeChanged,
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -325,6 +352,10 @@ impl EngineError {
             EngineError::Settings(SettingsError::Corrupt { .. }) => "settings-unreadable",
             EngineError::Settings(SettingsError::Io(_)) => "io",
             EngineError::ReplacementUnreadable { .. } => "replacement-unreadable",
+            EngineError::RescueUnlistable { .. } => "rescue-unreadable",
+            EngineError::EngineRunning { .. } => "engine-running",
+            EngineError::OrphanSessionRunning { .. } => "session-owned",
+            EngineError::PurgeChanged => "purge-changed",
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -654,6 +685,27 @@ mod tests {
                 },
                 "replacement-unreadable",
             ),
+            (
+                EngineError::RescueUnlistable {
+                    path: PathBuf::from("r"),
+                    detail: "d".into(),
+                },
+                "rescue-unreadable",
+            ),
+            (
+                EngineError::EngineRunning {
+                    provider: "p".into(),
+                    pid: Some(7),
+                },
+                "engine-running",
+            ),
+            (
+                EngineError::OrphanSessionRunning {
+                    profile: PathBuf::from("s"),
+                },
+                "session-owned",
+            ),
+            (EngineError::PurgeChanged, "purge-changed"),
             (EngineError::Io(io::Error::other("x")), "io"),
             (
                 EngineError::Provider(ProviderError::Lock(LockError::Interrupted {

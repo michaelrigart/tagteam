@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tagteam_core::{AccountId, Fingerprint};
@@ -21,10 +21,34 @@ pub enum VaultError {
     Verify,
 }
 
+/// What a full purge's sweep of the vault left (§10.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Leftovers {
+    /// Nothing is left.
+    None,
+    /// Entries that no account of this store names remain where every tagteam data directory's
+    /// entries live (the macOS Keychain's `tagteam` service): they may be another data
+    /// directory's, so only `--keychain-orphans` deletes them.
+    Shared,
+    /// Whether any remain could not be told.
+    Unknown(String),
+}
+
 pub trait VaultBackend: Send + Sync {
     fn read(&self, key: &str) -> Read<Vec<u8>>;
     fn write(&self, key: &str, bytes: &[u8]) -> Result<(), VaultError>;
     fn delete(&self, key: &str) -> Result<(), VaultError>;
+    /// The Keychain behind the backend (macOS): purge's sweep by service (§10.5), and doctor's
+    /// lock check and by-service probe (§13.6). `None` for a backend that keeps no Keychain
+    /// items.
+    fn keychain(&self) -> Option<&dyn Keychain> {
+        None
+    }
+    /// The directory of a file backend (Linux): purge deletes it whole (§10.5), and doctor
+    /// lists it (§13.6).
+    fn dir(&self) -> Option<&Path> {
+        None
+    }
 }
 
 pub const SERVICE: &str = "tagteam";
@@ -53,6 +77,9 @@ impl VaultBackend for KeychainVault {
         self.keychain
             .delete(SERVICE, key)
             .map_err(|e| VaultError::Delete(e.to_string()))
+    }
+    fn keychain(&self) -> Option<&dyn Keychain> {
+        Some(self.keychain.as_ref())
     }
 }
 
@@ -89,6 +116,9 @@ impl VaultBackend for FileVault {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(VaultError::Delete(e.to_string())),
         }
+    }
+    fn dir(&self) -> Option<&Path> {
+        Some(&self.dir)
     }
 }
 
@@ -150,6 +180,51 @@ impl Vault {
             "stored a credential in the vault"
         );
         Ok(())
+    }
+
+    /// The backend's Keychain (macOS), or `None` (§10.5, §13.6).
+    pub fn keychain(&self) -> Option<&dyn Keychain> {
+        self.backend.keychain()
+    }
+
+    /// The backend's directory (Linux), or `None` (§10.5, §13.6).
+    pub fn dir(&self) -> Option<&Path> {
+        self.backend.dir()
+    }
+
+    /// §10.5: a full purge's last word on the vault, once every account's entries are deleted.
+    /// `shared_too` is `--keychain-orphans`. Every tagteam data directory on the Mac shares the
+    /// `tagteam` service, so items left there are deleted by service only with `shared_too`,
+    /// and otherwise found by the attributes-only probe (Appendix A.3). `vault/` is this data
+    /// directory's alone, so it goes whole whatever `shared_too` says, and a link there is
+    /// removed as a link. A backend with neither refuses, so it never reports a clean sweep.
+    pub fn sweep(&self, shared_too: bool) -> Result<Leftovers, VaultError> {
+        if let Some(keychain) = self.keychain() {
+            if shared_too {
+                keychain
+                    .delete_service(SERVICE)
+                    .map_err(|e| VaultError::Delete(e.to_string()))?;
+                return Ok(Leftovers::None);
+            }
+            return Ok(match keychain.service_has_items(SERVICE) {
+                Read::Present(true) => Leftovers::Shared,
+                Read::Present(false) | Read::Absent => Leftovers::None,
+                Read::Unreadable(e) => Leftovers::Unknown(e.to_string()),
+            });
+        }
+        let Some(dir) = self.dir() else {
+            return Err(VaultError::Delete("this vault cannot be swept".into()));
+        };
+        let removed = match fs::symlink_metadata(dir) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(dir),
+            Ok(_) => fs::remove_file(dir),
+            Err(e) => Err(e),
+        };
+        match removed {
+            Ok(()) => Ok(Leftovers::None),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Leftovers::None),
+            Err(e) => Err(VaultError::Delete(e.to_string())),
+        }
     }
 
     /// Strict: both generations are deleted, errors propagate, and absence is verified. `.prev`
