@@ -320,6 +320,33 @@ impl Provider for FakeAgent {
         (KIND_STATIC.into(), bytes)
     }
 
+    /// The identity is the stored object (`handle`, `workspace`, `uid`): no email anywhere.
+    fn export_login(
+        &self,
+        login: &StoredLogin,
+        full: bool,
+    ) -> Result<(Value, Value), ProviderError> {
+        Ok((
+            login.identity.raw.clone(),
+            shape::export_credential(&login.secret, full)?,
+        ))
+    }
+
+    fn import_login(
+        &self,
+        identity: &Value,
+        credential: &Value,
+    ) -> Result<StoredLogin, ProviderError> {
+        let identity = shape::identity_from(identity)
+            .ok_or_else(|| ProviderError::Invalid("the FakeAgent identity has no handle".into()))?;
+        let secret = shape::import_credential(credential)?;
+        Ok(StoredLogin {
+            kind: shape::classify(&secret).into(),
+            secret,
+            identity,
+        })
+    }
+
     fn classify(&self, secret: &[u8]) -> String {
         shape::classify(secret).into()
     }

@@ -544,6 +544,24 @@ pub trait Provider: Send + Sync {
     /// `(kind, vault bytes)` for a token given to `add-token`.
     fn token_secret(&self, token: &str) -> (String, Vec<u8>);
 
+    /// §13.3: the provider-owned payload an export file carries for `login`, as
+    /// `(identity, credential)`. Without `full`, the credential keeps only what the login needs
+    /// on another machine; what is bound to this machine stays here (CC: `{claudeAiOauth}`).
+    /// An error names no secret.
+    fn export_login(
+        &self,
+        login: &StoredLogin,
+        full: bool,
+    ) -> Result<(Value, Value), ProviderError>;
+    /// §13.3 pass 1: validates an exported `(identity, credential)` and rebuilds the stored
+    /// login, its kind classified from the credential (CC: §10.2's email pattern). The inverse
+    /// of `export_login`. An error names no secret.
+    fn import_login(
+        &self,
+        identity: &Value,
+        credential: &Value,
+    ) -> Result<StoredLogin, ProviderError>;
+
     fn classify(&self, secret: &[u8]) -> String;
     fn fingerprint(&self, secret: &[u8]) -> Option<Fingerprint>;
     fn has_refresh_token(&self, secret: &[u8]) -> bool;

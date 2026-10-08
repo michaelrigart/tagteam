@@ -311,6 +311,31 @@ impl Provider for ClaudeCode {
         }
     }
 
+    fn export_login(
+        &self,
+        login: &StoredLogin,
+        full: bool,
+    ) -> Result<(Value, Value), ProviderError> {
+        Ok((
+            shape::export_identity(&login.identity),
+            shape::export_credential(&login.secret, full)?,
+        ))
+    }
+
+    fn import_login(
+        &self,
+        identity: &Value,
+        credential: &Value,
+    ) -> Result<StoredLogin, ProviderError> {
+        let identity = shape::import_identity(identity)?;
+        let secret = shape::import_credential(credential)?;
+        Ok(StoredLogin {
+            kind: shape::classify(&secret).into(),
+            secret,
+            identity,
+        })
+    }
+
     fn classify(&self, secret: &[u8]) -> String {
         shape::classify(secret).into()
     }

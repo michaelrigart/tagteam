@@ -1,5 +1,6 @@
 use serde_json::{Map, Value, json};
 use tagteam_core::Fingerprint;
+use tagteam_core::validate::is_valid_email;
 use tagteam_provider::{Identity, KindTraits, ProviderError};
 
 /// Taken from the live credential on activation, absence included (Appendix A.4, B.9).
@@ -250,6 +251,111 @@ pub fn identity_from_oauth_account(v: &Value) -> Option<Identity> {
 pub fn token_identity(email: &str) -> Identity {
     let raw = json!({"emailAddress": email, "accountUuid": "", "organizationUuid": null, "organizationName": null});
     identity_from_oauth_account(&raw).expect("a non-empty email always parses")
+}
+
+/// The one key a slim export keeps (§13.3, Appendix A.4): the login itself. The machine-shared
+/// keys and the device-bound `trustedDeviceToken` stay on this machine.
+const OAUTH_KEY: &str = "claudeAiOauth";
+
+fn invalid(message: &str) -> ProviderError {
+    ProviderError::Invalid(message.to_owned())
+}
+
+/// §13.3's identity payload: the email, the uuids and the organization, then the stored
+/// `oauthAccount` object itself, which `import_identity` reads first.
+pub fn export_identity(id: &Identity) -> Value {
+    json!({
+        "email": id.email,
+        "accountUuid": id.account_uuid,
+        "organizationUuid": id.org_uuid,
+        "organizationName": id.org_name,
+        "oauthAccount": id.raw,
+    })
+}
+
+/// §13.3's credential payload: an API key as its string, any other credential as its JSON
+/// object, reduced to `{claudeAiOauth}` unless `full`. A stored credential without a
+/// `claudeAiOauth` object is not one this provider exports.
+pub fn export_credential(secret: &[u8], full: bool) -> Result<Value, ProviderError> {
+    if is_api_key(secret) {
+        return Ok(Value::String(
+            String::from_utf8_lossy(secret).trim().to_owned(),
+        ));
+    }
+    let Ok(Value::Object(mut root)) = serde_json::from_slice::<Value>(secret) else {
+        return Err(invalid("the stored credential is not a JSON object"));
+    };
+    if !root.get(OAUTH_KEY).is_some_and(Value::is_object) {
+        return Err(invalid("the stored credential has no claudeAiOauth object"));
+    }
+    if full {
+        return Ok(Value::Object(root));
+    }
+    let oauth = root.remove(OAUTH_KEY).expect("checked above");
+    Ok(json!({ OAUTH_KEY: oauth }))
+}
+
+/// The identity of an export's account (§13.3): its `oauthAccount` object when it has one, else
+/// one built from the flat fields, as a token account records it (`token_identity`). The email
+/// must match §10.2's pattern and, when the flat `email` is given too, be the same.
+pub fn import_identity(v: &Value) -> Result<Identity, ProviderError> {
+    let o = v
+        .as_object()
+        .ok_or_else(|| invalid("the identity is not a JSON object"))?;
+    let flat_email = match o.get("email") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(e)) => Some(e.as_str()),
+        Some(_) => return Err(invalid("the identity's email is not a string")),
+    };
+    let identity = match o.get("oauthAccount") {
+        Some(account @ Value::Object(_)) => identity_from_oauth_account(account)
+            .ok_or_else(|| invalid("the identity's oauthAccount has no emailAddress"))?,
+        None | Some(Value::Null) => {
+            let email = flat_email.ok_or_else(|| invalid("the identity has no email"))?;
+            let field = |k: &str| o.get(k).filter(|x| x.is_string()).cloned();
+            identity_from_oauth_account(&json!({
+                "emailAddress": email,
+                "accountUuid": field("accountUuid").unwrap_or_else(|| json!("")),
+                "organizationUuid": field("organizationUuid"),
+                "organizationName": field("organizationName"),
+            }))
+            .ok_or_else(|| invalid("the identity has no email"))?
+        }
+        Some(_) => return Err(invalid("the identity's oauthAccount is not a JSON object")),
+    };
+    let email = identity.email.as_deref().unwrap_or_default();
+    if !is_valid_email(email) {
+        return Err(invalid(&format!("{email:?} is not a valid email address")));
+    }
+    if flat_email.is_some_and(|f| f != email) {
+        return Err(invalid(
+            "the identity's email and its oauthAccount name different logins",
+        ));
+    }
+    Ok(identity)
+}
+
+/// The vault bytes of an export's credential (§13.3): an `sk-ant-api…` string as the key
+/// itself, or a JSON object with a `claudeAiOauth` object holding a token. Anything else, a
+/// wiped credential included, is refused without quoting it.
+pub fn import_credential(v: &Value) -> Result<Vec<u8>, ProviderError> {
+    let bytes = match v {
+        Value::String(key) if is_api_key(key.as_bytes()) => key.trim().as_bytes().to_vec(),
+        Value::String(_) => return Err(invalid("a credential string must be an API key")),
+        Value::Object(o) if o.get(OAUTH_KEY).is_some_and(Value::is_object) => {
+            serde_json::to_vec(v).expect("a Value always serializes")
+        }
+        Value::Object(_) => return Err(invalid("the credential has no claudeAiOauth object")),
+        _ => {
+            return Err(invalid(
+                "the credential is neither a JSON object nor an API key",
+            ));
+        }
+    };
+    if is_wiped(&bytes) || fingerprint(&bytes).is_none() {
+        return Err(invalid("the credential holds no token"));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

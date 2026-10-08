@@ -1101,3 +1101,79 @@ mod validation {
         }
     }
 }
+
+/// A stored FakeAgent login: a renewable token, and the machine-shared `device` key.
+fn fake_login(f: &Fx) -> StoredLogin {
+    StoredLogin {
+        kind: KIND_TOKEN.into(),
+        secret: serde_json::to_vec(&credential_json("tok-a", Some("renew-a"), Some(9))).unwrap(),
+        identity: f
+            .fake
+            .parse_identity(&identity_json("alice", "ws", "uid-alice"))
+            .unwrap(),
+    }
+}
+
+#[test]
+fn its_export_payload_is_its_own_shape_with_no_claude_code_field() {
+    // §13.3, B.45: the payload is the provider's; nothing in FakeAgent's is Claude Code's.
+    let f = fx();
+    let l = fake_login(&f);
+    let (identity, slim) = f.fake.export_login(&l, false).unwrap();
+    let (_, full) = f.fake.export_login(&l, true).unwrap();
+    assert_eq!(identity, identity_json("alice", "ws", "uid-alice"));
+    assert_eq!(
+        slim,
+        json!({"fa": {"token": "tok-a", "renew": "renew-a", "expires": 9}})
+    );
+    assert_eq!(full, credential_json("tok-a", Some("renew-a"), Some(9)));
+    for payload in [&identity, &slim, &full] {
+        let text = payload.to_string();
+        for cc_field in ["email", "claudeAiOauth", "oauthAccount", "organizationUuid"] {
+            assert!(!text.contains(cc_field), "{cc_field} in {text}");
+        }
+    }
+    let back = f.fake.import_login(&identity, &slim).unwrap();
+    assert_eq!(back.kind, KIND_TOKEN);
+    assert_eq!(back.identity.label, "alice@ws");
+    assert_eq!(back.identity.email, None);
+    assert_eq!(
+        f.fake.fingerprint(&back.secret),
+        f.fake.fingerprint(&l.secret)
+    );
+}
+
+#[test]
+fn its_import_refuses_an_identity_without_a_handle_or_a_credential_without_a_token() {
+    let f = fx();
+    let good = json!({"fa": {"token": "tok-SENTINEL"}});
+    for (identity, credential, want) in [
+        (
+            json!({"workspace": "ws"}),
+            good.clone(),
+            "the FakeAgent identity has no handle",
+        ),
+        (
+            identity_json("alice", "ws", "u"),
+            json!({"claudeAiOauth": {"accessToken": "SENTINEL"}}),
+            "the FakeAgent credential has no fa object",
+        ),
+        (
+            identity_json("alice", "ws", "u"),
+            json!({"fa": {"token": ""}}),
+            "the FakeAgent credential holds no token",
+        ),
+    ] {
+        match f.fake.import_login(&identity, &credential) {
+            Err(ProviderError::Invalid(m)) => assert_eq!(m, want),
+            other => panic!("expected {want:?}, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        f.fake
+            .import_login(&identity_json("bob", "", "u"), &good)
+            .unwrap()
+            .kind,
+        KIND_STATIC
+    );
+}
