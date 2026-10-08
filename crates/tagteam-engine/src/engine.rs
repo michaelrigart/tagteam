@@ -384,21 +384,28 @@ impl Engine {
     }
 
     /// §10.5 steps 4 and 5 (Decision 7): `MutationGuard`, under which every interrupted switch
-    /// whose holder died is recovered as usual (§9.6). A journal row of an affected provider
-    /// that is still there afterwards (undecidable, blocked, or unreadable) is deleted, with a
-    /// warning that the live login may be incoherent, and the live login is left as it is: purge
-    /// is the way out of a state tagteam cannot repair, so it never refuses on one. Returns the
-    /// guard and the warnings.
-    pub(crate) fn purge_guard(
-        &self,
-        providers: &[ProviderId],
-    ) -> Result<(MutationGuard, Vec<String>), EngineError> {
+    /// whose holder died is recovered as usual (§9.6). What recovery could not settle is left
+    /// for `purge_leftover_journals`, which runs once step 6's refusals have passed: a refused
+    /// purge deletes nothing, so the next guarded command still finds the interrupted switch.
+    pub(crate) fn purge_guard(&self) -> Result<MutationGuard, EngineError> {
         let (guard, _blocked) = self.guard_recovering_from(
             true,
             "cli",
             MutationGuard::TIMEOUT,
             Self::dead_decodable_journals,
         )?;
+        Ok(guard)
+    }
+
+    /// §10.5 step 5 (Decision 7), after step 6: a journal row of an affected provider that is
+    /// still there once recovery is done (undecidable, blocked, or unreadable) is deleted, with
+    /// a warning that the live login may be incoherent, and the live login is left as it is:
+    /// purge is the way out of a state tagteam cannot repair, so it never refuses on one.
+    /// Returns the warnings. The caller holds the guard `purge_guard` gave.
+    pub(crate) fn purge_leftover_journals(
+        &self,
+        providers: &[ProviderId],
+    ) -> Result<Vec<String>, EngineError> {
         let mut warnings = Vec::new();
         if let Some(store) = self.existing_store()? {
             for provider in providers {
@@ -415,7 +422,7 @@ impl Engine {
                 ));
             }
         }
-        Ok((guard, warnings))
+        Ok(warnings)
     }
 
     /// `dead_journals` for `purge_guard`: each row decoded on its own, and one that does not

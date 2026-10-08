@@ -13,7 +13,7 @@ use tagteam_core::autoswitch::{
 };
 use tagteam_core::rank::span;
 use tagteam_core::usage::headroom;
-use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, Fingerprint, ProviderId, Window, WindowKind};
 use tagteam_provider::{Env, FlockGuard, LockError, ProcessStamp, Provider, Read, ReadError};
 
 use crate::collect::{CollectMode, CollectReport, Collected};
@@ -174,10 +174,27 @@ fn write_holder(path: &Path) -> Result<(), EngineError> {
 
 /// §5: `locks/autoswitch-<provider>.lock`, the provider's engine lock (§11.1). `auto` holds it
 /// for an engine's life, and `purge` while it runs (§10.5 step 3).
+///
+/// A provider ID is a string the store holds, so one that is not a plain name (anything outside
+/// `[A-Za-z0-9._-]`, or one starting with `.`) cannot name a path: its lock is
+/// `locks/engine-<first 12 hex digits of the ID's SHA-256>.lock`, inside `locks/`. Every
+/// registered provider's ID is a plain name and keeps its `autoswitch-` file.
 pub(crate) fn engine_lock_path(env: &Env, provider: &ProviderId) -> PathBuf {
-    env.data_dir()
-        .join("locks")
-        .join(format!("autoswitch-{provider}.lock"))
+    let id = provider.as_str();
+    let plain = !id.is_empty()
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    let name = if plain {
+        format!("autoswitch-{id}.lock")
+    } else {
+        format!(
+            "engine-{}.lock",
+            Fingerprint::of_secret(id.as_bytes()).short12()
+        )
+    };
+    env.data_dir().join("locks").join(name)
 }
 
 /// The holder `write_holder` recorded in an engine lock file (§11.1), read without trying the

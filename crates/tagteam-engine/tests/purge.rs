@@ -4,8 +4,10 @@ mod common;
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::{FakeFx, Fx, add, crashed_switch, credential, vault_fp};
+use common::{FakeFx, Fx, add, crashed_switch, credential, journal, vault_fp};
 use serde_json::json;
 use tagteam_cc::live::Platform;
 use tagteam_core::{AccountId, ProviderId};
@@ -15,7 +17,7 @@ use tagteam_engine::store::{DisplacedRow, JournalRow, Store};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::liveness::FakeProcess;
 use tagteam_provider::profile::ProfileMarker;
-use tagteam_provider::{FlockGuard, ProcessStamp};
+use tagteam_provider::{FlockGuard, Keychain, KeychainError, LockState, ProcessStamp, Read};
 
 /// The account a plan or report names, as `purge` builds it.
 fn account(fx: &Fx, id: &AccountId, has_profile: bool) -> PurgeAccount {
@@ -1119,4 +1121,268 @@ fn a_provider_purge_whose_second_displaced_entry_fails_counts_the_first_and_repo
     assert_eq!(what, ["displaced credentials"], "{:?}", report.failures);
     assert_eq!(count(&fx, "displaced", "claude-code"), 1, "its row stays");
     assert_eq!(report.accounts.len(), 1, "the accounts went regardless");
+}
+
+#[test]
+fn a_refused_purge_deletes_no_undecidable_journal_row() {
+    // Fix round 1, I1: step 5 recovers, but a leftover row is deleted only once step 6's
+    // refusals have passed, so a refused purge leaves the interrupted switch for the next
+    // guarded command to report. A purge that goes ahead deletes it with its warning.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    fx.rotate_live("rt-nobody-knows"); // neither side's generation, and no oracle
+    let dir = fx.make_profile(&a);
+    let plan = fx.engine.purge_plan(Some(&fx.provider())).unwrap();
+    let session = fx.hold_reservation(&dir);
+    let err = fx.engine.purge(&plan).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    assert!(journal(&fx).is_some(), "a refused purge deletes nothing");
+    assert!(fx.vault_bytes(&a).is_some());
+    drop(session);
+    let report = fx.engine.purge(&plan).unwrap();
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("may be incoherent"),
+        "{:?}",
+        report.warnings
+    );
+    assert!(journal(&fx).is_none());
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_provider_purge_that_found_no_data_directory_checks_again_and_hands_over() {
+    // Fix round 1, M2: the check after "no data directory" holds for `--provider` too. A data
+    // directory an `add` made meanwhile is the guarded path's, where step 6 refuses the
+    // account the confirmed plan did not name.
+    use std::sync::{Arc, Mutex};
+
+    use tagteam_engine::lifecycle::AddOptions;
+
+    let fx = Fx::new();
+    fx.login("a@x.co", "rt-a");
+    let plan = fx.engine.purge_plan(Some(&fx.provider())).unwrap();
+    assert!(plan.accounts.is_empty() && !fx.env.data_dir().exists());
+    let adder = Arc::new(fx.engine_with_env(fx.env.clone()));
+    let added = Arc::new(Mutex::new(None));
+    let slot = added.clone();
+    fx.engine.on_point(
+        "purge-without-data-dir",
+        Box::new(move || {
+            let opts = AddOptions {
+                provider: ProviderId::new("claude-code"),
+                position: None,
+                alias: None,
+                yes: false,
+            };
+            *slot.lock().unwrap() = Some(adder.add_live(opts).unwrap().account.id);
+        }),
+    );
+    let err = fx.engine.purge(&plan).unwrap_err();
+    assert_eq!(err.kind(), "purge-changed", "{err}");
+    let id = added.lock().unwrap().clone().expect("the add ran");
+    assert!(fx.vault_bytes(&id).is_some());
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}
+
+/// `from` copied to `to`, files and directories (not links).
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_copy_of_an_account_s_profile_never_deletes_the_account_s_item() {
+    // Fix round 1, M3: an orphan whose readable marker names an account the store still holds
+    // is a copy, not that account's profile. Step 8 names its item by its own path, so the
+    // account's item survives when step 7 could not delete the account.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let (original, item) = profile_with_item(&fx, &a);
+    let copy = fx.env.data_dir().join("sessions/copy");
+    copy_dir(&original, &copy);
+    let plan = full_plan(&fx);
+    assert_eq!(plan.orphan_profiles, [copy.clone()]);
+    fx.kc.set_fail_delete(SERVICE, true);
+    let report = fx.engine.purge(&plan).unwrap();
+    fx.kc.set_fail_delete(SERVICE, false);
+    assert!(report.accounts.is_empty(), "{report:?}");
+    assert!(!copy.exists(), "the copy itself goes");
+    assert!(original.exists());
+    assert!(
+        fx.kc.get(&item.0, &item.1).is_some(),
+        "the account's own item survives step 8"
+    );
+}
+
+#[test]
+fn an_orphan_naming_the_live_config_dir_never_deletes_the_live_login() {
+    // Fix round 1, M4 (§10.5: purge never deletes the live login): an orphan link with no
+    // marker whose canonical path is the directory `CLAUDE_CONFIG_DIR` names would be given
+    // that directory's item, which is the live login's.
+    let fx = Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
+        let parent = fs::canonicalize(e.home.parent().unwrap()).unwrap();
+        let live = parent.join(e.home.file_name().unwrap()).join(".claude");
+        e.claude_config_dir = Some(live.into_os_string());
+    });
+    fx.add("a@x.co", "rt-a");
+    let live_dir = PathBuf::from(fx.env.claude_config_dir.clone().unwrap());
+    let live_item = fx.live_item(tagteam_cc::ItemKind::OAuth);
+    fx.kc.put(&live_item.0, &live_item.1, b"the live login");
+    let link = fx.env.data_dir().join("sessions/live-link");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&live_dir, &link).unwrap();
+    assert_eq!(fs::canonicalize(&link).unwrap(), live_dir);
+
+    let plan = full_plan(&fx);
+    assert_eq!(plan.orphan_profiles, [link.clone()]);
+    let report = fx.engine.purge(&plan).unwrap();
+
+    assert_eq!(
+        fx.kc.get(&live_item.0, &live_item.1).as_deref(),
+        Some(&b"the live login"[..])
+    );
+    assert!(live_dir.join("settings.json").exists(), "nor its directory");
+    let what: Vec<&str> = report.failures.iter().map(|(w, _)| w.as_str()).collect();
+    assert_eq!(what, [link.display().to_string()], "{:?}", report.failures);
+    assert!(
+        report.failures[0].1.contains("live login"),
+        "{:?}",
+        report.failures
+    );
+}
+
+#[test]
+fn a_stored_provider_string_never_places_a_lock_outside_locks() {
+    // Fix round 1, M5: a provider ID is a stored string. One that is not a plain name gets a
+    // lock file name derived from its hash, inside `locks/`.
+    let fx = Fx::new();
+    let hostile = ProviderId::new("/../../escape");
+    add(
+        &fx.engine.store().unwrap(),
+        &hostile,
+        "0192-hostile",
+        "h@x.co",
+        1,
+    );
+    let data = fx.env.data_dir();
+    let report = fx.engine.purge(&full_plan(&fx)).unwrap();
+    assert_eq!(report.accounts.len(), 1, "{report:?}");
+    assert!(!data.join("escape.lock").exists());
+    let names: Vec<String> = fs::read_dir(data.join("locks"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("engine-"))
+        .collect();
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(names[0].ends_with(".lock"));
+    assert!(
+        data.join("locks/autoswitch-claude-code.lock").exists(),
+        "a registered provider keeps its name"
+    );
+    for entry in fs::read_dir(&data).unwrap() {
+        let name = entry.unwrap().file_name().into_string().unwrap();
+        assert!(!name.contains("escape"), "{name}");
+    }
+}
+
+/// A Keychain that forwards to `FakeKeychain` and counts the deletes by service it is asked.
+struct CountingKeychain {
+    inner: Arc<tagteam_provider::FakeKeychain>,
+    service_deletes: Arc<AtomicUsize>,
+}
+
+impl Keychain for CountingKeychain {
+    fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
+        self.inner.find(s, a)
+    }
+    fn exists(&self, s: &str, a: &str) -> Read<()> {
+        self.inner.exists(s, a)
+    }
+    fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), KeychainError> {
+        self.inner.upsert(s, a, d)
+    }
+    fn delete(&self, s: &str, a: &str) -> Result<(), KeychainError> {
+        self.inner.delete(s, a)
+    }
+    fn lock_state(&self) -> LockState {
+        self.inner.lock_state()
+    }
+    fn unlock(&self) -> bool {
+        self.inner.unlock()
+    }
+    fn delete_service(&self, s: &str) -> Result<u32, KeychainError> {
+        self.service_deletes.fetch_add(1, Ordering::SeqCst);
+        self.inner.delete_service(s)
+    }
+    fn service_has_items(&self, s: &str) -> Read<bool> {
+        self.inner.service_has_items(s)
+    }
+}
+
+#[test]
+fn keychain_orphans_deletes_nothing_by_service_while_an_account_is_left() {
+    // Fix round 1, M7: an account left over may own an entry the sweep would delete.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.kc.put(SERVICE, "another-stores-account", b"theirs");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let vault = tagteam_engine::vault::Vault::new(Box::new(
+        tagteam_engine::vault::KeychainVault::new(Arc::new(CountingKeychain {
+            inner: fx.kc.clone(),
+            service_deletes: calls.clone(),
+        })),
+    ));
+    let engine = fx.engine_with_vault(vault);
+    let plan = PurgePlan {
+        keychain_orphans: true,
+        ..engine.purge_plan(None).unwrap()
+    };
+    fx.kc.set_fail_delete(SERVICE, true);
+    let report = engine.purge(&plan).unwrap();
+    fx.kc.set_fail_delete(SERVICE, false);
+    assert!(
+        report.accounts.is_empty() && !report.store_emptied,
+        "{report:?}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "no delete by service");
+    assert!(fx.vault_bytes(&a).is_some());
+    assert!(fx.kc.get(SERVICE, "another-stores-account").is_some());
+    // Finished, the sweep runs once.
+    let again = PurgePlan {
+        keychain_orphans: true,
+        ..engine.purge_plan(None).unwrap()
+    };
+    engine.purge(&again).unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn on_linux_a_purge_that_leaves_an_account_keeps_the_vault_directory() {
+    // Fix round 1, M7: `vault/` holds the left account's entry.
+    let fx = Fx::with_platform(Platform::Linux);
+    let a = fx.add("a@x.co", "rt-a");
+    let vault = fx.env.data_dir().join("vault");
+    // A directory where the account's entry should be makes its deletion fail.
+    let entry = vault.join(format!("{a}.json"));
+    fs::remove_file(&entry).unwrap();
+    fs::create_dir(&entry).unwrap();
+    fs::write(entry.join("held"), "x").unwrap();
+    let report = fx.engine.purge(&full_plan(&fx)).unwrap();
+    assert!(
+        report.accounts.is_empty() && !report.store_emptied,
+        "{report:?}"
+    );
+    assert!(vault.exists(), "kept with the account that needs it");
+    assert!(report.failures.iter().any(|(w, _)| w == "the store"));
 }

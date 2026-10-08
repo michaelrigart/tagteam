@@ -249,7 +249,7 @@ impl Engine {
         // 3. No auto-switch engine may start while the purge runs.
         let _engines = self.hold_engine_locks(&providers)?;
         // 4 and 5, held to the end: nothing is created behind the purge.
-        let (_guard, warnings) = self.purge_guard(&providers)?;
+        let _guard = self.purge_guard()?;
         hooks::point(self, "purge-guarded")?;
         // 6.
         let store = self.existing_store()?;
@@ -295,6 +295,8 @@ impl Engine {
             }
             None => UnlistedRescues::Skip,
         };
+        // 5, once nothing refuses: what recovery could not settle goes, with its warning.
+        let warnings = self.purge_leftover_journals(&providers)?;
         let mut report = PurgeReport {
             warnings,
             ..PurgeReport::default()
@@ -607,10 +609,13 @@ impl Engine {
     }
 
     /// §10.5 step 8: the hashed item its marker's spelling names (§12.2), or, when the marker
-    /// cannot be read, the item each judging provider names from the profile's canonical path;
-    /// then the entry itself, its links removed as links. A path that does not resolve names
-    /// no item, so its item is skipped with a warning. So is the item of a marker naming a
-    /// provider this build does not register, and the warning returned says so.
+    /// cannot be read, or names an account the store still holds (so the profile is a copy of
+    /// that account's, never its own), the item each judging provider names from the profile's
+    /// canonical path; then the entry itself, its links removed as links. A path that does not
+    /// resolve names no item, so its item is skipped with a warning. So is the item of a marker
+    /// naming a provider this build does not register, and the warning returned says so. An item
+    /// that is the live login's is never deleted (§10.5): the orphan is left, and the refusal
+    /// is returned as its failure.
     fn delete_orphan(
         &self,
         profile: &Path,
@@ -624,9 +629,15 @@ impl Engine {
         // Asked again just before it goes, as step 7 asks each account again.
         self.refuse_orphan_split(profile)?;
         let mut warning = None;
+        let mut items: Vec<(Arc<dyn Provider>, String)> = Vec::new();
         match ProfileMarker::read(profile) {
             Read::Present(marker) => match self.provider(&marker.provider) {
-                Ok(p) => p.delete_profile_credential(&self.env, profile, &marker.config_dir)?,
+                Ok(p) if !self.store_holds(&marker.account_id)? => {
+                    items.push((p, marker.config_dir));
+                }
+                // A copy of a stored account's profile: its marker's spelling is that
+                // account's item, which is not this entry's to delete.
+                Ok(_) => self.items_by_path(profile, providers, &mut items),
                 Err(_) => {
                     tracing::warn!(
                         profile = %profile.display(),
@@ -640,18 +651,21 @@ impl Engine {
                     ));
                 }
             },
-            Read::Absent | Read::Unreadable(_) => match canonical_profile_path(profile) {
-                Ok(canonical) => {
-                    for p in self.judges(profile, providers) {
-                        let spelling = p.profile_spelling(&canonical);
-                        p.delete_profile_credential(&self.env, profile, &spelling)?;
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    profile = %profile.display(),
-                    "a session profile no account owns has no readable marker and does not resolve ({e}); no Keychain item can be named for it"
-                ),
-            },
+            Read::Absent | Read::Unreadable(_) => {
+                self.items_by_path(profile, providers, &mut items)
+            }
+        }
+        for (p, spelling) in &items {
+            if p.session_dir(&self.env)
+                .is_some_and(|live| p.profile_spelling(&live) == *spelling)
+            {
+                return Err(EngineError::Io(io::Error::other(
+                    "the Keychain item it names is the live login's, since CLAUDE_CONFIG_DIR names the same directory; it was left as it is, and so was the profile (a purge never deletes the live login)",
+                )));
+            }
+        }
+        for (p, spelling) in &items {
+            p.delete_profile_credential(&self.env, profile, spelling)?;
         }
         // `remove_dir_all` removes a symlink inside the profile as a link, never following it.
         if meta.is_dir() {
@@ -661,6 +675,36 @@ impl Engine {
         }
         tracing::info!(profile = %profile.display(), "deleted a session profile no account owned");
         Ok(warning)
+    }
+
+    /// Whether the store holds the account `id`, of any provider.
+    fn store_holds(&self, id: &AccountId) -> Result<bool, EngineError> {
+        Ok(match self.existing_store()? {
+            Some(store) => store.account(id)?.is_some(),
+            None => false,
+        })
+    }
+
+    /// The items an orphan with no usable marker is given: each judging provider's, named from
+    /// the profile's canonical path. A path that does not resolve names none.
+    fn items_by_path(
+        &self,
+        profile: &Path,
+        providers: &[ProviderId],
+        items: &mut Vec<(Arc<dyn Provider>, String)>,
+    ) {
+        match canonical_profile_path(profile) {
+            Ok(canonical) => {
+                for p in self.judges(profile, providers) {
+                    let spelling = p.profile_spelling(&canonical);
+                    items.push((p, spelling));
+                }
+            }
+            Err(e) => tracing::warn!(
+                profile = %profile.display(),
+                "a session profile no account owns has no readable marker and does not resolve ({e}); no Keychain item can be named for it"
+            ),
+        }
     }
 
     /// §10.5 with `--provider P`, once its accounts are gone: P's displaced entries, each file
@@ -785,12 +829,12 @@ impl Engine {
     /// `--provider` purge has nothing to delete.
     fn purge_without_data(&self, plan: &PurgePlan) -> Result<Option<PurgeReport>, EngineError> {
         let mut report = PurgeReport::default();
-        if plan.provider.is_some() {
-            return Ok(Some(report));
-        }
         hooks::point(self, "purge-without-data-dir")?;
         if self.env.data_dir().try_exists()? {
             return Ok(None);
+        }
+        if plan.provider.is_some() {
+            return Ok(Some(report));
         }
         // A vault kept in a directory keeps it in the data directory: nothing is there.
         if self.vault.dir().is_none() {
