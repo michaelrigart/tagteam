@@ -1423,3 +1423,18 @@ fn a_write_that_finds_cc_changed_the_entry_aborts_and_leaves_everything_as_cc_le
     assert_eq!(fs::read_to_string(&paths.global_config).unwrap(), "{}");
     assert!(!paths.storage_write_lock.exists());
 }
+
+#[test]
+fn the_keychain_lock_state_is_the_one_cc_reads_its_stores_from_and_none_off_macos() {
+    let kc = Arc::new(FakeKeychain::new());
+    let mac = ClaudeCode::new(kc.clone(), Platform::MacOs);
+    assert_eq!(mac.keychain_lock_state(), Some(LockState::Unlocked));
+    kc.set_locked(true);
+    assert_eq!(mac.keychain_lock_state(), Some(LockState::Locked));
+    let linux = ClaudeCode::new(kc, Platform::Linux);
+    assert_eq!(
+        linux.keychain_lock_state(),
+        None,
+        "CC uses no Keychain off macOS"
+    );
+}

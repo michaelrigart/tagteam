@@ -1852,3 +1852,206 @@ fn an_ambiguous_reply_warns_and_without_online_nothing_is_sent() {
     let statuses: Vec<CheckStatus> = reach.iter().map(|c| c.status).collect();
     assert_eq!(statuses, [CheckStatus::Ok, CheckStatus::Warn], "{reach:#?}");
 }
+
+// ---- Each store's secret reads are gated on its own Keychain (§13.6) ----
+
+/// A Keychain over a `FakeKeychain` that counts the secret reads it is asked for.
+struct ReadCounting {
+    inner: std::sync::Arc<tagteam_provider::FakeKeychain>,
+    finds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Keychain for ReadCounting {
+    fn find(&self, s: &str, a: &str) -> tagteam_provider::Read<Vec<u8>> {
+        self.finds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.find(s, a)
+    }
+    fn exists(&self, s: &str, a: &str) -> tagteam_provider::Read<()> {
+        self.inner.exists(s, a)
+    }
+    fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), tagteam_provider::KeychainError> {
+        self.inner.upsert(s, a, d)
+    }
+    fn delete(&self, s: &str, a: &str) -> Result<(), tagteam_provider::KeychainError> {
+        self.inner.delete(s, a)
+    }
+    fn lock_state(&self) -> tagteam_provider::LockState {
+        self.inner.lock_state()
+    }
+    fn unlock(&self) -> bool {
+        self.inner.unlock()
+    }
+    fn service_has_items(&self, s: &str) -> tagteam_provider::Read<bool> {
+        self.inner.service_has_items(s)
+    }
+}
+
+/// Two Keychains, as a compat run has them (`TAGTEAM_TEST_VAULT_KEYCHAIN`): the vault's is
+/// `fx.kc`, Claude Code's own stores are in `cc_kc`. Each counts the secret reads it is asked.
+struct Split {
+    engine: tagteam_engine::Engine,
+    cc_kc: std::sync::Arc<tagteam_provider::FakeKeychain>,
+    cc_finds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    vault_finds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Split {
+    fn new(fx: &Fx) -> Split {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use tagteam_cc::ClaudeCode;
+        use tagteam_cc::live::LiveStore;
+        let cc_kc = Arc::new(tagteam_provider::FakeKeychain::new());
+        let cc_finds = Arc::new(AtomicUsize::new(0));
+        let vault_finds = Arc::new(AtomicUsize::new(0));
+        let provider = ClaudeCode::with_store(
+            LiveStore::new(
+                Arc::new(ReadCounting {
+                    inner: cc_kc.clone(),
+                    finds: cc_finds.clone(),
+                }),
+                Platform::MacOs,
+            )
+            .with_retry_delay(std::time::Duration::ZERO),
+        );
+        let engine = tagteam_engine::Engine::new(tagteam_engine::EngineConfig {
+            env: fx.env.clone(),
+            registry: tagteam_engine::registry::ProviderRegistry::new().with(Arc::new(provider)),
+            vault: tagteam_engine::vault::Vault::new(Box::new(
+                tagteam_engine::vault::KeychainVault::new(Arc::new(ReadCounting {
+                    inner: fx.kc.clone(),
+                    finds: vault_finds.clone(),
+                })),
+            )),
+            oracle: fx.oracle.clone(),
+            clock: fx.clock.clone(),
+            http: fx.http.clone(),
+            default_provider: cc(),
+            settings: tagteam_engine::settings::Settings::default(),
+            process: fx.process.clone(),
+            run_shell: tagteam_provider::profile::RunShell::Outside,
+            spawner: fx.spawner.clone(),
+        });
+        Split {
+            engine,
+            cc_kc,
+            cc_finds,
+            vault_finds,
+        }
+    }
+
+    fn doctor(&self) -> DoctorReport {
+        self.engine.doctor(DoctorOptions::default()).unwrap()
+    }
+
+    fn finds(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A profile that is a provenance conflict when both Keychains can be read: its credential in
+/// Claude Code's Keychain and the vault's entry both differ from the seed.
+fn conflicting_profile(fx: &Fx, split: &Split, id: &AccountId) -> PathBuf {
+    let dir = fx.make_profile(id);
+    let row = fx.engine.store().unwrap().account(id).unwrap().unwrap();
+    let seed = fx.cc.fingerprint(&credential("a@x.co", "rt-seed")).unwrap();
+    fx.write_seed(&dir, row.login_epoch, seed.as_str());
+    let (svc, acct) = fx.profile_item(&dir);
+    split
+        .cc_kc
+        .put(&svc, &acct, &credential("a@x.co", "rt-profile"));
+    dir
+}
+
+#[test]
+fn a_locked_provider_keychain_skips_what_reads_it_though_the_vault_s_is_open() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let split = Split::new(&fx);
+    let dir = conflicting_profile(&fx, &split, &id);
+    assert_eq!(
+        one(&split.doctor(), "sessions.provenance").status,
+        CheckStatus::Fail,
+        "with both Keychains open, the profile is a conflict"
+    );
+
+    split.cc_kc.set_locked(true);
+    let provider_items = split.cc_kc.items();
+    let vault_items = fx.kc.items();
+    let before = Split::finds(&split.cc_finds);
+    let r = split.doctor();
+    assert!(found(&r, "sessions.credential").is_empty(), "{r:#?}");
+    assert!(found(&r, "sessions.provenance").is_empty(), "{r:#?}");
+    assert_eq!(one(&r, "keychain.locked").status, CheckStatus::Warn);
+    assert_eq!(
+        Split::finds(&split.cc_finds),
+        before,
+        "nothing is read from the locked Keychain"
+    );
+    assert_eq!(split.cc_kc.unlock_attempts(), 0);
+    assert_eq!(split.cc_kc.items(), provider_items);
+    assert_eq!(fx.kc.items(), vault_items);
+    assert!(dir.exists());
+}
+
+#[test]
+fn a_locked_provider_keychain_leaves_an_interrupted_switch_unjudged_though_the_vault_s_is_open() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &a, &b);
+    let split = Split::new(&fx);
+    let (svc, acct) = fx.live_item(tagteam_cc::ItemKind::OAuth);
+    split.cc_kc.put(&svc, &acct, &credential("a@x.co", "rt-a"));
+    split.cc_kc.set_locked(true);
+    let before = Split::finds(&split.cc_finds);
+    let r = split.doctor();
+    let c = one(&r, "switch.interrupted");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(c.message.contains("Keychain is locked"), "{}", c.message);
+    assert_eq!(one(&r, "keychain.locked").status, CheckStatus::Warn);
+    assert_eq!(Split::finds(&split.cc_finds), before);
+    assert_eq!(split.cc_kc.unlock_attempts(), 0);
+}
+
+#[test]
+fn a_locked_vault_keychain_skips_the_vault_reads_though_the_provider_s_is_open() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let split = Split::new(&fx);
+    let dir = conflicting_profile(&fx, &split, &id);
+    let (svc, acct) = fx.profile_item(&dir);
+    fx.kc.delete(SERVICE, id.as_str()).unwrap();
+    fx.kc.set_locked(true);
+    let vault_items = fx.kc.items();
+
+    // The provider's own store is read: this credential cannot be, and doctor says so.
+    split.cc_kc.set_unreadable(&svc, &acct, true);
+    let vault_before = Split::finds(&split.vault_finds);
+    let r = split.doctor();
+    assert_eq!(
+        one(&r, "sessions.credential").status,
+        CheckStatus::Warn,
+        "{r:#?}"
+    );
+    assert!(found(&r, "accounts.vault").is_empty(), "{r:#?}");
+    assert_eq!(one(&r, "keychain.locked").status, CheckStatus::Warn);
+
+    // Readable, it is read too, but the vault entry it would be compared with is not.
+    split.cc_kc.set_unreadable(&svc, &acct, false);
+    let provider_before = Split::finds(&split.cc_finds);
+    let r = split.doctor();
+    assert!(
+        Split::finds(&split.cc_finds) > provider_before,
+        "the provider's credential was read"
+    );
+    assert!(found(&r, "sessions.provenance").is_empty(), "{r:#?}");
+    assert!(found(&r, "accounts.vault").is_empty(), "{r:#?}");
+    assert_eq!(
+        Split::finds(&split.vault_finds),
+        vault_before,
+        "nothing is read from the locked vault Keychain"
+    );
+    assert_eq!(fx.kc.unlock_attempts(), 0);
+    assert_eq!(fx.kc.items(), vault_items);
+}

@@ -12,9 +12,9 @@ use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, Check, CredLocks, Credential, DoomedEntry, Env,
     FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange,
-    LiveLockSet, LiveLocks, LockError, MergeReport, MustShare, MutationGuard, Pace, PollBudget,
-    Provider, ProviderError, Read, SessionEnv, SharePolicy, StoredLogin, Undo, UsageResult,
-    Validity, Window, Written,
+    LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare, MutationGuard, Pace,
+    PollBudget, Provider, ProviderError, Read, SessionEnv, SharePolicy, StoredLogin, Undo,
+    UsageResult, Validity, Window, Written,
 };
 
 use crate::config;
@@ -764,6 +764,11 @@ impl Provider for ClaudeCode {
         cancel: &Cancel,
     ) -> Vec<Check> {
         doctor::checks(&self.live, env, spawner, cancel)
+    }
+
+    /// The state of the Keychain `cc.keychain` asks about: only on macOS does CC use one.
+    fn keychain_lock_state(&self) -> Option<LockState> {
+        (self.live.platform() == Platform::MacOs).then(|| self.live.keychain().lock_state())
     }
 
     /// The token, profile and usage hosts (Appendix A.5), each once, as root URLs.

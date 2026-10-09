@@ -18,7 +18,7 @@ use crate::doctor::Check;
 use crate::env::Env;
 use crate::flock::MutationGuard;
 use crate::http::{Http, HttpError, HttpResponse};
-use crate::keychain::KeychainError;
+use crate::keychain::{KeychainError, LockState};
 use crate::mkdir_lock::LockError;
 use crate::process::ProcessSpawner;
 use crate::read::{Read, ReadError};
@@ -803,6 +803,14 @@ pub trait Provider: Send + Sync {
     /// usage hosts), which doctor probes for reachability with no credentials. None by default.
     fn doctor_hosts(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// §13.6: the lock state of the Keychain this provider reads its own stores from (the live
+    /// login, the profiles' credentials), which can differ from the vault's. Asked without
+    /// prompting and bounded by its timeout (Appendix A.3). `None` (the default) when the
+    /// provider keeps those stores in no Keychain, so they are always readable.
+    fn keychain_lock_state(&self) -> Option<LockState> {
+        None
     }
 }
 

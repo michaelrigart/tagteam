@@ -4,8 +4,8 @@
 //! without waiting, reads the vault only when the Keychain is unlocked, and creates nothing: no
 //! data directory, store, log or lock file. Every finding names its fix.
 
-use std::cell::OnceCell;
-use std::collections::BTreeSet;
+use std::cell::{OnceCell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -87,7 +87,8 @@ enum Stored {
     },
 }
 
-/// Whether doctor may read secrets from the Keychain the vault keeps (§13.6, Appendix A.3).
+/// Whether doctor may read secrets from one Keychain: the vault's, or a provider's own stores'
+/// (§13.6, Appendix A.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Secrets {
     Readable,
@@ -95,14 +96,24 @@ enum Secrets {
     Unknown,
 }
 
-/// One doctor run: the read-only store, what was found, and the Keychain's state, asked at
-/// most once and only when a check needs a secret.
+/// One doctor run: the read-only store, what was found, and the state of each Keychain (the
+/// vault's, and each provider's own), asked at most once and only when a check needs a secret
+/// from it.
 struct Run<'e> {
     engine: &'e Engine,
     now_ms: i64,
     stored: Stored,
     secrets: OnceCell<Secrets>,
+    provider_secrets: RefCell<BTreeMap<ProviderId, Secrets>>,
     out: Vec<(Option<ProviderId>, Check)>,
+}
+
+fn secrets_of(state: LockState) -> Secrets {
+    match state {
+        LockState::Unlocked => Secrets::Readable,
+        LockState::Locked => Secrets::Locked,
+        LockState::Unknown => Secrets::Unknown,
+    }
 }
 
 /// The CLI words that run `args` against `provider`: `--provider` only when it is not the
@@ -260,6 +271,7 @@ impl Engine {
             now_ms: self.now_ms(),
             stored: Stored::Nothing,
             secrets: OnceCell::new(),
+            provider_secrets: RefCell::new(BTreeMap::new()),
             out: Vec::new(),
         };
         run.store();
@@ -316,19 +328,32 @@ impl Run<'_> {
         }
     }
 
-    /// The Keychain's lock state, asked once (Appendix A.3's check, which never prompts and is
-    /// bounded by its timeout). A backend with no Keychain (Linux) is always readable.
+    /// The vault's Keychain's lock state, asked once (Appendix A.3's check, which never prompts
+    /// and is bounded by its timeout); it gates every vault read. A backend with no Keychain
+    /// (Linux) is always readable.
     fn secrets(&self) -> Secrets {
         *self
             .secrets
             .get_or_init(|| match self.engine.vault.keychain() {
                 None => Secrets::Readable,
-                Some(k) => match k.lock_state() {
-                    LockState::Unlocked => Secrets::Readable,
-                    LockState::Locked => Secrets::Locked,
-                    LockState::Unknown => Secrets::Unknown,
-                },
+                Some(k) => secrets_of(k.lock_state()),
             })
+    }
+
+    /// The lock state of the Keychain `p` reads its own stores from (the live login, its
+    /// profiles' credentials), asked once per provider; it gates those reads, which the vault's
+    /// state does not speak for when the two Keychains differ. A provider with no Keychain is
+    /// always readable.
+    fn provider_secrets(&self, p: &dyn Provider) -> Secrets {
+        let id = p.id();
+        if let Some(known) = self.provider_secrets.borrow().get(&id) {
+            return *known;
+        }
+        let state = p
+            .keychain_lock_state()
+            .map_or(Secrets::Readable, secrets_of);
+        self.provider_secrets.borrow_mut().insert(id, state);
+        state
     }
 
     /// The providers in scope (`DoctorOptions::provider`, or the default provider and every
@@ -1615,7 +1640,7 @@ impl Run<'_> {
         // makes the switch that was being made; `list` takes it only when the live account's
         // usage is due.
         let retry = command(self.engine, &p.id(), &format!("switch {position}"));
-        if self.secrets() != Secrets::Readable {
+        if self.provider_secrets(p) != Secrets::Readable {
             return Check::warn(
                 "switch.interrupted",
                 format!(
@@ -2095,7 +2120,7 @@ impl Run<'_> {
         }
         // The credential's Keychain item is named from the recorded spelling (§12.2).
         let Some(marker) = marker else { return };
-        if self.secrets() != Secrets::Readable {
+        if self.provider_secrets(p) != Secrets::Readable {
             return;
         }
         let cannot = format!(
@@ -2148,6 +2173,10 @@ impl Run<'_> {
         let Some(p_fp) = p.fingerprint(&held).filter(|_| p.has_refresh_token(&held)) else {
             return;
         };
+        // The vault's Keychain can be locked while the provider's is not.
+        if self.secrets() != Secrets::Readable {
+            return;
+        }
         // An entry that cannot be read is `accounts.vault`'s `fail`, in the same run.
         let Read::Present(vault) = self.engine.vault.read(&row.id) else {
             return;
@@ -2435,9 +2464,20 @@ impl Run<'_> {
     }
 
     /// §13.6: the one warning for every check skipped because the Keychain could not be read
-    /// without unlocking it. Said only when a check needed a secret.
+    /// without unlocking it, the vault's or a provider's. Said once, only when a check needed a
+    /// secret, and a locked Keychain over one whose state cannot be told.
     fn keychain_note(&mut self) {
-        let Some(state) = self.secrets.get().copied() else {
+        let states: Vec<Secrets> = self
+            .secrets
+            .get()
+            .copied()
+            .into_iter()
+            .chain(self.provider_secrets.borrow().values().copied())
+            .collect();
+        let Some(state) = [Secrets::Locked, Secrets::Unknown]
+            .into_iter()
+            .find(|s| states.contains(s))
+        else {
             return;
         };
         let check = match state {
