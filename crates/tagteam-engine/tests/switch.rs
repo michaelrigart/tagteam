@@ -879,6 +879,22 @@ fn cc_holding_its_refresh_lock_blocks_the_switch_and_changes_nothing() {
     );
 }
 
+#[test]
+fn a_switch_reports_whether_it_replaced_a_live_managed_key() {
+    // Appendix A.7: CC keeps the managed key for its process's life, so the output must say
+    // to restart it even when no stored account held the key.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live: b
+    assert!(!switch(&fx, to(&a), false).unwrap().managed_key_replaced);
+
+    fx.put_managed_key(STRAY_API_KEY.as_bytes());
+    let out = switch(&fx, to(&b), false).unwrap();
+
+    assert!(out.managed_key_replaced);
+    assert_eq!(fx.managed_key(), None);
+}
+
 /// Whether CC's credential locks and the mutation lock can all be taken now: nothing holds them.
 fn credential_locks_and_guard_free(fx: &Fx) -> bool {
     let free = fs::create_dir(fx.paths().refresh_lock).is_ok();

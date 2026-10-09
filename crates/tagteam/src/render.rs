@@ -671,7 +671,8 @@ pub fn switch_human(o: &SwitchOutcome) -> String {
             let api_key = [o.from.as_ref(), Some(to)]
                 .into_iter()
                 .flatten()
-                .any(|r| r.kind == KIND_API_KEY);
+                .any(|r| r.kind == KIND_API_KEY)
+                || o.managed_key_replaced;
             let hint = match o.stored_in {
                 _ if api_key => API_KEY_HINT,
                 Some(SecretStore::File(_) | SecretStore::Fallback(_)) => FILE_STORE_HINT,
@@ -921,6 +922,7 @@ mod tests {
             warnings: vec![],
             stored_in,
             unmanaged_email: None,
+            managed_key_replaced: false,
         }
     }
 
@@ -997,6 +999,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_switch_that_replaces_a_live_managed_key_no_account_holds_says_to_restart_too() {
+        // No `from` row: the key was a login tagteam does not store.
+        let o = SwitchOutcome {
+            managed_key_replaced: true,
+            ..switched(None, "oauth", SecretStore::Keychain)
+        };
+        assert_eq!(
+            switch_human(&o),
+            "Switched to x@x.co (position 2).\nRestart Claude Code to apply.\n"
+        );
     }
 
     #[test]

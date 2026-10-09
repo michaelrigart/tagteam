@@ -137,6 +137,10 @@ pub struct SwitchOutcome {
     /// Where this switch's credential write put the secret; `None` when it wrote none.
     pub stored_in: Option<SecretStore>,
     pub unmanaged_email: Option<String>,
+    /// A live managed API key was in place and this switch replaced or cleared it, whether or
+    /// not a stored account held it. CC keeps that key for the life of its process (Appendix
+    /// A.7), so the human output says to restart it.
+    pub managed_key_replaced: bool,
 }
 
 /// §9.4 step 1: after this many lock acquisitions that each found the plan outdated, abort.
@@ -203,6 +207,7 @@ fn noop(
         warnings: vec![],
         stored_in: None,
         unmanaged_email,
+        managed_key_replaced: false,
     }
 }
 
@@ -1991,6 +1996,7 @@ impl Engine {
         let target_identity = p.parse_identity(&target.identity_json)?;
         let live = p.read_live_auth(&self.env);
         refuse_unsafe_live_reads(&live)?;
+        let managed_key_replaced = matches!(&live.managed_key, Read::Present(k) if !k.is_empty());
         let doomed = p.doomed(&self.env, locks, LiveChange::Write(&target.kind));
         refuse_unreadable(&doomed)?;
 
@@ -2198,6 +2204,7 @@ impl Engine {
             warnings,
             stored_in: Some(stored_in),
             unmanaged_email: None,
+            managed_key_replaced,
         })
     }
 
