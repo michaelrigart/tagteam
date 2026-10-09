@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 
 use tagteam_cc::{ItemKind, keychain_account};
 use tagteam_provider::keychain::Keychain as _;
-use tagteam_provider::security::{ProcessRunner, SecurityCli};
+use tagteam_provider::security::{ProcessRunner, Runner, SecurityCli};
 use tagteam_provider::{LockState, Read};
 
 use super::guard::{Roots, cc_env};
@@ -89,6 +89,100 @@ fn quoted(path: &Path) -> Result<String, HarnessError> {
     Ok(format!("\"{s}\""))
 }
 
+/// The `security` operations keychain creation needs, so that its failure paths can be tested
+/// without touching a real keychain.
+trait SecurityTool {
+    fn search_list(&self) -> Result<Vec<String>, HarnessError>;
+    fn set_search_list(&self, list: &[String]) -> Result<(), HarnessError>;
+    fn create_keychain(&self, password: &str, path: &Path) -> Result<(), HarnessError>;
+    /// Best effort: the keychain, and its file, are gone afterwards or were never there.
+    fn delete_keychain(&self, path: &Path);
+}
+
+struct RealSecurity;
+
+impl SecurityTool for RealSecurity {
+    fn search_list(&self) -> Result<Vec<String>, HarnessError> {
+        search_list()
+    }
+
+    fn set_search_list(&self, list: &[String]) -> Result<(), HarnessError> {
+        let mut args = vec!["list-keychains", "-d", "user", "-s"];
+        args.extend(list.iter().map(String::as_str));
+        security(&args).map(|_| ())
+    }
+
+    fn create_keychain(&self, password: &str, path: &Path) -> Result<(), HarnessError> {
+        security_line(&format!(
+            "create-keychain -p \"{password}\" {}",
+            quoted(path)?
+        ))
+    }
+
+    fn delete_keychain(&self, path: &Path) {
+        let _ = security(&["delete-keychain", &path.to_string_lossy()]);
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Puts the user's keychain search list back as `before` had it. `create-keychain` may add the
+/// new file to it, where tagteam's own `-s tagteam` probe and purge would meet the compat
+/// keychain.
+fn restore_search_list(tool: &dyn SecurityTool, before: &[String]) -> Result<(), HarnessError> {
+    if tool.search_list()? != before {
+        tool.set_search_list(before)?;
+        if tool.search_list()? != before {
+            return Err(harness(
+                "could not restore the keychain search list after creating a compat keychain",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Formed before `create-keychain` runs: unless `disarm`ed, it puts the search list back,
+/// deletes the keychain file and removes `also`, whatever way creation ended (an error, a `?`
+/// or a panic).
+struct CreationGuard<'a> {
+    tool: &'a dyn SecurityTool,
+    path: &'a Path,
+    before: Vec<String>,
+    also: Option<&'a Path>,
+    armed: bool,
+}
+
+impl<'a> CreationGuard<'a> {
+    fn new(
+        tool: &'a dyn SecurityTool,
+        path: &'a Path,
+        also: Option<&'a Path>,
+    ) -> Result<Self, HarnessError> {
+        Ok(Self {
+            tool,
+            path,
+            before: tool.search_list()?,
+            also,
+            armed: true,
+        })
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CreationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = restore_search_list(self.tool, &self.before);
+            self.tool.delete_keychain(self.path);
+            if let Some(also) = self.also {
+                let _ = fs::remove_file(also);
+            }
+        }
+    }
+}
+
 /// The compat vault's keychain file (Decision 16): the test account's vault, which a
 /// `test-support` `tagteam` reaches through `TAGTEAM_TEST_VAULT_KEYCHAIN`. Its password is a
 /// generated one, kept beside it at 0600.
@@ -98,43 +192,46 @@ pub struct VaultKeychain {
 }
 
 impl VaultKeychain {
-    /// Creates the file, never over an existing one. `create-keychain` may add it to the user's
-    /// search list, where tagteam's own `-s tagteam` probe and purge would meet the compat
-    /// vault; the list is put back as it was.
+    /// Creates the file, never over an existing one, and unlocks it. Whatever fails after
+    /// `create-keychain` leaves neither the keychain nor `vault.password` behind, and the search
+    /// list as it was.
     pub fn create(path: &Path, password_file: &Path) -> Result<Unlocked<Self>, HarnessError> {
+        Self::create_with(&RealSecurity, path, password_file)?.unlock()
+    }
+
+    fn create_with(
+        tool: &dyn SecurityTool,
+        path: &Path,
+        password_file: &Path,
+    ) -> Result<Self, HarnessError> {
+        if password_file.exists() {
+            return Err(harness(format!(
+                "{} exists but the vault does not: delete it, or the compat store, and log in again",
+                password_file.display()
+            )));
+        }
         let password = random_hex()?;
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(password_file)?;
-        f.write_all(password.as_bytes())?;
-        let before = search_list()?;
-        security_line(&format!(
-            "create-keychain -p \"{password}\" {}",
-            quoted(path)?
-        ))?;
+        let guard = CreationGuard::new(tool, path, Some(password_file))?;
+        tool.create_keychain(&password, path)?;
         if !path.is_file() {
             return Err(harness(format!(
                 "security create-keychain made no file at {}",
                 path.display()
             )));
         }
-        if search_list()? != before {
-            let mut args = vec!["list-keychains", "-d", "user", "-s"];
-            args.extend(before.iter().map(String::as_str));
-            security(&args)?;
-            if search_list()? != before {
-                return Err(harness(
-                    "could not restore the keychain search list after creating the compat vault",
-                ));
-            }
-        }
-        Self {
+        restore_search_list(tool, &guard.before)?;
+        // After the keychain exists: a failed create-keychain leaves no password behind.
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(password_file)?;
+        f.write_all(password.as_bytes())?;
+        guard.disarm();
+        Ok(Self {
             path: path.to_path_buf(),
             password_file: password_file.to_path_buf(),
-        }
-        .unlock()
+        })
     }
 
     pub fn open(path: &Path, password_file: &Path) -> Result<Self, HarnessError> {
@@ -223,18 +320,16 @@ impl<K: Relock> Drop for Unlocked<K> {
 pub struct ThrowawayKeychain(pub PathBuf);
 
 impl ThrowawayKeychain {
+    /// Whatever fails after `create-keychain` leaves no file and the search list as it was.
     pub fn create(path: &Path) -> Result<Self, HarnessError> {
-        let before = search_list()?;
-        security_line(&format!(
-            "create-keychain -p \"{}\" {}",
-            random_hex()?,
-            quoted(path)?
-        ))?;
-        if search_list()? != before {
-            let mut args = vec!["list-keychains", "-d", "user", "-s"];
-            args.extend(before.iter().map(String::as_str));
-            security(&args)?;
-        }
+        Self::create_with(&RealSecurity, path)
+    }
+
+    fn create_with(tool: &dyn SecurityTool, path: &Path) -> Result<Self, HarnessError> {
+        let guard = CreationGuard::new(tool, path, None)?;
+        tool.create_keychain(&random_hex()?, path)?;
+        restore_search_list(tool, &guard.before)?;
+        guard.disarm();
         Ok(Self(path.to_path_buf()))
     }
 
@@ -338,9 +433,15 @@ impl CcItem {
     }
 }
 
-/// The login keychain's state by the lock check (Appendix A.3).
-pub fn login_lock_state() -> LockState {
-    SecurityCli::new().lock_state()
+/// The state of the keychain file `file` by the lock check's own probe (Appendix A.3), asked
+/// of that file: the file the caller also locks and unlocks, never whichever keychain is the
+/// default.
+pub fn login_lock_state(file: &Path) -> LockState {
+    lock_state_with(Box::new(ProcessRunner), file)
+}
+
+fn lock_state_with(runner: Box<dyn Runner>, file: &Path) -> LockState {
+    SecurityCli::with_runner(runner, Some(file.to_path_buf())).lock_state()
 }
 
 #[cfg(test)]
@@ -408,5 +509,171 @@ mod tests {
         let h = random_hex().unwrap();
         assert_eq!(h.len(), 32);
         assert_ne!(h, random_hex().unwrap());
+    }
+
+    use std::cell::RefCell;
+
+    /// A `security` double: the search list it holds, and how creation goes wrong.
+    #[derive(Default)]
+    struct Fake {
+        list: RefCell<Vec<String>>,
+        /// `create-keychain` adds the file to the search list, as it may.
+        adds_to_list: bool,
+        /// `create-keychain` writes the file, then reports failure.
+        fails: bool,
+        /// `list-keychains -s` has no effect.
+        cannot_restore: bool,
+        deleted: RefCell<Vec<PathBuf>>,
+    }
+
+    impl SecurityTool for Fake {
+        fn search_list(&self) -> Result<Vec<String>, HarnessError> {
+            Ok(self.list.borrow().clone())
+        }
+
+        fn set_search_list(&self, list: &[String]) -> Result<(), HarnessError> {
+            if !self.cannot_restore {
+                *self.list.borrow_mut() = list.to_vec();
+            }
+            Ok(())
+        }
+
+        fn create_keychain(&self, _password: &str, path: &Path) -> Result<(), HarnessError> {
+            fs::write(path, b"keychain")?;
+            if self.adds_to_list {
+                self.list.borrow_mut().push(path.display().to_string());
+            }
+            if self.fails {
+                return Err(harness("security create-keychain failed: nope"));
+            }
+            Ok(())
+        }
+
+        fn delete_keychain(&self, path: &Path) {
+            self.deleted.borrow_mut().push(path.to_path_buf());
+            self.list
+                .borrow_mut()
+                .retain(|l| l != &path.display().to_string());
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    fn dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("xtask-kc-{tag}-{}", random_hex().unwrap()));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn fake(adds_to_list: bool, fails: bool, cannot_restore: bool) -> Fake {
+        Fake {
+            list: RefCell::new(vec!["/login.keychain-db".into()]),
+            adds_to_list,
+            fails,
+            cannot_restore,
+            ..Fake::default()
+        }
+    }
+
+    #[test]
+    fn a_vault_whose_creation_fails_leaves_no_keychain_no_password_and_the_list_as_it_was() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = dir("vault");
+        let (kc, pw) = (d.join("vault.keychain-db"), d.join("vault.password"));
+        for (tool, why) in [
+            (fake(true, true, false), "create-keychain fails"),
+            (fake(true, false, true), "the list cannot be restored"),
+        ] {
+            let e = VaultKeychain::create_with(&tool, &kc, &pw).err();
+            assert!(e.is_some(), "{why}");
+            assert!(!kc.exists() && !pw.exists(), "{why}");
+            // Deleting the keychain takes it out of the list, restored or not.
+            assert_eq!(*tool.list.borrow(), ["/login.keychain-db"], "{why}");
+            assert_eq!(tool.deleted.borrow().len(), 1, "{why}");
+        }
+        // Success: the password follows the keychain, 0600, and the list is restored.
+        let tool = fake(true, false, false);
+        let made = VaultKeychain::create_with(&tool, &kc, &pw).unwrap();
+        assert_eq!(made.path, kc);
+        assert_eq!(fs::read_to_string(&pw).unwrap().len(), 32);
+        assert_eq!(
+            fs::metadata(&pw).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(*tool.list.borrow(), ["/login.keychain-db"]);
+        assert!(tool.deleted.borrow().is_empty());
+        // An existing password file is never written over, and nothing is created.
+        let tool = fake(false, false, false);
+        fs::remove_file(&kc).unwrap();
+        assert!(VaultKeychain::create_with(&tool, &kc, &pw).is_err());
+        assert!(!kc.exists());
+        assert_eq!(fs::read_to_string(&pw).unwrap().len(), 32, "kept");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_throwaway_keychain_whose_creation_fails_is_deleted_and_the_list_restored() {
+        let d = dir("throwaway");
+        let kc = d.join("probe.keychain-db");
+        let tool = fake(true, true, false);
+        assert!(ThrowawayKeychain::create_with(&tool, &kc).is_err());
+        assert!(!kc.exists());
+        assert_eq!(*tool.list.borrow(), ["/login.keychain-db"]);
+        let tool = fake(true, false, true);
+        assert!(ThrowawayKeychain::create_with(&tool, &kc).is_err());
+        assert!(
+            !kc.exists(),
+            "a list that cannot be restored deletes the file"
+        );
+        let tool = fake(true, false, false);
+        let made = ThrowawayKeychain::create_with(&tool, &kc).unwrap();
+        assert_eq!(made.0, kc);
+        assert_eq!(*tool.list.borrow(), ["/login.keychain-db"]);
+        assert!(kc.exists());
+        std::mem::forget(made); // its Drop would run the real `security delete-keychain`
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_lock_state_is_asked_of_the_file_that_is_locked() {
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use tagteam_provider::security::RunResult;
+        /// A runner that answers `code` and records the arguments it was given.
+        struct Rec(Arc<Mutex<Vec<Vec<String>>>>, i32);
+        impl Runner for Rec {
+            fn run(
+                &self,
+                _program: &str,
+                args: &[String],
+                _stdin: Option<&[u8]>,
+                _timeout: Duration,
+            ) -> RunResult {
+                self.0.lock().unwrap().push(args.to_vec());
+                RunResult::Exited {
+                    code: self.1,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                }
+            }
+
+            fn run_attached(&self, _program: &str, _args: &[String]) -> RunResult {
+                unreachable!("the probe never attaches the terminal")
+            }
+        }
+        let file = Path::new("/Users/t/Library/Keychains/login.keychain-db");
+        for (code, state) in [
+            (0, LockState::Unlocked),
+            (36, LockState::Locked),
+            (1, LockState::Unknown),
+        ] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let got = lock_state_with(Box::new(Rec(seen.clone(), code)), file);
+            assert_eq!(got, state);
+            assert_eq!(
+                *seen.lock().unwrap(),
+                [["show-keychain-info", &file.display().to_string()]]
+            );
+        }
     }
 }

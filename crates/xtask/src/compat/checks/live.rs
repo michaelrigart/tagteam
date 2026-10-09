@@ -241,7 +241,8 @@ pub fn refresh_lock_interop(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     p.expect(
         "CC first: tagteam sent no refresh of its own: its row shows no refresh failure, which resending the consumed generation would be (R9, §7.5 step 4)",
         !refresh_failed,
-        json!({"usageStatus": row["usageStatus"], "usageError": row["usageError"]}),
+        ctx.redact
+            .value(&json!({"usageStatus": row["usageStatus"], "usageError": row["usageError"]})),
     );
     p.expect(
         "CC first: the vault holds CC's generation or the one it held before, never an older one over a newer (§7.5 step 3)",
@@ -526,7 +527,10 @@ pub fn api_key_entry(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
         "api_key",
         v["authMethod"].clone(),
     );
-    p.note("auth status: apiKeySource", v["apiKeySource"].clone());
+    p.note(
+        "auth status: apiKeySource",
+        ctx.redact.value(&v["apiKeySource"]),
+    );
     let capture = Capture::start()?;
     let ran = ctx
         .claude(&live, &REQUEST)

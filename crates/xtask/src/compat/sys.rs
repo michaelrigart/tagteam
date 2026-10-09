@@ -340,6 +340,14 @@ fn end_group(child: &mut Child) -> bool {
 /// as its `Child`, whose pid is its group's id, so that a leader not yet reaped still can be.
 static SURVIVORS: Mutex<Vec<(String, Child)>> = Mutex::new(Vec::new());
 
+/// Tests that start children share `SURVIVORS`, which the quiescence test also empties and
+/// checks: they take this lock, so none can add to it while another asserts on it.
+#[cfg(test)]
+pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Quiescence, before teardown touches a credential: every process group the harness started
 /// is empty. Each group its handle's drop left non-empty is probed again for up to 10 s; the
 /// error names each that still holds a process.
@@ -513,7 +521,7 @@ impl Pty {
 }
 
 /// A `claude` or `tagteam` to start.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Cmd {
     program: PathBuf,
     args: Vec<OsString>,
@@ -523,6 +531,24 @@ pub struct Cmd {
     stdin: Option<Vec<u8>>,
     redact: Redactor,
     cancel: Cancel,
+}
+
+/// What a `{:?}` shows: the program, its arguments as the redactor shows them, and where and
+/// for how long it runs. Never `vars`, which may hold a credential, or `stdin`, which does.
+impl fmt::Debug for Cmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let args: Vec<String> = self
+            .args
+            .iter()
+            .map(|a| self.redact.text(&a.to_string_lossy()))
+            .collect();
+        f.debug_struct("Cmd")
+            .field("program", &self.program)
+            .field("args", &args)
+            .field("cwd", &self.cwd)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Cmd {
@@ -756,6 +782,7 @@ mod tests {
 
     #[test]
     fn a_spawn_needs_the_guard_s_consent() {
+        let _serial = serial();
         let roots = Roots {
             scratch: PathBuf::from("/tmp/tagteam-compat.test"),
             state: PathBuf::from("/nonexistent/state"),
@@ -783,6 +810,7 @@ mod tests {
 
     #[test]
     fn a_process_past_its_deadline_is_ended_with_its_group() {
+        let _serial = serial();
         let roots = Roots {
             scratch: PathBuf::from("/tmp/tagteam-compat.test"),
             state: PathBuf::from("/nonexistent/state"),
@@ -830,6 +858,7 @@ mod tests {
 
     #[test]
     fn a_running_dropped_early_leaves_no_live_child() {
+        let _serial = serial();
         let running = sh("sleep 30 & wait").spawn(&test_roots()).unwrap();
         let pid = running.pid();
         assert!(group_alive(pid), "its group runs");
@@ -840,6 +869,7 @@ mod tests {
 
     #[test]
     fn a_descendant_that_ignores_sigterm_is_killed_with_its_group() {
+        let _serial = serial();
         // The leader ends on SIGTERM; its child, and the child's `sleep`, ignore it.
         let ready = std::env::temp_dir().join(format!("xtask-sys-trap-{}", std::process::id()));
         let _ = std::fs::remove_file(&ready);
@@ -858,6 +888,7 @@ mod tests {
 
     #[test]
     fn a_child_s_output_is_redacted_as_it_is_captured() {
+        let _serial = serial();
         use crate::compat::report::{CheckResult, Evidence, Outcome, Report, Status};
         let org = r#"Acme "Research""#;
         let mut redact = Redactor::default();
@@ -903,6 +934,7 @@ exit 1"#)
 
     #[test]
     fn a_cancelled_wait_ends_the_group_and_nothing_new_starts() {
+        let _serial = serial();
         let token = Cancel::new();
         let running = sh("sleep 30 & wait")
             .cancel(&token)
@@ -940,6 +972,7 @@ exit 1"#)
 
     #[test]
     fn quiescence_waits_for_every_recorded_group_and_names_one_that_stays() {
+        let _serial = serial();
         let child = Command::new("/bin/sleep")
             .arg("30")
             .process_group(0)
@@ -958,5 +991,28 @@ exit 1"#)
         assert_eq!(quiesce_within(Duration::from_secs(5)), Ok(()));
         assert!(!group_alive(pgid), "its leader was reaped");
         assert!(SURVIVORS.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_command_s_debug_output_omits_its_environment_and_standard_input() {
+        let cmd = Cmd::new(
+            Path::new("/bin/sh"),
+            vec![(
+                "CLAUDE_CODE_OAUTH_TOKEN".into(),
+                "sk-ant-oat01-secret".into(),
+            )],
+            Path::new("/"),
+        )
+        .args(["-c", "true"])
+        .stdin(b"sk-ant-api03-secret".to_vec());
+        let shown = format!("{cmd:?}");
+        assert!(
+            !shown.contains("secret") && !shown.contains("CLAUDE_CODE"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("/bin/sh") && shown.contains("\"-c\""),
+            "{shown}"
+        );
     }
 }

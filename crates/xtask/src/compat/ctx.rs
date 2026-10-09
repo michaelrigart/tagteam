@@ -491,9 +491,9 @@ impl Ctx {
         let out = ran.json().unwrap_or(Value::Null);
         let done = ran.success() && (out["switched"] == true || out["reason"] == "already-active");
         if done {
-            Ok(
-                json!({"to": alias, "reason": out["reason"], "credentialStore": out["credentialStore"]}),
-            )
+            Ok(self.redact.value(
+                &json!({"to": alias, "reason": out["reason"], "credentialStore": out["credentialStore"]}),
+            ))
         } else {
             Err(harness(format!(
                 "tagteam switch {alias}: {}",
@@ -662,6 +662,7 @@ mod tests {
 
     #[test]
     fn organizations_named_accounts_and_null_break_neither_setup_nor_the_report() {
+        let _serial = crate::compat::sys::serial();
         use crate::compat::report::{Report, Status};
         use std::os::unix::fs::PermissionsExt as _;
         let scratch = crate::compat::layout::make_scratch().unwrap();
@@ -732,6 +733,7 @@ mod tests {
 
     #[test]
     fn a_daemon_a_check_started_is_stopped_even_after_a_signal() {
+        let _serial = crate::compat::sys::serial();
         use crate::compat::sys::{process_alive, signal};
         use std::os::unix::fs::PermissionsExt as _;
         let scratch = crate::compat::layout::make_scratch().unwrap();

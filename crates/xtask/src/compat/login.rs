@@ -196,10 +196,23 @@ fn log_in(
     }
 
     let list = ctx.list()?;
-    if account(&list, ALIAS_OAUTH).is_none() || account(&list, ALIAS_SETUP_TOKEN).is_none() {
+    let (Some(oauth), Some(setup)) = (
+        account(&list, ALIAS_OAUTH),
+        account(&list, ALIAS_SETUP_TOKEN),
+    ) else {
         return Err(harness(
             "the compat store lacks compat-oauth or compat-setup-token",
         ));
+    };
+    // The login goes only once compat's own vault is seen to hold it. A `tagteam` that ignored
+    // the vault hook (a build without `test-support`) would have stored it in the default
+    // keychain instead, and the scratch home's copy would then be the only other one.
+    for (alias, id) in [(ALIAS_OAUTH, &oauth.id), (ALIAS_SETUP_TOKEN, &setup.id)] {
+        if let Err(e) = ctx.vault_credential(id) {
+            return Err(harness(format!(
+                "compat's vault does not hold {alias} ({e}); the stored login may be in the default keychain (is `tagteam` built with test-support?)"
+            )));
+        }
     }
     // The login's copy in the scratch home goes: the vault holds it now.
     ctx.forget(&live)?;
@@ -238,7 +251,18 @@ mod tests {
     /// A fake `claude` and `tagteam` in `bin`. A bare `claude` stands for `/login`: it writes the
     /// home's credential, says so in `bin/ready`, and waits for `bin/go` (5 s at most). `tagteam
     /// add` exits `add_exit`; `tagteam list --json` names both compat accounts.
-    fn fakes(bin: &Path, add_exit: i32) -> (PathBuf, PathBuf) {
+    fn fakes(bin: &Path, add_exit: i32, vault: bool) -> (PathBuf, PathBuf) {
+        // What a `tagteam` that honours the vault hook leaves in the compat vault (the Linux
+        // file vault: these tests run with `macos` false).
+        let store = |id: &str| {
+            if vault {
+                format!(
+                    r#"mkdir -p "$XDG_DATA_HOME/tagteam/vault" && printf '%s' '{{}}' > "$XDG_DATA_HOME/tagteam/vault/{id}.json""#
+                )
+            } else {
+                String::new()
+            }
+        };
         let claude = script(
             bin,
             "claude",
@@ -259,11 +283,14 @@ exit 0
             "tagteam",
             &format!(
                 r#"case "$1" in
-add) exit {add_exit} ;;
+add) [ {add_exit} -eq 0 ] && {store1}; exit {add_exit} ;;
+add-token) {store2}; exit 0 ;;
 list) printf '%s' '{{"accounts":[{{"alias":"compat-oauth","id":"1","position":1}},{{"alias":"compat-setup-token","id":"2","position":2}}]}}' ;;
 esac
 exit 0
-"#
+"#,
+                store1 = if vault { store("1") } else { ":".into() },
+                store2 = if vault { store("2") } else { ":".into() },
             ),
         );
         (claude, tagteam)
@@ -274,9 +301,10 @@ exit 0
     fn login_with(
         bin: &Path,
         add_exit: i32,
+        vault: bool,
         token: &Cancel,
     ) -> (Result<(), HarnessError>, PathBuf) {
-        let (claude, tagteam) = fakes(bin, add_exit);
+        let (claude, tagteam) = fakes(bin, add_exit, vault);
         let (state, home) = (temp("state"), temp("home"));
         let layout = Layout {
             workspace: PathBuf::from("/w"),
@@ -295,11 +323,12 @@ exit 0
 
     #[test]
     fn a_login_s_scratch_directory_goes_only_once_the_login_is_captured() {
+        let _serial = crate::compat::sys::serial();
         // `tagteam add` fails after `/login`: the directory and its login stay, and are named.
         let bin = temp("bin");
         fs::write(bin.join("go"), "").unwrap();
         let token = Cancel::new();
-        let (done, scratch) = login_with(&bin, 1, &token);
+        let (done, scratch) = login_with(&bin, 1, true, &token);
         let message = done.clone().unwrap_err().0;
         assert!(
             message.contains("tagteam add failed")
@@ -320,7 +349,7 @@ exit 0
             fs::write(watched.join("go"), "").unwrap();
             ready
         });
-        let (done, scratch) = login_with(&waiting, 0, &token);
+        let (done, scratch) = login_with(&waiting, 0, true, &token);
         assert!(interrupt.join().unwrap(), "the fake claude wrote its login");
         let message = done.clone().unwrap_err().0;
         assert!(
@@ -334,12 +363,37 @@ exit 0
 
         // Captured: the scratch home's copy goes, then the directory.
         let token = Cancel::new();
-        let (done, scratch) = login_with(&bin, 0, &token);
+        let (done, scratch) = login_with(&bin, 0, true, &token);
         assert_eq!(done, Ok(()));
         assert!(!scratch.exists());
         assert_eq!(finish(done, &token), EXIT_PASS);
         for dir in [bin, waiting] {
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn a_login_the_vault_does_not_hold_keeps_its_scratch_directory() {
+        let _serial = crate::compat::sys::serial();
+        // A `tagteam` that ignored the vault hook added both accounts somewhere else (the
+        // default keychain): the store lists them, compat's vault holds nothing.
+        let bin = temp("bin");
+        fs::write(bin.join("go"), "").unwrap();
+        let token = Cancel::new();
+        let (done, scratch) = login_with(&bin, 0, false, &token);
+        let message = done.clone().unwrap_err().0;
+        assert!(
+            message.contains("compat's vault does not hold compat-oauth")
+                && message.contains("default keychain")
+                && message.contains(&format!("Kept {}", scratch.display())),
+            "{message}"
+        );
+        assert!(
+            scratch.join("live/.credentials.json").is_file(),
+            "the scratch home's copy is not deleted"
+        );
+        assert_eq!(finish(done, &token), EXIT_HARNESS);
+        fs::remove_dir_all(&scratch).unwrap();
+        fs::remove_dir_all(&bin).unwrap();
     }
 }

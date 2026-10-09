@@ -156,7 +156,7 @@ pub fn auth_status(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     );
     p.note(
         "overridden by apiKeyHelper: apiKeySource",
-        v["apiKeySource"].clone(),
+        ctx.redact.value(&v["apiKeySource"]),
     );
 
     // overridden: a token in the environment, which run scrubs (§12.5).

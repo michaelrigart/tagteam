@@ -5,6 +5,7 @@
 //! carry one, so it goes through `Redactor` as it is captured (`Cmd::redact`), before anything
 //! formats it, and every string a report writes goes through it again (`Report::write`).
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -47,10 +48,19 @@ pub fn fingerprint(secret: &str) -> String {
 /// compat store's accounts (`learn`), and any token-shaped run (`<token>`): one holding
 /// `sk-ant-`, or 40 or more characters of `[A-Za-z0-9_-]`. Where readability and privacy
 /// conflict, privacy wins.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default)]
 pub struct Redactor {
     /// Longest value first, so a value inside another never splits it.
     known: Vec<(String, String)>,
+}
+
+/// What a `{:?}` shows: how many values it learned, never the values.
+impl fmt::Debug for Redactor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Redactor")
+            .field("learned", &self.known.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Redactor {
@@ -144,6 +154,17 @@ impl Redactor {
             .iter()
             .find(|(value, _)| value == k)
             .map_or_else(|| k.to_owned(), |(_, placeholder)| placeholder.clone())
+    }
+
+    /// `outcome` as it may be stored: its summary and every evidence entry redacted. A check's
+    /// `expect_eq` compares raw values and records both, so this is where the raw view of what
+    /// it saw is kept out of the report (`run_checks`).
+    pub fn outcome(&self, outcome: &Outcome) -> Outcome {
+        Outcome {
+            status: outcome.status,
+            summary: self.text(&outcome.summary),
+            evidence: self.evidence(&outcome.evidence),
+        }
     }
 
     fn evidence(&self, evidence: &[Evidence]) -> Vec<Evidence> {
@@ -288,7 +309,7 @@ pub struct CheckResult {
     pub seconds: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default)]
 pub struct Report {
     /// Epoch seconds.
     pub started_at: i64,
@@ -305,8 +326,29 @@ pub struct Report {
     pub blessed: Option<String>,
     /// The signal that ended the run, which then exits 128 + its number.
     pub interrupted: Option<i32>,
+    /// The teardown steps that completed, once teardown has begun (`None` before it).
+    pub teardown: Option<Vec<&'static str>>,
     /// What `write` keeps out of the files.
     pub redact: Redactor,
+}
+
+/// A `{:?}` shows the report as `write` would: through its redactor, which it never shows.
+impl fmt::Debug for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let r = self.redacted();
+        f.debug_struct("Report")
+            .field("started_at", &r.started_at)
+            .field("platform", &r.platform)
+            .field("claude", &r.claude)
+            .field("tested", &r.tested)
+            .field("setup", &r.setup)
+            .field("harness_error", &r.harness_error)
+            .field("checks", &r.checks)
+            .field("blessed", &r.blessed)
+            .field("interrupted", &r.interrupted)
+            .field("teardown", &r.teardown)
+            .finish_non_exhaustive()
+    }
 }
 
 fn evidence_json(e: &[Evidence]) -> Value {
@@ -438,11 +480,7 @@ impl Report {
                 .checks
                 .iter()
                 .map(|c| CheckResult {
-                    outcome: Outcome {
-                        status: c.outcome.status,
-                        summary: r.text(&c.outcome.summary),
-                        evidence: r.evidence(&c.outcome.evidence),
-                    },
+                    outcome: r.outcome(&c.outcome),
                     ..c.clone()
                 })
                 .collect(),
@@ -670,5 +708,49 @@ mod tests {
     fn a_fingerprint_is_short_and_stable() {
         assert_eq!(fingerprint("abc"), "ba7816bf8f01");
         assert_ne!(fingerprint("rt-a"), fingerprint("rt-b"));
+    }
+
+    #[test]
+    fn an_outcome_is_redacted_as_it_is_stored() {
+        // `expect_eq` records the raw actual value: here CC reported the account's email.
+        let mut r = Redactor::default();
+        r.learn("t@x.co", "<account 1>".into());
+        let mut p = Probe::new();
+        p.expect_eq("another identity: email", "other@x.co", "t@x.co");
+        let raw = p.finish("fine");
+        assert!(raw.evidence[0].value.to_string().contains("t@x.co"));
+        let stored = r.outcome(&raw);
+        assert_eq!(
+            stored.evidence[0].value,
+            json!({"expected": "other@x.co", "actual": "<account 1>"})
+        );
+        assert_eq!(stored.status, Status::Fail);
+        assert!(!format!("{stored:?}").contains("t@x.co"));
+    }
+
+    #[test]
+    fn debug_output_shows_no_learned_value() {
+        let mut r = report(&[("auth-status", Status::Fail)]);
+        r.redact.learn("t@x.co", "<account 1>".into());
+        r.harness_error = Some("refresh for t@x.co failed".into());
+        for shown in [format!("{r:?}"), format!("{:#?}", r.redact)] {
+            assert!(!shown.contains("t@x.co"), "{shown}");
+        }
+        assert!(format!("{r:?}").contains("<account 1>"));
+    }
+
+    #[test]
+    fn a_value_with_a_quote_is_redacted_from_text_that_holds_only_its_escaped_form() {
+        // A truncated JSON line is no JSON, so it is redacted as text; the organization's name
+        // appears in it only as JSON escapes it (`\"`), which the raw form does not match.
+        let org = r#"Acme "Research""#;
+        let mut r = Redactor::default();
+        r.learn(org, "<account 1 org>".into());
+        let line = r#"{"organizationName":"Acme \"Research\"","seats":4"#;
+        assert!(!line.contains(org), "only the escaped form is in the text");
+        let shown = r.text(line);
+        assert!(!shown.contains("Research"), "{shown}");
+        assert_eq!(shown, r#"{"organizationName":"<account 1 org>","seats":4"#);
+        assert_eq!(r.text(org), "<account 1 org>");
     }
 }

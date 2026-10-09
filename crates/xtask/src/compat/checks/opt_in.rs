@@ -137,7 +137,7 @@ pub struct Login(pub PathBuf);
 
 impl LoginKeychain for Login {
     fn state(&self) -> LockState {
-        login_lock_state()
+        login_lock_state(&self.0)
     }
 
     fn lock(&self) -> Result<(), HarnessError> {
@@ -243,7 +243,7 @@ pub fn locked_login_keychain(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
             Locked::Ran(was_locked) => was_locked,
             Locked::Unknown => return Ok(Outcome::skip(UNKNOWN_STATE)),
         };
-    let state = login_lock_state();
+    let state = login.state();
     let found = if was_locked {
         LockState::Locked
     } else {
@@ -283,7 +283,10 @@ fn observe_locked(ctx: &Ctx, p: &mut Probe, was_locked: bool) -> Result<bool, Ha
             .filter(|c| c["id"].as_str().is_some_and(|id| id.contains("keychain")))
             .cloned()
             .collect();
-        p.note("doctor's keychain checks", json!(keychain));
+        p.note(
+            "doctor's keychain checks",
+            ctx.redact.value(&json!(keychain)),
+        );
     }
     let dialog =
         ask("Did a dialog asking for your login keychain's password appear?").unwrap_or(false);
@@ -318,6 +321,8 @@ mod tests {
         state: Cell<LockState>,
         locks: Cell<u32>,
         unlocks: Cell<u32>,
+        /// `unlock` fails, leaving the keychain locked.
+        unlock_fails: bool,
     }
 
     impl Double {
@@ -326,6 +331,7 @@ mod tests {
                 state: Cell::new(state),
                 locks: Cell::new(0),
                 unlocks: Cell::new(0),
+                unlock_fails: false,
             }
         }
     }
@@ -343,6 +349,9 @@ mod tests {
 
         fn unlock(&self) -> Result<(), HarnessError> {
             self.unlocks.set(self.unlocks.get() + 1);
+            if self.unlock_fails {
+                return Err(harness("security unlock-keychain failed"));
+            }
             self.state.set(LockState::Unlocked);
             Ok(())
         }
@@ -398,5 +407,54 @@ mod tests {
         assert!(stopped.is_err());
         assert_eq!((login.locks.get(), login.unlocks.get()), (0, 0));
         assert_eq!(login.state(), LockState::Locked);
+    }
+
+    #[test]
+    fn an_unlock_that_fails_says_the_keychain_is_still_locked_whatever_the_check_met() {
+        let failing = || Double {
+            unlock_fails: true,
+            ..Double::new(LockState::Unlocked)
+        };
+        let by_hand = "your login keychain is still locked; unlock it by hand with `security unlock-keychain`";
+        // The check finished; only the unlock failed.
+        let login = failing();
+        let e = with_login_locked(&login, |_| Ok(())).unwrap_err().0;
+        assert!(
+            e.starts_with("security unlock-keychain failed:") && e.contains(by_hand),
+            "{e}"
+        );
+        assert_eq!((login.locks.get(), login.unlocks.get()), (1, 1));
+        // The check met an error too: the unlock failure leads, and names what it met.
+        let login = failing();
+        let e = with_login_locked(&login, |_| -> Result<(), HarnessError> {
+            Err(interrupted(2))
+        })
+        .unwrap_err()
+        .0;
+        assert!(
+            e.contains(by_hand) && e.ends_with("(the check met: interrupted by SIGINT)"),
+            "{e}"
+        );
+        // The check panicked: the panic is not resumed over a keychain left locked.
+        let login = failing();
+        let e = catch_unwind(AssertUnwindSafe(|| {
+            with_login_locked(&login, |_| -> Result<(), HarnessError> {
+                panic!("a check bug")
+            })
+        }))
+        .expect("the unlock failure is returned, not the panic")
+        .unwrap_err()
+        .0;
+        assert!(
+            e.contains(by_hand) && e.ends_with("(the check panicked)"),
+            "{e}"
+        );
+        // A keychain locked beforehand is never unlocked, so nothing can fail.
+        let login = Double {
+            unlock_fails: true,
+            ..Double::new(LockState::Locked)
+        };
+        assert_eq!(with_login_locked(&login, Ok), Ok(Locked::Ran(true)));
+        assert_eq!(login.unlocks.get(), 0);
     }
 }
