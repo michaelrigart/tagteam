@@ -10,8 +10,10 @@ use std::path::Path;
 
 use common::{LOCKED, cc_profile, cmd, live_email, two_fresh_accounts};
 use serde_json::{Value, json};
+use tagteam_core::{AccountId, ProviderId};
+use tagteam_engine::store::{NewAccount, Store};
 use tagteam_engine::vault::SERVICE;
-use tagteam_provider::{Env, FileKeychain, Keychain, Read};
+use tagteam_provider::{Env, FileKeychain, Identity, Keychain, Read};
 
 fn json_of(out: &std::process::Output) -> Value {
     serde_json::from_slice(&out.stdout).unwrap()
@@ -348,4 +350,72 @@ fn the_usage_error_comes_before_the_run_shell_refusal() {
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(json_of(&out)["error"]["type"], "usage");
     assert!(keychain(d.path()).find(SERVICE, &a).is_present());
+}
+
+/// Stores an account of `provider`, which this build does not register, as another tagteam's
+/// provider leaves one.
+fn plant_unregistered_account(root: &Path, provider: &str, id: &str) {
+    let store = Store::open_existing(&Env::for_test(root).data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    store
+        .insert_account(&NewAccount {
+            id: &AccountId::from_string(id),
+            provider: &ProviderId::new(provider),
+            position: 1,
+            identity_key: "g@x.co\n",
+            identity: &Identity {
+                label: "g@x.co".into(),
+                email: Some("g@x.co".into()),
+                org_uuid: String::new(),
+                org_name: None,
+                account_uuid: None,
+                raw: json!({"emailAddress": "g@x.co"}),
+            },
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 1,
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_provider_purge_accepts_a_provider_the_store_holds_accounts_of_though_this_build_has_none() {
+    // Codex pre-merge slice 5 (§10.5): purge is the way out of a state tagteam cannot repair.
+    let d = tempfile::tempdir().unwrap();
+    let (a, _) = two_fresh_accounts(d.path());
+    plant_unregistered_account(d.path(), "ghost", "0192-ghost");
+
+    let out = purge(d.path(), &["--provider", "ghost", "--yes", "--json"]);
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v = json_of(&out);
+    assert_eq!(v["provider"], json!("ghost"));
+    assert_eq!(v["accounts"].as_array().unwrap().len(), 1, "{v}");
+    let store = Store::open_existing(&Env::for_test(d.path()).data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .accounts(&ProviderId::new("ghost"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        keychain(d.path()).find(SERVICE, &a).is_present(),
+        "another provider's account stays"
+    );
+
+    // Once its accounts are gone, and for a name the store never held, it is unknown.
+    for name in ["ghost", "nosuch"] {
+        let out = purge(d.path(), &["--provider", name, "--yes", "--json"]);
+        assert_eq!(out.status.code(), Some(1), "{name}");
+        assert_eq!(json_of(&out)["error"]["type"], "unknown-provider", "{name}");
+    }
 }

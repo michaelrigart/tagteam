@@ -719,7 +719,14 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
         keychain,
         io,
     };
-    if let Some(p) = &app.provider_flag {
+    // `purge --provider P` also names a provider this build does not register, while the store
+    // holds accounts of it (§10.5); `purge_plan` validates that, and refuses any other name as
+    // unknown-provider all the same.
+    if let Some(p) = app
+        .provider_flag
+        .as_ref()
+        .filter(|_| !matches!(command, Command::Purge { .. }))
+    {
         if let Err(e) = app.engine.provider(p) {
             return Ended::Code(fail(app.io, json, e.kind(), &e.to_string()));
         }
