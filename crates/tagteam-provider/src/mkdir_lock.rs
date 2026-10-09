@@ -11,7 +11,7 @@ use crate::cancel::Cancel;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
-    #[error("timed out waiting for the lock {0}")]
+    #[error("{}", timeout_text(.0))]
     Timeout(PathBuf),
     #[error("the lock {0} was taken over while held")]
     Compromised(PathBuf),
@@ -20,6 +20,24 @@ pub enum LockError {
     /// The cancel token was set while waiting (§14.1). The wait took nothing.
     #[error("interrupted while waiting for the lock {path}")]
     Interrupted { path: PathBuf, signal: i32 },
+}
+
+/// A timeout's message. CC's config lock (`<global config>.lock`) may be one CC left behind
+/// after a short command, which frees itself once stale (10 s, plus up to 1 s that its mtime
+/// can lie in the future, §9.1), so its message says so.
+fn timeout_text(path: &Path) -> String {
+    let base = format!("timed out waiting for the lock {}", path.display());
+    let config = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".json.lock"));
+    if config {
+        format!(
+            "{base}; Claude Code may have left it behind after a short command, and it frees itself within about 11 s, so retry"
+        )
+    } else {
+        base
+    }
 }
 
 impl LockError {
@@ -224,6 +242,31 @@ impl MkdirLock {
             check_cancel(&spec.cancel, &spec.path)?;
             if let Some(lock) = Self::try_acquire(spec)? {
                 return Ok(lock);
+            }
+            if Instant::now() >= deadline {
+                return Err(LockError::Timeout(spec.path.clone()));
+            }
+            thread::sleep(Duration::from_millis(fastrand::u64(250..=500)));
+        }
+    }
+
+    /// Waits up to `acquire_timeout`, polling every 250-500 ms, until the lock directory is
+    /// absent or stale, and takes nothing (§9.1's pre-wait). Staleness is judged as
+    /// `try_acquire` judges it, so a lock whose mtime lies in the future reads as age 0.
+    /// `spec.cancel` is checked before every look (§14.1).
+    pub fn wait_idle(spec: &MkdirLockSpec) -> Result<(), LockError> {
+        let deadline = Instant::now() + spec.acquire_timeout;
+        loop {
+            check_cancel(&spec.cancel, &spec.path)?;
+            match fs::metadata(&spec.path).and_then(|m| m.modified()) {
+                Ok(mtime) => {
+                    let age = SystemTime::now().duration_since(mtime).unwrap_or_default();
+                    if age > spec.stale {
+                        return Ok(());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e.into()),
             }
             if Instant::now() >= deadline {
                 return Err(LockError::Timeout(spec.path.clone()));
@@ -660,6 +703,63 @@ mod tests {
         let _held = MkdirLock::acquire(&s).unwrap();
         assert!(matches!(MkdirLock::acquire(&s), Err(LockError::Timeout(_))));
         assert!(MkdirLock::try_acquire(&s).unwrap().is_none());
+    }
+
+    #[test]
+    fn wait_idle_returns_at_once_for_an_absent_lock_and_takes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 100, 3_000);
+        MkdirLock::wait_idle(&s).unwrap();
+        assert!(!s.path.exists());
+    }
+
+    #[test]
+    fn wait_idle_outlasts_a_lock_with_a_future_mtime_and_leaves_it() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 1_000, 5_000, 3_000);
+        fs::create_dir(&s.path).unwrap();
+        set_dir_mtime(&s.path, SystemTime::now() + Duration::from_secs(1)).unwrap();
+        let start = Instant::now();
+        MkdirLock::wait_idle(&s).unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(1_900),
+            "returned after {:?}, before the lock went stale",
+            start.elapsed()
+        );
+        assert!(s.path.is_dir(), "the pre-wait takes nothing over");
+    }
+
+    #[test]
+    fn wait_idle_times_out_on_a_lock_that_stays_fresh() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 600, 3_000);
+        fs::create_dir(&s.path).unwrap();
+        assert!(matches!(
+            MkdirLock::wait_idle(&s),
+            Err(LockError::Timeout(p)) if p == s.path
+        ));
+    }
+
+    #[test]
+    fn wait_idle_is_a_cancellation_point() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 30_000, 3_000);
+        fs::create_dir(&s.path).unwrap();
+        s.cancel.request(15);
+        assert_eq!(MkdirLock::wait_idle(&s).unwrap_err().signal(), Some(15));
+    }
+
+    #[test]
+    fn a_config_lock_timeout_says_it_frees_itself_and_other_locks_do_not() {
+        let config = LockError::Timeout(PathBuf::from("/h/.claude.json.lock")).to_string();
+        assert_eq!(
+            config,
+            "timed out waiting for the lock /h/.claude.json.lock; Claude Code may have left it behind after a short command, and it frees itself within about 11 s, so retry"
+        );
+        assert_eq!(
+            LockError::Timeout(PathBuf::from("/h/.oauth_refresh.lock")).to_string(),
+            "timed out waiting for the lock /h/.oauth_refresh.lock"
+        );
     }
 
     #[test]

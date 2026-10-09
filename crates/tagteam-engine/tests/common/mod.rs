@@ -288,6 +288,16 @@ impl Fx {
         Self::build(Platform::MacOs, |_| {}, |cc| cc.with_lock_timeout(timeout))
     }
 
+    /// `with_lock_timeout` with its own budget for the config lock, so a test can tell it from
+    /// the credential locks' (§9.1).
+    pub fn with_lock_budgets(locks: Duration, config: Duration) -> Self {
+        Self::build(
+            Platform::MacOs,
+            |_| {},
+            |cc| cc.with_lock_timeout(locks).with_config_lock_timeout(config),
+        )
+    }
+
     fn build(
         platform: Platform,
         adjust: impl FnOnce(&mut Env),

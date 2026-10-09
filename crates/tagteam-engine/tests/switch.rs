@@ -877,6 +877,67 @@ fn cc_holding_its_refresh_lock_blocks_the_switch_and_changes_nothing() {
     );
 }
 
+/// Whether CC's credential locks and the mutation lock can all be taken now: nothing holds them.
+fn credential_locks_and_guard_free(fx: &Fx) -> bool {
+    let free = fs::create_dir(fx.paths().refresh_lock).is_ok();
+    if free {
+        fs::remove_dir(fx.paths().refresh_lock).unwrap();
+    }
+    free && !fx.paths().legacy_lock().exists() && mutation_lock_free(&fx.env)
+}
+
+#[test]
+fn a_switch_waits_out_cc_s_config_lock_before_taking_any_lock() {
+    // §9.1: a config lock CC left behind is waited out holding neither the mutation lock nor
+    // CC's credential locks, which CC's own refresh waits on.
+    let fx = Fx::with_lock_budgets(Duration::from_millis(300), Duration::from_secs(5));
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live: b
+    fs::create_dir(fx.paths().config_lock).unwrap(); // left behind, fresh
+
+    let out = std::thread::scope(|s| {
+        let switching = s.spawn(|| switch(&fx, to(&a), false));
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!switching.is_finished(), "the switch did not wait");
+            assert!(
+                credential_locks_and_guard_free(&fx),
+                "the pre-wait holds a lock"
+            );
+        }
+        fs::remove_dir(fx.paths().config_lock).unwrap();
+        switching.join().unwrap()
+    })
+    .unwrap();
+
+    assert_eq!(out.to.unwrap().id, a);
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+}
+
+#[test]
+fn a_config_lock_that_outlasts_the_pre_wait_refuses_with_a_lock_timeout_and_changes_nothing() {
+    let fx = Fx::with_lock_budgets(Duration::from_millis(300), Duration::from_millis(600));
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fs::create_dir(fx.paths().config_lock).unwrap();
+    let config = fs::read(fx.paths().global_config).unwrap();
+
+    let err = switch(&fx, to(&a), false).unwrap_err();
+
+    assert_eq!(err.kind(), "lock-timeout");
+    assert!(
+        err.to_string().contains("frees itself within about 11 s"),
+        "{err}"
+    );
+    assert_eq!(fs::read(fx.paths().global_config).unwrap(), config);
+    assert_eq!(
+        fx.engine.store().unwrap().active(&fx.provider()).unwrap(),
+        Some(b)
+    );
+    assert!(credential_locks_and_guard_free(&fx));
+    assert!(fx.paths().config_lock.is_dir(), "CC's lock is left alone");
+}
+
 /// When `id`'s next poll is planned, in seconds from now.
 fn planned_in(fx: &Fx, id: &AccountId) -> i64 {
     fx.usage_state(id).unwrap().next_poll_at.unwrap() - fx.engine.now_ms() / 1000

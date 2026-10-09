@@ -607,7 +607,7 @@ impl Engine {
     }
 
     /// Writes `secret` to the live store under the config lock, taken now with its own budget
-    /// (§9.1) and waited for under `cancel` (§14.1), then retires `retire` once the write reads
+    /// (§9.1: the config lock's own 12 s) and waited for under `cancel` (§14.1), then retires `retire` once the write reads
     /// back. `false` when the live store was not written; the caller reports
     /// `PersistedNotPublished`, and the next pass reconciles it (§7.5 step 3). What the write
     /// destroys is saved first unless a vault generation already holds it (§9.4 step 7's rule).
@@ -632,7 +632,10 @@ impl Engine {
         };
         let mut env = self.env.clone();
         env.cancel = cancel.clone();
-        let locks = match p.lock_config(&env, cred, p.live_lock_budget()) {
+        if let Err(e) = hooks::point(self, "active-before-config-lock") {
+            return not_published(e);
+        }
+        let locks = match p.lock_config(&env, cred, p.config_lock_budget()) {
             Ok(locks) => locks,
             Err(e) => return not_published(EngineError::from(e)),
         };

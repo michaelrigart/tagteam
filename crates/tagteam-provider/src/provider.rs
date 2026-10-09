@@ -579,6 +579,16 @@ pub trait Provider: Send + Sync {
     fn read_live_auth(&self, env: &Env) -> LiveAuth;
     /// How long the live locks may take, both stages together (§9.1: CC 9 s).
     fn live_lock_budget(&self) -> Duration;
+    /// How long a wait for the provider's config lock may take where it is taken alone or after
+    /// its request, and how long the pre-wait below may (§9.1: CC 12 s, its staleness plus the
+    /// up to 1 s a lock it left behind can carry in the future).
+    fn config_lock_budget(&self) -> Duration;
+    /// §9.1's pre-wait, run before `MutationGuard` is taken, holding no lock: waits until the
+    /// default home's config lock is absent or stale, for up to `config_lock_budget`, and takes
+    /// nothing. A cancellation point (§14.1). A provider without such a lock returns at once.
+    fn wait_config_lock_idle(&self, _env: &Env) -> Result<(), ProviderError> {
+        Ok(())
+    }
     /// The first stage of the live locks (for CC: the refresh lock, then the legacy lock).
     fn lock_credentials<'g>(
         &self,
@@ -606,6 +616,15 @@ pub trait Provider: Send + Sync {
             |cred, budget| self.lock_config(env, cred, budget),
         )
     }
+    /// §9.1 (amended): splices `identity` into the live config once more, after a switch has
+    /// committed and a re-read found another there. Takes the config lock alone, with
+    /// `config_lock_budget`, and no credential lock; `_guard` shows `MutationGuard` is held.
+    fn resplice_identity(
+        &self,
+        env: &Env,
+        _guard: &MutationGuard,
+        identity: &Identity,
+    ) -> Result<(), ProviderError>;
     /// Every live entry holding secrets that `change` overwrites or deletes, on either auth
     /// axis, read now under `locks` (§9.4 step 7): the entries it writes or clears, and the
     /// copies of them no reader sees that go with them.

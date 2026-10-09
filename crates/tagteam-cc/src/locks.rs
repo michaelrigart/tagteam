@@ -8,6 +8,9 @@ use crate::paths::CcPaths;
 pub const CRED_STALE: Duration = Duration::from_secs(60);
 pub const CONFIG_STALE: Duration = Duration::from_secs(10);
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(9);
+/// The config lock's own budget (§9.1): its staleness plus the up to 1 s that a lock CC left
+/// behind can carry in the future (Appendix A.7), with room. The credential locks keep 9 s.
+pub const CONFIG_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(12);
 /// CC's storage-write lock goes stale after 15 s (§9.1, Appendix A.1).
 pub const STORAGE_WRITE_STALE: Duration = Duration::from_secs(15);
 
@@ -86,6 +89,18 @@ pub fn acquire_config(
                 .with_cancel(cancel),
         )?,
     })
+}
+
+/// §9.1's pre-wait: until the config lock is absent or stale, for up to `timeout`, under
+/// `cancel` (§14.1). Takes nothing and holds nothing, so a caller holds no lock while it waits.
+pub fn wait_config_idle(
+    paths: &CcPaths,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<(), LockError> {
+    MkdirLock::wait_idle(
+        &MkdirLockSpec::new(paths.config_lock.clone(), CONFIG_STALE, timeout).with_cancel(cancel),
+    )
 }
 
 /// CC's storage-write lock (§9.1): the pair of lock directories, `.storage-write` (recorded
@@ -278,6 +293,80 @@ mod tests {
             p.config_lock.is_dir(),
             "the other holder's lock is left alone"
         );
+    }
+
+    /// A config lock `proper-lockfile` left behind after a short command: fresh, with an mtime
+    /// 1 s ahead of now (Appendix A.7).
+    fn left_behind(p: &CcPaths) {
+        fs::create_dir(&p.config_lock).unwrap();
+        fs::File::open(&p.config_lock)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn the_config_lock_has_its_own_twelve_second_budget() {
+        assert_eq!(CONFIG_ACQUIRE_TIMEOUT, Duration::from_secs(12));
+        assert_eq!(ACQUIRE_TIMEOUT, Duration::from_secs(9));
+        assert!(CONFIG_ACQUIRE_TIMEOUT > CONFIG_STALE + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_lock_left_behind_with_a_future_mtime_outlasts_the_credential_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        left_behind(&p);
+        let start = Instant::now();
+        assert!(matches!(
+            acquire_config(&p, ACQUIRE_TIMEOUT, &Cancel::new()),
+            Err(LockError::Timeout(_))
+        ));
+        assert!(start.elapsed() >= ACQUIRE_TIMEOUT);
+    }
+
+    #[test]
+    fn a_lock_left_behind_with_a_future_mtime_is_acquired_once_stale_within_the_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        left_behind(&p);
+        let start = Instant::now();
+        let set = acquire_config(&p, CONFIG_ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
+        let waited = start.elapsed();
+        assert!(set.check_owned().is_ok());
+        assert!(
+            waited >= CONFIG_STALE && waited < CONFIG_ACQUIRE_TIMEOUT,
+            "acquired after {waited:?}"
+        );
+    }
+
+    #[test]
+    fn the_pre_wait_outlasts_a_lock_left_behind_and_takes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        left_behind(&p);
+        let start = Instant::now();
+        wait_config_idle(&p, CONFIG_ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
+        let waited = start.elapsed();
+        assert!(
+            waited >= CONFIG_STALE && waited < CONFIG_ACQUIRE_TIMEOUT,
+            "idle after {waited:?}"
+        );
+        assert!(p.config_lock.is_dir(), "the pre-wait takes nothing over");
+    }
+
+    #[test]
+    fn the_pre_wait_returns_at_once_without_a_lock_and_is_a_cancellation_point() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        let start = Instant::now();
+        wait_config_idle(&p, CONFIG_ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        fs::create_dir(&p.config_lock).unwrap(); // fresh
+        let cancel = Cancel::new();
+        cancel.request(libc::SIGINT);
+        let err = wait_config_idle(&p, CONFIG_ACQUIRE_TIMEOUT, &cancel).unwrap_err();
+        assert_eq!(err.signal(), Some(libc::SIGINT));
     }
 
     /// Sets `cancel` to SIGINT from another thread 200 ms from now, as the CLI's handler would

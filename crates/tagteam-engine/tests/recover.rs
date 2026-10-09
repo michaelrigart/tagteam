@@ -213,6 +213,40 @@ fn a_recovery_that_cannot_take_cc_s_lock_names_it_instead_of_advising_force() {
 }
 
 #[test]
+fn a_recovery_waits_out_cc_s_config_lock_before_taking_any_lock() {
+    // §9.1: the pre-wait comes first for recovery too, holding neither the mutation lock nor
+    // CC's credential locks.
+    let fx = Fx::with_lock_budgets(Duration::from_millis(300), Duration::from_secs(5));
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    fs::create_dir(fx.paths().config_lock).unwrap(); // left behind, fresh
+
+    std::thread::scope(|s| {
+        let recovering = s.spawn(|| any_mutation(&fx, &a));
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!recovering.is_finished(), "the recovery did not wait");
+            let free = fs::create_dir(fx.paths().refresh_lock).is_ok();
+            if free {
+                fs::remove_dir(fx.paths().refresh_lock).unwrap();
+            }
+            assert!(free, "the pre-wait holds CC's refresh lock");
+            assert!(
+                common::mutation_lock_free(&fx.env),
+                "the pre-wait holds the mutation lock"
+            );
+        }
+        fs::remove_dir(fx.paths().config_lock).unwrap();
+        recovering.join().unwrap();
+    });
+
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert_journal_cleared(&fx);
+}
+
+#[test]
 fn a_stale_file_behind_an_unreadable_keychain_is_undecidable() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");

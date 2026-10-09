@@ -559,7 +559,7 @@ impl Engine {
         let p = self.provider(&account.provider)?;
         let p = p.as_ref();
         hooks::point(self, "exit-before-locks")?;
-        let guard = MutationGuard::acquire(&self.env, MutationGuard::BOOTSTRAP_TIMEOUT)?;
+        let guard = self.acquire_guard(MutationGuard::BOOTSTRAP_TIMEOUT)?;
         let lock = self.lock_account(&account.id)?;
         let own = reservation.path().to_path_buf();
         let failed = self

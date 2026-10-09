@@ -173,6 +173,7 @@ fn a_stuck_rejected_fp_goes_to_active_refresh_before_any_request() {
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
 fn a_refused_token_that_active_refresh_left_live_is_never_sent() {
     // §7.5 refreshes the refused token but cannot publish the successor (CC holds its config
     // lock): the live store still holds the refused token, so nothing is sent.
@@ -181,10 +182,22 @@ fn a_refused_token_that_active_refresh_left_live_is_never_sent() {
     refuse(&fx, &a, "rt-a");
     fx.script_refresh(Some("rt-a2"));
     fx.script_usage(200, usage_fixture());
-    fs::create_dir(fx.paths().config_lock).unwrap();
+    // CC takes the lock once the pre-wait (§9.1) is over, before the successor is published.
+    let taken = fx.paths().config_lock;
+    fx.engine.on_point(
+        "active-before-config-lock",
+        Box::new(move || fs::create_dir(&taken).unwrap()),
+    );
+    // And lets go of it before the next mutation lock, whose pre-wait would otherwise wait it out.
+    let held = fx.paths().config_lock;
+    fx.engine.also_on_point(
+        "before-mutation-lock",
+        Box::new(move || {
+            let _ = fs::remove_dir(&held);
+        }),
+    );
 
     let report = fx.collect(&[&a]);
-    fs::remove_dir(fx.paths().config_lock).unwrap();
 
     assert_eq!(report.outcomes, [(a.clone(), failed("token-expired"))]);
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);

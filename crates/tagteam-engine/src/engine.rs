@@ -67,7 +67,7 @@ pub struct Engine {
     pub(crate) fail_at: Mutex<Option<&'static str>>,
     #[cfg(feature = "test-hooks")]
     #[allow(clippy::type_complexity)]
-    pub(crate) on_point: Mutex<Option<(&'static str, Box<dyn Fn() + Send + Sync>)>>,
+    pub(crate) on_point: Mutex<Vec<(&'static str, Box<dyn Fn() + Send + Sync>)>>,
 }
 
 impl Engine {
@@ -88,7 +88,7 @@ impl Engine {
             #[cfg(feature = "test-hooks")]
             fail_at: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
-            on_point: Mutex::new(None),
+            on_point: Mutex::new(Vec::new()),
         }
     }
 
@@ -351,6 +351,19 @@ impl Engine {
         self.guard_recovering_from(ask_oracle, source, timeout, Self::dead_journals)
     }
 
+    /// `MutationGuard`, taken after §9.1's pre-wait: each provider's config lock is waited for,
+    /// holding no lock of tagteam's or of CC's, until it is absent or stale, so neither
+    /// `MutationGuard` nor the credential locks CC's refresh waits on are held through the
+    /// wait. Every acquisition of the guard goes through here. A lock a process holds for its
+    /// whole lifetime (an `auto` engine's, §11.1) stays held. A timeout refuses as a lock
+    /// timeout does.
+    pub(crate) fn acquire_guard(&self, timeout: Duration) -> Result<MutationGuard, EngineError> {
+        for p in self.registry.all() {
+            p.wait_config_lock_idle(&self.env)?;
+        }
+        Ok(MutationGuard::acquire(&self.env, timeout)?)
+    }
+
     /// `guard_recovering` over the rows `journals` gives, read before the lock and again under
     /// it. `purge_guard` passes `dead_decodable_journals`, so a row that does not decode is
     /// left for it to delete (§10.5 step 5) rather than ending it; every other caller reads
@@ -374,7 +387,7 @@ impl Engine {
             })
             .collect::<Result<_, EngineError>>()?;
         hooks::point(self, "before-mutation-lock")?;
-        let guard = MutationGuard::acquire(&self.env, timeout)?;
+        let guard = self.acquire_guard(timeout)?;
         // Enumerated again under the lock: a switch may have died while this command waited,
         // and its row is recovered now too, without a hint.
         let mut blocked = Vec::new();
@@ -556,7 +569,13 @@ impl Engine {
     /// hook point on this same engine: that would deadlock. Drive the race through a second
     /// engine instead (`Fx::engine_with_env`).
     pub fn on_point(&self, name: &'static str, callback: Box<dyn Fn() + Send + Sync>) {
-        *self.on_point.lock().unwrap() = Some((name, callback));
+        *self.on_point.lock().unwrap() = vec![(name, callback)];
+    }
+
+    /// `on_point` for one more point, keeping what is registered: a test that must act at two
+    /// points of one run (a lock taken at one and released at another).
+    pub fn also_on_point(&self, name: &'static str, callback: Box<dyn Fn() + Send + Sync>) {
+        self.on_point.lock().unwrap().push((name, callback));
     }
 }
 

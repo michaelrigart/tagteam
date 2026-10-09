@@ -44,6 +44,9 @@ pub struct ClaudeCode {
     /// How long CC's live locks may take, both stages together (§9.1):
     /// `locks::ACQUIRE_TIMEOUT`, except in tests.
     lock_budget: Duration,
+    /// How long a wait for CC's config lock may take on its own: `locks::CONFIG_ACQUIRE_TIMEOUT`,
+    /// except in tests (§9.1).
+    config_budget: Duration,
     /// Appendix A.5's URLs; `Endpoints::production()` except when the CLI's test-support
     /// build points them at a local server.
     endpoints: Endpoints,
@@ -58,6 +61,7 @@ impl ClaudeCode {
         Self {
             live: Arc::new(store),
             lock_budget: locks::ACQUIRE_TIMEOUT,
+            config_budget: locks::CONFIG_ACQUIRE_TIMEOUT,
             endpoints: Endpoints::production(),
         }
     }
@@ -68,10 +72,20 @@ impl ClaudeCode {
         self
     }
 
-    /// A shorter budget for CC's locks, so a test of a held lock need not wait the full 9 s.
+    /// A shorter budget for CC's locks, so a test of a held lock need not wait the full 9 s
+    /// (or the config lock's 12 s).
     #[cfg(feature = "test-hooks")]
     pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_budget = timeout;
+        self.config_budget = timeout;
+        self
+    }
+
+    /// A budget for the config lock alone, so a test can tell its 12 s from the credential
+    /// locks' 9 s.
+    #[cfg(feature = "test-hooks")]
+    pub fn with_config_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.config_budget = timeout;
         self
     }
 }
@@ -383,6 +397,36 @@ impl Provider for ClaudeCode {
         self.lock_budget
     }
 
+    fn config_lock_budget(&self) -> Duration {
+        self.config_budget
+    }
+
+    fn wait_config_lock_idle(&self, env: &Env) -> Result<(), ProviderError> {
+        Ok(locks::wait_config_idle(
+            &CcPaths::resolve(env),
+            self.config_budget,
+            &env.cancel,
+        )?)
+    }
+
+    fn resplice_identity(
+        &self,
+        env: &Env,
+        _guard: &MutationGuard,
+        identity: &Identity,
+    ) -> Result<(), ProviderError> {
+        let paths = CcPaths::resolve(env);
+        let lock = locks::acquire_config(&paths, self.config_budget, &env.cancel)?;
+        let fence = || lock.check_owned().map_err(ProviderError::from);
+        config::splice_key(
+            &paths.global_config,
+            "oauthAccount",
+            Some(&identity.raw),
+            &fence,
+        )?;
+        Ok(())
+    }
+
     fn lock_credentials<'g>(
         &self,
         env: &Env,
@@ -674,7 +718,7 @@ impl Provider for ClaudeCode {
         dir: &Path,
         identity: &Identity,
     ) -> Result<(), ProviderError> {
-        session::seed(env, dir, identity, self.lock_budget)
+        session::seed(env, dir, identity, self.config_budget)
     }
 
     fn has_baseline(&self, dir: &Path) -> bool {
@@ -687,7 +731,7 @@ impl Provider for ClaudeCode {
         dir: &Path,
         cancel: &Cancel,
     ) -> Result<MergeReport, ProviderError> {
-        session::merge_back(env, dir, self.lock_budget, cancel)
+        session::merge_back(env, dir, self.config_budget, cancel)
     }
 
     /// §12.3 step 4 (Decision 6), under the profile's own credential locks:

@@ -403,6 +403,38 @@ impl Provider for FakeAgent {
         self.lock_budget
     }
 
+    fn config_lock_budget(&self) -> Duration {
+        self.lock_budget
+    }
+
+    fn resplice_identity(
+        &self,
+        env: &Env,
+        _guard: &MutationGuard,
+        identity: &Identity,
+    ) -> Result<(), ProviderError> {
+        let p = FakePaths::resolve(env);
+        let unsplicable = || ProviderError::ConfigUnsplicable {
+            path: p.identity.clone(),
+            remedy: REMEDY,
+        };
+        let before = present_or_err(read_file(&p.identity)).map_err(|_| unsplicable())?;
+        let new = match &before {
+            None => format!(
+                "{{\n  \"identity\": {}\n}}\n",
+                render_nested(&identity.raw, 1)
+            )
+            .into_bytes(),
+            Some(b) => splice::replace_top_level(b, "identity", &identity.raw)
+                .map_err(|_| unsplicable())?,
+        };
+        if before.as_deref() != Some(new.as_slice()) {
+            ensure_private_dir(&p.dir)?;
+            write_atomic_with(&p.identity, &new, 0o600, || Ok::<(), ProviderError>(()))?;
+        }
+        Ok(())
+    }
+
     fn lock_credentials<'g>(
         &self,
         env: &Env,

@@ -16,7 +16,7 @@ pub(crate) fn point(engine: &Engine, name: &'static str) -> Result<(), EngineErr
         std::process::exit(137);
     }
     pause_at(name);
-    if let Some((at, callback)) = &*engine.on_point.lock().unwrap() {
+    for (at, callback) in &*engine.on_point.lock().unwrap() {
         if *at == name {
             callback();
         }
