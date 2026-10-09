@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tagteam_provider::doctor::quoted;
 use tagteam_provider::{LockError, ProviderError, ReadError};
 
+use crate::session::{Damaged, DamagedKind, SessionState};
 use crate::settings::SettingsError;
 use crate::store::StoreError;
 use crate::transfer::TransferError;
@@ -300,66 +301,115 @@ pub(crate) fn daemon_advice(profile: &Path) -> String {
     )
 }
 
-/// What owns a profile that is session-owned (§12.5, §12.6), as a refusal names it: every
-/// owner found, not the first.
+/// What owns a profile that is session-owned (§12.5, §12.6): every live owner and every
+/// unreadable input found, not the first. The one source of every user-facing text about
+/// ownership (refusals, the auto-switch reason, warnings, doctor's `sessions.*` lines).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SessionOwner {
     /// A `tagteam run` session, or any live owner that is not a background daemon.
     pub session: bool,
-    /// A Claude Code background daemon owns it too, in this profile.
+    /// A Claude Code background daemon owns it, in this profile.
     pub daemon: Option<PathBuf>,
-    /// Session state that could not be read, and why (nothing live was found).
-    pub unreadable: Option<String>,
-    /// The supervisor's `daemon.lock` that could not be read, when that is what `unreadable`
-    /// names.
-    pub lock: Option<PathBuf>,
+    /// Every input that could not be read.
+    pub damaged: Vec<Damaged>,
 }
 
 impl SessionOwner {
-    /// The owners `state` found.
-    pub fn of(state: &crate::session::SessionState) -> Self {
-        use crate::session::SessionState;
+    /// The owners and unreadable inputs `state` found.
+    pub fn of(state: &SessionState) -> Self {
         match state {
             SessionState::Owned {
                 profile,
                 session,
                 daemon,
+                damaged,
             } => Self {
                 session: *session,
                 daemon: daemon.then(|| profile.clone()),
-                ..Self::default()
+                damaged: damaged.clone(),
             },
-            SessionState::Unreadable { detail, lock, .. } => Self {
-                unreadable: Some(detail.clone()),
-                lock: lock.clone(),
+            SessionState::Unreadable { damaged, .. } => Self {
+                damaged: damaged.clone(),
                 ..Self::default()
             },
             _ => Self::default(),
         }
     }
 
-    /// Why the profile counts as in use, for a sentence "... {subject} counts as in use by ...".
-    fn reason(&self, subject: &str) -> String {
-        match (&self.unreadable, &self.lock, &self.daemon) {
-            (Some(detail), Some(lock), _) => format!(
-                "{subject} counts as in use by a Claude Code background daemon because its lock {} cannot be read ({detail}); if nothing runs as Claude Code for that profile, delete it, then retry",
-                quoted(lock)
-            ),
-            (Some(detail), None, _) => format!(
-                "{subject} counts as in use by a `tagteam run` session because its session state cannot be read ({detail}); repair or remove that file, then retry"
-            ),
-            (None, _, Some(profile)) if self.session => format!(
-                "{subject} is in use by a `tagteam run` session and by a Claude Code background daemon; exit that session, and {}, then retry",
-                daemon_advice(profile)
-            ),
-            (None, _, Some(profile)) => format!(
-                "{subject} is in use by a Claude Code background daemon; {}, then retry",
-                daemon_advice(profile)
-            ),
-            (None, _, None) => {
-                format!("{subject} is in use by a `tagteam run` session; exit that session first")
+    /// Whether anything live owns it, as opposed to nothing readable.
+    fn live(&self) -> bool {
+        self.session || self.daemon.is_some()
+    }
+
+    /// The unreadable inputs, each named by its quoted file and why: "'f' cannot be read (why)".
+    pub fn damaged_list(&self) -> String {
+        self.damaged
+            .iter()
+            .map(|d| format!("{} cannot be read ({})", quoted(&d.file), d.detail))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Who owns it, as a predicate: "is in use by a `tagteam run` session and by a Claude Code
+    /// background daemon", and "also" the unreadable inputs, or, with nothing live, that it
+    /// "counts as in use because" of them.
+    pub fn who(&self) -> String {
+        let live = match (self.session, self.daemon.is_some()) {
+            (true, true) => {
+                "is in use by a `tagteam run` session and by a Claude Code background daemon"
+            }
+            (true, false) => "is in use by a `tagteam run` session",
+            (false, true) => "is in use by a Claude Code background daemon",
+            (false, false) => "",
+        };
+        match (self.live(), self.damaged.is_empty()) {
+            (true, true) => live.to_owned(),
+            (true, false) => format!("{live}, and also {}", self.damaged_list()),
+            (false, false) => format!("counts as in use because {}", self.damaged_list()),
+            (false, true) => "is in use by a `tagteam run` session".to_owned(),
+        }
+    }
+
+    /// What repairs each unreadable input, once each.
+    pub fn repairs(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for d in &self.damaged {
+            let r = match d.kind {
+                DamagedKind::SupervisorLock => {
+                    "if nothing runs as Claude Code for that profile, delete the lock"
+                }
+                DamagedKind::Record => "repair or remove that record",
+                DamagedKind::Profile | DamagedKind::Reservations | DamagedKind::RecordsDir => {
+                    "make it readable again"
+                }
+            };
+            if !out.iter().any(|o| o == r) {
+                out.push(r.to_owned());
             }
         }
+        out
+    }
+
+    /// What ends each owner, then what repairs each unreadable input.
+    pub fn remedies(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.session || (!self.live() && self.damaged.is_empty()) {
+            out.push("exit that session".to_owned());
+        }
+        if let Some(profile) = &self.daemon {
+            out.push(daemon_advice(profile));
+        }
+        out.extend(self.repairs());
+        out
+    }
+
+    /// The whole sentence about `subject`: who owns it and what to do, then retry.
+    pub fn reason(&self, subject: &str) -> String {
+        format!(
+            "{subject} {}; {}, then retry",
+            self.who(),
+            self.remedies().join("; ")
+        )
     }
 }
 
@@ -371,7 +421,7 @@ fn orphan_message(profile: &Path, owner: &SessionOwner) -> String {
     ))
 }
 
-/// `SessionOwned`'s message: a running session, a daemon, or session state that cannot be read.
+/// `SessionOwned`'s message: a running session, a daemon, or state that cannot be read.
 fn session_owned_message(position: u32, label: &str, owner: &SessionOwner) -> String {
     owner.reason(&format!("position {position} ({label})"))
 }
@@ -631,7 +681,11 @@ mod tests {
                     position: 1,
                     label: "a".into(),
                     owner: Box::new(SessionOwner {
-                        unreadable: Some("/p/sessions/7.json: not JSON".into()),
+                        damaged: vec![Damaged {
+                            kind: DamagedKind::Record,
+                            file: PathBuf::from("/p/sessions/7.json"),
+                            detail: "not JSON".into(),
+                        }],
                         ..SessionOwner::default()
                     }),
                 },

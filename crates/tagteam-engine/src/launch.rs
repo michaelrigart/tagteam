@@ -13,7 +13,7 @@ use tagteam_provider::{MutationGuard, Provider, Read, ReadError};
 use crate::account_lock::AccountLock;
 use crate::bootstrap::{Trigger, refusal, refuse_linked_profile};
 use crate::engine::Engine;
-use crate::error::EngineError;
+use crate::error::{EngineError, SessionOwner};
 use crate::hooks;
 use crate::provenance::ProfileCheck;
 use crate::refresh::{GateOutcome, OwnedBy};
@@ -166,10 +166,11 @@ impl Engine {
                 );
             }
         }
-        if let Some(detail) = state.unreadable_text() {
+        if !state.damaged().is_empty() {
             warnings.push(format!(
-                "a session of position {} may be running ({detail}), so this launch joins it as it is",
-                row.position
+                "a session of position {} may be running ({}), so this launch joins it as it is",
+                row.position,
+                SessionOwner::of(&state).damaged_list()
             ));
         }
         // A marker naming another account refuses first: that profile is neither merged back

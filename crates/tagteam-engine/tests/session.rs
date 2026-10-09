@@ -15,7 +15,7 @@ use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
-use tagteam_engine::session::SessionState;
+use tagteam_engine::session::{DamagedKind, SessionState};
 use tagteam_engine::switch::SwitchReason;
 use tagteam_provider::FlockGuard;
 use tagteam_provider::liveness::{FakeProcess, parse_lstart};
@@ -74,7 +74,8 @@ fn a_held_reservation_owns_the_account_and_a_released_one_does_not() {
         SessionState::Owned {
             profile: dir.clone(),
             session: true,
-            daemon: false
+            daemon: false,
+            damaged: vec![],
         }
     );
     assert!(s.owned());
@@ -100,7 +101,8 @@ fn a_live_record_of_any_kind_owns_the_account() {
             SessionState::Owned {
                 profile: dir,
                 session: kind == "interactive",
-                daemon: kind != "interactive"
+                daemon: kind != "interactive",
+                damaged: vec![],
             },
             "{kind}"
         );
@@ -152,7 +154,8 @@ fn a_dead_or_recycled_record_does_not_own_the_account() {
         SessionState::Owned {
             profile: dir,
             session: true,
-            daemon: false
+            daemon: false,
+            damaged: vec![],
         }
     );
 }
@@ -201,7 +204,8 @@ fn a_live_supervisor_in_daemon_lock_owns_the_account_and_a_dead_one_does_not() {
         SessionState::Owned {
             profile: dir.clone(),
             session: false,
-            daemon: true
+            daemon: true,
+            damaged: vec![],
         }
     );
     assert!(s.owned());
@@ -237,15 +241,13 @@ fn a_daemon_lock_that_cannot_be_read_counts_as_owned() {
         let dir = fx.make_profile(&a);
         fs::write(dir.join("daemon.lock"), bytes).unwrap();
         let s = state(&fx, &a);
-        let SessionState::Unreadable { profile, lock, .. } = &s else {
+        let SessionState::Unreadable { profile, damaged } = &s else {
             panic!("{s:?}")
         };
         assert_eq!(profile, &dir);
-        assert_eq!(lock.as_deref(), Some(dir.join("daemon.lock").as_path()));
-        assert!(
-            s.unreadable_text().unwrap().contains("daemon.lock"),
-            "{s:?}"
-        );
+        assert_eq!(damaged.len(), 1, "{damaged:?}");
+        assert_eq!(damaged[0].kind, DamagedKind::SupervisorLock);
+        assert_eq!(damaged[0].file, dir.join("daemon.lock"));
         assert!(s.owned());
     }
 }
@@ -303,7 +305,8 @@ fn a_live_session_does_not_hide_a_live_supervisor() {
             SessionState::Owned {
                 profile: dir.clone(),
                 session: true,
-                daemon: true
+                daemon: true,
+                damaged: vec![],
             },
             "record: {with_record}"
         );
@@ -322,6 +325,76 @@ fn a_live_session_does_not_hide_a_live_supervisor() {
                 "{message}"
             );
         }
+    }
+}
+
+#[test]
+fn nothing_hides_another_owner_or_another_unreadable_input() {
+    // One aggregate (R-live-owner-diagnosis): an unreadable records directory does not skip
+    // the supervisor, and a live session does not drop an unreadable `daemon.lock`; every text
+    // names each owner and each file.
+    // (a) the records directory cannot be listed, a supervisor is live.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let records = fx.cc.session_records_dir(&dir);
+    fs::create_dir_all(&records).unwrap();
+    plant_daemon_lock(&dir, 4343);
+    run_process(&fx, 4343);
+    fs::set_permissions(&records, fs::Permissions::from_mode(0o000)).unwrap();
+    let s = state(&fx, &a);
+    let errs = [
+        fx.engine.remove(&a).unwrap_err().to_string(),
+        fx.switch_to(&a, false).unwrap_err().to_string(),
+    ];
+    fs::set_permissions(&records, fs::Permissions::from_mode(0o700)).unwrap();
+    let SessionState::Owned {
+        daemon,
+        session,
+        damaged,
+        ..
+    } = &s
+    else {
+        panic!("{s:?}")
+    };
+    assert!(*daemon && !*session, "{s:?}");
+    assert_eq!(damaged.len(), 1, "{damaged:?}");
+    assert_eq!(damaged[0].kind, DamagedKind::RecordsDir);
+    for message in errs {
+        assert!(
+            message.contains("background daemon")
+                && message.contains(&format!("'{}' cannot be read", records.display()))
+                && message.contains("make it readable again"),
+            "{message}"
+        );
+    }
+
+    // (b) a live session, and a `daemon.lock` that cannot be read.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    fx.live_record(&dir, 4242, "interactive");
+    let lock = dir.join("daemon.lock");
+    fs::write(&lock, b"{").unwrap();
+    let s = state(&fx, &a);
+    assert!(
+        matches!(&s, SessionState::Owned { session: true, daemon: false, damaged, .. }
+            if damaged.len() == 1 && damaged[0].kind == DamagedKind::SupervisorLock),
+        "{s:?}"
+    );
+    for message in [
+        fx.engine.remove(&a).unwrap_err().to_string(),
+        fx.switch_to(&a, false).unwrap_err().to_string(),
+    ] {
+        assert!(
+            message.contains("`tagteam run` session")
+                && message.contains("exit that session")
+                && message.contains(&format!("'{}' cannot be read", lock.display()))
+                && message.contains("if nothing runs as Claude Code for that profile"),
+            "{message}"
+        );
     }
 }
 
@@ -346,7 +419,8 @@ fn an_unreadable_daemon_lock_is_named_in_the_refusals_with_its_repair() {
         assert!(
             message.contains(&named)
                 && message.contains("cannot be read")
-                && message.contains("if nothing runs as Claude Code for that profile, delete it")
+                && message
+                    .contains("if nothing runs as Claude Code for that profile, delete the lock")
                 && !message.contains("exit that session"),
             "{message}"
         );
@@ -377,7 +451,7 @@ fn an_unreadable_daemon_lock_that_appears_before_the_gate_is_named_in_the_switch
     let message = err.to_string();
     assert!(
         message.contains(&format!("'{}'", lock.display()))
-            && message.contains("delete it")
+            && message.contains("delete the lock")
             && !message.contains("exit that session"),
         "{message}"
     );
@@ -407,17 +481,13 @@ fn an_unreadable_record_counts_as_owned() {
     fx.dead_record(&dir, 4242);
     fx.plant_record(&dir, "torn", b"{\"pid\":");
     let s = state(&fx, &a);
-    let SessionState::Unreadable {
-        profile,
-        detail,
-        lock,
-    } = &s
-    else {
+    let SessionState::Unreadable { profile, damaged } = &s else {
         panic!("{s:?}")
     };
     assert_eq!(profile, &dir);
-    assert!(detail.contains("torn.json"), "{detail}");
-    assert_eq!(lock, &None, "a record is no supervisor lock");
+    assert_eq!(damaged.len(), 1, "{damaged:?}");
+    assert_eq!(damaged[0].kind, DamagedKind::Record);
+    assert!(damaged[0].file.ends_with("torn.json"), "{damaged:?}");
     assert!(s.owned());
 }
 

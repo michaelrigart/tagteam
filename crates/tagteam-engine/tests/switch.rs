@@ -1416,6 +1416,57 @@ fn a_target_that_is_no_longer_a_candidate_writes_nothing() {
 }
 
 #[test]
+fn an_automatic_switch_to_a_target_a_daemon_or_an_unreadable_lock_holds_says_so() {
+    // §11.2 step 11: the reason is the shared ownership text, naming each owner and each file,
+    // not "a `tagteam run` session".
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    let dir = fx.make_profile(&a);
+    let lock = dir.join("daemon.lock");
+    fs::write(&lock, b"{").unwrap();
+    let out = fx
+        .engine
+        .switch(auto_switch(&fx, &b, &a, Trigger::AtLimit))
+        .unwrap();
+    assert_eq!(out.reason, SwitchReason::NotCandidate);
+    assert!(
+        out.message
+            .contains(&format!("'{}' cannot be read", lock.display()))
+            && out.message.contains("delete the lock")
+            && !out.message.contains("`tagteam run` session"),
+        "{}",
+        out.message
+    );
+    fs::write(
+        &lock,
+        serde_json::json!({"pid": 4343, "origin": "transient", "procStart": common::LSTART})
+            .to_string(),
+    )
+    .unwrap();
+    fx.process.set(
+        4343,
+        tagteam_provider::liveness::FakeProcess {
+            exists: Some(true),
+            start_time_s: tagteam_provider::parse_lstart(common::LSTART),
+            ..Default::default()
+        },
+    );
+    let out = fx
+        .engine
+        .switch(auto_switch(&fx, &b, &a, Trigger::AtLimit))
+        .unwrap();
+    assert_eq!(out.reason, SwitchReason::NotCandidate);
+    assert!(
+        out.message.contains("background daemon")
+            && out.message.contains("claude daemon stop --any"),
+        "{}",
+        out.message
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+#[test]
 fn an_automatic_switch_leaves_freshening_to_the_tick() {
     // §11.2 step 10: the tick freshens each target by its own table before it performs; the
     // switch does not freshen again.

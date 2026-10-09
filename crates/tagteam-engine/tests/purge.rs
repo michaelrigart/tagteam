@@ -541,7 +541,7 @@ fn an_orphaned_profile_with_an_unreadable_daemon_lock_or_a_session_and_a_daemon_
     let message = fx.engine.purge(&plan).unwrap_err().to_string();
     assert!(
         message.contains(&format!("'{}'", lock.display()))
-            && message.contains("if nothing runs as Claude Code for that profile, delete it")
+            && message.contains("if nothing runs as Claude Code for that profile, delete the lock")
             && !message.contains("exit that session"),
         "{message}"
     );

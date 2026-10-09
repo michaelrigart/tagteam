@@ -30,7 +30,7 @@ use tagteam_provider::{
 
 use crate::auto::{engine_lock_path, read_holder};
 use crate::engine::Engine;
-use crate::error::{EngineError, daemon_advice};
+use crate::error::{EngineError, SessionOwner, daemon_advice};
 use crate::profiles::{Held, allowlist, held, is_private, resolved};
 use crate::provenance::identity_drifted;
 use crate::recover::Direction;
@@ -2131,11 +2131,19 @@ impl Run<'_> {
         }
         let state = self.engine.session_state(p, row);
         let quiescent = matches!(state, Ok(SessionState::Quiescent { .. }));
+        // Beside a live owner too: an unreadable input is reported whatever else is found.
         let unread = match &state {
-            Ok(state) => state.unreadable_text(),
-            Err(e) => Some(e.kind().to_owned()),
+            Ok(state) if !state.damaged().is_empty() => {
+                let owner = SessionOwner::of(state);
+                Some((owner.damaged_list(), owner.repairs().join("; ")))
+            }
+            Ok(_) => None,
+            Err(e) => Some((
+                e.kind().to_owned(),
+                "make what it names readable again".to_owned(),
+            )),
         };
-        if let Some(why) = unread {
+        if let Some((why, repair)) = unread {
             found.push(
                 Check::warn(
                     "sessions.state",
@@ -2143,7 +2151,7 @@ impl Run<'_> {
                         "account {n}'s session state cannot be read ({why}), so the account counts as in a session: commands that change it refuse, and its baseline and provenance are not checked"
                     ),
                 )
-                .fix("make what it names readable again; once no session runs in the profile, a damaged session record can be deleted"),
+                .fix(repair),
             );
         }
         if let Ok(daemon @ SessionState::Owned { daemon: true, .. }) = &state {

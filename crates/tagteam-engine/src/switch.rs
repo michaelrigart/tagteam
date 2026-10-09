@@ -19,7 +19,7 @@ use crate::account_lock::AccountLock;
 use crate::collect::{CollectMode, jitter};
 use crate::displace::displace;
 use crate::engine::Engine;
-use crate::error::{EngineError, daemon_advice};
+use crate::error::{EngineError, SessionOwner};
 use crate::hooks;
 use crate::oracle::verdict;
 use crate::provenance::ProfileCheck;
@@ -1156,13 +1156,9 @@ impl Engine {
             Some("it is disabled".to_owned())
         } else if target.quarantine_reason.is_some() {
             Some("it needs a new login".to_owned())
-        } else if let Some(profile) = state.daemon_profile() {
-            Some(format!(
-                "it is in use by a Claude Code background daemon; {}",
-                daemon_advice(profile)
-            ))
         } else if state.owned() {
-            Some("it is in a `tagteam run` session".to_owned())
+            // The same words as `session-owned`'s refusal: every owner and every file.
+            Some(SessionOwner::of(&state).reason("it"))
         } else if !self.has_login(&target)? {
             Some("it has no stored credential".to_owned())
         } else {

@@ -295,7 +295,7 @@ fn a_session_owned_account_replaced_stale_marks_its_profile_and_the_session_keep
     assert_eq!(
         report.warnings,
         [
-            "position 1 is in use by a `tagteam run` session, which keeps its login until it exits; the next `run` starts with the imported one"
+            "position 1 is in use by a `tagteam run` session; whatever runs there keeps its login until it exits, and the next `run` starts with the imported one"
         ]
     );
     let Read::Present(seed) = Seed::read(&dir) else {

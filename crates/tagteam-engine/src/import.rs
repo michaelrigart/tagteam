@@ -11,7 +11,7 @@ use tagteam_core::{AccountId, IdentityKey, ProviderId};
 use tagteam_provider::{Provider, Read, StoredLogin};
 
 use crate::engine::Engine;
-use crate::error::EngineError;
+use crate::error::{EngineError, SessionOwner};
 use crate::lifecycle::{LoginSource, Prepared, check_identity_conflict};
 use crate::store::{AccountRow, Store, StoreError};
 use crate::transfer::ImportRecord;
@@ -282,10 +282,12 @@ impl Engine {
                 flag = self.provider_flag(&account.provider),
             ));
         }
-        if self.session_state(p, &account)?.owned() {
+        let state = self.session_state(p, &account)?;
+        if state.owned() {
             warnings.push(format!(
-                "position {} is in use by a `tagteam run` session, which keeps its login until it exits; the next `run` starts with the imported one",
-                account.position
+                "position {} {}; whatever runs there keeps its login until it exits, and the next `run` starts with the imported one",
+                account.position,
+                SessionOwner::of(&state).who()
             ));
         }
         let message = if quarantined {
