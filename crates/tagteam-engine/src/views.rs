@@ -840,8 +840,13 @@ impl Engine {
             ..stamp
         };
         // Only a cache: a failed write costs the next run a parse, never this one its line.
+        // SQLite's result code, never the error's text (§14.2): its message may be the
+        // database's own.
         if let Err(e) = store.put_live_identity_cache_within(&row, CACHE_WRITE_WAIT) {
-            tracing::debug!(error = %e, "the live identity cache was not written");
+            tracing::debug!(
+                code = e.sqlite_code().map(tracing::field::debug),
+                "the live identity cache was not written"
+            );
         }
         Ok(login)
     }

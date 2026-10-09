@@ -1962,7 +1962,11 @@ mod hooked {
                     "launch-before-locks",
                     Box::new(move || {
                         kc.set_fail_write(SERVICE, false);
-                        other.store().unwrap().clear_quarantine(&id).unwrap();
+                        other
+                            .store()
+                            .unwrap()
+                            .clear_quarantine(&id, "credentials-replaced", "cli", 1)
+                            .unwrap();
                         if joining {
                             *started.lock().unwrap() = FlockGuard::try_lock(&race).unwrap();
                         }

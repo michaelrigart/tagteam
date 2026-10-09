@@ -288,6 +288,16 @@ impl Fx {
         Self::build(Platform::MacOs, |_| {}, |cc| cc.with_lock_timeout(timeout))
     }
 
+    /// `with_lock_timeout` with its own budget for the config lock, so a test can tell it from
+    /// the credential locks' (§9.1).
+    pub fn with_lock_budgets(locks: Duration, config: Duration) -> Self {
+        Self::build(
+            Platform::MacOs,
+            |_| {},
+            |cc| cc.with_lock_timeout(locks).with_config_lock_timeout(config),
+        )
+    }
+
     fn build(
         platform: Platform,
         adjust: impl FnOnce(&mut Env),
@@ -726,7 +736,7 @@ impl Fx {
         self.fixture_vault()
             .store(&lock, new_bytes, &|b| self.cc.fingerprint(b))
             .unwrap();
-        store.finish_replacement(id).unwrap();
+        store.finish_replacement(id, self.clock.now_ms()).unwrap();
     }
 
     /// A vault over the fixture's own backend: the Keychain on macOS, files on Linux, as the

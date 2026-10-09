@@ -14,10 +14,11 @@ use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 
 use crate::cancel::Cancel;
 use crate::credential::{Credential, FreshCredential};
+use crate::doctor::Check;
 use crate::env::Env;
 use crate::flock::MutationGuard;
 use crate::http::{Http, HttpError, HttpResponse};
-use crate::keychain::KeychainError;
+use crate::keychain::{KeychainError, LockState};
 use crate::mkdir_lock::LockError;
 use crate::process::ProcessSpawner;
 use crate::read::{Read, ReadError};
@@ -544,6 +545,24 @@ pub trait Provider: Send + Sync {
     /// `(kind, vault bytes)` for a token given to `add-token`.
     fn token_secret(&self, token: &str) -> (String, Vec<u8>);
 
+    /// §13.3: the provider-owned payload an export file carries for `login`, as
+    /// `(identity, credential)`. Without `full`, the credential keeps only what the login needs
+    /// on another machine; what is bound to this machine stays here (CC: `{claudeAiOauth}`).
+    /// An error names no secret.
+    fn export_login(
+        &self,
+        login: &StoredLogin,
+        full: bool,
+    ) -> Result<(Value, Value), ProviderError>;
+    /// §13.3 pass 1: validates an exported `(identity, credential)` and rebuilds the stored
+    /// login, its kind classified from the credential (CC: §10.2's email pattern). The inverse
+    /// of `export_login`. An error names no secret.
+    fn import_login(
+        &self,
+        identity: &Value,
+        credential: &Value,
+    ) -> Result<StoredLogin, ProviderError>;
+
     fn classify(&self, secret: &[u8]) -> String;
     fn fingerprint(&self, secret: &[u8]) -> Option<Fingerprint>;
     fn has_refresh_token(&self, secret: &[u8]) -> bool;
@@ -560,6 +579,16 @@ pub trait Provider: Send + Sync {
     fn read_live_auth(&self, env: &Env) -> LiveAuth;
     /// How long the live locks may take, both stages together (§9.1: CC 9 s).
     fn live_lock_budget(&self) -> Duration;
+    /// How long a wait for the provider's config lock may take where it is taken alone or after
+    /// its request, and how long the pre-wait below may (§9.1: CC 12 s, its staleness plus the
+    /// up to 1 s a lock it left behind can carry in the future).
+    fn config_lock_budget(&self) -> Duration;
+    /// §9.1's pre-wait, run before `MutationGuard` is taken, holding no lock: waits until the
+    /// default home's config lock is absent or stale, for up to `config_lock_budget`, and takes
+    /// nothing. A cancellation point (§14.1). A provider without such a lock returns at once.
+    fn wait_config_lock_idle(&self, _env: &Env) -> Result<(), ProviderError> {
+        Ok(())
+    }
     /// The first stage of the live locks (for CC: the refresh lock, then the legacy lock).
     fn lock_credentials<'g>(
         &self,
@@ -587,6 +616,15 @@ pub trait Provider: Send + Sync {
             |cred, budget| self.lock_config(env, cred, budget),
         )
     }
+    /// §9.1 (amended): splices `identity` into the live config once more, after a switch has
+    /// committed and a re-read found another there. Takes the config lock alone, with
+    /// `config_lock_budget`, and no credential lock; `_guard` shows `MutationGuard` is held.
+    fn resplice_identity(
+        &self,
+        env: &Env,
+        _guard: &MutationGuard,
+        identity: &Identity,
+    ) -> Result<(), ProviderError>;
     /// Every live entry holding secrets that `change` overwrites or deletes, on either auth
     /// axis, read now under `locks` (§9.4 step 7): the entries it writes or clears, and the
     /// copies of them no reader sees that go with them.
@@ -664,6 +702,14 @@ pub trait Provider: Send + Sync {
     fn session_dir_var(&self) -> Option<&'static str>;
     /// The directory `env` points this provider at, if set and non-empty.
     fn session_dir(&self, env: &Env) -> Option<PathBuf>;
+    /// The spelling the live login's Keychain item name is derived from in `env` (§12.2), when
+    /// that name is derived from one: the string `profile_spelling` gives a profile whose item
+    /// it would be. Purge compares it with an orphaned profile's, so it never deletes the live
+    /// item (§10.5). `None` (the default) for a provider whose live item is named by no
+    /// spelling, or one that keeps no Keychain items for profiles.
+    fn live_item_spelling(&self, _env: &Env) -> Option<String> {
+        None
+    }
     /// §12.2: the record of the home `env` resolves to, stored as the marker's `outer`.
     fn outer_home(&self, env: &Env) -> Value;
     /// §12.8: `env` with this provider's home variables restored from `outer`. A record that
@@ -675,10 +721,28 @@ pub trait Provider: Send + Sync {
     fn share_policy(&self, env: &Env) -> SharePolicy;
     /// Where the profile's session records live (CC: `<profile>/sessions`).
     fn session_records_dir(&self, profile: &Path) -> PathBuf;
+    /// Where the profile's background supervisor records itself, for an agent whose supervisor
+    /// writes no session record of its own (CC 2.1.292: `<profile>/daemon.lock`, §12.6). A live
+    /// supervisor there makes the profile session-owned; one that cannot be read counts as
+    /// unreadable. `None`: the agent has no such file.
+    fn supervisor_lock(&self, _profile: &Path) -> Option<PathBuf> {
+        None
+    }
     /// §8.1, §12.5: the profile's credential, read as the agent reads it (Decision 19): the
     /// Keychain item named from `spelling`, the marker's recorded spelling, then the credential
     /// file in `dir`, the profile's actual directory.
     fn read_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Read<Credential>;
+    /// §13.3: `read_profile_credential` under the profile's own credential locks (CC: its
+    /// refresh lock and legacy lock, through `spelling`), taken after the account lock (§4.3)
+    /// and released before this returns. A refresh a session has in flight completes first, so
+    /// the read is the generation the profile settles on. `guard` is the caller's.
+    fn read_profile_credential_settled(
+        &self,
+        env: &Env,
+        dir: &Path,
+        spelling: &str,
+        guard: &MutationGuard,
+    ) -> Result<Read<Credential>, ProviderError>;
     /// §12.5 "Identity drift": the login identity of the profile in `dir`, its actual directory
     /// (CC: its `.claude.json` `oauthAccount`; Decision 19).
     fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>;
@@ -746,6 +810,34 @@ pub trait Provider: Send + Sync {
         spawner: &dyn ProcessSpawner,
         cancel: &Cancel,
     ) -> Validity;
+
+    /// §13.6: the provider's own checks for `tagteam doctor`, run in the effective (outer)
+    /// environment `env` with the engine's spawn port (Decision 2). They read and probe only:
+    /// nothing is written or unlocked, nothing asks, and every spawn is bounded by its timeout.
+    /// A set `cancel` stops any spawn under way. A provider without checks of its own has none.
+    fn doctor_checks(
+        &self,
+        env: &Env,
+        spawner: &dyn ProcessSpawner,
+        cancel: &Cancel,
+    ) -> Vec<Check> {
+        let _ = (env, spawner, cancel);
+        Vec::new()
+    }
+
+    /// §13.6 `--online`: the root URL of each host the provider sends to (its token, profile and
+    /// usage hosts), which doctor probes for reachability with no credentials. None by default.
+    fn doctor_hosts(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// §13.6: the lock state of the Keychain this provider reads its own stores from (the live
+    /// login, the profiles' credentials), which can differ from the vault's. Asked without
+    /// prompting and bounded by its timeout (Appendix A.3). `None` (the default) when the
+    /// provider keeps those stores in no Keychain, so they are always readable.
+    fn keychain_lock_state(&self) -> Option<LockState> {
+        None
+    }
 }
 
 #[cfg(test)]

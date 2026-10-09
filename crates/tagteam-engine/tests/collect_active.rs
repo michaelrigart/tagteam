@@ -173,6 +173,7 @@ fn a_stuck_rejected_fp_goes_to_active_refresh_before_any_request() {
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
 fn a_refused_token_that_active_refresh_left_live_is_never_sent() {
     // §7.5 refreshes the refused token but cannot publish the successor (CC holds its config
     // lock): the live store still holds the refused token, so nothing is sent.
@@ -181,10 +182,22 @@ fn a_refused_token_that_active_refresh_left_live_is_never_sent() {
     refuse(&fx, &a, "rt-a");
     fx.script_refresh(Some("rt-a2"));
     fx.script_usage(200, usage_fixture());
-    fs::create_dir(fx.paths().config_lock).unwrap();
+    // CC takes the lock once the pre-wait (§9.1) is over, before the successor is published.
+    let taken = fx.paths().config_lock;
+    fx.engine.on_point(
+        "active-before-config-lock",
+        Box::new(move || fs::create_dir(&taken).unwrap()),
+    );
+    // And lets go of it before the next mutation lock, whose pre-wait would otherwise wait it out.
+    let held = fx.paths().config_lock;
+    fx.engine.also_on_point(
+        "before-mutation-lock",
+        Box::new(move || {
+            let _ = fs::remove_dir(&held);
+        }),
+    );
 
     let report = fx.collect(&[&a]);
-    fs::remove_dir(fx.paths().config_lock).unwrap();
 
     assert_eq!(report.outcomes, [(a.clone(), failed("token-expired"))]);
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);
@@ -571,6 +584,24 @@ fn a_mutation_lock_held_past_its_timeout_drops_the_active_collection() {
 
     let report = fx.collect(&[&a]);
     drop(held);
+
+    assert_eq!(report.outcomes, [(a.clone(), Collected::Dropped)]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(fx.http.requests().is_empty());
+    assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    assert_eq!(fx.usage_state(&a).and_then(|s| s.fetched_at), None);
+}
+
+#[test]
+fn a_config_lock_held_past_the_pre_wait_drops_the_active_collection_without_a_warning() {
+    // §9.1: the pre-wait's timeout is the guard's own busy failure, so it ends the live fetch
+    // exactly as a held mutation lock does.
+    let fx = Fx::with_lock_budgets(Duration::from_millis(300), Duration::from_millis(600));
+    let a = fx.add("a@x.co", "rt-a"); // live
+    fx.script_usage(200, usage_fixture());
+    fs::create_dir(fx.paths().config_lock).unwrap(); // fresh, left behind
+
+    let report = fx.collect(&[&a]);
 
     assert_eq!(report.outcomes, [(a.clone(), Collected::Dropped)]);
     assert!(report.warnings.is_empty(), "{:?}", report.warnings);

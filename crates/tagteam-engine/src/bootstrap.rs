@@ -472,7 +472,7 @@ impl Engine {
         id: &AccountId,
         cwd: &Path,
     ) -> Result<Option<Trigger>, EngineError> {
-        let guard = MutationGuard::acquire(&self.env, MutationGuard::BOOTSTRAP_TIMEOUT)?;
+        let guard = self.acquire_guard(MutationGuard::BOOTSTRAP_TIMEOUT)?;
         let lock = self.lock_account(id)?;
         let row = self
             .store()?

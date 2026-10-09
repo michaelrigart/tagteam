@@ -1,10 +1,13 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use tagteam_provider::doctor::quoted;
 use tagteam_provider::{LockError, ProviderError, ReadError};
 
+use crate::session::{Damaged, DamagedKind, SessionState};
 use crate::settings::SettingsError;
 use crate::store::StoreError;
+use crate::transfer::TransferError;
 use crate::vault::VaultError;
 
 /// " (from <source>)" when `claude auth status` named where the overriding key came from.
@@ -130,11 +133,12 @@ pub enum EngineError {
     /// pull the login from under a running session. `unreadable` is set when a reservation or a
     /// session record could not be read (§12.6), which counts as owned: it names the file and
     /// why, since nothing may be running at all and the user has a file to repair.
-    #[error("{}", session_owned_message(*.position, .label, .unreadable.as_deref()))]
+    /// `owner` says what owns it, and the message names each (§12.6).
+    #[error("{}", session_owned_message(*.position, .label, .owner))]
     SessionOwned {
         position: u32,
         label: String,
-        unreadable: Option<String>,
+        owner: Box<SessionOwner>,
     },
     /// §9.2, §12.5: the account's quiescent session profile and the vault both moved since they
     /// last agreed, so the vault's generation may be consumed. An explicit replacement resolves
@@ -206,6 +210,48 @@ pub enum EngineError {
     /// A `config` command's refusal, or its failure to write (§6.4).
     #[error(transparent)]
     Settings(#[from] SettingsError),
+    /// §12.5: a replacement landed (the vault holds `replacing_fp`), but what it recorded about
+    /// the new login cannot be read, so it can be neither installed nor undone. Every holder of
+    /// the account's lock refuses, except `remove` and `purge`, which delete it either way.
+    #[error(
+        "position {position} ({label}) has a new login whose recorded details cannot be read, so it cannot be finished; run `tagteam remove {position}`, then add the login again"
+    )]
+    ReplacementUnreadable { position: u32, label: String },
+    /// §6.3: the `rescue` path is not a directory or cannot be listed, so every account's
+    /// rescues are unknown. `remove` and a `--provider` purge refuse rather than guess which
+    /// entries were the account's; only a full purge deletes the path (§10.5).
+    #[error(
+        "{} cannot be listed ({detail}), so it may hold any account's refreshed tokens; fix or move it, or run a full `tagteam purge`, which deletes it",
+        path.display()
+    )]
+    RescueUnlistable { path: PathBuf, detail: String },
+    /// §10.5 step 3: a provider's auto-switch engine holds its engine lock; `pid` is the one
+    /// its lock record names, when it can be read (§11.1).
+    #[error(
+        "an auto-switch engine for {provider} is running{}; stop it, then run `tagteam purge` again",
+        pid.map_or_else(String::new, |pid| format!(" (pid {pid})"))
+    )]
+    EngineRunning { provider: String, pid: Option<u32> },
+    /// §10.5 step 6: a session profile that no store account owns is in use: a live launch
+    /// reservation, or a session record that is live or cannot be read (§12.5, §12.6).
+    /// `owner` says what is using it (§12.6).
+    #[error("{}", orphan_message(profile, .owner))]
+    OrphanSessionRunning {
+        profile: PathBuf,
+        owner: Box<SessionOwner>,
+    },
+    /// §10.5 step 6: the accounts a purge would delete are not the ones that were confirmed.
+    #[error(
+        "the accounts changed since the purge was confirmed (another command added or removed one); run `tagteam purge` again"
+    )]
+    PurgeChanged,
+    /// §13.3: an account an explicit `--account` named whose exportable generation cannot be
+    /// determined, or is known to be dead. Nothing is written.
+    #[error("position {position} cannot be exported: {reason}")]
+    AccountBroken { position: u32, reason: String },
+    /// §13.3: an export or import file, its encryption, or a key for it.
+    #[error(transparent)]
+    Transfer(#[from] TransferError),
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -243,16 +289,141 @@ fn split_message(profile: &Path, shared: &Path, cause: SplitCause) -> String {
     }
 }
 
-/// `SessionOwned`'s message: a running session, or session state that cannot be read.
-fn session_owned_message(position: u32, label: &str, unreadable: Option<&str>) -> String {
-    match unreadable {
-        None => format!(
-            "position {position} ({label}) is in use by a `tagteam run` session; exit that session first"
-        ),
-        Some(detail) => format!(
-            "position {position} ({label}) counts as in use by a `tagteam run` session because its session state cannot be read ({detail}); repair or remove that file, then retry"
-        ),
+/// How to end a Claude Code background daemon that owns `profile` (§12.6, Appendix A.7), by the
+/// profile path where tagteam found its `daemon.lock`. If the pid in the lock was reused by an
+/// unrelated `claude`, the daemon is not running and only the lock is left, which Claude Code's
+/// own advice has the user delete.
+pub(crate) fn daemon_advice(profile: &Path) -> String {
+    format!(
+        "stop it with `claude daemon stop --any` run with CLAUDE_CONFIG_DIR set to {}; if nothing is running at that pid, delete {}",
+        quoted(profile),
+        quoted(&profile.join("daemon.lock"))
+    )
+}
+
+/// What owns a profile that is session-owned (§12.5, §12.6): every live owner and every
+/// unreadable input found, not the first. The one source of every user-facing text about
+/// ownership (refusals, the auto-switch reason, warnings, doctor's `sessions.*` lines).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionOwner {
+    /// A `tagteam run` session, or any live owner that is not a background daemon.
+    pub session: bool,
+    /// A Claude Code background daemon owns it, in this profile.
+    pub daemon: Option<PathBuf>,
+    /// Every input that could not be read.
+    pub damaged: Vec<Damaged>,
+}
+
+impl SessionOwner {
+    /// The owners and unreadable inputs `state` found.
+    pub fn of(state: &SessionState) -> Self {
+        match state {
+            SessionState::Owned {
+                profile,
+                session,
+                daemon,
+                damaged,
+            } => Self {
+                session: *session,
+                daemon: daemon.then(|| profile.clone()),
+                damaged: damaged.clone(),
+            },
+            SessionState::Unreadable { damaged, .. } => Self {
+                damaged: damaged.clone(),
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
     }
+
+    /// Whether anything live owns it, as opposed to nothing readable.
+    fn live(&self) -> bool {
+        self.session || self.daemon.is_some()
+    }
+
+    /// The unreadable inputs, each named by its quoted file and why: "'f' cannot be read (why)".
+    pub fn damaged_list(&self) -> String {
+        self.damaged
+            .iter()
+            .map(|d| format!("{} cannot be read ({})", quoted(&d.file), d.detail))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Who owns it, as a predicate: "is in use by a `tagteam run` session and by a Claude Code
+    /// background daemon", and "also" the unreadable inputs, or, with nothing live, that it
+    /// "counts as in use because" of them.
+    pub fn who(&self) -> String {
+        let live = match (self.session, self.daemon.is_some()) {
+            (true, true) => {
+                "is in use by a `tagteam run` session and by a Claude Code background daemon"
+            }
+            (true, false) => "is in use by a `tagteam run` session",
+            (false, true) => "is in use by a Claude Code background daemon",
+            (false, false) => "",
+        };
+        match (self.live(), self.damaged.is_empty()) {
+            (true, true) => live.to_owned(),
+            (true, false) => format!("{live}, and also {}", self.damaged_list()),
+            (false, false) => format!("counts as in use because {}", self.damaged_list()),
+            (false, true) => "is in use by a `tagteam run` session".to_owned(),
+        }
+    }
+
+    /// What repairs each unreadable input, once each.
+    pub fn repairs(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for d in &self.damaged {
+            let r = match d.kind {
+                DamagedKind::SupervisorLock => {
+                    "if nothing runs as Claude Code for that profile, delete the lock"
+                }
+                DamagedKind::Record => "repair or remove that record",
+                DamagedKind::Profile | DamagedKind::Reservations | DamagedKind::RecordsDir => {
+                    "make it readable again"
+                }
+            };
+            if !out.iter().any(|o| o == r) {
+                out.push(r.to_owned());
+            }
+        }
+        out
+    }
+
+    /// What ends each owner, then what repairs each unreadable input.
+    pub fn remedies(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.session || (!self.live() && self.damaged.is_empty()) {
+            out.push("exit that session".to_owned());
+        }
+        if let Some(profile) = &self.daemon {
+            out.push(daemon_advice(profile));
+        }
+        out.extend(self.repairs());
+        out
+    }
+
+    /// The whole sentence about `subject`: who owns it and what to do, then retry.
+    pub fn reason(&self, subject: &str) -> String {
+        format!(
+            "{subject} {}; {}, then retry",
+            self.who(),
+            self.remedies().join("; ")
+        )
+    }
+}
+
+/// `OrphanSessionRunning`'s message.
+fn orphan_message(profile: &Path, owner: &SessionOwner) -> String {
+    owner.reason(&format!(
+        "{} belongs to no stored account, but it",
+        profile.display()
+    ))
+}
+
+/// `SessionOwned`'s message: a running session, a daemon, or state that cannot be read.
+fn session_owned_message(position: u32, label: &str, owner: &SessionOwner) -> String {
+    owner.reason(&format!("position {position} ({label})"))
 }
 
 impl EngineError {
@@ -317,6 +488,13 @@ impl EngineError {
             ) => "invalid-input",
             EngineError::Settings(SettingsError::Corrupt { .. }) => "settings-unreadable",
             EngineError::Settings(SettingsError::Io(_)) => "io",
+            EngineError::ReplacementUnreadable { .. } => "replacement-unreadable",
+            EngineError::RescueUnlistable { .. } => "rescue-unreadable",
+            EngineError::EngineRunning { .. } => "engine-running",
+            EngineError::OrphanSessionRunning { .. } => "session-owned",
+            EngineError::PurgeChanged => "purge-changed",
+            EngineError::AccountBroken { .. } => "account-broken",
+            EngineError::Transfer(e) => e.kind(),
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -494,7 +672,7 @@ mod tests {
                 EngineError::SessionOwned {
                     position: 1,
                     label: "a".into(),
-                    unreadable: None,
+                    owner: Box::default(),
                 },
                 "session-owned",
             ),
@@ -502,7 +680,14 @@ mod tests {
                 EngineError::SessionOwned {
                     position: 1,
                     label: "a".into(),
-                    unreadable: Some("/p/sessions/7.json: not JSON".into()),
+                    owner: Box::new(SessionOwner {
+                        damaged: vec![Damaged {
+                            kind: DamagedKind::Record,
+                            file: PathBuf::from("/p/sessions/7.json"),
+                            detail: "not JSON".into(),
+                        }],
+                        ..SessionOwner::default()
+                    }),
                 },
                 "session-owned",
             ),
@@ -638,6 +823,46 @@ mod tests {
             (
                 EngineError::Settings(SettingsError::Io(io::Error::other("x"))),
                 "io",
+            ),
+            (
+                EngineError::ReplacementUnreadable {
+                    position: 1,
+                    label: "a".into(),
+                },
+                "replacement-unreadable",
+            ),
+            (
+                EngineError::RescueUnlistable {
+                    path: PathBuf::from("r"),
+                    detail: "d".into(),
+                },
+                "rescue-unreadable",
+            ),
+            (
+                EngineError::EngineRunning {
+                    provider: "p".into(),
+                    pid: Some(7),
+                },
+                "engine-running",
+            ),
+            (
+                EngineError::OrphanSessionRunning {
+                    profile: PathBuf::from("s"),
+                    owner: Box::default(),
+                },
+                "session-owned",
+            ),
+            (EngineError::PurgeChanged, "purge-changed"),
+            (
+                EngineError::AccountBroken {
+                    position: 1,
+                    reason: "r".into(),
+                },
+                "account-broken",
+            ),
+            (
+                EngineError::Transfer(TransferError::NeedsPassphrase),
+                "needs-passphrase",
             ),
             (EngineError::Io(io::Error::other("x")), "io"),
             (

@@ -347,6 +347,21 @@ fn prune_samples(
 // once with `SQLITE_BUSY` when another connection committed between its read and its write,
 // since WAL mode cannot wait that conflict out.
 impl Store {
+    /// The usage requests counted against an identity's hourly budget after `since_s` (§8.6),
+    /// read without pruning anything.
+    pub fn usage_request_count(
+        &self,
+        provider: &ProviderId,
+        identity_key: &str,
+        since_s: i64,
+    ) -> Result<u32, StoreError> {
+        Ok(self.lock().query_row(
+            "SELECT COUNT(*) FROM usage_requests WHERE provider = ?1 AND identity_key = ?2 AND at > ?3",
+            params![provider.as_str(), identity_key, since_s],
+            |r| r.get(0),
+        )?)
+    }
+
     /// The account's usage state; `None` until something records one.
     pub fn usage_state(&self, id: &AccountId) -> Result<Option<UsageStateRow>, StoreError> {
         Ok(self

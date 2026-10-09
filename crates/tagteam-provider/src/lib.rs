@@ -2,6 +2,7 @@ pub mod atomic;
 pub mod cancel;
 pub mod clock;
 pub mod credential;
+pub mod doctor;
 pub mod env;
 pub mod flock;
 pub mod http;
@@ -17,6 +18,7 @@ pub mod read;
 pub mod reservation;
 pub mod security;
 pub mod splice;
+pub mod term;
 
 /// Serialises the lib tests that fork a child or drop a flock and re-lock it: a child forked in
 /// that window briefly holds a duplicate of the lock's open file description, so the re-lock
@@ -27,8 +29,9 @@ pub(crate) static FORK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub use cancel::{Cancel, Interrupted};
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use credential::{Credential, FreshCredential, Provenance};
+pub use doctor::{Check, CheckStatus};
 pub use env::{Env, EnvError};
-pub use flock::{FlockGuard, LockProbe, MutationGuard, probe_lock};
+pub use flock::{FlockGuard, LockProbe, MutationGuard, holders_of, probe_lock};
 pub use http::{
     Http, HttpError, HttpRequest, HttpResponse, Method, NoHttp, RecordedRequest, ScriptedHttp,
 };
@@ -37,13 +40,13 @@ pub use keychain::FileKeychain;
 pub use keychain::{FakeKeychain, Keychain, KeychainError, LockState};
 pub use liveness::{
     FakeProcess, FakeProcessProbe, ProcessProbe, RecordEntry, SessionRecord, SystemProcessProbe,
-    parse_lstart, parse_session_record, read_session_records, record_is_live,
+    parse_lstart, parse_session_record, read_session_records, read_supervisor_lock, record_is_live,
 };
 pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 #[cfg(feature = "mock-server")]
 pub use mock_server::{MockReply, MockRequest, MockServer};
 pub use process::{
-    Captured, ProcessSpawner, ProcessStamp, ScriptedSpawner, SpawnSpec, SystemSpawner,
+    Captured, Liveness, ProcessSpawner, ProcessStamp, ScriptedSpawner, SpawnSpec, SystemSpawner,
     exec_command, exit_code, find_on_path, run_captured, spawn_session,
 };
 pub use profile::{

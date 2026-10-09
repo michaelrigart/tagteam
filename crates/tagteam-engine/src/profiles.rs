@@ -39,13 +39,13 @@ pub struct SyncReport {
 const OWN_PREFIX: &str = ".tagteam-";
 
 /// One allowlisted entry, and the kind a must-share one is created as.
-struct Wanted {
-    name: String,
-    must: Option<EntryKind>,
+pub(crate) struct Wanted {
+    pub(crate) name: String,
+    pub(crate) must: Option<EntryKind>,
 }
 
 /// What the profile holds where a link may belong.
-enum Held {
+pub(crate) enum Held {
     Nothing,
     /// A symbolic link, and the target it was made with.
     Link(PathBuf),
@@ -154,17 +154,74 @@ impl Engine {
         p: &dyn Provider,
         row: &AccountRow,
     ) -> Result<(), EngineError> {
+        let profile = profile_path(&self.env, &row.id);
+        self.refuse_split_at(p, &profile, |m| {
+            m.account_id == row.id && m.provider == row.provider
+        })
+    }
+
+    /// The split check for a profile no known share list judges (§10.5 steps 6 to 8): an
+    /// orphan whose marker cannot be read, and the profile of an account or orphan whose
+    /// provider this build does not register. Every registered provider's must-share entries
+    /// are checked in it, and a real file or directory refuses, naming its path and that
+    /// provider's shared entry in the default home. A link, which deleting the profile removes
+    /// as a link, holds no history to lose.
+    pub(crate) fn refuse_real_copies(&self, profile: &Path) -> Result<(), EngineError> {
+        if !fs::symlink_metadata(profile).is_ok_and(|m| m.is_dir()) {
+            return Ok(());
+        }
+        for p in self.registry.all() {
+            if !p.capabilities().sessions {
+                continue;
+            }
+            let policy = p.share_policy(&self.env);
+            for m in &policy.must_share {
+                if is_private(&policy, m.name) {
+                    continue;
+                }
+                let dst = profile.join(m.name);
+                if matches!(held(&dst)?, Held::Real) {
+                    return Err(EngineError::ProfileSplit {
+                        profile: dst,
+                        shared: policy.source.join(m.name),
+                        cause: SplitCause::RealCopy,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `refuse_profile_split` for the profile directory at `profile`, whoever's it is: purge
+    /// asks it of an orphaned profile, which no account owns, whose readable marker names `p`
+    /// (§10.5 steps 6 and 8). The source home is the one the marker records when `own` trusts
+    /// the marker, otherwise the default home's.
+    pub(crate) fn refuse_split_at(
+        &self,
+        p: &dyn Provider,
+        profile: &Path,
+        own: impl Fn(&ProfileMarker) -> bool,
+    ) -> Result<(), EngineError> {
         if !p.capabilities().sessions {
             return Ok(());
         }
-        let profile = profile_path(&self.env, &row.id);
-        if !fs::symlink_metadata(&profile).is_ok_and(|m| m.is_dir()) {
+        if !fs::symlink_metadata(profile).is_ok_and(|m| m.is_dir()) {
             return Ok(());
         }
-        let outer = match ProfileMarker::read(&profile) {
-            Read::Present(m) if m.account_id == row.id && m.provider == row.provider => {
-                p.apply_outer_home(&self.env, &m.outer).ok()
-            }
+        let outer = match ProfileMarker::read(profile) {
+            Read::Present(m) if own(&m) => match p.apply_outer_home(&self.env, &m.outer) {
+                Ok(env) => Some(env),
+                Err(_) => {
+                    // §14: the profile is judged by tagteam's own environment instead. A fixed
+                    // phrase and no account (§14.2): the error's text can name a path, and
+                    // purge's orphan path passes `|_| true`, so the marker's ID is a free string.
+                    tracing::warn!(
+                        "the outer home a profile's marker records could not be applied; the profile is \
+                         judged by tagteam's own environment"
+                    );
+                    None
+                }
+            },
             Read::Present(_) | Read::Absent | Read::Unreadable(_) => None,
         };
         let policy = p.share_policy(outer.as_ref().unwrap_or(&self.env));
@@ -198,7 +255,11 @@ impl Engine {
 /// The must-share entries, then the shared ones, then `run.share_extra`, without repeats. A
 /// private name, or one of tagteam's own, is never on it; one named in `run.share_extra`
 /// warns.
-fn allowlist(policy: &SharePolicy, extra: &[String], warnings: &mut Vec<String>) -> Vec<Wanted> {
+pub(crate) fn allowlist(
+    policy: &SharePolicy,
+    extra: &[String],
+    warnings: &mut Vec<String>,
+) -> Vec<Wanted> {
     fn add(wanted: &mut Vec<Wanted>, name: &str, must: Option<EntryKind>) {
         if !wanted.iter().any(|w| w.name == name) {
             wanted.push(Wanted {
@@ -481,7 +542,7 @@ fn create_empty(source: &Path, src: &Path, kind: EntryKind) -> io::Result<()> {
     }
 }
 
-fn held(path: &Path) -> io::Result<Held> {
+pub(crate) fn held(path: &Path) -> io::Result<Held> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => Ok(Held::Link(fs::read_link(path)?)),
         Ok(_) => Ok(Held::Real),
@@ -508,7 +569,7 @@ fn names_nothing(e: &io::Error) -> bool {
 
 /// The fully resolved path of `path`, or `None` when there is nothing to resolve (absent, or a
 /// link to nothing, `names_nothing`).
-fn resolved(path: &Path) -> io::Result<Option<PathBuf>> {
+pub(crate) fn resolved(path: &Path) -> io::Result<Option<PathBuf>> {
     match fs::canonicalize(path) {
         Ok(p) => Ok(Some(p)),
         Err(e) if names_nothing(&e) => Ok(None),

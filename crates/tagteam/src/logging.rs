@@ -33,8 +33,8 @@ pub(crate) struct LogConfig {
     pub debug: bool,
     /// Neither `--no-color` nor `NO_COLOR`: stderr's lines may be coloured, on a terminal.
     pub color: bool,
-    /// `Env::state_dir`, where `tagteam.log` lives (§5).
-    pub state_dir: PathBuf,
+    /// `Env::log_file` (§5, §14.2).
+    pub log_file: PathBuf,
     /// `Env::home`, whose paths the file writes as `~/…`.
     pub home: PathBuf,
     /// `TAGTEAM_LOG`, as the environment holds it.
@@ -108,7 +108,7 @@ fn file_directive(debug: bool, var: Option<&OsStr>, err: &mut dyn Write) -> Opti
 /// The file layer's writer. Under `--debug`, a log that cannot be written says so once on
 /// stderr; otherwise it falls silent (§14.2).
 fn log_file(cfg: &LogConfig) -> LogFile {
-    let file = LogFile::new(cfg.state_dir.clone());
+    let file = LogFile::new(cfg.log_file.clone());
     if !cfg.debug {
         return file;
     }

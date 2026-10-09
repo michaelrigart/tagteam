@@ -1,5 +1,9 @@
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Component, Path, PathBuf};
 
 use tagteam_core::validate::{is_valid_email, normalize_alias};
 use tagteam_core::{AccountId, ProviderId};
@@ -7,9 +11,9 @@ use tagteam_provider::profile::{ProfileMarker, canonical_profile_path, profile_p
 use tagteam_provider::{Credential, Identity, Provenance, Provider, Read};
 
 use crate::account_lock::AccountLock;
-use crate::engine::Engine;
+use crate::engine::{Engine, Reconcile};
 use crate::error::EngineError;
-use crate::rescue::{RescueEntry, RescueFile};
+use crate::rescue::RescueUnlisted;
 use crate::store::{AccountRow, EventRow, LoginMeta, NewAccount, Store, StoreError};
 
 pub struct AddOptions {
@@ -115,7 +119,7 @@ fn no_default_email(kind: &str) -> EngineError {
 /// both by `prepare`'s pre-lock fast path and again, post-lock, by `add_live`/`add_token`:
 /// reconciling a pending replacement under the account lock can install a uuid the pre-lock
 /// read never saw, so the pre-lock check alone is not enough.
-fn check_identity_conflict(
+pub(crate) fn check_identity_conflict(
     row: Option<&AccountRow>,
     claimed_uuid: Option<&str>,
     label: &str,
@@ -159,20 +163,131 @@ fn unused_token_identity(
 }
 
 /// What a login write will replace, decided before anything is mutated.
-struct Prepared {
-    existing: Option<AccountRow>,
-    occupant: Option<AccountRow>,
-    id: AccountId,
+pub(crate) struct Prepared {
+    pub(crate) existing: Option<AccountRow>,
+    pub(crate) occupant: Option<AccountRow>,
+    pub(crate) id: AccountId,
 }
 
-/// Where a login comes from, for the evidence an explicit replacement records (§12.5).
+/// Where a login comes from: the evidence an explicit replacement records (§12.5), the event
+/// the write records, and when a new account was first added.
 #[derive(Clone, Copy)]
-struct LoginSource {
+pub(crate) struct LoginSource {
     /// Taken from the live store (`add`): finishing the replacement records its new epoch as
     /// the activation epoch (§10.1).
-    from_live: bool,
+    pub(crate) from_live: bool,
     /// The live identity names the account (§12.5 "A replacement records its own evidence").
-    live_names_account: bool,
+    pub(crate) live_names_account: bool,
+    /// The `events` row's kind: `add`, or `import` (§13.3).
+    pub(crate) event: &'static str,
+    /// A new account's `added_at`, epoch ms: an import keeps the file's (§13.3); `None` is now.
+    pub(crate) added_at: Option<i64>,
+}
+
+/// The most links `trace_path` follows, as the kernel's own limit.
+const MAX_LINK_HOPS: u32 = 40;
+
+/// Walks the absolute `path` component by component as the kernel resolves it, and returns
+/// every location it touched: each link entry's own location (not what it leads to alone), each
+/// directory on the way, and the final target. A link's target is spliced in at its place,
+/// relative to the link's directory; `.` and `..` apply to the resolved prefix, which holds no
+/// link. A component that is not there ends the walk with what was touched before it: nothing
+/// beyond can be lost. More than `MAX_LINK_HOPS` links, a relative `path` and any other failure
+/// are errors.
+pub(crate) fn trace_path(path: &Path) -> io::Result<Vec<PathBuf>> {
+    if !path.is_absolute() {
+        return Err(io::Error::other("not an absolute path"));
+    }
+    let mut touched = Vec::new();
+    let mut resolved = PathBuf::from("/");
+    let mut queue: VecDeque<OsString> = names(path).collect();
+    let mut hops = 0;
+    while let Some(name) = queue.pop_front() {
+        if name == "." {
+            continue;
+        }
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let next = resolved.join(&name);
+        match fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                hops += 1;
+                if hops > MAX_LINK_HOPS {
+                    return Err(io::Error::other("too many levels of symbolic links"));
+                }
+                touched.push(next.clone());
+                let target = fs::read_link(&next)?;
+                if target.is_absolute() {
+                    resolved = PathBuf::from("/");
+                }
+                for part in names(&target).collect::<Vec<_>>().into_iter().rev() {
+                    queue.push_front(part);
+                }
+            }
+            Ok(_) => {
+                touched.push(next.clone());
+                resolved = next;
+            }
+            Err(e) if absent(&e) => return Ok(touched),
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(touched)
+}
+
+/// The names `path` is made of, `.` and `..` included, without its root.
+fn names(path: &Path) -> impl Iterator<Item = OsString> + '_ {
+    path.components().filter_map(|c| match c {
+        Component::Normal(n) => Some(n.to_os_string()),
+        Component::CurDir => Some(".".into()),
+        Component::ParentDir => Some("..".into()),
+        Component::RootDir | Component::Prefix(_) => None,
+    })
+}
+
+/// `(device, inode)`: what a file is, whatever it is called.
+pub(crate) fn identity(meta: &fs::Metadata) -> (u64, u64) {
+    (meta.dev(), meta.ino())
+}
+
+/// Whether `e` says the path is not there (or has a non-directory in the way).
+pub(crate) fn absent(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+/// The Keychain item `remove_profile` names for a profile directory (see `Engine::profile_item`).
+enum ProfileItem {
+    /// The spelling its trusted marker records.
+    Marker(String),
+    /// No trusted marker (`why`): the spelling of the canonical path.
+    Derived { spelling: String, why: &'static str },
+    /// No trusted marker (`why`) and the path does not resolve: no item to name.
+    Unresolved { why: &'static str, error: String },
+}
+
+impl ProfileItem {
+    fn spelling(&self) -> Option<&str> {
+        match self {
+            Self::Marker(s) | Self::Derived { spelling: s, .. } => Some(s),
+            Self::Unresolved { .. } => None,
+        }
+    }
+}
+
+/// What `remove_locked` does with a `rescue` path it cannot list (§6.3, §10.5 step 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnlistedRescues {
+    /// `remove`, an `add` over an occupant, and a `--provider` purge: refuse, naming the path,
+    /// rather than guess which entries were the account's.
+    Refuse,
+    /// A full purge: skip the account's rescue step. The purge deletes the whole path once
+    /// every vault entry is gone.
+    Skip,
 }
 
 impl Engine {
@@ -183,16 +298,19 @@ impl Engine {
         from: Option<&AccountId>,
         to: Option<&AccountId>,
     ) -> Result<(), EngineError> {
-        self.store()?.insert_event(&EventRow {
-            at: self.now_ms(),
-            provider: provider.clone(),
-            kind: kind.to_owned(),
-            from_id: from.cloned(),
-            to_id: to.cloned(),
-            trigger: None,
-            source: "cli".into(),
-            detail: None,
-        })?;
+        self.store()?.insert_event(
+            &EventRow {
+                at: self.now_ms(),
+                provider: provider.clone(),
+                kind: kind.to_owned(),
+                from_id: from.cloned(),
+                to_id: to.cloned(),
+                trigger: None,
+                source: "cli".into(),
+                detail: None,
+            },
+            self.registered_id(provider).is_some(),
+        )?;
         Ok(())
     }
 
@@ -204,23 +322,37 @@ impl Engine {
     /// fails stops before the row goes, so the account stays listed and the remove can be run
     /// again; every delete treats an absent item as done. The caller holds the mutation lock and
     /// this account's lock, and has run `refuse_destroying` on it. The live login is never
-    /// touched.
+    /// touched. A pending replacement is reconciled first (§6.2), but one that cannot be
+    /// installed does not stop it: the account goes either way (§12.5).
+    ///
+    /// The rescue files are listed before anything is deleted, so a `rescue` path that cannot be
+    /// listed refuses with nothing deleted, unless `unlisted` skips it (a full purge). Returns
+    /// how many rescue files it deleted.
     pub(crate) fn remove_locked(
         &self,
         row: &AccountRow,
         lock: &AccountLock,
-    ) -> Result<(), EngineError> {
+        unlisted: UnlistedRescues,
+    ) -> Result<usize, EngineError> {
+        self.reconcile_replacement_as(lock, Reconcile::Removing)?;
         let p = self.provider(&row.provider)?;
+        let rescues = match self.rescue_paths_for(&row.id) {
+            Ok(paths) => paths,
+            Err(_) if unlisted == UnlistedRescues::Skip => Vec::new(),
+            Err(RescueUnlisted { path, detail }) => {
+                return Err(EngineError::RescueUnlistable { path, detail });
+            }
+        };
+        // Asked again at the deletion, where the vault's file goes first (a second line).
+        self.refuse_live_vault_files(row)?;
         self.vault.delete(lock)?;
-        for rescue in self.rescues_for(&row.id) {
-            let (RescueFile::Entry(RescueEntry { path, .. }) | RescueFile::Unreadable { path, .. }) =
-                rescue;
-            self.delete_rescue(&path)?;
+        for path in &rescues {
+            self.delete_rescue(path)?;
         }
         self.remove_profile(p.as_ref(), row)?;
         self.store()?.delete_account(&row.id)?;
         self.event(&row.provider, "remove", Some(&row.id), None)?;
-        Ok(())
+        Ok(rescues.len())
     }
 
     /// §10.3 Guard, before `remove_locked` deletes anything of `row`: it is not session-owned
@@ -228,7 +360,180 @@ impl Engine {
     /// (§12.2, `refuse_profile_split`). Either refusal leaves everything as it was.
     fn refuse_destroying(&self, p: &dyn Provider, row: &AccountRow) -> Result<(), EngineError> {
         self.refuse_session_owned(p, row)?;
-        self.refuse_profile_split(p, row)
+        self.refuse_profile_split(p, row)?;
+        self.refuse_live_profile_item(p, row)?;
+        self.refuse_live_vault_files(row)
+    }
+
+    /// §10.3, §10.5: the Linux file backend's `vault/<id>.json` and `<id>.prev.json` are files
+    /// `remove` deletes, so a live login that resolves to one is never to be broken: refuses
+    /// when any registered provider's live files touch them (the identity guard). A Keychain
+    /// backend's entries are items, not files: nothing to guard.
+    pub(crate) fn refuse_live_vault_files(&self, row: &AccountRow) -> Result<(), EngineError> {
+        let Some(dir) = self.vault.dir() else {
+            return Ok(());
+        };
+        for name in [format!("{}.json", row.id), format!("{}.prev.json", row.id)] {
+            for p in self.registry.all() {
+                self.refuse_live_files_at(p.as_ref(), &dir.join(&name))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Which Keychain item `remove_profile` deletes for the profile directory at `profile`: the
+    /// spelling its marker records when the marker names this account and its provider, else
+    /// the one derived from the canonical path (Decision 12), else none. The one place that
+    /// choice is made, so `remove_profile` and `refuse_live_profile_item` cannot drift.
+    fn profile_item(&self, p: &dyn Provider, row: &AccountRow, profile: &Path) -> ProfileItem {
+        let derived = |why: &'static str| match canonical_profile_path(profile) {
+            Ok(canonical) => ProfileItem::Derived {
+                spelling: p.profile_spelling(&canonical),
+                why,
+            },
+            Err(e) => ProfileItem::Unresolved {
+                why,
+                error: e.to_string(),
+            },
+        };
+        match ProfileMarker::read(profile) {
+            Read::Present(marker)
+                if marker.account_id == row.id && marker.provider == row.provider =>
+            {
+                ProfileItem::Marker(marker.config_dir)
+            }
+            Read::Present(_) => derived("it names another account"),
+            Read::Absent => derived("it has none"),
+            Read::Unreadable(_) => derived("it cannot be read"),
+        }
+    }
+
+    /// §10.5 "never deletes or replaces a provider's live login": refuses when the Keychain item
+    /// `spelling` names is the live login's, since the environment names the same directory.
+    fn refuse_live_item(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        spelling: &str,
+    ) -> Result<(), EngineError> {
+        if p.live_item_spelling(&self.env).as_deref() != Some(spelling) {
+            return Ok(());
+        }
+        let var = p.session_dir_var().unwrap_or("the home variable");
+        tracing::warn!(
+            position = row.position,
+            account = %row.id,
+            "the Keychain item the session profile names is the live login's; nothing was deleted"
+        );
+        Err(EngineError::Io(io::Error::other(format!(
+            "the Keychain item account {}'s profile names is the live login's, since the environment ({var}, or the provider's override of it) names the same directory; nothing was deleted (tagteam never deletes the live login)",
+            row.position
+        ))))
+    }
+
+    /// §10.5 "never deletes or replaces a provider's live login", by path and apart from any
+    /// Keychain spelling: refuses when a file `p` keeps its live login in (its identity
+    /// surface's credential files and JSON files) would be broken by deleting `entry`, a profile
+    /// or orphan entry of `sessions/`. The environment can name a profile's directory in a
+    /// spelling that differs from the marker's (a trailing `/.`), so the spellings compare
+    /// unequal while the login sits in the profile. Each file's path is walked as the kernel
+    /// resolves it (`trace_path`), and refuses if anything it touches is, or lies under, the entry
+    /// by filesystem identity (device and inode, never spelling: a case-insensitive filesystem
+    /// or a `/.` spells one place many ways). The entry is its own location (its parent
+    /// resolved, the entry itself not followed: a link is deleted exactly there), and for a
+    /// directory also what it is. That is a link entry the
+    /// path passes through, a directory inside the profile, or the final target. A missing
+    /// entry or parent holds nothing; any other failure to resolve refuses, as the
+    /// stored-profile guard does. The refusal names no path.
+    pub(crate) fn refuse_live_files_at(
+        &self,
+        p: &dyn Provider,
+        entry: &Path,
+    ) -> Result<(), EngineError> {
+        let unresolved = || {
+            EngineError::Io(io::Error::other(
+                "a path the live login lives at could not be resolved, so it cannot be told whether deleting this profile entry would break it; nothing was deleted (tagteam never deletes the live login)",
+            ))
+        };
+        let (Some(parent), Some(name)) = (entry.parent(), entry.file_name()) else {
+            return Err(unresolved());
+        };
+        let location = match fs::canonicalize(parent) {
+            Ok(parent) => parent.join(name),
+            Err(e) if absent(&e) => return Ok(()),
+            Err(_) => return Err(unresolved()),
+        };
+        // What is deleted is identified by (device, inode), not by its spelling: a case-insensitive
+        // filesystem, a trailing `/.` or a link can spell one place many ways.
+        let mut doomed = Vec::new();
+        match fs::symlink_metadata(&location) {
+            Ok(meta) => {
+                doomed.push(identity(&meta));
+                if !meta.file_type().is_symlink() {
+                    match fs::metadata(&location) {
+                        Ok(followed) => doomed.push(identity(&followed)),
+                        Err(e) if absent(&e) => return Ok(()),
+                        Err(_) => return Err(unresolved()),
+                    }
+                }
+            }
+            Err(e) if absent(&e) => return Ok(()),
+            Err(_) => return Err(unresolved()),
+        }
+        let surface = p.identity_surface(&self.env);
+        let files = surface
+            .credential_files
+            .into_iter()
+            .chain(surface.json_keys.into_iter().map(|(file, _)| file));
+        for file in files {
+            let touched = trace_path(&file).map_err(|_| unresolved())?;
+            let mut inside = false;
+            for path in &touched {
+                // The path itself and each ancestor: one of them being the deleted entry puts
+                // the path at it or under it. A missing ancestor ends that walk.
+                for ancestor in path.ancestors() {
+                    match fs::symlink_metadata(ancestor) {
+                        Ok(meta) => inside |= doomed.contains(&identity(&meta)),
+                        Err(e) if absent(&e) => break,
+                        Err(_) => return Err(unresolved()),
+                    }
+                }
+            }
+            if inside {
+                tracing::warn!(
+                    "the live login's files are inside a profile directory; nothing was deleted"
+                );
+                return Err(EngineError::Io(io::Error::other(
+                    "the live login's files are inside what this would delete, since the environment names it; nothing was deleted (tagteam never deletes the live login)",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Before anything of `row` is deleted: refuses when deleting its session profile would
+    /// delete the live login's Keychain items. A profile that is a link names no item
+    /// (`remove_profile` removes it as a link), so it passes.
+    pub(crate) fn refuse_live_profile_item(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+    ) -> Result<(), EngineError> {
+        let profile = profile_path(&self.env, &row.id);
+        let meta = match fs::symlink_metadata(&profile) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // A link is deleted at its own location, and the live login may go through it.
+        self.refuse_live_files_at(p, &profile)?;
+        if meta.file_type().is_symlink() {
+            return Ok(());
+        }
+        match self.profile_item(p, row, &profile).spelling() {
+            Some(spelling) => self.refuse_live_item(p, row, spelling),
+            None => Ok(()),
+        }
     }
 
     /// §10.3: deletes `row`'s session profile, if it has one. The agent's credential items for
@@ -243,7 +548,9 @@ impl Engine {
     /// warning, and the path itself is removed as a link, so a stray path never leaves `remove`
     /// unable to finish once the vault is gone. Any other failure stops before the directory
     /// goes. The items are found by the recorded spelling, the files by the profile's actual
-    /// directory (Decision 19).
+    /// directory (Decision 19). A profile that is itself a link names no item at all (§10.5
+    /// step 6): only the link goes. An item that is the live login's is never deleted (§10.5):
+    /// it refuses, before anything is deleted, with the profile as it was.
     pub(crate) fn remove_profile(
         &self,
         p: &dyn Provider,
@@ -255,38 +562,39 @@ impl Engine {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        let current_spelling = |why: String| -> Option<String> {
-            match canonical_profile_path(&profile) {
-                Ok(canonical) => {
-                    tracing::warn!(
-                        position = row.position,
-                        account = %row.id,
-                        "the session profile's marker could not be read ({why}); deleting its Keychain item under its current spelling, so an item under an older spelling may remain"
-                    );
-                    Some(p.profile_spelling(&canonical))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        position = row.position,
-                        account = %row.id,
-                        "the session profile's marker could not be read ({why}) and its path does not resolve ({e}); skipping its Keychain item, so an item under an older spelling may remain"
-                    );
-                    None
-                }
-            }
-        };
-        let spelling = match ProfileMarker::read(&profile) {
-            Read::Present(marker)
-                if marker.account_id == row.id && marker.provider == row.provider =>
-            {
-                Some(marker.config_dir)
-            }
-            Read::Present(_) => current_spelling("it names another account".into()),
-            Read::Absent => current_spelling("it has none".into()),
-            Read::Unreadable(e) => current_spelling(e.to_string()),
-        };
-        if let Some(spelling) = spelling {
-            p.delete_profile_credential(&self.env, &profile, &spelling)?;
+        // §10.5 step 6: a session profile is a directory under `sessions/`. A link there is not
+        // one, so no Keychain item is named through it, by its marker or by the path it leads
+        // to: the link goes, and what it led to stays as it is.
+        // Before any deletion, the link's included: the live login may go through it.
+        self.refuse_live_files_at(p, &profile)?;
+        if meta.file_type().is_symlink() {
+            tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                "the session profile is a link, not a directory; the link was removed and no Keychain item was deleted through it"
+            );
+            fs::remove_file(&profile)?;
+            return Ok(());
+        }
+        let item = self.profile_item(p, row, &profile);
+        // `why` is a fixed phrase (§14.2): a marker's read error names its path, under a data
+        // directory the user may have named, and may quote the file.
+        match &item {
+            ProfileItem::Marker(_) => {}
+            ProfileItem::Derived { why, .. } => tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                "the session profile's marker could not be read ({why}); deleting its Keychain item under its current spelling, so an item under an older spelling may remain"
+            ),
+            ProfileItem::Unresolved { why, error } => tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                "the session profile's marker could not be read ({why}) and its path does not resolve ({error}); skipping its Keychain item, so an item under an older spelling may remain"
+            ),
+        }
+        if let Some(spelling) = item.spelling() {
+            self.refuse_live_item(p, row, spelling)?;
+            p.delete_profile_credential(&self.env, &profile, spelling)?;
         }
         // `remove_dir_all` removes a symlink inside the profile as a link, never following it.
         if meta.is_dir() {
@@ -381,7 +689,7 @@ impl Engine {
     /// occupant it displaces is removed, so a failure never loses the occupant. `source` is the
     /// evidence a replacement records for the default home (§12.5).
     #[allow(clippy::too_many_arguments)]
-    fn commit_login(
+    pub(crate) fn commit_login(
         &self,
         store: &Store,
         p: &dyn Provider,
@@ -432,12 +740,20 @@ impl Engine {
                     // The write never landed: reconcile in process rather than leaving the
                     // marker dangling for the next lock holder to find (Task 18's review,
                     // item 6). `reconcile_replacement` reads the vault fresh, sees it still
-                    // holds the old generation, and rolls the marker back; a failure here is
-                    // swallowed since the next lock acquisition retries it regardless.
-                    let _ = self.reconcile_replacement(lock_for(&row.id));
+                    // holds the old generation, and rolls the marker back. A failure here is
+                    // logged, by its kind (§14.2), and not returned: the write's error is the
+                    // one to report, and the next lock acquisition retries the reconciliation.
+                    if let Err(r) = self.reconcile_replacement(lock_for(&row.id)) {
+                        tracing::warn!(
+                            account = %row.id,
+                            position = row.position,
+                            kind = r.kind(),
+                            "could not roll back a replacement whose vault write failed; the next command that locks the account retries"
+                        );
+                    }
                     return Err(e.into());
                 }
-                store.finish_replacement(&row.id)?;
+                store.finish_replacement(&row.id, self.now_ms())?;
             }
             None => {
                 // At a free position first; it moves once any occupant is gone.
@@ -450,16 +766,17 @@ impl Engine {
                     kind,
                     alias: None,
                     login_expires_at: p.login_expires_at(secret),
-                    added_at: self.now_ms(),
+                    added_at: source.added_at.unwrap_or_else(|| self.now_ms()),
                 })?;
                 if let Err(e) = self.vault.store(lock_for(&prep.id), secret, &fp) {
                     // The write may have landed and failed only its read-back. A new account
                     // has no earlier generation to keep, so whatever it left goes with the row:
-                    // no secret outlives its account (§5, L444).
-                    if let Err(cleanup) = self.vault.delete(lock_for(&prep.id)) {
+                    // no secret outlives its account (§5, L444). A failure is logged by a fixed
+                    // phrase (§14.2): a vault error carries the Keychain's message or a path.
+                    if self.vault.delete(lock_for(&prep.id)).is_err() {
                         tracing::error!(
                             account = %prep.id,
-                            "could not remove the vault entry of an account that was never added: {cleanup}"
+                            "could not remove the vault entry of an account that was never added"
                         );
                     }
                     store.delete_account(&prep.id)?;
@@ -468,7 +785,7 @@ impl Engine {
             }
         }
         if let Some(occupant) = &prep.occupant {
-            self.remove_locked(occupant, lock_for(&occupant.id))?;
+            self.remove_locked(occupant, lock_for(&occupant.id), UnlistedRescues::Refuse)?;
         }
         let current = store.account(&prep.id)?.ok_or(StoreError::NoSuchAccount)?;
         if let Some(pos) = position.filter(|pos| *pos != current.position) {
@@ -477,7 +794,7 @@ impl Engine {
         if alias.is_some() {
             store.set_alias(&prep.id, alias).map_err(alias_taken)?;
         }
-        self.event(provider, "add", None, Some(&prep.id))?;
+        self.event(provider, source.event, None, Some(&prep.id))?;
         Ok((
             store.account(&prep.id)?.ok_or(StoreError::NoSuchAccount)?,
             prep.existing.is_none(),
@@ -600,6 +917,8 @@ impl Engine {
             LoginSource {
                 from_live: true,
                 live_names_account: true,
+                event: "add",
+                added_at: None,
             },
         )?;
         drop(live_locks);
@@ -704,6 +1023,8 @@ impl Engine {
             LoginSource {
                 from_live: false,
                 live_names_account,
+                event: "add",
+                added_at: None,
             },
         )?;
         Ok(AddOutcome {
@@ -730,12 +1051,14 @@ impl Engine {
         self.settle_or_refuse(&provider)?;
         let _guard = self.guard_or_refuse(&provider)?;
         let row = self.managed_row(id)?;
-        let lock = self.lock_account(id)?;
+        // Not `lock_account`: its strict reconciliation refuses a replacement that cannot be
+        // installed, which `remove_locked` deletes instead (§12.5).
+        let lock = AccountLock::acquire(&self.env, id, AccountLock::WAIT)?;
         // §10.3 Guard: under the mutation lock and the account lock, no session can start
         // before the remove is done (§12.5).
         let p = self.provider(&row.provider)?;
         self.refuse_destroying(p.as_ref(), &row)?;
-        self.remove_locked(&row, &lock)?;
+        self.remove_locked(&row, &lock, UnlistedRescues::Refuse)?;
         Ok(row)
     }
 
@@ -790,5 +1113,107 @@ impl Engine {
         self.next_position_precheck(&row.provider, Some(position))?;
         self.store()?.move_to(id, position)?;
         self.managed_row(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    /// A canonical temp root, with `a/b/` and a file `a/b/f` in it.
+    fn root() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/f"), "x").unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn a_plain_path_touches_each_directory_and_the_file() {
+        let (_dir, r) = root();
+        let touched = trace_path(&r.join("a/b/f")).unwrap();
+        assert_eq!(
+            &touched[touched.len() - 3..],
+            [r.join("a"), r.join("a/b"), r.join("a/b/f")]
+        );
+    }
+
+    #[test]
+    fn a_final_link_touches_its_own_location_and_its_target() {
+        let (_dir, r) = root();
+        symlink(r.join("a/b/f"), r.join("link")).unwrap();
+        let touched = trace_path(&r.join("link")).unwrap();
+        assert!(touched.contains(&r.join("link")), "{touched:?}");
+        assert_eq!(touched.last().unwrap(), &r.join("a/b/f"));
+    }
+
+    #[test]
+    fn an_intermediate_file_link_is_touched_though_neither_end_is_inside() {
+        // `live -> a/b/bridge -> outside/login`: the bridge is in `a/b`.
+        let (_dir, r) = root();
+        fs::create_dir_all(r.join("outside")).unwrap();
+        fs::write(r.join("outside/login"), "x").unwrap();
+        symlink(r.join("outside/login"), r.join("a/b/bridge")).unwrap();
+        symlink(r.join("a/b/bridge"), r.join("live")).unwrap();
+        let touched = trace_path(&r.join("live")).unwrap();
+        assert!(touched.contains(&r.join("a/b/bridge")), "{touched:?}");
+        assert!(touched.contains(&r.join("outside/login")), "{touched:?}");
+        assert!(touched.iter().any(|p| p.starts_with(r.join("a/b"))));
+    }
+
+    #[test]
+    fn a_linked_directory_component_is_walked_through() {
+        let (_dir, r) = root();
+        symlink(r.join("a/b"), r.join("dirlink")).unwrap();
+        let touched = trace_path(&r.join("dirlink/f")).unwrap();
+        assert!(touched.contains(&r.join("dirlink")), "{touched:?}");
+        assert!(touched.contains(&r.join("a/b")), "{touched:?}");
+        assert_eq!(touched.last().unwrap(), &r.join("a/b/f"));
+    }
+
+    #[test]
+    fn relative_targets_are_taken_from_the_link_s_directory_and_dots_apply_to_the_resolved_prefix()
+    {
+        let (_dir, r) = root();
+        symlink("b/f", r.join("a/rel")).unwrap();
+        let touched = trace_path(&r.join("a/rel")).unwrap();
+        assert_eq!(touched.last().unwrap(), &r.join("a/b/f"));
+        symlink("../a/b/f", r.join("a/up")).unwrap();
+        assert_eq!(
+            trace_path(&r.join("a/up")).unwrap().last().unwrap(),
+            &r.join("a/b/f")
+        );
+        // `..` after a linked directory goes up from where the link leads, not from the link.
+        symlink(r.join("a/b"), r.join("dirlink")).unwrap();
+        let touched = trace_path(&r.join("dirlink/../b/f")).unwrap();
+        assert_eq!(touched.last().unwrap(), &r.join("a/b/f"));
+    }
+
+    #[test]
+    fn a_missing_component_ends_the_walk_with_what_came_before() {
+        let (_dir, r) = root();
+        symlink(r.join("a/missing/deeper"), r.join("dangling")).unwrap();
+        let touched = trace_path(&r.join("dangling")).unwrap();
+        assert!(touched.contains(&r.join("dangling")), "{touched:?}");
+        assert!(touched.contains(&r.join("a")), "{touched:?}");
+        assert!(!touched.contains(&r.join("a/missing")));
+        // A file where a directory is expected is also the end of the walk.
+        assert!(
+            trace_path(&r.join("a/b/f/x"))
+                .unwrap()
+                .contains(&r.join("a/b/f"))
+        );
+    }
+
+    #[test]
+    fn a_loop_is_an_error_and_a_relative_path_is_refused() {
+        let (_dir, r) = root();
+        symlink(r.join("two"), r.join("one")).unwrap();
+        symlink(r.join("one"), r.join("two")).unwrap();
+        assert!(trace_path(&r.join("one")).is_err());
+        assert!(trace_path(Path::new("a/b")).is_err());
     }
 }

@@ -134,8 +134,44 @@ fn ctrl_c_while_cc_holds_its_legacy_lock_ends_the_switch() {
 }
 
 #[test]
-fn ctrl_c_while_the_config_lock_is_held_ends_the_switch_and_releases_the_credential_locks() {
+fn ctrl_c_while_the_config_lock_is_held_ends_the_switch_in_the_pre_wait() {
+    // §9.1: the config lock is waited out before any lock of tagteam's or CC's is taken, so
+    // the interruption lands there and nothing of either kind exists to release.
     interrupted_while_cc_holds(|fx| fx.paths().config_lock);
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn ctrl_c_while_cc_takes_the_config_lock_after_the_pre_wait_releases_the_credential_locks() {
+    // CC takes its config lock once the pre-wait is over, so the switch holds the credential
+    // locks when it waits for it: the interruption must release them.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let held = fx.paths().config_lock;
+    let taken = held.clone();
+    fx.engine.on_point(
+        "config-pre-wait-done",
+        Box::new(move || fs::create_dir(&taken).unwrap()),
+    );
+    let before = written(&fx);
+
+    let (err, ran_on) = interrupted(&fx, || fx.switch_to(&a, false));
+
+    assert_interrupted(&err, ran_on);
+    assert!(
+        err.to_string().contains(&held.display().to_string()),
+        "names the lock it waited for: {err}"
+    );
+    assert_eq!(written(&fx), before, "nothing is written");
+    for lock in cc_locks(&fx) {
+        if lock == held {
+            assert!(lock.is_dir(), "CC's lock is left alone");
+        } else {
+            assert!(!lock.exists(), "{} was left behind", lock.display());
+        }
+    }
+    assert!(mutation_lock_free(&fx.env), "the mutation lock is released");
 }
 
 #[test]

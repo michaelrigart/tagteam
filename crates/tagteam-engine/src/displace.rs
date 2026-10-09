@@ -236,17 +236,23 @@ impl Engine {
     /// carries; a row with no file, with its file missing. It reads only, under no lock, and
     /// creates nothing when the store or the directory is absent (§5).
     pub fn displaced(&self) -> Result<DisplacedList, EngineError> {
+        let store = self.existing_store()?;
+        self.displaced_in(store.as_deref())
+    }
+
+    /// `displaced`'s listing over `store`, or over the directory alone without one. `doctor`
+    /// passes its read-only store (Decision 3).
+    pub(crate) fn displaced_in(&self, store: Option<&Store>) -> Result<DisplacedList, EngineError> {
         let dir = displaced_dir(&self.env);
         // Rows before files: a displace writes its file, then its row, so a concurrent one can
         // only show as `unrecorded` here, never as a row whose file is falsely missing.
-        let store = self.existing_store()?;
-        let rows = match &store {
+        let rows = match store {
             Some(store) => store.displaced_rows()?,
             None => Vec::new(),
         };
         let mut files = displaced_files(&dir)?;
         let mut entries = Vec::new();
-        if let Some(store) = &store {
+        if let Some(store) = store {
             for row in rows {
                 // Only a displaced ID is ever in `files`, so no path is built from a row's ID.
                 let file_present = files.remove(&row.id);

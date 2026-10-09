@@ -8,6 +8,7 @@ on:
     paths:
       - .github/workflows/cc-drift.yml
       - scripts/cc-drift.sh
+      - scripts/cc-drift-test.sh
       - crates/tagteam-cc/compat/**
 
 permissions:
@@ -29,6 +30,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Test the drift script against fake claude builds
+        run: scripts/cc-drift-test.sh
       - name: Install the latest Claude Code
         run: |
           curl -fsSL https://claude.ai/install.sh | bash -s latest
@@ -67,11 +70,14 @@ jobs:
           if [ -f "$RUNNER_TEMP/cc-drift-report.md" ]; then
             cp "$RUNNER_TEMP/cc-drift-report.md" "$RUNNER_TEMP/report/report.md"
           fi
+          if [ -f "$RUNNER_TEMP/cc-drift-report.md.env-names.txt" ]; then
+            cp "$RUNNER_TEMP/cc-drift-report.md.env-names.txt" "$RUNNER_TEMP/report/env-names.txt"
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ always() }}
         with:
           name: cc-drift-${{ runner.os }}
-          path: ${{ runner.temp }}/report/report.md
+          path: ${{ runner.temp }}/report/
           if-no-files-found: ignore
 
   report:

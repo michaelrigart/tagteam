@@ -66,8 +66,15 @@ fn parse(path: &Path, bytes: &[u8], id: &AccountId) -> Result<RescueEntry, Strin
     })
 }
 
+/// §6.3: a `rescue` path that is not a directory, or cannot be listed, so every account's
+/// rescues are unknown.
+pub(crate) struct RescueUnlisted {
+    pub path: PathBuf,
+    pub detail: String,
+}
+
 impl Engine {
-    fn rescue_dir(&self) -> PathBuf {
+    pub(crate) fn rescue_dir(&self) -> PathBuf {
         self.env.data_dir().join("rescue")
     }
 
@@ -113,30 +120,56 @@ impl Engine {
         Ok(path)
     }
 
-    /// Every rescue file for `id` (named `<id>-…json`), in name order. Never creates
-    /// `rescue/`. A directory that cannot be listed is itself unreadable: it may hide one.
-    pub(crate) fn rescues_for(&self, id: &AccountId) -> Vec<RescueFile> {
+    /// The paths of `id`'s rescue files (named `<id>-…json`), readable or not, in name order.
+    /// Never creates `rescue/`. A `rescue` path that cannot be listed is `Err`: it may hide any
+    /// account's.
+    pub(crate) fn rescue_paths_for(&self, id: &AccountId) -> Result<Vec<PathBuf>, RescueUnlisted> {
         let dir = self.rescue_dir();
         let listing = match fs::read_dir(&dir) {
             Ok(l) => l,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return vec![],
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
             Err(e) => {
-                return vec![RescueFile::Unreadable {
+                return Err(RescueUnlisted {
                     path: dir,
                     detail: e.to_string(),
-                }];
+                });
             }
         };
         let prefix = format!("{id}-");
-        let mut paths: Vec<PathBuf> = listing
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".json"))
-            })
-            .collect();
+        let mut paths = Vec::new();
+        for entry in listing {
+            // An entry the listing cannot return may be one of `id`'s: the path cannot be
+            // listed, as when it cannot be opened (§14: never skipped).
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => {
+                    return Err(RescueUnlisted {
+                        path: dir,
+                        detail: e.to_string(),
+                    });
+                }
+            };
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".json"))
+            {
+                paths.push(path);
+            }
+        }
         paths.sort();
+        Ok(paths)
+    }
+
+    /// Every rescue file for `id` (named `<id>-…json`), in name order. Never creates
+    /// `rescue/`. A directory that cannot be listed is itself unreadable: it may hide one.
+    pub(crate) fn rescues_for(&self, id: &AccountId) -> Vec<RescueFile> {
+        let paths = match self.rescue_paths_for(id) {
+            Ok(paths) => paths,
+            Err(RescueUnlisted { path, detail }) => {
+                return vec![RescueFile::Unreadable { path, detail }];
+            }
+        };
         paths
             .into_iter()
             .map(|path| match fs::read(&path) {
@@ -209,7 +242,8 @@ impl Engine {
                 tracing::warn!(
                     position = row.position,
                     account = %row.id,
-                    "an adopted rescue file could not be deleted: {err}"
+                    kind = err.kind(),
+                    "an adopted rescue file could not be deleted"
                 );
             }
             return Ok(());

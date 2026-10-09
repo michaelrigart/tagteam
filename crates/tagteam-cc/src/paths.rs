@@ -27,9 +27,13 @@ pub struct CcPaths {
     pub secure_storage_dir: PathBuf,
     pub credentials_file: PathBuf,
     pub refresh_lock: PathBuf,
-    /// CC's storage-write lock, `<secure-storage dir>/.storage-write`, symlinks not resolved
-    /// (§9.1).
+    /// CC's storage-write lock as recorded against 2.1.286, `<secure-storage dir>/.storage-write`,
+    /// symlinks not resolved (§9.1). tagteam takes it first.
     pub storage_write_lock: PathBuf,
+    /// CC 2.1.292's storage-write lock, `<secure-storage dir>/.storage-write.lock`: the lock
+    /// directory `proper-lockfile` makes for `.storage-write` (§9.1, Appendix A.1). tagteam
+    /// takes it second, so "the storage-write lock" is the pair.
+    pub storage_write_lock_v2: PathBuf,
     pub config_lock: PathBuf,
 }
 
@@ -56,6 +60,7 @@ impl CcPaths {
             credentials_file: env.guard(secure_storage_dir.join(".credentials.json")),
             refresh_lock: env.guard(secure_storage_dir.join(".oauth_refresh.lock")),
             storage_write_lock: env.guard(secure_storage_dir.join(".storage-write")),
+            storage_write_lock_v2: env.guard(secure_storage_dir.join(".storage-write.lock")),
             config_lock: env.guard(with_suffix(&global_config, ".lock")),
             config_home: env.guard(config_home),
             global_config: env.guard(global_config),
@@ -91,6 +96,11 @@ mod tests {
         assert_eq!(p.credentials_file, h.join(".claude/.credentials.json"));
         assert_eq!(p.refresh_lock, h.join(".claude/.oauth_refresh.lock"));
         assert_eq!(p.config_lock, h.join(".claude.json.lock"));
+        assert_eq!(p.storage_write_lock, h.join(".claude/.storage-write"));
+        assert_eq!(
+            p.storage_write_lock_v2,
+            h.join(".claude/.storage-write.lock")
+        );
     }
 
     #[test]

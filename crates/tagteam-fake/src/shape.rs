@@ -125,6 +125,37 @@ pub(crate) fn compose(
     Ok(serde_json::to_vec(&Value::Object(out)).expect("a Value always serializes"))
 }
 
+/// §13.3's credential payload in FakeAgent's shape: the stored object, without the
+/// machine-shared `device` key unless `full`.
+pub(crate) fn export_credential(secret: &[u8], full: bool) -> Result<Value, ProviderError> {
+    let Ok(Value::Object(mut root)) = serde_json::from_slice::<Value>(secret) else {
+        return Err(ProviderError::Invalid(
+            "the stored FakeAgent credential is not a JSON object".into(),
+        ));
+    };
+    if !full {
+        root.shift_remove(DEVICE);
+    }
+    Ok(Value::Object(root))
+}
+
+/// The vault bytes of an exported FakeAgent credential: an object whose `fa` object holds a
+/// token. Anything else is refused without quoting it.
+pub(crate) fn import_credential(v: &Value) -> Result<Vec<u8>, ProviderError> {
+    if !v.get("fa").is_some_and(Value::is_object) {
+        return Err(ProviderError::Invalid(
+            "the FakeAgent credential has no fa object".into(),
+        ));
+    }
+    let bytes = serde_json::to_vec(v).expect("a Value always serializes");
+    if is_wiped(&bytes) || fingerprint(&bytes).is_none() {
+        return Err(ProviderError::Invalid(
+            "the FakeAgent credential holds no token".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

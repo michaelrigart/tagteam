@@ -15,7 +15,8 @@ use tagteam_cc::{CcPaths, ClaudeCode, keychain_account};
 use tagteam_core::AccountId;
 use tagteam_provider::{
     EntryKind, Env, FakeKeychain, Keychain, KeychainError, LockError, LockState, MustShare,
-    Provenance, Provider, ProviderError, Read, canonical_profile_path, entry_matches, profile_path,
+    MutationGuard, Provenance, Provider, ProviderError, Read, canonical_profile_path,
+    entry_matches, profile_path,
 };
 
 struct Fx {
@@ -602,9 +603,11 @@ fn deleting_a_profile_credential_holds_the_profile_s_own_credential_locks_and_re
         paths.refresh_lock.clone(),
         paths.legacy_lock(),
         paths.storage_write_lock.clone(),
+        paths.storage_write_lock_v2.clone(),
     ];
     assert_eq!(locks[0], dir.join(".oauth_refresh.lock"));
     assert_eq!(locks[2], dir.join(".storage-write"));
+    assert_eq!(locks[3], dir.join(".storage-write.lock"));
     let probe = LockProbeKeychain::over(&f.kc, &locks);
     let cc = ClaudeCode::with_store(
         LiveStore::new(probe.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO),
@@ -621,10 +624,10 @@ fn deleting_a_profile_credential_holds_the_profile_s_own_credential_locks_and_re
     assert_eq!(
         *probe.deletes.lock().unwrap(),
         [
-            (oauth.clone(), vec![true; 3]),
-            (managed.clone(), vec![true; 3])
+            (oauth.clone(), vec![true; 4]),
+            (managed.clone(), vec![true; 4])
         ],
-        "each delete holds the refresh, legacy and storage-write locks"
+        "each delete holds the refresh, legacy and both storage-write locks"
     );
     for lock in &locks {
         assert!(!lock.exists(), "{} is released", lock.display());
@@ -657,6 +660,7 @@ fn a_set_token_ends_a_profile_credential_delete_before_it_takes_or_deletes_anyth
         paths.refresh_lock.clone(),
         paths.legacy_lock(),
         paths.storage_write_lock.clone(),
+        paths.storage_write_lock_v2.clone(),
     ] {
         assert!(!lock.exists(), "{} was never taken", lock.display());
     }
@@ -714,7 +718,7 @@ fn delete_where_the_profile_is_not_a_directory(place: impl Fn(&Path)) {
         (None, None),
         "both items are deleted and verified gone"
     );
-    assert!(!dir.join(".storage-write").exists());
+    assert!(!dir.join(".storage-write").exists() && !dir.join(".storage-write.lock").exists());
     assert!(!dir.join(".oauth_refresh.lock").exists() && !legacy.exists());
     assert_eq!(
         fs::symlink_metadata(&dir).ok().map(|m| m.file_type()),
@@ -2224,4 +2228,40 @@ mod validation {
         );
         assert!(spawner.specs().is_empty(), "nothing was spawned");
     }
+}
+
+#[test]
+fn a_settled_profile_read_waits_out_the_profile_s_refresh_lock_then_releases_it() {
+    // §13.3: a refresh the session has in flight completes first, and the read is what it
+    // wrote. The locks are the profile's own, named from its spelling.
+    let f = fx_on(Platform::Linux);
+    let (dir, spelling) = profile(&f, "0193");
+    fs::write(
+        dir.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"refreshToken":"rt-consumed"}}"#,
+    )
+    .unwrap();
+    let lock = Path::new(&spelling).join(".oauth_refresh.lock");
+    fs::create_dir(&lock).unwrap();
+    let (file, held) = (dir.join(".credentials.json"), lock.clone());
+    let session = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        fs::write(&file, ENTRY).unwrap();
+        fs::remove_dir(&held).unwrap();
+    });
+    let guard = MutationGuard::acquire(&f.env, Duration::from_millis(100)).unwrap();
+    let started = std::time::Instant::now();
+
+    let read =
+        f.cc.read_profile_credential_settled(&f.env, &dir, &spelling, &guard)
+            .unwrap();
+    session.join().unwrap();
+
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    let c = read.present().unwrap();
+    assert_eq!((c.bytes(), c.provenance()), (ENTRY, Provenance::Fresh));
+    assert!(!lock.exists(), "released on return");
+    let mut legacy = fs::canonicalize(&dir).unwrap().into_os_string();
+    legacy.push(".lock");
+    assert!(!Path::new(&legacy).exists());
 }

@@ -6,7 +6,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::keychain::{Keychain, KeychainError, LockState};
+use crate::keychain::{
+    Keychain, KeychainError, LockState, empty_service_err, empty_service_read, locked_err,
+};
 use crate::process::drain;
 use crate::read::{Read, ReadError};
 
@@ -15,6 +17,8 @@ pub const SECURITY: &str = "/usr/bin/security";
 /// leaves the old entry (Appendix A.3).
 pub const LINE_LIMIT: usize = 4032;
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// Appendix A.3: deleting by service deletes one item per call, at most this many times.
+pub const DELETE_SERVICE_LIMIT: u32 = 10_000;
 
 /// `stdout` of `find-generic-password -w` is a secret, so `Debug` shows lengths only.
 #[derive(Clone)]
@@ -490,6 +494,58 @@ impl Keychain for SecurityCli {
         }
     }
 
+    /// Appendix A.3's delete by service: `delete-generic-password -s <service>` without `-a`
+    /// deletes one item of the service per call and returns rc 44 once none is left. It is
+    /// repeated until then, at most `DELETE_SERVICE_LIMIT` times, and the attributes-only probe
+    /// must then find none. A locked keychain (rc 36) stops it, named as such.
+    fn delete_service(&self, service: &str) -> Result<u32, KeychainError> {
+        if service.is_empty() {
+            return Err(empty_service_err());
+        }
+        let mut deleted = 0;
+        while deleted < DELETE_SERVICE_LIMIT {
+            match self.run(s(&["delete-generic-password", "-s", service]), None) {
+                RunResult::Exited { code: 0, .. } => deleted += 1,
+                RunResult::Exited { code: 44, .. } => {
+                    return match self.service_has_items(service) {
+                        Read::Present(false) | Read::Absent => Ok(deleted),
+                        Read::Present(true) => Err(KeychainError {
+                            rc: None,
+                            detail: format!(
+                                "items of {service:?} are still present after deleting {deleted}"
+                            ),
+                        }),
+                        Read::Unreadable(e) => Err(KeychainError {
+                            rc: None,
+                            detail: format!("could not verify that {service:?} is empty: {e}"),
+                        }),
+                    };
+                }
+                RunResult::Exited { code: 36, .. } => return Err(locked_err()),
+                other => return Err(failed(other)),
+            }
+        }
+        Err(KeychainError {
+            rc: None,
+            detail: format!(
+                "{service:?}: stopped after {DELETE_SERVICE_LIMIT} deletions, the limit; whether any items remain was not checked"
+            ),
+        })
+    }
+
+    /// Appendix A.3: `find-generic-password -s <service>`, without `-a`, `-w` or `-g`: rc 0
+    /// while any item of the service exists, rc 44 once none does. It never prompts.
+    fn service_has_items(&self, service: &str) -> Read<bool> {
+        if service.is_empty() {
+            return empty_service_read();
+        }
+        match self.run(s(&["find-generic-password", "-s", service]), None) {
+            RunResult::Exited { code: 0, .. } => Read::Present(true),
+            RunResult::Exited { code: 44, .. } => Read::Present(false),
+            other => Read::Unreadable(unreadable(other)),
+        }
+    }
+
     /// `unlock-keychain` with no `-p`: macOS reads the password from the terminal itself.
     fn unlock(&self) -> bool {
         let mut args = s(&["unlock-keychain"]);
@@ -592,6 +648,130 @@ mod tests {
             &["find-generic-password", "-a", "acct", "-w", "-s", "svc"]
         );
         assert!(stdin.is_none());
+    }
+
+    /// The argv of one call, with the keychain file a test targets appended, as `run` does.
+    fn argv(args: &[&str], file: Option<&str>) -> Vec<String> {
+        args.iter()
+            .copied()
+            .chain(file)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn delete_service_deletes_until_rc_44_then_verifies_by_attributes_only() {
+        for file in [None, Some("/tmp/t.keychain")] {
+            let s = Scripted::default()
+                .then(ok(b""))
+                .then(ok(b""))
+                .then(rc(44))
+                .then(rc(44));
+            assert_eq!(cli(&s, file).delete_service("tagteam").unwrap(), 2);
+            let delete = argv(&["delete-generic-password", "-s", "tagteam"], file);
+            let probe = argv(&["find-generic-password", "-s", "tagteam"], file);
+            let calls: Vec<(String, Vec<String>, Option<Vec<u8>>)> = s.calls();
+            assert_eq!(
+                calls,
+                vec![
+                    (SECURITY.to_owned(), delete.clone(), None),
+                    (SECURITY.to_owned(), delete.clone(), None),
+                    (SECURITY.to_owned(), delete, None),
+                    (SECURITY.to_owned(), probe, None),
+                ],
+                "{file:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_service_that_still_has_items_after_the_loop_is_an_error() {
+        let s = Scripted::default().then(rc(44)).then(ok(b""));
+        let err = cli(&s, None).delete_service("tagteam").unwrap_err();
+        assert!(err.detail.contains("still present"), "{err}");
+        let s = Scripted::default().then(rc(44)).then(RunResult::TimedOut);
+        let err = cli(&s, None).delete_service("tagteam").unwrap_err();
+        assert!(err.detail.contains("could not verify"), "{err}");
+    }
+
+    #[test]
+    fn a_locked_keychain_stops_the_delete_by_service_at_once() {
+        let s = Scripted::default().then(ok(b"")).then(rc(36));
+        let err = cli(&s, None).delete_service("tagteam").unwrap_err();
+        assert_eq!(err.rc, Some(36));
+        assert!(err.to_string().contains("locked"), "{err}");
+        assert_eq!(s.calls().len(), 2, "nothing after the lock");
+    }
+
+    #[test]
+    fn any_other_failure_of_the_delete_loop_is_reported() {
+        let s = Scripted::default().then(rc(51));
+        assert_eq!(
+            cli(&s, None).delete_service("tagteam").unwrap_err().rc,
+            Some(51)
+        );
+        let s = Scripted::default().then(RunResult::TimedOut);
+        assert_eq!(
+            cli(&s, None).delete_service("tagteam").unwrap_err().rc,
+            None
+        );
+    }
+
+    #[test]
+    fn delete_service_gives_up_after_ten_thousand_deletions() {
+        let mut s = Scripted::default();
+        for _ in 0..DELETE_SERVICE_LIMIT {
+            s = s.then(ok(b""));
+        }
+        let err = cli(&s, None).delete_service("tagteam").unwrap_err();
+        assert!(
+            err.detail.contains(
+                "stopped after 10000 deletions, the limit; whether any items remain was not checked"
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            s.calls().len(),
+            DELETE_SERVICE_LIMIT as usize,
+            "no call past the limit"
+        );
+    }
+
+    #[test]
+    fn an_empty_service_is_refused_before_any_call() {
+        // `Scripted` panics on an unexpected call, and none is scripted.
+        let s = Scripted::default();
+        assert!(cli(&s, None).delete_service("").is_err());
+        assert!(matches!(
+            cli(&s, None).service_has_items(""),
+            Read::Unreadable(_)
+        ));
+        assert!(s.calls().is_empty());
+    }
+
+    #[test]
+    fn service_has_items_is_the_attributes_only_find_by_service() {
+        let cases = [
+            (ok(b""), Some(true)),
+            (rc(44), Some(false)),
+            (rc(36), None),
+            (rc(1), None),
+            (RunResult::TimedOut, None),
+        ];
+        for (result, want) in cases {
+            let s = Scripted::default().then(result);
+            let got = match cli(&s, None).service_has_items("tagteam") {
+                Read::Present(b) => Some(b),
+                Read::Absent => panic!("a probe is never Absent"),
+                Read::Unreadable(_) => None,
+            };
+            assert_eq!(got, want);
+            assert_eq!(
+                s.calls()[0].1,
+                ["find-generic-password", "-s", "tagteam"],
+                "no -a, -w or -g"
+            );
+        }
     }
 
     #[test]

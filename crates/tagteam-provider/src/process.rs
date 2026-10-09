@@ -30,12 +30,30 @@ impl ProcessStamp {
 
     /// Exact pid and start-time match. Anything undeterminable counts as live.
     pub fn is_live(&self) -> bool {
+        self.liveness() != Liveness::Dead
+    }
+
+    /// What an exact pid and start-time match finds (§12.6), keeping apart a start time that
+    /// could not be read, which `is_live` counts as live (§13.6).
+    pub fn liveness(&self) -> Liveness {
         match start_of(self.pid) {
-            Ok(Some(start)) => start == self.start,
-            Ok(None) => false,
-            Err(_) => true,
+            Ok(Some(start)) if start == self.start => Liveness::Live,
+            Ok(_) => Liveness::Dead,
+            Err(e) => Liveness::Unknown(e.to_string()),
         }
     }
+}
+
+/// A `ProcessStamp`'s holder, by an exact pid and start-time match (§12.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Liveness {
+    /// The pid runs, and it started exactly when the stamp says.
+    Live,
+    /// No process has the pid, or one that started at another time has it.
+    Dead,
+    /// The pid's start time could not be read, as an `EPERM` gives for another user's process,
+    /// which may be a recycled pid: it counts as live, but may not be (§13.6).
+    Unknown(String),
 }
 
 /// `/proc/<pid>/stat` field 22, counted after the last `)`.
@@ -434,6 +452,23 @@ mod tests {
             }
             .is_live()
         );
+    }
+
+    #[test]
+    fn liveness_tells_a_live_stamp_from_a_dead_one() {
+        let me = ProcessStamp::current().unwrap();
+        assert_eq!(me.liveness(), Liveness::Live);
+        let restarted = ProcessStamp {
+            start: me.start + 1,
+            ..me
+        };
+        assert_eq!(restarted.liveness(), Liveness::Dead);
+        let gone = ProcessStamp {
+            pid: i32::MAX as u32,
+            start: 0,
+        };
+        assert_eq!(gone.liveness(), Liveness::Dead);
+        assert!(!gone.is_live());
     }
 
     #[test]

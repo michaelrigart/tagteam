@@ -217,6 +217,75 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Delete tagteam's data: every account (or only --provider's), never a live login
+    ///
+    /// Asks first on a terminal; elsewhere, and with --json, it needs --yes. --json prints
+    /// {schemaVersion, ok, provider, accounts: [{number, id, email}], displaced, rescues,
+    /// storeEmptied, failures: [{what, message}]}. Exits 1 if anything could not be deleted.
+    Purge {
+        /// Delete without asking
+        #[arg(long)]
+        yes: bool,
+        /// Also delete every `tagteam` Keychain item no account names, for every tagteam data
+        /// directory on this Mac (not with --provider)
+        #[arg(long = "keychain-orphans")]
+        keychain_orphans: bool,
+    },
+    /// Write the stored accounts to FILE, or `-` for stdout, age-encrypted by default
+    ///
+    /// An OAuth export hands its logins over rather than copying them: whichever machine
+    /// refreshes one first invalidates every other copy. To use an account on two machines,
+    /// log in on each. Without --recipient or --recipient-file, a passphrase is asked for on
+    /// the terminal. --json prints {schemaVersion, ok, file, encrypted, accounts: [{provider,
+    /// number, email, source, inUse}], skipped: [{provider, number, email, reason}]}.
+    Export {
+        /// Where to write the export; `-`, the default, is stdout
+        file: Option<String>,
+        /// Export only this account (repeatable)
+        #[arg(long)]
+        account: Vec<String>,
+        /// Keep the whole credential, this machine's keys included
+        #[arg(long)]
+        full: bool,
+        /// Encrypt to this age1… or ssh-ed25519 public key (repeatable)
+        #[arg(long, conflicts_with = "plaintext")]
+        recipient: Vec<String>,
+        /// Encrypt to each public key in FILE, one per line (repeatable)
+        #[arg(
+            long = "recipient-file",
+            value_name = "FILE",
+            conflicts_with = "plaintext"
+        )]
+        recipient_file: Vec<PathBuf>,
+        /// Write the export unencrypted
+        #[arg(long)]
+        plaintext: bool,
+    },
+    /// Add the accounts of an export (tagteam's, or cswap's version 1) from FILE, or `-` for stdin
+    ///
+    /// An account already stored is skipped unless --force, or unless it is quarantined. --json
+    /// prints {schemaVersion, ok, accounts: [{provider, number, email, outcome, message}],
+    /// warnings}. It exits 1 if any account failed.
+    Import {
+        file: String,
+        /// Replace accounts already stored
+        #[arg(long)]
+        force: bool,
+        /// A private key the file is encrypted to: an age identity file or an ssh-ed25519 key
+        /// (repeatable)
+        #[arg(long, value_name = "FILE")]
+        identity: Vec<PathBuf>,
+    },
+    /// Check tagteam's state and how it works with each agent CLI; tagteam changes nothing itself
+    ///
+    /// Each check reports ok, info, warn or fail, and every problem names its fix. It exits 1
+    /// when a check fails. --json prints {schemaVersion, ok, checks: [{id, provider, status,
+    /// message, fix}]}, with provider null for tagteam's own checks.
+    Doctor {
+        /// Also check that each agent's hosts can be reached; no credential is sent
+        #[arg(long)]
+        online: bool,
+    },
     /// Print a completion script for bash, zsh or fish
     Completions { shell: CompletionShell },
 }
@@ -259,6 +328,10 @@ impl Command {
     /// accounts' items, and a real one switches.
     /// `run` checks for itself, and only once it knows it launches a session: plain `claude`
     /// touches no item, so an unmapped directory never waits on an unlock prompt (§12.7).
+    /// `purge` deletes its accounts' vault items, and with `--keychain-orphans` every `tagteam`
+    /// item, so it checks too, after its run shell's refusal (§10.5).
+    /// `export` and `import` check for themselves, once their destination, keys and file are
+    /// settled (§13.3): a bad argument is refused first, whatever the Keychain's state.
     pub fn touches_keychain(&self) -> bool {
         matches!(
             self,
@@ -267,6 +340,7 @@ impl Command {
                 | Command::Switch { .. }
                 | Command::Remove { .. }
                 | Command::Auto { .. }
+                | Command::Purge { .. }
         )
     }
 

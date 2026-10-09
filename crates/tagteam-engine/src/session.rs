@@ -7,14 +7,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use tagteam_provider::flock::LockProbe;
-use tagteam_provider::liveness::{RecordEntry, read_session_records, record_is_live};
+use tagteam_provider::liveness::{
+    RecordEntry, read_session_records, read_supervisor_lock, record_is_live,
+};
 use tagteam_provider::profile::{
     MARKER_FILE, ProfileMarker, RunShell, launch_reservations, profile_path,
 };
 use tagteam_provider::{Env, Provider, Read};
 
 use crate::engine::Engine;
-use crate::error::EngineError;
+use crate::error::{EngineError, SessionOwner};
 use crate::registry::ProviderRegistry;
 use crate::store::AccountRow;
 
@@ -69,25 +71,63 @@ pub fn detect_run_shell(env: &Env, registry: &ProviderRegistry) -> (RunShell, En
 }
 
 /// §12.5: whether a session owns an account, computed on each call and never cached
-/// (Decision 8).
+/// (Decision 8). One aggregate: it carries every live owner and every unreadable input found,
+/// since judging stops at nothing (§12.6); the texts about it come from `SessionOwner`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionState {
     NoProfile,
     Quiescent {
         profile: PathBuf,
     },
+    /// At least one live owner (§12.6): `session`, a held reservation or a record that is not a
+    /// daemon's; `daemon`, a Claude Code background daemon (a `bg`, `daemon` or `daemon-worker`
+    /// record, or the supervisor's lock file). Both can hold at once. `damaged` is every input
+    /// that could not be read beside them.
     Owned {
         profile: PathBuf,
+        session: bool,
+        daemon: bool,
+        damaged: Vec<Damaged>,
     },
-    /// A reservation or a record could not be read: counts as owned (§10.3, §12.6).
+    /// Nothing live was found, but an input could not be read: counts as owned (§10.3, §12.6).
     Unreadable {
         profile: PathBuf,
-        detail: String,
+        damaged: Vec<Damaged>,
     },
 }
 
+/// An input to the session state that could not be read (§12.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Damaged {
+    pub kind: DamagedKind,
+    /// The file or directory, as the reader named it.
+    pub file: PathBuf,
+    /// Why, never quoting its bytes.
+    pub detail: String,
+}
+
+/// Which input a `Damaged` is, which decides its remedy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DamagedKind {
+    /// The profile directory itself.
+    Profile,
+    /// The launch reservations directory.
+    Reservations,
+    /// The session records directory.
+    RecordsDir,
+    /// One session record.
+    Record,
+    /// The supervisor's lock file.
+    SupervisorLock,
+}
+
+/// The `kind`s of a session record written by a Claude Code background daemon or its workers
+/// (Appendix A.7).
+const DAEMON_KINDS: [&str; 3] = ["bg", "daemon", "daemon-worker"];
+
 impl SessionState {
-    /// Session-owned (§12.5): a live reservation or record, or one that could not be read.
+    /// Session-owned (§12.5): a live reservation, record or supervisor, or one that could not be
+    /// read.
     pub fn owned(&self) -> bool {
         matches!(
             self,
@@ -95,21 +135,36 @@ impl SessionState {
         )
     }
 
+    /// Every input that could not be read.
+    pub fn damaged(&self) -> &[Damaged] {
+        match self {
+            SessionState::Owned { damaged, .. } | SessionState::Unreadable { damaged, .. } => {
+                damaged
+            }
+            _ => &[],
+        }
+    }
+
+    /// The profile directory, when a background daemon owns it (§12.6).
+    pub fn daemon_profile(&self) -> Option<&Path> {
+        match self {
+            SessionState::Owned {
+                profile,
+                daemon: true,
+                ..
+            } => Some(profile),
+            _ => None,
+        }
+    }
+
     /// The profile directory, when the account has one.
     pub fn profile(&self) -> Option<&Path> {
         match self {
             SessionState::NoProfile => None,
             SessionState::Quiescent { profile }
-            | SessionState::Owned { profile }
+            | SessionState::Owned { profile, .. }
             | SessionState::Unreadable { profile, .. } => Some(profile),
         }
-    }
-}
-
-fn unreadable_state(profile: &Path, detail: String) -> SessionState {
-    SessionState::Unreadable {
-        profile: profile.to_path_buf(),
-        detail,
     }
 }
 
@@ -120,7 +175,10 @@ impl Engine {
         p: &dyn Provider,
         row: &AccountRow,
     ) -> Result<SessionState, EngineError> {
-        self.session_state_leaving_out(p, row, None)
+        if !p.capabilities().sessions {
+            return Ok(SessionState::NoProfile);
+        }
+        Ok(self.session_state_leaving_out(p, &profile_path(&self.env, &row.id), None))
     }
 
     /// `session_state`, with `own` left out: this process's own launch reservation, as §12.5
@@ -132,68 +190,113 @@ impl Engine {
         row: &AccountRow,
         own: &Path,
     ) -> Result<SessionState, EngineError> {
-        self.session_state_leaving_out(p, row, Some(own))
-    }
-
-    /// The body of both. The profile is `profile_path(env, id)` (§5). A held reservation
-    /// other than `own`, then a live record, makes the account `Owned`; failing that, anything
-    /// that could not be read makes it `Unreadable`. Every I/O failure is a state, never an
-    /// error. A provider without `sessions` has no profiles, and nothing on disk is touched for
-    /// it.
-    fn session_state_leaving_out(
-        &self,
-        p: &dyn Provider,
-        row: &AccountRow,
-        own: Option<&Path>,
-    ) -> Result<SessionState, EngineError> {
         if !p.capabilities().sessions {
             return Ok(SessionState::NoProfile);
         }
-        let profile = profile_path(&self.env, &row.id);
+        Ok(self.session_state_leaving_out(p, &profile_path(&self.env, &row.id), Some(own)))
+    }
+
+    /// `session_state` for the profile at `profile`, whatever account it belongs to: §10.5
+    /// step 6 asks it of a profile that no store account owns. `p` judges its session records.
+    pub(crate) fn session_state_at(&self, p: &dyn Provider, profile: &Path) -> SessionState {
+        self.session_state_leaving_out(p, profile, None)
+    }
+
+    /// The body of all three, for the profile at `profile` (for an account,
+    /// `profile_path(env, id)`, §5). It judges every input and stops at none: the profile, the
+    /// launch reservations other than `own`, the records directory, every record, and the
+    /// supervisor's lock (§12.6). Any live owner makes it `Owned`, naming each; failing that,
+    /// anything that could not be read makes it `Unreadable`; either carries every unreadable
+    /// input found, with its file. Every I/O failure is a state, never an error. The callers
+    /// that take an account check first that its provider has `sessions`, so nothing on disk is
+    /// touched for one without.
+    fn session_state_leaving_out(
+        &self,
+        p: &dyn Provider,
+        profile: &Path,
+        own: Option<&Path>,
+    ) -> SessionState {
+        let profile = profile.to_path_buf();
+        let mut damaged = Vec::new();
         match fs::symlink_metadata(&profile) {
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(SessionState::NoProfile),
-            Err(e) => {
-                let detail = format!("{}: {e}", profile.display());
-                return Ok(unreadable_state(&profile, detail));
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return SessionState::NoProfile,
+            Err(e) => damaged.push(Damaged {
+                kind: DamagedKind::Profile,
+                file: profile.clone(),
+                detail: e.to_string(),
+            }),
         }
         let is_own = |path: &Path| own.is_some_and(|own| path.file_name() == own.file_name());
+        let (mut session, mut daemon) = (false, false);
         match launch_reservations(&profile) {
             Read::Present(found) => {
-                if found
+                session |= found
                     .iter()
-                    .any(|(path, probe)| *probe == LockProbe::Held && !is_own(path))
-                {
-                    return Ok(SessionState::Owned { profile });
-                }
+                    .any(|(path, probe)| *probe == LockProbe::Held && !is_own(path));
             }
             Read::Absent => {}
-            Read::Unreadable(e) => return Ok(unreadable_state(&profile, e.to_string())),
+            Read::Unreadable(e) => damaged.push(Damaged {
+                kind: DamagedKind::Reservations,
+                file: PathBuf::from(e.what),
+                detail: e.detail,
+            }),
         }
-        let mut damaged = None;
         match read_session_records(&p.session_records_dir(&profile)) {
             Read::Present(entries) => {
                 for entry in entries {
                     match entry {
                         RecordEntry::Record(r) => {
                             if record_is_live(self.process.as_ref(), &r, p.launch_command()) {
-                                return Ok(SessionState::Owned { profile });
+                                if r.kind.as_deref().is_some_and(|k| DAEMON_KINDS.contains(&k)) {
+                                    daemon = true;
+                                } else {
+                                    session = true;
+                                }
                             }
                         }
-                        RecordEntry::Unreadable { path, detail } => {
-                            damaged.get_or_insert_with(|| format!("{}: {detail}", path.display()));
-                        }
+                        RecordEntry::Unreadable { path, detail } => damaged.push(Damaged {
+                            kind: DamagedKind::Record,
+                            file: path,
+                            detail,
+                        }),
                     }
                 }
             }
             Read::Absent => {}
-            Read::Unreadable(e) => return Ok(unreadable_state(&profile, e.to_string())),
+            Read::Unreadable(e) => damaged.push(Damaged {
+                kind: DamagedKind::RecordsDir,
+                file: PathBuf::from(e.what),
+                detail: e.detail,
+            }),
         }
-        Ok(match damaged {
-            Some(detail) => unreadable_state(&profile, detail),
-            None => SessionState::Quiescent { profile },
-        })
+        // The supervisor of a background daemon writes no record of its own (CC 2.1.292); its
+        // lock file is judged as a record is (§12.6).
+        if let Some(lock) = p.supervisor_lock(&profile) {
+            match read_supervisor_lock(&lock) {
+                Read::Present(r) => {
+                    daemon |= record_is_live(self.process.as_ref(), &r, p.launch_command());
+                }
+                Read::Absent => {}
+                Read::Unreadable(e) => damaged.push(Damaged {
+                    kind: DamagedKind::SupervisorLock,
+                    file: lock,
+                    detail: e.detail,
+                }),
+            }
+        }
+        if session || daemon {
+            SessionState::Owned {
+                profile,
+                session,
+                daemon,
+                damaged,
+            }
+        } else if damaged.is_empty() {
+            SessionState::Quiescent { profile }
+        } else {
+            SessionState::Unreadable { profile, damaged }
+        }
     }
 
     /// §10.3 Guard and §9.2's session-owned target: refuses while `row` is session-owned. The
@@ -206,27 +309,29 @@ impl Engine {
         row: &AccountRow,
     ) -> Result<(), EngineError> {
         let state = self.session_state(p, row)?;
-        let unreadable = match &state {
-            // §14.2, B.69: the log gives the state only, since the detail names the file and a
-            // record's name is not tagteam's to choose. The refusal names it to the user.
-            SessionState::Unreadable { detail, .. } => {
-                tracing::warn!(
-                    position = row.position,
-                    account = %row.id,
-                    state = "unreadable",
-                    "a session reservation or record could not be read; the account counts as session-owned"
-                );
-                Some(detail.clone())
-            }
-            _ => None,
-        };
+        // §14.2, B.69: the log gives the state only, since the detail names the file and a
+        // record's name is not tagteam's to choose. The refusal names it to the user.
+        if !state.damaged().is_empty() {
+            tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                state = "unreadable",
+                "a session reservation or record could not be read; the account counts as session-owned"
+            );
+        }
         if state.owned() {
-            return Err(EngineError::SessionOwned {
-                position: row.position,
-                label: row.label.clone(),
-                unreadable,
-            });
+            return Err(session_owned_error(row, &state));
         }
         Ok(())
+    }
+}
+
+/// The `session-owned` refusal for `row`, whose profile is in `state`: it names every owner
+/// found and, for state that could not be read, the file and its repair.
+pub(crate) fn session_owned_error(row: &AccountRow, state: &SessionState) -> EngineError {
+    EngineError::SessionOwned {
+        position: row.position,
+        label: row.label.clone(),
+        owner: Box::new(SessionOwner::of(state)),
     }
 }

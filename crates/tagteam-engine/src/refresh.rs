@@ -15,7 +15,7 @@ use crate::error::EngineError;
 use crate::hooks;
 use crate::provenance::ProfileCheck;
 use crate::quarantine::QuarantineReason;
-use crate::store::{AccountRow, Store};
+use crate::store::{AccountRow, CREDENTIALS_REPLACED, Store};
 
 /// §7.3 step 5: the token request's bound. The account lock is held across it, which is why
 /// every other vault writer waits up to 15 s (§6.2).
@@ -227,8 +227,8 @@ impl Drop for Received<'_> {
                 account = %row.id,
                 "a refresh was interrupted before its token was stored; the token was kept outside the vault"
             ),
-            Err(e) if foreign => log_lost(&row, &e),
-            Err(e) => engine.record_loss(&row, &sent_fp, &e),
+            Err(e) if foreign => log_lost(&row, e.kind()),
+            Err(e) => engine.record_loss(&row, &sent_fp, e.kind()),
         }
     }
 }
@@ -262,12 +262,14 @@ pub(crate) enum Displacement {
 }
 
 /// A successor is lost (§7.3 step 6). Logged at ERROR, naming the account by position and ID
-/// only (§4.4); the caller's refusal or notice carries it to the user.
-pub(crate) fn log_lost(row: &AccountRow, cause: &dyn std::fmt::Display) {
+/// only (§4.4); the caller's refusal or notice carries it to the user. `cause` is an error's
+/// `kind()` or a fixed phrase, never an error's text (§14.2).
+pub(crate) fn log_lost(row: &AccountRow, cause: &'static str) {
     tracing::error!(
         position = row.position,
         account = %row.id,
-        "a refreshed token was lost: {cause}"
+        cause,
+        "a refreshed token was lost"
     );
 }
 
@@ -347,7 +349,7 @@ impl Engine {
         self.store()?
             .set_login_expires_at(&row.id, p.login_expires_at(bytes))?;
         if p.fingerprint(bytes) != before {
-            self.unquarantine(row)?;
+            self.unquarantine(row, CREDENTIALS_REPLACED, "cli")?;
         }
         Ok(())
     }
@@ -400,7 +402,7 @@ impl Engine {
                     QuarantineReason::parse(reason).unwrap_or(QuarantineReason::InvalidGrant),
                 ));
             }
-            self.unquarantine(&row)?;
+            self.unquarantine(&row, CREDENTIALS_REPLACED, "cli")?;
         }
         if !p.kind_traits(&row.kind).refreshable {
             return Ok(transient("not-refreshable"));
@@ -425,11 +427,12 @@ impl Engine {
         // picks it up. A conflict, or a profile that cannot be read, sends nothing (Decision 9).
         match self.apply_provenance(p, &row, &lock) {
             Ok(ProfileCheck::Conflict) => return Ok(GateOutcome::Conflict),
-            Ok(ProfileCheck::Unreadable(detail)) => {
+            // A fixed phrase (§14.2): the detail names the profile's path and may quote a file.
+            Ok(ProfileCheck::Unreadable(_)) => {
                 tracing::warn!(
                     position = row.position,
                     account = %row.id,
-                    "the session profile could not be read ({detail}); nothing is sent"
+                    "the session profile could not be read; nothing is sent"
                 );
                 return Ok(transient("profile-unreadable"));
             }
@@ -576,7 +579,8 @@ impl Engine {
             tracing::error!(
                 position = row.position,
                 account = %row.id,
-                "a refreshed token was stored, but recording it failed: {e}"
+                kind = e.kind(),
+                "a refreshed token was stored, but recording it failed"
             );
             received.disarm();
             return Persisted::Vault;
@@ -587,7 +591,8 @@ impl Engine {
         tracing::error!(
             position = row.position,
             account = %row.id,
-            "the vault could not store a refreshed token: {e}"
+            kind = e.kind(),
+            "the vault could not store a refreshed token"
         );
         match kept {
             Ok(()) => Persisted::Rescued,
@@ -595,7 +600,8 @@ impl Engine {
                 tracing::error!(
                     position = row.position,
                     account = %row.id,
-                    "neither the vault nor rescue/ could store a refreshed token: {e}"
+                    kind = e.kind(),
+                    "neither the vault nor rescue/ could store a refreshed token"
                 );
                 Persisted::Unpersisted
             }
@@ -636,7 +642,7 @@ impl Engine {
                 return Ok(match kept {
                     Ok(()) => GateOutcome::AlreadyFresh(now),
                     Err(e) => {
-                        log_lost(row, &e);
+                        log_lost(row, e.kind());
                         GateOutcome::Unpersisted
                     }
                 });
@@ -647,7 +653,7 @@ impl Engine {
                         kind: "vault-unreadable".into(),
                         rescued: true,
                     },
-                    Err(e) => self.lose(row, sent_fp, &e),
+                    Err(e) => self.lose(row, sent_fp, e.kind()),
                 });
             }
         }
@@ -658,11 +664,9 @@ impl Engine {
                 kind: "vault-write".into(),
                 rescued: true,
             },
-            Persisted::Unpersisted => self.lose(
-                row,
-                sent_fp,
-                &"neither the vault nor rescue/ could store it",
-            ),
+            Persisted::Unpersisted => {
+                self.lose(row, sent_fp, "neither the vault nor rescue/ could store it")
+            }
         })
     }
 
@@ -681,7 +685,7 @@ impl Engine {
         let quarantined = self.quarantine(row, QuarantineReason::IdentityConflict, sent_fp);
         match (kept, quarantined) {
             (Err(e), _) => {
-                log_lost(row, &e);
+                log_lost(row, e.kind());
                 Ok(Displacement::Lost)
             }
             (Ok(()), Err(e)) => Err(e),
@@ -702,7 +706,8 @@ impl Engine {
                 position = row.position,
                 account = %row.id,
                 reason = reason.as_str(),
-                "could not quarantine the account: {e}"
+                kind = e.kind(),
+                "could not quarantine the account"
             );
         }
     }
@@ -712,18 +717,13 @@ impl Engine {
     /// quarantines the account, bound to `sent_fp`, best effort: a store that cannot record it
     /// either leaves the loss reported only. Shared by the gate, `Received::drop` and
     /// active-token refresh (Task 16). Never panics.
-    pub(crate) fn record_loss(
-        &self,
-        row: &AccountRow,
-        sent_fp: &str,
-        cause: &dyn std::fmt::Display,
-    ) {
+    pub(crate) fn record_loss(&self, row: &AccountRow, sent_fp: &str, cause: &'static str) {
         log_lost(row, cause);
         self.quarantine_best_effort(row, QuarantineReason::SuccessorLost, sent_fp);
     }
 
     /// The gate's `Unpersisted`, recorded (`record_loss`).
-    fn lose(&self, row: &AccountRow, sent_fp: &str, cause: &dyn std::fmt::Display) -> GateOutcome {
+    fn lose(&self, row: &AccountRow, sent_fp: &str, cause: &'static str) -> GateOutcome {
         self.record_loss(row, sent_fp, cause);
         GateOutcome::Unpersisted
     }
@@ -752,12 +752,13 @@ impl Engine {
                 tracing::error!(
                     position = row.position,
                     account = %row.id,
-                    "the refresh failed after its token was received: {cause}"
+                    kind = cause.kind(),
+                    "the refresh failed after its token was received"
                 );
                 if foreign {
-                    log_lost(row, &e);
+                    log_lost(row, e.kind());
                 } else {
-                    self.record_loss(row, sent_fp, &e);
+                    self.record_loss(row, sent_fp, e.kind());
                 }
                 Abandoned::Lost
             }
@@ -817,16 +818,24 @@ mod tests {
             after.quarantine_reason, None,
             "§7.4: a fingerprint change clears it"
         );
-        let kinds: Vec<String> = t
+        // §7.4: one event, `credentials-replaced`, since no replacement moved the epoch.
+        let events: Vec<(String, Option<serde_json::Value>, String)> = t
             .engine
             .store()
             .unwrap()
             .events()
             .unwrap()
             .into_iter()
-            .map(|e| e.kind)
+            .map(|e| (e.kind, e.detail, e.source))
             .collect();
-        assert_eq!(kinds, ["unquarantine"]);
+        assert_eq!(
+            events,
+            [(
+                "unquarantine".to_owned(),
+                Some(serde_json::json!({"reason": "credentials-replaced"})),
+                "cli".to_owned()
+            )]
+        );
     }
 
     #[test]
@@ -851,6 +860,10 @@ mod tests {
         let after = t.row(&row.id);
         assert_eq!(after.quarantine_fp.as_deref(), Some(fp.as_str()));
         assert_eq!(after.login_expires_at, Some(7));
+        assert!(
+            t.engine.store().unwrap().events().unwrap().is_empty(),
+            "nothing cleared, nothing recorded"
+        );
     }
 
     #[test]

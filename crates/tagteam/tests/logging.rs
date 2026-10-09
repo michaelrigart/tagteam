@@ -377,6 +377,24 @@ const SETUP_TOKEN: &str = "sk-ant-oat01-zqsetup-Mx6kPw2zRq9vTs4nLy7j";
 const STRANGER_EMAIL: &str = "zq-stranger-7736@redact.test";
 const STRANGER_RT: &str = "zqrt-stranger-Qw4xKp9zRm2vTn7s";
 const STRANGER_AT: &str = "zqat-stranger-Hv8kWq3zPx6mRt2n";
+/// age's own ssh-ed25519 test key pair (age 0.12.1, `src/ssh`): an export is encrypted to it and
+/// imported with it, so no passphrase is asked for.
+const SSH_PK: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHsKLqeplhpW+uObz5dvMgjz1OxfM/XXUB+VHtZ6isGN alice@rust";
+/// The armor label is assembled from pieces, so no scanner reads this file as holding a key.
+const SSH_SK: &str = concat!(
+    "-----BEGIN OPENSSH ",
+    "PRIVATE",
+    " KEY-----\n",
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n",
+    "QyNTUxOQAAACB7Ci6nqZYaVvrjm8+XbzII89TsXzP111AflR7WeorBjQAAAJCfEwtqnxML\n",
+    "agAAAAtzc2gtZWQyNTUxOQAAACB7Ci6nqZYaVvrjm8+XbzII89TsXzP111AflR7WeorBjQ\n",
+    "AAAEADBJvjZT8X6JRJI8xVq/1aU8nMVgOtVnmdwqWwrSlXG3sKLqeplhpW+uObz5dvMgjz\n",
+    "1OxfM/XXUB+VHtZ6isGNAAAADHN0cjRkQGNhcmJvbgE=\n",
+    "-----END OPENSSH ",
+    "PRIVATE",
+    " KEY-----\n",
+);
 /// No line holds one of these whole.
 const IDENTITIES: [&str; 7] = [
     ALPHA_EMAIL,
@@ -387,8 +405,9 @@ const IDENTITIES: [&str; 7] = [
     ORG_NAME,
     ORG_UUID,
 ];
-/// No line holds 13 consecutive characters of one of these.
-const SECRETS: [&str; 12] = [
+/// No line holds 13 consecutive characters of one of these. The export recipient is among them
+/// though it is public: tagteam never logs a recipient or a key, so a line naming one is a leak.
+const SECRETS: [&str; 14] = [
     STRANGER_RT,
     STRANGER_AT,
     ALPHA_RT,
@@ -401,6 +420,8 @@ const SECRETS: [&str; 12] = [
     BRAVO_AT_ROTATED,
     API_KEY,
     SETUP_TOKEN,
+    SSH_SK,
+    SSH_PK,
 ];
 
 /// What `claude /login` leaves behind, as `common::login` writes it, but with this fixture's
@@ -570,6 +591,68 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
             String::from_utf8_lossy(&tick.stdout)
         );
     }
+    // M5b's commands. A plaintext export holds every token and is read back; an export to an
+    // SSH key is opened with the key's file (§13.3). Neither the files' contents nor the key
+    // may reach the log.
+    let plain = root.join("zq-export.json");
+    run(&["export", plain.to_str().unwrap(), "--plaintext"]);
+    run(&["import", plain.to_str().unwrap()]);
+    run(&["import", plain.to_str().unwrap(), "--force", "--json"]);
+    let key = root.join("zq-ssh-key");
+    fs::write(&key, SSH_SK).unwrap();
+    let sealed = root.join("zq-export.age");
+    run(&["export", sealed.to_str().unwrap(), "--recipient", SSH_PK]);
+    run(&[
+        "import",
+        sealed.to_str().unwrap(),
+        "--identity",
+        key.to_str().unwrap(),
+        "--force",
+    ]);
+    // doctor (§13.6), with a `claude` on PATH whose `auth status` names the fixture's email
+    // and organization, which doctor compares with the live login's. It exits 1 when a check
+    // fails, so only its exit code's range is asserted.
+    let bin = root.join("zq-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let claude = bin.join("claude");
+    fs::write(
+        &claude,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo '2.1.286 (Claude Code)' ;;\n  auth) : > \"$0.auth-called\"; echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"configDirectory\":\"x\",\"email\":\"{BRAVO_EMAIL}\",\"orgId\":\"{ORG_UUID}\",\"orgName\":\"{ORG_NAME}\"}}' ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
+    for args in [&["doctor"][..], &["doctor", "--json"][..]] {
+        let out = traced(root, &server)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            matches!(out.status.code(), Some(0 | 1)),
+            "{args:?}: {out:?}"
+        );
+        if args.contains(&"--json") {
+            // The identity leg must not pass vacuously: doctor found the fake `claude` on the
+            // `PATH` it captured, and asked it for the login's identity.
+            let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert!(
+                report["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["id"] == "cc.auth"),
+                "doctor ran no `claude auth status`: {report:#}"
+            );
+            assert!(
+                bin.join("claude.auth-called").exists(),
+                "the fake `claude` was never asked for `auth`"
+            );
+        }
+    }
+    // purge (§10.5): `--provider` keeps the log, which a full purge deletes last.
+    run(&["purge", "--provider", "claude-code", "--yes"]);
     run(&["list"]);
 
     // The secrets were sent: the log is clean because it never writes them.

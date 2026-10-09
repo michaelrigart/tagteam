@@ -1,6 +1,6 @@
 # tagteam — sub-project 1: Core + CLI
 
-**Status:** In progress
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/10
 **Date:** 2026-09-26
 **Scope:** Sub-project 1 of 4, plus a provider extension point. The daemon (2), TUI (3) and
 macOS menu bar (4) get their own specs and must not require reshaping anything defined here.
@@ -85,7 +85,7 @@ tagteam is public OSS under the MIT license, built for macOS and Linux.
 | Profile marker | `<profile>/.tagteam-profile.json`: the profile's account, its exported config-dir spelling, and the outer home it shares from (§12.2) |
 | Run shell | A process whose `CLAUDE_CONFIG_DIR` names a directory holding a profile marker: `claude` under `tagteam run`, and everything it spawns (§12.8) |
 | Launch reservation | tagteam's own record of a `run` in progress, written before `claude` starts and removed after exit handling (§12.5) |
-| Quiescent | A profile with no live launch reservation, and no live or unreadable session record |
+| Quiescent | A profile with no live launch reservation, no live or unreadable session record, and no live or unreadable daemon supervisor (`daemon.lock`, §12.6) |
 | Session-owned | An account whose profile is not quiescent |
 | Activation epoch | The login epoch an account had when tagteam last made it the live login, kept with the store's active account (§6.1, §12.5) |
 | Account lock | The per-account `flock` that every vault write for that account holds (§6.2) |
@@ -1156,18 +1156,23 @@ with its own locks and surface.
 | tagteam mutation lock | `flock(LOCK_EX)`, fd `O_CLOEXEC`, polled every 100 ms | `$XDG_DATA_HOME/tagteam/.mutation.lock` | n/a | 10 s (30 s for `run` bootstrap) |
 | CC OAuth refresh lock | `mkdir` directory lock | `<secure-storage dir>/.oauth_refresh.lock`, symlinks not resolved | 60 s | 9 s |
 | CC legacy credential lock | `mkdir` | `<realpath(secure-storage dir)>.lock` (`~/.claude.lock`); the unresolved path if `realpath` fails | 60 s | 9 s |
-| CC config lock | `mkdir` | `<global config path>.lock` (`~/.claude.json.lock`) | 10 s | 9 s |
-| CC storage-write lock | `mkdir` | `<secure-storage dir>/.storage-write`, symlinks not resolved | 15 s | 9 s |
+| CC config lock | `mkdir` | `<global config path>.lock` (`~/.claude.json.lock`) | 10 s | 12 s |
+| CC storage-write lock | `mkdir` | `<secure-storage dir>/.storage-write.lock` (CC 2.1.292), and the `<secure-storage dir>/.storage-write` recorded against 2.1.286; tagteam takes both, the second first; symlinks not resolved | 15 s | 9 s |
 
 Both credential locks and the storage-write lock are anchored at the secure-storage dir, not
 the config home; the two differ when `CLAUDE_SECURESTORAGE_CONFIG_DIR` is set (Appendix A.1).
 
-**The storage-write lock** is CC's serialization of every credential write (CC 2.1.286,
-Appendix A.3). CC takes it for each write to its secure storage, including writes that take no
+**The storage-write lock** is CC's serialization of every credential write (Appendix A.1,
+A.3). CC takes it for each write to its secure storage, including writes that take no
 refresh lock, such as MCP OAuth updates and its dead-token marking. tagteam takes it for every
 write or delete of a CC credential entry: the OAuth entry (Keychain item or
 `.credentials.json`) and the managed-key item. That covers the switch (§9.4 steps 7 and 10),
 recovery (§9.6), the active-token refresh's live write (§7.5) and profile bootstrap (§12.3).
+- **Two spellings.** CC 2.1.292 names its lock directory `.storage-write.lock`; the facts
+  recorded against 2.1.286 name `.storage-write`, which 2.1.292 does not create. tagteam takes
+  `.storage-write` and then `.storage-write.lock`, in that order, and releases both after the
+  write, so a CC that uses either spelling is excluded. Both share the staleness and wait
+  below, and "the storage-write lock" means the pair.
 - It is a leaf lock. It is taken only while the credential locks are held (for a profile, the
   profile's own), held around one entry's write, and never across a network call; no other
   lock is taken while it is held, except the displaced lock (§6.3), itself a leaf, when a
@@ -1188,9 +1193,29 @@ recovery (§9.6), the active-token refresh's live write (§7.5) and profile boot
     and only while nothing has written any of the entry's places since tagteam first changed
     them. A marking or any other write since leaves the whole entry as it is.
 
-When a switch or a recovery takes the three CC locks together, one 9 s budget covers all
-three. The active-token refresh takes the credential locks with that budget and, after its
-request, the config lock with a fresh 9 s budget (§7.5).
+**The config lock has its own 12 s budget**: its staleness (10 s) plus the up to 1 s that a lock
+CC left behind can carry in the future (Appendix A.7), with room. Every command that takes
+`MutationGuard`, and so may switch or recover (§9.4, §9.6), first waits until the default home's
+config lock is absent or stale, for up to 12 s (a cancellation point, §14.1), holding neither
+`MutationGuard`, nor an account lock, nor any CC lock; a lock the process holds for its whole
+lifetime, such as an `auto` engine's engine lock (§4.3, §11.1), stays held, since nothing else
+waits on it. Only then does it take `MutationGuard`, the account locks and, when it switches or
+recovers, the three CC locks together under one 9 s budget. So neither `MutationGuard` nor the
+credential locks, which CC's refresh waits on, are held through that wait. The active-token refresh takes the
+credential locks with the 9 s budget and, after its request, the config lock with its own 12 s
+(§7.5). Every other taker of the config lock (seeding, merge-back, a settings write) waits up to
+12 s.
+
+**CC does not always wait out the config lock** (*2.1.292*, Appendix A.7). It retries the lock on
+a backoff that totals about 10 s (only 1.5 s during its first 30 s, until its interactive UI is
+up) and then writes the global config without it, unless the change touches only its own
+counters and caches. tagteam holds the config lock only around one splice, well under that
+window, but a CC that starts during a switch can overwrite the splice. So after a
+switch commits, tagteam reads the default home's global config again. If `oauthAccount` is what
+the switch wrote, nothing more is done. Otherwise tagteam splices it once more under the config
+lock; if the lock cannot be taken, the splice fails, or a read afterwards still differs, it warns
+that a starting Claude Code may have overwritten the account's identity there and names
+`tagteam switch` again as the fix.
 
 The CC locks follow the `proper-lockfile` protocol:
 
@@ -1419,6 +1444,8 @@ here on.
 - The human output prints the result and a hint:
   - Keychain: "applies within ~30 s; restart Claude Code to apply now"
   - File store: "active on your next message"
+  - An API-key account on either side of the switch: "restart Claude Code to apply", since CC
+    caches the managed API key for the life of its process (*2.1.292*, Appendix A.7)
 
 ### 9.5 The `~/.claude.json` splice
 
@@ -1555,7 +1582,8 @@ Captures the live login.
   positions.
 - **Guard.** Destructive commands (`remove`, `purge`, `add` over an occupied position, and
   profile bootstrap) refuse while an affected account is session-owned: a live launch
-  reservation, or a session record that is live **or unreadable**. `move` is not destructive:
+  reservation, a session record that is live **or unreadable**, or a daemon supervisor in
+  `daemon.lock` that is live or unreadable (§12.6). `move` is not destructive:
   positions are display order only, and a profile is keyed by the account's ID.
 
 ### 10.4 Account references
@@ -1601,7 +1629,8 @@ home only to finish an interrupted switch, as every command that takes `Mutation
    - an affected account that is session-owned (§10.3's guard), naming its session;
    - an orphaned profile that is not quiescent: a profile directory under `sessions/` whose
      marker names no store account, or cannot be read, and that has a live launch
-     reservation or a session record that is live or unreadable (§12.5, §12.6). An orphan
+     reservation, a session record that is live or unreadable, or a daemon supervisor
+     (`daemon.lock`) that is live or unreadable (§12.5, §12.6). An orphan
      counts as affected when its marker names the provider being purged, or cannot be read,
      or the purge is full;
    - a set of affected accounts that differs from the one confirmed, because another command
@@ -2321,7 +2350,9 @@ record's writer, as judged from `procStart`:
 
 Records of every `kind` count, `bg` and `daemon` included. CC's background daemon reads and
 refreshes the profile's credential (Appendix A.7), so the account stays session-owned for as
-long as it runs.
+long as it runs. Its supervisor writes no record in 2.1.292, so a live supervisor in
+`<profile>/daemon.lock` counts too: its `pid` and `procStart` are judged as a record's are, and
+a `daemon.lock` that cannot be read counts as unreadable.
 
 **The `switch_journal` holder** is recorded with its start time taken from the same source it
 is later compared against (`/proc/<pid>/stat` field 22 on Linux, `proc_pidinfo` on macOS).
@@ -2683,7 +2714,10 @@ old` when the data is older than 15 min, else empty).
 `tagteam doctor [--online] [--json]` checks tagteam's own state and its interop with each
 provider.
 
-**Read-only.** Doctor writes nothing and creates nothing.
+**Read-only.** Doctor writes nothing and creates nothing itself. The `claude` it runs (`claude
+--version`, `claude auth status`) may make Claude Code's own start-up writes in the home it
+starts in, as any `claude` start does (Appendix A.7); doctor does not run `claude auth status`
+in a home whose global config does not exist.
 - It takes no `MutationGuard`, so it reports an interrupted switch rather than recovering it
   (§9.6).
 - It opens the store read-only and never migrates it. With no data directory, it reports that
@@ -2762,6 +2796,8 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
     warn, naming what to delete
   - reservations whose `tagteam` parent is gone but whose lock is still held, with the
     holding processes where the OS can tell; baselines awaiting merge-back → info
+  - a live background-daemon supervisor in a profile (`daemon.lock`, §12.6) → info: the
+    account is session-owned until it stops (`claude daemon stop --any` in that home)
   - a provenance conflict (§12.5) → fail, naming the account and the fix
   - a profile that is stale-marked, or whose seed records that it needs a bootstrap (§12.3)
     → info: its next launch bootstraps it
@@ -2789,7 +2825,9 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
   - any variable that `run` scrubs because it supplies or redirects a login (§12.5) → warn,
     naming it
 - **The default home's login,** by `claude auth status` (Appendix A.7) with a 10 s timeout, in
-  the outer home's environment inside a run shell (§12.8):
+  the outer home's environment inside a run shell (§12.8). When that home's global config does
+  not exist, doctor does not run it, since it would create the config (A.7), and reports
+  instead that Claude Code has not been started in that home → info:
   - logged in by a method other than its stored `claude.ai` login (`api_key_helper`,
     `oauth_token`, …) → warn: a switch changes nothing for `claude` started here
   - logged in as an email or org other than the live identity's → warn
@@ -3139,7 +3177,10 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
   - CC writes `settings.json` through a single link, appends `history.jsonl` through one, and
     what it does to a linked `CLAUDE.md` and `keybindings.json`
   - session records: written at start, removed on SIGINT, SIGTERM and SIGHUP, with an `lstart`
-    `procStart` on macOS and Linux; a `claude --bg` daemon's record in a profile
+    `procStart` on macOS and Linux
+  - a `claude --bg` daemon in a profile: its supervisor in `daemon.lock` (live `pid` and
+    `procStart`) and its workers' session records while it runs, the profile session-owned for
+    tagteam, and all of them gone after `claude daemon stop --any` (A.7)
   - the storage-write lock: CC waits for tagteam's, and the reverse
   - hot reload after a switch (file mtime, and the Keychain within 30 s)
   - CC reads tagteam-written Keychain items silently from a non-GUI (SSH) session, which covers
@@ -3148,14 +3189,18 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
     activation can commit (Appendix A.3)
   - CC runs on an API key while the credential entry keeps only machine-shared keys (§9.4)
   - lock interop while CC refreshes
-  - CC honours `~/.claude.json.lock` around its own writes of the global config (§9.1)
+  - CC, during its start-up, waits only briefly for `~/.claude.json.lock` before writing the
+    global config without it (§9.1, A.7). Its retry window past start-up is read from its code;
+    compat has no way to drive a CC write past start-up, so it does not check that window
   - CC accepts a `~/.claude.json` that tagteam created on a fresh machine (§9.5), and its own
     next write of the file leaves the span tagteam spliced byte-identical, which pins §9.5's
     rendering against `JSON.stringify`
-  - which of the managed-key item and `primaryApiKey` CC reads first, and whether a key in
-    `primaryApiKey` applies on the next message as §9.4's hint says
+  - which of the managed-key item and `primaryApiKey` CC reads first, and that a changed key
+    reaches only a new CC process, as §9.4's hint says (A.7)
   - CC writes `expiresAt` as an integer
-  - `claude auth status` writes nothing in the home it inspects (§13.6 relies on it)
+  - `claude auth status` writes nothing in a home whose global config CC has initialized, and
+    what CC's start-up writes in one whose config is absent or not yet initialized by CC, such
+    as one tagteam seeded (§13.6 relies on both)
   - opt-in, since they need the user's own session: the lock check on a locked login keychain
     in a GUI session (§17 O3), and CC reading tagteam-written items over SSH (`--ssh`)
 - Checks that need CC to refresh expire the scratch profile's access token and run one minimal
@@ -3243,8 +3288,10 @@ since 2.1.283.
   `<realpath(secure-storage dir)>.lock`, both `proper-lockfile` with stale 60 s and update 5 s
   (§9.1). CC takes the refresh lock first, then the legacy one, and releases the first to retry
   when the second is contended.
-- **Storage-write lock** (*2.1.286*): `<secure-storage dir>/.storage-write`, `proper-lockfile`
-  with stale 15 s and up to 10 retries. CC takes it around every write to its secure storage,
+- **Storage-write lock** (*2.1.292*): `proper-lockfile`'s `lock` of
+  `<secure-storage dir>/.storage-write` with no `lockfilePath`, so its lock directory is
+  `<secure-storage dir>/.storage-write.lock` (the library's default suffix), with stale 15 s
+  and up to 10 retries. Recorded against 2.1.286 as `.storage-write`; tagteam takes both (§9.1). CC takes it around every write to its secure storage,
   re-reading the entry strictly under it (§9.1, A.3).
 - **Refresh-lock owner record** (*2.1.286*): CC writes `.oauth_refresh.lock.owner` (its pid,
   `procStart` and the lock directory's birth time) when it takes the refresh lock, and, behind
@@ -3453,7 +3500,13 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   supervisor per config home. Its state is `<config_home>/daemon/` with sibling `daemon.*`
   files, and its sockets are under `/tmp/cc-daemon-<uid>/<sha256(config home)[..8]>/`. It reads
   that home's credential, refreshes it proactively under the credential locks, and passes
-  access tokens to its workers. It registers a session record of kind `daemon`. The installed
+  access tokens to its workers. Each worker writes a session record (`bg` or `daemon-worker`).
+  The supervisor's own identity is `<config_home>/daemon.lock` (`pid`, `origin`, `procStart`)
+  and `daemon/roster.json` (*2.1.292*; 2.1.286 was recorded as registering a record of kind
+  `daemon`, which 2.1.292's supervisor does not write). A daemon that `claude --bg` started is
+  transient (`origin` `transient`): `claude daemon stop` refuses it unless `--any` is given, and
+  `--any` reaches only that config home's daemon, through its `daemon.lock` and control
+  socket (*2.1.292*). The installed
   launchd or systemd service is for the default config dir only: `claude daemon install`
   refuses when `CLAUDE_CONFIG_DIR` is set.
 - **`claude auth status`** prints JSON by default; `--json` is accepted and changes nothing,
@@ -3463,7 +3516,18 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   they apply. `authMethod` is `claude.ai`, `api_key`, `api_key_helper`, `oauth_token`,
   `third_party`, or `none` when logged out. It exits 0 only when logged in. Its source order is
   `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, the token file descriptor, an
-  `apiKeyHelper`, a workload-identity profile, and only then the stored `claude.ai` login.
+  `apiKeyHelper`, a workload-identity profile, and only then the stored `claude.ai` login. In
+  a home whose global config CC has initialized, it writes nothing. In one whose config is
+  absent, or present but not yet initialized by CC (as one tagteam seeded, or the first start
+  after an upgrade, which runs CC's migrations), CC's start-up runs first: it writes the global
+  config and `backups/`, and leaves its `.claude.json.lock` behind, whose mtime can be up to 1 s
+  in the future (`proper-lockfile`'s first probe), before answering (*2.1.292*).
+- **The config lock's retries** (*2.1.292*): CC retries the config lock on a backoff of 200, 400,
+  800, 1600, 3200 and 4000 ms (about 10.2 s in all); during its first 30 s, until its interactive
+  UI is up, it stops retrying after 1.5 s. Then it writes the global config without the lock,
+  unless every changed key is one of its counters or caches (`numStartups`, `tipsHistory`, …).
+- **The managed API key** (*2.1.292*) is read once and cached for the life of the CC process;
+  a later change of the managed-key item or `primaryApiKey` reaches only new processes.
 - **Workload-identity profiles** live outside the config dir (`$ANTHROPIC_CONFIG_DIR`, else
   `$XDG_CONFIG_HOME/anthropic` or `~/.config/anthropic`) and are selected by
   `ANTHROPIC_PROFILE` or an `active_config` file. They are not keyed by `CLAUDE_CONFIG_DIR`.
@@ -3524,7 +3588,8 @@ Each is a one-liner, and each gets at least one test.
 29. Only a definite `invalid` auth status deletes a profile.
 30. tagteam only removes links it created; real history directories are never deleted.
 31. Destructive operations refuse while an affected account is session-owned (a live launch
-    reservation, or a session record that is live or unreadable).
+    reservation, a session record that is live or unreadable, or a daemon supervisor in
+    `daemon.lock` that is live or unreadable).
 32. Commands that change accounts or the live login refuse inside a `tagteam run` shell.
 33. Secret-bearing files are created 0600 at creation, never chmod'ed afterwards.
 34. Import validates everything before writing anything; the email and position checks defend
@@ -3617,7 +3682,7 @@ Each is a one-liner, and each gets at least one test.
     account is session-owned. It holds `MutationGuard` throughout, so nothing is created
     behind it, and a purge that stops part-way is finished by running it again (§10.5).
 67. `doctor` writes nothing, creates nothing apart from §13.6's SQLite exception, and asks
-    nothing (§13.6).
+    nothing (§13.6). The `claude` it runs may make Claude Code's own start-up writes.
 68. Every settings write is validated against the one key registry, and changes only the key
     it names (§6.4).
 69. No log line, at any level, holds an email, organization name, token, key, credential or

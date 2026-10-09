@@ -84,3 +84,29 @@ fn an_unlocked_keychain_file_passes_the_lock_check() {
     let k = SecurityCli::with_runner(Box::new(ProcessRunner), Some(kc.0.clone()));
     assert_eq!(k.lock_state(), LockState::Unlocked);
 }
+
+#[test]
+fn deleting_by_service_deletes_every_item_of_that_service_and_no_other() {
+    // Appendix A.3: `delete-generic-password -s` without `-a` deletes one item per call and
+    // returns rc 44 once none is left (inferred until this test pins it). The service names
+    // are this test's own, so even a call that missed the keychain file could touch nothing
+    // of tagteam's or Claude Code's.
+    const SERVICE: &str = "tagteam-test-delete-by-service";
+    const OTHER: &str = "tagteam-test-delete-by-service-other";
+    let kc = TempKeychain::new();
+    let k = SecurityCli::with_runner(Box::new(ProcessRunner), Some(kc.0.clone()));
+    for account in ["a", "a.prev", "b"] {
+        k.upsert(SERVICE, account, b"{}").unwrap();
+    }
+    k.upsert(OTHER, "a", b"kept").unwrap();
+    assert!(matches!(k.service_has_items(SERVICE), Read::Present(true)));
+    assert_eq!(k.delete_service(SERVICE).unwrap(), 3);
+    assert!(matches!(k.service_has_items(SERVICE), Read::Present(false)));
+    assert_eq!(k.find(OTHER, "a").present().unwrap(), b"kept");
+    assert!(matches!(k.service_has_items(OTHER), Read::Present(true)));
+    assert_eq!(
+        k.delete_service(SERVICE).unwrap(),
+        0,
+        "an empty service is done"
+    );
+}

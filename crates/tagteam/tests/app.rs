@@ -15,6 +15,7 @@ use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{CLAUDE_CODE, ProviderId, WindowKind};
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::Store;
+use tagteam_engine::transfer;
 use tagteam_provider::{Cancel, Env, FakeKeychain};
 
 const UNLOCK: &str = "The login keychain is locked (common over SSH). Unlock it now?";
@@ -155,6 +156,7 @@ impl H {
         let mut ctx = Context {
             env: self.env.clone(),
             keychain: self.kc.clone(),
+            vault_keychain: None,
             platform: Platform::MacOs,
             api_base: Some(common::OFFLINE_API_BASE.into()),
             stdout_terminal: false,
@@ -302,6 +304,35 @@ fn colour_under_auto_follows_the_output_the_command_writes_to() {
         list(&["list"], |c| c.force_color_env = true).contains(YELLOW_77),
         "FORCE_COLOR colours a pipe"
     );
+}
+
+#[test]
+fn a_vault_keychain_of_its_own_holds_the_vault_and_nothing_else() {
+    // Decision 16: `cargo xtask compat` gives the vault, and only the vault, a keychain of its
+    // own; Claude Code's items stay where they are.
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    let vault = Arc::new(FakeKeychain::new());
+    let own = vault.clone();
+    let (code, _, err) = h.run_in(&["add"], &mut Scripted::none(), move |ctx| {
+        ctx.vault_keychain = Some(own);
+    });
+    assert_eq!(code, 0, "{err}");
+    let services: Vec<String> = vault.items().into_keys().map(|(s, _)| s).collect();
+    assert!(
+        !services.is_empty() && services.iter().all(|s| s == "tagteam"),
+        "{services:?}"
+    );
+    let login = h.kc.items();
+    assert!(
+        login.keys().all(|(s, _)| s != "tagteam"),
+        "no vault item in the login keychain"
+    );
+    let live = (
+        keychain_service(&h.env, ItemKind::OAuth),
+        keychain_account(&h.env),
+    );
+    assert!(login.contains_key(&live), "Claude Code's item is untouched");
 }
 
 #[test]
@@ -1381,4 +1412,304 @@ fn a_repeated_id_counts_once_in_the_question_and_is_deleted_once() {
     );
     assert_eq!(yes.asked, [DELETE_ONE]);
     assert!(!file.exists());
+}
+
+/// §10.5's question, after its summary.
+const PURGE_QUESTION: &str = "Delete all of this?";
+
+/// What `with_login_and_key`'s full purge summary says before the question.
+const PURGE_SUMMARY: &str = "This deletes, for good:\n  #1  a@x.co\n  #2  api-key-2@token.local\n  the store and the log\nIt never deletes or changes a live login.\n";
+
+/// The accounts `list --json` shows, by email.
+fn stored_emails(h: &H) -> Vec<String> {
+    h.json(&["list", "--json"])["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["email"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn purge_asks_on_a_terminal_and_only_a_yes_deletes() {
+    // §10.5 step 2: the summary and the question, default no, before anything is locked.
+    let h = H::with_login_and_key();
+    let mut no = Scripted::answering(&[""]);
+    let (code, out, err) = h.run(&["purge"], &mut no);
+    assert_eq!(
+        (code, out.as_str(), err),
+        (1, "", format!("{PURGE_SUMMARY}tagteam: cancelled\n"))
+    );
+    assert_eq!(no.asked, [PURGE_QUESTION]);
+    assert_eq!(stored_emails(&h), ["a@x.co", "api-key-2@token.local"]);
+
+    let mut yes = Scripted::answering(&["y"]);
+    let (code, out, err) = h.run(&["purge"], &mut yes);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(err, PURGE_SUMMARY);
+    assert_eq!(
+        out,
+        "Purged a@x.co (position 1).\nPurged api-key-2@token.local (position 2).\nEmptied the store and deleted the log.\n"
+    );
+    assert!(stored_emails(&h).is_empty());
+}
+
+#[test]
+fn purge_without_a_terminal_or_under_json_needs_yes() {
+    let h = H::with_login_and_key();
+    let (code, out, err) = h.run(&["purge"], &mut Scripted::none());
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            1,
+            "",
+            "tagteam: purge deletes tagteam's data for good; run it on a terminal to confirm, or pass --yes\n"
+        )
+    );
+    // Even a person at a terminal is not asked under --json.
+    let mut nobody_asked = Scripted::answering(&[]);
+    let (code, out, _) = h.run(&["purge", "--json"], &mut nobody_asked);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        (code, v["error"]["type"].as_str()),
+        (1, Some("needs-confirmation"))
+    );
+    assert!(nobody_asked.asked.is_empty());
+    assert_eq!(stored_emails(&h).len(), 2);
+    h.ok(&["purge", "--yes"]);
+    assert!(stored_emails(&h).is_empty());
+}
+
+#[test]
+fn a_signal_at_the_purge_question_deletes_nothing() {
+    // §14.1, Decision 5: a prompt is a cancellation point, whatever it answered.
+    let h = H::with_login_and_key();
+    let cancel = Cancel::new();
+    let mut ctrl_c = Scripted::interrupted_by(&cancel, libc::SIGINT, &["y"]);
+    let (code, out, err) = h.run_with_cancel(&["purge"], &mut ctrl_c, &cancel);
+    assert_eq!(
+        (code, out.as_str(), err),
+        (130, "", format!("{PURGE_SUMMARY}{INTERRUPTED}"))
+    );
+    assert_eq!(stored_emails(&h).len(), 2);
+}
+
+#[test]
+fn purge_checks_a_locked_keychain_before_the_question() {
+    // §10.5 step 1, Appendix A.3: a person may unlock it; declining fails before the summary.
+    let h = H::with_login_and_key();
+    h.kc.set_locked(true);
+    let mut no_unlock = Scripted::answering(&["n"]);
+    let (code, out, err) = h.run(&["purge"], &mut no_unlock);
+    assert_eq!(
+        (code, out.as_str(), err),
+        (1, "", format!("tagteam: {LOCKED}\n"))
+    );
+    assert_eq!(no_unlock.asked, [UNLOCK]);
+    h.kc.set_locked(false);
+    assert_eq!(stored_emails(&h).len(), 2);
+}
+
+#[test]
+fn keychain_orphans_is_named_in_the_summary_only_where_there_is_a_keychain() {
+    // §10.5: it deletes `tagteam` Keychain items; Linux keeps its vault in `vault/`.
+    let h = H::new();
+    let summary = |keychain: &str| {
+        format!(
+            "This deletes, for good:\n  no account\n  the store and the log\n{keychain}It never deletes or changes a live login.\ntagteam: cancelled\n"
+        )
+    };
+    let mut no = Scripted::answering(&["n"]);
+    let (code, _, err) = h.run(&["purge", "--keychain-orphans"], &mut no);
+    assert_eq!(
+        (code, err),
+        (
+            1,
+            summary(
+                "  every `tagteam` Keychain item no account names, for every tagteam data directory on this Mac\n"
+            )
+        )
+    );
+    let mut no = Scripted::answering(&["n"]);
+    let (code, _, err) = h.run_in(&["purge", "--keychain-orphans"], &mut no, |c| {
+        c.platform = Platform::Linux
+    });
+    assert_eq!((code, err), (1, summary("")));
+}
+
+/// `a@x.co` stored at position 1 and live, and the path `export` writes to in `h`'s root.
+fn exporting() -> (H, String) {
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    h.ok(&["add"]);
+    let path = h._dir.path().join("backup.age");
+    (h, path.to_str().unwrap().to_owned())
+}
+
+/// Every file directly in `dir`.
+fn files_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn an_export_asks_its_passphrase_twice_and_seals_the_file_with_it() {
+    let (h, path) = exporting();
+    let mut asked = Scripted::answering(&["pw-1", "pw-1"]);
+    let (code, out, err) = h.run(&["export", &path], &mut asked);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        asked.asked,
+        ["Passphrase for the export: ", "The same passphrase again: "]
+    );
+    assert_eq!(out, format!("Exported 1 account to {path}, encrypted.\n"));
+    assert!(err.contains("hands its OAuth logins over"), "{err}");
+    assert!(err.contains("#1 a@x.co is in use here"), "{err}");
+    let file = std::fs::read(&path).unwrap();
+    assert!(file.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----"));
+    assert!(!String::from_utf8_lossy(&file).contains("rt-a"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let opened = transfer::decode(&file, &[], &mut |_: &transfer::Need| {
+        Some(transfer::SecretString::from("pw-1"))
+    })
+    .unwrap();
+    assert_eq!(opened.records.len(), 1);
+    assert_eq!(
+        opened.records[0].credential["claudeAiOauth"]["refreshToken"],
+        "rt-a"
+    );
+}
+
+#[test]
+fn a_destination_that_cannot_be_written_refuses_before_any_prompt_or_vault_read() {
+    // Review Focus 5: a directory, a directory this user cannot write in, and `-` under
+    // `--json` each refuse first. `Scripted::answering(&[])` fails the test on any prompt.
+    let (h, _) = exporting();
+    let root = h._dir.path();
+    let dir = root.to_str().unwrap();
+    let (code, _, err) = h.run(&["export", dir], &mut Scripted::answering(&[]));
+    assert_eq!(code, 1);
+    assert_eq!(
+        err,
+        format!("tagteam: {dir} is a directory; name a file to export to\n")
+    );
+
+    let theirs = root.join("theirs");
+    std::fs::create_dir(&theirs).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let into = theirs.join("x.age");
+    let (code, _, err) = h.run(
+        &["export", into.to_str().unwrap()],
+        &mut Scripted::answering(&[]),
+    );
+    std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code, 1);
+    assert!(
+        err.starts_with(&format!(
+            "tagteam: cannot create the export in {}: ",
+            theirs.display()
+        )),
+        "{err}"
+    );
+
+    for args in [&["export", "-", "--json"][..], &["export", "--json"]] {
+        let (code, out, _) = h.run(args, &mut Scripted::answering(&[]));
+        assert_eq!(code, 2, "{args:?}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"]["type"], "usage");
+        assert_eq!(
+            v["error"]["message"],
+            "export - writes the export to stdout, which --json needs for its result; name a file"
+        );
+    }
+    assert!(
+        files_in(root).iter().all(|f| !f.contains(".tagteam-")),
+        "no temporary file is left: {:?}",
+        files_in(root)
+    );
+}
+
+#[test]
+fn the_export_passphrase_must_be_typed_the_same_twice_and_not_be_empty() {
+    let (h, path) = exporting();
+    for (answers, message) in [
+        (&["pw-1", "pw-2"][..], "the two passphrases differ"),
+        (
+            &[""][..],
+            "an empty passphrase protects nothing; pass --plaintext to write the export unencrypted",
+        ),
+    ] {
+        let (code, _, err) = h.run(&["export", &path], &mut Scripted::answering(answers));
+        assert_eq!((code, err), (1, format!("tagteam: {message}\n")));
+        assert!(!Path::new(&path).exists());
+    }
+    assert_eq!(
+        files_in(h._dir.path()),
+        ["home"],
+        "no temporary file is left"
+    );
+}
+
+#[test]
+fn without_a_terminal_or_under_json_an_export_needs_a_key_or_plaintext() {
+    let (h, path) = exporting();
+    let (code, _, err) = h.run(&["export", &path], &mut Scripted::none());
+    assert_eq!(code, 1);
+    assert_eq!(
+        err,
+        "tagteam: an export is encrypted with a passphrase typed on a terminal; pass --recipient or --recipient-file to encrypt it to a key, or --plaintext to write it unencrypted\n"
+    );
+    let (code, out, _) = h.run(&["export", &path, "--json"], &mut Scripted::answering(&[]));
+    assert_eq!(code, 1);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["error"]["type"], "needs-passphrase");
+    assert!(!Path::new(&path).exists());
+}
+
+#[test]
+fn another_home_imports_a_passphrase_export_asking_for_it_once() {
+    let (from, path) = exporting();
+    let (code, _, err) = from.run(
+        &["export", &path],
+        &mut Scripted::answering(&["pw-1", "pw-1"]),
+    );
+    assert_eq!(code, 0, "{err}");
+    let to = H::new();
+    let mut asked = Scripted::answering(&["pw-1"]);
+    let (code, out, err) = to.run(&["import", &path], &mut asked);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(asked.asked, [format!("Passphrase for {path}: ")]);
+    assert_eq!(out, "created  #1 a@x.co: added\n");
+    assert_eq!(
+        to.json(&["list", "--json"])["accounts"][0]["email"],
+        "a@x.co"
+    );
+    let (code, _, err) = to.run(&["import", &path], &mut Scripted::answering(&["wrong"]));
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            1,
+            "tagteam: the passphrase is wrong, or the file is damaged\n"
+        )
+    );
+}
+
+#[test]
+fn a_passphrase_file_is_never_prompted_for_under_json() {
+    let (from, path) = exporting();
+    let (code, _, err) = from.run(&["export", &path], &mut Scripted::answering(&["pw", "pw"]));
+    assert_eq!(code, 0, "{err}");
+    let to = H::new();
+    let (code, out, _) = to.run(&["import", &path, "--json"], &mut Scripted::answering(&[]));
+    assert_eq!(code, 1);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["error"]["type"], "needs-passphrase");
+    assert!(!to.env.data_dir().exists(), "nothing was created");
 }

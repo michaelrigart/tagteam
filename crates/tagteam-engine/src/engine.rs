@@ -14,8 +14,19 @@ use crate::hooks;
 use crate::oracle::Oracle;
 use crate::registry::ProviderRegistry;
 use crate::settings::Settings;
-use crate::store::Store;
+use crate::store::{JournalRow, Store, StoreError};
 use crate::vault::Vault;
+
+/// How a holder of an account lock treats a pending replacement it cannot install (§12.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reconcile {
+    /// Every holder but `remove` and `purge`: a replacement that landed with metadata that
+    /// cannot be read refuses with `replacement-unreadable`.
+    Strict,
+    /// `remove` and `purge`, which delete the account either way (§12.5): such a replacement
+    /// is left as it is, and the account goes with it.
+    Removing,
+}
 
 pub struct EngineConfig {
     pub env: Env,
@@ -56,7 +67,7 @@ pub struct Engine {
     pub(crate) fail_at: Mutex<Option<&'static str>>,
     #[cfg(feature = "test-hooks")]
     #[allow(clippy::type_complexity)]
-    pub(crate) on_point: Mutex<Option<(&'static str, Box<dyn Fn() + Send + Sync>)>>,
+    pub(crate) on_point: Mutex<Vec<(&'static str, Box<dyn Fn() + Send + Sync>)>>,
 }
 
 impl Engine {
@@ -77,7 +88,7 @@ impl Engine {
             #[cfg(feature = "test-hooks")]
             fail_at: Mutex::new(None),
             #[cfg(feature = "test-hooks")]
-            on_point: Mutex::new(None),
+            on_point: Mutex::new(Vec::new()),
         }
     }
 
@@ -170,6 +181,15 @@ impl Engine {
             .ok_or_else(|| EngineError::UnknownProvider(id.to_string()))
     }
 
+    /// `id` as a log line's field, only when this build registers it (§14.2): an ID read from a
+    /// marker or a store column is otherwise any text, an email among it.
+    pub(crate) fn registered_id<'a>(
+        &self,
+        id: &'a ProviderId,
+    ) -> Option<tracing::field::DisplayValue<&'a ProviderId>> {
+        self.registry.get(id).map(|_| tracing::field::display(id))
+    }
+
     /// §12.8: commands that change accounts or the live login refuse inside a run shell, and
     /// under a marker that cannot be read, which the refusal names.
     pub(crate) fn refuse_inside_run_shell(&self) -> Result<(), EngineError> {
@@ -239,12 +259,35 @@ impl Engine {
         source: &'static str,
         timeout: Duration,
     ) -> Result<MutationGuard, EngineError> {
-        let (guard, blocked) = self.guard_recovering(true, source, timeout)?;
-        if self.interrupted(provider)? {
-            return Err(blocked
-                .into_iter()
-                .find_map(|(p, e)| (&p == provider).then_some(e))
-                .unwrap_or_else(|| EngineError::InterruptedSwitch(provider.to_string())));
+        self.guard_or_refuse_each_within(std::slice::from_ref(provider), source, timeout)
+    }
+
+    /// `guard_or_refuse_as` for several providers under one mutation lock (`import`, §13.3):
+    /// refused for the first of `providers` whose interrupted switch is still unresolved once
+    /// recovery has run under it.
+    pub(crate) fn guard_or_refuse_each(
+        &self,
+        providers: &[ProviderId],
+        source: &'static str,
+    ) -> Result<MutationGuard, EngineError> {
+        self.guard_or_refuse_each_within(providers, source, MutationGuard::TIMEOUT)
+    }
+
+    /// `guard_or_refuse_each`, waiting up to `timeout` for the lock.
+    fn guard_or_refuse_each_within(
+        &self,
+        providers: &[ProviderId],
+        source: &'static str,
+        timeout: Duration,
+    ) -> Result<MutationGuard, EngineError> {
+        let (guard, mut blocked) = self.guard_recovering(true, source, timeout)?;
+        for provider in providers {
+            if self.interrupted(provider)? {
+                return Err(match blocked.iter().position(|(p, _)| p == provider) {
+                    Some(i) => blocked.swap_remove(i).1,
+                    None => EngineError::InterruptedSwitch(provider.to_string()),
+                });
+            }
         }
         Ok(guard)
     }
@@ -305,8 +348,40 @@ impl Engine {
         source: &'static str,
         timeout: Duration,
     ) -> Result<(MutationGuard, Vec<(ProviderId, EngineError)>), EngineError> {
-        let hints: Vec<_> = self
-            .dead_journals()?
+        self.guard_recovering_from(ask_oracle, source, timeout, Self::dead_journals)
+    }
+
+    /// `MutationGuard`, taken after §9.1's pre-wait: each provider's config lock is waited for,
+    /// holding no lock of tagteam's or of CC's, until it is absent or stale, so neither
+    /// `MutationGuard` nor the credential locks CC's refresh waits on are held through the
+    /// wait. Every acquisition of the guard goes through here. A lock a process holds for its
+    /// whole lifetime (an `auto` engine's, §11.1) stays held. A timeout refuses as a lock
+    /// timeout does.
+    pub(crate) fn acquire_guard(&self, timeout: Duration) -> Result<MutationGuard, EngineError> {
+        for p in self.registry.all() {
+            // A lock failure is the guard's own kind of failure (`EngineError::Lock`), which
+            // callers that treat a busy guard as "moved" or "no switch" already match.
+            p.wait_config_lock_idle(&self.env).map_err(|e| match e {
+                ProviderError::Lock(e) => EngineError::Lock(e),
+                e => EngineError::Provider(e),
+            })?;
+        }
+        hooks::point(self, "config-pre-wait-done")?;
+        Ok(MutationGuard::acquire(&self.env, timeout)?)
+    }
+
+    /// `guard_recovering` over the rows `journals` gives, read before the lock and again under
+    /// it. `purge_guard` passes `dead_decodable_journals`, so a row that does not decode is
+    /// left for it to delete (§10.5 step 5) rather than ending it; every other caller reads
+    /// them all, strictly.
+    fn guard_recovering_from(
+        &self,
+        ask_oracle: bool,
+        source: &'static str,
+        timeout: Duration,
+        journals: fn(&Self) -> Result<Vec<JournalRow>, EngineError>,
+    ) -> Result<(MutationGuard, Vec<(ProviderId, EngineError)>), EngineError> {
+        let hints: Vec<_> = journals(self)?
             .into_iter()
             .map(|row| {
                 let hint = if ask_oracle {
@@ -318,11 +393,11 @@ impl Engine {
             })
             .collect::<Result<_, EngineError>>()?;
         hooks::point(self, "before-mutation-lock")?;
-        let guard = MutationGuard::acquire(&self.env, timeout)?;
+        let guard = self.acquire_guard(timeout)?;
         // Enumerated again under the lock: a switch may have died while this command waited,
         // and its row is recovered now too, without a hint.
         let mut blocked = Vec::new();
-        for row in self.dead_journals()? {
+        for row in journals(self)? {
             let hint = hints
                 .iter()
                 .find(|(r, _)| *r == row)
@@ -347,7 +422,13 @@ impl Engine {
                 if e.signal().is_some() {
                     return Err(e);
                 }
-                tracing::warn!(provider = %row.provider, "could not recover an interrupted switch: {e}");
+                // By kind (§14.2): the error may name an account's label, a path, or a provider
+                // as the row stored it.
+                tracing::warn!(
+                    provider = self.registered_id(&row.provider),
+                    kind = e.kind(),
+                    "could not recover an interrupted switch"
+                );
                 if matches!(
                     e,
                     EngineError::RecoveryBlocked { .. } | EngineError::RecoveryMoved { .. }
@@ -357,6 +438,63 @@ impl Engine {
             }
         }
         Ok((guard, blocked))
+    }
+
+    /// §10.5 steps 4 and 5 (Decision 7): `MutationGuard`, under which every interrupted switch
+    /// whose holder died is recovered as usual (§9.6). What recovery could not settle is left
+    /// for `purge_leftover_journals`, which runs once step 6's refusals have passed: a refused
+    /// purge deletes nothing, so the next guarded command still finds the interrupted switch.
+    pub(crate) fn purge_guard(&self) -> Result<MutationGuard, EngineError> {
+        let (guard, _blocked) = self.guard_recovering_from(
+            true,
+            "cli",
+            MutationGuard::TIMEOUT,
+            Self::dead_decodable_journals,
+        )?;
+        Ok(guard)
+    }
+
+    /// §10.5 step 5 (Decision 7), after step 6: a journal row of an affected provider that is
+    /// still there once recovery is done (undecidable, blocked, or unreadable) is deleted, with
+    /// a warning that the live login may be incoherent, and the live login is left as it is:
+    /// purge is the way out of a state tagteam cannot repair, so it never refuses on one.
+    /// Returns the warnings. The caller holds the guard `purge_guard` gave.
+    pub(crate) fn purge_leftover_journals(
+        &self,
+        providers: &[ProviderId],
+    ) -> Result<Vec<String>, EngineError> {
+        let mut warnings = Vec::new();
+        if let Some(store) = self.existing_store()? {
+            for provider in providers {
+                if matches!(store.journal(provider), Ok(None)) {
+                    continue;
+                }
+                store.delete_journal(provider)?;
+                tracing::warn!(
+                    provider = self.registered_id(provider),
+                    "purge deleted an interrupted switch's record that recovery could not settle"
+                );
+                warnings.push(format!(
+                    "an interrupted switch for {provider} could not be recovered, so its record was deleted; the live login may be incoherent (its credential and its identity may name different accounts), and it is left as it is"
+                ));
+            }
+        }
+        Ok(warnings)
+    }
+
+    /// `dead_journals` for `purge_guard`: each row decoded on its own, and one that does not
+    /// decode left out of recovery. It is one recovery cannot decide, so `purge_guard` deletes
+    /// it with the rest (§10.5 step 5, Decision 7).
+    fn dead_decodable_journals(&self) -> Result<Vec<JournalRow>, EngineError> {
+        let Some(store) = self.existing_store()? else {
+            return Ok(vec![]);
+        };
+        Ok(store
+            .journals_each()?
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|j| !j.holder.is_live())
+            .collect())
     }
 
     /// Takes the account lock, then reconciles a pending explicit replacement (§12.5): the
@@ -374,20 +512,48 @@ impl Engine {
         sorted.into_iter().map(|id| self.lock_account(id)).collect()
     }
 
+    /// §12.5's reconciliation, strictly: every lock holder but `remove` and `purge` runs it.
     pub(crate) fn reconcile_replacement(&self, lock: &AccountLock) -> Result<(), EngineError> {
+        self.reconcile_replacement_as(lock, Reconcile::Strict)
+    }
+
+    /// §12.5: a pending replacement the vault holds (`replacing_fp`) landed, and its recorded
+    /// metadata is installed; one it does not hold never landed, and is rolled back, which needs
+    /// no metadata. A landed one whose metadata cannot be read refuses under `Strict`, naming
+    /// the account, and is left as it is under `Removing`.
+    pub(crate) fn reconcile_replacement_as(
+        &self,
+        lock: &AccountLock,
+        mode: Reconcile,
+    ) -> Result<(), EngineError> {
         let Some(store) = self.existing_store()? else {
             return Ok(());
         };
         let Some(row) = store.account(lock.id())? else {
             return Ok(());
         };
-        let Some(fp) = row.replacing_fp else {
+        let Some(fp) = row.replacing_fp.as_deref() else {
             return Ok(());
         };
         let provider = self.provider(&row.provider)?;
         match self.vault.read(lock.id()) {
             Read::Present(b) if provider.fingerprint(&b).is_some_and(|f| f.as_str() == fp) => {
-                store.finish_replacement(lock.id())?
+                match store.finish_replacement(lock.id(), self.now_ms()) {
+                    Ok(()) => {}
+                    Err(StoreError::ReplacementUnreadable(_)) if mode == Reconcile::Removing => {}
+                    Err(StoreError::ReplacementUnreadable(detail)) => {
+                        tracing::warn!(
+                            position = row.position,
+                            account = %row.id,
+                            "a new login landed but what its replacement recorded cannot be read ({detail})"
+                        );
+                        return Err(EngineError::ReplacementUnreadable {
+                            position: row.position,
+                            label: row.label.clone(),
+                        });
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
             Read::Present(_) | Read::Absent => store.rollback_replacement(lock.id())?,
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
@@ -409,7 +575,13 @@ impl Engine {
     /// hook point on this same engine: that would deadlock. Drive the race through a second
     /// engine instead (`Fx::engine_with_env`).
     pub fn on_point(&self, name: &'static str, callback: Box<dyn Fn() + Send + Sync>) {
-        *self.on_point.lock().unwrap() = Some((name, callback));
+        *self.on_point.lock().unwrap() = vec![(name, callback)];
+    }
+
+    /// `on_point` for one more point, keeping what is registered: a test that must act at two
+    /// points of one run (a lock taken at one and released at another).
+    pub fn also_on_point(&self, name: &'static str, callback: Box<dyn Fn() + Send + Sync>) {
+        self.on_point.lock().unwrap().push((name, callback));
     }
 }
 

@@ -75,15 +75,17 @@ struct Temp<'a> {
 
 impl Drop for Temp<'_> {
     /// A temp file that cannot be removed is left behind: a contained error, logged at WARN
-    /// with its cause, never discarded (§14). One that is already gone was never left behind.
+    /// with its cause, never discarded (§14). The line names the file by its role, never its
+    /// path: it sits beside its target, perhaps in a Claude Code home the user named
+    /// (`CLAUDE_CONFIG_DIR`), and §14.2 keeps such a name out of the log. One that is already
+    /// gone was never left behind.
     fn drop(&mut self) {
         if self.published {
             return;
         }
         match fs::remove_file(self.path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => tracing::warn!(
-                path = %self.path.display(),
-                "could not remove a temporary file: {e}"
+                "could not remove the temporary file of a write that was not published, left beside its target: {e}"
             ),
             _ => {}
         }
@@ -138,8 +140,34 @@ fn write_atomic_mode_with<E: From<io::Error>>(
         .and_then(|()| fs::rename(&tmp, &target).map_err(E::from))?;
     temp.published = true;
     // Published: from here on nothing may report failure.
-    let _ = File::open(dir).and_then(|d| d.sync_all());
+    sync_parent(dir, "a file tagteam wrote");
     Ok(())
+}
+
+/// §14: after a published write, the parent directory's `fsync`, best effort. The rename has
+/// published the file, so nothing here fails the write. A filesystem that does not sync a
+/// directory refuses on every call with `EINVAL`, `ENOTSUP` or `EOPNOTSUPP` (macOS's `sync_all`
+/// is `F_FULLFSYNC`, which devfs refuses with `ENOTSUP`): that stays silent. Any other failure,
+/// an `EIO` say, is logged at WARN with its cause and the file's `role`, never a path (§14.2).
+pub fn sync_parent(dir: &Path, role: &str) {
+    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
+        if let Some(line) = parent_sync_warning(role, &e) {
+            tracing::warn!("{line}");
+        }
+    }
+}
+
+/// `sync_parent`'s WARN line for `e`, or `None` where the filesystem does not sync directories.
+fn parent_sync_warning(role: &str, e: &io::Error) -> Option<String> {
+    let unsupported = [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP];
+    if e.raw_os_error()
+        .is_some_and(|code| unsupported.contains(&code))
+    {
+        return None;
+    }
+    Some(format!(
+        "could not sync the directory of {role} after publishing it, so it may not survive a crash: {e}"
+    ))
 }
 
 /// Removes the file a path resolves to and leaves any symlink in place, the mirror image of
@@ -165,6 +193,43 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
     DirBuilder::new().recursive(true).mode(0o700).create(path)
 }
 
+/// The writer's pid in the name of a temp file the atomic writer left (§9.5:
+/// `.<name>.tagteam-<pid>-<hex8>`), or `None` for any other name. Purge deletes such a file once
+/// its writer is gone (§10.5), and doctor reports one (§13.6), since it may hold a secret.
+pub fn temp_writer_pid(file_name: &str) -> Option<u32> {
+    let (target, tail) = file_name.strip_prefix('.')?.rsplit_once(".tagteam-")?;
+    let (pid, rand) = tail.split_once('-')?;
+    let lower_hex = |b: u8| b.is_ascii_digit() || (b'a'..=b'f').contains(&b);
+    if target.is_empty()
+        || pid.is_empty()
+        || !pid.bytes().all(|b| b.is_ascii_digit())
+        || rand.len() != 8
+        || !rand.bytes().all(lower_hex)
+    {
+        return None;
+    }
+    pid.parse().ok().filter(|p| *p > 0)
+}
+
+/// Whether this process may write `path`, as `access(2)` with `W_OK` answers it: for a
+/// directory, whether it may create entries in it. It opens and creates nothing. A path that
+/// does not exist is an error, `NotFound`.
+pub fn writable(path: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the path holds a NUL byte"))?;
+    // SAFETY: `c` is a NUL-terminated string that lives for the whole call; `access` only
+    // reads it.
+    if unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EACCES | libc::EROFS | libc::EPERM) => Ok(false),
+        _ => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +237,70 @@ mod tests {
 
     fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn a_temp_name_gives_its_writer_s_pid_and_nothing_else_does() {
+        assert_eq!(
+            temp_writer_pid(".credentials.json.tagteam-4242-0a1b2c3d"),
+            Some(4242)
+        );
+        assert_eq!(
+            temp_writer_pid(".claude.json.tagteam-7-ffffffff"),
+            Some(7),
+            "a name with dots of its own"
+        );
+        for other in [
+            "credentials.json.tagteam-4242-0a1b2c3d",
+            ".credentials.json",
+            "..tagteam-4242-0a1b2c3d",
+            ".x.tagteam-4242-0A1B2C3D",
+            ".x.tagteam-4242-0a1b2c3",
+            ".x.tagteam-+42-0a1b2c3d",
+            ".x.tagteam-0-0a1b2c3d",
+            ".x.tagteam--0a1b2c3d",
+            ".x.tagteam-99999999999-0a1b2c3d",
+        ] {
+            assert_eq!(temp_writer_pid(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_temp_file_the_writer_leaves_is_one_temp_writer_pid_reads() {
+        // Its name is the writer's own (§9.5): what a killed writer leaves behind.
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("v.json");
+        let _ = write_atomic_with(&target, b"x", 0o600, || {
+            let name = fs::read_dir(d.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .find(|n| n != "v.json")
+                .unwrap();
+            assert_eq!(temp_writer_pid(&name), Some(std::process::id()));
+            Err(io::Error::other("stop before publishing"))
+        });
+    }
+
+    #[test]
+    fn writable_answers_for_files_and_directories_and_creates_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("f");
+        fs::write(&file, "x").unwrap();
+        assert!(writable(&file).unwrap());
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(!writable(&file).unwrap(), "run as a non-root user");
+        let dir = d.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        assert!(writable(&dir).unwrap());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(!writable(&dir).unwrap());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let missing = d.path().join("missing");
+        assert_eq!(
+            writable(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!missing.exists());
     }
 
     #[test]
@@ -192,6 +321,26 @@ mod tests {
         write_atomic(&p, b"new", 0o600).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"new");
         assert_eq!(mode(&p), 0o644);
+    }
+
+    #[test]
+    fn a_parent_directory_sync_is_silent_only_where_the_filesystem_does_not_do_it() {
+        // §14: the unsupported answers stay silent; any other cause is a WARN line that names
+        // the file's role and the cause, never a path.
+        for code in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            let e = io::Error::from_raw_os_error(code);
+            assert_eq!(parent_sync_warning("an export", &e), None, "{e}");
+        }
+        let eio = io::Error::from_raw_os_error(libc::EIO);
+        let line = parent_sync_warning("an export", &eio).unwrap();
+        assert!(
+            line.contains("directory of an export") && line.contains("(os error 5)"),
+            "{line}"
+        );
+        // A real directory syncs, and a missing one is reported, never fatal.
+        let d = tempfile::tempdir().unwrap();
+        sync_parent(d.path(), "a test file");
+        sync_parent(&d.path().join("gone"), "a test file");
     }
 
     #[test]
@@ -367,8 +516,14 @@ mod tests {
         let warnings: Vec<&String> = logs.iter().filter(|l| l.contains("WARN")).collect();
         assert_eq!(warnings.len(), 1, "{logs:?}");
         assert!(
-            warnings[0].contains("could not remove a temporary file")
-                && warnings[0].contains(".c.json.tagteam-"),
+            warnings[0].contains("could not remove the temporary file of a write"),
+            "{}",
+            warnings[0]
+        );
+        // §14.2: its role and cause, never the path, which may name a Claude Code home.
+        assert!(
+            !warnings[0].contains(".c.json.tagteam-")
+                && !warnings[0].contains(&d.path().display().to_string()),
             "{}",
             warnings[0]
         );

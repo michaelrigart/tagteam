@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tagteam_core::autoswitch::{
     AccountSnapshot, AutoConfig, AutoState, Decision, Live, NoSwitchReason, Outcome, Phase,
@@ -13,8 +13,8 @@ use tagteam_core::autoswitch::{
 };
 use tagteam_core::rank::span;
 use tagteam_core::usage::headroom;
-use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
-use tagteam_provider::{FlockGuard, LockError, ProcessStamp, Provider};
+use tagteam_core::{AccountId, Fingerprint, ProviderId, Window, WindowKind};
+use tagteam_provider::{Env, FlockGuard, LockError, ProcessStamp, Provider, Read, ReadError};
 
 use crate::collect::{CollectMode, CollectReport, Collected};
 use crate::engine::Engine;
@@ -172,6 +172,61 @@ fn write_holder(path: &Path) -> Result<(), EngineError> {
     Ok(())
 }
 
+/// §5: `locks/autoswitch-<provider>.lock`, the provider's engine lock (§11.1). `auto` holds it
+/// for an engine's life, and `purge` while it runs (§10.5 step 3).
+///
+/// A provider ID is a string the store holds, so one that is not a plain name (anything outside
+/// `[A-Za-z0-9._-]`, or one starting with `.`) cannot name a path: its lock is
+/// `locks/engine-<first 12 hex digits of the ID's SHA-256>.lock`, inside `locks/`. Every
+/// registered provider's ID is a plain name and keeps its `autoswitch-` file.
+pub(crate) fn engine_lock_path(env: &Env, provider: &ProviderId) -> PathBuf {
+    let id = provider.as_str();
+    let plain = !id.is_empty()
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    let name = if plain {
+        format!("autoswitch-{id}.lock")
+    } else {
+        format!(
+            "engine-{}.lock",
+            Fingerprint::of_secret(id.as_bytes()).short12()
+        )
+    };
+    env.data_dir().join("locks").join(name)
+}
+
+/// The holder `write_holder` recorded in an engine lock file (§11.1), read without trying the
+/// lock, which an `auto` starting at that instant would then find taken (§13.6): the holder
+/// an engine named, never proof that it still holds the lock. `Absent` when
+/// there is no file, or an empty one: no engine has written its record there yet.
+pub(crate) fn read_holder(path: &Path) -> Read<ProcessStamp> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Read::Absent,
+        Err(e) => {
+            return Read::Unreadable(ReadError::new(path.display().to_string(), e.to_string()));
+        }
+    };
+    if bytes.is_empty() {
+        return Read::Absent;
+    }
+    let v: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
+    let pid = v
+        .as_ref()
+        .and_then(|v| v["pid"].as_u64())
+        .and_then(|p| u32::try_from(p).ok());
+    let start = v.as_ref().and_then(|v| v["start"].as_u64());
+    match (pid, start) {
+        (Some(pid), Some(start)) => Read::Present(ProcessStamp { pid, start }),
+        _ => Read::Unreadable(ReadError::new(
+            path.display().to_string(),
+            "it is not a pid and a start time",
+        )),
+    }
+}
+
 impl Engine {
     /// §11.1: the auto-switch engine for `provider`. It tries the provider's engine lock,
     /// `locks/autoswitch-<provider>.lock`, once and never waits: `Ok(None)` while another
@@ -191,11 +246,7 @@ impl Engine {
             None
         } else {
             self.refuse_inside_run_shell()?;
-            let path = self
-                .env
-                .data_dir()
-                .join("locks")
-                .join(format!("autoswitch-{provider}.lock"));
+            let path = engine_lock_path(&self.env, provider);
             let Some(lock) = FlockGuard::try_lock(&path)? else {
                 return Ok(None);
             };

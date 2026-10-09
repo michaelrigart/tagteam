@@ -8,12 +8,14 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::sync::Mutex;
 
+use serde_json::json;
+
 use common::{API_KEY, Fx, LSTART, capture_logs, credential, due, journal, token_requests};
 use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::refresh::{GateOutcome, OwnedBy};
-use tagteam_engine::session::SessionState;
+use tagteam_engine::session::{DamagedKind, SessionState};
 use tagteam_engine::switch::SwitchReason;
 use tagteam_provider::FlockGuard;
 use tagteam_provider::liveness::{FakeProcess, parse_lstart};
@@ -70,7 +72,10 @@ fn a_held_reservation_owns_the_account_and_a_released_one_does_not() {
     assert_eq!(
         s,
         SessionState::Owned {
-            profile: dir.clone()
+            profile: dir.clone(),
+            session: true,
+            daemon: false,
+            damaged: vec![],
         }
     );
     assert!(s.owned());
@@ -93,7 +98,12 @@ fn a_live_record_of_any_kind_owns_the_account() {
         fx.live_record(&dir, 4242, kind);
         assert_eq!(
             state(&fx, &a),
-            SessionState::Owned { profile: dir },
+            SessionState::Owned {
+                profile: dir,
+                session: kind == "interactive",
+                daemon: kind != "interactive",
+                damaged: vec![],
+            },
             "{kind}"
         );
     }
@@ -139,7 +149,327 @@ fn a_dead_or_recycled_record_does_not_own_the_account() {
             ..FakeProcess::default()
         },
     );
-    assert_eq!(state(&fx, &a), SessionState::Owned { profile: dir });
+    assert_eq!(
+        state(&fx, &a),
+        SessionState::Owned {
+            profile: dir,
+            session: true,
+            daemon: false,
+            damaged: vec![],
+        }
+    );
+}
+
+// §12.6, Appendix A.7: a Claude Code background daemon's supervisor writes no session record in
+// 2.1.292; its `daemon.lock` (`pid`, `origin`, `procStart`) is what makes the profile owned.
+
+/// `daemon.lock` in `profile`, as CC 2.1.292 writes it for the supervisor `pid`.
+fn plant_daemon_lock(profile: &Path, pid: u32) {
+    fs::write(
+        profile.join("daemon.lock"),
+        json!({"pid": pid, "origin": "transient", "procStart": LSTART}).to_string(),
+    )
+    .unwrap();
+}
+
+/// The fixture's probe says `pid` runs, started at `LSTART`.
+fn run_process(fx: &Fx, pid: u32) {
+    fx.process.set(
+        pid,
+        FakeProcess {
+            exists: Some(true),
+            start_time_s: parse_lstart(LSTART),
+            ..FakeProcess::default()
+        },
+    );
+}
+
+#[test]
+fn a_live_supervisor_in_daemon_lock_owns_the_account_and_a_dead_one_does_not() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let dir = fx.make_profile(&a);
+    plant_daemon_lock(&dir, 4343);
+    assert_eq!(
+        state(&fx, &a),
+        SessionState::Quiescent {
+            profile: dir.clone()
+        },
+        "the supervisor's pid is not running"
+    );
+    run_process(&fx, 4343);
+    let s = state(&fx, &a);
+    assert_eq!(
+        s,
+        SessionState::Owned {
+            profile: dir.clone(),
+            session: false,
+            daemon: true,
+            damaged: vec![],
+        }
+    );
+    assert!(s.owned());
+    assert_eq!(s.daemon_profile(), Some(dir.as_path()));
+    fs::remove_file(dir.join("daemon.lock")).unwrap();
+    assert_eq!(state(&fx, &a), SessionState::Quiescent { profile: dir });
+}
+
+#[test]
+fn a_recycled_supervisor_pid_does_not_own_the_account() {
+    // Judged as a record is: the pid runs again, started at another time, and is not claude.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let dir = fx.make_profile(&a);
+    plant_daemon_lock(&dir, 4343);
+    fx.process.set(
+        4343,
+        FakeProcess {
+            exists: Some(true),
+            start_time_s: parse_lstart(LSTART).map(|s| s + 3_600),
+            mentions_launch: Some(false),
+            ..FakeProcess::default()
+        },
+    );
+    assert_eq!(state(&fx, &a), SessionState::Quiescent { profile: dir });
+}
+
+#[test]
+fn a_daemon_lock_that_cannot_be_read_counts_as_owned() {
+    for bytes in [&b"{\"pid\":"[..], b"[1]", b"{\"origin\":\"transient\"}"] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let dir = fx.make_profile(&a);
+        fs::write(dir.join("daemon.lock"), bytes).unwrap();
+        let s = state(&fx, &a);
+        let SessionState::Unreadable { profile, damaged } = &s else {
+            panic!("{s:?}")
+        };
+        assert_eq!(profile, &dir);
+        assert_eq!(damaged.len(), 1, "{damaged:?}");
+        assert_eq!(damaged[0].kind, DamagedKind::SupervisorLock);
+        assert_eq!(damaged[0].file, dir.join("daemon.lock"));
+        assert!(s.owned());
+    }
+}
+
+#[test]
+fn a_live_supervisor_makes_remove_and_switch_refuse_naming_the_daemon() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    plant_daemon_lock(&dir, 4343);
+    run_process(&fx, 4343);
+    let err = fx.engine.remove(&a).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    let message = err.to_string();
+    assert!(
+        message.contains("background daemon")
+            && message.contains("claude daemon stop --any")
+            && message.contains(&format!("set to '{}'", dir.display()))
+            && message.contains(&format!("delete '{}'", dir.join("daemon.lock").display()))
+            && !message.contains("exit that session"),
+        "{message}"
+    );
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
+    let err = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    assert!(
+        err.to_string().contains("claude daemon stop --any"),
+        "{err}"
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(token_requests(&fx), 0);
+    // Once it stops, the account can go.
+    fs::remove_file(dir.join("daemon.lock")).unwrap();
+    fx.engine.remove(&a).unwrap();
+}
+
+#[test]
+fn a_live_session_does_not_hide_a_live_supervisor() {
+    // Every owner is judged: a live ordinary record, or a held reservation, beside a live
+    // `daemon.lock` leaves both in the state, and the refusal names each.
+    for with_record in [true, false] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        fx.add("b@x.co", "rt-b");
+        let dir = fx.make_profile(&a);
+        let _held = (!with_record).then(|| fx.hold_reservation(&dir));
+        if with_record {
+            fx.live_record(&dir, 4242, "interactive");
+        }
+        plant_daemon_lock(&dir, 4343);
+        run_process(&fx, 4343);
+        assert_eq!(
+            state(&fx, &a),
+            SessionState::Owned {
+                profile: dir.clone(),
+                session: true,
+                daemon: true,
+                damaged: vec![],
+            },
+            "record: {with_record}"
+        );
+        for err in [
+            fx.engine.remove(&a).unwrap_err(),
+            fx.switch_to(&a, false).unwrap_err(),
+        ] {
+            assert_eq!(err.kind(), "session-owned", "{err}");
+            let message = err.to_string();
+            assert!(
+                message.contains("`tagteam run` session")
+                    && message.contains("background daemon")
+                    && message.contains("exit that session")
+                    && message.contains("claude daemon stop --any")
+                    && message.contains(&format!("set to '{}'", dir.display())),
+                "{message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nothing_hides_another_owner_or_another_unreadable_input() {
+    // One aggregate (R-live-owner-diagnosis): an unreadable records directory does not skip
+    // the supervisor, and a live session does not drop an unreadable `daemon.lock`; every text
+    // names each owner and each file.
+    // (a) the records directory cannot be listed, a supervisor is live.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let records = fx.cc.session_records_dir(&dir);
+    fs::create_dir_all(&records).unwrap();
+    plant_daemon_lock(&dir, 4343);
+    run_process(&fx, 4343);
+    fs::set_permissions(&records, fs::Permissions::from_mode(0o000)).unwrap();
+    let s = state(&fx, &a);
+    let errs = [
+        fx.engine.remove(&a).unwrap_err().to_string(),
+        fx.switch_to(&a, false).unwrap_err().to_string(),
+    ];
+    fs::set_permissions(&records, fs::Permissions::from_mode(0o700)).unwrap();
+    let SessionState::Owned {
+        daemon,
+        session,
+        damaged,
+        ..
+    } = &s
+    else {
+        panic!("{s:?}")
+    };
+    assert!(*daemon && !*session, "{s:?}");
+    assert_eq!(damaged.len(), 1, "{damaged:?}");
+    assert_eq!(damaged[0].kind, DamagedKind::RecordsDir);
+    for message in errs {
+        assert!(
+            message.contains("background daemon")
+                && message.contains(&format!("'{}' cannot be read", records.display()))
+                && message.contains("make it readable again"),
+            "{message}"
+        );
+    }
+
+    // (b) a live session, and a `daemon.lock` that cannot be read.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    fx.live_record(&dir, 4242, "interactive");
+    let lock = dir.join("daemon.lock");
+    fs::write(&lock, b"{").unwrap();
+    let s = state(&fx, &a);
+    assert!(
+        matches!(&s, SessionState::Owned { session: true, daemon: false, damaged, .. }
+            if damaged.len() == 1 && damaged[0].kind == DamagedKind::SupervisorLock),
+        "{s:?}"
+    );
+    for message in [
+        fx.engine.remove(&a).unwrap_err().to_string(),
+        fx.switch_to(&a, false).unwrap_err().to_string(),
+    ] {
+        assert!(
+            message.contains("`tagteam run` session")
+                && message.contains("exit that session")
+                && message.contains(&format!("'{}' cannot be read", lock.display()))
+                && message.contains("if nothing runs as Claude Code for that profile"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_daemon_lock_is_named_in_the_refusals_with_its_repair() {
+    // A malformed `daemon.lock` blocks (it may be a daemon), and the refusal says which file
+    // and what to do, on every path that refuses: remove, a direct switch, and the switch's
+    // late recheck.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let lock = dir.join("daemon.lock");
+    fs::write(&lock, b"{\"pid\":").unwrap();
+    let named = format!("'{}'", lock.display());
+    for err in [
+        fx.engine.remove(&a).unwrap_err(),
+        fx.switch_to(&a, false).unwrap_err(),
+    ] {
+        assert_eq!(err.kind(), "session-owned", "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains(&named)
+                && message.contains("cannot be read")
+                && message
+                    .contains("if nothing runs as Claude Code for that profile, delete the lock")
+                && !message.contains("exit that session"),
+            "{message}"
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_daemon_lock_that_appears_before_the_gate_is_named_in_the_switch_refusal() {
+    let fx = Fx::new();
+    let a = due(&fx);
+    fx.script_refresh(Some("rt-a2"));
+    let dir = fx.make_profile(&a);
+    let key = a.as_str().to_owned();
+    let lock = dir.join("daemon.lock");
+    let planted = Mutex::new(false);
+    let engine = fx.engine_with_vault_probe({
+        let lock = lock.clone();
+        move |read: &str| {
+            let mut planted = planted.lock().unwrap();
+            if read == key && !*planted {
+                *planted = true;
+                fs::write(&lock, b"[").unwrap();
+            }
+        }
+    });
+    let err = engine.switch(fx.switch_request(&a, false)).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("'{}'", lock.display()))
+            && message.contains("delete the lock")
+            && !message.contains("exit that session"),
+        "{message}"
+    );
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[test]
+fn a_bg_record_names_the_daemon_in_the_refusal_too() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    fx.live_record(&dir, 4242, "daemon-worker");
+    let err = fx.engine.remove(&a).unwrap_err();
+    assert!(
+        err.to_string().contains("claude daemon stop --any"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -151,11 +481,13 @@ fn an_unreadable_record_counts_as_owned() {
     fx.dead_record(&dir, 4242);
     fx.plant_record(&dir, "torn", b"{\"pid\":");
     let s = state(&fx, &a);
-    let SessionState::Unreadable { profile, detail } = &s else {
+    let SessionState::Unreadable { profile, damaged } = &s else {
         panic!("{s:?}")
     };
     assert_eq!(profile, &dir);
-    assert!(detail.contains("torn.json"), "{detail}");
+    assert_eq!(damaged.len(), 1, "{damaged:?}");
+    assert_eq!(damaged[0].kind, DamagedKind::Record);
+    assert!(damaged[0].file.ends_with("torn.json"), "{damaged:?}");
     assert!(s.owned());
 }
 
@@ -624,8 +956,8 @@ fn remove_never_trusts_a_marker_that_names_another_account() {
 
 #[test]
 fn remove_of_a_dangling_profile_link_skips_the_item_and_removes_the_link() {
-    // The profile path resolves to nothing and has no marker, so there is no spelling to name
-    // an item from. Once the vault is gone, a stray path must not leave `remove` unable to
+    // The profile path is a link (to nothing): no item is named through a link (§10.5 step 6).
+    // Once the vault is gone, a stray path must not leave `remove` unable to
     // finish: the link goes as a link, the row goes, and no Keychain item is touched.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
@@ -674,7 +1006,7 @@ fn remove_of_a_dangling_profile_link_skips_the_item_and_removes_the_link() {
     );
     assert!(
         logs.iter()
-            .any(|l| l.contains("WARN") && l.contains("older spelling")),
+            .any(|l| l.contains("WARN") && l.contains("is a link, not a directory")),
         "{logs:?}"
     );
 }
@@ -837,6 +1169,34 @@ fn a_session_that_starts_before_the_gate_refuses_a_direct_switch_and_sends_nothi
         0,
         "the gate left the session's token alone"
     );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+}
+
+#[test]
+fn a_supervisor_that_starts_before_the_gate_refuses_a_direct_switch_naming_the_daemon() {
+    // The gate answers "a session"; the refusal reads the state again to name the daemon.
+    let fx = Fx::new();
+    let a = due(&fx);
+    fx.script_refresh(Some("rt-a2"));
+    let dir = fx.make_profile(&a);
+    run_process(&fx, 4343);
+    let key = a.as_str().to_owned();
+    let lock = dir.join("daemon.lock");
+    let planted = Mutex::new(false);
+    let engine = fx.engine_with_vault_probe(move |read: &str| {
+        let mut planted = planted.lock().unwrap();
+        if read == key && !*planted {
+            *planted = true;
+            plant_daemon_lock(lock.parent().unwrap(), 4343);
+        }
+    });
+    let err = engine.switch(fx.switch_request(&a, false)).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    assert!(
+        err.to_string().contains("claude daemon stop --any"),
+        "{err}"
+    );
+    assert_eq!(token_requests(&fx), 0);
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
 }
 

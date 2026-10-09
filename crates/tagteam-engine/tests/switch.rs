@@ -2,6 +2,8 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -877,6 +879,195 @@ fn cc_holding_its_refresh_lock_blocks_the_switch_and_changes_nothing() {
     );
 }
 
+#[test]
+fn a_switch_reports_whether_it_replaced_a_live_managed_key() {
+    // Appendix A.7: CC keeps the managed key for its process's life, so the output must say
+    // to restart it even when no stored account held the key.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live: b
+    assert!(!switch(&fx, to(&a), false).unwrap().managed_key_replaced);
+
+    fx.put_managed_key(STRAY_API_KEY.as_bytes());
+    let out = switch(&fx, to(&b), false).unwrap();
+
+    assert!(out.managed_key_replaced);
+    assert_eq!(fx.managed_key(), None);
+}
+
+/// Whether CC's credential locks and the mutation lock can all be taken now: nothing holds them.
+fn credential_locks_and_guard_free(fx: &Fx) -> bool {
+    let free = fs::create_dir(fx.paths().refresh_lock).is_ok();
+    if free {
+        fs::remove_dir(fx.paths().refresh_lock).unwrap();
+    }
+    free && !fx.paths().legacy_lock().exists() && mutation_lock_free(&fx.env)
+}
+
+#[test]
+fn a_switch_waits_out_cc_s_config_lock_before_taking_any_lock() {
+    // §9.1: a config lock CC left behind is waited out holding neither the mutation lock nor
+    // CC's credential locks, which CC's own refresh waits on.
+    let fx = Fx::with_lock_budgets(Duration::from_millis(300), Duration::from_secs(5));
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live: b
+    fs::create_dir(fx.paths().config_lock).unwrap(); // left behind, fresh
+
+    let out = std::thread::scope(|s| {
+        let switching = s.spawn(|| switch(&fx, to(&a), false));
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!switching.is_finished(), "the switch did not wait");
+            assert!(
+                credential_locks_and_guard_free(&fx),
+                "the pre-wait holds a lock"
+            );
+        }
+        fs::remove_dir(fx.paths().config_lock).unwrap();
+        switching.join().unwrap()
+    })
+    .unwrap();
+
+    assert_eq!(out.to.unwrap().id, a);
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+}
+
+#[test]
+fn a_config_lock_that_outlasts_the_pre_wait_refuses_with_a_lock_timeout_and_changes_nothing() {
+    let fx = Fx::with_lock_budgets(Duration::from_millis(300), Duration::from_millis(600));
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fs::create_dir(fx.paths().config_lock).unwrap();
+    let config = fs::read(fx.paths().global_config).unwrap();
+
+    let start = Instant::now();
+    let err = switch(&fx, to(&a), false).unwrap_err();
+
+    assert!(
+        start.elapsed() >= Duration::from_millis(600),
+        "refused after {:?}, before the pre-wait's budget",
+        start.elapsed()
+    );
+    assert_eq!(err.kind(), "lock-timeout");
+    assert!(
+        err.to_string().contains("frees itself within about 11 s"),
+        "{err}"
+    );
+    assert_eq!(fs::read(fx.paths().global_config).unwrap(), config);
+    assert_eq!(
+        fx.engine.store().unwrap().active(&fx.provider()).unwrap(),
+        Some(b)
+    );
+    assert!(credential_locks_and_guard_free(&fx));
+    assert!(fx.paths().config_lock.is_dir(), "CC's lock is left alone");
+}
+
+/// Plants a hook that has CC's start-up overwrite `oauthAccount` with `email`'s at each of the
+/// first `times` reads of §9.1's re-verification, and counts the reads.
+#[cfg(feature = "test-hooks")]
+fn overwrite_identity_at_reverify(fx: &Fx, email: &'static str, times: usize) -> Arc<AtomicUsize> {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let seen = reads.clone();
+    let config = fx.paths().global_config;
+    fx.engine.on_point(
+        "identity-reverify",
+        Box::new(move || {
+            if seen.fetch_add(1, Ordering::SeqCst) < times {
+                common::splice_oauth_account(&config, &Fx::oauth_account(email));
+            }
+        }),
+    );
+    reads
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn an_untouched_identity_is_read_once_after_the_commit_and_nothing_more_is_done() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let reads = overwrite_identity_at_reverify(&fx, "x@x.co", 0);
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn an_identity_overwritten_after_the_commit_is_spliced_again_without_a_warning() {
+    // §9.1 (amended): CC's start-up wrote the global config without its lock.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let reads = overwrite_identity_at_reverify(&fx, "b@x.co", 1);
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "read, spliced, read again");
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert!(out.switched);
+    assert!(
+        !fx.paths().config_lock.exists(),
+        "the splice's lock is released"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn an_identity_overwritten_again_warns_and_names_switching_again() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    overwrite_identity_at_reverify(&fx, "b@x.co", 2);
+
+    let (out, logs) = capture_logs(|| switch(&fx, to(&a), false).unwrap());
+
+    assert!(out.switched, "the switch committed");
+    assert_eq!(
+        out.warnings,
+        [
+            "a starting Claude Code may have overwritten the account's identity in its config; run `tagteam switch` again to restore it"
+        ]
+    );
+    assert_eq!(
+        fx.engine.store().unwrap().active(&fx.provider()).unwrap(),
+        Some(a)
+    );
+    let warned: Vec<_> = logs
+        .iter()
+        .filter(|l| l.contains("may have overwritten the switched account's identity"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{logs:?}");
+    assert!(
+        logs.iter().all(|l| !l.contains("@x.co")),
+        "no email in the log: {logs:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn an_identity_that_cannot_be_spliced_again_warns_too() {
+    // The splice itself fails: the config is torn when it is tried.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let config = fx.paths().global_config;
+    fx.engine.on_point(
+        "identity-reverify",
+        Box::new(move || fs::write(&config, b"{ not json").unwrap()),
+    );
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert!(out.switched);
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(out.warnings[0].contains("tagteam switch"));
+}
+
 /// When `id`'s next poll is planned, in seconds from now.
 fn planned_in(fx: &Fx, id: &AccountId) -> i64 {
     fx.usage_state(id).unwrap().next_poll_at.unwrap() - fx.engine.now_ms() / 1000
@@ -1108,9 +1299,9 @@ fn a_re_plan_that_cannot_be_stored_never_fails_the_switch() {
         .unwrap()
         .execute_batch(
             "CREATE TRIGGER no_insert BEFORE INSERT ON usage_state \
-               BEGIN SELECT RAISE(ABORT, 'usage_state is read-only'); END;
+               BEGIN SELECT RAISE(ABORT, 'usage_state is read-only for bob@example.com'); END;
              CREATE TRIGGER no_update BEFORE UPDATE ON usage_state \
-               BEGIN SELECT RAISE(ABORT, 'usage_state is read-only'); END;",
+               BEGIN SELECT RAISE(ABORT, 'usage_state is read-only for bob@example.com'); END;",
         )
         .unwrap();
 
@@ -1124,7 +1315,8 @@ fn a_re_plan_that_cannot_be_stored_never_fails_the_switch() {
         "the plan is as it was"
     );
     // The failed re-plan is logged at ERROR (§14, K3), naming the account by position and id,
-    // with the store's error as a field and never the email.
+    // with SQLite's result code as the cause (§14.2): the message is the database's own text,
+    // here a trigger's, and never logged.
     let errors: Vec<&String> = logs.iter().filter(|l| l.starts_with("ERROR")).collect();
     assert_eq!(errors.len(), 1, "{logs:?}");
     let line = errors[0];
@@ -1132,8 +1324,9 @@ fn a_re_plan_that_cannot_be_stored_never_fails_the_switch() {
         line.contains("could not re-plan usage polls after the switch")
             && line.contains("position=1")
             && line.contains(&format!("account={a}"))
-            && line.contains("error=")
-            && line.contains("usage_state is read-only"),
+            && line.contains("code=ConstraintViolation")
+            && !line.contains("read-only")
+            && !line.contains("bob@example.com"),
         "{line}"
     );
     assert!(!line.contains("@x.co"), "{line}");
@@ -1411,6 +1604,57 @@ fn a_target_that_is_no_longer_a_candidate_writes_nothing() {
         assert!(switch_events(&fx).is_empty(), "{case}");
         assert_eq!(token_requests(&fx), 0, "{case}");
     }
+}
+
+#[test]
+fn an_automatic_switch_to_a_target_a_daemon_or_an_unreadable_lock_holds_says_so() {
+    // §11.2 step 11: the reason is the shared ownership text, naming each owner and each file,
+    // not "a `tagteam run` session".
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    let dir = fx.make_profile(&a);
+    let lock = dir.join("daemon.lock");
+    fs::write(&lock, b"{").unwrap();
+    let out = fx
+        .engine
+        .switch(auto_switch(&fx, &b, &a, Trigger::AtLimit))
+        .unwrap();
+    assert_eq!(out.reason, SwitchReason::NotCandidate);
+    assert!(
+        out.message
+            .contains(&format!("'{}' cannot be read", lock.display()))
+            && out.message.contains("delete the lock")
+            && !out.message.contains("`tagteam run` session"),
+        "{}",
+        out.message
+    );
+    fs::write(
+        &lock,
+        serde_json::json!({"pid": 4343, "origin": "transient", "procStart": common::LSTART})
+            .to_string(),
+    )
+    .unwrap();
+    fx.process.set(
+        4343,
+        tagteam_provider::liveness::FakeProcess {
+            exists: Some(true),
+            start_time_s: tagteam_provider::parse_lstart(common::LSTART),
+            ..Default::default()
+        },
+    );
+    let out = fx
+        .engine
+        .switch(auto_switch(&fx, &b, &a, Trigger::AtLimit))
+        .unwrap();
+    assert_eq!(out.reason, SwitchReason::NotCandidate);
+    assert!(
+        out.message.contains("background daemon")
+            && out.message.contains("claude daemon stop --any"),
+        "{}",
+        out.message
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
 }
 
 #[test]

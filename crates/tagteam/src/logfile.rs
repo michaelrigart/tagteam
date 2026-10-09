@@ -11,11 +11,9 @@ use std::sync::{Mutex, PoisonError};
 
 use tagteam_provider::FlockGuard;
 use tagteam_provider::atomic::ensure_private_dir;
+use tagteam_provider::env::LOG_ROTATIONS;
 use tracing_subscriber::fmt::MakeWriter;
 
-/// §5, §14.2.
-pub(crate) const FILE_NAME: &str = "tagteam.log";
-const LOCK_NAME: &str = "tagteam.log.lock";
 /// §14.2: a file over 1 MiB is rotated.
 const LIMIT: u64 = 1024 * 1024;
 
@@ -40,23 +38,23 @@ pub(crate) struct LogFile {
 }
 
 impl LogFile {
-    /// `tagteam.log` in `state_dir`, rotated past 1 MiB. Nothing is touched before a line
-    /// arrives.
-    pub(crate) fn new(state_dir: PathBuf) -> Self {
-        Self::at(state_dir, LIMIT)
+    /// The log at `path` (`Env::log_file`, §5), rotated past 1 MiB. Nothing is touched before
+    /// a line arrives.
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self::at(path, LIMIT)
     }
 
     /// `new` with a rotation limit small enough for a test to cross.
     #[cfg(test)]
-    pub(crate) fn with_limit(state_dir: PathBuf, limit: u64) -> Self {
-        Self::at(state_dir, limit)
+    pub(crate) fn with_limit(path: PathBuf, limit: u64) -> Self {
+        Self::at(path, limit)
     }
 
-    fn at(dir: PathBuf, limit: u64) -> Self {
+    fn at(path: PathBuf, limit: u64) -> Self {
         Self {
-            path: dir.join(FILE_NAME),
-            lock: dir.join(LOCK_NAME),
-            dir,
+            dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            lock: suffixed(&path, ".lock"),
+            path,
             limit,
             file: Mutex::new(None),
             disabled: AtomicBool::new(false),
@@ -72,9 +70,9 @@ impl LogFile {
         self
     }
 
-    /// `tagteam.log.<n>`.
+    /// The `n`th rotation: the path with `LOG_ROTATIONS[n - 1]` appended (§14.2).
     fn rotated(&self, n: u8) -> PathBuf {
-        self.dir.join(format!("{FILE_NAME}.{n}"))
+        suffixed(&self.path, LOG_ROTATIONS[usize::from(n) - 1])
     }
 
     /// Hands one finished line to the file. It never waits on another process and never
@@ -186,6 +184,13 @@ fn rename_present(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// `path` with `suffix` appended to its last component.
+fn suffixed(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 /// One event's line, gathered as the formatter writes it and handed to the file whole when it
 /// is dropped (Decision 7).
 pub(crate) struct EventWriter<'a> {
@@ -228,6 +233,10 @@ mod tests {
 
     use super::*;
 
+    /// The log's name, and its rotation lock's, in the directories the tests make.
+    const FILE_NAME: &str = "tagteam.log";
+    const LOCK_NAME: &str = "tagteam.log.lock";
+
     fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
@@ -269,7 +278,7 @@ mod tests {
         // creates nothing (§5).
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("state/tagteam");
-        let file = LogFile::new(dir.clone());
+        let file = LogFile::new(dir.join(FILE_NAME));
         drop(file.make_writer());
         assert!(!d.path().join("state").exists());
         log(&file, "one\n");
@@ -280,7 +289,7 @@ mod tests {
     fn the_file_is_0600_in_a_0700_directory() {
         let d = tempfile::tempdir().unwrap();
         let dir = d.path().join("state/tagteam");
-        let file = LogFile::with_limit(dir.clone(), 8);
+        let file = LogFile::with_limit(dir.join(FILE_NAME), 8);
         log(&file, "first line\n");
         log(&file, "second line\n"); // the first is over the limit: it rotates to `.1`
         assert_eq!(mode(&d.path().join("state")), 0o700);
@@ -295,7 +304,7 @@ mod tests {
         // Decision 7: the pieces a formatter writes are gathered, and the line reaches the
         // file as one write(2), which O_APPEND keeps whole among other processes' lines.
         let d = tempfile::tempdir().unwrap();
-        let file = LogFile::new(d.path().to_path_buf());
+        let file = LogFile::new(d.path().join(FILE_NAME));
         for n in 0..5 {
             log(&file, &format!("line {n}\n"));
         }
@@ -310,7 +319,7 @@ mod tests {
     fn rotation_keeps_the_file_and_two_older_ones() {
         // §14.2: `.1` becomes `.2`, the file becomes `.1`, and the oldest is dropped.
         let d = tempfile::tempdir().unwrap();
-        let file = LogFile::with_limit(d.path().to_path_buf(), 100);
+        let file = LogFile::with_limit(d.path().join(FILE_NAME), 100);
         // 30 bytes each: four fill a file past 100, and the fifth rotates it.
         let lines: Vec<String> = (0..40)
             .map(|n| format!("line {n:02} {}\n", "x".repeat(21)))
@@ -336,7 +345,7 @@ mod tests {
     fn a_process_that_cannot_take_the_rotation_lock_does_not_rotate() {
         // §14.2: rotation is only tried. Whoever holds the lock is rotating, and nothing waits.
         let d = tempfile::tempdir().unwrap();
-        let file = LogFile::with_limit(d.path().to_path_buf(), 10);
+        let file = LogFile::with_limit(d.path().join(FILE_NAME), 10);
         log(&file, "over the limit already\n");
         // Its own open file description: to `flock`, another process.
         let held = FlockGuard::try_lock(&d.path().join(LOCK_NAME))
@@ -362,7 +371,7 @@ mod tests {
         // §14.2: another process rotated it, or a person moved or deleted it. The inode check
         // reopens the path, so the next line starts a new file.
         let d = tempfile::tempdir().unwrap();
-        let file = LogFile::new(d.path().to_path_buf());
+        let file = LogFile::new(d.path().join(FILE_NAME));
         log(&file, "before\n");
         fs::rename(d.path().join(FILE_NAME), d.path().join("tagteam.log.1")).unwrap();
         log(&file, "after\n");
@@ -382,10 +391,9 @@ mod tests {
         fs::write(d.path().join("blocker"), "").unwrap();
         let reports = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&reports);
-        let file =
-            LogFile::new(d.path().join("blocker/tagteam")).on_disable(Box::new(move |path, _| {
-                seen.lock().unwrap().push(path.to_path_buf())
-            }));
+        let file = LogFile::new(d.path().join("blocker/tagteam").join(FILE_NAME)).on_disable(
+            Box::new(move |path, _| seen.lock().unwrap().push(path.to_path_buf())),
+        );
         log(&file, "one\n");
         log(&file, "two\n");
         assert_eq!(
@@ -426,7 +434,7 @@ mod tests {
             .map(|w| {
                 let (dir, start) = (d.path().to_path_buf(), Arc::clone(&start));
                 std::thread::spawn(move || {
-                    let file = LogFile::with_limit(dir, 64 * 1024);
+                    let file = LogFile::with_limit(dir.join(FILE_NAME), 64 * 1024);
                     start.wait();
                     for n in 0..LINES {
                         log(&file, &numbered(w, n));
@@ -469,7 +477,7 @@ mod tests {
         let reports = Arc::new(Mutex::new(0));
         let seen = Arc::clone(&reports);
         let file =
-            LogFile::with_limit(d.path().to_path_buf(), 8).on_disable(Box::new(move |_, _| {
+            LogFile::with_limit(d.path().join(FILE_NAME), 8).on_disable(Box::new(move |_, _| {
                 *seen.lock().unwrap() += 1;
             }));
         log(&file, "first line\n"); // over the limit, but nothing has rotated it yet
@@ -496,12 +504,14 @@ mod tests {
         let calls = Arc::new(Mutex::new(0));
         let (cb_slot, cb_calls) = (Arc::clone(&slot), Arc::clone(&calls));
         let file = Arc::new(
-            LogFile::new(d.path().join("blocker/tagteam")).on_disable(Box::new(move |_, _| {
-                *cb_calls.lock().unwrap() += 1;
-                if let Some(file) = cb_slot.get() {
-                    log(file, "from the callback\n");
-                }
-            })),
+            LogFile::new(d.path().join("blocker/tagteam").join(FILE_NAME)).on_disable(Box::new(
+                move |_, _| {
+                    *cb_calls.lock().unwrap() += 1;
+                    if let Some(file) = cb_slot.get() {
+                        log(file, "from the callback\n");
+                    }
+                },
+            )),
         );
         slot.set(Arc::clone(&file)).ok().unwrap();
         let (done, finished) = std::sync::mpsc::channel();

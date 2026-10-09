@@ -121,7 +121,7 @@ fn replacement_markers_move_the_epoch() {
         (1, Some("sha256:x"), "oauth")
     );
     // Finishing installs the recorded metadata, kind included.
-    s.finish_replacement(&a).unwrap();
+    s.finish_replacement(&a, 0).unwrap();
     let r = s.account(&a).unwrap().unwrap();
     assert_eq!(
         (r.login_epoch, r.replacing_fp, r.kind.as_str()),
@@ -345,8 +345,8 @@ fn finish_replacement_refuses_metadata_missing_required_fields() {
     }
     let s = Store::open(&path).unwrap();
     assert!(matches!(
-        s.finish_replacement(&a),
-        Err(StoreError::Corrupt(_))
+        s.finish_replacement(&a, 0),
+        Err(StoreError::ReplacementUnreadable(_))
     ));
     // Untouched: the original login and the pending marker are both still there.
     let r = s.account(&a).unwrap().unwrap();
@@ -413,7 +413,7 @@ fn a_missing_account_is_reported_by_both_replacement_entry_points() {
         Err(StoreError::NoSuchAccount)
     ));
     assert!(matches!(
-        s.finish_replacement(&missing),
+        s.finish_replacement(&missing, 0),
         Err(StoreError::NoSuchAccount)
     ));
 }
@@ -498,13 +498,45 @@ fn quarantines_are_set_bound_to_a_fingerprint_and_cleared() {
         ),
         (Some("invalid_grant"), Some("sha256:sent"), Some(42))
     );
-    assert!(s.clear_quarantine(&a).unwrap(), "one was set");
-    assert!(!s.clear_quarantine(&a).unwrap(), "nothing left to clear");
+    assert!(
+        s.clear_quarantine(&a, "credentials-replaced", "auto", 77)
+            .unwrap(),
+        "one was set"
+    );
+    assert!(
+        !s.clear_quarantine(&a, "credentials-replaced", "auto", 78)
+            .unwrap(),
+        "nothing left to clear"
+    );
     let row = s.account(&a).unwrap().unwrap();
     assert_eq!(
         (row.quarantine_reason, row.quarantine_fp, row.quarantine_at),
         (None, None, None)
     );
+    // §7.4: the clear, and only the clear, recorded one event.
+    assert_eq!(
+        s.events().unwrap(),
+        vec![EventRow {
+            at: 77,
+            provider: cc(),
+            kind: "unquarantine".into(),
+            from_id: None,
+            to_id: Some(a.clone()),
+            trigger: None,
+            source: "auto".into(),
+            detail: Some(json!({"reason": "credentials-replaced"})),
+        }]
+    );
+    assert!(
+        !s.clear_quarantine(
+            &AccountId::from_string("nobody"),
+            "credentials-replaced",
+            "cli",
+            79
+        )
+        .unwrap()
+    );
+    assert_eq!(s.events().unwrap().len(), 1, "no account, no event");
     assert!(matches!(
         s.set_quarantine(
             &AccountId::from_string("nobody"),
@@ -957,7 +989,7 @@ fn a_row_that_already_names_the_account_with_an_epoch_is_kept() {
     let incoming = identity("a@x.co");
     s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, false), false)
         .unwrap();
-    s.finish_replacement(&a).unwrap();
+    s.finish_replacement(&a, 0).unwrap();
 
     s.begin_replacement(&a, "sha256:y", &login_meta(&incoming, false), true)
         .unwrap();
@@ -1009,7 +1041,7 @@ fn finishing_a_replacement_taken_from_the_live_login_records_its_epoch() {
         s.begin_replacement(&a, "sha256:x", &login_meta(&incoming, from_live), true)
             .unwrap();
 
-        s.finish_replacement(&a).unwrap();
+        s.finish_replacement(&a, 0).unwrap();
 
         let want = if from_live { 1 } else { 0 };
         assert_eq!(
@@ -1042,7 +1074,7 @@ fn a_finish_never_overwrites_a_switch_committed_since_the_replacer_died() {
     s.commit_switch(&cc(), &b, 0, &switch_event_to(&b), None)
         .unwrap();
 
-    s.finish_replacement(&a).unwrap();
+    s.finish_replacement(&a, 0).unwrap();
 
     assert_eq!(
         s.activation(&cc()).unwrap(),
@@ -1072,7 +1104,7 @@ fn replacement_metadata_without_from_live_is_not_from_the_live_login() {
         )
         .unwrap();
 
-    s.finish_replacement(&a).unwrap();
+    s.finish_replacement(&a, 0).unwrap();
 
     assert_eq!(
         s.activation(&cc()).unwrap(),
@@ -1114,4 +1146,348 @@ fn displaced_rows_are_newest_first_and_a_delete_says_whether_a_row_went() {
     assert!(s.delete_displaced("2-000000000000-bbbbbb").unwrap());
     assert!(!s.delete_displaced("2-000000000000-bbbbbb").unwrap());
     assert_eq!(s.displaced_rows().unwrap().len(), 2);
+}
+
+#[test]
+fn finishing_a_replacement_records_the_quarantine_it_clears() {
+    // §7.4, §11.4: a landed replacement moved the epoch, so its clear is `account-replaced`, in
+    // the transaction that installs the login.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let replacement = identity("a@x.co");
+    let meta = LoginMeta {
+        identity_key: "a@x.co\n",
+        identity: &replacement,
+        kind: "oauth",
+        login_expires_at: None,
+        from_live: false,
+    };
+    s.set_quarantine(&a, "invalid_grant", "sha256:sent", 1)
+        .unwrap();
+    s.begin_replacement(&a, "sha256:new", &meta, false).unwrap();
+    s.finish_replacement(&a, 500).unwrap();
+    let row = s.account(&a).unwrap().unwrap();
+    assert_eq!((row.quarantine_reason, row.replacing_fp), (None, None));
+    let events = s.events().unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(
+        (
+            events[0].kind.as_str(),
+            events[0].to_id.as_ref(),
+            events[0].source.as_str(),
+            events[0].at,
+            events[0].detail.clone()
+        ),
+        (
+            "unquarantine",
+            Some(&a),
+            "cli",
+            500,
+            Some(json!({"reason": "account-replaced"}))
+        )
+    );
+    // An account that was not quarantined gets no event.
+    let meta = LoginMeta {
+        identity_key: "b@x.co\n",
+        identity: &identity("b@x.co"),
+        ..meta
+    };
+    s.begin_replacement(&b, "sha256:other", &meta, false)
+        .unwrap();
+    s.finish_replacement(&b, 600).unwrap();
+    assert_eq!(s.events().unwrap().len(), 1);
+}
+
+#[test]
+fn installing_a_login_never_clears_a_quarantine_behind_its_event() {
+    // §7.4: `update_login` writes identity fields only; its caller clears a quarantine through
+    // `clear_quarantine`, which records it.
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    s.set_quarantine(&a, "invalid_grant", "sha256:sent", 1)
+        .unwrap();
+    s.update_login(&a, "a@x.co\n", &identity("a@x.co"), "oauth", Some(9))
+        .unwrap();
+    let row = s.account(&a).unwrap().unwrap();
+    assert_eq!(
+        (row.quarantine_reason.as_deref(), row.login_expires_at),
+        (Some("invalid_grant"), Some(9))
+    );
+    assert!(s.events().unwrap().is_empty());
+}
+
+#[test]
+fn emptying_the_store_keeps_its_schema_and_leaves_no_row() {
+    // §10.5, Decision 8: the store file stays, valid and empty, for whoever opened it.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    s.set_active(&cc(), Some(&a), Some(0)).unwrap();
+    s.insert_journal(&JournalRow {
+        provider: cc(),
+        holder: ProcessStamp { pid: 1, start: 2 },
+        from_id: None,
+        to_id: a.clone(),
+        from_fp: None,
+        from_identity: None,
+        to_fp: "sha256:to".into(),
+        to_epoch: None,
+        started_at: 5,
+        prior: None,
+    })
+    .unwrap();
+    let other = Store::open(&path).unwrap(); // another process's connection, opened before
+    s.empty_all().unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(tables.len() >= 12, "{tables:?}");
+    for table in &tables {
+        let n: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0, "{table}");
+    }
+    assert_eq!(s.schema_version().unwrap(), 2);
+    assert!(other.all_accounts().unwrap().is_empty());
+    add(&other, &cc(), "b", "b@x.co", 1);
+    assert_eq!(
+        s.all_accounts().unwrap().len(),
+        1,
+        "a valid store, for both"
+    );
+}
+
+#[test]
+fn a_provider_s_rows_go_and_its_usage_budget_stays() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let other = ProviderId::new("fake-agent");
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let f = add(&s, &other, "f", "f@x.co", 1);
+    for (p, id) in [(cc(), &a), (other.clone(), &f)] {
+        s.set_active(&p, Some(id), Some(0)).unwrap();
+        s.set_unhealthy_ticks(&p, 2).unwrap();
+        s.insert_event(
+            &EventRow {
+                at: 1,
+                provider: p.clone(),
+                kind: "add".into(),
+                from_id: None,
+                to_id: Some(id.clone()),
+                trigger: None,
+                source: "cli".into(),
+                detail: None,
+            },
+            true,
+        )
+        .unwrap();
+    }
+    let db = rusqlite::Connection::open(&path).unwrap();
+    for p in ["claude-code", "fake-agent"] {
+        db.execute(
+            "INSERT INTO usage_requests (provider, identity_key, at) VALUES (?1, 'k', 1)",
+            [p],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO live_identity_cache (provider, identity_key) VALUES (?1, 'k')",
+            [p],
+        )
+        .unwrap();
+    }
+    s.delete_provider_rows(&cc()).unwrap();
+    let count = |table: &str, p: &str| -> i64 {
+        db.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE provider = ?1"),
+            [p],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    for table in [
+        "events",
+        "autoswitch_state",
+        "active_accounts",
+        "live_identity_cache",
+    ] {
+        assert_eq!(
+            (count(table, "claude-code"), count(table, "fake-agent")),
+            (0, 1),
+            "{table}"
+        );
+    }
+    assert_eq!(
+        (
+            count("usage_requests", "claude-code"),
+            count("usage_requests", "fake-agent")
+        ),
+        (1, 1),
+        "§8.6"
+    );
+    assert_eq!(
+        s.all_accounts().unwrap().len(),
+        2,
+        "accounts are not its to delete"
+    );
+}
+
+// ---- M5b Task 9: doctor's read-only store (Decision 3) ----
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_read_only_open_of_a_store_nobody_holds_creates_nothing_and_writes_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    assert!(Store::open_read_only(&path).unwrap().is_none());
+    assert!(
+        names_in(d.path()).is_empty(),
+        "a missing store is not created"
+    );
+    {
+        let s = Store::open(&path).unwrap();
+        add(&s, &cc(), "a", "a@x.co", 1);
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let ro = Store::open_read_only(&path).unwrap().unwrap();
+    assert_eq!(
+        ro.account(&AccountId::from_string("a"))
+            .unwrap()
+            .unwrap()
+            .position,
+        1
+    );
+    assert_eq!(ro.quick_check().unwrap(), ["ok"]);
+    assert!(
+        ro.set_alias(&AccountId::from_string("a"), Some("x"))
+            .is_err()
+    );
+    drop(ro);
+    assert_eq!(names_in(d.path()), ["t.db"], "no -wal or -shm appears");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn a_read_only_open_beside_a_writer_reads_what_it_committed_and_never_migrates() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("dir with ? and #/t.db");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let writer = Store::open(&path).unwrap();
+    add(&writer, &cc(), "a", "a@x.co", 1);
+    let ro = Store::open_read_only(&path).unwrap().unwrap();
+    assert_eq!(ro.all_accounts().unwrap().len(), 1, "the WAL is read");
+    drop(ro);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 1)
+        .unwrap();
+    drop(writer);
+    let ro = Store::open_read_only(&path).unwrap().unwrap();
+    assert_eq!(
+        ro.schema_version().unwrap(),
+        1,
+        "an older store is not migrated"
+    );
+}
+
+#[test]
+fn recorded_replacement_metadata_parses_only_as_finish_replacement_installs_it() {
+    let meta = json!({"identity_key": "a@x.co\n", "label": "a@x.co", "kind": "oauth"});
+    assert!(tagteam_engine::store::replacing_meta_parses(
+        &meta.to_string()
+    ));
+    for bad in [
+        "not json".to_owned(),
+        "[]".to_owned(),
+        json!({"identity_key": "k", "label": "l"}).to_string(),
+        json!({"identity_key": "k", "label": 1, "kind": "oauth"}).to_string(),
+    ] {
+        assert!(!tagteam_engine::store::replacing_meta_parses(&bad), "{bad}");
+    }
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    assert_eq!(s.replacing_meta(&a).unwrap(), None);
+    s.begin_replacement(
+        &a,
+        "sha256:x",
+        &login_meta(&identity("a@x.co"), false),
+        false,
+    )
+    .unwrap();
+    assert!(tagteam_engine::store::replacing_meta_parses(
+        &s.replacing_meta(&a).unwrap().unwrap()
+    ));
+}
+
+#[test]
+fn usage_requests_are_counted_per_identity_after_a_time_without_pruning() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let c = rusqlite::Connection::open(&path).unwrap();
+    for (key, at) in [("a\n", 100), ("a\n", 200), ("a\n", 300), ("b\n", 300)] {
+        c.execute(
+            "INSERT INTO usage_requests (provider, identity_key, at) VALUES ('claude-code', ?1, ?2)",
+            rusqlite::params![key, at],
+        )
+        .unwrap();
+    }
+    assert_eq!(s.usage_request_count(&cc(), "a\n", 100).unwrap(), 2);
+    assert_eq!(s.usage_request_count(&cc(), "a\n", 0).unwrap(), 3);
+    assert_eq!(
+        s.usage_request_count(&ProviderId::new("other"), "a\n", 0)
+            .unwrap(),
+        0
+    );
+    let left: i64 = c
+        .query_row("SELECT COUNT(*) FROM usage_requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 4, "nothing is pruned");
+}
+
+#[test]
+fn a_read_only_open_of_a_store_with_only_one_of_its_wal_files_opens_nothing_and_creates_nothing() {
+    // R-T9-sidecars: a `-wal` alone may hold commits that `immutable=1` would never read, and a
+    // `-shm` alone would have `mode=ro` create the `-wal`. Neither can be opened without a write.
+    for (present, absent) in [("-wal", "-shm"), ("-shm", "-wal")] {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("t.db");
+        {
+            let s = Store::open(&path).unwrap();
+            add(&s, &cc(), "a", "a@x.co", 1);
+        }
+        let mut side = path.clone().into_os_string();
+        side.push(present);
+        std::fs::write(&side, b"x").unwrap();
+        let before = names_in(d.path());
+        let err = Store::open_read_only(&path).err().expect("refused");
+        assert!(
+            matches!(err, StoreError::LopsidedWal { present: p } if p == present),
+            "{present}: {err:?}"
+        );
+        assert_eq!(names_in(d.path()), before, "nothing was created");
+        assert!(!before.iter().any(|n| n.ends_with(absent)), "{before:?}");
+    }
 }

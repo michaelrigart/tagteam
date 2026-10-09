@@ -9,16 +9,19 @@ pub mod auto;
 pub mod cli;
 mod config_cmd;
 mod displaced_cmd;
+mod doctor_cmd;
 mod history;
 mod logfile;
 mod logging;
 pub mod prompt;
+mod purge_cmd;
 mod render;
 mod root_guard;
 mod run;
 mod shell_init;
 mod signals;
 mod statusline;
+mod transfer_cmd;
 
 const TEXT_UNDER_JSON: &str = "--help and --version print text; run them without --json";
 
@@ -153,7 +156,7 @@ where
             logging::LogConfig {
                 debug: cli.debug,
                 color: !cli.no_color && !ctx.no_color_env,
-                state_dir: ctx.env.state_dir(),
+                log_file: ctx.env.log_file(),
                 home: ctx.env.home.clone(),
                 filter: std::env::var_os(logging::TAGTEAM_LOG),
             },

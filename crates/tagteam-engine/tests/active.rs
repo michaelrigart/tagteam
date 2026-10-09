@@ -494,18 +494,25 @@ fn an_expired_recovered_generation_is_published_before_it_is_refreshed() {
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
 fn a_self_heal_that_cannot_publish_sends_nothing_and_says_so() {
-    // CC holds its config lock, so B cannot reach the live store. Whether or not B needs a
-    // refresh, nothing is sent, and the outcome is `PersistedNotPublished`, never `NotNeeded`.
+    // CC takes its config lock once the pre-wait is over (§9.1), so B cannot reach the live
+    // store. Whether or not B needs a refresh, nothing is sent, and the outcome is
+    // `PersistedNotPublished`, never `NotNeeded`.
     for b_expired in [true, false] {
         let fx = Fx::with_lock_timeout(Duration::from_millis(300));
         let a = fx.add("a@x.co", "rt-a");
         let now = fx.clock.now_ms();
         unpublished_b(&fx, &a, if b_expired { now } else { now + 3_600_000 });
-        fs::create_dir(fx.paths().config_lock).unwrap(); // CC holds it, freshly
+        let lock = fx.paths().config_lock;
+        let taken = lock.clone();
+        fx.engine.on_point(
+            "active-before-config-lock",
+            Box::new(move || fs::create_dir(&taken).unwrap()), // CC holds it, freshly
+        );
 
         let out = active(&fx, ActiveTrigger::Expired).unwrap();
-        fs::remove_dir(fx.paths().config_lock).unwrap();
+        fs::remove_dir(lock).unwrap();
 
         assert_eq!(
             out,
@@ -524,6 +531,47 @@ fn a_self_heal_that_cannot_publish_sends_nothing_and_says_so() {
             "B expired: {b_expired}"
         );
     }
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn the_refresh_waits_for_the_config_lock_within_its_own_budget_not_the_credential_locks() {
+    // §7.5, §9.1: the live write after the request waits for the config lock with the config
+    // lock's budget. Here that is 3 s against the credential locks' 300 ms, and CC lets go
+    // after 1 s.
+    let fx = Fx::with_lock_budgets(Duration::from_millis(300), Duration::from_secs(3));
+    let a = fx.add("a@x.co", "rt-a");
+    unpublished_b(&fx, &a, fx.clock.now_ms() + 3_600_000);
+    let lock = fx.paths().config_lock;
+    let taken = lock.clone();
+    fx.engine.on_point(
+        "active-before-config-lock",
+        Box::new(move || {
+            fs::create_dir(&taken).unwrap();
+            let held = taken.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                fs::remove_dir(held).unwrap();
+            });
+        }),
+    );
+
+    let out = active(&fx, ActiveTrigger::Expired).unwrap();
+
+    assert_eq!(out, ActiveOutcome::NotNeeded { reconciled: true });
+    assert_eq!(
+        fx.live_refresh_token().as_deref(),
+        Some("rt-b"),
+        "published"
+    );
+    assert!(!lock.exists());
+}
+
+#[test]
+fn cc_s_config_lock_has_a_twelve_second_budget_and_its_credential_locks_nine() {
+    let fx = Fx::new();
+    assert_eq!(fx.cc.live_lock_budget(), Duration::from_secs(9));
+    assert_eq!(fx.cc.config_lock_budget(), Duration::from_secs(12));
 }
 
 #[test]

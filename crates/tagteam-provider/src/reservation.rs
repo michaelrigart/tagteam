@@ -55,7 +55,15 @@ impl LaunchReservation {
             })
             .and_then(|()| fs::rename(&temp, &path));
         if let Err(e) = placed {
-            let _ = fs::remove_file(&temp);
+            // §14: the placement's error is the one returned; a temporary file it cannot
+            // remove is logged with its cause, never its path (§14.2). `launch_reservations`
+            // never counts one.
+            match fs::remove_file(&temp) {
+                Err(left) if left.kind() != io::ErrorKind::NotFound => tracing::warn!(
+                    "could not remove a launch reservation's temporary file, left in its profile: {left}"
+                ),
+                _ => {}
+            }
             return Err(e);
         }
         Ok(LaunchReservation { file, path })

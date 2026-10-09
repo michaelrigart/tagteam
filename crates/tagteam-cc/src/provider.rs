@@ -10,14 +10,16 @@ use tagteam_provider::process::{ProcessSpawner, SpawnSpec};
 use tagteam_provider::profile::refuse_linked_credential;
 use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
-    BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
-    Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
-    LockError, MergeReport, MustShare, MutationGuard, Pace, PollBudget, Provider, ProviderError,
-    Read, SessionEnv, SharePolicy, StoredLogin, Undo, UsageResult, Validity, Window, Written,
+    BeforeFallback, Cancel, Capabilities, Check, CredLocks, Credential, DoomedEntry, Env,
+    FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange,
+    LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare, MutationGuard, Pace,
+    PollBudget, Provider, ProviderError, Read, SessionEnv, SharePolicy, StoredLogin, Undo,
+    UsageResult, Validity, Window, Written,
 };
 
 use crate::config;
 use crate::crash;
+use crate::doctor;
 use crate::endpoints::Endpoints;
 use crate::live::{self, Extent, Fence, LiveStore, Platform, Snapshot};
 use crate::locks;
@@ -42,6 +44,9 @@ pub struct ClaudeCode {
     /// How long CC's live locks may take, both stages together (§9.1):
     /// `locks::ACQUIRE_TIMEOUT`, except in tests.
     lock_budget: Duration,
+    /// How long a wait for CC's config lock may take on its own: `locks::CONFIG_ACQUIRE_TIMEOUT`,
+    /// except in tests (§9.1).
+    config_budget: Duration,
     /// Appendix A.5's URLs; `Endpoints::production()` except when the CLI's test-support
     /// build points them at a local server.
     endpoints: Endpoints,
@@ -56,6 +61,7 @@ impl ClaudeCode {
         Self {
             live: Arc::new(store),
             lock_budget: locks::ACQUIRE_TIMEOUT,
+            config_budget: locks::CONFIG_ACQUIRE_TIMEOUT,
             endpoints: Endpoints::production(),
         }
     }
@@ -66,10 +72,20 @@ impl ClaudeCode {
         self
     }
 
-    /// A shorter budget for CC's locks, so a test of a held lock need not wait the full 9 s.
+    /// A shorter budget for CC's locks, so a test of a held lock need not wait the full 9 s
+    /// (or the config lock's 12 s).
     #[cfg(feature = "test-hooks")]
     pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_budget = timeout;
+        self.config_budget = timeout;
+        self
+    }
+
+    /// A budget for the config lock alone, so a test can tell its 12 s from the credential
+    /// locks' 9 s.
+    #[cfg(feature = "test-hooks")]
+    pub fn with_config_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.config_budget = timeout;
         self
     }
 }
@@ -175,8 +191,9 @@ struct Armed<'a, 'l> {
 impl Drop for Armed<'_, '_> {
     fn drop(&mut self) {
         if let Some(undo) = self.undo.take() {
-            if let Err(e) = undo.undo(self.locks) {
-                tracing::error!("restoring the live credential during unwinding failed: {e}");
+            // A fixed phrase (§14.2): the error may name a path or another program's message.
+            if undo.undo(self.locks).is_err() {
+                tracing::error!("restoring the live credential during unwinding failed");
             }
         }
     }
@@ -311,6 +328,31 @@ impl Provider for ClaudeCode {
         }
     }
 
+    fn export_login(
+        &self,
+        login: &StoredLogin,
+        full: bool,
+    ) -> Result<(Value, Value), ProviderError> {
+        Ok((
+            shape::export_identity(&login.identity),
+            shape::export_credential(&login.secret, full)?,
+        ))
+    }
+
+    fn import_login(
+        &self,
+        identity: &Value,
+        credential: &Value,
+    ) -> Result<StoredLogin, ProviderError> {
+        let identity = shape::import_identity(identity)?;
+        let secret = shape::import_credential(credential)?;
+        Ok(StoredLogin {
+            kind: shape::classify(&secret).into(),
+            secret,
+            identity,
+        })
+    }
+
     fn classify(&self, secret: &[u8]) -> String {
         shape::classify(secret).into()
     }
@@ -353,6 +395,36 @@ impl Provider for ClaudeCode {
 
     fn live_lock_budget(&self) -> Duration {
         self.lock_budget
+    }
+
+    fn config_lock_budget(&self) -> Duration {
+        self.config_budget
+    }
+
+    fn wait_config_lock_idle(&self, env: &Env) -> Result<(), ProviderError> {
+        Ok(locks::wait_config_idle(
+            &CcPaths::resolve(env),
+            self.config_budget,
+            &env.cancel,
+        )?)
+    }
+
+    fn resplice_identity(
+        &self,
+        env: &Env,
+        _guard: &MutationGuard,
+        identity: &Identity,
+    ) -> Result<(), ProviderError> {
+        let paths = CcPaths::resolve(env);
+        let lock = locks::acquire_config(&paths, self.config_budget, &env.cancel)?;
+        let fence = || lock.check_owned().map_err(ProviderError::from);
+        config::splice_key(
+            &paths.global_config,
+            "oauthAccount",
+            Some(&identity.raw),
+            &fence,
+        )?;
+        Ok(())
     }
 
     fn lock_credentials<'g>(
@@ -545,6 +617,12 @@ impl Provider for ClaudeCode {
             .map(PathBuf::from)
     }
 
+    /// Appendix A.2: the live items are named from `CLAUDE_SECURESTORAGE_CONFIG_DIR` when it is
+    /// set, else from `CLAUDE_CONFIG_DIR`, NFC-normalised, an empty value counting as unset.
+    fn live_item_spelling(&self, env: &Env) -> Option<String> {
+        crate::naming::suffix_source(env)
+    }
+
     fn outer_home(&self, env: &Env) -> Value {
         session::outer_home(env)
     }
@@ -574,6 +652,10 @@ impl Provider for ClaudeCode {
         profile.join("sessions")
     }
 
+    fn supervisor_lock(&self, profile: &Path) -> Option<PathBuf> {
+        Some(profile.join("daemon.lock"))
+    }
+
     /// The hashed Keychain item named from `spelling`, the recorded spelling, then
     /// `.credentials.json` in `dir`, where the profile is now (Decision 19), exactly as the
     /// live read takes them (§12.3 step 2).
@@ -582,6 +664,26 @@ impl Provider for ClaudeCode {
             &session::profile_env(env, spelling),
             &session::profile_paths(env, dir),
         )
+    }
+
+    /// The profile's credential locks are named from `spelling`, as Claude Code running there
+    /// names them (M4b's `write_profile_credential` takes them the same way); the read is
+    /// `read_profile_credential`'s. Releasing them ends the operation.
+    fn read_profile_credential_settled(
+        &self,
+        env: &Env,
+        dir: &Path,
+        spelling: &str,
+        guard: &MutationGuard,
+    ) -> Result<Read<Credential>, ProviderError> {
+        let held = self.lock_credentials(
+            &session::profile_env(env, spelling),
+            guard,
+            self.lock_budget,
+        )?;
+        let read = self.read_profile_credential(env, dir, spelling);
+        drop(held);
+        Ok(read)
     }
 
     /// The `oauthAccount` of the config in `dir`, where the profile is now (Decision 19).
@@ -616,7 +718,7 @@ impl Provider for ClaudeCode {
         dir: &Path,
         identity: &Identity,
     ) -> Result<(), ProviderError> {
-        session::seed(env, dir, identity, self.lock_budget)
+        session::seed(env, dir, identity, self.config_budget)
     }
 
     fn has_baseline(&self, dir: &Path) -> bool {
@@ -629,7 +731,7 @@ impl Provider for ClaudeCode {
         dir: &Path,
         cancel: &Cancel,
     ) -> Result<MergeReport, ProviderError> {
-        session::merge_back(env, dir, self.lock_budget, cancel)
+        session::merge_back(env, dir, self.config_budget, cancel)
     }
 
     /// §12.3 step 4 (Decision 6), under the profile's own credential locks:
@@ -700,6 +802,38 @@ impl Provider for ClaudeCode {
             spelling,
             expect,
         )
+    }
+
+    /// §13.6's Claude Code checks (`doctor.rs`), with this provider's own Keychain.
+    fn doctor_checks(
+        &self,
+        env: &Env,
+        spawner: &dyn ProcessSpawner,
+        cancel: &Cancel,
+    ) -> Vec<Check> {
+        doctor::checks(&self.live, env, spawner, cancel)
+    }
+
+    /// The state of the Keychain `cc.keychain` asks about: only on macOS does CC use one.
+    fn keychain_lock_state(&self) -> Option<LockState> {
+        (self.live.platform() == Platform::MacOs).then(|| self.live.keychain().lock_state())
+    }
+
+    /// The token, profile and usage hosts (Appendix A.5), each once, as root URLs.
+    fn doctor_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = Vec::new();
+        for url in [
+            &self.endpoints.token,
+            &self.endpoints.profile,
+            &self.endpoints.usage,
+        ] {
+            if let Some(host) = doctor::origin(url) {
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+        }
+        hosts
     }
 }
 

@@ -11,7 +11,7 @@ use crate::cancel::Cancel;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
-    #[error("timed out waiting for the lock {0}")]
+    #[error("{}", timeout_text(.0))]
     Timeout(PathBuf),
     #[error("the lock {0} was taken over while held")]
     Compromised(PathBuf),
@@ -20,6 +20,24 @@ pub enum LockError {
     /// The cancel token was set while waiting (§14.1). The wait took nothing.
     #[error("interrupted while waiting for the lock {path}")]
     Interrupted { path: PathBuf, signal: i32 },
+}
+
+/// A timeout's message. CC's config lock (`<global config>.lock`) may be one CC left behind
+/// after a short command, which frees itself once stale (10 s, plus up to 1 s that its mtime
+/// can lie in the future, §9.1), so its message says so.
+fn timeout_text(path: &Path) -> String {
+    let base = format!("timed out waiting for the lock {}", path.display());
+    let config = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".json.lock"));
+    if config {
+        format!(
+            "{base}; Claude Code may have left it behind after a short command, and it frees itself within about 11 s, so retry"
+        )
+    } else {
+        base
+    }
 }
 
 impl LockError {
@@ -94,12 +112,39 @@ fn trusted_span(stale: Duration) -> Duration {
 /// Removes the lock directory at `path` only while it is still the one this holder made: the
 /// device and inode of its held fd, and, once touched, the mtime it set (§9.1). For a start that
 /// fails after the directory was established as its own; the caller still holds the fd, so the
-/// inode cannot have been reused.
+/// inode cannot have been reused. A directory that cannot be removed holds the lock until it
+/// goes stale: logged at WARN with its cause (§14), as the caller reports its own failure.
 fn remove_if_ours(path: &Path, id: DirId, set: Option<SystemTime>) {
     let ours = fs::symlink_metadata(path)
         .is_ok_and(|m| DirId::of(&m) == id && set.is_none_or(|t| m.modified().ok() == Some(t)));
     if ours {
-        let _ = fs::remove_dir(path);
+        warn_if_left(path, fs::remove_dir(path));
+    }
+}
+
+/// §14: a lock directory this holder made and could not remove is a contained error, logged
+/// at WARN with its cause; Claude Code waits on it until it goes stale (§9.1). One already
+/// gone was not left.
+fn warn_if_left(path: &Path, removed: io::Result<()>) {
+    match removed {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => tracing::warn!(
+            "could not remove {}, which this process made, so it holds the lock until it goes stale: {e}",
+            lock_role(path)
+        ),
+        _ => {}
+    }
+}
+
+/// Which lock a directory is, by the name Claude Code gives each of its locks (§9.1): what a
+/// log line names instead of the path. The path is under a Claude Code home, which the user may
+/// have named after themselves (`CLAUDE_CONFIG_DIR`), and §14.2 keeps such names out of the log.
+fn lock_role(path: &Path) -> &'static str {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(".oauth_refresh.lock") => "Claude Code's refresh lock",
+        Some(".storage-write" | ".storage-write.lock") => "Claude Code's storage-write lock",
+        Some(".claude.json.lock" | ".config.json.lock") => "Claude Code's config lock",
+        Some(name) if name.ends_with(".lock") => "Claude Code's credential lock",
+        _ => "a lock directory",
     }
 }
 
@@ -205,6 +250,31 @@ impl MkdirLock {
         }
     }
 
+    /// Waits up to `acquire_timeout`, polling every 250-500 ms, until the lock directory is
+    /// absent or stale, and takes nothing (§9.1's pre-wait). Staleness is judged as
+    /// `try_acquire` judges it, so a lock whose mtime lies in the future reads as age 0.
+    /// `spec.cancel` is checked before every look (§14.1).
+    pub fn wait_idle(spec: &MkdirLockSpec) -> Result<(), LockError> {
+        let deadline = Instant::now() + spec.acquire_timeout;
+        loop {
+            check_cancel(&spec.cancel, &spec.path)?;
+            match fs::metadata(&spec.path).and_then(|m| m.modified()) {
+                Ok(mtime) => {
+                    let age = SystemTime::now().duration_since(mtime).unwrap_or_default();
+                    if age > spec.stale {
+                        return Ok(());
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+            if Instant::now() >= deadline {
+                return Err(LockError::Timeout(spec.path.clone()));
+            }
+            thread::sleep(Duration::from_millis(fastrand::u64(250..=500)));
+        }
+    }
+
     /// Takes the directory `mkdir` made at `made_at` as this holder's: opens it, records its
     /// identity, touches it and starts the heartbeat. `None`, touching and removing nothing,
     /// when the directory may have been replaced before it was opened (`trusted_span`): the
@@ -273,7 +343,14 @@ impl MkdirLock {
                         // and this touch is never touched (L356).
                         match touch(&st.dir, SystemTime::now()) {
                             Ok(t) => *last = t,
-                            Err(_) => st.compromised.store(true, Ordering::SeqCst),
+                            Err(e) => {
+                                // §14: the holder's next check reports the loss, not its cause.
+                                tracing::warn!(
+                                    "could not touch {}, which this process holds, so the lock counts as lost: {e}",
+                                    lock_role(&path)
+                                );
+                                st.compromised.store(true, Ordering::SeqCst);
+                            }
                         }
                     }
                 }
@@ -331,7 +408,7 @@ impl Drop for MkdirLock {
         // The check and the `rmdir` are two steps: a takeover between them needs this holder
         // to stall for the whole staleness window inside that gap, as with `proper-lockfile`.
         if self.check_owned().is_ok() {
-            let _ = fs::remove_dir(&self.path);
+            warn_if_left(&self.path, fs::remove_dir(&self.path));
         }
     }
 }
@@ -438,6 +515,53 @@ mod tests {
     /// Makes the step at `point` fail for the lock at `path`, after the hooks set before this.
     fn fail_at(path: &Path, point: Point) {
         seam::set(path, point, || Err(io::Error::other("injected failure")));
+    }
+
+    /// The `tracing` lines `f` logs on this thread, one per event, level first.
+    fn logged(f: impl FnOnce()) -> Vec<String> {
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Lines {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Lines {
+            type Writer = Lines;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let lines = Lines::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(lines.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// A directory made read-only, so no entry in it can be removed (as a non-root user), until
+    /// this is dropped.
+    struct ReadOnly(PathBuf);
+
+    impl ReadOnly {
+        fn new(dir: &Path) -> Self {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).unwrap();
+            Self(dir.to_path_buf())
+        }
+    }
+
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 
     fn spec(dir: &Path, stale_ms: u64, timeout_ms: u64, touch_ms: u64) -> MkdirLockSpec {
@@ -579,6 +703,77 @@ mod tests {
         let _held = MkdirLock::acquire(&s).unwrap();
         assert!(matches!(MkdirLock::acquire(&s), Err(LockError::Timeout(_))));
         assert!(MkdirLock::try_acquire(&s).unwrap().is_none());
+    }
+
+    #[test]
+    fn wait_idle_returns_at_once_for_an_absent_lock_and_takes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 100, 3_000);
+        MkdirLock::wait_idle(&s).unwrap();
+        assert!(!s.path.exists());
+    }
+
+    #[test]
+    fn wait_idle_outlasts_a_lock_with_a_future_mtime_and_leaves_it() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 1_000, 5_000, 3_000);
+        fs::create_dir(&s.path).unwrap();
+        set_dir_mtime(&s.path, SystemTime::now() + Duration::from_secs(1)).unwrap();
+        let start = Instant::now();
+        MkdirLock::wait_idle(&s).unwrap();
+        assert!(
+            start.elapsed() >= Duration::from_millis(1_900),
+            "returned after {:?}, before the lock went stale",
+            start.elapsed()
+        );
+        assert!(s.path.is_dir(), "the pre-wait takes nothing over");
+    }
+
+    #[test]
+    fn wait_idle_times_out_on_a_lock_that_stays_fresh() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 600, 3_000);
+        fs::create_dir(&s.path).unwrap();
+        assert!(matches!(
+            MkdirLock::wait_idle(&s),
+            Err(LockError::Timeout(p)) if p == s.path
+        ));
+    }
+
+    #[test]
+    fn wait_idle_is_a_cancellation_point() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 30_000, 3_000);
+        fs::create_dir(&s.path).unwrap();
+        s.cancel.request(15);
+        assert_eq!(MkdirLock::wait_idle(&s).unwrap_err().signal(), Some(15));
+    }
+
+    #[test]
+    fn both_spellings_of_the_global_config_s_lock_are_the_config_lock() {
+        for name in [".claude.json.lock", ".config.json.lock"] {
+            assert_eq!(
+                lock_role(&PathBuf::from("/h").join(name)),
+                "Claude Code's config lock"
+            );
+        }
+        assert_eq!(
+            lock_role(Path::new("/h/.claude.lock")),
+            "Claude Code's credential lock"
+        );
+    }
+
+    #[test]
+    fn a_config_lock_timeout_says_it_frees_itself_and_other_locks_do_not() {
+        let config = LockError::Timeout(PathBuf::from("/h/.claude.json.lock")).to_string();
+        assert_eq!(
+            config,
+            "timed out waiting for the lock /h/.claude.json.lock; Claude Code may have left it behind after a short command, and it frees itself within about 11 s, so retry"
+        );
+        assert_eq!(
+            LockError::Timeout(PathBuf::from("/h/.oauth_refresh.lock")).to_string(),
+            "timed out waiting for the lock /h/.oauth_refresh.lock"
+        );
     }
 
     #[test]
@@ -867,6 +1062,63 @@ mod tests {
         let ino = theirs.try_recv().unwrap();
         assert!(s.path.is_dir(), "the failed start removed the replacement");
         assert_eq!(fs::metadata(&s.path).unwrap().ino(), ino);
+    }
+
+    #[test]
+    fn a_released_lock_directory_that_cannot_be_removed_is_logged_with_its_cause() {
+        // §14: a contained error is logged, never discarded. The directory holds the lock until
+        // it goes stale, so Claude Code waits on it; the line says why.
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 100, 3_000);
+        let lock = MkdirLock::acquire(&s).unwrap();
+        let _restore = ReadOnly::new(d.path());
+        let logs = logged(|| drop(lock));
+        assert!(s.path.is_dir());
+        let warnings: Vec<&String> = logs.iter().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{logs:?}");
+        assert!(
+            warnings[0].contains("could not remove Claude Code's credential lock")
+                && warnings[0].contains("ermission denied"),
+            "{}",
+            warnings[0]
+        );
+        // The role, never the path: a Claude Code home may carry its user's name (§14.2).
+        assert!(!warnings[0].contains(&d.path().display().to_string()));
+        assert_eq!(
+            lock_role(Path::new("/h/.oauth_refresh.lock")),
+            "Claude Code's refresh lock"
+        );
+        assert_eq!(
+            lock_role(Path::new("/h/.storage-write")),
+            "Claude Code's storage-write lock"
+        );
+        assert_eq!(
+            lock_role(Path::new("/h/.storage-write.lock")),
+            "Claude Code's storage-write lock",
+            "CC 2.1.292's spelling is no generic credential lock"
+        );
+    }
+
+    #[test]
+    fn a_failed_start_whose_directory_cannot_be_removed_is_logged_with_its_cause() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 0, 3_000);
+        let parent = d.path().to_path_buf();
+        let restore = once_at(&s.path, Point::BeforeHeartbeat, move || {
+            ReadOnly::new(&parent)
+        });
+        fail_at(&s.path, Point::BeforeHeartbeat);
+        let logs = logged(|| assert!(MkdirLock::acquire(&s).is_err()));
+        drop(restore.try_recv().unwrap());
+        assert!(s.path.is_dir(), "left until it goes stale");
+        let warnings: Vec<&String> = logs.iter().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{logs:?}");
+        assert!(
+            warnings[0].contains("could not remove Claude Code's credential lock")
+                && !warnings[0].contains(&d.path().display().to_string()),
+            "{}",
+            warnings[0]
+        );
     }
 
     #[test]

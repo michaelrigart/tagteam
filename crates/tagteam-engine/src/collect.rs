@@ -499,7 +499,7 @@ impl Engine {
             Ok(state) => state,
             Err(e) => {
                 // Nothing was sent: give the slot back, best effort, before the error.
-                let _ = store.release_slot(&reservation, &slot);
+                give_back(store, &reservation, &slot, row);
                 return Err(e);
             }
         };
@@ -634,6 +634,21 @@ impl From<StoreError> for Stop {
 
 fn failed(kind: &str) -> Stop {
     Stop::Failed(Failure::new(kind))
+}
+
+/// Gives the slot of a request that was never sent back, best effort (§8.3): the error that
+/// stopped the collection is the one reported. A slot that cannot be given back counts
+/// against the account's hourly budget until it leaves the hour (§8.6), which is logged at
+/// WARN with its cause (§14): SQLite's result code, never the error's text (§14.2).
+fn give_back(store: &Store, reservation: &Reservation, slot: &Slot, row: &AccountRow) {
+    if let Err(e) = store.release_slot(reservation, slot) {
+        tracing::warn!(
+            account = %row.id,
+            position = row.position,
+            code = e.sqlite_code().map(tracing::field::debug),
+            "could not give back the slot of a usage request that was never sent, so it counts against the hour's budget"
+        );
+    }
 }
 
 /// The fetch's windows, or the failure its result records (§8.3, §6.1's tokens).
@@ -1153,7 +1168,7 @@ impl Collection<'_> {
             Ok(collected) => Ok((collected, self.warnings)),
             Err(e) => {
                 if let Some(slot) = self.slot.take() {
-                    let _ = self.store.release_slot(&self.reservation, &slot);
+                    give_back(self.store, &self.reservation, &slot, self.row);
                 }
                 Err(e)
             }
@@ -1224,7 +1239,7 @@ impl Collection<'_> {
                     // Fenced out before the record deleted it: a slot that was never sent
                     // must not hold budget for the hour. One that was sent is not held here.
                     if let Some(slot) = self.slot.take() {
-                        let _ = self.store.release_slot(&self.reservation, &slot);
+                        give_back(self.store, &self.reservation, &slot, self.row);
                     }
                     Collected::Dropped
                 }
@@ -1237,7 +1252,7 @@ impl Collection<'_> {
             }
             Err(Stop::LeaseLost) => {
                 if let Some(slot) = self.slot.take() {
-                    let _ = self.store.release_slot(&self.reservation, &slot);
+                    give_back(self.store, &self.reservation, &slot, self.row);
                 }
                 Collected::Dropped
             }

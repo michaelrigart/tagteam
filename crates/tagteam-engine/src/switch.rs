@@ -11,21 +11,22 @@ use tagteam_core::{
 };
 use tagteam_provider::{
     BeforeFallback, Credential, DoomedEntry, Identity, LiveAuth, LiveChange, LiveLocks,
-    ProcessStamp, Provenance, Provider, ProviderError, Read, ReadError, SecretStore, StoredLogin,
-    Undo,
+    MutationGuard, ProcessStamp, Provenance, Provider, ProviderError, Read, ReadError, SecretStore,
+    StoredLogin, Undo,
 };
 
 use crate::account_lock::AccountLock;
 use crate::collect::{CollectMode, jitter};
 use crate::displace::displace;
 use crate::engine::Engine;
-use crate::error::EngineError;
+use crate::error::{EngineError, SessionOwner};
 use crate::hooks;
 use crate::oracle::verdict;
 use crate::provenance::ProfileCheck;
 use crate::refresh::{GateOutcome, OwnedBy};
 use crate::rescue::RescueFile;
-use crate::store::{AccountRow, AutoRecord, EventRow, JournalRow, Store};
+use crate::session::{SessionState, session_owned_error};
+use crate::store::{AccountRow, AutoRecord, CREDENTIALS_REPLACED, EventRow, JournalRow, Store};
 
 /// §9.3's strategies that rank by usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +137,10 @@ pub struct SwitchOutcome {
     /// Where this switch's credential write put the secret; `None` when it wrote none.
     pub stored_in: Option<SecretStore>,
     pub unmanaged_email: Option<String>,
+    /// A live managed API key was in place and this switch replaced or cleared it, whether or
+    /// not a stored account held it. CC keeps that key for the life of its process (Appendix
+    /// A.7), so the human output says to restart it.
+    pub managed_key_replaced: bool,
 }
 
 /// §9.4 step 1: after this many lock acquisitions that each found the plan outdated, abort.
@@ -202,6 +207,7 @@ fn noop(
         warnings: vec![],
         stored_in: None,
         unmanaged_email,
+        managed_key_replaced: false,
     }
 }
 
@@ -529,13 +535,10 @@ pub(crate) fn works_until_expiry(target: &AccountRow) -> String {
     )
 }
 
-/// §9.2's session-owned refusal, for a target a session took after planning.
-fn session_owned(target: &AccountRow) -> EngineError {
-    EngineError::SessionOwned {
-        position: target.position,
-        label: target.label.clone(),
-        unreadable: None,
-    }
+/// §9.2's session-owned refusal, for a target a session took after planning: it names what
+/// owns the profile in `state`, as every other refusal does (§12.6).
+fn session_owned(target: &AccountRow, state: &SessionState) -> EngineError {
+    session_owned_error(target, state)
 }
 
 /// §9.2's refusal for a target whose profile and vault both moved (§12.5).
@@ -607,13 +610,15 @@ impl<'a> Rollback<'a, '_> {
             );
             EngineError::RolledBack(cause.to_string())
         } else {
+            // A count (§14.2): each entry names a Keychain service or a file path, and an
+            // error's text.
             tracing::error!(
                 provider = %self.provider,
                 from_account = from,
                 to_account = %self.to,
                 kind = cause.kind(),
-                "a switch was not fully rolled back; its journal row stays for recovery: {}",
-                failed.join("; ")
+                failed = failed.len(),
+                "a switch was not fully rolled back; its journal row stays for recovery"
             );
             EngineError::RollbackFailed {
                 cause: cause.to_string(),
@@ -657,9 +662,11 @@ impl Drop for Rollback<'_, '_> {
         if failed.is_empty() {
             tracing::warn!("an unwinding switch was rolled back");
         } else {
+            // A count (§14.2): each entry names a Keychain service or a file path, and an
+            // error's text.
             tracing::error!(
-                "an unwinding switch was not fully rolled back; its journal row stays for recovery: {}",
-                failed.join("; ")
+                failed = failed.len(),
+                "an unwinding switch was not fully rolled back; its journal row stays for recovery"
             );
         }
     }
@@ -1149,14 +1156,16 @@ impl Engine {
                 "the account to switch to was removed".into(),
             );
         };
+        let state = self.session_state(p, &target)?;
         let why = if target.disabled {
-            Some("it is disabled")
+            Some("it is disabled".to_owned())
         } else if target.quarantine_reason.is_some() {
-            Some("it needs a new login")
-        } else if self.session_state(p, &target)?.owned() {
-            Some("it is in a `tagteam run` session")
+            Some("it needs a new login".to_owned())
+        } else if state.owned() {
+            // The same words as `session-owned`'s refusal: every owner and every file.
+            Some(SessionOwner::of(&state).reason("it"))
         } else if !self.has_login(&target)? {
-            Some("it has no stored credential")
+            Some("it has no stored credential".to_owned())
         } else {
             None
         };
@@ -1461,7 +1470,11 @@ impl Engine {
             // (§9.3); a direct target is refused. A conflicting profile refuses either way
             // (§12.5).
             GateOutcome::Owned(OwnedBy::Session) if chosen => Freshened::Replan,
-            GateOutcome::Owned(OwnedBy::Session) => return Err(session_owned(target)),
+            // The gate answers only "a session"; the state is read again to name a daemon.
+            GateOutcome::Owned(OwnedBy::Session) => {
+                let state = self.session_state(p, target)?;
+                return Err(session_owned(target, &state));
+            }
             GateOutcome::Conflict => return Err(profile_conflict(target)),
         })
     }
@@ -1494,11 +1507,13 @@ impl Engine {
             };
             match self.settle_rescues(p, &row, &lock) {
                 Ok(()) => {}
-                Err(EngineError::RescuePending { detail, .. }) => {
+                // Fixed phrases (§14.2): the details name a path, and may quote a file or an
+                // error that names the account.
+                Err(EngineError::RescuePending { .. }) => {
                     tracing::warn!(
                         position = row.position,
                         account = %row.id,
-                        "a pending rescue could not be settled ({detail}); the target is passed over"
+                        "a pending rescue could not be settled; the target is passed over"
                     );
                     return Ok(AutoFreshened::Failed("rescue-unreadable".into()));
                 }
@@ -1507,11 +1522,11 @@ impl Engine {
             }
             match self.apply_provenance(p, &row, &lock) {
                 Ok(ProfileCheck::Conflict) => return Ok(AutoFreshened::Skip),
-                Ok(ProfileCheck::Unreadable(detail)) => {
+                Ok(ProfileCheck::Unreadable(_)) => {
                     tracing::warn!(
                         position = row.position,
                         account = %row.id,
-                        "the session profile could not be read ({detail}); the target is passed over"
+                        "the session profile could not be read; the target is passed over"
                     );
                     return Ok(AutoFreshened::Failed("profile-unreadable".into()));
                 }
@@ -1686,10 +1701,22 @@ impl Engine {
             let locks = p.lock_live(&self.env, &guard)?;
             match self.rederive(p, store, req, &plan, outgoing.as_ref())? {
                 Rederived::Go(locked) => {
-                    let outcome = self.transact(p, store, &plan, locked, &accounts, &locks, req)?;
-                    // The re-plan needs no lock and never fetches (§8.3).
+                    let mut outcome =
+                        self.transact(p, store, &plan, locked, &accounts, &locks, req)?;
                     drop(locks);
                     drop(accounts);
+                    // §9.1 (amended): with CC's locks released, `oauthAccount` is read again.
+                    if let Some(to) = &outcome.to {
+                        if let Ok(identity) = p.parse_identity(&to.identity_json) {
+                            outcome.warnings.extend(self.reverify_identity(
+                                p,
+                                &guard,
+                                &req.provider,
+                                &identity,
+                            ));
+                        }
+                    }
+                    // The re-plan needs no lock and never fetches (§8.3).
                     self.replan_polls(p, store, &outcome);
                     return Ok(outcome);
                 }
@@ -1702,6 +1729,50 @@ impl Engine {
             // `locks`, then `accounts`, are released here; the mutation lock is kept.
         }
         Err(EngineError::LiveMoved)
+    }
+
+    /// §9.1 (amended): CC's start-up may write the global config without its lock for its first
+    /// 30 s (Appendix A.7), so after a switch (or a recovery that activated) commits and CC's
+    /// locks are released, the live identity is read again. If it is not the identity the
+    /// switch wrote (by identity key, so a fuller `oauthAccount` of the same account stands), it
+    /// is spliced once more under the config lock alone, with its own budget, and read a last
+    /// time. A warning comes back only when the second read still differs or the splice failed:
+    /// a starting Claude Code may have overwritten it, and switching again restores it. The
+    /// switch has committed, so this is contained (§14): it never fails it. The log carries a
+    /// fixed phrase, never an email or a label (§14.2).
+    pub(crate) fn reverify_identity(
+        &self,
+        p: &dyn Provider,
+        guard: &MutationGuard,
+        provider: &ProviderId,
+        written: &Identity,
+    ) -> Option<String> {
+        let key = p.identity_key(written);
+        let intact = || match p.live_identity(&self.env) {
+            Read::Present(live) => p.identity_key(&live) == key,
+            Read::Absent | Read::Unreadable(_) => false,
+        };
+        let _ = hooks::point(self, "identity-reverify");
+        if intact() {
+            return None;
+        }
+        let spliced = p.resplice_identity(&self.env, guard, written);
+        let _ = hooks::point(self, "identity-reverify");
+        if spliced.is_ok() && intact() {
+            tracing::info!(
+                provider = self.registered_id(provider),
+                "a starting Claude Code had overwritten the switched account's identity, which was spliced again"
+            );
+            return None;
+        }
+        tracing::warn!(
+            provider = self.registered_id(provider),
+            "a starting Claude Code may have overwritten the switched account's identity"
+        );
+        Some(format!(
+            "a starting {} may have overwritten the account's identity in its config; run `tagteam switch` again to restore it",
+            p.display_name()
+        ))
     }
 
     /// §8.3: after a switch that activated an account, both accounts' polls are re-planned
@@ -1736,7 +1807,7 @@ impl Engine {
                 tracing::error!(
                     position = row.position,
                     account = %row.id,
-                    error = %e,
+                    code = e.sqlite_code().map(tracing::field::debug),
                     "could not re-plan usage polls after the switch"
                 );
             }
@@ -1788,11 +1859,12 @@ impl Engine {
         // stands until the locks are released. A direct target is refused (§9.2); a rotation or
         // a usage strategy plans again, and its walk skips the account (§9.3). An automatic
         // switch never gets here with one: `auto_refusal` above answers it `not-candidate`.
-        if self.session_state(p, &target)?.owned() {
+        let state = self.session_state(p, &target)?;
+        if state.owned() {
             return if req.target.chosen() {
                 Ok(Rederived::Replan)
             } else {
-                Err(session_owned(&target))
+                Err(session_owned(&target, &state))
             };
         }
         // The rotation decision, recomputed from the store and each candidate's session state
@@ -1924,6 +1996,7 @@ impl Engine {
         let target_identity = p.parse_identity(&target.identity_json)?;
         let live = p.read_live_auth(&self.env);
         refuse_unsafe_live_reads(&live)?;
+        let managed_key_replaced = matches!(&live.managed_key, Read::Present(k) if !k.is_empty());
         let doomed = p.doomed(&self.env, locks, LiveChange::Write(&target.kind));
         refuse_unreadable(&doomed)?;
 
@@ -1993,6 +2066,7 @@ impl Engine {
                     plan.hint.as_ref(),
                     account_locks,
                     live_identity.as_ref(),
+                    req.source,
                     &mut warnings,
                 )?;
                 // Step 4 settled the outgoing generation: kept, captured or displaced.
@@ -2130,10 +2204,13 @@ impl Engine {
             warnings,
             stored_in: Some(stored_in),
             unmanaged_email: None,
+            managed_key_replaced,
         })
     }
 
-    /// Step 4: classify the outgoing credential and act on it.
+    /// Step 4: classify the outgoing credential and act on it. A capture's write changes the
+    /// vault's fingerprint (it is never `Ours`), so it clears a quarantine (§7.4) and records
+    /// the clear with the switch's `source`.
     #[allow(clippy::too_many_arguments)]
     fn settle_outgoing(
         &self,
@@ -2144,6 +2221,7 @@ impl Engine {
         hint: Option<&OracleHint>,
         account_locks: &[AccountLock],
         live_identity: Option<&Identity>,
+        source: &str,
         warnings: &mut Vec<String>,
     ) -> Result<(), EngineError> {
         let Some(bytes) = Axis::of(p, &out.kind).live_secret(live) else {
@@ -2199,6 +2277,7 @@ impl Engine {
                     &out.kind,
                     p.login_expires_at(&bytes),
                 )?;
+                self.unquarantine(out, CREDENTIALS_REPLACED, source)?;
                 if backfill_uuid {
                     if let Some(uuid) = resolved.and_then(|i| i.account_uuid.as_deref()) {
                         store.backfill_account_uuid(&out.id, uuid)?;

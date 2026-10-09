@@ -9,7 +9,8 @@ use tagteam_engine::lifecycle::AddTokenOptions;
 use tagteam_engine::store::{JournalRow, NewAccount};
 use tagteam_engine::vault::SERVICE;
 use tagteam_engine::views::StatusView;
-use tagteam_provider::{ProcessStamp, Provider};
+use tagteam_provider::profile::ProfileMarker;
+use tagteam_provider::{ProcessStamp, Provider, Read};
 
 #[test]
 fn references_resolve_by_position_alias_and_email() {
@@ -294,4 +295,366 @@ fn a_rescue_that_cannot_be_deleted_fails_remove_before_the_row_goes() {
     fx.engine.remove(&a).unwrap();
     assert!(!rescue.exists());
     assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
+}
+
+#[test]
+fn remove_refuses_a_rescue_path_it_cannot_list_before_deleting_anything() {
+    // §6.3: a `rescue` that is not a directory hides every account's rescues; `remove` refuses,
+    // naming it, rather than guess which entries were the account's.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let rescue = fx.env.data_dir().join("rescue");
+    fs::write(&rescue, "not a directory").unwrap();
+    let err = fx.engine.remove(&a).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::RescueUnlistable { path, .. } if path == &rescue),
+        "{err:?}"
+    );
+    assert_eq!(err.kind(), "rescue-unreadable");
+    assert!(
+        err.to_string().contains(&rescue.display().to_string()),
+        "{err}"
+    );
+    assert!(fx.vault_bytes(&a).is_some(), "the vault was not touched");
+    assert!(rescue.is_file(), "nor the path");
+    fs::remove_file(&rescue).unwrap();
+    fx.engine.remove(&a).unwrap();
+}
+
+/// The live login's items and what each holds.
+type LiveItems = [((String, String), &'static [u8]); 2];
+
+/// A macOS fixture whose `CLAUDE_CONFIG_DIR` names a directory holding the live login, with the
+/// live login's two items planted; the account `a` is stored beside `b`.
+fn live_config_fixture() -> (Fx, AccountId, std::path::PathBuf, LiveItems) {
+    let fx = Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
+        let parent = fs::canonicalize(e.home.parent().unwrap()).unwrap();
+        let live = parent.join(e.home.file_name().unwrap()).join(".claude");
+        e.claude_config_dir = Some(live.into_os_string());
+    });
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let live_dir = std::path::PathBuf::from(fx.env.claude_config_dir.clone().unwrap());
+    fs::create_dir_all(&live_dir).unwrap();
+    fs::write(live_dir.join("settings.json"), b"{}").unwrap();
+    let items = [
+        (
+            fx.live_item(tagteam_cc::ItemKind::OAuth),
+            &b"the live login"[..],
+        ),
+        (
+            fx.live_item(tagteam_cc::ItemKind::ManagedKey),
+            &b"the live key"[..],
+        ),
+    ];
+    for (item, bytes) in &items {
+        fx.kc.put(&item.0, &item.1, bytes);
+    }
+    (fx, a, live_dir, items)
+}
+
+fn assert_live_items_kept(fx: &Fx, items: &LiveItems) {
+    for (item, bytes) in items {
+        assert_eq!(
+            fx.kc.get(&item.0, &item.1).as_deref(),
+            Some(*bytes),
+            "the live login's item {item:?} is kept"
+        );
+    }
+}
+
+#[test]
+fn remove_of_a_profile_that_is_a_link_to_the_live_config_dir_never_deletes_the_live_login() {
+    // Codex pre-merge P1 (§10.3, §10.5): the account's own `sessions/<id>` is a link to the
+    // directory `CLAUDE_CONFIG_DIR` names, with no marker. No item is named through a link.
+    let (fx, a, live_dir, items) = live_config_fixture();
+    let link = fx.profile_dir(&a);
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&live_dir, &link).unwrap();
+
+    fx.engine.remove(&a).unwrap();
+
+    assert_live_items_kept(&fx, &items);
+    assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
+    assert!(live_dir.join("settings.json").exists(), "the target stays");
+    assert!(fx.vault_bytes(&a).is_none());
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
+}
+
+#[test]
+fn remove_of_a_profile_whose_marker_names_the_live_config_dir_refuses_with_nothing_deleted() {
+    let (fx, a, live_dir, items) = live_config_fixture();
+    let profile = fx.make_profile(&a);
+    let mut marker = match ProfileMarker::read(&profile) {
+        Read::Present(m) => m,
+        _ => panic!("no marker"),
+    };
+    marker.config_dir = fx.cc.live_item_spelling(&fx.env).unwrap();
+    marker.write(&profile).unwrap();
+
+    let err = fx.engine.remove(&a).unwrap_err();
+
+    assert!(err.to_string().contains("is the live login's"), "{err}");
+    assert_live_items_kept(&fx, &items);
+    assert!(live_dir.join("settings.json").exists());
+    assert!(profile.join(".claude.json").exists(), "the profile is kept");
+    assert!(fx.vault_bytes(&a).is_some(), "the vault entry is kept");
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
+}
+
+#[test]
+fn remove_of_a_profile_holding_the_live_login_s_files_refuses_with_nothing_deleted() {
+    // Codex pre-merge P1b (§10.3, §10.5): the environment names the profile directory in a
+    // spelling that differs from its marker's; the live credential file is inside it.
+    let id = AccountId::from_string("0192-live-inside");
+    let fx = Fx::with(tagteam_cc::live::Platform::Linux, |e| {
+        let dir = tagteam_provider::profile::profile_path(e, &id);
+        fs::create_dir_all(&dir).unwrap();
+        let mut spelled = fs::canonicalize(&dir).unwrap().into_os_string();
+        spelled.push("/.");
+        e.claude_securestorage_config_dir = Some(spelled);
+    });
+    let dir = fx.profile_dir(&id);
+    fx.write_marker(&dir, &id, &fx.env);
+    let live = dir.join(".credentials.json");
+    fs::write(&live, b"the live login").unwrap();
+    let store = fx.engine.store().unwrap();
+    let identity = fx.cc.token_identity("a@x.co");
+    store
+        .insert_account(&NewAccount {
+            id: &id,
+            provider: &ProviderId::new("claude-code"),
+            position: 1,
+            identity_key: "a@x.co\n",
+            identity: &identity,
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 0,
+        })
+        .unwrap();
+    fx.put_vault(&id, b"a vault credential");
+
+    let err = fx.engine.remove(&id).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(dir.join(".tagteam-profile.json").exists());
+    assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}
+
+#[test]
+fn remove_of_a_profile_a_live_credential_link_leads_into_refuses_with_nothing_deleted() {
+    let id = AccountId::from_string("0192-linked-in");
+    let fx = Fx::with(tagteam_cc::live::Platform::Linux, |_| {});
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_account(&NewAccount {
+            id: &id,
+            provider: &ProviderId::new("claude-code"),
+            position: 1,
+            identity_key: "a@x.co\n",
+            identity: &fx.cc.token_identity("a@x.co"),
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 0,
+        })
+        .unwrap();
+    fx.put_vault(&id, b"a vault credential");
+    let dir = fx.profile_dir(&id);
+    fx.write_marker(&dir, &id, &fx.env);
+    let target = dir.join(".credentials.json");
+    fs::write(&target, b"the live login").unwrap();
+    let link = fx.paths().credentials_file;
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let err = fx.engine.remove(&id).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"the live login");
+    assert!(fs::symlink_metadata(&link).is_ok(), "the link stays");
+    assert!(dir.join(".tagteam-profile.json").exists());
+    assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}
+
+#[test]
+fn remove_of_a_profile_a_live_credential_is_bridged_through_refuses_with_nothing_deleted() {
+    let id = AccountId::from_string("0192-bridged");
+    let fx = Fx::with(tagteam_cc::live::Platform::Linux, |_| {});
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_account(&NewAccount {
+            id: &id,
+            provider: &ProviderId::new("claude-code"),
+            position: 1,
+            identity_key: "a@x.co\n",
+            identity: &fx.cc.token_identity("a@x.co"),
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 0,
+        })
+        .unwrap();
+    fx.put_vault(&id, b"a vault credential");
+    let dir = fx.profile_dir(&id);
+    fx.write_marker(&dir, &id, &fx.env);
+    let target = fx.dir.path().join("safe-login.json");
+    fs::write(&target, b"the live login").unwrap();
+    let bridge = dir.join("credential-bridge");
+    std::os::unix::fs::symlink(&target, &bridge).unwrap();
+    let live = fx.paths().credentials_file;
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&bridge, &live).unwrap();
+
+    let err = fx.engine.remove(&id).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"the live login");
+    assert!(fs::symlink_metadata(&bridge).is_ok(), "the bridge stays");
+    assert!(dir.join(".tagteam-profile.json").exists());
+    assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}
+
+#[test]
+fn remove_of_a_profile_link_a_live_credential_goes_through_refuses_with_nothing_deleted() {
+    let id = AccountId::from_string("0192-link-profile");
+    let fx = Fx::with(tagteam_cc::live::Platform::Linux, |_| {});
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_account(&NewAccount {
+            id: &id,
+            provider: &ProviderId::new("claude-code"),
+            position: 1,
+            identity_key: "a@x.co\n",
+            identity: &fx.cc.token_identity("a@x.co"),
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 0,
+        })
+        .unwrap();
+    fx.put_vault(&id, b"a vault credential");
+    let outside = fx.dir.path().join("ext");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join(".credentials.json"), b"the live login").unwrap();
+    let entry = fx.profile_dir(&id);
+    fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &entry).unwrap();
+    let live = fx.paths().credentials_file;
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(entry.join(".credentials.json"), &live).unwrap();
+
+    let err = fx.engine.remove(&id).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert!(fs::symlink_metadata(&entry).is_ok(), "the link stays");
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}
+
+#[test]
+fn remove_of_a_profile_the_live_login_is_in_under_another_case_refuses() {
+    let probe = tempfile::tempdir().unwrap();
+    fs::create_dir(probe.path().join("probe-a")).unwrap();
+    if !probe.path().join("PROBE-A").exists() {
+        eprintln!("skipped: this filesystem is case-sensitive");
+        return;
+    }
+    let id = AccountId::from_string("0192-case-alias");
+    let fx = Fx::with(tagteam_cc::live::Platform::Linux, |e| {
+        let dir = tagteam_provider::profile::profile_path(e, &id);
+        fs::create_dir_all(&dir).unwrap();
+        let sessions = fs::canonicalize(dir.parent().unwrap()).unwrap();
+        e.claude_securestorage_config_dir = Some(sessions.join("0192-CASE-ALIAS").into_os_string());
+    });
+    let dir = fx.profile_dir(&id);
+    fx.write_marker(&dir, &id, &fx.env);
+    let live = dir.join(".credentials.json");
+    fs::write(&live, b"the live login").unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_account(&NewAccount {
+            id: &id,
+            provider: &ProviderId::new("claude-code"),
+            position: 1,
+            identity_key: "a@x.co\n",
+            identity: &fx.cc.token_identity("a@x.co"),
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 0,
+        })
+        .unwrap();
+    fx.put_vault(&id, b"a vault credential");
+
+    let err = fx.engine.remove(&id).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(dir.join(".tagteam-profile.json").exists());
+    assert!(fx.vault_bytes(&id).is_some());
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}
+
+#[test]
+fn remove_of_an_account_whose_vault_file_the_live_credential_links_to_refuses() {
+    // Codex slice 1 re-review (§10.3): the Linux file vault's `vault/<id>.json` is what the live
+    // `.credentials.json` resolves to.
+    let id = AccountId::from_string("0192-vaulted");
+    let fx = Fx::with(tagteam_cc::live::Platform::Linux, |_| {});
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_account(&NewAccount {
+            id: &id,
+            provider: &ProviderId::new("claude-code"),
+            position: 1,
+            identity_key: "a@x.co\n",
+            identity: &fx.cc.token_identity("a@x.co"),
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 0,
+        })
+        .unwrap();
+    fx.put_vault(&id, b"the live login");
+    let vault_file = fx.env.data_dir().join("vault/0192-vaulted.json");
+    let live = fx.paths().credentials_file;
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&vault_file, &live).unwrap();
+
+    let err = fx.engine.remove(&id).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(fx.vault_bytes(&id).is_some());
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
 }

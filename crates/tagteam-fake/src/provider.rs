@@ -320,6 +320,33 @@ impl Provider for FakeAgent {
         (KIND_STATIC.into(), bytes)
     }
 
+    /// The identity is the stored object (`handle`, `workspace`, `uid`): no email anywhere.
+    fn export_login(
+        &self,
+        login: &StoredLogin,
+        full: bool,
+    ) -> Result<(Value, Value), ProviderError> {
+        Ok((
+            login.identity.raw.clone(),
+            shape::export_credential(&login.secret, full)?,
+        ))
+    }
+
+    fn import_login(
+        &self,
+        identity: &Value,
+        credential: &Value,
+    ) -> Result<StoredLogin, ProviderError> {
+        let identity = shape::identity_from(identity)
+            .ok_or_else(|| ProviderError::Invalid("the FakeAgent identity has no handle".into()))?;
+        let secret = shape::import_credential(credential)?;
+        Ok(StoredLogin {
+            kind: shape::classify(&secret).into(),
+            secret,
+            identity,
+        })
+    }
+
     fn classify(&self, secret: &[u8]) -> String {
         shape::classify(secret).into()
     }
@@ -374,6 +401,38 @@ impl Provider for FakeAgent {
 
     fn live_lock_budget(&self) -> Duration {
         self.lock_budget
+    }
+
+    fn config_lock_budget(&self) -> Duration {
+        self.lock_budget
+    }
+
+    fn resplice_identity(
+        &self,
+        env: &Env,
+        _guard: &MutationGuard,
+        identity: &Identity,
+    ) -> Result<(), ProviderError> {
+        let p = FakePaths::resolve(env);
+        let unsplicable = || ProviderError::ConfigUnsplicable {
+            path: p.identity.clone(),
+            remedy: REMEDY,
+        };
+        let before = present_or_err(read_file(&p.identity)).map_err(|_| unsplicable())?;
+        let new = match &before {
+            None => format!(
+                "{{\n  \"identity\": {}\n}}\n",
+                render_nested(&identity.raw, 1)
+            )
+            .into_bytes(),
+            Some(b) => splice::replace_top_level(b, "identity", &identity.raw)
+                .map_err(|_| unsplicable())?,
+        };
+        if before.as_deref() != Some(new.as_slice()) {
+            ensure_private_dir(&p.dir)?;
+            write_atomic_with(&p.identity, &new, 0o600, || Ok::<(), ProviderError>(()))?;
+        }
+        Ok(())
     }
 
     fn lock_credentials<'g>(
@@ -658,6 +717,12 @@ impl Provider for FakeAgent {
             .map(PathBuf::from)
     }
 
+    /// FakeAgent names a profile's item (when it keeps one) from its one home variable, so the
+    /// live login's is named from the same string `profile_spelling` gives that home.
+    fn live_item_spelling(&self, env: &Env) -> Option<String> {
+        self.session_dir(env).map(|dir| self.profile_spelling(&dir))
+    }
+
     /// `{"FAKEAGENT_HOME": <string>|null}`: one variable, unlike Claude Code's two.
     fn outer_home(&self, env: &Env) -> Value {
         let home = env
@@ -715,6 +780,21 @@ impl Provider for FakeAgent {
     /// names nothing after the spelling (Decision 19).
     fn read_profile_credential(&self, env: &Env, dir: &Path, _spelling: &str) -> Read<Credential> {
         self.read_live_auth(&profile_env_in(env, dir)).credential
+    }
+
+    /// `read_profile_credential`, under the profile's own `.live.lock` in `dir` (Decision 19:
+    /// FakeAgent names nothing of a profile after its spelling).
+    fn read_profile_credential_settled(
+        &self,
+        env: &Env,
+        dir: &Path,
+        spelling: &str,
+        guard: &MutationGuard,
+    ) -> Result<Read<Credential>, ProviderError> {
+        let held = self.lock_credentials(&profile_env_in(env, dir), guard, self.lock_budget)?;
+        let read = self.read_profile_credential(env, dir, spelling);
+        drop(held);
+        Ok(read)
     }
 
     /// The `identity` key of `<dir>/identity.json`.

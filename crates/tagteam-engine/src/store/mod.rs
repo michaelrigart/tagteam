@@ -41,7 +41,7 @@ const MIGRATIONS: [&str; 2] = [SCHEMA_V1, MIGRATION_V2];
 
 /// The `PRAGMA user_version` this build knows how to read and write. A stored version above
 /// this is a store written by a newer tagteam; `migrate` refuses it rather than guessing.
-const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
 
@@ -65,8 +65,36 @@ pub enum StoreError {
     UnsupportedSchema(i64),
     #[error("a replacement is already pending for this account")]
     ReplacementPending,
+    /// §12.5: the metadata a pending replacement recorded (`replacing_meta`) is not JSON, or
+    /// lacks a field the login needs, so the replacement cannot be installed. The detail never
+    /// quotes it.
+    #[error("the pending replacement's recorded login cannot be read: {0}")]
+    ReplacementUnreadable(String),
+    /// §10.5, Decision 8: the emptied store's WAL could not be truncated, because another
+    /// connection is still reading it; deleted rows may survive in the WAL until it is.
+    #[error("the store's write-ahead log could not be truncated while another process reads it")]
+    WalBusy,
     #[error("an alias cannot be empty")]
     InvalidAlias,
+    /// R-T9-sidecars: exactly one of the store's `-wal` and `-shm` files exists. A `-wal` alone
+    /// may hold commits an immutable open never reads, and a `-shm` alone has a read-only open
+    /// create the `-wal`, so a reader that must write nothing opens neither.
+    #[error(
+        "the store has its {present} file but not the other, a write-ahead log that cannot be read without writing"
+    )]
+    LopsidedWal { present: &'static str },
+}
+
+impl StoreError {
+    /// SQLite's result code, when SQLite refused: all of a store error a log line may name
+    /// (§14.2). Its message may quote a stored value or name a path, and `Corrupt` and
+    /// `AliasTaken` carry stored text.
+    pub fn sqlite_code(&self) -> Option<rusqlite::ErrorCode> {
+        match self {
+            StoreError::Sqlite(e) => e.sqlite_error_code(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -256,15 +284,32 @@ const ACCOUNT_COLUMNS: &str = "id, provider, position, identity_key, label, emai
     account_uuid, kind, alias, disabled, identity_json, login_expires_at, login_epoch, replacing_fp, \
     quarantine_reason, quarantine_fp, quarantine_at, added_at";
 
-/// Installs a login's identity fields and clears any quarantine: shared by `update_login` and
-/// the replacement `finish_replacement` records, which land the same fields. Clearing here is
-/// §7.4's rule, not an exception to it. Every caller installs a login that replaces the vault's:
-/// `add`, `add-token` and `import` clear a quarantine explicitly, and the switch's outgoing
-/// capture only ever writes a generation whose fingerprint differs from the vault's (it is not
-/// `Ours`, §9.4 step 4).
+/// Whether recorded replacement metadata is what `finish_replacement` can install (§12.5): a
+/// JSON object whose `identity_key`, `label` and `kind` are strings.
+pub fn replacing_meta_parses(meta: &str) -> bool {
+    serde_json::from_str::<Value>(meta).is_ok_and(|v| {
+        ["identity_key", "label", "kind"]
+            .iter()
+            .all(|k| v[*k].is_string())
+    })
+}
+
+/// Installs a login's identity fields: shared by `update_login` and the replacement
+/// `finish_replacement` records, which land the same fields. It never clears a quarantine:
+/// every clear records its `unquarantine` event (§7.4), so it goes through
+/// `clear_quarantine_on`, which `finish_replacement` calls in its own transaction and every other
+/// caller through `clear_quarantine`.
 const APPLY_LOGIN_SQL: &str = "UPDATE accounts SET identity_key = ?2, label = ?3, email = ?4, org_uuid = ?5, \
     org_name = ?6, account_uuid = COALESCE(?7, account_uuid), kind = ?8, identity_json = ?9, \
-    login_expires_at = ?10, quarantine_reason = NULL, quarantine_fp = NULL, quarantine_at = NULL WHERE id = ?1";
+    login_expires_at = ?10 WHERE id = ?1";
+
+/// §7.4, §11.4: the reason an `unquarantine` event records when the account's `login_epoch`
+/// moved, that is, an explicit replacement cleared it (§12.5).
+pub const ACCOUNT_REPLACED: &str = "account-replaced";
+
+/// §7.4, §11.4: the reason an `unquarantine` event records for every other clear: a vault write
+/// that changed the fingerprint, or a quarantine that no longer binds.
+pub const CREDENTIALS_REPLACED: &str = "credentials-replaced";
 
 /// Upserts the provider's active account and its activation epoch, both columns on conflict:
 /// an epoch left from the previous account would stale-mark the next one (§12.5). Shared by
@@ -369,9 +414,13 @@ fn event_from_row(r: &Row<'_>) -> rusqlite::Result<EventRow> {
 /// §14.2 and Decision 10: every `events` row is logged at INFO once it is written, naming its
 /// accounts by ID only. `detail` is never logged: it is free-form JSON, and nothing bounds what
 /// a later kind puts in it.
-fn log_event(e: &EventRow) {
+///
+/// The provider is named only when `name_provider` says so, which the engine decides by whether
+/// this build registers it (§14.2): a row records whatever provider its writer gave, and purge
+/// records the removal of an account whose provider this build does not register.
+fn log_event(e: &EventRow, name_provider: bool) {
     tracing::info!(
-        provider = %e.provider,
+        provider = name_provider.then(|| tracing::field::display(&e.provider)),
         kind = e.kind.as_str(),
         from_account = e.from_id.as_ref().map(tracing::field::display),
         to_account = e.to_id.as_ref().map(tracing::field::display),
@@ -435,6 +484,43 @@ fn apply_login(
             login_expires_at,
         ],
     )
+}
+
+/// §7.4: clears `id`'s quarantine and inserts its one `unquarantine` event, on any
+/// connection-like handle, so a caller's transaction holds both or neither. The event names the
+/// account as `to_id` and carries `{"reason": reason}`. `None`, and no event, when the account
+/// had no quarantine (or does not exist).
+fn clear_quarantine_on(
+    c: &Connection,
+    id: &AccountId,
+    reason: &str,
+    source: &str,
+    at: i64,
+) -> rusqlite::Result<Option<EventRow>> {
+    let provider: Option<String> = c
+        .query_row(
+            "UPDATE accounts SET quarantine_reason = NULL, quarantine_fp = NULL, \
+             quarantine_at = NULL WHERE id = ?1 AND quarantine_reason IS NOT NULL \
+             RETURNING provider",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(provider) = provider else {
+        return Ok(None);
+    };
+    let event = EventRow {
+        at,
+        provider: ProviderId::new(provider),
+        kind: "unquarantine".into(),
+        from_id: None,
+        to_id: Some(id.clone()),
+        trigger: None,
+        source: source.to_owned(),
+        detail: Some(json!({"reason": reason})),
+    };
+    Store::insert_event_on(c, &event)?;
+    Ok(Some(event))
 }
 
 /// `SET_ACTIVE_SQL` on any connection-like handle. No account means no epoch, whatever the
@@ -506,6 +592,22 @@ fn is_cannot_open(e: &StoreError) -> bool {
     matches!(e, StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _)) if f.code == ErrorCode::CannotOpen)
 }
 
+/// `path` as a URI filename (sqlite.org/uri.html): every byte but an unreserved one or `/` is
+/// percent-encoded, so a `?`, `#` or `%` in a directory name stays part of the path.
+fn uri_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|&b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// Creates the database file with mode 0600 before SQLite first opens it (§6.1): it names
 /// every account. SQLite gives its `-wal` and `-shm` files the database's own mode. A file
 /// that already exists is left exactly as it is; an empty one is a valid empty database.
@@ -565,6 +667,59 @@ impl Store {
         };
         store.migrate()?;
         Ok(Some(store))
+    }
+
+    /// §13.6, Decision 3: the store as `doctor` reads it, never written, migrated or created.
+    /// `None` when there is no database file. A read-only open of a WAL database with neither
+    /// its `-wal` nor its `-shm` would create both, so with neither it opens `immutable`: no
+    /// process has the store open, so no WAL is left to read. With both, it opens `mode=ro` and
+    /// reads the writers' WAL through it. It writes no page, though, like every reader, it
+    /// records its read mark in the `-shm` index. With exactly one of them it opens nothing and
+    /// fails with `LopsidedWal` (R-T9-sidecars). A schema of any version opens; `schema_version`
+    /// says which.
+    pub fn open_read_only(path: &Path) -> Result<Option<Self>, StoreError> {
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+        let sidecar = |suffix: &str| -> io::Result<bool> {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            Path::new(&name).try_exists()
+        };
+        let params = match (sidecar("-wal")?, sidecar("-shm")?) {
+            (false, false) => "mode=ro&immutable=1",
+            (true, true) => "mode=ro",
+            (true, false) => return Err(StoreError::LopsidedWal { present: "-wal" }),
+            (false, true) => return Err(StoreError::LopsidedWal { present: "-shm" }),
+        };
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn =
+            match Connection::open_with_flags(format!("file:{}?{params}", uri_path(path)), flags) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    let e = StoreError::from(e);
+                    if is_cannot_open(&e) && !path.try_exists()? {
+                        return Ok(None);
+                    }
+                    return Err(e);
+                }
+            };
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(Some(Self {
+            conn: Mutex::new(conn),
+        }))
+    }
+
+    /// `PRAGMA quick_check`'s rows: exactly `["ok"]` for a sound file (§13.6).
+    pub fn quick_check(&self) -> Result<Vec<String>, StoreError> {
+        let c = self.lock();
+        let mut stmt = c.prepare("PRAGMA quick_check")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -741,6 +896,8 @@ impl Store {
         Ok(self.lock().execute(sql, p)?)
     }
 
+    /// Installs a login's identity fields and expiry. It never clears a quarantine: a caller
+    /// whose write cleared one says so through `clear_quarantine`, which records it (§7.4).
     pub fn update_login(
         &self,
         id: &AccountId,
@@ -831,9 +988,12 @@ impl Store {
     }
 
     /// The replacement landed: installs its recorded metadata, clears any quarantine and the
-    /// marker, all in one transaction. A missing `identity_key`, `label` or `kind` in the
-    /// recorded metadata means the account and its marker are left exactly as they were
-    /// (§12.5) rather than installing an empty identity.
+    /// marker, all in one transaction. A quarantine it clears records its `unquarantine` event
+    /// in that transaction, at `at`, as `account-replaced` from `cli`: the epoch moved, and an
+    /// explicit replacement is a command's (§7.4, §11.4), whichever lock holder finishes it. A
+    /// missing `identity_key`, `label` or `kind` in the recorded metadata means the account and
+    /// its marker are left exactly as they were (§12.5) rather than installing an empty
+    /// identity: that is `ReplacementUnreadable`, as is metadata that is not JSON.
     ///
     /// A login taken from the live store (`from_live`, `add`'s) also records the account's new
     /// `login_epoch` as the activation epoch here (§10.1, §12.5): the live store holds exactly
@@ -841,7 +1001,7 @@ impl Store {
     /// `begin_replacement` made it so, and a switch that committed another account after a
     /// replacer died is the newer record. Metadata without `from_live` is not from the live
     /// store.
-    pub fn finish_replacement(&self, id: &AccountId) -> Result<(), StoreError> {
+    pub fn finish_replacement(&self, id: &AccountId, at: i64) -> Result<(), StoreError> {
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let row: Option<Option<String>> = tx
@@ -855,12 +1015,12 @@ impl Store {
             None => return Err(StoreError::NoSuchAccount),
             Some(meta) => meta,
         };
+        let mut cleared = None;
         if let Some(m) = meta {
-            let v: Value =
-                serde_json::from_str(&m).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-            let missing = |field: &str| {
-                StoreError::Corrupt(format!("replacement metadata is missing its {field} field"))
-            };
+            let v: Value = serde_json::from_str(&m)
+                .map_err(|_| StoreError::ReplacementUnreadable("it is not JSON".into()))?;
+            let missing =
+                |field: &str| StoreError::ReplacementUnreadable(format!("it has no {field} field"));
             let identity_key = v["identity_key"]
                 .as_str()
                 .ok_or_else(|| missing("identity_key"))?;
@@ -876,6 +1036,7 @@ impl Store {
             };
             let login_expires_at = v["login_expires_at"].as_i64();
             apply_login(&tx, id, identity_key, &identity, kind, login_expires_at)?;
+            cleared = clear_quarantine_on(&tx, id, ACCOUNT_REPLACED, "cli", at)?;
             if v["from_live"].as_bool().unwrap_or(false) {
                 tx.execute(
                     "UPDATE active_accounts SET login_epoch = \
@@ -889,7 +1050,26 @@ impl Store {
             [id.as_str()],
         )?;
         tx.commit()?;
+        drop(c);
+        // Cleared only through the account's provider, which this build registers.
+        if let Some(e) = &cleared {
+            log_event(e, true);
+        }
         Ok(())
+    }
+
+    /// The replacement metadata recorded with `id`'s marker (§12.5), as stored; `None` when
+    /// there is none. A read, nothing more: `doctor` tests it without reconciling anything.
+    pub fn replacing_meta(&self, id: &AccountId) -> Result<Option<String>, StoreError> {
+        let meta: Option<Option<String>> = self
+            .lock()
+            .query_row(
+                "SELECT replacing_meta FROM accounts WHERE id = ?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(meta.flatten())
     }
 
     pub fn rollback_replacement(&self, id: &AccountId) -> Result<(), StoreError> {
@@ -929,14 +1109,27 @@ impl Store {
         }
     }
 
-    /// Clears the quarantine; `true` when there was one.
-    pub fn clear_quarantine(&self, id: &AccountId) -> Result<bool, StoreError> {
-        let n = self.exec(
-            "UPDATE accounts SET quarantine_reason = NULL, quarantine_fp = NULL, quarantine_at = NULL \
-             WHERE id = ?1 AND quarantine_reason IS NOT NULL",
-            &[&id.as_str()],
-        )?;
-        Ok(n > 0)
+    /// §7.4: clears the quarantine and records one `unquarantine` event, with `reason`
+    /// (`ACCOUNT_REPLACED` when the account's `login_epoch` moved, else
+    /// `CREDENTIALS_REPLACED`), `source` and `at` (epoch ms), in one transaction. `true` when
+    /// there was one; with none there is no event either.
+    pub fn clear_quarantine(
+        &self,
+        id: &AccountId,
+        reason: &str,
+        source: &str,
+        at: i64,
+    ) -> Result<bool, StoreError> {
+        let mut c = self.lock();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let cleared = clear_quarantine_on(&tx, id, reason, source, at)?;
+        tx.commit()?;
+        drop(c);
+        // Cleared only through the account's provider, which this build registers.
+        if let Some(e) = &cleared {
+            log_event(e, true);
+        }
+        Ok(cleared.is_some())
     }
 
     /// The login's own expiry (CC: `refreshTokenExpiresAt`), after a new generation lands.
@@ -1127,7 +1320,8 @@ impl Store {
         tx.execute(DELETE_JOURNAL_SQL, [provider.as_str()])?;
         tx.commit()?;
         drop(c);
-        log_event(event);
+        // A switch runs through its provider, which this build registers.
+        log_event(event, true);
         Ok(())
     }
 
@@ -1174,9 +1368,10 @@ impl Store {
         Ok(())
     }
 
-    pub fn insert_event(&self, e: &EventRow) -> Result<(), StoreError> {
+    /// Records `e` and logs it, naming its provider only when `name_provider` (`log_event`).
+    pub fn insert_event(&self, e: &EventRow, name_provider: bool) -> Result<(), StoreError> {
         Self::insert_event_on(&self.lock(), e)?;
-        log_event(e);
+        log_event(e, name_provider);
         Ok(())
     }
 
@@ -1356,5 +1551,74 @@ impl Store {
     /// Deletes the displaced row `id`; `true` when there was one.
     pub fn delete_displaced(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self.exec("DELETE FROM displaced WHERE id = ?1", &[&id])? > 0)
+    }
+
+    /// Every journal row, each decoded on its own: a row that does not decode is an `Err` in
+    /// its place rather than an error for the whole read. Only `purge` reads them so (§10.5
+    /// step 5): it deletes such a row as one recovery cannot decide. Every other reader takes
+    /// `journals`, which refuses one.
+    pub fn journals_each(&self) -> Result<Vec<Result<JournalRow, StoreError>>, StoreError> {
+        let c = self.lock();
+        let mut stmt = c.prepare("SELECT * FROM switch_journal ORDER BY provider")?;
+        let rows = stmt
+            .query_map([], |r| Ok(journal_from_row(r).map_err(StoreError::from)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// §10.5 with `--provider P`, once its accounts are gone: P's events, auto-switch state,
+    /// active account, live identity cache and switch journal, in one transaction. Its
+    /// `usage_requests` rows stay, so the hourly budget does not reset (§8.6), and its displaced
+    /// entries go through the displaced purge, each file before its row (§6.3).
+    pub fn delete_provider_rows(&self, provider: &ProviderId) -> Result<(), StoreError> {
+        let mut c = self.lock();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for table in [
+            "events",
+            "autoswitch_state",
+            "active_accounts",
+            "live_identity_cache",
+            "switch_journal",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE provider = ?1"),
+                [provider.as_str()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// §10.5, Decision 8: a full purge empties the store in place. With `secure_delete` on, one
+    /// transaction deletes every row of every table (foreign keys deferred to its commit). A
+    /// `VACUUM` then rebuilds the file, since a row deleted or rewritten earlier, without
+    /// `secure_delete`, leaves its bytes in the free space of a page still in use. A `TRUNCATE`
+    /// checkpoint last writes the result into the database file and empties the WAL, so no
+    /// deleted row survives in either file. The schema and `user_version` stay, so a process
+    /// that opened the store before goes on with a valid, empty one. `secure_delete` stays on
+    /// for the rest of this connection.
+    pub fn empty_all(&self) -> Result<(), StoreError> {
+        let mut c = self.lock();
+        c.pragma_update(None, "secure_delete", true)?;
+        let tables: Vec<String> = c
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+        for table in &tables {
+            tx.execute(&format!("DELETE FROM \"{table}\""), [])?;
+        }
+        tx.commit()?;
+        // Rows deleted or rewritten before this transaction, without `secure_delete`, leave
+        // their bytes in the free space of pages still in use: only a rebuild clears those.
+        c.execute_batch("VACUUM;")?;
+        let busy: i64 = c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        if busy != 0 {
+            return Err(StoreError::WalBusy);
+        }
+        Ok(())
     }
 }

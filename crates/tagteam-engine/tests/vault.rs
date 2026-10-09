@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use tagteam_core::{AccountId, Fingerprint};
 use tagteam_engine::account_lock::AccountLock;
-use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultError};
+use tagteam_engine::vault::{FileVault, KeychainVault, Leftovers, SERVICE, Vault, VaultError};
 use tagteam_provider::{Env, FakeKeychain, Read};
 
 fn fp(b: &[u8]) -> Option<Fingerprint> {
@@ -118,4 +118,55 @@ fn file_vault_forces_0600_even_over_a_widened_existing_mode() {
     v.store(&lock, b"gen2", &fp).unwrap();
     let meta = std::fs::metadata(&path).unwrap();
     assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn the_keychain_sweep_deletes_another_store_s_items_only_when_asked() {
+    // §10.5: every data directory on a Mac shares the `tagteam` service.
+    let kc = Arc::new(FakeKeychain::new());
+    let v = Vault::new(Box::new(KeychainVault::new(kc.clone())));
+    assert_eq!(v.sweep(false).unwrap(), Leftovers::None);
+    kc.put(SERVICE, "another-stores-account", b"theirs");
+    kc.put("Claude Code-credentials", "me", b"live");
+    assert_eq!(v.sweep(false).unwrap(), Leftovers::Shared);
+    assert!(kc.get(SERVICE, "another-stores-account").is_some(), "kept");
+    kc.set_unreadable(SERVICE, "another-stores-account", true);
+    assert!(matches!(v.sweep(false).unwrap(), Leftovers::Unknown(_)));
+    kc.set_unreadable(SERVICE, "another-stores-account", false);
+    kc.set_locked(true);
+    assert!(v.sweep(true).is_err(), "a locked keychain deletes nothing");
+    kc.set_locked(false);
+    assert_eq!(v.sweep(true).unwrap(), Leftovers::None);
+    assert!(kc.get(SERVICE, "another-stores-account").is_none());
+    assert!(
+        kc.get("Claude Code-credentials", "me").is_some(),
+        "another service"
+    );
+}
+
+#[test]
+fn the_file_vault_sweep_deletes_its_directory_whatever_it_is_asked() {
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let dir = env.data_dir().join("vault");
+    let v = Vault::new(Box::new(FileVault::new(dir.clone())));
+    assert_eq!(v.sweep(false).unwrap(), Leftovers::None, "none there");
+    let id = AccountId::from_string("z");
+    let lock = AccountLock::acquire(&env, &id, AccountLock::WAIT).unwrap();
+    v.store(&lock, b"g", &fp).unwrap();
+    std::fs::write(dir.join("an-orphan.json"), "{}").unwrap();
+    assert_eq!(v.sweep(false).unwrap(), Leftovers::None);
+    assert!(!dir.exists());
+}
+
+#[test]
+fn a_keychain_vault_names_its_keychain_and_a_file_vault_its_directory() {
+    // §13.6: doctor's lock check and by-service probe, or its listing of `vault/`.
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    let kc = Arc::new(FakeKeychain::new());
+    let [keychain, files] = <[Vault; 2]>::try_from(backends(&env, kc)).ok().unwrap();
+    assert!(keychain.keychain().is_some() && keychain.dir().is_none());
+    assert_eq!(files.dir(), Some(env.data_dir().join("vault").as_path()));
+    assert!(files.keychain().is_none());
 }

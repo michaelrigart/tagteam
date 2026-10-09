@@ -527,7 +527,7 @@ fn a_replacement_between_planning_and_freshening_stale_marks_the_profile() {
             store
                 .begin_replacement(&id, &seed_fp, &meta, false)
                 .unwrap();
-            store.finish_replacement(&id).unwrap();
+            store.finish_replacement(&id, 0).unwrap();
         }),
     );
 

@@ -15,6 +15,7 @@ test-hooks = []
 real_keychain = []
 
 [dependencies]
+age.workspace = true
 tagteam-core.workspace = true
 tagteam-provider.workspace = true
 fastrand.workspace = true

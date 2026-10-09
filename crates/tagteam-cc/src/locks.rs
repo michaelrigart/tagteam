@@ -8,6 +8,9 @@ use crate::paths::CcPaths;
 pub const CRED_STALE: Duration = Duration::from_secs(60);
 pub const CONFIG_STALE: Duration = Duration::from_secs(10);
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(9);
+/// The config lock's own budget (§9.1): its staleness plus the up to 1 s that a lock CC left
+/// behind can carry in the future (Appendix A.7), with room. The credential locks keep 9 s.
+pub const CONFIG_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(12);
 /// CC's storage-write lock goes stale after 15 s (§9.1, Appendix A.1).
 pub const STORAGE_WRITE_STALE: Duration = Duration::from_secs(15);
 
@@ -80,31 +83,90 @@ pub fn acquire_config(
     timeout: Duration,
     cancel: &Cancel,
 ) -> Result<CcConfigSet, LockError> {
+    acquire_config_stale(paths, CONFIG_STALE, timeout, cancel)
+}
+
+/// `acquire_config` with the staleness given, so a test can shorten it.
+fn acquire_config_stale(
+    paths: &CcPaths,
+    stale: Duration,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<CcConfigSet, LockError> {
     Ok(CcConfigSet {
         config: MkdirLock::acquire(
-            &MkdirLockSpec::new(paths.config_lock.clone(), CONFIG_STALE, timeout)
-                .with_cancel(cancel),
+            &MkdirLockSpec::new(paths.config_lock.clone(), stale, timeout).with_cancel(cancel),
         )?,
     })
 }
 
-/// CC's storage-write lock (§9.1), waited for up to `timeout` under `cancel` (§14.1). It is a
-/// leaf: a caller takes it only while holding the credential locks, holds it around one
-/// credential entry's write, and takes no other lock while it is held. Dropping the guard
-/// releases it.
+/// §9.1's pre-wait: until the config lock is absent or stale, for up to `timeout`, under
+/// `cancel` (§14.1). Takes nothing and holds nothing, so a caller holds no lock while it waits.
+pub fn wait_config_idle(
+    paths: &CcPaths,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<(), LockError> {
+    wait_config_idle_stale(paths, CONFIG_STALE, timeout, cancel)
+}
+
+/// `wait_config_idle` with the staleness given, so a test can shorten it.
+fn wait_config_idle_stale(
+    paths: &CcPaths,
+    stale: Duration,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<(), LockError> {
+    MkdirLock::wait_idle(
+        &MkdirLockSpec::new(paths.config_lock.clone(), stale, timeout).with_cancel(cancel),
+    )
+}
+
+/// CC's storage-write lock (§9.1): the pair of lock directories, `.storage-write` (recorded
+/// against 2.1.286) and `.storage-write.lock` (CC 2.1.292). Fields drop in declaration order,
+/// so the second is released first and the first last: the reverse of the order taken.
+pub struct CcStorageWrite {
+    v2: MkdirLock,
+    v1: MkdirLock,
+}
+
+impl CcStorageWrite {
+    /// Whether both directories are still this holder's (§9.1).
+    pub fn check_owned(&self) -> Result<(), LockError> {
+        self.v1.check_owned()?;
+        self.v2.check_owned()
+    }
+}
+
+/// CC's storage-write lock (§9.1), waited for up to `timeout` under `cancel` (§14.1): the
+/// `.storage-write` directory, then the `.storage-write.lock` one, the two sharing one deadline.
+/// A wait on either is a cancellation point; a timeout or an interruption on the second releases
+/// the first. It is a leaf: a caller takes it only while holding the credential locks, holds it
+/// around one credential entry's write, and takes no other lock while it is held. Dropping the
+/// guard releases both.
 pub fn acquire_storage_write(
     paths: &CcPaths,
     timeout: Duration,
     cancel: &Cancel,
-) -> Result<MkdirLock, LockError> {
-    MkdirLock::acquire(
+) -> Result<CcStorageWrite, LockError> {
+    let deadline = Instant::now() + timeout;
+    let v1 = MkdirLock::acquire(
         &MkdirLockSpec::new(
             paths.storage_write_lock.clone(),
             STORAGE_WRITE_STALE,
             timeout,
         )
         .with_cancel(cancel),
-    )
+    )?;
+    let v2 = MkdirLock::acquire(
+        &MkdirLockSpec::new(
+            paths.storage_write_lock_v2.clone(),
+            STORAGE_WRITE_STALE,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .with_cancel(cancel),
+    )?;
+    Ok(CcStorageWrite { v2, v1 })
 }
 
 #[cfg(test)]
@@ -252,6 +314,92 @@ mod tests {
         );
     }
 
+    /// A config lock `proper-lockfile` left behind after a short command: fresh, with an mtime
+    /// 1 s ahead of now (Appendix A.7), the most it can lie.
+    fn left_behind(p: &CcPaths) {
+        fs::create_dir(&p.config_lock).unwrap();
+        fs::File::open(&p.config_lock)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(1))
+            .unwrap();
+    }
+
+    /// The timing tests shorten the staleness to 1 s, keeping the 1 s future mtime: the lock
+    /// goes stale 2 s after it is made. The waits poll every 250-500 ms, which the real 10 s
+    /// and 12 s dwarf, so the budget that must outlast it carries 4 s of margin here.
+    const SHORT_STALE: Duration = Duration::from_secs(1);
+    const OUTLASTING: Duration = Duration::from_secs(6);
+
+    #[test]
+    fn the_config_lock_has_its_own_twelve_second_budget() {
+        assert_eq!(CONFIG_ACQUIRE_TIMEOUT, Duration::from_secs(12));
+        assert_eq!(ACQUIRE_TIMEOUT, Duration::from_secs(9));
+        // The staleness, the 1 s a lock left behind can lie ahead, and a poll of up to 500 ms.
+        assert!(
+            CONFIG_ACQUIRE_TIMEOUT >= CONFIG_STALE + Duration::from_millis(1_500),
+            "the budget must outlast a lock left behind"
+        );
+        assert!(ACQUIRE_TIMEOUT < CONFIG_STALE + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_lock_left_behind_with_a_future_mtime_outlasts_a_budget_shorter_than_its_staleness() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        left_behind(&p);
+        let budget = Duration::from_secs(1); // stale only 2 s after it was made
+        let start = Instant::now();
+        assert!(matches!(
+            acquire_config_stale(&p, SHORT_STALE, budget, &Cancel::new()),
+            Err(LockError::Timeout(_))
+        ));
+        assert!(start.elapsed() >= budget);
+    }
+
+    #[test]
+    fn a_lock_left_behind_with_a_future_mtime_is_acquired_once_stale_within_a_long_enough_budget() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        left_behind(&p);
+        let start = Instant::now();
+        let set = acquire_config_stale(&p, SHORT_STALE, OUTLASTING, &Cancel::new()).unwrap();
+        let waited = start.elapsed();
+        assert!(set.check_owned().is_ok());
+        assert!(
+            waited >= Duration::from_millis(1_900),
+            "acquired after {waited:?}, before it went stale"
+        );
+    }
+
+    #[test]
+    fn the_pre_wait_outlasts_a_lock_left_behind_and_takes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        left_behind(&p);
+        let start = Instant::now();
+        wait_config_idle_stale(&p, SHORT_STALE, OUTLASTING, &Cancel::new()).unwrap();
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(1_900),
+            "idle after {waited:?}, before it went stale"
+        );
+        assert!(p.config_lock.is_dir(), "the pre-wait takes nothing over");
+    }
+
+    #[test]
+    fn the_pre_wait_returns_at_once_without_a_lock_and_is_a_cancellation_point() {
+        let d = tempfile::tempdir().unwrap();
+        let p = paths(d.path());
+        let start = Instant::now();
+        wait_config_idle(&p, CONFIG_ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        fs::create_dir(&p.config_lock).unwrap(); // fresh
+        let cancel = Cancel::new();
+        cancel.request(libc::SIGINT);
+        let err = wait_config_idle(&p, CONFIG_ACQUIRE_TIMEOUT, &cancel).unwrap_err();
+        assert_eq!(err.signal(), Some(libc::SIGINT));
+    }
+
     /// Sets `cancel` to SIGINT from another thread 200 ms from now, as the CLI's handler would
     /// (§14.1), and returns the instant just before it did.
     fn interrupt_soon(cancel: &Cancel) -> thread::JoinHandle<Instant> {
@@ -343,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn the_storage_write_lock_is_taken_alone_and_released_on_drop() {
+    fn the_storage_write_lock_is_the_pair_taken_alone_and_released_on_drop() {
         // §9.1: a leaf, anchored at the secure-storage dir; taking it takes no other lock.
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
@@ -351,54 +499,109 @@ mod tests {
             p.storage_write_lock,
             p.secure_storage_dir.join(".storage-write")
         );
+        assert_eq!(
+            p.storage_write_lock_v2,
+            p.secure_storage_dir.join(".storage-write.lock")
+        );
         let lock = acquire_storage_write(&p, ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
-        assert!(p.storage_write_lock.is_dir());
+        assert!(p.storage_write_lock.is_dir() && p.storage_write_lock_v2.is_dir());
         assert!(lock.check_owned().is_ok());
         assert!(!p.refresh_lock.exists() && !p.legacy_lock().exists() && !p.config_lock.exists());
         drop(lock);
-        assert!(!p.storage_write_lock.exists(), "Drop removes it");
+        assert!(
+            !p.storage_write_lock.exists() && !p.storage_write_lock_v2.exists(),
+            "Drop removes both"
+        );
     }
 
     #[test]
-    fn a_held_storage_write_lock_times_out_without_touching_it() {
+    fn the_storage_write_pair_is_taken_in_order_and_released_in_reverse() {
+        // `.storage-write` first, `.storage-write.lock` second; a lock held on the second
+        // leaves the first taken only while the wait lasts, and released on the timeout.
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
-        fs::create_dir(&p.storage_write_lock).unwrap(); // CC holds it, freshly
-        let start = Instant::now();
-        match acquire_storage_write(&p, Duration::from_millis(500), &Cancel::new()) {
-            Err(LockError::Timeout(path)) => assert_eq!(path, p.storage_write_lock),
-            other => panic!("expected a timeout, got {:?}", other.err()),
+        fs::create_dir(&p.storage_write_lock_v2).unwrap(); // CC 2.1.292 holds its spelling
+        let seen = std::sync::Mutex::new(Vec::new());
+        thread::scope(|s| {
+            s.spawn(|| {
+                let end = Instant::now() + Duration::from_millis(400);
+                while Instant::now() < end {
+                    seen.lock().unwrap().push(p.storage_write_lock.is_dir());
+                    thread::sleep(Duration::from_millis(20));
+                }
+            });
+            match acquire_storage_write(&p, Duration::from_millis(500), &Cancel::new()) {
+                Err(LockError::Timeout(path)) => assert_eq!(path, p.storage_write_lock_v2),
+                other => panic!("expected a timeout on the second, got {:?}", other.err()),
+            }
+        });
+        assert!(
+            seen.lock().unwrap().iter().any(|held| *held),
+            "the first is taken before the second is waited for"
+        );
+        assert!(
+            !p.storage_write_lock.exists(),
+            "a timeout on the second releases the first"
+        );
+        assert!(p.storage_write_lock_v2.is_dir(), "CC's lock is left alone");
+    }
+
+    #[test]
+    fn a_held_storage_write_lock_of_either_spelling_times_out_without_touching_it() {
+        for first in [true, false] {
+            let d = tempfile::tempdir().unwrap();
+            let p = paths(d.path());
+            let (cc, ours) = if first {
+                (&p.storage_write_lock, &p.storage_write_lock_v2)
+            } else {
+                (&p.storage_write_lock_v2, &p.storage_write_lock)
+            };
+            fs::create_dir(cc).unwrap(); // CC holds it, freshly
+            let start = Instant::now();
+            match acquire_storage_write(&p, Duration::from_millis(500), &Cancel::new()) {
+                Err(LockError::Timeout(path)) => assert_eq!(&path, cc),
+                res => panic!("expected a timeout, got {:?}", res.err()),
+            }
+            assert!(start.elapsed() >= Duration::from_millis(500));
+            assert!(cc.is_dir(), "CC's lock is left alone");
+            assert!(!ours.exists(), "nothing of tagteam's is left behind");
         }
-        assert!(start.elapsed() >= Duration::from_millis(500));
-        assert!(p.storage_write_lock.is_dir(), "CC's lock is left alone");
     }
 
     #[test]
     fn a_storage_write_lock_is_stale_after_15_s() {
-        // Appendix A.1: `proper-lockfile` with stale 15 s, as CC takes it.
-        let d = tempfile::tempdir().unwrap();
-        let p = paths(d.path());
-        fs::create_dir(&p.storage_write_lock).unwrap();
-        let aged = |secs| {
-            fs::File::open(&p.storage_write_lock)
-                .unwrap()
-                .set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
-                .unwrap()
-        };
-        aged(13);
-        assert!(matches!(
-            acquire_storage_write(&p, Duration::from_millis(300), &Cancel::new()),
-            Err(LockError::Timeout(_))
-        ));
-        aged(16);
-        let lock = acquire_storage_write(&p, Duration::from_millis(300), &Cancel::new()).unwrap();
-        assert!(lock.check_owned().is_ok(), "the stale lock is taken over");
+        // Appendix A.1: `proper-lockfile` with stale 15 s, as CC takes it, either spelling.
+        for second in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let p = paths(d.path());
+            let dir = if second {
+                &p.storage_write_lock_v2
+            } else {
+                &p.storage_write_lock
+            };
+            fs::create_dir(dir).unwrap();
+            let aged = |secs| {
+                fs::File::open(dir)
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
+                    .unwrap()
+            };
+            aged(13);
+            assert!(matches!(
+                acquire_storage_write(&p, Duration::from_millis(300), &Cancel::new()),
+                Err(LockError::Timeout(_))
+            ));
+            aged(16);
+            let lock =
+                acquire_storage_write(&p, Duration::from_millis(300), &Cancel::new()).unwrap();
+            assert!(lock.check_owned().is_ok(), "the stale lock is taken over");
+        }
     }
 
     #[test]
     fn a_signal_ends_the_storage_write_wait_and_a_set_token_takes_nothing() {
-        // §9.1: its wait is a cancellation point (§14.1); a set token makes no attempt
-        // (Decision 3).
+        // §9.1: its wait is a cancellation point on either lock (§14.1); a set token makes no
+        // attempt (Decision 3).
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
         let cancel = Cancel::new();
@@ -412,10 +615,22 @@ mod tests {
             }
             other => panic!("expected an interrupted wait, got {:?}", other.err()),
         }
-        assert!(!p.storage_write_lock.exists(), "no attempt was made");
+        assert!(
+            !p.storage_write_lock.exists() && !p.storage_write_lock_v2.exists(),
+            "no attempt was made"
+        );
         fs::create_dir(&p.storage_write_lock).unwrap(); // CC holds it, freshly
         let named = interrupted(|c| acquire_storage_write(&p, Duration::from_secs(30), c));
         assert_eq!(named, p.storage_write_lock);
         assert!(p.storage_write_lock.is_dir(), "CC's lock is left alone");
+        fs::remove_dir(&p.storage_write_lock).unwrap();
+        fs::create_dir(&p.storage_write_lock_v2).unwrap(); // CC 2.1.292 holds its spelling
+        let named = interrupted(|c| acquire_storage_write(&p, Duration::from_secs(30), c));
+        assert_eq!(named, p.storage_write_lock_v2);
+        assert!(p.storage_write_lock_v2.is_dir(), "CC's lock is left alone");
+        assert!(
+            !p.storage_write_lock.exists(),
+            "an interruption on the second releases the first"
+        );
     }
 }

@@ -11,6 +11,7 @@ pub mod poll;
 pub mod provenance;
 pub mod rank;
 pub mod rotation;
+pub mod time;
 pub mod trust;
 pub mod usage;
 pub mod validate;

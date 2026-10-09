@@ -106,6 +106,43 @@ pub fn probe_lock(path: &Path) -> io::Result<LockProbe> {
     }
 }
 
+/// The processes that hold `path` open, where the OS can tell (§13.6: a reservation's holders):
+/// on Linux, each process whose `/proc/<pid>/fd` this user may read and that holds `path`'s
+/// file, by device and inode; elsewhere `None`. It opens nothing it lists.
+#[cfg(target_os = "linux")]
+pub fn holders_of(path: &Path) -> Option<Vec<u32>> {
+    use std::os::unix::fs::MetadataExt;
+    let target = std::fs::metadata(path).ok()?;
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").ok()?.filter_map(Result::ok) {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        let holds = fds.filter_map(Result::ok).any(|fd| {
+            std::fs::metadata(fd.path())
+                .is_ok_and(|m| m.dev() == target.dev() && m.ino() == target.ino())
+        });
+        if holds {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+    Some(pids)
+}
+
+/// macOS cannot list a file's holders without `lsof`'s privileges, so it never tells.
+#[cfg(not(target_os = "linux"))]
+pub fn holders_of(_path: &Path) -> Option<Vec<u32>> {
+    None
+}
+
 /// tagteam's mutation lock (§9.1). Provider live locks can only be taken from one.
 #[derive(Debug)]
 pub struct MutationGuard {
@@ -212,6 +249,21 @@ mod tests {
             LockProbe::Held,
             "a launcher's exclusive lock still shows"
         );
+        drop(held);
+    }
+
+    #[test]
+    fn the_holders_of_a_file_are_listed_where_the_os_can_tell() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("42.lock");
+        let held = FlockGuard::try_lock(&p).unwrap().unwrap();
+        match holders_of(&p) {
+            Some(pids) => {
+                assert!(cfg!(target_os = "linux"));
+                assert!(pids.contains(&std::process::id()), "{pids:?}");
+            }
+            None => assert!(!cfg!(target_os = "linux")),
+        }
         drop(held);
     }
 
