@@ -41,7 +41,7 @@ const MIGRATIONS: [&str; 2] = [SCHEMA_V1, MIGRATION_V2];
 
 /// The `PRAGMA user_version` this build knows how to read and write. A stored version above
 /// this is a store written by a newer tagteam; `migrate` refuses it rather than guessing.
-const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
 
@@ -264,6 +264,16 @@ pub struct Store {
 const ACCOUNT_COLUMNS: &str = "id, provider, position, identity_key, label, email, org_uuid, org_name, \
     account_uuid, kind, alias, disabled, identity_json, login_expires_at, login_epoch, replacing_fp, \
     quarantine_reason, quarantine_fp, quarantine_at, added_at";
+
+/// Whether recorded replacement metadata is what `finish_replacement` can install (§12.5): a
+/// JSON object whose `identity_key`, `label` and `kind` are strings.
+pub fn replacing_meta_parses(meta: &str) -> bool {
+    serde_json::from_str::<Value>(meta).is_ok_and(|v| {
+        ["identity_key", "label", "kind"]
+            .iter()
+            .all(|k| v[*k].is_string())
+    })
+}
 
 /// Installs a login's identity fields: shared by `update_login` and the replacement
 /// `finish_replacement` records, which land the same fields. It never clears a quarantine:
@@ -559,6 +569,22 @@ fn is_cannot_open(e: &StoreError) -> bool {
     matches!(e, StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _)) if f.code == ErrorCode::CannotOpen)
 }
 
+/// `path` as a URI filename (sqlite.org/uri.html): every byte but an unreserved one or `/` is
+/// percent-encoded, so a `?`, `#` or `%` in a directory name stays part of the path.
+fn uri_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|&b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// Creates the database file with mode 0600 before SQLite first opens it (§6.1): it names
 /// every account. SQLite gives its `-wal` and `-shm` files the database's own mode. A file
 /// that already exists is left exactly as it is; an empty one is a valid empty database.
@@ -618,6 +644,54 @@ impl Store {
         };
         store.migrate()?;
         Ok(Some(store))
+    }
+
+    /// §13.6, Decision 3: the store as `doctor` reads it, never written, migrated or created.
+    /// `None` when there is no database file. A read-only open of a WAL database whose `-shm`
+    /// file is absent would create the `-shm` and `-wal` files, so without one it opens
+    /// `immutable`: no process has the store open, so no WAL is left to read. With one, it opens
+    /// `mode=ro` and reads the writers' WAL through it. It writes no page, though, like every
+    /// reader, it records its read mark in the `-shm` index. A schema of any version opens;
+    /// `schema_version` says which.
+    pub fn open_read_only(path: &Path) -> Result<Option<Self>, StoreError> {
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+        let mut shm = path.as_os_str().to_owned();
+        shm.push("-shm");
+        let params = if Path::new(&shm).try_exists()? {
+            "mode=ro"
+        } else {
+            "mode=ro&immutable=1"
+        };
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn =
+            match Connection::open_with_flags(format!("file:{}?{params}", uri_path(path)), flags) {
+                Ok(conn) => conn,
+                Err(e) => {
+                    let e = StoreError::from(e);
+                    if is_cannot_open(&e) && !path.try_exists()? {
+                        return Ok(None);
+                    }
+                    return Err(e);
+                }
+            };
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        Ok(Some(Self {
+            conn: Mutex::new(conn),
+        }))
+    }
+
+    /// `PRAGMA quick_check`'s rows: exactly `["ok"]` for a sound file (§13.6).
+    pub fn quick_check(&self) -> Result<Vec<String>, StoreError> {
+        let c = self.lock();
+        let mut stmt = c.prepare("PRAGMA quick_check")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -953,6 +1027,20 @@ impl Store {
             log_event(e);
         }
         Ok(())
+    }
+
+    /// The replacement metadata recorded with `id`'s marker (§12.5), as stored; `None` when
+    /// there is none. A read, nothing more: `doctor` tests it without reconciling anything.
+    pub fn replacing_meta(&self, id: &AccountId) -> Result<Option<String>, StoreError> {
+        let meta: Option<Option<String>> = self
+            .lock()
+            .query_row(
+                "SELECT replacing_meta FROM accounts WHERE id = ?1",
+                [id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(meta.flatten())
     }
 
     pub fn rollback_replacement(&self, id: &AccountId) -> Result<(), StoreError> {

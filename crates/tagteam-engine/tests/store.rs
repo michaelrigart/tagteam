@@ -1340,3 +1340,126 @@ fn a_provider_s_rows_go_and_its_usage_budget_stays() {
         "accounts are not its to delete"
     );
 }
+
+// ---- M5b Task 9: doctor's read-only store (Decision 3) ----
+
+/// The names in `dir`, sorted.
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_read_only_open_of_a_store_nobody_holds_creates_nothing_and_writes_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    assert!(Store::open_read_only(&path).unwrap().is_none());
+    assert!(
+        names_in(d.path()).is_empty(),
+        "a missing store is not created"
+    );
+    {
+        let s = Store::open(&path).unwrap();
+        add(&s, &cc(), "a", "a@x.co", 1);
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let ro = Store::open_read_only(&path).unwrap().unwrap();
+    assert_eq!(
+        ro.account(&AccountId::from_string("a"))
+            .unwrap()
+            .unwrap()
+            .position,
+        1
+    );
+    assert_eq!(ro.quick_check().unwrap(), ["ok"]);
+    assert!(
+        ro.set_alias(&AccountId::from_string("a"), Some("x"))
+            .is_err()
+    );
+    drop(ro);
+    assert_eq!(names_in(d.path()), ["t.db"], "no -wal or -shm appears");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn a_read_only_open_beside_a_writer_reads_what_it_committed_and_never_migrates() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("dir with ? and #/t.db");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let writer = Store::open(&path).unwrap();
+    add(&writer, &cc(), "a", "a@x.co", 1);
+    let ro = Store::open_read_only(&path).unwrap().unwrap();
+    assert_eq!(ro.all_accounts().unwrap().len(), 1, "the WAL is read");
+    drop(ro);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 1)
+        .unwrap();
+    drop(writer);
+    let ro = Store::open_read_only(&path).unwrap().unwrap();
+    assert_eq!(
+        ro.schema_version().unwrap(),
+        1,
+        "an older store is not migrated"
+    );
+}
+
+#[test]
+fn recorded_replacement_metadata_parses_only_as_finish_replacement_installs_it() {
+    let meta = json!({"identity_key": "a@x.co\n", "label": "a@x.co", "kind": "oauth"});
+    assert!(tagteam_engine::store::replacing_meta_parses(
+        &meta.to_string()
+    ));
+    for bad in [
+        "not json".to_owned(),
+        "[]".to_owned(),
+        json!({"identity_key": "k", "label": "l"}).to_string(),
+        json!({"identity_key": "k", "label": 1, "kind": "oauth"}).to_string(),
+    ] {
+        assert!(!tagteam_engine::store::replacing_meta_parses(&bad), "{bad}");
+    }
+    let d = tempfile::tempdir().unwrap();
+    let s = Store::open(&d.path().join("t.db")).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    assert_eq!(s.replacing_meta(&a).unwrap(), None);
+    s.begin_replacement(
+        &a,
+        "sha256:x",
+        &login_meta(&identity("a@x.co"), false),
+        false,
+    )
+    .unwrap();
+    assert!(tagteam_engine::store::replacing_meta_parses(
+        &s.replacing_meta(&a).unwrap().unwrap()
+    ));
+}
+
+#[test]
+fn usage_requests_are_counted_per_identity_after_a_time_without_pruning() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let c = rusqlite::Connection::open(&path).unwrap();
+    for (key, at) in [("a\n", 100), ("a\n", 200), ("a\n", 300), ("b\n", 300)] {
+        c.execute(
+            "INSERT INTO usage_requests (provider, identity_key, at) VALUES ('claude-code', ?1, ?2)",
+            rusqlite::params![key, at],
+        )
+        .unwrap();
+    }
+    assert_eq!(s.usage_request_count(&cc(), "a\n", 100).unwrap(), 2);
+    assert_eq!(s.usage_request_count(&cc(), "a\n", 0).unwrap(), 3);
+    assert_eq!(
+        s.usage_request_count(&ProviderId::new("other"), "a\n", 0)
+            .unwrap(),
+        0
+    );
+    let left: i64 = c
+        .query_row("SELECT COUNT(*) FROM usage_requests", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 4, "nothing is pruned");
+}
