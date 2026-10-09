@@ -251,13 +251,18 @@ fn settle_token(
     done: Result<&'static str, HarnessError>,
     restored: Result<Option<Restore>, HarnessError>,
 ) -> Result<&'static str, HarnessError> {
-    let note = |p: &mut Probe, restored: &Option<Restore>| match restored {
+    let note = |p: &mut Probe, restored: &Option<Restore>| {
+        match restored {
         None => p.note(
-            "the live token: nothing to restore, since no expiry with life to spare was replaced",
+            "the live token: nothing to restore, since the check expired nothing",
             json!(null),
         ),
         Some(Restore::Restored) => p.note(
             "the live token was still expired; its expiry before the check is put back",
+            json!(null),
+        ),
+        Some(Restore::RestoredShort) => p.note(
+            "the live token was still expired; its expiry before the check had little life left, and is put back: the checks after may need a refresh",
             json!(null),
         ),
         Some(Restore::Fresh) => {}
@@ -265,6 +270,7 @@ fn settle_token(
             "the live token is another generation than the one the check expired; left as it is",
             json!(null),
         ),
+    }
     };
     match (done, restored) {
         (Ok(summary), Ok(restored)) => {
@@ -303,11 +309,16 @@ impl<'a> LiveToken<'a> {
         }
     }
 
-    /// `Ctx::expire` of the live home, remembering what it replaced when that had life to spare.
+    /// `Ctx::expire` of the live home, remembering what it replaced whatever life that had
+    /// left. A later call replaces it only when the token has been refreshed since (it had life
+    /// to spare), never with the artificial expiry the first call wrote.
     fn expire(&self) -> Result<Value, HarnessError> {
         let (note, prior) = self.ctx.expire_noting(&self.live)?;
-        if let Some(prior) = prior.filter(|p| p.expires_at - now_ms() >= MIN_LIFE_MS) {
-            *self.prior.borrow_mut() = Some(prior);
+        if let Some(prior) = prior {
+            let mut kept = self.prior.borrow_mut();
+            if kept.is_none() || prior.expires_at - now_ms() >= MIN_LIFE_MS {
+                *kept = Some(prior);
+            }
         }
         Ok(note)
     }
@@ -968,16 +979,19 @@ esac"#;
     }
 
     #[test]
-    fn a_token_with_no_life_to_begin_with_is_noted_as_nothing_to_restore() {
+    fn a_token_with_little_life_is_put_back_too_after_an_error_and_the_note_says_so() {
         let _serial = crate::compat::sys::serial();
         let (mut ctx, scratch) = ctx_with_claude("exit 0");
         let live = ctx.live();
         let file = Path::new(&live).join(".credentials.json");
-        // The token has little life left, so expiring it records nothing to restore; the
-        // harness error is the run's own (no vault).
+        // Less than MIN_LIFE_MS left: the check still expires it, meets its error (no vault)
+        // and must not leave the artificial expiry behind.
+        let was = now_ms() + 2 * 60_000;
         fs::write(
             &file,
-            r#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt","expiresAt":1}}"#,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"rt","expiresAt":{was}}}}}"#
+            ),
         )
         .unwrap();
         ctx.layout.state = scratch.join("state");
@@ -992,10 +1006,50 @@ esac"#;
         let out = refresh_lock_interop(&mut ctx).unwrap();
         assert_eq!(out.status, Status::Error);
         assert_eq!(
-            label(&out, "the live token: nothing to restore").ok,
-            None,
-            "said so, since no expiry with life to spare was replaced"
+            crate::compat::ctx::expires_at(&fs::read(&file).unwrap()),
+            Some(was),
+            "put back, not left expired"
         );
+        assert_eq!(
+            label(&out, "its expiry before the check had little life left").ok,
+            None
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_second_expiry_keeps_the_first_unless_the_token_was_refreshed_between() {
+        let _serial = crate::compat::sys::serial();
+        let (ctx, scratch) = ctx_with_claude("exit 0");
+        let live = ctx.live();
+        let file = Path::new(&live).join(".credentials.json");
+        let write = |expires: i64| {
+            fs::write(
+                &file,
+                format!(
+                    r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"rt","expiresAt":{expires}}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let read = || crate::compat::ctx::expires_at(&fs::read(&file).unwrap()).unwrap();
+        let first = now_ms() + 2 * 60_000;
+        write(first);
+        let token = LiveToken::new(&ctx);
+        token.expire().unwrap();
+        // Nothing refreshed it: expiring the artificial expiry again must not become "the" prior.
+        token.expire().unwrap();
+        assert_eq!(token.restore(), Ok(Some(Restore::RestoredShort)));
+        assert_eq!(read(), first);
+
+        // Refreshed in between (life to spare): the refreshed expiry is the one to keep.
+        write(first);
+        token.expire().unwrap();
+        let refreshed = now_ms() + 8 * 3_600_000;
+        write(refreshed);
+        token.expire().unwrap();
+        assert_eq!(token.restore(), Ok(Some(Restore::Restored)));
+        assert_eq!(read(), refreshed);
         fs::remove_dir_all(&scratch).unwrap();
     }
 

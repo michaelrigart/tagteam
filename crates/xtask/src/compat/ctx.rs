@@ -95,6 +95,9 @@ pub struct Prior {
 pub enum Restore {
     /// The expired token got its earlier expiry back.
     Restored,
+    /// The same, but that expiry has less than `MIN_LIFE_MS` left: the checks after may need a
+    /// refresh. Restored all the same, since leaving the artificial expiry is worse.
+    RestoredShort,
     /// The token had life to spare already; nothing written.
     Fresh,
     /// The token is another generation than the one expired; nothing written.
@@ -545,13 +548,13 @@ impl Ctx {
         ))
     }
 
-    /// Leaves the home's access token fresh after `expire` replaced `prior`. A token with life
-    /// to spare already (CC's or tagteam's refresh) is left alone (`Fresh`). One of another
+    /// Leaves the home's access token as it was before `expire` replaced `prior`. A token with
+    /// life to spare already (CC's or tagteam's refresh) is left alone (`Fresh`). One of another
     /// generation than the one expired is left as it is too (`Changed`): it is not the token
     /// that was expired, and its expiry is not this check's to set. The expired token itself
     /// gets its `expiresAt` back, its tokens untouched (`Restored`; the server never expired
-    /// it). An error when that expiry has too little life left, since the next check could not
-    /// send a message without a refresh. Only while nothing runs in the home.
+    /// it), whatever life that has left: when it is under `MIN_LIFE_MS` the result says so
+    /// (`RestoredShort`) and the caller records it. Only while nothing runs in the home.
     pub fn unexpire(&self, spelling: &str, prior: &Prior) -> Result<Restore, HarnessError> {
         self.assert_quiescent(spelling)?;
         let (bytes, place) = self
@@ -565,20 +568,17 @@ impl Ctx {
         }
         let mut v: Value = serde_json::from_slice(&bytes)
             .map_err(|_| harness(format!("{spelling}'s credential is not JSON")))?;
-        let left = prior.expires_at - now_ms();
-        if left < MIN_LIFE_MS {
-            return Err(harness(format!(
-                "the live token is expired, and the expiry it had before the check has {} s left: it needs a refresh",
-                left / 1000
-            )));
-        }
         v["claudeAiOauth"]["expiresAt"] = json!(prior.expires_at);
         self.write_credential(
             spelling,
             &place,
             &serde_json::to_vec(&v).expect("a Value serializes"),
         )?;
-        Ok(Restore::Restored)
+        Ok(if prior.expires_at - now_ms() >= MIN_LIFE_MS {
+            Restore::Restored
+        } else {
+            Restore::RestoredShort
+        })
     }
 
     /// The account's vault entry: the compat keychain file on macOS, the vault file on Linux.
@@ -855,15 +855,15 @@ mod tests {
         assert_eq!(ctx.unexpire(&home, &prior), Ok(Restore::Changed));
         assert_eq!(read(), lapsed, "nothing written");
 
-        // Expired, the same generation, and what it had before is no better: an error.
+        // Expired, the same generation, and what it had before had little life left: still put
+        // back (the artificial expiry is worse), and said so.
         write("rt", lapsed);
-        let weak = Prior {
-            expires_at: now_ms() + 1000,
+        let short = Prior {
+            expires_at: now_ms() + 60_000,
             ..prior
         };
-        let e = ctx.unexpire(&home, &weak).unwrap_err().0;
-        assert!(e.contains("needs a refresh"), "{e}");
-        assert_eq!(read(), lapsed);
+        assert_eq!(ctx.unexpire(&home, &short), Ok(Restore::RestoredShort));
+        assert_eq!(read(), short.expires_at);
         fs::remove_dir_all(&scratch).unwrap();
     }
 
