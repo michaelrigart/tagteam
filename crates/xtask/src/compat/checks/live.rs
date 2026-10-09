@@ -19,8 +19,8 @@ use super::profile::read_name;
 use super::{keys, new_record, records};
 use crate::compat::capture::{Capture, Sent};
 use crate::compat::ctx::{
-    ALIAS_API_KEY, ALIAS_OAUTH, ALIAS_SETUP_TOKEN, Ctx, MIN_LIFE_MS, MODEL, PROMPT, Prior, Restore,
-    dummy_key, generation, life_to_spare, now_ms,
+    ALIAS_API_KEY, ALIAS_OAUTH, ALIAS_SETUP_TOKEN, Ctx, MODEL, PROMPT, Prior, Restore, dummy_key,
+    generation, life_to_spare, now_ms,
 };
 use crate::compat::report::{Outcome, Probe, fingerprint};
 use crate::compat::store;
@@ -309,14 +309,19 @@ impl<'a> LiveToken<'a> {
         }
     }
 
-    /// `Ctx::expire` of the live home, remembering what it replaced whatever life that had
-    /// left. A later call replaces it only when the token has been refreshed since (it had life
-    /// to spare), never with the artificial expiry the first call wrote.
+    /// `Ctx::expire` of the live home, remembering the generation it expired and that token's
+    /// original expiry. A call replaces an earlier record whenever the generation differs: the
+    /// earlier one is no longer live and cannot be restored, however much life either had. The
+    /// same generation again is the artificial expiry the earlier call wrote, so the earlier
+    /// record, which holds the original, stays.
     fn expire(&self) -> Result<Value, HarnessError> {
         let (note, prior) = self.ctx.expire_noting(&self.live)?;
         if let Some(prior) = prior {
             let mut kept = self.prior.borrow_mut();
-            if kept.is_none() || prior.expires_at - now_ms() >= MIN_LIFE_MS {
+            if kept
+                .as_ref()
+                .is_none_or(|k| k.generation != prior.generation)
+            {
                 *kept = Some(prior);
             }
         }
@@ -1018,38 +1023,50 @@ esac"#;
     }
 
     #[test]
-    fn a_second_expiry_keeps_the_first_unless_the_token_was_refreshed_between() {
+    fn a_second_expiry_of_the_same_generation_keeps_the_first_record_and_of_another_replaces_it() {
         let _serial = crate::compat::sys::serial();
         let (ctx, scratch) = ctx_with_claude("exit 0");
         let live = ctx.live();
         let file = Path::new(&live).join(".credentials.json");
-        let write = |expires: i64| {
+        let write = |refresh: &str, expires: i64| {
             fs::write(
                 &file,
                 format!(
-                    r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"rt","expiresAt":{expires}}}}}"#
+                    r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"{refresh}","expiresAt":{expires}}}}}"#
                 ),
             )
             .unwrap();
         };
         let read = || crate::compat::ctx::expires_at(&fs::read(&file).unwrap()).unwrap();
+
+        // Nothing refreshed it between: the second call saw the artificial expiry.
         let first = now_ms() + 2 * 60_000;
-        write(first);
+        write("rtA", first);
         let token = LiveToken::new(&ctx);
         token.expire().unwrap();
-        // Nothing refreshed it: expiring the artificial expiry again must not become "the" prior.
         token.expire().unwrap();
         assert_eq!(token.restore(), Ok(Some(Restore::RestoredShort)));
         assert_eq!(read(), first);
 
-        // Refreshed in between (life to spare): the refreshed expiry is the one to keep.
-        write(first);
+        // Generation A replaced by B between the two calls, B with life to spare.
+        write("rtA", first);
         token.expire().unwrap();
         let refreshed = now_ms() + 8 * 3_600_000;
-        write(refreshed);
+        write("rtB", refreshed);
         token.expire().unwrap();
         assert_eq!(token.restore(), Ok(Some(Restore::Restored)));
         assert_eq!(read(), refreshed);
+
+        // The same with B short of life: the record must still follow B, or the restore sees a
+        // generation mismatch and leaves B expired.
+        write("rtA", first);
+        token.expire().unwrap();
+        let short = now_ms() + 3 * 60_000;
+        write("rtB", short);
+        token.expire().unwrap();
+        assert!(read() < now_ms(), "B is artificially expired");
+        assert_eq!(token.restore(), Ok(Some(Restore::RestoredShort)));
+        assert_eq!(read(), short, "B is put back, not left expired");
         fs::remove_dir_all(&scratch).unwrap();
     }
 
