@@ -212,10 +212,10 @@ impl Engine {
             Read::Present(m) if own(&m) => match p.apply_outer_home(&self.env, &m.outer) {
                 Ok(env) => Some(env),
                 Err(_) => {
-                    // §14: the profile is judged by tagteam's own environment instead. The
-                    // error is not logged (§14.2): a `ProviderError`'s text can name a path.
+                    // §14: the profile is judged by tagteam's own environment instead. A fixed
+                    // phrase and no account (§14.2): the error's text can name a path, and
+                    // purge's orphan path passes `|_| true`, so the marker's ID is a free string.
                     tracing::warn!(
-                        account = %m.account_id,
                         "the outer home a profile's marker records could not be applied; the profile is \
                          judged by tagteam's own environment"
                     );

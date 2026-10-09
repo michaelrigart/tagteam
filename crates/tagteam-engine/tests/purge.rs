@@ -1226,6 +1226,50 @@ fn a_copy_of_an_account_s_profile_never_deletes_the_account_s_item() {
 }
 
 #[test]
+fn a_stored_profile_that_cannot_be_resolved_leaves_every_orphan_as_it_is() {
+    // Task 14 fix round 1: `stored_spellings` guards an orphan that leads to a stored
+    // account's profile. A profile it cannot resolve for any cause but "not there" would drop
+    // that account's spelling and open the guard, so the orphan is left instead (fails closed).
+    let ffx = FakeFx::new();
+    let fx = &ffx.fx;
+    fx.add("a@x.co", "rt-a");
+    let gone = orphan(fx, "0192-gone");
+    let gone_item = fx.profile_item(&gone);
+    fx.kc.put(&gone_item.0, &gone_item.1, b"{}");
+    // A stored FakeAgent account, which a Claude Code purge leaves alone, whose profile is a
+    // link to itself: canonicalizing it fails with ELOOP.
+    let stored = AccountId::from_string("0192-fake");
+    add(
+        &ffx.engine.store().unwrap(),
+        &ffx.fake_provider(),
+        stored.as_str(),
+        "f@x.co",
+        2,
+    );
+    let profile = fx.profile_dir(&stored);
+    fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&profile, &profile).unwrap();
+    let plan = ffx.engine.purge_plan(Some(&fx.provider())).unwrap();
+    assert_eq!(plan.orphan_profiles, [gone.clone()]);
+    let report = ffx.engine.purge(&plan).unwrap();
+    assert!(gone.exists(), "the orphan is left as it is");
+    assert!(
+        fx.kc.get(&gone_item.0, &gone_item.1).is_some(),
+        "no Keychain item was deleted"
+    );
+    let failure = report
+        .failures
+        .iter()
+        .find(|(what, _)| what == &gone.display().to_string())
+        .unwrap_or_else(|| panic!("{:?}", report.failures));
+    assert!(
+        failure.1.contains("could not be resolved") && !failure.1.contains("symbolic"),
+        "{}",
+        failure.1
+    );
+}
+
+#[test]
 fn an_orphan_naming_the_live_config_dir_never_deletes_the_live_login() {
     // Fix round 1, M4 (§10.5: purge never deletes the live login): an orphan link with no
     // marker whose canonical path is the directory `CLAUDE_CONFIG_DIR` names would be given

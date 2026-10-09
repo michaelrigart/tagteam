@@ -1227,7 +1227,8 @@ fn a_marker_whose_outer_home_cannot_be_applied_is_logged_by_a_fixed_phrase() {
         "the outer home a profile's marker records could not be applied; the profile is judged by tagteam's own environment",
     );
     assert_eq!(line.len(), 1, "{logs:#?}");
-    assert_eq!(field(line[0], "account"), Some(a.as_str()), "{}", line[0]);
+    // No account field (§14.2): purge's orphan path trusts any marker, whose ID is a free string.
+    assert_eq!(field(line[0], "account"), None, "{}", line[0]);
     assert!(!line[0].contains("outer record"), "{}", line[0]);
     none_named(&logs);
 }

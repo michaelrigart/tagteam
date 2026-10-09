@@ -706,7 +706,8 @@ impl Engine {
 
     /// The spellings that name a stored account's profile item: the one its marker records,
     /// and the canonical path of its profile as each registered provider with sessions spells
-    /// it.
+    /// it. Fails closed: a profile that cannot be resolved, for any cause but "not there",
+    /// refuses (`delete_orphan` leaves the entry), since its spelling cannot be told apart.
     fn stored_spellings(&self) -> Result<BTreeSet<String>, EngineError> {
         let mut spellings = BTreeSet::new();
         let Some(store) = self.existing_store()? else {
@@ -717,11 +718,26 @@ impl Engine {
             if let Read::Present(marker) = ProfileMarker::read(&profile) {
                 spellings.insert(marker.config_dir);
             }
-            if let Ok(canonical) = canonical_profile_path(&profile) {
-                for p in self.registry.all() {
-                    if p.capabilities().sessions {
-                        spellings.insert(p.profile_spelling(&canonical));
+            match canonical_profile_path(&profile) {
+                Ok(canonical) => {
+                    for p in self.registry.all() {
+                        if p.capabilities().sessions {
+                            spellings.insert(p.profile_spelling(&canonical));
+                        }
                     }
+                }
+                // No profile, so no item named by its path.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) => {}
+                // Any other cause drops a stored account's spelling and opens the guard:
+                // the entry is left as it is. A fixed text (§14.2): no path, no error text.
+                Err(_) => {
+                    return Err(EngineError::Io(io::Error::other(
+                        "a stored account's profile could not be resolved, so this entry cannot be told apart from it; it was left as it is",
+                    )));
                 }
             }
         }
