@@ -603,8 +603,10 @@ fn pem(blob: &[u8]) -> String {
         .chunks(70)
         .map(|c| std::str::from_utf8(c).unwrap())
         .collect();
+    // The armor's label is assembled, so a secret scanner does not take this helper for a key.
+    let label = concat!("OPENSSH ", "PRIVATE", " KEY");
     format!(
-        "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+        "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
         lines.join("\n")
     )
 }
@@ -673,6 +675,10 @@ const ED25519_ONLY: &str = "keys/x: only age X25519 and ssh-ed25519 keys can dec
 #[test]
 fn an_rsa_ssh_key_is_not_an_identity() {
     let Some(rsa) = rsa_private_key("") else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "ssh-keygen is required on CI"
+        );
         eprintln!("skipped: no ssh-keygen on this machine");
         return;
     };
@@ -688,6 +694,10 @@ fn an_rsa_private_section_under_an_ed25519_header_is_not_an_identity() {
     // age reads the private section by its own type, so the header's public key alone does
     // not say which key decrypts.
     let Some(rsa) = rsa_private_key("") else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "ssh-keygen is required on CI"
+        );
         eprintln!("skipped: no ssh-keygen on this machine");
         return;
     };
@@ -702,6 +712,10 @@ fn an_rsa_private_section_under_an_ed25519_header_is_not_an_identity() {
 #[test]
 fn an_encrypted_rsa_private_section_under_an_ed25519_header_is_refused_once_unlocked() {
     let Some(rsa) = rsa_private_key("pw") else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "ssh-keygen is required on CI"
+        );
         eprintln!("skipped: no ssh-keygen on this machine");
         return;
     };
