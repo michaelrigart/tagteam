@@ -231,7 +231,9 @@ pub fn locked_login_keychain(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     let mut p = Probe::new();
     let Some(go) = ask(
         "This locks your login keychain, asks what you saw, and then asks for your password to unlock it. Continue?",
-    ) else {
+    )
+    .decided()?
+    else {
         return Ok(Outcome::skip("needs a terminal to ask on"));
     };
     if !go {
@@ -288,11 +290,14 @@ fn observe_locked(ctx: &Ctx, p: &mut Probe, was_locked: bool) -> Result<bool, Ha
             ctx.redact.value(&json!(keychain)),
         );
     }
-    let dialog =
-        ask("Did a dialog asking for your login keychain's password appear?").unwrap_or(false);
+    let dialog = ask("Did a dialog asking for your login keychain's password appear?")
+        .decided()?
+        .unwrap_or(false);
     p.note("a dialog appeared during doctor", json!(dialog));
     if dialog {
-        let stayed = ask("Is that dialog still on screen now?").unwrap_or(false);
+        let stayed = ask("Is that dialog still on screen now?")
+            .decided()?
+            .unwrap_or(false);
         p.note("the dialog outlived security's 5 s timeout", json!(stayed));
     }
     let item = ctx.item(&ctx.live(), ItemKind::OAuth)?;
@@ -304,7 +309,9 @@ fn observe_locked(ctx: &Ctx, p: &mut Probe, was_locked: bool) -> Result<bool, Ha
         probe.is_present() && probe_seconds < 5.0,
         json!({"read": read_name(&probe), "seconds": probe_seconds}),
     );
-    let again = ask("Did a dialog appear just now, for the probe?").unwrap_or(false);
+    let again = ask("Did a dialog appear just now, for the probe?")
+        .decided()?
+        .unwrap_or(false);
     p.expect("the probe raised no dialog", !again, json!(again));
     Ok(was_locked)
 }

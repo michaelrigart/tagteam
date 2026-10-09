@@ -2923,6 +2923,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hex",
+ "libc",
  "rusqlite",
  "serde_json",
  "sha2 0.10.9",
