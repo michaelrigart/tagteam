@@ -221,6 +221,9 @@ pub fn run(args: &CompatArgs) -> u8 {
             if let Err(e) = torn {
                 report.fail(e.0);
             }
+            if scratch.as_deref().is_some_and(Path::exists) {
+                report.setup.push(kept_note(&ctx.layout.scratch));
+            }
             if args.bless && cancel().requested().is_none() {
                 bless(&workspace, &mut report);
             }
@@ -258,6 +261,57 @@ fn teardown_refusal(
         "teardown refused, since {why}: no credential was touched, and {} is kept",
         scratch.display()
     )))
+}
+
+/// The credential files under `root`, by their path relative to it, links not followed: a CC
+/// home's `.credentials.json`. Names only, never contents.
+fn credential_files(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                walk(root, &path, out);
+            } else if kind.is_file() && path.file_name().is_some_and(|n| n == ".credentials.json") {
+                out.push(
+                    path.strip_prefix(root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// What the report says about a scratch directory that is kept: whether it holds credential
+/// files (by name), and that it should be deleted once nobody needs it.
+fn kept_note(scratch: &Path) -> Evidence {
+    let files = credential_files(scratch);
+    let holds = if files.is_empty() {
+        "it holds no credential files".to_owned()
+    } else {
+        format!(
+            "it holds credential files ({}): keep them private",
+            files.join(", ")
+        )
+    };
+    note(
+        "a kept scratch directory",
+        json!(format!(
+            "{} is kept; {holds}. Delete it when you no longer need it.",
+            scratch.display()
+        )),
+    )
 }
 
 /// The last teardown step: the vault locked again, after everything else.
@@ -347,8 +401,12 @@ fn setup(
     };
     let scratch = layout.scratch.clone();
     let made = prepare(args, layout, home, &path, claude, tagteam, report);
-    if made.is_err() && !args.keep {
-        let _ = fs::remove_dir_all(&scratch);
+    if made.is_err() {
+        if args.keep {
+            report.setup.push(kept_note(&scratch));
+        } else {
+            let _ = fs::remove_dir_all(&scratch);
+        }
     }
     made
 }
@@ -608,9 +666,6 @@ fn teardown(ctx: &mut Ctx, keep: bool, report: &mut Report) -> Result<(), Harnes
             "cargo xtask compat: kept {} and the profiles; never run claude in them, since the vault holds their generation",
             ctx.layout.scratch.display()
         );
-        report
-            .setup
-            .push(note("kept", json!({"scratch": ctx.layout.scratch})));
     } else {
         // Teardown's own children too.
         quiesce()?;
@@ -830,6 +885,33 @@ mod tests {
             assert!(!written.contains("t@x.co"), "{name}: {written}");
             assert!(written.contains("2.1.286"), "{name}: {written}");
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_kept_scratch_directory_is_reported_with_its_credential_files_by_name() {
+        let dir = std::env::temp_dir().join(format!("xtask-kept-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("homes/other-identity")).unwrap();
+        fs::create_dir_all(dir.join("live")).unwrap();
+        fs::write(dir.join("live/.claude.json"), "{}").unwrap();
+        let none = kept_note(&dir).value.as_str().unwrap().to_owned();
+        assert!(
+            none.contains("holds no credential files") && none.contains("Delete it"),
+            "{none}"
+        );
+        fs::write(
+            dir.join("homes/other-identity/.credentials.json"),
+            "sk-ant-secret-body",
+        )
+        .unwrap();
+        let held = kept_note(&dir).value.as_str().unwrap().to_owned();
+        assert!(
+            held.contains("holds credential files (homes/other-identity/.credentials.json)")
+                && held.contains("Delete it")
+                && !held.contains("sk-ant"),
+            "{held}"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
