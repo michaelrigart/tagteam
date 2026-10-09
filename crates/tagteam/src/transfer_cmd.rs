@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tagteam_engine::export::ExportResult;
 use tagteam_engine::import::ImportReport;
 use tagteam_engine::store::AccountRow;
+use tagteam_provider::atomic::sync_parent;
 
 use crate::render;
 
@@ -83,17 +84,28 @@ impl ExportFile {
         fs::rename(&self.temp, &self.target)?;
         self.published = true;
         if let Some(dir) = self.target.parent().filter(|d| !d.as_os_str().is_empty()) {
-            // Best effort, as every published write's directory sync is.
-            let _ = File::open(dir).and_then(|d| d.sync_all());
+            // As every published write's (§14): silent only where the filesystem does not sync
+            // a directory, and never a failure of the export.
+            sync_parent(dir, "an export");
         }
         Ok(())
     }
 }
 
 impl Drop for ExportFile {
+    /// A temporary file that cannot be removed is left beside the destination, holding part of
+    /// an export: a contained error, logged at WARN with its cause (§14). The line names the file
+    /// by its role, never its path: the user chose the export's name, which may carry an email
+    /// or a label (§14.2). One already gone was never left.
     fn drop(&mut self) {
-        if !self.published {
-            let _ = fs::remove_file(&self.temp);
+        if self.published {
+            return;
+        }
+        match fs::remove_file(&self.temp) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => tracing::warn!(
+                "could not remove an unpublished export's temporary file, left beside the export: {e}"
+            ),
+            _ => {}
         }
     }
 }
@@ -255,6 +267,53 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         drop(ExportFile::create(&d.path().join("x")).unwrap());
         assert_eq!(fs::read_dir(d.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_unpublished_export_that_cannot_be_removed_is_logged_with_its_cause() {
+        // §14: a contained error is logged, never discarded. The temporary file is swapped for
+        // a non-empty directory of its name, which no `remove_file` deletes.
+        #[derive(Clone, Default)]
+        struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Lines {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Lines {
+            type Writer = Lines;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let d = tempfile::tempdir().unwrap();
+        // A name the user chose, which carries an email.
+        let f = ExportFile::create(&d.path().join("alice@example.com.age")).unwrap();
+        let temp = f.temp.clone();
+        fs::remove_file(&temp).unwrap();
+        fs::create_dir(&temp).unwrap();
+        fs::write(temp.join("keep"), "").unwrap();
+        let lines = Lines::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(lines.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, || drop(f));
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        let warnings: Vec<&str> = text.lines().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{text}");
+        assert!(
+            warnings[0].contains("could not remove an unpublished export's temporary file"),
+            "{}",
+            warnings[0]
+        );
+        // §14.2: its role and cause, never the path the user chose.
+        assert!(!text.contains("alice@example.com"), "{text}");
     }
 
     #[test]

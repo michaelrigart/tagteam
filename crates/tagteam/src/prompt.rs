@@ -242,8 +242,16 @@ fn line_of(mut line: Vec<u8>) -> io::Result<LineRead> {
 fn answer_of(read: io::Result<LineRead>) -> Option<String> {
     match read {
         Ok(LineRead::Line(s)) => Some(s.trim().to_owned()),
-        Ok(LineRead::End | LineRead::Interrupted) | Err(_) => None,
+        Ok(LineRead::End | LineRead::Interrupted) => None,
+        Err(e) => declined(&e),
     }
+}
+
+/// A prompt whose terminal cannot be opened, set up or read declines. The decline says nothing
+/// of why, so the cause is logged at WARN (§14); an I/O error holds no byte of the answer.
+fn declined(e: &io::Error) -> Option<String> {
+    tracing::warn!("a prompt could not use the terminal, so it counts as declined: {e}");
+    None
 }
 
 /// One line from the terminal stdin is, for `add-token -`: read as a prompt reads one, in slices
@@ -368,8 +376,12 @@ impl<'a> EchoOff<'a> {
 }
 
 impl Drop for EchoOff<'_> {
+    /// A terminal whose settings cannot be put back keeps its echo off after tagteam exits:
+    /// logged at WARN with its cause (§14). `stty sane` restores it.
     fn drop(&mut self) {
-        let _ = set_termios(self.tty, &self.saved);
+        if let Err(e) = set_termios(self.tty, &self.saved) {
+            tracing::warn!("could not turn the terminal's echo back on (`stty sane` does): {e}");
+        }
     }
 }
 
@@ -445,13 +457,17 @@ impl Prompter for TtyPrompter {
         if self.cancel.requested().is_some() {
             return None;
         }
-        let tty = open_prompt_terminal().ok()?;
+        let tty = match open_prompt_terminal() {
+            Ok(tty) => tty,
+            Err(e) => return declined(&e),
+        };
         let _ = (&tty).write_all(question.as_bytes());
         let read = read_secret(&tty, &self.cancel);
         let _ = (&tty).write_all(b"\n");
         match read {
             Ok(LineRead::Line(secret)) => Some(secret),
-            Ok(LineRead::End | LineRead::Interrupted) | Err(_) => None,
+            Ok(LineRead::End | LineRead::Interrupted) => None,
+            Err(e) => declined(&e),
         }
     }
 }
