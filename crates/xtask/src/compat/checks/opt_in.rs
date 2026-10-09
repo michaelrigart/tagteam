@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tagteam_cc::ItemKind;
 use tagteam_provider::LockState;
+use tagteam_provider::keychain::Keychain as _;
 
 use super::profile::read_name;
 use super::{ask, read_json};
 use crate::compat::ctx::Ctx;
-use crate::compat::keychain::{LOGIN_KEYCHAIN, SECURITY, login_lock_state};
+use crate::compat::keychain::{LOGIN_KEYCHAIN, SECURITY, ThrowawayKeychain, login_lock_state};
 use crate::compat::report::{Outcome, Probe};
 use crate::compat::sys::{
     HarnessError, cancel, harness, shell_quote, spawn_interactive, wait_interactive,
@@ -264,6 +265,27 @@ pub fn locked_login_keychain(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     Ok(p.finish("the lock check and the probe answered on a locked login keychain"))
 }
 
+/// The lock check (`show-keychain-info`) on a throwaway keychain file that is locked: in a GUI
+/// session it waits on a SecurityAgent unlock dialog until its 5 s timeout, which is why it runs
+/// here and not in the default `locked-file-probe` check. A note, not an expectation.
+fn lock_check_on_a_locked_file(ctx: &Ctx, p: &mut Probe) -> Result<(), HarnessError> {
+    eprintln!(
+        "cargo xtask compat: the lock check on a throwaway locked file; an unlock dialog may appear, dismiss it."
+    );
+    let kc = ThrowawayKeychain::create(&ctx.layout.scratch.join("lock-check.keychain-db"))?;
+    let cli = kc.cli();
+    cli.upsert("tagteam-compat-probe", "present", b"x")
+        .map_err(|e| harness(format!("writing the probe item: {e}")))?;
+    kc.lock()?;
+    let t = Instant::now();
+    let state = cli.lock_state();
+    p.note(
+        "the lock check on a locked throwaway file",
+        json!({"state": format!("{state:?}"), "seconds": t.elapsed().as_secs_f64()}),
+    );
+    Ok(())
+}
+
 /// `locked-login-keychain`'s observations, made while the login keychain is locked.
 fn observe_locked(ctx: &Ctx, p: &mut Probe, was_locked: bool) -> Result<bool, HarnessError> {
     p.note(
@@ -318,6 +340,7 @@ fn observe_locked(ctx: &Ctx, p: &mut Probe, was_locked: bool) -> Result<bool, Ha
         .decided()?
         .unwrap_or(false);
     p.expect("the probe raised no dialog", !again, json!(again));
+    lock_check_on_a_locked_file(ctx, p)?;
     Ok(was_locked)
 }
 

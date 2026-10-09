@@ -17,6 +17,8 @@ const PROBE_SERVICE: &str = "tagteam-compat-probe";
 /// Appendix A.3: on a locked keychain file the existence probe (`find-generic-password` without
 /// `-w`) answers rc 0 for a present item and rc 44 for an absent one, at once and without a
 /// prompt, which is what lets a file-fallback activation commit. A throwaway keychain file.
+/// The lock check on that locked file (`show-keychain-info`) is not made here: in a GUI session
+/// it raises an unlock dialog, so it belongs to the opt-in `--locked-keychain` check.
 pub fn locked_file_probe(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     let mut p = Probe::new();
     let kc = ThrowawayKeychain::create(&ctx.layout.scratch.join("probe.keychain-db"))?;
@@ -34,9 +36,5 @@ pub fn locked_file_probe(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
             json!({"read": read_name(&r), "seconds": seconds}),
         );
     }
-    p.note(
-        "the lock check on the locked file",
-        json!(format!("{:?}", cli.lock_state())),
-    );
     Ok(p.finish("rc 0 and rc 44 on a locked keychain file, without a prompt"))
 }
