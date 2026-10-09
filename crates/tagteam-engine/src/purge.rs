@@ -290,6 +290,10 @@ impl Engine {
                 EngineError::Io(io::Error::other(format!("{}: {e}", profile.display())))
             })?;
         }
+        // §10.5: nothing else purge deletes may hold the live login either: `displaced/`, the
+        // rescue path, `vault/`, dead temp files and the log, against every registered
+        // provider's live files.
+        self.refuse_live_in_targets(plan, &rows)?;
         let unlisted = match plan.provider {
             // §6.3: as `remove` would, before anything is deleted.
             Some(_) => {
@@ -770,6 +774,109 @@ impl Engine {
         Ok(())
     }
 
+    /// §10.5: refuses the purge when anything `target` is, or holds, is a registered provider's
+    /// live login (`refuse_live_files_at` for each provider with a live login to protect).
+    fn refuse_live_at_all(&self, target: &Path) -> Result<(), EngineError> {
+        for p in self.registry.all() {
+            self.refuse_live_files_at(p.as_ref(), target)?;
+        }
+        Ok(())
+    }
+
+    /// The temp files of §9.5's atomic writer in `dir` whose writer the process port finds gone:
+    /// what `remove_dead_temp_files` deletes. A directory that cannot be listed has none to name
+    /// here (its deletion reports the failure).
+    fn dead_temp_files(&self, dir: &Path) -> Vec<PathBuf> {
+        let Ok(listing) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        listing
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(temp_writer_pid)
+                    .is_some_and(|pid| {
+                        entry.file_type().is_ok_and(|t| t.is_file())
+                            && self.process.exists(pid) == Some(false)
+                    })
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    /// The log and its rotations (§14.2).
+    fn log_paths(&self) -> Vec<PathBuf> {
+        let log = self.env.log_file();
+        let rotations = LOG_ROTATIONS.iter().map(|suffix| {
+            let mut path = log.clone().into_os_string();
+            path.push(suffix);
+            PathBuf::from(path)
+        });
+        std::iter::once(log.clone()).chain(rotations).collect()
+    }
+
+    /// Every filesystem entry besides profiles and orphans that this purge would delete, by
+    /// scope: a full purge's `displaced/`, rescue path, `vault/` (Linux), dead temp files and
+    /// log; a `--provider` purge's displaced files and its accounts' rescue files. The store
+    /// file (emptied in place) and the lock files (kept) are not deleted, so not listed.
+    fn deletion_targets(&self, plan: &PurgePlan, rows: &[AccountRow]) -> Vec<PathBuf> {
+        let data = self.env.data_dir();
+        let mut targets = Vec::new();
+        match &plan.provider {
+            None => {
+                targets.push(data.join("displaced"));
+                targets.push(self.rescue_dir());
+                if let Some(vault) = self.vault.dir() {
+                    targets.push(vault.to_path_buf());
+                }
+                for dir in [
+                    data.clone(),
+                    data.join("sessions"),
+                    self.env.config_dir(),
+                    self.env.state_dir(),
+                ] {
+                    targets.extend(self.dead_temp_files(&dir));
+                }
+                targets.extend(self.log_paths());
+            }
+            Some(provider) => {
+                for id in self.displaced_of(provider).unwrap_or_default() {
+                    targets.push(data.join("displaced").join(format!("{id}.json")));
+                }
+                for row in rows {
+                    targets.extend(self.rescue_paths_for(&row.id).unwrap_or_default());
+                }
+            }
+        }
+        targets
+    }
+
+    /// The deletion-time recheck for `--provider`'s displaced files (the preflight ran it).
+    fn refuse_live_in_displaced_files(&self, ids: &[String]) -> Result<(), EngineError> {
+        let dir = self.env.data_dir().join("displaced");
+        for id in ids {
+            self.refuse_live_at_all(&dir.join(format!("{id}.json")))?;
+        }
+        Ok(())
+    }
+
+    /// Step 6: refuses the whole purge when any of `deletion_targets` holds a registered
+    /// provider's live login. The error names the entry for the user (never a log).
+    fn refuse_live_in_targets(
+        &self,
+        plan: &PurgePlan,
+        rows: &[AccountRow],
+    ) -> Result<(), EngineError> {
+        for target in self.deletion_targets(plan, rows) {
+            self.refuse_live_at_all(&target).map_err(|e| {
+                EngineError::Io(io::Error::other(format!("{}: {e}", target.display())))
+            })?;
+        }
+        Ok(())
+    }
+
     /// §10.5 step 6, for an orphan entry: refuses the purge when deleting it would delete or
     /// break the live login, by Keychain item (a real directory only: no item is named through
     /// a link) and by the live login's files. Nothing is deleted.
@@ -890,7 +997,14 @@ impl Engine {
         // it stay deleted, so they count; the failure is reported with its cause.
         match self.displaced_of(provider) {
             Ok(ids) if ids.is_empty() => {}
-            Ok(ids) => match self.purge_displaced(&ids) {
+            Ok(ids) => match self
+                .refuse_live_in_displaced_files(&ids)
+                .map_err(|cause| PurgeError {
+                    cause,
+                    deleted: Vec::new(),
+                })
+                .and_then(|()| self.purge_displaced(&ids))
+            {
                 Ok(deleted) => report.displaced = deleted.len(),
                 Err(PurgeError { cause, deleted }) => {
                     report.displaced = deleted.len();
@@ -947,7 +1061,13 @@ impl Engine {
             self.sweep_vault(keychain_orphans, report);
             // The rescue path whatever it is (§6.3).
             let rescue = self.rescue_dir();
-            match remove_path(&rescue) {
+            // Each deletion asks again (a second line: the preflight ran it, so only a race
+            // trips it).
+            match self
+                .refuse_live_at_all(&rescue)
+                .map_err(io::Error::other)
+                .and_then(|()| remove_path(&rescue))
+            {
                 Ok(n) => report.rescues += n,
                 Err(e) => report
                     .failures
@@ -955,7 +1075,11 @@ impl Engine {
             }
         }
         let displaced = data.join("displaced");
-        match remove_path(&displaced) {
+        match self
+            .refuse_live_at_all(&displaced)
+            .map_err(io::Error::other)
+            .and_then(|()| remove_path(&displaced))
+        {
             Ok(n) => report.displaced += n,
             Err(e) => report
                 .failures
@@ -1006,6 +1130,19 @@ impl Engine {
         if plan.provider.is_some() {
             return Ok(Some(report));
         }
+        // Outside the data directory: dead temp files and the log, guarded as the full purge's.
+        for dir in [self.env.config_dir(), self.env.state_dir()] {
+            for target in self.dead_temp_files(&dir) {
+                self.refuse_live_at_all(&target).map_err(|e| {
+                    EngineError::Io(io::Error::other(format!("{}: {e}", target.display())))
+                })?;
+            }
+        }
+        for target in self.log_paths() {
+            self.refuse_live_at_all(&target).map_err(|e| {
+                EngineError::Io(io::Error::other(format!("{}: {e}", target.display())))
+            })?;
+        }
         // A vault kept in a directory keeps it in the data directory: nothing is there.
         if self.vault.dir().is_none() {
             self.sweep_vault(plan.keychain_orphans, &mut report);
@@ -1052,13 +1189,13 @@ impl Engine {
             failures = report.failures.len(),
             "purge finished; deleting the log"
         );
-        let log = self.env.log_file();
-        let rotations = LOG_ROTATIONS.iter().map(|suffix| {
-            let mut path = log.clone().into_os_string();
-            path.push(suffix);
-            PathBuf::from(path)
-        });
-        for path in std::iter::once(log.clone()).chain(rotations) {
+        for path in self.log_paths() {
+            if let Err(e) = self.refuse_live_at_all(&path) {
+                report
+                    .failures
+                    .push((path.display().to_string(), e.to_string()));
+                continue;
+            }
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1085,6 +1222,8 @@ impl Engine {
             if !entry.file_type()?.is_file() || self.process.exists(pid) != Some(false) {
                 continue;
             }
+            self.refuse_live_at_all(&entry.path())
+                .map_err(io::Error::other)?;
             match fs::remove_file(entry.path()) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}

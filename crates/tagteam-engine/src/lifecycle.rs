@@ -485,7 +485,7 @@ impl Engine {
                     "the live login's files are inside a profile directory; nothing was deleted"
                 );
                 return Err(EngineError::Io(io::Error::other(
-                    "the live login's files are inside this profile directory, since the environment names it; nothing was deleted (tagteam never deletes the live login)",
+                    "the live login's files are inside what this would delete, since the environment names it; nothing was deleted (tagteam never deletes the live login)",
                 )));
             }
         }

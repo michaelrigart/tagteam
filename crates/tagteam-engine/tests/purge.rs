@@ -3,7 +3,7 @@
 mod common;
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1963,4 +1963,57 @@ fn a_later_account_holding_the_live_login_refuses_before_an_earlier_one_is_delet
     );
     assert!(store.account(&first).unwrap().is_some());
     assert!(profile_first.exists());
+}
+
+/// A Linux fixture whose `CLAUDE_CONFIG_DIR` is `<data>/<under>/live`, holding the live login's
+/// two files, with nothing stored. Returns the fixture, the config directory and the log files
+/// planted beside, which nothing may delete.
+fn live_config_under_data(under: &str) -> (Fx, PathBuf, [PathBuf; 4]) {
+    let under = under.to_owned();
+    let fx = Fx::with(Platform::Linux, |e| {
+        let live = e.data_dir().join(&under).join("live");
+        fs::create_dir_all(&live).unwrap();
+        e.claude_config_dir = Some(live.into_os_string());
+    });
+    let live = PathBuf::from(fx.env.claude_config_dir.clone().unwrap());
+    fs::write(live.join(".claude.json"), b"{\"oauthAccount\":{}}").unwrap();
+    fs::write(live.join(".credentials.json"), b"the live login").unwrap();
+    let log = plant_log(&fx);
+    (fx, live, log)
+}
+
+fn assert_live_config_whole(live: &Path, log: &[PathBuf; 4]) {
+    assert_eq!(
+        fs::read(live.join(".credentials.json")).unwrap(),
+        b"the live login"
+    );
+    assert!(live.join(".claude.json").exists());
+    assert!(log.iter().all(|f| f.exists()), "the log is kept");
+}
+
+#[test]
+fn a_live_config_dir_under_displaced_refuses_the_full_purge() {
+    // Codex slice 1 re-review: `displaced/` is deleted whole, with the live login inside it.
+    let (fx, live, log) = live_config_under_data("displaced");
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_live_config_whole(&live, &log);
+}
+
+#[test]
+fn a_live_config_dir_under_the_rescue_path_refuses_the_full_purge() {
+    let (fx, live, log) = live_config_under_data("rescue");
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_live_config_whole(&live, &log);
 }
