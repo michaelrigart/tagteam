@@ -924,8 +924,14 @@ fn a_config_lock_that_outlasts_the_pre_wait_refuses_with_a_lock_timeout_and_chan
     fs::create_dir(fx.paths().config_lock).unwrap();
     let config = fs::read(fx.paths().global_config).unwrap();
 
+    let start = Instant::now();
     let err = switch(&fx, to(&a), false).unwrap_err();
 
+    assert!(
+        start.elapsed() >= Duration::from_millis(600),
+        "refused after {:?}, before the pre-wait's budget",
+        start.elapsed()
+    );
     assert_eq!(err.kind(), "lock-timeout");
     assert!(
         err.to_string().contains("frees itself within about 11 s"),

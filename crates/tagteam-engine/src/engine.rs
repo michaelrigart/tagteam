@@ -359,8 +359,14 @@ impl Engine {
     /// timeout does.
     pub(crate) fn acquire_guard(&self, timeout: Duration) -> Result<MutationGuard, EngineError> {
         for p in self.registry.all() {
-            p.wait_config_lock_idle(&self.env)?;
+            // A lock failure is the guard's own kind of failure (`EngineError::Lock`), which
+            // callers that treat a busy guard as "moved" or "no switch" already match.
+            p.wait_config_lock_idle(&self.env).map_err(|e| match e {
+                ProviderError::Lock(e) => EngineError::Lock(e),
+                e => EngineError::Provider(e),
+            })?;
         }
+        hooks::point(self, "config-pre-wait-done")?;
         Ok(MutationGuard::acquire(&self.env, timeout)?)
     }
 

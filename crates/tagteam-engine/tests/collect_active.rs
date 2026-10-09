@@ -592,6 +592,24 @@ fn a_mutation_lock_held_past_its_timeout_drops_the_active_collection() {
     assert_eq!(fx.usage_state(&a).and_then(|s| s.fetched_at), None);
 }
 
+#[test]
+fn a_config_lock_held_past_the_pre_wait_drops_the_active_collection_without_a_warning() {
+    // §9.1: the pre-wait's timeout is the guard's own busy failure, so it ends the live fetch
+    // exactly as a held mutation lock does.
+    let fx = Fx::with_lock_budgets(Duration::from_millis(300), Duration::from_millis(600));
+    let a = fx.add("a@x.co", "rt-a"); // live
+    fx.script_usage(200, usage_fixture());
+    fs::create_dir(fx.paths().config_lock).unwrap(); // fresh, left behind
+
+    let report = fx.collect(&[&a]);
+
+    assert_eq!(report.outcomes, [(a.clone(), Collected::Dropped)]);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert!(fx.http.requests().is_empty());
+    assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    assert_eq!(fx.usage_state(&a).and_then(|s| s.fetched_at), None);
+}
+
 #[cfg(feature = "test-hooks")]
 mod hooks {
     use std::sync::{Arc, Mutex};
