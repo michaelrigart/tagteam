@@ -17,7 +17,7 @@ use super::{ask, read_json};
 use crate::compat::ctx::Ctx;
 use crate::compat::keychain::{LOGIN_KEYCHAIN, SECURITY, login_lock_state};
 use crate::compat::report::{Outcome, Probe};
-use crate::compat::sys::{HarnessError, harness, shell_quote};
+use crate::compat::sys::{HarnessError, cancel, harness, shell_quote, wait_interactive};
 
 /// The `<word> <number>...` lines the SSH script writes.
 fn field(results: &str, word: &str, i: usize) -> Option<i64> {
@@ -80,10 +80,12 @@ pub fn ssh_keychain_read(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
         service = shell_quote(&item.service),
     );
     eprintln!("cargo xtask compat: over SSH to {host}; enter your login password when asked.");
-    let status = Command::new("ssh")
+    // A cancellation point (`wait_interactive`): a signal ends ssh, and the run unwinds.
+    let mut ssh = Command::new("ssh")
         .args(["-t", &host, &script])
-        .status()
+        .spawn()
         .map_err(|e| harness(format!("could not run ssh: {e}")))?;
+    let status = wait_interactive(&mut ssh, cancel())?;
     if status.code() == Some(90) {
         return Err(harness(format!(
             "{host} is not this Mac: the scratch directory is not there"

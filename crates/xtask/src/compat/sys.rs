@@ -336,6 +336,30 @@ fn end_group(child: &mut Child) -> bool {
     settle(GRACE, || done(child))
 }
 
+/// Waits for `child`, an interactive process that shares the harness's terminal and process
+/// group (`ssh -t`), as a cancellation point: a signal recorded in `token` sends it SIGTERM
+/// alone (its group is the harness's own), SIGKILL after the grace period, reaps it, and
+/// returns `interrupted`, so the caller unwinds through its cleanup.
+pub fn wait_interactive(child: &mut Child, token: &Cancel) -> Result<ExitStatus, HarnessError> {
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| harness(format!("could not wait for {}: {e}", child.id())))?
+        {
+            return Ok(status);
+        }
+        if let Some(n) = token.requested() {
+            signal(child.id(), "TERM", false);
+            if !settle(GRACE, || reaped(child)) {
+                signal(child.id(), "KILL", false);
+                let _ = child.wait();
+            }
+            return Err(interrupted(n));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The children whose group SIGKILL left non-empty (`Proc`'s drop), for `quiesce`. Each is kept
 /// as its `Child`, whose pid is its group's id, so that a leader not yet reaped still can be.
 static SURVIVORS: Mutex<Vec<(String, Child)>> = Mutex::new(Vec::new());
@@ -754,6 +778,37 @@ impl Cmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cancelled_wait_ends_an_interactive_child_and_reaps_it() {
+        let _serial = serial();
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let token = Cancel::new();
+        let later = token.clone();
+        let signaller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            later.request(SIGTERM);
+        });
+        let t = Instant::now();
+        let err = wait_interactive(&mut child, &token).unwrap_err();
+        signaller.join().unwrap();
+        assert_eq!(err, interrupted(SIGTERM));
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        assert!(reaped(&mut child), "the child was reaped");
+        assert!(!process_alive(pid));
+    }
+
+    #[test]
+    fn an_interactive_child_that_exits_gives_its_status() {
+        let _serial = serial();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 90"])
+            .spawn()
+            .unwrap();
+        let status = wait_interactive(&mut child, &Cancel::new()).unwrap();
+        assert_eq!(status.code(), Some(90));
+    }
 
     #[test]
     fn shell_quoting_survives_quotes() {
