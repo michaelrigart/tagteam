@@ -276,6 +276,16 @@ pub enum Command {
         #[arg(long, value_name = "FILE")]
         identity: Vec<PathBuf>,
     },
+    /// Check tagteam's state and how it works with each agent CLI, changing nothing
+    ///
+    /// Each check reports ok, info, warn or fail, and every problem names its fix. It exits 1
+    /// when a check fails. --json prints {schemaVersion, ok, checks: [{id, provider, status,
+    /// message, fix}]}, with provider null for tagteam's own checks.
+    Doctor {
+        /// Also check that each agent's hosts can be reached; no credential is sent
+        #[arg(long)]
+        online: bool,
+    },
     /// Print a completion script for bash, zsh or fish
     Completions { shell: CompletionShell },
 }

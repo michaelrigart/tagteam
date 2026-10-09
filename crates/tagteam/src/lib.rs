@@ -9,6 +9,7 @@ pub mod auto;
 pub mod cli;
 mod config_cmd;
 mod displaced_cmd;
+mod doctor_cmd;
 mod history;
 mod logfile;
 mod logging;

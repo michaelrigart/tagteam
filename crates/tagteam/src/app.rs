@@ -12,6 +12,7 @@ use tagteam_core::autoswitch::Strategy;
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Window};
 use tagteam_engine::collect::CollectMode;
 use tagteam_engine::displace::PurgeError;
+use tagteam_engine::doctor::DoctorOptions;
 use tagteam_engine::export::ExportRequest;
 use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
@@ -42,8 +43,8 @@ use crate::cli::{AutoStrategyArg, Cli, Command, ConfigAction, ShellArg, Strategy
 use crate::prompt::Prompter;
 use crate::shell_init::Wrapped;
 use crate::{
-    auto, config_cmd, displaced_cmd, history, prompt, purge_cmd, render, root_guard, shell_init,
-    statusline, transfer_cmd,
+    auto, config_cmd, displaced_cmd, doctor_cmd, history, prompt, purge_cmd, render, root_guard,
+    shell_init, statusline, transfer_cmd,
 };
 
 /// §13.1.
@@ -766,6 +767,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Purge { .. } => "purge",
         Command::Export { .. } => "export",
         Command::Import { .. } => "import",
+        Command::Doctor { .. } => "doctor",
         Command::Completions { .. } => "completions",
     }
 }
@@ -1265,6 +1267,16 @@ impl App<'_, '_> {
                 force,
                 identity,
             } => return self.import(&file, force, &identity),
+            // §13.6: read-only, so no Keychain check precedes it; it exits 1 when a check fails.
+            Command::Doctor { online } => {
+                let report = self.engine.doctor(DoctorOptions {
+                    online,
+                    provider: self.provider_flag.clone(),
+                })?;
+                let human = doctor_cmd::human(&report, &|p| display_name(&self.engine, p));
+                self.print(&human, doctor_cmd::json(&report));
+                return Ok(if report.ok() { 0 } else { EXIT_ERROR });
+            }
             Command::Completions { .. } => unreachable!("run answers completions before dispatch"),
             Command::Auto {
                 once,
@@ -2293,6 +2305,7 @@ mod tests {
             &["purge", "--yes"],
             &["export", "--plaintext"],
             &["import", "backup.age"],
+            &["doctor"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))
