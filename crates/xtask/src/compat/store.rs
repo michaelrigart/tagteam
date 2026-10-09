@@ -57,16 +57,25 @@ pub fn redactor(db: &Path) -> Result<Redactor, HarnessError> {
 
 /// Makes account `id` eligible for `tagteam list`'s collection now (§8.3 `OnDemand`): no poll
 /// planned, no backoff, and its reading older than Claude Code's floor (`PollBudget::STANDARD`).
-/// Only the reading's time moves; what it read is untouched.
+/// Only the reading's time moves; what it read is untouched. The account's `usage:<id>` lease
+/// goes too: a collection leaves it standing for 90 s after its record (§8.3), and a live lease
+/// makes the account ineligible, so a second `tagteam list` within that time would collect
+/// nothing. Safe only because no tagteam process runs, as above: nobody holds the lease.
 pub fn make_due(db: &Path, id: &str, now_s: i64) -> Result<(), HarnessError> {
     let conn = open(db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     let stale = now_s - PollBudget::STANDARD.floor_s - 1;
+    let due = |e: rusqlite::Error| harness(format!("making {id} due in the compat store: {e}"));
     conn.execute(
         "UPDATE usage_state SET next_poll_at = NULL, backoff_until = NULL, \
          fetched_at = MIN(fetched_at, ?2) WHERE account_id = ?1",
         params![id, stale],
     )
-    .map_err(|e| harness(format!("making {id} due in the compat store: {e}")))?;
+    .map_err(due)?;
+    conn.execute(
+        "DELETE FROM leases WHERE name = ?1",
+        params![format!("usage:{id}")],
+    )
+    .map_err(due)?;
     Ok(())
 }
 
@@ -140,6 +149,36 @@ mod tests {
             Some(now - floor - 1),
             "an older reading is kept"
         );
+        std::fs::remove_file(&db).unwrap();
+    }
+
+    #[test]
+    fn making_an_account_due_frees_its_usage_lease_and_no_other() {
+        let db = store("lease");
+        let now = 1_790_000_000_i64;
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT INTO usage_state (account_id, fetched_at) VALUES ('a1', ?1)",
+            params![now - 10],
+        )
+        .unwrap();
+        for name in ["usage:a1", "usage:a2", "switch"] {
+            conn.execute(
+                "INSERT INTO leases (name, holder, expires_at) VALUES (?1, 'h', ?2)",
+                params![name, (now + 90) * 1000],
+            )
+            .unwrap();
+        }
+        make_due(&db, "a1", now).unwrap();
+        let left: Vec<String> = conn
+            .prepare("SELECT name FROM leases ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(left, ["switch", "usage:a2"]);
+        make_due(&db, "a1", now).unwrap();
         std::fs::remove_file(&db).unwrap();
     }
 }
