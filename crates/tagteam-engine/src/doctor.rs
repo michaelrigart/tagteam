@@ -30,7 +30,7 @@ use tagteam_provider::{
 
 use crate::auto::{engine_lock_path, read_holder};
 use crate::engine::Engine;
-use crate::error::EngineError;
+use crate::error::{EngineError, daemon_advice};
 use crate::profiles::{Held, allowlist, held, is_private, resolved};
 use crate::provenance::identity_drifted;
 use crate::recover::Direction;
@@ -1897,6 +1897,21 @@ impl Run<'_> {
                 continue;
             }
             let delete = Self::move_then_delete(&dir);
+            // No provider is known for these, so every registered one judges, as `purge` does
+            // when a marker names none it can ask.
+            let judges: Vec<&dyn Provider> = self
+                .engine
+                .registry
+                .all()
+                .iter()
+                .map(|p| p.as_ref())
+                .collect();
+            let orphaned = !matches!(&marker, Read::Present(m)
+                if self.engine.registry.get(&m.provider).is_some() && in_scope.contains(&m.provider));
+            let reports = orphaned && (only.is_none() || !matches!(&marker, Read::Present(_)));
+            if reports {
+                found.extend(self.orphan_daemon(&judges, &dir));
+            }
             match marker {
                 Read::Unreadable(e) => found.push(
                     Check::warn(
@@ -2033,25 +2048,57 @@ impl Run<'_> {
                     )
                     .fix(Self::move_then_delete(&dir)),
                 ),
-                None => found.push(
-                    Check::warn(
-                        "sessions.orphan",
-                        format!(
-                            "{} is a profile of an account this store no longer has",
-                            dir.display()
-                        ),
-                    )
-                    .fix(format!(
-                        "{}; `tagteam purge` deletes it with its Keychain item",
-                        Self::move_then_delete(&dir)
-                    )),
-                ),
+                None => {
+                    found.extend(self.orphan_daemon(&[p], &dir));
+                    found.push(
+                        Check::warn(
+                            "sessions.orphan",
+                            format!(
+                                "{} is a profile of an account this store no longer has",
+                                dir.display()
+                            ),
+                        )
+                        .fix(format!(
+                            "{}; `tagteam purge` deletes it with its Keychain item",
+                            Self::move_then_delete(&dir)
+                        )),
+                    );
+                }
             }
         }
         self.unknown_entries(p, &mut found);
         for check in found {
             self.push(Some(&id), check);
         }
+    }
+
+    /// §13.6: a live background-daemon supervisor in `profile` (`daemon.lock`, §12.6), found at
+    /// that path, as the refusal names it. `whose` finishes "runs in ...".
+    fn daemon_check(profile: &Path, whose: &str) -> Check {
+        Check::info(
+            "sessions.daemon",
+            format!("a Claude Code background daemon runs in {whose} until it stops"),
+        )
+        .fix(daemon_advice(profile))
+    }
+
+    /// `daemon_check` for the profile at `dir` that no stored account owns, when any of
+    /// `judges` finds a daemon in it (§12.6); each is asked, as `purge` asks (§10.5 step 6).
+    fn orphan_daemon(&self, judges: &[&dyn Provider], dir: &Path) -> Option<Check> {
+        judges
+            .iter()
+            .filter(|p| p.capabilities().sessions)
+            .map(|p| self.engine.session_state_at(*p, dir))
+            .find(|state| matches!(state, SessionState::Owned { daemon: true, .. }))
+            .map(|_| {
+                Self::daemon_check(
+                    dir,
+                    &format!(
+                        "the orphaned profile {}, which is session-owned",
+                        dir.display()
+                    ),
+                )
+            })
     }
 
     /// One profile of account `row` (§12.2–§12.6), read and probed only. With no marker, its
@@ -2100,20 +2147,11 @@ impl Run<'_> {
                 .fix("make what it names readable again; once no session runs in the profile, a damaged session record can be deleted"),
             );
         }
-        if let Ok(SessionState::Owned { daemon: true, .. }) = &state {
-            let home = marker.map_or_else(|| dir.display().to_string(), |m| m.config_dir.clone());
-            found.push(
-                Check::info(
-                    "sessions.daemon",
-                    format!(
-                        "a Claude Code background daemon runs in account {n}'s profile, so the account is session-owned until it stops"
-                    ),
-                )
-                .fix(format!(
-                    "stop it with `claude daemon stop --any`, run with CLAUDE_CONFIG_DIR set to {}",
-                    quoted(Path::new(&home))
-                )),
-            );
+        if let Ok(daemon @ SessionState::Owned { daemon: true, .. }) = &state {
+            found.push(Self::daemon_check(
+                daemon.profile().unwrap_or(dir),
+                &format!("account {n}'s profile, so the account is session-owned"),
+            ));
         }
         self.reservations(dir, n, found);
         if quiescent && p.has_baseline(dir) {

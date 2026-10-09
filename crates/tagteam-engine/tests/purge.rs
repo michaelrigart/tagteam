@@ -491,6 +491,46 @@ fn a_session_owned_account_refuses_and_nothing_is_deleted() {
 }
 
 #[test]
+fn an_orphaned_profile_with_a_live_daemon_supervisor_refuses_naming_the_daemon() {
+    // §10.5 step 6: a supervisor in `daemon.lock` is not a `tagteam run` session, and the
+    // refusal says what to stop.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let gone = orphan(&fx, "0192-gone");
+    let plan = full_plan(&fx);
+    fs::write(
+        gone.join("daemon.lock"),
+        json!({"pid": 779, "origin": "transient", "procStart": common::LSTART}).to_string(),
+    )
+    .unwrap();
+    fx.process.set(
+        779,
+        FakeProcess {
+            exists: Some(true),
+            start_time_s: tagteam_provider::parse_lstart(common::LSTART),
+            ..FakeProcess::default()
+        },
+    );
+    let err = fx.engine.purge(&plan).unwrap_err();
+    assert!(
+        matches!(&err, EngineError::OrphanSessionRunning { profile, daemon: true } if profile == &gone),
+        "{err:?}"
+    );
+    assert_eq!(err.kind(), "session-owned");
+    let message = err.to_string();
+    assert!(
+        message.contains("background daemon")
+            && message.contains("claude daemon stop --any")
+            && message.contains(&format!("delete '{}'", gone.join("daemon.lock").display()))
+            && !message.contains("exit that session"),
+        "{message}"
+    );
+    assert!(fx.vault_bytes(&a).is_some() && gone.exists());
+    fs::remove_file(gone.join("daemon.lock")).unwrap();
+    fx.engine.purge(&plan).unwrap();
+}
+
+#[test]
 fn an_orphaned_profile_in_use_refuses() {
     // Review Focus 3: the profile's account row is gone, and a session still runs in it.
     let fx = Fx::new();
@@ -500,7 +540,7 @@ fn an_orphaned_profile_in_use_refuses() {
     let session = fx.hold_reservation(&gone);
     let err = fx.engine.purge(&plan).unwrap_err();
     assert!(
-        matches!(&err, EngineError::OrphanSessionRunning { profile } if profile == &gone),
+        matches!(&err, EngineError::OrphanSessionRunning { profile, daemon: false } if profile == &gone),
         "{err:?}"
     );
     assert_eq!(err.kind(), "session-owned");

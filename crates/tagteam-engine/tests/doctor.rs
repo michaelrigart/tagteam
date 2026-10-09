@@ -1432,6 +1432,69 @@ fn a_profile_without_a_store_account_warns_naming_what_to_delete() {
     );
 }
 
+/// A live supervisor in `dir`: its `daemon.lock`, and the probe saying its pid runs.
+fn live_supervisor(fx: &Fx, dir: &Path, pid: u32) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("daemon.lock"),
+        serde_json::json!({"pid": pid, "origin": "transient", "procStart": LSTART}).to_string(),
+    )
+    .unwrap();
+    fx.process.set(
+        pid,
+        FakeProcess {
+            exists: Some(true),
+            start_time_s: tagteam_provider::parse_lstart(LSTART),
+            ..FakeProcess::default()
+        },
+    );
+}
+
+#[test]
+fn a_live_daemon_in_an_orphaned_profile_is_reported_whoever_owns_the_marker() {
+    // §13.6: a profile no stored account owns can hold a supervisor too: found for a registered
+    // provider's orphan, one of a provider this build lacks, and one with no marker at all.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let gone = AccountId::from_string("0192ffff-0000-7000-8000-00000000000b");
+    let dir = fx.profile_dir(&gone);
+    fx.write_marker(&dir, &gone, &fx.env);
+    let sessions = fx.env.data_dir().join("sessions");
+    let bare = sessions.join("0192ffff-0000-7000-8000-00000000000c");
+    let ghost = AccountId::from_string("0192ffff-0000-7000-8000-00000000000d");
+    let ghost_dir = fx.profile_dir(&ghost);
+    fs::create_dir_all(&ghost_dir).unwrap();
+    tagteam_provider::ProfileMarker {
+        provider: ProviderId::new("ghost"),
+        account_id: ghost.clone(),
+        config_dir: ghost_dir.display().to_string(),
+        outer: serde_json::json!({}),
+    }
+    .write(&ghost_dir)
+    .unwrap();
+    assert!(found(&doctor(&fx), "sessions.daemon").is_empty());
+    for (i, d) in [&dir, &bare, &ghost_dir].into_iter().enumerate() {
+        live_supervisor(&fx, d, 5000 + i as u32);
+    }
+    let r = doctor(&fx);
+    let daemons = found(&r, "sessions.daemon");
+    assert_eq!(daemons.len(), 3, "{daemons:#?}");
+    for d in [&dir, &bare, &ghost_dir] {
+        let c = daemons
+            .iter()
+            .find(|c| c.message.contains(&d.display().to_string()))
+            .unwrap_or_else(|| panic!("{}: {daemons:#?}", d.display()));
+        assert_eq!(c.status, CheckStatus::Info);
+        let fix = fix(c);
+        assert!(
+            fix.contains("claude daemon stop --any")
+                && fix.contains(&format!("'{}'", d.display()))
+                && fix.contains(&format!("delete '{}'", d.join("daemon.lock").display())),
+            "{fix}"
+        );
+    }
+}
+
 #[test]
 fn every_other_orphan_also_moves_history_before_deleting() {
     let fx = Fx::new();
@@ -1567,7 +1630,10 @@ fn a_live_background_daemon_supervisor_in_a_profile_is_information_naming_how_to
     );
     let fix = c.fix.as_deref().unwrap();
     assert!(
-        fix.contains("claude daemon stop --any") && fix.contains("CLAUDE_CONFIG_DIR"),
+        fix.contains("claude daemon stop --any")
+            && fix.contains("CLAUDE_CONFIG_DIR")
+            && fix.contains(&format!("set to '{}'", dir.display()))
+            && fix.contains(&format!("delete '{}'", dir.join("daemon.lock").display())),
         "{fix}"
     );
     assert!(found(&r, "sessions.state").is_empty());

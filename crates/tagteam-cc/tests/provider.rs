@@ -1252,8 +1252,8 @@ fn a_rollback_clears_the_pin_within_its_operation() {
 /// lock, refresh lock, legacy lock and config lock were each held at that moment (§4.3, §9.1).
 struct HeldLocksProbe {
     inner: Arc<FakeKeychain>,
-    locks: [PathBuf; 4],
-    writes: Mutex<Vec<(String, [bool; 4])>>,
+    locks: [PathBuf; 5],
+    writes: Mutex<Vec<(String, [bool; 5])>>,
 }
 
 impl HeldLocksProbe {
@@ -1297,6 +1297,7 @@ fn probed_fx() -> (Fx, Arc<HeldLocksProbe>) {
         inner: kc.clone(),
         locks: [
             paths.storage_write_lock.clone(),
+            paths.storage_write_lock_v2.clone(),
             paths.refresh_lock.clone(),
             paths.legacy_lock(),
             paths.config_lock,
@@ -1326,14 +1327,14 @@ fn the_storage_write_lock_is_a_leaf_taken_only_around_each_entry_write() {
         f.cc.lock_credentials(&f.env, &g, Duration::from_secs(1))
             .unwrap();
     assert!(
-        !paths.storage_write_lock.exists(),
+        !paths.storage_write_lock.exists() && !paths.storage_write_lock_v2.exists(),
         "the credential locks never take it"
     );
     let locks =
         f.cc.lock_config(&f.env, cred, Duration::from_secs(1))
             .unwrap();
     assert!(
-        !paths.storage_write_lock.exists(),
+        !paths.storage_write_lock.exists() && !paths.storage_write_lock_v2.exists(),
         "nor does the config lock"
     );
 
@@ -1346,9 +1347,9 @@ fn the_storage_write_lock_is_a_leaf_taken_only_around_each_entry_write() {
         f.cc.write_credential(&f.env, &locks, &key, &mut save_nothing)
             .unwrap()
             .undo;
-    assert!(!paths.storage_write_lock.exists());
+    assert!(!paths.storage_write_lock.exists() && !paths.storage_write_lock_v2.exists());
     undo.undo(&locks).unwrap();
-    assert!(!paths.storage_write_lock.exists());
+    assert!(!paths.storage_write_lock.exists() && !paths.storage_write_lock_v2.exists());
     f.cc.write_credential(
         &f.env,
         &locks,
@@ -1356,14 +1357,14 @@ fn the_storage_write_lock_is_a_leaf_taken_only_around_each_entry_write() {
         &mut save_nothing,
     )
     .unwrap();
-    assert!(!paths.storage_write_lock.exists());
+    assert!(!paths.storage_write_lock.exists() && !paths.storage_write_lock_v2.exists());
     drop(locks);
 
     let writes = probe.writes.lock().unwrap().clone();
     assert!(writes.len() >= 4, "{writes:?}");
     assert!(
-        writes.iter().all(|(_, held)| *held == [true; 4]),
-        "a credential entry written without the storage-write lock or the live locks: {writes:?}"
+        writes.iter().all(|(_, held)| *held == [true; 5]),
+        "a credential entry written without both storage-write locks or the live locks: {writes:?}"
     );
 }
 

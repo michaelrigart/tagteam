@@ -629,6 +629,7 @@ impl Engine {
             if state.owned() {
                 return Err(EngineError::OrphanSessionRunning {
                     profile: profile.to_path_buf(),
+                    daemon: state.daemon_profile().is_some(),
                 });
             }
         }

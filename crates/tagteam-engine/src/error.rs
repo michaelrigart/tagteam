@@ -1,6 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use tagteam_provider::doctor::quoted;
 use tagteam_provider::{LockError, ProviderError, ReadError};
 
 use crate::settings::SettingsError;
@@ -235,11 +236,9 @@ pub enum EngineError {
     EngineRunning { provider: String, pid: Option<u32> },
     /// §10.5 step 6: a session profile that no store account owns is in use: a live launch
     /// reservation, or a session record that is live or cannot be read (§12.5, §12.6).
-    #[error(
-        "{} belongs to no stored account, but a `tagteam run` session is using it or its sessions cannot be checked; exit that session first",
-        profile.display()
-    )]
-    OrphanSessionRunning { profile: PathBuf },
+    /// `daemon`: what is using it is a Claude Code background daemon (§12.6).
+    #[error("{}", orphan_message(profile, *daemon))]
+    OrphanSessionRunning { profile: PathBuf, daemon: bool },
     /// §10.5 step 6: the accounts a purge would delete are not the ones that were confirmed.
     #[error(
         "the accounts changed since the purge was confirmed (another command added or removed one); run `tagteam purge` again"
@@ -289,6 +288,34 @@ fn split_message(profile: &Path, shared: &Path, cause: SplitCause) -> String {
     }
 }
 
+/// How to end a Claude Code background daemon that owns `profile` (§12.6, Appendix A.7), by the
+/// profile path where tagteam found its `daemon.lock`. If the pid in the lock was reused by an
+/// unrelated `claude`, the daemon is not running and only the lock is left, which Claude Code's
+/// own advice has the user delete.
+pub(crate) fn daemon_advice(profile: &Path) -> String {
+    format!(
+        "stop it with `claude daemon stop --any` run with CLAUDE_CONFIG_DIR set to {}; if nothing is running at that pid, delete {}",
+        quoted(profile),
+        quoted(&profile.join("daemon.lock"))
+    )
+}
+
+/// `OrphanSessionRunning`'s message.
+fn orphan_message(profile: &Path, daemon: bool) -> String {
+    if daemon {
+        format!(
+            "{} belongs to no stored account, but a Claude Code background daemon runs in it; {}, then retry",
+            profile.display(),
+            daemon_advice(profile)
+        )
+    } else {
+        format!(
+            "{} belongs to no stored account, but a `tagteam run` session is using it or its sessions cannot be checked; exit that session first",
+            profile.display()
+        )
+    }
+}
+
 /// `SessionOwned`'s message: a running session, or session state that cannot be read.
 fn session_owned_message(
     position: u32,
@@ -298,8 +325,8 @@ fn session_owned_message(
 ) -> String {
     match (unreadable, daemon) {
         (None, Some(profile)) => format!(
-            "position {position} ({label}) is in use by a Claude Code background daemon; stop it with `claude daemon stop --any` run with CLAUDE_CONFIG_DIR set to {}, then retry",
-            profile.display()
+            "position {position} ({label}) is in use by a Claude Code background daemon; {}, then retry",
+            daemon_advice(profile)
         ),
         (None, None) => format!(
             "position {position} ({label}) is in use by a `tagteam run` session; exit that session first"
@@ -727,6 +754,7 @@ mod tests {
             (
                 EngineError::OrphanSessionRunning {
                     profile: PathBuf::from("s"),
+                    daemon: false,
                 },
                 "session-owned",
             ),

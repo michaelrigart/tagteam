@@ -256,7 +256,8 @@ fn a_live_supervisor_makes_remove_and_switch_refuse_naming_the_daemon() {
     assert!(
         message.contains("background daemon")
             && message.contains("claude daemon stop --any")
-            && message.contains(&dir.display().to_string())
+            && message.contains(&format!("set to '{}'", dir.display()))
+            && message.contains(&format!("delete '{}'", dir.join("daemon.lock").display()))
             && !message.contains("exit that session"),
         "{message}"
     );
@@ -983,6 +984,34 @@ fn a_session_that_starts_before_the_gate_refuses_a_direct_switch_and_sends_nothi
         0,
         "the gate left the session's token alone"
     );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+}
+
+#[test]
+fn a_supervisor_that_starts_before_the_gate_refuses_a_direct_switch_naming_the_daemon() {
+    // The gate answers "a session"; the refusal reads the state again to name the daemon.
+    let fx = Fx::new();
+    let a = due(&fx);
+    fx.script_refresh(Some("rt-a2"));
+    let dir = fx.make_profile(&a);
+    run_process(&fx, 4343);
+    let key = a.as_str().to_owned();
+    let lock = dir.join("daemon.lock");
+    let planted = Mutex::new(false);
+    let engine = fx.engine_with_vault_probe(move |read: &str| {
+        let mut planted = planted.lock().unwrap();
+        if read == key && !*planted {
+            *planted = true;
+            plant_daemon_lock(lock.parent().unwrap(), 4343);
+        }
+    });
+    let err = engine.switch(fx.switch_request(&a, false)).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    assert!(
+        err.to_string().contains("claude daemon stop --any"),
+        "{err}"
+    );
+    assert_eq!(token_requests(&fx), 0);
     assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
 }
 

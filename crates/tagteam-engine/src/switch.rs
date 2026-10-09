@@ -21,7 +21,7 @@ use crate::account_lock::AccountLock;
 use crate::collect::{CollectMode, jitter};
 use crate::displace::displace;
 use crate::engine::Engine;
-use crate::error::EngineError;
+use crate::error::{EngineError, daemon_advice};
 use crate::hooks;
 use crate::oracle::verdict;
 use crate::provenance::ProfileCheck;
@@ -1161,14 +1161,20 @@ impl Engine {
                 "the account to switch to was removed".into(),
             );
         };
+        let state = self.session_state(p, &target)?;
         let why = if target.disabled {
-            Some("it is disabled")
+            Some("it is disabled".to_owned())
         } else if target.quarantine_reason.is_some() {
-            Some("it needs a new login")
-        } else if self.session_state(p, &target)?.owned() {
-            Some("it is in a `tagteam run` session")
+            Some("it needs a new login".to_owned())
+        } else if let Some(profile) = state.daemon_profile() {
+            Some(format!(
+                "it is in use by a Claude Code background daemon; {}",
+                daemon_advice(profile)
+            ))
+        } else if state.owned() {
+            Some("it is in a `tagteam run` session".to_owned())
         } else if !self.has_login(&target)? {
-            Some("it has no stored credential")
+            Some("it has no stored credential".to_owned())
         } else {
             None
         };
@@ -1473,7 +1479,11 @@ impl Engine {
             // (§9.3); a direct target is refused. A conflicting profile refuses either way
             // (§12.5).
             GateOutcome::Owned(OwnedBy::Session) if chosen => Freshened::Replan,
-            GateOutcome::Owned(OwnedBy::Session) => return Err(session_owned(target, None)),
+            // The gate answers only "a session"; the state is read again to name a daemon.
+            GateOutcome::Owned(OwnedBy::Session) => {
+                let state = self.session_state(p, target)?;
+                return Err(session_owned(target, Some(&state)));
+            }
             GateOutcome::Conflict => return Err(profile_conflict(target)),
         })
     }

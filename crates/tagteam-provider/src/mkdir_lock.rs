@@ -123,7 +123,7 @@ fn warn_if_left(path: &Path, removed: io::Result<()>) {
 fn lock_role(path: &Path) -> &'static str {
     match path.file_name().and_then(|n| n.to_str()) {
         Some(".oauth_refresh.lock") => "Claude Code's refresh lock",
-        Some(".storage-write") => "Claude Code's storage-write lock",
+        Some(".storage-write" | ".storage-write.lock") => "Claude Code's storage-write lock",
         Some(".claude.json.lock") => "Claude Code's config lock",
         Some(name) if name.ends_with(".lock") => "Claude Code's credential lock",
         _ => "a lock directory",
@@ -977,6 +977,11 @@ mod tests {
         assert_eq!(
             lock_role(Path::new("/h/.storage-write")),
             "Claude Code's storage-write lock"
+        );
+        assert_eq!(
+            lock_role(Path::new("/h/.storage-write.lock")),
+            "Claude Code's storage-write lock",
+            "CC 2.1.292's spelling is no generic credential lock"
         );
     }
 

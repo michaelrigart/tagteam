@@ -214,6 +214,37 @@ fn a_home_with_no_global_config_is_not_asked_and_is_reported_as_never_started() 
 }
 
 #[test]
+fn a_named_config_dir_with_no_global_config_is_not_asked_either() {
+    // `CLAUDE_CONFIG_DIR` set: the global config is `$CLAUDE_CONFIG_DIR/.claude.json`, here in a
+    // directory that exists and in one that does not.
+    for made in [true, false] {
+        let mut f = fx();
+        f.install_claude();
+        let named = f.env.home.join("elsewhere");
+        if made {
+            fs::create_dir_all(&named).unwrap();
+        }
+        f.env.claude_config_dir = Some(named.clone().into_os_string());
+        f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
+        let checks = f.checks();
+        let c = one(&checks, "cc.auth");
+        assert_eq!(c.status, CheckStatus::Info, "{c:?}");
+        assert!(
+            c.message.contains("has not been started in this home")
+                && c.message
+                    .contains(&named.join(".claude.json").display().to_string()),
+            "{}",
+            c.message
+        );
+        assert_eq!(f.spawner.specs().len(), 1, "only `claude --version`");
+        assert!(
+            !named.join(".claude.json").exists(),
+            "doctor creates nothing"
+        );
+    }
+}
+
+#[test]
 fn a_global_config_that_cannot_be_told_to_exist_warns_and_nothing_is_spawned() {
     // A dangling link, and a home whose directory cannot be searched: unreadable input, a
     // warning, and still no `claude auth status`.
