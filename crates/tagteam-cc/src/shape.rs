@@ -325,7 +325,7 @@ pub fn import_identity(v: &Value) -> Result<Identity, ProviderError> {
     };
     let email = identity.email.as_deref().unwrap_or_default();
     if !is_valid_email(email) {
-        return Err(invalid(&format!("{email:?} is not a valid email address")));
+        return Err(invalid("the identity's email is not a valid email address"));
     }
     if flat_email.is_some_and(|f| f != email) {
         return Err(invalid(

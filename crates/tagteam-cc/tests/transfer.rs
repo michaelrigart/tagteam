@@ -138,7 +138,7 @@ fn import_refuses_what_claude_code_could_not_use_without_quoting_a_token() {
         (
             json!({"oauthAccount": oauth_account("not-an-email")}),
             good.clone(),
-            "\"not-an-email\" is not a valid email address",
+            "the identity's email is not a valid email address",
         ),
         (
             json!({"email": "b@x.co", "oauthAccount": oauth_account("a@x.co")}),

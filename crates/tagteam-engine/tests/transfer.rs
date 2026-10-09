@@ -486,3 +486,238 @@ fn a_cswap_export_that_is_encrypted_or_not_version_1_is_refused_by_name() {
     );
     assert!(!err.to_string().contains(API_KEY));
 }
+
+#[test]
+fn an_armored_export_with_leading_whitespace_decrypts() {
+    // The file is detected after its leading whitespace; it is decrypted from the same place.
+    let file = encrypt(
+        &plaintext(),
+        &Encryption::Passphrase(SecretString::from("correct horse")),
+    )
+    .unwrap();
+    let mut padded = b"\n \r\n".to_vec();
+    padded.extend_from_slice(&file);
+    let d = decode(&padded, &[], &mut |_: &Need| {
+        Some(SecretString::from("correct horse"))
+    })
+    .unwrap();
+    assert_round_trip(&d);
+}
+
+/// An age file (binary) encrypted to `SSH_PK`, its ssh-ed25519 stanza's body damaged: the key
+/// matches the stanza's tag and then fails to open it.
+fn damaged_ssh_stanza_file() -> Vec<u8> {
+    use std::str::FromStr;
+    let to = age::ssh::Recipient::from_str(SSH_PK).unwrap();
+    let encryptor =
+        age::Encryptor::with_recipients([&to as &dyn age::Recipient].into_iter()).unwrap();
+    let mut file = Vec::new();
+    let mut w = encryptor.wrap_output(&mut file).unwrap();
+    std::io::Write::write_all(&mut w, &plaintext()).unwrap();
+    w.finish().unwrap();
+    let at = file
+        .windows(14)
+        .position(|w| w == b"-> ssh-ed25519")
+        .unwrap();
+    let body = at + file[at..].iter().position(|b| *b == b'\n').unwrap() + 1;
+    file[body] = if file[body] == b'A' { b'B' } else { b'A' };
+    file
+}
+
+#[test]
+fn a_key_that_fails_to_open_a_file_does_not_blame_a_passphrase() {
+    let plain = parse_identity_file("id_plain", SSH_SK.as_bytes()).unwrap();
+    let err = decode(&damaged_ssh_stanza_file(), &[plain], &mut ask_nothing).unwrap_err();
+    assert_eq!(err.kind(), "decrypt-failed");
+    assert_eq!(
+        err.to_string(),
+        "the file could not be opened with the given key, or it is damaged"
+    );
+}
+
+#[test]
+fn an_encrypted_ssh_key_is_not_asked_for_when_the_file_has_no_ssh_ed25519_stanza() {
+    let key = age::x25519::Identity::generate();
+    let to = parse_recipient(&key.to_public().to_string()).unwrap();
+    let file = encrypt(&plaintext(), &Encryption::Recipients(vec![to])).unwrap();
+    let locked = parse_identity_file("id_ed25519", SSH_SK_ENCRYPTED.as_bytes()).unwrap();
+    let err = decode(&file, &[locked], &mut ask_nothing).unwrap_err();
+    assert_eq!(
+        (err.kind(), err.to_string().as_str()),
+        (
+            "decrypt-failed",
+            "none of the --identity keys can decrypt this file"
+        )
+    );
+}
+
+/// OpenSSH's wire `string`: a big-endian length, then the bytes.
+fn wire_string(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn take_wire_string(input: &[u8]) -> (&[u8], &[u8]) {
+    let n = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
+    (&input[4..4 + n], &input[4 + n..])
+}
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_decode(text: &str) -> Vec<u8> {
+    let (mut out, mut acc, mut bits) = (Vec::new(), 0u32, 0);
+    for c in text.bytes().filter(|c| *c != b'=') {
+        acc = acc << 6 | B64.iter().position(|b| *b == c).unwrap() as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |n, b| n << 8 | u32::from(*b)) << (8 * (3 - chunk.len()));
+        for i in 0..=chunk.len() {
+            out.push(B64[(n >> (18 - 6 * i) & 63) as usize] as char);
+        }
+        out.push_str(&"=".repeat(3 - chunk.len()));
+    }
+    out
+}
+
+fn pem_blob(pem: &str) -> Vec<u8> {
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    base64_decode(&body)
+}
+
+/// An OpenSSH private key file holding `blob`.
+fn pem(blob: &[u8]) -> String {
+    let b64 = base64_encode(blob);
+    let lines: Vec<&str> = b64
+        .as_bytes()
+        .chunks(70)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect();
+    format!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+        lines.join("\n")
+    )
+}
+
+/// `rsa_blob` (an OpenSSH private key) with the public key in its header replaced by
+/// `ed25519_blob`'s: an RSA private section under an ssh-ed25519 header.
+fn splice(rsa_blob: &[u8], ed25519_blob: &[u8]) -> Vec<u8> {
+    let magic = b"openssh-key-v1\0";
+    let header_of = |blob: &[u8]| {
+        let rest = &blob[magic.len()..];
+        let (cipher, rest) = take_wire_string(rest);
+        let (kdf, rest) = take_wire_string(rest);
+        let (opts, rest) = take_wire_string(rest);
+        let (public, rest) = take_wire_string(&rest[4..]);
+        (
+            cipher.to_vec(),
+            kdf.to_vec(),
+            opts.to_vec(),
+            public.to_vec(),
+            rest.to_vec(),
+        )
+    };
+    let (cipher, kdf, opts, _, rest) = header_of(rsa_blob);
+    let (_, _, _, ed25519_public, _) = header_of(ed25519_blob);
+    let mut out = magic.to_vec();
+    for s in [&cipher, &kdf, &opts] {
+        wire_string(&mut out, s);
+    }
+    out.extend_from_slice(&1u32.to_be_bytes());
+    wire_string(&mut out, &ed25519_public);
+    out.extend_from_slice(&rest);
+    out
+}
+
+/// A freshly generated OpenSSH RSA private key (`ssh-keygen`, test-only, never stored), or
+/// `None` when this machine has no `ssh-keygen`.
+fn rsa_private_key(passphrase: &str) -> Option<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rsa");
+    let made = std::process::Command::new("ssh-keygen")
+        .args([
+            "-q",
+            "-t",
+            "rsa",
+            "-b",
+            "2048",
+            "-C",
+            "test-only",
+            "-N",
+            passphrase,
+            "-f",
+        ])
+        .arg(&path)
+        .status()
+        .ok()?
+        .success();
+    let pem = made
+        .then(|| std::fs::read_to_string(&path).ok())
+        .flatten()?;
+    pem.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----")
+        .then_some(pem)
+}
+
+const ED25519_ONLY: &str = "keys/x: only age X25519 and ssh-ed25519 keys can decrypt an export";
+
+#[test]
+fn an_rsa_ssh_key_is_not_an_identity() {
+    let Some(rsa) = rsa_private_key("") else {
+        eprintln!("skipped: no ssh-keygen on this machine");
+        return;
+    };
+    let err = parse_identity_file("keys/x", rsa.as_bytes()).unwrap_err();
+    assert_eq!(
+        (err.kind(), err.to_string().as_str()),
+        ("invalid-input", ED25519_ONLY)
+    );
+}
+
+#[test]
+fn an_rsa_private_section_under_an_ed25519_header_is_not_an_identity() {
+    // age reads the private section by its own type, so the header's public key alone does
+    // not say which key decrypts.
+    let Some(rsa) = rsa_private_key("") else {
+        eprintln!("skipped: no ssh-keygen on this machine");
+        return;
+    };
+    let spliced = pem(&splice(&pem_blob(&rsa), &pem_blob(SSH_SK)));
+    let err = parse_identity_file("keys/x", spliced.as_bytes()).unwrap_err();
+    assert_eq!(
+        (err.kind(), err.to_string().as_str()),
+        ("invalid-input", ED25519_ONLY)
+    );
+}
+
+#[test]
+fn an_encrypted_rsa_private_section_under_an_ed25519_header_is_refused_once_unlocked() {
+    let Some(rsa) = rsa_private_key("pw") else {
+        eprintln!("skipped: no ssh-keygen on this machine");
+        return;
+    };
+    let spliced = pem(&splice(&pem_blob(&rsa), &pem_blob(SSH_SK)));
+    let locked = parse_identity_file("keys/x", spliced.as_bytes()).unwrap();
+    let file = encrypt(
+        &plaintext(),
+        &Encryption::Recipients(vec![parse_recipient(SSH_PK).unwrap()]),
+    )
+    .unwrap();
+    let err = decode(&file, &[locked], &mut |_: &Need| {
+        Some(SecretString::from("pw"))
+    })
+    .unwrap_err();
+    assert_eq!(
+        (err.kind(), err.to_string().as_str()),
+        ("invalid-input", ED25519_ONLY)
+    );
+}

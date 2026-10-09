@@ -28,6 +28,8 @@ const NOT_AN_EXPORT: &str =
     "the file is not a tagteam export, an age-encrypted one, or a cswap version 1 export";
 const WRONG_PASSPHRASE: &str = "the passphrase is wrong, or the file is damaged";
 const NO_MATCHING_KEY: &str = "none of the --identity keys can decrypt this file";
+const KEY_DID_NOT_OPEN: &str = "the file could not be opened with the given key, or it is damaged";
+const ED25519_ONLY: &str = "only age X25519 and ssh-ed25519 keys can decrypt an export";
 const BAD_RECIPIENT: &str = "a recipient must be an age1… or ssh-ed25519 public key";
 
 #[derive(Debug, thiserror::Error)]
@@ -510,16 +512,15 @@ pub fn parse_identity_file(file: &str, bytes: &[u8]) -> Result<IdentityFile, Tra
         file: file.to_owned(),
         detail: detail.to_owned(),
     };
-    let ed25519_only = "only age X25519 and ssh-ed25519 keys can decrypt an export";
     let keys = if bytes.trim_ascii_start().starts_with(b"-----BEGIN") {
         let key = age::ssh::Identity::from_buffer(bytes, Some(file.to_owned()))
             .map_err(|_| refused("it is not a private key tagteam can read"))?;
-        // The key's public half says its type, encrypted or not.
-        if !matches!(
-            age::ssh::Recipient::try_from(key.clone()),
-            Ok(age::ssh::Recipient::SshEd25519(..))
-        ) {
-            return Err(refused(ed25519_only));
+        // The header's public half says the type of an encrypted key, which is checked again
+        // once it is unlocked. An unencrypted key's private section is read by its own type,
+        // not the header's, so it must open what is encrypted to its own public half.
+        let encrypted = matches!(key, age::ssh::Identity::Encrypted(_));
+        if !is_ed25519_recipient(&key) || (!encrypted && !opens_its_own_recipient(&key)) {
+            return Err(refused(ED25519_ONLY));
         }
         match key {
             age::ssh::Identity::Encrypted(key) => vec![Key::SshEncrypted(key)],
@@ -541,6 +542,41 @@ pub fn parse_identity_file(file: &str, bytes: &[u8]) -> Result<IdentityFile, Tra
         file: file.to_owned(),
         keys,
     })
+}
+
+/// Whether the key's public half, which names its type, is an ssh-ed25519 one.
+fn is_ed25519_recipient(key: &age::ssh::Identity) -> bool {
+    matches!(
+        age::ssh::Recipient::try_from(key.clone()),
+        Ok(age::ssh::Recipient::SshEd25519(..))
+    )
+}
+
+/// Whether `key` decrypts what is encrypted to the ssh-ed25519 recipient derived from its
+/// public half. A private section of another type (an RSA key under an ed25519 header) does
+/// not, and so never reaches the `rsa` crate's decryption (RUSTSEC-2023-0071).
+fn opens_its_own_recipient(key: &age::ssh::Identity) -> bool {
+    let Ok(recipient) = age::ssh::Recipient::try_from(key.clone()) else {
+        return false;
+    };
+    let probe = b"tagteam";
+    let mut sealed = Vec::new();
+    let sealed_ok =
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .ok()
+            .and_then(|e| e.wrap_output(&mut sealed).ok())
+            .is_some_and(|mut w| w.write_all(probe).is_ok() && w.finish().is_ok());
+    if !sealed_ok {
+        return false;
+    }
+    let Ok(decryptor) = age::Decryptor::new_buffered(&sealed[..]) else {
+        return false;
+    };
+    let Ok(mut reader) = decryptor.decrypt(std::iter::once(key as &dyn age::Identity)) else {
+        return false;
+    };
+    let mut opened = Vec::new();
+    reader.read_to_end(&mut opened).is_ok() && opened == probe
 }
 
 /// What `decode` asks its caller for, only when the file needs it.
@@ -573,7 +609,7 @@ pub fn decode(
     let start = input.trim_ascii_start();
     let encrypted = start.starts_with(ARMOR_BEGIN) || start.starts_with(AGE_MAGIC);
     let plaintext = if encrypted {
-        decrypt(input, identities, ask)?
+        decrypt(start, identities, ask)?
     } else {
         input.to_vec()
     };
@@ -604,7 +640,12 @@ fn damaged(e: impl fmt::Display) -> TransferError {
 }
 
 /// One attempt with `keys`, over a fresh read of `input`: a `Decryptor` is spent by a try.
-fn attempt(input: &[u8], keys: &[&dyn age::Identity]) -> Result<Attempt, TransferError> {
+/// `passphrase` says whether the keys are a passphrase, which a failure then blames.
+fn attempt(
+    input: &[u8],
+    keys: &[&dyn age::Identity],
+    passphrase: bool,
+) -> Result<Attempt, TransferError> {
     let decryptor = age::Decryptor::new_buffered(ArmoredReader::new(input)).map_err(damaged)?;
     match decryptor.decrypt(keys.iter().copied()) {
         Ok(mut reader) => {
@@ -613,11 +654,39 @@ fn attempt(input: &[u8], keys: &[&dyn age::Identity]) -> Result<Attempt, Transfe
             Ok(Attempt::Plaintext(out))
         }
         Err(age::DecryptError::NoMatchingKeys) => Ok(Attempt::NoMatch),
-        Err(age::DecryptError::DecryptionFailed) => {
-            Err(TransferError::Decrypt(WRONG_PASSPHRASE.into()))
-        }
+        Err(age::DecryptError::DecryptionFailed) => Err(TransferError::Decrypt(
+            if passphrase {
+                WRONG_PASSPHRASE
+            } else {
+                KEY_DID_NOT_OPEN
+            }
+            .into(),
+        )),
         Err(e) => Err(damaged(e)),
     }
+}
+
+/// The recipient stanza types of an age file's header, armored or binary, or `None` when the
+/// header cannot be read.
+fn stanza_types(input: &[u8]) -> Option<Vec<String>> {
+    let mut head = Vec::new();
+    ArmoredReader::new(input)
+        .take(64 * 1024)
+        .read_to_end(&mut head)
+        .ok()?;
+    let mut lines = head.split(|b| *b == b'\n');
+    lines.next()?;
+    let mut types = Vec::new();
+    for line in lines {
+        if line.starts_with(b"---") {
+            return Some(types);
+        }
+        if let Some(stanza) = line.strip_prefix(b"-> ") {
+            let name = stanza.split(|b| *b == b' ').next()?;
+            types.push(String::from_utf8_lossy(name).into_owned());
+        }
+    }
+    None
 }
 
 fn decrypt(
@@ -629,7 +698,7 @@ fn decrypt(
     if decryptor.is_scrypt() {
         let passphrase = ask(&Need::Passphrase).ok_or(TransferError::NeedsPassphrase)?;
         let key = age::scrypt::Identity::new(passphrase);
-        return match attempt(input, &[&key])? {
+        return match attempt(input, &[&key], true)? {
             Attempt::Plaintext(p) => Ok(p),
             Attempt::NoMatch => Err(TransferError::Decrypt(WRONG_PASSPHRASE.into())),
         };
@@ -647,11 +716,15 @@ fn decrypt(
         })
         .collect();
     if !ready.is_empty() {
-        if let Attempt::Plaintext(p) = attempt(input, &ready)? {
+        if let Attempt::Plaintext(p) = attempt(input, &ready, false)? {
             return Ok(p);
         }
     }
-    for file in identities {
+    // An encrypted SSH key can only open an ssh-ed25519 stanza: without one, its passphrase is
+    // not worth asking for. A header that cannot be read leaves the question to the key.
+    let may_hold_ssh_stanza =
+        stanza_types(input).is_none_or(|t| t.iter().any(|t| t == "ssh-ed25519"));
+    for file in identities.iter().filter(|_| may_hold_ssh_stanza) {
         for key in &file.keys {
             let Key::SshEncrypted(encrypted) = key else {
                 continue;
@@ -662,7 +735,13 @@ fn decrypt(
                 TransferError::Decrypt(format!("{}: the SSH key's passphrase is wrong", file.file))
             })?;
             let unlocked = age::ssh::Identity::from(unlocked);
-            if let Attempt::Plaintext(p) = attempt(input, &[&unlocked])? {
+            if !is_ed25519_recipient(&unlocked) || !opens_its_own_recipient(&unlocked) {
+                return Err(TransferError::Identity {
+                    file: file.file.clone(),
+                    detail: ED25519_ONLY.into(),
+                });
+            }
+            if let Attempt::Plaintext(p) = attempt(input, &[&unlocked], false)? {
                 return Ok(p);
             }
         }
