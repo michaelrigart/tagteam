@@ -15,6 +15,12 @@
 #   c. Every top-level entry of ~/.claude, after one headless `claude -p` run with a
 #      dummy API key, is on the known-shared or known-private list. The probe must have
 #      created ~/.claude/projects/*, else the check proves nothing (harness failure).
+#   d. Every CLAUDE_CODE_* and ANTHROPIC_* name in the claude executable (and, for an npm
+#      install, in every file of its package) is matched by a known-env entry. A name counts
+#      only where it stands alone between punctuation or whitespace, so a byte that a string
+#      table packs after a name never makes a new one. The check must find a name that `run`
+#      scrubs, else it proves nothing (harness failure). The report lists the first 150
+#      unmatched names (override: CC_DRIFT_ENV_REPORT_MAX); FILE.env-names.txt lists them all.
 #
 # Data files live in crates/tagteam-cc/compat/ (override: CC_DRIFT_COMPAT_DIR).
 # The probe timeout in seconds defaults to 300 (override: CC_DRIFT_PROBE_TIMEOUT): claude
@@ -54,9 +60,10 @@ done
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 compat="${CC_DRIFT_COMPAT_DIR:-$script_dir/../crates/tagteam-cc/compat}"
 probe_timeout="${CC_DRIFT_PROBE_TIMEOUT:-300}"
+env_report_max="${CC_DRIFT_ENV_REPORT_MAX:-150}"
 
 command -v jq >/dev/null || die "jq not found"
-for f in tested-cc-version known-shared known-private auth-status-logged-out.json; do
+for f in tested-cc-version known-shared known-private known-env auth-status-logged-out.json; do
   [[ -r "$compat/$f" ]] || die "missing compat file: $compat/$f"
 done
 
@@ -72,6 +79,7 @@ case "$claude_bin" in
 esac
 
 : >"$report"
+rm -f "$report.env-names.txt"
 
 # Env overrides that would point claude at a real account, config or provider.
 while IFS= read -r name; do
@@ -256,6 +264,96 @@ fi
 if [[ -n "$unknown" ]]; then
   add_section "Unknown top-level \`~/.claude\` entries" \
     "On neither the known-shared nor the known-private list:"$'\n\n'"${unknown%$'\n'}"
+fi
+
+# d. Environment names ---------------------------------------------------------
+# Follows a symlink chain to the file it names (no `readlink -f` on older macOS).
+resolve_link() {
+  local p="$1" target hops=0
+  while [[ -L "$p" ]]; do
+    hops=$((hops + 1))
+    ((hops <= 40)) || die "too many symlinks resolving $1"
+    target="$(readlink "$p")"
+    case "$target" in
+      /*) p="$target" ;;
+      *) p="$(dirname "$p")/$target" ;;
+    esac
+  done
+  printf '%s\n' "$p"
+}
+
+env_classes=()
+env_patterns=()
+while IFS= read -r line; do
+  class="${line%%[[:space:]]*}"
+  pattern="${line#"$class"}"
+  pattern="${pattern#"${pattern%%[![:space:]]*}"}"
+  case "$class" in
+    scrub | known) ;;
+    *) die "bad known-env entry (the class is scrub or known): $line" ;;
+  esac
+  [[ "$pattern" =~ ^[A-Z0-9_*]+$ ]] || die "bad known-env entry (the name): $line"
+  env_classes+=("$class")
+  env_patterns+=("$pattern")
+done < <(read_list "$compat/known-env")
+((${#env_patterns[@]} > 0)) || die "known-env lists no name"
+
+binary="$(resolve_link "$claude_bin")"
+env_sources=("$binary")
+dir="$(dirname "$binary")"
+for _ in 1 2 3; do
+  if [[ -f "$dir/package.json" ]] &&
+    [[ "$(jq -r '.name // empty' "$dir/package.json" 2>/dev/null)" == "@anthropic-ai/claude-code" ]]; then
+    while IFS= read -r -d '' f; do
+      [[ "$f" == "$binary" ]] || env_sources+=("$f")
+    done < <(find "$dir" -type f -print0)
+    break
+  fi
+  [[ "$dir" == / ]] && break
+  dir="$(dirname "$dir")"
+done
+
+# Bytes other than printable ASCII, tab, LF and CR become '~'; every byte but a letter, digit,
+# '_' or '~' then ends a token; a token is a name only when the whole of it is one.
+env_names="$work/env-names"
+for src in "${env_sources[@]}"; do
+  LC_ALL=C tr '\000-\010\013\014\016-\037\177-\377' '~' <"$src"
+  echo
+done | LC_ALL=C tr -cs 'A-Za-z0-9_~' '\n' |
+  { LC_ALL=C grep -E '^(CLAUDE_CODE|ANTHROPIC)_[A-Z0-9_]+$' || true; } |
+  LC_ALL=C sort -u >"$env_names"
+
+unknown_env=""
+unknown_count=0
+scrub_seen=0
+while IFS= read -r name; do
+  matched=""
+  for i in "${!env_patterns[@]}"; do
+    # shellcheck disable=SC2053 # the entry is a glob pattern on purpose
+    if [[ "$name" == ${env_patterns[i]} ]]; then
+      matched="${env_classes[i]}"
+      break
+    fi
+  done
+  case "$matched" in
+    scrub) scrub_seen=1 ;;
+    known) ;;
+    *)
+      unknown_env+="$name"$'\n'
+      unknown_count=$((unknown_count + 1))
+      ;;
+  esac
+done <"$env_names"
+((scrub_seen)) ||
+  die "found no name that run scrubs in $binary (${#env_sources[@]} file(s) read); the extraction cannot read this build"
+if ((unknown_count)); then
+  printf '%s' "$unknown_env" >"$report.env-names.txt"
+  shown="$(printf '%s' "$unknown_env" | sed -n "1,${env_report_max}{s/^/- \`/;s/\$/\`/;p;}")"
+  if ((unknown_count > env_report_max)); then
+    shown+=$'\n'"- … and $((unknown_count - env_report_max)) more: all $unknown_count are in the run's \`env-names.txt\` artifact (locally, \`FILE.env-names.txt\`)."
+  fi
+  add_section "Unclassified environment names" \
+    "$unknown_count \`CLAUDE_CODE_*\` or \`ANTHROPIC_*\` name(s) in the binary that no \`known-env\` entry matches:"$'\n\n'"$shown"
 fi
 
 # Report ----------------------------------------------------------------------
