@@ -583,41 +583,44 @@ pub fn session_records(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     );
 
     // While it runs, the profile is session-owned for tagteam: doctor reports the daemon, and a
-    // switch to the account is refused as `session-owned` (§12.6, §13.6).
-    let doctor = ctx
-        .tagteam(&["doctor", "--json"])
-        .timeout(Duration::from_secs(60))
-        .run(&ctx.roots)?;
-    p.note("tagteam doctor --json", doctor.summary());
-    p.expect(
-        "--bg: doctor's `sessions.daemon` info line names this profile",
-        doctor
-            .json()
-            .is_some_and(|v| doctor_names_daemon(&v, &spelling)),
-        json!(null),
-    );
-    let switch = ctx
-        .tagteam(&["switch", ALIAS_OAUTH, "--json"])
-        .run(&ctx.roots)?;
-    p.note("tagteam switch while it runs", switch.summary());
-    p.expect(
-        "--bg: a switch to the account is refused as session-owned",
-        !switch.success() && switch.json().as_ref().and_then(error_kind) == Some("session-owned"),
-        json!(null),
-    );
+    // switch to the account is refused as `session-owned` (§12.6, §13.6). Only when both the
+    // supervisor and a worker were seen: otherwise the profile is not known to be owned.
+    if supervisor && workers {
+        let doctor = ctx
+            .tagteam(&["doctor", "--json"])
+            .timeout(Duration::from_secs(60))
+            .run(&ctx.roots)?;
+        p.note("tagteam doctor --json", doctor.summary());
+        let report = doctor.json().unwrap_or(Value::Null);
+        p.expect(
+            "--bg: doctor's `sessions.daemon` info line names this profile",
+            doctor_names_daemon(&report, &spelling),
+            ctx.redact.value(&daemon_entries(&report)),
+        );
+        let switch = ctx
+            .tagteam(&["switch", ALIAS_OAUTH, "--json"])
+            .run(&ctx.roots)?;
+        p.note("tagteam switch while it runs", switch.summary());
+        p.expect(
+            "--bg: a switch to the account is refused as session-owned",
+            !switch.success()
+                && switch.json().as_ref().and_then(error_kind) == Some("session-owned"),
+            json!(null),
+        );
+    } else {
+        p.note(
+            "--bg: doctor and the switch while it runs",
+            json!("not run: the supervisor and a worker were not both seen"),
+        );
+    }
 
     // A failed stop is a failed expectation with its error, not a lost check: the evidence so
     // far stays, and cleanup (`must_stop`) and the later quiescence assertion stand.
-    match ctx.stop_daemon(&spelling) {
-        Ok(stop) => p.note("claude daemon stop --any", json!(stop)),
-        Err(e) => {
-            p.expect(
-                "--bg: claude daemon stop --any stopped it",
-                false,
-                json!(e.0),
-            );
-        }
-    }
+    stop_outcome(
+        &mut p,
+        ctx.stop_daemon(&spelling),
+        cancel().requested().is_some(),
+    )?;
     let left = daemon::survey(home, &SystemProcessProbe);
     p.expect(
         "--bg: the lock, the roster and the records name nothing alive once it stops",
@@ -646,6 +649,40 @@ fn doctor_names_daemon(doctor: &Value, profile: &str) -> bool {
                     || c["message"].as_str().is_some_and(|m| m.contains(profile)))
         })
     })
+}
+
+/// Doctor's `sessions.daemon` entries, whole (id, status, message, fix), as evidence.
+fn daemon_entries(doctor: &Value) -> Value {
+    let entries: Vec<Value> = doctor["checks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| c["id"] == "sessions.daemon")
+        .map(|c| json!({"id": c["id"], "status": c["status"], "message": c["message"], "fix": c["fix"]}))
+        .collect();
+    json!(entries)
+}
+
+/// What the `--bg` sub-check makes of the daemon's stop. A stop that failed is a failed
+/// expectation carrying its error, unless the run was cancelled: a cancelled stop is the
+/// run's interruption, which must unwind (an Error outcome), not a verdict on the daemon.
+fn stop_outcome(
+    p: &mut Probe,
+    stop: Result<Option<Value>, HarnessError>,
+    cancelled: bool,
+) -> Result<(), HarnessError> {
+    match stop {
+        Ok(ran) => p.note("claude daemon stop --any", json!(ran)),
+        Err(e) if cancelled => return Err(e),
+        Err(e) => {
+            p.expect(
+                "--bg: claude daemon stop --any stopped it",
+                false,
+                json!(e.0),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The `error.type` of a `--json` command's error object.
@@ -777,6 +814,14 @@ pub fn storage_write_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
         thread::sleep(Duration::from_millis(1));
     }
     let ran = running.wait()?;
+    for (name, spelling) in [(".storage-write", &old), (".storage-write.lock", &new)] {
+        if spelling.seen > 0 && spelling.refused == 0 {
+            p.note(
+                &format!("CC's {name} was seen but never refused tagteam"),
+                spelling.tally(),
+            );
+        }
+    }
     let (held, which) = lock_verdict(&old, &new);
     p.expect(
         "CC held a storage-write lock under a spelling tagteam takes, and it refused tagteam",
@@ -896,6 +941,41 @@ esac"#;
             assert_eq!(which, [name]);
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_stop_unwinds_and_any_other_failed_stop_is_a_failed_expectation() {
+        let failed = || Err(harness("`claude daemon stop` failed: exit 1"));
+        let mut p = Probe::new();
+        assert!(
+            stop_outcome(&mut p, failed(), true).is_err(),
+            "cancelled: an error"
+        );
+
+        let mut p = Probe::new();
+        stop_outcome(&mut p, failed(), false).unwrap();
+        let outcome = p.finish("done");
+        assert_eq!(outcome.status, Status::Fail);
+        assert_eq!(outcome.evidence[0].ok, Some(false));
+        assert!(outcome.evidence[0].value.to_string().contains("exit 1"));
+
+        let mut p = Probe::new();
+        stop_outcome(&mut p, Ok(Some(json!({"exit": 0}))), true).unwrap();
+        assert_eq!(p.finish("done").status, Status::Pass);
+    }
+
+    #[test]
+    fn doctor_s_daemon_entries_are_kept_whole_as_evidence() {
+        let doctor = json!({"checks": [
+            {"id": "keychain.lock", "status": "ok", "message": "m", "fix": null},
+            {"id": "sessions.daemon", "status": "info", "message": "a daemon runs", "fix": "stop it"},
+        ]});
+        assert_eq!(
+            daemon_entries(&doctor),
+            json!([{"id": "sessions.daemon", "status": "info", "message": "a daemon runs",
+                    "fix": "stop it"}])
+        );
+        assert_eq!(daemon_entries(&Value::Null), json!([]));
     }
 
     fn label<'o>(o: &'o Outcome, text: &str) -> &'o crate::compat::report::Evidence {

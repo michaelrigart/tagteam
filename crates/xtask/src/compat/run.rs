@@ -306,9 +306,10 @@ fn credential_files(root: &Path) -> Vec<String> {
 /// test account has: only from here on is a scratch directory safe to delete.
 const TAKEN_INTO_VAULT: &str = "default home's generation taken into the vault";
 
-/// The Keychain items named from the scratch homes (macOS), which `credential_files` cannot
-/// see: the default home's and each home under `homes/`, by service name. These carry the
-/// scratch suffix; the user's own items never appear here.
+/// The Keychain items the scratch homes would have (macOS), which `credential_files` cannot
+/// see: the default home's and each home under `homes/`, by service name. They are computed
+/// names, not a listing, so an item may not exist. They carry the scratch suffix; the user's
+/// own items never appear here.
 fn scratch_items(ctx: &Ctx) -> Vec<String> {
     if !ctx.macos {
         return Vec::new();
@@ -352,7 +353,7 @@ fn kept_note(scratch: &Path, captured: bool, items: &[String]) -> Evidence {
         String::new()
     } else {
         format!(
-            " Keychain items named from its homes are left behind too, and go with it: {}.",
+            " Keychain items named from its homes may be left behind too (these are the names its homes would have, whether or not the items exist; deleting the directory does not remove them): {}.",
             items.join(", ")
         )
     };
@@ -996,6 +997,10 @@ mod tests {
                 && unsafe_to_delete.contains("tagteam add")
                 && unsafe_to_delete.contains("settle gate")
                 && unsafe_to_delete.contains("Claude Code-credentials-1b2f156f"),
+            "{unsafe_to_delete}"
+        );
+        assert!(
+            unsafe_to_delete.contains("may be left behind"),
             "{unsafe_to_delete}"
         );
         let safe = kept_note(&dir, true, &items)
