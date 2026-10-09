@@ -39,6 +39,6 @@ pub mod vault;
 pub mod views;
 
 pub use engine::{Engine, EngineConfig};
-pub use error::{EngineError, SplitCause};
+pub use error::{EngineError, SessionOwner, SplitCause};
 #[cfg(feature = "test-hooks")]
 pub use hooks::pause_at;

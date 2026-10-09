@@ -2132,9 +2132,8 @@ impl Run<'_> {
         let state = self.engine.session_state(p, row);
         let quiescent = matches!(state, Ok(SessionState::Quiescent { .. }));
         let unread = match &state {
-            Ok(SessionState::Unreadable { detail, .. }) => Some(detail.clone()),
+            Ok(state) => state.unreadable_text(),
             Err(e) => Some(e.kind().to_owned()),
-            Ok(_) => None,
         };
         if let Some(why) = unread {
             found.push(

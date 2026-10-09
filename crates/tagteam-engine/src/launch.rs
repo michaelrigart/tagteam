@@ -166,7 +166,7 @@ impl Engine {
                 );
             }
         }
-        if let SessionState::Unreadable { detail, .. } = &state {
+        if let Some(detail) = state.unreadable_text() {
             warnings.push(format!(
                 "a session of position {} may be running ({detail}), so this launch joins it as it is",
                 row.position

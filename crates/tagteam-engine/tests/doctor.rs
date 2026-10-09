@@ -1640,6 +1640,31 @@ fn a_live_background_daemon_supervisor_in_a_profile_is_information_naming_how_to
 }
 
 #[test]
+fn a_live_session_does_not_hide_the_daemon_from_doctor_and_an_unreadable_lock_is_named() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = seeded_profile(&fx, &id);
+    fx.live_record(&dir, 4242, "interactive");
+    live_supervisor(&fx, &dir, 4343);
+    let r = doctor(&fx);
+    let c = one(&r, "sessions.daemon");
+    assert_eq!(c.status, CheckStatus::Info);
+    assert!(fix(c).contains("claude daemon stop --any"), "{c:?}");
+
+    fs::remove_file(dir.join("sessions/4242.json")).unwrap();
+    fs::write(dir.join("daemon.lock"), "{").unwrap();
+    let r = doctor(&fx);
+    let c = one(&r, "sessions.state");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        c.message
+            .contains(&dir.join("daemon.lock").display().to_string()),
+        "the lock is named: {}",
+        c.message
+    );
+}
+
+#[test]
 fn a_baseline_awaiting_merge_back_and_a_profile_awaiting_a_bootstrap_are_information() {
     let fx = Fx::new();
     let id = fx.add("a@x.co", "rt-a");

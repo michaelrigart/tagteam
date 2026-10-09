@@ -513,7 +513,7 @@ fn an_orphaned_profile_with_a_live_daemon_supervisor_refuses_naming_the_daemon()
     );
     let err = fx.engine.purge(&plan).unwrap_err();
     assert!(
-        matches!(&err, EngineError::OrphanSessionRunning { profile, daemon: true } if profile == &gone),
+        matches!(&err, EngineError::OrphanSessionRunning { profile, owner } if profile == &gone && owner.daemon.is_some()),
         "{err:?}"
     );
     assert_eq!(err.kind(), "session-owned");
@@ -531,6 +531,44 @@ fn an_orphaned_profile_with_a_live_daemon_supervisor_refuses_naming_the_daemon()
 }
 
 #[test]
+fn an_orphaned_profile_with_an_unreadable_daemon_lock_or_a_session_and_a_daemon_names_each() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let gone = orphan(&fx, "0192-gone");
+    let plan = full_plan(&fx);
+    let lock = gone.join("daemon.lock");
+    fs::write(&lock, "{").unwrap();
+    let message = fx.engine.purge(&plan).unwrap_err().to_string();
+    assert!(
+        message.contains(&format!("'{}'", lock.display()))
+            && message.contains("if nothing runs as Claude Code for that profile, delete it")
+            && !message.contains("exit that session"),
+        "{message}"
+    );
+    fs::write(
+        &lock,
+        json!({"pid": 779, "origin": "transient", "procStart": common::LSTART}).to_string(),
+    )
+    .unwrap();
+    fx.process.set(
+        779,
+        FakeProcess {
+            exists: Some(true),
+            start_time_s: tagteam_provider::parse_lstart(common::LSTART),
+            ..FakeProcess::default()
+        },
+    );
+    let _held = fx.hold_reservation(&gone);
+    let message = fx.engine.purge(&plan).unwrap_err().to_string();
+    assert!(
+        message.contains("`tagteam run` session")
+            && message.contains("background daemon")
+            && message.contains("claude daemon stop --any"),
+        "{message}"
+    );
+}
+
+#[test]
 fn an_orphaned_profile_in_use_refuses() {
     // Review Focus 3: the profile's account row is gone, and a session still runs in it.
     let fx = Fx::new();
@@ -540,7 +578,7 @@ fn an_orphaned_profile_in_use_refuses() {
     let session = fx.hold_reservation(&gone);
     let err = fx.engine.purge(&plan).unwrap_err();
     assert!(
-        matches!(&err, EngineError::OrphanSessionRunning { profile, daemon: false } if profile == &gone),
+        matches!(&err, EngineError::OrphanSessionRunning { profile, owner } if profile == &gone && owner.daemon.is_none()),
         "{err:?}"
     );
     assert_eq!(err.kind(), "session-owned");

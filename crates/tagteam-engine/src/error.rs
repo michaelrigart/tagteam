@@ -132,15 +132,12 @@ pub enum EngineError {
     /// pull the login from under a running session. `unreadable` is set when a reservation or a
     /// session record could not be read (§12.6), which counts as owned: it names the file and
     /// why, since nothing may be running at all and the user has a file to repair.
-    ///
-    /// `daemon` is set, with the profile, when what owns it is a Claude Code background daemon
-    /// (§12.6): the message names it and how to stop it.
-    #[error("{}", session_owned_message(*.position, .label, .unreadable.as_deref(), .daemon.as_deref()))]
+    /// `owner` says what owns it, and the message names each (§12.6).
+    #[error("{}", session_owned_message(*.position, .label, .owner))]
     SessionOwned {
         position: u32,
         label: String,
-        unreadable: Option<String>,
-        daemon: Option<PathBuf>,
+        owner: Box<SessionOwner>,
     },
     /// §9.2, §12.5: the account's quiescent session profile and the vault both moved since they
     /// last agreed, so the vault's generation may be consumed. An explicit replacement resolves
@@ -236,9 +233,12 @@ pub enum EngineError {
     EngineRunning { provider: String, pid: Option<u32> },
     /// §10.5 step 6: a session profile that no store account owns is in use: a live launch
     /// reservation, or a session record that is live or cannot be read (§12.5, §12.6).
-    /// `daemon`: what is using it is a Claude Code background daemon (§12.6).
-    #[error("{}", orphan_message(profile, *daemon))]
-    OrphanSessionRunning { profile: PathBuf, daemon: bool },
+    /// `owner` says what is using it (§12.6).
+    #[error("{}", orphan_message(profile, .owner))]
+    OrphanSessionRunning {
+        profile: PathBuf,
+        owner: Box<SessionOwner>,
+    },
     /// §10.5 step 6: the accounts a purge would delete are not the ones that were confirmed.
     #[error(
         "the accounts changed since the purge was confirmed (another command added or removed one); run `tagteam purge` again"
@@ -300,41 +300,80 @@ pub(crate) fn daemon_advice(profile: &Path) -> String {
     )
 }
 
-/// `OrphanSessionRunning`'s message.
-fn orphan_message(profile: &Path, daemon: bool) -> String {
-    if daemon {
-        format!(
-            "{} belongs to no stored account, but a Claude Code background daemon runs in it; {}, then retry",
-            profile.display(),
-            daemon_advice(profile)
-        )
-    } else {
-        format!(
-            "{} belongs to no stored account, but a `tagteam run` session is using it or its sessions cannot be checked; exit that session first",
-            profile.display()
-        )
+/// What owns a profile that is session-owned (§12.5, §12.6), as a refusal names it: every
+/// owner found, not the first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionOwner {
+    /// A `tagteam run` session, or any live owner that is not a background daemon.
+    pub session: bool,
+    /// A Claude Code background daemon owns it too, in this profile.
+    pub daemon: Option<PathBuf>,
+    /// Session state that could not be read, and why (nothing live was found).
+    pub unreadable: Option<String>,
+    /// The supervisor's `daemon.lock` that could not be read, when that is what `unreadable`
+    /// names.
+    pub lock: Option<PathBuf>,
+}
+
+impl SessionOwner {
+    /// The owners `state` found.
+    pub fn of(state: &crate::session::SessionState) -> Self {
+        use crate::session::SessionState;
+        match state {
+            SessionState::Owned {
+                profile,
+                session,
+                daemon,
+            } => Self {
+                session: *session,
+                daemon: daemon.then(|| profile.clone()),
+                ..Self::default()
+            },
+            SessionState::Unreadable { detail, lock, .. } => Self {
+                unreadable: Some(detail.clone()),
+                lock: lock.clone(),
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
+
+    /// Why the profile counts as in use, for a sentence "... {subject} counts as in use by ...".
+    fn reason(&self, subject: &str) -> String {
+        match (&self.unreadable, &self.lock, &self.daemon) {
+            (Some(detail), Some(lock), _) => format!(
+                "{subject} counts as in use by a Claude Code background daemon because its lock {} cannot be read ({detail}); if nothing runs as Claude Code for that profile, delete it, then retry",
+                quoted(lock)
+            ),
+            (Some(detail), None, _) => format!(
+                "{subject} counts as in use by a `tagteam run` session because its session state cannot be read ({detail}); repair or remove that file, then retry"
+            ),
+            (None, _, Some(profile)) if self.session => format!(
+                "{subject} is in use by a `tagteam run` session and by a Claude Code background daemon; exit that session, and {}, then retry",
+                daemon_advice(profile)
+            ),
+            (None, _, Some(profile)) => format!(
+                "{subject} is in use by a Claude Code background daemon; {}, then retry",
+                daemon_advice(profile)
+            ),
+            (None, _, None) => {
+                format!("{subject} is in use by a `tagteam run` session; exit that session first")
+            }
+        }
     }
 }
 
-/// `SessionOwned`'s message: a running session, or session state that cannot be read.
-fn session_owned_message(
-    position: u32,
-    label: &str,
-    unreadable: Option<&str>,
-    daemon: Option<&Path>,
-) -> String {
-    match (unreadable, daemon) {
-        (None, Some(profile)) => format!(
-            "position {position} ({label}) is in use by a Claude Code background daemon; {}, then retry",
-            daemon_advice(profile)
-        ),
-        (None, None) => format!(
-            "position {position} ({label}) is in use by a `tagteam run` session; exit that session first"
-        ),
-        (Some(detail), _) => format!(
-            "position {position} ({label}) counts as in use by a `tagteam run` session because its session state cannot be read ({detail}); repair or remove that file, then retry"
-        ),
-    }
+/// `OrphanSessionRunning`'s message.
+fn orphan_message(profile: &Path, owner: &SessionOwner) -> String {
+    owner.reason(&format!(
+        "{} belongs to no stored account, but it",
+        profile.display()
+    ))
+}
+
+/// `SessionOwned`'s message: a running session, a daemon, or session state that cannot be read.
+fn session_owned_message(position: u32, label: &str, owner: &SessionOwner) -> String {
+    owner.reason(&format!("position {position} ({label})"))
 }
 
 impl EngineError {
@@ -583,8 +622,7 @@ mod tests {
                 EngineError::SessionOwned {
                     position: 1,
                     label: "a".into(),
-                    unreadable: None,
-                    daemon: None,
+                    owner: Box::default(),
                 },
                 "session-owned",
             ),
@@ -592,8 +630,10 @@ mod tests {
                 EngineError::SessionOwned {
                     position: 1,
                     label: "a".into(),
-                    unreadable: Some("/p/sessions/7.json: not JSON".into()),
-                    daemon: None,
+                    owner: Box::new(SessionOwner {
+                        unreadable: Some("/p/sessions/7.json: not JSON".into()),
+                        ..SessionOwner::default()
+                    }),
                 },
                 "session-owned",
             ),
@@ -754,7 +794,7 @@ mod tests {
             (
                 EngineError::OrphanSessionRunning {
                     profile: PathBuf::from("s"),
-                    daemon: false,
+                    owner: Box::default(),
                 },
                 "session-owned",
             ),

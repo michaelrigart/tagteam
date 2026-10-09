@@ -21,11 +21,11 @@ use crate::account_lock::AccountLock;
 use crate::auto::{engine_lock_path, read_holder};
 use crate::displace::PurgeError;
 use crate::engine::Engine;
-use crate::error::EngineError;
+use crate::error::{EngineError, SessionOwner};
 use crate::hooks;
 use crate::lifecycle::{UnlistedRescues, absent, identity, trace_path};
 use crate::rescue::RescueUnlisted;
-use crate::session::SessionState;
+use crate::session::{SessionState, session_owned_error};
 use crate::store::{AccountRow, Store};
 use crate::vault::Leftovers;
 
@@ -457,16 +457,7 @@ impl Engine {
                 );
             }
             if state.owned() {
-                let unreadable = match &state {
-                    SessionState::Unreadable { detail, .. } => Some(detail.clone()),
-                    _ => None,
-                };
-                return Err(EngineError::SessionOwned {
-                    position: row.position,
-                    label: row.label.clone(),
-                    unreadable,
-                    daemon: state.daemon_profile().map(Path::to_path_buf),
-                });
+                return Err(session_owned_error(row, &state));
             }
         }
         Ok(())
@@ -629,7 +620,7 @@ impl Engine {
             if state.owned() {
                 return Err(EngineError::OrphanSessionRunning {
                     profile: profile.to_path_buf(),
-                    daemon: state.daemon_profile().is_some(),
+                    owner: Box::new(SessionOwner::of(&state)),
                 });
             }
         }

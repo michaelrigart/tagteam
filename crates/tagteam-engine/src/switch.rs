@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use tagteam_core::autoswitch::{Departure, Trigger};
 use tagteam_core::poll::replan_for_role;
 use tagteam_core::rank::{
@@ -27,7 +25,7 @@ use crate::oracle::verdict;
 use crate::provenance::ProfileCheck;
 use crate::refresh::{GateOutcome, OwnedBy};
 use crate::rescue::RescueFile;
-use crate::session::SessionState;
+use crate::session::{SessionState, session_owned_error};
 use crate::store::{AccountRow, AutoRecord, CREDENTIALS_REPLACED, EventRow, JournalRow, Store};
 
 /// §9.3's strategies that rank by usage.
@@ -532,18 +530,10 @@ pub(crate) fn works_until_expiry(target: &AccountRow) -> String {
     )
 }
 
-/// §9.2's session-owned refusal, for a target a session took after planning.
-/// `state` is the session state found, when it is at hand: a background daemon that owns the
-/// profile is named (§12.6).
-fn session_owned(target: &AccountRow, state: Option<&SessionState>) -> EngineError {
-    EngineError::SessionOwned {
-        position: target.position,
-        label: target.label.clone(),
-        unreadable: None,
-        daemon: state
-            .and_then(SessionState::daemon_profile)
-            .map(Path::to_path_buf),
-    }
+/// §9.2's session-owned refusal, for a target a session took after planning: it names what
+/// owns the profile in `state`, as every other refusal does (§12.6).
+fn session_owned(target: &AccountRow, state: &SessionState) -> EngineError {
+    session_owned_error(target, state)
 }
 
 /// §9.2's refusal for a target whose profile and vault both moved (§12.5).
@@ -1482,7 +1472,7 @@ impl Engine {
             // The gate answers only "a session"; the state is read again to name a daemon.
             GateOutcome::Owned(OwnedBy::Session) => {
                 let state = self.session_state(p, target)?;
-                return Err(session_owned(target, Some(&state)));
+                return Err(session_owned(target, &state));
             }
             GateOutcome::Conflict => return Err(profile_conflict(target)),
         })
@@ -1817,7 +1807,7 @@ impl Engine {
             return if req.target.chosen() {
                 Ok(Rederived::Replan)
             } else {
-                Err(session_owned(&target, Some(&state)))
+                Err(session_owned(&target, &state))
             };
         }
         // The rotation decision, recomputed from the store and each candidate's session state
