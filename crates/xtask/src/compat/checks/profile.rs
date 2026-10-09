@@ -653,6 +653,57 @@ fn error_kind(v: &Value) -> Option<&str> {
     v["error"]["type"].as_str()
 }
 
+/// One spelling of CC's storage-write lock, watched while CC runs: how often its directory was
+/// there, and how often tagteam's try-lock of it was refused.
+struct Spelling {
+    path: std::path::PathBuf,
+    spec: MkdirLockSpec,
+    seen: u32,
+    refused: u32,
+}
+
+impl Spelling {
+    fn new(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            spec: MkdirLockSpec::new(path.to_path_buf(), STORAGE_WRITE_STALE, Duration::ZERO),
+            seen: 0,
+            refused: 0,
+        }
+    }
+
+    /// When the directory is there, tagteam tries it, once: a refusal is CC's lock excluding
+    /// tagteam's.
+    fn probe(&mut self) -> Result<(), HarnessError> {
+        if self.path.is_dir() {
+            self.seen += 1;
+            match MkdirLock::try_acquire(&self.spec) {
+                Ok(None) => self.refused += 1,
+                Ok(Some(ours)) => drop(ours),
+                Err(e) => return Err(harness(format!("trying the storage-write lock: {e}"))),
+            }
+        }
+        Ok(())
+    }
+
+    fn tally(&self) -> Value {
+        json!({"seen": self.seen, "refused": self.refused})
+    }
+}
+
+/// Whether CC was seen holding either spelling and tagteam's try-lock of it was refused, and
+/// which spelling that was (both when both).
+fn lock_verdict(old: &Spelling, new: &Spelling) -> (bool, Vec<&'static str>) {
+    let mut which = Vec::new();
+    if old.refused > 0 {
+        which.push(".storage-write");
+    }
+    if new.refused > 0 {
+        which.push(".storage-write.lock");
+    }
+    (!which.is_empty(), which)
+}
+
 /// The storage-write lock's timestamp in the item (macOS) or the file's (Linux), epoch seconds.
 fn written_at(ctx: &Ctx, spelling: &str) -> Option<i64> {
     match ctx.read_credential(spelling).ok()?? {
@@ -714,39 +765,23 @@ pub fn storage_write_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 
     // tagteam waits for CC's: whenever CC's lock is there, tagteam's attempt fails.
     p.note("expired again", ctx.expire(&spelling)?);
-    // CC 2.1.292 names its lock `.storage-write.lock`; the older spelling is watched too, as
-    // information.
-    let spec = MkdirLockSpec::new(
-        paths.storage_write_lock_v2.clone(),
-        STORAGE_WRITE_STALE,
-        Duration::ZERO,
-    );
+    // Either spelling is excluded by tagteam's pair (§9.1): whichever one CC is seen holding is
+    // try-locked, and must refuse tagteam. CC 2.1.292 is expected to hold `.storage-write.lock`.
+    let mut old = Spelling::new(&paths.storage_write_lock);
+    let mut new = Spelling::new(&paths.storage_write_lock_v2);
     let mut running = ctx.run_as(ALIAS_OAUTH, &REQUEST).spawn(&ctx.roots)?;
-    let (mut seen, mut refused, mut seen_old) = (0u32, 0u32, 0u32);
     let deadline = Instant::now() + Duration::from_secs(180);
     while !running.finished() && Instant::now() < deadline && cancel().requested().is_none() {
-        if paths.storage_write_lock.is_dir() {
-            seen_old += 1;
-        }
-        if paths.storage_write_lock_v2.is_dir() {
-            seen += 1;
-            match MkdirLock::try_acquire(&spec) {
-                Ok(None) => refused += 1,
-                Ok(Some(ours)) => drop(ours),
-                Err(e) => return Err(harness(format!("trying the storage-write lock: {e}"))),
-            }
-        }
+        old.probe()?;
+        new.probe()?;
         thread::sleep(Duration::from_millis(1));
     }
     let ran = running.wait()?;
+    let (held, which) = lock_verdict(&old, &new);
     p.expect(
-        "CC's lock is the directory tagteam names, and it refused tagteam",
-        refused > 0,
-        json!({"seen": seen, "refused": refused}),
-    );
-    p.note(
-        "CC's lock under the older spelling `.storage-write` (2.1.286)",
-        json!({"seen": seen_old}),
+        "CC held a storage-write lock under a spelling tagteam takes, and it refused tagteam",
+        held,
+        json!({"held": which, ".storage-write": old.tally(), ".storage-write.lock": new.tally()}),
     );
     p.expect("claude -p succeeded", ran.success(), ran.summary());
     Ok(p.finish("CC and tagteam each waited for the other's storage-write lock"))
@@ -833,6 +868,34 @@ esac"#;
             json!({"schemaVersion": 1, "error": {"type": "session-owned", "message": "m"}});
         assert_eq!(error_kind(&refused), Some("session-owned"));
         assert_eq!(error_kind(&json!({"switched": true})), None);
+    }
+
+    #[test]
+    fn cc_holding_either_spelling_and_refusing_tagteam_passes_and_names_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "xtask-spelling-{}",
+            crate::compat::keychain::random_hex().unwrap()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        for name in [".storage-write", ".storage-write.lock"] {
+            let (mut old, mut new) = (
+                Spelling::new(&dir.join(".storage-write")),
+                Spelling::new(&dir.join(".storage-write.lock")),
+            );
+            // Nothing there: nothing seen, no verdict.
+            old.probe().unwrap();
+            new.probe().unwrap();
+            assert_eq!(lock_verdict(&old, &new), (false, vec![]));
+            // CC's lock under `name`: it is seen, and tagteam is refused.
+            fs::create_dir(dir.join(name)).unwrap();
+            old.probe().unwrap();
+            new.probe().unwrap();
+            fs::remove_dir(dir.join(name)).unwrap();
+            let (held, which) = lock_verdict(&old, &new);
+            assert!(held, "{name}");
+            assert_eq!(which, [name]);
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn label<'o>(o: &'o Outcome, text: &str) -> &'o crate::compat::report::Evidence {
