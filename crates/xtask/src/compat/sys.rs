@@ -7,7 +7,7 @@
 //! cancel token (`catch_signals`); every wait here is a cancellation point, so a signal unwinds
 //! the run through that same cleanup.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read as _, Write as _};
@@ -411,7 +411,10 @@ fn wait_interactive_as(
         // Harmless if it runs; a child stopped before the handoff (SIGTTIN) continues.
         signal(pgid, "CONT", true);
     }
-    let mut seen = BTreeSet::from([pgid]);
+    // Who the leader and what it started are, by pid AND start time, listed from the start and
+    // again before anything is signalled.
+    let mut seen = Members::new();
+    seen.refresh_now(Some(pgid));
     let mut last_listed = Instant::now();
     let outcome = loop {
         match child.try_wait() {
@@ -436,9 +439,7 @@ fn wait_interactive_as(
         // What the tree looks like while the leader lives, for the sweep once it is gone.
         if last_listed.elapsed() >= Duration::from_secs(1) {
             last_listed = Instant::now();
-            if let Ok(table) = process_table() {
-                seen.extend(tree_of(&table, &seen));
-            }
+            seen.refresh_now(Some(pgid));
         }
         thread::sleep(Duration::from_millis(20));
     };
@@ -450,6 +451,9 @@ fn wait_interactive_as(
             token.request(n);
         }
     }
+    // Everything current is known before anything is signalled: the group's end below reaps the
+    // leader, and a descendant that left the group (`setsid`) is then re-parented out of sight.
+    seen.refresh_now(matches!(child.try_wait(), Ok(None)).then_some(pgid));
     // The terminal back first: the sweep below must not run with it held by a dying group.
     drop(foreground);
     let swept = if own_group {
@@ -525,19 +529,34 @@ fn group_members(pgid: u32) -> usize {
     else {
         return 0;
     };
-    parse_process_table(&String::from_utf8_lossy(&out.stdout))
-        .into_iter()
-        .filter(|(_, group, zombie)| *group == pgid && !*zombie)
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| {
+            let mut f = l.split_whitespace();
+            let (_pid, group, stat) = (f.next(), f.next(), f.next());
+            group.and_then(|g| g.parse::<u32>().ok()) == Some(pgid)
+                && stat.is_some_and(|s| !s.starts_with('Z'))
+        })
         .count()
 }
 
 /// Passes `end_tree` makes: SIGTERM, then SIGKILL until nothing of the tree is left.
 const TREE_PASSES: u32 = 5;
 
-/// `(pid, parent, zombie)` for every process, from `ps -A -o pid=,ppid=,stat=`.
-fn process_table() -> io::Result<Vec<(u32, u32, bool)>> {
+/// One row of the process table: who it is (pid and start time) and whose child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcRow {
+    pid: u32,
+    ppid: u32,
+    zombie: bool,
+    /// `ps -o lstart=`, whitespace-normalized: a pid reused by another process has another one.
+    start: String,
+}
+
+/// Every process, from `ps -A -o pid=,ppid=,stat=,lstart=`.
+fn process_table() -> io::Result<Vec<ProcRow>> {
     let out = Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,stat="])
+        .args(["-A", "-o", "pid=,ppid=,stat=,lstart="])
         .env_clear()
         .env("PATH", "/bin:/usr/bin")
         .env("LC_ALL", "C")
@@ -547,47 +566,127 @@ fn process_table() -> io::Result<Vec<(u32, u32, bool)>> {
     if !out.status.success() {
         return Err(io::Error::other("ps failed"));
     }
-    Ok(parse_process_table(&String::from_utf8_lossy(&out.stdout)))
+    Ok(parse_procs(&String::from_utf8_lossy(&out.stdout)))
 }
 
-fn parse_process_table(out: &str) -> Vec<(u32, u32, bool)> {
+fn parse_procs(out: &str) -> Vec<ProcRow> {
     out.lines()
         .filter_map(|l| {
             let mut f = l.split_whitespace();
             let (pid, ppid) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?);
-            Some((pid, ppid, f.next().is_some_and(|s| s.starts_with('Z'))))
+            let stat = f.next()?;
+            let start = f.collect::<Vec<_>>().join(" ");
+            (!start.is_empty()).then(|| ProcRow {
+                pid,
+                ppid,
+                zombie: stat.starts_with('Z'),
+                start,
+            })
         })
         .collect()
 }
 
-/// Every process in `table` that descends from one of `roots`, the roots that are in it too.
-fn tree_of(table: &[(u32, u32, bool)], roots: &BTreeSet<u32>) -> BTreeSet<u32> {
-    let mut tree: BTreeSet<u32> = table
-        .iter()
-        .filter(|(pid, _, _)| roots.contains(pid))
-        .map(|(pid, _, _)| *pid)
-        .collect();
-    loop {
-        let before = tree.len();
-        let more: Vec<u32> = table
+/// `ps -o lstart=` of one process, normalized as `ProcRow::start`; `None` if it is gone.
+fn start_of(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .env_clear()
+        .env("PATH", "/bin:/usr/bin")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let start = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (out.status.success() && !start.is_empty()).then_some(start)
+}
+
+/// A command's processes by identity, `pid -> start time`: a member counts only while the
+/// process with that pid still has that start time, so a pid reused by an unrelated process is
+/// never taken for one.
+#[derive(Default)]
+struct Members(BTreeMap<u32, String>);
+
+impl Members {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drops members that are gone or replaced, then adds `table`'s descendants of the rest and
+    /// of `leader`, which the caller holds unreaped (its pid is its own).
+    fn refresh(&mut self, table: &[ProcRow], leader: Option<u32>) {
+        self.0
+            .retain(|pid, start| table.iter().any(|p| p.pid == *pid && &p.start == start));
+        let mut roots = self.0.clone();
+        if let Some(p) = leader.and_then(|l| table.iter().find(|p| p.pid == l)) {
+            roots.insert(p.pid, p.start.clone());
+        }
+        let mut tree: BTreeMap<u32, String> = table
             .iter()
-            .filter(|(_, ppid, _)| tree.contains(ppid))
-            .map(|(pid, _, _)| *pid)
+            .filter(|p| roots.get(&p.pid) == Some(&p.start))
+            .map(|p| (p.pid, p.start.clone()))
             .collect();
-        tree.extend(more);
-        if tree.len() == before {
-            return tree;
+        loop {
+            let more: Vec<(u32, String)> = table
+                .iter()
+                .filter(|p| tree.contains_key(&p.ppid) && !tree.contains_key(&p.pid))
+                .map(|p| (p.pid, p.start.clone()))
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            tree.extend(more);
+        }
+        self.0.extend(tree);
+    }
+
+    /// `refresh` from a listing taken now; without one, nothing changes.
+    fn refresh_now(&mut self, leader: Option<u32>) {
+        if let Ok(table) = process_table() {
+            self.refresh(&table, leader);
+        }
+    }
+
+    /// The members still alive in `table` (zombies hold nothing), the harness itself never.
+    fn alive(&self, table: &[ProcRow]) -> Vec<(u32, String)> {
+        let me = std::process::id();
+        self.0
+            .iter()
+            .filter(|(pid, start)| {
+                **pid != me
+                    && table
+                        .iter()
+                        .any(|p| p.pid == **pid && &p.start == *start && !p.zombie)
+            })
+            .map(|(pid, start)| (*pid, start.clone()))
+            .collect()
+    }
+}
+
+/// Signals each of `members` alone with `how`, but only if `start_of` still reports the start
+/// time it was recorded with: a pid whose identity is unknown or changed is skipped.
+fn signal_verified(
+    members: &[(u32, String)],
+    how: &str,
+    start_of: &dyn Fn(u32) -> Option<String>,
+    send: &mut dyn FnMut(u32, &str),
+) {
+    for (pid, start) in members {
+        if start_of(*pid).as_ref() == Some(start) {
+            send(*pid, how);
         }
     }
 }
 
-/// Ends every process in `seen` (the pids of `child` and of what it started, as last listed)
-/// and everything that descends from them: what left the group, which killing the group does
-/// not reach. The tree is listed again on every pass from what was seen, so a descendant its parent's death re-parented is still found. Each member is
-/// signalled alone (never the harness, never a group): SIGTERM, a short grace while the direct
-/// child is reaped, then SIGKILL, up to `TREE_PASSES`. A survivor is an error.
-fn end_tree(child: &mut Child, mut seen: BTreeSet<u32>) -> Result<(), HarnessError> {
-    let me = std::process::id();
+/// Ends every process in `seen` and everything that descends from them: what left the group,
+/// which killing the group does not reach. The tree is listed again on every pass and each
+/// member is signalled alone (never the harness, never a group, and only while its start time
+/// still matches): SIGTERM, a short grace while the direct child is reaped, then SIGKILL, up to
+/// `TREE_PASSES`. A survivor is an error.
+fn end_tree(child: &mut Child, mut seen: Members) -> Result<(), HarnessError> {
     let mut left = 0;
     for pass in 0..TREE_PASSES {
         let Ok(table) = process_table() else {
@@ -595,24 +694,18 @@ fn end_tree(child: &mut Child, mut seen: BTreeSet<u32>) -> Result<(), HarnessErr
             // before this.
             return Ok(());
         };
-        let _ = child.try_wait();
-        let live: Vec<u32> = tree_of(&table, &seen)
-            .into_iter()
-            .filter(|pid| *pid != me)
-            .filter(|pid| {
-                // A zombie holds nothing: the direct child is reaped just above, and any other
-                // is its dead parent's to reap, or init's.
-                !table.iter().any(|(p, _, zombie)| p == pid && *zombie)
-            })
-            .collect();
+        seen.refresh(
+            &table,
+            matches!(child.try_wait(), Ok(None)).then(|| child.id()),
+        );
+        let live = seen.alive(&table);
         if live.is_empty() {
             return Ok(());
         }
-        seen.extend(&live);
         let how = if pass == 0 { "TERM" } else { "KILL" };
-        for pid in &live {
-            signal(*pid, how, false);
-        }
+        signal_verified(&live, how, &start_of, &mut |pid, how| {
+            signal(pid, how, false);
+        });
         let grace = if pass == 0 {
             GRACE
         } else {
@@ -620,20 +713,13 @@ fn end_tree(child: &mut Child, mut seen: BTreeSet<u32>) -> Result<(), HarnessErr
         };
         settle(grace, || {
             let _ = child.try_wait();
-            process_table().is_ok_and(|t| {
-                tree_of(&t, &seen)
-                    .iter()
-                    .all(|pid| t.iter().any(|(p, _, z)| p == pid && *z))
-            })
+            process_table().is_ok_and(|t| seen.alive(&t).is_empty())
         });
         left = live.len();
     }
     // The last pass's KILL had its grace: whatever still lists is a survivor.
     let table = process_table().unwrap_or_default();
-    let survivors = tree_of(&table, &seen)
-        .into_iter()
-        .filter(|pid| !table.iter().any(|(p, _, z)| p == pid && *z))
-        .count();
+    let survivors = seen.alive(&table).len();
     let _ = child.try_wait();
     if survivors == 0 {
         return Ok(());
@@ -1239,6 +1325,40 @@ mod tests {
     }
 
     #[test]
+    fn an_early_cancel_still_finds_a_descendant_that_left_the_group() {
+        // `perl` (on macOS and every Linux CI image) stands in for `setsid(1)`, which macOS lacks:
+        // the descendant makes its own session, so the group kill does not reach it, and the
+        // leader's death would re-parent it out of the tree. The tree is listed before the kill.
+        let _serial = serial();
+        let dir = std::env::temp_dir().join(format!("xtask-setsid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!(
+            "perl -MPOSIX -e 'POSIX::setsid(); exec q(sleep), q(31)' & echo $! > '{d}/pid'; sleep 30",
+            d = dir.display()
+        );
+        let mut child = spawn_interactive(Command::new("/bin/sh").args(["-c", &script])).unwrap();
+        let token = Cancel::new();
+        let later = token.clone();
+        let signaller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(500));
+            later.request(SIGTERM);
+        });
+        let err = wait_interactive(&mut child, &token).unwrap_err();
+        signaller.join().unwrap();
+        assert_eq!(err, interrupted(SIGTERM));
+        let pid: u32 = std::fs::read_to_string(dir.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            !process_alive(pid),
+            "the setsid descendant ({pid}) survived"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_stopped_child_with_no_terminal_is_a_cancellation_not_a_hang() {
         let _serial = serial();
         let mut child =
@@ -1282,14 +1402,47 @@ mod tests {
     }
 
     #[test]
-    fn a_process_listing_is_parsed_into_a_tree() {
-        let table = parse_process_table(
-            "  1     0 Ss\n 10     1 S\n 11    10 S+\n 12    10 Z\n 99    98 S\n",
+    fn a_process_listing_is_parsed_with_its_start_time_into_a_tree() {
+        let table = parse_procs(
+            "  1     0 Ss   Thu Oct  9 08:00:00 2026\n 10     1 S    Thu Oct  9 09:00:00 2026\n 11    10 S+   Thu Oct  9 09:00:01 2026\n 12    10 Z    Thu Oct  9 09:00:02 2026\n 99    98 S    Thu Oct  9 07:00:00 2026\n",
         );
-        let tree = tree_of(&table, &BTreeSet::from([10]));
-        assert_eq!(tree, BTreeSet::from([10, 11, 12]));
-        assert!(table.contains(&(12, 10, true)));
-        assert!(tree_of(&table, &BTreeSet::from([4242])).is_empty());
+        assert_eq!(table[1].start, "Thu Oct 9 09:00:00 2026");
+        assert!(table[3].zombie);
+        let mut members = Members::new();
+        // The leader is the caller's own: it roots the tree; its descendants follow.
+        members.refresh(&table, Some(10));
+        assert_eq!(members.0.keys().copied().collect::<Vec<_>>(), [10, 11, 12]);
+        // A recorded member whose pid now has another start time is dropped, not kept.
+        let mut reused = table.clone();
+        reused[2].start = "Fri Oct 10 10:00:00 2026".into();
+        reused[2].ppid = 1; // an unrelated process now has that pid
+        members.refresh(&reused, None);
+        assert_eq!(members.0.keys().copied().collect::<Vec<_>>(), [10, 12]);
+        let mut stranger = Members::new();
+        stranger.refresh(&table, Some(4242));
+        assert!(stranger.0.is_empty());
+        // Zombies hold nothing.
+        assert!(members.alive(&table).iter().all(|(pid, _)| *pid != 12));
+    }
+
+    #[test]
+    fn a_member_is_signalled_only_while_its_start_time_still_matches() {
+        let members = vec![
+            (10, "Thu Oct 9 09:00:00 2026".to_owned()),
+            (11, "Thu Oct 9 09:00:01 2026".to_owned()),
+            (12, "Thu Oct 9 09:00:02 2026".to_owned()),
+        ];
+        // 10 is as recorded, 11 was replaced by another process, 12's identity is unknown.
+        let reader = |pid: u32| match pid {
+            10 => Some("Thu Oct 9 09:00:00 2026".to_owned()),
+            11 => Some("Fri Oct 10 10:00:00 2026".to_owned()),
+            _ => None,
+        };
+        let mut sent = Vec::new();
+        signal_verified(&members, "TERM", &reader, &mut |pid, how| {
+            sent.push((pid, how.to_owned()));
+        });
+        assert_eq!(sent, [(10, "TERM".to_owned())]);
     }
 
     #[test]
