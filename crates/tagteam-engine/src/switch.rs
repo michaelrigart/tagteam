@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use tagteam_core::autoswitch::{Departure, Trigger};
 use tagteam_core::poll::replan_for_role;
 use tagteam_core::rank::{
@@ -25,6 +27,7 @@ use crate::oracle::verdict;
 use crate::provenance::ProfileCheck;
 use crate::refresh::{GateOutcome, OwnedBy};
 use crate::rescue::RescueFile;
+use crate::session::SessionState;
 use crate::store::{AccountRow, AutoRecord, CREDENTIALS_REPLACED, EventRow, JournalRow, Store};
 
 /// §9.3's strategies that rank by usage.
@@ -530,11 +533,16 @@ pub(crate) fn works_until_expiry(target: &AccountRow) -> String {
 }
 
 /// §9.2's session-owned refusal, for a target a session took after planning.
-fn session_owned(target: &AccountRow) -> EngineError {
+/// `state` is the session state found, when it is at hand: a background daemon that owns the
+/// profile is named (§12.6).
+fn session_owned(target: &AccountRow, state: Option<&SessionState>) -> EngineError {
     EngineError::SessionOwned {
         position: target.position,
         label: target.label.clone(),
         unreadable: None,
+        daemon: state
+            .and_then(SessionState::daemon_profile)
+            .map(Path::to_path_buf),
     }
 }
 
@@ -1465,7 +1473,7 @@ impl Engine {
             // (§9.3); a direct target is refused. A conflicting profile refuses either way
             // (§12.5).
             GateOutcome::Owned(OwnedBy::Session) if chosen => Freshened::Replan,
-            GateOutcome::Owned(OwnedBy::Session) => return Err(session_owned(target)),
+            GateOutcome::Owned(OwnedBy::Session) => return Err(session_owned(target, None)),
             GateOutcome::Conflict => return Err(profile_conflict(target)),
         })
     }
@@ -1794,11 +1802,12 @@ impl Engine {
         // stands until the locks are released. A direct target is refused (§9.2); a rotation or
         // a usage strategy plans again, and its walk skips the account (§9.3). An automatic
         // switch never gets here with one: `auto_refusal` above answers it `not-candidate`.
-        if self.session_state(p, &target)?.owned() {
+        let state = self.session_state(p, &target)?;
+        if state.owned() {
             return if req.target.chosen() {
                 Ok(Rederived::Replan)
             } else {
-                Err(session_owned(&target))
+                Err(session_owned(&target, Some(&state)))
             };
         }
         // The rotation decision, recomputed from the store and each candidate's session state

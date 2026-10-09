@@ -131,11 +131,15 @@ pub enum EngineError {
     /// pull the login from under a running session. `unreadable` is set when a reservation or a
     /// session record could not be read (§12.6), which counts as owned: it names the file and
     /// why, since nothing may be running at all and the user has a file to repair.
-    #[error("{}", session_owned_message(*.position, .label, .unreadable.as_deref()))]
+    ///
+    /// `daemon` is set, with the profile, when what owns it is a Claude Code background daemon
+    /// (§12.6): the message names it and how to stop it.
+    #[error("{}", session_owned_message(*.position, .label, .unreadable.as_deref(), .daemon.as_deref()))]
     SessionOwned {
         position: u32,
         label: String,
         unreadable: Option<String>,
+        daemon: Option<PathBuf>,
     },
     /// §9.2, §12.5: the account's quiescent session profile and the vault both moved since they
     /// last agreed, so the vault's generation may be consumed. An explicit replacement resolves
@@ -286,12 +290,21 @@ fn split_message(profile: &Path, shared: &Path, cause: SplitCause) -> String {
 }
 
 /// `SessionOwned`'s message: a running session, or session state that cannot be read.
-fn session_owned_message(position: u32, label: &str, unreadable: Option<&str>) -> String {
-    match unreadable {
-        None => format!(
+fn session_owned_message(
+    position: u32,
+    label: &str,
+    unreadable: Option<&str>,
+    daemon: Option<&Path>,
+) -> String {
+    match (unreadable, daemon) {
+        (None, Some(profile)) => format!(
+            "position {position} ({label}) is in use by a Claude Code background daemon; stop it with `claude daemon stop --any` run with CLAUDE_CONFIG_DIR set to {}, then retry",
+            profile.display()
+        ),
+        (None, None) => format!(
             "position {position} ({label}) is in use by a `tagteam run` session; exit that session first"
         ),
-        Some(detail) => format!(
+        (Some(detail), _) => format!(
             "position {position} ({label}) counts as in use by a `tagteam run` session because its session state cannot be read ({detail}); repair or remove that file, then retry"
         ),
     }
@@ -544,6 +557,7 @@ mod tests {
                     position: 1,
                     label: "a".into(),
                     unreadable: None,
+                    daemon: None,
                 },
                 "session-owned",
             ),
@@ -552,6 +566,7 @@ mod tests {
                     position: 1,
                     label: "a".into(),
                     unreadable: Some("/p/sessions/7.json: not JSON".into()),
+                    daemon: None,
                 },
                 "session-owned",
             ),

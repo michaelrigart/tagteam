@@ -465,6 +465,7 @@ impl Engine {
                     position: row.position,
                     label: row.label.clone(),
                     unreadable,
+                    daemon: state.daemon_profile().map(Path::to_path_buf),
                 });
             }
         }

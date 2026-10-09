@@ -608,6 +608,10 @@ impl Provider for ClaudeCode {
         profile.join("sessions")
     }
 
+    fn supervisor_lock(&self, profile: &Path) -> Option<PathBuf> {
+        Some(profile.join("daemon.lock"))
+    }
+
     /// The hashed Keychain item named from `spelling`, the recorded spelling, then
     /// `.credentials.json` in `dir`, where the profile is now (Decision 19), exactly as the
     /// live read takes them (§12.3 step 2).

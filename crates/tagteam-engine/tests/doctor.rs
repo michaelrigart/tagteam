@@ -1534,6 +1534,46 @@ fn a_reservation_held_after_its_tagteam_died_is_information() {
 }
 
 #[test]
+fn a_live_background_daemon_supervisor_in_a_profile_is_information_naming_how_to_stop_it() {
+    // §13.6: the profile is session-owned until the supervisor in `daemon.lock` stops.
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = seeded_profile(&fx, &id);
+    assert!(found(&doctor(&fx), "sessions.daemon").is_empty());
+    fs::write(
+        dir.join("daemon.lock"),
+        serde_json::json!({"pid": 4343, "origin": "transient", "procStart": LSTART}).to_string(),
+    )
+    .unwrap();
+    assert!(
+        found(&doctor(&fx), "sessions.daemon").is_empty(),
+        "a supervisor that is gone is no finding"
+    );
+    fx.process.set(
+        4343,
+        FakeProcess {
+            exists: Some(true),
+            start_time_s: tagteam_provider::parse_lstart(LSTART),
+            ..FakeProcess::default()
+        },
+    );
+    let r = doctor(&fx);
+    let c = one(&r, "sessions.daemon");
+    assert_eq!(c.status, CheckStatus::Info);
+    assert!(
+        c.message.contains("session-owned until it stops"),
+        "{}",
+        c.message
+    );
+    let fix = c.fix.as_deref().unwrap();
+    assert!(
+        fix.contains("claude daemon stop --any") && fix.contains("CLAUDE_CONFIG_DIR"),
+        "{fix}"
+    );
+    assert!(found(&r, "sessions.state").is_empty());
+}
+
+#[test]
 fn a_baseline_awaiting_merge_back_and_a_profile_awaiting_a_bootstrap_are_information() {
     let fx = Fx::new();
     let id = fx.add("a@x.co", "rt-a");

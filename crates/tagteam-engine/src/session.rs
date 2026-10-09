@@ -7,7 +7,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use tagteam_provider::flock::LockProbe;
-use tagteam_provider::liveness::{RecordEntry, read_session_records, record_is_live};
+use tagteam_provider::liveness::{
+    RecordEntry, read_session_records, read_supervisor_lock, record_is_live,
+};
 use tagteam_provider::profile::{
     MARKER_FILE, ProfileMarker, RunShell, launch_reservations, profile_path,
 };
@@ -76,15 +78,24 @@ pub enum SessionState {
     Quiescent {
         profile: PathBuf,
     },
+    /// `daemon`: what owns it is a Claude Code background daemon (a `bg`, `daemon` or
+    /// `daemon-worker` record, or the supervisor's lock file, §12.6), not a `tagteam run`
+    /// session: the refusal names it and how to stop it.
     Owned {
         profile: PathBuf,
+        daemon: bool,
     },
-    /// A reservation or a record could not be read: counts as owned (§10.3, §12.6).
+    /// A reservation, a record or a supervisor lock could not be read: counts as owned (§10.3,
+    /// §12.6).
     Unreadable {
         profile: PathBuf,
         detail: String,
     },
 }
+
+/// The `kind`s of a session record written by a Claude Code background daemon or its workers
+/// (Appendix A.7).
+const DAEMON_KINDS: [&str; 3] = ["bg", "daemon", "daemon-worker"];
 
 impl SessionState {
     /// Session-owned (§12.5): a live reservation or record, or one that could not be read.
@@ -95,12 +106,23 @@ impl SessionState {
         )
     }
 
+    /// The profile directory, when a background daemon owns it (§12.6).
+    pub fn daemon_profile(&self) -> Option<&Path> {
+        match self {
+            SessionState::Owned {
+                profile,
+                daemon: true,
+            } => Some(profile),
+            _ => None,
+        }
+    }
+
     /// The profile directory, when the account has one.
     pub fn profile(&self) -> Option<&Path> {
         match self {
             SessionState::NoProfile => None,
             SessionState::Quiescent { profile }
-            | SessionState::Owned { profile }
+            | SessionState::Owned { profile, .. }
             | SessionState::Unreadable { profile, .. } => Some(profile),
         }
     }
@@ -174,7 +196,10 @@ impl Engine {
                     .iter()
                     .any(|(path, probe)| *probe == LockProbe::Held && !is_own(path))
                 {
-                    return SessionState::Owned { profile };
+                    return SessionState::Owned {
+                        profile,
+                        daemon: false,
+                    };
                 }
             }
             Read::Absent => {}
@@ -187,7 +212,9 @@ impl Engine {
                     match entry {
                         RecordEntry::Record(r) => {
                             if record_is_live(self.process.as_ref(), &r, p.launch_command()) {
-                                return SessionState::Owned { profile };
+                                let daemon =
+                                    r.kind.as_deref().is_some_and(|k| DAEMON_KINDS.contains(&k));
+                                return SessionState::Owned { profile, daemon };
                             }
                         }
                         RecordEntry::Unreadable { path, detail } => {
@@ -198,6 +225,24 @@ impl Engine {
             }
             Read::Absent => {}
             Read::Unreadable(e) => return unreadable_state(&profile, e.to_string()),
+        }
+        // The supervisor of a background daemon writes no record of its own (CC 2.1.292); its
+        // lock file is judged as a record is (§12.6).
+        if let Some(lock) = p.supervisor_lock(&profile) {
+            match read_supervisor_lock(&lock) {
+                Read::Present(r) => {
+                    if record_is_live(self.process.as_ref(), &r, p.launch_command()) {
+                        return SessionState::Owned {
+                            profile,
+                            daemon: true,
+                        };
+                    }
+                }
+                Read::Absent => {}
+                Read::Unreadable(e) => {
+                    damaged.get_or_insert_with(|| e.to_string());
+                }
+            }
         }
         match damaged {
             Some(detail) => unreadable_state(&profile, detail),
@@ -215,6 +260,7 @@ impl Engine {
         row: &AccountRow,
     ) -> Result<(), EngineError> {
         let state = self.session_state(p, row)?;
+        let daemon = state.daemon_profile().map(Path::to_path_buf);
         let unreadable = match &state {
             // §14.2, B.69: the log gives the state only, since the detail names the file and a
             // record's name is not tagteam's to choose. The refusal names it to the user.
@@ -234,6 +280,7 @@ impl Engine {
                 position: row.position,
                 label: row.label.clone(),
                 unreadable,
+                daemon,
             });
         }
         Ok(())

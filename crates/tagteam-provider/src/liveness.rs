@@ -148,6 +148,31 @@ pub fn read_session_records(dir: &Path) -> Read<Vec<RecordEntry>> {
     Read::Present(out)
 }
 
+/// A background supervisor's lock file (CC 2.1.292: `<profile>/daemon.lock`, JSON with at least
+/// `pid`, `origin` and `procStart`), read as a session record is (§12.6): the supervisor's `pid`
+/// and `procStart` are what liveness needs. A missing file, or one under a profile path that is
+/// not a directory, is `Absent`; one that cannot be read or parsed is `Unreadable`, and counts
+/// as owned like an unreadable record. `detail` never quotes the file's bytes.
+pub fn read_supervisor_lock(path: &Path) -> Read<SessionRecord> {
+    let unreadable =
+        |detail: String| Read::Unreadable(ReadError::new(path.display().to_string(), detail));
+    match fs::read(path) {
+        Ok(bytes) => match parse_session_record(&bytes) {
+            Ok(r) => Read::Present(r),
+            Err(detail) => unreadable(detail),
+        },
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Read::Absent
+        }
+        Err(e) => unreadable(e.to_string()),
+    }
+}
+
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -652,6 +677,49 @@ mod tests {
             read_session_records(&file.join("sessions")),
             Read::Present(v) if v.is_empty()
         ));
+    }
+
+    #[test]
+    fn a_supervisor_lock_is_read_as_a_record_and_absent_or_unreadable_otherwise() {
+        let d = tempfile::tempdir().unwrap();
+        let lock = d.path().join("daemon.lock");
+        assert!(matches!(read_supervisor_lock(&lock), Read::Absent));
+        assert!(
+            matches!(
+                read_supervisor_lock(&d.path().join("no-such-dir/daemon.lock")),
+                Read::Absent
+            ),
+            "nothing is written under a profile that is missing"
+        );
+        fs::write(
+            &lock,
+            json!({"pid": 77, "origin": "transient", "procStart": "Thu Oct  1 12:34:56 2026"})
+                .to_string(),
+        )
+        .unwrap();
+        let Read::Present(r) = read_supervisor_lock(&lock) else {
+            panic!("a supervisor lock reads");
+        };
+        assert_eq!(r.pid, 77);
+        assert_eq!(r.proc_start.as_deref(), Some("Thu Oct  1 12:34:56 2026"));
+        for bytes in [
+            &b"{"[..],
+            b"[1]",
+            br#"{"origin": "transient"}"#,
+            br#"{"pid": 0}"#,
+        ] {
+            fs::write(&lock, bytes).unwrap();
+            let Read::Unreadable(e) = read_supervisor_lock(&lock) else {
+                panic!("{bytes:?} is unreadable");
+            };
+            assert!(e.what.ends_with("daemon.lock"), "{e:?}");
+        }
+        fs::remove_file(&lock).unwrap();
+        fs::create_dir(&lock).unwrap();
+        assert!(
+            matches!(read_supervisor_lock(&lock), Read::Unreadable(_)),
+            "a directory is no lock file"
+        );
     }
 
     #[test]

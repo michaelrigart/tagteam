@@ -40,7 +40,7 @@ pub use keychain::FileKeychain;
 pub use keychain::{FakeKeychain, Keychain, KeychainError, LockState};
 pub use liveness::{
     FakeProcess, FakeProcessProbe, ProcessProbe, RecordEntry, SessionRecord, SystemProcessProbe,
-    parse_lstart, parse_session_record, read_session_records, record_is_live,
+    parse_lstart, parse_session_record, read_session_records, read_supervisor_lock, record_is_live,
 };
 pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 #[cfg(feature = "mock-server")]

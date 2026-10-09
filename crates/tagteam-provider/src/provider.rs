@@ -702,6 +702,13 @@ pub trait Provider: Send + Sync {
     fn share_policy(&self, env: &Env) -> SharePolicy;
     /// Where the profile's session records live (CC: `<profile>/sessions`).
     fn session_records_dir(&self, profile: &Path) -> PathBuf;
+    /// Where the profile's background supervisor records itself, for an agent whose supervisor
+    /// writes no session record of its own (CC 2.1.292: `<profile>/daemon.lock`, §12.6). A live
+    /// supervisor there makes the profile session-owned; one that cannot be read counts as
+    /// unreadable. `None`: the agent has no such file.
+    fn supervisor_lock(&self, _profile: &Path) -> Option<PathBuf> {
+        None
+    }
     /// §8.1, §12.5: the profile's credential, read as the agent reads it (Decision 19): the
     /// Keychain item named from `spelling`, the marker's recorded spelling, then the credential
     /// file in `dir`, the profile's actual directory.

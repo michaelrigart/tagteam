@@ -8,6 +8,8 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::sync::Mutex;
 
+use serde_json::json;
+
 use common::{API_KEY, Fx, LSTART, capture_logs, credential, due, journal, token_requests};
 use tagteam_cc::live::Platform;
 use tagteam_core::AccountId;
@@ -70,7 +72,8 @@ fn a_held_reservation_owns_the_account_and_a_released_one_does_not() {
     assert_eq!(
         s,
         SessionState::Owned {
-            profile: dir.clone()
+            profile: dir.clone(),
+            daemon: false
         }
     );
     assert!(s.owned());
@@ -93,7 +96,10 @@ fn a_live_record_of_any_kind_owns_the_account() {
         fx.live_record(&dir, 4242, kind);
         assert_eq!(
             state(&fx, &a),
-            SessionState::Owned { profile: dir },
+            SessionState::Owned {
+                profile: dir,
+                daemon: kind != "interactive"
+            },
             "{kind}"
         );
     }
@@ -139,7 +145,147 @@ fn a_dead_or_recycled_record_does_not_own_the_account() {
             ..FakeProcess::default()
         },
     );
-    assert_eq!(state(&fx, &a), SessionState::Owned { profile: dir });
+    assert_eq!(
+        state(&fx, &a),
+        SessionState::Owned {
+            profile: dir,
+            daemon: false
+        }
+    );
+}
+
+// §12.6, Appendix A.7: a Claude Code background daemon's supervisor writes no session record in
+// 2.1.292; its `daemon.lock` (`pid`, `origin`, `procStart`) is what makes the profile owned.
+
+/// `daemon.lock` in `profile`, as CC 2.1.292 writes it for the supervisor `pid`.
+fn plant_daemon_lock(profile: &Path, pid: u32) {
+    fs::write(
+        profile.join("daemon.lock"),
+        json!({"pid": pid, "origin": "transient", "procStart": LSTART}).to_string(),
+    )
+    .unwrap();
+}
+
+/// The fixture's probe says `pid` runs, started at `LSTART`.
+fn run_process(fx: &Fx, pid: u32) {
+    fx.process.set(
+        pid,
+        FakeProcess {
+            exists: Some(true),
+            start_time_s: parse_lstart(LSTART),
+            ..FakeProcess::default()
+        },
+    );
+}
+
+#[test]
+fn a_live_supervisor_in_daemon_lock_owns_the_account_and_a_dead_one_does_not() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let dir = fx.make_profile(&a);
+    plant_daemon_lock(&dir, 4343);
+    assert_eq!(
+        state(&fx, &a),
+        SessionState::Quiescent {
+            profile: dir.clone()
+        },
+        "the supervisor's pid is not running"
+    );
+    run_process(&fx, 4343);
+    let s = state(&fx, &a);
+    assert_eq!(
+        s,
+        SessionState::Owned {
+            profile: dir.clone(),
+            daemon: true
+        }
+    );
+    assert!(s.owned());
+    assert_eq!(s.daemon_profile(), Some(dir.as_path()));
+    fs::remove_file(dir.join("daemon.lock")).unwrap();
+    assert_eq!(state(&fx, &a), SessionState::Quiescent { profile: dir });
+}
+
+#[test]
+fn a_recycled_supervisor_pid_does_not_own_the_account() {
+    // Judged as a record is: the pid runs again, started at another time, and is not claude.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let dir = fx.make_profile(&a);
+    plant_daemon_lock(&dir, 4343);
+    fx.process.set(
+        4343,
+        FakeProcess {
+            exists: Some(true),
+            start_time_s: parse_lstart(LSTART).map(|s| s + 3_600),
+            mentions_launch: Some(false),
+            ..FakeProcess::default()
+        },
+    );
+    assert_eq!(state(&fx, &a), SessionState::Quiescent { profile: dir });
+}
+
+#[test]
+fn a_daemon_lock_that_cannot_be_read_counts_as_owned() {
+    for bytes in [&b"{\"pid\":"[..], b"[1]", b"{\"origin\":\"transient\"}"] {
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        let dir = fx.make_profile(&a);
+        fs::write(dir.join("daemon.lock"), bytes).unwrap();
+        let s = state(&fx, &a);
+        let SessionState::Unreadable { profile, detail } = &s else {
+            panic!("{s:?}")
+        };
+        assert_eq!(profile, &dir);
+        assert!(detail.contains("daemon.lock"), "{detail}");
+        assert!(s.owned());
+    }
+}
+
+#[test]
+fn a_live_supervisor_makes_remove_and_switch_refuse_naming_the_daemon() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    plant_daemon_lock(&dir, 4343);
+    run_process(&fx, 4343);
+    let err = fx.engine.remove(&a).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    let message = err.to_string();
+    assert!(
+        message.contains("background daemon")
+            && message.contains("claude daemon stop --any")
+            && message.contains(&dir.display().to_string())
+            && !message.contains("exit that session"),
+        "{message}"
+    );
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
+    let err = fx.switch_to(&a, false).unwrap_err();
+    assert_eq!(err.kind(), "session-owned", "{err}");
+    assert!(
+        err.to_string().contains("claude daemon stop --any"),
+        "{err}"
+    );
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+    assert_eq!(token_requests(&fx), 0);
+    // Once it stops, the account can go.
+    fs::remove_file(dir.join("daemon.lock")).unwrap();
+    fx.engine.remove(&a).unwrap();
+}
+
+#[test]
+fn a_bg_record_names_the_daemon_in_the_refusal_too() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    fx.live_record(&dir, 4242, "daemon-worker");
+    let err = fx.engine.remove(&a).unwrap_err();
+    assert!(
+        err.to_string().contains("claude daemon stop --any"),
+        "{err}"
+    );
 }
 
 #[test]

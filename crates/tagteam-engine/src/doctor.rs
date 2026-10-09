@@ -2100,6 +2100,21 @@ impl Run<'_> {
                 .fix("make what it names readable again; once no session runs in the profile, a damaged session record can be deleted"),
             );
         }
+        if let Ok(SessionState::Owned { daemon: true, .. }) = &state {
+            let home = marker.map_or_else(|| dir.display().to_string(), |m| m.config_dir.clone());
+            found.push(
+                Check::info(
+                    "sessions.daemon",
+                    format!(
+                        "a Claude Code background daemon runs in account {n}'s profile, so the account is session-owned until it stops"
+                    ),
+                )
+                .fix(format!(
+                    "stop it with `claude daemon stop --any`, run with CLAUDE_CONFIG_DIR set to {}",
+                    quoted(Path::new(&home))
+                )),
+            );
+        }
         self.reservations(dir, n, found);
         if quiescent && p.has_baseline(dir) {
             found.push(
