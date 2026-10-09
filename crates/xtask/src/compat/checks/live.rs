@@ -129,12 +129,12 @@ const START_UP_WINDOW: Duration = Duration::from_secs(8);
 /// §9.1 and Appendix A.7 (*2.1.292*): for its first 30 s, until its interactive UI is up, CC
 /// retries `<global config>.lock` for only 1.5 s and then writes the global config without it,
 /// unless every key it changes is one of its own counters or caches. So `claude mcp add --scope
-/// user` (a new process, in its start-up, changing `mcpServers`) is expected to write while
-/// tagteam holds the lock. Only the timing is recorded: whether the write landed within the
-/// window, and when. A save that lands later, after the release, is a note and not a failure, so
-/// a slow start does not fail the check; the server must be added either way. The lock excludes
-/// only a CC process past its start-up (for its full retry window, about 10 s); that half is
-/// not tested (see the note it records).
+/// user` (a new process, in its start-up, changing `mcpServers`) must write while tagteam still
+/// holds the lock: that is the expectation. A write only after tagteam released the lock means
+/// CC waited it out, which contradicts A.7, and fails the check; no write at all is a harness
+/// error. The seconds, the window and whether the write landed inside it are notes. The lock
+/// excludes only a CC process past its start-up (for its full retry window, about 10 s); that
+/// half is not tested (see the note it records).
 pub fn config_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     config_lock_within(ctx, START_UP_WINDOW)
 }
@@ -169,14 +169,31 @@ fn config_lock_within(ctx: &mut Ctx, window: Duration) -> Result<Outcome, Harnes
         drop(lock);
         let ran = running.wait()?;
         let after = fs::read(&paths.global_config)?;
+        p.expect(
+            "start-up: CC's write of the global config landed while tagteam still held .claude.json.lock (2.1.292, A.7)",
+            wrote,
+            json!(if wrote {
+                "written under the held lock"
+            } else if after != before {
+                "written only after tagteam released it: CC waited the lock out"
+            } else {
+                "not written"
+            }),
+        );
         p.note(
-            "start-up: CC wrote the global config while tagteam held its lock, once its 1.5 s retry ran out (2.1.292, A.7: expected)",
-            json!({"wrote": wrote, "seconds": seconds, "window": window.as_secs()}),
+            "start-up: when CC's write landed",
+            json!({"seconds": seconds, "window": window.as_secs(), "insideWindow": wrote}),
         );
         p.note(
             "claude mcp add had finished while it was held",
             json!(finished_early),
         );
+        if after == before {
+            return Err(harness(format!(
+                "claude mcp add wrote nothing to the global config, with the lock held or after: {}",
+                ran.summary()
+            )));
+        }
         let added = serde_json::from_slice::<Value>(&after)
             .ok()
             .is_some_and(|v| v["mcpServers"].get(MCP_SERVER).is_some());
@@ -192,7 +209,7 @@ fn config_lock_within(ctx: &mut Ctx, window: Duration) -> Result<Outcome, Harnes
             .run(&ctx.roots)?;
         p.note("claude mcp remove", removed.summary());
         Ok(
-            "CC's start-up wrote the global config past tagteam's lock after its 1.5 s retry, as 2.1.292's Appendix A.7 records",
+            "CC's start-up wrote the global config under tagteam's held lock, as 2.1.292's Appendix A.7 records",
         )
     }))
 }
@@ -829,7 +846,11 @@ esac"#;
         let out = config_lock_within(&mut ctx, Duration::from_secs(5)).unwrap();
         assert_eq!(out.status, Status::Pass, "{:?}", out.evidence);
         assert_eq!(
-            label(&out, "start-up: CC wrote").value["wrote"],
+            label(&out, "start-up: CC's write of the global config landed").ok,
+            Some(true)
+        );
+        assert_eq!(
+            label(&out, "start-up: when CC's write landed").value["insideWindow"],
             json!(true)
         );
         assert_eq!(label(&out, "the server was added").ok, Some(true));
@@ -844,25 +865,32 @@ esac"#;
     }
 
     #[test]
-    fn a_write_that_lands_after_the_window_is_a_note_not_a_failure() {
+    fn a_write_only_after_the_release_means_cc_waited_the_lock_out_and_fails() {
         let _serial = crate::compat::sys::serial();
         let (mut ctx, scratch) = ctx_with_claude(WAITS_FOR_THE_LOCK);
         let out = config_lock_within(&mut ctx, Duration::from_millis(800)).unwrap();
-        assert_eq!(out.status, Status::Pass, "{:?}", out.evidence);
-        let timing = label(&out, "start-up: CC wrote");
-        assert_eq!((timing.ok, &timing.value["wrote"]), (None, &json!(false)));
-        // It wrote once the lock was released, so the add still happened.
-        assert_eq!(label(&out, "the server was added").ok, Some(true));
+        assert_eq!(out.status, Status::Fail, "{:?}", out.evidence);
+        let landed = label(&out, "start-up: CC's write of the global config landed");
+        assert_eq!(landed.ok, Some(false));
+        assert!(landed.value.to_string().contains("waited the lock out"));
+        let when = label(&out, "start-up: when CC's write landed");
+        assert_eq!(
+            (when.ok, &when.value["insideWindow"]),
+            (None, &json!(false))
+        );
         fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
-    fn a_server_that_is_never_added_fails_the_check() {
+    fn no_write_at_all_is_a_harness_error_that_keeps_the_evidence() {
         let _serial = crate::compat::sys::serial();
         let (mut ctx, scratch) = ctx_with_claude("exit 0");
         let out = config_lock_within(&mut ctx, Duration::from_millis(300)).unwrap();
-        assert_eq!(out.status, Status::Fail, "{:?}", out.evidence);
-        assert_eq!(label(&out, "the server was added").ok, Some(false));
+        assert_eq!(out.status, Status::Error, "{:?}", out.evidence);
+        assert!(out.summary.contains("wrote nothing"), "{}", out.summary);
+        let landed = label(&out, "start-up: CC's write of the global config landed");
+        assert_eq!(landed.ok, Some(false));
+        assert!(!ctx.paths(&ctx.live()).config_lock.exists());
         fs::remove_dir_all(&scratch).unwrap();
     }
 
