@@ -13,7 +13,8 @@ use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_provider::{
-    Cancel, Captured, Check, CheckStatus, Env, FakeKeychain, Provider, ScriptedSpawner,
+    Cancel, Captured, Check, CheckStatus, Env, FakeKeychain, Keychain, KeychainError, LockState,
+    Provider, Read, ScriptedSpawner,
 };
 
 struct Fx {
@@ -538,4 +539,122 @@ fn the_online_hosts_are_each_endpoint_host_once() {
     let local = ClaudeCode::with_store(LiveStore::new(f.kc.clone(), Platform::MacOs))
         .with_endpoints(Endpoints::with_base("http://127.0.0.1:9"));
     assert_eq!(local.doctor_hosts(), ["http://127.0.0.1:9/"]);
+}
+
+/// A keychain whose lock state cannot be told (`security show-keychain-info` failing), over a
+/// `FakeKeychain` for everything else.
+struct UnknownLock(Arc<FakeKeychain>);
+
+impl Keychain for UnknownLock {
+    fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
+        self.0.find(s, a)
+    }
+    fn exists(&self, s: &str, a: &str) -> Read<()> {
+        self.0.exists(s, a)
+    }
+    fn upsert(&self, s: &str, a: &str, d: &[u8]) -> Result<(), KeychainError> {
+        self.0.upsert(s, a, d)
+    }
+    fn delete(&self, s: &str, a: &str) -> Result<(), KeychainError> {
+        self.0.delete(s, a)
+    }
+    fn lock_state(&self) -> LockState {
+        LockState::Unknown
+    }
+    fn unlock(&self) -> bool {
+        self.0.unlock()
+    }
+}
+
+#[test]
+fn a_keychain_whose_state_cannot_be_told_skips_auth_status_and_says_so() {
+    let mut f = fx();
+    let inner = f.kc.clone();
+    f.cc = ClaudeCode::with_store(LiveStore::new(
+        Arc::new(UnknownLock(inner.clone())),
+        Platform::MacOs,
+    ));
+    f.install_claude();
+    inner.put(
+        &keychain_service(&f.env, ItemKind::ManagedKey),
+        &keychain_account(&f.env),
+        b"",
+    );
+    f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
+    let checks = f.checks();
+    let specs = f.spawner.specs();
+    assert_eq!(specs.len(), 1, "only `claude --version`: {specs:?}");
+    assert_eq!(specs[0].args, vec![OsString::from("--version")]);
+    none(&checks, "cc.auth");
+    none(&checks, "cc.managed-key");
+    let c = one(&checks, "cc.keychain");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        c.message.contains("lock state cannot be told")
+            && c.message.contains("`claude auth status` included"),
+        "{}",
+        c.message
+    );
+    assert!(c.fix.as_deref().unwrap().contains("show-keychain-info"));
+    assert_eq!(inner.unlock_attempts(), 0);
+}
+
+#[test]
+fn the_auth_fixes_say_where_to_run_claude_auth_status() {
+    for reply in [
+        Captured::TimedOut,
+        Captured::SpawnFailed("x".into()),
+        exited(0, "no"),
+    ] {
+        let f = fx();
+        f.install_claude();
+        f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
+        f.spawner.push(reply);
+        let checks = f.checks();
+        let c = one(&checks, "cc.auth");
+        let home = CcPaths::resolve(&f.env).config_home;
+        let fix = c.fix.as_deref().unwrap();
+        assert!(
+            fix.contains("outside any `tagteam run` session")
+                && fix.contains(&home.display().to_string()),
+            "{fix}"
+        );
+    }
+}
+
+#[test]
+fn the_unreadable_item_fixes_do_not_claim_an_attributes_probe_shows_why() {
+    let mut f = fx();
+    let default_home = f.env.home.join(".claude");
+    f.env.claude_config_dir = Some(default_home.into_os_string());
+    let acct = keychain_account(&f.env);
+    f.kc.put("Claude Code-credentials", &acct, b"{}");
+    f.kc.set_unreadable("Claude Code-credentials", &acct, true);
+    let svc = keychain_service(&f.env, ItemKind::ManagedKey);
+    f.kc.put(&svc, &acct, b"x");
+    f.kc.set_unreadable(&svc, &acct, true);
+    for c in f.checks().iter().filter(|c| {
+        matches!(c.id.as_str(), "cc.former-item" | "cc.managed-key")
+            && c.status == CheckStatus::Warn
+    }) {
+        let fix = c.fix.as_deref().unwrap();
+        assert!(!fix.contains("find-generic-password"), "{}: {fix}", c.id);
+        assert!(fix.contains("unlock"), "{}: {fix}", c.id);
+    }
+}
+
+#[test]
+fn the_online_hosts_are_probed_once_each_even_when_a_duplicate_is_not_adjacent() {
+    let f = fx();
+    let cc = ClaudeCode::with_store(LiveStore::new(f.kc.clone(), Platform::MacOs)).with_endpoints(
+        Endpoints {
+            token: "https://a.example/token".into(),
+            profile: "https://b.example/profile".into(),
+            usage: "https://a.example/usage".into(),
+        },
+    );
+    assert_eq!(
+        cc.doctor_hosts(),
+        ["https://a.example/", "https://b.example/"]
+    );
 }

@@ -147,6 +147,36 @@ pub(crate) fn checks(
     out
 }
 
+/// `claude --version` against the tested version (§15.4): newer warns, and whichever of the two
+/// cannot be read is named as the one that cannot.
+fn version_check(reported: Option<Version>, tested: Option<Version>) -> Check {
+    match (reported, tested) {
+        (Some(v), Some(t)) if v > t => Check::warn(
+            "cc.version",
+            format!(
+                "Claude Code {} is newer than {}, the newest version tagteam was checked against",
+                shown(v),
+                shown(t)
+            ),
+        )
+        .fix("watch for a tagteam release that covers it; until then, what it changed may not be handled"),
+        (Some(v), Some(t)) => Check::ok(
+            "cc.version",
+            format!("Claude Code {} (checked against {})", shown(v), shown(t)),
+        ),
+        (_, None) => Check::warn(
+            "cc.version",
+            "the tested Claude Code version (compat/tested-cc-version) built into this tagteam cannot be read, so `claude`'s version is not compared with it",
+        )
+        .fix("this tagteam build is damaged: reinstall tagteam or update it"),
+        (None, Some(_)) => Check::warn(
+            "cc.version",
+            "`claude --version` printed a version tagteam cannot read",
+        )
+        .fix("run `claude --version` yourself; if it does not print `X.Y.Z (Claude Code)`, update Claude Code or tagteam"),
+    }
+}
+
 /// The binary on `PATH`, and its version against the tested one (§15.4): newer warns.
 fn binary(
     claude: Option<&Path>,
@@ -178,26 +208,7 @@ fn binary(
             code: Some(0),
             stdout,
             ..
-        } => match (reported(&stdout), tested()) {
-            (Some(v), Some(t)) if v > t => Check::warn(
-                "cc.version",
-                format!(
-                    "Claude Code {} is newer than {}, the newest version tagteam was checked against",
-                    shown(v),
-                    shown(t)
-                ),
-            )
-            .fix("watch for a tagteam release that covers it; until then, what it changed may not be handled"),
-            (Some(v), Some(t)) => Check::ok(
-                "cc.version",
-                format!("Claude Code {} (checked against {})", shown(v), shown(t)),
-            ),
-            _ => Check::warn(
-                "cc.version",
-                "`claude --version` printed a version tagteam cannot read",
-            )
-            .fix("run `claude --version` yourself; if it does not print `X.Y.Z (Claude Code)`, update Claude Code or tagteam"),
-        },
+        } => version_check(reported(&stdout), tested()),
         Captured::Exited { code, signal, .. } => Check::warn(
             "cc.version",
             format!(
@@ -217,18 +228,16 @@ fn binary(
             ),
         )
         .fix("run `claude --version` yourself; if it hangs, reinstall Claude Code"),
-        Captured::SpawnFailed(e) => {
-            Check::warn("cc.version", format!("`claude --version` could not be run: {e}")).fix(
-                format!(
-                    "check that {} is an executable this user may run",
-                    quoted(bin)
-                ),
-            )
-        }
-        Captured::Interrupted(_) => {
-            Check::warn("cc.version", "`claude --version` was interrupted")
-                .fix("run `tagteam doctor` again")
-        }
+        Captured::SpawnFailed(e) => Check::warn(
+            "cc.version",
+            format!("`claude --version` could not be run: {e}"),
+        )
+        .fix(format!(
+            "check that {} is an executable this user may run",
+            quoted(bin)
+        )),
+        Captured::Interrupted(_) => Check::warn("cc.version", "`claude --version` was interrupted")
+            .fix("run `tagteam doctor` again"),
     };
     out.push(check);
 }
@@ -281,9 +290,9 @@ fn keychain(kc: &dyn Keychain, env: &Env, acct: &str, out: &mut Vec<Check>) -> L
                     "cc.managed-key",
                     format!("the managed-key item {svc} cannot be read: {e}"),
                 )
-                .fix(format!(
-                    "run `tagteam doctor` again; if it persists, `security find-generic-password -s '{svc}' -a '{acct}'` shows why"
-                )),
+                .fix(
+                    "the Keychain would not give the item up: unlock the login keychain, or allow `tagteam` access to it when macOS asks, then `tagteam doctor` again",
+                ),
             ),
         }
     }
@@ -307,9 +316,9 @@ fn keychain(kc: &dyn Keychain, env: &Env, acct: &str, out: &mut Vec<Check>) -> L
                         "whether the Keychain holds {svc}, an item Claude Code read for this home before 2.1.286, cannot be told: {e}"
                     ),
                 )
-                .fix(format!(
-                    "run `tagteam doctor` again; if it persists, `security find-generic-password -s '{svc}' -a '{acct}'` shows why"
-                )),
+                .fix(
+                    "the Keychain would not answer for the item: unlock the login keychain, or allow `tagteam` access to it when macOS asks, then `tagteam doctor` again",
+                ),
             ),
         }
     }
@@ -418,6 +427,15 @@ fn environment(env: &Env, out: &mut Vec<Check>) {
     }
 }
 
+/// Where to run `claude auth status` by hand: in the home doctor checked, and outside any
+/// `tagteam run` session, whose own profile it would otherwise ask about (§12.8).
+fn auth_fix(paths: &CcPaths) -> String {
+    format!(
+        "run `claude auth status` yourself outside any `tagteam run` session, with CLAUDE_CONFIG_DIR as it is here (the home doctor checked: {}), to see why, then `tagteam doctor` again",
+        paths.config_home.display()
+    )
+}
+
 /// The default home's login, by `claude auth status` (Appendix A.7) in the outer home's
 /// environment: `env`'s two home variables replace the process's, so inside a run shell it
 /// asks about the default home, not the profile (§12.8). It writes nothing (§15.4).
@@ -454,7 +472,7 @@ fn auth(
                         AUTH_STATUS_TIMEOUT.as_secs()
                     ),
                 )
-                .fix("run `claude auth status` yourself to see why, then `tagteam doctor` again"),
+                .fix(auth_fix(paths)),
             );
             return;
         }
@@ -464,7 +482,7 @@ fn auth(
                     "cc.auth",
                     format!("`claude auth status` could not be run: {e}"),
                 )
-                .fix("run `claude auth status` yourself to see why, then `tagteam doctor` again"),
+                .fix(auth_fix(paths)),
             );
             return;
         }
@@ -482,7 +500,7 @@ fn auth(
                 "cc.auth",
                 "`claude auth status` printed no status tagteam can read",
             )
-            .fix("run `claude auth status` yourself to see why, then `tagteam doctor` again"),
+            .fix(auth_fix(paths)),
         );
         return;
     };
@@ -643,6 +661,24 @@ mod tests {
         for bad in ["2.1", "2.1.2.3", "2.x.1", "", "v2.1.286"] {
             assert_eq!(version(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn an_unreadable_tested_version_is_blamed_on_the_tested_version() {
+        let bad_tested = version_check(Some((2, 1, 286)), None);
+        assert!(
+            bad_tested.message.contains("compat/tested-cc-version"),
+            "{}",
+            bad_tested.message
+        );
+        assert!(!bad_tested.message.contains("`claude --version` printed"));
+        assert!(bad_tested.fix.is_some());
+        let bad_claude = version_check(None, Some((2, 1, 286)));
+        assert!(
+            bad_claude.message.contains("`claude --version` printed"),
+            "{}",
+            bad_claude.message
+        );
     }
 
     #[test]

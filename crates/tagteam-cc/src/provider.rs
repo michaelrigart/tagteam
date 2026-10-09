@@ -767,15 +767,18 @@ impl Provider for ClaudeCode {
 
     /// The token, profile and usage hosts (Appendix A.5), each once, as root URLs.
     fn doctor_hosts(&self) -> Vec<String> {
-        let mut hosts: Vec<String> = [
+        let mut hosts: Vec<String> = Vec::new();
+        for url in [
             &self.endpoints.token,
             &self.endpoints.profile,
             &self.endpoints.usage,
-        ]
-        .into_iter()
-        .filter_map(|url| doctor::origin(url))
-        .collect();
-        hosts.dedup();
+        ] {
+            if let Some(host) = doctor::origin(url) {
+                if !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+        }
         hosts
     }
 }

@@ -1849,7 +1849,7 @@ impl Run<'_> {
             if accounts.iter().any(|r| r.id.as_str() == name) {
                 continue;
             }
-            let delete = format!("once no session runs in it, delete {}", quoted(&dir));
+            let delete = Self::move_then_delete(&dir);
             match marker {
                 Read::Unreadable(e) => found.push(
                     Check::warn(
@@ -1971,7 +1971,10 @@ impl Run<'_> {
             if m.provider != id {
                 continue;
             }
-            match accounts.iter().find(|r| r.id == m.account_id && r.provider == id) {
+            match accounts
+                .iter()
+                .find(|r| r.id == m.account_id && r.provider == id)
+            {
                 Some(row) => found.push(
                     Check::warn(
                         "sessions.marker",
@@ -1986,11 +1989,14 @@ impl Run<'_> {
                 None => found.push(
                     Check::warn(
                         "sessions.orphan",
-                        format!("{} is a profile of an account this store no longer has", dir.display()),
+                        format!(
+                            "{} is a profile of an account this store no longer has",
+                            dir.display()
+                        ),
                     )
                     .fix(format!(
-                        "once no session runs in it, delete {}; `tagteam purge` deletes it with its Keychain item",
-                        quoted(&dir)
+                        "{}; `tagteam purge` deletes it with its Keychain item",
+                        Self::move_then_delete(&dir)
                     )),
                 ),
             }
@@ -2322,27 +2328,9 @@ impl Run<'_> {
             if self.engine.process.exists(parent) != Some(false) {
                 continue;
             }
-            let holders = match holders_of(&path) {
-                Some(pids) if !pids.is_empty() => format!(
-                    "held by pid {}",
-                    pids.iter()
-                        .map(u32::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-                Some(_) => "held by a process this user cannot see".to_owned(),
-                None => "this OS cannot tell which process holds it".to_owned(),
-            };
-            found.push(
-                Check::info(
-                    "sessions.reservation",
-                    format!(
-                        "{} is still held although its tagteam (pid {parent}) is gone ({holders}): a process its `claude` started still runs, so account {n} stays in a session",
-                        path.display()
-                    ),
-                )
-                .fix("end that process to release the account"),
-            );
+            let holders = holders_of(&path);
+            let still_there = holders.is_some() || path.try_exists().unwrap_or(true);
+            found.push(held_reservation(&path, parent, n, holders, still_there));
         }
     }
 
@@ -2469,6 +2457,48 @@ impl Run<'_> {
     }
 }
 
+/// `sessions.reservation` for a reservation `path` still held after its tagteam `parent` died.
+/// `holders` is `holders_of`'s answer; `None` means either that this OS cannot tell, or (when
+/// `still_there` is false) that the lock file went away between the probe and the scan. (The
+/// scan's `stat` of the file could hang on a stalled NFS mount; parked, R-T10.)
+fn held_reservation(
+    path: &Path,
+    parent: u32,
+    n: u32,
+    holders: Option<Vec<u32>>,
+    still_there: bool,
+) -> Check {
+    if holders.is_none() && !still_there {
+        return Check::info(
+            "sessions.reservation",
+            format!(
+                "{} was held although its tagteam (pid {parent}) is gone, but the lock went away while doctor looked, so account {n}'s state is not known to have stayed the same",
+                path.display()
+            ),
+        )
+        .fix("run `tagteam doctor` again");
+    }
+    let holders = match holders {
+        Some(pids) if !pids.is_empty() => format!(
+            "held by pid {}",
+            pids.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Some(_) => "held by a process this user cannot see".to_owned(),
+        None => "this OS cannot tell which process holds it".to_owned(),
+    };
+    Check::info(
+        "sessions.reservation",
+        format!(
+            "{} is still held although its tagteam (pid {parent}) is gone ({holders}): a process its `claude` started still runs, so account {n} stays in a session",
+            path.display()
+        ),
+    )
+    .fix("end that process to release the account")
+}
+
 /// §7.4's quarantine reasons, in words.
 fn quarantine_words(reason: &str) -> &'static str {
     match reason {
@@ -2483,6 +2513,26 @@ fn quarantine_words(reason: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reservation_whose_lock_went_away_is_not_reported_as_unknowable() {
+        let path = Path::new("/d/.tagteam-launch/42.lock");
+        let gone = held_reservation(path, 42, 1, None, false);
+        assert!(gone.message.contains("lock went away"), "{}", gone.message);
+        assert_eq!(gone.fix.as_deref(), Some("run `tagteam doctor` again"));
+        let blind = held_reservation(path, 42, 1, None, true);
+        assert!(
+            blind.message.contains("this OS cannot tell"),
+            "{}",
+            blind.message
+        );
+        let seen = held_reservation(path, 42, 1, Some(vec![7, 9]), true);
+        assert!(
+            seen.message.contains("held by pid 7, 9"),
+            "{}",
+            seen.message
+        );
+    }
 
     #[test]
     fn every_quarantine_reason_has_its_words() {

@@ -1384,9 +1384,73 @@ fn a_profile_without_a_store_account_warns_naming_what_to_delete() {
     let (provider, c) = under(&r, "sessions.orphan");
     assert_eq!(provider, Some(&cc()));
     assert!(
-        fix(c).contains(&format!("delete '{}'", dir.display())),
-        "{c:?}"
+        fix(c).starts_with("move any real `projects/` or `history.jsonl` in ")
+            && fix(c).contains(&format!("in '{}' into the default home's", dir.display()))
+            && fix(c).contains("then delete it once no session runs in it")
+            && fix(c).contains("`tagteam purge`"),
+        "history first, never deletion (§12.2): {c:?}"
     );
+}
+
+#[test]
+fn every_other_orphan_also_moves_history_before_deleting() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let sessions = fx.env.data_dir().join("sessions");
+    let bare = sessions.join("0192ffff-0000-7000-8000-00000000000c");
+    fs::create_dir_all(&bare).unwrap();
+    let ghost = AccountId::from_string("0192ffff-0000-7000-8000-00000000000d");
+    let ghost_dir = fx.profile_dir(&ghost);
+    fs::create_dir_all(&ghost_dir).unwrap();
+    tagteam_provider::ProfileMarker {
+        provider: ProviderId::new("ghost"),
+        account_id: ghost.clone(),
+        config_dir: ghost_dir.display().to_string(),
+        outer: serde_json::json!({}),
+    }
+    .write(&ghost_dir)
+    .unwrap();
+    let r = doctor(&fx);
+    let orphans = found(&r, "sessions.orphan");
+    assert_eq!(orphans.len(), 2, "{orphans:#?}");
+    for (c, dir) in orphans.iter().zip([&bare, &ghost_dir]) {
+        let _ = dir;
+        assert!(
+            fix(c).starts_with("move any real `projects/` or `history.jsonl` in '"),
+            "{c:?}"
+        );
+        assert!(fix(c).contains("then delete it once no session runs in it"));
+    }
+    for dir in [&bare, &ghost_dir] {
+        assert!(
+            orphans
+                .iter()
+                .any(|c| fix(c).contains(&format!("in '{}'", dir.display()))),
+            "{dir:?}: {orphans:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_locked_keychain_skips_the_profile_credential_and_provenance_and_says_so_once() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = fx.make_profile(&id);
+    let row = fx.engine.store().unwrap().account(&id).unwrap().unwrap();
+    let seed = fx.cc.fingerprint(&credential("a@x.co", "rt-seed")).unwrap();
+    fx.write_seed(&dir, row.login_epoch, seed.as_str());
+    fx.set_profile_credential(&dir, &credential("a@x.co", "rt-profile"));
+    // Unlocked, this profile is a provenance conflict (the test above); locked, it is not told.
+    assert_eq!(
+        one(&doctor(&fx), "sessions.provenance").status,
+        CheckStatus::Fail
+    );
+    fx.kc.set_locked(true);
+    let r = doctor(&fx);
+    assert!(found(&r, "sessions.credential").is_empty(), "{r:#?}");
+    assert!(found(&r, "sessions.provenance").is_empty(), "{r:#?}");
+    assert_eq!(one(&r, "keychain.locked").status, CheckStatus::Warn);
+    assert_eq!(fx.kc.unlock_attempts(), 0);
 }
 
 #[test]
@@ -1656,6 +1720,10 @@ fn an_orphan_of_a_registered_provider_with_no_account_is_found_from_sessions_its
         c.message.contains(&dir.display().to_string()) && c.message.contains("fake-agent"),
         "{}",
         c.message
+    );
+    assert!(
+        fix(c).starts_with("move any real `projects/`") && fix(c).contains("`tagteam purge`"),
+        "{c:?}"
     );
 }
 
