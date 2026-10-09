@@ -2918,6 +2918,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "rusqlite",
+ "serde_json",
+ "sha2 0.10.9",
+ "signal-hook",
+ "tagteam-cc",
+ "tagteam-provider",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"

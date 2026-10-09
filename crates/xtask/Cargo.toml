@@ -1,0 +1,25 @@
+[package]
+name = "xtask"
+description = "The tagteam workspace's development tasks: `cargo xtask compat` (spec 15.4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# Never published or distributed: dist skips a package that is not publishable.
+publish = false
+
+# Workspace dependencies only, with no feature the release build lacks: a dist build of the
+# whole workspace unifies features, and must build `tagteam` exactly as it does without xtask.
+[dependencies]
+tagteam-provider.workspace = true
+tagteam-cc.workspace = true
+clap.workspace = true
+hex.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+signal-hook.workspace = true
+
+[lints]
+workspace = true
