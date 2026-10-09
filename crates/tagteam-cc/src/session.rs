@@ -330,9 +330,9 @@ pub(crate) fn merge_back(
             )
         }
         Read::Absent => {
+            // Its role, never its path (§14.2): the profile sits under the data directory.
             tracing::warn!(
-                "{} is gone, so its session has nothing to merge back",
-                profile.display()
+                "a session profile's global config is gone, so its session has nothing to merge back"
             );
             remove_own_file(dir, BASELINE_FILE)?;
             return Ok(MergeReport::default());

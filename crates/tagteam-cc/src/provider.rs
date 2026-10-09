@@ -177,8 +177,9 @@ struct Armed<'a, 'l> {
 impl Drop for Armed<'_, '_> {
     fn drop(&mut self) {
         if let Some(undo) = self.undo.take() {
-            if let Err(e) = undo.undo(self.locks) {
-                tracing::error!("restoring the live credential during unwinding failed: {e}");
+            // A fixed phrase (§14.2): the error may name a path or another program's message.
+            if undo.undo(self.locks).is_err() {
+                tracing::error!("restoring the live credential during unwinding failed");
             }
         }
     }

@@ -618,3 +618,73 @@ fn an_import_logs_each_account_by_id_and_position_and_never_its_login() {
     no_email(&logs);
     assert!(logs.iter().all(|l| !l.contains("rt-")), "{logs:#?}");
 }
+
+#[test]
+fn a_keychain_delete_that_fails_is_logged_with_its_cause() {
+    // §14: the probe after the delete decides, and `remove` reports the item left; the line
+    // says why the delete failed, naming the item's service and no account.
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let dir = fx.make_profile(&a);
+    let (svc, acct) = fx.profile_item(&dir);
+    fx.kc
+        .put(&svc, &acct, &common::credential("a@x.co", "rt-a2"));
+    fx.kc.set_fail_delete(&svc, true);
+    let (removed, logs) = capture_logs(|| fx.engine.remove(&a));
+    assert!(removed.is_err());
+    let failed = at(&logs, "WARN", "could not delete a Keychain item");
+    assert_eq!(failed.len(), 1, "{logs:#?}");
+    // By `security`'s exit status, never its message (§14.2).
+    assert_eq!(field(failed[0], "rc"), Some("25"), "{}", failed[0]);
+    assert!(
+        failed[0].contains(&svc) && !failed[0].contains("injected"),
+        "{}",
+        failed[0]
+    );
+    no_email(&logs);
+}
+
+/// A fixture whose data directory sits under a name with an email in it (§14.2).
+fn named_home() -> Fx {
+    Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
+        e.xdg_data_home = Some(e.home.join("alice@example.com/data"));
+    })
+}
+
+/// Asserts that no line names the data directory's email, nor `bob@example.com`, which the
+/// tests write into the files they break.
+fn none_named(logs: &[String]) {
+    for name in ["alice@example.com", "bob@example.com"] {
+        assert!(
+            logs.iter().all(|l| !l.contains(name)),
+            "{name} in {logs:#?}"
+        );
+    }
+    no_email(logs);
+}
+
+#[test]
+fn a_keychain_write_that_falls_back_is_logged_by_its_exit_status() {
+    // §14.2: `security`'s message is another program's text; its exit status is the cause.
+    let _serial = one_at_a_time();
+    let fx = named_home();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.kc.set_fail_write(
+        &tagteam_cc::keychain_service(&fx.env, tagteam_cc::ItemKind::OAuth),
+        true,
+    );
+    let (switched, logs) = capture_logs(|| fx.switch_to(&a, false));
+    assert!(switched.unwrap().switched);
+    let line = at(
+        &logs,
+        "WARN",
+        "keychain write failed, falling back to the credentials file",
+    );
+    assert_eq!(line.len(), 1, "{logs:#?}");
+    assert_eq!(field(line[0], "rc"), Some("25"), "{}", line[0]);
+    assert!(logs.iter().all(|l| !l.contains("injected")), "{logs:#?}");
+    none_named(&logs);
+}

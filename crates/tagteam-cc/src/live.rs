@@ -344,12 +344,15 @@ fn restore_file(
     }
 }
 
-/// Logs, right before a lock-loss abort, exactly which entries never got restored:
-/// those already recorded as failed, and those the abort means will never be
-/// attempted. Names only — Keychain services and file paths — never bytes.
+/// Logs, right before a lock-loss abort, how many entries never got restored: those already
+/// recorded as failed, and those the abort means will never be attempted. Counts only
+/// (§14.2): an entry's name is a Keychain service or a file path, which may lie in a home the
+/// user named.
 fn log_lock_abort(failed: &[String], never_attempted: &[String]) {
     tracing::error!(
-        "the lock was lost mid-restore; left unrestored: {failed:?}; never attempted: {never_attempted:?}"
+        unrestored = failed.len(),
+        never_attempted = never_attempted.len(),
+        "the lock was lost mid-restore, so entries were left unrestored"
     );
 }
 
@@ -680,9 +683,10 @@ impl LiveStore {
     }
 
     /// Checks `fence`, deletes the item `svc`/`acct` and returns whether the existence probe
-    /// now finds it `Absent`. A delete that fails is not an error of its own: the probe decides.
-    /// It touches no ledger and takes no lock, so a caller that needs either wraps it
-    /// (`remove_item` does the ledger).
+    /// now finds it `Absent`. A delete that fails is not an error of its own: the probe decides,
+    /// and the failure is logged at WARN with its cause, which the caller's error does not
+    /// carry (§14). It touches no ledger and takes no lock, so a caller that needs either wraps
+    /// it (`remove_item` does the ledger).
     fn delete_verified(
         &self,
         svc: &str,
@@ -690,7 +694,10 @@ impl LiveStore {
         fence: Fence<'_>,
     ) -> Result<bool, ProviderError> {
         fence()?;
-        let _ = self.keychain.delete(svc, acct);
+        if let Err(e) = self.keychain.delete(svc, acct) {
+            // By `security`'s exit status (§14.2): its message is another program's text.
+            tracing::warn!(service = svc, rc = e.rc, "could not delete a Keychain item");
+        }
         Ok(matches!(self.keychain.exists(svc, acct), Read::Absent))
     }
 
@@ -763,7 +770,8 @@ impl LiveStore {
                     return Ok(SecretStore::Keychain);
                 }
                 Err(e) => tracing::warn!(
-                    "keychain write failed, falling back to the credentials file: {e}"
+                    rc = e.rc,
+                    "keychain write failed, falling back to the credentials file"
                 ),
             }
         }
@@ -949,7 +957,10 @@ impl LiveStore {
                 match upserted {
                     Ok(()) => return Ok(true),
                     Err(e) => {
-                        tracing::warn!("keychain write failed, storing primaryApiKey instead: {e}")
+                        tracing::warn!(
+                            rc = e.rc,
+                            "keychain write failed, storing primaryApiKey instead"
+                        )
                     }
                 }
                 self.report_item(env, ItemKind::ManagedKey, before_fallback)?;
