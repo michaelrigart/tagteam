@@ -3189,9 +3189,9 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
     activation can commit (Appendix A.3)
   - CC runs on an API key while the credential entry keeps only machine-shared keys (§9.4)
   - lock interop while CC refreshes
-  - CC waits for `~/.claude.json.lock` around its own writes of the global config: during its
-    start-up only briefly before writing without it, and past start-up for its full retry window
-    (§9.1, A.7)
+  - CC, during its start-up, waits only briefly for `~/.claude.json.lock` before writing the
+    global config without it (§9.1, A.7). Its retry window past start-up is read from its code;
+    compat has no way to drive a CC write past start-up, so it does not check that window
   - CC accepts a `~/.claude.json` that tagteam created on a fresh machine (§9.5), and its own
     next write of the file leaves the span tagteam spliced byte-identical, which pins §9.5's
     rendering against `JSON.stringify`
