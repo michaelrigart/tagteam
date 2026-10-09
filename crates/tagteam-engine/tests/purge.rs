@@ -1756,3 +1756,42 @@ fn a_live_credential_file_that_links_into_a_profile_is_never_deleted_by_purge() 
     assert!(dir.join(".tagteam-profile.json").exists());
     assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
 }
+
+/// The live credential file is a link to `bridge`, a link inside the stored account `id`'s
+/// profile, which leads to a file outside it: neither the live path nor the final target is
+/// inside the profile, only the link in the middle. Returns the profile, the live link, the
+/// bridge and the target.
+fn live_login_bridged_through(id: &str) -> (Fx, AccountId, PathBuf, PathBuf, PathBuf, PathBuf) {
+    let fx = Fx::with(Platform::Linux, |_| {});
+    let id = add(&fx.engine.store().unwrap(), &fx.provider(), id, "a@x.co", 1);
+    fx.put_vault(&id, b"a vault credential");
+    let dir = fx.profile_dir(&id);
+    fx.write_marker(&dir, &id, &fx.env);
+    let target = fx.dir.path().join("safe-login.json");
+    fs::write(&target, b"the live login").unwrap();
+    let bridge = dir.join("credential-bridge");
+    std::os::unix::fs::symlink(&target, &bridge).unwrap();
+    let live = fx.paths().credentials_file;
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&bridge, &live).unwrap();
+    (fx, id, dir, live, bridge, target)
+}
+
+#[test]
+fn a_live_credential_reached_through_a_link_inside_a_profile_is_never_deleted_by_purge() {
+    // Codex slice 3 re-review 2: `~/.claude/.credentials.json -> sessions/<id>/credential-bridge
+    // -> /elsewhere/login.json`; deleting the profile would leave the live path dangling.
+    let (fx, id, dir, live, bridge, target) = live_login_bridged_through("0192-bridged");
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"the live login");
+    assert!(fs::symlink_metadata(&bridge).is_ok(), "the bridge stays");
+    assert!(fs::symlink_metadata(&live).is_ok());
+    assert!(dir.join(".tagteam-profile.json").exists());
+    assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
+}
