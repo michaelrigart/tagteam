@@ -13,6 +13,8 @@ use std::path::Path;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::sys::HarnessError;
+
 pub const EXIT_PASS: u8 = 0;
 pub const EXIT_FAIL: u8 = 1;
 pub const EXIT_HARNESS: u8 = 2;
@@ -323,6 +325,17 @@ impl Probe {
 
     pub fn into_evidence(self) -> Vec<Evidence> {
         self.evidence
+    }
+
+    /// Runs a check's `body` on a new probe. `Ok(summary)` finishes the probe as `finish` does;
+    /// a harness error ends the check as an error outcome that keeps every note and expectation
+    /// gathered before it, since that evidence is what says how far the check got.
+    pub fn run(body: impl FnOnce(&mut Probe) -> Result<&'static str, HarnessError>) -> Outcome {
+        let mut p = Probe::new();
+        match body(&mut p) {
+            Ok(passed) => p.finish(passed),
+            Err(e) => Outcome::error(e.0, p.into_evidence()),
+        }
     }
 }
 
@@ -885,5 +898,31 @@ mod tests {
         assert_eq!(r.to_json()["teardown"], json!(["daemons stopped"]));
         r.teardown = Some(vec![]);
         assert_eq!(r.teardown_text(), "begun, no step finished");
+    }
+
+    #[test]
+    fn a_check_that_meets_a_harness_error_keeps_the_evidence_it_gathered() {
+        use crate::compat::sys::harness;
+        let out = Probe::run(|p| {
+            p.note("first half", json!("done"));
+            p.expect("it held", false, json!(1));
+            Err(harness("the second half could not start"))
+        });
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(out.summary, "the second half could not start");
+        let labels: Vec<_> = out.evidence.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, ["first half", "it held"]);
+        assert_eq!(out.evidence[1].ok, Some(false));
+
+        let out = Probe::run(|p| {
+            p.expect("it held", true, json!(null));
+            Ok("fine")
+        });
+        assert_eq!((out.status, out.summary.as_str()), (Status::Pass, "fine"));
+        let out = Probe::run(|p| {
+            p.expect("it held", false, json!(null));
+            Ok("fine")
+        });
+        assert_eq!(out.status, Status::Fail);
     }
 }
