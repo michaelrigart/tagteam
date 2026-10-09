@@ -897,6 +897,9 @@ pub struct Running {
     out: Receiver<Vec<u8>>,
     err: Receiver<Vec<u8>>,
     started: Instant,
+    /// When the first look at it (`finished`, or `wait`'s polling) found it exited, so that
+    /// `Ran::seconds` is the child's own run time and not the time until `wait` was called.
+    ended: Option<Instant>,
     timeout: Duration,
 }
 
@@ -906,7 +909,11 @@ impl Running {
     }
 
     pub fn finished(&mut self) -> bool {
-        self.proc.exited()
+        let done = self.proc.exited();
+        if done {
+            self.ended.get_or_insert_with(Instant::now);
+        }
+        done
     }
 
     /// Waits until it exits or its deadline passes; then its whole process group is sent
@@ -917,6 +924,7 @@ impl Running {
         let mut timed_out = false;
         let status = loop {
             if let Some(s) = self.proc.status()? {
+                self.ended.get_or_insert_with(Instant::now);
                 break Some(s);
             }
             if let Some(n) = self.cancel.requested() {
@@ -926,6 +934,7 @@ impl Running {
             if Instant::now() >= deadline {
                 timed_out = true;
                 end_group(self.proc.child());
+                self.ended.get_or_insert_with(Instant::now);
                 break self.proc.status()?;
             }
             thread::sleep(Duration::from_millis(20));
@@ -941,7 +950,11 @@ impl Running {
             code: status.and_then(|s| s.code()),
             stdout: self.redact.output(&out),
             stderr: self.redact.output(&err),
-            seconds: self.started.elapsed().as_secs_f64(),
+            seconds: self
+                .ended
+                .unwrap_or_else(Instant::now)
+                .duration_since(self.started)
+                .as_secs_f64(),
             timed_out,
             raw: Raw(out),
         })
@@ -1133,6 +1146,7 @@ impl Cmd {
                 child: Some(child),
             },
             started: Instant::now(),
+            ended: None,
             timeout: self.timeout,
             redact: self.redact,
             cancel: self.cancel,
@@ -1723,6 +1737,30 @@ mod tests {
         drop(running);
         assert!(!signal(pid, "0", false), "the child was reaped");
         assert!(!group_alive(pid), "nothing of its group runs");
+    }
+
+    #[test]
+    fn a_run_s_seconds_end_at_the_first_look_that_finds_the_exit_not_at_wait() {
+        let _serial = serial();
+        let mut running = sh("exit 3").spawn(&test_roots()).unwrap();
+        assert!(wait_until(Duration::from_secs(5), || running.finished()));
+        thread::sleep(Duration::from_millis(1500));
+        let ran = running.wait().unwrap();
+        assert_eq!(ran.code, Some(3));
+        assert!(
+            ran.seconds < 1.4,
+            "the 1.5 s before wait() are not the child's: {}",
+            ran.seconds
+        );
+
+        // Without a look before `wait`, its own polling is the first.
+        let started = Instant::now();
+        let ran = sh("sleep 0.3").run(&test_roots()).unwrap();
+        assert!(
+            ran.seconds >= 0.25 && ran.seconds <= started.elapsed().as_secs_f64(),
+            "{}",
+            ran.seconds
+        );
     }
 
     #[test]
