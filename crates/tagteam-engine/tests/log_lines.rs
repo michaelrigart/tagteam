@@ -12,6 +12,7 @@ use serde_json::json;
 use tagteam_core::AccountId;
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::active::{ActiveOutcome, ActiveTrigger};
+use tagteam_engine::export::ExportRequest;
 use tagteam_engine::vault::SERVICE;
 use tagteam_engine::views::StatuslineView;
 use tagteam_provider::Clock;
@@ -553,4 +554,35 @@ fn a_purge_logs_each_account_and_its_totals() {
         "{done}"
     );
     no_email(&logs);
+}
+
+#[test]
+fn an_export_logs_each_account_by_id_and_position_and_never_its_login() {
+    // §14.2: an export is logged by position, never by its contents.
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    fx.quarantine(&a, "invalid_grant", "sha256:old");
+    let (_, logs) = capture_logs(|| fx.engine.export(&ExportRequest::default()).unwrap());
+    let line = one(&logs, "exported an account");
+    assert_eq!(
+        [
+            field(line, "account"),
+            field(line, "position"),
+            field(line, "source")
+        ],
+        [Some(b.as_str()), Some("2"), Some("\"vault\"")],
+        "{line}"
+    );
+    let skipped = at(&logs, "WARN", "an account was not exported");
+    assert_eq!(skipped.len(), 1, "{logs:#?}");
+    assert_eq!(
+        [field(skipped[0], "account"), field(skipped[0], "kind")],
+        [Some(a.as_str()), Some("\"account-broken\"")],
+        "{}",
+        skipped[0]
+    );
+    no_email(&logs);
+    assert!(logs.iter().all(|l| !l.contains("rt-")), "{logs:#?}");
 }

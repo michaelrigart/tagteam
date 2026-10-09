@@ -5,6 +5,7 @@ use tagteam_provider::{LockError, ProviderError, ReadError};
 
 use crate::settings::SettingsError;
 use crate::store::StoreError;
+use crate::transfer::TransferError;
 use crate::vault::VaultError;
 
 /// " (from <source>)" when `claude auth status` named where the overriding key came from.
@@ -240,6 +241,13 @@ pub enum EngineError {
         "the accounts changed since the purge was confirmed (another command added or removed one); run `tagteam purge` again"
     )]
     PurgeChanged,
+    /// §13.3: an account an explicit `--account` named whose exportable generation cannot be
+    /// determined, or is known to be dead. Nothing is written.
+    #[error("position {position} cannot be exported: {reason}")]
+    AccountBroken { position: u32, reason: String },
+    /// §13.3: an export or import file, its encryption, or a key for it.
+    #[error(transparent)]
+    Transfer(#[from] TransferError),
     #[error(transparent)]
     Io(#[from] io::Error),
     /// §14.1: a cancellation point outside a lock wait found the cancel token set. A lock wait
@@ -356,6 +364,8 @@ impl EngineError {
             EngineError::EngineRunning { .. } => "engine-running",
             EngineError::OrphanSessionRunning { .. } => "session-owned",
             EngineError::PurgeChanged => "purge-changed",
+            EngineError::AccountBroken { .. } => "account-broken",
+            EngineError::Transfer(e) => e.kind(),
             EngineError::Io(_) => "io",
             EngineError::Interrupted(_) => "interrupted",
         }
@@ -706,6 +716,17 @@ mod tests {
                 "session-owned",
             ),
             (EngineError::PurgeChanged, "purge-changed"),
+            (
+                EngineError::AccountBroken {
+                    position: 1,
+                    reason: "r".into(),
+                },
+                "account-broken",
+            ),
+            (
+                EngineError::Transfer(TransferError::NeedsPassphrase),
+                "needs-passphrase",
+            ),
             (EngineError::Io(io::Error::other("x")), "io"),
             (
                 EngineError::Provider(ProviderError::Lock(LockError::Interrupted {
