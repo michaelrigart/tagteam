@@ -21,6 +21,7 @@ use tagteam_provider::Cancel;
 use super::CompatArgs;
 use super::checks::{CHECKS, metas};
 use super::ctx::{ALIAS_API_KEY, ALIAS_OAUTH, ALIAS_SETUP_TOKEN, Account, Ctx, account, now_ms};
+use super::gate;
 use super::guard::Roots;
 use super::keychain::VaultKeychain;
 use super::layout::{self, Layout, RunLock, make_scratch};
@@ -460,6 +461,11 @@ fn prepare(
     report
         .setup
         .push(note("the lineage at the start", ctx.lineage()?));
+    // Before any check: no daemon left, the profile captured, relinked and trusting this run's
+    // work directory, the lineage in step (`gate::settle`).
+    report
+        .setup
+        .push(note("the settle gate", gate::settle(&ctx)?));
     Ok(ctx)
 }
 

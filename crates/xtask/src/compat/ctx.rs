@@ -614,6 +614,42 @@ pub fn dummy_key(tag: &str) -> Result<String, HarnessError> {
 }
 
 #[cfg(test)]
+impl Ctx {
+    /// A `Ctx` off macOS over the scratch directory and compat store given, with no vault and
+    /// no `claude`: its credentials are files.
+    pub(crate) fn offline(scratch: &Path, state: &Path, tagteam: PathBuf, redact: Redactor) -> Ctx {
+        Ctx {
+            layout: Layout {
+                workspace: PathBuf::from("/w"),
+                reports: PathBuf::from("/w/target/compat"),
+                state: state.to_path_buf(),
+                scratch: scratch.to_path_buf(),
+            },
+            roots: Roots {
+                scratch: scratch.to_path_buf(),
+                state: state.to_path_buf(),
+                users: vec![],
+                home: std::env::temp_dir(),
+                user: None,
+            },
+            tagteam,
+            claude: PathBuf::from("/nonexistent/claude"),
+            macos: false,
+            oauth: Account::default(),
+            setup_token: None,
+            vault: None,
+            base: Vec::new(),
+            activation_config: None,
+            live_active: false,
+            ssh: None,
+            redact,
+            cancel: Cancel::new(),
+            daemons: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -652,35 +688,7 @@ mod tests {
 
     /// A `Ctx` off macOS over a new scratch directory, with no vault and no `claude`.
     fn offline_ctx(scratch: &Path, tagteam: PathBuf, redact: Redactor) -> Ctx {
-        let state = PathBuf::from("/nonexistent/state");
-        Ctx {
-            layout: Layout {
-                workspace: PathBuf::from("/w"),
-                reports: PathBuf::from("/w/target/compat"),
-                state: state.clone(),
-                scratch: scratch.to_path_buf(),
-            },
-            roots: Roots {
-                scratch: scratch.to_path_buf(),
-                state,
-                users: vec![],
-                home: std::env::temp_dir(),
-                user: None,
-            },
-            tagteam,
-            claude: PathBuf::from("/nonexistent/claude"),
-            macos: false,
-            oauth: Account::default(),
-            setup_token: None,
-            vault: None,
-            base: Vec::new(),
-            activation_config: None,
-            live_active: false,
-            ssh: None,
-            redact,
-            cancel: Cancel::new(),
-            daemons: Vec::new(),
-        }
+        Ctx::offline(scratch, Path::new("/nonexistent/state"), tagteam, redact)
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod capture;
 pub mod checks;
 pub mod ctx;
 pub mod daemon;
+pub mod gate;
 pub mod guard;
 pub mod keychain;
 pub mod layout;
