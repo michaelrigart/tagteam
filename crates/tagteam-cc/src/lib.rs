@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod compat;
 pub mod config;
 mod crash;
 mod doctor;
