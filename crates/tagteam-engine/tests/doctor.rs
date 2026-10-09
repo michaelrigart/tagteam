@@ -1496,6 +1496,60 @@ fn a_live_daemon_in_an_orphaned_profile_is_reported_whoever_owns_the_marker() {
 }
 
 #[test]
+fn an_orphan_reports_the_whole_aggregate_as_an_account_does() {
+    // Doctor filters nothing: an orphan with a malformed `daemon.lock` is named with its
+    // repair, and one with a live daemon and an unreadable record gets both findings.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let bad = AccountId::from_string("0192ffff-0000-7000-8000-00000000000b");
+    let bad_dir = fx.profile_dir(&bad);
+    fx.write_marker(&bad_dir, &bad, &fx.env);
+    let lock = bad_dir.join("daemon.lock");
+    fs::write(&lock, "{").unwrap();
+    let both = AccountId::from_string("0192ffff-0000-7000-8000-00000000000e");
+    let both_dir = fx.profile_dir(&both);
+    fx.write_marker(&both_dir, &both, &fx.env);
+    live_supervisor(&fx, &both_dir, 5100);
+    fs::create_dir_all(both_dir.join("sessions")).unwrap();
+    fs::write(both_dir.join("sessions/torn.json"), "{").unwrap();
+
+    let r = doctor(&fx);
+    let states = found(&r, "sessions.state");
+    let named = |dir: &Path| {
+        states
+            .iter()
+            .find(|c| c.message.contains(&dir.display().to_string()))
+            .copied()
+    };
+    let c = named(&bad_dir).unwrap_or_else(|| panic!("{states:#?}"));
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        c.message
+            .contains(&format!("'{}' cannot be read", lock.display()))
+            && fix(c).contains("if nothing runs as Claude Code for that profile, delete the lock"),
+        "{c:?}"
+    );
+    assert!(
+        found(&r, "sessions.daemon")
+            .iter()
+            .all(|c| !c.message.contains(&bad_dir.display().to_string())),
+        "no daemon is live in the first"
+    );
+    let c = named(&both_dir).unwrap_or_else(|| panic!("{states:#?}"));
+    assert!(
+        c.message.contains("torn.json") && fix(c).contains("repair or remove that record"),
+        "{c:?}"
+    );
+    let daemons = found(&r, "sessions.daemon");
+    let d = daemons
+        .iter()
+        .find(|c| c.message.contains(&both_dir.display().to_string()))
+        .unwrap_or_else(|| panic!("{daemons:#?}"));
+    assert_eq!(d.status, CheckStatus::Info);
+    assert!(fix(d).contains("claude daemon stop --any"), "{d:?}");
+}
+
+#[test]
 fn every_other_orphan_also_moves_history_before_deleting() {
     let fx = Fx::new();
     fx.add("a@x.co", "rt-a");

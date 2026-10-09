@@ -1910,7 +1910,7 @@ impl Run<'_> {
                 if self.engine.registry.get(&m.provider).is_some() && in_scope.contains(&m.provider));
             let reports = orphaned && (only.is_none() || !matches!(&marker, Read::Present(_)));
             if reports {
-                found.extend(self.orphan_daemon(&judges, &dir));
+                found.extend(self.orphan_ownership(&judges, &dir));
             }
             match marker {
                 Read::Unreadable(e) => found.push(
@@ -2049,7 +2049,7 @@ impl Run<'_> {
                     .fix(Self::move_then_delete(&dir)),
                 ),
                 None => {
-                    found.extend(self.orphan_daemon(&[p], &dir));
+                    found.extend(self.orphan_ownership(&[p], &dir));
                     found.push(
                         Check::warn(
                             "sessions.orphan",
@@ -2082,23 +2082,59 @@ impl Run<'_> {
         .fix(daemon_advice(profile))
     }
 
-    /// `daemon_check` for the profile at `dir` that no stored account owns, when any of
-    /// `judges` finds a daemon in it (§12.6); each is asked, as `purge` asks (§10.5 step 6).
-    fn orphan_daemon(&self, judges: &[&dyn Provider], dir: &Path) -> Option<Check> {
-        judges
-            .iter()
-            .filter(|p| p.capabilities().sessions)
-            .map(|p| self.engine.session_state_at(*p, dir))
-            .find(|state| matches!(state, SessionState::Owned { daemon: true, .. }))
-            .map(|_| {
-                Self::daemon_check(
-                    dir,
-                    &format!(
-                        "the orphaned profile {}, which is session-owned",
-                        dir.display()
+    /// What `state` says about ownership of the profile `whose` names, from the whole aggregate
+    /// and through the shared builder: a warning for every input that could not be read, with
+    /// its repair, and the daemon, if one is live (§12.6). Nothing is filtered, so the account
+    /// checks and the orphan checks report alike. `consequence` finishes the warning.
+    fn ownership(
+        state: &SessionState,
+        whose: &str,
+        runs_in: &str,
+        consequence: &str,
+    ) -> Vec<Check> {
+        let mut out = Vec::new();
+        if !state.damaged().is_empty() {
+            let owner = SessionOwner::of(state);
+            out.push(
+                Check::warn(
+                    "sessions.state",
+                    format!(
+                        "{whose} session state cannot be read ({}), {consequence}",
+                        owner.damaged_list()
                     ),
                 )
-            })
+                .fix(owner.repairs().join("; ")),
+            );
+        }
+        if let Some(profile) = state.daemon_profile() {
+            out.push(Self::daemon_check(
+                profile,
+                &format!("{runs_in}, so it is session-owned"),
+            ));
+        }
+        out
+    }
+
+    /// `ownership` for the profile at `dir` that no stored account owns: each of `judges` is
+    /// asked, as `purge` asks (§10.5 step 6), and every finding is reported once.
+    fn orphan_ownership(&self, judges: &[&dyn Provider], dir: &Path) -> Vec<Check> {
+        let whose = format!("the orphaned profile {}'s", dir.display());
+        let runs_in = format!("the orphaned profile {}", dir.display());
+        let mut out: Vec<Check> = Vec::new();
+        for p in judges.iter().filter(|p| p.capabilities().sessions) {
+            let state = self.engine.session_state_at(*p, dir);
+            for c in Self::ownership(
+                &state,
+                &whose,
+                &runs_in,
+                "so it counts as in use: `tagteam purge` refuses it",
+            ) {
+                if !out.iter().any(|o| o.id == c.id && o.message == c.message) {
+                    out.push(c);
+                }
+            }
+        }
+        out
     }
 
     /// One profile of account `row` (§12.2–§12.6), read and probed only. With no marker, its
@@ -2131,34 +2167,25 @@ impl Run<'_> {
         }
         let state = self.engine.session_state(p, row);
         let quiescent = matches!(state, Ok(SessionState::Quiescent { .. }));
-        // Beside a live owner too: an unreadable input is reported whatever else is found.
-        let unread = match &state {
-            Ok(state) if !state.damaged().is_empty() => {
-                let owner = SessionOwner::of(state);
-                Some((owner.damaged_list(), owner.repairs().join("; ")))
-            }
-            Ok(_) => None,
-            Err(e) => Some((
-                e.kind().to_owned(),
-                "make what it names readable again".to_owned(),
+        // The whole aggregate, as an orphan's is reported: an unreadable input beside a live
+        // owner, and the daemon, whatever else is found.
+        match &state {
+            Ok(state) => found.extend(Self::ownership(
+                state,
+                &format!("account {n}'s"),
+                &format!("account {n}'s profile"),
+                "so the account counts as in a session: commands that change it refuse, and its baseline and provenance are not checked",
             )),
-        };
-        if let Some((why, repair)) = unread {
-            found.push(
+            Err(e) => found.push(
                 Check::warn(
                     "sessions.state",
                     format!(
-                        "account {n}'s session state cannot be read ({why}), so the account counts as in a session: commands that change it refuse, and its baseline and provenance are not checked"
+                        "account {n}'s session state cannot be read ({}), so the account counts as in a session: commands that change it refuse, and its baseline and provenance are not checked",
+                        e.kind()
                     ),
                 )
-                .fix(repair),
-            );
-        }
-        if let Ok(daemon @ SessionState::Owned { daemon: true, .. }) = &state {
-            found.push(Self::daemon_check(
-                daemon.profile().unwrap_or(dir),
-                &format!("account {n}'s profile, so the account is session-owned"),
-            ));
+                .fix("make what it names readable again"),
+            ),
         }
         self.reservations(dir, n, found);
         if quiescent && p.has_baseline(dir) {
