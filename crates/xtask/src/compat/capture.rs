@@ -46,8 +46,11 @@ pub struct Seen {
 }
 
 impl Seen {
+    /// A Messages request: `POST /v1/messages`, a query allowed. Not `/v1/messages/count_tokens`
+    /// or another sub-path, which CC sends beside its messages and which carry no reply of
+    /// the session's.
     fn is_message(&self) -> bool {
-        self.method == "POST" && self.path.starts_with("/v1/messages")
+        self.method == "POST" && self.path.split('?').next() == Some("/v1/messages")
     }
 }
 
@@ -177,6 +180,21 @@ mod tests {
         let mut reply = String::new();
         s.read_to_string(&mut reply).unwrap();
         reply
+    }
+
+    #[test]
+    fn only_the_messages_endpoint_is_a_message_not_its_sub_paths() {
+        let seen = |method: &str, path: &str| Seen {
+            method: method.into(),
+            path: path.into(),
+            sent: Sent::None,
+        };
+        assert!(seen("POST", "/v1/messages").is_message());
+        assert!(seen("POST", "/v1/messages?beta=true").is_message());
+        assert!(!seen("POST", "/v1/messages/count_tokens?beta=true").is_message());
+        assert!(!seen("POST", "/v1/messages/batches").is_message());
+        assert!(!seen("GET", "/v1/messages").is_message());
+        assert!(!seen("POST", "/v1/messagesX").is_message());
     }
 
     #[test]
