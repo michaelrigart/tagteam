@@ -620,3 +620,41 @@ fn remove_of_a_profile_the_live_login_is_in_under_another_case_refuses() {
     assert!(fx.vault_bytes(&id).is_some());
     assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
 }
+
+#[test]
+fn remove_of_an_account_whose_vault_file_the_live_credential_links_to_refuses() {
+    // Codex slice 1 re-review (§10.3): the Linux file vault's `vault/<id>.json` is what the live
+    // `.credentials.json` resolves to.
+    let id = AccountId::from_string("0192-vaulted");
+    let fx = Fx::with(tagteam_cc::live::Platform::Linux, |_| {});
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_account(&NewAccount {
+            id: &id,
+            provider: &ProviderId::new("claude-code"),
+            position: 1,
+            identity_key: "a@x.co\n",
+            identity: &fx.cc.token_identity("a@x.co"),
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 0,
+        })
+        .unwrap();
+    fx.put_vault(&id, b"the live login");
+    let vault_file = fx.env.data_dir().join("vault/0192-vaulted.json");
+    let live = fx.paths().credentials_file;
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&vault_file, &live).unwrap();
+
+    let err = fx.engine.remove(&id).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(fx.vault_bytes(&id).is_some());
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}

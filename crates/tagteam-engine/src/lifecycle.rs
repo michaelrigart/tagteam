@@ -194,7 +194,7 @@ const MAX_LINK_HOPS: u32 = 40;
 /// link. A component that is not there ends the walk with what was touched before it: nothing
 /// beyond can be lost. More than `MAX_LINK_HOPS` links, a relative `path` and any other failure
 /// are errors.
-fn trace_path(path: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn trace_path(path: &Path) -> io::Result<Vec<PathBuf>> {
     if !path.is_absolute() {
         return Err(io::Error::other("not an absolute path"));
     }
@@ -248,12 +248,12 @@ fn names(path: &Path) -> impl Iterator<Item = OsString> + '_ {
 }
 
 /// `(device, inode)`: what a file is, whatever it is called.
-fn identity(meta: &fs::Metadata) -> (u64, u64) {
+pub(crate) fn identity(meta: &fs::Metadata) -> (u64, u64) {
     (meta.dev(), meta.ino())
 }
 
 /// Whether `e` says the path is not there (or has a non-directory in the way).
-fn absent(e: &io::Error) -> bool {
+pub(crate) fn absent(e: &io::Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
@@ -343,6 +343,8 @@ impl Engine {
                 return Err(EngineError::RescueUnlistable { path, detail });
             }
         };
+        // Asked again at the deletion, where the vault's file goes first (a second line).
+        self.refuse_live_vault_files(row)?;
         self.vault.delete(lock)?;
         for path in &rescues {
             self.delete_rescue(path)?;
@@ -359,7 +361,24 @@ impl Engine {
     fn refuse_destroying(&self, p: &dyn Provider, row: &AccountRow) -> Result<(), EngineError> {
         self.refuse_session_owned(p, row)?;
         self.refuse_profile_split(p, row)?;
-        self.refuse_live_profile_item(p, row)
+        self.refuse_live_profile_item(p, row)?;
+        self.refuse_live_vault_files(row)
+    }
+
+    /// §10.3, §10.5: the Linux file backend's `vault/<id>.json` and `<id>.prev.json` are files
+    /// `remove` deletes, so a live login that resolves to one is never to be broken: refuses
+    /// when any registered provider's live files touch them (the identity guard). A Keychain
+    /// backend's entries are items, not files: nothing to guard.
+    pub(crate) fn refuse_live_vault_files(&self, row: &AccountRow) -> Result<(), EngineError> {
+        let Some(dir) = self.vault.dir() else {
+            return Ok(());
+        };
+        for name in [format!("{}.json", row.id), format!("{}.prev.json", row.id)] {
+            for p in self.registry.all() {
+                self.refuse_live_files_at(p.as_ref(), &dir.join(&name))?;
+            }
+        }
+        Ok(())
     }
 
     /// Which Keychain item `remove_profile` deletes for the profile directory at `profile`: the

@@ -2017,3 +2017,60 @@ fn a_live_config_dir_under_the_rescue_path_refuses_the_full_purge() {
     );
     assert_live_config_whole(&live, &log);
 }
+
+#[test]
+fn a_live_credential_that_links_to_an_accounts_vault_file_refuses_a_provider_purge() {
+    // Codex slice 1 re-review (§10.5): on the Linux file vault, `.credentials.json` is a link to
+    // `vault/<id>.json` of a stored account without a profile; `vault.delete` would unlink the
+    // live credential's target.
+    let fx = Fx::with(Platform::Linux, |_| {});
+    let id = add(
+        &fx.engine.store().unwrap(),
+        &fx.provider(),
+        "0192-vaulted",
+        "a@x.co",
+        1,
+    );
+    fx.put_vault(&id, b"the live login");
+    let vault_file = fx.env.data_dir().join("vault/0192-vaulted.json");
+    let live = fx.paths().credentials_file;
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&vault_file, &live).unwrap();
+
+    let plan = fx.engine.purge_plan(Some(&fx.provider())).unwrap();
+    let err = fx.engine.purge(&plan).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(fs::symlink_metadata(&live).is_ok());
+    assert!(fx.vault_bytes(&id).is_some());
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}
+
+#[test]
+fn a_provider_purge_leaves_alone_another_providers_live_login_in_its_own_profile() {
+    // The exception: provider Q's live login resolves into Q's own profile, an account
+    // `--provider P` leaves untouched, so it is not refused.
+    let (fx, dir, live) = live_login_inside("0192-q");
+    let store = fx.engine.store().unwrap();
+    let q = add(&store, &fx.provider(), "0192-q", "q@x.co", 1);
+    fx.put_vault(&q, &credential("q@x.co", "rt-q"));
+    let ghost = ProviderId::new("ghost");
+    let g = add(&store, &ghost, "0192-ghost", "g@x.co", 1);
+    fx.put_vault(&g, b"a credential only its provider can read");
+
+    let plan = fx.engine.purge_plan(Some(&ghost)).unwrap();
+    let report = fx.engine.purge(&plan).unwrap();
+
+    assert_eq!(report.accounts.len(), 1, "{report:?}");
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(
+        dir.join(".tagteam-profile.json").exists(),
+        "Q's profile stays"
+    );
+    assert!(fx.vault_bytes(&q).is_some(), "Q's account stays");
+    assert!(fx.vault_bytes(&g).is_none(), "the ghost account went");
+}

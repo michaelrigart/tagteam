@@ -23,7 +23,7 @@ use crate::displace::PurgeError;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
-use crate::lifecycle::UnlistedRescues;
+use crate::lifecycle::{UnlistedRescues, absent, identity, trace_path};
 use crate::rescue::RescueUnlisted;
 use crate::session::SessionState;
 use crate::store::{AccountRow, Store};
@@ -294,6 +294,7 @@ impl Engine {
         // rescue path, `vault/`, dead temp files and the log, against every registered
         // provider's live files.
         self.refuse_live_in_targets(plan, &rows)?;
+        self.refuse_live_in_envelope(plan, &rows, store.as_deref())?;
         let unlisted = match plan.provider {
             // §6.3: as `remove` would, before anything is deleted.
             Some(_) => {
@@ -858,6 +859,104 @@ impl Engine {
         let dir = self.env.data_dir().join("displaced");
         for id in ids {
             self.refuse_live_at_all(&dir.join(format!("{id}.json")))?;
+        }
+        Ok(())
+    }
+
+    /// Step 6, the envelope: purge can delete only inside tagteam's data directory and, for a
+    /// full purge, the log's directory (and the config and state directories' temp files, which
+    /// `refuse_live_in_targets` names). So no registered provider's live file may resolve to
+    /// anything there, whatever it is called, EXCEPT inside the `sessions/<id>` profile of an
+    /// account this purge leaves untouched (another provider's, under `--provider P`), or the
+    /// directories on the way to one. Every path `trace_path` touches is judged by filesystem
+    /// identity, never spelling. This closes what a list of targets keeps missing (an account's
+    /// vault file, say); a failure to resolve refuses.
+    fn refuse_live_in_envelope(
+        &self,
+        plan: &PurgePlan,
+        rows: &[AccountRow],
+        store: Option<&Store>,
+    ) -> Result<(), EngineError> {
+        let unresolved = || {
+            EngineError::Io(io::Error::other(
+                "a path the live login lives at could not be resolved, so it cannot be told whether this purge would delete it; nothing was deleted (tagteam never deletes the live login)",
+            ))
+        };
+        let refused = || {
+            EngineError::Io(io::Error::other(
+                "the live login's files are inside what this would delete, since the environment names them; nothing was deleted (tagteam never deletes the live login)",
+            ))
+        };
+        let mut walls: Vec<(u64, u64)> = Vec::new();
+        let mut wall_dirs = vec![self.env.data_dir()];
+        if plan.provider.is_none() {
+            wall_dirs.extend(self.env.log_file().parent().map(Path::to_path_buf));
+        }
+        for dir in &wall_dirs {
+            match fs::metadata(dir) {
+                Ok(meta) => walls.push(identity(&meta)),
+                Err(e) if absent(&e) => {}
+                Err(_) => return Err(unresolved()),
+            }
+        }
+        if walls.is_empty() {
+            return Ok(());
+        }
+        // What the purge leaves alone: the profiles of the accounts it does not affect, and the
+        // directories above each, which a path passes through to reach one.
+        let affected: BTreeSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        let mut spared: Vec<(u64, u64)> = Vec::new();
+        let mut on_the_way: Vec<(u64, u64)> = Vec::new();
+        if let Some(store) = store {
+            for row in store.all_accounts()? {
+                if affected.contains(row.id.as_str()) {
+                    continue;
+                }
+                let profile = profile_path(&self.env, &row.id);
+                match fs::symlink_metadata(&profile) {
+                    Ok(meta) => spared.push(identity(&meta)),
+                    Err(e) if absent(&e) => continue,
+                    Err(_) => return Err(unresolved()),
+                }
+                if let Ok(meta) = fs::metadata(&profile) {
+                    spared.push(identity(&meta));
+                }
+                for above in profile.ancestors().skip(1) {
+                    match fs::metadata(above) {
+                        Ok(meta) => on_the_way.push(identity(&meta)),
+                        Err(e) if absent(&e) => break,
+                        Err(_) => return Err(unresolved()),
+                    }
+                }
+            }
+        }
+        for p in self.registry.all() {
+            let surface = p.identity_surface(&self.env);
+            let files = surface
+                .credential_files
+                .into_iter()
+                .chain(surface.json_keys.into_iter().map(|(file, _)| file));
+            for file in files {
+                for touched in trace_path(&file).map_err(|_| unresolved())? {
+                    let mut chain = Vec::new();
+                    for ancestor in touched.ancestors() {
+                        match fs::symlink_metadata(ancestor) {
+                            Ok(meta) => chain.push(identity(&meta)),
+                            Err(e) if absent(&e) => break,
+                            Err(_) => return Err(unresolved()),
+                        }
+                    }
+                    let inside = chain.iter().any(|id| walls.contains(id));
+                    let spared_path = chain.iter().any(|id| spared.contains(id))
+                        || chain.first().is_some_and(|id| on_the_way.contains(id));
+                    if inside && !spared_path {
+                        tracing::warn!(
+                            "the live login's files are inside what a purge would delete; nothing was deleted"
+                        );
+                        return Err(refused());
+                    }
+                }
+            }
         }
         Ok(())
     }
