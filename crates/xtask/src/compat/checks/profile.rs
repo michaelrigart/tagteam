@@ -304,6 +304,7 @@ pub fn auth_status_read_only(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 
     // The home it made now has its global config: a second run writes nothing.
     let before = snapshot(Path::new(&empty))?;
+    let items = item_states(ctx, &empty)?;
     let r = ctx.claude(&empty, &STATUS).run(&ctx.roots)?;
     p.note("the same home again: claude auth status", r.summary());
     let found = changes(&before, &snapshot(Path::new(&empty))?);
@@ -311,6 +312,11 @@ pub fn auth_status_read_only(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
         "the same home again, now with a global config: nothing created, changed or removed",
         found.is_empty(),
         json!(found),
+    );
+    p.expect_eq(
+        "the same home again: its Keychain items as they were",
+        items,
+        item_states(ctx, &empty)?,
     );
     Ok(p.finish(
         "claude auth status wrote nothing in a home with its global config; what it creates in an empty one is recorded",
