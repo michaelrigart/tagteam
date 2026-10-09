@@ -68,10 +68,28 @@ pub fn parse_search_list(out: &str) -> Vec<String> {
         .collect()
 }
 
+/// The search list `security list-keychains -d user` answered with (`rc`, `out`), as a
+/// snapshot to restore. A nonzero exit is a failed read, and an empty list cannot be told from
+/// one (a user search list always holds a keychain), so neither is a snapshot: restoring either
+/// would empty the user's list.
+fn snapshot_from(rc: i32, out: &str) -> Result<Vec<String>, HarnessError> {
+    if rc != 0 {
+        return Err(harness(format!(
+            "security list-keychains -d user exited {rc}, so the keychain search list cannot be snapshotted"
+        )));
+    }
+    let list = parse_search_list(out);
+    if list.is_empty() {
+        return Err(harness(
+            "security list-keychains -d user listed no keychain, so the keychain search list cannot be snapshotted",
+        ));
+    }
+    Ok(list)
+}
+
 fn search_list() -> Result<Vec<String>, HarnessError> {
-    Ok(parse_search_list(
-        &security(&["list-keychains", "-d", "user"])?.1,
-    ))
+    let (rc, out) = security(&["list-keychains", "-d", "user"])?;
+    snapshot_from(rc, &out)
 }
 
 /// 32 hex digits from `/dev/urandom`.
@@ -109,7 +127,12 @@ impl SecurityTool for RealSecurity {
     fn set_search_list(&self, list: &[String]) -> Result<(), HarnessError> {
         let mut args = vec!["list-keychains", "-d", "user", "-s"];
         args.extend(list.iter().map(String::as_str));
-        security(&args).map(|_| ())
+        match security(&args)? {
+            (0, _) => Ok(()),
+            (rc, _) => Err(harness(format!(
+                "security list-keychains -d user -s exited {rc}"
+            ))),
+        }
     }
 
     fn create_keychain(&self, password: &str, path: &Path) -> Result<(), HarnessError> {
@@ -468,6 +491,25 @@ mod tests {
                 "/Library/Keychains/System.keychain"
             ]
         );
+    }
+
+    #[test]
+    fn a_search_list_snapshot_needs_a_zero_exit_and_a_keychain() {
+        // Codex pre-merge slice 9: an unchecked failed read looked like an empty list, which
+        // restoration would then write back, emptying the user's search list.
+        let list = "    \"/Users/t/Library/Keychains/login.keychain-db\"\n";
+        assert_eq!(
+            snapshot_from(0, list).unwrap(),
+            ["/Users/t/Library/Keychains/login.keychain-db"]
+        );
+        assert!(snapshot_from(0, "").is_err(), "empty is not a snapshot");
+        assert!(snapshot_from(0, "  \n").is_err());
+        assert!(snapshot_from(1, "").is_err(), "a failed read");
+        assert!(
+            snapshot_from(1, list).is_err(),
+            "a failed read, whatever it printed"
+        );
+        assert!(snapshot_from(-1, list).is_err(), "no exit code (a signal)");
     }
 
     #[test]
