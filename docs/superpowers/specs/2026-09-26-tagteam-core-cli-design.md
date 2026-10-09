@@ -1156,7 +1156,7 @@ with its own locks and surface.
 | tagteam mutation lock | `flock(LOCK_EX)`, fd `O_CLOEXEC`, polled every 100 ms | `$XDG_DATA_HOME/tagteam/.mutation.lock` | n/a | 10 s (30 s for `run` bootstrap) |
 | CC OAuth refresh lock | `mkdir` directory lock | `<secure-storage dir>/.oauth_refresh.lock`, symlinks not resolved | 60 s | 9 s |
 | CC legacy credential lock | `mkdir` | `<realpath(secure-storage dir)>.lock` (`~/.claude.lock`); the unresolved path if `realpath` fails | 60 s | 9 s |
-| CC config lock | `mkdir` | `<global config path>.lock` (`~/.claude.json.lock`) | 10 s | 9 s |
+| CC config lock | `mkdir` | `<global config path>.lock` (`~/.claude.json.lock`) | 10 s | 12 s |
 | CC storage-write lock | `mkdir` | `<secure-storage dir>/.storage-write.lock` (CC 2.1.292), and the `<secure-storage dir>/.storage-write` recorded against 2.1.286; tagteam takes both, the second first; symlinks not resolved | 15 s | 9 s |
 
 Both credential locks and the storage-write lock are anchored at the secure-storage dir, not
@@ -1193,9 +1193,27 @@ recovery (§9.6), the active-token refresh's live write (§7.5) and profile boot
     and only while nothing has written any of the entry's places since tagteam first changed
     them. A marking or any other write since leaves the whole entry as it is.
 
-When a switch or a recovery takes the three CC locks together, one 9 s budget covers all
-three. The active-token refresh takes the credential locks with that budget and, after its
-request, the config lock with a fresh 9 s budget (§7.5).
+**The config lock has its own 12 s budget**: its staleness (10 s) plus the up to 1 s that a lock
+CC left behind can carry in the future (Appendix A.7), with room. Every command that takes
+`MutationGuard`, and so may switch or recover (§9.4, §9.6), first waits until the default home's
+config lock is absent or stale, for up to 12 s (a cancellation point, §14.1), holding neither
+`MutationGuard`, nor an account lock, nor any CC lock; a lock the process holds for its whole
+lifetime, such as an `auto` engine's engine lock (§4.3, §11.1), stays held, since nothing else
+waits on it. Only then does it take `MutationGuard`, the account locks and, when it switches or
+recovers, the three CC locks together under one 9 s budget. So neither `MutationGuard` nor the
+credential locks, which CC's refresh waits on, are held through that wait. The active-token refresh takes the
+credential locks with the 9 s budget and, after its request, the config lock with its own 12 s
+(§7.5). Every other taker of the config lock (seeding, merge-back, a settings write) waits up to
+12 s.
+
+**CC's start-up does not always honour the config lock** (*2.1.292*, Appendix A.7). For its first
+30 s, until its interactive UI is up, CC waits only 1.5 s for the config lock and then writes the
+global config without it, unless the change touches only its own counters and caches. So after a
+switch commits, tagteam reads the default home's global config again. If `oauthAccount` is what
+the switch wrote, nothing more is done. Otherwise tagteam splices it once more under the config
+lock; if the lock cannot be taken, the splice fails, or a read afterwards still differs, it warns
+that a starting Claude Code may have overwritten the account's identity there and names
+`tagteam switch` again as the fix.
 
 The CC locks follow the `proper-lockfile` protocol:
 
@@ -1424,6 +1442,8 @@ here on.
 - The human output prints the result and a hint:
   - Keychain: "applies within ~30 s; restart Claude Code to apply now"
   - File store: "active on your next message"
+  - An API-key account on either side of the switch: "restart Claude Code to apply", since CC
+    caches the managed API key for the life of its process (*2.1.292*, Appendix A.7)
 
 ### 9.5 The `~/.claude.json` splice
 
@@ -2692,7 +2712,10 @@ old` when the data is older than 15 min, else empty).
 `tagteam doctor [--online] [--json]` checks tagteam's own state and its interop with each
 provider.
 
-**Read-only.** Doctor writes nothing and creates nothing.
+**Read-only.** Doctor writes nothing and creates nothing itself. The `claude` it runs (`claude
+--version`, `claude auth status`) may make Claude Code's own start-up writes in the home it
+starts in, as any `claude` start does (Appendix A.7); doctor does not run `claude auth status`
+in a home whose global config does not exist.
 - It takes no `MutationGuard`, so it reports an interrupted switch rather than recovering it
   (§9.6).
 - It opens the store read-only and never migrates it. With no data directory, it reports that
@@ -3164,15 +3187,17 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
     activation can commit (Appendix A.3)
   - CC runs on an API key while the credential entry keeps only machine-shared keys (§9.4)
   - lock interop while CC refreshes
-  - CC honours `~/.claude.json.lock` around its own writes of the global config (§9.1)
+  - CC honours `~/.claude.json.lock` around its own writes of the global config once past its
+    start-up, and during start-up waits only briefly before writing without it (§9.1, A.7)
   - CC accepts a `~/.claude.json` that tagteam created on a fresh machine (§9.5), and its own
     next write of the file leaves the span tagteam spliced byte-identical, which pins §9.5's
     rendering against `JSON.stringify`
-  - which of the managed-key item and `primaryApiKey` CC reads first, and whether a key in
-    `primaryApiKey` applies on the next message as §9.4's hint says
+  - which of the managed-key item and `primaryApiKey` CC reads first, and that a changed key
+    reaches only a new CC process, as §9.4's hint says (A.7)
   - CC writes `expiresAt` as an integer
-  - `claude auth status` writes nothing in a home that has its global config, and what it
-    creates in one that has none (§13.6 relies on both)
+  - `claude auth status` writes nothing in a home whose global config CC has initialized, and
+    what CC's start-up writes in one whose config is absent or not yet initialized by CC, such
+    as one tagteam seeded (§13.6 relies on both)
   - opt-in, since they need the user's own session: the lock check on a locked login keychain
     in a GUI session (§17 O3), and CC reading tagteam-written items over SSH (`--ssh`)
 - Checks that need CC to refresh expire the scratch profile's access token and run one minimal
@@ -3489,9 +3514,16 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   `third_party`, or `none` when logged out. It exits 0 only when logged in. Its source order is
   `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, the token file descriptor, an
   `apiKeyHelper`, a workload-identity profile, and only then the stored `claude.ai` login. In
-  a home whose global config exists it writes nothing. In one where it does not, CC's start-up
-  runs first and creates the global config, a `.claude.json.lock` it leaves behind and
-  `backups/`, before answering (*2.1.292*).
+  a home whose global config CC has initialized, it writes nothing. In one whose config is
+  absent, or present but not yet initialized by CC (as one tagteam seeded, or the first start
+  after an upgrade, which runs CC's migrations), CC's start-up runs first: it writes the global
+  config and `backups/`, and leaves its `.claude.json.lock` behind, whose mtime can be up to 1 s
+  in the future (`proper-lockfile`'s first probe), before answering (*2.1.292*).
+- **Start-up and the config lock** (*2.1.292*): for its first 30 s, until its interactive UI is
+  up, CC retries the config lock for only 1.5 s, then writes the global config without it unless
+  every changed key is one of its counters or caches (`numStartups`, `tipsHistory`, …).
+- **The managed API key** (*2.1.292*) is read once and cached for the life of the CC process;
+  a later change of the managed-key item or `primaryApiKey` reaches only new processes.
 - **Workload-identity profiles** live outside the config dir (`$ANTHROPIC_CONFIG_DIR`, else
   `$XDG_CONFIG_HOME/anthropic` or `~/.config/anthropic`) and are selected by
   `ANTHROPIC_PROFILE` or an `active_config` file. They are not keyed by `CLAUDE_CONFIG_DIR`.
@@ -3646,7 +3678,7 @@ Each is a one-liner, and each gets at least one test.
     account is session-owned. It holds `MutationGuard` throughout, so nothing is created
     behind it, and a purge that stops part-way is finished by running it again (§10.5).
 67. `doctor` writes nothing, creates nothing apart from §13.6's SQLite exception, and asks
-    nothing (§13.6).
+    nothing (§13.6). The `claude` it runs may make Claude Code's own start-up writes.
 68. Every settings write is validated against the one key registry, and changes only the key
     it names (§6.4).
 69. No log line, at any level, holds an email, organization name, token, key, credential or
