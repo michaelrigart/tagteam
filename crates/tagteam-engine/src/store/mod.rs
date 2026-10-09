@@ -76,6 +76,13 @@ pub enum StoreError {
     WalBusy,
     #[error("an alias cannot be empty")]
     InvalidAlias,
+    /// R-T9-sidecars: exactly one of the store's `-wal` and `-shm` files exists. A `-wal` alone
+    /// may hold commits an immutable open never reads, and a `-shm` alone has a read-only open
+    /// create the `-wal`, so a reader that must write nothing opens neither.
+    #[error(
+        "the store has its {present} file but not the other, a write-ahead log that cannot be read without writing"
+    )]
+    LopsidedWal { present: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -647,22 +654,27 @@ impl Store {
     }
 
     /// §13.6, Decision 3: the store as `doctor` reads it, never written, migrated or created.
-    /// `None` when there is no database file. A read-only open of a WAL database whose `-shm`
-    /// file is absent would create the `-shm` and `-wal` files, so without one it opens
-    /// `immutable`: no process has the store open, so no WAL is left to read. With one, it opens
-    /// `mode=ro` and reads the writers' WAL through it. It writes no page, though, like every
-    /// reader, it records its read mark in the `-shm` index. A schema of any version opens;
-    /// `schema_version` says which.
+    /// `None` when there is no database file. A read-only open of a WAL database with neither
+    /// its `-wal` nor its `-shm` would create both, so with neither it opens `immutable`: no
+    /// process has the store open, so no WAL is left to read. With both, it opens `mode=ro` and
+    /// reads the writers' WAL through it. It writes no page, though, like every reader, it
+    /// records its read mark in the `-shm` index. With exactly one of them it opens nothing and
+    /// fails with `LopsidedWal` (R-T9-sidecars). A schema of any version opens; `schema_version`
+    /// says which.
     pub fn open_read_only(path: &Path) -> Result<Option<Self>, StoreError> {
         if !path.try_exists()? {
             return Ok(None);
         }
-        let mut shm = path.as_os_str().to_owned();
-        shm.push("-shm");
-        let params = if Path::new(&shm).try_exists()? {
-            "mode=ro"
-        } else {
-            "mode=ro&immutable=1"
+        let sidecar = |suffix: &str| -> io::Result<bool> {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            Path::new(&name).try_exists()
+        };
+        let params = match (sidecar("-wal")?, sidecar("-shm")?) {
+            (false, false) => "mode=ro&immutable=1",
+            (true, true) => "mode=ro",
+            (true, false) => return Err(StoreError::LopsidedWal { present: "-wal" }),
+            (false, true) => return Err(StoreError::LopsidedWal { present: "-shm" }),
         };
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI

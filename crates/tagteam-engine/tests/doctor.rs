@@ -1060,7 +1060,9 @@ fn an_engine_runs_exactly_when_its_record_matches_a_live_process() {
     .unwrap();
     assert_eq!(one(&doctor(&fx), "auto.engine").status, CheckStatus::Ok);
     fs::write(&lock, "garbage").unwrap();
-    assert_eq!(one(&doctor(&fx), "auto.engine").status, CheckStatus::Warn);
+    let c = one(&doctor(&fx), "auto.engine").clone();
+    assert_eq!(c.status, CheckStatus::Warn);
+    fix(&c);
 }
 
 #[test]
@@ -1185,4 +1187,122 @@ fn an_interrupted_switch_the_live_login_cannot_judge_warns_and_an_undecidable_on
     let c = one(&doctor(&fx), "switch.interrupted").clone();
     assert_eq!(c.status, CheckStatus::Fail, "{c:?}");
     assert!(fix(&c).starts_with("`tagteam switch 2 --force`"), "{c:?}");
+}
+
+// ---- fix round 1 ----
+
+#[test]
+fn a_store_with_only_one_of_its_wal_files_warns_and_is_not_opened() {
+    // R-T9-sidecars: `-wal` alone hides commits from an immutable open, `-shm` alone makes a
+    // read-only open create the `-wal`. Doctor opens neither and creates nothing.
+    for keep_wal in [true, false] {
+        let fx = Fx::new();
+        fx.add("a@x.co", "rt-a");
+        let db = store_path(&fx);
+        let wal = db.with_extension("db-wal");
+        let shm = db.with_extension("db-shm");
+        assert!(
+            wal.exists() && shm.exists(),
+            "the fixture's engine holds the store open"
+        );
+        fs::remove_file(if keep_wal { &shm } else { &wal }).unwrap();
+        let before = tree(fx.dir.path());
+        let r = doctor(&fx);
+        let c = one(&r, "store.integrity");
+        assert_eq!(c.status, CheckStatus::Warn, "keep_wal {keep_wal}: {c:?}");
+        assert!(c.message.contains("write-ahead log"), "{}", c.message);
+        assert!(fix(c).contains("any tagteam command"), "{c:?}");
+        assert_eq!(one(&r, "store.skipped").status, CheckStatus::Info);
+        assert!(found(&r, "accounts.vault").is_empty());
+        assert_eq!(
+            changed(&before, &tree(fx.dir.path())),
+            Vec::<PathBuf>::new(),
+            "keep_wal {keep_wal}"
+        );
+    }
+}
+
+#[test]
+fn every_warning_about_an_input_that_could_not_be_read_names_a_fix() {
+    // The log itself, with its directory unreadable.
+    let fx = Fx::new();
+    let log = fx.env.log_file();
+    let dir = log.parent().unwrap().to_path_buf();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(&log, "line\n").unwrap();
+    let r = with_mode(&dir, 0o000, || doctor(&fx));
+    for c in found(&r, "log.file") {
+        assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+        fix(c);
+    }
+
+    // The Keychain probe for orphaned items.
+    let fx = Fx::new();
+    fx.engine.store().unwrap();
+    fx.kc.set_unreadable(SERVICE, "x", true);
+    let c = one(&doctor(&fx), "accounts.orphans").clone();
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    fix(&c);
+
+    // The displaced listing, with a file where its directory goes.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    fs::write(fx.env.data_dir().join("displaced"), "a file").unwrap();
+    let c = one(&doctor(&fx), "pending.displaced").clone();
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    fix(&c);
+
+    // The switch journal and the auto-switch record, unreadable.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    sql(&fx)
+        .execute(
+            "ALTER TABLE switch_journal RENAME TO switch_journal_gone",
+            [],
+        )
+        .unwrap();
+    let c = one(&doctor(&fx), "switch.interrupted").clone();
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    fix(&c);
+    let lock = fx.env.data_dir().join("locks/autoswitch-claude-code.lock");
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    fs::write(&lock, "garbage").unwrap();
+    let c = one(&doctor(&fx), "auto.engine").clone();
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    fix(&c);
+}
+
+#[test]
+fn a_keychain_that_nothing_needs_is_never_asked_about_for_a_store_with_no_accounts() {
+    let fx = Fx::new();
+    fx.engine.store().unwrap();
+    fx.kc.set_locked(true);
+    let r = doctor(&fx);
+    assert!(found(&r, "keychain.locked").is_empty(), "{:#?}", r.checks);
+    assert_eq!(fx.kc.unlock_attempts(), 0);
+}
+
+#[test]
+fn a_log_whose_nearest_existing_ancestor_is_not_a_directory_is_not_writable() {
+    let fx = Fx::new();
+    let state = fx.env.state_dir();
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(&state, "a file").unwrap();
+    let r = doctor(&fx);
+    let c = one(&r, "log.writable");
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    assert!(c.message.contains("not a directory"), "{}", c.message);
+    fix(c);
+}
+
+#[test]
+fn a_log_path_that_is_a_directory_is_not_writable() {
+    let fx = Fx::new();
+    let log = fx.env.log_file();
+    fs::create_dir_all(&log).unwrap();
+    let r = doctor(&fx);
+    let c = one(&r, "log.writable");
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    assert!(c.message.contains("is a directory"), "{}", c.message);
+    fix(c);
 }

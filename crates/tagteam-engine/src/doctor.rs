@@ -165,6 +165,43 @@ fn is_damage(e: &crate::store::StoreError) -> bool {
     )
 }
 
+/// `PRAGMA quick_check` run once more before it fails the store: an immutable open reads the
+/// file while a writer that began after the probe may be checkpointing it, which can show a
+/// torn page that a second run does not (R-T9). Two failures stand.
+fn settled_quick_check(
+    first: Result<Vec<String>, crate::store::StoreError>,
+    again: impl FnOnce() -> Result<Vec<String>, crate::store::StoreError>,
+) -> Result<Vec<String>, crate::store::StoreError> {
+    match first {
+        Ok(rows) if rows == ["ok"] => Ok(rows),
+        _ => match again() {
+            Ok(rows) if rows == ["ok"] => Ok(rows),
+            second => second,
+        },
+    }
+}
+
+/// `auto.engine` for an engine lock record naming `pid`: an undetermined liveness is an input
+/// doctor could not read, so a warning (R-T9-liveness), as for `switch.interrupted`.
+fn engine_record_check(pid: u32, liveness: Liveness) -> Check {
+    match liveness {
+        Liveness::Live => Check::info("auto.engine", format!("auto-switch runs as pid {pid}")),
+        Liveness::Dead => Check::ok(
+            "auto.engine",
+            format!("auto-switch is not running (its last engine, pid {pid}, has exited)"),
+        ),
+        Liveness::Unknown(e) => Check::warn(
+            "auto.engine",
+            format!(
+                "whether auto-switch runs as pid {pid} cannot be told: the process's start time cannot be read ({e})"
+            ),
+        )
+        .fix(format!(
+            "check whether pid {pid} is still running a `tagteam auto`, then `tagteam doctor` again"
+        )),
+    }
+}
+
 /// The fix for a damaged store.
 fn restore_backup(path: &Path) -> String {
     format!(
@@ -379,7 +416,16 @@ impl Run<'_> {
             }
             Err(e) => {
                 self.stored = Stored::Unusable;
-                let check = if is_damage(&e) {
+                let check = if let crate::store::StoreError::LopsidedWal { .. } = e {
+                    Check::warn(
+                        "store.integrity",
+                        format!(
+                            "{} has a write-ahead log doctor cannot read without writing, so its integrity cannot be told ({e})",
+                            path.display()
+                        ),
+                    )
+                    .fix("run any tagteam command, such as `tagteam list`: it recovers the log, then `tagteam doctor` again")
+                } else if is_damage(&e) {
                     Check::fail(
                         "store.integrity",
                         format!("{} cannot be opened: {e}", path.display()),
@@ -399,7 +445,7 @@ impl Run<'_> {
                 return;
             }
         };
-        let sound = match store.quick_check() {
+        let sound = match settled_quick_check(store.quick_check(), || store.quick_check()) {
             Ok(rows) if rows == ["ok"] => {
                 self.push(
                     None,
@@ -469,7 +515,8 @@ impl Run<'_> {
                     Check::warn(
                         "store.schema",
                         format!("the store's schema version cannot be read: {e}"),
-                    ),
+                    )
+                    .fix(restore(self.engine)),
                 );
                 false
             }
@@ -816,7 +863,8 @@ impl Run<'_> {
             ),
             Err(e) => self.push(
                 None,
-                Check::warn("log.file", format!("{} cannot be read: {e}", log.display())),
+                Check::warn("log.file", format!("{} cannot be read: {e}", log.display()))
+                    .fix(readable(&log)),
             ),
         }
         let mut at = log.clone();
@@ -845,6 +893,51 @@ impl Run<'_> {
                 }
             }
         }
+        let is_dir = match fs::metadata(&at) {
+            Ok(m) => Some(m.is_dir()),
+            Err(e) if e.kind() == ErrorKind::NotFound => None,
+            Err(e) => {
+                self.push(
+                    None,
+                    Check::warn(
+                        "log.writable",
+                        format!(
+                            "whether {} can be written cannot be told: {} cannot be read ({})",
+                            log.display(),
+                            at.display(),
+                            e.kind()
+                        ),
+                    )
+                    .fix(readable(&at)),
+                );
+                return;
+            }
+        };
+        if let Some(is_dir) = is_dir
+            && is_dir != (at != log)
+        {
+            let (what, fix) = if at == log {
+                ("is a directory", "move it aside")
+            } else {
+                (
+                    "is not a directory",
+                    "move it aside, or make it a directory",
+                )
+            };
+            self.push(
+                None,
+                Check::warn(
+                    "log.writable",
+                    format!(
+                        "{} cannot be written: {} {what}, so tagteam logs nothing",
+                        log.display(),
+                        at.display()
+                    ),
+                )
+                .fix(format!("{fix}: {}", quoted(&at))),
+            );
+            return;
+        }
         match writable(&at) {
             Ok(true) => self.push(
                 None,
@@ -869,7 +962,8 @@ impl Run<'_> {
                         "whether {} can be written cannot be told: {e}",
                         log.display()
                     ),
-                ),
+                )
+                .fix(readable(&at)),
             ),
         }
     }
@@ -954,7 +1048,8 @@ impl Run<'_> {
             Read::Unreadable(e) => Check::warn(
                 "accounts.orphans",
                 format!("whether the Keychain holds items of service `{SERVICE}` cannot be told: {e}"),
-            ),
+            )
+            .fix("run `tagteam doctor` again; if it persists, `security show-keychain-info` shows the Keychain's state"),
         };
         self.push(None, check);
     }
@@ -979,7 +1074,7 @@ impl Run<'_> {
             }
         };
         let mut found = Vec::new();
-        let readable = self.secrets() == Secrets::Readable;
+        let readable = !rows.is_empty() && self.secrets() == Secrets::Readable;
         if readable {
             let mut broken = 0;
             for row in &rows {
@@ -1373,7 +1468,11 @@ impl Run<'_> {
                     Check::warn(
                         "pending.displaced",
                         format!("the displaced credentials cannot be listed: {e}"),
-                    ),
+                    )
+                    .fix(format!(
+                        "make {} a directory this user can read, then `tagteam doctor` again",
+                        quoted(&self.engine.env.data_dir().join("displaced"))
+                    )),
                 );
                 return;
             }
@@ -1449,7 +1548,8 @@ impl Run<'_> {
                     Check::warn(
                         "switch.interrupted",
                         format!("the switch journal cannot be read: {e}"),
-                    ),
+                    )
+                    .fix(restore(self.engine)),
                 );
                 return;
             }
@@ -1552,30 +1652,12 @@ impl Run<'_> {
         let lock = engine_lock_path(&self.engine.env, &id);
         let running = match read_holder(&lock) {
             Read::Absent => Check::ok("auto.engine", "auto-switch is not running"),
-            Read::Present(stamp) => match stamp.liveness() {
-                Liveness::Live => Check::info(
-                    "auto.engine",
-                    format!("auto-switch runs as pid {}", stamp.pid),
-                ),
-                Liveness::Dead => Check::ok(
-                    "auto.engine",
-                    format!(
-                        "auto-switch is not running (its last engine, pid {}, has exited)",
-                        stamp.pid
-                    ),
-                ),
-                Liveness::Unknown(e) => Check::info(
-                    "auto.engine",
-                    format!(
-                        "auto-switch may run as pid {}, which cannot be checked ({e})",
-                        stamp.pid
-                    ),
-                ),
-            },
+            Read::Present(stamp) => engine_record_check(stamp.pid, stamp.liveness()),
             Read::Unreadable(e) => Check::warn(
                 "auto.engine",
                 format!("whether auto-switch runs cannot be told: {e}"),
-            ),
+            )
+            .fix(readable(&lock)),
         };
         self.push(Some(&id), running);
         if let Some(store) = self.store_ref() {
@@ -1744,6 +1826,38 @@ mod tests {
                 "{reason}"
             );
         }
+    }
+
+    #[test]
+    fn an_engine_whose_liveness_cannot_be_told_is_a_warning_with_a_fix() {
+        let c = engine_record_check(4242, Liveness::Unknown("permission denied".into()));
+        assert_eq!(c.id, "auto.engine");
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.message.contains("4242") && c.message.contains("permission denied"));
+        assert!(c.fix.as_deref().is_some_and(|f| f.contains("pid 4242")));
+        assert_eq!(
+            engine_record_check(4242, Liveness::Live).status,
+            CheckStatus::Info
+        );
+        assert_eq!(
+            engine_record_check(4242, Liveness::Dead).status,
+            CheckStatus::Ok
+        );
+    }
+
+    #[test]
+    fn an_integrity_failure_stands_only_when_a_second_run_finds_it_too() {
+        let bad = || Ok(vec!["row 1 missing from index".to_owned()]);
+        let ok = || Ok(vec!["ok".to_owned()]);
+        let rows = |r: Result<Vec<String>, crate::store::StoreError>| r.unwrap();
+        assert_eq!(
+            rows(settled_quick_check(ok(), || panic!("no second run"))),
+            rows(ok())
+        );
+        assert_eq!(rows(settled_quick_check(bad(), ok)), rows(ok()));
+        assert_eq!(rows(settled_quick_check(bad(), bad)), rows(bad()));
+        let unreadable = || Err(crate::store::StoreError::Corrupt("x".into()));
+        assert!(settled_quick_check(unreadable(), unreadable).is_err());
     }
 
     #[test]

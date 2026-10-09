@@ -1463,3 +1463,28 @@ fn usage_requests_are_counted_per_identity_after_a_time_without_pruning() {
         .unwrap();
     assert_eq!(left, 4, "nothing is pruned");
 }
+
+#[test]
+fn a_read_only_open_of_a_store_with_only_one_of_its_wal_files_opens_nothing_and_creates_nothing() {
+    // R-T9-sidecars: a `-wal` alone may hold commits that `immutable=1` would never read, and a
+    // `-shm` alone would have `mode=ro` create the `-wal`. Neither can be opened without a write.
+    for (present, absent) in [("-wal", "-shm"), ("-shm", "-wal")] {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("t.db");
+        {
+            let s = Store::open(&path).unwrap();
+            add(&s, &cc(), "a", "a@x.co", 1);
+        }
+        let mut side = path.clone().into_os_string();
+        side.push(present);
+        std::fs::write(&side, b"x").unwrap();
+        let before = names_in(d.path());
+        let err = Store::open_read_only(&path).err().expect("refused");
+        assert!(
+            matches!(err, StoreError::LopsidedWal { present: p } if p == present),
+            "{present}: {err:?}"
+        );
+        assert_eq!(names_in(d.path()), before, "nothing was created");
+        assert!(!before.iter().any(|n| n.ends_with(absent)), "{before:?}");
+    }
+}
