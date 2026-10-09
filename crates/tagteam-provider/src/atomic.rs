@@ -183,6 +183,25 @@ pub fn temp_writer_pid(file_name: &str) -> Option<u32> {
     pid.parse().ok().filter(|p| *p > 0)
 }
 
+/// Whether this process may write `path`, as `access(2)` with `W_OK` answers it: for a
+/// directory, whether it may create entries in it. It opens and creates nothing. A path that
+/// does not exist is an error, `NotFound`.
+pub fn writable(path: &Path) -> io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "the path holds a NUL byte"))?;
+    // SAFETY: `c` is a NUL-terminated string that lives for the whole call; `access` only
+    // reads it.
+    if unsafe { libc::access(c.as_ptr(), libc::W_OK) } == 0 {
+        return Ok(true);
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EACCES | libc::EROFS | libc::EPERM) => Ok(false),
+        _ => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +251,28 @@ mod tests {
             assert_eq!(temp_writer_pid(&name), Some(std::process::id()));
             Err(io::Error::other("stop before publishing"))
         });
+    }
+
+    #[test]
+    fn writable_answers_for_files_and_directories_and_creates_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("f");
+        fs::write(&file, "x").unwrap();
+        assert!(writable(&file).unwrap());
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(!writable(&file).unwrap(), "run as a non-root user");
+        let dir = d.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        assert!(writable(&dir).unwrap());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(!writable(&dir).unwrap());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let missing = d.path().join("missing");
+        assert_eq!(
+            writable(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(!missing.exists());
     }
 
     #[test]

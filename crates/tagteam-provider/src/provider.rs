@@ -14,6 +14,7 @@ use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 
 use crate::cancel::Cancel;
 use crate::credential::{Credential, FreshCredential};
+use crate::doctor::Check;
 use crate::env::Env;
 use crate::flock::MutationGuard;
 use crate::http::{Http, HttpError, HttpResponse};
@@ -783,6 +784,20 @@ pub trait Provider: Send + Sync {
         spawner: &dyn ProcessSpawner,
         cancel: &Cancel,
     ) -> Validity;
+
+    /// §13.6: the provider's own checks for `tagteam doctor`, run in the effective (outer)
+    /// environment `env` with the engine's spawn port (Decision 2). They read and probe only:
+    /// nothing is written or unlocked, nothing asks, and every spawn is bounded by its timeout.
+    /// A set `cancel` stops any spawn under way. A provider without checks of its own has none.
+    fn doctor_checks(
+        &self,
+        env: &Env,
+        spawner: &dyn ProcessSpawner,
+        cancel: &Cancel,
+    ) -> Vec<Check> {
+        let _ = (env, spawner, cancel);
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

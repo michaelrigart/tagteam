@@ -2,6 +2,7 @@ pub mod atomic;
 pub mod cancel;
 pub mod clock;
 pub mod credential;
+pub mod doctor;
 pub mod env;
 pub mod flock;
 pub mod http;
@@ -27,6 +28,7 @@ pub(crate) static FORK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub use cancel::{Cancel, Interrupted};
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use credential::{Credential, FreshCredential, Provenance};
+pub use doctor::{Check, CheckStatus};
 pub use env::{Env, EnvError};
 pub use flock::{FlockGuard, LockProbe, MutationGuard, probe_lock};
 pub use http::{
@@ -43,7 +45,7 @@ pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 #[cfg(feature = "mock-server")]
 pub use mock_server::{MockReply, MockRequest, MockServer};
 pub use process::{
-    Captured, ProcessSpawner, ProcessStamp, ScriptedSpawner, SpawnSpec, SystemSpawner,
+    Captured, Liveness, ProcessSpawner, ProcessStamp, ScriptedSpawner, SpawnSpec, SystemSpawner,
     exec_command, exit_code, find_on_path, run_captured, spawn_session,
 };
 pub use profile::{
