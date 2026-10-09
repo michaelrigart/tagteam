@@ -346,7 +346,8 @@ impl Engine {
     /// surface's credential files and JSON files) lies inside the directory `dir`, which is
     /// about to be deleted. The environment can name a profile's directory in a spelling that
     /// differs from the marker's (a trailing `/.`), so the spellings compare unequal while the
-    /// login sits in the profile. Paths are compared resolved, by component. A parent that
+    /// login sits in the profile. Paths are compared resolved, by component, and so is where a file
+    /// that is itself a link leads. A parent that
     /// does not exist holds nothing; any other failure to resolve refuses, as the stored-profile
     /// guard does. The refusal names no path.
     pub(crate) fn refuse_live_files_inside(
@@ -378,7 +379,19 @@ impl Engine {
                 Err(e) if absent(&e) => continue,
                 Err(_) => return Err(unresolved()),
             };
-            if parent.join(name).starts_with(&dir) {
+            let file = parent.join(name);
+            // A file that is itself a link leads wherever it leads: the login is read through
+            // it, so what it resolves to must not be inside either. No file, nothing to lose.
+            let leads_inside = match fs::symlink_metadata(&file) {
+                Ok(_) => match fs::canonicalize(&file) {
+                    Ok(target) => target.starts_with(&dir),
+                    Err(e) if absent(&e) => false,
+                    Err(_) => return Err(unresolved()),
+                },
+                Err(e) if absent(&e) => false,
+                Err(_) => return Err(unresolved()),
+            };
+            if leads_inside || file.starts_with(&dir) {
                 tracing::warn!(
                     "the live login's files are inside a profile directory; nothing was deleted"
                 );

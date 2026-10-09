@@ -1722,3 +1722,37 @@ fn an_orphan_holding_the_live_login_s_files_is_left_and_reported() {
         "{failure:?}"
     );
 }
+
+/// A Linux fixture whose live credential file is a link to the credential file of the stored
+/// account `id`'s profile. Returns the profile directory, the link and the file it leads to.
+fn live_login_linked_into(id: &str) -> (Fx, AccountId, PathBuf, PathBuf, PathBuf) {
+    let fx = Fx::with(Platform::Linux, |_| {});
+    let id = add(&fx.engine.store().unwrap(), &fx.provider(), id, "a@x.co", 1);
+    fx.put_vault(&id, b"a vault credential");
+    let dir = fx.profile_dir(&id);
+    fx.write_marker(&dir, &id, &fx.env);
+    let target = dir.join(".credentials.json");
+    fs::write(&target, b"the live login").unwrap();
+    let link = fx.paths().credentials_file;
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    (fx, id, dir, link, target)
+}
+
+#[test]
+fn a_live_credential_file_that_links_into_a_profile_is_never_deleted_by_purge() {
+    // Codex slice 3 re-review: the file's parent is outside the profile, but the login is read
+    // through the link into it.
+    let (fx, id, dir, link, target) = live_login_linked_into("0192-linked-in");
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"the live login");
+    assert!(fs::symlink_metadata(&link).is_ok(), "the link stays");
+    assert!(dir.join(".tagteam-profile.json").exists());
+    assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
+}
