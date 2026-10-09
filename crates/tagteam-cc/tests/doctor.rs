@@ -63,6 +63,14 @@ impl Fx {
             .doctor_checks(&self.env, &self.spawner, &Cancel::new())
     }
 
+    /// A home Claude Code has been started in: its global config exists (§13.6 runs
+    /// `claude auth status` only there).
+    fn started(&self) {
+        let global = CcPaths::resolve(&self.env).global_config;
+        fs::create_dir_all(global.parent().unwrap()).unwrap();
+        fs::write(global, "{}").unwrap();
+    }
+
     /// What `claude /login` leaves in `~/.claude.json`.
     fn login(&self, email: &str) {
         fs::write(
@@ -162,6 +170,7 @@ fn auth_status_runs_in_the_outer_home_s_environment() {
     f.install_claude();
     let outer = f.env.home.join("elsewhere");
     f.env.claude_config_dir = Some(outer.clone().into_os_string());
+    f.started();
     f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
     f.spawner.push(logged_in("a@x.co", "org-1"));
     f.checks();
@@ -179,6 +188,57 @@ fn auth_status_runs_in_the_outer_home_s_environment() {
         vec![OsString::from("CLAUDE_SECURESTORAGE_CONFIG_DIR")],
         "a run shell's own variables never reach the check (§12.8)"
     );
+}
+
+#[test]
+fn a_home_with_no_global_config_is_not_asked_and_is_reported_as_never_started() {
+    // §13.6, Appendix A.7: `claude auth status` creates the global config where it is missing,
+    // so doctor does not run it there.
+    let f = fx();
+    f.install_claude();
+    let global = CcPaths::resolve(&f.env).global_config;
+    assert!(!global.exists());
+    f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
+    let checks = f.checks();
+    let c = one(&checks, "cc.auth");
+    assert_eq!(c.status, CheckStatus::Info);
+    assert!(
+        c.message.contains("has not been started in this home"),
+        "{}",
+        c.message
+    );
+    let specs = f.spawner.specs();
+    assert_eq!(specs.len(), 1, "only `claude --version`: {specs:?}");
+    assert_eq!(specs[0].args, vec![OsString::from("--version")]);
+    assert!(!global.exists(), "doctor creates nothing");
+}
+
+#[test]
+fn a_global_config_that_cannot_be_told_to_exist_warns_and_nothing_is_spawned() {
+    // A dangling link, and a home whose directory cannot be searched: unreadable input, a
+    // warning, and still no `claude auth status`.
+    let f = fx();
+    f.install_claude();
+    let global = CcPaths::resolve(&f.env).global_config;
+    std::os::unix::fs::symlink(f.d.path().join("nowhere"), &global).unwrap();
+    f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
+    let checks = f.checks();
+    let c = one(&checks, "cc.auth");
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    assert!(c.message.contains("cannot be told"), "{}", c.message);
+    assert_eq!(f.spawner.specs().len(), 1, "only `claude --version`");
+
+    let f = fx();
+    f.install_claude();
+    f.started();
+    let before = fs::metadata(&f.env.home).unwrap().permissions();
+    fs::set_permissions(&f.env.home, fs::Permissions::from_mode(0o000)).unwrap();
+    f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
+    let checks = f.checks();
+    fs::set_permissions(&f.env.home, before).unwrap();
+    let c = one(&checks, "cc.auth");
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    assert_eq!(f.spawner.specs().len(), 1, "only `claude --version`");
 }
 
 #[test]
@@ -238,6 +298,7 @@ fn a_login_as_another_account_or_organization_than_the_live_one_warns() {
 fn an_auth_status_that_times_out_or_says_logged_out_is_reported_as_such() {
     let f = fx();
     f.install_claude();
+    f.started();
     f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
     f.spawner.push(Captured::TimedOut);
     let c = one(&f.checks(), "cc.auth").clone();
@@ -246,6 +307,7 @@ fn an_auth_status_that_times_out_or_says_logged_out_is_reported_as_such() {
 
     let f = fx();
     f.install_claude();
+    f.started();
     f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
     f.spawner.push(exited(
         1,
@@ -633,6 +695,7 @@ fn the_auth_fixes_say_where_to_run_claude_auth_status() {
     ] {
         let f = fx();
         f.install_claude();
+        f.started();
         f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
         f.spawner.push(reply);
         let checks = f.checks();

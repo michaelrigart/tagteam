@@ -438,7 +438,10 @@ fn auth_fix(paths: &CcPaths) -> String {
 
 /// The default home's login, by `claude auth status` (Appendix A.7) in the outer home's
 /// environment: `env`'s two home variables replace the process's, so inside a run shell it
-/// asks about the default home, not the profile (§12.8). It writes nothing (§15.4).
+/// asks about the default home, not the profile (§12.8). Where that home's global config exists
+/// it writes nothing (§15.4); where it does not, Claude Code's start-up would create it, so
+/// `claude` is not run there (§13.6, Appendix A.7): a global config that is missing is reported
+/// as a home Claude Code has not been started in, and one that cannot be told is a warning.
 fn auth(
     bin: &Path,
     env: &Env,
@@ -447,6 +450,44 @@ fn auth(
     cancel: &Cancel,
     out: &mut Vec<Check>,
 ) {
+    // (what could not be read, whether the path is a link: a dangling link is no absent file)
+    let unstarted = match fs::symlink_metadata(&paths.global_config) {
+        Err(e) => Some((e, false)),
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::metadata(&paths.global_config).err().map(|e| (e, true))
+        }
+        Ok(_) => None,
+    };
+    match unstarted {
+        Some((e, false)) if e.kind() == ErrorKind::NotFound => {
+            out.push(Check::info(
+                "cc.auth",
+                format!(
+                    "Claude Code has not been started in this home ({} does not exist), so `claude auth status` was not run: it would create the config",
+                    paths.global_config.display()
+                ),
+            ));
+            return;
+        }
+        Some((e, _)) => {
+            out.push(
+                Check::warn(
+                    "cc.auth",
+                    format!(
+                        "whether Claude Code has been started in this home cannot be told: {} cannot be read ({}), so `claude auth status` was not run",
+                        paths.global_config.display(),
+                        e.kind()
+                    ),
+                )
+                .fix(format!(
+                    "make {} and the directories above it readable by this user",
+                    quoted(&paths.global_config)
+                )),
+            );
+            return;
+        }
+        None => {}
+    }
     let mut spec = SpawnSpec {
         program: bin.to_path_buf(),
         args: ["auth", "status", "--json"].map(OsString::from).to_vec(),
