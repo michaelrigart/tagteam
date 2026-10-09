@@ -142,7 +142,7 @@ fn lock_role(path: &Path) -> &'static str {
     match path.file_name().and_then(|n| n.to_str()) {
         Some(".oauth_refresh.lock") => "Claude Code's refresh lock",
         Some(".storage-write" | ".storage-write.lock") => "Claude Code's storage-write lock",
-        Some(".claude.json.lock") => "Claude Code's config lock",
+        Some(".claude.json.lock" | ".config.json.lock") => "Claude Code's config lock",
         Some(name) if name.ends_with(".lock") => "Claude Code's credential lock",
         _ => "a lock directory",
     }
@@ -747,6 +747,20 @@ mod tests {
         fs::create_dir(&s.path).unwrap();
         s.cancel.request(15);
         assert_eq!(MkdirLock::wait_idle(&s).unwrap_err().signal(), Some(15));
+    }
+
+    #[test]
+    fn both_spellings_of_the_global_config_s_lock_are_the_config_lock() {
+        for name in [".claude.json.lock", ".config.json.lock"] {
+            assert_eq!(
+                lock_role(&PathBuf::from("/h").join(name)),
+                "Claude Code's config lock"
+            );
+        }
+        assert_eq!(
+            lock_role(Path::new("/h/.claude.lock")),
+            "Claude Code's credential lock"
+        );
     }
 
     #[test]

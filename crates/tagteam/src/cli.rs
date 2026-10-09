@@ -276,7 +276,7 @@ pub enum Command {
         #[arg(long, value_name = "FILE")]
         identity: Vec<PathBuf>,
     },
-    /// Check tagteam's state and how it works with each agent CLI, changing nothing
+    /// Check tagteam's state and how it works with each agent CLI; tagteam changes nothing itself
     ///
     /// Each check reports ok, info, warn or fail, and every problem names its fix. It exits 1
     /// when a check fails. --json prints {schemaVersion, ok, checks: [{id, provider, status,
