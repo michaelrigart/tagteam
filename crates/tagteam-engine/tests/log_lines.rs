@@ -828,9 +828,21 @@ fn purge_logs_no_path_of_an_orphaned_profile_or_of_the_data_directory() {
     );
     assert_eq!(dropped.len(), 1, "{logs:#?}");
     assert_eq!(field(dropped[0], "provider"), None, "{logs:#?}");
+    // The directory is deleted as a profile; the dangling link is only a link (R-final-M1),
+    // and its line names no path either.
     assert_eq!(
         at(&logs, "INFO", "deleted an unrecognized profile entry").len(),
-        2,
+        1,
+        "{logs:#?}"
+    );
+    assert_eq!(
+        at(
+            &logs,
+            "WARN",
+            "an unrecognized profile entry is a link, not a profile directory"
+        )
+        .len(),
+        1,
         "{logs:#?}"
     );
     one(
@@ -875,14 +887,14 @@ fn purge_logs_no_path_of_an_orphaned_profile_or_of_the_data_directory() {
         assert_eq!(field(account[0], "provider"), provider, "{logs:#?}");
         assert_eq!(field(event[0], "provider"), provider, "{logs:#?}");
     }
-    assert_eq!(
+    // The dangling link is no profile directory (R-final-M1): no marker is looked for.
+    assert!(
         at(
             &logs,
             "WARN",
             "an unrecognized profile entry has no readable marker"
         )
-        .len(),
-        1,
+        .is_empty(),
         "{logs:#?}"
     );
     all.extend(logs);

@@ -17,7 +17,9 @@ use tagteam_engine::store::{DisplacedRow, JournalRow, Store};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::liveness::FakeProcess;
 use tagteam_provider::profile::ProfileMarker;
-use tagteam_provider::{FlockGuard, Keychain, KeychainError, LockState, ProcessStamp, Read};
+use tagteam_provider::{
+    FlockGuard, Keychain, KeychainError, LockState, ProcessStamp, Provider, Read,
+};
 
 /// The account a plan or report names, as `purge` builds it.
 fn account(fx: &Fx, id: &AccountId, has_profile: bool) -> PurgeAccount {
@@ -1273,7 +1275,7 @@ fn a_stored_profile_that_cannot_be_resolved_leaves_every_orphan_as_it_is() {
 fn an_orphan_naming_the_live_config_dir_never_deletes_the_live_login() {
     // Fix round 1, M4 (§10.5: purge never deletes the live login): an orphan link with no
     // marker whose canonical path is the directory `CLAUDE_CONFIG_DIR` names would be given
-    // that directory's item, which is the live login's.
+    // that directory's item, which is the live login's. Since R-final-M1 the link names none.
     let fx = Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
         let parent = fs::canonicalize(e.home.parent().unwrap()).unwrap();
         let live = parent.join(e.home.file_name().unwrap()).join(".claude");
@@ -1297,12 +1299,17 @@ fn an_orphan_naming_the_live_config_dir_never_deletes_the_live_login() {
         Some(&b"the live login"[..])
     );
     assert!(live_dir.join("settings.json").exists(), "nor its directory");
-    let what: Vec<&str> = report.failures.iter().map(|(w, _)| w.as_str()).collect();
-    assert_eq!(what, [link.display().to_string()], "{:?}", report.failures);
+    // R-final-M1: a link is not a profile directory, so it is only removed, and no item is
+    // named through it, the live login's least of all.
+    assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert!(
-        report.failures[0].1.contains("live login"),
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("is a link, not a profile directory")),
         "{:?}",
-        report.failures
+        report.warnings
     );
 }
 
@@ -1434,8 +1441,8 @@ fn on_linux_a_purge_that_leaves_an_account_keeps_the_vault_directory() {
 #[test]
 fn a_link_to_an_account_s_profile_never_deletes_the_account_s_item() {
     // Fix round 2, M3: `sessions/x -> sessions/<a>` reads `a`'s marker through the link, and
-    // its canonical path is `a`'s own profile. Its item is `a`'s, so with `a` left by step 7
-    // the orphan is skipped whole.
+    // its canonical path is `a`'s own profile. Its item is `a`'s: since R-final-M1 the link
+    // names no item at all, and only the link goes.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     let (original, item) = profile_with_item(&fx, &a);
@@ -1449,17 +1456,15 @@ fn a_link_to_an_account_s_profile_never_deletes_the_account_s_item() {
     assert!(report.accounts.is_empty(), "{report:?}");
     assert!(fx.kc.get(&item.0, &item.1).is_some(), "a's item survives");
     assert!(original.exists());
-    assert!(
-        fs::symlink_metadata(&link).is_ok(),
-        "the orphan is skipped whole"
-    );
+    // R-final-M1: the link is no profile directory, so it is removed and names no item.
+    assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
     assert!(
         report
-            .failures
+            .warnings
             .iter()
-            .any(|(w, m)| w == &link.display().to_string() && m.contains("stored account")),
+            .any(|w| w.contains("is a link, not a profile directory")),
         "{:?}",
-        report.failures
+        report.warnings
     );
 }
 
@@ -1492,5 +1497,78 @@ fn an_orphan_named_by_the_secure_storage_override_never_deletes_the_live_login()
     assert!(
         message.contains("live login") && message.contains("CLAUDE_CONFIG_DIR"),
         "names the provider's own variable: {message}"
+    );
+}
+
+#[test]
+fn a_link_with_no_marker_is_removed_and_names_no_keychain_item_by_the_path_it_leads_to() {
+    // R-final-M1 (§10.5 step 6: an orphaned profile is a directory under `sessions/`).
+    let fx = Fx::new();
+    let outside = fx.dir.path().join("elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("settings.json"), "mine").unwrap();
+    let item = fx.item_for_spelling(&fx.cc.profile_spelling(&fs::canonicalize(&outside).unwrap()));
+    fx.kc.put(&item.0, &item.1, b"another home's login");
+    let link = fx.env.data_dir().join("sessions/x");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let items = fx.kc.items();
+
+    let plan = full_plan(&fx);
+    assert_eq!(plan.orphan_profiles, [link.clone()]);
+    let report = fx.engine.purge(&plan).unwrap();
+
+    assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
+    assert_eq!(
+        fs::read_to_string(outside.join("settings.json")).unwrap(),
+        "mine"
+    );
+    assert_eq!(fx.kc.items(), items, "no Keychain item was deleted");
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains(&link.display().to_string())
+                && w.contains("is a link, not a profile directory")),
+        "{:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn a_link_to_a_directory_holding_a_readable_marker_names_no_item_by_that_marker() {
+    // R-final-M1: the marker read through the link names the item of the profile it belongs to,
+    // which the link is not.
+    let fx = Fx::new();
+    let outside = fx.dir.path().join("elsewhere");
+    fx.write_marker(&outside, &AccountId::from_string("0192-elsewhere"), &fx.env);
+    fs::write(outside.join("settings.json"), "mine").unwrap();
+    let item = fx.profile_item(&outside);
+    fx.kc.put(&item.0, &item.1, b"another data dir's profile");
+    let link = fx.env.data_dir().join("sessions/x");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let items = fx.kc.items();
+
+    let plan = full_plan(&fx);
+    assert_eq!(plan.orphan_profiles, [link.clone()]);
+    let report = fx.engine.purge(&plan).unwrap();
+
+    assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
+    assert!(outside.join("settings.json").exists());
+    assert!(
+        ProfileMarker::read(&outside).is_present(),
+        "the target keeps its marker"
+    );
+    assert_eq!(fx.kc.items(), items, "no Keychain item was deleted");
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("is a link, not a profile directory")),
+        "{:?}",
+        report.warnings
     );
 }

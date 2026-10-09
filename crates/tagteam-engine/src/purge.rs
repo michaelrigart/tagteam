@@ -614,7 +614,8 @@ impl Engine {
     /// resolve names no item, so its item is skipped with a warning. So is the item of a marker
     /// naming a provider this build does not register, and the warning returned says so. An item
     /// that is the live login's is never deleted (§10.5): the orphan is left, and the refusal
-    /// is returned as its failure.
+    /// is returned as its failure. An entry that is itself a link is not a profile directory: no
+    /// item is named through it, only the link is removed, and the warning says so.
     fn delete_orphan(
         &self,
         profile: &Path,
@@ -627,6 +628,20 @@ impl Engine {
         };
         // Asked again just before it goes, as step 7 asks each account again.
         self.refuse_orphan_split(profile)?;
+        // §10.5 step 6: an orphaned profile is a directory under `sessions/`. A link there is
+        // not one, so no Keychain item is named through it, by its marker or by the path it
+        // leads to: the link goes, and what it led to stays as it is.
+        if meta.file_type().is_symlink() {
+            fs::remove_file(profile)?;
+            tracing::warn!(
+                "{} is a link, not a profile directory; the link was removed and no Keychain item was deleted through it",
+                Self::profile_label(profile)
+            );
+            return Ok(Some(format!(
+                "{} is a link, not a profile directory; the link was removed and no Keychain item was deleted through it",
+                profile.display()
+            )));
+        }
         let mut warning = None;
         let mut items: Vec<(Arc<dyn Provider>, String)> = Vec::new();
         match ProfileMarker::read(profile) {
