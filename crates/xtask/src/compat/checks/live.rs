@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tagteam_cc::ItemKind;
-use tagteam_cc::locks::acquire_config;
+use tagteam_cc::locks::{CONFIG_ACQUIRE_TIMEOUT, acquire_config};
 use tagteam_provider::atomic::write_atomic_private;
 use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{Cancel, Read};
@@ -18,8 +18,8 @@ use super::profile::read_name;
 use super::{keys, new_record, records};
 use crate::compat::capture::{Capture, Sent};
 use crate::compat::ctx::{
-    ALIAS_API_KEY, ALIAS_OAUTH, ALIAS_SETUP_TOKEN, Ctx, MODEL, PROMPT, dummy_key, generation,
-    now_ms,
+    ALIAS_API_KEY, ALIAS_OAUTH, ALIAS_SETUP_TOKEN, Ctx, MIN_LIFE_MS, MODEL, PROMPT, dummy_key,
+    generation, life_to_spare, now_ms,
 };
 use crate::compat::report::{Outcome, Probe, fingerprint};
 use crate::compat::store;
@@ -46,127 +46,153 @@ fn bearer(credential: &[u8]) -> Option<Sent> {
 /// opened this phase made it), and CC's next write of it re-renders, byte for byte, as tagteam's
 /// splice renders each top-level value: that pins §9.5's rendering against `JSON.stringify`.
 pub fn fresh_global_config(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let live = ctx.live();
-    let path = ctx.paths(&live).global_config;
-    let created = ctx
-        .activation_config
-        .clone()
-        .ok_or_else(|| harness("the activation's global config was not recorded"))?;
-    let made: Value = serde_json::from_slice(&created)
-        .map_err(|_| harness("tagteam's global config is not JSON"))?;
-    p.expect_eq(
-        "tagteam created it holding only oauthAccount (§9.5)",
-        json!(["oauthAccount"]),
-        json!(keys(&made)),
-    );
-    let ran = ctx.claude(&live, &REQUEST).run(&ctx.roots)?;
-    p.expect("CC ran on it", ran.success(), ran.summary());
-    let after = fs::read(&path)?;
-    p.expect(
-        "CC has written it since",
-        after != created,
-        json!({"bytesBefore": created.len(), "bytesAfter": after.len()}),
-    );
-    let doc: Value = serde_json::from_slice(&after)
-        .map_err(|_| harness("CC left the global config unparseable"))?;
-    p.expect(
-        "the login is still the account's",
-        doc["oauthAccount"]["emailAddress"] == made["oauthAccount"]["emailAddress"],
-        json!(null),
-    );
-    let mut differ = Vec::new();
-    for key in keys(&doc) {
-        let spliced = replace_top_level(&after, &key, &doc[&key])
-            .map_err(|e| harness(format!("splicing {key}: {e}")))?;
-        if spliced != after {
-            differ.push(key);
-        }
-    }
-    p.expect(
-        "every top-level value CC wrote renders as tagteam renders it",
-        differ.is_empty(),
-        json!(differ),
-    );
-    if doc["oauthAccount"] == made["oauthAccount"] {
-        let same = replace_top_level(&after, "oauthAccount", &made["oauthAccount"])
-            .map_err(|e| harness(format!("splicing oauthAccount: {e}")))?
-            == after;
+    Ok(Probe::run(|p| {
+        let live = ctx.live();
+        let path = ctx.paths(&live).global_config;
+        let created = ctx
+            .activation_config
+            .clone()
+            .ok_or_else(|| harness("the activation's global config was not recorded"))?;
+        let made: Value = serde_json::from_slice(&created)
+            .map_err(|_| harness("tagteam's global config is not JSON"))?;
+        p.expect_eq(
+            "tagteam created it holding only oauthAccount (§9.5)",
+            json!(["oauthAccount"]),
+            json!(keys(&made)),
+        );
+        let ran = ctx.claude(&live, &REQUEST).run(&ctx.roots)?;
+        p.expect("CC ran on it", ran.success(), ran.summary());
+        let after = fs::read(&path)?;
         p.expect(
-            "the span tagteam spliced is byte-identical",
-            same,
+            "CC has written it since",
+            after != created,
+            json!({"bytesBefore": created.len(), "bytesAfter": after.len()}),
+        );
+        let doc: Value = serde_json::from_slice(&after)
+            .map_err(|_| harness("CC left the global config unparseable"))?;
+        p.expect(
+            "the login is still the account's",
+            doc["oauthAccount"]["emailAddress"] == made["oauthAccount"]["emailAddress"],
             json!(null),
         );
-    } else {
-        p.note(
-            "CC changed oauthAccount itself; its fields",
-            json!(keys(&doc["oauthAccount"])),
-        );
-    }
-    let mut corrupt = Vec::new();
-    for dir in [ctx.layout.live(), ctx.layout.live().join("backups")] {
-        for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.contains("corrupt") {
-                corrupt.push(name);
+        let mut differ = Vec::new();
+        for key in keys(&doc) {
+            let spliced = replace_top_level(&after, &key, &doc[&key])
+                .map_err(|e| harness(format!("splicing {key}: {e}")))?;
+            if spliced != after {
+                differ.push(key);
             }
         }
-    }
-    p.expect(
-        "CC set no copy aside as corrupt",
-        corrupt.is_empty(),
-        json!(corrupt),
-    );
-    Ok(p.finish("CC took tagteam's file, and its write re-renders as tagteam's"))
+        p.expect(
+            "every top-level value CC wrote renders as tagteam renders it",
+            differ.is_empty(),
+            json!(differ),
+        );
+        if doc["oauthAccount"] == made["oauthAccount"] {
+            let same = replace_top_level(&after, "oauthAccount", &made["oauthAccount"])
+                .map_err(|e| harness(format!("splicing oauthAccount: {e}")))?
+                == after;
+            p.expect(
+                "the span tagteam spliced is byte-identical",
+                same,
+                json!(null),
+            );
+        } else {
+            p.note(
+                "CC changed oauthAccount itself; its fields",
+                json!(keys(&doc["oauthAccount"])),
+            );
+        }
+        let mut corrupt = Vec::new();
+        for dir in [ctx.layout.live(), ctx.layout.live().join("backups")] {
+            for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.contains("corrupt") {
+                    corrupt.push(name);
+                }
+            }
+        }
+        p.expect(
+            "CC set no copy aside as corrupt",
+            corrupt.is_empty(),
+            json!(corrupt),
+        );
+        Ok("CC took tagteam's file, and its write re-renders as tagteam's")
+    }))
 }
 
-/// §9.1: CC takes `<global config>.lock` around its own writes of the global config. While
-/// tagteam holds it, `claude mcp add --scope user` writes nothing; once released, it writes.
+/// How long tagteam holds the config lock while CC's start-up is watched: well past the 1.5 s
+/// CC retries it for.
+const START_UP_WINDOW: Duration = Duration::from_secs(6);
+
+/// §9.1 and Appendix A.7 (*2.1.292*): for its first 30 s, until its interactive UI is up, CC
+/// retries `<global config>.lock` for only 1.5 s and then writes the global config without it,
+/// unless every key it changes is one of its own counters or caches. So `claude mcp add --scope
+/// user` (a new process, in its start-up, changing `mcpServers`) writes while tagteam holds the
+/// lock: pinned here as the expected behaviour, so a Claude Code that waits again, or never
+/// waited, shows. The lock excludes only a CC process past its start-up; that half is not
+/// tested (see the note it records).
 pub fn config_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let live = ctx.live();
-    let paths = ctx.paths(&live);
-    let before = fs::read(&paths.global_config)?;
-    let lock = acquire_config(&paths, Duration::from_secs(9), &Cancel::new())
-        .map_err(|e| harness(format!("CC's config lock: {e}")))?;
-    let mut running = ctx
-        .claude(
-            &live,
-            &[
-                "mcp",
-                "add",
-                "--scope",
-                "user",
-                MCP_SERVER,
-                "--",
-                "/usr/bin/true",
-            ],
+    config_lock_within(ctx, START_UP_WINDOW)
+}
+
+fn config_lock_within(ctx: &mut Ctx, window: Duration) -> Result<Outcome, HarnessError> {
+    Ok(Probe::run(|p| {
+        let live = ctx.live();
+        let paths = ctx.paths(&live);
+        let before = fs::read(&paths.global_config)?;
+        let lock = acquire_config(&paths, CONFIG_ACQUIRE_TIMEOUT, &Cancel::new())
+            .map_err(|e| harness(format!("CC's config lock: {e}")))?;
+        let started = Instant::now();
+        let mut running = ctx
+            .claude(
+                &live,
+                &[
+                    "mcp",
+                    "add",
+                    "--scope",
+                    "user",
+                    MCP_SERVER,
+                    "--",
+                    "/usr/bin/true",
+                ],
+            )
+            .spawn(&ctx.roots)?;
+        let wrote = wait_until(window, || {
+            fs::read(&paths.global_config).is_ok_and(|now| now != before)
+        });
+        let seconds = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+        let finished_early = running.finished();
+        drop(lock);
+        let ran = running.wait()?;
+        let after = fs::read(&paths.global_config)?;
+        p.expect(
+            "start-up: CC wrote the global config while tagteam held its lock, once its 1.5 s retry ran out (2.1.292, A.7)",
+            wrote,
+            json!({"seconds": seconds, "window": window.as_secs()}),
+        );
+        p.note(
+            "claude mcp add had finished while it was held",
+            json!(finished_early),
+        );
+        let added = serde_json::from_slice::<Value>(&after)
+            .ok()
+            .is_some_and(|v| v["mcpServers"].get(MCP_SERVER).is_some());
+        p.expect("the server was added", added, ran.summary());
+        p.note(
+            "exclusion by the lock past CC's start-up",
+            json!(
+                "not tested: it holds only for a CC process more than 30 s old or with its interactive UI up, and compat drives no entry point there that makes a chosen change of the global config (mcp add and remove, and -p, end within their start-up or write only as they exit; an interactive session's own writes are CC's)"
+            ),
+        );
+        let removed = ctx
+            .claude(&live, &["mcp", "remove", "--scope", "user", MCP_SERVER])
+            .run(&ctx.roots)?;
+        p.note("claude mcp remove", removed.summary());
+        Ok(
+            "CC's start-up wrote the global config past tagteam's lock after its 1.5 s retry, as 2.1.292's Appendix A.7 records",
         )
-        .spawn(&ctx.roots)?;
-    pause(HOLD);
-    let during = fs::read(&paths.global_config)?;
-    let finished_early = running.finished();
-    drop(lock);
-    let ran = running.wait()?;
-    let after = fs::read(&paths.global_config)?;
-    p.expect(
-        "CC wrote nothing while tagteam held the lock",
-        during == before,
-        json!(null),
-    );
-    p.note(
-        "claude mcp add had finished while it was held",
-        json!(finished_early),
-    );
-    let added = serde_json::from_slice::<Value>(&after)
-        .ok()
-        .is_some_and(|v| v["mcpServers"].get(MCP_SERVER).is_some());
-    p.expect("CC wrote once tagteam released it", added, ran.summary());
-    let removed = ctx
-        .claude(&live, &["mcp", "remove", "--scope", "user", MCP_SERVER])
-        .run(&ctx.roots)?;
-    p.note("claude mcp remove", removed.summary());
-    Ok(p.finish("CC waited for the config lock tagteam held"))
+    }))
 }
 
 /// §7.5 and §9.1: when CC and tagteam both find the live access token expired, CC's credential
@@ -187,7 +213,44 @@ pub fn config_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 /// plan the last collection or switch recorded would hold it back, so each order first makes
 /// the account due (`store::make_due`).
 pub fn refresh_lock_interop(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
+    Ok(Probe::run(|p| {
+        let live = ctx.live();
+        let mut fresh = None;
+        let done = interop(ctx, p, &mut fresh);
+        // However it ended, the live token is left fresh for the checks after it: an error
+        // between `expire` and CC's refresh would leave it expired, and CC would refresh it
+        // under whatever runs next (hot reload judged the wrong token because of that).
+        if let Some(was) = fresh {
+            match ctx.unexpire(&live, was) {
+                Ok(true) => p.note(
+                    "the live token was still expired; its expiry before the check is put back",
+                    json!(null),
+                ),
+                Ok(false) => {}
+                Err(e) => {
+                    p.expect("the live token is left fresh", false, json!(e.0));
+                }
+            }
+        }
+        done
+    }))
+}
+
+/// `Ctx::expire` of the live home, remembering in `fresh` the expiry it replaced when that had
+/// life to spare (`Ctx::unexpire` puts it back).
+fn expire_keeping(ctx: &Ctx, live: &str, fresh: &mut Option<i64>) -> Result<Value, HarnessError> {
+    let (note, was) = ctx.expire_noting(live)?;
+    if let Some(was) = was.filter(|w| w - now_ms() >= MIN_LIFE_MS) {
+        *fresh = Some(was);
+    }
+    Ok(note)
+}
+
+fn interop(
+    ctx: &mut Ctx,
+    p: &mut Probe,
+    fresh: &mut Option<i64>,
+) -> Result<&'static str, HarnessError> {
     let live = ctx.live();
     let paths = ctx.paths(&live);
     let db = ctx.layout.data_dir().join("tagteam.db");
@@ -202,7 +265,7 @@ pub fn refresh_lock_interop(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 
     // CC first.
     store::make_due(&db, &ctx.oauth.id, now_ms() / 1000)?;
-    let expired = ctx.expire(&live)?;
+    let expired = expire_keeping(ctx, &live, fresh)?;
     let consumed = expired["generation"].clone();
     p.note("expired", expired);
     let vault_before = vault_generation(ctx)?;
@@ -262,7 +325,7 @@ pub fn refresh_lock_interop(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     );
 
     // tagteam first.
-    p.note("expired again", ctx.expire(&live)?);
+    p.note("expired again", expire_keeping(ctx, &live, fresh)?);
     let pause_dir = ctx.layout.scratch.join("pause");
     let _ = fs::remove_dir_all(&pause_dir);
     fs::create_dir(&pause_dir)?;
@@ -316,7 +379,7 @@ pub fn refresh_lock_interop(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
         vault.is_some() && vault == held,
         json!({"vault": vault, "live": held}),
     );
-    Ok(p.finish("CC's credential locks kept one refresh at a time, both ways"))
+    Ok("CC's credential locks kept one refresh at a time, both ways")
 }
 
 /// An interactive `claude` in the default home that talks to `capture`, started and ready.
@@ -353,85 +416,103 @@ fn prompt(
 /// credential file's mtime moves, and from the Keychain within 30 s. The switch goes from the
 /// account to its setup token and back, so the lineage never leaves the default home.
 pub fn hot_reload(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let Some(st) = ctx.setup_token.clone() else {
-        p.expect(
-            "a setup-token account to switch to",
-            false,
-            json!("run `cargo xtask compat login` again to add it"),
-        );
-        return Ok(p.finish(""));
-    };
-    let live = ctx.live();
-    ctx.seed_trust(&live)?;
-    let setup = bearer(&ctx.vault_credential(&st.id)?)
-        .ok_or_else(|| harness("the setup token's vault entry has no access token"))?;
-    let capture = Capture::start()?;
-    let file = ctx.paths(&live).credentials_file;
-    let modes: &[(&str, bool)] = if ctx.macos {
-        &[("from the Keychain", false), ("by the file's mtime", true)]
-    } else {
-        &[("by the file's mtime", true)]
-    };
-    for &(label, with_file) in modes {
-        ctx.switch(ALIAS_OAUTH)?;
-        let (bytes, _) = ctx
-            .read_credential(&live)?
-            .ok_or_else(|| harness("the default home holds no credential"))?;
-        if ctx.macos {
-            // tagteam rewrites the file after a Keychain write only if it exists (A.3).
-            if with_file {
-                write_atomic_private(&file, &bytes, 0o600)?;
-            } else if file.exists() {
-                fs::remove_file(&file)?;
-            }
-        }
-        let Some(mut pty) = session_on(ctx, &capture)? else {
-            p.expect(&format!("{label}: the session started"), false, json!(null));
-            continue;
+    Ok(Probe::run(|p| {
+        let Some(st) = ctx.setup_token.clone() else {
+            p.expect(
+                "a setup-token account to switch to",
+                false,
+                json!("run `cargo xtask compat login` again to add it"),
+            );
+            return Ok("");
         };
-        let first = prompt(&mut pty, &capture)?;
-        p.expect_eq(
-            &format!("{label}: before the switch, the account's token"),
-            sent_json(bearer(&bytes)),
-            sent_json(first),
-        );
-        p.note(&format!("{label}: switch"), ctx.switch(ALIAS_SETUP_TOKEN)?);
-        let switched = Instant::now();
-        if with_file {
-            let next = prompt(&mut pty, &capture)?;
-            p.expect_eq(
-                &format!("{label}: the next message carries the setup token"),
-                setup.to_json(),
-                sent_json(next),
-            );
+        let live = ctx.live();
+        ctx.seed_trust(&live)?;
+        let setup = bearer(&ctx.vault_credential(&st.id)?)
+            .ok_or_else(|| harness("the setup token's vault entry has no access token"))?;
+        let capture = Capture::start()?;
+        let file = ctx.paths(&live).credentials_file;
+        let modes: &[(&str, bool)] = if ctx.macos {
+            &[("from the Keychain", false), ("by the file's mtime", true)]
         } else {
-            pause(Duration::from_secs(2));
-            let early = prompt(&mut pty, &capture)?;
-            p.note(&format!("{label}: 2 s after the switch"), sent_json(early));
-            pause(Duration::from_secs(31).saturating_sub(switched.elapsed()));
-            let late = prompt(&mut pty, &capture)?;
-            p.expect_eq(
-                &format!("{label}: 31 s after the switch, the setup token"),
-                setup.to_json(),
-                sent_json(late),
+            &[("by the file's mtime", true)]
+        };
+        for &(label, with_file) in modes {
+            ctx.switch(ALIAS_OAUTH)?;
+            let (bytes, _) = ctx
+                .read_credential(&live)?
+                .ok_or_else(|| harness("the default home holds no credential"))?;
+            // CC refreshes an expired token before its first message, which moves the lineage
+            // this check judges: a precondition of the harness, not a finding.
+            p.note(
+                &format!("{label}: the live token's life left, in seconds"),
+                json!(life_to_spare(&bytes, now_ms())? / 1000),
             );
+            if ctx.macos {
+                // tagteam rewrites the file after a Keychain write only if it exists (A.3).
+                if with_file {
+                    write_atomic_private(&file, &bytes, 0o600)?;
+                } else if file.exists() {
+                    fs::remove_file(&file)?;
+                }
+            }
+            let Some(mut pty) = session_on(ctx, &capture)? else {
+                p.expect(&format!("{label}: the session started"), false, json!(null));
+                continue;
+            };
+            let first = prompt(&mut pty, &capture)?;
+            // The account's token is whatever its refresh-token lineage holds in the live store
+            // once the message is out, so a refresh CC makes anyway does not mislead the check.
+            let (after, _) = ctx
+                .read_credential(&live)?
+                .ok_or_else(|| harness("the default home holds no credential"))?;
+            if generation(&after) != generation(&bytes) {
+                p.note(
+                    &format!("{label}: CC refreshed before its first message"),
+                    json!({"before": generation(&bytes), "after": generation(&after)}),
+                );
+            }
+            p.expect_eq(
+                &format!("{label}: before the switch, the account's token"),
+                sent_json(bearer(&after)),
+                sent_json(first),
+            );
+            p.note(&format!("{label}: switch"), ctx.switch(ALIAS_SETUP_TOKEN)?);
+            let switched = Instant::now();
+            if with_file {
+                let next = prompt(&mut pty, &capture)?;
+                p.expect_eq(
+                    &format!("{label}: the next message carries the setup token"),
+                    setup.to_json(),
+                    sent_json(next),
+                );
+            } else {
+                pause(Duration::from_secs(2));
+                let early = prompt(&mut pty, &capture)?;
+                p.note(&format!("{label}: 2 s after the switch"), sent_json(early));
+                pause(Duration::from_secs(31).saturating_sub(switched.elapsed()));
+                let late = prompt(&mut pty, &capture)?;
+                p.expect_eq(
+                    &format!("{label}: 31 s after the switch, the setup token"),
+                    setup.to_json(),
+                    sent_json(late),
+                );
+            }
+            let _ = pty.line("/exit");
+            pty.finish(Duration::from_secs(30))?;
+            ctx.switch(ALIAS_OAUTH)?;
         }
-        let _ = pty.line("/exit");
-        pty.finish(Duration::from_secs(30))?;
-        ctx.switch(ALIAS_OAUTH)?;
-    }
-    if ctx.macos && file.exists() {
-        fs::remove_file(&file)?;
-    }
-    Ok(p.finish("a running claude took up each switch as tagteam's hint says"))
+        if ctx.macos && file.exists() {
+            fs::remove_file(&file)?;
+        }
+        Ok("a running claude took up each switch as tagteam's hint says")
+    }))
 }
 
 /// `primaryApiKey` in the home's global config, set or removed, with a set key's last 20
 /// characters approved as tagteam approves its own (§9.4 step 7). Under CC's config lock.
 fn set_primary_api_key(ctx: &Ctx, key: Option<&str>) -> Result<(), HarnessError> {
     let paths = ctx.paths(&ctx.live());
-    let _lock = acquire_config(&paths, Duration::from_secs(9), &Cancel::new())
+    let _lock = acquire_config(&paths, CONFIG_ACQUIRE_TIMEOUT, &Cancel::new())
         .map_err(|e| harness(format!("CC's config lock: {e}")))?;
     let doc = fs::read(&paths.global_config)?;
     let err = |e| harness(format!("splicing the global config: {e}"));
@@ -466,155 +547,284 @@ fn set_primary_api_key(ctx: &Ctx, key: Option<&str>) -> Result<(), HarnessError>
 /// §9.4 step 7: activating an API key drops the credential entry's account-scoped keys and keeps
 /// its machine-shared ones, and CC then runs on the key: it sends it, to the stand-in.
 pub fn api_key_entry(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let live = ctx.live();
-    let (bytes, place) = ctx
-        .read_credential(&live)?
-        .ok_or_else(|| harness("the default home holds no credential"))?;
-    let mut v: Value =
-        serde_json::from_slice(&bytes).map_err(|_| harness("the live credential is not JSON"))?;
-    v["mcpOAuth"] = json!({"tagteam-compat|0": {
-        "serverName": "tagteam-compat",
-        "serverUrl": "http://127.0.0.1:9/mcp",
-        "accessToken": "tagteam-compat-mcp-dummy",
-        "expiresAt": 0
-    }});
-    ctx.write_credential(
-        &live,
-        &place,
-        &serde_json::to_vec(&v).expect("a Value serializes"),
-    )?;
-    let key = ctx.add_dummy_api_key()?;
-    p.note("switch", ctx.switch(ALIAS_API_KEY)?);
-    match ctx.read_credential(&live)? {
-        Some((b, at)) => {
-            let entry: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
-            p.expect_eq(
-                "the entry keeps only its machine-shared keys",
-                json!(["mcpOAuth"]),
-                json!(keys(&entry)),
-            );
-            p.note("the entry", at.describe());
-        }
-        None => {
-            p.expect(
-                "the entry is kept for its machine-shared key",
-                false,
-                json!(null),
-            );
-        }
-    }
-    if ctx.macos {
-        let stored = ctx.item(&live, ItemKind::ManagedKey)?.read();
-        p.expect(
-            "the key is in the managed-key item",
-            matches!(&stored, Read::Present(b) if b.as_slice() == key.as_bytes()),
-            json!(read_name(&stored)),
-        );
-    } else {
-        let stored = get_top_level(&fs::read(ctx.paths(&live).global_config)?, "primaryApiKey")
-            .ok()
-            .flatten();
-        p.expect(
-            "the key is primaryApiKey",
-            stored == Some(json!(key)),
-            json!(stored.is_some()),
-        );
-    }
-    let v = ctx
-        .claude(&live, &STATUS)
-        .run(&ctx.roots)?
-        .json()
-        .unwrap_or(Value::Null);
-    p.expect_eq(
-        "auth status: authMethod",
-        "api_key",
-        v["authMethod"].clone(),
-    );
-    p.note(
-        "auth status: apiKeySource",
-        ctx.redact.value(&v["apiKeySource"]),
-    );
-    let capture = Capture::start()?;
-    let ran = ctx
-        .claude(&live, &REQUEST)
-        .var("ANTHROPIC_BASE_URL", capture.base_url())
-        .timeout(Duration::from_secs(120))
-        .run(&ctx.roots)?;
-    p.note("claude -p against the stand-in", ran.summary());
-    p.expect_eq(
-        "CC sent the key",
-        Sent::ApiKey(fingerprint(&key)).to_json(),
-        sent_json(capture.next_message(0, Duration::from_secs(5))),
-    );
-    ctx.drop_dummy_api_key()?;
-    if let Some((b, at)) = ctx.read_credential(&live)? {
-        let mut entry: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
-        if let Some(o) = entry.as_object_mut() {
-            o.remove("mcpOAuth");
-        }
+    Ok(Probe::run(|p| {
+        let live = ctx.live();
+        let (bytes, place) = ctx
+            .read_credential(&live)?
+            .ok_or_else(|| harness("the default home holds no credential"))?;
+        let mut v: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| harness("the live credential is not JSON"))?;
+        v["mcpOAuth"] = json!({"tagteam-compat|0": {
+            "serverName": "tagteam-compat",
+            "serverUrl": "http://127.0.0.1:9/mcp",
+            "accessToken": "tagteam-compat-mcp-dummy",
+            "expiresAt": 0
+        }});
         ctx.write_credential(
             &live,
-            &at,
-            &serde_json::to_vec(&entry).expect("a Value serializes"),
+            &place,
+            &serde_json::to_vec(&v).expect("a Value serializes"),
         )?;
-    }
-    Ok(p.finish("the entry kept its machine-shared key and CC ran on the key"))
-}
-
-/// §9.4: with the managed-key item and `primaryApiKey` both set, which CC sends; with the item
-/// gone, `primaryApiKey`; and a running session's next message after `primaryApiKey` changes,
-/// as the file-store hint ("active on your next message") says.
-pub fn managed_key_precedence(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let live = ctx.live();
-    ctx.seed_trust(&live)?;
-    let k1 = ctx.add_dummy_api_key()?;
-    p.note("switch", ctx.switch(ALIAS_API_KEY)?);
-    let k2 = dummy_key("k2")?;
-    set_primary_api_key(ctx, Some(&k2))?;
-    let capture = Capture::start()?;
-    let request = |ctx: &Ctx| -> Result<Option<Sent>, HarnessError> {
-        let n = capture.messages();
-        ctx.claude(&ctx.live(), &REQUEST)
+        let key = ctx.add_dummy_api_key()?;
+        p.note("switch", ctx.switch(ALIAS_API_KEY)?);
+        match ctx.read_credential(&live)? {
+            Some((b, at)) => {
+                let entry: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+                p.expect_eq(
+                    "the entry keeps only its machine-shared keys",
+                    json!(["mcpOAuth"]),
+                    json!(keys(&entry)),
+                );
+                p.note("the entry", at.describe());
+            }
+            None => {
+                p.expect(
+                    "the entry is kept for its machine-shared key",
+                    false,
+                    json!(null),
+                );
+            }
+        }
+        if ctx.macos {
+            let stored = ctx.item(&live, ItemKind::ManagedKey)?.read();
+            p.expect(
+                "the key is in the managed-key item",
+                matches!(&stored, Read::Present(b) if b.as_slice() == key.as_bytes()),
+                json!(read_name(&stored)),
+            );
+        } else {
+            let stored = get_top_level(&fs::read(ctx.paths(&live).global_config)?, "primaryApiKey")
+                .ok()
+                .flatten();
+            p.expect(
+                "the key is primaryApiKey",
+                stored == Some(json!(key)),
+                json!(stored.is_some()),
+            );
+        }
+        let v = ctx
+            .claude(&live, &STATUS)
+            .run(&ctx.roots)?
+            .json()
+            .unwrap_or(Value::Null);
+        p.expect_eq(
+            "auth status: authMethod",
+            "api_key",
+            v["authMethod"].clone(),
+        );
+        p.note(
+            "auth status: apiKeySource",
+            ctx.redact.value(&v["apiKeySource"]),
+        );
+        let capture = Capture::start()?;
+        let ran = ctx
+            .claude(&live, &REQUEST)
             .var("ANTHROPIC_BASE_URL", capture.base_url())
             .timeout(Duration::from_secs(120))
             .run(&ctx.roots)?;
-        Ok(capture.next_message(n, Duration::from_secs(5)))
-    };
-    p.expect_eq(
-        "both set: CC sends the managed-key item's key",
-        Sent::ApiKey(fingerprint(&k1)).to_json(),
-        sent_json(request(ctx)?),
-    );
-    ctx.item(&live, ItemKind::ManagedKey)?.delete()?;
-    p.expect_eq(
-        "the item gone: CC sends primaryApiKey",
-        Sent::ApiKey(fingerprint(&k2)).to_json(),
-        sent_json(request(ctx)?),
-    );
-    match session_on(ctx, &capture)? {
-        None => {
-            p.expect("a session: it started", false, json!(null));
+        p.note("claude -p against the stand-in", ran.summary());
+        p.expect_eq(
+            "CC sent the key",
+            Sent::ApiKey(fingerprint(&key)).to_json(),
+            sent_json(capture.next_message(0, Duration::from_secs(5))),
+        );
+        ctx.drop_dummy_api_key()?;
+        if let Some((b, at)) = ctx.read_credential(&live)? {
+            let mut entry: Value = serde_json::from_slice(&b).unwrap_or(Value::Null);
+            if let Some(o) = entry.as_object_mut() {
+                o.remove("mcpOAuth");
+            }
+            ctx.write_credential(
+                &live,
+                &at,
+                &serde_json::to_vec(&entry).expect("a Value serializes"),
+            )?;
         }
-        Some(mut pty) => {
-            p.expect_eq(
-                "a session: its first message carries primaryApiKey",
-                Sent::ApiKey(fingerprint(&k2)).to_json(),
-                sent_json(prompt(&mut pty, &capture)?),
-            );
-            let k3 = dummy_key("k3")?;
-            set_primary_api_key(ctx, Some(&k3))?;
-            p.expect_eq(
-                "a session: the next message carries the changed primaryApiKey",
-                Sent::ApiKey(fingerprint(&k3)).to_json(),
-                sent_json(prompt(&mut pty, &capture)?),
-            );
-            let _ = pty.line("/exit");
-            pty.finish(Duration::from_secs(30))?;
+        Ok("the entry kept its machine-shared key and CC ran on the key")
+    }))
+}
+
+/// §9.4 and Appendix A.7 (*2.1.292*): with the managed-key item and `primaryApiKey` both set,
+/// which CC sends; with the item gone, `primaryApiKey`; and CC reads the managed key once and
+/// caches it for the life of the process, so when `primaryApiKey` changes a running session keeps
+/// sending the key it started with and a new process sends the changed one, which is why the
+/// hint for an API-key account is "restart Claude Code to apply".
+pub fn managed_key_precedence(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
+    Ok(Probe::run(|p| {
+        let live = ctx.live();
+        ctx.seed_trust(&live)?;
+        let k1 = ctx.add_dummy_api_key()?;
+        p.note("switch", ctx.switch(ALIAS_API_KEY)?);
+        let k2 = dummy_key("k2")?;
+        set_primary_api_key(ctx, Some(&k2))?;
+        let capture = Capture::start()?;
+        let request = |ctx: &Ctx| -> Result<Option<Sent>, HarnessError> {
+            let n = capture.messages();
+            ctx.claude(&ctx.live(), &REQUEST)
+                .var("ANTHROPIC_BASE_URL", capture.base_url())
+                .timeout(Duration::from_secs(120))
+                .run(&ctx.roots)?;
+            Ok(capture.next_message(n, Duration::from_secs(5)))
+        };
+        p.expect_eq(
+            "both set: CC sends the managed-key item's key",
+            Sent::ApiKey(fingerprint(&k1)).to_json(),
+            sent_json(request(ctx)?),
+        );
+        ctx.item(&live, ItemKind::ManagedKey)?.delete()?;
+        p.expect_eq(
+            "the item gone: CC sends primaryApiKey",
+            Sent::ApiKey(fingerprint(&k2)).to_json(),
+            sent_json(request(ctx)?),
+        );
+        match session_on(ctx, &capture)? {
+            None => {
+                p.expect("a session: it started", false, json!(null));
+            }
+            Some(mut pty) => {
+                p.expect_eq(
+                    "a session: its first message carries primaryApiKey",
+                    Sent::ApiKey(fingerprint(&k2)).to_json(),
+                    sent_json(prompt(&mut pty, &capture)?),
+                );
+                let k3 = dummy_key("k3")?;
+                set_primary_api_key(ctx, Some(&k3))?;
+                p.expect_eq(
+                    "a session: the next message still carries the key it started with (cached for the process, 2.1.292)",
+                    Sent::ApiKey(fingerprint(&k2)).to_json(),
+                    sent_json(prompt(&mut pty, &capture)?),
+                );
+                p.expect_eq(
+                    "a new process, while that session runs: it carries the changed primaryApiKey",
+                    Sent::ApiKey(fingerprint(&k3)).to_json(),
+                    sent_json(request(ctx)?),
+                );
+                let _ = pty.line("/exit");
+                pty.finish(Duration::from_secs(30))?;
+            }
         }
+        set_primary_api_key(ctx, None)?;
+        ctx.drop_dummy_api_key()?;
+        Ok(
+            "CC read the managed keys in the order tagteam assumes, and a changed key reached only a new process",
+        )
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::compat::report::{Redactor, Status};
+
+    /// A `Ctx` whose default home holds an empty global config and whose `claude` is `script`.
+    fn ctx_with_claude(script: &str) -> (Ctx, PathBuf) {
+        let scratch = crate::compat::layout::make_scratch().unwrap();
+        let fake = scratch.join("claude");
+        fs::write(
+            &fake,
+            format!("#!/bin/sh\nhome=\"$CLAUDE_CONFIG_DIR\"\n{script}\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut ctx = Ctx::offline(
+            &scratch,
+            Path::new("/nonexistent/state"),
+            PathBuf::from("/nonexistent/tagteam"),
+            Redactor::default(),
+        );
+        ctx.claude = fake;
+        fs::write(ctx.layout.live().join(".claude.json"), "{}\n").unwrap();
+        (ctx, scratch)
     }
-    set_primary_api_key(ctx, None)?;
-    ctx.drop_dummy_api_key()?;
-    Ok(p.finish("CC read the managed keys in the order and at the time tagteam assumes"))
+
+    const ADDS_AT_ONCE: &str = r#"case "$1 $2" in
+"mcp add") printf '{"mcpServers":{"tagteam-compat-probe":{}}}' > "$home/.claude.json" ;;
+esac"#;
+
+    const WAITS_FOR_THE_LOCK: &str = r#"case "$1 $2" in
+"mcp add")
+    while [ -d "$home/.claude.json.lock" ]; do sleep 0.1; done
+    printf '{"mcpServers":{"tagteam-compat-probe":{}}}' > "$home/.claude.json" ;;
+esac"#;
+
+    fn label<'o>(o: &'o Outcome, text: &str) -> &'o crate::compat::report::Evidence {
+        o.evidence
+            .iter()
+            .find(|e| e.label.contains(text))
+            .unwrap_or_else(|| panic!("no evidence line {text:?} in {:?}", o.evidence))
+    }
+
+    #[test]
+    fn a_start_up_that_writes_past_the_held_lock_is_the_expected_behaviour() {
+        let _serial = crate::compat::sys::serial();
+        let (mut ctx, scratch) = ctx_with_claude(ADDS_AT_ONCE);
+        let out = config_lock_within(&mut ctx, Duration::from_secs(5)).unwrap();
+        assert_eq!(out.status, Status::Pass, "{:?}", out.evidence);
+        assert_eq!(label(&out, "start-up: CC wrote").ok, Some(true));
+        assert_eq!(label(&out, "the server was added").ok, Some(true));
+        let note = label(&out, "exclusion by the lock past CC's start-up");
+        assert_eq!(note.ok, None, "a note, not an expectation");
+        assert!(note.value.to_string().contains("not tested"));
+        assert!(
+            !ctx.paths(&ctx.live()).config_lock.exists(),
+            "the lock is released"
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_claude_that_waits_for_the_lock_again_fails_the_pin() {
+        let _serial = crate::compat::sys::serial();
+        let (mut ctx, scratch) = ctx_with_claude(WAITS_FOR_THE_LOCK);
+        let out = config_lock_within(&mut ctx, Duration::from_millis(800)).unwrap();
+        assert_eq!(out.status, Status::Fail, "{:?}", out.evidence);
+        assert_eq!(label(&out, "start-up: CC wrote").ok, Some(false));
+        // It wrote once the lock was released, so the add still happened.
+        assert_eq!(label(&out, "the server was added").ok, Some(true));
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn an_error_after_the_first_half_keeps_its_evidence_and_leaves_the_live_token_fresh() {
+        let _serial = crate::compat::sys::serial();
+        let (mut ctx, scratch) = ctx_with_claude("exit 0");
+        let live = ctx.live();
+        let file = Path::new(&live).join(".credentials.json");
+        let was = now_ms() + 8 * 3_600_000;
+        fs::write(
+            &file,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"rt","expiresAt":{was}}}}}"#
+            ),
+        )
+        .unwrap();
+        // A store with no vault: the check expires the token, then meets a harness error.
+        ctx.layout.state = scratch.join("state");
+        let data = ctx.layout.data_dir();
+        fs::create_dir_all(&data).unwrap();
+        rusqlite::Connection::open(data.join("tagteam.db"))
+            .unwrap()
+            .execute_batch(include_str!(
+                "../../../../tagteam-engine/src/store/schema.sql"
+            ))
+            .unwrap();
+        let out = refresh_lock_interop(&mut ctx).unwrap();
+        assert_eq!(out.status, Status::Error, "{:?}", out.evidence);
+        assert!(out.summary.contains("vault file"), "{}", out.summary);
+        assert_eq!(
+            label(&out, "expired").ok,
+            None,
+            "the evidence gathered before the error is kept"
+        );
+        let bytes = fs::read(&file).unwrap();
+        assert_eq!(
+            crate::compat::ctx::expires_at(&bytes),
+            Some(was),
+            "the live token was left fresh"
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+    }
 }

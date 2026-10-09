@@ -20,7 +20,7 @@ use super::{changes, new_record, read_json, records, snapshot};
 use crate::compat::ctx::{ALIAS_OAUTH, ALIAS_SETUP_TOKEN, Ctx, MODEL, PROMPT, generation, now_ms};
 use crate::compat::daemon;
 use crate::compat::report::{Outcome, Probe};
-use crate::compat::sys::{HarnessError, cancel, harness, pause, signal, wait_until};
+use crate::compat::sys::{HarnessError, Running, cancel, harness, pause, signal, wait_until};
 
 const STATUS: [&str; 3] = ["auth", "status", "--json"];
 const REQUEST: [&str; 6] = ["-p", PROMPT, "--model", MODEL, "--max-turns", "1"];
@@ -79,156 +79,156 @@ fn seed_inert_login(
 /// §12.3 step 8's table, from CC's side: what `claude auth status --json` reports in each case
 /// tagteam tells apart, `configDirectory` as the exported spelling, and a setup token's method.
 pub fn auth_status(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
+    Ok(Probe::run(|p| {
+        // valid: tagteam's own launch bootstraps the profile and validates it with this very
+        // command (§12.3 step 8) before it runs it.
+        let ran = ctx.run_profile(&STATUS)?;
+        p.note("valid: tagteam run", ran.summary());
+        let (dir, spelling) = ctx
+            .profile()?
+            .ok_or_else(|| harness("tagteam run made no profile"))?;
+        let v = ran.json().unwrap_or(Value::Null);
+        p.expect_eq("valid: exit", 0, json!(ran.code));
+        p.expect_eq("valid: loggedIn", true, v["loggedIn"].clone());
+        p.expect_eq("valid: authMethod", "claude.ai", v["authMethod"].clone());
+        p.expect_eq(
+            "valid: configDirectory is the exported spelling",
+            spelling.as_str(),
+            v["configDirectory"].clone(),
+        );
+        p.expect(
+            "valid: email is the account's",
+            v["email"].as_str() == Some(ctx.oauth.email.as_str()),
+            json!(v["email"].is_string()),
+        );
 
-    // valid: tagteam's own launch bootstraps the profile and validates it with this very
-    // command (§12.3 step 8) before it runs it.
-    let ran = ctx.run_profile(&STATUS)?;
-    p.note("valid: tagteam run", ran.summary());
-    let (dir, spelling) = ctx
-        .profile()?
-        .ok_or_else(|| harness("tagteam run made no profile"))?;
-    let v = ran.json().unwrap_or(Value::Null);
-    p.expect_eq("valid: exit", 0, json!(ran.code));
-    p.expect_eq("valid: loggedIn", true, v["loggedIn"].clone());
-    p.expect_eq("valid: authMethod", "claude.ai", v["authMethod"].clone());
-    p.expect_eq(
-        "valid: configDirectory is the exported spelling",
-        spelling.as_str(),
-        v["configDirectory"].clone(),
-    );
-    p.expect(
-        "valid: email is the account's",
-        v["email"].as_str() == Some(ctx.oauth.email.as_str()),
-        json!(v["email"].is_string()),
-    );
+        // invalid, logged out.
+        let empty = ctx.new_home("logged-out")?;
+        let r = ctx.claude(&empty, &STATUS).run(&ctx.roots)?;
+        let v = r.json().unwrap_or(Value::Null);
+        p.expect("logged out: exits non-zero", !r.success(), json!(r.code));
+        p.expect_eq("logged out: loggedIn", false, v["loggedIn"].clone());
+        p.expect_eq("logged out: authMethod", "none", v["authMethod"].clone());
+        p.expect_eq(
+            "logged out: configDirectory",
+            empty.as_str(),
+            v["configDirectory"].clone(),
+        );
 
-    // invalid, logged out.
-    let empty = ctx.new_home("logged-out")?;
-    let r = ctx.claude(&empty, &STATUS).run(&ctx.roots)?;
-    let v = r.json().unwrap_or(Value::Null);
-    p.expect("logged out: exits non-zero", !r.success(), json!(r.code));
-    p.expect_eq("logged out: loggedIn", false, v["loggedIn"].clone());
-    p.expect_eq("logged out: authMethod", "none", v["authMethod"].clone());
-    p.expect_eq(
-        "logged out: configDirectory",
-        empty.as_str(),
-        v["configDirectory"].clone(),
-    );
+        let credential: Value = serde_json::from_slice(&ctx.vault_credential(&ctx.oauth.id)?)
+            .map_err(|_| harness("the vault credential is not JSON"))?;
+        let account = read_json(&dir.join(".claude.json"))
+            .map(|c| c["oauthAccount"].clone())
+            .filter(Value::is_object)
+            .ok_or_else(|| harness("the profile's .claude.json has no oauthAccount"))?;
 
-    let credential: Value = serde_json::from_slice(&ctx.vault_credential(&ctx.oauth.id)?)
-        .map_err(|_| harness("the vault credential is not JSON"))?;
-    let account = read_json(&dir.join(".claude.json"))
-        .map(|c| c["oauthAccount"].clone())
-        .filter(Value::is_object)
-        .ok_or_else(|| harness("the profile's .claude.json has no oauthAccount"))?;
+        // invalid, another identity: CC reports the config's email, which tagteam compares.
+        let other = ctx.new_home("other-identity")?;
+        let mut someone = account.clone();
+        someone["emailAddress"] = json!(OTHER_EMAIL);
+        seed_inert_login(&other, &credential, &someone)?;
+        let v = ctx
+            .claude(&other, &STATUS)
+            .run(&ctx.roots)?
+            .json()
+            .unwrap_or(Value::Null);
+        p.expect_eq("another identity: loggedIn", true, v["loggedIn"].clone());
+        p.expect_eq(
+            "another identity: authMethod",
+            "claude.ai",
+            v["authMethod"].clone(),
+        );
+        p.expect_eq("another identity: email", OTHER_EMAIL, v["email"].clone());
 
-    // invalid, another identity: CC reports the config's email, which tagteam compares.
-    let other = ctx.new_home("other-identity")?;
-    let mut someone = account.clone();
-    someone["emailAddress"] = json!(OTHER_EMAIL);
-    seed_inert_login(&other, &credential, &someone)?;
-    let v = ctx
-        .claude(&other, &STATUS)
-        .run(&ctx.roots)?
-        .json()
-        .unwrap_or(Value::Null);
-    p.expect_eq("another identity: loggedIn", true, v["loggedIn"].clone());
-    p.expect_eq(
-        "another identity: authMethod",
-        "claude.ai",
-        v["authMethod"].clone(),
-    );
-    p.expect_eq("another identity: email", OTHER_EMAIL, v["email"].clone());
+        // overridden: an apiKeyHelper in the settings a profile shares.
+        let helper = ctx.new_home("api-key-helper")?;
+        seed_inert_login(&helper, &credential, &account)?;
+        fs::write(
+            Path::new(&helper).join("settings.json"),
+            json!({"apiKeyHelper": "echo sk-ant-api03-tagteam-compat-helper"}).to_string(),
+        )?;
+        let v = ctx
+            .claude(&helper, &STATUS)
+            .run(&ctx.roots)?
+            .json()
+            .unwrap_or(Value::Null);
+        p.expect_eq(
+            "overridden by apiKeyHelper: authMethod",
+            "api_key_helper",
+            v["authMethod"].clone(),
+        );
+        p.note(
+            "overridden by apiKeyHelper: apiKeySource",
+            ctx.redact.value(&v["apiKeySource"]),
+        );
 
-    // overridden: an apiKeyHelper in the settings a profile shares.
-    let helper = ctx.new_home("api-key-helper")?;
-    seed_inert_login(&helper, &credential, &account)?;
-    fs::write(
-        Path::new(&helper).join("settings.json"),
-        json!({"apiKeyHelper": "echo sk-ant-api03-tagteam-compat-helper"}).to_string(),
-    )?;
-    let v = ctx
-        .claude(&helper, &STATUS)
-        .run(&ctx.roots)?
-        .json()
-        .unwrap_or(Value::Null);
-    p.expect_eq(
-        "overridden by apiKeyHelper: authMethod",
-        "api_key_helper",
-        v["authMethod"].clone(),
-    );
-    p.note(
-        "overridden by apiKeyHelper: apiKeySource",
-        ctx.redact.value(&v["apiKeySource"]),
-    );
+        // overridden: a token in the environment, which run scrubs (§12.5).
+        let v = ctx
+            .claude(&other, &STATUS)
+            .var(
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "sk-ant-oat01-tagteam-compat-dummy",
+            )
+            .run(&ctx.roots)?
+            .json()
+            .unwrap_or(Value::Null);
+        p.expect_eq(
+            "overridden by CLAUDE_CODE_OAUTH_TOKEN: authMethod",
+            "oauth_token",
+            v["authMethod"].clone(),
+        );
 
-    // overridden: a token in the environment, which run scrubs (§12.5).
-    let v = ctx
-        .claude(&other, &STATUS)
-        .var(
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "sk-ant-oat01-tagteam-compat-dummy",
-        )
-        .run(&ctx.roots)?
-        .json()
-        .unwrap_or(Value::Null);
-    p.expect_eq(
-        "overridden by CLAUDE_CODE_OAUTH_TOKEN: authMethod",
-        "oauth_token",
-        v["authMethod"].clone(),
-    );
+        // drifted is never CC's doing when it reports the spelling it was given, a link's
+        // included, and never the link's target (Appendix A.1).
+        let link = ctx.layout.homes().join("linked");
+        std::os::unix::fs::symlink(&other, &link)?;
+        let linked = link.to_string_lossy().into_owned();
+        ctx.roots.services(&linked)?;
+        let v = ctx
+            .claude(&linked, &STATUS)
+            .run(&ctx.roots)?
+            .json()
+            .unwrap_or(Value::Null);
+        p.expect_eq(
+            "a linked home: configDirectory is the link's spelling",
+            linked.as_str(),
+            v["configDirectory"].clone(),
+        );
 
-    // drifted is never CC's doing when it reports the spelling it was given, a link's
-    // included, and never the link's target (Appendix A.1).
-    let link = ctx.layout.homes().join("linked");
-    std::os::unix::fs::symlink(&other, &link)?;
-    let linked = link.to_string_lossy().into_owned();
-    ctx.roots.services(&linked)?;
-    let v = ctx
-        .claude(&linked, &STATUS)
-        .run(&ctx.roots)?
-        .json()
-        .unwrap_or(Value::Null);
-    p.expect_eq(
-        "a linked home: configDirectory is the link's spelling",
-        linked.as_str(),
-        v["configDirectory"].clone(),
-    );
-
-    // A setup token's account (§12.3 infers `claude.ai`).
-    match &ctx.setup_token {
-        None => {
-            p.expect(
-                "setup token: the compat store holds one",
-                false,
-                json!("run `cargo xtask compat login` again to add it"),
-            );
+        // A setup token's account (§12.3 infers `claude.ai`).
+        match &ctx.setup_token {
+            None => {
+                p.expect(
+                    "setup token: the compat store holds one",
+                    false,
+                    json!("run `cargo xtask compat login` again to add it"),
+                );
+            }
+            Some(st) => {
+                let ran = ctx.run_as(ALIAS_SETUP_TOKEN, &STATUS).run(&ctx.roots)?;
+                p.note("setup token: tagteam run", ran.summary());
+                let v = match ran.json() {
+                    Some(v) => v,
+                    // tagteam's validation refused the launch: ask CC in that profile directly.
+                    None => match ctx.profile_of(&st.id)? {
+                        Some((_, sp)) => ctx
+                            .claude(&sp, &STATUS)
+                            .run(&ctx.roots)?
+                            .json()
+                            .unwrap_or(Value::Null),
+                        None => Value::Null,
+                    },
+                };
+                p.expect_eq("setup token: loggedIn", true, v["loggedIn"].clone());
+                p.expect_eq(
+                    "setup token: authMethod",
+                    "claude.ai",
+                    v["authMethod"].clone(),
+                );
+            }
         }
-        Some(st) => {
-            let ran = ctx.run_as(ALIAS_SETUP_TOKEN, &STATUS).run(&ctx.roots)?;
-            p.note("setup token: tagteam run", ran.summary());
-            let v = match ran.json() {
-                Some(v) => v,
-                // tagteam's validation refused the launch: ask CC in that profile directly.
-                None => match ctx.profile_of(&st.id)? {
-                    Some((_, sp)) => ctx
-                        .claude(&sp, &STATUS)
-                        .run(&ctx.roots)?
-                        .json()
-                        .unwrap_or(Value::Null),
-                    None => Value::Null,
-                },
-            };
-            p.expect_eq("setup token: loggedIn", true, v["loggedIn"].clone());
-            p.expect_eq(
-                "setup token: authMethod",
-                "claude.ai",
-                v["authMethod"].clone(),
-            );
-        }
-    }
-    Ok(p.finish("CC answers every case as §12.3's table reads it"))
+        Ok("CC answers every case as §12.3's table reads it")
+    }))
 }
 
 /// Every Keychain item of `spelling`: present or not, and when it was last written.
@@ -255,251 +255,347 @@ fn item_states(ctx: &Ctx, spelling: &str) -> Result<Value, HarnessError> {
 /// existence, so what `--version` does to a never-started home is recorded too, as information
 /// only.
 pub fn auth_status_read_only(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let (_, profile) = ctx.profile_ready()?;
+    Ok(Probe::run(|p| {
+        let (profile_dir, profile) = ctx.profile_ready()?;
 
-    // A home that has its global config: nothing is created, changed or removed.
-    let before = snapshot(Path::new(&profile))?;
-    let items = item_states(ctx, &profile)?;
-    let r = ctx.claude(&profile, &STATUS).run(&ctx.roots)?;
-    p.note("the profile: claude auth status", r.summary());
-    let found = changes(&before, &snapshot(Path::new(&profile))?);
-    p.expect(
-        "the profile: nothing created, changed or removed",
-        found.is_empty(),
-        json!(found),
-    );
-    p.expect_eq(
-        "the profile: its Keychain items as they were",
-        items,
-        item_states(ctx, &profile)?,
-    );
+        // A home that has its global config: nothing is created, changed or removed.
+        let before = snapshot(Path::new(&profile))?;
+        let items = item_states(ctx, &profile)?;
+        let r = ctx.claude(&profile, &STATUS).run(&ctx.roots)?;
+        p.note("the profile: claude auth status", r.summary());
+        let found = changes(&before, &snapshot(Path::new(&profile))?);
+        p.expect(
+            "the profile: nothing created, changed or removed",
+            found.is_empty(),
+            json!(found),
+        );
+        p.expect_eq(
+            "the profile: its Keychain items as they were",
+            items,
+            item_states(ctx, &profile)?,
+        );
 
-    // An empty home, `claude --version` first, in a home of its own and otherwise the same.
-    let version_home = ctx.new_home("read-only-version")?;
-    let before = snapshot(Path::new(&version_home))?;
-    let r = ctx.claude(&version_home, &["--version"]).run(&ctx.roots)?;
-    p.note("an empty home: claude --version", r.summary());
-    p.note(
-        "an empty home: what claude --version created, changed or removed (information only)",
-        json!(changes(&before, &snapshot(Path::new(&version_home))?)),
-    );
+        // An empty home, `claude --version` first, in a home of its own and otherwise the same.
+        let version_home = ctx.new_home("read-only-version")?;
+        let before = snapshot(Path::new(&version_home))?;
+        let r = ctx.claude(&version_home, &["--version"]).run(&ctx.roots)?;
+        p.note("an empty home: claude --version", r.summary());
+        p.note(
+            "an empty home: what claude --version created, changed or removed (information only)",
+            json!(changes(&before, &snapshot(Path::new(&version_home))?)),
+        );
 
-    // An empty home: what CC creates is evidence, expected, not a failure.
-    let empty = ctx.new_home("read-only")?;
-    let before = snapshot(Path::new(&empty))?;
-    let items = item_states(ctx, &empty)?;
-    let r = ctx.claude(&empty, &STATUS).run(&ctx.roots)?;
-    p.note("an empty home: claude auth status", r.summary());
-    let created = changes(&before, &snapshot(Path::new(&empty))?);
-    p.note(
-        "an empty home: what claude auth status created, changed or removed (expected)",
-        json!(created),
-    );
-    p.expect_eq(
-        "an empty home: its Keychain items as they were",
-        items,
-        item_states(ctx, &empty)?,
-    );
+        // An empty home: what CC creates is evidence, expected, not a failure.
+        let empty = ctx.new_home("read-only")?;
+        let before = snapshot(Path::new(&empty))?;
+        let items = item_states(ctx, &empty)?;
+        let r = ctx.claude(&empty, &STATUS).run(&ctx.roots)?;
+        p.note("an empty home: claude auth status", r.summary());
+        let created = changes(&before, &snapshot(Path::new(&empty))?);
+        p.note(
+            "an empty home: what claude auth status created, changed or removed (expected)",
+            json!(created),
+        );
+        p.expect_eq(
+            "an empty home: its Keychain items as they were",
+            items,
+            item_states(ctx, &empty)?,
+        );
 
-    // The home it made now has its global config: a second run writes nothing.
-    let before = snapshot(Path::new(&empty))?;
-    let items = item_states(ctx, &empty)?;
-    let r = ctx.claude(&empty, &STATUS).run(&ctx.roots)?;
-    p.note("the same home again: claude auth status", r.summary());
-    let found = changes(&before, &snapshot(Path::new(&empty))?);
-    p.expect(
-        "the same home again, now with a global config: nothing created, changed or removed",
-        found.is_empty(),
-        json!(found),
-    );
-    p.expect_eq(
-        "the same home again: its Keychain items as they were",
-        items,
-        item_states(ctx, &empty)?,
-    );
-    Ok(p.finish(
-        "claude auth status wrote nothing in a home with its global config; what it creates in an empty one is recorded",
-    ))
+        // The home it made now has its global config: a second run writes nothing.
+        let before = snapshot(Path::new(&empty))?;
+        let items = item_states(ctx, &empty)?;
+        let r = ctx.claude(&empty, &STATUS).run(&ctx.roots)?;
+        p.note("the same home again: claude auth status", r.summary());
+        let found = changes(&before, &snapshot(Path::new(&empty))?);
+        p.expect(
+            "the same home again, now with a global config: nothing created, changed or removed",
+            found.is_empty(),
+            json!(found),
+        );
+        p.expect_eq(
+            "the same home again: its Keychain items as they were",
+            items,
+            item_states(ctx, &empty)?,
+        );
+
+        // A home whose config tagteam created and CC never started in (a seeded profile, §9.5's
+        // first activation): the config exists, but CC has not initialized it. Its start-up
+        // writes it, as in an empty home, and leaves the lock a tagteam wait must outlast.
+        let seeded = ctx.new_home("read-only-seeded")?;
+        let account = read_json(&profile_dir.join(".claude.json"))
+            .map(|c| c["oauthAccount"].clone())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        write_atomic_private(
+            &Path::new(&seeded).join(".claude.json"),
+            &serde_json::to_vec_pretty(
+                &json!({"oauthAccount": account, "hasCompletedOnboarding": true}),
+            )
+            .expect("a Value serializes"),
+            0o600,
+        )?;
+        let before = snapshot(Path::new(&seeded))?;
+        let items = item_states(ctx, &seeded)?;
+        let r = ctx.claude(&seeded, &STATUS).run(&ctx.roots)?;
+        p.note("a seeded home: claude auth status", r.summary());
+        let created = changes(&before, &snapshot(Path::new(&seeded))?);
+        p.note(
+            "a seeded home: what claude auth status created, changed or removed (expected: CC's start-up writes and its lock)",
+            json!(created),
+        );
+        p.note(
+            "a seeded home: CC left its config lock behind",
+            json!(Path::new(&seeded).join(".claude.json.lock").is_dir()),
+        );
+        p.expect_eq(
+            "a seeded home: its Keychain items as they were",
+            items,
+            item_states(ctx, &seeded)?,
+        );
+
+        // CC has initialized it now: a second run writes nothing, the lock it left included.
+        let before = snapshot(Path::new(&seeded))?;
+        let items = item_states(ctx, &seeded)?;
+        let r = ctx.claude(&seeded, &STATUS).run(&ctx.roots)?;
+        p.note("a seeded home, run again: claude auth status", r.summary());
+        let found = changes(&before, &snapshot(Path::new(&seeded))?);
+        p.expect(
+            "a seeded home, run again: nothing created, changed or removed",
+            found.is_empty(),
+            json!(found),
+        );
+        p.expect_eq(
+            "a seeded home, run again: its Keychain items as they were",
+            items,
+            item_states(ctx, &seeded)?,
+        );
+        Ok(
+            "claude auth status wrote nothing in a home CC had initialized; what it creates in an empty or a seeded one is recorded",
+        )
+    }))
 }
 
 /// Appendix A.2 and A.3: a freshly bootstrapped profile holds its credential in the file and no
 /// item; CC's first credential write lands in the item named from the exported spelling, and
 /// the file goes. tagteam captures the rotation when the session ends.
 pub fn profile_keychain_item(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let (dir, spelling) = ctx.fresh_profile()?;
-    let canonical = fs::canonicalize(&dir)?.to_string_lossy().into_owned();
-    p.expect_eq(
-        "the exported spelling is the profile's canonical path (§12.2)",
-        canonical,
-        spelling.as_str(),
-    );
-    let item = ctx.item(&spelling, ItemKind::OAuth)?;
-    p.note("the item named from that spelling", json!(item.service));
-    let file = dir.join(".credentials.json");
-    let exists = item.exists();
-    p.expect(
-        "after the bootstrap: no item (§12.3 step 5)",
-        matches!(exists, Read::Absent),
-        json!(read_name(&exists)),
-    );
-    p.expect_eq(
-        "after the bootstrap: .credentials.json, 0600",
-        json!("600"),
-        json!(mode(&file).map(|m| format!("{m:o}"))),
-    );
-    let before = fs::read(&file).ok().and_then(|b| generation(&b));
-    p.note("expired", ctx.expire(&spelling)?);
-    let ran = ctx.run_profile(&REQUEST)?;
-    p.expect("claude -p succeeded", ran.success(), ran.summary());
-    let after = match item.read() {
-        Read::Present(b) => generation(&b),
-        _ => None,
-    };
-    p.expect(
-        "after CC's write: the item holds the credential",
-        after.is_some(),
-        json!(after),
-    );
-    p.expect(
-        "after CC's write: .credentials.json is gone (Appendix A.3)",
-        !file.exists(),
-        json!(file.exists()),
-    );
-    p.expect(
-        "CC refreshed: a new generation",
-        after.is_some() && after != before,
-        json!({"before": before, "after": after}),
-    );
-    let vault = generation(&ctx.vault_credential(&ctx.oauth.id)?);
-    p.expect_eq(
-        "tagteam captured it when the session ended",
-        json!(after),
-        json!(vault),
-    );
-    Ok(p.finish("CC moved the bootstrapped file into the item named from the spelling"))
+    Ok(Probe::run(|p| {
+        let (dir, spelling) = ctx.fresh_profile()?;
+        let canonical = fs::canonicalize(&dir)?.to_string_lossy().into_owned();
+        p.expect_eq(
+            "the exported spelling is the profile's canonical path (§12.2)",
+            canonical,
+            spelling.as_str(),
+        );
+        let item = ctx.item(&spelling, ItemKind::OAuth)?;
+        p.note("the item named from that spelling", json!(item.service));
+        let file = dir.join(".credentials.json");
+        let exists = item.exists();
+        p.expect(
+            "after the bootstrap: no item (§12.3 step 5)",
+            matches!(exists, Read::Absent),
+            json!(read_name(&exists)),
+        );
+        p.expect_eq(
+            "after the bootstrap: .credentials.json, 0600",
+            json!("600"),
+            json!(mode(&file).map(|m| format!("{m:o}"))),
+        );
+        let before = fs::read(&file).ok().and_then(|b| generation(&b));
+        p.note("expired", ctx.expire(&spelling)?);
+        let ran = ctx.run_profile(&REQUEST)?;
+        p.expect("claude -p succeeded", ran.success(), ran.summary());
+        let after = match item.read() {
+            Read::Present(b) => generation(&b),
+            _ => None,
+        };
+        p.expect(
+            "after CC's write: the item holds the credential",
+            after.is_some(),
+            json!(after),
+        );
+        p.expect(
+            "after CC's write: .credentials.json is gone (Appendix A.3)",
+            !file.exists(),
+            json!(file.exists()),
+        );
+        p.expect(
+            "CC refreshed: a new generation",
+            after.is_some() && after != before,
+            json!({"before": before, "after": after}),
+        );
+        let vault = generation(&ctx.vault_credential(&ctx.oauth.id)?);
+        p.expect_eq(
+            "tagteam captured it when the session ended",
+            json!(after),
+            json!(vault),
+        );
+        Ok("CC moved the bootstrapped file into the item named from the spelling")
+    }))
+}
+
+/// §9.1's 12 s config-lock budget, against what CC does: a bootstrap validates the profile with
+/// `claude auth status`, which writes a config CC has not initialized and leaves its
+/// `.claude.json.lock` behind with an mtime up to 1 s ahead (Appendix A.7). The launches that
+/// follow seed the profile under that lock, and a 9 s wait for a lock that goes stale only after
+/// 10 s plus that skew timed out. Two launches back to back right after a bootstrap must both
+/// succeed.
+pub fn launches_after_bootstrap(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
+    Ok(Probe::run(|p| {
+        let (_, spelling) = ctx.fresh_profile()?;
+        p.note(
+            "after the bootstrap: CC's config lock is there",
+            json!(ctx.paths(&spelling).config_lock.is_dir()),
+        );
+        for launch in ["first", "second"] {
+            let ran = ctx.run_profile(&["--version"])?;
+            p.expect(
+                &format!("the {launch} launch after the bootstrap succeeded"),
+                ran.success(),
+                ran.summary(),
+            );
+        }
+        Ok("two launches right after a bootstrap both got through CC's config lock")
+    }))
 }
 
 /// Appendix A.4: CC writes `expiresAt` as an integer of epoch milliseconds.
 pub fn expires_at_integer(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let (_, spelling) = ctx.profile_ready()?;
-    p.note("expired", ctx.expire(&spelling)?);
-    let ran = ctx.run_profile(&REQUEST)?;
-    p.expect("claude -p succeeded", ran.success(), ran.summary());
-    let (bytes, place) = ctx
-        .read_credential(&spelling)?
-        .ok_or_else(|| harness("the profile holds no credential after the refresh"))?;
-    p.note("CC wrote it to", place.describe());
-    let v: Value =
-        serde_json::from_slice(&bytes).map_err(|_| harness("the credential is not JSON"))?;
-    let raw = &v["claudeAiOauth"]["expiresAt"];
-    let text = raw.to_string();
-    p.expect(
-        "expiresAt is a JSON integer",
-        raw.is_number() && text.bytes().all(|b| b.is_ascii_digit()),
-        json!(text),
-    );
-    p.expect(
-        "expiresAt is ahead: CC refreshed and wrote it",
-        raw.as_i64().is_some_and(|t| t > now_ms()),
-        json!(raw.as_i64().map(|t| t - now_ms())),
-    );
-    Ok(p.finish("CC wrote expiresAt as an integer"))
+    Ok(Probe::run(|p| {
+        let (_, spelling) = ctx.profile_ready()?;
+        p.note("expired", ctx.expire(&spelling)?);
+        let ran = ctx.run_profile(&REQUEST)?;
+        p.expect("claude -p succeeded", ran.success(), ran.summary());
+        let (bytes, place) = ctx
+            .read_credential(&spelling)?
+            .ok_or_else(|| harness("the profile holds no credential after the refresh"))?;
+        p.note("CC wrote it to", place.describe());
+        let v: Value =
+            serde_json::from_slice(&bytes).map_err(|_| harness("the credential is not JSON"))?;
+        let raw = &v["claudeAiOauth"]["expiresAt"];
+        let text = raw.to_string();
+        p.expect(
+            "expiresAt is a JSON integer",
+            raw.is_number() && text.bytes().all(|b| b.is_ascii_digit()),
+            json!(text),
+        );
+        p.expect(
+            "expiresAt is ahead: CC refreshed and wrote it",
+            raw.as_i64().is_some_and(|t| t > now_ms()),
+            json!(raw.as_i64().map(|t| t - now_ms())),
+        );
+        Ok("CC wrote expiresAt as an integer")
+    }))
 }
 
 fn lines(path: &Path) -> usize {
     fs::read_to_string(path).map_or(0, |s| s.lines().count())
 }
 
+/// What a history file gained after its first `before` lines: how many lines, whether one of
+/// them is the prompt, and whether CC also recorded the `/exit` that ended the session. CC
+/// records every input it is given, so the prompt is among the lines appended and not the last.
+fn appended(history: &str, before: usize) -> (usize, bool, bool) {
+    let added: Vec<&str> = history.lines().skip(before).collect();
+    let typed = |line: &str, text: &str| {
+        serde_json::from_str::<Value>(line).is_ok_and(|v| v["display"] == text)
+    };
+    (
+        added.len(),
+        added.iter().any(|l| l.contains(PROMPT)),
+        added.iter().any(|l| typed(l, "/exit")),
+    )
+}
+
 /// §12.2: `settings.json` is written through one link (`claude auto-mode reset` rewrites the
 /// user settings), `history.jsonl` is appended through one (an interactive prompt), and
 /// `CLAUDE.md` and `keybindings.json` are reported as CC leaves them across those sessions.
 pub fn shared_writes(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let live = ctx.layout.live();
-    let (dir, _) = ctx.profile_ready()?;
-    let kept: Vec<Option<Vec<u8>>> = SHARED_FILES
-        .iter()
-        .map(|n| fs::read(live.join(n)).ok())
-        .collect();
-    for name in SHARED_FILES {
-        let target = fs::read_link(dir.join(name)).ok();
+    Ok(Probe::run(|p| {
+        let live = ctx.layout.live();
+        let (dir, _) = ctx.profile_ready()?;
+        let kept: Vec<Option<Vec<u8>>> = SHARED_FILES
+            .iter()
+            .map(|n| fs::read(live.join(n)).ok())
+            .collect();
+        for name in SHARED_FILES {
+            let target = fs::read_link(dir.join(name)).ok();
+            p.expect(
+                &format!("{name}: a link to the default home's file"),
+                target.as_deref() == Some(live.join(name).as_path()),
+                json!(target),
+            );
+        }
+
+        // settings.json: rewritten through the link.
+        fs::write(
+            live.join("settings.json"),
+            json!({"autoMode": {}, "tagteamCompat": "kept"}).to_string(),
+        )?;
+        let ran = ctx.run_profile(&["auto-mode", "reset", "--yes"])?;
+        p.note("claude auto-mode reset", ran.summary());
+        let settings = read_json(&live.join("settings.json")).unwrap_or(Value::Null);
         p.expect(
-            &format!("{name}: a link to the default home's file"),
-            target.as_deref() == Some(live.join(name).as_path()),
-            json!(target),
+            "settings.json: CC's write reached the default home's file",
+            settings.get("autoMode").is_none() && settings["tagteamCompat"] == "kept",
+            settings.clone(),
         );
-    }
-
-    // settings.json: rewritten through the link.
-    fs::write(
-        live.join("settings.json"),
-        json!({"autoMode": {}, "tagteamCompat": "kept"}).to_string(),
-    )?;
-    let ran = ctx.run_profile(&["auto-mode", "reset", "--yes"])?;
-    p.note("claude auto-mode reset", ran.summary());
-    let settings = read_json(&live.join("settings.json")).unwrap_or(Value::Null);
-    p.expect(
-        "settings.json: CC's write reached the default home's file",
-        settings.get("autoMode").is_none() && settings["tagteamCompat"] == "kept",
-        settings.clone(),
-    );
-    p.expect(
-        "settings.json: still a link",
-        fs::read_link(dir.join("settings.json")).is_ok(),
-        json!(mode(&dir.join("settings.json")).map(|m| format!("{m:o}"))),
-    );
-
-    // history.jsonl: appended through the link by an interactive prompt.
-    let history = live.join("history.jsonl");
-    let before_lines = lines(&history);
-    let sessions = dir.join("sessions");
-    let before = records(&sessions);
-    let mut pty = ctx.profile_pty(&["--model", MODEL])?;
-    let started = new_record(&sessions, &before, Duration::from_secs(60)).is_some();
-    let mut appended = false;
-    if started {
-        pause(Duration::from_secs(2));
-        pty.line(PROMPT)?;
-        appended = wait_until(Duration::from_secs(30), || lines(&history) > before_lines);
-        pause(Duration::from_secs(15));
-    }
-    p.expect(
-        "history.jsonl: the session started",
-        started,
-        json!(pty.transcript(600)),
-    );
-    let _ = pty.line("/exit");
-    let code = pty.finish(Duration::from_secs(30))?;
-    p.note("the session's exit", json!(code));
-    let last = fs::read_to_string(&history)
-        .ok()
-        .and_then(|s| s.lines().last().map(str::to_owned))
-        .unwrap_or_default();
-    p.expect(
-        "history.jsonl: the prompt was appended to the default home's file",
-        appended && last.contains(PROMPT),
-        json!({"linesBefore": before_lines, "linesAfter": lines(&history)}),
-    );
-    p.expect(
-        "history.jsonl: still a link",
-        fs::read_link(dir.join("history.jsonl")).is_ok(),
-        json!(null),
-    );
-
-    // CLAUDE.md and keybindings.json: what CC did to them over these sessions.
-    for (i, name) in SHARED_FILES.iter().enumerate().skip(2) {
-        let link = fs::read_link(dir.join(name)).ok();
-        let now = fs::read(live.join(name)).ok();
         p.expect(
-            &format!("{name}: still a link"),
-            link.is_some(),
-            json!({"contentUnchanged": now == kept[i]}),
+            "settings.json: still a link",
+            fs::read_link(dir.join("settings.json")).is_ok(),
+            json!(mode(&dir.join("settings.json")).map(|m| format!("{m:o}"))),
         );
-    }
-    Ok(p.finish("CC wrote and appended through the links and left the others linked"))
+
+        // history.jsonl: appended through the link by an interactive prompt.
+        let history = live.join("history.jsonl");
+        let before_lines = lines(&history);
+        let sessions = dir.join("sessions");
+        let before = records(&sessions);
+        let mut pty = ctx.profile_pty(&["--model", MODEL])?;
+        let started = new_record(&sessions, &before, Duration::from_secs(60)).is_some();
+        let mut written = false;
+        if started {
+            pause(Duration::from_secs(2));
+            pty.line(PROMPT)?;
+            written = wait_until(Duration::from_secs(30), || lines(&history) > before_lines);
+            pause(Duration::from_secs(15));
+        }
+        p.expect(
+            "history.jsonl: the session started",
+            started,
+            json!(pty.transcript(600)),
+        );
+        let _ = pty.line("/exit");
+        let code = pty.finish(Duration::from_secs(30))?;
+        p.note("the session's exit", json!(code));
+        let (added, prompt_added, exit_recorded) = appended(
+            &fs::read_to_string(&history).unwrap_or_default(),
+            before_lines,
+        );
+        p.expect(
+            "history.jsonl: the prompt was appended to the default home's file",
+            written && prompt_added,
+            json!({"linesBefore": before_lines, "linesAdded": added, "exitRecorded": exit_recorded}),
+        );
+        p.expect(
+            "history.jsonl: still a link",
+            fs::read_link(dir.join("history.jsonl")).is_ok(),
+            json!(null),
+        );
+
+        // CLAUDE.md and keybindings.json: what CC did to them over these sessions.
+        for (i, name) in SHARED_FILES.iter().enumerate().skip(2) {
+            let link = fs::read_link(dir.join(name)).ok();
+            let now = fs::read(live.join(name)).ok();
+            p.expect(
+                &format!("{name}: still a link"),
+                link.is_some(),
+                json!({"contentUnchanged": now == kept[i]}),
+            );
+        }
+        Ok("CC wrote and appended through the links and left the others linked")
+    }))
 }
 
 /// Appendix A.7: a record when a session starts, removed by a graceful exit on SIGINT, SIGTERM
@@ -507,141 +603,143 @@ pub fn shared_writes(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 /// that is `daemon.lock` (a live pid) with its workers' records in the profile, all of it gone
 /// after `claude daemon stop --any`.
 pub fn session_records(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let (_, spelling) = ctx.profile_ready()?;
-    let sessions = Path::new(&spelling).join("sessions");
-    for sig in ["INT", "TERM", "HUP"] {
-        let before = records(&sessions);
-        let pty = ctx.profile_pty(&["--model", MODEL])?;
-        let Some((path, record)) = new_record(&sessions, &before, Duration::from_secs(60)) else {
+    Ok(Probe::run(|p| {
+        let (_, spelling) = ctx.profile_ready()?;
+        let sessions = Path::new(&spelling).join("sessions");
+        for sig in ["INT", "TERM", "HUP"] {
+            let before = records(&sessions);
+            let pty = ctx.profile_pty(&["--model", MODEL])?;
+            let Some((path, record)) = new_record(&sessions, &before, Duration::from_secs(60))
+            else {
+                p.expect(
+                    &format!("SIG{sig}: a record at the start"),
+                    false,
+                    json!(pty.transcript(600)),
+                );
+                pty.finish(Duration::from_secs(5))?;
+                continue;
+            };
             p.expect(
                 &format!("SIG{sig}: a record at the start"),
-                false,
-                json!(pty.transcript(600)),
+                true,
+                json!({"kind": record.kind, "pid": record.pid}),
             );
-            pty.finish(Duration::from_secs(5))?;
-            continue;
-        };
+            let ps = super::lstart(record.pid);
+            let parsed = record
+                .proc_start
+                .as_deref()
+                .and_then(tagteam_provider::parse_lstart);
+            p.expect(
+                &format!("SIG{sig}: procStart is ps's lstart"),
+                parsed.is_some() && record.proc_start.as_deref().map(str::trim) == ps.as_deref(),
+                json!({"procStart": record.proc_start, "ps": ps}),
+            );
+            signal(record.pid, sig, false);
+            let gone = wait_until(Duration::from_secs(20), || !path.exists());
+            p.expect(
+                &format!("SIG{sig}: the record is removed"),
+                gone,
+                json!(null),
+            );
+            p.note(
+                &format!("SIG{sig}: tagteam's exit"),
+                json!(pty.finish(Duration::from_secs(30))?),
+            );
+        }
+
+        // A background session's supervisor (`claude --bg`), in the profile. It leaves the groups
+        // the harness ends, so cleanup must stop it if this check cannot. In 2.1.292 the supervisor
+        // writes no session record: it is `daemon.lock` (a live pid), and its workers write
+        // records (Appendix A.7).
+        ctx.must_stop(&spelling);
+        let ran = ctx.run_profile(&["--bg", "--model", MODEL, PROMPT])?;
+        p.note("claude --bg", ran.summary());
+        let home = Path::new(&spelling);
+        let (mut supervisor, mut workers, mut kinds) = (false, false, Vec::new());
+        wait_until(Duration::from_secs(60), || {
+            supervisor = matches!(
+                read_supervisor_lock(&home.join("daemon.lock")),
+                Read::Present(r) if record_is_live(&SystemProcessProbe, &r, "claude")
+            );
+            let live: Vec<_> = records(&sessions)
+                .into_iter()
+                .filter(|(_, r)| record_is_live(&SystemProcessProbe, r, "claude"))
+                .collect();
+            kinds = live.iter().filter_map(|(_, r)| r.kind.clone()).collect();
+            workers = live
+                .iter()
+                .any(|(_, r)| matches!(r.kind.as_deref(), Some("bg" | "daemon-worker")));
+            supervisor && workers
+        });
         p.expect(
-            &format!("SIG{sig}: a record at the start"),
-            true,
-            json!({"kind": record.kind, "pid": record.pid}),
-        );
-        let ps = super::lstart(record.pid);
-        let parsed = record
-            .proc_start
-            .as_deref()
-            .and_then(tagteam_provider::parse_lstart);
-        p.expect(
-            &format!("SIG{sig}: procStart is ps's lstart"),
-            parsed.is_some() && record.proc_start.as_deref().map(str::trim) == ps.as_deref(),
-            json!({"procStart": record.proc_start, "ps": ps}),
-        );
-        signal(record.pid, sig, false);
-        let gone = wait_until(Duration::from_secs(20), || !path.exists());
-        p.expect(
-            &format!("SIG{sig}: the record is removed"),
-            gone,
+            "--bg: daemon.lock names a live supervisor",
+            supervisor,
             json!(null),
         );
-        p.note(
-            &format!("SIG{sig}: tagteam's exit"),
-            json!(pty.finish(Duration::from_secs(30))?),
-        );
-    }
-
-    // A background session's supervisor (`claude --bg`), in the profile. It leaves the groups
-    // the harness ends, so cleanup must stop it if this check cannot. In 2.1.292 the supervisor
-    // writes no session record: it is `daemon.lock` (a live pid), and its workers write
-    // records (Appendix A.7).
-    ctx.must_stop(&spelling);
-    let ran = ctx.run_profile(&["--bg", "--model", MODEL, PROMPT])?;
-    p.note("claude --bg", ran.summary());
-    let home = Path::new(&spelling);
-    let (mut supervisor, mut workers, mut kinds) = (false, false, Vec::new());
-    wait_until(Duration::from_secs(60), || {
-        supervisor = matches!(
-            read_supervisor_lock(&home.join("daemon.lock")),
-            Read::Present(r) if record_is_live(&SystemProcessProbe, &r, "claude")
-        );
-        let live: Vec<_> = records(&sessions)
-            .into_iter()
-            .filter(|(_, r)| record_is_live(&SystemProcessProbe, r, "claude"))
-            .collect();
-        kinds = live.iter().filter_map(|(_, r)| r.kind.clone()).collect();
-        workers = live
-            .iter()
-            .any(|(_, r)| matches!(r.kind.as_deref(), Some("bg" | "daemon-worker")));
-        supervisor && workers
-    });
-    p.expect(
-        "--bg: daemon.lock names a live supervisor",
-        supervisor,
-        json!(null),
-    );
-    p.expect("--bg: a worker's session record", workers, json!(kinds));
-    p.note("--bg: the kinds of the live records", json!(kinds));
-    let shape = daemon::lock_shape(home);
-    p.expect(
+        p.expect("--bg: a worker's session record", workers, json!(kinds));
+        p.note("--bg: the kinds of the live records", json!(kinds));
+        let shape = daemon::lock_shape(home);
+        p.expect(
         "--bg: daemon.lock's procStart is ps's lstart text (judged like a record's, Appendix A.7)",
         shape["procStart"] == "lstart text",
         shape.clone(),
     );
 
-    // While it runs, the profile is session-owned for tagteam: doctor reports the daemon, and a
-    // switch to the account is refused as `session-owned` (§12.6, §13.6). Only when both the
-    // supervisor and a worker were seen: otherwise the profile is not known to be owned.
-    if supervisor && workers {
-        let doctor = ctx
-            .tagteam(&["doctor", "--json"])
-            .timeout(Duration::from_secs(60))
-            .run(&ctx.roots)?;
-        p.note("tagteam doctor --json", doctor.summary());
-        let report = doctor.json().unwrap_or(Value::Null);
+        // While it runs, the profile is session-owned for tagteam: doctor reports the daemon, and a
+        // switch to the account is refused as `session-owned` (§12.6, §13.6). Only when both the
+        // supervisor and a worker were seen: otherwise the profile is not known to be owned.
+        if supervisor && workers {
+            let doctor = ctx
+                .tagteam(&["doctor", "--json"])
+                .timeout(Duration::from_secs(60))
+                .run(&ctx.roots)?;
+            p.note("tagteam doctor --json", doctor.summary());
+            let report = doctor.json().unwrap_or(Value::Null);
+            p.expect(
+                "--bg: doctor's `sessions.daemon` info line names this profile",
+                doctor_names_daemon(&report, &spelling),
+                ctx.redact.value(&daemon_entries(&report)),
+            );
+            let switch = ctx
+                .tagteam(&["switch", ALIAS_OAUTH, "--json"])
+                .run(&ctx.roots)?;
+            p.note("tagteam switch while it runs", switch.summary());
+            p.expect(
+                "--bg: a switch to the account is refused as session-owned",
+                !switch.success()
+                    && switch.json().as_ref().and_then(error_kind) == Some("session-owned"),
+                json!(null),
+            );
+        } else {
+            p.note(
+                "--bg: doctor and the switch while it runs",
+                json!("not run: the supervisor and a worker were not both seen"),
+            );
+        }
+
+        // A failed stop is a failed expectation with its error, not a lost check: the evidence so
+        // far stays, and cleanup (`must_stop`) and the later quiescence assertion stand.
+        stop_outcome(
+            p,
+            ctx.stop_daemon(&spelling),
+            cancel().requested().is_some(),
+        )?;
+        let left = daemon::survey(home, &SystemProcessProbe);
         p.expect(
-            "--bg: doctor's `sessions.daemon` info line names this profile",
-            doctor_names_daemon(&report, &spelling),
-            ctx.redact.value(&daemon_entries(&report)),
+            "--bg: the lock, the roster and the records name nothing alive once it stops",
+            left.is_clear(),
+            json!(left.describe()),
         );
-        let switch = ctx
-            .tagteam(&["switch", ALIAS_OAUTH, "--json"])
-            .run(&ctx.roots)?;
-        p.note("tagteam switch while it runs", switch.summary());
         p.expect(
-            "--bg: a switch to the account is refused as session-owned",
-            !switch.success()
-                && switch.json().as_ref().and_then(error_kind) == Some("session-owned"),
+            "--bg: daemon.lock is gone or names a dead process",
+            !matches!(
+                read_supervisor_lock(&home.join("daemon.lock")),
+                Read::Present(r) if record_is_live(&SystemProcessProbe, &r, "claude")
+            ),
             json!(null),
         );
-    } else {
-        p.note(
-            "--bg: doctor and the switch while it runs",
-            json!("not run: the supervisor and a worker were not both seen"),
-        );
-    }
-
-    // A failed stop is a failed expectation with its error, not a lost check: the evidence so
-    // far stays, and cleanup (`must_stop`) and the later quiescence assertion stand.
-    stop_outcome(
-        &mut p,
-        ctx.stop_daemon(&spelling),
-        cancel().requested().is_some(),
-    )?;
-    let left = daemon::survey(home, &SystemProcessProbe);
-    p.expect(
-        "--bg: the lock, the roster and the records name nothing alive once it stops",
-        left.is_clear(),
-        json!(left.describe()),
-    );
-    p.expect(
-        "--bg: daemon.lock is gone or names a dead process",
-        !matches!(
-            read_supervisor_lock(&home.join("daemon.lock")),
-            Read::Present(r) if record_is_live(&SystemProcessProbe, &r, "claude")
-        ),
-        json!(null),
-    );
-    Ok(p.finish("records come and go as Appendix A.7 says"))
+        Ok("records come and go as Appendix A.7 says")
+    }))
 }
 
 /// Whether doctor's `--json` report has a `sessions.daemon` info line for the profile at
@@ -694,6 +792,32 @@ fn stop_outcome(
 /// The `error.type` of a `--json` command's error object.
 fn error_kind(v: &Value) -> Option<&str> {
     v["error"]["type"].as_str()
+}
+
+/// How the wait for CC's refresh lock ended.
+#[derive(Debug, PartialEq, Eq)]
+enum RefreshWait {
+    /// CC's refresh lock directory was there.
+    Took,
+    /// The process that should have started CC exited first.
+    TagteamExited,
+    /// Neither, within the patience.
+    TimedOut,
+}
+
+/// Waits up to `patience` for the refresh lock directory `lock` to appear, and stops at once if
+/// `running` (tagteam, which starts CC) exits first: nothing is left to take the lock then.
+fn wait_for_refresh(patience: Duration, lock: &Path, running: &mut Running) -> RefreshWait {
+    let mut how = RefreshWait::TimedOut;
+    wait_until(patience, || {
+        if lock.is_dir() {
+            how = RefreshWait::Took;
+        } else if running.finished() {
+            how = RefreshWait::TagteamExited;
+        }
+        how != RefreshWait::TimedOut
+    });
+    how
 }
 
 /// One spelling of CC's storage-write lock, watched while CC runs: how often its directory was
@@ -766,76 +890,96 @@ fn written_at(ctx: &Ctx, spelling: &str) -> Option<i64> {
 /// tagteam holds it, CC's refresh does not write; once released, it does. While CC holds it
 /// for its own write, tagteam's attempt finds it taken.
 pub fn storage_write_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
-    let mut p = Probe::new();
-    let (_, spelling) = ctx.profile_ready()?;
-    let paths = ctx.paths(&spelling);
-    let generation_now = |ctx: &Ctx| {
-        ctx.read_credential(&spelling)
-            .ok()
-            .flatten()
-            .and_then(|(b, _)| generation(&b))
-    };
+    Ok(Probe::run(|p| {
+        let (_, spelling) = ctx.profile_ready()?;
+        let paths = ctx.paths(&spelling);
+        let generation_now = |ctx: &Ctx| {
+            ctx.read_credential(&spelling)
+                .ok()
+                .flatten()
+                .and_then(|(b, _)| generation(&b))
+        };
 
-    // CC waits for tagteam's.
-    p.note("expired", ctx.expire(&spelling)?);
-    let start = generation_now(ctx);
-    let lock = acquire_storage_write(&paths, Duration::from_secs(9), &Cancel::new())
-        .map_err(|e| harness(format!("the storage-write lock: {e}")))?;
-    let running = ctx.run_as(ALIAS_OAUTH, &REQUEST).spawn(&ctx.roots)?;
-    let refreshing = wait_until(Duration::from_secs(60), || paths.refresh_lock.is_dir());
-    pause(HOLD);
-    let held = generation_now(ctx);
-    let released = now_ms() / 1000;
-    drop(lock);
-    let ran = running.wait()?;
-    let after = generation_now(ctx);
-    p.expect(
-        "CC refreshed while tagteam held the lock",
-        refreshing,
-        json!(null),
-    );
-    p.expect_eq(
-        "CC wrote nothing while tagteam held it",
-        json!(start),
-        json!(held),
-    );
-    p.expect(
-        "CC wrote once tagteam released it",
-        after.is_some() && after != start && written_at(ctx, &spelling).is_some_and(|t| t >= released),
-        json!({"before": start, "after": after, "writtenAt": written_at(ctx, &spelling), "releasedAt": released}),
-    );
-    p.expect("claude -p succeeded", ran.success(), ran.summary());
-
-    // tagteam waits for CC's: whenever CC's lock is there, tagteam's attempt fails.
-    p.note("expired again", ctx.expire(&spelling)?);
-    // Either spelling is excluded by tagteam's pair (§9.1): whichever one CC is seen holding is
-    // try-locked, and must refuse tagteam. CC 2.1.292 is expected to hold `.storage-write.lock`.
-    let mut old = Spelling::new(&paths.storage_write_lock);
-    let mut new = Spelling::new(&paths.storage_write_lock_v2);
-    let mut running = ctx.run_as(ALIAS_OAUTH, &REQUEST).spawn(&ctx.roots)?;
-    let deadline = Instant::now() + Duration::from_secs(180);
-    while !running.finished() && Instant::now() < deadline && cancel().requested().is_none() {
-        old.probe()?;
-        new.probe()?;
-        thread::sleep(Duration::from_millis(1));
-    }
-    let ran = running.wait()?;
-    for (name, spelling) in [(".storage-write", &old), (".storage-write.lock", &new)] {
-        if spelling.seen > 0 && spelling.refused == 0 {
+        // CC waits for tagteam's.
+        p.note("expired", ctx.expire(&spelling)?);
+        let start = generation_now(ctx);
+        let lock = acquire_storage_write(&paths, Duration::from_secs(9), &Cancel::new())
+            .map_err(|e| harness(format!("the storage-write lock: {e}")))?;
+        let mut running = ctx.run_as(ALIAS_OAUTH, &REQUEST).spawn(&ctx.roots)?;
+        let waited = wait_for_refresh(Duration::from_secs(60), &paths.refresh_lock, &mut running);
+        if waited == RefreshWait::Took {
+            pause(HOLD);
+        }
+        let held = generation_now(ctx);
+        let released = now_ms() / 1000;
+        drop(lock);
+        let ran = running.wait()?;
+        let after = generation_now(ctx);
+        p.expect(
+            "CC refreshed while tagteam held the lock",
+            waited == RefreshWait::Took,
+            match waited {
+                RefreshWait::Took => json!(null),
+                RefreshWait::TagteamExited => {
+                    json!({"cause": "tagteam exited before CC took the refresh lock", "tagteam": ran.summary()})
+                }
+                RefreshWait::TimedOut => {
+                    json!({"cause": "no refresh lock within 60 s, and tagteam still running"})
+                }
+            },
+        );
+        if waited == RefreshWait::Took {
+            p.expect_eq(
+                "CC wrote nothing while tagteam held it",
+                json!(start),
+                json!(held),
+            );
+            p.expect(
+                "CC wrote once tagteam released it",
+                after.is_some()
+                    && after != start
+                    && written_at(ctx, &spelling).is_some_and(|t| t >= released),
+                json!({"before": start, "after": after, "writtenAt": written_at(ctx, &spelling), "releasedAt": released}),
+            );
+        } else {
             p.note(
-                &format!("CC's {name} was seen but never refused tagteam"),
-                spelling.tally(),
+                "what CC wrote while tagteam held the lock, and once it released it",
+                json!("not judged: CC never took the refresh lock"),
             );
         }
-    }
-    let (held, which) = lock_verdict(&old, &new);
-    p.expect(
+        p.expect("claude -p succeeded", ran.success(), ran.summary());
+
+        // tagteam waits for CC's: whenever CC's lock is there, tagteam's attempt fails.
+        p.note("expired again", ctx.expire(&spelling)?);
+        // Either spelling is excluded by tagteam's pair (§9.1): whichever one CC is seen holding is
+        // try-locked, and must refuse tagteam. CC 2.1.292 is expected to hold `.storage-write.lock`.
+        let mut old = Spelling::new(&paths.storage_write_lock);
+        let mut new = Spelling::new(&paths.storage_write_lock_v2);
+        let mut running = ctx.run_as(ALIAS_OAUTH, &REQUEST).spawn(&ctx.roots)?;
+        let deadline = Instant::now() + Duration::from_secs(180);
+        while !running.finished() && Instant::now() < deadline && cancel().requested().is_none() {
+            old.probe()?;
+            new.probe()?;
+            thread::sleep(Duration::from_millis(1));
+        }
+        let ran = running.wait()?;
+        for (name, spelling) in [(".storage-write", &old), (".storage-write.lock", &new)] {
+            if spelling.seen > 0 && spelling.refused == 0 {
+                p.note(
+                    &format!("CC's {name} was seen but never refused tagteam"),
+                    spelling.tally(),
+                );
+            }
+        }
+        let (held, which) = lock_verdict(&old, &new);
+        p.expect(
         "CC held a storage-write lock under a spelling tagteam takes, and it refused tagteam",
         held,
         json!({"held": which, ".storage-write": old.tally(), ".storage-write.lock": new.tally()}),
     );
-    p.expect("claude -p succeeded", ran.success(), ran.summary());
-    Ok(p.finish("CC and tagteam each waited for the other's storage-write lock"))
+        p.expect("claude -p succeeded", ran.success(), ran.summary());
+        Ok("CC and tagteam each waited for the other's storage-write lock")
+    }))
 }
 
 #[cfg(test)]
@@ -886,17 +1030,18 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        fs::write(profile.join(".claude.json"), "{}").unwrap();
+        fs::write(profile.join(".claude.json"), r#"{"numStartups":1}"#).unwrap();
         (ctx, scratch, state)
     }
 
-    /// `--version` writes nothing; `auth status` creates CC's start-up files in a home with no
-    /// global config and nothing in one that has it.
+    /// `--version` writes nothing; `auth status` starts CC up in a home whose config it has not
+    /// initialized (none, or one without its `numStartups` counter): it writes the config,
+    /// `backups/` and leaves its lock. In an initialized home it writes nothing.
     const WELL_BEHAVED: &str = r#"case "$1" in
 --version) echo "2.1.292 (Claude Code)" ;;
 auth)
-    if [ ! -e "$home/.claude.json" ]; then
-        echo '{}' > "$home/.claude.json"; mkdir "$home/.claude.json.lock" "$home/backups"
+    if ! grep -qs numStartups "$home/.claude.json"; then
+        echo '{"numStartups":1}' > "$home/.claude.json"; mkdir "$home/.claude.json.lock" "$home/backups"
     fi
     echo '{"loggedIn":false,"authMethod":"none"}'; exit 1 ;;
 esac"#;
@@ -984,6 +1129,67 @@ esac"#;
         assert_eq!(daemon_entries(&Value::Null), json!([]));
     }
 
+    #[test]
+    fn the_prompt_is_found_among_the_lines_appended_whatever_follows_it() {
+        let prompt = json!({"display": PROMPT, "project": "/w"}).to_string();
+        let exit = json!({"display": "/exit", "project": "/w"}).to_string();
+        let old = json!({"display": "earlier"}).to_string();
+        let text = format!("{old}\n{prompt}\n{exit}\n");
+        assert_eq!(appended(&text, 1), (2, true, true), "/exit comes last");
+        assert_eq!(appended(&text, 0), (3, true, true));
+        assert_eq!(appended(&text, 3), (0, false, false));
+        let no_prompt = format!("{old}\n{exit}\n");
+        assert_eq!(appended(&no_prompt, 1), (1, false, true));
+        // The prompt among the lines before the cut does not count.
+        assert_eq!(
+            appended(&format!("{prompt}\n{exit}\n"), 1),
+            (1, false, true)
+        );
+        assert_eq!(appended("", 0), (0, false, false));
+    }
+
+    #[test]
+    fn the_wait_for_a_refresh_lock_ends_when_tagteam_exits_and_names_which_ended_it() {
+        let _serial = crate::compat::sys::serial();
+        let (ctx, scratch, state) = ctx_with_profile(
+            "case \"$1\" in exit) exit 7 ;; sleep) sleep 5 ;; lock) sleep 0.3; mkdir \"$home/.oauth_refresh.lock\"; sleep 5 ;; esac",
+        );
+        let (_, spelling) = ctx.profile().unwrap().unwrap();
+        let lock = Path::new(&spelling).join(".oauth_refresh.lock");
+        let start = |arg: &str| ctx.claude(&spelling, &[arg]).spawn(&ctx.roots).unwrap();
+
+        // tagteam exits at once: the wait ends then, not after its 60 s.
+        let mut running = start("exit");
+        let t = Instant::now();
+        assert_eq!(
+            wait_for_refresh(Duration::from_secs(30), &lock, &mut running),
+            RefreshWait::TagteamExited
+        );
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        let ran = running.wait().unwrap();
+        assert_eq!(ran.code, Some(7));
+        assert!(ran.seconds < 3.0, "its own run time: {}", ran.seconds);
+
+        // The lock appears while it runs.
+        let mut running = start("lock");
+        assert_eq!(
+            wait_for_refresh(Duration::from_secs(30), &lock, &mut running),
+            RefreshWait::Took
+        );
+        drop(running);
+        fs::remove_dir(&lock).unwrap();
+
+        // Neither within the patience.
+        let mut running = start("sleep");
+        assert_eq!(
+            wait_for_refresh(Duration::from_millis(300), &lock, &mut running),
+            RefreshWait::TimedOut
+        );
+        drop(running);
+        fs::remove_dir_all(&scratch).unwrap();
+        fs::remove_dir_all(&state).unwrap();
+    }
+
     fn label<'o>(o: &'o Outcome, text: &str) -> &'o crate::compat::report::Evidence {
         o.evidence
             .iter()
@@ -1013,6 +1219,26 @@ esac"#;
         assert_eq!(version.value, json!([]));
         assert_eq!(version.ok, None, "information only");
         assert!(ctx.layout.homes().join("read-only-version").is_dir());
+        let seeded = label(&outcome, "a seeded home: what claude auth status created");
+        assert_eq!(seeded.ok, None, "expected, so no verdict");
+        let seeded_changes = seeded.value.to_string();
+        assert!(
+            seeded_changes.contains("changed .claude.json:")
+                && seeded_changes.contains("created .claude.json.lock")
+                && seeded_changes.contains("created backups"),
+            "{seeded_changes}"
+        );
+        assert_eq!(
+            label(&outcome, "a seeded home: CC left its config lock").value,
+            json!(true)
+        );
+        assert_eq!(
+            label(&outcome, "a seeded home, run again: nothing").ok,
+            Some(true)
+        );
+        let written =
+            fs::read_to_string(ctx.layout.homes().join("read-only-seeded/.claude.json")).unwrap();
+        assert!(written.contains("numStartups"), "{written}");
         fs::remove_dir_all(&scratch).unwrap();
         fs::remove_dir_all(&state).unwrap();
     }
@@ -1048,6 +1274,11 @@ esac"#,
             Some(false),
             "{:?}",
             outcome.evidence
+        );
+        assert_eq!(
+            label(&outcome, "a seeded home, run again: nothing").ok,
+            Some(false),
+            "a second run that writes fails there too"
         );
         fs::remove_dir_all(&scratch).unwrap();
         fs::remove_dir_all(&state).unwrap();

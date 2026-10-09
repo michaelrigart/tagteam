@@ -72,7 +72,7 @@ pub const CHECKS: &[Check] = &[
     ),
     check(
         "auth-status-read-only",
-        "`claude auth status` writes nothing in a home that has its global config, and what it creates in one that has none (§13.6)",
+        "`claude auth status` writes nothing in a home whose global config CC has initialized, and what it creates in one that has none or a seeded one (§13.6)",
         Phase::Profile,
         false,
         None,
@@ -85,6 +85,14 @@ pub const CHECKS: &[Check] = &[
         true,
         None,
         profile::profile_keychain_item,
+    ),
+    check(
+        "launches-after-bootstrap",
+        "two launches back to back right after a bootstrap both succeed: tagteam outlasts the config lock CC's validation leaves (§9.1, Appendix A.7)",
+        Phase::Profile,
+        false,
+        None,
+        profile::launches_after_bootstrap,
     ),
     check(
         "expires-at-integer",
@@ -128,7 +136,7 @@ pub const CHECKS: &[Check] = &[
     ),
     check(
         "config-lock",
-        "CC honours the global config's lock around its own writes (§9.1)",
+        "CC's start-up writes the global config without its lock after 1.5 s (§9.1, Appendix A.7); exclusion past start-up is not tested",
         Phase::Live,
         false,
         None,
@@ -160,7 +168,7 @@ pub const CHECKS: &[Check] = &[
     ),
     check(
         "managed-key-precedence",
-        "the managed-key item or `primaryApiKey` first, and `primaryApiKey` on the next message (§9.4)",
+        "the managed-key item or `primaryApiKey` first, and a changed key reaching only a new process, not a running session (§9.4, Appendix A.7)",
         Phase::Live,
         true,
         None,
@@ -483,6 +491,7 @@ mod tests {
                 "auth-status",
                 "auth-status-read-only",
                 "profile-keychain-item",
+                "launches-after-bootstrap",
                 "expires-at-integer",
                 "shared-writes",
                 "session-records",
