@@ -1206,9 +1206,11 @@ credential locks with the 9 s budget and, after its request, the config lock wit
 (§7.5). Every other taker of the config lock (seeding, merge-back, a settings write) waits up to
 12 s.
 
-**CC's start-up does not always honour the config lock** (*2.1.292*, Appendix A.7). For its first
-30 s, until its interactive UI is up, CC waits only 1.5 s for the config lock and then writes the
-global config without it, unless the change touches only its own counters and caches. So after a
+**CC does not always wait out the config lock** (*2.1.292*, Appendix A.7). It retries the lock on
+a backoff that totals about 10 s (only 1.5 s during its first 30 s, until its interactive UI is
+up) and then writes the global config without it, unless the change touches only its own
+counters and caches. tagteam holds the config lock only around one splice, well under that
+window, but a CC that starts during a switch can overwrite the splice. So after a
 switch commits, tagteam reads the default home's global config again. If `oauthAccount` is what
 the switch wrote, nothing more is done. Otherwise tagteam splices it once more under the config
 lock; if the lock cannot be taken, the splice fails, or a read afterwards still differs, it warns
@@ -3187,8 +3189,9 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
     activation can commit (Appendix A.3)
   - CC runs on an API key while the credential entry keeps only machine-shared keys (§9.4)
   - lock interop while CC refreshes
-  - CC honours `~/.claude.json.lock` around its own writes of the global config once past its
-    start-up, and during start-up waits only briefly before writing without it (§9.1, A.7)
+  - CC waits for `~/.claude.json.lock` around its own writes of the global config: during its
+    start-up only briefly before writing without it, and past start-up for its full retry window
+    (§9.1, A.7)
   - CC accepts a `~/.claude.json` that tagteam created on a fresh machine (§9.5), and its own
     next write of the file leaves the span tagteam spliced byte-identical, which pins §9.5's
     rendering against `JSON.stringify`
@@ -3519,9 +3522,10 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   after an upgrade, which runs CC's migrations), CC's start-up runs first: it writes the global
   config and `backups/`, and leaves its `.claude.json.lock` behind, whose mtime can be up to 1 s
   in the future (`proper-lockfile`'s first probe), before answering (*2.1.292*).
-- **Start-up and the config lock** (*2.1.292*): for its first 30 s, until its interactive UI is
-  up, CC retries the config lock for only 1.5 s, then writes the global config without it unless
-  every changed key is one of its counters or caches (`numStartups`, `tipsHistory`, …).
+- **The config lock's retries** (*2.1.292*): CC retries the config lock on a backoff of 200, 400,
+  800, 1600, 3200 and 4000 ms (about 10.2 s in all); during its first 30 s, until its interactive
+  UI is up, it stops retrying after 1.5 s. Then it writes the global config without the lock,
+  unless every changed key is one of its counters or caches (`numStartups`, `tipsHistory`, …).
 - **The managed API key** (*2.1.292*) is read once and cached for the life of the CC process;
   a later change of the managed-key item or `primaryApiKey` reaches only new processes.
 - **Workload-identity profiles** live outside the config dir (`$ANTHROPIC_CONFIG_DIR`, else
