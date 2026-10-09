@@ -153,12 +153,10 @@ fn read_records(home: &Path, probe: &dyn ProcessProbe, only_daemons: bool, s: &m
     }
 }
 
-/// Everything of the home's daemon that still lives: `daemon.lock`'s pid, the roster's
-/// supervisor and worker pids, and every session record of a daemon kind (`DAEMON_KINDS`).
-pub fn survey(home: &Path, probe: &dyn ProcessProbe) -> Survey {
-    let mut s = Survey::default();
-    read_lock(home, probe, &mut s);
-
+/// `daemon/roster.json` into `s`: every worker, and its repl process, that still lives
+/// (`roster_records`), and whatever does not parse as unreadable. A roster that is missing is
+/// nothing.
+fn read_roster(home: &Path, probe: &dyn ProcessProbe, s: &mut Survey) {
     match fs::read(home.join("daemon/roster.json")) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(roster) => {
@@ -181,6 +179,15 @@ pub fn survey(home: &Path, probe: &dyn ProcessProbe) -> Survey {
             ) => {}
         Err(e) => s.unreadable.push(format!("daemon/roster.json ({e})")),
     }
+}
+
+/// Everything of the home's daemon that still lives: `daemon.lock`'s pid, the roster's
+/// supervisor and worker pids, and every session record of a daemon kind (`DAEMON_KINDS`).
+pub fn survey(home: &Path, probe: &dyn ProcessProbe) -> Survey {
+    let mut s = Survey::default();
+    read_lock(home, probe, &mut s);
+
+    read_roster(home, probe, &mut s);
 
     read_records(home, probe, true, &mut s);
     s.alive.sort();
@@ -190,7 +197,9 @@ pub fn survey(home: &Path, probe: &dyn ProcessProbe) -> Survey {
 
 /// What makes the profile `home` session-owned for tagteam (§12.5, §12.6): a launch
 /// reservation that is held, a live session record of any kind, a live daemon supervisor in
-/// `daemon.lock`; and a reservation, record or lock that cannot be read, which may hide one.
+/// `daemon.lock`; the roster's live workers and their repl processes (a daemon's, which no
+/// record or lock may name any more); and a reservation, record, lock or roster that cannot be
+/// read, which may hide one.
 pub fn owners(home: &Path, probe: &dyn ProcessProbe) -> Survey {
     let mut s = Survey::default();
     match launch_reservations(home) {
@@ -210,6 +219,7 @@ pub fn owners(home: &Path, probe: &dyn ProcessProbe) -> Survey {
     }
     read_records(home, probe, false, &mut s);
     read_lock(home, probe, &mut s);
+    read_roster(home, probe, &mut s);
     s.alive.sort();
     s.alive.dedup();
     s
@@ -615,6 +625,42 @@ mod tests {
         );
         fs::write(h.join("daemon.lock"), "{").unwrap();
         assert_eq!(owners(&h, &probe).unreadable.len(), 1);
+        fs::remove_dir_all(&h).unwrap();
+    }
+
+    #[test]
+    fn a_repl_or_worker_only_the_roster_names_still_owns_the_profile() {
+        let h = home("owners-roster");
+        fs::write(
+            h.join("daemon/roster.json"),
+            json!({"workers": {
+                "a": {"pid": 231, "procStart": LSTART, "replPid": 232, "replProcStart": LSTART},
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        // No record, no lock: only the repl runs.
+        let probe = FakeProcessProbe::new();
+        running(&probe, 232, STARTED);
+        assert_eq!(
+            owners(&h, &probe).alive,
+            ["a worker's repl in the roster (pid 232)"]
+        );
+        // Only the worker.
+        let probe = FakeProcessProbe::new();
+        running(&probe, 231, STARTED);
+        assert_eq!(
+            owners(&h, &probe).alive,
+            ["a worker in the roster (pid 231)"]
+        );
+        // Neither: clear. A roster that does not parse is unreadable, so owned.
+        assert!(owners(&h, &FakeProcessProbe::new()).is_clear());
+        fs::write(
+            h.join("daemon/roster.json"),
+            r#"{"workers":{"a":{"no":"pid"}}}"#,
+        )
+        .unwrap();
+        assert!(!owners(&h, &FakeProcessProbe::new()).is_clear());
         fs::remove_dir_all(&h).unwrap();
     }
 
