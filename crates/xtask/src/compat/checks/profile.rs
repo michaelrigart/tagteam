@@ -444,9 +444,10 @@ pub fn profile_keychain_item(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 pub fn launches_after_bootstrap(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     Ok(Probe::run(|p| {
         let (_, spelling) = ctx.fresh_profile()?;
+        let lock_left = ctx.paths(&spelling).config_lock.is_dir();
         p.note(
             "after the bootstrap: CC's config lock is there",
-            json!(ctx.paths(&spelling).config_lock.is_dir()),
+            json!(lock_left),
         );
         for launch in ["first", "second"] {
             let ran = ctx.run_profile(&["--version"])?;
@@ -456,8 +457,18 @@ pub fn launches_after_bootstrap(ctx: &mut Ctx) -> Result<Outcome, HarnessError> 
                 ran.summary(),
             );
         }
-        Ok("two launches right after a bootstrap both got through CC's config lock")
+        Ok(bootstrap_summary(lock_left))
     }))
+}
+
+/// What a pass of `launches_after_bootstrap` shows: that the launches got through CC's lock
+/// only if the bootstrap left one to get through.
+fn bootstrap_summary(lock_left: bool) -> &'static str {
+    if lock_left {
+        "two launches right after a bootstrap both got through the config lock CC's validation left"
+    } else {
+        "pass, with nothing to wait out: the bootstrap left no config lock, so the 12 s budget was not exercised"
+    }
 }
 
 /// Appendix A.4: CC writes `expiresAt` as an integer of epoch milliseconds.
@@ -943,8 +954,8 @@ pub fn storage_write_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
             );
         } else {
             p.note(
-                "what CC wrote while tagteam held the lock, and once it released it",
-                json!("not judged: CC never took the refresh lock"),
+                "CC was not seen taking the refresh lock, so what it wrote is not judged; the generations, as recorded",
+                json!({"before": start, "whileHeld": held, "after": after, "writtenAt": written_at(ctx, &spelling), "releasedAt": released}),
             );
         }
         p.expect("claude -p succeeded", ran.success(), ran.summary());
@@ -1127,6 +1138,13 @@ esac"#;
                     "fix": "stop it"}])
         );
         assert_eq!(daemon_entries(&Value::Null), json!([]));
+    }
+
+    #[test]
+    fn a_pass_after_a_bootstrap_that_left_no_lock_says_nothing_was_waited_out() {
+        assert!(bootstrap_summary(true).contains("got through the config lock"));
+        let none = bootstrap_summary(false);
+        assert!(none.contains("nothing to wait out") && !none.contains("got through"));
     }
 
     #[test]

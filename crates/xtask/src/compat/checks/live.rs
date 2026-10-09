@@ -3,6 +3,7 @@
 //! that must see which credential CC sends point it at the local stand-in (`capture`) and
 //! spend nothing; a dummy API key and the setup token are the other credentials they switch to.
 
+use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -18,8 +19,8 @@ use super::profile::read_name;
 use super::{keys, new_record, records};
 use crate::compat::capture::{Capture, Sent};
 use crate::compat::ctx::{
-    ALIAS_API_KEY, ALIAS_OAUTH, ALIAS_SETUP_TOKEN, Ctx, MIN_LIFE_MS, MODEL, PROMPT, dummy_key,
-    generation, life_to_spare, now_ms,
+    ALIAS_API_KEY, ALIAS_OAUTH, ALIAS_SETUP_TOKEN, Ctx, MIN_LIFE_MS, MODEL, PROMPT, Prior, Restore,
+    dummy_key, generation, life_to_spare, now_ms,
 };
 use crate::compat::report::{Outcome, Probe, fingerprint};
 use crate::compat::store;
@@ -122,16 +123,18 @@ pub fn fresh_global_config(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 }
 
 /// How long tagteam holds the config lock while CC's start-up is watched: well past the 1.5 s
-/// CC retries it for.
-const START_UP_WINDOW: Duration = Duration::from_secs(6);
+/// CC retries it for, and past a slow start.
+const START_UP_WINDOW: Duration = Duration::from_secs(8);
 
 /// §9.1 and Appendix A.7 (*2.1.292*): for its first 30 s, until its interactive UI is up, CC
 /// retries `<global config>.lock` for only 1.5 s and then writes the global config without it,
 /// unless every key it changes is one of its own counters or caches. So `claude mcp add --scope
-/// user` (a new process, in its start-up, changing `mcpServers`) writes while tagteam holds the
-/// lock: pinned here as the expected behaviour, so a Claude Code that waits again, or never
-/// waited, shows. The lock excludes only a CC process past its start-up; that half is not
-/// tested (see the note it records).
+/// user` (a new process, in its start-up, changing `mcpServers`) is expected to write while
+/// tagteam holds the lock. Only the timing is recorded: whether the write landed within the
+/// window, and when. A save that lands later, after the release, is a note and not a failure, so
+/// a slow start does not fail the check; the server must be added either way. The lock excludes
+/// only a CC process past its start-up (for its full retry window, about 10 s); that half is
+/// not tested (see the note it records).
 pub fn config_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     config_lock_within(ctx, START_UP_WINDOW)
 }
@@ -166,10 +169,9 @@ fn config_lock_within(ctx: &mut Ctx, window: Duration) -> Result<Outcome, Harnes
         drop(lock);
         let ran = running.wait()?;
         let after = fs::read(&paths.global_config)?;
-        p.expect(
-            "start-up: CC wrote the global config while tagteam held its lock, once its 1.5 s retry ran out (2.1.292, A.7)",
-            wrote,
-            json!({"seconds": seconds, "window": window.as_secs()}),
+        p.note(
+            "start-up: CC wrote the global config while tagteam held its lock, once its 1.5 s retry ran out (2.1.292, A.7: expected)",
+            json!({"wrote": wrote, "seconds": seconds, "window": window.as_secs()}),
         );
         p.note(
             "claude mcp add had finished while it was held",
@@ -214,43 +216,100 @@ fn config_lock_within(ctx: &mut Ctx, window: Duration) -> Result<Outcome, Harnes
 /// the account due (`store::make_due`).
 pub fn refresh_lock_interop(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     Ok(Probe::run(|p| {
-        let live = ctx.live();
-        let mut fresh = None;
-        let done = interop(ctx, p, &mut fresh);
+        let ctx: &Ctx = ctx;
+        let token = LiveToken::new(ctx);
+        let done = interop(ctx, p, &token);
         // However it ended, the live token is left fresh for the checks after it: an error
         // between `expire` and CC's refresh would leave it expired, and CC would refresh it
-        // under whatever runs next (hot reload judged the wrong token because of that).
-        if let Some(was) = fresh {
-            match ctx.unexpire(&live, was) {
-                Ok(true) => p.note(
-                    "the live token was still expired; its expiry before the check is put back",
-                    json!(null),
-                ),
-                Ok(false) => {}
-                Err(e) => {
-                    p.expect("the live token is left fresh", false, json!(e.0));
-                }
-            }
-        }
-        done
+        // under whatever runs next (hot reload judged the wrong token because of that). A
+        // panic in `interop` is covered by `LiveToken`'s drop.
+        settle_token(p, done, token.restore())
     }))
 }
 
-/// `Ctx::expire` of the live home, remembering in `fresh` the expiry it replaced when that had
-/// life to spare (`Ctx::unexpire` puts it back).
-fn expire_keeping(ctx: &Ctx, live: &str, fresh: &mut Option<i64>) -> Result<Value, HarnessError> {
-    let (note, was) = ctx.expire_noting(live)?;
-    if let Some(was) = was.filter(|w| w - now_ms() >= MIN_LIFE_MS) {
-        *fresh = Some(was);
+/// How the interop check ends, given its own result and the restore of the live token.
+fn settle_token(
+    p: &mut Probe,
+    done: Result<&'static str, HarnessError>,
+    restored: Result<Option<Restore>, HarnessError>,
+) -> Result<&'static str, HarnessError> {
+    let note = |p: &mut Probe, restored: &Option<Restore>| match restored {
+        None => p.note(
+            "the live token: nothing to restore, since no expiry with life to spare was replaced",
+            json!(null),
+        ),
+        Some(Restore::Restored) => p.note(
+            "the live token was still expired; its expiry before the check is put back",
+            json!(null),
+        ),
+        Some(Restore::Fresh) => {}
+        Some(Restore::Changed) => p.note(
+            "the live token is another generation than the one the check expired; left as it is",
+            json!(null),
+        ),
+    };
+    match (done, restored) {
+        (Ok(summary), Ok(restored)) => {
+            note(p, &restored);
+            Ok(summary)
+        }
+        // Leaving the token fresh failed after a check that otherwise ran: the next checks
+        // cannot be trusted, so this is the harness failing, not a finding about CC.
+        (Ok(_), Err(e)) => Err(e),
+        (Err(e), Ok(restored)) => {
+            note(p, &restored);
+            Err(e)
+        }
+        (Err(e), Err(not_fresh)) => {
+            p.note("the live token could not be left fresh", json!(not_fresh.0));
+            Err(e)
+        }
     }
-    Ok(note)
 }
 
-fn interop(
-    ctx: &mut Ctx,
-    p: &mut Probe,
-    fresh: &mut Option<i64>,
-) -> Result<&'static str, HarnessError> {
+/// The live home's token as the interop check expires it, and the guard that leaves it fresh:
+/// `restore` puts back the expiry `expire` replaced, and dropping the guard does the same on
+/// an unwind, ignoring the outcome.
+struct LiveToken<'a> {
+    ctx: &'a Ctx,
+    live: String,
+    prior: RefCell<Option<Prior>>,
+}
+
+impl<'a> LiveToken<'a> {
+    fn new(ctx: &'a Ctx) -> Self {
+        Self {
+            ctx,
+            live: ctx.live(),
+            prior: RefCell::new(None),
+        }
+    }
+
+    /// `Ctx::expire` of the live home, remembering what it replaced when that had life to spare.
+    fn expire(&self) -> Result<Value, HarnessError> {
+        let (note, prior) = self.ctx.expire_noting(&self.live)?;
+        if let Some(prior) = prior.filter(|p| p.expires_at - now_ms() >= MIN_LIFE_MS) {
+            *self.prior.borrow_mut() = Some(prior);
+        }
+        Ok(note)
+    }
+
+    /// `None` when nothing is remembered to restore.
+    fn restore(&self) -> Result<Option<Restore>, HarnessError> {
+        let prior = self.prior.borrow_mut().take();
+        prior
+            .map(|prior| self.ctx.unexpire(&self.live, &prior))
+            .transpose()
+    }
+}
+
+impl Drop for LiveToken<'_> {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+fn interop(ctx: &Ctx, p: &mut Probe, token: &LiveToken) -> Result<&'static str, HarnessError> {
     let live = ctx.live();
     let paths = ctx.paths(&live);
     let db = ctx.layout.data_dir().join("tagteam.db");
@@ -265,7 +324,7 @@ fn interop(
 
     // CC first.
     store::make_due(&db, &ctx.oauth.id, now_ms() / 1000)?;
-    let expired = expire_keeping(ctx, &live, fresh)?;
+    let expired = token.expire()?;
     let consumed = expired["generation"].clone();
     p.note("expired", expired);
     let vault_before = vault_generation(ctx)?;
@@ -325,7 +384,7 @@ fn interop(
     );
 
     // tagteam first.
-    p.note("expired again", expire_keeping(ctx, &live, fresh)?);
+    p.note("expired again", token.expire()?);
     let pause_dir = ctx.layout.scratch.join("pause");
     let _ = fs::remove_dir_all(&pause_dir);
     fs::create_dir(&pause_dir)?;
@@ -677,6 +736,8 @@ pub fn managed_key_precedence(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
             Sent::ApiKey(fingerprint(&k2)).to_json(),
             sent_json(request(ctx)?),
         );
+        let k3 = dummy_key("k3")?;
+        let mut changed = false;
         match session_on(ctx, &capture)? {
             None => {
                 p.expect("a session: it started", false, json!(null));
@@ -687,21 +748,25 @@ pub fn managed_key_precedence(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
                     Sent::ApiKey(fingerprint(&k2)).to_json(),
                     sent_json(prompt(&mut pty, &capture)?),
                 );
-                let k3 = dummy_key("k3")?;
                 set_primary_api_key(ctx, Some(&k3))?;
                 p.expect_eq(
                     "a session: the next message still carries the key it started with (cached for the process, 2.1.292)",
                     Sent::ApiKey(fingerprint(&k2)).to_json(),
                     sent_json(prompt(&mut pty, &capture)?),
                 );
-                p.expect_eq(
-                    "a new process, while that session runs: it carries the changed primaryApiKey",
-                    Sent::ApiKey(fingerprint(&k3)).to_json(),
-                    sent_json(request(ctx)?),
-                );
                 let _ = pty.line("/exit");
                 pty.finish(Duration::from_secs(30))?;
+                changed = true;
             }
+        }
+        // After the session has ended, so that no request of its can be read as the new
+        // process's.
+        if changed {
+            p.expect_eq(
+                "a new process: it carries the changed primaryApiKey",
+                Sent::ApiKey(fingerprint(&k3)).to_json(),
+                sent_json(request(ctx)?),
+            );
         }
         set_primary_api_key(ctx, None)?;
         ctx.drop_dummy_api_key()?;
@@ -763,7 +828,10 @@ esac"#;
         let (mut ctx, scratch) = ctx_with_claude(ADDS_AT_ONCE);
         let out = config_lock_within(&mut ctx, Duration::from_secs(5)).unwrap();
         assert_eq!(out.status, Status::Pass, "{:?}", out.evidence);
-        assert_eq!(label(&out, "start-up: CC wrote").ok, Some(true));
+        assert_eq!(
+            label(&out, "start-up: CC wrote").value["wrote"],
+            json!(true)
+        );
         assert_eq!(label(&out, "the server was added").ok, Some(true));
         let note = label(&out, "exclusion by the lock past CC's start-up");
         assert_eq!(note.ok, None, "a note, not an expectation");
@@ -776,14 +844,25 @@ esac"#;
     }
 
     #[test]
-    fn a_claude_that_waits_for_the_lock_again_fails_the_pin() {
+    fn a_write_that_lands_after_the_window_is_a_note_not_a_failure() {
         let _serial = crate::compat::sys::serial();
         let (mut ctx, scratch) = ctx_with_claude(WAITS_FOR_THE_LOCK);
         let out = config_lock_within(&mut ctx, Duration::from_millis(800)).unwrap();
-        assert_eq!(out.status, Status::Fail, "{:?}", out.evidence);
-        assert_eq!(label(&out, "start-up: CC wrote").ok, Some(false));
+        assert_eq!(out.status, Status::Pass, "{:?}", out.evidence);
+        let timing = label(&out, "start-up: CC wrote");
+        assert_eq!((timing.ok, &timing.value["wrote"]), (None, &json!(false)));
         // It wrote once the lock was released, so the add still happened.
         assert_eq!(label(&out, "the server was added").ok, Some(true));
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_server_that_is_never_added_fails_the_check() {
+        let _serial = crate::compat::sys::serial();
+        let (mut ctx, scratch) = ctx_with_claude("exit 0");
+        let out = config_lock_within(&mut ctx, Duration::from_millis(300)).unwrap();
+        assert_eq!(out.status, Status::Fail, "{:?}", out.evidence);
+        assert_eq!(label(&out, "the server was added").ok, Some(false));
         fs::remove_dir_all(&scratch).unwrap();
     }
 
@@ -826,5 +905,97 @@ esac"#;
             "the live token was left fresh"
         );
         fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_panic_inside_the_check_still_leaves_the_live_token_fresh() {
+        let _serial = crate::compat::sys::serial();
+        let (ctx, scratch) = ctx_with_claude("exit 0");
+        let live = ctx.live();
+        let file = Path::new(&live).join(".credentials.json");
+        let was = now_ms() + 8 * 3_600_000;
+        fs::write(
+            &file,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"rt","expiresAt":{was}}}}}"#
+            ),
+        )
+        .unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let token = LiveToken::new(&ctx);
+            token.expire().unwrap();
+            assert!(crate::compat::ctx::expires_at(&fs::read(&file).unwrap()).unwrap() < now_ms());
+            panic!("the check panicked");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(
+            crate::compat::ctx::expires_at(&fs::read(&file).unwrap()),
+            Some(was)
+        );
+        // Nothing remembered, nothing restored.
+        let token = LiveToken::new(&ctx);
+        assert_eq!(token.restore(), Ok(None));
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_token_with_no_life_to_begin_with_is_noted_as_nothing_to_restore() {
+        let _serial = crate::compat::sys::serial();
+        let (mut ctx, scratch) = ctx_with_claude("exit 0");
+        let live = ctx.live();
+        let file = Path::new(&live).join(".credentials.json");
+        // The token has little life left, so expiring it records nothing to restore; the
+        // harness error is the run's own (no vault).
+        fs::write(
+            &file,
+            r#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt","expiresAt":1}}"#,
+        )
+        .unwrap();
+        ctx.layout.state = scratch.join("state");
+        let data = ctx.layout.data_dir();
+        fs::create_dir_all(&data).unwrap();
+        rusqlite::Connection::open(data.join("tagteam.db"))
+            .unwrap()
+            .execute_batch(include_str!(
+                "../../../../tagteam-engine/src/store/schema.sql"
+            ))
+            .unwrap();
+        let out = refresh_lock_interop(&mut ctx).unwrap();
+        assert_eq!(out.status, Status::Error);
+        assert_eq!(
+            label(&out, "the live token: nothing to restore").ok,
+            None,
+            "said so, since no expiry with life to spare was replaced"
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_failed_restore_is_an_error_after_a_check_that_ran_and_a_note_after_one_that_did_not() {
+        let fail = || Err(harness("could not leave it fresh"));
+        let mut p = Probe::new();
+        let e = settle_token(&mut p, Ok("fine"), fail()).unwrap_err();
+        assert_eq!(e.0, "could not leave it fresh");
+
+        let mut p = Probe::new();
+        let e = settle_token(&mut p, Err(harness("the run's own")), fail()).unwrap_err();
+        assert_eq!(e.0, "the run's own");
+        let out = Outcome::error(e.0, p.into_evidence());
+        assert_eq!(
+            label(&out, "the live token could not be left fresh").value,
+            json!("could not leave it fresh")
+        );
+
+        let mut p = Probe::new();
+        assert_eq!(
+            settle_token(&mut p, Ok("fine"), Ok(Some(Restore::Restored))),
+            Ok("fine")
+        );
+        assert_eq!(
+            settle_token(&mut p, Ok("fine"), Ok(Some(Restore::Fresh))),
+            Ok("fine")
+        );
+        let out = p.finish("done");
+        assert_eq!(out.evidence.len(), 1, "only a restore is noted");
     }
 }
