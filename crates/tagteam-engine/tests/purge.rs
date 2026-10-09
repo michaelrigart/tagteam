@@ -1795,3 +1795,72 @@ fn a_live_credential_reached_through_a_link_inside_a_profile_is_never_deleted_by
     assert!(dir.join(".tagteam-profile.json").exists());
     assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
 }
+
+/// The live credential file is a link to `<sessions/<name>>/.credentials.json`, where
+/// `sessions/<name>` is itself a link to a directory outside the data directory that holds the
+/// file. Unlinking `sessions/<name>` leaves the live path dangling. Returns the fixture, the
+/// `sessions/<name>` link, the live link and the outside file.
+fn live_login_through_a_profile_link(name: &str) -> (Fx, PathBuf, PathBuf, PathBuf) {
+    let fx = Fx::with(Platform::Linux, |_| {});
+    let outside = fx.dir.path().join("ext");
+    fs::create_dir_all(&outside).unwrap();
+    let target = outside.join(".credentials.json");
+    fs::write(&target, b"the live login").unwrap();
+    let sessions = fx.env.data_dir().join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let entry = sessions.join(name);
+    std::os::unix::fs::symlink(&outside, &entry).unwrap();
+    let live = fx.paths().credentials_file;
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(entry.join(".credentials.json"), &live).unwrap();
+    (fx, entry, live, target)
+}
+
+#[test]
+fn a_stored_profile_link_a_live_credential_goes_through_is_never_unlinked_by_purge() {
+    // Codex slice 3 re-review 3 (§10.5): the link is the profile entry, and the live path
+    // resolves through it.
+    let (fx, entry, live, target) = live_login_through_a_profile_link("0192-link-profile");
+    let id = add(
+        &fx.engine.store().unwrap(),
+        &fx.provider(),
+        "0192-link-profile",
+        "a@x.co",
+        1,
+    );
+    fx.put_vault(&id, b"a vault credential");
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert!(fs::symlink_metadata(&entry).is_ok(), "the link stays");
+    assert_eq!(
+        fs::read(&live).unwrap(),
+        b"the live login",
+        "the live path resolves"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"the live login");
+    assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
+}
+
+#[test]
+fn an_orphan_link_a_live_credential_goes_through_is_left_and_reported() {
+    let (fx, entry, live, _target) = live_login_through_a_profile_link("orphan-link");
+
+    let report = fx.engine.purge(&full_plan(&fx)).unwrap();
+
+    assert!(fs::symlink_metadata(&entry).is_ok(), "the link is left");
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    let failure = report
+        .failures
+        .iter()
+        .find(|(what, _)| what.contains("orphan-link"))
+        .unwrap_or_else(|| panic!("{:?}", report.failures));
+    assert!(
+        failure.1.contains("live login's files are inside"),
+        "{failure:?}"
+    );
+}

@@ -530,3 +530,45 @@ fn remove_of_a_profile_a_live_credential_is_bridged_through_refuses_with_nothing
     assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
     assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
 }
+
+#[test]
+fn remove_of_a_profile_link_a_live_credential_goes_through_refuses_with_nothing_deleted() {
+    let id = AccountId::from_string("0192-link-profile");
+    let fx = Fx::with(tagteam_cc::live::Platform::Linux, |_| {});
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_account(&NewAccount {
+            id: &id,
+            provider: &ProviderId::new("claude-code"),
+            position: 1,
+            identity_key: "a@x.co\n",
+            identity: &fx.cc.token_identity("a@x.co"),
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 0,
+        })
+        .unwrap();
+    fx.put_vault(&id, b"a vault credential");
+    let outside = fx.dir.path().join("ext");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join(".credentials.json"), b"the live login").unwrap();
+    let entry = fx.profile_dir(&id);
+    fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &entry).unwrap();
+    let live = fx.paths().credentials_file;
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(entry.join(".credentials.json"), &live).unwrap();
+
+    let err = fx.engine.remove(&id).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert!(fs::symlink_metadata(&entry).is_ok(), "the link stays");
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}

@@ -402,11 +402,11 @@ impl Engine {
         providers: &[ProviderId],
     ) -> Result<(), EngineError> {
         let profile = profile_path(&self.env, &row.id);
-        if !fs::symlink_metadata(&profile).is_ok_and(|m| m.is_dir()) {
+        if fs::symlink_metadata(&profile).is_err() {
             return Ok(());
         }
         for p in self.judges(&profile, providers) {
-            self.refuse_live_files_inside(p.as_ref(), &profile)?;
+            self.refuse_live_files_at(p.as_ref(), &profile)?;
         }
         Ok(())
     }
@@ -654,6 +654,10 @@ impl Engine {
         // not one, so no Keychain item is named through it, by its marker or by the path it
         // leads to: the link goes, and what it led to stays as it is.
         if meta.file_type().is_symlink() {
+            // The link goes at its own location, and the live login may go through it.
+            for p in self.judges(profile, providers) {
+                self.refuse_live_files_at(p.as_ref(), profile)?;
+            }
             fs::remove_file(profile)?;
             tracing::warn!(
                 "{} is a link, not a profile directory; the link was removed and no Keychain item was deleted through it",
@@ -708,10 +712,8 @@ impl Engine {
         }
         // Nor is the live login's files' path inside the directory, whatever spelling its items
         // go by (§10.5): checked before any item or the directory goes.
-        if meta.is_dir() {
-            for p in self.judges(profile, providers) {
-                self.refuse_live_files_inside(p.as_ref(), profile)?;
-            }
+        for p in self.judges(profile, providers) {
+            self.refuse_live_files_at(p.as_ref(), profile)?;
         }
         for (p, spelling) in &items {
             p.delete_profile_credential(&self.env, profile, spelling)?;

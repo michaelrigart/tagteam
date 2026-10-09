@@ -408,30 +408,46 @@ impl Engine {
 
     /// §10.5 "never deletes or replaces a provider's live login", by path and apart from any
     /// Keychain spelling: refuses when a file `p` keeps its live login in (its identity
-    /// surface's credential files and JSON files) lies inside the directory `dir`, which is
-    /// about to be deleted. The environment can name a profile's directory in a spelling that
-    /// differs from the marker's (a trailing `/.`), so the spellings compare unequal while the
-    /// login sits in the profile. Each file's path is walked as the kernel resolves it
-    /// (`trace_path`), and refuses if anything it touches lies inside `dir`, by component: a
-    /// link entry inside the profile that the path passes through, a directory inside it, or the
-    /// final target. A parent that
-    /// does not exist holds nothing; any other failure to resolve refuses, as the stored-profile
-    /// guard does. The refusal names no path.
-    pub(crate) fn refuse_live_files_inside(
+    /// surface's credential files and JSON files) would be broken by deleting `entry`, a profile
+    /// or orphan entry of `sessions/`. The environment can name a profile's directory in a
+    /// spelling that differs from the marker's (a trailing `/.`), so the spellings compare
+    /// unequal while the login sits in the profile. Each file's path is walked as the kernel
+    /// resolves it (`trace_path`), and refuses if anything it touches equals or lies under the
+    /// entry's own location (its parent resolved, the entry itself not followed: a link is
+    /// deleted exactly there), or, for a directory, its canonical path. That is a link entry the
+    /// path passes through, a directory inside the profile, or the final target. A missing
+    /// entry or parent holds nothing; any other failure to resolve refuses, as the
+    /// stored-profile guard does. The refusal names no path.
+    pub(crate) fn refuse_live_files_at(
         &self,
         p: &dyn Provider,
-        dir: &Path,
+        entry: &Path,
     ) -> Result<(), EngineError> {
         let unresolved = || {
             EngineError::Io(io::Error::other(
-                "a path the live login lives at could not be resolved, so it cannot be told whether it is inside this profile directory; nothing was deleted (tagteam never deletes the live login)",
+                "a path the live login lives at could not be resolved, so it cannot be told whether deleting this profile entry would break it; nothing was deleted (tagteam never deletes the live login)",
             ))
         };
-        let dir = match fs::canonicalize(dir) {
-            Ok(dir) => dir,
+        let (Some(parent), Some(name)) = (entry.parent(), entry.file_name()) else {
+            return Err(unresolved());
+        };
+        let location = match fs::canonicalize(parent) {
+            Ok(parent) => parent.join(name),
             Err(e) if absent(&e) => return Ok(()),
             Err(_) => return Err(unresolved()),
         };
+        let mut doomed = vec![location.clone()];
+        match fs::symlink_metadata(&location) {
+            Ok(meta) if meta.file_type().is_symlink() => {}
+            Ok(_) => match fs::canonicalize(&location) {
+                Ok(canonical) if canonical != location => doomed.push(canonical),
+                Ok(_) => {}
+                Err(e) if absent(&e) => return Ok(()),
+                Err(_) => return Err(unresolved()),
+            },
+            Err(e) if absent(&e) => return Ok(()),
+            Err(_) => return Err(unresolved()),
+        }
         let surface = p.identity_surface(&self.env);
         let files = surface
             .credential_files
@@ -439,7 +455,10 @@ impl Engine {
             .chain(surface.json_keys.into_iter().map(|(file, _)| file));
         for file in files {
             let touched = trace_path(&file).map_err(|_| unresolved())?;
-            if touched.iter().any(|path| path.starts_with(&dir)) {
+            if touched
+                .iter()
+                .any(|path| doomed.iter().any(|gone| path.starts_with(gone)))
+            {
                 tracing::warn!(
                     "the live login's files are inside a profile directory; nothing was deleted"
                 );
@@ -461,13 +480,14 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let profile = profile_path(&self.env, &row.id);
         let meta = match fs::symlink_metadata(&profile) {
-            Ok(meta) if meta.file_type().is_symlink() => return Ok(()),
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        if meta.is_dir() {
-            self.refuse_live_files_inside(p, &profile)?;
+        // A link is deleted at its own location, and the live login may go through it.
+        self.refuse_live_files_at(p, &profile)?;
+        if meta.file_type().is_symlink() {
+            return Ok(());
         }
         match self.profile_item(p, row, &profile).spelling() {
             Some(spelling) => self.refuse_live_item(p, row, spelling),
@@ -504,6 +524,8 @@ impl Engine {
         // §10.5 step 6: a session profile is a directory under `sessions/`. A link there is not
         // one, so no Keychain item is named through it, by its marker or by the path it leads
         // to: the link goes, and what it led to stays as it is.
+        // Before any deletion, the link's included: the live login may go through it.
+        self.refuse_live_files_at(p, &profile)?;
         if meta.file_type().is_symlink() {
             tracing::warn!(
                 position = row.position,
@@ -512,9 +534,6 @@ impl Engine {
             );
             fs::remove_file(&profile)?;
             return Ok(());
-        }
-        if meta.is_dir() {
-            self.refuse_live_files_inside(p, &profile)?;
         }
         let item = self.profile_item(p, row, &profile);
         // `why` is a fixed phrase (§14.2): a marker's read error names its path, under a data
