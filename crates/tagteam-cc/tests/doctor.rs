@@ -399,6 +399,31 @@ fn a_lock_directory_past_its_staleness_warns_and_a_fresh_one_does_not() {
 }
 
 #[test]
+fn a_stale_storage_write_lock_of_either_spelling_warns() {
+    for pick in [
+        (|p: &CcPaths| p.storage_write_lock.clone()) as fn(&CcPaths) -> std::path::PathBuf,
+        |p: &CcPaths| p.storage_write_lock_v2.clone(),
+    ] {
+        let f = fx();
+        let dir = pick(&CcPaths::resolve(&f.env));
+        fs::create_dir(&dir).unwrap();
+        fs::File::open(&dir)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(120))
+            .unwrap();
+        let checks = f.checks();
+        let c = one(&checks, "cc.locks");
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(
+            c.message.contains(&dir.display().to_string()),
+            "{}",
+            c.message
+        );
+        assert!(dir.exists(), "doctor removes nothing");
+    }
+}
+
+#[test]
 fn linux_has_no_keychain_checks() {
     let f = fx_on(Platform::Linux);
     let checks = f.checks();

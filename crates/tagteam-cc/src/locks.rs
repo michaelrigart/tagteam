@@ -88,23 +88,51 @@ pub fn acquire_config(
     })
 }
 
-/// CC's storage-write lock (§9.1), waited for up to `timeout` under `cancel` (§14.1). It is a
-/// leaf: a caller takes it only while holding the credential locks, holds it around one
-/// credential entry's write, and takes no other lock while it is held. Dropping the guard
-/// releases it.
+/// CC's storage-write lock (§9.1): the pair of lock directories, `.storage-write` (recorded
+/// against 2.1.286) and `.storage-write.lock` (CC 2.1.292). Fields drop in declaration order,
+/// so the second is released first and the first last: the reverse of the order taken.
+pub struct CcStorageWrite {
+    v2: MkdirLock,
+    v1: MkdirLock,
+}
+
+impl CcStorageWrite {
+    /// Whether both directories are still this holder's (§9.1).
+    pub fn check_owned(&self) -> Result<(), LockError> {
+        self.v1.check_owned()?;
+        self.v2.check_owned()
+    }
+}
+
+/// CC's storage-write lock (§9.1), waited for up to `timeout` under `cancel` (§14.1): the
+/// `.storage-write` directory, then the `.storage-write.lock` one, the two sharing one deadline.
+/// A wait on either is a cancellation point; a timeout or an interruption on the second releases
+/// the first. It is a leaf: a caller takes it only while holding the credential locks, holds it
+/// around one credential entry's write, and takes no other lock while it is held. Dropping the
+/// guard releases both.
 pub fn acquire_storage_write(
     paths: &CcPaths,
     timeout: Duration,
     cancel: &Cancel,
-) -> Result<MkdirLock, LockError> {
-    MkdirLock::acquire(
+) -> Result<CcStorageWrite, LockError> {
+    let deadline = Instant::now() + timeout;
+    let v1 = MkdirLock::acquire(
         &MkdirLockSpec::new(
             paths.storage_write_lock.clone(),
             STORAGE_WRITE_STALE,
             timeout,
         )
         .with_cancel(cancel),
-    )
+    )?;
+    let v2 = MkdirLock::acquire(
+        &MkdirLockSpec::new(
+            paths.storage_write_lock_v2.clone(),
+            STORAGE_WRITE_STALE,
+            deadline.saturating_duration_since(Instant::now()),
+        )
+        .with_cancel(cancel),
+    )?;
+    Ok(CcStorageWrite { v2, v1 })
 }
 
 #[cfg(test)]
@@ -343,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn the_storage_write_lock_is_taken_alone_and_released_on_drop() {
+    fn the_storage_write_lock_is_the_pair_taken_alone_and_released_on_drop() {
         // §9.1: a leaf, anchored at the secure-storage dir; taking it takes no other lock.
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
@@ -351,54 +379,109 @@ mod tests {
             p.storage_write_lock,
             p.secure_storage_dir.join(".storage-write")
         );
+        assert_eq!(
+            p.storage_write_lock_v2,
+            p.secure_storage_dir.join(".storage-write.lock")
+        );
         let lock = acquire_storage_write(&p, ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
-        assert!(p.storage_write_lock.is_dir());
+        assert!(p.storage_write_lock.is_dir() && p.storage_write_lock_v2.is_dir());
         assert!(lock.check_owned().is_ok());
         assert!(!p.refresh_lock.exists() && !p.legacy_lock().exists() && !p.config_lock.exists());
         drop(lock);
-        assert!(!p.storage_write_lock.exists(), "Drop removes it");
+        assert!(
+            !p.storage_write_lock.exists() && !p.storage_write_lock_v2.exists(),
+            "Drop removes both"
+        );
     }
 
     #[test]
-    fn a_held_storage_write_lock_times_out_without_touching_it() {
+    fn the_storage_write_pair_is_taken_in_order_and_released_in_reverse() {
+        // `.storage-write` first, `.storage-write.lock` second; a lock held on the second
+        // leaves the first taken only while the wait lasts, and released on the timeout.
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
-        fs::create_dir(&p.storage_write_lock).unwrap(); // CC holds it, freshly
-        let start = Instant::now();
-        match acquire_storage_write(&p, Duration::from_millis(500), &Cancel::new()) {
-            Err(LockError::Timeout(path)) => assert_eq!(path, p.storage_write_lock),
-            other => panic!("expected a timeout, got {:?}", other.err()),
+        fs::create_dir(&p.storage_write_lock_v2).unwrap(); // CC 2.1.292 holds its spelling
+        let seen = std::sync::Mutex::new(Vec::new());
+        thread::scope(|s| {
+            s.spawn(|| {
+                let end = Instant::now() + Duration::from_millis(400);
+                while Instant::now() < end {
+                    seen.lock().unwrap().push(p.storage_write_lock.is_dir());
+                    thread::sleep(Duration::from_millis(20));
+                }
+            });
+            match acquire_storage_write(&p, Duration::from_millis(500), &Cancel::new()) {
+                Err(LockError::Timeout(path)) => assert_eq!(path, p.storage_write_lock_v2),
+                other => panic!("expected a timeout on the second, got {:?}", other.err()),
+            }
+        });
+        assert!(
+            seen.lock().unwrap().iter().any(|held| *held),
+            "the first is taken before the second is waited for"
+        );
+        assert!(
+            !p.storage_write_lock.exists(),
+            "a timeout on the second releases the first"
+        );
+        assert!(p.storage_write_lock_v2.is_dir(), "CC's lock is left alone");
+    }
+
+    #[test]
+    fn a_held_storage_write_lock_of_either_spelling_times_out_without_touching_it() {
+        for first in [true, false] {
+            let d = tempfile::tempdir().unwrap();
+            let p = paths(d.path());
+            let (cc, ours) = if first {
+                (&p.storage_write_lock, &p.storage_write_lock_v2)
+            } else {
+                (&p.storage_write_lock_v2, &p.storage_write_lock)
+            };
+            fs::create_dir(cc).unwrap(); // CC holds it, freshly
+            let start = Instant::now();
+            match acquire_storage_write(&p, Duration::from_millis(500), &Cancel::new()) {
+                Err(LockError::Timeout(path)) => assert_eq!(&path, cc),
+                res => panic!("expected a timeout, got {:?}", res.err()),
+            }
+            assert!(start.elapsed() >= Duration::from_millis(500));
+            assert!(cc.is_dir(), "CC's lock is left alone");
+            assert!(!ours.exists(), "nothing of tagteam's is left behind");
         }
-        assert!(start.elapsed() >= Duration::from_millis(500));
-        assert!(p.storage_write_lock.is_dir(), "CC's lock is left alone");
     }
 
     #[test]
     fn a_storage_write_lock_is_stale_after_15_s() {
-        // Appendix A.1: `proper-lockfile` with stale 15 s, as CC takes it.
-        let d = tempfile::tempdir().unwrap();
-        let p = paths(d.path());
-        fs::create_dir(&p.storage_write_lock).unwrap();
-        let aged = |secs| {
-            fs::File::open(&p.storage_write_lock)
-                .unwrap()
-                .set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
-                .unwrap()
-        };
-        aged(13);
-        assert!(matches!(
-            acquire_storage_write(&p, Duration::from_millis(300), &Cancel::new()),
-            Err(LockError::Timeout(_))
-        ));
-        aged(16);
-        let lock = acquire_storage_write(&p, Duration::from_millis(300), &Cancel::new()).unwrap();
-        assert!(lock.check_owned().is_ok(), "the stale lock is taken over");
+        // Appendix A.1: `proper-lockfile` with stale 15 s, as CC takes it, either spelling.
+        for second in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let p = paths(d.path());
+            let dir = if second {
+                &p.storage_write_lock_v2
+            } else {
+                &p.storage_write_lock
+            };
+            fs::create_dir(dir).unwrap();
+            let aged = |secs| {
+                fs::File::open(dir)
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(secs))
+                    .unwrap()
+            };
+            aged(13);
+            assert!(matches!(
+                acquire_storage_write(&p, Duration::from_millis(300), &Cancel::new()),
+                Err(LockError::Timeout(_))
+            ));
+            aged(16);
+            let lock =
+                acquire_storage_write(&p, Duration::from_millis(300), &Cancel::new()).unwrap();
+            assert!(lock.check_owned().is_ok(), "the stale lock is taken over");
+        }
     }
 
     #[test]
     fn a_signal_ends_the_storage_write_wait_and_a_set_token_takes_nothing() {
-        // §9.1: its wait is a cancellation point (§14.1); a set token makes no attempt
-        // (Decision 3).
+        // §9.1: its wait is a cancellation point on either lock (§14.1); a set token makes no
+        // attempt (Decision 3).
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
         let cancel = Cancel::new();
@@ -412,10 +495,22 @@ mod tests {
             }
             other => panic!("expected an interrupted wait, got {:?}", other.err()),
         }
-        assert!(!p.storage_write_lock.exists(), "no attempt was made");
+        assert!(
+            !p.storage_write_lock.exists() && !p.storage_write_lock_v2.exists(),
+            "no attempt was made"
+        );
         fs::create_dir(&p.storage_write_lock).unwrap(); // CC holds it, freshly
         let named = interrupted(|c| acquire_storage_write(&p, Duration::from_secs(30), c));
         assert_eq!(named, p.storage_write_lock);
         assert!(p.storage_write_lock.is_dir(), "CC's lock is left alone");
+        fs::remove_dir(&p.storage_write_lock).unwrap();
+        fs::create_dir(&p.storage_write_lock_v2).unwrap(); // CC 2.1.292 holds its spelling
+        let named = interrupted(|c| acquire_storage_write(&p, Duration::from_secs(30), c));
+        assert_eq!(named, p.storage_write_lock_v2);
+        assert!(p.storage_write_lock_v2.is_dir(), "CC's lock is left alone");
+        assert!(
+            !p.storage_write_lock.exists(),
+            "an interruption on the second releases the first"
+        );
     }
 }

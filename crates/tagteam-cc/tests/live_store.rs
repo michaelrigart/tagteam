@@ -1479,18 +1479,21 @@ fn a_symlinked_credentials_file_stays_a_symlink_with_its_target_at_0600() {
 // --- CC's storage-write lock (§9.1) ----------------------------------------------
 
 /// Wraps a `FakeKeychain` and records, at every `upsert`/`delete`, the item and whether CC's
-/// storage-write lock was held at that moment (§9.1).
+/// storage-write lock, both spellings of it (`.storage-write` and `.storage-write.lock`), was
+/// held at that moment (§9.1).
 struct LockProbeKeychain {
     inner: Arc<FakeKeychain>,
     lock: PathBuf,
+    lock_v2: PathBuf,
     writes: Mutex<Vec<(String, bool)>>,
 }
 
 impl LockProbeKeychain {
-    fn new(inner: Arc<FakeKeychain>, lock: PathBuf) -> Self {
+    fn new(inner: Arc<FakeKeychain>, lock: PathBuf, lock_v2: PathBuf) -> Self {
         Self {
             inner,
             lock,
+            lock_v2,
             writes: Mutex::new(Vec::new()),
         }
     }
@@ -1500,7 +1503,7 @@ impl LockProbeKeychain {
     }
 
     fn record(&self, s: &str) {
-        let held = self.lock.is_dir();
+        let held = self.lock.is_dir() && self.lock_v2.is_dir();
         self.writes.lock().unwrap().push((s.to_owned(), held));
     }
 }
@@ -1603,14 +1606,24 @@ fn every_credential_entry_write_holds_the_storage_write_lock_and_releases_it() {
     // included, and releases it when the write returns.
     let f = explicit_default();
     let lock = f.paths.storage_write_lock.clone();
-    let probe = Arc::new(LockProbeKeychain::new(f.kc.clone(), lock.clone()));
+    let lock_v2 = f.paths.storage_write_lock_v2.clone();
+    let probe = Arc::new(LockProbeKeychain::new(
+        f.kc.clone(),
+        lock.clone(),
+        lock_v2.clone(),
+    ));
     let s = LiveStore::new(probe.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
     let (svc, acct) = oauth_svc(&f);
     f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
     fs::write(&f.paths.credentials_file, cc_login("rt-0", "m0")).unwrap();
     fs::write(&f.paths.global_config, "{}").unwrap();
     let snap = s.snapshot(&f.env, &f.paths).unwrap();
-    let released = |what: &str| assert!(!lock.exists(), "{what} left the lock behind");
+    let released = |what: &str| {
+        assert!(
+            !lock.exists() && !lock_v2.exists(),
+            "{what} left the lock behind"
+        )
+    };
 
     s.write_credential_entry(
         &f.env,
@@ -1624,7 +1637,7 @@ fn every_credential_entry_write_holds_the_storage_write_lock_and_releases_it() {
     f.kc.set_fail_write(&svc, true);
     let mut reported_under_the_lock = Vec::new();
     let mut report = |_: &[u8]| {
-        reported_under_the_lock.push(lock.is_dir());
+        reported_under_the_lock.push(lock.is_dir() && lock_v2.is_dir());
         Ok(())
     };
     s.write_credential_entry(
@@ -1870,6 +1883,85 @@ fn a_write_waits_for_cc_and_keeps_the_machine_shared_keys_cc_wrote_meanwhile() {
         "the target's login, with the MCP token CC wrote meanwhile"
     );
     assert!(!f.paths.storage_write_lock.exists());
+}
+
+#[test]
+fn a_write_waits_for_cc_2_1_292_s_storage_write_dot_lock_and_holds_both_spellings() {
+    // §9.1: CC 2.1.292 holds `.storage-write.lock`; tagteam waits for it, and while it writes
+    // holds `.storage-write` first and `.storage-write.lock` second, then releases both.
+    let f = fx();
+    let s = store(&f, Platform::MacOs);
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    s.snapshot(&f.env, &f.paths).unwrap();
+    let (kc, cc_svc, cc_acct) = (f.kc.clone(), svc.clone(), acct.clone());
+    let cc = cc_writes_under_the_lock(&f.paths.storage_write_lock_v2, move || {
+        kc.put(&cc_svc, &cc_acct, &cc_login("rt-0", "m1"))
+    });
+    let seen = Mutex::new(Vec::new());
+    let (a, b) = (
+        f.paths.storage_write_lock.clone(),
+        f.paths.storage_write_lock_v2.clone(),
+    );
+    let probe = || {
+        seen.lock().unwrap().push(a.is_dir() && b.is_dir());
+        Ok(())
+    };
+
+    s.write_credential_entry(
+        &f.env,
+        &f.paths,
+        &cc_login("rt-1", "m0"),
+        &probe,
+        &mut save_nothing,
+    )
+    .unwrap();
+    let ended = Instant::now();
+    let released = cc.join().unwrap();
+
+    assert!(ended > released, "the write waited for CC's lock");
+    assert_eq!(
+        json_of(&f.kc.get(&svc, &acct).unwrap()),
+        json_of(&cc_login("rt-1", "m1")),
+        "the target's login, with the MCP token CC wrote meanwhile"
+    );
+    let held = seen.lock().unwrap().clone();
+    assert!(
+        !held.is_empty() && held.iter().all(|h| *h),
+        "both held at every write: {held:?}"
+    );
+    assert!(!a.exists() && !b.exists(), "both released");
+}
+
+#[test]
+fn a_held_storage_write_dot_lock_makes_an_entry_write_wait_then_time_out() {
+    let f = fx();
+    let s = store(&f, Platform::MacOs).with_storage_write_timeout(Duration::from_millis(300));
+    let (svc, acct) = oauth_svc(&f);
+    f.kc.put(&svc, &acct, &cc_login("rt-0", "m0"));
+    fs::write(&f.paths.global_config, "{}").unwrap();
+    let items = f.kc.items();
+    fs::create_dir(&f.paths.storage_write_lock_v2).unwrap(); // CC 2.1.292 holds it, freshly
+
+    times_out(&f.paths.storage_write_lock_v2, "an OAuth write", || {
+        s.write_credential_entry(
+            &f.env,
+            &f.paths,
+            &cc_login("rt-2", "m0"),
+            &open,
+            &mut save_nothing,
+        )
+    });
+
+    assert_eq!(f.kc.items(), items, "no Keychain item was written");
+    assert!(
+        !f.paths.storage_write_lock.exists(),
+        "the timeout released the first spelling"
+    );
+    assert!(
+        f.paths.storage_write_lock_v2.is_dir(),
+        "CC's lock is left alone"
+    );
 }
 
 #[test]

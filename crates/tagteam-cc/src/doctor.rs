@@ -585,11 +585,12 @@ fn auth(
 fn locks(paths: &CcPaths, out: &mut Vec<Check>) {
     let before = out.len();
     let now = SystemTime::now();
-    let dirs: [(PathBuf, Duration); 4] = [
+    let dirs: [(PathBuf, Duration); 5] = [
         (paths.refresh_lock.clone(), CRED_STALE),
         (paths.legacy_lock(), CRED_STALE),
         (paths.config_lock.clone(), CONFIG_STALE),
         (paths.storage_write_lock.clone(), STORAGE_WRITE_STALE),
+        (paths.storage_write_lock_v2.clone(), STORAGE_WRITE_STALE),
     ];
     for (dir, stale) in dirs {
         let untold = |e: std::io::Error| {

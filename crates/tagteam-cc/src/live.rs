@@ -10,12 +10,12 @@ use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
 };
 use tagteam_provider::{
-    BeforeFallback, Cancel, Credential, DoomedEntry, Env, Keychain, LiveLockSet, MkdirLock,
-    ProviderError, Read, SecretStore,
+    BeforeFallback, Cancel, Credential, DoomedEntry, Env, Keychain, LiveLockSet, ProviderError,
+    Read, SecretStore,
 };
 
 use crate::config::{self, read_bytes};
-use crate::locks;
+use crate::locks::{self, CcStorageWrite};
 use crate::naming::{ItemKind, keychain_account, keychain_service};
 use crate::paths::CcPaths;
 use crate::provider::CONFIG_REMEDY;
@@ -283,7 +283,10 @@ fn is_real_dir(path: &Path) -> bool {
 
 /// `fence`, then the storage-write lock's own ownership check: the check that runs immediately
 /// before every write the lock protects (§9.1).
-fn held<'a>(fence: Fence<'a>, lock: &'a MkdirLock) -> impl Fn() -> Result<(), ProviderError> + 'a {
+fn held<'a>(
+    fence: Fence<'a>,
+    lock: &'a CcStorageWrite,
+) -> impl Fn() -> Result<(), ProviderError> + 'a {
     move || {
         fence()?;
         Ok(lock.check_owned()?)
@@ -406,7 +409,11 @@ impl LiveStore {
     }
 
     /// CC's storage-write lock, for one entry's write (§9.1), waited for under `cancel`.
-    fn storage_write(&self, paths: &CcPaths, cancel: &Cancel) -> Result<MkdirLock, ProviderError> {
+    fn storage_write(
+        &self,
+        paths: &CcPaths,
+        cancel: &Cancel,
+    ) -> Result<CcStorageWrite, ProviderError> {
         Ok(locks::acquire_storage_write(
             paths,
             self.storage_write_timeout,
