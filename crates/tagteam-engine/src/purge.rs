@@ -160,6 +160,9 @@ fn account_of(row: &AccountRow, has_profile: bool) -> PurgeAccount {
     }
 }
 
+/// The Keychain items an orphan is given: each with the provider that names it.
+type OrphanItems = Vec<(Arc<dyn Provider>, String)>;
+
 impl Engine {
     /// §10.5 step 2's summary. Inside a run shell it refuses at once (§12.8). It reads the
     /// store and the data directory only, takes no lock and creates nothing (§5). An account
@@ -281,6 +284,11 @@ impl Engine {
         for profile in &orphans {
             self.refuse_orphan_in_use(profile, &providers)?;
             self.refuse_orphan_split(profile)?;
+            // §10.5: the live login is found here, before anything is deleted, not when this
+            // entry's turn comes. The user is told which entry.
+            self.refuse_orphan_live(profile, &providers).map_err(|e| {
+                EngineError::Io(io::Error::other(format!("{}: {e}", profile.display())))
+            })?;
         }
         let unlisted = match plan.provider {
             // §6.3: as `remove` would, before anything is deleted.
@@ -668,50 +676,17 @@ impl Engine {
                 profile.display()
             )));
         }
-        let mut warning = None;
-        let mut items: Vec<(Arc<dyn Provider>, String)> = Vec::new();
-        match ProfileMarker::read(profile) {
-            Read::Present(marker) => match self.provider(&marker.provider) {
-                Ok(p) if !self.store_holds(&marker.account_id)? => {
-                    items.push((p, marker.config_dir));
-                }
-                // A copy of a stored account's profile: its marker's spelling is that
-                // account's item, which is not this entry's to delete.
-                Ok(_) => self.items_by_path(profile, providers, &mut items),
-                Err(_) => {
-                    tracing::warn!(
-                        "{} names a provider this build does not register; the credential item that provider keeps for it cannot be named, and may remain",
-                        Self::profile_label(profile)
-                    );
-                    warning = Some(format!(
-                        "{} names {}, a provider this build does not register, so the credential item it keeps for that session profile cannot be named; the profile was deleted, and that item may remain",
-                        profile.display(),
-                        marker.provider
-                    ));
-                }
-            },
-            Read::Absent | Read::Unreadable(_) => {
-                self.items_by_path(profile, providers, &mut items)
-            }
+        let (items, warning) = self.orphan_items(profile, providers)?;
+        if warning.is_some() {
+            tracing::warn!(
+                "{} names a provider this build does not register; the credential item that provider keeps for it cannot be named, and may remain",
+                Self::profile_label(profile)
+            );
         }
-        // Neither the live login's item nor a stored account's is this entry's to delete: an
-        // orphan can be a link to an account's profile, or to the live config directory.
-        let stored = self.stored_spellings()?;
-        for (p, spelling) in &items {
-            if p.live_item_spelling(&self.env).as_deref() == Some(spelling.as_str()) {
-                let var = p.session_dir_var().unwrap_or("the home variable");
-                return Err(EngineError::Io(io::Error::other(format!(
-                    "the Keychain item it names is the live login's, since the environment ({var}, or the provider's override of it) names the same directory; it was left as it is, and so was the profile (a purge never deletes the live login)"
-                ))));
-            }
-            if stored.contains(spelling) {
-                return Err(EngineError::Io(io::Error::other(
-                    "the Keychain item it names belongs to a stored account, since this entry leads to that account's profile; it was left as it is, and so was the entry",
-                )));
-            }
-        }
-        // Nor is the live login's files' path inside the directory, whatever spelling its items
-        // go by (§10.5): checked before any item or the directory goes.
+        // The live login's checks, again at the moment of deletion (a second line: the preflight
+        // ran them already, so this fires only on a race).
+        self.refuse_orphan_items_live(&items)?;
+        self.refuse_orphan_items_stored(&items)?;
         for p in self.judges(profile, providers) {
             self.refuse_live_files_at(p.as_ref(), profile)?;
         }
@@ -726,6 +701,96 @@ impl Engine {
         }
         tracing::info!("deleted {}", Self::profile_label(profile));
         Ok(warning)
+    }
+
+    /// The Keychain items an orphan entry (a real directory) is given, and a warning when its
+    /// marker names a provider this build does not register (§10.5 step 8).
+    fn orphan_items(
+        &self,
+        profile: &Path,
+        providers: &[ProviderId],
+    ) -> Result<(OrphanItems, Option<String>), EngineError> {
+        let mut warning = None;
+        let mut items: OrphanItems = Vec::new();
+        match ProfileMarker::read(profile) {
+            Read::Present(marker) => match self.provider(&marker.provider) {
+                Ok(p) if !self.store_holds(&marker.account_id)? => {
+                    items.push((p, marker.config_dir));
+                }
+                // A copy of a stored account's profile: its marker's spelling is that
+                // account's item, which is not this entry's to delete.
+                Ok(_) => self.items_by_path(profile, providers, &mut items),
+                Err(_) => {
+                    warning = Some(format!(
+                        "{} names {}, a provider this build does not register, so the credential item it keeps for that session profile cannot be named; the profile was deleted, and that item may remain",
+                        profile.display(),
+                        marker.provider
+                    ));
+                }
+            },
+            Read::Absent | Read::Unreadable(_) => {
+                self.items_by_path(profile, providers, &mut items)
+            }
+        }
+        Ok((items, warning))
+    }
+
+    /// The live login's item is never an orphan's to delete: an orphan can be a link to the live
+    /// config directory, or spell it another way.
+    fn refuse_orphan_items_live(
+        &self,
+        items: &[(Arc<dyn Provider>, String)],
+    ) -> Result<(), EngineError> {
+        for (p, spelling) in items {
+            if p.live_item_spelling(&self.env).as_deref() == Some(spelling.as_str()) {
+                let var = p.session_dir_var().unwrap_or("the home variable");
+                return Err(EngineError::Io(io::Error::other(format!(
+                    "the Keychain item it names is the live login's, since the environment ({var}, or the provider's override of it) names the same directory; it was left as it is, and so was the profile (a purge never deletes the live login)"
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    /// Nor is a stored account's: an orphan can be a link to, or a copy of, an account's profile.
+    /// Left to the moment of deletion, where it leaves that one entry (the rest of the purge
+    /// goes on), unlike the live login's, which refuses the whole purge.
+    fn refuse_orphan_items_stored(
+        &self,
+        items: &[(Arc<dyn Provider>, String)],
+    ) -> Result<(), EngineError> {
+        let stored = self.stored_spellings()?;
+        for (_, spelling) in items {
+            if stored.contains(spelling) {
+                return Err(EngineError::Io(io::Error::other(
+                    "the Keychain item it names belongs to a stored account, since this entry leads to that account's profile; it was left as it is, and so was the entry",
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// §10.5 step 6, for an orphan entry: refuses the purge when deleting it would delete or
+    /// break the live login, by Keychain item (a real directory only: no item is named through
+    /// a link) and by the live login's files. Nothing is deleted.
+    fn refuse_orphan_live(
+        &self,
+        profile: &Path,
+        providers: &[ProviderId],
+    ) -> Result<(), EngineError> {
+        let meta = match fs::symlink_metadata(profile) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        if !meta.file_type().is_symlink() {
+            let (items, _) = self.orphan_items(profile, providers)?;
+            self.refuse_orphan_items_live(&items)?;
+        }
+        for p in self.judges(profile, providers) {
+            self.refuse_live_files_at(p.as_ref(), profile)?;
+        }
+        Ok(())
     }
 
     /// How a log line names an entry of `sessions/` no account owns, never by its path (§14.2):

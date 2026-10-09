@@ -1486,14 +1486,13 @@ fn an_orphan_named_by_the_secure_storage_override_never_deletes_the_live_login()
     fx.kc.put(&live_item.0, &live_item.1, b"the live login");
     let plan = full_plan(&fx);
     assert_eq!(plan.orphan_profiles, [orphan.clone()]);
-    let report = fx.engine.purge(&plan).unwrap();
+    // R-premerge-preflight-live: the whole purge refuses, before anything is deleted.
+    let message = fx.engine.purge(&plan).unwrap_err().to_string();
     assert_eq!(
         fx.kc.get(&live_item.0, &live_item.1).as_deref(),
         Some(&b"the live login"[..])
     );
-    assert!(orphan.exists(), "skipped whole");
-    assert_eq!(report.failures.len(), 1, "{:?}", report.failures);
-    let message = &report.failures[0].1;
+    assert!(orphan.exists(), "left whole");
     assert!(
         message.contains("live login") && message.contains("CLAUDE_CONFIG_DIR"),
         "names the provider's own variable: {message}"
@@ -1705,22 +1704,17 @@ fn a_stored_profile_holding_the_live_login_s_files_is_never_deleted_by_purge() {
 }
 
 #[test]
-fn an_orphan_holding_the_live_login_s_files_is_left_and_reported() {
+fn an_orphan_holding_the_live_login_s_files_refuses_the_whole_purge() {
     let (fx, dir, live) = live_login_inside("0192-gone");
 
-    let report = fx.engine.purge(&full_plan(&fx)).unwrap();
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
 
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
     assert_eq!(fs::read(&live).unwrap(), b"the live login");
     assert!(dir.exists(), "the orphan is left");
-    let failure = report
-        .failures
-        .iter()
-        .find(|(what, _)| what.contains("0192-gone"))
-        .unwrap_or_else(|| panic!("{:?}", report.failures));
-    assert!(
-        failure.1.contains("live login's files are inside"),
-        "{failure:?}"
-    );
 }
 
 /// A Linux fixture whose live credential file is a link to the credential file of the stored
@@ -1847,22 +1841,17 @@ fn a_stored_profile_link_a_live_credential_goes_through_is_never_unlinked_by_pur
 }
 
 #[test]
-fn an_orphan_link_a_live_credential_goes_through_is_left_and_reported() {
+fn an_orphan_link_a_live_credential_goes_through_refuses_the_whole_purge() {
     let (fx, entry, live, _target) = live_login_through_a_profile_link("orphan-link");
 
-    let report = fx.engine.purge(&full_plan(&fx)).unwrap();
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
 
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
     assert!(fs::symlink_metadata(&entry).is_ok(), "the link is left");
     assert_eq!(fs::read(&live).unwrap(), b"the live login");
-    let failure = report
-        .failures
-        .iter()
-        .find(|(what, _)| what.contains("orphan-link"))
-        .unwrap_or_else(|| panic!("{:?}", report.failures));
-    assert!(
-        failure.1.contains("live login's files are inside"),
-        "{failure:?}"
-    );
 }
 
 /// Whether the filesystem under the temp directory ignores case (macOS's default APFS).
@@ -1916,4 +1905,62 @@ fn a_profile_the_live_login_is_in_under_another_case_is_never_deleted_by_purge()
     assert_eq!(fs::read(&live).unwrap(), b"the live login");
     assert!(dir.join(".tagteam-profile.json").exists());
     assert!(fx.vault_bytes(&aid).is_some(), "nothing else was deleted");
+}
+
+#[test]
+fn an_orphan_holding_the_live_login_refuses_before_any_account_is_deleted() {
+    // R-premerge-preflight-live: stored accounts plus an orphan that holds the live login's
+    // files. Nothing of any account goes, nor the journal rows.
+    let (fx, dir, live) = live_login_inside("0192-gone");
+    let store = fx.engine.store().unwrap();
+    let a = add(&store, &fx.provider(), "0192-a", "a@x.co", 1);
+    let b = add(&store, &fx.provider(), "0192-b", "b@x.co", 2);
+    fx.put_vault(&a, &credential("a@x.co", "rt-a"));
+    fx.put_vault(&b, &credential("b@x.co", "rt-b"));
+    let profile_a = fx.profile_dir(&a);
+    fx.write_marker(&profile_a, &a, &fx.env);
+    crashed_switch(&fx, &a, &b);
+    assert!(journal(&fx).is_some());
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(dir.exists());
+    for id in [&a, &b] {
+        assert!(fx.vault_bytes(id).is_some(), "{id} keeps its vault entry");
+        assert!(store.account(id).unwrap().is_some(), "{id} keeps its row");
+    }
+    assert!(profile_a.exists());
+    assert!(journal(&fx).is_some(), "the journal row is intact");
+}
+
+#[test]
+fn a_later_account_holding_the_live_login_refuses_before_an_earlier_one_is_deleted() {
+    let (fx, dir, live) = live_login_inside("0192-second");
+    let store = fx.engine.store().unwrap();
+    let first = add(&store, &fx.provider(), "0192-first", "a@x.co", 1);
+    let second = add(&store, &fx.provider(), "0192-second", "b@x.co", 2);
+    fx.put_vault(&first, b"first vault credential");
+    fx.put_vault(&second, b"second vault credential");
+    let profile_first = fx.profile_dir(&first);
+    fx.write_marker(&profile_first, &first, &fx.env);
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(dir.exists());
+    assert!(
+        fx.vault_bytes(&first).is_some(),
+        "the first account is whole"
+    );
+    assert!(store.account(&first).unwrap().is_some());
+    assert!(profile_first.exists());
 }
