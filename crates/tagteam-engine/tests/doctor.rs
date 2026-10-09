@@ -444,6 +444,11 @@ fn a_locked_keychain_skips_what_reads_it_with_one_warning_and_is_never_unlocked(
     let (provider, c) = under(&r, "keychain.locked");
     assert_eq!(provider, None);
     assert_eq!(c.status, CheckStatus::Warn);
+    assert_eq!(
+        c.message,
+        "the login keychain is locked (common over SSH), so the checks that read it were skipped: vault entries, pending replacements, interrupted switches and session credentials",
+        "one Keychain, locked: the wording of a release run"
+    );
     assert!(fix(c).contains("security unlock-keychain"));
     assert_eq!(fx.kc.unlock_attempts(), 0, "doctor asks nothing (B.67)");
 }
@@ -1982,7 +1987,13 @@ fn a_locked_provider_keychain_skips_what_reads_it_though_the_vault_s_is_open() {
     let r = split.doctor();
     assert!(found(&r, "sessions.credential").is_empty(), "{r:#?}");
     assert!(found(&r, "sessions.provenance").is_empty(), "{r:#?}");
-    assert_eq!(one(&r, "keychain.locked").status, CheckStatus::Warn);
+    let note = one(&r, "keychain.locked");
+    assert_eq!(note.status, CheckStatus::Warn);
+    assert_eq!(
+        note.message,
+        "the login keychain is locked (common over SSH), so the checks that read it were skipped: interrupted switches and session credentials",
+        "only what the provider's Keychain holds was skipped; the vault's was read"
+    );
     assert_eq!(
         Split::finds(&split.cc_finds),
         before,
@@ -2009,7 +2020,15 @@ fn a_locked_provider_keychain_leaves_an_interrupted_switch_unjudged_though_the_v
     let c = one(&r, "switch.interrupted");
     assert_eq!(c.status, CheckStatus::Warn);
     assert!(c.message.contains("Keychain is locked"), "{}", c.message);
-    assert_eq!(one(&r, "keychain.locked").status, CheckStatus::Warn);
+    let note = one(&r, "keychain.locked");
+    assert_eq!(note.status, CheckStatus::Warn);
+    assert!(
+        note.message
+            .contains("interrupted switches and session credentials")
+            && !note.message.contains("vault entries"),
+        "{}",
+        note.message
+    );
     assert_eq!(Split::finds(&split.cc_finds), before);
     assert_eq!(split.cc_kc.unlock_attempts(), 0);
 }
@@ -2035,7 +2054,13 @@ fn a_locked_vault_keychain_skips_the_vault_reads_though_the_provider_s_is_open()
         "{r:#?}"
     );
     assert!(found(&r, "accounts.vault").is_empty(), "{r:#?}");
-    assert_eq!(one(&r, "keychain.locked").status, CheckStatus::Warn);
+    let note = one(&r, "keychain.locked");
+    assert_eq!(note.status, CheckStatus::Warn);
+    assert_eq!(
+        note.message,
+        "the vault's keychain is locked (common over SSH), so the checks that read it were skipped: vault entries and pending replacements",
+        "only the vault's Keychain is at fault, and session credentials were read"
+    );
 
     // Readable, it is read too, but the vault entry it would be compared with is not.
     split.cc_kc.set_unreadable(&svc, &acct, false);

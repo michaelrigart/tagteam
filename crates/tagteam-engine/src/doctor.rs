@@ -300,7 +300,7 @@ impl Engine {
                 run.online(p.as_ref())?;
             }
         }
-        run.keychain_note();
+        run.keychain_note(&providers);
         Ok(run.finish(&providers))
     }
 }
@@ -2465,35 +2465,100 @@ impl Run<'_> {
 
     /// §13.6: the one warning for every check skipped because the Keychain could not be read
     /// without unlocking it, the vault's or a provider's. Said once, only when a check needed a
-    /// secret, and a locked Keychain over one whose state cannot be told.
-    fn keychain_note(&mut self) {
-        let states: Vec<Secrets> = self
+    /// secret from a Keychain that was locked or whose state cannot be told (a locked one over
+    /// the other). It names the checks that were skipped, and the Keychain as "the login
+    /// keychain" unless only the vault's is the one at fault while a provider's is not in the
+    /// same state. Both in one state cannot be told apart from one Keychain, which is every
+    /// release run: that is the wording of a single Keychain, unchanged.
+    fn keychain_note(&mut self, providers: &[Arc<dyn Provider>]) {
+        let vault = self
             .secrets
             .get()
             .copied()
-            .into_iter()
-            .chain(self.provider_secrets.borrow().values().copied())
-            .collect();
-        let Some(state) = [Secrets::Locked, Secrets::Unknown]
-            .into_iter()
-            .find(|s| states.contains(s))
-        else {
+            .filter(|s| *s != Secrets::Readable);
+        let provider = worst(self.provider_secrets.borrow().values().copied());
+        let provider = (provider != Secrets::Readable).then_some(provider);
+        let Some(state) = worst(vault.into_iter().chain(provider)).bad() else {
             return;
         };
+        // What each side is in now, whether or not a check asked: the same state on both is
+        // one Keychain as far as anyone can tell.
+        let vault_now = self.secrets();
+        let provider_now = worst(providers.iter().map(|p| self.provider_secrets(p.as_ref())));
+        let check = if vault_now == provider_now {
+            Check::warn(
+                "keychain.locked",
+                format!(
+                    "{}, so the checks that read it were skipped: {}",
+                    state_of("the login keychain", state),
+                    skipped(true, true)
+                ),
+            )
+        } else {
+            let mut clauses = Vec::new();
+            if let Some(v) = vault {
+                clauses.push(state_of("the vault's keychain", v));
+            }
+            if let Some(p) = provider {
+                clauses.push(state_of("the login keychain", p));
+            }
+            Check::warn(
+                "keychain.locked",
+                format!(
+                    "{}, so the checks that read {} were skipped: {}",
+                    clauses.join(", and "),
+                    if clauses.len() == 1 { "it" } else { "them" },
+                    skipped(vault.is_some(), provider.is_some())
+                ),
+            )
+        };
         let check = match state {
-            Secrets::Readable => return,
-            Secrets::Locked => Check::warn(
-                "keychain.locked",
-                "the login keychain is locked (common over SSH), so the checks that read it were skipped: vault entries, pending replacements, interrupted switches and session credentials",
-            )
-            .fix("`security unlock-keychain ~/Library/Keychains/login.keychain-db`, then `tagteam doctor` again"),
-            Secrets::Unknown => Check::warn(
-                "keychain.locked",
-                "the login keychain's lock state cannot be told, so the checks that read it were skipped: vault entries, pending replacements, interrupted switches and session credentials",
-            )
-            .fix("`security show-keychain-info` shows why; unlock the keychain if it is locked, then `tagteam doctor` again"),
+            Secrets::Locked => check.fix("`security unlock-keychain ~/Library/Keychains/login.keychain-db`, then `tagteam doctor` again"),
+            _ => check.fix("`security show-keychain-info` shows why; unlock the keychain if it is locked, then `tagteam doctor` again"),
         };
         self.push(None, check);
+    }
+}
+
+impl Secrets {
+    /// The state that warrants the note, if this is one.
+    fn bad(self) -> Option<Secrets> {
+        (self != Secrets::Readable).then_some(self)
+    }
+}
+
+/// The worst of `states`: a locked Keychain over one whose state cannot be told over a readable one.
+fn worst(states: impl IntoIterator<Item = Secrets>) -> Secrets {
+    let states: Vec<Secrets> = states.into_iter().collect();
+    [Secrets::Locked, Secrets::Unknown]
+        .into_iter()
+        .find(|s| states.contains(s))
+        .unwrap_or(Secrets::Readable)
+}
+
+/// What is said of `keychain` in `state`: the note's wording for a locked one, or one whose
+/// state cannot be told.
+fn state_of(keychain: &str, state: Secrets) -> String {
+    match state {
+        Secrets::Unknown => format!("{keychain}'s lock state cannot be told"),
+        _ => format!("{keychain} is locked (common over SSH)"),
+    }
+}
+
+/// The checks skipped for want of the vault's Keychain and of a provider's, as a sentence part.
+fn skipped(vault: bool, provider: bool) -> String {
+    let mut parts = Vec::new();
+    if vault {
+        parts.extend(["vault entries", "pending replacements"]);
+    }
+    if provider {
+        parts.extend(["interrupted switches", "session credentials"]);
+    }
+    let last = parts.pop().unwrap_or_default();
+    if parts.is_empty() {
+        last.to_owned()
+    } else {
+        format!("{} and {last}", parts.join(", "))
     }
 }
 
