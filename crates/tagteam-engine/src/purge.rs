@@ -266,6 +266,7 @@ impl Engine {
                 Ok(p) => {
                     self.refuse_session_owned(p.as_ref(), row)?;
                     self.refuse_profile_split(p.as_ref(), row)?;
+                    self.refuse_live_profile_item(p.as_ref(), row)?;
                 }
                 // Its provider's share lists are unknown: every registered provider's judge.
                 Err(_) => {
@@ -379,6 +380,7 @@ impl Engine {
             Ok(p) => {
                 self.refuse_session_owned(p.as_ref(), row)?;
                 self.refuse_profile_split(p.as_ref(), row)?;
+                self.refuse_live_profile_item(p.as_ref(), row)?;
                 Ok((self.remove_locked(row, &lock, unlisted)?, None))
             }
             Err(_) => {

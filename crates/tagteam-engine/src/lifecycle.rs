@@ -1,5 +1,6 @@
 use std::fs;
 use std::io;
+use std::path::Path;
 
 use tagteam_core::validate::{is_valid_email, normalize_alias};
 use tagteam_core::{AccountId, ProviderId};
@@ -180,6 +181,25 @@ pub(crate) struct LoginSource {
     pub(crate) added_at: Option<i64>,
 }
 
+/// The Keychain item `remove_profile` names for a profile directory (see `Engine::profile_item`).
+enum ProfileItem {
+    /// The spelling its trusted marker records.
+    Marker(String),
+    /// No trusted marker (`why`): the spelling of the canonical path.
+    Derived { spelling: String, why: &'static str },
+    /// No trusted marker (`why`) and the path does not resolve: no item to name.
+    Unresolved { why: &'static str, error: String },
+}
+
+impl ProfileItem {
+    fn spelling(&self) -> Option<&str> {
+        match self {
+            Self::Marker(s) | Self::Derived { spelling: s, .. } => Some(s),
+            Self::Unresolved { .. } => None,
+        }
+    }
+}
+
 /// What `remove_locked` does with a `rescue` path it cannot list (§6.3, §10.5 step 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnlistedRescues {
@@ -259,7 +279,79 @@ impl Engine {
     /// (§12.2, `refuse_profile_split`). Either refusal leaves everything as it was.
     fn refuse_destroying(&self, p: &dyn Provider, row: &AccountRow) -> Result<(), EngineError> {
         self.refuse_session_owned(p, row)?;
-        self.refuse_profile_split(p, row)
+        self.refuse_profile_split(p, row)?;
+        self.refuse_live_profile_item(p, row)
+    }
+
+    /// Which Keychain item `remove_profile` deletes for the profile directory at `profile`: the
+    /// spelling its marker records when the marker names this account and its provider, else
+    /// the one derived from the canonical path (Decision 12), else none. The one place that
+    /// choice is made, so `remove_profile` and `refuse_live_profile_item` cannot drift.
+    fn profile_item(&self, p: &dyn Provider, row: &AccountRow, profile: &Path) -> ProfileItem {
+        let derived = |why: &'static str| match canonical_profile_path(profile) {
+            Ok(canonical) => ProfileItem::Derived {
+                spelling: p.profile_spelling(&canonical),
+                why,
+            },
+            Err(e) => ProfileItem::Unresolved {
+                why,
+                error: e.to_string(),
+            },
+        };
+        match ProfileMarker::read(profile) {
+            Read::Present(marker)
+                if marker.account_id == row.id && marker.provider == row.provider =>
+            {
+                ProfileItem::Marker(marker.config_dir)
+            }
+            Read::Present(_) => derived("it names another account"),
+            Read::Absent => derived("it has none"),
+            Read::Unreadable(_) => derived("it cannot be read"),
+        }
+    }
+
+    /// §10.5 "never deletes or replaces a provider's live login": refuses when the Keychain item
+    /// `spelling` names is the live login's, since the environment names the same directory.
+    fn refuse_live_item(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        spelling: &str,
+    ) -> Result<(), EngineError> {
+        if p.live_item_spelling(&self.env).as_deref() != Some(spelling) {
+            return Ok(());
+        }
+        let var = p.session_dir_var().unwrap_or("the home variable");
+        tracing::warn!(
+            position = row.position,
+            account = %row.id,
+            "the Keychain item the session profile names is the live login's; nothing was deleted"
+        );
+        Err(EngineError::Io(io::Error::other(format!(
+            "the Keychain item account {}'s profile names is the live login's, since the environment ({var}, or the provider's override of it) names the same directory; nothing was deleted (tagteam never deletes the live login)",
+            row.position
+        ))))
+    }
+
+    /// Before anything of `row` is deleted: refuses when deleting its session profile would
+    /// delete the live login's Keychain items. A profile that is a link names no item
+    /// (`remove_profile` removes it as a link), so it passes.
+    pub(crate) fn refuse_live_profile_item(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+    ) -> Result<(), EngineError> {
+        let profile = profile_path(&self.env, &row.id);
+        match fs::symlink_metadata(&profile) {
+            Ok(meta) if !meta.file_type().is_symlink() => {}
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        match self.profile_item(p, row, &profile).spelling() {
+            Some(spelling) => self.refuse_live_item(p, row, spelling),
+            None => Ok(()),
+        }
     }
 
     /// §10.3: deletes `row`'s session profile, if it has one. The agent's credential items for
@@ -274,7 +366,9 @@ impl Engine {
     /// warning, and the path itself is removed as a link, so a stray path never leaves `remove`
     /// unable to finish once the vault is gone. Any other failure stops before the directory
     /// goes. The items are found by the recorded spelling, the files by the profile's actual
-    /// directory (Decision 19).
+    /// directory (Decision 19). A profile that is itself a link names no item at all (§10.5
+    /// step 6): only the link goes. An item that is the live login's is never deleted (§10.5):
+    /// it refuses, before anything is deleted, with the profile as it was.
     pub(crate) fn remove_profile(
         &self,
         p: &dyn Provider,
@@ -286,40 +380,37 @@ impl Engine {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
+        // §10.5 step 6: a session profile is a directory under `sessions/`. A link there is not
+        // one, so no Keychain item is named through it, by its marker or by the path it leads
+        // to: the link goes, and what it led to stays as it is.
+        if meta.file_type().is_symlink() {
+            tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                "the session profile is a link, not a directory; the link was removed and no Keychain item was deleted through it"
+            );
+            fs::remove_file(&profile)?;
+            return Ok(());
+        }
+        let item = self.profile_item(p, row, &profile);
         // `why` is a fixed phrase (§14.2): a marker's read error names its path, under a data
         // directory the user may have named, and may quote the file.
-        let current_spelling = |why: &str| -> Option<String> {
-            match canonical_profile_path(&profile) {
-                Ok(canonical) => {
-                    tracing::warn!(
-                        position = row.position,
-                        account = %row.id,
-                        "the session profile's marker could not be read ({why}); deleting its Keychain item under its current spelling, so an item under an older spelling may remain"
-                    );
-                    Some(p.profile_spelling(&canonical))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        position = row.position,
-                        account = %row.id,
-                        "the session profile's marker could not be read ({why}) and its path does not resolve ({e}); skipping its Keychain item, so an item under an older spelling may remain"
-                    );
-                    None
-                }
-            }
-        };
-        let spelling = match ProfileMarker::read(&profile) {
-            Read::Present(marker)
-                if marker.account_id == row.id && marker.provider == row.provider =>
-            {
-                Some(marker.config_dir)
-            }
-            Read::Present(_) => current_spelling("it names another account"),
-            Read::Absent => current_spelling("it has none"),
-            Read::Unreadable(_) => current_spelling("it cannot be read"),
-        };
-        if let Some(spelling) = spelling {
-            p.delete_profile_credential(&self.env, &profile, &spelling)?;
+        match &item {
+            ProfileItem::Marker(_) => {}
+            ProfileItem::Derived { why, .. } => tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                "the session profile's marker could not be read ({why}); deleting its Keychain item under its current spelling, so an item under an older spelling may remain"
+            ),
+            ProfileItem::Unresolved { why, error } => tracing::warn!(
+                position = row.position,
+                account = %row.id,
+                "the session profile's marker could not be read ({why}) and its path does not resolve ({error}); skipping its Keychain item, so an item under an older spelling may remain"
+            ),
+        }
+        if let Some(spelling) = item.spelling() {
+            self.refuse_live_item(p, row, spelling)?;
+            p.delete_profile_credential(&self.env, &profile, spelling)?;
         }
         // `remove_dir_all` removes a symlink inside the profile as a link, never following it.
         if meta.is_dir() {

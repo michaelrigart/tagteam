@@ -1572,3 +1572,87 @@ fn a_link_to_a_directory_holding_a_readable_marker_names_no_item_by_that_marker(
         report.warnings
     );
 }
+
+/// The live login's items and what each holds.
+type LiveItems = [((String, String), &'static [u8]); 2];
+
+/// A macOS fixture whose `CLAUDE_CONFIG_DIR` names a directory holding the live login, with the
+/// live login's two items planted; two accounts are stored, the first of them `a`.
+fn live_config_fixture() -> (Fx, AccountId, PathBuf, LiveItems) {
+    let fx = Fx::with(Platform::MacOs, |e| {
+        let parent = fs::canonicalize(e.home.parent().unwrap()).unwrap();
+        let live = parent.join(e.home.file_name().unwrap()).join(".claude");
+        e.claude_config_dir = Some(live.into_os_string());
+    });
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let live_dir = PathBuf::from(fx.env.claude_config_dir.clone().unwrap());
+    fs::create_dir_all(&live_dir).unwrap();
+    fs::write(live_dir.join("settings.json"), b"{}").unwrap();
+    let items = [
+        (
+            fx.live_item(tagteam_cc::ItemKind::OAuth),
+            &b"the live login"[..],
+        ),
+        (
+            fx.live_item(tagteam_cc::ItemKind::ManagedKey),
+            &b"the live key"[..],
+        ),
+    ];
+    for (item, bytes) in &items {
+        fx.kc.put(&item.0, &item.1, bytes);
+    }
+    (fx, a, live_dir, items)
+}
+
+fn assert_live_items_kept(fx: &Fx, items: &LiveItems) {
+    for (item, bytes) in items {
+        assert_eq!(
+            fx.kc.get(&item.0, &item.1).as_deref(),
+            Some(*bytes),
+            "the live login's item {item:?} is kept"
+        );
+    }
+}
+
+#[test]
+fn a_stored_profile_that_is_a_link_to_the_live_config_dir_never_deletes_the_live_login() {
+    // Codex pre-merge P1 (§10.5): the account's own `sessions/<id>` is a link to the directory
+    // `CLAUDE_CONFIG_DIR` names, with no marker. A link is not a profile directory, so no item
+    // is named through it: the link goes, the live login and its directory stay.
+    let (fx, a, live_dir, items) = live_config_fixture();
+    let link = fx.profile_dir(&a);
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&live_dir, &link).unwrap();
+
+    let report = fx.engine.purge(&full_plan(&fx)).unwrap();
+
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_live_items_kept(&fx, &items);
+    assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
+    assert!(live_dir.join("settings.json").exists(), "the target stays");
+    assert!(fx.vault_bytes(&a).is_none(), "the account itself went");
+}
+
+#[test]
+fn a_profile_whose_marker_names_the_live_config_dir_refuses_the_purge_whole() {
+    // Codex pre-merge P1: a real profile directory whose marker's `configDir` is the live
+    // login's spelling would have its credential items deleted: the live login's.
+    let (fx, a, live_dir, items) = live_config_fixture();
+    let profile = fx.make_profile(&a);
+    let mut marker = match ProfileMarker::read(&profile) {
+        Read::Present(m) => m,
+        _ => panic!("no marker"),
+    };
+    marker.config_dir = fx.cc.live_item_spelling(&fx.env).unwrap();
+    marker.write(&profile).unwrap();
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(err.to_string().contains("is the live login's"), "{err}");
+    assert_live_items_kept(&fx, &items);
+    assert!(live_dir.join("settings.json").exists());
+    assert!(profile.join(".claude.json").exists(), "the profile is kept");
+    assert!(fx.vault_bytes(&a).is_some(), "the vault entry is kept");
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
+}

@@ -1090,7 +1090,8 @@ fn remove_logs_a_profile_whose_marker_cannot_be_read_by_a_fixed_phrase() {
         1,
         "{logs:#?}"
     );
-    // A profile that is a link to nowhere: no marker, and no path to resolve.
+    // A profile that is a link, here to nowhere: no item is named through it (Codex pre-merge
+    // P1), so its path is neither resolved nor logged.
     std::os::unix::fs::symlink(fx.env.home.join("bob@example.com/gone"), fx.profile_dir(&c))
         .unwrap();
     let (removed, more) = capture_logs(|| fx.engine.remove(&c));
@@ -1099,7 +1100,7 @@ fn remove_logs_a_profile_whose_marker_cannot_be_read_by_a_fixed_phrase() {
         at(
             &more,
             "WARN",
-            "the session profile's marker could not be read (it has none) and its path does not resolve"
+            "the session profile is a link, not a directory; the link was removed and no Keychain item was deleted through it"
         )
         .len(),
         1,

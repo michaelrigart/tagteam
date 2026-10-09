@@ -9,7 +9,8 @@ use tagteam_engine::lifecycle::AddTokenOptions;
 use tagteam_engine::store::{JournalRow, NewAccount};
 use tagteam_engine::vault::SERVICE;
 use tagteam_engine::views::StatusView;
-use tagteam_provider::{ProcessStamp, Provider};
+use tagteam_provider::profile::ProfileMarker;
+use tagteam_provider::{ProcessStamp, Provider, Read};
 
 #[test]
 fn references_resolve_by_position_alias_and_email() {
@@ -318,4 +319,85 @@ fn remove_refuses_a_rescue_path_it_cannot_list_before_deleting_anything() {
     assert!(rescue.is_file(), "nor the path");
     fs::remove_file(&rescue).unwrap();
     fx.engine.remove(&a).unwrap();
+}
+
+/// The live login's items and what each holds.
+type LiveItems = [((String, String), &'static [u8]); 2];
+
+/// A macOS fixture whose `CLAUDE_CONFIG_DIR` names a directory holding the live login, with the
+/// live login's two items planted; the account `a` is stored beside `b`.
+fn live_config_fixture() -> (Fx, AccountId, std::path::PathBuf, LiveItems) {
+    let fx = Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
+        let parent = fs::canonicalize(e.home.parent().unwrap()).unwrap();
+        let live = parent.join(e.home.file_name().unwrap()).join(".claude");
+        e.claude_config_dir = Some(live.into_os_string());
+    });
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let live_dir = std::path::PathBuf::from(fx.env.claude_config_dir.clone().unwrap());
+    fs::create_dir_all(&live_dir).unwrap();
+    fs::write(live_dir.join("settings.json"), b"{}").unwrap();
+    let items = [
+        (
+            fx.live_item(tagteam_cc::ItemKind::OAuth),
+            &b"the live login"[..],
+        ),
+        (
+            fx.live_item(tagteam_cc::ItemKind::ManagedKey),
+            &b"the live key"[..],
+        ),
+    ];
+    for (item, bytes) in &items {
+        fx.kc.put(&item.0, &item.1, bytes);
+    }
+    (fx, a, live_dir, items)
+}
+
+fn assert_live_items_kept(fx: &Fx, items: &LiveItems) {
+    for (item, bytes) in items {
+        assert_eq!(
+            fx.kc.get(&item.0, &item.1).as_deref(),
+            Some(*bytes),
+            "the live login's item {item:?} is kept"
+        );
+    }
+}
+
+#[test]
+fn remove_of_a_profile_that_is_a_link_to_the_live_config_dir_never_deletes_the_live_login() {
+    // Codex pre-merge P1 (§10.3, §10.5): the account's own `sessions/<id>` is a link to the
+    // directory `CLAUDE_CONFIG_DIR` names, with no marker. No item is named through a link.
+    let (fx, a, live_dir, items) = live_config_fixture();
+    let link = fx.profile_dir(&a);
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&live_dir, &link).unwrap();
+
+    fx.engine.remove(&a).unwrap();
+
+    assert_live_items_kept(&fx, &items);
+    assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
+    assert!(live_dir.join("settings.json").exists(), "the target stays");
+    assert!(fx.vault_bytes(&a).is_none());
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_none());
+}
+
+#[test]
+fn remove_of_a_profile_whose_marker_names_the_live_config_dir_refuses_with_nothing_deleted() {
+    let (fx, a, live_dir, items) = live_config_fixture();
+    let profile = fx.make_profile(&a);
+    let mut marker = match ProfileMarker::read(&profile) {
+        Read::Present(m) => m,
+        _ => panic!("no marker"),
+    };
+    marker.config_dir = fx.cc.live_item_spelling(&fx.env).unwrap();
+    marker.write(&profile).unwrap();
+
+    let err = fx.engine.remove(&a).unwrap_err();
+
+    assert!(err.to_string().contains("is the live login's"), "{err}");
+    assert_live_items_kept(&fx, &items);
+    assert!(live_dir.join("settings.json").exists());
+    assert!(profile.join(".claude.json").exists(), "the profile is kept");
+    assert!(fx.vault_bytes(&a).is_some(), "the vault entry is kept");
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
 }

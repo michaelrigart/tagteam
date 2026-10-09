@@ -624,8 +624,8 @@ fn remove_never_trusts_a_marker_that_names_another_account() {
 
 #[test]
 fn remove_of_a_dangling_profile_link_skips_the_item_and_removes_the_link() {
-    // The profile path resolves to nothing and has no marker, so there is no spelling to name
-    // an item from. Once the vault is gone, a stray path must not leave `remove` unable to
+    // The profile path is a link (to nothing): no item is named through a link (§10.5 step 6).
+    // Once the vault is gone, a stray path must not leave `remove` unable to
     // finish: the link goes as a link, the row goes, and no Keychain item is touched.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
@@ -674,7 +674,7 @@ fn remove_of_a_dangling_profile_link_skips_the_item_and_removes_the_link() {
     );
     assert!(
         logs.iter()
-            .any(|l| l.contains("WARN") && l.contains("older spelling")),
+            .any(|l| l.contains("WARN") && l.contains("is a link, not a directory")),
         "{logs:?}"
     );
 }
