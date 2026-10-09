@@ -265,6 +265,20 @@ impl Ran {
     /// too, redacted as well: a `--json` command writes its error object there and leaves
     /// standard error empty.
     pub fn summary(&self) -> Value {
+        if self.success() {
+            self.summary_with(false)
+        } else {
+            self.summary_full()
+        }
+    }
+
+    /// `summary`, with the end of the redacted standard output whatever the exit was: for an
+    /// error about what a command that succeeded left undone.
+    pub fn summary_full(&self) -> Value {
+        self.summary_with(true)
+    }
+
+    fn summary_with(&self, stdout: bool) -> Value {
         let mut v = json!({
             "command": self.what,
             "exit": self.code,
@@ -272,7 +286,7 @@ impl Ran {
             "seconds": (self.seconds * 10.0).round() / 10.0,
             "stderr": tail(&String::from_utf8_lossy(&self.stderr), 400),
         });
-        if !self.success() {
+        if stdout {
             v["stdout"] = json!(tail(&self.stdout_text(), 400));
         }
         v
@@ -1649,6 +1663,7 @@ mod tests {
         assert!(long.summary()["stdout"].as_str().unwrap().len() <= 405);
         let ok = sh("echo fine").run(&test_roots()).unwrap();
         assert!(ok.summary().get("stdout").is_none(), "{}", ok.summary());
+        assert_eq!(ok.summary_full()["stdout"], "fine\n", "kept on request");
     }
 
     #[test]

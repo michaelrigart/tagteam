@@ -304,9 +304,9 @@ impl Ctx {
             Err(e) => Some(format!("`claude daemon stop --any`: {e}")),
         };
         // Whatever the stop printed stays in the error, whether it or the verification failed.
-        let ran_text = evidence
-            .as_ref()
-            .map_or_else(String::new, |v| format!(" (the stop: {v})"));
+        let ran_text = stop.as_ref().ok().map_or_else(String::new, |ran| {
+            format!(" (the stop: {})", ran.summary_full())
+        });
         match (refused, left.is_clear()) {
             (None, true) => Ok(evidence),
             (None, false) => Err(harness(format!(
@@ -1035,7 +1035,10 @@ esac
         let scratch = crate::compat::layout::make_scratch().unwrap();
         let ctx = daemon_ctx(
             &scratch,
-            fake_claude(&scratch, r#"echo "stopping soon" >&2; exit 0"#),
+            fake_claude(
+                &scratch,
+                r#"echo "stopping soon" >&2; echo "stdout noted"; exit 0"#,
+            ),
         );
         let home = ctx.new_home("one").unwrap();
         let pid = orphan_sleep();
@@ -1046,7 +1049,9 @@ esac
             .0;
         crate::compat::sys::signal(pid, "KILL", false);
         assert!(
-            e.contains("still running") && e.contains("stopping soon"),
+            e.contains("still running")
+                && e.contains("stopping soon")
+                && e.contains("stdout noted"),
             "{e}"
         );
         fs::remove_dir_all(&scratch).unwrap();
