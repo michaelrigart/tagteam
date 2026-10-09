@@ -44,6 +44,10 @@ pub fn fingerprint(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))[..12].to_owned()
 }
 
+/// A byte range of the text to redact: a learned value (its placeholder and length) or, with
+/// `None`, a token-shaped run.
+type Span<'a> = (usize, usize, Option<(&'a str, usize)>);
+
 /// What a report must never carry, and what stands in for it: each identity value of the
 /// compat store's accounts (`learn`), and any token-shaped run (`<token>`): one holding
 /// `sk-ant-`, or 40 or more characters of `[A-Za-z0-9_-]`. Where readability and privacy
@@ -102,46 +106,78 @@ impl Redactor {
         }
     }
 
-    /// `s` as it may be shown. Token-shaped runs are found on the ORIGINAL text and replaced
-    /// first; learned values are replaced only in what lies between them, so an identity
-    /// placeholder can never split a token and leave the tail of its secret below the pattern.
+    /// `s` as it may be shown. Both kinds of span, token-shaped runs and learned values, are
+    /// found on the ORIGINAL text; overlapping or adjacent ones are one span, written as a single
+    /// placeholder: that of a learned value covering all of it, else `<token>` if it holds any token
+    /// span, else the placeholder of the longest learned value in it. Nothing outside a span changes, and no replacement ever runs on
+    /// text already replaced, so neither kind can split the other and leave a tail.
     pub fn text(&self, s: &str) -> String {
-        let mut redacted = String::with_capacity(s.len());
-        let mut plain = String::new();
-        let mut run = String::new();
-        let flush = |run: &mut String, plain: &mut String, redacted: &mut String| {
-            if run.len() >= 40 || run.contains("sk-ant-") {
-                redacted.push_str(&self.identities(plain));
-                plain.clear();
-                redacted.push_str("<token>");
-            } else {
-                plain.push_str(run);
-            }
-            run.clear();
-        };
-        for c in s.chars() {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                run.push(c);
-            } else {
-                flush(&mut run, &mut plain, &mut redacted);
-                plain.push(c);
-            }
-        }
-        flush(&mut run, &mut plain, &mut redacted);
-        redacted.push_str(&self.identities(&plain));
-        redacted
-    }
-
-    /// Every learned value in `s` as its placeholder (a short one only as a whole word).
-    fn identities(&self, s: &str) -> String {
-        let mut out = s.to_owned();
+        // (start, end, learned placeholder and length, or None for a token)
+        let mut spans: Vec<Span> = Vec::new();
         for (value, placeholder) in &self.known {
-            out = if value.chars().count() < 4 {
-                replace_word(&out, value, placeholder)
-            } else {
-                out.replace(value.as_str(), placeholder)
-            };
+            let short = value.chars().count() < 4;
+            for (start, found) in s.match_indices(value.as_str()) {
+                let end = start + found.len();
+                if short {
+                    let touched = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+                    if touched(s[..start].chars().next_back()) || touched(s[end..].chars().next()) {
+                        continue;
+                    }
+                }
+                spans.push((start, end, Some((placeholder.as_str(), value.len()))));
+            }
         }
+        let mut run_start = None;
+        for (i, c) in s.char_indices().chain(std::iter::once((s.len(), ' '))) {
+            let in_run = c.is_ascii_alphanumeric() || c == '-' || c == '_';
+            match (in_run, run_start) {
+                (true, None) => run_start = Some(i),
+                (false, Some(start)) => {
+                    let run = &s[start..i];
+                    if run.len() >= 40 || run.contains("sk-ant-") {
+                        spans.push((start, i, None));
+                    }
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
+        spans.sort_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
+        let mut out = String::with_capacity(s.len());
+        let mut at = 0;
+        let mut i = 0;
+        while i < spans.len() {
+            let (start, mut end, _) = spans[i];
+            let mut token = false;
+            let mut learned: Option<(&str, usize)> = None;
+            let mut j = i;
+            while j < spans.len() && spans[j].0 <= end {
+                end = end.max(spans[j].1);
+                match spans[j].2 {
+                    None => token = true,
+                    Some(l) if learned.is_none_or(|(_, len)| l.1 > len) => learned = Some(l),
+                    Some(_) => {}
+                }
+                j += 1;
+            }
+            // A learned value that covers the whole span names it best (a token-shaped word
+            // inside an organization's name goes with the name); otherwise a token span makes
+            // it `<token>`, else the longest learned value's placeholder.
+            let covering = spans[i..j]
+                .iter()
+                .filter(|&&(a, b, _)| a == start && b == end)
+                .filter_map(|&(_, _, l)| l)
+                .max_by_key(|&(_, len)| len);
+            out.push_str(&s[at..start]);
+            out.push_str(match (covering, token, learned) {
+                (Some((placeholder, _)), _, _) => placeholder,
+                (None, true, _) | (None, false, None) => "<token>",
+                (None, false, Some((placeholder, _))) => placeholder,
+            });
+            at = end;
+            i = j;
+        }
+        out.push_str(&s[at..]);
         out
     }
 
@@ -189,29 +225,6 @@ impl Redactor {
             })
             .collect()
     }
-}
-
-/// `text` with each occurrence of `word` that no letter or digit touches replaced by `with`.
-fn replace_word(text: &str, word: &str, with: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(k) = rest.find(word) {
-        let before = rest[..k]
-            .chars()
-            .next_back()
-            .or_else(|| out.chars().next_back());
-        let after = rest[k + word.len()..].chars().next();
-        let touched = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
-        out.push_str(&rest[..k]);
-        out.push_str(if touched(before) || touched(after) {
-            word
-        } else {
-            with
-        });
-        rest = &rest[k + word.len()..];
-    }
-    out.push_str(rest);
-    out
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -550,6 +563,32 @@ mod tests {
             json!({"k": "<token>"})
         );
         assert_eq!(r.bytes(token.as_bytes()), b"<token>");
+    }
+
+    #[test]
+    fn a_token_shaped_word_in_a_learned_identity_takes_the_whole_identity_with_it() {
+        // The mirror image: the token pattern must not split a learned organization name.
+        let org = format!(
+            "{} Private Research",
+            "InternationalAssociationOfComputationalScience"
+        );
+        let mut r = Redactor::default();
+        r.learn(&org, "<account 1 org>".into());
+        assert_eq!(r.text(&format!("org: {org}!")), "org: <account 1 org>!");
+        assert!(!r.text(&org).contains("Private"));
+        // A learned value next to a token is one span with it, and the token wins.
+        let mut r = Redactor::default();
+        r.learn("Acme", "<account 1 org>".into());
+        let token = "A".repeat(44);
+        assert_eq!(r.text(&format!("{token}Acme")), "<token>");
+        assert_eq!(r.text(&format!("Acme{token}")), "<token>");
+        assert_eq!(r.text(&format!("Acme {token}")), "<account 1 org> <token>");
+        // Overlapping learned values: the longer one's placeholder.
+        let mut r = Redactor::default();
+        r.learn("Acme Research", "<long>".into());
+        r.learn("Research Labs", "<other>".into());
+        r.learn("Acme", "<short>".into());
+        assert_eq!(r.text("Acme Research Labs"), "<long>");
     }
 
     fn result(id: &'static str, status: Status) -> CheckResult {
