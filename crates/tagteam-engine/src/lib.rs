@@ -7,6 +7,7 @@ pub mod bootstrap;
 pub mod collect;
 pub mod config;
 pub mod displace;
+pub mod doctor;
 pub mod engine;
 pub mod error;
 pub mod export;
