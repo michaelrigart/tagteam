@@ -10,12 +10,12 @@ use std::path::{Path, PathBuf};
 
 use common::*;
 use tagteam_cc::live::Platform;
-use tagteam_core::{AccountId, ProviderId};
+use tagteam_core::{AccountId, ProviderId, WindowKind};
 use tagteam_engine::doctor::{DoctorOptions, DoctorReport};
-use tagteam_engine::store::Store;
+use tagteam_engine::store::{DisplacedRow, Store};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::liveness::FakeProcess;
-use tagteam_provider::{Check, CheckStatus, Keychain};
+use tagteam_provider::{Check, CheckStatus, Keychain, ProcessStamp};
 
 fn doctor(fx: &Fx) -> DoctorReport {
     fx.engine.doctor(DoctorOptions::default()).unwrap()
@@ -808,4 +808,381 @@ fn a_store_no_process_has_open_is_read_immutable_and_gains_no_wal_or_shm() {
         changed(&before, &tree(fx.dir.path())),
         Vec::<PathBuf>::new()
     );
+}
+
+// ---- Part D: usage, pending storage, interrupted switches and auto-switch ----
+
+#[test]
+fn a_backoff_is_information_with_its_error_and_retry_time() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    sql(&fx)
+        .execute(
+            "INSERT INTO usage_state (account_id, consecutive_failures, last_error, backoff_until) \
+             VALUES (?1, 1, 'http-500', ?2)",
+            rusqlite::params![id.as_str(), now_s(&fx) + 120],
+        )
+        .unwrap();
+    let c = one(&doctor(&fx), "usage.backoff").clone();
+    assert_eq!(c.status, CheckStatus::Info);
+    assert!(
+        c.message.contains("after http-500") && c.message.contains("in 2m"),
+        "{}",
+        c.message
+    );
+}
+
+#[test]
+fn stamps_further_ahead_than_8_4_allows_warn_of_a_skewed_clock() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let now = now_s(&fx);
+    sql(&fx)
+        .execute(
+            "INSERT INTO usage_state (account_id, fetched_at, next_poll_at, backoff_until) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![id.as_str(), now + 600, now + 3660 + 600, now + 4500 + 600],
+        )
+        .unwrap();
+    let r = doctor(&fx);
+    let skew = found(&r, "usage.clock-skew");
+    let what: Vec<bool> = ["reading", "poll plan", "backoff"]
+        .iter()
+        .map(|w| skew.iter().any(|c| c.message.contains(w)))
+        .collect();
+    assert_eq!(what, [true, true, true], "{skew:#?}");
+    assert!(skew.iter().all(|c| fix(c).contains("system clock")));
+    assert!(
+        found(&r, "usage.backoff").is_empty(),
+        "a skewed backoff does not hold"
+    );
+}
+
+#[test]
+fn an_identity_at_its_hourly_budget_warns() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let key = fx
+        .engine
+        .store()
+        .unwrap()
+        .account(&id)
+        .unwrap()
+        .unwrap()
+        .identity_key;
+    let c = sql(&fx);
+    for i in 0..20 {
+        c.execute(
+            "INSERT INTO usage_requests (provider, identity_key, at) VALUES ('claude-code', ?1, ?2)",
+            rusqlite::params![key, now_s(&fx) - 100 - i],
+        )
+        .unwrap();
+    }
+    let r = doctor(&fx);
+    let c = one(&r, "usage.budget");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(c.message.contains("all 20 usage requests"), "{}", c.message);
+}
+
+#[test]
+fn a_rescue_path_that_is_not_a_directory_fails() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    fs::write(fx.env.data_dir().join("rescue"), "a file").unwrap();
+    let r = doctor(&fx);
+    let (provider, c) = under(&r, "pending.rescue-dir");
+    assert_eq!(provider, None);
+    assert_eq!(c.status, CheckStatus::Fail);
+    assert!(fix(c).contains("tagteam purge"), "{c:?}");
+}
+
+#[test]
+fn a_pending_rescue_warns_under_its_provider_and_an_orphan_under_tagteam() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let rescue = fx.plant_rescue(&id, &vault_fp(&fx, &id), &credential("a@x.co", "rt-next"));
+    let orphan = fx
+        .env
+        .data_dir()
+        .join("rescue/0192ffff-0000-7000-8000-000000000000-0-0123456789ab.json");
+    fs::write(&orphan, "{}").unwrap();
+    let r = doctor(&fx);
+    let (provider, c) = under(&r, "pending.rescue");
+    assert_eq!(provider, Some(&cc()));
+    assert!(c.message.contains(&rescue.display().to_string()));
+    let (provider, c) = under(&r, "pending.rescue-orphan");
+    assert_eq!(provider, None);
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        fix(c).contains(&format!("rm '{}'", orphan.display())),
+        "{c:?}"
+    );
+}
+
+#[test]
+fn displaced_entries_and_their_mismatches_are_information() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let dir = fx.env.data_dir().join("displaced");
+    fs::create_dir_all(&dir).unwrap();
+    let store = fx.engine.store().unwrap();
+    for (id, file) in [
+        ("1790000000-0123456789ab-aaaaaa", true),
+        ("1790000001-0123456789ab-bbbbbb", false),
+    ] {
+        store
+            .insert_displaced(&DisplacedRow {
+                id: id.into(),
+                provider: cc(),
+                at: 1,
+                reason: "displaced-live-login".into(),
+                fingerprint: String::new(),
+                identity: None,
+            })
+            .unwrap();
+        if file {
+            fs::write(dir.join(format!("{id}.json")), "x").unwrap();
+        }
+    }
+    fs::write(dir.join("1790000002-0123456789ab-cccccc.json"), "x").unwrap();
+    let r = doctor(&fx);
+    let (provider, c) = under(&r, "pending.displaced");
+    assert_eq!(provider, Some(&cc()));
+    assert_eq!(c.status, CheckStatus::Info);
+    assert!(c.message.starts_with("2 displaced"), "{}", c.message);
+    let c = one(&r, "pending.displaced-unrecorded");
+    assert_eq!(
+        fix(c),
+        "`tagteam displaced --purge 1790000002-0123456789ab-cccccc` deletes it"
+    );
+    let c = one(&r, "pending.displaced-missing");
+    assert_eq!(c.status, CheckStatus::Info);
+    assert!(c.message.contains("1790000001-0123456789ab-bbbbbb"));
+}
+
+#[test]
+fn an_interrupted_switch_warns_when_recoverable_and_fails_when_undecidable() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &a, &b);
+    write_target_credential(&fx, &b);
+    let c = one(&doctor(&fx), "switch.interrupted").clone();
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    assert_eq!(
+        fix(&c),
+        "`tagteam switch 2` recovers it, then makes the switch it was making"
+    );
+
+    fx.set_live_credential(&credential("b@x.co", "rt-rotated-since"));
+    let c = one(&doctor(&fx), "switch.interrupted").clone();
+    assert_eq!(c.status, CheckStatus::Fail, "{c:?}");
+    assert!(fix(&c).starts_with("`tagteam switch 2 --force`"), "{c:?}");
+    assert!(journal(&fx).is_some(), "doctor recovers nothing (§13.6)");
+}
+
+#[test]
+fn the_fix_named_for_a_recoverable_switch_recovers_it() {
+    // §13.6: every check that finds a problem names the fix, and that fix must work: `switch N`
+    // takes `MutationGuard`, so it recovers the row before it switches (§9.6).
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &a, &b);
+    write_target_credential(&fx, &b);
+    assert_eq!(
+        one(&doctor(&fx), "switch.interrupted").status,
+        CheckStatus::Warn
+    );
+    fx.switch_to(&b, false).unwrap();
+    assert!(journal(&fx).is_none(), "the switch recovered the row");
+    assert_eq!(
+        one(&doctor(&fx), "switch.interrupted").status,
+        CheckStatus::Ok
+    );
+}
+
+#[test]
+fn a_switch_under_way_is_information() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let mut row = crash_row(&fx, &a, &b);
+    row.holder = ProcessStamp::current().unwrap();
+    fx.engine.store().unwrap().insert_journal(&row).unwrap();
+    let c = one(&doctor(&fx), "switch.interrupted").clone();
+    assert_eq!(c.status, CheckStatus::Info);
+    assert!(c.message.contains("under way"), "{}", c.message);
+}
+
+#[test]
+fn an_interrupted_switch_is_not_judged_while_the_keychain_is_locked() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &a, &b);
+    fx.kc.set_locked(true);
+    let r = doctor(&fx);
+    let c = one(&r, "switch.interrupted");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(c.message.contains("Keychain is locked"), "{}", c.message);
+    assert_eq!(one(&r, "keychain.locked").status, CheckStatus::Warn);
+    assert_eq!(fx.kc.unlock_attempts(), 0);
+}
+
+#[test]
+fn an_engine_runs_exactly_when_its_record_matches_a_live_process() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let lock = fx.env.data_dir().join("locks/autoswitch-claude-code.lock");
+    assert_eq!(
+        one(&doctor(&fx), "auto.engine").message,
+        "auto-switch is not running"
+    );
+    assert!(
+        !lock.exists(),
+        "doctor never tries, so never creates, the lock"
+    );
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    let me = ProcessStamp::current().unwrap();
+    fs::write(
+        &lock,
+        format!("{{\"pid\":{},\"start\":{}}}\n", me.pid, me.start),
+    )
+    .unwrap();
+    let c = one(&doctor(&fx), "auto.engine").clone();
+    assert_eq!(c.status, CheckStatus::Info);
+    assert_eq!(c.message, format!("auto-switch runs as pid {}", me.pid));
+    fs::write(
+        &lock,
+        format!("{{\"pid\":{},\"start\":{}}}\n", me.pid, me.start + 1),
+    )
+    .unwrap();
+    assert_eq!(one(&doctor(&fx), "auto.engine").status, CheckStatus::Ok);
+    fs::write(&lock, "garbage").unwrap();
+    assert_eq!(one(&doctor(&fx), "auto.engine").status, CheckStatus::Warn);
+}
+
+#[test]
+fn unhealthy_ticks_warn() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    fx.engine
+        .store()
+        .unwrap()
+        .set_unhealthy_ticks(&cc(), 2)
+        .unwrap();
+    let c = one(&doctor(&fx), "auto.unhealthy").clone();
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(c.message.contains("last 2 auto-switch"), "{}", c.message);
+}
+
+#[test]
+fn consume_first_for_a_provider_without_a_long_window_warns() {
+    let ff = FakeFx::new();
+    ff.fake_add("alice", "tok-1", "renew-1");
+    let path = ff.fx.env.config_dir().join("config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "[autoswitch]\nstrategy = \"consume-first\"\n").unwrap();
+    let r = ff.engine.doctor(DoctorOptions::default()).unwrap();
+    let (provider, c) = under(&r, "auto.strategy");
+    assert_eq!(
+        provider,
+        Some(&ff.fake_provider()),
+        "Claude Code has a long window"
+    );
+    assert_eq!(
+        fix(c),
+        "`tagteam config set provider.fake-agent.autoswitch.strategy best`"
+    );
+}
+
+#[test]
+fn a_model_no_reading_reports_warns_once_some_account_has_a_reading() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let path = fx.env.config_dir().join("config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "[autoswitch]\nmodels = [\"Fable\", \"Opus\"]\n").unwrap();
+    assert!(
+        found(&doctor(&fx), "auto.models").is_empty(),
+        "nothing to judge by without a reading"
+    );
+    let now = now_s(&fx);
+    record_reading(
+        &fx.engine,
+        &id,
+        &[usage_window(
+            "scoped:Opus",
+            WindowKind::Scoped,
+            10.0,
+            now + 3600,
+        )],
+        now - 10,
+        now + 300,
+    );
+    let r = doctor(&fx);
+    let c = one(&r, "auto.models");
+    assert!(c.message.contains("\"Fable\""), "{}", c.message);
+}
+
+#[test]
+fn usage_and_auto_switch_state_that_cannot_be_read_warn_with_their_cause() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let path = fx.env.config_dir().join("config.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, "[autoswitch]\nmodels = [\"Opus\"]\n").unwrap();
+    let db = sql(&fx);
+    db.execute(
+        "INSERT INTO usage_state (account_id, fetched_at) VALUES (?1, 'x')",
+        [id.as_str()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO autoswitch_state (provider, unhealthy_ticks) VALUES ('claude-code', 'x')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "ALTER TABLE usage_requests RENAME TO usage_requests_gone",
+        [],
+    )
+    .unwrap();
+    let r = doctor(&fx);
+    for (id, cause) in [
+        ("usage.state", "Invalid column type Text"),
+        ("usage.budget", "no such table: usage_requests"),
+        ("auto.unhealthy", "Invalid column type Text"),
+        ("auto.models", "Invalid column type Text"),
+    ] {
+        let c = one(&r, id);
+        assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+        assert!(c.message.contains(cause), "{id}: {}", c.message);
+    }
+}
+
+#[test]
+fn an_interrupted_switch_the_live_login_cannot_judge_warns_and_an_undecidable_one_fails() {
+    // §13.6: a live login that cannot be read is an input that cannot be read, a `warn` naming
+    // why; a readable one whose fingerprints cannot decide fails, naming the forced switch.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &a, &b);
+    let (svc, acct) = fx.live_item(tagteam_cc::ItemKind::OAuth);
+    fx.kc.set_unreadable(&svc, &acct, true);
+    let c = one(&doctor(&fx), "switch.interrupted").clone();
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    assert!(
+        c.message
+            .contains("the live login cannot be read to judge it"),
+        "{}",
+        c.message
+    );
+    fx.kc.set_unreadable(&svc, &acct, false);
+    fx.set_live_credential(&credential("b@x.co", "rt-rotated-since"));
+    let c = one(&doctor(&fx), "switch.interrupted").clone();
+    assert_eq!(c.status, CheckStatus::Fail, "{c:?}");
+    assert!(fix(&c).starts_with("`tagteam switch 2 --force`"), "{c:?}");
 }

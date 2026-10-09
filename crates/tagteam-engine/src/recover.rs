@@ -17,7 +17,7 @@ use crate::switch::{
 
 /// Which way an interrupted switch went, as the live credential decides it (§9.6), with the
 /// fingerprint of the generation established as the chosen account's.
-enum Direction {
+pub(crate) enum Direction {
     Forward(String),
     Backward(String),
     Undecidable,
@@ -171,7 +171,7 @@ impl Engine {
 
     /// §9.6's table, in order: the target's generation, then the outgoing one; anything else,
     /// a read that cannot be trusted included, is undecidable.
-    fn direction(
+    pub(crate) fn direction(
         &self,
         p: &dyn Provider,
         store: &Store,

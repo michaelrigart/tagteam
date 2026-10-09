@@ -14,16 +14,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tagteam_core::ProviderId;
+use tagteam_core::autoswitch::Strategy;
 use tagteam_core::rank::span;
+use tagteam_core::trust::is_future_stamped;
+use tagteam_core::usage::WindowKind;
 use tagteam_provider::atomic::{temp_writer_pid, writable};
 use tagteam_provider::doctor::quoted;
 use tagteam_provider::env::LOG_ROTATIONS;
-use tagteam_provider::{Check, CheckStatus, LockState, Provider, Read};
+use tagteam_provider::{Check, CheckStatus, Liveness, LockState, Provider, Read};
 
+use crate::auto::{engine_lock_path, read_holder};
 use crate::engine::Engine;
 use crate::error::EngineError;
-use crate::settings;
-use crate::store::{AccountRow, SCHEMA_VERSION, Store, replacing_meta_parses};
+use crate::recover::Direction;
+use crate::settings::{self, Settings};
+use crate::store::{
+    AccountRow, JournalRow, SCHEMA_VERSION, Store, backoff_holds, backoff_is_skewed,
+    plan_is_skewed, replacing_meta_parses,
+};
 use crate::vault::SERVICE;
 
 /// What `doctor` covers (§13.6).
@@ -213,8 +221,13 @@ impl Engine {
         let providers = run.scope(opts.provider.as_ref());
         run.temp_files(&providers);
         run.vault_orphans();
+        run.rescues(opts.provider.as_ref());
+        run.displaced(opts.provider.as_ref());
         for p in &providers {
             run.accounts(p.as_ref());
+            run.usage(p.as_ref());
+            run.journal(p.as_ref());
+            run.auto(p.as_ref());
             self.check_cancel()?;
             let id = p.id();
             for check in p.doctor_checks(&self.env, self.spawner.as_ref(), self.cancel()) {
@@ -1155,6 +1168,527 @@ impl Run<'_> {
                 "nothing to do: the next command that refreshes, switches to or adds account {} finishes or undoes it",
                 row.position
             )),
+        }
+    }
+
+    /// §13.6 Usage, for `p`: backoff, the hourly budget (§8.6), and stamps a skewed clock left
+    /// (§8.4).
+    fn usage(&mut self, p: &dyn Provider) {
+        let Some(store) = self.store_ref() else {
+            return;
+        };
+        let id = p.id();
+        // `accounts.vault` reports the same read when it fails.
+        let Ok(rows) = store.accounts(&id) else {
+            return;
+        };
+        let now_s = self.now_ms.div_euclid(1000);
+        let budget = p.poll_budget();
+        let mut found = Vec::new();
+        let mut identities = BTreeSet::new();
+        for row in &rows {
+            if identities.insert(row.identity_key.clone()) {
+                let since = now_s - budget.count_window_s;
+                match store.usage_request_count(&id, &row.identity_key, since) {
+                    Ok(n) if n >= budget.hourly_requests => found.push(
+                        Check::warn(
+                            "usage.budget",
+                            format!(
+                                "account {} has used all {} usage requests of the past hour",
+                                row.position, budget.hourly_requests
+                            ),
+                        )
+                        .fix("wait: tagteam sends no more until the oldest leaves the hour; a second `tagteam auto`, or another tool polling the account, uses it up"),
+                    ),
+                    Ok(_) => {}
+                    Err(e) => found.push(
+                        Check::warn(
+                            "usage.budget",
+                            format!(
+                                "account {}'s usage requests of the past hour cannot be counted: {e}",
+                                row.position
+                            ),
+                        )
+                        .fix(restore(self.engine)),
+                    ),
+                }
+            }
+            let state = match store.usage_state(&row.id) {
+                Ok(Some(state)) => state,
+                Ok(None) => continue,
+                Err(e) => {
+                    found.push(
+                        Check::warn(
+                            "usage.state",
+                            format!("account {}'s usage state cannot be read: {e}", row.position),
+                        )
+                        .fix(restore(self.engine)),
+                    );
+                    continue;
+                }
+            };
+            if let Some(until) = state
+                .backoff_until
+                .filter(|u| backoff_holds(Some(*u), now_s))
+            {
+                found.push(
+                    Check::info(
+                        "usage.backoff",
+                        format!(
+                            "account {}'s usage is backed off after {}; the next try is in {}",
+                            row.position,
+                            state.last_error.as_deref().unwrap_or("a failure"),
+                            span(until - now_s)
+                        ),
+                    )
+                    .fix("nothing to do: tagteam tries again then"),
+                );
+            }
+            let skewed: Vec<(&str, i64)> = [
+                state
+                    .fetched_at
+                    .filter(|t| is_future_stamped(*t, now_s))
+                    .map(|t| ("reading", t)),
+                state
+                    .next_poll_at
+                    .filter(|t| plan_is_skewed(*t, now_s, &budget))
+                    .map(|t| ("poll plan", t)),
+                state
+                    .backoff_until
+                    .filter(|t| backoff_is_skewed(*t, now_s))
+                    .map(|t| ("backoff", t)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            for (what, at) in skewed {
+                found.push(
+                    Check::warn(
+                        "usage.clock-skew",
+                        format!(
+                            "account {}'s {what} is stamped {} ahead of now: the clock is, or was, skewed",
+                            row.position,
+                            span(at - now_s)
+                        ),
+                    )
+                    .fix("check the system clock; tagteam ignores the stamp, and the next fetch replaces it"),
+                );
+            }
+        }
+        if found.is_empty() && !rows.is_empty() {
+            found.push(Check::ok(
+                "usage.state",
+                "no account is backed off, over its budget or stamped by a skewed clock",
+            ));
+        }
+        for check in found {
+            self.push(Some(&id), check);
+        }
+    }
+
+    /// §13.6 Pending storage, `rescue/` (§6.3): a path that is not a listable directory fails;
+    /// each pending rescue warns under its account's provider, and one whose account is gone
+    /// under tagteam's own.
+    fn rescues(&mut self, only: Option<&ProviderId>) {
+        let dir = self.engine.env.data_dir().join("rescue");
+        let paths = match entries(&dir) {
+            Ok(paths) => paths,
+            Err(e) => {
+                self.push(
+                    None,
+                    Check::fail(
+                        "pending.rescue-dir",
+                        format!(
+                            "{} is not a directory tagteam can list ({e}), so every account's rescues are unknown: `remove` refuses, and no account can be activated safely",
+                            dir.display()
+                        ),
+                    )
+                    .fix(format!(
+                        "move {} aside if it is not tagteam's, or make it a directory again; `tagteam purge` deletes it with everything else",
+                        quoted(&dir)
+                    )),
+                );
+                return;
+            }
+        };
+        let Some(accounts) = self.all_accounts() else {
+            return;
+        };
+        let files = paths.into_iter().filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| !n.starts_with('.') && n.ends_with(".json"))
+        });
+        for path in files {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let owner = accounts
+                .iter()
+                .find(|r| name.starts_with(&format!("{}-", r.id)));
+            match owner {
+                Some(row) => {
+                    if only.is_some_and(|p| p != &row.provider) {
+                        continue;
+                    }
+                    let provider = row.provider.clone();
+                    self.push(
+                        Some(&provider),
+                        Check::warn(
+                            "pending.rescue",
+                            format!(
+                                "account {} has a refreshed login in {} that is not in the vault yet",
+                                row.position,
+                                path.display()
+                            ),
+                        )
+                        .fix("nothing to do: the account's next refresh or activation adopts it; if it stays, check that the vault can be written"),
+                    );
+                }
+                None => self.push(
+                    None,
+                    Check::warn(
+                        "pending.rescue-orphan",
+                        format!("{} belongs to no account of this store", path.display()),
+                    )
+                    .fix(format!(
+                        "`tagteam purge` deletes it with everything else, or delete it: rm {}",
+                        quoted(&path)
+                    )),
+                ),
+            }
+        }
+    }
+
+    /// §13.6 Pending storage, `displaced/` (§6.3): its entries, by provider, and a file with no
+    /// row or a row with no file, all `info`. Read through M5a's listing, over the read-only
+    /// store.
+    fn displaced(&mut self, only: Option<&ProviderId>) {
+        if matches!(self.stored, Stored::Unusable) {
+            return;
+        }
+        let list = match self.engine.displaced_in(self.store_ref()) {
+            Ok(list) => list,
+            Err(e) => {
+                self.push(
+                    None,
+                    Check::warn(
+                        "pending.displaced",
+                        format!("the displaced credentials cannot be listed: {e}"),
+                    ),
+                );
+                return;
+            }
+        };
+        let mut counts: Vec<(ProviderId, usize)> = Vec::new();
+        for e in &list.entries {
+            if let Some(p) = &e.provider {
+                if only.is_some_and(|o| o != p) {
+                    continue;
+                }
+                match counts.iter_mut().find(|(q, _)| q == p) {
+                    Some((_, n)) => *n += 1,
+                    None => counts.push((p.clone(), 1)),
+                }
+            }
+        }
+        for (p, n) in counts {
+            self.push(
+                Some(&p),
+                Check::info(
+                    "pending.displaced",
+                    format!(
+                        "{n} displaced credential(s) in {}: logins a command overwrote, kept for a manual restore",
+                        list.dir.display()
+                    ),
+                )
+                .fix("`tagteam displaced` lists them; `tagteam displaced --purge ID` deletes one"),
+            );
+        }
+        for e in &list.entries {
+            if only.is_some_and(|o| e.provider.as_ref().is_some_and(|p| p != o)) {
+                continue;
+            }
+            let file = list.dir.join(format!("{}.json", e.id));
+            if !e.recorded {
+                self.push(
+                    None,
+                    Check::info(
+                        "pending.displaced-unrecorded",
+                        format!("{} has no row in the store", file.display()),
+                    )
+                    .fix(format!("`tagteam displaced --purge {}` deletes it", e.id)),
+                );
+            } else if !e.file_present {
+                self.push(
+                    e.provider.as_ref(),
+                    Check::info(
+                        "pending.displaced-missing",
+                        format!("the displaced entry {} has a row but no file", e.id),
+                    )
+                    .fix(format!(
+                        "`tagteam displaced --purge {}` deletes the row",
+                        e.id
+                    )),
+                );
+            }
+        }
+    }
+
+    /// §13.6 Interrupted switch, for `p`: each journal row, by its holder's liveness (§12.6).
+    /// A dead holder's row warns when §9.6 can decide it from fingerprints alone, and fails
+    /// when it cannot. Doctor recovers nothing, and asks no oracle.
+    fn journal(&mut self, p: &dyn Provider) {
+        let Some(store) = self.store_ref() else {
+            return;
+        };
+        let id = p.id();
+        let rows: Vec<JournalRow> = match store.journals() {
+            Ok(rows) => rows.into_iter().filter(|r| r.provider == id).collect(),
+            Err(e) => {
+                self.push(
+                    Some(&id),
+                    Check::warn(
+                        "switch.interrupted",
+                        format!("the switch journal cannot be read: {e}"),
+                    ),
+                );
+                return;
+            }
+        };
+        let mut found = Vec::new();
+        for row in &rows {
+            let position = store
+                .account(&row.to_id)
+                .ok()
+                .flatten()
+                .map_or_else(|| row.to_id.to_string(), |a| a.position.to_string());
+            let force = command(self.engine, &id, &format!("switch {position} --force"));
+            let holder = format!("pid {}, started {}", row.holder.pid, row.holder.start);
+            found.push(match row.holder.liveness() {
+                Liveness::Live => Check::info(
+                    "switch.interrupted",
+                    format!("a switch to account {position} is under way ({holder})"),
+                ),
+                Liveness::Unknown(e) => Check::warn(
+                    "switch.interrupted",
+                    format!(
+                        "a switch to account {position} is journaled by {holder}, which reads as live but may be another user's recycled pid ({e})"
+                    ),
+                )
+                .fix(format!("if no tagteam process is running, `{force}`")),
+                Liveness::Dead => self.dead_switch(p, store, row, &position, &force),
+            });
+        }
+        if rows.is_empty() {
+            found.push(Check::ok("switch.interrupted", "no switch was interrupted"));
+        }
+        for check in found {
+            self.push(Some(&id), check);
+        }
+    }
+
+    /// §9.6's table, from the live login's fingerprints alone, for a row whose holder died.
+    fn dead_switch(
+        &self,
+        p: &dyn Provider,
+        store: &Store,
+        row: &JournalRow,
+        position: &str,
+        force: &str,
+    ) -> Check {
+        // `switch N` always takes `MutationGuard`, so it recovers the row first (§9.6), then
+        // makes the switch that was being made; `list` takes it only when the live account's
+        // usage is due.
+        let retry = command(self.engine, &p.id(), &format!("switch {position}"));
+        if self.secrets() != Secrets::Readable {
+            return Check::warn(
+                "switch.interrupted",
+                format!(
+                    "a switch to account {position} was interrupted; whether it can be recovered cannot be read while the Keychain is locked"
+                ),
+            )
+            .fix(format!("unlock the Keychain; `{retry}` then recovers it"));
+        }
+        let live = p.read_live_auth(&self.engine.env);
+        // §13.6: a live login that cannot be read is an input that cannot be read, never an
+        // undecidable switch, which `direction` would make of it.
+        if let Err(e) = crate::switch::refuse_unsafe_live_reads(&live) {
+            return Check::warn(
+                "switch.interrupted",
+                format!(
+                    "a switch to account {position} was interrupted, and the live login cannot be read to judge it: {e}"
+                ),
+            )
+            .fix(format!(
+                "make the live login readable again; `{retry}` then recovers it"
+            ));
+        }
+        match self.engine.direction(p, store, row, &live, &[]) {
+            Ok(Direction::Undecidable) => Check::fail(
+                "switch.interrupted",
+                format!(
+                    "a switch to account {position} was interrupted, and the live login cannot tell whether it landed: commands that change accounts refuse until it is settled"
+                ),
+            )
+            .fix(format!("`{force}` settles it by activating the account you name")),
+            Ok(_) => Check::warn(
+                "switch.interrupted",
+                format!("a switch to account {position} was interrupted"),
+            )
+            .fix(format!(
+                "`{retry}` recovers it, then makes the switch it was making"
+            )),
+            Err(e) => Check::warn(
+                "switch.interrupted",
+                format!("a switch to account {position} was interrupted, and cannot be judged: {e}"),
+            )
+            .fix(format!("`{retry}` recovers it if it can")),
+        }
+    }
+
+    /// §13.6 Auto-switch, for `p`: whether an engine runs, by its lock record and an exact pid
+    /// and start-time match (§11.1); unhealthy ticks; and the settings a tick would warn about.
+    fn auto(&mut self, p: &dyn Provider) {
+        let id = p.id();
+        let lock = engine_lock_path(&self.engine.env, &id);
+        let running = match read_holder(&lock) {
+            Read::Absent => Check::ok("auto.engine", "auto-switch is not running"),
+            Read::Present(stamp) => match stamp.liveness() {
+                Liveness::Live => Check::info(
+                    "auto.engine",
+                    format!("auto-switch runs as pid {}", stamp.pid),
+                ),
+                Liveness::Dead => Check::ok(
+                    "auto.engine",
+                    format!(
+                        "auto-switch is not running (its last engine, pid {}, has exited)",
+                        stamp.pid
+                    ),
+                ),
+                Liveness::Unknown(e) => Check::info(
+                    "auto.engine",
+                    format!(
+                        "auto-switch may run as pid {}, which cannot be checked ({e})",
+                        stamp.pid
+                    ),
+                ),
+            },
+            Read::Unreadable(e) => Check::warn(
+                "auto.engine",
+                format!("whether auto-switch runs cannot be told: {e}"),
+            ),
+        };
+        self.push(Some(&id), running);
+        if let Some(store) = self.store_ref() {
+            let unhealthy = match store.autoswitch_state(&id) {
+                Ok(state) if state.unhealthy_ticks > 0 => Some(
+                    Check::warn(
+                        "auto.unhealthy",
+                        format!(
+                            "the last {} auto-switch tick(s) could not read the live account's usage",
+                            state.unhealthy_ticks
+                        ),
+                    )
+                    .fix("`tagteam list` shows why the live account's usage cannot be read"),
+                ),
+                Ok(_) => None,
+                Err(e) => Some(
+                    Check::warn(
+                        "auto.unhealthy",
+                        format!("the auto-switch state cannot be read: {e}"),
+                    )
+                    .fix(restore(self.engine)),
+                ),
+            };
+            if let Some(check) = unhealthy {
+                self.push(Some(&id), check);
+            }
+        }
+        let (settings, _) = Settings::load(&self.engine.env, &id);
+        if settings.strategy == Strategy::ConsumeFirst && p.primary_long_window().is_none() {
+            self.push(
+                Some(&id),
+                Check::warn(
+                    "auto.strategy",
+                    format!(
+                        "autoswitch.strategy is consume-first, but {} has no long usage window to rank by, so auto-switch runs best",
+                        p.display_name()
+                    ),
+                )
+                .fix(format!(
+                    "`tagteam config set provider.{id}.autoswitch.strategy best`"
+                )),
+            );
+        }
+        self.models(p, &settings);
+    }
+
+    /// §11.2 step 3's model check, as the tick's `config-warning` makes it: each
+    /// `autoswitch.models` name should be a scoped window some account's last reading reports.
+    /// Nothing is said until some account has a reading.
+    fn models(&mut self, p: &dyn Provider, settings: &Settings) {
+        let Some(store) = self.store_ref() else {
+            return;
+        };
+        let id = p.id();
+        let names: Vec<&String> = settings
+            .models
+            .iter()
+            .filter(|m| !m.eq_ignore_ascii_case("all"))
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        let (mut read_any, mut scoped, mut unread) = (false, BTreeSet::new(), None);
+        // The accounts `accounts.vault` read: it reports them when they cannot be read.
+        for row in store.accounts(&id).unwrap_or_default() {
+            match store.usage_state(&row.id) {
+                Ok(state) => {
+                    if let Some(windows) = state.and_then(|s| s.last_good) {
+                        read_any = true;
+                        scoped.extend(
+                            windows
+                                .iter()
+                                .filter(|w| w.kind == WindowKind::Scoped)
+                                .map(|w| w.label.to_lowercase()),
+                        );
+                    }
+                }
+                Err(e) => {
+                    unread = Some((row.position, e));
+                    break;
+                }
+            }
+        }
+        if let Some((n, e)) = unread {
+            let check = Check::warn(
+                "auto.models",
+                format!(
+                    "whether autoswitch.models names a model no account's usage reports cannot be told: account {n}'s usage state cannot be read ({e})"
+                ),
+            )
+            .fix(restore(self.engine));
+            self.push(Some(&id), check);
+            return;
+        }
+        if !read_any {
+            return;
+        }
+        let missing: Vec<String> = names
+            .into_iter()
+            .filter(|n| !scoped.contains(&n.to_lowercase()))
+            .cloned()
+            .collect();
+        for name in missing {
+            self.push(
+                Some(&id),
+                Check::warn(
+                    "auto.models",
+                    format!(
+                        "autoswitch.models names {name:?}, but no account's usage reports a window for that model"
+                    ),
+                )
+                .fix("check the name against `tagteam list`, then `tagteam config set autoswitch.models …`"),
+            );
         }
     }
 
