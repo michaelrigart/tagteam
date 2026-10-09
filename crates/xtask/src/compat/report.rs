@@ -102,7 +102,38 @@ impl Redactor {
         }
     }
 
+    /// `s` as it may be shown. Token-shaped runs are found on the ORIGINAL text and replaced
+    /// first; learned values are replaced only in what lies between them, so an identity
+    /// placeholder can never split a token and leave the tail of its secret below the pattern.
     pub fn text(&self, s: &str) -> String {
+        let mut redacted = String::with_capacity(s.len());
+        let mut plain = String::new();
+        let mut run = String::new();
+        let flush = |run: &mut String, plain: &mut String, redacted: &mut String| {
+            if run.len() >= 40 || run.contains("sk-ant-") {
+                redacted.push_str(&self.identities(plain));
+                plain.clear();
+                redacted.push_str("<token>");
+            } else {
+                plain.push_str(run);
+            }
+            run.clear();
+        };
+        for c in s.chars() {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                run.push(c);
+            } else {
+                flush(&mut run, &mut plain, &mut redacted);
+                plain.push(c);
+            }
+        }
+        flush(&mut run, &mut plain, &mut redacted);
+        redacted.push_str(&self.identities(&plain));
+        redacted
+    }
+
+    /// Every learned value in `s` as its placeholder (a short one only as a whole word).
+    fn identities(&self, s: &str) -> String {
         let mut out = s.to_owned();
         for (value, placeholder) in &self.known {
             out = if value.chars().count() < 4 {
@@ -111,26 +142,7 @@ impl Redactor {
                 out.replace(value.as_str(), placeholder)
             };
         }
-        let mut redacted = String::with_capacity(out.len());
-        let mut run = String::new();
-        let flush = |run: &mut String, redacted: &mut String| {
-            if run.len() >= 40 || run.contains("sk-ant-") {
-                redacted.push_str("<token>");
-            } else {
-                redacted.push_str(run);
-            }
-            run.clear();
-        };
-        for c in out.chars() {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                run.push(c);
-            } else {
-                flush(&mut run, &mut redacted);
-                redacted.push(c);
-            }
-        }
-        flush(&mut run, &mut redacted);
-        redacted
+        out
     }
 
     /// `v` by its structure: every string value as `text`, and an object key only where it is
@@ -517,6 +529,28 @@ fn evidence_md(evidence: &[Evidence]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_learned_value_inside_a_token_cannot_split_it_and_leave_its_tail() {
+        // Codex slice 10 re-review: identity replacement ran first, so `Acme` inside the token
+        // became a placeholder, and the last 12 secret characters fell below the token pattern.
+        let mut r = Redactor::default();
+        r.learn("Acme", "<account 1 org>".into());
+        let token = format!("sk-ant-oat01-{}Acme{}", "A".repeat(44), "B".repeat(12));
+        assert_eq!(r.text(&token), "<token>");
+        let around = format!("org Acme used {token} for Acme");
+        assert_eq!(
+            r.text(&around),
+            "org <account 1 org> used <token> for <account 1 org>"
+        );
+        assert!(!r.text(&token).contains('B'));
+        // Structure and bytes go the same way.
+        assert_eq!(
+            r.value(&json!({"k": token.clone()})),
+            json!({"k": "<token>"})
+        );
+        assert_eq!(r.bytes(token.as_bytes()), b"<token>");
+    }
 
     fn result(id: &'static str, status: Status) -> CheckResult {
         CheckResult {
