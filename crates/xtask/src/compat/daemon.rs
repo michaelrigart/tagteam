@@ -59,22 +59,19 @@ fn roster_pid_lives(probe: &dyn ProcessProbe, record: &SessionRecord) -> bool {
             || probe.mentions(record.pid, LAUNCH) != Some(false))
 }
 
-fn bare(pid: u64) -> Option<SessionRecord> {
-    Some(SessionRecord {
-        pid: u32::try_from(pid).ok()?,
-        proc_start: None,
-        started_at_ms: None,
-        kind: None,
-    })
-}
-
-/// The pids `daemon/roster.json` names: `supervisorPid`, and the `pid` of each entry under
-/// `workers` (an object's values or an array's elements), with whatever start time sits beside
-/// a worker's pid.
-fn roster_records(roster: &Value) -> Vec<(String, SessionRecord)> {
-    let mut out = Vec::new();
-    if let Some(r) = roster["supervisorPid"].as_u64().and_then(bare) {
-        out.push(("the roster's supervisor".to_owned(), r));
+/// What `daemon/roster.json` names, judged as a worker's own record is: each entry under
+/// `workers` (an object's values or an array's elements) by its `pid` and any start time beside
+/// it, and its repl process (`replPid`, with `replProcStart`) the same way. Whatever does not
+/// parse is returned as unreadable, since it may hide a process: an entry that is no object
+/// with a pid, a `replPid` or a `supervisorPid` that is no integer (`null` is no pid). The
+/// roster's `supervisorPid` is checked for its type only: a bare pid in a file that keeps stale
+/// ones proves nothing, and the live supervisor is `daemon.lock`'s (`read_lock`).
+fn roster_records(roster: &Value) -> (Vec<(String, SessionRecord)>, Vec<String>) {
+    let (mut out, mut unreadable) = (Vec::new(), Vec::new());
+    match &roster["supervisorPid"] {
+        Value::Null => {}
+        v if v.as_u64().and_then(|p| u32::try_from(p).ok()).is_some() => {}
+        _ => unreadable.push("daemon/roster.json (supervisorPid is no pid)".to_owned()),
     }
     let entries: Vec<&Value> = match &roster["workers"] {
         Value::Object(o) => o.values().collect(),
@@ -82,11 +79,39 @@ fn roster_records(roster: &Value) -> Vec<(String, SessionRecord)> {
         _ => Vec::new(),
     };
     for entry in entries {
-        if let Ok(r) = parse_session_record(entry.to_string().as_bytes()) {
-            out.push(("a worker in the roster".to_owned(), r));
+        match parse_session_record(entry.to_string().as_bytes()) {
+            Ok(r) => out.push(("a worker in the roster".to_owned(), r)),
+            Err(detail) => {
+                unreadable.push(format!("a worker in daemon/roster.json ({detail})"));
+                continue;
+            }
+        }
+        match &entry["replPid"] {
+            Value::Null => {}
+            v => match v.as_u64().and_then(|p| u32::try_from(p).ok()) {
+                Some(pid) => {
+                    let proc_start = match &entry["replProcStart"] {
+                        Value::String(s) => Some(s.clone()),
+                        Value::Number(n) => Some(n.to_string()),
+                        _ => None,
+                    };
+                    out.push((
+                        "a worker's repl in the roster".to_owned(),
+                        SessionRecord {
+                            pid,
+                            proc_start,
+                            started_at_ms: None,
+                            kind: None,
+                        },
+                    ));
+                }
+                None => {
+                    unreadable.push("a worker in daemon/roster.json (replPid is no pid)".to_owned())
+                }
+            },
         }
     }
-    out
+    (out, unreadable)
 }
 
 /// `daemon.lock` (CC 2.1.292) into `s`: a live supervisor is alive, a lock that cannot be read
@@ -139,7 +164,9 @@ pub fn survey(home: &Path, probe: &dyn ProcessProbe) -> Survey {
     match fs::read(home.join("daemon/roster.json")) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
             Ok(roster) => {
-                for (what, r) in roster_records(&roster) {
+                let (records, unreadable) = roster_records(&roster);
+                s.unreadable.extend(unreadable);
+                for (what, r) in records {
                     if roster_pid_lives(probe, &r) {
                         s.alive.push(format!("{what} (pid {})", r.pid));
                     }
@@ -396,7 +423,8 @@ mod tests {
             ]
         );
 
-        // The supervisor's pid alone, as an array of workers names none.
+        // A bare supervisorPid proves nothing: with no daemon.lock it is not counted, though
+        // the pid runs (the roster keeps stale pids).
         fs::write(
             h.join("daemon/roster.json"),
             json!({"supervisorPid": 205, "workers": [{"pid": 206}]}).to_string(),
@@ -404,8 +432,82 @@ mod tests {
         .unwrap();
         let probe = FakeProcessProbe::new();
         running(&probe, 205, STARTED);
+        assert!(survey(&h, &probe).is_clear(), "{:?}", survey(&h, &probe));
+
+        // With a daemon.lock naming it, the supervisor is the lock's, judged by its procStart,
+        // and counted once.
+        lock(&h, 205);
+        assert_eq!(
+            survey(&h, &probe).alive,
+            ["the supervisor in daemon.lock (pid 205)"]
+        );
+        fs::remove_file(h.join("daemon.lock")).unwrap();
+        fs::remove_dir_all(&h).unwrap();
+    }
+
+    #[test]
+    fn a_worker_s_repl_process_counts_by_its_own_start_time() {
+        let h = home("repl");
+        fs::write(
+            h.join("daemon/roster.json"),
+            json!({"workers": {
+                "a": {"pid": 211, "procStart": LSTART, "replPid": 212, "replProcStart": LSTART},
+                "b": {"pid": 213, "procStart": LSTART, "replPid": 214, "replProcStart": LSTART},
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let probe = FakeProcessProbe::new();
+        // The workers are gone; repl 212 is the recorded process, and 214 was recycled.
+        running(&probe, 212, STARTED);
+        probe.set(
+            214,
+            FakeProcess {
+                exists: Some(true),
+                start_time_s: Some(STARTED + 9_000),
+                mentions_launch: Some(false),
+                ..FakeProcess::default()
+            },
+        );
         let s = survey(&h, &probe);
-        assert_eq!(s.alive, ["the roster's supervisor (pid 205)"]);
+        assert_eq!(s.alive, ["a worker's repl in the roster (pid 212)"]);
+        fs::remove_dir_all(&h).unwrap();
+    }
+
+    #[test]
+    fn a_roster_entry_that_does_not_parse_cannot_be_verified() {
+        let h = home("roster-bad");
+        let probe = FakeProcessProbe::new();
+        for (roster, named) in [
+            (
+                json!({"workers": {"a": {"no": "pid"}}}),
+                "a worker in daemon/roster.json",
+            ),
+            (
+                json!({"workers": ["nope"]}),
+                "a worker in daemon/roster.json",
+            ),
+            (
+                json!({"workers": {"a": {"pid": 221, "replPid": "x"}}}),
+                "replPid is no pid",
+            ),
+            (json!({"supervisorPid": "x"}), "supervisorPid is no pid"),
+            (json!({"supervisorPid": -4}), "supervisorPid is no pid"),
+        ] {
+            fs::write(h.join("daemon/roster.json"), roster.to_string()).unwrap();
+            let s = survey(&h, &probe);
+            assert!(
+                !s.is_clear() && s.describe().contains(named),
+                "{roster}: {s:?}"
+            );
+        }
+        // null is no pid: a roster without a supervisor yet.
+        fs::write(
+            h.join("daemon/roster.json"),
+            json!({"supervisorPid": null, "workers": {}}).to_string(),
+        )
+        .unwrap();
+        assert!(survey(&h, &probe).is_clear());
         fs::remove_dir_all(&h).unwrap();
     }
 
