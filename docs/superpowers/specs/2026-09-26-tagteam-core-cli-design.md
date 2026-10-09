@@ -1,6 +1,6 @@
 # tagteam — sub-project 1: Core + CLI
 
-**Status:** In progress
+**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/10
 **Date:** 2026-09-26
 **Scope:** Sub-project 1 of 4, plus a provider extension point. The daemon (2), TUI (3) and
 macOS menu bar (4) get their own specs and must not require reshaping anything defined here.
