@@ -1,5 +1,7 @@
 //! §13.6 `doctor`, engine side: one fixture state per check, and the read-only invariant
-//! (B.67): doctor creates nothing, changes no byte, and never unlocks or asks.
+//! (B.67): doctor itself creates nothing, changes no byte, and never unlocks or asks. The
+//! `claude` it runs is a scripted spawner here, so Claude Code's own start-up writes (Appendix
+//! A.7) are out of these tests' reach.
 
 mod common;
 

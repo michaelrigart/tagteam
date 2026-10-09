@@ -1,8 +1,12 @@
 //! §13.6 `tagteam doctor`: tagteam's own state and its interop with each provider. Doctor is
-//! read-only (B.67). It takes no `MutationGuard` and no account lock, and runs no recovery
-//! (Decision 4). It opens the store read-only and never migrates it (Decision 3). It tests locks
-//! without waiting, reads the vault only when the Keychain is unlocked, and creates nothing: no
-//! data directory, store, log or lock file. Every finding names its fix.
+//! read-only (B.67): it writes nothing and creates nothing itself. It takes no `MutationGuard`
+//! and no account lock, and runs no recovery (Decision 4). It opens the store read-only and
+//! never migrates it (Decision 3). It tests locks without waiting, reads the vault only when
+//! the Keychain is unlocked, and creates no data directory, store, log or lock file. The
+//! `claude` it runs (`--version`, `auth status`) may make Claude Code's own start-up writes in
+//! the home it starts in, as any `claude` start does (Appendix A.7); doctor does not run
+//! `claude auth status` in a home whose global config does not exist. Every finding names its
+//! fix.
 
 use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};

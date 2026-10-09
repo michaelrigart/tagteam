@@ -192,8 +192,9 @@ fn auth_status_runs_in_the_outer_home_s_environment() {
 
 #[test]
 fn a_home_with_no_global_config_is_not_asked_and_is_reported_as_never_started() {
-    // §13.6, Appendix A.7: `claude auth status` creates the global config where it is missing,
-    // so doctor does not run it there.
+    // §13.6, Appendix A.7: Claude Code's start-up creates the global config where it is missing
+    // (and `backups/`, and a config lock it may leave), so doctor does not run `claude auth
+    // status` there.
     let f = fx();
     f.install_claude();
     let global = CcPaths::resolve(&f.env).global_config;

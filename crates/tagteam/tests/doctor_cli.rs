@@ -1,6 +1,7 @@
 //! `tagteam doctor` through the binary (§13.6): its shapes, its exit codes, and B.67 — it
-//! writes nothing, creates nothing and asks nothing, over SSH-like conditions included
-//! (Review Focus 4).
+//! itself writes nothing, creates nothing and asks nothing, over SSH-like conditions included
+//! (Review Focus 4). The `claude` it runs may make Claude Code's own start-up writes (Appendix
+//! A.7); these tests run with no `claude` on `PATH`.
 #![cfg(feature = "test-support")]
 
 mod common;

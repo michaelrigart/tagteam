@@ -438,10 +438,14 @@ fn auth_fix(paths: &CcPaths) -> String {
 
 /// The default home's login, by `claude auth status` (Appendix A.7) in the outer home's
 /// environment: `env`'s two home variables replace the process's, so inside a run shell it
-/// asks about the default home, not the profile (§12.8). Where that home's global config exists
-/// it writes nothing (§15.4); where it does not, Claude Code's start-up would create it, so
-/// `claude` is not run there (§13.6, Appendix A.7): a global config that is missing is reported
-/// as a home Claude Code has not been started in, and one that cannot be told is a warning.
+/// asks about the default home, not the profile (§12.8). Claude Code writes nothing there once it
+/// has initialized the global config (§15.4). Where the config is absent, or present but not yet
+/// initialized by Claude Code (one tagteam seeded, or the first start after an upgrade), its
+/// start-up writes the config and `backups/` and may leave a config lock behind (Appendix A.7).
+/// So `claude` is not run where the global config does not exist (§13.6): a missing one is
+/// reported as a home Claude Code has not been started in, and one that cannot be told is a
+/// warning. Where it exists, doctor still cannot tell an initialized config from a seeded one,
+/// and the `claude` it runs may make those start-up writes (B.67).
 fn auth(
     bin: &Path,
     env: &Env,
