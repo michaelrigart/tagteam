@@ -75,15 +75,17 @@ struct Temp<'a> {
 
 impl Drop for Temp<'_> {
     /// A temp file that cannot be removed is left behind: a contained error, logged at WARN
-    /// with its cause, never discarded (§14). One that is already gone was never left behind.
+    /// with its cause, never discarded (§14). The line names the file by its role, never its
+    /// path: it sits beside its target, perhaps in a Claude Code home the user named
+    /// (`CLAUDE_CONFIG_DIR`), and §14.2 keeps such a name out of the log. One that is already
+    /// gone was never left behind.
     fn drop(&mut self) {
         if self.published {
             return;
         }
         match fs::remove_file(self.path) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => tracing::warn!(
-                path = %self.path.display(),
-                "could not remove a temporary file: {e}"
+                "could not remove the temporary file of a write that was not published, left beside its target: {e}"
             ),
             _ => {}
         }
@@ -138,8 +140,34 @@ fn write_atomic_mode_with<E: From<io::Error>>(
         .and_then(|()| fs::rename(&tmp, &target).map_err(E::from))?;
     temp.published = true;
     // Published: from here on nothing may report failure.
-    let _ = File::open(dir).and_then(|d| d.sync_all());
+    sync_parent(dir, "a file tagteam wrote");
     Ok(())
+}
+
+/// §14: after a published write, the parent directory's `fsync`, best effort. The rename has
+/// published the file, so nothing here fails the write. A filesystem that does not sync a
+/// directory refuses on every call with `EINVAL`, `ENOTSUP` or `EOPNOTSUPP` (macOS's `sync_all`
+/// is `F_FULLFSYNC`, which devfs refuses with `ENOTSUP`): that stays silent. Any other failure,
+/// an `EIO` say, is logged at WARN with its cause and the file's `role`, never a path (§14.2).
+pub fn sync_parent(dir: &Path, role: &str) {
+    if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
+        if let Some(line) = parent_sync_warning(role, &e) {
+            tracing::warn!("{line}");
+        }
+    }
+}
+
+/// `sync_parent`'s WARN line for `e`, or `None` where the filesystem does not sync directories.
+fn parent_sync_warning(role: &str, e: &io::Error) -> Option<String> {
+    let unsupported = [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP];
+    if e.raw_os_error()
+        .is_some_and(|code| unsupported.contains(&code))
+    {
+        return None;
+    }
+    Some(format!(
+        "could not sync the directory of {role} after publishing it, so it may not survive a crash: {e}"
+    ))
 }
 
 /// Removes the file a path resolves to and leaves any symlink in place, the mirror image of
@@ -293,6 +321,26 @@ mod tests {
         write_atomic(&p, b"new", 0o600).unwrap();
         assert_eq!(fs::read(&p).unwrap(), b"new");
         assert_eq!(mode(&p), 0o644);
+    }
+
+    #[test]
+    fn a_parent_directory_sync_is_silent_only_where_the_filesystem_does_not_do_it() {
+        // §14: the unsupported answers stay silent; any other cause is a WARN line that names
+        // the file's role and the cause, never a path.
+        for code in [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP] {
+            let e = io::Error::from_raw_os_error(code);
+            assert_eq!(parent_sync_warning("an export", &e), None, "{e}");
+        }
+        let eio = io::Error::from_raw_os_error(libc::EIO);
+        let line = parent_sync_warning("an export", &eio).unwrap();
+        assert!(
+            line.contains("directory of an export") && line.contains("(os error 5)"),
+            "{line}"
+        );
+        // A real directory syncs, and a missing one is reported, never fatal.
+        let d = tempfile::tempdir().unwrap();
+        sync_parent(d.path(), "a test file");
+        sync_parent(&d.path().join("gone"), "a test file");
     }
 
     #[test]
@@ -468,8 +516,14 @@ mod tests {
         let warnings: Vec<&String> = logs.iter().filter(|l| l.contains("WARN")).collect();
         assert_eq!(warnings.len(), 1, "{logs:?}");
         assert!(
-            warnings[0].contains("could not remove a temporary file")
-                && warnings[0].contains(".c.json.tagteam-"),
+            warnings[0].contains("could not remove the temporary file of a write"),
+            "{}",
+            warnings[0]
+        );
+        // §14.2: its role and cause, never the path, which may name a Claude Code home.
+        assert!(
+            !warnings[0].contains(".c.json.tagteam-")
+                && !warnings[0].contains(&d.path().display().to_string()),
             "{}",
             warnings[0]
         );

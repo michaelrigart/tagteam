@@ -94,12 +94,39 @@ fn trusted_span(stale: Duration) -> Duration {
 /// Removes the lock directory at `path` only while it is still the one this holder made: the
 /// device and inode of its held fd, and, once touched, the mtime it set (§9.1). For a start that
 /// fails after the directory was established as its own; the caller still holds the fd, so the
-/// inode cannot have been reused.
+/// inode cannot have been reused. A directory that cannot be removed holds the lock until it
+/// goes stale: logged at WARN with its cause (§14), as the caller reports its own failure.
 fn remove_if_ours(path: &Path, id: DirId, set: Option<SystemTime>) {
     let ours = fs::symlink_metadata(path)
         .is_ok_and(|m| DirId::of(&m) == id && set.is_none_or(|t| m.modified().ok() == Some(t)));
     if ours {
-        let _ = fs::remove_dir(path);
+        warn_if_left(path, fs::remove_dir(path));
+    }
+}
+
+/// §14: a lock directory this holder made and could not remove is a contained error, logged
+/// at WARN with its cause; Claude Code waits on it until it goes stale (§9.1). One already
+/// gone was not left.
+fn warn_if_left(path: &Path, removed: io::Result<()>) {
+    match removed {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => tracing::warn!(
+            "could not remove {}, which this process made, so it holds the lock until it goes stale: {e}",
+            lock_role(path)
+        ),
+        _ => {}
+    }
+}
+
+/// Which lock a directory is, by the name Claude Code gives each of its locks (§9.1): what a
+/// log line names instead of the path. The path is under a Claude Code home, which the user may
+/// have named after themselves (`CLAUDE_CONFIG_DIR`), and §14.2 keeps such names out of the log.
+fn lock_role(path: &Path) -> &'static str {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(".oauth_refresh.lock") => "Claude Code's refresh lock",
+        Some(".storage-write") => "Claude Code's storage-write lock",
+        Some(".claude.json.lock") => "Claude Code's config lock",
+        Some(name) if name.ends_with(".lock") => "Claude Code's credential lock",
+        _ => "a lock directory",
     }
 }
 
@@ -273,7 +300,14 @@ impl MkdirLock {
                         // and this touch is never touched (L356).
                         match touch(&st.dir, SystemTime::now()) {
                             Ok(t) => *last = t,
-                            Err(_) => st.compromised.store(true, Ordering::SeqCst),
+                            Err(e) => {
+                                // §14: the holder's next check reports the loss, not its cause.
+                                tracing::warn!(
+                                    "could not touch {}, which this process holds, so the lock counts as lost: {e}",
+                                    lock_role(&path)
+                                );
+                                st.compromised.store(true, Ordering::SeqCst);
+                            }
                         }
                     }
                 }
@@ -331,7 +365,7 @@ impl Drop for MkdirLock {
         // The check and the `rmdir` are two steps: a takeover between them needs this holder
         // to stall for the whole staleness window inside that gap, as with `proper-lockfile`.
         if self.check_owned().is_ok() {
-            let _ = fs::remove_dir(&self.path);
+            warn_if_left(&self.path, fs::remove_dir(&self.path));
         }
     }
 }
@@ -438,6 +472,53 @@ mod tests {
     /// Makes the step at `point` fail for the lock at `path`, after the hooks set before this.
     fn fail_at(path: &Path, point: Point) {
         seam::set(path, point, || Err(io::Error::other("injected failure")));
+    }
+
+    /// The `tracing` lines `f` logs on this thread, one per event, level first.
+    fn logged(f: impl FnOnce()) -> Vec<String> {
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Lines {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Lines {
+            type Writer = Lines;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let lines = Lines::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(lines.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// A directory made read-only, so no entry in it can be removed (as a non-root user), until
+    /// this is dropped.
+    struct ReadOnly(PathBuf);
+
+    impl ReadOnly {
+        fn new(dir: &Path) -> Self {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).unwrap();
+            Self(dir.to_path_buf())
+        }
+    }
+
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 
     fn spec(dir: &Path, stale_ms: u64, timeout_ms: u64, touch_ms: u64) -> MkdirLockSpec {
@@ -867,6 +948,58 @@ mod tests {
         let ino = theirs.try_recv().unwrap();
         assert!(s.path.is_dir(), "the failed start removed the replacement");
         assert_eq!(fs::metadata(&s.path).unwrap().ino(), ino);
+    }
+
+    #[test]
+    fn a_released_lock_directory_that_cannot_be_removed_is_logged_with_its_cause() {
+        // §14: a contained error is logged, never discarded. The directory holds the lock until
+        // it goes stale, so Claude Code waits on it; the line says why.
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 100, 3_000);
+        let lock = MkdirLock::acquire(&s).unwrap();
+        let _restore = ReadOnly::new(d.path());
+        let logs = logged(|| drop(lock));
+        assert!(s.path.is_dir());
+        let warnings: Vec<&String> = logs.iter().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{logs:?}");
+        assert!(
+            warnings[0].contains("could not remove Claude Code's credential lock")
+                && warnings[0].contains("ermission denied"),
+            "{}",
+            warnings[0]
+        );
+        // The role, never the path: a Claude Code home may carry its user's name (§14.2).
+        assert!(!warnings[0].contains(&d.path().display().to_string()));
+        assert_eq!(
+            lock_role(Path::new("/h/.oauth_refresh.lock")),
+            "Claude Code's refresh lock"
+        );
+        assert_eq!(
+            lock_role(Path::new("/h/.storage-write")),
+            "Claude Code's storage-write lock"
+        );
+    }
+
+    #[test]
+    fn a_failed_start_whose_directory_cannot_be_removed_is_logged_with_its_cause() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 0, 3_000);
+        let parent = d.path().to_path_buf();
+        let restore = once_at(&s.path, Point::BeforeHeartbeat, move || {
+            ReadOnly::new(&parent)
+        });
+        fail_at(&s.path, Point::BeforeHeartbeat);
+        let logs = logged(|| assert!(MkdirLock::acquire(&s).is_err()));
+        drop(restore.try_recv().unwrap());
+        assert!(s.path.is_dir(), "left until it goes stale");
+        let warnings: Vec<&String> = logs.iter().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{logs:?}");
+        assert!(
+            warnings[0].contains("could not remove Claude Code's credential lock")
+                && !warnings[0].contains(&d.path().display().to_string()),
+            "{}",
+            warnings[0]
+        );
     }
 
     #[test]
