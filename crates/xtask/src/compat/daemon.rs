@@ -583,6 +583,9 @@ mod tests {
     #[test]
     fn a_profile_is_owned_by_a_held_reservation_any_live_record_or_a_live_supervisor() {
         use tagteam_provider::FlockGuard;
+        // A child another test forks while this one holds the lock inherits the open file
+        // description, and the reservation reads as held until its exec closes it.
+        let _serial = crate::compat::sys::serial();
         let h = home("owners");
         let probe = FakeProcessProbe::new();
         assert!(owners(&h, &probe).is_clear());

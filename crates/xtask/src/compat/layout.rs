@@ -189,6 +189,8 @@ mod tests {
 
     #[test]
     fn a_second_run_refuses_at_once_naming_the_holder() {
+        // See `daemon`'s reservation test: a forked child would inherit the held lock.
+        let _serial = crate::compat::sys::serial();
         let state = std::env::temp_dir().join(format!("xtask-lock-{}", std::process::id()));
         let _ = fs::remove_dir_all(&state);
         let held = RunLock::take(&state).unwrap();
