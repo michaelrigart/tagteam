@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tagteam_cc::ItemKind;
 use tagteam_provider::Cancel;
 
 use super::CompatArgs;
@@ -222,7 +223,15 @@ pub fn run(args: &CompatArgs) -> u8 {
                 report.fail(e.0);
             }
             if scratch.as_deref().is_some_and(Path::exists) {
-                report.setup.push(kept_note(&ctx.layout.scratch));
+                let captured = report
+                    .teardown
+                    .as_deref()
+                    .is_some_and(|steps| steps.contains(&TAKEN_INTO_VAULT));
+                report.setup.push(kept_note(
+                    &ctx.layout.scratch,
+                    captured,
+                    &scratch_items(&ctx),
+                ));
             }
             if args.bless && cancel().requested().is_none() {
                 bless(&workspace, &mut report);
@@ -293,9 +302,43 @@ fn credential_files(root: &Path) -> Vec<String> {
     out
 }
 
+/// The teardown step after which the vault holds the default home's generation, the newest the
+/// test account has: only from here on is a scratch directory safe to delete.
+const TAKEN_INTO_VAULT: &str = "default home's generation taken into the vault";
+
+/// The Keychain items named from the scratch homes (macOS), which `credential_files` cannot
+/// see: the default home's and each home under `homes/`, by service name. These carry the
+/// scratch suffix; the user's own items never appear here.
+fn scratch_items(ctx: &Ctx) -> Vec<String> {
+    if !ctx.macos {
+        return Vec::new();
+    }
+    let mut homes = vec![ctx.live()];
+    if let Ok(listing) = fs::read_dir(ctx.layout.homes()) {
+        homes.extend(
+            listing
+                .flatten()
+                .map(|e| e.path().to_string_lossy().into_owned()),
+        );
+    }
+    homes.sort();
+    let mut out = Vec::new();
+    for home in homes {
+        for kind in [ItemKind::OAuth, ItemKind::ManagedKey] {
+            if let Ok(item) = ctx.item(&home, kind) {
+                out.push(item.service);
+            }
+        }
+    }
+    out
+}
+
 /// What the report says about a scratch directory that is kept: whether it holds credential
-/// files (by name), and that it should be deleted once nobody needs it.
-fn kept_note(scratch: &Path) -> Evidence {
+/// files (by name), the Keychain items named from its homes (`items`, macOS), and what to do
+/// with it. Only when `captured` (teardown took the default home's generation into the vault,
+/// or nothing had been activated) is it safe to delete; otherwise it may hold the newest
+/// generation of the test account, which must be captured first.
+fn kept_note(scratch: &Path, captured: bool, items: &[String]) -> Evidence {
     let files = credential_files(scratch);
     let holds = if files.is_empty() {
         "it holds no credential files".to_owned()
@@ -305,10 +348,23 @@ fn kept_note(scratch: &Path) -> Evidence {
             files.join(", ")
         )
     };
+    let items = if items.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Keychain items named from its homes are left behind too, and go with it: {}.",
+            items.join(", ")
+        )
+    };
+    let todo = if captured {
+        "Delete it when you no longer need it."
+    } else {
+        "Teardown did not take the default home's generation into the vault, so the test account's newest generation may be only in the session profile or in this directory's live/ home. Do not delete it yet: a rerun's settle gate captures the profile's; for the live/ home, run `tagteam add` in it with the compat store's environment."
+    };
     note(
         "a kept scratch directory",
         json!(format!(
-            "{} is kept; {holds}. Delete it when you no longer need it.",
+            "{} is kept; {holds}.{items} {todo}",
             scratch.display()
         )),
     )
@@ -408,7 +464,8 @@ fn setup(
     let made = prepare(args, layout, home, &path, claude, tagteam, report);
     if made.is_err() {
         if args.keep {
-            report.setup.push(kept_note(&scratch));
+            // Nothing was activated, so there is no generation to lose.
+            report.setup.push(kept_note(&scratch, true, &[]));
         } else {
             let _ = fs::remove_dir_all(&scratch);
         }
@@ -665,7 +722,7 @@ fn teardown(ctx: &mut Ctx, keep: bool, report: &mut Report) -> Result<(), Harnes
             ctx.layout.scratch.display()
         )));
     }
-    step(report, "default home's generation taken into the vault");
+    step(report, TAKEN_INTO_VAULT);
     if keep {
         eprintln!(
             "cargo xtask compat: kept {} and the profiles; never run claude in them, since the vault holds their generation",
@@ -900,7 +957,11 @@ mod tests {
         fs::create_dir_all(dir.join("homes/other-identity")).unwrap();
         fs::create_dir_all(dir.join("live")).unwrap();
         fs::write(dir.join("live/.claude.json"), "{}").unwrap();
-        let none = kept_note(&dir).value.as_str().unwrap().to_owned();
+        let none = kept_note(&dir, true, &[])
+            .value
+            .as_str()
+            .unwrap()
+            .to_owned();
         assert!(
             none.contains("holds no credential files") && none.contains("Delete it"),
             "{none}"
@@ -910,12 +971,41 @@ mod tests {
             "sk-ant-secret-body",
         )
         .unwrap();
-        let held = kept_note(&dir).value.as_str().unwrap().to_owned();
+        let held = kept_note(&dir, true, &[])
+            .value
+            .as_str()
+            .unwrap()
+            .to_owned();
         assert!(
             held.contains("holds credential files (homes/other-identity/.credentials.json)")
                 && held.contains("Delete it")
                 && !held.contains("sk-ant"),
             "{held}"
+        );
+        // Teardown did not reach the vault: no advice to delete, the way to capture is named,
+        // and the Keychain items are listed.
+        let items = ["Claude Code-credentials-1b2f156f".to_owned()];
+        let unsafe_to_delete = kept_note(&dir, false, &items)
+            .value
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            !unsafe_to_delete.contains("Delete it when")
+                && unsafe_to_delete.contains("Do not delete it yet")
+                && unsafe_to_delete.contains("tagteam add")
+                && unsafe_to_delete.contains("settle gate")
+                && unsafe_to_delete.contains("Claude Code-credentials-1b2f156f"),
+            "{unsafe_to_delete}"
+        );
+        let safe = kept_note(&dir, true, &items)
+            .value
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            safe.contains("Delete it when") && safe.contains("Claude Code-credentials-1b2f156f"),
+            "{safe}"
         );
         fs::remove_dir_all(&dir).unwrap();
     }
