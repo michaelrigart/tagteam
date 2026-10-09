@@ -16,6 +16,7 @@ use tagteam_provider::{Read, SystemProcessProbe};
 use super::checks::read_json;
 use super::ctx::{ALIAS_OAUTH, ALIAS_SETUP_TOKEN, Ctx};
 use super::daemon;
+use super::guard::{CONFIG_DIR, SECURE_STORAGE_DIR};
 use super::sys::{HarnessError, harness};
 
 fn unsettled(what: &str, why: impl std::fmt::Display) -> HarnessError {
@@ -79,6 +80,10 @@ pub fn settle(ctx: &Ctx) -> Result<Value, HarnessError> {
         profiles.push(json!({"alias": alias, "profile": true, "daemonStop": stopped}));
     }
 
+    // Only the oauth profile is launched. The setup-token profile is stopped and checked
+    // quiescent above, but not launched: its first launch, in `auth-status`, re-marks and
+    // relinks it, and a refused launch there is an outcome that check reports, not a reason to
+    // stop the run.
     let ran = ctx.run_profile(&["--version"])?;
     if !ran.success() {
         return Err(unsettled(
@@ -93,18 +98,31 @@ pub fn settle(ctx: &Ctx) -> Result<Value, HarnessError> {
     let lineage = ctx.lineage()?;
     lineage_agrees(&lineage)?;
     trusts_work(&dir, &ctx.layout.work().to_string_lossy())?;
-    let live = ctx.live();
-    let outer = match ProfileMarker::read(&dir) {
-        Read::Present(m) => m.outer["CLAUDE_CONFIG_DIR"].as_str().map(str::to_owned),
-        _ => None,
-    };
-    if outer.as_deref().is_some_and(|o| o != live) {
-        return Err(unsettled(
+    outer_is_this_run(ctx, &dir)?;
+    Ok(json!({"profiles": profiles, "lineage": lineage}))
+}
+
+/// The outer home the marker records is exactly what compat exports: the scratch default home
+/// as `CLAUDE_CONFIG_DIR`, and compat's own `CLAUDE_SECURESTORAGE_CONFIG_DIR` (none, so null).
+/// A quiescent launch re-marks it (§12.5), so anything else is not settled: null, a missing key,
+/// another home, or a marker that cannot be read.
+fn outer_is_this_run(ctx: &Ctx, dir: &Path) -> Result<(), HarnessError> {
+    let secure = ctx
+        .base
+        .iter()
+        .find(|(k, _)| k == SECURE_STORAGE_DIR)
+        .map(|(_, v)| json!(v.to_string_lossy()))
+        .unwrap_or(Value::Null);
+    let expected = json!({CONFIG_DIR: ctx.live(), SECURE_STORAGE_DIR: secure});
+    match ProfileMarker::read(dir) {
+        Read::Present(m) if m.outer == expected => Ok(()),
+        Read::Present(m) => Err(unsettled(
             "the profile still records another outer home",
-            "its marker's outer.CLAUDE_CONFIG_DIR is not this run's scratch home",
-        ));
+            format!("its marker's outer is {}, not {expected}", m.outer),
+        )),
+        Read::Absent => Err(unsettled("the profile has no marker", dir.display())),
+        Read::Unreadable(e) => Err(unsettled("the profile's marker cannot be read", e)),
     }
-    Ok(json!({"profiles": profiles, "lineage": lineage, "outerRecorded": outer.is_some()}))
 }
 
 #[cfg(test)]
@@ -162,7 +180,7 @@ mod tests {
                 profile.join(MARKER),
                 json!({"format": "tagteam-profile", "version": 1, "provider": "claude-code",
                        "accountId": ID, "configDir": profile,
-                       "outer": {"CLAUDE_CONFIG_DIR": ctx.live()}})
+                       "outer": {"CLAUDE_CONFIG_DIR": ctx.live(), "CLAUDE_SECURESTORAGE_CONFIG_DIR": null}})
                 .to_string(),
             )
             .unwrap();
@@ -261,14 +279,69 @@ mod tests {
             "{e}"
         );
         f.done();
+    }
 
-        // The marker still names another outer home.
+    #[test]
+    fn the_marker_s_outer_must_be_exactly_what_compat_exports() {
+        let _serial = crate::compat::sys::serial();
+        let write = |f: &Fixture, outer: Value| {
+            let mut marker: Value =
+                serde_json::from_slice(&fs::read(f.profile.join(MARKER)).unwrap()).unwrap();
+            marker["outer"] = outer;
+            fs::write(f.profile.join(MARKER), marker.to_string()).unwrap();
+        };
+        let exact = |f: &Fixture| json!({"CLAUDE_CONFIG_DIR": f.ctx.live(), "CLAUDE_SECURESTORAGE_CONFIG_DIR": null});
+
         let f = Fixture::new(0);
-        let marker = fs::read_to_string(f.profile.join(MARKER)).unwrap();
-        let marker = marker.replace(&f.ctx.live(), "/tmp/tagteam-compat.old/live");
-        fs::write(f.profile.join(MARKER), marker).unwrap();
+        settle(&f.ctx).expect("the exact match settles");
+        f.done();
+
+        for (what, outer) in [
+            ("null", Some(Value::Null)),
+            ("a missing key", Some(json!({"CLAUDE_CONFIG_DIR": "LIVE"}))),
+            (
+                "another string",
+                Some(json!({"CLAUDE_CONFIG_DIR": "/tmp/tagteam-compat.old/live",
+                            "CLAUDE_SECURESTORAGE_CONFIG_DIR": null})),
+            ),
+            (
+                "a secure-storage dir compat does not export",
+                Some(json!({"CLAUDE_CONFIG_DIR": "LIVE", "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/x"})),
+            ),
+            (
+                "an extra key",
+                Some(json!({"CLAUDE_CONFIG_DIR": "LIVE",
+                            "CLAUDE_SECURESTORAGE_CONFIG_DIR": null, "HOME": "/h"})),
+            ),
+        ] {
+            let f = Fixture::new(0);
+            let outer = outer.unwrap().to_string().replace("LIVE", &f.ctx.live());
+            write(&f, serde_json::from_str(&outer).unwrap());
+            let e = refused(&f);
+            // A marker with no outer object is unreadable to tagteam itself, and refused as such.
+            assert!(
+                e.contains("another outer home") || e.contains("it has no outer record"),
+                "{what}: {e}"
+            );
+            f.done();
+        }
+
+        // An unreadable marker.
+        let f = Fixture::new(0);
+        fs::write(f.profile.join(MARKER), "not json").unwrap();
         let e = refused(&f);
-        assert!(e.contains("another outer home"), "{e}");
+        assert!(
+            e.contains("the profile marker") && e.contains("unreadable"),
+            "{e}"
+        );
+        f.done();
+
+        // The exact value is what the other tests' fixture writes.
+        let f = Fixture::new(0);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(f.profile.join(MARKER)).unwrap()).unwrap()["outer"],
+            exact(&f)
+        );
         f.done();
     }
 }
