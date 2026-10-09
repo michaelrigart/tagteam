@@ -3,6 +3,7 @@
 //! an account in daily use: compat refreshes its login, which would consume your own copy.
 
 use std::fs;
+use std::io::{IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 
 use tagteam_cc::{ItemKind, keychain_service};
@@ -16,6 +17,30 @@ use super::layout::{self, Layout, make_scratch};
 use super::report::{EXIT_HARNESS, EXIT_PASS, Redactor};
 use super::run::{base_env, build_tagteam, take_run_lock, user_homes, workspace_root};
 use super::sys::{CAUGHT, HarnessError, cancel, catch_signals, harness, interrupted, which_in};
+
+/// Said before `claude setup-token`, which prints the token it makes on the terminal.
+const SETUP_TOKEN_WARNING: &str = "\nNow a setup token for the same account: `claude setup-token` opens the browser and then SHOWS THE TOKEN ON THIS SCREEN.\n\
+     Paste it only at tagteam's prompt, which follows, and nowhere else. If it leaks (a log, a screenshot, a shared terminal), revoke it.\n\
+     Once tagteam has stored it, this screen and its scrollback are cleared.\n";
+
+/// Home, erase the screen, erase the scrollback.
+const CLEAR_SCREEN: &str = "\x1b[H\x1b[2J\x1b[3J";
+
+/// Clears the screen and the terminal's scrollback on `out`, and says so, but only when `out` is
+/// a terminal: into a pipe or a file the escape sequence would be noise, and nothing there
+/// shows the token. Best effort; a failed write is no failure of the login.
+fn clear_screen(out: &mut impl Write, is_terminal: bool) -> bool {
+    if !is_terminal {
+        return false;
+    }
+    let _ = write!(out, "{CLEAR_SCREEN}");
+    let _ = writeln!(
+        out,
+        "cargo xtask compat login: cleared the screen and its scrollback, which showed the setup token."
+    );
+    let _ = out.flush();
+    true
+}
 
 pub fn login() -> u8 {
     if let Err(e) = catch_signals(cancel(), &CAUGHT) {
@@ -181,9 +206,7 @@ fn log_in(
         ));
     }
 
-    eprintln!(
-        "\nNow a setup token for the same account: `claude setup-token` opens the browser and prints it.\n"
-    );
+    eprintln!("{SETUP_TOKEN_WARNING}");
     ctx.claude(&live, &["setup-token"]).attached(&ctx.roots)?;
     let _ = ctx.tagteam(&["remove", ALIAS_SETUP_TOKEN]).run(&ctx.roots);
     eprintln!("\nPaste the token at tagteam's prompt; it is not echoed.\n");
@@ -194,6 +217,7 @@ fn log_in(
     {
         return Err(harness("tagteam add-token failed"));
     }
+    clear_screen(&mut std::io::stderr(), std::io::stderr().is_terminal());
 
     let list = ctx.list()?;
     let (Some(oauth), Some(setup)) = (
@@ -319,6 +343,31 @@ exit 0
             fs::remove_dir_all(dir).unwrap();
         }
         (done, scratch)
+    }
+
+    #[test]
+    fn the_screen_and_scrollback_are_cleared_only_on_a_terminal() {
+        let mut piped = Vec::new();
+        assert!(!clear_screen(&mut piped, false));
+        assert!(piped.is_empty(), "nothing is written to a pipe or a file");
+
+        let mut terminal = Vec::new();
+        assert!(clear_screen(&mut terminal, true));
+        let shown = String::from_utf8(terminal).unwrap();
+        assert!(shown.starts_with("\x1b[H\x1b[2J\x1b[3J"), "{shown:?}");
+        assert!(shown.contains("scrollback"), "{shown:?}");
+    }
+
+    #[test]
+    fn the_warning_before_setup_token_says_where_to_paste_and_to_revoke_a_leak() {
+        for needle in [
+            "SHOWS THE TOKEN ON THIS SCREEN",
+            "only at tagteam's prompt",
+            "nowhere else",
+            "revoke",
+        ] {
+            assert!(SETUP_TOKEN_WARNING.contains(needle), "{needle}");
+        }
     }
 
     #[test]
