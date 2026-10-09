@@ -247,30 +247,74 @@ fn item_states(ctx: &Ctx, spelling: &str) -> Result<Value, HarnessError> {
     Ok(Value::Object(out))
 }
 
-/// §13.6 relies on it: `claude auth status` writes nothing in the home it inspects, a profile's
-/// or an empty one, its Keychain items included.
+/// §13.6 relies on both halves of Appendix A.7: `claude auth status` writes nothing in a home
+/// that has its global config (the profile's, its Keychain items included), and in one that has
+/// none CC's start-up creates its config first (`.claude.json`, a `.claude.json.lock` it leaves,
+/// `backups/`). The second half is evidence, never a failure; run again in the home it made,
+/// `auth status` writes nothing. Doctor runs `claude --version` before its gate on the config's
+/// existence, so what `--version` does to a never-started home is recorded too, as information
+/// only.
 pub fn auth_status_read_only(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     let mut p = Probe::new();
     let (_, profile) = ctx.profile_ready()?;
+
+    // A home that has its global config: nothing is created, changed or removed.
+    let before = snapshot(Path::new(&profile))?;
+    let items = item_states(ctx, &profile)?;
+    let r = ctx.claude(&profile, &STATUS).run(&ctx.roots)?;
+    p.note("the profile: claude auth status", r.summary());
+    let found = changes(&before, &snapshot(Path::new(&profile))?);
+    p.expect(
+        "the profile: nothing created, changed or removed",
+        found.is_empty(),
+        json!(found),
+    );
+    p.expect_eq(
+        "the profile: its Keychain items as they were",
+        items,
+        item_states(ctx, &profile)?,
+    );
+
+    // An empty home, `claude --version` first, in a home of its own and otherwise the same.
+    let version_home = ctx.new_home("read-only-version")?;
+    let before = snapshot(Path::new(&version_home))?;
+    let r = ctx.claude(&version_home, &["--version"]).run(&ctx.roots)?;
+    p.note("an empty home: claude --version", r.summary());
+    p.note(
+        "an empty home: what claude --version created, changed or removed (information only)",
+        json!(changes(&before, &snapshot(Path::new(&version_home))?)),
+    );
+
+    // An empty home: what CC creates is evidence, expected, not a failure.
     let empty = ctx.new_home("read-only")?;
-    for (label, home) in [("the profile", profile), ("an empty home", empty)] {
-        let before = snapshot(Path::new(&home))?;
-        let items = item_states(ctx, &home)?;
-        let r = ctx.claude(&home, &STATUS).run(&ctx.roots)?;
-        p.note(&format!("{label}: claude auth status"), r.summary());
-        let found = changes(&before, &snapshot(Path::new(&home))?);
-        p.expect(
-            &format!("{label}: nothing created, changed or removed"),
-            found.is_empty(),
-            json!(found),
-        );
-        p.expect_eq(
-            &format!("{label}: its Keychain items as they were"),
-            items,
-            item_states(ctx, &home)?,
-        );
-    }
-    Ok(p.finish("claude auth status wrote nothing"))
+    let before = snapshot(Path::new(&empty))?;
+    let items = item_states(ctx, &empty)?;
+    let r = ctx.claude(&empty, &STATUS).run(&ctx.roots)?;
+    p.note("an empty home: claude auth status", r.summary());
+    let created = changes(&before, &snapshot(Path::new(&empty))?);
+    p.note(
+        "an empty home: what claude auth status created, changed or removed (expected)",
+        json!(created),
+    );
+    p.expect_eq(
+        "an empty home: its Keychain items as they were",
+        items,
+        item_states(ctx, &empty)?,
+    );
+
+    // The home it made now has its global config: a second run writes nothing.
+    let before = snapshot(Path::new(&empty))?;
+    let r = ctx.claude(&empty, &STATUS).run(&ctx.roots)?;
+    p.note("the same home again: claude auth status", r.summary());
+    let found = changes(&before, &snapshot(Path::new(&empty))?);
+    p.expect(
+        "the same home again, now with a global config: nothing created, changed or removed",
+        found.is_empty(),
+        json!(found),
+    );
+    Ok(p.finish(
+        "claude auth status wrote nothing in a home with its global config; what it creates in an empty one is recorded",
+    ))
 }
 
 /// Appendix A.2 and A.3: a freshly bootstrapped profile holds its credential in the file and no
@@ -640,4 +684,137 @@ pub fn storage_write_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     );
     p.expect("claude -p succeeded", ran.success(), ran.summary());
     Ok(p.finish("CC and tagteam each waited for the other's storage-write lock"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::compat::ctx::Account;
+    use crate::compat::layout::make_scratch;
+    use crate::compat::report::{Redactor, Status};
+
+    /// A `Ctx` whose profile exists (marker and global config) and whose `claude` is `script`.
+    fn ctx_with_profile(script: &str) -> (Ctx, PathBuf, PathBuf) {
+        let scratch = make_scratch().unwrap();
+        let state = std::env::temp_dir().join(format!(
+            "xtask-profile-{}",
+            crate::compat::keychain::random_hex().unwrap()
+        ));
+        fs::create_dir_all(&state).unwrap();
+        let state = fs::canonicalize(state).unwrap();
+        let fake = scratch.join("claude");
+        fs::write(
+            &fake,
+            format!("#!/bin/sh\nhome=\"$CLAUDE_CONFIG_DIR\"\n{script}\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut ctx = Ctx::offline(
+            &scratch,
+            &state,
+            PathBuf::from("/nonexistent/tagteam"),
+            Redactor::default(),
+        );
+        ctx.claude = fake;
+        ctx.oauth = Account {
+            id: "01a".into(),
+            position: 1,
+            email: "t@x.co".into(),
+        };
+        let profile = ctx.layout.profile("01a");
+        fs::create_dir_all(&profile).unwrap();
+        let profile = fs::canonicalize(profile).unwrap();
+        fs::write(
+            profile.join(".tagteam-profile.json"),
+            json!({"format": "tagteam-profile", "version": 1, "provider": "claude-code",
+                   "accountId": "01a", "configDir": profile, "outer": {}})
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(profile.join(".claude.json"), "{}").unwrap();
+        (ctx, scratch, state)
+    }
+
+    /// `--version` writes nothing; `auth status` creates CC's start-up files in a home with no
+    /// global config and nothing in one that has it.
+    const WELL_BEHAVED: &str = r#"case "$1" in
+--version) echo "2.1.292 (Claude Code)" ;;
+auth)
+    if [ ! -e "$home/.claude.json" ]; then
+        echo '{}' > "$home/.claude.json"; mkdir "$home/.claude.json.lock" "$home/backups"
+    fi
+    echo '{"loggedIn":false,"authMethod":"none"}'; exit 1 ;;
+esac"#;
+
+    fn label<'o>(o: &'o Outcome, text: &str) -> &'o crate::compat::report::Evidence {
+        o.evidence
+            .iter()
+            .find(|e| e.label.contains(text))
+            .unwrap_or_else(|| panic!("no evidence line {text:?} in {:?}", o.evidence))
+    }
+
+    #[test]
+    fn what_auth_status_creates_in_an_empty_home_is_evidence_and_a_home_with_a_config_must_stay_untouched()
+     {
+        let _serial = crate::compat::sys::serial();
+        let (mut ctx, scratch, state) = ctx_with_profile(WELL_BEHAVED);
+        let outcome = auth_status_read_only(&mut ctx).unwrap();
+        assert_eq!(outcome.status, Status::Pass, "{:?}", outcome.evidence);
+        let created = label(&outcome, "what claude auth status created")
+            .value
+            .to_string();
+        for name in [".claude.json", ".claude.json.lock", "backups"] {
+            assert!(created.contains(&format!("created {name}")), "{created}");
+        }
+        assert_eq!(
+            label(&outcome, "what claude auth status created").ok,
+            None,
+            "expected, so no verdict"
+        );
+        let version = label(&outcome, "what claude --version created");
+        assert_eq!(version.value, json!([]));
+        assert_eq!(version.ok, None, "information only");
+        assert!(ctx.layout.homes().join("read-only-version").is_dir());
+        fs::remove_dir_all(&scratch).unwrap();
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn a_write_into_the_profile_or_into_a_home_that_has_its_config_fails_the_check() {
+        let _serial = crate::compat::sys::serial();
+        // Touches the profile.
+        let (mut ctx, scratch, state) = ctx_with_profile(
+            r#"case "$1" in auth) date +%s%N > "$home/touched"; echo '{}'; exit 1 ;; esac"#,
+        );
+        let outcome = auth_status_read_only(&mut ctx).unwrap();
+        assert_eq!(outcome.status, Status::Fail);
+        assert_eq!(
+            label(&outcome, "the profile: nothing created").ok,
+            Some(false)
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+        fs::remove_dir_all(&state).unwrap();
+
+        // Touches only a home that already has its config (a second run).
+        let (mut ctx, scratch, state) = ctx_with_profile(
+            r#"case "$1" in
+auth) if [ -e "$home/.claude.json" ] && [ "$home" != "$PROFILE" ]; then date +%s%N >> "$home/.claude.json"; else echo '{}' > "$home/.claude.json"; fi; echo '{}'; exit 1 ;;
+esac"#,
+        );
+        let profile = ctx.profile().unwrap().unwrap().1;
+        ctx.base.push(("PROFILE".into(), profile.into()));
+        let outcome = auth_status_read_only(&mut ctx).unwrap();
+        assert_eq!(outcome.status, Status::Fail);
+        assert_eq!(
+            label(&outcome, "the same home again, now").ok,
+            Some(false),
+            "{:?}",
+            outcome.evidence
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+        fs::remove_dir_all(&state).unwrap();
+    }
 }

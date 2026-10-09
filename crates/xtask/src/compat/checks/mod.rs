@@ -72,7 +72,7 @@ pub const CHECKS: &[Check] = &[
     ),
     check(
         "auth-status-read-only",
-        "`claude auth status` writes nothing in the home it inspects (§13.6)",
+        "`claude auth status` writes nothing in a home that has its global config, and what it creates in one that has none (§13.6)",
         Phase::Profile,
         false,
         None,
