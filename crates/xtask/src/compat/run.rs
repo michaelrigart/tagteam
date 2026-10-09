@@ -205,7 +205,7 @@ pub fn run(args: &CompatArgs) -> u8 {
     };
     let mut scratch = None;
     match setup(args, &workspace, &reports, &mut report) {
-        Err(e) => report.harness_error = Some(e.0),
+        Err(e) => report.fail(e.0),
         Ok(mut ctx) => {
             scratch = Some(ctx.layout.scratch.clone());
             let quiet = run_checks(&mut ctx, &selected, &mut report);
@@ -218,7 +218,7 @@ pub fn run(args: &CompatArgs) -> u8 {
                 None => teardown(&mut ctx, args.keep, &mut report),
             };
             if let Err(e) = torn {
-                report.harness_error.get_or_insert(e.0);
+                report.fail(e.0);
             }
             if args.bless && cancel().requested().is_none() {
                 bless(&workspace, &mut report);
@@ -478,7 +478,7 @@ fn run_checks(ctx: &mut Ctx, selected: &[usize], report: &mut Report) -> Result<
         }
         if phase == Phase::Live {
             if let Err(e) = enter_live(ctx, report) {
-                report.harness_error = Some(e.0);
+                report.fail(e.0);
                 break;
             }
         }
@@ -662,9 +662,7 @@ fn bless(workspace: &Path, report: &mut Report) {
         .and_then(|text| fs::write(&path, text).map_err(|e| e.to_string()));
     match written {
         Ok(()) => report.blessed = Some(version.to_string()),
-        Err(e) => {
-            report.harness_error = Some(format!("--bless could not write {}: {e}", path.display()))
-        }
+        Err(e) => report.fail(format!("--bless could not write {}: {e}", path.display())),
     }
 }
 

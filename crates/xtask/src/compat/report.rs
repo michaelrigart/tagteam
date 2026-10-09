@@ -387,6 +387,29 @@ fn cell(s: &str) -> String {
 }
 
 impl Report {
+    /// Records a harness error without losing an earlier one: the messages are kept in order,
+    /// joined by `; `, and one already recorded is not repeated.
+    pub fn fail(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        match &mut self.harness_error {
+            None => self.harness_error = Some(message),
+            Some(kept) if kept.split("; ").any(|m| m == message) => {}
+            Some(kept) => {
+                kept.push_str("; ");
+                kept.push_str(&message);
+            }
+        }
+    }
+
+    /// How far teardown got, for a reader of the report: not begun, or the steps it finished.
+    pub fn teardown_text(&self) -> String {
+        match self.teardown.as_deref() {
+            None => "not begun".to_owned(),
+            Some([]) => "begun, no step finished".to_owned(),
+            Some(done) => format!("finished: {}", done.join(", ")),
+        }
+    }
+
     pub fn exit_code(&self) -> u8 {
         let has = |s: Status| self.checks.iter().any(|c| c.outcome.status == s);
         if let Some(n) = self.interrupted {
@@ -423,6 +446,7 @@ impl Report {
             "testedVersion": self.tested,
             "exitCode": self.exit_code(),
             "harnessError": self.harness_error,
+            "teardown": self.teardown,
             "blessed": self.blessed,
             "setup": evidence_json(&self.setup),
             "checks": self.checks.iter().map(|c| json!({
@@ -462,6 +486,7 @@ impl Report {
         if let Some(e) = &self.harness_error {
             md += &format!("- **Harness failure:** {e}\n");
         }
+        md += &format!("- Teardown: {}\n", self.teardown_text());
         if !self.setup.is_empty() {
             md += "\n## Setup\n\n";
             md += &evidence_md(&self.setup);
@@ -825,5 +850,33 @@ mod tests {
         assert!(!shown.contains("Research"), "{shown}");
         assert_eq!(shown, r#"{"organizationName":"<account 1 org>","seats":4"#);
         assert_eq!(r.text(org), "<account 1 org>");
+    }
+
+    #[test]
+    fn every_harness_error_is_kept_and_teardown_is_always_reported() {
+        let mut r = report(&[]);
+        r.fail("tagteam switch compat-oauth: session-owned");
+        r.fail("teardown refused, since a daemon runs");
+        r.fail("tagteam switch compat-oauth: session-owned");
+        assert_eq!(
+            r.harness_error.as_deref(),
+            Some(
+                "tagteam switch compat-oauth: session-owned; teardown refused, since a daemon runs"
+            )
+        );
+        assert_eq!(r.exit_code(), EXIT_HARNESS);
+        assert_eq!(r.teardown_text(), "not begun");
+        let md = r.to_markdown();
+        assert!(md.contains("- Teardown: not begun"), "{md}");
+        assert!(md.contains("teardown refused"), "{md}");
+        assert_eq!(r.to_json()["teardown"], Value::Null);
+        r.teardown = Some(vec!["daemons stopped"]);
+        assert!(
+            r.to_markdown()
+                .contains("- Teardown: finished: daemons stopped")
+        );
+        assert_eq!(r.to_json()["teardown"], json!(["daemons stopped"]));
+        r.teardown = Some(vec![]);
+        assert_eq!(r.teardown_text(), "begun, no step finished");
     }
 }

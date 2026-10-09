@@ -256,15 +256,21 @@ impl Ran {
 
     /// For a report: the command, its exit, its time and the end of its standard error, which
     /// `Running::wait` redacted as it captured it, so any string this is formatted into carries
-    /// placeholders only.
+    /// placeholders only. A command that did not succeed adds the end of its standard output
+    /// too, redacted as well: a `--json` command writes its error object there and leaves
+    /// standard error empty.
     pub fn summary(&self) -> Value {
-        json!({
+        let mut v = json!({
             "command": self.what,
             "exit": self.code,
             "timedOut": self.timed_out,
             "seconds": (self.seconds * 10.0).round() / 10.0,
             "stderr": tail(&String::from_utf8_lossy(&self.stderr), 400),
-        })
+        });
+        if !self.success() {
+            v["stdout"] = json!(tail(&self.stdout_text(), 400));
+        }
+        v
     }
 }
 
@@ -1612,6 +1618,32 @@ mod tests {
         assert_eq!(ran.code, Some(3));
         assert_eq!(ran.stdout_text(), "/tmp/tagteam-compat.test/live\n");
         assert_eq!(ran.summary()["stderr"], "err\n");
+    }
+
+    #[test]
+    fn a_failed_command_s_summary_carries_its_redacted_stdout_and_a_successful_one_does_not() {
+        let _serial = serial();
+        let mut redact = Redactor::default();
+        redact.learn("t@x.co", "<account 1>".into());
+        let failed =
+            sh(r#"printf '%s' '{"error":{"type":"session-owned","who":"t@x.co"}}'; exit 1"#)
+                .redact(&redact)
+                .run(&test_roots())
+                .unwrap();
+        let summary = failed.summary();
+        assert_eq!(summary["stderr"], "");
+        let stdout = summary["stdout"].as_str().unwrap();
+        assert!(stdout.contains("session-owned"), "{stdout}");
+        assert!(
+            stdout.contains("<account 1>") && !stdout.contains("t@x.co"),
+            "{stdout}"
+        );
+        let long = sh("i=0; while [ $i -lt 100 ]; do printf 0123456789; i=$((i+1)); done; exit 4")
+            .run(&test_roots())
+            .unwrap();
+        assert!(long.summary()["stdout"].as_str().unwrap().len() <= 405);
+        let ok = sh("echo fine").run(&test_roots()).unwrap();
+        assert!(ok.summary().get("stdout").is_none(), "{}", ok.summary());
     }
 
     #[test]
