@@ -18,6 +18,7 @@ pub mod read;
 pub mod reservation;
 pub mod security;
 pub mod splice;
+pub mod term;
 
 /// Serialises the lib tests that fork a child or drop a flock and re-lock it: a child forked in
 /// that window briefly holds a duplicate of the lock's open file description, so the re-lock

@@ -17,6 +17,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
+use tagteam_provider::term::{self, ByteRead, Readiness};
 use tagteam_provider::{Cancel, SessionRecord, parse_session_record};
 
 use super::ctx::Ctx;
@@ -343,11 +344,11 @@ pub fn ask(question: &str) -> Answer {
     }
     eprint!("{question} [y/N] ");
     let _ = io::stderr().flush();
-    read_answer(libc::STDIN_FILENO, cancel())
+    read_answer(0, cancel())
 }
 
 /// How long one `poll(2)` waits before the token is looked at again.
-const ASK_SLICE_MS: libc::c_int = 200;
+const ASK_SLICE_MS: i32 = 200;
 
 /// One line from `fd`, read a byte at a time so nothing past it is taken from the terminal,
 /// waiting in `ASK_SLICE_MS` slices and looking at `token` between them: a blocking read would
@@ -358,34 +359,16 @@ fn read_answer(fd: RawFd, token: &Cancel) -> Answer {
         if let Some(n) = token.requested() {
             return Answer::Interrupted(n);
         }
-        let mut fds = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: `fds` is one valid, writable `pollfd` for the duration of the call.
-        let ready = unsafe { libc::poll(&mut fds, 1, ASK_SLICE_MS) };
-        if ready < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Answer::NoTerminal;
+        match term::wait_readable(fd, ASK_SLICE_MS) {
+            Readiness::Interrupted | Readiness::TimedOut => continue,
+            Readiness::Invalid | Readiness::Failed => return Answer::NoTerminal,
+            Readiness::Ready => {}
         }
-        if ready == 0 {
-            continue;
-        }
-        if fds.revents & libc::POLLNVAL != 0 {
-            return Answer::NoTerminal;
-        }
-        let mut byte = 0u8;
-        // SAFETY: `byte` is one valid, writable byte for the duration of the call.
-        let n = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
-        match n {
-            1 if byte == b'\n' => break,
-            1 => line.push(byte),
-            0 => break,
-            _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
-            _ => return Answer::NoTerminal,
+        match term::read_byte(fd) {
+            ByteRead::Byte(b'\n') | ByteRead::End => break,
+            ByteRead::Byte(byte) => line.push(byte),
+            ByteRead::Interrupted => {}
+            ByteRead::Failed => return Answer::NoTerminal,
         }
     }
     let line = String::from_utf8_lossy(&line);
@@ -398,83 +381,104 @@ fn read_answer(fd: RawFd, token: &Cancel) -> Answer {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::net::UnixStream;
+
+    use signal_hook::consts::{SIGINT, SIGTERM};
+
     use super::*;
     use serde_json::json;
 
-    /// A pipe standing for stdin: (read end, write end).
-    fn pipe() -> (RawFd, RawFd) {
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `fds` holds the two descriptors `pipe(2)` writes.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        (fds[0], fds[1])
+    /// A socket pair standing for stdin: (read end, write end).
+    fn pipe() -> (UnixStream, UnixStream) {
+        UnixStream::pair().unwrap()
     }
 
-    fn write_all(fd: RawFd, bytes: &[u8]) {
-        // SAFETY: `bytes` is valid for its length for the duration of the call.
-        let n = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        assert_eq!(n, bytes.len() as isize);
-    }
-
-    fn close(fds: &[RawFd]) {
-        for &fd in fds {
-            // SAFETY: each descriptor was opened by `pipe` and is closed once.
-            unsafe { libc::close(fd) };
-        }
+    fn write_all(end: &UnixStream, bytes: &[u8]) {
+        (&*end).write_all(bytes).unwrap();
     }
 
     #[test]
     fn an_answer_is_read_up_to_its_line_and_no_further() {
         let (r, w) = pipe();
-        write_all(w, b"y\nn\n");
+        let fd = r.as_raw_fd();
+        write_all(&w, b"y\nn\n");
         let token = Cancel::new();
-        assert_eq!(read_answer(r, &token), Answer::Yes);
-        assert_eq!(read_answer(r, &token), Answer::No, "the next line was left");
-        write_all(w, b"yes\n");
-        assert_eq!(read_answer(r, &token), Answer::Yes);
-        write_all(w, b"maybe\n");
-        assert_eq!(read_answer(r, &token), Answer::No);
-        write_all(w, b"Y");
-        close(&[w]);
+        assert_eq!(read_answer(fd, &token), Answer::Yes);
         assert_eq!(
-            read_answer(r, &token),
+            read_answer(fd, &token),
+            Answer::No,
+            "the next line was left"
+        );
+        write_all(&w, b"yes\n");
+        assert_eq!(read_answer(fd, &token), Answer::Yes);
+        write_all(&w, b"maybe\n");
+        assert_eq!(read_answer(fd, &token), Answer::No);
+        write_all(&w, b"Y");
+        drop(w);
+        assert_eq!(
+            read_answer(fd, &token),
             Answer::Yes,
             "the end of input ends the line"
         );
-        assert_eq!(read_answer(r, &token), Answer::No, "and nothing is a no");
-        close(&[r]);
+        assert_eq!(read_answer(fd, &token), Answer::No, "and nothing is a no");
     }
 
     #[test]
     fn a_cancelled_token_ends_the_question_without_any_input() {
         let (r, w) = pipe();
         let token = Cancel::new();
-        token.request(libc::SIGINT);
-        assert_eq!(read_answer(r, &token), Answer::Interrupted(libc::SIGINT));
+        token.request(SIGINT);
+        assert_eq!(
+            read_answer(r.as_raw_fd(), &token),
+            Answer::Interrupted(SIGINT)
+        );
         // Input already waiting does not outrank the signal either.
-        write_all(w, b"y\n");
-        assert_eq!(read_answer(r, &token), Answer::Interrupted(libc::SIGINT));
-        close(&[r, w]);
+        write_all(&w, b"y\n");
+        assert_eq!(
+            read_answer(r.as_raw_fd(), &token),
+            Answer::Interrupted(SIGINT)
+        );
     }
 
     #[test]
     fn a_signal_arriving_while_the_question_waits_ends_it() {
-        let (r, w) = pipe();
+        let (r, _w) = pipe();
         let token = Cancel::new();
         let later = token.clone();
         let signaller = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
-            later.request(libc::SIGTERM);
+            later.request(SIGTERM);
         });
-        assert_eq!(read_answer(r, &token), Answer::Interrupted(libc::SIGTERM));
+        assert_eq!(
+            read_answer(r.as_raw_fd(), &token),
+            Answer::Interrupted(SIGTERM)
+        );
         signaller.join().unwrap();
-        close(&[r, w]);
     }
 
     #[test]
     fn a_descriptor_that_is_not_open_is_no_terminal() {
+        // A descriptor number is only a number: this one is not open once its socket is dropped.
+        // (Another test's socket may be given the same number meanwhile, so the answer is
+        // either "no terminal" or, for a socket that has nothing to say yet, a wait; the
+        // cancelled token ends that wait.)
         let (r, w) = pipe();
-        close(&[r, w]);
-        assert_eq!(read_answer(r, &Cancel::new()), Answer::NoTerminal);
+        let fd = r.as_raw_fd();
+        drop((r, w));
+        let token = Cancel::new();
+        let later = token.clone();
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            later.request(SIGTERM);
+        });
+        let answer = read_answer(fd, &token);
+        signaller.join().unwrap();
+        assert!(
+            matches!(answer, Answer::NoTerminal | Answer::Interrupted(_)),
+            "{answer:?}"
+        );
     }
 
     #[test]
@@ -482,8 +486,8 @@ mod tests {
         assert_eq!(Answer::Yes.decided().unwrap(), Some(true));
         assert_eq!(Answer::No.decided().unwrap(), Some(false));
         assert_eq!(Answer::NoTerminal.decided().unwrap(), None);
-        let err = Answer::Interrupted(libc::SIGINT).decided().unwrap_err();
-        assert_eq!(err.to_string(), interrupted(libc::SIGINT).to_string());
+        let err = Answer::Interrupted(SIGINT).decided().unwrap_err();
+        assert_eq!(err.to_string(), interrupted(SIGINT).to_string());
     }
 
     #[test]

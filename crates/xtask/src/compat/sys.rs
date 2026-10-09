@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-use tagteam_provider::Cancel;
+use tagteam_provider::{Cancel, term};
 
 use super::guard::Roots;
 use super::report::Redactor;
@@ -115,7 +115,8 @@ pub fn tail(s: &str, n: usize) -> String {
 }
 
 /// Sends `signal` (`INT`, `TERM`, `HUP`, `KILL`) to `pid`, or to its process group when
-/// `group`. Through `/bin/kill`: compat has no `unsafe`.
+/// `group`. Through `/bin/kill`, since `xtask` forbids `unsafe` (its few libc calls are
+/// `tagteam_provider::term`'s).
 pub fn signal(pid: u32, signal: &str, group: bool) -> bool {
     let target = if group {
         format!("-{pid}")
@@ -344,42 +345,23 @@ pub fn spawn_interactive(cmd: &mut Command) -> io::Result<Child> {
     cmd.process_group(0).spawn()
 }
 
-/// Whether the terminal on stdin is held by the harness's own group, so it may be handed on.
-fn tty_foreground_is_ours() -> bool {
-    // SAFETY: isatty, tcgetpgrp and getpgrp only read descriptor 0's and the process's state.
-    unsafe { libc::isatty(0) == 1 && libc::tcgetpgrp(0) == libc::getpgrp() }
-}
-
-/// `tcsetpgrp(0, pgid)` with SIGTTOU ignored around it: a background group calling it would be
-/// stopped otherwise.
-fn set_foreground(pgid: libc::pid_t) {
-    // SAFETY: SIGTTOU's disposition is set to ignore and put back; `tcsetpgrp` takes a group id
-    // and no pointer. Nothing else in the harness handles SIGTTOU.
-    unsafe {
-        let before = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
-        libc::tcsetpgrp(0, pgid);
-        libc::signal(libc::SIGTTOU, before);
-    }
-}
-
 /// The terminal handed to an interactive child's group. Dropping it hands the terminal back to
 /// the harness's own group, so no path leaves it with a dead or foreign foreground group. Without
 /// a terminal on stdin, or when the harness is not its foreground group, it does nothing.
 struct Foreground {
-    ours: Option<libc::pid_t>,
+    ours: Option<i32>,
 }
 
 impl Foreground {
     fn hand_to(pgid: u32) -> Self {
-        if !tty_foreground_is_ours() {
-            return Self { ours: None };
-        }
-        // SAFETY: getpgrp has no arguments and cannot fail.
-        let ours = unsafe { libc::getpgrp() };
-        let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        let Ok(pgid) = i32::try_from(pgid) else {
             return Self { ours: None };
         };
-        set_foreground(pgid);
+        if !term::stdin_is_our_foreground_terminal() {
+            return Self { ours: None };
+        }
+        let ours = term::own_process_group();
+        term::set_foreground_group(pgid);
         Self { ours: Some(ours) }
     }
 }
@@ -387,7 +369,7 @@ impl Foreground {
 impl Drop for Foreground {
     fn drop(&mut self) {
         if let Some(ours) = self.ours.take() {
-            set_foreground(ours);
+            term::set_foreground_group(ours);
         }
     }
 }
@@ -395,11 +377,7 @@ impl Drop for Foreground {
 /// Whether `child` leads a process group of its own (`spawn_interactive` made it so). The group
 /// is signalled as a whole only then: never the harness's own.
 fn leads_its_group(child: &Child) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(child.id()) else {
-        return false;
-    };
-    // SAFETY: getpgid takes a process id and returns a group id; it touches no memory.
-    unsafe { libc::getpgid(pid) == pid }
+    term::process_group_of(child.id()) == Some(child.id())
 }
 
 /// Waits for `child`, started by `spawn_interactive`: a process group of its own, handed the
