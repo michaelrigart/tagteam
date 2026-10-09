@@ -24,7 +24,7 @@ use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{self, ColorMode, Settings, parse_bool};
 use tagteam_engine::store::{AccountRow, Mapping, StoreError};
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
-use tagteam_engine::transfer::{self, Encryption, Recipient, SecretString};
+use tagteam_engine::transfer::{self, Encryption, Need, Recipient, SecretString};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, ShellAccount, StatusView};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
@@ -109,6 +109,8 @@ const PASSPHRASES_DIFFER: &str = "the two passphrases differ";
 const PASSPHRASE: &str = "Passphrase for the export: ";
 const PASSPHRASE_AGAIN: &str = "The same passphrase again: ";
 const NOTHING_EXPORTED: &str = "no account was exported";
+const IMPORT_FROM_TERMINAL: &str =
+    "import - reads the export from stdin, which is a terminal; pipe the file in, or name it";
 const PURGE_DATA_NEEDS_YES: &str =
     "purge deletes tagteam's data for good; run it on a terminal to confirm, or pass --yes";
 
@@ -763,6 +765,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Displaced { .. } => "displaced",
         Command::Purge { .. } => "purge",
         Command::Export { .. } => "export",
+        Command::Import { .. } => "import",
         Command::Completions { .. } => "completions",
     }
 }
@@ -1257,6 +1260,11 @@ impl App<'_, '_> {
                 recipient_file,
                 plaintext,
             } => self.export(file, &account, full, &recipient, &recipient_file, plaintext)?,
+            Command::Import {
+                file,
+                force,
+                identity,
+            } => return self.import(&file, force, &identity),
             Command::Completions { .. } => unreachable!("run answers completions before dispatch"),
             Command::Auto {
                 once,
@@ -1392,6 +1400,58 @@ impl App<'_, '_> {
             ));
         }
         Ok(SecretString::from(first))
+    }
+
+    /// §13.3: `import`. Refused inside a run shell before anything is read (§12.8). The file is
+    /// read and decoded first, a passphrase asked for only when the file needs one, and only
+    /// where a person can answer; then the Keychain check (Appendix A.3), and the engine's two
+    /// passes. It exits 1 if any account failed.
+    fn import(&mut self, file: &str, force: bool, identity: &[PathBuf]) -> Result<i32, Failure> {
+        if let RunShell::Inside { .. } = self.engine.run_shell() {
+            return Err(EngineError::InsideRunShell.into());
+        }
+        let input = if file == "-" {
+            if std::io::stdin().is_terminal() {
+                return Err(Failure::Usage(IMPORT_FROM_TERMINAL.into()));
+            }
+            let all = prompt::read_piped_all(self.engine.cancel()).map_err(EngineError::Io)?;
+            self.after_prompt()?;
+            all.ok_or_else(cancelled)?
+        } else {
+            fs::read(file).map_err(|e| Failure::Message(KIND_IO, format!("{file}: {e}")))?
+        };
+        let mut keys = Vec::new();
+        for path in identity {
+            let name = path.display().to_string();
+            let bytes =
+                fs::read(path).map_err(|e| Failure::Message(KIND_IO, format!("{name}: {e}")))?;
+            keys.push(transfer::parse_identity_file(&name, &bytes).map_err(EngineError::from)?);
+        }
+        let can_ask = !self.json && self.io.prompter.reaches_terminal();
+        let what = if file == "-" { "the export" } else { file };
+        let prompter = &mut *self.io.prompter;
+        let decoded = transfer::decode(&input, &keys, &mut |need: &Need| {
+            if !can_ask {
+                return None;
+            }
+            let question = match need {
+                Need::Passphrase => format!("Passphrase for {what}: "),
+                Need::KeyPassphrase(key) => format!("Passphrase for the SSH key {key}: "),
+            };
+            prompter.secret(&question).map(SecretString::from)
+        });
+        self.after_prompt()?;
+        let decoded = decoded.map_err(EngineError::from)?;
+        self.ensure_unlocked()?;
+        let report = self.engine.import(decoded.records, force)?;
+        for w in &report.warnings {
+            let _ = writeln!(self.io.err, "warning: {w}");
+        }
+        self.print(
+            &transfer_cmd::import_human(&report),
+            transfer_cmd::import_json(&report),
+        );
+        Ok(if report.any_failed() { EXIT_ERROR } else { 0 })
     }
 
     /// §6.4's reads. None touches the store or the Keychain, and none creates anything (§5).
@@ -2232,6 +2292,7 @@ mod tests {
             &["completions", "bash"],
             &["purge", "--yes"],
             &["export", "--plaintext"],
+            &["import", "backup.age"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))

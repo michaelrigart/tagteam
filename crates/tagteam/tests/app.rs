@@ -1642,3 +1642,44 @@ fn without_a_terminal_or_under_json_an_export_needs_a_key_or_plaintext() {
     assert_eq!(v["error"]["type"], "needs-passphrase");
     assert!(!Path::new(&path).exists());
 }
+
+#[test]
+fn another_home_imports_a_passphrase_export_asking_for_it_once() {
+    let (from, path) = exporting();
+    let (code, _, err) = from.run(
+        &["export", &path],
+        &mut Scripted::answering(&["pw-1", "pw-1"]),
+    );
+    assert_eq!(code, 0, "{err}");
+    let to = H::new();
+    let mut asked = Scripted::answering(&["pw-1"]);
+    let (code, out, err) = to.run(&["import", &path], &mut asked);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(asked.asked, [format!("Passphrase for {path}: ")]);
+    assert_eq!(out, "created  #1 a@x.co: added\n");
+    assert_eq!(
+        to.json(&["list", "--json"])["accounts"][0]["email"],
+        "a@x.co"
+    );
+    let (code, _, err) = to.run(&["import", &path], &mut Scripted::answering(&["wrong"]));
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            1,
+            "tagteam: the passphrase is wrong, or the file is damaged\n"
+        )
+    );
+}
+
+#[test]
+fn a_passphrase_file_is_never_prompted_for_under_json() {
+    let (from, path) = exporting();
+    let (code, _, err) = from.run(&["export", &path], &mut Scripted::answering(&["pw", "pw"]));
+    assert_eq!(code, 0, "{err}");
+    let to = H::new();
+    let (code, out, _) = to.run(&["import", &path, "--json"], &mut Scripted::answering(&[]));
+    assert_eq!(code, 1);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["error"]["type"], "needs-passphrase");
+    assert!(!to.env.data_dir().exists(), "nothing was created");
+}

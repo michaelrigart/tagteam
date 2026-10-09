@@ -261,6 +261,21 @@ pub enum Command {
         #[arg(long)]
         plaintext: bool,
     },
+    /// Add the accounts of an export (tagteam's, or cswap's version 1) from FILE, or `-` for stdin
+    ///
+    /// An account already stored is skipped unless --force, or unless it is quarantined. --json
+    /// prints {schemaVersion, ok, accounts: [{provider, number, email, outcome, message}],
+    /// warnings}. It exits 1 if any account failed.
+    Import {
+        file: String,
+        /// Replace accounts already stored
+        #[arg(long)]
+        force: bool,
+        /// A private key the file is encrypted to: an age identity file or an ssh-ed25519 key
+        /// (repeatable)
+        #[arg(long, value_name = "FILE")]
+        identity: Vec<PathBuf>,
+    },
     /// Print a completion script for bash, zsh or fish
     Completions { shell: CompletionShell },
 }

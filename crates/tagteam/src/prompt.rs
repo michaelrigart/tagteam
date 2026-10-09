@@ -14,6 +14,12 @@ pub trait Prompter {
     fn confirm(&mut self, question: &str, default_yes: bool) -> bool;
     fn choose(&mut self, question: &str, options: &[String]) -> Option<usize>;
     fn secret(&mut self, question: &str) -> Option<String>;
+    /// True when a person can answer `secret` although stdin is not a terminal: `import -`
+    /// reads the file from stdin and its passphrase from the terminal (§13.3). `interactive` by
+    /// default.
+    fn reaches_terminal(&self) -> bool {
+        self.interactive()
+    }
 }
 
 /// The controlling terminal's generic name: the last resort when neither stdin nor stderr names
@@ -295,6 +301,32 @@ pub fn read_piped_line(cancel: &Cancel) -> io::Result<Option<String>> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the line is not UTF-8"))
 }
 
+/// All of stdin when it is not a terminal (`import -`, §13.3), read as `read_piped_line` reads
+/// a line: in `wait_for_input`'s slices, so a signal ends a wait on a writer that never closes.
+/// `None` once a signal ended it.
+pub fn read_piped_all(cancel: &Cancel) -> io::Result<Option<Vec<u8>>> {
+    use io::BufRead;
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut all = Vec::new();
+    loop {
+        if !wait_for_input(input.as_raw_fd(), cancel) {
+            return Ok(None);
+        }
+        let chunk = match input.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() {
+            return Ok(Some(all));
+        }
+        let taken = chunk.len();
+        all.extend_from_slice(chunk);
+        input.consume(taken);
+    }
+}
+
 /// The terminal's settings.
 fn termios(tty: BorrowedFd<'_>) -> io::Result<libc::termios> {
     let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -383,6 +415,11 @@ fn chosen(answer: Option<String>, count: usize) -> Option<usize> {
 impl Prompter for TtyPrompter {
     fn interactive(&self) -> bool {
         std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+    }
+
+    /// stderr's terminal, which `secret` opens when stdin is not one (`terminal_path`).
+    fn reaches_terminal(&self) -> bool {
+        std::io::stderr().is_terminal()
     }
 
     fn confirm(&mut self, question: &str, default_yes: bool) -> bool {

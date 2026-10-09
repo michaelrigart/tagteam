@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use tagteam_engine::export::ExportResult;
+use tagteam_engine::import::ImportReport;
 use tagteam_engine::store::AccountRow;
 
 use crate::render;
@@ -175,6 +176,48 @@ pub(crate) fn export_json(r: &ExportResult, file: Option<&Path>, encrypted: bool
     })
 }
 
+/// One line per account of the file, in its order.
+pub(crate) fn import_human(r: &ImportReport) -> String {
+    if r.accounts.is_empty() {
+        return "The file holds no account.\n".to_owned();
+    }
+    r.accounts
+        .iter()
+        .map(|a| {
+            format!(
+                "{:<8} #{} {}: {}\n",
+                a.outcome.as_str(),
+                a.position,
+                a.email,
+                a.message
+            )
+        })
+        .collect()
+}
+
+/// §13.3's `--json` for `import`.
+pub(crate) fn import_json(r: &ImportReport) -> Value {
+    let accounts: Vec<Value> = r
+        .accounts
+        .iter()
+        .map(|a| {
+            json!({
+                "provider": a.provider.as_str(),
+                "number": a.position,
+                "email": a.email,
+                "outcome": a.outcome.as_str(),
+                "message": a.message,
+            })
+        })
+        .collect();
+    json!({
+        "schemaVersion": 1,
+        "ok": !r.any_failed(),
+        "accounts": accounts,
+        "warnings": r.warnings,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -299,5 +342,44 @@ mod tests {
             skipped: Vec::new(),
         };
         assert!(export_warnings(&tokens_only).is_empty());
+    }
+
+    #[test]
+    fn an_import_report_reads_one_line_per_account_and_a_failure_is_not_ok() {
+        use tagteam_core::{CLAUDE_CODE, ProviderId};
+        use tagteam_engine::import::{Imported, Outcome};
+
+        let empty = ImportReport::default();
+        assert_eq!(import_human(&empty), "The file holds no account.\n");
+        assert_eq!(import_json(&empty)["ok"], true);
+
+        let report = ImportReport {
+            accounts: vec![
+                Imported {
+                    provider: ProviderId::new(CLAUDE_CODE),
+                    position: 1,
+                    email: "a@x.co".into(),
+                    outcome: Outcome::Created,
+                    message: "added".into(),
+                },
+                Imported {
+                    provider: ProviderId::new(CLAUDE_CODE),
+                    position: 12,
+                    email: "b@x.co".into(),
+                    outcome: Outcome::Failed,
+                    message: "no".into(),
+                },
+            ],
+            warnings: vec!["w".into()],
+        };
+        assert_eq!(
+            import_human(&report),
+            "created  #1 a@x.co: added\nfailed   #12 b@x.co: no\n"
+        );
+        let v = import_json(&report);
+        assert_eq!(
+            (&v["ok"], &v["accounts"][1]["number"], &v["warnings"][0]),
+            (&json!(false), &json!(12), &json!("w"))
+        );
     }
 }
