@@ -2,6 +2,8 @@
 //! test account, run against a `test-support` build of `tagteam` driven as a binary.
 
 pub mod capture;
+pub mod checks;
+pub mod ctx;
 pub mod guard;
 pub mod keychain;
 pub mod layout;
