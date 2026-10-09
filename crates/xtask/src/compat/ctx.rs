@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tagteam_cc::{CcPaths, ItemKind};
 use tagteam_provider::atomic::write_atomic_private;
 use tagteam_provider::keychain::Keychain as _;
-use tagteam_provider::profile::{ProfileMarker, Seed};
+use tagteam_provider::profile::{MARKER_FILE, ProfileMarker, Seed};
 use tagteam_provider::splice::{get_top_level, replace_top_level};
 use tagteam_provider::{Cancel, Read, SystemProcessProbe};
 
@@ -23,6 +23,8 @@ use super::guard::{CONFIG_DIR, Roots, cc_env};
 use super::keychain::{CcItem, Unlocked, VaultKeychain, random_hex};
 use super::layout::{Layout, private_dir};
 use super::report::Redactor;
+#[cfg(test)]
+use super::sys::process_alive;
 use super::sys::{Cmd, HarnessError, Pty, Ran, harness, settle};
 
 /// The test account's alias in the compat store, set by `compat login`.
@@ -422,7 +424,35 @@ impl Ctx {
         }
     }
 
-    pub fn write_credential(&self, place: &Place, bytes: &[u8]) -> Result<(), HarnessError> {
+    /// Refuses a profile that is session-owned (`daemon::owners`: a held launch reservation, a
+    /// live session record, a live daemon supervisor, or one that cannot be read): its
+    /// credential is only ever changed while nothing runs in it. A home that is no profile
+    /// (no marker) is the harness's own and is not judged.
+    pub fn assert_quiescent(&self, spelling: &str) -> Result<(), HarnessError> {
+        let home = Path::new(spelling);
+        if !home.join(MARKER_FILE).exists() {
+            return Ok(());
+        }
+        let owners = daemon::owners(home, &SystemProcessProbe);
+        if owners.is_clear() {
+            Ok(())
+        } else {
+            Err(harness(format!(
+                "{spelling} is session-owned ({}); its credential is changed only while nothing runs in it",
+                owners.describe()
+            )))
+        }
+    }
+
+    /// Writes the credential the home `spelling` holds at `place`, once nothing runs in it
+    /// (`assert_quiescent`).
+    pub fn write_credential(
+        &self,
+        spelling: &str,
+        place: &Place,
+        bytes: &[u8],
+    ) -> Result<(), HarnessError> {
+        self.assert_quiescent(spelling)?;
         match place {
             Place::Item(item) => item.write(bytes),
             Place::File(path) => Ok(write_atomic_private(path, bytes, 0o600)?),
@@ -432,6 +462,7 @@ impl Ctx {
     /// Makes the home's access token expired, its tokens untouched, so CC's next request
     /// refreshes it. Only while nothing runs in that home.
     pub fn expire(&self, spelling: &str) -> Result<Value, HarnessError> {
+        self.assert_quiescent(spelling)?;
         let (bytes, place) = self
             .read_credential(spelling)?
             .ok_or_else(|| harness(format!("{spelling} holds no credential to expire")))?;
@@ -442,7 +473,11 @@ impl Ctx {
             .and_then(Value::as_object_mut)
             .ok_or_else(|| harness(format!("{spelling}'s credential has no claudeAiOauth")))?;
         oauth.insert("expiresAt".into(), json!(now_ms() - EXPIRED_BY_MS));
-        self.write_credential(&place, &serde_json::to_vec(&v).expect("a Value serializes"))?;
+        self.write_credential(
+            spelling,
+            &place,
+            &serde_json::to_vec(&v).expect("a Value serializes"),
+        )?;
         Ok(json!({"place": place.describe(), "generation": generation(&bytes)}))
     }
 
@@ -952,6 +987,64 @@ rm -f "$home/daemon.lock""#,
             ["daemon stop --any", "daemon stop"]
         );
         assert!(!Path::new(&home).join("daemon.lock").exists());
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_session_owned_profile_s_credential_is_neither_expired_nor_written() {
+        let _serial = crate::compat::sys::serial();
+        let scratch = crate::compat::layout::make_scratch().unwrap();
+        let ctx = offline_ctx(
+            &scratch,
+            PathBuf::from("/nonexistent/tagteam"),
+            Redactor::default(),
+        );
+        let profile = ctx.new_home("profile").unwrap();
+        let file = Path::new(&profile).join(".credentials.json");
+        let original =
+            br#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt","expiresAt":1}}"#;
+        fs::write(&file, original).unwrap();
+
+        // No marker: not a profile, so not judged.
+        let pid = orphan_sleep();
+        lock_naming(&profile, pid);
+        ctx.expire(&profile).unwrap();
+        fs::write(&file, original).unwrap();
+
+        // A profile with a live supervisor: refused, and the credential is untouched.
+        fs::write(Path::new(&profile).join(MARKER_FILE), "{}").unwrap();
+        let e = ctx.expire(&profile).unwrap_err().0;
+        assert!(
+            e.contains("session-owned") && e.contains(&format!("pid {pid}")),
+            "{e}"
+        );
+        let place = Place::File(file.clone());
+        let e = ctx.write_credential(&profile, &place, b"{}").unwrap_err().0;
+        assert!(e.contains("session-owned"), "{e}");
+        assert_eq!(fs::read(&file).unwrap(), original);
+
+        // A live session record of any kind does too.
+        crate::compat::sys::signal(pid, "KILL", false);
+        crate::compat::sys::wait_until(Duration::from_secs(5), || !process_alive(pid));
+        ctx.expire(&profile).unwrap();
+        fs::write(&file, original).unwrap();
+        fs::remove_file(Path::new(&profile).join("daemon.lock")).unwrap();
+        fs::create_dir_all(Path::new(&profile).join("sessions")).unwrap();
+        let other = orphan_sleep();
+        fs::write(
+            Path::new(&profile).join("sessions/1.json"),
+            json!({"pid": other, "kind": "interactive"}).to_string(),
+        )
+        .unwrap();
+        let e = ctx.expire(&profile).unwrap_err().0;
+        assert!(e.contains("record of kind interactive"), "{e}");
+
+        // Quiet: both go ahead.
+        crate::compat::sys::signal(other, "KILL", false);
+        crate::compat::sys::wait_until(Duration::from_secs(5), || !process_alive(other));
+        ctx.expire(&profile).unwrap();
+        ctx.write_credential(&profile, &place, original).unwrap();
+        assert_eq!(fs::read(&file).unwrap(), original);
         fs::remove_dir_all(&scratch).unwrap();
     }
 

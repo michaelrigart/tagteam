@@ -14,8 +14,8 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 use tagteam_provider::{
-    ProcessProbe, Read, RecordEntry, SessionRecord, parse_lstart, parse_session_record,
-    read_session_records, read_supervisor_lock, record_is_live,
+    LockProbe, ProcessProbe, Read, RecordEntry, SessionRecord, launch_reservations, parse_lstart,
+    parse_session_record, read_session_records, read_supervisor_lock, record_is_live,
 };
 
 use super::ctx::DAEMON_KINDS;
@@ -89,11 +89,9 @@ fn roster_records(roster: &Value) -> Vec<(String, SessionRecord)> {
     out
 }
 
-/// Everything of the home's daemon that still lives: `daemon.lock`'s pid, the roster's
-/// supervisor and worker pids, and every session record of a daemon kind (`DAEMON_KINDS`).
-pub fn survey(home: &Path, probe: &dyn ProcessProbe) -> Survey {
-    let mut s = Survey::default();
-
+/// `daemon.lock` (CC 2.1.292) into `s`: a live supervisor is alive, a lock that cannot be read
+/// is unreadable, as tagteam judges both (§12.6).
+fn read_lock(home: &Path, probe: &dyn ProcessProbe, s: &mut Survey) {
     match read_supervisor_lock(&home.join("daemon.lock")) {
         Read::Present(r) if record_is_live(probe, &r, LAUNCH) => {
             s.alive
@@ -102,6 +100,41 @@ pub fn survey(home: &Path, probe: &dyn ProcessProbe) -> Survey {
         Read::Present(_) | Read::Absent => {}
         Read::Unreadable(e) => s.unreadable.push(format!("daemon.lock ({e})")),
     }
+}
+
+/// The home's session records into `s`: a live one is alive (`only_daemons` keeps to the
+/// daemon kinds, `DAEMON_KINDS`), one that cannot be read is unreadable.
+fn read_records(home: &Path, probe: &dyn ProcessProbe, only_daemons: bool, s: &mut Survey) {
+    match read_session_records(&home.join("sessions")) {
+        Read::Present(entries) => {
+            for entry in entries {
+                match entry {
+                    RecordEntry::Record(r) => {
+                        let daemon = r.kind.as_deref().is_some_and(|k| DAEMON_KINDS.contains(&k));
+                        if (daemon || !only_daemons) && record_is_live(probe, &r, LAUNCH) {
+                            s.alive.push(format!(
+                                "a record of kind {} (pid {})",
+                                r.kind.as_deref().unwrap_or("session"),
+                                r.pid
+                            ));
+                        }
+                    }
+                    RecordEntry::Unreadable { path, detail } => {
+                        s.unreadable.push(format!("{} ({detail})", path.display()))
+                    }
+                }
+            }
+        }
+        Read::Absent => {}
+        Read::Unreadable(e) => s.unreadable.push(format!("sessions ({e})")),
+    }
+}
+
+/// Everything of the home's daemon that still lives: `daemon.lock`'s pid, the roster's
+/// supervisor and worker pids, and every session record of a daemon kind (`DAEMON_KINDS`).
+pub fn survey(home: &Path, probe: &dyn ProcessProbe) -> Survey {
+    let mut s = Survey::default();
+    read_lock(home, probe, &mut s);
 
     match fs::read(home.join("daemon/roster.json")) {
         Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
@@ -124,30 +157,34 @@ pub fn survey(home: &Path, probe: &dyn ProcessProbe) -> Survey {
         Err(e) => s.unreadable.push(format!("daemon/roster.json ({e})")),
     }
 
-    match read_session_records(&home.join("sessions")) {
-        Read::Present(entries) => {
-            for entry in entries {
-                match entry {
-                    RecordEntry::Record(r) => {
-                        let daemon = r.kind.as_deref().is_some_and(|k| DAEMON_KINDS.contains(&k));
-                        if daemon && record_is_live(probe, &r, LAUNCH) {
-                            s.alive.push(format!(
-                                "a {} record (pid {})",
-                                r.kind.as_deref().unwrap_or("?"),
-                                r.pid
-                            ));
-                        }
-                    }
-                    RecordEntry::Unreadable { path, detail } => {
-                        s.unreadable.push(format!("{} ({detail})", path.display()))
-                    }
+    read_records(home, probe, true, &mut s);
+    s.alive.sort();
+    s.alive.dedup();
+    s
+}
+
+/// What makes the profile `home` session-owned for tagteam (§12.5, §12.6): a launch
+/// reservation that is held, a live session record of any kind, a live daemon supervisor in
+/// `daemon.lock`; and a reservation, record or lock that cannot be read, which may hide one.
+pub fn owners(home: &Path, probe: &dyn ProcessProbe) -> Survey {
+    let mut s = Survey::default();
+    match launch_reservations(home) {
+        Read::Present(held) => {
+            for (path, state) in held {
+                if state == LockProbe::Held {
+                    s.alive.push(format!(
+                        "a launch reservation ({})",
+                        path.file_name()
+                            .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                    ));
                 }
             }
         }
         Read::Absent => {}
-        Read::Unreadable(e) => s.unreadable.push(format!("sessions ({e})")),
+        Read::Unreadable(e) => s.unreadable.push(format!("launch reservations ({e})")),
     }
-
+    read_records(home, probe, false, &mut s);
+    read_lock(home, probe, &mut s);
     s.alive.sort();
     s.alive.dedup();
     s
@@ -396,8 +433,59 @@ mod tests {
         let s = survey(&h, &probe);
         assert_eq!(
             s.alive,
-            ["a bg record (pid 301)", "a daemon-worker record (pid 302)"]
+            [
+                "a record of kind bg (pid 301)",
+                "a record of kind daemon-worker (pid 302)"
+            ]
         );
+        fs::remove_dir_all(&h).unwrap();
+    }
+
+    #[test]
+    fn a_profile_is_owned_by_a_held_reservation_any_live_record_or_a_live_supervisor() {
+        use tagteam_provider::FlockGuard;
+        let h = home("owners");
+        let probe = FakeProcessProbe::new();
+        assert!(owners(&h, &probe).is_clear());
+
+        // A live record of any kind owns the profile, though it is no daemon's.
+        fs::write(
+            h.join("sessions/7.json"),
+            json!({"pid": 401, "kind": "interactive", "procStart": LSTART}).to_string(),
+        )
+        .unwrap();
+        running(&probe, 401, STARTED);
+        assert_eq!(
+            owners(&h, &probe).alive,
+            ["a record of kind interactive (pid 401)"]
+        );
+        assert!(survey(&h, &probe).is_clear(), "but it is no daemon's");
+        fs::remove_file(h.join("sessions/7.json")).unwrap();
+        assert!(owners(&h, &FakeProcessProbe::new()).is_clear());
+
+        // A held reservation does; a free one does not.
+        fs::create_dir_all(h.join(".tagteam-launch")).unwrap();
+        let path = h.join(".tagteam-launch/run.lock");
+        fs::write(&path, "").unwrap();
+        assert!(owners(&h, &probe).is_clear(), "a free reservation");
+        let held = FlockGuard::try_lock(&path)
+            .unwrap()
+            .expect("the lock is free");
+        assert_eq!(
+            owners(&h, &probe).alive,
+            ["a launch reservation (run.lock)"]
+        );
+        drop(held);
+
+        // A live supervisor does, and an unreadable lock may hide one.
+        lock(&h, 100);
+        running(&probe, 100, STARTED);
+        assert_eq!(
+            owners(&h, &probe).alive,
+            ["the supervisor in daemon.lock (pid 100)"]
+        );
+        fs::write(h.join("daemon.lock"), "{").unwrap();
+        assert_eq!(owners(&h, &probe).unreadable.len(), 1);
         fs::remove_dir_all(&h).unwrap();
     }
 

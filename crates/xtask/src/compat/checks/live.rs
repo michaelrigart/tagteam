@@ -479,7 +479,11 @@ pub fn api_key_entry(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
         "accessToken": "tagteam-compat-mcp-dummy",
         "expiresAt": 0
     }});
-    ctx.write_credential(&place, &serde_json::to_vec(&v).expect("a Value serializes"))?;
+    ctx.write_credential(
+        &live,
+        &place,
+        &serde_json::to_vec(&v).expect("a Value serializes"),
+    )?;
     let key = ctx.add_dummy_api_key()?;
     p.note("switch", ctx.switch(ALIAS_API_KEY)?);
     match ctx.read_credential(&live)? {
@@ -550,6 +554,7 @@ pub fn api_key_entry(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
             o.remove("mcpOAuth");
         }
         ctx.write_credential(
+            &live,
             &at,
             &serde_json::to_vec(&entry).expect("a Value serializes"),
         )?;
