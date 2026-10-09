@@ -334,6 +334,9 @@ pub struct CheckResult {
     pub seconds: f64,
 }
 
+/// The last teardown step: the vault locked again, after everything else.
+pub const TEARDOWN_LAST: &str = "the vault locked";
+
 #[derive(Clone, PartialEq, Default)]
 pub struct Report {
     /// Epoch seconds.
@@ -401,12 +404,16 @@ impl Report {
         }
     }
 
-    /// How far teardown got, for a reader of the report: not begun, or the steps it finished.
+    /// How far teardown got, for a reader of the report: not begun, stopped after some steps,
+    /// or finished (its last step, `TEARDOWN_LAST`, done).
     pub fn teardown_text(&self) -> String {
         match self.teardown.as_deref() {
             None => "not begun".to_owned(),
             Some([]) => "begun, no step finished".to_owned(),
-            Some(done) => format!("finished: {}", done.join(", ")),
+            Some(done) if done.last() == Some(&TEARDOWN_LAST) => {
+                format!("finished: {}", done.join(", "))
+            }
+            Some(done) => format!("stopped after: {}", done.join(", ")),
         }
     }
 
@@ -873,7 +880,7 @@ mod tests {
         r.teardown = Some(vec!["daemons stopped"]);
         assert!(
             r.to_markdown()
-                .contains("- Teardown: finished: daemons stopped")
+                .contains("- Teardown: stopped after: daemons stopped")
         );
         assert_eq!(r.to_json()["teardown"], json!(["daemons stopped"]));
         r.teardown = Some(vec![]);

@@ -392,6 +392,7 @@ impl Ctx {
     /// one.
     pub fn drop_profile(&self, dir: &Path, spelling: &str) -> Result<(), HarnessError> {
         self.stop_daemon(spelling)?;
+        self.assert_quiescent(spelling)?;
         if self.uncaptured(dir, spelling)?.is_some() {
             return Err(harness(format!(
                 "{} holds a generation the vault does not have; it is kept",
@@ -1053,6 +1054,38 @@ rm -f "$home/daemon.lock""#,
         ctx.expire(&profile).unwrap();
         ctx.write_credential(&profile, &place, original).unwrap();
         assert_eq!(fs::read(&file).unwrap(), original);
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_profile_with_a_live_session_is_not_dropped() {
+        let _serial = crate::compat::sys::serial();
+        let scratch = crate::compat::layout::make_scratch().unwrap();
+        let ctx = offline_ctx(
+            &scratch,
+            PathBuf::from("/nonexistent/tagteam"),
+            Redactor::default(),
+        );
+        let profile = ctx.new_home("profile").unwrap();
+        let dir = PathBuf::from(&profile);
+        fs::write(dir.join(MARKER_FILE), "{}").unwrap();
+        fs::write(dir.join(".credentials.json"), "{}").unwrap();
+        fs::create_dir_all(dir.join("sessions")).unwrap();
+        let pid = orphan_sleep();
+        // Not a daemon's kind, so `stop_daemon` has nothing to stop and the quiescence
+        // assertion is what refuses.
+        fs::write(
+            dir.join("sessions/1.json"),
+            json!({"pid": pid, "kind": "interactive"}).to_string(),
+        )
+        .unwrap();
+        let e = ctx.drop_profile(&dir, &profile).unwrap_err().0;
+        crate::compat::sys::signal(pid, "KILL", false);
+        assert!(e.contains("session-owned"), "{e}");
+        assert!(
+            dir.join(".credentials.json").exists(),
+            "nothing was deleted"
+        );
         fs::remove_dir_all(&scratch).unwrap();
     }
 

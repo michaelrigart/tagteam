@@ -26,7 +26,7 @@ use super::guard::Roots;
 use super::keychain::VaultKeychain;
 use super::layout::{self, Layout, RunLock, make_scratch};
 use super::registry::{Flags, Phase, select};
-use super::report::{CheckResult, EXIT_HARNESS, Evidence, Outcome, Report};
+use super::report::{CheckResult, EXIT_HARNESS, Evidence, Outcome, Report, TEARDOWN_LAST};
 use super::store;
 use super::sys::{
     CAUGHT, HarnessError, Ran, cancel, catch_signals, drain, harness, interrupted, quiesce,
@@ -314,9 +314,6 @@ fn kept_note(scratch: &Path) -> Evidence {
     )
 }
 
-/// The last teardown step: the vault locked again, after everything else.
-const TEARDOWN_LAST: &str = "the vault locked";
-
 /// A run a signal ended, once its `Ctx` has gone: the vault is locked again. The report names
 /// the signal and how far teardown got (not begun, interrupted after which steps, or already
 /// finished), keeps what else went wrong (a group quiescence found still holding a process,
@@ -330,10 +327,18 @@ fn conclude(report: &mut Report, token: &Cancel, scratch: Option<&Path>) {
     let kept = scratch
         .filter(|s| s.exists())
         .map_or_else(String::new, |s| format!("; {} is kept", s.display()));
+    // What else went wrong, without the signal's own message, which may be one of several
+    // errors joined (`Report::fail`) and is said once, first.
     let also = report
         .harness_error
         .take()
-        .filter(|e| *e != signal)
+        .map(|e| {
+            e.split("; ")
+                .filter(|part| *part != signal)
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .filter(|e| !e.is_empty())
         .map_or_else(String::new, |e| format!(" ({e})"));
     let torn = match report.teardown.as_deref() {
         None => "nothing was torn down".to_owned(),
@@ -1005,6 +1010,18 @@ mod tests {
         );
         let done = concluded(Some(vec!["daemons stopped", TEARDOWN_LAST]));
         assert!(done.contains("teardown had finished"), "{done}");
+
+        // The signal's own message, joined with other errors, is said once.
+        let mut report = Report::default();
+        report.fail("interrupted by SIGINT");
+        report.fail("teardown refused, since a daemon runs");
+        conclude(&mut report, &token, None);
+        let said = report.harness_error.unwrap();
+        assert_eq!(said.matches("interrupted by SIGINT").count(), 1, "{said}");
+        assert!(
+            said.contains("(teardown refused, since a daemon runs)"),
+            "{said}"
+        );
     }
 
     #[test]
