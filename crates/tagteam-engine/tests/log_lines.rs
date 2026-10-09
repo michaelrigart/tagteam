@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use common::{Fx, capture_logs, crashed_switch, due, vault_fp, write_target_credential};
 use serde_json::json;
-use tagteam_core::AccountId;
+use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::active::{ActiveOutcome, ActiveTrigger};
 use tagteam_engine::export::ExportRequest;
+use tagteam_engine::transfer::ImportRecord;
 use tagteam_engine::vault::SERVICE;
 use tagteam_engine::views::StatuslineView;
 use tagteam_provider::Clock;
@@ -582,6 +583,37 @@ fn an_export_logs_each_account_by_id_and_position_and_never_its_login() {
         [Some(a.as_str()), Some("\"account-broken\"")],
         "{}",
         skipped[0]
+    );
+    no_email(&logs);
+    assert!(logs.iter().all(|l| !l.contains("rt-")), "{logs:#?}");
+}
+
+#[test]
+fn an_import_logs_each_account_by_id_and_position_and_never_its_login() {
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    let record = ImportRecord {
+        provider: ProviderId::new(CLAUDE_CODE),
+        position: 3,
+        kind: Some("oauth".into()),
+        label: None,
+        alias: None,
+        disabled: false,
+        added_at: None,
+        identity: json!({"oauthAccount": Fx::oauth_account("c@x.co")}),
+        credential: json!({"claudeAiOauth": {"accessToken": "at-c", "refreshToken": "rt-c"}}),
+    };
+    let (_, logs) = capture_logs(|| fx.engine.import(vec![record], false).unwrap());
+    let c = fx.engine.resolve("c@x.co", None).unwrap();
+    let line = one(&logs, "imported an account");
+    assert_eq!(
+        [
+            field(line, "account"),
+            field(line, "position"),
+            field(line, "outcome")
+        ],
+        [Some(c.id.as_str()), Some("3"), Some("\"created\"")],
+        "{line}"
     );
     no_email(&logs);
     assert!(logs.iter().all(|l| !l.contains("rt-")), "{logs:#?}");

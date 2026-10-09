@@ -115,7 +115,7 @@ fn no_default_email(kind: &str) -> EngineError {
 /// both by `prepare`'s pre-lock fast path and again, post-lock, by `add_live`/`add_token`:
 /// reconciling a pending replacement under the account lock can install a uuid the pre-lock
 /// read never saw, so the pre-lock check alone is not enough.
-fn check_identity_conflict(
+pub(crate) fn check_identity_conflict(
     row: Option<&AccountRow>,
     claimed_uuid: Option<&str>,
     label: &str,
@@ -159,20 +159,25 @@ fn unused_token_identity(
 }
 
 /// What a login write will replace, decided before anything is mutated.
-struct Prepared {
-    existing: Option<AccountRow>,
-    occupant: Option<AccountRow>,
-    id: AccountId,
+pub(crate) struct Prepared {
+    pub(crate) existing: Option<AccountRow>,
+    pub(crate) occupant: Option<AccountRow>,
+    pub(crate) id: AccountId,
 }
 
-/// Where a login comes from, for the evidence an explicit replacement records (§12.5).
+/// Where a login comes from: the evidence an explicit replacement records (§12.5), the event
+/// the write records, and when a new account was first added.
 #[derive(Clone, Copy)]
-struct LoginSource {
+pub(crate) struct LoginSource {
     /// Taken from the live store (`add`): finishing the replacement records its new epoch as
     /// the activation epoch (§10.1).
-    from_live: bool,
+    pub(crate) from_live: bool,
     /// The live identity names the account (§12.5 "A replacement records its own evidence").
-    live_names_account: bool,
+    pub(crate) live_names_account: bool,
+    /// The `events` row's kind: `add`, or `import` (§13.3).
+    pub(crate) event: &'static str,
+    /// A new account's `added_at`, epoch ms: an import keeps the file's (§13.3); `None` is now.
+    pub(crate) added_at: Option<i64>,
 }
 
 /// What `remove_locked` does with a `rescue` path it cannot list (§6.3, §10.5 step 7).
@@ -404,7 +409,7 @@ impl Engine {
     /// occupant it displaces is removed, so a failure never loses the occupant. `source` is the
     /// evidence a replacement records for the default home (§12.5).
     #[allow(clippy::too_many_arguments)]
-    fn commit_login(
+    pub(crate) fn commit_login(
         &self,
         store: &Store,
         p: &dyn Provider,
@@ -473,7 +478,7 @@ impl Engine {
                     kind,
                     alias: None,
                     login_expires_at: p.login_expires_at(secret),
-                    added_at: self.now_ms(),
+                    added_at: source.added_at.unwrap_or_else(|| self.now_ms()),
                 })?;
                 if let Err(e) = self.vault.store(lock_for(&prep.id), secret, &fp) {
                     // The write may have landed and failed only its read-back. A new account
@@ -500,7 +505,7 @@ impl Engine {
         if alias.is_some() {
             store.set_alias(&prep.id, alias).map_err(alias_taken)?;
         }
-        self.event(provider, "add", None, Some(&prep.id))?;
+        self.event(provider, source.event, None, Some(&prep.id))?;
         Ok((
             store.account(&prep.id)?.ok_or(StoreError::NoSuchAccount)?,
             prep.existing.is_none(),
@@ -623,6 +628,8 @@ impl Engine {
             LoginSource {
                 from_live: true,
                 live_names_account: true,
+                event: "add",
+                added_at: None,
             },
         )?;
         drop(live_locks);
@@ -727,6 +734,8 @@ impl Engine {
             LoginSource {
                 from_live: false,
                 live_names_account,
+                event: "add",
+                added_at: None,
             },
         )?;
         Ok(AddOutcome {

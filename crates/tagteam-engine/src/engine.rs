@@ -250,12 +250,35 @@ impl Engine {
         source: &'static str,
         timeout: Duration,
     ) -> Result<MutationGuard, EngineError> {
-        let (guard, blocked) = self.guard_recovering(true, source, timeout)?;
-        if self.interrupted(provider)? {
-            return Err(blocked
-                .into_iter()
-                .find_map(|(p, e)| (&p == provider).then_some(e))
-                .unwrap_or_else(|| EngineError::InterruptedSwitch(provider.to_string())));
+        self.guard_or_refuse_each_within(std::slice::from_ref(provider), source, timeout)
+    }
+
+    /// `guard_or_refuse_as` for several providers under one mutation lock (`import`, §13.3):
+    /// refused for the first of `providers` whose interrupted switch is still unresolved once
+    /// recovery has run under it.
+    pub(crate) fn guard_or_refuse_each(
+        &self,
+        providers: &[ProviderId],
+        source: &'static str,
+    ) -> Result<MutationGuard, EngineError> {
+        self.guard_or_refuse_each_within(providers, source, MutationGuard::TIMEOUT)
+    }
+
+    /// `guard_or_refuse_each`, waiting up to `timeout` for the lock.
+    fn guard_or_refuse_each_within(
+        &self,
+        providers: &[ProviderId],
+        source: &'static str,
+        timeout: Duration,
+    ) -> Result<MutationGuard, EngineError> {
+        let (guard, mut blocked) = self.guard_recovering(true, source, timeout)?;
+        for provider in providers {
+            if self.interrupted(provider)? {
+                return Err(match blocked.iter().position(|(p, _)| p == provider) {
+                    Some(i) => blocked.swap_remove(i).1,
+                    None => EngineError::InterruptedSwitch(provider.to_string()),
+                });
+            }
         }
         Ok(guard)
     }
