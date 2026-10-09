@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::json;
+use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_provider::{
@@ -525,4 +526,16 @@ fn every_warning_and_failure_names_a_fix() {
     for c in problems {
         assert!(c.fix.is_some(), "{} names no fix: {c:?}", c.id);
     }
+}
+
+#[test]
+fn the_online_hosts_are_each_endpoint_host_once() {
+    let f = fx();
+    assert_eq!(
+        f.cc.doctor_hosts(),
+        ["https://platform.claude.com/", "https://api.anthropic.com/"]
+    );
+    let local = ClaudeCode::with_store(LiveStore::new(f.kc.clone(), Platform::MacOs))
+        .with_endpoints(Endpoints::with_base("http://127.0.0.1:9"));
+    assert_eq!(local.doctor_hosts(), ["http://127.0.0.1:9/"]);
 }

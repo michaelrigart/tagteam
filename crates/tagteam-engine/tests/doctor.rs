@@ -1697,3 +1697,90 @@ fn an_account_s_profile_whose_marker_names_another_provider_is_still_the_account
     assert!(splits.iter().all(|c| c.status == CheckStatus::Fail));
     assert!(found(&r, "sessions.orphan").is_empty());
 }
+
+// ---- Task 10 Part C: --online ----
+
+/// An engine whose Claude Code sends to `base`, through `http`.
+fn engine_for(
+    fx: &Fx,
+    base: &str,
+    http: std::sync::Arc<dyn tagteam_provider::Http>,
+) -> tagteam_engine::Engine {
+    use tagteam_cc::ClaudeCode;
+    use tagteam_cc::endpoints::Endpoints;
+    use tagteam_cc::live::LiveStore;
+    let provider = ClaudeCode::with_store(LiveStore::new(fx.kc.clone(), Platform::MacOs))
+        .with_endpoints(Endpoints::with_base(base));
+    tagteam_engine::Engine::new(tagteam_engine::EngineConfig {
+        env: fx.env.clone(),
+        registry: tagteam_engine::registry::ProviderRegistry::new()
+            .with(std::sync::Arc::new(provider)),
+        vault: tagteam_engine::vault::Vault::new(Box::new(
+            tagteam_engine::vault::KeychainVault::new(fx.kc.clone()),
+        )),
+        oracle: fx.oracle.clone(),
+        clock: fx.clock.clone(),
+        http,
+        default_provider: cc(),
+        settings: tagteam_engine::settings::Settings::default(),
+        process: fx.process.clone(),
+        run_shell: tagteam_provider::profile::RunShell::Outside,
+        spawner: fx.spawner.clone(),
+    })
+}
+
+fn online(engine: &tagteam_engine::Engine) -> DoctorReport {
+    engine
+        .doctor(DoctorOptions {
+            online: true,
+            ..DoctorOptions::default()
+        })
+        .unwrap()
+}
+
+#[test]
+fn online_reaches_a_host_that_answers_and_fails_one_that_refuses_the_connection() {
+    let fx = Fx::new();
+    let server = tagteam_provider::MockServer::start();
+    let http = std::sync::Arc::new(tagteam_engine::net::UreqHttp::direct());
+    let r = online(&engine_for(&fx, &server.base_url(), http.clone()));
+    let c = one(&r, "online.reach");
+    assert_eq!(c.status, CheckStatus::Ok);
+    assert!(c.message.contains("(HTTP 404)"), "{}", c.message);
+    let sent = server.requests();
+    assert_eq!(sent.len(), 1, "one request per host");
+    assert!(
+        sent[0].headers.iter().all(|(k, _)| k != "authorization"),
+        "no credential is sent"
+    );
+
+    let r = online(&engine_for(&fx, "http://127.0.0.1:9", http));
+    let c = one(&r, "online.reach");
+    assert_eq!(c.status, CheckStatus::Fail);
+    assert!(fix(c).contains("proxy"), "{c:?}");
+}
+
+#[test]
+fn an_ambiguous_reply_warns_and_without_online_nothing_is_sent() {
+    use tagteam_provider::http::{HttpError, HttpResponse, Method};
+    let fx = Fx::new();
+    doctor(&fx);
+    assert!(
+        fx.http.requests().is_empty(),
+        "doctor sends nothing without --online"
+    );
+    fx.http.push(
+        Method::Get,
+        "https://platform.claude.com/",
+        Ok(HttpResponse::json_body(404, &serde_json::json!({}))),
+    );
+    fx.http.push(
+        Method::Get,
+        "https://api.anthropic.com/",
+        Err(HttpError::Ambiguous("reset after connect".into())),
+    );
+    let r = online(&fx.engine);
+    let reach = found(&r, "online.reach");
+    let statuses: Vec<CheckStatus> = reach.iter().map(|c| c.status).collect();
+    assert_eq!(statuses, [CheckStatus::Ok, CheckStatus::Warn], "{reach:#?}");
+}

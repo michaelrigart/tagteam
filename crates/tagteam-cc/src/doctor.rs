@@ -80,6 +80,13 @@ fn reported(stdout: &[u8]) -> Option<Version> {
     version(v)
 }
 
+/// The scheme and host of `url`, as a root URL (`https://api.anthropic.com/`).
+pub(crate) fn origin(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let host = rest.split('/').next().filter(|h| !h.is_empty())?;
+    Some(format!("{scheme}://{host}/"))
+}
+
 /// Whether `dir` is a spelling of the default home, `~/.claude` (Appendix A.2).
 fn names_default_home(env: &Env, dir: &OsStr) -> bool {
     let default = env.home.join(".claude");
@@ -658,5 +665,19 @@ mod tests {
         ] {
             assert_eq!(reported(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_origin_is_a_url_s_scheme_and_host() {
+        assert_eq!(
+            origin("https://api.anthropic.com/api/oauth/usage").as_deref(),
+            Some("https://api.anthropic.com/")
+        );
+        assert_eq!(
+            origin("http://127.0.0.1:9/v1/oauth/token").as_deref(),
+            Some("http://127.0.0.1:9/")
+        );
+        assert_eq!(origin("no-scheme"), None);
+        assert_eq!(origin("https:///path"), None);
     }
 }

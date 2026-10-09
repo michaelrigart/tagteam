@@ -22,6 +22,7 @@ use tagteam_core::{ProvenanceVerdict, provenance};
 use tagteam_provider::atomic::{temp_writer_pid, writable};
 use tagteam_provider::doctor::quoted;
 use tagteam_provider::env::LOG_ROTATIONS;
+use tagteam_provider::http::{HttpError, HttpRequest};
 use tagteam_provider::profile::{ProfileMarker, Seed, canonical_profile_path, launch_reservations};
 use tagteam_provider::{
     Check, CheckStatus, Env, Liveness, LockProbe, LockState, Provenance, Provider, Read, holders_of,
@@ -68,6 +69,9 @@ impl DoctorReport {
 
 /// `login_expires_at` this close is reported (§13.6).
 const EXPIRY_NOTICE_MS: i64 = 7 * 86_400_000;
+
+/// How long `--online` waits for each host (§13.6).
+const ONLINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What the store let doctor read.
 enum Stored {
@@ -280,6 +284,9 @@ impl Engine {
                 run.push(Some(&id), check);
             }
             self.check_cancel()?;
+            if opts.online {
+                run.online(p.as_ref())?;
+            }
         }
         run.keychain_note();
         Ok(run.finish(&providers))
@@ -2396,6 +2403,47 @@ impl Run<'_> {
             )
             .fix("to share one with every profile, `tagteam config set run.share_extra <names>`"),
         );
+    }
+
+    /// §13.6 `--online`: TLS reachability of `p`'s hosts through the engine's `Http` port, in
+    /// parallel, with no credentials: any HTTP response reaches the host, a `PreSend` failure
+    /// does not, and an `Ambiguous` one cannot tell. A signal that has landed sends nothing.
+    fn online(&mut self, p: &dyn Provider) -> Result<(), EngineError> {
+        let hosts = p.doctor_hosts();
+        self.engine.check_cancel()?;
+        let http = self.engine.http.as_ref();
+        let replies: Vec<(String, Result<u16, HttpError>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = hosts
+                .iter()
+                .map(|url| {
+                    s.spawn(move || {
+                        let reply = http.send(&HttpRequest::get(url.clone(), ONLINE_TIMEOUT));
+                        (url.clone(), reply.map(|r| r.status))
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a reachability probe never panics"))
+                .collect()
+        });
+        let id = p.id();
+        for (url, reply) in replies {
+            let check = match reply {
+                Ok(status) => Check::ok("online.reach", format!("{url} answers (HTTP {status})")),
+                Err(HttpError::PreSend(e)) => {
+                    Check::fail("online.reach", format!("{url} cannot be reached: {e}"))
+                        .fix("check the network, any proxy (HTTPS_PROXY) and the TLS trust store")
+                }
+                Err(HttpError::Ambiguous(e)) => Check::warn(
+                    "online.reach",
+                    format!("{url} took the request but gave no answer: {e}"),
+                )
+                .fix("try again; if it persists, check the network and any proxy"),
+            };
+            self.push(Some(&id), check);
+        }
+        Ok(())
     }
 
     /// §13.6: the one warning for every check skipped because the Keychain could not be read

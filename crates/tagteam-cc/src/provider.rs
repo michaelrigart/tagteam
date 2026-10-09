@@ -764,6 +764,20 @@ impl Provider for ClaudeCode {
     ) -> Vec<Check> {
         doctor::checks(&self.live, env, spawner, cancel)
     }
+
+    /// The token, profile and usage hosts (Appendix A.5), each once, as root URLs.
+    fn doctor_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = [
+            &self.endpoints.token,
+            &self.endpoints.profile,
+            &self.endpoints.usage,
+        ]
+        .into_iter()
+        .filter_map(|url| doctor::origin(url))
+        .collect();
+        hosts.dedup();
+        hosts
+    }
 }
 
 #[cfg(test)]

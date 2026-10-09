@@ -798,6 +798,12 @@ pub trait Provider: Send + Sync {
         let _ = (env, spawner, cancel);
         Vec::new()
     }
+
+    /// §13.6 `--online`: the root URL of each host the provider sends to (its token, profile and
+    /// usage hosts), which doctor probes for reachability with no credentials. None by default.
+    fn doctor_hosts(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
