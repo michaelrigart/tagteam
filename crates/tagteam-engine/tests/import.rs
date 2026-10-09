@@ -4,11 +4,13 @@
 mod common;
 
 use common::{FakeFx, Fx, crashed_switch, credential, quiescent, two_accounts};
+use std::os::unix::fs::PermissionsExt;
+
 use serde_json::{Value, json};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::export::ExportRequest;
 use tagteam_engine::import::{ImportReport, Outcome};
-use tagteam_engine::store::AccountRow;
+use tagteam_engine::store::{AccountRow, Activation};
 use tagteam_engine::transfer::{ImportRecord, decode, read_envelope};
 use tagteam_provider::profile::Seed;
 use tagteam_provider::{Provider, Read};
@@ -81,7 +83,7 @@ fn a_pass_one_refusal_names_the_account_and_creates_nothing() {
         (
             bad(&|r| r.kind = Some("api_key".into())),
             "invalid-input",
-            "account 2 of the file: its kind api_key does not match its credential's, oauth",
+            "account 2 of the file: its kind does not match its credential's, oauth",
         ),
         (
             bad(&|r| r.alias = Some("-dev".into())),
@@ -166,7 +168,7 @@ fn a_taken_position_falls_to_the_next_and_an_alias_held_here_is_dropped() {
     assert_eq!(
         report.warnings,
         [
-            "the alias of the file's account at position 1 is another account's here, so it was not imported"
+            "the alias of the file's account at position 1 is another account's here, so the account was imported without it"
         ]
     );
     assert_eq!(row(&fx, "c@x.co").alias, None);
@@ -438,4 +440,72 @@ fn a_file_with_no_account_imports_nothing_and_creates_nothing() {
     let fx = Fx::new();
     assert_eq!(import(&fx, vec![], false), ImportReport::default());
     assert!(!fx.env.data_dir().exists());
+}
+
+#[test]
+fn a_replacement_records_the_live_identity_as_evidence_whatever_the_store_says_is_active() {
+    // §12.5 "A replacement records its own evidence": Claude Code was logged in as `a` by hand
+    // (`claude /login`), so `active_accounts` names another account or none. The import reads
+    // the live identity, so the live store is still stale-marked for `a` at its old epoch.
+    for named in [Some("b@x.co"), None] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let provider = fx.provider();
+        let store = fx.engine.store().unwrap();
+        match named {
+            Some(email) => store
+                .set_active(&provider, Some(&row(&fx, email).id), Some(0))
+                .unwrap(),
+            None => store.set_active(&provider, None, None).unwrap(),
+        }
+        fx.login("a@x.co", "rt-a-live");
+        assert_ne!(fx.activation().map(|x| x.account), Some(a.clone()));
+
+        let report = import(&fx, vec![record(1, "a@x.co", "rt-a9")], true);
+
+        assert_eq!(
+            outcomes(&report),
+            [(1, Outcome::Replaced, "replaced".into())]
+        );
+        assert_eq!(
+            fx.activation(),
+            Some(Activation {
+                account: a.clone(),
+                epoch: Some(0)
+            }),
+            "named {named:?}: the account at the epoch it had before the replacement"
+        );
+        assert!(fx.live_store_stale(&a), "named {named:?}");
+        assert_eq!(
+            report.warnings,
+            [
+                "position 1 is Claude Code's live login, which keeps its old login until you run `tagteam switch 1 --force`"
+            ]
+        );
+    }
+}
+
+#[test]
+fn an_unreadable_live_identity_fails_that_account_and_writes_nothing_for_it() {
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let before = row(&fx, "a@x.co");
+    let config = fx.paths().global_config;
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = fx.engine.import(vec![record(1, "a@x.co", "rt-a9")], true);
+
+    // Restored before any assertion can panic and leave the tempdir unreadable for cleanup.
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let report = result.unwrap();
+    assert!(report.any_failed());
+    assert_eq!(report.accounts[0].outcome, Outcome::Failed);
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    let after = row(&fx, "a@x.co");
+    assert_eq!(
+        (after.login_epoch, after.replacing_fp.clone()),
+        (before.login_epoch, None),
+        "no replacement was begun"
+    );
+    assert_eq!(events(&fx, "import", &a), 0);
 }

@@ -176,10 +176,7 @@ impl Engine {
                     if *kind != login.kind {
                         return Err(refused(
                             n,
-                            format!(
-                                "its kind {kind} does not match its credential's, {}",
-                                login.kind
-                            ),
+                            format!("its kind does not match its credential's, {}", login.kind),
                         ));
                     }
                 }
@@ -318,7 +315,7 @@ impl Engine {
         let alias = match &v.alias {
             Some(a) if store.find_by_alias(a)?.is_some() => {
                 warnings.push(format!(
-                    "the alias of the file's account at position {wanted} is another account's here, so it was not imported"
+                    "the alias of the file's account at position {wanted} is another account's here, so the account was imported without it"
                 ));
                 None
             }
