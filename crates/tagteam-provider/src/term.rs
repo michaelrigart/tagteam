@@ -148,7 +148,14 @@ pub fn spawn_foreground(cmd: &mut Command) -> io::Result<Child> {
             Ok(())
         });
     }
-    cmd.spawn()
+    let spawned = cmd.spawn();
+    if spawned.is_err() && take_terminal {
+        // The child took the terminal before its exec failed (a missing program or
+        // interpreter): it is gone, so the terminal goes back to this process's group, or the
+        // next read of it from the background would stop the harness with SIGTTIN.
+        set_foreground_group(own_process_group());
+    }
+    spawned
 }
 
 /// Whether process `pid`, a child of this process, is stopped (SIGSTOP, SIGTSTP, SIGTTIN or
@@ -209,5 +216,20 @@ mod tests {
             u32::try_from(own_process_group()).ok()
         );
         assert_eq!(process_group_of(u32::MAX), None);
+    }
+}
+
+#[cfg(test)]
+mod spawn_tests {
+    use super::*;
+
+    #[test]
+    fn a_program_that_cannot_start_is_an_error_and_changes_nothing_without_a_terminal() {
+        // The tests' stdin is no terminal, so no terminal was taken and none is given back; the
+        // path with one is exercised only by a live run.
+        let before = stdin_foreground_group();
+        let err = spawn_foreground(&mut Command::new("/nonexistent/program")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(stdin_foreground_group(), before);
     }
 }

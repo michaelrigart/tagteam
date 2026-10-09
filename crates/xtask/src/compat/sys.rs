@@ -446,7 +446,7 @@ fn wait_interactive_as(
     // token records it, as the harness's own handler would, before any cleanup, so every caller
     // sees `requested()` whatever the cleanup then does.
     if let Ok(Some(status)) = &outcome {
-        if let Some(n) = status.signal().filter(|n| CAUGHT.contains(n)) {
+        if let Some(n) = terminating_signal(*status) {
             token.request(n);
         }
     }
@@ -462,12 +462,22 @@ fn wait_interactive_as(
     match (outcome, swept) {
         (_, Err(e)) => Err(e),
         (Err(e), Ok(())) => Err(e),
-        (Ok(Some(status)), Ok(())) => match status.signal() {
-            Some(n) if CAUGHT.contains(&n) => Err(interrupted(n)),
-            _ => Ok(status),
+        (Ok(Some(status)), Ok(())) => match terminating_signal(status) {
+            Some(n) => Err(interrupted(n)),
+            None => Ok(status),
         },
         (Ok(None), Ok(())) => Err(harness("the wait ended without a status")),
     }
+}
+
+/// The signal of `CAUGHT` that ended an interactive child: by death, or by the conventional exit
+/// code 128+n of a program that caught it and ended (`tagteam` exits 130 on Ctrl-C at a prompt).
+/// Any other end, exit code 2 included, is an ordinary one.
+fn terminating_signal(status: ExitStatus) -> Option<i32> {
+    status
+        .signal()
+        .or_else(|| status.code().and_then(|c| c.checked_sub(128)))
+        .filter(|n| CAUGHT.contains(n))
 }
 
 /// Ends the process group `pgid` led by `child`: SIGTERM, up to `GRACE`, SIGKILL, up to `GRACE`
@@ -1202,6 +1212,30 @@ mod tests {
         assert_eq!(err, interrupted(SIGINT));
         // The run's token records it, as the harness's own handler would, so the callers stop.
         assert_eq!(token.requested(), Some(SIGINT));
+    }
+
+    #[test]
+    fn an_exit_of_128_plus_a_caught_signal_is_that_signal_and_any_other_exit_is_not() {
+        // `tagteam` catches Ctrl-C at its prompt and exits 130.
+        let _serial = serial();
+        for (code, signal) in [(130, SIGINT), (143, SIGTERM), (129, SIGHUP)] {
+            let mut child =
+                spawn_interactive(Command::new("/bin/sh").args(["-c", &format!("exit {code}")]))
+                    .unwrap();
+            let token = Cancel::new();
+            let err = wait_interactive(&mut child, &token).unwrap_err();
+            assert_eq!(err, interrupted(signal), "exit {code}");
+            assert_eq!(token.requested(), Some(signal), "exit {code}");
+        }
+        for code in [2, 1, 131] {
+            let mut child =
+                spawn_interactive(Command::new("/bin/sh").args(["-c", &format!("exit {code}")]))
+                    .unwrap();
+            let token = Cancel::new();
+            let status = wait_interactive(&mut child, &token).unwrap();
+            assert_eq!(status.code(), Some(code));
+            assert_eq!(token.requested(), None);
+        }
     }
 
     #[test]
