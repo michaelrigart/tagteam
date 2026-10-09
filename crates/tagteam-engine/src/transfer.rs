@@ -14,7 +14,7 @@ use age::armor::{ArmoredReader, ArmoredWriter, Format};
 pub use age::secrecy::SecretString;
 use serde_json::{Map, Value, json};
 use tagteam_core::time::{format_iso8601, parse_iso8601};
-use tagteam_core::{CLAUDE_CODE, ProviderId};
+use tagteam_core::{CLAUDE_CODE, Fingerprint, ProviderId};
 
 /// The envelope's `format` and `version` (§13.3).
 pub const FORMAT: &str = "tagteam-export";
@@ -749,6 +749,67 @@ fn decrypt(
     Err(TransferError::Decrypt(NO_MATCHING_KEY.into()))
 }
 
+/// A generation as §7.5 step 3's table compares it (§13.3): its lineage fingerprint (§2), and
+/// whether it is a full token pair, one that carries a refresh token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generation {
+    pub fp: Fingerprint,
+    pub full: bool,
+}
+
+/// A pending rescue (§6.3): the generation it holds, and the one it succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRescue {
+    pub fp: Option<Fingerprint>,
+    pub predecessor: String,
+}
+
+/// The generation an export takes from the live login, the vault and its rescues (§13.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    Live,
+    Vault,
+    /// The rescue at this index of the slice `newest_live` was given.
+    Rescue(usize),
+    /// Neither is safe to export; the account is broken, for this reason.
+    Broken(&'static str),
+}
+
+/// §13.3's broken account whose live copy is the one to export but lacks a refresh token.
+pub const LIVE_LACKS_REFRESH: &str =
+    "its live credential has no refresh token, so the newest generation cannot be told";
+
+/// The pending rescue that succeeds the vault's generation `vault`, if any: it consumed that
+/// generation (§6.2), so it is the newer one.
+pub fn successor(vault: &Fingerprint, rescues: &[PendingRescue]) -> Option<usize> {
+    rescues.iter().position(|r| r.predecessor == vault.as_str())
+}
+
+/// §13.3's choice for the live login: the generation §7.5 step 3 would settle on among the
+/// live credential, the vault, its `.prev` and the pending rescues, decided without writing
+/// anything. The live credential at the vault's generation or its `.prev` is the vault's, or
+/// the rescue that succeeds it; at a rescue's generation, that rescue's; any other full token
+/// pair is Claude Code's rotation, the newest. Expiry never decides (B.48). `active.rs`'s own
+/// reconciliation writes as it decides, so it cannot serve here.
+pub fn newest_live(
+    live: &Generation,
+    vault: &Fingerprint,
+    prev: Option<&Fingerprint>,
+    rescues: &[PendingRescue],
+) -> Pick {
+    if &live.fp == vault || prev == Some(&live.fp) {
+        return successor(vault, rescues).map_or(Pick::Vault, Pick::Rescue);
+    }
+    if let Some(i) = rescues.iter().position(|r| r.fp.as_ref() == Some(&live.fp)) {
+        return Pick::Rescue(i);
+    }
+    if live.full {
+        Pick::Live
+    } else {
+        Pick::Broken(LIVE_LACKS_REFRESH)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,5 +863,62 @@ mod tests {
             Encryption::Passphrase(SecretString::from("pw-SENTINEL"))
         );
         assert!(!p.contains("SENTINEL"), "{p}");
+    }
+    fn generation(name: &str, full: bool) -> Generation {
+        Generation {
+            fp: Fingerprint::of_secret(name.as_bytes()),
+            full,
+        }
+    }
+
+    fn fp(name: &str) -> Fingerprint {
+        Fingerprint::of_secret(name.as_bytes())
+    }
+
+    fn rescue(holds: &str, succeeds: &str) -> PendingRescue {
+        PendingRescue {
+            fp: Some(fp(holds)),
+            predecessor: fp(succeeds).as_str().to_owned(),
+        }
+    }
+
+    #[test]
+    fn newest_live_follows_section_7_5_step_3_s_table() {
+        let v = fp("v");
+        let prev = fp("prev");
+        let pending = [rescue("other", "older"), rescue("r", "v")];
+        // (live, .prev, rescues) and the pick.
+        let rows = [
+            (generation("v", true), None, &[][..], Pick::Vault),
+            (generation("v", true), None, &pending[..], Pick::Rescue(1)),
+            (generation("prev", true), Some(&prev), &[][..], Pick::Vault),
+            (
+                generation("prev", true),
+                Some(&prev),
+                &pending[..],
+                Pick::Rescue(1),
+            ),
+            (
+                generation("r", true),
+                None,
+                &[rescue("r", "elsewhere")][..],
+                Pick::Rescue(0),
+            ),
+            (
+                generation("cc", true),
+                Some(&prev),
+                &pending[..],
+                Pick::Live,
+            ),
+            (
+                generation("cc", false),
+                None,
+                &[][..],
+                Pick::Broken(LIVE_LACKS_REFRESH),
+            ),
+        ];
+        for (live, prev, rescues, want) in rows {
+            assert_eq!(newest_live(&live, &v, prev, rescues), want, "{live:?}");
+        }
     }
 }
