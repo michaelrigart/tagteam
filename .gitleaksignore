@@ -2,3 +2,7 @@
 aaa27e843a1d3f4016e1cc33615117110a6c53e8:docs/superpowers/plans/2026-10-02-tagteam-m5b-doctor-purge-export.md:private-key:7634
 aaa27e843a1d3f4016e1cc33615117110a6c53e8:docs/superpowers/plans/2026-10-02-tagteam-m5b-doctor-purge-export.md:private-key:7641
 aaa27e843a1d3f4016e1cc33615117110a6c53e8:docs/superpowers/plans/2026-10-02-tagteam-m5b-doctor-purge-export.md:private-key:20136
+# The same published test key in M5b's export tests, and the armor header the tests' key helper formats.
+5916375bdc9f36b47b98138e4584282b0173a185:crates/tagteam-engine/tests/transfer.rs:private-key:23
+5916375bdc9f36b47b98138e4584282b0173a185:crates/tagteam-engine/tests/transfer.rs:private-key:30
+9e550fc7746a0e51b3c81ad9ef68a71db0b0afcb:crates/tagteam-engine/tests/transfer.rs:private-key:607
