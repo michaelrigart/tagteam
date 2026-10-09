@@ -611,7 +611,8 @@ fn written_at(ctx: &Ctx, spelling: &str) -> Option<i64> {
     }
 }
 
-/// §9.1: the storage-write lock is the directory `<secure-storage dir>/.storage-write`. While
+/// §9.1: the storage-write lock is the pair of directories `<secure-storage dir>/.storage-write`
+/// and `.storage-write.lock` (the one CC 2.1.292 takes). While
 /// tagteam holds it, CC's refresh does not write; once released, it does. While CC holds it
 /// for its own write, tagteam's attempt finds it taken.
 pub fn storage_write_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
@@ -657,16 +658,21 @@ pub fn storage_write_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 
     // tagteam waits for CC's: whenever CC's lock is there, tagteam's attempt fails.
     p.note("expired again", ctx.expire(&spelling)?);
+    // CC 2.1.292 names its lock `.storage-write.lock`; the older spelling is watched too, as
+    // information.
     let spec = MkdirLockSpec::new(
-        paths.storage_write_lock.clone(),
+        paths.storage_write_lock_v2.clone(),
         STORAGE_WRITE_STALE,
         Duration::ZERO,
     );
     let mut running = ctx.run_as(ALIAS_OAUTH, &REQUEST).spawn(&ctx.roots)?;
-    let (mut seen, mut refused) = (0u32, 0u32);
+    let (mut seen, mut refused, mut seen_old) = (0u32, 0u32, 0u32);
     let deadline = Instant::now() + Duration::from_secs(180);
     while !running.finished() && Instant::now() < deadline && cancel().requested().is_none() {
         if paths.storage_write_lock.is_dir() {
+            seen_old += 1;
+        }
+        if paths.storage_write_lock_v2.is_dir() {
             seen += 1;
             match MkdirLock::try_acquire(&spec) {
                 Ok(None) => refused += 1,
@@ -681,6 +687,10 @@ pub fn storage_write_lock(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
         "CC's lock is the directory tagteam names, and it refused tagteam",
         refused > 0,
         json!({"seen": seen, "refused": refused}),
+    );
+    p.note(
+        "CC's lock under the older spelling `.storage-write` (2.1.286)",
+        json!({"seen": seen_old}),
     );
     p.expect("claude -p succeeded", ran.success(), ran.summary());
     Ok(p.finish("CC and tagteam each waited for the other's storage-write lock"))
