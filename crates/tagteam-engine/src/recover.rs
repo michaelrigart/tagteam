@@ -1,8 +1,8 @@
 use serde_json::Value;
 use tagteam_core::{OracleVerdict, OutgoingAction, OutgoingFacts, decide_outgoing};
 use tagteam_provider::{
-    Credential, LiveAuth, LiveChange, LiveLocks, LockError, MutationGuard, Provider, ProviderError,
-    Read,
+    Credential, Identity, LiveAuth, LiveChange, LiveLocks, LockError, MutationGuard, Provider,
+    ProviderError, Read,
 };
 
 use crate::account_lock::AccountLock;
@@ -160,13 +160,25 @@ impl Engine {
             direction = direction.name(),
             "recovering an interrupted switch"
         );
-        match direction {
+        let activated = match direction {
             Direction::Forward(fp) => {
-                self.finish_forward(p, &store, row, &accounts, &locks, &live, hints, &fp, source)
+                self.finish_forward(p, &store, row, &accounts, &locks, &live, hints, &fp, source)?
             }
-            Direction::Backward(fp) => self.finish_backward(p, &store, row, &locks, &live, &fp),
-            Direction::Undecidable => Ok(()),
+            Direction::Backward(fp) => {
+                self.finish_backward(p, &store, row, &locks, &live, &fp)?;
+                None
+            }
+            Direction::Undecidable => None,
+        };
+        // §9.1 (amended): a recovery that activated the target is verified like a switch is,
+        // once CC's locks are released. A warning has no command to ride on here, so it is
+        // logged (by `reverify_identity`) and not shown.
+        drop(locks);
+        drop(accounts);
+        if let Some(identity) = activated {
+            let _ = self.reverify_identity(p, guard, &row.provider, &identity);
         }
+        Ok(())
     }
 
     /// §9.6's table, in order: the target's generation, then the outgoing one; anything else,
@@ -236,7 +248,7 @@ impl Engine {
         hints: &[OracleHint],
         established: &str,
         source: &'static str,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Option<Identity>, EngineError> {
         let to = store
             .account(&row.to_id)?
             .ok_or_else(|| EngineError::NoSuchAccount(row.to_id.to_string()))?;
@@ -247,7 +259,7 @@ impl Engine {
             .live_secret(live)
             .filter(|_| holds(p, live, own, established))
         else {
-            return Ok(());
+            return Ok(None);
         };
         let identity = p.parse_identity(&to.identity_json)?;
         let mut warnings = Vec::new();
@@ -311,7 +323,7 @@ impl Engine {
         p.write_identity(&self.env, locks, Some(&identity))?;
         hooks::point(self, "recovery-before-commit")?;
         if !self.surfaces_agree(p, locks, own, established, Some(&to.identity_json)) {
-            return Ok(());
+            return Ok(None);
         }
         // §9.6: the epoch the row journaled, so a replacement that landed on the target since
         // leaves the live store stale-marked. A row written before the column falls back to the
@@ -335,7 +347,7 @@ impl Engine {
             // view of usage, which cannot be rebuilt now.
             None,
         )?;
-        Ok(())
+        Ok(Some(identity))
     }
 
     /// §9.6 (amended): an entry a forward finish is about to clear, holding a generation that

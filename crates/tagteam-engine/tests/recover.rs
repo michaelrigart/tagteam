@@ -247,6 +247,56 @@ fn a_recovery_waits_out_cc_s_config_lock_before_taking_any_lock() {
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
+fn a_recovery_that_activated_splices_an_overwritten_identity_again() {
+    // §9.1 (amended): the re-verification covers a forward recovery too.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = reads.clone();
+    let config = fx.paths().global_config;
+    fx.engine.on_point(
+        "identity-reverify",
+        Box::new(move || {
+            if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                common::splice_oauth_account(&config, &Fx::oauth_account("b@x.co"));
+            }
+        }),
+    );
+
+    any_mutation(&fx, &a);
+
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert_journal_cleared(&fx);
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_backward_recovery_does_not_verify_an_identity_it_did_not_activate() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live: b
+    crashed_switch(&fx, &b, &a); // the credential never landed
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = reads.clone();
+    fx.engine.on_point(
+        "identity-reverify",
+        Box::new(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }),
+    );
+
+    any_mutation(&fx, &a);
+
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(fx.live_email().as_deref(), Some("b@x.co"));
+}
+
+#[test]
 fn a_stale_file_behind_an_unreadable_keychain_is_undecidable() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");

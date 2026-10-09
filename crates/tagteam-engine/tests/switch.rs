@@ -2,6 +2,8 @@ mod common;
 
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(feature = "test-hooks")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -936,6 +938,112 @@ fn a_config_lock_that_outlasts_the_pre_wait_refuses_with_a_lock_timeout_and_chan
     );
     assert!(credential_locks_and_guard_free(&fx));
     assert!(fx.paths().config_lock.is_dir(), "CC's lock is left alone");
+}
+
+/// Plants a hook that has CC's start-up overwrite `oauthAccount` with `email`'s at each of the
+/// first `times` reads of §9.1's re-verification, and counts the reads.
+#[cfg(feature = "test-hooks")]
+fn overwrite_identity_at_reverify(fx: &Fx, email: &'static str, times: usize) -> Arc<AtomicUsize> {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let seen = reads.clone();
+    let config = fx.paths().global_config;
+    fx.engine.on_point(
+        "identity-reverify",
+        Box::new(move || {
+            if seen.fetch_add(1, Ordering::SeqCst) < times {
+                common::splice_oauth_account(&config, &Fx::oauth_account(email));
+            }
+        }),
+    );
+    reads
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn an_untouched_identity_is_read_once_after_the_commit_and_nothing_more_is_done() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let reads = overwrite_identity_at_reverify(&fx, "x@x.co", 0);
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn an_identity_overwritten_after_the_commit_is_spliced_again_without_a_warning() {
+    // §9.1 (amended): CC's start-up wrote the global config without its lock.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let reads = overwrite_identity_at_reverify(&fx, "b@x.co", 1);
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert_eq!(reads.load(Ordering::SeqCst), 2, "read, spliced, read again");
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    assert!(out.switched);
+    assert!(
+        !fx.paths().config_lock.exists(),
+        "the splice's lock is released"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn an_identity_overwritten_again_warns_and_names_switching_again() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    overwrite_identity_at_reverify(&fx, "b@x.co", 2);
+
+    let (out, logs) = capture_logs(|| switch(&fx, to(&a), false).unwrap());
+
+    assert!(out.switched, "the switch committed");
+    assert_eq!(
+        out.warnings,
+        [
+            "a starting Claude Code may have overwritten the account's identity in its config; run `tagteam switch` again to restore it"
+        ]
+    );
+    assert_eq!(
+        fx.engine.store().unwrap().active(&fx.provider()).unwrap(),
+        Some(a)
+    );
+    let warned: Vec<_> = logs
+        .iter()
+        .filter(|l| l.contains("may have overwritten the switched account's identity"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{logs:?}");
+    assert!(
+        logs.iter().all(|l| !l.contains("@x.co")),
+        "no email in the log: {logs:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn an_identity_that_cannot_be_spliced_again_warns_too() {
+    // The splice itself fails: the config is torn when it is tried.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let config = fx.paths().global_config;
+    fx.engine.on_point(
+        "identity-reverify",
+        Box::new(move || fs::write(&config, b"{ not json").unwrap()),
+    );
+
+    let out = switch(&fx, to(&a), false).unwrap();
+
+    assert!(out.switched);
+    assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+    assert!(out.warnings[0].contains("tagteam switch"));
 }
 
 /// When `id`'s next poll is planned, in seconds from now.

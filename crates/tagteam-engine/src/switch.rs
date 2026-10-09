@@ -11,8 +11,8 @@ use tagteam_core::{
 };
 use tagteam_provider::{
     BeforeFallback, Credential, DoomedEntry, Identity, LiveAuth, LiveChange, LiveLocks,
-    ProcessStamp, Provenance, Provider, ProviderError, Read, ReadError, SecretStore, StoredLogin,
-    Undo,
+    MutationGuard, ProcessStamp, Provenance, Provider, ProviderError, Read, ReadError, SecretStore,
+    StoredLogin, Undo,
 };
 
 use crate::account_lock::AccountLock;
@@ -1696,10 +1696,22 @@ impl Engine {
             let locks = p.lock_live(&self.env, &guard)?;
             match self.rederive(p, store, req, &plan, outgoing.as_ref())? {
                 Rederived::Go(locked) => {
-                    let outcome = self.transact(p, store, &plan, locked, &accounts, &locks, req)?;
-                    // The re-plan needs no lock and never fetches (§8.3).
+                    let mut outcome =
+                        self.transact(p, store, &plan, locked, &accounts, &locks, req)?;
                     drop(locks);
                     drop(accounts);
+                    // §9.1 (amended): with CC's locks released, `oauthAccount` is read again.
+                    if let Some(to) = &outcome.to {
+                        if let Ok(identity) = p.parse_identity(&to.identity_json) {
+                            outcome.warnings.extend(self.reverify_identity(
+                                p,
+                                &guard,
+                                &req.provider,
+                                &identity,
+                            ));
+                        }
+                    }
+                    // The re-plan needs no lock and never fetches (§8.3).
                     self.replan_polls(p, store, &outcome);
                     return Ok(outcome);
                 }
@@ -1712,6 +1724,50 @@ impl Engine {
             // `locks`, then `accounts`, are released here; the mutation lock is kept.
         }
         Err(EngineError::LiveMoved)
+    }
+
+    /// §9.1 (amended): CC's start-up may write the global config without its lock for its first
+    /// 30 s (Appendix A.7), so after a switch (or a recovery that activated) commits and CC's
+    /// locks are released, the live identity is read again. If it is not the identity the
+    /// switch wrote (by identity key, so a fuller `oauthAccount` of the same account stands), it
+    /// is spliced once more under the config lock alone, with its own budget, and read a last
+    /// time. A warning comes back only when the second read still differs or the splice failed:
+    /// a starting Claude Code may have overwritten it, and switching again restores it. The
+    /// switch has committed, so this is contained (§14): it never fails it. The log carries a
+    /// fixed phrase, never an email or a label (§14.2).
+    pub(crate) fn reverify_identity(
+        &self,
+        p: &dyn Provider,
+        guard: &MutationGuard,
+        provider: &ProviderId,
+        written: &Identity,
+    ) -> Option<String> {
+        let key = p.identity_key(written);
+        let intact = || match p.live_identity(&self.env) {
+            Read::Present(live) => p.identity_key(&live) == key,
+            Read::Absent | Read::Unreadable(_) => false,
+        };
+        let _ = hooks::point(self, "identity-reverify");
+        if intact() {
+            return None;
+        }
+        let spliced = p.resplice_identity(&self.env, guard, written);
+        let _ = hooks::point(self, "identity-reverify");
+        if spliced.is_ok() && intact() {
+            tracing::info!(
+                provider = self.registered_id(provider),
+                "a starting Claude Code had overwritten the switched account's identity, which was spliced again"
+            );
+            return None;
+        }
+        tracing::warn!(
+            provider = self.registered_id(provider),
+            "a starting Claude Code may have overwritten the switched account's identity"
+        );
+        Some(format!(
+            "a starting {} may have overwritten the account's identity in its config; run `tagteam switch` again to restore it",
+            p.display_name()
+        ))
     }
 
     /// §8.3: after a switch that activated an account, both accounts' polls are re-planned
