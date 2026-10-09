@@ -16,13 +16,14 @@ use tagteam_provider::atomic::write_atomic_private;
 use tagteam_provider::keychain::Keychain as _;
 use tagteam_provider::profile::{ProfileMarker, Seed};
 use tagteam_provider::splice::{get_top_level, replace_top_level};
-use tagteam_provider::{Cancel, Read, RecordEntry, read_session_records};
+use tagteam_provider::{Cancel, Read, SystemProcessProbe};
 
+use super::daemon;
 use super::guard::{CONFIG_DIR, Roots, cc_env};
 use super::keychain::{CcItem, Unlocked, VaultKeychain, random_hex};
 use super::layout::{Layout, private_dir};
 use super::report::Redactor;
-use super::sys::{Cmd, HarnessError, Pty, Ran, harness, process_alive, settle};
+use super::sys::{Cmd, HarnessError, Pty, Ran, harness, settle};
 
 /// The test account's alias in the compat store, set by `compat login`.
 pub const ALIAS_OAUTH: &str = "compat-oauth";
@@ -37,6 +38,8 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 pub const LAUNCH_TIMEOUT: Duration = Duration::from_secs(90);
 /// The session-record kinds of `claude --bg`'s supervisor and its workers (Appendix A.7).
 pub const DAEMON_KINDS: [&str; 3] = ["daemon", "bg", "daemon-worker"];
+/// How long a stopped daemon has to be gone.
+const DAEMON_PATIENCE: Duration = Duration::from_secs(30);
 /// An expired access token's `expiresAt`: a minute ago.
 const EXPIRED_BY_MS: i64 = 60_000;
 
@@ -255,14 +258,68 @@ impl Ctx {
         self.profile_ready()
     }
 
-    /// Stops a background daemon that `claude` runs in the home `spelling`, if it has one.
-    pub fn stop_daemon(&self, spelling: &str) -> Result<(), HarnessError> {
-        if Path::new(spelling).join("daemon").exists() {
-            self.claude(spelling, &["daemon", "stop"])
-                .timeout(Duration::from_secs(60))
-                .run(&self.roots)?;
+    /// Stops the background daemon that `claude` runs in the home `spelling`, if one runs, and
+    /// verifies that it is gone. Fail closed: a `claude daemon stop --any` that exits non-zero
+    /// is an error carrying its redacted output, and so is anything of the daemon still
+    /// running, or a lock, roster or record that cannot be read, once the deadline passes
+    /// (`daemon::survey`). A transient daemon, which `claude --bg` starts, is stopped only with
+    /// `--any` (Appendix A.7); a `claude` that does not know the option gets plain `daemon
+    /// stop`. Returns the stop command's summary, or `None` when nothing needed stopping.
+    pub fn stop_daemon(&self, spelling: &str) -> Result<Option<Value>, HarnessError> {
+        self.stop_and_verify(spelling, &self.cancel, DAEMON_PATIENCE)
+    }
+
+    fn stop_and_verify(
+        &self,
+        spelling: &str,
+        token: &Cancel,
+        patience: Duration,
+    ) -> Result<Option<Value>, HarnessError> {
+        let home = Path::new(spelling);
+        let probe = SystemProcessProbe;
+        if daemon::survey(home, &probe).is_clear() {
+            return Ok(None);
         }
-        Ok(())
+        let stop = self.daemon_stop(spelling, token);
+        let mut left = daemon::survey(home, &probe);
+        settle(patience, || {
+            left = daemon::survey(home, &probe);
+            left.is_clear()
+        });
+        let ran = match &stop {
+            Ok(ran) => Some(ran.summary()),
+            Err(_) => None,
+        };
+        let refused = match &stop {
+            Ok(ran) if ran.success() => None,
+            Ok(ran) => Some(format!("`claude daemon stop` failed: {}", ran.summary())),
+            Err(e) => Some(format!("`claude daemon stop`: {e}")),
+        };
+        match (refused, left.is_clear()) {
+            (None, true) => Ok(ran),
+            (None, false) => Err(harness(format!(
+                "{spelling}: after `claude daemon stop`, {}",
+                left.describe()
+            ))),
+            (Some(why), true) => Err(harness(format!("{spelling}: {why}"))),
+            (Some(why), false) => Err(harness(format!("{spelling}: {why}; {}", left.describe()))),
+        }
+    }
+
+    /// `claude daemon stop --any` in the home, through the guard, or plain `daemon stop` when
+    /// this `claude` rejects the option.
+    fn daemon_stop(&self, spelling: &str, token: &Cancel) -> Result<Ran, HarnessError> {
+        let stop = |args: &[&str]| {
+            self.claude(spelling, args)
+                .cancel(token)
+                .timeout(Duration::from_secs(60))
+                .run(&self.roots)
+        };
+        let ran = stop(&["daemon", "stop", "--any"])?;
+        if !ran.success() && daemon::rejects_any(&ran.stderr_text(), &ran.stdout_text()) {
+            return stop(&["daemon", "stop"]);
+        }
+        Ok(ran)
     }
 
     /// Registers the home `spelling` before a check starts a daemon in it (`claude --bg`, or
@@ -274,38 +331,20 @@ impl Ctx {
         }
     }
 
-    /// Cleanup, whether or not a signal ended the run: `claude daemon stop` in every home a
-    /// check registered (`must_stop`). Its spawn takes a token no signal sets, so it is bounded
-    /// by its timeout but never cancelled. Each home is then verified as `session-records`
-    /// reads it: no daemon session record (`DAEMON_KINDS`) may name a process still running,
-    /// within 30 s. A home where one does, or whose records cannot be read, is a harness error
-    /// naming it.
+    /// Cleanup, whether or not a signal ended the run: `claude daemon stop --any` in every home
+    /// a check registered (`must_stop`), each verified as `stop_daemon` does, within 30 s. Its
+    /// spawn takes a token no signal sets, so it is bounded by its timeout but never
+    /// cancelled. A home where a daemon is not stopped, or cannot be verified, is a harness
+    /// error naming it.
     pub fn stop_daemons(&self) -> Result<(), HarnessError> {
-        self.stop_daemons_within(Duration::from_secs(30))
+        self.stop_daemons_within(DAEMON_PATIENCE)
     }
 
     fn stop_daemons_within(&self, patience: Duration) -> Result<(), HarnessError> {
         let mut left = Vec::new();
         for spelling in &self.daemons {
-            let stop = self
-                .claude(spelling, &["daemon", "stop"])
-                .cancel(&Cancel::new())
-                .timeout(Duration::from_secs(60))
-                .run(&self.roots);
-            let mut running = Ok(Vec::new());
-            settle(patience, || {
-                running = daemons_running(spelling);
-                matches!(&running, Ok(pids) if pids.is_empty())
-            });
-            let after = match &stop {
-                Ok(ran) if ran.success() => String::new(),
-                Ok(ran) => format!(" after `claude daemon stop` {}", ran.summary()),
-                Err(e) => format!(" (`claude daemon stop`: {e})"),
-            };
-            match running {
-                Ok(pids) if pids.is_empty() => {}
-                Ok(pids) => left.push(format!("{spelling}: pids {pids:?} still run{after}")),
-                Err(e) => left.push(format!("{spelling}: cannot be verified ({e}){after}")),
+            if let Err(e) = self.stop_and_verify(spelling, &Cancel::new(), patience) {
+                left.push(e.0);
             }
         }
         if left.is_empty() {
@@ -529,31 +568,6 @@ impl Ctx {
             )))
         }
     }
-}
-
-/// The daemons the home `spelling`'s session records name that still run: `Err` when its
-/// records cannot be read.
-fn daemons_running(spelling: &str) -> Result<Vec<u32>, String> {
-    let entries = match read_session_records(&Path::new(spelling).join("sessions")) {
-        Read::Present(entries) => entries,
-        Read::Absent => return Ok(Vec::new()),
-        Read::Unreadable(e) => return Err(e.to_string()),
-    };
-    let mut pids = Vec::new();
-    for entry in entries {
-        match entry {
-            RecordEntry::Record(r) => {
-                let daemon = r.kind.as_deref().is_some_and(|k| DAEMON_KINDS.contains(&k));
-                if daemon && process_alive(r.pid) {
-                    pids.push(r.pid);
-                }
-            }
-            RecordEntry::Unreadable { path, detail } => {
-                return Err(format!("{}: {detail}", path.display()));
-            }
-        }
-    }
-    Ok(pids)
 }
 
 /// A key shaped like an Anthropic API key, never a real one.
@@ -799,6 +813,145 @@ esac
             "cleanup ran daemon stop"
         );
         assert!(ended, "and the daemon is gone");
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    /// A `sleep` outside the test's own children (so killing it leaves no zombie), and its pid.
+    fn orphan_sleep() -> u32 {
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 60 >/dev/null 2>&1 & echo $!"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+
+    /// A fake `claude` whose `daemon stop` runs `body`, with `args` logging its arguments.
+    fn fake_claude(scratch: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let fake = scratch.join("claude");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nhome=\"$CLAUDE_CONFIG_DIR\"\necho \"$*\" >> \"$home/args\"\n{body}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    fn daemon_ctx(scratch: &Path, claude: PathBuf) -> Ctx {
+        let mut ctx = offline_ctx(
+            scratch,
+            PathBuf::from("/nonexistent/tagteam"),
+            Redactor::default(),
+        );
+        ctx.claude = claude;
+        ctx.base.push(("PATH".into(), "/bin:/usr/bin".into()));
+        ctx
+    }
+
+    fn lock_naming(home: &str, pid: u32) {
+        fs::write(
+            Path::new(home).join("daemon.lock"),
+            json!({"pid": pid, "origin": "transient"}).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_daemon_stop_that_exits_non_zero_is_a_harness_error_carrying_its_output() {
+        let _serial = crate::compat::sys::serial();
+        let scratch = crate::compat::layout::make_scratch().unwrap();
+        let claude = fake_claude(
+            &scratch,
+            r#"echo "refused: a transient daemon" >&2; echo '{"error":"stdout too"}'; exit 1"#,
+        );
+        let ctx = daemon_ctx(&scratch, claude);
+        let home = ctx.new_home("profile").unwrap();
+        let pid = orphan_sleep();
+        lock_naming(&home, pid);
+
+        let e = ctx
+            .stop_and_verify(&home, &Cancel::new(), Duration::from_secs(1))
+            .unwrap_err()
+            .0;
+        crate::compat::sys::signal(pid, "KILL", false);
+        assert!(
+            e.contains("`claude daemon stop` failed")
+                && e.contains("refused: a transient daemon")
+                && e.contains("stdout too")
+                && e.contains(&format!("the supervisor in daemon.lock (pid {pid})")),
+            "{e}"
+        );
+        let args = fs::read_to_string(Path::new(&home).join("args")).unwrap();
+        assert_eq!(
+            args.trim(),
+            "daemon stop --any",
+            "the guard-checked spelling, with --any"
+        );
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_stop_that_succeeds_but_leaves_the_supervisor_running_is_an_error_and_a_clean_home_is_left_alone()
+     {
+        let _serial = crate::compat::sys::serial();
+        let scratch = crate::compat::layout::make_scratch().unwrap();
+        let ctx = daemon_ctx(&scratch, fake_claude(&scratch, "exit 0"));
+        let home = ctx.new_home("profile").unwrap();
+        // Nothing to stop: claude is not even started.
+        assert_eq!(ctx.stop_daemon(&home), Ok(None));
+        assert!(!Path::new(&home).join("args").exists());
+
+        let pid = orphan_sleep();
+        lock_naming(&home, pid);
+        let e = ctx
+            .stop_and_verify(&home, &Cancel::new(), Duration::from_secs(1))
+            .unwrap_err()
+            .0;
+        crate::compat::sys::signal(pid, "KILL", false);
+        assert!(
+            e.contains("after `claude daemon stop`") && e.contains("still running"),
+            "{e}"
+        );
+
+        // An unreadable lock cannot be verified: the same.
+        fs::write(Path::new(&home).join("daemon.lock"), "garbage").unwrap();
+        let e = ctx
+            .stop_and_verify(&home, &Cancel::new(), Duration::from_secs(1))
+            .unwrap_err()
+            .0;
+        assert!(e.contains("cannot be read: daemon.lock"), "{e}");
+        fs::remove_dir_all(&scratch).unwrap();
+    }
+
+    #[test]
+    fn a_claude_that_does_not_know_any_gets_plain_daemon_stop() {
+        let _serial = crate::compat::sys::serial();
+        let scratch = crate::compat::layout::make_scratch().unwrap();
+        let claude = fake_claude(
+            &scratch,
+            r#"case "$*" in
+*--any*) echo "error: unknown option '--any'" >&2; exit 1 ;;
+esac
+kill "$(sed 's/.*"pid":\([0-9]*\).*/\1/' "$home/daemon.lock")"
+rm -f "$home/daemon.lock""#,
+        );
+        let ctx = daemon_ctx(&scratch, claude);
+        let home = ctx.new_home("profile").unwrap();
+        let pid = orphan_sleep();
+        lock_naming(&home, pid);
+
+        let summary = ctx.stop_daemon(&home).unwrap().expect("a stop ran");
+        crate::compat::sys::signal(pid, "KILL", false);
+        assert_eq!(summary["exit"], 0);
+        let args = fs::read_to_string(Path::new(&home).join("args")).unwrap();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["daemon stop --any", "daemon stop"]
+        );
+        assert!(!Path::new(&home).join("daemon.lock").exists());
         fs::remove_dir_all(&scratch).unwrap();
     }
 

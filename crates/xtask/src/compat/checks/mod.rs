@@ -104,7 +104,7 @@ pub const CHECKS: &[Check] = &[
     ),
     check(
         "session-records",
-        "session records: written at start, removed on SIGINT, SIGTERM and SIGHUP, an `lstart` procStart; a `claude --bg` daemon's record",
+        "session records: written at start, removed on SIGINT, SIGTERM and SIGHUP, an `lstart` procStart; a `claude --bg` daemon: its supervisor in `daemon.lock` and its workers' records",
         Phase::Profile,
         false,
         None,

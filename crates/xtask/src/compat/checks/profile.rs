@@ -11,10 +11,14 @@ use serde_json::{Value, json};
 use tagteam_cc::ItemKind;
 use tagteam_cc::locks::{STORAGE_WRITE_STALE, acquire_storage_write};
 use tagteam_provider::atomic::write_atomic_private;
-use tagteam_provider::{Cancel, MkdirLock, MkdirLockSpec, Read};
+use tagteam_provider::{
+    Cancel, MkdirLock, MkdirLockSpec, Read, SystemProcessProbe, read_supervisor_lock,
+    record_is_live,
+};
 
 use super::{changes, new_record, read_json, records, snapshot};
 use crate::compat::ctx::{ALIAS_OAUTH, ALIAS_SETUP_TOKEN, Ctx, MODEL, PROMPT, generation, now_ms};
+use crate::compat::daemon;
 use crate::compat::report::{Outcome, Probe};
 use crate::compat::sys::{HarnessError, cancel, harness, pause, signal, wait_until};
 
@@ -450,7 +454,8 @@ pub fn shared_writes(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 
 /// Appendix A.7: a record when a session starts, removed by a graceful exit on SIGINT, SIGTERM
 /// and SIGHUP, its `procStart` what `ps -o lstart=` reports; `claude --bg` runs a supervisor
-/// that registers a `daemon` record in the profile.
+/// that is `daemon.lock` (a live pid) with its workers' records in the profile, all of it gone
+/// after `claude daemon stop --any`.
 pub fn session_records(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     let mut p = Probe::new();
     let (_, spelling) = ctx.profile_ready()?;
@@ -496,30 +501,55 @@ pub fn session_records(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     }
 
     // A background session's supervisor (`claude --bg`), in the profile. It leaves the groups
-    // the harness ends, so cleanup must stop it if this check cannot.
+    // the harness ends, so cleanup must stop it if this check cannot. In 2.1.292 the supervisor
+    // writes no session record: it is `daemon.lock` (a live pid), and its workers write
+    // records (Appendix A.7).
     ctx.must_stop(&spelling);
     let ran = ctx.run_profile(&["--bg", "--model", MODEL, PROMPT])?;
     p.note("claude --bg", ran.summary());
-    let mut kinds = Vec::new();
-    let daemon = wait_until(Duration::from_secs(60), || {
-        kinds = records(&sessions)
+    let home = Path::new(&spelling);
+    let (mut supervisor, mut workers, mut kinds) = (false, false, Vec::new());
+    wait_until(Duration::from_secs(60), || {
+        supervisor = matches!(
+            read_supervisor_lock(&home.join("daemon.lock")),
+            Read::Present(r) if record_is_live(&SystemProcessProbe, &r, "claude")
+        );
+        let live: Vec<_> = records(&sessions)
             .into_iter()
-            .filter_map(|(_, r)| r.kind)
+            .filter(|(_, r)| record_is_live(&SystemProcessProbe, r, "claude"))
             .collect();
-        kinds.iter().any(|k| k == "daemon")
-    });
-    p.expect("--bg: a daemon record in the profile", daemon, json!(kinds));
-    let stop = ctx
-        .claude(&spelling, &["daemon", "stop"])
-        .timeout(Duration::from_secs(60))
-        .run(&ctx.roots)?;
-    p.note("claude daemon stop", stop.summary());
-    let quiet = wait_until(Duration::from_secs(60), || {
-        records(&sessions)
+        kinds = live.iter().filter_map(|(_, r)| r.kind.clone()).collect();
+        workers = live
             .iter()
-            .all(|(_, r)| !matches!(r.kind.as_deref(), Some("daemon" | "bg" | "daemon-worker")))
+            .any(|(_, r)| matches!(r.kind.as_deref(), Some("bg" | "daemon-worker")));
+        supervisor && workers
     });
-    p.expect("--bg: its records go when it stops", quiet, json!(null));
+    p.expect(
+        "--bg: daemon.lock names a live supervisor",
+        supervisor,
+        json!(null),
+    );
+    p.expect("--bg: a worker's session record", workers, json!(kinds));
+    p.note("--bg: the kinds of the live records", json!(kinds));
+    p.note("--bg: daemon.lock's shape", daemon::lock_shape(home));
+    p.note(
+        "claude daemon stop --any",
+        json!(ctx.stop_daemon(&spelling)?),
+    );
+    let left = daemon::survey(home, &SystemProcessProbe);
+    p.expect(
+        "--bg: the lock, the roster and the records name nothing alive once it stops",
+        left.is_clear(),
+        json!(left.describe()),
+    );
+    p.expect(
+        "--bg: daemon.lock is gone or names a dead process",
+        !matches!(
+            read_supervisor_lock(&home.join("daemon.lock")),
+            Read::Present(r) if record_is_live(&SystemProcessProbe, &r, "claude")
+        ),
+        json!(null),
+    );
     Ok(p.finish("records come and go as Appendix A.7 says"))
 }
 

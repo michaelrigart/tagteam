@@ -241,6 +241,11 @@ impl Ran {
         String::from_utf8_lossy(&self.stdout).into_owned()
     }
 
+    /// Standard error as it may be shown: redacted.
+    pub fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).into_owned()
+    }
+
     /// Standard output as one JSON value, if it is one, parsed from the raw view: for control
     /// flow, deciding and comparing, never for evidence or an error, which take `stdout`.
     pub fn json(&self) -> Option<Value> {
