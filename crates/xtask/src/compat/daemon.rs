@@ -68,6 +68,10 @@ fn roster_pid_lives(probe: &dyn ProcessProbe, record: &SessionRecord) -> bool {
 /// ones proves nothing, and the live supervisor is `daemon.lock`'s (`read_lock`).
 fn roster_records(roster: &Value) -> (Vec<(String, SessionRecord)>, Vec<String>) {
     let (mut out, mut unreadable) = (Vec::new(), Vec::new());
+    if !roster.is_object() {
+        unreadable.push("daemon/roster.json (it is not a JSON object)".to_owned());
+        return (out, unreadable);
+    }
     match &roster["supervisorPid"] {
         Value::Null => {}
         v if v.as_u64().and_then(|p| u32::try_from(p).ok()).is_some() => {}
@@ -76,7 +80,12 @@ fn roster_records(roster: &Value) -> (Vec<(String, SessionRecord)>, Vec<String>)
     let entries: Vec<&Value> = match &roster["workers"] {
         Value::Object(o) => o.values().collect(),
         Value::Array(a) => a.iter().collect(),
-        _ => Vec::new(),
+        Value::Null => Vec::new(),
+        _ => {
+            unreadable
+                .push("daemon/roster.json (workers is neither an object nor an array)".to_owned());
+            Vec::new()
+        }
     };
     for entry in entries {
         match parse_session_record(entry.to_string().as_bytes()) {
@@ -86,29 +95,18 @@ fn roster_records(roster: &Value) -> (Vec<(String, SessionRecord)>, Vec<String>)
                 continue;
             }
         }
+        // The repl process is judged as a record is, by the same parse and pid range.
         match &entry["replPid"] {
             Value::Null => {}
-            v => match v.as_u64().and_then(|p| u32::try_from(p).ok()) {
-                Some(pid) => {
-                    let proc_start = match &entry["replProcStart"] {
-                        Value::String(s) => Some(s.clone()),
-                        Value::Number(n) => Some(n.to_string()),
-                        _ => None,
-                    };
-                    out.push((
-                        "a worker's repl in the roster".to_owned(),
-                        SessionRecord {
-                            pid,
-                            proc_start,
-                            started_at_ms: None,
-                            kind: None,
-                        },
-                    ));
+            pid => {
+                let repl = json!({"pid": pid, "procStart": entry["replProcStart"]});
+                match parse_session_record(repl.to_string().as_bytes()) {
+                    Ok(r) => out.push(("a worker's repl in the roster".to_owned(), r)),
+                    Err(detail) => unreadable.push(format!(
+                        "a worker in daemon/roster.json (replPid: {detail})"
+                    )),
                 }
-                None => {
-                    unreadable.push("a worker in daemon/roster.json (replPid is no pid)".to_owned())
-                }
-            },
+            }
         }
     }
     (out, unreadable)
@@ -489,10 +487,26 @@ mod tests {
             ),
             (
                 json!({"workers": {"a": {"pid": 221, "replPid": "x"}}}),
-                "replPid is no pid",
+                "replPid",
             ),
             (json!({"supervisorPid": "x"}), "supervisorPid is no pid"),
             (json!({"supervisorPid": -4}), "supervisorPid is no pid"),
+            (
+                json!({"workers": {"a": {"pid": 221, "replPid": 0}}}),
+                "replPid",
+            ),
+            (
+                json!({"workers": {"a": {"pid": 221, "replPid": 4_294_967_296_u64}}}),
+                "replPid",
+            ),
+            (
+                json!({"workers": {"a": {"pid": 221, "replPid": -3}}}),
+                "replPid",
+            ),
+            (json!([]), "not a JSON object"),
+            (json!("x"), "not a JSON object"),
+            (json!({"workers": 7}), "neither an object nor an array"),
+            (json!({"workers": "x"}), "neither an object nor an array"),
         ] {
             fs::write(h.join("daemon/roster.json"), roster.to_string()).unwrap();
             let s = survey(&h, &probe);
@@ -501,6 +515,19 @@ mod tests {
                 "{roster}: {s:?}"
             );
         }
+        // A missing or null replPid, and a null or missing workers, name nothing.
+        fs::write(
+            h.join("daemon/roster.json"),
+            json!({"workers": {"a": {"pid": 222, "replPid": null}, "b": {"pid": 223}}}).to_string(),
+        )
+        .unwrap();
+        assert!(survey(&h, &probe).is_clear());
+        fs::write(
+            h.join("daemon/roster.json"),
+            json!({"workers": null}).to_string(),
+        )
+        .unwrap();
+        assert!(survey(&h, &probe).is_clear());
         // null is no pid: a roster without a supervisor yet.
         fs::write(
             h.join("daemon/roster.json"),
