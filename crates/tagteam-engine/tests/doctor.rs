@@ -1550,6 +1550,51 @@ fn an_orphan_reports_the_whole_aggregate_as_an_account_does() {
 }
 
 #[test]
+fn a_stray_directory_with_a_copied_marker_is_judged_for_ownership_like_any_entry() {
+    // `sessions/` is walked once for ownership, whatever a marker says: a directory whose name
+    // is no account's, holding a copy of an existing account's marker, is refused by purge as
+    // an orphan, so doctor reports its daemon and its unreadable lock; and an account's own
+    // profile is reported once.
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let own = seeded_profile(&fx, &id);
+    live_supervisor(&fx, &own, 5200);
+    let copy = fx.env.data_dir().join("sessions").join("copied-profile");
+    fx.write_marker(&copy, &id, &fx.env);
+    live_supervisor(&fx, &copy, 5201);
+    let torn = fx.env.data_dir().join("sessions").join("copied-torn");
+    fx.write_marker(&torn, &id, &fx.env);
+    fs::write(torn.join("daemon.lock"), "{").unwrap();
+
+    let r = doctor(&fx);
+    let daemons = found(&r, "sessions.daemon");
+    let in_dir = |checks: &[&Check], dir: &Path| {
+        checks
+            .iter()
+            .filter(|c| c.message.contains(&dir.display().to_string()))
+            .count()
+    };
+    assert_eq!(daemons.len(), 2, "{daemons:#?}");
+    assert_eq!(in_dir(&daemons, &copy), 1, "{daemons:#?}");
+    assert!(
+        daemons
+            .iter()
+            .any(|c| c.message.contains("account 1's profile")),
+        "the account's own profile is reported once: {daemons:#?}"
+    );
+    let states = found(&r, "sessions.state");
+    assert_eq!(states.len(), 1, "{states:#?}");
+    let c = states[0];
+    assert!(
+        c.message.contains(&format!(
+            "'{}' cannot be read",
+            torn.join("daemon.lock").display()
+        )) && fix(c).contains("delete the lock"),
+        "{c:?}"
+    );
+}
+
+#[test]
 fn every_other_orphan_also_moves_history_before_deleting() {
     let fx = Fx::new();
     fx.add("a@x.co", "rt-a");

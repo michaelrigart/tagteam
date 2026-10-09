@@ -283,6 +283,7 @@ impl Engine {
         run.vault_orphans();
         run.rescues(opts.provider.as_ref());
         run.displaced(opts.provider.as_ref());
+        run.ownership_walk(opts.provider.as_ref());
         run.stray_profiles(opts.provider.as_ref());
         for p in &providers {
             run.accounts(p.as_ref());
@@ -1897,21 +1898,6 @@ impl Run<'_> {
                 continue;
             }
             let delete = Self::move_then_delete(&dir);
-            // No provider is known for these, so every registered one judges, as `purge` does
-            // when a marker names none it can ask.
-            let judges: Vec<&dyn Provider> = self
-                .engine
-                .registry
-                .all()
-                .iter()
-                .map(|p| p.as_ref())
-                .collect();
-            let orphaned = !matches!(&marker, Read::Present(m)
-                if self.engine.registry.get(&m.provider).is_some() && in_scope.contains(&m.provider));
-            let reports = orphaned && (only.is_none() || !matches!(&marker, Read::Present(_)));
-            if reports {
-                found.extend(self.orphan_ownership(&judges, &dir));
-            }
             match marker {
                 Read::Unreadable(e) => found.push(
                     Check::warn(
@@ -2049,7 +2035,6 @@ impl Run<'_> {
                     .fix(Self::move_then_delete(&dir)),
                 ),
                 None => {
-                    found.extend(self.orphan_ownership(&[p], &dir));
                     found.push(
                         Check::warn(
                             "sessions.orphan",
@@ -2115,14 +2100,97 @@ impl Run<'_> {
         out
     }
 
+    /// §13.6: ownership of every entry of `sessions/`, walked once and reported through
+    /// `ownership`, before and apart from any marker or account classification, each judged
+    /// as `purge` judges it: an account's profile by that account's provider, any other entry
+    /// (an orphan, a stray, a copy of another's marker) by the provider its marker names when
+    /// this build registers it with sessions, else by every registered provider with sessions
+    /// (`Engine::judges`). A `sessions/` that cannot be listed is `stray_profiles`'s to report.
+    /// With `only`, the entries of providers in scope, and the ones whose provider cannot be
+    /// told.
+    fn ownership_walk(&mut self, only: Option<&ProviderId>) {
+        let Ok(profiles) = self.profile_dirs() else {
+            return;
+        };
+        let Some(accounts) = self.all_accounts() else {
+            return;
+        };
+        let in_scope: Vec<ProviderId> = self.scope(only).iter().map(|p| p.id()).collect();
+        let every: Vec<ProviderId> = self.engine.registry.all().iter().map(|p| p.id()).collect();
+        let mut found: Vec<(Option<ProviderId>, Check)> = Vec::new();
+        for (dir, marker) in profiles {
+            let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if let Some(row) = accounts.iter().find(|r| r.id.as_str() == name) {
+                let n = row.position;
+                match self.engine.registry.get(&row.provider) {
+                    Some(p) if p.capabilities().sessions => {
+                        if !in_scope.contains(&row.provider) {
+                            continue;
+                        }
+                        let whose = format!("account {n}'s");
+                        let runs_in = format!("account {n}'s profile");
+                        let consequence = "so the account counts as in a session: commands that change it refuse, and its baseline and provenance are not checked";
+                        let checks =
+                            match self.engine.session_state(p.as_ref(), row) {
+                                Ok(state) => Self::ownership(&state, &whose, &runs_in, consequence),
+                                Err(e) => vec![Check::warn(
+                                "sessions.state",
+                                format!(
+                                    "{whose} session state cannot be read ({}), {consequence}",
+                                    e.kind()
+                                ),
+                            )
+                            .fix("make what it names readable again")],
+                            };
+                        found.extend(checks.into_iter().map(|c| (Some(row.provider.clone()), c)));
+                    }
+                    Some(_) => {}
+                    None => {
+                        if only.is_none() {
+                            let judges = self.engine.judges(&dir, &every);
+                            found.extend(
+                                self.orphan_ownership(&judges, &dir)
+                                    .into_iter()
+                                    .map(|c| (None, c)),
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+            // Not an account's profile: judged as purge judges an orphan, however its marker
+            // reads, and whoever the marker names.
+            let named = match &marker {
+                Read::Present(m) => Some(m.provider.clone()),
+                _ => None,
+            };
+            if only.is_some() && named.as_ref().is_some_and(|id| !in_scope.contains(id)) {
+                continue;
+            }
+            let judges = self.engine.judges(&dir, &every);
+            let owner = match (&named, judges.as_slice()) {
+                (Some(id), [one]) if one.id() == *id => Some(id.clone()),
+                _ => None,
+            };
+            found.extend(
+                self.orphan_ownership(&judges, &dir)
+                    .into_iter()
+                    .map(|c| (owner.clone(), c)),
+            );
+        }
+        for (id, check) in found {
+            self.push(id.as_ref(), check);
+        }
+    }
+
     /// `ownership` for the profile at `dir` that no stored account owns: each of `judges` is
     /// asked, as `purge` asks (§10.5 step 6), and every finding is reported once.
-    fn orphan_ownership(&self, judges: &[&dyn Provider], dir: &Path) -> Vec<Check> {
+    fn orphan_ownership(&self, judges: &[Arc<dyn Provider>], dir: &Path) -> Vec<Check> {
         let whose = format!("the orphaned profile {}'s", dir.display());
         let runs_in = format!("the orphaned profile {}", dir.display());
         let mut out: Vec<Check> = Vec::new();
         for p in judges.iter().filter(|p| p.capabilities().sessions) {
-            let state = self.engine.session_state_at(*p, dir);
+            let state = self.engine.session_state_at(p.as_ref(), dir);
             for c in Self::ownership(
                 &state,
                 &whose,
@@ -2165,28 +2233,12 @@ impl Run<'_> {
             ),
             None => self.splits(p, env, dir, found),
         }
-        let state = self.engine.session_state(p, row);
-        let quiescent = matches!(state, Ok(SessionState::Quiescent { .. }));
-        // The whole aggregate, as an orphan's is reported: an unreadable input beside a live
-        // owner, and the daemon, whatever else is found.
-        match &state {
-            Ok(state) => found.extend(Self::ownership(
-                state,
-                &format!("account {n}'s"),
-                &format!("account {n}'s profile"),
-                "so the account counts as in a session: commands that change it refuse, and its baseline and provenance are not checked",
-            )),
-            Err(e) => found.push(
-                Check::warn(
-                    "sessions.state",
-                    format!(
-                        "account {n}'s session state cannot be read ({}), so the account counts as in a session: commands that change it refuse, and its baseline and provenance are not checked",
-                        e.kind()
-                    ),
-                )
-                .fix("make what it names readable again"),
-            ),
-        }
+        // Ownership is reported once for every `sessions/` entry, by `ownership_walk`; this
+        // only gates the checks that need a quiescent profile.
+        let quiescent = matches!(
+            self.engine.session_state(p, row),
+            Ok(SessionState::Quiescent { .. })
+        );
         self.reservations(dir, n, found);
         if quiescent && p.has_baseline(dir) {
             found.push(

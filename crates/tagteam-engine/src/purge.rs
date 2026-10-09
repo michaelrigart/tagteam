@@ -579,7 +579,11 @@ impl Engine {
     /// with sessions, else every affected provider with sessions, since any of them may have
     /// run it. An affected provider this build does not register cannot be asked, so every
     /// registered provider with sessions judges in its place.
-    fn judges(&self, profile: &Path, providers: &[ProviderId]) -> Vec<Arc<dyn Provider>> {
+    pub(crate) fn judges(
+        &self,
+        profile: &Path,
+        providers: &[ProviderId],
+    ) -> Vec<Arc<dyn Provider>> {
         if let Read::Present(marker) = ProfileMarker::read(profile) {
             if let Ok(p) = self.provider(&marker.provider) {
                 if p.capabilities().sessions {
