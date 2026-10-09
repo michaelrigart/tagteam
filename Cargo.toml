@@ -16,6 +16,11 @@ tagteam-provider = { path = "crates/tagteam-provider", version = "0.1.0" }
 tagteam-cc = { path = "crates/tagteam-cc", version = "0.1.0" }
 tagteam-engine = { path = "crates/tagteam-engine", version = "0.1.0" }
 tagteam-fake = { path = "crates/tagteam-fake" }
+# Export encryption (§13.3, Decision 10): scrypt passphrases, X25519 and ssh-ed25519 recipients,
+# ASCII armor. The `ssh` feature pulls in `rsa` (RUSTSEC-2023-0071, a timing side channel in
+# RSA decryption); tagteam never decrypts with an RSA key: `transfer::parse_identity_file`
+# refuses one and `transfer::parse_recipient` refuses `ssh-rsa`, so the advisory does not apply.
+age = { version = "0.12", features = ["armor", "ssh"] }
 clap = { version = "4", features = ["derive", "string"] }
 # `tagteam completions` (§13.7): static scripts generated from the command definitions.
 clap_complete = "4"

@@ -31,6 +31,7 @@ pub mod store;
 pub mod switch;
 #[cfg(test)]
 mod testutil;
+pub mod transfer;
 pub mod vault;
 pub mod views;
 
