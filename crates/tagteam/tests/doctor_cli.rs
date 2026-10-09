@@ -123,6 +123,11 @@ fn over_ssh_with_no_store_and_no_claude_doctor_answers_at_once_and_creates_nothi
     assert_eq!(out.status.code(), Some(0), "nothing fails: {v:#}");
 
     let human = doctor(d.path(), &[]);
+    assert_eq!(
+        changed(&before, &tree(d.path())),
+        Vec::<PathBuf>::new(),
+        "the human form writes nothing either"
+    );
     let text = String::from_utf8_lossy(&human.stdout);
     assert!(text.contains("· tagteam has no state yet"), "{text}");
     assert!(text.contains("! the login keychain is locked"), "{text}");

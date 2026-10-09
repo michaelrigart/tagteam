@@ -405,8 +405,9 @@ const IDENTITIES: [&str; 7] = [
     ORG_NAME,
     ORG_UUID,
 ];
-/// No line holds 13 consecutive characters of one of these.
-const SECRETS: [&str; 13] = [
+/// No line holds 13 consecutive characters of one of these. The export recipient is among them
+/// though it is public: tagteam never logs a recipient or a key, so a line naming one is a leak.
+const SECRETS: [&str; 14] = [
     STRANGER_RT,
     STRANGER_AT,
     ALPHA_RT,
@@ -420,6 +421,7 @@ const SECRETS: [&str; 13] = [
     API_KEY,
     SETUP_TOKEN,
     SSH_SK,
+    SSH_PK,
 ];
 
 /// What `claude /login` leaves behind, as `common::login` writes it, but with this fixture's
@@ -616,7 +618,7 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
     fs::write(
         &claude,
         format!(
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo '2.1.286 (Claude Code)' ;;\n  auth) echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"configDirectory\":\"x\",\"email\":\"{BRAVO_EMAIL}\",\"orgId\":\"{ORG_UUID}\",\"orgName\":\"{ORG_NAME}\"}}' ;;\nesac\n"
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo '2.1.286 (Claude Code)' ;;\n  auth) : > \"$0.auth-called\"; echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"configDirectory\":\"x\",\"email\":\"{BRAVO_EMAIL}\",\"orgId\":\"{ORG_UUID}\",\"orgName\":\"{ORG_NAME}\"}}' ;;\nesac\n"
         ),
     )
     .unwrap();
@@ -631,6 +633,23 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
             matches!(out.status.code(), Some(0 | 1)),
             "{args:?}: {out:?}"
         );
+        if args.contains(&"--json") {
+            // The identity leg must not pass vacuously: doctor found the fake `claude` on the
+            // `PATH` it captured, and asked it for the login's identity.
+            let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert!(
+                report["checks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["id"] == "cc.auth"),
+                "doctor ran no `claude auth status`: {report:#}"
+            );
+            assert!(
+                bin.join("claude.auth-called").exists(),
+                "the fake `claude` was never asked for `auth`"
+            );
+        }
     }
     // purge (§10.5): `--provider` keeps the log, which a full purge deletes last.
     run(&["purge", "--provider", "claude-code", "--yes"]);
