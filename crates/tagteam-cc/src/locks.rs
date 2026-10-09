@@ -83,10 +83,19 @@ pub fn acquire_config(
     timeout: Duration,
     cancel: &Cancel,
 ) -> Result<CcConfigSet, LockError> {
+    acquire_config_stale(paths, CONFIG_STALE, timeout, cancel)
+}
+
+/// `acquire_config` with the staleness given, so a test can shorten it.
+fn acquire_config_stale(
+    paths: &CcPaths,
+    stale: Duration,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<CcConfigSet, LockError> {
     Ok(CcConfigSet {
         config: MkdirLock::acquire(
-            &MkdirLockSpec::new(paths.config_lock.clone(), CONFIG_STALE, timeout)
-                .with_cancel(cancel),
+            &MkdirLockSpec::new(paths.config_lock.clone(), stale, timeout).with_cancel(cancel),
         )?,
     })
 }
@@ -98,8 +107,18 @@ pub fn wait_config_idle(
     timeout: Duration,
     cancel: &Cancel,
 ) -> Result<(), LockError> {
+    wait_config_idle_stale(paths, CONFIG_STALE, timeout, cancel)
+}
+
+/// `wait_config_idle` with the staleness given, so a test can shorten it.
+fn wait_config_idle_stale(
+    paths: &CcPaths,
+    stale: Duration,
+    timeout: Duration,
+    cancel: &Cancel,
+) -> Result<(), LockError> {
     MkdirLock::wait_idle(
-        &MkdirLockSpec::new(paths.config_lock.clone(), CONFIG_STALE, timeout).with_cancel(cancel),
+        &MkdirLockSpec::new(paths.config_lock.clone(), stale, timeout).with_cancel(cancel),
     )
 }
 
@@ -296,7 +315,7 @@ mod tests {
     }
 
     /// A config lock `proper-lockfile` left behind after a short command: fresh, with an mtime
-    /// 1 s ahead of now (Appendix A.7).
+    /// 1 s ahead of now (Appendix A.7), the most it can lie.
     fn left_behind(p: &CcPaths) {
         fs::create_dir(&p.config_lock).unwrap();
         fs::File::open(&p.config_lock)
@@ -305,38 +324,50 @@ mod tests {
             .unwrap();
     }
 
+    /// The timing tests shorten the staleness to 1 s, keeping the 1 s future mtime: the lock
+    /// goes stale 2 s after it is made. The waits poll every 250-500 ms, which the real 10 s
+    /// and 12 s dwarf, so the budget that must outlast it carries 4 s of margin here.
+    const SHORT_STALE: Duration = Duration::from_secs(1);
+    const OUTLASTING: Duration = Duration::from_secs(6);
+
     #[test]
     fn the_config_lock_has_its_own_twelve_second_budget() {
         assert_eq!(CONFIG_ACQUIRE_TIMEOUT, Duration::from_secs(12));
         assert_eq!(ACQUIRE_TIMEOUT, Duration::from_secs(9));
-        assert!(CONFIG_ACQUIRE_TIMEOUT > CONFIG_STALE + Duration::from_secs(1));
+        // The staleness, the 1 s a lock left behind can lie ahead, and a poll of up to 500 ms.
+        assert!(
+            CONFIG_ACQUIRE_TIMEOUT >= CONFIG_STALE + Duration::from_millis(1_500),
+            "the budget must outlast a lock left behind"
+        );
+        assert!(ACQUIRE_TIMEOUT < CONFIG_STALE + Duration::from_secs(1));
     }
 
     #[test]
-    fn a_lock_left_behind_with_a_future_mtime_outlasts_the_credential_budget() {
+    fn a_lock_left_behind_with_a_future_mtime_outlasts_a_budget_shorter_than_its_staleness() {
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
         left_behind(&p);
+        let budget = Duration::from_secs(1); // stale only 2 s after it was made
         let start = Instant::now();
         assert!(matches!(
-            acquire_config(&p, ACQUIRE_TIMEOUT, &Cancel::new()),
+            acquire_config_stale(&p, SHORT_STALE, budget, &Cancel::new()),
             Err(LockError::Timeout(_))
         ));
-        assert!(start.elapsed() >= ACQUIRE_TIMEOUT);
+        assert!(start.elapsed() >= budget);
     }
 
     #[test]
-    fn a_lock_left_behind_with_a_future_mtime_is_acquired_once_stale_within_the_budget() {
+    fn a_lock_left_behind_with_a_future_mtime_is_acquired_once_stale_within_a_long_enough_budget() {
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
         left_behind(&p);
         let start = Instant::now();
-        let set = acquire_config(&p, CONFIG_ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
+        let set = acquire_config_stale(&p, SHORT_STALE, OUTLASTING, &Cancel::new()).unwrap();
         let waited = start.elapsed();
         assert!(set.check_owned().is_ok());
         assert!(
-            waited >= CONFIG_STALE && waited < CONFIG_ACQUIRE_TIMEOUT,
-            "acquired after {waited:?}"
+            waited >= Duration::from_millis(1_900),
+            "acquired after {waited:?}, before it went stale"
         );
     }
 
@@ -346,11 +377,11 @@ mod tests {
         let p = paths(d.path());
         left_behind(&p);
         let start = Instant::now();
-        wait_config_idle(&p, CONFIG_ACQUIRE_TIMEOUT, &Cancel::new()).unwrap();
+        wait_config_idle_stale(&p, SHORT_STALE, OUTLASTING, &Cancel::new()).unwrap();
         let waited = start.elapsed();
         assert!(
-            waited >= CONFIG_STALE && waited < CONFIG_ACQUIRE_TIMEOUT,
-            "idle after {waited:?}"
+            waited >= Duration::from_millis(1_900),
+            "idle after {waited:?}, before it went stale"
         );
         assert!(p.config_lock.is_dir(), "the pre-wait takes nothing over");
     }
