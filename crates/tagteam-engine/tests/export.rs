@@ -524,3 +524,47 @@ fn a_profile_that_rotated_under_a_running_session_is_exported_whatever_its_expir
     assert_eq!(exported_rt(&r, 1), "rt-a2");
     assert_eq!(fp(&fx, "rt-a"), fp_of(&fx, "a@x.co", "rt-a"));
 }
+
+#[test]
+fn a_session_credential_without_a_refresh_token_is_broken_while_the_vault_has_one() {
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let tokenless = json!({"claudeAiOauth": {"accessToken": "at-profile"}});
+    let dir = quiescent(&fx, &a, "rt-a", tokenless.to_string().as_bytes());
+    let _session = fx.hold_reservation(&dir);
+    let r = all(&fx);
+    assert_eq!(
+        skipped(&r),
+        [(
+            1,
+            "its session's credential has no refresh token, while the vault's has one".to_owned()
+        )]
+    );
+    assert_eq!(only(&fx, &a).unwrap_err().kind(), "account-broken");
+}
+
+#[test]
+fn a_session_with_no_seed_exports_the_vault_only_when_its_credential_is_the_vault_s() {
+    // In step: the vault's generation. Otherwise nothing to compare the profile against.
+    for (profile_rt, want) in [("rt-a", Ok("rt-a")), ("rt-a2", Err(()))] {
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        let dir = quiescent(&fx, &a, "rt-a", &credential("a@x.co", profile_rt));
+        fs::remove_file(dir.join(tagteam_provider::profile::SEED_FILE)).unwrap();
+        let _session = fx.hold_reservation(&dir);
+        let r = all(&fx);
+        match want {
+            Ok(rt) => {
+                assert_eq!(sources(&r)[0], (1, Source::Vault, true));
+                assert_eq!(exported_rt(&r, 1), rt);
+            }
+            Err(()) => assert_eq!(
+                skipped(&r),
+                [(
+                    1,
+                    "its running session has no seed to compare its credential against".to_owned()
+                )]
+            ),
+        }
+    }
+}

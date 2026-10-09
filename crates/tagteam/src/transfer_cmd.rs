@@ -109,7 +109,8 @@ pub(crate) fn export_warnings(r: &ExportResult) -> Vec<String> {
     if r.accounts.iter().any(|e| e.refreshes) {
         out.push(HAND_OFF.to_owned());
     }
-    for e in r.accounts.iter().filter(|e| e.in_use) {
+    // A kind that never refreshes keeps working in the exported copy (§13.3).
+    for e in r.accounts.iter().filter(|e| e.in_use && e.refreshes) {
         out.push(format!(
             "{} is in use here: this machine goes on refreshing it, so its exported copy stops working the next time it does",
             who(&e.row)
@@ -178,6 +179,8 @@ pub(crate) fn export_json(r: &ExportResult, file: Option<&Path>, encrypted: bool
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use tagteam_engine::export::{Exported, Source};
+
     use super::*;
 
     #[test]
@@ -234,5 +237,67 @@ mod tests {
             "{err}"
         );
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn exported(position: u32, kind: &str, in_use: bool, refreshes: bool) -> Exported {
+        use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+        let email = format!("u{position}@x.co");
+        Exported {
+            row: AccountRow {
+                id: AccountId::from_string(format!("id-{position}")),
+                provider: ProviderId::new(CLAUDE_CODE),
+                position,
+                identity_key: format!("{email}\n"),
+                label: email.clone(),
+                email: Some(email),
+                org_uuid: String::new(),
+                org_name: None,
+                account_uuid: None,
+                kind: kind.into(),
+                alias: None,
+                disabled: false,
+                identity_json: json!({}),
+                login_expires_at: None,
+                login_epoch: 0,
+                replacing_fp: None,
+                quarantine_reason: None,
+                quarantine_fp: None,
+                quarantine_at: None,
+                added_at: 1,
+            },
+            source: Source::Vault,
+            in_use,
+            refreshes,
+        }
+    }
+
+    #[test]
+    fn only_an_in_use_account_that_refreshes_is_warned_about() {
+        // §13.3: a setup token or an API key never rotates, so its exported copy keeps working
+        // while this machine uses it.
+        let result = ExportResult {
+            envelope: Vec::new(),
+            accounts: vec![
+                exported(1, "oauth", true, true),
+                exported(2, "setup-token", true, false),
+                exported(3, "api-key", true, false),
+                exported(4, "oauth", false, true),
+            ],
+            skipped: Vec::new(),
+        };
+        let warnings = export_warnings(&result);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings[0], HAND_OFF);
+        assert!(
+            warnings[1].starts_with("#1 u1@x.co is in use here"),
+            "{warnings:?}"
+        );
+
+        let tokens_only = ExportResult {
+            envelope: Vec::new(),
+            accounts: vec![exported(2, "setup-token", true, false)],
+            skipped: Vec::new(),
+        };
+        assert!(export_warnings(&tokens_only).is_empty());
     }
 }

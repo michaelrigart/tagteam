@@ -5,10 +5,13 @@
 mod common;
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 use common::{cmd, two_accounts};
 use serde_json::{Value, json};
 use tagteam_engine::transfer::{self, Decoded, IdentityFile, Need};
+use tagteam_engine::vault::SERVICE;
+use tagteam_provider::{FileKeychain, Keychain};
 
 /// age's own ssh-ed25519 test key pair (age 0.12.1, `src/ssh`).
 const SSH_PK: &str =
@@ -137,6 +140,7 @@ fn a_bad_recipient_is_a_usage_error_that_never_quotes_it() {
     let root = tempfile::tempdir().unwrap();
     two_accounts(root.path());
     let out = cmd(root.path())
+        .current_dir(root.path())
         .args([
             "export",
             "x.age",
@@ -151,8 +155,115 @@ fn a_bad_recipient_is_a_usage_error_that_never_quotes_it() {
         "tagteam: --recipient: a recipient must be an age1… or ssh-ed25519 public key\n"
     );
     let out = cmd(root.path())
+        .current_dir(root.path())
         .args(["export", "x.age", "--recipient", SSH_PK, "--plaintext"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "clap refuses the pair");
+}
+
+/// Deletes the vault copy of each of `ids`, so the account has no stored credential.
+fn break_accounts(root: &Path, ids: &[&String]) {
+    let kc = FileKeychain::new(root.join("keychain"));
+    for id in ids {
+        kc.delete(SERVICE, id).unwrap();
+    }
+}
+
+/// Every file directly in `dir`, except the fixture's own `home` and `keychain`.
+fn left_beside(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "home" && n != "keychain")
+        .collect()
+}
+
+#[test]
+fn an_export_with_every_account_broken_is_nothing_exported_and_writes_no_file() {
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = two_accounts(root.path());
+    break_accounts(root.path(), &[&a, &b]);
+    let file = root.path().join("accounts.json");
+    let out = cmd(root.path())
+        .args(["export", file.to_str().unwrap(), "--plaintext", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = json_of(&out.stdout);
+    assert_eq!(v["error"]["type"], "nothing-exported");
+    assert_eq!(v["error"]["message"], "no account was exported");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("warning: #1 a@x.co was not exported: it has no stored credential"),
+        "{err}"
+    );
+    assert!(!file.exists());
+    assert_eq!(
+        left_beside(root.path()),
+        Vec::<String>::new(),
+        "no temporary file"
+    );
+}
+
+#[test]
+fn an_export_of_no_accounts_is_nothing_exported_too() {
+    let root = tempfile::tempdir().unwrap();
+    let out = cmd(root.path())
+        .current_dir(root.path())
+        .args(["export", "out.json", "--plaintext"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "tagteam: no account was exported\n"
+    );
+    assert_eq!(left_beside(root.path()), Vec::<String>::new());
+}
+
+#[test]
+fn a_named_broken_account_is_a_hard_error_and_leaves_no_file() {
+    let root = tempfile::tempdir().unwrap();
+    let (a, _) = two_accounts(root.path());
+    break_accounts(root.path(), &[&a]);
+    let file = root.path().join("accounts.json");
+    let out = cmd(root.path())
+        .args([
+            "export",
+            file.to_str().unwrap(),
+            "--plaintext",
+            "--account",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let v = json_of(&out.stdout);
+    assert_eq!(v["error"]["type"], "account-broken");
+    assert_eq!(
+        v["error"]["message"],
+        "position 1 cannot be exported: it has no stored credential"
+    );
+    assert!(!file.exists());
+    assert_eq!(
+        left_beside(root.path()),
+        Vec::<String>::new(),
+        "no temporary file"
+    );
+
+    // The other account exports on its own.
+    let out = cmd(root.path())
+        .args([
+            "export",
+            file.to_str().unwrap(),
+            "--plaintext",
+            "--account",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(holds(&opened(&std::fs::read(&file).unwrap(), &[])).len(), 1);
 }
