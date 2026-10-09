@@ -156,6 +156,7 @@ impl H {
         let mut ctx = Context {
             env: self.env.clone(),
             keychain: self.kc.clone(),
+            vault_keychain: None,
             platform: Platform::MacOs,
             api_base: Some(common::OFFLINE_API_BASE.into()),
             stdout_terminal: false,
@@ -303,6 +304,35 @@ fn colour_under_auto_follows_the_output_the_command_writes_to() {
         list(&["list"], |c| c.force_color_env = true).contains(YELLOW_77),
         "FORCE_COLOR colours a pipe"
     );
+}
+
+#[test]
+fn a_vault_keychain_of_its_own_holds_the_vault_and_nothing_else() {
+    // Decision 16: `cargo xtask compat` gives the vault, and only the vault, a keychain of its
+    // own; Claude Code's items stay where they are.
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    let vault = Arc::new(FakeKeychain::new());
+    let own = vault.clone();
+    let (code, _, err) = h.run_in(&["add"], &mut Scripted::none(), move |ctx| {
+        ctx.vault_keychain = Some(own);
+    });
+    assert_eq!(code, 0, "{err}");
+    let services: Vec<String> = vault.items().into_keys().map(|(s, _)| s).collect();
+    assert!(
+        !services.is_empty() && services.iter().all(|s| s == "tagteam"),
+        "{services:?}"
+    );
+    let login = h.kc.items();
+    assert!(
+        login.keys().all(|(s, _)| s != "tagteam"),
+        "no vault item in the login keychain"
+    );
+    let live = (
+        keychain_service(&h.env, ItemKind::OAuth),
+        keychain_account(&h.env),
+    );
+    assert!(login.contains_key(&live), "Claude Code's item is untouched");
 }
 
 #[test]

@@ -579,6 +579,7 @@ mod tests {
         let ctx = Context {
             env: env.clone(),
             keychain: kc,
+            vault_keychain: None,
             platform: Platform::MacOs,
             api_base: Some("http://127.0.0.1:9".into()),
             stdout_terminal: false,
@@ -703,6 +704,7 @@ mod tests {
         let ctx = Context {
             env,
             keychain: Arc::new(FakeKeychain::new()),
+            vault_keychain: None,
             platform: Platform::MacOs,
             api_base: None,
             stdout_terminal: false,
@@ -737,6 +739,7 @@ mod tests {
         Context {
             env,
             keychain: Arc::new(FakeKeychain::new()),
+            vault_keychain: None,
             platform: Platform::MacOs,
             api_base: None,
             stdout_terminal: false,

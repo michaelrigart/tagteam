@@ -33,6 +33,8 @@ use tagteam_provider::http::Http;
 use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::{SpawnSpec, SystemSpawner, exec_command};
 use tagteam_provider::profile::RunShell;
+#[cfg(feature = "test-support")]
+use tagteam_provider::security::ProcessRunner;
 use tagteam_provider::security::SecurityCli;
 use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, SystemClock};
 
@@ -127,10 +129,18 @@ const TEST_KEYCHAIN_DIR: &str = "TAGTEAM_TEST_KEYCHAIN_DIR";
 const TEST_PLATFORM: &str = "TAGTEAM_TEST_PLATFORM";
 #[cfg(any(test, feature = "test-support"))]
 const TEST_API_BASE: &str = "TAGTEAM_TEST_API_BASE";
+/// A keychain file for the vault alone (Decision 16): `cargo xtask compat` keeps its test
+/// account's vault there while Claude Code's items stay in the login keychain.
+#[cfg(any(test, feature = "test-support"))]
+const TEST_VAULT_KEYCHAIN: &str = "TAGTEAM_TEST_VAULT_KEYCHAIN";
 
 pub struct Context {
     pub env: Env,
     pub keychain: Arc<dyn Keychain>,
+    /// The vault's own Keychain, when it is not `keychain`: only a test-support build sets it
+    /// (`TAGTEAM_TEST_VAULT_KEYCHAIN`, `cargo xtask compat`). `None` keeps the vault in
+    /// `keychain`.
+    pub vault_keychain: Option<Arc<dyn Keychain>>,
     pub platform: Platform,
     /// Every endpoint under this base instead of production; only a test-support build sets it.
     pub api_base: Option<String>,
@@ -147,6 +157,7 @@ pub struct Context {
 #[derive(Default)]
 struct Overrides {
     keychain: Option<Arc<dyn Keychain>>,
+    vault_keychain: Option<Arc<dyn Keychain>>,
     platform: Option<Platform>,
     api_base: Option<String>,
 }
@@ -166,8 +177,16 @@ fn test_overrides(var: &dyn Fn(&str) -> Option<OsString>) -> Overrides {
         _ => None,
     };
     let api_base = var(TEST_API_BASE).and_then(|v| v.into_string().ok());
+    // `/usr/bin/security` bound to that keychain file, as the `real_keychain` tests drive it.
+    let vault_keychain = var(TEST_VAULT_KEYCHAIN).map(|file| {
+        Arc::new(SecurityCli::with_runner(
+            Box::new(ProcessRunner),
+            Some(std::path::PathBuf::from(file)),
+        )) as Arc<dyn Keychain>
+    });
     Overrides {
         keychain,
+        vault_keychain,
         platform,
         api_base,
     }
@@ -188,6 +207,7 @@ impl Context {
         let mut ctx = Self {
             env,
             keychain: o.keychain.unwrap_or_else(|| Arc::new(SecurityCli::new())),
+            vault_keychain: o.vault_keychain,
             platform: o.platform.unwrap_or_else(Platform::current),
             api_base: o.api_base,
             stdout_terminal: std::io::stdout().is_terminal(),
@@ -329,7 +349,9 @@ fn build_engine(
     flag: Option<&ProviderId>,
 ) -> (Engine, Vec<String>) {
     let vault = match ctx.platform {
-        Platform::MacOs => Vault::new(Box::new(KeychainVault::new(ctx.keychain))),
+        Platform::MacOs => Vault::new(Box::new(KeychainVault::new(
+            ctx.vault_keychain.unwrap_or(ctx.keychain),
+        ))),
         Platform::Linux => Vault::new(Box::new(FileVault::new(env.data_dir().join("vault")))),
     };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -2092,6 +2114,7 @@ mod tests {
             TEST_KEYCHAIN_DIR => Some("/nonexistent/keychain".into()),
             TEST_PLATFORM => Some("linux".into()),
             TEST_API_BASE => Some("http://127.0.0.1:9".into()),
+            TEST_VAULT_KEYCHAIN => Some("/nonexistent/vault.keychain-db".into()),
             _ => None,
         }
     }
@@ -2103,6 +2126,7 @@ mod tests {
         let o = test_overrides(&all_set);
         let honoured = cfg!(feature = "test-support");
         assert_eq!(o.keychain.is_some(), honoured);
+        assert_eq!(o.vault_keychain.is_some(), honoured);
         assert_eq!(o.platform, honoured.then_some(Platform::Linux));
         assert_eq!(
             o.api_base.as_deref(),
@@ -2252,6 +2276,7 @@ mod tests {
         let ctx = Context {
             env: Env::for_test(dir.path()),
             keychain: Arc::new(tagteam_provider::FakeKeychain::new()),
+            vault_keychain: None,
             platform: Platform::MacOs,
             api_base: None,
             stdout_terminal: false,
@@ -2400,6 +2425,7 @@ mod tests {
         let ctx = Context {
             env: Env::for_test(dir.path()),
             keychain: Arc::new(FakeKeychain::new()),
+            vault_keychain: None,
             platform: Platform::MacOs,
             api_base: None,
             stdout_terminal: false,
@@ -2479,6 +2505,7 @@ mod tests {
         let ctx = Context {
             env: Env::for_test(dir.path()),
             keychain: Arc::new(FakeKeychain::new()),
+            vault_keychain: None,
             platform: Platform::MacOs,
             api_base: None,
             stdout_terminal: false,
