@@ -95,23 +95,6 @@ impl Place {
     }
 }
 
-/// A daemon stop: the command that ran, and, when `--any` was rejected as an unknown option and
-/// plain `daemon stop` ran instead, the summary of the rejected attempt.
-struct Stopped {
-    ran: Ran,
-    rejected: Option<Value>,
-}
-
-impl Stopped {
-    /// The evidence of the stop: its summary, or both attempts' when `--any` was rejected.
-    fn evidence(&self) -> Value {
-        match &self.rejected {
-            None => self.ran.summary(),
-            Some(any) => json!({"any": any, "fallback": self.ran.summary()}),
-        }
-    }
-}
-
 pub struct Ctx {
     pub layout: Layout,
     pub roots: Roots,
@@ -282,8 +265,9 @@ impl Ctx {
     /// is an error carrying its redacted output, and so is anything of the daemon still
     /// running, or a lock, roster or record that cannot be read, once the deadline passes
     /// (`daemon::survey`). A transient daemon, which `claude --bg` starts, is stopped only with
-    /// `--any` (Appendix A.7); a `claude` that does not know the option gets plain `daemon
-    /// stop`. Returns the stop command's summary, or `None` when nothing needed stopping.
+    /// `--any` (Appendix A.7), and compat has no other way to stop it: a `claude` that
+    /// rejects the option is an error (`daemon_stop`). Returns the stop command's summary, or
+    /// `None` when nothing needed stopping.
     pub fn stop_daemon(&self, spelling: &str) -> Result<Option<Value>, HarnessError> {
         self.stop_and_verify(spelling, &self.cancel, DAEMON_PATIENCE)
     }
@@ -305,22 +289,28 @@ impl Ctx {
             left = daemon::survey(home, &probe);
             left.is_clear()
         });
-        let ran = match &stop {
-            Ok(stopped) => Some(stopped.evidence()),
-            Err(_) => None,
-        };
+        let evidence = stop.as_ref().ok().map(Ran::summary);
         let refused = match &stop {
-            Ok(stopped) if stopped.ran.success() => None,
-            Ok(stopped) => Some(format!(
-                "`claude daemon stop` failed: {}",
-                stopped.evidence()
+            Ok(ran) if ran.success() => None,
+            Ok(ran) => Some(format!(
+                "`claude daemon stop --any` failed: {}{}",
+                ran.summary(),
+                if daemon::rejects_any(&ran.stderr_text(), &ran.stdout_text()) {
+                    "; compat needs a Claude Code whose `daemon stop` supports `--any` (2.1.292 does)"
+                } else {
+                    ""
+                }
             )),
-            Err(e) => Some(format!("`claude daemon stop`: {e}")),
+            Err(e) => Some(format!("`claude daemon stop --any`: {e}")),
         };
+        // Whatever the stop printed stays in the error, whether it or the verification failed.
+        let ran_text = evidence
+            .as_ref()
+            .map_or_else(String::new, |v| format!(" (the stop: {v})"));
         match (refused, left.is_clear()) {
-            (None, true) => Ok(ran),
+            (None, true) => Ok(evidence),
             (None, false) => Err(harness(format!(
-                "{spelling}: after `claude daemon stop`, {}",
+                "{spelling}: after `claude daemon stop --any`, {}{ran_text}",
                 left.describe()
             ))),
             (Some(why), true) => Err(harness(format!("{spelling}: {why}"))),
@@ -328,29 +318,14 @@ impl Ctx {
         }
     }
 
-    /// `claude daemon stop --any` in the home, through the guard. Only when this `claude`
-    /// rejects `--any` as an unknown option (an older one) is plain `daemon stop` run in its
-    /// place; the rejected attempt is kept, so the outcome shows both. Any other failure of
-    /// `--any` is the result, with no fallback.
-    fn daemon_stop(&self, spelling: &str, token: &Cancel) -> Result<Stopped, HarnessError> {
-        let stop = |args: &[&str]| {
-            self.claude(spelling, args)
-                .cancel(token)
-                .timeout(Duration::from_secs(60))
-                .run(&self.roots)
-        };
-        let any = stop(&["daemon", "stop", "--any"])?;
-        if !any.success() && daemon::rejects_any(&any.stderr_text(), &any.stdout_text()) {
-            let rejected = any.summary();
-            return Ok(Stopped {
-                ran: stop(&["daemon", "stop"])?,
-                rejected: Some(rejected),
-            });
-        }
-        Ok(Stopped {
-            ran: any,
-            rejected: None,
-        })
+    /// `claude daemon stop --any` in the home, through the guard, and nothing else: a `claude`
+    /// that rejects `--any` (an unknown option or otherwise) is a failed stop, with no second
+    /// command, so the one attempt's exit and output are all the evidence there is.
+    fn daemon_stop(&self, spelling: &str, token: &Cancel) -> Result<Ran, HarnessError> {
+        self.claude(spelling, &["daemon", "stop", "--any"])
+            .cancel(token)
+            .timeout(Duration::from_secs(60))
+            .run(&self.roots)
     }
 
     /// Registers the home `spelling` before a check starts a daemon in it (`claude --bg`, or
@@ -951,7 +926,7 @@ esac
             .0;
         crate::compat::sys::signal(pid, "KILL", false);
         assert!(
-            e.contains("`claude daemon stop` failed")
+            e.contains("`claude daemon stop --any` failed")
                 && e.contains("refused: a transient daemon")
                 && e.contains("stdout too")
                 && e.contains(&format!("the supervisor in daemon.lock (pid {pid})")),
@@ -985,7 +960,7 @@ esac
             .0;
         crate::compat::sys::signal(pid, "KILL", false);
         assert!(
-            e.contains("after `claude daemon stop`") && e.contains("still running"),
+            e.contains("after `claude daemon stop --any`") && e.contains("still running"),
             "{e}"
         );
 
@@ -1000,16 +975,14 @@ esac
     }
 
     #[test]
-    fn an_any_failure_other_than_an_unknown_option_has_no_fallback_and_a_failed_fallback_keeps_both()
-     {
+    fn a_claude_that_rejects_any_is_an_error_and_no_second_command_runs() {
         let _serial = crate::compat::sys::serial();
         let scratch = crate::compat::layout::make_scratch().unwrap();
-        // `--any` refused for another reason: no plain stop is tried.
         let ctx = daemon_ctx(
             &scratch,
             fake_claude(
                 &scratch,
-                r#"echo "error: no daemon is running" >&2; exit 1"#,
+                r#"echo "error: unknown option '--any'" >&2; exit 1"#,
             ),
         );
         let home = ctx.new_home("one").unwrap();
@@ -1019,72 +992,63 @@ esac
             .stop_and_verify(&home, &Cancel::new(), Duration::from_secs(1))
             .unwrap_err()
             .0;
-        assert!(e.contains("no daemon is running"), "{e}");
+        crate::compat::sys::signal(pid, "KILL", false);
+        assert!(
+            e.contains("unknown option '--any'")
+                && e.contains("\"exit\":1")
+                && e.contains("supports `--any` (2.1.292 does)"),
+            "{e}"
+        );
         let args = fs::read_to_string(Path::new(&home).join("args")).unwrap();
-        assert_eq!(args.lines().collect::<Vec<_>>(), ["daemon stop --any"]);
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            ["daemon stop --any"],
+            "no plain `daemon stop` follows"
+        );
 
-        // `--any` unknown and the plain stop fails too: the error shows both attempts.
+        // Any other failure is the same: the one attempt, its output kept, no hint.
         let ctx = daemon_ctx(
             &scratch,
             fake_claude(
                 &scratch,
-                r#"case "$*" in
-*--any*) echo "error: unknown option '--any'" >&2; exit 1 ;;
-esac
-echo "plain stop refused" >&2; exit 3"#,
+                r#"echo "error: no daemon is running" >&2; exit 1"#,
             ),
         );
-        let two = ctx.new_home("two").unwrap();
-        lock_naming(&two, pid);
+        let other = ctx.new_home("two").unwrap();
+        let pid = orphan_sleep();
+        lock_naming(&other, pid);
         let e = ctx
-            .stop_and_verify(&two, &Cancel::new(), Duration::from_secs(1))
+            .stop_and_verify(&other, &Cancel::new(), Duration::from_secs(1))
             .unwrap_err()
             .0;
         crate::compat::sys::signal(pid, "KILL", false);
         assert!(
-            e.contains("unknown option") && e.contains("plain stop refused"),
+            e.contains("no daemon is running") && !e.contains("supports `--any`"),
             "{e}"
         );
         fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]
-    fn a_claude_that_does_not_know_any_gets_plain_daemon_stop() {
+    fn a_stop_that_exits_zero_but_leaves_the_daemon_keeps_its_output_in_the_error() {
         let _serial = crate::compat::sys::serial();
         let scratch = crate::compat::layout::make_scratch().unwrap();
-        let claude = fake_claude(
+        let ctx = daemon_ctx(
             &scratch,
-            r#"case "$*" in
-*--any*) echo "error: unknown option '--any'" >&2; exit 1 ;;
-esac
-kill "$(sed 's/.*"pid":\([0-9]*\).*/\1/' "$home/daemon.lock")"
-rm -f "$home/daemon.lock""#,
+            fake_claude(&scratch, r#"echo "stopping soon" >&2; exit 0"#),
         );
-        let ctx = daemon_ctx(&scratch, claude);
-        let home = ctx.new_home("profile").unwrap();
+        let home = ctx.new_home("one").unwrap();
         let pid = orphan_sleep();
         lock_naming(&home, pid);
-
-        let summary = ctx.stop_daemon(&home).unwrap().expect("a stop ran");
+        let e = ctx
+            .stop_and_verify(&home, &Cancel::new(), Duration::from_secs(1))
+            .unwrap_err()
+            .0;
         crate::compat::sys::signal(pid, "KILL", false);
-        assert_eq!(summary["fallback"]["exit"], 0);
-        assert_eq!(
-            summary["any"]["exit"], 1,
-            "the rejected attempt is kept: {summary}"
-        );
         assert!(
-            summary["any"]["stderr"]
-                .as_str()
-                .unwrap()
-                .contains("unknown option '--any'"),
-            "{summary}"
+            e.contains("still running") && e.contains("stopping soon"),
+            "{e}"
         );
-        let args = fs::read_to_string(Path::new(&home).join("args")).unwrap();
-        assert_eq!(
-            args.lines().collect::<Vec<_>>(),
-            ["daemon stop --any", "daemon stop"]
-        );
-        assert!(!Path::new(&home).join("daemon.lock").exists());
         fs::remove_dir_all(&scratch).unwrap();
     }
 
