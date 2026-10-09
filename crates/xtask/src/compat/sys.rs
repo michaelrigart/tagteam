@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM, SIGTSTP};
 use tagteam_provider::{Cancel, term};
 
 use super::guard::Roots;
@@ -342,7 +342,7 @@ fn end_group(child: &mut Child) -> bool {
 /// with the terminal's streams inherited. `std` makes the group before it returns, so the group
 /// exists when this does. Wait for it with `wait_interactive`.
 pub fn spawn_interactive(cmd: &mut Command) -> io::Result<Child> {
-    cmd.process_group(0).spawn()
+    term::spawn_foreground(cmd)
 }
 
 /// The terminal handed to an interactive child's group. Dropping it hands the terminal back to
@@ -357,10 +357,14 @@ impl Foreground {
         let Ok(pgid) = i32::try_from(pgid) else {
             return Self { ours: None };
         };
-        if !term::stdin_is_our_foreground_terminal() {
-            return Self { ours: None };
-        }
         let ours = term::own_process_group();
+        // The terminal is ours, or the child already took it before its exec
+        // (`spawn_foreground`): either way it is handed to the child's group now and back
+        // to ours on drop.
+        match term::stdin_foreground_group() {
+            Some(group) if group == ours || group == pgid => {}
+            _ => return Self { ours: None },
+        }
         term::set_foreground_group(pgid);
         Self { ours: Some(ours) }
     }
@@ -389,9 +393,24 @@ fn leads_its_group(child: &Child) -> bool {
 /// group (a `setsid`) is swept from the process tree last seen (`end_tree`). A survivor is a
 /// harness error, not a silent one.
 pub fn wait_interactive(child: &mut Child, token: &Cancel) -> Result<ExitStatus, HarnessError> {
+    wait_interactive_as(child, token, false)
+}
+
+/// `wait_interactive`; `holds_terminal` says the child's group is to be treated as holding the
+/// terminal even when stdin is not one (tests).
+fn wait_interactive_as(
+    child: &mut Child,
+    token: &Cancel,
+    holds_terminal: bool,
+) -> Result<ExitStatus, HarnessError> {
     let pgid = child.id();
     let own_group = leads_its_group(child);
     let foreground = own_group.then(|| Foreground::hand_to(pgid));
+    let holds_terminal = holds_terminal || foreground.as_ref().is_some_and(|f| f.ours.is_some());
+    if holds_terminal {
+        // Harmless if it runs; a child stopped before the handoff (SIGTTIN) continues.
+        signal(pgid, "CONT", true);
+    }
     let mut seen = BTreeSet::from([pgid]);
     let mut last_listed = Instant::now();
     let outcome = loop {
@@ -403,6 +422,17 @@ pub fn wait_interactive(child: &mut Child, token: &Cancel) -> Result<ExitStatus,
         if let Some(n) = token.requested() {
             break Err(interrupted(n));
         }
+        if own_group && term::child_is_stopped(pgid) {
+            if holds_terminal {
+                // Stopped though it holds the terminal (a SIGTTIN lost to the handoff race):
+                // resumed, as a shell does for a foreground job.
+                signal(pgid, "CONT", true);
+            } else {
+                // Nobody to resume it for: a stopped command with no terminal never ends.
+                token.request(SIGTSTP);
+                break Err(interrupted(SIGTSTP));
+            }
+        }
         // What the tree looks like while the leader lives, for the sweep once it is gone.
         if last_listed.elapsed() >= Duration::from_secs(1) {
             last_listed = Instant::now();
@@ -412,6 +442,14 @@ pub fn wait_interactive(child: &mut Child, token: &Cancel) -> Result<ExitStatus,
         }
         thread::sleep(Duration::from_millis(20));
     };
+    // A leader ended by a terminal Ctrl-C (or SIGTERM, SIGHUP) is the run's cancellation: the
+    // token records it, as the harness's own handler would, before any cleanup, so every caller
+    // sees `requested()` whatever the cleanup then does.
+    if let Ok(Some(status)) = &outcome {
+        if let Some(n) = status.signal().filter(|n| CAUGHT.contains(n)) {
+            token.request(n);
+        }
+    }
     // The terminal back first: the sweep below must not run with it held by a dying group.
     drop(foreground);
     let swept = if own_group {
@@ -440,6 +478,8 @@ fn end_group_of(child: &mut Child, pgid: u32) -> Result<(), HarnessError> {
     if !group_alive(pgid) {
         return Ok(());
     }
+    // A stopped group takes SIGTERM only once continued.
+    signal(pgid, "CONT", true);
     signal(pgid, "TERM", true);
     if !settle(GRACE, || {
         let _ = child.try_wait();
@@ -1157,8 +1197,40 @@ mod tests {
         let mut child =
             spawn_interactive(Command::new("/bin/sh").args(["-c", "kill -INT $$; sleep 5"]))
                 .unwrap();
-        let err = wait_interactive(&mut child, &Cancel::new()).unwrap_err();
+        let token = Cancel::new();
+        let err = wait_interactive(&mut child, &token).unwrap_err();
         assert_eq!(err, interrupted(SIGINT));
+        // The run's token records it, as the harness's own handler would, so the callers stop.
+        assert_eq!(token.requested(), Some(SIGINT));
+    }
+
+    #[test]
+    fn a_stopped_child_with_no_terminal_is_a_cancellation_not_a_hang() {
+        let _serial = serial();
+        let mut child =
+            spawn_interactive(Command::new("/bin/sh").args(["-c", "kill -STOP $$; exit 0"]))
+                .unwrap();
+        let token = Cancel::new();
+        let t = Instant::now();
+        let err = wait_interactive(&mut child, &token).unwrap_err();
+        assert_eq!(err, interrupted(SIGTSTP));
+        assert_eq!(token.requested(), Some(SIGTSTP));
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        assert!(reaped(&mut child));
+    }
+
+    #[test]
+    fn a_stopped_child_that_holds_the_terminal_is_resumed() {
+        let _serial = serial();
+        let dir = std::env::temp_dir().join(format!("xtask-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let done = dir.join("done");
+        let script = format!("kill -STOP $$; echo ok > '{}'", done.display());
+        let mut child = spawn_interactive(Command::new("/bin/sh").args(["-c", &script])).unwrap();
+        let status = wait_interactive_as(&mut child, &Cancel::new(), true).unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&done).unwrap().trim(), "ok");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

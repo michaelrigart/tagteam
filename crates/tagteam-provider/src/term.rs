@@ -4,6 +4,8 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::os::unix::process::CommandExt as _;
+use std::process::{Child, Command};
 
 /// How a wait for a descriptor to become readable ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +103,69 @@ pub fn set_foreground_group(pgid: i32) {
         let before = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
         libc::tcsetpgrp(0, pgid);
         libc::signal(libc::SIGTTOU, before);
+    }
+}
+
+/// The foreground group of the terminal on stdin, if stdin is a terminal.
+pub fn stdin_foreground_group() -> Option<i32> {
+    // SAFETY: isatty and tcgetpgrp only read descriptor 0's state.
+    unsafe {
+        if libc::isatty(0) != 1 {
+            return None;
+        }
+        let group = libc::tcgetpgrp(0);
+        (group > 0).then_some(group)
+    }
+}
+
+/// Starts `cmd` as a job of its own, as a shell starts a foreground job: in a process group of
+/// its own and, when stdin is a terminal held by this process's group, as that terminal's
+/// foreground group before it execs, so it never reads the terminal from the background and is
+/// stopped by SIGTTIN. The job's SIGTTOU, SIGTTIN, SIGTSTP, SIGINT and SIGQUIT are the default
+/// ones. The caller still hands the terminal over itself (the classic double handoff, closing the
+/// race either way) and takes it back.
+pub fn spawn_foreground(cmd: &mut Command) -> io::Result<Child> {
+    let take_terminal = stdin_is_our_foreground_terminal();
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // async-signal-safe functions (setpgid, signal, tcsetpgrp, getpid), touching no memory of
+    // the parent's but its own stack.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::setpgid(0, 0);
+            if take_terminal {
+                libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+                libc::tcsetpgrp(0, libc::getpid());
+            }
+            for sig in [
+                libc::SIGTTOU,
+                libc::SIGTTIN,
+                libc::SIGTSTP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+            ] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()
+}
+
+/// Whether process `pid`, a child of this process, is stopped (SIGSTOP, SIGTSTP, SIGTTIN or
+/// SIGTTOU), without reaping it or consuming any other report: `waitid` with `WNOWAIT`.
+pub fn child_is_stopped(pid: u32) -> bool {
+    let pid: libc::id_t = pid;
+    // SAFETY: `info` is a zeroed `siginfo_t` that `waitid` fills in; WNOHANG and WNOWAIT make it
+    // return at once and leave the child waitable.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        rc == 0 && info.si_signo == libc::SIGCHLD && info.si_code == libc::CLD_STOPPED
     }
 }
 
