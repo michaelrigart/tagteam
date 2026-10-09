@@ -10,14 +10,16 @@ use tagteam_provider::process::{ProcessSpawner, SpawnSpec};
 use tagteam_provider::profile::refuse_linked_credential;
 use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
-    BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, Env, FreshCredential,
-    Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
-    LockError, MergeReport, MustShare, MutationGuard, Pace, PollBudget, Provider, ProviderError,
-    Read, SessionEnv, SharePolicy, StoredLogin, Undo, UsageResult, Validity, Window, Written,
+    BeforeFallback, Cancel, Capabilities, Check, CredLocks, Credential, DoomedEntry, Env,
+    FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange,
+    LiveLockSet, LiveLocks, LockError, MergeReport, MustShare, MutationGuard, Pace, PollBudget,
+    Provider, ProviderError, Read, SessionEnv, SharePolicy, StoredLogin, Undo, UsageResult,
+    Validity, Window, Written,
 };
 
 use crate::config;
 use crate::crash;
+use crate::doctor;
 use crate::endpoints::Endpoints;
 use crate::live::{self, Extent, Fence, LiveStore, Platform, Snapshot};
 use crate::locks;
@@ -751,6 +753,16 @@ impl Provider for ClaudeCode {
             spelling,
             expect,
         )
+    }
+
+    /// §13.6's Claude Code checks (`doctor.rs`), with this provider's own Keychain.
+    fn doctor_checks(
+        &self,
+        env: &Env,
+        spawner: &dyn ProcessSpawner,
+        cancel: &Cancel,
+    ) -> Vec<Check> {
+        doctor::checks(&self.live, env, spawner, cancel)
     }
 }
 

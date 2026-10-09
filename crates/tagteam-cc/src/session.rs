@@ -409,7 +409,7 @@ const DESCRIPTOR_PREFIX: &[u8] = b"CLAUDE_CODE_";
 const DESCRIPTOR_SUFFIX: &[u8] = b"_FILE_DESCRIPTOR";
 
 /// `CLAUDE_CODE_*_FILE_DESCRIPTOR`, the `*` any run of bytes, possibly empty.
-fn is_token_descriptor(name: &OsStr) -> bool {
+pub(crate) fn is_token_descriptor(name: &OsStr) -> bool {
     let b = name.as_bytes();
     b.len() >= DESCRIPTOR_PREFIX.len() + DESCRIPTOR_SUFFIX.len()
         && b.starts_with(DESCRIPTOR_PREFIX)
@@ -445,21 +445,21 @@ pub(crate) const AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const INTERRUPTED: &str = "interrupted";
 /// The account's own login (§12.3 step 8): CC's OAuth accounts, and setup-token accounts
 /// (*inferred*).
-const CLAUDE_AI: &str = "claude.ai";
+pub(crate) const CLAUDE_AI: &str = "claude.ai";
 
 /// The fields of `claude auth status --json` that §12.3's table reads (Appendix A.7).
-struct AuthStatus {
-    logged_in: bool,
-    auth_method: String,
-    config_directory: String,
-    email: Option<String>,
-    org_id: Option<String>,
-    api_key_source: Option<String>,
+pub(crate) struct AuthStatus {
+    pub(crate) logged_in: bool,
+    pub(crate) auth_method: String,
+    pub(crate) config_directory: String,
+    pub(crate) email: Option<String>,
+    pub(crate) org_id: Option<String>,
+    pub(crate) api_key_source: Option<String>,
 }
 
 impl AuthStatus {
     /// `None` unless `stdout` is one JSON object holding the three fields CC always prints.
-    fn parse(stdout: &[u8]) -> Option<Self> {
+    pub(crate) fn parse(stdout: &[u8]) -> Option<Self> {
         let v: Value = serde_json::from_slice(stdout).ok()?;
         let text = |k: &str| {
             v.get(k)

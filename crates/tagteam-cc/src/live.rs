@@ -380,6 +380,11 @@ impl LiveStore {
         self.platform
     }
 
+    /// The Keychain this store reads and writes, for doctor's lock check and probes (§13.6).
+    pub(crate) fn keychain(&self) -> &dyn Keychain {
+        self.keychain.as_ref()
+    }
+
     pub fn file_mode_pinned(&self) -> bool {
         self.file_mode_pinned.load(Ordering::SeqCst)
     }

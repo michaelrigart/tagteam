@@ -1,5 +1,6 @@
 pub mod config;
 mod crash;
+mod doctor;
 pub mod endpoints;
 pub mod live;
 pub mod locks;
