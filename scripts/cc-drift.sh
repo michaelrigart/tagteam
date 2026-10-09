@@ -61,6 +61,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 compat="${CC_DRIFT_COMPAT_DIR:-$script_dir/../crates/tagteam-cc/compat}"
 probe_timeout="${CC_DRIFT_PROBE_TIMEOUT:-300}"
 env_report_max="${CC_DRIFT_ENV_REPORT_MAX:-150}"
+[[ "$probe_timeout" =~ ^[1-9][0-9]*$ ]] || die "CC_DRIFT_PROBE_TIMEOUT must be a positive integer: $probe_timeout"
+[[ "$env_report_max" =~ ^[1-9][0-9]*$ ]] || die "CC_DRIFT_ENV_REPORT_MAX must be a positive integer: $env_report_max"
 
 command -v jq >/dev/null || die "jq not found"
 for f in tested-cc-version known-shared known-private known-env auth-status-logged-out.json; do
@@ -332,7 +334,8 @@ while IFS= read -r name; do
     # shellcheck disable=SC2053 # the entry is a glob pattern on purpose
     if [[ "$name" == ${env_patterns[i]} ]]; then
       matched="${env_classes[i]}"
-      break
+      # A scrub entry wins over a known one, whatever their order in the file.
+      [[ "$matched" == scrub ]] && break
     fi
   done
   case "$matched" in

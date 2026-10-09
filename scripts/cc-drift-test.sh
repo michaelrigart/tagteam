@@ -71,8 +71,9 @@ run_case() {
   [[ -z "$claude" ]] || args+=(--claude "$claude")
   rc=0
   env CC_DRIFT_PROBE_TIMEOUT=30 "$@" "$drift" "${args[@]}" >"$work/$case_name.out" 2>&1 || rc=$?
+  names=""
   # shellcheck disable=SC2016 # the backticks are the report's, not a substitution
-  names="$(sed -n 's/^- `\([A-Z0-9_]*\)`$/\1/p' "$report" | tr '\n' ' ')"
+  [[ ! -f "$report" ]] || names="$(sed -n 's/^- `\([A-Z0-9_]*\)`$/\1/p' "$report" | tr '\n' ' ')"
   names="${names% }"
 }
 
@@ -135,6 +136,29 @@ printf 'maybe CLAUDE_CODE_TAGTEAM_FIXTURE_ONE\n' >>"$work/compat-bad/known-env"
 run_case bad-class "$work/native/bin/claude" CC_DRIFT_COMPAT_DIR="$work/compat-bad"
 expect_rc 2
 grep -q 'bad known-env entry' "$work/bad-class.out" || fail "not the known-env failure"
+
+# 7. A malformed override is a harness failure, not drift (exit 1).
+for bad in abc 0 -3; do
+  run_case "bad-max$bad" "$work/native/bin/claude" CC_DRIFT_ENV_REPORT_MAX="$bad"
+  expect_rc 2
+  grep -q 'CC_DRIFT_ENV_REPORT_MAX must be a positive integer' "$work/$case_name.out" ||
+    fail "not the override's failure"
+done
+run_case bad-timeout "$work/native/bin/claude" CC_DRIFT_PROBE_TIMEOUT=soon
+expect_rc 2
+grep -q 'CC_DRIFT_PROBE_TIMEOUT must be a positive integer' "$work/bad-timeout.out" ||
+  fail "not the timeout's failure"
+
+# 8. A known glob listed before the scrub block does not unscrub a name: scrub wins whatever
+#    the order, so the build's only scrub name still counts and nothing drifts.
+fake_claude "$work/oauth/claude" 'x("CLAUDE_CODE_OAUTH_TOKEN");\n'
+cp -R "$compat" "$work/compat-order"
+{
+  echo 'known CLAUDE_CODE_OAUTH_*'
+  cat "$compat/known-env"
+} >"$work/compat-order/known-env"
+run_case scrub-wins "$work/oauth/claude" CC_DRIFT_COMPAT_DIR="$work/compat-order"
+expect_rc 0
 
 if ((failed)); then
   exit 1

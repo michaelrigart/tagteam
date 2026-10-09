@@ -186,3 +186,21 @@ fn every_known_name_is_one_the_drift_job_meets_and_none_is_scrubbed() {
         );
     }
 }
+
+/// The known patterns of `text` that match a literal scrub name.
+fn known_over_scrub(text: &str) -> Vec<&str> {
+    known_env(text)
+        .unwrap()
+        .into_iter()
+        .filter(|(class, _)| *class == Class::Known)
+        .map(|(_, name)| name)
+        .filter(|k| CC_SCRUB.iter().any(|s| entry_matches(k, s)))
+        .collect()
+}
+
+#[test]
+fn no_known_pattern_matches_a_scrub_name() {
+    assert_eq!(known_over_scrub(KNOWN_ENV), Vec::<&str>::new());
+    let widened = format!("known CLAUDE_CODE_OAUTH_*\n{KNOWN_ENV}");
+    assert_eq!(known_over_scrub(&widened), ["CLAUDE_CODE_OAUTH_*"]);
+}
