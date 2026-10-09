@@ -7,6 +7,7 @@
 //! cancel token (`catch_signals`); every wait here is a cancellation point, so a signal unwinds
 //! the run through that same cleanup.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read as _, Write as _};
@@ -337,9 +338,9 @@ fn end_group(child: &mut Child) -> bool {
 }
 
 /// Waits for `child`, an interactive process that shares the harness's terminal and process
-/// group (`ssh -t`), as a cancellation point: a signal recorded in `token` sends it SIGTERM
-/// alone (its group is the harness's own), SIGKILL after the grace period, reaps it, and
-/// returns `interrupted`, so the caller unwinds through its cleanup.
+/// group (`ssh -t`, `claude`, `cargo`), as a cancellation point: a signal recorded in `token`
+/// ends the child and everything it started (`end_tree`), reaps it, and returns `interrupted`,
+/// so the caller unwinds through its cleanup. A survivor is a harness error, not a silent one.
 pub fn wait_interactive(child: &mut Child, token: &Cancel) -> Result<ExitStatus, HarnessError> {
     loop {
         if let Some(status) = child
@@ -349,15 +350,130 @@ pub fn wait_interactive(child: &mut Child, token: &Cancel) -> Result<ExitStatus,
             return Ok(status);
         }
         if let Some(n) = token.requested() {
-            signal(child.id(), "TERM", false);
-            if !settle(GRACE, || reaped(child)) {
-                signal(child.id(), "KILL", false);
-                let _ = child.wait();
-            }
+            end_tree(child)?;
             return Err(interrupted(n));
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Passes `end_tree` makes: SIGTERM, then SIGKILL until nothing of the tree is left.
+const TREE_PASSES: u32 = 5;
+
+/// `(pid, parent, zombie)` for every process, from `ps -A -o pid=,ppid=,stat=`.
+fn process_table() -> io::Result<Vec<(u32, u32, bool)>> {
+    let out = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,stat="])
+        .env_clear()
+        .env("PATH", "/bin:/usr/bin")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other("ps failed"));
+    }
+    Ok(parse_process_table(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_process_table(out: &str) -> Vec<(u32, u32, bool)> {
+    out.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let (pid, ppid) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?);
+            Some((pid, ppid, f.next().is_some_and(|s| s.starts_with('Z'))))
+        })
+        .collect()
+}
+
+/// Every process in `table` that descends from one of `roots`, the roots that are in it too.
+fn tree_of(table: &[(u32, u32, bool)], roots: &BTreeSet<u32>) -> BTreeSet<u32> {
+    let mut tree: BTreeSet<u32> = table
+        .iter()
+        .filter(|(pid, _, _)| roots.contains(pid))
+        .map(|(pid, _, _)| *pid)
+        .collect();
+    loop {
+        let before = tree.len();
+        let more: Vec<u32> = table
+            .iter()
+            .filter(|(_, ppid, _)| tree.contains(ppid))
+            .map(|(pid, _, _)| *pid)
+            .collect();
+        tree.extend(more);
+        if tree.len() == before {
+            return tree;
+        }
+    }
+}
+
+/// Ends `child` and every process it started, none of which has a process group of its own to
+/// signal. The tree is listed before anything is signalled, and listed again on every pass from
+/// what was seen, so a descendant its parent's death re-parented is still found. Each member is
+/// signalled alone (never the harness, never a group): SIGTERM, a short grace while the direct
+/// child is reaped, then SIGKILL, up to `TREE_PASSES`. A survivor is an error.
+fn end_tree(child: &mut Child) -> Result<(), HarnessError> {
+    let me = std::process::id();
+    let mut seen: BTreeSet<u32> = BTreeSet::from([child.id()]);
+    let mut left = 0;
+    for pass in 0..TREE_PASSES {
+        let table = match process_table() {
+            Ok(table) => table,
+            Err(e) => {
+                // Without a listing only the direct child can be ended.
+                signal(child.id(), "KILL", false);
+                let _ = child.wait();
+                return Err(harness(format!(
+                    "could not list processes ({e}), so only the interrupted command itself was ended"
+                )));
+            }
+        };
+        let _ = child.try_wait();
+        let live: Vec<u32> = tree_of(&table, &seen)
+            .into_iter()
+            .filter(|pid| *pid != me)
+            .filter(|pid| {
+                // A zombie holds nothing: the direct child is reaped just above, and any other
+                // is its dead parent's to reap, or init's.
+                !table.iter().any(|(p, _, zombie)| p == pid && *zombie)
+            })
+            .collect();
+        if live.is_empty() {
+            return Ok(());
+        }
+        seen.extend(&live);
+        let how = if pass == 0 { "TERM" } else { "KILL" };
+        for pid in &live {
+            signal(*pid, how, false);
+        }
+        let grace = if pass == 0 {
+            GRACE
+        } else {
+            Duration::from_millis(500)
+        };
+        settle(grace, || {
+            let _ = child.try_wait();
+            process_table().is_ok_and(|t| {
+                tree_of(&t, &seen)
+                    .iter()
+                    .all(|pid| t.iter().any(|(p, _, z)| p == pid && *z))
+            })
+        });
+        left = live.len();
+    }
+    // The last pass's KILL had its grace: whatever still lists is a survivor.
+    let table = process_table().unwrap_or_default();
+    let survivors = tree_of(&table, &seen)
+        .into_iter()
+        .filter(|pid| !table.iter().any(|(p, _, z)| p == pid && *z))
+        .count();
+    let _ = child.try_wait();
+    if survivors == 0 {
+        return Ok(());
+    }
+    Err(harness(format!(
+        "{survivors} process(es) of the interrupted command survived SIGKILL (of {left} signalled)"
+    )))
 }
 
 /// The children whose group SIGKILL left non-empty (`Proc`'s drop), for `quiesce`. Each is kept
@@ -828,6 +944,53 @@ mod tests {
             .unwrap();
         assert!(!process_alive(pid), "the child was ended and reaped");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_interactive_wait_ends_the_whole_tree() {
+        let _serial = serial();
+        let dir = std::env::temp_dir().join(format!("xtask-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!(
+            "sleep 30 & echo $! > '{d}/one'; sleep 31 & echo $! > '{d}/two'; wait",
+            d = dir.display()
+        );
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .spawn()
+            .unwrap();
+        let token = Cancel::new();
+        let later = token.clone();
+        let signaller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            later.request(SIGTERM);
+        });
+        let t = Instant::now();
+        let err = wait_interactive(&mut child, &token).unwrap_err();
+        signaller.join().unwrap();
+        assert_eq!(err, interrupted(SIGTERM));
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(reaped(&mut child));
+        for name in ["one", "two"] {
+            let pid: u32 = std::fs::read_to_string(dir.join(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(!process_alive(pid), "{name} ({pid}) outlived the cancel");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_process_listing_is_parsed_into_a_tree() {
+        let table = parse_process_table(
+            "  1     0 Ss\n 10     1 S\n 11    10 S+\n 12    10 Z\n 99    98 S\n",
+        );
+        let tree = tree_of(&table, &BTreeSet::from([10]));
+        assert_eq!(tree, BTreeSet::from([10, 11, 12]));
+        assert!(table.contains(&(12, 10, true)));
+        assert!(tree_of(&table, &BTreeSet::from([4242])).is_empty());
     }
 
     #[test]
