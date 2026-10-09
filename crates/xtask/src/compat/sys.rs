@@ -266,7 +266,7 @@ impl Ran {
     }
 }
 
-fn drain(pipe: Option<impl io::Read + Send + 'static>) -> Receiver<Vec<u8>> {
+pub fn drain(pipe: Option<impl io::Read + Send + 'static>) -> Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut buf = Vec::new();
@@ -693,15 +693,17 @@ impl Cmd {
     }
 
     /// With the terminal attached and no deadline, for the steps a person answers (`compat
-    /// login`). It stays in the terminal's process group, so Ctrl-C reaches it.
+    /// login`). It stays in the terminal's process group, so Ctrl-C reaches it. A cancellation
+    /// point (`wait_interactive`): a signal recorded in the token ends it and returns
+    /// `interrupted`, so the run unwinds instead of waiting on the person.
     pub fn attached(self, roots: &Roots) -> Result<Option<i32>, HarnessError> {
         self.not_cancelled()?;
         roots.check_env(&self.vars)?;
-        let status = self
+        let mut child = self
             .command(&self.program, &self.args)
-            .status()
+            .spawn()
             .map_err(|e| harness(format!("could not start {}: {e}", self.describe())))?;
-        Ok(status.code())
+        Ok(wait_interactive(&mut child, &self.cancel)?.code())
     }
 
     /// In a pseudo-terminal of 120 by 40 that `script` makes, so `claude` runs its interactive
@@ -797,6 +799,35 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
         assert!(reaped(&mut child), "the child was reaped");
         assert!(!process_alive(pid));
+    }
+
+    #[test]
+    fn a_cancelled_attached_command_is_ended_and_reaped() {
+        let _serial = serial();
+        let dir = std::env::temp_dir().join(format!("xtask-attached-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let token = Cancel::new();
+        let later = token.clone();
+        let signaller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            later.request(SIGTERM);
+        });
+        let t = Instant::now();
+        let err = sh(&format!("echo $$ > '{}'; exec sleep 30", pidfile.display()))
+            .cancel(&token)
+            .attached(&test_roots())
+            .unwrap_err();
+        signaller.join().unwrap();
+        assert_eq!(err, interrupted(SIGTERM));
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!process_alive(pid), "the child was ended and reaped");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

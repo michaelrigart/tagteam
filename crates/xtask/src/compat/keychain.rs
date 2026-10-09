@@ -20,7 +20,9 @@ use super::sys::{HarnessError, harness};
 pub const SECURITY: &str = "/usr/bin/security";
 pub const LOGIN_KEYCHAIN: &str = "Library/Keychains/login.keychain-db";
 
-/// `security <args>`; its exit code and standard output.
+/// `security <args>`; its exit code and standard output. Not a cancellation point: these are
+/// short probes and the restoration steps (`delete-keychain`, `list-keychains -s`, `lock-keychain`)
+/// that must still run after a cancel, and none asks the person for anything.
 fn security(args: &[&str]) -> Result<(i32, String), HarnessError> {
     let out = Command::new(SECURITY)
         .args(args)
@@ -34,7 +36,8 @@ fn security(args: &[&str]) -> Result<(i32, String), HarnessError> {
 }
 
 /// `security -i` with `line` on its standard input, so a password never reaches an argument
-/// list that `ps` shows.
+/// list that `ps` shows. Not a cancellation point, for `security`'s reasons: the password is
+/// supplied, so nothing waits on a person.
 fn security_line(line: &str) -> Result<(), HarnessError> {
     let mut child = Command::new(SECURITY)
         .arg("-i")

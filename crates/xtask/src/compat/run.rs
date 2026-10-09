@@ -28,7 +28,8 @@ use super::registry::{Flags, Phase, select};
 use super::report::{CheckResult, EXIT_HARNESS, Evidence, Outcome, Report};
 use super::store;
 use super::sys::{
-    CAUGHT, HarnessError, Ran, cancel, catch_signals, harness, interrupted, quiesce, tail, which_in,
+    CAUGHT, HarnessError, Ran, cancel, catch_signals, drain, harness, interrupted, quiesce, tail,
+    wait_interactive, which_in,
 };
 use super::version::{CcVersion, blessed};
 
@@ -61,7 +62,9 @@ fn note(label: &str, value: Value) -> Evidence {
 /// name a stale build without `test-support`, which ignores `TAGTEAM_TEST_VAULT_KEYCHAIN`.
 pub fn build_tagteam(workspace: &Path) -> Result<PathBuf, HarnessError> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let out = Command::new(cargo)
+    // Unbounded in time, so a cancellation point (`wait_interactive`): cargo shares the
+    // harness's group and terminal, and a signal ends it before the run starts anything.
+    let mut child = Command::new(cargo)
         .args([
             "build",
             "--quiet",
@@ -74,14 +77,20 @@ pub fn build_tagteam(workspace: &Path) -> Result<PathBuf, HarnessError> {
         .current_dir(workspace)
         .stdin(Stdio::null())
         .stderr(Stdio::inherit())
-        .output()
+        .stdout(Stdio::piped())
+        .spawn()
         .map_err(|e| harness(format!("could not run cargo: {e}")))?;
-    if !out.status.success() {
+    let stdout = drain(child.stdout.take());
+    let status = wait_interactive(&mut child, cancel())?;
+    let stdout = stdout
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_default();
+    if !status.success() {
         return Err(harness(
             "cargo build -p tagteam --features test-support failed",
         ));
     }
-    tagteam_executable(&String::from_utf8_lossy(&out.stdout)).ok_or_else(|| {
+    tagteam_executable(&String::from_utf8_lossy(&stdout)).ok_or_else(|| {
         harness("cargo build reported no executable for the tagteam binary; refusing to guess one")
     })
 }

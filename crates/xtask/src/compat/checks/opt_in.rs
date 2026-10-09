@@ -143,6 +143,7 @@ impl LoginKeychain for Login {
     }
 
     fn lock(&self) -> Result<(), HarnessError> {
+        // Bounded (`lock-keychain` asks for nothing), so not a cancellation point.
         let locked = Command::new(SECURITY)
             .arg("lock-keychain")
             .arg(&self.0)
@@ -155,6 +156,8 @@ impl LoginKeychain for Login {
     }
 
     fn unlock(&self) -> Result<(), HarnessError> {
+        // Restoration: it asks for the password and must run after a cancel too, so it is
+        // deliberately not a cancellation point.
         eprintln!("cargo xtask compat: unlocking your login keychain.");
         let unlocked = Command::new(SECURITY)
             .arg("unlock-keychain")
