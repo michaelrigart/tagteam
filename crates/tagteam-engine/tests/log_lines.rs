@@ -478,8 +478,11 @@ mod hooks {
         assert!(matches!(err, EngineError::RollbackFailed { .. }), "{err}");
         let found = at(&logs, "ERROR", "a switch was not fully rolled back");
         assert_eq!(found.len(), 1, "{logs:#?}");
+        // A count, never the entries (§14.2): each names a Keychain service or a file path,
+        // and an error's text.
+        assert_eq!(field(found[0], "failed"), Some("1"), "{}", found[0]);
         assert!(
-            found[0].contains("its journal row stays for recovery: restore the live credential"),
+            !found[0].contains("restore the live credential"),
             "{}",
             found[0]
         );
@@ -686,5 +689,545 @@ fn a_keychain_write_that_falls_back_is_logged_by_its_exit_status() {
     assert_eq!(line.len(), 1, "{logs:#?}");
     assert_eq!(field(line[0], "rc"), Some("25"), "{}", line[0]);
     assert!(logs.iter().all(|l| !l.contains("injected")), "{logs:#?}");
+    none_named(&logs);
+}
+
+#[test]
+fn a_replacement_whose_vault_write_and_rollback_both_fail_logs_the_rollback_by_kind() {
+    // §14, §14.2: `add` reports the vault write's error; the rollback's own failure is logged
+    // by its kind and the account's ID and position, never by an error text that may carry a
+    // label.
+    let _serial = one_at_a_time();
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.login("a@x.co", "rt-a2");
+    fx.kc
+        .set_unreadable(tagteam_engine::vault::SERVICE, a.as_str(), true);
+    let (added, logs) = capture_logs(|| fx.engine.add_live(fx.add_options()));
+    assert!(added.is_err());
+    let line = at(&logs, "WARN", "could not roll back a replacement");
+    assert_eq!(line.len(), 1, "{logs:#?}");
+    assert_eq!(
+        [
+            field(line[0], "account"),
+            field(line[0], "position"),
+            field(line[0], "kind")
+        ],
+        [Some(a.as_str()), Some("1"), Some("\"unreadable\"")],
+        "{}",
+        line[0]
+    );
+    no_email(&logs);
+}
+
+#[test]
+fn purge_logs_no_path_of_an_orphaned_profile_or_of_the_data_directory() {
+    // §14.2: the data directory sits under a name the user chose, and an entry of `sessions/`
+    // may carry any name. Purge's lines name an entry by its account's ID when its name is one
+    // tagteam makes, and otherwise as an unrecognized entry: never a path. A provider is named
+    // only when this build registers it: a marker or a row may say anything.
+    let _serial = one_at_a_time();
+    let fx = Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
+        e.xdg_data_home = Some(e.home.join("alice@example.com/data"));
+    });
+    let a = fx.add("a@x.co", "rt-a");
+    let sessions = fx.env.data_dir().join("sessions");
+    assert!(sessions.to_string_lossy().contains("alice@example.com"));
+    let unrecognized = sessions.join("bob@example.com");
+    fx.write_marker(
+        &unrecognized,
+        &AccountId::from_string("bob@example.com"),
+        &fx.env,
+    );
+    let gone = uuid::Uuid::now_v7().to_string();
+    let recognized = sessions.join(&gone);
+    fx.write_marker(&recognized, &AccountId::from_string(gone.as_str()), &fx.env);
+    let foreign = AccountId::from_string(uuid::Uuid::now_v7().to_string().as_str());
+    mark(
+        &sessions.join(foreign.as_str()),
+        "alice@example.com",
+        &foreign,
+    );
+    // An account whose row names that provider, with its profile, and a switch of it whose
+    // holder died.
+    let alien = ProviderId::new("alice@example.com");
+    let ghost = common::add(
+        &fx.engine.store().unwrap(),
+        &alien,
+        &uuid::Uuid::now_v7().to_string(),
+        "g@x.co",
+        1,
+    );
+    fx.put_vault(&ghost, b"a credential only its provider can read");
+    mark(&fx.profile_dir(&ghost), alien.as_str(), &ghost);
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_journal(&tagteam_engine::store::JournalRow {
+            provider: alien.clone(),
+            holder: common::dead_holder(),
+            from_id: None,
+            to_id: ghost.clone(),
+            from_fp: None,
+            from_identity: None,
+            to_fp: "sha256:00".into(),
+            to_epoch: None,
+            started_at: 1,
+            prior: None,
+        })
+        .unwrap();
+    // A dangling entry: no marker, and no path to resolve.
+    std::os::unix::fs::symlink(sessions.join("nowhere"), sessions.join("carol@example.com"))
+        .unwrap();
+    // A session record that cannot be read makes the first purge refuse, with its warning,
+    // after the guard dealt with the dead switch.
+    let record = fx.live_record(&unrecognized, 778, "interactive");
+    std::fs::write(&record, "{\"pid\": ").unwrap();
+    let plan = fx.engine.purge_plan(None).unwrap();
+    let (refused, logs) = capture_logs(|| fx.engine.purge(&plan));
+    assert_eq!(refused.unwrap_err().kind(), "session-owned");
+    assert_eq!(
+        at(
+            &logs,
+            "WARN",
+            "of an unrecognized profile entry could not be read"
+        )
+        .len(),
+        1,
+        "{logs:#?}"
+    );
+    let unrecovered = at(&logs, "WARN", "could not recover an interrupted switch");
+    assert_eq!(unrecovered.len(), 1, "{logs:#?}");
+    assert_eq!(
+        [
+            field(unrecovered[0], "provider"),
+            field(unrecovered[0], "kind")
+        ],
+        [None, Some("\"unknown-provider\"")],
+        "{logs:#?}"
+    );
+    // The refused purge deleted nothing: the record goes only once nothing refuses.
+    assert!(
+        at(
+            &logs,
+            "WARN",
+            "purge deleted an interrupted switch's record"
+        )
+        .is_empty(),
+        "{logs:#?}"
+    );
+    let mut all = logs;
+    std::fs::remove_file(&record).unwrap();
+    let plan = fx.engine.purge_plan(None).unwrap();
+    let (purged, logs) = capture_logs(|| fx.engine.purge(&plan));
+    assert!(purged.unwrap().failures.is_empty());
+    let dropped = at(
+        &logs,
+        "WARN",
+        "purge deleted an interrupted switch's record",
+    );
+    assert_eq!(dropped.len(), 1, "{logs:#?}");
+    assert_eq!(field(dropped[0], "provider"), None, "{logs:#?}");
+    assert_eq!(
+        at(&logs, "INFO", "deleted an unrecognized profile entry").len(),
+        2,
+        "{logs:#?}"
+    );
+    one(
+        &logs,
+        &format!("deleted the orphaned profile of account {gone}"),
+    );
+    one(
+        &logs,
+        &format!("deleted the orphaned profile of account {foreign}"),
+    );
+    assert_eq!(
+        at(
+            &logs,
+            "WARN",
+            "names a provider this build does not register"
+        )
+        .len(),
+        1,
+        "{logs:#?}"
+    );
+    assert_eq!(
+        at(
+            &logs,
+            "WARN",
+            "purged the session profile of an account whose provider this build does not register"
+        )
+        .len(),
+        1,
+        "{logs:#?}"
+    );
+    // Each account's line and its `remove` event name the provider only when it is registered.
+    for (id, provider) in [(&a, Some(CLAUDE_CODE)), (&ghost, None)] {
+        let account = at(&logs, "INFO", "purged an account")
+            .into_iter()
+            .filter(|l| field(l, "account") == Some(id.as_str()))
+            .collect::<Vec<_>>();
+        let event = at(&logs, "INFO", "event recorded")
+            .into_iter()
+            .filter(|l| field(l, "from_account") == Some(id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!((account.len(), event.len()), (1, 1), "{logs:#?}");
+        assert_eq!(field(account[0], "provider"), provider, "{logs:#?}");
+        assert_eq!(field(event[0], "provider"), provider, "{logs:#?}");
+    }
+    assert_eq!(
+        at(
+            &logs,
+            "WARN",
+            "an unrecognized profile entry has no readable marker"
+        )
+        .len(),
+        1,
+        "{logs:#?}"
+    );
+    all.extend(logs);
+    for name in ["alice@example.com", "bob@example.com", "carol@example.com"] {
+        assert!(all.iter().all(|l| !l.contains(name)), "{name} in {all:#?}");
+    }
+    no_email(&all);
+}
+
+/// Writes a profile marker into `dir`, created if absent, that names `provider` whatever this
+/// build registers: a marker's provider may be any text.
+fn mark(dir: &std::path::Path, provider: &str, id: &AccountId) {
+    tagteam_provider::profile::ProfileMarker {
+        provider: ProviderId::new(provider),
+        account_id: id.clone(),
+        config_dir: dir.display().to_string(),
+        outer: json!({}),
+    }
+    .write(dir)
+    .unwrap();
+}
+
+#[test]
+fn a_profile_whose_state_cannot_be_read_is_logged_by_a_fixed_phrase() {
+    // §14.2: what could not be read is named by the profile's path, under a data directory the
+    // user may have named, and may quote the file. The lines say it in a fixed phrase.
+    let _serial = one_at_a_time();
+    let fx = Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
+        e.xdg_data_home = Some(e.home.join("alice@example.com/data"));
+    });
+    let s = fx.add("s@x.co", "rt-s");
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    fx.expire_access(&a);
+    // `remove` refuses an account whose session record does not parse.
+    let profile = fx.make_profile(&s);
+    let record = fx.live_record(&profile, 778, "interactive");
+    std::fs::write(&record, r#"{"pid": "bob@example.com"}"#).unwrap();
+    let (removed, mut logs) = capture_logs(|| fx.engine.remove(&s));
+    assert_eq!(removed.unwrap_err().kind(), "session-owned");
+    assert_eq!(
+        at(
+            &logs,
+            "WARN",
+            "a session reservation or record could not be read; the account counts as session-owned"
+        )
+        .len(),
+        1,
+        "{logs:#?}"
+    );
+    // The gate sends nothing for an account whose profile's seed does not parse.
+    let dir = common::quiescent(&fx, &a, "rt-a", &fx.vault_bytes(&a).unwrap());
+    std::fs::write(
+        dir.join(tagteam_provider::profile::SEED_FILE),
+        r#"{"login_epoch": "bob@example.com"}"#,
+    )
+    .unwrap();
+    let snapshot = fx.vault_bytes(&a).unwrap();
+    let (gated, more) = capture_logs(|| {
+        fx.engine
+            .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
+            .unwrap()
+    });
+    assert!(
+        matches!(&gated, tagteam_engine::refresh::GateOutcome::Transient { kind, .. } if kind == "profile-unreadable"),
+        "{gated:?}"
+    );
+    assert_eq!(
+        at(
+            &more,
+            "WARN",
+            "the session profile could not be read; nothing is sent"
+        )
+        .len(),
+        1,
+        "{more:#?}"
+    );
+    logs.extend(more);
+    for name in ["alice@example.com", "bob@example.com"] {
+        assert!(
+            logs.iter().all(|l| !l.contains(name)),
+            "{name} in {logs:#?}"
+        );
+    }
+    no_email(&logs);
+}
+
+#[test]
+fn an_automatic_target_that_cannot_be_freshened_is_logged_by_a_fixed_phrase() {
+    // §14.2, as above: freshening passes over a target whose pending rescue or profile cannot
+    // be read, and its line names neither the file nor what the file says.
+    let _serial = one_at_a_time();
+    let rescue: fn(&Fx, &AccountId) = |fx, a| {
+        let path = fx.plant_rescue(a, &vault_fp(fx, a), &common::credential("a@x.co", "rt-a2"));
+        std::fs::write(path, r#"{"format": "bob@example.com"}"#).unwrap();
+    };
+    let seed: fn(&Fx, &AccountId) = |fx, a| {
+        let dir = common::quiescent(fx, a, "rt-a", &common::credential("a@x.co", "rt-a2"));
+        std::fs::write(
+            dir.join(tagteam_provider::profile::SEED_FILE),
+            r#"{"login_epoch": "bob@example.com"}"#,
+        )
+        .unwrap();
+    };
+    for (break_it, message) in [
+        (
+            rescue,
+            "a pending rescue could not be settled; the target is passed over",
+        ),
+        (
+            seed,
+            "the session profile could not be read; the target is passed over",
+        ),
+    ] {
+        let fx = Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
+            e.xdg_data_home = Some(e.home.join("alice@example.com/data"));
+        });
+        let a = fx.add("a@x.co", "rt-a");
+        let c = fx.add("c@x.co", "rt-c"); // live, at its limit
+        reading(&fx, &a, 10.0, 20.0);
+        reading(&fx, &c, 100.0, 50.0);
+        break_it(&fx, &a);
+        let mut engine = fx
+            .engine
+            .auto(&fx.provider(), auto_config(&fx), false)
+            .unwrap()
+            .unwrap();
+        let sink = common::Recorded::default();
+        let (_, logs) = capture_logs(|| engine.tick(&sink).unwrap());
+        assert_eq!(at(&logs, "WARN", message).len(), 1, "{logs:#?}");
+        for name in ["alice@example.com", "bob@example.com"] {
+            assert!(
+                logs.iter().all(|l| !l.contains(name)),
+                "{name} in {logs:#?}"
+            );
+        }
+        no_email(&logs);
+    }
+}
+
+/// A decision-grade reading of `short` and `long` percent in Claude Code's windows, taken at
+/// the fixture clock's start with its next poll five minutes out, as `auto_tick.rs` records.
+fn reading(fx: &Fx, id: &AccountId, short: f64, long: f64) {
+    use tagteam_core::WindowKind::{Long, Short};
+    let t0 = fx.clock.now_ms() / 1000;
+    let windows = [
+        common::usage_window("5h", Short, short, t0 + 9_630),
+        common::usage_window("7d", Long, long, t0 + 291_630),
+    ];
+    common::record_reading(&fx.engine, id, &windows, t0, t0 + 300);
+}
+
+/// `auto_tick.rs`'s configuration: switch at 90%, the best strategy.
+fn auto_config(fx: &Fx) -> tagteam_core::autoswitch::AutoConfig {
+    use tagteam_provider::Provider;
+    tagteam_core::autoswitch::AutoConfig {
+        threshold: 90.0,
+        hysteresis_pct: 10.0,
+        cooldown_s: 300,
+        interval_s: 60,
+        unhealthy_ticks: 3,
+        strategy: tagteam_core::autoswitch::Strategy::Best,
+        include_api_key_accounts: false,
+        models: Vec::new(),
+        long_window: fx.cc.primary_long_window().map(str::to_owned),
+    }
+}
+
+#[test]
+fn remove_logs_a_profile_whose_marker_cannot_be_read_by_a_fixed_phrase() {
+    // §14.2: a marker that does not parse is named by its path in its read error, under a data
+    // directory the user may have named. `remove` says why it falls back in a fixed phrase.
+    let _serial = one_at_a_time();
+    let fx = named_home();
+    let a = fx.add("a@x.co", "rt-a");
+    let c = fx.add("c@x.co", "rt-c");
+    fx.add("b@x.co", "rt-b");
+    let profile = fx.make_profile(&a);
+    std::fs::write(
+        profile.join(".tagteam-profile.json"),
+        r#"{"provider": "bob@example.com""#,
+    )
+    .unwrap();
+    let (removed, mut logs) = capture_logs(|| fx.engine.remove(&a));
+    removed.unwrap();
+    assert_eq!(
+        at(
+            &logs,
+            "WARN",
+            "the session profile's marker could not be read (it cannot be read); deleting its Keychain item under its current spelling"
+        )
+        .len(),
+        1,
+        "{logs:#?}"
+    );
+    // A profile that is a link to nowhere: no marker, and no path to resolve.
+    std::os::unix::fs::symlink(fx.env.home.join("bob@example.com/gone"), fx.profile_dir(&c))
+        .unwrap();
+    let (removed, more) = capture_logs(|| fx.engine.remove(&c));
+    removed.unwrap();
+    assert_eq!(
+        at(
+            &more,
+            "WARN",
+            "the session profile's marker could not be read (it has none) and its path does not resolve"
+        )
+        .len(),
+        1,
+        "{more:#?}"
+    );
+    logs.extend(more);
+    none_named(&logs);
+}
+
+#[test]
+fn a_new_account_whose_vault_entry_cannot_be_removed_is_logged_by_a_fixed_phrase() {
+    // §14.2: a vault error carries the Keychain's message; the line names the account by ID.
+    let _serial = one_at_a_time();
+    let fx = named_home();
+    fx.login("a@x.co", "rt-a");
+    fx.kc.set_fail_write(tagteam_engine::vault::SERVICE, true);
+    fx.kc.set_fail_delete(tagteam_engine::vault::SERVICE, true);
+    let (added, logs) = capture_logs(|| fx.engine.add_live(fx.add_options()));
+    assert!(added.is_err());
+    let line = at(
+        &logs,
+        "ERROR",
+        "could not remove the vault entry of an account that was never added",
+    );
+    assert_eq!(line.len(), 1, "{logs:#?}");
+    assert!(logs.iter().all(|l| !l.contains("injected")), "{logs:#?}");
+    none_named(&logs);
+}
+
+#[test]
+fn a_refreshed_token_that_cannot_be_stored_is_logged_by_kind() {
+    // §14.2: the gate's errors are named by `kind()`, the loss by a fixed phrase; neither by an
+    // error's text, which may carry the Keychain's message or a path.
+    let _serial = one_at_a_time();
+    let fx = named_home();
+    let a = due(&fx);
+    let snapshot = fx.vault_bytes(&a).unwrap();
+    fx.script_refresh(Some("rt-a2"));
+    fx.kc.set_fail_write(tagteam_engine::vault::SERVICE, true);
+    common::block_rescue(&fx);
+    let (gated, logs) = capture_logs(|| {
+        fx.engine
+            .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
+            .unwrap()
+    });
+    common::unblock_rescue(&fx);
+    assert!(
+        matches!(gated, tagteam_engine::refresh::GateOutcome::Unpersisted),
+        "{gated:?}"
+    );
+    for message in [
+        "the vault could not store a refreshed token",
+        "neither the vault nor rescue/ could store a refreshed token",
+    ] {
+        let line = at(&logs, "ERROR", message);
+        assert_eq!(line.len(), 1, "{logs:#?}");
+        assert!(field(line[0], "kind").is_some(), "{}", line[0]);
+    }
+    let lost = at(&logs, "ERROR", "a refreshed token was lost");
+    assert_eq!(lost.len(), 1, "{logs:#?}");
+    assert!(
+        lost[0].contains(r#"cause="neither the vault nor rescue/ could store it""#),
+        "{}",
+        lost[0]
+    );
+    assert!(logs.iter().all(|l| !l.contains("injected")), "{logs:#?}");
+    none_named(&logs);
+}
+
+#[test]
+fn an_adopted_rescue_that_cannot_be_deleted_is_logged_by_kind() {
+    // §14.2: the delete's error is named by `kind()`, never by a text that may name its path.
+    let _serial = one_at_a_time();
+    let fx = named_home();
+    let a = due(&fx);
+    fx.plant_rescue(
+        &a,
+        &vault_fp(&fx, &a),
+        &common::credential("a@x.co", "rt-a2"),
+    );
+    common::block_rescue(&fx);
+    let snapshot = fx.vault_bytes(&a).unwrap();
+    let (_, logs) = capture_logs(|| {
+        fx.engine
+            .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
+            .unwrap()
+    });
+    common::unblock_rescue(&fx);
+    let line = at(&logs, "WARN", "an adopted rescue file could not be deleted");
+    assert_eq!(line.len(), 1, "{logs:#?}");
+    assert_eq!(field(line[0], "kind"), Some("\"io\""), "{}", line[0]);
+    none_named(&logs);
+}
+
+#[test]
+fn a_live_identity_cache_that_cannot_be_written_is_logged_by_its_sqlite_code() {
+    // §14.2: the store's error is SQLite's message, which can be the database's own text (here
+    // a trigger's); the status bar's DEBUG line gives SQLite's result code instead.
+    let _serial = one_at_a_time();
+    let fx = named_home();
+    fx.add("a@x.co", "rt-a");
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER no_cache BEFORE INSERT ON live_identity_cache \
+               BEGIN SELECT RAISE(ABORT, 'the cache is read-only for bob@example.com'); END;",
+        )
+        .unwrap();
+    let (view, logs) = capture_logs(|| fx.engine.statusline(&fx.provider()).unwrap());
+    assert!(matches!(view, StatuslineView::Managed { .. }), "{view:?}");
+    let line = at(&logs, "DEBUG", "the live identity cache was not written");
+    assert_eq!(line.len(), 1, "{logs:#?}");
+    assert_eq!(
+        field(line[0], "code"),
+        Some("ConstraintViolation"),
+        "{}",
+        line[0]
+    );
+    none_named(&logs);
+}
+
+#[test]
+fn a_marker_whose_outer_home_cannot_be_applied_is_logged_by_a_fixed_phrase() {
+    // §14: link sync falls back to tagteam's own environment, and says so once. §14.2: the
+    // provider's error is not logged, and nothing names the user's data directory.
+    let _serial = one_at_a_time();
+    let fx = named_home();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b");
+    let profile = fx.make_profile(&a);
+    // The account's own marker, whose outer record names no home Claude Code can restore.
+    mark(&profile, CLAUDE_CODE, &a);
+    let (_removed, logs) = capture_logs(|| fx.engine.remove(&a));
+    let line = at(
+        &logs,
+        "WARN",
+        "the outer home a profile's marker records could not be applied; the profile is judged by tagteam's own environment",
+    );
+    assert_eq!(line.len(), 1, "{logs:#?}");
+    assert_eq!(field(line[0], "account"), Some(a.as_str()), "{}", line[0]);
+    assert!(!line[0].contains("outer record"), "{}", line[0]);
     none_named(&logs);
 }

@@ -61,16 +61,19 @@ impl Engine {
         reason: Option<&str>,
         source: &str,
     ) -> Result<(), EngineError> {
-        self.store()?.insert_event(&EventRow {
-            at: self.now_ms(),
-            provider: row.provider.clone(),
-            kind: kind.into(),
-            from_id: None,
-            to_id: Some(row.id.clone()),
-            trigger: None,
-            source: source.into(),
-            detail: reason.map(|r| json!({"reason": r})),
-        })?;
+        self.store()?.insert_event(
+            &EventRow {
+                at: self.now_ms(),
+                provider: row.provider.clone(),
+                kind: kind.into(),
+                from_id: None,
+                to_id: Some(row.id.clone()),
+                trigger: None,
+                source: source.into(),
+                detail: reason.map(|r| json!({"reason": r})),
+            },
+            self.registered_id(&row.provider).is_some(),
+        )?;
         Ok(())
     }
 

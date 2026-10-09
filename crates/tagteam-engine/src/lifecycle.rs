@@ -199,16 +199,19 @@ impl Engine {
         from: Option<&AccountId>,
         to: Option<&AccountId>,
     ) -> Result<(), EngineError> {
-        self.store()?.insert_event(&EventRow {
-            at: self.now_ms(),
-            provider: provider.clone(),
-            kind: kind.to_owned(),
-            from_id: from.cloned(),
-            to_id: to.cloned(),
-            trigger: None,
-            source: "cli".into(),
-            detail: None,
-        })?;
+        self.store()?.insert_event(
+            &EventRow {
+                at: self.now_ms(),
+                provider: provider.clone(),
+                kind: kind.to_owned(),
+                from_id: from.cloned(),
+                to_id: to.cloned(),
+                trigger: None,
+                source: "cli".into(),
+                detail: None,
+            },
+            self.registered_id(provider).is_some(),
+        )?;
         Ok(())
     }
 
@@ -283,7 +286,9 @@ impl Engine {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        let current_spelling = |why: String| -> Option<String> {
+        // `why` is a fixed phrase (§14.2): a marker's read error names its path, under a data
+        // directory the user may have named, and may quote the file.
+        let current_spelling = |why: &str| -> Option<String> {
             match canonical_profile_path(&profile) {
                 Ok(canonical) => {
                     tracing::warn!(
@@ -309,9 +314,9 @@ impl Engine {
             {
                 Some(marker.config_dir)
             }
-            Read::Present(_) => current_spelling("it names another account".into()),
-            Read::Absent => current_spelling("it has none".into()),
-            Read::Unreadable(e) => current_spelling(e.to_string()),
+            Read::Present(_) => current_spelling("it names another account"),
+            Read::Absent => current_spelling("it has none"),
+            Read::Unreadable(_) => current_spelling("it cannot be read"),
         };
         if let Some(spelling) = spelling {
             p.delete_profile_credential(&self.env, &profile, &spelling)?;
@@ -460,9 +465,17 @@ impl Engine {
                     // The write never landed: reconcile in process rather than leaving the
                     // marker dangling for the next lock holder to find (Task 18's review,
                     // item 6). `reconcile_replacement` reads the vault fresh, sees it still
-                    // holds the old generation, and rolls the marker back; a failure here is
-                    // swallowed since the next lock acquisition retries it regardless.
-                    let _ = self.reconcile_replacement(lock_for(&row.id));
+                    // holds the old generation, and rolls the marker back. A failure here is
+                    // logged, by its kind (§14.2), and not returned: the write's error is the
+                    // one to report, and the next lock acquisition retries the reconciliation.
+                    if let Err(r) = self.reconcile_replacement(lock_for(&row.id)) {
+                        tracing::warn!(
+                            account = %row.id,
+                            position = row.position,
+                            kind = r.kind(),
+                            "could not roll back a replacement whose vault write failed; the next command that locks the account retries"
+                        );
+                    }
                     return Err(e.into());
                 }
                 store.finish_replacement(&row.id, self.now_ms())?;
@@ -483,11 +496,12 @@ impl Engine {
                 if let Err(e) = self.vault.store(lock_for(&prep.id), secret, &fp) {
                     // The write may have landed and failed only its read-back. A new account
                     // has no earlier generation to keep, so whatever it left goes with the row:
-                    // no secret outlives its account (§5, L444).
-                    if let Err(cleanup) = self.vault.delete(lock_for(&prep.id)) {
+                    // no secret outlives its account (§5, L444). A failure is logged by a fixed
+                    // phrase (§14.2): a vault error carries the Keychain's message or a path.
+                    if self.vault.delete(lock_for(&prep.id)).is_err() {
                         tracing::error!(
                             account = %prep.id,
-                            "could not remove the vault entry of an account that was never added: {cleanup}"
+                            "could not remove the vault entry of an account that was never added"
                         );
                     }
                     store.delete_account(&prep.id)?;

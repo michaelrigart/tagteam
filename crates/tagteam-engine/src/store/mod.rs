@@ -85,6 +85,18 @@ pub enum StoreError {
     LopsidedWal { present: &'static str },
 }
 
+impl StoreError {
+    /// SQLite's result code, when SQLite refused: all of a store error a log line may name
+    /// (§14.2). Its message may quote a stored value or name a path, and `Corrupt` and
+    /// `AliasTaken` carry stored text.
+    pub fn sqlite_code(&self) -> Option<rusqlite::ErrorCode> {
+        match self {
+            StoreError::Sqlite(e) => e.sqlite_error_code(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountRow {
     pub id: AccountId,
@@ -402,9 +414,13 @@ fn event_from_row(r: &Row<'_>) -> rusqlite::Result<EventRow> {
 /// §14.2 and Decision 10: every `events` row is logged at INFO once it is written, naming its
 /// accounts by ID only. `detail` is never logged: it is free-form JSON, and nothing bounds what
 /// a later kind puts in it.
-fn log_event(e: &EventRow) {
+///
+/// The provider is named only when `name_provider` says so, which the engine decides by whether
+/// this build registers it (§14.2): a row records whatever provider its writer gave, and purge
+/// records the removal of an account whose provider this build does not register.
+fn log_event(e: &EventRow, name_provider: bool) {
     tracing::info!(
-        provider = %e.provider,
+        provider = name_provider.then(|| tracing::field::display(&e.provider)),
         kind = e.kind.as_str(),
         from_account = e.from_id.as_ref().map(tracing::field::display),
         to_account = e.to_id.as_ref().map(tracing::field::display),
@@ -1035,8 +1051,9 @@ impl Store {
         )?;
         tx.commit()?;
         drop(c);
+        // Cleared only through the account's provider, which this build registers.
         if let Some(e) = &cleared {
-            log_event(e);
+            log_event(e, true);
         }
         Ok(())
     }
@@ -1108,8 +1125,9 @@ impl Store {
         let cleared = clear_quarantine_on(&tx, id, reason, source, at)?;
         tx.commit()?;
         drop(c);
+        // Cleared only through the account's provider, which this build registers.
         if let Some(e) = &cleared {
-            log_event(e);
+            log_event(e, true);
         }
         Ok(cleared.is_some())
     }
@@ -1302,7 +1320,8 @@ impl Store {
         tx.execute(DELETE_JOURNAL_SQL, [provider.as_str()])?;
         tx.commit()?;
         drop(c);
-        log_event(event);
+        // A switch runs through its provider, which this build registers.
+        log_event(event, true);
         Ok(())
     }
 
@@ -1349,9 +1368,10 @@ impl Store {
         Ok(())
     }
 
-    pub fn insert_event(&self, e: &EventRow) -> Result<(), StoreError> {
+    /// Records `e` and logs it, naming its provider only when `name_provider` (`log_event`).
+    pub fn insert_event(&self, e: &EventRow, name_provider: bool) -> Result<(), StoreError> {
         Self::insert_event_on(&self.lock(), e)?;
-        log_event(e);
+        log_event(e, name_provider);
         Ok(())
     }
 

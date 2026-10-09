@@ -607,13 +607,15 @@ impl<'a> Rollback<'a, '_> {
             );
             EngineError::RolledBack(cause.to_string())
         } else {
+            // A count (§14.2): each entry names a Keychain service or a file path, and an
+            // error's text.
             tracing::error!(
                 provider = %self.provider,
                 from_account = from,
                 to_account = %self.to,
                 kind = cause.kind(),
-                "a switch was not fully rolled back; its journal row stays for recovery: {}",
-                failed.join("; ")
+                failed = failed.len(),
+                "a switch was not fully rolled back; its journal row stays for recovery"
             );
             EngineError::RollbackFailed {
                 cause: cause.to_string(),
@@ -657,9 +659,11 @@ impl Drop for Rollback<'_, '_> {
         if failed.is_empty() {
             tracing::warn!("an unwinding switch was rolled back");
         } else {
+            // A count (§14.2): each entry names a Keychain service or a file path, and an
+            // error's text.
             tracing::error!(
-                "an unwinding switch was not fully rolled back; its journal row stays for recovery: {}",
-                failed.join("; ")
+                failed = failed.len(),
+                "an unwinding switch was not fully rolled back; its journal row stays for recovery"
             );
         }
     }
@@ -1494,11 +1498,13 @@ impl Engine {
             };
             match self.settle_rescues(p, &row, &lock) {
                 Ok(()) => {}
-                Err(EngineError::RescuePending { detail, .. }) => {
+                // Fixed phrases (§14.2): the details name a path, and may quote a file or an
+                // error that names the account.
+                Err(EngineError::RescuePending { .. }) => {
                     tracing::warn!(
                         position = row.position,
                         account = %row.id,
-                        "a pending rescue could not be settled ({detail}); the target is passed over"
+                        "a pending rescue could not be settled; the target is passed over"
                     );
                     return Ok(AutoFreshened::Failed("rescue-unreadable".into()));
                 }
@@ -1507,11 +1513,11 @@ impl Engine {
             }
             match self.apply_provenance(p, &row, &lock) {
                 Ok(ProfileCheck::Conflict) => return Ok(AutoFreshened::Skip),
-                Ok(ProfileCheck::Unreadable(detail)) => {
+                Ok(ProfileCheck::Unreadable(_)) => {
                     tracing::warn!(
                         position = row.position,
                         account = %row.id,
-                        "the session profile could not be read ({detail}); the target is passed over"
+                        "the session profile could not be read; the target is passed over"
                     );
                     return Ok(AutoFreshened::Failed("profile-unreadable".into()));
                 }
@@ -1736,7 +1742,7 @@ impl Engine {
                 tracing::error!(
                     position = row.position,
                     account = %row.id,
-                    error = %e,
+                    code = e.sqlite_code().map(tracing::field::debug),
                     "could not re-plan usage polls after the switch"
                 );
             }

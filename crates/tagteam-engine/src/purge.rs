@@ -311,7 +311,7 @@ impl Engine {
                     tracing::info!(
                         account = %row.id,
                         position = row.position,
-                        provider = %row.provider,
+                        provider = self.registered_id(&row.provider),
                         "purged an account"
                     );
                     report.rescues += rescues;
@@ -414,11 +414,11 @@ impl Engine {
         let profile = profile_path(&self.env, &row.id);
         for p in self.judges(&profile, providers) {
             let state = self.session_state_at(p.as_ref(), &profile);
-            if let SessionState::Unreadable { detail, .. } = &state {
+            if matches!(state, SessionState::Unreadable { .. }) {
                 tracing::warn!(
                     position = row.position,
                     account = %row.id,
-                    "a session reservation or record could not be read ({detail}); the account counts as session-owned"
+                    "a session reservation or record of the account's profile could not be read; the account counts as session-owned"
                 );
             }
             if state.owned() {
@@ -476,7 +476,6 @@ impl Engine {
         tracing::warn!(
             account = %row.id,
             position = row.position,
-            provider = %row.provider,
             "purged the session profile of an account whose provider this build does not register; the credential item that provider keeps for it cannot be named, and may remain"
         );
         let warning = format!(
@@ -579,10 +578,10 @@ impl Engine {
     ) -> Result<(), EngineError> {
         for p in self.judges(profile, providers) {
             let state = self.session_state_at(p.as_ref(), profile);
-            if let SessionState::Unreadable { detail, .. } = &state {
+            if matches!(state, SessionState::Unreadable { .. }) {
                 tracing::warn!(
-                    profile = %profile.display(),
-                    "a session reservation or record of a profile no account owns could not be read ({detail}); it counts as in use"
+                    "a session reservation or record of {} could not be read; it counts as in use",
+                    Self::profile_label(profile)
                 );
             }
             if state.owned() {
@@ -640,9 +639,8 @@ impl Engine {
                 Ok(_) => self.items_by_path(profile, providers, &mut items),
                 Err(_) => {
                     tracing::warn!(
-                        profile = %profile.display(),
-                        provider = %marker.provider,
-                        "a session profile no account owns names a provider this build does not register; the credential item that provider keeps for it cannot be named, and may remain"
+                        "{} names a provider this build does not register; the credential item that provider keeps for it cannot be named, and may remain",
+                        Self::profile_label(profile)
                     );
                     warning = Some(format!(
                         "{} names {}, a provider this build does not register, so the credential item it keeps for that session profile cannot be named; the profile was deleted, and that item may remain",
@@ -680,8 +678,22 @@ impl Engine {
         } else {
             fs::remove_file(profile)?;
         }
-        tracing::info!(profile = %profile.display(), "deleted a session profile no account owned");
+        tracing::info!("deleted {}", Self::profile_label(profile));
         Ok(warning)
+    }
+
+    /// How a log line names an entry of `sessions/` no account owns, never by its path (§14.2):
+    /// the data directory may sit under a name the user chose (`XDG_DATA_HOME`), and the entry
+    /// may carry any name at all. So it is "the orphaned profile of account <ID>" only when its
+    /// name is an ID as tagteam makes one (a hyphenated UUID), and otherwise an unrecognized
+    /// entry.
+    fn profile_label(profile: &Path) -> String {
+        let name = profile.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if uuid::Uuid::parse_str(name).is_ok_and(|u| u.hyphenated().to_string() == name) {
+            format!("the orphaned profile of account {name}")
+        } else {
+            "an unrecognized profile entry".to_owned()
+        }
     }
 
     /// Whether the store holds the account `id`, of any provider.
@@ -732,8 +744,8 @@ impl Engine {
                 }
             }
             Err(e) => tracing::warn!(
-                profile = %profile.display(),
-                "a session profile no account owns has no readable marker and does not resolve ({e}); no Keychain item can be named for it"
+                "{} has no readable marker and does not resolve ({e}); no Keychain item can be named for it",
+                Self::profile_label(profile)
             ),
         }
     }
@@ -780,7 +792,7 @@ impl Engine {
             }
         }
         tracing::info!(
-            provider = %provider,
+            provider = self.registered_id(provider),
             accounts = report.accounts.len(),
             rescues = report.rescues,
             displaced = report.displaced,

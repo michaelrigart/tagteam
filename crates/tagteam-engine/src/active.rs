@@ -82,7 +82,7 @@ impl Drop for PendingLoss<'_> {
             self.engine.record_loss(
                 self.row,
                 self.sent_fp,
-                &"publishing it to the live store unwound",
+                "publishing it to the live store unwound",
             );
         }
     }
@@ -379,11 +379,12 @@ impl Engine {
                 Ok(match (persisted, published) {
                     (Persisted::Unpersisted, Ok(true)) => ActiveOutcome::PublishedOnly,
                     (Persisted::Unpersisted, published) => {
+                        // By kind (§14.2): the error's text may name a path or a label.
                         let cause = match &published {
-                            Err(e) => format!("the live store was not written either: {e}"),
-                            Ok(_) => "the live store was not written either".to_owned(),
+                            Err(e) => e.kind(),
+                            Ok(_) => "the live store was not written either",
                         };
-                        self.record_loss(row, sent_fp, &cause);
+                        self.record_loss(row, sent_fp, cause);
                         ActiveOutcome::Unpersisted
                     }
                     (_, Err(e)) => return Err(e),
@@ -619,11 +620,13 @@ impl Engine {
         retire: &[PathBuf],
         cancel: &Cancel,
     ) -> Result<bool, EngineError> {
-        let not_published = |why: &dyn std::fmt::Display| {
+        // By kind (§14.2): the error's text may name a path or a label.
+        let not_published = |e: EngineError| {
             tracing::warn!(
                 position = row.position,
                 account = %row.id,
-                "a refreshed credential was not published to the live store: {why}"
+                kind = e.kind(),
+                "a refreshed credential was not published to the live store"
             );
             Ok(false)
         };
@@ -631,11 +634,11 @@ impl Engine {
         env.cancel = cancel.clone();
         let locks = match p.lock_config(&env, cred, p.live_lock_budget()) {
             Ok(locks) => locks,
-            Err(e) => return not_published(&e),
+            Err(e) => return not_published(EngineError::from(e)),
         };
         let doomed = p.doomed(&self.env, &locks, LiveChange::Write(&row.kind));
         if let Err(e) = refuse_unreadable(&doomed) {
-            return not_published(&e);
+            return not_published(e);
         }
         let mut held = Held::default();
         held.hold(p, secret);
@@ -653,7 +656,7 @@ impl Engine {
                     None,
                     &mut warnings,
                 ) {
-                    return not_published(&e);
+                    return not_published(e);
                 }
             }
         }
@@ -693,7 +696,7 @@ impl Engine {
             );
         }
         if let Err(e) = written {
-            return not_published(&e);
+            return not_published(EngineError::from(e));
         }
         let landed = match p.read_live_auth(&self.env).credential {
             Read::Present(c) if c.provenance() == Provenance::Fresh => {

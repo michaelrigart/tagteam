@@ -1108,9 +1108,9 @@ fn a_re_plan_that_cannot_be_stored_never_fails_the_switch() {
         .unwrap()
         .execute_batch(
             "CREATE TRIGGER no_insert BEFORE INSERT ON usage_state \
-               BEGIN SELECT RAISE(ABORT, 'usage_state is read-only'); END;
+               BEGIN SELECT RAISE(ABORT, 'usage_state is read-only for bob@example.com'); END;
              CREATE TRIGGER no_update BEFORE UPDATE ON usage_state \
-               BEGIN SELECT RAISE(ABORT, 'usage_state is read-only'); END;",
+               BEGIN SELECT RAISE(ABORT, 'usage_state is read-only for bob@example.com'); END;",
         )
         .unwrap();
 
@@ -1124,7 +1124,8 @@ fn a_re_plan_that_cannot_be_stored_never_fails_the_switch() {
         "the plan is as it was"
     );
     // The failed re-plan is logged at ERROR (§14, K3), naming the account by position and id,
-    // with the store's error as a field and never the email.
+    // with SQLite's result code as the cause (§14.2): the message is the database's own text,
+    // here a trigger's, and never logged.
     let errors: Vec<&String> = logs.iter().filter(|l| l.starts_with("ERROR")).collect();
     assert_eq!(errors.len(), 1, "{logs:?}");
     let line = errors[0];
@@ -1132,8 +1133,9 @@ fn a_re_plan_that_cannot_be_stored_never_fails_the_switch() {
         line.contains("could not re-plan usage polls after the switch")
             && line.contains("position=1")
             && line.contains(&format!("account={a}"))
-            && line.contains("error=")
-            && line.contains("usage_state is read-only"),
+            && line.contains("code=ConstraintViolation")
+            && !line.contains("read-only")
+            && !line.contains("bob@example.com"),
         "{line}"
     );
     assert!(!line.contains("@x.co"), "{line}");

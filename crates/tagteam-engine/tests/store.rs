@@ -1280,16 +1280,19 @@ fn a_provider_s_rows_go_and_its_usage_budget_stays() {
     for (p, id) in [(cc(), &a), (other.clone(), &f)] {
         s.set_active(&p, Some(id), Some(0)).unwrap();
         s.set_unhealthy_ticks(&p, 2).unwrap();
-        s.insert_event(&EventRow {
-            at: 1,
-            provider: p.clone(),
-            kind: "add".into(),
-            from_id: None,
-            to_id: Some(id.clone()),
-            trigger: None,
-            source: "cli".into(),
-            detail: None,
-        })
+        s.insert_event(
+            &EventRow {
+                at: 1,
+                provider: p.clone(),
+                kind: "add".into(),
+                from_id: None,
+                to_id: Some(id.clone()),
+                trigger: None,
+                source: "cli".into(),
+                detail: None,
+            },
+            true,
+        )
         .unwrap();
     }
     let db = rusqlite::Connection::open(&path).unwrap();

@@ -181,6 +181,15 @@ impl Engine {
             .ok_or_else(|| EngineError::UnknownProvider(id.to_string()))
     }
 
+    /// `id` as a log line's field, only when this build registers it (§14.2): an ID read from a
+    /// marker or a store column is otherwise any text, an email among it.
+    pub(crate) fn registered_id<'a>(
+        &self,
+        id: &'a ProviderId,
+    ) -> Option<tracing::field::DisplayValue<&'a ProviderId>> {
+        self.registry.get(id).map(|_| tracing::field::display(id))
+    }
+
     /// §12.8: commands that change accounts or the live login refuse inside a run shell, and
     /// under a marker that cannot be read, which the refusal names.
     pub(crate) fn refuse_inside_run_shell(&self) -> Result<(), EngineError> {
@@ -394,7 +403,13 @@ impl Engine {
                 if e.signal().is_some() {
                     return Err(e);
                 }
-                tracing::warn!(provider = %row.provider, "could not recover an interrupted switch: {e}");
+                // By kind (§14.2): the error may name an account's label, a path, or a provider
+                // as the row stored it.
+                tracing::warn!(
+                    provider = self.registered_id(&row.provider),
+                    kind = e.kind(),
+                    "could not recover an interrupted switch"
+                );
                 if matches!(
                     e,
                     EngineError::RecoveryBlocked { .. } | EngineError::RecoveryMoved { .. }
@@ -437,7 +452,7 @@ impl Engine {
                 }
                 store.delete_journal(provider)?;
                 tracing::warn!(
-                    provider = %provider,
+                    provider = self.registered_id(provider),
                     "purge deleted an interrupted switch's record that recovery could not settle"
                 );
                 warnings.push(format!(

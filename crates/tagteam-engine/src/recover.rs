@@ -299,7 +299,10 @@ impl Engine {
             )?;
         }
         for w in &warnings {
-            tracing::warn!(provider = %row.provider, "recovering an interrupted switch: {w}");
+            tracing::warn!(
+                provider = self.registered_id(&row.provider),
+                "recovering an interrupted switch: {w}"
+            );
         }
         // The undos are dropped, never run: undoing would write an old credential back.
         // Recovery's writes are a critical span (§14.1): their storage-write wait is not a

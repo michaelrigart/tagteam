@@ -136,14 +136,27 @@ impl Engine {
             }
         };
         let prefix = format!("{id}-");
-        let mut paths: Vec<PathBuf> = listing
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".json"))
-            })
-            .collect();
+        let mut paths = Vec::new();
+        for entry in listing {
+            // An entry the listing cannot return may be one of `id`'s: the path cannot be
+            // listed, as when it cannot be opened (§14: never skipped).
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => {
+                    return Err(RescueUnlisted {
+                        path: dir,
+                        detail: e.to_string(),
+                    });
+                }
+            };
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".json"))
+            {
+                paths.push(path);
+            }
+        }
         paths.sort();
         Ok(paths)
     }
@@ -229,7 +242,8 @@ impl Engine {
                 tracing::warn!(
                     position = row.position,
                     account = %row.id,
-                    "an adopted rescue file could not be deleted: {err}"
+                    kind = err.kind(),
+                    "an adopted rescue file could not be deleted"
                 );
             }
             return Ok(());
