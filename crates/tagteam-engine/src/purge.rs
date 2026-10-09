@@ -490,11 +490,17 @@ impl Engine {
                 return Err(EngineError::RescueUnlistable { path, detail });
             }
         };
+        // Asked again where the deletions are, as `remove_locked` asks: the vault's files, and
+        // the profile against every registered provider (its own cannot be asked).
+        self.refuse_live_vault_files(row)?;
+        let profile = profile_path(&self.env, &row.id);
+        if fs::symlink_metadata(&profile).is_ok() {
+            self.refuse_live_at_all(&profile)?;
+        }
         self.vault.delete(lock)?;
         for path in &rescues {
             self.delete_rescue(path)?;
         }
-        let profile = profile_path(&self.env, &row.id);
         let had_profile = match fs::symlink_metadata(&profile) {
             Ok(_) => {
                 remove_path(&profile)?;
@@ -887,8 +893,21 @@ impl Engine {
                 "the live login's files are inside what this would delete, since the environment names them; nothing was deleted (tagteam never deletes the live login)",
             ))
         };
+        // The roots are every directory purge deletes in, by what each RESOLVES to
+        // (`metadata` follows links): `vault/`, `displaced/` and `sessions/` may be links to
+        // somewhere else entirely, and the rescue path is whatever it is.
         let mut walls: Vec<(u64, u64)> = Vec::new();
-        let mut wall_dirs = vec![self.env.data_dir()];
+        let data = self.env.data_dir();
+        let mut wall_dirs = vec![
+            data.clone(),
+            data.join("vault"),
+            data.join("displaced"),
+            data.join("sessions"),
+            self.rescue_dir(),
+        ];
+        if let Some(vault) = self.vault.dir() {
+            wall_dirs.push(vault.to_path_buf());
+        }
         if plan.provider.is_none() {
             wall_dirs.extend(self.env.log_file().parent().map(Path::to_path_buf));
         }
@@ -901,6 +920,11 @@ impl Engine {
         }
         if walls.is_empty() {
             return Ok(());
+        }
+        // Every affected account's vault files (`vault/<id>.json`, `.prev.json`), whoever its
+        // provider is: what `vault.delete` unlinks.
+        for row in rows {
+            self.refuse_live_vault_files(row)?;
         }
         // What the purge leaves alone: the profiles of the accounts it does not affect, and the
         // directories above each, which a path passes through to reach one.
@@ -938,12 +962,17 @@ impl Engine {
                 .chain(surface.json_keys.into_iter().map(|(file, _)| file));
             for file in files {
                 for touched in trace_path(&file).map_err(|_| unresolved())? {
+                    // Each ancestor as itself, and, for a link, as what it leads to: a link
+                    // to a root counts as the root.
                     let mut chain = Vec::new();
                     for ancestor in touched.ancestors() {
                         match fs::symlink_metadata(ancestor) {
                             Ok(meta) => chain.push(identity(&meta)),
                             Err(e) if absent(&e) => break,
                             Err(_) => return Err(unresolved()),
+                        }
+                        if let Ok(meta) = fs::metadata(ancestor) {
+                            chain.push(identity(&meta));
                         }
                     }
                     let inside = chain.iter().any(|id| walls.contains(id));

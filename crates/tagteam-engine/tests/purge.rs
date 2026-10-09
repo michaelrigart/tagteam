@@ -2074,3 +2074,70 @@ fn a_provider_purge_leaves_alone_another_providers_live_login_in_its_own_profile
     assert!(fx.vault_bytes(&q).is_some(), "Q's account stays");
     assert!(fx.vault_bytes(&g).is_none(), "the ghost account went");
 }
+
+#[test]
+fn a_vault_directory_that_is_a_link_elsewhere_cannot_hide_the_live_login_from_a_provider_purge() {
+    // Codex slice 1 re-review (§10.5): `data/vault -> /outside/vault`, an account of a provider
+    // this build does not register, and the live credential pointing straight at the vault file
+    // out there: the live path never touches the data directory, but `vault.delete` unlinks it.
+    let fx = Fx::with(Platform::Linux, |_| {});
+    let outside = fx.dir.path().join("outside-vault");
+    fs::create_dir_all(&outside).unwrap();
+    let data = fx.env.data_dir();
+    fs::create_dir_all(&data).unwrap();
+    std::os::unix::fs::symlink(&outside, data.join("vault")).unwrap();
+    let ghost = ProviderId::new("ghost");
+    let g = add(
+        &fx.engine.store().unwrap(),
+        &ghost,
+        "0192-ghost",
+        "g@x.co",
+        1,
+    );
+    fx.put_vault(&g, b"the live login");
+    let target = outside.join("0192-ghost.json");
+    assert!(target.exists());
+    let live = fx.paths().credentials_file;
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &live).unwrap();
+
+    let plan = fx.engine.purge_plan(Some(&ghost)).unwrap();
+    let err = fx.engine.purge(&plan).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(target.exists(), "the vault file stays");
+    assert!(fx.engine.store().unwrap().account(&g).unwrap().is_some());
+}
+
+#[test]
+fn a_displaced_directory_that_is_a_link_to_the_live_config_refuses_a_full_purge() {
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = fs::canonicalize(outside.path()).unwrap();
+    let live_dir = outside_path.join("live");
+    fs::create_dir_all(&live_dir).unwrap();
+    let config = live_dir.clone();
+    let fx = Fx::with(Platform::Linux, move |e| {
+        e.claude_config_dir = Some(config.into_os_string());
+    });
+    fs::write(live_dir.join(".credentials.json"), b"the live login").unwrap();
+    fs::write(live_dir.join(".claude.json"), b"{}").unwrap();
+    let data = fx.env.data_dir();
+    fs::create_dir_all(&data).unwrap();
+    std::os::unix::fs::symlink(&outside_path, data.join("displaced")).unwrap();
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read(live_dir.join(".credentials.json")).unwrap(),
+        b"the live login"
+    );
+    assert!(fs::symlink_metadata(data.join("displaced")).is_ok());
+}
