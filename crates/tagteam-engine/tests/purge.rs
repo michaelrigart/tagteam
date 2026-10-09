@@ -1864,3 +1864,56 @@ fn an_orphan_link_a_live_credential_goes_through_is_left_and_reported() {
         "{failure:?}"
     );
 }
+
+/// Whether the filesystem under the temp directory ignores case (macOS's default APFS).
+fn case_insensitive_fs() -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("probe-a")).unwrap();
+    dir.path().join("PROBE-A").exists()
+}
+
+/// A Linux-style fixture whose live login sits in `<sessions/<id>>/.credentials.json`, named
+/// through the secure-storage override with the directory name in UPPER case: on a
+/// case-insensitive filesystem the same place, spelled differently.
+fn live_login_in_a_case_alias(id: &str) -> (Fx, AccountId, PathBuf, PathBuf) {
+    let aid = AccountId::from_string(id);
+    let fx = Fx::with(Platform::Linux, |e| {
+        let dir = tagteam_provider::profile::profile_path(e, &aid);
+        fs::create_dir_all(&dir).unwrap();
+        let sessions = fs::canonicalize(dir.parent().unwrap()).unwrap();
+        e.claude_securestorage_config_dir = Some(sessions.join(id.to_uppercase()).into_os_string());
+    });
+    let dir = fx.profile_dir(&aid);
+    fx.write_marker(&dir, &aid, &fx.env);
+    let live = dir.join(".credentials.json");
+    fs::write(&live, b"the live login").unwrap();
+    (fx, aid, dir, live)
+}
+
+#[test]
+fn a_profile_the_live_login_is_in_under_another_case_is_never_deleted_by_purge() {
+    // Codex slice 3 re-review: the spellings differ, the directory is one inode.
+    if !case_insensitive_fs() {
+        eprintln!("skipped: this filesystem is case-sensitive");
+        return;
+    }
+    let (fx, aid, dir, live) = live_login_in_a_case_alias("0192-case-alias");
+    add(
+        &fx.engine.store().unwrap(),
+        &fx.provider(),
+        "0192-case-alias",
+        "a@x.co",
+        1,
+    );
+    fx.put_vault(&aid, b"a vault credential");
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(dir.join(".tagteam-profile.json").exists());
+    assert!(fx.vault_bytes(&aid).is_some(), "nothing else was deleted");
+}

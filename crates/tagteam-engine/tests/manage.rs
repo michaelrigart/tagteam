@@ -572,3 +572,51 @@ fn remove_of_a_profile_link_a_live_credential_goes_through_refuses_with_nothing_
     assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
     assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
 }
+
+#[test]
+fn remove_of_a_profile_the_live_login_is_in_under_another_case_refuses() {
+    let probe = tempfile::tempdir().unwrap();
+    fs::create_dir(probe.path().join("probe-a")).unwrap();
+    if !probe.path().join("PROBE-A").exists() {
+        eprintln!("skipped: this filesystem is case-sensitive");
+        return;
+    }
+    let id = AccountId::from_string("0192-case-alias");
+    let fx = Fx::with(tagteam_cc::live::Platform::Linux, |e| {
+        let dir = tagteam_provider::profile::profile_path(e, &id);
+        fs::create_dir_all(&dir).unwrap();
+        let sessions = fs::canonicalize(dir.parent().unwrap()).unwrap();
+        e.claude_securestorage_config_dir = Some(sessions.join("0192-CASE-ALIAS").into_os_string());
+    });
+    let dir = fx.profile_dir(&id);
+    fx.write_marker(&dir, &id, &fx.env);
+    let live = dir.join(".credentials.json");
+    fs::write(&live, b"the live login").unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .insert_account(&NewAccount {
+            id: &id,
+            provider: &ProviderId::new("claude-code"),
+            position: 1,
+            identity_key: "a@x.co\n",
+            identity: &fx.cc.token_identity("a@x.co"),
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 0,
+        })
+        .unwrap();
+    fx.put_vault(&id, b"a vault credential");
+
+    let err = fx.engine.remove(&id).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(dir.join(".tagteam-profile.json").exists());
+    assert!(fx.vault_bytes(&id).is_some());
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}

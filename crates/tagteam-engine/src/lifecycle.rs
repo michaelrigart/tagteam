@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 
 use tagteam_core::validate::{is_valid_email, normalize_alias};
@@ -246,6 +247,11 @@ fn names(path: &Path) -> impl Iterator<Item = OsString> + '_ {
     })
 }
 
+/// `(device, inode)`: what a file is, whatever it is called.
+fn identity(meta: &fs::Metadata) -> (u64, u64) {
+    (meta.dev(), meta.ino())
+}
+
 /// Whether `e` says the path is not there (or has a non-directory in the way).
 fn absent(e: &io::Error) -> bool {
     matches!(
@@ -412,9 +418,11 @@ impl Engine {
     /// or orphan entry of `sessions/`. The environment can name a profile's directory in a
     /// spelling that differs from the marker's (a trailing `/.`), so the spellings compare
     /// unequal while the login sits in the profile. Each file's path is walked as the kernel
-    /// resolves it (`trace_path`), and refuses if anything it touches equals or lies under the
-    /// entry's own location (its parent resolved, the entry itself not followed: a link is
-    /// deleted exactly there), or, for a directory, its canonical path. That is a link entry the
+    /// resolves it (`trace_path`), and refuses if anything it touches is, or lies under, the entry
+    /// by filesystem identity (device and inode, never spelling: a case-insensitive filesystem
+    /// or a `/.` spells one place many ways). The entry is its own location (its parent
+    /// resolved, the entry itself not followed: a link is deleted exactly there), and for a
+    /// directory also what it is. That is a link entry the
     /// path passes through, a directory inside the profile, or the final target. A missing
     /// entry or parent holds nothing; any other failure to resolve refuses, as the
     /// stored-profile guard does. The refusal names no path.
@@ -436,15 +444,20 @@ impl Engine {
             Err(e) if absent(&e) => return Ok(()),
             Err(_) => return Err(unresolved()),
         };
-        let mut doomed = vec![location.clone()];
+        // What is deleted is identified by (device, inode), not by its spelling: a case-insensitive
+        // filesystem, a trailing `/.` or a link can spell one place many ways.
+        let mut doomed = Vec::new();
         match fs::symlink_metadata(&location) {
-            Ok(meta) if meta.file_type().is_symlink() => {}
-            Ok(_) => match fs::canonicalize(&location) {
-                Ok(canonical) if canonical != location => doomed.push(canonical),
-                Ok(_) => {}
-                Err(e) if absent(&e) => return Ok(()),
-                Err(_) => return Err(unresolved()),
-            },
+            Ok(meta) => {
+                doomed.push(identity(&meta));
+                if !meta.file_type().is_symlink() {
+                    match fs::metadata(&location) {
+                        Ok(followed) => doomed.push(identity(&followed)),
+                        Err(e) if absent(&e) => return Ok(()),
+                        Err(_) => return Err(unresolved()),
+                    }
+                }
+            }
             Err(e) if absent(&e) => return Ok(()),
             Err(_) => return Err(unresolved()),
         }
@@ -455,10 +468,19 @@ impl Engine {
             .chain(surface.json_keys.into_iter().map(|(file, _)| file));
         for file in files {
             let touched = trace_path(&file).map_err(|_| unresolved())?;
-            if touched
-                .iter()
-                .any(|path| doomed.iter().any(|gone| path.starts_with(gone)))
-            {
+            let mut inside = false;
+            for path in &touched {
+                // The path itself and each ancestor: one of them being the deleted entry puts
+                // the path at it or under it. A missing ancestor ends that walk.
+                for ancestor in path.ancestors() {
+                    match fs::symlink_metadata(ancestor) {
+                        Ok(meta) => inside |= doomed.contains(&identity(&meta)),
+                        Err(e) if absent(&e) => break,
+                        Err(_) => return Err(unresolved()),
+                    }
+                }
+            }
+            if inside {
                 tracing::warn!(
                     "the live login's files are inside a profile directory; nothing was deleted"
                 );
