@@ -262,6 +262,9 @@ pub fn locked_login_keychain(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
         state == found,
         json!(format!("{state:?}")),
     );
+    // After the login keychain is back as it was: the throwaway file's lock check needs no
+    // locked login keychain, and its dialog must never overlap the restore's password prompt.
+    lock_check_on_a_locked_file(ctx, &mut p)?;
     Ok(p.finish("the lock check and the probe answered on a locked login keychain"))
 }
 
@@ -340,7 +343,6 @@ fn observe_locked(ctx: &Ctx, p: &mut Probe, was_locked: bool) -> Result<bool, Ha
         .decided()?
         .unwrap_or(false);
     p.expect("the probe raised no dialog", !again, json!(again));
-    lock_check_on_a_locked_file(ctx, p)?;
     Ok(was_locked)
 }
 
