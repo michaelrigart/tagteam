@@ -401,3 +401,48 @@ fn remove_of_a_profile_whose_marker_names_the_live_config_dir_refuses_with_nothi
     assert!(fx.vault_bytes(&a).is_some(), "the vault entry is kept");
     assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
 }
+
+#[test]
+fn remove_of_a_profile_holding_the_live_login_s_files_refuses_with_nothing_deleted() {
+    // Codex pre-merge P1b (§10.3, §10.5): the environment names the profile directory in a
+    // spelling that differs from its marker's; the live credential file is inside it.
+    let id = AccountId::from_string("0192-live-inside");
+    let fx = Fx::with(tagteam_cc::live::Platform::Linux, |e| {
+        let dir = tagteam_provider::profile::profile_path(e, &id);
+        fs::create_dir_all(&dir).unwrap();
+        let mut spelled = fs::canonicalize(&dir).unwrap().into_os_string();
+        spelled.push("/.");
+        e.claude_securestorage_config_dir = Some(spelled);
+    });
+    let dir = fx.profile_dir(&id);
+    fx.write_marker(&dir, &id, &fx.env);
+    let live = dir.join(".credentials.json");
+    fs::write(&live, b"the live login").unwrap();
+    let store = fx.engine.store().unwrap();
+    let identity = fx.cc.token_identity("a@x.co");
+    store
+        .insert_account(&NewAccount {
+            id: &id,
+            provider: &ProviderId::new("claude-code"),
+            position: 1,
+            identity_key: "a@x.co\n",
+            identity: &identity,
+            kind: "oauth",
+            alias: None,
+            login_expires_at: None,
+            added_at: 0,
+        })
+        .unwrap();
+    fx.put_vault(&id, b"a vault credential");
+
+    let err = fx.engine.remove(&id).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(dir.join(".tagteam-profile.json").exists());
+    assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}

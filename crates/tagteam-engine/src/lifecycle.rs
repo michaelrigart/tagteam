@@ -181,6 +181,14 @@ pub(crate) struct LoginSource {
     pub(crate) added_at: Option<i64>,
 }
 
+/// Whether `e` says the path is not there (or has a non-directory in the way).
+fn absent(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
 /// The Keychain item `remove_profile` names for a profile directory (see `Engine::profile_item`).
 enum ProfileItem {
     /// The spelling its trusted marker records.
@@ -333,6 +341,55 @@ impl Engine {
         ))))
     }
 
+    /// §10.5 "never deletes or replaces a provider's live login", by path and apart from any
+    /// Keychain spelling: refuses when a file `p` keeps its live login in (its identity
+    /// surface's credential files and JSON files) lies inside the directory `dir`, which is
+    /// about to be deleted. The environment can name a profile's directory in a spelling that
+    /// differs from the marker's (a trailing `/.`), so the spellings compare unequal while the
+    /// login sits in the profile. Paths are compared resolved, by component. A parent that
+    /// does not exist holds nothing; any other failure to resolve refuses, as the stored-profile
+    /// guard does. The refusal names no path.
+    pub(crate) fn refuse_live_files_inside(
+        &self,
+        p: &dyn Provider,
+        dir: &Path,
+    ) -> Result<(), EngineError> {
+        let unresolved = || {
+            EngineError::Io(io::Error::other(
+                "a path the live login lives at could not be resolved, so it cannot be told whether it is inside this profile directory; nothing was deleted (tagteam never deletes the live login)",
+            ))
+        };
+        let dir = match fs::canonicalize(dir) {
+            Ok(dir) => dir,
+            Err(e) if absent(&e) => return Ok(()),
+            Err(_) => return Err(unresolved()),
+        };
+        let surface = p.identity_surface(&self.env);
+        let files = surface
+            .credential_files
+            .into_iter()
+            .chain(surface.json_keys.into_iter().map(|(file, _)| file));
+        for file in files {
+            let (Some(parent), Some(name)) = (file.parent(), file.file_name()) else {
+                continue;
+            };
+            let parent = match fs::canonicalize(parent) {
+                Ok(parent) => parent,
+                Err(e) if absent(&e) => continue,
+                Err(_) => return Err(unresolved()),
+            };
+            if parent.join(name).starts_with(&dir) {
+                tracing::warn!(
+                    "the live login's files are inside a profile directory; nothing was deleted"
+                );
+                return Err(EngineError::Io(io::Error::other(
+                    "the live login's files are inside this profile directory, since the environment names it; nothing was deleted (tagteam never deletes the live login)",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Before anything of `row` is deleted: refuses when deleting its session profile would
     /// delete the live login's Keychain items. A profile that is a link names no item
     /// (`remove_profile` removes it as a link), so it passes.
@@ -342,11 +399,14 @@ impl Engine {
         row: &AccountRow,
     ) -> Result<(), EngineError> {
         let profile = profile_path(&self.env, &row.id);
-        match fs::symlink_metadata(&profile) {
-            Ok(meta) if !meta.file_type().is_symlink() => {}
-            Ok(_) => return Ok(()),
+        let meta = match fs::symlink_metadata(&profile) {
+            Ok(meta) if meta.file_type().is_symlink() => return Ok(()),
+            Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
+        };
+        if meta.is_dir() {
+            self.refuse_live_files_inside(p, &profile)?;
         }
         match self.profile_item(p, row, &profile).spelling() {
             Some(spelling) => self.refuse_live_item(p, row, spelling),
@@ -391,6 +451,9 @@ impl Engine {
             );
             fs::remove_file(&profile)?;
             return Ok(());
+        }
+        if meta.is_dir() {
+            self.refuse_live_files_inside(p, &profile)?;
         }
         let item = self.profile_item(p, row, &profile);
         // `why` is a fixed phrase (§14.2): a marker's read error names its path, under a data

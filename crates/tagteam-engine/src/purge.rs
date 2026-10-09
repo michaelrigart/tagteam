@@ -272,6 +272,7 @@ impl Engine {
                 Err(_) => {
                     self.refuse_unregistered_in_use(row, &providers)?;
                     self.refuse_real_copies(&profile_path(&self.env, &row.id))?;
+                    self.refuse_live_files_in_unregistered(row, &providers)?;
                 }
             }
         }
@@ -386,9 +387,28 @@ impl Engine {
             Err(_) => {
                 self.refuse_unregistered_in_use(row, providers)?;
                 self.refuse_real_copies(&profile_path(&self.env, &row.id))?;
+                self.refuse_live_files_in_unregistered(row, providers)?;
                 self.remove_unregistered(row, &lock, unlisted)
             }
         }
+    }
+
+    /// Before an account of a provider this build does not register has its profile directory
+    /// deleted: no registered provider's live login has its files inside it (the provider that
+    /// kept the profile cannot be asked, so every one with sessions is).
+    fn refuse_live_files_in_unregistered(
+        &self,
+        row: &AccountRow,
+        providers: &[ProviderId],
+    ) -> Result<(), EngineError> {
+        let profile = profile_path(&self.env, &row.id);
+        if !fs::symlink_metadata(&profile).is_ok_and(|m| m.is_dir()) {
+            return Ok(());
+        }
+        for p in self.judges(&profile, providers) {
+            self.refuse_live_files_inside(p.as_ref(), &profile)?;
+        }
+        Ok(())
     }
 
     /// `--provider P` (§10.5): a provider this build registers, or one the store still holds
@@ -684,6 +704,13 @@ impl Engine {
                 return Err(EngineError::Io(io::Error::other(
                     "the Keychain item it names belongs to a stored account, since this entry leads to that account's profile; it was left as it is, and so was the entry",
                 )));
+            }
+        }
+        // Nor is the live login's files' path inside the directory, whatever spelling its items
+        // go by (§10.5): checked before any item or the directory goes.
+        if meta.is_dir() {
+            for p in self.judges(profile, providers) {
+                self.refuse_live_files_inside(p.as_ref(), profile)?;
             }
         }
         for (p, spelling) in &items {

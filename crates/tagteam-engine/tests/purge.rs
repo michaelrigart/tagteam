@@ -1656,3 +1656,69 @@ fn a_profile_whose_marker_names_the_live_config_dir_refuses_the_purge_whole() {
     assert!(fx.vault_bytes(&a).is_some(), "the vault entry is kept");
     assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
 }
+
+/// A Linux fixture whose live login sits in `<sessions/<id>>/.credentials.json`: the
+/// secure-storage override names that directory with `/.` appended, so its spelling differs
+/// from the one any profile marker records. Returns the directory, made with a marker, and the
+/// live credential file in it.
+fn live_login_inside(id: &str) -> (Fx, PathBuf, PathBuf) {
+    let id = AccountId::from_string(id);
+    let fx = Fx::with(Platform::Linux, |e| {
+        let dir = tagteam_provider::profile::profile_path(e, &id);
+        fs::create_dir_all(&dir).unwrap();
+        let mut spelled = fs::canonicalize(&dir).unwrap().into_os_string();
+        spelled.push("/.");
+        e.claude_securestorage_config_dir = Some(spelled);
+    });
+    let dir = fx.env.data_dir().join("sessions").join(id.as_str());
+    fx.write_marker(&dir, &id, &fx.env);
+    let live = dir.join(".credentials.json");
+    fs::write(&live, b"the live login").unwrap();
+    (fx, dir, live)
+}
+
+#[test]
+fn a_stored_profile_holding_the_live_login_s_files_is_never_deleted_by_purge() {
+    // Codex pre-merge P1b (§10.5): the environment names the profile directory in a spelling
+    // that differs from its marker's, so a spelling guard passes; the live login's credential
+    // file is inside the directory, by path.
+    let (fx, dir, live) = live_login_inside("0192-live-inside");
+    let id = add(
+        &fx.engine.store().unwrap(),
+        &fx.provider(),
+        "0192-live-inside",
+        "a@x.co",
+        1,
+    );
+    fx.put_vault(&id, b"a vault credential");
+
+    let err = fx.engine.purge(&full_plan(&fx)).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(dir.join(".tagteam-profile.json").exists(), "the profile");
+    assert!(fx.vault_bytes(&id).is_some(), "nothing else was deleted");
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}
+
+#[test]
+fn an_orphan_holding_the_live_login_s_files_is_left_and_reported() {
+    let (fx, dir, live) = live_login_inside("0192-gone");
+
+    let report = fx.engine.purge(&full_plan(&fx)).unwrap();
+
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(dir.exists(), "the orphan is left");
+    let failure = report
+        .failures
+        .iter()
+        .find(|(what, _)| what.contains("0192-gone"))
+        .unwrap_or_else(|| panic!("{:?}", report.failures));
+    assert!(
+        failure.1.contains("live login's files are inside"),
+        "{failure:?}"
+    );
+}
