@@ -44,6 +44,10 @@ pub const DAEMON_KINDS: [&str; 3] = ["daemon", "bg", "daemon-worker"];
 const DAEMON_PATIENCE: Duration = Duration::from_secs(30);
 /// An expired access token's `expiresAt`: a minute ago.
 const EXPIRED_BY_MS: i64 = 60_000;
+/// How much life a live access token needs left for a check that holds a session open: CC
+/// refreshes a token past its expiry before its first message, and a refresh under the check
+/// moves the lineage the check is judging.
+pub const MIN_LIFE_MS: i64 = 10 * 60_000;
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -55,6 +59,28 @@ pub fn now_ms() -> i64 {
 /// a report; `None` for no token at all.
 pub fn generation(credential: &[u8]) -> Option<String> {
     tagteam_cc::shape::fingerprint(credential).map(|f| f.short12().to_owned())
+}
+
+/// The credential's `expiresAt`, epoch milliseconds.
+pub fn expires_at(credential: &[u8]) -> Option<i64> {
+    serde_json::from_slice::<Value>(credential).ok()?["claudeAiOauth"]["expiresAt"].as_i64()
+}
+
+/// How long the credential's access token still has at `now_ms`, when that is at least
+/// `MIN_LIFE_MS`; otherwise a harness error naming how long it has.
+pub fn life_to_spare(credential: &[u8], now_ms: i64) -> Result<i64, HarnessError> {
+    let left = expires_at(credential)
+        .ok_or_else(|| harness("the credential has no integer expiresAt"))?
+        - now_ms;
+    if left >= MIN_LIFE_MS {
+        Ok(left)
+    } else {
+        Err(harness(format!(
+            "the live access token has {} s left (it needs {} s): expired, or about to be, so CC would refresh it under the check",
+            left / 1000,
+            MIN_LIFE_MS / 1000
+        )))
+    }
 }
 
 /// An account of the compat store.
@@ -467,6 +493,11 @@ impl Ctx {
     /// Makes the home's access token expired, its tokens untouched, so CC's next request
     /// refreshes it. Only while nothing runs in that home.
     pub fn expire(&self, spelling: &str) -> Result<Value, HarnessError> {
+        Ok(self.expire_noting(spelling)?.0)
+    }
+
+    /// `expire`, and the `expiresAt` it replaced (`unexpire` puts it back).
+    pub fn expire_noting(&self, spelling: &str) -> Result<(Value, Option<i64>), HarnessError> {
         self.assert_quiescent(spelling)?;
         let (bytes, place) = self
             .read_credential(spelling)?
@@ -477,13 +508,48 @@ impl Ctx {
             .get_mut("claudeAiOauth")
             .and_then(Value::as_object_mut)
             .ok_or_else(|| harness(format!("{spelling}'s credential has no claudeAiOauth")))?;
+        let was = oauth.get("expiresAt").and_then(Value::as_i64);
         oauth.insert("expiresAt".into(), json!(now_ms() - EXPIRED_BY_MS));
         self.write_credential(
             spelling,
             &place,
             &serde_json::to_vec(&v).expect("a Value serializes"),
         )?;
-        Ok(json!({"place": place.describe(), "generation": generation(&bytes)}))
+        Ok((
+            json!({"place": place.describe(), "generation": generation(&bytes)}),
+            was,
+        ))
+    }
+
+    /// Leaves the home's access token fresh after `expire` replaced `was_ms`: when the token is
+    /// still the expired one, its `expiresAt` goes back to `was_ms`, the tokens untouched (the
+    /// server never expired it); a token that has life to spare already, CC's or tagteam's
+    /// refresh, is left alone. `Ok(true)` when it wrote. An error when neither holds, since the
+    /// next check could not send a message without a refresh. Only while nothing runs in the home.
+    pub fn unexpire(&self, spelling: &str, was_ms: i64) -> Result<bool, HarnessError> {
+        self.assert_quiescent(spelling)?;
+        let (bytes, place) = self
+            .read_credential(spelling)?
+            .ok_or_else(|| harness(format!("{spelling} holds no credential")))?;
+        if life_to_spare(&bytes, now_ms()).is_ok() {
+            return Ok(false);
+        }
+        let mut v: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| harness(format!("{spelling}'s credential is not JSON")))?;
+        let left = was_ms - now_ms();
+        if left < MIN_LIFE_MS {
+            return Err(harness(format!(
+                "the live token is expired, and the expiry it had before the check has {} s left: it needs a refresh",
+                left / 1000
+            )));
+        }
+        v["claudeAiOauth"]["expiresAt"] = json!(was_ms);
+        self.write_credential(
+            spelling,
+            &place,
+            &serde_json::to_vec(&v).expect("a Value serializes"),
+        )?;
+        Ok(true)
     }
 
     /// The account's vault entry: the compat keychain file on macOS, the vault file on Linux.
@@ -527,9 +593,12 @@ impl Ctx {
     /// interactive interface opens straight onto its prompt. Under CC's config lock (§9.1).
     pub fn seed_trust(&self, spelling: &str) -> Result<(), HarnessError> {
         let paths = self.paths(spelling);
-        let _lock =
-            tagteam_cc::locks::acquire_config(&paths, Duration::from_secs(9), &Cancel::new())
-                .map_err(|e| harness(format!("CC's config lock: {e}")))?;
+        let _lock = tagteam_cc::locks::acquire_config(
+            &paths,
+            tagteam_cc::locks::CONFIG_ACQUIRE_TIMEOUT,
+            &Cancel::new(),
+        )
+        .map_err(|e| harness(format!("CC's config lock: {e}")))?;
         let mut doc = match fs::read(&paths.global_config) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => b"{}\n".to_vec(),
@@ -689,6 +758,73 @@ mod tests {
             generation(br#"{"claudeAiOauth":{"refreshToken":"rt-2"}}"#)
         );
         assert_eq!(generation(b"{}"), None);
+    }
+
+    #[test]
+    fn a_token_needs_minutes_to_spare() {
+        let at =
+            |ms: i64| format!(r#"{{"claudeAiOauth":{{"expiresAt":{ms},"refreshToken":"rt"}}}}"#);
+        let now = 1_800_000_000_000_i64;
+        assert_eq!(
+            life_to_spare(at(now + MIN_LIFE_MS).as_bytes(), now).unwrap(),
+            MIN_LIFE_MS
+        );
+        for ms in [now + MIN_LIFE_MS - 1, now, now - 60_000] {
+            let e = life_to_spare(at(ms).as_bytes(), now).unwrap_err().0;
+            assert!(e.contains("would refresh it under the check"), "{e}");
+        }
+        assert!(life_to_spare(b"{}", now).is_err());
+        assert!(life_to_spare(br#"{"claudeAiOauth":{"expiresAt":"soon"}}"#, now).is_err());
+    }
+
+    #[test]
+    fn an_expired_token_gets_its_old_expiry_back_unless_a_refresh_left_it_fresh() {
+        let _serial = crate::compat::sys::serial();
+        let scratch = crate::compat::layout::make_scratch().unwrap();
+        let ctx = offline_ctx(
+            &scratch,
+            PathBuf::from("/nonexistent/tagteam"),
+            Redactor::default(),
+        );
+        let home = ctx.new_home("live").unwrap();
+        let file = Path::new(&home).join(".credentials.json");
+        let was = now_ms() + 8 * 3_600_000;
+        let write = |expires: i64| {
+            fs::write(
+                &file,
+                format!(
+                    r#"{{"claudeAiOauth":{{"accessToken":"at","refreshToken":"rt","expiresAt":{expires}}}}}"#
+                ),
+            )
+            .unwrap();
+        };
+        let read = || expires_at(&fs::read(&file).unwrap()).unwrap();
+
+        // Expired by the check, put back: the same tokens, the expiry they had.
+        write(was);
+        let (note, noted) = ctx.expire_noting(&home).unwrap();
+        assert_eq!(noted, Some(was));
+        assert!(note["generation"].is_string());
+        assert!(read() < now_ms(), "expired");
+        assert!(ctx.unexpire(&home, was).unwrap());
+        assert_eq!(read(), was);
+        let after = String::from_utf8(fs::read(&file).unwrap()).unwrap();
+        assert!(
+            after.contains(r#""accessToken":"at""#) && after.contains(r#""refreshToken":"rt""#)
+        );
+
+        // Already fresh (a refresh ran): left alone, even when it differs from `was`.
+        let refreshed = now_ms() + 7 * 3_600_000;
+        write(refreshed);
+        assert!(!ctx.unexpire(&home, was).unwrap());
+        assert_eq!(read(), refreshed);
+
+        // Expired, and what it had before is no better: an error, nothing written.
+        write(now_ms() - 60_000);
+        let e = ctx.unexpire(&home, now_ms() + 1000).unwrap_err().0;
+        assert!(e.contains("needs a refresh"), "{e}");
+        assert!(read() < now_ms());
+        fs::remove_dir_all(&scratch).unwrap();
     }
 
     /// A `Ctx` off macOS over a new scratch directory, with no vault and no `claude`.
