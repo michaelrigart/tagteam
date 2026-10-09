@@ -123,8 +123,9 @@ pub fn fresh_global_config(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
 }
 
 /// How long tagteam holds the config lock while CC's start-up is watched: well past the 1.5 s
-/// CC retries it for, and past a slow start.
-const START_UP_WINDOW: Duration = Duration::from_secs(8);
+/// CC retries it for, and past a slow start, yet inside CC's 30 s start-up phase, so a CC that
+/// is slow to start still writes under the held lock and is not read as having waited it out.
+const START_UP_WINDOW: Duration = Duration::from_secs(15);
 
 /// §9.1 and Appendix A.7 (*2.1.292*): for its first 30 s, until its interactive UI is up, CC
 /// retries `<global config>.lock` for only 1.5 s and then writes the global config without it,
