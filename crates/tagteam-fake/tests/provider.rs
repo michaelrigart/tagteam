@@ -1177,3 +1177,34 @@ fn its_import_refuses_an_identity_without_a_handle_or_a_credential_without_a_tok
         KIND_STATIC
     );
 }
+
+#[test]
+fn a_settled_profile_read_waits_out_the_profile_s_own_lock() {
+    // §13.3: FakeAgent's one lock, in the profile's directory.
+    let f = fx();
+    let profile = f.env.data_dir().join("sessions/0194");
+    let spelling = profile.to_str().unwrap().to_owned();
+    login(&with_home(&f, &spelling), "bob", "ws", "tok-p", "renew-p");
+    let lock = profile.join(".live.lock");
+    fs::create_dir(&lock).unwrap();
+    let (home, held) = (with_home(&f, &spelling), lock.clone());
+    let session = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        login(&home, "bob", "ws", "tok-p2", "renew-p2");
+        fs::remove_dir(&held).unwrap();
+    });
+    let guard = MutationGuard::acquire(&f.env, Duration::from_millis(100)).unwrap();
+
+    let read = f
+        .fake
+        .read_profile_credential_settled(&f.env, &profile, &spelling, &guard)
+        .unwrap();
+    session.join().unwrap();
+
+    let c = read.present().unwrap();
+    assert_eq!(
+        f.fake.fingerprint(c.bytes()),
+        Some(Fingerprint::of_secret(b"renew-p2"))
+    );
+    assert!(!lock.exists(), "released on return");
+}

@@ -15,7 +15,8 @@ use tagteam_cc::{CcPaths, ClaudeCode, keychain_account};
 use tagteam_core::AccountId;
 use tagteam_provider::{
     EntryKind, Env, FakeKeychain, Keychain, KeychainError, LockError, LockState, MustShare,
-    Provenance, Provider, ProviderError, Read, canonical_profile_path, entry_matches, profile_path,
+    MutationGuard, Provenance, Provider, ProviderError, Read, canonical_profile_path,
+    entry_matches, profile_path,
 };
 
 struct Fx {
@@ -2224,4 +2225,40 @@ mod validation {
         );
         assert!(spawner.specs().is_empty(), "nothing was spawned");
     }
+}
+
+#[test]
+fn a_settled_profile_read_waits_out_the_profile_s_refresh_lock_then_releases_it() {
+    // §13.3: a refresh the session has in flight completes first, and the read is what it
+    // wrote. The locks are the profile's own, named from its spelling.
+    let f = fx_on(Platform::Linux);
+    let (dir, spelling) = profile(&f, "0193");
+    fs::write(
+        dir.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"refreshToken":"rt-consumed"}}"#,
+    )
+    .unwrap();
+    let lock = Path::new(&spelling).join(".oauth_refresh.lock");
+    fs::create_dir(&lock).unwrap();
+    let (file, held) = (dir.join(".credentials.json"), lock.clone());
+    let session = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        fs::write(&file, ENTRY).unwrap();
+        fs::remove_dir(&held).unwrap();
+    });
+    let guard = MutationGuard::acquire(&f.env, Duration::from_millis(100)).unwrap();
+    let started = std::time::Instant::now();
+
+    let read =
+        f.cc.read_profile_credential_settled(&f.env, &dir, &spelling, &guard)
+            .unwrap();
+    session.join().unwrap();
+
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    let c = read.present().unwrap();
+    assert_eq!((c.bytes(), c.provenance()), (ENTRY, Provenance::Fresh));
+    assert!(!lock.exists(), "released on return");
+    let mut legacy = fs::canonicalize(&dir).unwrap().into_os_string();
+    legacy.push(".lock");
+    assert!(!Path::new(&legacy).exists());
 }

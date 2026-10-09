@@ -750,6 +750,21 @@ impl Provider for FakeAgent {
         self.read_live_auth(&profile_env_in(env, dir)).credential
     }
 
+    /// `read_profile_credential`, under the profile's own `.live.lock` in `dir` (Decision 19:
+    /// FakeAgent names nothing of a profile after its spelling).
+    fn read_profile_credential_settled(
+        &self,
+        env: &Env,
+        dir: &Path,
+        spelling: &str,
+        guard: &MutationGuard,
+    ) -> Result<Read<Credential>, ProviderError> {
+        let held = self.lock_credentials(&profile_env_in(env, dir), guard, self.lock_budget)?;
+        let read = self.read_profile_credential(env, dir, spelling);
+        drop(held);
+        Ok(read)
+    }
+
     /// The `identity` key of `<dir>/identity.json`.
     fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity> {
         self.live_identity(&profile_env_in(env, dir))

@@ -705,6 +705,17 @@ pub trait Provider: Send + Sync {
     /// Keychain item named from `spelling`, the marker's recorded spelling, then the credential
     /// file in `dir`, the profile's actual directory.
     fn read_profile_credential(&self, env: &Env, dir: &Path, spelling: &str) -> Read<Credential>;
+    /// §13.3: `read_profile_credential` under the profile's own credential locks (CC: its
+    /// refresh lock and legacy lock, through `spelling`), taken after the account lock (§4.3)
+    /// and released before this returns. A refresh a session has in flight completes first, so
+    /// the read is the generation the profile settles on. `guard` is the caller's.
+    fn read_profile_credential_settled(
+        &self,
+        env: &Env,
+        dir: &Path,
+        spelling: &str,
+        guard: &MutationGuard,
+    ) -> Result<Read<Credential>, ProviderError>;
     /// §12.5 "Identity drift": the login identity of the profile in `dir`, its actual directory
     /// (CC: its `.claude.json` `oauthAccount`; Decision 19).
     fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity>;

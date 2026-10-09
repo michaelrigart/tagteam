@@ -615,6 +615,26 @@ impl Provider for ClaudeCode {
         )
     }
 
+    /// The profile's credential locks are named from `spelling`, as Claude Code running there
+    /// names them (M4b's `write_profile_credential` takes them the same way); the read is
+    /// `read_profile_credential`'s. Releasing them ends the operation.
+    fn read_profile_credential_settled(
+        &self,
+        env: &Env,
+        dir: &Path,
+        spelling: &str,
+        guard: &MutationGuard,
+    ) -> Result<Read<Credential>, ProviderError> {
+        let held = self.lock_credentials(
+            &session::profile_env(env, spelling),
+            guard,
+            self.lock_budget,
+        )?;
+        let read = self.read_profile_credential(env, dir, spelling);
+        drop(held);
+        Ok(read)
+    }
+
     /// The `oauthAccount` of the config in `dir`, where the profile is now (Decision 19).
     fn profile_identity(&self, env: &Env, dir: &Path) -> Read<Identity> {
         config::live_identity(&session::profile_paths(env, dir))
