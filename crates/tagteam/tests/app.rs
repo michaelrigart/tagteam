@@ -15,6 +15,7 @@ use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{CLAUDE_CODE, ProviderId, WindowKind};
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::Store;
+use tagteam_engine::transfer;
 use tagteam_provider::{Cancel, Env, FakeKeychain};
 
 const UNLOCK: &str = "The login keychain is locked (common over SSH). Unlock it now?";
@@ -1504,4 +1505,140 @@ fn keychain_orphans_is_named_in_the_summary_only_where_there_is_a_keychain() {
         c.platform = Platform::Linux
     });
     assert_eq!((code, err), (1, summary("")));
+}
+
+/// `a@x.co` stored at position 1 and live, and the path `export` writes to in `h`'s root.
+fn exporting() -> (H, String) {
+    let h = H::new();
+    h.login("a@x.co", "rt-a");
+    h.ok(&["add"]);
+    let path = h._dir.path().join("backup.age");
+    (h, path.to_str().unwrap().to_owned())
+}
+
+/// Every file directly in `dir`.
+fn files_in(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn an_export_asks_its_passphrase_twice_and_seals_the_file_with_it() {
+    let (h, path) = exporting();
+    let mut asked = Scripted::answering(&["pw-1", "pw-1"]);
+    let (code, out, err) = h.run(&["export", &path], &mut asked);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        asked.asked,
+        ["Passphrase for the export: ", "The same passphrase again: "]
+    );
+    assert_eq!(out, format!("Exported 1 account to {path}, encrypted.\n"));
+    assert!(err.contains("hands its OAuth logins over"), "{err}");
+    assert!(err.contains("#1 a@x.co is in use here"), "{err}");
+    let file = std::fs::read(&path).unwrap();
+    assert!(file.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----"));
+    assert!(!String::from_utf8_lossy(&file).contains("rt-a"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let opened = transfer::decode(&file, &[], &mut |_: &transfer::Need| {
+        Some(transfer::SecretString::from("pw-1"))
+    })
+    .unwrap();
+    assert_eq!(opened.records.len(), 1);
+    assert_eq!(
+        opened.records[0].credential["claudeAiOauth"]["refreshToken"],
+        "rt-a"
+    );
+}
+
+#[test]
+fn a_destination_that_cannot_be_written_refuses_before_any_prompt_or_vault_read() {
+    // Review Focus 5: a directory, a directory this user cannot write in, and `-` under
+    // `--json` each refuse first. `Scripted::answering(&[])` fails the test on any prompt.
+    let (h, _) = exporting();
+    let root = h._dir.path();
+    let dir = root.to_str().unwrap();
+    let (code, _, err) = h.run(&["export", dir], &mut Scripted::answering(&[]));
+    assert_eq!(code, 1);
+    assert_eq!(
+        err,
+        format!("tagteam: {dir} is a directory; name a file to export to\n")
+    );
+
+    let theirs = root.join("theirs");
+    std::fs::create_dir(&theirs).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let into = theirs.join("x.age");
+    let (code, _, err) = h.run(
+        &["export", into.to_str().unwrap()],
+        &mut Scripted::answering(&[]),
+    );
+    std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code, 1);
+    assert!(
+        err.starts_with(&format!(
+            "tagteam: cannot create the export in {}: ",
+            theirs.display()
+        )),
+        "{err}"
+    );
+
+    for args in [&["export", "-", "--json"][..], &["export", "--json"]] {
+        let (code, out, _) = h.run(args, &mut Scripted::answering(&[]));
+        assert_eq!(code, 2, "{args:?}");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"]["type"], "usage");
+        assert_eq!(
+            v["error"]["message"],
+            "export - writes the export to stdout, which --json needs for its result; name a file"
+        );
+    }
+    assert!(
+        files_in(root).iter().all(|f| !f.contains(".tagteam-")),
+        "no temporary file is left: {:?}",
+        files_in(root)
+    );
+}
+
+#[test]
+fn the_export_passphrase_must_be_typed_the_same_twice_and_not_be_empty() {
+    let (h, path) = exporting();
+    for (answers, message) in [
+        (&["pw-1", "pw-2"][..], "the two passphrases differ"),
+        (
+            &[""][..],
+            "an empty passphrase protects nothing; pass --plaintext to write the export unencrypted",
+        ),
+    ] {
+        let (code, _, err) = h.run(&["export", &path], &mut Scripted::answering(answers));
+        assert_eq!((code, err), (1, format!("tagteam: {message}\n")));
+        assert!(!Path::new(&path).exists());
+    }
+    assert_eq!(
+        files_in(h._dir.path()),
+        ["home"],
+        "no temporary file is left"
+    );
+}
+
+#[test]
+fn without_a_terminal_or_under_json_an_export_needs_a_key_or_plaintext() {
+    let (h, path) = exporting();
+    let (code, _, err) = h.run(&["export", &path], &mut Scripted::none());
+    assert_eq!(code, 1);
+    assert_eq!(
+        err,
+        "tagteam: an export is encrypted with a passphrase typed on a terminal; pass --recipient or --recipient-file to encrypt it to a key, or --plaintext to write it unencrypted\n"
+    );
+    let (code, out, _) = h.run(&["export", &path, "--json"], &mut Scripted::answering(&[]));
+    assert_eq!(code, 1);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["error"]["type"], "needs-passphrase");
+    assert!(!Path::new(&path).exists());
 }

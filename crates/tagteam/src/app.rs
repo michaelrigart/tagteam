@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use tagteam_core::autoswitch::Strategy;
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Window};
 use tagteam_engine::collect::CollectMode;
 use tagteam_engine::displace::PurgeError;
+use tagteam_engine::export::ExportRequest;
 use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::net::UreqHttp;
@@ -22,6 +24,7 @@ use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{self, ColorMode, Settings, parse_bool};
 use tagteam_engine::store::{AccountRow, Mapping, StoreError};
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
+use tagteam_engine::transfer::{self, Encryption, Recipient, SecretString};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, ShellAccount, StatusView};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
@@ -40,7 +43,7 @@ use crate::prompt::Prompter;
 use crate::shell_init::Wrapped;
 use crate::{
     auto, config_cmd, displaced_cmd, history, prompt, purge_cmd, render, root_guard, shell_init,
-    statusline,
+    statusline, transfer_cmd,
 };
 
 /// §13.1.
@@ -68,6 +71,12 @@ const KIND_NO_CANDIDATES: &str = "no-candidates";
 pub(crate) const KIND_INTERRUPTED: &str = "interrupted";
 /// A deletion that needs a person's yes, or `--yes` (§6.3).
 const KIND_NEEDS_CONFIRMATION: &str = "needs-confirmation";
+/// §13.3: an export's passphrase, which only a terminal can type. The engine's
+/// `TransferError::NeedsPassphrase` has the same kind for an import's.
+const KIND_NEEDS_PASSPHRASE: &str = "needs-passphrase";
+/// §13.3: every account was broken, or there was none to export.
+const KIND_NOTHING_EXPORTED: &str = "nothing-exported";
+const KIND_IO: &str = "io";
 
 /// Appendix A.3. The default keychain is the login keychain, so the hint names its file.
 const UNLOCK_QUESTION: &str = "The login keychain is locked (common over SSH). Unlock it now?";
@@ -91,6 +100,15 @@ const NOTHING_TO_SWITCH: &str =
     "auto-switch needs two switchable accounts on a provider; add another with `tagteam add`";
 const BAD_THRESHOLD: &str = "--threshold takes a number from 50 to 99.9";
 const BAD_INCLUDE: &str = "--include-api-key-accounts takes true, false, 1, 0, yes or no";
+const EXPORT_TO_STDOUT_UNDER_JSON: &str =
+    "export - writes the export to stdout, which --json needs for its result; name a file";
+const EXPORT_NEEDS_PASSPHRASE: &str = "an export is encrypted with a passphrase typed on a terminal; pass --recipient or --recipient-file to encrypt it to a key, or --plaintext to write it unencrypted";
+const EMPTY_PASSPHRASE: &str =
+    "an empty passphrase protects nothing; pass --plaintext to write the export unencrypted";
+const PASSPHRASES_DIFFER: &str = "the two passphrases differ";
+const PASSPHRASE: &str = "Passphrase for the export: ";
+const PASSPHRASE_AGAIN: &str = "The same passphrase again: ";
+const NOTHING_EXPORTED: &str = "no account was exported";
 const PURGE_DATA_NEEDS_YES: &str =
     "purge deletes tagteam's data for good; run it on a terminal to confirm, or pass --yes";
 
@@ -418,6 +436,27 @@ fn model_list(arg: &str) -> Vec<String> {
         .collect()
 }
 
+/// `--recipient` and `--recipient-file` (§13.3), each public key parsed before anything else
+/// runs. A bad key is a usage error naming the flag, and never quoted: it may be a private key
+/// pasted by mistake.
+fn recipients(flags: &[String], files: &[PathBuf]) -> Result<Vec<Recipient>, Failure> {
+    let mut out = Vec::new();
+    for r in flags {
+        out.push(
+            transfer::parse_recipient(r)
+                .map_err(|e| Failure::Usage(format!("--recipient: {e}")))?,
+        );
+    }
+    for f in files {
+        let named = |e: &dyn std::fmt::Display| {
+            Failure::Usage(format!("--recipient-file {}: {e}", f.display()))
+        };
+        let text = fs::read_to_string(f).map_err(|e| named(&e))?;
+        out.extend(transfer::parse_recipients(&text).map_err(|e| named(&e))?);
+    }
+    Ok(out)
+}
+
 /// `auto`'s flags as the loop takes them (§11.4); each is clamped there (§6.4). clap reads `nan`
 /// and `inf` as numbers, so `--threshold` must be finite. `--include-api-key-accounts` takes
 /// §6.4's booleans.
@@ -723,6 +762,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Config { .. } => "config",
         Command::Displaced { .. } => "displaced",
         Command::Purge { .. } => "purge",
+        Command::Export { .. } => "export",
         Command::Completions { .. } => "completions",
     }
 }
@@ -1209,6 +1249,14 @@ impl App<'_, '_> {
                 yes,
                 keychain_orphans,
             } => return self.purge(yes, keychain_orphans),
+            Command::Export {
+                file,
+                account,
+                full,
+                recipient,
+                recipient_file,
+                plaintext,
+            } => self.export(file, &account, full, &recipient, &recipient_file, plaintext)?,
             Command::Completions { .. } => unreachable!("run answers completions before dispatch"),
             Command::Auto {
                 once,
@@ -1237,6 +1285,113 @@ impl App<'_, '_> {
             }
         }
         Ok(0)
+    }
+
+    /// §13.3: `export`. The destination and the encryption are settled before any account is
+    /// read: a destination that cannot be written refuses first (Review Focus 5), and the
+    /// passphrase is asked for, and recipients parsed, before any lock is taken. The Keychain
+    /// check comes next (Appendix A.3), then the engine. Encryption and the write run once the
+    /// engine has released every lock.
+    fn export(
+        &mut self,
+        file: Option<String>,
+        account: &[String],
+        full: bool,
+        recipient: &[String],
+        recipient_file: &[PathBuf],
+        plaintext: bool,
+    ) -> Result<(), Failure> {
+        let path = file.filter(|f| f != "-").map(PathBuf::from);
+        if path.is_none() && self.json {
+            return Err(Failure::Usage(EXPORT_TO_STDOUT_UNDER_JSON.into()));
+        }
+        let pending = match &path {
+            Some(p) => Some(
+                transfer_cmd::ExportFile::create(p)
+                    .map_err(|e| Failure::Message(KIND_IO, e.to_string()))?,
+            ),
+            None => None,
+        };
+        let recipients = recipients(recipient, recipient_file)?;
+        let accounts = if account.is_empty() {
+            None
+        } else {
+            Some(
+                account
+                    .iter()
+                    .map(|a| self.resolve(a).map(|r| r.id))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        };
+        let encryption = if plaintext {
+            Encryption::Plaintext
+        } else if !recipients.is_empty() {
+            Encryption::Recipients(recipients)
+        } else {
+            Encryption::Passphrase(self.new_passphrase()?)
+        };
+        if self.engine.existing_store()?.is_some() {
+            self.ensure_unlocked()?;
+        }
+        let result = self.engine.export(&ExportRequest {
+            accounts,
+            provider: self.provider_flag.clone(),
+            full,
+        })?;
+        for w in transfer_cmd::export_warnings(&result) {
+            let _ = writeln!(self.io.err, "warning: {w}");
+        }
+        if result.accounts.is_empty() {
+            return Err(Failure::Message(
+                KIND_NOTHING_EXPORTED,
+                NOTHING_EXPORTED.into(),
+            ));
+        }
+        let bytes = transfer::encrypt(&result.envelope, &encryption).map_err(EngineError::from)?;
+        let encrypted = encryption.is_encrypted();
+        let human = transfer_cmd::export_human(&result, path.as_deref(), encrypted);
+        match pending {
+            Some(f) => {
+                f.publish(&bytes).map_err(EngineError::from)?;
+                let json = transfer_cmd::export_json(&result, path.as_deref(), encrypted);
+                self.print(&human, json);
+            }
+            None => {
+                self.io.out.write_all(&bytes).map_err(EngineError::from)?;
+                // stdout carries the export, so the summary goes to stderr.
+                let _ = write!(self.io.err, "{human}");
+            }
+        }
+        Ok(())
+    }
+
+    /// §13.3: the export's passphrase, asked twice without echo, only where a person can
+    /// answer and never under `--json`.
+    fn new_passphrase(&mut self) -> Result<SecretString, Failure> {
+        if !self.can_prompt() {
+            return Err(Failure::Message(
+                KIND_NEEDS_PASSPHRASE,
+                EXPORT_NEEDS_PASSPHRASE.into(),
+            ));
+        }
+        let first = self.io.prompter.secret(PASSPHRASE);
+        self.after_prompt()?;
+        let first = first.ok_or_else(cancelled)?;
+        if first.is_empty() {
+            return Err(Failure::Message(
+                KIND_INVALID_INPUT,
+                EMPTY_PASSPHRASE.into(),
+            ));
+        }
+        let again = self.io.prompter.secret(PASSPHRASE_AGAIN);
+        self.after_prompt()?;
+        if again.ok_or_else(cancelled)? != first {
+            return Err(Failure::Message(
+                KIND_INVALID_INPUT,
+                PASSPHRASES_DIFFER.into(),
+            ));
+        }
+        Ok(SecretString::from(first))
     }
 
     /// §6.4's reads. None touches the store or the Keychain, and none creates anything (§5).
@@ -2076,6 +2231,7 @@ mod tests {
             &["displaced"],
             &["completions", "bash"],
             &["purge", "--yes"],
+            &["export", "--plaintext"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))

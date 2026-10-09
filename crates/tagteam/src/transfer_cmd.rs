@@ -1,0 +1,238 @@
+//! `export` and `import` (§13.3): their output, and the export's file while it is being made.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+use serde_json::{Value, json};
+use tagteam_engine::export::ExportResult;
+use tagteam_engine::store::AccountRow;
+
+use crate::render;
+
+/// §13.3: whenever the file holds an OAuth account, export says that it hands logins over.
+pub(crate) const HAND_OFF: &str = "this export hands its OAuth logins over rather than copying them: whichever machine refreshes one first invalidates every other copy, so use it to move accounts; to use one account on two machines, log in on each";
+
+/// The export's file while it is made (§13.3): a temporary file created 0600 with `O_EXCL`
+/// beside the destination before any account is read, so a destination that cannot be written
+/// refuses first (Review Focus 5). `publish` renames it into place; dropped unpublished, it is
+/// removed.
+pub(crate) struct ExportFile {
+    temp: PathBuf,
+    target: PathBuf,
+    file: Option<File>,
+    published: bool,
+}
+
+impl ExportFile {
+    /// Refuses a directory, and a directory it cannot create a file in, before anything is
+    /// read; the error names the path.
+    pub(crate) fn create(target: &Path) -> io::Result<Self> {
+        if fs::metadata(target).is_ok_and(|m| m.is_dir()) {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!(
+                    "{} is a directory; name a file to export to",
+                    target.display()
+                ),
+            ));
+        }
+        let name = target.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} names no file to export to", target.display()),
+            )
+        })?;
+        let dir = match target.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let temp = dir.join(format!(
+            ".{}.tagteam-{}-{:08x}",
+            name.to_string_lossy(),
+            std::process::id(),
+            fastrand::u32(..)
+        ));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot create the export in {}: {e}", dir.display()),
+                )
+            })?;
+        Ok(Self {
+            temp,
+            target: target.to_path_buf(),
+            file: Some(file),
+            published: false,
+        })
+    }
+
+    /// Writes `bytes`, syncs them, and renames the file into place.
+    pub(crate) fn publish(mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut file = self.file.take().expect("an export file is published once");
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&self.temp, &self.target)?;
+        self.published = true;
+        if let Some(dir) = self.target.parent().filter(|d| !d.as_os_str().is_empty()) {
+            // Best effort, as every published write's directory sync is.
+            let _ = File::open(dir).and_then(|d| d.sync_all());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ExportFile {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.temp);
+        }
+    }
+}
+
+/// An account as export's and import's lines name it: `#2 b@x.co`.
+fn who(row: &AccountRow) -> String {
+    format!("#{} {}", row.position, render::email(row))
+}
+
+/// §13.3's warnings, for stderr: the hand-over, the accounts this machine goes on refreshing,
+/// and each account a bulk export skipped, with its reason.
+pub(crate) fn export_warnings(r: &ExportResult) -> Vec<String> {
+    let mut out = Vec::new();
+    if r.accounts.iter().any(|e| e.refreshes) {
+        out.push(HAND_OFF.to_owned());
+    }
+    for e in r.accounts.iter().filter(|e| e.in_use) {
+        out.push(format!(
+            "{} is in use here: this machine goes on refreshing it, so its exported copy stops working the next time it does",
+            who(&e.row)
+        ));
+    }
+    for s in &r.skipped {
+        out.push(format!("{} was not exported: {}", who(&s.row), s.reason));
+    }
+    out
+}
+
+pub(crate) fn export_human(r: &ExportResult, file: Option<&Path>, encrypted: bool) -> String {
+    let what = match r.accounts.len() {
+        1 => "1 account".to_owned(),
+        n => format!("{n} accounts"),
+    };
+    let how = if encrypted {
+        "encrypted"
+    } else {
+        "unencrypted"
+    };
+    match file {
+        Some(f) => format!("Exported {what} to {}, {how}.\n", f.display()),
+        None => format!("Exported {what}, {how}.\n"),
+    }
+}
+
+/// §13.3's `--json` for `export`.
+pub(crate) fn export_json(r: &ExportResult, file: Option<&Path>, encrypted: bool) -> Value {
+    let accounts: Vec<Value> = r
+        .accounts
+        .iter()
+        .map(|e| {
+            json!({
+                "provider": e.row.provider.as_str(),
+                "number": e.row.position,
+                "email": render::email(&e.row),
+                "source": e.source.as_str(),
+                "inUse": e.in_use,
+            })
+        })
+        .collect();
+    let skipped: Vec<Value> = r
+        .skipped
+        .iter()
+        .map(|s| {
+            json!({
+                "provider": s.row.provider.as_str(),
+                "number": s.row.position,
+                "email": render::email(&s.row),
+                "reason": s.reason,
+            })
+        })
+        .collect();
+    json!({
+        "schemaVersion": 1,
+        "ok": true,
+        "file": file.map(|f| f.display().to_string()),
+        "encrypted": encrypted,
+        "accounts": accounts,
+        "skipped": skipped,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn an_export_file_is_private_from_creation_and_appears_only_when_published() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("backup.age");
+        let f = ExportFile::create(&target).unwrap();
+        let temps: Vec<PathBuf> = fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(temps.len(), 1);
+        assert_eq!(
+            fs::metadata(&temps[0]).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!target.exists());
+        f.publish(b"sealed").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"sealed");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1, "no temp left");
+    }
+
+    #[test]
+    fn an_export_file_never_published_leaves_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        drop(ExportFile::create(&d.path().join("x")).unwrap());
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_directory_or_a_directory_it_cannot_write_in_is_refused_by_name() {
+        let d = tempfile::tempdir().unwrap();
+        let err = ExportFile::create(d.path()).err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "{} is a directory; name a file to export to",
+                d.path().display()
+            )
+        );
+        let locked = d.path().join("someone-else");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let err = ExportFile::create(&locked.join("x.age")).err().unwrap();
+        assert!(
+            err.to_string().starts_with(&format!(
+                "cannot create the export in {}: ",
+                locked.display()
+            )),
+            "{err}"
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}

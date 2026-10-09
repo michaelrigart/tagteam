@@ -20,6 +20,7 @@ mod run;
 mod shell_init;
 mod signals;
 mod statusline;
+mod transfer_cmd;
 
 const TEXT_UNDER_JSON: &str = "--help and --version print text; run them without --json";
 

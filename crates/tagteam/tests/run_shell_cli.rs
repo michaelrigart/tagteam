@@ -52,6 +52,7 @@ const COMMANDS: &[&[&str]] = &[
     ],
     &["completions", "bash"],
     &["purge", "--yes"],
+    &["export", "--plaintext"],
 ];
 
 /// `id`'s profile directory under the fixture's `sessions/`.
