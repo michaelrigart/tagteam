@@ -15,7 +15,7 @@ use tagteam_engine::doctor::{DoctorOptions, DoctorReport};
 use tagteam_engine::store::{DisplacedRow, Store};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::liveness::FakeProcess;
-use tagteam_provider::{Check, CheckStatus, Keychain, ProcessStamp};
+use tagteam_provider::{Check, CheckStatus, Keychain, ProcessStamp, Provider};
 
 fn doctor(fx: &Fx) -> DoctorReport {
     fx.engine.doctor(DoctorOptions::default()).unwrap()
@@ -762,6 +762,14 @@ fn populated(fx: &Fx) {
     let log = fx.env.log_file();
     fs::create_dir_all(log.parent().unwrap()).unwrap();
     fs::write(&log, "line\n").unwrap();
+    // Task 10: a profile with a seed, a baseline, a held reservation's file and a credential,
+    // and an entry of the source home on no share list.
+    let profile = seeded_profile(fx, &b);
+    fs::write(profile.join(".tagteam-baseline.json"), "{}").unwrap();
+    fs::create_dir_all(profile.join(".tagteam-launch")).unwrap();
+    fs::write(profile.join(".tagteam-launch/4242.lock"), "").unwrap();
+    fx.set_profile_credential(&profile, &credential("b@x.co", "rt-profile"));
+    fs::create_dir(fx.env.home.join(".claude/new-thing")).unwrap();
 }
 
 #[test]
@@ -1305,4 +1313,387 @@ fn a_log_path_that_is_a_directory_is_not_writable() {
     assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
     assert!(c.message.contains("is a directory"), "{}", c.message);
     fix(c);
+}
+
+// ---- Task 10 Part A: session profiles ----
+
+/// `id`'s profile, made by `Fx::make_profile`, with the account's login epoch as its seed's,
+/// agreeing with the vault: a profile as a bootstrap leaves it.
+fn seeded_profile(fx: &Fx, id: &AccountId) -> PathBuf {
+    let dir = fx.make_profile(id);
+    let row = fx.engine.store().unwrap().account(id).unwrap().unwrap();
+    fx.write_seed(&dir, row.login_epoch, &vault_fp(fx, id));
+    dir
+}
+
+#[test]
+fn a_real_projects_directory_in_a_profile_fails_and_another_split_file_warns() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = seeded_profile(&fx, &id);
+    fs::create_dir(dir.join("projects")).unwrap();
+    fs::write(dir.join("CLAUDE.md"), "a private copy\n").unwrap();
+    let r = doctor(&fx);
+    let splits = found(&r, "sessions.split");
+    assert_eq!(splits.len(), 2, "{splits:#?}");
+    let projects = splits
+        .iter()
+        .find(|c| c.message.contains("projects"))
+        .unwrap();
+    assert_eq!(projects.status, CheckStatus::Fail);
+    assert!(fix(projects).starts_with("merge "), "{projects:?}");
+    let claude_md = splits
+        .iter()
+        .find(|c| c.message.contains("CLAUDE.md"))
+        .unwrap();
+    assert_eq!(claude_md.status, CheckStatus::Warn);
+}
+
+#[test]
+fn a_marker_that_cannot_be_read_warns_naming_the_directory_to_delete() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let dir = fx
+        .env
+        .data_dir()
+        .join("sessions/0192ffff-0000-7000-8000-00000000000a");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(".tagteam-profile.json"), "not json").unwrap();
+    let r = doctor(&fx);
+    let (provider, c) = under(&r, "sessions.marker");
+    assert_eq!(provider, None);
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert_eq!(
+        fix(c),
+        format!(
+            "move any real `projects/` or `history.jsonl` in '{}' into the default home's, then delete it once no session runs in it",
+            dir.display()
+        ),
+        "history first, never deletion (§12.2)"
+    );
+}
+
+#[test]
+fn a_profile_without_a_store_account_warns_naming_what_to_delete() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let gone = AccountId::from_string("0192ffff-0000-7000-8000-00000000000b");
+    let dir = fx.profile_dir(&gone);
+    fx.write_marker(&dir, &gone, &fx.env);
+    let r = doctor(&fx);
+    let (provider, c) = under(&r, "sessions.orphan");
+    assert_eq!(provider, Some(&cc()));
+    assert!(
+        fix(c).contains(&format!("delete '{}'", dir.display())),
+        "{c:?}"
+    );
+}
+
+#[test]
+fn a_recorded_spelling_that_is_no_longer_canonical_warns() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = seeded_profile(&fx, &id);
+    let tagteam_provider::Read::Present(mut marker) = tagteam_provider::ProfileMarker::read(&dir)
+    else {
+        panic!("no marker")
+    };
+    marker.config_dir = "/moved/away/sessions/x".into();
+    marker.write(&dir).unwrap();
+    let c = one(&doctor(&fx), "sessions.spelling").clone();
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(c.message.contains("/moved/away"), "{}", c.message);
+}
+
+#[test]
+fn a_reservation_held_after_its_tagteam_died_is_information() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = seeded_profile(&fx, &id);
+    let lock = dir.join(".tagteam-launch/4242.lock");
+    let held = tagteam_provider::FlockGuard::try_lock(&lock)
+        .unwrap()
+        .unwrap();
+    let c = one(&doctor(&fx), "sessions.reservation").clone();
+    assert_eq!(c.status, CheckStatus::Info);
+    assert!(c.message.contains("(pid 4242) is gone"), "{}", c.message);
+    if cfg!(target_os = "linux") {
+        assert!(
+            c.message
+                .contains(&format!("held by pid {}", std::process::id())),
+            "{}",
+            c.message
+        );
+    }
+    drop(held);
+    assert!(found(&doctor(&fx), "sessions.reservation").is_empty());
+}
+
+#[test]
+fn a_baseline_awaiting_merge_back_and_a_profile_awaiting_a_bootstrap_are_information() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = seeded_profile(&fx, &id);
+    fs::write(dir.join(".tagteam-baseline.json"), "{}").unwrap();
+    let row = fx.engine.store().unwrap().account(&id).unwrap().unwrap();
+    fx.write_seed(&dir, row.login_epoch + 1, &vault_fp(&fx, &id));
+    let r = doctor(&fx);
+    assert_eq!(one(&r, "sessions.baseline").status, CheckStatus::Info);
+    let c = one(&r, "sessions.bootstrap");
+    assert_eq!(c.status, CheckStatus::Info);
+    assert!(c.message.contains("stale-marked"), "{}", c.message);
+}
+
+#[test]
+fn a_provenance_conflict_fails_naming_the_account_and_the_explicit_replacement() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = fx.make_profile(&id);
+    let row = fx.engine.store().unwrap().account(&id).unwrap().unwrap();
+    let seed = fx.cc.fingerprint(&credential("a@x.co", "rt-seed")).unwrap();
+    fx.write_seed(&dir, row.login_epoch, seed.as_str());
+    fx.set_profile_credential(&dir, &credential("a@x.co", "rt-profile"));
+    let r = doctor(&fx);
+    let (provider, c) = under(&r, "sessions.provenance");
+    assert_eq!(provider, Some(&cc()));
+    assert_eq!(c.status, CheckStatus::Fail);
+    assert_eq!(
+        fix(c),
+        "log in as account 1 with `claude`, then `tagteam add --position 1`: an explicit replacement settles it"
+    );
+    assert!(!r.ok());
+    assert_eq!(
+        tagteam_provider::Seed::read(&dir)
+            .present()
+            .unwrap()
+            .seed_fp,
+        seed.as_str(),
+        "doctor never applies provenance (§13.6)"
+    );
+}
+
+#[test]
+fn a_profile_credential_that_cannot_be_read_warns() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = seeded_profile(&fx, &id);
+    let (svc, acct) = fx.profile_item(&dir);
+    fx.kc.put(&svc, &acct, &credential("a@x.co", "rt-a"));
+    fx.kc.set_unreadable(&svc, &acct, true);
+    let c = one(&doctor(&fx), "sessions.credential").clone();
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        c.message.contains("cannot switch or launch"),
+        "{}",
+        c.message
+    );
+}
+
+#[test]
+fn entries_of_the_source_home_on_no_share_list_warn_and_private_ones_do_not() {
+    let fx = Fx::new();
+    let r = doctor(&fx);
+    assert_eq!(one(&r, "sessions.unknown-entries").status, CheckStatus::Ok);
+    let claude = fx.env.home.join(".claude");
+    fs::create_dir(claude.join("new-thing")).unwrap();
+    fs::create_dir(claude.join("cache")).unwrap();
+    let c = one(&doctor(&fx), "sessions.unknown-entries").clone();
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(c.message.ends_with(": new-thing"), "{}", c.message);
+}
+
+#[test]
+fn a_sessions_directory_that_cannot_be_listed_warns_once() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    seeded_profile(&fx, &id);
+    let sessions = fx.env.data_dir().join("sessions");
+    let r = with_mode(&sessions, 0o300, || doctor(&fx));
+    let (provider, c) = under(&r, "sessions.profiles");
+    assert_eq!(provider, None);
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        c.message.contains("cannot be listed (permission denied)"),
+        "{}",
+        c.message
+    );
+}
+
+#[test]
+fn a_session_state_that_cannot_be_read_warns_and_leaves_the_profile_to_its_session() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = seeded_profile(&fx, &id);
+    fs::write(dir.join(".tagteam-baseline.json"), "{}").unwrap();
+    fs::create_dir_all(dir.join("sessions")).unwrap();
+    fs::write(dir.join("sessions/4242.json"), "not json").unwrap();
+    let r = doctor(&fx);
+    let c = one(&r, "sessions.state");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        c.message.contains("4242.json") && c.message.contains("counts as in a session"),
+        "{}",
+        c.message
+    );
+    assert!(
+        found(&r, "sessions.baseline").is_empty(),
+        "a profile not known to be quiescent is its session's"
+    );
+}
+
+#[test]
+fn a_profile_identity_that_cannot_be_read_leaves_provenance_untold_with_a_warning() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = seeded_profile(&fx, &id);
+    fx.set_profile_credential(&dir, &credential("a@x.co", "rt-profile"));
+    fs::write(dir.join(".claude.json"), "{\"oauthAccount\": ").unwrap();
+    let c = one(&doctor(&fx), "sessions.provenance").clone();
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(c.message.contains("cannot be told"), "{}", c.message);
+}
+
+#[test]
+fn a_split_whose_paths_cannot_be_read_warns_that_it_cannot_be_told() {
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = seeded_profile(&fx, &id);
+    // The source's CLAUDE.md, and the profile's own `projects` link, each lead through a
+    // directory this user cannot search; the source's `projects` is the fixture's.
+    let blocked = fx.dir.path().join("blocked");
+    fs::create_dir_all(blocked.join("x")).unwrap();
+    let claude = fx.env.home.join(".claude");
+    fs::remove_file(claude.join("CLAUDE.md")).unwrap();
+    std::os::unix::fs::symlink(blocked.join("x/CLAUDE.md"), claude.join("CLAUDE.md")).unwrap();
+    std::os::unix::fs::symlink(blocked.join("x/projects"), dir.join("projects")).unwrap();
+    let r = with_mode(&blocked, 0o000, || doctor(&fx));
+    let splits = found(&r, "sessions.split");
+    for name in ["CLAUDE.md", "projects"] {
+        assert!(
+            splits.iter().any(|c| c.status == CheckStatus::Warn
+                && c.message.contains("cannot be told")
+                && c.message
+                    .contains(&format!("{name} cannot be read (permission denied)"))),
+            "{name}: {splits:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_source_home_that_cannot_be_listed_warns() {
+    let fx = Fx::new();
+    let claude = fx.env.home.join(".claude");
+    let r = with_mode(&claude, 0o300, || doctor(&fx));
+    let c = one(&r, "sessions.unknown-entries");
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        c.message.contains("cannot be listed (permission denied)"),
+        "{}",
+        c.message
+    );
+}
+
+#[test]
+fn a_profile_naming_no_identity_still_reports_a_provenance_conflict() {
+    // §12.5: an absent identity is no drift. With P, V and S all distinct the table says
+    // conflict, which fails; where it says the profile rotated, nothing names the rotation the
+    // account's, which warns (Decision 9).
+    for (seed_rt, status) in [("rt-seed", CheckStatus::Fail), ("rt-a", CheckStatus::Warn)] {
+        let fx = Fx::new();
+        let id = fx.add("a@x.co", "rt-a");
+        let dir = fx.make_profile(&id);
+        let row = fx.engine.store().unwrap().account(&id).unwrap().unwrap();
+        let seed = fx.cc.fingerprint(&credential("a@x.co", seed_rt)).unwrap();
+        fx.write_seed(&dir, row.login_epoch, seed.as_str());
+        fx.set_profile_credential(&dir, &credential("a@x.co", "rt-profile"));
+        fs::write(dir.join(".claude.json"), "{}").unwrap();
+        let c = one(&doctor(&fx), "sessions.provenance").clone();
+        assert_eq!(c.status, status, "{seed_rt}: {c:?}");
+    }
+}
+
+#[test]
+fn an_account_s_profile_without_a_marker_warns_and_its_splits_are_still_judged() {
+    // §13.6: a profile is its account's by its directory, whatever its marker says.
+    let fx = Fx::new();
+    let id = fx.add("a@x.co", "rt-a");
+    let dir = fx.profile_dir(&id);
+    fs::create_dir_all(dir.join("projects")).unwrap();
+    let row = fx.engine.store().unwrap().account(&id).unwrap().unwrap();
+    fx.write_seed(&dir, row.login_epoch, &vault_fp(&fx, &id));
+    let r = doctor(&fx);
+    let (provider, c) = under(&r, "sessions.marker");
+    assert_eq!(provider, Some(&cc()));
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        c.message.contains("account 1's profile marker is missing"),
+        "{}",
+        c.message
+    );
+    assert!(
+        fix(c).starts_with("move any real `projects/`")
+            && fix(c).ends_with("log in again and run `tagteam add --position 1`"),
+        "never deletion first: {c:?}"
+    );
+    let split = one(&r, "sessions.split");
+    assert_eq!(split.status, CheckStatus::Fail);
+    assert!(split.message.contains("projects"), "{}", split.message);
+    assert!(found(&r, "sessions.orphan").is_empty());
+}
+
+#[test]
+fn an_orphan_of_a_registered_provider_with_no_account_is_found_from_sessions_itself() {
+    // §13.6: orphans come from `sessions/`, not from the providers that have accounts.
+    let ff = FakeFx::new();
+    ff.fx.add("a@x.co", "rt-a");
+    let dir = ff
+        .fx
+        .make_profile_for(ff.fake.as_ref(), &AccountId::from_string("0192-fake"));
+    let r = ff.engine.doctor(DoctorOptions::default()).unwrap();
+    let (provider, c) = under(&r, "sessions.orphan");
+    assert_eq!(provider, None);
+    assert!(
+        c.message.contains(&dir.display().to_string()) && c.message.contains("fake-agent"),
+        "{}",
+        c.message
+    );
+}
+
+#[test]
+fn an_account_s_profile_whose_marker_names_another_provider_is_still_the_account_s() {
+    // §5: `sessions/<id>` is account `<id>`'s profile, whatever its marker says. A marker naming
+    // another provider (one with no account here, or one this build lacks) warns, and the
+    // checks that need no marker still run: a real `projects/` fails.
+    let ff = FakeFx::new();
+    let fx = &ff.fx;
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    for (id, provider) in [(&a, "fake-agent"), (&b, "ghost")] {
+        let dir = fx.profile_dir(id);
+        fs::create_dir_all(dir.join("projects")).unwrap();
+        tagteam_provider::ProfileMarker {
+            provider: ProviderId::new(provider),
+            account_id: id.clone(),
+            config_dir: dir.display().to_string(),
+            outer: serde_json::json!({}),
+        }
+        .write(&dir)
+        .unwrap();
+    }
+    let r = ff.engine.doctor(DoctorOptions::default()).unwrap();
+    let markers = found(&r, "sessions.marker");
+    assert_eq!(markers.len(), 2, "{markers:#?}");
+    for (c, provider) in markers.iter().zip(["fake-agent", "ghost"]) {
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(
+            c.message.contains(&format!("of {provider} instead")),
+            "{}",
+            c.message
+        );
+        assert!(fix(c).starts_with("move any real `projects/`"), "{c:?}");
+    }
+    let splits = found(&r, "sessions.split");
+    assert_eq!(splits.len(), 2, "{splits:#?}");
+    assert!(splits.iter().all(|c| c.status == CheckStatus::Fail));
+    assert!(found(&r, "sessions.orphan").is_empty());
 }

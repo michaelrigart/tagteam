@@ -18,15 +18,22 @@ use tagteam_core::autoswitch::Strategy;
 use tagteam_core::rank::span;
 use tagteam_core::trust::is_future_stamped;
 use tagteam_core::usage::WindowKind;
+use tagteam_core::{ProvenanceVerdict, provenance};
 use tagteam_provider::atomic::{temp_writer_pid, writable};
 use tagteam_provider::doctor::quoted;
 use tagteam_provider::env::LOG_ROTATIONS;
-use tagteam_provider::{Check, CheckStatus, Liveness, LockState, Provider, Read};
+use tagteam_provider::profile::{ProfileMarker, Seed, canonical_profile_path, launch_reservations};
+use tagteam_provider::{
+    Check, CheckStatus, Env, Liveness, LockProbe, LockState, Provenance, Provider, Read, holders_of,
+};
 
 use crate::auto::{engine_lock_path, read_holder};
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::profiles::{Held, allowlist, held, is_private, resolved};
+use crate::provenance::identity_drifted;
 use crate::recover::Direction;
+use crate::session::SessionState;
 use crate::settings::{self, Settings};
 use crate::store::{
     AccountRow, JournalRow, SCHEMA_VERSION, Store, backoff_holds, backoff_is_skewed,
@@ -260,11 +267,13 @@ impl Engine {
         run.vault_orphans();
         run.rescues(opts.provider.as_ref());
         run.displaced(opts.provider.as_ref());
+        run.stray_profiles(opts.provider.as_ref());
         for p in &providers {
             run.accounts(p.as_ref());
             run.usage(p.as_ref());
             run.journal(p.as_ref());
             run.auto(p.as_ref());
+            run.sessions(p.as_ref());
             self.check_cancel()?;
             let id = p.id();
             for check in p.doctor_checks(&self.env, self.spawner.as_ref(), self.cancel()) {
@@ -1772,6 +1781,621 @@ impl Run<'_> {
                 .fix("check the name against `tagteam list`, then `tagteam config set autoswitch.models …`"),
             );
         }
+    }
+
+    /// The fix for a profile directory doctor cannot place: real history first, never deleted
+    /// (§12.2), then the directory.
+    fn move_then_delete(dir: &Path) -> String {
+        format!(
+            "move any real `projects/` or `history.jsonl` in {} into the default home's, then delete it once no session runs in it",
+            quoted(dir)
+        )
+    }
+
+    /// Every directory under `sessions/`, with its marker as read (§12.2); an error when
+    /// `sessions/` cannot be listed, which `stray_profiles` reports.
+    fn profile_dirs(&self) -> io::Result<Vec<(PathBuf, Read<ProfileMarker>)>> {
+        let dirs = subdirs(&self.engine.env.data_dir().join("sessions"))?;
+        Ok(dirs
+            .into_iter()
+            .map(|d| {
+                let m = ProfileMarker::read(&d);
+                (d, m)
+            })
+            .collect())
+    }
+
+    /// §13.6 Session profiles that belong to no provider in scope, found from `sessions/`
+    /// itself: a marker that cannot be read, one naming a provider this build lacks or one out
+    /// of scope (a registered provider with no account), and a directory with no marker, each
+    /// in a directory no stored account owns. An account's own profile, marker or not, is its
+    /// provider's to report (`sessions`). Each names what to delete. A `sessions/` that cannot
+    /// be listed warns here, once, for every provider.
+    fn stray_profiles(&mut self, only: Option<&ProviderId>) {
+        let profiles = match self.profile_dirs() {
+            Ok(profiles) => profiles,
+            Err(e) => {
+                let dir = self.engine.env.data_dir().join("sessions");
+                self.push(
+                    None,
+                    Check::warn(
+                        "sessions.profiles",
+                        format!(
+                            "{} cannot be listed ({}), so no session profile is checked",
+                            dir.display(),
+                            e.kind()
+                        ),
+                    )
+                    .fix(readable(&dir)),
+                );
+                return;
+            }
+        };
+        let Some(accounts) = self.all_accounts() else {
+            return;
+        };
+        // The providers whose `sessions` runs, and reports their own orphans (§13.1's scope).
+        let in_scope: Vec<ProviderId> = self.scope(only).iter().map(|p| p.id()).collect();
+        let mut found = Vec::new();
+        for (dir, marker) in profiles {
+            let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if accounts.iter().any(|r| r.id.as_str() == name) {
+                continue;
+            }
+            let delete = format!("once no session runs in it, delete {}", quoted(&dir));
+            match marker {
+                Read::Unreadable(e) => found.push(
+                    Check::warn(
+                        "sessions.marker",
+                        format!(
+                            "the profile marker {} cannot be read ({}), so whose profile {} is cannot be told",
+                            e.what,
+                            e.detail,
+                            dir.display()
+                        ),
+                    )
+                    .fix(Self::move_then_delete(&dir)),
+                ),
+                Read::Present(m) if self.engine.registry.get(&m.provider).is_none() => {
+                    if only.is_none() {
+                        found.push(
+                            Check::warn(
+                                "sessions.orphan",
+                                format!(
+                                    "{} is a profile of {}, which this tagteam does not have",
+                                    dir.display(),
+                                    m.provider
+                                ),
+                            )
+                            .fix(delete),
+                        );
+                    }
+                }
+                // A registered provider with no account is out of scope, so no `sessions` run
+                // finds its orphans.
+                Read::Present(m) if !in_scope.contains(&m.provider) => {
+                    if only.is_none() {
+                        found.push(
+                            Check::warn(
+                                "sessions.orphan",
+                                format!(
+                                    "{} is a profile of {}, which has no account in this store",
+                                    dir.display(),
+                                    m.provider
+                                ),
+                            )
+                            .fix(format!(
+                                "{delete}; `tagteam purge` deletes it with its Keychain item"
+                            )),
+                        );
+                    }
+                }
+                Read::Present(_) => {}
+                Read::Absent => found.push(
+                    Check::warn(
+                        "sessions.orphan",
+                        format!(
+                            "{} has no profile marker and names no account",
+                            dir.display()
+                        ),
+                    )
+                    .fix(delete),
+                ),
+            }
+        }
+        for check in found {
+            self.push(None, check);
+        }
+    }
+
+    /// §13.6 Session profiles, for `p`: each profile whose marker names `p`, and the entries of
+    /// `p`'s source home on no share list. The profiles need every account and `sessions/`'s
+    /// listing; when either cannot be read, `store.accounts` (or `store.skipped`) and
+    /// `sessions.profiles` say so, once.
+    fn sessions(&mut self, p: &dyn Provider) {
+        if !p.capabilities().sessions {
+            return;
+        }
+        let id = p.id();
+        let mut found = Vec::new();
+        let (accounts, profiles) = match (self.all_accounts(), self.profile_dirs()) {
+            (Some(accounts), Ok(profiles)) => (accounts, profiles),
+            _ => (Vec::new(), Vec::new()),
+        };
+        for (dir, marker) in profiles {
+            // §5: a directory named by a stored account's ID is that account's profile, whatever
+            // its marker says, and the account's provider checks it.
+            let name = dir.file_name().and_then(|n| n.to_str());
+            if let Some(row) = accounts.iter().find(|r| Some(r.id.as_str()) == name) {
+                if row.provider != id {
+                    continue;
+                }
+                let why = match &marker {
+                    Read::Present(m) if m.account_id == row.id && m.provider == row.provider => {
+                        self.profile(p, row, &dir, Some(m), &mut found);
+                        continue;
+                    }
+                    Read::Present(m) => format!("names {} of {} instead", m.account_id, m.provider),
+                    Read::Unreadable(e) => format!("cannot be read ({}: {})", e.what, e.detail),
+                    Read::Absent => "is missing".to_owned(),
+                };
+                // §13.6: a marker that cannot be trusted warns, and what needs no marker is
+                // still checked.
+                let n = row.position;
+                found.push(
+                    Check::warn(
+                        "sessions.marker",
+                        format!(
+                            "account {n}'s profile marker {why}, so its recorded spelling and outer home are unknown: its credential and provenance are not checked"
+                        ),
+                    )
+                    .fix(format!(
+                        "{}; if account {n}'s login then stops working, log in again and run `{}`",
+                        Self::move_then_delete(&dir),
+                        command(self.engine, &id, &format!("add --position {n}"))
+                    )),
+                );
+                self.profile(p, row, &dir, None, &mut found);
+                continue;
+            }
+            // Any other directory is its marker's provider's; `stray_profiles` reports one
+            // with no marker it can read.
+            let Read::Present(m) = marker else { continue };
+            if m.provider != id {
+                continue;
+            }
+            match accounts.iter().find(|r| r.id == m.account_id && r.provider == id) {
+                Some(row) => found.push(
+                    Check::warn(
+                        "sessions.marker",
+                        format!(
+                            "{} holds the marker of account {}'s profile, which lives elsewhere",
+                            dir.display(),
+                            row.position
+                        ),
+                    )
+                    .fix(Self::move_then_delete(&dir)),
+                ),
+                None => found.push(
+                    Check::warn(
+                        "sessions.orphan",
+                        format!("{} is a profile of an account this store no longer has", dir.display()),
+                    )
+                    .fix(format!(
+                        "once no session runs in it, delete {}; `tagteam purge` deletes it with its Keychain item",
+                        quoted(&dir)
+                    )),
+                ),
+            }
+        }
+        self.unknown_entries(p, &mut found);
+        for check in found {
+            self.push(Some(&id), check);
+        }
+    }
+
+    /// One profile of account `row` (§12.2–§12.6), read and probed only. With no marker, its
+    /// splits are judged against the default home, as `remove` judges such a profile, and what
+    /// needs the recorded spelling (the spelling itself, the credential and the provenance) is
+    /// skipped: the caller's `sessions.marker` warning says so.
+    fn profile(
+        &self,
+        p: &dyn Provider,
+        row: &AccountRow,
+        dir: &Path,
+        marker: Option<&ProfileMarker>,
+        found: &mut Vec<Check>,
+    ) {
+        let n = row.position;
+        let env = &self.engine.env;
+        if let Some(marker) = marker {
+            self.spelling(p, dir, marker, n, found);
+        }
+        match marker.map(|m| p.apply_outer_home(env, &m.outer)) {
+            Some(Ok(outer)) => self.splits(p, &outer, dir, found),
+            Some(Err(e)) => found.push(
+                Check::warn(
+                    "sessions.marker",
+                    format!("account {n}'s profile marker records an outer home that cannot be read: {e}"),
+                )
+                .fix(format!("nothing to do: account {n}'s next `tagteam run` records it again")),
+            ),
+            None => self.splits(p, env, dir, found),
+        }
+        let state = self.engine.session_state(p, row);
+        let quiescent = matches!(state, Ok(SessionState::Quiescent { .. }));
+        let unread = match &state {
+            Ok(SessionState::Unreadable { detail, .. }) => Some(detail.clone()),
+            Err(e) => Some(e.kind().to_owned()),
+            Ok(_) => None,
+        };
+        if let Some(why) = unread {
+            found.push(
+                Check::warn(
+                    "sessions.state",
+                    format!(
+                        "account {n}'s session state cannot be read ({why}), so the account counts as in a session: commands that change it refuse, and its baseline and provenance are not checked"
+                    ),
+                )
+                .fix("make what it names readable again; once no session runs in the profile, a damaged session record can be deleted"),
+            );
+        }
+        self.reservations(dir, n, found);
+        if quiescent && p.has_baseline(dir) {
+            found.push(
+                Check::info(
+                    "sessions.baseline",
+                    format!("account {n}'s profile has a config baseline awaiting merge-back"),
+                )
+                .fix(format!(
+                    "nothing to do: account {n}'s next `tagteam run` merges it back"
+                )),
+            );
+        }
+        let seed = Seed::read(dir);
+        match &seed {
+            Read::Present(s) if s.login_epoch != row.login_epoch || s.needs_bootstrap => {
+                let why = if s.login_epoch != row.login_epoch {
+                    "is stale-marked: an explicit command replaced the account's login"
+                } else {
+                    "needs a bootstrap: its last login check found it invalid"
+                };
+                found.push(
+                    Check::info("sessions.bootstrap", format!("account {n}'s profile {why}")).fix(
+                        format!("nothing to do: account {n}'s next `tagteam run` bootstraps it"),
+                    ),
+                );
+            }
+            Read::Unreadable(e) => found.push(
+                Check::warn(
+                    "sessions.seed",
+                    format!(
+                        "account {n}'s profile seed {} cannot be read: {}",
+                        e.what, e.detail
+                    ),
+                )
+                .fix(format!(
+                    "nothing to do: account {n}'s next `tagteam run` bootstraps it"
+                )),
+            ),
+            _ => {}
+        }
+        // The credential's Keychain item is named from the recorded spelling (§12.2).
+        let Some(marker) = marker else { return };
+        if self.secrets() != Secrets::Readable {
+            return;
+        }
+        let cannot = format!(
+            "account {n}'s profile credential cannot be read, so the account cannot switch or launch until it can"
+        );
+        let held = match p.read_profile_credential(env, dir, &marker.config_dir) {
+            Read::Unreadable(e) => {
+                found.push(
+                    Check::warn("sessions.credential", format!("{cannot}: {e}"))
+                        .fix("make it readable again (on macOS, unlock the login keychain)"),
+                );
+                return;
+            }
+            Read::Present(c) if c.provenance() == Provenance::Degraded => {
+                found.push(
+                    Check::warn(
+                        "sessions.credential",
+                        format!("{cannot}: only its file could be read, which may be out of date"),
+                    )
+                    .fix("make its Keychain item readable again (unlock the login keychain)"),
+                );
+                return;
+            }
+            Read::Present(c) => c.bytes().to_vec(),
+            Read::Absent => return,
+        };
+        let Read::Present(seed) = seed else { return };
+        if !quiescent {
+            return;
+        }
+        // §12.5: only a login that names another account is drift, which is ignored. An absent
+        // identity decides nothing: the table runs, and only a rotation needs one (Decision 9).
+        let identity_absent = match p.profile_identity(env, dir) {
+            Read::Present(login) if !identity_drifted(&login, row) => false,
+            Read::Present(_) => return,
+            Read::Absent => true,
+            Read::Unreadable(e) => {
+                found.push(
+                    Check::warn(
+                        "sessions.provenance",
+                        format!(
+                            "whether account {n}'s profile and the vault both moved cannot be told: the profile's identity cannot be read ({e})"
+                        ),
+                    )
+                    .fix("make the file it names readable again"),
+                );
+                return;
+            }
+        };
+        let Some(p_fp) = p.fingerprint(&held).filter(|_| p.has_refresh_token(&held)) else {
+            return;
+        };
+        // An entry that cannot be read is `accounts.vault`'s `fail`, in the same run.
+        let Read::Present(vault) = self.engine.vault.read(&row.id) else {
+            return;
+        };
+        let Some(v_fp) = p.fingerprint(&vault) else {
+            return;
+        };
+        let stale = seed.login_epoch != row.login_epoch;
+        let replace = format!(
+            "log in as account {n} with `{}`, then `{}`: an explicit replacement settles it",
+            p.launch_command(),
+            command(self.engine, &p.id(), &format!("add --position {n}"))
+        );
+        match provenance(p_fp.as_str(), v_fp.as_str(), &seed.seed_fp, stale) {
+            ProvenanceVerdict::Conflict => found.push(
+                Check::fail(
+                    "sessions.provenance",
+                    format!(
+                        "account {n}'s profile and the vault both moved since they last agreed: nothing is captured, refreshed or launched for the account"
+                    ),
+                )
+                .fix(replace),
+            ),
+            // The profile rotated the vault's generation, but names no identity that says the
+            // rotation is the account's: no holder of its lock captures it (Decision 9).
+            ProvenanceVerdict::Capture if identity_absent => found.push(
+                Check::warn(
+                    "sessions.provenance",
+                    format!(
+                        "account {n}'s profile holds a login it rotated but names no identity, so it cannot be told to be the account's and is not captured"
+                    ),
+                )
+                .fix(replace),
+            ),
+            _ => {}
+        }
+    }
+
+    /// §13.6: a recorded spelling (§12.2 "One spelling") that is no longer the profile's
+    /// canonical path, or a path that cannot be resolved.
+    fn spelling(
+        &self,
+        p: &dyn Provider,
+        dir: &Path,
+        marker: &ProfileMarker,
+        n: u32,
+        found: &mut Vec<Check>,
+    ) {
+        match canonical_profile_path(dir) {
+            Ok(canonical) => {
+                let now = p.profile_spelling(&canonical);
+                if now != marker.config_dir {
+                    found.push(
+                        Check::warn(
+                            "sessions.spelling",
+                            format!(
+                                "account {n}'s profile is recorded as {} but is now {now}: the data directory moved",
+                                marker.config_dir
+                            ),
+                        )
+                        .fix(format!("nothing to do: account {n}'s next `tagteam run` bootstraps it")),
+                    );
+                }
+            }
+            Err(e) => found.push(
+                Check::warn(
+                    "sessions.spelling",
+                    format!(
+                        "whether account {n}'s profile is still at {} cannot be told: {} cannot be resolved ({})",
+                        marker.config_dir,
+                        dir.display(),
+                        e.kind()
+                    ),
+                )
+                .fix(readable(dir)),
+            ),
+        }
+    }
+
+    /// §12.2: a must-share entry the profile holds as a real copy, or as a link that resolves
+    /// elsewhere, fails; another shared entry held as a real copy warns. Read-only: link sync's
+    /// own allowlist and matcher, with the provider's `run.share_extra`.
+    fn splits(&self, p: &dyn Provider, outer: &Env, dir: &Path, found: &mut Vec<Check>) {
+        let policy = p.share_policy(outer);
+        let (settings, _) = Settings::load(&self.engine.env, &p.id());
+        for w in allowlist(&policy, &settings.share_extra, &mut Vec::new()) {
+            let (src, dst) = (policy.source.join(&w.name), dir.join(&w.name));
+            let untold = |path: &Path, e: io::Error| {
+                Check::warn(
+                    "sessions.split",
+                    format!(
+                        "whether {} is split from {} cannot be told: {} cannot be read ({})",
+                        dst.display(),
+                        src.display(),
+                        path.display(),
+                        e.kind()
+                    ),
+                )
+                .fix(readable(path))
+            };
+            let target = match resolved(&src) {
+                Ok(target) => target,
+                Err(e) => {
+                    found.push(untold(&src, e));
+                    continue;
+                }
+            };
+            let split = match held(&dst) {
+                Ok(Held::Real) => w.must.is_some() || target.is_some(),
+                Ok(Held::Link(_)) if w.must.is_some() && target.is_some() => match resolved(&dst) {
+                    Ok(now) => now != target,
+                    Err(e) => {
+                        found.push(untold(&dst, e));
+                        continue;
+                    }
+                },
+                Ok(Held::Link(_) | Held::Nothing) => false,
+                Err(e) => {
+                    found.push(untold(&dst, e));
+                    continue;
+                }
+            };
+            if !split {
+                continue;
+            }
+            found.push(if w.must.is_some() {
+                Check::fail(
+                    "sessions.split",
+                    format!(
+                        "{} is not the link to {} it must be: memory or history is split, and `tagteam run` refuses the account",
+                        dst.display(),
+                        src.display()
+                    ),
+                )
+                .fix(format!(
+                    "merge {} into {} by hand, then remove {}",
+                    quoted(&dst),
+                    quoted(&src),
+                    quoted(&dst)
+                ))
+            } else {
+                Check::warn(
+                    "sessions.split",
+                    format!(
+                        "{} is a real copy where {} should be linked: the two have split",
+                        dst.display(),
+                        src.display()
+                    ),
+                )
+                .fix(format!(
+                    "merge them by hand and remove {}; the next launch links it",
+                    quoted(&dst)
+                ))
+            });
+        }
+    }
+
+    /// §12.5: a reservation whose `tagteam` is gone but whose lock is still held, with the
+    /// processes that hold it where the OS can tell. Probed, never waited on, never created.
+    fn reservations(&self, dir: &Path, n: u32, found: &mut Vec<Check>) {
+        let list = match launch_reservations(dir) {
+            Read::Present(list) => list,
+            // The session state reads the same reservations, and `sessions.state` reports
+            // them when they cannot be read.
+            Read::Absent | Read::Unreadable(_) => return,
+        };
+        for (path, probe) in list {
+            if probe != LockProbe::Held {
+                continue;
+            }
+            let Some(parent) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if self.engine.process.exists(parent) != Some(false) {
+                continue;
+            }
+            let holders = match holders_of(&path) {
+                Some(pids) if !pids.is_empty() => format!(
+                    "held by pid {}",
+                    pids.iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some(_) => "held by a process this user cannot see".to_owned(),
+                None => "this OS cannot tell which process holds it".to_owned(),
+            };
+            found.push(
+                Check::info(
+                    "sessions.reservation",
+                    format!(
+                        "{} is still held although its tagteam (pid {parent}) is gone ({holders}): a process its `claude` started still runs, so account {n} stays in a session",
+                        path.display()
+                    ),
+                )
+                .fix("end that process to release the account"),
+            );
+        }
+    }
+
+    /// §12.2 "Unknown entries": the entries of `p`'s source home on neither its share lists
+    /// nor its known-private list, which each profile keeps its own of.
+    fn unknown_entries(&self, p: &dyn Provider, found: &mut Vec<Check>) {
+        let policy = p.share_policy(&self.engine.env);
+        let (settings, _) = Settings::load(&self.engine.env, &p.id());
+        let wanted = allowlist(&policy, &settings.share_extra, &mut Vec::new());
+        // A source home that does not exist holds nothing to report.
+        let listing = match policy.source.try_exists() {
+            Ok(false) => return,
+            Ok(true) => entries(&policy.source),
+            Err(e) => Err(e),
+        };
+        let paths = match listing {
+            Ok(paths) => paths,
+            Err(e) => {
+                found.push(
+                    Check::warn(
+                        "sessions.unknown-entries",
+                        format!(
+                            "{} cannot be listed ({}), so whether it holds entries on no share list cannot be told",
+                            policy.source.display(),
+                            e.kind()
+                        ),
+                    )
+                    .fix(readable(&policy.source)),
+                );
+                return;
+            }
+        };
+        let unknown: Vec<String> = paths
+            .iter()
+            .filter_map(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .filter(|n| !is_private(&policy, n) && !wanted.iter().any(|w| &w.name == n))
+            .collect();
+        if unknown.is_empty() {
+            found.push(Check::ok(
+                "sessions.unknown-entries",
+                format!(
+                    "every entry of {} is on a share list",
+                    policy.source.display()
+                ),
+            ));
+            return;
+        }
+        found.push(
+            Check::warn(
+                "sessions.unknown-entries",
+                format!(
+                    "{} holds entries on none of {}'s share lists, so each profile keeps its own: {}",
+                    policy.source.display(),
+                    p.display_name(),
+                    unknown.join(", ")
+                ),
+            )
+            .fix("to share one with every profile, `tagteam config set run.share_extra <names>`"),
+        );
     }
 
     /// §13.6: the one warning for every check skipped because the Keychain could not be read

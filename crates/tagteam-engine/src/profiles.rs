@@ -39,13 +39,13 @@ pub struct SyncReport {
 const OWN_PREFIX: &str = ".tagteam-";
 
 /// One allowlisted entry, and the kind a must-share one is created as.
-struct Wanted {
-    name: String,
-    must: Option<EntryKind>,
+pub(crate) struct Wanted {
+    pub(crate) name: String,
+    pub(crate) must: Option<EntryKind>,
 }
 
 /// What the profile holds where a link may belong.
-enum Held {
+pub(crate) enum Held {
     Nothing,
     /// A symbolic link, and the target it was made with.
     Link(PathBuf),
@@ -243,7 +243,11 @@ impl Engine {
 /// The must-share entries, then the shared ones, then `run.share_extra`, without repeats. A
 /// private name, or one of tagteam's own, is never on it; one named in `run.share_extra`
 /// warns.
-fn allowlist(policy: &SharePolicy, extra: &[String], warnings: &mut Vec<String>) -> Vec<Wanted> {
+pub(crate) fn allowlist(
+    policy: &SharePolicy,
+    extra: &[String],
+    warnings: &mut Vec<String>,
+) -> Vec<Wanted> {
     fn add(wanted: &mut Vec<Wanted>, name: &str, must: Option<EntryKind>) {
         if !wanted.iter().any(|w| w.name == name) {
             wanted.push(Wanted {
@@ -526,7 +530,7 @@ fn create_empty(source: &Path, src: &Path, kind: EntryKind) -> io::Result<()> {
     }
 }
 
-fn held(path: &Path) -> io::Result<Held> {
+pub(crate) fn held(path: &Path) -> io::Result<Held> {
     match fs::symlink_metadata(path) {
         Ok(m) if m.file_type().is_symlink() => Ok(Held::Link(fs::read_link(path)?)),
         Ok(_) => Ok(Held::Real),
@@ -553,7 +557,7 @@ fn names_nothing(e: &io::Error) -> bool {
 
 /// The fully resolved path of `path`, or `None` when there is nothing to resolve (absent, or a
 /// link to nothing, `names_nothing`).
-fn resolved(path: &Path) -> io::Result<Option<PathBuf>> {
+pub(crate) fn resolved(path: &Path) -> io::Result<Option<PathBuf>> {
     match fs::canonicalize(path) {
         Ok(p) => Ok(Some(p)),
         Err(e) if names_nothing(&e) => Ok(None),

@@ -30,7 +30,7 @@ pub use clock::{Clock, FakeClock, SystemClock};
 pub use credential::{Credential, FreshCredential, Provenance};
 pub use doctor::{Check, CheckStatus};
 pub use env::{Env, EnvError};
-pub use flock::{FlockGuard, LockProbe, MutationGuard, probe_lock};
+pub use flock::{FlockGuard, LockProbe, MutationGuard, holders_of, probe_lock};
 pub use http::{
     Http, HttpError, HttpRequest, HttpResponse, Method, NoHttp, RecordedRequest, ScriptedHttp,
 };
