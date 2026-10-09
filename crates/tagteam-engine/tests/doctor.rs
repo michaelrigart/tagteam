@@ -309,6 +309,41 @@ fn a_temp_file_whose_writer_is_gone_warns_and_one_being_written_does_not() {
 }
 
 #[test]
+fn a_temp_file_whose_writer_cannot_be_told_warns_and_is_not_called_clear() {
+    // §13.6: an input that cannot be read warns. Codex pre-merge slice 6: the file was skipped
+    // and, with nothing else found, the check said no write left a temp file behind.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let unsure = fx.env.data_dir().join(".x.json.tagteam-4245-0a1b2c3d");
+    fs::write(&unsure, "secret").unwrap();
+    fx.process.set(
+        4245,
+        FakeProcess {
+            exists: None,
+            ..FakeProcess::default()
+        },
+    );
+    let r = doctor(&fx);
+    let temps = found(&r, "store.temp-files");
+    assert_eq!(temps.len(), 1, "{temps:?}");
+    let c = temps[0];
+    assert_eq!(c.status, CheckStatus::Warn, "{c:?}");
+    assert!(
+        c.message.contains(&unsure.display().to_string())
+            && c.message.contains("pid 4245")
+            && c.message.contains("cannot be told"),
+        "{}",
+        c.message
+    );
+    assert!(
+        !fix(c).starts_with("rm ") && fix(c).contains("pid 4245"),
+        "{}",
+        fix(c)
+    );
+    assert!(unsure.exists(), "doctor stays read-only");
+}
+
+#[test]
 fn an_unparseable_settings_file_fails_and_a_bad_value_or_unknown_key_warns() {
     let fx = Fx::new();
     let path = fx.env.config_dir().join("config.toml");

@@ -673,7 +673,7 @@ impl Run<'_> {
     /// §13.6: a temp file the atomic writer left (§9.5) whose writer is gone, in tagteam's own
     /// directories or beside a file a provider's identity surface names (§3), the only places
     /// tagteam's writer runs. It may hold a secret. A directory that cannot be listed warns, and
-    /// the check is then not `ok`.
+    /// so does a file whose writer's liveness cannot be told; the check is then not `ok`.
     fn temp_files(&mut self, providers: &[Arc<dyn Provider>]) {
         let engine = self.engine;
         let env = &engine.env;
@@ -699,6 +699,7 @@ impl Run<'_> {
         dirs.sort();
         dirs.dedup();
         let mut found = Vec::new();
+        let mut undecided = Vec::new();
         for dir in dirs {
             let paths = match entries(&dir) {
                 Ok(paths) => paths,
@@ -712,13 +713,18 @@ impl Run<'_> {
                 let Some(pid) = name.and_then(temp_writer_pid) else {
                     continue;
                 };
-                if engine.process.exists(pid) == Some(false) {
-                    found.push((path, pid));
+                match engine.process.exists(pid) {
+                    Some(false) => found.push((path, pid)),
+                    // §13.6: an input that cannot be read warns. Whether its writer still runs
+                    // cannot be told, so the file is neither found nor cleared.
+                    None => undecided.push((path, pid)),
+                    Some(true) => {}
                 }
             }
         }
         found.sort();
-        if found.is_empty() && unlisted.is_empty() {
+        undecided.sort();
+        if found.is_empty() && unlisted.is_empty() && undecided.is_empty() {
             self.push(
                 None,
                 Check::ok("store.temp-files", "no write left a temp file behind"),
@@ -749,6 +755,22 @@ impl Run<'_> {
                     ),
                 )
                 .fix(format!("rm {}", quoted(&path))),
+            );
+        }
+        for (path, pid) in undecided {
+            self.push(
+                None,
+                Check::warn(
+                    "store.temp-files",
+                    format!(
+                        "{} is a temp file of a write by pid {pid}, and whether that process is still running cannot be told; it may hold a secret",
+                        path.display()
+                    ),
+                )
+                .fix(format!(
+                    "run `tagteam doctor` again; if it stays, check whether pid {pid} is a tagteam process before deleting {}",
+                    quoted(&path)
+                )),
             );
         }
     }
