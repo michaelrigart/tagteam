@@ -28,8 +28,8 @@ use super::registry::{Flags, Phase, select};
 use super::report::{CheckResult, EXIT_HARNESS, Evidence, Outcome, Report};
 use super::store;
 use super::sys::{
-    CAUGHT, HarnessError, Ran, cancel, catch_signals, drain, harness, interrupted, quiesce, tail,
-    wait_interactive, which_in,
+    CAUGHT, HarnessError, Ran, cancel, catch_signals, drain, harness, interrupted, quiesce,
+    spawn_interactive, tail, wait_interactive, which_in,
 };
 use super::version::{CcVersion, blessed};
 
@@ -64,7 +64,8 @@ pub fn build_tagteam(workspace: &Path) -> Result<PathBuf, HarnessError> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     // Unbounded in time, so a cancellation point (`wait_interactive`): cargo shares the
     // harness's group and terminal, and a signal ends it before the run starts anything.
-    let mut child = Command::new(cargo)
+    let mut build = Command::new(cargo);
+    build
         .args([
             "build",
             "--quiet",
@@ -77,9 +78,9 @@ pub fn build_tagteam(workspace: &Path) -> Result<PathBuf, HarnessError> {
         .current_dir(workspace)
         .stdin(Stdio::null())
         .stderr(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|e| harness(format!("could not run cargo: {e}")))?;
+        .stdout(Stdio::piped());
+    let mut child =
+        spawn_interactive(&mut build).map_err(|e| harness(format!("could not run cargo: {e}")))?;
     let stdout = drain(child.stdout.take());
     let status = wait_interactive(&mut child, cancel())?;
     let stdout = stdout

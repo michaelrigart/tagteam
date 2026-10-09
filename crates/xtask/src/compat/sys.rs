@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::process::CommandExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -337,24 +337,170 @@ fn end_group(child: &mut Child) -> bool {
     settle(GRACE, || done(child))
 }
 
-/// Waits for `child`, an interactive process that shares the harness's terminal and process
-/// group (`ssh -t`, `claude`, `cargo`), as a cancellation point: a signal recorded in `token`
-/// ends the child and everything it started (`end_tree`), reaps it, and returns `interrupted`,
-/// so the caller unwinds through its cleanup. A survivor is a harness error, not a silent one.
+/// Starts `cmd` as an interactive child: in a process group of its own (a shell's job control),
+/// with the terminal's streams inherited. `std` makes the group before it returns, so the group
+/// exists when this does. Wait for it with `wait_interactive`.
+pub fn spawn_interactive(cmd: &mut Command) -> io::Result<Child> {
+    cmd.process_group(0).spawn()
+}
+
+/// Whether the terminal on stdin is held by the harness's own group, so it may be handed on.
+fn tty_foreground_is_ours() -> bool {
+    // SAFETY: isatty, tcgetpgrp and getpgrp only read descriptor 0's and the process's state.
+    unsafe { libc::isatty(0) == 1 && libc::tcgetpgrp(0) == libc::getpgrp() }
+}
+
+/// `tcsetpgrp(0, pgid)` with SIGTTOU ignored around it: a background group calling it would be
+/// stopped otherwise.
+fn set_foreground(pgid: libc::pid_t) {
+    // SAFETY: SIGTTOU's disposition is set to ignore and put back; `tcsetpgrp` takes a group id
+    // and no pointer. Nothing else in the harness handles SIGTTOU.
+    unsafe {
+        let before = libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::tcsetpgrp(0, pgid);
+        libc::signal(libc::SIGTTOU, before);
+    }
+}
+
+/// The terminal handed to an interactive child's group. Dropping it hands the terminal back to
+/// the harness's own group, so no path leaves it with a dead or foreign foreground group. Without
+/// a terminal on stdin, or when the harness is not its foreground group, it does nothing.
+struct Foreground {
+    ours: Option<libc::pid_t>,
+}
+
+impl Foreground {
+    fn hand_to(pgid: u32) -> Self {
+        if !tty_foreground_is_ours() {
+            return Self { ours: None };
+        }
+        // SAFETY: getpgrp has no arguments and cannot fail.
+        let ours = unsafe { libc::getpgrp() };
+        let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+            return Self { ours: None };
+        };
+        set_foreground(pgid);
+        Self { ours: Some(ours) }
+    }
+}
+
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        if let Some(ours) = self.ours.take() {
+            set_foreground(ours);
+        }
+    }
+}
+
+/// Whether `child` leads a process group of its own (`spawn_interactive` made it so). The group
+/// is signalled as a whole only then: never the harness's own.
+fn leads_its_group(child: &Child) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+        return false;
+    };
+    // SAFETY: getpgid takes a process id and returns a group id; it touches no memory.
+    unsafe { libc::getpgid(pid) == pid }
+}
+
+/// Waits for `child`, started by `spawn_interactive`: a process group of its own, handed the
+/// terminal while stdin is one and always handed back, as a cancellation point. A signal
+/// recorded in `token` ends it, and so does a leader that ends by SIGINT, SIGTERM or SIGHUP
+/// (Ctrl-C reaches its group, not the harness): both return `interrupted`, so the caller
+/// unwinds through its cleanup. On every path out, normal exit included, the whole group is
+/// sent SIGTERM, then SIGKILL, until `kill(-pgid, 0)` says it is empty, and what left the
+/// group (a `setsid`) is swept from the process tree last seen (`end_tree`). A survivor is a
+/// harness error, not a silent one.
 pub fn wait_interactive(child: &mut Child, token: &Cancel) -> Result<ExitStatus, HarnessError> {
-    loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| harness(format!("could not wait for {}: {e}", child.id())))?
-        {
-            return Ok(status);
+    let pgid = child.id();
+    let own_group = leads_its_group(child);
+    let foreground = own_group.then(|| Foreground::hand_to(pgid));
+    let mut seen = BTreeSet::from([pgid]);
+    let mut last_listed = Instant::now();
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(Some(status)),
+            Ok(None) => {}
+            Err(e) => break Err(harness(format!("could not wait for {pgid}: {e}"))),
         }
         if let Some(n) = token.requested() {
-            end_tree(child)?;
-            return Err(interrupted(n));
+            break Err(interrupted(n));
+        }
+        // What the tree looks like while the leader lives, for the sweep once it is gone.
+        if last_listed.elapsed() >= Duration::from_secs(1) {
+            last_listed = Instant::now();
+            if let Ok(table) = process_table() {
+                seen.extend(tree_of(&table, &seen));
+            }
         }
         thread::sleep(Duration::from_millis(20));
+    };
+    // The terminal back first: the sweep below must not run with it held by a dying group.
+    drop(foreground);
+    let swept = if own_group {
+        end_group_of(child, pgid).and_then(|()| end_tree(child, seen))
+    } else {
+        // Not a group of its own (not started by `spawn_interactive`): the harness's own group
+        // is never signalled, only the child and what it started.
+        end_tree(child, seen)
+    };
+    match (outcome, swept) {
+        (_, Err(e)) => Err(e),
+        (Err(e), Ok(())) => Err(e),
+        (Ok(Some(status)), Ok(())) => match status.signal() {
+            Some(n) if CAUGHT.contains(&n) => Err(interrupted(n)),
+            _ => Ok(status),
+        },
+        (Ok(None), Ok(())) => Err(harness("the wait ended without a status")),
     }
+}
+
+/// Ends the process group `pgid` led by `child`: SIGTERM, up to `GRACE`, SIGKILL, up to `GRACE`
+/// again, until `kill(-pgid, 0)` reports it empty, reaping the leader. Nothing is signalled when
+/// the group is already empty (the usual end), so a reused id is never hit by a late signal.
+fn end_group_of(child: &mut Child, pgid: u32) -> Result<(), HarnessError> {
+    let _ = child.try_wait();
+    if !group_alive(pgid) {
+        return Ok(());
+    }
+    signal(pgid, "TERM", true);
+    if !settle(GRACE, || {
+        let _ = child.try_wait();
+        !group_alive(pgid)
+    }) {
+        signal(pgid, "KILL", true);
+        settle(GRACE, || {
+            let _ = child.try_wait();
+            !group_alive(pgid)
+        });
+    }
+    let _ = child.try_wait();
+    if !group_alive(pgid) {
+        return Ok(());
+    }
+    let left = group_members(pgid);
+    Err(harness(format!(
+        "{} process(es) of the interrupted command's group survived SIGKILL",
+        left.max(1)
+    )))
+}
+
+/// How many processes, zombies not counted, `ps` lists in group `pgid`; 0 if it cannot say.
+fn group_members(pgid: u32) -> usize {
+    let Ok(out) = Command::new("ps")
+        .args(["-A", "-o", "pid=,pgid=,stat="])
+        .env_clear()
+        .env("PATH", "/bin:/usr/bin")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return 0;
+    };
+    parse_process_table(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .filter(|(_, group, zombie)| *group == pgid && !*zombie)
+        .count()
 }
 
 /// Passes `end_tree` makes: SIGTERM, then SIGKILL until nothing of the tree is left.
@@ -407,26 +553,19 @@ fn tree_of(table: &[(u32, u32, bool)], roots: &BTreeSet<u32>) -> BTreeSet<u32> {
     }
 }
 
-/// Ends `child` and every process it started, none of which has a process group of its own to
-/// signal. The tree is listed before anything is signalled, and listed again on every pass from
-/// what was seen, so a descendant its parent's death re-parented is still found. Each member is
+/// Ends every process in `seen` (the pids of `child` and of what it started, as last listed)
+/// and everything that descends from them: what left the group, which killing the group does
+/// not reach. The tree is listed again on every pass from what was seen, so a descendant its parent's death re-parented is still found. Each member is
 /// signalled alone (never the harness, never a group): SIGTERM, a short grace while the direct
 /// child is reaped, then SIGKILL, up to `TREE_PASSES`. A survivor is an error.
-fn end_tree(child: &mut Child) -> Result<(), HarnessError> {
+fn end_tree(child: &mut Child, mut seen: BTreeSet<u32>) -> Result<(), HarnessError> {
     let me = std::process::id();
-    let mut seen: BTreeSet<u32> = BTreeSet::from([child.id()]);
     let mut left = 0;
     for pass in 0..TREE_PASSES {
-        let table = match process_table() {
-            Ok(table) => table,
-            Err(e) => {
-                // Without a listing only the direct child can be ended.
-                signal(child.id(), "KILL", false);
-                let _ = child.wait();
-                return Err(harness(format!(
-                    "could not list processes ({e}), so only the interrupted command itself was ended"
-                )));
-            }
+        let Ok(table) = process_table() else {
+            // Without a listing nothing can be swept. The group, which needs none, was ended
+            // before this.
+            return Ok(());
         };
         let _ = child.try_wait();
         let live: Vec<u32> = tree_of(&table, &seen)
@@ -815,9 +954,7 @@ impl Cmd {
     pub fn attached(self, roots: &Roots) -> Result<Option<i32>, HarnessError> {
         self.not_cancelled()?;
         roots.check_env(&self.vars)?;
-        let mut child = self
-            .command(&self.program, &self.args)
-            .spawn()
+        let mut child = spawn_interactive(&mut self.command(&self.program, &self.args))
             .map_err(|e| harness(format!("could not start {}: {e}", self.describe())))?;
         Ok(wait_interactive(&mut child, &self.cancel)?.code())
     }
@@ -900,7 +1037,7 @@ mod tests {
     #[test]
     fn a_cancelled_wait_ends_an_interactive_child_and_reaps_it() {
         let _serial = serial();
-        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let mut child = spawn_interactive(Command::new("/bin/sleep").arg("30")).unwrap();
         let pid = child.id();
         let token = Cancel::new();
         let later = token.clone();
@@ -980,6 +1117,84 @@ mod tests {
             assert!(!process_alive(pid), "{name} ({pid}) outlived the cancel");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs `script` as an interactive child to its end, and returns how long `wait_interactive`
+    /// took and the pid its `$!` was recorded as.
+    fn leader_that_leaves_one_behind(
+        script: &str,
+    ) -> (Duration, u32, Result<ExitStatus, HarnessError>) {
+        let dir = std::env::temp_dir().join(format!(
+            "xtask-leader-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = script.replace("PIDFILE", &dir.join("pid").display().to_string());
+        let mut child = spawn_interactive(Command::new("/bin/sh").args(["-c", &script])).unwrap();
+        let t = Instant::now();
+        let result = wait_interactive(&mut child, &Cancel::new());
+        let took = t.elapsed();
+        let pid: u32 = std::fs::read_to_string(dir.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (took, pid, result)
+    }
+
+    #[test]
+    fn a_leader_that_exits_leaves_no_descendant_that_ignores_sigint() {
+        // Codex slice 8 re-review: the leader is gone before the next poll, so a tree walk from
+        // it finds nothing; the group is ended on the normal path too.
+        let _serial = serial();
+        let (took, pid, result) =
+            leader_that_leaves_one_behind("trap '' INT; sleep 30 & echo $! > 'PIDFILE'; exit 0");
+        assert!(result.unwrap().success());
+        assert!(took < Duration::from_secs(3), "{took:?}");
+        assert!(
+            !process_alive(pid),
+            "the descendant ({pid}) outlived the wait"
+        );
+    }
+
+    #[test]
+    fn a_descendant_that_ignores_sigterm_too_is_killed_after_the_grace() {
+        let _serial = serial();
+        let (took, pid, result) = leader_that_leaves_one_behind(
+            "trap '' INT TERM; sleep 30 & echo $! > 'PIDFILE'; exit 0",
+        );
+        assert!(result.unwrap().success());
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        assert!(
+            !process_alive(pid),
+            "the descendant ({pid}) outlived the wait"
+        );
+    }
+
+    #[test]
+    fn a_leader_ended_by_sigint_counts_as_a_cancellation() {
+        let _serial = serial();
+        let mut child =
+            spawn_interactive(Command::new("/bin/sh").args(["-c", "kill -INT $$; sleep 5"]))
+                .unwrap();
+        let err = wait_interactive(&mut child, &Cancel::new()).unwrap_err();
+        assert_eq!(err, interrupted(SIGINT));
+    }
+
+    #[test]
+    fn a_child_that_does_not_lead_its_own_group_is_never_signalled_as_one() {
+        // Started without `spawn_interactive`, it shares the harness's group: a group signal
+        // would hit the test process. It is waited for and swept as a tree instead.
+        let _serial = serial();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        assert!(!leads_its_group(&child));
+        let status = wait_interactive(&mut child, &Cancel::new()).unwrap();
+        assert_eq!(status.code(), Some(3));
     }
 
     #[test]

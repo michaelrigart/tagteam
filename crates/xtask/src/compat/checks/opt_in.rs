@@ -17,7 +17,9 @@ use super::{ask, read_json};
 use crate::compat::ctx::Ctx;
 use crate::compat::keychain::{LOGIN_KEYCHAIN, SECURITY, login_lock_state};
 use crate::compat::report::{Outcome, Probe};
-use crate::compat::sys::{HarnessError, cancel, harness, shell_quote, wait_interactive};
+use crate::compat::sys::{
+    HarnessError, cancel, harness, shell_quote, spawn_interactive, wait_interactive,
+};
 
 /// The `<word> <number>...` lines the SSH script writes.
 fn field(results: &str, word: &str, i: usize) -> Option<i64> {
@@ -81,9 +83,7 @@ pub fn ssh_keychain_read(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
     );
     eprintln!("cargo xtask compat: over SSH to {host}; enter your login password when asked.");
     // A cancellation point (`wait_interactive`): a signal ends ssh, and the run unwinds.
-    let mut ssh = Command::new("ssh")
-        .args(["-t", &host, &script])
-        .spawn()
+    let mut ssh = spawn_interactive(Command::new("ssh").args(["-t", &host, &script]))
         .map_err(|e| harness(format!("could not run ssh: {e}")))?;
     let status = wait_interactive(&mut ssh, cancel())?;
     if status.code() == Some(90) {
