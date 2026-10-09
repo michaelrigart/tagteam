@@ -192,9 +192,11 @@ pub struct VaultKeychain {
 }
 
 impl VaultKeychain {
-    /// Creates the file, never over an existing one, and unlocks it. Whatever fails after
-    /// `create-keychain` leaves neither the keychain nor `vault.password` behind, and the search
-    /// list as it was.
+    /// Creates the file, never over an existing keychain or password file, and unlocks it.
+    /// Whatever fails between `create-keychain` and the password being written leaves neither
+    /// the keychain nor `vault.password` behind, and the search list as it was. A failed
+    /// `unlock` comes after that, so it leaves both: a consistent vault, which the next
+    /// `compat login` takes by the open path.
     pub fn create(path: &Path, password_file: &Path) -> Result<Unlocked<Self>, HarnessError> {
         Self::create_with(&RealSecurity, path, password_file)?.unlock()
     }
@@ -207,6 +209,14 @@ impl VaultKeychain {
         if password_file.exists() {
             return Err(harness(format!(
                 "{} exists but the vault does not: delete it, or the compat store, and log in again",
+                password_file.display()
+            )));
+        }
+        // Before the guard: it deletes the keychain at `path`, which must be one this call made.
+        if path.exists() {
+            return Err(harness(format!(
+                "{} exists but {} does not: delete it, or the compat store, and log in again",
+                path.display(),
                 password_file.display()
             )));
         }
@@ -607,6 +617,20 @@ mod tests {
         assert!(VaultKeychain::create_with(&tool, &kc, &pw).is_err());
         assert!(!kc.exists());
         assert_eq!(fs::read_to_string(&pw).unwrap().len(), 32, "kept");
+        // An existing keychain file is refused and left alone: the guard never deletes one
+        // this call did not create.
+        fs::remove_file(&pw).unwrap();
+        fs::write(&kc, b"someone else's keychain").unwrap();
+        let tool = fake(true, true, false);
+        let e = VaultKeychain::create_with(&tool, &kc, &pw).err().unwrap().0;
+        assert!(e.contains("exists but"), "{e}");
+        assert_eq!(fs::read(&kc).unwrap(), b"someone else's keychain");
+        assert!(
+            tool.deleted.borrow().is_empty(),
+            "no delete-keychain issued"
+        );
+        assert!(!pw.exists());
+        assert_eq!(*tool.list.borrow(), ["/login.keychain-db"]);
         fs::remove_dir_all(&d).unwrap();
     }
 

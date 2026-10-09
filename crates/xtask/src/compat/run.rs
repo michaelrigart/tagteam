@@ -277,7 +277,7 @@ fn conclude(report: &mut Report, token: &Cancel, scratch: Option<&Path>) {
             format!("teardown had finished ({})", done.join(", "))
         }
         Some(done) => format!(
-            "teardown was interrupted after: {}; the other steps were not done",
+            "teardown was interrupted after: {}; the next step may be partly done and the rest were not done",
             done.join(", ")
         ),
     };
@@ -903,7 +903,7 @@ mod tests {
         ]));
         assert!(
             mid.contains(
-                "teardown was interrupted after: daemons stopped, default home's generation taken into the vault; the other steps were not done"
+                "teardown was interrupted after: daemons stopped, default home's generation taken into the vault; the next step may be partly done and the rest were not done"
             ) && !mid.contains("nothing was torn down"),
             "{mid}"
         );
