@@ -460,25 +460,8 @@ mod tests {
 
     #[test]
     fn a_descriptor_that_is_not_open_is_no_terminal() {
-        // A descriptor number is only a number: this one is not open once its socket is dropped.
-        // (Another test's socket may be given the same number meanwhile, so the answer is
-        // either "no terminal" or, for a socket that has nothing to say yet, a wait; the
-        // cancelled token ends that wait.)
-        let (r, w) = pipe();
-        let fd = r.as_raw_fd();
-        drop((r, w));
-        let token = Cancel::new();
-        let later = token.clone();
-        let signaller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            later.request(SIGTERM);
-        });
-        let answer = read_answer(fd, &token);
-        signaller.join().unwrap();
-        assert!(
-            matches!(answer, Answer::NoTerminal | Answer::Interrupted(_)),
-            "{answer:?}"
-        );
+        // A number no process opens (a freed one could be given to a parallel test's socket).
+        assert_eq!(read_answer(900_000, &Cancel::new()), Answer::NoTerminal);
     }
 
     #[test]

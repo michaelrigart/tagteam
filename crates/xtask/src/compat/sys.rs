@@ -457,7 +457,8 @@ fn wait_interactive_as(
     // The terminal back first: the sweep below must not run with it held by a dying group.
     drop(foreground);
     let swept = if own_group {
-        end_group_of(child, pgid).and_then(|()| end_tree(child, seen))
+        // Both always run: a group left unclean must not spare a descendant outside it.
+        clean_up_with(end_group_of(child, pgid), || end_tree(child, seen))
     } else {
         // Not a group of its own (not started by `spawn_interactive`): the harness's own group
         // is never signalled, only the child and what it started.
@@ -484,12 +485,32 @@ fn terminating_signal(status: ExitStatus) -> Option<i32> {
         .filter(|n| CAUGHT.contains(n))
 }
 
+/// `tree` runs whether or not `group` failed, and the two results are one.
+fn clean_up_with(
+    group: Result<(), HarnessError>,
+    tree: impl FnOnce() -> Result<(), HarnessError>,
+) -> Result<(), HarnessError> {
+    both_cleanups(group, tree())
+}
+
+/// The result of two cleanups that both ran: the one that failed, or both failures together.
+fn both_cleanups(
+    a: Result<(), HarnessError>,
+    b: Result<(), HarnessError>,
+) -> Result<(), HarnessError> {
+    match (a, b) {
+        (Err(a), Err(b)) => Err(harness(format!("{}; {}", a.0, b.0))),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 /// Ends the process group `pgid` led by `child`: SIGTERM, up to `GRACE`, SIGKILL, up to `GRACE`
 /// again, until `kill(-pgid, 0)` reports it empty, reaping the leader. Nothing is signalled when
 /// the group is already empty (the usual end), so a reused id is never hit by a late signal.
 fn end_group_of(child: &mut Child, pgid: u32) -> Result<(), HarnessError> {
     let _ = child.try_wait();
-    if !group_alive(pgid) {
+    if group_gone(pgid) {
         return Ok(());
     }
     // A stopped group takes SIGTERM only once continued.
@@ -497,16 +518,16 @@ fn end_group_of(child: &mut Child, pgid: u32) -> Result<(), HarnessError> {
     signal(pgid, "TERM", true);
     if !settle(GRACE, || {
         let _ = child.try_wait();
-        !group_alive(pgid)
+        group_gone(pgid)
     }) {
         signal(pgid, "KILL", true);
         settle(GRACE, || {
             let _ = child.try_wait();
-            !group_alive(pgid)
+            group_gone(pgid)
         });
     }
     let _ = child.try_wait();
-    if !group_alive(pgid) {
+    if group_gone(pgid) {
         return Ok(());
     }
     let left = group_members(pgid);
@@ -516,9 +537,20 @@ fn end_group_of(child: &mut Child, pgid: u32) -> Result<(), HarnessError> {
     )))
 }
 
-/// How many processes, zombies not counted, `ps` lists in group `pgid`; 0 if it cannot say.
-fn group_members(pgid: u32) -> usize {
-    let Ok(out) = Command::new("ps")
+/// Whether group `pgid` holds nothing that runs: by `ps`'s listing, where a zombie (state `Z`)
+/// runs nothing, whatever `kill(-pgid, 0)` says while it stays unreaped (a container whose
+/// PID 1 does not reap); by `kill -0` alone when the listing is not available.
+fn group_gone(pgid: u32) -> bool {
+    match group_listing() {
+        Some(rows) => live_in_group(&rows, pgid) == 0,
+        None => !group_alive(pgid),
+    }
+}
+
+/// `(pid, pgid, zombie)` for every process, from `ps -A -o pid=,pgid=,stat=`; `None` if `ps`
+/// cannot be run.
+fn group_listing() -> Option<Vec<(u32, u32, bool)>> {
+    let out = Command::new("ps")
         .args(["-A", "-o", "pid=,pgid=,stat="])
         .env_clear()
         .env("PATH", "/bin:/usr/bin")
@@ -526,18 +558,31 @@ fn group_members(pgid: u32) -> usize {
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-    else {
-        return 0;
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| {
+        .ok()
+        .filter(|o| o.status.success())?;
+    Some(parse_group_listing(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_group_listing(out: &str) -> Vec<(u32, u32, bool)> {
+    out.lines()
+        .filter_map(|l| {
             let mut f = l.split_whitespace();
-            let (_pid, group, stat) = (f.next(), f.next(), f.next());
-            group.and_then(|g| g.parse::<u32>().ok()) == Some(pgid)
-                && stat.is_some_and(|s| !s.starts_with('Z'))
+            let (pid, group) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?);
+            Some((pid, group, f.next()?.starts_with('Z')))
         })
+        .collect()
+}
+
+/// How many processes of group `pgid` run, zombies not counted.
+fn live_in_group(rows: &[(u32, u32, bool)], pgid: u32) -> usize {
+    rows.iter()
+        .filter(|(_, group, zombie)| *group == pgid && !*zombie)
         .count()
+}
+
+/// How many processes, zombies not counted, `ps` lists in group `pgid`; 0 if it cannot say.
+fn group_members(pgid: u32) -> usize {
+    group_listing().map_or(0, |rows| live_in_group(&rows, pgid))
 }
 
 /// Passes `end_tree` makes: SIGTERM, then SIGKILL until nothing of the tree is left.
@@ -686,14 +731,25 @@ fn signal_verified(
 /// member is signalled alone (never the harness, never a group, and only while its start time
 /// still matches): SIGTERM, a short grace while the direct child is reaped, then SIGKILL, up to
 /// `TREE_PASSES`. A survivor is an error.
-fn end_tree(child: &mut Child, mut seen: Members) -> Result<(), HarnessError> {
+fn end_tree(child: &mut Child, seen: Members) -> Result<(), HarnessError> {
+    end_tree_with(child, seen, &process_table)
+}
+
+/// `end_tree` over a process lister (a test's can fail). A listing that fails cannot show the
+/// tree is empty, so it is an error, never a clean end.
+fn end_tree_with(
+    child: &mut Child,
+    mut seen: Members,
+    lister: &dyn Fn() -> io::Result<Vec<ProcRow>>,
+) -> Result<(), HarnessError> {
+    let unlisted = |e: io::Error| {
+        harness(format!(
+            "could not list processes ({e}), so it is not known that the interrupted command's processes are gone"
+        ))
+    };
     let mut left = 0;
     for pass in 0..TREE_PASSES {
-        let Ok(table) = process_table() else {
-            // Without a listing nothing can be swept. The group, which needs none, was ended
-            // before this.
-            return Ok(());
-        };
+        let table = lister().map_err(unlisted)?;
         seen.refresh(
             &table,
             matches!(child.try_wait(), Ok(None)).then(|| child.id()),
@@ -713,12 +769,13 @@ fn end_tree(child: &mut Child, mut seen: Members) -> Result<(), HarnessError> {
         };
         settle(grace, || {
             let _ = child.try_wait();
-            process_table().is_ok_and(|t| seen.alive(&t).is_empty())
+            lister().is_ok_and(|t| seen.alive(&t).is_empty())
         });
         left = live.len();
     }
-    // The last pass's KILL had its grace: whatever still lists is a survivor.
-    let table = process_table().unwrap_or_default();
+    // The last pass's KILL had its grace: whatever still runs is a survivor, and a listing that
+    // fails here shows nothing.
+    let table = lister().map_err(unlisted)?;
     let survivors = seen.alive(&table).len();
     let _ = child.try_wait();
     if survivors == 0 {
@@ -1356,6 +1413,54 @@ mod tests {
             "the setsid descendant ({pid}) survived"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_group_cleanup_does_not_spare_the_tree_cleanup() {
+        let mut ran = false;
+        let err = clean_up_with(Err(harness("group: 1 survived")), || {
+            ran = true;
+            Err(harness("tree: 1 survived"))
+        })
+        .unwrap_err();
+        assert!(ran, "the tree cleanup ran");
+        assert_eq!(err.0, "group: 1 survived; tree: 1 survived");
+        let mut ran = false;
+        let err = clean_up_with(Err(harness("group")), || {
+            ran = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(ran);
+        assert_eq!(err.0, "group");
+        assert!(clean_up_with(Ok(()), || Ok(())).is_ok());
+    }
+
+    #[test]
+    fn a_listing_that_fails_is_a_cleanup_error_not_a_clean_end() {
+        let _serial = serial();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let err = end_tree_with(&mut child, Members::new(), &|| {
+            Err(io::Error::other("no ps here"))
+        })
+        .unwrap_err();
+        assert!(err.0.contains("could not list processes"), "{err}");
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_zombie_runs_nothing_in_the_tree_or_the_group() {
+        let rows = parse_group_listing("  7     7 Ss\n  8     7 Z\n  9     7 Z+\n 20    20 S\n");
+        assert_eq!(live_in_group(&rows, 7), 1);
+        assert_eq!(live_in_group(&[(8, 7, true), (9, 7, true)], 7), 0);
+        let table = parse_procs("  8     1 Z    Thu Oct  9 09:00:00 2026\n");
+        let mut members = Members::new();
+        members.refresh(&table, Some(8));
+        assert!(!members.0.is_empty(), "the zombie is still a member");
+        assert!(members.alive(&table).is_empty(), "but it runs nothing");
     }
 
     #[test]
