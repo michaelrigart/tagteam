@@ -1,0 +1,30 @@
+name: Feature request
+description: Suggest a new capability or a change to existing behaviour
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like
+      description: The behaviour or command you have in mind. Include example commands and output if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Other ways to solve it, including any workaround you use now.
+  - type: markdown
+    attributes:
+      value: |
+        tagteam changes only an agent's account identity and never touches its memory, history or
+        settings. A proposal that would need to write elsewhere needs a strong case.
+
+        Remove tokens, emails and account IDs from anything you paste.
