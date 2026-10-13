@@ -150,8 +150,8 @@ You do not need to write a spec for a bug fix or a small change.
   `tagteam doctor` or `list` from a real machine, in code, fixtures, commit messages and
   comments. Use obvious placeholders such as `user@example.com`.
 - **Do not hand-edit `.github/workflows/release.yml`.** `cargo-dist` generates it from
-  `dist-workspace.toml`. Change the dist configuration and regenerate the file with `dist`
-  instead.
+  `dist-workspace.toml`. Change the dist configuration and regenerate the file with
+  `dist generate` instead.
 - Fill in the pull request template. Say what changed, why, and how you verified it.
 
 To report a security problem, follow [SECURITY.md](SECURITY.md) rather than opening a public
