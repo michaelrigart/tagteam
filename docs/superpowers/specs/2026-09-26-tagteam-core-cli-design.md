@@ -3237,8 +3237,19 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
     run on Alpine, and round-trip the bundled SQLite store. An ignored live test, built for the
     same target, proves the TLS platform verifier accepts a real chain and rejects an untrusted
     root.
+- **crates.io.** A release also publishes `tagteam-core`, `tagteam-provider`, `tagteam-cc`,
+  `tagteam-engine` and `tagteam` to crates.io, in that dependency order and at the workspace
+  version, so `cargo install tagteam --locked` builds the CLI.
+  - A custom dist publish job does it, after the GitHub Release is hosted, with the
+    `CARGO_REGISTRY_TOKEN` secret. Like the Homebrew job, it skips prereleases.
+  - It skips a crate whose version is already on crates.io, so a run that failed part-way
+    can be re-run.
+  - The library crates are tagteam's internals with no stable API, and their descriptions
+    say so. `tagteam-fake` and `xtask` stay `publish = false`.
+  - Every published crate carries `LICENSE` and `NOTICE`.
 - **Package names.** On crates.io, `tagteam` for the binary crate, plus the `tagteam-*` library
-  crates. Name availability was checked on 2026-09-26: crates.io and Homebrew are free.
+  crates. Name availability was checked on 2026-09-26, and again on 2026-10-13: crates.io and
+  Homebrew are free.
 
 ## 17. Risks and open items
 
