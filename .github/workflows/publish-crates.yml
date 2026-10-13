@@ -31,18 +31,21 @@ jobs:
       - name: Publish the crates
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          # Wait up to 5 minutes, not cargo's 60 s, for each crate to reach the index before the
-          # next one, which depends on it, is verified.
-          CARGO_PUBLISH_TIMEOUT: "300"
+          USER_AGENT: michaelrigart/tagteam publish-crates workflow (https://github.com/michaelrigart/tagteam)
         run: |
           set -euo pipefail
+          # True once <crate> <version> is in the sparse index, where cargo resolves the next
+          # crate's dependency on it.
+          in_index() {
+            curl -sS --retry 3 -A "$USER_AGENT" "https://index.crates.io/${1:0:2}/${1:2:2}/$1" \
+              | jq -s -e --arg v "$2" 'any(.[]; .vers == $v)' >/dev/null 2>&1
+          }
           VERSION=$(cargo metadata --no-deps --format-version 1 --locked \
             | jq -r '.packages[] | select(.name == "tagteam") | .version')
           test -n "$VERSION"
           echo "Publishing version $VERSION"
           for crate in tagteam-core tagteam-provider tagteam-cc tagteam-engine tagteam; do
-            status=$(curl -sS --retry 3 -o /dev/null -w '%{http_code}' \
-              -A 'michaelrigart/tagteam publish-crates workflow (https://github.com/michaelrigart/tagteam)' \
+            status=$(curl -sS --retry 3 -o /dev/null -w '%{http_code}' -A "$USER_AGENT" \
               "https://crates.io/api/v1/crates/$crate/$VERSION")
             case $status in
               200)
@@ -57,4 +60,14 @@ jobs:
                 exit 1
                 ;;
             esac
+            # cargo 1.88 waits at most 60 s for the index and then only warns, so wait here,
+            # up to 5 minutes, before the next crate needs this one.
+            deadline=$((SECONDS + 300))
+            until in_index "$crate" "$VERSION"; do
+              if (( SECONDS >= deadline )); then
+                echo "::error::$crate $VERSION is not in the crates.io index after 5 minutes"
+                exit 1
+              fi
+              sleep 10
+            done
           done
