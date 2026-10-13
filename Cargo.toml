@@ -9,6 +9,9 @@ rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/michaelrigart/tagteam"
 homepage = "https://github.com/michaelrigart/tagteam"
+readme = "README.md"
+keywords = ["claude", "claude-code", "accounts", "cli", "switcher"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 tagteam-core = { path = "crates/tagteam-core", version = "0.1.0" }
