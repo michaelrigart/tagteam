@@ -141,7 +141,7 @@ You do not need to write a spec for a bug fix or a small change.
   internal `version = "…"` entries in `[workspace.dependencies]` (`tagteam-core`,
   `tagteam-provider`, `tagteam-cc` and `tagteam-engine`) together, then refresh `Cargo.lock`.
 - Add a dated section to the [changelog](CHANGELOG.md), with the version as its heading.
-- Tag the commit `v<version>` (for example `v20261013.2001.0`) and push the tag. The release
+- Tag the commit `v<version>` (for example `v20261013.2030.0`) and push the tag. The release
   publishes the GitHub archives, the Homebrew formula and the crates on crates.io. Prereleases
   publish none of the last two.
 - A failed crates.io run can be re-run: the job skips every crate whose version is already
