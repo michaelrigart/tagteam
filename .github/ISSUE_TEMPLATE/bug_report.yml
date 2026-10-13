@@ -64,13 +64,14 @@ body:
   - type: textarea
     id: doctor
     attributes:
-      label: Output of `tagteam doctor`
+      label: Failing `tagteam doctor` checks
       description: |
-        Run `tagteam doctor` and paste its output. It only reads state and changes nothing.
-        **Redact tokens, emails and account IDs first.**
+        Run `tagteam doctor` (it only reads state and changes nothing) and paste the checks
+        that warn or fail. Its messages can name your email or organization:
+        **redact tokens, emails, organization names and account IDs first.**
       render: text
     validations:
-      required: true
+      required: false
   - type: textarea
     id: extra
     attributes:
