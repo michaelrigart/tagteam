@@ -1,0 +1,78 @@
+name: Bug report
+description: Something in tagteam does not work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Redact secrets before you post anything.** Remove access tokens, refresh tokens, API
+        keys (`sk-ant-...`), email addresses, organization names and account or organization
+        IDs from every field below, including `tagteam doctor` output, logs and screenshots.
+        Replace them with placeholders such as `user@example.com`.
+
+        Do not report a security problem here. Use
+        [private vulnerability reporting](https://github.com/michaelrigart/tagteam/security/advisories/new).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran, what you saw and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands you ran, in order, with secrets redacted.
+      render: sh
+    validations:
+      required: true
+  - type: input
+    id: tagteam-version
+    attributes:
+      label: tagteam version
+      description: The output of `tagteam --version`.
+      placeholder: tagteam 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: claude-version
+    attributes:
+      label: Claude Code version
+      description: The output of `claude --version`.
+      placeholder: 2.1.292 (Claude Code)
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Operating system and architecture
+      placeholder: macOS 15 on Apple silicon, or Ubuntu 24.04 on x86-64
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How you installed tagteam
+      options:
+        - Homebrew
+        - From source (cargo install or cargo build)
+        - A release archive
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `tagteam doctor`
+      description: |
+        Run `tagteam doctor` and paste its output. It only reads state and changes nothing.
+        **Redact tokens, emails and account IDs first.**
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Relevant lines from `tagteam.log` (redacted), or settings you changed with `tagteam config`.
