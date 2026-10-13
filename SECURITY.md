@@ -18,7 +18,7 @@ the advisory unless you ask otherwise.
 
 ## Supported versions
 
-tagteam is pre-1.0. Only the latest release receives security fixes.
+Only the latest release receives security fixes.
 
 ## What tagteam stores and protects
 

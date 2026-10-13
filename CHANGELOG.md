@@ -6,7 +6,7 @@ All notable changes to tagteam are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-10-13
+## [20261013.2001.0] - 2026-10-13
 
 First release. tagteam is a multi-account switcher for Claude Code on macOS and Linux.
 
@@ -54,5 +54,5 @@ First release. tagteam is a multi-account switcher for Claude Code on macOS and 
   `tagteam` crate on crates.io (`cargo install tagteam --locked`) with the internal
   `tagteam-*` crates it depends on.
 
-[Unreleased]: https://github.com/michaelrigart/tagteam/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/michaelrigart/tagteam/releases/tag/v0.1.0
+[Unreleased]: https://github.com/michaelrigart/tagteam/compare/v20261013.2001.0...HEAD
+[20261013.2001.0]: https://github.com/michaelrigart/tagteam/releases/tag/v20261013.2001.0
