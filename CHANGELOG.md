@@ -1,8 +1,9 @@
 # Changelog
 
 All notable changes to tagteam are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions are calendar versions,
+`YYYYMMDD.HHMM.0` in UTC: a version says when a release was made, not whether it is compatible
+with the one before, so any release may contain breaking changes. Each section says what changed.
 
 ## [Unreleased]
 
