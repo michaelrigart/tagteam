@@ -6,7 +6,7 @@ All notable changes to tagteam are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-13
 
 First release. tagteam is a multi-account switcher for Claude Code on macOS and Linux.
 
