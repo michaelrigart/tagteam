@@ -62,10 +62,23 @@ Available from v0.1.0, once that release is published:
 brew install michaelrigart/tap/tagteam
 ```
 
+### crates.io
+
+Available from v0.1.0, once that release is published:
+
+```sh
+cargo install tagteam --locked
+```
+
+You need Rust 1.85 or newer (the minimum supported version, `rust-version` in `Cargo.toml`)
+and a C compiler, because tagteam bundles SQLite. Only `tagteam` is meant to be installed; the
+`tagteam-*` crates it depends on are internals with no stable API.
+
 ### From source
 
-You need [rustup](https://rustup.rs) and a C compiler (tagteam bundles SQLite). The repository's
-`rust-toolchain.toml` pins Rust 1.88.0, which rustup installs on first use.
+Build the current `main` instead of a release. You need [rustup](https://rustup.rs) and a C
+compiler (tagteam bundles SQLite). The repository's `rust-toolchain.toml` pins Rust 1.88.0, which
+rustup installs on first use.
 
 ```sh
 git clone https://github.com/michaelrigart/tagteam.git
