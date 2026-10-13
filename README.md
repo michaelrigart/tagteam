@@ -253,9 +253,9 @@ tagteam purge --keychain-orphans # macOS: also delete leftover `tagteam` Keychai
                                  # of every tagteam data directory on this Mac
 ```
 
-Purge keeps your `config.toml`, the lock files and the emptied store file. To remove them, delete the `tagteam`
-directories under `~/.config`, `~/.local/share` and `~/.local/state` (or their `XDG_*`
-equivalents). Also remove the `statusLine` entry from Claude Code's `settings.json` and the
+Purge keeps your `config.toml`, the lock files and the emptied store file. To remove them,
+delete the `tagteam` directories under `~/.config`, `~/.local/share` and `~/.local/state` (or
+their `XDG_*` equivalents). Also remove the `statusLine` entry from Claude Code's `settings.json` and the
 `shell-init` line from your shell rc file if you added them. tagteam never edited those.
 
 Then remove the program:
