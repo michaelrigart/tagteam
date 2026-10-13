@@ -16,7 +16,7 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-
 # Which actions to run on pull requests
 pr-run-mode = "upload"
 # Publish jobs to run in CI
-publish-jobs = ["homebrew"]
+publish-jobs = ["homebrew", "./publish-crates"]
 # NOTICE is not auto-included (LICENSE is); both land in every archive
 include = ["NOTICE"]
 # Local artifacts jobs to run in CI after dist's own, before the release is hosted
