@@ -7,5 +7,5 @@ fn prints_its_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout("tagteam 0.1.0\n");
+        .stdout(concat!("tagteam ", env!("CARGO_PKG_VERSION"), "\n"));
 }
