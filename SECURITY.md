@@ -28,9 +28,14 @@ protects it. The full description is in the
 and 14).
 
 - **Credentials** live in the vault. On macOS the vault is the login Keychain (generic
-  passwords, service `tagteam`), reached only through `/usr/bin/security`. On Linux it is
-  `vault/<id>.json` with mode 0600 in a directory with mode 0700. The SQLite store
+  passwords, service `tagteam`, an item per account plus one for its previous generation),
+  reached only through `/usr/bin/security`. On Linux it is `vault/<id>.json` and
+  `<id>.prev.json` with mode 0600 in a directory with mode 0700. The SQLite store
   (`tagteam.db`) holds metadata and usage readings, never a credential.
+- **Session profiles** (`tagteam run`) hold their account's credential the way Claude Code
+  keeps it: tagteam writes `sessions/<id>/.credentials.json` with mode 0600, and on macOS
+  Claude Code moves it into its own Keychain item, `Claude Code-credentials-<hash>`, on its
+  first credential write.
 - **Files that hold secrets** are created with mode 0600 at creation time (exclusive create,
   write, rename) and are not changed afterwards. tagteam's directories are created with mode
   0700. `rescue/` (a refreshed token whose vault write failed) and `displaced/` (a credential
@@ -48,11 +53,14 @@ and 14).
 - **Network.** The only hosts in tagteam's source are Claude Code's own OAuth hosts,
   `platform.claude.com` and `api.anthropic.com`, used over TLS for token refresh, the account
   profile and usage. There is no telemetry, and `tagteam statusline` makes no network request.
-- **Refresh tokens are single-use.** tagteam persists every successor it receives, and never
-  sends a superseded token to the token endpoint. A copy of a login exported to another machine
-  stops working as soon as either machine refreshes it.
-- **Root.** tagteam refuses to run as root outside a container, so it does not leave root-owned
-  files in a user's directories.
+- **Refresh tokens are single-use.** tagteam persists every successor it receives (to the
+  vault, to `rescue/`, or to `displaced/` when it belongs to another account), reports the
+  case where every write fails, and never sends a superseded token to the token endpoint. A
+  copy of a login exported to another machine stops working as soon as either machine
+  refreshes it.
+- **Root.** tagteam refuses to run as root, so it does not leave root-owned files in a user's
+  directories. The one exception is a Linux container whose root filesystem is an overlay
+  mount.
 - **Purge.** `tagteam purge` deletes the data, the Keychain items and the log, and empties the
   store with `secure_delete` on and a `VACUUM`.
 

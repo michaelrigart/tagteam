@@ -17,8 +17,9 @@ First release. tagteam is a multi-account switcher for Claude Code on macOS and 
   account identity; Claude Code's memory, history, settings and other local state are left
   alone. An interrupted switch is recovered the next time a command runs.
 - A vault for credentials: the login Keychain on macOS (through `/usr/bin/security`) and mode
-  0600 files on Linux. Refreshed refresh-token successors are always persisted, to the vault or
-  to a rescue file, and a credential that was not tagteam's to keep is set aside under
+  0600 files on Linux. Every refresh-token successor is persisted: to the vault, to a rescue
+  file, or under `displaced/` when it belongs to another account. If every write fails,
+  tagteam reports it. A credential that was not tagteam's to keep is also set aside under
   `displaced/` (`tagteam displaced`).
 - Token refresh and usage: OAuth token refresh with quarantine of accounts that need a new
   login, and usage collection with a request budget and failure backoff. `list` shows the 5-hour
@@ -42,7 +43,8 @@ First release. tagteam is a multi-account switcher for Claude Code on macOS and 
   warning for a Claude Code version newer than the one tagteam was checked against
   (2.1.292). `doctor --online` also checks that the endpoints are reachable.
 - `purge`: deletes tagteam's data and Keychain items, and never the live login.
-- `completions` for bash, zsh and fish, and `--json` output on every command.
+- `completions` for bash, zsh and fish, and `--json` output for scripting (one object per
+  command, one event per line for `auto`).
 - A file log at `$XDG_STATE_HOME/tagteam/tagteam.log` that never records an email or a
   credential, with `--debug` and `TAGTEAM_LOG`.
 - `cargo xtask compat`, a compatibility check against the real `claude`, and a weekly CI job

@@ -28,10 +28,11 @@ test pins it.
   settings.
 - **Switch automatically.** `tagteam auto` moves to a better account before the current one
   reaches a threshold.
-- **Keep refreshed tokens safe.** Every refresh-token successor tagteam receives is persisted,
-  to the vault or, if that write fails, to a rescue file.
-- **One static binary** for macOS and Linux, with no runtime beyond `claude` itself (and
-  `/usr/bin/security` on macOS).
+- **Keep refreshed tokens safe.** Every refresh-token successor tagteam receives is persisted:
+  to the vault, to a rescue file if that write fails, or under `displaced/` if it belongs to
+  another account. If every write fails, tagteam reports it.
+- **One binary** for macOS and Linux (statically linked on Linux), with no runtime beyond
+  `claude` itself (and `/usr/bin/security` on macOS).
 
 tagteam began as a Rust rewrite of [claude-swap](https://github.com/realiti4/claude-swap) and
 keeps its JSON field names, so scripts written for claude-swap can read tagteam's output. See
@@ -48,7 +49,8 @@ keeps its JSON field names, so scripts written for claude-swap can read tagteam'
   2.1.283 and later, and the newest version it has been checked against is **2.1.292**
   (`crates/tagteam-cc/compat/tested-cc-version`). It does not refuse a newer version, but
   `tagteam doctor` warns about one. Older versions are untested.
-- tagteam refuses to run as root, except inside a container.
+- tagteam refuses to run as root. The one exception is a Linux container whose root
+  filesystem is an overlay mount, such as Docker's.
 
 ## Install
 
@@ -111,9 +113,11 @@ token from stdin so it stays out of your shell history.
 
 ## Commands
 
-Run `tagteam <command> --help` for the full options. Every command accepts `--json`, which
-prints one JSON object on stdout, and `--provider`/`-p` (Claude Code is the only provider at
-present). A bare `tagteam` runs `list`.
+Run `tagteam <command> --help` for the full options. Every command accepts `--provider`/`-p`
+(Claude Code is the only provider at present). Most commands accept `--json` and then print
+one JSON object on stdout. The exceptions: `auto --json` prints one event per line,
+`run --json` covers only errors before Claude Code starts, and `statusline`, `shell-init`
+and `completions` refuse `--json`. A bare `tagteam` runs `list`.
 
 | Command | What it does |
 |---|---|
@@ -133,8 +137,9 @@ present). A bare `tagteam` runs `list`.
 | `purge` | Delete tagteam's data (see [Uninstall](#uninstall-and-purge)) |
 | `completions` | Print a completion script for bash, zsh or fish |
 
-Exit codes: `0` success, `1` error, `2` usage error, `130` interrupted. `tagteam auto --once`
-uses `0` switched, `1` error, `2` no action and `3` blocked.
+Exit codes: `0` success, `1` error, `2` usage error, and 128 plus the signal number when
+interrupted (`130` for Ctrl-C). `tagteam auto --once` uses `0` switched, `1` error, `2` no
+action and `3` blocked.
 
 ### Automatic switching
 
@@ -145,9 +150,11 @@ tagteam auto
 `auto` runs in the foreground until you press Ctrl-C and prints a line per check. It needs at
 least two switchable accounts. By default it switches away above 90% usage, checks every 60
 seconds and waits 300 seconds between automatic switches. Change these with flags
-(`--threshold`, `--interval`, `--cooldown`, `--strategy`) or with `tagteam config set
-autoswitch.<key> <value>`. tagteam has no background service in this release, so keep `auto`
-running in a terminal multiplexer or under a process supervisor of your choice.
+(`--threshold`, `--interval`, `--cooldown`, `--strategy`) or with the settings
+`autoswitch.threshold`, `autoswitch.interval_seconds`, `autoswitch.cooldown_seconds` and
+`autoswitch.strategy`, for example `tagteam config set autoswitch.threshold 85`. tagteam has
+no background service in this release, so keep `auto` running in a terminal multiplexer or
+under a process supervisor of your choice.
 
 ### Running accounts side by side
 
@@ -160,9 +167,13 @@ tagteam run work -- --resume     # everything after -- goes to claude
 ```
 
 Each account gets a profile directory under tagteam's data directory, and `tagteam run` points
-Claude Code at it with `CLAUDE_CONFIG_DIR`. The profile links to your default home for history,
-projects and memory, `CLAUDE.md`, settings, keybindings and your agents, commands, skills,
-plugins and hooks, so sessions share them. Everything else stays private to the profile.
+Claude Code at it with `CLAUDE_CONFIG_DIR`. The profile links a fixed list of entries to your
+default home, so sessions share them: history, projects and memory, `CLAUDE.md`, settings,
+keybindings, your agents, commands, skills, plugins, hooks, rules, workflows, output styles
+and themes, and Claude Code's file history, paste cache, shell snapshots and session
+environments. Any other entry, including the credential, stays private to the profile. To
+share more of your own files, add their names to the `run.share_extra` setting (section 12.2
+of the [design spec](docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md)).
 
 To pick the account by directory, map it, and add the shell wrapper to your shell rc file:
 
@@ -219,9 +230,13 @@ set to absolute paths. Directories are created lazily with mode 0700.
 `tagteam config path` prints the settings file's location.
 
 - **Credentials** are held in the vault. On macOS the vault is the login Keychain (service
-  `tagteam`, one item per account), accessed only through `/usr/bin/security`. On Linux it is
-  `vault/<id>.json`, mode 0600 in a 0700 directory. The store holds metadata only, never a
-  credential.
+  `tagteam`, an item per account plus one for its previous generation), accessed only through
+  `/usr/bin/security`. On Linux it is `vault/<id>.json` and `<id>.prev.json`, mode 0600 in a
+  0700 directory. The store holds metadata only, never a credential.
+- **Session profiles** used by `tagteam run` hold their account's credential the way Claude
+  Code keeps it. tagteam writes `sessions/<id>/.credentials.json` (mode 0600); on macOS,
+  Claude Code moves it into its own Keychain item, `Claude Code-credentials-<hash>`, on its
+  first credential write.
 - **Rescued and displaced credentials** are plain files with mode 0600 on both platforms,
   because they must not depend on the Keychain. `rescue/` holds a refreshed token whose vault
   write failed. `displaced/` holds a credential tagteam would otherwise have overwritten, such
