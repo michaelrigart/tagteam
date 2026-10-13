@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "20261013.2001.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -14,10 +14,10 @@ keywords = ["claude", "claude-code", "accounts", "cli", "switcher"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-tagteam-core = { path = "crates/tagteam-core", version = "0.1.0" }
-tagteam-provider = { path = "crates/tagteam-provider", version = "0.1.0" }
-tagteam-cc = { path = "crates/tagteam-cc", version = "0.1.0" }
-tagteam-engine = { path = "crates/tagteam-engine", version = "0.1.0" }
+tagteam-core = { path = "crates/tagteam-core", version = "20261013.2001.0" }
+tagteam-provider = { path = "crates/tagteam-provider", version = "20261013.2001.0" }
+tagteam-cc = { path = "crates/tagteam-cc", version = "20261013.2001.0" }
+tagteam-engine = { path = "crates/tagteam-engine", version = "20261013.2001.0" }
 tagteam-fake = { path = "crates/tagteam-fake" }
 # Export encryption (§13.3, Decision 10): scrypt passphrases, X25519 and ssh-ed25519 recipients,
 # ASCII armor. The `ssh` feature pulls in `rsa` (RUSTSEC-2023-0071, a timing side channel in
