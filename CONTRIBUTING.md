@@ -134,6 +134,17 @@ tagteam's design lives in the repository, next to the code, under `docs/superpow
 
 You do not need to write a spec for a bug fix or a small change.
 
+## Releasing
+
+- Bump `version` in `[workspace.package]` and the four internal `version = "…"` entries in
+  `[workspace.dependencies]` (`tagteam-core`, `tagteam-provider`, `tagteam-cc` and
+  `tagteam-engine`) together, then refresh `Cargo.lock`.
+- Add a dated section to the [changelog](CHANGELOG.md).
+- Tag the commit `vX.Y.Z` and push the tag. The release publishes the GitHub archives, the
+  Homebrew formula and the crates on crates.io. Prereleases publish none of the last two.
+- A failed crates.io run can be re-run: the job skips every crate whose version is already
+  published and carries on with the rest.
+
 ## Pull requests
 
 - **Open an issue first** for anything that changes behaviour, adds a command or touches the
