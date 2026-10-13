@@ -50,7 +50,9 @@ First release. tagteam is a multi-account switcher for Claude Code on macOS and 
 - `cargo xtask compat`, a compatibility check against the real `claude`, and a weekly CI job
   that watches the latest Claude Code release for drift.
 - Release builds for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`
-  and `aarch64-unknown-linux-musl`, and a Homebrew formula in `michaelrigart/homebrew-tap`.
+  and `aarch64-unknown-linux-musl`, a Homebrew formula in `michaelrigart/homebrew-tap`, and the
+  `tagteam` crate on crates.io (`cargo install tagteam --locked`) with the internal
+  `tagteam-*` crates it depends on.
 
 [Unreleased]: https://github.com/michaelrigart/tagteam/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/michaelrigart/tagteam/releases/tag/v0.1.0
