@@ -3237,6 +3237,13 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
     run on Alpine, and round-trip the bundled SQLite store. An ignored live test, built for the
     same target, proves the TLS platform verifier accepts a real chain and rejects an untrusted
     root.
+- **Versions.** Calendar versions, `YYYYMMDD.HHMM.0`: the UTC date and time a release is cut,
+  as SemVer's major and minor, with patch 0. The release tag is `v<version>`.
+  - SemVer forbids leading zeros, so a time before 10:00 drops them (09:05 is `905`).
+    Versions still sort in time order.
+  - Every workspace crate carries the same version.
+  - A version says when a release was made, not whether it breaks anything. The changelog
+    says that.
 - **crates.io.** A release also publishes `tagteam-core`, `tagteam-provider`, `tagteam-cc`,
   `tagteam-engine` and `tagteam` to crates.io, in that dependency order and at the workspace
   version, so `cargo install tagteam --locked` builds the CLI.
