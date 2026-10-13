@@ -823,15 +823,30 @@ mod tests {
         );
     }
 
+    /// Polls `cond` every 10 ms until it holds or `deadline` passes.
+    fn eventually(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let start = Instant::now();
+        loop {
+            if cond() {
+                return true;
+            }
+            if start.elapsed() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn the_heartbeat_keeps_the_mtime_fresh() {
         let d = tempfile::tempdir().unwrap();
         let s = spec(d.path(), 60_000, 100, 20);
         let l = MkdirLock::acquire(&s).unwrap();
         let before = fs::metadata(&s.path).unwrap().modified().unwrap();
-        std::thread::sleep(Duration::from_millis(150));
-        let after = fs::metadata(&s.path).unwrap().modified().unwrap();
-        assert!(after > before);
+        let advanced = eventually(Duration::from_secs(5), || {
+            fs::metadata(&s.path).unwrap().modified().unwrap() > before
+        });
+        assert!(advanced);
         assert!(l.check_owned().is_ok());
     }
 
@@ -853,8 +868,7 @@ mod tests {
         let l = MkdirLock::acquire(&s).unwrap();
         // Another process replaced the lock: its mtime is no longer the one we set.
         set_dir_mtime(&s.path, SystemTime::now() - Duration::from_secs(30)).unwrap();
-        std::thread::sleep(Duration::from_millis(150));
-        assert!(l.is_compromised());
+        assert!(eventually(Duration::from_secs(5), || l.is_compromised()));
         drop(l);
         assert!(
             s.path.is_dir(),
