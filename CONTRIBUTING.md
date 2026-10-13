@@ -143,7 +143,8 @@ You do not need to write a spec for a bug fix or a small change.
 - Tag the commit `vX.Y.Z` and push the tag. The release publishes the GitHub archives, the
   Homebrew formula and the crates on crates.io. Prereleases publish none of the last two.
 - A failed crates.io run can be re-run: the job skips every crate whose version is already
-  published and carries on with the rest.
+  published and carries on with the rest. crates.io rate-limits new crate names, so if the
+  first release of a new crate is refused with HTTP 429, wait ten minutes and re-run.
 
 ## Pull requests
 
