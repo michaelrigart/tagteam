@@ -136,12 +136,14 @@ You do not need to write a spec for a bug fix or a small change.
 
 ## Releasing
 
-- Bump `version` in `[workspace.package]` and the four internal `version = "…"` entries in
-  `[workspace.dependencies]` (`tagteam-core`, `tagteam-provider`, `tagteam-cc` and
-  `tagteam-engine`) together, then refresh `Cargo.lock`.
-- Add a dated section to the [changelog](CHANGELOG.md).
-- Tag the commit `vX.Y.Z` and push the tag. The release publishes the GitHub archives, the
-  Homebrew formula and the crates on crates.io. Prereleases publish none of the last two.
+- Set the version to the UTC date and time of the release, `YYYYMMDD.HHMM.0`, with no leading
+  zeros in `HHMM` (09:05 is `905`). Change `version` in `[workspace.package]` and the four
+  internal `version = "…"` entries in `[workspace.dependencies]` (`tagteam-core`,
+  `tagteam-provider`, `tagteam-cc` and `tagteam-engine`) together, then refresh `Cargo.lock`.
+- Add a dated section to the [changelog](CHANGELOG.md), with the version as its heading.
+- Tag the commit `v<version>` (for example `v20261013.2001.0`) and push the tag. The release
+  publishes the GitHub archives, the Homebrew formula and the crates on crates.io. Prereleases
+  publish none of the last two.
 - A failed crates.io run can be re-run: the job skips every crate whose version is already
   published and carries on with the rest. crates.io rate-limits new crate names, so if the
   first release of a new crate is refused with HTTP 429, wait ten minutes and re-run.

@@ -38,9 +38,11 @@ tagteam began as a Rust rewrite of [claude-swap](https://github.com/realiti4/cla
 keeps its JSON field names, so scripts written for claude-swap can read tagteam's output. See
 [NOTICE](NOTICE).
 
-> **Status:** pre-1.0. The interface and the on-disk format can still change between 0.x
-> releases. tagteam relies on Claude Code internals that Anthropic does not document or
-> guarantee, so a Claude Code update can break it. See [Requirements](#requirements).
+> **Status:** versions are dates, `YYYYMMDD.HHMM.0` in UTC, so a version number says when a
+> release was made, not whether it breaks anything. Read the [CHANGELOG](CHANGELOG.md) before
+> upgrading: the interface and the on-disk format can still change between releases. tagteam
+> relies on Claude Code internals that Anthropic does not document or guarantee, so a Claude
+> Code update can break it. See [Requirements](#requirements).
 
 ## Requirements
 
@@ -56,7 +58,7 @@ keeps its JSON field names, so scripts written for claude-swap can read tagteam'
 
 ### Homebrew
 
-Available from v0.1.0, once that release is published:
+Available once the first release is published:
 
 ```sh
 brew install michaelrigart/tap/tagteam
@@ -64,7 +66,7 @@ brew install michaelrigart/tap/tagteam
 
 ### crates.io
 
-Available from v0.1.0, once that release is published:
+Available once the first release is published:
 
 ```sh
 cargo install tagteam --locked
