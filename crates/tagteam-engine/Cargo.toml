@@ -1,6 +1,6 @@
 [package]
 name = "tagteam-engine"
-description = "The tagteam store, vault and provider-generic operations"
+description = "Internal crate of tagteam: the store, vault and provider-generic operations. No stable API."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

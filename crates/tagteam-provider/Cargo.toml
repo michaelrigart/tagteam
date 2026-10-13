@@ -1,6 +1,6 @@
 [package]
 name = "tagteam-provider"
-description = "The tagteam Provider trait and the I/O primitives providers share"
+description = "Internal crate of tagteam: the Provider trait and the I/O primitives providers share. No stable API."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

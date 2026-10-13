@@ -1,6 +1,6 @@
 [package]
 name = "tagteam-cc"
-description = "The Claude Code provider for tagteam"
+description = "Internal crate of tagteam: the Claude Code provider. No stable API."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "tagteam-core"
-description = "Provider-neutral domain types and policy for tagteam"
+description = "Internal crate of tagteam: provider-neutral domain types and policy. No stable API."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
