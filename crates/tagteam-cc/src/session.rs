@@ -42,6 +42,7 @@ pub(crate) const CC_SHARED: &[&str] = &[
     "paste-cache",
     "shell-snapshots",
     "session-env",
+    "tasks",
 ];
 
 pub(crate) const CC_MUST_SHARE: &[(&str, EntryKind)] = &[
@@ -78,6 +79,7 @@ pub(crate) const CC_PRIVATE: &[&str] = &[
     "debug",
     "feedback",
     "routines",
+    "dev-mods",
     "settings.local.json",
     ".last-cleanup",
     ".cc-writes",

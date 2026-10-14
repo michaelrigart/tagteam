@@ -28,6 +28,7 @@ chrome
 debug
 feedback
 routines
+dev-mods
 settings.local.json
 .last-cleanup
 .cc-writes

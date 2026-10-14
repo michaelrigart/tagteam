@@ -130,7 +130,8 @@ fn the_share_policy_is_section_12_2_s_tables_from_the_resolved_home() {
             "file-history",
             "paste-cache",
             "shell-snapshots",
-            "session-env"
+            "session-env",
+            "tasks"
         ]
     );
     let private = |name: &str| policy.private.iter().any(|p| entry_matches(p, name));
@@ -172,6 +173,7 @@ fn the_share_policy_is_section_12_2_s_tables_from_the_resolved_home() {
         "debug",
         "feedback",
         "routines",
+        "dev-mods",
         "settings.local.json",
         ".last-cleanup",
         ".cc-writes",
