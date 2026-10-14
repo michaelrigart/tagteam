@@ -1981,6 +1981,7 @@ and CC creates its own copy there when it needs one. For Claude Code:
 | `CLAUDE.md`, `settings.json`, `keybindings.json` | the user's instructions and settings |
 | `agents/`, `commands/`, `skills/`, `plugins/`, `hooks/`, `output-styles/`, `themes/`, `rules/`, `workflows/` | the user's customizations |
 | `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/` | per-session state keyed by session ID, which a session resumed in the other home needs |
+| `tasks/` | Claude Code's task lists, `tasks/<list id>/<task id>.json`: the list id is the session ID unless a team name or `CLAUDE_CODE_TASK_LIST_ID` names it, so a resumed session keeps its tasks (Appendix A.7) |
 
 `run.share_extra` (§6.4) adds entry names to the allowlist, for a user's own files that hooks
 or settings reach through the profile. A known-private name there is ignored with a warning.
@@ -2023,6 +2024,7 @@ from unknown ones):
 | `policy-limits.json` (and `.signature*`, `.stamp`), `remote-settings.json`, `remote-settings-consent.json`, `remote-settings-helper-consent` | an organization's managed policy, which must not reach another account's sessions |
 | `.session_ingress_token`, `hfi-auth.json` | tokens |
 | `state/`, `seed-admin/`, `bridge-spawn/`, `chrome/`, `debug/`, `feedback/`, `routines/`, `settings.local.json`, `.last-cleanup`, `.cc-writes/` | per-home consents, uploads, logs and housekeeping |
+| `dev-mods/` | the mods a session develops, which CC loads as plugin code; CC's sandbox protects the directory only when it is a plain directory under the config home (Appendix A.7) |
 | `.device-keys.json` | unused in a profile: CC keeps device keys machine-wide (Appendix A.7) |
 | `*.lock`, `*.lock.owner`, `.storage-write`, `.*_auth_refresh-*` | lock directories, owner records and refresh coordination files |
 | `.tagteam-*` | tagteam's own files |
@@ -3589,6 +3591,20 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   `Claude Code-device-keys` and the fallback file `~/.claude/.device-keys.json`, keyed by
   account uuid, whatever `CLAUDE_CONFIG_DIR` says. `~/.claude/bridge-spawn/` is fixed to the
   default home too. A profile shares these with the default home by CC's own design.
+- **`tasks/` is shared and `dev-mods/` is private** (*2.1.299*, read from the binary). A task list
+  is `<config_home>/tasks/<list id>/<task id>.json` with a `.lock` file and a `.highwatermark` file;
+  a task holds `id`, `subject`, `description`, `activeForm`, `owner`, `status`, `blocks`,
+  `blockedBy` and `metadata`. The list id is `CLAUDE_CODE_TASK_LIST_ID`, else the team name, else
+  the session ID, and the writers coordinate through the lock, so a second process is expected.
+  It holds no token, account or organization id, or per-account policy, and is keyed by session
+  ID like `session-env/`, so it is on the share allowlist (§12.2). `dev-mods/<session id>/` holds
+  a mod the session develops, which CC joins as a plugin directory, and holds no account state
+  either. It stays private because of CC's sandbox setup: the root must be a plain directory
+  under the config home, and when it is a symlink CC logs "the dev-mods root is not a plain
+  directory under the config home; denied as it stands" and write-denies only the root path as
+  it stands, not a live link's target. A shared `dev-mods` could leave the default home's
+  directory, which CC loads as plugin code, writable to a sandboxed shell whose writable paths
+  include it.
 
 ## Appendix B — Invariants carried over from cswap
 

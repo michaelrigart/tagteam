@@ -185,8 +185,8 @@ Each account gets a profile directory under tagteam's data directory, and `tagte
 Claude Code at it with `CLAUDE_CONFIG_DIR`. The profile links a fixed list of entries to your
 default home, so sessions share them: history, projects and memory, `CLAUDE.md`, settings,
 keybindings, your agents, commands, skills, plugins, hooks, rules, workflows, output styles
-and themes, and Claude Code's file history, paste cache, shell snapshots and session
-environments. Any other entry, including the credential, stays private to the profile. To
+and themes, and Claude Code's file history, paste cache, shell snapshots, session environments
+and task lists. Any other entry, including the credential, stays private to the profile. To
 share more of your own files, add their names to the `run.share_extra` setting (section 12.2
 of the [design spec](docs/superpowers/specs/2026-09-26-tagteam-core-cli-design.md)).
 
