@@ -2609,6 +2609,21 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_seed_never_backdates_a_later_activation() {
+        // No account was active at the epoch, so the migration seeded no row; `b` became
+        // active later without a switch.
+        let t = Timeline::build(
+            &[add(5 * H, "b")],
+            &[active(40 * H, Some("b"))],
+            30 * H,
+            &BTreeMap::new(),
+        );
+        assert_eq!(t.account_at(10 * H), None);
+        assert_eq!(t.account_at(35 * H), None);
+        assert_eq!(t.account_at(41 * H), Some(id("b")));
+    }
+
+    #[test]
     fn remove_ends_a_segment() {
         let events = [
             add(H, "a"),
@@ -2968,8 +2983,11 @@ impl Timeline {
                 }
             }
             None => {
+                // Only the row the migration seeded at the epoch: a later activation says
+                // nothing about who was active before it.
                 let seeded = history
                     .iter()
+                    .filter(|c| c.at_ms <= epoch_ms)
                     .min_by_key(|c| c.at_ms)
                     .and_then(|c| c.account.as_ref());
                 if let Some(account) = seeded {
