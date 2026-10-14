@@ -31,6 +31,13 @@ scrub ANTHROPIC_FEDERATION_RULE_ID
 scrub ANTHROPIC_IDENTITY_TOKEN
 scrub ANTHROPIC_IDENTITY_TOKEN_FILE
 
+# Carries or points at a credential that `claude auth status` does not report (Claude Code
+# 2.1.299 shows no login change when one is set).
+scrub CLAUDE_CODE_SESSION_ACCESS_TOKEN
+scrub CLAUDE_CODE_GATEWAY_TOKEN
+scrub CLAUDE_CODE_HOST_CREDS_FILE
+scrub CLAUDE_CODE_HOST_AUTH_ENV_VAR
+
 # Renames CC's config file and Keychain items (Appendix A.1), or moves its secure storage.
 scrub CLAUDE_CODE_CUSTOM_OAUTH_URL
 scrub USE_LOCAL_OAUTH
@@ -44,13 +51,14 @@ known CLAUDE_CODE_FORCE_SESSION_PERSISTENCE
 known CLAUDE_CODE_SESSION_ID
 
 # A baseline, not a review: every other CLAUDE_CODE_* and ANTHROPIC_* name that Claude Code
-# 2.1.286 (the tested version) contains, as check d of scripts/cc-drift.sh extracts them, so that
-# the weekly job reports only the names added since. None of them was reviewed one by one beyond
-# spec 12.5's scrub list above; reclassify one when its meaning is known. Some concern the login
-# but are not on spec 12.5's list (CLAUDE_CODE_SESSION_ACCESS_TOKEN, CLAUDE_CODE_GATEWAY_TOKEN,
-# CLAUDE_CODE_HOST_CREDS_FILE, ANTHROPIC_FOUNDRY_API_KEY, ANTHROPIC_BASE_URL and others): whether
-# `run` scrubs them is an open question for the spec, and until it is settled, validation's
-# `overridden` outcome (spec 12.3) refuses a launch whose login one of them overrides.
+# 2.1.286 (the tested version when the baseline was taken) contains, as check d of
+# scripts/cc-drift.sh extracts them, so that the weekly job reports only the names added since.
+# None of them was reviewed one by one beyond spec 12.5's scrub list above; reclassify one when
+# its meaning is known. Some concern the login but stay unscrubbed on purpose
+# (ANTHROPIC_BASE_URL, CLAUDE_CODE_USE_GATEWAY, ANTHROPIC_FOUNDRY_API_KEY, ANTHROPIC_AWS_API_KEY
+# and others): they route traffic, which people set on purpose, or take effect only with a
+# provider switch that validation's `overridden` outcome (spec 12.3) refuses. Spec 12.5 gives the
+# rule and spec 17 (O4) the decision.
 known ANTHROPIC_API_HOST
 known ANTHROPIC_ASSETS_HOST
 known ANTHROPIC_AWS_API_KEY
@@ -417,7 +425,6 @@ known CLAUDE_CODE_FRAME_TIMING_LOG
 known CLAUDE_CODE_FRAME_TIMING_SAMPLE_EVERY
 known CLAUDE_CODE_GATEWAY_HINT_HEADERS
 known CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_TIMEOUT_MS
-known CLAUDE_CODE_GATEWAY_TOKEN
 known CLAUDE_CODE_GB_BASE_URL
 known CLAUDE_CODE_GB_DISK_CACHE_WHEN_TELEMETRY_OFF
 known CLAUDE_CODE_GB_REFRESH_INTERVAL_MS
@@ -443,9 +450,7 @@ known CLAUDE_CODE_HOME_SEED_HOLD_TIMEOUT_MS
 known CLAUDE_CODE_HOME_SEED_VERDICT_TIMEOUT_MS
 known CLAUDE_CODE_HOOKS_SAME_THREAD
 known CLAUDE_CODE_HOST_
-known CLAUDE_CODE_HOST_AUTH_ENV_VAR
 known CLAUDE_CODE_HOST_AUTH_REFRESH_TIMEOUT_MS
-known CLAUDE_CODE_HOST_CREDS_FILE
 known CLAUDE_CODE_HOST_GATEWAY_LINEAGE
 known CLAUDE_CODE_HOST_HTTP_PROXY_PORT
 known CLAUDE_CODE_HOST_PLATFORM
@@ -637,7 +642,6 @@ known CLAUDE_CODE_SENDMESSAGE_HANDBACK
 known CLAUDE_CODE_SEND_FEEDBACK
 known CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS
 known CLAUDE_CODE_SESSION_
-known CLAUDE_CODE_SESSION_ACCESS_TOKEN
 known CLAUDE_CODE_SESSION_ATTENDED
 known CLAUDE_CODE_SESSION_KIND
 known CLAUDE_CODE_SESSION_LOG

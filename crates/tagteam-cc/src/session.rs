@@ -381,8 +381,8 @@ pub(crate) fn merge_back(
     })
 }
 
-/// §12.5 "Environment": scrubbed from every session, because each supplies or redirects the
-/// login, or renames CC's config file or Keychain item (Appendix A.1, A.7). Every
+/// §12.5 "Environment": scrubbed from every session, because each supplies, points at or
+/// redirects the login, or renames CC's config file or Keychain item (Appendix A.1, A.7). Every
 /// `CLAUDE_CODE_*_FILE_DESCRIPTOR` set in the process joins them (`session_env`).
 pub(crate) const CC_SCRUB: &[&str] = &[
     "ANTHROPIC_API_KEY",
@@ -399,6 +399,10 @@ pub(crate) const CC_SCRUB: &[&str] = &[
     "ANTHROPIC_FEDERATION_RULE_ID",
     "ANTHROPIC_IDENTITY_TOKEN",
     "ANTHROPIC_IDENTITY_TOKEN_FILE",
+    "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+    "CLAUDE_CODE_GATEWAY_TOKEN",
+    "CLAUDE_CODE_HOST_CREDS_FILE",
+    "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
     "CLAUDE_CODE_CUSTOM_OAUTH_URL",
     "USE_LOCAL_OAUTH",
     "USE_STAGING_OAUTH",

@@ -441,6 +441,7 @@ fn variables_that_redirect_the_login_warn_each_by_name() {
     f.env.claude_config_dir = Some(OsString::new());
     for name in [
         "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_GATEWAY_TOKEN",
         "USE_STAGING_OAUTH",
         "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     ] {
@@ -463,6 +464,7 @@ fn variables_that_redirect_the_login_warn_each_by_name() {
         scrubbed,
         [
             "unset ANTHROPIC_API_KEY",
+            "unset CLAUDE_CODE_GATEWAY_TOKEN",
             "unset CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"
         ]
     );
