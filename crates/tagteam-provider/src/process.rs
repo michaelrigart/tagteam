@@ -439,7 +439,8 @@ mod tests {
     use std::fs::File;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::sync::MutexGuard;
+
+    use crate::fork_guard;
 
     #[test]
     fn this_process_is_live_and_a_changed_start_is_not() {
@@ -483,12 +484,6 @@ mod tests {
         };
         child.wait().unwrap();
         assert!(!stamp.is_live());
-    }
-
-    fn fork_guard() -> MutexGuard<'static, ()> {
-        crate::FORK_GUARD
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn spec(program: &str, args: &[&str]) -> SpawnSpec {

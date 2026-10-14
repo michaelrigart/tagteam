@@ -1193,6 +1193,7 @@ mod tests {
 
     #[test]
     fn a_real_process_reports_its_code_and_both_streams() {
+        let _fork = crate::fork_guard();
         let r = ProcessRunner::run_bounded(
             "/bin/sh",
             &s(&["-c", "printf out; printf err >&2; exit 3"]),
@@ -1218,6 +1219,7 @@ mod tests {
     fn a_grandchild_holding_the_pipes_cannot_hang_run() {
         // L343: `sleep` inherits the pipes and outlives the shell, so the readers never see
         // EOF. `run` used to join them and wait the full 8 s.
+        let _fork = crate::fork_guard();
         let started = Instant::now();
         let r = ProcessRunner::run_bounded(
             "/bin/sh",
