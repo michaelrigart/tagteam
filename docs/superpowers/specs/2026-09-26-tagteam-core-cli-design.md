@@ -3247,8 +3247,14 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
 - **crates.io.** A release also publishes `tagteam-core`, `tagteam-provider`, `tagteam-cc`,
   `tagteam-engine` and `tagteam` to crates.io, in that dependency order and at the workspace
   version, so `cargo install tagteam --locked` builds the CLI.
-  - A custom dist publish job does it, after the GitHub Release is hosted, with the
-    `CARGO_REGISTRY_TOKEN` secret. Like the Homebrew job, it skips prereleases.
+  - A custom dist publish job does it, after the GitHub Release is hosted. Like the Homebrew
+    job, it skips prereleases.
+  - It authenticates with crates.io trusted publishing (GitHub OIDC): the job has
+    `id-token: write` and swaps its OIDC token for a short-lived crates.io token with
+    `rust-lang/crates-io-auth-action`. The repository needs no crates.io secret.
+  - crates.io matches the token's `workflow_ref` claim, which names the top-level workflow,
+    so each of the five crates registers `release.yml` (the caller of `publish-crates.yml`)
+    as its trusted publisher, with no environment.
   - It skips a crate whose version is already on crates.io, so a run that failed part-way
     can be re-run.
   - The library crates are tagteam's internals with no stable API, and their descriptions
