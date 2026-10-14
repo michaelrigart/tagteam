@@ -29,6 +29,7 @@ global-artifacts-jobs = ["./release-smoke"]
 "actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
 "swatinem/rust-cache" = "6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
 
-# The publish-crates job checks out the tagged commit, so it needs to read contents
+# The publish-crates job checks out the tagged commit (contents) and gets a crates.io token
+# through trusted publishing (id-token)
 [dist.github-custom-job-permissions]
-"publish-crates" = { contents = "read" }
+"publish-crates" = { contents = "read", id-token = "write" }
