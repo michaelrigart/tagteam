@@ -7,6 +7,8 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+## [20261014.2045.0] - 2026-10-14
+
 ### Changed
 
 - `tagteam run` now also removes Claude Code's session-access, gateway and host-credential
@@ -76,6 +78,7 @@ First release. tagteam is a multi-account switcher for Claude Code on macOS and 
   `tagteam` crate on crates.io (`cargo install tagteam --locked`) with the internal
   `tagteam-*` crates it depends on.
 
-[Unreleased]: https://github.com/michaelrigart/tagteam/compare/v20261014.1500.0...HEAD
+[Unreleased]: https://github.com/michaelrigart/tagteam/compare/v20261014.2045.0...HEAD
+[20261014.2045.0]: https://github.com/michaelrigart/tagteam/compare/v20261014.1500.0...v20261014.2045.0
 [20261014.1500.0]: https://github.com/michaelrigart/tagteam/compare/v20261013.2030.0...v20261014.1500.0
 [20261013.2030.0]: https://github.com/michaelrigart/tagteam/releases/tag/v20261013.2030.0

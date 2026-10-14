@@ -2266,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam"
-version = "20261014.1500.0"
+version = "20261014.2045.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -2290,7 +2290,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-cc"
-version = "20261014.1500.0"
+version = "20261014.2045.0"
 dependencies = [
  "fastrand",
  "hex",
@@ -2307,7 +2307,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-core"
-version = "20261014.1500.0"
+version = "20261014.2045.0"
 dependencies = [
  "hex",
  "proptest",
@@ -2318,7 +2318,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-engine"
-version = "20261014.1500.0"
+version = "20261014.2045.0"
 dependencies = [
  "age",
  "fastrand",
@@ -2341,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-fake"
-version = "20261014.1500.0"
+version = "20261014.2045.0"
 dependencies = [
  "serde_json",
  "tagteam-core",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "tagteam-provider"
-version = "20261014.1500.0"
+version = "20261014.2045.0"
 dependencies = [
  "fastrand",
  "hex",
@@ -2919,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "20261014.1500.0"
+version = "20261014.2045.0"
 dependencies = [
  "clap",
  "hex",
