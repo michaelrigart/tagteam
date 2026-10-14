@@ -2209,20 +2209,36 @@ death.
   whatever happened in exit handling.
 
 **Environment.** These variables are scrubbed from the session environment, with a warning
-naming each one that was set, because each supplies or redirects the login, or renames CC's
-config file or Keychain item (Appendix A.1, A.7):
+naming each one that was set, because each supplies, points at or redirects the login, or
+renames CC's config file or Keychain item (Appendix A.1, A.7):
 - `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, `CLAUDE_CODE_OAUTH_SCOPES`, `CLAUDE_CODE_OAUTH_CLIENT_ID`,
   and every `CLAUDE_CODE_*_FILE_DESCRIPTOR`;
 - `CLAUDE_CODE_ACCOUNT_UUID`, `CLAUDE_CODE_USER_EMAIL`, `CLAUDE_CODE_ORGANIZATION_UUID`;
 - `ANTHROPIC_PROFILE`, `ANTHROPIC_CONFIG_DIR`, `ANTHROPIC_FEDERATION_RULE_ID`,
   `ANTHROPIC_IDENTITY_TOKEN`, `ANTHROPIC_IDENTITY_TOKEN_FILE`;
+- `CLAUDE_CODE_SESSION_ACCESS_TOKEN`, `CLAUDE_CODE_GATEWAY_TOKEN`,
+  `CLAUDE_CODE_HOST_CREDS_FILE`, `CLAUDE_CODE_HOST_AUTH_ENV_VAR`;
 - `CLAUDE_CODE_CUSTOM_OAUTH_URL`, `USE_LOCAL_OAUTH`, `USE_STAGING_OAUTH`;
 - `CLAUDE_SECURESTORAGE_CONFIG_DIR`.
 
 They are not scrubbed on the plain-`claude` paths. A pre-set `CLAUDE_CONFIG_DIR` is
 overridden, with a warning. A login source the environment cannot express, such as a
 workload-identity profile file, is caught by validation as `overridden` (§12.3).
+
+**What is scrubbed.** A name is scrubbed when it supplies a credential or points at one, and
+validation cannot see it: `claude auth status` reports no change when it is set (Appendix A.7),
+so a session could use a login other than the account's own without `overridden` ever firing.
+That is why the four names in the fourth bullet are on the list.
+
+**What is not.** Two kinds of name stay in the session environment:
+- Names that only route traffic, which people set on purpose: `ANTHROPIC_BASE_URL`,
+  `CLAUDE_CODE_USE_GATEWAY` and `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`. Scrubbing
+  `ANTHROPIC_BASE_URL` would break a proxy or gateway setup.
+- Cloud-provider keys, `ANTHROPIC_FOUNDRY_API_KEY` and `ANTHROPIC_AWS_API_KEY`. They take effect
+  only with a provider switch (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` or
+  `CLAUDE_CODE_USE_FOUNDRY`), and a switch makes `claude auth status` report `third_party`, which
+  validation refuses as `overridden` (§12.3).
 
 Removing `CLAUDE_SECURESTORAGE_CONFIG_DIR` makes the secure-storage dir resolve to the profile
 (Appendix A.1). Set to an empty string, it would send CC to the default `~/.claude` credentials;
@@ -2822,8 +2838,8 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
   - `CLAUDE_CONFIG_DIR` set but empty, or set to a spelling of the default home: CC 2.1.286
     then reads a hashed Keychain item, not the one a switch writes (Appendix A.2) → warn
   - a non-production OAuth switch (Appendix A.1) → warn
-  - any variable that `run` scrubs because it supplies or redirects a login (§12.5) → warn,
-    naming it
+  - any variable that `run` scrubs because it supplies, points at or redirects a login (§12.5)
+    → warn, naming it
 - **The default home's login,** by `claude auth status` (Appendix A.7) with a 10 s timeout, in
   the outer home's environment inside a run shell (§12.8). When that home's global config does
   not exist, doctor does not run it, since it would create the config (A.7), and reports
@@ -3280,6 +3296,7 @@ is a workspace crate (`publish = false`) reached through a cargo alias. It drive
 | O2 | CC 2.1.286 passes `rate_limits` (five-hour, seven-day and spend percentages with resets) on the statusline command's stdin | Not used: `statusline` ignores stdin (§13.5). A later version could record them as free readings for the session's account, outside the request budget |
 | R9 | An exported OAuth login is a single-use refresh lineage, so using it on two machines quarantines it on whichever refreshes second | Export reads each account's newest generation and says that it hands logins over (§13.3); one login per machine is the supported way to share an account |
 | O3 | On a Mac whose login keychain is locked, the lock check may show a SecurityAgent dialog for up to its 5 s timeout, and whether killing `security` at the timeout dismisses it is unknown (found while planning M4a) | An opt-in `cargo xtask compat` check settles it (§15.4). Until then every command, `doctor` included, bounds the check by its timeout |
+| O4 | Whether `run` should scrub the login-related environment names §12.5 did not list, such as `CLAUDE_CODE_GATEWAY_TOKEN`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_FOUNDRY_API_KEY` (found while planning M5b) | Closed: `run` scrubs the four that carry or point at a credential and that validation cannot see (`CLAUDE_CODE_SESSION_ACCESS_TOKEN`, `CLAUDE_CODE_GATEWAY_TOKEN`, `CLAUDE_CODE_HOST_CREDS_FILE`, `CLAUDE_CODE_HOST_AUTH_ENV_VAR`), checked against CC 2.1.299 (Appendix A.7). It leaves names that only route traffic, and provider keys that need a switch validation refuses. The rule is in §12.5 |
 
 ---
 
@@ -3546,6 +3563,15 @@ caches account- and org-scoped data (`groveConfigCache`, `modelAccessCache`,
   after an upgrade, which runs CC's migrations), CC's start-up runs first: it writes the global
   config and `backups/`, and leaves its `.claude.json.lock` behind, whose mtime can be up to 1 s
   in the future (`proper-lockfile`'s first probe), before answering (*2.1.292*).
+- **Environment names and `auth status`** (*2.1.299*, a throwaway config dir and fake values).
+  `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX` and `CLAUDE_CODE_USE_FOUNDRY` each make it
+  report `authMethod` `third_party`, with `apiProvider` `bedrock`, `vertex` or `foundry`. It
+  reports no change (`loggedIn` false, `authMethod` `none`, `apiProvider` `firstParty`) for
+  `CLAUDE_CODE_SESSION_ACCESS_TOKEN`, `CLAUDE_CODE_GATEWAY_TOKEN`, `CLAUDE_CODE_USE_GATEWAY` (alone
+  and with the gateway token), `CLAUDE_CODE_HOST_CREDS_FILE`, `CLAUDE_CODE_HOST_AUTH_ENV_VAR`,
+  `ANTHROPIC_FOUNDRY_API_KEY`, `ANTHROPIC_AWS_API_KEY`, `ANTHROPIC_BASE_URL` and
+  `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`. The controls behave as §12.3 expects:
+  `CLAUDE_CODE_OAUTH_TOKEN` gives `oauth_token` and `ANTHROPIC_API_KEY` gives `api_key`.
 - **The config lock's retries** (*2.1.292*): CC retries the config lock on a backoff of 200, 400,
   800, 1600, 3200 and 4000 ms (about 10.2 s in all); during its first 30 s, until its interactive
   UI is up, it stops retrying after 1.5 s. Then it writes the global config without the lock,
