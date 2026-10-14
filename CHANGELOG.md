@@ -15,6 +15,11 @@ with the one before, so any release may contain breaking changes. Each section s
   environment, so none of them can give the session a login other than the account's own. It
   warns about each one that was set, and `tagteam doctor` reports them. Variables that only route
   traffic, such as `ANTHROPIC_BASE_URL`, are still passed through.
+- `tagteam run` sessions now share Claude Code's task lists (`tasks`) with your default home,
+  like its file history and session environments, so a session resumed in another account keeps
+  its tasks. Mods in development (`dev-mods`) stay per profile, so Claude Code's sandbox keeps
+  protecting them. `tagteam doctor` and the launch no longer report either entry as
+  unknown.
 
 ## [20261014.1500.0] - 2026-10-14
 
