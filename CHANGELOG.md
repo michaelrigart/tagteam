@@ -7,6 +7,11 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+### Changed
+
+- tagteam has been checked against Claude Code 2.1.299, the newest version it now knows works
+  with it.
+
 ## [20261013.2030.0] - 2026-10-13
 
 First release. tagteam is a multi-account switcher for Claude Code on macOS and Linux.
