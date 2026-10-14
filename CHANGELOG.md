@@ -9,8 +9,8 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ### Changed
 
-- tagteam has been checked against Claude Code 2.1.299, the newest version it now knows works
-  with it.
+- Checked against Claude Code 2.1.299, now the newest version tagteam is known to work with.
+  `tagteam doctor` no longer warns about Claude Code versions up to 2.1.299.
 
 ## [20261013.2030.0] - 2026-10-13
 
