@@ -203,18 +203,12 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{MutexGuard, PoisonError};
 
     use crate::flock::FlockGuard;
+    use crate::fork_guard;
     use crate::process::{SpawnSpec, spawn_session};
     use crate::profile::launch_reservations;
     use crate::read::Read;
-
-    fn fork_guard() -> MutexGuard<'static, ()> {
-        crate::FORK_GUARD
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
 
     fn launch_dir(profile: &Path) -> PathBuf {
         profile.join(LAUNCH_DIR)

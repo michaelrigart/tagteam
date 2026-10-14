@@ -226,7 +226,9 @@ mod spawn_tests {
     #[test]
     fn a_program_that_cannot_start_is_an_error_and_changes_nothing_without_a_terminal() {
         // The tests' stdin is no terminal, so no terminal was taken and none is given back; the
-        // path with one is exercised only by a live run.
+        // path with one is exercised only by a live run. `spawn_foreground` forks before the exec
+        // fails, so the fork guard is held.
+        let _fork = crate::fork_guard();
         let before = stdin_foreground_group();
         let err = spawn_foreground(&mut Command::new("/nonexistent/program")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);

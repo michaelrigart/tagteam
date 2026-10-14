@@ -23,8 +23,23 @@ pub mod term;
 /// Serialises the lib tests that fork a child or drop a flock and re-lock it: a child forked in
 /// that window briefly holds a duplicate of the lock's open file description, so the re-lock
 /// would spuriously see it held.
+///
+/// Every test in this crate's lib tests that forks holds it (`fork_guard()`) for as long as its
+/// children may be forked, however it starts them: `Command`, `spawn_session`, `spawn_foreground`,
+/// `run_captured` and `ProcessRunner` all fork, and a program that cannot start still forks
+/// before its exec fails. The reservation tests probe locks that a child forked by any other test
+/// thread would hold between its fork and its exec, even though the descriptors are `O_CLOEXEC`.
 #[cfg(test)]
 pub(crate) static FORK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes `FORK_GUARD`, ignoring poison: a test that panicked while holding it left nothing the
+/// next one depends on.
+#[cfg(test)]
+pub(crate) fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
+    FORK_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 pub use cancel::{Cancel, Interrupted};
 pub use clock::{Clock, FakeClock, SystemClock};
