@@ -1919,6 +1919,31 @@ mod tests {
     }
 
     #[test]
+    fn a_dated_override_equal_to_shipped_still_pins_its_entry() {
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "claude-opus-5-5".to_owned(),
+            PriceOverride {
+                base: input_only(3.0),
+                ..PriceOverride::default()
+            },
+        );
+        overrides.insert(
+            "claude-opus-5-5-20261001".to_owned(),
+            PriceOverride {
+                base: input_only(4.0),
+                ..PriceOverride::default()
+            },
+        );
+        let (prices, changed) = Prices::new(&TABLE, &overrides);
+        assert_eq!(changed, vec!["claude-opus-5-5".to_owned()]);
+        let input = |model: &str| prices.lookup(model).map(|p| p.base.input);
+        assert_eq!(input("claude-opus-5-5"), Some(3.0));
+        assert_eq!(input("claude-opus-5-5-20261001"), Some(4.0));
+        assert_eq!(input("claude-opus-5-5-20270101"), Some(3.0));
+    }
+
+    #[test]
     fn an_unknown_model_is_unpriced() {
         let prices = shipped();
         let c = tokens(1, 1, 1, 1, 1);
@@ -2102,9 +2127,13 @@ impl Prices {
                     })
                 }),
             };
-            if let Some(price) = now.filter(|now| Some(*now) != was) {
+            if let Some(price) = now {
+                // Kept under its own name even when it equals what the name found, so a dated
+                // override pins its entry against an override of the undated name.
+                if Some(price) != was {
+                    changed.push(name.clone());
+                }
                 models.insert(name.clone(), price);
-                changed.push(name.clone());
             }
         }
         (
