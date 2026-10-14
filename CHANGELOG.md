@@ -7,6 +7,15 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+### Changed
+
+- `tagteam run` now also removes Claude Code's session-access, gateway and host-credential
+  variables (`CLAUDE_CODE_SESSION_ACCESS_TOKEN`, `CLAUDE_CODE_GATEWAY_TOKEN`,
+  `CLAUDE_CODE_HOST_CREDS_FILE` and `CLAUDE_CODE_HOST_AUTH_ENV_VAR`) from the session's
+  environment, so none of them can give the session a login other than the account's own. It
+  warns about each one that was set, and `tagteam doctor` reports them. Variables that only route
+  traffic, such as `ANTHROPIC_BASE_URL`, are still passed through.
+
 ## [20261014.1500.0] - 2026-10-14
 
 ### Changed

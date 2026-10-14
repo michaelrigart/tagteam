@@ -2523,6 +2523,8 @@ mod tests {
         for name in [
             "ANTHROPIC_API_KEY",
             "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
+            "CLAUDE_CODE_HOST_CREDS_FILE",
             "USE_STAGING_OAUTH",
             "CLAUDE_SECURESTORAGE_CONFIG_DIR",
         ] {

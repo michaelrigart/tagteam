@@ -412,7 +412,7 @@ fn environment(env: &Env, out: &mut Vec<Check>) {
                 Check::warn(
                     "cc.env.scrubbed",
                     format!(
-                        "{name} is set: it supplies or redirects Claude Code's login, so `claude` started here may not use the account tagteam switched to"
+                        "{name} is set: it supplies, points at or redirects Claude Code's login, so `claude` started here may not use the account tagteam switched to"
                     ),
                 )
                 .fix(format!("unset {name}")),
