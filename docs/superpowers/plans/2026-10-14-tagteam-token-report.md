@@ -4693,6 +4693,28 @@ fn zero_top_level_falls_back_to_the_first_iteration() {
 }
 
 #[test]
+fn a_huge_iterations_array_keeps_only_the_first() {
+    // Spec §2.2: only iterations[0] counts; the rest is skipped as it is read.
+    let mut zero = final_line();
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation/ephemeral_5m_input_tokens",
+        "cache_creation/ephemeral_1h_input_tokens",
+    ] {
+        zero = with(zero, &format!("message/usage/{field}"), json!(0));
+    }
+    let mut many = vec![json!({"input_tokens": 7, "output_tokens": 8})];
+    many.extend(std::iter::repeat_n(json!({}), 200_000));
+    let line = with(zero, "message/usage/iterations", Value::Array(many));
+    assert_eq!(parsed(&line).counts, counts(7, 8, 0, 0, 0, 2));
+    let null = with(final_line(), "message/usage/iterations", Value::Null);
+    assert_eq!(parsed(&null).counts, counts(10, 120, 200, 100, 2000, 2));
+}
+
+#[test]
 fn cache_writes_without_a_split_count_as_five_minute_writes() {
     let unsplit = without(final_line(), "message/usage/cache_creation");
     assert_eq!(parsed(&unsplit).counts, counts(10, 120, 300, 0, 2000, 2));
@@ -4908,6 +4930,9 @@ fn discovers_sessions_and_subagents_only() {
     .unwrap();
     touch(d.path(), "linked-project/s5.jsonl");
     symlink(d.path().join("linked-project"), projects.join("-w-c")).unwrap();
+    touch(d.path(), "linked-agents/agent-fedcba9876543210.jsonl");
+    fs::create_dir_all(projects.join("-w-b/s3")).unwrap();
+    symlink(d.path().join("linked-agents"), projects.join("-w-b/s3/subagents")).unwrap();
     expected.sort();
     assert_eq!(discover(&projects).unwrap(), expected);
 }
@@ -5267,7 +5292,12 @@ pub fn discover(projects: &Path) -> io::Result<Vec<PathBuf>> {
         for entry in entries(&project.path()) {
             let path = entry.path();
             if is_dir(&entry) {
-                for agent in entries(&path.join("subagents")) {
+                let subagents = path.join("subagents");
+                // A link in place of `subagents/` is not followed either.
+                if !fs::symlink_metadata(&subagents).is_ok_and(|m| m.is_dir()) {
+                    continue;
+                }
+                for agent in entries(&subagents) {
                     let name = agent.file_name();
                     let name = name.as_encoded_bytes();
                     if name.starts_with(b"agent-") && name.ends_with(b".jsonl") && is_file(&agent) {
@@ -5393,7 +5423,35 @@ struct Usage {
     cache_creation: Option<CacheSplit>,
     server_tool_use: Option<ServerToolUse>,
     speed: Option<String>,
-    iterations: Option<Vec<Iteration>>,
+    #[serde(default, deserialize_with = "first_iteration")]
+    iterations: Option<Iteration>,
+}
+
+/// `usage.iterations[0]`, the rest skipped as it is read and never collected, so a huge array
+/// costs no memory (spec §2.2: it is never longer than one; spec §5.2: workers stay bounded).
+fn first_iteration<'de, D>(d: D) -> Result<Option<Iteration>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct First;
+    impl<'de> serde::de::Visitor<'de> for First {
+        type Value = Option<Iteration>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an array of iterations, or null")
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let first = seq.next_element::<Iteration>()?;
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(first)
+        }
+    }
+    d.deserialize_any(First)
 }
 
 /// An entry of `usage.iterations` (spec §2.2).
@@ -5493,8 +5551,8 @@ pub fn parse_usage_line(line: &[u8]) -> Result<Option<UsageLine>, LineError> {
         usage.cache_read_input_tokens,
         usage.cache_creation.as_ref(),
     );
-    let mut counts = match usage.iterations.as_deref() {
-        Some([first, ..]) if top == TokenCounts::default() => token_counts(
+    let mut counts = match usage.iterations.as_ref() {
+        Some(first) if top == TokenCounts::default() => token_counts(
             first.input_tokens,
             first.output_tokens,
             first.cache_creation_input_tokens,
