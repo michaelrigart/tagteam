@@ -144,6 +144,14 @@ You do not need to write a spec for a bug fix or a small change.
 - Tag the commit `v<version>` (for example `v20261013.2030.0`) and push the tag. The release
   publishes the GitHub archives, the Homebrew formula and the crates on crates.io. Prereleases
   publish none of the last two.
+- Publishing to crates.io uses [trusted publishing](https://crates.io/docs/trusted-publishing)
+  (GitHub OIDC), so the repository holds no crates.io token. A crate owner registers each
+  published crate under its crates.io Settings, Trusted Publishing, Add, GitHub: repository
+  owner `michaelrigart`, repository `tagteam`, workflow filename `release.yml` (the workflow
+  that calls the publish job, not `publish-crates.yml`) and no environment. When you add a
+  crate to the workspace, publish its first version by hand with a short-lived API token (a
+  trusted publisher can only be added to a crate that exists), register it the same way, and
+  add it to the loop in `.github/workflows/publish-crates.yml`.
 - A failed crates.io run can be re-run: the job skips every crate whose version is already
   published and carries on with the rest. crates.io rate-limits new crate names, so if the
   first release of a new crate is refused with HTTP 429, wait ten minutes and re-run.
