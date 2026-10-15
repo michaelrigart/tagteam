@@ -71,7 +71,7 @@ const HELP_GLOBAL: [(&str, &str); 7] = [
     ("q  Ctrl-C", "quit"),
     ("Ctrl-Z", "suspend"),
 ];
-const HELP_ACCOUNTS: [(&str, &str); 10] = [
+const HELP_ACCOUNTS: [(&str, &str); 11] = [
     ("s", "switch to the selected account"),
     ("b", "switch to the best account"),
     ("n", "switch to the next available account"),
@@ -82,6 +82,7 @@ const HELP_ACCOUNTS: [(&str, &str); 10] = [
     ("R", "run a session on the account"),
     ("r", "refresh"),
     ("Enter", "history of the account"),
+    ("J K", "scroll the detail's windows"),
 ];
 const HELP_HISTORY: [(&str, &str); 2] = [("[ ]", "range: 1, 7, 14 or 30 days"), ("r", "refresh")];
 
