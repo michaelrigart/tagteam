@@ -8,8 +8,10 @@ mod view;
 
 use std::path::PathBuf;
 
-use tagteam_core::{Fingerprint, ProviderId};
+use tagteam_core::ProviderId;
 use tagteam_provider::Env;
+
+use crate::auto::lock_file_name;
 
 pub use evidence::*;
 pub use refresh::*;
@@ -18,22 +20,9 @@ pub use view::*;
 /// `locks/tokens-<provider>.lock` (spec §5.1): held by one refresh of the provider at a time, a
 /// leaf. A provider ID that is not a plain name (anything outside `[A-Za-z0-9._-]`, or one
 /// starting with `.`) cannot name a path: its lock is named by the first 12 hex digits of the
-/// ID's SHA-256, inside `locks/`, as `engine_lock_path` names an engine lock.
+/// ID's SHA-256, inside `locks/`, by the same `lock_file_name` as an engine lock.
 pub fn tokens_lock_path(env: &Env, provider: &ProviderId) -> PathBuf {
-    let id = provider.as_str();
-    let plain = !id.is_empty()
-        && !id.starts_with('.')
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    let name = if plain {
-        format!("tokens-{id}.lock")
-    } else {
-        format!(
-            "tokens-{}.lock",
-            Fingerprint::of_secret(id.as_bytes()).short12()
-        )
-    };
+    let name = lock_file_name(provider.as_str(), "tokens", "tokens");
     env.data_dir().join("locks").join(name)
 }
 

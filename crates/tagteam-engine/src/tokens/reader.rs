@@ -717,6 +717,48 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_past_the_hash_window_skips_an_over_cap_line_and_keeps_the_rest_in_order() {
+        let limits = Limits {
+            chunk: 16,
+            max_line: 64,
+        };
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("s.jsonl");
+        let first: String = (0..60)
+            .map(|i| format!("{i:04}{}\n", "x".repeat(95)))
+            .collect();
+        fs::write(&path, &first).unwrap();
+        let (lines, row) = index(&path, None);
+        assert_eq!((lines.len(), row.offset), (60, 6_000));
+        assert!(row.offset > HASH_SPAN, "past the hash window");
+        append(
+            &path,
+            format!("k1\n{}\nk2\nk3\n", "z".repeat(200)).as_bytes(),
+        );
+        let open = open_at(&path, Some(&row)).unwrap();
+        assert_eq!(open.start(), 6_000, "the stored offset still holds");
+        let (lines, stop, reader) = read_lines(&open, limits, None, &Cancel::new());
+        assert_eq!(
+            (lines, stop),
+            (vec!["k1".into(), "k2".into(), "k3".into()], Stop::Eof)
+        );
+        assert_eq!(reader.long_lines(), 1);
+        let len = meta(&path).len();
+        let Checkpoint::Valid(row) = reader.checkpoint(true).unwrap() else {
+            panic!("nothing changed");
+        };
+        assert_eq!(row.offset, len);
+        append(&path, b"k4\n");
+        let (lines, row) = index(&path, Some(&row));
+        assert_eq!(
+            lines,
+            ["k4"],
+            "each line once: the checkpoint's hashes held"
+        );
+        assert_eq!(row.offset, len + 3);
+    }
+
+    #[test]
     fn the_deadline_stops_between_lines() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("s.jsonl");
