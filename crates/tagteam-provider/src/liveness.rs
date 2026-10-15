@@ -109,6 +109,20 @@ pub enum RecordEntry {
 /// be written there. A `dir` that cannot be listed is `Unreadable`. A record that vanishes between the listing and its read
 /// has been removed by its session's exit, so it is skipped.
 pub fn read_session_records(dir: &Path) -> Read<Vec<RecordEntry>> {
+    match read_session_records_dated(dir, &mut || 0) {
+        Read::Present(entries) => Read::Present(entries.into_iter().map(|(e, _)| e).collect()),
+        Read::Absent => Read::Absent,
+        Read::Unreadable(e) => Read::Unreadable(e),
+    }
+}
+
+/// `read_session_records`, each entry with the time `clock` gives right after its file was
+/// read, before it is parsed and before the next one is read: what dates a sighting (token
+/// report spec §6.4). `clock` is asked once for each file read.
+pub fn read_session_records_dated(
+    dir: &Path,
+    clock: &mut dyn FnMut() -> i64,
+) -> Read<Vec<(RecordEntry, i64)>> {
     let unreadable =
         |e: io::Error| Read::Unreadable(ReadError::new(dir.display().to_string(), e.to_string()));
     // Nothing that is not a directory, the profile's own path included, holds a record.
@@ -140,17 +154,20 @@ pub fn read_session_records(dir: &Path) -> Read<Vec<RecordEntry>> {
     paths.sort();
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
-        match fs::read(&path) {
-            Ok(bytes) => out.push(match parse_session_record(&bytes) {
+        let read = fs::read(&path);
+        let at = clock();
+        let entry = match read {
+            Ok(bytes) => match parse_session_record(&bytes) {
                 Ok(r) => RecordEntry::Record(r),
                 Err(detail) => RecordEntry::Unreadable { path, detail },
-            }),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => out.push(RecordEntry::Unreadable {
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => RecordEntry::Unreadable {
                 path,
                 detail: e.to_string(),
-            }),
-        }
+            },
+        };
+        out.push((entry, at));
     }
     Read::Present(out)
 }
@@ -696,6 +713,34 @@ mod tests {
             "a directory named like a record cannot be read"
         );
         assert_eq!(entries.len(), 4, "notes.txt is not a record");
+    }
+
+    #[test]
+    fn each_record_is_dated_right_after_its_own_read() {
+        // Token report spec §6.4: the scan dates a sighting at the read of its record, not at
+        // the end of the directory's. `clock` is asked once for each file, right after its read
+        // and before the next one; this one counts its calls.
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("sessions");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("20.json"), br#"{"pid": 20}"#).unwrap();
+        fs::write(dir.join("10.json"), br#"{"pid": 10}"#).unwrap();
+        fs::write(dir.join("30.json"), b"{").unwrap();
+        fs::write(dir.join("notes.txt"), b"not a record").unwrap();
+        let mut calls = 0;
+        let mut clock = || {
+            calls += 1;
+            calls * 1_000
+        };
+        let Read::Present(entries) = read_session_records_dated(&dir, &mut clock) else {
+            panic!("the directory lists");
+        };
+        let dates: Vec<i64> = entries.iter().map(|(_, at)| *at).collect();
+        assert_eq!(dates, [1_000, 2_000, 3_000]);
+        let pid = |p| RecordEntry::Record(record(json!({"pid": p})).unwrap());
+        assert_eq!(entries[0].0, pid(10));
+        assert_eq!(entries[1].0, pid(20));
+        assert!(matches!(&entries[2].0, RecordEntry::Unreadable { .. }));
     }
 
     #[test]
