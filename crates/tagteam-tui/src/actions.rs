@@ -1038,6 +1038,66 @@ mod tests {
         assert!(state.overlay.is_none() && state.running.is_none());
     }
 
+    fn alias_dialog_with(alias: &str) -> State {
+        let mut state = loaded(1);
+        let mut aliased = many(1);
+        aliased[0].row.alias = Some(alias.into());
+        state.accounts.apply(snapshot(aliased));
+        update(&mut state, ch('a'), NOW_MS);
+        state
+    }
+
+    fn typed(state: &State) -> &str {
+        let Some(Overlay::Text { input, .. }) = &state.overlay else {
+            panic!("{:?}", state.overlay);
+        };
+        input
+    }
+
+    #[test]
+    fn ctrl_h_is_backspace_in_a_text_dialog() {
+        // crossterm reports a terminal's 0x08 Backspace as Ctrl+h.
+        let mut state = alias_dialog_with("work");
+        assert_eq!(typed(&state), "work");
+        update(&mut state, ctrl('h'), NOW_MS);
+        assert_eq!(typed(&state), "wor");
+        assert_eq!(state.quitting, None);
+        update(&mut state, ctrl('h'), NOW_MS);
+        update(&mut state, ctrl('h'), NOW_MS);
+        update(&mut state, ctrl('h'), NOW_MS);
+        assert_eq!(typed(&state), "");
+        update(&mut state, ctrl('h'), NOW_MS);
+        assert_eq!(typed(&state), "", "an empty input stays empty");
+    }
+
+    #[test]
+    fn ctrl_u_clears_a_text_dialog_s_input() {
+        let mut state = alias_dialog_with("work");
+        update(&mut state, ctrl('u'), NOW_MS);
+        assert_eq!(typed(&state), "");
+        assert!(state.overlay.is_some());
+        assert_eq!(
+            update(&mut state, key(KeyCode::Enter), NOW_MS),
+            [Cmd::Act(Action::ClearAlias(sel(1)))]
+        );
+    }
+
+    #[test]
+    fn another_ctrl_key_does_nothing_in_a_dialog() {
+        let mut state = loaded(2);
+        update(&mut state, ch('x'), NOW_MS);
+        let before = format!("{:?}", state.overlay);
+        for c in ['n', 'y', 'l', 'u', 'h'] {
+            assert!(update(&mut state, ctrl(c), NOW_MS).is_empty(), "{c}");
+            assert_eq!(format!("{:?}", state.overlay), before, "{c}");
+        }
+        assert!(state.running.is_none());
+        let mut state = alias_dialog_with("work");
+        update(&mut state, ctrl('n'), NOW_MS);
+        update(&mut state, ctrl('w'), NOW_MS);
+        assert_eq!(typed(&state), "work");
+    }
+
     #[test]
     fn the_move_dialog_takes_digits_only() {
         let mut state = loaded(3);
