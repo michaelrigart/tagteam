@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::{
-    PENDING_LAUNCH_DIR, PendingLaunch, ProfileMarker, Provider, Read, RecordEntry,
+    PENDING_LAUNCH_DIR, PendingFile, PendingLaunch, ProfileMarker, Provider, Read, RecordEntry,
     parse_session_record, profile_path, read_session_records_dated, record_is_live,
 };
 
@@ -83,10 +83,11 @@ impl Engine {
 
     /// `sight_sessions`, and a refresh's step 1 (spec §5.2): the scan of spec §6.2, then each
     /// pending launch file is recorded and removed (spec §6.2), then every open launch whose
-    /// profile is no longer in use is closed at the moment it is found so (spec §6.1). Each time is read after the check it records, never at the scan's start: a
-    /// child of a killed `run` that answers once more while the scan runs, then exits before
-    /// its profile is checked, leaves no response past its launch's end. A late close
-    /// over-covers, which can only leave a response unattributed, never misplace it.
+    /// profile is no longer in use is closed at the moment it is found so (spec §6.1). Each
+    /// time is read after the check it records, never at the scan's start: a child of a killed
+    /// `run` that answers once more while the scan runs, then exits before its profile is
+    /// checked, leaves no response past its launch's end. A late close over-covers, which can
+    /// only leave a response unattributed, never misplace it.
     pub(crate) fn scan_sessions(&self, p: &dyn Provider) -> Result<u64, EngineError> {
         let provider = p.id();
         let store = self.store()?;
@@ -132,8 +133,8 @@ impl Engine {
                 }
             }
         }
-        for (path, pending) in self.pending_launches(p) {
-            changed += self.record_pending(&store, &path, &pending)?;
+        for (file, pending) in self.pending_launches(p) {
+            changed += self.record_pending(&store, &file, &pending)?;
         }
         for launch in store.launches(&provider)? {
             if launch.ended_at.is_some() {
@@ -190,7 +191,7 @@ impl Engine {
     /// The pending launch files in `p`'s profiles (spec §6.1), each with its path: those that
     /// parse and name `p` and the account whose profile holds them. Any other file is skipped
     /// and logged at debug, never removed.
-    pub(crate) fn pending_launches(&self, p: &dyn Provider) -> Vec<(PathBuf, PendingLaunch)> {
+    pub(crate) fn pending_launches(&self, p: &dyn Provider) -> Vec<(PendingFile, PendingLaunch)> {
         let provider = p.id();
         let mut found = Vec::new();
         for (home, _) in self.homes(p) {
@@ -198,12 +199,12 @@ impl Engine {
                 continue;
             }
             let account = AccountId::from_string(home);
-            for (path, parsed) in PendingLaunch::read_all(&profile_path(&self.env, &account)) {
+            for (file, parsed) in PendingLaunch::read_all(&profile_path(&self.env, &account)) {
                 match parsed {
                     Ok(pending)
                         if pending.provider == provider && pending.account_id == account =>
                     {
-                        found.push((path, pending));
+                        found.push((file, pending));
                     }
                     Ok(_) => tracing::debug!(
                         "a pending launch file names another provider or account than its profile's; skipped"
@@ -217,14 +218,14 @@ impl Engine {
         found
     }
 
-    /// Spec §6.2: records the pending launch read from `path` open from its start, closes it at
+    /// Spec §6.2: records the pending launch read from `file` open from its start, closes it at
     /// its end when it has one, then removes the file. Both writes are idempotent, so a file a
     /// failed removal left behind is recorded again as it was. Returns 1 when the launch was
     /// new or the file closed it, else 0.
     fn record_pending(
         &self,
         store: &Store,
-        path: &Path,
+        file: &PendingFile,
         pending: &PendingLaunch,
     ) -> Result<u64, EngineError> {
         let account = pending.account_id.as_str();
@@ -243,11 +244,13 @@ impl Engine {
                 now,
             )?;
         }
-        match fs::remove_file(path) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => {
-                tracing::debug!("a recorded pending launch file was not removed: {e}");
-            }
-            _ => {}
+        // A file `run` replaced since it was read holds a newer record: it stays for the next
+        // scan.
+        hooks::point(self, "scan-pending-recorded")?;
+        match file.remove_if_unchanged() {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!("a pending launch file changed since it was read; kept"),
+            Err(e) => tracing::debug!("a recorded pending launch file was not removed: {e}"),
         }
         Ok(u64::from(stored.is_none_or(|l| {
             l.ended_at.is_none() && pending.ended_at_ms.is_some()
@@ -271,10 +274,10 @@ impl Engine {
             return Ok(());
         }
         let store = self.store()?;
-        for (path, parsed) in files {
+        for (file, parsed) in files {
             match parsed {
                 Ok(pending) if pending.provider == p.id() && &pending.account_id == account => {
-                    self.record_pending(&store, &path, &pending)?;
+                    self.record_pending(&store, &file, &pending)?;
                 }
                 _ => tracing::debug!("a pending launch file was skipped"),
             }
