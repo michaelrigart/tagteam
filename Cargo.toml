@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "20261014.2045.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/michaelrigart/tagteam"
 homepage = "https://github.com/michaelrigart/tagteam"
@@ -19,6 +19,7 @@ tagteam-provider = { path = "crates/tagteam-provider", version = "20261014.2045.
 tagteam-cc = { path = "crates/tagteam-cc", version = "20261014.2045.0" }
 tagteam-engine = { path = "crates/tagteam-engine", version = "20261014.2045.0" }
 tagteam-daemon = { path = "crates/tagteam-daemon", version = "20261014.2045.0" }
+tagteam-tui = { path = "crates/tagteam-tui", version = "20261014.2045.0" }
 tagteam-fake = { path = "crates/tagteam-fake" }
 # Export encryption (§13.3, Decision 10): scrypt passphrases, X25519 and ssh-ed25519 recipients,
 # ASCII armor. The `ssh` feature pulls in `rsa` (RUSTSEC-2023-0071, a timing side channel in
@@ -28,12 +29,17 @@ age = { version = "0.12", features = ["armor", "ssh"] }
 clap = { version = "4", features = ["derive", "string"] }
 # `tagteam completions` (§13.7): static scripts generated from the command definitions.
 clap_complete = "4"
+# The terminal UI (TUI spec §4.1): ratatui with its default crossterm backend, and the crossterm
+# it is built against. Both are pinned exactly, so a patch release never changes what is drawn;
+# ratatui 0.30.2 declares rust-version 1.88.0, which is why the MSRV is 1.88.
+crossterm = "=0.29.0"
 fastrand = "2"
 hex = "0.4"
 # The token report's days and months in a time zone, DST included (token report §3.1): the
 # system zone database, nothing bundled. Pinned exactly, so a newer release is taken on purpose.
 jiff = { version = "=0.2.37", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2"
+ratatui = "=0.30.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }

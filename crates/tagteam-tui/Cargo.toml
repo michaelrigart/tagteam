@@ -1,0 +1,19 @@
+[package]
+name = "tagteam-tui"
+description = "Internal crate of tagteam: the terminal UI. No stable API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tagteam-core.workspace = true
+tagteam-provider.workspace = true
+tagteam-engine.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true
