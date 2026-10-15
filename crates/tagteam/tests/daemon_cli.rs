@@ -8,8 +8,12 @@
 mod common;
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::Stdio;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use common::{
     Running, cmd, now_epoch_s, record_reading, std_cmd, two_fresh_accounts, usage_window,
@@ -237,4 +241,100 @@ fn an_unknown_flag_is_a_usage_error() {
     // D8.1: exit 2.
     let d = tempfile::tempdir().unwrap();
     cmd(d.path()).args(["daemon", "--once"]).assert().code(2);
+}
+
+/// Connects to `sock` once the daemon has bound it. It fails the test, killing the daemon,
+/// after `within`.
+fn connect_socket_within(
+    daemon: &mut common::Running,
+    sock: &Path,
+    within: Duration,
+) -> UnixStream {
+    let deadline = Instant::now() + within;
+    loop {
+        match UnixStream::connect(sock) {
+            Ok(stream) => return stream,
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                let _ = daemon.child.kill();
+                panic!("the daemon never served {}: {e}", sock.display());
+            }
+        }
+    }
+}
+
+/// The next line, as JSON.
+fn next_json(reader: &mut BufReader<UnixStream>) -> Value {
+    let mut line = String::new();
+    assert!(
+        reader.read_line(&mut line).unwrap() > 0,
+        "the connection ended"
+    );
+    serde_json::from_str(&line).unwrap()
+}
+
+#[test]
+fn the_daemon_serves_its_socket_until_a_signal_and_then_removes_it() {
+    // D4.1 step 5, D4.6, D5.1: the socket is bound before the scheduler starts and answers
+    // from the board. On SIGTERM a subscriber hears `stopping` before its connection ends;
+    // then the file is gone, and the daemon exits 0. Notifications are off, as in every test
+    // of this file.
+    let root = common::short_tempdir();
+    common::seed_home(&Env::for_test(root.path()));
+    cmd(root.path())
+        .args(["config", "set", "notify.enabled", "false"])
+        .assert()
+        .success();
+    let sock = root.path().join("home/.local/share/tagteam/daemon.sock");
+    let mut cmd = common::std_cmd(root.path());
+    cmd.arg("daemon").stdin(Stdio::null());
+    let mut daemon = common::Running::spawn(cmd);
+
+    let stream = connect_socket_within(&mut daemon, &sock, Duration::from_secs(10));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let hello = next_json(&mut reader);
+    assert_eq!(hello["event"], "hello", "{hello}");
+    assert_eq!(hello["protocol"], 1);
+    assert_eq!(hello["pid"], json!(daemon.child.id()));
+
+    (&stream)
+        .write_all(b"{\"id\":1,\"op\":\"status\"}\n")
+        .unwrap();
+    let status = next_json(&mut reader);
+    assert_eq!(status["id"], 1, "{status}");
+    assert_eq!(status["ok"], true, "{status}");
+    let result = &status["result"];
+    assert_eq!(result["daemon"]["pid"], json!(daemon.child.id()));
+    assert_eq!(
+        result["daemon"]["socket"],
+        "~/.local/share/tagteam/daemon.sock"
+    );
+    assert_eq!(result["subscribers"], 0);
+
+    (&stream)
+        .write_all(b"{\"id\":2,\"op\":\"subscribe\"}\n")
+        .unwrap();
+    assert_eq!(next_json(&mut reader)["ok"], true);
+    daemon.signal(libc::SIGTERM);
+    let mut last = Value::Null;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        last = serde_json::from_str(&line).unwrap();
+    }
+    assert_eq!(last["event"], "stopping", "{last}");
+    assert_eq!(last["reason"], "signal");
+    let out = daemon.finish(Duration::from_secs(10));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!sock.exists(), "the socket file was left behind");
 }

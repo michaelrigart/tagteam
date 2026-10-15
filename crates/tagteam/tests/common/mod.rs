@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use tagteam_cc::live::Platform;
 use tagteam_cc::{ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, ProviderId, Window, WindowKind};
+use tagteam_engine::daemon::{MAX_SOCKET_PATH, daemon_socket_path};
 use tagteam_engine::store::{Eligibility, Reserve, Store};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::atomic::ensure_private_dir;
@@ -41,6 +42,26 @@ pub fn now_epoch_s() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+/// A fixture root short enough for the daemon's socket (D5.1, D14):
+/// `<root>/home/.local/share/tagteam/daemon.sock` must fit `sun_path`, and macOS's own
+/// `$TMPDIR` can push it past. It is made under `/tmp`, else under `$TMPDIR` where `/tmp`
+/// cannot be written (a sandbox), and it fails the test, saying why, when the socket path
+/// would not fit there.
+pub fn short_tempdir() -> tempfile::TempDir {
+    let d = tempfile::Builder::new()
+        .prefix("tt")
+        .tempdir_in("/tmp")
+        .or_else(|_| tempfile::Builder::new().prefix("tt").tempdir())
+        .expect("a temporary directory under /tmp or $TMPDIR");
+    let sock = daemon_socket_path(&Env::for_test(d.path()));
+    assert!(
+        sock.as_os_str().len() <= MAX_SOCKET_PATH,
+        "{} is too long for a Unix socket; run the tests where /tmp is writable",
+        sock.display()
+    );
+    d
 }
 
 /// The binary in an isolated environment rooted at `root`, with its file-backed Keychain.

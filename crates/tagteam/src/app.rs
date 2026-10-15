@@ -1685,16 +1685,23 @@ impl App<'_, '_> {
         let started = Daemon::start(engine, opts, &mut |notice| {
             let _ = writeln!(err, "note: {notice}");
         })?;
+        // D4.1 step 5: the socket, once `daemon.lock` is held and before the scheduler runs.
+        let server = daemon_cmd::bind_socket(engine.env(), &started.board());
         let exit = if self.json {
             let sink = daemon_cmd::DaemonJson::new(&mut **out, &now_ms).stopping(engine.cancel());
-            started.serve(&sink, &ThreadSleeper, &mut uniform_jitter)
+            daemon_cmd::serve(started, &sink, server.as_ref())
         } else {
             let auto = HumanSink::new(&mut **out, &mut **err, &now_ms, &names, color, several)
                 .stopping(engine.cancel());
             let sink = daemon_cmd::DaemonHuman::new(auto, engine.env());
             sink.started(std::process::id());
-            started.serve(&sink, &ThreadSleeper, &mut uniform_jitter)
+            daemon_cmd::serve(started, &sink, server.as_ref())
         };
+        // D4.6: the hub removed the socket file when `stopping` went out, while `daemon.lock`
+        // was still held. Each connection has written `stopping`; this closes them.
+        if let Some(server) = server {
+            server.shutdown();
+        }
         Ok(match exit {
             DaemonExit::Signal => 0,
             DaemonExit::Restart => daemon_cmd::EXIT_RESTART,
