@@ -199,11 +199,12 @@ fn sigterm_waits_for_a_switch_inside_its_critical_span_and_reports_it_as_switche
         tui.child.try_wait().unwrap().is_none(),
         "the TUI waits for the switch"
     );
-    let waiting = tui.screen();
+    tui.wait_for(LONG, "the terminal restored while it waits (§10.2)", |s| {
+        !s.on_alt()
+    });
     assert!(
-        !waiting.on_alt(),
-        "the terminal is restored while it waits (§10.2):\n{}",
-        waiting.text()
+        tui.child.try_wait().unwrap().is_none(),
+        "the TUI still waits for the switch"
     );
     fs::write(pause.join("resume"), b"").unwrap();
     let f = tui.finish(LONG);
@@ -351,8 +352,12 @@ fn run_on_an_account_moved_elsewhere_is_refused_and_launches_nothing() {
     let home = Home::new();
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the accounts table", accounts);
-    // Nothing here re-reads on its own: the start-up collection fetches nothing offline, and
-    // a collection that fetched nothing is not read back (§6.2); the next tick is 30 s away.
+    // The start-up collection fails offline, which counts as fetched, so the TUI re-reads once
+    // (§6.2): the rows go from "no data yet" to "unavailable (pre-send, ...)". Wait for that, so
+    // the `move` below is the only change after the TUI's last read.
+    tui.wait_for(LONG, "the start-up re-read", |s| {
+        s.on_alt() && s.contains("pre-send")
+    });
     cmd(home.root()).args(["move", "1", "2"]).assert().success();
     tui.type_keys(b"R");
     let shown = tui.wait_for(LONG, "the wait for Enter", returning);
