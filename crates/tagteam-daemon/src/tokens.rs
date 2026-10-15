@@ -61,6 +61,17 @@ impl Common {
             .collect())
     }
 
+    /// `serving`, for a run: a failure to read the store is not one provider's, so it is logged
+    /// at WARN with the error's kind only (never its text, §14.2) and is the run's `lastError`,
+    /// as `store: <message>`; the run then serves no provider and keeps its cadence.
+    fn serving_or_note(&self, engine: &Engine, error: &mut Option<String>) -> Vec<ProviderId> {
+        self.serving(engine).unwrap_or_else(|e| {
+            tracing::warn!(kind = e.kind(), "cannot read the store for the token jobs");
+            error.get_or_insert_with(|| format!("store: {e}"));
+            Vec::new()
+        })
+    }
+
     /// Token report §12: reads `provider`'s index state, and emits `token-index` when its
     /// `changed_at_ms` moved since the last event for it. An index that never changed is not
     /// broadcast.
@@ -158,10 +169,7 @@ impl Job for SessionsWatch {
     fn run(&mut self, cx: &mut JobCx<'_>) -> Ran {
         let (engine, sink) = (cx.engine, cx.sink);
         let mut error = None;
-        let providers = self.common.serving(engine).unwrap_or_else(|e| {
-            error = Some(e.to_string());
-            Vec::new()
-        });
+        let providers = self.common.serving_or_note(engine, &mut error);
         for p in &providers {
             let called = engine
                 .sight_sessions(p)
@@ -184,8 +192,9 @@ pub struct TokenIndexJob {
 }
 
 impl TokenIndexJob {
-    /// A refresh slice other than `INDEX_SLICE`. Tests use `Duration::ZERO` to end a refresh
-    /// after its first chunk.
+    /// A refresh slice other than `INDEX_SLICE`. Under `Duration::ZERO` the budget is spent from
+    /// the start, so each call stops about one line past its deadline (token report §5.2) and
+    /// reports `complete: false` until the transcripts are read.
     pub fn with_slice(mut self, slice: Duration) -> Self {
         self.slice = slice;
         self
@@ -201,10 +210,7 @@ impl Job for TokenIndexJob {
         let (engine, sink) = (cx.engine, cx.sink);
         let mut error = None;
         let mut delay = INDEX_EVERY_MS;
-        let providers = self.common.serving(engine).unwrap_or_else(|e| {
-            error = Some(e.to_string());
-            Vec::new()
-        });
+        let providers = self.common.serving_or_note(engine, &mut error);
         for p in &providers {
             let refreshed = engine
                 .refresh_tokens(p, Wait::Try, Some(self.slice), engine.cancel(), &mut |_| {})

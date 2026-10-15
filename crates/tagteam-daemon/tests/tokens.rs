@@ -12,7 +12,7 @@ use serde_json::json;
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::live::Platform;
 use tagteam_core::{CLAUDE_CODE, ProviderId};
-use tagteam_daemon::events::{DaemonEvent, DaemonSink};
+use tagteam_daemon::events::{DaemonEvent, DaemonSink, StopReason};
 use tagteam_daemon::protocol::{Event, daemon_event_json, parse_event};
 use tagteam_daemon::scheduler::{Job, JobCx, Ran};
 use tagteam_daemon::status::{DaemonInfo, JobStatus, NotifyInfo, StatusBoard};
@@ -20,9 +20,9 @@ use tagteam_daemon::tokens::{INDEX_EVERY_MS, SESSIONS_EVERY_MS, token_jobs};
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
-use tagteam_engine::tokens::{IndexState, tokens_lock_path};
+use tagteam_engine::tokens::{IndexProgress, IndexState, Wait, tokens_lock_path};
 use tagteam_engine::vault::{KeychainVault, Vault};
-use tagteam_engine::{Engine, EngineConfig};
+use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::{
     Env, FakeClock, FakeKeychain, FakeProcess, FakeProcessProbe, FlockGuard, RunShell,
     ScriptedHttp, ScriptedSpawner,
@@ -331,6 +331,104 @@ fn a_session_the_watch_sights_is_broadcast_as_token_index() {
     assert_eq!(events.len(), 1, "{events:?}");
     assert!(events[0].1.changed_at_ms.is_some());
     assert_eq!(job_status(&fx, "sessions-watch").last_error, None);
+}
+
+/// A live session's record in the default home, as the sessions watch sights it.
+fn live_session(fx: &Fx) {
+    fx.process.set(
+        4242,
+        FakeProcess {
+            exists: Some(true),
+            ..FakeProcess::default()
+        },
+    );
+    let records = fx.env.home.join(".claude/sessions");
+    fs::create_dir_all(&records).unwrap();
+    fs::write(
+        records.join("4242.json"),
+        json!({"pid": 4242, "sessionId": "s-live", "cwd": "/work/app",
+               "startedAt": T0_MS - 60_000, "kind": "interactive"})
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_change_one_job_broadcast_is_not_broadcast_again_by_the_other() {
+    // The two jobs share one record of what was broadcast (one `changed_at_ms` per provider), so
+    // a change is announced once, whichever job saw it first.
+    let fx = fx(true);
+    let sink = Recorded::default();
+    let (mut sessions, mut index) = token_jobs(vec![cc()], fx.board.clone(), false);
+    live_session(&fx);
+    assert_eq!(
+        run(&mut sessions, &fx, &sink),
+        Ran::After(SESSIONS_EVERY_MS)
+    );
+    let events = sink.token_index();
+    assert_eq!(events.len(), 1, "{events:?}");
+    let changed = events[0].1.changed_at_ms;
+    assert!(changed.is_some());
+
+    assert_eq!(run(&mut index, &fx, &sink), Ran::After(INDEX_EVERY_MS));
+    assert_eq!(
+        fx.engine.token_index_state(&cc()).unwrap().changed_at_ms,
+        changed,
+        "the refresh found nothing new"
+    );
+    assert_eq!(sink.token_index().len(), 1, "announced once");
+}
+
+#[test]
+fn an_interrupted_refresh_stops_the_scheduler_with_signal() {
+    // D4.3, D4.6: a signal that reaches a call ends the run with `Stop(Signal)`, as an
+    // interrupted provider run does, and the job reports nothing.
+    let fx = fx(true);
+    let sink = Recorded::default();
+    let (_, mut index) = token_jobs(vec![cc()], fx.board.clone(), false);
+    append(&fx, "s1", 0, 1);
+    fx.engine.cancel().request(libc::SIGTERM);
+    let call = fx.engine.refresh_tokens(
+        &cc(),
+        Wait::Try,
+        None,
+        fx.engine.cancel(),
+        &mut |_: &IndexProgress| {},
+    );
+    assert!(
+        matches!(call, Err(EngineError::Interrupted(_))),
+        "the call itself ends in an interruption: {call:?}"
+    );
+    assert_eq!(run(&mut index, &fx, &sink), Ran::Stop(StopReason::Signal));
+    assert!(sink.0.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_store_that_cannot_be_read_is_recorded_in_status_and_keeps_the_cadence() {
+    // `serving` is no provider's error: `lastError` names the store, and both jobs keep their
+    // cadence and emit nothing (the error is logged at WARN by kind).
+    let fx = fx(false);
+    let sink = Recorded::default();
+    let (mut sessions, mut index) = token_jobs(vec![cc()], fx.board.clone(), false);
+    fs::create_dir_all(fx.env.data_dir()).unwrap();
+    fs::write(
+        fx.env.data_dir().join("tagteam.db"),
+        "not a database".repeat(100),
+    )
+    .unwrap();
+    assert_eq!(
+        run(&mut sessions, &fx, &sink),
+        Ran::After(SESSIONS_EVERY_MS)
+    );
+    assert_eq!(run(&mut index, &fx, &sink), Ran::After(INDEX_EVERY_MS));
+    for name in ["sessions-watch", "token-index"] {
+        let error = job_status(&fx, name).last_error;
+        assert!(
+            error.as_deref().is_some_and(|e| e.starts_with("store: ")),
+            "{name}: {error:?}"
+        );
+    }
+    assert!(sink.0.lock().unwrap().is_empty());
 }
 
 #[test]
