@@ -151,10 +151,27 @@ fn on_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     if state.quitting.is_some() {
         return vec![];
     }
+    // A terminal whose Backspace sends ^H reaches crossterm as Ctrl+h: it is a Backspace.
+    let key = match key {
+        KeyEvent {
+            code: KeyCode::Char('h'),
+            modifiers: KeyModifiers::CONTROL,
+            kind,
+            ..
+        } => KeyEvent::new_with_kind(KeyCode::Backspace, KeyModifiers::NONE, kind),
+        key => key,
+    };
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
             KeyCode::Char('c') => quit(state, 0),
             KeyCode::Char('z') => vec![Cmd::Stop],
+            // Ctrl-U clears a text dialog's input; no other dialog has one.
+            KeyCode::Char('u') => {
+                if let Some(Overlay::Text { input, .. }) = &mut state.overlay {
+                    input.clear();
+                }
+                vec![]
+            }
             _ => vec![],
         };
     }
