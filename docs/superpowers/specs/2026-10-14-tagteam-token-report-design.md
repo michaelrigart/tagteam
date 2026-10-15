@@ -239,7 +239,8 @@ CREATE TABLE session_sightings (
   home        TEXT NOT NULL,     -- '' for the default home, else the profile's account id
   started_at  INTEGER NOT NULL,  -- epoch ms: the execution, its record's startedAt
   first_at    INTEGER NOT NULL,  -- epoch ms: the first read that named the session in it
-  last_at     INTEGER NOT NULL,  -- epoch ms: the last read that named it there
+  last_at     INTEGER NOT NULL,  -- epoch ms: the last read written there (§6.4); it lags
+                                 -- the last read by up to a minute, never leads it
   source      TEXT NOT NULL,     -- 'run' | 'scan' | 'statusline': the source that created it
   recorded_at INTEGER NOT NULL,  -- epoch ms of the last write
   PRIMARY KEY (provider, session_id, home, started_at, first_at)
@@ -449,7 +450,7 @@ report (§11.3), as the first sign of transcript format drift (core §17 R2).
 
 Two kinds of evidence place a session:
 - A **sighting** says a session was seen in one execution in a home, from the first read that
-  named it there (`first_at`) to the last (`last_at`).
+  named it there (`first_at`) to the last one written (`last_at`, §6.4).
 - A **launch** says `tagteam run` may have had a profile session running for an account over
   an interval.
 
@@ -479,17 +480,22 @@ impl Engine {
   a read only when its mtime moved since the read that named the current session.
   - A read of this child's record (its pid, started no earlier than the launch, its process
     live) that names a session begins a **tenure** at the read. An unchanged mtime, or a read
-    naming the same session under the same `startedAt`, confirms the tenure.
+    naming the same session under the same `startedAt`, confirms the tenure. Each read is
+    dated when it is done, before the liveness check that follows it.
   - A read naming another session, or another `startedAt`, ends the tenure at its last
     confirmation and begins the next one.
   - A read that shows no session (unreadable, not this child's, not live, or gone) confirms
     nothing, and the next tick reads again.
   - Every 2 seconds `run` writes what its checks saw (source `run`): the current tenure, to its
     last confirmation, then each tenure that ended since, newest first, exactly to its last
-    confirmation. A write that fails keeps them for the next.
-- **Exit.** After exit handling, `run` ends the child's tenure at its last confirming read, not
-  at the exit: the child may have left its session after that read. It never ends past the
-  exit, since a check after it, of a record a crash left behind, confirms nothing.
+    confirmation (§6.4). A tenure leaves the queue only once every later one is stored. A write
+    that fails keeps the rest for the next.
+- **Exit.** After exit handling, `run` moves the end of the child's tenure forward to its last
+  confirming read, not to the exit: the child may have left its session after that read. It
+  never moves it past the exit, since a check after it, of a record a crash left behind,
+  confirms nothing, and never back, since every stored end is a read: a later one by the scan
+  or the statusline stands. The tenures that ended and were not yet written end as the write
+  ends them.
 - A `run` that execs plain `claude` (core §12.1) records neither: §7.2 places that session.
 
 ### 6.2 Scan
@@ -497,8 +503,9 @@ impl Engine {
 Every refresh, and the daemon on its own timer (§12), reads every `*.json` in the default
 home's `sessions/` and in each profile's (source `scan`). For a record whose process is alive
 (core §12.6), the scan continues the latest tenure of `sessionId` in that execution
-(`home`, `startedAt`) to now, or begins one now (§6.4). An unreadable or partly written record,
-or one whose process is gone, is skipped.
+(`home`, `startedAt`) to the read, or begins one at it (§6.4). The read is dated when the home's
+records were read, before the liveness checks and the writes that follow. An unreadable or
+partly written record, or one whose process is gone, is skipped.
 
 ### 6.3 Statusline
 
@@ -513,12 +520,12 @@ environment. Stdin stays drained and ignored (core §13.5).
   is within the last minute, there is nothing to do.
 - **Otherwise it finds its execution.** It walks its ancestor processes (at most 8) to the
   first that has a record in the home's `sessions/`: the Claude Code process it runs under.
-  That record's `startedAt` is the execution. As the scan does, the statusline continues the
-  session's latest tenure there to now, or begins one now (source `statusline`). With no such
-  ancestor it records nothing.
+  That record's `startedAt` is the execution, and its read dates the sighting. As the scan
+  does, the statusline continues the session's latest tenure there to the read, or begins one
+  at it (source `statusline`). With no such ancestor it records nothing.
 
   A sighting is only ever extended by the execution it belongs to, so a gap between two
-  executions of a session is never bridged, nor a gap within one (§6.4).
+  executions of a session is never bridged, nor, under A3 (§7.4), a gap within one (§6.4).
 - **The write** waits at most the 5 ms the live-identity cache already allows
   (`CACHE_WRITE_WAIT`). A busy store skips it; the line is never held up for it.
 
@@ -528,13 +535,19 @@ environment. Stdin stays drained and ignored (core §13.5).
   execution's record, keyed by its `startedAt`, that named the session. It begins at the first
   read that named the session in the execution, never at the record's `startedAt` or a file's
   mtime, and ends at the last read that named it. A read that shows no session confirms
-  nothing and extends nothing.
+  nothing and extends nothing. Each read is dated right after it is done, before the liveness
+  check and any write that follow it.
 - `run` keeps its tenures itself (§6.1). The scan and the statusline keep no state: a read
   continues the latest tenure of its session in the execution, or begins one at the read. It
   begins one too when the execution was seen naming another session at or after that tenure's
-  end: the session may have left in between, so the gap is never bridged.
-- A source extends a tenure at most once a minute. `run` sets a tenure's end exactly when it
-  ends.
+  end: the session may have left in between, so, under A3 (§7.4), the gap is not bridged.
+- A source extends a tenure at most once a minute, so a stored end lags the last read by up to
+  a minute, and never leads it.
+- When a switch ends a tenure, `run` sets its end exactly to its last confirmation, back as
+  well as forward. At the exit it only moves the end forward (§6.1). Either way, in the same
+  transaction, it clamps to that end every other tenure of the session in that execution that
+  began by then. A scan or statusline read of a session `run` saw leave and come back, made
+  before `run` wrote the session it left for, may have continued one over the absence.
 - Every write sets `recorded_at`, which moves `IndexState.changed_at_ms` (§10).
 
 ---
@@ -599,8 +612,10 @@ assumptions:
   reads of one execution's record that name a session, with no read between them naming
   another, the session stayed in that execution. A session that left an execution and came
   back between two such reads, unseen, is credited to that home for the time it was away, unless
-  another home sighted it then. `run` reads every 50 ms; the scan and the statusline read far
-  less often.
+  another home sighted it then. `run` and the scan read the record's `sessionId`: `run` every
+  50 ms, the scan far less often. The statusline reads only the execution from the record and
+  takes the session from its environment (§6.3), so its reads are only as good as that
+  environment.
 
 Known limits:
 
@@ -1015,7 +1030,9 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
   - Evidence:
     - sightings from all three sources, extended at most once a minute;
     - a session entering a running execution (`/clear`, `/resume`), sighted from the read that
-      first named it and ended at its last confirming read, and a return to it never bridged;
+      first named it and ended at its last confirming read, and a return to it not bridged,
+      including by a stateless tenure continued before `run`'s write (§6.4);
+    - each source's sighting dated at its read; the order of `run`'s writes;
     - the statusline finding its execution through its ancestors, recording nothing without
       one, and never extending another execution's sighting;
     - a launch recorded before the spawn and closed at exit;

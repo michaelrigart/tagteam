@@ -386,8 +386,8 @@ const RECORD_SIGHTING: &str = "INSERT INTO session_sightings \
 /// The latest tenure of the row's session in its execution, or one starting at the row's
 /// `first_at` when there is none, or when the execution has been seen naming another session at
 /// or after that tenure's end: the session may have left it in between, and a source that keeps
-/// no state cannot tell, so the gap is never bridged (spec §6.4). One statement, so its read
-/// and its write share one write transaction.
+/// no state cannot tell, so the gap is not bridged (spec §6.4, under §7.4 A3). One statement,
+/// so its read and its write share one write transaction.
 const CONTINUE_SIGHTING: &str = "INSERT INTO session_sightings \
      (provider, session_id, home, started_at, first_at, last_at, source, recorded_at) \
      SELECT ?1, ?2, ?3, ?4, coalesce(( \
