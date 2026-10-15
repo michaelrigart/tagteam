@@ -40,6 +40,7 @@ pub mod tokens;
 pub mod transfer;
 pub mod vault;
 pub mod views;
+pub mod words;
 
 pub use engine::{Engine, EngineConfig};
 pub use error::{EngineError, SessionOwner, SplitCause};
