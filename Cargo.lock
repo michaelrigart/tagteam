@@ -2417,6 +2417,7 @@ version = "20261014.2045.0"
 dependencies = [
  "fastrand",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "tagteam-cc",

@@ -6,6 +6,7 @@
 //! in every slice and before every job, and every job hears of a change before the next job
 //! runs.
 
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use tagteam_engine::Engine;
@@ -76,12 +77,35 @@ struct Slot<'j> {
     delay_ms: i64,
 }
 
+/// D4.3: a handle a job keeps to make other jobs due at once. `wake(prefix)` makes every job
+/// whose name starts with `prefix` due before the scheduler next sleeps or picks a job; each
+/// then runs once and keeps its own cadence after. The store watch wakes `provider:` after a
+/// `changed` event, so every provider job re-evaluates its mode (D4.4).
+#[derive(Debug, Clone, Default)]
+pub struct Wake(Arc<Mutex<Vec<String>>>);
+
+impl Wake {
+    pub fn wake(&self, prefix: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(prefix.to_owned());
+    }
+
+    /// The prefixes woken since the last call.
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
 /// The jobs, and when each runs next (D4.2).
 #[derive(Default)]
 pub struct Scheduler<'j> {
     slots: Vec<Slot<'j>>,
     /// `config.toml`'s mtime as the jobs last read their settings; `None` until it is known.
     settings: Option<Option<SystemTime>>,
+    /// What jobs woke since the last pass; every handle `wake()` gave out feeds it.
+    wake: Wake,
 }
 
 impl<'j> Scheduler<'j> {
@@ -107,6 +131,25 @@ impl<'j> Scheduler<'j> {
         });
     }
 
+    /// The handle jobs wake each other through.
+    pub fn wake(&self) -> Wake {
+        self.wake.clone()
+    }
+
+    /// Every job a `Wake` named since the last pass is due now; a deadline already past keeps
+    /// its place.
+    fn woken(&mut self, now_ms: i64) {
+        for prefix in self.wake.take() {
+            for slot in self
+                .slots
+                .iter_mut()
+                .filter(|s| s.job.name().starts_with(&prefix))
+            {
+                slot.due_ms = slot.due_ms.min(now_ms);
+            }
+        }
+    }
+
     /// Runs the jobs until one returns `Stop`, or the cancel token is set (`Signal`), which is
     /// checked before every job and in every slice. A signal that lands inside a run is the
     /// job's to end that run at its next cancellation point (§14.1).
@@ -121,6 +164,7 @@ impl<'j> Scheduler<'j> {
             }
             self.check_settings(cx);
             let now_ms = cx.engine.now_ms();
+            self.woken(now_ms);
             for slot in &mut self.slots {
                 // A wall clock set back would stretch the wait by as much: never wait longer
                 // than the delay the due time was set for.
@@ -442,5 +486,99 @@ mod tests {
             let j = uniform_jitter();
             assert!((-1.0..1.0).contains(&j), "{j}");
         }
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use std::cell::RefCell;
+
+    use tagteam_provider::{Clock, FakeClock};
+
+    use super::*;
+    use crate::events::StopReason;
+    use crate::testutil::{Emitted, Fx, Slices, T0};
+
+    /// A job that runs every `period_ms`, recording each run, and on its `on`-th run wakes
+    /// every job whose name starts with `prefix`.
+    struct Every<'a> {
+        name: &'static str,
+        period_ms: i64,
+        clock: &'a FakeClock,
+        runs: &'a RefCell<Vec<(&'static str, i64)>>,
+        wake: Option<(Wake, usize, &'static str)>,
+    }
+
+    impl Job for Every<'_> {
+        fn name(&self) -> String {
+            self.name.to_owned()
+        }
+
+        fn run(&mut self, _cx: &mut JobCx<'_>) -> Ran {
+            let mut runs = self.runs.borrow_mut();
+            runs.push((self.name, self.clock.now_ms().div_euclid(1000) - T0));
+            let mine = runs.iter().filter(|(n, _)| *n == self.name).count();
+            if let Some((wake, on, prefix)) = &self.wake {
+                if mine == *on {
+                    wake.wake(prefix);
+                }
+            }
+            Ran::After(self.period_ms)
+        }
+    }
+
+    #[test]
+    fn a_wake_makes_every_job_it_names_due_before_the_next_sleep() {
+        // D4.3: after `changed`, every provider job re-evaluates at once. The jobs a wake
+        // names run before the scheduler sleeps again, once, and then keep their own
+        // cadence; a job it does not name keeps its deadline.
+        let fx = Fx::new();
+        let runs = RefCell::new(Vec::new());
+        let (clock, cancel) = (fx.clock.clone(), fx.engine.cancel().clone());
+        let slices = Slices::new(&fx.clock, move |_| {
+            if clock.now_ms() >= (T0 + 10) * 1000 {
+                cancel.request(libc::SIGTERM);
+            }
+        });
+        let mut scheduler = Scheduler::new();
+        let wake = scheduler.wake();
+        let now = fx.engine.now_ms();
+        for name in ["provider:a", "provider:b", "upgrade-watch"] {
+            let job = Every {
+                name,
+                period_ms: 60_000,
+                clock: &fx.clock,
+                runs: &runs,
+                wake: None,
+            };
+            scheduler.add(Box::new(job), now);
+        }
+        let waker = Every {
+            name: "store-watch",
+            period_ms: 2_000,
+            clock: &fx.clock,
+            runs: &runs,
+            wake: Some((wake, 3, "provider:")),
+        };
+        scheduler.add(Box::new(waker), now);
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        assert_eq!(scheduler.run(&mut cx, &slices), StopReason::Signal);
+        let of = |name: &str| -> Vec<i64> {
+            runs.borrow()
+                .iter()
+                .filter(|(n, _)| *n == name)
+                .map(|(_, at)| *at)
+                .collect()
+        };
+        assert_eq!(of("provider:a"), [0, 4]);
+        assert_eq!(of("provider:b"), [0, 4]);
+        assert_eq!(of("upgrade-watch"), [0]);
+        assert_eq!(of("store-watch"), [0, 2, 4, 6, 8]);
     }
 }
