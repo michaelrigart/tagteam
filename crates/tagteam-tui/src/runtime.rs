@@ -462,13 +462,17 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
             }
             Ok(false) => {}
             // §10.4: a terminal that can no longer be written is fatal. Once the shutdown has
-            // begun there is nothing more to do about it.
-            Err(e) if self.ending.is_none() => self.begin_shutdown(
-                1,
-                libc::SIGINT,
-                Some(format!("tagteam: the terminal could not be written: {e}")),
-            ),
-            Err(_) => {}
+            // begun there is nothing more to do about it. A hang-up is what made it fail, and
+            // exits 128 + the signal: the token is looked at first.
+            Err(e) => {
+                if !self.shutting_down() {
+                    self.begin_shutdown(
+                        1,
+                        libc::SIGINT,
+                        Some(format!("tagteam: the terminal could not be written: {e}")),
+                    );
+                }
+            }
         }
     }
 
@@ -491,15 +495,20 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
             self.draw();
         } else {
             // A signal or a fatal error: the terminal is restored first.
-            self.hand_back();
+            self.hand_back(signal);
         }
     }
 
     /// §10.2 step 4 for a signal or a fatal error. The input thread is asked to pause, and the
-    /// terminal is given back whether it says so or not: the process is exiting.
-    fn hand_back(&mut self) {
+    /// terminal is given back whether it says so or not: the process is exiting. After a SIGHUP
+    /// the terminal is gone, its reader may never answer, and nothing waits for it.
+    fn hand_back(&mut self, signal: i32) {
         if self.tty.active() {
-            let _ = self.input.pause();
+            if signal == libc::SIGHUP {
+                self.input.hang_up();
+            } else {
+                let _ = self.input.pause();
+            }
             self.tty.release();
         }
     }
@@ -656,6 +665,9 @@ mod tests {
         }
         fn resume(&self) {
             self.log.push("resume");
+        }
+        fn hang_up(&self) {
+            self.log.push("hang_up");
         }
     }
 
@@ -1433,6 +1445,106 @@ mod tests {
         };
         assert_eq!(fx.log.take(), ["pause", "release"]);
         assert_eq!(fx.finish(ending).code, 143);
+    }
+
+    #[test]
+    fn a_hang_up_gives_the_terminal_back_without_waiting_for_the_keys() {
+        let fx = Fixture::new(quick(), |_| idle());
+        fx.keys.stuck.store(true, Ordering::SeqCst);
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            fx.log.take();
+            fx.opts.signal.request(libc::SIGHUP);
+            ui.run()
+        };
+        assert_eq!(fx.log.take(), ["hang_up", "release"]);
+        assert_eq!(fx.finish(ending).code, 129);
+    }
+
+    /// A terminal whose writes fail, as a hung-up one's do; the hang-up has been recorded by
+    /// the time the write fails when `hangs_up` holds the token.
+    struct Unwritable {
+        log: Log,
+        active: bool,
+        hangs_up: Option<Cancel>,
+    }
+
+    impl Tty for Unwritable {
+        type B = ratatui::backend::CrosstermBackend<io::Sink>;
+
+        fn draw(&mut self, _render: impl FnOnce(&mut ratatui::Frame)) -> io::Result<bool> {
+            if let Some(signal) = &self.hangs_up {
+                signal.request(libc::SIGHUP);
+            }
+            Err(io::Error::from_raw_os_error(libc::EIO))
+        }
+
+        fn size(&mut self) -> io::Result<(u16, u16)> {
+            Ok((120, 40))
+        }
+
+        fn active(&self) -> bool {
+            self.active
+        }
+
+        fn release(&mut self) {
+            self.log.push("release");
+            self.active = false;
+        }
+
+        fn reclaim(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The ending a failed frame write leads to.
+    fn write_fails(fx: &Fixture, hangs_up: bool) -> Ending {
+        let tty = Unwritable {
+            log: fx.log.clone(),
+            active: true,
+            hangs_up: hangs_up.then(|| fx.opts.signal.clone()),
+        };
+        let mut ui = Ui::new(
+            &fx.opts,
+            tty,
+            fx.keys.clone(),
+            &fx.rx,
+            &fx.lanes,
+            fx.host.as_ref(),
+        );
+        ui.state.dirty = true;
+        ui.draw();
+        ui.ending.take().expect("the failed write began a shutdown")
+    }
+
+    #[test]
+    fn a_write_that_fails_because_of_a_hang_up_exits_with_the_signal_not_1() {
+        let fx = Fixture::new(quick(), |_| idle());
+        let ending = write_fails(&fx, true);
+        let log = fx.log.clone();
+        let exit = fx.finish(ending);
+        assert_eq!((exit.code, exit.report), (129, None));
+        assert_eq!(log.take(), ["hang_up", "release"]);
+    }
+
+    #[test]
+    fn a_write_that_fails_alone_is_fatal_and_says_so() {
+        let fx = Fixture::new(quick(), |_| idle());
+        let ending = write_fails(&fx, false);
+        let log = fx.log.clone();
+        let exit = fx.finish(ending);
+        assert_eq!(exit.code, 1);
+        let report = exit.report.unwrap();
+        assert!(
+            report.starts_with("tagteam: the terminal could not be written:"),
+            "{report}"
+        );
+        assert_eq!(log.take(), ["pause", "release"]);
     }
 
     #[test]
