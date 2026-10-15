@@ -1,6 +1,6 @@
 # tagteam — sub-project 2: the daemon
 
-**Status:** In progress — https://github.com/michaelrigart/tagteam/pull/17
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/17
 **Date:** 2026-10-14
 **Scope:** Sub-project 2 of 4. It builds on sub-project 1, whose spec,
 [`2026-09-26-tagteam-core-cli-design.md`](2026-09-26-tagteam-core-cli-design.md) (the "core
@@ -806,3 +806,9 @@ design:
   hold. The WARN-once/DEBUG logging is built from the exit status and the timeout only.
 - **D12, D14:** the perf daemon runs at the shortest auto-switch interval (15 s), since
   §6.4 allows nothing shorter.
+- **D13:** the token-index job polls: every 60 s, or again at once while a refresh comes back
+  incomplete. It does not watch `projects/` for changes, the token report's other trigger (its
+  §12), because that needs kqueue or inotify and an append does not move a directory's mtime,
+  so polling cannot stand in for one. The index can therefore trail by up to a minute. The
+  `token-index` event forwards `token_index_state` as stored; `skippedLines` covers every
+  call of the last completed refresh, which the token report accumulates.
