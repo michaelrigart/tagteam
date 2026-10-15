@@ -12,7 +12,7 @@ use tagteam_engine::views::{AccountView, HistoryView, HistoryWindow};
 use tagteam_engine::words;
 
 use crate::msg::Cmd;
-use crate::state::State;
+use crate::state::{Screen, State};
 use crate::view::{
     bold, fit, flow, furthest_scroll, pad, scrolled_windows, selected, severity_style, width_of,
     wrap_rows,
@@ -130,6 +130,23 @@ pub(crate) fn on_enter(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         },
     }
     reload(state, now_ms).into_iter().collect()
+}
+
+/// A new `accounts` read: while History is open, an account that is gone, or none chosen yet,
+/// moves it to the first account.
+pub(crate) fn on_accounts(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    if state.screen != Screen::History {
+        return vec![];
+    }
+    let present = state
+        .history
+        .account
+        .as_ref()
+        .is_some_and(|id| accounts(state).iter().any(|v| &v.row.id == id));
+    if present && state.history.view.is_some() {
+        return vec![];
+    }
+    on_enter(state, now_ms)
 }
 
 pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
@@ -882,5 +899,50 @@ mod tests {
             vec![],
         ));
         assert!(draw(&read, 80, 24)[1].ends_with(NO_HISTORY));
+    }
+
+    #[test]
+    fn an_accounts_read_moves_history_off_an_account_that_is_gone() {
+        let mut state = on_history(many(2));
+        let week = NOW_S - 7 * 86_400;
+        assert_eq!(
+            on_accounts(&mut state, NOW_MS),
+            [Cmd::LoadHistory {
+                r#gen: 1,
+                account: id(1),
+                since_s: week,
+            }],
+            "none chosen yet: the first"
+        );
+        state
+            .history
+            .apply(view_of(account(1, "a1@x.co", read(60, 1.0, 1.0, false))));
+        assert!(
+            on_accounts(&mut state, NOW_MS).is_empty(),
+            "still there, already read"
+        );
+        state.history.select(id(2));
+        state
+            .history
+            .apply(view_of(account(2, "a2@x.co", read(60, 1.0, 1.0, false))));
+        state.accounts.apply(snapshot(many(1)));
+        assert_eq!(
+            on_accounts(&mut state, NOW_MS),
+            [Cmd::LoadHistory {
+                r#gen: 2,
+                account: id(1),
+                since_s: week,
+            }]
+        );
+        assert_eq!(state.history.account(), Some(&id(1)));
+        state.accounts.apply(snapshot(vec![]));
+        assert!(on_accounts(&mut state, NOW_MS).is_empty());
+        assert_eq!(state.history.account(), None);
+        state.screen = Screen::Accounts;
+        state.accounts.apply(snapshot(many(1)));
+        assert!(
+            on_accounts(&mut state, NOW_MS).is_empty(),
+            "only while History is open"
+        );
     }
 }

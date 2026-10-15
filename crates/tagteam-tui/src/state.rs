@@ -124,6 +124,15 @@ impl State {
         }
     }
 
+    /// A collection of `accounts` (spec §6.2), under the next generation.
+    pub(crate) fn collect_due(&mut self, accounts: Vec<AccountId>) -> Cmd {
+        self.gens.collect += 1;
+        Cmd::CollectDue {
+            r#gen: self.gens.collect,
+            accounts,
+        }
+    }
+
     /// Shows `text` in place of the footer for `TOAST_MS`.
     pub(crate) fn toast(&mut self, text: impl Into<String>, now_ms: i64) {
         self.toast = Some(Toast {
