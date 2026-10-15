@@ -828,6 +828,7 @@ fn a_cancel_that_meets_a_refresh_with_nothing_to_do_reports_interrupted() {
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
 fn a_scan_that_fails_loses_its_evidence_and_the_refresh_goes_on() {
     // Step 1's scan is evidence: when it cannot write (a store busy past its timeout, injected
     // here at its launch check), the refresh indexes and completes without it.
