@@ -599,13 +599,19 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
                 self.resized();
                 self.state.dirty = true;
             }
-            Err(e) => self.begin_shutdown(
-                1,
-                libc::SIGINT,
-                Some(format!(
-                    "tagteam: the terminal could not be set up again: {e}"
-                )),
-            ),
+            // A window closed while stopped is a SIGHUP with the SIGCONT: the token first, so
+            // it exits with the signal, as a failed write does (`draw`).
+            Err(e) => {
+                if !self.shutting_down() {
+                    self.begin_shutdown(
+                        1,
+                        libc::SIGINT,
+                        Some(format!(
+                            "tagteam: the terminal could not be set up again: {e}"
+                        )),
+                    );
+                }
+            }
         }
     }
 
@@ -1498,7 +1504,11 @@ mod tests {
         }
 
         fn stop(&mut self) -> io::Result<()> {
-            Ok(())
+            // A window closed while stopped: SIGHUP, and the terminal cannot be taken again.
+            if let Some(signal) = &self.hangs_up {
+                signal.request(libc::SIGHUP);
+            }
+            Err(io::Error::from_raw_os_error(libc::EIO))
         }
     }
 
@@ -1545,6 +1555,48 @@ mod tests {
             "{report}"
         );
         assert_eq!(log.take(), ["pause", "release"]);
+    }
+
+    /// The ending Ctrl-Z leads to on a terminal that cannot be taken again.
+    fn stop_fails(fx: &Fixture, hangs_up: bool) -> Ending {
+        let tty = Unwritable {
+            log: fx.log.clone(),
+            active: true,
+            hangs_up: hangs_up.then(|| fx.opts.signal.clone()),
+        };
+        let mut ui = Ui::new(
+            &fx.opts,
+            tty,
+            fx.keys.clone(),
+            &fx.rx,
+            &fx.lanes,
+            fx.host.as_ref(),
+        );
+        ui.execute(vec![Cmd::Stop]);
+        ui.ending.take().expect("the failed stop began a shutdown")
+    }
+
+    #[test]
+    fn a_hang_up_while_stopped_exits_with_the_signal_not_1() {
+        let fx = Fixture::new(quick(), |_| idle());
+        let ending = stop_fails(&fx, true);
+        let log = fx.log.clone();
+        let exit = fx.finish(ending);
+        assert_eq!((exit.code, exit.report), (129, None));
+        assert_eq!(log.take(), ["pause", "hang_up", "release"]);
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_be_taken_again_after_ctrl_z_is_fatal_and_says_so() {
+        let fx = Fixture::new(quick(), |_| idle());
+        let ending = stop_fails(&fx, false);
+        let exit = fx.finish(ending);
+        assert_eq!(exit.code, 1);
+        let report = exit.report.unwrap();
+        assert!(
+            report.starts_with("tagteam: the terminal could not be set up again:"),
+            "{report}"
+        );
     }
 
     #[test]
