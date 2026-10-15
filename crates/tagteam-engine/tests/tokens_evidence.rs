@@ -231,33 +231,35 @@ fn a_scan_starts_a_tenure_at_its_read_and_continues_the_latest() {
 
 #[test]
 #[cfg(feature = "test-hooks")]
-fn a_scan_dates_a_sighting_at_its_read() {
-    // Spec §6.4: a sighting begins and ends at reads. The scan reads a home's records at once;
-    // what follows, the liveness check and the writes, takes time in which the session may
-    // leave, so the read's own time is the one written. Here 5 s pass right after the read.
+fn a_scan_dates_each_sighting_at_its_own_read() {
+    // Spec §6.2, §6.4: a sighting begins and ends at reads. The scan dates each record at its
+    // own read: not at the end of the home's, nor after the liveness check and the writes that
+    // follow, which take time in which the session may leave. Here 5 s pass right after each
+    // record's read: 101's is read first, then 202's.
     let fx = Fx::new();
     fx.add("a@x.co", "rt-a");
+    let home = fx.paths().config_home;
     running(&fx, 101, None);
-    record(
-        &fx,
-        &fx.paths().config_home,
-        101,
-        "s-1",
-        NOW - 60_000,
-        "interactive",
-    );
+    record(&fx, &home, 101, "s-1", NOW - 60_000, "interactive");
+    running(&fx, 202, None);
+    record(&fx, &home, 202, "s-2", NOW - 60_000, "interactive");
     let clock = fx.clock.clone();
     fx.engine.on_point(
-        "scan-records-read",
+        "scan-record-read",
         Box::new(move || clock.advance_ms(5_000)),
     );
 
-    assert_eq!(sight(&fx), 1);
-    let seen = sightings(&fx);
+    assert_eq!(sight(&fx), 2);
+    let dated: Vec<(String, i64, i64)> = sightings(&fx)
+        .into_iter()
+        .map(|s| (s.session_id, s.first_at, s.last_at))
+        .collect();
     assert_eq!(
-        (seen[0].first_at, seen[0].last_at),
-        (NOW, NOW),
-        "dated at the read: {seen:?}"
+        dated,
+        [
+            ("s-1".to_owned(), NOW, NOW),
+            ("s-2".to_owned(), NOW + 5_000, NOW + 5_000)
+        ]
     );
 }
 

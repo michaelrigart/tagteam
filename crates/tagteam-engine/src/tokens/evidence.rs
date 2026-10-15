@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::{
     ProfileMarker, Provider, Read, RecordEntry, parse_session_record, profile_path,
-    read_session_records, record_is_live,
+    read_session_records_dated, record_is_live,
 };
 
 use crate::engine::Engine;
@@ -81,15 +81,18 @@ impl Engine {
         let store = self.store()?;
         let mut changed = 0;
         for (home, dir) in self.homes(p) {
-            let Read::Present(entries) = read_session_records(&dir) else {
+            // A sighting is dated at its record's read, not at the end of the home's, nor after
+            // the liveness check and the writes that follow, which take time in which the
+            // session may leave (spec §6.4). A test stops right after each read.
+            let mut clock = || {
+                let at = self.now_ms();
+                let _ = hooks::point(self, "scan-record-read");
+                at
+            };
+            let Read::Present(entries) = read_session_records_dated(&dir, &mut clock) else {
                 continue;
             };
-            // The home's records were read now. A sighting is dated at its read, not after the
-            // liveness checks and the writes that follow, which take time in which the session
-            // may leave (spec §6.4).
-            let read_at = self.now_ms();
-            hooks::point(self, "scan-records-read")?;
-            for entry in entries {
+            for (entry, read_at) in entries {
                 // An unreadable or partly written record, or one whose process is gone, is
                 // skipped (spec §6.2).
                 let RecordEntry::Record(r) = entry else {

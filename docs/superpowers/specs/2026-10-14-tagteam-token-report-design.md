@@ -503,9 +503,9 @@ impl Engine {
 Every refresh, and the daemon on its own timer (§12), reads every `*.json` in the default
 home's `sessions/` and in each profile's (source `scan`). For a record whose process is alive
 (core §12.6), the scan continues the latest tenure of `sessionId` in that execution
-(`home`, `startedAt`) to the read, or begins one at it (§6.4). The read is dated when the home's
-records were read, before the liveness checks and the writes that follow. An unreadable or
-partly written record, or one whose process is gone, is skipped.
+(`home`, `startedAt`) to the read, or begins one at it (§6.4). Each record is dated right after
+its own read, before the liveness check and the writes that follow. An unreadable or partly
+written record, or one whose process is gone, is skipped.
 
 ### 6.3 Statusline
 
