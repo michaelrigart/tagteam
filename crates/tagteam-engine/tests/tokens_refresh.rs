@@ -804,6 +804,44 @@ fn a_budgeted_prune_goes_on_over_several_calls() {
 }
 
 #[test]
+fn a_cancel_that_meets_a_refresh_with_nothing_to_do_reports_interrupted() {
+    // Nothing to read and nothing to prune: the refresh completes, and it records that, but a
+    // cancel it met is still reported, so `tokens` stops instead of printing a report.
+    let ffx = FakeFx::new();
+    let p = ffx.fake_provider();
+    let cancel = Cancel::new();
+    let err = ffx
+        .engine
+        .refresh_tokens(&p, Wait::Wait, None, &cancel, &mut |_: &IndexProgress| {
+            cancel.request(2)
+        })
+        .unwrap_err();
+    assert_eq!((err.signal(), err.kind()), (Some(2), "interrupted"));
+    let state = ffx
+        .engine
+        .store()
+        .unwrap()
+        .token_state(&p)
+        .unwrap()
+        .unwrap();
+    assert!(state.refreshed_at.is_some(), "what it completed is kept");
+}
+
+#[test]
+fn a_scan_that_fails_loses_its_evidence_and_the_refresh_goes_on() {
+    // Step 1's scan is evidence: when it cannot write (a store busy past its timeout, injected
+    // here at its launch check), the refresh indexes and completes without it.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.engine.open_launch(&cc, &a).unwrap();
+    fx.engine.fail_at(Some("scan-launch-check"));
+    let report = refresh(&fx.engine, &cc);
+    assert!(report.complete);
+    assert_eq!(report.evidence_changed, 0);
+}
+
+#[test]
 fn a_cancelled_prune_reports_interrupted() {
     // A cancel that meets the prune follows the refresh's cancel path: the prune stops before
     // its next chunk, what was pruned stays pruned, and the refresh is interrupted, not complete.
