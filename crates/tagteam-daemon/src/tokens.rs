@@ -39,6 +39,18 @@ struct Common {
     board: Arc<StatusBoard>,
     schema_newer: bool,
     broadcast: Mutex<BTreeMap<ProviderId, i64>>,
+    logged: Mutex<Logged>,
+}
+
+/// The failures the jobs last warned of, by message, as the store watch remembers its own
+/// (`watch.rs`): an error that repeats is logged at DEBUG, and a call that succeeds forgets its
+/// failure, so a later one is news again. The message is only compared, never logged (§14.2).
+#[derive(Default)]
+struct Logged {
+    /// The store could not be read: one failure for both jobs.
+    store: Option<String>,
+    /// A call that failed, per call and provider.
+    calls: BTreeMap<(&'static str, ProviderId), String>,
 }
 
 impl Common {
@@ -61,15 +73,77 @@ impl Common {
             .collect())
     }
 
-    /// `serving`, for a run: a failure to read the store is not one provider's, so it is logged
-    /// at WARN with the error's kind only (never its text, §14.2) and is the run's `lastError`,
-    /// as `store: <message>`; the run then serves no provider and keeps its cadence.
+    /// `serving`, for a run: a failure to read the store is not one provider's, so it is the
+    /// run's `lastError` (its own text already says "store error", so it is not prefixed again);
+    /// the run then serves no provider and keeps its cadence. The log has the error's kind only
+    /// (§14.2), at WARN when the failure is a new one and at DEBUG when it repeats.
     fn serving_or_note(&self, engine: &Engine, error: &mut Option<String>) -> Vec<ProviderId> {
-        self.serving(engine).unwrap_or_else(|e| {
-            tracing::warn!(kind = e.kind(), "cannot read the store for the token jobs");
-            error.get_or_insert_with(|| format!("store: {e}"));
-            Vec::new()
-        })
+        match self.serving(engine) {
+            Ok(providers) => {
+                self.lock_logged().store = None;
+                providers
+            }
+            Err(e) => {
+                let message = e.to_string();
+                let new =
+                    self.lock_logged().store.replace(message.clone()).as_ref() != Some(&message);
+                if new {
+                    tracing::warn!(kind = e.kind(), "cannot read the store for the token jobs");
+                } else {
+                    tracing::debug!(
+                        kind = e.kind(),
+                        "the store is still unreadable for the token jobs"
+                    );
+                }
+                error.get_or_insert_with(|| match e {
+                    EngineError::Store(_) => message,
+                    _ => format!("store: {message}"),
+                });
+                Vec::new()
+            }
+        }
+    }
+
+    fn lock_logged(&self) -> std::sync::MutexGuard<'_, Logged> {
+        self.logged.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What a run does with one call's result: an interruption stops the scheduler (D4.6);
+    /// anything else is logged and, if it is the run's first, kept for `lastError`. The log has
+    /// the error's kind only (§14.2; the full message is in `lastError`, which goes over the 0600
+    /// socket), at WARN when it differs from the last one logged for this call and provider and
+    /// at DEBUG when it repeats. A success forgets the last failure.
+    fn note(
+        &self,
+        result: Result<(), EngineError>,
+        provider: &ProviderId,
+        what: &'static str,
+        error: &mut Option<String>,
+    ) -> Option<Ran> {
+        let key = (what, provider.clone());
+        match result {
+            Ok(()) => {
+                self.lock_logged().calls.remove(&key);
+                None
+            }
+            Err(EngineError::Interrupted(_)) => Some(Ran::Stop(StopReason::Signal)),
+            Err(e) => {
+                let message = e.to_string();
+                let new = self
+                    .lock_logged()
+                    .calls
+                    .insert(key, message.clone())
+                    .as_ref()
+                    != Some(&message);
+                if new {
+                    tracing::warn!(provider = %provider, kind = e.kind(), "{what} failed");
+                } else {
+                    tracing::debug!(provider = %provider, kind = e.kind(), "{what} failed again");
+                }
+                error.get_or_insert_with(|| format!("{provider}: {message}"));
+                None
+            }
+        }
     }
 
     /// Token report §12: reads `provider`'s index state, and emits `token-index` when its
@@ -114,25 +188,6 @@ impl Common {
     }
 }
 
-/// What a run does with one call's error: an interruption stops the scheduler (D4.6); anything
-/// else is logged at WARN and, if it is the run's first, kept for `lastError`.
-fn note(
-    result: Result<(), EngineError>,
-    provider: &ProviderId,
-    what: &str,
-    error: &mut Option<String>,
-) -> Option<Ran> {
-    match result {
-        Ok(()) => None,
-        Err(EngineError::Interrupted(_)) => Some(Ran::Stop(StopReason::Signal)),
-        Err(e) => {
-            tracing::warn!(provider = %provider, error = %e, "{what} failed");
-            error.get_or_insert_with(|| format!("{provider}: {e}"));
-            None
-        }
-    }
-}
-
 /// Both jobs, sharing one record of what was broadcast.
 pub fn token_jobs(
     providers: Vec<ProviderId>,
@@ -144,6 +199,7 @@ pub fn token_jobs(
         board,
         schema_newer,
         broadcast: Mutex::new(BTreeMap::new()),
+        logged: Mutex::default(),
     });
     (
         SessionsWatch {
@@ -174,7 +230,7 @@ impl Job for SessionsWatch {
             let called = engine
                 .sight_sessions(p)
                 .and_then(|_| self.common.after_call(engine, p, sink));
-            if let Some(stop) = note(called, p, "sighting sessions", &mut error) {
+            if let Some(stop) = self.common.note(called, p, "sighting sessions", &mut error) {
                 return stop;
             }
         }
@@ -219,15 +275,208 @@ impl Job for TokenIndexJob {
                         delay = 0;
                     }
                 });
-            if let Some(stop) = note(refreshed, p, "the token index refresh", &mut error) {
+            if let Some(stop) =
+                self.common
+                    .note(refreshed, p, "the token index refresh", &mut error)
+            {
                 return stop;
             }
             let read = self.common.after_call(engine, p, sink);
-            if let Some(stop) = note(read, p, "reading the token index", &mut error) {
+            if let Some(stop) = self
+                .common
+                .note(read, p, "reading the token index", &mut error)
+            {
                 return stop;
             }
         }
         self.common.report(TOKEN_INDEX, engine, delay, error);
         Ran::After(delay)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::status::StatusBoard;
+    use crate::testutil::{Emitted, Fx, board, capture_logs, cc};
+
+    const MARKER: &str = "secret-marker";
+
+    fn run(job: &mut dyn Job, fx: &Fx, sink: &Emitted<'_>) -> Ran {
+        let mut jitter = || 0.0;
+        job.run(&mut JobCx {
+            engine: &fx.engine,
+            sink,
+            jitter: &mut jitter,
+        })
+    }
+
+    fn last_error(board: &StatusBoard, name: &str) -> Option<String> {
+        let jobs = board.snapshot().jobs;
+        jobs.into_iter()
+            .find(|j| j.name == name)
+            .unwrap_or_else(|| panic!("{name} is not on the board"))
+            .last_error
+    }
+
+    /// The lines at WARN, trimmed.
+    fn warns(lines: &[String]) -> Vec<&str> {
+        lines
+            .iter()
+            .map(|l| l.trim_start())
+            .filter(|l| l.starts_with("WARN"))
+            .collect()
+    }
+
+    /// The repeats the jobs logged: the DEBUG lines about a failure, not the engine's own.
+    fn repeats(lines: &[String]) -> usize {
+        lines
+            .iter()
+            .map(|l| l.trim_start())
+            .filter(|l| l.starts_with("DEBUG") && l.contains("kind="))
+            .count()
+    }
+
+    /// A store file that is not a database, so the store cannot be read.
+    fn corrupt_store(fx: &Fx) {
+        fx.remove_store();
+        fs::create_dir_all(fx.env.data_dir()).unwrap();
+        fs::write(fx.engine.store_file(), "not a database".repeat(100)).unwrap();
+    }
+
+    /// A directory where the store file should be: SQLite's error quotes the file's path.
+    fn store_path_is_a_directory(fx: &Fx) {
+        fx.remove_store();
+        fs::create_dir_all(fx.engine.store_file()).unwrap();
+    }
+
+    /// A `locks` path that is a regular file, so the tokens lock cannot be opened.
+    fn block_locks(fx: &Fx) {
+        let locks = fx.env.data_dir().join("locks");
+        let _ = fs::remove_dir_all(&locks);
+        fs::write(&locks, "").unwrap();
+    }
+
+    #[test]
+    fn a_store_that_stays_unreadable_warns_once_and_again_after_a_success() {
+        let fx = Fx::marked(MARKER);
+        let sink = Emitted::new(&fx.clock);
+        let (mut sessions, mut index) = token_jobs(vec![cc()], board(), false);
+        corrupt_store(&fx);
+        let ((), lines) = capture_logs(|| {
+            for _ in 0..3 {
+                run(&mut sessions, &fx, &sink);
+                run(&mut index, &fx, &sink);
+            }
+        });
+        let warned = warns(&lines);
+        assert_eq!(warned.len(), 1, "{lines:#?}");
+        assert!(warned[0].contains("kind=\"store\""), "{}", warned[0]);
+        assert_eq!(repeats(&lines), 5, "{lines:#?}");
+
+        // A run that reads the store forgets the failure: the next one is news again.
+        fx.remove_store();
+        let ((), lines) = capture_logs(|| {
+            run(&mut sessions, &fx, &sink);
+            run(&mut index, &fx, &sink);
+        });
+        assert!(warns(&lines).is_empty(), "{lines:#?}");
+        corrupt_store(&fx);
+        let ((), lines) = capture_logs(|| {
+            run(&mut sessions, &fx, &sink);
+            run(&mut index, &fx, &sink);
+        });
+        assert_eq!(warns(&lines).len(), 1, "{lines:#?}");
+    }
+
+    #[test]
+    fn a_call_that_keeps_failing_warns_once_and_again_after_a_success() {
+        let fx = Fx::marked(MARKER);
+        let board = board();
+        let sink = Emitted::new(&fx.clock);
+        let (_, mut index) = token_jobs(vec![cc()], board.clone(), false);
+        fx.engine.store().unwrap();
+        block_locks(&fx);
+        let ((), lines) = capture_logs(|| {
+            for _ in 0..3 {
+                run(&mut index, &fx, &sink);
+            }
+        });
+        let warned = warns(&lines);
+        assert_eq!(warned.len(), 1, "{lines:#?}");
+        assert!(
+            warned[0].contains("provider=claude-code") && warned[0].contains("kind="),
+            "{}",
+            warned[0]
+        );
+        assert_eq!(repeats(&lines), 2, "{lines:#?}");
+        assert!(
+            last_error(&board, TOKEN_INDEX).is_some_and(|e| e.starts_with("claude-code: ")),
+            "status keeps the failure"
+        );
+
+        fs::remove_file(fx.env.data_dir().join("locks")).unwrap();
+        let ((), lines) = capture_logs(|| {
+            run(&mut index, &fx, &sink);
+        });
+        assert!(warns(&lines).is_empty(), "{lines:#?}");
+        assert_eq!(last_error(&board, TOKEN_INDEX), None);
+
+        block_locks(&fx);
+        let ((), lines) = capture_logs(|| {
+            run(&mut index, &fx, &sink);
+        });
+        assert_eq!(warns(&lines).len(), 1, "{lines:#?}");
+    }
+
+    #[test]
+    fn no_log_line_carries_an_errors_text_or_a_path() {
+        // §14.2: status keeps the message, which here names the path; the log never does.
+        let fx = Fx::marked(MARKER);
+        let board = board();
+        let sink = Emitted::new(&fx.clock);
+        let (mut sessions, mut index) = token_jobs(vec![cc()], board.clone(), false);
+
+        store_path_is_a_directory(&fx);
+        let ((), lines) = capture_logs(|| {
+            run(&mut sessions, &fx, &sink);
+            run(&mut index, &fx, &sink);
+        });
+        let status = last_error(&board, SESSIONS_WATCH).unwrap();
+        assert!(status.contains(MARKER), "the premise: {status}");
+        assert!(!warns(&lines).is_empty(), "{lines:#?}");
+        let logged = lines.join("\n");
+        assert!(
+            !logged.contains(MARKER) && !logged.contains("unable to open"),
+            "{logged}"
+        );
+
+        fs::remove_dir(fx.engine.store_file()).unwrap();
+        fx.engine.store().unwrap();
+        block_locks(&fx);
+        let ((), lines) = capture_logs(|| {
+            run(&mut index, &fx, &sink);
+        });
+        let status = last_error(&board, TOKEN_INDEX).unwrap();
+        assert!(status.contains("File exists"), "the premise: {status}");
+        assert!(!warns(&lines).is_empty(), "{lines:#?}");
+        let logged = lines.join("\n");
+        assert!(!logged.contains("File exists"), "{logged}");
+    }
+
+    #[test]
+    fn the_stores_error_names_the_store_once() {
+        let fx = Fx::marked(MARKER);
+        let board = board();
+        let sink = Emitted::new(&fx.clock);
+        let (mut sessions, _) = token_jobs(vec![cc()], board.clone(), false);
+        corrupt_store(&fx);
+        run(&mut sessions, &fx, &sink);
+        assert_eq!(
+            last_error(&board, SESSIONS_WATCH).as_deref(),
+            Some("store error: file is not a database")
+        );
     }
 }

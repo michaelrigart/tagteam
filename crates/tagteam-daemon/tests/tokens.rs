@@ -405,8 +405,8 @@ fn an_interrupted_refresh_stops_the_scheduler_with_signal() {
 
 #[test]
 fn a_store_that_cannot_be_read_is_recorded_in_status_and_keeps_the_cadence() {
-    // `serving` is no provider's error: `lastError` names the store, and both jobs keep their
-    // cadence and emit nothing (the error is logged at WARN by kind).
+    // `serving` is no provider's error: `lastError` is the store's own message (it says "store
+    // error" once), and both jobs keep their cadence and emit nothing (the log has the kind).
     let fx = fx(false);
     let sink = Recorded::default();
     let (mut sessions, mut index) = token_jobs(vec![cc()], fx.board.clone(), false);
@@ -424,7 +424,9 @@ fn a_store_that_cannot_be_read_is_recorded_in_status_and_keeps_the_cadence() {
     for name in ["sessions-watch", "token-index"] {
         let error = job_status(&fx, name).last_error;
         assert!(
-            error.as_deref().is_some_and(|e| e.starts_with("store: ")),
+            error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("store error: ") && !e.contains("store: store")),
             "{name}: {error:?}"
         );
     }

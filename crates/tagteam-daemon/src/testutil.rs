@@ -121,8 +121,19 @@ impl Fx {
 
     /// `new`, with the engine inside or outside a run shell (§12.8).
     pub(crate) fn with_run_shell(run_shell: RunShell) -> Self {
+        Self::under(None, run_shell)
+    }
+
+    /// `new`, with the home and everything beside it under a directory called `marker`, so a
+    /// test can tell whether a path under the home reached a log line.
+    pub(crate) fn marked(marker: &str) -> Self {
+        Self::under(Some(marker), RunShell::Outside)
+    }
+
+    fn under(marker: Option<&str>, run_shell: RunShell) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let env = Env::for_test(dir.path());
+        let root = marker.map_or_else(|| dir.path().to_owned(), |m| dir.path().join(m));
+        let env = Env::for_test(&root);
         fs::create_dir_all(env.home.join(".claude")).unwrap();
         let kc = Arc::new(FakeKeychain::new());
         let clock = Arc::new(FakeClock::new(T0 * 1000));
