@@ -440,8 +440,20 @@ impl Engine {
             )));
         }
         // Step 1, holding no lock: sightings are written without the tokens lock (spec §5.1),
-        // and so nothing is taken while it is held.
-        let evidence_changed = self.scan_sessions(p.as_ref())?;
+        // and so nothing is taken while it is held. A scan that fails loses its evidence, never
+        // the refresh.
+        let evidence_changed = match self.scan_sessions(p.as_ref()) {
+            Ok(changed) => changed,
+            Err(EngineError::Interrupted(signal)) => return Err(EngineError::Interrupted(signal)),
+            Err(e) => {
+                tracing::warn!(
+                    kind = e.kind(),
+                    "could not record the sessions found for the token report"
+                );
+                tracing::debug!(error = %e, "the session scan failed");
+                0
+            }
+        };
         let path = tokens_lock_path(&self.env, provider);
         hooks::point(self, "refresh-tokens-lock")?;
         let _lock = match wait {
@@ -533,9 +545,6 @@ impl Engine {
                 .prune_tokens(provider, epoch, cutoff_ms, &holder, self.now_ms(), &stop)?
                 .complete;
         }
-        if let (false, Some(signal)) = (complete, cancel.requested()) {
-            return Err(EngineError::Interrupted(signal));
-        }
         if complete {
             // The store keeps `responses` itself, each batch and prune counting it, so the count
             // passed on is the stored one.
@@ -548,6 +557,11 @@ impl Engine {
                 unreadable_files: tally.unreadable,
             };
             store.finish_token_refresh(provider, epoch, &stats, self.now_ms())?;
+        }
+        // A cancel is reported even when there was nothing left for it to stop; what completed
+        // stays recorded.
+        if let Some(signal) = cancel.requested() {
+            return Err(EngineError::Interrupted(signal));
         }
         let report = IndexReport {
             complete,

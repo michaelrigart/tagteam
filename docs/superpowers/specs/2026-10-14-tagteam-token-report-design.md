@@ -374,7 +374,8 @@ running, and is kept.
 
 ### 5.2 Steps
 
-1. Run `sight_sessions` (§6).
+1. Run `sight_sessions` (§6). A scan that fails loses its evidence, with a warning in the log;
+   the refresh goes on.
 2. List the transcript files and `stat` each. Discovery is not budgeted. It walks two fixed
    levels (`projects/<project>/` and `projects/<project>/<session>/subagents/`): 26 ms for
    2,521 files on this machine. A file whose `(dev, ino)`, size and mtime match those stored
@@ -943,7 +944,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
 
 - An unreadable transcript is a warning, not an error (§5.4).
 - A store error is `EngineError::Store`, with exit 1.
-- A cancelled refresh exits 130, keeping what it committed.
+- A cancelled refresh exits 130, keeping what it committed, even when the cancel came too late
+  to stop any of it.
 - An invalid `--since`, `--until`, `--tz` or `--by` is a usage error, with exit 2.
 - `token_report` reports whatever is indexed. Before the first complete refresh it is
   partial, and `IndexState.refreshed_at_ms` is `None`. The CLI's `--no-refresh` says so on
