@@ -386,9 +386,11 @@ impl DaemonSink for NotifySink<'_> {
 /// - the window's reset has passed
 /// - this window instance was notified before
 ///
-/// D6.3's marker is the lease `notify:limit:<account id>:<window key>:<resets_at>`. It is
-/// taken before the notice is returned, and expires 60 s after the reset (an hour from now when
-/// the reset is unknown), so it holds across a restart.
+/// D6.3's marker is the lease `notify:limit:<account id>:<window key>`. It is taken before the
+/// notice is returned, and expires 60 s after the reset (an hour from now when the reset is
+/// unknown), so it holds across a restart. The name carries no reset time: a window's
+/// `resets_at` drifts by seconds between polls, and the expiry alone bounds the window
+/// instance.
 pub fn limit_notice(
     engine: &Engine,
     provider: &ProviderId,
@@ -422,10 +424,7 @@ pub fn limit_notice(
     let Some(store) = engine.existing_store()? else {
         return Ok(None);
     };
-    let instance = window
-        .resets_at
-        .map_or_else(|| "none".to_owned(), |at| at.to_string());
-    let lease = format!("notify:limit:{}:{}:{instance}", live.account, window.key);
+    let lease = format!("notify:limit:{}:{}", live.account, window.key);
     let expires_ms = window
         .resets_at
         .map_or(now_ms + UNKNOWN_RESET_MS, |at| at * 1000 + AFTER_RESET_MS);
@@ -828,8 +827,9 @@ mod tests {
             limit_notice(&home.other(), &cc(), &s, T0 * 1000 + 60_000).unwrap(),
             None
         );
-        // The window reset, and its next instance is at 95 % already.
-        let later = T0 + 600;
+        // The window reset and the marker ran out (60 s after the reset), and its next
+        // instance is at 95 % already.
+        let later = LONG_RESETS + 61;
         home.clock.set(later * 1000);
         let a = home
             .engine
@@ -844,7 +844,48 @@ mod tests {
         home.read_windows(&a, &next, later, later + 300);
         assert_eq!(
             limit_notice(&home.engine, &cc(), &s, later * 1000).unwrap(),
-            Some(notice("2 · a: 7d at 95% (resets in 10d08h)"))
+            Some(notice("2 · a: 7d at 95% (resets in 6d23h)"))
+        );
+    }
+
+    #[test]
+    fn a_resets_at_that_drifts_by_a_second_is_the_same_window_instance() {
+        // D6.3: polls of one window differ in `resets_at` by a second or so
+        // (`INSTANCE_SLACK_S`), so the marker's name carries no reset time. Its expiry, 60 s
+        // after the reset, ends the instance.
+        let home = two_at_the_limit();
+        let s = Settings::default();
+        let a = home
+            .engine
+            .store()
+            .unwrap()
+            .find_by_position(&cc(), 2)
+            .unwrap()
+            .unwrap()
+            .id;
+        assert_eq!(
+            limit_notice(&home.engine, &cc(), &s, T0 * 1000).unwrap(),
+            Some(notice("2 · a: 7d at 93% (resets in 3d09h)"))
+        );
+        let later = T0 + 300;
+        home.clock.set(later * 1000);
+        let mut drifted = windows(40.0, 94.0);
+        drifted[1].resets_at = Some(LONG_RESETS + 1);
+        home.read_windows(&a, &drifted, later, later + 300);
+        assert_eq!(
+            limit_notice(&home.engine, &cc(), &s, later * 1000).unwrap(),
+            None,
+            "a reset 1 s later is the same instance"
+        );
+        // A new instance once the marker has expired, 60 s after the reset.
+        let next_at = LONG_RESETS + 61;
+        home.clock.set(next_at * 1000);
+        let mut next = windows(40.0, 95.0);
+        next[1].resets_at = Some(LONG_RESETS + 604_800);
+        home.read_windows(&a, &next, next_at, next_at + 300);
+        assert_eq!(
+            limit_notice(&home.engine, &cc(), &s, next_at * 1000).unwrap(),
+            Some(notice("2 · a: 7d at 95% (resets in 6d23h)"))
         );
     }
 
