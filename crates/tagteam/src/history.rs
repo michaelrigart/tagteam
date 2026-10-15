@@ -160,7 +160,7 @@ pub(crate) fn csv(view: &HistoryView) -> String {
 }
 
 /// RFC 4180: a field holding a comma, a quote or a line break is quoted, its quotes doubled.
-fn csv_field(s: &str) -> String {
+pub(crate) fn csv_field(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {

@@ -2362,6 +2362,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "fastrand",
+ "jiff",
  "libc",
  "predicates",
  "rusqlite",

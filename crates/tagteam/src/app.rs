@@ -9,6 +9,7 @@ use tagteam_cc::ClaudeCode;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::Platform;
 use tagteam_core::autoswitch::Strategy;
+use tagteam_core::validate::{AccountRefInput, parse_account_ref};
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Window};
 use tagteam_engine::collect::CollectMode;
 use tagteam_engine::displace::PurgeError;
@@ -25,6 +26,7 @@ use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{self, ColorMode, Settings, parse_bool};
 use tagteam_engine::store::{AccountRow, Mapping, StoreError};
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
+use tagteam_engine::tokens::{AccountSel, TokenPeriod, TokenQuery};
 use tagteam_engine::transfer::{self, Encryption, Need, Recipient, SecretString};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, ShellAccount, StatusView};
@@ -41,12 +43,14 @@ use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, SystemClock};
 use crate::auto::{
     AutoError, AutoFlags, AutoRun, HumanSink, JsonSink, ThreadSleeper, uniform_jitter,
 };
-use crate::cli::{AutoStrategyArg, Cli, Command, ConfigAction, ShellArg, StrategyArg};
+use crate::cli::{
+    AutoStrategyArg, Cli, Command, ConfigAction, ShellArg, StrategyArg, TokensArgs, TokensPeriod,
+};
 use crate::prompt::Prompter;
 use crate::shell_init::Wrapped;
 use crate::{
     auto, config_cmd, displaced_cmd, doctor_cmd, history, prompt, purge_cmd, render, root_guard,
-    shell_init, statusline, transfer_cmd,
+    shell_init, statusline, tokens_cmd, transfer_cmd,
 };
 
 /// §13.1.
@@ -785,6 +789,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Alias { .. } => "alias",
         Command::Move { .. } => "move",
         Command::History { .. } => "history",
+        Command::Tokens { .. } => "tokens",
         Command::Map { .. } => "map",
         Command::Unmap { .. } => "unmap",
         Command::ShellInit { .. } => "shell-init",
@@ -1089,9 +1094,19 @@ impl App<'_, '_> {
 
     /// §10.4, with a terminal prompt for an ambiguous email.
     fn resolve(&mut self, input: &str) -> Result<AccountRow, Failure> {
-        match self.engine.resolve(input, self.provider_flag.as_ref()) {
+        let provider = self.provider_flag.clone();
+        self.resolve_in(input, provider.as_ref())
+    }
+
+    /// `resolve` within `provider`, or in every provider when it is `None` (§10.4).
+    fn resolve_in(
+        &mut self,
+        input: &str,
+        provider: Option<&ProviderId>,
+    ) -> Result<AccountRow, Failure> {
+        match self.engine.resolve(input, provider) {
             Err(EngineError::Ambiguous { .. }) if self.can_prompt() => {
-                let found = self.engine.candidates(input, self.provider_flag.as_ref())?;
+                let found = self.engine.candidates(input, provider)?;
                 let labels: Vec<String> = found
                     .iter()
                     .map(|r| format!("{} #{} {}", r.provider, r.position, render::name(r)))
@@ -1269,6 +1284,7 @@ impl App<'_, '_> {
                 since,
                 csv,
             } => self.history(account, window, &since, csv)?,
+            Command::Tokens { period, args } => self.tokens(period, args)?,
             Command::Map { account, path } => match account {
                 None => self.list_mappings()?,
                 Some(account) => self.map(&account, path)?,
@@ -1938,6 +1954,94 @@ impl App<'_, '_> {
         Ok(())
     }
 
+    /// Token report spec §11: `tokens`. Every flag is checked before anything is read; the
+    /// accounts named choose the provider unless `--provider` does (core §13.1); the index is
+    /// refreshed (unless `--no-refresh`), and `--model` is then resolved against it. Like any
+    /// writing command it creates the store. It never fetches and touches no Keychain item.
+    fn tokens(
+        &mut self,
+        period: Option<Box<TokensPeriod>>,
+        args: TokensArgs,
+    ) -> Result<(), Failure> {
+        let (period, args) = match period.map(|p| *p) {
+            None => (TokenPeriod::Day, args),
+            Some(TokensPeriod::Day(a)) => (TokenPeriod::Day, a),
+            Some(TokensPeriod::Month(a)) => (TokenPeriod::Month, a),
+            Some(TokensPeriod::Session(a)) => (TokenPeriod::Session, a),
+            Some(TokensPeriod::Block(a)) => (TokenPeriod::Block, a),
+        };
+        if args.csv && self.json {
+            return Err(Failure::Usage(CSV_AND_JSON.into()));
+        }
+        let flags = tokens_cmd::parse_flags(&args, &period, self.engine.now_ms())
+            .map_err(Failure::Usage)?;
+        // Core §13.1: a position counts within --provider, else the default provider; an alias
+        // or an email names its account in whichever provider holds it, so `provider_for` can
+        // refuse one that is not --provider's, or accounts of two providers at once.
+        let mut named = Vec::new();
+        for input in &args.accounts {
+            let scope = match parse_account_ref(input) {
+                Some(AccountRefInput::Position(_)) => self.provider_flag.clone(),
+                _ => None,
+            };
+            named.push(self.resolve_in(input, scope.as_ref())?);
+        }
+        let positions: Vec<(u32, ProviderId)> = named
+            .iter()
+            .map(|row| (row.position, row.provider.clone()))
+            .collect();
+        let provider = tokens_cmd::provider_for(
+            self.provider_flag.as_ref(),
+            self.engine.default_provider(),
+            &positions,
+        )
+        .map_err(Failure::Usage)?;
+        let p = self.engine.provider(&provider)?;
+        if !p.capabilities().transcripts {
+            return Err(Failure::Message(
+                KIND_UNSUPPORTED,
+                format!("{} has no transcripts", p.display_name()),
+            ));
+        }
+        let mut accounts: Vec<AccountSel> = named
+            .into_iter()
+            .map(|row| AccountSel::Account(row.id))
+            .collect();
+        if args.unattributed {
+            accounts.push(AccountSel::Unattributed);
+        }
+        let store = self.engine.store()?;
+        if !args.no_refresh {
+            tokens_cmd::refresh(&self.engine, &provider, &mut *self.io.err)?;
+        }
+        let models = if args.model.is_empty() {
+            None
+        } else {
+            let indexed = store.token_models(&provider).map_err(EngineError::from)?;
+            Some(tokens_cmd::resolve_models(&args.model, &indexed).map_err(Failure::Usage)?)
+        };
+        let report = self.engine.token_report(&TokenQuery {
+            provider,
+            period,
+            grouping: flags.grouping,
+            since_ms: Some(flags.since_ms),
+            until_ms: flags.until_ms,
+            accounts: (!accounts.is_empty()).then_some(accounts),
+            models,
+            session: None,
+            tz: flags.tz,
+        })?;
+        for notice in tokens_cmd::notices(&report, args.no_refresh) {
+            let _ = writeln!(self.io.err, "{notice}");
+        }
+        if args.csv {
+            let _ = write!(self.io.out, "{}", tokens_cmd::csv(&report));
+        } else {
+            self.print(&tokens_cmd::human(&report), tokens_cmd::json(&report));
+        }
+        Ok(())
+    }
+
     /// §12.7: `map` with no arguments lists the mappings, only `--provider`'s when it is given.
     /// It never creates the store (§5).
     fn list_mappings(&mut self) -> Result<(), Failure> {
@@ -2324,6 +2428,9 @@ mod tests {
             &["alias"],
             &["move", "1", "2"],
             &["history"],
+            &["tokens"],
+            &["tokens", "month", "1", "--by", "model"],
+            &["tokens", "2", "--json"],
             &["statusline"],
             &["auto"],
             &["map"],

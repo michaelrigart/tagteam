@@ -657,3 +657,107 @@ pub fn fake_claude_calls(out: &Path) -> Vec<FakeCall> {
     }
     calls
 }
+
+/// One assistant response of a fixture transcript (token report spec §2.1): its model, its time,
+/// its counts (input, output, 5-minute and 1-hour cache writes, cache reads), and whether its
+/// line is final. A subagent's response often never gets a final line (spec §2.3).
+#[derive(Debug, Clone, Copy)]
+pub struct Turn<'a> {
+    pub model: &'a str,
+    pub at_ms: i64,
+    pub counts: [u64; 5],
+    pub final_line: bool,
+}
+
+/// A finished response of `model` at `at_ms`.
+pub fn turn(model: &str, at_ms: i64, counts: [u64; 5]) -> Turn<'_> {
+    Turn {
+        model,
+        at_ms,
+        counts,
+        final_line: true,
+    }
+}
+
+/// `at_ms` as Claude Code stamps a transcript line: ISO 8601 UTC, to the millisecond.
+pub fn cc_timestamp(at_ms: i64) -> String {
+    let seconds = tagteam_core::time::format_iso8601(at_ms.div_euclid(1000));
+    format!(
+        "{}.{:03}Z",
+        seconds.trim_end_matches('Z'),
+        at_ms.rem_euclid(1000)
+    )
+}
+
+/// Claude Code's transcript line for one assistant response (token report spec §2.1–2.2), with
+/// `text` as its only content and `/w` as its working directory. A line that is not final is
+/// a subagent's streaming snapshot: no `stop_reason`, on a sidechain.
+pub fn assistant_line(
+    session: &str,
+    message_id: &str,
+    request_id: &str,
+    t: &Turn,
+    text: &str,
+) -> String {
+    let [input, output, write_5m, write_1h, read] = t.counts;
+    let stop = if t.final_line {
+        json!("end_turn")
+    } else {
+        Value::Null
+    };
+    json!({
+        "parentUuid": null,
+        "isSidechain": !t.final_line,
+        "type": "assistant",
+        "requestId": request_id,
+        "sessionId": session,
+        "timestamp": cc_timestamp(t.at_ms),
+        "cwd": "/w",
+        "message": {
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "model": t.model,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": stop,
+            "usage": {
+                "input_tokens": input,
+                "output_tokens": output,
+                "cache_creation_input_tokens": write_5m + write_1h,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": write_5m,
+                    "ephemeral_1h_input_tokens": write_1h,
+                },
+                "cache_read_input_tokens": read,
+                "server_tool_use": {"web_search_requests": 0},
+                "service_tier": "standard",
+            },
+        },
+    })
+    .to_string()
+}
+
+/// Appends one line per turn, each its own response with "x" as its only content, to the
+/// session's transcript `<home>/.claude/projects/-w/<session>.jsonl`, where Claude Code keeps
+/// it. Returns the file.
+pub fn write_transcript(root: &Path, session: &str, turns: &[Turn]) -> PathBuf {
+    let dir = Env::for_test(root).home.join(".claude/projects/-w");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{session}.jsonl"));
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    let before = text.lines().count();
+    for (i, t) in turns.iter().enumerate() {
+        let n = before + i;
+        let line = assistant_line(
+            session,
+            &format!("msg_{session}_{n}"),
+            &format!("req_{session}_{n}"),
+            t,
+            "x",
+        );
+        text.push_str(&line);
+        text.push('\n');
+    }
+    fs::write(&path, text).unwrap();
+    path
+}
