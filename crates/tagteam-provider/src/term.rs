@@ -255,7 +255,7 @@ mod spawn_tests {
         // 0. The child leads a group of its own first: in an orphaned group, as a CI runner's
         // may be, SIGTSTP is discarded.
         let _fork = crate::fork_guard();
-        // SAFETY: the child calls only async-signal-safe functions: setpgid(2), raise(3)
+        // SAFETY: the child calls only async-signal-safe functions: setpgid(2), kill(2)
         // inside `stop_self`, and _exit(2).
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
