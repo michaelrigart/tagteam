@@ -11,3 +11,4 @@ pub mod scheduler;
 pub mod status;
 #[cfg(test)]
 mod testutil;
+pub mod watch;

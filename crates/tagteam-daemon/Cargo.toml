@@ -27,6 +27,7 @@ tracing.workspace = true
 tagteam-cc = { workspace = true, features = ["test-hooks"] }
 tagteam-fake.workspace = true
 tagteam-provider = { workspace = true, features = ["file-keychain", "mock-server"] }
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [lints]

@@ -338,3 +338,35 @@ pub(crate) fn status(board: &StatusBoard, of: &ProviderId) -> ProviderStatus {
         .find(|p| &p.provider == of)
         .expect("the provider job has run")
 }
+
+impl Fx {
+    /// Another process on the same home: an engine of its own, with its own store connection.
+    pub(crate) fn other(&self) -> Engine {
+        engine_on(&self.env, &self.kc, &self.clock, &self.http)
+    }
+
+    /// `claude /login` as `email`, then `tagteam add` through `engine`.
+    pub(crate) fn add_on(&self, engine: &Engine, email: &str) -> AccountId {
+        self.login(email);
+        let opts = AddOptions {
+            provider: cc(),
+            position: None,
+            alias: None,
+            yes: false,
+        };
+        engine.add_live(opts).unwrap().account.id
+    }
+
+    /// The store file and its sidecars removed, as a person deleting the store by hand would.
+    pub(crate) fn remove_store(&self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = self.engine.store_file().into_os_string();
+            name.push(suffix);
+            match fs::remove_file(&name) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("{}: {e}", std::path::Path::new(&name).display()),
+            }
+        }
+    }
+}
