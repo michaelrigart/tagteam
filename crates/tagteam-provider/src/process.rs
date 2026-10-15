@@ -399,6 +399,13 @@ pub fn exit_code(status: ExitStatus) -> i32 {
     }
 }
 
+/// This process's real user ID (`getuid(2)`). D9.2: launchd runs a user's agents in the
+/// `gui/<uid>` domain. D9.3: `loginctl` is asked about this uid when `$USER` is unset.
+pub fn current_uid() -> u32 {
+    // SAFETY: getuid(2) takes no arguments, has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
+
 /// The port engine tests script (Decision 10). `SystemSpawner` calls `run_captured`.
 pub trait ProcessSpawner: Send + Sync {
     fn run_captured(&self, spec: &SpawnSpec, timeout: Duration, cancel: &Cancel) -> Captured;
@@ -996,6 +1003,15 @@ mod tests {
             .status()
             .unwrap();
         assert_eq!(exit_code(killed), 137);
+    }
+
+    #[test]
+    fn the_current_uid_owns_the_files_this_process_creates() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("mine");
+        fs::write(&file, "").unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().uid(), current_uid());
     }
 
     #[test]
