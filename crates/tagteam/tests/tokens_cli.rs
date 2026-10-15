@@ -421,6 +421,30 @@ fn bare_tokens_is_day() {
 }
 
 #[test]
+fn a_flag_before_the_period_leaves_it_the_period() {
+    let f = fixture();
+    let before = json_in(&f, &["tokens", "--json", "month"]);
+    let after = json_in(&f, &["tokens", "month", "--json", "--no-refresh"]);
+    assert_eq!(before["period"], "month");
+    assert_eq!(before["rows"], after["rows"]);
+    assert!(
+        !before["rows"].as_array().unwrap().is_empty(),
+        "the fixture's two days fall in months: {before}"
+    );
+    assert_eq!(
+        json_in(&f, &["tokens", "--no-refresh", "session", "--json"])["period"],
+        "session"
+    );
+    // An account named like a period is an account anywhere but first.
+    cmd(f.root())
+        .args(["tokens", "1", "month", "--no-refresh"])
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicates::str::contains("month"));
+}
+
+#[test]
 fn a_since_date_is_local_midnight_in_tz() {
     // Review Focus 4: `--since DATE` is that date's midnight in `--tz`, and a day is that
     // zone's calendar day. Asia/Kolkata is UTC+05:30: 18:30 UTC is its next midnight.
@@ -679,15 +703,21 @@ fn named_accounts_choose_the_provider() {
             added_at: 1,
         })
         .unwrap();
-    // Named under --provider claude-code, it is refused as `run` refuses it.
+    // Core §10.4: under --provider an alias resolves within that provider only, so another
+    // provider's account is as unknown to `tokens` as it is to `run`.
+    let refused = cmd(root)
+        .args(["run", "--provider", CLAUDE_CODE, "fakey"])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
     cmd(root)
         .args(["tokens", "fakey", "--provider", CLAUDE_CODE])
         .assert()
-        .code(2)
+        .failure()
         .stdout("")
-        .stderr(format!(
-            "tagteam: position 1 is a {FAKE_AGENT} account, not a {CLAUDE_CODE} one\n"
-        ));
+        .stderr(String::from_utf8(refused).unwrap());
     // Beside a Claude Code account: one report covers one provider.
     cmd(root)
         .args(["tokens", "a@x.co", "fakey"])

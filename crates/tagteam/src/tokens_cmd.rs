@@ -1151,4 +1151,64 @@ mod tests {
             "observed; active: 2h30m left, 41.2K tokens/min, $3.20/h, projected 9.8M tokens, —"
         );
     }
+
+    fn report_with(index: IndexState) -> TokenReport {
+        TokenReport {
+            query: tagteam_engine::tokens::TokenQuery {
+                provider: ProviderId::new("claude-code"),
+                period: TokenPeriod::Day,
+                grouping: TokenGrouping::Account,
+                since_ms: None,
+                until_ms: None,
+                accounts: None,
+                models: None,
+                session: None,
+                tz: TimeZone::UTC,
+            },
+            time_zone: "UTC".to_owned(),
+            rows: vec![],
+            total: TokenTotal::default(),
+            index,
+            unpriced_models: vec![],
+            prices_as_of: "2026-10-01",
+            price_overrides: vec![],
+        }
+    }
+
+    #[test]
+    fn notices_name_a_partial_index_skipped_lines_and_unreadable_files() {
+        let refreshed = IndexState {
+            refreshed_at_ms: Some(1),
+            ..IndexState::default()
+        };
+        assert!(notices(&report_with(refreshed), true).is_empty());
+        assert_eq!(
+            notices(&report_with(IndexState::default()), true),
+            [format!("note: {PARTIAL_INDEX}")]
+        );
+        assert!(
+            notices(&report_with(IndexState::default()), false).is_empty(),
+            "a refresh that ran says nothing of being partial"
+        );
+        let drift = IndexState {
+            skipped_lines: 1,
+            unreadable_files: 3,
+            ..refreshed
+        };
+        assert_eq!(
+            notices(&report_with(drift), false),
+            [
+                "warning: 1 transcript line could not be read in the last refresh of the token index; Claude Code's transcript format may have changed",
+                "warning: 3 transcript files could not be read; the next refresh tries again",
+            ]
+        );
+        let many = IndexState {
+            skipped_lines: 12,
+            unreadable_files: 1,
+            ..refreshed
+        };
+        let out = notices(&report_with(many), false);
+        assert!(out[0].starts_with("warning: 12 transcript lines could not be read"));
+        assert!(out[1].starts_with("warning: 1 transcript file could not be read"));
+    }
 }
