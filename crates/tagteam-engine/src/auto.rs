@@ -180,21 +180,27 @@ fn write_holder(path: &Path) -> Result<(), EngineError> {
 /// `locks/engine-<first 12 hex digits of the ID's SHA-256>.lock`, inside `locks/`. Every
 /// registered provider's ID is a plain name and keeps its `autoswitch-` file.
 pub(crate) fn engine_lock_path(env: &Env, provider: &ProviderId) -> PathBuf {
-    let id = provider.as_str();
+    let name = lock_file_name(provider.as_str(), "autoswitch", "engine");
+    env.data_dir().join("locks").join(name)
+}
+
+/// The file name of a provider lock: `<plain_prefix>-<id>.lock` when `id` is a plain name
+/// (non-empty, not starting with `.`, only `[A-Za-z0-9._-]`), else `<hashed_prefix>-<first 12 hex
+/// digits of the ID's SHA-256>.lock`. The one guard that keeps a stored ID from naming a path.
+pub(crate) fn lock_file_name(id: &str, plain_prefix: &str, hashed_prefix: &str) -> String {
     let plain = !id.is_empty()
         && !id.starts_with('.')
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    let name = if plain {
-        format!("autoswitch-{id}.lock")
+    if plain {
+        format!("{plain_prefix}-{id}.lock")
     } else {
         format!(
-            "engine-{}.lock",
+            "{hashed_prefix}-{}.lock",
             Fingerprint::of_secret(id.as_bytes()).short12()
         )
-    };
-    env.data_dir().join("locks").join(name)
+    }
 }
 
 /// The holder `write_holder` recorded in an engine lock file (§11.1), read without trying the
@@ -968,4 +974,25 @@ fn recheck_ids(snap: &Snapshot, live: &AccountId) -> Vec<AccountId> {
     std::iter::once(live.clone())
         .chain(candidates.map(|a| a.id.clone()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lock_name_keeps_a_plain_id_and_hashes_any_other() {
+        assert_eq!(
+            lock_file_name("claude-code", "autoswitch", "engine"),
+            "autoswitch-claude-code.lock"
+        );
+        for id in ["", ".hidden", "a/b", "/../../escape", "sp ace"] {
+            let name = lock_file_name(id, "autoswitch", "engine");
+            assert!(
+                name.starts_with("engine-") && name.ends_with(".lock") && !name.contains('/'),
+                "{name}"
+            );
+            assert_eq!(name.len(), "engine-".len() + 12 + ".lock".len(), "{name}");
+        }
+    }
 }
