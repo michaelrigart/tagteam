@@ -1,6 +1,6 @@
 # tagteam — token report
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/19
 **Date:** 2026-10-14
 **Scope:** A per-account token and cost report over Claude Code's transcripts: an index in the
 store, an engine view, and the `tagteam tokens` command. It extends sub-project 1, whose
