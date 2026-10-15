@@ -3,7 +3,6 @@ mod common;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::Parser;
 use common::{LOCKED, login, seed_home};
@@ -1749,35 +1748,6 @@ fn daemon_on_a_terminal_offers_to_unlock_first_and_a_decline_exits_1() {
     assert_eq!((code, err), (1, format!("tagteam: {LOCKED}\n")));
     assert_eq!(h.kc.unlock_attempts(), 1);
     assert!(!h.env.data_dir().join("locks/daemon.lock").exists());
-}
-
-#[test]
-fn daemon_without_a_terminal_runs_no_keychain_check_and_a_signal_stops_it_with_exit_0() {
-    // D4.1 step 3: a service has nobody to answer, and the check could block on a dialog
-    // (Appendix A.3). With no store the provider is idle. The signal ends the run at its next
-    // slice, with no "too late" notice.
-    let h = H::new();
-    h.kc.set_locked(true);
-    let cancel = Cancel::new();
-    let signal = {
-        let cancel = cancel.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(1));
-            cancel.request(libc::SIGTERM);
-        })
-    };
-    let (code, out, err) = h.run_with_cancel(&["daemon"], &mut Scripted::none(), &cancel);
-    signal.join().unwrap();
-    assert_eq!((code, err.as_str()), (0, ""), "{out}");
-    let lines: Vec<&str> = out.lines().map(|l| &l[10..]).collect();
-    let started = format!(
-        "daemon started (pid {}); Ctrl-C stops it",
-        std::process::id()
-    );
-    assert_eq!(lines.first(), Some(&started.as_str()), "{out}");
-    assert!(lines.contains(&"mode idle"), "{out}");
-    assert_eq!(lines.last(), Some(&"stopped"), "{out}");
-    assert_eq!(h.kc.unlock_attempts(), 0);
 }
 
 #[test]

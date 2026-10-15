@@ -419,6 +419,16 @@ fn real_env_cmd(root: &Path, args: &[&str]) -> Output {
     c.output().unwrap()
 }
 
+/// Uninstalls the real unit when dropped, so a failed assertion after the install never leaves a
+/// KeepAlive agent loaded. A second uninstall after a successful one removes nothing.
+struct UninstallOnDrop<'a>(&'a Path);
+
+impl Drop for UninstallOnDrop<'_> {
+    fn drop(&mut self) {
+        real_env_cmd(self.0, &["daemon", "uninstall"]);
+    }
+}
+
 #[test]
 #[ignore = "loads a real launchd agent or systemd user unit under tagteam's own label: run by hand, with Michael's go-ahead (plan B Task 10)"]
 fn a_real_service_manager_starts_and_stops_the_daemon() {
@@ -442,6 +452,7 @@ fn a_real_service_manager_starts_and_stops_the_daemon() {
     let unit = PathBuf::from(before["service"]["path"].as_str().unwrap());
 
     let out = real_env_cmd(root, &["--json", "daemon", "install"]);
+    let _uninstall = UninstallOnDrop(root);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(json_of(&out)["started"], json!(true));
     assert_eq!(mode(&unit), 0o600);
