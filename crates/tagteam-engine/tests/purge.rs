@@ -10,10 +10,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use common::{FakeFx, Fx, add, crashed_switch, credential, journal, vault_fp};
 use serde_json::json;
 use tagteam_cc::live::Platform;
+use tagteam_core::tokens::TokenCounts;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EngineError;
 use tagteam_engine::purge::{KEYCHAIN_LEFTOVERS, PurgeAccount, PurgePlan};
-use tagteam_engine::store::{DisplacedRow, JournalRow, Store};
+use tagteam_engine::store::{
+    DisplacedRow, JournalRow, SightingRow, SightingSource, Store, TokenFileRow, UsageRow, usage_key,
+};
+use tagteam_engine::tokens::tokens_lock_path;
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::liveness::FakeProcess;
 use tagteam_provider::profile::ProfileMarker;
@@ -2218,4 +2222,263 @@ fn a_displaced_directory_that_is_a_link_to_the_live_config_refuses_a_full_purge(
         b"the live login"
     );
     assert!(fs::symlink_metadata(data.join("displaced")).is_ok());
+}
+
+/// A refresh's rows and the evidence's for `provider`, as a refresh, a scan and `run` leave
+/// them (spec §4).
+fn plant_token_rows(fx: &Fx, provider: &ProviderId) {
+    let store = fx.engine.store().unwrap();
+    let now = 1_790_000_000_000;
+    let usage = UsageRow {
+        key: usage_key(provider, "m1", "r1"),
+        session_id: "s-1".into(),
+        project: Some("/w".into()),
+        at_ms: now,
+        model: "claude-opus-5-5".into(),
+        sidechain: false,
+        counts: TokenCounts {
+            input: 1,
+            output: 2,
+            ..TokenCounts::default()
+        },
+        speed: None,
+        finalized: true,
+    };
+    let file = TokenFileRow {
+        path: format!("/t/{provider}.jsonl"),
+        dev: 1,
+        ino: 2,
+        size: 10,
+        mtime_ns: 3,
+        offset: 10,
+        head_hash: [0; 8],
+        tail_hash: [0; 8],
+    };
+    let epoch = store.begin_token_refresh(provider, now).unwrap();
+    store
+        .commit_token_batch(provider, epoch, &[usage], &[file], &[], now)
+        .unwrap();
+    let seen = SightingRow {
+        session_id: "s-1".into(),
+        home: String::new(),
+        first_at: now - 1_000,
+        last_at: now,
+        source: SightingSource::Scan,
+        recorded_at: now,
+    };
+    store.record_sighting(provider, &seen, 60_000).unwrap();
+    store
+        .open_launch(provider, "an-account", now - 1_000, now)
+        .unwrap();
+}
+
+/// `provider`'s responses in the index, read behind the store's back.
+fn usage_rows(fx: &Fx, provider: &str) -> i64 {
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM token_usage u JOIN token_sessions s ON s.id = u.session \
+             WHERE s.provider = ?1",
+            [provider],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// Every index and evidence row of `provider`: its usage, and its rows in the six
+/// provider-keyed tables (spec §13).
+fn token_rows(fx: &Fx, provider: &str) -> i64 {
+    let tables = [
+        "token_files",
+        "token_sessions",
+        "session_sightings",
+        "run_launches",
+        "active_history",
+        "token_state",
+    ];
+    usage_rows(fx, provider)
+        + tables
+            .iter()
+            .map(|table| count(fx, table, provider))
+            .sum::<i64>()
+}
+
+/// Runs a purge while a refresh of `provider` holds its tokens lock (spec §5.1), then again
+/// once that refresh is done; `plan` makes each run's plan.
+///
+/// The first run reaches the point before its tokens-lock wait, and the test sets the cancel
+/// token there. A purge that waits for the lock never reaches the point after the wait, and
+/// deletes nothing. One that took no lock would reach that point at once, since nothing between
+/// the two points can be interrupted.
+///
+/// Returns the second run's report, after asserting that the first run was interrupted and the
+/// second held the lock past that point.
+#[cfg(feature = "test-hooks")]
+fn purge_under_a_refresh(
+    fx: &Fx,
+    provider: &ProviderId,
+    plan: impl Fn() -> PurgePlan,
+) -> tagteam_engine::purge::PurgeReport {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let path = tokens_lock_path(&fx.env, provider);
+    let refresh = FlockGuard::try_lock(&path).unwrap().unwrap();
+    let (at_lock, reached) = mpsc::channel();
+    fx.engine.on_point(
+        "purge-tokens-lock",
+        Box::new(move || at_lock.send(()).unwrap()),
+    );
+    let passed = Arc::new(AtomicBool::new(false));
+    let held_there = Arc::new(AtomicBool::new(false));
+    let (passed_cb, held_cb, path_cb) = (passed.clone(), held_there.clone(), path.clone());
+    fx.engine.also_on_point(
+        "purge-tokens-locked",
+        Box::new(move || {
+            passed_cb.store(true, Ordering::SeqCst);
+            let held = FlockGuard::try_lock(&path_cb).unwrap().is_none();
+            held_cb.store(held, Ordering::SeqCst);
+        }),
+    );
+
+    let first_plan = plan();
+    let first = std::thread::scope(|s| {
+        let purge = s.spawn(|| fx.engine.purge(&first_plan));
+        // A guard against a hang, not a timing: the purge reaches this point at once.
+        reached
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the purge reaches its tokens lock");
+        fx.engine.cancel().request(2);
+        purge.join().unwrap()
+    });
+    assert_eq!(
+        first.unwrap_err().signal(),
+        Some(2),
+        "only the cancel token ends the wait"
+    );
+    assert!(
+        !passed.load(Ordering::SeqCst),
+        "the purge passed the tokens lock while a refresh held it"
+    );
+    assert!(
+        token_rows(fx, provider.as_str()) > 0,
+        "nothing was deleted under the refresh"
+    );
+
+    fx.engine.cancel().take();
+    drop(refresh);
+    let report = fx.engine.purge(&plan()).unwrap();
+    assert!(passed.load(Ordering::SeqCst));
+    assert!(
+        held_there.load(Ordering::SeqCst),
+        "the purge held the tokens lock while it deleted"
+    );
+    report
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn purge_waits_for_a_running_refresh() {
+    // Spec §5.1: a purge never falls between two batches of a refresh. Once its accounts are
+    // gone, it waits for the provider's tokens lock, under its mutation lock and with no account
+    // lock held, before it deletes the provider's rows.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    fx.add("a@x.co", "rt-a");
+    plant_token_rows(&fx, &cc);
+
+    let report = purge_under_a_refresh(&fx, &cc, || fx.engine.purge_plan(Some(&cc)).unwrap());
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(token_rows(&fx, "claude-code"), 0);
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_full_purge_waits_for_a_running_refresh_too() {
+    // Spec §13: a full purge empties the store under every affected provider's tokens lock.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    fx.add("a@x.co", "rt-a");
+    plant_token_rows(&fx, &cc);
+
+    let report = purge_under_a_refresh(&fx, &cc, || full_plan(&fx));
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(report.store_emptied);
+    assert_eq!(token_rows(&fx, "claude-code"), 0);
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_full_purge_locks_every_provider_with_token_rows() {
+    // Spec §13: a full purge empties every table, so it holds the tokens lock of every provider
+    // with rows there. That includes one with no account, and one only another build registers.
+    use std::sync::Mutex;
+
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let ghost = ProviderId::new("ghost");
+    fx.add("a@x.co", "rt-a");
+    plant_token_rows(&fx, &cc);
+    plant_token_rows(&fx, &ghost);
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let (held_cb, env) = (held.clone(), fx.env.clone());
+    fx.engine.on_point(
+        "purge-tokens-locked",
+        Box::new(move || {
+            let mut held = held_cb.lock().unwrap();
+            for p in ["claude-code", "ghost"] {
+                let path = tokens_lock_path(&env, &ProviderId::new(p));
+                held.push((p, FlockGuard::try_lock(&path).unwrap().is_none()));
+            }
+        }),
+    );
+
+    let report = fx.engine.purge(&full_plan(&fx)).unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+        *held.lock().unwrap(),
+        [("claude-code", true), ("ghost", true)]
+    );
+    assert_eq!(token_rows(&fx, "ghost"), 0);
+}
+
+#[test]
+fn purge_provider_deletes_the_token_rows() {
+    // Spec §13: `purge --provider` deletes that provider's rows from the six provider-keyed
+    // tables, and its usage with its sessions. Another provider's stay, and so does the epoch.
+    let ffx = FakeFx::new();
+    let fx = &ffx.fx;
+    let (cc, fake) = (fx.provider(), ffx.fake_provider());
+    fx.add("a@x.co", "rt-a");
+    ffx.fake_add("hank", "tok-h", "renew-h");
+    plant_token_rows(fx, &cc);
+    plant_token_rows(fx, &fake);
+    let store = fx.engine.store().unwrap();
+    let epoch = store.token_epoch().unwrap();
+    assert!(epoch.is_some());
+
+    let plan = ffx.engine.purge_plan(Some(&cc)).unwrap();
+    let report = ffx.engine.purge(&plan).unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(token_rows(fx, "claude-code"), 0);
+    for table in [
+        "token_files",
+        "token_sessions",
+        "session_sightings",
+        "run_launches",
+        "token_state",
+    ] {
+        assert_eq!(count(fx, table, "fake-agent"), 1, "{table}");
+    }
+    assert_eq!(usage_rows(fx, "fake-agent"), 1);
+    assert_eq!(store.token_epoch().unwrap(), epoch, "the epoch stays");
+    assert!(
+        tokens_lock_path(&fx.env, &cc).exists(),
+        "the purge took the provider's tokens lock"
+    );
+    assert!(
+        !tokens_lock_path(&fx.env, &fake).exists(),
+        "and no other provider's"
+    );
 }

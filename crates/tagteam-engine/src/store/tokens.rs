@@ -813,6 +813,24 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every provider with a row in a token or evidence table, sorted. A full purge takes the
+    /// tokens lock of each (spec §13), one with no account, or one only another build
+    /// registers, included.
+    pub fn token_providers(&self) -> Result<Vec<ProviderId>, StoreError> {
+        let c = self.lock();
+        let mut stmt = c.prepare(
+            "SELECT provider FROM token_files UNION SELECT provider FROM token_sessions \
+             UNION SELECT provider FROM token_models UNION SELECT provider FROM token_state \
+             UNION SELECT provider FROM session_sightings UNION SELECT provider FROM run_launches \
+             UNION SELECT provider FROM active_history ORDER BY provider",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .map(|p| p.map(ProviderId::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Every model the provider's index has held since its last purge, sorted: a model whose
     /// responses retention pruned is still named (ruling R8).
     pub fn token_models(&self, provider: &ProviderId) -> Result<Vec<String>, StoreError> {
