@@ -20,9 +20,9 @@ with the one before, so any release may contain breaking changes. Each section s
 - `tagteam run` and `tagteam statusline` now record which session runs under which account, for
   the token report. Neither changes what it prints or its exit code, and the status line stays
   within its time budget.
-- `tagteam daemon`: a background process that keeps every account's usage fresh and switches
-  accounts automatically, as `tagteam auto` does, for each provider with two or more switchable
-  accounts. Every command still works without it.
+- `tagteam daemon`: a background process that keeps the usage of the live account and the
+  switchable accounts fresh and switches accounts automatically, as `tagteam auto` does, for
+  each provider with two or more switchable accounts. Every command still works without it.
 - `tagteam daemon install`, `uninstall` and `status`. `install` sets up a LaunchAgent on macOS
   or a systemd user unit on Linux, which starts the daemon at login and restarts it after a
   failure or an upgrade. `install --print` prints the unit instead.
