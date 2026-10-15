@@ -10,7 +10,8 @@ By contributing, you agree that your contribution is licensed under the [MIT lic
 
 - **Rust.** `rust-toolchain.toml` pins Rust 1.88.0 with `rustfmt` and `clippy`. With
   [rustup](https://rustup.rs) installed, cargo picks it up on first use inside the checkout. The
-  workspace declares a minimum supported Rust version of 1.85 (edition 2024).
+  workspace declares a minimum supported Rust version of 1.88 (edition 2024), which ratatui 0.30
+  requires.
 - **mise.** `mise.toml` pins only `cargo-dist` 0.33.0, which builds releases. You do not need it
   for ordinary development.
 - **C compiler.** SQLite is bundled and compiled from source.
@@ -25,6 +26,7 @@ The workspace has these crates under `crates/`:
 | `tagteam-cc` | The Claude Code provider |
 | `tagteam-engine` | The store, the vault and the provider-generic operations (switching, refresh, auto-switch, sessions) |
 | `tagteam-daemon` | The daemon: the scheduler that `tagteam auto` also runs on, its jobs and the socket protocol |
+| `tagteam-tui` | The terminal UI: its state machine, screens and ports (`tagteam tui`) |
 | `tagteam-fake` | A test-only second provider that keeps the `Provider` trait provider-neutral |
 | `xtask` | Development tasks (`cargo xtask compat`) |
 
@@ -139,10 +141,10 @@ You do not need to write a spec for a bug fix or a small change.
 ## Releasing
 
 - Set the version to the UTC date and time of the release, `YYYYMMDD.HHMM.0`, with no leading
-  zeros in `HHMM` (09:05 is `905`). Change `version` in `[workspace.package]` and the five
+  zeros in `HHMM` (09:05 is `905`). Change `version` in `[workspace.package]` and the six
   internal `version = "…"` entries in `[workspace.dependencies]` (`tagteam-core`,
-  `tagteam-provider`, `tagteam-cc`, `tagteam-engine` and `tagteam-daemon`) together, then
-  refresh `Cargo.lock`.
+  `tagteam-provider`, `tagteam-cc`, `tagteam-engine`, `tagteam-daemon` and `tagteam-tui`) together,
+  then refresh `Cargo.lock`.
 - Add a dated section to the [changelog](CHANGELOG.md), with the version as its heading.
 - Tag the commit `v<version>` (for example `v20261013.2030.0`) and push the tag. The release
   publishes the GitHub archives, the Homebrew formula and the crates on crates.io. Prereleases

@@ -22,6 +22,7 @@ tagteam-provider.workspace = true
 tagteam-cc.workspace = true
 tagteam-engine.workspace = true
 tagteam-daemon.workspace = true
+tagteam-tui.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 fastrand.workspace = true
