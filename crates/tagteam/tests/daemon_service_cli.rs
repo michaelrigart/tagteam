@@ -541,6 +541,16 @@ fn a_real_service_manager_starts_and_stops_the_daemon() {
         (out.status.code(), json_of(&out))
     };
     let (code, before) = status();
+    // A launchd agent can stay loaded after its plist is deleted, and the install's bootout
+    // would then unload the person's own agent: refuse unless the manager says, explicitly,
+    // that nothing is loaded. `null` is the manager not answering, which proves nothing.
+    assert_eq!(
+        before["service"]["loaded"],
+        json!(false),
+        "a tagteam service is loaded already, or the manager did not say it is not (this test \
+         would replace it): run `tagteam daemon uninstall` first, then run this test again: \
+         {before}"
+    );
     assert_eq!(code, Some(3), "{before}");
     assert_eq!(
         before["service"]["installed"],
