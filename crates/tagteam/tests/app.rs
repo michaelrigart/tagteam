@@ -1165,6 +1165,23 @@ fn an_interrupted_usage_collection_interrupts_list_and_status() {
 }
 
 #[test]
+fn a_signal_between_the_refresh_and_the_token_report_interrupts_tokens() {
+    // Token report spec §14: the report is not printed once a signal has come; the refresh
+    // has nothing to read here, so the check after it is the only cancellation point.
+    let h = H::new();
+    let (code, out, err) = h.run_with_cancel(
+        &["tokens", "--no-refresh", "--json"],
+        &mut Scripted::none(),
+        &signalled(libc::SIGINT),
+    );
+    assert_eq!((code, err.as_str()), (130, ""));
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap(),
+        interrupted_json()
+    );
+}
+
+#[test]
 fn a_signal_that_meets_no_cancellation_point_is_too_late_and_changes_nothing() {
     // Decision 6: `list` on a fresh home collects nothing, so nothing could stop it.
     let h = H::new();

@@ -439,9 +439,9 @@ fn a_flag_before_the_period_leaves_it_the_period() {
     cmd(f.root())
         .args(["tokens", "1", "month", "--no-refresh"])
         .assert()
-        .failure()
+        .code(1)
         .stdout("")
-        .stderr(predicates::str::contains("month"));
+        .stderr("tagteam: no account matches \"month\"\n");
 }
 
 #[test]
