@@ -1150,15 +1150,20 @@ fn a_purge_between_a_prunes_chunks_stops_it_and_frees_its_lease() {
     // Spec §5.1, §13: each chunk is a write of the refresh's generation, so a purge that lands
     // between two chunks (while `stop` runs, the connection free) is met by the next chunk's
     // check, not only by the one at the start. The prune writes nothing more, answers
-    // `TokenIndexPurged` and releases its lease at once.
-    let (_d, s, _) = store();
+    // `TokenIndexPurged` and releases its lease at once. The purge here removes the generation
+    // alone (`token_epoch`, which every full purge deletes): the lease row stays, so only the
+    // release lets the next holder take it.
+    let (_d, s, path) = store();
     let cutoff = T - 30 * DAY;
     let started = generation(&s);
     commit(&s, &[row(1, "old", cutoff - 1, 1), row(2, "live", T, 1)], T);
     let asks = Cell::new(0);
     let purge_between_chunks = || {
         asks.set(asks.get() + 1);
-        s.empty_all().unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DELETE FROM token_epoch", [])
+            .unwrap();
         false
     };
     let err = s
@@ -1166,11 +1171,18 @@ fn a_purge_between_a_prunes_chunks_stops_it_and_frees_its_lease() {
         .unwrap_err();
     assert!(matches!(err, StoreError::TokenIndexPurged), "{err:?}");
     assert_eq!(asks.get(), 1, "asked once, after the chunk that deleted");
-    assert_eq!(s.token_state(&cc()).unwrap(), None, "not recreated");
-    assert_eq!(s.token_epoch().unwrap(), None);
+    let state = s.token_state(&cc()).unwrap().unwrap();
+    assert_eq!(state.pruned_at, None, "the refused prune finished nothing");
+    assert_eq!(
+        raw_count(
+            &path,
+            "SELECT expires_at FROM leases WHERE name = 'prune:tokens:claude-code'"
+        ),
+        T + 1,
+        "the refused prune handed its lease back, expiring at its `now`"
+    );
 
-    // A new holder in a fresh generation takes the lease at the same instant: the refused one
-    // handed it back with its expiry at `now`.
+    // A new holder in a fresh generation takes the lease at the same instant.
     let fresh = s.begin_token_refresh(&cc(), T + 2).unwrap();
     assert_eq!(
         s.prune_tokens(&cc(), fresh, cutoff, "h2", T + 1, &|| false)

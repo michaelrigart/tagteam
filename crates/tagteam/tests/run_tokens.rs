@@ -147,6 +147,15 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// The lines of `out`'s stderr that are warnings.
+fn warnings(out: &Output) -> Vec<String> {
+    stderr(out)
+        .lines()
+        .filter(|l| l.starts_with("warning:"))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The system clock in epoch ms, the clock the binary stamps with.
 fn now_ms() -> i64 {
     let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
@@ -336,24 +345,20 @@ fn evidence_failures_never_change_the_exit_code() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
-    assert!(
-        stderr(&output)
-            .contains("warning: the token report could not record this session's launch yet"),
-        "{}",
-        stderr(&output)
-    );
+    // Exactly two warnings: before the spawn, and at the close once the retries are spent,
+    // never one per retry and never one for the end of a launch that was never recorded.
+    let cause = "store error: no such table: run_launches";
     assert_eq!(
-        stderr(&output)
-            .matches("could not record this session's launch")
-            .count(),
-        2,
-        "the warning before the spawn, and one at the close, never one per retry: {}",
-        stderr(&output)
-    );
-    assert!(
-        stderr(&output)
-            .contains("launch, so its usage may be credited to the default login's account"),
-        "the close says what a launch never recorded means: {}",
+        warnings(&output),
+        [
+            format!(
+                "warning: the token report could not record this session's launch yet: {cause}. It will try again while the session runs. If it never can, this session's usage may be credited to the default login's account."
+            ),
+            format!(
+                "warning: the token report could not record this session's launch, so its usage may be credited to the default login's account: {cause}"
+            ),
+        ],
+        "{}",
         stderr(&output)
     );
     let calls = fake_claude_calls(&out);
@@ -370,7 +375,8 @@ fn a_launch_that_failed_to_record_is_recorded_later_with_its_original_start() {
     // Spec §6.1: a launch that could not be recorded before the spawn is retried by the poller
     // while the child runs. It keeps the start planned before the spawn, so attribution, which
     // reads launches at query time, covers the whole session. The table is gone when the run
-    // plans its launch and back some seconds into the session.
+    // plans its launch; the poller parks right after its first retry failed (`launch-retry-
+    // failed`), the table comes back, and a later retry records the launch.
     let home = Home::new();
     let db = Env::for_test(home.root()).data_dir().join("tagteam.db");
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -384,43 +390,51 @@ fn a_launch_that_failed_to_record_is_recorded_later_with_its_original_start() {
     conn.execute_batch("DROP TABLE run_launches").unwrap();
     let out = home.out("late-record");
     let hold = home.root().join("hold");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
     let _release = Release(hold.clone());
+    let _resume = Release(pause.join("resume"));
     let planned_after = now_ms();
     let child = home
         .run_a(&out)
         .env("FAKE_CLAUDE_HOLD", &hold)
+        .env("TAGTEAM_TEST_PAUSE_AT", "launch-retry-failed")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause)
         .spawn()
         .unwrap();
     running(&out);
+    wait_for("the first retry to fail", || {
+        pause.join("paused").exists().then_some(())
+    });
     assert!(
         home.launches_if_any().is_none(),
-        "nothing could be recorded yet"
+        "the first retry recorded nothing"
     );
-    thread::sleep(Duration::from_millis(1_500));
     let restored_at = now_ms();
     conn.execute_batch(&schema).unwrap();
-    let late = wait_for("the retried launch", || {
+    fs::write(pause.join("resume"), b"").unwrap();
+    let late = wait_for("a later retry to record the launch", || {
         home.launches().into_iter().find(|l| l.pid.is_some())
     });
     assert!(
-        (planned_after..restored_at - 1_000).contains(&late.started_at),
+        (planned_after..restored_at).contains(&late.started_at),
         "the launch keeps the start planned before the spawn, not the retry's: {late:?}, planned after {planned_after}, restored at {restored_at}"
     );
     assert_eq!(late.account_id, home.a);
     fs::write(&hold, b"").unwrap();
     let output = finish(child);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("could not record this session's launch yet"),
-        "{}",
+    let pre_spawn = warnings(&output);
+    assert_eq!(
+        pre_spawn.len(),
+        1,
+        "the warning before the spawn alone; none at the close after a late record: {}",
         stderr(&output)
     );
-    assert_eq!(
-        stderr(&output)
-            .matches("could not record this session's launch")
-            .count(),
-        1,
-        "a launch recorded late is not warned of again at the close: {}",
+    assert!(
+        pre_spawn[0]
+            .starts_with("warning: the token report could not record this session's launch yet"),
+        "{}",
         stderr(&output)
     );
     let closed = home.launches();
@@ -430,6 +444,35 @@ fn a_launch_that_failed_to_record_is_recorded_later_with_its_original_start() {
         closed[0].ended_at.is_some(),
         "closed at the exit: {closed:?}"
     );
+}
+
+#[test]
+fn a_spawn_that_fails_with_an_unrecorded_launch_warns_of_it_before_the_spawn_only() {
+    // No session ran, so no usage can be misplaced: the close says nothing more.
+    let home = Home::new();
+    let db = Env::for_test(home.root()).data_dir().join("tagteam.db");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE run_launches")
+        .unwrap();
+    let out = home.out("gone-unrecorded");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _resume = Release(pause.join("resume"));
+    let child = home
+        .run_a(&out)
+        .env("TAGTEAM_TEST_PAUSE_AT", "before-spawn")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause)
+        .spawn()
+        .unwrap();
+    wait_for("the spawn", || pause.join("paused").exists().then_some(()));
+    fs::remove_file(home.root().join("bin/claude")).unwrap();
+    fs::write(pause.join("resume"), b"").unwrap();
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let w = warnings(&output);
+    assert_eq!(w.len(), 1, "{}", stderr(&output));
+    assert!(w[0].contains("launch yet"), "{}", stderr(&output));
 }
 
 #[test]

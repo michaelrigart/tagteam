@@ -91,8 +91,8 @@ its counts is the **maximum** over its lines; its time is the **earliest** line'
 line's top-level counts are all zero and `iterations[0]` is not, the iteration's counts are
 used. `<synthetic>` lines are skipped. The maximum makes the result independent of the order
 in which lines and files are read, so an incremental or concurrent index converges. A copy of
-a response in another file keeps the session, sidechain flag and project of the line indexed
-first (§7.4).
+a response in another file keeps the session and sidechain flag of the batch that committed it
+first, and a session's project is the first one known (§7.4).
 
 ### 2.3 Subagent output is a lower bound
 
@@ -537,7 +537,7 @@ unattributed.
 
 **Coverage.**
 - From the epoch (`token_epoch`, when the store migrated to step 3) on, coverage is complete:
-  `run` records each launch before its child starts (§6.1).
+  `run` records each launch from a start planned before its child starts (§6.1).
 - Before the epoch, coverage comes from the seeded launches (§4). It is complete only after
   the provider's last `remove` event before the epoch. An account removed before then may have
   had a profile that left no trace.
@@ -572,11 +572,11 @@ assumptions:
 Known limits:
 
 - A response copied into another transcript file (a resume or fork copy, §2.2) keeps the
-  session id, sidechain flag and project of whichever batch committed it first, because the
-  upsert never changes them. The counts converge whatever the read order. Session rows can show
+  session and sidechain flag of whichever batch committed it first, because the upsert never
+  changes them, and its session's project is the first one known. The counts converge whatever the read order. Session rows can show
   such a response under either session. It is never attributed to an account it could not have
-  used: at worst it is unattributed. In the real tree 0.3% of responses are such copies.
-
+  used: at worst it is unattributed. In the real tree 0.3% of responses have a copy under
+  another session id.
 - A session CC spawns itself inside a profile writes no record. Its responses fall inside its
   parent's launch, so they are unattributed rather than misplaced.
 - Whether a record's `sessionId` follows `/clear` is unverified (§17 T1). If it does not, a
