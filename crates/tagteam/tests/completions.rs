@@ -38,10 +38,12 @@ fn words(script: &str) -> BTreeSet<&str> {
         .collect()
 }
 
-/// Every subcommand name and visible alias under `cmd`, and every long flag.
+/// Every subcommand name and visible alias under `cmd`, and every long flag a person can use:
+/// a hidden one (`--expect-account`) is in no script.
 fn definitions(cmd: &clap::Command, names: &mut BTreeSet<String>, flags: &mut BTreeSet<String>) {
     flags.extend(
         cmd.get_arguments()
+            .filter(|a| !a.is_hide_set())
             .filter_map(|a| a.get_long())
             .map(str::to_owned),
     );
@@ -339,9 +341,12 @@ impl<'s> Fish<'s> {
     }
 }
 
-/// Every spelling of an option under `cmd`, by whether it takes a value.
+/// Every spelling of an option under `cmd` that is not hidden, by whether it takes a value.
 fn options(cmd: &clap::Command, valued: &mut BTreeSet<String>, flags: &mut BTreeSet<String>) {
-    for arg in cmd.get_arguments().filter(|a| !a.is_positional()) {
+    for arg in cmd
+        .get_arguments()
+        .filter(|a| !a.is_positional() && !a.is_hide_set())
+    {
         let shorts = arg.get_short_and_visible_aliases().unwrap_or_default();
         let longs = arg.get_long_and_visible_aliases().unwrap_or_default();
         let spellings = shorts
@@ -491,4 +496,35 @@ fn completions_under_json_or_for_another_shell_is_a_usage_error() {
         .code(2)
         .stdout("");
     cmd(d.path()).arg("completions").assert().code(2).stdout("");
+}
+
+#[test]
+fn the_hidden_guard_flag_is_in_no_help_page_and_no_completion_script() {
+    // The TUI's `--expect-account` (core §10.4) is not for people. clap keeps it out of `--help`
+    // with `hide`, but clap_complete writes a hidden flag into its scripts all the same, so
+    // `CompletionShell::script` strips it.
+    let d = tempfile::tempdir().unwrap();
+    for args in [&["--help"][..], &["switch", "--help"], &["alias", "--help"]] {
+        let out = cmd(d.path())
+            .args(args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let help = String::from_utf8(out).unwrap();
+        assert!(!help.contains("expect-account"), "{args:?}: {help}");
+    }
+    for shell in SHELLS {
+        let text = script(d.path(), shell);
+        assert!(!text.contains("expect-account"), "{shell}");
+        assert!(text.contains("--provider") || fish_declares_long(&text, "provider"));
+    }
+    // It is still a flag of the parser, global and hidden.
+    let command = Cli::command();
+    let flag = command
+        .get_arguments()
+        .find(|a| a.get_long() == Some("expect-account"))
+        .expect("the flag exists");
+    assert!(flag.is_hide_set() && flag.is_global_set());
 }
