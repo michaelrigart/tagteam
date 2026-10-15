@@ -322,10 +322,20 @@ pub fn render_unit(
 }
 
 /// What a unit tagteam wrote starts, and with which variables.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UnitContents {
     pub program: PathBuf,
     pub env: Vec<(String, String)>,
+}
+
+/// The variables' names only: their values may be proxy URLs carrying a password (§14.2).
+impl std::fmt::Debug for UnitContents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnitContents")
+            .field("program", &self.program)
+            .field("env", &self.env.iter().map(|(k, _)| k).collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// Decision 5: the program and variables of a unit exactly as `render_*` wrote it. It returns
@@ -637,6 +647,24 @@ mod tests {
     const BIN: &str = "/opt/homebrew/bin/tagteam";
     const FIVE: Duration = Duration::from_secs(5);
     const KINDS: [ServiceKind; 2] = [ServiceKind::Launchd, ServiceKind::Systemd];
+
+    #[test]
+    fn debug_of_a_parsed_unit_names_its_variables_and_never_their_values() {
+        // Review I2: a recorded proxy URL can carry a password.
+        let env = vec![(
+            "HTTPS_PROXY".to_owned(),
+            "http://user:secret@proxy".to_owned(),
+        )];
+        for kind in KINDS {
+            let text = render_unit(kind, Path::new(BIN), &env).unwrap();
+            let unit = parse_unit(kind, &text).unwrap();
+            assert_eq!(unit.env, env, "{kind:?}: the value is still read back");
+            let shown = format!("{unit:?}");
+            assert!(!shown.contains("secret"), "{kind:?}: {shown}");
+            assert!(shown.contains("HTTPS_PROXY"), "{kind:?}: {shown}");
+            assert!(shown.contains(BIN), "{kind:?}: {shown}");
+        }
+    }
 
     fn plain_env() -> Vec<(String, String)> {
         vec![

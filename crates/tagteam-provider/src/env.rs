@@ -44,7 +44,7 @@ pub fn home_from(value: Option<OsString>) -> Result<PathBuf, EnvError> {
 }
 
 /// Everything tagteam resolves paths from (§15.1). Tests build one with `for_test`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Env {
     pub home: PathBuf,
     pub user: Option<String>,
@@ -62,6 +62,28 @@ pub struct Env {
     /// captured by `capture_vars`. Empty in `from_process` and `for_test`.
     pub vars: BTreeMap<String, OsString>,
     forbidden_root: Option<PathBuf>,
+}
+
+/// `vars` shows its names and never its values: a value may be a proxy URL carrying a password
+/// or a login (§14.2), and nothing that holds an `Env` may leak it through `{:?}`.
+impl std::fmt::Debug for Env {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Env")
+            .field("home", &self.home)
+            .field("user", &self.user)
+            .field("xdg_config_home", &self.xdg_config_home)
+            .field("xdg_data_home", &self.xdg_data_home)
+            .field("xdg_state_home", &self.xdg_state_home)
+            .field("claude_config_dir", &self.claude_config_dir)
+            .field(
+                "claude_securestorage_config_dir",
+                &self.claude_securestorage_config_dir,
+            )
+            .field("cancel", &self.cancel)
+            .field("vars", &self.vars.keys().collect::<Vec<_>>())
+            .field("forbidden_root", &self.forbidden_root)
+            .finish()
+    }
 }
 
 impl Env {
@@ -179,6 +201,23 @@ impl Env {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn debug_shows_the_names_of_vars_and_never_their_values() {
+        // Review I2: `vars` holds proxy URLs, which can carry a password.
+        let mut env = Env::for_test(Path::new("/tmp/fixture"));
+        env.vars
+            .insert("HTTPS_PROXY".into(), "http://user:secret@proxy".into());
+        env.vars.insert("CLAUDECODE".into(), "1".into());
+        let shown = format!("{env:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(!shown.contains("user:secret"), "{shown}");
+        assert!(
+            shown.contains("HTTPS_PROXY") && shown.contains("CLAUDECODE"),
+            "{shown}"
+        );
+        assert!(!format!("{env:#?}").contains("secret"));
+    }
 
     #[test]
     fn xdg_defaults_live_under_home() {
