@@ -12,6 +12,7 @@ tagteam-core.workspace = true
 tagteam-provider.workspace = true
 tagteam-engine.workspace = true
 crossterm.workspace = true
+libc.workspace = true
 ratatui.workspace = true
 unicode-width.workspace = true
 

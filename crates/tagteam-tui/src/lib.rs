@@ -17,6 +17,7 @@ mod term;
 pub mod update;
 pub mod view;
 
+pub use runtime::{TuiExit, TuiOptions, run};
 pub use state::Screen;
 
 #[cfg(test)]

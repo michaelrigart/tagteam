@@ -10,17 +10,14 @@ use crate::host::Ask;
 use crate::msg::{Answer, Msg, Prompt, PromptKind};
 
 /// How long the lane waits for an answer before it looks at the shutdown token again.
-#[allow(dead_code)]
 const SLICE: Duration = Duration::from_millis(100);
 
 /// Task 11's runtime builds one for each action; until then only the tests do.
-#[allow(dead_code)]
 pub(crate) struct ChannelAsk {
     tx: Sender<Msg>,
     shutdown: Cancel,
 }
 
-#[allow(dead_code)]
 impl ChannelAsk {
     /// Prompts go to the UI thread on `tx`; once `shutdown` is set, every prompt is declined.
     pub(crate) fn new(tx: Sender<Msg>, shutdown: Cancel) -> Self {
