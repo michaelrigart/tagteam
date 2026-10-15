@@ -176,12 +176,15 @@ pub fn child_is_stopped(pid: u32) -> bool {
     }
 }
 
-/// Ctrl-Z for a program that reads its keys raw (TUI spec §10.1): stops this process with
-/// SIGTSTP, as the terminal would have, and returns once it is continued (SIGCONT). Where
-/// nothing does job control the signal is discarded, and this returns at once.
+/// Ctrl-Z for a program that reads its keys raw (TUI spec §10.1): stops this process's group
+/// with SIGTSTP, as the terminal would have, and returns once it is continued (SIGCONT). The
+/// group, not the process alone, as vim and less do: under a wrapper (`cargo run`, a shim) the
+/// shell's job is the wrapper's group, and it sees the job stop only when all of it has.
+/// Where nothing does job control the signal is discarded, and this returns at once.
 pub fn stop_self() -> io::Result<()> {
-    // SAFETY: raise(3) takes a signal number and touches no memory of ours.
-    if unsafe { libc::raise(libc::SIGTSTP) } != 0 {
+    // SAFETY: kill(2) with pid 0 takes a signal number and signals the caller's own process
+    // group; it touches no memory of ours.
+    if unsafe { libc::kill(0, libc::SIGTSTP) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -281,5 +284,76 @@ mod spawn_tests {
             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "{status:#x}"
         );
+    }
+
+    #[test]
+    fn stop_self_stops_every_process_of_the_group() {
+        // A forked child leads a group of its own, and a second child joins it. When the leader
+        // stops itself the other stops too, as a wrapper's shell would need.
+        let _fork = crate::fork_guard();
+        let mut ready = [0; 2];
+        // SAFETY: pipe(2) fills the two descriptors of `ready`.
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+        // SAFETY: the children call only async-signal-safe functions: read(2), pause(2),
+        // `stop_self`'s kill(2), and _exit(2).
+        let leader = unsafe { libc::fork() };
+        assert!(leader >= 0, "fork: {}", io::Error::last_os_error());
+        if leader == 0 {
+            let mut byte = 0u8;
+            // SAFETY: in the forked child; read(2) writes one byte into `byte`.
+            unsafe {
+                libc::read(ready[0], (&raw mut byte).cast(), 1);
+                libc::_exit(if stop_self().is_ok() { 0 } else { 1 });
+            }
+        }
+        // SAFETY: as above; the second child does nothing but wait for a signal.
+        let member = unsafe { libc::fork() };
+        assert!(member >= 0, "fork: {}", io::Error::last_os_error());
+        if member == 0 {
+            // SAFETY: in the forked child; pause(2) takes nothing.
+            unsafe {
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        // SAFETY: setpgid(2) on this test's own children, neither reaped; write(2) reads one
+        // byte of `byte`.
+        unsafe {
+            assert_eq!(libc::setpgid(leader, leader), 0);
+            assert_eq!(libc::setpgid(member, leader), 0);
+            let byte = 0u8;
+            assert_eq!(libc::write(ready[1], (&raw const byte).cast(), 1), 1);
+        }
+        let stopped = |pid: libc::pid_t| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let mut status = 0;
+                // SAFETY: waitpid(2) writes the child's status into `status`; WUNTRACED reports
+                // a stop and WNOHANG returns at once.
+                let reaped =
+                    unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+                if reaped == pid {
+                    return libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGTSTP;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let (leader_stopped, member_stopped) = (stopped(leader), stopped(member));
+        // SAFETY: kill(2) and waitpid(2) on this test's own children, which are not reaped yet;
+        // close(2) on the pipe's descriptors.
+        unsafe {
+            for pid in [leader, member] {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            libc::close(ready[0]);
+            libc::close(ready[1]);
+        }
+        assert!(leader_stopped, "the leader stopped");
+        assert!(member_stopped, "the rest of the group stopped with it");
     }
 }
