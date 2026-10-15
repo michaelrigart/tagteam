@@ -413,6 +413,46 @@ fn polling_reads_the_record_only_when_it_changed() {
 }
 
 #[test]
+fn a_poll_that_sees_no_session_extends_none() {
+    // Spec §6.1: a poll extends the sighting of the session it sees. A record rewritten into
+    // one that does not read as this child's, or one that is gone, shows no session: the child
+    // may have left the one it saw last (`/clear`), so that sighting is not extended.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    let run = SightingSource::Run;
+    running(&fx, 777, None);
+    let started = NOW + 1_000;
+    let path = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&path, 1_790_000_000);
+    fx.clock.advance_ms(2_000);
+    let polled = NOW + 2_000;
+    fx.engine
+        .poll_launch(&id, &profile, 777, &mut state)
+        .unwrap();
+    let seen = vec![sighting("s-a", a.as_str(), started, polled, run, polled)];
+    assert_eq!(sightings(&fx), seen);
+
+    fs::write(&path, b"{\"pid\": 777, \"sessionId\":").unwrap();
+    set_mtime(&path, 1_790_000_001);
+    fx.clock.advance_ms(61_000);
+    fx.engine
+        .poll_launch(&id, &profile, 777, &mut state)
+        .unwrap();
+    assert_eq!(sightings(&fx), seen, "a record that does not read");
+
+    fs::remove_file(&path).unwrap();
+    fx.clock.advance_ms(61_000);
+    fx.engine
+        .poll_launch(&id, &profile, 777, &mut state)
+        .unwrap();
+    assert_eq!(sightings(&fx), seen, "a record that is gone");
+}
+
+#[test]
 fn a_stale_record_with_a_reused_pid_is_ignored() {
     // A crashed execution left `777.json` behind, and the OS gave its pid to this child. The
     // record names an older execution, started before this launch began: it is never sighted,
@@ -567,17 +607,17 @@ fn close_stamps_the_sighting_at_the_exit_not_at_the_close() {
     fx.engine
         .poll_launch(&id, &profile, 777, &mut state)
         .unwrap();
-    // The child exits at t1. The poller's last round, in flight then, stamps the sighting past
-    // the exit, and exit handling takes until t2.
+    // The child exits at t1. The poller's last round, in flight then, saw the record before it
+    // went and stamps the sighting past the exit, and exit handling takes until t2.
     fx.clock.advance_ms(30_000);
     let t1 = fx.engine.now_ms();
-    fs::remove_file(&child).unwrap();
-    gone(&fx, 777);
     fx.clock.advance_ms(61_000);
     let stamped = fx.engine.now_ms();
     fx.engine
         .poll_launch(&id, &profile, 777, &mut state)
         .unwrap();
+    fs::remove_file(&child).unwrap();
+    gone(&fx, 777);
     let run = SightingSource::Run;
     assert_eq!(
         sightings(&fx),
