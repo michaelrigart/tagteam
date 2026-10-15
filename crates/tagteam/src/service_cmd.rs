@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 use tagteam_daemon::client::{ClientError, Connect, connect};
 use tagteam_daemon::protocol::{Status, StatusJob, StatusNotifications, StatusProvider};
-use tagteam_daemon::service::InstallReport;
+use tagteam_daemon::service::{InstallReport, Uninstalled};
 use tagteam_daemon::watch::program_path;
 use tagteam_engine::daemon::{daemon_lock_path, daemon_socket_path, read_daemon_record};
 use tagteam_engine::service::{ServiceKind, ServiceState};
@@ -65,21 +65,27 @@ pub(crate) fn install_json(r: &InstallReport) -> Value {
     })
 }
 
-pub(crate) fn uninstall_human(kind: ServiceKind, path: &Path, removed: bool) -> String {
-    if removed {
-        format!(
+pub(crate) fn uninstall_human(kind: ServiceKind, path: &Path, found: Uninstalled) -> String {
+    match found {
+        Uninstalled::Removed => format!(
             "Stopped the daemon and removed the {} at {}.\n",
             kind.noun(),
             path.display()
-        )
-    } else {
-        format!("No {} is installed at {}.\n", kind.noun(), path.display())
+        ),
+        Uninstalled::StoppedOnly => format!(
+            "Stopped the daemon; no unit file was left at {}.\n",
+            path.display()
+        ),
+        Uninstalled::Nothing => {
+            format!("No {} is installed at {}.\n", kind.noun(), path.display())
+        }
     }
 }
 
-/// D9.4: `{schemaVersion, ok, removed}`.
-pub(crate) fn uninstall_json(removed: bool) -> Value {
-    json!({"schemaVersion": 1, "ok": true, "removed": removed})
+/// D9.4: `{schemaVersion, ok, removed, stopped}`. `removed` is true unless nothing was found;
+/// `stopped` is true when the manager stopped a unit whose file was already gone.
+pub(crate) fn uninstall_json(found: Uninstalled) -> Value {
+    json!({"schemaVersion": 1, "ok": true, "removed": found.removed(), "stopped": found.stopped()})
 }
 
 /// What `daemon status` found (D8.2).
@@ -640,17 +646,28 @@ mod tests {
             )
         );
         assert_eq!(
-            uninstall_human(ServiceKind::Launchd, &agent(), true),
+            uninstall_human(ServiceKind::Launchd, &agent(), Uninstalled::Removed),
             "Stopped the daemon and removed the launchd agent at /Users/me/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist.\n"
         );
         assert_eq!(
-            uninstall_human(ServiceKind::Launchd, &agent(), false),
-            "No launchd agent is installed at /Users/me/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist.\n"
+            uninstall_human(ServiceKind::Launchd, &agent(), Uninstalled::StoppedOnly),
+            "Stopped the daemon; no unit file was left at /Users/me/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist.\n"
         );
         assert_eq!(
-            uninstall_json(true),
-            json!({"schemaVersion": 1, "ok": true, "removed": true})
+            uninstall_human(ServiceKind::Launchd, &agent(), Uninstalled::Nothing),
+            "No launchd agent is installed at /Users/me/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist.\n"
         );
+        for (found, removed, stopped) in [
+            (Uninstalled::Removed, true, false),
+            (Uninstalled::StoppedOnly, true, true),
+            (Uninstalled::Nothing, false, false),
+        ] {
+            assert_eq!(
+                uninstall_json(found),
+                json!({"schemaVersion": 1, "ok": true, "removed": removed, "stopped": stopped}),
+                "{found:?}"
+            );
+        }
         assert_eq!(
             print_json(ServiceKind::Launchd, &agent(), "<plist/>"),
             json!({"schemaVersion": 1,

@@ -612,8 +612,10 @@ Each command runs `launchctl` or `systemctl` through the `ProcessSpawner` port w
 timeout. A failure reports that program's stderr and exit status. The commands return `0` on
 success, `1` on failure, and `2` for a usage error. JSON shapes:
 - `install`: `{schemaVersion, ok, service: {kind, path, label}, started, warnings}`
-- `uninstall`: `{schemaVersion, ok, removed}`. `uninstall` with no unit installed succeeds with
-  `removed: false`.
+- `uninstall`: `{schemaVersion, ok, removed, stopped}`. `uninstall` with no unit installed and
+  nothing loaded succeeds with `removed: false`. With no unit file but a unit the manager still
+  runs, it stops that and reports `removed: true, stopped: true`; the human output then says no
+  unit file was left. `stopped` is false when the file was deleted.
 
 ## D10. Doctor
 
@@ -626,7 +628,7 @@ each bounded by a 5 s timeout; none changes anything.
 | `daemon.running` | info: running, with the pid and version from `daemon.lock`'s record (judged live by an exact pid and start-time match, §12.6). warn: its version differs from this binary's, "restart it". info: not running |
 | `daemon.service` | info: installed and loaded, or not installed. fail: the unit's program path does not exist. warn: a recorded variable (D9.1) other than `PATH` differs from doctor's own environment, so the daemon uses another store or home; the fix is `tagteam daemon install` again. `PATH` places no store or home, and a version manager changes it in every directory, so it is not compared. info (Linux): lingering is off. warn (Linux): whether lingering is on cannot be told (`loginctl` missing, hung or failing), with the reason |
 | `daemon.socket` | info: a socket file with no live daemon (the next start replaces it). warn: its mode is not 0600, or a live daemon has no socket file (it runs without one, D5.1). fail: its path is too long to bind (D5.1), once a daemon runs or a unit is installed; until then the length is not judged, so `doctor` never fails for someone who does not use the daemon |
-| `daemon.notify` | warn: notifications are on but there is no backend (`notify-send` missing) |
+| `daemon.notify` | warn: notifications are on but there is no backend (`notify-send` missing), once a daemon runs or a unit is installed; until then it is not checked, as for `daemon.socket`, so a machine that does not use the daemon carries no warning for it |
 
 The existing auto-switch check ("an engine running", §13.6) says `the daemon (pid N)` when the
 engine lock's record matches `daemon.lock`'s.
@@ -778,5 +780,10 @@ design:
   with its reason; a too-long socket path fails only once a daemon runs or a unit is installed;
   a live daemon with no socket file warns; the intro names `loginctl show-user` among the
   commands it reads.
+- **D10:** `daemon.notify` warns only once a daemon runs or a unit is installed, the same gate
+  `daemon.socket` has, so a headless Linux machine that does not use the daemon carries no
+  permanent warning.
+- **D9.4:** `uninstall` asks the manager whether or not the unit file exists, so a loaded unit
+  whose file is gone is still stopped; `--json` gains `stopped` for that case.
 - **D12, D14:** the perf daemon runs at the shortest auto-switch interval (15 s), since
   §6.4 allows nothing shorter.

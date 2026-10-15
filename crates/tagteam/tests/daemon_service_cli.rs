@@ -66,14 +66,15 @@ fn launchctl(bin: &Path) {
     );
 }
 
-/// A stand-in `systemctl` that succeeds at everything, and a `loginctl` that reports lingering
+/// A stand-in `systemctl` that succeeds at everything but `stop`, which finds the unit not
+/// loaded (exit 5) as systemd does once its file is gone, and a `loginctl` that reports lingering
 /// off. Each logs its arguments beside itself.
 fn systemd(bin: &Path) {
     let log = bin.join("systemctl.log");
     install_script(
         &bin.join("systemctl"),
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\ncase \"$2\" in\n  stop) echo 'Failed to stop tagteam.service: Unit tagteam.service not loaded.' >&2; exit 5 ;;\nesac\nexit 0\n",
             log = log.display()
         ),
     );
@@ -202,7 +203,7 @@ fn install_and_uninstall_drive_systemd_through_the_systemctl_on_path() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     assert_eq!(
         json_of(&out),
-        json!({"schemaVersion": 1, "ok": true, "removed": true})
+        json!({"schemaVersion": 1, "ok": true, "removed": true, "stopped": false})
     );
     assert!(!path.exists());
     assert_eq!(
@@ -219,10 +220,107 @@ fn install_and_uninstall_drive_systemd_through_the_systemctl_on_path() {
         format!("No systemd user unit is installed at {}.\n", path.display())
     );
     assert_eq!(
-        calls(&bin, "systemctl").len(),
-        7,
-        "nothing to stop the second time"
+        calls(&bin, "systemctl")[7..],
+        ["--user stop tagteam.service"],
+        "with no unit file, only a best-effort stop"
     );
+}
+
+/// A stand-in manager that succeeds at everything, `bootout` and `stop` included: the daemon's
+/// unit is loaded and running whatever its file says.
+fn loaded(bin: &Path, program: &str) {
+    let log = bin.join(format!("{program}.log"));
+    install_script(
+        &bin.join(program),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\nexit 0\n",
+            log = log.display()
+        ),
+    );
+}
+
+#[test]
+fn uninstall_says_what_it_did_for_each_of_its_three_outcomes() {
+    // D9.4: `Removed` is covered by the round trips above. Here the unit file is absent: a
+    // loaded unit is stopped (`StoppedOnly`, `removed` and `stopped` both true), and one that
+    // is not loaded leaves nothing to do (`Nothing`).
+    for (platform, program, unit, noun, stopped_call) in [
+        (
+            "macos",
+            "launchctl",
+            "home/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist",
+            "launchd agent",
+            format!(
+                "bootout gui/{}/io.github.michaelrigart.tagteam",
+                current_uid()
+            ),
+        ),
+        (
+            "linux",
+            "systemctl",
+            "home/.config/systemd/user/tagteam.service",
+            "systemd user unit",
+            "--user stop tagteam.service".to_owned(),
+        ),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let bin = bin(d.path());
+        let path = d.path().join(unit);
+        // Nothing loaded: the default stand-ins answer "not loaded".
+        if platform == "macos" {
+            launchctl(&bin);
+        } else {
+            systemd(&bin);
+        }
+        let out = service_cmd(d.path(), platform, &["--json", "daemon", "uninstall"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{platform}: {}",
+            text(&out.stderr)
+        );
+        assert_eq!(
+            json_of(&out),
+            json!({"schemaVersion": 1, "ok": true, "removed": false, "stopped": false}),
+            "{platform}"
+        );
+        let out = service_cmd(d.path(), platform, &["daemon", "uninstall"]);
+        assert_eq!(
+            text(&out.stdout),
+            format!("No {noun} is installed at {}.\n", path.display()),
+            "{platform}"
+        );
+
+        // Loaded without a file.
+        loaded(&bin, program);
+        let out = service_cmd(d.path(), platform, &["--json", "daemon", "uninstall"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{platform}: {}",
+            text(&out.stderr)
+        );
+        assert_eq!(
+            json_of(&out),
+            json!({"schemaVersion": 1, "ok": true, "removed": true, "stopped": true}),
+            "{platform}"
+        );
+        let out = service_cmd(d.path(), platform, &["daemon", "uninstall"]);
+        assert_eq!(
+            text(&out.stdout),
+            format!(
+                "Stopped the daemon; no unit file was left at {}.\n",
+                path.display()
+            ),
+            "{platform}"
+        );
+        assert_eq!(
+            calls(&bin, program).last().map(String::as_str),
+            Some(stopped_call.as_str()),
+            "{platform}"
+        );
+        assert!(!path.exists(), "{platform}: no file was made");
+    }
 }
 
 #[test]

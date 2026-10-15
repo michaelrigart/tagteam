@@ -243,8 +243,9 @@ impl Context {
         let names = session_vars(&registry);
         ctx.env.capture_vars(&names);
         // Decision 18: which of the variables a session scrubs are set here, for the launch's
-        // warnings (§12.5). Only their presence is kept, never a value: a value may be a login,
-        // and `Env` derives `Debug`.
+        // warnings (§12.5). Only their presence is kept, never a value: a value may be a login.
+        // `Env`'s `Debug` prints `vars`' names only, so a later capture of values (the proxy
+        // URLs below) cannot leak through `{:?}`.
         for name in scrubbed_vars(&registry) {
             if std::env::var_os(&name).is_some() {
                 ctx.env.vars.insert(name, OsString::new());
@@ -1777,7 +1778,8 @@ impl App<'_, '_> {
     }
 
     /// D9: stops the daemon the unit runs and removes the unit. With none installed it changes
-    /// nothing and succeeds (D9.4). It refuses inside a run shell, as `install` does.
+    /// nothing and succeeds; with no file but a unit still loaded, it stops that (D9.4). It
+    /// refuses inside a run shell, as `install` does.
     fn daemon_uninstall(&mut self) -> Result<i32, Failure> {
         if matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
             return Err(EngineError::InsideRunShell.into());
@@ -1785,11 +1787,11 @@ impl App<'_, '_> {
         let env = self.engine.env().clone();
         let kind = self.service();
         let spawner = self.engine.spawner();
-        let removed =
+        let found =
             daemon_service::uninstall(&env, kind, spawner.as_ref()).map_err(install_failure)?;
         self.print(
-            &service_cmd::uninstall_human(kind, &unit_path(&env, kind), removed),
-            service_cmd::uninstall_json(removed),
+            &service_cmd::uninstall_human(kind, &unit_path(&env, kind), found),
+            service_cmd::uninstall_json(found),
         );
         Ok(0)
     }
