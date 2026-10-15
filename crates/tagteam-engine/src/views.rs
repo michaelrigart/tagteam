@@ -19,7 +19,7 @@ const PACE_LOOKBACK_S: i64 = 48 * 3600;
 
 /// The longest `statusline` waits on the store's write lock to cache the live identity: the
 /// cache is a convenience, and the line is never held up for it (§13.5).
-const CACHE_WRITE_WAIT: Duration = Duration::from_millis(5);
+pub(crate) const CACHE_WRITE_WAIT: Duration = Duration::from_millis(5);
 
 /// `usageError` for an account that has neither a reading nor a failure yet (§13.2).
 pub const NO_DATA: &str = "no-data";
