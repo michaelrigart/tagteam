@@ -628,6 +628,55 @@ fn a_pass_over_several_budgeted_calls_stores_the_skips_of_all_of_them() {
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
+fn a_commit_inside_a_chunk_does_not_carry_the_chunks_skips() {
+    // Spec §5.2 step 4: a chunk's skips go with its checkpoint. A chunk of more than 2,000 new
+    // responses commits once mid-chunk, before its checkpoint is in the batch; a failure after
+    // that commit has the file read again from the start, so the skips must not be stored yet.
+    let ffx = FakeFx::new();
+    let (env, p) = (&ffx.fx.env, ffx.fake_provider());
+    let bad = "{\"t\":\"usage\",\"id\":7}\n";
+    let mut text = format!("{bad}{bad}");
+    for i in 0..2_100 {
+        text.push_str(&line(&response(&format!("m{i}"), 2, true)));
+        if i == 1_000 {
+            text.push_str(bad);
+        }
+    }
+    assert!(text.len() < 1 << 20, "the file is one chunk");
+    append_transcript(env, "a.jsonl", &text);
+
+    ffx.engine.fail_at(Some("refresh-tokens-committed"));
+    let err = ffx
+        .engine
+        .refresh_tokens(
+            &p,
+            Wait::Wait,
+            None,
+            &Cancel::new(),
+            &mut |_: &IndexProgress| {},
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("injected failure"), "{err}");
+    assert!(
+        !rows(&ffx.engine, &p).is_empty() && files(&ffx.engine, &p).is_empty(),
+        "the first commit held rows and no checkpoint"
+    );
+
+    ffx.engine.fail_at(None);
+    ffx.fx.clock.advance_ms(1_000);
+    assert!(refresh(&ffx.engine, &p).complete);
+    let state = ffx
+        .engine
+        .store()
+        .unwrap()
+        .token_state(&p)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.stats.skipped_lines, 3);
+}
+
+#[test]
 fn skipped_lines_are_counted_in_the_state() {
     // Spec §5.4: a line that does not parse is skipped and counted; it never fails the refresh.
     let ffx = FakeFx::new();
