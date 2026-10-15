@@ -14,8 +14,13 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::atomic::ensure_private_dir;
 use tagteam_provider::{Clock, Identity, ProcessStamp, SystemClock};
 
+mod tokens;
 mod usage;
 
+pub use tokens::{
+    BatchOutcome, EpochRow, LaunchRow, PruneOutcome, RefreshStats, SightingRow, SightingSource,
+    TokenFileRow, TokenStateRow, UsageRow, usage_key,
+};
 pub use usage::{
     Eligibility, Ineligible, LiveIdentityCacheRow, Reservation, Reserve, SendGrant, Slot,
     UsageStateRow,
@@ -90,6 +95,11 @@ pub enum StoreError {
         "the store has its {present} file but not the other, a write-ahead log that cannot be read without writing"
     )]
     LopsidedWal { present: &'static str },
+    /// Token report spec §5.1, §13: a full purge emptied the token index after the refresh
+    /// writing to it began (its `token_epoch` row, the index's generation, is gone or new), so
+    /// the write was refused rather than leave part of the old index behind.
+    #[error("the token index was purged during the refresh")]
+    TokenIndexPurged,
 }
 
 impl StoreError {
@@ -1695,7 +1705,9 @@ impl Store {
     /// §10.5 with `--provider P`, once its accounts are gone: P's events, auto-switch state,
     /// active account, live identity cache and switch journal, in one transaction. Its
     /// `usage_requests` rows stay, so the hourly budget does not reset (§8.6), and its displaced
-    /// entries go through the displaced purge, each file before its row (§6.3).
+    /// entries go through the displaced purge, each file before its row (§6.3). The same
+    /// transaction deletes P's token index and session evidence, its sessions taking their
+    /// responses with them, and its prune lease; `token_epoch` stays (token report spec §13).
     pub fn delete_provider_rows(&self, provider: &ProviderId) -> Result<(), StoreError> {
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1705,12 +1717,23 @@ impl Store {
             "active_accounts",
             "live_identity_cache",
             "switch_journal",
+            "token_files",
+            "token_sessions",
+            "token_models",
+            "session_sightings",
+            "run_launches",
+            "active_history",
+            "token_state",
         ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE provider = ?1"),
                 [provider.as_str()],
             )?;
         }
+        tx.execute(
+            "DELETE FROM leases WHERE name = ?1",
+            [format!("prune:tokens:{provider}")],
+        )?;
         tx.commit()?;
         Ok(())
     }

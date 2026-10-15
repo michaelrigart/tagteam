@@ -52,7 +52,7 @@ const OVER_BUDGET: &str = "over-budget";
 
 /// §6.1's lease statement. The lease is held when it changes one row: it was free, or its
 /// holder's expiry (`?4`, now in ms) has passed.
-const TAKE_LEASE_SQL: &str = "INSERT INTO leases (name, holder, expires_at) VALUES (?1, ?2, ?3) \
+pub(super) const TAKE_LEASE_SQL: &str = "INSERT INTO leases (name, holder, expires_at) VALUES (?1, ?2, ?3) \
     ON CONFLICT(name) DO UPDATE SET holder = excluded.holder, expires_at = excluded.expires_at \
     WHERE leases.expires_at <= ?4";
 
