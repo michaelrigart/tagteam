@@ -73,6 +73,10 @@ pub struct UsageView {
     /// ahead and the status is one that is retried: not `ok`, and not `ReloginRequired`,
     /// `ApiKey` or `Unsupported`, which are never fetched.
     pub retry_at: Option<i64>,
+    /// The next planned poll (§8.6), whatever the status, while it is still ahead: the TUI's
+    /// detail pane shows it (TUI spec §5.2). A plan `reserve_usage` ignores as clock skew (§8.4)
+    /// is none.
+    pub next_poll_at: Option<i64>,
 }
 
 impl UsageView {
@@ -87,6 +91,7 @@ impl UsageView {
             age_s: None,
             error: unavailable.then(|| error.unwrap_or_else(|| NO_DATA.to_owned())),
             retry_at: None,
+            next_poll_at: None,
         }
     }
 }
@@ -358,6 +363,9 @@ impl Engine {
                         .filter(|&at| !plan_is_skewed(at, now_s, budget)),
                 )
                 .filter(|&at| retried && at > now_s),
+            next_poll_at: state
+                .next_poll_at
+                .filter(|&at| at > now_s && !plan_is_skewed(at, now_s, budget)),
         })
     }
 
