@@ -256,22 +256,6 @@ fn engine_record_check(pid: u32, liveness: Liveness, daemon: bool) -> Check {
     }
 }
 
-/// `daemon.lock`'s record, read again when a file there gave none. A daemon rewrites the record
-/// by truncating the file and then writing it (D4.1), and doctor takes no lock to wait for
-/// that, so one empty or half-written read proves nothing: it is read up to three times, 10 ms
-/// apart, and a record still not there stands. A file that is not there is read once.
-fn settled_daemon_record(path: &Path) -> Read<DaemonRecord> {
-    let mut read = read_daemon_record(path);
-    for _ in 0..2 {
-        if matches!(read, Read::Present(_)) || !path.exists() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        read = read_daemon_record(path);
-    }
-    read
-}
-
 /// `daemon.running` for `daemon.lock`'s record (D4.1): a live daemon of another version is told
 /// to restart (D10).
 fn daemon_record_check(r: &DaemonRecord, liveness: Liveness) -> Check {
@@ -1195,7 +1179,7 @@ impl Run<'_> {
     /// be told counts as running, as `is_live` counts it.
     fn daemon_running(&mut self) -> bool {
         let lock = daemon_lock_path(&self.engine.env);
-        let (check, live) = match settled_daemon_record(&lock) {
+        let (check, live) = match read_daemon_record(&lock) {
             Read::Absent => (
                 Check::info("daemon.running", "the daemon is not running"),
                 false,
@@ -1226,7 +1210,7 @@ impl Run<'_> {
     /// and start time (D10).
     fn held_by_daemon(&self, holder: &ProcessStamp) -> bool {
         matches!(
-            settled_daemon_record(&daemon_lock_path(&self.engine.env)),
+            read_daemon_record(&daemon_lock_path(&self.engine.env)),
             Read::Present(r) if r.pid == holder.pid && r.start == holder.start
         )
     }
