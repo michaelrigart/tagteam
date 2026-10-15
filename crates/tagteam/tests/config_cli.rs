@@ -132,6 +132,9 @@ fn config_list_shows_every_key_with_its_value_and_source_then_the_unknown_ones()
             "statusline.format                    default   {account} · 5h {5h}% · 7d {7d}%{stale}\n",
             "run.share_extra                      default   ''\n",
             "ui.color                             default   auto\n",
+            "daemon.autoswitch                    default   true\n",
+            "notify.enabled                       default   true\n",
+            "notify.events                        default   switch,quarantine,limit\n",
             "\n",
             "Unknown keys, ignored:\n",
             "  autoswitch.thresold\n",
@@ -145,6 +148,7 @@ fn config_list_json_is_the_specs_shape() {
     let path = write_config(d.path(), MIXED);
     let row = |key: &str, value: Value, default: Value, source: &str| json!({"key": key, "value": value, "default": default, "source": source});
     let format = json!("{account} · 5h {5h}% · 7d {7d}%{stale}");
+    let events = json!(["switch", "quarantine", "limit"]);
     assert_eq!(
         ok_json(d.path(), &["config", "list", "--json"]),
         json!({
@@ -166,6 +170,9 @@ fn config_list_json_is_the_specs_shape() {
                 row("statusline.format", format.clone(), format, "default"),
                 row("run.share_extra", json!([]), json!([]), "default"),
                 row("ui.color", json!("auto"), json!("auto"), "default"),
+                row("daemon.autoswitch", json!(true), json!(true), "default"),
+                row("notify.enabled", json!(true), json!(true), "default"),
+                row("notify.events", events.clone(), events, "default"),
             ],
             "unknown": ["autoswitch.thresold"],
         })
