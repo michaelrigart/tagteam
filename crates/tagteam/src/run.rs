@@ -22,7 +22,8 @@ use crate::signals;
 /// How often the wait loop looks at `claude` and at the cancel token (Decision 1).
 const POLL: Duration = Duration::from_millis(50);
 
-/// Token report spec §6.1: how often `run` reads its child's session record.
+/// Token report spec §6.1: how often `run` writes what its checks of the child's session record
+/// saw. It checks the record on every `POLL` tick.
 const RECORD_POLL: Duration = Duration::from_secs(2);
 
 /// `run`'s exit code when it lost track of `claude`'s status, which only a failing `waitpid`
@@ -99,8 +100,8 @@ pub(crate) fn run_session(
     // spawned, the terminal could not deliver to it.
     forward(pid, cancel.take(), true);
     let mut seen = LaunchPoll::default();
-    // Token report spec §6.1: the child's exit, stamped as soon as the wait returns, ends its
-    // sighting.
+    // Token report spec §6.1: the child's exit, stamped as soon as the wait returns, bounds its
+    // sighting: a check after it confirms nothing.
     let (status, exited_at_ms) = match &tracked {
         Some(launch) => wait_polling(engine, launch, &profile, pid, &mut seen, || {
             wait(&mut child, cancel)
@@ -171,13 +172,13 @@ fn plan_launch(engine: &Engine, launched: &Launched, err: &mut dyn Write) -> Opt
 }
 
 /// Token report spec §6.1, after exit handling: records the launch once more if it is still not
-/// recorded, ends the sighting the poll saw last at `exited_at_ms`, the child's exit, and closes
-/// the launch unless the profile is still in use, as by a background session the child left
-/// running.
+/// recorded, ends the child's tenures at their last confirming reads, never past `exited_at_ms`,
+/// the child's exit, and closes the launch unless the profile is still in use, as by a
+/// background session the child left running.
 ///
 /// A launch that still cannot be recorded is logged, and warned of on `err` (the child being
 /// gone) when `child_ran`: with no child there is no usage to misplace. The close that follows
-/// fails for the same reason and is not warned of again, and the sighting's end is written all
+/// fails for the same reason and is not warned of again, and the tenures' ends are written all
 /// the same. Any other failure to close is a warning, and the next `sight_sessions` closes the
 /// launch then.
 fn close_launch(
@@ -219,13 +220,14 @@ fn close_launch(
     }
 }
 
-/// Token report spec §6.1: runs `wait` on this thread while a scoped thread, every `RECORD_POLL`
-/// from its first tick until `wait` returns, records the launch if it is not yet, records the
-/// child's pid once it is, and reads the child's session record, whether or not the launch is
-/// recorded yet. Returns what `wait` returned and the child's exit, stamped by `beside` before
-/// the poller is joined. The store writes are the poller's, so a busy store never delays the
-/// wait, the signals it forwards or the stamp. The poller never touches the cancel token or the
-/// terminal: a failure is logged, once, and the next poll tries again.
+/// Token report spec §6.1: runs `wait` on this thread while a scoped thread, until `wait`
+/// returns, checks the child's session record on every `POLL` tick, and every `RECORD_POLL` from
+/// its first tick records the launch if it is not yet, records the child's pid once it is, and
+/// writes what the checks saw, whether or not the launch is recorded yet. Returns what `wait`
+/// returned and the child's exit, stamped by `beside` before the poller is joined. The store
+/// writes are the poller's, so a busy store never delays the wait, the signals it forwards or
+/// the stamp. The poller never touches the cancel token or the terminal: a failure is logged,
+/// once for each kind, and the next tick tries again.
 fn wait_polling<T>(
     engine: &Engine,
     launch: &TrackedLaunch,
@@ -239,8 +241,17 @@ fn wait_polling<T>(
         let mut pid_attached = false;
         let mut record_logged = false;
         let mut next = Instant::now();
-        let mut logged = false;
+        let (mut check_logged, mut write_logged) = (false, false);
         while !stop.load(Ordering::Relaxed) {
+            if let Err(e) = engine.observe_launch(id, profile, pid, seen) {
+                if !check_logged {
+                    tracing::warn!(
+                        kind = e.kind(),
+                        "could not read the session's record for the token report"
+                    );
+                    check_logged = true;
+                }
+            }
             if Instant::now() >= next {
                 if !launch.recorded.load(Ordering::Relaxed) {
                     match engine.record_launch(id) {
@@ -266,13 +277,13 @@ fn wait_polling<T>(
                         );
                     }
                 }
-                if let Err(e) = engine.poll_launch(id, profile, pid, seen) {
-                    if !logged {
+                if let Err(e) = engine.poll_launch(id, seen) {
+                    if !write_logged {
                         tracing::warn!(
                             kind = e.kind(),
-                            "could not read the session's record for the token report"
+                            "could not record the session for the token report"
                         );
-                        logged = true;
+                        write_logged = true;
                     }
                 }
                 next = Instant::now() + RECORD_POLL;

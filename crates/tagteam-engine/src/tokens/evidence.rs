@@ -16,7 +16,7 @@ use tagteam_provider::{
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
-use crate::store::{SightingRow, SightingSource};
+use crate::store::{SightingRow, SightingSource, Store};
 use crate::views::CACHE_WRITE_WAIT;
 
 /// A sighting is extended at most once a minute (spec §6.4), and the statusline does nothing
@@ -34,12 +34,25 @@ pub struct LaunchId {
     pub started_at_ms: i64,
 }
 
-/// The poller's own state, owned by `run` (spec §6.1): the child's record's last mtime, and the
-/// sighting it wrote last, as `(session id, first_at)`.
+/// One tenure of the child's session (spec §6.1): the reads of one execution's record (its
+/// `startedAt`) that named one session, from the first (`first_at`) to the last read or
+/// unchanged `stat` that confirmed it (`confirmed_at`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tenure {
+    pub session_id: String,
+    pub started_at: i64,
+    pub first_at: i64,
+    pub confirmed_at: i64,
+}
+
+/// The poller's own state, owned by `run` (spec §6.1): the record's mtime at the read that named
+/// the current tenure's session, that tenure, and the tenures that ended since the last write,
+/// oldest first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaunchPoll {
     pub last_mtime_ns: Option<i128>,
-    pub last_sighting: Option<(String, i64)>,
+    pub tenure: Option<Tenure>,
+    pub ended: Vec<Tenure>,
 }
 
 impl Engine {
@@ -200,13 +213,16 @@ impl Engine {
         )?)
     }
 
-    /// Spec §6.1's poll, every 2 seconds while the child runs: its record,
-    /// `<records dir>/<pid>.json`, is read again only when its mtime moved, and the sighting of
-    /// the session it names, keyed by its `startedAt`, is extended to now, only when the poll
-    /// sees it. The store writes at
-    /// most once a minute (spec §6.4). A record caught part-way through its write, or one that is
-    /// not this child's, is read again at the next poll.
-    pub fn poll_launch(
+    /// Spec §6.1's check, on every 50 ms tick while the child runs; it reads the filesystem only.
+    /// The child's record, `<records dir>/<pid>.json`, is `stat`ed. An mtime unchanged since the
+    /// read that named the current tenure's session confirms that tenure now: Claude Code
+    /// rewrites the record when its session changes (spec §7.4 A3). A moved mtime is read. This
+    /// child's own record naming the tenure's session in the same execution confirms it; naming
+    /// another, it ends the tenure at its last confirmation and starts the next one now. Any
+    /// other read, of a record caught part-way through its write, of one that is not this
+    /// child's, or of none, confirms nothing, and its mtime is not remembered, so the next tick
+    /// reads it again.
+    pub fn observe_launch(
         &self,
         id: &LaunchId,
         profile: &Path,
@@ -215,65 +231,90 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let p = self.provider(&id.provider)?;
         let record = p.session_records_dir(profile).join(format!("{pid}.json"));
-        // Whether this poll sees a session: the record read now, or unchanged since the read
-        // that saw it. One that does not read as this child's, or is gone, shows none, and the
-        // child may have left the session it saw last (`/clear`): that one is not extended.
-        let sees = match fs::metadata(&record) {
-            Ok(meta) => {
-                let mtime =
-                    i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
-                state.last_mtime_ns == Some(mtime) || {
-                    // Only this child's own execution: a record of its pid, started no earlier
-                    // than the launch, whose process still runs. One a crashed execution left
-                    // behind under a reused pid is skipped, and not remembered.
-                    let seen = fs::read(&record)
-                        .ok()
-                        .and_then(|bytes| parse_session_record(&bytes).ok())
-                        .filter(|r| {
-                            r.pid == pid
-                                && r.started_at_ms.is_some_and(|at| at >= id.started_at_ms)
-                                && record_is_live(self.process.as_ref(), r, p.launch_command())
-                        })
-                        .and_then(|r| r.session_id.zip(r.started_at_ms));
-                    if let Some(seen) = &seen {
-                        state.last_mtime_ns = Some(mtime);
-                        state.last_sighting = Some(seen.clone());
-                    }
-                    seen.is_some()
-                }
-            }
+        let mtime = match fs::metadata(&record) {
+            Ok(meta) => i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
             // Not written yet, or already removed at the child's exit.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        let (true, Some((session_id, first_at))) = (sees, &state.last_sighting) else {
+        if state.last_mtime_ns == Some(mtime) {
+            if let Some(t) = &mut state.tenure {
+                t.confirmed_at = self.now_ms();
+            }
+            return Ok(());
+        }
+        // Only this child's own execution: a record of its pid, started no earlier than the
+        // launch, whose process still runs. One a crashed execution left behind under a reused
+        // pid is skipped.
+        let named = fs::read(&record)
+            .ok()
+            .and_then(|bytes| parse_session_record(&bytes).ok())
+            .filter(|r| {
+                r.pid == pid
+                    && r.started_at_ms.is_some_and(|at| at >= id.started_at_ms)
+                    && record_is_live(self.process.as_ref(), r, p.launch_command())
+            })
+            .and_then(|r| r.session_id.zip(r.started_at_ms));
+        let Some((session_id, started_at)) = named else {
             return Ok(());
         };
         let now = self.now_ms();
-        let row = SightingRow {
-            session_id: session_id.clone(),
-            home: id.account.as_str().to_owned(),
-            started_at: *first_at,
-            first_at: *first_at,
-            last_at: now,
-            source: SightingSource::Run,
-            recorded_at: now,
-        };
-        self.store()?
-            .record_sighting(&id.provider, &row, SIGHTING_GAP_MS)?;
+        state.last_mtime_ns = Some(mtime);
+        match &mut state.tenure {
+            Some(t) if t.session_id == session_id && t.started_at == started_at => {
+                t.confirmed_at = now;
+            }
+            current => {
+                let next = Tenure {
+                    session_id,
+                    started_at,
+                    first_at: now,
+                    confirmed_at: now,
+                };
+                if let Some(ended) = current.replace(next) {
+                    state.ended.push(ended);
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Spec §6.1, at the child's exit: the sighting it saw last ends exactly at `exited_at_ms`,
-    /// when the child exited, moved back as well as forward, since a poll in flight as the child
-    /// exited may have stamped it later. The launch closes at the moment the profile is found
-    /// idle (`session_state_at`), read after that check, unless it is still in use. `run` calls
-    /// it after `finish_run`, once its own launch reservation is released, so the profile reads
-    /// idle when nothing else runs there. Only the launch may close late, which over-covers; the
-    /// sighting never outlasts the child, so exit handling that waits on locks cannot stretch it
-    /// over a resume elsewhere. A background session the child started, or another launcher's
-    /// reservation, keeps the launch open, and the next scan that finds the profile idle closes
-    /// it.
+    /// Spec §6.1's write, every 2 seconds while the child runs: the current tenure, to its last
+    /// confirmation, extended at most once a minute (spec §6.4); then each tenure that ended
+    /// since, newest first, exactly to its last confirmation. A tenure leaves the queue only once
+    /// every later one is stored, so a scan or a statusline that reads its session again finds
+    /// the execution seen naming another since, and starts a new tenure rather than bridging the
+    /// gap (spec §6.4). A write that fails leaves the rest queued for the next poll.
+    pub fn poll_launch(&self, id: &LaunchId, state: &mut LaunchPoll) -> Result<(), EngineError> {
+        if state.tenure.is_none() && state.ended.is_empty() {
+            return Ok(());
+        }
+        let store = self.store()?;
+        if let Some(t) = &state.tenure {
+            store.record_sighting(
+                &id.provider,
+                &self.tenure_row(id, t, t.confirmed_at),
+                SIGHTING_GAP_MS,
+            )?;
+        }
+        while let Some(t) = state.ended.last() {
+            self.end_tenure(&store, id, t, t.confirmed_at)?;
+            state.ended.pop();
+        }
+        Ok(())
+    }
+
+    /// Spec §6.1, at the child's exit: the child's tenures end at their last confirming reads,
+    /// the current one first, then those the poll had not stored, newest first; not at the exit,
+    /// since the child may have left its session after its last read. None ends past
+    /// `exited_at_ms`, when the child exited: a check after it, of a record a crash left behind,
+    /// confirms nothing. Each end is set back as well as forward, below a later stamp too, such
+    /// as a scan's read between the last check and the exit. The launch closes at the moment the
+    /// profile is found idle (`session_state_at`), read after that check, unless it is still in
+    /// use. `run` calls it after `finish_run`, once its own launch reservation is released, so
+    /// the profile reads idle when nothing else runs there. Only the launch may close late, which
+    /// over-covers. A background session the child started, or another launcher's reservation,
+    /// keeps the launch open, and the next scan that finds the profile idle closes it.
     pub fn close_launch(
         &self,
         id: &LaunchId,
@@ -283,20 +324,8 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let p = self.provider(&id.provider)?;
         let store = self.store()?;
-        if let Some((session_id, first_at)) = &state.last_sighting {
-            let now = self.now_ms();
-            store.set_sighting_last_at(
-                &id.provider,
-                &SightingRow {
-                    session_id: session_id.clone(),
-                    home: id.account.as_str().to_owned(),
-                    started_at: *first_at,
-                    first_at: *first_at,
-                    last_at: exited_at_ms,
-                    source: SightingSource::Run,
-                    recorded_at: now,
-                },
-            )?;
+        for t in state.tenure.iter().chain(state.ended.iter().rev()) {
+            self.end_tenure(&store, id, t, t.confirmed_at.min(exited_at_ms))?;
         }
         hooks::point(self, "close-launch-check")?;
         if !self.session_state_at(p.as_ref(), profile).owned() {
@@ -309,6 +338,34 @@ impl Engine {
                 now,
             )?;
         }
+        Ok(())
+    }
+
+    /// `run`'s sighting of the tenure `t` in its launch's profile, ending at `last_at`.
+    fn tenure_row(&self, id: &LaunchId, t: &Tenure, last_at: i64) -> SightingRow {
+        SightingRow {
+            session_id: t.session_id.clone(),
+            home: id.account.as_str().to_owned(),
+            started_at: t.started_at,
+            first_at: t.first_at,
+            last_at,
+            source: SightingSource::Run,
+            recorded_at: self.now_ms(),
+        }
+    }
+
+    /// Ends `run`'s tenure `t` exactly at `last_at` (spec §6.1): stored first, when no write has
+    /// stored it yet, then its end set, back as well as forward.
+    fn end_tenure(
+        &self,
+        store: &Store,
+        id: &LaunchId,
+        t: &Tenure,
+        last_at: i64,
+    ) -> Result<(), EngineError> {
+        let row = self.tenure_row(id, t, last_at);
+        store.record_sighting(&id.provider, &row, SIGHTING_GAP_MS)?;
+        store.set_sighting_last_at(&id.provider, &row)?;
         Ok(())
     }
 
