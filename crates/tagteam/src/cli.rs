@@ -674,11 +674,55 @@ impl CompletionShell {
         let mut cmd = Cli::command();
         let mut script = Vec::new();
         generate(shell, &mut cmd, "tagteam", &mut script);
+        let mut script = without_hidden_flags(script, &cmd);
         if let CompletionShell::Fish = self {
             fish_positionals(&cmd, &mut script);
         }
         script
     }
+}
+
+/// `script` without the global flags `cmd` hides (`--expect-account`). clap keeps a hidden flag
+/// out of `--help`, but clap_complete's bash, zsh and fish writers still list it, so this
+/// removes, line by line, what each writes for it:
+/// - bash: the flag's word in each `opts=` list, and its `case "${prev}"` arm;
+/// - zsh: its `'--flag=…' \` line in each `_arguments` call;
+/// - fish: its `complete … -l flag …` lines, and its word in the global option spec.
+fn without_hidden_flags(script: Vec<u8>, cmd: &clap::Command) -> Vec<u8> {
+    let hidden: Vec<&str> = cmd
+        .get_arguments()
+        .filter(|a| a.is_hide_set() && a.is_global_set())
+        .filter_map(|a| a.get_long())
+        .collect();
+    let text = String::from_utf8(script).expect("clap_complete writes UTF-8");
+    let mut out = String::with_capacity(text.len());
+    let mut in_arm = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if in_arm {
+            in_arm = trimmed != ";;";
+            continue;
+        }
+        let mut line = line.to_owned();
+        let mut drop = false;
+        for flag in &hidden {
+            let words: Vec<&str> = trimmed.split_whitespace().collect();
+            if trimmed == format!("--{flag})") {
+                in_arm = true;
+                drop = true;
+            }
+            drop |= trimmed.starts_with(&format!("'--{flag}"));
+            drop |= trimmed.starts_with("complete ") && words.windows(2).any(|w| w == ["-l", flag]);
+            line = line
+                .replace(&format!(" --{flag}"), "")
+                .replace(&format!(" {flag}="), "");
+        }
+        if !drop {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out.into_bytes()
 }
 
 /// clap_complete's fish script completes options and subcommands, but no positional argument's
@@ -769,7 +813,7 @@ complete -c tagteam -n "__fish_tagteam_after_{name}" -f -a "{}"
 fn options_taking_values(cmd: &clap::Command, valued: &mut BTreeSet<String>) {
     for arg in cmd
         .get_arguments()
-        .filter(|a| !a.is_positional() && a.get_action().takes_values())
+        .filter(|a| !a.is_positional() && !a.is_hide_set() && a.get_action().takes_values())
     {
         let shorts = arg.get_short_and_visible_aliases().unwrap_or_default();
         let longs = arg.get_long_and_visible_aliases().unwrap_or_default();
