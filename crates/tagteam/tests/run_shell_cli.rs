@@ -29,6 +29,8 @@ const COMMANDS: &[&[&str]] = &[
     &["alias", "1", "work"],
     &["move", "1", "2"],
     &["history"],
+    &["tokens"],
+    &["tokens", "month", "1", "--no-refresh"],
     &["auto", "--once"],
     &["auto", "--once", "--dry-run"],
     &["map"],
