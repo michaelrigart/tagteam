@@ -135,6 +135,12 @@ pub enum UnitError {
     Unrepresentable(String),
     #[error("{0} is not valid UTF-8")]
     NotUtf8(String),
+    /// D9.3: systemd takes the unexpanded first word of `ExecStart=` as the executable, then
+    /// expands `$` in argv, argv[0] included, so no spelling of `$` there names the same file.
+    #[error(
+        "{0} holds a `$`, which systemd's ExecStart cannot carry; install tagteam at a path without one, or use --print and edit the unit by hand"
+    )]
+    DollarInProgram(String),
 }
 
 /// D9.1: the variables of `RECORDED_VARS` that `var` finds set, in that order, each with its
@@ -244,9 +250,10 @@ pub fn render_launchd(program: &Path, env: &[(String, String)]) -> Result<String
 /// D9.3's quoting, double quotes around:
 /// - `Environment=` (systemd.exec(5)): `\` and `"` are escaped, and `%` is written `%%`, since
 ///   specifiers expand there. `$` stays, since `Environment=` expands no variables.
-/// - `ExecStart=` (systemd.service(5), with `exec`): the same, and `$` is written `$$`, since a
-///   command line also expands variables.
-fn quoted(text: &str, exec: bool) -> String {
+/// - `ExecStart=` (systemd.service(5)): the same. `$` is not written at all:
+///   `render_systemd` refuses a program path holding one, since no spelling of it names the
+///   file systemd would start.
+fn quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for c in text.chars() {
@@ -254,7 +261,6 @@ fn quoted(text: &str, exec: bool) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '%' => out.push_str("%%"),
-            '$' if exec => out.push_str("$$"),
             c => out.push(c),
         }
     }
@@ -264,7 +270,7 @@ fn quoted(text: &str, exec: bool) -> String {
 
 /// The inverse of `quoted`; `None` for text it never writes. `parse_unit` checks the result by
 /// rendering it again.
-fn unquote(text: &str, exec: bool) -> Option<String> {
+fn unquote(text: &str) -> Option<String> {
     let inner = text.strip_prefix('"')?.strip_suffix('"')?;
     let mut out = String::with_capacity(inner.len());
     let mut chars = inner.chars();
@@ -277,12 +283,6 @@ fn unquote(text: &str, exec: bool) -> Option<String> {
                 }
                 out.push('%');
             }
-            '$' if exec => {
-                if chars.next()? != '$' {
-                    return None;
-                }
-                out.push('$');
-            }
             c => out.push(c),
         }
     }
@@ -291,18 +291,22 @@ fn unquote(text: &str, exec: bool) -> Option<String> {
 
 /// D9.3: the user unit, with one `Environment=` line per recorded variable, in order. Its
 /// standard error follows its standard output (systemd's default `StandardError=inherit`),
-/// so both are discarded and the log file is the record (D11).
+/// so both are discarded and the log file is the record (D11). A program path holding `$` is
+/// refused (`UnitError::DollarInProgram`).
 pub fn render_systemd(program: &Path, env: &[(String, String)]) -> Result<String, UnitError> {
     let program = program_text(program)?;
+    if program.contains('$') {
+        return Err(UnitError::DollarInProgram(PROGRAM_PATH.to_owned()));
+    }
     let mut s = String::from("[Unit]\nDescription=tagteam daemon\n\n[Service]\nType=simple\n");
-    s.push_str(&format!("ExecStart={} daemon\n", quoted(program, true)));
+    s.push_str(&format!("ExecStart={} daemon\n", quoted(program)));
     s.push_str("Restart=on-failure\nRestartSec=10\nStandardOutput=null\n");
     for (name, value) in env {
         carried(name, name)?;
         carried(name, value)?;
         s.push_str(&format!(
             "Environment={}\n",
-            quoted(&format!("{name}={value}"), false)
+            quoted(&format!("{name}={value}"))
         ));
     }
     s.push_str("\n[Install]\nWantedBy=default.target\n");
@@ -381,9 +385,9 @@ fn read_systemd(text: &str) -> Option<UnitContents> {
     let mut env = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("ExecStart=") {
-            program = Some(unquote(rest.strip_suffix(" daemon")?, true)?);
+            program = Some(unquote(rest.strip_suffix(" daemon")?)?);
         } else if let Some(rest) = line.strip_prefix("Environment=") {
-            let assignment = unquote(rest, false)?;
+            let assignment = unquote(rest)?;
             let (name, value) = assignment.split_once('=')?;
             env.push((name.to_owned(), value.to_owned()));
         }
@@ -854,10 +858,11 @@ mod tests {
         // D9.3, D14: a proxy URL can hold any of them, and must reach the daemon unchanged.
         let proxy = r#"http://us$er:p%40ss"w\rd@proxy.example:8080"#;
         let env = vec![("HTTPS_PROXY".to_owned(), proxy.to_owned())];
-        let program = Path::new(r#"/opt/te$t 100%/"q"\tagteam"#);
+        // systemd cannot carry a `$` in ExecStart's program, so its path has none.
+        let program = Path::new(r#"/opt/test 100%/"q"\tagteam"#);
         let unit = render_systemd(program, &env).unwrap();
         assert!(
-            unit.contains(r#"ExecStart="/opt/te$$t 100%%/\"q\"\\tagteam" daemon"#),
+            unit.contains(r#"ExecStart="/opt/test 100%%/\"q\"\\tagteam" daemon"#),
             "{unit}"
         );
         assert!(
@@ -866,7 +871,9 @@ mod tests {
             ),
             "{unit}"
         );
-        let plist = render_launchd(program, &env).unwrap();
+        // A plist carries `$` literally, in the program and in a value.
+        let dollar_program = Path::new(r#"/opt/te$t 100%/"q"\tagteam"#);
+        let plist = render_launchd(dollar_program, &env).unwrap();
         assert!(
             plist.contains("<string>/opt/te$t 100%/&quot;q&quot;\\tagteam</string>"),
             "{plist}"
@@ -874,6 +881,10 @@ mod tests {
         assert!(
             plist.contains("<string>http://us$er:p%40ss&quot;w\\rd@proxy.example:8080</string>"),
             "{plist}"
+        );
+        assert_eq!(
+            parse_unit(ServiceKind::Launchd, &plist),
+            contents(dollar_program, &env)
         );
         for kind in KINDS {
             let text = render_unit(kind, program, &env).unwrap();
@@ -887,6 +898,32 @@ mod tests {
             "{plist}"
         );
         assert_eq!(parse_unit(ServiceKind::Launchd, &plist), contents(odd, &[]));
+    }
+
+    #[test]
+    fn a_systemd_program_path_holding_a_dollar_is_refused_without_showing_it() {
+        // systemd takes ExecStart's first word, unexpanded, as the executable, then expands `$`
+        // in argv: `$$` would name a file that is not there, a bare `$` would make argv[0]
+        // differ from the path the daemon's upgrade watch stats.
+        let program = Path::new("/opt/te$t-secret/tagteam");
+        let e = render_systemd(program, &[]).unwrap_err();
+        assert_eq!(e, UnitError::DollarInProgram("the program path".into()));
+        let text = e.to_string();
+        assert!(text.contains("the program path"), "{text}");
+        assert!(text.contains("ExecStart"), "{text}");
+        assert!(text.contains("--print"), "{text}");
+        assert!(!text.contains("te$t") && !text.contains("secret"), "{text}");
+        assert_eq!(
+            render_unit(ServiceKind::Systemd, program, &[]).unwrap_err(),
+            e
+        );
+        // Only the program path: a `$` in a value stays literal in `Environment=`.
+        let env = vec![("HTTPS_PROXY".to_owned(), "http://us$er:pw@p".to_owned())];
+        let unit = render_systemd(Path::new(BIN), &env).unwrap();
+        assert!(
+            unit.contains("Environment=\"HTTPS_PROXY=http://us$er:pw@p\"\n"),
+            "{unit}"
+        );
     }
 
     #[test]
