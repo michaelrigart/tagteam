@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
 use serde_json::json;
 use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::Strategy;
+use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_engine::settings::{
     self, COOLDOWN_SECONDS_RANGE, ColorMode, HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE,
     Inspection, KEYS, Key, KeyKind, KeyState, STATUSLINE_PLACEHOLDERS, Settings, SettingsError,
@@ -44,12 +46,14 @@ fn the_defaults_are_the_specs_table() {
     assert_eq!(d.unhealthy_ticks, 3);
     assert_eq!(d.models, Vec::<String>::new());
     assert_eq!(d.history_retention_days, 180);
+    assert_eq!(d.tokens_retention_days, 365);
     assert_eq!(
         d.statusline_format,
         "{account} · 5h {5h}% · 7d {7d}%{stale}"
     );
     assert_eq!(d.color, ColorMode::Auto);
     assert!(d.share_extra.is_empty());
+    assert!(d.prices.is_empty());
 }
 
 #[test]
@@ -91,6 +95,9 @@ models = ["Fable", "Opus"]
 [usage]
 history_retention_days = 30
 
+[tokens]
+retention_days = 90
+
 [statusline]
 format = "{5h}%"
 
@@ -99,6 +106,9 @@ color = "never"
 
 [run]
 share_extra = ["hook-data"]
+
+[provider.claude-code.prices."claude-opus-5-5"]
+input = 4.0
 "#,
     );
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -115,9 +125,23 @@ share_extra = ["hook-data"]
             unhealthy_ticks: 5,
             models: models(&["Fable", "Opus"]),
             history_retention_days: 30,
+            tokens_retention_days: 90,
             statusline_format: "{5h}%".to_owned(),
             color: ColorMode::Never,
             share_extra: vec!["hook-data".into()],
+            prices: BTreeMap::from([(
+                ProviderId::new("claude-code"),
+                BTreeMap::from([(
+                    "claude-opus-5-5".to_owned(),
+                    PriceOverride {
+                        base: CardOverride {
+                            input: Some(4.0),
+                            ..CardOverride::default()
+                        },
+                        ..PriceOverride::default()
+                    }
+                )])
+            )]),
         }
     );
 }
@@ -1036,6 +1060,11 @@ fn the_registry_is_section_six_four_s_table_in_order() {
                 KeyKind::Int { min: 1, max: 3650 },
                 false
             ),
+            (
+                "tokens.retention_days",
+                KeyKind::Int { min: 30, max: 3650 },
+                false
+            ),
             ("statusline.format", KeyKind::Format, true),
             ("run.share_extra", KeyKind::ShareNames, true),
             (
@@ -1086,6 +1115,7 @@ fn every_key_reads_back_its_default_from_the_settings() {
             ("autoswitch.unhealthy_ticks", Value::Int(3)),
             ("autoswitch.models", list(&[])),
             ("usage.history_retention_days", Value::Int(180)),
+            ("tokens.retention_days", Value::Int(365)),
             (
                 "statusline.format",
                 Value::Str("{account} · 5h {5h}% · 7d {7d}%{stale}".into())
@@ -1138,6 +1168,10 @@ fn each_key_says_what_a_valid_value_is() {
     assert_eq!(
         expect("usage.history_retention_days"),
         "must be a whole number of days from 1 to 3650"
+    );
+    assert_eq!(
+        expect("tokens.retention_days"),
+        "must be a whole number of days from 30 to 3650"
     );
     assert!(
         expect("statusline.format")
@@ -1209,8 +1243,8 @@ fn every_numeric_key_reads_its_bounds_and_defaults_just_outside_them() {
         }
     }
     assert_eq!(
-        numeric, 6,
-        "threshold, three seconds and ticks, hysteresis, retention"
+        numeric, 7,
+        "threshold, three seconds and ticks, hysteresis, two retentions"
     );
 }
 
@@ -1705,7 +1739,7 @@ fn every_refusal_says_what_the_value_must_be() {
 }
 
 /// One command-line sample per registry key, in the registry's order.
-const SAMPLES: [(&str, &str); 13] = [
+const SAMPLES: [(&str, &str); 14] = [
     ("default_provider", "fake-agent"),
     ("autoswitch.threshold", "75.5"),
     ("autoswitch.interval_seconds", "120"),
@@ -1716,6 +1750,7 @@ const SAMPLES: [(&str, &str); 13] = [
     ("autoswitch.unhealthy_ticks", "100"),
     ("autoswitch.models", "Fable, Opus"),
     ("usage.history_retention_days", "3650"),
+    ("tokens.retention_days", "30"),
     ("statusline.format", "{account} {5h}%"),
     ("run.share_extra", ""),
     ("ui.color", "always"),
@@ -1934,4 +1969,278 @@ fn a_settings_error_tells_the_user_what_to_do() {
         .to_string(),
         "`autoswitch.threshold` must be a number from 50 to 99.9"
     );
+}
+
+// ---- Token report Task 13: retention and price overrides (token report spec §4, §8.2) ----
+
+#[test]
+fn retention_days_reads_and_clamps_like_every_key() {
+    // Spec §4 Retention: `tokens.retention_days`, 30 to 3650, 365 by default, the same for
+    // every provider.
+    for days in [30u32, 365, 3650] {
+        let (s, warnings) = load(&format!("[tokens]\nretention_days = {days}\n"));
+        assert_eq!(s.tokens_retention_days, days);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+    for text in ["29", "3651", "0", "-5", "1.5", "\"90\"", "true"] {
+        let (s, warnings) = load(&format!("[tokens]\nretention_days = {text}\n"));
+        assert_eq!(s.tokens_retention_days, 365, "{text}");
+        assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+        assert!(
+            warnings[0].ends_with(
+                ": `tokens.retention_days` must be a whole number of days from 30 to 3650 (ignored)"
+            ),
+            "{warnings:?}"
+        );
+    }
+    let i = inspect_as(
+        "[provider.claude-code.tokens]\nretention_days = 40\n",
+        PROVIDER,
+    );
+    let s = state(&i, "tokens.retention_days");
+    assert_eq!(
+        (&s.value, s.source),
+        (&Value::Int(365), Source::Default),
+        "no provider table holds it"
+    );
+    assert_eq!(i.unknown, ["provider.claude-code.tokens.retention_days"]);
+    let key = reg("tokens.retention_days");
+    assert_eq!(key.parse_arg("90"), Ok(Value::Int(90)));
+    assert_eq!(
+        key.parse_arg("29"),
+        Err("must be a whole number of days from 30 to 3650".to_owned()),
+        "a typed value is never clamped"
+    );
+}
+
+/// A card with the given fields, the rest unset.
+fn card(
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_write_5m: Option<f64>,
+    cache_write_1h: Option<f64>,
+    cache_read: Option<f64>,
+) -> CardOverride {
+    CardOverride {
+        input,
+        output,
+        cache_write_5m,
+        cache_write_1h,
+        cache_read,
+    }
+}
+
+/// `base` alone.
+fn base(base: CardOverride) -> PriceOverride {
+    PriceOverride {
+        base,
+        ..PriceOverride::default()
+    }
+}
+
+/// A price table for each provider, in each TOML spelling: a table header, a dotted key and an
+/// inline table.
+const PRICES: &str = r#"
+[provider.claude-code.prices."claude-opus-5-5"]
+input = 4
+output = 20.0
+cache_write_5m = 5.0
+cache_write_1h = 8.0
+cache_read = 0.2
+web_search_per_1k = 10
+long_prompt_above = 200000
+
+[provider.claude-code.prices."claude-opus-5-5".long_prompt]
+input = 8.0
+output = 30.0
+cache_write_5m = 10.0
+cache_write_1h = 16.0
+cache_read = 0.4
+
+[provider.claude-code.prices."claude-opus-5-5".fast]
+input = 8.0
+cache_read = 0.4
+
+[provider.claude-code.prices]
+"claude-sonnet-5".output = 12.5
+"claude-new-1" = { input = 1, output = 2, cache_write_5m = 3, cache_write_1h = 4, cache_read = 0.5 }
+
+[provider.fake-agent.prices."fake-1"]
+input = 9.0
+"#;
+
+#[test]
+fn price_overrides_read_every_field() {
+    // Spec §8.2: any field of the base card and `web_search_per_1k`, `long_prompt_above`, and
+    // the `long_prompt` and `fast` cards; a whole number reads as a price.
+    let (s, warnings) = load(PRICES);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let s = &s.prices[&ProviderId::new(PROVIDER)];
+    let opus = PriceOverride {
+        base: card(Some(4.0), Some(20.0), Some(5.0), Some(8.0), Some(0.2)),
+        long_prompt_above: Some(200_000),
+        long_prompt: card(Some(8.0), Some(30.0), Some(10.0), Some(16.0), Some(0.4)),
+        fast: card(Some(8.0), None, None, None, Some(0.4)),
+        web_search_per_1k: Some(10.0),
+    };
+    assert_eq!(
+        *s,
+        BTreeMap::from([
+            (
+                "claude-new-1".to_owned(),
+                base(card(Some(1.0), Some(2.0), Some(3.0), Some(4.0), Some(0.5)))
+            ),
+            ("claude-opus-5-5".to_owned(), opus),
+            (
+                "claude-sonnet-5".to_owned(),
+                base(card(None, Some(12.5), None, None, None))
+            ),
+        ])
+    );
+}
+
+#[test]
+fn every_provider_s_price_tables_load_whoever_reads_them() {
+    // A report for one provider through an engine loaded for another prices it by its own
+    // tables: every provider's are read, whichever provider the file is loaded for.
+    let fake_1 = BTreeMap::from([(
+        "fake-1".to_owned(),
+        base(card(Some(9.0), None, None, None, None)),
+    )]);
+    for reader in [PROVIDER, "fake-agent", "another"] {
+        let (s, warnings) = load_as(PRICES, reader);
+        assert!(warnings.is_empty(), "{reader}: {warnings:?}");
+        assert_eq!(
+            s.prices.keys().map(ProviderId::as_str).collect::<Vec<_>>(),
+            ["claude-code", "fake-agent"],
+            "{reader}"
+        );
+        assert_eq!(
+            s.prices[&ProviderId::new("claude-code")].len(),
+            3,
+            "{reader}"
+        );
+        assert_eq!(s.prices[&ProviderId::new("fake-agent")], fake_1, "{reader}");
+    }
+}
+
+#[test]
+fn an_invalid_price_value_warns_and_is_dropped() {
+    // Spec §8.2: read forgivingly. An invalid value keeps the shipped one, with a warning, and
+    // the rest of the table stands.
+    let (s, warnings) = load(
+        r#"
+[provider.claude-code.prices."claude-opus-5-5"]
+input = -1.0
+output = "20"
+cache_write_5m = nan
+cache_write_1h = inf
+cache_read = 0.25
+web_search_per_1k = true
+long_prompt_above = 0
+long_prompt = 3
+
+[provider.claude-code.prices."claude-opus-5-5".fast]
+output = [40]
+input = 8
+
+[provider.claude-code.prices]
+"claude-sonnet-5" = 2.0
+"claude-haiku-5-5" = { long_prompt_above = 1.5 }
+"#,
+    );
+    assert_eq!(
+        s.prices,
+        BTreeMap::from([(
+            ProviderId::new(PROVIDER),
+            BTreeMap::from([(
+                "claude-opus-5-5".to_owned(),
+                PriceOverride {
+                    base: card(None, None, None, None, Some(0.25)),
+                    fast: card(Some(8.0), None, None, None, None),
+                    ..PriceOverride::default()
+                }
+            )])
+        )]),
+        "valid fields stand; a model with none is left out"
+    );
+    let dollars = "must be a number of US dollars, 0 or more (ignored)";
+    let tokens = "must be a whole number of tokens, 1 or more (ignored)";
+    let table = "must be a table (ignored)";
+    let opus = "provider.claude-code.prices.claude-opus-5-5";
+    let prices = "provider.claude-code.prices";
+    let mut want = vec![
+        format!("`{opus}.input` {dollars}"),
+        format!("`{opus}.output` {dollars}"),
+        format!("`{opus}.cache_write_5m` {dollars}"),
+        format!("`{opus}.cache_write_1h` {dollars}"),
+        format!("`{opus}.web_search_per_1k` {dollars}"),
+        format!("`{opus}.long_prompt_above` {tokens}"),
+        format!("`{opus}.long_prompt` {table}"),
+        format!("`{opus}.fast.output` {dollars}"),
+        format!("`{prices}.claude-sonnet-5` {table}"),
+        format!("`{prices}.claude-haiku-5-5.long_prompt_above` {tokens}"),
+    ];
+    let mut got: Vec<String> = warnings
+        .iter()
+        .map(|w| {
+            let (file, rest) = w.split_once(": ").expect("a warning names the file first");
+            assert!(file.ends_with("config.toml"), "{w}");
+            rest.to_owned()
+        })
+        .collect();
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
+
+    let (s, warnings) = load("[provider.claude-code]\nprices = 3\n");
+    assert!(s.prices.is_empty());
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].ends_with(": `provider.claude-code.prices` must be a table (ignored)"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn price_tables_are_not_unknown_keys() {
+    // Spec §8.2: the price tables are no registry keys, yet known: `config list` names only
+    // what no price table holds.
+    let i = inspect_as(
+        r#"
+[provider.claude-code.prices."claude-opus-5-5"]
+input = 4.0
+web_search_per_1k = 10.0
+long_prompt_above = 200000
+inptu = 4.0
+
+[provider.claude-code.prices."claude-opus-5-5".long_prompt]
+output = 30.0
+web_search_per_1k = 10.0
+
+[provider.claude-code.prices."claude-opus-5-5".fast]
+cache_read = 0.4
+
+[provider.claude-code.prices."claude-opus-5-5".turbo]
+input = 1.0
+
+[provider.fake-agent.prices.fake-1]
+output = 2.0
+
+[prices.claude-opus-5-5]
+input = 4.0
+"#,
+        PROVIDER,
+    );
+    assert_eq!(
+        i.unknown,
+        [
+            "prices.claude-opus-5-5.input",
+            "provider.claude-code.prices.claude-opus-5-5.inptu",
+            "provider.claude-code.prices.claude-opus-5-5.long_prompt.web_search_per_1k",
+            "provider.claude-code.prices.claude-opus-5-5.turbo.input",
+        ]
+    );
+    assert!(i.warnings.is_empty(), "{:?}", i.warnings);
+    assert_eq!(i.keys.len(), KEYS.len(), "a price table is no registry key");
 }

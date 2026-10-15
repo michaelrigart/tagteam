@@ -7,12 +7,14 @@
 //! the default, the last two with a warning for the caller to print. Every warning names the
 //! full path of the settings file.
 
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use tagteam_core::autoswitch::Strategy;
+use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_core::{CLAUDE_CODE, ProviderId};
 use tagteam_provider::{Env, LockError};
 use toml_edit::{DocumentMut, Item, TableLike};
@@ -23,6 +25,7 @@ pub const DEFAULT_COOLDOWN_SECONDS: i64 = 300;
 pub const DEFAULT_HYSTERESIS_PCT: f64 = 10.0;
 pub const DEFAULT_UNHEALTHY_TICKS: u32 = 3;
 pub const DEFAULT_HISTORY_RETENTION_DAYS: u32 = 180;
+pub const DEFAULT_TOKENS_RETENTION_DAYS: u32 = 365;
 pub const DEFAULT_STATUSLINE_FORMAT: &str = "{account} · 5h {5h}% · 7d {7d}%{stale}";
 
 /// §6.4's valid ranges. A value in the file outside its range falls back to the default, with a
@@ -45,6 +48,22 @@ pub const STATUSLINE_MODEL_PREFIX: &str = "model:";
 
 /// Entry names tagteam keeps for itself in a profile (§12.2): `run.share_extra` never names one.
 const OWN_PREFIX: &str = ".tagteam-";
+
+/// The fields of a rate card in a price table (token report spec §8.2), each USD per million
+/// tokens: a model's own, and those of its `long_prompt` and `fast` tables.
+const CARD_FIELDS: [&str; 5] = [
+    "input",
+    "output",
+    "cache_write_5m",
+    "cache_write_1h",
+    "cache_read",
+];
+
+/// The tables of rate cards a price table may hold beside its own card.
+const CARD_TABLES: [&str; 2] = ["long_prompt", "fast"];
+
+/// A price table's fields that are not on a card.
+const PRICE_FIELDS: [&str; 2] = ["web_search_per_1k", "long_prompt_above"];
 
 /// Whether `name`, the text between a placeholder's braces, is one of §13.5's placeholders:
 /// one of [`STATUSLINE_PLACEHOLDERS`], or `model:` followed by a model name. A model name is
@@ -196,6 +215,11 @@ pub const KEYS: &[Key] = &[
     Key {
         name: "usage.history_retention_days",
         kind: KeyKind::Int { min: 1, max: 3650 },
+        per_provider: false,
+    },
+    Key {
+        name: "tokens.retention_days",
+        kind: KeyKind::Int { min: 30, max: 3650 },
         per_provider: false,
     },
     Key {
@@ -683,6 +707,8 @@ pub struct Settings {
     pub models: Vec<String>,
     /// `usage.history_retention_days`: 1–3650.
     pub history_retention_days: u32,
+    /// `tokens.retention_days`: 30–3650 (token report spec §4 Retention).
+    pub tokens_retention_days: u32,
     /// `statusline.format`. The provider's own table first.
     pub statusline_format: String,
     /// `ui.color`.
@@ -692,6 +718,11 @@ pub struct Settings {
     /// an entry name (`is_share_name`) is dropped here with a warning; the link sync drops a
     /// known-private one, also with a warning.
     pub share_extra: Vec<String>,
+    /// `[provider.<id>.prices."<model>"]` (token report spec §8.2): every provider's price
+    /// overrides, by provider then model, whichever provider the file was loaded for; each
+    /// field as read, one that is not valid dropped with a warning. Not a registry key:
+    /// `config` neither lists nor writes it.
+    pub prices: BTreeMap<ProviderId, BTreeMap<String, PriceOverride>>,
 }
 
 impl Default for Settings {
@@ -707,9 +738,11 @@ impl Default for Settings {
             unhealthy_ticks: DEFAULT_UNHEALTHY_TICKS,
             models: Vec::new(),
             history_retention_days: DEFAULT_HISTORY_RETENTION_DAYS,
+            tokens_retention_days: DEFAULT_TOKENS_RETENTION_DAYS,
             statusline_format: DEFAULT_STATUSLINE_FORMAT.to_owned(),
             color: ColorMode::Auto,
             share_extra: Vec::new(),
+            prices: BTreeMap::new(),
         }
     }
 }
@@ -747,6 +780,7 @@ impl Settings {
             "autoswitch.unhealthy_ticks" => Value::Int(self.unhealthy_ticks.into()),
             "autoswitch.models" => Value::List(self.models.clone()),
             "usage.history_retention_days" => Value::Int(self.history_retention_days.into()),
+            "tokens.retention_days" => Value::Int(self.tokens_retention_days.into()),
             "statusline.format" => Value::Str(self.statusline_format.clone()),
             "run.share_extra" => Value::List(self.share_extra.clone()),
             "ui.color" => Value::Str(self.color.as_str().to_owned()),
@@ -774,6 +808,7 @@ impl Settings {
             ("usage.history_retention_days", Value::Int(n)) => {
                 self.history_retention_days = whole(n)
             }
+            ("tokens.retention_days", Value::Int(n)) => self.tokens_retention_days = whole(n),
             ("statusline.format", Value::Str(s)) => self.statusline_format = s,
             ("run.share_extra", Value::List(names)) => self.share_extra = names,
             ("ui.color", Value::Str(s)) => {
@@ -788,9 +823,9 @@ impl Settings {
     }
 }
 
-/// An `Int` key's value as a `u32` field holds it: the ranges of `autoswitch.unhealthy_ticks`
-/// and `usage.history_retention_days` lie within `u32`. The two seconds keys are `i64`, as
-/// M3b's `AutoConfig` takes them.
+/// An `Int` key's value as a `u32` field holds it: the ranges of `autoswitch.unhealthy_ticks`,
+/// `usage.history_retention_days` and `tokens.retention_days` lie within `u32`. The two seconds
+/// keys are `i64`, as M3b's `AutoConfig` takes them.
 fn whole(n: i64) -> u32 {
     u32::try_from(n).expect("a u32 field's Int range lies within u32")
 }
@@ -872,6 +907,7 @@ fn read_file(env: &Env, provider: &ProviderId) -> FileRead {
             *source = from;
         }
     }
+    read.settings.prices = reader.read_prices();
     read.warnings = reader.warnings;
     unknown_keys(doc.as_table(), &mut Vec::new(), &mut read.unknown);
     read.unknown.sort();
@@ -955,6 +991,135 @@ impl<'a> Reader<'a> {
         }
         None
     }
+
+    /// Every `[provider.<id>.prices]` table (token report spec §8.2), by provider: one table
+    /// per model. A field that is not valid, or a table that is not one, warns and is dropped;
+    /// the rest stand. A model whose table holds no valid field is left out, and so is a
+    /// provider with no model left.
+    fn read_prices(&mut self) -> BTreeMap<ProviderId, BTreeMap<String, PriceOverride>> {
+        let doc: &'a DocumentMut = self.doc;
+        let mut all = BTreeMap::new();
+        let Some(providers) = doc.get("provider").and_then(Item::as_table_like) else {
+            return all;
+        };
+        for (id, item) in providers.iter() {
+            let Some(item) = item.as_table_like().and_then(|t| t.get("prices")) else {
+                continue;
+            };
+            let Some(models) = item.as_table_like() else {
+                self.warn(format!(
+                    "{}: `provider.{id}.prices` must be a table (ignored)",
+                    self.path
+                ));
+                continue;
+            };
+            let prices = self.read_provider_prices(id, models);
+            if !prices.is_empty() {
+                all.insert(ProviderId::new(id), prices);
+            }
+        }
+        all
+    }
+
+    /// One provider's price tables, `models`, which sits at `provider.<id>.prices`.
+    fn read_provider_prices(
+        &mut self,
+        provider: &str,
+        models: &dyn TableLike,
+    ) -> BTreeMap<String, PriceOverride> {
+        let mut prices = BTreeMap::new();
+        for (model, item) in models.iter() {
+            let dotted = format!("provider.{provider}.prices.{model}");
+            let Some(table) = item.as_table_like() else {
+                self.warn(format!(
+                    "{}: `{dotted}` must be a table (ignored)",
+                    self.path
+                ));
+                continue;
+            };
+            let mut price = PriceOverride {
+                base: self.read_card(table, &dotted),
+                web_search_per_1k: self.read_field(table, &dotted, "web_search_per_1k", rate),
+                long_prompt_above: self.read_field(
+                    table,
+                    &dotted,
+                    "long_prompt_above",
+                    token_count,
+                ),
+                ..PriceOverride::default()
+            };
+            for name in CARD_TABLES {
+                let Some(item) = table.get(name) else {
+                    continue;
+                };
+                let at = format!("{dotted}.{name}");
+                let Some(inner) = item.as_table_like() else {
+                    self.warn(format!("{}: `{at}` must be a table (ignored)", self.path));
+                    continue;
+                };
+                let card = self.read_card(inner, &at);
+                match name {
+                    "long_prompt" => price.long_prompt = card,
+                    _ => price.fast = card,
+                }
+            }
+            if price != PriceOverride::default() {
+                prices.insert(model.to_owned(), price);
+            }
+        }
+        prices
+    }
+
+    /// The card fields of `table`, which sits at `dotted`.
+    fn read_card(&mut self, table: &dyn TableLike, dotted: &str) -> CardOverride {
+        let [input, output, cache_write_5m, cache_write_1h, cache_read] =
+            CARD_FIELDS.map(|field| self.read_field(table, dotted, field, rate));
+        CardOverride {
+            input,
+            output,
+            cache_write_5m,
+            cache_write_1h,
+            cache_read,
+        }
+    }
+
+    /// `field` of `table`, read by `parse`, or `None` when it is absent or not valid; one that
+    /// is not valid warns with the `Err` text.
+    fn read_field<T>(
+        &mut self,
+        table: &dyn TableLike,
+        dotted: &str,
+        field: &str,
+        parse: fn(&Item) -> Result<T, &'static str>,
+    ) -> Option<T> {
+        let item = table.get(field)?;
+        match parse(item) {
+            Ok(value) => Some(value),
+            Err(expect) => {
+                self.warn(format!(
+                    "{}: `{dotted}.{field}` {expect} (ignored)",
+                    self.path
+                ));
+                None
+            }
+        }
+    }
+}
+
+/// A price in US dollars, per million tokens or per thousand searches: a number, 0 or more.
+fn rate(item: &Item) -> Result<f64, &'static str> {
+    item.as_float()
+        .or_else(|| item.as_integer().map(|i| i as f64))
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .ok_or("must be a number of US dollars, 0 or more")
+}
+
+/// `long_prompt_above`: a prompt size in tokens, 1 or more.
+fn token_count(item: &Item) -> Result<u64, &'static str> {
+    item.as_integer()
+        .and_then(|n| u64::try_from(n).ok())
+        .filter(|n| *n >= 1)
+        .ok_or("must be a whole number of tokens, 1 or more")
 }
 
 /// Where a dotted path of the file stands in the registry.
@@ -965,12 +1130,28 @@ enum Place {
 }
 
 /// `path`, from the top of the file. `provider` and `provider.<id>` are tables for any id, and
-/// under them only a per-provider key, and its table, are known.
+/// under them only a per-provider key, and its table, are known, and the price tables.
 fn place(path: &[&str]) -> Place {
     match path {
         ["provider"] | ["provider", _] => Place::Table,
+        ["provider", _, "prices", rest @ ..] => place_in_prices(rest),
         ["provider", _, rest @ ..] => place_in(rest, true),
         rest => place_in(rest, false),
+    }
+}
+
+/// Under `provider.<id>.prices` (token report spec §8.2): a table per model, holding its card
+/// fields, `web_search_per_1k`, `long_prompt_above` and the `long_prompt` and `fast` tables
+/// of card fields.
+fn place_in_prices(path: &[&str]) -> Place {
+    match path {
+        [] | [_] => Place::Table,
+        [_, field] if CARD_FIELDS.contains(field) || PRICE_FIELDS.contains(field) => Place::Key,
+        [_, table] if CARD_TABLES.contains(table) => Place::Table,
+        [_, table, field] if CARD_TABLES.contains(table) && CARD_FIELDS.contains(field) => {
+            Place::Key
+        }
+        _ => Place::Unknown,
     }
 }
 

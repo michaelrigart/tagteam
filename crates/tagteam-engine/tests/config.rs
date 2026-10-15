@@ -439,6 +439,7 @@ fn the_spec_s_ranges_and_spellings_hold_at_both_ends_and_nothing_is_clamped() {
             &["1", "3650"],
             &["0", "3651"],
         ),
+        ("tokens.retention_days", &["30", "3650"], &["29", "3651"]),
         (
             "autoswitch.strategy",
             &["best", "consume-first"],
@@ -569,6 +570,7 @@ fn a_key_no_provider_table_may_hold_refuses_under_either_spelling() {
     for (name, raw) in [
         ("ui.color", "never"),
         ("usage.history_retention_days", "30"),
+        ("tokens.retention_days", "90"),
         ("default_provider", "claude-code"),
     ] {
         let prefixed = format!("provider.claude-code.{name}");
@@ -1152,4 +1154,33 @@ mod hooks {
             "[autoswitch]\nthreshold = 85.5\n\n[ui]\ncolor = \"never\"\n"
         );
     }
+}
+
+#[test]
+fn config_set_refuses_a_price_key() {
+    // Token report spec §8.2: the price tables are no registry keys, so `config` writes none
+    // of them; the user edits the file.
+    let fx = Fx::new();
+    let text = "[provider.claude-code.prices.\"claude-opus-5-5\"]\ninput = 4.0\n";
+    write_config(&fx, text);
+    let flag = cc();
+    for (name, provider) in [
+        ("provider.claude-code.prices.claude-opus-5-5.input", None),
+        ("prices.claude-opus-5-5.input", Some(&flag)),
+        ("provider.claude-code.prices", None),
+    ] {
+        assert_eq!(refusal(&fx, name, provider, "5"), "invalid-input", "{name}");
+        assert_eq!(
+            fx.engine.config_unset(name, provider).unwrap_err().kind(),
+            "invalid-input",
+            "{name}"
+        );
+    }
+    assert_eq!(config_text(&fx), text, "the file is left as it was");
+    let (settings, warnings) = Settings::load(&fx.env, &cc());
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        settings.prices[&cc()]["claude-opus-5-5"].base.input,
+        Some(4.0)
+    );
 }
