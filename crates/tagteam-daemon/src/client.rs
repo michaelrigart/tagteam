@@ -3,6 +3,7 @@
 //! whether a daemon is there and speaks this protocol (D1.1 criterion 5).
 
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -12,6 +13,7 @@ use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_provider::Env;
 
 use crate::protocol::{Event, Hello, MAX_LINE, PROTOCOL, Status, parse_event};
+use crate::server::MAX_SOCKET_PATH;
 
 /// D5.7: how long `connect` waits for the greeting.
 pub const GREETING_TIMEOUT: Duration = Duration::from_millis(250);
@@ -22,8 +24,8 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub enum Connect {
     Connected(Client),
-    /// No socket file, a refused connection, or the end of it before the greeting: no daemon
-    /// serves this data directory, and the caller works without one.
+    /// No socket file, a path too long to bind, a refused connection, or the end of it before
+    /// the greeting: no daemon serves this data directory, and the caller works without one.
     NoDaemon,
     /// The daemon speaks another protocol (D5.6). The connection is closed, and the caller
     /// works without the daemon until it restarts on this binary (D4.5).
@@ -52,8 +54,12 @@ pub fn connect(env: &Env) -> Result<Connect, ClientError> {
 
 /// D5.7: the daemon at `path`, greeted within `GREETING_TIMEOUT`. A greeting that does not come
 /// in time is `Timeout`: something accepted and said nothing, so a daemon is there but does
-/// not answer (D8.2).
+/// not answer (D8.2). A path over `MAX_SOCKET_PATH` is `NoDaemon` without a connect: no daemon
+/// can have bound it (D5.1), and the operating system would answer `InvalidInput`.
 pub fn connect_at(path: &Path) -> Result<Connect, ClientError> {
+    if path.as_os_str().as_bytes().len() > MAX_SOCKET_PATH {
+        return Ok(Connect::NoDaemon);
+    }
     let stream = match UnixStream::connect(path) {
         Ok(stream) => stream,
         Err(e) if no_daemon(&e) => return Ok(Connect::NoDaemon),

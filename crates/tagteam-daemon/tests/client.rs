@@ -18,7 +18,7 @@ use tagteam_core::autoswitch::Trigger;
 use tagteam_daemon::client::{Client, ClientError, Connect, connect, connect_at};
 use tagteam_daemon::events::{DaemonEvent, DaemonSink, Mode, StopReason, WaitingFor};
 use tagteam_daemon::protocol::{Event, Hello, MAX_LINE, PROTOCOL, Status, status_json};
-use tagteam_daemon::server::{MAX_CONNECTIONS, Server};
+use tagteam_daemon::server::{MAX_CONNECTIONS, MAX_SOCKET_PATH, Server};
 use tagteam_engine::auto::AutoEvent;
 use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_provider::{Cancel, Env};
@@ -138,6 +138,21 @@ fn a_missing_socket_is_no_daemon() {
         connect_at(&dir.path().join("absent/daemon.sock")),
         "no directory",
     );
+}
+
+#[test]
+fn a_socket_path_too_long_to_bind_is_no_daemon() {
+    // D5.7, D5.1: no daemon can listen at a path over `MAX_SOCKET_PATH`, so `connect` answers
+    // NoDaemon, not the `InvalidInput` the operating system gives.
+    let dir = short_tempdir();
+    let room = MAX_SOCKET_PATH - dir.path().as_os_str().len();
+    let long = dir.path().join("d".repeat(room)).join("daemon.sock");
+    assert!(long.as_os_str().len() > MAX_SOCKET_PATH);
+    assert_no_daemon(connect_at(&long), "connect_at");
+    let mut env = Env::for_test(dir.path());
+    env.xdg_data_home = Some(dir.path().join("d".repeat(room)));
+    assert!(daemon_socket_path(&env).as_os_str().len() > MAX_SOCKET_PATH);
+    assert_no_daemon(connect(&env), "connect");
 }
 
 #[test]
