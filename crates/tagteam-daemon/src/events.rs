@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use tagteam_core::ProviderId;
 use tagteam_engine::auto::{AutoEvent, EventSink};
 
+use crate::notify::Notice;
+
 /// D4.3: what a provider job does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -104,6 +106,9 @@ pub trait DaemonSink {
     fn emit(&self, e: &DaemonEvent);
     /// The end of a tick of `provider`'s engine, as `EventSink::tick_done` has it.
     fn tick_done(&self, _provider: &ProviderId) {}
+    /// A notice was queued for `provider` (D6). `tagteam daemon` prints a line for it (D8.1).
+    /// It is not an event, so neither `--json` nor the socket carries it.
+    fn notified(&self, _provider: &ProviderId, _notice: &Notice) {}
 }
 
 /// Every `AutoEvent` an engine emits, as `DaemonEvent::Auto`, into a `DaemonSink`; the end of
@@ -149,6 +154,12 @@ impl DaemonSink for Fanout<'_> {
     fn tick_done(&self, provider: &ProviderId) {
         for sink in &self.0 {
             sink.tick_done(provider);
+        }
+    }
+
+    fn notified(&self, provider: &ProviderId, notice: &Notice) {
+        for sink in &self.0 {
+            sink.notified(provider, notice);
         }
     }
 }
