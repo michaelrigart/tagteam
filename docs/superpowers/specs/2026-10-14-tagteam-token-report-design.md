@@ -479,7 +479,22 @@ impl Engine {
   `started_at` stamped then, and records it open (`ended_at` NULL); once spawned, it adds the
   child's pid. A record that fails is tried again on each poll while the child runs, and once
   more at the close; the launch keeps its planned start, so a late record covers the whole
-  session. After exit handling, which releases the reservation `run` itself holds, `run`
+  session.
+  - When the store refuses the record before the spawn, `run` keeps the launch in a **pending
+    file**, `<profile>/.tagteam-pending-launches/<started_at ms>-<run pid>.json`, in the run's
+    own profile. The launch reservation has just proved that directory writable. The write is
+    atomic: a temp file beside it, then a rename. The file has the profile marker's shape: a
+    format tag, a version, the provider, the account, `startedAt` (ms) and `endedAt` (ms or
+    null).
+  - The poller removes the file once the launch is recorded. While the launch is unrecorded
+    and the file is missing, the poller writes it again.
+  - At the close, a recorded launch's file is removed. An unrecorded launch's file is written
+    with `endedAt` set to the moment the profile is found idle, the moment the store's close
+    would have stored, or null while the profile is in use.
+  - `run` warns on stderr only when the launch is in neither the store nor a pending file,
+    before the spawn and again at the close. A pending file written is logged at debug.
+
+  After exit handling, which releases the reservation `run` itself holds, `run`
   closes the launch if the profile is no longer in use (core §12.6). A background session the
   child started may outlive it; then, as when `run` was killed, the next `sight_sessions` that
   finds the profile no longer in use closes the launch, at that moment. A late close
@@ -515,6 +530,11 @@ home's `sessions/` and in each profile's (source `scan`). For a record whose pro
 (`home`, `startedAt`) to the read, or begins one at it (§6.4). Each record is dated right after
 its own read, before the liveness check and the writes that follow. An unreadable or partly
 written record, or one whose process is gone, is skipped.
+
+Before it closes launches, the scan reads the pending launch files (§6.1) in each profile. It
+records each launch open from its `startedAt`, closes it at its `endedAt` if it has one, then
+removes the file. A file that does not parse, or names another provider or another account than
+its profile, is skipped and kept. A temp file, which is not `*.json`, is ignored.
 
 ### 6.3 Statusline
 
@@ -593,7 +613,9 @@ unattributed.
 
 **Coverage.**
 - From the epoch (`token_epoch`, when the store migrated to step 3) on, coverage is complete:
-  `run` records each launch from a start planned before its child starts (§6.1).
+  `run` records each launch, in the store or in a pending file (§6.1), from a start planned
+  before its child starts. A report reads each pending file the store does not hold as a
+  launch, open when it has no `endedAt`. It only reads: it never writes or removes one.
 - Before the epoch, coverage comes from the seeded launches (§4). It is complete only after
   the provider's last `remove` event before the epoch. An account removed before then may have
   had a profile that left no trace.
@@ -644,6 +666,8 @@ Known limits:
   only from a read after the copy existed, later than the response, so §7.2 places it, and at
   worst it is unattributed. In the real tree 0.3% of responses have a copy under another
   session id.
+- A launch that neither the store nor its profile directory accepted, from before the spawn
+  until the close, is placed as a default-home session. `run` warns of it on stderr.
 - A session CC spawns itself inside a profile writes no record. Its responses fall inside its
   parent's launch, so they are unattributed rather than misplaced.
 - `/clear` starts a new session in the same execution (§17 T1), and `/resume` switches to
@@ -1003,6 +1027,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
     `token_epoch` stays.
   - Either holds each affected provider's tokens lock while it deletes (§5.1).
   - `remove` deletes none of them: the account's usage stays, as a removed account.
+  - `remove` records a profile's pending launches (§6.1) before it deletes the profile, as the
+    scan does. A purge deletes the profiles it covers, and their pending files with them.
 
 ---
 
@@ -1053,19 +1079,25 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
       one, and never extending another execution's sighting;
     - a launch recorded before the spawn and closed at exit;
     - a launch closed by `sight_sessions` after its `run` was killed while the child lived on;
+    - a launch the store refuses, kept in a pending file and removed once recorded, whether by
+      the poller or by a scan; its `endedAt` set at the close when the profile is idle and null
+      while it is in use; the warnings only when neither accepts it;
+    - a pending file recorded by `sight_sessions` open, or closed at its `endedAt`, and removed;
+      one that does not parse or names another account left in place; a temp file ignored;
     - seeding of idle and in-use profiles at migration;
     - `active_history` rows from switches, from `add`, and from `remove` setting NULL.
   - Attribution end to end:
     - a profile session, and the default home through `active_history` and through `events`;
     - an unsighted response with and without a covering launch, before and after the epoch,
       and before and after a pre-epoch `remove`;
+    - an unsighted response inside a pending launch, unattributed before the next scan;
     - a session sighted in two homes at once;
     - a session resumed in another home, with either home unsighted;
     - a removed account, with and without switches, and a removed profile.
   - The view's grouping, filters (including `Some(vec![])`), order and drill-down;
     `changed_at_ms` moving on new evidence alone.
   - Migration from a version-2 store, with profiles to seed.
-  - `purge` and `remove`.
+  - `purge` and `remove`, `remove` recording a profile's pending launches.
 - **CLI.** Snapshot tests of the human, `--json` and `--csv` output (core §13.2). `tokens` joins
   core §15.3's byte-identity test.
 - **Budgets.**
