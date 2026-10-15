@@ -1,6 +1,6 @@
-//! The terminal and descriptor calls the development harness (`xtask`) needs, as safe
-//! functions: the workspace allows `unsafe` only here and in `tagteam`, so `xtask` forbids it
-//! and calls these.
+//! The terminal, descriptor and job-control calls that the development harness (`xtask`) and
+//! the TUI (`tagteam-tui`) need, as safe functions: the workspace allows `unsafe` only here and
+//! in `tagteam`, so both forbid it and call these.
 
 use std::io;
 use std::os::fd::RawFd;
@@ -176,6 +176,17 @@ pub fn child_is_stopped(pid: u32) -> bool {
     }
 }
 
+/// Ctrl-Z for a program that reads its keys raw (TUI spec §10.1): stops this process with
+/// SIGTSTP, as the terminal would have, and returns once it is continued (SIGCONT). Where
+/// nothing does job control the signal is discarded, and this returns at once.
+pub fn stop_self() -> io::Result<()> {
+    // SAFETY: raise(3) takes a signal number and touches no memory of ours.
+    if unsafe { libc::raise(libc::SIGTSTP) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -233,5 +244,42 @@ mod spawn_tests {
         let err = spawn_foreground(&mut Command::new("/nonexistent/program")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert_eq!(stdin_foreground_group(), before);
+    }
+
+    #[test]
+    fn stop_self_stops_the_process_until_it_is_continued() {
+        // A forked child stops itself; the test sees it stopped, continues it, and sees it exit
+        // 0. The child leads a group of its own first: in an orphaned group, as a CI runner's
+        // may be, SIGTSTP is discarded.
+        let _fork = crate::fork_guard();
+        // SAFETY: the child calls only async-signal-safe functions: setpgid(2), raise(3)
+        // inside `stop_self`, and _exit(2).
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: in the forked child; both take integers and touch no memory.
+            unsafe {
+                libc::setpgid(0, 0);
+                libc::_exit(if stop_self().is_ok() { 0 } else { 1 });
+            }
+        }
+        let mut status = 0;
+        // SAFETY: waitpid(2) writes the child's status into `status`; WUNTRACED reports a stop.
+        assert_eq!(
+            unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+            pid
+        );
+        assert!(
+            libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGTSTP,
+            "{status:#x}"
+        );
+        // SAFETY: kill(2) on this test's own child, which is not reaped yet.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+        // SAFETY: as above, now for its exit.
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "{status:#x}"
+        );
     }
 }

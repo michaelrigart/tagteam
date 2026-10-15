@@ -3269,6 +3269,7 @@ name = "tagteam-tui"
 version = "20261014.2045.0"
 dependencies = [
  "crossterm",
+ "libc",
  "ratatui",
  "serde_json",
  "tagteam-cc",
