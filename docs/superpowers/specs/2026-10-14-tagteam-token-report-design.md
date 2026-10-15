@@ -490,8 +490,8 @@ impl Engine {
     atomic: a temp file beside it, then a rename. The file has the profile marker's shape: a
     format tag, a version, the provider, the account, `startedAt` (ms) and `endedAt` (ms or
     null).
-  - The poller removes the file once the launch is recorded. While the launch is unrecorded
-    and the file is missing, the poller writes it again.
+  - The poller removes the file once the launch is recorded. While the launch is unrecorded,
+    it writes the file again if that write failed.
   - At the close, a recorded launch's file is removed. An unrecorded launch's file is written
     with `endedAt` set to the moment the profile is found idle, the moment the store's close
     would have stored, or null while the profile is in use.
@@ -537,7 +537,8 @@ written record, or one whose process is gone, is skipped.
 
 Before it closes launches, the scan reads the pending launch files (§6.1) in each profile. It
 records each launch open from its `startedAt`, closes it at its `endedAt` if it has one, then
-removes the file. A file that does not parse, or names another provider or another account than
+removes the file, unless the file changed since the scan read it: `run` may have replaced it
+with a newer one, which the next scan records. A file that does not parse, or names another provider or another account than
 its profile, is skipped and kept. A temp file, which is not `*.json`, is ignored.
 
 ### 6.3 Statusline
@@ -1031,8 +1032,14 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
     `token_epoch` stays.
   - Either holds each affected provider's tokens lock while it deletes (§5.1).
   - `remove` deletes none of them: the account's usage stays, as a removed account.
-  - `remove` records a profile's pending launches (§6.1) before it deletes the profile, as the
-    scan does. A purge deletes the profiles it covers, and their pending files with them.
+  - Every deleter of a profile but a purge records the profile's pending launches (§6.1) first,
+    as the scan does: `remove`, an `add` over an occupant, and the bootstrap that deletes a
+    profile whose login is invalid. `remove` and `add` record before they delete anything, the
+    vault entry included. A store that refuses the record stops the delete with everything as
+    it was, and the bootstrap's launch is refused with the store's error.
+  - A purge records nothing. It deletes the profiles it covers, and their pending files with
+    them, and empties the launch table; a table that cannot be written never leaves an account
+    unpurged.
 
 ---
 
@@ -1087,7 +1094,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
       the poller or by a scan; its `endedAt` set at the close when the profile is idle and null
       while it is in use; the warnings only when neither accepts it;
     - a pending file recorded by `sight_sessions` open, or closed at its `endedAt`, and removed;
-      one that does not parse or names another account left in place; a temp file ignored;
+      one replaced during the scan kept; one that does not parse or names another account left
+      in place; a temp file ignored;
     - seeding of idle and in-use profiles at migration;
     - `active_history` rows from switches, from `add`, and from `remove` setting NULL.
   - Attribution end to end:
@@ -1101,7 +1109,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
   - The view's grouping, filters (including `Some(vec![])`), order and drill-down;
     `changed_at_ms` moving on new evidence alone.
   - Migration from a version-2 store, with profiles to seed.
-  - `purge` and `remove`, `remove` recording a profile's pending launches.
+  - `purge` and `remove`, `remove` and the bootstrap recording a profile's pending launches
+    before they delete it, and a purge forgetting them.
 - **CLI.** Snapshot tests of the human, `--json` and `--csv` output (core §13.2). `tokens` joins
   core §15.3's byte-identity test.
 - **Budgets.**
