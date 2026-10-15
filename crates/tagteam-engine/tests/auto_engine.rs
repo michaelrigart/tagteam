@@ -1,17 +1,22 @@
 //! §11.1's engine: one per provider per machine, held by a try-only lock that records its
 //! holder; dry-run holds no lock and writes no auto-switch state; the live account's next
-//! fetchable time for the loop.
+//! fetchable time for the loop. The daemon's hooks (daemon plan A, Decisions 4 to 6): the
+//! source an engine records, the record it empties when dropped, and the quarantine watch its
+//! ticks share with the daemon's collect rounds.
 mod common;
 
 use std::fs;
 
-use common::{FakeFx, Fx, Recorded, record_reading, usage_window};
-use serde_json::Value;
+use common::{
+    FakeFx, Fx, Recorded, crashed_switch, record_reading, usage_window, write_target_credential,
+};
+use serde_json::{Value, json};
 use tagteam_core::autoswitch::{AutoConfig, AutoState, Decision, NoSwitchReason, Strategy};
-use tagteam_core::{ProviderId, WindowKind};
+use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
 use tagteam_engine::EngineError;
-use tagteam_engine::auto::{AutoEvent, TickOutcome};
-use tagteam_provider::{ProcessStamp, Provider};
+use tagteam_engine::auto::{AutoEvent, QuarantineWatch, TickOutcome};
+use tagteam_engine::store::AccountRow;
+use tagteam_provider::{FlockGuard, ProcessStamp, Provider, Read};
 
 const T0: i64 = 1_790_000_000;
 
@@ -240,4 +245,271 @@ fn the_next_poll_waits_out_the_live_accounts_backoff() {
             "backoff until {backoff}"
         );
     }
+}
+
+/// Claude Code's 5h and 7d windows at `short` and `long` percent, as every reading here has
+/// them.
+fn windows(short: f64, long: f64) -> Vec<Window> {
+    vec![
+        usage_window("5h", WindowKind::Short, short, T0 + 9_630),
+        usage_window("7d", WindowKind::Long, long, T0 + 291_630),
+    ]
+}
+
+/// A reading taken now with its next poll five minutes out: decision-grade, and not due.
+fn read(fx: &Fx, id: &AccountId, w: &[Window]) {
+    record_reading(&fx.engine, id, w, T0, T0 + 300);
+}
+
+/// The last event the store recorded, as `(kind, source)`.
+fn last_event(fx: &Fx) -> (String, String) {
+    let last = fx.engine.store().unwrap().events().unwrap().pop().unwrap();
+    (last.kind, last.source)
+}
+
+#[test]
+fn a_daemon_engine_records_its_switches_as_the_daemon_s() {
+    // Decision 4: `events.source` reserves `daemon` (§6.1). The engine starts as `auto`.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    read(&fx, &a, &windows(10.0, 20.0));
+    read(&fx, &b, &windows(20.0, 95.0));
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap()
+        .with_source("daemon");
+    assert_eq!(engine.provider(), &fx.provider());
+    let (outcome, _) = engine.tick(&Recorded::default()).unwrap();
+    assert_eq!(outcome, TickOutcome::Switched);
+    assert_eq!(last_event(&fx), ("switch".into(), "daemon".into()));
+}
+
+#[test]
+fn a_daemon_engine_recovers_an_interrupted_switch_as_the_daemon() {
+    // Decision 4: §11.2 step 2's recovery records the engine's source too (§9.6).
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    read(&fx, &a, &windows(10.0, 20.0));
+    read(&fx, &b, &windows(10.0, 20.0));
+    crashed_switch(&fx, &b, &a);
+    write_target_credential(&fx, &a);
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap()
+        .with_source("daemon");
+    engine.tick(&Recorded::default()).unwrap();
+    assert_eq!(
+        last_event(&fx),
+        ("switch-recovered".into(), "daemon".into())
+    );
+}
+
+#[test]
+fn a_daemon_engine_releases_an_unbound_quarantine_as_the_daemon() {
+    // Decision 4: step 1's release records the engine's source (§7.4). The vault has moved
+    // past the generation the quarantine names, so it no longer binds.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    read(&fx, &a, &windows(10.0, 10.0));
+    read(&fx, &b, &windows(10.0, 50.0));
+    fx.quarantine(&a, "invalid_grant", "sha256:a-generation-long-gone");
+    let mut engine = fx
+        .engine
+        .auto(&fx.provider(), cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap()
+        .with_source("daemon");
+    engine.tick(&Recorded::default()).unwrap();
+    assert_eq!(last_event(&fx), ("unquarantine".into(), "daemon".into()));
+}
+
+#[test]
+fn a_dropped_engine_leaves_its_lock_file_empty_and_free() {
+    // Decision 5, D3 change 3: a daemon that lets a provider go lives on, so a record left
+    // behind would name a live process as the provider's engine.
+    let fx = Fx::new();
+    let provider = fx.provider();
+    let path = lock_path(&fx, &provider);
+    assert!(matches!(fx.engine.engine_holder(&provider), Read::Absent));
+    let engine = fx
+        .engine
+        .auto(&provider, cfg(fx.cc.as_ref()), false)
+        .unwrap()
+        .unwrap();
+    let me = ProcessStamp::current().unwrap();
+    assert!(matches!(fx.engine.engine_holder(&provider), Read::Present(s) if s == me));
+    drop(engine);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"",
+        "the lock file stays, emptied"
+    );
+    assert!(matches!(fx.engine.engine_holder(&provider), Read::Absent));
+    assert!(
+        FlockGuard::try_lock(&path).unwrap().is_some(),
+        "and the lock is free"
+    );
+}
+
+#[test]
+fn a_dry_run_engine_s_drop_touches_no_lock_file() {
+    // Decision 5: a dry run holds no lock (§11.1), so the record belongs to someone else.
+    let fx = Fx::new();
+    let provider = fx.provider();
+    let path = lock_path(&fx, &provider);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let record = "{\"pid\":4242,\"start\":1}\n";
+    fs::write(&path, record).unwrap();
+    let dry = fx
+        .engine
+        .auto(&provider, cfg(fx.cc.as_ref()), true)
+        .unwrap()
+        .unwrap();
+    drop(dry);
+    assert_eq!(fs::read_to_string(&path).unwrap(), record);
+    assert!(matches!(
+        fx.engine.engine_holder(&provider),
+        Read::Present(ProcessStamp {
+            pid: 4242,
+            start: 1
+        })
+    ));
+    fs::write(&path, "garbage").unwrap();
+    assert!(matches!(
+        fx.engine.engine_holder(&provider),
+        Read::Unreadable(_)
+    ));
+}
+
+/// A Claude Code account row at `position`, quarantined for `reason` when one is given.
+fn row(id: &str, position: u32, reason: Option<&str>, login_epoch: i64) -> AccountRow {
+    let email = format!("{id}@x.co");
+    AccountRow {
+        id: AccountId::from_string(id),
+        provider: ProviderId::new("claude-code"),
+        position,
+        identity_key: format!("{email}\n"),
+        label: email.clone(),
+        email: Some(email),
+        org_uuid: String::new(),
+        org_name: None,
+        account_uuid: None,
+        kind: "oauth".into(),
+        alias: None,
+        disabled: false,
+        identity_json: json!({}),
+        login_expires_at: None,
+        login_epoch,
+        replacing_fp: None,
+        quarantine_reason: reason.map(str::to_owned),
+        quarantine_fp: reason.map(|_| "sha256:q".to_owned()),
+        quarantine_at: reason.map(|_| 1),
+        added_at: 1,
+    }
+}
+
+fn quarantined(p: &ProviderId, number: u32, email: &str, reason: &str) -> AutoEvent {
+    AutoEvent::AccountQuarantined {
+        provider: p.clone(),
+        number,
+        email: email.into(),
+        reason: reason.into(),
+    }
+}
+
+fn unquarantined(p: &ProviderId, number: u32, email: &str, reason: &str) -> AutoEvent {
+    AutoEvent::AccountUnquarantined {
+        provider: p.clone(),
+        number,
+        email: email.into(),
+        reason: reason.into(),
+    }
+}
+
+#[test]
+fn a_quarantine_watch_reports_only_releases_on_its_first_call() {
+    // Decision 6, as the tick's step 1 did (Decision 10): with no previous call to compare
+    // with, a quarantine that is already set is not news.
+    let p = ProviderId::new("claude-code");
+    let sink = Recorded::default();
+    let mut watch = QuarantineWatch::new();
+    let rows = [row("a", 1, Some("invalid_grant"), 0), row("b", 2, None, 0)];
+    watch.report(&p, &rows, &[AccountId::from_string("b")], &sink);
+    assert_eq!(
+        sink.take(),
+        [unquarantined(&p, 2, "b@x.co", "credentials-replaced")]
+    );
+}
+
+#[test]
+fn a_quarantine_watch_reports_what_was_set_or_cleared_since_its_previous_call() {
+    let p = ProviderId::new("claude-code");
+    let sink = Recorded::default();
+    let mut watch = QuarantineWatch::new();
+    watch.report(
+        &p,
+        &[row("a", 1, None, 0), row("b", 2, Some("invalid_grant"), 0)],
+        &[],
+        &sink,
+    );
+    assert!(sink.take().is_empty());
+    // Set on a, cleared on b, and c added since, already quarantined.
+    watch.report(
+        &p,
+        &[
+            row("a", 1, Some("invalid_grant"), 0),
+            row("b", 2, None, 0),
+            row("c", 3, Some("invalid_grant"), 0),
+        ],
+        &[],
+        &sink,
+    );
+    assert_eq!(
+        sink.take(),
+        [
+            quarantined(&p, 1, "a@x.co", "invalid_grant"),
+            unquarantined(&p, 2, "b@x.co", "credentials-replaced"),
+            quarantined(&p, 3, "c@x.co", "invalid_grant"),
+        ]
+    );
+    // An explicit replacement (§12.5) moved a's login epoch as it cleared the quarantine.
+    let now = [
+        row("a", 1, None, 1),
+        row("b", 2, None, 0),
+        row("c", 3, Some("invalid_grant"), 0),
+    ];
+    watch.report(&p, &now, &[], &sink);
+    assert_eq!(
+        sink.take(),
+        [unquarantined(&p, 1, "a@x.co", "account-replaced")]
+    );
+    watch.report(&p, &now, &[], &sink);
+    assert!(sink.take().is_empty(), "nothing changed since");
+}
+
+#[test]
+fn a_quarantine_a_round_found_itself_is_reported_once() {
+    // Decision 6: a collection's or a freshening's quarantine is news once; the next
+    // comparison already knows it.
+    let p = ProviderId::new("claude-code");
+    let sink = Recorded::default();
+    let mut watch = QuarantineWatch::new();
+    let a = row("a", 1, Some("invalid_grant"), 0);
+    watch.note_quarantined(&p, &a, &sink);
+    watch.note_quarantined(&p, &a, &sink);
+    assert_eq!(sink.take(), [quarantined(&p, 1, "a@x.co", "invalid_grant")]);
+    watch.report(&p, std::slice::from_ref(&a), &[], &sink);
+    assert!(sink.take().is_empty());
+    watch.note_quarantined(&p, &row("b", 2, None, 0), &sink);
+    assert!(
+        sink.take().is_empty(),
+        "an account with no quarantine is no news"
+    );
 }
