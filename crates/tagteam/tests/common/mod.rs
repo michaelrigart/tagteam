@@ -315,6 +315,26 @@ impl Running {
         String::from_utf8_lossy(&self.out.lock().unwrap()).into_owned()
     }
 
+    /// Everything it has printed on stderr so far.
+    pub fn stderr(&self) -> String {
+        String::from_utf8_lossy(&self.err.lock().unwrap()).into_owned()
+    }
+
+    /// `wait_for`, on its stderr.
+    pub fn wait_for_stderr(&mut self, within: Duration, what: &str, ready: impl Fn(&str) -> bool) {
+        let deadline = Instant::now() + within;
+        while !ready(&self.stderr()) {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!("tagteam exited ({status}) before {what}");
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                panic!("tagteam never got to {what}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Polls every 10 ms until `ready` holds for its stdout so far. Fails the test if it exits
     /// first, or if `within` passes (killing it, so a hung one is not left behind).
     pub fn wait_for(&mut self, within: Duration, what: &str, ready: impl Fn(&str) -> bool) {

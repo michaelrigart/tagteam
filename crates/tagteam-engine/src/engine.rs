@@ -287,6 +287,12 @@ impl Engine {
             .ok_or_else(|| EngineError::UnknownProvider(id.to_string()))
     }
 
+    /// Every provider this build registers, in registration order: the daemon runs one job
+    /// per provider (D4.3).
+    pub fn provider_ids(&self) -> Vec<ProviderId> {
+        self.registry.all().iter().map(|p| p.id()).collect()
+    }
+
     /// `id` as a log line's field, only when this build registers it (§14.2): an ID read from a
     /// marker or a store column is otherwise any text, an email among it.
     pub(crate) fn registered_id<'a>(
@@ -720,6 +726,33 @@ mod tests {
 
     fn test_engine(env: Env) -> Engine {
         Engine::new(test_config(env))
+    }
+
+    #[test]
+    fn provider_ids_are_the_registered_providers_in_order() {
+        // D4.3: the daemon runs one job per registered provider.
+        let d = tempfile::tempdir().unwrap();
+        let engine = Engine::new(EngineConfig {
+            registry: ProviderRegistry::new()
+                .with(Arc::new(tagteam_cc::ClaudeCode::new(
+                    Arc::new(FakeKeychain::new()),
+                    tagteam_cc::live::Platform::MacOs,
+                )))
+                .with(Arc::new(tagteam_fake::FakeAgent::new())),
+            ..test_config(Env::for_test(d.path()))
+        });
+        assert_eq!(
+            engine.provider_ids(),
+            [
+                ProviderId::new(tagteam_core::CLAUDE_CODE),
+                ProviderId::new(tagteam_fake::FAKE_AGENT)
+            ]
+        );
+        assert!(
+            test_engine(Env::for_test(d.path()))
+                .provider_ids()
+                .is_empty()
+        );
     }
 
     #[test]

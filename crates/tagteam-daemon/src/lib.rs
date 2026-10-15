@@ -4,6 +4,7 @@
 
 pub mod auto;
 pub mod backoff;
+pub mod daemon;
 pub mod events;
 pub mod notify;
 pub mod protocol;

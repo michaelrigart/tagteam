@@ -136,6 +136,14 @@ pub enum Command {
         )]
         include_api_key_accounts: Option<String>,
     },
+    /// Run the daemon in the foreground: collect usage and switch automatically, until stopped
+    ///
+    /// One job per provider (or only --provider's). While daemon.autoswitch is true it switches
+    /// as `tagteam auto` does, and otherwise it only collects usage, so `tagteam config set
+    /// daemon.autoswitch false` pauses it. Notifications follow the notify.* settings. --json
+    /// prints one event per line: {"schemaVersion":1,"event":<kind>,"ts":"…Z", …}. It exits 0
+    /// when a signal stops it, and 75 when a newer tagteam must take over.
+    Daemon {},
     /// Usage history: burn rate, and when each window runs out
     ///
     /// Reads the stored samples only; it never fetches. With no ACCOUNT it shows the live
