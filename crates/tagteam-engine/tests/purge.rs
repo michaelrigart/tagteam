@@ -2261,6 +2261,7 @@ fn plant_token_rows(fx: &Fx, provider: &ProviderId) {
     let seen = SightingRow {
         session_id: "s-1".into(),
         home: String::new(),
+        started_at: now - 1_000,
         first_at: now - 1_000,
         last_at: now,
         source: SightingSource::Scan,

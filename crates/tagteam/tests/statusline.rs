@@ -440,10 +440,11 @@ fn sightings(root: &Path) -> Vec<SightingRow> {
 #[test]
 fn the_statusline_records_its_session_once_a_minute() {
     // Token report spec §6.3: Claude Code runs the line with its session's environment. The
-    // line's first ancestor with a session record, this test process, keys the sighting. The
-    // binary has no clock to set, so only what holds at any time is asserted here: one
-    // execution is one sighting, whenever the line runs again. Whether a second look extends it
-    // (a minute on) or only reads it (within one) is Task 16's, tested on the fake clock.
+    // line's first ancestor with a session record, this test process, is the execution, and
+    // the session is sighted there from the line's own read on (spec §6.4). The binary has no
+    // clock to set, so only what holds at any time is asserted here: one tenure is one
+    // sighting, whenever the line runs again. Whether a second look extends it (a minute on) or
+    // only reads it (within one) is Task 16's, tested on the fake clock.
     let (d, _, _) = managed(0);
     let root = d.path();
     let started = record_for_this_process(&Env::for_test(root).home.join(".claude"), "s-line");
@@ -471,16 +472,28 @@ fn the_statusline_records_its_session_once_a_minute() {
         (
             first[0].session_id.as_str(),
             first[0].home.as_str(),
-            first[0].first_at,
+            first[0].started_at,
             first[0].source
         ),
         ("s-line", "", started, SightingSource::Statusline)
+    );
+    assert!(
+        first[0].first_at > started,
+        "the tenure starts at the line's read, not the execution's start: {first:?}"
     );
     // The same execution, looked at again: still one sighting, keyed as before. Only its end
     // may move, and only if a minute passed, so the end is not compared.
     line();
     let again = sightings(root);
-    let key = |s: &SightingRow| (s.session_id.clone(), s.home.clone(), s.first_at, s.source);
+    let key = |s: &SightingRow| {
+        (
+            s.session_id.clone(),
+            s.home.clone(),
+            s.started_at,
+            s.first_at,
+            s.source,
+        )
+    };
     assert_eq!(
         again.iter().map(key).collect::<Vec<_>>(),
         first.iter().map(key).collect::<Vec<_>>(),

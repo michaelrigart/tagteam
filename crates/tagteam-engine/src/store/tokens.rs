@@ -28,8 +28,8 @@ const PRUNE_CHUNK: usize = 5_000;
 const PRUNE_CLEANUP: [&str; 3] = [
     "DELETE FROM token_sessions WHERE id IN (SELECT id FROM token_sessions WHERE provider = ?1 \
      AND NOT EXISTS (SELECT 1 FROM token_usage WHERE session = token_sessions.id) LIMIT ?3)",
-    "DELETE FROM session_sightings WHERE (provider, session_id, home, first_at) IN \
-     (SELECT provider, session_id, home, first_at FROM session_sightings \
+    "DELETE FROM session_sightings WHERE (provider, session_id, home, started_at, first_at) IN \
+     (SELECT provider, session_id, home, started_at, first_at FROM session_sightings \
      WHERE provider = ?1 AND last_at < ?2 LIMIT ?3)",
     "DELETE FROM run_launches WHERE (provider, account_id, started_at) IN \
      (SELECT provider, account_id, started_at FROM run_launches \
@@ -140,12 +140,15 @@ impl SightingSource {
     }
 }
 
-/// One execution of a session seen alive in a home (spec §6.4), keyed by the session, the
-/// home and `first_at`. `home` is `""` for the default home, else the profile's account id.
+/// One tenure of a session in one execution in a home (spec §6.4): the reads of that execution's
+/// record that named the session, from the first (`first_at`) to the last (`last_at`). Keyed by
+/// the session, the home, the execution (`started_at`, its record's `startedAt`) and `first_at`.
+/// `home` is `""` for the default home, else the profile's account id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SightingRow {
     pub session_id: String,
     pub home: String,
+    pub started_at: i64,
     pub first_at: i64,
     pub last_at: i64,
     pub source: SightingSource,
@@ -337,46 +340,71 @@ fn usage_from_row(r: &Row<'_>) -> rusqlite::Result<UsageRow> {
     })
 }
 
-const SIGHTING_COLUMNS: &str = "session_id, home, first_at, last_at, source, recorded_at";
+const SIGHTING_COLUMNS: &str =
+    "session_id, home, started_at, first_at, last_at, source, recorded_at";
 
 fn sighting_from_row(r: &Row<'_>) -> rusqlite::Result<SightingRow> {
-    let source: String = r.get(4)?;
+    let source: String = r.get(5)?;
     Ok(SightingRow {
         session_id: r.get(0)?,
         home: r.get(1)?,
-        first_at: r.get(2)?,
-        last_at: r.get(3)?,
+        started_at: r.get(2)?,
+        first_at: r.get(3)?,
+        last_at: r.get(4)?,
         source: SightingSource::parse(&source).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
-                4,
+                5,
                 rusqlite::types::Type::Text,
                 "unknown sighting source".into(),
             )
         })?,
-        recorded_at: r.get(5)?,
+        recorded_at: r.get(6)?,
     })
 }
 
-/// Spec §6.4's sighting write on one connection, which `Store::record_sighting` and
-/// `Store::record_sighting_within` share: inserts the sighting, or extends the stored one when
-/// `s.last_at` is at least `min_gap_ms` past its own. Returns whether it wrote.
+/// What a sighting write does once its tenure is found (spec §6.4): inserts it, or extends the
+/// stored one when the new `last_at` is at least the gap (`?9`) past its own.
+const EXTEND_SIGHTING: &str = "ON CONFLICT(provider, session_id, home, started_at, first_at) \
+     DO UPDATE SET last_at = excluded.last_at, recorded_at = excluded.recorded_at \
+     WHERE excluded.last_at - session_sightings.last_at >= ?9";
+
+/// The tenure the row's own key names.
+const RECORD_SIGHTING: &str = "INSERT INTO session_sightings \
+     (provider, session_id, home, started_at, first_at, last_at, source, recorded_at) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ";
+
+/// The latest tenure of the row's session in its execution, or one starting at the row's
+/// `first_at` when there is none, or when the execution has been seen naming another session at
+/// or after that tenure's end: the session may have left it in between, and a source that keeps
+/// no state cannot tell, so the gap is never bridged (spec §6.4). One statement, so its read
+/// and its write share one write transaction.
+const CONTINUE_SIGHTING: &str = "INSERT INTO session_sightings \
+     (provider, session_id, home, started_at, first_at, last_at, source, recorded_at) \
+     SELECT ?1, ?2, ?3, ?4, coalesce(( \
+       SELECT latest.first_at FROM (SELECT first_at, last_at FROM session_sightings \
+         WHERE provider = ?1 AND session_id = ?2 AND home = ?3 AND started_at = ?4 \
+         ORDER BY first_at DESC LIMIT 1) latest \
+       WHERE NOT EXISTS (SELECT 1 FROM session_sightings other \
+         WHERE other.provider = ?1 AND other.home = ?3 AND other.started_at = ?4 \
+         AND other.session_id != ?2 AND other.last_at >= latest.last_at)), ?5), \
+     ?6, ?7, ?8 WHERE true ";
+
+/// Spec §6.4's sighting write on one connection: `sql` finds the tenure (`RECORD_SIGHTING` or
+/// `CONTINUE_SIGHTING`), and `EXTEND_SIGHTING` inserts or extends it. Returns whether it wrote.
 fn write_sighting(
     c: &Connection,
+    sql: &str,
     provider: &ProviderId,
     s: &SightingRow,
     min_gap_ms: i64,
 ) -> rusqlite::Result<bool> {
     let n = c.execute(
-        "INSERT INTO session_sightings \
-         (provider, session_id, home, first_at, last_at, source, recorded_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-         ON CONFLICT(provider, session_id, home, first_at) DO UPDATE SET \
-         last_at = excluded.last_at, recorded_at = excluded.recorded_at \
-         WHERE excluded.last_at - session_sightings.last_at >= ?8",
+        &format!("{sql}{EXTEND_SIGHTING}"),
         params![
             provider.as_str(),
             s.session_id,
             s.home,
+            s.started_at,
             s.first_at,
             s.last_at,
             s.source.as_str(),
@@ -757,7 +785,7 @@ impl Store {
         })
     }
 
-    /// The connection's busy timeout: for the tests that pin `record_sighting_within`
+    /// The connection's busy timeout: for the tests that pin `continue_sighting_within`
     /// restoring it.
     #[cfg(feature = "test-hooks")]
     pub fn busy_timeout(&self) -> Result<Duration, StoreError> {
@@ -908,8 +936,8 @@ impl Store {
         Ok((end("ASC")?, end("DESC")?))
     }
 
-    /// Spec §6.4: inserts the sighting, or extends the stored one to `s.last_at` when that is
-    /// at least `min_gap_ms` past its own `last_at`. An extension sets `last_at` and
+    /// Spec §6.4: inserts the tenure `s`'s key names, or extends the stored one to `s.last_at`
+    /// when that is at least `min_gap_ms` past its own `last_at`. An extension sets `last_at` and
     /// `recorded_at` alone: `source` stays the creator's. Returns whether it wrote.
     pub fn record_sighting(
         &self,
@@ -917,14 +945,40 @@ impl Store {
         s: &SightingRow,
         min_gap_ms: i64,
     ) -> Result<bool, StoreError> {
-        Ok(write_sighting(&self.lock(), provider, s, min_gap_ms)?)
+        Ok(write_sighting(
+            &self.lock(),
+            RECORD_SIGHTING,
+            provider,
+            s,
+            min_gap_ms,
+        )?)
     }
 
-    /// `record_sighting`, giving up after `wait` on another connection's write lock
+    /// Spec §6.4's write for a source that keeps no state, the scan or the statusline: a read of
+    /// `s`'s session in its execution and home goes on in the latest tenure there, extended to
+    /// `s.last_at` by `record_sighting`'s rule. It starts a tenure at `s.first_at` when there is
+    /// none, or when the execution has been seen naming another session since that tenure's end.
+    /// Returns whether it wrote.
+    pub fn continue_sighting(
+        &self,
+        provider: &ProviderId,
+        s: &SightingRow,
+        min_gap_ms: i64,
+    ) -> Result<bool, StoreError> {
+        Ok(write_sighting(
+            &self.lock(),
+            CONTINUE_SIGHTING,
+            provider,
+            s,
+            min_gap_ms,
+        )?)
+    }
+
+    /// `continue_sighting`, giving up after `wait` on another connection's write lock
     /// (`SQLITE_BUSY`) instead of the connection's own, far longer, wait: the statusline's
     /// sighting, which never holds its line up (spec §6.3). The connection stays locked across
     /// the write, so no other thread of this process writes with the short wait.
-    pub fn record_sighting_within(
+    pub fn continue_sighting_within(
         &self,
         provider: &ProviderId,
         s: &SightingRow,
@@ -933,40 +987,38 @@ impl Store {
     ) -> Result<bool, StoreError> {
         let c = self.lock();
         c.busy_timeout(wait)?;
-        let written = write_sighting(&c, provider, s, min_gap_ms);
+        let written = write_sighting(&c, CONTINUE_SIGHTING, provider, s, min_gap_ms);
         c.busy_timeout(super::BUSY_TIMEOUT)?;
         Ok(written?)
     }
 
-    /// `run`'s exit write (spec §6.1): sets the sighting's end to the child's exit, back as well
-    /// as forward (the child was not alive after it, whatever a poll stamped just before it
-    /// stopped); never before `first_at`. Sets `recorded_at` when the end changed.
+    /// `run`'s end of a tenure (spec §6.1): sets the end of the tenure `s`'s key names to
+    /// `s.last_at`, its last confirming read, back as well as forward (a later stamp is not
+    /// one of `run`'s reads); never before `first_at`. Sets `recorded_at` to `s.recorded_at`
+    /// when the end changed.
     pub fn set_sighting_last_at(
         &self,
         provider: &ProviderId,
-        session_id: &str,
-        home: &str,
-        first_at: i64,
-        last_at: i64,
-        now_ms: i64,
+        s: &SightingRow,
     ) -> Result<(), StoreError> {
         self.exec(
-            "UPDATE session_sightings SET last_at = max(first_at, ?5), recorded_at = ?6 \
-             WHERE provider = ?1 AND session_id = ?2 AND home = ?3 AND first_at = ?4 \
-             AND last_at != max(first_at, ?5)",
+            "UPDATE session_sightings SET last_at = max(first_at, ?6), recorded_at = ?7 \
+             WHERE provider = ?1 AND session_id = ?2 AND home = ?3 AND started_at = ?4 \
+             AND first_at = ?5 AND last_at != max(first_at, ?6)",
             &[
                 &provider.as_str(),
-                &session_id,
-                &home,
-                &first_at,
-                &last_at,
-                &now_ms,
+                &s.session_id,
+                &s.home,
+                &s.started_at,
+                &s.first_at,
+                &s.last_at,
+                &s.recorded_at,
             ],
         )?;
         Ok(())
     }
 
-    /// The latest execution's sighting of `session_id` in `home` (spec §6.3).
+    /// The latest tenure of `session_id` in `home`, by `first_at`, then by execution (spec §6.3).
     pub fn latest_sighting(
         &self,
         provider: &ProviderId,
@@ -979,7 +1031,7 @@ impl Store {
                 &format!(
                     "SELECT {SIGHTING_COLUMNS} FROM session_sightings \
                      WHERE provider = ?1 AND session_id = ?2 AND home = ?3 \
-                     ORDER BY first_at DESC LIMIT 1"
+                     ORDER BY first_at DESC, started_at DESC LIMIT 1"
                 ),
                 params![provider.as_str(), session_id, home],
                 sighting_from_row,
@@ -987,12 +1039,12 @@ impl Store {
             .optional()?)
     }
 
-    /// Every sighting of the provider, by session, then `first_at`, then home.
+    /// Every sighting of the provider, by session, then `first_at`, then home, then execution.
     pub fn sightings(&self, provider: &ProviderId) -> Result<Vec<SightingRow>, StoreError> {
         let c = self.lock();
         let mut stmt = c.prepare(&format!(
             "SELECT {SIGHTING_COLUMNS} FROM session_sightings WHERE provider = ?1 \
-             ORDER BY session_id, first_at, home"
+             ORDER BY session_id, first_at, home, started_at"
         ))?;
         let rows = stmt
             .query_map([provider.as_str()], sighting_from_row)?

@@ -51,12 +51,15 @@ CREATE TABLE session_sightings (
   provider    TEXT NOT NULL,
   session_id  TEXT NOT NULL,
   home        TEXT NOT NULL,
+  started_at  INTEGER NOT NULL,
   first_at    INTEGER NOT NULL,
   last_at     INTEGER NOT NULL,
   source      TEXT NOT NULL,
   recorded_at INTEGER NOT NULL,
-  PRIMARY KEY (provider, session_id, home, first_at)
+  PRIMARY KEY (provider, session_id, home, started_at, first_at)
 ) WITHOUT ROWID;
+-- An execution's tenures, of every session: what a continued sighting checks (spec §6.4).
+CREATE INDEX session_sightings_by_execution ON session_sightings (provider, home, started_at);
 
 CREATE TABLE run_launches (
   provider    TEXT NOT NULL,

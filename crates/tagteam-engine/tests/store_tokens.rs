@@ -87,10 +87,20 @@ fn sighting(session: &str, home: &str, first: i64, last: i64) -> SightingRow {
     SightingRow {
         session_id: session.into(),
         home: home.into(),
+        started_at: first,
         first_at: first,
         last_at: last,
         source: SightingSource::Scan,
         recorded_at: last,
+    }
+}
+
+/// A tenure of `session` in the execution started at `started`, from its first read at `first`
+/// to `last`.
+fn tenure(session: &str, home: &str, started: i64, first: i64, last: i64) -> SightingRow {
+    SightingRow {
+        started_at: started,
+        ..sighting(session, home, first, last)
     }
 }
 
@@ -553,6 +563,21 @@ fn prune_runs_once_a_day_and_moves_changed_at_when_it_deletes() {
 }
 
 #[test]
+fn prune_deletes_a_sighting_by_its_full_key() {
+    // Spec §4: of two executions' tenures whose first reads fell on the same millisecond, only
+    // the one that ended before the cutoff goes.
+    let (_d, s, _) = store();
+    let cutoff = T - 365 * DAY;
+    let ended = tenure("s1", "", cutoff - 20, cutoff - 10, cutoff - 1);
+    let live = tenure("s1", "", cutoff - 15, cutoff - 10, T);
+    for row in [&ended, &live] {
+        s.record_sighting(&cc(), row, 0).unwrap();
+    }
+    assert_eq!(prune(&s, cutoff, "h1", T), done(0));
+    assert_eq!(s.sightings(&cc()).unwrap(), [live]);
+}
+
+#[test]
 fn a_prune_that_fails_part_way_still_moves_changed_at() {
     // Each chunk that deletes a response moves `changed_at` with it: a prune that stops after
     // its chunks, under a lease that keeps a retry away for a day, leaves no change unseen.
@@ -694,8 +719,8 @@ fn the_cleanup_after_the_responses_stops_and_resumes_too() {
         for i in 0..6_000 {
             tx.execute(
                 "INSERT INTO session_sightings \
-                 (provider, session_id, home, first_at, last_at, source, recorded_at) \
-                 VALUES ('claude-code', ?1, '', ?2, ?2, 'scan', ?2)",
+                 (provider, session_id, home, started_at, first_at, last_at, source, \
+                 recorded_at) VALUES ('claude-code', ?1, '', ?2, ?2, ?2, 'scan', ?2)",
                 rusqlite::params![format!("s{i}"), cutoff - 1],
             )
             .unwrap();
@@ -801,56 +826,190 @@ fn sightings_insert_then_extend_only_after_the_gap() {
 }
 
 #[test]
-fn run_s_exit_sets_the_end_back_or_forward_never_before_the_start() {
-    // Spec §6.1: the child was not alive after its exit, so the exit write sets the end exactly,
-    // even below what a poll stamped just before the poller stopped.
+fn tenures_are_keyed_by_their_execution_and_first_read() {
+    // Spec §6.4: a session that leaves an execution and comes back has two tenures there, each
+    // extended by its own key only; two executions whose first reads fell on the same
+    // millisecond are two sightings too, the later execution the latest.
     let (_d, s, _) = store();
-    let polled = sighting("s1", "acct-a", T, T + 10_000);
-    s.record_sighting(&cc(), &polled, 0).unwrap();
-    let end = |last_at: i64, recorded_at: i64| SightingRow {
-        last_at,
-        recorded_at,
-        ..polled.clone()
+    let first = tenure("s1", "acct-a", T, T + 1_000, T + 5_000);
+    let back = tenure("s1", "acct-a", T, T + 9_000, T + 9_000);
+    let elsewhere = tenure("s1", "acct-a", T - 7, T + 9_000, T + 9_500);
+    for row in [&first, &back, &elsewhere] {
+        assert!(s.record_sighting(&cc(), row, 60_000).unwrap(), "{row:?}");
+    }
+    assert_eq!(
+        s.sightings(&cc()).unwrap(),
+        [first.clone(), elsewhere.clone(), back.clone()]
+    );
+    assert_eq!(
+        s.latest_sighting(&cc(), "s1", "acct-a").unwrap(),
+        Some(back.clone())
+    );
+    let later = SightingRow {
+        last_at: T + 70_000,
+        recorded_at: T + 70_000,
+        ..back
     };
-    let latest = |s: &Store| s.latest_sighting(&cc(), "s1", "acct-a").unwrap();
-
-    s.set_sighting_last_at(&cc(), "s1", "acct-a", T, T + 20_000, T + 20_001)
-        .unwrap();
-    assert_eq!(latest(&s), Some(end(T + 20_000, T + 20_001)), "forward");
-    s.set_sighting_last_at(&cc(), "s1", "acct-a", T, T + 9_000, T + 20_002)
-        .unwrap();
+    assert!(s.record_sighting(&cc(), &later, 60_000).unwrap());
     assert_eq!(
-        latest(&s),
-        Some(end(T + 9_000, T + 20_002)),
-        "back: the poll ran ahead of the exit"
-    );
-    s.set_sighting_last_at(&cc(), "s1", "acct-a", T, T + 9_000, T + 20_003)
-        .unwrap();
-    assert_eq!(
-        latest(&s),
-        Some(end(T + 9_000, T + 20_002)),
-        "the same end writes nothing"
-    );
-    s.set_sighting_last_at(&cc(), "s1", "acct-a", T, T - 5_000, T + 20_004)
-        .unwrap();
-    assert_eq!(
-        latest(&s),
-        Some(end(T, T + 20_004)),
-        "an exit before the start clamps to it"
-    );
-    s.set_sighting_last_at(&cc(), "s1", "acct-a", T + 1, T + 30_000, T + 20_005)
-        .unwrap();
-    assert_eq!(
-        latest(&s),
-        Some(end(T, T + 20_004)),
-        "another execution's key writes nothing"
+        s.sightings(&cc()).unwrap(),
+        [first, elsewhere, later],
+        "only the tenure the key names is extended"
     );
 }
 
 #[test]
-fn record_sighting_within_gives_up_on_a_busy_store() {
+fn a_continued_sighting_extends_the_latest_tenure_or_starts_one() {
+    // Spec §6.4, for the scan and the statusline, which keep no state: a read of a session goes
+    // on in the latest tenure of its execution there, by the gap rule, or starts one at the read
+    // when the execution has none, however long ago the execution started.
+    let (_d, s, _) = store();
+    let started = T - 3_600_000;
+    let read = |at: i64| tenure("s1", "", started, at, at);
+    assert!(s.continue_sighting(&cc(), &read(T), 60_000).unwrap());
+    assert_eq!(
+        s.sightings(&cc()).unwrap(),
+        [read(T)],
+        "a first read starts a tenure at itself"
+    );
+    assert!(
+        !s.continue_sighting(&cc(), &read(T + 59_999), 60_000)
+            .unwrap(),
+        "within the gap"
+    );
+
+    // `run`'s tenure of the session in the execution began later: it is the latest, and the
+    // read goes on in it, keeping its source.
+    let polled = SightingRow {
+        source: SightingSource::Run,
+        ..tenure("s1", "", started, T + 30_000, T + 40_000)
+    };
+    s.record_sighting(&cc(), &polled, 0).unwrap();
+    assert!(
+        s.continue_sighting(&cc(), &read(T + 100_000), 60_000)
+            .unwrap()
+    );
+    let extended = SightingRow {
+        last_at: T + 100_000,
+        recorded_at: T + 100_000,
+        ..polled
+    };
+    assert_eq!(s.sightings(&cc()).unwrap(), [read(T), extended.clone()]);
+
+    // Another execution of the session, or another home, starts its own.
+    let next = SightingRow {
+        started_at: T + 150_000,
+        ..read(T + 200_000)
+    };
+    let profile = tenure("s1", "acct-a", started, T + 200_000, T + 200_000);
+    assert!(s.continue_sighting(&cc(), &next, 60_000).unwrap());
+    assert!(s.continue_sighting(&cc(), &profile, 60_000).unwrap());
+    assert_eq!(
+        s.sightings(&cc()).unwrap(),
+        [read(T), extended, next, profile]
+    );
+}
+
+#[test]
+fn a_continued_sighting_never_bridges_a_read_of_another_session() {
+    // Spec §6.4: once the execution has been seen naming another session at or after the end of
+    // the session's latest tenure, the session may have left it in between: a read of it starts
+    // a new tenure. Another execution's or another home's sessions say nothing of this one.
+    let (_d, s, _) = store();
+    let started = T - 3_600_000;
+    let run = |session: &str, first: i64, last: i64| SightingRow {
+        source: SightingSource::Run,
+        ..tenure(session, "acct-a", started, first, last)
+    };
+    let (left, other) = (
+        run("s-a", T, T + 10_000),
+        run("s-b", T + 10_050, T + 70_000),
+    );
+    s.record_sighting(&cc(), &left, 0).unwrap();
+    s.record_sighting(&cc(), &other, 0).unwrap();
+    let back = tenure("s-a", "acct-a", started, T + 90_000, T + 90_000);
+    assert!(s.continue_sighting(&cc(), &back, 60_000).unwrap());
+    assert_eq!(
+        s.sightings(&cc()).unwrap(),
+        [left.clone(), back.clone(), other.clone()],
+        "the return to s-a is a new tenure; the gap is not bridged"
+    );
+
+    // The latest tenure is the new one, and nothing has been seen since: a later read goes on
+    // in it, whatever other executions and homes saw meanwhile.
+    let elsewhere = tenure("s-c", "acct-a", started + 1, T + 95_000, T + 150_000);
+    let default_home = tenure("s-c", "", started, T + 95_000, T + 150_000);
+    s.record_sighting(&cc(), &elsewhere, 0).unwrap();
+    s.record_sighting(&cc(), &default_home, 0).unwrap();
+    let again = tenure("s-a", "acct-a", started, T + 160_000, T + 160_000);
+    assert!(s.continue_sighting(&cc(), &again, 60_000).unwrap());
+    let back = SightingRow {
+        last_at: T + 160_000,
+        recorded_at: T + 160_000,
+        ..back
+    };
+    assert_eq!(
+        s.sightings(&cc()).unwrap(),
+        [left, back, other, default_home, elsewhere]
+    );
+}
+
+#[test]
+fn ending_a_tenure_sets_its_end_back_or_forward_by_its_full_key() {
+    // Spec §6.1: `run` ends a tenure at its last confirming read, below a later stamp too, and
+    // never before its first read. Only the tenure its full key names moves.
+    let (_d, s, _) = store();
+    let ours = tenure("s1", "acct-a", T - 500, T, T + 10_000);
+    let other_execution = tenure("s1", "acct-a", T - 400, T, T + 10_000);
+    let other_tenure = tenure("s1", "acct-a", T - 500, T + 50_000, T + 60_000);
+    for row in [&ours, &other_execution, &other_tenure] {
+        s.record_sighting(&cc(), row, 0).unwrap();
+    }
+    let end = |last_at: i64, recorded_at: i64| SightingRow {
+        last_at,
+        recorded_at,
+        ..ours.clone()
+    };
+    let stored = |s: &Store| s.sightings(&cc()).unwrap();
+    let with = |row: SightingRow| [row, other_execution.clone(), other_tenure.clone()];
+
+    s.set_sighting_last_at(&cc(), &end(T + 20_000, T + 20_001))
+        .unwrap();
+    assert_eq!(stored(&s), with(end(T + 20_000, T + 20_001)), "forward");
+    s.set_sighting_last_at(&cc(), &end(T + 9_000, T + 20_002))
+        .unwrap();
+    assert_eq!(
+        stored(&s),
+        with(end(T + 9_000, T + 20_002)),
+        "back: a later stamp was not one of run's reads"
+    );
+    s.set_sighting_last_at(&cc(), &end(T + 9_000, T + 20_003))
+        .unwrap();
+    assert_eq!(
+        stored(&s),
+        with(end(T + 9_000, T + 20_002)),
+        "the same end writes nothing"
+    );
+    s.set_sighting_last_at(&cc(), &end(T - 5_000, T + 20_004))
+        .unwrap();
+    assert_eq!(
+        stored(&s),
+        with(end(T, T + 20_004)),
+        "an end before the first read clamps to it"
+    );
+    s.set_sighting_last_at(&cc(), &tenure("s1", "acct-a", T - 600, T, T + 30_000))
+        .unwrap();
+    assert_eq!(
+        stored(&s),
+        with(end(T, T + 20_004)),
+        "a key that names no tenure writes nothing"
+    );
+}
+
+#[test]
+fn continue_sighting_within_gives_up_on_a_busy_store() {
     // Spec §6.3: while another connection holds the write lock, the statusline's write gives up
-    // after its own short wait and writes nothing. Free, it writes as `record_sighting` does.
+    // after its own short wait and writes nothing. Free, it writes as `continue_sighting` does.
     let (_d, s, path) = store();
     let mut other = rusqlite::Connection::open(&path).unwrap();
     let held = other
@@ -858,7 +1017,7 @@ fn record_sighting_within_gives_up_on_a_busy_store() {
         .unwrap();
     let seen = sighting("s1", "", T, T);
     let err = s
-        .record_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
+        .continue_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
         .unwrap_err();
     assert_eq!(
         err.sqlite_code(),
@@ -873,11 +1032,11 @@ fn record_sighting_within_gives_up_on_a_busy_store() {
     );
 
     assert!(
-        s.record_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
+        s.continue_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
             .unwrap()
     );
     assert!(
-        !s.record_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
+        !s.continue_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
             .unwrap(),
         "within the gap"
     );
@@ -886,21 +1045,21 @@ fn record_sighting_within_gives_up_on_a_busy_store() {
 
 #[cfg(feature = "test-hooks")]
 #[test]
-fn record_sighting_within_restores_the_connection_s_wait() {
+fn continue_sighting_within_restores_the_connection_s_wait() {
     // Every other write of the process waits its full `busy_timeout` again, whether the short
     // write succeeded or gave up.
     let (_d, s, path) = store();
     let normal = s.busy_timeout().unwrap();
     assert_eq!(normal, Duration::from_millis(5000));
     let seen = sighting("s1", "", T, T);
-    s.record_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
+    s.continue_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
         .unwrap();
     assert_eq!(s.busy_timeout().unwrap(), normal, "after a write");
     let mut other = rusqlite::Connection::open(&path).unwrap();
     let held = other
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
-    s.record_sighting_within(&cc(), &seen, 0, Duration::from_millis(1))
+    s.continue_sighting_within(&cc(), &seen, 0, Duration::from_millis(1))
         .unwrap_err();
     drop(held);
     assert_eq!(s.busy_timeout().unwrap(), normal, "after giving up");

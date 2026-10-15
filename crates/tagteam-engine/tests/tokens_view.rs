@@ -160,6 +160,7 @@ impl View {
         let row = SightingRow {
             session_id: session.to_owned(),
             home: home.to_owned(),
+            started_at: first,
             first_at: first,
             last_at: last,
             source: SightingSource::Scan,

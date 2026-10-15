@@ -166,6 +166,7 @@ fn fixture() -> Fixture {
     let sighted = SightingRow {
         session_id: "s-a".into(),
         home: a.clone(),
+        started_at: d1 + 9 * HOUR_MS,
         first_at: d1 + 9 * HOUR_MS,
         last_at: d1 + 12 * HOUR_MS,
         source: SightingSource::Run,
