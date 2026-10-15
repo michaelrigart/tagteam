@@ -178,7 +178,7 @@ Session records are found through the existing `session_records_dir`.
 
 ## 4. Store: migration step 3
 
-Step 3 of `MIGRATIONS` (core §6.1) adds eight tables and two triggers. The branch that merges second renumbers
+Step 3 of `MIGRATIONS` (core §6.1) adds nine tables and two triggers. The branch that merges second renumbers
 its step when it rebases.
 
 ```sql
@@ -203,11 +203,19 @@ CREATE TABLE token_sessions (
   UNIQUE (provider, session_id)
 );
 
+CREATE TABLE token_models (       -- each model name once (ruling R8)
+  id         INTEGER PRIMARY KEY,
+  provider   TEXT NOT NULL,
+  name       TEXT NOT NULL,
+  UNIQUE (provider, name)
+);
+
 CREATE TABLE token_usage (
-  key        INTEGER PRIMARY KEY, -- first 8 bytes of SHA-256(provider NUL message.id NUL requestId)
+  id         INTEGER PRIMARY KEY, -- insertion order: a time range's rows share pages (ruling R7)
+  key        INTEGER NOT NULL UNIQUE, -- 8 bytes of SHA-256(provider NUL message.id NUL requestId)
   session    INTEGER NOT NULL REFERENCES token_sessions(id) ON DELETE CASCADE,
   at         INTEGER NOT NULL,    -- epoch ms of the earliest line
-  model      TEXT NOT NULL,
+  model      INTEGER NOT NULL REFERENCES token_models(id),
   sidechain  INTEGER NOT NULL,
   input      INTEGER NOT NULL,
   output     INTEGER NOT NULL,
@@ -270,9 +278,10 @@ CREATE TABLE token_state (       -- created by a provider's first refresh write,
 );
 
 CREATE TABLE token_epoch (       -- one row: when this store first ran a version that records
-  at INTEGER NOT NULL            -- sightings and launches (§7.2), epoch ms
+  at     INTEGER NOT NULL,       -- sightings and launches (§7.2), epoch ms
+  seeded INTEGER NOT NULL        -- 1: the migration listed every profile (ruling R1)
 );
-INSERT INTO token_epoch VALUES (<now ms>);
+INSERT INTO token_epoch VALUES (<now ms>, <seeded>);
 INSERT INTO active_history SELECT provider, <now ms>, account_id, <now ms> FROM active_accounts;
 ```
 
@@ -292,9 +301,16 @@ INSERT INTO active_history SELECT provider, <now ms>, account_id, <now ms> FROM 
   - its birth time as `started_at`, or 0 when the filesystem reports none;
   - the epoch as `ended_at`, unless the profile is in use (core §12.6). Then `ended_at` is
     NULL, and §6.1 closes it. That covers a `run` of the previous version still running.
+
+  `token_epoch.seeded` records whether the migration could list every profile to seed. When it
+  could not (a `sessions/` it cannot read, or a raw `Store::open`, which lists none), coverage
+  before the epoch (§7.2) is never complete, which can only leave a response unattributed (plan
+  ruling R1).
 - **Size.** About 100 bytes per response, indexes included: about 150 MB a year at this
   machine's rate (127k responses in 30 days). The plan may normalize `model` into a lookup
-  table if that is needed to stay within it.
+  table if that is needed to stay within it. It does (`token_models`, plan ruling R8), and keys
+  rows by insertion with the hash `UNIQUE` beside it (ruling R7): about 109 bytes a response,
+  and a 30-day range read of a year's rows in 16 ms rather than up to 1.4 s.
 - **Retention.** `tokens.retention_days` (default 365, valid 30–3650, core §6.4) prunes, at
   most once a day on the write path (`token_state.pruned_at`) as core §6.1 prunes samples:
   `token_usage` rows older than the window; then sessions with no rows and their sightings;
@@ -341,8 +357,10 @@ A refresh holds `locks/tokens-<provider>.lock`, an `flock`, so any number of pro
 it at once and only one reads at a time. With `Wait::Wait` a second refresh waits for the first,
 cancellably, then finds little left to do; `tagteam tokens` waits. With `Wait::Try` it returns
 `Busy` at once; the TUI's timer and the daemon try. The lock is a leaf (core §4.3): it may be
-taken under any other tagteam lock, and nothing is taken while it is held. Store transactions
-are not locks in that order.
+taken under any other tagteam lock, and nothing is taken while it is held. The one exception
+is a full `purge`, below: it holds every affected provider's tokens lock at once, taken in
+sorted order. That cannot deadlock, because a refresh takes only one tokens lock (plan
+"Rulings (planning)", "Lock waits"). Store transactions are not locks in that order.
 
 `purge` (core §10.5) takes it too, waiting, under its mutation lock and for each provider whose
 rows it deletes, so a purge never falls between two batches of a refresh. Sightings and launches
@@ -796,7 +814,10 @@ impl TokenQuery {
   elsewhere.
   The TUI calls both on a worker thread, with an engine of its own if `Engine` is not `Sync`.
   A query on a current index needs no refresh. `IndexState.refreshed_at_ms` says how current the
-  index is, and a `changed_at_ms` that moved says a report may have changed.
+  index is, and a `changed_at_ms` that moved says a report may have changed. It follows the
+  index and the evidence, and does not move when an account's alias or position changes, or
+  when an account other than the active one is removed. Those change row labels and kinds, so a
+  consumer that caches rows also re-queries on account changes.
 
 ---
 
@@ -810,8 +831,12 @@ tagteam tokens [day|month|session|block] [ACCOUNT...] [--unattributed] [--model 
 
 ### 11.1 Arguments
 
-- **The period** is a subcommand, so an alias spelled like one cannot be mistaken for it.
-  Bare `tagteam tokens` is `tagteam tokens day`.
+- **The period** is a subcommand, so an alias spelled like one cannot be mistaken for it. When
+  no period subcommand matched (for example `tagteam tokens --json month`, where a flag comes
+  first), a period word in the first `ACCOUNT` position is the period, and only the first
+  position is read so. An alias spelled like a period is named after a period:
+  `tagteam tokens day month` (execution ruling, made in review). Bare `tagteam tokens` is
+  `tagteam tokens day`.
 - **`ACCOUNT`** resolves as core §10.4 does. `--unattributed` adds the unattributed bucket. With
   neither, every account and the unattributed bucket are shown.
 - **`--model`** matches model names containing the text, case-insensitively, and is
@@ -892,7 +917,7 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
 - **Export** carries none of it (core §13.3: nothing machine-local).
 - **Purge.**
   - A full purge empties these tables with the rest (core §10.5).
-  - `purge --provider` deletes that provider's rows from the six provider-keyed tables;
+  - `purge --provider` deletes that provider's rows from the seven provider-keyed tables;
     `token_epoch` stays.
   - Either holds each affected provider's tokens lock while it deletes (§5.1).
   - `remove` deletes none of them: the account's usage stays, as a removed account.
@@ -971,7 +996,7 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
 
 Small hunks, in the same branch:
 
-- **core §4.3:** `locks/tokens-<provider>.lock` is a leaf.
+- **core §4.3:** `locks/tokens-<provider>.lock` is a leaf, except that a full purge holds every affected provider's at once (§5.1).
 - **core §10.5:** `purge` takes each affected provider's tokens lock while it deletes.
 - **core §4.5:** the `transcripts` capability and its three methods.
 - **core §6.1:** the tables and triggers of §4 and their retention.

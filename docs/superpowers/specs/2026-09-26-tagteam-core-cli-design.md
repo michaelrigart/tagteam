@@ -197,7 +197,11 @@ impl Engine {
   leaf, like CC's storage-write lock: it may be taken under any other lock, the storage-write
   lock included, and nothing is taken while it is held. The log's rotation lock (§14.2) is only
   ever tried, never waited for, and nothing is taken while it is held, so a log line may try it
-  under any lock; the rules above leave it out.
+  under any lock; the rules above leave it out. The token index's lock,
+  `locks/tokens-<provider>.lock` ([token report spec] §5.1), is a leaf too: it may be taken
+  under any other tagteam lock, and nothing is taken while it is held. The one exception is a
+  full `purge` (§10.5), which holds every affected provider's token index lock at once, taken
+  in sorted order; that cannot deadlock, because a refresh takes only one.
 - **No network while holding a contended lock.** There are two exceptions, both bounded:
   - the refresh gate holds the account lock across its token request (§7.3, 10 s), which is
     what makes it single-flight;
@@ -287,6 +291,13 @@ pub trait Provider: Send + Sync {
 
     // Diagnostics
     fn doctor_checks(&self, env: &Env) -> Vec<Check>;    // §13.6; Check { id, status, message, fix }
+
+    // The token report, with the `transcripts` capability (token report spec §3.2)
+    fn transcript_files(&self, env: &Env) -> io::Result<Vec<PathBuf>>; // every transcript
+    fn parse_usage_line(&self, line: &[u8]) -> Result<Option<UsageLine>, LineError>;
+    fn price_table(&self) -> &'static PriceTable;     // the shipped API list prices
+    // The default home's `sessions/`, whose records the scan and the statusline read:
+    fn default_session_records_dir(&self, env: &Env) -> Option<PathBuf>;
 }
 ```
 
@@ -296,6 +307,8 @@ the engine degrades rather than failing:
   on authentication failure.
 - Without `sessions`: `run` refuses for that provider.
 - Without `statusline`: the `statusline` command refuses for that provider.
+- Without `transcripts`: `tokens` refuses for that provider, and nothing records its sessions
+  ([token report spec] §3.2).
 
 **Usage windows are generic:** `Window { key, label, kind, pct, resets_at, period_s, detail }`,
 where `kind` is one of `Short | Long | Spend | Scoped` and `detail` is optional provider-owned
@@ -537,6 +550,13 @@ which the kernel holds for as long as the holder lives.
 **History retention.** Samples older than `usage.history_retention_days` are pruned, at most
 once a day, on the write path.
 
+**Token index.** Migration step 3 adds the token report's index and its session evidence:
+`token_files`, `token_sessions`, `token_models`, `token_usage`, `session_sightings`,
+`run_launches`, `active_history` (filled by two triggers on `active_accounts`), `token_state`
+and `token_epoch`, with their upsert, seeding and retention in [token report spec] §4. Usage
+older than `tokens.retention_days` is pruned at most once a day on the write path, as samples
+are. `remove` deletes none of it: a removed account keeps its usage.
+
 ### 6.2 Vault
 
 The vault holds credential bytes and is the source of truth for them. The store holds metadata
@@ -679,6 +699,12 @@ one provider (`models`, `statusline.*`, `run.share_extra`) are read from that pr
 table first, then from the global table. `provider.<id>.<key>` and `<key> --provider <id>` name
 the same entry in every `config` command.
 
+**Price tables.** `[provider.<id>.prices."<model>"]` tables override the token report's shipped
+API list prices, field by field ([token report spec] §8.2). They are read forgivingly like every
+setting, an invalid value keeping the shipped one with a warning, but they are not registry
+keys: `config set` refuses them and the user edits the file. `config list` and `doctor` do not
+report them as unknown.
+
 **Commands.**
 - **`config list [--provider P]`** shows every key with its effective value for the provider
   (`default_provider` when none is given) and its source: `default`, `global` or `provider`.
@@ -714,6 +740,7 @@ source}], unknown: [key]}`; `get` returns `{schemaVersion, key, provider, value,
 | `autoswitch.unhealthy_ticks` | 3 | 1–100 | yes |
 | `autoswitch.models` | `[]` | list of model display names, or `["all"]` alone; duplicates collapse (case-insensitively) | yes |
 | `usage.history_retention_days` | 180 | 1–3650 | — |
+| `tokens.retention_days` | 365 | 30–3650 | — |
 | `statusline.format` | `"{account} · 5h {5h}% · 7d {7d}%{stale}"` | placeholders listed in §13.5 only; `{model:<name>}` needs a trimmed, non-empty name without braces | yes |
 | `run.share_extra` | `[]` | entry names of the source home to share into profiles, besides the provider's allowlist (§12.2); known-private names are ignored with a warning | yes |
 | `ui.color` | `auto` | `auto`, `always`, `never` (`NO_COLOR` and `FORCE_COLOR` also honoured) | — |
@@ -1643,7 +1670,9 @@ home only to finish an interrupted switch, as every command that takes `Mutation
 8. The orphaned profiles that count as affected, each after deleting the hashed item its
    marker's spelling names, or, when the marker cannot be read, the item its canonical path
    names.
-9. The rest of the provider's data, or of all data (below).
+9. The rest of the provider's data, or of all data (below). Each affected provider's token
+   index lock is taken first, waiting for a running refresh, and held across the deletion, so a
+   purge never falls between two batches of a refresh ([token report spec] §5.1).
 
 **A purge that stops part-way,** interrupted or failing on one item, can leave an account
 partly deleted. Since each account's vault goes first (§10.3), such an account has no vault
@@ -1653,7 +1682,10 @@ left where a newer one was deleted. `doctor` reports it (§13.6), and running `p
 
 **With `--provider P`,** purge then deletes P's remaining rows: its displaced entries (each
 file before its row, §6.3), events, `autoswitch_state`, `active_accounts`, `live_identity_cache`
-and `switch_journal`. Its `usage_requests` rows stay. They age out within the hour, so the
+and `switch_journal`, and its token index and evidence: its rows of `token_files`,
+`token_sessions` (and so `token_usage`), `token_models`, `session_sightings`, `run_launches`,
+`active_history` and `token_state` ([token report spec] §13); `token_epoch` stays. Its
+`usage_requests` rows stay. They age out within the hour, so the
 budget (§8.6) does not reset.
 
 **Without `--provider`,** purge then deletes:
@@ -2192,6 +2224,13 @@ death.
 7. Spawn `claude` with the reservation fd. It stays in the terminal's foreground process group
    (§14.1).
 
+**Token evidence** ([token report spec] §6.1). For a provider with `transcripts`, `run` records
+an open launch for the account just before step 7, and the child's pid once it is spawned. While
+the child runs, a scoped thread reads the child's session record every 2 s, when its mtime
+changed, and records the session it names as seen in the profile's home. After exit handling,
+`run` ends that sighting and closes the launch, unless the profile is still in use. None of this
+changes the exit code, and the plain-`claude` paths record nothing.
+
 **Signals** (§14.1 sets the general rules; these are `run`'s):
 - **Before the spawn**, every lock wait is a cancellation point, and so is the wait for the
   login check (§12.3), whose process is then killed. The token is checked once more right
@@ -2448,6 +2487,7 @@ exactly as it would without providers.
 | `auto` | §11 |
 | `run`, `map`, `unmap`, `shell-init` | §12 |
 | `history [ACCOUNT] [--window 5h\|7d\|spend\|<model>] [--since 14d] [--csv]` | §13.4 |
+| `tokens [day\|month\|session\|block] [ACCOUNT...] [--unattributed] [--model M]... [--since 30d\|DATE] [--until DATE] [--by account\|model\|account,model\|none] [--tz ZONE] [--csv] [--no-refresh]` | Token use and API cost per account, from Claude Code's transcripts ([token report spec] §11) |
 | `statusline` | §13.5 |
 | `export`, `import` | §13.3 |
 | `displaced [--purge ID... [--yes]]` | §6.3 |
@@ -2717,6 +2757,13 @@ environment it runs in (a `CLAUDE_CONFIG_DIR` or a CC-invoked process means Clau
   when its mtime or size changed. The parse deserializes `oauthAccount` alone and skips the
   rest.
 - It reads `usage_state` and prints one line using `statusline.format`.
+- **Session evidence.** Once the line is out, it records the session it serves
+  ([token report spec] §6.3): the id in `CLAUDE_CODE_SESSION_ID`, in the run shell's profile or
+  the default home (and nowhere when `CLAUDE_CONFIG_DIR` names another directory), keyed by the
+  session record of the Claude Code process it runs under. A sighting under a minute old costs
+  one indexed lookup; otherwise an ancestor walk and one write, which waits at most 5 ms. It
+  never creates the store, logs at debug at most, and a failure changes neither the line nor the
+  exit code.
 
 **Placeholders:** `{account}` (the alias, else the email local part), `{position}`, `{email}`,
 `{5h}`, `{7d}`, `{5h_reset}`, `{7d_reset}`, `{spend}`, `{model:<name>}`, `{stale}` (` · 12m
@@ -3777,4 +3824,6 @@ Each is a one-liner, and each gets at least one test.
 | `tui`, `watch`, `menubar` | — | Sub-projects 3 and 4 |
 | `upgrade`, update check | — | Dropped; package managers handle it |
 | `purge` | `purge [--provider P]` | Keeps `config.toml` (§10.5) |
-| — | `history`, `statusline`, `doctor`, `completions`, `shell-init` | New |
+| — | `history`, `statusline`, `doctor`, `completions`, `shell-init`, `tokens` | New |
+
+[token report spec]: 2026-10-14-tagteam-token-report-design.md

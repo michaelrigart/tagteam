@@ -7,6 +7,25 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+### Added
+
+- `tagteam tokens`: token use and its API-equivalent cost from Claude Code's transcripts, by
+  day, month, session or 5-hour block, per account and per model, as a table, `--json` or
+  `--csv`. Each request is credited to the account that made it where tagteam can tell (a
+  `tagteam run` session, or the default login at the time), and shown as unattributed where it
+  cannot. tagteam keeps the counts, never any content, in an index in its store, so the history
+  outlives Claude Code's 30-day transcript cleanup; `tokens.retention_days` (default 365) bounds
+  it. Prices ship with tagteam, and `[provider.claude-code.prices."<model>"]` tables in
+  `config.toml` override them.
+- `tagteam run` and `tagteam statusline` now record which session runs under which account, for
+  the token report. Neither changes what it prints or its exit code, and the status line stays
+  within its time budget.
+
+### Changed
+
+- `tagteam purge` waits for a running token index refresh before it deletes a provider's data,
+  and deletes the index with it. `tagteam remove` keeps a removed account's token usage.
+
 ## [20261014.2045.0] - 2026-10-14
 
 ### Changed
