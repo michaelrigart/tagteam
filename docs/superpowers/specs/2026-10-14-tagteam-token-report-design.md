@@ -144,6 +144,10 @@ not reconcile with the transcripts. This report counts transcripts only and says
 offsets, DST included, and tagteam has no zone support today. It reads the system zone
 database and adds no runtime dependency.
 
+The implementation added three more dependencies, with the spec owner's approval: `jiff` in the
+`tagteam` CLI as well; `sha2` in `tagteam-engine`, for the response-key hash (§4); and `proptest`
+as a dev-dependency of `tagteam-cc`.
+
 ### 3.2 Provider trait (core §4.5)
 
 `Capabilities` gains `transcripts: bool`. A provider with it implements:
