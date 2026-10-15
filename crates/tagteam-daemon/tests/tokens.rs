@@ -380,6 +380,39 @@ fn a_change_one_job_broadcast_is_not_broadcast_again_by_the_other() {
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
+fn a_failed_scan_still_broadcasts_a_change_the_state_shows() {
+    // §12: the state is read after each call, a failed one included. The scan records the
+    // live session, then fails at its launch check (injected, as a store busy past its timeout
+    // would): the evidence it committed is readable, so it is announced now, not after a later
+    // scan that succeeds.
+    let fx = fx(true);
+    let sink = Recorded::default();
+    let (mut sessions, _) = token_jobs(vec![cc()], fx.board.clone(), false);
+    live_session(&fx);
+    fx.engine
+        .open_launch(&cc(), &tagteam_core::AccountId::from_string("a@x.co"))
+        .unwrap();
+    fx.engine.fail_at(Some("scan-launch-check"));
+    assert_eq!(
+        run(&mut sessions, &fx, &sink),
+        Ran::After(SESSIONS_EVERY_MS)
+    );
+    let error = job_status(&fx, "sessions-watch").last_error;
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("claude-code: ")),
+        "the scan's failure is the run's lastError: {error:?}"
+    );
+    let changed = fx.engine.token_index_state(&cc()).unwrap().changed_at_ms;
+    assert!(changed.is_some(), "the premise: the scan changed the index");
+    let events = sink.token_index();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].1.changed_at_ms, changed);
+}
+
+#[test]
 fn an_interrupted_refresh_stops_the_scheduler_with_signal() {
     // D4.3, D4.6: a signal that reaches a call ends the run with `Stop(Signal)`, as an
     // interrupted provider run does, and the job reports nothing.
