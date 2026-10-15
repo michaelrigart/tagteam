@@ -59,7 +59,12 @@ pub fn connect_at(path: &Path) -> Result<Connect, ClientError> {
         Err(e) if no_daemon(&e) => return Ok(Connect::NoDaemon),
         Err(e) => return Err(e.into()),
     };
-    stream.set_write_timeout(Some(REPLY_TIMEOUT))?;
+    greet(stream)
+}
+
+/// The half of `connect_at` after the connection: the greeting, read and checked.
+fn greet(stream: UnixStream) -> Result<Connect, ClientError> {
+    timeout_set(stream.set_write_timeout(Some(REPLY_TIMEOUT)))?;
     let mut lines = Lines::new(stream);
     let greeting = match lines.read_line(Some(Instant::now() + GREETING_TIMEOUT)) {
         Ok(Some(line)) => line,
@@ -102,6 +107,16 @@ fn no_daemon(e: &io::Error) -> bool {
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
     ) || e.raw_os_error() == Some(libc::ENOTSOCK)
+}
+
+/// macOS refuses `SO_RCVTIMEO` and `SO_SNDTIMEO` with `EINVAL` once the peer has closed. The
+/// read or write that follows then answers at once, from the data still queued or with the end
+/// of the stream, so that refusal is no failure.
+fn timeout_set(set: io::Result<()>) -> io::Result<()> {
+    match set {
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        other => other,
+    }
 }
 
 /// A greeted connection.
@@ -267,12 +282,7 @@ impl Lines {
                 },
                 None => None,
             };
-            // macOS refuses `SO_RCVTIMEO` with `EINVAL` once the peer has closed. The read below
-            // then answers at once, from the data still queued or with the end of the stream.
-            match self.stream.set_read_timeout(wait) {
-                Err(e) if e.kind() != io::ErrorKind::InvalidInput => return Err(e.into()),
-                _ => {}
-            }
+            timeout_set(self.stream.set_read_timeout(wait))?;
             match self.stream.read(&mut chunk) {
                 Ok(0) => return Ok(None),
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
@@ -286,5 +296,19 @@ impl Lines {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_connection_closed_before_the_timeouts_are_set_is_no_daemon() {
+        // The race `fake(&path, drop)` and a full daemon run: the peer is gone before
+        // `connect_at` sets its timeouts, which macOS refuses with EINVAL.
+        let (client, server) = UnixStream::pair().unwrap();
+        drop(server);
+        assert!(matches!(greet(client), Ok(Connect::NoDaemon)));
     }
 }
