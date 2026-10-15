@@ -46,6 +46,18 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 /// Epoch seconds from `YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)` (Decision 5). The fraction
 /// is dropped. Anything else, a missing offset or an impossible date included, is `None`.
 pub fn parse_iso8601(s: &str) -> Option<i64> {
+    parse(s).map(|(secs, _)| secs)
+}
+
+/// Epoch milliseconds from the forms `parse_iso8601` reads, keeping the fraction's first three
+/// digits, truncated: Claude Code's transcripts time their lines to the millisecond (token
+/// report spec §2.1).
+pub fn parse_iso8601_ms(s: &str) -> Option<i64> {
+    parse(s).map(|(secs, ms)| secs * 1000 + ms)
+}
+
+/// `parse_iso8601`'s epoch seconds, and the milliseconds of the fraction.
+fn parse(s: &str) -> Option<(i64, i64)> {
     let b = s.as_bytes();
     if b.len() < 20
         || b[4] != b'-'
@@ -63,11 +75,15 @@ pub fn parse_iso8601(s: &str) -> Option<i64> {
         digits(&b[17..19])?,
     );
     let mut rest = &b[19..];
+    let mut ms = 0;
     if let Some(fraction) = rest.strip_prefix(b".") {
         let n = fraction.iter().take_while(|c| c.is_ascii_digit()).count();
         if n == 0 {
             return None;
         }
+        ms = (0..3).fold(0, |acc, i| {
+            acc * 10 + fraction[..n].get(i).map_or(0, |d| i64::from(d - b'0'))
+        });
         rest = &fraction[n..];
     }
     let offset = match rest {
@@ -93,7 +109,8 @@ pub fn parse_iso8601(s: &str) -> Option<i64> {
     {
         return None;
     }
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second - offset)
+    let secs = days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second;
+    Some((secs - offset, ms))
 }
 
 /// `YYYY-MM-DDTHH:MM:SSZ` for epoch seconds: how rendered JSON spells a time (§13.2).
@@ -121,5 +138,42 @@ mod tests {
             parse_iso8601("2026-09-21T16:13:20.5+02:00"),
             Some(1_790_000_000)
         );
+    }
+
+    #[test]
+    fn milliseconds_are_kept_when_asked_for() {
+        // Token report spec §2.1: transcript lines carry milliseconds and `Z`.
+        for (text, ms) in [
+            ("2026-09-21T14:13:20.123Z", 1_790_000_000_123),
+            ("2026-09-21T14:13:20.5Z", 1_790_000_000_500),
+            ("2026-09-21T14:13:20.05Z", 1_790_000_000_050),
+            ("2026-09-21T14:13:20.123987Z", 1_790_000_000_123),
+            ("2026-09-21T14:13:20Z", 1_790_000_000_000),
+            ("2026-09-21T16:13:20.250+02:00", 1_790_000_000_250),
+            ("1969-12-31T23:59:59.900Z", -100),
+        ] {
+            assert_eq!(parse_iso8601_ms(text), Some(ms), "{text}");
+        }
+        assert_eq!(
+            parse_iso8601("2026-09-21T14:13:20.999Z"),
+            Some(1_790_000_000),
+            "seconds still drop the fraction, never round it"
+        );
+    }
+
+    #[test]
+    fn milliseconds_refuse_what_seconds_refuse() {
+        for text in [
+            "",
+            "2026-09-21T14:13:20",
+            "2026-09-21T14:13:20.Z",
+            "2026-09-21T14:13:20.12x3Z",
+            "2026-02-30T00:00:00.000Z",
+            "2026-09-21 14:13:20.000Z",
+            "2026-09-21T24:00:00.000Z",
+        ] {
+            assert_eq!(parse_iso8601_ms(text), None, "{text:?}");
+            assert_eq!(parse_iso8601(text), None, "{text:?}");
+        }
     }
 }

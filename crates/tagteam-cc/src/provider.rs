@@ -1,9 +1,11 @@
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Map, Value};
+use tagteam_core::tokens::PriceTable;
 use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::http::Http;
 use tagteam_provider::process::{ProcessSpawner, SpawnSpec};
@@ -11,10 +13,10 @@ use tagteam_provider::profile::refuse_linked_credential;
 use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, Check, CredLocks, Credential, DoomedEntry, Env,
-    FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LiveAuth, LiveChange,
-    LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare, MutationGuard, Pace,
-    PollBudget, Provider, ProviderError, Read, SessionEnv, SharePolicy, StoredLogin, Undo,
-    UsageResult, Validity, Window, Written,
+    FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LineError, LiveAuth,
+    LiveChange, LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare,
+    MutationGuard, Pace, PollBudget, Provider, ProviderError, Read, SessionEnv, SharePolicy,
+    StoredLogin, Undo, UsageLine, UsageResult, Validity, Window, Written,
 };
 
 use crate::config;
@@ -26,8 +28,10 @@ use crate::locks;
 use crate::naming::{ItemKind, keychain_account, keychain_service};
 use crate::oauth;
 use crate::paths::{CcPaths, nfc};
+use crate::prices;
 use crate::session::{self, CC_MUST_SHARE, CC_PRIVATE, CC_SHARED};
 use crate::shape::{self, KIND_API_KEY, KINDS, MACHINE_SHARED_KEYS};
+use crate::transcripts;
 use crate::usage;
 
 /// A live read that is too stale or unreliable to compose from, but that isn't itself an
@@ -257,7 +261,7 @@ impl Provider for ClaudeCode {
             api_keys: true,
             sessions: true,
             statusline: true,
-            transcripts: false,
+            transcripts: true,
         }
     }
 
@@ -653,6 +657,11 @@ impl Provider for ClaudeCode {
         profile.join("sessions")
     }
 
+    /// `<config_home>/sessions` (token report ruling R2).
+    fn default_session_records_dir(&self, env: &Env) -> Option<PathBuf> {
+        Some(CcPaths::resolve(env).config_home.join("sessions"))
+    }
+
     fn supervisor_lock(&self, profile: &Path) -> Option<PathBuf> {
         Some(profile.join("daemon.lock"))
     }
@@ -835,6 +844,19 @@ impl Provider for ClaudeCode {
             }
         }
         hosts
+    }
+
+    /// `<config_home>/projects`, which every profile links (token report spec §2.1).
+    fn transcript_files(&self, env: &Env) -> io::Result<Vec<PathBuf>> {
+        transcripts::discover(&env.guard(CcPaths::resolve(env).config_home.join("projects")))
+    }
+
+    fn parse_usage_line(&self, line: &[u8]) -> Result<Option<UsageLine>, LineError> {
+        transcripts::parse_usage_line(line)
+    }
+
+    fn price_table(&self) -> &'static PriceTable {
+        &prices::PRICES
     }
 }
 
