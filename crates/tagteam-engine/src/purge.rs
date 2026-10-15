@@ -27,6 +27,7 @@ use crate::lifecycle::{UnlistedRescues, absent, identity, trace_path};
 use crate::rescue::RescueUnlisted;
 use crate::session::{SessionState, session_owned_error};
 use crate::store::{AccountRow, Store};
+use crate::tokens::{lock_until_free, tokens_lock_path};
 use crate::vault::Leftovers;
 
 /// §10.5: Keychain items are not a provider's, so the flag that deletes the ones no account
@@ -354,9 +355,15 @@ impl Engine {
             }
         }
         // 9. An account step 7 could not delete keeps its row, so the store's rows stay too.
+        // Every account lock is released by now; the tokens locks taken here are leaves.
         match &plan.provider {
-            Some(p) => self.purge_provider_rest(p, unfinished, &mut report),
-            None => self.purge_everything_else(plan.keychain_orphans, unfinished, &mut report),
+            Some(p) => self.purge_provider_rest(p, unfinished, &mut report)?,
+            None => self.purge_everything_else(
+                &providers,
+                plan.keychain_orphans,
+                unfinished,
+                &mut report,
+            )?,
         }
         Ok(report)
     }
@@ -377,6 +384,31 @@ impl Engine {
                 }
             })
             .collect()
+    }
+
+    /// Spec §5.1, §13: the tokens lock of each of `providers`, waited for (cancellably), so a
+    /// purge never falls between two batches of a refresh. They are taken last, under the
+    /// engine and mutation locks once every account lock is released, in provider order. A
+    /// refresh holds one tokens lock and waits on nothing while it does, and two purges never
+    /// overlap, so these waits close no cycle; nothing is taken while they are held. The test
+    /// hooks `purge-tokens-lock` and `purge-tokens-locked` lie immediately before and after the
+    /// wait.
+    fn hold_tokens_locks(&self, providers: &[ProviderId]) -> Result<Vec<FlockGuard>, EngineError> {
+        let mut sorted: Vec<&ProviderId> = providers.iter().collect();
+        sorted.sort();
+        sorted.dedup();
+        hooks::point(self, "purge-tokens-lock")?;
+        let locks = sorted
+            .into_iter()
+            .map(|p| {
+                Ok(lock_until_free(
+                    &tokens_lock_path(&self.env, p),
+                    &self.env.cancel,
+                )?)
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        hooks::point(self, "purge-tokens-locked")?;
+        Ok(locks)
     }
 
     /// §10.5 step 7: one account, under its account lock, re-checked as `remove` checks it
@@ -1110,14 +1142,15 @@ impl Engine {
     }
 
     /// §10.5 with `--provider P`, once its accounts are gone: P's displaced entries, each file
-    /// before its row (§6.3), then its other rows. Its `usage_requests` rows stay. With
-    /// `unfinished` accounts left, P's rows stay with them, and a failure says so.
+    /// before its row (§6.3), then its other rows, under P's tokens lock (spec §5.1). Its
+    /// `usage_requests` rows stay. With `unfinished` accounts left, P's rows stay with them, and
+    /// a failure says so. Only an interrupted wait for the tokens lock ends it with an error.
     fn purge_provider_rest(
         &self,
         provider: &ProviderId,
         unfinished: usize,
         report: &mut PurgeReport,
-    ) {
+    ) -> Result<(), EngineError> {
         // R-T4-purgeerror: `purge_displaced` stops at its first failure, and the entries before
         // it stay deleted, so they count; the failure is reported with its cause.
         match self.displaced_of(provider) {
@@ -1150,11 +1183,16 @@ impl Engine {
                 .push((what, store_kept(unfinished, "", &again)));
         } else {
             let rows = self.existing_store().and_then(|store| match store {
-                Some(s) => Ok(s.delete_provider_rows(provider)?),
+                Some(s) => {
+                    let _tokens = self.hold_tokens_locks(std::slice::from_ref(provider))?;
+                    Ok(s.delete_provider_rows(provider)?)
+                }
                 None => Ok(()),
             });
-            if let Err(e) = rows {
-                report.failures.push((what, e.to_string()));
+            match rows {
+                Ok(()) => {}
+                Err(e) if e.signal().is_some() => return Err(e),
+                Err(e) => report.failures.push((what, e.to_string())),
             }
         }
         tracing::info!(
@@ -1165,6 +1203,7 @@ impl Engine {
             failures = report.failures.len(),
             "purge finished"
         );
+        Ok(())
     }
 
     /// §10.5 without `--provider`, once every account is gone, in the spec's order. With
@@ -1173,14 +1212,18 @@ impl Engine {
     /// which may be their entries; and the `rescue` path, since a newer generation deleted from
     /// it while the vault keeps the consumed one is what vault first rules out (§10.5 "A purge
     /// that stops part-way"). One failure says so. `displaced/`, dead temp files and the log
-    /// are no account's, and go either way. The log goes last, and nothing is logged after it:
-    /// a line would create it again (Decision 9).
+    /// are no account's, and go either way. The store is emptied under the tokens lock of every
+    /// affected provider and of every provider with rows in the token tables (spec §5.1, §13),
+    /// one with no account, or one only another build registers, included; only an interrupted
+    /// wait for one ends it with an error. The log goes last, and nothing is logged after it: a
+    /// line would create it again (Decision 9).
     fn purge_everything_else(
         &self,
+        providers: &[ProviderId],
         keychain_orphans: bool,
         unfinished: usize,
         report: &mut PurgeReport,
-    ) {
+    ) -> Result<(), EngineError> {
         let data = self.env.data_dir();
         if unfinished == 0 {
             self.sweep_vault(keychain_orphans, report);
@@ -1231,14 +1274,23 @@ impl Engine {
         } else {
             match self.existing_store() {
                 Ok(None) => report.store_emptied = true,
-                Ok(Some(store)) => match store.empty_all() {
-                    Ok(()) => report.store_emptied = true,
+                Ok(Some(store)) => match store
+                    .token_providers()
+                    .map_err(EngineError::from)
+                    .and_then(|stored| self.hold_tokens_locks(&[providers, &stored].concat()))
+                {
+                    Ok(_tokens) => match store.empty_all() {
+                        Ok(()) => report.store_emptied = true,
+                        Err(e) => report.failures.push(("the store".into(), e.to_string())),
+                    },
+                    Err(e) if e.signal().is_some() => return Err(e),
                     Err(e) => report.failures.push(("the store".into(), e.to_string())),
                 },
                 Err(e) => report.failures.push(("the store".into(), e.to_string())),
             }
         }
         self.delete_log(report);
+        Ok(())
     }
 
     /// §10.5 for a full purge that found no data directory: only what lies outside one, the
