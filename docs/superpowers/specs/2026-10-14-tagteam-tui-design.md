@@ -1,6 +1,6 @@
 # tagteam — sub-project 3: TUI
 
-**Status:** Approved
+**Status:** In progress — branch `tui` (part A implemented; parts B and C to come)
 **Date:** 2026-10-14
 **Scope:** `tagteam tui`: a terminal UI over the existing engine. It is the main place to read
 the token report, and it shows accounts with their limit windows and pace, and usage history.
