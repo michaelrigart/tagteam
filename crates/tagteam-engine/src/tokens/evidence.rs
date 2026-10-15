@@ -199,7 +199,8 @@ impl Engine {
 
     /// Spec §6.1's poll, every 2 seconds while the child runs: its record,
     /// `<records dir>/<pid>.json`, is read again only when its mtime moved, and the sighting of
-    /// the session it names, keyed by its `startedAt`, is extended to now. The store writes at
+    /// the session it names, keyed by its `startedAt`, is extended to now, only when the poll
+    /// sees it. The store writes at
     /// most once a minute (spec §6.4). A record caught part-way through its write, or one that is
     /// not this child's, is read again at the next poll.
     pub fn poll_launch(
@@ -211,11 +212,14 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let p = self.provider(&id.provider)?;
         let record = p.session_records_dir(profile).join(format!("{pid}.json"));
-        match fs::metadata(&record) {
+        // Whether this poll sees a session: the record read now, or unchanged since the read
+        // that saw it. One that does not read as this child's, or is gone, shows none, and the
+        // child may have left the session it saw last (`/clear`): that one is not extended.
+        let sees = match fs::metadata(&record) {
             Ok(meta) => {
                 let mtime =
                     i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
-                if state.last_mtime_ns != Some(mtime) {
+                state.last_mtime_ns == Some(mtime) || {
                     // Only this child's own execution: a record of its pid, started no earlier
                     // than the launch, whose process still runs. One a crashed execution left
                     // behind under a reused pid is skipped, and not remembered.
@@ -228,17 +232,18 @@ impl Engine {
                                 && record_is_live(self.process.as_ref(), r, p.launch_command())
                         })
                         .and_then(|r| r.session_id.zip(r.started_at_ms));
-                    if let Some(seen) = seen {
+                    if let Some(seen) = &seen {
                         state.last_mtime_ns = Some(mtime);
-                        state.last_sighting = Some(seen);
+                        state.last_sighting = Some(seen.clone());
                     }
+                    seen.is_some()
                 }
             }
             // Not written yet, or already removed at the child's exit.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
             Err(e) => return Err(e.into()),
-        }
-        let Some((session_id, first_at)) = &state.last_sighting else {
+        };
+        let (true, Some((session_id, first_at))) = (sees, &state.last_sighting) else {
             return Ok(());
         };
         let now = self.now_ms();
