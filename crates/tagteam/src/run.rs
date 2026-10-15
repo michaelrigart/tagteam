@@ -243,6 +243,7 @@ fn wait_polling<T>(
         let mut record_logged = false;
         let mut next = Instant::now();
         let (mut check_logged, mut write_logged) = (false, false);
+        let mut reported = None;
         while !stop.load(Ordering::Relaxed) {
             if let Err(e) = engine.observe_launch(id, profile, pid, seen) {
                 if !check_logged {
@@ -253,6 +254,7 @@ fn wait_polling<T>(
                     check_logged = true;
                 }
             }
+            report_confirmed(seen, &mut reported);
             if Instant::now() >= next {
                 if !launch.recorded.load(Ordering::Relaxed) {
                     match engine.record_launch(id) {
@@ -439,6 +441,27 @@ fn pause_point(name: &str) {
 
 #[cfg(not(feature = "test-support"))]
 fn pause_point(_name: &str) {}
+
+/// A test-only report of the poller's checks: with `TAGTEAM_TEST_CONFIRMED_AT=<file>`, each time
+/// the current tenure's `confirmed_at` moves, the poller writes it to that file (epoch ms), so a
+/// binary test can wait for a check after a store write rather than sleep. `reported` is what it
+/// wrote last.
+#[cfg(feature = "test-support")]
+fn report_confirmed(seen: &LaunchPoll, reported: &mut Option<i64>) {
+    let Some(path) = std::env::var_os("TAGTEAM_TEST_CONFIRMED_AT") else {
+        return;
+    };
+    let Some(at) = seen.tenure.as_ref().map(|t| t.confirmed_at) else {
+        return;
+    };
+    if *reported != Some(at) {
+        *reported = Some(at);
+        let _ = std::fs::write(path, at.to_string());
+    }
+}
+
+#[cfg(not(feature = "test-support"))]
+fn report_confirmed(_seen: &LaunchPoll, _reported: &mut Option<i64>) {}
 
 #[cfg(test)]
 mod tests {
