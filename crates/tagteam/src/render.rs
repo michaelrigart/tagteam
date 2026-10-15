@@ -821,6 +821,7 @@ pub(crate) mod testutil {
             age_s: None,
             error: error.map(str::to_owned),
             retry_at: retry_in.map(|s| NOW + s),
+            next_poll_at: None,
         }
     }
 
@@ -897,6 +898,7 @@ pub(crate) mod testutil {
             age_s: Some(age_s),
             error: None,
             retry_at: None,
+            next_poll_at: None,
         }
     }
 }

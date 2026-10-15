@@ -415,6 +415,33 @@ fn the_retry_is_the_later_of_the_backoff_and_the_next_planned_poll() {
 }
 
 #[test]
+fn the_next_poll_is_shown_while_it_is_ahead_and_not_clock_skew() {
+    // TUI spec §5.2's detail pane shows the next poll, whatever the status: an `ok` reading has
+    // no retry time, but its next poll is planned all the same.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let skewed = fx.add("b@x.co", "rt-b");
+    let unread = fx.add("c@x.co", "rt-c");
+    record(&fx, &a, &reading(T0, 9.0, 40.0), T0, T0 + 180);
+    record(&fx, &skewed, &reading(T0, 9.0, 40.0), T0, T0 + 86_400);
+    at(&fx, T0 + 60);
+    let u = usage_of(&fx.engine, &a);
+    assert_eq!(
+        (u.status, u.retry_at, u.next_poll_at),
+        (UsageStatus::Ok, None, Some(T0 + 180))
+    );
+    // A plan a day ahead is clock skew, as `retry_at` treats it (§8.4).
+    assert_eq!(usage_of(&fx.engine, &skewed).next_poll_at, None);
+    // Never read, so nothing is planned.
+    assert_eq!(usage_of(&fx.engine, &unread).next_poll_at, None);
+    // A re-plan moves it, and once it has passed nothing is ahead.
+    replan(&fx, &a, T0 + 1_200);
+    assert_eq!(usage_of(&fx.engine, &a).next_poll_at, Some(T0 + 1_200));
+    at(&fx, T0 + 1_200);
+    assert_eq!(usage_of(&fx.engine, &a).next_poll_at, None);
+}
+
+#[test]
 fn a_clock_skewed_plan_is_not_a_plan_in_force_for_trust() {
     // A 600 s-old reading with no failure, no lease and no recent 429 is decision-grade only
     // while a poll is planned. A `next_poll_at` a day ahead (a clock that ran ahead, then was
