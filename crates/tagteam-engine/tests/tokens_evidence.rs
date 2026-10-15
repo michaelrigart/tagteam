@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use common::{Fx, LSTART};
 use serde_json::json;
 use tagteam_engine::store::{LaunchRow, SightingRow, SightingSource};
-use tagteam_engine::tokens::{LaunchId, LaunchPoll};
+use tagteam_engine::tokens::{LaunchId, LaunchPoll, Tenure};
 use tagteam_provider::{FakeProcess, FlockGuard, LAUNCH_DIR, parse_lstart};
 
 const NOW: i64 = 1_790_000_000_000;
@@ -113,6 +113,18 @@ fn set_mtime(path: &Path, secs: u64) {
         .unwrap()
         .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
         .unwrap();
+}
+
+/// One tick of `run`'s poller that is also a 2 s write, for the child 777: the check of its
+/// record, then the store write (spec §6.1).
+fn poll(fx: &Fx, id: &LaunchId, profile: &Path, state: &mut LaunchPoll) {
+    check(fx, id, profile, state);
+    fx.engine.poll_launch(id, state).unwrap();
+}
+
+/// One 50 ms check of the child 777's record, with no store write (spec §6.1).
+fn check(fx: &Fx, id: &LaunchId, profile: &Path, state: &mut LaunchPoll) {
+    fx.engine.observe_launch(id, profile, 777, state).unwrap();
 }
 
 #[test]
@@ -410,9 +422,11 @@ fn a_planned_launch_is_recorded_late_with_its_own_start_and_recording_is_idempot
 }
 
 #[test]
-fn polling_reads_the_record_only_when_it_changed() {
-    // Spec §6.1: `run` reads its child's record only when its mtime moved, and extends the
-    // sighting of the session it saw last, at most once a minute (spec §6.4).
+fn checking_reads_the_record_only_when_its_mtime_moved() {
+    // Spec §6.1: each check `stat`s the child's record, and reads it only when its mtime moved
+    // since the read that named the current tenure's session; unchanged, it confirms that
+    // tenure. The write extends the stored tenure to its last confirmation, at most once a
+    // minute (spec §6.4).
     let fx = Fx::new();
     let cc = fx.provider();
     let a = fx.add("a@x.co", "rt-a");
@@ -421,9 +435,7 @@ fn polling_reads_the_record_only_when_it_changed() {
     let mut state = LaunchPoll::default();
     let run = SightingSource::Run;
 
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
+    poll(&fx, &id, &profile, &mut state);
     assert_eq!(state, LaunchPoll::default(), "no record yet");
     assert!(sightings(&fx).is_empty());
 
@@ -434,39 +446,49 @@ fn polling_reads_the_record_only_when_it_changed() {
     running(&fx, 777, None);
     let path = record(&fx, &profile, 777, "s-a", started, "interactive");
     set_mtime(&path, 1_790_000_000);
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
-    assert_eq!(state.last_sighting, Some(("s-a".to_owned(), started)));
+    poll(&fx, &id, &profile, &mut state);
+    assert_eq!(
+        state.tenure,
+        Some(Tenure {
+            session_id: "s-a".into(),
+            started_at: started,
+            first_at: polled,
+            confirmed_at: polled
+        })
+    );
     assert_eq!(
         sightings(&fx),
         [sighting(
             "s-a",
             a.as_str(),
             started,
-            started,
+            polled,
             polled,
             run,
             polled
         )]
     );
 
-    // Rewritten under the same mtime: not read again, and the sighting it saw is extended.
+    // Rewritten under the same mtime: not read again, so the check confirms s-a.
     record(&fx, &profile, 777, "s-b", started, "interactive");
     set_mtime(&path, 1_790_000_000);
     fx.clock.advance_ms(61_000);
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
-    assert_eq!(state.last_sighting, Some(("s-a".to_owned(), started)));
     let later = polled + 61_000;
+    poll(&fx, &id, &profile, &mut state);
+    assert_eq!(
+        state
+            .tenure
+            .as_ref()
+            .map(|t| (t.session_id.as_str(), t.confirmed_at)),
+        Some(("s-a", later))
+    );
     assert_eq!(
         sightings(&fx),
         [sighting(
             "s-a",
             a.as_str(),
             started,
-            started,
+            polled,
             later,
             run,
             later
@@ -474,26 +496,144 @@ fn polling_reads_the_record_only_when_it_changed() {
     );
 
     // Its mtime moves: read again. `/clear` rewrites the record this way, with a new
-    // `sessionId` under the same `startedAt` (spec §17 T1), and the new session is sighted too.
+    // `sessionId` under the same `startedAt` (spec §17 T1): s-b is sighted from this read, and
+    // s-a's tenure ends at its last confirmation.
     set_mtime(&path, 1_790_000_001);
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
-    assert_eq!(state.last_sighting, Some(("s-b".to_owned(), started)));
+    fx.clock.advance_ms(50);
+    let read = later + 50;
+    poll(&fx, &id, &profile, &mut state);
+    assert_eq!(
+        state
+            .tenure
+            .as_ref()
+            .map(|t| (t.session_id.as_str(), t.first_at)),
+        Some(("s-b", read))
+    );
     assert_eq!(
         sightings(&fx),
         [
-            sighting("s-a", a.as_str(), started, started, later, run, later),
-            sighting("s-b", a.as_str(), started, started, later, run, later),
+            sighting("s-a", a.as_str(), started, polled, later, run, later),
+            sighting("s-b", a.as_str(), started, read, read, run, read),
+        ]
+    );
+}
+
+#[test]
+fn a_session_that_enters_a_running_process_is_sighted_from_the_read_that_first_named_it() {
+    // Spec §6.1, §6.4: the child's record names s-a, and later, under the same `startedAt`,
+    // s-b (`/clear` or `/resume`, spec §17 T1). s-b entered a process that was already running:
+    // it is sighted from the read that first named it, not from the execution's start, and
+    // s-a's tenure ends at the last check that confirmed it.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    let run = SightingSource::Run;
+    let started = NOW + 500;
+    running(&fx, 777, None);
+    let path = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&path, 1_790_000_000);
+    fx.clock.advance_ms(1_000);
+    poll(&fx, &id, &profile, &mut state);
+    fx.clock.advance_ms(30_000);
+    poll(&fx, &id, &profile, &mut state);
+    let confirmed = NOW + 31_000;
+
+    record(&fx, &profile, 777, "s-b", started, "interactive");
+    set_mtime(&path, 1_790_000_001);
+    fx.clock.advance_ms(9_000);
+    poll(&fx, &id, &profile, &mut state);
+    let switched = NOW + 40_000;
+    assert_eq!(
+        sightings(&fx),
+        [
+            sighting(
+                "s-a",
+                a.as_str(),
+                started,
+                NOW + 1_000,
+                confirmed,
+                run,
+                switched
+            ),
+            sighting(
+                "s-b",
+                a.as_str(),
+                started,
+                switched,
+                switched,
+                run,
+                switched
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_return_to_a_session_the_child_left_starts_a_new_tenure() {
+    // Spec §6.1, the `/resume` case: the child leaves s-a for s-b and comes back. Both switches
+    // fall between two writes, 50 ms checks apart; the write ends each tenure exactly at its
+    // last confirmation, and the return to s-a is a tenure of its own. The time s-a spent away,
+    // where it may have run elsewhere, is never bridged.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    let started = NOW + 500;
+    running(&fx, 777, None);
+    let path = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&path, 1_790_000_000);
+    fx.clock.advance_ms(1_000);
+    poll(&fx, &id, &profile, &mut state);
+    for (at, session, mtime) in [
+        (1_050, None, None),
+        (1_100, Some("s-b"), Some(1_790_000_001)),
+        (1_150, None, None),
+        (1_200, Some("s-a"), Some(1_790_000_002)),
+        (1_250, None, None),
+    ] {
+        if let (Some(session), Some(mtime)) = (session, mtime) {
+            record(&fx, &profile, 777, session, started, "interactive");
+            set_mtime(&path, mtime);
+        }
+        fx.clock.set(NOW + at);
+        check(&fx, &id, &profile, &mut state);
+    }
+    assert_eq!(state.ended.len(), 2, "{state:?}");
+
+    fx.engine.poll_launch(&id, &mut state).unwrap();
+    assert!(state.ended.is_empty(), "{state:?}");
+    let run = |session: &str, first: i64, last: i64| {
+        sighting(
+            session,
+            a.as_str(),
+            started,
+            NOW + first,
+            NOW + last,
+            SightingSource::Run,
+            NOW + 1_250,
+        )
+    };
+    assert_eq!(
+        sightings(&fx),
+        [
+            run("s-a", 1_000, 1_050),
+            run("s-a", 1_200, 1_250),
+            run("s-b", 1_100, 1_150)
         ]
     );
 }
 
 #[test]
 fn a_poll_that_sees_no_session_extends_none() {
-    // Spec §6.1: a poll extends the sighting of the session it sees. A record rewritten into
-    // one that does not read as this child's, or one that is gone, shows no session: the child
-    // may have left the one it saw last (`/clear`), so that sighting is not extended.
+    // Spec §6.1: only a check that sees the tenure's session confirms it. A record rewritten
+    // into one that does not read as this child's, or one that is gone, shows no session: the
+    // child may have left the one it saw last (`/clear`), so that tenure is not extended, by the
+    // checks or by the writes after them. Such a record is read again at the next check.
     let fx = Fx::new();
     let cc = fx.provider();
     let a = fx.add("a@x.co", "rt-a");
@@ -507,33 +647,31 @@ fn a_poll_that_sees_no_session_extends_none() {
     set_mtime(&path, 1_790_000_000);
     fx.clock.advance_ms(2_000);
     let polled = NOW + 2_000;
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
+    poll(&fx, &id, &profile, &mut state);
     let seen = vec![sighting(
         "s-a",
         a.as_str(),
         started,
-        started,
+        polled,
         polled,
         run,
         polled,
     )];
     assert_eq!(sightings(&fx), seen);
+    let confirmed = state.clone();
 
     fs::write(&path, b"{\"pid\": 777, \"sessionId\":").unwrap();
     set_mtime(&path, 1_790_000_001);
     fx.clock.advance_ms(61_000);
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
+    poll(&fx, &id, &profile, &mut state);
+    check(&fx, &id, &profile, &mut state);
+    assert_eq!(state, confirmed, "a record that does not read");
     assert_eq!(sightings(&fx), seen, "a record that does not read");
 
     fs::remove_file(&path).unwrap();
     fx.clock.advance_ms(61_000);
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
+    poll(&fx, &id, &profile, &mut state);
+    assert_eq!(state, confirmed, "a record that is gone");
     assert_eq!(sightings(&fx), seen, "a record that is gone");
 }
 
@@ -551,9 +689,7 @@ fn a_stale_record_with_a_reused_pid_is_ignored() {
     let path = record(&fx, &profile, 777, "s-old", NOW - 3_600_000, "interactive");
     let id = fx.engine.open_launch(&cc, &a).unwrap();
     let mut state = LaunchPoll::default();
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
+    poll(&fx, &id, &profile, &mut state);
     assert_eq!(state, LaunchPoll::default(), "not remembered");
     assert!(sightings(&fx).is_empty(), "not sighted");
 
@@ -565,31 +701,33 @@ fn a_stale_record_with_a_reused_pid_is_ignored() {
         "sessionId": "s-x"
     });
     fs::write(&path, other_pid.to_string()).unwrap();
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
+    poll(&fx, &id, &profile, &mut state);
     gone(&fx, 777);
     record(&fx, &profile, 777, "s-dead", NOW + 10, "interactive");
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
+    poll(&fx, &id, &profile, &mut state);
     assert_eq!(state, LaunchPoll::default());
     assert!(sightings(&fx).is_empty());
 
     running(&fx, 777, None);
     fx.clock.advance_ms(1_000);
     record(&fx, &profile, 777, "s-new", NOW + 500, "interactive");
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
-    assert_eq!(state.last_sighting, Some(("s-new".to_owned(), NOW + 500)));
+    poll(&fx, &id, &profile, &mut state);
+    assert_eq!(
+        state.tenure,
+        Some(Tenure {
+            session_id: "s-new".into(),
+            started_at: NOW + 500,
+            first_at: NOW + 1_000,
+            confirmed_at: NOW + 1_000
+        })
+    );
     assert_eq!(
         sightings(&fx),
         [sighting(
             "s-new",
             a.as_str(),
             NOW + 500,
-            NOW + 500,
+            NOW + 1_000,
             NOW + 1_000,
             SightingSource::Run,
             NOW + 1_000
@@ -598,10 +736,121 @@ fn a_stale_record_with_a_reused_pid_is_ignored() {
 }
 
 #[test]
+fn a_write_that_fails_keeps_what_it_did_not_store() {
+    // Spec §6.1: a failed write loses none of the tenures the checks saw. They stay queued, and
+    // the next write ends each exactly at its last confirmation.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    let started = NOW + 500;
+    running(&fx, 777, None);
+    let path = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&path, 1_790_000_000);
+    fx.clock.advance_ms(1_000);
+    check(&fx, &id, &profile, &mut state);
+    record(&fx, &profile, 777, "s-b", started, "interactive");
+    set_mtime(&path, 1_790_000_001);
+    fx.clock.advance_ms(50);
+    check(&fx, &id, &profile, &mut state);
+    let raw = rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db")).unwrap();
+    raw.execute_batch("ALTER TABLE session_sightings RENAME TO hidden;")
+        .unwrap();
+    assert!(fx.engine.poll_launch(&id, &mut state).is_err());
+    assert_eq!(state.ended.len(), 1, "{state:?}");
+
+    raw.execute_batch("ALTER TABLE hidden RENAME TO session_sightings;")
+        .unwrap();
+    fx.clock.advance_ms(2_000);
+    fx.engine.poll_launch(&id, &mut state).unwrap();
+    assert!(state.ended.is_empty(), "{state:?}");
+    let written = NOW + 3_050;
+    let run = SightingSource::Run;
+    assert_eq!(
+        sightings(&fx),
+        [
+            sighting(
+                "s-a",
+                a.as_str(),
+                started,
+                NOW + 1_000,
+                NOW + 1_000,
+                run,
+                written
+            ),
+            sighting(
+                "s-b",
+                a.as_str(),
+                started,
+                NOW + 1_050,
+                NOW + 1_050,
+                run,
+                written
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_scan_after_the_child_returns_to_a_session_never_bridges_its_absence() {
+    // Spec §6.4: the child left s-a for s-b for over a minute, then came back. A scan that reads
+    // the record after the return, before the poller's next write, finds s-b's tenure stored
+    // since s-a's ended, so it starts a tenure of its own rather than stretching s-a's first one
+    // over the time s-a was away. The poller's next write stores its own tenure beside it.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    let started = NOW + 500;
+    running(&fx, 777, None);
+    let path = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&path, 1_790_000_000);
+    fx.clock.advance_ms(1_000);
+    poll(&fx, &id, &profile, &mut state);
+    record(&fx, &profile, 777, "s-b", started, "interactive");
+    set_mtime(&path, 1_790_000_001);
+    fx.clock.advance_ms(50);
+    poll(&fx, &id, &profile, &mut state);
+    fx.clock.advance_ms(90_000);
+    poll(&fx, &id, &profile, &mut state);
+
+    record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&path, 1_790_000_002);
+    fx.clock.advance_ms(50);
+    sight(&fx);
+    let (run, scan) = (SightingSource::Run, SightingSource::Scan);
+    let (left, away, back) = (NOW + 1_000, NOW + 91_050, NOW + 91_100);
+    let first = sighting("s-a", a.as_str(), started, left, left, run, left);
+    let other = sighting("s-b", a.as_str(), started, left + 50, away, run, away);
+    let scanned = sighting("s-a", a.as_str(), started, back, back, scan, back);
+    assert_eq!(
+        sightings(&fx),
+        [first.clone(), scanned.clone(), other.clone()]
+    );
+
+    fx.clock.advance_ms(50);
+    poll(&fx, &id, &profile, &mut state);
+    let polled = sighting(
+        "s-a",
+        a.as_str(),
+        started,
+        back + 50,
+        back + 50,
+        run,
+        back + 50,
+    );
+    assert_eq!(sightings(&fx), [first, scanned, polled, other]);
+}
+
+#[test]
 fn close_leaves_the_launch_open_while_a_background_session_runs() {
-    // Spec §6.1: at the child's exit the sighting it saw last ends then, and the launch closes
-    // only once the profile is no longer in use. A background session the child started keeps
-    // it open; the next scan that finds the profile idle closes it.
+    // Spec §6.1: at the child's exit its tenure ends at its last confirmation, and the launch
+    // closes only once the profile is no longer in use. A background session the child started
+    // keeps it open; the next scan that finds the profile idle closes it.
     let fx = Fx::new();
     let cc = fx.provider();
     let a = fx.add("a@x.co", "rt-a");
@@ -610,9 +859,7 @@ fn close_leaves_the_launch_open_while_a_background_session_runs() {
     let mut state = LaunchPoll::default();
     running(&fx, 777, None);
     let child = record(&fx, &profile, 777, "s-a", NOW, "interactive");
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
+    poll(&fx, &id, &profile, &mut state);
     // The child exits and its record goes; a background session it started lives on.
     fs::remove_file(&child).unwrap();
     gone(&fx, 777);
@@ -628,9 +875,9 @@ fn close_leaves_the_launch_open_while_a_background_session_runs() {
             a.as_str(),
             NOW,
             NOW,
-            exit,
+            NOW,
             SightingSource::Run,
-            exit
+            NOW
         )),
         "{:?}",
         sightings(&fx)
@@ -678,65 +925,107 @@ fn close_leaves_the_launch_open_while_another_launcher_holds_the_profile() {
 }
 
 #[test]
-fn close_stamps_the_sighting_at_the_exit_not_at_the_close() {
-    // Spec §6.1: the sighting ends when the child exited. `run`'s exit handling, which may wait
-    // on locks, comes before the close; only the launch may close late. A poll in flight as the
-    // child exited may have stamped the sighting later: the close moves it back to the exit.
+fn close_ends_the_tenure_at_its_last_confirming_read() {
+    // Spec §6.1: at the child's exit its tenure ends at the last check that confirmed it, not at
+    // the exit: the child may have left its session after that check, and the session run
+    // elsewhere since. A later stamp, here a scan's read between the last check and the exit,
+    // is moved back. The launch still closes at its idle check, after exit handling.
     let fx = Fx::new();
     let cc = fx.provider();
     let a = fx.add("a@x.co", "rt-a");
     let profile = fx.make_profile(&a);
     let id = fx.engine.open_launch(&cc, &a).unwrap();
     let mut state = LaunchPoll::default();
+    let run = SightingSource::Run;
+    let started = NOW + 500;
     running(&fx, 777, None);
-    let child = record(&fx, &profile, 777, "s-a", NOW + 500, "interactive");
+    let child = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&child, 1_790_000_000);
     fx.clock.advance_ms(1_000);
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
-    // The child exits at t1. The poller's last round, in flight then, saw the record before it
-    // went and stamps the sighting past the exit, and exit handling takes until t2.
+    poll(&fx, &id, &profile, &mut state);
     fx.clock.advance_ms(30_000);
-    let t1 = fx.engine.now_ms();
+    check(&fx, &id, &profile, &mut state);
+    let confirmed = NOW + 31_000;
     fx.clock.advance_ms(61_000);
-    let stamped = fx.engine.now_ms();
-    fx.engine
-        .poll_launch(&id, &profile, 777, &mut state)
-        .unwrap();
+    sight(&fx);
+    let scanned = NOW + 92_000;
+    assert_eq!(
+        sightings(&fx),
+        [sighting(
+            "s-a",
+            a.as_str(),
+            started,
+            NOW + 1_000,
+            scanned,
+            run,
+            scanned
+        )],
+        "the scan continued run's tenure"
+    );
     fs::remove_file(&child).unwrap();
     gone(&fx, 777);
-    let run = SightingSource::Run;
-    assert_eq!(
-        sightings(&fx),
-        [sighting(
-            "s-a",
-            a.as_str(),
-            NOW + 500,
-            NOW + 500,
-            stamped,
-            run,
-            stamped
-        )],
-        "the late poll stamped it past the exit"
-    );
+    fx.clock.advance_ms(10);
+    let exit = fx.engine.now_ms();
     fx.clock.advance_ms(45_000);
-    let t2 = fx.engine.now_ms();
+    let closed = fx.engine.now_ms();
 
-    fx.engine.close_launch(&id, &profile, &state, t1).unwrap();
+    fx.engine.close_launch(&id, &profile, &state, exit).unwrap();
     assert_eq!(
         sightings(&fx),
         [sighting(
             "s-a",
             a.as_str(),
-            NOW + 500,
-            NOW + 500,
-            t1,
+            started,
+            NOW + 1_000,
+            confirmed,
             run,
-            t2
+            closed
         )],
-        "the close moves it back to the exit"
+        "the close moves it back to its last confirming read"
     );
-    assert_eq!(ended(&fx), [(a.to_string(), Some(t2))]);
+    assert_eq!(ended(&fx), [(a.to_string(), Some(closed))]);
+}
+
+#[test]
+fn a_check_after_the_exit_confirms_nothing() {
+    // Spec §6.1: a crash leaves the child's record behind, unchanged, so a check after the
+    // child exited still finds the mtime of the read that named its session. The close ends the
+    // tenure no later than the exit.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    let started = NOW + 500;
+    running(&fx, 777, None);
+    let child = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&child, 1_790_000_000);
+    fx.clock.advance_ms(1_000);
+    poll(&fx, &id, &profile, &mut state);
+    fx.clock.advance_ms(10_000);
+    let exit = fx.engine.now_ms();
+    gone(&fx, 777);
+    fx.clock.advance_ms(40);
+    check(&fx, &id, &profile, &mut state);
+    assert_eq!(
+        state.tenure.as_ref().map(|t| t.confirmed_at),
+        Some(exit + 40)
+    );
+
+    fx.engine.close_launch(&id, &profile, &state, exit).unwrap();
+    assert_eq!(
+        sightings(&fx),
+        [sighting(
+            "s-a",
+            a.as_str(),
+            started,
+            NOW + 1_000,
+            exit,
+            SightingSource::Run,
+            exit + 40
+        )]
+    );
 }
 
 #[test]

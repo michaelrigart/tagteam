@@ -202,11 +202,12 @@ fn run_records_a_launch_and_closes_it() {
 
 #[test]
 fn run_sights_the_child_session() {
-    // Spec §6.1: while the child runs, `run` reads its record every 2 s and sights the session
-    // it names in the profile's home, keyed by the record's `startedAt`. The child's exit,
-    // stamped as soon as the wait returns, is where that sighting ends; the launch closes after
-    // exit handling. The run is parked between the two (`after-exit`), so two reads of the
-    // clock, as the child is let go and at the pause, bracket the stamp whatever anything took.
+    // Spec §6.1: while the child runs, `run` checks its record every 50 ms and writes every
+    // 2 s: the session it names is sighted in the profile's home, in the execution of the
+    // record's `startedAt`, from the read that first named it. The sighting ends at the last
+    // check that confirmed it, never past the child's exit; the launch closes after exit
+    // handling. The run is parked between the two (`after-exit`), so a read of the clock at the
+    // pause bounds the end whatever anything took.
     let home = Home::new();
     let out = home.out("sighting");
     let hold = home.root().join("hold");
@@ -238,14 +239,15 @@ fn run_sights_the_child_session() {
         .unwrap(),
     )
     .unwrap();
+    let started_at = record["startedAt"].as_i64().unwrap();
     assert_eq!(
-        (seen.home.as_str(), seen.source, seen.first_at),
-        (
-            home.a.as_str(),
-            SightingSource::Run,
-            record["startedAt"].as_i64().unwrap()
-        ),
+        (seen.home.as_str(), seen.source, seen.started_at),
+        (home.a.as_str(), SightingSource::Run, started_at),
         "{seen:?}"
+    );
+    assert!(
+        seen.first_at >= started_at,
+        "sighted from a read of the record, once it was written: {seen:?}"
     );
     let launches = home.launches();
     assert_eq!(launches.len(), 1, "{launches:?}");
@@ -253,7 +255,9 @@ fn run_sights_the_child_session() {
         launches[0].started_at <= record["startedAt"].as_i64().unwrap(),
         "the launch is recorded before the spawn: {launches:?}, record {record}"
     );
-    let released_at = now_ms();
+    // The checks go on confirming the session while it runs; a write extends the sighting at
+    // most once a minute, so only the close can carry its end past this first write's.
+    thread::sleep(Duration::from_millis(300));
     fs::write(&hold, b"").unwrap();
     wait_for("the run's exit handling", || {
         pause.join("paused").exists().then_some(())
@@ -267,16 +271,16 @@ fn run_sights_the_child_session() {
         .into_iter()
         .filter(|s| s.session_id == session_id)
         .collect();
-    assert_eq!(after.len(), 1, "one execution, one sighting: {after:?}");
+    assert_eq!(after.len(), 1, "one session, one tenure: {after:?}");
     assert_eq!(after[0].first_at, seen.first_at);
     let ended = home.launches()[0]
         .ended_at
         .expect("closed after exit handling");
-    // A poll writes at most once a minute, so only `close_launch`, which sets the end to the
-    // stamp exactly, can have put it in this bracket.
     assert!(
-        (released_at..=parked_at).contains(&after[0].last_at),
-        "the sighting ends at the exit stamp, between {released_at} and {parked_at}: {after:?}"
+        seen.last_at < after[0].last_at && after[0].last_at <= parked_at,
+        "the close ends the sighting at the last check that confirmed it, after the first \
+         write's end {} and before the pause at {parked_at}: {after:?}",
+        seen.last_at
     );
     assert!(
         parked_at <= ended,

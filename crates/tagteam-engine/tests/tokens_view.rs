@@ -8,10 +8,12 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
+use std::time::{Duration, UNIX_EPOCH};
 
-use common::{FakeFx, Fx, add, cc, record_reading, usage_window};
+use common::{FakeFx, Fx, LSTART, add, cc, record_reading, usage_window};
 use jiff::civil::date;
 use jiff::tz::TimeZone;
+use serde_json::json;
 use tagteam_core::tokens::{BlockSpan, CardOverride, PriceOverride, project};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, WindowKind};
 use tagteam_engine::registry::ProviderRegistry;
@@ -20,13 +22,13 @@ use tagteam_engine::store::{
     EventRow, RefreshStats, SightingRow, SightingSource, Store, UsageRow, usage_key,
 };
 use tagteam_engine::tokens::{
-    AccountSel, ActiveBlock, Basis, Cost, IndexState, PeriodKey, RowAccount, TokenCounts,
-    TokenGrouping, TokenPeriod, TokenQuery, TokenReport,
+    AccountSel, ActiveBlock, Basis, Cost, IndexState, LaunchPoll, PeriodKey, RowAccount,
+    TokenCounts, TokenGrouping, TokenPeriod, TokenQuery, TokenReport,
 };
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::{Engine, EngineConfig};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
-use tagteam_provider::{Provider, RunShell};
+use tagteam_provider::{FakeProcess, Provider, RunShell, parse_lstart};
 
 const MIN: i64 = 60_000;
 const H: i64 = 60 * MIN;
@@ -514,6 +516,89 @@ fn unattributed_is_its_own_bucket_and_last() {
     assert_eq!(
         r.rows[0].accounts,
         [v.account(&v.a), v.account(&v.b), RowAccount::Unattributed]
+    );
+}
+
+#[test]
+fn a_session_resumed_in_a_running_profile_keeps_its_earlier_responses_off_that_account() {
+    // Spec §1.1 criterion 2, the example of the sighting fix: b's `run` child starts at +100 s;
+    // s-1 answers in the default home at +200 s, unsighted there, and exits; the child does
+    // `/resume s-1` at +300 s. `run`'s checks sight s-1 in b's profile from the read that first
+    // named it there, so the answer at +200 s is not b's: b's launch covers it, so it is
+    // unattributed (spec §7.2). The answer at +350 s, inside the sighting, is b's.
+    let v = View::new();
+    let epoch = v.engine.now_ms();
+    let profile = v.fx.make_profile(&v.b);
+    let at = |s: i64| epoch + s * 1_000;
+    v.fx.clock.set(at(100));
+    let id = v.engine.open_launch(&cc(), &v.b).unwrap();
+    v.fx.process.set(
+        777,
+        FakeProcess {
+            exists: Some(true),
+            start_time_s: parse_lstart(LSTART),
+            ..FakeProcess::default()
+        },
+    );
+    let mut state = LaunchPoll::default();
+    let names = |session: &str, mtime_s: u64| {
+        let record = json!({
+            "pid": 777,
+            "procStart": LSTART,
+            "startedAt": at(100) + 500,
+            "kind": "interactive",
+            "sessionId": session
+        });
+        let path =
+            v.fx.plant_record(&profile, "777", record.to_string().as_bytes());
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(mtime_s))
+            .unwrap();
+        path
+    };
+    let mut tick = |when: i64| {
+        v.fx.clock.set(when);
+        v.engine
+            .observe_launch(&id, &profile, 777, &mut state)
+            .unwrap();
+        v.engine.poll_launch(&id, &mut state).unwrap();
+    };
+    names("s-0", 1_790_000_000);
+    tick(at(101));
+    names("s-1", 1_790_000_001);
+    tick(at(300));
+    let path = names("s-1", 1_790_000_002);
+    tick(at(360));
+    fs::remove_file(path).unwrap();
+    v.engine
+        .close_launch(&id, &profile, &state, at(400))
+        .unwrap();
+    v.index(&[
+        v.usage("s-1", at(200), "model-a", 1, 0),
+        v.usage("s-1", at(350), "model-a", 2, 0),
+    ]);
+
+    let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::Account));
+    assert_eq!(
+        r.rows
+            .iter()
+            .map(|row| (row.account.clone(), row.counts))
+            .collect::<Vec<_>>(),
+        [
+            (Some(v.account(&v.b)), counts(2, 0)),
+            (Some(RowAccount::Unattributed), counts(1, 0))
+        ]
+    );
+    assert_eq!(
+        r.total.by_basis,
+        [
+            (Basis::Profile, 2),
+            (Basis::Timeline, 0),
+            (Basis::Unattributed, 1)
+        ]
     );
 }
 
