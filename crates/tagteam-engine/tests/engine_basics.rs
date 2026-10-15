@@ -1,13 +1,18 @@
 mod common;
 
+use std::fs;
+use std::sync::Arc;
+use std::time::Duration;
+
 use common::Fx;
 use serde_json::json;
 use tagteam_core::{AccountId, OracleVerdict};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::oracle::verdict;
-use tagteam_engine::store::{LoginMeta, NewAccount};
+use tagteam_engine::store::{LoginMeta, NewAccount, Store};
 use tagteam_engine::vault::SERVICE;
-use tagteam_provider::{Identity, Provider};
+use tagteam_provider::process::{Captured, SpawnSpec};
+use tagteam_provider::{Cancel, Identity, Provider};
 
 #[test]
 fn reading_commands_never_create_the_store() {
@@ -197,4 +202,98 @@ fn views_carry_each_rows_kind_traits_from_its_provider() {
     let view = fx.engine.account_view(key_row, false);
     assert!(view.kind.managed_key_axis);
     assert_eq!(view.kind.display, Some("api key"));
+}
+
+#[test]
+fn data_version_is_none_without_a_store_and_moves_only_for_another_connection() {
+    // D3 change 4: the daemon's own writes never trigger the store watch (D4.4).
+    let fx = Fx::new();
+    assert_eq!(fx.engine.data_version().unwrap(), None);
+    assert_eq!(fx.engine.store_file(), fx.env.data_dir().join("tagteam.db"));
+    assert!(!fx.engine.store_file().exists(), "never creates the store");
+    fx.add("a@x.co", "rt-a");
+    let first = fx.engine.data_version().unwrap().unwrap();
+    fx.engine
+        .store()
+        .unwrap()
+        .set_unhealthy_ticks(&fx.provider(), 1)
+        .unwrap();
+    assert_eq!(
+        fx.engine.data_version().unwrap(),
+        Some(first),
+        "its own write"
+    );
+    Store::open(&fx.engine.store_file())
+        .unwrap()
+        .set_unhealthy_ticks(&fx.provider(), 2)
+        .unwrap();
+    let second = fx.engine.data_version().unwrap().unwrap();
+    assert_ne!(second, first, "another connection committed");
+}
+
+#[test]
+fn forget_store_makes_the_next_use_open_the_file_again() {
+    // Decision 11: a store deleted and created again under a running engine (its data
+    // directory removed, then a first `add`) is read from the new file, never from the
+    // unlinked one the cached connection still holds.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let file = fx.engine.store_file();
+    let remove_all = || {
+        for name in ["tagteam.db", "tagteam.db-wal", "tagteam.db-shm"] {
+            let _ = fs::remove_file(fx.env.data_dir().join(name));
+        }
+    };
+    let before = fx.engine.existing_store().unwrap().unwrap();
+    remove_all();
+    let replacement = Store::open(&file).unwrap();
+    common::add(&replacement, &fx.provider(), "other", "z@x.co", 1);
+    drop(replacement);
+    assert!(
+        Arc::ptr_eq(&fx.engine.existing_store().unwrap().unwrap(), &before),
+        "still the cached connection"
+    );
+    drop(before);
+    fx.engine.forget_store();
+    let ids: Vec<AccountId> = fx
+        .engine
+        .existing_store()
+        .unwrap()
+        .unwrap()
+        .accounts(&fx.provider())
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(ids, [AccountId::from_string("other")]);
+    // A file that is gone is no store, and nothing creates it.
+    fx.engine.forget_store();
+    remove_all();
+    assert!(fx.engine.existing_store().unwrap().is_none());
+    assert!(!file.exists());
+}
+
+#[test]
+fn the_spawner_is_the_port_the_engine_was_built_with() {
+    // D6.2: the notifier delivers through the engine's own port, so tests script it.
+    let fx = Fx::new();
+    fx.spawner.push(Captured::Exited {
+        code: Some(0),
+        signal: None,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    });
+    let spec = SpawnSpec {
+        program: "/usr/bin/osascript".into(),
+        ..SpawnSpec::default()
+    };
+    let ran = fx
+        .engine
+        .spawner()
+        .run_captured(&spec, Duration::from_secs(5), &Cancel::new());
+    assert!(
+        matches!(ran, Captured::Exited { code: Some(0), .. }),
+        "{ran:?}"
+    );
+    assert_eq!(fx.spawner.specs(), [spec]);
 }

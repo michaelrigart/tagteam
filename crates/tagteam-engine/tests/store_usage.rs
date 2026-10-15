@@ -1358,3 +1358,41 @@ fn a_schedule_written_under_a_clock_that_ran_ahead_does_not_lock_the_account_out
         }
     }
 }
+
+#[test]
+fn take_lease_is_the_single_lease_statement() {
+    // §6.1: held when the statement changed one row, because the lease was free or its
+    // holder's expiry had passed. D6.3's notification markers are such leases.
+    let (_d, path, s) = open();
+    let name = "notify:limit:a:7d:1790291630";
+    assert!(
+        s.take_lease(name, "one", T_MS, T_MS + 60_000).unwrap(),
+        "free"
+    );
+    assert!(
+        !s.take_lease(name, "two", T_MS + 59_999, T_MS + 120_000)
+            .unwrap(),
+        "held until it expires"
+    );
+    assert!(
+        !s.take_lease(name, "one", T_MS + 1, T_MS + 120_000).unwrap(),
+        "by its own holder too"
+    );
+    assert!(
+        s.take_lease(name, "two", T_MS + 60_000, T_MS + 120_000)
+            .unwrap(),
+        "expired"
+    );
+    let (holder, expires_at): (String, i64) = raw(&path)
+        .query_row(
+            "SELECT holder, expires_at FROM leases WHERE name = ?1",
+            [name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((holder.as_str(), expires_at), ("two", T_MS + 120_000));
+    assert!(
+        s.take_lease("another", "one", T_MS, T_MS + 1).unwrap(),
+        "each name is its own lease"
+    );
+}

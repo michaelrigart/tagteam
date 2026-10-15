@@ -854,6 +854,15 @@ impl Store {
         Ok(rows)
     }
 
+    /// SQLite's `PRAGMA data_version` for this connection (D3 change 4): it changes when
+    /// another connection commits to the file, and never for this connection's own commits.
+    /// A value is this connection's only; another connection's are not comparable with it.
+    pub fn data_version(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .lock()
+            .query_row("PRAGMA data_version", [], |r| r.get(0))?)
+    }
+
     fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }

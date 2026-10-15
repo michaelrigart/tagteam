@@ -167,8 +167,35 @@ impl Engine {
         &self.run_shell
     }
 
-    fn store_path(&self) -> PathBuf {
+    /// `<data>/tagteam.db` (§5), whether or not it exists. The daemon's store watch compares
+    /// its device and inode (Decision 11).
+    pub fn store_file(&self) -> PathBuf {
         self.env.data_dir().join("tagteam.db")
+    }
+
+    /// D3 change 4: SQLite's `PRAGMA data_version` on this engine's own connection, which
+    /// changes when another connection commits and never for this engine's own writes (D4.4).
+    /// `None` while there is no store; never creates one (§5). A value read after
+    /// `forget_store` comes from a new connection and is not comparable with one read before.
+    pub fn data_version(&self) -> Result<Option<i64>, EngineError> {
+        match self.existing_store()? {
+            Some(store) => Ok(Some(store.data_version()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Decision 11: drops the engine's cached connection, so the next `store`,
+    /// `existing_store` or `data_version` opens `store_file()` again. A store another
+    /// process deleted or replaced is then the one read and written, never the unlinked file.
+    /// A caller still holding an `Arc<Store>` keeps it until it drops it.
+    pub fn forget_store(&self) {
+        *self.store.lock().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// The process port this engine spawns through (§4.2): the daemon's notifier delivers
+    /// through it (D6.2), so tests script it.
+    pub fn spawner(&self) -> Arc<dyn ProcessSpawner> {
+        self.spawner.clone()
     }
 
     /// Opens the store, creating it (and its directory, 0700) when needed.
@@ -178,7 +205,7 @@ impl Engine {
             return Ok(s.clone());
         }
         let s = Arc::new(Store::open_seeded(
-            &self.store_path(),
+            &self.store_file(),
             &|| self.now_ms(),
             &|| self.seed_launches(),
         )?);
@@ -192,7 +219,7 @@ impl Engine {
         if let Some(s) = slot.as_ref() {
             return Ok(Some(s.clone()));
         }
-        match Store::open_existing_seeded(&self.store_path(), &|| self.now_ms(), &|| {
+        match Store::open_existing_seeded(&self.store_file(), &|| self.now_ms(), &|| {
             self.seed_launches()
         })? {
             Some(s) => {

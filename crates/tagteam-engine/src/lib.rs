@@ -6,6 +6,7 @@ pub mod auto;
 pub mod bootstrap;
 pub mod collect;
 pub mod config;
+pub mod daemon;
 pub mod displace;
 pub mod doctor;
 pub mod engine;

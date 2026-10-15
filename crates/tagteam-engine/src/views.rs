@@ -229,6 +229,20 @@ pub struct HistoryView {
     pub unmatched_window: bool,
 }
 
+/// D3 change 5: the provider's managed live account and its reading, as a tick's decision
+/// uses it, for D6.1's `limit` notice. Its names are for the notice's text (D6.2): position,
+/// alias, email and label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveReading {
+    pub account: AccountId,
+    pub position: u32,
+    pub alias: Option<String>,
+    pub email: Option<String>,
+    pub label: String,
+    /// The decision-grade (§8.4) windows relevant under `models` (§8.2, `is_relevant`).
+    pub windows: Vec<Window>,
+}
+
 /// What `statusline` shows (§13.5).
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -409,6 +423,43 @@ impl Engine {
             return Ok(None);
         }
         Ok(Some(state.last_good.unwrap_or_default()))
+    }
+
+    /// D3 change 5: the managed live account, found as a tick finds it (its identity key,
+    /// §11.2 step 2), and its decision-grade windows (§8.4) relevant under `models` (§8.2).
+    /// `None` with no store, with an absent or unmanaged live login, or without a
+    /// decision-grade reading. An unreadable live identity is an error, as for a tick. Reads
+    /// the live identity and the store only: it never fetches and never creates the store.
+    pub fn live_reading(
+        &self,
+        provider: &ProviderId,
+        models: &[String],
+    ) -> Result<Option<LiveReading>, EngineError> {
+        let p = self.provider(provider)?;
+        let Some(store) = self.existing_store()? else {
+            return Ok(None);
+        };
+        let Some(identity) = self.read_live_identity(p.as_ref())? else {
+            return Ok(None);
+        };
+        let key = p.identity_key(&identity);
+        let Some(row) = store.find_by_identity_key(provider, key.as_str())? else {
+            return Ok(None);
+        };
+        let Some(windows) = self.decision_windows(&row, models)? else {
+            return Ok(None);
+        };
+        Ok(Some(LiveReading {
+            windows: windows
+                .into_iter()
+                .filter(|w| is_relevant(w, models))
+                .collect(),
+            account: row.id,
+            position: row.position,
+            alias: row.alias,
+            email: row.email,
+            label: row.label,
+        }))
     }
 
     fn view(&self, provider: &ProviderId) -> Result<(ProviderAccounts, Read<String>), EngineError> {
