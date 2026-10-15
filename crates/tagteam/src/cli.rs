@@ -8,6 +8,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::aot::{Shell, generate};
 use tagteam_core::CLAUDE_CODE;
 use tagteam_engine::settings::KEYS;
+use tagteam_engine::tokens::TokenPeriod;
 
 /// No `Debug`: `add-token` carries a secret, and a derived `Debug` would print it.
 #[derive(Parser)]
@@ -347,6 +348,41 @@ pub enum TokensPeriod {
     Session(TokensArgs),
     /// A row per 5-hour block of each account
     Block(TokensArgs),
+}
+
+impl TokensPeriod {
+    /// The period and arguments `tokens` asked for (token report spec §11.1). A bare `tokens`
+    /// is `day`. With a flag before it, clap takes the period word for the first ACCOUNT
+    /// (`args_conflicts_with_subcommands`), so a first ACCOUNT that is exactly a period's name
+    /// is that period, and the rest stay ACCOUNTs. Only the first is read so: `tokens alice
+    /// month` names two accounts.
+    pub fn effective(
+        period: Option<Box<TokensPeriod>>,
+        mut args: TokensArgs,
+    ) -> (TokenPeriod, TokensArgs) {
+        match period.map(|p| *p) {
+            Some(TokensPeriod::Day(a)) => (TokenPeriod::Day, a),
+            Some(TokensPeriod::Month(a)) => (TokenPeriod::Month, a),
+            Some(TokensPeriod::Session(a)) => (TokenPeriod::Session, a),
+            Some(TokensPeriod::Block(a)) => (TokenPeriod::Block, a),
+            None => {
+                let named = match args.accounts.first().map(String::as_str) {
+                    Some("day") => Some(TokenPeriod::Day),
+                    Some("month") => Some(TokenPeriod::Month),
+                    Some("session") => Some(TokenPeriod::Session),
+                    Some("block") => Some(TokenPeriod::Block),
+                    _ => None,
+                };
+                match named {
+                    Some(period) => {
+                        args.accounts.remove(0);
+                        (period, args)
+                    }
+                    None => (TokenPeriod::Day, args),
+                }
+            }
+        }
+    }
 }
 
 /// `tokens`' arguments (token report spec §11.1), the same under every period.
@@ -744,6 +780,8 @@ mod tests {
     use clap::Parser;
     use tagteam_engine::settings::parse_bool;
 
+    use tagteam_engine::tokens::TokenPeriod;
+
     use super::{BOOL_WORDS, Cli, Command, TokensPeriod};
 
     /// Every string of `a-z0-9`, up to `max` characters.
@@ -824,5 +862,46 @@ mod tests {
             "an account named like a period, after one"
         );
         assert_eq!(tokens(&["tokens", "session"]).0, Some("session"));
+    }
+
+    /// The period and ACCOUNTs `tagteam <args>` asks `tokens` for, once normalized.
+    fn effective(args: &[&str]) -> (TokenPeriod, Vec<String>) {
+        let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        let Some(Command::Tokens { period, args }) = cli.command else {
+            panic!("not tokens");
+        };
+        let (period, args) = TokensPeriod::effective(period, args);
+        (period, args.accounts)
+    }
+
+    #[test]
+    fn a_flag_before_the_period_leaves_it_the_period() {
+        // With a flag first clap reads the period word as an ACCOUNT; the first ACCOUNT that
+        // is exactly a period's name is that period (spec §11.1), and only the first.
+        let owned = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(effective(&["tokens"]), (TokenPeriod::Day, vec![]));
+        assert_eq!(
+            effective(&["tokens", "--json", "month"]),
+            (TokenPeriod::Month, vec![])
+        );
+        assert_eq!(
+            effective(&["tokens", "--tz", "UTC", "session", "alice"]),
+            (TokenPeriod::Session, owned(&["alice"]))
+        );
+        assert_eq!(
+            effective(&["tokens", "alice", "month"]),
+            (TokenPeriod::Day, owned(&["alice", "month"])),
+            "only the first ACCOUNT can be the period"
+        );
+        assert_eq!(
+            effective(&["tokens", "month", "--json", "block"]),
+            (TokenPeriod::Month, owned(&["block"])),
+            "a period that matched keeps the rest as ACCOUNTs"
+        );
+        assert_eq!(
+            effective(&["tokens", "--json", "block", "day"]),
+            (TokenPeriod::Block, owned(&["day"]))
+        );
     }
 }

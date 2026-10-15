@@ -9,7 +9,6 @@ use tagteam_cc::ClaudeCode;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::Platform;
 use tagteam_core::autoswitch::Strategy;
-use tagteam_core::validate::{AccountRefInput, parse_account_ref};
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Window};
 use tagteam_engine::collect::CollectMode;
 use tagteam_engine::displace::PurgeError;
@@ -26,7 +25,7 @@ use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{self, ColorMode, Settings, parse_bool};
 use tagteam_engine::store::{AccountRow, Mapping, StoreError};
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
-use tagteam_engine::tokens::{AccountSel, TokenPeriod, TokenQuery};
+use tagteam_engine::tokens::{AccountSel, TokenQuery};
 use tagteam_engine::transfer::{self, Encryption, Need, Recipient, SecretString};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, ShellAccount, StatusView};
@@ -1094,19 +1093,9 @@ impl App<'_, '_> {
 
     /// §10.4, with a terminal prompt for an ambiguous email.
     fn resolve(&mut self, input: &str) -> Result<AccountRow, Failure> {
-        let provider = self.provider_flag.clone();
-        self.resolve_in(input, provider.as_ref())
-    }
-
-    /// `resolve` within `provider`, or in every provider when it is `None` (§10.4).
-    fn resolve_in(
-        &mut self,
-        input: &str,
-        provider: Option<&ProviderId>,
-    ) -> Result<AccountRow, Failure> {
-        match self.engine.resolve(input, provider) {
+        match self.engine.resolve(input, self.provider_flag.as_ref()) {
             Err(EngineError::Ambiguous { .. }) if self.can_prompt() => {
-                let found = self.engine.candidates(input, provider)?;
+                let found = self.engine.candidates(input, self.provider_flag.as_ref())?;
                 let labels: Vec<String> = found
                     .iter()
                     .map(|r| format!("{} #{} {}", r.provider, r.position, render::name(r)))
@@ -1963,28 +1952,17 @@ impl App<'_, '_> {
         period: Option<Box<TokensPeriod>>,
         args: TokensArgs,
     ) -> Result<(), Failure> {
-        let (period, args) = match period.map(|p| *p) {
-            None => (TokenPeriod::Day, args),
-            Some(TokensPeriod::Day(a)) => (TokenPeriod::Day, a),
-            Some(TokensPeriod::Month(a)) => (TokenPeriod::Month, a),
-            Some(TokensPeriod::Session(a)) => (TokenPeriod::Session, a),
-            Some(TokensPeriod::Block(a)) => (TokenPeriod::Block, a),
-        };
+        let (period, args) = TokensPeriod::effective(period, args);
         if args.csv && self.json {
             return Err(Failure::Usage(CSV_AND_JSON.into()));
         }
         let flags = tokens_cmd::parse_flags(&args, &period, self.engine.now_ms())
             .map_err(Failure::Usage)?;
-        // Core §13.1: a position counts within --provider, else the default provider; an alias
-        // or an email names its account in whichever provider holds it, so `provider_for` can
-        // refuse one that is not --provider's, or accounts of two providers at once.
+        // Core §10.4 scopes each ACCOUNT to --provider when it is given, as for any command; the
+        // accounts named then choose the provider unless --provider does (core §13.1).
         let mut named = Vec::new();
         for input in &args.accounts {
-            let scope = match parse_account_ref(input) {
-                Some(AccountRefInput::Position(_)) => self.provider_flag.clone(),
-                _ => None,
-            };
-            named.push(self.resolve_in(input, scope.as_ref())?);
+            named.push(self.resolve(input)?);
         }
         let positions: Vec<(u32, ProviderId)> = named
             .iter()
@@ -2013,6 +1991,9 @@ impl App<'_, '_> {
         let store = self.engine.store()?;
         if !args.no_refresh {
             tokens_cmd::refresh(&self.engine, &provider, &mut *self.io.err)?;
+        }
+        if let Some(signal) = self.engine.cancel().requested() {
+            return Err(EngineError::Interrupted(signal).into());
         }
         let models = if args.model.is_empty() {
             None
