@@ -227,10 +227,18 @@ impl Job for SessionsWatch {
         let mut error = None;
         let providers = self.common.serving_or_note(engine, &mut error);
         for p in &providers {
-            let called = engine
-                .sight_sessions(p)
-                .and_then(|_| self.common.after_call(engine, p, sink));
-            if let Some(stop) = self.common.note(called, p, "sighting sessions", &mut error) {
+            let sighted = engine.sight_sessions(p).map(drop);
+            if let Some(stop) = self
+                .common
+                .note(sighted, p, "sighting sessions", &mut error)
+            {
+                return stop;
+            }
+            let read = self.common.after_call(engine, p, sink);
+            if let Some(stop) = self
+                .common
+                .note(read, p, "reading the token index", &mut error)
+            {
                 return stop;
             }
         }
