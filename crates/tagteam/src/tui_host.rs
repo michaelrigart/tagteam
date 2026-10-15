@@ -30,6 +30,10 @@ pub struct CliHost {
     foreground: Context,
     /// The binary `Run` spawns (§7.3 step 3).
     exe: PathBuf,
+    /// The settings warnings printed at start-up. Each action reads the settings afresh and
+    /// says them again; the captured output leaves out those words, so only a warning that is
+    /// new or changed since then opens the result panel.
+    startup_warnings: Vec<String>,
 }
 
 impl CliHost {
@@ -41,13 +45,33 @@ impl CliHost {
         inside.env.cancel = shutdown;
         // Captured, so never a terminal; `--no-color` keeps it plain either way.
         inside.stdout_terminal = false;
-        // `tui_cmd` printed the settings warnings once, before the alternate screen.
-        inside.settings_warned = true;
+        // The settings warnings the TUI prints before the alternate screen, as `tui_cmd` reads
+        // them for the default provider.
+        let registry = app::build_registry(&inside);
+        let (run_shell, env) = app::locate(inside.env.clone(), &registry);
+        let (_, startup_warnings) =
+            app::build_engine(inside.clone(), registry, run_shell, env, None);
         CliHost {
             inside,
             foreground: ctx.clone(),
             exe,
+            startup_warnings,
         }
+    }
+
+    /// The settings warnings the TUI already printed, for a start-up that read them for another
+    /// provider than the default (`--provider`). An action's output leaves out exactly these.
+    pub fn with_startup_warnings(mut self, warnings: Vec<String>) -> CliHost {
+        self.startup_warnings = warnings;
+        self
+    }
+
+    /// `err` without the lines that repeat the start-up warnings, each once.
+    fn without_startup_warnings(&self, mut err: String) -> String {
+        for w in &self.startup_warnings {
+            err = err.replacen(&format!("warning: {w}\n"), "", 1);
+        }
+        err
     }
 
     /// The signal token (§2).
@@ -171,7 +195,7 @@ impl Host for CliHost {
         ActionOutcome::Done {
             exit,
             out: String::from_utf8_lossy(&out).into_owned(),
-            err: String::from_utf8_lossy(&err).into_owned(),
+            err: self.without_startup_warnings(String::from_utf8_lossy(&err).into_owned()),
         }
     }
 

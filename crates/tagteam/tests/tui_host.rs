@@ -174,7 +174,6 @@ impl Home {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
-            settings_warned: false,
         }
     }
 
@@ -277,6 +276,52 @@ fn the_settings_warnings_the_tui_printed_are_not_repeated_in_an_action_s_output(
         (0, SWITCHED_TO_A.to_owned(), String::new()),
         "the warning was printed at start-up"
     );
+}
+
+#[test]
+fn a_settings_warning_that_appears_after_start_up_is_shown_by_the_action() {
+    let home = Home::with_two();
+    let (host, _) = home.host();
+    let dir = home.env.config_dir();
+    fs::create_dir_all(&dir).unwrap();
+    // Written in another shell while the TUI runs: the action reads it afresh.
+    fs::write(dir.join("config.toml"), "[autoswitch]\nthreshold = 5\n").unwrap();
+    let (exit, out, err) = done(host.act(&Action::Switch(home.at(1)), &mut Dialogs::none()));
+    assert_eq!((exit, out.as_str()), (0, SWITCHED_TO_A));
+    assert!(
+        err.starts_with("warning: ") && err.contains("autoswitch.threshold"),
+        "{err}"
+    );
+    // A warning that changed is another warning.
+    fs::write(dir.join("config.toml"), "[autoswitch\n").unwrap();
+    let (_, _, changed) = done(host.act(&Action::Switch(home.at(2)), &mut Dialogs::none()));
+    assert!(
+        changed.starts_with("warning: ") && !changed.contains("threshold"),
+        "{changed}"
+    );
+}
+
+#[test]
+fn the_start_up_warnings_the_tui_names_are_the_ones_left_out() {
+    // A start-up for another provider than the default read warnings `new` cannot know.
+    let home = Home::with_two();
+    let dir = home.env.config_dir();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("config.toml"), "[autoswitch]\nthreshold = 5\n").unwrap();
+    let (_, _, warning) = home.cli_run(&["list"]);
+    let text = warning
+        .trim_end()
+        .strip_prefix("warning: ")
+        .unwrap()
+        .to_owned();
+    let (host, _) = home.host();
+    let host = host.with_startup_warnings(vec![text, "another".into()]);
+    let outcome = host.act(&Action::Switch(home.at(1)), &mut Dialogs::none());
+    assert_eq!(done(outcome).2, "");
+    let (host, _) = home.host();
+    let host = host.with_startup_warnings(vec![]);
+    let outcome = host.act(&Action::Switch(home.at(2)), &mut Dialogs::none());
+    assert!(done(outcome).2.starts_with("warning: "));
 }
 
 #[test]
