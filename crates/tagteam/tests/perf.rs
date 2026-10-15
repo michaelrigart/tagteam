@@ -1,8 +1,9 @@
-//! §1.1's timing targets through the real binary: `statusline` within 10 ms p95, and `list`
-//! within 50 ms p95 when no usage fetch is due, alone and while a daemon runs against the same
-//! store (D1.1 criterion 3, D12). Timings mean something only in an optimized
-//! build on an idle machine, so this file exists only in release builds and its tests are
-//! ignored by default:
+//! §1.1's timing targets through the real binary: `statusline` within 10 ms p95, `list` within
+//! 50 ms p95 when no usage fetch is due, alone and while a daemon runs against the same store
+//! (D1.1 criterion 3, D12), and the TUI's first frame within 50 ms p95 under the same
+//! conditions (TUI spec §1.1). Timings mean something only in an optimized build on an idle
+//! machine, so this file exists only in release builds and its tests are ignored by default.
+//! The TUI's opens a pseudo-terminal, so run them outside a sandbox:
 //! `cargo test --release -p tagteam --features test-support --test perf -- --ignored`
 //! (add `--nocapture` to see each measured p95).
 #![cfg(all(feature = "test-support", not(debug_assertions)))]
@@ -15,6 +16,7 @@ use std::process::Stdio;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+use common::pty::{Pty, Screen};
 use common::{
     Guarded, bloat_claude_json, cc_profile, hold_launch, now_epoch_s, record_history,
     short_tempdir, std_cmd, two_fresh_accounts, usage_window,
@@ -259,6 +261,46 @@ fn list_p95_is_within_50_ms_when_nothing_is_due() {
     assert!(
         p <= Duration::from_millis(50),
         "list p95 {p:?} over {RUNS} runs: {runs:?}"
+    );
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn tui_first_frame_p95_is_within_50_ms_when_nothing_is_due() {
+    // TUI spec §1.1 criterion 2, §11: from the spawn to the arrival of the bytes that first put
+    // the accounts table on the screen, through a pty, under `list`'s conditions (core §1.1).
+    // The first frame never waits on a fetch (§6.1), and nothing is due, so the collection the
+    // TUI starts after it sends nothing either.
+    let _one_at_a_time = serial();
+    let d = tempfile::tempdir().unwrap();
+    nothing_due(d.path());
+    let server = MockServer::start();
+    let shown = |s: &Screen| s.on_alt() && s.contains("a@x.co");
+    let run = || {
+        let mut c = std_cmd(d.path());
+        c.env("TAGTEAM_TEST_API_BASE", server.base_url()).arg("tui");
+        let mut tui = Pty::spawn(c, true);
+        tui.wait_for(Duration::from_secs(10), "the accounts table", shown);
+        let took = tui.first_shown(shown).unwrap() - tui.started;
+        tui.type_keys(b"q");
+        let f = tui.finish(Duration::from_secs(10));
+        assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+        took
+    };
+    for _ in 0..WARM_UP {
+        run();
+    }
+    let runs: Vec<Duration> = (0..RUNS).map(|_| run()).collect();
+    let p = p95(&runs);
+    eprintln!("tui first frame p95 {p:?} over {RUNS} runs");
+    assert_eq!(
+        server.requests().len(),
+        0,
+        "a fetch was due, so this measured the wrong path"
+    );
+    assert!(
+        p <= Duration::from_millis(50),
+        "tui first frame p95 {p:?} over {RUNS} runs: {runs:?}"
     );
 }
 
