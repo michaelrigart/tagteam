@@ -491,7 +491,8 @@ impl Engine {
     format tag, a version, the provider, the account, `startedAt` (ms) and `endedAt` (ms or
     null). A file that cannot be read or does not parse, but whose name gives
     `<started_at ms>-<pid>` as two integers, stands for a launch of the profile's account,
-    open from that start; every reader takes it so.
+    open from that start; every reader takes it so. A start the name gives before the epoch
+    (§7.2) is not taken, so a stray name never covers the past; a start in the future is.
   - The poller removes the file once the launch is recorded. While the launch is unrecorded,
     it writes the file again if that write failed.
   - At the close, a recorded launch's file is removed. An unrecorded launch's file is written
@@ -544,7 +545,7 @@ with a newer one, which the next scan records. A file that cannot be read or doe
 recorded as the open launch its name stands for (§6.1), and removed the same way: its end, if
 it had one, is lost, and the launch closes once the scan finds the profile idle. A file that
 names another provider or another account than its profile, or whose content cannot be used
-and whose name gives no start, is skipped and kept. A temp file, which is not `*.json`, is
+and whose name gives no start, or one before the epoch, is skipped and kept. A temp file, which is not `*.json`, is
 ignored.
 
 ### 6.3 Statusline
@@ -1106,8 +1107,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
       while it is in use; the warnings only when neither accepts it;
     - a pending file recorded by `sight_sessions` open, or closed at its `endedAt`, and removed;
       one replaced during the scan kept; one that names another account left in place; one
-      that cannot be read or does not parse recorded open from its name's start; a temp file
-      ignored;
+      that cannot be read or does not parse recorded open from its name's start, unless that
+      start is before the epoch; a temp file ignored;
     - seeding of idle and in-use profiles at migration;
     - `active_history` rows from switches, from `add`, and from `remove` setting NULL.
   - Attribution end to end:

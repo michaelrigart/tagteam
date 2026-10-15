@@ -381,12 +381,14 @@ impl Engine {
         }
         // The usage, the pending files, then the stored launches, as the doc says. Each store
         // read is a statement of its own: a transaction opened before the files are read would
-        // fix the launches' snapshot there. A test stops after each read.
+        // fix the launches' snapshot there. A test stops after each read. The epoch bounds the
+        // starts the pending files' names give.
+        let epoch = store.token_epoch()?;
         let usage = group::usage(q, &store)?;
         hooks::point(self, "report-usage-read")?;
         // Launches `run` kept in a pending file count as stored ones, read only.
         let pending = self
-            .pending_launches(p.as_ref())
+            .pending_launches(p.as_ref(), epoch.map(|e| e.at))
             .into_iter()
             .map(|(_, launch)| launch)
             .collect();
@@ -394,6 +396,7 @@ impl Engine {
         let launches = store.launches(&q.provider)?;
         hooks::point(self, "report-launches-read")?;
         let reads = group::Reads {
+            epoch,
             usage,
             pending,
             launches,
