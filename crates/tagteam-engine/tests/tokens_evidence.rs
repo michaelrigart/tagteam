@@ -1088,11 +1088,11 @@ fn close_leaves_the_launch_open_while_another_launcher_holds_the_profile() {
 }
 
 #[test]
-fn close_ends_the_tenure_at_its_last_confirming_read() {
-    // Spec §6.1: at the child's exit its tenure ends at the last check that confirmed it, not at
-    // the exit: the child may have left its session after that check, and the session run
-    // elsewhere since. A later stamp, here a scan's read between the last check and the exit,
-    // is moved back. The launch still closes at its idle check, after exit handling.
+fn close_ends_the_tenure_at_its_last_read_and_never_moves_it_back() {
+    // Spec §6.1: at the child's exit its tenure ends at its last confirming read, not at the
+    // exit: the child may have left its session after that read. Every stored end is a read, so
+    // a later one stands: here a scan's read between run's last check and the exit, which the
+    // close keeps. The launch still closes at its idle check, after exit handling.
     let fx = Fx::new();
     let cc = fx.provider();
     let a = fx.add("a@x.co", "rt-a");
@@ -1140,13 +1140,44 @@ fn close_ends_the_tenure_at_its_last_confirming_read() {
             a.as_str(),
             started,
             NOW + 1_000,
-            confirmed,
+            scanned,
             run,
-            closed
+            scanned
         )],
-        "the close moves it back to its last confirming read"
+        "the scan's read stands"
     );
     assert_eq!(ended(&fx), [(a.to_string(), Some(closed))]);
+
+    // Without that read, the close moves the end forward to run's last confirmation.
+    let fx2 = Fx::new();
+    let a2 = fx2.add("a@x.co", "rt-a");
+    let profile2 = fx2.make_profile(&a2);
+    let id2 = fx2.engine.open_launch(&fx2.provider(), &a2).unwrap();
+    let mut state2 = LaunchPoll::default();
+    running(&fx2, 777, None);
+    let child2 = record(&fx2, &profile2, 777, "s-a", started, "interactive");
+    set_mtime(&child2, 1_790_000_000);
+    fx2.clock.advance_ms(1_000);
+    poll(&fx2, &id2, &profile2, &mut state2);
+    fx2.clock.advance_ms(30_000);
+    check(&fx2, &id2, &profile2, &mut state2);
+    fx2.clock.advance_ms(5_000);
+    let exit2 = fx2.engine.now_ms();
+    fx2.engine
+        .close_launch(&id2, &profile2, &state2, exit2)
+        .unwrap();
+    assert_eq!(
+        sightings(&fx2),
+        [sighting(
+            "s-a",
+            a2.as_str(),
+            started,
+            NOW + 1_000,
+            confirmed,
+            run,
+            exit2
+        )]
+    );
 }
 
 #[test]

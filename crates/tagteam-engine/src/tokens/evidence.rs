@@ -16,7 +16,7 @@ use tagteam_provider::{
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
-use crate::store::{SightingRow, SightingSource, Store};
+use crate::store::{SightingEnd, SightingRow, SightingSource, Store};
 use crate::views::CACHE_WRITE_WAIT;
 
 /// A sighting is extended at most once a minute (spec §6.4), and the statusline does nothing
@@ -303,7 +303,7 @@ impl Engine {
             )?;
         }
         while let Some(t) = state.ended.last() {
-            self.end_tenure(&store, id, t, t.confirmed_at)?;
+            self.end_tenure(&store, id, t, t.confirmed_at, SightingEnd::Exactly)?;
             state.ended.pop();
         }
         Ok(())
@@ -311,12 +311,13 @@ impl Engine {
 
     /// Spec §6.1, at the child's exit: the child's tenures end at their last confirming reads,
     /// the current one first, then those the poll had not stored, newest first; not at the exit,
-    /// since the child may have left its session after its last read. None ends past
+    /// since the child may have left its session after its last read. None is moved past
     /// `exited_at_ms`, when the child exited: a check after it, of a record a crash left behind,
-    /// confirms nothing. Each end is set back as well as forward, below a later stamp too, such
-    /// as a scan's read between the last check and the exit. The launch closes at the moment the
-    /// profile is found idle (`session_state_at`), read after that check, unless it is still in
-    /// use. `run` calls it after `finish_run`, once its own launch reservation is released, so
+    /// confirms nothing. The current tenure's end only moves forward: every stored end is a
+    /// read, and a later one, such as a scan's between the last check and the exit, stands. A
+    /// tenure a switch ended ends exactly at its last confirmation, as `poll_launch` ends it.
+    /// The launch closes at the moment the profile is found idle (`session_state_at`), read
+    /// after that check, unless it is still in use. `run` calls it after `finish_run`, once its own launch reservation is released, so
     /// the profile reads idle when nothing else runs there. Only the launch may close late, which
     /// over-covers. A background session the child started, or another launcher's reservation,
     /// keeps the launch open, and the next scan that finds the profile idle closes it.
@@ -329,8 +330,10 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let p = self.provider(&id.provider)?;
         let store = self.store()?;
-        for t in state.tenure.iter().chain(state.ended.iter().rev()) {
-            self.end_tenure(&store, id, t, t.confirmed_at.min(exited_at_ms))?;
+        let ends = state.tenure.iter().map(|t| (t, SightingEnd::AtLeast));
+        let ended = state.ended.iter().rev().map(|t| (t, SightingEnd::Exactly));
+        for (t, how) in ends.chain(ended) {
+            self.end_tenure(&store, id, t, t.confirmed_at.min(exited_at_ms), how)?;
         }
         hooks::point(self, "close-launch-check")?;
         if !self.session_state_at(p.as_ref(), profile).owned() {
@@ -359,17 +362,18 @@ impl Engine {
         }
     }
 
-    /// Ends `run`'s tenure `t` exactly at `last_at` (spec §6.1): stored first, when no write has
-    /// stored it yet, then its end set, back as well as forward, and every other tenure of its
-    /// session in that execution that began by then clamped to it (spec §6.4).
+    /// Ends `run`'s tenure `t` at `last_at` as `how` says (spec §6.1): stored first, when no
+    /// write has stored it yet, then its end moved, and every other tenure of its session in
+    /// that execution that began by then clamped to it (spec §6.4).
     fn end_tenure(
         &self,
         store: &Store,
         id: &LaunchId,
         t: &Tenure,
         last_at: i64,
+        how: SightingEnd,
     ) -> Result<(), EngineError> {
-        store.end_sighting(&id.provider, &self.tenure_row(id, t, last_at))?;
+        store.end_sighting(&id.provider, &self.tenure_row(id, t, last_at), how)?;
         Ok(())
     }
 
