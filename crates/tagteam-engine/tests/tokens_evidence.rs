@@ -1972,3 +1972,33 @@ fn remove_fails_before_deleting_anything_when_the_store_refuses_the_pending_laun
     assert!(profile.exists() && file.exists(), "the profile is kept");
     assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
 }
+
+#[test]
+fn a_close_with_a_store_that_cannot_be_opened_still_keeps_the_launch_in_its_pending_file() {
+    // Spec §6.1: the file needs the profile alone. An engine whose store cannot be opened (the
+    // database's path is a directory) cannot end the tenures or close the launch, but the
+    // unrecorded launch is kept with the close time, and a recorded one is not claimed kept.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.plan_launch(&cc, &a);
+    let db = fx.env.data_dir().join("tagteam.db");
+    let engine = fx.engine_with_settings(Default::default());
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    fs::create_dir(&db).unwrap();
+    assert!(engine.store().is_err(), "the premise: no store");
+
+    let closed = engine.close_launch(&id, &profile, &LaunchPoll::default(), NOW, false);
+
+    assert!(closed.stored.is_err(), "{closed:?}");
+    assert!(closed.kept, "{closed:?}");
+    let kept = PendingLaunch::read_all(&profile).remove(0).1.unwrap();
+    assert_eq!(
+        (kept.started_at_ms, kept.ended_at_ms),
+        (id.started_at_ms, Some(NOW)),
+        "closed at the idle check"
+    );
+}

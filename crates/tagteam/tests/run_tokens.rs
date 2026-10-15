@@ -670,3 +670,115 @@ fn a_spawn_that_fails_closes_its_launch_with_no_sighting() {
     assert_eq!(launches[0].pid, None, "no child ever ran: {launches:?}");
     assert!(home.sightings().is_empty(), "{:?}", home.sightings());
 }
+
+#[test]
+fn the_poller_writes_the_pending_file_late_when_the_first_write_failed() {
+    // Spec §6.1: the store refuses the launch and the profile cannot take the pending file at
+    // first (a file stands where its directory goes), so the pre-spawn warning is printed.
+    // While the child runs the obstacle goes; the poller's next retry writes the file, open,
+    // and the close sets its end. No warning is printed at the close.
+    let home = Home::new();
+    home.drop_launches();
+    let out = home.out("late-file");
+    let hold = home.root().join("hold");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _release = Release(hold.clone());
+    let _resume = Release(pause.join("resume"));
+    let child = home
+        .run_a(&out)
+        .env("FAKE_CLAUDE_HOLD", &hold)
+        .env("TAGTEAM_TEST_PAUSE_AT", "before-spawn")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause)
+        .spawn()
+        .unwrap();
+    wait_for("the spawn", || pause.join("paused").exists().then_some(()));
+    let obstacle = home.profile().join(PENDING_LAUNCH_DIR);
+    fs::write(&obstacle, b"").unwrap();
+    fs::write(pause.join("resume"), b"").unwrap();
+    running(&out);
+    fs::remove_file(&obstacle).unwrap();
+    let late = wait_for("the poller's pending file", || {
+        home.pending().into_iter().next()
+    });
+    assert_eq!(
+        late.ended_at_ms, None,
+        "open while the child runs: {late:?}"
+    );
+    fs::write(&hold, b"").unwrap();
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let w = warnings(&output);
+    assert_eq!(
+        w.len(),
+        1,
+        "the pre-spawn warning alone: {}",
+        stderr(&output)
+    );
+    assert!(w[0].contains("or in its profile ("), "{}", w[0]);
+    let kept = home.pending();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].started_at_ms, late.started_at_ms);
+    assert!(
+        kept[0].ended_at_ms.is_some(),
+        "closed at the exit: {kept:?}"
+    );
+}
+
+#[test]
+fn two_runs_on_one_profile_keep_two_pending_files_and_a_scan_records_both() {
+    // Spec §6.1: a second `run` joins a profile in use. Each keeps a file of its own, named by
+    // its start and its pid. A scan then records both, and closes whichever is still open once
+    // the profile is idle.
+    let home = Home::new();
+    let schema = home.drop_launches();
+    let hold = home.root().join("hold");
+    let _release = Release(hold.clone());
+    let out_1 = home.out("join-1");
+    let first = home
+        .run_a(&out_1)
+        .env("FAKE_CLAUDE_HOLD", &hold)
+        .spawn()
+        .unwrap();
+    running(&out_1);
+    let out_2 = home.out("join-2");
+    let second = home
+        .run_a(&out_2)
+        .env("FAKE_CLAUDE_HOLD", &hold)
+        .spawn()
+        .unwrap();
+    running(&out_2);
+    let both = wait_for("both pending files", || {
+        Some(home.pending()).filter(|p| p.len() == 2)
+    });
+    assert_ne!(both[0].started_at_ms, both[1].started_at_ms);
+    fs::write(&hold, b"").unwrap();
+    for child in [first, second] {
+        let output = finish(child);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert_eq!(
+            warnings(&output),
+            Vec::<String>::new(),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert_eq!(home.pending().len(), 2);
+
+    home.restore_launches(&schema);
+    cmd(home.root())
+        .args(["tokens", "--json"])
+        .assert()
+        .success();
+    let mut stored: Vec<i64> = home.launches().iter().map(|l| l.started_at).collect();
+    stored.sort_unstable();
+    let mut kept: Vec<i64> = both.iter().map(|l| l.started_at_ms).collect();
+    kept.sort_unstable();
+    assert_eq!(stored, kept);
+    assert!(
+        home.launches().iter().all(|l| l.ended_at.is_some()),
+        "{:?}",
+        home.launches()
+    );
+    assert!(home.pending().is_empty());
+}
