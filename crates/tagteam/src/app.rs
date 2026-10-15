@@ -16,6 +16,7 @@ use tagteam_daemon::notify::Backend;
 use tagteam_daemon::scheduler::{ThreadSleeper, uniform_jitter};
 use tagteam_daemon::watch::{ProgramStamp, UPGRADE_WATCH_MS};
 use tagteam_engine::collect::CollectMode;
+use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
 use tagteam_engine::displace::PurgeError;
 use tagteam_engine::doctor::DoctorOptions;
 use tagteam_engine::export::ExportRequest;
@@ -26,6 +27,7 @@ use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::purge::{KEYCHAIN_ORPHANS_WITH_PROVIDER, PurgePlan};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::run::{RunPlan, RunRequest};
+use tagteam_engine::service::{RECORDED_VARS, ServiceKind};
 use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{self, ColorMode, Settings, parse_bool};
 use tagteam_engine::store::{AccountRow, Mapping, StoreError};
@@ -43,7 +45,7 @@ use tagteam_provider::profile::RunShell;
 #[cfg(feature = "test-support")]
 use tagteam_provider::security::ProcessRunner;
 use tagteam_provider::security::SecurityCli;
-use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, SystemClock};
+use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, Read, SystemClock};
 
 use crate::auto::{HumanSink, JsonSink};
 use crate::cli::{
@@ -238,6 +240,11 @@ impl Context {
                 ctx.env.vars.insert(name, OsString::new());
             }
         }
+        // D9.1, D10: the variables a service unit records, as this process has them, for
+        // `daemon install` and for doctor's comparison with an installed unit. They come after
+        // the presence markers above. `CLAUDE_SECURESTORAGE_CONFIG_DIR` is among both: its
+        // value, a directory the Env already holds raw, replaces its marker and keeps it present.
+        ctx.env.capture_vars(RECORDED_VARS);
         Ok(ctx)
     }
 }
@@ -540,12 +547,27 @@ fn display_name(engine: &Engine, provider: &ProviderId) -> String {
         .map_or_else(|_| provider.to_string(), |p| p.display_name().to_owned())
 }
 
-/// How `auto` fails as a command, each provider named by `name`. Consume-first named for a
-/// provider without a long window is a usage error, exit 2, as every bad flag value is (§4.5).
-fn auto_failure(e: AutoError, name: &dyn Fn(&ProviderId) -> String) -> Failure {
+/// How `auto` fails as a command, each provider named by `name`. A provider whose engine is the
+/// daemon's (`daemon` gives its pid) is named with the daemon and how to pause it (D8.3).
+/// Consume-first named for a provider without a long window is a usage error, exit 2, as every
+/// bad flag value is (§4.5).
+fn auto_failure(
+    e: AutoError,
+    name: &dyn Fn(&ProviderId) -> String,
+    daemon: &dyn Fn(&ProviderId) -> Option<u32>,
+) -> Failure {
     match e {
         AutoError::AlreadyRuns(providers) => {
-            let names: Vec<String> = providers.iter().map(name).collect();
+            let names: Vec<String> = providers
+                .iter()
+                .map(|p| match daemon(p) {
+                    Some(pid) => format!(
+                        "{} (the daemon, pid {pid}; pause it with tagteam config set daemon.autoswitch false)",
+                        name(p)
+                    ),
+                    None => name(p),
+                })
+                .collect();
             Failure::Message(
                 KIND_ENGINE_RUNNING,
                 format!("auto-switch already runs for {}", names.join(", ")),
@@ -559,6 +581,18 @@ fn auto_failure(e: AutoError, name: &dyn Fn(&ProviderId) -> String) -> Failure {
             name(&p)
         )),
         AutoError::Engine(e) => e.into(),
+    }
+}
+
+/// D8.3: the daemon's pid when `provider`'s engine lock record names the process `daemon.lock`
+/// names, by pid and start time; `None` for any other holder, or a record that cannot be read.
+fn daemon_engine(engine: &Engine, provider: &ProviderId) -> Option<u32> {
+    let Read::Present(holder) = engine.engine_holder(provider) else {
+        return None;
+    };
+    match read_daemon_record(&daemon_lock_path(engine.env())) {
+        Read::Present(d) if d.pid == holder.pid && d.start == holder.start => Some(d.pid),
+        _ => None,
     }
 }
 
@@ -1353,6 +1387,7 @@ impl App<'_, '_> {
                 let report = self.engine.doctor(DoctorOptions {
                     online,
                     provider: self.provider_flag.clone(),
+                    service: Some(self.service()),
                 })?;
                 let human = doctor_cmd::human(&report, &|p| display_name(&self.engine, p));
                 self.print(&human, doctor_cmd::json(&report));
@@ -1626,6 +1661,12 @@ impl App<'_, '_> {
         }
     }
 
+    /// This platform's service manager (D9): launchd on macOS, systemd on Linux, by
+    /// `Context::platform`, which a test-support build can override.
+    fn service(&self) -> ServiceKind {
+        ServiceKind::for_platform(self.platform == Platform::MacOs)
+    }
+
     /// §11: `auto`. Like every command that changes the live login it refuses inside a run
     /// shell, except with `--dry-run` (§11.1); `run_command` has run the Keychain check. Events
     /// go to stdout as human lines or JSONL (§11.4), warnings and errors to stderr.
@@ -1638,6 +1679,7 @@ impl App<'_, '_> {
         let engine = &self.engine;
         let now_ms = || engine.now_ms();
         let names = |p: &ProviderId| display_name(engine, p);
+        let daemon = |p: &ProviderId| daemon_engine(engine, p);
         let Io { out, err, .. } = &mut *self.io;
         let ended = if self.json {
             let sink = JsonSink::new(&mut **out, &now_ms).stopping(engine.cancel());
@@ -1647,7 +1689,7 @@ impl App<'_, '_> {
                 .stopping(engine.cancel());
             auto::run_loop(engine, &run, &sink, &ThreadSleeper, &mut uniform_jitter)
         };
-        ended.map_err(|e| auto_failure(e, &names))
+        ended.map_err(|e| auto_failure(e, &names, &daemon))
     }
 
     /// D8.1: `tagteam daemon` in the foreground. It stamps its program file first (Decision
@@ -2609,7 +2651,8 @@ mod tests {
         let fake = FakeAgent::new();
         assert_eq!(fake.primary_long_window(), None);
         let name = |_: &ProviderId| fake.display_name().to_owned();
-        let Failure::Usage(message) = auto_failure(AutoError::NoLongWindow(fake.id()), &name)
+        let Failure::Usage(message) =
+            auto_failure(AutoError::NoLongWindow(fake.id()), &name, &|_| None)
         else {
             panic!("not a usage error");
         };
@@ -2617,6 +2660,30 @@ mod tests {
             message,
             "--strategy consume-first needs a long usage window to rank by, and FakeAgent has none"
         );
+    }
+
+    #[test]
+    fn auto_names_the_daemon_when_it_holds_the_engine_lock() {
+        // D8.3: the holder's record matches daemon.lock's, so the refusal names the daemon and
+        // how to pause it.
+        let cc = ProviderId::new(CLAUDE_CODE);
+        let name = |_: &ProviderId| "Claude Code".to_owned();
+        let refusal = |daemon: Option<u32>| match auto_failure(
+            AutoError::AlreadyRuns(vec![cc.clone()]),
+            &name,
+            &|_| daemon,
+        ) {
+            Failure::Message(kind, message) => {
+                assert_eq!(kind, KIND_ENGINE_RUNNING);
+                message
+            }
+            _ => panic!("not engine-running"),
+        };
+        assert_eq!(
+            refusal(Some(4242)),
+            "auto-switch already runs for Claude Code (the daemon, pid 4242; pause it with tagteam config set daemon.autoswitch false)"
+        );
+        assert_eq!(refusal(None), "auto-switch already runs for Claude Code");
     }
 
     #[test]

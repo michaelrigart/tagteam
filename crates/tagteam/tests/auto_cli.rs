@@ -20,8 +20,8 @@ use tagteam_cc::CcPaths;
 use tagteam_core::autoswitch::AutoState;
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, Window, WindowKind};
 use tagteam_engine::store::Store;
-use tagteam_provider::Env;
 use tagteam_provider::profile::{ProfileMarker, canonical_profile_path};
+use tagteam_provider::{Env, FlockGuard, ProcessStamp};
 
 /// A reading taken at `now`: 5h at `five` and 7d at `seven`, resetting in 2h40m30s and
 /// 3d09h00m30s.
@@ -459,5 +459,50 @@ fn bad_flag_values_are_usage_errors() {
     assert_eq!(
         untimed(&out.stdout),
         ["#2 b@x.co  60%  no switch: below-threshold"]
+    );
+}
+
+#[test]
+fn auto_names_the_daemon_when_the_daemon_holds_the_engine_lock() {
+    // D8.3: the engine lock is held, and its record matches daemon.lock's. This test process
+    // stands in for the daemon: it holds the lock and both records name it.
+    let d = tempfile::tempdir().unwrap();
+    staying(d.path());
+    let locks = Env::for_test(d.path()).data_dir().join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    let me = ProcessStamp::current().unwrap();
+    let engine_lock = locks.join("autoswitch-claude-code.lock");
+    let _held = FlockGuard::try_lock(&engine_lock).unwrap().unwrap();
+    fs::write(
+        &engine_lock,
+        format!("{{\"pid\":{},\"start\":{}}}\n", me.pid, me.start),
+    )
+    .unwrap();
+    let daemon_record = |start: u64| {
+        format!(
+            "{{\"pid\":{},\"start\":{start},\"version\":\"{}\"}}\n",
+            me.pid,
+            env!("CARGO_PKG_VERSION")
+        )
+    };
+    fs::write(locks.join("daemon.lock"), daemon_record(me.start)).unwrap();
+    let message = format!(
+        "auto-switch already runs for Claude Code (the daemon, pid {}; pause it with tagteam config set daemon.autoswitch false)",
+        me.pid
+    );
+    let out = auto(d.path(), &[]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(text(&out.stderr), format!("tagteam: {message}\n"));
+    let out = auto(d.path(), &["--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!({"schemaVersion": 1, "error": {"type": "engine-running", "message": message}})
+    );
+    // daemon.lock naming another start time: the holder is not the daemon.
+    fs::write(locks.join("daemon.lock"), daemon_record(me.start + 1)).unwrap();
+    assert_eq!(
+        text(&auto(d.path(), &[]).stderr),
+        "tagteam: auto-switch already runs for Claude Code\n"
     );
 }

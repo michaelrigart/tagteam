@@ -7,17 +7,24 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use common::*;
 use tagteam_cc::live::Platform;
 use tagteam_core::{AccountId, ProviderId, WindowKind};
+use tagteam_engine::daemon::{daemon_lock_path, daemon_socket_path};
 use tagteam_engine::doctor::{DoctorOptions, DoctorReport};
+use tagteam_engine::service::{ServiceKind, render_unit, unit_path};
 use tagteam_engine::store::{DisplacedRow, Store};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::liveness::FakeProcess;
-use tagteam_provider::{Check, CheckStatus, Keychain, ProcessStamp, Provider};
+use tagteam_provider::process::{Captured, ProcessSpawner, SpawnSpec, current_uid};
+use tagteam_provider::{
+    Cancel, Check, CheckStatus, Env, FlockGuard, Keychain, ProcessStamp, Provider,
+};
 
 fn doctor(fx: &Fx) -> DoctorReport {
     fx.engine.doctor(DoctorOptions::default()).unwrap()
@@ -70,6 +77,7 @@ fn now_s(fx: &Fx) -> i64 {
 /// links are never followed, so the walk itself reads nothing it should not. A store's `-shm`
 /// file is listed without its bytes: it is SQLite's shared-memory WAL index, where every reader
 /// of a store another process holds open records its read mark, and it holds no row (Decision 3).
+/// A socket is listed without bytes too: it has none to read.
 fn tree(root: &Path) -> Tree {
     fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, (u32, Option<Vec<u8>>)>) {
         let Ok(listing) = fs::read_dir(dir) else {
@@ -88,7 +96,7 @@ fn tree(root: &Path) -> Tree {
             } else if m.is_dir() {
                 out.insert(path.clone(), (mode, None));
                 walk(&path, out);
-            } else if path.to_string_lossy().ends_with("-shm") {
+            } else if path.to_string_lossy().ends_with("-shm") || m.file_type().is_socket() {
                 out.insert(path, (mode, None));
             } else {
                 out.insert(path.clone(), (mode, Some(fs::read(&path).unwrap())));
@@ -797,6 +805,13 @@ fn populated(fx: &Fx) {
         "{\"pid\":1,\"start\":1}\n",
     )
     .unwrap();
+    // D10: the daemon's lock record, and a socket file a daemon left.
+    fs::write(
+        locks.join("daemon.lock"),
+        "{\"pid\":1,\"start\":1,\"version\":\"0\"}\n",
+    )
+    .unwrap();
+    fs::write(fx.env.data_dir().join("daemon.sock"), "").unwrap();
     fs::write(fx.env.data_dir().join(".x.json.tagteam-4242-0a1b2c3d"), "s").unwrap();
     let config = fx.env.config_dir();
     fs::create_dir_all(&config).unwrap();
@@ -2346,4 +2361,852 @@ fn a_locked_vault_keychain_skips_the_vault_reads_though_the_provider_s_is_open()
     );
     assert_eq!(fx.kc.unlock_attempts(), 0);
     assert_eq!(fx.kc.items(), vault_items);
+}
+
+// ---- The daemon (D10) ----
+
+/// doctor as the CLI runs it: with this platform's service manager, `kind`.
+fn doctor_as(fx: &Fx, kind: ServiceKind) -> DoctorReport {
+    fx.engine
+        .doctor(DoctorOptions {
+            service: Some(kind),
+            ..DoctorOptions::default()
+        })
+        .unwrap()
+}
+
+/// A directory short enough for a socket path (D14: macOS's `$TMPDIR` can push one past
+/// `sun_path`): under `/tmp`, or under `$TMPDIR` where `/tmp` cannot be written. The daemon
+/// crate's and the CLI's socket tests have a helper of the same name.
+fn short_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("tt")
+        .tempdir_in("/tmp")
+        .or_else(|_| tempfile::tempdir())
+        .unwrap()
+}
+
+/// A fixture for the daemon's checks. Its data directory is short enough for a socket path,
+/// so the socket's length never decides a check, and its `PATH` (in `Env.vars`, where the CLI
+/// captures it) is `<home>/bin`. `adjust` changes the Env further, before anything is made.
+/// The directory must outlive the fixture.
+fn daemon_fx(adjust: impl FnOnce(&mut Env)) -> (tempfile::TempDir, Fx) {
+    let short = short_tempdir();
+    let data = short.path().join("d");
+    let fx = Fx::with(Platform::MacOs, |e| {
+        e.xdg_data_home = Some(data);
+        let bin = e.home.join("bin");
+        e.vars.insert("PATH".into(), bin.into_os_string());
+        adjust(e);
+    });
+    (short, fx)
+}
+
+/// An executable `name` in `<home>/bin`, for doctor to find on `PATH`. It never runs: the
+/// fixture's scripted spawner answers in its place.
+fn manager_stub(fx: &Fx, name: &str) {
+    let bin = fx.env.home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let file = bin.join(name);
+    fs::write(&file, "#!/bin/sh\nexit 99\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// D4.1's record in `daemon.lock`, naming `stamp`.
+fn daemon_lock_record(fx: &Fx, stamp: ProcessStamp, version: &str) {
+    let lock = daemon_lock_path(&fx.env);
+    fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    fs::write(
+        &lock,
+        format!(
+            "{{\"pid\":{},\"start\":{},\"version\":\"{version}\"}}\n",
+            stamp.pid, stamp.start
+        ),
+    )
+    .unwrap();
+}
+
+/// The unit `daemon install` writes for `program` and `env`, at its path.
+fn plant_unit(fx: &Fx, kind: ServiceKind, program: &Path, env: &[(String, String)]) -> PathBuf {
+    let path = unit_path(&fx.env, kind);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, render_unit(kind, program, env).unwrap()).unwrap();
+    path
+}
+
+fn answered(code: i32, stdout: &str, stderr: &str) -> Captured {
+    Captured::Exited {
+        code: Some(code),
+        signal: None,
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+/// A program that exists: this test binary.
+fn existing_program() -> PathBuf {
+    std::env::current_exe().unwrap()
+}
+
+#[test]
+fn the_daemon_runs_by_its_lock_record_and_another_version_is_told_to_restart() {
+    let fx = Fx::new();
+    let lock = daemon_lock_path(&fx.env);
+    let running = |fx: &Fx| one(&doctor(fx), "daemon.running").clone();
+    let c = running(&fx);
+    assert_eq!(
+        (c.status, c.message.as_str()),
+        (CheckStatus::Info, "the daemon is not running")
+    );
+    assert!(
+        !lock.exists(),
+        "doctor never tries, so never creates, the lock"
+    );
+    let me = ProcessStamp::current().unwrap();
+    let this = env!("CARGO_PKG_VERSION");
+    daemon_lock_record(&fx, me, this);
+    let c = running(&fx);
+    assert_eq!(
+        (c.status, c.message.clone(), c.fix.clone()),
+        (
+            CheckStatus::Info,
+            format!("the daemon runs (pid {}, version {this})", me.pid),
+            None
+        )
+    );
+    daemon_lock_record(&fx, me, "19990101.0000.0");
+    let c = running(&fx);
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert_eq!(
+        c.message,
+        format!(
+            "the daemon runs (pid {}) on version 19990101.0000.0, not this tagteam's {this}",
+            me.pid
+        )
+    );
+    assert_eq!(
+        fix(&c),
+        "restart it: a daemon restarts by itself within a minute of an upgrade; if this one has not, `tagteam daemon install` restarts the service's daemon, and a foreground one restarts once you stop it (Ctrl-C) and start it again"
+    );
+    daemon_lock_record(&fx, dead_holder(), this);
+    let c = running(&fx);
+    assert_eq!(
+        (c.status, c.message.clone()),
+        (
+            CheckStatus::Info,
+            format!(
+                "the daemon is not running (its last run, pid {}, has exited)",
+                i32::MAX
+            )
+        )
+    );
+    fs::write(&lock, "garbage").unwrap();
+    let c = running(&fx);
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert!(
+        c.message
+            .starts_with("whether the daemon runs cannot be told: "),
+        "{}",
+        c.message
+    );
+    fix(&c);
+}
+
+#[test]
+fn an_engine_lock_held_by_the_daemon_names_the_daemon() {
+    // D10: the auto-switch check says "the daemon (pid N)" when the engine lock's record
+    // matches daemon.lock's.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let me = ProcessStamp::current().unwrap();
+    let engine_lock = fx.env.data_dir().join("locks/autoswitch-claude-code.lock");
+    fs::create_dir_all(engine_lock.parent().unwrap()).unwrap();
+    fs::write(
+        &engine_lock,
+        format!("{{\"pid\":{},\"start\":{}}}\n", me.pid, me.start),
+    )
+    .unwrap();
+    daemon_lock_record(&fx, me, env!("CARGO_PKG_VERSION"));
+    let c = one(&doctor(&fx), "auto.engine").clone();
+    assert_eq!(
+        (c.status, c.message),
+        (
+            CheckStatus::Info,
+            format!("auto-switch runs in the daemon (pid {})", me.pid)
+        )
+    );
+    // Another start time: not the daemon, whatever its pid.
+    let other = ProcessStamp {
+        pid: me.pid,
+        start: me.start + 1,
+    };
+    daemon_lock_record(&fx, other, env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        one(&doctor(&fx), "auto.engine").message,
+        format!("auto-switch runs as pid {}", me.pid)
+    );
+}
+
+#[test]
+fn the_service_unit_is_reported_with_what_its_manager_says() {
+    for kind in [ServiceKind::Launchd, ServiceKind::Systemd] {
+        let (_short, fx) = daemon_fx(|_| {});
+        for name in ["launchctl", "systemctl", "loginctl"] {
+            manager_stub(&fx, name);
+        }
+        let linux = kind == ServiceKind::Systemd;
+        let path = unit_path(&fx.env, kind);
+        let r = doctor_as(&fx, kind);
+        let c = one(&r, "daemon.service");
+        assert_eq!(
+            (c.status, c.message.clone(), c.fix.clone()),
+            (
+                CheckStatus::Info,
+                format!(
+                    "the daemon's {} is not installed ({})",
+                    kind.noun(),
+                    path.display()
+                ),
+                None
+            )
+        );
+        assert!(
+            fx.spawner.specs().is_empty(),
+            "nothing is asked about a unit that is not there"
+        );
+
+        plant_unit(&fx, kind, &existing_program(), &[]);
+        let unit = format!(
+            "the daemon's {} is installed at {}",
+            kind.noun(),
+            path.display()
+        );
+        let (running, stopped, unloaded) = match kind {
+            ServiceKind::Launchd => (
+                answered(
+                    0,
+                    "gui/501/io.github.michaelrigart.tagteam = {\n\tstate = running\n\tlast exit code = (never exited)\n}\n",
+                    "",
+                ),
+                answered(
+                    0,
+                    "gui/501/io.github.michaelrigart.tagteam = {\n\tstate = not running\n\tlast exit code = 1\n}\n",
+                    "",
+                ),
+                answered(
+                    113,
+                    "",
+                    "Could not find service \"io.github.michaelrigart.tagteam\" in domain for user gui: 501",
+                ),
+            ),
+            ServiceKind::Systemd => (
+                answered(
+                    0,
+                    "LoadState=loaded\nActiveState=active\nExecMainStatus=0\n",
+                    "",
+                ),
+                answered(
+                    0,
+                    "LoadState=loaded\nActiveState=failed\nExecMainStatus=1\n",
+                    "",
+                ),
+                answered(
+                    0,
+                    "LoadState=not-found\nActiveState=inactive\nExecMainStatus=0\n",
+                    "",
+                ),
+            ),
+        };
+        let linger = |on: &str| answered(0, &format!("Linger={on}\n"), "");
+
+        fx.spawner.push(running);
+        if linux {
+            fx.spawner.push(linger("yes"));
+        }
+        let r = doctor_as(&fx, kind);
+        let c = one(&r, "daemon.service");
+        assert_eq!(
+            (c.status, c.message.clone()),
+            (CheckStatus::Info, format!("{unit}, loaded and running"))
+        );
+
+        fx.spawner.push(stopped);
+        if linux {
+            fx.spawner.push(linger("no"));
+        }
+        let r = doctor_as(&fx, kind);
+        let c = found(&r, "daemon.service");
+        assert_eq!(
+            c[0].message,
+            format!("{unit}, loaded but not running (its last exit status was 1)")
+        );
+        if linux {
+            assert_eq!(c.len(), 2, "{c:#?}");
+            assert_eq!(
+                (c[1].status, c[1].message.as_str()),
+                (
+                    CheckStatus::Info,
+                    "lingering is off for tester, so systemd stops the daemon when you log out"
+                )
+            );
+            assert_eq!(
+                fix(c[1]),
+                "`loginctl enable-linger tester` keeps it running"
+            );
+        } else {
+            assert_eq!(c.len(), 1, "{c:#?}");
+        }
+
+        fx.spawner.push(unloaded);
+        if linux {
+            fx.spawner.push(linger("yes"));
+        }
+        let r = doctor_as(&fx, kind);
+        let c = one(&r, "daemon.service");
+        assert_eq!(
+            (c.status, c.message.clone()),
+            (
+                CheckStatus::Info,
+                format!("{unit} but not loaded, so it starts at the next login")
+            )
+        );
+        assert_eq!(fix(c), "`tagteam daemon install` loads and starts it now");
+
+        let asked = fx.spawner.specs();
+        assert_eq!(asked.len(), if linux { 6 } else { 3 });
+        let manager = if linux { "systemctl" } else { "launchctl" };
+        assert_eq!(asked[0].program, fx.env.home.join("bin").join(manager));
+    }
+}
+
+#[test]
+fn a_unit_whose_program_is_gone_fails_and_one_recording_another_store_warns() {
+    // No manager on PATH here: the unit's state is unknown, which
+    // doctor_reports_a_hanging_or_missing_service_manager_as_a_warning pins.
+    let (_short, fx) = daemon_fx(|e| {
+        e.vars.insert("XDG_STATE_HOME".into(), "/state".into());
+    });
+    let kind = ServiceKind::Launchd;
+    let path = plant_unit(&fx, kind, Path::new("/nowhere/tagteam"), &[]);
+    let r = doctor_as(&fx, kind);
+    let gone = found(&r, "daemon.service")
+        .into_iter()
+        .find(|c| c.status == CheckStatus::Fail)
+        .unwrap_or_else(|| panic!("{:#?}", r.checks))
+        .clone();
+    assert_eq!(
+        gone.message,
+        format!(
+            "{} starts /nowhere/tagteam, which does not exist, so the service cannot start the daemon",
+            path.display()
+        )
+    );
+    assert_eq!(
+        fix(&gone),
+        "`tagteam daemon install` writes the unit again for this tagteam"
+    );
+    assert!(!r.ok());
+
+    // Recorded: another data directory, a proxy with a password, and another PATH. Doctor's
+    // own environment has a state directory the unit does not record.
+    let recorded = vec![
+        ("XDG_DATA_HOME".to_owned(), "/old/data".to_owned()),
+        (
+            "HTTPS_PROXY".to_owned(),
+            "http://u:secret@proxy:3128".to_owned(),
+        ),
+        ("PATH".to_owned(), "/somewhere/else".to_owned()),
+    ];
+    plant_unit(&fx, kind, &existing_program(), &recorded);
+    let r = doctor_as(&fx, kind);
+    let service = found(&r, "daemon.service");
+    let differ = service
+        .iter()
+        .find(|c| c.message.contains("differently"))
+        .unwrap_or_else(|| panic!("{service:#?}"));
+    assert_eq!(differ.status, CheckStatus::Warn);
+    assert_eq!(
+        differ.message,
+        format!(
+            "{} records XDG_DATA_HOME, XDG_STATE_HOME and HTTPS_PROXY differently from this environment, so the daemon may use another store, home, proxy or log level",
+            path.display()
+        )
+    );
+    assert!(!differ.message.contains("secret") && !differ.message.contains("/old/data"));
+    assert_eq!(
+        fix(differ),
+        "run `tagteam daemon install` again from the environment whose store and home the daemon should use"
+    );
+    assert!(r.ok(), "a difference is a warning: {:#?}", r.checks);
+
+    // A unit tagteam did not write as it stands is installed, and not judged.
+    fs::write(
+        &path,
+        fs::read_to_string(&path)
+            .unwrap()
+            .replace("<true/>", "<false/>"),
+    )
+    .unwrap();
+    let r = doctor_as(&fx, kind);
+    let service = found(&r, "daemon.service");
+    assert!(
+        service.iter().any(|c| c.status == CheckStatus::Info
+            && c.message
+                == format!(
+                    "{} was not written by tagteam as it stands, so the program it starts and its environment are not checked",
+                    path.display()
+                )),
+        "{service:#?}"
+    );
+    assert!(service.iter().all(|c| !c.message.contains("differently")));
+}
+
+/// A service manager that never answers: every call runs past its timeout. It records each
+/// timeout it was given.
+#[derive(Default)]
+struct Hanging(Mutex<Vec<Duration>>);
+
+impl ProcessSpawner for Hanging {
+    fn run_captured(&self, _: &SpawnSpec, timeout: Duration, _: &Cancel) -> Captured {
+        self.0.lock().unwrap().push(timeout);
+        Captured::TimedOut
+    }
+}
+
+#[test]
+fn doctor_reports_a_hanging_or_missing_service_manager_as_a_warning() {
+    // Review Focus 5: launchctl or systemctl missing, hanging or failing during doctor. Each
+    // is a warning with its reason, asked within 5 s, and never fails the run by itself. On
+    // Linux, `loginctl` beside it is judged the same way.
+    for (kind, manager) in [
+        (ServiceKind::Launchd, "launchctl"),
+        (ServiceKind::Systemd, "systemctl"),
+    ] {
+        let (_short, fx) = daemon_fx(|_| {});
+        let path = plant_unit(&fx, kind, &existing_program(), &[]);
+        let head = format!(
+            "the daemon's {} is installed at {}, but whether it is loaded cannot be told: ",
+            kind.noun(),
+            path.display()
+        );
+        let unknown = |r: &DoctorReport| -> Check {
+            let warned: Vec<&Check> = found(r, "daemon.service")
+                .into_iter()
+                .filter(|c| c.status == CheckStatus::Warn && c.message.starts_with(&head))
+                .collect();
+            assert_eq!(warned.len(), 1, "{:#?}", r.checks);
+            warned[0].clone()
+        };
+        // On Linux, lingering's warning and its reason; none on macOS.
+        let lingering = |r: &DoctorReport, why: &str| {
+            let said: Vec<(CheckStatus, String)> = found(r, "daemon.service")
+                .into_iter()
+                .filter(|c| c.message.starts_with("whether lingering is on"))
+                .map(|c| (c.status, c.message.clone()))
+                .collect();
+            let want = match kind {
+                ServiceKind::Launchd => vec![],
+                ServiceKind::Systemd => vec![(
+                    CheckStatus::Warn,
+                    format!("whether lingering is on for tester cannot be told: {why}"),
+                )],
+            };
+            assert_eq!(said, want, "{:#?}", r.checks);
+        };
+        let fix_for = match kind {
+            ServiceKind::Launchd => {
+                "`launchctl print gui/$(id -u)/io.github.michaelrigart.tagteam` shows its state"
+            }
+            ServiceKind::Systemd => "`systemctl --user status tagteam.service` shows its state",
+        };
+
+        // Missing: no manager on PATH, and nothing spawned.
+        let r = doctor_as(&fx, kind);
+        let c = unknown(&r);
+        assert_eq!(c.message, format!("{head}{manager} is not on PATH"));
+        assert_eq!(fix(&c), fix_for);
+        lingering(&r, "loginctl is not on PATH");
+        assert!(r.ok(), "{:#?}", r.checks);
+        assert!(fx.spawner.specs().is_empty());
+
+        // Hanging: every call is bounded at 5 s.
+        manager_stub(&fx, manager);
+        manager_stub(&fx, "loginctl");
+        let hanging = Arc::new(Hanging::default());
+        let r = fx
+            .engine_with_spawner(hanging.clone())
+            .doctor(DoctorOptions {
+                service: Some(kind),
+                ..DoctorOptions::default()
+            })
+            .unwrap();
+        assert_eq!(
+            unknown(&r).message,
+            format!("{head}{manager} did not answer within 5 s")
+        );
+        lingering(&r, "loginctl did not answer within 5 s");
+        assert!(r.ok(), "{:#?}", r.checks);
+        let asked = hanging.0.lock().unwrap().clone();
+        assert_eq!(
+            asked.len(),
+            if kind == ServiceKind::Systemd { 2 } else { 1 }
+        );
+        assert!(
+            asked.iter().all(|t| *t == Duration::from_secs(5)),
+            "{asked:?}"
+        );
+
+        // Failing: its exit and its own words.
+        fx.spawner.push(answered(1, "", "Bad request.\n"));
+        if kind == ServiceKind::Systemd {
+            fx.spawner.push(answered(1, "", ""));
+        }
+        let r = doctor_as(&fx, kind);
+        let command = match kind {
+            ServiceKind::Launchd => format!(
+                "launchctl print gui/{}/io.github.michaelrigart.tagteam",
+                current_uid()
+            ),
+            ServiceKind::Systemd => "systemctl --user show tagteam.service".to_owned(),
+        };
+        assert_eq!(
+            unknown(&r).message,
+            format!("{head}`{command}` exited 1: Bad request.")
+        );
+        lingering(&r, "`loginctl show-user tester -p Linger` exited 1");
+        assert!(r.ok(), "{:#?}", r.checks);
+    }
+}
+
+#[test]
+fn lingering_that_cannot_be_told_is_a_warning_with_its_reason_while_systemctl_answers() {
+    // Review Focus 5, D9.3: `systemctl` describes the unit, but `loginctl` is missing, fails or
+    // hangs. Each is a warning that names why, beside the unit's own line, and never fails the
+    // run.
+    let (_short, fx) = daemon_fx(|_| {});
+    manager_stub(&fx, "systemctl");
+    let path = plant_unit(&fx, ServiceKind::Systemd, &existing_program(), &[]);
+    let loaded = || {
+        answered(
+            0,
+            "LoadState=loaded\nActiveState=active\nExecMainStatus=0\n",
+            "",
+        )
+    };
+    let lingering = |r: &DoctorReport| -> Check {
+        let said: Vec<&Check> = found(r, "daemon.service")
+            .into_iter()
+            .filter(|c| c.message.contains("lingering"))
+            .collect();
+        assert_eq!(said.len(), 1, "{:#?}", r.checks);
+        said[0].clone()
+    };
+    let running = format!(
+        "the daemon's systemd user unit is installed at {}, loaded and running",
+        path.display()
+    );
+
+    // Missing: no `loginctl` on PATH, so only `systemctl` is asked.
+    fx.spawner.push(loaded());
+    let r = doctor_as(&fx, ServiceKind::Systemd);
+    assert_eq!(found(&r, "daemon.service")[0].message, running);
+    let c = lingering(&r);
+    assert_eq!(
+        (c.status, c.message.as_str()),
+        (
+            CheckStatus::Warn,
+            "whether lingering is on for tester cannot be told: loginctl is not on PATH"
+        )
+    );
+    assert_eq!(fix(&c), "`loginctl show-user tester -p Linger` shows it");
+    assert!(r.ok(), "{:#?}", r.checks);
+    assert_eq!(fx.spawner.specs().len(), 1);
+
+    // Failing: its exit and its own words.
+    manager_stub(&fx, "loginctl");
+    fx.spawner.push(loaded());
+    fx.spawner.push(answered(
+        1,
+        "",
+        "Failed to get user: User ID 1000 is not logged in or lingering\n",
+    ));
+    let r = doctor_as(&fx, ServiceKind::Systemd);
+    assert_eq!(
+        lingering(&r).message,
+        "whether lingering is on for tester cannot be told: `loginctl show-user tester -p Linger` exited 1: Failed to get user: User ID 1000 is not logged in or lingering"
+    );
+    assert!(r.ok(), "{:#?}", r.checks);
+
+    // Hanging: past its 5 s.
+    fx.spawner.push(loaded());
+    fx.spawner.push(Captured::TimedOut);
+    let r = doctor_as(&fx, ServiceKind::Systemd);
+    assert_eq!(
+        lingering(&r).message,
+        "whether lingering is on for tester cannot be told: loginctl did not answer within 5 s"
+    );
+    assert!(r.ok(), "{:#?}", r.checks);
+}
+
+#[test]
+fn the_socket_is_judged_against_the_daemon_that_should_own_it() {
+    let (_short, fx) = daemon_fx(|_| {});
+    let sock = daemon_socket_path(&fx.env);
+    let socket = |fx: &Fx| one(&doctor(fx), "daemon.socket").clone();
+    let c = socket(&fx);
+    assert_eq!(
+        (c.status, c.message.as_str()),
+        (
+            CheckStatus::Ok,
+            "no daemon runs, and none left a socket behind"
+        )
+    );
+    fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    fs::write(&sock, "").unwrap();
+    fs::set_permissions(&sock, fs::Permissions::from_mode(0o600)).unwrap();
+    let c = socket(&fx);
+    assert_eq!(
+        (c.status, c.message.clone()),
+        (
+            CheckStatus::Info,
+            format!(
+                "{} is left from a daemon that is not running; the next one to start replaces it",
+                sock.display()
+            )
+        )
+    );
+    fs::set_permissions(&sock, fs::Permissions::from_mode(0o644)).unwrap();
+    let c = socket(&fx);
+    assert_eq!(
+        (c.status, c.message.clone()),
+        (
+            CheckStatus::Warn,
+            format!(
+                "{} has mode 644, not 600: another user may reach the daemon through it",
+                sock.display()
+            )
+        )
+    );
+    assert_eq!(fix(&c), format!("rm '{}'", sock.display()));
+
+    daemon_lock_record(
+        &fx,
+        ProcessStamp::current().unwrap(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    let c = socket(&fx);
+    assert_eq!(c.status, CheckStatus::Warn);
+    assert_eq!(
+        fix(&c),
+        format!(
+            "`chmod 600 '{}'`, or restart the daemon, which creates it 0600",
+            sock.display()
+        )
+    );
+    fs::set_permissions(&sock, fs::Permissions::from_mode(0o600)).unwrap();
+    let c = socket(&fx);
+    assert_eq!(
+        (c.status, c.message.clone()),
+        (
+            CheckStatus::Ok,
+            format!("the daemon listens on {}", sock.display())
+        )
+    );
+    fs::remove_file(&sock).unwrap();
+    let c = socket(&fx);
+    assert_eq!(
+        (c.status, c.message.clone()),
+        (
+            CheckStatus::Warn,
+            format!(
+                "the daemon runs without its socket ({} does not exist), so `tagteam daemon status` and the TUI cannot reach it",
+                sock.display()
+            )
+        )
+    );
+    assert_eq!(
+        fix(&c),
+        "the log says why it could not bind; restart the daemon once that is fixed"
+    );
+}
+
+#[test]
+fn a_socket_path_too_long_to_bind_fails_once_a_daemon_runs_or_is_installed() {
+    // D5.1, D10. Without a daemon or a unit the length is not judged: doctor never fails for
+    // someone who does not use the daemon.
+    let fx = Fx::with(Platform::MacOs, |e| {
+        e.xdg_data_home = Some(e.home.join("d".repeat(120)))
+    });
+    let sock = daemon_socket_path(&fx.env);
+    assert!(sock.as_os_str().len() > 108);
+    assert_eq!(one(&doctor(&fx), "daemon.socket").status, CheckStatus::Ok);
+
+    let unit = plant_unit(&fx, ServiceKind::Launchd, &existing_program(), &[]);
+    let r = doctor_as(&fx, ServiceKind::Launchd);
+    let c = one(&r, "daemon.socket");
+    assert_eq!(c.status, CheckStatus::Fail);
+    assert!(
+        c.message.starts_with(&format!(
+            "{} is {} bytes, too long for a socket here (at most ",
+            sock.display(),
+            sock.as_os_str().len()
+        )),
+        "{}",
+        c.message
+    );
+    assert!(
+        c.message
+            .ends_with("), so the daemon runs without it and nothing can reach it"),
+        "{}",
+        c.message
+    );
+    assert_eq!(
+        fix(c),
+        "set XDG_DATA_HOME to a shorter directory, then `tagteam daemon install` again"
+    );
+    assert!(!r.ok());
+
+    fs::remove_file(&unit).unwrap();
+    daemon_lock_record(
+        &fx,
+        ProcessStamp::current().unwrap(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    assert_eq!(
+        one(&doctor(&fx), "daemon.socket").status,
+        CheckStatus::Fail,
+        "a live daemon runs without it"
+    );
+}
+
+#[test]
+fn notifications_that_are_on_with_nothing_to_show_them_warn() {
+    // D6.2, D10.
+    let (_short, fx) = daemon_fx(|_| {});
+    let c = one(&doctor_as(&fx, ServiceKind::Launchd), "daemon.notify").clone();
+    assert_eq!(
+        (c.status, c.message.as_str()),
+        (CheckStatus::Ok, "notifications are on, through osascript")
+    );
+    let r = doctor_as(&fx, ServiceKind::Systemd);
+    let c = one(&r, "daemon.notify");
+    assert_eq!(
+        (c.status, c.message.as_str()),
+        (
+            CheckStatus::Warn,
+            "notifications are on, but notify-send is not on the daemon's PATH, so none is shown"
+        )
+    );
+    assert_eq!(
+        fix(c),
+        "install notify-send (libnotify), or turn them off with `tagteam config set notify.enabled false`"
+    );
+    manager_stub(&fx, "notify-send");
+    let c = one(&doctor_as(&fx, ServiceKind::Systemd), "daemon.notify").clone();
+    assert_eq!(
+        (c.status, c.message),
+        (
+            CheckStatus::Ok,
+            format!(
+                "notifications are on, through {}",
+                fx.env.home.join("bin/notify-send").display()
+            )
+        )
+    );
+
+    // The daemon's own PATH, as its unit records it, is the one that counts.
+    fs::remove_file(fx.env.home.join("bin/notify-send")).unwrap();
+    let elsewhere = fx.dir.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let notify = elsewhere.join("notify-send");
+    fs::write(&notify, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&notify, fs::Permissions::from_mode(0o755)).unwrap();
+    plant_unit(
+        &fx,
+        ServiceKind::Systemd,
+        &existing_program(),
+        &[("PATH".to_owned(), elsewhere.display().to_string())],
+    );
+    let c = one(&doctor_as(&fx, ServiceKind::Systemd), "daemon.notify").clone();
+    assert_eq!(
+        c.message,
+        format!("notifications are on, through {}", notify.display())
+    );
+
+    fs::create_dir_all(fx.env.config_dir()).unwrap();
+    fs::write(
+        fx.env.config_dir().join("config.toml"),
+        "notify.enabled = false\n",
+    )
+    .unwrap();
+    let c = one(&doctor_as(&fx, ServiceKind::Systemd), "daemon.notify").clone();
+    assert_eq!(
+        (c.status, c.message.as_str()),
+        (
+            CheckStatus::Info,
+            "notifications are off (notify.enabled is false)"
+        )
+    );
+}
+
+#[test]
+fn the_daemon_checks_change_no_byte_take_no_lock_and_never_connect() {
+    // §13.6, D10: doctor reads daemon.lock's record without trying the lock, looks at the
+    // socket without connecting to it, and asks the service manager only to describe the
+    // unit. Every file stays byte for byte as it was.
+    use std::os::unix::net::UnixListener;
+    let (short, fx) = daemon_fx(|_| {});
+    for name in ["launchctl", "systemctl", "loginctl"] {
+        manager_stub(&fx, name);
+    }
+    daemon_lock_record(
+        &fx,
+        ProcessStamp::current().unwrap(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    let held = FlockGuard::try_lock(&daemon_lock_path(&fx.env))
+        .unwrap()
+        .expect("this test holds daemon.lock, as a daemon does");
+    let sock = daemon_socket_path(&fx.env);
+    let listener = UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    fs::set_permissions(&sock, fs::Permissions::from_mode(0o600)).unwrap();
+    let elsewhere = vec![("XDG_DATA_HOME".to_owned(), "/elsewhere".to_owned())];
+    for kind in [ServiceKind::Launchd, ServiceKind::Systemd] {
+        plant_unit(&fx, kind, &existing_program(), &elsewhere);
+    }
+    let before = (tree(fx.dir.path()), tree(short.path()));
+    fx.spawner
+        .push(answered(0, "x = {\n\tstate = running\n}\n", ""));
+    fx.spawner.push(answered(
+        0,
+        "LoadState=loaded\nActiveState=active\nExecMainStatus=0\n",
+        "",
+    ));
+    fx.spawner.push(answered(0, "Linger=yes\n", ""));
+    for kind in [ServiceKind::Launchd, ServiceKind::Systemd] {
+        let r = doctor_as(&fx, kind);
+        assert_eq!(one(&r, "daemon.running").status, CheckStatus::Info);
+        assert_eq!(one(&r, "daemon.socket").status, CheckStatus::Ok);
+        assert!(
+            found(&r, "daemon.service")
+                .iter()
+                .any(|c| c.message.ends_with("loaded and running")),
+            "{:#?}",
+            r.checks
+        );
+    }
+    assert_eq!(
+        changed(&before.0, &tree(fx.dir.path())),
+        Vec::<PathBuf>::new()
+    );
+    assert_eq!(
+        changed(&before.1, &tree(short.path())),
+        Vec::<PathBuf>::new()
+    );
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "doctor never connected"
+    );
+    drop(held);
 }

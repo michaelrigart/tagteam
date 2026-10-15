@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use common::*;
 use serde_json::{Value, json};
 use tagteam_core::AccountId;
+use tagteam_engine::service::{ServiceKind, render_unit};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::{Env, FileKeychain, Keychain, ProfileMarker, profile_path};
 
@@ -178,6 +179,10 @@ fn the_json_shape_of_a_fixture_with_two_accounts() {
             own("settings.file", "ok"),
             own("log.file", "info"),
             own("log.writable", "ok"),
+            own("daemon.running", "info"),
+            own("daemon.service", "info"),
+            own("daemon.socket", "ok"),
+            own("daemon.notify", "ok"),
             own("store.temp-files", "ok"),
             cc("accounts.vault", "ok"),
             cc("usage.state", "ok"),
@@ -249,6 +254,23 @@ fn doctor_over_a_full_fixture_home_leaves_every_byte_as_it_was() {
     fs::write(data.join(".tagteam.db.tagteam-4242-0a1b2c3d"), "s").unwrap();
     fs::create_dir_all(env.config_dir()).unwrap();
     fs::write(env.config_dir().join("config.toml"), "bogus = 1\n").unwrap();
+    // D10: the daemon's lock record, a socket file it left, and its launchd agent, whose
+    // program is gone.
+    fs::write(
+        data.join("locks/daemon.lock"),
+        "{\"pid\":1,\"start\":1,\"version\":\"0\"}\n",
+    )
+    .unwrap();
+    fs::write(data.join("daemon.sock"), "").unwrap();
+    let agent = env
+        .home
+        .join("Library/LaunchAgents/io.github.michaelrigart.tagteam.plist");
+    fs::create_dir_all(agent.parent().unwrap()).unwrap();
+    fs::write(
+        &agent,
+        render_unit(ServiceKind::Launchd, Path::new("/opt/tagteam"), &[]).unwrap(),
+    )
+    .unwrap();
     let before = tree(d.path());
     for args in [&[][..], &["--json"], &["--json", "--online"]] {
         doctor(d.path(), args);
@@ -305,4 +327,133 @@ fn doctor_runs_inside_a_run_shell_and_refuses_under_an_unreadable_marker() {
     assert_eq!(refused.status.code(), Some(1));
     let v: Value = serde_json::from_slice(&refused.stdout).unwrap();
     assert_eq!(v["error"]["type"], json!("run-shell-unreadable"));
+}
+
+#[test]
+fn the_daemon_s_checks_on_each_platform() {
+    // D10 through the binary, on a machine with no daemon: the four checks, as JSON, with the
+    // platform the test-support override names.
+    for (platform, noun, unit, notify) in [
+        (
+            "macos",
+            "launchd agent",
+            "home/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist",
+            json!({"id": "daemon.notify", "status": "ok",
+                   "message": "notifications are on, through osascript", "fix": null}),
+        ),
+        (
+            "linux",
+            "systemd user unit",
+            "home/.config/systemd/user/tagteam.service",
+            json!({"id": "daemon.notify", "status": "warn",
+                   "message": "notifications are on, but notify-send is not on the daemon's PATH, so none is shown",
+                   "fix": "install notify-send (libnotify), or turn them off with `tagteam config set notify.enabled false`"}),
+        ),
+    ] {
+        let d = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            std_cmd(d.path())
+                .env("TAGTEAM_TEST_PLATFORM", platform)
+                .env("PATH", d.path().join("no-bin"))
+                .args(args)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let v: Value = serde_json::from_slice(&run(&["doctor", "--json"]).stdout).unwrap();
+        let daemon: Vec<Value> = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["id"].as_str().unwrap().starts_with("daemon."))
+            .map(|c| json!({"id": c["id"], "status": c["status"], "message": c["message"], "fix": c["fix"]}))
+            .collect();
+        assert_eq!(
+            daemon,
+            vec![
+                json!({"id": "daemon.running", "status": "info",
+                       "message": "the daemon is not running", "fix": null}),
+                json!({"id": "daemon.service", "status": "info",
+                       "message": format!("the daemon's {noun} is not installed ({})", d.path().join(unit).display()),
+                       "fix": null}),
+                json!({"id": "daemon.socket", "status": "ok",
+                       "message": "no daemon runs, and none left a socket behind", "fix": null}),
+                notify,
+            ],
+            "{platform}"
+        );
+        let human = String::from_utf8_lossy(&run(&["doctor"]).stdout).into_owned();
+        assert!(human.contains("· the daemon is not running\n"), "{human}");
+    }
+
+    // A unit recording another data directory: a warning naming the variable, beside the
+    // one for a launchctl that is not on PATH. Doctor still exits 0. Run with the data
+    // directory the unit records, nothing differs. The data directory is short, so the
+    // socket's length, judged once a unit is installed, passes.
+    let d = tempfile::tempdir().unwrap();
+    let short = short_tempdir();
+    let data = short.path().join("d");
+    let agent = d
+        .path()
+        .join("home/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist");
+    fs::create_dir_all(agent.parent().unwrap()).unwrap();
+    let program = assert_cmd::cargo::cargo_bin("tagteam");
+    let plant = |recorded: &str| {
+        let env = [("XDG_DATA_HOME".to_owned(), recorded.to_owned())];
+        fs::write(
+            &agent,
+            render_unit(ServiceKind::Launchd, &program, &env).unwrap(),
+        )
+        .unwrap();
+    };
+    let service = || {
+        let out = std_cmd(d.path())
+            .env("PATH", d.path().join("no-bin"))
+            .env("XDG_DATA_HOME", &data)
+            .args(["doctor", "--json"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let found: Vec<(String, String)> = with_id(&v, "daemon.service")
+            .iter()
+            .map(|c| {
+                (
+                    c["status"].as_str().unwrap().to_owned(),
+                    c["message"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        (found, out.status.code())
+    };
+    let unknown = (
+        "warn".to_owned(),
+        format!(
+            "the daemon's launchd agent is installed at {}, but whether it is loaded cannot be told: launchctl is not on PATH",
+            agent.display()
+        ),
+    );
+    plant("/elsewhere");
+    assert_eq!(
+        service(),
+        (
+            vec![
+                unknown.clone(),
+                (
+                    "warn".to_owned(),
+                    format!(
+                        "{} records XDG_DATA_HOME differently from this environment, so the daemon may use another store, home, proxy or log level",
+                        agent.display()
+                    )
+                ),
+            ],
+            Some(0)
+        )
+    );
+    plant(data.to_str().unwrap());
+    assert_eq!(
+        service(),
+        (vec![unknown], Some(0)),
+        "the same data directory"
+    );
 }
