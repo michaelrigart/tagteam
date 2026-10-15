@@ -396,7 +396,8 @@ fn polling_reads_the_record_only_when_it_changed() {
         [sighting("s-a", a.as_str(), started, later, run, later)]
     );
 
-    // Its mtime moves: read again.
+    // Its mtime moves: read again. `/clear` rewrites the record this way, with a new
+    // `sessionId` under the same `startedAt` (spec §17 T1), and the new session is sighted too.
     set_mtime(&path, 1_790_000_001);
     fx.engine
         .poll_launch(&id, &profile, 777, &mut state)
