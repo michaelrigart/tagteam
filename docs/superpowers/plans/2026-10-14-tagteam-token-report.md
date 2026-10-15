@@ -8611,6 +8611,63 @@ fn a_stopped_prune_resumes_on_the_next_call_and_completes() {
 }
 
 #[test]
+fn the_cleanup_after_the_responses_stops_and_resumes_too() {
+    // The phases after the expired responses (sessions, sightings, launches) also delete in
+    // chunks with `stop` asked before each: a large backlog of expired sightings never runs
+    // as one transaction.
+    let (_d, s, path) = store();
+    let cutoff = T - 30 * DAY;
+    {
+        let mut raw = rusqlite::Connection::open(&path).unwrap();
+        let tx = raw.transaction().unwrap();
+        for i in 0..6_000 {
+            tx.execute(
+                "INSERT INTO session_sightings \
+                 (provider, session_id, home, first_at, last_at, source, recorded_at) \
+                 VALUES ('claude-code', ?1, '', ?2, ?2, 'scan', ?2)",
+                rusqlite::params![format!("s{i}"), cutoff - 1],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+    let sightings = || -> i64 {
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM session_sightings", [], |r| r.get(0))
+            .unwrap()
+    };
+
+    // Asked before: the responses (none), the sessions (none), the first 5,000 sightings, and
+    // then it stops.
+    let asked = Cell::new(0);
+    let after_three = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 3
+    };
+    assert_eq!(
+        s.prune_tokens(&cc(), cutoff, "h1", T, &after_three)
+            .unwrap(),
+        PruneOutcome {
+            deleted: 0,
+            complete: false
+        }
+    );
+    assert_eq!(sightings(), 1_000);
+    assert_eq!(
+        s.token_state(&cc()).unwrap().and_then(|st| st.pruned_at),
+        None
+    );
+
+    assert_eq!(prune(&s, cutoff, "h2", T + 1), done(0));
+    assert_eq!(sightings(), 0);
+    assert_eq!(
+        s.token_state(&cc()).unwrap().unwrap().pruned_at,
+        Some(T + 1)
+    );
+}
+
+#[test]
 fn sightings_insert_then_extend_only_after_the_gap() {
     let (_d, s, _) = store();
     let seen = |last: i64, source| SightingRow {
@@ -9108,6 +9165,21 @@ const DAY_MS: i64 = 86_400_000;
 /// Responses one prune transaction deletes at most, so an overdue prune never holds the write
 /// lock for long (spec §5.2).
 const PRUNE_CHUNK: usize = 5_000;
+
+/// What a prune deletes after the expired responses (spec §4), each phase in chunks of
+/// `PRUNE_CHUNK` rows, one transaction per chunk: sessions left without a response, sightings
+/// that ended before the cutoff, and launches that did. `?1` the provider, `?2` the cutoff, `?3`
+/// the chunk.
+const PRUNE_CLEANUP: [&str; 3] = [
+    "DELETE FROM token_sessions WHERE id IN (SELECT id FROM token_sessions WHERE provider = ?1 \
+     AND NOT EXISTS (SELECT 1 FROM token_usage WHERE session = token_sessions.id) LIMIT ?3)",
+    "DELETE FROM session_sightings WHERE (provider, session_id, home, first_at) IN \
+     (SELECT provider, session_id, home, first_at FROM session_sightings \
+     WHERE provider = ?1 AND last_at < ?2 LIMIT ?3)",
+    "DELETE FROM run_launches WHERE (provider, account_id, started_at) IN \
+     (SELECT provider, account_id, started_at FROM run_launches \
+     WHERE provider = ?1 AND ended_at < ?2 LIMIT ?3)",
+];
 
 /// A response's key: the first 8 bytes of SHA-256 over `provider NUL message_id NUL
 /// request_id`, big-endian (spec §4). Response ids are kept only as this hash (spec §13).
@@ -9681,6 +9753,9 @@ impl Store {
             });
         }
         let mut deleted = 0u64;
+        // Phase 0 is the expired responses, then each of `PRUNE_CLEANUP`; every chunk is its own
+        // transaction, and `stop` is asked before each.
+        let mut phase = 0;
         loop {
             if stop() {
                 self.exec(
@@ -9694,34 +9769,32 @@ impl Store {
             }
             let mut c = self.lock();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let n = prune_chunk(&tx, provider, cutoff_ms, now_ms)?;
+            let n = if phase == 0 {
+                let n = prune_chunk(&tx, provider, cutoff_ms, now_ms)?;
+                deleted += n as u64;
+                n
+            } else {
+                tx.execute(
+                    PRUNE_CLEANUP[phase - 1],
+                    params![provider.as_str(), cutoff_ms, PRUNE_CHUNK as i64],
+                )?
+            };
+            let last = phase == PRUNE_CLEANUP.len() && n < PRUNE_CHUNK;
+            if last {
+                tx.execute(ENSURE_STATE, [provider.as_str()])?;
+                tx.execute(
+                    "UPDATE token_state SET pruned_at = ?2 WHERE provider = ?1",
+                    params![provider.as_str(), now_ms],
+                )?;
+            }
             tx.commit()?;
-            deleted += n as u64;
-            if n < PRUNE_CHUNK {
+            if last {
                 break;
             }
+            if n < PRUNE_CHUNK {
+                phase += 1;
+            }
         }
-        let mut c = self.lock();
-        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute(
-            "DELETE FROM token_sessions WHERE provider = ?1 AND NOT EXISTS \
-             (SELECT 1 FROM token_usage WHERE session = token_sessions.id)",
-            [provider.as_str()],
-        )?;
-        tx.execute(
-            "DELETE FROM session_sightings WHERE provider = ?1 AND last_at < ?2",
-            params![provider.as_str(), cutoff_ms],
-        )?;
-        tx.execute(
-            "DELETE FROM run_launches WHERE provider = ?1 AND ended_at < ?2",
-            params![provider.as_str(), cutoff_ms],
-        )?;
-        tx.execute(ENSURE_STATE, [provider.as_str()])?;
-        tx.execute(
-            "UPDATE token_state SET pruned_at = ?2 WHERE provider = ?1",
-            params![provider.as_str(), now_ms],
-        )?;
-        tx.commit()?;
         Ok(PruneOutcome {
             deleted,
             complete: true,
