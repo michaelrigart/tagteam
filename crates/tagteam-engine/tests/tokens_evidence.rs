@@ -446,7 +446,9 @@ fn a_planned_launch_is_recorded_late_with_its_own_start_and_recording_is_idempot
             &fx.make_profile(&a),
             &LaunchPoll::default(),
             NOW + 9_000,
+            true,
         )
+        .stored
         .unwrap();
     let closed = launches(&fx);
     assert_eq!(closed[0].ended_at, Some(NOW + 9_000), "{closed:?}");
@@ -1200,7 +1202,10 @@ fn close_leaves_the_launch_open_while_a_background_session_runs() {
     fx.clock.advance_ms(5_000);
 
     let exit = fx.engine.now_ms();
-    fx.engine.close_launch(&id, &profile, &state, exit).unwrap();
+    fx.engine
+        .close_launch(&id, &profile, &state, exit, true)
+        .stored
+        .unwrap();
     assert!(
         sightings(&fx).contains(&sighting(
             "s-a",
@@ -1236,7 +1241,8 @@ fn close_leaves_the_launch_open_while_another_launcher_holds_the_profile() {
         .unwrap();
     let first = fx.engine.open_launch(&cc, &a).unwrap();
     fx.engine
-        .close_launch(&first, &profile, &LaunchPoll::default(), NOW)
+        .close_launch(&first, &profile, &LaunchPoll::default(), NOW, true)
+        .stored
         .unwrap();
     assert_eq!(
         ended(&fx),
@@ -1248,7 +1254,8 @@ fn close_leaves_the_launch_open_while_another_launcher_holds_the_profile() {
     fx.clock.advance_ms(1_000);
     let second = fx.engine.open_launch(&cc, &a).unwrap();
     fx.engine
-        .close_launch(&second, &profile, &LaunchPoll::default(), NOW + 1_000)
+        .close_launch(&second, &profile, &LaunchPoll::default(), NOW + 1_000, true)
+        .stored
         .unwrap();
     assert_eq!(
         ended(&fx),
@@ -1301,7 +1308,10 @@ fn close_ends_the_tenure_at_its_last_read_and_never_moves_it_back() {
     fx.clock.advance_ms(45_000);
     let closed = fx.engine.now_ms();
 
-    fx.engine.close_launch(&id, &profile, &state, exit).unwrap();
+    fx.engine
+        .close_launch(&id, &profile, &state, exit, true)
+        .stored
+        .unwrap();
     assert_eq!(
         sightings(&fx),
         [sighting(
@@ -1333,7 +1343,8 @@ fn close_ends_the_tenure_at_its_last_read_and_never_moves_it_back() {
     fx2.clock.advance_ms(5_000);
     let exit2 = fx2.engine.now_ms();
     fx2.engine
-        .close_launch(&id2, &profile2, &state2, exit2)
+        .close_launch(&id2, &profile2, &state2, exit2, true)
+        .stored
         .unwrap();
     assert_eq!(
         sightings(&fx2),
@@ -1378,7 +1389,10 @@ fn a_write_after_the_exit_is_capped_at_the_close() {
         "the late write stored a check after the exit"
     );
 
-    fx.engine.close_launch(&id, &profile, &state, exit).unwrap();
+    fx.engine
+        .close_launch(&id, &profile, &state, exit, true)
+        .stored
+        .unwrap();
     assert_eq!(
         sightings(&fx),
         [sighting(
@@ -1420,7 +1434,10 @@ fn a_check_after_the_exit_confirms_nothing() {
         Some(exit + 40)
     );
 
-    fx.engine.close_launch(&id, &profile, &state, exit).unwrap();
+    fx.engine
+        .close_launch(&id, &profile, &state, exit, true)
+        .stored
+        .unwrap();
     assert_eq!(
         sightings(&fx),
         [sighting(
@@ -1452,7 +1469,8 @@ fn close_ends_the_launch_at_its_idle_check() {
     );
 
     fx.engine
-        .close_launch(&id, &profile, &LaunchPoll::default(), NOW)
+        .close_launch(&id, &profile, &LaunchPoll::default(), NOW, true)
+        .stored
         .unwrap();
     assert_eq!(ended(&fx), [(a.to_string(), Some(NOW + 5_000))]);
 }
@@ -1704,9 +1722,7 @@ fn pending(
     }
     .write(profile, run_pid)
     .unwrap();
-    profile
-        .join(PENDING_LAUNCH_DIR)
-        .join(format!("{started_at_ms}-{run_pid}.json"))
+    PendingLaunch::path(profile, started_at_ms, run_pid)
 }
 
 /// What is in `profile`'s pending directory, by name.
@@ -1775,7 +1791,8 @@ fn a_pending_launch_the_store_already_holds_changes_nothing() {
     let profile = fx.make_profile(&a);
     let id = fx.engine.open_launch(&cc, &a).unwrap();
     fx.engine
-        .close_launch(&id, &profile, &LaunchPoll::default(), NOW)
+        .close_launch(&id, &profile, &LaunchPoll::default(), NOW, true)
+        .stored
         .unwrap();
     let stored = launches(&fx);
     let file = pending(&fx, &profile, &a, id.started_at_ms, Some(NOW + 9_000), 4242);
@@ -1836,11 +1853,7 @@ fn a_launch_kept_unrecorded_is_closed_with_the_close_time_and_dropped_once_recor
     let profile = fx.make_profile(&a);
     let id = fx.engine.plan_launch(&cc, &a);
     fx.engine.keep_pending_launch(&id, &profile, None).unwrap();
-    let file = profile.join(PENDING_LAUNCH_DIR).join(format!(
-        "{}-{}.json",
-        id.started_at_ms,
-        std::process::id()
-    ));
+    let file = PendingLaunch::path(&profile, id.started_at_ms, std::process::id());
     let read = || {
         let all = PendingLaunch::read_all(&profile);
         assert_eq!(all.len(), 1, "{all:?}");
@@ -1853,7 +1866,7 @@ fn a_launch_kept_unrecorded_is_closed_with_the_close_time_and_dropped_once_recor
         .unwrap();
     let closed = fx
         .engine
-        .close_launch_kept(&id, &profile, &LaunchPoll::default(), NOW, false);
+        .close_launch(&id, &profile, &LaunchPoll::default(), NOW, false);
     assert!(closed.kept, "{closed:?}");
     assert_eq!(read().ended_at_ms, None, "the profile is in use");
 
@@ -1861,14 +1874,14 @@ fn a_launch_kept_unrecorded_is_closed_with_the_close_time_and_dropped_once_recor
     fx.clock.advance_ms(3_000);
     let closed = fx
         .engine
-        .close_launch_kept(&id, &profile, &LaunchPoll::default(), NOW, false);
+        .close_launch(&id, &profile, &LaunchPoll::default(), NOW, false);
     assert!(closed.kept, "{closed:?}");
     assert_eq!(read().ended_at_ms, Some(NOW + 3_000));
     assert!(launches(&fx).is_empty(), "nothing went to the store");
 
     let closed = fx
         .engine
-        .close_launch_kept(&id, &profile, &LaunchPoll::default(), NOW, true);
+        .close_launch(&id, &profile, &LaunchPoll::default(), NOW, true);
     assert!(!closed.kept, "{closed:?}");
     assert!(!file.exists(), "recorded: the file goes");
 }

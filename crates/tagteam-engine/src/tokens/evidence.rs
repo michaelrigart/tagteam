@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::{
-    PENDING_LAUNCH_DIR, PendingFile, PendingLaunch, ProfileMarker, Provider, Read, RecordEntry,
-    parse_session_record, profile_path, read_session_records_dated, record_is_live,
+    PendingFile, PendingLaunch, ProfileMarker, Provider, Read, RecordEntry, parse_session_record,
+    profile_path, read_session_records_dated, record_is_live,
 };
 
 use crate::engine::Engine;
@@ -35,7 +35,7 @@ pub struct LaunchId {
     pub started_at_ms: i64,
 }
 
-/// What `Engine::close_launch_kept` did (spec §6.1).
+/// What `Engine::close_launch` did (spec §6.1).
 #[derive(Debug)]
 pub struct LaunchClose {
     /// The store's side: the tenures' ends and the launch's close.
@@ -438,24 +438,14 @@ impl Engine {
     /// close late, which over-covers. A background session the child started, or another
     /// launcher's reservation, keeps the launch open, and the next scan that finds the profile
     /// idle closes it.
+    ///
+    /// `recorded` says whether `run` has the launch in the store (spec §6.1). A recorded
+    /// launch's pending file is removed, as it is not needed. One that is not recorded is kept
+    /// in its profile's pending file, with `endedAt` the moment the profile was found idle, the
+    /// one the store's close would have stored, or null while the profile is in use. The
+    /// tenures' ends are written all the same, and each failure is reported apart: `stored` is
+    /// the store's, `kept` is the file's.
     pub fn close_launch(
-        &self,
-        id: &LaunchId,
-        profile: &Path,
-        state: &LaunchPoll,
-        exited_at_ms: i64,
-    ) -> Result<(), EngineError> {
-        self.close_launch_kept(id, profile, state, exited_at_ms, true)
-            .stored
-    }
-
-    /// `close_launch` for `run`, which knows whether the launch is `recorded` in the store
-    /// (spec §6.1). A recorded launch's pending file is removed, as it is not needed. One that
-    /// is not recorded is kept in its profile's pending file, with `endedAt` the moment the
-    /// profile was found idle, the one the store's close would have stored, or null while the
-    /// profile is in use. The tenures' ends are written all the same, and each failure is
-    /// reported apart: `stored` is the store's, `kept` is the file's.
-    pub fn close_launch_kept(
         &self,
         id: &LaunchId,
         profile: &Path,
@@ -489,7 +479,7 @@ impl Engine {
             false
         } else {
             self.keep_pending_launch(id, profile, closed_at).is_ok()
-                || self.pending_launch_path(id, profile).is_file()
+                || PendingLaunch::path(profile, id.started_at_ms, std::process::id()).is_file()
         };
         LaunchClose { stored, kept }
     }
@@ -551,14 +541,6 @@ impl Engine {
             id.started_at_ms,
             std::process::id(),
         )?)
-    }
-
-    fn pending_launch_path(&self, id: &LaunchId, profile: &Path) -> PathBuf {
-        profile.join(PENDING_LAUNCH_DIR).join(format!(
-            "{}-{}.json",
-            id.started_at_ms,
-            std::process::id()
-        ))
     }
 
     /// `run`'s sighting of the tenure `t` in its launch's profile, ending at `last_at`.

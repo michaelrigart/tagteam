@@ -434,6 +434,7 @@ fn a_launch_the_store_refused_throughout_is_kept_in_a_pending_file_until_a_scan_
     assert!(
         files[0]
             .0
+            .path
             .starts_with(home.profile().join(PENDING_LAUNCH_DIR)),
         "{files:?}"
     );

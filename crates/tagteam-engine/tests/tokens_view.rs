@@ -573,7 +573,8 @@ fn a_session_resumed_in_a_running_profile_keeps_its_earlier_responses_off_that_a
     tick(at(360));
     fs::remove_file(path).unwrap();
     v.engine
-        .close_launch(&id, &profile, &state, at(400))
+        .close_launch(&id, &profile, &state, at(400), true)
+        .stored
         .unwrap();
     v.index(&[
         v.usage("s-1", at(200), "model-a", 1, 0),
