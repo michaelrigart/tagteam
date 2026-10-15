@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::read::{Read, ReadError};
@@ -31,6 +31,76 @@ impl fmt::Display for KeychainError {
 }
 
 impl std::error::Error for KeychainError {}
+
+/// D3 change 6, Decision 7: how one keychain instance's secret reads (`find`) ended. The
+/// daemon's keychain backoff compares a tally taken before a provider's run with one taken
+/// after it (D4.1); nothing else reads them.
+#[derive(Debug, Default)]
+pub struct ReadCounts {
+    /// Reads that returned a secret.
+    answered: AtomicU64,
+    /// Reads refused because the keychain is locked (rc 36), or that timed out.
+    locked: AtomicU64,
+}
+
+impl ReadCounts {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// A secret read that returned a secret (rc 0).
+    pub fn record_answered(&self) {
+        self.answered.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A secret read the locked keychain refused (rc 36), or one that timed out.
+    pub fn record_locked(&self) {
+        self.locked.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn tally(&self) -> ReadTally {
+        ReadTally {
+            answered: self.answered.load(Ordering::SeqCst),
+            locked: self.locked.load(Ordering::SeqCst),
+        }
+    }
+}
+
+/// The counts at one moment, or the reads between two moments (`since`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadTally {
+    pub answered: u64,
+    pub locked: u64,
+}
+
+impl ReadTally {
+    /// The reads made between `before` and `self`.
+    pub fn since(self, before: ReadTally) -> ReadTally {
+        ReadTally {
+            answered: self.answered.saturating_sub(before.answered),
+            locked: self.locked.saturating_sub(before.locked),
+        }
+    }
+
+    /// D4.1: some secret read ended locked and none was answered. Reads that found an item
+    /// absent count as neither, so a run whose reads were all absent, or that made none, does
+    /// not look locked.
+    pub fn looks_locked(self) -> bool {
+        self.locked > 0 && self.answered == 0
+    }
+}
+
+/// Two instances' reads together: the daemon sums the keychains it was handed (Decision 7).
+impl std::ops::Add for ReadTally {
+    type Output = ReadTally;
+
+    fn add(self, other: ReadTally) -> ReadTally {
+        ReadTally {
+            answered: self.answered.saturating_add(other.answered),
+            locked: self.locked.saturating_add(other.locked),
+        }
+    }
+}
 
 /// Generic-password items keyed by (service, account). Appendix A.3 semantics.
 pub trait Keychain: Send + Sync {
@@ -65,6 +135,11 @@ pub trait Keychain: Send + Sync {
             format!("this keychain cannot probe the service {service:?}"),
         ))
     }
+    /// The counts of this instance's secret reads (`find`), when it keeps them (D3 change 6,
+    /// Decision 7). The default keeps none.
+    fn read_counts(&self) -> Option<Arc<ReadCounts>> {
+        None
+    }
 }
 
 impl<K: Keychain + ?Sized> Keychain for Arc<K> {
@@ -91,6 +166,10 @@ impl<K: Keychain + ?Sized> Keychain for Arc<K> {
     }
     fn service_has_items(&self, s: &str) -> Read<bool> {
         (**self).service_has_items(s)
+    }
+
+    fn read_counts(&self) -> Option<Arc<ReadCounts>> {
+        (**self).read_counts()
     }
 }
 
@@ -134,6 +213,8 @@ pub struct FakeKeychain {
     panic_delete: Mutex<BTreeSet<String>>,
     refuse_unlock: AtomicBool,
     unlock_attempts: AtomicUsize,
+    /// Decision 7: its secret reads, by how they ended.
+    counts: Arc<ReadCounts>,
 }
 
 fn key(s: &str, a: &str) -> Key {
@@ -190,18 +271,25 @@ impl FakeKeychain {
     pub fn unlock_attempts(&self) -> usize {
         self.unlock_attempts.load(Ordering::SeqCst)
     }
-    fn blocked(&self, s: &str, a: &str) -> bool {
-        self.locked.load(Ordering::SeqCst) || self.unreadable.lock().unwrap().contains(&key(s, a))
-    }
 }
 
 impl Keychain for FakeKeychain {
+    /// A locked fake refuses every secret read, counted as locked. An item marked unreadable
+    /// is an injected failure: refused the same way, and not counted. A secret returned is
+    /// counted as answered; an absent item is not counted.
     fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
-        if self.blocked(s, a) {
+        if self.locked.load(Ordering::SeqCst) {
+            self.counts.record_locked();
+            return locked_read();
+        }
+        if self.unreadable.lock().unwrap().contains(&key(s, a)) {
             return locked_read();
         }
         match self.get(s, a) {
-            Some(v) => Read::Present(v),
+            Some(v) => {
+                self.counts.record_answered();
+                Read::Present(v)
+            }
             None => Read::Absent,
         }
     }
@@ -306,18 +394,27 @@ impl Keychain for FakeKeychain {
         }
         Read::Present(self.items.lock().unwrap().keys().any(|(svc, _)| svc == s))
     }
+
+    fn read_counts(&self) -> Option<Arc<ReadCounts>> {
+        Some(self.counts.clone())
+    }
 }
 
 /// A directory-backed fake, so tests can drive the real binary across processes.
 #[cfg(feature = "file-keychain")]
 pub struct FileKeychain {
     dir: std::path::PathBuf,
+    /// Decision 7: its secret reads, by how they ended. Per instance, not per directory.
+    counts: Arc<ReadCounts>,
 }
 
 #[cfg(feature = "file-keychain")]
 impl FileKeychain {
     pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            counts: ReadCounts::new(),
+        }
     }
     fn path(&self, s: &str, a: &str) -> std::path::PathBuf {
         self.dir
@@ -347,12 +444,18 @@ impl FileKeychain {
 
 #[cfg(feature = "file-keychain")]
 impl Keychain for FileKeychain {
+    /// A `LOCKED` file refuses every secret read, counted as locked; a secret returned is
+    /// counted as answered. An absent item, and a file that cannot be read, are not counted.
     fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
         if self.locked() {
+            self.counts.record_locked();
             return locked_read();
         }
         match std::fs::read(self.path(s, a)) {
-            Ok(v) => Read::Present(v),
+            Ok(v) => {
+                self.counts.record_answered();
+                Read::Present(v)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Read::Absent,
             Err(e) => Read::Unreadable(ReadError::new("keychain", e.to_string())),
         }
@@ -430,6 +533,10 @@ impl Keychain for FileKeychain {
             Ok(files) => Read::Present(!files.is_empty()),
             Err(e) => Read::Unreadable(ReadError::new("keychain", e.to_string())),
         }
+    }
+
+    fn read_counts(&self) -> Option<Arc<ReadCounts>> {
+        Some(self.counts.clone())
     }
 }
 
@@ -554,6 +661,9 @@ mod tests {
         }
         assert!(Bare.delete_service("s").is_err());
         assert!(matches!(Bare.service_has_items("s"), Read::Unreadable(_)));
+        // Nor does it count its secret reads: only a keychain that keeps counts has any.
+        assert!(Bare.read_counts().is_none());
+        assert!(Arc::new(Bare).read_counts().is_none());
     }
 
     #[test]
@@ -639,6 +749,105 @@ mod tests {
         assert!(
             k.exists("st", "a").is_present(),
             "a service whose name starts like it is another service"
+        );
+    }
+
+    #[test]
+    fn a_tally_since_an_earlier_one_is_the_reads_between_them() {
+        let t = |answered, locked| ReadTally { answered, locked };
+        assert_eq!(t(5, 7).since(t(3, 2)), t(2, 5));
+        assert_eq!(t(5, 7).since(t(5, 7)), t(0, 0));
+        assert_eq!(t(1, 1).since(t(2, 2)), t(0, 0), "never wraps");
+        assert_eq!(t(1, 2) + t(3, 4), t(4, 6), "two keychains' reads together");
+    }
+
+    #[test]
+    fn a_run_looks_locked_when_a_read_ended_locked_and_none_was_answered() {
+        // D4.1: a run whose secret reads were all absent, or that made none, changes nothing.
+        let t = |answered, locked| ReadTally { answered, locked };
+        assert!(t(0, 1).looks_locked());
+        assert!(t(0, 3).looks_locked());
+        assert!(!t(1, 3).looks_locked(), "one answered read is enough");
+        assert!(!t(0, 0).looks_locked());
+        assert!(!t(2, 0).looks_locked());
+    }
+
+    #[test]
+    fn the_fake_counts_answered_and_locked_secret_reads_only() {
+        // Decision 7: per instance, read through `read_counts`, through an `Arc` too.
+        let k = Arc::new(FakeKeychain::new());
+        let counts = Keychain::read_counts(&k).expect("the fake keeps counts");
+        assert!(Arc::ptr_eq(&counts, &Keychain::read_counts(&*k).unwrap()));
+        k.put("s", "a", b"v");
+        let _ = k.find("s", "a");
+        let _ = k.find("s", "missing");
+        k.set_unreadable("s", "a", true);
+        let _ = k.find("s", "a");
+        k.set_unreadable("s", "a", false);
+        assert_eq!(
+            counts.tally(),
+            ReadTally {
+                answered: 1,
+                locked: 0
+            }
+        );
+        k.set_locked(true);
+        let _ = k.find("s", "a");
+        let _ = k.find("s", "missing");
+        let _ = k.exists("s", "a");
+        let _ = k.service_has_items("s");
+        assert_eq!(
+            counts.tally(),
+            ReadTally {
+                answered: 1,
+                locked: 2
+            }
+        );
+        assert_eq!(
+            FakeKeychain::new().read_counts().unwrap().tally(),
+            ReadTally::default(),
+            "each instance counts its own"
+        );
+    }
+
+    #[cfg(feature = "file-keychain")]
+    #[test]
+    fn file_keychain_counts_answered_and_locked_secret_reads_only() {
+        let d = tempfile::tempdir().unwrap();
+        let k = FileKeychain::new(d.path());
+        let counts = k.read_counts().unwrap();
+        k.upsert("s", "a", b"v").unwrap();
+        let _ = k.find("s", "a");
+        let _ = k.find("s", "missing");
+        let _ = k.exists("s", "a");
+        // An item that cannot be read is a failure, not a lock.
+        std::fs::create_dir(
+            d.path()
+                .join(format!("{}.{}", hex::encode("s"), hex::encode("dir"))),
+        )
+        .unwrap();
+        assert!(matches!(k.find("s", "dir"), Read::Unreadable(_)));
+        assert_eq!(
+            counts.tally(),
+            ReadTally {
+                answered: 1,
+                locked: 0
+            }
+        );
+        std::fs::write(d.path().join("LOCKED"), "").unwrap();
+        let _ = k.find("s", "a");
+        let _ = k.exists("s", "a");
+        assert_eq!(
+            counts.tally(),
+            ReadTally {
+                answered: 1,
+                locked: 1
+            }
+        );
+        assert_eq!(
+            FileKeychain::new(d.path()).read_counts().unwrap().tally(),
+            ReadTally::default(),
+            "per instance, not per directory"
         );
     }
 }
