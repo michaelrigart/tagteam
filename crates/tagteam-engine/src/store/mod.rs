@@ -19,8 +19,8 @@ mod usage;
 
 pub(crate) use tokens::merge_line;
 pub use tokens::{
-    BatchOutcome, EpochRow, LaunchRow, PruneOutcome, RefreshStats, SightingRow, SightingSource,
-    TokenFileRow, TokenStateRow, UsageRow, usage_key,
+    BatchOutcome, EpochRow, LaunchRow, PruneOutcome, RefreshStats, SightingEnd, SightingRow,
+    SightingSource, TokenFileRow, TokenStateRow, UsageRow, usage_key,
 };
 pub use usage::{
     Eligibility, Ineligible, LiveIdentityCacheRow, Reservation, Reserve, SendGrant, Slot,

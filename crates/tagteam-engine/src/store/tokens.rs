@@ -155,6 +155,16 @@ pub struct SightingRow {
     pub recorded_at: i64,
 }
 
+/// How `Store::end_sighting` moves the end of the tenure it ends (spec §6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SightingEnd {
+    /// To the given end, back as well as forward: a switch ended the tenure, so a later end
+    /// stored on it is not a read of its session there.
+    Exactly,
+    /// Forward only: every stored end is a read, and a later one already stored stands.
+    AtLeast,
+}
+
 /// A `run` launch (spec §6.1), or a profile seeded at the migration (spec §4). `ended_at` is
 /// `None` while the launch may still run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -993,13 +1003,22 @@ impl Store {
     }
 
     /// `run`'s end of a tenure (spec §6.1, §6.4), in one `IMMEDIATE` transaction. The tenure
-    /// `s`'s key names is stored if no write stored it yet, and its end set to `s.last_at`, its
-    /// last confirming read, back as well as forward (a later stamp is not one of `run`'s
-    /// reads); never before `first_at`. Then every other tenure of the session in that execution
-    /// and home that began by that end, and runs past it, is clamped to it: a scan or a
-    /// statusline may have continued one over the time the session was away, before `run`'s
-    /// write stored the tenure that saw it go. Each row it changes gets `s.recorded_at`.
-    pub fn end_sighting(&self, provider: &ProviderId, s: &SightingRow) -> Result<(), StoreError> {
+    /// `s`'s key names is stored if no write stored it yet, and its end moved to `s.last_at`, its
+    /// last confirming read, as `how` says; never before `first_at`. Then every other tenure of
+    /// the session in that execution and home that began by the end it now has, and runs past
+    /// it, is clamped to it: a scan or a statusline may have continued one over the time the
+    /// session was away, before `run`'s write stored the tenure that saw it go. Each row it
+    /// changes gets `s.recorded_at`.
+    pub fn end_sighting(
+        &self,
+        provider: &ProviderId,
+        s: &SightingRow,
+        how: SightingEnd,
+    ) -> Result<(), StoreError> {
+        let moves = match how {
+            SightingEnd::Exactly => "session_sightings.last_at != excluded.last_at",
+            SightingEnd::AtLeast => "session_sightings.last_at < excluded.last_at",
+        };
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let key = params![
@@ -1010,12 +1029,13 @@ impl Store {
             s.first_at
         ];
         tx.execute(
-            "INSERT INTO session_sightings \
-             (provider, session_id, home, started_at, first_at, last_at, source, recorded_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, max(?5, ?6), ?7, ?8) \
-             ON CONFLICT(provider, session_id, home, started_at, first_at) DO UPDATE SET \
-             last_at = excluded.last_at, recorded_at = excluded.recorded_at \
-             WHERE session_sightings.last_at != excluded.last_at",
+            &format!(
+                "INSERT INTO session_sightings \
+                 (provider, session_id, home, started_at, first_at, last_at, source, recorded_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, max(?5, ?6), ?7, ?8) \
+                 ON CONFLICT(provider, session_id, home, started_at, first_at) DO UPDATE SET \
+                 last_at = excluded.last_at, recorded_at = excluded.recorded_at WHERE {moves}"
+            ),
             params![
                 provider.as_str(),
                 s.session_id,

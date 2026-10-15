@@ -10,8 +10,8 @@ use common::{add, cc};
 use tagteam_core::ProviderId;
 use tagteam_core::tokens::TokenCounts;
 use tagteam_engine::store::{
-    BatchOutcome, EpochRow, LaunchRow, PruneOutcome, RefreshStats, SightingRow, SightingSource,
-    Store, StoreError, TokenFileRow, TokenStateRow, UsageRow, usage_key,
+    BatchOutcome, EpochRow, LaunchRow, PruneOutcome, RefreshStats, SightingEnd, SightingRow,
+    SightingSource, Store, StoreError, TokenFileRow, TokenStateRow, UsageRow, usage_key,
 };
 
 /// The fixtures' clock (`Fx`'s `FakeClock`).
@@ -974,21 +974,25 @@ fn ending_a_tenure_sets_its_end_back_or_forward_by_its_full_key() {
     let stored = |s: &Store| s.sightings(&cc()).unwrap();
     let with = |row: SightingRow| [row, other_execution.clone(), other_tenure.clone()];
 
-    s.end_sighting(&cc(), &end(T + 20_000, T + 20_001)).unwrap();
+    s.end_sighting(&cc(), &end(T + 20_000, T + 20_001), SightingEnd::Exactly)
+        .unwrap();
     assert_eq!(stored(&s), with(end(T + 20_000, T + 20_001)), "forward");
-    s.end_sighting(&cc(), &end(T + 9_000, T + 20_002)).unwrap();
+    s.end_sighting(&cc(), &end(T + 9_000, T + 20_002), SightingEnd::Exactly)
+        .unwrap();
     assert_eq!(
         stored(&s),
         with(end(T + 9_000, T + 20_002)),
         "back: a later stamp was not one of run's reads"
     );
-    s.end_sighting(&cc(), &end(T + 9_000, T + 20_003)).unwrap();
+    s.end_sighting(&cc(), &end(T + 9_000, T + 20_003), SightingEnd::Exactly)
+        .unwrap();
     assert_eq!(
         stored(&s),
         with(end(T + 9_000, T + 20_002)),
         "the same end writes nothing"
     );
-    s.end_sighting(&cc(), &end(T - 5_000, T + 20_004)).unwrap();
+    s.end_sighting(&cc(), &end(T - 5_000, T + 20_004), SightingEnd::Exactly)
+        .unwrap();
     assert_eq!(
         stored(&s),
         with(end(T, T + 20_004)),
@@ -1026,7 +1030,7 @@ fn ending_a_tenure_stores_it_and_clamps_the_session_s_other_tenures_there() {
         ..tenure("s1", "acct-a", started, T, T + 20_000)
     };
 
-    s.end_sighting(&cc(), &ours).unwrap();
+    s.end_sighting(&cc(), &ours, SightingEnd::Exactly).unwrap();
     let clamped = SightingRow {
         last_at: T + 20_000,
         recorded_at: T + 95_000,
@@ -1050,6 +1054,50 @@ fn ending_a_tenure_stores_it_and_clamps_the_session_s_other_tenures_there() {
         ))
     });
     assert_eq!(s.sightings(&cc()).unwrap(), want);
+}
+
+#[test]
+fn ending_a_tenure_at_least_moves_its_end_forward_only() {
+    // Spec §6.1: at the child's exit, run's last confirmation is no reason to drop a later read
+    // already stored: the end moves forward only. The session's other tenures there are clamped
+    // to where it ends.
+    let (_d, s, _) = store();
+    let started = T - 500;
+    let read_later = tenure("s1", "acct-a", started, T, T + 30_000);
+    let duplicate = tenure("s1", "acct-a", started, T + 10, T + 40_000);
+    for row in [&read_later, &duplicate] {
+        s.record_sighting(&cc(), row, 0).unwrap();
+    }
+    let ours = |last_at: i64| SightingRow {
+        source: SightingSource::Run,
+        recorded_at: T + 50_000,
+        ..tenure("s1", "acct-a", started, T, last_at)
+    };
+
+    s.end_sighting(&cc(), &ours(T + 20_000), SightingEnd::AtLeast)
+        .unwrap();
+    let clamped = SightingRow {
+        last_at: T + 30_000,
+        recorded_at: T + 50_000,
+        ..duplicate.clone()
+    };
+    assert_eq!(
+        s.sightings(&cc()).unwrap(),
+        [read_later.clone(), clamped.clone()],
+        "the later read stands, and bounds the other tenure"
+    );
+    s.end_sighting(&cc(), &ours(T + 35_000), SightingEnd::AtLeast)
+        .unwrap();
+    let moved = SightingRow {
+        last_at: T + 35_000,
+        recorded_at: T + 50_000,
+        ..read_later
+    };
+    assert_eq!(
+        s.sightings(&cc()).unwrap(),
+        [moved, clamped],
+        "a later end moves it forward, and the row keeps the source that created it"
+    );
 }
 
 #[test]
