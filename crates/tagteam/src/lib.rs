@@ -25,6 +25,7 @@ mod signals;
 mod statusline;
 mod tokens_cmd;
 mod transfer_cmd;
+pub mod tui_host;
 
 const TEXT_UNDER_JSON: &str = "--help and --version print text; run them without --json";
 

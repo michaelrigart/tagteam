@@ -29,19 +29,32 @@ impl Cancel {
     }
 
     /// Consumes the recorded signal (§12.5's forwarding): returns it and leaves the token unset,
-    /// for every clone. Only `tagteam run` takes (M4b Decision 1):
-    /// - its last look before the spawn, where a signal ends the launch;
-    /// - its wait loop, which forwards what arrived while `claude` runs;
+    /// for every clone. Only `tagteam run`, and the TUI around the `tagteam run` it starts, take
+    /// (M4b Decision 1, TUI spec §7.3):
+    /// - `run`'s last look before the spawn, where a signal ends the launch;
+    /// - its wait loop, which forwards what arrived while `claude` runs; the TUI's wait for
+    ///   `tagteam run` is the same loop;
     /// - once `claude` has exited, to clear what forwarding left;
     /// - `abandon`, before a refused or interrupted launch's exit handling.
     ///
-    /// So the exit handling's cancellation points see only new signals. Everything else only
-    /// reads.
+    /// So the exit handling's cancellation points see only new signals. The TUI spends only a
+    /// SIGINT, with `take_if`. Everything else only reads.
     pub fn take(&self) -> Option<i32> {
         match self.signal.swap(0, Ordering::SeqCst) {
             0 => None,
             n => Some(n as i32),
         }
+    }
+
+    /// Consumes the recorded signal only if it is `signal`, in one step: true when it was. A
+    /// signal that replaced it, even an instant before, stays recorded. The TUI spends a
+    /// foreground action's SIGINT this way, so a SIGTERM or SIGHUP that arrives with it still
+    /// ends the TUI (TUI spec §7.3).
+    pub fn take_if(&self, signal: i32) -> bool {
+        debug_assert!(signal > 0, "signal numbers are positive");
+        self.signal
+            .compare_exchange(signal as usize, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
     /// `Err(Interrupted(n))` once a signal is recorded.
@@ -121,6 +134,32 @@ mod tests {
         c.cell().store(1, Ordering::SeqCst);
         assert_eq!(c.requested(), Some(1));
         assert_eq!(c.take(), Some(1));
+    }
+
+    #[test]
+    fn take_if_consumes_only_the_signal_it_names_for_every_clone() {
+        let c = Cancel::new();
+        let clone = c.clone();
+        assert!(!c.take_if(2), "nothing is recorded yet");
+        clone.request(2);
+        assert!(c.take_if(2));
+        assert_eq!(clone.requested(), None);
+        assert!(!clone.take_if(2), "a signal is taken once");
+        c.request(15);
+        assert!(!c.take_if(2), "another signal is left as it is");
+        assert_eq!(clone.requested(), Some(15));
+    }
+
+    #[test]
+    fn spending_a_sigint_never_consumes_a_signal_that_replaced_it() {
+        // The TUI's interleaving (TUI spec §7.3): a foreground action's SIGINT is seen, then a
+        // SIGTERM replaces it before it is spent. The SIGTERM must stay, to end the TUI.
+        let c = Cancel::new();
+        c.request(2);
+        assert_eq!(c.requested(), Some(2));
+        c.request(15);
+        assert!(!c.take_if(2));
+        assert_eq!(c.requested(), Some(15));
     }
 
     #[test]

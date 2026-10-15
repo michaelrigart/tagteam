@@ -103,7 +103,7 @@ pub(crate) fn run_session(
     let mut seen = LaunchPoll::default();
     // Token report spec §6.1: the child's exit, stamped as soon as the wait returns, bounds its
     // sighting: a check after it confirms nothing.
-    let (status, exited_at_ms) = match &tracked {
+    let ((status, _forwarded), exited_at_ms) = match &tracked {
         Some(launch) => wait_polling(engine, launch, &profile, pid, &mut seen, || {
             wait(&mut child, cancel)
         }),
@@ -438,13 +438,12 @@ pub(crate) fn forwarded(signal: i32, first: bool) -> bool {
     }
 }
 
-/// Sends `signal`, when `forwarded` says so, to `claude` (`pid`).
-fn forward(pid: u32, signal: Option<i32>, first: bool) {
-    let Some(signal) = signal.filter(|&s| forwarded(s, first)) else {
-        return;
-    };
+/// Sends `signal`, when `forwarded` says so, to the child `pid`. Returns the signal when it
+/// was one to forward.
+fn forward(pid: u32, signal: Option<i32>, first: bool) -> Option<i32> {
+    let signal = signal.filter(|&s| forwarded(s, first))?;
     // SAFETY: kill(2) reads no memory of ours. `pid` is this process's child, which only
-    // `wait` reaps, and nothing is sent once it has: the pid names `claude` or its zombie,
+    // `wait` reaps, and nothing is sent once it has: the pid names the child or its zombie,
     // never a process that reused the number.
     let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
     if rc != 0 {
@@ -454,21 +453,24 @@ fn forward(pid: u32, signal: Option<i32>, first: bool) {
             io::Error::last_os_error()
         );
     }
+    Some(signal)
 }
 
-/// Waits for `claude`, forwarding what the token records meanwhile. Nothing here waits on a
-/// lock (B.37).
-fn wait(child: &mut Child, cancel: &Cancel) -> io::Result<ExitStatus> {
+/// Waits for the child, forwarding what the token records meanwhile (Decision 1), and returns
+/// its status with the last signal forwarded to it. `run`'s wait for `claude`, and the TUI's for
+/// the `tagteam run` it starts (TUI spec §7.3). Nothing here waits on a lock (B.37).
+pub(crate) fn wait(child: &mut Child, cancel: &Cancel) -> (io::Result<ExitStatus>, Option<i32>) {
     let pid = child.id();
+    let mut last = None;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
+            Ok(Some(status)) => return (Ok(status), last),
             Ok(None) => {}
             // No status to poll for: wait it out; it is still the child's exit that ends the run.
-            Err(_) => return child.wait(),
+            Err(_) => return (child.wait(), last),
         }
         thread::sleep(POLL);
-        forward(pid, cancel.take(), false);
+        last = forward(pid, cancel.take(), false).or(last);
     }
 }
 
