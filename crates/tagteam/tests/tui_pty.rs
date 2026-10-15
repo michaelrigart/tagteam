@@ -199,6 +199,12 @@ fn sigterm_waits_for_a_switch_inside_its_critical_span_and_reports_it_as_switche
         tui.child.try_wait().unwrap().is_none(),
         "the TUI waits for the switch"
     );
+    let waiting = tui.screen();
+    assert!(
+        !waiting.on_alt(),
+        "the terminal is restored while it waits (§10.2):\n{}",
+        waiting.text()
+    );
     fs::write(pause.join("resume"), b"").unwrap();
     let f = tui.finish(LONG);
     assert_eq!(f.status.code(), Some(143), "{}", f.screen.text());
@@ -345,8 +351,8 @@ fn run_on_an_account_moved_elsewhere_is_refused_and_launches_nothing() {
     let home = Home::new();
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the accounts table", accounts);
-    // Whatever the TUI collects and re-reads as it starts is done by now (§6.2).
-    thread::sleep(Duration::from_secs(1));
+    // Nothing here re-reads on its own: the start-up collection fetches nothing offline, and
+    // a collection that fetched nothing is not read back (§6.2); the next tick is 30 s away.
     cmd(home.root()).args(["move", "1", "2"]).assert().success();
     tui.type_keys(b"R");
     let shown = tui.wait_for(LONG, "the wait for Enter", returning);

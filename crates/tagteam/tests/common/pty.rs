@@ -65,10 +65,21 @@ impl Pty {
             .stdin(stdin)
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave.try_clone().unwrap()));
-        // SAFETY: the closure runs in the child between fork and exec, and calls only setsid(2)
-        // and ioctl(2), which are async-signal-safe. Its stdout is the pty's slave by then.
+        // SAFETY: the closure runs in the child between fork and exec, and calls only signal(2),
+        // sigemptyset(3), sigprocmask(2), setsid(2) and ioctl(2), which are async-signal-safe.
+        // Its stdout is the pty's slave by then.
         unsafe {
             cmd.pre_exec(|| {
+                // As a terminal emulator starts a shell: default dispositions and an empty
+                // mask, whatever this process inherited. A SIGINT or SIGQUIT ignored on entry
+                // (a backgrounded `cargo test`, nohup) would pass down to the TUI, `run` and
+                // `claude`, and production keeps an inherited SIG_IGN.
+                for signal in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
+                    libc::signal(signal, libc::SIG_DFL);
+                }
+                let mut none: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut none);
+                libc::sigprocmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
                 if libc::setsid() < 0 || libc::ioctl(1, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -86,10 +97,11 @@ impl Pty {
                 match from.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        let arrived = Instant::now();
                         let mut w = into.lock().unwrap();
                         w.bytes.extend_from_slice(&buf[..n]);
                         let end = w.bytes.len();
-                        w.chunks.push((Instant::now(), end));
+                        w.chunks.push((arrived, end));
                     }
                     Err(e) if e.kind() == ErrorKind::Interrupted => {}
                     // EIO once every slave descriptor is closed (Linux).
@@ -202,6 +214,14 @@ impl Pty {
         panic!("tcgetattr: {}", std::io::Error::last_os_error())
     }
 
+    /// How many bytes the master holds that the reading thread has not taken yet.
+    fn unread(&self) -> libc::c_int {
+        let mut n: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one int through the pointer, which is valid for the call.
+        let rc = unsafe { libc::ioctl(self.master.as_raw_fd(), libc::FIONREAD as _, &mut n) };
+        if rc == 0 { n } else { 0 }
+    }
+
     /// Waits for the program to exit, then for the last of its output, and says how it ended.
     /// Fails the test if it still runs after `within`.
     pub fn finish(mut self, within: Duration) -> Finished {
@@ -217,15 +237,19 @@ impl Pty {
             );
             thread::sleep(Duration::from_millis(10));
         };
-        // Its last bytes may still be in the pty: read until nothing more comes for 50 ms.
-        let mut seen = usize::MAX;
-        for _ in 0..40 {
+        // Its last bytes may still be in the pty: read until the master has nothing left and
+        // the count has held for three polls, within 2 s.
+        let ceiling = Instant::now() + Duration::from_secs(2);
+        let (mut seen, mut steady) = (usize::MAX, 0);
+        while steady < 3 && Instant::now() < ceiling {
+            thread::sleep(Duration::from_millis(20));
             let now = self.written.lock().unwrap().bytes.len();
-            if now == seen {
-                break;
-            }
+            steady = if now == seen && self.unread() == 0 {
+                steady + 1
+            } else {
+                0
+            };
             seen = now;
-            thread::sleep(Duration::from_millis(50));
         }
         Finished {
             status,
