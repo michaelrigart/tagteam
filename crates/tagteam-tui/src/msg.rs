@@ -1,10 +1,14 @@
-//! The lanes' requests (spec §4.3); Task 5 adds what reaches the state machine and what it
-//! asks for.
+//! What reaches the state machine (`Msg`), what it asks for (`Cmd`), and the lanes' requests
+//! (spec §4.2, §4.3).
+
+use std::sync::mpsc::Sender;
 
 use tagteam_core::AccountId;
+use tagteam_engine::views::HistoryView;
 
-use crate::host::Action;
+use crate::host::{Action, ActionOutcome};
 use crate::lanes::Coalesce;
+use crate::source::{AccountsSnapshot, CollectSummary, SourceError};
 
 /// The views lane's requests: store-served reads, no network (spec §4.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +54,81 @@ impl Coalesce for ActionsReq {
             (ActionsReq::Collect { .. }, ActionsReq::Collect { .. })
         )
     }
+}
+
+/// One input to `update`. The data variants are large, as the engine's views are, and a
+/// message is moved once, so they are not boxed.
+#[allow(clippy::large_enum_variant)]
+pub enum Msg {
+    Key(crossterm::event::KeyEvent),
+    Resize {
+        width: u16,
+        height: u16,
+    },
+    Tick,
+    Accounts {
+        r#gen: u64,
+        result: Result<AccountsSnapshot, SourceError>,
+    },
+    History {
+        r#gen: u64,
+        result: Result<HistoryView, SourceError>,
+    },
+    Collected {
+        r#gen: u64,
+        result: Result<CollectSummary, SourceError>,
+    },
+    Prompt(Prompt),
+    ActionDone {
+        action: Action,
+        outcome: ActionOutcome,
+    },
+    LaneDied {
+        lane: &'static str,
+    },
+}
+
+/// A question from the CLI path, and where its answer goes (spec §7.2).
+pub struct Prompt {
+    pub question: String,
+    pub kind: PromptKind,
+    pub reply: Sender<Answer>,
+}
+
+pub enum PromptKind {
+    Confirm { default_yes: bool },
+    Choose { options: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    Confirm(bool),
+    Choose(Option<usize>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cmd {
+    LoadAccounts {
+        r#gen: u64,
+    },
+    LoadHistory {
+        r#gen: u64,
+        account: AccountId,
+        since_s: i64,
+    },
+    CollectDue {
+        r#gen: u64,
+        accounts: Vec<AccountId>,
+    },
+    Act(Action),
+    /// Run `action` with the terminal handed back (spec §7.3).
+    Suspend(Action),
+    /// Begin the shutdown sequence (spec §10.2) with this exit code.
+    Quit {
+        code: i32,
+    },
+    /// Ctrl-Z (spec §10.1).
+    Stop,
 }
 
 #[cfg(test)]

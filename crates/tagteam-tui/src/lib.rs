@@ -16,3 +16,8 @@ pub mod state;
 mod term;
 pub mod update;
 pub mod view;
+
+pub use state::Screen;
+
+#[cfg(test)]
+pub(crate) mod testutil;
