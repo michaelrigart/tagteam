@@ -323,7 +323,7 @@ fn settle(
 }
 
 /// A `no-switch` with no detail, as `decide` would return it.
-fn no_switch(reason: NoSwitchReason) -> Decision {
+pub(crate) fn no_switch(reason: NoSwitchReason) -> Decision {
     Decision::NoSwitch {
         reason,
         outcome: reason.outcome(),
@@ -347,14 +347,11 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
-    use tagteam_core::AccountId;
     use tagteam_engine::vault::SERVICE;
     use tagteam_provider::{Clock, FakeClock, Method};
 
     use super::*;
-    use crate::testutil::{FAR_MS, Fx, Slices, T0, cc, fake};
-
-    const CC_USAGE: &str = "https://api.anthropic.com/api/oauth/usage";
+    use crate::testutil::{CC_USAGE, FAR_MS, Fx, Slices, T0, cc, fake, two};
 
     /// Every event, with the fixture clock's time it was emitted at, in seconds after `T0`.
     struct Recorded<'a> {
@@ -410,11 +407,6 @@ mod tests {
 
     fn looping() -> AutoRun {
         AutoRun::default()
-    }
-
-    /// `b` at position 2 is the live login, `a` at position 1 a candidate.
-    fn two(fx: &Fx) -> (AccountId, AccountId) {
-        (fx.add("a@x.co"), fx.add("b@x.co"))
     }
 
     #[test]
