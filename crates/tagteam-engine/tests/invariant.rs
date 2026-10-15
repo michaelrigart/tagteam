@@ -374,7 +374,7 @@ fn run_every_command_on(fx: &Fx) {
             )
             .unwrap();
         assert!(
-            matches!(outcome, RefreshOutcome::Done(report) if report.complete),
+            matches!(outcome, RefreshOutcome::Done(report) if report.complete && report.evidence_changed >= 1),
             "{outcome:?}"
         );
         let report = fx.engine.token_report(&whole_index(fx)).unwrap();
