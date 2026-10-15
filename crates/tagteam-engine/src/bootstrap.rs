@@ -21,6 +21,7 @@ use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
 use crate::launch::merge_summary;
+use crate::lifecycle::PendingLaunches;
 use crate::provenance::identity_drifted;
 use crate::store::AccountRow;
 
@@ -453,7 +454,7 @@ impl Engine {
                 account = %row.id,
                 "the session profile's login is invalid; deleting the profile"
             );
-            self.remove_profile(p, row)?;
+            self.remove_profile(p, row, PendingLaunches::Record)?;
         }
         refusal(row, validity).map_or(Ok(()), Err)
     }

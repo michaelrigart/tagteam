@@ -23,7 +23,7 @@ use crate::displace::PurgeError;
 use crate::engine::Engine;
 use crate::error::{EngineError, SessionOwner};
 use crate::hooks;
-use crate::lifecycle::{UnlistedRescues, absent, identity, trace_path};
+use crate::lifecycle::{PendingLaunches, UnlistedRescues, absent, identity, trace_path};
 use crate::rescue::RescueUnlisted;
 use crate::session::{SessionState, session_owned_error};
 use crate::store::{AccountRow, Store};
@@ -427,7 +427,10 @@ impl Engine {
                 self.refuse_session_owned(p.as_ref(), row)?;
                 self.refuse_profile_split(p.as_ref(), row)?;
                 self.refuse_live_profile_item(p.as_ref(), row)?;
-                Ok((self.remove_locked(row, &lock, unlisted)?, None))
+                Ok((
+                    self.remove_locked(row, &lock, unlisted, PendingLaunches::Forget)?,
+                    None,
+                ))
             }
             Err(_) => {
                 self.refuse_unregistered_in_use(row, providers)?;
