@@ -19,6 +19,7 @@ age.workspace = true
 tagteam-core.workspace = true
 tagteam-provider.workspace = true
 fastrand.workspace = true
+jiff.workspace = true
 libc.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
