@@ -579,8 +579,9 @@ Known limits:
   another session id.
 - A session CC spawns itself inside a profile writes no record. Its responses fall inside its
   parent's launch, so they are unattributed rather than misplaced.
-- Whether a record's `sessionId` follows `/clear` is unverified (§17 T1). If it does not, a
-  profile session after `/clear` is placed by the statusline, or is unattributed.
+- `/clear` starts a new session in the same execution (§17 T1). CC rewrites the same record
+  under the same `startedAt` with the new `sessionId`, so `run`'s poll sights the new session
+  from the record's `startedAt`, before it existed, which covers none of its responses.
 - Unattributed usage is larger where evidence is thin: before the epoch while profiles
   existed, and for default-home sessions running alongside a `run` session with neither the
   daemon nor the statusline sighting them.
@@ -1025,9 +1026,9 @@ Small hunks, in the same branch:
 
 ## 17. Risks and open items
 
-- **T1.** Whether a session record's `sessionId` changes on `/clear`. The plan verifies it
-  first. If it does not change, profile sessions after `/clear` are placed by the statusline
-  or left unattributed (§7.4).
+- **T1.** Resolved by the compat check `session-record-session-id` on CC 2.1.299: on
+  `/clear` the record file stays, its `sessionId` changes within 10 s, and the next answer is
+  written to a new transcript, the one the record then names (§7.4).
 - **T2.** Subagent output is a lower bound (§2.3). A later Claude Code may write final lines
   for subagent responses; the merge rule then picks them up with no change.
 - **T3.** Transcript format drift (core §17 R2): the skipped-lines count, a warning, and the compat
