@@ -12,12 +12,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{
-    FakeCall, fake_claude, fake_claude_calls, hold_launch, path_with, std_cmd, two_fresh_accounts,
+    FakeCall, cmd, fake_claude, fake_claude_calls, hold_launch, path_with, std_cmd,
+    two_fresh_accounts,
 };
 use serde_json::Value;
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::store::{LaunchRow, SightingRow, SightingSource, Store};
-use tagteam_provider::{Env, profile_path};
+use tagteam_provider::{Env, PENDING_LAUNCH_DIR, PendingLaunch, profile_path};
 
 /// How long one step may take before it counts as stuck.
 const LONG: Duration = Duration::from_secs(20);
@@ -90,6 +91,38 @@ impl Home {
             .launches(&ProviderId::new(CLAUDE_CODE))
             .ok()
             .filter(|l| !l.is_empty())
+    }
+
+    /// The pending launch files in the profile (spec §6.1), parsed.
+    fn pending(&self) -> Vec<PendingLaunch> {
+        PendingLaunch::read_all(&self.profile())
+            .into_iter()
+            .map(|(path, parsed)| parsed.unwrap_or_else(|why| panic!("{path:?}: {why}")))
+            .collect()
+    }
+
+    /// `run_launches`'s schema, and `DROP TABLE` for it: the store then refuses every launch
+    /// write, as one that cannot be written would.
+    fn drop_launches(&self) -> String {
+        let db = Env::for_test(self.root()).data_dir().join("tagteam.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'run_launches'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute_batch("DROP TABLE run_launches").unwrap();
+        schema
+    }
+
+    fn restore_launches(&self, schema: &str) {
+        let db = Env::for_test(self.root()).data_dir().join("tagteam.db");
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(schema)
+            .unwrap();
     }
 
     fn sightings(&self) -> Vec<SightingRow> {
@@ -326,8 +359,8 @@ fn a_launch_stays_open_while_the_profile_is_in_use() {
 fn evidence_failures_never_change_the_exit_code() {
     // Spec §6.1: evidence is never worth a session. With the sightings table gone every poll
     // fails, and with the launches table gone too the launch cannot be recorded; either way
-    // the run exits with the session's code. A failed poll goes to the log; a launch that
-    // could not be recorded is one warning, before the session starts.
+    // the run exits with the session's code. A failed poll goes to the log. A launch the store
+    // refuses is kept in a pending file, so nothing is warned of.
     let home = Home::new();
     let db = Env::for_test(home.root()).data_dir().join("tagteam.db");
     rusqlite::Connection::open(&db)
@@ -348,10 +381,7 @@ fn evidence_failures_never_change_the_exit_code() {
         "a failed poll goes to the log, never to claude's stderr: {}",
         stderr(&output)
     );
-    rusqlite::Connection::open(&db)
-        .unwrap()
-        .execute_batch("DROP TABLE run_launches")
-        .unwrap();
+    home.drop_launches();
     let out = home.out("no-launches");
     let output = home
         .run_a(&out)
@@ -359,22 +389,13 @@ fn evidence_failures_never_change_the_exit_code() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
-    // Exactly two warnings: before the spawn, and at the close once the retries are spent,
-    // never one per retry and never one for the end of a launch that was never recorded.
-    let cause = "store error: no such table: run_launches";
     assert_eq!(
         warnings(&output),
-        [
-            format!(
-                "warning: the token report could not record this session's launch yet: {cause}. It will try again while the session runs. If it never can, this session's usage may be credited to the default login's account."
-            ),
-            format!(
-                "warning: the token report could not record this session's launch, so its usage may be credited to the default login's account: {cause}"
-            ),
-        ],
+        Vec::<String>::new(),
         "{}",
         stderr(&output)
     );
+    assert_eq!(home.pending().len(), 1, "the launch is kept in its profile");
     let calls = fake_claude_calls(&out);
     assert!(
         calls
@@ -385,12 +406,118 @@ fn evidence_failures_never_change_the_exit_code() {
 }
 
 #[test]
+fn a_launch_the_store_refused_throughout_is_kept_in_a_pending_file_until_a_scan_records_it() {
+    // Spec §6.1, §6.2: the store refuses every launch write, from before the spawn to the
+    // close. The launch is kept in the profile's pending file, open while the child runs and
+    // closed at the close's time. Nothing is warned of, and the exit code is the child's. A
+    // scan then records the launch from its planned start and removes the file.
+    let home = Home::new();
+    let schema = home.drop_launches();
+    let out = home.out("refused");
+    let planned_after = now_ms();
+    let output = home
+        .run_a(&out)
+        .env("FAKE_CLAUDE_EXIT", "7")
+        .env("FAKE_CLAUDE_SLEEP", "2.5")
+        .output()
+        .unwrap();
+    let closed_before = now_ms();
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert_eq!(
+        warnings(&output),
+        Vec::<String>::new(),
+        "{}",
+        stderr(&output)
+    );
+    let files = PendingLaunch::read_all(&home.profile());
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert!(
+        files[0]
+            .0
+            .starts_with(home.profile().join(PENDING_LAUNCH_DIR)),
+        "{files:?}"
+    );
+    let kept = files[0].1.clone().unwrap();
+    assert_eq!(
+        (kept.provider.as_str(), kept.account_id.as_str()),
+        (CLAUDE_CODE, home.a.as_str())
+    );
+    assert!(
+        (planned_after..closed_before).contains(&kept.started_at_ms),
+        "{kept:?}: planned between {planned_after} and {closed_before}"
+    );
+    let ended = kept.ended_at_ms.expect("the profile was idle at the close");
+    assert!(
+        kept.started_at_ms + 2_000 <= ended && ended <= closed_before,
+        "closed after the child ran: {kept:?}"
+    );
+
+    home.restore_launches(&schema);
+    cmd(home.root())
+        .args(["tokens", "--json"])
+        .assert()
+        .success();
+    let launches = home.launches();
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    assert_eq!(
+        (
+            launches[0].account_id.as_str(),
+            launches[0].started_at,
+            launches[0].ended_at
+        ),
+        (home.a.as_str(), kept.started_at_ms, Some(ended))
+    );
+    assert!(home.pending().is_empty(), "the scan removed the file");
+}
+
+#[test]
+fn a_launch_neither_the_store_nor_the_profile_keeps_is_warned_of_twice() {
+    // Spec §6.1, §7.4: the store refuses the launch and the profile cannot hold the pending
+    // file (a file stands where its directory goes): one warning before the spawn and one at
+    // the close, once the child has run.
+    let home = Home::new();
+    home.drop_launches();
+    let out = home.out("lost");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _resume = Release(pause.join("resume"));
+    let child = home
+        .run_a(&out)
+        .env("FAKE_CLAUDE_EXIT", "7")
+        .env("TAGTEAM_TEST_PAUSE_AT", "before-spawn")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause)
+        .spawn()
+        .unwrap();
+    wait_for("the spawn", || pause.join("paused").exists().then_some(()));
+    fs::write(home.profile().join(PENDING_LAUNCH_DIR), b"").unwrap();
+    fs::write(pause.join("resume"), b"").unwrap();
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    let w = warnings(&output);
+    assert_eq!(w.len(), 2, "{}", stderr(&output));
+    assert!(
+        w[0].starts_with(
+            "warning: the token report could not record this session's launch, in the store (store error: no such table: run_launches) or in its profile ("
+        ) && w[0].ends_with(
+            "). It will try again while the session runs. If it never can, this session's usage may be credited to the default login's account."
+        ),
+        "{}",
+        w[0]
+    );
+    assert_eq!(
+        w[1],
+        "warning: the token report could not record this session's launch, in the store or in its profile, so its usage may be credited to the default login's account"
+    );
+}
+
+#[test]
 fn a_launch_that_failed_to_record_is_recorded_later_with_its_original_start() {
     // Spec §6.1: a launch that could not be recorded before the spawn is retried by the poller
     // while the child runs. It keeps the start planned before the spawn, so attribution, which
     // reads launches at query time, covers the whole session. The table is gone when the run
-    // plans its launch; the poller parks right after its first retry failed (`launch-retry-
-    // failed`), the table comes back, and a later retry records the launch.
+    // plans its launch, which is kept in a pending file meanwhile; the poller parks right after
+    // its first retry failed (`launch-retry-failed`), the table comes back, and a later retry
+    // records the launch and removes the file.
     let home = Home::new();
     let db = Env::for_test(home.root()).data_dir().join("tagteam.db");
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -424,6 +551,9 @@ fn a_launch_that_failed_to_record_is_recorded_later_with_its_original_start() {
         home.launches_if_any().is_none(),
         "the first retry recorded nothing"
     );
+    let kept = home.pending();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].ended_at_ms, None, "open while the child runs");
     let restored_at = now_ms();
     conn.execute_batch(&schema).unwrap();
     fs::write(pause.join("resume"), b"").unwrap();
@@ -435,22 +565,17 @@ fn a_launch_that_failed_to_record_is_recorded_later_with_its_original_start() {
         "the launch keeps the start planned before the spawn, not the retry's: {late:?}, planned after {planned_after}, restored at {restored_at}"
     );
     assert_eq!(late.account_id, home.a);
+    assert_eq!(kept[0].started_at_ms, late.started_at, "the same launch");
     fs::write(&hold, b"").unwrap();
     let output = finish(child);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    let pre_spawn = warnings(&output);
     assert_eq!(
-        pre_spawn.len(),
-        1,
-        "the warning before the spawn alone; none at the close after a late record: {}",
+        warnings(&output),
+        Vec::<String>::new(),
+        "the profile kept the launch meanwhile: {}",
         stderr(&output)
     );
-    assert!(
-        pre_spawn[0]
-            .starts_with("warning: the token report could not record this session's launch yet"),
-        "{}",
-        stderr(&output)
-    );
+    assert!(home.pending().is_empty(), "recorded: the file is removed");
     let closed = home.launches();
     assert_eq!(closed.len(), 1, "{closed:?}");
     assert_eq!(closed[0].started_at, late.started_at);
@@ -461,14 +586,11 @@ fn a_launch_that_failed_to_record_is_recorded_later_with_its_original_start() {
 }
 
 #[test]
-fn a_spawn_that_fails_with_an_unrecorded_launch_warns_of_it_before_the_spawn_only() {
-    // No session ran, so no usage can be misplaced: the close says nothing more.
+fn a_spawn_that_fails_with_an_unrecorded_launch_keeps_it_in_a_pending_file() {
+    // No session ran, so no usage can be misplaced: nothing is warned of, and the launch is
+    // kept, closed, for the next scan.
     let home = Home::new();
-    let db = Env::for_test(home.root()).data_dir().join("tagteam.db");
-    rusqlite::Connection::open(&db)
-        .unwrap()
-        .execute_batch("DROP TABLE run_launches")
-        .unwrap();
+    home.drop_launches();
     let out = home.out("gone-unrecorded");
     let pause = home.root().join("pause");
     fs::create_dir_all(&pause).unwrap();
@@ -484,9 +606,15 @@ fn a_spawn_that_fails_with_an_unrecorded_launch_warns_of_it_before_the_spawn_onl
     fs::write(pause.join("resume"), b"").unwrap();
     let output = finish(child);
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    let w = warnings(&output);
-    assert_eq!(w.len(), 1, "{}", stderr(&output));
-    assert!(w[0].contains("launch yet"), "{}", stderr(&output));
+    assert_eq!(
+        warnings(&output),
+        Vec::<String>::new(),
+        "{}",
+        stderr(&output)
+    );
+    let kept = home.pending();
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(kept[0].ended_at_ms.is_some(), "{kept:?}");
 }
 
 #[test]

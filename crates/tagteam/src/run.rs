@@ -35,9 +35,10 @@ const LOST: i32 = 1;
 /// through its fd. Waits for it, forwarding signals (Decision 1), then runs the exit handling
 /// and prints its notices on `err`.
 ///
-/// Token report spec §6.1: the launch is planned and recorded before the spawn, and the child's
-/// pid, its session record and a launch record that failed are recorded off this thread while it
-/// runs. None of that ever changes the outcome.
+/// Token report spec §6.1: the launch is planned and recorded before the spawn, or kept in a
+/// pending file in its profile, and the child's pid, its session record and a launch record
+/// that failed are recorded off this thread while it runs. None of that ever changes the
+/// outcome.
 ///
 /// `Ok` is `claude`'s exit code, `128 + n` when signal `n` ended it, whatever exit handling did
 /// (B.63). `Err` is a launch that never started: interrupted at the token's last look, or a
@@ -66,8 +67,8 @@ pub(crate) fn run_session(
         return Err(EngineError::Interrupted(signal));
     }
     pause_point("before-spawn");
-    let tracked = plan_launch(engine, &launched, err);
     let profile = launched.profile.clone();
+    let tracked = plan_launch(engine, &launched, &profile, err);
     let spec = SpawnSpec {
         program: launch.to_path_buf(),
         args: args.to_vec(),
@@ -134,19 +135,26 @@ pub(crate) fn run_session(
 }
 
 /// A launch `run` planned for a provider whose transcripts the report reads (token report spec
-/// §6.1), and whether it is recorded yet. The poller sets the flag; `run` reads it once the
-/// poller is joined.
+/// §6.1), whether it is recorded yet, and whether it is in its profile's pending file. The poller
+/// sets the flags; `run` reads them once the poller is joined.
 struct TrackedLaunch {
     id: LaunchId,
     recorded: AtomicBool,
+    kept: AtomicBool,
 }
 
 /// Token report spec §6.1: plans the launch before the spawn, for a provider whose transcripts
 /// the report reads, and tries to record it. Its start is stamped here, so a launch recorded
-/// later still covers the whole session. A failure is one warning on `err`, and the session runs
-/// all the same: the poller retries the record while the child runs, and `close_launch` tries
-/// once more.
-fn plan_launch(engine: &Engine, launched: &Launched, err: &mut dyn Write) -> Option<TrackedLaunch> {
+/// later still covers the whole session. One the store refuses is kept in a pending file in the
+/// profile, which the reservation just made proves writable, and the session runs all the same:
+/// the poller retries the record while the child runs, and `close_launch` tries once more. A
+/// launch that neither accepts is one warning on `err`.
+fn plan_launch(
+    engine: &Engine,
+    launched: &Launched,
+    profile: &Path,
+    err: &mut dyn Write,
+) -> Option<TrackedLaunch> {
     let provider = &launched.account.provider;
     if !engine
         .provider(provider)
@@ -155,31 +163,43 @@ fn plan_launch(engine: &Engine, launched: &Launched, err: &mut dyn Write) -> Opt
         return None;
     }
     let id = engine.plan_launch(provider, &launched.account.id);
-    let recorded = match engine.record_launch(&id) {
-        Ok(()) => true,
-        Err(e) => {
-            let _ = writeln!(
-                err,
-                "warning: the token report could not record this session's launch yet: {e}. It will try again while the session runs. If it never can, this session's usage may be credited to the default login's account."
-            );
-            false
-        }
+    let (recorded, kept) = match engine.record_launch(&id) {
+        Ok(()) => (true, false),
+        Err(e) => match engine.keep_pending_launch(&id, profile, None) {
+            Ok(()) => {
+                tracing::debug!(
+                    kind = e.kind(),
+                    "the store refused the session's launch; it is kept in a pending file"
+                );
+                (false, true)
+            }
+            Err(k) => {
+                let _ = writeln!(
+                    err,
+                    "warning: the token report could not record this session's launch, in the store ({e}) or in its profile ({k}). It will try again while the session runs. If it never can, this session's usage may be credited to the default login's account."
+                );
+                (false, false)
+            }
+        },
     };
     Some(TrackedLaunch {
         id,
         recorded: AtomicBool::new(recorded),
+        kept: AtomicBool::new(kept),
     })
 }
 
 /// Token report spec §6.1, after exit handling: records the launch once more if it is still not
-/// recorded, ends the child's tenures (`Engine::close_launch`): the current one at the later of
-/// its stored end and its last confirming read, the ones a switch ended exactly at theirs, and
+/// recorded, ends the child's tenures (`Engine::close_launch_kept`): the current one at the later
+/// of its stored end and its last confirming read, the ones a switch ended exactly at theirs, and
 /// none past `exited_at_ms`, the child's exit. Then it closes the launch unless the profile is
-/// still in use, as by a background session the child left running.
+/// still in use, as by a background session the child left running. A launch still not recorded
+/// is kept in its pending file instead, with the close's time when the profile is idle.
 ///
-/// A launch that still cannot be recorded is logged, and warned of on `err` (the child being
-/// gone) when `child_ran`: with no child there is no usage to misplace. The close that follows
-/// fails for the same reason and is not warned of again, and the tenures' ends are written all
+/// A launch that is in neither the store nor a pending file is logged, and warned of on `err`
+/// (the child being gone) when `child_ran`: with no child there is no usage to misplace. A
+/// launch in a pending file is logged at debug alone: the next scan records it. The close that
+/// follows an unrecorded launch is not warned of again, and the tenures' ends are written all
 /// the same. Any other failure to close is a warning, and the next `sight_sessions` closes the
 /// launch then.
 fn close_launch(
@@ -194,29 +214,30 @@ fn close_launch(
     let Some(tracked) = tracked else {
         return;
     };
-    let mut unrecorded = false;
-    if !tracked.recorded.load(Ordering::Relaxed) {
-        if let Err(e) = engine.record_launch(&tracked.id) {
-            unrecorded = true;
-            tracing::warn!(
+    let mut recorded = tracked.recorded.load(Ordering::Relaxed);
+    if !recorded {
+        match engine.record_launch(&tracked.id) {
+            Ok(()) => recorded = true,
+            Err(e) => tracing::warn!(
                 kind = e.kind(),
                 "could not record the session's launch for the token report"
-            );
-            if child_ran {
-                let _ = writeln!(
-                    err,
-                    "warning: the token report could not record this session's launch, so its usage may be credited to the default login's account: {e}"
-                );
-            }
+            ),
         }
     }
-    if let Err(e) = engine.close_launch(&tracked.id, profile, seen, exited_at_ms) {
-        if unrecorded {
-            return;
+    let end = engine.close_launch_kept(&tracked.id, profile, seen, exited_at_ms, recorded);
+    if recorded {
+        if let Err(e) = end.stored {
+            let _ = writeln!(
+                err,
+                "warning: the token report could not record this session's end: {e}"
+            );
         }
+    } else if end.kept {
+        tracing::debug!("the session's launch is kept in a pending file for the next scan");
+    } else if child_ran {
         let _ = writeln!(
             err,
-            "warning: the token report could not record this session's end: {e}"
+            "warning: the token report could not record this session's launch, in the store or in its profile, so its usage may be credited to the default login's account"
         );
     }
 }
@@ -224,7 +245,9 @@ fn close_launch(
 /// Token report spec §6.1: runs `wait` on this thread while a scoped thread, until `wait`
 /// returns, checks the child's session record on every `POLL` tick, and every `RECORD_POLL` from
 /// its first tick records the launch if it is not yet, records the child's pid once it is, and
-/// writes what the checks saw, whether or not the launch is recorded yet. Returns what `wait`
+/// writes what the checks saw, whether or not the launch is recorded yet. A launch the store
+/// still refuses is kept in its pending file meanwhile, written again if that write failed, and
+/// the file goes once the launch is recorded. Returns what `wait`
 /// returned and the child's exit, stamped by `beside` before the poller is joined. The store
 /// writes are the poller's, so a busy store never delays the wait, the signals it forwards or
 /// the stamp. The poller never touches the cancel token or the terminal: a failure is logged,
@@ -267,9 +290,22 @@ fn wait_polling<T>(
                                 );
                                 record_logged = true;
                             }
+                            if !launch.kept.load(Ordering::Relaxed)
+                                && engine.keep_pending_launch(id, profile, None).is_ok()
+                            {
+                                launch.kept.store(true, Ordering::Relaxed);
+                            }
                             pause_point("launch-retry-failed");
                         }
                     }
+                }
+                // Recorded: the pending file is not needed. A removal that fails is tried
+                // again on the next write, and by the close.
+                if launch.recorded.load(Ordering::Relaxed)
+                    && launch.kept.load(Ordering::Relaxed)
+                    && engine.drop_pending_launch(id, profile).is_ok()
+                {
+                    launch.kept.store(false, Ordering::Relaxed);
                 }
                 if launch.recorded.load(Ordering::Relaxed) && !pid_attached {
                     pid_attached = true;
