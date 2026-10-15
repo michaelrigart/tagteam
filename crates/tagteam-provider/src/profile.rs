@@ -393,8 +393,11 @@ impl PendingLaunch {
         })
     }
 
-    fn file_name(started_at_ms: i64, run_pid: u32) -> String {
-        format!("{started_at_ms}-{run_pid}.json")
+    /// The file of the launch `run_pid` started at `started_at_ms` in `profile`.
+    pub fn path(profile: &Path, started_at_ms: i64, run_pid: u32) -> PathBuf {
+        profile
+            .join(PENDING_LAUNCH_DIR)
+            .join(format!("{started_at_ms}-{run_pid}.json"))
     }
 
     /// Writes the launch as `run_pid`'s file in `profile`: atomic, 0600, through a temp file in
@@ -418,7 +421,7 @@ impl PendingLaunch {
         let mut bytes = serde_json::to_vec_pretty(&v).expect("a Value always serializes");
         bytes.push(b'\n');
         write_atomic_private(
-            &dir.join(Self::file_name(self.started_at_ms, run_pid)),
+            &Self::path(profile, self.started_at_ms, run_pid),
             &bytes,
             0o600,
         )
@@ -427,17 +430,18 @@ impl PendingLaunch {
     /// Removes `run_pid`'s file for the launch started at `started_at_ms`; one that is not
     /// there is fine.
     pub fn remove(profile: &Path, started_at_ms: i64, run_pid: u32) -> io::Result<()> {
-        remove_own_file(
-            &profile.join(PENDING_LAUNCH_DIR),
-            &Self::file_name(started_at_ms, run_pid),
-        )
+        match fs::remove_file(Self::path(profile, started_at_ms, run_pid)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Every `*.json` file in `profile`'s pending directory, sorted by name, each parsed or
     /// with why it is not a pending launch (never quoting its bytes). Anything else is ignored:
     /// a writer's temp file, a link, a directory. A directory that is not there, or cannot be
-    /// listed, holds none.
-    pub fn read_all(profile: &Path) -> Vec<(PathBuf, Result<PendingLaunch, String>)> {
+    /// listed, holds none. Each file is `stat`ed before it is read, so its `stamp` is never
+    /// newer than what was parsed.
+    pub fn read_all(profile: &Path) -> Vec<(PendingFile, Result<PendingLaunch, String>)> {
         let dir = profile.join(PENDING_LAUNCH_DIR);
         let Ok(listing) = fs::read_dir(&dir) else {
             return Vec::new();
@@ -451,7 +455,8 @@ impl PendingLaunch {
         paths.sort();
         paths
             .into_iter()
-            .map(|path| {
+            .filter_map(|path| {
+                let stamp = FileStamp::of(&path)?;
                 let parsed = match fs::read(&path) {
                     Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                         Ok(v) => Self::parse(&v),
@@ -459,9 +464,49 @@ impl PendingLaunch {
                     },
                     Err(e) => Err(format!("it cannot be read: {}", e.kind())),
                 };
-                (path, parsed)
+                Some((PendingFile { path, stamp }, parsed))
             })
             .collect()
+    }
+}
+
+/// A pending launch file as `read_all` found it: where it is, and what it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFile {
+    pub path: PathBuf,
+    stamp: FileStamp,
+}
+
+impl PendingFile {
+    /// Removes the file unless it is no longer the one that was read: `run` replaces a file by
+    /// renaming a new one over it, so a changed file may hold a newer record (its `endedAt`)
+    /// that the reader never saw. Returns whether it was removed; one already gone counts.
+    pub fn remove_if_unchanged(&self) -> io::Result<bool> {
+        match FileStamp::of(&self.path) {
+            None => Ok(true),
+            Some(now) if now == self.stamp => fs::remove_file(&self.path).map(|()| true),
+            Some(_) => Ok(false),
+        }
+    }
+}
+
+/// What tells a file replaced by a rename from the one that was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    ino: u64,
+    len: u64,
+    mtime_ns: i128,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path).ok()?;
+        Some(Self {
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+        })
     }
 }
 
@@ -1130,7 +1175,7 @@ mod tests {
         let read = PendingLaunch::read_all(&profile);
         let names: Vec<_> = read
             .iter()
-            .map(|(p, _)| p.file_name().unwrap().to_str().unwrap().to_owned())
+            .map(|(f, _)| f.path.file_name().unwrap().to_str().unwrap().to_owned())
             .collect();
         assert_eq!(names, ["1790000000000-42.json", "torn.json"]);
         assert_eq!(read[0].1.as_ref().unwrap(), &closed, "replaced in place");
@@ -1139,5 +1184,34 @@ mod tests {
         PendingLaunch::remove(&profile, launch.started_at_ms, 42).unwrap();
         PendingLaunch::remove(&profile, launch.started_at_ms, 42).unwrap();
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_pending_file_replaced_after_it_was_read_is_not_removed_as_the_one_read() {
+        let d = tempfile::tempdir().unwrap();
+        let launch = PendingLaunch {
+            provider: ProviderId::new("claude-code"),
+            account_id: AccountId::from_string("acct"),
+            started_at_ms: 5,
+            ended_at_ms: None,
+        };
+        launch.write(d.path(), 1).unwrap();
+        let read = PendingLaunch::read_all(d.path()).remove(0).0;
+        assert_eq!(read.path, PendingLaunch::path(d.path(), 5, 1));
+
+        // `run`'s close renames a newer file over it.
+        PendingLaunch {
+            ended_at_ms: Some(9),
+            ..launch.clone()
+        }
+        .write(d.path(), 1)
+        .unwrap();
+        assert!(!read.remove_if_unchanged().unwrap(), "changed: kept");
+        assert!(read.path.exists());
+
+        let read = PendingLaunch::read_all(d.path()).remove(0).0;
+        assert!(read.remove_if_unchanged().unwrap());
+        assert!(!read.path.exists());
+        assert!(read.remove_if_unchanged().unwrap(), "already gone is fine");
     }
 }

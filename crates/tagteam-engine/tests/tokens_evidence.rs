@@ -1887,3 +1887,53 @@ fn remove_records_the_pending_launches_of_the_profile_it_deletes() {
     assert!(!profile.exists(), "the profile is gone");
     assert_eq!(ended(&fx), [(a.to_string(), Some(NOW - 1_000))]);
 }
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_pending_file_replaced_during_the_scan_is_kept_for_the_next_one() {
+    // Spec §6.2: `run`'s close renames a newer file (with `endedAt`) over its own while the
+    // scan has the older one in hand. The scan records what it read and leaves the newer file,
+    // which the next scan records, closing the launch.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let _in_use = FlockGuard::try_lock(&profile.join(LAUNCH_DIR).join("4242.lock"))
+        .unwrap()
+        .unwrap();
+    let file = pending(&fx, &profile, &a, NOW - 5_000, None, 4242);
+    let (account, dir) = (a.clone(), profile.clone());
+    let provider = fx.provider();
+    let swapped = std::sync::atomic::AtomicBool::new(false);
+    fx.engine.on_point(
+        "scan-pending-recorded",
+        Box::new(move || {
+            // Once: the second scan reads the newer file.
+            if !swapped.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                PendingLaunch {
+                    provider: provider.clone(),
+                    account_id: account.clone(),
+                    started_at_ms: NOW - 5_000,
+                    ended_at_ms: Some(NOW - 1_000),
+                }
+                .write(&dir, 4242)
+                .unwrap();
+            }
+        }),
+    );
+
+    sight(&fx);
+    assert_eq!(ended(&fx), [(a.to_string(), None)], "what was read");
+    assert!(file.exists(), "the newer file is kept");
+    assert_eq!(
+        PendingLaunch::read_all(&profile)[0]
+            .1
+            .as_ref()
+            .unwrap()
+            .ended_at_ms,
+        Some(NOW - 1_000)
+    );
+
+    sight(&fx);
+    assert_eq!(ended(&fx), [(a.to_string(), Some(NOW - 1_000))]);
+    assert!(!file.exists());
+}
