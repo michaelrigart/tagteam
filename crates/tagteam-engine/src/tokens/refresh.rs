@@ -21,7 +21,7 @@ use super::{lock_until_free, tokens_lock_path};
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
-use crate::store::{RefreshStats, Store, TokenFileRow, UsageRow, usage_key};
+use crate::store::{RefreshStats, Store, TokenFileRow, UsageRow, merge_line, usage_key};
 
 /// At most this many files are read at once (spec §5.2 step 4).
 const MAX_WORKERS: usize = 4;
@@ -62,7 +62,8 @@ pub struct IndexProgress {
 /// One refresh (spec §5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IndexReport {
-    /// False when the budget ran out or the refresh was cancelled first; call again to go on.
+    /// False when the budget ran out first, or the prune it ends with was stopped by it; call
+    /// again to go on. (A cancelled refresh returns the interruption instead of a report.)
     pub complete: bool,
     pub files_read: u64,
     pub responses_added: u64,
@@ -90,6 +91,16 @@ enum End {
     Stopped,
 }
 
+/// How a worker's turn at a file came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    /// The file was read, as far as `End` says.
+    Read(End),
+    /// The file was unreadable or gone: skipped, and not the worker's one guaranteed file under
+    /// a spent budget, since it read nothing.
+    Skipped,
+}
+
 /// What a worker sends the writer.
 enum Msg {
     /// One chunk's rows and the checkpoint just past them; `end` with a file's last chunk.
@@ -102,6 +113,8 @@ enum Msg {
     },
     /// A file that could not be opened or read: skipped, and tried again next time (spec §5.4).
     Unreadable,
+    /// A file deleted between the listing and the open: nothing to read, nothing to retry.
+    Gone,
 }
 
 /// What the workers share.
@@ -134,18 +147,23 @@ impl Work<'_> {
             let Some(job) = self.jobs.get(self.next.fetch_add(1, Ordering::Relaxed)) else {
                 return;
             };
-            first = false;
-            if self.read(job, tx) != Some(End::Done) {
-                return;
+            match self.read(job, tx) {
+                Some(Turn::Read(End::Done)) => first = false,
+                Some(Turn::Skipped) => {}
+                Some(Turn::Read(End::Stopped)) | None => return,
             }
         }
     }
 
     /// One file, from where `open_at` starts it, a message per chunk. `None` when the writer is
     /// gone.
-    fn read(&self, job: &Job, tx: &SyncSender<Msg>) -> Option<End> {
+    fn read(&self, job: &Job, tx: &SyncSender<Msg>) -> Option<Turn> {
         let open = match open_at(&job.path, job.stored.as_ref()) {
             Ok(open) => open,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                tx.send(Msg::Gone).ok()?;
+                return Some(Turn::Skipped);
+            }
             Err(e) => return self.unreadable(job, &e, tx),
         };
         let mut reader = LineReader::new(&open, self.limits);
@@ -199,19 +217,19 @@ impl Work<'_> {
                 end,
             };
             tx.send(msg).ok()?;
-            if end.is_some() {
-                return end;
+            if let Some(end) = end {
+                return Some(Turn::Read(end));
             }
         }
     }
 
     /// Spec §5.4: a file that cannot be opened or read is skipped with a warning (its path at
     /// debug only, §13), and tried again next time; its checkpoint stays where it was.
-    fn unreadable(&self, job: &Job, e: &io::Error, tx: &SyncSender<Msg>) -> Option<End> {
+    fn unreadable(&self, job: &Job, e: &io::Error, tx: &SyncSender<Msg>) -> Option<Turn> {
         tracing::warn!(kind = ?e.kind(), "a transcript could not be read; the next refresh tries it again");
         tracing::debug!(path = %job.path.display(), error = %e, "the transcript could not be read");
         tx.send(Msg::Unreadable).ok()?;
-        Some(End::Done)
+        Some(Turn::Skipped)
     }
 }
 
@@ -227,18 +245,6 @@ fn row_of(provider: &ProviderId, u: UsageLine) -> UsageRow {
         counts: u.counts,
         speed: u.speed,
         finalized: u.final_line,
-    }
-}
-
-/// Spec §2.2's rule for two lines of one response in one batch: each count's maximum, the
-/// earliest time, final once either line is, and the later line's speed when it has one, as
-/// the store's upsert does across batches.
-fn merge(into: &mut UsageRow, line: UsageRow) {
-    into.at_ms = into.at_ms.min(line.at_ms);
-    into.counts.merge_max(&line.counts);
-    into.finalized |= line.finalized;
-    if line.speed.is_some() {
-        into.speed = line.speed;
     }
 }
 
@@ -326,7 +332,9 @@ impl Writer<'_> {
             end,
         } = msg
         else {
-            self.tally.unreadable += 1;
+            if matches!(msg, Msg::Unreadable) {
+                self.tally.unreadable += 1;
+            }
             self.tally.files_done += 1;
             return Ok(());
         };
@@ -335,7 +343,7 @@ impl Writer<'_> {
         self.batch.since.get_or_insert_with(Instant::now);
         for row in rows {
             if let Some(&i) = self.batch.keys.get(&row.key) {
-                merge(&mut self.batch.rows[i], row);
+                merge_line(&mut self.batch.rows[i], &row);
                 continue;
             }
             // Full before this chunk's rows are all in: its checkpoint waits for the rest.
@@ -522,7 +530,7 @@ impl Engine {
             let holder = uuid::Uuid::now_v7().to_string();
             let stop = || past(deadline) || cancel.requested().is_some();
             complete = store
-                .prune_tokens(provider, cutoff_ms, &holder, self.now_ms(), &stop)?
+                .prune_tokens(provider, epoch, cutoff_ms, &holder, self.now_ms(), &stop)?
                 .complete;
         }
         if let (false, Some(signal)) = (complete, cancel.requested()) {

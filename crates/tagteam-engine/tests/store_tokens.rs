@@ -103,7 +103,7 @@ fn wall_ms() -> i64 {
 
 /// A prune nothing stops.
 fn prune(s: &Store, cutoff: i64, holder: &str, now: i64) -> PruneOutcome {
-    s.prune_tokens(&cc(), cutoff, holder, now, &|| false)
+    s.prune_tokens(&cc(), generation(s), cutoff, holder, now, &|| false)
         .unwrap()
 }
 
@@ -571,7 +571,7 @@ fn a_prune_that_fails_part_way_still_moves_changed_at() {
     .unwrap();
 
     assert!(
-        s.prune_tokens(&cc(), cutoff, "h1", T + 5, &|| false)
+        s.prune_tokens(&cc(), generation(&s), cutoff, "h1", T + 5, &|| false)
             .is_err()
     );
     assert_eq!(keys(&all(&s)), [2], "the chunk committed");
@@ -619,7 +619,7 @@ fn a_stopped_prune_resumes_on_the_next_call_and_completes() {
         true
     };
     assert_eq!(
-        s.prune_tokens(&cc(), cutoff, "h1", T + 1, &at_first_ask)
+        s.prune_tokens(&cc(), generation(&s), cutoff, "h1", T + 1, &at_first_ask)
             .unwrap(),
         PruneOutcome {
             deleted: 5_000,
@@ -638,7 +638,14 @@ fn a_stopped_prune_resumes_on_the_next_call_and_completes() {
     let mut outcomes = Vec::new();
     for (n, holder) in ["h2", "h3", "h4", "h5"].into_iter().enumerate() {
         let outcome = s
-            .prune_tokens(&cc(), cutoff, holder, T + 2 + n as i64, &at_first_ask)
+            .prune_tokens(
+                &cc(),
+                generation(&s),
+                cutoff,
+                holder,
+                T + 2 + n as i64,
+                &at_first_ask,
+            )
             .unwrap();
         outcomes.push(outcome);
         if outcome.complete {
@@ -709,7 +716,8 @@ fn the_cleanup_after_the_responses_stops_and_resumes_too() {
     // The responses and sessions delete nothing and move on unasked; 5,000 sightings go, then
     // the first ask stops it.
     assert_eq!(
-        s.prune_tokens(&cc(), cutoff, "h1", T, &|| true).unwrap(),
+        s.prune_tokens(&cc(), generation(&s), cutoff, "h1", T, &|| true)
+            .unwrap(),
         stopped
     );
     assert_eq!(sightings(), 1_000);
@@ -718,14 +726,14 @@ fn the_cleanup_after_the_responses_stops_and_resumes_too() {
         None
     );
     assert_eq!(
-        s.prune_tokens(&cc(), cutoff, "h2", T + 1, &|| true)
+        s.prune_tokens(&cc(), generation(&s), cutoff, "h2", T + 1, &|| true)
             .unwrap(),
         stopped,
         "the last 1,000, then an ask"
     );
     assert_eq!(sightings(), 0);
     assert_eq!(
-        s.prune_tokens(&cc(), cutoff, "h3", T + 2, &|| true)
+        s.prune_tokens(&cc(), generation(&s), cutoff, "h3", T + 2, &|| true)
             .unwrap(),
         done(0),
         "nothing left to delete: it completes without asking"
@@ -1001,7 +1009,8 @@ fn purge_provider_deletes_token_rows_and_keeps_the_epoch() {
         .unwrap();
         s.finish_token_refresh(&p, generation(&s), &RefreshStats::default(), T)
             .unwrap();
-        s.prune_tokens(&p, 0, "h", T, &|| false).unwrap();
+        s.prune_tokens(&p, generation(&s), 0, "h", T, &|| false)
+            .unwrap();
         s.record_sighting(&p, &sighting("s1", "", T, T), 0).unwrap();
         s.open_launch(&p, "acct", T, T).unwrap();
     }
@@ -1105,5 +1114,33 @@ fn reads_are_per_provider_by_range_and_session() {
     assert_eq!(
         s.token_span(&ProviderId::new("none")).unwrap(),
         (None, None)
+    );
+}
+
+#[test]
+fn a_prune_after_a_full_purge_is_refused() {
+    // Spec §5.1, §13: a prune is a write of the refresh's generation. A purge between the last
+    // batch and the prune leaves it nothing to write: no lease, no state row.
+    let (_d, s, _) = store();
+    let started = generation(&s);
+    commit(&s, &[row(1, "s1", T - 10 * DAY, 1)], T);
+    s.empty_all().unwrap();
+    let err = s
+        .prune_tokens(&cc(), started, T - DAY, "h1", T + 1, &|| false)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::TokenIndexPurged), "{err:?}");
+    assert_eq!(s.token_state(&cc()).unwrap(), None, "not recreated");
+    assert_eq!(s.token_epoch().unwrap(), None);
+
+    // A generation begun after the purge prunes, and the refused one left no lease behind.
+    let fresh = s.begin_token_refresh(&cc(), T + 2).unwrap();
+    assert_eq!(
+        s.prune_tokens(&cc(), fresh, T - DAY, "h2", T + 2, &|| false)
+            .unwrap(),
+        done(0)
+    );
+    assert_eq!(
+        s.token_state(&cc()).unwrap().unwrap().pruned_at,
+        Some(T + 2)
     );
 }
