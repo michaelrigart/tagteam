@@ -260,9 +260,10 @@ pub const SCHEMA_VERSION: i64 = 3;
 pub struct SeedLaunch { pub provider: ProviderId, pub account_id: String, pub started_at_ms: i64, pub in_use: bool }
 impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError>;  // unchanged signature: a migration to 3 uses the system clock and records seeded = 0
-    /// `now_ms` (the engine clock) dates the epoch and the seeded active_history rows; `seed` runs only when step 3 is applied, None = unknown -> seeded = 0.
-    pub fn open_seeded(path: &Path, now_ms: i64, seed: &dyn Fn() -> Option<Vec<SeedLaunch>>) -> Result<Self, StoreError>;
-    pub fn open_existing_seeded(path: &Path, now_ms: i64, seed: &dyn Fn() -> Option<Vec<SeedLaunch>>) -> Result<Option<Self>, StoreError>;
+    /// `now` (the engine passes `&|| self.now_ms()`) is read once, after the migration's IMMEDIATE transaction holds the write lock, and dates
+    /// the epoch and the seeded active_history rows; `now` and `seed` run only when step 3 is applied, `seed` None = unknown -> seeded = 0.
+    pub fn open_seeded(path: &Path, now: &dyn Fn() -> i64, seed: &dyn Fn() -> Option<Vec<SeedLaunch>>) -> Result<Self, StoreError>;
+    pub fn open_existing_seeded(path: &Path, now: &dyn Fn() -> i64, seed: &dyn Fn() -> Option<Vec<SeedLaunch>>) -> Result<Option<Self>, StoreError>;
 }
 
 // store/tokens.rs (Task 12)
@@ -272,6 +273,8 @@ pub struct TokenFileRow { pub path: String, pub dev: u64, pub ino: u64, pub size
 pub struct UsageRow { pub key: i64, pub session_id: String, pub project: Option<String>, pub at_ms: i64, pub model: String, pub sidechain: bool, pub counts: TokenCounts, pub speed: Option<String>, pub finalized: bool }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BatchOutcome { pub added: u64, pub updated: u64 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneOutcome { pub deleted: u64, pub complete: bool }
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RefreshStats { pub files: u64, pub responses: u64, pub skipped_lines: u64, pub unreadable_files: u64 } // `responses` is kept by the store (batches add, prunes subtract); finish_token_refresh ignores the input
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,8 +296,10 @@ impl Store {
     pub fn commit_token_batch(&self, provider: &ProviderId, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
     /// Sets refreshed_at and stats; inserts token_epoch(now, seeded = 1) if it has no row; on the first completion (refreshed_at was NULL) also sets changed_at.
     pub fn finish_token_refresh(&self, provider: &ProviderId, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
-    /// Daily lease `prune:tokens:<provider>`; deletes usage older than cutoff, then empty sessions and their sightings, then launches ended before cutoff; sets pruned_at, and changed_at when it deleted usage. Returns usage rows deleted.
-    pub fn prune_tokens(&self, provider: &ProviderId, cutoff_ms: i64, holder: &str, now_ms: i64) -> Result<u64, StoreError>;
+    /// Daily lease `prune:tokens:<provider>`; deletes usage older than cutoff in chunks, each chunk that deletes any also moving changed_at and
+    /// `responses`; then empty sessions, sightings that ended before cutoff, launches ended before cutoff, and pruned_at. `stop` is asked before
+    /// each chunk: stopped, the lease is released and `complete: false` (the next call goes on). A lease held or spent today: `{0, complete: true}`.
+    pub fn prune_tokens(&self, provider: &ProviderId, cutoff_ms: i64, holder: &str, now_ms: i64, stop: &dyn Fn() -> bool) -> Result<PruneOutcome, StoreError>;
     pub fn token_state(&self, provider: &ProviderId) -> Result<Option<TokenStateRow>, StoreError>;
     pub fn token_epoch(&self) -> Result<Option<EpochRow>, StoreError>;
     /// max(recorded_at) over session_sightings, run_launches and active_history for the provider.
@@ -321,7 +326,7 @@ impl Store {
 
 ```rust
 pub const DEFAULT_TOKENS_RETENTION_DAYS: u32 = 365;
-pub struct Settings { /* existing */ pub tokens_retention_days: u32, pub prices: BTreeMap<String, PriceOverride> }
+pub struct Settings { /* existing */ pub tokens_retention_days: u32, pub prices: BTreeMap<ProviderId, BTreeMap<String, PriceOverride>> } // every [provider.<id>.prices] table, whichever provider was loaded
 ```
 
 ### Engine (Tasks 14–18), in `tagteam_engine::tokens`
@@ -354,7 +359,7 @@ impl Engine {
     pub fn open_launch(&self, provider: &ProviderId, account: &AccountId) -> Result<LaunchId, EngineError>;          // before the spawn
     pub fn attach_launch_pid(&self, id: &LaunchId, pid: u32) -> Result<(), EngineError>;
     pub fn poll_launch(&self, id: &LaunchId, profile: &Path, pid: u32, state: &mut LaunchPoll) -> Result<(), EngineError>; // every 2 s while the child runs
-    pub fn close_launch(&self, id: &LaunchId, profile: &Path, state: &LaunchPoll) -> Result<(), EngineError>;              // at child exit
+    pub fn close_launch(&self, id: &LaunchId, profile: &Path, state: &LaunchPoll, exited_at_ms: i64) -> Result<(), EngineError>; // after finish_run: sighting ends at exited_at_ms (the child's exit, read right after the wait), launch closes now if idle
     /// The statusline sighting (spec §6.3). `profile`: the run-shell profile, or None for the default home. Never waits more than CACHE_WRITE_WAIT.
     pub fn statusline_sighting(&self, provider: &ProviderId, session_id: &str, profile: Option<&Path>) -> Result<(), EngineError>;
 }
@@ -6743,9 +6748,9 @@ git commit -m "Give the fake provider transcripts"
 **Depends on:** none
 **Files:**
 - Create: `crates/tagteam-engine/src/store/schema_v3.sql` (every table, index and trigger of spec §4; `token_epoch` with `seeded` per ruling R1; `token_usage` keyed per ruling R7 and its `model` normalized into `token_models` per ruling R8, see Notes)
-- Modify: `crates/tagteam-engine/src/store/mod.rs` (`MIGRATION_V3`, `MIGRATIONS: [&str; 3]`, `TOKENS_STEP`, `SCHEMA_VERSION = 3`, `SeedLaunch`, `Epoch`, `seed_tokens_step`, `Store::open_seeded(path, now_ms, seed)`, `Store::open_existing_seeded(path, now_ms, seed)`, `migrate(epoch)`)
-- Modify: `crates/tagteam-engine/src/engine.rs` (`store()` and `existing_store()` open through `open_seeded` / `open_existing_seeded` with `self.now_ms()` and `seed_launches`, which lists the profiles under `data_dir/sessions/*`, or says it could not)
-- Modify: `crates/tagteam-engine/tests/store.rs` (version asserts 2→3, the newer-schema test 3→4, the v1 test's comment, nine new tests)
+- Modify: `crates/tagteam-engine/src/store/mod.rs` (`MIGRATION_V3`, `MIGRATIONS: [&str; 3]`, `TOKENS_STEP`, `SCHEMA_VERSION = 3`, `SeedLaunch`, `Epoch`, `seed_tokens_step`, `Store::open_seeded(path, now, seed)`, `Store::open_existing_seeded(path, now, seed)`, `migrate(epoch)`)
+- Modify: `crates/tagteam-engine/src/engine.rs` (`store()` and `existing_store()` open through `open_seeded` / `open_existing_seeded` with `&|| self.now_ms()` and `seed_launches`, which lists the profiles under `data_dir/sessions/*`, or says it could not)
+- Modify: `crates/tagteam-engine/tests/store.rs` (version asserts 2→3, the newer-schema test 3→4, the v1 test's comment, ten new tests)
 - Modify: `crates/tagteam-engine/tests/purge.rs` (line 245: `schema_version()` 2→3)
 - Test: `crates/tagteam-engine/tests/store.rs`
 
@@ -6773,13 +6778,14 @@ No test in `crates/tagteam/tests` pins the version (`doctor`'s text uses `SCHEMA
   pub struct SeedLaunch { pub provider: ProviderId, pub account_id: String, pub started_at_ms: i64, pub in_use: bool }
   impl Store {
       pub fn open(path: &Path) -> Result<Self, StoreError>;  // a migration to 3: epoch = system clock, token_epoch.seeded = 0
-      /// A migration to 3 records the epoch at `now_ms` (the engine passes `self.now_ms()`), with the seeded
-      /// active_history rows at that same instant; `seed` runs only then. `None` from it records seeded = 0.
-      pub fn open_seeded(path: &Path, now_ms: i64, seed: &dyn Fn() -> Option<Vec<SeedLaunch>>) -> Result<Self, StoreError>;
-      pub fn open_existing_seeded(path: &Path, now_ms: i64, seed: &dyn Fn() -> Option<Vec<SeedLaunch>>) -> Result<Option<Self>, StoreError>;
+      /// A migration to 3 reads `now` once, after its IMMEDIATE transaction holds the write lock, and records the
+      /// epoch at that value, with the seeded active_history rows at that same instant (the engine passes
+      /// `&|| self.now_ms()`). `now` and `seed` run only then. `None` from `seed` records seeded = 0.
+      pub fn open_seeded(path: &Path, now: &dyn Fn() -> i64, seed: &dyn Fn() -> Option<Vec<SeedLaunch>>) -> Result<Self, StoreError>;
+      pub fn open_existing_seeded(path: &Path, now: &dyn Fn() -> i64, seed: &dyn Fn() -> Option<Vec<SeedLaunch>>) -> Result<Option<Self>, StoreError>;
   }
   ```
-  With a `FakeClock` engine, the epoch is the fixture's now (`Fx`: 1_790_000_000_000): a test places a response before or after the epoch by its time alone. The triggers keep stamping `active_history` rows with SQLite's wall clock (spec §4's `<now ms>`).
+  With a `FakeClock` engine, the epoch is the fixture's now (`Fx`: 1_790_000_000_000): a test places a response before or after the epoch by its time alone. Reading the clock under the lock means a switch another process commits while this open waits for the lock is never dated after the epoch whose history records it. The triggers keep stamping `active_history` rows with SQLite's wall clock (spec §4's `<now ms>`).
   and the tables Task 12 reads and writes: `token_files`, `token_sessions`, `token_models`, `token_usage` (`id` rowid, `key` UNIQUE, `model` → `token_models.id`), `session_sightings`, `run_launches`, `active_history` (filled by the two triggers on `active_accounts`), `token_state`, `token_epoch(at, seeded)`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -6809,6 +6815,7 @@ use common::{Fx, add, cc, identity};
 use serde_json::json;
 use std::cell::Cell;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
@@ -7015,7 +7022,7 @@ fn a_version_2_store_migrates_to_3_with_epoch_and_active_history() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("t.db");
     version_2_store(&path);
-    let s = Store::open_seeded(&path, NOW, &no_profiles).unwrap();
+    let s = Store::open_seeded(&path, &|| NOW, &no_profiles).unwrap();
     assert_eq!(s.schema_version().unwrap(), 3);
     assert_eq!(
         s.activation(&cc()).unwrap(),
@@ -7052,7 +7059,7 @@ fn a_version_2_store_migrates_to_3_with_epoch_and_active_history() {
         assert!(has_table(&path, table), "{table}");
     }
     // Reopening runs nothing more, and never asks for profiles.
-    let s = Store::open_seeded(&path, NOW + 1, &|| panic!("step 3 ran twice")).unwrap();
+    let s = Store::open_seeded(&path, &|| NOW + 1, &|| panic!("step 3 ran twice")).unwrap();
     assert_eq!(s.schema_version().unwrap(), 3);
     drop(s);
     assert_eq!(epoch_rows(&path), [(NOW, 1)]);
@@ -7085,7 +7092,7 @@ fn seeding_records_profiles_idle_closed_in_use_open() {
         if older {
             version_2_store(&path);
         }
-        Store::open_seeded(&path, NOW, &seed).unwrap();
+        Store::open_seeded(&path, &|| NOW, &seed).unwrap();
         assert_eq!(epoch_rows(&path), [(NOW, 1)], "{name}");
         assert_eq!(
             launch_rows(&path),
@@ -7125,7 +7132,7 @@ fn a_seed_that_cannot_list_every_profile_records_unseeded() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("t.db");
     version_2_store(&path);
-    Store::open_seeded(&path, NOW, &|| None).unwrap();
+    Store::open_seeded(&path, &|| NOW, &|| None).unwrap();
     assert_eq!(epoch_rows(&path), [(NOW, 0)]);
     assert!(launch_rows(&path).is_empty());
     assert_eq!(
@@ -7137,37 +7144,101 @@ fn a_seed_that_cannot_list_every_profile_records_unseeded() {
 
 #[test]
 fn the_seed_closure_runs_only_when_step_3_applies() {
+    // The clock too: it dates the epoch, and step 3 alone records one.
     let calls = Cell::new(0);
     let seed = || {
         calls.set(calls.get() + 1);
         Some(Vec::new())
     };
+    let reads = Cell::new(0);
+    let clock = || {
+        reads.set(reads.get() + 1);
+        NOW
+    };
     let d = tempfile::tempdir().unwrap();
     let missing = d.path().join("missing.db");
     assert!(
-        Store::open_existing_seeded(&missing, NOW, &seed)
+        Store::open_existing_seeded(&missing, &clock, &seed)
             .unwrap()
             .is_none()
     );
-    assert_eq!(calls.get(), 0, "no store, no migration");
+    assert_eq!((calls.get(), reads.get()), (0, 0), "no store, no migration");
 
     let fresh = d.path().join("fresh.db");
-    Store::open_seeded(&fresh, NOW, &seed).unwrap();
-    assert_eq!(calls.get(), 1, "a fresh store runs every step");
-    Store::open_seeded(&fresh, NOW, &seed).unwrap();
-    Store::open_existing_seeded(&fresh, NOW, &seed)
+    Store::open_seeded(&fresh, &clock, &seed).unwrap();
+    assert_eq!(
+        (calls.get(), reads.get()),
+        (1, 1),
+        "a fresh store runs every step"
+    );
+    Store::open_seeded(&fresh, &clock, &seed).unwrap();
+    Store::open_existing_seeded(&fresh, &clock, &seed)
         .unwrap()
         .unwrap();
-    assert_eq!(calls.get(), 1, "a version-3 store runs none");
+    assert_eq!(
+        (calls.get(), reads.get()),
+        (1, 1),
+        "a version-3 store runs none"
+    );
 
     let older = d.path().join("v2.db");
     version_2_store(&older);
-    Store::open_existing_seeded(&older, NOW, &seed)
+    Store::open_existing_seeded(&older, &clock, &seed)
         .unwrap()
         .unwrap();
-    assert_eq!(calls.get(), 2, "a version-2 store runs step 3");
-    Store::open_seeded(&older, NOW, &seed).unwrap();
-    assert_eq!(calls.get(), 2);
+    assert_eq!(
+        (calls.get(), reads.get()),
+        (2, 2),
+        "a version-2 store runs step 3"
+    );
+    Store::open_seeded(&older, &clock, &seed).unwrap();
+    assert_eq!((calls.get(), reads.get()), (2, 2));
+}
+
+#[test]
+fn the_epoch_is_read_once_the_migration_holds_the_write_lock() {
+    // An older process may switch accounts while this one waits for the write lock: the epoch,
+    // and the active account the seed records as of it, are read only once the lock is held.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    version_2_store(&path);
+    let released = AtomicBool::new(false);
+    let read_after_release = Cell::new(None);
+    let (locked, is_locked) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let (path, released) = (&path, &released);
+        scope.spawn(move || {
+            let mut holder = rusqlite::Connection::open(path).unwrap();
+            let tx = holder
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "UPDATE active_accounts SET account_id = 'b' WHERE provider = 'claude-code'",
+                [],
+            )
+            .unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            released.store(true, Ordering::SeqCst);
+            tx.commit().unwrap();
+        });
+        is_locked.recv().unwrap();
+        Store::open_seeded(
+            path,
+            &|| {
+                read_after_release.set(Some(released.load(Ordering::SeqCst)));
+                NOW
+            },
+            &no_profiles,
+        )
+        .unwrap();
+    });
+    assert_eq!(read_after_release.get(), Some(true));
+    assert_eq!(
+        history_rows(&path)[0],
+        ("claude-code".to_owned(), NOW, Some("b".to_owned()), NOW),
+        "the switch committed while the migration waited is the epoch's active account"
+    );
 }
 
 #[test]
@@ -7219,7 +7290,7 @@ fn a_failed_seed_rolls_back_the_whole_migration() {
     let path = d.path().join("t.db");
     version_2_store(&path);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        Store::open_seeded(&path, NOW, &|| panic!("the seed failed"))
+        Store::open_seeded(&path, &|| NOW, &|| panic!("the seed failed"))
     }));
     assert!(failed.is_err());
     assert_eq!(raw_version(&path), 2);
@@ -7234,7 +7305,7 @@ fn a_failed_seed_rolls_back_the_whole_migration() {
         .execute_batch("CREATE TABLE token_files (x);")
         .unwrap();
     let calls = Cell::new(0);
-    let err = Store::open_seeded(&blocked, NOW, &|| {
+    let err = Store::open_seeded(&blocked, &|| NOW, &|| {
         calls.set(calls.get() + 1);
         Some(Vec::new())
     })
@@ -7246,7 +7317,7 @@ fn a_failed_seed_rolls_back_the_whole_migration() {
     assert!(!has_table(&blocked, "token_epoch"));
 
     // The first store migrates once its seed succeeds.
-    let s = Store::open_seeded(&path, NOW, &no_profiles).unwrap();
+    let s = Store::open_seeded(&path, &|| NOW, &no_profiles).unwrap();
     assert_eq!(s.schema_version().unwrap(), 3);
 }
 
@@ -7522,19 +7593,22 @@ pub struct SeedLaunch {
 /// The session profiles to seed: `None` when they cannot all be listed.
 type Seed<'a> = &'a dyn Fn() -> Option<Vec<SeedLaunch>>;
 
-/// What a migration to version 3 records (token report spec §4): the epoch, and the profiles
-/// to seed, asked only when step 3 runs. A raw `Store::open` has no seed.
+/// What a migration to version 3 records (token report spec §4): the clock that dates the
+/// epoch, and the profiles to seed, both asked only when step 3 runs. A raw `Store::open` has
+/// no seed.
 struct Epoch<'a> {
-    now_ms: i64,
+    now: &'a dyn Fn() -> i64,
     seed: Option<Seed<'a>>,
 }
 
 /// The rows step 3 adds beside its SQL, in the ladder's transaction (token report spec §4):
-/// the epoch at `epoch.now_ms`, the active account of each provider as of that same instant,
-/// and one launch per listed profile, closed at the epoch unless it is in use. Unless every
-/// profile was listed, the epoch records `seeded = 0` (ruling R1).
+/// the epoch, the active account of each provider as of that same instant, and one launch per
+/// listed profile, closed at the epoch unless it is in use. The clock is read once, here,
+/// under the transaction's write lock, so no switch another process commits while this one
+/// waits for the lock falls after the epoch the seeded history dates. Unless every profile
+/// was listed, the epoch records `seeded = 0` (ruling R1).
 fn seed_tokens_step(c: &Connection, epoch: &Epoch<'_>) -> Result<(), StoreError> {
-    let now = epoch.now_ms;
+    let now = (epoch.now)();
     let launches = epoch.seed.and_then(|seed| seed());
     c.execute(
         "INSERT INTO token_epoch (at, seeded) VALUES (?1, ?2)",
@@ -7593,24 +7667,25 @@ impl Store {
         Self::create_and_open(
             path,
             &Epoch {
-                now_ms: SystemClock.now_ms(),
+                now: &|| SystemClock.now_ms(),
                 seed: None,
             },
         )
     }
 
     /// Opens the store, creating it (and its directory, 0700) when needed. When this open
-    /// applies migration step 3, `now_ms` is the epoch, and `seed` lists the session profiles
-    /// inside its transaction (token report spec §4 Seeding); it is not called otherwise.
+    /// applies migration step 3, `now` dates the epoch, read once under the migration's write
+    /// lock, and `seed` lists the session profiles inside its transaction (token report spec
+    /// §4 Seeding); neither is called otherwise.
     pub fn open_seeded(
         path: &Path,
-        now_ms: i64,
+        now: &dyn Fn() -> i64,
         seed: &dyn Fn() -> Option<Vec<SeedLaunch>>,
     ) -> Result<Self, StoreError> {
         Self::create_and_open(
             path,
             &Epoch {
-                now_ms,
+                now,
                 seed: Some(seed),
             },
         )
@@ -7644,23 +7719,23 @@ with:
         Self::open_existing_with(
             path,
             &Epoch {
-                now_ms: SystemClock.now_ms(),
+                now: &|| SystemClock.now_ms(),
                 seed: None,
             },
         )
     }
 
-    /// `open_existing`, recording the epoch and seeding as `open_seeded` does when the open
+    /// `open_existing`, dating the epoch and seeding as `open_seeded` does when the open
     /// applies step 3.
     pub fn open_existing_seeded(
         path: &Path,
-        now_ms: i64,
+        now: &dyn Fn() -> i64,
         seed: &dyn Fn() -> Option<Vec<SeedLaunch>>,
     ) -> Result<Option<Self>, StoreError> {
         Self::open_existing_with(
             path,
             &Epoch {
-                now_ms,
+                now,
                 seed: Some(seed),
             },
         )
@@ -7688,7 +7763,8 @@ become:
 
 ```rust
     /// this build ends up refusing must never have been touched at all. Step 3's rows
-    /// (`seed_tokens_step`, which calls the seed) land in that same transaction.
+    /// (`seed_tokens_step`, which reads the clock and calls the seed) land in that same
+    /// transaction.
     fn migrate(&self, epoch: &Epoch<'_>) -> Result<(), StoreError> {
 ```
 
@@ -7754,7 +7830,7 @@ In `store()`, replace `let s = Arc::new(Store::open(&self.store_path())?);` with
 ```rust
         let s = Arc::new(Store::open_seeded(
             &self.store_path(),
-            self.now_ms(),
+            &|| self.now_ms(),
             &|| self.seed_launches(),
         )?);
 ```
@@ -7762,7 +7838,7 @@ In `store()`, replace `let s = Arc::new(Store::open(&self.store_path())?);` with
 In `existing_store()`, replace `match Store::open_existing(&self.store_path())? {` with:
 
 ```rust
-        match Store::open_existing_seeded(&self.store_path(), self.now_ms(), &|| {
+        match Store::open_existing_seeded(&self.store_path(), &|| self.now_ms(), &|| {
             self.seed_launches()
         })? {
 ```
@@ -7830,7 +7906,7 @@ and insert, between `existing_store` and `pub fn provider`:
 cargo test -p tagteam-engine --locked --test store --test purge
 ```
 
-Expected: `test result: ok. 57 passed; 0 failed` for `store.rs` (48 existing, 9 new) and `test result: ok. 56 passed; 0 failed` for `purge.rs`. `a_failed_seed_rolls_back_the_whole_migration` prints the caught panic's message (`the seed failed`) only when the test fails.
+Expected: `test result: ok. 58 passed; 0 failed` for `store.rs` (48 existing, 10 new) and `test result: ok. 56 passed; 0 failed` for `purge.rs`. `a_failed_seed_rolls_back_the_whole_migration` prints the caught panic's message (`the seed failed`) only when the test fails.
 
 Every engine-made store now runs the seed, so also run the engine crate once:
 
@@ -7838,7 +7914,7 @@ Every engine-made store now runs the seed, so also run the engine crate once:
 cargo test -p tagteam-engine --locked
 ```
 
-Expected: every test passes (1,199 with this task alone at the time of planning, all suites `ok`).
+Expected: every test passes (1,200 with this task alone at the time of planning, all suites `ok`).
 
 - [ ] **Step 5: Lint**
 
@@ -7868,7 +7944,7 @@ git commit -m "Add migration step 3 for the token index and session evidence"
 
    The upsert, the merge rule and `UsageRow.key` are unchanged.
 2. **Ruling R8 (adopted; inside spec §4 "the plan may normalize `model`").** `token_usage.model` references `token_models(id, provider, name)`. A model's name stays after retention prunes its last response. Spec §4's "eight tables" becomes nine, and §13's "six provider-keyed tables" becomes seven. Task 24 should say so in the core spec amendment.
-3. **Clocks.** The epoch and the seeded `active_history` rows share one value, the caller's `now_ms`: the engine's clock through `open_seeded` and `open_existing_seeded`, and the system clock for a raw `Store::open`. With `Fx`, the epoch is 1_790_000_000_000. The triggers keep SQLite's `julianday('now')` (spec §4), so an `active_history` row a test's switch or `set_active` adds is stamped with the wall clock, which is after any `FakeClock` epoch. A test of Task 16 or 18 that needs a history change at a chosen fixture time still has to write it itself.
+3. **Clocks.** The epoch and the seeded `active_history` rows share one value, read once from the caller's clock after the migration's `IMMEDIATE` transaction holds the write lock: the engine's clock through `open_seeded` and `open_existing_seeded` (`&|| self.now_ms()`), and the system clock for a raw `Store::open`. Read before the lock, it would backdate the epoch: a switch an older process committed while this one waited would be recorded as active at an instant before it happened (`the_epoch_is_read_once_the_migration_holds_the_write_lock` fails on that, verified by moving the read before the lock). With `Fx`, the epoch is 1_790_000_000_000. The triggers keep SQLite's `julianday('now')` (spec §4), so an `active_history` row a test's switch or `set_active` adds is stamped with the wall clock, which is after any `FakeClock` epoch. A test of Task 16 or 18 that needs a history change at a chosen fixture time still has to write it itself.
 4. **Seeding (adopted: the seed can say "unknown").** `seed_launches` returns `None` when `sessions/` exists but cannot be listed, or when an entry or its metadata cannot be read (other than a racing removal); the epoch then records `seeded = 0`. A missing `sessions/` is `Some(vec![])`: no profile, so coverage is complete. A profile directory with no readable marker is seeded for every provider with `sessions`. This only adds coverage, so it can only leave a response unattributed. `an_engine_that_cannot_list_the_profiles_records_unseeded` returns early when run as root, since root reads a 0000 directory.
 5. The seed closure runs inside the migration's `IMMEDIATE` transaction: one `read_dir`, a marker read and a session-state judgement per profile, once per store's life. A statusline that happens to be the first command after an upgrade pays it once.
 
@@ -7898,6 +7974,8 @@ git commit -m "Add migration step 3 for the token index and session evidence"
   #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
   pub struct BatchOutcome { pub added: u64, pub updated: u64 }
   #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+  pub struct PruneOutcome { pub deleted: u64, pub complete: bool }
+  #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
   pub struct RefreshStats { pub files: u64, pub responses: u64, pub skipped_lines: u64, pub unreadable_files: u64 }
   #[derive(Debug, Clone, PartialEq, Eq)]
   pub struct TokenStateRow { pub refreshed_at: Option<i64>, pub changed_at: Option<i64>, pub stats: RefreshStats, pub pruned_at: Option<i64> }
@@ -7915,7 +7993,9 @@ git commit -m "Add migration step 3 for the token index and session evidence"
       pub fn token_files(&self, provider: &ProviderId) -> Result<Vec<TokenFileRow>, StoreError>;
       pub fn commit_token_batch(&self, provider: &ProviderId, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
       pub fn finish_token_refresh(&self, provider: &ProviderId, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
-      pub fn prune_tokens(&self, provider: &ProviderId, cutoff_ms: i64, holder: &str, now_ms: i64) -> Result<u64, StoreError>;
+      pub fn prune_tokens(&self, provider: &ProviderId, cutoff_ms: i64, holder: &str, now_ms: i64, stop: &dyn Fn() -> bool) -> Result<PruneOutcome, StoreError>;
+      #[cfg(feature = "test-hooks")]
+      pub fn busy_timeout(&self) -> Result<Duration, StoreError>; // the connection's, for the restoration test
       pub fn token_state(&self, provider: &ProviderId) -> Result<Option<TokenStateRow>, StoreError>;
       pub fn token_epoch(&self) -> Result<Option<EpochRow>, StoreError>;
       pub fn evidence_changed_at(&self, provider: &ProviderId) -> Result<Option<i64>, StoreError>;
@@ -7941,7 +8021,7 @@ git commit -m "Add migration step 3 for the token index and session evidence"
   - `commit_token_batch` merges rows of one key within the batch first, writes a response only when the merge changes it, and counts `added` (a key the store did not hold) and `updated` (a stored key whose merged row differs) per distinct key. It also adds `added` to `token_state.responses`.
   - `token_state.responses` is the index's live count, which each batch adds to and each prune subtracts from. `finish_token_refresh` does not write `stats.responses`, so Task 15 may pass any value there (0 is fine).
   - `token_usage` orders by `at`, then by first-indexed order (`id`). `token_models` lists every model the provider's index has held since its last purge, pruned ones included (ruling R8).
-  - `prune_tokens` also deletes sightings whose `last_at` is before the cutoff (see Notes).
+  - `prune_tokens` also deletes sightings whose `last_at` is before the cutoff (see Notes). Each deletion chunk (5,000 responses at most) is its own transaction and, when it deletes any, sets `changed_at` and subtracts from `responses` in that same transaction. `stop` is asked before each chunk; a stopped prune releases its lease (`expires_at` set to `now_ms`) and returns `complete: false`, so Task 15 calls it with a closure over the refresh's deadline and cancel and simply calls again on the next refresh. `pruned_at` is set only when a prune completes. A lease another holder took today is `PruneOutcome { deleted: 0, complete: true }`: nothing is due.
   - `record_sighting` with `min_gap_ms = 0` writes whenever `last_at` does not move back. `set_sighting_last_at` only ever moves `last_at` up, and writes nothing otherwise.
 
 - [ ] **Step 1: Write the failing tests**
@@ -7953,15 +8033,16 @@ Create `crates/tagteam-engine/tests/store_tokens.rs`:
 
 mod common;
 
+use std::cell::Cell;
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{add, cc};
 use tagteam_core::ProviderId;
 use tagteam_core::tokens::TokenCounts;
 use tagteam_engine::store::{
-    BatchOutcome, EpochRow, LaunchRow, RefreshStats, SightingRow, SightingSource, Store,
-    TokenFileRow, TokenStateRow, UsageRow, usage_key,
+    BatchOutcome, EpochRow, LaunchRow, PruneOutcome, RefreshStats, SightingRow, SightingSource,
+    Store, TokenFileRow, TokenStateRow, UsageRow, usage_key,
 };
 
 /// The fixtures' clock (`Fx`'s `FakeClock`).
@@ -8043,6 +8124,19 @@ fn wall_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+/// A prune nothing stops.
+fn prune(s: &Store, cutoff: i64, holder: &str, now: i64) -> PruneOutcome {
+    s.prune_tokens(&cc(), cutoff, holder, now, &|| false)
+        .unwrap()
+}
+
+fn done(deleted: u64) -> PruneOutcome {
+    PruneOutcome {
+        deleted,
+        complete: true,
+    }
 }
 
 fn raw_count(path: &std::path::Path, sql: &str) -> i64 {
@@ -8292,7 +8386,7 @@ fn prune_runs_once_a_day_and_moves_changed_at_when_it_deletes() {
         }
     }
 
-    assert_eq!(s.prune_tokens(&cc(), cutoff, "h1", T).unwrap(), 5_003);
+    assert_eq!(prune(&s, cutoff, "h1", T), done(5_003));
     assert_eq!(keys(&all(&s)), [3], "only the response inside the window");
     assert_eq!(
         s.sightings(&cc()).unwrap(),
@@ -8324,23 +8418,137 @@ fn prune_runs_once_a_day_and_moves_changed_at_when_it_deletes() {
 
     commit(&s, &[row(4, "live", cutoff - 3, 1)], T);
     assert_eq!(
-        s.prune_tokens(&cc(), cutoff, "h2", T + DAY - 1).unwrap(),
-        0,
-        "within the day, the lease holds"
+        prune(&s, cutoff, "h2", T + DAY - 1),
+        done(0),
+        "within the day, the lease holds: nothing is due"
     );
     assert_eq!(keys(&all(&s)), [4, 3]);
-    assert_eq!(s.prune_tokens(&cc(), cutoff, "h2", T + DAY).unwrap(), 1);
+    assert_eq!(prune(&s, cutoff, "h2", T + DAY), done(1));
     let state = s.token_state(&cc()).unwrap().unwrap();
     assert_eq!(
         (state.pruned_at, state.changed_at, state.stats.responses),
         (Some(T + DAY), Some(T + DAY), 1)
     );
-    assert_eq!(s.prune_tokens(&cc(), cutoff, "h3", T + 2 * DAY).unwrap(), 0);
+    assert_eq!(prune(&s, cutoff, "h3", T + 2 * DAY), done(0));
     let state = s.token_state(&cc()).unwrap().unwrap();
     assert_eq!(
         (state.pruned_at, state.changed_at),
         (Some(T + 2 * DAY), Some(T + DAY)),
         "a prune that deletes nothing changes no report"
+    );
+}
+
+#[test]
+fn a_prune_that_fails_part_way_still_moves_changed_at() {
+    // Each chunk that deletes a response moves `changed_at` with it: a prune that stops after
+    // its chunks, under a lease that keeps a retry away for a day, leaves no change unseen.
+    let (_d, s, path) = store();
+    let cutoff = T - 365 * DAY;
+    commit(&s, &[row(1, "old", cutoff - 1, 1), row(2, "live", T, 1)], T);
+    s.open_launch(&cc(), "a", cutoff - 10, T).unwrap();
+    s.close_launch(&cc(), "a", cutoff - 10, cutoff - 1, T)
+        .unwrap();
+    // The last transaction deletes that launch; a trigger makes it fail.
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER fail_the_last_step BEFORE DELETE ON run_launches \
+         BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    )
+    .unwrap();
+
+    assert!(
+        s.prune_tokens(&cc(), cutoff, "h1", T + 5, &|| false)
+            .is_err()
+    );
+    assert_eq!(keys(&all(&s)), [2], "the chunk committed");
+    let state = s.token_state(&cc()).unwrap().unwrap();
+    assert_eq!(
+        (state.changed_at, state.stats.responses, state.pruned_at),
+        (Some(T + 5), 1, None)
+    );
+    assert_eq!(
+        prune(&s, cutoff, "h2", T + 6),
+        done(0),
+        "the lease holds the retry off"
+    );
+
+    raw.execute_batch("DROP TRIGGER fail_the_last_step;")
+        .unwrap();
+    assert_eq!(prune(&s, cutoff, "h2", T + DAY + 5), done(0));
+    assert!(
+        s.launches(&cc()).unwrap().is_empty(),
+        "the next day's prune finishes it"
+    );
+    assert_eq!(
+        s.token_state(&cc()).unwrap().unwrap().changed_at,
+        Some(T + 5),
+        "deleting nothing changes no report"
+    );
+}
+
+#[test]
+fn a_stopped_prune_resumes_on_the_next_call_and_completes() {
+    // A retention cut can make a prune large: `stop` (the refresh's budget and cancel) is asked
+    // before each chunk, and a stopped prune hands its lease back so the next call goes on.
+    let (_d, s, _) = store();
+    let cutoff = T - 30 * DAY;
+    let mut rows: Vec<UsageRow> = (1000..1000 + 5_001)
+        .map(|k| row(k, "old", cutoff - 1, 1))
+        .collect();
+    rows.push(row(1, "live", T, 1));
+    commit(&s, &rows, T);
+
+    let asked = Cell::new(0);
+    let after_one_chunk = || {
+        asked.set(asked.get() + 1);
+        asked.get() > 1
+    };
+    assert_eq!(
+        s.prune_tokens(&cc(), cutoff, "h1", T + 1, &after_one_chunk)
+            .unwrap(),
+        PruneOutcome {
+            deleted: 5_000,
+            complete: false
+        }
+    );
+    let state = s.token_state(&cc()).unwrap().unwrap();
+    assert_eq!(
+        (state.changed_at, state.stats.responses, state.pruned_at),
+        (Some(T + 1), 2, None),
+        "the chunk that ran is seen; the prune is not done"
+    );
+
+    assert_eq!(
+        prune(&s, cutoff, "h2", T + 2),
+        done(1),
+        "the next call, the same day, goes on"
+    );
+    assert_eq!(keys(&all(&s)), [1]);
+    let state = s.token_state(&cc()).unwrap().unwrap();
+    assert_eq!(
+        (state.changed_at, state.stats.responses, state.pruned_at),
+        (Some(T + 2), 1, Some(T + 2))
+    );
+    assert_eq!(
+        prune(&s, cutoff, "h3", T + 3),
+        done(0),
+        "complete, it holds the day's lease"
+    );
+
+    let stopped = s
+        .prune_tokens(&cc(), cutoff, "h4", T + DAY + 2, &|| true)
+        .unwrap();
+    assert_eq!(
+        stopped,
+        PruneOutcome {
+            deleted: 0,
+            complete: false
+        },
+        "stopped before its first chunk"
+    );
+    assert_eq!(
+        s.token_state(&cc()).unwrap().unwrap().pruned_at,
+        Some(T + 2)
     );
 }
 
@@ -8421,25 +8629,22 @@ fn sightings_insert_then_extend_only_after_the_gap() {
 
 #[test]
 fn record_sighting_within_gives_up_on_a_busy_store() {
-    // Spec §6.3: the statusline's write waits at most its own short wait, writes nothing when
-    // it gives up, and leaves the connection's own wait as it was.
+    // Spec §6.3: while another connection holds the write lock, the statusline's write gives up
+    // after its own short wait and writes nothing. Free, it writes as `record_sighting` does.
     let (_d, s, path) = store();
     let mut other = rusqlite::Connection::open(&path).unwrap();
     let held = other
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
     let seen = sighting("s1", "", T, T);
-    let started = Instant::now();
     let err = s
-        .record_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(20))
+        .record_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
         .unwrap_err();
-    let waited = started.elapsed();
     assert_eq!(
         err.sqlite_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy),
         "{err:?}"
     );
-    assert!(waited < Duration::from_secs(1), "{waited:?}");
     drop(held);
     assert_eq!(
         s.latest_sighting(&cc(), "s1", "").unwrap(),
@@ -8447,39 +8652,38 @@ fn record_sighting_within_gives_up_on_a_busy_store() {
         "nothing written"
     );
 
-    // The next plain write waits out a lock held for longer than the short wait.
-    drop(other);
-    let (locked, is_locked) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        let path = &path;
-        scope.spawn(move || {
-            let mut other = rusqlite::Connection::open(path).unwrap();
-            let held = other
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-            locked.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(200));
-            held.commit().unwrap();
-        });
-        is_locked.recv().unwrap();
-        assert!(s.record_sighting(&cc(), &seen, 60_000).unwrap());
-    });
-    assert_eq!(
-        s.latest_sighting(&cc(), "s1", "").unwrap(),
-        Some(seen.clone())
+    assert!(
+        s.record_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
+            .unwrap()
     );
+    assert!(
+        !s.record_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
+            .unwrap(),
+        "within the gap"
+    );
+    assert_eq!(s.latest_sighting(&cc(), "s1", "").unwrap(), Some(seen));
+}
 
-    // Free, it writes as `record_sighting` does, the gap included.
-    let later = sighting("s1", "", T, T + 60_000);
-    assert!(
-        s.record_sighting_within(&cc(), &later, 60_000, Duration::from_millis(5))
-            .unwrap()
-    );
-    assert!(
-        !s.record_sighting_within(&cc(), &later, 60_000, Duration::from_millis(5))
-            .unwrap()
-    );
-    assert_eq!(s.latest_sighting(&cc(), "s1", "").unwrap(), Some(later));
+#[cfg(feature = "test-hooks")]
+#[test]
+fn record_sighting_within_restores_the_connection_s_wait() {
+    // Every other write of the process waits its full `busy_timeout` again, whether the short
+    // write succeeded or gave up.
+    let (_d, s, path) = store();
+    let normal = s.busy_timeout().unwrap();
+    assert_eq!(normal, Duration::from_millis(5000));
+    let seen = sighting("s1", "", T, T);
+    s.record_sighting_within(&cc(), &seen, 60_000, Duration::from_millis(1))
+        .unwrap();
+    assert_eq!(s.busy_timeout().unwrap(), normal, "after a write");
+    let mut other = rusqlite::Connection::open(&path).unwrap();
+    let held = other
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    s.record_sighting_within(&cc(), &seen, 0, Duration::from_millis(1))
+        .unwrap_err();
+    drop(held);
+    assert_eq!(s.busy_timeout().unwrap(), normal, "after giving up");
 }
 
 #[test]
@@ -8584,7 +8788,7 @@ fn purge_provider_deletes_token_rows_and_keeps_the_epoch() {
         .unwrap();
         s.finish_token_refresh(&p, &RefreshStats::default(), T)
             .unwrap();
-        s.prune_tokens(&p, 0, "h", T).unwrap();
+        s.prune_tokens(&p, 0, "h", T, &|| false).unwrap();
         s.record_sighting(&p, &sighting("s1", "", T, T), 0).unwrap();
         s.open_launch(&p, "acct", T, T).unwrap();
     }
@@ -8701,7 +8905,7 @@ cargo test -p tagteam-engine --locked --test store_tokens
 Expected: the file does not compile:
 
 ```
-error[E0432]: unresolved imports `tagteam_engine::store::BatchOutcome`, `tagteam_engine::store::EpochRow`, `tagteam_engine::store::LaunchRow`, `tagteam_engine::store::RefreshStats`, `tagteam_engine::store::SightingRow`, `tagteam_engine::store::SightingSource`, `tagteam_engine::store::TokenFileRow`, `tagteam_engine::store::TokenStateRow`, `tagteam_engine::store::UsageRow`, `tagteam_engine::store::usage_key`
+error[E0432]: unresolved imports `tagteam_engine::store::BatchOutcome`, `tagteam_engine::store::EpochRow`, `tagteam_engine::store::LaunchRow`, `tagteam_engine::store::PruneOutcome`, `tagteam_engine::store::RefreshStats`, `tagteam_engine::store::SightingRow`, `tagteam_engine::store::SightingSource`, `tagteam_engine::store::TokenFileRow`, `tagteam_engine::store::TokenStateRow`, `tagteam_engine::store::UsageRow`, `tagteam_engine::store::usage_key`
 ```
 
 - [ ] **Step 3: Implement**
@@ -8746,8 +8950,8 @@ mod tokens;
 mod usage;
 
 pub use tokens::{
-    BatchOutcome, EpochRow, LaunchRow, RefreshStats, SightingRow, SightingSource, TokenFileRow,
-    TokenStateRow, UsageRow, usage_key,
+    BatchOutcome, EpochRow, LaunchRow, PruneOutcome, RefreshStats, SightingRow, SightingSource,
+    TokenFileRow, TokenStateRow, UsageRow, usage_key,
 };
 pub use usage::{
 ```
@@ -8896,6 +9100,14 @@ pub struct UsageRow {
 pub struct BatchOutcome {
     pub added: u64,
     pub updated: u64,
+}
+
+/// What one `prune_tokens` call did: the responses it deleted, and whether it finished. A
+/// prune that stopped part-way released its lease, so the next call goes on with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneOutcome {
+    pub deleted: u64,
+    pub complete: bool,
 }
 
 /// A completed refresh's statistics (spec §4 `token_state`).
@@ -9181,9 +9393,16 @@ fn prune_lease(provider: &ProviderId) -> String {
     format!("prune:tokens:{provider}")
 }
 
-/// The provider's responses older than `cutoff_ms`, at most `PRUNE_CHUNK` of them, and their
-/// count off `token_state.responses`. Returns how many went.
-fn prune_chunk(c: &Connection, provider: &ProviderId, cutoff_ms: i64) -> rusqlite::Result<usize> {
+/// The provider's responses older than `cutoff_ms`, at most `PRUNE_CHUNK` of them. A chunk
+/// that deletes any takes their count off `token_state.responses` and sets `changed_at` to
+/// `now_ms` in the same transaction, so a prune that stops part-way leaves no change unseen.
+/// Returns how many went.
+fn prune_chunk(
+    c: &Connection,
+    provider: &ProviderId,
+    cutoff_ms: i64,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
     let n = c.execute(
         &format!(
             "DELETE FROM token_usage WHERE id IN (SELECT id FROM token_usage \
@@ -9191,10 +9410,13 @@ fn prune_chunk(c: &Connection, provider: &ProviderId, cutoff_ms: i64) -> rusqlit
         ),
         params![provider.as_str(), cutoff_ms, PRUNE_CHUNK as i64],
     )?;
-    c.execute(
-        "UPDATE token_state SET responses = max(responses - ?2, 0) WHERE provider = ?1",
-        params![provider.as_str(), n as i64],
-    )?;
+    if n > 0 {
+        c.execute(
+            "UPDATE token_state SET responses = max(responses - ?2, 0), changed_at = ?3 \
+             WHERE provider = ?1",
+            params![provider.as_str(), n as i64, now_ms],
+        )?;
+    }
     Ok(n)
 }
 
@@ -9372,40 +9594,49 @@ impl Store {
 
     /// Retention (spec §4), at most once a day per provider: the lease
     /// `prune:tokens:<provider>` spaces prunes, as `prune_samples` does (core §6.1). Deletes
-    /// the provider's responses older than `cutoff_ms`, in chunks of their own transactions;
-    /// then its sessions left without one, the sightings that ended before the cutoff (those
-    /// of every pruned session, but one still alive), and the launches that did. Model names
-    /// stay. Sets `pruned_at`, and `changed_at` when a response went. Returns how many
-    /// responses went; 0 when another prune holds the lease.
+    /// the provider's responses older than `cutoff_ms`, in chunks of their own transactions,
+    /// each of which that deletes any also sets `changed_at`; then its sessions left without
+    /// one, the sightings that ended before the cutoff (those of every pruned session, but one
+    /// still alive), and the launches that did, and sets `pruned_at`. Model names stay.
+    ///
+    /// `stop` is asked before each chunk, so a refresh's budget and cancel reach a prune that a
+    /// retention cut made large. Stopped, the prune releases its lease and returns
+    /// `complete: false`: the next call goes on where it stopped. Another prune's lease, held
+    /// or spent today, is nothing to do: `complete: true` with nothing deleted.
     pub fn prune_tokens(
         &self,
         provider: &ProviderId,
         cutoff_ms: i64,
         holder: &str,
         now_ms: i64,
-    ) -> Result<u64, StoreError> {
-        {
-            let mut c = self.lock();
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let taken = tx.execute(
-                TAKE_LEASE_SQL,
-                params![prune_lease(provider), holder, now_ms + DAY_MS, now_ms],
-            )?;
-            if taken != 1 {
-                return Ok(0);
-            }
-            tx.execute(ENSURE_STATE, [provider.as_str()])?;
-            tx.execute(
-                "UPDATE token_state SET pruned_at = ?2 WHERE provider = ?1",
-                params![provider.as_str(), now_ms],
-            )?;
-            tx.commit()?;
+        stop: &dyn Fn() -> bool,
+    ) -> Result<PruneOutcome, StoreError> {
+        let lease = prune_lease(provider);
+        let taken = self.lock().execute(
+            TAKE_LEASE_SQL,
+            params![lease, holder, now_ms + DAY_MS, now_ms],
+        )?;
+        if taken != 1 {
+            return Ok(PruneOutcome {
+                deleted: 0,
+                complete: true,
+            });
         }
         let mut deleted = 0u64;
         loop {
+            if stop() {
+                self.exec(
+                    "UPDATE leases SET expires_at = ?3 WHERE name = ?1 AND holder = ?2",
+                    &[&lease, &holder, &now_ms],
+                )?;
+                return Ok(PruneOutcome {
+                    deleted,
+                    complete: false,
+                });
+            }
             let mut c = self.lock();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let n = prune_chunk(&tx, provider, cutoff_ms)?;
+            let n = prune_chunk(&tx, provider, cutoff_ms, now_ms)?;
             tx.commit()?;
             deleted += n as u64;
             if n < PRUNE_CHUNK {
@@ -9427,14 +9658,26 @@ impl Store {
             "DELETE FROM run_launches WHERE provider = ?1 AND ended_at < ?2",
             params![provider.as_str(), cutoff_ms],
         )?;
-        if deleted > 0 {
-            tx.execute(
-                "UPDATE token_state SET changed_at = ?2 WHERE provider = ?1",
-                params![provider.as_str(), now_ms],
-            )?;
-        }
+        tx.execute(ENSURE_STATE, [provider.as_str()])?;
+        tx.execute(
+            "UPDATE token_state SET pruned_at = ?2 WHERE provider = ?1",
+            params![provider.as_str(), now_ms],
+        )?;
         tx.commit()?;
-        Ok(deleted)
+        Ok(PruneOutcome {
+            deleted,
+            complete: true,
+        })
+    }
+
+    /// The connection's busy timeout: for the tests that pin `record_sighting_within`
+    /// restoring it.
+    #[cfg(feature = "test-hooks")]
+    pub fn busy_timeout(&self) -> Result<Duration, StoreError> {
+        let ms: i64 = self
+            .lock()
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+        Ok(Duration::from_millis(from_sql(ms)))
     }
 
     /// The provider's `token_state` row; `None` before its first refresh wrote one.
@@ -9756,15 +9999,17 @@ The SQL relies on facts the tests pin against the bundled SQLite: two-argument `
 
 ```
 cargo test -p tagteam-engine --locked --test store_tokens --test store --test purge
+cargo test -p tagteam-engine --locked --features test-hooks --test store_tokens
 ```
 
-Expected: `store_tokens.rs` `test result: ok. 12 passed; 0 failed`, `store.rs` `ok. 57 passed`, `purge.rs` `ok. 56 passed`.
+Expected: `store_tokens.rs` `test result: ok. 14 passed; 0 failed`, `store.rs` `ok. 58 passed`, `purge.rs` `ok. 56 passed`. With `test-hooks`, `store_tokens.rs` runs `record_sighting_within_restores_the_connection_s_wait` too: `ok. 15 passed`.
 
 - [ ] **Step 5: Lint**
 
 ```
 cargo fmt --all --check
 cargo clippy -p tagteam-engine --all-targets --locked -- -D warnings
+cargo clippy -p tagteam-engine --all-targets --locked --features test-hooks -- -D warnings
 ```
 
 Expected: no output from `fmt`; clippy finishes with no warning.
@@ -9781,7 +10026,7 @@ git commit -m "Add the store API for the token index and evidence"
 1. **Dependency (adopted).** `tagteam-engine` gains `sha2.workspace = true` for `usage_key` (Task 14's head and tail hashes need it too). It is no new crate: the workspace already locks sha2 0.10.9 for `tagteam-core`, `tagteam-cc` and `xtask`, so `Cargo.lock` gains one line. The Global Constraints' "New dependencies: `jiff` only" holds in the sense of no new crate, but the constraint's wording does not mention this; record it if you want it explicit.
 2. **`RefreshStats.responses` is not an input (adopted).** Task 15 has no way to count the index's responses, so `token_state.responses` is kept by the store: each batch adds its `added`, each prune chunk subtracts what it deleted, and a purge deletes the row. `finish_token_refresh` ignores `stats.responses`. Spec §4 says "as of the last completed refresh" for `files`; the live count differs only mid-refresh. Recounting at completion instead cost 44–116 ms at a year's volume (1.55M responses) inside the write transaction, which would break the 100 ms "refresh with nothing new" budget (spec §1.1).
 3. **Prune deletes sightings by time (adopted).** Spec §4 says "then sessions with no rows and their sightings". This task deletes the sightings whose `last_at` is before the cutoff: those are every sighting of a pruned session, except one whose execution is still alive. That one still places the session's new responses. It also bounds sightings of sessions that never produced a response, which the spec's wording would keep forever. A sighting that ends before the cutoff covers only times before it, so no kept response loses evidence.
-4. **Prune runs in chunks.** It runs as three or more transactions: the lease and `pruned_at`, chunks of 5,000 deleted responses (each subtracting its count), then sessions, sightings, launches and `changed_at`. A prune that a retention change makes large (365 → 30 days at a year's volume: about 1.4M rows) never holds the write lock for long. If it fails part-way, the next day's prune finishes it.
+4. **Prune runs in chunks, and stops when asked.** It runs as several transactions: the lease, chunks of 5,000 deleted responses (each moving `changed_at` and subtracting its count when it deletes any), then sessions, sightings, launches and `pruned_at`. A prune that a retention change makes large (365 → 30 days at a year's volume: about 1.4M rows) never holds the write lock for long, and `stop` lets a refresh's budget and cancel end it between chunks: it releases its lease and the next refresh goes on (`a_stopped_prune_resumes_on_the_next_call_and_completes`). If it fails part-way, every committed chunk is already visible through `changed_at` (`a_prune_that_fails_part_way_still_moves_changed_at`, which makes the last transaction fail with a trigger), and the next day's prune finishes it.
 5. **Performance at a year's volume** (release, 1.55M responses; this task's API):
    - 30-day `token_usage`: 110 ms for 127k rows. The SQL is about 18 ms; the rest is `String` allocation per row (session id, project, model).
    - `token_models`: 45 µs. `token_span`: 6 ms. `token_state` and `evidence_changed_at`: under 0.5 ms.
@@ -9796,8 +10041,8 @@ git commit -m "Add the store API for the token index and evidence"
 
 **Depends on:** 3
 **Files:**
-- Modify: `crates/tagteam-engine/src/settings.rs` (the `tokens.retention_days` key through all five registry edits: `KEYS`, the `Settings` field, `Default`, `value`, `apply`, plus `DEFAULT_TOKENS_RETENTION_DAYS`; `Settings.prices` read from `[provider.<id>.prices."<model>"]` by `Reader::read_prices`; `place` knows the price tables)
-- Modify: `crates/tagteam-engine/tests/settings.rs` (the key lists: defaults, full file, registry order, defaults per key, `expect` phrases, the numeric-key count 6→7, `SAMPLES` 13→14; four new tests)
+- Modify: `crates/tagteam-engine/src/settings.rs` (the `tokens.retention_days` key through all five registry edits: `KEYS`, the `Settings` field, `Default`, `value`, `apply`, plus `DEFAULT_TOKENS_RETENTION_DAYS`; `Settings.prices` read from every `[provider.<id>.prices."<model>"]` table by `Reader::read_prices`; `place` knows the price tables)
+- Modify: `crates/tagteam-engine/tests/settings.rs` (the key lists: defaults, full file, registry order, defaults per key, `expect` phrases, the numeric-key count 6→7, `SAMPLES` 13→14; five new tests)
 - Modify: `crates/tagteam-engine/tests/config.rs` (the ranges table, the no-provider-table list, one new test)
 - Modify: `crates/tagteam/tests/config_cli.rs` (`config list` human and `--json` key lists)
 - Test: `crates/tagteam-engine/tests/settings.rs`, `crates/tagteam-engine/tests/config.rs`, `crates/tagteam/tests/config_cli.rs`
@@ -9815,9 +10060,9 @@ Other key lists, checked and needing no edit: `crates/tagteam/src/cli.rs` and `c
 - Produces (contract, "Settings (Task 13)"):
   ```rust
   pub const DEFAULT_TOKENS_RETENTION_DAYS: u32 = 365;
-  pub struct Settings { /* existing */ pub tokens_retention_days: u32, pub prices: BTreeMap<String, PriceOverride> }
+  pub struct Settings { /* existing */ pub tokens_retention_days: u32, pub prices: BTreeMap<ProviderId, BTreeMap<String, PriceOverride>> }
   ```
-  `prices` holds the overrides of the provider `Settings::load` was given, by model name exactly as written in the file, each field valid as read (a float ≥ 0 and finite; `long_prompt_above` an integer ≥ 1). A model whose table holds no valid field is absent. Task 18 passes it to `Prices::new`.
+  `prices` holds every provider's overrides, whichever provider `Settings::load` was given, by provider id then model name exactly as written in the file, each field valid as read (a float ≥ 0 and finite; `long_prompt_above` an integer ≥ 1). A model whose table holds no valid field is absent, and so is a provider with no model left. Task 18 passes `settings().prices.get(&q.provider)` (or an empty map) to `Prices::new`, so a report for any provider through any engine gets that provider's own overrides.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -9867,14 +10112,17 @@ and the expected `Settings` gains `tokens_retention_days: 90,` after `history_re
 
 ```rust
             prices: BTreeMap::from([(
-                "claude-opus-5-5".to_owned(),
-                PriceOverride {
-                    base: CardOverride {
-                        input: Some(4.0),
-                        ..CardOverride::default()
-                    },
-                    ..PriceOverride::default()
-                }
+                ProviderId::new("claude-code"),
+                BTreeMap::from([(
+                    "claude-opus-5-5".to_owned(),
+                    PriceOverride {
+                        base: CardOverride {
+                            input: Some(4.0),
+                            ..CardOverride::default()
+                        },
+                        ..PriceOverride::default()
+                    }
+                )])
             )]),
 ```
 
@@ -10025,6 +10273,7 @@ fn price_overrides_read_every_field() {
     // the `long_prompt` and `fast` cards; a whole number reads as a price.
     let (s, warnings) = load(PRICES);
     assert!(warnings.is_empty(), "{warnings:?}");
+    let s = &s.prices[&ProviderId::new(PROVIDER)];
     let opus = PriceOverride {
         base: card(Some(4.0), Some(20.0), Some(5.0), Some(8.0), Some(0.2)),
         long_prompt_above: Some(200_000),
@@ -10033,7 +10282,7 @@ fn price_overrides_read_every_field() {
         web_search_per_1k: Some(10.0),
     };
     assert_eq!(
-        s.prices,
+        *s,
         BTreeMap::from([
             (
                 "claude-new-1".to_owned(),
@@ -10046,16 +10295,31 @@ fn price_overrides_read_every_field() {
             ),
         ])
     );
-    let (s, warnings) = load_as(PRICES, "fake-agent");
-    assert!(warnings.is_empty(), "{warnings:?}");
-    assert_eq!(
-        s.prices,
-        BTreeMap::from([(
-            "fake-1".to_owned(),
-            base(card(Some(9.0), None, None, None, None))
-        )]),
-        "each provider reads its own tables"
-    );
+}
+
+#[test]
+fn every_provider_s_price_tables_load_whoever_reads_them() {
+    // A report for one provider through an engine loaded for another prices it by its own
+    // tables: every provider's are read, whichever provider the file is loaded for.
+    let fake_1 = BTreeMap::from([(
+        "fake-1".to_owned(),
+        base(card(Some(9.0), None, None, None, None)),
+    )]);
+    for reader in [PROVIDER, "fake-agent", "another"] {
+        let (s, warnings) = load_as(PRICES, reader);
+        assert!(warnings.is_empty(), "{reader}: {warnings:?}");
+        assert_eq!(
+            s.prices.keys().map(ProviderId::as_str).collect::<Vec<_>>(),
+            ["claude-code", "fake-agent"],
+            "{reader}"
+        );
+        assert_eq!(
+            s.prices[&ProviderId::new("claude-code")].len(),
+            3,
+            "{reader}"
+        );
+        assert_eq!(s.prices[&ProviderId::new("fake-agent")], fake_1, "{reader}");
+    }
 }
 
 #[test]
@@ -10086,12 +10350,15 @@ input = 8
     assert_eq!(
         s.prices,
         BTreeMap::from([(
-            "claude-opus-5-5".to_owned(),
-            PriceOverride {
-                base: card(None, None, None, None, Some(0.25)),
-                fast: card(Some(8.0), None, None, None, None),
-                ..PriceOverride::default()
-            }
+            ProviderId::new(PROVIDER),
+            BTreeMap::from([(
+                "claude-opus-5-5".to_owned(),
+                PriceOverride {
+                    base: card(None, None, None, None, Some(0.25)),
+                    fast: card(Some(8.0), None, None, None, None),
+                    ..PriceOverride::default()
+                }
+            )])
         )]),
         "valid fields stand; a model with none is left out"
     );
@@ -10215,7 +10482,10 @@ fn config_set_refuses_a_price_key() {
     assert_eq!(config_text(&fx), text, "the file is left as it was");
     let (settings, warnings) = Settings::load(&fx.env, &cc());
     assert!(warnings.is_empty(), "{warnings:?}");
-    assert_eq!(settings.prices["claude-opus-5-5"].base.input, Some(4.0));
+    assert_eq!(
+        settings.prices[&cc()]["claude-opus-5-5"].base.input,
+        Some(4.0)
+    );
 }
 ```
 
@@ -10327,10 +10597,11 @@ In `pub struct Settings`, after `pub history_retention_days: u32,`:
 and after `pub share_extra: Vec<String>,`:
 
 ```rust
-    /// `[provider.<id>.prices."<model>"]` (token report spec §8.2): the provider's price
-    /// overrides by model, each field as read; one that is not valid is dropped with a
-    /// warning. Not a registry key: `config` neither lists nor writes it.
-    pub prices: BTreeMap<String, PriceOverride>,
+    /// `[provider.<id>.prices."<model>"]` (token report spec §8.2): every provider's price
+    /// overrides, by provider then model, whichever provider the file was loaded for; each
+    /// field as read, one that is not valid dropped with a warning. Not a registry key:
+    /// `config` neither lists nor writes it.
+    pub prices: BTreeMap<ProviderId, BTreeMap<String, PriceOverride>>,
 ```
 
 In `impl Default for Settings`, after `history_retention_days: DEFAULT_HISTORY_RETENTION_DAYS,`:
@@ -10368,22 +10639,50 @@ In `Settings::apply`, after the `("usage.history_retention_days", Value::Int(n))
 In `read_file`, the line before `read.warnings = reader.warnings;` is new:
 
 ```rust
-    read.settings.prices = reader.read_prices(provider);
+    read.settings.prices = reader.read_prices();
     read.warnings = reader.warnings;
 ```
 
-Replace the closing `}` of `impl<'a> Reader<'a>` (the line right after `read_key`'s body) with the three new methods, that closing brace, and two parsers after it:
+Replace the closing `}` of `impl<'a> Reader<'a>` (the line right after `read_key`'s body) with the four new methods, that closing brace, and two parsers after it:
 
 ```rust
 
-    /// `[provider.<id>.prices]` (token report spec §8.2): one table per model. A field that is
-    /// not valid, or a table that is not one, warns and is dropped; the rest stand. A model
-    /// whose table holds no valid field is left out.
-    fn read_prices(&mut self, provider: &ProviderId) -> BTreeMap<String, PriceOverride> {
-        let mut prices = BTreeMap::new();
-        let Some(models) = self.table(&["provider", provider.as_str(), "prices"]) else {
-            return prices;
+    /// Every `[provider.<id>.prices]` table (token report spec §8.2), by provider: one table
+    /// per model. A field that is not valid, or a table that is not one, warns and is dropped;
+    /// the rest stand. A model whose table holds no valid field is left out, and so is a
+    /// provider with no model left.
+    fn read_prices(&mut self) -> BTreeMap<ProviderId, BTreeMap<String, PriceOverride>> {
+        let doc: &'a DocumentMut = self.doc;
+        let mut all = BTreeMap::new();
+        let Some(providers) = doc.get("provider").and_then(Item::as_table_like) else {
+            return all;
         };
+        for (id, item) in providers.iter() {
+            let Some(item) = item.as_table_like().and_then(|t| t.get("prices")) else {
+                continue;
+            };
+            let Some(models) = item.as_table_like() else {
+                self.warn(format!(
+                    "{}: `provider.{id}.prices` must be a table (ignored)",
+                    self.path
+                ));
+                continue;
+            };
+            let prices = self.read_provider_prices(id, models);
+            if !prices.is_empty() {
+                all.insert(ProviderId::new(id), prices);
+            }
+        }
+        all
+    }
+
+    /// One provider's price tables, `models`, which sits at `provider.<id>.prices`.
+    fn read_provider_prices(
+        &mut self,
+        provider: &str,
+        models: &dyn TableLike,
+    ) -> BTreeMap<String, PriceOverride> {
+        let mut prices = BTreeMap::new();
         for (model, item) in models.iter() {
             let dotted = format!("provider.{provider}.prices.{model}");
             let Some(table) = item.as_table_like() else {
@@ -10518,7 +10817,7 @@ cargo test -p tagteam-engine --locked --test settings --test config
 cargo test -p tagteam --locked --features test-support --test config_cli
 ```
 
-Expected: `settings.rs` `test result: ok. 86 passed; 0 failed`, `config.rs` `ok. 35 passed`, `config_cli.rs` `ok. 15 passed`.
+Expected: `settings.rs` `test result: ok. 87 passed; 0 failed`, `config.rs` `ok. 34 passed` (35 with `--features test-hooks`, which adds an existing hooks test), `config_cli.rs` `ok. 15 passed`.
 
 - [ ] **Step 5: Lint**
 
@@ -10547,7 +10846,7 @@ git commit -m "Add the token retention setting and price overrides"
    The dotted name joins the model name unquoted (`provider.claude-code.prices.claude-opus-5-5.input`), as `unknown_keys` names keys.
 2. **What a bad table does.** An override whose `base` is incomplete for a model the shipped table lacks is not dropped here: `Settings` cannot know the shipped table. Task 3's `Prices::new` ignores it, as the outline says. No warning reports it, which spec §8.2 does not require.
 3. A model whose table yields no valid field is left out of `prices` entirely, so `Prices::new` never lists it in `price_overrides`.
-4. Task 18 reads `self.settings.prices` from the engine's `Settings`. That is the provider the CLI loaded settings for (`Settings::load(env, provider)`), so a report for another provider than the one loaded would see the wrong table. Task 18/19 should load per report provider if that can differ.
+4. **Every provider's prices load (fix after review).** `Settings.prices` is keyed by provider and holds every `[provider.<id>.prices]` table, whichever provider `Settings::load` was given, so `token_report` for any provider through any engine reads `settings().prices.get(&q.provider)` (`every_provider_s_price_tables_load_whoever_reads_them`). A `provider.<id>` entry that is not a table is skipped silently, as the existing reader does for another provider's tables; one whose `prices` is not a table warns.
 
 ---
 
@@ -10833,6 +11132,30 @@ mod tests {
             .open(&path)
             .unwrap()
             .write_all_at(b"TWO", 4)
+            .unwrap();
+        assert!(matches!(
+            reader.checkpoint(true).unwrap(),
+            Checkpoint::Rewritten(_)
+        ));
+    }
+
+    #[test]
+    fn a_head_rewrite_during_a_first_read_is_caught() {
+        // A read from 0: the file's first bytes change after they were parsed, and its last ones
+        // stay. The head the checkpoint stores is the bytes parsed, so the change is caught; were
+        // it hashed from the file, the next refresh would resume past the rewritten response.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("s.jsonl");
+        let line = format!("{}\n", "x".repeat(99));
+        fs::write(&path, line.repeat(100)).unwrap();
+        let open = open_at(&path, None).unwrap();
+        let (lines, stop, reader) = read_lines(&open, Limits::SPEC, None, &Cancel::new());
+        assert_eq!((lines.len(), stop), (100, Stop::Eof));
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(b"y", 0)
             .unwrap();
         assert!(matches!(
             reader.checkpoint(true).unwrap(),
@@ -11188,8 +11511,9 @@ pub(crate) struct OpenFile {
     mtime_ns: i64,
     /// Where reading starts: the stored offset when it still holds, else 0.
     start: u64,
-    /// The hashes `start` was trusted on, and the bytes under the tail one.
-    start_head: [u8; 8],
+    /// The bytes `start` was trusted on: the first `min(4096, start)`, and the up to 4096 ending
+    /// at `start`, with their hash.
+    start_head_bytes: Vec<u8>,
     start_tail: [u8; 8],
     start_tail_bytes: Vec<u8>,
 }
@@ -11233,7 +11557,7 @@ pub(crate) fn open_at(path: &Path, stored: Option<&TokenFileRow>) -> io::Result<
         size,
         mtime_ns,
         start: 0,
-        start_head: empty,
+        start_head_bytes: Vec::new(),
         start_tail: empty,
         start_tail_bytes: Vec::new(),
     };
@@ -11251,7 +11575,7 @@ pub(crate) fn open_at(path: &Path, stored: Option<&TokenFileRow>) -> io::Result<
     };
     if hash8(&head) == s.head_hash && hash8(&tail) == s.tail_hash {
         open.start = s.offset;
-        open.start_head = s.head_hash;
+        open.start_head_bytes = head;
         open.start_tail = s.tail_hash;
         open.start_tail_bytes = tail;
     }
@@ -11291,6 +11615,12 @@ fn push_tail(tail: &mut Vec<u8>, bytes: &[u8]) {
     }
 }
 
+/// Appends to `head` the first of `bytes` that keep `before` plus its length within `HASH_SPAN`.
+fn fill_head(head: &mut Vec<u8>, before: usize, bytes: &[u8]) {
+    let room = (HASH_SPAN as usize).saturating_sub(before + head.len());
+    head.extend_from_slice(&bytes[..bytes.len().min(room)]);
+}
+
 /// Spec §5.2 step 3: an open file's whole lines, from its start, one chunk at a time. It holds
 /// at most one chunk and one line being assembled, and never a line over the cap: such a line is
 /// scanned to its newline, counted, and dropped.
@@ -11301,11 +11631,16 @@ pub(crate) struct LineReader<'f> {
     buf: Vec<u8>,
     /// The file offset of `buf[0]`.
     buf_at: u64,
-    /// Inside a line over the cap: its bytes so far are dropped, their last ones in `skip_tail`.
+    /// Inside a line over the cap: its bytes so far are dropped, the first ones `head` still
+    /// lacks kept in `skip_head`, and the last ones in `skip_tail`.
     skipping: bool,
+    skip_head: Vec<u8>,
     skip_tail: Vec<u8>,
     /// Just past the last whole line consumed.
     consumed: u64,
+    /// The file's first `min(HASH_SPAN, consumed)` bytes, as read: what the new `head_hash`
+    /// covers.
+    head: Vec<u8>,
     /// Up to `HASH_SPAN` bytes ending at `consumed`, as read: what the new `tail_hash` covers.
     tail: Vec<u8>,
     long_lines: u64,
@@ -11321,8 +11656,10 @@ impl<'f> LineReader<'f> {
             buf: Vec::new(),
             buf_at: open.start,
             skipping: false,
+            skip_head: Vec::new(),
             skip_tail: Vec::new(),
             consumed: open.start,
+            head: open.start_head_bytes.clone(),
             tail: open.start_tail_bytes.clone(),
             long_lines: 0,
             chunks: 0,
@@ -11377,6 +11714,7 @@ impl<'f> LineReader<'f> {
                 // The end of a line over the cap, whose earlier bytes were dropped.
                 self.skipping = false;
                 self.long_lines += 1;
+                self.head.append(&mut self.skip_head);
                 push_tail(&mut self.tail, &self.skip_tail);
                 self.skip_tail.clear();
             } else if nl - from > self.limits.max_line {
@@ -11396,6 +11734,7 @@ impl<'f> LineReader<'f> {
                 break;
             }
         }
+        fill_head(&mut self.head, 0, &self.buf[..from]);
         push_tail(&mut self.tail, &self.buf[..from]);
         self.buf.drain(..from);
         self.buf_at += from as u64;
@@ -11405,6 +11744,7 @@ impl<'f> LineReader<'f> {
         // What is left is one unfinished line. Past the cap it is dropped as it is read.
         if self.skipping || self.buf.len() > self.limits.max_line {
             self.skipping = true;
+            fill_head(&mut self.skip_head, self.head.len(), &self.buf);
             push_tail(&mut self.skip_tail, &self.buf);
             self.buf_at += self.buf.len() as u64;
             self.buf.clear();
@@ -11439,23 +11779,15 @@ impl<'f> LineReader<'f> {
 
     /// The row a batch commits for this file, just past the last whole line consumed (spec §5.2
     /// step 4). `Valid` while the path still names the open file, the file is at least that
-    /// long, and both the bytes its start was trusted on and the last bytes read are unchanged.
-    /// Its size and mtime are the ones it was opened with when `at_eof`; otherwise its size is
-    /// −1, so a file left part-way is never skipped. If a check fails the file was rewritten
-    /// during the read: `Rewritten` restarts it from 0.
+    /// long, and the bytes its start was trusted on and the first and last bytes read are all
+    /// unchanged; its hashes are of the bytes read. Its size and mtime are the ones it was opened
+    /// with when `at_eof`; otherwise its size is −1, so a file left part-way is never skipped. If
+    /// a check fails the file was rewritten during the read: `Rewritten` restarts it from 0.
     pub(crate) fn checkpoint(&self, at_eof: bool) -> io::Result<Checkpoint> {
         let open = self.open;
         if !self.still_holds()? {
             return Ok(Checkpoint::Rewritten(open.restart_row()));
         }
-        let head_hash = if open.start >= HASH_SPAN {
-            open.start_head
-        } else {
-            match bytes_at(&open.file, 0, self.consumed.min(HASH_SPAN))? {
-                Some(head) => hash8(&head),
-                None => return Ok(Checkpoint::Rewritten(open.restart_row())),
-            }
-        };
         let size = if at_eof {
             i64::try_from(open.size).unwrap_or(i64::MAX)
         } else {
@@ -11468,12 +11800,13 @@ impl<'f> LineReader<'f> {
             size,
             mtime_ns: open.mtime_ns,
             offset: self.consumed,
-            head_hash,
+            head_hash: hash8(&self.head),
             tail_hash: hash8(&self.tail),
         }))
     }
 
-    /// Spec §5.2 step 4's checks, and that the bytes just read are still there.
+    /// Spec §5.2 step 4's checks, and that the first and last bytes read are still there. The
+    /// first ones begin with the bytes under the stored `head_hash`.
     fn still_holds(&self) -> io::Result<bool> {
         let open = self.open;
         let same =
@@ -11483,17 +11816,15 @@ impl<'f> LineReader<'f> {
         }
         if open.start > 0 {
             let span = open.start.min(HASH_SPAN);
-            let head = bytes_at(&open.file, 0, span)?.map(|b| hash8(&b));
             let tail = bytes_at(&open.file, open.start - span, span)?.map(|b| hash8(&b));
-            if head != Some(open.start_head) || tail != Some(open.start_tail) {
+            if tail != Some(open.start_tail) {
                 return Ok(false);
             }
         }
-        let len = self.tail.len() as u64;
-        Ok(
-            bytes_at(&open.file, self.consumed - len, len)?.as_deref()
-                == Some(self.tail.as_slice()),
-        )
+        let still = |at: u64, bytes: &[u8]| -> io::Result<bool> {
+            Ok(bytes_at(&open.file, at, bytes.len() as u64)?.as_deref() == Some(bytes))
+        };
+        Ok(still(0, &self.head)? && still(self.consumed - self.tail.len() as u64, &self.tail)?)
     }
 }
 
@@ -11514,7 +11845,7 @@ pub(crate) enum Checkpoint {
 cargo test -p tagteam-engine --locked --lib tokens::
 ```
 
-Expected: `test result: ok. 12 passed; 0 failed` (11 in `tokens::reader::tests`, 1 in `tokens::tests`).
+Expected: `test result: ok. 13 passed; 0 failed` (12 in `tokens::reader::tests`, 1 in `tokens::tests`).
 
 - [ ] **Step 5: Lint**
 
@@ -11537,13 +11868,18 @@ git commit -m "Add the incremental transcript file reader"
 
 1. **Verified in a scratch crate.** It held this task's `tokens/` files over the real `tagteam-core` and `tagteam-provider`, with a stand-in `TokenFileRow` of the contract's shape, at `rust-version = 1.85`. Results:
    - `cargo clippy --all-targets -- -D warnings` was clean;
-   - all 12 tests passed;
+   - all 13 tests passed, `a_head_rewrite_during_a_first_read_is_caught` included (re-verified after the plan review's head fix);
    - `rustfmt --edition 2024 --check` was clean.
 
    The code above is the formatted text from that run. The same run confirmed that each placeholder's one public item satisfies `pub use x::*;` under `-D warnings`.
 2. `reader.rs` starts with `#![allow(dead_code)]`, because its `pub(crate)` items have no caller until Task 15. Task 15 removes it, and nothing else touches `reader.rs` in between.
 3. I replaced the outline's `plan_read(..) -> (Start, OpenFile)` with `unchanged(meta, stored)` and `open_at(path, stored)`. This lets the refresh decide on a skip from the discovery `stat` on its own thread, without opening the file, so "nothing new costs one stat per file" (spec §5.2) holds and `files_total` counts only files to read. It also means opening a file and checking its hashes happen on a worker.
-4. **Checkpoint hashes.** `tail_hash` is hashed over the bytes actually read, a rolling 4 KiB kept per chunk (skipped over-long lines included), not re-read from the file. The checkpoint also confirms the file still holds those bytes. That catches a rewrite during a read that started at 0, which the spec's stored-window checks alone cannot see. `head_hash` comes from the file, or is the stored one when the read started at or past 4 KiB.
+4. **Checkpoint hashes cover the bytes actually read, not the file as it is at checkpoint time.**
+   - `head_hash` covers the file's first `min(4096, consumed)` bytes. They are seeded with the bytes `open_at` verified under the stored `head_hash`, then appended as lines are consumed; a skipped over-long line's bytes are held in `skip_head` until its newline.
+   - `tail_hash` covers a rolling 4 KiB ending at the offset, kept per chunk; skipped lines are included.
+   - The checkpoint confirms the file still holds both, as well as the stored tail window its start was trusted on.
+
+   So a rewrite during a read from 0, of the head or of the tail, is caught (`a_head_rewrite_during_a_first_read_is_caught`, `a_rewrite_during_the_read_is_caught_by_the_checkpoint`). The spec's stored-window checks alone cannot see it. Had the head been hashed from the file at checkpoint time, a rewritten first 4 KiB would be stored as read, and the next refresh would resume past a response never parsed.
 5. The peak a reader holds is `have + chunk` at each read, and `have` never exceeds `max_line`, since a longer unfinished line is dropped as it is read. So the peak is at most `chunk + max_line`: 65 MiB at the spec's sizes, and pinned at 80 bytes by the huge-line test.
 
 ---
@@ -11562,6 +11898,7 @@ git commit -m "Add the incremental transcript file reader"
   - Task 7: `pub struct UsageLine { pub message_id: String, pub request_id: String, pub session_id: String, pub at_ms: i64, pub model: String, pub project: Option<String>, pub sidechain: bool, pub counts: TokenCounts, pub speed: Option<String>, pub final_line: bool }` (re-exported as `tagteam_provider::UsageLine`); `Capabilities.transcripts`; `Provider::transcript_files(&self, env: &Env) -> io::Result<Vec<PathBuf>>`; `Provider::parse_usage_line(&self, line: &[u8]) -> Result<Option<UsageLine>, LineError>`.
   - Task 2: `TokenCounts::merge_max(&mut self, other: &TokenCounts)`.
   - Task 12 (`crate::store`): `TokenFileRow`; `UsageRow { key, session_id, project, at_ms, model, sidechain, counts, speed, finalized }`; `BatchOutcome { added, updated }`; `RefreshStats { files, responses, skipped_lines, unreadable_files }`; `TokenStateRow`; `usage_key(provider, message_id, request_id) -> i64`; `Store::{token_files, commit_token_batch, finish_token_refresh, prune_tokens, token_state, token_usage}`.
+  - Task 12's `prune_tokens(&self, provider, cutoff_ms, holder, now_ms, stop: &dyn Fn() -> bool) -> Result<PruneOutcome { deleted: u64, complete: bool }, StoreError>`. It asks `stop` before each chunk, the first included, and an early stop releases the daily lease. This task's `stop` lets the first chunk of each call through, so every call makes progress (note 3).
   - Task 12's semantics this task relies on:
     - `token_state.responses` is the store's own live count, kept by each batch and prune;
     - `finish_token_refresh` writes `files`, `skipped_lines` and `unreadable_files`, and creates the provider's `token_state` row if absent;
@@ -11600,8 +11937,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::{FakeFx, Fx};
 use serde_json::json;
@@ -11886,31 +12222,64 @@ fn lines_outside_the_retention_window_are_not_inserted() {
 }
 
 #[test]
-fn a_waiting_refresh_runs_after_the_holder() {
-    // Spec §5.1: `Wait::Wait` waits for another refresh, then finds what is left to do.
+#[cfg(feature = "test-hooks")]
+fn a_waiting_refresh_never_passes_the_lock_while_another_holds_it() {
+    // Spec §5.1: `Wait::Wait` waits for another refresh. While the test holds the lock, the
+    // refresh reaches the point before its wait and never the one after it: only the cancel
+    // token ends that wait. Were the lock not taken, nothing between the two points could be
+    // interrupted. Once the lock is free, the next refresh passes that point holding it.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+
     let ffx = FakeFx::new();
     let p = ffx.fake_provider();
     append_transcript(&ffx.fx.env, "a.jsonl", &line(&response("m1", 2, true)));
-    let other = FlockGuard::try_lock(&tokens_lock_path(&ffx.fx.env, &p))
-        .unwrap()
-        .unwrap();
+    let path = tokens_lock_path(&ffx.fx.env, &p);
+    let other = FlockGuard::try_lock(&path).unwrap().unwrap();
+    let (at_lock, reached) = mpsc::channel();
+    ffx.engine.on_point(
+        "refresh-tokens-lock",
+        Box::new(move || at_lock.send(()).unwrap()),
+    );
+    let passed = Arc::new(AtomicBool::new(false));
+    let free_there = Arc::new(AtomicBool::new(true));
+    let (passed_cb, free_cb, path_cb) = (passed.clone(), free_there.clone(), path.clone());
+    ffx.engine.also_on_point(
+        "refresh-tokens-locked",
+        Box::new(move || {
+            passed_cb.store(true, Ordering::SeqCst);
+            let free = FlockGuard::try_lock(&path_cb).unwrap().is_some();
+            free_cb.store(free, Ordering::SeqCst);
+        }),
+    );
 
-    let report = thread::scope(|s| {
-        let waiting = s.spawn(|| refresh(&ffx.engine, &p));
-        thread::sleep(Duration::from_millis(300));
-        assert!(
-            !waiting.is_finished(),
-            "it waits while another refresh holds the lock"
-        );
-        assert!(
-            rows(&ffx.engine, &p).is_empty(),
-            "and reads nothing meanwhile"
-        );
-        drop(other);
+    let cancel = Cancel::new();
+    let first = thread::scope(|s| {
+        let waiting = s.spawn(|| {
+            ffx.engine
+                .refresh_tokens(&p, Wait::Wait, None, &cancel, &mut |_: &IndexProgress| {})
+        });
+        reached.recv().unwrap();
+        cancel.request(2);
         waiting.join().unwrap()
     });
+    assert_eq!(first.unwrap_err().signal(), Some(2));
+    assert!(
+        !passed.load(Ordering::SeqCst),
+        "it passed the lock while another refresh held it"
+    );
+    assert!(rows(&ffx.engine, &p).is_empty());
+
+    drop(other);
+    let report = refresh(&ffx.engine, &p);
     assert!(report.complete);
     assert_eq!(report.responses_added, 1);
+    assert!(passed.load(Ordering::SeqCst));
+    assert!(
+        !free_there.load(Ordering::SeqCst),
+        "past that point the refresh holds the lock"
+    );
 }
 
 #[test]
@@ -11922,7 +12291,6 @@ fn try_returns_busy_while_another_holds_the_lock() {
         .unwrap()
         .unwrap();
 
-    let started = Instant::now();
     let outcome = ffx
         .engine
         .refresh_tokens(
@@ -11934,11 +12302,6 @@ fn try_returns_busy_while_another_holds_the_lock() {
         )
         .unwrap();
     assert_eq!(outcome, RefreshOutcome::Busy);
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "at once: {:?}",
-        started.elapsed()
-    );
     assert!(rows(&ffx.engine, &p).is_empty());
 
     drop(other);
@@ -12128,8 +12491,7 @@ fn a_provider_without_transcripts_is_refused() {
 
 #[test]
 fn skipped_lines_are_counted_in_the_state() {
-    // Spec §5.4: a line that does not parse is skipped and counted, and a file that cannot be
-    // read is skipped and retried; neither fails the refresh.
+    // Spec §5.4: a line that does not parse is skipped and counted; it never fails the refresh.
     let ffx = FakeFx::new();
     let (env, p) = (&ffx.fx.env, ffx.fake_provider());
     append_transcript(
@@ -12143,8 +12505,6 @@ fn skipped_lines_are_counted_in_the_state() {
         ]
         .concat(),
     );
-    let locked = append_transcript(env, "b.jsonl", &line(&response("m4", 2, true)));
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
     let report = refresh(&ffx.engine, &p);
     assert!(report.complete);
@@ -12162,13 +12522,141 @@ fn skipped_lines_are_counted_in_the_state() {
             files: 1,
             responses: 2,
             skipped_lines: 2,
-            unreadable_files: 1
+            unreadable_files: 0
         }
     );
+}
+
+#[test]
+fn an_unreadable_file_is_counted_and_retried() {
+    // Spec §5.4: a file that cannot be read is skipped with a warning, counted, and read again on
+    // a later refresh; it never fails the refresh.
+    let ffx = FakeFx::new();
+    let (env, p) = (&ffx.fx.env, ffx.fake_provider());
+    append_transcript(env, "a.jsonl", &line(&response("m1", 2, true)));
+    let locked = append_transcript(env, "b.jsonl", &line(&response("m2", 2, true)));
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::File::open(&locked).is_ok() {
+        // A privileged run (root) reads a file of mode 000: no file can be made unreadable here,
+        // so there is nothing to test.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+        return;
+    }
+
+    let report = refresh(&ffx.engine, &p);
+    assert!(report.complete);
+    assert_eq!(report.responses_added, 1);
+    let stats = ffx
+        .engine
+        .store()
+        .unwrap()
+        .token_state(&p)
+        .unwrap()
+        .unwrap()
+        .stats;
+    assert_eq!((stats.files, stats.unreadable_files), (1, 1));
 
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
     let report = refresh(&ffx.engine, &p);
     assert_eq!(report.responses_added, 1, "the unreadable file is retried");
+}
+
+/// `n` responses older than any retention window, as an index a year old holds them.
+fn plant_expired(engine: &Engine, p: &ProviderId, n: usize) {
+    let rows: Vec<UsageRow> = (0..n)
+        .map(|i| UsageRow {
+            key: key(p, &format!("old{i}")),
+            session_id: "s-old".into(),
+            project: None,
+            at_ms: NOW - 400 * DAY,
+            model: "fake-1".into(),
+            sidechain: false,
+            counts: Default::default(),
+            speed: None,
+            finalized: true,
+        })
+        .collect();
+    engine
+        .store()
+        .unwrap()
+        .commit_token_batch(p, &rows, &[], &[], NOW - 400 * DAY)
+        .unwrap();
+}
+
+#[test]
+fn a_budgeted_prune_goes_on_over_several_calls() {
+    // Spec §4 Retention, §5.2 Budget: the prune that ends a refresh stops with the budget, as
+    // reading does. The refresh is then incomplete, and the next call goes on with the prune.
+    // 12,001 rows are more than one of the store's prune chunks.
+    let ffx = FakeFx::new();
+    let p = ffx.fake_provider();
+    plant_expired(&ffx.engine, &p, 12_001);
+    let mut left = rows(&ffx.engine, &p).len();
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        assert!(calls <= 10, "every call prunes some");
+        let RefreshOutcome::Done(report) = ffx
+            .engine
+            .refresh_tokens(
+                &p,
+                Wait::Wait,
+                Some(Duration::ZERO),
+                &Cancel::new(),
+                &mut |_: &IndexProgress| {},
+            )
+            .unwrap()
+        else {
+            panic!("nothing else refreshes");
+        };
+        let now = rows(&ffx.engine, &p).len();
+        if report.complete {
+            assert_eq!(now, 0);
+            break;
+        }
+        assert!(now > 0 && now < left, "{now} of {left} left");
+        let state = ffx
+            .engine
+            .store()
+            .unwrap()
+            .token_state(&p)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.refreshed_at, None);
+        left = now;
+    }
+    assert!(
+        calls >= 2,
+        "a prune of more than one chunk takes more than one budgeted call"
+    );
+}
+
+#[test]
+fn a_cancelled_prune_reports_interrupted() {
+    // A cancel that meets the prune follows the refresh's cancel path: the prune stops before
+    // its next chunk, what was pruned stays pruned, and the refresh is interrupted, not complete.
+    let ffx = FakeFx::new();
+    let p = ffx.fake_provider();
+    plant_expired(&ffx.engine, &p, 12_001);
+    let cancel = Cancel::new();
+    // Nothing to read: the token is set as the refresh starts, and the prune is what meets it.
+    let err = ffx
+        .engine
+        .refresh_tokens(&p, Wait::Wait, None, &cancel, &mut |_: &IndexProgress| {
+            cancel.request(2)
+        })
+        .unwrap_err();
+    assert_eq!(err.signal(), Some(2));
+    let left = rows(&ffx.engine, &p).len();
+    assert!(left > 0, "the prune stopped short of the end");
+    let state = ffx
+        .engine
+        .store()
+        .unwrap()
+        .token_state(&p)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.refreshed_at, None);
 }
 
 #[test]
@@ -12346,7 +12834,7 @@ mod tests {
 - [ ] **Step 2: Run them and see them fail**
 
 ```
-cargo test -p tagteam-engine --locked --test tokens_refresh
+cargo test -p tagteam-engine --locked --features test-hooks --test tokens_refresh
 cargo test -p tagteam-engine --locked --lib tokens::refresh
 ```
 
@@ -12365,6 +12853,7 @@ Replace `crates/tagteam-engine/src/tokens/refresh.rs` above its `#[cfg(test)] mo
 //! scoped workers read one file at a time, each holding one chunk; one writer, on the calling
 //! thread, commits their lines in batches, with the offsets just past them.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -12383,6 +12872,7 @@ use super::reader::{Checkpoint, Limits, LineReader, Step, Stop, open_at, past, u
 use super::{lock_until_free, tokens_lock_path};
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::hooks;
 use crate::store::{RefreshStats, Store, TokenFileRow, UsageRow, usage_key};
 
 /// At most this many files are read at once (spec §5.2 step 4).
@@ -12781,7 +13271,6 @@ impl Engine {
         limits: Limits,
     ) -> Result<(RefreshOutcome, usize), EngineError> {
         let started_ms = self.now_ms();
-        let deadline = budget.and_then(|b| Instant::now().checked_add(b));
         let p = self.provider(provider)?;
         if !p.capabilities().transcripts {
             return Err(EngineError::InvalidInput(format!(
@@ -12793,6 +13282,7 @@ impl Engine {
         // and so nothing is taken while it is held.
         let evidence_changed = self.scan_sessions(p.as_ref())?;
         let path = tokens_lock_path(&self.env, provider);
+        hooks::point(self, "refresh-tokens-lock")?;
         let _lock = match wait {
             Wait::Try => match FlockGuard::try_lock(&path)? {
                 Some(lock) => lock,
@@ -12803,11 +13293,15 @@ impl Engine {
                 e => EngineError::Lock(e),
             })?,
         };
+        hooks::point(self, "refresh-tokens-locked")?;
         let store = self.store()?;
         let retention = i64::from(self.settings.tokens_retention_days).saturating_mul(DAY_MS);
         let cutoff_ms = self.now_ms().saturating_sub(retention);
         let (jobs, removed, unreadable) =
             self.token_jobs(p.as_ref(), store.token_files(provider)?)?;
+        // The budget starts here: discovery and the wait for the lock are not budgeted (spec
+        // §5.2).
+        let deadline = budget.and_then(|b| Instant::now().checked_add(b));
         let total = IndexProgress {
             files_done: 0,
             files_total: jobs.len() as u64,
@@ -12860,15 +13354,26 @@ impl Engine {
             written
         })?;
         let tally = writer.tally;
-        let complete = tally.files_done == jobs.len() as u64;
+        let mut complete = tally.files_done == jobs.len() as u64;
+        if complete {
+            // Step 5. The prune stops with the budget or the cancel token, as reading does, and
+            // a prune left unfinished leaves the refresh incomplete, so the next call goes on.
+            // The store asks `stop` before each chunk; the first chunk of a call is let through
+            // whatever the budget, so every call makes progress (spec §5.2 Budget). The cancel
+            // token stops it at once.
+            let holder = uuid::Uuid::now_v7().to_string();
+            let first = Cell::new(true);
+            let stop = || cancel.requested().is_some() || (!first.replace(false) && past(deadline));
+            complete = store
+                .prune_tokens(provider, cutoff_ms, &holder, self.now_ms(), &stop)?
+                .complete;
+        }
         if let (false, Some(signal)) = (complete, cancel.requested()) {
             return Err(EngineError::Interrupted(signal));
         }
         if complete {
-            // Step 5, pruning first. The store keeps `responses` itself, each batch and prune
-            // counting it, so the count passed on is the stored one.
-            let holder = uuid::Uuid::now_v7().to_string();
-            store.prune_tokens(provider, cutoff_ms, &holder, self.now_ms())?;
+            // The store keeps `responses` itself, each batch and prune counting it, so the count
+            // passed on is the stored one.
             let stats = RefreshStats {
                 files: store.token_files(provider)?.len() as u64,
                 responses: store
@@ -12954,13 +13459,14 @@ impl Engine {
 - [ ] **Step 4: Run them and see them pass**
 
 ```
+cargo test -p tagteam-engine --locked --features test-hooks --test tokens_refresh
 cargo test -p tagteam-engine --locked --test tokens_refresh
 cargo test -p tagteam-engine --locked --lib tokens::
 ```
 
 Expected:
-- `tokens_refresh`: `test result: ok. 12 passed; 0 failed`.
-- the lib run: `test result: ok. 14 passed; 0 failed`: Task 14's 12, Task 17's lock-wait test, and `memory_and_budget_hold_on_a_file_of_many_chunks`.
+- `tokens_refresh` with `test-hooks`: `test result: ok. 15 passed; 0 failed`. Without the feature, 14 pass: the lock-wait test needs the engine's hook points.
+- the lib run: `test result: ok. 15 passed; 0 failed`: Task 14's 13, Task 17's lock-wait test, and `memory_and_budget_hold_on_a_file_of_many_chunks`.
 
 - [ ] **Step 5: Lint**
 
@@ -12989,6 +13495,11 @@ git commit -m "Add the incremental token index refresh"
    Task 12's `finish_token_refresh` also creates the state row, so a refresh that commits nothing needs no batch of its own.
 2. **Step 1 runs before the lock.** Spec §5.1 says sightings are written without the tokens lock, and running the scan first keeps that lock a strict leaf: nothing, not even a reservation probe, is taken while it is held. `Wait::Try` therefore scans, then returns `Busy`. The scan takes a few ms of small reads.
 3. **Step 5 prunes before it finishes**, so `files` and the stored `responses` describe what stays. The outline put finish first; the spec only says "Prune if due".
+   - **The prune is budgeted and cancellable (plan review).** It stops early when the deadline passes or the cancel token is set. If it stops early, the refresh returns `complete: false` without finishing, so the daemon runs it again at once; if the cancel token stopped it, the refresh returns the interruption.
+   - **Every call still makes progress.** Task 12's `prune_tokens` asks `stop` before each chunk, the first included. With a zero budget, or a slice whose reading used up its budget, a plain `past(deadline)` would delete nothing on every call, and no such refresh could ever complete. So the refresh's `stop` lets the first chunk of each call through whatever the budget (a `Cell` flag), and stops at once only for the cancel token. A slice therefore overruns its budget by at most one prune chunk, as it does by one line when reading.
+   - I verified this in the scratch crate with a stand-in store that asks `stop` exactly as Task 12 does. Without the flag, the budgeted-prune and zero-budget tests fail; with it, they pass, 28 of 28, 3 runs out of 3.
+   - Tests: `a_budgeted_prune_goes_on_over_several_calls` and `a_cancelled_prune_reports_interrupted`, each over 12,001 expired rows. That is more than one prune chunk at Task 12's `PRUNE_CHUNK` of 5,000; it has no test constructor, so the tests size the rows instead.
+   - **The budget starts after discovery and after the lock is held (plan review).** Spec §5.2 leaves discovery unbudgeted, and the wait for the lock is not reading.
 4. **In-batch merge.** The writer merges lines of one response within a batch by spec §2.2's rule, using Task 2's `merge_max`. Task 12's `commit_token_batch` merges too, so this is about sizing: `BATCH_ROWS` counts distinct responses, and fewer rows cross into the transaction for CC's up-to-9-lines-per-response pattern.
 5. **Rows are converted in the workers** (`usage_key`, the retention cutoff), not in the writer as the outline said, so hashing runs in parallel and the writer only does SQL.
 6. **Progress** is reported after every message (each chunk, and each file's end), not only per file, so `bytes_done` moves smoothly. The cancel test relies on this to be deterministic.
@@ -12998,8 +13509,14 @@ git commit -m "Add the incremental token index refresh"
    - Task 7 re-exports `UsageLine` at `tagteam_provider::UsageLine`.
    - The CC fixture test uses retention 3,650 days, because the fixtures' dates are unknown here.
    - **Logging (Task 22).** The refresh logs one `info` summary under its module's target, `tagteam_engine::tokens::refresh`, which falls under `tagteam_engine::tokens`. The summary carries the provider, completeness, counts and `took_ms`. Transcript paths appear only at `debug`, and content never does (spec §13). Each batch also logs a `debug` line with counts.
-10. **Batch order.** This task runs after Task 16, whose real `scan_sessions` it calls, and Task 17, whose `lock_until_free` in `tokens/mod.rs` it uses as `super::lock_until_free`. It does not edit `mod.rs`. It removes `reader.rs`'s `#![allow(dead_code)]`, and nothing else touches `reader.rs` in between.
-11. **What I verified, and what I did not.** I could not compile this task's Step 3 inside the engine: Tasks 7, 12 and 13 do not exist yet. Instead I compiled it verbatim in a scratch crate. That crate held the real Task 14 `tokens/` files and Task 17's `lock_until_free`, over the real `tagteam-core` and `tagteam-provider`, with in-memory stand-ins for `Engine`, `Store`, `EngineError` and a line-format provider. The only edit was swapping the `Provider`/`UsageLine` import for the stand-ins'. Results:
+10. **Deterministic lock tests (plan review).**
+    - `refresh_with` passes two hook points, `refresh-tokens-lock` immediately before taking the lock and `refresh-tokens-locked` immediately after.
+    - `a_waiting_refresh_never_passes_the_lock_while_another_holds_it` (feature `test-hooks`) holds the lock and waits on a channel for the first point, then sets the cancel token. The refresh must return the interruption without ever reaching the second point. Were the lock acquisition removed, nothing between the two points could be interrupted, so the test would fail deterministically.
+    - Once the lock is released, the next refresh reaches the second point, and `try_lock` there finds the lock held.
+    - The Try test asserts `Busy` with no elapsed-time check. No functional test here asserts elapsed time; timing belongs to Task 23's `#[ignore]` tests.
+    - **Unreadable files under root.** `an_unreadable_file_is_counted_and_retried` makes a file mode 000, then tries `File::open`. If that succeeds (a privileged run), it restores the mode and returns early with a comment, since no file can be unreadable there. I chose this over injecting a failure (a symlink loop, say) because Task 10's discovery may not list symlinks, so the skip is the deterministic option.
+11. **Batch order.** This task runs after Task 16, whose real `scan_sessions` it calls, and Task 17, whose `lock_until_free` in `tokens/mod.rs` it uses as `super::lock_until_free`. It does not edit `mod.rs`. It removes `reader.rs`'s `#![allow(dead_code)]`, and nothing else touches `reader.rs` in between.
+12. **What I verified, and what I did not.** I could not compile this task's Step 3 inside the engine: Tasks 7, 12 and 13 do not exist yet. Instead I compiled it verbatim in a scratch crate. That crate held the real Task 14 `tokens/` files and Task 17's `lock_until_free`, over the real `tagteam-core` and `tagteam-provider`, with in-memory stand-ins for `Engine`, `Store`, `EngineError` and a line-format provider. The only edit was swapping the `Provider`/`UsageLine` import for the stand-ins'. Results:
     - clippy `-D warnings` was clean;
     - rustfmt was clean (the text above is the formatted code);
     - 11 scenario tests passed on 8 runs out of 8, together with the reader's and lock's 13 tests.
@@ -13007,6 +13524,12 @@ git commit -m "Add the incremental token index refresh"
     The scenarios: the cold index and the in-batch merge; 8,000 rows over 10,000 lines, with production chunks and with 64-byte chunks; one line per call under a zero budget; cancel mid-file; `Try`/`Wait`; refusal without `transcripts`; an empty tree and a removed file; the memory bound; retention; an unreadable file. A store-side check also asserted on every commit that each checkpoint's lines were already committed and that no batch exceeded 2,000 rows.
 
     After Task 12's semantics were known, I aligned the stand-in store with them: `responses` is kept by batches and prunes, and `finish_token_refresh` creates the state row and leaves `responses` alone. I dropped the `token_counts` request and re-ran: still clippy-clean, and 24 of 24 passed: Task 14's 11 reader tests, the 2 `tokens::tests` (lock path and lock wait) and the 11 scenarios.
+
+    After the plan review, the stand-ins gained more: a hook `on_point`, and a store whose prune works in chunks of 5, checks `stop` after each chunk, and returns `PruneOutcome`. The re-run (clippy-clean, 28 of 28 passed, 3 runs out of 3) covered the same scenarios plus:
+    - the hook-based Wait test, which fails if the lock acquisition is removed;
+    - Try without timing;
+    - a budgeted prune over 3 calls;
+    - a cancelled prune.
 
     I did **not** compile this task's two test files (`tests/tokens_refresh.rs` and the unit test against FakeAgent) against the real engine, Task 10's fake, or Task 8's CC fixture tree.
 
@@ -13029,7 +13552,7 @@ git commit -m "Add the incremental token index refresh"
     - `pub struct SightingRow { pub session_id: String, pub home: String, pub first_at: i64, pub last_at: i64, pub source: SightingSource, pub recorded_at: i64 }`
     - `pub struct LaunchRow { pub account_id: String, pub started_at: i64, pub ended_at: Option<i64>, pub pid: Option<u32>, pub recorded_at: i64 }`
     - `Store::{record_sighting, set_sighting_last_at, latest_sighting, sightings, open_launch, attach_launch_pid, close_launch, launches}` with the contract's signatures.
-  - **Addition to Task 12 (see Notes):** `pub fn record_sighting_within(&self, provider: &ProviderId, s: &SightingRow, min_gap_ms: i64, wait: Duration) -> Result<bool, StoreError>`.
+  - Task 12: `pub fn record_sighting_within(&self, provider: &ProviderId, s: &SightingRow, min_gap_ms: i64, wait: Duration) -> Result<bool, StoreError>` (added to Task 12 at this task's request; see note 1).
   - Task 14: `LaunchId` in `evidence.rs`.
   - Existing:
     - `Engine::{session_state_at, existing_store, store, provider, registered_id, now_ms}` and `Engine.process`;
@@ -13046,7 +13569,7 @@ git commit -m "Add the incremental token index refresh"
       pub fn open_launch(&self, provider: &ProviderId, account: &AccountId) -> Result<LaunchId, EngineError>;
       pub fn attach_launch_pid(&self, id: &LaunchId, pid: u32) -> Result<(), EngineError>;
       pub fn poll_launch(&self, id: &LaunchId, profile: &Path, pid: u32, state: &mut LaunchPoll) -> Result<(), EngineError>;
-      pub fn close_launch(&self, id: &LaunchId, profile: &Path, state: &LaunchPoll) -> Result<(), EngineError>;
+      pub fn close_launch(&self, id: &LaunchId, profile: &Path, state: &LaunchPoll, exited_at_ms: i64) -> Result<(), EngineError>;
       pub fn statusline_sighting(&self, provider: &ProviderId, session_id: &str, profile: Option<&Path>) -> Result<(), EngineError>;
   }
   ```
@@ -13063,7 +13586,7 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 use common::{Fx, LSTART};
 use serde_json::json;
@@ -13328,29 +13851,34 @@ fn polling_reads_the_record_only_when_it_changed() {
     assert_eq!(state, LaunchPoll::default(), "no record yet");
     assert!(sightings(&fx).is_empty());
 
-    let path = record(&fx, &profile, 777, "s-a", NOW - 1_000, "interactive");
+    // The child, spawned once the launch began, writes its record.
+    let started = NOW + 1_000;
+    fx.clock.advance_ms(2_000);
+    let polled = NOW + 2_000;
+    running(&fx, 777, None);
+    let path = record(&fx, &profile, 777, "s-a", started, "interactive");
     set_mtime(&path, 1_790_000_000);
     fx.engine
         .poll_launch(&id, &profile, 777, &mut state)
         .unwrap();
-    assert_eq!(state.last_sighting, Some(("s-a".to_owned(), NOW - 1_000)));
+    assert_eq!(state.last_sighting, Some(("s-a".to_owned(), started)));
     assert_eq!(
         sightings(&fx),
-        [sighting("s-a", a.as_str(), NOW - 1_000, NOW, run, NOW)]
+        [sighting("s-a", a.as_str(), started, polled, run, polled)]
     );
 
     // Rewritten under the same mtime: not read again, and the sighting it saw is extended.
-    record(&fx, &profile, 777, "s-b", NOW - 1_000, "interactive");
+    record(&fx, &profile, 777, "s-b", started, "interactive");
     set_mtime(&path, 1_790_000_000);
     fx.clock.advance_ms(61_000);
     fx.engine
         .poll_launch(&id, &profile, 777, &mut state)
         .unwrap();
-    assert_eq!(state.last_sighting, Some(("s-a".to_owned(), NOW - 1_000)));
-    let later = NOW + 61_000;
+    assert_eq!(state.last_sighting, Some(("s-a".to_owned(), started)));
+    let later = polled + 61_000;
     assert_eq!(
         sightings(&fx),
-        [sighting("s-a", a.as_str(), NOW - 1_000, later, run, later)]
+        [sighting("s-a", a.as_str(), started, later, run, later)]
     );
 
     // Its mtime moves: read again.
@@ -13358,13 +13886,72 @@ fn polling_reads_the_record_only_when_it_changed() {
     fx.engine
         .poll_launch(&id, &profile, 777, &mut state)
         .unwrap();
-    assert_eq!(state.last_sighting, Some(("s-b".to_owned(), NOW - 1_000)));
+    assert_eq!(state.last_sighting, Some(("s-b".to_owned(), started)));
     assert_eq!(
         sightings(&fx),
         [
-            sighting("s-a", a.as_str(), NOW - 1_000, later, run, later),
-            sighting("s-b", a.as_str(), NOW - 1_000, later, run, later),
+            sighting("s-a", a.as_str(), started, later, run, later),
+            sighting("s-b", a.as_str(), started, later, run, later),
         ]
+    );
+}
+
+#[test]
+fn a_stale_record_with_a_reused_pid_is_ignored() {
+    // A crashed execution left `777.json` behind, and the OS gave its pid to this child. The
+    // record names an older execution, started before this launch began: it is never sighted,
+    // nor remembered. Neither is a record of another pid under that name, nor one whose process
+    // is gone. The child's own record, once it writes one, is.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    running(&fx, 777, None);
+    let path = record(&fx, &profile, 777, "s-old", NOW - 3_600_000, "interactive");
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    fx.engine
+        .poll_launch(&id, &profile, 777, &mut state)
+        .unwrap();
+    assert_eq!(state, LaunchPoll::default(), "not remembered");
+    assert!(sightings(&fx).is_empty(), "not sighted");
+
+    let other_pid = json!({
+        "pid": 778,
+        "procStart": LSTART,
+        "startedAt": NOW + 10,
+        "kind": "interactive",
+        "sessionId": "s-x"
+    });
+    fs::write(&path, other_pid.to_string()).unwrap();
+    fx.engine
+        .poll_launch(&id, &profile, 777, &mut state)
+        .unwrap();
+    gone(&fx, 777);
+    record(&fx, &profile, 777, "s-dead", NOW + 10, "interactive");
+    fx.engine
+        .poll_launch(&id, &profile, 777, &mut state)
+        .unwrap();
+    assert_eq!(state, LaunchPoll::default());
+    assert!(sightings(&fx).is_empty());
+
+    running(&fx, 777, None);
+    fx.clock.advance_ms(1_000);
+    record(&fx, &profile, 777, "s-new", NOW + 500, "interactive");
+    fx.engine
+        .poll_launch(&id, &profile, 777, &mut state)
+        .unwrap();
+    assert_eq!(state.last_sighting, Some(("s-new".to_owned(), NOW + 500)));
+    assert_eq!(
+        sightings(&fx),
+        [sighting(
+            "s-new",
+            a.as_str(),
+            NOW + 500,
+            NOW + 1_000,
+            SightingSource::Run,
+            NOW + 1_000
+        )]
     );
 }
 
@@ -13379,23 +13966,25 @@ fn close_leaves_the_launch_open_while_a_background_session_runs() {
     let profile = fx.make_profile(&a);
     let id = fx.engine.open_launch(&cc, &a).unwrap();
     let mut state = LaunchPoll::default();
-    let child = record(&fx, &profile, 777, "s-a", NOW - 1_000, "interactive");
+    running(&fx, 777, None);
+    let child = record(&fx, &profile, 777, "s-a", NOW, "interactive");
     fx.engine
         .poll_launch(&id, &profile, 777, &mut state)
         .unwrap();
     // The child exits and its record goes; a background session it started lives on.
     fs::remove_file(&child).unwrap();
+    gone(&fx, 777);
     running(&fx, 888, None);
     let background = record(&fx, &profile, 888, "s-bg", NOW, "bg");
     fx.clock.advance_ms(5_000);
 
-    fx.engine.close_launch(&id, &profile, &state).unwrap();
-    let exit = NOW + 5_000;
+    let exit = fx.engine.now_ms();
+    fx.engine.close_launch(&id, &profile, &state, exit).unwrap();
     assert!(
         sightings(&fx).contains(&sighting(
             "s-a",
             a.as_str(),
-            NOW - 1_000,
+            NOW,
             exit,
             SightingSource::Run,
             exit
@@ -13425,7 +14014,7 @@ fn close_leaves_the_launch_open_while_another_launcher_holds_the_profile() {
         .unwrap();
     let first = fx.engine.open_launch(&cc, &a).unwrap();
     fx.engine
-        .close_launch(&first, &profile, &LaunchPoll::default())
+        .close_launch(&first, &profile, &LaunchPoll::default(), NOW)
         .unwrap();
     assert_eq!(
         ended(&fx),
@@ -13437,12 +14026,45 @@ fn close_leaves_the_launch_open_while_another_launcher_holds_the_profile() {
     fx.clock.advance_ms(1_000);
     let second = fx.engine.open_launch(&cc, &a).unwrap();
     fx.engine
-        .close_launch(&second, &profile, &LaunchPoll::default())
+        .close_launch(&second, &profile, &LaunchPoll::default(), NOW + 1_000)
         .unwrap();
     assert_eq!(
         ended(&fx),
         [(a.to_string(), None), (a.to_string(), Some(NOW + 1_000))]
     );
+}
+
+#[test]
+fn close_stamps_the_sighting_at_the_exit_not_at_the_close() {
+    // Spec §6.1: the sighting ends when the child exited. `run`'s exit handling, which may wait
+    // on locks, comes before the close; only the launch may close late.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    running(&fx, 777, None);
+    let child = record(&fx, &profile, 777, "s-a", NOW + 500, "interactive");
+    fx.clock.advance_ms(1_000);
+    fx.engine
+        .poll_launch(&id, &profile, 777, &mut state)
+        .unwrap();
+    // The child exits at t1; exit handling takes until t2.
+    fx.clock.advance_ms(30_000);
+    let t1 = fx.engine.now_ms();
+    fs::remove_file(&child).unwrap();
+    gone(&fx, 777);
+    fx.clock.advance_ms(45_000);
+    let t2 = fx.engine.now_ms();
+
+    fx.engine.close_launch(&id, &profile, &state, t1).unwrap();
+    let run = SightingSource::Run;
+    assert_eq!(
+        sightings(&fx),
+        [sighting("s-a", a.as_str(), NOW + 500, t1, run, t2)]
+    );
+    assert_eq!(ended(&fx), [(a.to_string(), Some(t2))]);
 }
 
 #[test]
@@ -13565,7 +14187,8 @@ fn the_statusline_records_nothing_without_an_ancestor_record() {
 
 #[test]
 fn the_statusline_never_waits_on_a_busy_store() {
-    // Spec §6.3: the write waits at most `CACHE_WRITE_WAIT` (5 ms); a busy store skips it.
+    // Spec §6.3: the write waits at most `CACHE_WRITE_WAIT` (5 ms); a busy store skips it, and
+    // the call still succeeds. How long it took is left to the `#[ignore]` perf tests.
     let fx = Fx::new();
     let cc = fx.provider();
     fx.add("a@x.co", "rt-a");
@@ -13575,13 +14198,7 @@ fn the_statusline_never_waits_on_a_busy_store() {
     let other = rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db")).unwrap();
     other.execute_batch("BEGIN IMMEDIATE;").unwrap();
 
-    let started = Instant::now();
     fx.engine.statusline_sighting(&cc, "s-1", None).unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "it waited {:?}",
-        started.elapsed()
-    );
     other.execute_batch("ROLLBACK;").unwrap();
     assert!(sightings(&fx).is_empty(), "a busy store skips the write");
 
@@ -13802,8 +14419,8 @@ impl Engine {
     /// Spec §6.1's poll, every 2 seconds while the child runs: its record,
     /// `<records dir>/<pid>.json`, is read again only when its mtime moved, and the sighting of
     /// the session it names, keyed by its `startedAt`, is extended to now. The store writes at
-    /// most once a minute (spec §6.4). A record caught part-way through its write is read again
-    /// at the next poll.
+    /// most once a minute (spec §6.4). A record caught part-way through its write, or one that is
+    /// not this child's, is read again at the next poll.
     pub fn poll_launch(
         &self,
         id: &LaunchId,
@@ -13818,9 +14435,17 @@ impl Engine {
                 let mtime =
                     i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec());
                 if state.last_mtime_ns != Some(mtime) {
+                    // Only this child's own execution: a record of its pid, started no earlier
+                    // than the launch, whose process still runs. One a crashed execution left
+                    // behind under a reused pid is skipped, and not remembered.
                     let seen = fs::read(&record)
                         .ok()
                         .and_then(|bytes| parse_session_record(&bytes).ok())
+                        .filter(|r| {
+                            r.pid == pid
+                                && r.started_at_ms.is_some_and(|at| at >= id.started_at_ms)
+                                && record_is_live(self.process.as_ref(), r, p.launch_command())
+                        })
                         .and_then(|r| r.session_id.zip(r.started_at_ms));
                     if let Some(seen) = seen {
                         state.last_mtime_ns = Some(mtime);
@@ -13849,17 +14474,20 @@ impl Engine {
         Ok(())
     }
 
-    /// Spec §6.1, at the child's exit: the sighting it saw last ends now, and the launch closes
-    /// unless the profile is still in use (`session_state_at`). `run` calls it after
-    /// `finish_run`, once its own launch reservation is released, so the profile reads idle when
-    /// nothing else runs there. A background session the child started, or another launcher's
-    /// reservation, keeps the launch open, and the next scan that finds the profile idle closes
-    /// it.
+    /// Spec §6.1, at the child's exit: the sighting it saw last ends at `exited_at_ms`, when the
+    /// child exited, and the launch closes now unless the profile is still in use
+    /// (`session_state_at`). `run` calls it after `finish_run`, once its own launch reservation is
+    /// released, so the profile reads idle when nothing else runs there. Only the launch may
+    /// close late, which over-covers; the sighting never outlasts the child, so exit handling that
+    /// waits on locks cannot stretch it over a resume elsewhere. A background session the child
+    /// started, or another launcher's reservation, keeps the launch open, and the next scan that
+    /// finds the profile idle closes it.
     pub fn close_launch(
         &self,
         id: &LaunchId,
         profile: &Path,
         state: &LaunchPoll,
+        exited_at_ms: i64,
     ) -> Result<(), EngineError> {
         let p = self.provider(&id.provider)?;
         let store = self.store()?;
@@ -13870,7 +14498,7 @@ impl Engine {
                 session_id,
                 id.account.as_str(),
                 *first_at,
-                now,
+                exited_at_ms,
                 now,
             )?;
         }
@@ -13976,7 +14604,7 @@ impl Engine {
 cargo test -p tagteam-engine --locked --test tokens_evidence
 ```
 
-Expected: `test result: ok. 10 passed; 0 failed`.
+Expected: `test result: ok. 12 passed; 0 failed`.
 
 - [ ] **Step 5: Lint**
 
@@ -13998,33 +14626,21 @@ git commit -m "Record session evidence from scans, run launches and the statusli
 
 #### Notes for the controller
 
-1. **Contract addition for Task 12: `Store::record_sighting_within`.** The statusline's write must give up after 5 ms on a busy store (spec §6.3). Only the store module can set the connection's busy timeout, since `Store::lock` is private to `store`. Please add it to `store/tokens.rs` in Task 12, as `put_live_identity_cache_within` does, holding the connection across the write so no other thread runs with the short wait. The natural shape is a free function over one connection that both methods call:
-   ```rust
-   /// `record_sighting`, giving up after `wait` on another connection's write lock instead of the
-   /// connection's own wait: the statusline's sighting, which never holds its line up (spec §6.3).
-   pub fn record_sighting_within(
-       &self,
-       provider: &ProviderId,
-       s: &SightingRow,
-       min_gap_ms: i64,
-       wait: Duration,
-   ) -> Result<bool, StoreError> {
-       let c = self.lock();
-       c.busy_timeout(wait)?;
-       let written = record_sighting(&c, provider, s, min_gap_ms);
-       c.busy_timeout(super::BUSY_TIMEOUT)?;
-       written
-   }
-   ```
-   Here `record_sighting(c: &Connection, ..)` is the body of Task 12's `Store::record_sighting`: its one `INSERT … ON CONFLICT … DO UPDATE … WHERE excluded.last_at - session_sightings.last_at >= ?8` statement, moved into a free function with `-> rusqlite::Result<bool>` (`Ok(n > 0)`) that both methods call. `Store::record_sighting` becomes `Ok(record_sighting(&self.lock(), provider, s, min_gap_ms)?)`. Its test: `a_sighting_within_a_wait_gives_up_on_a_busy_store`. Hold the write lock from a second connection (`BEGIN IMMEDIATE`), then assert the call returns `Err` within 1 s and wrote nothing, and that the next plain `record_sighting` waits normally.
+1. **`Store::record_sighting_within` is now in Task 12**, added at this task's request. It works as `put_live_identity_cache_within` does: the connection stays locked across one write through the shared `write_sighting`, under the short busy timeout, which is then restored. The statusline's write therefore gives up after `CACHE_WRITE_WAIT` on a busy store (spec §6.3), and no other thread of the process writes with the short wait.
 2. `CACHE_WRITE_WAIT` in `views.rs` becomes `pub(crate)`. Nothing else in `views.rs` changes, and no other task in batch E touches it.
 3. **Task 21's ordering.**
    - `close_launch` judges the profile with `session_state_at(..).owned()`, as the scan does. Any held launch reservation counts as in use, `run`'s own included. So Task 21 calls it after `finish_run`, once `run`'s reservation is released; the profile then reads idle when nothing else runs there.
    - If `finish_run` could not take its locks and left the reservation held until the process exits, the launch stays open and the next scan closes it. A late close over-covers, which can only leave a response unattributed (spec §6.1).
    - `open_launch` must be called while `run` holds its reservation. It does: `run_session` receives `launched.reservation` before `spawn_session`. Otherwise a scan between the two would close the launch at once.
+   - **`close_launch` takes `exited_at_ms` (plan review; the signature changed, and so did the contract line in "Shared interfaces").**
+     - `run` reads `engine.now_ms()` right after its wait returns and passes it. The last sighting ends then, and the launch's `ended_at` is the close's own now, set only when the profile is idle.
+     - Otherwise exit handling that waits on locks would stretch a positive sighting past the child's exit and over a resume elsewhere. Spec §6.1 allows a late launch close, which only over-covers, but not a late sighting.
+     - Pinned by `close_stamps_the_sighting_at_the_exit_not_at_the_close`. Task 21 adapts its call.
 4. **Every poll extends, not only when the mtime moves.**
    - The spec says `run` reads the record when its mtime changed. Re-reading is gated on the mtime here, but the sighting of the session it saw last is extended on every poll; the store writes at most once a minute (§6.4).
    - Without that, a session whose record never changes would be sighted only from its start to the first poll until the exit write. During a long session, a live report would leave its responses unattributed: the default home plus the open launch makes two candidates.
+   - **The poll accepts only the child's own execution (plan review).** A record counts when all three hold: its `pid` is the child's, its `startedAt` is not earlier than the launch's own `started_at` (the child writes its record after the spawn), and `record_is_live` holds. Anything else is skipped and not cached in `LaunchPoll`, so a crashed execution's leftover `<pid>.json` under a reused pid never extends an old sighting to now (`a_stale_record_with_a_reused_pid_is_ignored`).
+   - The scan never attributes a record to a launch: it sights records by home, and closes launches by the profile's session state. So it needs no such check.
 5. **The scan places only the provider's own profiles.** It reads only profiles whose marker names the provider. One with an unreadable marker is skipped, which leaves its responses unattributed rather than guessing.
 6. **What the statusline walk requires.** It needs the ancestor's record to name that pid and be live (`record_is_live`), so a stale record of a recycled pid is never taken for the execution. It does not compare the record's `sessionId` with `CLAUDE_CODE_SESSION_ID`, since whether the record follows `/clear` is spec §17 T1's open item.
 7. Without `transcripts`, `statusline_sighting` returns `Ok(())` silently, because the statusline must never fail on evidence. `sight_sessions` refuses the same case with `invalid-input`. That refusal is tested only through `refresh_tokens` (Task 15), since FakeAgent's `without_transcripts` is the only provider without the capability.
@@ -14033,7 +14649,7 @@ git commit -m "Record session evidence from scans, run launches and the statusli
    - Task 7's `SessionRecord.session_id` and `ProcessProbe::parent_pid`;
    - `session_state_at` and `CACHE_WRITE_WAIT`.
 
-   Results: clippy `-D warnings` was clean and rustfmt was clean; the text above is the formatted code. Task 15's refresh tests also passed with this `scan_sessions` wired in. I did **not** run `tests/tokens_evidence.rs`, which needs the real engine with Tasks 7 and 12; rustfmt parsed and formatted it.
+   Results: clippy `-D warnings` was clean and rustfmt was clean; the text above is the formatted code. Task 15's refresh tests also passed with this `scan_sessions` wired in. After the plan review's changes (the poll's three checks, `close_launch`'s `exited_at_ms`), the same check is still clean. I did **not** run `tests/tokens_evidence.rs`, which needs the real engine with Tasks 7 and 12; rustfmt parsed and formatted it. No test here asserts elapsed time (plan review): the busy-store test asserts only that the call succeeds and writes nothing.
 
 ---
 
@@ -14042,8 +14658,9 @@ git commit -m "Record session evidence from scans, run launches and the statusli
 **Depends on:** 14 (and through it 12: `delete_provider_rows` covers the token tables, and the tests plant rows with Task 12's store API)
 **Files:**
 - Modify: `crates/tagteam-engine/src/tokens/mod.rs` (`lock_until_free`, the wait that has no deadline, and its test)
-- Modify: `crates/tagteam-engine/src/purge.rs` (step 9 deletes under the affected providers' tokens locks; an interrupted wait ends the purge)
-- Modify: `crates/tagteam-engine/tests/purge.rs` (helpers and three tests)
+- Modify: `crates/tagteam-engine/src/purge.rs` (step 9 deletes under the affected providers' tokens locks, with hook points `purge-tokens-lock` and `purge-tokens-locked` around them; an interrupted wait ends the purge)
+- Modify: `crates/tagteam-engine/src/store/tokens.rs` (`Store::token_providers`: every provider with rows in the token and evidence tables, for the full purge)
+- Modify: `crates/tagteam-engine/tests/purge.rs` (helpers and four tests, three of them under feature `test-hooks`)
 - Test: `crates/tagteam-engine/tests/purge.rs`, and the unit test in `crates/tagteam-engine/src/tokens/mod.rs`
 
 **Interfaces:**
@@ -14052,11 +14669,13 @@ git commit -m "Record session evidence from scans, run launches and the statusli
   - Task 12: `Store::delete_provider_rows`, which also deletes `token_files`, `token_sessions` (cascading `token_usage`), `session_sightings`, `run_launches`, `active_history` and `token_state` for the provider. Also `Store::empty_all` (existing; it empties every table).
   - Task 12 (tests): `Store::{commit_token_batch, record_sighting, open_launch, token_epoch}`, `UsageRow`, `TokenFileRow`, `SightingRow`, `SightingSource`, `usage_key`.
   - Task 2 (tests): `tagteam_core::tokens::TokenCounts`.
-  - Existing: `FlockGuard::lock`, `LockError`, `Cancel`, `EngineError::signal`.
-- Produces (crate-internal, for Task 15's `Wait::Wait`):
+  - Existing: `FlockGuard::lock`, `LockError`, `Cancel`, `EngineError::signal`, `crate::hooks::point`, and `Engine::{on_point, also_on_point, cancel}` (feature `test-hooks`).
+- Produces:
   ```rust
-  // crate::tokens (tokens/mod.rs)
+  // crate::tokens (tokens/mod.rs), crate-internal, also for Task 15's `Wait::Wait`
   pub(crate) fn lock_until_free(path: &Path, cancel: &Cancel) -> Result<FlockGuard, LockError>;
+  // crate::store (store/tokens.rs)
+  impl Store { pub fn token_providers(&self) -> Result<Vec<ProviderId>, StoreError>; } // distinct, sorted
   ```
 
 **On the wait.** A purge waits for the tokens lock without a deadline, as `Wait::Wait` does, and ends only on the cancel token (spec §5.1: "takes it too, waiting"). `FlockGuard::lock` alone cannot do that: it computes `Instant::now() + timeout`, which panics for `Duration::MAX`, and any finite value is a cap the spec does not have. `lock_until_free` loops over one-hour rounds of `FlockGuard::lock`, which polls every 100 ms and checks the token before each attempt. A refresh holds the lock for one slice (about 1 s for the daemon) or one refresh (seconds, a cold one included, spec §1.1). A holder that never lets go is stopped or stuck; then Ctrl-C ends the purge with 130, and running it again finishes it, as for an interruption at step 7. This adds no API to `tagteam-provider`.
@@ -14076,7 +14695,9 @@ In `crates/tagteam-engine/src/tokens/mod.rs`, add this test to `mod tests`, afte
 
 ```rust
     #[test]
-    fn a_wait_for_a_tokens_lock_ends_when_it_is_freed_or_cancelled() {
+    fn a_wait_for_a_tokens_lock_never_takes_a_held_lock() {
+        // Held elsewhere, the lock is never taken: only the cancel token ends the wait. Free, it
+        // is taken at once, and held.
         let d = tempfile::tempdir().unwrap();
         let env = Env::for_test(d.path());
         let path = tokens_lock_path(&env, &ProviderId::new("claude-code"));
@@ -14084,20 +14705,17 @@ In `crates/tagteam-engine/src/tokens/mod.rs`, add this test to `mod tests`, afte
         let cancel = Cancel::new();
         let waited = std::thread::scope(|s| {
             let waiter = s.spawn(|| lock_until_free(&path, &cancel).map(drop));
-            std::thread::sleep(Duration::from_millis(300));
-            assert!(!waiter.is_finished(), "it waits while the lock is held");
-            drop(held);
+            cancel.request(2);
             waiter.join().unwrap()
         });
-        assert!(waited.is_ok(), "{waited:?}");
-
-        let held = FlockGuard::try_lock(&path).unwrap().unwrap();
-        cancel.request(2);
-        assert!(matches!(
-            lock_until_free(&path, &cancel),
-            Err(LockError::Interrupted { signal: 2, .. })
-        ));
+        assert!(
+            matches!(waited, Err(LockError::Interrupted { signal: 2, .. })),
+            "{waited:?}"
+        );
         drop(held);
+        let taken = lock_until_free(&path, &Cancel::new()).unwrap();
+        assert!(FlockGuard::try_lock(&path).unwrap().is_none(), "and held");
+        drop(taken);
     }
 ```
 
@@ -14108,8 +14726,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use common::{FakeFx, Fx, add, crashed_switch, credential, journal, vault_fp};
 use serde_json::json;
@@ -14117,7 +14733,7 @@ use tagteam_cc::live::Platform;
 use tagteam_core::tokens::TokenCounts;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::EngineError;
-use tagteam_engine::purge::{KEYCHAIN_LEFTOVERS, PurgeAccount, PurgePlan, PurgeReport};
+use tagteam_engine::purge::{KEYCHAIN_LEFTOVERS, PurgeAccount, PurgePlan};
 use tagteam_engine::store::{
     DisplacedRow, JournalRow, SightingRow, SightingSource, Store, TokenFileRow, UsageRow, usage_key,
 };
@@ -14211,90 +14827,144 @@ fn token_rows(fx: &Fx, provider: &str) -> i64 {
             .sum::<i64>()
 }
 
-fn has_account(fx: &Fx, id: &AccountId) -> bool {
-    let n: i64 = rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM accounts WHERE id = ?1",
-            [id.as_str()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    n > 0
-}
-
-/// Polls `done` every 10 ms, for 10 s at most.
-fn wait_until(done: impl Fn() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out");
-        thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Runs `plan` while a refresh of `provider` holds its tokens lock. The holder lets go 300 ms
-/// after the purge has deleted `account` (its step 7), three of the purge's polls of the lock.
-/// Returns the purge's report, and how many of `provider`'s token rows were still there just
-/// before the holder let go.
+/// Runs a purge while a refresh of `provider` holds its tokens lock (spec §5.1), then again
+/// once that refresh is done; `plan` makes each run's plan.
+///
+/// The first run reaches the point before its tokens-lock wait, and the test sets the cancel
+/// token there. A purge that waits for the lock never reaches the point after the wait, and
+/// deletes nothing. One that took no lock would reach that point at once, since nothing between
+/// the two points can be interrupted.
+///
+/// Returns the second run's report, after asserting that the first run was interrupted and the
+/// second held the lock past that point.
+#[cfg(feature = "test-hooks")]
 fn purge_under_a_refresh(
     fx: &Fx,
     provider: &ProviderId,
-    account: &AccountId,
-    plan: &PurgePlan,
-) -> (PurgeReport, i64) {
-    let refresh = FlockGuard::try_lock(&tokens_lock_path(&fx.env, provider))
-        .unwrap()
-        .unwrap();
-    thread::scope(|s| {
-        let holder = s.spawn(move || {
-            wait_until(|| !has_account(fx, account));
-            thread::sleep(Duration::from_millis(300));
-            let kept = token_rows(fx, provider.as_str());
-            drop(refresh);
-            kept
-        });
-        let report = fx.engine.purge(plan).unwrap();
-        (report, holder.join().unwrap())
-    })
+    plan: impl Fn() -> PurgePlan,
+) -> tagteam_engine::purge::PurgeReport {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let path = tokens_lock_path(&fx.env, provider);
+    let refresh = FlockGuard::try_lock(&path).unwrap().unwrap();
+    let (at_lock, reached) = mpsc::channel();
+    fx.engine.on_point(
+        "purge-tokens-lock",
+        Box::new(move || at_lock.send(()).unwrap()),
+    );
+    let passed = Arc::new(AtomicBool::new(false));
+    let held_there = Arc::new(AtomicBool::new(false));
+    let (passed_cb, held_cb, path_cb) = (passed.clone(), held_there.clone(), path.clone());
+    fx.engine.also_on_point(
+        "purge-tokens-locked",
+        Box::new(move || {
+            passed_cb.store(true, Ordering::SeqCst);
+            let held = FlockGuard::try_lock(&path_cb).unwrap().is_none();
+            held_cb.store(held, Ordering::SeqCst);
+        }),
+    );
+
+    let first_plan = plan();
+    let first = std::thread::scope(|s| {
+        let purge = s.spawn(|| fx.engine.purge(&first_plan));
+        // A guard against a hang, not a timing: the purge reaches this point at once.
+        reached
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the purge reaches its tokens lock");
+        fx.engine.cancel().request(2);
+        purge.join().unwrap()
+    });
+    assert_eq!(
+        first.unwrap_err().signal(),
+        Some(2),
+        "only the cancel token ends the wait"
+    );
+    assert!(
+        !passed.load(Ordering::SeqCst),
+        "the purge passed the tokens lock while a refresh held it"
+    );
+    assert!(
+        token_rows(fx, provider.as_str()) > 0,
+        "nothing was deleted under the refresh"
+    );
+
+    fx.engine.cancel().take();
+    drop(refresh);
+    let report = fx.engine.purge(&plan()).unwrap();
+    assert!(passed.load(Ordering::SeqCst));
+    assert!(
+        held_there.load(Ordering::SeqCst),
+        "the purge held the tokens lock while it deleted"
+    );
+    report
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
 fn purge_waits_for_a_running_refresh() {
-    // Spec §5.1: a purge never falls between two batches of a refresh. It deletes the accounts,
-    // then waits for the provider's tokens lock, under its mutation lock and with no account
+    // Spec §5.1: a purge never falls between two batches of a refresh. Once its accounts are
+    // gone, it waits for the provider's tokens lock, under its mutation lock and with no account
     // lock held, before it deletes the provider's rows.
     let fx = Fx::new();
     let cc = fx.provider();
-    let a = fx.add("a@x.co", "rt-a");
+    fx.add("a@x.co", "rt-a");
     plant_token_rows(&fx, &cc);
-    let plan = fx.engine.purge_plan(Some(&cc)).unwrap();
 
-    let (report, kept_while_held) = purge_under_a_refresh(&fx, &cc, &a, &plan);
+    let report = purge_under_a_refresh(&fx, &cc, || fx.engine.purge_plan(Some(&cc)).unwrap());
     assert!(report.failures.is_empty(), "{:?}", report.failures);
-    assert!(
-        kept_while_held > 0,
-        "the purge deleted the token rows under a refresh's lock"
-    );
     assert_eq!(token_rows(&fx, "claude-code"), 0);
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
 fn a_full_purge_waits_for_a_running_refresh_too() {
     // Spec §13: a full purge empties the store under every affected provider's tokens lock.
     let fx = Fx::new();
     let cc = fx.provider();
-    let a = fx.add("a@x.co", "rt-a");
+    fx.add("a@x.co", "rt-a");
     plant_token_rows(&fx, &cc);
-    let plan = full_plan(&fx);
 
-    let (report, kept_while_held) = purge_under_a_refresh(&fx, &cc, &a, &plan);
+    let report = purge_under_a_refresh(&fx, &cc, || full_plan(&fx));
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert!(report.store_emptied);
-    assert!(
-        kept_while_held > 0,
-        "the purge emptied the store under a refresh's lock"
-    );
     assert_eq!(token_rows(&fx, "claude-code"), 0);
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_full_purge_locks_every_provider_with_token_rows() {
+    // Spec §13: a full purge empties every table, so it holds the tokens lock of every provider
+    // with rows there. That includes one with no account, and one only another build registers.
+    use std::sync::Mutex;
+
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let ghost = ProviderId::new("ghost");
+    fx.add("a@x.co", "rt-a");
+    plant_token_rows(&fx, &cc);
+    plant_token_rows(&fx, &ghost);
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let (held_cb, env) = (held.clone(), fx.env.clone());
+    fx.engine.on_point(
+        "purge-tokens-locked",
+        Box::new(move || {
+            let mut held = held_cb.lock().unwrap();
+            for p in ["claude-code", "ghost"] {
+                let path = tokens_lock_path(&env, &ProviderId::new(p));
+                held.push((p, FlockGuard::try_lock(&path).unwrap().is_none()));
+            }
+        }),
+    );
+
+    let report = fx.engine.purge(&full_plan(&fx)).unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+        *held.lock().unwrap(),
+        [("claude-code", true), ("ghost", true)]
+    );
+    assert_eq!(token_rows(&fx, "ghost"), 0);
 }
 
 #[test]
@@ -14342,14 +15012,14 @@ fn purge_provider_deletes_the_token_rows() {
 
 ```
 cargo test -p tagteam-engine --locked --lib tokens::tests
-cargo test -p tagteam-engine --locked --test purge -- purge_waits_for_a_running_refresh a_full_purge_waits_for_a_running_refresh_too purge_provider_deletes_the_token_rows
+cargo test -p tagteam-engine --locked --features test-hooks --test purge -- purge_waits_for_a_running_refresh a_full_purge_waits_for_a_running_refresh_too a_full_purge_locks_every_provider_with_token_rows purge_provider_deletes_the_token_rows
 ```
 
 Expected:
-- The lib run does not compile: `cannot find function `lock_until_free` in this scope`, and `cannot find type `Duration`, `Cancel`, `FlockGuard` and `LockError`.
-- The purge tests compile (all they need is in place) and two of them fail:
-  - `purge_waits_for_a_running_refresh` panics with `the purge deleted the token rows under a refresh's lock`;
-  - `a_full_purge_waits_for_a_running_refresh_too` panics with `the purge emptied the store under a refresh's lock`;
+- The lib run does not compile: `cannot find function `lock_until_free` in this scope`, and `cannot find type `Cancel`, `FlockGuard` and `LockError`.
+- The purge tests compile (all they need is in place) and all four fail:
+  - `purge_waits_for_a_running_refresh` and `a_full_purge_waits_for_a_running_refresh_too` panic with `the purge reaches its tokens lock`. There is no `purge-tokens-lock` point yet, so they give up after the 30 s hang guard.
+  - `a_full_purge_locks_every_provider_with_token_rows` fails its `assert_eq!` on the locks seen held: no `purge-tokens-locked` point yet, so it sees none.
   - `purge_provider_deletes_the_token_rows` fails at `the purge took the provider's tokens lock`.
 
 - [ ] **Step 3: Implement**
@@ -14395,7 +15065,7 @@ pub(crate) fn lock_until_free(path: &Path, cancel: &Cancel) -> Result<FlockGuard
 
 In `crates/tagteam-engine/src/purge.rs`:
 
-1. Add the import between `use crate::store::{AccountRow, Store};` and `use crate::vault::Leftovers;`:
+1. Add the import between `use crate::store::{AccountRow, Store};` and `use crate::vault::Leftovers;` (`hooks` is already imported):
 
 ```rust
 use crate::store::{AccountRow, Store};
@@ -14438,15 +15108,25 @@ with
     /// purge never falls between two batches of a refresh. They are taken last, under the
     /// engine and mutation locks once every account lock is released, in provider order. A
     /// refresh holds one tokens lock and waits on nothing while it does, and two purges never
-    /// overlap, so these waits close no cycle; nothing is taken while they are held.
+    /// overlap, so these waits close no cycle; nothing is taken while they are held. The test
+    /// hooks `purge-tokens-lock` and `purge-tokens-locked` lie immediately before and after the
+    /// wait.
     fn hold_tokens_locks(&self, providers: &[ProviderId]) -> Result<Vec<FlockGuard>, EngineError> {
         let mut sorted: Vec<&ProviderId> = providers.iter().collect();
         sorted.sort();
         sorted.dedup();
-        sorted
+        hooks::point(self, "purge-tokens-lock")?;
+        let locks = sorted
             .into_iter()
-            .map(|p| Ok(lock_until_free(&tokens_lock_path(&self.env, p), &self.env.cancel)?))
-            .collect()
+            .map(|p| {
+                Ok(lock_until_free(
+                    &tokens_lock_path(&self.env, p),
+                    &self.env.cancel,
+                )?)
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        hooks::point(self, "purge-tokens-locked")?;
+        Ok(locks)
     }
 ```
 
@@ -14547,10 +15227,11 @@ with
 with
 
 ```rust
-    /// are no account's, and go either way. The store is emptied under every affected
-    /// provider's tokens lock (spec §5.1, §13); only an interrupted wait for one ends it with an
-    /// error. The log goes last, and nothing is logged after it: a line would create it again
-    /// (Decision 9).
+    /// are no account's, and go either way. The store is emptied under the tokens lock of every
+    /// affected provider and of every provider with rows in the token tables (spec §5.1, §13),
+    /// one with no account, or one only another build registers, included; only an interrupted
+    /// wait for one ends it with an error. The log goes last, and nothing is logged after it: a
+    /// line would create it again (Decision 9).
     fn purge_everything_else(
         &self,
         providers: &[ProviderId],
@@ -14583,7 +15264,11 @@ with
         } else {
             match self.existing_store() {
                 Ok(None) => report.store_emptied = true,
-                Ok(Some(store)) => match self.hold_tokens_locks(providers) {
+                Ok(Some(store)) => match store
+                    .token_providers()
+                    .map_err(EngineError::from)
+                    .and_then(|stored| self.hold_tokens_locks(&[providers, &stored].concat()))
+                {
                     Ok(_tokens) => match store.empty_all() {
                         Ok(()) => report.store_emptied = true,
                         Err(e) => report.failures.push(("the store".into(), e.to_string())),
@@ -14599,16 +15284,40 @@ with
     }
 ```
 
+In `crates/tagteam-engine/src/store/tokens.rs` (Task 12's file), inside its `impl Store`, insert before the doc comment `/// Every model the provider's index has held since its last purge, sorted: a model whose`:
+
+```rust
+    /// Every provider with a row in a token or evidence table, sorted. A full purge takes the
+    /// tokens lock of each (spec §13), one with no account, or one only another build
+    /// registers, included.
+    pub fn token_providers(&self) -> Result<Vec<ProviderId>, StoreError> {
+        let c = self.lock();
+        let mut stmt = c.prepare(
+            "SELECT provider FROM token_files UNION SELECT provider FROM token_sessions \
+             UNION SELECT provider FROM token_models UNION SELECT provider FROM token_state \
+             UNION SELECT provider FROM session_sightings UNION SELECT provider FROM run_launches \
+             UNION SELECT provider FROM active_history ORDER BY provider",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .map(|p| p.map(ProviderId::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+```
+
 - [ ] **Step 4: Run them and see them pass**
 
 ```
 cargo test -p tagteam-engine --locked --lib tokens::tests
+cargo test -p tagteam-engine --locked --features test-hooks --test purge
 cargo test -p tagteam-engine --locked --test purge
 ```
 
 Expected:
 - the lib run: `test result: ok. 2 passed; 0 failed`;
-- `purge`: every test passes, the three new ones included. The existing ones still pass, because the tokens lock files are created inside `locks/` and kept like every lock file. `a_stored_provider_string_never_places_a_lock_outside_locks` counts only `engine-*` names, and a hostile provider's tokens lock is `tokens-<12 hex>.lock`.
+- `purge` with `test-hooks`: every test passes, the four new ones included. Without the feature, the three hook tests are compiled out and the rest pass. The existing ones still pass, because the tokens lock files are created inside `locks/` and kept like every lock file. `a_stored_provider_string_never_places_a_lock_outside_locks` counts only `engine-*` names, and a hostile provider's tokens lock is `tokens-<12 hex>.lock`.
 
 - [ ] **Step 5: Lint**
 
@@ -14624,7 +15333,7 @@ Expected: no output from the format check, and clippy finishes with no warnings.
 - [ ] **Step 6: Commit**
 
 ```
-git add crates/tagteam-engine/src/tokens/mod.rs crates/tagteam-engine/src/purge.rs crates/tagteam-engine/tests/purge.rs
+git add crates/tagteam-engine/src/tokens/mod.rs crates/tagteam-engine/src/purge.rs crates/tagteam-engine/src/store/tokens.rs crates/tagteam-engine/tests/purge.rs
 git commit -m "Make purge wait for a running token refresh"
 ```
 
@@ -14634,7 +15343,18 @@ git commit -m "Make purge wait for a running token refresh"
 2. **Waiting with no deadline is my reading of spec §5.1** ("takes it too, waiting"). I considered a bounded wait, say 60 s, that reports the rows as kept for a rerun. I rejected it: it would be an untested branch, and the spec gives no cap. If you prefer the bound, it is one constant in `hold_tokens_locks` and a `LockError::Timeout` arm pushing a failure.
 3. **A full purge holds several tokens locks at once.** That is the one exception to "nothing is taken while it is held". Spec §13 implies it, because `empty_all` is one transaction for every provider. The deadlock-freedom argument is in the task's lock-order paragraph. If you want spec §5.1's wording to say so, that belongs in Task 24's core-spec amendments.
 4. **An interrupted wait now ends the purge with the interruption** (exit 130), not with a failure line. Everything before step 9 is done, and a rerun finishes it, as for an interruption at step 7. That needed `purge_provider_rest` and `purge_everything_else` to return `Result`.
-5. **Which locks a full purge takes.** It takes the tokens lock of every provider in its `providers` list: the registered ones, plus any unregistered provider the plan names an account of. That mirrors `hold_engine_locks`. A registered provider without `transcripts` gets a lock file it never uses, which is harmless.
+5. **Which locks a full purge takes (plan review).** It takes the tokens lock of the union of two lists: its `providers` (the registered ones, plus any unregistered provider the plan names an account of, mirroring `hold_engine_locks`), and `Store::token_providers()`.
+   - `Store::token_providers()` is every provider with rows in `token_files`, `token_sessions`, `token_models`, `token_state`, `session_sightings`, `run_launches` or `active_history`. So rows of a provider with no account, or of one only another build registers, are never emptied under that build's running refresh.
+   - I checked the `UNION` query with `sqlite3` against Task 11's step-3 schema as extracted from this plan.
+   - A registered provider without `transcripts` gets a lock file it never uses, which is harmless.
+   - A `--provider P` purge takes P's lock only.
+6. **Deterministic lock tests (plan review).**
+   - `hold_tokens_locks` passes two hook points, `purge-tokens-lock` immediately before the wait and `purge-tokens-locked` immediately after.
+   - `purge_waits_for_a_running_refresh` and `a_full_purge_waits_for_a_running_refresh_too` hold the lock as a refresh would. They wait on a channel for the first point, then set the cancel token. The purge must return the interruption, never reach the second point, and delete nothing. Were the acquisition removed, nothing between the points could be interrupted, so the tests would fail deterministically.
+   - Each test then releases the lock and purges again. At the second point, `try_lock` must find the lock held, and the rows must end up gone.
+   - `a_full_purge_locks_every_provider_with_token_rows` checks the same at the second point for a provider with token rows and no account.
+   - The tests have no sleeps. The only time bound is a 30 s `recv_timeout` that guards against a hang when a point is missing.
+   - `lock_until_free`'s unit test is deterministic too. Held elsewhere with the token set, the lock is never taken; free, it is taken and held.
 
 ---
 
@@ -14699,6 +15419,7 @@ git commit -m "Make purge wait for a running token refresh"
   #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
   pub struct RefreshStats { pub files: u64, pub responses: u64, pub skipped_lines: u64, pub unreadable_files: u64 }
   pub struct TokenStateRow { pub refreshed_at: Option<i64>, pub changed_at: Option<i64>, pub stats: RefreshStats, pub pruned_at: Option<i64> }
+  // stats.responses is the index's live count (each batch adds, each prune subtracts); the other stats are the last completed refresh's
   pub enum SightingSource { Run, Scan, Statusline }
   pub struct SightingRow { pub session_id: String, pub home: String, pub first_at: i64, pub last_at: i64, pub source: SightingSource, pub recorded_at: i64 }
   pub struct LaunchRow { pub account_id: String, pub started_at: i64, pub ended_at: Option<i64>, pub pid: Option<u32>, pub recorded_at: i64 }
@@ -14722,8 +15443,13 @@ git commit -m "Make purge wait for a running token refresh"
       // existing: accounts, events, usage_samples; tests: account, insert_event, set_active, delete_account
   }
 
-  // Settings (Task 13)
-  pub struct Settings { /* existing */ pub prices: BTreeMap<String, PriceOverride> }
+  // Settings (Task 13): every provider's `[provider.<id>.prices]` tables, whichever provider
+  // `Settings::load` was given; tests also use `Settings::load` and `config_path`
+  pub struct Settings { /* existing */ pub prices: BTreeMap<ProviderId, BTreeMap<String, PriceOverride>> }
+  pub fn config_path(env: &Env) -> PathBuf;
+  impl Settings { pub fn load(env: &Env, provider: &ProviderId) -> (Settings, Vec<String>); }
+
+  // Task 10 (tests): FakeAgent's "fake-1" base {1, 2, 3, 4, 0.5}; `FakeAgent::without_transcripts(self) -> Self`
 
   // Task 14: tokens/mod.rs declares `mod view;` and `pub use view::*;`; tokens/view.rs holds only a `//!` line.
   ```
@@ -14815,7 +15541,7 @@ First give the engine the time zone crate its view and these tests name. In `cra
 jiff.workspace = true
 ```
 
-Then create `crates/tagteam-engine/tests/tokens_view.rs`. It seeds the store through Task 12's API with Claude Code as the provider, so it needs no transcript files. Every response lies in September 2026, before the store's epoch (the wall-clock time the migration ran), and `View::new` asserts that: the migration and the `active_history` trigger stamp SQLite's clock, never the fixture's. Before the epoch the default home's account comes from `events`, whose times the test chooses. Every attributed response is sighted, and every unattributed one is either sighted in two homes or covered by an open launch. No expectation depends on `token_epoch.seeded`. Prices come from two override-added models (`model-a`, `model-b`), so no expectation depends on the shipped table's rates.
+Then create `crates/tagteam-engine/tests/tokens_view.rs`. It seeds the store through Task 12's API with Claude Code as the provider, so it needs no transcript files. Every response lies in September 2026. `View::new` sets the fixture clock to `T0 + 40 days` before the store opens, so the migration dates the epoch after every response, and it asserts that. Before the epoch the default home's account comes from `events`, whose times the test chooses. The `active_history` trigger stamps SQLite's own clock, so `index_state_moves_on_new_evidence_alone` reads back the time it recorded instead of assuming one. Every attributed response is sighted, and every unattributed one is either sighted in two homes or covered by an open launch. No expectation depends on `token_epoch.seeded`. Prices come from two override-added models (`model-a`, `model-b`), so no expectation depends on the shipped table's rates. `Settings.prices` holds every provider's tables, keyed by provider. `price_overrides_follow_the_report_provider` loads the settings of a Claude Code command from a real `config.toml` and reports for FakeAgent, so a report has to take its own provider's table.
 
 ```rust
 //! The token report (spec §10, §10.1): grouping, filters, order, blocks, cost, drill-down and
@@ -14826,15 +15552,16 @@ mod common;
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::fs;
 use std::sync::Arc;
 
-use common::{Fx, add, cc, record_reading, usage_window};
+use common::{FakeFx, Fx, add, cc, record_reading, usage_window};
 use jiff::civil::date;
 use jiff::tz::TimeZone;
 use tagteam_core::tokens::{BlockSpan, CardOverride, PriceOverride, project};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, WindowKind};
 use tagteam_engine::registry::ProviderRegistry;
-use tagteam_engine::settings::Settings;
+use tagteam_engine::settings::{Settings, config_path};
 use tagteam_engine::store::{
     EventRow, RefreshStats, SightingRow, SightingSource, Store, UsageRow, usage_key,
 };
@@ -14850,9 +15577,9 @@ use tagteam_provider::{Provider, RunShell};
 const MIN: i64 = 60_000;
 const H: i64 = 60 * MIN;
 const D: i64 = 24 * H;
-/// 2026-09-01T00:00:00Z. Every response lies within 40 days of it, before the store's epoch
-/// (the wall-clock time its migration ran), so the default home's account comes from `events`
-/// (spec §7.3), and the fixture clock is set past it.
+/// 2026-09-01T00:00:00Z. Every response lies within 40 days of it. The migration dates the
+/// store's epoch with the engine clock, which `View::new` sets to `T0 + 40 days` first, so every
+/// response predates the epoch and the default home's account comes from `events` (spec §7.3).
 const T0: i64 = 1_788_220_800_000;
 
 /// model-a costs $1 / $2 / $3 / $4 / $0.50 per MTok and model-b twice that. Neither is in the
@@ -14877,7 +15604,7 @@ fn settings() -> Settings {
         );
     }
     Settings {
-        prices,
+        prices: BTreeMap::from([(cc(), prices)]),
         ..Settings::default()
     }
 }
@@ -14907,6 +15634,8 @@ struct View {
 impl View {
     fn new() -> Self {
         let fx = Fx::new();
+        // Before the store opens: its migration dates the epoch with this clock.
+        fx.clock.set(T0 + 40 * D);
         let engine = fx.engine_with_settings(settings());
         let store = engine.store().unwrap();
         let a = add(&store, &cc(), "acct-a", "a@x.co", 1);
@@ -14915,11 +15644,11 @@ impl View {
             .token_epoch()
             .unwrap()
             .expect("step 3 records the epoch");
-        assert!(
-            epoch.at > T0 + 41 * D,
+        assert_eq!(
+            epoch.at,
+            T0 + 40 * D,
             "the responses these tests index must predate the store's epoch"
         );
-        fx.clock.set(T0 + 40 * D);
         View {
             fx,
             engine,
@@ -15613,8 +16342,8 @@ fn a_partial_index_reports_rows_with_no_refreshed_at() {
     );
     assert_eq!(
         (r.index.files, r.index.responses),
-        (0, 0),
-        "statistics are the last completed refresh's"
+        (0, 2),
+        "files are the last completed refresh's; responses are the index's own count"
     );
 
     let done = v.engine.now_ms() + 1_000;
@@ -15673,10 +16402,14 @@ fn index_state_moves_on_new_evidence_alone() {
     let launched = state();
     assert_eq!(launched.changed_at_ms, Some(v.engine.now_ms()));
 
-    // And a change of the default home's login, which the trigger stamps with the database's
-    // own clock, after the epoch (spec §4).
+    // And a change of the default home's login. Its trigger stamps the database's own clock,
+    // not the fixture's (spec §4), so the time to expect is the one it recorded.
     v.store.set_active(&cc(), Some(&v.a), Some(0)).unwrap();
-    assert!(state().changed_at_ms > launched.changed_at_ms);
+    let switched_at = v.store.active_history(&cc()).unwrap().last().unwrap().0;
+    assert_eq!(
+        state().changed_at_ms,
+        launched.changed_at_ms.max(Some(switched_at))
+    );
 }
 
 #[test]
@@ -15754,11 +16487,10 @@ fn without_a_store_the_report_is_empty_and_creates_nothing() {
     assert!(!fx.env.data_dir().join("tagteam.db").exists());
 }
 
-#[test]
-fn a_provider_without_transcripts_is_refused() {
-    let fx = Fx::new();
-    let fake = Arc::new(FakeAgent::new().without_transcripts());
-    let engine = Engine::new(EngineConfig {
+/// An engine over `fx` with Claude Code and `fake` registered and `settings`, as the CLI builds
+/// one for a Claude Code command.
+fn engine_with(fx: &Fx, fake: Arc<FakeAgent>, settings: Settings) -> Engine {
+    Engine::new(EngineConfig {
         env: fx.env.clone(),
         registry: ProviderRegistry::new().with(fx.cc.clone()).with(fake),
         vault: Vault::new(Box::new(KeychainVault::new(fx.kc.clone()))),
@@ -15766,13 +16498,16 @@ fn a_provider_without_transcripts_is_refused() {
         clock: fx.clock.clone(),
         http: fx.http.clone(),
         default_provider: ProviderId::new(CLAUDE_CODE),
-        settings: Settings::default(),
+        settings,
         process: fx.process.clone(),
         spawner: fx.spawner.clone(),
         run_shell: RunShell::Outside,
-    });
-    let q = TokenQuery {
-        provider: ProviderId::new(FAKE_AGENT),
+    })
+}
+
+fn day_query(provider: ProviderId) -> TokenQuery {
+    TokenQuery {
+        provider,
         period: TokenPeriod::Day,
         grouping: TokenGrouping::Account,
         since_ms: None,
@@ -15781,13 +16516,72 @@ fn a_provider_without_transcripts_is_refused() {
         models: None,
         session: None,
         tz: TimeZone::UTC,
-    };
+    }
+}
+
+#[test]
+fn a_provider_without_transcripts_is_refused() {
+    let fx = Fx::new();
+    let fake = Arc::new(FakeAgent::new().without_transcripts());
+    let engine = engine_with(&fx, fake, Settings::default());
+    let q = day_query(ProviderId::new(FAKE_AGENT));
     for err in [
         engine.token_report(&q).unwrap_err(),
         engine.token_index_state(&q.provider).unwrap_err(),
     ] {
         assert_eq!(err.kind(), "invalid-input", "{err:?}");
     }
+}
+
+#[test]
+fn price_overrides_follow_the_report_provider() {
+    let ff = FakeFx::new();
+    let path = config_path(&ff.fx.env);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Each provider's own table (spec §8.2): fake-1's input at $7 per MTok, where FakeAgent's
+    // shipped table has $1, and a Claude Code model the shipped table lacks.
+    fs::write(
+        &path,
+        "[provider.fake-agent.prices.\"fake-1\"]\ninput = 7.0\n\n\
+         [provider.claude-code.prices.\"model-a\"]\n\
+         input = 1.0\noutput = 2.0\ncache_write_5m = 3.0\ncache_write_1h = 4.0\ncache_read = 0.5\n",
+    )
+    .unwrap();
+    // The settings of a Claude Code command, as the CLI loads them.
+    let (settings, warnings) = Settings::load(&ff.fx.env, &cc());
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let engine = engine_with(&ff.fx, ff.fake.clone(), settings);
+    let fake = ProviderId::new(FAKE_AGENT);
+    let row = UsageRow {
+        key: usage_key(&fake, "msg-1", "req-1"),
+        session_id: "s-f".into(),
+        project: None,
+        at_ms: T0 + H,
+        model: "fake-1".into(),
+        sidechain: false,
+        counts: counts(10, 0),
+        speed: None,
+        finalized: true,
+    };
+    engine
+        .store()
+        .unwrap()
+        .commit_token_batch(&fake, &[row], &[], &[], engine.now_ms())
+        .unwrap();
+
+    let r = engine.token_report(&day_query(fake)).unwrap();
+    assert_eq!(r.price_overrides, ["fake-1"]);
+    assert_eq!(r.prices_as_of, ff.fake.price_table().as_of);
+    // 10 input tokens at 7,000 nano-dollars each.
+    assert_eq!(
+        r.total.cost,
+        Some(Cost {
+            usd_nanos: 70_000,
+            partial: false
+        })
+    );
+    let r = engine.token_report(&day_query(cc())).unwrap();
+    assert_eq!(r.price_overrides, ["model-a"]);
 }
 ```
 
@@ -15823,6 +16617,7 @@ Replace the whole of `crates/tagteam-engine/src/tokens/view/mod.rs` with the pub
 
 mod group;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -16086,6 +16881,8 @@ pub struct IndexState {
     pub changed_at_ms: Option<i64>,
     /// As of the last completed refresh.
     pub files: u64,
+    /// The index's own count, which every committed batch moves, so a cold index shows its
+    /// progress.
     pub responses: u64,
     /// In the last completed refresh.
     pub skipped_lines: u64,
@@ -16152,8 +16949,11 @@ impl Engine {
     pub fn token_report(&self, q: &TokenQuery) -> Result<TokenReport, EngineError> {
         let p = provider_with_transcripts(self, &q.provider)?;
         let table = p.price_table();
-        // The CLI loads the settings for the command's provider, which is the query's.
-        let (prices, price_overrides) = Prices::new(table, &self.settings.prices);
+        // The query provider's own overrides, whichever provider the settings were loaded for
+        // (spec §8.2).
+        let none = BTreeMap::new();
+        let overrides = self.settings().prices.get(&q.provider).unwrap_or(&none);
+        let (prices, price_overrides) = Prices::new(table, overrides);
         let mut report = TokenReport {
             query: q.clone(),
             time_zone: q.tz.iana_name().unwrap_or("UTC").to_owned(),
@@ -16973,6 +17773,7 @@ How it holds spec §10.1, for the reviewer:
 - **Order.** Newest period first (a session by its latest response that counts, ties by id so a split session's rows stay together; a block by its start), then accounts by position, removed accounts, unattributed, then models by name.
 - **Drill.** A day or month span is clipped to the query's range, so the drilled totals equal the row's. A block span is not clipped, because the row counts the whole block. A session drill keeps the query's account and model filters and drops the range.
 - **Cost** is per response, summed in nano-dollars. A row with every response unpriced has `None`, and one with some unpriced is `partial`. `unpriced_models` lists each model with a counted response that has no price, including a `fast` response of a model without a fast card.
+- **Prices** are the report provider's shipped table merged with that provider's own overrides, `settings().prices.get(&q.provider)` (none when it has no table). They never come from the provider the settings were loaded for.
 - **Performance** (spec §1.1, 200 ms for 30 days at about 130k rows): one store read each for usage, sightings, launches, events, history and accounts. There is one hash lookup per response for each of model, session and account, a cached day or month boundary instead of a zone conversion per response, and `Copy` group keys. The rest is the store's per-row `String`s, measured in Task 23.
 
 - [ ] **Step 4: Run them and see them pass**
@@ -16981,7 +17782,7 @@ How it holds spec §10.1, for the reviewer:
 cargo test -p tagteam-engine --locked --test tokens_view
 ```
 
-Expected: `test result: ok. 15 passed; 0 failed`.
+Expected: `test result: ok. 16 passed; 0 failed`.
 
 - [ ] **Step 5: Lint**
 
@@ -17007,17 +17808,18 @@ git commit -m "Add the token report view"
 2. **Depends on** adds 2, 8 and 14 to the outline's list. The view needs `jiff`, a Claude Code provider with `transcripts: true` (the tests use it), and Task 14's `tokens/view.rs`. All of them precede batch F already.
 3. **`jiff` in `tagteam-engine`.** Task 2 adds it to the workspace and to `tagteam-core` only, so this task adds it to the engine. Task 19 needs `jiff.workspace = true` in `crates/tagteam/Cargo.toml` too, for `--tz` and the date output.
 4. **Task 12's re-exports.** These tests import `usage_key`, `UsageRow`, `SightingRow`, `SightingSource` and `RefreshStats` from `tagteam_engine::store`, so Task 12's `pub use tokens::{…}` must name them. The view also uses `TokenStateRow`, `EpochRow` and `LaunchRow` through the store's methods only.
-5. **Ruling R1 has no task.** No task switches `Engine::store()` / `existing_store()` to `open_seeded` / `open_existing_seeded`, so an engine-created store records `seeded = 0`, and spec §7.2 then leaves every unsighted pre-epoch response unattributed. That is conservative, but it contradicts R1's "every engine open seeds". The view reads `EpochRow.seeded` either way, and these tests are written not to depend on it. Assign the wiring, probably to Task 11 or 16, or restate R1.
+5. **The epoch and seeding.** Task 11 opens the engine's store with `open_seeded`, dating the epoch with the engine clock. `View::new` therefore sets the clock before the store opens and asserts the epoch it gets. The view reads `EpochRow.seeded` either way. No test here depends on it: every attributed response is sighted, and every unattributed one is sighted in two homes or covered by an open launch. The stub run passed with `seeded` both true and false.
 6. **Rulings to record in the PR** (each within spec §§7, 9, 10):
    - `switch-recovered` events count as switches and `import` as adds in the default home's timeline. Spec §7.3 names `switch`, `add` and `remove`, but recovery commits the same change of login, and import creates the account the same way. `remove` takes its account from `from_id`, which is what `lifecycle.rs` records.
    - Block reads look back 24 h before `since`, where the outline said 5 h, and 5 h past `until`. Five hours makes a straddling block whole but can re-anchor the chain of inferred blocks before it as `since` moves. A day nearly always contains the 5-hour gap that resets the chain.
    - Blocks are spans of the account's whole usage, and the filters choose responses, not spans. A block report's total is its rows' sum, which can include responses just before `since` in a straddling block.
    - Drill clips day and month spans to the query's range but not block spans, and a session drill keeps the query's filters.
-   - `IndexState.files` and `.responses` come from `token_state`'s last completed refresh, as spec §10 says. The outline said to count `token_files`, which would read about 2.5k rows on every TUI or daemon poll.
+   - `IndexState.files` comes from `token_state`'s last completed refresh, as spec §10 says. The outline said to count `token_files`, which would read about 2.5k rows on every TUI or daemon poll. `IndexState.responses` is `token_state`'s live count, which every committed batch moves, so a TUI can show a cold index's progress.
    - `token_index_state` refuses a provider without transcripts (`invalid-input`), as `token_report` does.
    - Removed accounts sort among themselves by id.
+   - A report prices with its own provider's overrides from `Settings.prices`, which holds every provider's tables, not the overrides of the provider the CLI loaded settings for (`price_overrides_follow_the_report_provider`).
 7. **For Task 19's JSON.** `RowAccount::Account.label` is `AccountRow.label`, which for Claude Code is the email that spec §11.2's `email` key wants, and `position` is `number`. `Cost.usd_nanos` becomes `costUsd` (divide by 1e9) and `partial` becomes `costPartial`.
-8. **What was verified.** The three files above were compiled, run (all tests but the last passed), clippy-checked with `-D warnings` and rustfmt-checked in a scratch workspace. That workspace stubs the contract's signatures: `tagteam_core::tokens` with spec-faithful bodies, the store API in memory, `Fx` and a minimal `jiff`. Four mutations (an unclipped drill span, removed accounts ranked with current ones, no block lookback, the account filter ignored) were each caught by at least one test. Nothing was run against the real crates, the real SQLite store or the real `jiff`, since none exist yet. `a_provider_without_transcripts_is_refused` was formatted but not compiled, because it uses `EngineConfig`, the registry and `FakeAgent::without_transcripts`, which the stubs lack; it mirrors `FakeFx::new` field for field. The 200 ms budget is Task 23's to measure. If it misses, the cost will be the per-row `String`s of `Store::token_usage`, not the view.
+8. **What was verified.** The three files above were compiled, run (every test but the last two passed), clippy-checked with `-D warnings` and rustfmt-checked in a scratch workspace. That workspace stubs the contract's signatures: `tagteam_core::tokens` with spec-faithful bodies, the store API in memory, `Fx` and a minimal `jiff`. Four mutations (an unclipped drill span, removed accounts ranked with current ones, no block lookback, the account filter ignored) were each caught by at least one test. Nothing was run against the real crates, the real SQLite store or the real `jiff`, since none exist yet. `a_provider_without_transcripts_is_refused` and `price_overrides_follow_the_report_provider` were formatted but not compiled. They use `EngineConfig`, the registry, `FakeAgent`, `Settings::load` and `config_path`, which the stubs lack, and `engine_with` mirrors `FakeFx::new` field for field. A stub-only test checked the per-provider lookup instead: settings that hold both providers' tables, a FakeAgent report taking FakeAgent's partial override (70,000 nano-dollars for 10 input tokens at $7), a Claude Code report taking Claude Code's, and a provider with no table getting none. The 200 ms budget is Task 23's to measure. If it misses, the cost will be the per-row `String`s of `Store::token_usage`, not the view.
 9. `months_follow_the_query_zone` needs the system zone database for `Europe/Brussels`, as Task 6's tests do. A minimal Linux container without `tzdata` fails both.
 
 ---
@@ -17061,6 +17863,9 @@ git commit -m "Add the token report view"
   impl RowKey { pub fn as_str(&self) -> &str; }
   impl Engine { pub fn token_report(&self, q: &TokenQuery) -> Result<TokenReport, EngineError>; }
   // Settings (Task 13): `[provider.claude-code.prices."<model>"]` tables in config.toml
+  // Existing: tagteam_core::validate::{parse_account_ref, AccountRefInput}; Engine::resolve and
+  // candidates (core §10.4); Store::insert_account with NewAccount and tagteam_provider::Identity
+  // (tests); tagteam_fake::FAKE_AGENT (tests)
   ```
 - Produces:
   ```rust
@@ -17069,6 +17874,9 @@ git commit -m "Add the token report view"
   pub enum TokensPeriod { Day(TokensArgs), Month(TokensArgs), Session(TokensArgs), Block(TokensArgs) }
   pub struct TokensArgs { pub accounts: Vec<String>, pub unattributed: bool, pub model: Vec<String>, pub since: Option<String>, pub until: Option<String>, pub by: Option<String>, pub tz: Option<String>, pub csv: bool, pub no_refresh: bool }
   pub(crate) fn csv_field(s: &str) -> String;                                              // crate::history
+  // crate::tokens_cmd, pure and unit-tested
+  pub(crate) fn default_since_ms(period: &TokenPeriod, now_ms: i64, tz: &TimeZone) -> i64;
+  pub(crate) fn provider_for(flag: Option<&ProviderId>, default: &ProviderId, named: &[(u32, ProviderId)]) -> Result<ProviderId, String>;
   // crates/tagteam/tests/common/mod.rs, for Task 22's tests
   pub struct Turn<'a> { pub model: &'a str, pub at_ms: i64, pub counts: [u64; 5], pub final_line: bool }
   pub fn turn(model: &str, at_ms: i64, counts: [u64; 5]) -> Turn<'_>;
@@ -17195,7 +18003,7 @@ pub fn write_transcript(root: &Path, session: &str, turns: &[Turn]) -> PathBuf {
 }
 ```
 
-Create `crates/tagteam/tests/tokens_cli.rs`. Its fixture is two accounts, config.toml prices for the two priced models (so no cost depends on the shipped table), and two sessions: one yesterday in account `a`'s profile, sighted there through the store's own API, and one two days ago in the default home before the store existed, which no evidence can credit to an account, so it is unattributed whatever `token_epoch.seeded` holds. Times are midnights relative to today in UTC with `--tz UTC`, so the expected text is exact. The costs, in nano-dollars per token (opus 1000, 2000, 3000, 4000, 500; sonnet 500, 1000, 1500, 2000, 250): `s-a` is 163,000,000 + 16,000 + 459,000,000 = 622,016,000 ($0.62); `s-d`'s sonnet response 25,000,000 + 72,000,000 = 97,000,000 ($0.10), its other model unpriced, so the row and the total are partial. The tables below were rendered by this task's `tokens_cmd.rs` from that report in a scratch build.
+Create `crates/tagteam/tests/tokens_cli.rs`. Its fixture is two accounts, config.toml prices for the two priced models (so no cost depends on the shipped table), and two sessions: one yesterday in account `a`'s profile, sighted there through the store's own API, and one two days ago in the default home before the store existed, which no evidence can credit to an account, so it is unattributed whatever `token_epoch.seeded` holds. Every report of the fixture passes `--tz UTC` and an explicit `--since` and `--until` (`Fixture::args`), so no expectation depends on when the test runs; the defaults (30 days, and twelve calendar months for `month`) are pinned by `tokens_cmd.rs`'s unit tests at fixed instants, and `month_defaults_to_twelve_calendar_months` asserts only their shape. No test sleeps or measures time: the progress line's one-second rule is a pure function of two `Instant`s, tested with fixed ones. The costs, in nano-dollars per token (opus 1000, 2000, 3000, 4000, 500; sonnet 500, 1000, 1500, 2000, 250): `s-a` is 163,000,000 + 16,000 + 459,000,000 = 622,016,000 ($0.62); `s-d`'s sonnet response 25,000,000 + 72,000,000 = 97,000,000 ($0.10), its other model unpriced, so the row and the total are partial. The tables below were rendered by this task's `tokens_cmd.rs` from that report in a scratch build.
 
 ```rust
 //! `tagteam tokens` through the binary (token report spec §11, §15 "CLI"): the table, `--json`
@@ -17210,10 +18018,11 @@ use std::path::Path;
 
 use common::{Turn, cmd, now_epoch_s, turn, two_fresh_accounts, write_transcript};
 use serde_json::{Value, json};
-use tagteam_core::time::{format_iso8601, parse_iso8601};
-use tagteam_core::{CLAUDE_CODE, ProviderId};
-use tagteam_engine::store::{SightingRow, SightingSource, Store};
-use tagteam_provider::Env;
+use tagteam_core::time::format_iso8601;
+use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_engine::store::{NewAccount, SightingRow, SightingSource, Store};
+use tagteam_fake::FAKE_AGENT;
+use tagteam_provider::{Env, Identity};
 
 const MINUTE_MS: i64 = 60_000;
 const HOUR_MS: i64 = 3_600_000;
@@ -17296,12 +18105,41 @@ struct Fixture {
     /// Yesterday's and the day before's midnights, UTC.
     d1: i64,
     d2: i64,
+    /// The range every report of the fixture asks for: the day before yesterday's date and
+    /// today's.
+    since: String,
+    until: String,
 }
 
 impl Fixture {
     fn root(&self) -> &Path {
         self.dir.path()
     }
+
+    /// `args`, then the fixture's range in UTC, so every expectation is fixed by the fixture
+    /// whenever the test runs. The default range is `tokens_cmd`'s unit tests' to pin.
+    fn args<'a>(&'a self, args: &[&'a str]) -> Vec<&'a str> {
+        let mut all = args.to_vec();
+        all.extend([
+            "--tz",
+            "UTC",
+            "--since",
+            &self.since,
+            "--until",
+            &self.until,
+        ]);
+        all
+    }
+}
+
+/// `json_of` over the fixture's range.
+fn json_in(f: &Fixture, args: &[&str]) -> Value {
+    json_of(f.root(), &f.args(args))
+}
+
+/// `text_of` over the fixture's range.
+fn text_in(f: &Fixture, args: &[&str]) -> String {
+    text_of(f.root(), &f.args(args))
 }
 
 fn fixture() -> Fixture {
@@ -17347,7 +18185,14 @@ fn fixture() -> Fixture {
     let config = Env::for_test(root).config_dir();
     fs::create_dir_all(&config).unwrap();
     fs::write(config.join("config.toml"), PRICES).unwrap();
-    Fixture { dir, a, d1, d2 }
+    Fixture {
+        dir,
+        a,
+        d1,
+        d2,
+        since: date_of(d2),
+        until: date_of(d1 + DAY_MS),
+    }
 }
 
 /// The last footnote, naming the shipped table's date and the overridden models.
@@ -17369,8 +18214,7 @@ fn tokens(input: u64, output: u64, write_5m: u64, write_1h: u64, read: u64) -> V
 #[test]
 fn tokens_day_human_json_and_csv() {
     let f = fixture();
-    let root = f.root();
-    let v = json_of(root, &["tokens", "--tz", "UTC", "--json"]);
+    let v = json_in(&f, &["tokens", "--json"]);
     let as_of = v["prices"]["asOf"].as_str().unwrap().to_owned();
     let (d1, d2) = (date_of(f.d1), date_of(f.d2));
     let a = json!({"kind": "account", "number": 1, "id": f.a, "email": "a@x.co"});
@@ -17410,6 +18254,7 @@ fn tokens_day_human_json_and_csv() {
             &v["period"],
             &v["grouping"],
             &v["timeZone"],
+            &v["since"],
             &v["until"],
             &v["unpricedModels"],
             &v["prices"]["overridden"],
@@ -17420,16 +18265,11 @@ fn tokens_day_human_json_and_csv() {
             &json!("day"),
             &json!("account"),
             &json!("UTC"),
-            &Value::Null,
+            &json!(iso(f.d2)),
+            &json!(iso(f.d1 + DAY_MS)),
             &json!([UNPRICED]),
             &json!([OPUS, SONNET]),
         ]
-    );
-    let since = parse_iso8601(v["since"].as_str().unwrap()).unwrap() * 1000;
-    assert!(
-        (now_epoch_s() * 1000 - 30 * DAY_MS - since).abs() < MINUTE_MS,
-        "--since defaults to 30 days back: {}",
-        v["since"]
     );
     let index = &v["index"];
     assert!(
@@ -17456,7 +18296,7 @@ fn tokens_day_human_json_and_csv() {
     );
 
     assert_eq!(
-        text_of(root, &["tokens", "--tz", "UTC", "--no-refresh"]),
+        text_in(&f, &["tokens", "--no-refresh"]),
         format!(
             concat!(
                 "DAY         ACCOUNT       INPUT  OUTPUT  CACHE WRITE  CACHE READ   TOTAL  API COST\n",
@@ -17472,7 +18312,7 @@ fn tokens_day_human_json_and_csv() {
         )
     );
     assert_eq!(
-        text_of(root, &["tokens", "--tz", "UTC", "--no-refresh", "--csv"]),
+        text_in(&f, &["tokens", "--no-refresh", "--csv"]),
         format!(
             concat!(
                 "period,account,model,input,output,cache_write_5m,cache_write_1h,cache_read,web_search,total,responses,unfinalized,cost_usd\n",
@@ -17485,17 +18325,9 @@ fn tokens_day_human_json_and_csv() {
     );
 
     // By account and model: a row per model, by name, and a model with no price has no cost.
-    let v = json_of(
-        root,
-        &[
-            "tokens",
-            "--tz",
-            "UTC",
-            "--by",
-            "account,model",
-            "--json",
-            "--no-refresh",
-        ],
+    let v = json_in(
+        &f,
+        &["tokens", "--by", "account,model", "--json", "--no-refresh"],
     );
     let rows: Vec<(&Value, &Value, &Value, &Value)> = v["rows"]
         .as_array()
@@ -17527,17 +18359,7 @@ fn tokens_day_human_json_and_csv() {
         ]
     );
     assert_eq!(
-        text_of(
-            root,
-            &[
-                "tokens",
-                "--tz",
-                "UTC",
-                "--by",
-                "account,model",
-                "--no-refresh"
-            ]
-        ),
+        text_in(&f, &["tokens", "--by", "account,model", "--no-refresh"]),
         format!(
             concat!(
                 "DAY         ACCOUNT       MODEL              INPUT  OUTPUT  CACHE WRITE  CACHE READ   TOTAL  API COST\n",
@@ -17554,18 +18376,7 @@ fn tokens_day_human_json_and_csv() {
         )
     );
     // By nothing: a row per day, with no `account` key, naming every account it holds.
-    let v = json_of(
-        root,
-        &[
-            "tokens",
-            "--tz",
-            "UTC",
-            "--by",
-            "none",
-            "--json",
-            "--no-refresh",
-        ],
-    );
+    let v = json_in(&f, &["tokens", "--by", "none", "--json", "--no-refresh"]);
     assert_eq!(v["grouping"], "none");
     assert_eq!(v["rows"][0].get("account"), None);
     assert_eq!(v["rows"][0]["accounts"], json!([a]));
@@ -17576,29 +18387,23 @@ fn bare_tokens_is_day() {
     let f = fixture();
     let root = f.root();
     cmd(root).args(["tokens", "--json"]).assert().success();
-    let bare = json_of(root, &["tokens", "--tz", "UTC", "--json", "--no-refresh"]);
-    let day = json_of(
-        root,
-        &["tokens", "day", "--tz", "UTC", "--json", "--no-refresh"],
-    );
+    let bare = json_in(&f, &["tokens", "--json", "--no-refresh"]);
+    let day = json_in(&f, &["tokens", "day", "--json", "--no-refresh"]);
     assert_eq!(bare["period"], "day");
     assert_eq!(
         (&bare["rows"], &bare["total"], &bare["period"]),
         (&day["rows"], &day["total"], &day["period"])
     );
     // An ACCOUNT on a bare `tokens` is day's too.
-    let only_a = json_of(
-        root,
-        &["tokens", "1", "--tz", "UTC", "--json", "--no-refresh"],
-    );
+    let only_a = json_in(&f, &["tokens", "1", "--json", "--no-refresh"]);
     assert_eq!(only_a["period"], "day");
     assert_eq!(only_a["rows"].as_array().unwrap().len(), 1);
     assert_eq!(only_a["rows"][0]["account"]["number"], 1);
     // `--unattributed` alone is the unattributed bucket alone; with an ACCOUNT, both.
     let keys = |args: &[&str]| -> Vec<String> {
-        let mut all = vec!["tokens", "--tz", "UTC", "--json", "--no-refresh"];
+        let mut all = vec!["tokens", "--json", "--no-refresh"];
         all.extend_from_slice(args);
-        json_of(root, &all)["rows"]
+        json_in(&f, &all)["rows"]
             .as_array()
             .unwrap()
             .iter()
@@ -17736,31 +18541,12 @@ fn an_unknown_model_is_a_usage_error_listing_models() {
         json!({"schemaVersion": 1, "error": {"type": "usage", "message": listed}})
     );
     // A pattern matches every model containing it, whatever the case.
-    let v = json_of(
-        root,
-        &[
-            "tokens",
-            "--model",
-            "OPUS",
-            "--tz",
-            "UTC",
-            "--json",
-            "--no-refresh",
-        ],
-    );
+    let v = json_in(&f, &["tokens", "--model", "OPUS", "--json", "--no-refresh"]);
     assert_eq!(v["rows"].as_array().unwrap().len(), 1, "{v}");
     assert_eq!(v["rows"][0]["models"], json!([OPUS]));
-    let v = json_of(
-        root,
-        &[
-            "tokens",
-            "--model",
-            "claude-s",
-            "--tz",
-            "UTC",
-            "--json",
-            "--no-refresh",
-        ],
+    let v = json_in(
+        &f,
+        &["tokens", "--model", "claude-s", "--json", "--no-refresh"],
     );
     assert_eq!(v["rows"][0]["models"], json!([SONNET]));
     assert_eq!(v["total"]["responses"], 1);
@@ -17819,48 +18605,127 @@ fn no_refresh_reports_the_partial_index_note() {
         .stderr(format!("note: {PARTIAL}\n"));
     // A refresh completes the index; from then on `--no-refresh` reports it, quietly.
     cmd(root).args(["tokens"]).assert().success().stderr("");
-    let text = text_of(root, &["tokens", "--no-refresh", "--tz", "UTC"]);
+    let text = text_in(&f, &["tokens", "--no-refresh"]);
     assert!(text.starts_with("DAY "), "{text}");
 }
 
 #[test]
 fn month_defaults_to_twelve_calendar_months() {
+    // Spec §11.1: with no --since, `month` starts on the first day of the eleventh month back, at
+    // midnight. Which month that is depends on the date, so this asserts the shape alone, and
+    // holds if the month turns while it runs; `default_since_ms`'s unit test pins the month.
     let d = tempfile::tempdir().unwrap();
     let root = d.path();
     two_fresh_accounts(root);
-    let yesterday = midnight(1) + HOUR_MS;
-    write_transcript(root, "s-m", &[turn(OPUS, yesterday, [10, 0, 0, 0, 0])]);
-    let v = json_of(root, &["tokens", "month", "--tz", "UTC", "--json"]);
-    // The first day of the eleventh month before this one: twelve months with this one.
-    let today = iso(now_epoch_s() * 1000);
-    let (year, month): (i64, i64) = (today[..4].parse().unwrap(), today[5..7].parse().unwrap());
-    let back = year * 12 + month - 1 - 11;
-    assert_eq!(
-        v["since"],
-        format!(
-            "{:04}-{:02}-01T00:00:00Z",
-            back.div_euclid(12),
-            back.rem_euclid(12) + 1
-        )
+    // A response every 30 days for 13 months: more months than the report spans.
+    let now = now_epoch_s() * 1000;
+    let turns: Vec<Turn> = (0..14i64)
+        .map(|k| turn(OPUS, now - HOUR_MS - k * 30 * DAY_MS, [10, 0, 0, 0, 0]))
+        .collect();
+    write_transcript(root, "s-m", &turns);
+    let month = |iso: &str| -> i64 {
+        iso[..4].parse::<i64>().unwrap() * 12 + iso[5..7].parse::<i64>().unwrap() - 1
+    };
+    let before = month(&iso(now_epoch_s() * 1000));
+    let v = json_of(
+        root,
+        &["tokens", "month", "--tz", "UTC", "--by", "none", "--json"],
+    );
+    let after = month(&iso(now_epoch_s() * 1000));
+    let since = v["since"].as_str().unwrap();
+    assert!(
+        since.ends_with("-01T00:00:00Z"),
+        "midnight on a first: {since}"
+    );
+    let first = month(since);
+    assert!(
+        first == before - 11 || first == after - 11,
+        "the eleventh month back: {since}"
     );
     assert_eq!((&v["period"], &v["until"]), (&json!("month"), &Value::Null));
-    let month = &iso(yesterday)[..7];
-    assert_eq!(
-        v["rows"][0]["period"],
-        json!({"kind": "month", "month": month})
+    let months: Vec<i64> = v["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| month(r["period"]["month"].as_str().unwrap()))
+        .collect();
+    assert!((2..=12).contains(&months.len()), "{months:?}");
+    assert!(
+        months.windows(2).all(|w| w[0] > w[1]),
+        "a row a month, newest first: {months:?}"
     );
+    assert!(
+        months.iter().all(|m| (first..=after).contains(m)),
+        "{months:?} outside {first}..={after}"
+    );
+}
+
+#[test]
+fn named_accounts_choose_the_provider() {
+    // Core §13.1: --provider, else the provider of the accounts named, else the default. This
+    // build registers Claude Code alone, so another provider's account is planted in the store.
+    let f = fixture();
+    let root = f.root();
+    let identity = Identity {
+        label: "f@x.co".into(),
+        email: Some("f@x.co".into()),
+        org_uuid: String::new(),
+        org_name: None,
+        account_uuid: None,
+        raw: json!({}),
+    };
+    store(root)
+        .insert_account(&NewAccount {
+            id: &AccountId::from_string("0192-fake"),
+            provider: &ProviderId::new(FAKE_AGENT),
+            position: 1,
+            identity_key: "f@x.co\n",
+            identity: &identity,
+            kind: "oauth",
+            alias: Some("fakey"),
+            login_expires_at: None,
+            added_at: 1,
+        })
+        .unwrap();
+    // Named under --provider claude-code, it is refused as `run` refuses it.
+    cmd(root)
+        .args(["tokens", "fakey", "--provider", CLAUDE_CODE])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(format!(
+            "tagteam: position 1 is a {FAKE_AGENT} account, not a {CLAUDE_CODE} one\n"
+        ));
+    // Beside a Claude Code account: one report covers one provider.
+    cmd(root)
+        .args(["tokens", "a@x.co", "fakey"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(format!(
+            "tagteam: the accounts named belong to more than one provider ({CLAUDE_CODE}, {FAKE_AGENT}); name one provider's accounts\n"
+        ));
+    // Named alone, it chooses its provider: here one this build lacks.
+    cmd(root)
+        .args(["tokens", "fakey"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(format!("tagteam: unknown provider \"{FAKE_AGENT}\"\n"));
+    // a@x.co chooses Claude Code, and so does naming no account (the default provider).
+    let v = json_in(&f, &["tokens", "a@x.co", "--json"]);
+    assert_eq!(v["provider"], CLAUDE_CODE);
+    assert_eq!(v["rows"].as_array().unwrap().len(), 1, "a's day alone: {v}");
     assert_eq!(
-        v["rows"][0]["key"],
-        format!("month:{month}|account:unattributed"),
-        "it ran before the store existed, so no account is credited with it"
+        json_in(&f, &["tokens", "--json", "--no-refresh"])["provider"],
+        CLAUDE_CODE
     );
 }
 
 #[test]
 fn session_and_block_columns() {
     let f = fixture();
-    let root = f.root();
-    let v = json_of(root, &["tokens", "session", "--tz", "UTC", "--json"]);
+    let v = json_in(&f, &["tokens", "session", "--json"]);
     let as_of = v["prices"]["asOf"].as_str().unwrap().to_owned();
     let (d1, d2) = (date_of(f.d1), date_of(f.d2));
     assert_eq!(v["period"], "session");
@@ -17881,7 +18746,7 @@ fn session_and_block_columns() {
         )
     );
     assert_eq!(
-        text_of(root, &["tokens", "session", "--tz", "UTC", "--no-refresh"]),
+        text_in(&f, &["tokens", "session", "--no-refresh"]),
         format!(
             concat!(
                 "SESSION  FIRST             LAST              ACCOUNT       INPUT  OUTPUT  CACHE WRITE  CACHE READ   TOTAL  API COST  PROJECT\n",
@@ -17897,10 +18762,7 @@ fn session_and_block_columns() {
         )
     );
     assert_eq!(
-        text_of(
-            root,
-            &["tokens", "session", "--tz", "UTC", "--no-refresh", "--csv"]
-        ),
+        text_in(&f, &["tokens", "session", "--no-refresh", "--csv"]),
         format!(
             concat!(
                 "period,account,model,input,output,cache_write_5m,cache_write_1h,cache_read,web_search,total,responses,unfinalized,cost_usd,project,first_at,last_at\n",
@@ -17914,10 +18776,7 @@ fn session_and_block_columns() {
 
     // Blocks are per account (spec §9): no usage sample observed a reset, so each is inferred,
     // from the hour of its first response, five hours long.
-    let v = json_of(
-        root,
-        &["tokens", "block", "--tz", "UTC", "--json", "--no-refresh"],
-    );
+    let v = json_in(&f, &["tokens", "block", "--json", "--no-refresh"]);
     assert_eq!(v["period"], "block");
     assert_eq!(
         (&v["rows"][0]["key"], &v["rows"][1]["key"]),
@@ -17935,7 +18794,7 @@ fn session_and_block_columns() {
                "end": iso(f.d1 + 15 * HOUR_MS), "observed": false, "active": null})
     );
     assert_eq!(
-        text_of(root, &["tokens", "block", "--tz", "UTC", "--no-refresh"]),
+        text_in(&f, &["tokens", "block", "--no-refresh"]),
         format!(
             concat!(
                 "START             END               ACCOUNT       INPUT  OUTPUT  CACHE WRITE  CACHE READ   TOTAL  API COST\n",
@@ -17951,10 +18810,7 @@ fn session_and_block_columns() {
         )
     );
     assert_eq!(
-        text_of(
-            root,
-            &["tokens", "block", "--tz", "UTC", "--no-refresh", "--csv"]
-        ),
+        text_in(&f, &["tokens", "block", "--no-refresh", "--csv"]),
         format!(
             concat!(
                 "period,account,model,input,output,cache_write_5m,cache_write_1h,cache_read,web_search,total,responses,unfinalized,cost_usd,start,end,observed,active\n",
@@ -18150,7 +19006,7 @@ with
 cargo test -p tagteam --features test-support --test tokens_cli
 ```
 
-Expected: the target builds (it uses only `common`, the store API and the binary) and all ten tests fail, each on its first `tagteam tokens` call: `Unexpected failure. code=2` with stderr `error: unrecognized subcommand 'tokens'`, or for `csv_and_json_together_is_a_usage_error` and `bad_flags_are_usage_errors` a usage error whose message is clap's (`unrecognized subcommand`) rather than the expected one.
+Expected: the target builds (it uses only `common`, the store API and the binary) and all eleven tests fail, each on its first `tagteam tokens` call: `Unexpected failure. code=2` with stderr `error: unrecognized subcommand 'tokens'`, or for `csv_and_json_together_is_a_usage_error` and `bad_flags_are_usage_errors` a usage error whose message is clap's (`unrecognized subcommand`) rather than the expected one.
 
 ```
 cargo test -p tagteam --features test-support --lib cli::tests
@@ -18380,6 +19236,19 @@ impl TypedValueParser for GroupingParser {
 app.rs hunk 1. Replace
 
 ```rust
+use tagteam_core::autoswitch::Strategy;
+```
+
+with
+
+```rust
+use tagteam_core::autoswitch::Strategy;
+use tagteam_core::validate::{AccountRefInput, parse_account_ref};
+```
+
+app.rs hunk 2. Replace
+
+```rust
 use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStrategy};
 ```
 
@@ -18390,7 +19259,7 @@ use tagteam_engine::switch::{SwitchReason, SwitchRequest, SwitchTarget, UsageStr
 use tagteam_engine::tokens::{AccountSel, TokenPeriod, TokenQuery};
 ```
 
-app.rs hunk 2. Replace
+app.rs hunk 3. Replace
 
 ```rust
 use crate::cli::{AutoStrategyArg, Cli, Command, ConfigAction, ShellArg, StrategyArg};
@@ -18404,7 +19273,7 @@ use crate::cli::{
 };
 ```
 
-app.rs hunk 3. Replace
+app.rs hunk 4. Replace
 
 ```rust
 use crate::{
@@ -18422,7 +19291,37 @@ use crate::{
 };
 ```
 
-app.rs hunk 4. Replace
+app.rs hunk 5. Replace
+
+```rust
+    /// §10.4, with a terminal prompt for an ambiguous email.
+    fn resolve(&mut self, input: &str) -> Result<AccountRow, Failure> {
+        match self.engine.resolve(input, self.provider_flag.as_ref()) {
+            Err(EngineError::Ambiguous { .. }) if self.can_prompt() => {
+                let found = self.engine.candidates(input, self.provider_flag.as_ref())?;
+```
+
+with
+
+```rust
+    /// §10.4, with a terminal prompt for an ambiguous email.
+    fn resolve(&mut self, input: &str) -> Result<AccountRow, Failure> {
+        let provider = self.provider_flag.clone();
+        self.resolve_in(input, provider.as_ref())
+    }
+
+    /// `resolve` within `provider`, or in every provider when it is `None` (§10.4).
+    fn resolve_in(
+        &mut self,
+        input: &str,
+        provider: Option<&ProviderId>,
+    ) -> Result<AccountRow, Failure> {
+        match self.engine.resolve(input, provider) {
+            Err(EngineError::Ambiguous { .. }) if self.can_prompt() => {
+                let found = self.engine.candidates(input, provider)?;
+```
+
+app.rs hunk 6. Replace
 
 ```rust
         Command::History { .. } => "history",
@@ -18435,7 +19334,7 @@ with
         Command::Tokens { .. } => "tokens",
 ```
 
-app.rs hunk 5. Replace
+app.rs hunk 7. Replace
 
 ```rust
             } => self.history(account, window, &since, csv)?,
@@ -18448,7 +19347,7 @@ with
             Command::Tokens { period, args } => self.tokens(period, args)?,
 ```
 
-app.rs hunk 6. Replace
+app.rs hunk 8. Replace
 
 ```rust
     /// §12.7: `map` with no arguments lists the mappings, only `--provider`'s when it is given.
@@ -18460,9 +19359,9 @@ with
 
 ```rust
     /// Token report spec §11: `tokens`. Every flag is checked before anything is read; the
-    /// index is refreshed (unless `--no-refresh`), and `--model` is then resolved against it.
-    /// Like any writing command it creates the store. It never fetches and touches no Keychain
-    /// item.
+    /// accounts named choose the provider unless `--provider` does (core §13.1); the index is
+    /// refreshed (unless `--no-refresh`), and `--model` is then resolved against it. Like any
+    /// writing command it creates the store. It never fetches and touches no Keychain item.
     fn tokens(
         &mut self,
         period: Option<Box<TokensPeriod>>,
@@ -18480,7 +19379,27 @@ with
         }
         let flags = tokens_cmd::parse_flags(&args, &period, self.engine.now_ms())
             .map_err(Failure::Usage)?;
-        let provider = self.provider();
+        // Core §13.1: a position counts within --provider, else the default provider; an alias
+        // or an email names its account in whichever provider holds it, so `provider_for` can
+        // refuse one that is not --provider's, or accounts of two providers at once.
+        let mut named = Vec::new();
+        for input in &args.accounts {
+            let scope = match parse_account_ref(input) {
+                Some(AccountRefInput::Position(_)) => self.provider_flag.clone(),
+                _ => None,
+            };
+            named.push(self.resolve_in(input, scope.as_ref())?);
+        }
+        let positions: Vec<(u32, ProviderId)> = named
+            .iter()
+            .map(|row| (row.position, row.provider.clone()))
+            .collect();
+        let provider = tokens_cmd::provider_for(
+            self.provider_flag.as_ref(),
+            self.engine.default_provider(),
+            &positions,
+        )
+        .map_err(Failure::Usage)?;
         let p = self.engine.provider(&provider)?;
         if !p.capabilities().transcripts {
             return Err(Failure::Message(
@@ -18488,10 +19407,10 @@ with
                 format!("{} has no transcripts", p.display_name()),
             ));
         }
-        let mut accounts = Vec::new();
-        for input in &args.accounts {
-            accounts.push(AccountSel::Account(self.resolve(input)?.id));
-        }
+        let mut accounts: Vec<AccountSel> = named
+            .into_iter()
+            .map(|row| AccountSel::Account(row.id))
+            .collect();
         if args.unattributed {
             accounts.push(AccountSel::Unattributed);
         }
@@ -18598,8 +19517,7 @@ pub(crate) fn parse_flags(
     };
     let since_ms = match args.since.as_deref() {
         Some(s) => parse_time(s, now_ms, &tz).ok_or(BAD_SINCE)?,
-        None if matches!(period, TokenPeriod::Month) => eleven_months_back(now_ms, &tz),
-        None => now_ms.saturating_sub(DEFAULT_SINCE_MS),
+        None => default_since_ms(period, now_ms, &tz),
     };
     let until_ms = match args.until.as_deref() {
         Some(s) => Some(parse_time(s, now_ms, &tz).ok_or(BAD_UNTIL)?),
@@ -18661,9 +19579,13 @@ fn date(s: &str) -> Option<jiff::civil::Date> {
     jiff::civil::Date::new(year, i8::try_from(month).ok()?, i8::try_from(day).ok()?).ok()
 }
 
-/// `month`'s default `--since`: the first day of the eleventh month before `now_ms`'s, at
-/// midnight in `tz`, so the report spans twelve calendar months with this one.
-fn eleven_months_back(now_ms: i64, tz: &TimeZone) -> i64 {
+/// Spec §11.1's default `--since`, a function of the time and the zone alone: 30 days back, or
+/// for `month` the first day of the eleventh month before `now_ms`'s, at midnight in `tz`, so
+/// the report spans twelve calendar months with this one.
+pub(crate) fn default_since_ms(period: &TokenPeriod, now_ms: i64, tz: &TimeZone) -> i64 {
+    if !matches!(period, TokenPeriod::Month) {
+        return now_ms.saturating_sub(DEFAULT_SINCE_MS);
+    }
     let (year, month) = month_of(now_ms, tz);
     let index = i32::from(year) * 12 + i32::from(month) - 1 - 11;
     let (year, month) = (index.div_euclid(12), index.rem_euclid(12) + 1);
@@ -18702,6 +19624,43 @@ pub(crate) fn resolve_models(
     Ok(names.into_iter().collect())
 }
 
+/// Core §13.1 for `tokens`: `--provider` when given, else the provider of the accounts named
+/// (`named`: each one's position and provider), else `default`. A named account of a provider
+/// other than `--provider` is a usage error worded as `run` words it, and so are accounts of
+/// more than one provider: a report covers one provider.
+pub(crate) fn provider_for(
+    flag: Option<&ProviderId>,
+    default: &ProviderId,
+    named: &[(u32, ProviderId)],
+) -> Result<ProviderId, String> {
+    if let Some(asked) = flag {
+        if let Some((position, provider)) = named.iter().find(|(_, p)| p != asked) {
+            return Err(format!(
+                "position {position} is a {provider} account, not a {asked} one"
+            ));
+        }
+        return Ok(asked.clone());
+    }
+    let mut providers: Vec<&ProviderId> = Vec::new();
+    for (_, p) in named {
+        if !providers.contains(&p) {
+            providers.push(p);
+        }
+    }
+    match providers.as_slice() {
+        [] => Ok(default.clone()),
+        [one] => Ok((*one).clone()),
+        several => Err(format!(
+            "the accounts named belong to more than one provider ({}); name one provider's accounts",
+            several
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 /// Spec §5.3, §11.2: brings the index up to date before the report, waiting for a refresh
 /// another process runs. Progress goes to stderr only when stderr is a terminal and the
 /// refresh runs past a second. An interruption keeps what was committed (spec §14).
@@ -18712,14 +19671,20 @@ pub(crate) fn refresh(
 ) -> Result<(), EngineError> {
     let mut progress = Progress::new(err, std::io::stderr().is_terminal(), Instant::now());
     let outcome = engine.refresh_tokens(provider, Wait::Wait, None, engine.cancel(), &mut |p| {
-        progress.show(p)
+        progress.show(p, Instant::now())
     });
     progress.clear();
     outcome.map(|_| ())
 }
 
-/// Refresh progress (spec §11.2): one line on stderr, rewritten in place, shown only on a
-/// terminal and only once the refresh has run `PROGRESS_AFTER`.
+/// Spec §11.2: whether a refresh that began at `started` shows its progress at `now`: only on a
+/// terminal, and only once it has run `PROGRESS_AFTER`.
+fn shows_progress(started: Instant, now: Instant, terminal: bool) -> bool {
+    terminal && now.saturating_duration_since(started) >= PROGRESS_AFTER
+}
+
+/// Refresh progress (spec §11.2): one line on stderr, rewritten in place, when
+/// `shows_progress` says so.
 struct Progress<'w> {
     err: &'w mut dyn Write,
     terminal: bool,
@@ -18737,8 +19702,9 @@ impl<'w> Progress<'w> {
         }
     }
 
-    fn show(&mut self, p: &IndexProgress) {
-        if !self.terminal || self.started.elapsed() < PROGRESS_AFTER {
+    /// Shows `p`, as of `now`.
+    fn show(&mut self, p: &IndexProgress, now: Instant) {
+        if !shows_progress(self.started, now, self.terminal) {
             return;
         }
         let _ = write!(
@@ -19478,12 +20444,56 @@ mod tests {
         );
     }
 
+    /// `s`, an ISO 8601 time, in epoch ms.
+    fn at(s: &str) -> i64 {
+        parse_iso8601_ms(s).unwrap()
+    }
+
     #[test]
-    fn month_defaults_to_the_first_of_the_eleventh_month_back() {
-        let now = 1_790_000_000_000; // 2026-09-21
+    fn default_ranges_follow_the_zones_calendar() {
+        // Spec §11.1, at fixed instants: 30 days back for every period but month, and for
+        // month the first of the eleventh month back, at midnight where the report's days are.
+        let utc = TimeZone::UTC;
+        let brussels = TimeZone::get("Europe/Brussels").unwrap();
+        let since = |period: TokenPeriod, now: &str, tz: &TimeZone| {
+            iso(default_since_ms(&period, at(now), tz))
+        };
+        let now = "2026-09-21T14:13:20Z";
+        assert_eq!(since(TokenPeriod::Day, now, &utc), "2026-08-22T14:13:20Z");
         assert_eq!(
-            format_iso8601(eleven_months_back(now, &TimeZone::UTC) / 1000),
-            "2025-10-01T00:00:00Z"
+            since(TokenPeriod::Block, now, &brussels),
+            "2026-08-22T14:13:20Z",
+            "30 days of 24 hours, whatever the zone"
+        );
+        assert_eq!(since(TokenPeriod::Month, now, &utc), "2025-10-01T00:00:00Z");
+        // Across the turn of a month and of a year.
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-02-28T23:59:59.999Z", &utc),
+            "2025-03-01T00:00:00Z"
+        );
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-03-01T00:00:00Z", &utc),
+            "2025-04-01T00:00:00Z"
+        );
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-01-15T12:00:00Z", &utc),
+            "2025-02-01T00:00:00Z"
+        );
+        // 23:30 UTC on 31 October is already 1 November in Brussels, on winter time (UTC+1):
+        // the range starts on 1 December 2025 at its midnight there.
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-10-31T23:30:00Z", &brussels),
+            "2025-11-30T23:00:00Z"
+        );
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-10-31T23:30:00Z", &utc),
+            "2025-11-01T00:00:00Z",
+            "still October in UTC"
+        );
+        // From late March 2026, eleven months back is April 2025, on summer time (UTC+2).
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-03-29T12:00:00Z", &brussels),
+            "2025-03-31T22:00:00Z"
         );
     }
 
@@ -19515,31 +20525,65 @@ mod tests {
     }
 
     #[test]
-    fn progress_shows_only_on_a_terminal_after_a_second() {
+    fn progress_shows_only_on_a_terminal_once_a_second_has_passed() {
+        // Fixed instants: nothing here sleeps or reads how long anything took.
+        let start = Instant::now();
+        let later = |ms: u64| start + Duration::from_millis(ms);
+        assert!(!shows_progress(start, later(999), true));
+        assert!(shows_progress(start, later(1_000), true));
+        assert!(
+            !shows_progress(start, later(5_000), false),
+            "never off a terminal"
+        );
+        assert!(
+            !shows_progress(later(10), start, true),
+            "a clock read before the start shows nothing"
+        );
         let p = IndexProgress {
             files_done: 3,
             files_total: 9,
             ..IndexProgress::default()
         };
-        let long_ago = Instant::now()
-            .checked_sub(Duration::from_secs(2))
-            .expect("the clock is past two seconds");
-        let shown = |terminal: bool, started: Instant| {
-            let mut out = Vec::new();
-            let mut progress = Progress::new(&mut out, terminal, started);
-            progress.show(&p);
-            progress.clear();
-            String::from_utf8(out).unwrap()
-        };
-        assert_eq!(shown(false, long_ago), "");
+        let mut out = Vec::new();
+        let mut progress = Progress::new(&mut out, true, start);
+        progress.show(&p, later(500));
+        progress.show(&p, later(1_500));
+        progress.clear();
         assert_eq!(
-            shown(true, Instant::now()),
-            "",
-            "not within the first second"
+            String::from_utf8(out).unwrap(),
+            "\r\x1b[2Krefreshing the token index: 3/9 files\r\x1b[2K"
+        );
+    }
+
+    #[test]
+    fn named_accounts_choose_the_provider() {
+        // Core §13.1: --provider, else the named accounts' provider, else the default.
+        let (cc, fake) = (
+            ProviderId::new("claude-code"),
+            ProviderId::new("fake-agent"),
+        );
+        let named = |list: &[(u32, &ProviderId)]| {
+            list.iter()
+                .map(|(n, p)| (*n, (*p).clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(provider_for(None, &cc, &[]), Ok(cc.clone()));
+        assert_eq!(provider_for(Some(&fake), &cc, &[]), Ok(fake.clone()));
+        assert_eq!(
+            provider_for(None, &cc, &named(&[(2, &fake)])),
+            Ok(fake.clone())
         );
         assert_eq!(
-            shown(true, long_ago),
-            "\r\x1b[2Krefreshing the token index: 3/9 files\r\x1b[2K"
+            provider_for(Some(&cc), &cc, &named(&[(1, &cc), (2, &cc)])),
+            Ok(cc.clone())
+        );
+        assert_eq!(
+            provider_for(Some(&cc), &cc, &named(&[(1, &cc), (2, &fake)])),
+            Err("position 2 is a fake-agent account, not a claude-code one".to_owned())
+        );
+        assert_eq!(
+            provider_for(None, &cc, &named(&[(1, &cc), (2, &fake), (3, &cc)])),
+            Err("the accounts named belong to more than one provider (claude-code, fake-agent); name one provider's accounts".to_owned())
         );
     }
 
@@ -19573,7 +20617,7 @@ cargo test -p tagteam --locked --features test-support --test tokens_cli --test 
 cargo test -p tagteam --locked --features test-support --lib
 ```
 
-Expected: `tokens_cli` 10 passed, `completions` passing as before (the new subcommands, flags and `--by` values appear in every script; `account,model` is a hidden value, so the fish names stay unquoted), and the lib's tests passing, `tokens_cmd::tests` (8) and `cli::tests::tokens_takes_its_period_as_a_subcommand_and_is_day_when_bare` among them.
+Expected: `tokens_cli` 11 passed, `completions` passing as before (the new subcommands, flags and `--by` values appear in every script; `account,model` is a hidden value, so the fish names stay unquoted), and the lib's tests passing, `tokens_cmd::tests` (9) and `cli::tests::tokens_takes_its_period_as_a_subcommand_and_is_day_when_bare` among them.
 
 - [ ] **Step 5: Lint**
 
@@ -19598,7 +20642,8 @@ git commit -m "Add tagteam tokens"
 4. **Progress and the terminal.** The progress line checks `std::io::stderr().is_terminal()` where it runs rather than adding a `stderr_terminal` field to `app::Context`, which every in-process test builds by hand.
 5. **Attribution in the fixture** does not depend on ruling R1's `seeded` flag: the unattributed session ran before the store existed and before either account's `add`, so with coverage complete it falls to the default home's timeline, which names no account before the first `add`, and with coverage incomplete it is unattributed outright.
 6. **The head's Review Focus owners are stale.** Focus 4 names Task 17 for `a_since_date_is_local_midnight_in_tz`, which is this task's; likewise Focus 1 names Tasks 11 and 12 for tests the outline gives Tasks 14 and 15, and Focus 5 names Task 15 for `purge_waits_for_a_running_refresh`, which is Task 17's.
-7. **What was verified.** In a scratch workspace with stand-ins for `jiff`, `tagteam_core` and the engine that follow task-18.md's types: `tokens_cmd.rs` exactly as above compiled, passed its 8 unit tests, `clippy -D warnings` and `rustfmt --check`, and rendered every expected table and CSV in `tokens_cli.rs`; the patched `cli.rs` (the real file plus the hunks) compiled against real clap 4.6.7, passed `Command::debug_assert`, its unit tests, clippy and rustfmt, and its bash, zsh and fish scripts offer `tokens`, its periods and `account`, `model`, `none` but not `account,model`; `tokens_cli.rs` and the `common` helpers type-checked and passed clippy against stubs of `common` and the store API. Not run: anything against the real engine, store, binary or `jiff` 0.2.37, since Tasks 2–18 do not exist yet. `app.rs`'s hunks were applied to the real file and pass `rustfmt --check`, but were not compiled.
+7. **Provider selection (core §13.1).** `--provider` wins; else the accounts named choose it; else the default provider. A position resolves within `--provider` (else the default provider), an alias or an email in whichever provider holds it, so `provider_for` can refuse a named account that is not `--provider`'s (worded as `run` words it, but a usage error, exit 2) and accounts of two providers at once. `App::resolve` is split into `resolve_in(input, provider)` for this; every other command's resolution is unchanged. The binary registers Claude Code alone, so the CLI test plants a `fake-agent` account in the store: naming it alone then fails as `unknown provider "fake-agent"`, which shows it chose the provider.
+8. **What was verified.** In a scratch workspace with stand-ins for `jiff`, `tagteam_core` and the engine that follow task-18.md's types: `tokens_cmd.rs` exactly as above compiled, passed its 9 unit tests (the default ranges' Brussels cases against a stand-in zone that keeps EU summer time), `clippy -D warnings` and `rustfmt --check`, and rendered every expected table and CSV in `tokens_cli.rs`; the patched `cli.rs` (the real file plus the hunks) compiled against real clap 4.6.7, passed `Command::debug_assert`, its unit tests, clippy and rustfmt, and its bash, zsh and fish scripts offer `tokens`, its periods and `account`, `model`, `none` but not `account,model`; `tokens_cli.rs` and the `common` helpers type-checked and passed clippy against stubs of `common` and the store API. Not run: anything against the real engine, store, binary or `jiff` 0.2.37, since Tasks 2–18 do not exist yet. `app.rs`'s hunks were applied to the real file and pass `rustfmt --check`, but were not compiled.
 
 ---
 
@@ -19677,18 +20722,13 @@ fn sightings(root: &Path) -> Vec<SightingRow> {
         .unwrap()
 }
 
-/// Moves every sighting's end back by `ms`, as if the line had last looked that long ago.
-fn age_sightings(root: &Path, ms: i64) {
-    rusqlite::Connection::open(Env::for_test(root).data_dir().join("tagteam.db"))
-        .unwrap()
-        .execute("UPDATE session_sightings SET last_at = last_at - ?1", [ms])
-        .unwrap();
-}
-
 #[test]
 fn the_statusline_records_its_session_once_a_minute() {
     // Token report spec §6.3: Claude Code runs the line with its session's environment. The
-    // line's first ancestor with a session record, this test process, keys the sighting.
+    // line's first ancestor with a session record, this test process, keys the sighting. The
+    // binary has no clock to set, so only what holds at any time is asserted here: one
+    // execution is one sighting, whenever the line runs again. Whether a second look extends it
+    // (a minute on) or only reads it (within one) is Task 16's, tested on the fake clock.
     let (d, _, _) = managed(0);
     let root = d.path();
     let started = record_for_this_process(&Env::for_test(root).home.join(".claude"), "s-line");
@@ -19718,24 +20758,15 @@ fn the_statusline_records_its_session_once_a_minute() {
         ),
         ("s-line", "", started, SightingSource::Statusline)
     );
+    // The same execution, looked at again: still one sighting, keyed as before. Only its end
+    // may move, and only if a minute passed, so the end is not compared.
     line();
+    let again = sightings(root);
+    let key = |s: &SightingRow| (s.session_id.clone(), s.home.clone(), s.first_at, s.source);
     assert_eq!(
-        sightings(root),
-        first,
-        "within a minute the line only looks"
-    );
-    age_sightings(root, 120_000);
-    line();
-    let extended = sightings(root);
-    assert_eq!(
-        extended.len(),
-        1,
-        "the same execution's sighting: {extended:?}"
-    );
-    assert_eq!(extended[0].first_at, started);
-    assert!(
-        extended[0].last_at >= first[0].last_at,
-        "a minute on, the line extended it: {extended:?} after {first:?}"
+        again.iter().map(key).collect::<Vec<_>>(),
+        first.iter().map(key).collect::<Vec<_>>(),
+        "a second look adds no sighting"
     );
     assert!(
         !Env::for_test(root).state_dir().exists(),
@@ -19793,11 +20824,10 @@ fn the_statusline_output_is_unchanged_by_a_sighting_failure() {
     let root = d.path();
     record_for_this_process(&Env::for_test(root).home.join(".claude"), "s-broken");
     let db = Env::for_test(root).data_dir().join("tagteam.db");
-    // A busy store: another process holds the write lock throughout. The line waits at most
-    // the 5 ms its identity cache allows, never the store's 5 s busy timeout.
+    // A busy store: another process holds the write lock throughout. The line still prints,
+    // and its write is skipped. How long it waited is the perf tests' to time, not this one's.
     let busy = rusqlite::Connection::open(&db).unwrap();
     busy.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let started = Instant::now();
     statusline(root)
         .arg("--no-color")
         .env("CLAUDE_CODE_SESSION_ID", "s-broken")
@@ -19805,11 +20835,6 @@ fn the_statusline_output_is_unchanged_by_a_sighting_failure() {
         .success()
         .stdout("b · 5h 9% · 7d 77%\n")
         .stderr("");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the line waited {:?} on the store",
-        started.elapsed()
-    );
     busy.execute_batch("ROLLBACK").unwrap();
     drop(busy);
     assert!(sightings(root).is_empty(), "a busy store skips the write");
@@ -20353,7 +21378,7 @@ git commit -m "Record the statusline's session as evidence"
 #### Notes for the controller
 
 1. **What these tests require of Task 16's `statusline_sighting`:** it opens the store with `existing_store` and records nothing without one (`a_sighting_never_creates_the_store`, as `statusline` never creates the store); it logs at debug at most, so the default filter opens no log (`the_statusline_records_its_session_once_a_minute`'s last assertion, core §14.2); its write waits at most `CACHE_WRITE_WAIT` and a busy store is skipped; its walk starts at this process and stops at the first ancestor with a parseable record in the home's `sessions/`.
-2. **The busy-store case** opens the store while another connection holds `BEGIN IMMEDIATE`. That works because `Store::open_existing` takes the write lock only when a migration is due, and the 2 s bound distinguishes the 5 ms wait from the 5 s busy timeout.
+2. **No ordinary test here reads the wall clock.** The busy-store case opens the store while another connection holds `BEGIN IMMEDIATE`, which works because `Store::open_existing` takes the write lock only when a migration is due; it asserts exit 0, the unchanged line and no sighting written, and leaves the wait's length to the `#[ignore]` perf tests. The binary has no test clock (`TAGTEAM_TEST_*` sets only the Keychain, the platform and the API base), so `the_statusline_records_its_session_once_a_minute` asserts only that the first line inserts one sighting keyed by the ancestor record's `startedAt` and a second adds none; the minute itself (no extension within it, one past it) is Task 16's engine test on `FakeClock`.
 3. **Batch H** runs this task beside 22 and 23: Task 22 edits only test files of this crate (`run_shell_cli.rs`, `home_cli.rs`, `logging.rs`), but every test target compiles this task's `app.rs` and `statusline.rs`, so run 20 first or re-run 22's focused tests after 20 lands.
 4. **What was verified.** The hunks were applied to the real `app.rs` (after Task 19's) and `statusline.rs` and pass `rustfmt --check`; the integration and perf tests were rustfmt-formatted in place and type-checked with clippy against stubs of `common`, the store API and `perf.rs`'s helpers. Nothing ran against the real binary, since Tasks 7–19 do not exist yet.
 
@@ -20363,7 +21388,7 @@ git commit -m "Record the statusline's session as evidence"
 
 **Depends on:** 16
 **Files:**
-- Modify: `crates/tagteam/src/run.rs` (the whole file below: `run_session` records the launch before the spawn, attaches the child's pid, waits on this thread while a scoped thread polls the child's session record, and closes the launch after exit handling; new `open_launch`, `close_launch`, `wait_polling`, `StopOnDrop`; a unit test)
+- Modify: `crates/tagteam/src/run.rs` (the whole file below: `run_session` records the launch before the spawn, waits on this thread while a scoped thread attaches the child's pid and then polls its session record, stamps the child's exit, and closes the launch after exit handling; new `open_launch`, `close_launch`, `wait_polling`, `StopOnDrop`; a unit test)
 - Create: `crates/tagteam/tests/run_tokens.rs`
 - Test: `crates/tagteam/tests/run_tokens.rs`, `crates/tagteam/src/run.rs` (`mod tests`), and the existing `run_cli.rs` and `signals.rs` as regression checks
 
@@ -20378,9 +21403,9 @@ git commit -m "Record the statusline's session as evidence"
   pub struct LaunchPoll { pub last_mtime_ns: Option<i128>, pub last_sighting: Option<(String, i64)> }
   impl Engine {
       pub fn open_launch(&self, provider: &ProviderId, account: &AccountId) -> Result<LaunchId, EngineError>;          // before the spawn
-      pub fn attach_launch_pid(&self, id: &LaunchId, pid: u32) -> Result<(), EngineError>;
+      pub fn attach_launch_pid(&self, id: &LaunchId, pid: u32) -> Result<(), EngineError>;  // the poller's first act
       pub fn poll_launch(&self, id: &LaunchId, profile: &Path, pid: u32, state: &mut LaunchPoll) -> Result<(), EngineError>; // every 2 s while the child runs
-      pub fn close_launch(&self, id: &LaunchId, profile: &Path, state: &LaunchPoll) -> Result<(), EngineError>;              // at child exit
+      pub fn close_launch(&self, id: &LaunchId, profile: &Path, state: &LaunchPoll, exited_at_ms: i64) -> Result<(), EngineError>; // after finish_run: the sighting ends at exited_at_ms, the launch closes now if idle
   }
   // Task 7: Capabilities.transcripts. Existing: Launched { account: AccountRow, profile: PathBuf, .. }, Engine::finish_run
   // Task 12, tagteam_engine::store (tests)
@@ -20392,14 +21417,15 @@ git commit -m "Record the statusline's session as evidence"
 
 Spec §6.1 in `run`'s terms:
 
-- **The launch** is recorded right after the token's last look and before the spawn, so it covers every response the child makes; the child's pid is attached once it exists. Only a provider with `transcripts` records one.
-- **The poll** runs on a scoped thread beside the existing wait, which stays on the calling thread with its signal forwarding unchanged. It reads the record every 2 s (Task 16's `poll_launch` skips an unchanged mtime) and stops when an `AtomicBool` is set. The flag is set by a guard dropped when the wait returns or unwinds, so the scope can never wait on the poller forever.
-- **The close** comes after `finish_run`, not before it: until exit handling unlinks this process's launch reservation, the profile is in use by this very run (core §12.5, §12.6), and `close_launch` would always leave the launch open. The profile and the launch's id are copied before `finish_run` consumes `launched`. A spawn that fails closes its launch after `abandon`'s exit handling, as no child ever ran.
-- **Failures are evidence lost, never a run failed.** A launch that cannot be recorded is one warning on stderr before the spawn; a failed pid attach or poll goes to the log (at warn, once per run), because stderr belongs to `claude` while it runs; a failed close is a warning after the child has exited. None of them changes the exit code.
+- **The launch** is recorded right after the token's last look and before the spawn, so it covers every response the child makes. Only a provider with `transcripts` records one.
+- **The poll** runs on a scoped thread beside the existing wait, which stays on the calling thread with its signal forwarding unchanged: after the spawn, the calling thread goes straight to the first forward and the wait loop. The poller's first act is to attach the child's pid to the launch; it then reads the record every 2 s (Task 16's `poll_launch` skips an unchanged mtime) and stops when an `AtomicBool` is set. Every store write while the child runs is the poller's, so a busy store never delays the wait or a forwarded signal. The flag is set by a guard dropped when the wait returns or unwinds, so the scope can never wait on the poller forever.
+- **The exit** is stamped with `engine.now_ms()` as soon as the wait returns, before `finish_run`: that is `exited_at_ms`, where the sighting ends. It is read once the poller is joined, so no poll wrote a later end (`set_sighting_last_at` only moves an end forward); the join waits at most for the one poll, or the attach, in flight.
+- **The close** comes after `finish_run`, not before it: until exit handling unlinks this process's launch reservation, the profile is in use by this very run (core §12.5, §12.6), and `close_launch` would always leave the launch open. The profile and the launch's id are copied before `finish_run` consumes `launched`. The sighting still ends at the exit stamp, so exit handling's time is never the session's; only the launch ends after it. A spawn that fails closes its launch after `abandon`'s exit handling, with no sighting, as no child ever ran.
+- **Failures are evidence lost, never a run failed.** A launch that cannot be recorded is one warning on stderr before the spawn; a failed pid attach or poll goes to the log at warn (a failed poll once per run), because stderr belongs to `claude` while it runs; a failed close is a warning after the child has exited. None of them changes the exit code.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/tagteam/tests/run_tokens.rs`. It drives the binary with the fake `claude` (`FAKE_CLAUDE_HOLD` keeps a session running; `FAKE_CLAUDE_RECORD` makes it write its session record, `sessionId` `fake-<pid>`, into the profile) and reads the store's evidence tables between steps.
+Create `crates/tagteam/tests/run_tokens.rs`. It drives the binary with the fake `claude` (`FAKE_CLAUDE_HOLD` keeps a session running; `FAKE_CLAUDE_RECORD` makes it write its session record, `sessionId` `fake-<pid>`, into the profile) and reads the store's evidence tables between steps. `run_sights_the_child_session` also parks the run at the existing `after-exit` pause point, between the child's exit and exit handling, and reads the clock there: the sighting must end no later than that, and the launch no earlier.
 
 ```rust
 //! `tagteam run`'s evidence for the token report (token report spec §6.1), through the binary
@@ -20413,7 +21439,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{
     FakeCall, fake_claude, fake_claude_calls, hold_launch, path_with, std_cmd, two_fresh_accounts,
@@ -20543,6 +21569,12 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// The system clock in epoch ms, the clock the binary stamps with.
+fn now_ms() -> i64 {
+    let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    i64::try_from(since.as_millis()).unwrap()
+}
+
 #[test]
 fn run_records_a_launch_and_closes_it() {
     // Spec §6.1: the launch is open from before the spawn, holds the child's pid once it
@@ -20580,16 +21612,23 @@ fn run_records_a_launch_and_closes_it() {
 #[test]
 fn run_sights_the_child_session() {
     // Spec §6.1: while the child runs, `run` reads its record every 2 s and sights the session
-    // it names in the profile's home, keyed by the record's `startedAt`; at the exit, it ends
-    // that sighting.
+    // it names in the profile's home, keyed by the record's `startedAt`. The child's exit,
+    // stamped before exit handling, ends that sighting; the launch closes after exit handling.
+    // The run is parked between the two (`after-exit`), so the test's clock read there falls
+    // after the stamp and before the close, whatever either took.
     let home = Home::new();
     let out = home.out("sighting");
     let hold = home.root().join("hold");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
     let _release = Release(hold.clone());
+    let _resume = Release(pause.join("resume"));
     let child = home
         .run_a(&out)
         .env("FAKE_CLAUDE_HOLD", &hold)
         .env("FAKE_CLAUDE_RECORD", "interactive")
+        .env("TAGTEAM_TEST_PAUSE_AT", "after-exit")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause)
         .spawn()
         .unwrap();
     let session = running(&out);
@@ -20618,6 +21657,11 @@ fn run_sights_the_child_session() {
         "{seen:?}"
     );
     fs::write(&hold, b"").unwrap();
+    wait_for("the run's exit handling", || {
+        pause.join("paused").exists().then_some(())
+    });
+    let parked_at = now_ms();
+    fs::write(pause.join("resume"), b"").unwrap();
     let output = finish(child);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let after: Vec<SightingRow> = home
@@ -20627,9 +21671,16 @@ fn run_sights_the_child_session() {
         .collect();
     assert_eq!(after.len(), 1, "one execution, one sighting: {after:?}");
     assert_eq!(after[0].first_at, seen.first_at);
+    let ended = home.launches()[0]
+        .ended_at
+        .expect("closed after exit handling");
     assert!(
-        after[0].last_at > seen.last_at,
-        "the exit moved its end on: {after:?} after {seen:?}"
+        seen.last_at <= after[0].last_at && after[0].last_at <= parked_at,
+        "the exit stamp ends the sighting, before exit handling at {parked_at}: {after:?} after {seen:?}"
+    );
+    assert!(
+        parked_at <= ended,
+        "the launch closes after exit handling: ended {ended}, parked at {parked_at}"
     );
 }
 
@@ -20757,8 +21808,9 @@ const LOST: i32 = 1;
 /// through its fd. Waits for it, forwarding signals (Decision 1), then runs the exit handling
 /// and prints its notices on `err`.
 ///
-/// Token report spec §6.1: the launch is recorded before the spawn, the child's pid once it
-/// exists, and its session record is read while it runs. None of that ever changes the outcome.
+/// Token report spec §6.1: the launch is recorded before the spawn, and the child's pid and
+/// its session record are recorded off this thread while it runs. None of that ever changes
+/// the outcome.
 ///
 /// `Ok` is `claude`'s exit code, `128 + n` when signal `n` ended it, whatever exit handling did
 /// (B.63). `Err` is a launch that never started: interrupted at the token's last look, or a
@@ -20803,25 +21855,19 @@ pub(crate) fn run_session(
                 detail: format!("{}: {e}", launch.display()),
             };
             let e = abandon(engine, launched, cancel, err, e);
+            let no_sighting = LaunchPoll::default();
             close_launch(
                 engine,
                 launch_id.as_ref(),
                 &profile,
-                &LaunchPoll::default(),
+                &no_sighting,
+                engine.now_ms(),
                 err,
             );
             return Err(e);
         }
     };
     let pid = child.id();
-    if let Some(id) = &launch_id {
-        if let Err(e) = engine.attach_launch_pid(id, pid) {
-            tracing::warn!(
-                kind = e.kind(),
-                "could not record the session's pid for the token report"
-            );
-        }
-    }
     // The first look forwards anything, SIGINT included: what arrived while `claude` was being
     // spawned, the terminal could not deliver to it.
     forward(pid, cancel.take(), true);
@@ -20832,6 +21878,9 @@ pub(crate) fn run_session(
         }),
         None => wait(&mut child, cancel),
     };
+    // Token report spec §6.1: the child's exit, stamped before exit handling, ends its sighting.
+    // The poller is joined by now, so no poll wrote a later end than this.
+    let exited_at_ms = engine.now_ms();
     // What forwarding left is spent, so exit handling meets only a signal sent from now on.
     let _ = cancel.take();
     pause_point("after-exit");
@@ -20845,7 +21894,14 @@ pub(crate) fn run_session(
     notify(err, &engine.finish_run(launched, LaunchEnd::Exited(code)));
     // After exit handling, which unlinks this process's reservation: until then the profile
     // is in use by this very run, and the launch could never close here.
-    close_launch(engine, launch_id.as_ref(), &profile, &seen, err);
+    close_launch(
+        engine,
+        launch_id.as_ref(),
+        &profile,
+        &seen,
+        exited_at_ms,
+        err,
+    );
     Ok(code)
 }
 
@@ -20872,20 +21928,22 @@ fn open_launch(engine: &Engine, launched: &Launched, err: &mut dyn Write) -> Opt
     }
 }
 
-/// Token report spec §6.1, once the child has exited: ends the sighting the poll saw last, and
-/// closes the launch unless the profile is still in use, as by a background session the child
-/// left running. A failure is a warning; the next `sight_sessions` closes the launch then.
+/// Token report spec §6.1, after exit handling: ends the sighting the poll saw last at
+/// `exited_at_ms`, the child's exit, and closes the launch unless the profile is still in use,
+/// as by a background session the child left running. A failure is a warning; the next
+/// `sight_sessions` closes the launch then.
 fn close_launch(
     engine: &Engine,
     id: Option<&LaunchId>,
     profile: &Path,
     seen: &LaunchPoll,
+    exited_at_ms: i64,
     err: &mut dyn Write,
 ) {
     let Some(id) = id else {
         return;
     };
-    if let Err(e) = engine.close_launch(id, profile, seen) {
+    if let Err(e) = engine.close_launch(id, profile, seen, exited_at_ms) {
         let _ = writeln!(
             err,
             "warning: the token report could not record this session's end: {e}"
@@ -20893,9 +21951,11 @@ fn close_launch(
     }
 }
 
-/// Token report spec §6.1: runs `wait` on this thread while a scoped thread reads the child's
-/// session record every `RECORD_POLL`, until `wait` returns. The poller never touches the
-/// cancel token or the terminal: a failed read is logged, once, and the next one tries again.
+/// Token report spec §6.1: runs `wait` on this thread while a scoped thread records the child's
+/// pid, then reads its session record every `RECORD_POLL`, until `wait` returns. The store
+/// writes are the poller's, so a busy store never delays the wait or the signals it forwards.
+/// The poller never touches the cancel token or the terminal: a failure is logged, once, and
+/// the next poll tries again.
 fn wait_polling<T>(
     engine: &Engine,
     id: &LaunchId,
@@ -20907,6 +21967,12 @@ fn wait_polling<T>(
     let stop = AtomicBool::new(false);
     thread::scope(|s| {
         s.spawn(|| {
+            if let Err(e) = engine.attach_launch_pid(id, pid) {
+                tracing::warn!(
+                    kind = e.kind(),
+                    "could not record the session's pid for the token report"
+                );
+            }
             let mut next = Instant::now();
             let mut logged = false;
             while !stop.load(Ordering::Relaxed) {
@@ -21122,11 +22188,11 @@ git commit -m "Record run launches and poll their sessions"
 
 #### Notes for the controller
 
-1. **Deviation from the outline:** the outline puts `close_launch` "after exit and before `finish_run` consumes `launched`". Before `finish_run`, this run's own reservation still holds the profile, so `close_launch`'s in-use check (Task 16: `session_state_at(..).owned()`) would never let the launch close at the exit, and `run_records_a_launch_and_closes_it` would fail. This task copies the id and profile before `finish_run` and closes after it. The cost is that the last sighting's end is the time exit handling finished, a few milliseconds to seconds after the child's exit; a late end over-covers, which spec §6.1 accepts for launches.
-2. **What the tests require of Task 16:** `poll_launch` reads `<session_records_dir(profile)>/<pid>.json` and records `(sessionId, home = account id, first_at = startedAt, source Run)`; `close_launch` ends `state.last_sighting` at now and closes the launch only when the profile is not in use; a held launch reservation of another process counts as in use (`a_launch_stays_open_while_the_profile_is_in_use`, using `common::hold_launch`).
+1. **Deviation from the outline:** the outline puts `close_launch` "after exit and before `finish_run` consumes `launched`". Before `finish_run`, this run's own reservation still holds the profile, so `close_launch`'s in-use check (Task 16: `session_state_at(..).owned()`) would never let the launch close at the exit, and `run_records_a_launch_and_closes_it` would fail. This task copies the id and profile before `finish_run` and closes after it. The sighting is not delayed by that: it ends at `exited_at_ms`, read before `finish_run` (plan review). Only the launch ends when exit handling has finished, a few milliseconds to seconds after the child's exit; a late launch end over-covers, which spec §6.1 accepts.
+2. **What the tests require of Task 16:** `poll_launch` reads `<session_records_dir(profile)>/<pid>.json` and records `(sessionId, home = account id, first_at = startedAt, source Run)`; `close_launch` moves `state.last_sighting`'s end forward to `exited_at_ms`, never back, and closes the launch at now only when the profile is not in use; a held launch reservation of another process counts as in use (`a_launch_stays_open_while_the_profile_is_in_use`, using `common::hold_launch`). `run_sights_the_child_session` asserts the order through the binary with the system clock, which is what the binary stamps with: the sighting's end, then the pause, then the launch's end. It compares clock reads only, never a duration.
 3. **Batch G shares the `tagteam` crate with Task 19** (see Task 19's note 1); this test file also loads `tests/common/mod.rs`, which Task 19 extends.
-4. **`open_launch` is a store write before the spawn**, so a busy store can delay the session by up to the store's 5 s busy timeout. Bounding it, as `CACHE_WRITE_WAIT` bounds the statusline's, would need an engine variant; it is left as is, and the reviewer may rule otherwise.
-5. **What was verified.** `wait_polling` and `StopOnDrop`, exactly as above but with a stand-in engine and log macro, compiled, passed clippy and ran in a scratch build (the poller stopped when the wait returned). The whole `run.rs` was rustfmt-checked but not compiled: it needs Task 16's API. `run_tokens.rs` was type-checked with clippy against stubs of `common` and the store API.
+4. **`open_launch` is a store write before the spawn**, so a busy store can delay the session by up to the store's 5 s busy timeout. Bounding it, as `CACHE_WRITE_WAIT` bounds the statusline's, would need an engine variant; it is left as is, and the reviewer may rule otherwise. The pid attach is no longer such a write (plan review): it is the poller's first act, so it never stands between the spawn and the first forward.
+5. **What was verified.** `wait_polling` and `StopOnDrop`, exactly as above but with a stand-in engine and log macro, compiled, passed clippy and ran in a scratch build (the poller attached the pid before its first poll, the wait ran at once on the calling thread, and the poller stopped when the wait returned). The whole `run.rs` was rustfmt-checked but not compiled: it needs Task 16's API. `run_tokens.rs` was type-checked with clippy against stubs of `common` and the store API.
 
 ---
 
@@ -22490,3 +23556,22 @@ R1–R6 are in the plan's header. The writers recorded these:
 - **Batching (Task 15).** The writer merges a response's lines within a batch, so the 2,000-row cap counts responses. A checkpoint commits only in the batch that holds the last of its chunk's rows.
 - **Tail hash (Task 14).** The reader hashes the bytes it actually read for `tail_hash`, which also catches a rewrite during a read that started at 0.
 - **Statusline write (Tasks 12 and 16).** The sighting uses `Store::record_sighting_within` with a 5 ms busy wait. `CACHE_WRITE_WAIT` becomes `pub(crate)`.
+- **Index counts (Task 18).** `IndexState.responses` is the live count, which moves with every batch so a TUI can show progress during a cold index. `files` is as of the last completed refresh.
+- **Prune budget (Task 15).** Each refresh call lets the first prune chunk through regardless of the budget, and stops at once only on cancel. So a spent budget still makes progress, and a slice overruns by at most one prune chunk.
+- **Plan review (Codex, 12 slices).** Each fix followed a finding:
+  - **Prices (Task 3).** A dated override keeps its entry even when it equals the shipped price.
+  - **Timeline (Task 4).** The pre-epoch timeline uses only the row seeded at the epoch.
+  - **Parser (Task 8).** It keeps only the first iteration, and no linked `subagents` directory is followed.
+  - **Store (Tasks 11–12).**
+    - The epoch is read inside the migration's lock.
+    - Every prune chunk moves `changed_at`.
+    - The prune is resumable within a budget.
+  - **Settings (Task 13).** Price overrides are kept per provider.
+  - **Reader (Task 14).** The head bytes actually read are validated at checkpoint.
+  - **Refresh (Task 15).** The deadline starts after discovery and the lock.
+  - **Evidence (Task 16).** A stale record with a reused PID is ignored. `close_launch` ends the sighting at the child's exit.
+  - **Purge (Task 17).** A full purge locks every provider with token rows.
+  - **Report (Task 18).** Each report uses its own provider's overrides.
+  - **CLI (Task 19).** Named accounts choose the provider.
+  - **run (Task 21).** The pid is attached on the poller thread.
+  - **Tests.** Contention tests use hook points, and no functional test depends on elapsed time or today's date.
