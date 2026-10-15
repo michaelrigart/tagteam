@@ -6,6 +6,7 @@ mod live;
 mod opt_in;
 mod profile;
 mod standalone;
+mod transcripts;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -125,6 +126,22 @@ pub const CHECKS: &[Check] = &[
         false,
         None,
         profile::storage_write_lock,
+    ),
+    check(
+        "transcript-usage-fields",
+        "a real request's transcript carries every field the token index reads (token report §3.2, §15)",
+        Phase::Profile,
+        false,
+        None,
+        transcripts::transcript_usage_fields,
+    ),
+    check(
+        "session-record-session-id",
+        "a session record's `sessionId` names its transcript, and what `/clear` does to it (token report §17 T1)",
+        Phase::Profile,
+        false,
+        None,
+        transcripts::session_record_session_id_and_clear,
     ),
     check(
         "fresh-global-config",
@@ -496,6 +513,8 @@ mod tests {
                 "shared-writes",
                 "session-records",
                 "storage-write-lock",
+                "transcript-usage-fields",
+                "session-record-session-id",
                 "fresh-global-config",
                 "config-lock",
                 "refresh-lock-interop",
