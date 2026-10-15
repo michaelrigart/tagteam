@@ -20,10 +20,11 @@ use tagteam_engine::settings::Settings;
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::{Engine, EngineError};
 use tagteam_provider::Read;
-use tagteam_provider::keychain::ReadCounts;
+use tagteam_provider::keychain::{ReadCounts, ReadTally};
 use tagteam_provider::process::Liveness;
 
 use crate::auto::{AutoFlags, auto_config, no_switch};
+use crate::backoff::KeychainBackoff;
 use crate::events::{AutoEvents, DaemonEvent, DaemonSink, Mode, StopReason, WaitingFor};
 use crate::scheduler::{Job, JobCx, Ran};
 use crate::status::{LastOutcome, LastSwitch, OutcomeKind, ProviderStatus, StatusBoard};
@@ -113,6 +114,7 @@ struct Shown {
     mode: Mode,
     waiting_for: Option<WaitingFor>,
     holder_pid: Option<u32>,
+    backoff: bool,
 }
 
 /// A run's work, done: its own next delay, and whether it made a switch.
@@ -178,6 +180,8 @@ pub struct ProviderJob<'e> {
     /// `collect`'s quarantine report (Decision 6), started afresh on each entry into
     /// `collect`: a tick reported everything before it.
     quarantines: QuarantineWatch,
+    /// D4.1: the keychain backoff, which carries over a mode change.
+    backoff: KeychainBackoff,
     /// `None` before the first evaluation.
     mode: Option<Mode>,
     waiting_for: Option<WaitingFor>,
@@ -215,6 +219,7 @@ impl<'e> ProviderJob<'e> {
             cfg,
             auto: None,
             quarantines: QuarantineWatch::new(),
+            backoff: KeychainBackoff::new(),
             mode: None,
             waiting_for: None,
             holder_pid: None,
@@ -229,6 +234,15 @@ impl<'e> ProviderJob<'e> {
 
     fn now_s(&self) -> i64 {
         self.engine.now_ms().div_euclid(1000)
+    }
+
+    /// The secret reads made so far, over every Keychain instance the job was given (D4.1).
+    fn reads(&self) -> ReadTally {
+        self.ctx
+            .keychain_counts
+            .iter()
+            .map(|c| c.tally())
+            .fold(ReadTally::default(), |sum, t| sum + t)
     }
 
     /// The pid the engine lock's record names, when that process is live by an exact pid and
@@ -320,9 +334,10 @@ impl<'e> ProviderJob<'e> {
             if mode == Mode::Collect {
                 self.quarantines = QuarantineWatch::new();
             }
-            // A mode that works starts with its work.
-            self.work_due_ms = self.engine.now_ms();
-            self.work_delay_ms = 0;
+            // A mode that works starts with its work, once a keychain backoff lets it (D4.3).
+            let now = self.engine.now_ms();
+            self.work_due_ms = self.backoff.until_ms().map_or(now, |until| until.max(now));
+            self.work_delay_ms = self.work_due_ms - now;
         }
         self.mode = Some(mode);
         self.waiting_for = waiting_for;
@@ -330,33 +345,53 @@ impl<'e> ProviderJob<'e> {
         self.announce(cx);
     }
 
-    /// D4.3: a mode change is a `mode` event (D5.5) and an INFO line (D11).
+    /// D4.3: a mode change, and a keychain backoff starting or ending, is a `mode` event
+    /// (D5.5) and an INFO line (D11).
     fn announce(&mut self, cx: &JobCx<'_>) {
         let Some(mode) = self.mode else {
             return;
         };
+        let backoff = self.backoff.current();
         let shown = Shown {
             mode,
             waiting_for: self.waiting_for,
             holder_pid: self.holder_pid,
+            backoff: backoff.is_some(),
         };
         if self.shown == Some(shown) {
             return;
         }
+        let moved = self.shown.is_none_or(|s| {
+            (s.mode, s.waiting_for, s.holder_pid) != (mode, self.waiting_for, self.holder_pid)
+        });
         self.shown = Some(shown);
-        tracing::info!(
-            provider = %self.provider,
-            mode = mode.as_str(),
-            waiting_for = self.waiting_for.map(|w| w.as_str()),
-            holder_pid = self.holder_pid,
-            "the provider's daemon mode changed"
-        );
+        if moved {
+            tracing::info!(
+                provider = %self.provider,
+                mode = mode.as_str(),
+                waiting_for = self.waiting_for.map(|w| w.as_str()),
+                holder_pid = self.holder_pid,
+                backoff_until = backoff.map(|b| b.until),
+                "the provider's daemon mode changed"
+            );
+        } else if let Some(b) = backoff {
+            tracing::info!(
+                provider = %self.provider,
+                until = b.until,
+                "the keychain looks locked, so the provider's runs back off"
+            );
+        } else {
+            tracing::info!(
+                provider = %self.provider,
+                "the keychain answered, so the provider's backoff ended"
+            );
+        }
         cx.sink.emit(&DaemonEvent::Mode {
             provider: self.provider.clone(),
             mode,
             waiting_for: self.waiting_for,
             holder_pid: self.holder_pid,
-            backoff: None,
+            backoff,
         });
     }
 
@@ -375,7 +410,8 @@ impl<'e> ProviderJob<'e> {
         });
     }
 
-    /// One run: the mode first, then its work when the work's deadline has come.
+    /// One run: the mode first, then its work when the work's deadline has come. A keychain
+    /// backoff moves that deadline later, never earlier (D4.1, D4.3).
     fn step(&mut self, cx: &mut JobCx<'_>) -> Ran {
         let now = self.engine.now_ms();
         // D4.2: a wall clock set back never stretches the wait past the delay it was set for.
@@ -396,6 +432,8 @@ impl<'e> ProviderJob<'e> {
             return Ran::After((self.work_due_ms - now).clamp(1, RECHECK_MS));
         }
         self.last_tick_at = Some(now.div_euclid(1000));
+        // D4.1: every secret read the run makes, whether it collects, freshens or switches.
+        let before = self.reads();
         let worked = if self.mode == Some(Mode::Auto) {
             self.tick(cx)
         } else {
@@ -404,11 +442,17 @@ impl<'e> ProviderJob<'e> {
         let Some(worked) = worked else {
             return Ran::Stop(StopReason::Signal);
         };
+        let reads = self.reads().since(before);
         self.after_run_notices(cx, worked.switched);
         let now = self.engine.now_ms();
-        self.work_delay_ms = worked.delay_ms;
-        self.work_due_ms = now + worked.delay_ms;
-        Ran::After(worked.delay_ms.clamp(1, RECHECK_MS))
+        let delay_ms = match self.backoff.after_run(reads, now) {
+            Some(backoff_ms) => worked.delay_ms.max(backoff_ms),
+            None => worked.delay_ms,
+        };
+        self.announce(cx);
+        self.work_delay_ms = delay_ms;
+        self.work_due_ms = now + delay_ms;
+        Ran::After(delay_ms.clamp(1, RECHECK_MS))
     }
 
     /// D4.3 `auto`: one §11.2 tick, settled as `tagteam auto` settles one (§11.4), its delay
@@ -613,7 +657,7 @@ impl<'e> ProviderJob<'e> {
             autoswitch: self.settings.daemon_autoswitch,
             waiting_for: self.waiting_for,
             holder_pid: self.holder_pid,
-            backoff: None,
+            backoff: self.backoff.current(),
             last_tick_at: self.last_tick_at,
             next_tick_at: works.then(|| self.work_due_ms.div_euclid(1000)),
             last_outcome: self.last_outcome.clone(),
@@ -1383,5 +1427,219 @@ mod tests {
                 trigger: trigger.as_str().to_owned(),
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use tagteam_engine::vault::SERVICE;
+    use tagteam_provider::{Clock, Keychain};
+
+    use super::*;
+    use crate::events::Backoff;
+    use crate::testutil::{Emitted, Fx, T0, board, cc, job_ctx, status, two};
+
+    /// The job's context with the fixture keychain's read counts, as macOS gives them
+    /// (Decision 7: one keychain serves the provider and the vault here).
+    fn counted(fx: &Fx, board: &Arc<StatusBoard>) -> ProviderJobCtx {
+        ProviderJobCtx {
+            keychain_counts: vec![
+                fx.kc
+                    .read_counts()
+                    .expect("the fake keychain counts its reads"),
+            ],
+            ..job_ctx(board)
+        }
+    }
+
+    /// Each `mode` event of `of`, with its backoff: (seconds after `T0`, mode, backoff).
+    fn backoffs(events: &Emitted<'_>, of: &ProviderId) -> Vec<(i64, Mode, Option<Backoff>)> {
+        events
+            .events()
+            .into_iter()
+            .filter_map(|(at, e)| match e {
+                DaemonEvent::Mode {
+                    provider,
+                    mode,
+                    backoff,
+                    ..
+                } if provider == *of => Some((at, mode, backoff)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The fetch error each `usage` event reported for position `at`.
+    fn fetch_errors(events: &Emitted<'_>, at: u32) -> Vec<String> {
+        events
+            .events()
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                DaemonEvent::Usage { fetch_errors, .. } => fetch_errors.get(&at).cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_locked_keychain_backs_the_provider_off_doubling_to_900_s_until_a_read_is_answered() {
+        // D4.1: one account, never read, so each round that may fetch reads its live
+        // credential. Each round whose reads all end locked doubles the wait, from 60 s to at
+        // most 900 s, and the first round with an answered read ends it. The round at 60 s
+        // finds the first round's usage lease still held (90 s, §8.3), so it reads nothing,
+        // and a run with no read leaves the backoff as it was: 60 s again. The account's own
+        // failure backoff (§8.5) always ends before the next round. The backoff's start and
+        // its end are `mode` events; doubling is not.
+        let fx = Fx::new();
+        fx.add("a@x.co");
+        fx.kc.set_locked(true);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), counted(&fx, &board));
+        let mut gaps = Vec::new();
+        for _ in 0..7 {
+            job.run(&mut cx);
+            let s = status(&board, &cc());
+            let now = fx.clock.now_ms().div_euclid(1000);
+            let until = s.backoff.expect("backing off").until;
+            assert_eq!(s.next_tick_at, Some(until), "the next round waits for it");
+            gaps.push(until - now);
+            fx.clock.set(until * 1000);
+        }
+        assert_eq!(gaps, [60, 60, 120, 240, 480, 900, 900]);
+        fx.kc.set_locked(false);
+        job.run(&mut cx);
+        assert_eq!(status(&board, &cc()).backoff, None);
+        assert_eq!(
+            backoffs(&events, &cc()),
+            [
+                (0, Mode::Collect, None),
+                (0, Mode::Collect, Some(Backoff { until: T0 + 60 })),
+                (2_760, Mode::Collect, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_item_beside_answered_reads_starts_no_backoff() {
+        // A read that fails for one item (not a locked keychain) is not counted, and the live
+        // credential's answered read shows the keychain unlocked.
+        let fx = Fx::new();
+        let (a, _) = two(&fx);
+        fx.settings("[daemon]\nautoswitch = false\n", 1);
+        fx.kc.set_unreadable(SERVICE, a.as_str(), true);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), counted(&fx, &board));
+        job.run(&mut cx);
+        assert_eq!(fetch_errors(&events, 1), ["keychain-unavailable"]);
+        assert_eq!(status(&board, &cc()).backoff, None);
+        assert_eq!(backoffs(&events, &cc()), [(0, Mode::Collect, None)]);
+    }
+
+    #[test]
+    fn a_run_that_reads_no_secret_starts_no_backoff() {
+        // Locked, but nothing is due: the round reads no secret, so it changes nothing.
+        let fx = Fx::new();
+        let a = fx.add("a@x.co");
+        fx.read(&a, 10.0, 10.0, T0, T0 + 300);
+        fx.kc.set_locked(true);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let counts = fx.kc.read_counts().unwrap();
+        let before = counts.tally();
+        let mut job = ProviderJob::new(&fx.engine, cc(), counted(&fx, &board));
+        job.run(&mut cx);
+        assert_eq!(
+            counts.tally(),
+            before,
+            "nothing was due, so nothing was read"
+        );
+        let s = status(&board, &cc());
+        assert_eq!((s.backoff, s.next_tick_at), (None, Some(T0 + 60)));
+    }
+
+    #[test]
+    fn pausing_during_a_backoff_frees_the_lock_at_once_and_the_delayed_run_collects() {
+        // D4.3: the mode is evaluated before the backoff applies. Pausing drops the engine
+        // and its lock at once; the backoff carries over, and the run it delays is a
+        // `collect` round, never a tick.
+        let fx = Fx::new();
+        two(&fx);
+        fx.kc.set_locked(true);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), counted(&fx, &board));
+        job.run(&mut cx);
+        fx.settings("[daemon]\nautoswitch = false\n", 1);
+        job.settings_changed(&mut cx);
+        assert!(matches!(fx.engine.engine_holder(&cc()), Read::Absent));
+        let free = auto_config(&Settings::default(), &AutoFlags::default(), Some("7d"));
+        assert!(fx.engine.auto(&cc(), free, false).unwrap().is_some());
+        let backoff = Some(Backoff { until: T0 + 60 });
+        assert_eq!(
+            backoffs(&events, &cc()),
+            [
+                (0, Mode::Auto, None),
+                (0, Mode::Auto, backoff),
+                (0, Mode::Collect, backoff),
+            ]
+        );
+        // Before the backoff ends the job only looks; at its end it runs a `collect` round.
+        assert_eq!(job.run(&mut cx), Ran::After(60_000));
+        assert_eq!(status(&board, &cc()).last_tick_at, Some(T0));
+        fx.clock.advance_ms(60_000);
+        job.run(&mut cx);
+        let s = status(&board, &cc());
+        assert_eq!(
+            (s.mode, s.last_tick_at, s.last_outcome.map(|o| o.kind)),
+            (Mode::Collect, Some(T0 + 60), Some(OutcomeKind::Collect))
+        );
+        assert_eq!(events.polls(&cc()), [0], "no tick after the pause");
+    }
+
+    #[test]
+    fn without_keychain_counts_a_provider_never_backs_off() {
+        // Linux: no Keychain, so no counts, whatever the reads came to.
+        let fx = Fx::new();
+        fx.add("a@x.co");
+        fx.kc.set_locked(true);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), job_ctx(&board));
+        job.run(&mut cx);
+        assert_eq!(fetch_errors(&events, 1), ["keychain-unavailable"]);
+        let s = status(&board, &cc());
+        assert_eq!((s.backoff, s.next_tick_at), (None, Some(T0 + 60)));
     }
 }
