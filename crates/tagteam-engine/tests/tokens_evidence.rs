@@ -1950,3 +1950,25 @@ fn a_pending_file_replaced_during_the_scan_is_kept_for_the_next_one() {
     assert_eq!(ended(&fx), [(a.to_string(), Some(NOW - 1_000))]);
     assert!(!file.exists());
 }
+
+#[test]
+fn remove_fails_before_deleting_anything_when_the_store_refuses_the_pending_launches() {
+    // Spec §13: the launches are recorded before the vault entry, the rescue files or the
+    // profile go, so a store that refuses them fails the remove with the account as it was.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live
+    let profile = fx.make_profile(&a);
+    let file = pending(&fx, &profile, &a, NOW - 5_000, None, 4242);
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute_batch("DROP TABLE run_launches")
+        .unwrap();
+
+    let err = fx.engine.remove(&a).unwrap_err();
+
+    assert_eq!(err.kind(), "store", "{err}");
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    assert!(profile.exists() && file.exists(), "the profile is kept");
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
+}

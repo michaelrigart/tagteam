@@ -2483,3 +2483,35 @@ fn purge_provider_deletes_the_token_rows() {
         "and no other provider's"
     );
 }
+
+#[test]
+fn a_purge_forgets_pending_launches_and_a_store_that_refuses_them_never_stops_it() {
+    // Token report spec §13: a purge empties the token tables, so it does not record a
+    // profile's pending launches; a `run_launches` that cannot be written leaves nothing
+    // unpurged, and the pending file goes with the profile.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live
+    let profile = fx.make_profile(&a);
+    tagteam_provider::PendingLaunch {
+        provider: fx.provider(),
+        account_id: a.clone(),
+        started_at_ms: 1_790_000_000_000,
+        ended_at_ms: None,
+    }
+    .write(&profile, 4242)
+    .unwrap();
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse BEFORE INSERT ON run_launches \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .unwrap();
+
+    let report = fx.engine.purge(&full_plan(&fx)).unwrap();
+
+    assert_eq!(report.failures, Vec::<(String, String)>::new());
+    assert!(!profile.exists(), "the profile and its pending file go");
+    assert!(report.store_emptied);
+}

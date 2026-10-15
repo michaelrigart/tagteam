@@ -22,6 +22,7 @@ use tagteam_core::AccountId;
 use tagteam_engine::EngineError;
 use tagteam_engine::bootstrap::Trigger;
 use tagteam_engine::store::AccountRow;
+use tagteam_provider::PendingLaunch;
 use tagteam_provider::process::{Captured, ProcessSpawner, SpawnSpec};
 use tagteam_provider::profile::{MARKER_FILE, ProfileMarker, Seed};
 use tagteam_provider::splice::get_top_level;
@@ -712,6 +713,74 @@ fn an_invalid_login_at_bootstrap_deletes_the_profile_and_refuses() {
         assert_eq!(err.kind(), "login-invalid", "{err}");
         assert!(!profile.exists(), "the profile is deleted: {err}");
     }
+}
+
+/// A launch of `id` that only its profile's pending file holds (token report spec §6.1).
+fn pending_launch(fx: &Fx, profile: &Path, id: &AccountId) {
+    let p = fx.engine.provider(&fx.provider()).unwrap();
+    fx.make_profile_for(p.as_ref(), id);
+    PendingLaunch {
+        provider: fx.provider(),
+        account_id: id.clone(),
+        started_at_ms: 1_790_000_000_000,
+        ended_at_ms: Some(1_790_000_005_000),
+    }
+    .write(profile, 4242)
+    .unwrap();
+}
+
+#[test]
+fn an_invalid_login_at_bootstrap_records_the_pending_launches_before_it_deletes_the_profile() {
+    // Token report spec §13: every deleter of a profile records its pending launches first, or
+    // the launch is lost and its responses go to the default home.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = fx.profile_dir(&a);
+    pending_launch(&fx, &profile, &a);
+    let (code, body) = (1, auth_logged_out(&fx.spelling_for(&profile)));
+    fx.script_auth(code, &body);
+
+    let err = fx
+        .engine
+        .bootstrap_quiescent(&a, &fx.work_dir("app"))
+        .unwrap_err();
+
+    assert_eq!(err.kind(), "login-invalid", "{err}");
+    assert!(!profile.exists(), "the profile is deleted");
+    let launches = fx.engine.store().unwrap().launches(&fx.provider()).unwrap();
+    assert_eq!(
+        launches
+            .iter()
+            .map(|l| (l.account_id.as_str(), l.started_at, l.ended_at))
+            .collect::<Vec<_>>(),
+        [(a.as_str(), 1_790_000_000_000, Some(1_790_000_005_000))]
+    );
+}
+
+#[test]
+fn an_invalid_login_keeps_the_profile_when_the_store_refuses_its_pending_launches() {
+    // Nothing is lost: the launch stays in its file, with the profile, and the store's error is
+    // what the launch is refused with.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let profile = fx.profile_dir(&a);
+    pending_launch(&fx, &profile, &a);
+    fx.engine.store().unwrap();
+    rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .execute_batch("DROP TABLE run_launches")
+        .unwrap();
+    let (code, body) = (1, auth_logged_out(&fx.spelling_for(&profile)));
+    fx.script_auth(code, &body);
+
+    let err = fx
+        .engine
+        .bootstrap_quiescent(&a, &fx.work_dir("app"))
+        .unwrap_err();
+
+    assert_eq!(err.kind(), "store", "{err}");
+    assert!(profile.exists(), "the profile is kept");
+    assert_eq!(PendingLaunch::read_all(&profile).len(), 1, "with its file");
 }
 
 #[test]

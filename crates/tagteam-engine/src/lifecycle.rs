@@ -290,6 +290,18 @@ pub(crate) enum UnlistedRescues {
     Skip,
 }
 
+/// Whether deleting a profile records the launches it holds in pending files (token report
+/// spec §6.1, §13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingLaunches {
+    /// Every deleter of a profile but a purge: the launches go to the store first, and a store
+    /// that refuses them stops the delete with the profile as it was.
+    Record,
+    /// A purge, which empties the token tables anyway: it forgets them, and a store that
+    /// cannot take them never leaves an account unpurged.
+    Forget,
+}
+
 impl Engine {
     pub(crate) fn event(
         &self,
@@ -315,9 +327,10 @@ impl Engine {
     }
 
     /// §10.3's order: the vault entries (strict), then the account's rescue files (§6.3: each
-    /// holds a live refresh token, readable or not, and none is left behind), then the pending
-    /// launches of the session profile, recorded in the store (token report spec §13), then the
-    /// session profile (`remove_profile`), and last the row (which cascades). The vault goes first, so
+    /// holds a live refresh token, readable or not, and none is left behind), then the session
+    /// profile (`remove_profile`), and last the row (which cascades). Before the vault goes, the
+    /// pending launches of the session profile are recorded in the store (token report spec
+    /// §13), except in a purge. The vault goes first, so
     /// no generation older than a rescue or a rotated profile can outlive it: an account
     /// without a vault credential is never switched to, refreshed or launched. Anything that
     /// fails stops before the row goes, so the account stays listed and the remove can be run
@@ -334,6 +347,7 @@ impl Engine {
         row: &AccountRow,
         lock: &AccountLock,
         unlisted: UnlistedRescues,
+        pending: PendingLaunches,
     ) -> Result<usize, EngineError> {
         self.reconcile_replacement_as(lock, Reconcile::Removing)?;
         let p = self.provider(&row.provider)?;
@@ -346,14 +360,16 @@ impl Engine {
         };
         // Asked again at the deletion, where the vault's file goes first (a second line).
         self.refuse_live_vault_files(row)?;
+        // Token report spec §13: before anything is deleted, so a store that refuses the
+        // launches fails the remove with the account as it was. `remove_profile` looks again.
+        if pending == PendingLaunches::Record {
+            self.record_pending_launches_of(p.as_ref(), &row.id)?;
+        }
         self.vault.delete(lock)?;
         for path in &rescues {
             self.delete_rescue(path)?;
         }
-        // Token report spec §13: a launch the profile still holds only in a pending file is
-        // recorded before the profile goes.
-        self.record_pending_launches_of(p.as_ref(), &row.id)?;
-        self.remove_profile(p.as_ref(), row)?;
+        self.remove_profile(p.as_ref(), row, pending)?;
         self.store()?.delete_account(&row.id)?;
         self.event(&row.provider, "remove", Some(&row.id), None)?;
         Ok(rescues.len())
@@ -559,6 +575,7 @@ impl Engine {
         &self,
         p: &dyn Provider,
         row: &AccountRow,
+        pending: PendingLaunches,
     ) -> Result<(), EngineError> {
         let profile = profile_path(&self.env, &row.id);
         let meta = match fs::symlink_metadata(&profile) {
@@ -566,6 +583,11 @@ impl Engine {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e.into()),
         };
+        // Token report spec §13: a launch the profile holds only in a pending file is recorded
+        // before the profile goes, whoever deletes it; a record that fails deletes nothing.
+        if pending == PendingLaunches::Record {
+            self.record_pending_launches_of(p, &row.id)?;
+        }
         // §10.5 step 6: a session profile is a directory under `sessions/`. A link there is not
         // one, so no Keychain item is named through it, by its marker or by the path it leads
         // to: the link goes, and what it led to stays as it is.
@@ -789,7 +811,12 @@ impl Engine {
             }
         }
         if let Some(occupant) = &prep.occupant {
-            self.remove_locked(occupant, lock_for(&occupant.id), UnlistedRescues::Refuse)?;
+            self.remove_locked(
+                occupant,
+                lock_for(&occupant.id),
+                UnlistedRescues::Refuse,
+                PendingLaunches::Record,
+            )?;
         }
         let current = store.account(&prep.id)?.ok_or(StoreError::NoSuchAccount)?;
         if let Some(pos) = position.filter(|pos| *pos != current.position) {
@@ -1062,7 +1089,12 @@ impl Engine {
         // before the remove is done (§12.5).
         let p = self.provider(&row.provider)?;
         self.refuse_destroying(p.as_ref(), &row)?;
-        self.remove_locked(&row, &lock, UnlistedRescues::Refuse)?;
+        self.remove_locked(
+            &row,
+            &lock,
+            UnlistedRescues::Refuse,
+            PendingLaunches::Record,
+        )?;
         Ok(row)
     }
 
