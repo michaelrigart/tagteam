@@ -1,6 +1,6 @@
 # tagteam — sub-project 2: the daemon
 
-**Status:** Approved
+**Status:** In progress
 **Date:** 2026-10-14
 **Scope:** Sub-project 2 of 4. It builds on sub-project 1, whose spec,
 [`2026-09-26-tagteam-core-cli-design.md`](2026-09-26-tagteam-core-cli-design.md) (the "core
