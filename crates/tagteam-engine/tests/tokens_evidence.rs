@@ -1870,9 +1870,11 @@ fn a_scan_records_a_pending_file_it_cannot_use_as_a_launch_open_from_its_name() 
     let in_use = FlockGuard::try_lock(&profile.join(LAUNCH_DIR).join("4242.lock"))
         .unwrap()
         .unwrap();
-    let unreadable = pending(&fx, &profile, &a, NOW - 9_000, Some(NOW - 8_000), 6);
+    // Past the store's epoch, `NOW`, before which a name's start is not taken.
+    fx.clock.advance_ms(10_000);
+    let unreadable = pending(&fx, &profile, &a, NOW + 1_000, Some(NOW + 2_000), 6);
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
-    let torn = PendingLaunch::path(&profile, NOW - 5_000, 7);
+    let torn = PendingLaunch::path(&profile, NOW + 5_000, 7);
     fs::write(&torn, "{ torn").unwrap();
 
     assert_eq!(sight(&fx), 2);
@@ -1883,8 +1885,8 @@ fn a_scan_records_a_pending_file_it_cannot_use_as_a_launch_open_from_its_name() 
     assert_eq!(
         starts,
         [
-            (a.to_string(), NOW - 9_000, None),
-            (a.to_string(), NOW - 5_000, None)
+            (a.to_string(), NOW + 1_000, None),
+            (a.to_string(), NOW + 5_000, None)
         ]
     );
     assert_eq!(
@@ -1899,10 +1901,48 @@ fn a_scan_records_a_pending_file_it_cannot_use_as_a_launch_open_from_its_name() 
     assert_eq!(
         ended(&fx),
         [
-            (a.to_string(), Some(NOW + 1_000)),
-            (a.to_string(), Some(NOW + 1_000))
+            (a.to_string(), Some(NOW + 11_000)),
+            (a.to_string(), Some(NOW + 11_000))
         ]
     );
+}
+
+#[test]
+fn a_start_a_file_s_name_gives_before_the_epoch_is_not_taken() {
+    // Spec §6.1: a start from a file's name is taken only from the store's epoch on, so a stray
+    // `0-1.json` never makes every unsighted response since unattributed. Such a file is skipped
+    // and kept. A start at the epoch or later is taken, one in the future too, and a file that
+    // parses keeps its own start, whatever it is.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let _in_use = FlockGuard::try_lock(&profile.join(LAUNCH_DIR).join("4242.lock"))
+        .unwrap()
+        .unwrap();
+    let epoch = fx
+        .engine
+        .store()
+        .unwrap()
+        .token_epoch()
+        .unwrap()
+        .unwrap()
+        .at;
+    pending(&fx, &profile, &a, epoch - 5_000, None, 1);
+    let torn = |started_at: i64, pid: u32| {
+        let file = PendingLaunch::path(&profile, started_at, pid);
+        fs::write(&file, "{ torn").unwrap();
+        file
+    };
+    let stray = torn(0, 2);
+    let before = torn(epoch - 1, 3);
+    let at = torn(epoch, 4);
+    let future = torn(epoch + 60_000, 5);
+
+    assert_eq!(sight(&fx), 3);
+    let starts: Vec<_> = launches(&fx).into_iter().map(|l| l.started_at).collect();
+    assert_eq!(starts, [epoch - 5_000, epoch, epoch + 60_000]);
+    assert!(stray.exists() && before.exists(), "skipped and kept");
+    assert!(!at.exists() && !future.exists());
 }
 
 #[test]
@@ -2039,7 +2079,9 @@ fn remove_records_a_pending_file_it_cannot_read_as_a_launch_open_from_its_name()
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b"); // live
     let profile = fx.make_profile(&a);
-    let file = pending(&fx, &profile, &a, NOW - 5_000, Some(NOW - 1_000), 4242);
+    // Past the store's epoch, `NOW`, before which a name's start is not taken.
+    fx.clock.advance_ms(10_000);
+    let file = pending(&fx, &profile, &a, NOW + 5_000, Some(NOW + 9_000), 4242);
     fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
     fs::write(profile.join(PENDING_LAUNCH_DIR).join("torn.json"), "{ torn").unwrap();
 
@@ -2050,7 +2092,7 @@ fn remove_records_a_pending_file_it_cannot_read_as_a_launch_open_from_its_name()
         .into_iter()
         .map(|l| (l.account_id, l.started_at, l.ended_at))
         .collect();
-    assert_eq!(recorded, [(a.to_string(), NOW - 5_000, None)]);
+    assert_eq!(recorded, [(a.to_string(), NOW + 5_000, None)]);
 }
 
 #[test]

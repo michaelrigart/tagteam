@@ -133,7 +133,8 @@ impl Engine {
                 }
             }
         }
-        for (file, pending) in self.pending_launches(p) {
+        let epoch_ms = store.token_epoch()?.map(|e| e.at);
+        for (file, pending) in self.pending_launches(p, epoch_ms) {
             changed += self.record_pending(&store, &file, &pending)?;
         }
         for launch in store.launches(&provider)? {
@@ -193,7 +194,11 @@ impl Engine {
     /// cannot be used stands for by its name (`launch_of`). Any other file is skipped and logged
     /// at debug, never removed, and so is a directory that cannot be listed: one bad file never
     /// fails a scan or a report.
-    pub(crate) fn pending_launches(&self, p: &dyn Provider) -> Vec<(PendingFile, PendingLaunch)> {
+    pub(crate) fn pending_launches(
+        &self,
+        p: &dyn Provider,
+        epoch_ms: Option<i64>,
+    ) -> Vec<(PendingFile, PendingLaunch)> {
         let provider = p.id();
         let mut found = Vec::new();
         for (home, _) in self.homes(p) {
@@ -215,7 +220,7 @@ impl Engine {
             found.extend(
                 entries
                     .into_iter()
-                    .filter_map(|entry| launch_of(entry, &provider, &account)),
+                    .filter_map(|entry| launch_of(entry, &provider, &account, epoch_ms)),
             );
         }
         found
@@ -278,14 +283,15 @@ impl Engine {
             Read::Absent => return Ok(()),
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         };
-        let launches: Vec<_> = entries
-            .into_iter()
-            .filter_map(|entry| launch_of(entry, &p.id(), account))
-            .collect();
-        if launches.is_empty() {
+        if entries.is_empty() {
             return Ok(());
         }
         let store = self.store()?;
+        let epoch_ms = store.token_epoch()?.map(|e| e.at);
+        let launches: Vec<_> = entries
+            .into_iter()
+            .filter_map(|entry| launch_of(entry, &p.id(), account, epoch_ms))
+            .collect();
         for (file, pending) in &launches {
             self.record_pending(&store, file, pending)?;
         }
@@ -668,12 +674,15 @@ impl Engine {
 /// The pending launch `entry` stands for in `account`'s profile (spec §6.1): the one it holds,
 /// if it names `provider` and `account`; for a file whose content cannot be used (unreadable,
 /// or not a pending launch), a launch of `account` open from its name's start. A file that
-/// names another provider or account, or whose name gives no start, stands for none; it is
-/// logged at debug.
+/// names another provider or account, or whose name gives no start, or a start before the
+/// store's epoch (`epoch_ms`, when the store has one), stands for none; it is logged at debug.
+/// The bound keeps a stray name from covering all of the past; a start in the future covers
+/// nothing yet.
 fn launch_of(
     entry: PendingEntry,
     provider: &ProviderId,
     account: &AccountId,
+    epoch_ms: Option<i64>,
 ) -> Option<(PendingFile, PendingLaunch)> {
     match entry {
         PendingEntry::Launch(file, pending)
@@ -685,6 +694,13 @@ fn launch_of(
             tracing::debug!(
                 "a pending launch file names another provider or account than its profile's; skipped"
             );
+            None
+        }
+        PendingEntry::Unusable {
+            started_at_ms: Some(started_at_ms),
+            ..
+        } if epoch_ms.is_some_and(|epoch| started_at_ms < epoch) => {
+            tracing::debug!("a pending launch file's name gives a start before the epoch; skipped");
             None
         }
         PendingEntry::Unusable {

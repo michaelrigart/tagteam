@@ -18,7 +18,7 @@ use super::{
     AccountSel, ActiveBlock, Basis, Cost, PeriodKey, RowAccount, RowKey, TokenCounts,
     TokenGrouping, TokenPeriod, TokenQuery, TokenRow, TokenTotal,
 };
-use crate::store::{AccountRow, EventRow, LaunchRow, Store, StoreError, UsageRow};
+use crate::store::{AccountRow, EpochRow, EventRow, LaunchRow, Store, StoreError, UsageRow};
 
 /// How far before `since` a block report reads (spec §9). A block that straddles `since` is
 /// then whole, and the chain of inferred blocks leading to it starts after a quiet gap of five
@@ -49,6 +49,8 @@ pub(super) fn usage(q: &TokenQuery, store: &Store) -> Result<Vec<UsageRow>, Stor
 
 /// What `Engine::token_report` reads for `group`, in the order it reads it (spec §7.2).
 pub(super) struct Reads {
+    /// The epoch (spec §7.2); `None` after a full purge, before the next refresh begins.
+    pub(super) epoch: Option<EpochRow>,
     /// The responses `usage` read for the query.
     pub(super) usage: Vec<UsageRow>,
     /// The launches `run` kept in pending files (spec §6.1), placed as stored ones.
@@ -252,7 +254,7 @@ impl Evidence {
         );
         // No epoch row (after a full purge, before the next refresh completes): every time is
         // before it, and coverage is never complete.
-        let epoch = store.token_epoch()?;
+        let epoch = reads.epoch;
         let epoch_ms = epoch.map_or(i64::MAX, |e| e.at);
         let events: Vec<TimelineEvent> = store
             .events()?
