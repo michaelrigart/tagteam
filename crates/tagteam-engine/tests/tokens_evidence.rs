@@ -55,6 +55,7 @@ fn record(fx: &Fx, home: &Path, pid: u32, session: &str, started_at: i64, kind: 
 fn sighting(
     session: &str,
     home: &str,
+    started_at: i64,
     first_at: i64,
     last_at: i64,
     source: SightingSource,
@@ -63,6 +64,7 @@ fn sighting(
     SightingRow {
         session_id: session.into(),
         home: home.into(),
+        started_at,
         first_at,
         last_at,
         source,
@@ -115,8 +117,9 @@ fn set_mtime(path: &Path, secs: u64) {
 
 #[test]
 fn a_scan_sights_live_records_in_every_home() {
-    // Spec §6.2: every live record in the default home and in each profile, keyed by its
-    // `startedAt`, extended at most once a minute (spec §6.4).
+    // Spec §6.2: every live record in the default home and in each profile, its execution keyed
+    // by its `startedAt`, sighted from the scan's read and extended at most once a minute (spec
+    // §6.4).
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     let profile = fx.make_profile(&a);
@@ -137,8 +140,8 @@ fn a_scan_sights_live_records_in_every_home() {
     assert_eq!(
         sightings(&fx),
         [
-            sighting("s-default", "", NOW - 5_000, NOW, scan, NOW),
-            sighting("s-profile", a.as_str(), NOW - 9_000, NOW, scan, NOW),
+            sighting("s-default", "", NOW - 5_000, NOW, NOW, scan, NOW),
+            sighting("s-profile", a.as_str(), NOW - 9_000, NOW, NOW, scan, NOW),
         ]
     );
 
@@ -150,8 +153,66 @@ fn a_scan_sights_live_records_in_every_home() {
     assert_eq!(
         sightings(&fx),
         [
-            sighting("s-default", "", NOW - 5_000, later, scan, later),
-            sighting("s-profile", a.as_str(), NOW - 9_000, later, scan, later),
+            sighting("s-default", "", NOW - 5_000, NOW, later, scan, later),
+            sighting(
+                "s-profile",
+                a.as_str(),
+                NOW - 9_000,
+                NOW,
+                later,
+                scan,
+                later
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_scan_starts_a_tenure_at_its_read_and_continues_the_latest() {
+    // Spec §6.2, §6.4: a record's `startedAt` is its execution, not when its session entered it.
+    // A first scan of an execution an hour old sights the session from the scan on; later scans
+    // continue that tenure. A session the record names after `/clear` starts its own tenure at
+    // the scan that reads it, and a return to the first one (`/resume`), once the execution was
+    // seen naming another, starts a new tenure rather than bridging the gap.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let home = fx.paths().config_home;
+    let started = NOW - 3_600_000;
+    running(&fx, 101, None);
+    record(&fx, &home, 101, "s-1", started, "interactive");
+    let scan = SightingSource::Scan;
+    let seen = |session: &str, first: i64, last: i64| {
+        sighting(session, "", started, first, last, scan, last)
+    };
+
+    assert_eq!(sight(&fx), 1);
+    assert_eq!(sightings(&fx), [seen("s-1", NOW, NOW)]);
+    fx.clock.advance_ms(61_000);
+    assert_eq!(sight(&fx), 1);
+    assert_eq!(sightings(&fx), [seen("s-1", NOW, NOW + 61_000)]);
+
+    record(&fx, &home, 101, "s-2", started, "interactive");
+    fx.clock.advance_ms(10_000);
+    assert_eq!(sight(&fx), 1);
+    let cleared = NOW + 71_000;
+    assert_eq!(
+        sightings(&fx),
+        [
+            seen("s-1", NOW, NOW + 61_000),
+            seen("s-2", cleared, cleared)
+        ]
+    );
+
+    record(&fx, &home, 101, "s-1", started, "interactive");
+    fx.clock.advance_ms(60_000);
+    assert_eq!(sight(&fx), 1);
+    let back = NOW + 131_000;
+    assert_eq!(
+        sightings(&fx),
+        [
+            seen("s-1", NOW, NOW + 61_000),
+            seen("s-1", back, back),
+            seen("s-2", cleared, cleared)
         ]
     );
 }
@@ -251,7 +312,7 @@ fn a_scan_closes_a_launch_at_its_idle_check_not_at_its_start() {
     let scan = SightingSource::Scan;
     assert_eq!(
         sightings(&fx),
-        [sighting("s-a", a.as_str(), NOW, NOW, scan, NOW)],
+        [sighting("s-a", a.as_str(), NOW, NOW, NOW, scan, NOW)],
         "the scan saw the child live as it began"
     );
     assert_eq!(ended(&fx), [(a.to_string(), Some(NOW + 5_000))]);
@@ -379,7 +440,15 @@ fn polling_reads_the_record_only_when_it_changed() {
     assert_eq!(state.last_sighting, Some(("s-a".to_owned(), started)));
     assert_eq!(
         sightings(&fx),
-        [sighting("s-a", a.as_str(), started, polled, run, polled)]
+        [sighting(
+            "s-a",
+            a.as_str(),
+            started,
+            started,
+            polled,
+            run,
+            polled
+        )]
     );
 
     // Rewritten under the same mtime: not read again, and the sighting it saw is extended.
@@ -393,7 +462,15 @@ fn polling_reads_the_record_only_when_it_changed() {
     let later = polled + 61_000;
     assert_eq!(
         sightings(&fx),
-        [sighting("s-a", a.as_str(), started, later, run, later)]
+        [sighting(
+            "s-a",
+            a.as_str(),
+            started,
+            started,
+            later,
+            run,
+            later
+        )]
     );
 
     // Its mtime moves: read again. `/clear` rewrites the record this way, with a new
@@ -406,8 +483,8 @@ fn polling_reads_the_record_only_when_it_changed() {
     assert_eq!(
         sightings(&fx),
         [
-            sighting("s-a", a.as_str(), started, later, run, later),
-            sighting("s-b", a.as_str(), started, later, run, later),
+            sighting("s-a", a.as_str(), started, started, later, run, later),
+            sighting("s-b", a.as_str(), started, started, later, run, later),
         ]
     );
 }
@@ -433,7 +510,15 @@ fn a_poll_that_sees_no_session_extends_none() {
     fx.engine
         .poll_launch(&id, &profile, 777, &mut state)
         .unwrap();
-    let seen = vec![sighting("s-a", a.as_str(), started, polled, run, polled)];
+    let seen = vec![sighting(
+        "s-a",
+        a.as_str(),
+        started,
+        started,
+        polled,
+        run,
+        polled,
+    )];
     assert_eq!(sightings(&fx), seen);
 
     fs::write(&path, b"{\"pid\": 777, \"sessionId\":").unwrap();
@@ -504,6 +589,7 @@ fn a_stale_record_with_a_reused_pid_is_ignored() {
             "s-new",
             a.as_str(),
             NOW + 500,
+            NOW + 500,
             NOW + 1_000,
             SightingSource::Run,
             NOW + 1_000
@@ -540,6 +626,7 @@ fn close_leaves_the_launch_open_while_a_background_session_runs() {
         sightings(&fx).contains(&sighting(
             "s-a",
             a.as_str(),
+            NOW,
             NOW,
             exit,
             SightingSource::Run,
@@ -625,6 +712,7 @@ fn close_stamps_the_sighting_at_the_exit_not_at_the_close() {
             "s-a",
             a.as_str(),
             NOW + 500,
+            NOW + 500,
             stamped,
             run,
             stamped
@@ -637,7 +725,15 @@ fn close_stamps_the_sighting_at_the_exit_not_at_the_close() {
     fx.engine.close_launch(&id, &profile, &state, t1).unwrap();
     assert_eq!(
         sightings(&fx),
-        [sighting("s-a", a.as_str(), NOW + 500, t1, run, t2)],
+        [sighting(
+            "s-a",
+            a.as_str(),
+            NOW + 500,
+            NOW + 500,
+            t1,
+            run,
+            t2
+        )],
         "the close moves it back to the exit"
     );
     assert_eq!(ended(&fx), [(a.to_string(), Some(t2))]);
@@ -691,6 +787,7 @@ fn the_statusline_extends_only_its_own_execution() {
         "s-1",
         "",
         NOW - 3_600_000,
+        NOW - 3_600_000,
         NOW - 3_000_000,
         scan,
         NOW - 3_000_000,
@@ -703,7 +800,7 @@ fn the_statusline_extends_only_its_own_execution() {
 
     fx.engine.statusline_sighting(&cc, "s-1", None).unwrap();
     let statusline = SightingSource::Statusline;
-    let ours = sighting("s-1", "", NOW - 60_000, NOW, statusline, NOW);
+    let ours = sighting("s-1", "", NOW - 60_000, NOW, NOW, statusline, NOW);
     assert_eq!(sightings(&fx), [earlier.clone(), ours.clone()]);
 
     // Within the minute, nothing is written; past it, only its own execution's sighting moves.
@@ -736,9 +833,52 @@ fn the_statusline_extends_only_its_own_execution() {
         a.as_str(),
         NOW - 1_000,
         later,
+        later,
         statusline,
         later
     )));
+}
+
+#[test]
+fn the_statusline_starts_a_tenure_at_its_read_and_continues_the_latest() {
+    // Spec §6.3, §6.4: the ancestor's record is the execution, not when the session entered it.
+    // A session the line reports is sighted from that run of the line on, however old the
+    // execution, and later runs continue its tenure. A return to it (`/resume`) after the line
+    // reported another session there starts a new tenure.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    fx.add("a@x.co", "rt-a");
+    running(&fx, std::process::id(), Some(500));
+    running(&fx, 500, Some(1));
+    let home = fx.paths().config_home;
+    let started = NOW - 3_600_000;
+    record(&fx, &home, 500, "s-1", started, "interactive");
+    let line = SightingSource::Statusline;
+    let seen = |session: &str, first: i64, last: i64| {
+        sighting(session, "", started, first, last, line, last)
+    };
+
+    fx.engine.statusline_sighting(&cc, "s-1", None).unwrap();
+    assert_eq!(sightings(&fx), [seen("s-1", NOW, NOW)]);
+    fx.clock.advance_ms(61_000);
+    fx.engine.statusline_sighting(&cc, "s-1", None).unwrap();
+    assert_eq!(sightings(&fx), [seen("s-1", NOW, NOW + 61_000)]);
+
+    record(&fx, &home, 500, "s-2", started, "interactive");
+    fx.clock.advance_ms(5_000);
+    fx.engine.statusline_sighting(&cc, "s-2", None).unwrap();
+    record(&fx, &home, 500, "s-1", started, "interactive");
+    fx.clock.advance_ms(60_000);
+    fx.engine.statusline_sighting(&cc, "s-1", None).unwrap();
+    let (cleared, back) = (NOW + 66_000, NOW + 126_000);
+    assert_eq!(
+        sightings(&fx),
+        [
+            seen("s-1", NOW, NOW + 61_000),
+            seen("s-1", back, back),
+            seen("s-2", cleared, cleared)
+        ]
+    );
 }
 
 #[test]
@@ -777,6 +917,7 @@ fn the_statusline_records_nothing_without_an_ancestor_record() {
             "",
             NOW - 5_000,
             NOW,
+            NOW,
             SightingSource::Statusline,
             NOW
         )]
@@ -806,6 +947,7 @@ fn the_statusline_never_waits_on_a_busy_store() {
         [sighting(
             "s-1",
             "",
+            NOW,
             NOW,
             NOW,
             SightingSource::Statusline,

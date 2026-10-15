@@ -315,7 +315,8 @@ fn statusline_due_a_sighting_extension_p95_is_within_10_ms() {
         rusqlite::Connection::open(&db)
             .unwrap()
             .execute(
-                "UPDATE session_sightings SET last_at = last_at - 120000",
+                "UPDATE session_sightings SET first_at = first_at - 120000, \
+                 last_at = last_at - 120000",
                 [],
             )
             .unwrap();

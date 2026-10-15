@@ -303,6 +303,7 @@ fn a_30_day_report_query_is_within_200_ms() {
         let sighting = SightingRow {
             session_id: session_of(file),
             home: "0192-bench-profile".into(),
+            started_at: now - 30 * DAY_MS,
             first_at: now - 30 * DAY_MS,
             last_at: now,
             source: SightingSource::Run,

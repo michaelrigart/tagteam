@@ -77,23 +77,26 @@ impl Engine {
                 let RecordEntry::Record(r) = entry else {
                     continue;
                 };
-                let (Some(session_id), Some(first_at)) = (r.session_id.clone(), r.started_at_ms)
+                let (Some(session_id), Some(started_at)) = (r.session_id.clone(), r.started_at_ms)
                 else {
                     continue;
                 };
                 if !record_is_live(self.process.as_ref(), &r, p.launch_command()) {
                     continue;
                 }
+                // The read names the session now, and says nothing of when it entered the
+                // execution: the latest tenure goes on, or one starts now (spec §6.4).
                 let now = self.now_ms();
                 let row = SightingRow {
                     session_id,
                     home: home.clone(),
-                    first_at,
+                    started_at,
+                    first_at: now,
                     last_at: now,
                     source: SightingSource::Scan,
                     recorded_at: now,
                 };
-                if store.record_sighting(&provider, &row, SIGHTING_GAP_MS)? {
+                if store.continue_sighting(&provider, &row, SIGHTING_GAP_MS)? {
                     changed += 1;
                 }
             }
@@ -250,6 +253,7 @@ impl Engine {
         let row = SightingRow {
             session_id: session_id.clone(),
             home: id.account.as_str().to_owned(),
+            started_at: *first_at,
             first_at: *first_at,
             last_at: now,
             source: SightingSource::Run,
@@ -280,13 +284,18 @@ impl Engine {
         let p = self.provider(&id.provider)?;
         let store = self.store()?;
         if let Some((session_id, first_at)) = &state.last_sighting {
+            let now = self.now_ms();
             store.set_sighting_last_at(
                 &id.provider,
-                session_id,
-                id.account.as_str(),
-                *first_at,
-                exited_at_ms,
-                self.now_ms(),
+                &SightingRow {
+                    session_id: session_id.clone(),
+                    home: id.account.as_str().to_owned(),
+                    started_at: *first_at,
+                    first_at: *first_at,
+                    last_at: exited_at_ms,
+                    source: SightingSource::Run,
+                    recorded_at: now,
+                },
             )?;
         }
         hooks::point(self, "close-launch-check")?;
@@ -306,9 +315,9 @@ impl Engine {
     /// Spec §6.3: the statusline's sighting of `session_id` in its home, which is `profile`, the
     /// run shell's profile, or the default home. Nothing is done while the session's latest
     /// sighting there is under a minute old. Otherwise the Claude Code process the statusline
-    /// runs under is found among its ancestors, by its record in the home, and that
-    /// execution's sighting is written. The write waits at most `CACHE_WRITE_WAIT`, and a busy
-    /// store skips it. The store is never created.
+    /// runs under is found among its ancestors, by its record in the home: the session's latest
+    /// tenure in that execution goes on to now, or one starts now (spec §6.4). The write waits
+    /// at most `CACHE_WRITE_WAIT`, and a busy store skips it. The store is never created.
     pub fn statusline_sighting(
         &self,
         provider: &ProviderId,
@@ -341,13 +350,14 @@ impl Engine {
         if fresh {
             return Ok(());
         }
-        let Some(first_at) = self.execution_started_at(p.as_ref(), &records) else {
+        let Some(started_at) = self.execution_started_at(p.as_ref(), &records) else {
             return Ok(());
         };
         let row = SightingRow {
             session_id: session_id.to_owned(),
             home,
-            first_at,
+            started_at,
+            first_at: now,
             last_at: now,
             source: SightingSource::Statusline,
             recorded_at: now,
@@ -355,7 +365,7 @@ impl Engine {
         // Evidence, not the line: a failed write leaves the session to the next run. SQLite's
         // result code only, never the error's text (§14.2).
         if let Err(e) =
-            store.record_sighting_within(provider, &row, SIGHTING_GAP_MS, CACHE_WRITE_WAIT)
+            store.continue_sighting_within(provider, &row, SIGHTING_GAP_MS, CACHE_WRITE_WAIT)
         {
             tracing::debug!(
                 code = e.sqlite_code().map(tracing::field::debug),
