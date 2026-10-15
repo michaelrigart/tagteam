@@ -6887,7 +6887,6 @@ use common::{Fx, add, cc, identity};
 use serde_json::json;
 use std::cell::Cell;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
@@ -7271,45 +7270,32 @@ fn the_seed_closure_runs_only_when_step_3_applies() {
 fn the_epoch_is_read_once_the_migration_holds_the_write_lock() {
     // An older process may switch accounts while this one waits for the write lock: the epoch,
     // and the active account the seed records as of it, are read only once the lock is held.
+    // The clock probes the lock itself: while the migration's IMMEDIATE transaction is open, a
+    // second connection cannot begin one, even with no wait.
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("t.db");
     version_2_store(&path);
-    let released = AtomicBool::new(false);
-    let read_after_release = Cell::new(None);
-    let (locked, is_locked) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        let (path, released) = (&path, &released);
-        scope.spawn(move || {
-            let mut holder = rusqlite::Connection::open(path).unwrap();
-            let tx = holder
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-            tx.execute(
-                "UPDATE active_accounts SET account_id = 'b' WHERE provider = 'claude-code'",
-                [],
-            )
-            .unwrap();
-            locked.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            released.store(true, Ordering::SeqCst);
-            tx.commit().unwrap();
-        });
-        is_locked.recv().unwrap();
-        Store::open_seeded(
-            path,
-            &|| {
-                read_after_release.set(Some(released.load(Ordering::SeqCst)));
-                NOW
-            },
-            &no_profiles,
-        )
-        .unwrap();
-    });
-    assert_eq!(read_after_release.get(), Some(true));
+    let probes = std::cell::RefCell::new(Vec::new());
+    Store::open_seeded(
+        &path,
+        &|| {
+            let probe = rusqlite::Connection::open(&path).unwrap();
+            probe.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let busy = matches!(
+                probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;"),
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy
+            );
+            probes.borrow_mut().push(busy);
+            NOW
+        },
+        &no_profiles,
+    )
+    .unwrap();
     assert_eq!(
-        history_rows(&path)[0],
-        ("claude-code".to_owned(), NOW, Some("b".to_owned()), NOW),
-        "the switch committed while the migration waited is the epoch's active account"
+        *probes.borrow(),
+        [true],
+        "the clock is read once, with the migration's write lock held"
     );
 }
 
