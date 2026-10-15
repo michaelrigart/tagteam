@@ -169,20 +169,15 @@ pub(crate) fn resolve_models(
 }
 
 /// Core §13.1 for `tokens`: `--provider` when given, else the provider of the accounts named
-/// (`named`: each one's position and provider), else `default`. A named account of a provider
-/// other than `--provider` is a usage error worded as `run` words it, and so are accounts of
-/// more than one provider: a report covers one provider.
+/// (`named`: each one's position and provider), else `default`. Each ACCOUNT is resolved within
+/// `--provider` first (core §10.4), so under it every one belongs to it; without it, accounts of
+/// more than one provider are a usage error: a report covers one provider.
 pub(crate) fn provider_for(
     flag: Option<&ProviderId>,
     default: &ProviderId,
     named: &[(u32, ProviderId)],
 ) -> Result<ProviderId, String> {
     if let Some(asked) = flag {
-        if let Some((position, provider)) = named.iter().find(|(_, p)| p != asked) {
-            return Err(format!(
-                "position {position} is a {provider} account, not a {asked} one"
-            ));
-        }
         return Ok(asked.clone());
     }
     let mut providers: Vec<&ProviderId> = Vec::new();
@@ -1120,10 +1115,6 @@ mod tests {
         assert_eq!(
             provider_for(Some(&cc), &cc, &named(&[(1, &cc), (2, &cc)])),
             Ok(cc.clone())
-        );
-        assert_eq!(
-            provider_for(Some(&cc), &cc, &named(&[(1, &cc), (2, &fake)])),
-            Err("position 2 is a fake-agent account, not a claude-code one".to_owned())
         );
         assert_eq!(
             provider_for(None, &cc, &named(&[(1, &cc), (2, &fake), (3, &cc)])),
