@@ -544,9 +544,12 @@ removes the file, unless the file changed since the scan read it: `run` may have
 with a newer one, which the next scan records. A file that cannot be read or does not parse is
 recorded as the open launch its name stands for (§6.1), and removed the same way: its end, if
 it had one, is lost, and the launch closes once the scan finds the profile idle. A file that
-names another provider or another account than its profile, or whose content cannot be used
-and whose name gives no start, or one before the epoch, is skipped and kept. A temp file, which is not `*.json`, is
-ignored.
+cannot even be `stat`ed cannot be told from a replaced one: each scan records it again, and
+none removes it. A file that names another provider or another account than its profile, or
+whose content cannot be used and whose name gives no start, or one before the epoch, is
+skipped and kept. A temp file, which is not `*.json`, is ignored. A profile whose marker or
+pending directory cannot be read, and a `sessions/` that cannot be listed, give the scan
+nothing to record: it skips them. A report does not (§7.2).
 
 ### 6.3 Statusline
 
