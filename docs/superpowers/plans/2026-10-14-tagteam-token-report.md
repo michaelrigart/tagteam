@@ -293,9 +293,12 @@ impl Store {
     pub fn token_files(&self, provider: &ProviderId) -> Result<Vec<TokenFileRow>, StoreError>;
     /// One IMMEDIATE transaction: upsert rows by the merge rule, write each file row, delete `removed` file rows,
     /// create the provider's token_state row if absent, and set changed_at = now when added + updated > 0.
-    pub fn commit_token_batch(&self, provider: &ProviderId, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
-    /// Sets refreshed_at and stats; inserts token_epoch(now, seeded = 1) if it has no row; on the first completion (refreshed_at was NULL) also sets changed_at.
-    pub fn finish_token_refresh(&self, provider: &ProviderId, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
+    /// `epoch`: the token_epoch.at the refresh read when it began (None: no row). A full purge deletes that row, so when
+    /// the stored epoch differs, nothing is written and the answer is StoreError::TokenIndexPurged.
+    pub fn commit_token_batch(&self, provider: &ProviderId, epoch: Option<i64>, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
+    /// Sets refreshed_at and stats; inserts token_epoch(now, seeded = 1) if it has no row (epoch None: a refresh begun after a
+    /// purge); on the first completion (refreshed_at was NULL) also sets changed_at. Same `epoch` check and TokenIndexPurged.
+    pub fn finish_token_refresh(&self, provider: &ProviderId, epoch: Option<i64>, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
     /// Daily lease `prune:tokens:<provider>`; deletes usage older than cutoff in chunks, each chunk that deletes any also moving changed_at and
     /// `responses`; then empty sessions, sightings that ended before cutoff, launches ended before cutoff, and pruned_at. `stop` is asked before
     /// each chunk: stopped, the lease is released and `complete: false` (the next call goes on). A lease held or spent today: `{0, complete: true}`.
@@ -311,6 +314,7 @@ impl Store {
     pub fn record_sighting(&self, provider: &ProviderId, s: &SightingRow, min_gap_ms: i64) -> Result<bool, StoreError>;
     /// record_sighting with the busy timeout set to `wait` for the call (the statusline's 5 ms, spec §6.3).
     pub fn record_sighting_within(&self, provider: &ProviderId, s: &SightingRow, min_gap_ms: i64, wait: Duration) -> Result<bool, StoreError>;
+    /// run's exit write: sets last_at = max(first_at, last_at) exactly, back as well as forward; recorded_at only when it changed.
     pub fn set_sighting_last_at(&self, provider: &ProviderId, session_id: &str, home: &str, first_at: i64, last_at: i64, now_ms: i64) -> Result<(), StoreError>;
     pub fn latest_sighting(&self, provider: &ProviderId, session_id: &str, home: &str) -> Result<Option<SightingRow>, StoreError>;
     pub fn sightings(&self, provider: &ProviderId) -> Result<Vec<SightingRow>, StoreError>;
@@ -320,6 +324,8 @@ impl Store {
     pub fn launches(&self, provider: &ProviderId) -> Result<Vec<LaunchRow>, StoreError>;
     pub fn active_history(&self, provider: &ProviderId) -> Result<Vec<(i64, Option<String>)>, StoreError>; // (at, account_id) by at
 }
+// store/mod.rs (Task 12): StoreError gains `TokenIndexPurged` ("the token index was purged during the refresh");
+// as every StoreError, it reaches the CLI as EngineError::Store, kind "store".
 ```
 
 ### Settings (Task 13)
@@ -8049,8 +8055,8 @@ git commit -m "Add migration step 3 for the token index and session evidence"
 
   impl Store {
       pub fn token_files(&self, provider: &ProviderId) -> Result<Vec<TokenFileRow>, StoreError>;
-      pub fn commit_token_batch(&self, provider: &ProviderId, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
-      pub fn finish_token_refresh(&self, provider: &ProviderId, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
+      pub fn commit_token_batch(&self, provider: &ProviderId, epoch: Option<i64>, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
+      pub fn finish_token_refresh(&self, provider: &ProviderId, epoch: Option<i64>, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
       pub fn prune_tokens(&self, provider: &ProviderId, cutoff_ms: i64, holder: &str, now_ms: i64, stop: &dyn Fn() -> bool) -> Result<PruneOutcome, StoreError>;
       #[cfg(feature = "test-hooks")]
       pub fn busy_timeout(&self) -> Result<Duration, StoreError>; // the connection's, for the restoration test
@@ -8074,13 +8080,15 @@ git commit -m "Add migration step 3 for the token index and session evidence"
       pub fn launches(&self, provider: &ProviderId) -> Result<Vec<LaunchRow>, StoreError>;
       pub fn active_history(&self, provider: &ProviderId) -> Result<Vec<(i64, Option<String>)>, StoreError>;
   }
+  // store/mod.rs: StoreError gains TokenIndexPurged ("the token index was purged during the refresh").
   ```
   Behaviour later tasks rely on, beyond the contract's doc lines:
+  - **The purge generation.** A full purge deletes the `token_epoch` row, so `token_epoch().map(|e| e.at)`, read once when a refresh begins, is that refresh's generation. `commit_token_batch` and `finish_token_refresh` take it as `epoch` and compare it, inside their `IMMEDIATE` transaction, with the stored epoch; on a mismatch they write nothing (not even the provider's `token_state` row) and return `StoreError::TokenIndexPurged`. A refresh that began after a purge passes `None`, and its `finish_token_refresh` records the new epoch. `TokenIndexPurged` reaches the CLI as `EngineError::Store` (kind `store`); Task 15 may stop the refresh on it, since its next run starts over on the emptied index. No other code matches `StoreError` exhaustively, and `kind_is_pinned_for_every_variant` pins `EngineError::Store` by one example, so neither needs a change.
   - `commit_token_batch` merges rows of one key within the batch first, writes a response only when the merge changes it, and counts `added` (a key the store did not hold) and `updated` (a stored key whose merged row differs) per distinct key. It also adds `added` to `token_state.responses`.
   - `token_state.responses` is the index's live count, which each batch adds to and each prune subtracts from. `finish_token_refresh` does not write `stats.responses`, so Task 15 may pass any value there (0 is fine).
   - `token_usage` orders by `at`, then by first-indexed order (`id`). `token_models` lists every model the provider's index has held since its last purge, pruned ones included (ruling R8).
   - `prune_tokens` also deletes sightings whose `last_at` is before the cutoff (see Notes). Each deletion chunk (5,000 responses at most) is its own transaction and, when it deletes any, sets `changed_at` and subtracts from `responses` in that same transaction. `stop` is asked before each chunk; a stopped prune releases its lease (`expires_at` set to `now_ms`) and returns `complete: false`, so Task 15 calls it with a closure over the refresh's deadline and cancel and simply calls again on the next refresh. `pruned_at` is set only when a prune completes. A lease another holder took today is `PruneOutcome { deleted: 0, complete: true }`: nothing is due.
-  - `record_sighting` with `min_gap_ms = 0` writes whenever `last_at` does not move back. `set_sighting_last_at` only ever moves `last_at` up, and writes nothing otherwise.
+  - `record_sighting` with `min_gap_ms = 0` writes whenever `last_at` does not move back. `set_sighting_last_at`, `run`'s exit write, sets `last_at` to the exit exactly, back as well as forward (a poll may have stamped a later instant just before the poller stopped), never before `first_at`, and touches `recorded_at` only when the end changed.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -8100,7 +8108,7 @@ use tagteam_core::ProviderId;
 use tagteam_core::tokens::TokenCounts;
 use tagteam_engine::store::{
     BatchOutcome, EpochRow, LaunchRow, PruneOutcome, RefreshStats, SightingRow, SightingSource,
-    Store, TokenFileRow, TokenStateRow, UsageRow, usage_key,
+    Store, StoreError, TokenFileRow, TokenStateRow, UsageRow, usage_key,
 };
 
 /// The fixtures' clock (`Fx`'s `FakeClock`).
@@ -8154,8 +8162,14 @@ fn file(path: &str, offset: u64) -> TokenFileRow {
     }
 }
 
+/// The index's generation as a refresh starting now reads it: `token_epoch.at`.
+fn generation(s: &Store) -> Option<i64> {
+    s.token_epoch().unwrap().map(|e| e.at)
+}
+
 fn commit(s: &Store, rows: &[UsageRow], now: i64) -> BatchOutcome {
-    s.commit_token_batch(&cc(), rows, &[], &[], now).unwrap()
+    s.commit_token_batch(&cc(), generation(s), rows, &[], &[], now)
+        .unwrap()
 }
 
 fn all(s: &Store) -> Vec<UsageRow> {
@@ -8274,7 +8288,7 @@ fn a_batch_creates_state_and_moves_changed_at_only_on_change() {
     assert_eq!(s.token_state(&cc()).unwrap(), None);
     let f = file("/t/a.jsonl", 10);
     assert_eq!(
-        s.commit_token_batch(&cc(), &[], std::slice::from_ref(&f), &[], T)
+        s.commit_token_batch(&cc(), generation(&s), &[], std::slice::from_ref(&f), &[], T)
             .unwrap(),
         BatchOutcome::default(),
         "offsets alone"
@@ -8322,11 +8336,25 @@ fn a_batch_creates_state_and_moves_changed_at_only_on_change() {
         size: 300,
         ..f.clone()
     };
-    s.commit_token_batch(&cc(), &[], std::slice::from_ref(&g), &[], T + 4)
-        .unwrap();
+    s.commit_token_batch(
+        &cc(),
+        generation(&s),
+        &[],
+        std::slice::from_ref(&g),
+        &[],
+        T + 4,
+    )
+    .unwrap();
     assert_eq!(s.token_files(&cc()).unwrap(), [g], "rewritten at its path");
-    s.commit_token_batch(&cc(), &[], &[], &["/t/a.jsonl".to_owned()], T + 5)
-        .unwrap();
+    s.commit_token_batch(
+        &cc(),
+        generation(&s),
+        &[],
+        &[],
+        &["/t/a.jsonl".to_owned()],
+        T + 5,
+    )
+    .unwrap();
     assert!(s.token_files(&cc()).unwrap().is_empty(), "removed");
     assert_eq!(
         all(&s).len(),
@@ -8340,7 +8368,7 @@ fn a_batch_creates_state_and_moves_changed_at_only_on_change() {
 fn finish_sets_refreshed_and_the_first_completion_moves_changed_at() {
     let (_d, s, _) = store();
     commit(&s, &[row(1, "s1", T, 5), row(2, "s2", T + 1, 5)], T);
-    s.commit_token_batch(&fake(), &[row(3, "f1", T, 5)], &[], &[], T)
+    s.commit_token_batch(&fake(), generation(&s), &[row(3, "f1", T, 5)], &[], &[], T)
         .unwrap();
     let stats = RefreshStats {
         files: 3,
@@ -8348,7 +8376,8 @@ fn finish_sets_refreshed_and_the_first_completion_moves_changed_at() {
         skipped_lines: 2,
         unreadable_files: 1,
     };
-    s.finish_token_refresh(&cc(), &stats, T + 10).unwrap();
+    s.finish_token_refresh(&cc(), generation(&s), &stats, T + 10)
+        .unwrap();
     assert_eq!(
         s.token_state(&cc()).unwrap(),
         Some(TokenStateRow {
@@ -8366,7 +8395,8 @@ fn finish_sets_refreshed_and_the_first_completion_moves_changed_at() {
         files: 4,
         ..RefreshStats::default()
     };
-    s.finish_token_refresh(&cc(), &later, T + 20).unwrap();
+    s.finish_token_refresh(&cc(), generation(&s), &later, T + 20)
+        .unwrap();
     assert_eq!(
         s.token_state(&cc()).unwrap(),
         Some(TokenStateRow {
@@ -8382,7 +8412,7 @@ fn finish_sets_refreshed_and_the_first_completion_moves_changed_at() {
         })
     );
     let other = ProviderId::new("other");
-    s.finish_token_refresh(&other, &RefreshStats::default(), T + 30)
+    s.finish_token_refresh(&other, generation(&s), &RefreshStats::default(), T + 30)
         .unwrap();
     assert_eq!(
         s.token_state(&other).unwrap(),
@@ -8401,7 +8431,7 @@ fn finish_inserts_an_epoch_after_a_full_purge() {
     let (_d, s, _) = store();
     let epoch = s.token_epoch().unwrap().expect("the migration's epoch");
     assert!(!epoch.seeded, "a raw open seeds nothing (ruling R1)");
-    s.finish_token_refresh(&cc(), &RefreshStats::default(), T)
+    s.finish_token_refresh(&cc(), generation(&s), &RefreshStats::default(), T)
         .unwrap();
     assert_eq!(
         s.token_epoch().unwrap(),
@@ -8410,7 +8440,7 @@ fn finish_inserts_an_epoch_after_a_full_purge() {
     );
     s.empty_all().unwrap();
     assert_eq!(s.token_epoch().unwrap(), None);
-    s.finish_token_refresh(&cc(), &RefreshStats::default(), T + 5)
+    s.finish_token_refresh(&cc(), generation(&s), &RefreshStats::default(), T + 5)
         .unwrap();
     assert_eq!(
         s.token_epoch().unwrap(),
@@ -8419,6 +8449,89 @@ fn finish_inserts_an_epoch_after_a_full_purge() {
             seeded: true
         })
     );
+}
+
+#[test]
+fn a_batch_after_a_full_purge_is_refused() {
+    // Spec §5.1, §13: a full purge deletes the epoch, the index's generation, so a refresh that
+    // began before it writes nothing after it, not even the provider's state row.
+    let (_d, s, _) = store();
+    let started = generation(&s);
+    assert!(started.is_some());
+    assert_eq!(
+        s.commit_token_batch(&cc(), started, &[row(1, "s1", T, 1)], &[], &[], T)
+            .unwrap(),
+        BatchOutcome {
+            added: 1,
+            updated: 0
+        }
+    );
+    s.empty_all().unwrap();
+    let err = s
+        .commit_token_batch(
+            &cc(),
+            started,
+            &[row(2, "s1", T + 1, 1)],
+            &[file("/t/a.jsonl", 10)],
+            &[],
+            T + 1,
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::TokenIndexPurged), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "the token index was purged during the refresh"
+    );
+    assert!(all(&s).is_empty());
+    assert!(s.token_files(&cc()).unwrap().is_empty());
+    assert_eq!(s.token_state(&cc()).unwrap(), None);
+
+    // A refresh that begins after the purge reads no epoch, and writes.
+    assert_eq!(
+        s.commit_token_batch(&cc(), None, &[row(2, "s1", T + 1, 1)], &[], &[], T + 2)
+            .unwrap(),
+        BatchOutcome {
+            added: 1,
+            updated: 0
+        }
+    );
+}
+
+#[test]
+fn a_finish_after_a_full_purge_is_refused() {
+    let (_d, s, _) = store();
+    let started = generation(&s);
+    commit(&s, &[row(1, "s1", T, 1)], T);
+    s.empty_all().unwrap();
+    let stats = RefreshStats {
+        files: 1,
+        ..RefreshStats::default()
+    };
+    let err = s
+        .finish_token_refresh(&cc(), started, &stats, T + 1)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::TokenIndexPurged), "{err:?}");
+    assert_eq!(s.token_state(&cc()).unwrap(), None, "nothing written");
+    assert_eq!(s.token_epoch().unwrap(), None, "and no epoch recorded");
+
+    // A refresh that began after the purge completes, and its completion records the epoch.
+    s.finish_token_refresh(&cc(), None, &stats, T + 2).unwrap();
+    assert_eq!(
+        s.token_epoch().unwrap(),
+        Some(EpochRow {
+            at: T + 2,
+            seeded: true
+        })
+    );
+    assert_eq!(
+        s.token_state(&cc()).unwrap().unwrap().refreshed_at,
+        Some(T + 2)
+    );
+    // That epoch is the new generation: one read before it is stale.
+    assert!(matches!(
+        s.commit_token_batch(&cc(), None, &[], &[], &[], T + 3),
+        Err(StoreError::TokenIndexPurged)
+    ));
 }
 
 #[test]
@@ -8431,8 +8544,15 @@ fn prune_runs_once_a_day_and_moves_changed_at_when_it_deletes() {
     old.extend([row(1, "old", cutoff - 2, 1), row(2, "live", cutoff - 1, 1)]);
     commit(&s, &old, T);
     commit(&s, &[row(3, "live", cutoff, 1)], T);
-    s.commit_token_batch(&fake(), &[row(9, "f1", cutoff - 5, 1)], &[], &[], T)
-        .unwrap();
+    s.commit_token_batch(
+        &fake(),
+        generation(&s),
+        &[row(9, "f1", cutoff - 5, 1)],
+        &[],
+        &[],
+        T,
+    )
+    .unwrap();
     s.record_sighting(&cc(), &sighting("old", "", cutoff - 10, cutoff - 1), 0)
         .unwrap();
     s.record_sighting(&cc(), &sighting("live", "", cutoff - 10, T), 0)
@@ -8719,27 +8839,55 @@ fn sightings_insert_then_extend_only_after_the_gap() {
             next.clone()
         ]
     );
-
-    s.set_sighting_last_at(&cc(), "s1", "", T + 100_000, T + 200_000, T + 200_001)
-        .unwrap();
-    let exited = SightingRow {
-        last_at: T + 200_000,
-        recorded_at: T + 200_001,
-        ..next
-    };
-    assert_eq!(
-        s.latest_sighting(&cc(), "s1", "").unwrap(),
-        Some(exited.clone())
-    );
-    s.set_sighting_last_at(&cc(), "s1", "", T + 100_000, T + 150_000, T + 300_000)
-        .unwrap();
-    assert_eq!(
-        s.latest_sighting(&cc(), "s1", "").unwrap(),
-        Some(exited),
-        "never back"
-    );
     assert_eq!(s.latest_sighting(&cc(), "s2", "").unwrap(), None);
     assert!(s.sightings(&fake()).unwrap().is_empty());
+}
+
+#[test]
+fn run_s_exit_sets_the_end_back_or_forward_never_before_the_start() {
+    // Spec §6.1: the child was not alive after its exit, so the exit write sets the end exactly,
+    // even below what a poll stamped just before the poller stopped.
+    let (_d, s, _) = store();
+    let polled = sighting("s1", "acct-a", T, T + 10_000);
+    s.record_sighting(&cc(), &polled, 0).unwrap();
+    let end = |last_at: i64, recorded_at: i64| SightingRow {
+        last_at,
+        recorded_at,
+        ..polled.clone()
+    };
+    let latest = |s: &Store| s.latest_sighting(&cc(), "s1", "acct-a").unwrap();
+
+    s.set_sighting_last_at(&cc(), "s1", "acct-a", T, T + 20_000, T + 20_001)
+        .unwrap();
+    assert_eq!(latest(&s), Some(end(T + 20_000, T + 20_001)), "forward");
+    s.set_sighting_last_at(&cc(), "s1", "acct-a", T, T + 9_000, T + 20_002)
+        .unwrap();
+    assert_eq!(
+        latest(&s),
+        Some(end(T + 9_000, T + 20_002)),
+        "back: the poll ran ahead of the exit"
+    );
+    s.set_sighting_last_at(&cc(), "s1", "acct-a", T, T + 9_000, T + 20_003)
+        .unwrap();
+    assert_eq!(
+        latest(&s),
+        Some(end(T + 9_000, T + 20_002)),
+        "the same end writes nothing"
+    );
+    s.set_sighting_last_at(&cc(), "s1", "acct-a", T, T - 5_000, T + 20_004)
+        .unwrap();
+    assert_eq!(
+        latest(&s),
+        Some(end(T, T + 20_004)),
+        "an exit before the start clamps to it"
+    );
+    s.set_sighting_last_at(&cc(), "s1", "acct-a", T + 1, T + 30_000, T + 20_005)
+        .unwrap();
+    assert_eq!(
+        latest(&s),
+        Some(end(T, T + 20_004)),
+        "another execution's key writes nothing"
+    );
 }
 
 #[test]
@@ -8895,13 +9043,14 @@ fn purge_provider_deletes_token_rows_and_keeps_the_epoch() {
         let path = format!("/t/{p}.jsonl");
         s.commit_token_batch(
             &p,
+            generation(&s),
             &[row(usage_key(&p, "m", "r"), "s1", T, 1)],
             &[file(&path, 1)],
             &[],
             T,
         )
         .unwrap();
-        s.finish_token_refresh(&p, &RefreshStats::default(), T)
+        s.finish_token_refresh(&p, generation(&s), &RefreshStats::default(), T)
             .unwrap();
         s.prune_tokens(&p, 0, "h", T, &|| false).unwrap();
         s.record_sighting(&p, &sighting("s1", "", T, T), 0).unwrap();
@@ -8982,7 +9131,7 @@ fn reads_are_per_provider_by_range_and_session() {
     commit(&s, &[third.clone(), first.clone(), second.clone()], T);
     let mut theirs = row(9, "s1", T + 5, 1);
     theirs.model = "m-z".into();
-    s.commit_token_batch(&fake(), &[theirs], &[], &[], T)
+    s.commit_token_batch(&fake(), generation(&s), &[theirs], &[], &[], T)
         .unwrap();
 
     let usage = |since, until, session| keys(&s.token_usage(&cc(), since, until, session).unwrap());
@@ -9070,6 +9219,18 @@ pub use tokens::{
 };
 pub use usage::{
 ```
+
+add the last variant of `StoreError`, after `LopsidedWal { present: &'static str },`:
+
+```rust
+    /// Token report spec §5.1, §13: a full purge emptied the token index after the refresh
+    /// writing to it began (its `token_epoch` row, the index's generation, is gone or new), so
+    /// the write was refused rather than leave part of the old index behind.
+    #[error("the token index was purged during the refresh")]
+    TokenIndexPurged,
+```
+
+(`EngineError::Store(_)` maps every `StoreError` to kind `store`, and nothing matches `StoreError` exhaustively, so no other file changes),
 
 and replace the whole of `delete_provider_rows` (doc comment included):
 
@@ -9519,6 +9680,24 @@ fn write_sighting(
     Ok(n > 0)
 }
 
+/// The index's generation check (spec §5.1, §13): `epoch` is the `token_epoch.at` the refresh
+/// read when it began. A full purge deletes that row, so a different one, or none, means the
+/// purge ran since, and the refresh's write would land in the emptied index.
+fn same_generation(c: &Connection, epoch: Option<i64>) -> Result<(), StoreError> {
+    let current: Option<i64> = c
+        .query_row(
+            "SELECT at FROM token_epoch ORDER BY rowid LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if current == epoch {
+        Ok(())
+    } else {
+        Err(StoreError::TokenIndexPurged)
+    }
+}
+
 fn prune_lease(provider: &ProviderId) -> String {
     format!("prune:tokens:{provider}")
 }
@@ -9581,10 +9760,13 @@ impl Store {
     /// `rows` by the merge rule (spec §4), writes each of `files`, deletes the file rows at
     /// `removed`, and creates the provider's `token_state` row if absent. When a response was
     /// added or changed it sets `changed_at` to `now_ms`, and it adds the new responses to
-    /// `responses`. A response whose merge changes nothing is not written.
+    /// `responses`. A response whose merge changes nothing is not written. `epoch` is the
+    /// `token_epoch.at` the refresh began with; when a full purge has run since, nothing is
+    /// written and the answer is `TokenIndexPurged`.
     pub fn commit_token_batch(
         &self,
         provider: &ProviderId,
+        epoch: Option<i64>,
         rows: &[UsageRow],
         files: &[TokenFileRow],
         removed: &[String],
@@ -9593,6 +9775,7 @@ impl Store {
         let rows = merge_batch(rows);
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        same_generation(&tx, epoch)?;
         tx.execute(ENSURE_STATE, [provider.as_str()])?;
         let mut outcome = BatchOutcome::default();
         {
@@ -9690,15 +9873,19 @@ impl Store {
     /// `files`, `skipped_lines` and `unreadable_files`, and on the provider's first completion
     /// `changed_at` too, which ends the index's partial state (spec §14). `stats.responses` is
     /// not written: `responses` is the index's own count, which each batch and prune keep.
-    /// After a full purge emptied `token_epoch`, it records the epoch anew at `now_ms`.
+    /// A refresh that began after a full purge emptied `token_epoch` (`epoch` is `None`)
+    /// records the epoch anew at `now_ms`. Like a batch, it writes nothing and answers
+    /// `TokenIndexPurged` when the index's generation is no longer `epoch`.
     pub fn finish_token_refresh(
         &self,
         provider: &ProviderId,
+        epoch: Option<i64>,
         stats: &RefreshStats,
         now_ms: i64,
     ) -> Result<(), StoreError> {
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        same_generation(&tx, epoch)?;
         tx.execute(ENSURE_STATE, [provider.as_str()])?;
         tx.execute(
             "UPDATE token_state SET \
@@ -9964,8 +10151,9 @@ impl Store {
         Ok(written?)
     }
 
-    /// `run`'s exit write (spec §6.1): moves the sighting's `last_at` up to `last_at`, never
-    /// back, setting `recorded_at` when it moved.
+    /// `run`'s exit write (spec §6.1): sets the sighting's end to the child's exit, back as well
+    /// as forward (the child was not alive after it, whatever a poll stamped just before it
+    /// stopped); never before `first_at`. Sets `recorded_at` when the end changed.
     pub fn set_sighting_last_at(
         &self,
         provider: &ProviderId,
@@ -9976,9 +10164,9 @@ impl Store {
         now_ms: i64,
     ) -> Result<(), StoreError> {
         self.exec(
-            "UPDATE session_sightings SET last_at = ?5, recorded_at = ?6 \
+            "UPDATE session_sightings SET last_at = max(first_at, ?5), recorded_at = ?6 \
              WHERE provider = ?1 AND session_id = ?2 AND home = ?3 AND first_at = ?4 \
-             AND last_at < ?5",
+             AND last_at != max(first_at, ?5)",
             &[
                 &provider.as_str(),
                 &session_id,
@@ -10133,7 +10321,7 @@ cargo test -p tagteam-engine --locked --test store_tokens --test store --test pu
 cargo test -p tagteam-engine --locked --features test-hooks --test store_tokens
 ```
 
-Expected: `store_tokens.rs` `test result: ok. 14 passed; 0 failed`, `store.rs` `ok. 58 passed`, `purge.rs` `ok. 56 passed`. With `test-hooks`, `store_tokens.rs` runs `record_sighting_within_restores_the_connection_s_wait` too: `ok. 15 passed`.
+Expected: `store_tokens.rs` `test result: ok. 18 passed; 0 failed`, `store.rs` `ok. 58 passed`, `purge.rs` `ok. 56 passed`. With `test-hooks`, `store_tokens.rs` runs `record_sighting_within_restores_the_connection_s_wait` too: `ok. 19 passed`.
 
 - [ ] **Step 5: Lint**
 
@@ -10165,6 +10353,8 @@ git commit -m "Add the store API for the token index and evidence"
 
    Task 18's 200 ms query budget therefore has about 90 ms left for attribution and grouping at a year's volume. Task 15 may want batches smaller than 2,000 once the index is large.
 6. `delete_provider_rows` deletes the provider's cascade of responses in one transaction (it is the spec's single purge transaction). At a year's volume that is seconds of write lock, acceptable for an explicit `purge --provider`. Task 17 holds the tokens lock around it.
+7. **Purge generation (fix after plan review).** A full purge locks the tokens locks of the providers it knows about. A refresh of a provider that has no rows yet (from another build, say) could still commit batches after `empty_all` and leave a partial index. The epoch row is the generation: `commit_token_batch` and `finish_token_refresh` take the `epoch` the refresh read when it began and refuse with `TokenIndexPurged`, writing nothing, when the store's differs (`a_batch_after_a_full_purge_is_refused`, `a_finish_after_a_full_purge_is_refused`). `purge --provider` keeps the epoch, so it needs no generation: Task 17's per-provider tokens lock already serializes it with that provider's refresh.
+8. **`run`'s exit write is exact (fix after plan review).** `set_sighting_last_at` sets `last_at = max(first_at, exit)` even when that moves it back, since a poll in flight may have stamped a later instant just before the poller stopped; it writes nothing when the end is already that value (`run_s_exit_sets_the_end_back_or_forward_never_before_the_start`).
 
 ---
 
@@ -12030,6 +12220,10 @@ git commit -m "Add the incremental transcript file reader"
   - Task 2: `TokenCounts::merge_max(&mut self, other: &TokenCounts)`.
   - Task 12 (`crate::store`): `TokenFileRow`; `UsageRow { key, session_id, project, at_ms, model, sidechain, counts, speed, finalized }`; `BatchOutcome { added, updated }`; `RefreshStats { files, responses, skipped_lines, unreadable_files }`; `TokenStateRow`; `usage_key(provider, message_id, request_id) -> i64`; `Store::{token_files, commit_token_batch, finish_token_refresh, prune_tokens, token_state, token_usage}`.
   - Task 12's `prune_tokens(&self, provider, cutoff_ms, holder, now_ms, stop: &dyn Fn() -> bool) -> Result<PruneOutcome { deleted: u64, complete: bool }, StoreError>`. It asks `stop` before each chunk, the first included, and an early stop releases the daily lease. This task's `stop` lets the first chunk of each call through, so every call makes progress (note 3).
+  - Task 12's purge generation (plan review round 2):
+    - `commit_token_batch(&self, provider, epoch: Option<i64>, rows, files, removed, now_ms)` and `finish_token_refresh(&self, provider, epoch: Option<i64>, stats, now_ms)`;
+    - both refuse with `StoreError::TokenIndexPurged` when `token_epoch`'s `at` differs from `epoch`;
+    - `Store::token_epoch() -> Result<Option<EpochRow { at, seeded }>, StoreError>`.
   - Task 12's semantics this task relies on:
     - `token_state.responses` is the store's own live count, kept by each batch and prune;
     - `finish_token_refresh` writes `files`, `skipped_lines` and `unreadable_files`, and creates the provider's `token_state` row if absent;
@@ -12707,11 +12901,74 @@ fn plant_expired(engine: &Engine, p: &ProviderId, n: usize) {
             finalized: true,
         })
         .collect();
-    engine
-        .store()
-        .unwrap()
-        .commit_token_batch(p, &rows, &[], &[], NOW - 400 * DAY)
+    let store = engine.store().unwrap();
+    let epoch = store.token_epoch().unwrap().map(|e| e.at);
+    store
+        .commit_token_batch(p, epoch, &rows, &[], &[], NOW - 400 * DAY)
         .unwrap();
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_purge_mid_refresh_aborts_the_refresh_without_rewriting() {
+    // Spec §5.1, §13: a full purge locks the providers with token rows when it starts. A refresh
+    // of one that had none then may still be running. Once the purge has emptied the index, the
+    // refresh's next write is refused, as written under a purge generation that is gone, and the
+    // refresh ends without rewriting a row. The next one starts clean.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tagteam_engine::EngineError;
+    use tagteam_engine::store::StoreError;
+
+    let ffx = FakeFx::new();
+    let p = ffx.fake_provider();
+    // More responses than one batch holds, so at least two batches commit.
+    let text: String = (0..2_500)
+        .map(|i| line(&response(&format!("m{i}"), 1, true)))
+        .collect();
+    append_transcript(&ffx.fx.env, "a.jsonl", &text);
+    // The purge empties the store through another engine's connection, as another process
+    // would, right after the refresh's first batch commits.
+    let other = ffx.fx.engine.store().unwrap();
+    let purged = Arc::new(AtomicBool::new(false));
+    let purged_cb = purged.clone();
+    ffx.engine.on_point(
+        "refresh-tokens-committed",
+        Box::new(move || {
+            if !purged_cb.swap(true, Ordering::SeqCst) {
+                other.empty_all().unwrap();
+            }
+        }),
+    );
+
+    let err = ffx
+        .engine
+        .refresh_tokens(
+            &p,
+            Wait::Wait,
+            None,
+            &Cancel::new(),
+            &mut |_: &IndexProgress| {},
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Store(StoreError::TokenIndexPurged)),
+        "{err:?}"
+    );
+    assert!(purged.load(Ordering::SeqCst));
+    let store = ffx.engine.store().unwrap();
+    assert!(
+        rows(&ffx.engine, &p).is_empty(),
+        "no row written after the purge"
+    );
+    assert!(store.token_files(&p).unwrap().is_empty());
+    assert_eq!(store.token_state(&p).unwrap(), None);
+
+    let report = refresh(&ffx.engine, &p);
+    assert!(report.complete);
+    assert_eq!(
+        report.responses_added, 2_500,
+        "the next refresh starts clean"
+    );
 }
 
 #[test]
@@ -13253,6 +13510,9 @@ struct Writer<'a> {
     engine: &'a Engine,
     store: &'a Store,
     provider: &'a ProviderId,
+    /// The purge generation the refresh started under: a batch written after a purge emptied
+    /// the index is refused (`TokenIndexPurged`).
+    epoch: Option<i64>,
     batch: Batch,
     tally: Tally,
     total: IndexProgress,
@@ -13349,6 +13609,7 @@ impl Writer<'_> {
             .collect();
         let outcome = self.store.commit_token_batch(
             self.provider,
+            self.epoch,
             &self.batch.rows,
             &files,
             &self.batch.removed,
@@ -13367,6 +13628,7 @@ impl Writer<'_> {
         self.batch.keys.clear();
         self.batch.removed.clear();
         self.batch.since = None;
+        hooks::point(self.engine, "refresh-tokens-committed")?;
         Ok(())
     }
 }
@@ -13426,6 +13688,10 @@ impl Engine {
         };
         hooks::point(self, "refresh-tokens-locked")?;
         let store = self.store()?;
+        // The purge generation the refresh reads under (spec §13). A full purge that started
+        // before this provider had token rows does not wait for its lock; once it has emptied
+        // the index, every later write of this refresh is refused, and the next one starts clean.
+        let epoch = store.token_epoch()?.map(|e| e.at);
         let retention = i64::from(self.settings.tokens_retention_days).saturating_mul(DAY_MS);
         let cutoff_ms = self.now_ms().saturating_sub(retention);
         let (jobs, removed, unreadable) =
@@ -13460,6 +13726,7 @@ impl Engine {
             engine: self,
             store: &store,
             provider,
+            epoch,
             batch: Batch {
                 removed,
                 ..Batch::default()
@@ -13513,7 +13780,7 @@ impl Engine {
                 skipped_lines: tally.skipped,
                 unreadable_files: tally.unreadable,
             };
-            store.finish_token_refresh(provider, &stats, self.now_ms())?;
+            store.finish_token_refresh(provider, epoch, &stats, self.now_ms())?;
         }
         let report = IndexReport {
             complete,
@@ -13596,7 +13863,7 @@ cargo test -p tagteam-engine --locked --lib tokens::
 ```
 
 Expected:
-- `tokens_refresh` with `test-hooks`: `test result: ok. 15 passed; 0 failed`. Without the feature, 14 pass: the lock-wait test needs the engine's hook points.
+- `tokens_refresh` with `test-hooks`: `test result: ok. 16 passed; 0 failed`. Without the feature, 14 pass: the lock-wait and purge-mid-refresh tests need the engine's hook points.
 - the lib run: `test result: ok. 15 passed; 0 failed`: Task 14's 13, Task 17's lock-wait test, and `memory_and_budget_hold_on_a_file_of_many_chunks`.
 
 - [ ] **Step 5: Lint**
@@ -13640,14 +13907,19 @@ git commit -m "Add the incremental token index refresh"
    - Task 7 re-exports `UsageLine` at `tagteam_provider::UsageLine`.
    - The CC fixture test uses retention 3,650 days, because the fixtures' dates are unknown here.
    - **Logging (Task 22).** The refresh logs one `info` summary under its module's target, `tagteam_engine::tokens::refresh`, which falls under `tagteam_engine::tokens`. The summary carries the provider, completeness, counts and `took_ms`. Transcript paths appear only at `debug`, and content never does (spec §13). Each batch also logs a `debug` line with counts.
-10. **Deterministic lock tests (plan review).**
+10. **Purge generation (plan review round 2).** A full purge locks the providers that have token rows when it starts, so a refresh of a provider with none yet can still be running when it empties the index.
+    - The refresh reads `store.token_epoch()?.map(|e| e.at)` once, after taking its lock, and passes it to every `commit_token_batch` and to `finish_token_refresh`.
+    - Once a purge has emptied the index (`token_epoch` gone), the next write is refused with `StoreError::TokenIndexPurged`. The writer returns that error, the workers stop, nothing more is written, and the refresh ends with `EngineError::Store`. The next refresh reads no epoch, writes under none, and starts clean, since the purge emptied `token_files` too.
+    - The writer passes a hook point, `refresh-tokens-committed`, after each committed batch. `a_purge_mid_refresh_aborts_the_refresh_without_rewriting` uses it to empty the store, through another engine's connection, right after the first of at least two batches (2,500 responses; a batch holds 2,000). The next batch is then refused, and the test asserts the error, an empty index, and a clean next refresh. It is deterministic: no timing decides which batch meets the purge.
+    - Verified in the scratch crate, with a stand-in store that refuses on an epoch mismatch: 29 of 29, 3 runs out of 3.
+11. **Deterministic lock tests (plan review).**
     - `refresh_with` passes two hook points, `refresh-tokens-lock` immediately before taking the lock and `refresh-tokens-locked` immediately after.
     - `a_waiting_refresh_never_passes_the_lock_while_another_holds_it` (feature `test-hooks`) holds the lock and waits on a channel for the first point, then sets the cancel token. The refresh must return the interruption without ever reaching the second point. Were the lock acquisition removed, nothing between the two points could be interrupted, so the test would fail deterministically.
     - Once the lock is released, the next refresh reaches the second point, and `try_lock` there finds the lock held.
     - The Try test asserts `Busy` with no elapsed-time check. No functional test here asserts elapsed time; timing belongs to Task 23's `#[ignore]` tests.
     - **Unreadable files under root.** `an_unreadable_file_is_counted_and_retried` makes a file mode 000, then tries `File::open`. If that succeeds (a privileged run), it restores the mode and returns early with a comment, since no file can be unreadable there. I chose this over injecting a failure (a symlink loop, say) because Task 10's discovery may not list symlinks, so the skip is the deterministic option.
-11. **Batch order.** This task runs after Task 16, whose real `scan_sessions` it calls, and Task 17, whose `lock_until_free` in `tokens/mod.rs` it uses as `super::lock_until_free`. It does not edit `mod.rs`. It removes `reader.rs`'s `#![allow(dead_code)]`, and nothing else touches `reader.rs` in between.
-12. **What I verified, and what I did not.** I could not compile this task's Step 3 inside the engine: Tasks 7, 12 and 13 do not exist yet. Instead I compiled it verbatim in a scratch crate. That crate held the real Task 14 `tokens/` files and Task 17's `lock_until_free`, over the real `tagteam-core` and `tagteam-provider`, with in-memory stand-ins for `Engine`, `Store`, `EngineError` and a line-format provider. The only edit was swapping the `Provider`/`UsageLine` import for the stand-ins'. Results:
+12. **Batch order.** This task runs after Task 16, whose real `scan_sessions` it calls, and Task 17, whose `lock_until_free` in `tokens/mod.rs` it uses as `super::lock_until_free`. It does not edit `mod.rs`. It removes `reader.rs`'s `#![allow(dead_code)]`, and nothing else touches `reader.rs` in between.
+13. **What I verified, and what I did not.** I could not compile this task's Step 3 inside the engine: Tasks 7, 12 and 13 do not exist yet. Instead I compiled it verbatim in a scratch crate. That crate held the real Task 14 `tokens/` files and Task 17's `lock_until_free`, over the real `tagteam-core` and `tagteam-provider`, with in-memory stand-ins for `Engine`, `Store`, `EngineError` and a line-format provider. The only edit was swapping the `Provider`/`UsageLine` import for the stand-ins'. Results:
     - clippy `-D warnings` was clean;
     - rustfmt was clean (the text above is the formatted code);
     - 11 scenario tests passed on 8 runs out of 8, together with the reader's and lock's 13 tests.
@@ -14168,7 +14440,8 @@ fn close_leaves_the_launch_open_while_another_launcher_holds_the_profile() {
 #[test]
 fn close_stamps_the_sighting_at_the_exit_not_at_the_close() {
     // Spec §6.1: the sighting ends when the child exited. `run`'s exit handling, which may wait
-    // on locks, comes before the close; only the launch may close late.
+    // on locks, comes before the close; only the launch may close late. A poll in flight as the
+    // child exited may have stamped the sighting later: the close moves it back to the exit.
     let fx = Fx::new();
     let cc = fx.provider();
     let a = fx.add("a@x.co", "rt-a");
@@ -14181,19 +14454,38 @@ fn close_stamps_the_sighting_at_the_exit_not_at_the_close() {
     fx.engine
         .poll_launch(&id, &profile, 777, &mut state)
         .unwrap();
-    // The child exits at t1; exit handling takes until t2.
+    // The child exits at t1. The poller's last round, in flight then, stamps the sighting past
+    // the exit, and exit handling takes until t2.
     fx.clock.advance_ms(30_000);
     let t1 = fx.engine.now_ms();
     fs::remove_file(&child).unwrap();
     gone(&fx, 777);
+    fx.clock.advance_ms(61_000);
+    let stamped = fx.engine.now_ms();
+    fx.engine
+        .poll_launch(&id, &profile, 777, &mut state)
+        .unwrap();
+    let run = SightingSource::Run;
+    assert_eq!(
+        sightings(&fx),
+        [sighting(
+            "s-a",
+            a.as_str(),
+            NOW + 500,
+            stamped,
+            run,
+            stamped
+        )],
+        "the late poll stamped it past the exit"
+    );
     fx.clock.advance_ms(45_000);
     let t2 = fx.engine.now_ms();
 
     fx.engine.close_launch(&id, &profile, &state, t1).unwrap();
-    let run = SightingSource::Run;
     assert_eq!(
         sightings(&fx),
-        [sighting("s-a", a.as_str(), NOW + 500, t1, run, t2)]
+        [sighting("s-a", a.as_str(), NOW + 500, t1, run, t2)],
+        "the close moves it back to the exit"
     );
     assert_eq!(ended(&fx), [(a.to_string(), Some(t2))]);
 }
@@ -14605,14 +14897,15 @@ impl Engine {
         Ok(())
     }
 
-    /// Spec §6.1, at the child's exit: the sighting it saw last ends at `exited_at_ms`, when the
-    /// child exited, and the launch closes now unless the profile is still in use
-    /// (`session_state_at`). `run` calls it after `finish_run`, once its own launch reservation is
-    /// released, so the profile reads idle when nothing else runs there. Only the launch may
-    /// close late, which over-covers; the sighting never outlasts the child, so exit handling that
-    /// waits on locks cannot stretch it over a resume elsewhere. A background session the child
-    /// started, or another launcher's reservation, keeps the launch open, and the next scan that
-    /// finds the profile idle closes it.
+    /// Spec §6.1, at the child's exit: the sighting it saw last ends exactly at `exited_at_ms`,
+    /// when the child exited, moved back as well as forward, since a poll in flight as the child
+    /// exited may have stamped it later. The launch closes now unless the profile is still in
+    /// use (`session_state_at`). `run` calls it after `finish_run`, once its own launch
+    /// reservation is released, so the profile reads idle when nothing else runs there. Only the
+    /// launch may close late, which over-covers; the sighting never outlasts the child, so exit
+    /// handling that waits on locks cannot stretch it over a resume elsewhere. A background
+    /// session the child started, or another launcher's reservation, keeps the launch open, and
+    /// the next scan that finds the profile idle closes it.
     pub fn close_launch(
         &self,
         id: &LaunchId,
@@ -14766,7 +15059,8 @@ git commit -m "Record session evidence from scans, run launches and the statusli
    - **`close_launch` takes `exited_at_ms` (plan review; the signature changed, and so did the contract line in "Shared interfaces").**
      - `run` reads `engine.now_ms()` right after its wait returns and passes it. The last sighting ends then, and the launch's `ended_at` is the close's own now, set only when the profile is idle.
      - Otherwise exit handling that waits on locks would stretch a positive sighting past the child's exit and over a resume elsewhere. Spec §6.1 allows a late launch close, which only over-covers, but not a late sighting.
-     - Pinned by `close_stamps_the_sighting_at_the_exit_not_at_the_close`. Task 21 adapts its call.
+     - Task 12's `set_sighting_last_at` sets `last_at` to exactly `max(first_at, exited_at_ms)`, back as well as forward (plan review round 2). So a poll in flight as the child exited, which stamped the sighting later, is undone by the close.
+     - Pinned by `close_stamps_the_sighting_at_the_exit_not_at_the_close`, which covers that late poll. Task 21 adapts its call.
 4. **Every poll extends, not only when the mtime moves.**
    - The spec says `run` reads the record when its mtime changed. Re-reading is gated on the mtime here, but the sighting of the session it saw last is extended on every poll; the store writes at most once a minute (§6.4).
    - Without that, a session whose record never changes would be sighted only from its start to the first poll until the exit write. During a long session, a live report would leave its responses unattributed: the default home plus the open launch makes two candidates.
@@ -14798,7 +15092,7 @@ git commit -m "Record session evidence from scans, run launches and the statusli
 - Consumes:
   - Task 14: `pub fn tokens_lock_path(env: &Env, provider: &ProviderId) -> PathBuf`.
   - Task 12: `Store::delete_provider_rows`, which also deletes `token_files`, `token_sessions` (cascading `token_usage`), `session_sightings`, `run_launches`, `active_history` and `token_state` for the provider. Also `Store::empty_all` (existing; it empties every table).
-  - Task 12 (tests): `Store::{commit_token_batch, record_sighting, open_launch, token_epoch}`, `UsageRow`, `TokenFileRow`, `SightingRow`, `SightingSource`, `usage_key`.
+  - Task 12 (tests): `Store::{commit_token_batch, record_sighting, open_launch, token_epoch}`, `UsageRow`, `TokenFileRow`, `SightingRow`, `SightingSource`, `usage_key`. `commit_token_batch` takes the `epoch` read from `token_epoch()` (plan review round 2).
   - Task 2 (tests): `tagteam_core::tokens::TokenCounts`.
   - Existing: `FlockGuard::lock`, `LockError`, `Cancel`, `EngineError::signal`, `crate::hooks::point`, and `Engine::{on_point, also_on_point, cancel}` (feature `test-hooks`).
 - Produces:
@@ -14910,8 +15204,9 @@ fn plant_token_rows(fx: &Fx, provider: &ProviderId) {
         head_hash: [0; 8],
         tail_hash: [0; 8],
     };
+    let epoch = store.token_epoch().unwrap().map(|e| e.at);
     store
-        .commit_token_batch(provider, &[usage], &[file], &[], now)
+        .commit_token_batch(provider, epoch, &[usage], &[file], &[], now)
         .unwrap();
     let seen = SightingRow {
         session_id: "s-1".into(),
@@ -15479,6 +15774,7 @@ git commit -m "Make purge wait for a running token refresh"
    - I checked the `UNION` query with `sqlite3` against Task 11's step-3 schema as extracted from this plan.
    - A registered provider without `transcripts` gets a lock file it never uses, which is harmless.
    - A `--provider P` purge takes P's lock only.
+   - **One gap remains, closed by the purge generation (plan review round 2).** A provider with no token rows when the purge snapshots `token_providers()` is not locked, so its refresh may still be running. Its writes after `empty_all` are refused (`StoreError::TokenIndexPurged`), because they carry the `token_epoch` the refresh started under and `empty_all` deleted it (Task 12, Task 15 note 10). This task's test helper passes that epoch to `commit_token_batch` too.
 6. **Deterministic lock tests (plan review).**
    - `hold_tokens_locks` passes two hook points, `purge-tokens-lock` immediately before the wait and `purge-tokens-locked` immediately after.
    - `purge_waits_for_a_running_refresh` and `a_full_purge_waits_for_a_running_refresh_too` hold the lock as a refresh would. They wait on a channel for the first point, then set the cancel token. The purge must return the interruption, never reach the second point, and delete nothing. Were the acquisition removed, nothing between the points could be interrupted, so the tests would fail deterministically.
@@ -15567,8 +15863,9 @@ git commit -m "Make purge wait for a running token refresh"
       pub fn evidence_changed_at(&self, provider: &ProviderId) -> Result<Option<i64>, StoreError>;
       pub fn token_span(&self, provider: &ProviderId) -> Result<(Option<i64>, Option<i64>), StoreError>;
       // tests only:
-      pub fn commit_token_batch(&self, provider: &ProviderId, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
-      pub fn finish_token_refresh(&self, provider: &ProviderId, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
+      pub fn commit_token_batch(&self, provider: &ProviderId, epoch: Option<i64>, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
+      pub fn finish_token_refresh(&self, provider: &ProviderId, epoch: Option<i64>, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
+      pub fn token_epoch(&self) -> Result<Option<EpochRow>, StoreError>;
       pub fn record_sighting(&self, provider: &ProviderId, s: &SightingRow, min_gap_ms: i64) -> Result<bool, StoreError>;
       pub fn open_launch(&self, provider: &ProviderId, account_id: &str, started_at: i64, now_ms: i64) -> Result<(), StoreError>;
       // existing: accounts, events, usage_samples; tests: account, insert_event, set_active, delete_account
@@ -15810,8 +16107,13 @@ impl View {
     /// One batch of a refresh that has not completed (spec §5.2).
     fn index(&self, rows: &[UsageRow]) {
         self.store
-            .commit_token_batch(&cc(), rows, &[], &[], self.engine.now_ms())
+            .commit_token_batch(&cc(), self.generation(), rows, &[], &[], self.engine.now_ms())
             .unwrap();
+    }
+
+    /// The epoch a refresh would have read when it started: the purge generation (Task 12).
+    fn generation(&self) -> Option<i64> {
+        self.store.token_epoch().unwrap().map(|e| e.at)
     }
 
     /// `session` seen alive in `home` ("" for the default home) from `first` to `last`.
@@ -16296,6 +16598,65 @@ fn blocks_are_per_account_with_the_active_projection() {
 }
 
 #[test]
+fn a_filter_never_changes_a_blocks_burn_window() {
+    let v = View::new();
+    v.sight("s-1", "acct-a", T0, T0 + D);
+    v.sight("s-2", "acct-a", T0, T0 + D);
+    // One block, [T0, T0+5h), active at T0+4h30: its burn rate runs from its first response, at
+    // T0, whichever responses a filter keeps (spec §9).
+    v.index(&[
+        v.usage("s-1", T0, "model-a", 100, 0),
+        v.usage("s-2", T0 + 4 * H, "model-b", 600, 0),
+    ]);
+    let now = T0 + 270 * MIN;
+    v.fx.clock.set(now);
+    let span = BlockSpan {
+        start_ms: T0,
+        end_ms: T0 + 5 * H,
+        observed: false,
+    };
+    // model-b: 600 × 2,000 nano-dollars.
+    let want = project(&span, T0, now, 600, Some(1_200_000)).unwrap();
+    let by_model = v.query(TokenPeriod::Block, TokenGrouping::Model);
+    let key = format!("block:{T0}|account:acct-a|model:model-b");
+    for q in [
+        by_model.clone(),
+        TokenQuery {
+            models: Some(vec!["model-b".into()]),
+            ..by_model.clone()
+        },
+        TokenQuery {
+            session: Some("s-2".into()),
+            ..by_model.clone()
+        },
+    ] {
+        let r = v.report(&q);
+        let row = r
+            .rows
+            .iter()
+            .find(|row| row.key.as_str() == key)
+            .unwrap_or_else(|| panic!("{q:?}: no row {key}"));
+        let PeriodKey::Block {
+            active: Some(active),
+            ..
+        } = &row.period
+        else {
+            panic!("{q:?}: not the active block: {:?}", row.period);
+        };
+        assert_eq!(row.counts, counts(600, 0), "{q:?}");
+        assert_eq!(
+            (
+                active.elapsed_s,
+                active.tokens_per_min,
+                active.projected_tokens
+            ),
+            (want.elapsed_s, want.tokens_per_min, want.projected_tokens),
+            "{q:?}"
+        );
+    }
+}
+
+#[test]
 fn cost_is_partial_with_an_unpriced_model_and_none_when_all_are() {
     let v = View::new();
     v.sight("s-a", "acct-a", T0, T0 + 3 * D);
@@ -16444,7 +16805,7 @@ fn row_keys_are_stable_across_refreshes() {
     ]);
     v.sight("s-1", "acct-a", T0 + 2 * D, T0 + 3 * D);
     v.store
-        .finish_token_refresh(&cc(), &RefreshStats::default(), v.engine.now_ms())
+        .finish_token_refresh(&cc(), v.generation(), &RefreshStats::default(), v.engine.now_ms())
         .unwrap();
     for (q, before) in queries.iter().zip(&before) {
         let r = v.report(q);
@@ -16485,7 +16846,9 @@ fn a_partial_index_reports_rows_with_no_refreshed_at() {
         skipped_lines: 1,
         unreadable_files: 0,
     };
-    v.store.finish_token_refresh(&cc(), &stats, done).unwrap();
+    v.store
+        .finish_token_refresh(&cc(), v.generation(), &stats, done)
+        .unwrap();
     let index = IndexState {
         refreshed_at_ms: Some(done),
         changed_at_ms: Some(done),
@@ -16509,7 +16872,7 @@ fn index_state_moves_on_new_evidence_alone() {
     let v = View::new();
     v.index(&[v.usage("s-1", T0 + H, "model-a", 1, 0)]);
     v.store
-        .finish_token_refresh(&cc(), &RefreshStats::default(), v.engine.now_ms())
+        .finish_token_refresh(&cc(), v.generation(), &RefreshStats::default(), v.engine.now_ms())
         .unwrap();
     let state = || v.engine.token_index_state(&cc()).unwrap();
     let refreshed = state();
@@ -16694,10 +17057,10 @@ fn price_overrides_follow_the_report_provider() {
         speed: None,
         finalized: true,
     };
-    engine
-        .store()
-        .unwrap()
-        .commit_token_batch(&fake, &[row], &[], &[], engine.now_ms())
+    let store = engine.store().unwrap();
+    let generation = store.token_epoch().unwrap().map(|e| e.at);
+    store
+        .commit_token_batch(&fake, generation, &[row], &[], &[], engine.now_ms())
         .unwrap();
 
     let r = engine.token_report(&day_query(fake)).unwrap();
@@ -17275,7 +17638,6 @@ pub(super) fn group(
                 if !meets_range(&t.blocks[b].span, q) {
                     continue;
                 }
-                t.blocks[b].first_ms = t.blocks[b].first_ms.min(row.at_ms);
                 Period::Block(b)
             }
         };
@@ -17604,14 +17966,15 @@ impl Sessions {
 /// One block of one series (spec §9).
 struct Block {
     span: BlockSpan,
-    /// Its first response that counts: where the active block's burn rate starts.
+    /// Its first response, of the account's whole usage: where the active block's burn rate
+    /// starts, whatever the filters keep.
     first_ms: i64,
 }
 
 /// Spec §9: each series' blocks, an account's from its observed resets and its responses,
-/// a removed account's and the unattributed series' from their responses alone. Returns the
-/// blocks and, for each resolved response, its block. A series with no response that counts
-/// gets none.
+/// a removed account's and the unattributed series' from their responses alone, each with its
+/// first response. Returns the blocks and, for each resolved response, its block. A series with
+/// no response that counts gets none.
 fn series_blocks(
     p: &dyn Provider,
     store: &Store,
@@ -17647,7 +18010,9 @@ fn series_blocks(
             span,
             first_ms: i64::MAX,
         }));
-        for (&i, b) in entries.iter().zip(of) {
+        for ((&i, &at), b) in entries.iter().zip(&times).zip(of) {
+            let block = &mut blocks[base + b];
+            block.first_ms = block.first_ms.min(at);
             block_of[i] = base + b;
         }
     }
@@ -17900,7 +18265,7 @@ fn active_block(p: &Projection, cost: Option<Cost>) -> ActiveBlock {
 How it holds spec §10.1, for the reviewer:
 - **Attribution** is `place` then `attribute` per response, with the session's sightings found once per session (`Sessions::intern` moves them out of the evidence map). An id the store no longer holds becomes `RowAccount::Removed`.
 - **Filters before grouping.** The model and session filters are checked before attribution; the account filter right after it, on the slot. `Some(vec![])` returns before any usage is read.
-- **Blocks** come from each account's whole usage in the read window (the read goes 24 h before `since` and 5 h past `until`), and the filters only choose which responses count. Otherwise a `--model` filter would move block boundaries. A block that meets `[since, until)` is reported whole, and the total is the rows' sum. Only `WindowKind::Short` samples give observed resets; a removed account's samples were cascaded away (core §6.1), so its blocks are all inferred.
+- **Blocks** come from each account's whole usage in the read window (the read goes 24 h before `since` and 5 h past `until`), and the filters only choose which responses count. Otherwise a `--model` filter would move block boundaries. The same goes for each block's first response, where the active block's burn rate starts: a filter changes a row's tokens but never its burn window (`a_filter_never_changes_a_blocks_burn_window`). A block that meets `[since, until)` is reported whole, and the total is the rows' sum. Only `WindowKind::Short` samples give observed resets; a removed account's samples were cascaded away (core §6.1), so its blocks are all inferred.
 - **Order.** Newest period first (a session by its latest response that counts, ties by id so a split session's rows stay together; a block by its start), then accounts by position, removed accounts, unattributed, then models by name.
 - **Drill.** A day or month span is clipped to the query's range, so the drilled totals equal the row's. A block span is not clipped, because the row counts the whole block. A session drill keeps the query's account and model filters and drops the range.
 - **Cost** is per response, summed in nano-dollars. A row with every response unpriced has `None`, and one with some unpriced is `partial`. `unpriced_models` lists each model with a counted response that has no price, including a `fast` response of a model without a fast card.
@@ -17913,7 +18278,7 @@ How it holds spec §10.1, for the reviewer:
 cargo test -p tagteam-engine --locked --test tokens_view
 ```
 
-Expected: `test result: ok. 16 passed; 0 failed`.
+Expected: `test result: ok. 17 passed; 0 failed`.
 
 - [ ] **Step 5: Lint**
 
@@ -17943,7 +18308,7 @@ git commit -m "Add the token report view"
 6. **Rulings to record in the PR** (each within spec §§7, 9, 10):
    - `switch-recovered` events count as switches and `import` as adds in the default home's timeline. Spec §7.3 names `switch`, `add` and `remove`, but recovery commits the same change of login, and import creates the account the same way. `remove` takes its account from `from_id`, which is what `lifecycle.rs` records.
    - Block reads look back 24 h before `since`, where the outline said 5 h, and 5 h past `until`. Five hours makes a straddling block whole but can re-anchor the chain of inferred blocks before it as `since` moves. A day nearly always contains the 5-hour gap that resets the chain.
-   - Blocks are spans of the account's whole usage, and the filters choose responses, not spans. A block report's total is its rows' sum, which can include responses just before `since` in a straddling block.
+   - Blocks are spans of the account's whole usage, and the filters choose responses, not spans. The active block's burn rate also runs from the block's first response in that whole usage, so filtering to one model or session does not shorten it. A block report's total is its rows' sum, which can include responses just before `since` in a straddling block.
    - Drill clips day and month spans to the query's range but not block spans, and a session drill keeps the query's filters.
    - `IndexState.files` comes from `token_state`'s last completed refresh, as spec §10 says. The outline said to count `token_files`, which would read about 2.5k rows on every TUI or daemon poll. `IndexState.responses` is `token_state`'s live count, which every committed batch moves, so a TUI can show a cold index's progress.
    - `token_index_state` refuses a provider without transcripts (`invalid-input`), as `token_report` does.
@@ -21519,7 +21884,7 @@ git commit -m "Record the statusline's session as evidence"
 
 **Depends on:** 16
 **Files:**
-- Modify: `crates/tagteam/src/run.rs` (the whole file below: `run_session` records the launch before the spawn, waits on this thread while a scoped thread attaches the child's pid and then polls its session record, stamps the child's exit, and closes the launch after exit handling; new `open_launch`, `close_launch`, `wait_polling`, `StopOnDrop`; a unit test)
+- Modify: `crates/tagteam/src/run.rs` (the whole file below: `run_session` records the launch before the spawn, waits on this thread while a scoped thread attaches the child's pid and then polls its session record, stamps the child's exit as the wait returns, and closes the launch after exit handling; new `open_launch`, `close_launch`, `wait_polling`, `beside`, `StopOnDrop`; two unit tests)
 - Create: `crates/tagteam/tests/run_tokens.rs`
 - Test: `crates/tagteam/tests/run_tokens.rs`, `crates/tagteam/src/run.rs` (`mod tests`), and the existing `run_cli.rs` and `signals.rs` as regression checks
 
@@ -21536,7 +21901,7 @@ git commit -m "Record the statusline's session as evidence"
       pub fn open_launch(&self, provider: &ProviderId, account: &AccountId) -> Result<LaunchId, EngineError>;          // before the spawn
       pub fn attach_launch_pid(&self, id: &LaunchId, pid: u32) -> Result<(), EngineError>;  // the poller's first act
       pub fn poll_launch(&self, id: &LaunchId, profile: &Path, pid: u32, state: &mut LaunchPoll) -> Result<(), EngineError>; // every 2 s while the child runs
-      pub fn close_launch(&self, id: &LaunchId, profile: &Path, state: &LaunchPoll, exited_at_ms: i64) -> Result<(), EngineError>; // after finish_run: the sighting ends at exited_at_ms, the launch closes now if idle
+      pub fn close_launch(&self, id: &LaunchId, profile: &Path, state: &LaunchPoll, exited_at_ms: i64) -> Result<(), EngineError>; // after finish_run: the sighting ends at exited_at_ms exactly, the launch closes now if idle
   }
   // Task 7: Capabilities.transcripts. Existing: Launched { account: AccountRow, profile: PathBuf, .. }, Engine::finish_run
   // Task 12, tagteam_engine::store (tests)
@@ -21550,13 +21915,13 @@ Spec §6.1 in `run`'s terms:
 
 - **The launch** is recorded right after the token's last look and before the spawn, so it covers every response the child makes. Only a provider with `transcripts` records one.
 - **The poll** runs on a scoped thread beside the existing wait, which stays on the calling thread with its signal forwarding unchanged: after the spawn, the calling thread goes straight to the first forward and the wait loop. The poller's first act is to attach the child's pid to the launch; it then reads the record every 2 s (Task 16's `poll_launch` skips an unchanged mtime) and stops when an `AtomicBool` is set. Every store write while the child runs is the poller's, so a busy store never delays the wait or a forwarded signal. The flag is set by a guard dropped when the wait returns or unwinds, so the scope can never wait on the poller forever.
-- **The exit** is stamped with `engine.now_ms()` as soon as the wait returns, before `finish_run`: that is `exited_at_ms`, where the sighting ends. It is read once the poller is joined, so no poll wrote a later end (`set_sighting_last_at` only moves an end forward); the join waits at most for the one poll, or the attach, in flight.
+- **The exit** is stamped with `engine.now_ms()` on the calling thread as soon as the wait returns, before the stop flag is set and the poller joined (`beside`; `wait_polling` returns the stamp with the exit status): that is `exited_at_ms`, where the sighting ends. A poller blocked on a store write therefore never delays it. A poll that wrote a later end just before stopping is corrected by `close_launch`, since Task 12's `set_sighting_last_at` sets the end exactly (backward too, clamped at `first_at`).
 - **The close** comes after `finish_run`, not before it: until exit handling unlinks this process's launch reservation, the profile is in use by this very run (core §12.5, §12.6), and `close_launch` would always leave the launch open. The profile and the launch's id are copied before `finish_run` consumes `launched`. The sighting still ends at the exit stamp, so exit handling's time is never the session's; only the launch ends after it. A spawn that fails closes its launch after `abandon`'s exit handling, with no sighting, as no child ever ran.
 - **Failures are evidence lost, never a run failed.** A launch that cannot be recorded is one warning on stderr before the spawn; a failed pid attach or poll goes to the log at warn (a failed poll once per run), because stderr belongs to `claude` while it runs; a failed close is a warning after the child has exited. None of them changes the exit code.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `crates/tagteam/tests/run_tokens.rs`. It drives the binary with the fake `claude` (`FAKE_CLAUDE_HOLD` keeps a session running; `FAKE_CLAUDE_RECORD` makes it write its session record, `sessionId` `fake-<pid>`, into the profile) and reads the store's evidence tables between steps. `run_sights_the_child_session` also parks the run at the existing `after-exit` pause point, between the child's exit and exit handling, and reads the clock there: the sighting must end no later than that, and the launch no earlier.
+Create `crates/tagteam/tests/run_tokens.rs`. It drives the binary with the fake `claude` (`FAKE_CLAUDE_HOLD` keeps a session running; `FAKE_CLAUDE_RECORD` makes it write its session record, `sessionId` `fake-<pid>`, into the profile) and reads the store's evidence tables between steps. `run_sights_the_child_session` also parks the run at the existing `after-exit` pause point, between the child's exit and exit handling, and reads the clock as it lets the child go and again at the pause: the sighting's end, the exit stamp, must fall between the two reads, and the launch must end no earlier than the pause.
 
 ```rust
 //! `tagteam run`'s evidence for the token report (token report spec §6.1), through the binary
@@ -21744,9 +22109,9 @@ fn run_records_a_launch_and_closes_it() {
 fn run_sights_the_child_session() {
     // Spec §6.1: while the child runs, `run` reads its record every 2 s and sights the session
     // it names in the profile's home, keyed by the record's `startedAt`. The child's exit,
-    // stamped before exit handling, ends that sighting; the launch closes after exit handling.
-    // The run is parked between the two (`after-exit`), so the test's clock read there falls
-    // after the stamp and before the close, whatever either took.
+    // stamped as soon as the wait returns, is where that sighting ends; the launch closes after
+    // exit handling. The run is parked between the two (`after-exit`), so two reads of the
+    // clock, as the child is let go and at the pause, bracket the stamp whatever anything took.
     let home = Home::new();
     let out = home.out("sighting");
     let hold = home.root().join("hold");
@@ -21787,6 +22152,7 @@ fn run_sights_the_child_session() {
         ),
         "{seen:?}"
     );
+    let released_at = now_ms();
     fs::write(&hold, b"").unwrap();
     wait_for("the run's exit handling", || {
         pause.join("paused").exists().then_some(())
@@ -21805,9 +22171,11 @@ fn run_sights_the_child_session() {
     let ended = home.launches()[0]
         .ended_at
         .expect("closed after exit handling");
+    // A poll writes at most once a minute, so only `close_launch`, which sets the end to the
+    // stamp exactly, can have put it in this bracket.
     assert!(
-        seen.last_at <= after[0].last_at && after[0].last_at <= parked_at,
-        "the exit stamp ends the sighting, before exit handling at {parked_at}: {after:?} after {seen:?}"
+        (released_at..=parked_at).contains(&after[0].last_at),
+        "the sighting ends at the exit stamp, between {released_at} and {parked_at}: {after:?}"
     );
     assert!(
         parked_at <= ended,
@@ -21888,7 +22256,7 @@ fn evidence_failures_never_change_the_exit_code() {
 }
 ```
 
-`run.rs`'s new unit test, `the_stop_flag_is_set_however_the_wait_ends`, is in the file of Step 3.
+`run.rs`'s new unit tests, `the_exit_is_stamped_before_the_poller_is_joined` and `the_stop_flag_is_set_however_the_wait_ends`, are in the file of Step 3.
 
 - [ ] **Step 2: Run them and see them fail**
 
@@ -22003,15 +22371,14 @@ pub(crate) fn run_session(
     // spawned, the terminal could not deliver to it.
     forward(pid, cancel.take(), true);
     let mut seen = LaunchPoll::default();
-    let status = match &launch_id {
+    // Token report spec §6.1: the child's exit, stamped as soon as the wait returns, ends its
+    // sighting.
+    let (status, exited_at_ms) = match &launch_id {
         Some(id) => wait_polling(engine, id, &profile, pid, &mut seen, || {
             wait(&mut child, cancel)
         }),
-        None => wait(&mut child, cancel),
+        None => (wait(&mut child, cancel), engine.now_ms()),
     };
-    // Token report spec §6.1: the child's exit, stamped before exit handling, ends its sighting.
-    // The poller is joined by now, so no poll wrote a later end than this.
-    let exited_at_ms = engine.now_ms();
     // What forwarding left is spent, so exit handling meets only a signal sent from now on.
     let _ = cancel.take();
     pause_point("after-exit");
@@ -22083,10 +22450,11 @@ fn close_launch(
 }
 
 /// Token report spec §6.1: runs `wait` on this thread while a scoped thread records the child's
-/// pid, then reads its session record every `RECORD_POLL`, until `wait` returns. The store
-/// writes are the poller's, so a busy store never delays the wait or the signals it forwards.
-/// The poller never touches the cancel token or the terminal: a failure is logged, once, and
-/// the next poll tries again.
+/// pid, then reads its session record every `RECORD_POLL`, until `wait` returns. Returns what
+/// `wait` returned and the child's exit, stamped by `beside` before the poller is joined. The
+/// store writes are the poller's, so a busy store never delays the wait, the signals it
+/// forwards or the stamp. The poller never touches the cancel token or the terminal: a failure
+/// is logged, once, and the next poll tries again.
 fn wait_polling<T>(
     engine: &Engine,
     id: &LaunchId,
@@ -22094,36 +22462,51 @@ fn wait_polling<T>(
     pid: u32,
     seen: &mut LaunchPoll,
     wait: impl FnOnce() -> T,
-) -> T {
+) -> (T, i64) {
+    let poller = |stop: &AtomicBool| {
+        if let Err(e) = engine.attach_launch_pid(id, pid) {
+            tracing::warn!(
+                kind = e.kind(),
+                "could not record the session's pid for the token report"
+            );
+        }
+        let mut next = Instant::now();
+        let mut logged = false;
+        while !stop.load(Ordering::Relaxed) {
+            if Instant::now() >= next {
+                if let Err(e) = engine.poll_launch(id, profile, pid, seen) {
+                    if !logged {
+                        tracing::warn!(
+                            kind = e.kind(),
+                            "could not read the session's record for the token report"
+                        );
+                        logged = true;
+                    }
+                }
+                next = Instant::now() + RECORD_POLL;
+            }
+            thread::sleep(POLL);
+        }
+    };
+    beside(poller, wait, || engine.now_ms())
+}
+
+/// Runs `wait` on this thread while a scoped thread runs `poller` until its flag is set, and
+/// returns what `wait` returned with `stamp`, read on this thread as soon as `wait` returns:
+/// before the flag is set and the poller joined, so a poller blocked in a store write never
+/// delays it. The flag is set however `wait` ends, a panic included.
+fn beside<T>(
+    poller: impl FnOnce(&AtomicBool) + Send,
+    wait: impl FnOnce() -> T,
+    stamp: impl FnOnce() -> i64,
+) -> (T, i64) {
     let stop = AtomicBool::new(false);
     thread::scope(|s| {
-        s.spawn(|| {
-            if let Err(e) = engine.attach_launch_pid(id, pid) {
-                tracing::warn!(
-                    kind = e.kind(),
-                    "could not record the session's pid for the token report"
-                );
-            }
-            let mut next = Instant::now();
-            let mut logged = false;
-            while !stop.load(Ordering::Relaxed) {
-                if Instant::now() >= next {
-                    if let Err(e) = engine.poll_launch(id, profile, pid, seen) {
-                        if !logged {
-                            tracing::warn!(
-                                kind = e.kind(),
-                                "could not read the session's record for the token report"
-                            );
-                            logged = true;
-                        }
-                    }
-                    next = Instant::now() + RECORD_POLL;
-                }
-                thread::sleep(POLL);
-            }
-        });
+        s.spawn(|| poller(&stop));
         let _stop = StopOnDrop(&stop);
-        wait()
+        let waited = wait();
+        let at = stamp();
+        (waited, at)
     })
 }
 
@@ -22278,6 +22661,32 @@ mod tests {
     }
 
     #[test]
+    fn the_exit_is_stamped_before_the_poller_is_joined() {
+        // Token report spec §6.1: a poller stuck in a store write. It goes on only once the
+        // stamp is read, so a stamp read after the join would find it finished; the 5 s bound
+        // only keeps such a failure from hanging.
+        let (stamped, finished) = (AtomicBool::new(false), AtomicBool::new(false));
+        let poller = |_stop: &AtomicBool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !stamped.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            finished.store(true, Ordering::SeqCst);
+        };
+        let stamp = || {
+            let busy = !finished.load(Ordering::SeqCst);
+            stamped.store(true, Ordering::SeqCst);
+            i64::from(busy)
+        };
+        assert_eq!(
+            beside(poller, || "exited", stamp),
+            ("exited", 1),
+            "the stamp is read while the poller is still busy"
+        );
+        assert!(finished.load(Ordering::SeqCst), "and the poller is joined");
+    }
+
+    #[test]
     fn the_stop_flag_is_set_however_the_wait_ends() {
         let stop = AtomicBool::new(false);
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -22300,7 +22709,7 @@ cargo test -p tagteam --locked --features test-support --test run_tokens --test 
 cargo test -p tagteam --locked --features test-support --lib run::tests
 ```
 
-Expected: `run_tokens` 4 passed (about 10 s: two runs poll for 2 s or more); `run_cli` and `signals` unchanged; `run::tests` 3 passed.
+Expected: `run_tokens` 4 passed (about 10 s: two runs poll for 2 s or more); `run_cli` and `signals` unchanged; `run::tests` 4 passed.
 
 - [ ] **Step 5: Lint**
 
@@ -22319,11 +22728,11 @@ git commit -m "Record run launches and poll their sessions"
 
 #### Notes for the controller
 
-1. **Deviation from the outline:** the outline puts `close_launch` "after exit and before `finish_run` consumes `launched`". Before `finish_run`, this run's own reservation still holds the profile, so `close_launch`'s in-use check (Task 16: `session_state_at(..).owned()`) would never let the launch close at the exit, and `run_records_a_launch_and_closes_it` would fail. This task copies the id and profile before `finish_run` and closes after it. The sighting is not delayed by that: it ends at `exited_at_ms`, read before `finish_run` (plan review). Only the launch ends when exit handling has finished, a few milliseconds to seconds after the child's exit; a late launch end over-covers, which spec §6.1 accepts.
-2. **What the tests require of Task 16:** `poll_launch` reads `<session_records_dir(profile)>/<pid>.json` and records `(sessionId, home = account id, first_at = startedAt, source Run)`; `close_launch` moves `state.last_sighting`'s end forward to `exited_at_ms`, never back, and closes the launch at now only when the profile is not in use; a held launch reservation of another process counts as in use (`a_launch_stays_open_while_the_profile_is_in_use`, using `common::hold_launch`). `run_sights_the_child_session` asserts the order through the binary with the system clock, which is what the binary stamps with: the sighting's end, then the pause, then the launch's end. It compares clock reads only, never a duration.
+1. **Deviation from the outline:** the outline puts `close_launch` "after exit and before `finish_run` consumes `launched`". Before `finish_run`, this run's own reservation still holds the profile, so `close_launch`'s in-use check (Task 16: `session_state_at(..).owned()`) would never let the launch close at the exit, and `run_records_a_launch_and_closes_it` would fail. This task copies the id and profile before `finish_run` and closes after it. The sighting is not delayed by that: it ends at `exited_at_ms`, read as the wait returns, before the poller is joined and before `finish_run` (plan review). Only the launch ends when exit handling has finished, a few milliseconds to seconds after the child's exit; a late launch end over-covers, which spec §6.1 accepts.
+2. **What the tests require of Task 16:** `poll_launch` reads `<session_records_dir(profile)>/<pid>.json` and records `(sessionId, home = account id, first_at = startedAt, source Run)`; `close_launch` sets `state.last_sighting`'s end to `exited_at_ms` exactly, through Task 12's `set_sighting_last_at` (backward too, clamped at `first_at`), and closes the launch at now only when the profile is not in use; a held launch reservation of another process counts as in use (`a_launch_stays_open_while_the_profile_is_in_use`, using `common::hold_launch`). `run_sights_the_child_session` brackets the stamp through the binary with the system clock, which is what the binary stamps with: a read as the child is let go, then the sighting's end, then a read at the `after-exit` pause, then the launch's end. A poll extends a sighting at most once a minute (Task 16's `SIGHTING_GAP_MS`), so only the close can put the end inside that bracket. The test compares clock reads only, never a duration. That the stamp precedes the join is `the_exit_is_stamped_before_the_poller_is_joined`'s to pin, with a poller that stays busy until the stamp is read; its 5 s bound only keeps a regression from hanging, and a passing run never waits on it.
 3. **Batch G shares the `tagteam` crate with Task 19** (see Task 19's note 1); this test file also loads `tests/common/mod.rs`, which Task 19 extends.
 4. **`open_launch` is a store write before the spawn**, so a busy store can delay the session by up to the store's 5 s busy timeout. Bounding it, as `CACHE_WRITE_WAIT` bounds the statusline's, would need an engine variant; it is left as is, and the reviewer may rule otherwise. The pid attach is no longer such a write (plan review): it is the poller's first act, so it never stands between the spawn and the first forward.
-5. **What was verified.** `wait_polling` and `StopOnDrop`, exactly as above but with a stand-in engine and log macro, compiled, passed clippy and ran in a scratch build (the poller attached the pid before its first poll, the wait ran at once on the calling thread, and the poller stopped when the wait returned). The whole `run.rs` was rustfmt-checked but not compiled: it needs Task 16's API. `run_tokens.rs` was type-checked with clippy against stubs of `common` and the store API.
+5. **What was verified.** `wait_polling`, `beside` and `StopOnDrop`, exactly as above but with a stand-in engine and log macro, compiled, passed clippy and ran in a scratch build (the poller attached the pid before its first poll, the wait ran at once on the calling thread, and the poller stopped when the wait returned). Both unit tests passed, and `the_exit_is_stamped_before_the_poller_is_joined` failed, as it should, against a `beside` that stamped after the join. The whole `run.rs` was rustfmt-checked but not compiled: it needs Task 16's API. `run_tokens.rs` was type-checked with clippy against stubs of `common` and the store API.
 
 ---
 
