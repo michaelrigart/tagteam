@@ -174,6 +174,7 @@ impl Home {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            settings_warned: false,
         }
     }
 
@@ -255,6 +256,27 @@ fn a_switch_runs_the_cli_s_switch_and_captures_its_words() {
     );
     assert!(dialogs.asked.is_empty());
     assert_eq!(live_email(home.root()), "a@x.co");
+}
+
+#[test]
+fn the_settings_warnings_the_tui_printed_are_not_repeated_in_an_action_s_output() {
+    let home = Home::with_two();
+    let dir = home.env.config_dir();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("config.toml"), "[autoswitch]\nthreshold = 5\n").unwrap();
+    // The CLI itself still says it, once per command.
+    let (_, _, err) = home.cli_run(&["list"]);
+    assert!(
+        err.starts_with("warning: ") && err.lines().count() == 1,
+        "{err}"
+    );
+    let (host, _) = home.host();
+    let outcome = host.act(&Action::Switch(home.at(1)), &mut Dialogs::none());
+    assert_eq!(
+        done(outcome),
+        (0, SWITCHED_TO_A.to_owned(), String::new()),
+        "the warning was printed at start-up"
+    );
 }
 
 #[test]

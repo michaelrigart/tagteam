@@ -162,6 +162,7 @@ impl H {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            settings_warned: false,
         };
         adjust(&mut ctx);
         let (mut out, mut err) = (Vec::new(), Vec::new());

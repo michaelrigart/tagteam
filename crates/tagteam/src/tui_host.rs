@@ -41,6 +41,8 @@ impl CliHost {
         inside.env.cancel = shutdown;
         // Captured, so never a terminal; `--no-color` keeps it plain either way.
         inside.stdout_terminal = false;
+        // `tui_cmd` printed the settings warnings once, before the alternate screen.
+        inside.settings_warned = true;
         CliHost {
             inside,
             foreground: ctx.clone(),
