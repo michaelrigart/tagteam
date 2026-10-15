@@ -286,7 +286,8 @@ const UPSERT_USAGE: &str = "INSERT INTO token_usage (key, session, at, model, si
 /// known (spec §4).
 const UPSERT_SESSION: &str = "INSERT INTO token_sessions (provider, session_id, project) \
      VALUES (?1, ?2, ?3) ON CONFLICT(provider, session_id) DO UPDATE SET \
-     project = coalesce(token_sessions.project, excluded.project) RETURNING id";
+     project = coalesce(token_sessions.project, excluded.project) \
+     RETURNING id, project IS NOT NULL";
 
 const MODEL_ID: &str = "SELECT id FROM token_models WHERE provider = ?1 AND name = ?2";
 
@@ -514,7 +515,9 @@ impl Store {
             let mut session = tx.prepare(UPSERT_SESSION)?;
             let mut model_id = tx.prepare(MODEL_ID)?;
             let mut insert_model = tx.prepare(INSERT_MODEL)?;
-            let mut sessions: HashMap<&str, i64> = HashMap::new();
+            // Each session's id, and whether its project is known yet: a later row that knows
+            // it upserts the session again, so the first project known is kept (spec §2.2).
+            let mut sessions: HashMap<&str, (i64, bool)> = HashMap::new();
             let mut models: HashMap<&str, i64> = HashMap::new();
             for row in &rows {
                 match read.query_row([row.key], merged_from_row).optional()? {
@@ -523,13 +526,13 @@ impl Store {
                     Some(_) => continue,
                 }
                 let id = match sessions.get(row.session_id.as_str()) {
-                    Some(id) => *id,
-                    None => {
-                        let id: i64 = session.query_row(
+                    Some(&(id, known)) if known || row.project.is_none() => id,
+                    _ => {
+                        let (id, known) = session.query_row(
                             params![provider.as_str(), row.session_id, row.project],
-                            |r| r.get(0),
+                            |r| Ok((r.get(0)?, r.get(1)?)),
                         )?;
-                        sessions.insert(&row.session_id, id);
+                        sessions.insert(&row.session_id, (id, known));
                         id
                     }
                 };

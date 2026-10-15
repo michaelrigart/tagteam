@@ -1118,6 +1118,46 @@ fn reads_are_per_provider_by_range_and_session() {
 }
 
 #[test]
+fn a_session_takes_the_first_project_known_within_a_batch_and_across_batches() {
+    // Spec §2.2: a session's project is the first one known. A response with no working
+    // directory leaves it unknown, and a later response of that session supplies it, whether
+    // it comes in the same batch or a later one.
+    let (_d, s, _) = store();
+    let mut unknown = row(1, "s1", T, 1);
+    unknown.project = None;
+    let known = row(2, "s1", T + 10, 1);
+    commit(&s, &[unknown, known.clone()], T);
+    let projects = |s: &Store, session| {
+        s.token_usage(&cc(), None, None, Some(session))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.project)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        projects(&s, "s1"),
+        [known.project.clone(), known.project.clone()],
+        "a later row of the same batch supplies it"
+    );
+
+    let mut first = row(3, "s2", T, 1);
+    first.project = None;
+    commit(&s, &[first], T);
+    assert_eq!(projects(&s, "s2"), [None]);
+    let mut other = row(4, "s2", T + 10, 1);
+    other.project = Some("/work/other".into());
+    commit(&s, &[other], T);
+    let mut late = row(5, "s2", T + 20, 1);
+    late.project = Some("/work/late".into());
+    commit(&s, &[late], T);
+    assert_eq!(
+        projects(&s, "s2"),
+        vec![Some("/work/other".to_owned()); 3],
+        "a later batch supplies it, and the first one known stays"
+    );
+}
+
+#[test]
 fn a_prune_after_a_full_purge_is_refused() {
     // Spec §5.1, §13: a prune is a write of the refresh's generation. A purge between the last
     // batch and the prune leaves it nothing to write: no lease, no state row.
