@@ -51,6 +51,14 @@ pub enum Command {
     List,
     /// Show the live account
     Status,
+    /// Open the terminal UI: accounts with their usage, usage history, and the account actions
+    ///
+    /// A bare `tagteam` opens it too, when stdin and stdout are terminals and --json is not
+    /// given. q quits; ? lists the keys.
+    Tui {
+        /// The screen to open on
+        screen: Option<ScreenArg>,
+    },
     /// Switch to the next account, to ACCOUNT, or to the one a usage strategy picks
     Switch {
         account: Option<String>,
@@ -467,6 +475,15 @@ impl TypedValueParser for GroupingParser {
             .into_iter(),
         ))
     }
+}
+
+/// The screen `tui` opens on (TUI spec §3). Part B adds `tokens`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ScreenArg {
+    /// The accounts table (the default)
+    Accounts,
+    /// Usage history
+    History,
 }
 
 impl Command {

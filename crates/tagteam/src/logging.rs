@@ -33,6 +33,9 @@ pub(crate) struct LogConfig {
     pub debug: bool,
     /// Neither `--no-color` nor `NO_COLOR`: stderr's lines may be coloured, on a terminal.
     pub color: bool,
+    /// Whether events go to stderr at all: false while the TUI owns the terminal (TUI spec
+    /// §10.3), so `--debug` and ERROR events go to the file only.
+    pub stderr: bool,
     /// `Env::log_file` (§5, §14.2).
     pub log_file: PathBuf,
     /// `Env::home`, whose paths the file writes as `~/…`.
@@ -53,15 +56,26 @@ pub(crate) fn init(cfg: LogConfig, err: &mut dyn Write) {
             .event_format(Line::new(&cfg.home))
             .with_filter(EnvFilter::new(directive))
     });
-    let stderr = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr)
-        .with_ansi(cfg.color && std::io::stderr().is_terminal())
-        .with_target(false)
-        .with_filter(stderr_filter(cfg.debug));
+    let stderr = stderr_layer(cfg.stderr, cfg.debug, cfg.color);
     let subscriber = tracing_subscriber::registry().with(stderr).with(file);
     if tracing::subscriber::set_global_default(subscriber).is_ok() {
         install_panic_hook();
     }
+}
+
+/// M2's stderr layer, ERROR or with `--debug` DEBUG; none while the TUI owns the terminal,
+/// which nothing else may write to (TUI spec §10.3).
+fn stderr_layer<S>(on: bool, debug: bool, color: bool) -> Option<impl Layer<S>>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    on.then(|| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(color && std::io::stderr().is_terminal())
+            .with_target(false)
+            .with_filter(stderr_filter(debug))
+    })
 }
 
 /// M2's stderr: ERROR, or DEBUG with `--debug`. Never a panic's line: the default hook prints
@@ -109,7 +123,8 @@ fn file_directive(debug: bool, var: Option<&OsStr>, err: &mut dyn Write) -> Opti
 /// stderr; otherwise it falls silent (§14.2).
 fn log_file(cfg: &LogConfig) -> LogFile {
     let file = LogFile::new(cfg.log_file.clone());
-    if !cfg.debug {
+    // The notice goes to stderr, which the TUI owns while it runs (TUI spec §10.3).
+    if !cfg.debug || !cfg.stderr {
         return file;
     }
     file.on_disable(Box::new(|path, e| {
@@ -454,5 +469,13 @@ mod tests {
             !debug.contains("a trace") && !debug.contains("boom"),
             "{debug}"
         );
+    }
+
+    #[test]
+    fn the_tui_s_log_has_no_stderr_layer() {
+        // TUI spec §10.3: while the TUI owns the terminal, `--debug` and ERROR go to the file
+        // only.
+        assert!(stderr_layer::<tracing_subscriber::Registry>(false, true, true).is_none());
+        assert!(stderr_layer::<tracing_subscriber::Registry>(true, false, false).is_some());
     }
 }

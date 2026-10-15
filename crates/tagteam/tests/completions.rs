@@ -93,6 +93,7 @@ fn each_shell_s_script_offers_every_possible_value_of_every_argument() {
         "best",
         "next-available",
         "consume-first",
+        "accounts",
         "claude-code",
         "bash",
         "true",
@@ -405,6 +406,7 @@ fn fish_completes_a_positional_only_in_its_place() {
     assert_eq!(
         patterns,
         [
+            "tui",
             "shell-init",
             "config get",
             "config set",
@@ -420,6 +422,7 @@ fn fish_completes_a_positional_only_in_its_place() {
     );
     let keys: BTreeSet<&str> = names.iter().map(String::as_str).collect();
     let shells = BTreeSet::from(["bash", "zsh", "fish"]);
+    let screens = BTreeSet::from(["accounts", "history"]);
     let nothing = BTreeSet::new();
     for (line, offered) in [
         ("tagteam shell-init", &shells),
@@ -427,6 +430,9 @@ fn fish_completes_a_positional_only_in_its_place() {
         ("tagteam config set", &keys),
         ("tagteam config unset", &keys),
         ("tagteam completions", &shells),
+        ("tagteam tui", &screens),
+        ("tagteam -p claude-code --no-color tui", &screens),
+        ("tagteam tui history", &nothing),
         // Options anywhere, and a global option's value, shift nothing.
         ("tagteam -p claude-code config get", &keys),
         ("tagteam config --provider claude-code --json set", &keys),
