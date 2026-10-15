@@ -7,14 +7,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use common::{Fx, LSTART};
+use common::{Chmod, Fx, LSTART};
 use serde_json::json;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{LaunchRow, SightingRow, SightingSource};
 use tagteam_engine::tokens::{LaunchId, LaunchPoll, Tenure};
 use tagteam_provider::{
-    FakeProcess, FlockGuard, LAUNCH_DIR, PENDING_LAUNCH_DIR, PendingEntry, PendingLaunch,
-    parse_lstart,
+    FakeProcess, FlockGuard, LAUNCH_DIR, MARKER_FILE, PENDING_LAUNCH_DIR, PendingEntry,
+    PendingLaunch, parse_lstart,
 };
 
 const NOW: i64 = 1_790_000_000_000;
@@ -1903,6 +1903,36 @@ fn a_scan_records_a_pending_file_it_cannot_use_as_a_launch_open_from_its_name() 
         [
             (a.to_string(), Some(NOW + 11_000)),
             (a.to_string(), Some(NOW + 11_000))
+        ]
+    );
+}
+
+#[test]
+fn a_scan_skips_the_pending_launches_it_cannot_see() {
+    // Spec §6.2: a pending directory that cannot be listed, a profile whose marker cannot be
+    // read, and a profiles directory that cannot be listed leave the scan nothing to record. It
+    // skips them and fails on none; once they can be read, it records what they hold.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let (pa, pb) = (fx.make_profile(&a), fx.make_profile(&b));
+    pending(&fx, &pa, &a, NOW - 5_000, Some(NOW - 4_000), 1);
+    pending(&fx, &pb, &b, NOW - 3_000, Some(NOW - 2_000), 2);
+    {
+        let _a = Chmod::new(&pa.join(PENDING_LAUNCH_DIR), 0o300);
+        let _b = Chmod::new(&pb.join(MARKER_FILE), 0o000);
+        assert_eq!(sight(&fx), 0);
+        let _all = Chmod::new(&fx.env.data_dir().join("sessions"), 0o300);
+        assert_eq!(sight(&fx), 0);
+    }
+    assert!(launches(&fx).is_empty());
+
+    assert_eq!(sight(&fx), 2);
+    assert_eq!(
+        ended(&fx),
+        [
+            (a.to_string(), Some(NOW - 4_000)),
+            (b.to_string(), Some(NOW - 2_000))
         ]
     );
 }

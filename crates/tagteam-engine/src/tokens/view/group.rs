@@ -12,13 +12,14 @@ use tagteam_core::tokens::{
     month_bounds_ms, month_of, observed_blocks, place, project,
 };
 use tagteam_core::{AccountId, ProviderId, WindowKind};
-use tagteam_provider::{PendingLaunch, Provider};
+use tagteam_provider::Provider;
 
 use super::{
     AccountSel, ActiveBlock, Basis, Cost, PeriodKey, RowAccount, RowKey, TokenCounts,
     TokenGrouping, TokenPeriod, TokenQuery, TokenRow, TokenTotal,
 };
 use crate::store::{AccountRow, EpochRow, EventRow, LaunchRow, Store, StoreError, UsageRow};
+use crate::tokens::evidence::PendingEvidence;
 
 /// How far before `since` a block report reads (spec §9). A block that straddles `since` is
 /// then whole, and the chain of inferred blocks leading to it starts after a quiet gap of five
@@ -53,8 +54,9 @@ pub(super) struct Reads {
     pub(super) epoch: Option<EpochRow>,
     /// The responses `usage` read for the query.
     pub(super) usage: Vec<UsageRow>,
-    /// The launches `run` kept in pending files (spec §6.1), placed as stored ones.
-    pub(super) pending: Vec<PendingLaunch>,
+    /// The launches `run` kept in pending files (spec §6.1), placed as stored ones, and what
+    /// of them could not be read.
+    pub(super) pending: PendingEvidence,
     /// The stored launches.
     pub(super) launches: Vec<LaunchRow>,
 }
@@ -232,7 +234,7 @@ impl Evidence {
         let stored = &reads.launches;
         // A pending launch the store already holds is the store's: a scan that recorded it has
         // not yet removed the file, or `run` recorded it late.
-        let unstored = reads.pending.iter().filter(|l| {
+        let unstored = reads.pending.launches.iter().map(|(_, l)| l).filter(|l| {
             !stored
                 .iter()
                 .any(|s| s.account_id == l.account_id.as_str() && s.started_at == l.started_at_ms)
@@ -249,6 +251,13 @@ impl Evidence {
                     account: l.account_id.clone(),
                     start_ms: l.started_at_ms,
                     end_ms: l.ended_at_ms,
+                }))
+                // Spec §7.2: pending files that could not be read are never taken for none. Their
+                // profile's account may have been launched at any time.
+                .chain(reads.pending.unseen.iter().map(|account| Launch {
+                    account: account.clone(),
+                    start_ms: i64::MIN,
+                    end_ms: None,
                 }))
                 .collect(),
         );
@@ -272,6 +281,8 @@ impl Evidence {
                     _ => None,
                 })
                 .max(),
+            // No profile's pending files were seen, so any profile may have run at any time.
+            unreadable: reads.pending.unlisted,
         };
         let history: Vec<ActiveChange> = store
             .active_history(provider)?

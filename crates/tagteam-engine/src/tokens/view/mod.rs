@@ -387,11 +387,7 @@ impl Engine {
         let usage = group::usage(q, &store)?;
         hooks::point(self, "report-usage-read")?;
         // Launches `run` kept in a pending file count as stored ones, read only.
-        let pending = self
-            .pending_launches(p.as_ref(), epoch.map(|e| e.at))
-            .into_iter()
-            .map(|(_, launch)| launch)
-            .collect();
+        let pending = self.pending_evidence(p.as_ref(), epoch.map(|e| e.at));
         hooks::point(self, "report-pending-read")?;
         let launches = store.launches(&q.provider)?;
         hooks::point(self, "report-launches-read")?;
