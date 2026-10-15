@@ -3,6 +3,7 @@
 //! provider's paths, keys or endpoints, and reaches providers through the engine only.
 
 pub mod auto;
+pub mod backoff;
 pub mod events;
 pub mod protocol;
 pub mod provider_job;
