@@ -23,6 +23,9 @@ with the one before, so any release may contain breaking changes. Each section s
 - `tagteam daemon`: a background process that keeps the usage of the live account and the
   switchable accounts fresh and switches accounts automatically, as `tagteam auto` does, for
   each provider with two or more switchable accounts. Every command still works without it.
+- The daemon keeps the `tagteam tokens` index current. It records running Claude Code sessions
+  every 5 seconds and indexes new transcript lines every minute, and its socket announces each
+  change with a `token-index` event.
 - `tagteam daemon install`, `uninstall` and `status`. `install` sets up a LaunchAgent on macOS
   or a systemd user unit on Linux, which starts the daemon at login and restarts it after a
   failure or an upgrade. `install --print` prints the unit instead.

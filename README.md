@@ -194,6 +194,7 @@ From then on it starts when you log in, and restarts if it fails. While it runs,
   `list`;
 - switches accounts automatically, exactly as `tagteam auto` does, for every provider with at
   least two switchable accounts;
+- keeps the `tagteam tokens` index current, so token reports open without a wait;
 - tells you about the events that matter (see below);
 - serves a local socket that the TUI and scripts can read.
 

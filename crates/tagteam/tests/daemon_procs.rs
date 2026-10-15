@@ -780,3 +780,53 @@ fn a_signal_stops_the_daemon_with_exit_0_and_leaves_no_socket_or_lock_record() {
         assert_stopped_cleanly(root);
     }
 }
+
+/// One final assistant line of a transcript (token report §2.1), as tokens.rs's.
+fn transcript_line(session: &str, n: u64) -> String {
+    json!({
+        "type": "assistant", "sessionId": session, "requestId": format!("req_{n:06}"),
+        "timestamp": "2026-10-14T20:00:00.000Z", "cwd": "/work/app", "isSidechain": false,
+        "message": {"id": format!("msg_{n:06}"), "model": "claude-opus-5-5",
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": n, "output_tokens": 10,
+                              "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+    })
+    .to_string()
+}
+
+#[test]
+fn a_daemon_keeps_the_token_index_and_reports_its_jobs() {
+    // D13, token report §12 (Task 9): the daemon indexes the default home's transcripts, says
+    // so with `token-index`, and lists both jobs in `status` (D5.4).
+    let d = short_tempdir();
+    let root = d.path();
+    staying(root);
+    let transcript = Env::for_test(root)
+        .home
+        .join(".claude/projects/-work-app/s1.jsonl");
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(&transcript, format!("{}\n", transcript_line("s1", 1))).unwrap();
+
+    let mut daemon = Guarded::spawn(daemon_cmd(root, &["--json"]));
+    daemon.wait_for(START, "a token-index event", |out| {
+        has_event(out, |e| {
+            e["event"] == "token-index" && e["provider"] == CLAUDE_CODE && e["responses"] == 1
+        })
+    });
+    let s = status(&socket(root));
+    for name in ["sessions-watch", "token-index"] {
+        let job = s
+            .jobs
+            .iter()
+            .find(|j| j.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in status"));
+        assert_eq!(job.last_error, None, "{name}");
+        assert!(
+            job.last_run_at.is_some() && job.next_run_at.is_some(),
+            "{name}"
+        );
+    }
+
+    daemon.signal(libc::SIGTERM);
+    assert_eq!(daemon.finish(STOP).status.code(), Some(0));
+}

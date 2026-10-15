@@ -98,6 +98,13 @@ pub enum DaemonEvent {
     },
     /// The last event before the daemon closes.
     Stopping { reason: StopReason },
+    /// D5.5's reserved `token-index` (token report spec §12): the index's state after a change,
+    /// exactly as `token_index_state` stores it. `skipped_lines` is the engine's count over
+    /// every call of the last completed pass; the daemon accumulates nothing.
+    TokenIndex {
+        provider: ProviderId,
+        state: tagteam_engine::tokens::IndexState,
+    },
 }
 
 /// Where the scheduler's jobs send their events: the CLI's human or JSON output, the socket's
