@@ -504,8 +504,10 @@ if [ -n "$FAKE_CLAUDE_RECORD" ]; then
   proc=
   if [ -n "$started" ]; then proc=",\"procStart\":\"$started\""; fi
   record="$home/sessions/$me.json"
-  printf '{"pid":%s,"sessionId":"fake-%s","cwd":"%s","startedAt":%s000,"kind":"%s"%s}\n' \
-    "$me" "$me" "$(pwd -P)" "$(date +%s)" "$FAKE_CLAUDE_RECORD" "$proc" > "$record"
+  at=$(perl -MTime::HiRes=time -e 'printf "%d", time() * 1000' 2>/dev/null)
+  if [ -z "$at" ]; then at="$(date +%s)000"; fi
+  printf '{"pid":%s,"sessionId":"fake-%s","cwd":"%s","startedAt":%s,"kind":"%s"%s}\n' \
+    "$me" "$me" "$(pwd -P)" "$at" "$FAKE_CLAUDE_RECORD" "$proc" > "$record"
 fi
 if [ -n "$FAKE_CLAUDE_ROTATE" ]; then
   (umask 077 && printf '%s' "$FAKE_CLAUDE_ROTATE" > "$home/.credentials.json.fake" \
