@@ -13,7 +13,8 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{LaunchRow, SightingRow, SightingSource};
 use tagteam_engine::tokens::{LaunchId, LaunchPoll, Tenure};
 use tagteam_provider::{
-    FakeProcess, FlockGuard, LAUNCH_DIR, PENDING_LAUNCH_DIR, PendingLaunch, parse_lstart,
+    FakeProcess, FlockGuard, LAUNCH_DIR, PENDING_LAUNCH_DIR, PendingEntry, PendingLaunch,
+    parse_lstart,
 };
 
 const NOW: i64 = 1_790_000_000_000;
@@ -1725,6 +1726,18 @@ fn pending(
     PendingLaunch::path(profile, started_at_ms, run_pid)
 }
 
+/// The pending launches in `profile`, each of which must be one.
+fn kept(profile: &Path) -> Vec<PendingLaunch> {
+    let entries = PendingLaunch::read_all(profile).present().unwrap();
+    entries
+        .into_iter()
+        .map(|e| match e {
+            PendingEntry::Launch(_, launch) => launch,
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
 /// What is in `profile`'s pending directory, by name.
 fn pending_files(profile: &Path) -> Vec<String> {
     let Ok(listing) = fs::read_dir(profile.join(PENDING_LAUNCH_DIR)) else {
@@ -1805,9 +1818,10 @@ fn a_pending_launch_the_store_already_holds_changes_nothing() {
 
 #[test]
 fn a_scan_leaves_a_pending_file_that_is_not_a_launch_of_its_profile_where_it_is() {
-    // Spec §6.2: a file that does not parse, or names another provider or another account than
-    // its profile, is skipped and kept; a writer's temp file (not `*.json`) is ignored. The
-    // valid file beside them is recorded and removed all the same.
+    // Spec §6.2: a file that does not parse, names another provider or another account than
+    // its profile, or cannot be read, is skipped and kept; a writer's temp file (not `*.json`)
+    // is ignored. The valid file beside them is recorded and removed all the same.
+    use std::os::unix::fs::PermissionsExt;
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     let profile = fx.make_profile(&a);
@@ -1833,11 +1847,19 @@ fn a_scan_leaves_a_pending_file_that_is_not_a_launch_of_its_profile_where_it_is(
     .unwrap();
     let temp = dir.join(".4000-5.json.tagteam-5-0a1b2c3d");
     fs::write(&temp, fs::read(&good).unwrap()).unwrap();
+    let unreadable = pending(&fx, &profile, &a, 5_000, Some(6_000), 6);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
 
     assert_eq!(sight(&fx), 1, "only the valid launch");
     assert_eq!(ended(&fx), [(a.to_string(), Some(NOW - 4_000))]);
     assert!(!good.exists());
-    for kept in [dir.join("1000-2.json"), other_account, other_provider, temp] {
+    for kept in [
+        dir.join("1000-2.json"),
+        other_account,
+        other_provider,
+        temp,
+        unreadable,
+    ] {
         assert!(kept.exists(), "{kept:?} is left in place");
     }
 }
@@ -1855,9 +1877,9 @@ fn a_launch_kept_unrecorded_is_closed_with_the_close_time_and_dropped_once_recor
     fx.engine.keep_pending_launch(&id, &profile, None).unwrap();
     let file = PendingLaunch::path(&profile, id.started_at_ms, std::process::id());
     let read = || {
-        let all = PendingLaunch::read_all(&profile);
+        let all = kept(&profile);
         assert_eq!(all.len(), 1, "{all:?}");
-        all.into_iter().next().unwrap().1.unwrap()
+        all.into_iter().next().unwrap()
     };
     assert_eq!(read().ended_at_ms, None, "kept open while the child runs");
 
@@ -1937,14 +1959,7 @@ fn a_pending_file_replaced_during_the_scan_is_kept_for_the_next_one() {
     sight(&fx);
     assert_eq!(ended(&fx), [(a.to_string(), None)], "what was read");
     assert!(file.exists(), "the newer file is kept");
-    assert_eq!(
-        PendingLaunch::read_all(&profile)[0]
-            .1
-            .as_ref()
-            .unwrap()
-            .ended_at_ms,
-        Some(NOW - 1_000)
-    );
+    assert_eq!(kept(&profile)[0].ended_at_ms, Some(NOW - 1_000));
 
     sight(&fx);
     assert_eq!(ended(&fx), [(a.to_string(), Some(NOW - 1_000))]);
@@ -1974,6 +1989,46 @@ fn remove_fails_before_deleting_anything_when_the_store_refuses_the_pending_laun
 }
 
 #[test]
+fn remove_fails_before_deleting_anything_when_a_pending_file_cannot_be_read() {
+    // Spec §13: a pending file that cannot be read, or a pending directory that cannot be
+    // listed, may hold a launch, so `remove` stops before it deletes anything, naming it. A file
+    // that reads but holds no launch never stops it: once the launch can be read, the remove
+    // records it and deletes the profile, the torn file with it.
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live
+    let profile = fx.make_profile(&a);
+    let dir = profile.join(PENDING_LAUNCH_DIR);
+    let file = pending(&fx, &profile, &a, NOW - 5_000, Some(NOW - 1_000), 4242);
+    fs::write(dir.join("1000-2.json"), "{ torn").unwrap();
+    let chmod = |path: &Path, mode: u32| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    };
+
+    for (unreadable, mode) in [(&file, 0o600), (&dir, 0o700)] {
+        chmod(unreadable, 0o000);
+        let err = fx.engine.remove(&a).unwrap_err();
+        chmod(unreadable, mode);
+
+        assert_eq!(err.kind(), "unreadable", "{err}");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("{} is unreadable: ", unreadable.display())),
+            "names it: {err}"
+        );
+        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+        assert!(profile.exists() && file.exists(), "the profile is kept");
+        assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
+        assert!(launches(&fx).is_empty(), "nothing recorded");
+    }
+
+    fx.engine.remove(&a).unwrap();
+    assert!(!profile.exists());
+    assert_eq!(ended(&fx), [(a.to_string(), Some(NOW - 1_000))]);
+}
+
+#[test]
 fn a_close_with_a_store_that_cannot_be_opened_still_keeps_the_launch_in_its_pending_file() {
     // Spec §6.1: the file needs the profile alone. An engine whose store cannot be opened (the
     // database's path is a directory) cannot end the tenures or close the launch, but the
@@ -1995,7 +2050,7 @@ fn a_close_with_a_store_that_cannot_be_opened_still_keeps_the_launch_in_its_pend
 
     assert!(closed.stored.is_err(), "{closed:?}");
     assert!(closed.kept, "{closed:?}");
-    let kept = PendingLaunch::read_all(&profile).remove(0).1.unwrap();
+    let kept = kept(&profile).remove(0);
     assert_eq!(
         (kept.started_at_ms, kept.ended_at_ms),
         (id.started_at_ms, Some(NOW)),

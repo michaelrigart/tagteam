@@ -539,7 +539,8 @@ Before it closes launches, the scan reads the pending launch files (§6.1) in ea
 records each launch open from its `startedAt`, closes it at its `endedAt` if it has one, then
 removes the file, unless the file changed since the scan read it: `run` may have replaced it
 with a newer one, which the next scan records. A file that does not parse, or names another provider or another account than
-its profile, is skipped and kept. A temp file, which is not `*.json`, is ignored.
+its profile, is skipped and kept. So is a file that cannot be read. A temp file, which is not
+`*.json`, is ignored.
 
 ### 6.3 Statusline
 
@@ -1038,7 +1039,10 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
     as the scan does: `remove`, an `add` over an occupant, and the bootstrap that deletes a
     profile whose login is invalid. `remove` and `add` record before they delete anything, the
     vault entry included. A store that refuses the record stops the delete with everything as
-    it was, and the bootstrap's launch is refused with the store's error.
+    it was. So does a pending file that cannot be read, or a pending directory that cannot be
+    listed: it may hold a launch, and the error names it. A file that reads but is not a launch
+    of the profile is skipped, as the scan skips it. The bootstrap's launch is refused with the
+    error.
   - A purge records nothing. It deletes the profiles it covers, and their pending files with
     them, and empties the launch table; a table that cannot be written never leaves an account
     unpurged.
@@ -1096,8 +1100,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
       the poller or by a scan; its `endedAt` set at the close when the profile is idle and null
       while it is in use; the warnings only when neither accepts it;
     - a pending file recorded by `sight_sessions` open, or closed at its `endedAt`, and removed;
-      one replaced during the scan kept; one that does not parse or names another account left
-      in place; a temp file ignored;
+      one replaced during the scan kept; one that does not parse, names another account or
+      cannot be read left in place; a temp file ignored;
     - seeding of idle and in-use profiles at migration;
     - `active_history` rows from switches, from `add`, and from `remove` setting NULL.
   - Attribution end to end:
@@ -1113,7 +1117,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
     `changed_at_ms` moving on new evidence alone.
   - Migration from a version-2 store, with profiles to seed.
   - `purge` and `remove`, `remove` and the bootstrap recording a profile's pending launches
-    before they delete it, and a purge forgetting them.
+    before they delete it, a pending file that cannot be read stopping a `remove`, and a purge
+    forgetting them.
 - **CLI.** Snapshot tests of the human, `--json` and `--csv` output (core §13.2). `tokens` joins
   core §15.3's byte-identity test.
 - **Budgets.**
