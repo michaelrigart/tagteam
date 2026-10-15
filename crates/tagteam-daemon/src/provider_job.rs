@@ -338,9 +338,11 @@ impl<'e> ProviderJob<'e> {
                 self.quarantines = QuarantineWatch::new();
             }
             // A mode that works starts with its work, once a keychain backoff lets it (D4.3).
+            // The wait is the backoff's time left, never more than its own delay, so a wall
+            // clock set back since it began cannot stretch it (D4.2).
             let now = self.engine.now_ms();
-            self.work_due_ms = self.backoff.until_ms().map_or(now, |until| until.max(now));
-            self.work_delay_ms = self.work_due_ms - now;
+            self.work_delay_ms = self.backoff.wait_ms(now).unwrap_or(0);
+            self.work_due_ms = now.saturating_add(self.work_delay_ms);
         }
         self.mode = Some(mode);
         self.waiting_for = waiting_for;
@@ -1632,6 +1634,47 @@ mod backoff_tests {
             (Mode::Collect, Some(T0 + 60), Some(OutcomeKind::Collect))
         );
         assert_eq!(events.polls(&cc()), [0], "no tick after the pause");
+    }
+
+    #[test]
+    fn a_clock_set_back_and_a_mode_change_never_stretch_a_backoff_past_its_delay() {
+        // D4.2, D4.3: a 60 s backoff ends at T0 + 60. The wall clock moves back an hour, and
+        // then the mode changes. The carried deadline is absolute, but the wait never
+        // exceeds the backoff's own delay.
+        let fx = Fx::new();
+        two(&fx);
+        fx.kc.set_locked(true);
+        let board = board();
+        let events = Emitted::new(&fx.clock);
+        let mut jitter = || 0.0;
+        let mut cx = JobCx {
+            engine: &fx.engine,
+            sink: &events,
+            jitter: &mut jitter,
+        };
+        let mut job = ProviderJob::new(&fx.engine, cc(), counted(&fx, &board));
+        job.run(&mut cx);
+        assert_eq!(
+            status(&board, &cc()).backoff,
+            Some(Backoff { until: T0 + 60 })
+        );
+        fx.clock.advance_ms(-3_600_000);
+        let back = fx.clock.now_ms();
+        fx.settings("[daemon]\nautoswitch = false\n", 1);
+        job.settings_changed(&mut cx);
+        assert_eq!(job.mode, Some(Mode::Collect));
+        assert_eq!(
+            (job.work_due_ms - back, job.work_delay_ms),
+            (60_000, 60_000),
+            "due within the backoff's 60 s, not an hour later"
+        );
+        // A minute later the delayed round runs.
+        fx.clock.advance_ms(60_000);
+        job.run(&mut cx);
+        assert_eq!(
+            status(&board, &cc()).last_tick_at,
+            Some(back.div_euclid(1000) + 60)
+        );
     }
 
     #[test]
