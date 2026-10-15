@@ -25,7 +25,8 @@ const SIGHTING_GAP_MS: i64 = 60_000;
 /// The most ancestors the statusline walks to find its Claude Code process (spec §6.3).
 const MAX_ANCESTORS: usize = 8;
 
-/// One launch `run` recorded (spec §6.1), as `open_launch` returns it.
+/// One launch `run` planned (spec §6.1), as `plan_launch` returns it. It is recorded once
+/// `record_launch` has written it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchId {
     pub provider: ProviderId,
@@ -149,22 +150,40 @@ impl Engine {
         homes
     }
 
-    /// Spec §6.1: the launch `run` records before it spawns its child, open from now. `run`
-    /// calls it while it holds its launch reservation, so no scan closes it before the child
-    /// runs.
+    /// Spec §6.1: the launch `run` plans before it spawns its child, started now. Nothing is
+    /// written: `record_launch` writes it, as often as it takes. Attribution reads launches at
+    /// query time, so one recorded late with this start covers the whole session.
+    pub fn plan_launch(&self, provider: &ProviderId, account: &AccountId) -> LaunchId {
+        LaunchId {
+            provider: provider.clone(),
+            account: account.clone(),
+            started_at_ms: self.now_ms(),
+        }
+    }
+
+    /// Spec §6.1: records a planned launch, open from its own start. Idempotent: a launch
+    /// already recorded at that key is kept as it is, so `run` can try again until it succeeds.
+    pub fn record_launch(&self, id: &LaunchId) -> Result<(), EngineError> {
+        self.store()?.open_launch(
+            &id.provider,
+            id.account.as_str(),
+            id.started_at_ms,
+            self.now_ms(),
+        )?;
+        Ok(())
+    }
+
+    /// Spec §6.1: `plan_launch`, then `record_launch`, for a caller with no use for the gap
+    /// between them. `run` calls the two apart, while it holds its launch reservation, so no scan
+    /// closes the launch before the child runs.
     pub fn open_launch(
         &self,
         provider: &ProviderId,
         account: &AccountId,
     ) -> Result<LaunchId, EngineError> {
-        let now = self.now_ms();
-        self.store()?
-            .open_launch(provider, account.as_str(), now, now)?;
-        Ok(LaunchId {
-            provider: provider.clone(),
-            account: account.clone(),
-            started_at_ms: now,
-        })
+        let id = self.plan_launch(provider, account);
+        self.record_launch(&id)?;
+        Ok(id)
     }
 
     /// The child's pid, once it is spawned (spec §6.1).

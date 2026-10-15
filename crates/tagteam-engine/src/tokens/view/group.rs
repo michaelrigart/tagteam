@@ -162,7 +162,7 @@ pub(super) fn group(
 }
 
 /// Spec §10.1: blocks are per account, so a block report is always grouped by account.
-fn effective_grouping(period: TokenPeriod, grouping: TokenGrouping) -> TokenGrouping {
+pub(super) fn effective_grouping(period: TokenPeriod, grouping: TokenGrouping) -> TokenGrouping {
     match (period, grouping) {
         (TokenPeriod::Block, TokenGrouping::None) => TokenGrouping::Account,
         (TokenPeriod::Block, TokenGrouping::Model) => TokenGrouping::AccountModel,

@@ -349,7 +349,7 @@ pub(crate) fn json(report: &TokenReport) -> Value {
         "schemaVersion": 1,
         "provider": q.provider.as_str(),
         "period": period_name(&q.period),
-        "grouping": grouping_name(&q.grouping),
+        "grouping": grouping_name(&q.applied_grouping()),
         "timeZone": report.time_zone,
         "since": q.since_ms.map(iso),
         "until": q.until_ms.map(iso),

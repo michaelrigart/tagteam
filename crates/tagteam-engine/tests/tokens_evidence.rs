@@ -293,6 +293,62 @@ fn a_launch_is_open_before_the_spawn_and_attached_after() {
 }
 
 #[test]
+fn a_planned_launch_is_recorded_late_with_its_own_start_and_recording_is_idempotent() {
+    // Spec §6.1: `run` plans the launch before the spawn and records it as often as it takes.
+    // A record made late keeps the planned start, and a record of a launch already there
+    // changes nothing: not its pid, its end, nor when it was written.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let id = fx.engine.plan_launch(&cc, &a);
+    assert_eq!(id.started_at_ms, NOW);
+    assert!(launches(&fx).is_empty(), "planning writes nothing");
+
+    fx.clock.advance_ms(7_000);
+    fx.engine.record_launch(&id).unwrap();
+    let open = LaunchRow {
+        account_id: a.to_string(),
+        started_at: NOW,
+        ended_at: None,
+        pid: None,
+        recorded_at: NOW + 7_000,
+    };
+    assert_eq!(launches(&fx), [open.clone()]);
+
+    fx.clock.advance_ms(1_000);
+    fx.engine.attach_launch_pid(&id, 4242).unwrap();
+    let attached = LaunchRow {
+        pid: Some(4242),
+        recorded_at: NOW + 8_000,
+        ..open
+    };
+    fx.clock.advance_ms(1_000);
+    fx.engine.record_launch(&id).unwrap();
+    assert_eq!(
+        launches(&fx),
+        [attached.clone()],
+        "a second record is a no-op"
+    );
+
+    fx.engine
+        .close_launch(
+            &id,
+            &fx.make_profile(&a),
+            &LaunchPoll::default(),
+            NOW + 9_000,
+        )
+        .unwrap();
+    let closed = launches(&fx);
+    assert_eq!(closed[0].ended_at, Some(NOW + 9_000), "{closed:?}");
+    fx.engine.record_launch(&id).unwrap();
+    assert_eq!(
+        launches(&fx),
+        closed,
+        "recording never reopens a closed launch"
+    );
+}
+
+#[test]
 fn polling_reads_the_record_only_when_it_changed() {
     // Spec §6.1: `run` reads its child's record only when its mtime moved, and extends the
     // sighting of the session it saw last, at most once a minute (spec §6.4).
