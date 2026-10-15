@@ -84,7 +84,11 @@ const HELP_ACCOUNTS: [(&str, &str); 11] = [
     ("Enter", "history of the account"),
     ("J K", "scroll the detail's windows"),
 ];
-const HELP_HISTORY: [(&str, &str); 2] = [("[ ]", "range: 1, 7, 14 or 30 days"), ("r", "refresh")];
+const HELP_HISTORY: [(&str, &str); 3] = [
+    ("[ ]", "range: 1, 7, 14 or 30 days"),
+    ("r", "refresh"),
+    ("J K", "scroll the windows"),
+];
 
 /// The action keys; Task 9 adds them. `None`: not an action key.
 pub fn handle_action_key(_state: &mut State, _key: KeyEvent, _now_ms: i64) -> Option<Vec<Cmd>> {
