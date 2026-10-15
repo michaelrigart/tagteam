@@ -23,6 +23,9 @@ test pins it.
 - **Switch** between stored logins with one command, by position, alias or email.
 - **See usage** for every account: the 5-hour and 7-day windows, spend, per-model limits, and
   when each one resets. `tagteam history` shows the burn rate and when a window runs out.
+- **Count tokens per account.** `tagteam tokens` reports token use and its API-equivalent
+  cost from Claude Code's transcripts, by day, month, session or 5-hour block, and which account
+  each request went to.
 - **Run accounts side by side.** `tagteam run` starts Claude Code as another account in its own
   session, while your default login stays as it is. Sessions share your history, memory and
   settings.
@@ -144,6 +147,7 @@ and `completions` refuse `--json`. A bare `tagteam` runs `list`.
 | `auto` | Switch automatically before a rate limit, until stopped. `--once` ticks once; `--dry-run` decides without switching |
 | `run`, `map`, `unmap`, `shell-init` | Run Claude Code as an account in a separate session, and map directories to accounts |
 | `history` | Usage history, burn rate, and when each window runs out |
+| `tokens` | Token use and API cost per account and model, by day, month, session or 5-hour block, from Claude Code's transcripts |
 | `statusline` | One line for Claude Code's status bar |
 | `export`, `import` | Move accounts between machines (age-encrypted by default); `import` also reads claude-swap v1 exports |
 | `config` | Read and edit `config.toml` (`list`, `get`, `set`, `unset`, `path`) |
@@ -236,7 +240,7 @@ set to absolute paths. Directories are created lazily with mode 0700.
 | What | Where |
 |---|---|
 | Settings | `$XDG_CONFIG_HOME/tagteam/config.toml` (default `~/.config/tagteam/`) |
-| Store (account metadata, usage, history) | `$XDG_DATA_HOME/tagteam/tagteam.db` (default `~/.local/share/tagteam/`) |
+| Store (account metadata, usage, history, the token index) | `$XDG_DATA_HOME/tagteam/tagteam.db` (default `~/.local/share/tagteam/`) |
 | Vault on Linux | `$XDG_DATA_HOME/tagteam/vault/` |
 | Session profiles | `$XDG_DATA_HOME/tagteam/sessions/` |
 | Rescued and displaced credentials | `$XDG_DATA_HOME/tagteam/rescue/` and `displaced/` |
@@ -257,6 +261,10 @@ set to absolute paths. Directories are created lazily with mode 0700.
   write failed. `displaced/` holds a credential tagteam would otherwise have overwritten, such
   as a live login that was not stored. tagteam never reads a displaced credential back;
   `tagteam displaced` lists them.
+- **The token index** holds counts, model names, times, session ids and working directories
+  read from Claude Code's transcripts, never their content, and response ids only as a hash. It
+  keeps 365 days by default (`tokens.retention_days`), about 100 bytes a response: some 150 MB a
+  year at a heavy user's rate. It outlives Claude Code's own 30-day transcript cleanup.
 - **The log** never contains an email, a token or any part of a credential.
 - **Exports** are encrypted with age by default, using a passphrase or recipient keys.
   `--plaintext` is an explicit opt-out. An OAuth export hands a login over rather than copying
@@ -265,7 +273,7 @@ set to absolute paths. Directories are created lazily with mode 0700.
 - **Network.** The only hosts in tagteam's source are Claude Code's own: `platform.claude.com`
   (token refresh) and `api.anthropic.com` (profile and usage). `tagteam doctor --online` only
   checks that these hosts are reachable and sends no credential. `tagteam statusline` makes no
-  network request.
+  network request, and neither does `tagteam tokens`: its prices ship with tagteam.
 
 See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 
