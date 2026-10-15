@@ -66,7 +66,6 @@ fn daemon_without_a_terminal_runs_no_keychain_check_and_a_signal_stops_it_with_e
         stdout_terminal: false,
         no_color_env: false,
         force_color_env: false,
-        settings_warned: false,
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let code = app::run(
