@@ -58,15 +58,17 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             vec![]
         }
         Msg::Collected { r#gen, result } => {
-            if r#gen != state.gens.collect {
-                return vec![];
-            }
-            state.dirty = true;
+            // A collection slower than the timer is overtaken by the next. What it recorded is
+            // in the store all the same, so it is read back; its banner and toast are dropped.
+            let stale = r#gen != state.gens.collect;
             match result {
                 Ok(summary) => {
-                    clear_read_error(state, BannerKind::Collect);
-                    if let Some(first) = summary.warnings.first() {
-                        state.toast(format!("warning: {first}"), now_ms);
+                    if !stale {
+                        state.dirty = true;
+                        clear_read_error(state, BannerKind::Collect);
+                        if let Some(first) = summary.warnings.first() {
+                            state.toast(format!("warning: {first}"), now_ms);
+                        }
                     }
                     if summary.fetched == 0 || state.quitting.is_some() {
                         return vec![];
@@ -78,7 +80,9 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                     }
                     cmds
                 }
+                Err(_) if stale => vec![],
                 Err(e) => {
+                    state.dirty = true;
                     let words = format!("usage was not collected: {}", e.message);
                     raise(state, BannerKind::Collect, words);
                     vec![]
@@ -417,11 +421,67 @@ mod tests {
         let stale = Msg::Collected {
             r#gen,
             result: Ok(CollectSummary {
-                fetched: 1,
-                warnings: vec![],
+                fetched: 0,
+                warnings: vec!["usage for a@x.co (position 1) was not collected: x".into()],
             }),
         };
         assert!(update(&mut state, stale, NOW_MS).is_empty());
+        assert!(
+            state.toast.is_none(),
+            "a stale collection's toast is dropped"
+        );
+    }
+
+    #[test]
+    fn a_collection_overtaken_by_a_newer_one_that_fetched_still_reads_the_views() {
+        // A collection slower than the 30 s timer is overtaken by the next: what it recorded
+        // is in the store all the same, and its banner and toast are the older run's.
+        for screen in [Screen::Accounts, Screen::History] {
+            let mut state = fresh(screen);
+            state.start();
+            update(&mut state, accounts_msg(1, 1), NOW_MS);
+            let Cmd::CollectDue { r#gen, .. } = state.collect_due(vec![id(1)]) else {
+                unreachable!()
+            };
+            state.collect_due(vec![id(1)]);
+            let stale = |fetched, warnings: Vec<String>| Msg::Collected {
+                r#gen,
+                result: Ok(CollectSummary { fetched, warnings }),
+            };
+            assert!(update(&mut state, stale(0, vec![]), NOW_MS).is_empty());
+            let cmds = update(
+                &mut state,
+                stale(
+                    2,
+                    vec!["usage for a@x.co (position 1) was not collected: x".into()],
+                ),
+                NOW_MS,
+            );
+            match screen {
+                Screen::Accounts => assert!(
+                    matches!(cmds.as_slice(), [Cmd::LoadAccounts { .. }]),
+                    "{cmds:?}"
+                ),
+                Screen::History => assert!(
+                    matches!(
+                        cmds.as_slice(),
+                        [Cmd::LoadAccounts { .. }, Cmd::LoadHistory { .. }]
+                    ),
+                    "{cmds:?}"
+                ),
+            }
+            assert!(state.toast.is_none() && state.banner.is_none());
+            // A failure of the older run says nothing and reads nothing.
+            let failure = Msg::Collected {
+                r#gen,
+                result: Err(failed("locked")),
+            };
+            assert!(update(&mut state, failure, NOW_MS).is_empty());
+            assert!(state.banner.is_none());
+            // Nothing is read once the shutdown has begun.
+            state.quitting = Some(0);
+            assert!(update(&mut state, stale(2, vec![]), NOW_MS).is_empty());
+        }
     }
 
     #[test]
