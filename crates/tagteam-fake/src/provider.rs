@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tagteam_core::merge::{MergeKey, three_way};
+use tagteam_core::tokens::PriceTable;
 use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::atomic::{
     ensure_private_dir, remove_target, write_atomic_private_with, write_atomic_with,
@@ -19,16 +20,17 @@ use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind};
 use tagteam_provider::splice::{self, render_nested};
 use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, EntryKind, Env,
-    FreshCredential, Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet,
-    LiveLocks, LockError, MergeReport, MkdirLock, MkdirLockSpec, MustShare, MutationGuard, Pace,
-    PollBudget, Provider, ProviderError, Read, ReadError, SecretStore, SessionEnv, SharePolicy,
-    StoredLogin, Undo, UsageResult, Validity, Window, Written,
+    FreshCredential, Identity, IdentitySurface, KindTraits, LineError, LiveAuth, LiveChange,
+    LiveLockSet, LiveLocks, LockError, MergeReport, MkdirLock, MkdirLockSpec, MustShare,
+    MutationGuard, Pace, PollBudget, Provider, ProviderError, Read, ReadError, SecretStore,
+    SessionEnv, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, Validity, Window, Written,
 };
 
 use crate::FAKE_AGENT;
 use crate::identity_json;
 use crate::paths::{FakePaths, HOME_VAR};
 use crate::shape::{self, DEVICE, KIND_STATIC, KINDS};
+use crate::transcripts;
 use crate::usage;
 
 /// FakeAgent's lock goes stale like Claude Code's credential locks.
@@ -49,6 +51,8 @@ const TOKEN_VAR: &str = "FAKEAGENT_TOKEN";
 pub struct FakeAgent {
     base: String,
     lock_budget: Duration,
+    /// The `transcripts` capability; on unless a test turns it off.
+    transcripts: bool,
 }
 
 impl Default for FakeAgent {
@@ -62,6 +66,7 @@ impl FakeAgent {
         Self {
             base: DEFAULT_BASE.to_owned(),
             lock_budget: DEFAULT_LOCK_BUDGET,
+            transcripts: true,
         }
     }
 
@@ -72,6 +77,13 @@ impl FakeAgent {
 
     pub fn with_lock_budget(mut self, budget: Duration) -> Self {
         self.lock_budget = budget;
+        self
+    }
+
+    /// A FakeAgent without the `transcripts` capability, for the engine's refusals (token report
+    /// spec §11.1).
+    pub fn without_transcripts(mut self) -> Self {
+        self.transcripts = false;
         self
     }
 
@@ -262,6 +274,7 @@ impl Provider for FakeAgent {
             usage: true,
             refresh: true,
             sessions: true,
+            transcripts: self.transcripts,
             ..Capabilities::default()
         }
     }
@@ -776,6 +789,11 @@ impl Provider for FakeAgent {
         profile.join("procs")
     }
 
+    /// The default home's `procs`, as a profile's (token report ruling R2).
+    fn default_session_records_dir(&self, env: &Env) -> Option<PathBuf> {
+        Some(FakePaths::resolve(env).dir.join("procs"))
+    }
+
     /// `<dir>/credential.json`, a plain file like the live one. FakeAgent keeps no item, so it
     /// names nothing after the spelling (Decision 19).
     fn read_profile_credential(&self, env: &Env, dir: &Path, _spelling: &str) -> Read<Credential> {
@@ -988,5 +1006,18 @@ impl Provider for FakeAgent {
             Read::Absent => Validity::Invalid("not logged in".into()),
             Read::Unreadable(e) => Validity::Unknown(e.to_string()),
         }
+    }
+
+    /// `<dir>/transcripts/*.jsonl`, nothing deeper.
+    fn transcript_files(&self, env: &Env) -> io::Result<Vec<PathBuf>> {
+        transcripts::discover(&FakePaths::resolve(env).transcripts)
+    }
+
+    fn parse_usage_line(&self, line: &[u8]) -> Result<Option<UsageLine>, LineError> {
+        transcripts::parse_line(line)
+    }
+
+    fn price_table(&self) -> &'static PriceTable {
+        &transcripts::PRICES
     }
 }

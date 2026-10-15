@@ -115,6 +115,7 @@ fn kinds_capabilities_endpoints_and_surface() {
             usage: true,
             refresh: true,
             sessions: true,
+            transcripts: true,
             ..Capabilities::default()
         }
     );
