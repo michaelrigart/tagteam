@@ -241,3 +241,98 @@ fn statusline_in_a_run_shell_p95_is_within_10_ms() {
         "statusline in a run shell p95 {p:?} over {RUNS} runs: {runs:?}"
     );
 }
+
+/// The session id the timed `statusline` runs carry, as Claude Code passes it (token report
+/// spec §6.3).
+const SESSION: &str = "perf-session";
+
+/// Claude Code's session record for this test process, every timed run's parent, in the
+/// default home: the ancestor a sighting is keyed by (token report spec §6.3).
+fn record_this_process(root: &Path) {
+    let dir = Env::for_test(root).home.join(".claude/sessions");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pid = std::process::id();
+    let record = format!(
+        "{{\"pid\":{pid},\"sessionId\":\"{SESSION}\",\"cwd\":\"/w\",\"startedAt\":{},\"kind\":\"interactive\"}}",
+        now_epoch_s() * 1000
+    );
+    std::fs::write(dir.join(format!("{pid}.json")), record).unwrap();
+}
+
+/// How many sightings the store holds, and the latest end of one.
+fn sightings(root: &Path) -> (i64, Option<i64>) {
+    rusqlite::Connection::open(Env::for_test(root).data_dir().join("tagteam.db"))
+        .unwrap()
+        .query_row(
+            "SELECT count(*), max(last_at) FROM session_sightings",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn statusline_with_a_fresh_sighting_p95_is_within_10_ms() {
+    // Token report spec §6.3, §15 "Budgets": the first warm-up run records the session, and
+    // every timed run finds that sighting less than a minute old: one indexed lookup.
+    let _one_at_a_time = serial();
+    let d = tempfile::tempdir().unwrap();
+    nothing_due(d.path());
+    record_this_process(d.path());
+    let server = MockServer::start();
+    let envs = [("CLAUDE_CODE_SESSION_ID", SESSION)];
+    let runs = timings(
+        d.path(),
+        &server.base_url(),
+        &["statusline"],
+        &envs,
+        &|_| {},
+    );
+    let p = p95(&runs);
+    eprintln!("statusline with a fresh sighting p95 {p:?} over {RUNS} runs");
+    assert_eq!(sightings(d.path()).0, 1, "the session was recorded");
+    assert_eq!(server.requests().len(), 0, "statusline sent a request");
+    assert!(
+        p <= Duration::from_millis(10),
+        "statusline with a fresh sighting p95 {p:?} over {RUNS} runs: {runs:?}"
+    );
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn statusline_due_a_sighting_extension_p95_is_within_10_ms() {
+    // Before each run the sighting is moved a minute and more into the past, so every timed
+    // run extends it: the lookup, the walk to the ancestor with a record, and one write.
+    let _one_at_a_time = serial();
+    let d = tempfile::tempdir().unwrap();
+    nothing_due(d.path());
+    record_this_process(d.path());
+    let server = MockServer::start();
+    let envs = [("CLAUDE_CODE_SESSION_ID", SESSION)];
+    let db = Env::for_test(d.path()).data_dir().join("tagteam.db");
+    let age = |_: usize| {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "UPDATE session_sightings SET last_at = last_at - 120000",
+                [],
+            )
+            .unwrap();
+    };
+    let started = now_epoch_s() * 1000;
+    let runs = timings(d.path(), &server.base_url(), &["statusline"], &envs, &age);
+    let p = p95(&runs);
+    eprintln!("statusline due a sighting extension p95 {p:?} over {RUNS} runs");
+    let (count, last) = sightings(d.path());
+    assert_eq!(count, 1, "one execution, one sighting");
+    assert!(
+        last.is_some_and(|at| at >= started),
+        "the last run extended the sighting: {last:?}"
+    );
+    assert_eq!(server.requests().len(), 0, "statusline sent a request");
+    assert!(
+        p <= Duration::from_millis(10),
+        "statusline due a sighting extension p95 {p:?} over {RUNS} runs: {runs:?}"
+    );
+}

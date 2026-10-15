@@ -1,6 +1,8 @@
 //! `tagteam statusline` (§13.5): one line for Claude Code's status bar, from the stored
 //! reading. It never fetches, never touches the Keychain, and never builds the HTTP adapter.
+//! Once the line is out, it records the session it serves (token report spec §6.3).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -252,14 +254,81 @@ pub(crate) fn engine(
         default_provider: chosen.default,
         settings: chosen.settings,
         env,
-        // `EngineConfig` requires a probe. The line never judges a session record (Decision 17),
-        // so this one is never asked.
+        // The line never judges a session record (Decision 17). The session sighting after it
+        // asks this probe only for its ancestors' pids (token report spec §6.3).
         process: Arc::new(SystemProcessProbe),
         // Nor does it launch or validate, so its spawner is never called either.
         spawner: Arc::new(SystemSpawner),
         run_shell,
     });
     (engine, chosen.provider, http, keychain)
+}
+
+/// Where the line's session runs, for its sighting (token report spec §6.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SightingHome {
+    /// The default home.
+    Default,
+    /// The run shell's profile.
+    Profile(PathBuf),
+    /// Neither: a `CLAUDE_CONFIG_DIR` naming another directory, or a marker that cannot be
+    /// read. Nothing is recorded.
+    Elsewhere,
+}
+
+/// Token report spec §6.3: in a run shell, the marker's profile; otherwise the default home,
+/// when `CLAUDE_CONFIG_DIR` is unset, empty or names it; otherwise `Elsewhere`. `env` is the
+/// engine's, which outside a run shell is the process's own.
+pub(crate) fn sighting_home(shell: &RunShell, env: &Env) -> SightingHome {
+    match shell {
+        RunShell::Inside { profile, .. } => SightingHome::Profile(profile.clone()),
+        RunShell::Unreadable { .. } => SightingHome::Elsewhere,
+        RunShell::Outside => {
+            let Some(dir) = env.claude_config_dir.as_deref().filter(|d| !d.is_empty()) else {
+                return SightingHome::Default;
+            };
+            let mut plain = env.clone();
+            plain.claude_config_dir = None;
+            if same_dir(Path::new(dir), &CcPaths::resolve(&plain).config_home) {
+                SightingHome::Default
+            } else {
+                SightingHome::Elsewhere
+            }
+        }
+    }
+}
+
+/// Whether two spellings name one directory: equal as written, or once resolved.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// Token report spec §6.3: records the session this line serves, once the line is out. Only
+/// for a provider whose transcripts the report reads, with the id Claude Code gave the
+/// command, in a home `sighting_home` names. A failure is logged at debug: the status bar has
+/// nowhere to show it, and neither the line nor the exit code changes.
+pub(crate) fn record_session(engine: &Engine, provider: &ProviderId, session_id: Option<&str>) {
+    let Some(session_id) = session_id else {
+        return;
+    };
+    if !engine
+        .provider(provider)
+        .is_ok_and(|p| p.capabilities().transcripts)
+    {
+        return;
+    }
+    let profile = match sighting_home(engine.run_shell(), engine.env()) {
+        SightingHome::Default => None,
+        SightingHome::Profile(profile) => Some(profile),
+        SightingHome::Elsewhere => return,
+    };
+    if let Err(e) = engine.statusline_sighting(provider, session_id, profile.as_deref()) {
+        tracing::debug!(kind = e.kind(), "the statusline's session was not recorded");
+    }
 }
 
 /// The statusline engine's Keychain: every call is refused, and counted.
@@ -319,6 +388,7 @@ impl Keychain for NoKeychain {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -529,6 +599,43 @@ mod tests {
             ..Capabilities::default()
         };
         assert_eq!(unsupported(capable, "Claude Code"), None);
+    }
+
+    #[test]
+    fn the_sighting_home_is_the_profile_the_default_home_or_elsewhere() {
+        // Token report spec §6.3.
+        let dir = tempfile::tempdir().unwrap();
+        let mut env = Env::for_test(dir.path());
+        let default = env.home.join(".claude");
+        std::fs::create_dir_all(&default).unwrap();
+        let outside = |env: &Env| sighting_home(&RunShell::Outside, env);
+        assert_eq!(outside(&env), SightingHome::Default, "unset");
+        env.claude_config_dir = Some(OsString::new());
+        assert_eq!(outside(&env), SightingHome::Default, "empty, as unset");
+        env.claude_config_dir = Some(default.clone().into_os_string());
+        assert_eq!(outside(&env), SightingHome::Default, "the default, by name");
+        let link = dir.path().join("claude-link");
+        std::os::unix::fs::symlink(&default, &link).unwrap();
+        env.claude_config_dir = Some(link.into_os_string());
+        assert_eq!(outside(&env), SightingHome::Default, "through a link");
+        env.claude_config_dir = Some(dir.path().join("elsewhere").into_os_string());
+        assert_eq!(outside(&env), SightingHome::Elsewhere);
+        let profile = dir.path().join("profile");
+        let inside = RunShell::Inside {
+            profile: profile.clone(),
+            marker: ProfileMarker {
+                provider: ProviderId::new(CLAUDE_CODE),
+                account_id: AccountId::from_string("0192"),
+                config_dir: profile.display().to_string(),
+                outer: json!({}),
+            },
+        };
+        assert_eq!(sighting_home(&inside, &env), SightingHome::Profile(profile));
+        let unreadable = RunShell::Unreadable {
+            marker: dir.path().join(MARKER_FILE),
+            detail: "torn".into(),
+        };
+        assert_eq!(sighting_home(&unreadable, &env), SightingHome::Elsewhere);
     }
 
     #[test]
