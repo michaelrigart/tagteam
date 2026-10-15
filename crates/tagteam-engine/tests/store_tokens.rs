@@ -1057,9 +1057,9 @@ fn ending_a_tenure_stores_it_and_clamps_the_session_s_other_tenures_there() {
 }
 
 #[test]
-fn ending_a_tenure_at_least_moves_its_end_forward_only() {
+fn ending_a_tenure_at_least_moves_its_end_forward_only_and_never_past_until() {
     // Spec §6.1: at the child's exit, run's last confirmation is no reason to drop a later read
-    // already stored: the end moves forward only. The session's other tenures there are clamped
+    // already stored: the end moves forward only, but never past the exit. The session's other tenures there are clamped
     // to where it ends.
     let (_d, s, _) = store();
     let started = T - 500;
@@ -1074,8 +1074,12 @@ fn ending_a_tenure_at_least_moves_its_end_forward_only() {
         ..tenure("s1", "acct-a", started, T, last_at)
     };
 
-    s.end_sighting(&cc(), &ours(T + 20_000), SightingEnd::AtLeast)
-        .unwrap();
+    s.end_sighting(
+        &cc(),
+        &ours(T + 20_000),
+        SightingEnd::AtLeast { until: i64::MAX },
+    )
+    .unwrap();
     let clamped = SightingRow {
         last_at: T + 30_000,
         recorded_at: T + 50_000,
@@ -1086,8 +1090,12 @@ fn ending_a_tenure_at_least_moves_its_end_forward_only() {
         [read_later.clone(), clamped.clone()],
         "the later read stands, and bounds the other tenure"
     );
-    s.end_sighting(&cc(), &ours(T + 35_000), SightingEnd::AtLeast)
-        .unwrap();
+    s.end_sighting(
+        &cc(),
+        &ours(T + 35_000),
+        SightingEnd::AtLeast { until: i64::MAX },
+    )
+    .unwrap();
     let moved = SightingRow {
         last_at: T + 35_000,
         recorded_at: T + 50_000,
@@ -1095,8 +1103,31 @@ fn ending_a_tenure_at_least_moves_its_end_forward_only() {
     };
     assert_eq!(
         s.sightings(&cc()).unwrap(),
-        [moved, clamped],
+        [moved.clone(), clamped.clone()],
         "a later end moves it forward, and the row keeps the source that created it"
+    );
+
+    // Never past `until`, the exit: not even an end already stored, nor the other tenure.
+    let capped = SightingRow {
+        recorded_at: T + 60_000,
+        ..ours(T + 40_000)
+    };
+    s.end_sighting(&cc(), &capped, SightingEnd::AtLeast { until: T + 25_000 })
+        .unwrap();
+    assert_eq!(
+        s.sightings(&cc()).unwrap(),
+        [
+            SightingRow {
+                last_at: T + 25_000,
+                recorded_at: T + 60_000,
+                ..moved
+            },
+            SightingRow {
+                last_at: T + 25_000,
+                recorded_at: T + 60_000,
+                ..clamped
+            }
+        ]
     );
 }
 

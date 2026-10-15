@@ -490,12 +490,12 @@ impl Engine {
     last confirmation, then each tenure that ended since, newest first, exactly to its last
     confirmation (§6.4). A tenure leaves the queue only once every later one is stored. A write
     that fails keeps the rest for the next.
-- **Exit.** After exit handling, `run` moves the end of the child's tenure forward to its last
-  confirming read, not to the exit: the child may have left its session after that read. It
-  never moves it past the exit, since a check after it, of a record a crash left behind,
-  confirms nothing, and never back, since every stored end is a read: a later one by the scan
-  or the statusline stands. The tenures that ended and were not yet written end as the write
-  ends them.
+- **Exit.** After exit handling, `run` ends the child's tenure at the later of its stored end
+  and its last confirming read, not at the exit: the child may have left its session after
+  that read. A later stored end, a read by the scan or the statusline, stands. The end is
+  never past the exit, whatever a write stored: a check after the exit, of a record a crash
+  left behind, confirms nothing, and the poller can finish one more tick after the exit is
+  stamped. The tenures that ended and were not yet written end as the write ends them.
 - A `run` that execs plain `claude` (core §12.1) records neither: §7.2 places that session.
 
 ### 6.2 Scan
@@ -544,7 +544,7 @@ environment. Stdin stays drained and ignored (core §13.5).
 - A source extends a tenure at most once a minute, so a stored end lags the last read by up to
   a minute, and never leads it.
 - When a switch ends a tenure, `run` sets its end exactly to its last confirmation, back as
-  well as forward. At the exit it only moves the end forward (§6.1). Either way, in the same
+  well as forward. At the exit it moves the end forward only, but never past the exit (§6.1). Either way, in the same
   transaction, it clamps to that end every other tenure of the session in that execution that
   began by then. A scan or statusline read of a session `run` saw leave and come back, made
   before `run` wrote the session it left for, may have continued one over the absence.

@@ -311,16 +311,18 @@ impl Engine {
 
     /// Spec §6.1, at the child's exit: the child's tenures end at their last confirming reads,
     /// the current one first, then those the poll had not stored, newest first; not at the exit,
-    /// since the child may have left its session after its last read. None is moved past
-    /// `exited_at_ms`, when the child exited: a check after it, of a record a crash left behind,
-    /// confirms nothing. The current tenure's end only moves forward: every stored end is a
-    /// read, and a later one, such as a scan's between the last check and the exit, stands. A
-    /// tenure a switch ended ends exactly at its last confirmation, as `poll_launch` ends it.
-    /// The launch closes at the moment the profile is found idle (`session_state_at`), read
-    /// after that check, unless it is still in use. `run` calls it after `finish_run`, once its own launch reservation is released, so
-    /// the profile reads idle when nothing else runs there. Only the launch may close late, which
-    /// over-covers. A background session the child started, or another launcher's reservation,
-    /// keeps the launch open, and the next scan that finds the profile idle closes it.
+    /// since the child may have left its session after its last read. The current tenure ends at
+    /// the later of its stored end and its last confirmation, since every stored end is a read
+    /// and a later one, such as a scan's between the last check and the exit, stands; but never
+    /// past `exited_at_ms`, when the child exited, whatever a write stored: a check after the
+    /// exit, of a record a crash left behind, confirms nothing. A tenure a switch ended ends
+    /// exactly at its last confirmation, as `poll_launch` ends it. The launch closes at the
+    /// moment the profile is found idle (`session_state_at`), read after that check, unless it
+    /// is still in use. `run` calls it after `finish_run`, once its own launch reservation is
+    /// released, so the profile reads idle when nothing else runs there. Only the launch may
+    /// close late, which over-covers. A background session the child started, or another
+    /// launcher's reservation, keeps the launch open, and the next scan that finds the profile
+    /// idle closes it.
     pub fn close_launch(
         &self,
         id: &LaunchId,
@@ -330,7 +332,11 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let p = self.provider(&id.provider)?;
         let store = self.store()?;
-        let ends = state.tenure.iter().map(|t| (t, SightingEnd::AtLeast));
+        let until = exited_at_ms;
+        let ends = state
+            .tenure
+            .iter()
+            .map(|t| (t, SightingEnd::AtLeast { until }));
         let ended = state.ended.iter().rev().map(|t| (t, SightingEnd::Exactly));
         for (t, how) in ends.chain(ended) {
             self.end_tenure(&store, id, t, t.confirmed_at.min(exited_at_ms), how)?;

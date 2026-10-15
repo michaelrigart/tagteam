@@ -172,9 +172,10 @@ fn plan_launch(engine: &Engine, launched: &Launched, err: &mut dyn Write) -> Opt
 }
 
 /// Token report spec §6.1, after exit handling: records the launch once more if it is still not
-/// recorded, ends the child's tenures at their last confirming reads, never past `exited_at_ms`,
-/// the child's exit, and closes the launch unless the profile is still in use, as by a
-/// background session the child left running.
+/// recorded, ends the child's tenures (`Engine::close_launch`): the current one at the later of
+/// its stored end and its last confirming read, the ones a switch ended exactly at theirs, and
+/// none past `exited_at_ms`, the child's exit. Then it closes the launch unless the profile is
+/// still in use, as by a background session the child left running.
 ///
 /// A launch that still cannot be recorded is logged, and warned of on `err` (the child being
 /// gone) when `child_ran`: with no child there is no usage to misplace. The close that follows
