@@ -597,6 +597,10 @@ fn a_launch_that_failed_to_record_is_recorded_later_with_its_original_start() {
     );
     assert_eq!(late.account_id, home.a);
     assert_eq!(kept[0].started_at_ms, late.started_at, "the same launch");
+    // The poller removes the file while the child is still held; the close would remove it too.
+    wait_for("the poller to remove the pending file", || {
+        home.pending().is_empty().then_some(())
+    });
     fs::write(&hold, b"").unwrap();
     let output = finish(child);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
@@ -606,7 +610,7 @@ fn a_launch_that_failed_to_record_is_recorded_later_with_its_original_start() {
         "the profile kept the launch meanwhile: {}",
         stderr(&output)
     );
-    assert!(home.pending().is_empty(), "recorded: the file is removed");
+    assert!(home.pending().is_empty(), "the close leaves none");
     let closed = home.launches();
     assert_eq!(closed.len(), 1, "{closed:?}");
     assert_eq!(closed[0].started_at, late.started_at);
