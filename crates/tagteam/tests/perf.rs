@@ -1,5 +1,6 @@
 //! §1.1's timing targets through the real binary: `statusline` within 10 ms p95, and `list`
-//! within 50 ms p95 when no usage fetch is due. Timings mean something only in an optimized
+//! within 50 ms p95 when no usage fetch is due, alone and while a daemon runs against the same
+//! store (D1.1 criterion 3, D12). Timings mean something only in an optimized
 //! build on an idle machine, so this file exists only in release builds and its tests are
 //! ignored by default:
 //! `cargo test --release -p tagteam --features test-support --test perf -- --ignored`
@@ -10,12 +11,13 @@ mod common;
 
 use std::fs::File;
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use common::{
-    bloat_claude_json, cc_profile, hold_launch, now_epoch_s, record_history, std_cmd,
-    two_fresh_accounts, usage_window,
+    Guarded, bloat_claude_json, cc_profile, hold_launch, now_epoch_s, record_history,
+    short_tempdir, std_cmd, two_fresh_accounts, usage_window,
 };
 use tagteam_core::{Window, WindowKind};
 use tagteam_provider::Env;
@@ -129,6 +131,65 @@ fn p95(runs: &[Duration]) -> Duration {
     let mut sorted = runs.to_vec();
     sorted.sort();
     sorted[(sorted.len() * 95).div_ceil(100) - 1]
+}
+
+/// The ticks a daemon's `--json` output has finished: each ends in one `switch` or `no-switch`
+/// event (§11.4).
+fn ticks(out: &str) -> usize {
+    out.matches(r#""event":"no-switch""#).count() + out.matches(r#""event":"switch""#).count()
+}
+
+/// Untimed, before each run: 350 ms, so the 53 runs span about 19 s, more than the longest tick
+/// delay (15 s × 1.1), and at least one tick lands among them. It spins rather than sleeps: an
+/// idle core clocks down, and a run started after 350 ms asleep measures the wake-up (about
+/// 19 ms for `statusline` with no daemon at all), not the binary.
+fn spread(_: usize) {
+    let until = Instant::now() + Duration::from_millis(350);
+    while Instant::now() < until {
+        std::hint::spin_loop();
+    }
+}
+
+/// D12, D14: a daemon on the fixture while the runs are timed. It is in `auto` mode, with the
+/// shortest interval §6.4 allows (15 s), so it ticks while the runs go on. Its scheduler also
+/// wakes every second, and its store watch reads the store every 2 s. Notifications are off,
+/// so it starts nothing. Returns once its first tick is in.
+fn start_daemon(root: &Path, base: &str) -> Guarded {
+    for (key, value) in [
+        ("autoswitch.interval_seconds", "15"),
+        ("notify.enabled", "false"),
+    ] {
+        let out = std_cmd(root)
+            .args(["config", "set", key, value])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "config set {key}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let mut cmd = std_cmd(root);
+    cmd.env("TAGTEAM_TEST_API_BASE", base)
+        .args(["daemon", "--json"])
+        .stdin(Stdio::null());
+    let mut daemon = Guarded::spawn(cmd);
+    daemon.wait_for(Duration::from_secs(30), "the daemon's first tick", |out| {
+        ticks(out) >= 1
+    });
+    daemon
+}
+
+/// SIGTERM, and the daemon's exit 0 (D4.6).
+fn stop(daemon: Guarded) {
+    daemon.signal(libc::SIGTERM);
+    let out = daemon.finish(Duration::from_secs(10));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -335,5 +396,61 @@ fn statusline_due_a_sighting_extension_p95_is_within_10_ms() {
     assert!(
         p <= Duration::from_millis(10),
         "statusline due a sighting extension p95 {p:?} over {RUNS} runs: {runs:?}"
+    );
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn statusline_p95_is_within_10_ms_while_a_daemon_runs() {
+    let _one_at_a_time = serial();
+    let d = short_tempdir();
+    nothing_due(d.path());
+    let server = MockServer::start();
+    let daemon = start_daemon(d.path(), &server.base_url());
+    let before = ticks(&daemon.stdout());
+    let runs = timings(d.path(), &server.base_url(), &["statusline"], &[], &spread);
+    let ticked = ticks(&daemon.stdout()) - before;
+    stop(daemon);
+    let p = p95(&runs);
+    eprintln!(
+        "statusline p95 while a daemon runs {p:?} over {RUNS} runs, {ticked} ticks among them"
+    );
+    assert!(
+        ticked >= 1,
+        "the daemon never ticked while the runs went on"
+    );
+    assert_eq!(server.requests().len(), 0, "a request was sent");
+    assert!(
+        p <= Duration::from_millis(10),
+        "statusline p95 while a daemon runs {p:?} over {RUNS} runs: {runs:?}"
+    );
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn list_p95_is_within_50_ms_when_nothing_is_due_while_a_daemon_runs() {
+    let _one_at_a_time = serial();
+    let d = short_tempdir();
+    nothing_due(d.path());
+    let server = MockServer::start();
+    let daemon = start_daemon(d.path(), &server.base_url());
+    let before = ticks(&daemon.stdout());
+    let runs = timings(d.path(), &server.base_url(), &["list"], &[], &spread);
+    let ticked = ticks(&daemon.stdout()) - before;
+    stop(daemon);
+    let p = p95(&runs);
+    eprintln!("list p95 while a daemon runs {p:?} over {RUNS} runs, {ticked} ticks among them");
+    assert!(
+        ticked >= 1,
+        "the daemon never ticked while the runs went on"
+    );
+    assert_eq!(
+        server.requests().len(),
+        0,
+        "a fetch was due, so this measured the wrong path"
+    );
+    assert!(
+        p <= Duration::from_millis(50),
+        "list p95 while a daemon runs {p:?} over {RUNS} runs: {runs:?}"
     );
 }

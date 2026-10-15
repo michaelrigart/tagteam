@@ -230,6 +230,59 @@ impl DaemonSink for DaemonJson<'_> {
     }
 }
 
+/// Plan B Decision 7: the multi-process tests' hooks, read only by a `test-support` build.
+/// `TAGTEAM_TEST_UPGRADE_WATCH_MS` shortens the upgrade watch's period (D4.5), so an exit-75
+/// test takes seconds. `TAGTEAM_TEST_DAEMON_PROGRAM` names the file the watch follows, so a
+/// test can replace it without touching the binary it runs.
+#[cfg(any(test, feature = "test-support"))]
+const TEST_UPGRADE_WATCH_MS: &str = "TAGTEAM_TEST_UPGRADE_WATCH_MS";
+#[cfg(any(test, feature = "test-support"))]
+const TEST_DAEMON_PROGRAM: &str = "TAGTEAM_TEST_DAEMON_PROGRAM";
+
+/// Decision 7: the path the upgrade watch follows. It is `program`, unless `var` gives
+/// `TAGTEAM_TEST_DAEMON_PROGRAM` a value that is not empty.
+#[cfg(feature = "test-support")]
+pub(crate) fn test_program(
+    program: PathBuf,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    var(TEST_DAEMON_PROGRAM)
+        .filter(|p| !p.is_empty())
+        .map_or(program, PathBuf::from)
+}
+
+/// Decision 7: the upgrade watch's period. It is `ms`, unless `var` gives
+/// `TAGTEAM_TEST_UPGRADE_WATCH_MS` a positive number of milliseconds.
+#[cfg(feature = "test-support")]
+pub(crate) fn test_upgrade_watch_ms(
+    ms: i64,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> i64 {
+    var(TEST_UPGRADE_WATCH_MS)
+        .and_then(|v| v.into_string().ok())
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(ms)
+}
+
+/// A release build has no test hooks, whatever the environment holds.
+#[cfg(not(feature = "test-support"))]
+pub(crate) fn test_program(
+    program: PathBuf,
+    _var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> PathBuf {
+    program
+}
+
+/// A release build has no test hooks, whatever the environment holds.
+#[cfg(not(feature = "test-support"))]
+pub(crate) fn test_upgrade_watch_ms(
+    ms: i64,
+    _var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> i64 {
+    ms
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -459,5 +512,66 @@ mod socket_tests {
         assert!(bind_socket(&env, &board).is_none());
         assert_eq!(board.snapshot().daemon.socket, None);
         assert!(!env.data_dir().exists(), "nothing was created");
+    }
+}
+
+#[cfg(test)]
+mod test_hook_tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// The path `tagteam daemon` would follow, before the hooks.
+    const INSTALLED: &str = "/opt/homebrew/bin/tagteam";
+
+    fn all_set(k: &str) -> Option<OsString> {
+        match k {
+            TEST_UPGRADE_WATCH_MS => Some("200".into()),
+            TEST_DAEMON_PROGRAM => Some("/tmp/tt/bin/tagteam".into()),
+            _ => None,
+        }
+    }
+
+    /// Runs under both builds: with `test-support` the hooks are honoured; without it (a
+    /// release build) they are ignored, whatever the environment holds (Decision 7).
+    #[test]
+    fn the_daemon_test_hooks_exist_only_with_test_support() {
+        let honoured = cfg!(feature = "test-support");
+        assert_eq!(
+            test_upgrade_watch_ms(60_000, &all_set),
+            if honoured { 200 } else { 60_000 }
+        );
+        assert_eq!(
+            test_program(PathBuf::from(INSTALLED), &all_set),
+            PathBuf::from(if honoured {
+                "/tmp/tt/bin/tagteam"
+            } else {
+                INSTALLED
+            })
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn a_hook_value_that_is_not_usable_changes_nothing() {
+        let unusable = |k: &str| match k {
+            TEST_UPGRADE_WATCH_MS => Some(OsString::from("soon")),
+            TEST_DAEMON_PROGRAM => Some(OsString::new()),
+            _ => None,
+        };
+        assert_eq!(test_upgrade_watch_ms(60_000, &unusable), 60_000);
+        assert_eq!(
+            test_program(PathBuf::from(INSTALLED), &unusable),
+            PathBuf::from(INSTALLED)
+        );
+        for zero_or_less in ["0", "-5"] {
+            let var = |k: &str| (k == TEST_UPGRADE_WATCH_MS).then(|| OsString::from(zero_or_less));
+            assert_eq!(
+                test_upgrade_watch_ms(60_000, &var),
+                60_000,
+                "{zero_or_less}"
+            );
+        }
     }
 }

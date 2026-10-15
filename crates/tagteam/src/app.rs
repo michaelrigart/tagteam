@@ -1824,10 +1824,15 @@ impl App<'_, '_> {
     /// (D4.1 step 3, Decision 14). It exits 0 once a signal stops it, and 75 once a newer
     /// tagteam must take over (D4.5).
     fn daemon(&mut self) -> Result<i32, Failure> {
+        // Plan B Decision 7: a test-support build's hooks; a release build ignores them.
+        let hook = |k: &str| std::env::var_os(k);
         // D4.5, Decision 17: before anything that can wait (the unlock offer, the
         // `daemon.lock` wait), so a binary replaced meanwhile is an upgrade at the upgrade
         // watch's first run, never this daemon's own baseline.
-        let program = ProgramStamp::take(daemon_cmd::program(self.engine.env().var("PATH")));
+        let program = ProgramStamp::take(daemon_cmd::test_program(
+            daemon_cmd::program(self.engine.env().var("PATH")),
+            &hook,
+        ));
         if matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
             return Err(EngineError::InsideRunShell.into());
         }
@@ -1841,7 +1846,7 @@ impl App<'_, '_> {
             provider: self.provider_flag.clone(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             program,
-            upgrade_watch_ms: UPGRADE_WATCH_MS,
+            upgrade_watch_ms: daemon_cmd::test_upgrade_watch_ms(UPGRADE_WATCH_MS, &hook),
             keychain_counts: self.keychain_counts.clone(),
             backend: Backend::detect(self.platform == Platform::MacOs, path),
         };
