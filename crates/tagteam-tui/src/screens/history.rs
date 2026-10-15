@@ -125,6 +125,7 @@ pub(crate) fn on_enter(state: &mut State, now_ms: i64) -> Vec<Cmd> {
             None => {
                 state.history.account = None;
                 state.history.view = None;
+                state.gens.history += 1;
                 return vec![];
             }
         },
@@ -943,6 +944,20 @@ mod tests {
         assert!(
             on_accounts(&mut state, NOW_MS).is_empty(),
             "only while History is open"
+        );
+    }
+
+    #[test]
+    fn no_accounts_drops_a_history_read_still_in_flight() {
+        let mut state = on_history(many(1));
+        on_accounts(&mut state, NOW_MS);
+        let before = state.gens.history;
+        state.accounts.apply(snapshot(vec![]));
+        assert!(on_accounts(&mut state, NOW_MS).is_empty());
+        assert_eq!(
+            state.gens.history,
+            before + 1,
+            "the read in flight is stale"
         );
     }
 }
