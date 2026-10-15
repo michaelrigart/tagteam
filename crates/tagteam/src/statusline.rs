@@ -16,6 +16,7 @@ use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{STATUSLINE_MODEL_PREFIX, is_statusline_placeholder};
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, StatuslineView};
+use tagteam_engine::words::{self, MISSING};
 use tagteam_engine::{Engine, EngineConfig};
 use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::SystemSpawner;
@@ -25,7 +26,7 @@ use tagteam_provider::{
 };
 
 use crate::app::{Context, command_settings};
-use crate::render::{self, MISSING, RESET};
+use crate::render::{self, RESET};
 
 /// §13.5: at most this much piped stdin is read, and none of it is used.
 const STDIN_CAP: u64 = 64 * 1024;
@@ -107,9 +108,9 @@ fn placeholder(
         "account" => row
             .alias
             .clone()
-            .unwrap_or_else(|| local_part(&render::email(row)).to_owned()),
+            .unwrap_or_else(|| local_part(&words::email(row)).to_owned()),
         "position" => row.position.to_string(),
-        "email" => render::email(row),
+        "email" => words::email(row),
         "5h" => pct(of_kind(WindowKind::Short), colour),
         "7d" => pct(of_kind(WindowKind::Long), colour),
         "5h_reset" => reset(of_kind(WindowKind::Short), now_s),
@@ -145,7 +146,7 @@ fn pct(w: Option<&Window>, colour: bool) -> String {
 }
 
 fn paint(text: &str, shown_pct: f64, colour: bool) -> String {
-    match render::severity(shown_pct as i64) {
+    match render::severity_code(shown_pct as i64) {
         Some(code) if colour => format!("{code}{text}{RESET}"),
         _ => text.to_owned(),
     }
@@ -154,7 +155,7 @@ fn paint(text: &str, shown_pct: f64, colour: bool) -> String {
 /// A window's time to reset, as `list` shows it.
 fn reset(w: Option<&Window>, now_s: i64) -> String {
     w.and_then(|w| w.resets_at)
-        .map_or_else(|| MISSING.to_owned(), |at| render::countdown(at, now_s))
+        .map_or_else(|| MISSING.to_owned(), |at| words::countdown(at, now_s))
 }
 
 /// The spend window as money (`€3.50 of €20`) when the provider's detail says how much, else
@@ -172,7 +173,7 @@ fn spend(w: Option<&Window>, colour: bool) -> String {
 fn stale(fetched_at: Option<i64>, now_s: i64) -> String {
     match fetched_at {
         Some(at) if now_s - at > STALE_AFTER_S => {
-            format!(" · {} old", render::duration(now_s - at))
+            format!(" · {} old", words::duration(now_s - at))
         }
         _ => String::new(),
     }

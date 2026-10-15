@@ -6,8 +6,9 @@ use tagteam_cc::usage::format_iso8601;
 use tagteam_core::ProviderId;
 use tagteam_engine::Engine;
 use tagteam_engine::displace::{DisplacedEntry, DisplacedList};
+use tagteam_engine::words::MISSING;
 
-use crate::render::{self, MISSING};
+use crate::render;
 
 const EMPTY: &str = "No displaced credentials.\n";
 const HEADS: [&str; 7] = [

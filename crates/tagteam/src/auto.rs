@@ -9,9 +9,10 @@ use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::NoSwitchReason;
 use tagteam_daemon::protocol::event_json;
 use tagteam_engine::auto::{AutoEvent, EventSink};
+use tagteam_engine::words::{MISSING, duration};
 use tagteam_provider::Cancel;
 
-use crate::render::{MISSING, RESET, duration, severity};
+use crate::render::{RESET, severity_code};
 
 /// Rust ignores SIGPIPE, so a reader that has gone away shows as `BrokenPipe` on a write. The
 /// command stops as SIGPIPE would have stopped it, through the cancel token (§14.1), so the loop
@@ -185,7 +186,7 @@ impl<'a> HumanSink<'a> {
 /// A percentage rounded as `list` rounds it, coloured by §13.5's severities when `color`.
 fn pct(used: f64, color: bool) -> String {
     let n = used.round() as i64;
-    match severity(n) {
+    match severity_code(n) {
         Some(code) if color => format!("{code}{n}%{RESET}"),
         _ => format!("{n}%"),
     }

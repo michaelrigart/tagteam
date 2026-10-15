@@ -5,12 +5,9 @@ use serde_json::{Value, json};
 use tagteam_cc::usage::format_iso8601;
 use tagteam_core::ProjectionMethod;
 use tagteam_engine::views::{HistoryView, HistoryWindow};
-
-use crate::render;
+use tagteam_engine::words;
 
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-/// A projection further out than this is not worth a countdown: it will not run out.
-const A_YEAR_S: i64 = 365 * 86_400;
 /// The widest sparkline. A longer history is bucketed, and each bucket shows its peak.
 const SPARK_WIDTH: usize = 60;
 
@@ -55,14 +52,14 @@ pub(crate) fn human(view: &HistoryView, window: Option<&str>, since: &str, now_s
     if view.windows.is_empty() {
         return match window {
             Some(name) if view.unmatched_window => {
-                format!("No window named {name} for {}.\n", render::name(row))
+                format!("No window named {name} for {}.\n", words::name(row))
             }
-            _ => format!("No usage history for {}.\n", render::name(row)),
+            _ => format!("No usage history for {}.\n", words::name(row)),
         };
     }
     let mut s = format!(
         "{} (position {}), last {since}\n",
-        render::name(row),
+        words::name(row),
         row.position
     );
     for w in &view.windows {
@@ -77,7 +74,7 @@ fn block(hw: &HistoryWindow, now_s: i64) -> String {
     let mut head = format!("{}  {:.0}%", w.label, w.pct.round());
     if let Some(at) = w.resets_at {
         // As `list` says it: a reset that has passed is `reset`, not a countdown to it.
-        let left = render::countdown(at, now_s);
+        let left = words::countdown(at, now_s);
         if at > now_s {
             head.push_str(&format!("  resets in {left}"));
         } else {
@@ -90,56 +87,10 @@ fn block(hw: &HistoryWindow, now_s: i64) -> String {
         1 => format!("{}  1 sample", sparkline(&pcts)),
         n => format!("{}  {n} samples", sparkline(&pcts)),
     };
-    format!("{head}\n  {samples}\n  {}\n", projection(hw, now_s))
-}
-
-/// A rate in points per hour with its sign: one decimal, or two below 0.05 in magnitude, where
-/// one would print a quiet window's rate as zero (`+0.03`, not `+0.0`). A rate too small for
-/// two decimals is `<0.01`, never a zero beside a finite runway; only exactly 0 is `+0.0`.
-fn signed(rate: f64) -> String {
-    let magnitude = rate.abs();
-    if magnitude == 0.0 {
-        "+0.0".to_owned()
-    } else if magnitude < 0.005 {
-        format!("{}<0.01", if rate < 0.0 { '-' } else { '+' })
-    } else if magnitude < 0.05 {
-        format!("{rate:+.2}")
-    } else {
-        format!("{rate:+.1}")
-    }
-}
-
-/// The burn rate and where it leads (§8.7): `lasts to reset` when the window will, else when it
-/// runs out (or `should have run out` when that time has passed, `won't run out within a year`
-/// when it is further off than that), with the method that measured the rate.
-fn projection(hw: &HistoryWindow, now_s: i64) -> String {
-    let p = &hw.pace;
-    let method = p
-        .method
-        .map_or_else(String::new, |m| format!(" ({})", m.as_str()));
-    // An exhausted window ran out when it was read, which may be long ago: no countdown applies.
-    if hw.window.pct >= 100.0 {
-        return match p.rate_per_hour {
-            Some(rate) => format!("{} pts/h · at the limit{method}", signed(rate)),
-            None => "at the limit".to_owned(),
-        };
-    }
-    let Some(rate) = p.rate_per_hour else {
-        return "no rate yet".to_owned();
-    };
-    let eta = match (p.will_last_to_reset, p.exhaustion_at) {
-        (Some(true), _) => "lasts to reset".to_owned(),
-        (_, Some(at)) if at <= now_s => format!(
-            "should have run out {} ago",
-            render::duration(now_s.saturating_sub(at))
-        ),
-        (_, Some(at)) if at.saturating_sub(now_s) > A_YEAR_S => {
-            "won't run out within a year".to_owned()
-        }
-        (_, Some(at)) => format!("runs out in {}", render::duration(at - now_s)),
-        _ => "no projection".to_owned(),
-    };
-    format!("{} pts/h · {eta}{method}", signed(rate))
+    format!(
+        "{head}\n  {samples}\n  {}\n",
+        words::projection_text(hw, now_s)
+    )
 }
 
 /// `--csv`: `window,fetched_at,pct,resets_at`, one row per sample, times in ISO 8601 UTC.
@@ -175,7 +126,7 @@ pub(crate) fn json(view: &HistoryView, provider: &str) -> Value {
     json!({
         "schemaVersion": 1,
         "provider": provider,
-        "account": {"number": row.position, "id": row.id.as_str(), "email": render::email(row)},
+        "account": {"number": row.position, "id": row.id.as_str(), "email": words::email(row)},
         "windows": windows,
     })
 }
@@ -350,148 +301,6 @@ mod tests {
                 "  no samples\n",
                 "  +0.3 pts/h · lasts to reset (average)\n",
             )
-        );
-    }
-
-    #[test]
-    fn a_projection_lasts_runs_out_or_is_missing() {
-        let with = |pace: Pace| {
-            let w = window("7d", "7d", WindowKind::Long, 30.0, None);
-            projection(&history_window(w, vec![], pace), NOW)
-        };
-        assert_eq!(with(Pace::default()), "no rate yet");
-        let past = Pace {
-            rate_per_hour: Some(5.0),
-            method: Some(ProjectionMethod::Regression),
-            exhaustion_at: Some(NOW - 60),
-            ..Pace::default()
-        };
-        assert_eq!(
-            with(past),
-            "+5.0 pts/h · should have run out 1m ago (regression)"
-        );
-        let just_past = Pace {
-            exhaustion_at: Some(NOW),
-            ..past
-        };
-        assert_eq!(
-            with(just_past),
-            "+5.0 pts/h · should have run out <1m ago (regression)"
-        );
-        let soon = Pace {
-            exhaustion_at: Some(NOW + 60),
-            ..past
-        };
-        assert_eq!(with(soon), "+5.0 pts/h · runs out in 1m (regression)");
-        let flat = Pace {
-            rate_per_hour: Some(0.0),
-            method: Some(ProjectionMethod::Average),
-            ..Pace::default()
-        };
-        assert_eq!(with(flat), "+0.0 pts/h · no projection (average)");
-    }
-
-    #[test]
-    fn an_exhausted_window_is_at_the_limit_with_or_without_a_rate() {
-        let exhausted = |pace: Pace| {
-            let w = window("5h", "5h", WindowKind::Short, 100.0, Some(HOUR));
-            projection(&history_window(w, vec![], pace), NOW)
-        };
-        // Read 100, 100, 100: no slope, no average for a Short window, but exhausted at the read.
-        let no_rate = Pace {
-            exhaustion_at: Some(NOW - 2 * HOUR),
-            ..Pace::default()
-        };
-        assert_eq!(exhausted(no_rate), "at the limit");
-        // With a rate the exhaustion time is the read's, hours ago: no countdown.
-        let with_rate = Pace {
-            rate_per_hour: Some(5.0),
-            method: Some(ProjectionMethod::Average),
-            exhaustion_at: Some(NOW - 2 * HOUR),
-            will_last_to_reset: Some(false),
-            ..Pace::default()
-        };
-        assert_eq!(exhausted(with_rate), "+5.0 pts/h · at the limit (average)");
-    }
-
-    #[test]
-    fn a_quiet_windows_rate_keeps_two_decimals() {
-        for (rate, text) in [
-            (0.03, "+0.03"),
-            (-0.049, "-0.05"),
-            (0.005, "+0.01"),
-            (0.004, "+<0.01"),
-            (-1e-9, "-<0.01"),
-            (0.0, "+0.0"),
-            (-0.0, "+0.0"),
-            (0.05, "+0.1"),
-            (0.099, "+0.1"),
-            (0.1, "+0.1"),
-            (5.0, "+5.0"),
-            (-1.26, "-1.3"),
-        ] {
-            assert_eq!(signed(rate), text, "{rate}");
-        }
-    }
-
-    #[test]
-    fn a_projection_beyond_a_year_says_it_will_not_run_out() {
-        let with = |pace: Pace, reset: Option<i64>| {
-            let w = window("7d", "7d", WindowKind::Long, 30.0, reset);
-            projection(&history_window(w, vec![], pace), NOW)
-        };
-        // A quiet window: 70 points to go at 0.006 an hour is well over a year.
-        let tiny = Pace {
-            rate_per_hour: Some(0.006),
-            method: Some(ProjectionMethod::Regression),
-            exhaustion_at: Some(NOW + 42_000_000),
-            will_last_to_reset: None,
-            ..Pace::default()
-        };
-        assert_eq!(
-            with(tiny, None),
-            "+0.01 pts/h · won't run out within a year (regression)"
-        );
-        // With a reset it will not reach, the reset is what counts (§8.7).
-        let lasts = Pace {
-            will_last_to_reset: Some(true),
-            ..tiny
-        };
-        assert_eq!(
-            with(lasts, Some(HOUR)),
-            "+0.01 pts/h · lasts to reset (regression)"
-        );
-        // 70 points at 0.01 an hour is 291 days: a countdown still.
-        let slow = Pace {
-            rate_per_hour: Some(0.01),
-            exhaustion_at: Some(NOW + 25_200_000),
-            ..tiny
-        };
-        assert_eq!(
-            with(slow, None),
-            "+0.01 pts/h · runs out in 291d16h (regression)"
-        );
-        // The year itself is still a countdown; a second more is not.
-        let year = |s| Pace {
-            exhaustion_at: Some(NOW + 365 * 86_400 + s),
-            ..tiny
-        };
-        assert_eq!(
-            with(year(0), None),
-            "+0.01 pts/h · runs out in 365d00h (regression)"
-        );
-        assert_eq!(
-            with(year(1), None),
-            "+0.01 pts/h · won't run out within a year (regression)"
-        );
-        // A saturated time must not overflow.
-        let saturated = Pace {
-            exhaustion_at: Some(i64::MAX),
-            ..tiny
-        };
-        assert_eq!(
-            with(saturated, None),
-            "+0.01 pts/h · won't run out within a year (regression)"
         );
     }
 

@@ -5,8 +5,16 @@ use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind};
 use tagteam_engine::store::{AccountRow, Mapping};
 use tagteam_engine::switch::SwitchOutcome;
 use tagteam_engine::views::{
-    AccountView, NO_DATA, ProviderAccounts, ShellAccount, StatusView, UsageStatus, UsageView,
+    AccountView, ProviderAccounts, ShellAccount, StatusView, UsageStatus, UsageView,
 };
+use tagteam_engine::words::{
+    AHEAD, IN_SESSION, Severity, WindowColumn, account_cell, countdown, row_notes, severity,
+    spend_text, usage_words, window_columns,
+};
+// `app` and `transfer_cmd` still spell these `render::email` and `render::name`.
+pub use tagteam_engine::words::{email, name};
+// `tokens_cmd` still spells these `render::MISSING` and `render::duration`.
+pub(crate) use tagteam_engine::words::{MISSING, duration};
 use tagteam_provider::SecretStore;
 use unicode_width::UnicodeWidthStr;
 
@@ -24,34 +32,9 @@ const API_KEY_HINT: &str = "Restart Claude Code to apply.";
 pub(crate) const CRITICAL: &str = "\x1b[31m";
 pub(crate) const WARNING: &str = "\x1b[33m";
 pub(crate) const RESET: &str = "\x1b[0m";
-/// A window a reading does not have, or an age that is not known.
-pub(crate) const MISSING: &str = "—";
-/// §8.7's marker for a window ahead of pace.
-const AHEAD: &str = "▲ pace";
-/// `list` always has a spend column once any account has a reading (§13.1).
-const SPEND_HEAD: &str = "SPEND";
-/// §13.1's marker of a session-owned account, in a one-column field after the position
-/// (Decision 11).
-const IN_SESSION: &str = "▶";
-/// The trailing note on the run shell's own row: §13.1's `▶ this`, kept with the notes so the
-/// columns stay aligned.
-const THIS: &str = "this";
 
 /// A row's windows in its provider's JSON shape: `Provider::render_usage` (§13.2).
 pub type RenderUsage<'a> = &'a dyn Fn(&ProviderId, &[(Window, Pace)]) -> Value;
-
-/// The account's email (or label when it has none).
-pub fn email(r: &AccountRow) -> String {
-    r.email.clone().unwrap_or_else(|| r.label.clone())
-}
-
-pub fn name(r: &AccountRow) -> String {
-    let email = email(r);
-    match &r.alias {
-        Some(a) => format!("{a} ({email})"),
-        None => email,
-    }
-}
 
 /// One `list` row (§13.2). `usage` is decision-grade only (§8.4), with its fetch time and age.
 /// Otherwise `usage` is null and the last good reading, if any, is `lastGoodUsage`. Whatever
@@ -134,45 +117,13 @@ pub fn list_json(
     })
 }
 
-// A span of time as `list` and `status` show it: `3d09h`, `2h40m`, `45m`, or `<1m`. The usage
-// strategies' messages state a reset in the same words, so there is one formatter.
-pub(crate) use tagteam_core::rank::span as duration;
-
-/// The time left until `at`, or `reset` once it has passed: the reading predates the window's
-/// reset, so its pct no longer applies.
-pub(crate) fn countdown(at: i64, now_s: i64) -> String {
-    if at <= now_s {
-        "reset".into()
-    } else {
-        duration(at - now_s)
-    }
-}
-
-pub(crate) fn severity(pct: i64) -> Option<&'static str> {
-    if pct >= 90 {
-        Some(CRITICAL)
-    } else if pct >= 70 {
-        Some(WARNING)
-    } else {
-        None
-    }
-}
-
-/// An amount with its currency's symbol (€, $, £), or its code for any other; a whole amount
-/// without cents.
-pub(crate) fn money(amount: f64, currency: &str) -> String {
-    let cents = format!("{amount:.2}");
-    let n = match cents.strip_suffix(".00") {
-        Some("-0") => "0",
-        Some(whole) => whole,
-        None => &cents,
-    }
-    .to_owned();
-    match currency.to_ascii_uppercase().as_str() {
-        "EUR" => format!("€{n}"),
-        "USD" => format!("${n}"),
-        "GBP" => format!("£{n}"),
-        code => format!("{n} {code}"),
+/// §13.5's severities as the ANSI codes `list`, `status`, `auto` and the statusline colour a
+/// percentage with: ≥ 90 critical, ≥ 70 warning.
+pub(crate) fn severity_code(pct: i64) -> Option<&'static str> {
+    match severity(pct) {
+        Severity::Critical => Some(CRITICAL),
+        Severity::Warning => Some(WARNING),
+        Severity::Normal => None,
     }
 }
 
@@ -186,22 +137,11 @@ pub(crate) fn spend_shown(w: &Window, color: bool) -> Option<String> {
 /// `spend_shown` as a table cell, with its plain text for the column's width.
 fn spend_cell(w: &Window, color: bool) -> Option<Cell> {
     let text = spend_text(w)?;
-    let shown = match severity(w.pct.round() as i64) {
+    let shown = match severity_code(w.pct.round() as i64) {
         Some(code) if color => format!("{code}{text}{RESET}"),
         _ => text.clone(),
     };
     Some(Cell { plain: text, shown })
-}
-
-/// `€0 of €20`, from a spend window's `detail {used, limit, currency}` (§8.2).
-pub(crate) fn spend_text(w: &Window) -> Option<String> {
-    let d = w.detail.as_ref().filter(|_| w.kind == WindowKind::Spend)?;
-    let currency = d["currency"].as_str()?;
-    Some(format!(
-        "{} of {}",
-        money(d["used"].as_f64()?, currency),
-        money(d["limit"].as_f64()?, currency)
-    ))
 }
 
 /// The columns `s` takes on a terminal: a CJK character or an emoji takes two.
@@ -243,7 +183,7 @@ fn pct_cell(pct: f64, color: bool) -> Cell {
     let n = pct.round() as i64;
     let digits = format!("{n}%");
     let pad = " ".repeat(4usize.saturating_sub(digits.len()));
-    let shown = match severity(n) {
+    let shown = match severity_code(n) {
         Some(c) if color => format!("{pad}{c}{digits}{RESET}"),
         _ => format!("{pad}{digits}"),
     };
@@ -266,98 +206,13 @@ fn window_cell(w: &Window, p: &Pace, now_s: i64, color: bool) -> Cell {
     c
 }
 
-/// A usage status in words (§13.1): in place of a row's windows when it has no reading, and
-/// beside them when its status is not `ok`. Whatever the status, a retry still ahead is said:
-/// `keychain unavailable (retry 2m)`, `unavailable (http-429, retry 5m)`.
-fn words(u: &UsageView, now_s: i64) -> String {
-    let (head, why) = match u.status {
-        UsageStatus::Ok => ("no usage reported", None),
-        UsageStatus::TokenExpired => ("token expired", None),
-        UsageStatus::ApiKey => ("api key", None),
-        UsageStatus::KeychainUnavailable => ("keychain unavailable", None),
-        UsageStatus::ReloginRequired => ("relogin required", None),
-        UsageStatus::ForeignCredential => ("foreign credential", None),
-        UsageStatus::NoCredentials => ("no credentials", None),
-        UsageStatus::Unsupported => ("usage unsupported", None),
-        UsageStatus::Unavailable => match u.error.as_deref() {
-            None | Some(NO_DATA) => ("no data yet", None),
-            Some("over-budget") => ("over budget", None),
-            Some(e) => ("unavailable", Some(e.to_owned())),
-        },
-    };
-    let retry = u
-        .retry_at
-        .filter(|&at| at > now_s)
-        .map(|at| format!("retry {}", duration(at - now_s)));
-    let detail: Vec<String> = why.into_iter().chain(retry).collect();
-    if detail.is_empty() {
-        head.to_owned()
-    } else {
-        format!("{head} ({})", detail.join(", "))
+/// The cell of a row whose reading lacks `col`'s window: `—`, under the `%` of a percentage
+/// column and at the start of the spend column.
+fn missing_cell(col: &WindowColumn) -> Cell {
+    match col.kind {
+        WindowKind::Spend => Cell::text(MISSING),
+        _ => Cell::text(format!("{MISSING:>4}")),
     }
-}
-
-/// One of `list`'s window columns: the window key it shows (`None` for the spend column when
-/// no account has spend), headed by the window's label in capitals.
-struct Column {
-    key: Option<String>,
-    kind: WindowKind,
-    head: String,
-}
-
-impl Column {
-    /// The cell of a row whose reading lacks this window: `—`, under the `%` of a percentage
-    /// column and at the start of the spend column.
-    fn missing(&self) -> Cell {
-        match self.kind {
-            WindowKind::Spend => Cell::text(MISSING),
-            _ => Cell::text(format!("{MISSING:>4}")),
-        }
-    }
-}
-
-/// §13.1's window columns for one provider's accounts: every window key some reading has, in
-/// kind order (Short, Long, Spend, Scoped) and then by first appearance. SPEND is always a
-/// column, `—` throughout when no account has spend: only scoped windows come and go. No
-/// columns at all while no account has a reading.
-fn columns(accounts: &[AccountView]) -> Vec<Column> {
-    let windows: Vec<&Window> = accounts
-        .iter()
-        .filter_map(|v| v.usage.windows.as_ref())
-        .flatten()
-        .map(|(w, _)| w)
-        .collect();
-    let mut cols: Vec<Column> = Vec::new();
-    if windows.is_empty() {
-        return cols;
-    }
-    for kind in [
-        WindowKind::Short,
-        WindowKind::Long,
-        WindowKind::Spend,
-        WindowKind::Scoped,
-    ] {
-        for w in windows.iter().filter(|w| w.kind == kind) {
-            if !cols
-                .iter()
-                .any(|c| c.key.as_deref() == Some(w.key.as_str()))
-            {
-                cols.push(Column {
-                    key: Some(w.key.clone()),
-                    kind,
-                    head: w.label.to_uppercase(),
-                });
-            }
-        }
-        if kind == WindowKind::Spend && !windows.iter().any(|w| w.kind == WindowKind::Spend) {
-            cols.push(Column {
-                key: None,
-                kind,
-                head: SPEND_HEAD.into(),
-            });
-        }
-    }
-    cols
 }
 
 /// One account's line before alignment: its cells (the window columns and AGE) when it has a
@@ -373,9 +228,8 @@ struct Row {
 }
 
 /// `this`: the row is the run shell's own account (§13.1).
-fn row(v: &AccountView, cols: &[Column], this: bool, now_s: i64, color: bool) -> Row {
+fn row(v: &AccountView, cols: &[WindowColumn], this: bool, now_s: i64, color: bool) -> Row {
     let u = &v.usage;
-    let mut notes = Vec::new();
     let cells = match u.windows.as_deref() {
         Some(ws) if !ws.is_empty() => {
             let mut cells: Vec<Cell> = cols
@@ -383,50 +237,29 @@ fn row(v: &AccountView, cols: &[Column], this: bool, now_s: i64, color: bool) ->
                 .map(|c| {
                     ws.iter()
                         .find(|(w, _)| c.key.as_deref() == Some(w.key.as_str()))
-                        .map_or_else(|| c.missing(), |(w, p)| window_cell(w, p, now_s, color))
+                        .map_or_else(|| missing_cell(c), |(w, p)| window_cell(w, p, now_s, color))
                 })
                 .collect();
             cells.push(Cell::text(
                 u.age_s.map_or_else(|| MISSING.to_owned(), duration),
             ));
-            if u.status != UsageStatus::Ok {
-                notes.push(words(u, now_s));
-            }
             Some(cells)
         }
-        _ => {
-            notes.push(words(u, now_s));
-            None
-        }
-    };
-    if let Some(kind) = v.kind.display {
-        if !notes.iter().any(|n| n == kind) {
-            notes.push(kind.to_owned());
-        }
-    }
-    if v.row.disabled {
-        notes.push("disabled".into());
-    }
-    if this {
-        notes.push(THIS.into());
-    }
-    let account = match &v.row.org_name {
-        Some(org) => format!("{} [{org}]", name(&v.row)),
-        None => name(&v.row),
+        _ => None,
     };
     Row {
         marker: if v.active { '*' } else { ' ' },
         position: v.row.position,
         session: v.in_session,
-        account,
+        account: account_cell(&v.row),
         cells,
-        notes,
+        notes: row_notes(v, this, now_s),
     }
 }
 
 /// §13.1's table for one provider's accounts. `this` is the run shell's own account (§12.8).
 fn table(accounts: &[AccountView], this: Option<&AccountId>, now_s: i64, color: bool) -> String {
-    let cols = columns(accounts);
+    let cols = window_columns(accounts);
     let rows: Vec<Row> = accounts
         .iter()
         .map(|v| row(v, &cols, this == Some(&v.row.id), now_s, color))
@@ -578,7 +411,7 @@ fn usage_line(u: &UsageView, now_s: i64, color: bool) -> Option<String> {
         ));
     }
     if u.status != UsageStatus::Ok && u.status != UsageStatus::ReloginRequired {
-        parts.push(words(u, now_s));
+        parts.push(usage_words(u, now_s));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
@@ -909,6 +742,7 @@ mod tests {
 
     use tagteam_core::CLAUDE_CODE;
     use tagteam_engine::switch::SwitchReason;
+    use tagteam_engine::views::NO_DATA;
 
     use super::testutil::*;
     use super::*;
@@ -1094,42 +928,18 @@ mod tests {
     }
 
     #[test]
-    fn durations_read_as_days_hours_or_minutes() {
-        for (secs, text) in [
-            (-5, "<1m"),
-            (0, "<1m"),
-            (59, "<1m"),
-            (60, "1m"),
-            (3_599, "59m"),
-            (3_600, "1h00m"),
-            (9_630, "2h40m"),
-            (86_399, "23h59m"),
-            (86_400, "1d00h"),
-            (291_630, "3d09h"),
+    fn severity_codes_follow_the_shared_severities() {
+        // `words::severity` decides; the CLI only maps it to §13.5's colours.
+        for (pct, code) in [
+            (0, None),
+            (69, None),
+            (70, Some(WARNING)),
+            (89, Some(WARNING)),
+            (90, Some(CRITICAL)),
+            (100, Some(CRITICAL)),
         ] {
-            assert_eq!(duration(secs), text, "{secs}");
+            assert_eq!(severity_code(pct), code, "{pct}");
         }
-        assert_eq!(countdown(NOW + 60, NOW), "1m");
-        assert_eq!(countdown(NOW, NOW), "reset");
-    }
-
-    #[test]
-    fn money_uses_the_symbol_or_the_code() {
-        assert_eq!(money(0.0, "EUR"), "€0");
-        assert_eq!(money(20.0, "eur"), "€20");
-        assert_eq!(money(12.5, "USD"), "$12.50");
-        assert_eq!(money(3.0, "GBP"), "£3");
-        assert_eq!(money(7.25, "CHF"), "7.25 CHF");
-    }
-
-    #[test]
-    fn money_rounds_to_cents_before_dropping_a_whole_amounts_cents() {
-        assert_eq!(money(12.999, "EUR"), "€13");
-        assert_eq!(money(0.004, "EUR"), "€0");
-        assert_eq!(money(19.996, "USD"), "$20");
-        assert_eq!(money(0.006, "EUR"), "€0.01");
-        assert_eq!(money(12.994, "EUR"), "€12.99");
-        assert_eq!(money(-0.004, "EUR"), "€0");
     }
 
     #[test]
@@ -1212,40 +1022,7 @@ mod tests {
     }
 
     #[test]
-    fn every_status_says_when_it_is_retried_while_that_is_ahead() {
-        let words_of = |status, error: Option<&str>, retry_in: Option<i64>| {
-            words(&unread(status, error, retry_in), NOW)
-        };
-        for (status, text) in [
-            (UsageStatus::KeychainUnavailable, "keychain unavailable"),
-            (UsageStatus::TokenExpired, "token expired"),
-            (UsageStatus::NoCredentials, "no credentials"),
-            (UsageStatus::ForeignCredential, "foreign credential"),
-        ] {
-            assert_eq!(
-                words_of(status, None, Some(120)),
-                format!("{text} (retry 2m)")
-            );
-            assert_eq!(words_of(status, None, None), text);
-            assert_eq!(
-                words_of(status, None, Some(-5)),
-                text,
-                "a passed retry says nothing"
-            );
-        }
-        assert_eq!(
-            words_of(UsageStatus::Unavailable, Some("over-budget"), Some(2_400)),
-            "over budget (retry 40m)"
-        );
-        assert_eq!(
-            words_of(UsageStatus::Unavailable, Some(NO_DATA), Some(30)),
-            "no data yet (retry <1m)"
-        );
-        assert_eq!(
-            words_of(UsageStatus::Unavailable, Some("http-429"), Some(330)),
-            "unavailable (http-429, retry 5m)"
-        );
-        // A row with a reading shows it, and the words beside it.
+    fn a_row_with_a_reading_shows_the_status_words_beside_it() {
         let mut locked = read(900, 31.0, 12.0, false, vec![]);
         locked.status = UsageStatus::KeychainUnavailable;
         locked.retry_at = Some(NOW + 120);
