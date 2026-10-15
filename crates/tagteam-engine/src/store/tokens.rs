@@ -241,8 +241,12 @@ fn merged_from_row(r: &Row<'_>) -> rusqlite::Result<Merged> {
 
 /// Spec §2.2's rule for a later line of a response already held: the earliest time, each
 /// count's maximum, the newer speed when it has one, and final once either line is. `into`
-/// keeps its session, project, model and sidechain flag, as the upsert does.
+/// keeps its session, model and sidechain flag, as the upsert does, and its project unless it
+/// has none and `row` is of the same session: a session's project is the first one known.
 pub(crate) fn merge_line(into: &mut UsageRow, row: &UsageRow) {
+    if into.project.is_none() && into.session_id == row.session_id {
+        into.project.clone_from(&row.project);
+    }
     into.at_ms = into.at_ms.min(row.at_ms);
     into.counts.merge_max(&row.counts);
     if row.speed.is_some() {
@@ -251,8 +255,7 @@ pub(crate) fn merge_line(into: &mut UsageRow, row: &UsageRow) {
     into.finalized |= row.finalized;
 }
 
-/// `rows`, one per key: a key's later rows merge into its first by the rule of spec §2.2, and
-/// the first keeps its session, project, model and sidechain flag, as the upsert does.
+/// `rows`, one per key: a key's later rows merge into its first by `merge_line`.
 fn merge_batch(rows: &[UsageRow]) -> Vec<UsageRow> {
     let mut at: HashMap<i64, usize> = HashMap::with_capacity(rows.len());
     let mut out: Vec<UsageRow> = Vec::with_capacity(rows.len());
@@ -288,6 +291,11 @@ const UPSERT_SESSION: &str = "INSERT INTO token_sessions (provider, session_id, 
      VALUES (?1, ?2, ?3) ON CONFLICT(provider, session_id) DO UPDATE SET \
      project = coalesce(token_sessions.project, excluded.project) \
      RETURNING id, project IS NOT NULL";
+
+/// A session's project, when it has none yet: a response that changes no count can still be
+/// the first of its session's to know it.
+const FILL_PROJECT: &str = "UPDATE token_sessions SET project = ?3 \
+     WHERE provider = ?1 AND session_id = ?2 AND project IS NULL";
 
 const MODEL_ID: &str = "SELECT id FROM token_models WHERE provider = ?1 AND name = ?2";
 
@@ -490,8 +498,9 @@ impl Store {
     /// One batch of a refresh (spec §5.2 step 4), in one `IMMEDIATE` transaction: upserts
     /// `rows` by the merge rule (spec §4), writes each of `files`, deletes the file rows at
     /// `removed`, and creates the provider's `token_state` row if absent. When a response was
-    /// added or changed it sets `changed_at` to `now_ms`, and it adds the new responses to
-    /// `responses`. A response whose merge changes nothing is not written. `epoch` is what
+    /// added or changed, or a session's project became known, it sets `changed_at` to `now_ms`,
+    /// and it adds the new responses to `responses`. A response whose merge changes nothing is
+    /// not written. `epoch` is what
     /// `begin_token_refresh` gave the refresh; when a full purge has run since, nothing is
     /// written and the answer is `TokenIndexPurged`.
     pub fn commit_token_batch(
@@ -509,10 +518,12 @@ impl Store {
         same_generation(&tx, epoch)?;
         tx.execute(ENSURE_STATE, [provider.as_str()])?;
         let mut outcome = BatchOutcome::default();
+        let mut filled = 0;
         {
             let mut read = tx.prepare(USAGE_MERGED)?;
             let mut upsert = tx.prepare(UPSERT_USAGE)?;
             let mut session = tx.prepare(UPSERT_SESSION)?;
+            let mut fill = tx.prepare(FILL_PROJECT)?;
             let mut model_id = tx.prepare(MODEL_ID)?;
             let mut insert_model = tx.prepare(INSERT_MODEL)?;
             // Each session's id, and whether its project is known yet: a later row that knows
@@ -523,7 +534,19 @@ impl Store {
                 match read.query_row([row.key], merged_from_row).optional()? {
                     None => outcome.added += 1,
                     Some(old) if old.with(row) != old => outcome.updated += 1,
-                    Some(_) => continue,
+                    Some(_) => {
+                        let known = sessions
+                            .get(row.session_id.as_str())
+                            .is_some_and(|&(_, known)| known);
+                        if !known && row.project.is_some() {
+                            filled += fill.execute(params![
+                                provider.as_str(),
+                                row.session_id,
+                                row.project
+                            ])?;
+                        }
+                        continue;
+                    }
                 }
                 let id = match sessions.get(row.session_id.as_str()) {
                     Some(&(id, known)) if known || row.project.is_none() => id,
@@ -591,7 +614,7 @@ impl Store {
                 remove.execute(params![provider.as_str(), path])?;
             }
         }
-        if outcome.added + outcome.updated > 0 {
+        if outcome.added + outcome.updated > 0 || filled > 0 {
             tx.execute(
                 "UPDATE token_state SET changed_at = ?2, responses = responses + ?3 \
                  WHERE provider = ?1",
