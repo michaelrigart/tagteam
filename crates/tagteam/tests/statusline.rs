@@ -10,11 +10,12 @@ use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{
-    cmd, login, now_epoch_s, record_reading, seed_home, std_cmd, two_fresh_accounts, usage_window,
+    cc_profile, cmd, login, now_epoch_s, record_reading, seed_home, std_cmd, two_fresh_accounts,
+    usage_window,
 };
 use serde_json::{Value, json};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, WindowKind};
-use tagteam_engine::store::Store;
+use tagteam_engine::store::{SightingRow, SightingSource, Store};
 use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Env, FileKeychain};
 
@@ -414,4 +415,185 @@ fn an_unknown_provider_is_an_error() {
         .code(1)
         .stdout("")
         .stderr("tagteam: unknown provider \"nope\"\n");
+}
+
+/// Claude Code's session record for this test process, which is the line's parent, in
+/// `config_home`: the ancestor a sighting is keyed by (token report spec §6.3). Returns its
+/// `startedAt`.
+fn record_for_this_process(config_home: &Path, session_id: &str) -> i64 {
+    let dir = config_home.join("sessions");
+    fs::create_dir_all(&dir).unwrap();
+    let pid = std::process::id();
+    let started = now_epoch_s() * 1000 - 60_000;
+    let record = json!({"pid": pid, "sessionId": session_id, "cwd": "/w",
+                        "startedAt": started, "kind": "interactive"});
+    fs::write(dir.join(format!("{pid}.json")), record.to_string()).unwrap();
+    started
+}
+
+fn sightings(root: &Path) -> Vec<SightingRow> {
+    store(root)
+        .sightings(&ProviderId::new(CLAUDE_CODE))
+        .unwrap()
+}
+
+#[test]
+fn the_statusline_records_its_session_once_a_minute() {
+    // Token report spec §6.3: Claude Code runs the line with its session's environment. The
+    // line's first ancestor with a session record, this test process, keys the sighting. The
+    // binary has no clock to set, so only what holds at any time is asserted here: one
+    // execution is one sighting, whenever the line runs again. Whether a second look extends it
+    // (a minute on) or only reads it (within one) is Task 16's, tested on the fake clock.
+    let (d, _, _) = managed(0);
+    let root = d.path();
+    let started = record_for_this_process(&Env::for_test(root).home.join(".claude"), "s-line");
+    // The setup's `add`s logged at info, so the log may exist; the lines must not add to it.
+    let log = Env::for_test(root).state_dir().join("tagteam.log");
+    let logged = fs::read(&log).ok();
+    let line = || {
+        statusline(root)
+            .arg("--no-color")
+            .env("CLAUDE_CODE_SESSION_ID", "s-line")
+            .assert()
+            .success()
+            .stdout("b · 5h 9% · 7d 77%\n")
+            .stderr("");
+    };
+    statusline(root).arg("--no-color").assert().success();
+    assert!(
+        sightings(root).is_empty(),
+        "no session id, nothing recorded"
+    );
+    line();
+    let first = sightings(root);
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert_eq!(
+        (
+            first[0].session_id.as_str(),
+            first[0].home.as_str(),
+            first[0].first_at,
+            first[0].source
+        ),
+        ("s-line", "", started, SightingSource::Statusline)
+    );
+    // The same execution, looked at again: still one sighting, keyed as before. Only its end
+    // may move, and only if a minute passed, so the end is not compared.
+    line();
+    let again = sightings(root);
+    let key = |s: &SightingRow| (s.session_id.clone(), s.home.clone(), s.first_at, s.source);
+    assert_eq!(
+        again.iter().map(key).collect::<Vec<_>>(),
+        first.iter().map(key).collect::<Vec<_>>(),
+        "a second look adds no sighting"
+    );
+    assert_eq!(
+        fs::read(&log).ok(),
+        logged,
+        "the line logs at debug at most, so it writes no log"
+    );
+}
+
+#[test]
+fn the_statusline_records_a_session_only_in_a_home_tagteam_knows() {
+    // Token report spec §6.3: in a run shell the profile's account; with `CLAUDE_CONFIG_DIR`
+    // naming the default home, that home; naming any other directory, nothing.
+    let (d, a, _) = managed(0);
+    let root = d.path();
+    let default = Env::for_test(root).home.join(".claude");
+    record_for_this_process(&default, "s-explicit");
+    statusline(root)
+        .env("CLAUDE_CONFIG_DIR", &default)
+        .env("CLAUDE_CODE_SESSION_ID", "s-explicit")
+        .assert()
+        .success();
+    let elsewhere = root.join("elsewhere");
+    record_for_this_process(&elsewhere, "s-elsewhere");
+    statusline(root)
+        .env("CLAUDE_CONFIG_DIR", &elsewhere)
+        .env("CLAUDE_CODE_SESSION_ID", "s-elsewhere")
+        .assert()
+        .success();
+    let (profile, shell) = cc_profile(root, &a);
+    record_for_this_process(&profile, "s-shell");
+    statusline(root)
+        .env("CLAUDE_CONFIG_DIR", &shell)
+        .env("CLAUDE_CODE_SESSION_ID", "s-shell")
+        .assert()
+        .success()
+        .stderr("");
+    let mut seen: Vec<(String, String)> = sightings(root)
+        .into_iter()
+        .map(|s| (s.session_id, s.home))
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            ("s-explicit".to_owned(), String::new()),
+            ("s-shell".to_owned(), a.clone()),
+        ]
+    );
+}
+
+#[test]
+fn the_statusline_output_is_unchanged_by_a_sighting_failure() {
+    // Token report spec §6.3: a sighting that cannot be written changes neither the line nor
+    // the exit code, and the status bar has nowhere to show why.
+    let (d, _, _) = managed(0);
+    let root = d.path();
+    record_for_this_process(&Env::for_test(root).home.join(".claude"), "s-broken");
+    let db = Env::for_test(root).data_dir().join("tagteam.db");
+    // A busy store: another process holds the write lock throughout. The line still prints,
+    // and its write is skipped. How long it waited is the perf tests' to time, not this one's.
+    let busy = rusqlite::Connection::open(&db).unwrap();
+    busy.execute_batch("BEGIN IMMEDIATE").unwrap();
+    statusline(root)
+        .arg("--no-color")
+        .env("CLAUDE_CODE_SESSION_ID", "s-broken")
+        .assert()
+        .success()
+        .stdout("b · 5h 9% · 7d 77%\n")
+        .stderr("");
+    busy.execute_batch("ROLLBACK").unwrap();
+    drop(busy);
+    assert!(sightings(root).is_empty(), "a busy store skips the write");
+    // No table to write to at all.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("DROP TABLE session_sightings")
+        .unwrap();
+    statusline(root)
+        .arg("--no-color")
+        .env("CLAUDE_CODE_SESSION_ID", "s-broken")
+        .assert()
+        .success()
+        .stdout("b · 5h 9% · 7d 77%\n")
+        .stderr("");
+}
+
+#[test]
+fn a_sighting_never_creates_the_store() {
+    // Like the line itself (§5): with no store there is no account to credit, and nothing is
+    // created.
+    let d = tempfile::tempdir().unwrap();
+    let env = Env::for_test(d.path());
+    seed_home(&env);
+    login(
+        &env,
+        &FileKeychain::new(d.path().join("keychain")),
+        "c@x.co",
+        "",
+        "rt-c",
+    );
+    record_for_this_process(&env.home.join(".claude"), "s-new");
+    statusline(d.path())
+        .env("CLAUDE_CODE_SESSION_ID", "s-new")
+        .assert()
+        .success()
+        .stdout("c@x.co\n")
+        .stderr("");
+    assert!(
+        !env.data_dir().exists(),
+        "a sighting never creates the store"
+    );
 }

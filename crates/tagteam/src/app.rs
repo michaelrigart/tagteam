@@ -1,4 +1,4 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -124,6 +124,9 @@ const NO_COLOR: &str = "NO_COLOR";
 const FORCE_COLOR: &str = "FORCE_COLOR";
 /// Set to `1` in every process Claude Code starts (§13.5, Appendix A.7).
 const CLAUDECODE: &str = "CLAUDECODE";
+/// The session's id, in every process Claude Code starts, its statusline command among them
+/// (token report spec §6.3).
+const CLAUDE_CODE_SESSION_ID: &str = "CLAUDE_CODE_SESSION_ID";
 
 /// Honoured only with the `test-support` feature: a release build never reads them.
 #[cfg(any(test, feature = "test-support"))]
@@ -253,7 +256,8 @@ fn build_registry(ctx: &Context) -> ProviderRegistry {
 
 /// The variables `Context::from_process` captures into `Env.vars` (Decision 5): every variable
 /// `registry`'s providers name a profile with (§4.5 `session_dir_var`), then `CLAUDECODE`
-/// (§13.5), then `PATH`, which `plan_run` looks the launch command up on (§12.1).
+/// (§13.5), then `CLAUDE_CODE_SESSION_ID`, the session the statusline records (token report
+/// spec §6.3), then `PATH`, which `plan_run` looks the launch command up on (§12.1).
 pub(crate) fn session_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
     let mut names: Vec<&'static str> = registry
         .all()
@@ -261,6 +265,7 @@ pub(crate) fn session_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
         .filter_map(|p| p.session_dir_var())
         .collect();
     names.push(CLAUDECODE);
+    names.push(CLAUDE_CODE_SESSION_ID);
     names.push("PATH");
     names
 }
@@ -833,7 +838,8 @@ fn fail_purge(io: &mut Io<'_>, json: bool, e: &PurgeError) -> i32 {
 /// §13.5's fast path, taken before `build_engine`: no lock check, no settings warnings (a status
 /// bar has nowhere to show them), and an engine walled off from the Keychain and the network
 /// (`statusline::engine`), which detects the run shell itself and resolves the provider in
-/// Decision 13's order. An unreadable marker shows nothing and exits 0 (§12.8).
+/// Decision 13's order. An unreadable marker shows nothing and exits 0 (§12.8). Once the line
+/// is out, it records its session as evidence for the token report (token report spec §6.3).
 /// `main_with_args` has already drained stdin.
 fn run_statusline(
     ctx: Context,
@@ -848,6 +854,12 @@ fn run_statusline(
         return EXIT_USAGE;
     }
     let (no_color_env, force_color_env) = (ctx.no_color_env, ctx.force_color_env);
+    let session_id = ctx
+        .env
+        .var(CLAUDE_CODE_SESSION_ID)
+        .and_then(OsStr::to_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
     let (engine, provider, _http, _keychain) = statusline::engine(ctx, provider.as_deref());
     let result = statusline_supported(&engine, &provider).and_then(|()| {
         if print_config {
@@ -875,6 +887,10 @@ fn run_statusline(
     match result {
         Ok(text) => {
             let _ = write!(io.out, "{text}");
+            if !print_config {
+                let _ = io.out.flush();
+                statusline::record_session(&engine, &provider, session_id.as_deref());
+            }
             0
         }
         Err(Failure::Engine(e)) => fail(io, false, e.kind(), &e.to_string()),
@@ -2529,7 +2545,12 @@ mod tests {
         };
         assert_eq!(
             session_vars(&build_registry(&ctx)),
-            ["CLAUDE_CONFIG_DIR", "CLAUDECODE", "PATH"]
+            [
+                "CLAUDE_CONFIG_DIR",
+                "CLAUDECODE",
+                "CLAUDE_CODE_SESSION_ID",
+                "PATH"
+            ]
         );
         assert!(
             ctx.env.vars.is_empty(),
