@@ -1981,3 +1981,19 @@ fn an_engine_that_cannot_list_the_profiles_records_unseeded() {
     assert_eq!(epoch_rows(&path), [(fx.engine.now_ms(), 0)]);
     assert!(launch_rows(&path).is_empty());
 }
+
+#[test]
+fn data_version_moves_for_another_connections_commit_and_never_for_its_own() {
+    // D3 change 4, D4.4: the store watch's signal.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let first = s.data_version().unwrap();
+    s.set_unhealthy_ticks(&cc(), 1).unwrap();
+    assert_eq!(s.data_version().unwrap(), first, "its own commit");
+    let other = Store::open(&path).unwrap();
+    other.set_unhealthy_ticks(&cc(), 2).unwrap();
+    let second = s.data_version().unwrap();
+    assert_ne!(second, first, "another connection committed");
+    assert_eq!(s.data_version().unwrap(), second, "and nothing since");
+}

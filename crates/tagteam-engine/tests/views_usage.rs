@@ -17,7 +17,8 @@ use tagteam_engine::Engine;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{Eligibility, LiveIdentityCacheRow, Reservation, Reserve};
 use tagteam_engine::views::{
-    HistoryView, HistoryWindow, NO_DATA, StatusView, StatuslineView, UsageStatus, UsageView,
+    HistoryView, HistoryWindow, LiveReading, NO_DATA, StatusView, StatuslineView, UsageStatus,
+    UsageView,
 };
 
 /// The fixture clock's start (`Fx`), in seconds.
@@ -1027,4 +1028,73 @@ fn decision_windows_take_a_clock_skewed_plan_for_no_plan() {
             row.label
         );
     }
+}
+
+#[test]
+fn live_reading_is_the_managed_live_accounts_relevant_decision_grade_windows() {
+    // D3 change 5, for D6.1's `limit`: the reading a tick's decision uses, from the store
+    // alone. A spend window is never relevant, and a scoped one only when the models name it
+    // (§8.2).
+    let fx = Fx::new();
+    assert_eq!(fx.engine.live_reading(&fx.provider(), &[]).unwrap(), None);
+    assert!(!fx.env.data_dir().exists(), "never creates the store");
+    fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live, at position 2
+    assert_eq!(
+        fx.engine.live_reading(&fx.provider(), &[]).unwrap(),
+        None,
+        "never read"
+    );
+    let windows = reading(T0, 40.0, 93.0); // 5h, 7d, Fable, spend
+    record(&fx, &b, &windows, T0, T0 + 300);
+    let store = fx.engine.store().unwrap();
+    store.set_alias(&b, Some("spare")).unwrap();
+    let label = store.account(&b).unwrap().unwrap().label;
+    let expected = |windows: &[Window]| LiveReading {
+        account: b.clone(),
+        position: 2,
+        alias: Some("spare".into()),
+        email: Some("b@x.co".into()),
+        label: label.clone(),
+        windows: windows.to_vec(),
+    };
+    at(&fx, T0 + 100);
+    assert_eq!(
+        fx.engine.live_reading(&fx.provider(), &[]).unwrap(),
+        Some(expected(&windows[..2]))
+    );
+    assert_eq!(
+        fx.engine
+            .live_reading(&fx.provider(), &["fable".to_owned()])
+            .unwrap(),
+        Some(expected(&windows[..3]))
+    );
+    assert!(fx.http.requests().is_empty(), "it never fetches");
+}
+
+#[test]
+fn live_reading_is_none_for_an_unmanaged_login_or_a_reading_past_decision_grade() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a"); // live
+    record(&fx, &a, &reading(T0, 40.0, 93.0), T0, T0 + 300);
+    at(&fx, T0 + 100);
+    assert!(
+        fx.engine
+            .live_reading(&fx.provider(), &[])
+            .unwrap()
+            .is_some()
+    );
+    at(&fx, T0 + 4_000);
+    assert_eq!(
+        fx.engine.live_reading(&fx.provider(), &[]).unwrap(),
+        None,
+        "past §8.4's hour, with nothing that extends it"
+    );
+    at(&fx, T0 + 100);
+    fx.login("z@x.co", "rt-z");
+    assert_eq!(
+        fx.engine.live_reading(&fx.provider(), &[]).unwrap(),
+        None,
+        "a live login tagteam does not manage"
+    );
 }

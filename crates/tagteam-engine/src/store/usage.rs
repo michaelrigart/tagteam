@@ -710,6 +710,23 @@ impl Store {
             .optional()?)
     }
 
+    /// §6.1's lease statement, alone: `true` when this call took `name` for `holder` until
+    /// `expires_at_ms`, because no lease of that name existed or its expiry was at or before
+    /// `now_ms` (`changes() = 1`). Times are epoch ms. One statement in autocommit, so it is
+    /// atomic across processes. D6.3's notification markers are such leases.
+    pub fn take_lease(
+        &self,
+        name: &str,
+        holder: &str,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<bool, StoreError> {
+        let taken = self
+            .lock()
+            .execute(TAKE_LEASE_SQL, params![name, holder, expires_at_ms, now_ms])?;
+        Ok(taken == 1)
+    }
+
     /// The provider's cached live identity. A row missing its path, mtime or size reads as
     /// no row: the caller re-parses the file.
     pub fn live_identity_cache(
