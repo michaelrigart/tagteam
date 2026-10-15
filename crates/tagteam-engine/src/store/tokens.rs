@@ -95,7 +95,7 @@ pub struct PruneOutcome {
     pub complete: bool,
 }
 
-/// A completed refresh's statistics (spec §4 `token_state`).
+/// The statistics of a provider's last completed refresh (spec §4 `token_state`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RefreshStats {
     pub files: u64,
@@ -540,9 +540,11 @@ impl Store {
     /// `removed`, and creates the provider's `token_state` row if absent. When a response was
     /// added or changed, or a session's project became known, it sets `changed_at` to `now_ms`,
     /// and it adds the new responses to `responses`. A response whose merge changes nothing is
-    /// not written. `epoch` is what
-    /// `begin_token_refresh` gave the refresh; when a full purge has run since, nothing is
+    /// not written. `skipped` is the lines skipped by the chunks whose checkpoints are in
+    /// `files`: it is added to `pending_skipped_lines` and never moves `changed_at`. `epoch` is
+    /// what `begin_token_refresh` gave the refresh; when a full purge has run since, nothing is
     /// written and the answer is `TokenIndexPurged`.
+    #[allow(clippy::too_many_arguments)]
     pub fn commit_token_batch(
         &self,
         provider: &ProviderId,
@@ -550,6 +552,7 @@ impl Store {
         rows: &[UsageRow],
         files: &[TokenFileRow],
         removed: &[String],
+        skipped: u64,
         now_ms: i64,
     ) -> Result<BatchOutcome, StoreError> {
         let rows = merge_batch(rows);
@@ -661,21 +664,30 @@ impl Store {
                 params![provider.as_str(), now_ms, to_sql(outcome.added)],
             )?;
         }
+        if skipped > 0 {
+            tx.execute(
+                "UPDATE token_state SET pending_skipped_lines = pending_skipped_lines + ?2 \
+                 WHERE provider = ?1",
+                params![provider.as_str(), to_sql(skipped)],
+            )?;
+        }
         tx.commit()?;
         Ok(outcome)
     }
 
     /// Spec §5.2 step 5, in one `IMMEDIATE` transaction: sets `refreshed_at` and the refresh's
-    /// `files`, `skipped_lines` and `unreadable_files`, and on the provider's first completion
-    /// `changed_at` too, which ends the index's partial state (spec §14). `stats.responses` is
-    /// not written: `responses` is the index's own count, which each batch and prune keep.
-    /// Like a batch, it writes nothing and answers `TokenIndexPurged` when the index's
-    /// generation is no longer `epoch`, what `begin_token_refresh` gave the refresh.
+    /// `files` and `unreadable_files`, and on the provider's first completion `changed_at` too,
+    /// which ends the index's partial state (spec §14). `skipped_lines` becomes the batches'
+    /// `pending_skipped_lines`, which it zeroes. `responses` is the index's own count, which
+    /// each batch and prune keep. Like a batch, it writes nothing and answers `TokenIndexPurged`
+    /// when the index's generation is no longer `epoch`, what `begin_token_refresh` gave the
+    /// refresh.
     pub fn finish_token_refresh(
         &self,
         provider: &ProviderId,
         epoch: i64,
-        stats: &RefreshStats,
+        files: u64,
+        unreadable_files: u64,
         now_ms: i64,
     ) -> Result<(), StoreError> {
         let mut c = self.lock();
@@ -685,14 +697,14 @@ impl Store {
         tx.execute(
             "UPDATE token_state SET \
              changed_at = CASE WHEN refreshed_at IS NULL THEN ?2 ELSE changed_at END, \
-             refreshed_at = ?2, files = ?3, skipped_lines = ?4, unreadable_files = ?5 \
+             refreshed_at = ?2, files = ?3, unreadable_files = ?4, \
+             skipped_lines = pending_skipped_lines, pending_skipped_lines = 0 \
              WHERE provider = ?1",
             params![
                 provider.as_str(),
                 now_ms,
-                to_sql(stats.files),
-                to_sql(stats.skipped_lines),
-                to_sql(stats.unreadable_files),
+                to_sql(files),
+                to_sql(unreadable_files),
             ],
         )?;
         tx.commit()?;

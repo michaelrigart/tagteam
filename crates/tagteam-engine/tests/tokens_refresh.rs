@@ -560,6 +560,74 @@ fn a_provider_without_transcripts_is_refused() {
 }
 
 #[test]
+fn a_pass_over_several_budgeted_calls_stores_the_skips_of_all_of_them() {
+    // Spec §5.4: the stored count is the last completed refresh's, and a pass spread over
+    // budgeted calls is one refresh. A skipped line is consumed, so no later call sees it again.
+    let ffx = FakeFx::new();
+    let (env, p) = (&ffx.fx.env, ffx.fake_provider());
+    let bad = "{\"t\":\"usage\",\"id\":7}\n";
+    let a = format!(
+        "{bad}{bad}{}{bad}{}",
+        line(&response("a0", 2, true)),
+        line(&response("a1", 2, true))
+    );
+    let b: String = (0..3)
+        .map(|i| line(&response(&format!("b{i}"), 2, true)))
+        .collect();
+    append_transcript(env, "a.jsonl", &a);
+    append_transcript(env, "b.jsonl", &b);
+
+    let mut reports = Vec::new();
+    let last = loop {
+        assert!(reports.len() < 20, "every call makes progress");
+        ffx.fx.clock.advance_ms(1_000);
+        let RefreshOutcome::Done(report) = ffx
+            .engine
+            .refresh_tokens(
+                &p,
+                Wait::Wait,
+                Some(Duration::ZERO),
+                &Cancel::new(),
+                &mut |_: &IndexProgress| {},
+            )
+            .unwrap()
+        else {
+            panic!("nothing else refreshes");
+        };
+        reports.push(report);
+        if report.complete {
+            break report;
+        }
+    };
+
+    assert!(reports.len() > 1, "the pass took several calls");
+    assert_eq!(last.skipped_lines, 0, "the completing call skipped none");
+    let sum: u64 = reports.iter().map(|r| r.skipped_lines).sum();
+    assert!(sum >= 3, "the calls skipped {sum} of 3 bad lines");
+    let state = ffx
+        .engine
+        .store()
+        .unwrap()
+        .token_state(&p)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.stats.skipped_lines, sum);
+    assert_eq!(ffx.engine.token_index_state(&p).unwrap().skipped_lines, sum);
+
+    // The next pass starts from nothing.
+    ffx.fx.clock.advance_ms(1_000);
+    assert!(refresh(&ffx.engine, &p).complete);
+    let state = ffx
+        .engine
+        .store()
+        .unwrap()
+        .token_state(&p)
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.stats.skipped_lines, 0);
+}
+
+#[test]
 fn skipped_lines_are_counted_in_the_state() {
     // Spec §5.4: a line that does not parse is skipped and counted; it never fails the refresh.
     let ffx = FakeFx::new();
@@ -649,7 +717,7 @@ fn plant_expired(engine: &Engine, p: &ProviderId, n: usize) {
     let store = engine.store().unwrap();
     let epoch = store.begin_token_refresh(p, NOW).unwrap();
     store
-        .commit_token_batch(p, epoch, &rows, &[], &[], NOW - 400 * DAY)
+        .commit_token_batch(p, epoch, &rows, &[], &[], 0, NOW - 400 * DAY)
         .unwrap();
 }
 

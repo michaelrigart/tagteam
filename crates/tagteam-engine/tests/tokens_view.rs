@@ -18,9 +18,7 @@ use tagteam_core::tokens::{BlockSpan, CardOverride, PriceOverride, project};
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, WindowKind};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::{Settings, config_path};
-use tagteam_engine::store::{
-    EventRow, RefreshStats, SightingRow, SightingSource, Store, UsageRow, usage_key,
-};
+use tagteam_engine::store::{EventRow, SightingRow, SightingSource, Store, UsageRow, usage_key};
 use tagteam_engine::tokens::{
     AccountSel, ActiveBlock, Basis, Cost, IndexState, LaunchPoll, PeriodKey, RowAccount,
     TokenCounts, TokenGrouping, TokenPeriod, TokenQuery, TokenReport,
@@ -145,6 +143,7 @@ impl View {
                 rows,
                 &[],
                 &[],
+                0,
                 self.engine.now_ms(),
             )
             .unwrap();
@@ -1122,12 +1121,7 @@ fn row_keys_are_stable_across_refreshes() {
     ]);
     v.sight("s-1", "acct-a", T0 + 2 * D, T0 + 3 * D);
     v.store
-        .finish_token_refresh(
-            &cc(),
-            v.generation(),
-            &RefreshStats::default(),
-            v.engine.now_ms(),
-        )
+        .finish_token_refresh(&cc(), v.generation(), 0, 0, v.engine.now_ms())
         .unwrap();
     for (q, before) in queries.iter().zip(&before) {
         let r = v.report(q);
@@ -1162,14 +1156,11 @@ fn a_partial_index_reports_rows_with_no_refreshed_at() {
 
     let done = v.engine.now_ms() + 1_000;
     v.fx.clock.set(done);
-    let stats = RefreshStats {
-        files: 2,
-        responses: 2,
-        skipped_lines: 1,
-        unreadable_files: 0,
-    };
     v.store
-        .finish_token_refresh(&cc(), v.generation(), &stats, done)
+        .commit_token_batch(&cc(), v.generation(), &[], &[], &[], 1, done)
+        .unwrap();
+    v.store
+        .finish_token_refresh(&cc(), v.generation(), 2, 0, done)
         .unwrap();
     let index = IndexState {
         refreshed_at_ms: Some(done),
@@ -1194,12 +1185,7 @@ fn index_state_moves_on_new_evidence_alone() {
     let v = View::new();
     v.index(&[v.usage("s-1", T0 + H, "model-a", 1, 0)]);
     v.store
-        .finish_token_refresh(
-            &cc(),
-            v.generation(),
-            &RefreshStats::default(),
-            v.engine.now_ms(),
-        )
+        .finish_token_refresh(&cc(), v.generation(), 0, 0, v.engine.now_ms())
         .unwrap();
     let state = || v.engine.token_index_state(&cc()).unwrap();
     let refreshed = state();
@@ -1387,7 +1373,7 @@ fn price_overrides_follow_the_report_provider() {
     let store = engine.store().unwrap();
     let generation = store.begin_token_refresh(&fake, engine.now_ms()).unwrap();
     store
-        .commit_token_batch(&fake, generation, &[row], &[], &[], engine.now_ms())
+        .commit_token_batch(&fake, generation, &[row], &[], &[], 0, engine.now_ms())
         .unwrap();
 
     let r = engine.token_report(&day_query(fake)).unwrap();

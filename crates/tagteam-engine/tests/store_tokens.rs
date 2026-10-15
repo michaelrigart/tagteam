@@ -71,7 +71,7 @@ fn generation(s: &Store) -> i64 {
 }
 
 fn commit(s: &Store, rows: &[UsageRow], now: i64) -> BatchOutcome {
-    s.commit_token_batch(&cc(), generation(s), rows, &[], &[], now)
+    s.commit_token_batch(&cc(), generation(s), rows, &[], &[], 0, now)
         .unwrap()
 }
 
@@ -201,8 +201,16 @@ fn a_batch_creates_state_and_moves_changed_at_only_on_change() {
     assert_eq!(s.token_state(&cc()).unwrap(), None);
     let f = file("/t/a.jsonl", 10);
     assert_eq!(
-        s.commit_token_batch(&cc(), generation(&s), &[], std::slice::from_ref(&f), &[], T)
-            .unwrap(),
+        s.commit_token_batch(
+            &cc(),
+            generation(&s),
+            &[],
+            std::slice::from_ref(&f),
+            &[],
+            0,
+            T
+        )
+        .unwrap(),
         BatchOutcome::default(),
         "offsets alone"
     );
@@ -255,6 +263,7 @@ fn a_batch_creates_state_and_moves_changed_at_only_on_change() {
         &[],
         std::slice::from_ref(&g),
         &[],
+        0,
         T + 4,
     )
     .unwrap();
@@ -265,6 +274,7 @@ fn a_batch_creates_state_and_moves_changed_at_only_on_change() {
         &[],
         &[],
         &["/t/a.jsonl".to_owned()],
+        0,
         T + 5,
     )
     .unwrap();
@@ -281,7 +291,17 @@ fn a_batch_creates_state_and_moves_changed_at_only_on_change() {
 fn finish_sets_refreshed_and_the_first_completion_moves_changed_at() {
     let (_d, s, _) = store();
     commit(&s, &[row(1, "s1", T, 5), row(2, "s2", T + 1, 5)], T);
-    s.commit_token_batch(&fake(), generation(&s), &[row(3, "f1", T, 5)], &[], &[], T)
+    s.commit_token_batch(
+        &fake(),
+        generation(&s),
+        &[row(3, "f1", T, 5)],
+        &[],
+        &[],
+        0,
+        T,
+    )
+    .unwrap();
+    s.commit_token_batch(&cc(), generation(&s), &[], &[], &[], 2, T)
         .unwrap();
     let stats = RefreshStats {
         files: 3,
@@ -289,7 +309,7 @@ fn finish_sets_refreshed_and_the_first_completion_moves_changed_at() {
         skipped_lines: 2,
         unreadable_files: 1,
     };
-    s.finish_token_refresh(&cc(), generation(&s), &stats, T + 10)
+    s.finish_token_refresh(&cc(), generation(&s), 3, 1, T + 10)
         .unwrap();
     assert_eq!(
         s.token_state(&cc()).unwrap(),
@@ -304,11 +324,7 @@ fn finish_sets_refreshed_and_the_first_completion_moves_changed_at() {
         }),
         "the first completion ends the partial index; responses are the index's own count"
     );
-    let later = RefreshStats {
-        files: 4,
-        ..RefreshStats::default()
-    };
-    s.finish_token_refresh(&cc(), generation(&s), &later, T + 20)
+    s.finish_token_refresh(&cc(), generation(&s), 4, 0, T + 20)
         .unwrap();
     assert_eq!(
         s.token_state(&cc()).unwrap(),
@@ -325,7 +341,7 @@ fn finish_sets_refreshed_and_the_first_completion_moves_changed_at() {
         })
     );
     let other = ProviderId::new("other");
-    s.finish_token_refresh(&other, generation(&s), &RefreshStats::default(), T + 30)
+    s.finish_token_refresh(&other, generation(&s), 0, 0, T + 30)
         .unwrap();
     assert_eq!(
         s.token_state(&other).unwrap(),
@@ -337,6 +353,73 @@ fn finish_sets_refreshed_and_the_first_completion_moves_changed_at() {
         }),
         "a provider with nothing to index completes too"
     );
+}
+
+fn pending_skipped(path: &std::path::Path) -> i64 {
+    raw_count(
+        path,
+        "SELECT pending_skipped_lines FROM token_state WHERE provider = 'claude-code'",
+    )
+}
+
+fn skips(s: &Store, skipped: u64) {
+    s.commit_token_batch(&cc(), generation(s), &[], &[], &[], skipped, T)
+        .unwrap();
+}
+
+#[test]
+fn a_batch_adds_its_skips_to_the_pending_count_without_moving_changed_at() {
+    // Spec §5.2 step 4: the lines a batch's checkpoints consumed are counted with them, and a
+    // skipped line changes no report.
+    let (_d, s, path) = store();
+    skips(&s, 2);
+    skips(&s, 3);
+    assert_eq!(pending_skipped(&path), 5);
+    let state = s.token_state(&cc()).unwrap().unwrap();
+    assert_eq!(state.changed_at, None, "skips alone move nothing");
+    assert_eq!(
+        state.stats.skipped_lines, 0,
+        "published by a completion only"
+    );
+
+    // A batch refused for a purge adds nothing.
+    let started = generation(&s);
+    s.empty_all().unwrap();
+    let err = s
+        .commit_token_batch(&cc(), started, &[], &[], &[], 7, T)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::TokenIndexPurged), "{err:?}");
+    assert_eq!(s.token_state(&cc()).unwrap(), None);
+
+    // A full purge leaves nothing pending for the next pass.
+    skips(&s, 0);
+    assert_eq!(pending_skipped(&path), 0);
+}
+
+#[test]
+fn completion_publishes_the_pending_count_and_the_next_pass_starts_from_zero() {
+    let (_d, s, path) = store();
+    let skipped = |s: &Store| s.token_state(&cc()).unwrap().unwrap().stats.skipped_lines;
+    skips(&s, 2);
+    skips(&s, 3);
+    s.finish_token_refresh(&cc(), generation(&s), 1, 0, T + 1)
+        .unwrap();
+    assert_eq!(skipped(&s), 5, "every batch of the pass");
+    assert_eq!(pending_skipped(&path), 0);
+
+    skips(&s, 1);
+    assert_eq!(
+        skipped(&s),
+        5,
+        "the last completed refresh's, until the next completes"
+    );
+    s.finish_token_refresh(&cc(), generation(&s), 1, 0, T + 2)
+        .unwrap();
+    assert_eq!(skipped(&s), 1, "only the second pass's");
+
+    s.finish_token_refresh(&cc(), generation(&s), 1, 0, T + 3)
+        .unwrap();
+    assert_eq!(skipped(&s), 0, "a pass that skipped none");
 }
 
 #[test]
@@ -375,24 +458,23 @@ fn begin_creates_a_new_generation_after_each_purge() {
     let second = s.begin_token_refresh(&cc(), T + 2).unwrap();
     assert_ne!(second, first);
     assert!(matches!(
-        s.commit_token_batch(&cc(), first, &[row(1, "s1", T, 1)], &[], &[], T + 3),
+        s.commit_token_batch(&cc(), first, &[row(1, "s1", T, 1)], &[], &[], 0, T + 3),
         Err(StoreError::TokenIndexPurged)
     ));
     assert!(matches!(
-        s.finish_token_refresh(&cc(), first, &RefreshStats::default(), T + 3),
+        s.finish_token_refresh(&cc(), first, 0, 0, T + 3),
         Err(StoreError::TokenIndexPurged)
     ));
     assert!(all(&s).is_empty(), "the older generation wrote nothing");
     assert_eq!(
-        s.commit_token_batch(&cc(), second, &[row(1, "s1", T, 1)], &[], &[], T + 3)
+        s.commit_token_batch(&cc(), second, &[row(1, "s1", T, 1)], &[], &[], 0, T + 3)
             .unwrap(),
         BatchOutcome {
             added: 1,
             updated: 0
         }
     );
-    s.finish_token_refresh(&cc(), second, &RefreshStats::default(), T + 4)
-        .unwrap();
+    s.finish_token_refresh(&cc(), second, 0, 0, T + 4).unwrap();
     assert_eq!(
         s.token_epoch().unwrap(),
         Some(EpochRow {
@@ -410,7 +492,7 @@ fn a_batch_after_a_full_purge_is_refused() {
     let (_d, s, _) = store();
     let started = generation(&s);
     assert_eq!(
-        s.commit_token_batch(&cc(), started, &[row(1, "s1", T, 1)], &[], &[], T)
+        s.commit_token_batch(&cc(), started, &[row(1, "s1", T, 1)], &[], &[], 0, T)
             .unwrap(),
         BatchOutcome {
             added: 1,
@@ -425,6 +507,7 @@ fn a_batch_after_a_full_purge_is_refused() {
             &[row(2, "s1", T + 1, 1)],
             &[file("/t/a.jsonl", 10)],
             &[],
+            0,
             T + 1,
         )
         .unwrap_err();
@@ -441,7 +524,7 @@ fn a_batch_after_a_full_purge_is_refused() {
     let fresh = s.begin_token_refresh(&cc(), T + 2).unwrap();
     assert_ne!(fresh, started);
     assert_eq!(
-        s.commit_token_batch(&cc(), fresh, &[row(2, "s1", T + 1, 1)], &[], &[], T + 2)
+        s.commit_token_batch(&cc(), fresh, &[row(2, "s1", T + 1, 1)], &[], &[], 0, T + 2)
             .unwrap(),
         BatchOutcome {
             added: 1,
@@ -456,12 +539,8 @@ fn a_finish_after_a_full_purge_is_refused() {
     let started = generation(&s);
     commit(&s, &[row(1, "s1", T, 1)], T);
     s.empty_all().unwrap();
-    let stats = RefreshStats {
-        files: 1,
-        ..RefreshStats::default()
-    };
     let err = s
-        .finish_token_refresh(&cc(), started, &stats, T + 1)
+        .finish_token_refresh(&cc(), started, 1, 0, T + 1)
         .unwrap_err();
     assert!(matches!(err, StoreError::TokenIndexPurged), "{err:?}");
     assert_eq!(s.token_state(&cc()).unwrap(), None, "nothing written");
@@ -469,13 +548,13 @@ fn a_finish_after_a_full_purge_is_refused() {
 
     // A refresh that began after the purge completes.
     let fresh = s.begin_token_refresh(&cc(), T + 2).unwrap();
-    s.finish_token_refresh(&cc(), fresh, &stats, T + 3).unwrap();
+    s.finish_token_refresh(&cc(), fresh, 1, 0, T + 3).unwrap();
     assert_eq!(
         s.token_state(&cc()).unwrap().unwrap().refreshed_at,
         Some(T + 3)
     );
     assert!(matches!(
-        s.commit_token_batch(&cc(), started, &[], &[], &[], T + 4),
+        s.commit_token_batch(&cc(), started, &[], &[], &[], 0, T + 4),
         Err(StoreError::TokenIndexPurged)
     ));
 }
@@ -496,6 +575,7 @@ fn prune_runs_once_a_day_and_moves_changed_at_when_it_deletes() {
         &[row(9, "f1", cutoff - 5, 1)],
         &[],
         &[],
+        0,
         T,
     )
     .unwrap();
@@ -1288,11 +1368,11 @@ fn purge_provider_deletes_token_rows_and_keeps_the_epoch() {
             &[row(usage_key(&p, "m", "r"), "s1", T, 1)],
             &[file(&path, 1)],
             &[],
+            0,
             T,
         )
         .unwrap();
-        s.finish_token_refresh(&p, generation(&s), &RefreshStats::default(), T)
-            .unwrap();
+        s.finish_token_refresh(&p, generation(&s), 0, 0, T).unwrap();
         s.prune_tokens(&p, generation(&s), 0, "h", T, &|| false)
             .unwrap();
         s.record_sighting(&p, &sighting("s1", "", T, T), 0).unwrap();
@@ -1373,7 +1453,7 @@ fn reads_are_per_provider_by_range_and_session() {
     commit(&s, &[third.clone(), first.clone(), second.clone()], T);
     let mut theirs = row(9, "s1", T + 5, 1);
     theirs.model = "m-z".into();
-    s.commit_token_batch(&fake(), generation(&s), &[theirs], &[], &[], T)
+    s.commit_token_batch(&fake(), generation(&s), &[theirs], &[], &[], 0, T)
         .unwrap();
 
     let usage = |since, until, session| keys(&s.token_usage(&cc(), since, until, session).unwrap());

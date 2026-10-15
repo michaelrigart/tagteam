@@ -21,7 +21,7 @@ use super::{lock_until_free, tokens_lock_path};
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::hooks;
-use crate::store::{RefreshStats, Store, TokenFileRow, UsageRow, merge_line, usage_key};
+use crate::store::{Store, TokenFileRow, UsageRow, merge_line, usage_key};
 
 /// At most this many files are read at once (spec §5.2 step 4).
 const MAX_WORKERS: usize = 4;
@@ -268,6 +268,8 @@ struct Batch {
     keys: HashMap<i64, usize>,
     files: BTreeMap<String, TokenFileRow>,
     removed: Vec<String>,
+    /// The skipped lines of the chunks whose checkpoints are in `files`.
+    skipped: u64,
     since: Option<Instant>,
 }
 
@@ -355,6 +357,7 @@ impl Writer<'_> {
             self.batch.rows.push(row);
         }
         self.batch.files.insert(file.path.clone(), file);
+        self.batch.skipped += skipped;
         if self.batch.rows.len() == BATCH_ROWS {
             self.commit()?;
         }
@@ -381,6 +384,7 @@ impl Writer<'_> {
             &self.batch.rows,
             &files,
             &self.batch.removed,
+            self.batch.skipped,
             self.engine.now_ms(),
         )?;
         tracing::debug!(
@@ -395,6 +399,7 @@ impl Writer<'_> {
         self.batch.rows.clear();
         self.batch.keys.clear();
         self.batch.removed.clear();
+        self.batch.skipped = 0;
         self.batch.since = None;
         hooks::point(self.engine, "refresh-tokens-committed")?;
         Ok(())
@@ -546,17 +551,10 @@ impl Engine {
                 .complete;
         }
         if complete {
-            // The store keeps `responses` itself, each batch and prune counting it, so the count
-            // passed on is the stored one.
-            let stats = RefreshStats {
-                files: store.token_files(provider)?.len() as u64,
-                responses: store
-                    .token_state(provider)?
-                    .map_or(0, |state| state.stats.responses),
-                skipped_lines: tally.skipped,
-                unreadable_files: tally.unreadable,
-            };
-            store.finish_token_refresh(provider, epoch, &stats, self.now_ms())?;
+            // The store keeps `responses` and the pass's skipped lines itself, each batch counting
+            // them.
+            let files = store.token_files(provider)?.len() as u64;
+            store.finish_token_refresh(provider, epoch, files, tally.unreadable, self.now_ms())?;
         }
         // A cancel is reported even when there was nothing left for it to stop; what completed
         // stays recorded.
