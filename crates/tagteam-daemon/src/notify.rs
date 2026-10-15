@@ -20,7 +20,7 @@ use tagteam_engine::settings::{NotifyEvent, Settings};
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::{Engine, EngineError};
 use tagteam_provider::Cancel;
-use tagteam_provider::process::{Captured, ProcessSpawner, SpawnSpec};
+use tagteam_provider::process::{Discarded, ProcessSpawner, SpawnSpec};
 
 use crate::events::{DaemonEvent, DaemonSink};
 
@@ -194,22 +194,23 @@ fn deliver_until_stopped(
 /// One delivery (D6.2). It has a cancel token of its own, never the daemon's, so a stop never
 /// kills it half-way, and a 5 s bound. A failure is logged at WARN the first time and at DEBUG
 /// after. The line names the backend and how it failed, never the text, which names accounts
-/// (§14.2). The program's output is never read.
+/// (§14.2). The program's stdin, stdout and stderr are null (D6.2): its output is never
+/// captured, so none can grow memory or be held open by a descendant.
 fn deliver(backend: &Backend, spawner: &dyn ProcessSpawner, notice: &Notice, warned: &mut bool) {
     let spec = backend.spec(&notice.title, &notice.body);
-    let failure = match spawner.run_captured(&spec, DELIVERY_TIMEOUT, &Cancel::new()) {
-        Captured::Exited { code: Some(0), .. } => None,
-        Captured::Exited {
+    let failure = match spawner.run_discarded(&spec, DELIVERY_TIMEOUT, &Cancel::new()) {
+        Discarded::Exited { code: Some(0), .. } => None,
+        Discarded::Exited {
             code: Some(code), ..
         } => Some(format!("exit {code}")),
-        Captured::Exited {
+        Discarded::Exited {
             signal: Some(signal),
             ..
         } => Some(format!("signal {signal}")),
-        Captured::Exited { .. } => Some("no exit status".to_owned()),
-        Captured::TimedOut => Some("timed out".to_owned()),
-        Captured::Interrupted(signal) => Some(format!("interrupted by signal {signal}")),
-        Captured::SpawnFailed(why) => Some(why),
+        Discarded::Exited { .. } => Some("no exit status".to_owned()),
+        Discarded::TimedOut => Some("timed out".to_owned()),
+        Discarded::Interrupted(signal) => Some(format!("interrupted by signal {signal}")),
+        Discarded::SpawnFailed(why) => Some(why),
     };
     match failure {
         None => tracing::debug!(backend = backend.name(), "notification sent"),
@@ -505,7 +506,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
 
-    use tagteam_provider::process::ScriptedSpawner;
+    use tagteam_provider::process::{Captured, ScriptedSpawner};
 
     use super::*;
     use crate::events::Fanout;
@@ -693,6 +694,7 @@ mod tests {
                 queue.send(notice(body));
             }
             let specs = delivered(&spawner, 3);
+            assert_eq!(spawner.discards(), 3, "every delivery discards its output");
             let last: Vec<&OsString> = specs.iter().map(|s| s.args.last().unwrap()).collect();
             assert_eq!(last, bodies.map(OsString::from).iter().collect::<Vec<_>>());
             notifier.stop();

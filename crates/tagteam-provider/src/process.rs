@@ -7,6 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, PoisonError};
 use std::thread;
@@ -165,6 +166,35 @@ pub enum Captured {
     SpawnFailed(String),
 }
 
+/// How a child run with its output discarded ended (`run_discarded`). It has no output to hold,
+/// and no case for a drain that ran late.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Discarded {
+    /// It exited. `code` is its exit code, or `signal` the signal that ended it.
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// It ran past the timeout and its group was killed.
+    TimedOut,
+    /// The cancel token was set: its group was killed, or it was never spawned.
+    Interrupted(i32),
+    /// It could not be spawned, or its wait failed.
+    SpawnFailed(String),
+}
+
+impl From<Captured> for Discarded {
+    /// What a captured run's ending says of a discarded one: the output is dropped.
+    fn from(c: Captured) -> Self {
+        match c {
+            Captured::Exited { code, signal, .. } => Discarded::Exited { code, signal },
+            Captured::TimedOut => Discarded::TimedOut,
+            Captured::Interrupted(signal) => Discarded::Interrupted(signal),
+            Captured::SpawnFailed(why) => Discarded::SpawnFailed(why),
+        }
+    }
+}
+
 /// How often a captured child's wait looks at its exit, the deadline and the token.
 const POLL: Duration = Duration::from_millis(10);
 /// How long `run_captured` waits for the output pipes to close once the child has exited, as
@@ -213,25 +243,9 @@ fn capture(spec: &SpawnSpec, timeout: Duration, cancel: &Cancel, grace: Duration
     };
     let out = drain(child.stdout.take());
     let err = drain(child.stderr.take());
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(e) => {
-                kill_group(&mut child);
-                return Captured::SpawnFailed(e.to_string());
-            }
-        }
-        if let Some(signal) = cancel.requested() {
-            kill_group(&mut child);
-            return Captured::Interrupted(signal);
-        }
-        if Instant::now() >= deadline {
-            kill_group(&mut child);
-            return Captured::TimedOut;
-        }
-        thread::sleep(POLL);
+    let status = match wait_for(&mut child, timeout, cancel) {
+        Ok(status) => status,
+        Err(ended) => return ended,
     };
     // The child is reaped now, so its group id may name another group once its last member
     // goes: whatever still holds a pipe is left alone rather than killed by a stale id.
@@ -247,6 +261,57 @@ fn capture(spec: &SpawnSpec, timeout: Duration, cancel: &Cancel, grace: Duration
         },
         Err(Unfinished::Late) => Captured::TimedOut,
         Err(Unfinished::Interrupted(signal)) => Captured::Interrupted(signal),
+    }
+}
+
+/// Waits for `child` to exit, polling its exit, the deadline and the token. On the deadline or
+/// the token its whole group is killed and the child reaped; `Err` is then how the run ended.
+fn wait_for(child: &mut Child, timeout: Duration, cancel: &Cancel) -> Result<ExitStatus, Captured> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(e) => {
+                kill_group(child);
+                return Err(Captured::SpawnFailed(e.to_string()));
+            }
+        }
+        if let Some(signal) = cancel.requested() {
+            kill_group(child);
+            return Err(Captured::Interrupted(signal));
+        }
+        if Instant::now() >= deadline {
+            kill_group(child);
+            return Err(Captured::TimedOut);
+        }
+        thread::sleep(POLL);
+    }
+}
+
+/// `run_captured` for a child whose output nobody wants (D6.2): stdin, stdout and stderr are all
+/// null, so it buffers nothing, no drain thread exists, and a descendant that outlives it holds
+/// no pipe. Its own process group, and the kill of that group on `timeout` or when `cancel`
+/// is set, are `run_captured`'s. A token already set spawns nothing.
+pub fn run_discarded(spec: &SpawnSpec, timeout: Duration, cancel: &Cancel) -> Discarded {
+    if let Some(signal) = cancel.requested() {
+        return Discarded::Interrupted(signal);
+    }
+    let mut cmd = command(spec);
+    cmd.process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return Discarded::SpawnFailed(e.to_string()),
+    };
+    match wait_for(&mut child, timeout, cancel) {
+        Ok(status) => Discarded::Exited {
+            code: status.code(),
+            signal: status.signal(),
+        },
+        Err(ended) => ended.into(),
     }
 }
 
@@ -266,9 +331,17 @@ fn kill_group(child: &mut Child) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Drain threads the current thread has started, for the tests that prove there are none.
+    static DRAINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Reads a pipe to its end on a thread and sends what it read. The thread is detached, so a
 /// pipe that never closes costs one parked thread, not a hang.
 pub(crate) fn drain<R: io::Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    #[cfg(test)]
+    DRAINS.with(|n| n.set(n.get() + 1));
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut buf = Vec::new();
@@ -409,6 +482,13 @@ pub fn current_uid() -> u32 {
 /// The port engine tests script (Decision 10). `SystemSpawner` calls `run_captured`.
 pub trait ProcessSpawner: Send + Sync {
     fn run_captured(&self, spec: &SpawnSpec, timeout: Duration, cancel: &Cancel) -> Captured;
+
+    /// A run whose output is discarded (D6.2's notifier). `SystemSpawner` nulls all three
+    /// streams. The default, for a double that only scripts `run_captured`, runs that and drops
+    /// the output.
+    fn run_discarded(&self, spec: &SpawnSpec, timeout: Duration, cancel: &Cancel) -> Discarded {
+        self.run_captured(spec, timeout, cancel).into()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -418,15 +498,20 @@ impl ProcessSpawner for SystemSpawner {
     fn run_captured(&self, spec: &SpawnSpec, timeout: Duration, cancel: &Cancel) -> Captured {
         run_captured(spec, timeout, cancel)
     }
+
+    fn run_discarded(&self, spec: &SpawnSpec, timeout: Duration, cancel: &Cancel) -> Discarded {
+        run_discarded(spec, timeout, cancel)
+    }
 }
 
-/// Tests: replies in order, recording each spec. A token already set answers `Interrupted`, as
+/// Tests: replies in order (a discarded run's too), recording each spec. A token already set answers `Interrupted`, as
 /// a real spawn does, and leaves the next reply queued; with no reply left the spawn fails, as
 /// a missing launch command would.
 #[derive(Default)]
 pub struct ScriptedSpawner {
     replies: Mutex<VecDeque<Captured>>,
     specs: Mutex<Vec<SpawnSpec>>,
+    discards: AtomicUsize,
 }
 
 impl ScriptedSpawner {
@@ -439,6 +524,11 @@ impl ScriptedSpawner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push_back(c);
+    }
+
+    /// How many of the recorded runs were `run_discarded`.
+    pub fn discards(&self) -> usize {
+        self.discards.load(Ordering::SeqCst)
     }
 
     pub fn specs(&self) -> Vec<SpawnSpec> {
@@ -464,11 +554,18 @@ impl ProcessSpawner for ScriptedSpawner {
             .pop_front()
             .unwrap_or_else(|| Captured::SpawnFailed("no reply scripted".into()))
     }
+
+    /// Records the spec and answers from the same queue as `run_captured`, its output dropped.
+    fn run_discarded(&self, spec: &SpawnSpec, timeout: Duration, cancel: &Cancel) -> Discarded {
+        self.discards.fetch_add(1, Ordering::SeqCst);
+        self.run_captured(spec, timeout, cancel).into()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fs::File;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -1023,6 +1120,110 @@ mod tests {
             matches!(&got, Captured::Exited { code: Some(0), stdout, .. } if stdout == b"ok"),
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn a_discarded_child_is_never_given_a_pipe_to_fill_or_to_hold() {
+        // D6.2: stdin, stdout and stderr are null, so a chatty child buffers nothing, a
+        // descendant holds no pipe that delays the return, and no drain thread exists.
+        let _fork = fork_guard();
+        let drains = DRAINS.with(Cell::get);
+        let started = Instant::now();
+        let got = SystemSpawner.run_discarded(
+            &sh("yes | head -c 10000000; yes | head -c 1000000 >&2; exit 3"),
+            Duration::from_secs(10),
+            &Cancel::new(),
+        );
+        assert_eq!(
+            got,
+            Discarded::Exited {
+                code: Some(3),
+                signal: None
+            }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // A descendant outlives the child: with pipes, the return would wait out the 2 s drain
+        // grace and report a timeout.
+        let started = Instant::now();
+        let got = run_discarded(
+            &sh("sleep 2 & exit 0"),
+            Duration::from_secs(10),
+            &Cancel::new(),
+        );
+        assert_eq!(
+            got,
+            Discarded::Exited {
+                code: Some(0),
+                signal: None
+            }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            DRAINS.with(Cell::get),
+            drains,
+            "no drain thread was spawned"
+        );
+        // Control: a captured run does spawn two.
+        run_captured(&sh("exit 0"), Duration::from_secs(5), &Cancel::new());
+        assert_eq!(DRAINS.with(Cell::get), drains + 2);
+    }
+
+    #[test]
+    fn a_discarded_child_is_killed_with_its_group_on_the_timeout_or_a_cancel() {
+        let _fork = fork_guard();
+        let started = Instant::now();
+        let got = run_discarded(&sh("sleep 30"), Duration::from_millis(200), &Cancel::new());
+        assert_eq!(got, Discarded::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let cancelled = Cancel::new();
+        cancelled.request(15);
+        assert_eq!(
+            run_discarded(&sh("sleep 30"), Duration::from_secs(10), &cancelled),
+            Discarded::Interrupted(15),
+            "a set token spawns nothing"
+        );
+        assert!(matches!(
+            run_discarded(
+                &spec("/nonexistent/program", &[]),
+                Duration::from_secs(5),
+                &Cancel::new()
+            ),
+            Discarded::SpawnFailed(_)
+        ));
+    }
+
+    #[test]
+    fn the_scripted_spawner_records_a_discarded_run_s_spec_and_replies_from_the_same_queue() {
+        let s = ScriptedSpawner::new();
+        s.push(Captured::TimedOut);
+        s.push(Captured::Exited {
+            code: Some(1),
+            signal: None,
+            stdout: b"never kept".to_vec(),
+            stderr: vec![],
+        });
+        let (one, timeout, quiet) = (sh("one"), Duration::from_secs(10), Cancel::new());
+        assert_eq!(s.run_discarded(&one, timeout, &quiet), Discarded::TimedOut);
+        assert_eq!(
+            s.run_discarded(&one, timeout, &quiet),
+            Discarded::Exited {
+                code: Some(1),
+                signal: None
+            }
+        );
+        assert!(matches!(
+            s.run_discarded(&one, timeout, &quiet),
+            Discarded::SpawnFailed(_)
+        ));
+        assert_eq!((s.specs(), s.discards()), (vec![one; 3], 3));
     }
 
     #[test]
