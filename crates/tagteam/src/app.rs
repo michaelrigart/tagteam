@@ -10,6 +10,8 @@ use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::Platform;
 use tagteam_core::autoswitch::Strategy;
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Window};
+use tagteam_daemon::auto::{self, AutoError, AutoFlags, AutoRun};
+use tagteam_daemon::scheduler::{ThreadSleeper, uniform_jitter};
 use tagteam_engine::collect::CollectMode;
 use tagteam_engine::displace::PurgeError;
 use tagteam_engine::doctor::DoctorOptions;
@@ -39,16 +41,14 @@ use tagteam_provider::security::ProcessRunner;
 use tagteam_provider::security::SecurityCli;
 use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, SystemClock};
 
-use crate::auto::{
-    AutoError, AutoFlags, AutoRun, HumanSink, JsonSink, ThreadSleeper, uniform_jitter,
-};
+use crate::auto::{HumanSink, JsonSink};
 use crate::cli::{
     AutoStrategyArg, Cli, Command, ConfigAction, ShellArg, StrategyArg, TokensArgs, TokensPeriod,
 };
 use crate::prompt::Prompter;
 use crate::shell_init::Wrapped;
 use crate::{
-    auto, config_cmd, displaced_cmd, doctor_cmd, history, prompt, purge_cmd, render, root_guard,
+    config_cmd, displaced_cmd, doctor_cmd, history, prompt, purge_cmd, render, root_guard,
     shell_init, statusline, tokens_cmd, transfer_cmd,
 };
 
@@ -2476,7 +2476,7 @@ mod tests {
         let Ok(flags) = auto_flags(threshold, interval, cooldown, None, None, None) else {
             panic!("bad flags");
         };
-        let c = crate::auto::auto_config(&Settings::default(), &flags, None);
+        let c = auto::auto_config(&Settings::default(), &flags, None);
         (c.threshold, c.interval_s, c.cooldown_s)
     }
 

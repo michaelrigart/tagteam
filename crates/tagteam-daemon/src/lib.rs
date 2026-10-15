@@ -2,5 +2,9 @@
 //! both run on, the daemon's jobs, and the socket protocol (D3). Like the engine, it names no
 //! provider's paths, keys or endpoints, and reaches providers through the engine only.
 
+pub mod auto;
 pub mod events;
 pub mod protocol;
+pub mod scheduler;
+#[cfg(test)]
+mod testutil;
