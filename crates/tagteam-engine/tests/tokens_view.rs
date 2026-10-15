@@ -103,6 +103,10 @@ impl View {
             T0 + 40 * D,
             "the responses these tests index must predate the store's epoch"
         );
+        assert!(
+            epoch.seeded,
+            "an unsighted default-home response before the epoch is placed only on a seeded epoch"
+        );
         View {
             fx,
             engine,
@@ -513,18 +517,153 @@ fn unattributed_is_its_own_bucket_and_last() {
 }
 
 #[test]
+fn a_switch_places_an_unsighted_response_unless_a_launch_may_cover_it() {
+    let v = View::new();
+    // b was the default home's login from T0-1d (spec §7.3), and b's profile may have been
+    // running from T0+4h on, so a response from then on may be one of its sessions (spec §7.2).
+    v.event(T0 - D, "switch", None, Some(&v.b));
+    v.store
+        .open_launch(&cc(), v.b.as_str(), T0 + 4 * H, v.engine.now_ms())
+        .unwrap();
+    v.index(&[
+        v.usage("s-1", T0 + H, "model-a", 1, 0),
+        v.usage("s-2", T0 + 5 * H, "model-a", 2, 0),
+    ]);
+
+    let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::Account));
+    assert_eq!(
+        keys(&r),
+        [
+            "day:2026-09-01|account:acct-b",
+            "day:2026-09-01|account:unattributed"
+        ]
+    );
+    assert_eq!(r.rows[0].account, Some(v.account(&v.b)));
+    assert_eq!(r.rows[0].counts, counts(1, 0));
+    assert_eq!(r.rows[1].counts, counts(2, 0));
+    assert_eq!(
+        r.total.by_basis,
+        [
+            (Basis::Profile, 0),
+            (Basis::Timeline, 1),
+            (Basis::Unattributed, 2)
+        ]
+    );
+}
+
+#[test]
+fn a_remove_before_the_epoch_leaves_earlier_unsighted_responses_unattributed() {
+    let v = View::new();
+    let c = AccountId::from_string("acct-c");
+    v.event(T0 - D, "switch", None, Some(&v.b));
+    // An account removed at T0+2h may have had a profile that left no trace: launch coverage is
+    // complete only after it (spec §7.2).
+    v.event(T0 + 2 * H, "remove", Some(&c), None);
+    v.index(&[
+        v.usage("s-1", T0 + H, "model-a", 1, 0),
+        v.usage("s-2", T0 + 3 * H, "model-a", 2, 0),
+    ]);
+
+    let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::Account));
+    assert_eq!(
+        keys(&r),
+        [
+            "day:2026-09-01|account:acct-b",
+            "day:2026-09-01|account:unattributed"
+        ]
+    );
+    assert_eq!(r.rows[0].counts, counts(2, 0));
+    assert_eq!(r.rows[1].counts, counts(1, 0));
+}
+
+#[test]
+fn recovered_switches_and_imports_move_the_default_homes_login() {
+    let v = View::new();
+    // c was imported and is gone from the store: it has no other record of being added.
+    let c = AccountId::from_string("acct-c");
+    v.event(T0 - 5 * D, "import", None, Some(&c));
+    v.event(T0 - 3 * D, "switch", Some(&c), Some(&v.b));
+    v.event(T0 - D, "switch-recovered", Some(&v.b), Some(&v.a));
+    v.index(&[
+        v.usage("s-1", T0 - 4 * D, "model-a", 1, 0),
+        v.usage("s-2", T0 - 2 * D, "model-a", 2, 0),
+        v.usage("s-3", T0 - 12 * H, "model-a", 4, 0),
+    ]);
+
+    let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::Account));
+    assert_eq!(
+        keys(&r),
+        [
+            "day:2026-08-31|account:acct-a",
+            "day:2026-08-30|account:acct-b",
+            "day:2026-08-28|account:acct-c",
+        ]
+    );
+    assert_eq!(r.rows[0].account, Some(v.account(&v.a)));
+    assert_eq!(r.rows[1].account, Some(v.account(&v.b)));
+    assert_eq!(r.rows[2].account, Some(RowAccount::Removed { id: c }));
+    assert_eq!(
+        r.total.by_basis,
+        [
+            (Basis::Profile, 0),
+            (Basis::Timeline, 7),
+            (Basis::Unattributed, 0)
+        ]
+    );
+}
+
+#[test]
+fn after_the_epoch_the_default_homes_login_comes_from_the_history() {
+    let v = View::new();
+    // The history trigger stamps the database's own clock, so read back the time it recorded
+    // (as `index_state_moves_on_new_evidence_alone` does).
+    v.store.set_active(&cc(), Some(&v.a), Some(0)).unwrap();
+    let switched_at = v.store.active_history(&cc()).unwrap().last().unwrap().0;
+    let epoch = v.store.token_epoch().unwrap().unwrap().at;
+    assert!(
+        switched_at - MIN >= epoch,
+        "the database's clock must be past the fixture epoch for this to be a post-epoch case"
+    );
+    v.index(&[
+        v.usage("s-1", switched_at - MIN, "model-a", 1, 0),
+        v.usage("s-2", switched_at + MIN, "model-a", 2, 0),
+    ]);
+
+    let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::Account));
+    let counts_of = |account: RowAccount| -> Vec<TokenCounts> {
+        r.rows
+            .iter()
+            .filter(|row| row.account.as_ref() == Some(&account))
+            .map(|row| row.counts)
+            .collect()
+    };
+    // Before the login change nothing names the default home's account.
+    assert_eq!(counts_of(v.account(&v.a)), [counts(2, 0)]);
+    assert_eq!(counts_of(RowAccount::Unattributed), [counts(1, 0)]);
+    assert_eq!(
+        r.total.by_basis,
+        [
+            (Basis::Profile, 0),
+            (Basis::Timeline, 2),
+            (Basis::Unattributed, 1)
+        ]
+    );
+}
+
+#[test]
 fn blocks_are_per_account_with_the_active_projection() {
     let v = View::new();
     v.sight("s-a", "acct-a", T0, T0 + D);
     v.sight("s-b", "acct-b", T0, T0 + D);
     // a's 5h window, read at T0+1h30, resets at T0+6h: the observed block [T0+1h, T0+6h). Its
-    // 7d window is not the short window and makes no block (spec §9).
+    // 7d window is not the short window and makes no block (spec §9), though its reset at T0+10h
+    // would make one holding two responses.
     record_reading(
         &v.engine,
         &v.a,
         &[
             usage_window("5h", WindowKind::Short, 10.0, (T0 + 6 * H) / 1000),
-            usage_window("7d", WindowKind::Long, 5.0, (T0 + 3 * D) / 1000),
+            usage_window("7d", WindowKind::Long, 5.0, (T0 + 10 * H) / 1000),
         ],
         (T0 + 90 * MIN) / 1000,
         (T0 + 2 * H) / 1000,
@@ -804,6 +943,63 @@ fn drill_from_a_day_gives_its_sessions_and_from_a_session_its_models() {
     assert_eq!(r.rows[0].counts, counts(3, 0));
     // A session's per-model rows are the last level.
     assert_eq!(models.drill(&r.rows[0]), None);
+}
+
+#[test]
+fn drill_from_a_month_clips_to_the_range_and_a_model_row_filters_by_model() {
+    let v = View::new();
+    v.sight("s-a", "acct-a", T0 - 20 * D, T0 + 60 * D);
+    v.index(&[
+        v.usage("s-a", T0 - 7 * D, "model-a", 1, 0),
+        v.usage("s-a", T0 + H, "model-a", 2, 0),
+        v.usage("s-a", T0 + 2 * H, "model-b", 4, 0),
+        v.usage("s-a", T0 + 34 * D, "model-a", 8, 0),
+    ]);
+    // A range wider than September (30 days from T0).
+    let q = TokenQuery {
+        since_ms: Some(T0 - 10 * D),
+        until_ms: Some(T0 + 50 * D),
+        ..v.query(TokenPeriod::Month, TokenGrouping::Model)
+    };
+    let r = v.report(&q);
+    assert_eq!(
+        keys(&r),
+        [
+            "month:2026-10|model:model-a",
+            "month:2026-09|model:model-a",
+            "month:2026-09|model:model-b",
+            "month:2026-08|model:model-a",
+        ]
+    );
+    let september = &r.rows[1];
+
+    // The month, clipped to the range; the model it is grouped by becomes the filter.
+    let sessions = q.drill(september).unwrap();
+    assert_eq!(
+        sessions,
+        TokenQuery {
+            period: TokenPeriod::Session,
+            since_ms: Some(T0),
+            until_ms: Some(T0 + 30 * D),
+            models: Some(vec!["model-a".into()]),
+            ..q.clone()
+        }
+    );
+    let r = v.report(&sessions);
+    assert_eq!(keys(&r), ["session:s-a|model:model-a"]);
+    assert_eq!(r.total.counts, september.counts);
+
+    // A range inside the month is kept as it is.
+    let inside = TokenQuery {
+        since_ms: Some(T0 + 10 * D),
+        until_ms: Some(T0 + 20 * D),
+        ..q.clone()
+    };
+    let drilled = inside.drill(september).unwrap();
+    assert_eq!(
+        (drilled.since_ms, drilled.until_ms),
+        (Some(T0 + 10 * D), Some(T0 + 20 * D))
+    );
 }
 
 #[test]
