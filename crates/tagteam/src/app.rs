@@ -14,6 +14,7 @@ use tagteam_daemon::auto::{self, AutoError, AutoFlags, AutoRun};
 use tagteam_daemon::daemon::{Daemon, DaemonError, DaemonExit, DaemonOptions};
 use tagteam_daemon::notify::Backend;
 use tagteam_daemon::scheduler::{ThreadSleeper, uniform_jitter};
+use tagteam_daemon::service::{self as daemon_service, InstallError, MANAGER_TIMEOUT};
 use tagteam_daemon::watch::{ProgramStamp, UPGRADE_WATCH_MS};
 use tagteam_engine::collect::CollectMode;
 use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
@@ -27,7 +28,9 @@ use tagteam_engine::oracle::{CachingOracle, HttpOracle};
 use tagteam_engine::purge::{KEYCHAIN_ORPHANS_WITH_PROVIDER, PurgePlan};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::run::{RunPlan, RunRequest};
-use tagteam_engine::service::{RECORDED_VARS, ServiceKind};
+use tagteam_engine::service::{
+    RECORDED_VARS, ServiceKind, recorded_env, render_unit, service_state, unit_path,
+};
 use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{self, ColorMode, Settings, parse_bool};
 use tagteam_engine::store::{AccountRow, Mapping, StoreError};
@@ -49,13 +52,14 @@ use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, Read, SystemCl
 
 use crate::auto::{HumanSink, JsonSink};
 use crate::cli::{
-    AutoStrategyArg, Cli, Command, ConfigAction, ShellArg, StrategyArg, TokensArgs, TokensPeriod,
+    AutoStrategyArg, Cli, Command, ConfigAction, DaemonAction, ShellArg, StrategyArg, TokensArgs,
+    TokensPeriod,
 };
 use crate::prompt::Prompter;
 use crate::shell_init::Wrapped;
 use crate::{
     config_cmd, daemon_cmd, displaced_cmd, doctor_cmd, history, prompt, purge_cmd, render,
-    root_guard, shell_init, statusline, tokens_cmd, transfer_cmd,
+    root_guard, service_cmd, shell_init, statusline, tokens_cmd, transfer_cmd,
 };
 
 /// §13.1.
@@ -89,6 +93,12 @@ const KIND_NEEDS_PASSPHRASE: &str = "needs-passphrase";
 /// §13.3: every account was broken, or there was none to export.
 const KIND_NOTHING_EXPORTED: &str = "nothing-exported";
 const KIND_IO: &str = "io";
+/// `daemon install` and `uninstall`: the service manager refused, or gave no answer (D9.4).
+const KIND_SERVICE: &str = "service";
+/// D9.3: no `launchctl` or `systemctl` to load the unit with.
+const KIND_NO_SERVICE_MANAGER: &str = "no-service-manager";
+/// `daemon status`: the daemon's socket answered something unusable, or nothing in time.
+const KIND_DAEMON: &str = "daemon";
 
 /// Appendix A.3. The default keychain is the login keychain, so the hint names its file.
 const UNLOCK_QUESTION: &str = "The login keychain is locked (common over SSH). Unlock it now?";
@@ -584,6 +594,25 @@ fn auto_failure(
     }
 }
 
+/// How `daemon install` and `uninstall` fail as a command (D9.4): exit 1, with the manager's
+/// own words. D9.2: launchd loads an agent only in a GUI login session, which a failed
+/// `bootstrap`'s message says.
+fn install_failure(e: InstallError) -> Failure {
+    let kind = match &e {
+        InstallError::Unit(_) => KIND_INVALID_INPUT,
+        InstallError::Io(_) => KIND_IO,
+        InstallError::NoManager(_) => KIND_NO_SERVICE_MANAGER,
+        InstallError::Manager { .. } | InstallError::NoAnswer { .. } => KIND_SERVICE,
+    };
+    let message = match &e {
+        InstallError::Manager { program, .. } if program == "launchctl bootstrap" => format!(
+            "{e}; launchd loads an agent only in a GUI login session, not over SSH alone: run `tagteam daemon` in the foreground instead"
+        ),
+        _ => e.to_string(),
+    };
+    Failure::Message(kind, message)
+}
+
 /// D8.3: the daemon's pid when `provider`'s engine lock record names the process `daemon.lock`
 /// names, by pid and start time; `None` for any other holder, or a record that cannot be read.
 fn daemon_engine(engine: &Engine, provider: &ProviderId) -> Option<u32> {
@@ -685,7 +714,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     // late for them.
     let stops_on_a_signal = matches!(
         cli.command,
-        Some(Command::Auto { once: false, .. } | Command::Daemon { .. })
+        Some(Command::Auto { once: false, .. } | Command::Daemon { action: None })
     );
     let cancel = ctx.env.cancel.clone();
     match run_command(cli, ctx, io) {
@@ -1419,7 +1448,11 @@ impl App<'_, '_> {
                     dry_run,
                 });
             }
-            Command::Daemon { .. } => return self.daemon(),
+            Command::Daemon { action: None } => return self.daemon(),
+            // D8, D9: the service commands. Root is refused for every command already.
+            Command::Daemon {
+                action: Some(action),
+            } => return self.daemon_action(action),
         }
         Ok(0)
     }
@@ -1690,6 +1723,98 @@ impl App<'_, '_> {
             auto::run_loop(engine, &run, &sink, &ThreadSleeper, &mut uniform_jitter)
         };
         ended.map_err(|e| auto_failure(e, &names, &daemon))
+    }
+
+    /// D8, D9: `daemon install`, `uninstall` and `status`. `tagteam daemon` with no action is
+    /// the foreground run.
+    fn daemon_action(&mut self, action: DaemonAction) -> Result<i32, Failure> {
+        match action {
+            DaemonAction::Install { print, no_start } => self.daemon_install(print, no_start),
+            DaemonAction::Uninstall => self.daemon_uninstall(),
+            DaemonAction::Status => self.daemon_status(),
+        }
+    }
+
+    /// D9: writes the unit and loads it, restarting a daemon it already runs. `--no-start`
+    /// writes it (and on Linux enables it) only, and `--print` prints it and changes nothing.
+    /// It refuses inside a run shell, whose environment is a session's, not the one the daemon
+    /// should keep: `--print` too, since what it prints would record that environment.
+    fn daemon_install(&mut self, print: bool, no_start: bool) -> Result<i32, Failure> {
+        if matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
+            return Err(EngineError::InsideRunShell.into());
+        }
+        let env = self.engine.env().clone();
+        let kind = self.service();
+        let program = service_cmd::install_program(&env).map_err(|e| {
+            Failure::Message(
+                KIND_IO,
+                format!("this tagteam's own path cannot be read: {e}"),
+            )
+        })?;
+        let recorded = recorded_env(&|name| env.var(name).map(OsStr::to_os_string))
+            .map_err(|e| Failure::Message(KIND_INVALID_INPUT, e.to_string()))?;
+        if print {
+            let unit = render_unit(kind, &program, &recorded)
+                .map_err(|e| Failure::Message(KIND_INVALID_INPUT, e.to_string()))?;
+            let json = service_cmd::print_json(kind, &unit_path(&env, kind), &unit);
+            self.print(&unit, json);
+            return Ok(0);
+        }
+        let spawner = self.engine.spawner();
+        let report =
+            daemon_service::install(&env, kind, &program, &recorded, !no_start, spawner.as_ref())
+                .map_err(install_failure)?;
+        if !self.json {
+            for w in &report.warnings {
+                let _ = writeln!(self.io.err, "warning: {w}");
+            }
+        }
+        self.print(
+            &service_cmd::install_human(&report),
+            service_cmd::install_json(&report),
+        );
+        Ok(0)
+    }
+
+    /// D9: stops the daemon the unit runs and removes the unit. With none installed it changes
+    /// nothing and succeeds (D9.4). It refuses inside a run shell, as `install` does.
+    fn daemon_uninstall(&mut self) -> Result<i32, Failure> {
+        if matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
+            return Err(EngineError::InsideRunShell.into());
+        }
+        let env = self.engine.env().clone();
+        let kind = self.service();
+        let spawner = self.engine.spawner();
+        let removed =
+            daemon_service::uninstall(&env, kind, spawner.as_ref()).map_err(install_failure)?;
+        self.print(
+            &service_cmd::uninstall_human(kind, &unit_path(&env, kind), removed),
+            service_cmd::uninstall_json(removed),
+        );
+        Ok(0)
+    }
+
+    /// D8.2: the daemon's own `status` from its socket, else what its lock and its service
+    /// say. It exits 0 when a daemon runs, 3 when none does, and 1 on an error. `--json`
+    /// prints its object either way (plan B Decision 6). It is read-only, so it answers inside
+    /// a run shell too.
+    fn daemon_status(&mut self) -> Result<i32, Failure> {
+        let env = self.engine.env().clone();
+        let kind = self.service();
+        let found = service_cmd::find_daemon(&env)
+            .map_err(|e| Failure::Message(KIND_DAEMON, e.to_string()))?;
+        let spawner = self.engine.spawner();
+        let state = service_state(&env, kind, spawner.as_ref(), MANAGER_TIMEOUT);
+        let path = unit_path(&env, kind);
+        self.print(
+            &service_cmd::status_human(&found, kind, &path, &state),
+            service_cmd::status_json(&found, kind, &path, &state),
+        );
+        Ok(if found.running() {
+            0
+        } else {
+            service_cmd::EXIT_NOT_RUNNING
+        })
     }
 
     /// D8.1: `tagteam daemon` in the foreground. It stamps its program file first (Decision

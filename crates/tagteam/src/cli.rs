@@ -143,7 +143,10 @@ pub enum Command {
     /// daemon.autoswitch false` pauses it. Notifications follow the notify.* settings. --json
     /// prints one event per line: {"schemaVersion":1,"event":<kind>,"ts":"…Z", …}. It exits 0
     /// when a signal stops it, and 75 when a newer tagteam must take over.
-    Daemon {},
+    Daemon {
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+    },
     /// Usage history: burn rate, and when each window runs out
     ///
     /// Reads the stored samples only; it never fetches. With no ACCOUNT it shows the live
@@ -534,6 +537,36 @@ pub enum ConfigAction {
     Path,
 }
 
+/// `tagteam daemon`'s service commands (D8, D9). Without one, `tagteam daemon` runs the daemon
+/// in the foreground.
+#[derive(Subcommand)]
+pub enum DaemonAction {
+    /// Install the service that runs the daemon at login, and start it
+    ///
+    /// macOS: a launchd agent in ~/Library/LaunchAgents. Linux: a systemd user unit. The unit
+    /// records this tagteam's path, and the variables that place its store, Claude Code's
+    /// home, a proxy and the log. Running it again replaces the unit and restarts the daemon.
+    /// --json prints {schemaVersion, ok, service: {kind, path, label}, started, warnings}.
+    Install {
+        /// Print the unit for this platform and change nothing
+        #[arg(long, conflicts_with = "no_start")]
+        print: bool,
+        /// Write the unit and enable it for the next login, starting and stopping nothing
+        #[arg(long = "no-start")]
+        no_start: bool,
+    },
+    /// Stop the daemon and remove its service
+    ///
+    /// --json prints {schemaVersion, ok, removed}; removed is false when none was installed.
+    Uninstall,
+    /// Whether the daemon runs: its own status from its socket, else its lock and its service
+    ///
+    /// Exits 0 when it runs, 3 when it does not, and 1 on an error. --json prints
+    /// {schemaVersion, running, pid, daemon, service: {kind, path, installed, loaded,
+    /// lastExitStatus}}, daemon being the daemon's own status, or null.
+    Status,
+}
+
 /// The providers this build registers, as completion offers them (§13.7).
 pub(crate) const COMPLETED_PROVIDERS: &[&str] = &[CLAUDE_CODE];
 
@@ -911,5 +944,62 @@ mod tests {
             effective(&["tokens", "--json", "block", "day"]),
             (TokenPeriod::Block, owned(&["day"]))
         );
+    }
+
+    #[test]
+    fn daemon_alone_is_the_foreground_run_and_its_service_commands_parse() {
+        use clap::Parser;
+
+        use super::{Cli, Command, DaemonAction};
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|c| c.command);
+        assert!(matches!(
+            parse(&["tagteam", "daemon"]),
+            Ok(Some(Command::Daemon { action: None }))
+        ));
+        assert!(matches!(
+            parse(&["tagteam", "daemon", "install"]),
+            Ok(Some(Command::Daemon {
+                action: Some(DaemonAction::Install {
+                    print: false,
+                    no_start: false
+                })
+            }))
+        ));
+        assert!(matches!(
+            parse(&["tagteam", "daemon", "install", "--no-start"]),
+            Ok(Some(Command::Daemon {
+                action: Some(DaemonAction::Install {
+                    print: false,
+                    no_start: true
+                })
+            }))
+        ));
+        assert!(matches!(
+            parse(&["tagteam", "daemon", "install", "--print"]),
+            Ok(Some(Command::Daemon {
+                action: Some(DaemonAction::Install {
+                    print: true,
+                    no_start: false
+                })
+            }))
+        ));
+        assert!(
+            parse(&["tagteam", "daemon", "install", "--print", "--no-start"]).is_err(),
+            "--print changes nothing, so --no-start means nothing beside it"
+        );
+        assert!(matches!(
+            parse(&["tagteam", "daemon", "uninstall"]),
+            Ok(Some(Command::Daemon {
+                action: Some(DaemonAction::Uninstall)
+            }))
+        ));
+        let cli = Cli::try_parse_from(["tagteam", "daemon", "status", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Daemon {
+                action: Some(DaemonAction::Status)
+            })
+        ));
     }
 }
