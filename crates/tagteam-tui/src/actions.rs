@@ -396,7 +396,7 @@ fn overlay_key(
         } => match key.code {
             KeyCode::Esc | KeyCode::Enter => (None, vec![]),
             code => {
-                let scroll = scrolled(scroll, code, &text, state.size.0);
+                let scroll = scrolled(scroll, code, &text, state.size);
                 (
                     Some(Overlay::Result {
                         title,
@@ -428,7 +428,7 @@ fn overlay_key(
                 (Some(kept), cmds)
             }
             code => {
-                let scroll = scrolled(scroll, code, &text, state.size.0);
+                let scroll = scrolled(scroll, code, &text, state.size);
                 (
                     Some(Overlay::Doctor {
                         text,
@@ -472,11 +472,11 @@ fn submitted(then: &TextThen, input: &str) -> Option<Action> {
     }
 }
 
-/// A panel's scroll after `code`, never past its last row at a terminal `width` wide: rows,
+/// A panel's scroll after `code`, never past its last full page on a `size` terminal: rows,
 /// not lines, as the panel wraps them. It moves from the row that shows, which a resize may
 /// have brought nearer than the stored scroll.
-fn scrolled(scroll: u16, code: KeyCode, text: &str, width: u16) -> u16 {
-    let last = last_row(text, width);
+fn scrolled(scroll: u16, code: KeyCode, text: &str, (width, height): (u16, u16)) -> u16 {
+    let last = furthest(text, width, height);
     let scroll = scroll.min(last);
     let to = match code {
         KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1),
@@ -766,10 +766,18 @@ fn boxed(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, 
     );
 }
 
-/// The last row a panel's text can be scrolled to on a terminal `width` wide.
-fn last_row(text: &str, width: u16) -> u16 {
+/// The rows of text a panel shows at once on a terminal `height` rows tall: the panel leaves a
+/// row above and below it, and its borders take two more.
+fn panel_height(height: u16) -> usize {
+    usize::from(height.saturating_sub(4)).max(1)
+}
+
+/// The furthest a panel's text can be scrolled on a `width` by `height` terminal: to the top of
+/// its last full page, so the last row ends the panel and never sits alone at its top. Text
+/// shorter than the panel does not scroll.
+fn furthest(text: &str, width: u16, height: u16) -> u16 {
     let rows = panel_rows(text, panel_width(width)).len();
-    u16::try_from(rows.saturating_sub(1)).unwrap_or(u16::MAX)
+    u16::try_from(rows.saturating_sub(panel_height(height))).unwrap_or(u16::MAX)
 }
 
 /// The width of a panel's text on a terminal `width` wide: two columns of margin, a border and
@@ -803,7 +811,7 @@ fn panel_rows(text: &str, width: usize) -> Vec<String> {
 /// A scrollable panel over most of `area`, its keys on its last line. Its text wraps at the
 /// panel's width (`panel_rows`), and its scroll stops at its last row at that width.
 fn panel(frame: &mut Frame, area: Rect, title: &str, text: &str, scroll: u16, keys: &str) {
-    let scroll = scroll.min(last_row(text, area.width));
+    let scroll = scroll.min(furthest(text, area.width, area.height));
     let rect = Rect::new(
         area.x + 2,
         area.y + 1,
@@ -1386,10 +1394,10 @@ mod tests {
         for _ in 0..100 {
             update(&mut state, key(KeyCode::Down), NOW_MS);
         }
-        assert!(matches!(
-            state.overlay,
-            Some(Overlay::Doctor { scroll: 39, .. })
-        ));
+        assert!(
+            matches!(state.overlay, Some(Overlay::Doctor { scroll: 20, .. })),
+            "40 rows in a 20-row panel: the last page, not the last row on top"
+        );
         assert_eq!(
             update(&mut state, ch('o'), NOW_MS),
             [Cmd::Act(Action::Doctor {
@@ -1420,18 +1428,22 @@ mod tests {
         let Some(Overlay::Result { scroll, .. }) = &state.overlay else {
             panic!("{:?}", state.overlay);
         };
-        assert_eq!(*scroll, 31, "30 lines, then the long one's two");
+        assert_eq!(*scroll, 12, "32 rows, the last page of 20");
         let drawn = draw(&state, 80, 24);
         let inside = |l: &String| l.chars().skip(4).take(72).collect::<String>();
         assert_eq!(
-            inside(&drawn[2]).trim_end(),
+            inside(&drawn[21]).trim_end(),
             "  not collected: the endpoint answered http-429, retry in 5m",
             "the last row, indented as its line is: {drawn:?}"
+        );
+        assert_eq!(
+            drawn[2].chars().skip(4).take(7).collect::<String>(),
+            "line 13"
         );
         update(&mut state, key(KeyCode::Up), NOW_MS);
         let drawn = draw(&state, 80, 24);
         assert_eq!(
-            inside(&drawn[2]).trim_end(),
+            inside(&drawn[21]).trim_end(),
             "  warning: usage for averyveryverylongname@example.com (position 2) was"
         );
     }
@@ -1461,8 +1473,8 @@ mod tests {
             on_done(&mut state, action.clone(), done(1, &text, ""), NOW_MS);
             update(&mut state, key(KeyCode::End), NOW_MS);
             assert!(
-                first_row(&state, 80).starts_with("word"),
-                "{action:?}: row 60 of 60"
+                first_row(&state, 80).starts_with("21 word"),
+                "{action:?}: the last page of 60 rows starts at row 40"
             );
             update(
                 &mut state,
@@ -1473,14 +1485,60 @@ mod tests {
                 NOW_MS,
             );
             assert!(
-                first_row(&state, 120).starts_with("30 word"),
-                "{action:?}: the last of 30 rows, not a blank panel"
+                first_row(&state, 120).starts_with("11 word"),
+                "{action:?}: the last page of 30 rows, not a blank panel"
             );
             update(&mut state, key(KeyCode::Up), NOW_MS);
             assert!(
-                first_row(&state, 120).starts_with("29 word"),
+                first_row(&state, 120).starts_with("10 word"),
                 "{action:?}: Up moves from what shows"
             );
+        }
+    }
+
+    #[test]
+    fn a_panel_scrolls_no_further_than_its_last_page() {
+        // A 24-row terminal: 20 rows of text between the panel's borders.
+        for (lines, furthest) in [(5, 0), (20, 0), (21, 1), (45, 25)] {
+            for action in [
+                Action::Switch(sel(1)),
+                Action::Doctor {
+                    provider: None,
+                    online: false,
+                },
+            ] {
+                let text: String = (1..=lines).map(|i| format!("line {i}\n")).collect();
+                let mut state = loaded(1);
+                on_done(&mut state, action.clone(), done(1, &text, ""), NOW_MS);
+                for code in [KeyCode::End, KeyCode::PageDown, KeyCode::Down] {
+                    update(&mut state, key(code), NOW_MS);
+                    update(&mut state, key(KeyCode::Down), NOW_MS);
+                    let Some(Overlay::Result { scroll, .. } | Overlay::Doctor { scroll, .. }) =
+                        &state.overlay
+                    else {
+                        panic!("{:?}", state.overlay);
+                    };
+                    assert!(*scroll <= furthest, "{lines} lines, {code:?}: {scroll}");
+                }
+                update(&mut state, key(KeyCode::End), NOW_MS);
+                let Some(Overlay::Result { scroll, .. } | Overlay::Doctor { scroll, .. }) =
+                    &state.overlay
+                else {
+                    panic!("{:?}", state.overlay);
+                };
+                assert_eq!(*scroll, furthest, "{lines} lines");
+                let drawn = draw(&state, 80, 24);
+                assert!(
+                    drawn.iter().any(|l| l.contains(&format!("line {lines}"))),
+                    "the last line shows: {drawn:?}"
+                );
+                assert!(
+                    drawn
+                        .iter()
+                        .any(|l| l.contains(&format!("line {}", lines - 19.min(lines - 1)))),
+                    "and a full page with it: {drawn:?}"
+                );
+            }
         }
     }
 
@@ -1521,7 +1579,7 @@ mod tests {
             else {
                 panic!("{:?}", state.overlay);
             };
-            assert_eq!(*scroll, 6, "{action:?}: the blank rows count");
+            assert_eq!(*scroll, 0, "{action:?}: seven rows fit the panel");
         }
     }
 
