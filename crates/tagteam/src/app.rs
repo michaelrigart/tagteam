@@ -103,7 +103,8 @@ const KIND_DAEMON: &str = "daemon";
 pub const KIND_STALE_SELECTION: &str = "stale-selection";
 
 /// Appendix A.3. The default keychain is the login keychain, so the hint names its file.
-const UNLOCK_QUESTION: &str = "The login keychain is locked (common over SSH). Unlock it now?";
+pub(crate) const UNLOCK_QUESTION: &str =
+    "The login keychain is locked (common over SSH). Unlock it now?";
 const KEYCHAIN_LOCKED: &str = "the login keychain is locked (common over SSH); run `security unlock-keychain ~/Library/Keychains/login.keychain-db`, then retry";
 const STALE_SELECTION: &str = "the selected account changed; nothing was done";
 const CANCELLED: &str = "cancelled";
