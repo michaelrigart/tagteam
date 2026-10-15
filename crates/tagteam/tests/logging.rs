@@ -548,6 +548,15 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
         )],
     );
     run(&["tokens"]);
+    let report = traced(root, &server)
+        .args(["tokens", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert!(
+        report["total"]["responses"].as_u64() >= Some(1),
+        "the transcript was indexed: {report}"
+    );
     run(&["tokens", "session", "--json"]);
     run(&["tokens", "1", "--csv", "--no-refresh"]);
     run(&["statusline"]);
@@ -735,12 +744,18 @@ fn the_token_index_never_logs_content() {
                       "message": {"role": "user", "content": CONTENT}});
     let broken = json!({"type": "assistant", "sessionId": "zq-s", "timestamp": cc_timestamp(at),
                         "message": {"id": "msg_zq_2", "content": CONTENT}});
+    // Lines serde itself rejects, whose messages may quote what they hold: not JSON at all,
+    // and a field of the wrong type.
+    let not_json = format!(r#"{{"type":"assistant","message":{{"content":"{CONTENT}""#);
+    let wrong_type = format!(
+        r#"{{"type":"assistant","sessionId":"zq-s","isSidechain":"{CONTENT}","message":{{"id":"msg_zq_3"}}}}"#
+    );
     let dir = env.home.join(".claude/projects/-w");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("zq-s.jsonl"),
         format!(
-            "{user}\n{}\n{broken}\n",
+            "{user}\n{}\n{broken}\n{not_json}\n{wrong_type}\n",
             assistant_line("zq-s", "msg_zq_1", "req_zq_1", &response, CONTENT)
         ),
     )
@@ -755,8 +770,8 @@ fn the_token_index_never_logs_content() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["total"]["responses"], 1, "the response was indexed: {v}");
     assert_eq!(
-        v["index"]["skippedLines"], 1,
-        "the broken line was counted: {v}"
+        v["index"]["skippedLines"], 3,
+        "the broken lines were counted: {v}"
     );
     let log = log_text(&state_dir(root));
     assert!(
