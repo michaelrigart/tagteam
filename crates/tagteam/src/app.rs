@@ -11,7 +11,10 @@ use tagteam_cc::live::Platform;
 use tagteam_core::autoswitch::Strategy;
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Window};
 use tagteam_daemon::auto::{self, AutoError, AutoFlags, AutoRun};
+use tagteam_daemon::daemon::{Daemon, DaemonError, DaemonExit, DaemonOptions};
+use tagteam_daemon::notify::Backend;
 use tagteam_daemon::scheduler::{ThreadSleeper, uniform_jitter};
+use tagteam_daemon::watch::{ProgramStamp, UPGRADE_WATCH_MS};
 use tagteam_engine::collect::CollectMode;
 use tagteam_engine::displace::PurgeError;
 use tagteam_engine::doctor::DoctorOptions;
@@ -33,6 +36,7 @@ use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
 use tagteam_engine::views::{AccountView, ShellAccount, StatusView};
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::http::Http;
+use tagteam_provider::keychain::ReadCounts;
 use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::{SpawnSpec, SystemSpawner, exec_command};
 use tagteam_provider::profile::RunShell;
@@ -48,8 +52,8 @@ use crate::cli::{
 use crate::prompt::Prompter;
 use crate::shell_init::Wrapped;
 use crate::{
-    config_cmd, displaced_cmd, doctor_cmd, history, prompt, purge_cmd, render, root_guard,
-    shell_init, statusline, tokens_cmd, transfer_cmd,
+    config_cmd, daemon_cmd, displaced_cmd, doctor_cmd, history, prompt, purge_cmd, render,
+    root_guard, shell_init, statusline, tokens_cmd, transfer_cmd,
 };
 
 /// §13.1.
@@ -421,6 +425,14 @@ impl From<PurgeError> for Failure {
     }
 }
 
+impl From<DaemonError> for Failure {
+    fn from(e: DaemonError) -> Self {
+        match e {
+            DaemonError::Engine(e) => Failure::Engine(e),
+        }
+    }
+}
+
 fn cancelled() -> Failure {
     Failure::Message(KIND_CANCELLED, CANCELLED.into())
 }
@@ -609,6 +621,11 @@ struct App<'a, 'b> {
     settings_warnings: Vec<String>,
     /// The Keychain Appendix A.3's lock check asks: macOS only, since Linux has none.
     keychain: Option<Arc<dyn Keychain>>,
+    /// `Context::platform`: the daemon's notification backend depends on it (D6.2).
+    platform: Platform,
+    /// Decision 7: the read counts of the command's Keychains, which the daemon's keychain
+    /// backoff compares (D4.1). Empty on Linux, which has no Keychain to back off for.
+    keychain_counts: Vec<Arc<ReadCounts>>,
     io: &'a mut Io<'b>,
 }
 
@@ -630,8 +647,12 @@ enum Ended {
 pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     let json = cli.json;
     let name = cli.command.as_ref().map_or("list", command_name);
-    // §11.4: a signal is how the `auto` loop ends, so it is never too late for it.
-    let stops_on_a_signal = matches!(cli.command, Some(Command::Auto { once: false, .. }));
+    // §11.4 and D4.6: a signal is how the `auto` loop and the daemon end, so it is never too
+    // late for them.
+    let stops_on_a_signal = matches!(
+        cli.command,
+        Some(Command::Auto { once: false, .. } | Command::Daemon { .. })
+    );
     let cancel = ctx.env.cancel.clone();
     match run_command(cli, ctx, io) {
         Ended::Interrupted(signal) => {
@@ -708,6 +729,13 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
+    let keychain_counts = match ctx.platform {
+        Platform::MacOs => daemon_cmd::keychain_counts(
+            std::iter::once(&ctx.keychain).chain(ctx.vault_keychain.as_ref()),
+        ),
+        Platform::Linux => Vec::new(),
+    };
+    let platform = ctx.platform;
     let (stdout_terminal, no_color_env, force_color_env) =
         (ctx.stdout_terminal, ctx.no_color_env, ctx.force_color_env);
     let provider_flag = cli.provider.map(ProviderId::new);
@@ -725,6 +753,8 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
         provider_flag,
         settings_warnings: warnings,
         keychain,
+        platform,
+        keychain_counts,
         io,
     };
     // `purge --provider P` also names a provider this build does not register, while the store
@@ -799,6 +829,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::ShellInit { .. } => "shell-init",
         Command::Statusline { .. } => "statusline",
         Command::Auto { .. } => "auto",
+        Command::Daemon { .. } => "daemon",
         Command::Run { .. } => "run",
         Command::Config { .. } => "config",
         Command::Displaced { .. } => "displaced",
@@ -1353,6 +1384,7 @@ impl App<'_, '_> {
                     dry_run,
                 });
             }
+            Command::Daemon { .. } => return self.daemon(),
         }
         Ok(0)
     }
@@ -1616,6 +1648,57 @@ impl App<'_, '_> {
             auto::run_loop(engine, &run, &sink, &ThreadSleeper, &mut uniform_jitter)
         };
         ended.map_err(|e| auto_failure(e, &names))
+    }
+
+    /// D8.1: `tagteam daemon` in the foreground. It stamps its program file first (Decision
+    /// 17). Like `auto`, it refuses inside a run shell (D4.1 step 1). On a terminal it runs
+    /// Appendix A.3's check and offers to unlock, as `auto` does. Without a terminal it runs
+    /// none: a service has nobody to answer, and the check can block on a SecurityAgent dialog
+    /// (D4.1 step 3, Decision 14). It exits 0 once a signal stops it, and 75 once a newer
+    /// tagteam must take over (D4.5).
+    fn daemon(&mut self) -> Result<i32, Failure> {
+        // D4.5, Decision 17: before anything that can wait (the unlock offer, the
+        // `daemon.lock` wait), so a binary replaced meanwhile is an upgrade at the upgrade
+        // watch's first run, never this daemon's own baseline.
+        let program = ProgramStamp::take(daemon_cmd::program(self.engine.env().var("PATH")));
+        if matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
+            return Err(EngineError::InsideRunShell.into());
+        }
+        if self.io.prompter.interactive() {
+            self.ensure_unlocked()?;
+        }
+        let color = self.color();
+        let engine = &self.engine;
+        let path = engine.env().var("PATH");
+        let opts = DaemonOptions {
+            provider: self.provider_flag.clone(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            program,
+            upgrade_watch_ms: UPGRADE_WATCH_MS,
+            keychain_counts: self.keychain_counts.clone(),
+            backend: Backend::detect(self.platform == Platform::MacOs, path),
+        };
+        let several = self.provider_flag.is_none() && engine.provider_ids().len() > 1;
+        let now_ms = || engine.now_ms();
+        let names = |p: &ProviderId| display_name(engine, p);
+        let Io { out, err, .. } = &mut *self.io;
+        let started = Daemon::start(engine, opts, &mut |notice| {
+            let _ = writeln!(err, "note: {notice}");
+        })?;
+        let exit = if self.json {
+            let sink = daemon_cmd::DaemonJson::new(&mut **out, &now_ms).stopping(engine.cancel());
+            started.serve(&sink, &ThreadSleeper, &mut uniform_jitter)
+        } else {
+            let auto = HumanSink::new(&mut **out, &mut **err, &now_ms, &names, color, several)
+                .stopping(engine.cancel());
+            let sink = daemon_cmd::DaemonHuman::new(auto, engine.env());
+            sink.started(std::process::id());
+            started.serve(&sink, &ThreadSleeper, &mut uniform_jitter)
+        };
+        Ok(match exit {
+            DaemonExit::Signal => 0,
+            DaemonExit::Restart => daemon_cmd::EXIT_RESTART,
+        })
     }
 
     /// §10.5: the plan, its summary and a person's yes (or `--yes`), then the purge. The
@@ -2442,6 +2525,7 @@ mod tests {
             &["export", "--plaintext"],
             &["import", "backup.age"],
             &["doctor"],
+            &["daemon"],
         ];
         for args in cases {
             let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))

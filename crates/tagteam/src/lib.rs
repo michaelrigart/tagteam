@@ -8,6 +8,7 @@ pub mod app;
 pub mod auto;
 pub mod cli;
 mod config_cmd;
+mod daemon_cmd;
 mod displaced_cmd;
 mod doctor_cmd;
 mod history;

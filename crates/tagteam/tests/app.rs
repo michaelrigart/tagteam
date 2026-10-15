@@ -3,6 +3,7 @@ mod common;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use common::{LOCKED, login, seed_home};
@@ -16,7 +17,7 @@ use tagteam_core::{CLAUDE_CODE, ProviderId, WindowKind};
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::Store;
 use tagteam_engine::transfer;
-use tagteam_provider::{Cancel, Env, FakeKeychain};
+use tagteam_provider::{Cancel, Env, FakeKeychain, FlockGuard};
 
 const UNLOCK: &str = "The login keychain is locked (common over SSH). Unlock it now?";
 
@@ -1729,4 +1730,66 @@ fn a_passphrase_file_is_never_prompted_for_under_json() {
     let v: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(v["error"]["type"], "needs-passphrase");
     assert!(!to.env.data_dir().exists(), "nothing was created");
+}
+
+#[test]
+fn daemon_on_a_terminal_offers_to_unlock_first_and_a_decline_exits_1() {
+    // D4.1 step 3, Decision 14: as `auto` does, before `daemon.lock` is tried.
+    let h = H::new();
+    h.kc.set_locked(true);
+    let mut no = Scripted::answering(&["n"]);
+    let (code, out, err) = h.run(&["daemon"], &mut no);
+    assert_eq!(
+        (code, out.as_str(), err),
+        (1, "", format!("tagteam: {LOCKED}\n"))
+    );
+    assert_eq!(no.asked, [UNLOCK]);
+    h.kc.set_refuse_unlock(true);
+    let (code, _, err) = h.run(&["daemon"], &mut Scripted::answering(&["y"]));
+    assert_eq!((code, err), (1, format!("tagteam: {LOCKED}\n")));
+    assert_eq!(h.kc.unlock_attempts(), 1);
+    assert!(!h.env.data_dir().join("locks/daemon.lock").exists());
+}
+
+#[test]
+fn daemon_without_a_terminal_runs_no_keychain_check_and_a_signal_stops_it_with_exit_0() {
+    // D4.1 step 3: a service has nobody to answer, and the check could block on a dialog
+    // (Appendix A.3). With no store the provider is idle. The signal ends the run at its next
+    // slice, with no "too late" notice.
+    let h = H::new();
+    h.kc.set_locked(true);
+    let cancel = Cancel::new();
+    let signal = {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            cancel.request(libc::SIGTERM);
+        })
+    };
+    let (code, out, err) = h.run_with_cancel(&["daemon"], &mut Scripted::none(), &cancel);
+    signal.join().unwrap();
+    assert_eq!((code, err.as_str()), (0, ""), "{out}");
+    let lines: Vec<&str> = out.lines().map(|l| &l[10..]).collect();
+    let started = format!(
+        "daemon started (pid {}); Ctrl-C stops it",
+        std::process::id()
+    );
+    assert_eq!(lines.first(), Some(&started.as_str()), "{out}");
+    assert!(lines.contains(&"mode idle"), "{out}");
+    assert_eq!(lines.last(), Some(&"stopped"), "{out}");
+    assert_eq!(h.kc.unlock_attempts(), 0);
+}
+
+#[test]
+fn daemon_with_a_store_it_cannot_open_exits_1_and_lets_daemon_lock_go_empty() {
+    // D8.1: a store that cannot be opened is a start failure.
+    let h = H::new();
+    std::fs::create_dir_all(h.env.data_dir()).unwrap();
+    std::fs::write(h.env.data_dir().join("tagteam.db"), "x".repeat(200)).unwrap();
+    let (code, out, err) = h.run(&["daemon"], &mut Scripted::none());
+    assert_eq!((code, out.as_str()), (1, ""), "{err}");
+    assert!(err.starts_with("tagteam: "), "{err}");
+    let lock = h.env.data_dir().join("locks/daemon.lock");
+    assert_eq!(std::fs::read(&lock).unwrap(), b"");
+    assert!(FlockGuard::try_lock(&lock).unwrap().is_some());
 }

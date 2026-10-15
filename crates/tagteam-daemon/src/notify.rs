@@ -272,11 +272,25 @@ fn window_at(w: &Window) -> String {
 pub struct NotifySink<'a> {
     engine: &'a Engine,
     queue: NoticeQueue,
+    /// Where each queued notice is also announced (`DaemonSink::notified`): `tagteam daemon`'s
+    /// sink, for its line per notification (D8.1).
+    echo: Option<&'a dyn DaemonSink>,
 }
 
 impl<'a> NotifySink<'a> {
     pub fn new(engine: &'a Engine, queue: NoticeQueue) -> Self {
-        NotifySink { engine, queue }
+        NotifySink {
+            engine,
+            queue,
+            echo: None,
+        }
+    }
+
+    /// Announces each notice it queues to `to` as well. `Started::serve` echoes to its caller's
+    /// sink.
+    pub(crate) fn echoing(mut self, to: &'a dyn DaemonSink) -> Self {
+        self.echo = Some(to);
+        self
     }
 
     /// The notice `e` calls for, with its provider. `None` for any other event, or one the
@@ -370,7 +384,10 @@ impl<'a> NotifySink<'a> {
 
 impl DaemonSink for NotifySink<'_> {
     fn emit(&self, e: &DaemonEvent) {
-        if let Some((_, notice)) = self.notice_for(e) {
+        if let Some((provider, notice)) = self.notice_for(e) {
+            if let Some(echo) = self.echo {
+                echo.notified(&provider, &notice);
+            }
             self.queue.send(notice);
         }
     }
@@ -807,6 +824,28 @@ mod tests {
         assert_eq!(one.announced(), [(cc(), quarantine.clone())]);
         assert_eq!(two.announced(), [(cc(), quarantine)]);
         assert!(one.events().is_empty() && two.events().is_empty());
+    }
+
+    #[test]
+    fn an_echoing_sink_announces_each_notice_it_queues() {
+        // D8.1: `tagteam daemon` prints a line per notification, so `serve` builds its
+        // `NotifySink` echoing to the caller's sink, inside a `Fanout`. The echo is told of the
+        // notice, and is never handed the event by this sink.
+        let home = two_at_the_limit();
+        let (queue, rx) = NoticeQueue::for_test();
+        let echo = Emitted::new(&home.clock);
+        let sink = NotifySink::new(&home.engine, queue).echoing(&echo);
+        Fanout(vec![&sink]).emit(&DaemonEvent::Auto(quarantined(1, "w@b.example")));
+        let queued: Vec<Notice> = rx.try_iter().collect();
+        assert_eq!(
+            queued,
+            [notice("1 · work needs a new login (invalid_grant)")]
+        );
+        assert_eq!(echo.announced(), [(cc(), queued[0].clone())]);
+        assert!(
+            echo.events().is_empty(),
+            "the echo is told of the notice, never handed the event"
+        );
     }
 
     #[test]

@@ -57,6 +57,7 @@ const COMMANDS: &[&[&str]] = &[
     &["export", "--plaintext"],
     &["import", "backup.age"],
     &["doctor"],
+    &["daemon"],
 ];
 
 /// `id`'s profile directory under the fixture's `sessions/`.

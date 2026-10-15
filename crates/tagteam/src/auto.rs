@@ -17,7 +17,7 @@ use crate::render::{MISSING, RESET, duration, severity};
 /// command stops as SIGPIPE would have stopped it, through the cancel token (§14.1), so the loop
 /// ends at its next cancellation point and never inside a critical span. Any other write error
 /// is ignored, as is every write without a token.
-fn written(result: io::Result<()>, cancel: &Option<Cancel>) {
+pub(crate) fn written(result: io::Result<()>, cancel: &Option<Cancel>) {
     if let (Err(e), Some(cancel)) = (result, cancel) {
         if e.kind() == io::ErrorKind::BrokenPipe {
             cancel.request(libc::SIGPIPE);
@@ -116,6 +116,29 @@ impl<'a> HumanSink<'a> {
         self
     }
 
+    /// The engine's wall clock, epoch seconds: what `tagteam daemon`'s own lines are timed by.
+    pub(crate) fn now_s(&self) -> i64 {
+        (self.now_ms)().div_euclid(1000)
+    }
+
+    /// Epoch seconds as this sink writes a time of day.
+    pub(crate) fn time_of(&self, epoch_s: i64) -> String {
+        (self.clock)(epoch_s)
+    }
+
+    /// A line about no provider in particular: the time, then `text` (D8.1's start and stop).
+    pub(crate) fn plain(&self, now: i64, text: &str) {
+        let mut out = self.out.borrow_mut();
+        written(writeln!(out, "{}  {text}", (self.clock)(now)), &self.cancel);
+    }
+
+    /// This sink on `clock` instead of the local time of day, for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn with_clock(mut self, clock: fn(i64) -> String) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// The time and, with several providers, the provider: how every line starts.
     fn head(&self, now: i64, provider: &ProviderId) -> String {
         let time = (self.clock)(now);
@@ -126,7 +149,7 @@ impl<'a> HumanSink<'a> {
         }
     }
 
-    fn line(&self, now: i64, provider: &ProviderId, text: &str) {
+    pub(crate) fn line(&self, now: i64, provider: &ProviderId, text: &str) {
         let mut out = self.out.borrow_mut();
         written(
             writeln!(out, "{}{text}", self.head(now, provider)),
