@@ -18,7 +18,7 @@ use common::{
 use serde_json::Value;
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::store::{LaunchRow, SightingRow, SightingSource, Store};
-use tagteam_provider::{Env, PENDING_LAUNCH_DIR, PendingLaunch, profile_path};
+use tagteam_provider::{Env, PENDING_LAUNCH_DIR, PendingEntry, PendingLaunch, profile_path};
 
 /// How long one step may take before it counts as stuck.
 const LONG: Duration = Duration::from_secs(20);
@@ -95,9 +95,13 @@ impl Home {
 
     /// The pending launch files in the profile (spec §6.1), parsed.
     fn pending(&self) -> Vec<PendingLaunch> {
-        PendingLaunch::read_all(&self.profile())
+        let entries = PendingLaunch::read_all(&self.profile()).present().unwrap();
+        entries
             .into_iter()
-            .map(|(path, parsed)| parsed.unwrap_or_else(|why| panic!("{path:?}: {why}")))
+            .map(|e| match e {
+                PendingEntry::Launch(_, launch) => launch,
+                other => panic!("{other:?}"),
+            })
             .collect()
     }
 
@@ -448,16 +452,16 @@ fn a_launch_the_store_refused_throughout_is_kept_in_a_pending_file_until_a_scan_
         !log.contains("could not record the session's launch"),
         "no warning in the log either: {log}"
     );
-    let files = PendingLaunch::read_all(&home.profile());
-    assert_eq!(files.len(), 1, "{files:?}");
+    let files = PendingLaunch::read_all(&home.profile()).present().unwrap();
+    let [PendingEntry::Launch(file, kept)] = files.as_slice() else {
+        panic!("{files:?}");
+    };
     assert!(
-        files[0]
-            .0
-            .path
+        file.path
             .starts_with(home.profile().join(PENDING_LAUNCH_DIR)),
-        "{files:?}"
+        "{file:?}"
     );
-    let kept = files[0].1.clone().unwrap();
+    let kept = kept.clone();
     assert_eq!(
         (kept.provider.as_str(), kept.account_id.as_str()),
         (CLAUDE_CODE, home.a.as_str())

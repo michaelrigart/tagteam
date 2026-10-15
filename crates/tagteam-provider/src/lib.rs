@@ -67,10 +67,10 @@ pub use process::{
     exec_command, exit_code, find_on_path, run_captured, spawn_session,
 };
 pub use profile::{
-    LAUNCH_DIR, LINKS_FILE, LinksRecord, MARKER_FILE, PENDING_LAUNCH_DIR, PendingFile,
-    PendingLaunch, ProfileMarker, RunShell, SEED_FILE, Seed, canonical_profile_path, entry_matches,
-    has_own_file, launch_reservations, profile_path, read_own_bytes, refuse_linked_credential,
-    refuse_linked_file, remove_own_file, write_own_json_with,
+    LAUNCH_DIR, LINKS_FILE, LinksRecord, MARKER_FILE, PENDING_LAUNCH_DIR, PendingEntry,
+    PendingFile, PendingLaunch, ProfileMarker, RunShell, SEED_FILE, Seed, canonical_profile_path,
+    entry_matches, has_own_file, launch_reservations, profile_path, read_own_bytes,
+    refuse_linked_credential, refuse_linked_file, remove_own_file, write_own_json_with,
 };
 pub use provider::{
     BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, EntryKind,

@@ -436,38 +436,79 @@ impl PendingLaunch {
         }
     }
 
-    /// Every `*.json` file in `profile`'s pending directory, sorted by name, each parsed or
-    /// with why it is not a pending launch (never quoting its bytes). Anything else is ignored:
-    /// a writer's temp file, a link, a directory. A directory that is not there, or cannot be
-    /// listed, holds none. Each file is `stat`ed before it is read, so its `stamp` is never
-    /// newer than what was parsed.
-    pub fn read_all(profile: &Path) -> Vec<(PendingFile, Result<PendingLaunch, String>)> {
+    /// Every `*.json` file in `profile`'s pending directory, sorted by name: a launch, a file
+    /// that is not one, or one that cannot be `stat`ed or read, which may hold a launch.
+    /// Anything else is ignored: a writer's temp file, a link, a directory, and a file gone
+    /// since the listing, which goes only once its launch is stored. A directory that is not
+    /// there, or a path that is not a directory, holds none; one that cannot be listed is
+    /// `Unreadable`. Each file is `stat`ed before it is read, so its `stamp` is never newer
+    /// than what was parsed.
+    pub fn read_all(profile: &Path) -> Read<Vec<PendingEntry>> {
         let dir = profile.join(PENDING_LAUNCH_DIR);
-        let Ok(listing) = fs::read_dir(&dir) else {
-            return Vec::new();
+        let unreadable =
+            |what: &Path, e: io::Error| ReadError::new(what.display().to_string(), e.to_string());
+        let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+        let listing = match fs::read_dir(&dir) {
+            Ok(l) => l,
+            Err(e) if gone(&e) || e.kind() == io::ErrorKind::NotADirectory => {
+                return Read::Present(vec![]);
+            }
+            Err(e) => return Read::Unreadable(unreadable(&dir, e)),
         };
-        let mut paths: Vec<PathBuf> = listing
-            .flatten()
-            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .collect();
+        let mut paths = Vec::new();
+        for entry in listing {
+            match entry {
+                Ok(e) => {
+                    let path = e.path();
+                    if path.extension().is_some_and(|x| x == "json") {
+                        paths.push(path);
+                    }
+                }
+                Err(e) => return Read::Unreadable(unreadable(&dir, e)),
+            }
+        }
         paths.sort();
-        paths
-            .into_iter()
-            .filter_map(|path| {
-                let stamp = FileStamp::of(&path)?;
-                let parsed = match fs::read(&path) {
-                    Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-                        Ok(v) => Self::parse(&v),
-                        Err(_) => Err("it is not JSON".to_owned()),
-                    },
-                    Err(e) => Err(format!("it cannot be read: {}", e.kind())),
-                };
-                Some((PendingFile { path, stamp }, parsed))
-            })
-            .collect()
+        let mut out = Vec::with_capacity(paths.len());
+        for path in paths {
+            let stamp = match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() => FileStamp::of(&meta),
+                Ok(_) => continue,
+                Err(e) if gone(&e) => continue,
+                Err(e) => {
+                    out.push(PendingEntry::Unreadable(unreadable(&path, e)));
+                    continue;
+                }
+            };
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if gone(&e) => continue,
+                Err(e) => {
+                    out.push(PendingEntry::Unreadable(unreadable(&path, e)));
+                    continue;
+                }
+            };
+            let parsed = match serde_json::from_slice::<Value>(&bytes) {
+                Ok(v) => Self::parse(&v),
+                Err(_) => Err("it is not JSON".to_owned()),
+            };
+            out.push(match parsed {
+                Ok(launch) => PendingEntry::Launch(PendingFile { path, stamp }, launch),
+                Err(why) => PendingEntry::Invalid(path, why),
+            });
+        }
+        Read::Present(out)
     }
+}
+
+/// One `*.json` file of a profile's pending directory, as `PendingLaunch::read_all` found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingEntry {
+    /// A pending launch, and its file as it was read.
+    Launch(PendingFile, PendingLaunch),
+    /// A file that was read and is not a pending launch, and why, never quoting its bytes.
+    Invalid(PathBuf, String),
+    /// A file that could not be `stat`ed or read, named.
+    Unreadable(ReadError),
 }
 
 /// A pending launch file as `read_all` found it: where it is, and what it was.
@@ -482,10 +523,14 @@ impl PendingFile {
     /// renaming a new one over it, so a changed file may hold a newer record (its `endedAt`)
     /// that the reader never saw. Returns whether it was removed; one already gone counts.
     pub fn remove_if_unchanged(&self) -> io::Result<bool> {
-        match FileStamp::of(&self.path) {
-            None => Ok(true),
-            Some(now) if now == self.stamp => fs::remove_file(&self.path).map(|()| true),
-            Some(_) => Ok(false),
+        let removed = match fs::symlink_metadata(&self.path) {
+            Ok(meta) if FileStamp::of(&meta) == self.stamp => fs::remove_file(&self.path),
+            Ok(_) => return Ok(false),
+            Err(e) => Err(e),
+        };
+        match removed {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(true),
         }
     }
 }
@@ -499,14 +544,13 @@ struct FileStamp {
 }
 
 impl FileStamp {
-    fn of(path: &Path) -> Option<Self> {
+    fn of(meta: &fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
-        let meta = fs::symlink_metadata(path).ok()?;
-        Some(Self {
+        Self {
             ino: meta.ino(),
             len: meta.len(),
             mtime_ns: i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
-        })
+        }
     }
 }
 
@@ -1172,18 +1216,79 @@ mod tests {
         fs::write(dir.join(".1-2.json.tagteam-2-0a1b2c3d"), "{}").unwrap();
         fs::write(dir.join("torn.json"), "{ torn").unwrap();
         fs::write(dir.join("7-7.txt"), "{}").unwrap();
-        let read = PendingLaunch::read_all(&profile);
+        let read = PendingLaunch::read_all(&profile).present().unwrap();
         let names: Vec<_> = read
             .iter()
-            .map(|(f, _)| f.path.file_name().unwrap().to_str().unwrap().to_owned())
+            .map(|e| match e {
+                PendingEntry::Launch(f, _) => &f.path,
+                PendingEntry::Invalid(path, _) => path,
+                PendingEntry::Unreadable(e) => panic!("{e}"),
+            })
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
             .collect();
         assert_eq!(names, ["1790000000000-42.json", "torn.json"]);
-        assert_eq!(read[0].1.as_ref().unwrap(), &closed, "replaced in place");
-        assert!(read[1].1.is_err());
+        assert!(
+            matches!(&read[0], PendingEntry::Launch(_, l) if l == &closed),
+            "replaced in place: {read:?}"
+        );
+        assert!(matches!(read[1], PendingEntry::Invalid(..)), "{read:?}");
 
         PendingLaunch::remove(&profile, launch.started_at_ms, 42).unwrap();
         PendingLaunch::remove(&profile, launch.started_at_ms, 42).unwrap();
         assert!(!file.exists());
+    }
+
+    /// The file of the only pending launch in `profile`, as it was read.
+    fn only_pending_file(profile: &Path) -> PendingFile {
+        match PendingLaunch::read_all(profile)
+            .present()
+            .unwrap()
+            .as_slice()
+        {
+            [PendingEntry::Launch(file, _)] => file.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pending_file_that_cannot_be_read_is_named_and_a_path_that_is_no_directory_holds_none() {
+        let d = tempfile::tempdir().unwrap();
+        let launch = PendingLaunch {
+            provider: ProviderId::new("claude-code"),
+            account_id: AccountId::from_string("acct"),
+            started_at_ms: 5,
+            ended_at_ms: None,
+        };
+        launch.write(d.path(), 1).unwrap();
+        let file = PendingLaunch::path(d.path(), 5, 1);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        match PendingLaunch::read_all(d.path())
+            .present()
+            .unwrap()
+            .as_slice()
+        {
+            [PendingEntry::Unreadable(e)] => assert_eq!(e.what, file.display().to_string()),
+            other => panic!("{other:?}"),
+        }
+
+        let dir = d.path().join(PENDING_LAUNCH_DIR);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let listed = PendingLaunch::read_all(d.path());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        match listed {
+            Read::Unreadable(e) => assert_eq!(e.what, dir.display().to_string()),
+            other => panic!("{other:?}"),
+        }
+
+        let elsewhere = d.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::write(elsewhere.join(PENDING_LAUNCH_DIR), "{}").unwrap();
+        let none = PendingLaunch::read_all(&elsewhere).present().unwrap();
+        assert!(none.is_empty(), "{none:?}");
+        let none = PendingLaunch::read_all(&d.path().join("missing"))
+            .present()
+            .unwrap();
+        assert!(none.is_empty(), "{none:?}");
     }
 
     #[test]
@@ -1196,7 +1301,7 @@ mod tests {
             ended_at_ms: None,
         };
         launch.write(d.path(), 1).unwrap();
-        let read = PendingLaunch::read_all(d.path()).remove(0).0;
+        let read = only_pending_file(d.path());
         assert_eq!(read.path, PendingLaunch::path(d.path(), 5, 1));
 
         // `run`'s close renames a newer file over it.
@@ -1209,7 +1314,7 @@ mod tests {
         assert!(!read.remove_if_unchanged().unwrap(), "changed: kept");
         assert!(read.path.exists());
 
-        let read = PendingLaunch::read_all(d.path()).remove(0).0;
+        let read = only_pending_file(d.path());
         assert!(read.remove_if_unchanged().unwrap());
         assert!(!read.path.exists());
         assert!(read.remove_if_unchanged().unwrap(), "already gone is fine");

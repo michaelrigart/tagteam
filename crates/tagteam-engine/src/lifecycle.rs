@@ -295,7 +295,8 @@ pub(crate) enum UnlistedRescues {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingLaunches {
     /// Every deleter of a profile but a purge: the launches go to the store first, and a store
-    /// that refuses them stops the delete with the profile as it was.
+    /// that refuses them, or a pending file that cannot be read, stops the delete with the
+    /// profile as it was.
     Record,
     /// A purge, which empties the token tables anyway: it forgets them, and a store that
     /// cannot take them never leaves an account unpurged.
@@ -361,7 +362,8 @@ impl Engine {
         // Asked again at the deletion, where the vault's file goes first (a second line).
         self.refuse_live_vault_files(row)?;
         // Token report spec §13: before anything is deleted, so a store that refuses the
-        // launches fails the remove with the account as it was. `remove_profile` looks again.
+        // launches, or a pending file that cannot be read, fails the remove with the account as
+        // it was. `remove_profile` looks again.
         if pending == PendingLaunches::Record {
             self.record_pending_launches_of(p.as_ref(), &row.id)?;
         }

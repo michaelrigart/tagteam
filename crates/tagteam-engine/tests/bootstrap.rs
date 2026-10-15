@@ -780,7 +780,11 @@ fn an_invalid_login_keeps_the_profile_when_the_store_refuses_its_pending_launche
 
     assert_eq!(err.kind(), "store", "{err}");
     assert!(profile.exists(), "the profile is kept");
-    assert_eq!(PendingLaunch::read_all(&profile).len(), 1, "with its file");
+    assert_eq!(
+        PendingLaunch::read_all(&profile).present().unwrap().len(),
+        1,
+        "with its file"
+    );
 }
 
 #[test]

@@ -672,7 +672,11 @@ fn a_pending_launch_leaves_an_unsighted_response_unattributed_without_the_scan()
             (Basis::Unattributed, 2)
         ]
     );
-    assert_eq!(PendingLaunch::read_all(&profile).len(), 1, "the file stays");
+    assert_eq!(
+        PendingLaunch::read_all(&profile).present().unwrap().len(),
+        1,
+        "the file stays"
+    );
     assert!(v.store.launches(&cc()).unwrap().is_empty());
 
     // A pending launch that ended before the response does not cover it.
@@ -752,7 +756,10 @@ fn a_pending_launch_a_scan_stores_while_the_report_reads_still_covers_its_respon
     let stored = v.store.launches(&cc()).unwrap();
     assert_eq!(stored.len(), 1, "the premise: the scan stored it");
     assert!(
-        PendingLaunch::read_all(&profile).is_empty(),
+        PendingLaunch::read_all(&profile)
+            .present()
+            .unwrap()
+            .is_empty(),
         "and removed its file"
     );
     assert_eq!(keys(&r), ["day:2026-09-01|account:unattributed"]);
