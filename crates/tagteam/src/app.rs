@@ -179,6 +179,9 @@ pub struct Context {
     /// process's own.
     pub no_color_env: bool,
     pub force_color_env: bool,
+    /// The caller has already printed the settings warnings, so a command does not print them
+    /// again: the TUI's in-process actions set it, their captured output being theirs alone.
+    pub settings_warned: bool,
 }
 
 #[derive(Default)]
@@ -240,6 +243,7 @@ impl Context {
             stdout_terminal: std::io::stdout().is_terminal(),
             no_color_env: env_flag(NO_COLOR),
             force_color_env: env_flag(FORCE_COLOR),
+            settings_warned: false,
         };
         // Decision 5: the variables this build's providers asked for, captured here at the
         // process boundary and never in `run`, so a hand-built `Context` carries exactly the
@@ -820,10 +824,13 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     let platform = ctx.platform;
     let (stdout_terminal, no_color_env, force_color_env) =
         (ctx.stdout_terminal, ctx.no_color_env, ctx.force_color_env);
+    let settings_warned = ctx.settings_warned;
     let provider_flag = cli.provider.map(ProviderId::new);
     let (engine, warnings) = build_engine(ctx, registry, run_shell, env, provider_flag.as_ref());
-    for w in &warnings {
-        let _ = writeln!(io.err, "warning: {w}");
+    if !settings_warned {
+        for w in &warnings {
+            let _ = writeln!(io.err, "warning: {w}");
+        }
     }
     let mut app = App {
         engine,
@@ -2684,6 +2691,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            settings_warned: false,
         };
         let registered: BTreeSet<ProviderId> =
             build_registry(&ctx).all().iter().map(|p| p.id()).collect();
@@ -2862,6 +2870,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            settings_warned: false,
         };
         assert_eq!(
             session_vars(&build_registry(&ctx)),
@@ -2947,6 +2956,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            settings_warned: false,
         };
         let names = scrubbed_vars(&build_registry(&ctx));
         for name in [

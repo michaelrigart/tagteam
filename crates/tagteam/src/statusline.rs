@@ -693,6 +693,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            settings_warned: false,
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = run(
@@ -818,6 +819,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            settings_warned: false,
         };
         let (built, provider, _, _) = engine(ctx, None);
         assert_eq!(provider.as_str(), CLAUDE_CODE);
@@ -853,6 +855,7 @@ mod tests {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            settings_warned: false,
         }
     }
 

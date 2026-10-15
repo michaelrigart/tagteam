@@ -143,6 +143,7 @@ fn app_run_refuses_tui_for_an_in_process_caller() {
             stdout_terminal: false,
             no_color_env: false,
             force_color_env: false,
+            settings_warned: false,
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = app::run(
