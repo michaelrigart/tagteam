@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod provider_job;
 pub mod scheduler;
 pub mod server;
+pub mod service;
 pub mod status;
 #[cfg(test)]
 mod testutil;

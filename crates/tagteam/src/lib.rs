@@ -19,6 +19,7 @@ mod purge_cmd;
 mod render;
 mod root_guard;
 mod run;
+mod service_cmd;
 mod shell_init;
 mod signals;
 mod statusline;
