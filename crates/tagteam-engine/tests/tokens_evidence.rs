@@ -912,6 +912,104 @@ fn a_scan_after_the_child_returns_to_a_session_never_bridges_its_absence() {
 }
 
 #[test]
+fn ending_a_tenure_clamps_a_tenure_bridged_over_the_session_s_absence() {
+    // Spec §6.4, criterion 2: run's checks saw s-a leave for s-b at +100 s and come back at
+    // +101 s, inside one 2 s write. Before that write stored s-b, the statusline read s-a and
+    // continued its own tenure of s-a, the latest there, over the absence. When run ends its
+    // tenure of s-a at its last confirmation, every other tenure of s-a in that execution that
+    // began by then is clamped to it, so no sighting covers the time s-a was away.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    let started = NOW + 500;
+    // The statusline runs under the child, 777.
+    running(&fx, std::process::id(), Some(777));
+    running(&fx, 777, None);
+    let path = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&path, 1_790_000_000);
+    let at = |ms: i64| NOW + ms;
+    let line = |when: i64| {
+        fx.clock.set(when);
+        fx.engine
+            .statusline_sighting(&cc, "s-a", Some(&profile))
+            .unwrap();
+    };
+    fx.clock.set(at(1_000));
+    check(&fx, &id, &profile, &mut state);
+    line(at(1_010));
+    fx.clock.set(at(1_050));
+    fx.engine.poll_launch(&id, &mut state).unwrap();
+    for (when, session, mtime) in [
+        (99_950, None, None),
+        (100_000, Some("s-b"), Some(1_790_000_001)),
+        (100_950, None, None),
+        (101_000, Some("s-a"), Some(1_790_000_002)),
+    ] {
+        if let (Some(session), Some(mtime)) = (session, mtime) {
+            record(&fx, &profile, 777, session, started, "interactive");
+            set_mtime(&path, mtime);
+        }
+        fx.clock.set(at(when));
+        check(&fx, &id, &profile, &mut state);
+    }
+    line(at(101_100));
+    assert!(
+        sightings(&fx).iter().any(|s| s.last_at == at(101_100)),
+        "the statusline bridged its tenure: {:?}",
+        sightings(&fx)
+    );
+
+    fx.clock.set(at(101_500));
+    poll(&fx, &id, &profile, &mut state);
+    let (run, statusline) = (SightingSource::Run, SightingSource::Statusline);
+    let written = at(101_500);
+    assert_eq!(
+        sightings(&fx),
+        [
+            sighting(
+                "s-a",
+                a.as_str(),
+                started,
+                at(1_000),
+                at(99_950),
+                run,
+                written
+            ),
+            sighting(
+                "s-a",
+                a.as_str(),
+                started,
+                at(1_010),
+                at(99_950),
+                statusline,
+                written
+            ),
+            sighting(
+                "s-a",
+                a.as_str(),
+                started,
+                at(101_000),
+                written,
+                run,
+                written
+            ),
+            sighting(
+                "s-b",
+                a.as_str(),
+                started,
+                at(100_000),
+                at(100_950),
+                run,
+                written
+            ),
+        ]
+    );
+}
+
+#[test]
 fn close_leaves_the_launch_open_while_a_background_session_runs() {
     // Spec §6.1: at the child's exit its tenure ends at its last confirmation, and the launch
     // closes only once the profile is no longer in use. A background session the child started

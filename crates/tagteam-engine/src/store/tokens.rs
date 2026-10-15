@@ -992,29 +992,62 @@ impl Store {
         Ok(written?)
     }
 
-    /// `run`'s end of a tenure (spec §6.1): sets the end of the tenure `s`'s key names to
-    /// `s.last_at`, its last confirming read, back as well as forward (a later stamp is not
-    /// one of `run`'s reads); never before `first_at`. Sets `recorded_at` to `s.recorded_at`
-    /// when the end changed.
-    pub fn set_sighting_last_at(
-        &self,
-        provider: &ProviderId,
-        s: &SightingRow,
-    ) -> Result<(), StoreError> {
-        self.exec(
-            "UPDATE session_sightings SET last_at = max(first_at, ?6), recorded_at = ?7 \
-             WHERE provider = ?1 AND session_id = ?2 AND home = ?3 AND started_at = ?4 \
-             AND first_at = ?5 AND last_at != max(first_at, ?6)",
-            &[
-                &provider.as_str(),
-                &s.session_id,
-                &s.home,
-                &s.started_at,
-                &s.first_at,
-                &s.last_at,
-                &s.recorded_at,
+    /// `run`'s end of a tenure (spec §6.1, §6.4), in one `IMMEDIATE` transaction. The tenure
+    /// `s`'s key names is stored if no write stored it yet, and its end set to `s.last_at`, its
+    /// last confirming read, back as well as forward (a later stamp is not one of `run`'s
+    /// reads); never before `first_at`. Then every other tenure of the session in that execution
+    /// and home that began by that end, and runs past it, is clamped to it: a scan or a
+    /// statusline may have continued one over the time the session was away, before `run`'s
+    /// write stored the tenure that saw it go. Each row it changes gets `s.recorded_at`.
+    pub fn end_sighting(&self, provider: &ProviderId, s: &SightingRow) -> Result<(), StoreError> {
+        let mut c = self.lock();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let key = params![
+            provider.as_str(),
+            s.session_id,
+            s.home,
+            s.started_at,
+            s.first_at
+        ];
+        tx.execute(
+            "INSERT INTO session_sightings \
+             (provider, session_id, home, started_at, first_at, last_at, source, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, max(?5, ?6), ?7, ?8) \
+             ON CONFLICT(provider, session_id, home, started_at, first_at) DO UPDATE SET \
+             last_at = excluded.last_at, recorded_at = excluded.recorded_at \
+             WHERE session_sightings.last_at != excluded.last_at",
+            params![
+                provider.as_str(),
+                s.session_id,
+                s.home,
+                s.started_at,
+                s.first_at,
+                s.last_at,
+                s.source.as_str(),
+                s.recorded_at,
             ],
         )?;
+        let end: i64 = tx.query_row(
+            "SELECT last_at FROM session_sightings WHERE provider = ?1 AND session_id = ?2 \
+             AND home = ?3 AND started_at = ?4 AND first_at = ?5",
+            key,
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "UPDATE session_sightings SET last_at = ?6, recorded_at = ?7 \
+             WHERE provider = ?1 AND session_id = ?2 AND home = ?3 AND started_at = ?4 \
+             AND first_at != ?5 AND first_at <= ?6 AND last_at > ?6",
+            params![
+                provider.as_str(),
+                s.session_id,
+                s.home,
+                s.started_at,
+                s.first_at,
+                end,
+                s.recorded_at,
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 

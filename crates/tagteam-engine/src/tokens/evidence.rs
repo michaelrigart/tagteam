@@ -360,7 +360,8 @@ impl Engine {
     }
 
     /// Ends `run`'s tenure `t` exactly at `last_at` (spec §6.1): stored first, when no write has
-    /// stored it yet, then its end set, back as well as forward.
+    /// stored it yet, then its end set, back as well as forward, and every other tenure of its
+    /// session in that execution that began by then clamped to it (spec §6.4).
     fn end_tenure(
         &self,
         store: &Store,
@@ -368,9 +369,7 @@ impl Engine {
         t: &Tenure,
         last_at: i64,
     ) -> Result<(), EngineError> {
-        let row = self.tenure_row(id, t, last_at);
-        store.record_sighting(&id.provider, &row, SIGHTING_GAP_MS)?;
-        store.set_sighting_last_at(&id.provider, &row)?;
+        store.end_sighting(&id.provider, &self.tenure_row(id, t, last_at))?;
         Ok(())
     }
 
