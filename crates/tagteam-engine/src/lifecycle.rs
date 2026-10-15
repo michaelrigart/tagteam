@@ -315,8 +315,9 @@ impl Engine {
     }
 
     /// §10.3's order: the vault entries (strict), then the account's rescue files (§6.3: each
-    /// holds a live refresh token, readable or not, and none is left behind), then the session
-    /// profile (`remove_profile`), and last the row (which cascades). The vault goes first, so
+    /// holds a live refresh token, readable or not, and none is left behind), then the pending
+    /// launches of the session profile, recorded in the store (token report spec §13), then the
+    /// session profile (`remove_profile`), and last the row (which cascades). The vault goes first, so
     /// no generation older than a rescue or a rotated profile can outlive it: an account
     /// without a vault credential is never switched to, refreshed or launched. Anything that
     /// fails stops before the row goes, so the account stays listed and the remove can be run
@@ -349,6 +350,9 @@ impl Engine {
         for path in &rescues {
             self.delete_rescue(path)?;
         }
+        // Token report spec §13: a launch the profile still holds only in a pending file is
+        // recorded before the profile goes.
+        self.record_pending_launches_of(p.as_ref(), &row.id)?;
         self.remove_profile(p.as_ref(), row)?;
         self.store()?.delete_account(&row.id)?;
         self.event(&row.provider, "remove", Some(&row.id), None)?;

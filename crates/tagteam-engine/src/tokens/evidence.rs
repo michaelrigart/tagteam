@@ -6,11 +6,12 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::{
-    ProfileMarker, Provider, Read, RecordEntry, parse_session_record, profile_path,
-    read_session_records_dated, record_is_live,
+    PENDING_LAUNCH_DIR, PendingLaunch, ProfileMarker, Provider, Read, RecordEntry,
+    parse_session_record, profile_path, read_session_records_dated, record_is_live,
 };
 
 use crate::engine::Engine;
@@ -32,6 +33,16 @@ pub struct LaunchId {
     pub provider: ProviderId,
     pub account: AccountId,
     pub started_at_ms: i64,
+}
+
+/// What `Engine::close_launch_kept` did (spec §6.1).
+#[derive(Debug)]
+pub struct LaunchClose {
+    /// The store's side: the tenures' ends and the launch's close.
+    pub stored: Result<(), EngineError>,
+    /// Whether the launch is in its profile's pending file, as `run` left it or as this close
+    /// wrote it. Always false for a launch the caller says is recorded.
+    pub kept: bool,
 }
 
 /// One tenure of the child's session (spec §6.1): the reads of one execution's record (its
@@ -70,9 +81,9 @@ impl Engine {
         self.scan_sessions(p.as_ref())
     }
 
-    /// `sight_sessions`, and a refresh's step 1 (spec §5.2): the scan of spec §6.2, then every
-    /// open launch whose profile is no longer in use is closed at the moment it is found so
-    /// (spec §6.1). Each time is read after the check it records, never at the scan's start: a
+    /// `sight_sessions`, and a refresh's step 1 (spec §5.2): the scan of spec §6.2, then each
+    /// pending launch file is recorded and removed (spec §6.2), then every open launch whose
+    /// profile is no longer in use is closed at the moment it is found so (spec §6.1). Each time is read after the check it records, never at the scan's start: a
     /// child of a killed `run` that answers once more while the scan runs, then exits before
     /// its profile is checked, leaves no response past its launch's end. A late close
     /// over-covers, which can only leave a response unattributed, never misplace it.
@@ -120,6 +131,9 @@ impl Engine {
                     changed += 1;
                 }
             }
+        }
+        for (path, pending) in self.pending_launches(p) {
+            changed += self.record_pending(&store, &path, &pending)?;
         }
         for launch in store.launches(&provider)? {
             if launch.ended_at.is_some() {
@@ -171,6 +185,101 @@ impl Engine {
         }
         homes.sort();
         homes
+    }
+
+    /// The pending launch files in `p`'s profiles (spec §6.1), each with its path: those that
+    /// parse and name `p` and the account whose profile holds them. Any other file is skipped
+    /// and logged at debug, never removed.
+    pub(crate) fn pending_launches(&self, p: &dyn Provider) -> Vec<(PathBuf, PendingLaunch)> {
+        let provider = p.id();
+        let mut found = Vec::new();
+        for (home, _) in self.homes(p) {
+            if home.is_empty() {
+                continue;
+            }
+            let account = AccountId::from_string(home);
+            for (path, parsed) in PendingLaunch::read_all(&profile_path(&self.env, &account)) {
+                match parsed {
+                    Ok(pending)
+                        if pending.provider == provider && pending.account_id == account =>
+                    {
+                        found.push((path, pending));
+                    }
+                    Ok(_) => tracing::debug!(
+                        "a pending launch file names another provider or account than its profile's; skipped"
+                    ),
+                    Err(why) => {
+                        tracing::debug!("a pending launch file was skipped: {why}");
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Spec §6.2: records the pending launch read from `path` open from its start, closes it at
+    /// its end when it has one, then removes the file. Both writes are idempotent, so a file a
+    /// failed removal left behind is recorded again as it was. Returns 1 when the launch was
+    /// new or the file closed it, else 0.
+    fn record_pending(
+        &self,
+        store: &Store,
+        path: &Path,
+        pending: &PendingLaunch,
+    ) -> Result<u64, EngineError> {
+        let account = pending.account_id.as_str();
+        let stored = store
+            .launches(&pending.provider)?
+            .into_iter()
+            .find(|l| l.account_id == account && l.started_at == pending.started_at_ms);
+        let now = self.now_ms();
+        store.open_launch(&pending.provider, account, pending.started_at_ms, now)?;
+        if let Some(ended_at) = pending.ended_at_ms {
+            store.close_launch(
+                &pending.provider,
+                account,
+                pending.started_at_ms,
+                ended_at,
+                now,
+            )?;
+        }
+        match fs::remove_file(path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                tracing::debug!("a recorded pending launch file was not removed: {e}");
+            }
+            _ => {}
+        }
+        Ok(u64::from(stored.is_none_or(|l| {
+            l.ended_at.is_none() && pending.ended_at_ms.is_some()
+        })))
+    }
+
+    /// Spec §13: records the pending launches of `account`'s profile before `remove` deletes it,
+    /// as the scan does. The profile need not hold a marker; a file that does not parse, or
+    /// names another provider or account, is skipped. A provider with no transcripts has none.
+    pub(crate) fn record_pending_launches_of(
+        &self,
+        p: &dyn Provider,
+        account: &AccountId,
+    ) -> Result<(), EngineError> {
+        if !p.capabilities().transcripts {
+            return Ok(());
+        }
+        let profile = profile_path(&self.env, account);
+        let files = PendingLaunch::read_all(&profile);
+        if files.is_empty() {
+            return Ok(());
+        }
+        let store = self.store()?;
+        for (path, parsed) in files {
+            match parsed {
+                Ok(pending) if pending.provider == p.id() && &pending.account_id == account => {
+                    self.record_pending(&store, &path, &pending)?;
+                }
+                _ => tracing::debug!("a pending launch file was skipped"),
+            }
+        }
+        Ok(())
     }
 
     /// Spec §6.1: the launch `run` plans before it spawns its child, started now. Nothing is
@@ -333,7 +442,63 @@ impl Engine {
         state: &LaunchPoll,
         exited_at_ms: i64,
     ) -> Result<(), EngineError> {
-        let p = self.provider(&id.provider)?;
+        self.close_launch_kept(id, profile, state, exited_at_ms, true)
+            .stored
+    }
+
+    /// `close_launch` for `run`, which knows whether the launch is `recorded` in the store
+    /// (spec §6.1). A recorded launch's pending file is removed, as it is not needed. One that
+    /// is not recorded is kept in its profile's pending file, with `endedAt` the moment the
+    /// profile was found idle, the one the store's close would have stored, or null while the
+    /// profile is in use. The tenures' ends are written all the same, and each failure is
+    /// reported apart: `stored` is the store's, `kept` is the file's.
+    pub fn close_launch_kept(
+        &self,
+        id: &LaunchId,
+        profile: &Path,
+        state: &LaunchPoll,
+        exited_at_ms: i64,
+        recorded: bool,
+    ) -> LaunchClose {
+        let tenures = self.end_tenures(id, state, exited_at_ms);
+        let idle = self.idle_at(id, profile);
+        let closed_at = idle.as_ref().ok().copied().flatten();
+        let stored = match (tenures, idle) {
+            (Ok(store), Ok(Some(now))) => store
+                .close_launch(
+                    &id.provider,
+                    id.account.as_str(),
+                    id.started_at_ms,
+                    now,
+                    now,
+                )
+                .map_err(EngineError::from),
+            (Ok(_), Ok(None)) => Ok(()),
+            (Err(e), _) | (Ok(_), Err(e)) => Err(e),
+        };
+        let kept = if recorded {
+            if let Err(e) = self.drop_pending_launch(id, profile) {
+                tracing::debug!(
+                    kind = e.kind(),
+                    "could not remove the recorded launch's pending file"
+                );
+            }
+            false
+        } else {
+            self.keep_pending_launch(id, profile, closed_at).is_ok()
+                || self.pending_launch_path(id, profile).is_file()
+        };
+        LaunchClose { stored, kept }
+    }
+
+    /// The child's tenures ended as `close_launch` describes, and the store they were written
+    /// to.
+    fn end_tenures(
+        &self,
+        id: &LaunchId,
+        state: &LaunchPoll,
+        exited_at_ms: i64,
+    ) -> Result<Arc<Store>, EngineError> {
         let store = self.store()?;
         let until = exited_at_ms;
         let ends = state
@@ -344,18 +509,53 @@ impl Engine {
         for (t, how) in ends.chain(ended) {
             self.end_tenure(&store, id, t, t.confirmed_at.min(exited_at_ms), how)?;
         }
+        Ok(store)
+    }
+
+    /// The moment the launch's profile is found no longer in use, read after the check; `None`
+    /// while it is in use.
+    fn idle_at(&self, id: &LaunchId, profile: &Path) -> Result<Option<i64>, EngineError> {
+        let p = self.provider(&id.provider)?;
         hooks::point(self, "close-launch-check")?;
-        if !self.session_state_at(p.as_ref(), profile).owned() {
-            let now = self.now_ms();
-            store.close_launch(
-                &id.provider,
-                id.account.as_str(),
-                id.started_at_ms,
-                now,
-                now,
-            )?;
+        Ok((!self.session_state_at(p.as_ref(), profile).owned()).then(|| self.now_ms()))
+    }
+
+    /// Spec §6.1: keeps the planned launch in `profile`'s pending file, `endedAt` as given, when
+    /// the store refuses it. Atomic, and idempotent for one launch: the file of this process
+    /// and this start is replaced. The profile's own writability is what it needs, never the
+    /// store's.
+    pub fn keep_pending_launch(
+        &self,
+        id: &LaunchId,
+        profile: &Path,
+        ended_at_ms: Option<i64>,
+    ) -> Result<(), EngineError> {
+        PendingLaunch {
+            provider: id.provider.clone(),
+            account_id: id.account.clone(),
+            started_at_ms: id.started_at_ms,
+            ended_at_ms,
         }
+        .write(profile, std::process::id())?;
         Ok(())
+    }
+
+    /// Spec §6.1: removes the launch's pending file once it is recorded. A file that is not
+    /// there is fine.
+    pub fn drop_pending_launch(&self, id: &LaunchId, profile: &Path) -> Result<(), EngineError> {
+        Ok(PendingLaunch::remove(
+            profile,
+            id.started_at_ms,
+            std::process::id(),
+        )?)
+    }
+
+    fn pending_launch_path(&self, id: &LaunchId, profile: &Path) -> PathBuf {
+        profile.join(PENDING_LAUNCH_DIR).join(format!(
+            "{}-{}.json",
+            id.started_at_ms,
+            std::process::id()
+        ))
     }
 
     /// `run`'s sighting of the tenure `t` in its launch's profile, ending at `last_at`.

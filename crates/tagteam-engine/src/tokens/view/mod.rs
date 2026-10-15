@@ -369,7 +369,13 @@ impl Engine {
         {
             return Ok(report);
         }
-        let grouped = group::group(q, p.as_ref(), &store, &prices, self.now_ms())?;
+        // Spec §7.2: launches `run` kept in a pending file count as stored ones, read only.
+        let pending: Vec<_> = self
+            .pending_launches(p.as_ref())
+            .into_iter()
+            .map(|(_, launch)| launch)
+            .collect();
+        let grouped = group::group(q, p.as_ref(), &store, &pending, &prices, self.now_ms())?;
         report.rows = grouped.rows;
         report.total = grouped.total;
         report.unpriced_models = grouped.unpriced_models;
