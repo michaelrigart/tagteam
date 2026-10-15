@@ -32,29 +32,35 @@ pub(super) struct Grouped {
     pub(super) unpriced_models: Vec<String>,
 }
 
-/// The rows and totals of `q` (spec §10.1). `pending` are the launches `run` kept in pending
-/// files (spec §6.1), placed as stored ones. `now_ms` decides the active block.
-pub(super) fn group(
-    q: &TokenQuery,
-    p: &dyn Provider,
-    store: &Store,
-    pending: &[PendingLaunch],
-    prices: &Prices,
-    now_ms: i64,
-) -> Result<Grouped, StoreError> {
-    let by_block = q.period == TokenPeriod::Block;
-    // A block is a span of its account's whole usage (spec §9), so a block report resolves
-    // every response it reads; the filters only choose which of them count.
-    let usage = if by_block {
+/// The responses `q` reads. A block is a span of its account's whole usage (spec §9), so a
+/// block report resolves every response it reads; the filters only choose which of them count.
+pub(super) fn usage(q: &TokenQuery, store: &Store) -> Result<Vec<UsageRow>, StoreError> {
+    if q.period == TokenPeriod::Block {
         store.token_usage(
             &q.provider,
             q.since_ms.map(|s| s.saturating_sub(BLOCK_LOOKBACK_MS)),
             q.until_ms.map(|u| u.saturating_add(BLOCK_MS)),
             None,
-        )?
+        )
     } else {
-        store.token_usage(&q.provider, q.since_ms, q.until_ms, q.session.as_deref())?
-    };
+        store.token_usage(&q.provider, q.since_ms, q.until_ms, q.session.as_deref())
+    }
+}
+
+/// The rows and totals of `q` (spec §10.1), from the responses `usage` read for it. `pending`
+/// are the launches `run` kept in pending files (spec §6.1), placed as stored ones; the stored
+/// launches are read here, after both (`Engine::token_report` says why). `now_ms` decides the
+/// active block.
+pub(super) fn group(
+    q: &TokenQuery,
+    p: &dyn Provider,
+    store: &Store,
+    usage: &[UsageRow],
+    pending: &[PendingLaunch],
+    prices: &Prices,
+    now_ms: i64,
+) -> Result<Grouped, StoreError> {
+    let by_block = q.period == TokenPeriod::Block;
     let accounts = store.accounts(&q.provider)?;
     let mut evidence = Evidence::load(store, &q.provider, &accounts, pending)?;
     let mut t = Tables {
@@ -87,7 +93,7 @@ pub(super) fn group(
         }
     }
     let block_of = if by_block {
-        let (blocks, block_of) = series_blocks(p, store, &t.slots, &usage, &resolved)?;
+        let (blocks, block_of) = series_blocks(p, store, &t.slots, usage, &resolved)?;
         t.blocks = blocks;
         block_of
     } else {

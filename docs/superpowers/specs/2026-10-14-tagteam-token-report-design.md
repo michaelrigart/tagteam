@@ -620,7 +620,9 @@ unattributed.
 - From the epoch (`token_epoch`, when the store migrated to step 3) on, coverage is complete:
   `run` records each launch, in the store or in a pending file (§6.1), from a start planned
   before its child starts. A report reads each pending file the store does not hold as a
-  launch, open when it has no `endedAt`. It only reads: it never writes or removes one.
+  launch, open when it has no `endedAt`. It only reads: it never writes or removes one. It
+  reads the usage first, then the pending files, then the stored launches, each read begun
+  after the one before.
 - Before the epoch, coverage comes from the seeded launches (§4). It is complete only after
   the provider's last `remove` event before the epoch. An account removed before then may have
   had a profile that left no trace.
@@ -1102,7 +1104,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
     - a profile session, and the default home through `active_history` and through `events`;
     - an unsighted response with and without a covering launch, before and after the epoch,
       and before and after a pre-epoch `remove`;
-    - an unsighted response inside a pending launch, unattributed before the next scan;
+    - an unsighted response inside a pending launch, unattributed before the next scan, with
+      the file written, or moved to the store by a scan, while the report reads;
     - a session sighted in two homes at once;
     - a session resumed in another home, with either home unsighted;
     - a removed account, with and without switches, and a removed profile.
