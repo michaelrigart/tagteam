@@ -72,10 +72,11 @@ cargo test -p tagteam-engine --features real_keychain --test run_real_keychain -
 - **Linux tests run in Docker.** To reproduce the Linux CI run from a Mac, run the tests in a
   `rust:1.88` container. They must run as a non-root user (root defeats the permission-based
   fault injection in the engine tests), as a user with a passwd entry, and with `HOME` outside
-  `/tmp`:
+  `/tmp`. Pass `--init` too: the process-group tests in `xtask` need PID 1 to reap the orphans
+  they leave, and without an init process they find them still there as zombies:
 
   ```sh
-  docker run --rm -v "$PWD":/src:ro \
+  docker run --rm --init -v "$PWD":/src:ro \
     -v tagteam-target:/target -v tagteam-registry:/usr/local/cargo/registry \
     -e CARGO_TARGET_DIR=/target -e RUSTUP_TOOLCHAIN=1.88.0 -w /src rust:1.88 \
     bash -c 'useradd -m -u 1000 tester && chown -R tester /target /usr/local/cargo &&
