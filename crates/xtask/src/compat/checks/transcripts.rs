@@ -172,6 +172,50 @@ fn record_session_id(path: &Path) -> Option<String> {
     read_json(path)?["sessionId"].as_str().map(str::to_owned)
 }
 
+/// The `sessionId`s of the record files in `current` that are neither `record` nor in `before`:
+/// a record CC replaced or added.
+fn new_record_ids(current: &[PathBuf], before: &[PathBuf], record: &Path) -> Vec<String> {
+    let mut ids: Vec<String> = current
+        .iter()
+        .filter(|path| path.as_path() != record && !before.contains(path))
+        .filter_map(|path| record_session_id(path))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// The `sessionId` the session's record names once the next answer is written. `read` is the
+/// record's own id, `last` the last one read while it lived (kept when it was caught
+/// mid-write). A record file that is gone is named by the one record that replaced it.
+fn named_session_id(
+    read: Option<String>,
+    record_kept: bool,
+    last: Option<String>,
+    new_ids: &[String],
+) -> Option<String> {
+    match (read, record_kept, new_ids) {
+        (Some(id), _, _) => Some(id),
+        (None, true, _) => last,
+        (None, false, [only]) => Some(only.clone()),
+        (None, false, _) => None,
+    }
+}
+
+/// The summary of the `/clear` check: the final answer on the record's `sessionId`, from the
+/// id at the start and the one it names after the next answer.
+fn clear_summary(first: Option<&str>, named: Option<&str>) -> &'static str {
+    match (first, named) {
+        (None, _) => "the record carried no sessionId at the start; the notes say what /clear did",
+        (Some(_), None) => {
+            "after /clear the record names no session; the notes say what became of it"
+        }
+        (Some(a), Some(b)) if a == b => {
+            "/clear left the record's sessionId as it was by the next answer"
+        }
+        (Some(_), Some(_)) => "/clear changed the record's sessionId by the next answer",
+    }
+}
+
 /// Token report §15: a real request's transcript has every field the index reads on every
 /// assistant line, and its final line has the rest.
 pub fn transcript_usage_fields(ctx: &mut Ctx) -> Result<Outcome, HarnessError> {
@@ -228,6 +272,7 @@ pub fn session_record_session_id_and_clear(ctx: &mut Ctx) -> Result<Outcome, Har
         let sessions = home.join("sessions");
         let projects = home.join("projects");
         let before = records(&sessions);
+        let known: Vec<PathBuf> = before.iter().map(|(path, _)| path.clone()).collect();
         let mut pty = ctx.profile_pty(&["--model", MODEL])?;
         let Some((record, _)) = new_record(&sessions, &before, Duration::from_secs(60)) else {
             p.expect(
@@ -273,16 +318,18 @@ pub fn session_record_session_id_and_clear(ctx: &mut Ctx) -> Result<Outcome, Har
             now = record_session_id(&record).or_else(|| now.clone());
             now != first
         });
-        let new_records = records(&sessions)
+        let current: Vec<PathBuf> = records(&sessions)
             .into_iter()
-            .filter(|(path, _)| *path != record && !before.iter().any(|(b, _)| b == path))
-            .count();
+            .map(|(path, _)| path)
+            .collect();
+        let new_ids = new_record_ids(&current, &known, &record);
         p.note(
             "after /clear: what happened to the record (token report §17 T1)",
             json!({
-                "sessionIdChanged": changed,
+                "sessionIdChangedWithin10s": changed,
                 "recordFileKept": record.exists(),
-                "newRecordFiles": new_records,
+                "newRecordFiles": current.iter().filter(|c| **c != record && !known.contains(c)).count(),
+                "newRecordSessionIds": new_ids,
             }),
         );
 
@@ -300,12 +347,21 @@ pub fn session_record_session_id_and_clear(ctx: &mut Ctx) -> Result<Outcome, Har
             !answered.is_empty(),
             json!(answered.len()),
         );
-        let named = record_session_id(&record).or(now);
+        let current: Vec<PathBuf> = records(&sessions)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        let new_ids = new_record_ids(&current, &known, &record);
+        let named = named_session_id(record_session_id(&record), record.exists(), now, &new_ids);
         p.note(
             "after /clear: where the next answer was written (token report §17 T1)",
             json!({
+                "sessionIdChangedByNextAnswer": named != first,
                 "aNewTranscript": answered.iter().any(|s| Some(s) != first.as_ref()),
                 "theTranscriptTheRecordNames": answered.iter().any(|s| Some(s) == named.as_ref()),
+                "recordFileKept": record.exists(),
+                "newRecordSessionIds": new_ids,
+                "aNewRecordNamesTheTranscript": answered.iter().any(|s| new_ids.contains(s)),
             }),
         );
         let _ = pty.line("/exit");
@@ -313,7 +369,7 @@ pub fn session_record_session_id_and_clear(ctx: &mut Ctx) -> Result<Outcome, Har
             "the session's exit",
             json!(pty.finish(Duration::from_secs(30))?),
         );
-        Ok("the record carries sessionId; what /clear does to it is in the notes")
+        Ok(clear_summary(first.as_deref(), named.as_deref()))
     }))
 }
 
@@ -487,5 +543,54 @@ mod tests {
         );
         assert_eq!(record_session_id(&dir.join("4.json")), None, "gone");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_replaced_record_is_found_by_the_new_files_session_ids() {
+        let dir = scratch("replaced");
+        let old = dir.join("1.json");
+        let kept = dir.join("2.json");
+        let new = dir.join("3.json");
+        fs::write(&kept, r#"{"pid":2,"sessionId":"other"}"#).unwrap();
+        fs::write(&new, r#"{"pid":3,"sessionId":"fresh"}"#).unwrap();
+        fs::write(dir.join("4.json"), r#"{"pid":4,"sessi"#).unwrap();
+        let before = [old.clone(), kept.clone()];
+        let current = [kept, new, dir.join("4.json")];
+        assert_eq!(new_record_ids(&current, &before, &old), ["fresh"]);
+        assert!(new_record_ids(&before, &before, &old).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_named_id_follows_the_record_its_replacement_or_the_last_read() {
+        let id = |s: &str| Some(s.to_owned());
+        let fresh = ["fresh".to_owned()];
+        let two = ["a".to_owned(), "b".to_owned()];
+        assert_eq!(named_session_id(id("new"), true, id("old"), &[]), id("new"));
+        assert_eq!(
+            named_session_id(None, true, id("old"), &[]),
+            id("old"),
+            "mid-write"
+        );
+        assert_eq!(
+            named_session_id(None, false, id("old"), &fresh),
+            id("fresh")
+        );
+        assert_eq!(named_session_id(None, false, id("old"), &two), None);
+        assert_eq!(named_session_id(None, false, id("old"), &[]), None);
+    }
+
+    #[test]
+    fn the_summary_states_the_final_answer_not_the_first_sample() {
+        assert_eq!(
+            clear_summary(Some("a"), Some("b")),
+            "/clear changed the record's sessionId by the next answer"
+        );
+        assert_eq!(
+            clear_summary(Some("a"), Some("a")),
+            "/clear left the record's sessionId as it was by the next answer"
+        );
+        assert!(clear_summary(Some("a"), None).contains("names no session"));
+        assert!(clear_summary(None, None).contains("no sessionId at the start"));
     }
 }
