@@ -291,17 +291,24 @@ pub fn usage_key(provider: &ProviderId, message_id: &str, request_id: &str) -> i
 
 impl Store {
     pub fn token_files(&self, provider: &ProviderId) -> Result<Vec<TokenFileRow>, StoreError>;
+    /// A refresh's start, called once under its lock: one IMMEDIATE transaction that creates the provider's token_state row if
+    /// absent and returns token_epoch.at, first inserting (now_ms, seeded = 0) when a full purge left no row (ruling R1: after a
+    /// purge, pre-epoch coverage is incomplete). That value is the refresh's generation; every purge deletes the row, so the next
+    /// begin starts a new one.
+    pub fn begin_token_refresh(&self, provider: &ProviderId, now_ms: i64) -> Result<i64, StoreError>;
     /// One IMMEDIATE transaction: upsert rows by the merge rule, write each file row, delete `removed` file rows,
     /// create the provider's token_state row if absent, and set changed_at = now when added + updated > 0.
-    /// `epoch`: the token_epoch.at the refresh read when it began (None: no row). A full purge deletes that row, so when
-    /// the stored epoch differs, nothing is written and the answer is StoreError::TokenIndexPurged.
-    pub fn commit_token_batch(&self, provider: &ProviderId, epoch: Option<i64>, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
-    /// Sets refreshed_at and stats; inserts token_epoch(now, seeded = 1) if it has no row (epoch None: a refresh begun after a
-    /// purge); on the first completion (refreshed_at was NULL) also sets changed_at. Same `epoch` check and TokenIndexPurged.
-    pub fn finish_token_refresh(&self, provider: &ProviderId, epoch: Option<i64>, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
+    /// `epoch`: what begin_token_refresh gave the refresh. When the stored epoch row is missing or differs (a purge ran since),
+    /// nothing is written and the answer is StoreError::TokenIndexPurged.
+    pub fn commit_token_batch(&self, provider: &ProviderId, epoch: i64, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
+    /// Sets refreshed_at and stats; on the first completion (refreshed_at was NULL) also sets changed_at. Same `epoch` check and
+    /// TokenIndexPurged. It records no epoch: begin_token_refresh does.
+    pub fn finish_token_refresh(&self, provider: &ProviderId, epoch: i64, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
     /// Daily lease `prune:tokens:<provider>`; deletes usage older than cutoff in chunks, each chunk that deletes any also moving changed_at and
-    /// `responses`; then empty sessions, sightings that ended before cutoff, launches ended before cutoff, and pruned_at. `stop` is asked before
-    /// each chunk: stopped, the lease is released and `complete: false` (the next call goes on). A lease held or spent today: `{0, complete: true}`.
+    /// `responses`; then empty sessions, sightings that ended before cutoff, launches ended before cutoff, each in chunks, and pruned_at.
+    /// `stop` is asked only after a chunk that deleted something (a chunk deleting nothing moves straight on), so every call deletes
+    /// something or completes: stopped, the lease is released and `complete: false` (the next call goes on). A lease held or spent
+    /// today: `{0, complete: true}`.
     pub fn prune_tokens(&self, provider: &ProviderId, cutoff_ms: i64, holder: &str, now_ms: i64, stop: &dyn Fn() -> bool) -> Result<PruneOutcome, StoreError>;
     pub fn token_state(&self, provider: &ProviderId) -> Result<Option<TokenStateRow>, StoreError>;
     pub fn token_epoch(&self) -> Result<Option<EpochRow>, StoreError>;
@@ -365,7 +372,7 @@ impl Engine {
     pub fn open_launch(&self, provider: &ProviderId, account: &AccountId) -> Result<LaunchId, EngineError>;          // before the spawn
     pub fn attach_launch_pid(&self, id: &LaunchId, pid: u32) -> Result<(), EngineError>;
     pub fn poll_launch(&self, id: &LaunchId, profile: &Path, pid: u32, state: &mut LaunchPoll) -> Result<(), EngineError>; // every 2 s while the child runs
-    pub fn close_launch(&self, id: &LaunchId, profile: &Path, state: &LaunchPoll, exited_at_ms: i64) -> Result<(), EngineError>; // after finish_run: sighting ends at exited_at_ms (the child's exit, read right after the wait), launch closes now if idle
+    pub fn close_launch(&self, id: &LaunchId, profile: &Path, state: &LaunchPoll, exited_at_ms: i64) -> Result<(), EngineError>; // after finish_run: sighting ends at exited_at_ms (the child's exit, read right after the wait), launch closes if idle, ended_at read after that check
     /// The statusline sighting (spec §6.3). `profile`: the run-shell profile, or None for the default home. Never waits more than CACHE_WRITE_WAIT.
     pub fn statusline_sighting(&self, provider: &ProviderId, session_id: &str, profile: Option<&Path>) -> Result<(), EngineError>;
 }
@@ -8055,8 +8062,9 @@ git commit -m "Add migration step 3 for the token index and session evidence"
 
   impl Store {
       pub fn token_files(&self, provider: &ProviderId) -> Result<Vec<TokenFileRow>, StoreError>;
-      pub fn commit_token_batch(&self, provider: &ProviderId, epoch: Option<i64>, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
-      pub fn finish_token_refresh(&self, provider: &ProviderId, epoch: Option<i64>, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
+      pub fn begin_token_refresh(&self, provider: &ProviderId, now_ms: i64) -> Result<i64, StoreError>;
+      pub fn commit_token_batch(&self, provider: &ProviderId, epoch: i64, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
+      pub fn finish_token_refresh(&self, provider: &ProviderId, epoch: i64, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
       pub fn prune_tokens(&self, provider: &ProviderId, cutoff_ms: i64, holder: &str, now_ms: i64, stop: &dyn Fn() -> bool) -> Result<PruneOutcome, StoreError>;
       #[cfg(feature = "test-hooks")]
       pub fn busy_timeout(&self) -> Result<Duration, StoreError>; // the connection's, for the restoration test
@@ -8083,11 +8091,11 @@ git commit -m "Add migration step 3 for the token index and session evidence"
   // store/mod.rs: StoreError gains TokenIndexPurged ("the token index was purged during the refresh").
   ```
   Behaviour later tasks rely on, beyond the contract's doc lines:
-  - **The purge generation.** A full purge deletes the `token_epoch` row, so `token_epoch().map(|e| e.at)`, read once when a refresh begins, is that refresh's generation. `commit_token_batch` and `finish_token_refresh` take it as `epoch` and compare it, inside their `IMMEDIATE` transaction, with the stored epoch; on a mismatch they write nothing (not even the provider's `token_state` row) and return `StoreError::TokenIndexPurged`. A refresh that began after a purge passes `None`, and its `finish_token_refresh` records the new epoch. `TokenIndexPurged` reaches the CLI as `EngineError::Store` (kind `store`); Task 15 may stop the refresh on it, since its next run starts over on the emptied index. No other code matches `StoreError` exhaustively, and `kind_is_pinned_for_every_variant` pins `EngineError::Store` by one example, so neither needs a change.
+  - **The purge generation.** A refresh calls `begin_token_refresh` once, under its lock, and gets the index's generation: the `token_epoch.at` there is, or, when a full purge left no row, a new row `(now_ms, seeded = 0)` it inserts (ruling R1: after a purge, pre-epoch coverage is incomplete). Every purge deletes the row, so each purge starts a new generation, and an absent row is never a generation. `commit_token_batch` and `finish_token_refresh` take that `epoch: i64` and compare it, inside their `IMMEDIATE` transaction, with the stored row; when the row is missing or differs they write nothing (not even the provider's `token_state` row) and return `StoreError::TokenIndexPurged`. `finish_token_refresh` records no epoch. Two generations share an `at` only if a refresh begins in the very millisecond of the epoch a stale refresh holds, which only a clock set back could make. `TokenIndexPurged` reaches the CLI as `EngineError::Store` (kind `store`); Task 15 may stop the refresh on it, since its next run starts over on the emptied index. No other code matches `StoreError` exhaustively, and `kind_is_pinned_for_every_variant` pins `EngineError::Store` by one example, so neither needs a change.
   - `commit_token_batch` merges rows of one key within the batch first, writes a response only when the merge changes it, and counts `added` (a key the store did not hold) and `updated` (a stored key whose merged row differs) per distinct key. It also adds `added` to `token_state.responses`.
   - `token_state.responses` is the index's live count, which each batch adds to and each prune subtracts from. `finish_token_refresh` does not write `stats.responses`, so Task 15 may pass any value there (0 is fine).
   - `token_usage` orders by `at`, then by first-indexed order (`id`). `token_models` lists every model the provider's index has held since its last purge, pruned ones included (ruling R8).
-  - `prune_tokens` also deletes sightings whose `last_at` is before the cutoff (see Notes). Each deletion chunk (5,000 responses at most) is its own transaction and, when it deletes any, sets `changed_at` and subtracts from `responses` in that same transaction. `stop` is asked before each chunk; a stopped prune releases its lease (`expires_at` set to `now_ms`) and returns `complete: false`, so Task 15 calls it with a closure over the refresh's deadline and cancel and simply calls again on the next refresh. `pruned_at` is set only when a prune completes. A lease another holder took today is `PruneOutcome { deleted: 0, complete: true }`: nothing is due.
+  - `prune_tokens` also deletes sightings whose `last_at` is before the cutoff (see Notes). Each deletion chunk (5,000 responses at most) is its own transaction and, when it deletes any, sets `changed_at` and subtracts from `responses` in that same transaction. `stop` is asked only after a chunk that deleted something, before the next; a chunk that deletes nothing moves straight on, so every call deletes something or completes, and a prune stopped at every ask still finishes over successive calls. A stopped prune releases its lease (`expires_at` set to `now_ms`) and returns `complete: false`, so Task 15 calls it with a closure over the refresh's deadline and cancel and simply calls again on the next refresh. `pruned_at` is set only when a prune completes. A lease another holder took today is `PruneOutcome { deleted: 0, complete: true }`: nothing is due.
   - `record_sighting` with `min_gap_ms = 0` writes whenever `last_at` does not move back. `set_sighting_last_at`, `run`'s exit write, sets `last_at` to the exit exactly, back as well as forward (a poll may have stamped a later instant just before the poller stopped), never before `first_at`, and touches `recorded_at` only when the end changed.
 
 - [ ] **Step 1: Write the failing tests**
@@ -8162,9 +8170,9 @@ fn file(path: &str, offset: u64) -> TokenFileRow {
     }
 }
 
-/// The index's generation as a refresh starting now reads it: `token_epoch.at`.
-fn generation(s: &Store) -> Option<i64> {
-    s.token_epoch().unwrap().map(|e| e.at)
+/// The index's generation, as a refresh beginning now takes it.
+fn generation(s: &Store) -> i64 {
+    s.begin_token_refresh(&cc(), T).unwrap()
 }
 
 fn commit(s: &Store, rows: &[UsageRow], now: i64) -> BatchOutcome {
@@ -8427,27 +8435,66 @@ fn finish_sets_refreshed_and_the_first_completion_moves_changed_at() {
 }
 
 #[test]
-fn finish_inserts_an_epoch_after_a_full_purge() {
+fn begin_creates_a_new_generation_after_each_purge() {
+    // Spec §5.1, §13: the epoch is the index's generation. A refresh begins on the one there
+    // is; after a purge deleted it, the next refresh to begin records a new one, unseeded
+    // (ruling R1), and a refresh of an older generation writes nothing.
     let (_d, s, _) = store();
-    let epoch = s.token_epoch().unwrap().expect("the migration's epoch");
-    assert!(!epoch.seeded, "a raw open seeds nothing (ruling R1)");
-    s.finish_token_refresh(&cc(), generation(&s), &RefreshStats::default(), T)
-        .unwrap();
+    let migrated = s.token_epoch().unwrap().expect("the migration's epoch");
+    assert!(!migrated.seeded, "a raw open seeds nothing (ruling R1)");
+    assert_eq!(s.begin_token_refresh(&cc(), T).unwrap(), migrated.at);
     assert_eq!(
         s.token_epoch().unwrap(),
-        Some(epoch),
-        "the epoch never moves"
+        Some(migrated),
+        "an epoch is kept, never moved"
     );
+
     s.empty_all().unwrap();
     assert_eq!(s.token_epoch().unwrap(), None);
-    s.finish_token_refresh(&cc(), generation(&s), &RefreshStats::default(), T + 5)
+    let first = s.begin_token_refresh(&cc(), T + 1).unwrap();
+    assert_eq!(first, T + 1);
+    assert_eq!(
+        s.token_epoch().unwrap(),
+        Some(EpochRow {
+            at: T + 1,
+            seeded: false
+        })
+    );
+    assert_eq!(
+        s.begin_token_refresh(&fake(), T + 5).unwrap(),
+        first,
+        "one generation for every provider"
+    );
+
+    s.empty_all().unwrap();
+    let second = s.begin_token_refresh(&cc(), T + 2).unwrap();
+    assert_ne!(second, first);
+    assert!(matches!(
+        s.commit_token_batch(&cc(), first, &[row(1, "s1", T, 1)], &[], &[], T + 3),
+        Err(StoreError::TokenIndexPurged)
+    ));
+    assert!(matches!(
+        s.finish_token_refresh(&cc(), first, &RefreshStats::default(), T + 3),
+        Err(StoreError::TokenIndexPurged)
+    ));
+    assert!(all(&s).is_empty(), "the older generation wrote nothing");
+    assert_eq!(
+        s.commit_token_batch(&cc(), second, &[row(1, "s1", T, 1)], &[], &[], T + 3)
+            .unwrap(),
+        BatchOutcome {
+            added: 1,
+            updated: 0
+        }
+    );
+    s.finish_token_refresh(&cc(), second, &RefreshStats::default(), T + 4)
         .unwrap();
     assert_eq!(
         s.token_epoch().unwrap(),
         Some(EpochRow {
-            at: T + 5,
-            seeded: true
-        })
+            at: T + 2,
+            seeded: false
+        }),
+        "a completion records no epoch of its own"
     );
 }
 
@@ -8457,7 +8504,6 @@ fn a_batch_after_a_full_purge_is_refused() {
     // began before it writes nothing after it, not even the provider's state row.
     let (_d, s, _) = store();
     let started = generation(&s);
-    assert!(started.is_some());
     assert_eq!(
         s.commit_token_batch(&cc(), started, &[row(1, "s1", T, 1)], &[], &[], T)
             .unwrap(),
@@ -8486,9 +8532,11 @@ fn a_batch_after_a_full_purge_is_refused() {
     assert!(s.token_files(&cc()).unwrap().is_empty());
     assert_eq!(s.token_state(&cc()).unwrap(), None);
 
-    // A refresh that begins after the purge reads no epoch, and writes.
+    // A refresh that begins after the purge has a generation of its own, and writes.
+    let fresh = s.begin_token_refresh(&cc(), T + 2).unwrap();
+    assert_ne!(fresh, started);
     assert_eq!(
-        s.commit_token_batch(&cc(), None, &[row(2, "s1", T + 1, 1)], &[], &[], T + 2)
+        s.commit_token_batch(&cc(), fresh, &[row(2, "s1", T + 1, 1)], &[], &[], T + 2)
             .unwrap(),
         BatchOutcome {
             added: 1,
@@ -8514,22 +8562,15 @@ fn a_finish_after_a_full_purge_is_refused() {
     assert_eq!(s.token_state(&cc()).unwrap(), None, "nothing written");
     assert_eq!(s.token_epoch().unwrap(), None, "and no epoch recorded");
 
-    // A refresh that began after the purge completes, and its completion records the epoch.
-    s.finish_token_refresh(&cc(), None, &stats, T + 2).unwrap();
-    assert_eq!(
-        s.token_epoch().unwrap(),
-        Some(EpochRow {
-            at: T + 2,
-            seeded: true
-        })
-    );
+    // A refresh that began after the purge completes.
+    let fresh = s.begin_token_refresh(&cc(), T + 2).unwrap();
+    s.finish_token_refresh(&cc(), fresh, &stats, T + 3).unwrap();
     assert_eq!(
         s.token_state(&cc()).unwrap().unwrap().refreshed_at,
-        Some(T + 2)
+        Some(T + 3)
     );
-    // That epoch is the new generation: one read before it is stale.
     assert!(matches!(
-        s.commit_token_batch(&cc(), None, &[], &[], &[], T + 3),
+        s.commit_token_batch(&cc(), started, &[], &[], &[], T + 4),
         Err(StoreError::TokenIndexPurged)
     ));
 }
@@ -8666,8 +8707,9 @@ fn a_prune_that_fails_part_way_still_moves_changed_at() {
 
 #[test]
 fn a_stopped_prune_resumes_on_the_next_call_and_completes() {
-    // A retention cut can make a prune large: `stop` (the refresh's budget and cancel) is asked
-    // before each chunk, and a stopped prune hands its lease back so the next call goes on.
+    // A retention cut can make a prune large. `stop` (the refresh's budget and cancel) is asked
+    // only after a chunk that deleted something, and a stopped prune hands its lease back: a
+    // `stop` that trips at its first ask still lets call after call finish.
     let (_d, s, _) = store();
     let cutoff = T - 30 * DAY;
     let mut rows: Vec<UsageRow> = (1000..1000 + 5_001)
@@ -8677,18 +8719,20 @@ fn a_stopped_prune_resumes_on_the_next_call_and_completes() {
     commit(&s, &rows, T);
 
     let asked = Cell::new(0);
-    let after_one_chunk = || {
+    let at_first_ask = || {
         asked.set(asked.get() + 1);
-        asked.get() > 1
+        true
     };
     assert_eq!(
-        s.prune_tokens(&cc(), cutoff, "h1", T + 1, &after_one_chunk)
+        s.prune_tokens(&cc(), cutoff, "h1", T + 1, &at_first_ask)
             .unwrap(),
         PruneOutcome {
             deleted: 5_000,
             complete: false
-        }
+        },
+        "a full chunk, then the first ask"
     );
+    assert_eq!(asked.get(), 1);
     let state = s.token_state(&cc()).unwrap().unwrap();
     assert_eq!(
         (state.changed_at, state.stats.responses, state.pruned_at),
@@ -8696,45 +8740,50 @@ fn a_stopped_prune_resumes_on_the_next_call_and_completes() {
         "the chunk that ran is seen; the prune is not done"
     );
 
+    let mut outcomes = Vec::new();
+    for (n, holder) in ["h2", "h3", "h4", "h5"].into_iter().enumerate() {
+        let outcome = s
+            .prune_tokens(&cc(), cutoff, holder, T + 2 + n as i64, &at_first_ask)
+            .unwrap();
+        outcomes.push(outcome);
+        if outcome.complete {
+            break;
+        }
+    }
     assert_eq!(
-        prune(&s, cutoff, "h2", T + 2),
-        done(1),
-        "the next call, the same day, goes on"
+        outcomes,
+        [
+            PruneOutcome {
+                deleted: 1,
+                complete: false
+            },
+            PruneOutcome {
+                deleted: 0,
+                complete: false
+            },
+            done(0),
+        ],
+        "the last expired response; the session it left empty; then the rest, deleting nothing"
     );
     assert_eq!(keys(&all(&s)), [1]);
     let state = s.token_state(&cc()).unwrap().unwrap();
     assert_eq!(
         (state.changed_at, state.stats.responses, state.pruned_at),
-        (Some(T + 2), 1, Some(T + 2))
+        (Some(T + 2), 1, Some(T + 4))
     );
     assert_eq!(
-        prune(&s, cutoff, "h3", T + 3),
+        prune(&s, cutoff, "h6", T + 5),
         done(0),
         "complete, it holds the day's lease"
-    );
-
-    let stopped = s
-        .prune_tokens(&cc(), cutoff, "h4", T + DAY + 2, &|| true)
-        .unwrap();
-    assert_eq!(
-        stopped,
-        PruneOutcome {
-            deleted: 0,
-            complete: false
-        },
-        "stopped before its first chunk"
-    );
-    assert_eq!(
-        s.token_state(&cc()).unwrap().unwrap().pruned_at,
-        Some(T + 2)
     );
 }
 
 #[test]
 fn the_cleanup_after_the_responses_stops_and_resumes_too() {
     // The phases after the expired responses (sessions, sightings, launches) also delete in
-    // chunks with `stop` asked before each: a large backlog of expired sightings never runs
-    // as one transaction.
+    // chunks, each that deletes something followed by an ask: a large backlog of expired
+    // sightings never runs as one transaction, and a `stop` that trips at its first ask still
+    // lets the calls finish.
     let (_d, s, path) = store();
     let cutoff = T - 30 * DAY;
     {
@@ -8757,33 +8806,38 @@ fn the_cleanup_after_the_responses_stops_and_resumes_too() {
             .query_row("SELECT count(*) FROM session_sightings", [], |r| r.get(0))
             .unwrap()
     };
-
-    // Asked before: the responses (none), the sessions (none), the first 5,000 sightings, and
-    // then it stops.
-    let asked = Cell::new(0);
-    let after_three = || {
-        asked.set(asked.get() + 1);
-        asked.get() > 3
+    let stopped = PruneOutcome {
+        deleted: 0,
+        complete: false,
     };
+
+    // The responses and sessions delete nothing and move on unasked; 5,000 sightings go, then
+    // the first ask stops it.
     assert_eq!(
-        s.prune_tokens(&cc(), cutoff, "h1", T, &after_three)
-            .unwrap(),
-        PruneOutcome {
-            deleted: 0,
-            complete: false
-        }
+        s.prune_tokens(&cc(), cutoff, "h1", T, &|| true).unwrap(),
+        stopped
     );
     assert_eq!(sightings(), 1_000);
     assert_eq!(
         s.token_state(&cc()).unwrap().and_then(|st| st.pruned_at),
         None
     );
-
-    assert_eq!(prune(&s, cutoff, "h2", T + 1), done(0));
+    assert_eq!(
+        s.prune_tokens(&cc(), cutoff, "h2", T + 1, &|| true)
+            .unwrap(),
+        stopped,
+        "the last 1,000, then an ask"
+    );
     assert_eq!(sightings(), 0);
     assert_eq!(
+        s.prune_tokens(&cc(), cutoff, "h3", T + 2, &|| true)
+            .unwrap(),
+        done(0),
+        "nothing left to delete: it completes without asking"
+    );
+    assert_eq!(
         s.token_state(&cc()).unwrap().unwrap().pruned_at,
-        Some(T + 1)
+        Some(T + 2)
     );
 }
 
@@ -9680,18 +9734,22 @@ fn write_sighting(
     Ok(n > 0)
 }
 
-/// The index's generation check (spec §5.1, §13): `epoch` is the `token_epoch.at` the refresh
-/// read when it began. A full purge deletes that row, so a different one, or none, means the
-/// purge ran since, and the refresh's write would land in the emptied index.
-fn same_generation(c: &Connection, epoch: Option<i64>) -> Result<(), StoreError> {
-    let current: Option<i64> = c
-        .query_row(
-            "SELECT at FROM token_epoch ORDER BY rowid LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if current == epoch {
+/// The epoch's `at`: the index's generation (spec §5.1, §13). `None` after a full purge.
+fn current_generation(c: &Connection) -> rusqlite::Result<Option<i64>> {
+    c.query_row(
+        "SELECT at FROM token_epoch ORDER BY rowid LIMIT 1",
+        [],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// The index's generation check: `epoch` is what `Store::begin_token_refresh` gave the
+/// refresh. Every full purge deletes that row, and the next refresh to begin records a new
+/// one, so a missing or different row means a purge ran since, and the refresh's write would
+/// land in the emptied index.
+fn same_generation(c: &Connection, epoch: i64) -> Result<(), StoreError> {
+    if current_generation(c)? == Some(epoch) {
         Ok(())
     } else {
         Err(StoreError::TokenIndexPurged)
@@ -9756,17 +9814,45 @@ impl Store {
         Ok(rows)
     }
 
+    /// The start of a refresh, under its lock (spec §5.1): the index's generation, which every
+    /// batch and the completion of this refresh pass back. In one `IMMEDIATE` transaction it
+    /// creates the provider's `token_state` row if absent, and, when a full purge emptied
+    /// `token_epoch`, records the epoch anew at `now_ms` (spec §5.2 step 5) with
+    /// `seeded = 0`: the purge deleted the seeded launches, so coverage before it is not
+    /// complete (ruling R1). Every purge deletes the row, so each one starts a new generation.
+    pub fn begin_token_refresh(
+        &self,
+        provider: &ProviderId,
+        now_ms: i64,
+    ) -> Result<i64, StoreError> {
+        let mut c = self.lock();
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(ENSURE_STATE, [provider.as_str()])?;
+        let epoch = match current_generation(&tx)? {
+            Some(at) => at,
+            None => {
+                tx.execute(
+                    "INSERT INTO token_epoch (at, seeded) VALUES (?1, 0)",
+                    [now_ms],
+                )?;
+                now_ms
+            }
+        };
+        tx.commit()?;
+        Ok(epoch)
+    }
+
     /// One batch of a refresh (spec §5.2 step 4), in one `IMMEDIATE` transaction: upserts
     /// `rows` by the merge rule (spec §4), writes each of `files`, deletes the file rows at
     /// `removed`, and creates the provider's `token_state` row if absent. When a response was
     /// added or changed it sets `changed_at` to `now_ms`, and it adds the new responses to
-    /// `responses`. A response whose merge changes nothing is not written. `epoch` is the
-    /// `token_epoch.at` the refresh began with; when a full purge has run since, nothing is
+    /// `responses`. A response whose merge changes nothing is not written. `epoch` is what
+    /// `begin_token_refresh` gave the refresh; when a full purge has run since, nothing is
     /// written and the answer is `TokenIndexPurged`.
     pub fn commit_token_batch(
         &self,
         provider: &ProviderId,
-        epoch: Option<i64>,
+        epoch: i64,
         rows: &[UsageRow],
         files: &[TokenFileRow],
         removed: &[String],
@@ -9873,13 +9959,12 @@ impl Store {
     /// `files`, `skipped_lines` and `unreadable_files`, and on the provider's first completion
     /// `changed_at` too, which ends the index's partial state (spec §14). `stats.responses` is
     /// not written: `responses` is the index's own count, which each batch and prune keep.
-    /// A refresh that began after a full purge emptied `token_epoch` (`epoch` is `None`)
-    /// records the epoch anew at `now_ms`. Like a batch, it writes nothing and answers
-    /// `TokenIndexPurged` when the index's generation is no longer `epoch`.
+    /// Like a batch, it writes nothing and answers `TokenIndexPurged` when the index's
+    /// generation is no longer `epoch`, what `begin_token_refresh` gave the refresh.
     pub fn finish_token_refresh(
         &self,
         provider: &ProviderId,
-        epoch: Option<i64>,
+        epoch: i64,
         stats: &RefreshStats,
         now_ms: i64,
     ) -> Result<(), StoreError> {
@@ -9900,11 +9985,6 @@ impl Store {
                 to_sql(stats.unreadable_files),
             ],
         )?;
-        tx.execute(
-            "INSERT INTO token_epoch (at, seeded) SELECT ?1, 1 \
-             WHERE NOT EXISTS (SELECT 1 FROM token_epoch)",
-            [now_ms],
-        )?;
         tx.commit()?;
         Ok(())
     }
@@ -9916,10 +9996,13 @@ impl Store {
     /// one, the sightings that ended before the cutoff (those of every pruned session, but one
     /// still alive), and the launches that did, and sets `pruned_at`. Model names stay.
     ///
-    /// `stop` is asked before each chunk, so a refresh's budget and cancel reach a prune that a
-    /// retention cut made large. Stopped, the prune releases its lease and returns
-    /// `complete: false`: the next call goes on where it stopped. Another prune's lease, held
-    /// or spent today, is nothing to do: `complete: true` with nothing deleted.
+    /// `stop` is asked after each chunk that deleted something, before the next one, so a
+    /// refresh's budget and cancel reach a prune that a retention cut made large. A chunk that
+    /// deletes nothing moves straight on without asking: every call deletes something or
+    /// completes, so a prune stopped call after call still finishes. Stopped, the prune
+    /// releases its lease and returns `complete: false`: the next call goes on. Another
+    /// prune's lease, held or spent today, is nothing to do: `complete: true` with nothing
+    /// deleted.
     pub fn prune_tokens(
         &self,
         provider: &ProviderId,
@@ -9941,10 +10024,11 @@ impl Store {
         }
         let mut deleted = 0u64;
         // Phase 0 is the expired responses, then each of `PRUNE_CLEANUP`; every chunk is its own
-        // transaction, and `stop` is asked before each.
+        // transaction, and `stop` is asked only after one that deleted something.
         let mut phase = 0;
+        let mut progressed = false;
         loop {
-            if stop() {
+            if progressed && stop() {
                 self.exec(
                     "UPDATE leases SET expires_at = ?3 WHERE name = ?1 AND holder = ?2",
                     &[&lease, &holder, &now_ms],
@@ -9978,6 +10062,7 @@ impl Store {
             if last {
                 break;
             }
+            progressed = n > 0;
             if n < PRUNE_CHUNK {
                 phase += 1;
             }
@@ -10023,7 +10108,7 @@ impl Store {
             .optional()?)
     }
 
-    /// The epoch (spec §7.2); `None` after a full purge until a refresh completes.
+    /// The epoch (spec §7.2); `None` after a full purge until a refresh begins.
     pub fn token_epoch(&self) -> Result<Option<EpochRow>, StoreError> {
         Ok(self
             .lock()
@@ -10345,7 +10430,7 @@ git commit -m "Add the store API for the token index and evidence"
 1. **Dependency (adopted).** `tagteam-engine` gains `sha2.workspace = true` for `usage_key` (Task 14's head and tail hashes need it too). It is no new crate: the workspace already locks sha2 0.10.9 for `tagteam-core`, `tagteam-cc` and `xtask`, so `Cargo.lock` gains one line. The Global Constraints' "New dependencies: `jiff` only" holds in the sense of no new crate, but the constraint's wording does not mention this; record it if you want it explicit.
 2. **`RefreshStats.responses` is not an input (adopted).** Task 15 has no way to count the index's responses, so `token_state.responses` is kept by the store: each batch adds its `added`, each prune chunk subtracts what it deleted, and a purge deletes the row. `finish_token_refresh` ignores `stats.responses`. Spec §4 says "as of the last completed refresh" for `files`; the live count differs only mid-refresh. Recounting at completion instead cost 44–116 ms at a year's volume (1.55M responses) inside the write transaction, which would break the 100 ms "refresh with nothing new" budget (spec §1.1).
 3. **Prune deletes sightings by time (adopted).** Spec §4 says "then sessions with no rows and their sightings". This task deletes the sightings whose `last_at` is before the cutoff: those are every sighting of a pruned session, except one whose execution is still alive. That one still places the session's new responses. It also bounds sightings of sessions that never produced a response, which the spec's wording would keep forever. A sighting that ends before the cutoff covers only times before it, so no kept response loses evidence.
-4. **Prune runs in chunks, and stops when asked.** It runs as several transactions: the lease, chunks of 5,000 deleted responses (each moving `changed_at` and subtracting its count when it deletes any), then sessions, sightings, launches and `pruned_at`. A prune that a retention change makes large (365 → 30 days at a year's volume: about 1.4M rows) never holds the write lock for long, and `stop` lets a refresh's budget and cancel end it between chunks: it releases its lease and the next refresh goes on (`a_stopped_prune_resumes_on_the_next_call_and_completes`). If it fails part-way, every committed chunk is already visible through `changed_at` (`a_prune_that_fails_part_way_still_moves_changed_at`, which makes the last transaction fail with a trigger), and the next day's prune finishes it.
+4. **Prune runs in chunks, and stops when asked.** It runs as several transactions: the lease, chunks of 5,000 deleted responses (each moving `changed_at` and subtracting its count when it deletes any), then sessions, sightings, launches and `pruned_at`. A prune that a retention change makes large (365 → 30 days at a year's volume: about 1.4M rows) never holds the write lock for long, and `stop` lets a refresh's budget and cancel end it between chunks: it releases its lease and the next refresh goes on. `stop` is asked only after a chunk that deleted something, so every call deletes something or completes, and a prune stopped at every ask still finishes (`a_stopped_prune_resumes_on_the_next_call_and_completes`, `the_cleanup_after_the_responses_stops_and_resumes_too`). Asked before every chunk, a budget that allows one chunk per call would spend it on the empty responses phase each time and never reach the cleanup. If it fails part-way, every committed chunk is already visible through `changed_at` (`a_prune_that_fails_part_way_still_moves_changed_at`, which makes the last transaction fail with a trigger), and the next day's prune finishes it.
 5. **Performance at a year's volume** (release, 1.55M responses; this task's API):
    - 30-day `token_usage`: 110 ms for 127k rows. The SQL is about 18 ms; the rest is `String` allocation per row (session id, project, model).
    - `token_models`: 45 µs. `token_span`: 6 ms. `token_state` and `evidence_changed_at`: under 0.5 ms.
@@ -10353,7 +10438,7 @@ git commit -m "Add the store API for the token index and evidence"
 
    Task 18's 200 ms query budget therefore has about 90 ms left for attribution and grouping at a year's volume. Task 15 may want batches smaller than 2,000 once the index is large.
 6. `delete_provider_rows` deletes the provider's cascade of responses in one transaction (it is the spec's single purge transaction). At a year's volume that is seconds of write lock, acceptable for an explicit `purge --provider`. Task 17 holds the tokens lock around it.
-7. **Purge generation (fix after plan review).** A full purge locks the tokens locks of the providers it knows about. A refresh of a provider that has no rows yet (from another build, say) could still commit batches after `empty_all` and leave a partial index. The epoch row is the generation: `commit_token_batch` and `finish_token_refresh` take the `epoch` the refresh read when it began and refuse with `TokenIndexPurged`, writing nothing, when the store's differs (`a_batch_after_a_full_purge_is_refused`, `a_finish_after_a_full_purge_is_refused`). `purge --provider` keeps the epoch, so it needs no generation: Task 17's per-provider tokens lock already serializes it with that provider's refresh.
+7. **Purge generation (fix after plan review).** A full purge locks the tokens locks of the providers it knows about. A refresh of a provider that has no rows yet (from another build, say) could still commit batches after `empty_all` and leave a partial index. The epoch row is the generation: `begin_token_refresh` returns it, creating a new one when a purge left none, and `commit_token_batch` and `finish_token_refresh` take that value and refuse with `TokenIndexPurged`, writing nothing, when the stored row is missing or differs (`begin_creates_a_new_generation_after_each_purge`, `a_batch_after_a_full_purge_is_refused`, `a_finish_after_a_full_purge_is_refused`). An absent row is never a generation, so a refresh begun before two purges cannot pass the check against an empty table. `finish_inserts_an_epoch_after_a_full_purge` became `begin_creates_a_new_generation_after_each_purge`, since `begin` now records the epoch, unseeded. `purge --provider` keeps the epoch, so it needs no generation: Task 17's per-provider tokens lock already serializes it with that provider's refresh.
 8. **`run`'s exit write is exact (fix after plan review).** `set_sighting_last_at` sets `last_at = max(first_at, exit)` even when that moves it back, since a poll in flight may have stamped a later instant just before the poller stopped; it writes nothing when the end is already that value (`run_s_exit_sets_the_end_back_or_forward_never_before_the_start`).
 
 ---
@@ -12218,12 +12303,12 @@ git commit -m "Add the incremental transcript file reader"
 - Consumes:
   - Task 7: `pub struct UsageLine { pub message_id: String, pub request_id: String, pub session_id: String, pub at_ms: i64, pub model: String, pub project: Option<String>, pub sidechain: bool, pub counts: TokenCounts, pub speed: Option<String>, pub final_line: bool }` (re-exported as `tagteam_provider::UsageLine`); `Capabilities.transcripts`; `Provider::transcript_files(&self, env: &Env) -> io::Result<Vec<PathBuf>>`; `Provider::parse_usage_line(&self, line: &[u8]) -> Result<Option<UsageLine>, LineError>`.
   - Task 2: `TokenCounts::merge_max(&mut self, other: &TokenCounts)`.
-  - Task 12 (`crate::store`): `TokenFileRow`; `UsageRow { key, session_id, project, at_ms, model, sidechain, counts, speed, finalized }`; `BatchOutcome { added, updated }`; `RefreshStats { files, responses, skipped_lines, unreadable_files }`; `TokenStateRow`; `usage_key(provider, message_id, request_id) -> i64`; `Store::{token_files, commit_token_batch, finish_token_refresh, prune_tokens, token_state, token_usage}`.
-  - Task 12's `prune_tokens(&self, provider, cutoff_ms, holder, now_ms, stop: &dyn Fn() -> bool) -> Result<PruneOutcome { deleted: u64, complete: bool }, StoreError>`. It asks `stop` before each chunk, the first included, and an early stop releases the daily lease. This task's `stop` lets the first chunk of each call through, so every call makes progress (note 3).
-  - Task 12's purge generation (plan review round 2):
-    - `commit_token_batch(&self, provider, epoch: Option<i64>, rows, files, removed, now_ms)` and `finish_token_refresh(&self, provider, epoch: Option<i64>, stats, now_ms)`;
-    - both refuse with `StoreError::TokenIndexPurged` when `token_epoch`'s `at` differs from `epoch`;
-    - `Store::token_epoch() -> Result<Option<EpochRow { at, seeded }>, StoreError>`.
+  - Task 12 (`crate::store`): `TokenFileRow`; `UsageRow { key, session_id, project, at_ms, model, sidechain, counts, speed, finalized }`; `BatchOutcome { added, updated }`; `RefreshStats { files, responses, skipped_lines, unreadable_files }`; `TokenStateRow`; `usage_key(provider, message_id, request_id) -> i64`; `Store::{token_files, begin_token_refresh, commit_token_batch, finish_token_refresh, prune_tokens, token_state, token_usage}`.
+  - Task 12's `prune_tokens(&self, provider, cutoff_ms, holder, now_ms, stop: &dyn Fn() -> bool) -> Result<PruneOutcome { deleted: u64, complete: bool }, StoreError>`. It asks `stop` only before a chunk that follows one that deleted rows, so every call deletes some or completes, whatever the budget (note 3); an early stop releases the daily lease.
+  - Task 12's purge generation (plan review rounds 2 and 3):
+    - `begin_token_refresh(&self, provider, now_ms) -> Result<i64, StoreError>`: `token_epoch.at`, inserting `(now_ms, seeded 0)` first when a purge left no row;
+    - `commit_token_batch(&self, provider, epoch: i64, rows, files, removed, now_ms)` and `finish_token_refresh(&self, provider, epoch: i64, stats, now_ms)`;
+    - both refuse with `StoreError::TokenIndexPurged`, writing nothing, when the `token_epoch` row is missing or its `at` differs from `epoch`.
   - Task 12's semantics this task relies on:
     - `token_state.responses` is the store's own live count, kept by each batch and prune;
     - `finish_token_refresh` writes `files`, `skipped_lines` and `unreadable_files`, and creates the provider's `token_state` row if absent;
@@ -12902,7 +12987,7 @@ fn plant_expired(engine: &Engine, p: &ProviderId, n: usize) {
         })
         .collect();
     let store = engine.store().unwrap();
-    let epoch = store.token_epoch().unwrap().map(|e| e.at);
+    let epoch = store.begin_token_refresh(p, NOW).unwrap();
     store
         .commit_token_batch(p, epoch, &rows, &[], &[], NOW - 400 * DAY)
         .unwrap();
@@ -12914,7 +12999,8 @@ fn a_purge_mid_refresh_aborts_the_refresh_without_rewriting() {
     // Spec §5.1, §13: a full purge locks the providers with token rows when it starts. A refresh
     // of one that had none then may still be running. Once the purge has emptied the index, the
     // refresh's next write is refused, as written under a purge generation that is gone, and the
-    // refresh ends without rewriting a row. The next one starts clean.
+    // refresh ends without rewriting a row. A refresh that begins a new generation after it is
+    // refused the same way by a second purge. The next one starts clean.
     use std::sync::atomic::{AtomicBool, Ordering};
     use tagteam_engine::EngineError;
     use tagteam_engine::store::StoreError;
@@ -12963,6 +13049,41 @@ fn a_purge_mid_refresh_aborts_the_refresh_without_rewriting() {
     assert!(store.token_files(&p).unwrap().is_empty());
     assert_eq!(store.token_state(&p).unwrap(), None);
 
+    // The next refresh begins a new generation, and a second purge lands before its first batch:
+    // that batch is refused too.
+    let other = ffx.fx.engine.store().unwrap();
+    let again = Arc::new(AtomicBool::new(false));
+    let again_cb = again.clone();
+    ffx.engine.also_on_point(
+        "refresh-tokens-locked",
+        Box::new(move || {
+            if !again_cb.swap(true, Ordering::SeqCst) {
+                other.empty_all().unwrap();
+            }
+        }),
+    );
+    let err = ffx
+        .engine
+        .refresh_tokens(
+            &p,
+            Wait::Wait,
+            None,
+            &Cancel::new(),
+            &mut |_: &IndexProgress| {},
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::Store(StoreError::TokenIndexPurged)),
+        "{err:?}"
+    );
+    assert!(again.load(Ordering::SeqCst));
+    assert!(
+        rows(&ffx.engine, &p).is_empty(),
+        "no row written after the second purge"
+    );
+    assert!(store.token_files(&p).unwrap().is_empty());
+    assert_eq!(store.token_state(&p).unwrap(), None);
+
     let report = refresh(&ffx.engine, &p);
     assert!(report.complete);
     assert_eq!(
@@ -12975,7 +13096,8 @@ fn a_purge_mid_refresh_aborts_the_refresh_without_rewriting() {
 fn a_budgeted_prune_goes_on_over_several_calls() {
     // Spec §4 Retention, §5.2 Budget: the prune that ends a refresh stops with the budget, as
     // reading does. The refresh is then incomplete, and the next call goes on with the prune.
-    // 12,001 rows are more than one of the store's prune chunks.
+    // Even under a zero budget every call deletes some or completes: the store asks `stop` only
+    // after a chunk that deleted rows. 12,001 rows are more than one of the store's prune chunks.
     let ffx = FakeFx::new();
     let p = ffx.fake_provider();
     plant_expired(&ffx.engine, &p, 12_001);
@@ -12983,7 +13105,7 @@ fn a_budgeted_prune_goes_on_over_several_calls() {
     let mut calls = 0;
     loop {
         calls += 1;
-        assert!(calls <= 10, "every call prunes some");
+        assert!(calls <= 10, "every call deletes some or completes");
         let RefreshOutcome::Done(report) = ffx
             .engine
             .refresh_tokens(
@@ -13002,7 +13124,9 @@ fn a_budgeted_prune_goes_on_over_several_calls() {
             assert_eq!(now, 0);
             break;
         }
-        assert!(now > 0 && now < left, "{now} of {left} left");
+        // Responses while any are left; after them the cleanup phases (the sessions the
+        // responses left empty), which these rows do not show.
+        assert!(now < left || left == 0, "{now} of {left} left");
         let state = ffx
             .engine
             .store()
@@ -13027,7 +13151,8 @@ fn a_cancelled_prune_reports_interrupted() {
     let p = ffx.fake_provider();
     plant_expired(&ffx.engine, &p, 12_001);
     let cancel = Cancel::new();
-    // Nothing to read: the token is set as the refresh starts, and the prune is what meets it.
+    // Nothing to read: the token is set as the refresh starts, and the prune is what meets it,
+    // after its first chunk (the store asks `stop` only once a chunk has deleted rows).
     let err = ffx
         .engine
         .refresh_tokens(&p, Wait::Wait, None, &cancel, &mut |_: &IndexProgress| {
@@ -13241,7 +13366,6 @@ Replace `crates/tagteam-engine/src/tokens/refresh.rs` above its `#[cfg(test)] mo
 //! scoped workers read one file at a time, each holding one chunk; one writer, on the calling
 //! thread, commits their lines in batches, with the offsets just past them.
 
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -13510,9 +13634,9 @@ struct Writer<'a> {
     engine: &'a Engine,
     store: &'a Store,
     provider: &'a ProviderId,
-    /// The purge generation the refresh started under: a batch written after a purge emptied
-    /// the index is refused (`TokenIndexPurged`).
-    epoch: Option<i64>,
+    /// The purge generation the refresh began: a batch written after a purge emptied the index
+    /// is refused (`TokenIndexPurged`).
+    epoch: i64,
     batch: Batch,
     tally: Tally,
     total: IndexProgress,
@@ -13686,12 +13810,13 @@ impl Engine {
                 e => EngineError::Lock(e),
             })?,
         };
-        hooks::point(self, "refresh-tokens-locked")?;
         let store = self.store()?;
-        // The purge generation the refresh reads under (spec §13). A full purge that started
-        // before this provider had token rows does not wait for its lock; once it has emptied
-        // the index, every later write of this refresh is refused, and the next one starts clean.
-        let epoch = store.token_epoch()?.map(|e| e.at);
+        // The purge generation the refresh writes under (spec §13), begun anew when a purge left
+        // none. A full purge that started before this provider had token rows does not wait for
+        // its lock; once it has emptied the index, every later write of this refresh is refused,
+        // and the next one begins a generation of its own.
+        let epoch = store.begin_token_refresh(provider, self.now_ms())?;
+        hooks::point(self, "refresh-tokens-locked")?;
         let retention = i64::from(self.settings.tokens_retention_days).saturating_mul(DAY_MS);
         let cutoff_ms = self.now_ms().saturating_sub(retention);
         let (jobs, removed, unreadable) =
@@ -13756,12 +13881,10 @@ impl Engine {
         if complete {
             // Step 5. The prune stops with the budget or the cancel token, as reading does, and
             // a prune left unfinished leaves the refresh incomplete, so the next call goes on.
-            // The store asks `stop` before each chunk; the first chunk of a call is let through
-            // whatever the budget, so every call makes progress (spec §5.2 Budget). The cancel
-            // token stops it at once.
+            // The store asks `stop` only once a chunk has deleted rows, so every call deletes
+            // some or completes (spec §5.2 Budget).
             let holder = uuid::Uuid::now_v7().to_string();
-            let first = Cell::new(true);
-            let stop = || cancel.requested().is_some() || (!first.replace(false) && past(deadline));
+            let stop = || past(deadline) || cancel.requested().is_some();
             complete = store
                 .prune_tokens(provider, cutoff_ms, &holder, self.now_ms(), &stop)?
                 .complete;
@@ -13894,8 +14017,8 @@ git commit -m "Add the incremental token index refresh"
 2. **Step 1 runs before the lock.** Spec §5.1 says sightings are written without the tokens lock, and running the scan first keeps that lock a strict leaf: nothing, not even a reservation probe, is taken while it is held. `Wait::Try` therefore scans, then returns `Busy`. The scan takes a few ms of small reads.
 3. **Step 5 prunes before it finishes**, so `files` and the stored `responses` describe what stays. The outline put finish first; the spec only says "Prune if due".
    - **The prune is budgeted and cancellable (plan review).** It stops early when the deadline passes or the cancel token is set. If it stops early, the refresh returns `complete: false` without finishing, so the daemon runs it again at once; if the cancel token stopped it, the refresh returns the interruption.
-   - **Every call still makes progress.** Task 12's `prune_tokens` asks `stop` before each chunk, the first included. With a zero budget, or a slice whose reading used up its budget, a plain `past(deadline)` would delete nothing on every call, and no such refresh could ever complete. So the refresh's `stop` lets the first chunk of each call through whatever the budget (a `Cell` flag), and stops at once only for the cancel token. A slice therefore overruns its budget by at most one prune chunk, as it does by one line when reading.
-   - I verified this in the scratch crate with a stand-in store that asks `stop` exactly as Task 12 does. Without the flag, the budgeted-prune and zero-budget tests fail; with it, they pass, 28 of 28, 3 runs out of 3.
+   - **Every call still makes progress (plan review round 3).** Task 12's `prune_tokens` asks `stop` only before a chunk that follows one that deleted rows. Under a zero budget, or in a slice whose reading used up its budget, every call therefore deletes some or completes, and a prune with nothing due completes without asking. So the refresh's `stop` is a plain `past(deadline) || cancel.requested().is_some()`. The `Cell` first-chunk flag of round 1 is gone: under the cleanup phases, Task 12's earlier ask-before-every-chunk would have stopped every zero-budget call after an empty first chunk, so the flag no longer guaranteed progress. A slice overruns its budget by at most one prune chunk, as it does by one line when reading, and a cancel set before the prune lets one chunk run.
+   - I verified this in the scratch crate with a stand-in store that prunes as Task 12 does: the responses, then the cleanup phases (sessions left empty, sightings, launches), and `stop` asked only after a chunk that deleted rows. The budgeted prune of 12 rows in chunks of 5 takes 5 calls: 5, 5, then 2 responses, then the emptied session, then completion. Every zero-budget test passes, 29 of 29, 3 runs out of 3.
    - Tests: `a_budgeted_prune_goes_on_over_several_calls` and `a_cancelled_prune_reports_interrupted`, each over 12,001 expired rows. That is more than one prune chunk at Task 12's `PRUNE_CHUNK` of 5,000; it has no test constructor, so the tests size the rows instead.
    - **The budget starts after discovery and after the lock is held (plan review).** Spec §5.2 leaves discovery unbudgeted, and the wait for the lock is not reading.
 4. **In-batch merge.** The writer merges lines of one response within a batch by spec §2.2's rule, using Task 2's `merge_max`. Task 12's `commit_token_batch` merges too, so this is about sizing: `BATCH_ROWS` counts distinct responses, and fewer rows cross into the transaction for CC's up-to-9-lines-per-response pattern.
@@ -13907,13 +14030,13 @@ git commit -m "Add the incremental token index refresh"
    - Task 7 re-exports `UsageLine` at `tagteam_provider::UsageLine`.
    - The CC fixture test uses retention 3,650 days, because the fixtures' dates are unknown here.
    - **Logging (Task 22).** The refresh logs one `info` summary under its module's target, `tagteam_engine::tokens::refresh`, which falls under `tagteam_engine::tokens`. The summary carries the provider, completeness, counts and `took_ms`. Transcript paths appear only at `debug`, and content never does (spec §13). Each batch also logs a `debug` line with counts.
-10. **Purge generation (plan review round 2).** A full purge locks the providers that have token rows when it starts, so a refresh of a provider with none yet can still be running when it empties the index.
-    - The refresh reads `store.token_epoch()?.map(|e| e.at)` once, after taking its lock, and passes it to every `commit_token_batch` and to `finish_token_refresh`.
-    - Once a purge has emptied the index (`token_epoch` gone), the next write is refused with `StoreError::TokenIndexPurged`. The writer returns that error, the workers stop, nothing more is written, and the refresh ends with `EngineError::Store`. The next refresh reads no epoch, writes under none, and starts clean, since the purge emptied `token_files` too.
-    - The writer passes a hook point, `refresh-tokens-committed`, after each committed batch. `a_purge_mid_refresh_aborts_the_refresh_without_rewriting` uses it to empty the store, through another engine's connection, right after the first of at least two batches (2,500 responses; a batch holds 2,000). The next batch is then refused, and the test asserts the error, an empty index, and a clean next refresh. It is deterministic: no timing decides which batch meets the purge.
-    - Verified in the scratch crate, with a stand-in store that refuses on an epoch mismatch: 29 of 29, 3 runs out of 3.
+10. **Purge generation (plan review rounds 2 and 3).** A full purge locks the providers that have token rows when it starts, so a refresh of a provider with none yet can still be running when it empties the index.
+    - The refresh calls `store.begin_token_refresh(provider, now)?` once, after taking its lock, and passes the generation it returns to every `commit_token_batch` and to `finish_token_refresh`. A refresh that begins after a purge thereby records a new generation before its first write, so a second purge removes that one too.
+    - Once a purge has emptied the index (`token_epoch` gone), the next write is refused with `StoreError::TokenIndexPurged`. The writer returns that error, the workers stop, nothing more is written, and the refresh ends with `EngineError::Store`. The next refresh begins a generation of its own and starts clean, since the purge emptied `token_files` too.
+    - The writer passes a hook point, `refresh-tokens-committed`, after each committed batch. `a_purge_mid_refresh_aborts_the_refresh_without_rewriting` uses it to empty the store, through another engine's connection, right after the first of at least two batches (2,500 responses; a batch holds 2,000). The next batch is then refused. A second refresh then begins a new generation, and the test empties the store again at `refresh-tokens-locked`, which now follows `begin_token_refresh`, so that refresh's first batch is refused as well. The test asserts the error and an empty index each time, and a clean third refresh. It is deterministic: hook points, not timing, decide which write meets each purge. Without `begin_token_refresh` (a refresh writing under "no generation"), the second phase would be accepted, and the test fails.
+    - Verified in the scratch crate, with a stand-in store whose generation `begin_token_refresh` records and `empty_all` removes, and whose writes refuse a missing or different one: 29 of 29, 3 runs out of 3.
 11. **Deterministic lock tests (plan review).**
-    - `refresh_with` passes two hook points, `refresh-tokens-lock` immediately before taking the lock and `refresh-tokens-locked` immediately after.
+    - `refresh_with` passes two hook points, `refresh-tokens-lock` immediately before taking the lock and `refresh-tokens-locked` once it holds it and has called `begin_token_refresh` (round 3: neither of those can be interrupted, so the lock test is unchanged).
     - `a_waiting_refresh_never_passes_the_lock_while_another_holds_it` (feature `test-hooks`) holds the lock and waits on a channel for the first point, then sets the cancel token. The refresh must return the interruption without ever reaching the second point. Were the lock acquisition removed, nothing between the two points could be interrupted, so the test would fail deterministically.
     - Once the lock is released, the next refresh reaches the second point, and `try_lock` there finds the lock held.
     - The Try test asserts `Busy` with no elapsed-time check. No functional test here asserts elapsed time; timing belongs to Task 23's `#[ignore]` tests.
@@ -13933,6 +14056,8 @@ git commit -m "Add the incremental token index refresh"
     - Try without timing;
     - a budgeted prune over 3 calls;
     - a cancelled prune.
+
+    After plan review round 3, the stand-in store took Task 12's new semantics: `begin_token_refresh` and an `i64` generation, and a phased prune that asks `stop` only after a chunk that deleted rows. The `Cell` flag was removed and the purge test gained its second phase. The re-run was clippy-clean, 29 of 29, 3 runs out of 3; the budgeted prune now takes 5 calls (note 3).
 
     I did **not** compile this task's two test files (`tests/tokens_refresh.rs` and the unit test against FakeAgent) against the real engine, Task 10's fake, or Task 8's CC fixture tree.
 
@@ -14199,6 +14324,46 @@ fn a_scan_closes_launches_of_idle_profiles_only() {
     fx.clock.advance_ms(1_000);
     assert_eq!(sight(&fx), 1, "a's launch closes once its session is gone");
     assert!(ended(&fx).iter().all(|(_, end)| end.is_some()));
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_scan_closes_a_launch_at_its_idle_check_not_at_its_start() {
+    // Spec §6.1: a launch closes at the moment its profile is found idle. A child of a killed
+    // `run` that answers once more after the scan began, then exits before the scan checks its
+    // profile, keeps that response inside its launch: the launch ends at the check.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    fx.engine.open_launch(&cc, &a).unwrap();
+    running(&fx, 101, None);
+    record(&fx, &profile, 101, "s-a", NOW, "interactive");
+    // Between the scan's sightings and the check of the launch's profile, 5 s pass, and the
+    // child answers and exits.
+    let (clock, process) = (fx.clock.clone(), fx.process.clone());
+    fx.engine.on_point(
+        "scan-launch-check",
+        Box::new(move || {
+            clock.advance_ms(5_000);
+            process.set(
+                101,
+                FakeProcess {
+                    exists: Some(false),
+                    ..FakeProcess::default()
+                },
+            );
+        }),
+    );
+
+    assert_eq!(sight(&fx), 2, "s-a's sighting, and the launch closed");
+    let scan = SightingSource::Scan;
+    assert_eq!(
+        sightings(&fx),
+        [sighting("s-a", a.as_str(), NOW, NOW, scan, NOW)],
+        "the scan saw the child live as it began"
+    );
+    assert_eq!(ended(&fx), [(a.to_string(), Some(NOW + 5_000))]);
 }
 
 #[test]
@@ -14491,6 +14656,28 @@ fn close_stamps_the_sighting_at_the_exit_not_at_the_close() {
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
+fn close_ends_the_launch_at_its_idle_check() {
+    // Spec §6.1: as in the scan, the launch ends when the close finds the profile idle, not when
+    // the close began.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let clock = fx.clock.clone();
+    fx.engine.on_point(
+        "close-launch-check",
+        Box::new(move || clock.advance_ms(5_000)),
+    );
+
+    fx.engine
+        .close_launch(&id, &profile, &LaunchPoll::default(), NOW)
+        .unwrap();
+    assert_eq!(ended(&fx), [(a.to_string(), Some(NOW + 5_000))]);
+}
+
+#[test]
 fn the_statusline_extends_only_its_own_execution() {
     // Spec §6.3: the statusline finds the Claude Code process it runs under among its
     // ancestors, by that process's record in the home, and writes that execution's sighting.
@@ -14682,6 +14869,7 @@ use tagteam_provider::{
 
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::hooks;
 use crate::store::{SightingRow, SightingSource};
 use crate::views::CACHE_WRITE_WAIT;
 
@@ -14723,12 +14911,14 @@ impl Engine {
     }
 
     /// `sight_sessions`, and a refresh's step 1 (spec §5.2): the scan of spec §6.2, then every
-    /// open launch whose profile is no longer in use is closed, now (spec §6.1). A late close
+    /// open launch whose profile is no longer in use is closed at the moment it is found so
+    /// (spec §6.1). Each time is read after the check it records, never at the scan's start: a
+    /// child of a killed `run` that answers once more while the scan runs, then exits before
+    /// its profile is checked, leaves no response past its launch's end. A late close
     /// over-covers, which can only leave a response unattributed, never misplace it.
     pub(crate) fn scan_sessions(&self, p: &dyn Provider) -> Result<u64, EngineError> {
         let provider = p.id();
         let store = self.store()?;
-        let now = self.now_ms();
         let mut changed = 0;
         for (home, dir) in self.homes(p) {
             let Read::Present(entries) = read_session_records(&dir) else {
@@ -14747,6 +14937,7 @@ impl Engine {
                 if !record_is_live(self.process.as_ref(), &r, p.launch_command()) {
                     continue;
                 }
+                let now = self.now_ms();
                 let row = SightingRow {
                     session_id,
                     home: home.clone(),
@@ -14765,10 +14956,12 @@ impl Engine {
                 continue;
             }
             let account = AccountId::from_string(launch.account_id.as_str());
+            hooks::point(self, "scan-launch-check")?;
             if !self
                 .session_state_at(p, &profile_path(&self.env, &account))
                 .owned()
             {
+                let now = self.now_ms();
                 store.close_launch(&provider, &launch.account_id, launch.started_at, now, now)?;
                 changed += 1;
             }
@@ -14899,13 +15092,14 @@ impl Engine {
 
     /// Spec §6.1, at the child's exit: the sighting it saw last ends exactly at `exited_at_ms`,
     /// when the child exited, moved back as well as forward, since a poll in flight as the child
-    /// exited may have stamped it later. The launch closes now unless the profile is still in
-    /// use (`session_state_at`). `run` calls it after `finish_run`, once its own launch
-    /// reservation is released, so the profile reads idle when nothing else runs there. Only the
-    /// launch may close late, which over-covers; the sighting never outlasts the child, so exit
-    /// handling that waits on locks cannot stretch it over a resume elsewhere. A background
-    /// session the child started, or another launcher's reservation, keeps the launch open, and
-    /// the next scan that finds the profile idle closes it.
+    /// exited may have stamped it later. The launch closes at the moment the profile is found
+    /// idle (`session_state_at`), read after that check, unless it is still in use. `run` calls
+    /// it after `finish_run`, once its own launch reservation is released, so the profile reads
+    /// idle when nothing else runs there. Only the launch may close late, which over-covers; the
+    /// sighting never outlasts the child, so exit handling that waits on locks cannot stretch it
+    /// over a resume elsewhere. A background session the child started, or another launcher's
+    /// reservation, keeps the launch open, and the next scan that finds the profile idle closes
+    /// it.
     pub fn close_launch(
         &self,
         id: &LaunchId,
@@ -14915,7 +15109,6 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let p = self.provider(&id.provider)?;
         let store = self.store()?;
-        let now = self.now_ms();
         if let Some((session_id, first_at)) = &state.last_sighting {
             store.set_sighting_last_at(
                 &id.provider,
@@ -14923,10 +15116,12 @@ impl Engine {
                 id.account.as_str(),
                 *first_at,
                 exited_at_ms,
-                now,
+                self.now_ms(),
             )?;
         }
+        hooks::point(self, "close-launch-check")?;
         if !self.session_state_at(p.as_ref(), profile).owned() {
+            let now = self.now_ms();
             store.close_launch(
                 &id.provider,
                 id.account.as_str(),
@@ -15026,9 +15221,10 @@ impl Engine {
 
 ```
 cargo test -p tagteam-engine --locked --test tokens_evidence
+cargo test -p tagteam-engine --locked --features test-hooks --test tokens_evidence
 ```
 
-Expected: `test result: ok. 12 passed; 0 failed`.
+Expected: `test result: ok. 12 passed; 0 failed` without the feature, and `test result: ok. 14 passed; 0 failed` with it: the two idle-check tests need the engine's hook points.
 
 - [ ] **Step 5: Lint**
 
@@ -15057,7 +15253,7 @@ git commit -m "Record session evidence from scans, run launches and the statusli
    - If `finish_run` could not take its locks and left the reservation held until the process exits, the launch stays open and the next scan closes it. A late close over-covers, which can only leave a response unattributed (spec §6.1).
    - `open_launch` must be called while `run` holds its reservation. It does: `run_session` receives `launched.reservation` before `spawn_session`. Otherwise a scan between the two would close the launch at once.
    - **`close_launch` takes `exited_at_ms` (plan review; the signature changed, and so did the contract line in "Shared interfaces").**
-     - `run` reads `engine.now_ms()` right after its wait returns and passes it. The last sighting ends then, and the launch's `ended_at` is the close's own now, set only when the profile is idle.
+     - `run` reads `engine.now_ms()` right after its wait returns and passes it. The last sighting ends then, and the launch's `ended_at` is the moment the close finds the profile idle (note 9), set only then.
      - Otherwise exit handling that waits on locks would stretch a positive sighting past the child's exit and over a resume elsewhere. Spec §6.1 allows a late launch close, which only over-covers, but not a late sighting.
      - Task 12's `set_sighting_last_at` sets `last_at` to exactly `max(first_at, exited_at_ms)`, back as well as forward (plan review round 2). So a poll in flight as the child exited, which stamped the sighting later, is undone by the close.
      - Pinned by `close_stamps_the_sighting_at_the_exit_not_at_the_close`, which covers that late poll. Task 21 adapts its call.
@@ -15075,6 +15271,14 @@ git commit -m "Record session evidence from scans, run launches and the statusli
    - `session_state_at` and `CACHE_WRITE_WAIT`.
 
    Results: clippy `-D warnings` was clean and rustfmt was clean; the text above is the formatted code. Task 15's refresh tests also passed with this `scan_sessions` wired in. After the plan review's changes (the poll's three checks, `close_launch`'s `exited_at_ms`), the same check is still clean. I did **not** run `tests/tokens_evidence.rs`, which needs the real engine with Tasks 7 and 12; rustfmt parsed and formatted it. No test here asserts elapsed time (plan review): the busy-store test asserts only that the call succeeds and writes nothing.
+9. **Every time is read after the check it records (plan review round 3).**
+   - The scan used to read one `now` at its start and close every idle launch with it. Suppose a surviving child of a killed `run` answers after that read and exits before its profile's idle check. The launch then ended before that response, which no sighting covers, so it fell to the default home. Spec §6.1 closes a launch "at that moment".
+   - So the scan reads the close's time per launch, after `session_state_at` finds the profile idle. `close_launch` does the same for `ended_at`; its sighting's `recorded_at` is read at that write. A scan sighting's `last_at` is read once its record is found live, which is the same rule, so a sighting never ends before the check that saw it.
+   - Two hook points make this testable: `scan-launch-check` before each open launch's idle check in the scan, and `close-launch-check` before `close_launch`'s check.
+     - `a_scan_closes_a_launch_at_its_idle_check_not_at_its_start` uses the first: it advances the fixture's clock 5 s and ends the child there, between the scan's sightings and the check. It asserts the sighting at the scan's start and `ended_at` at the check.
+     - `close_ends_the_launch_at_its_idle_check` uses the second the same way.
+     - Both need `test-hooks`, so Step 4 runs both ways (12 and 14 tests). They are deterministic: the hook, not timing, moves the clock.
+   - Verified in the scratch crate, whose stand-in store now records launches. A check over both paths passes with this code, 30 of 30, 3 runs out of 3. Against the old timing, with only the hook points added, it fails: `ended_at` comes out at the scan's start, `NOW` instead of `NOW + 5_000`. The plan's `evidence.rs` matches the scratch copy except for the provider import.
 
 ---
 
@@ -15092,7 +15296,7 @@ git commit -m "Record session evidence from scans, run launches and the statusli
 - Consumes:
   - Task 14: `pub fn tokens_lock_path(env: &Env, provider: &ProviderId) -> PathBuf`.
   - Task 12: `Store::delete_provider_rows`, which also deletes `token_files`, `token_sessions` (cascading `token_usage`), `session_sightings`, `run_launches`, `active_history` and `token_state` for the provider. Also `Store::empty_all` (existing; it empties every table).
-  - Task 12 (tests): `Store::{commit_token_batch, record_sighting, open_launch, token_epoch}`, `UsageRow`, `TokenFileRow`, `SightingRow`, `SightingSource`, `usage_key`. `commit_token_batch` takes the `epoch` read from `token_epoch()` (plan review round 2).
+  - Task 12 (tests): `Store::{begin_token_refresh, commit_token_batch, record_sighting, open_launch, token_epoch}`, `UsageRow`, `TokenFileRow`, `SightingRow`, `SightingSource`, `usage_key`. `commit_token_batch` takes the `epoch: i64` that `begin_token_refresh` returns (plan review rounds 2 and 3).
   - Task 2 (tests): `tagteam_core::tokens::TokenCounts`.
   - Existing: `FlockGuard::lock`, `LockError`, `Cancel`, `EngineError::signal`, `crate::hooks::point`, and `Engine::{on_point, also_on_point, cancel}` (feature `test-hooks`).
 - Produces:
@@ -15204,7 +15408,7 @@ fn plant_token_rows(fx: &Fx, provider: &ProviderId) {
         head_hash: [0; 8],
         tail_hash: [0; 8],
     };
-    let epoch = store.token_epoch().unwrap().map(|e| e.at);
+    let epoch = store.begin_token_refresh(provider, now).unwrap();
     store
         .commit_token_batch(provider, epoch, &[usage], &[file], &[], now)
         .unwrap();
@@ -15774,7 +15978,7 @@ git commit -m "Make purge wait for a running token refresh"
    - I checked the `UNION` query with `sqlite3` against Task 11's step-3 schema as extracted from this plan.
    - A registered provider without `transcripts` gets a lock file it never uses, which is harmless.
    - A `--provider P` purge takes P's lock only.
-   - **One gap remains, closed by the purge generation (plan review round 2).** A provider with no token rows when the purge snapshots `token_providers()` is not locked, so its refresh may still be running. Its writes after `empty_all` are refused (`StoreError::TokenIndexPurged`), because they carry the `token_epoch` the refresh started under and `empty_all` deleted it (Task 12, Task 15 note 10). This task's test helper passes that epoch to `commit_token_batch` too.
+   - **One gap remains, closed by the purge generation (plan review round 2).** A provider with no token rows when the purge snapshots `token_providers()` is not locked, so its refresh may still be running. Its writes after `empty_all` are refused (`StoreError::TokenIndexPurged`), because they carry the generation its `begin_token_refresh` returned and `empty_all` deleted it (Task 12, Task 15 note 10). This task's test helper gets its generation from `begin_token_refresh` too (plan review round 3).
 6. **Deterministic lock tests (plan review).**
    - `hold_tokens_locks` passes two hook points, `purge-tokens-lock` immediately before the wait and `purge-tokens-locked` immediately after.
    - `purge_waits_for_a_running_refresh` and `a_full_purge_waits_for_a_running_refresh_too` hold the lock as a refresh would. They wait on a channel for the first point, then set the cancel token. The purge must return the interruption, never reach the second point, and delete nothing. Were the acquisition removed, nothing between the points could be interrupted, so the tests would fail deterministically.
@@ -15863,9 +16067,9 @@ git commit -m "Make purge wait for a running token refresh"
       pub fn evidence_changed_at(&self, provider: &ProviderId) -> Result<Option<i64>, StoreError>;
       pub fn token_span(&self, provider: &ProviderId) -> Result<(Option<i64>, Option<i64>), StoreError>;
       // tests only:
-      pub fn commit_token_batch(&self, provider: &ProviderId, epoch: Option<i64>, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
-      pub fn finish_token_refresh(&self, provider: &ProviderId, epoch: Option<i64>, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
-      pub fn token_epoch(&self) -> Result<Option<EpochRow>, StoreError>;
+      pub fn begin_token_refresh(&self, provider: &ProviderId, now_ms: i64) -> Result<i64, StoreError>;
+      pub fn commit_token_batch(&self, provider: &ProviderId, epoch: i64, rows: &[UsageRow], files: &[TokenFileRow], removed: &[String], now_ms: i64) -> Result<BatchOutcome, StoreError>;
+      pub fn finish_token_refresh(&self, provider: &ProviderId, epoch: i64, stats: &RefreshStats, now_ms: i64) -> Result<(), StoreError>;
       pub fn record_sighting(&self, provider: &ProviderId, s: &SightingRow, min_gap_ms: i64) -> Result<bool, StoreError>;
       pub fn open_launch(&self, provider: &ProviderId, account_id: &str, started_at: i64, now_ms: i64) -> Result<(), StoreError>;
       // existing: accounts, events, usage_samples; tests: account, insert_event, set_active, delete_account
@@ -16111,9 +16315,11 @@ impl View {
             .unwrap();
     }
 
-    /// The epoch a refresh would have read when it started: the purge generation (Task 12).
-    fn generation(&self) -> Option<i64> {
-        self.store.token_epoch().unwrap().map(|e| e.at)
+    /// The purge generation a refresh begins with (Task 12's `begin_token_refresh`).
+    fn generation(&self) -> i64 {
+        self.store
+            .begin_token_refresh(&cc(), self.engine.now_ms())
+            .unwrap()
     }
 
     /// `session` seen alive in `home` ("" for the default home) from `first` to `last`.
@@ -17058,7 +17264,7 @@ fn price_overrides_follow_the_report_provider() {
         finalized: true,
     };
     let store = engine.store().unwrap();
-    let generation = store.token_epoch().unwrap().map(|e| e.at);
+    let generation = store.begin_token_refresh(&fake, engine.now_ms()).unwrap();
     store
         .commit_token_batch(&fake, generation, &[row], &[], &[], engine.now_ms())
         .unwrap();
@@ -24097,7 +24303,7 @@ R1–R6 are in the plan's header. The writers recorded these:
 - **Tail hash (Task 14).** The reader hashes the bytes it actually read for `tail_hash`, which also catches a rewrite during a read that started at 0.
 - **Statusline write (Tasks 12 and 16).** The sighting uses `Store::record_sighting_within` with a 5 ms busy wait. `CACHE_WRITE_WAIT` becomes `pub(crate)`.
 - **Index counts (Task 18).** `IndexState.responses` is the live count, which moves with every batch so a TUI can show progress during a cold index. `files` is as of the last completed refresh.
-- **Prune budget (Task 15).** Each refresh call lets the first prune chunk through regardless of the budget, and stops at once only on cancel. So a spent budget still makes progress, and a slice overruns by at most one prune chunk.
+- **Prune budget (Task 15).** Superseded by "Prune progress (Task 12)" below.
 - **Plan review (Codex, 12 slices).** Each fix followed a finding:
   - **Prices (Task 3).** A dated override keeps its entry even when it equals the shipped price.
   - **Timeline (Task 4).** The pre-epoch timeline uses only the row seeded at the epoch.
@@ -24115,3 +24321,6 @@ R1–R6 are in the plan's header. The writers recorded these:
   - **CLI (Task 19).** Named accounts choose the provider.
   - **run (Task 21).** The pid is attached on the poller thread.
   - **Tests.** Contention tests use hook points, and no functional test depends on elapsed time or today's date.
+- **Purge generation (Tasks 12 and 15).** A refresh calls `begin_token_refresh` once under its lock. It returns the epoch, recording a fresh one (`seeded = 0`) when a full purge left none. Batch and finish writes refuse with `TokenIndexPurged` when the epoch is missing or differs. The generation is a millisecond timestamp. A stale refresh could be wrongly accepted only if a refresh began and two full purges, each with a `VACUUM`, all fell in one millisecond. That risk is accepted.
+- **Prune progress (Task 12).** `stop` is asked only before a chunk that follows one that deleted rows, so every call deletes something or completes. This replaces Task 15's first-chunk flag.
+- **Evidence clocks (Task 16).** A launch closes, and a scan stamps a sighting's `last_at`, at the moment its check ran (the idle check, or the record found live), not when the scan started.
