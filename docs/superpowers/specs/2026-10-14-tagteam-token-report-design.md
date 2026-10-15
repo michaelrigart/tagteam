@@ -239,8 +239,8 @@ CREATE TABLE session_sightings (
   home        TEXT NOT NULL,     -- '' for the default home, else the profile's account id
   started_at  INTEGER NOT NULL,  -- epoch ms: the execution, its record's startedAt
   first_at    INTEGER NOT NULL,  -- epoch ms: the first read that named the session in it
-  last_at     INTEGER NOT NULL,  -- epoch ms: never after the tenure's last read, and at
-                                 -- most a minute before it (§6.4)
+  last_at     INTEGER NOT NULL,  -- epoch ms: never after the tenure's last read; it can
+                                 -- lag that read (§6.4)
   source      TEXT NOT NULL,     -- 'run' | 'scan' | 'statusline': the source that created it
   recorded_at INTEGER NOT NULL,  -- epoch ms of the last write
   PRIMARY KEY (provider, session_id, home, started_at, first_at)
@@ -546,11 +546,12 @@ environment. Stdin stays drained and ignored (core §13.5).
   end: the session may have left in between, so, under A3 (§7.4), the gap is not bridged.
 - A stored end is never later than the tenure's last read: a `run` check, a scan's read, or
   the statusline's start (§6.3). Once `run`'s close has run, a tenure of its child also never
-  ends after the child's exit (§6.1). A source extends a tenure at most once a minute, so a
-  stored end can lag that read by up to a minute; `run` writes the exact end of each tenure a
-  switch ends.
+  ends after the child's exit (§6.1). A source extends a tenure at most once a minute, and a
+  write can be skipped or fail, so a stored end can lag that read, which only leaves less
+  sighted; `run` writes the exact end of each tenure a switch ends.
 - When a switch ends a tenure, `run` sets its end exactly to its last confirmation, back as
-  well as forward. At the exit it moves the end forward only, but never past the exit (§6.1). Either way, in the same
+  well as forward. At the exit it moves the end forward to its last confirmation, and back to the exit
+  when a stored end is past it (§6.1). Either way, in the same
   transaction, it clamps to that end every other tenure of the session in that execution that
   began by then. A scan or statusline read of a session `run` saw leave and come back, made
   before `run` wrote the session it left for, may have continued one over the absence.
