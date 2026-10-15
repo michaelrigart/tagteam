@@ -341,6 +341,8 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
                 break;
             }
         }
+        // A wait that ran out looks at the token too, before the first frame (R17).
+        self.shutting_down();
         if self.ending.is_none() {
             self.state.dirty = true;
             self.draw();
@@ -530,8 +532,10 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         // stays recorded.
         self.signal.take_if(libc::SIGINT);
         if let Some(signal) = self.signal.requested() {
-            // SIGTERM or SIGHUP: the shutdown, with the terminal as the action left it.
+            // SIGTERM or SIGHUP: the shutdown, with the terminal as the action left it. The
+            // outcome the shutdown overtakes goes into the report (R17).
             self.begin_shutdown(128 + signal, signal, None);
+            self.report(action, outcome);
             return;
         }
         if let Err(e) = self.tty.reclaim() {
@@ -542,6 +546,7 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
                     "tagteam: the terminal could not be set up again: {e}"
                 )),
             );
+            self.report(action, outcome);
             return;
         }
         self.input.resume();
@@ -559,6 +564,15 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         self.state.dirty = true;
     }
 
+    /// Adds an outcome the shutdown overtook to the report (§10.2 step 6).
+    fn report(&mut self, action: Action, outcome: ActionOutcome) {
+        if let Some(ending) = &mut self.ending {
+            ending
+                .report
+                .push_str(&reported(Msg::ActionDone { action, outcome }));
+        }
+    }
+
     /// Ctrl-Z (§10.1): the terminal is given back while the process is stopped, and taken
     /// again, and redrawn, once it is continued. Refused, as a suspension is, when the input
     /// thread does not pause.
@@ -568,6 +582,10 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         }
         match self.tty.stop() {
             Ok(()) => {
+                // A signal that came while the process was stopped comes first (R17).
+                if self.shutting_down() {
+                    return;
+                }
                 self.input.resume();
                 self.resized();
                 self.state.dirty = true;
@@ -1015,7 +1033,7 @@ mod tests {
         let ending = {
             let mut ui = fx.ui();
             ui.start();
-            seen_within(&fx.frames, "collect");
+            assert!(seen_within(&fx.frames, "collect"), "never collected");
             fx.key('q');
             ui.run()
         };
@@ -1430,6 +1448,105 @@ mod tests {
                 ui.ending.is_none() && ui.state.dirty,
                 "redrawn, and carrying on"
             );
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn a_signal_during_a_first_wait_that_runs_out_draws_no_frame() {
+        let fx = Fixture::new(
+            sources(Duration::from_millis(600), false, &Arc::default()),
+            |_| idle(),
+        );
+        let signal = fx.opts.signal.clone();
+        let ending = {
+            let mut ui = fx.ui();
+            let sender = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(30));
+                signal.request(libc::SIGTERM);
+            });
+            ui.start();
+            sender.join().unwrap();
+            assert!(ui.ending.is_some(), "the timeout looked at the token");
+            ui.run()
+        };
+        assert_eq!(fx.frames.seen(), Vec::<&str>::new(), "no frame was drawn");
+        assert_eq!(fx.finish(ending).code, 143);
+    }
+
+    #[test]
+    fn the_outcome_of_a_suspension_a_sigterm_overtook_is_reported() {
+        let fx = Fixture::new(quick(), |opts| {
+            let signal = opts.signal.clone();
+            Scripted {
+                act: never(),
+                foreground: Box::new(move |_| {
+                    signal.request(libc::SIGTERM);
+                    done(143, "out line\n", "err line\n")
+                }),
+            }
+        });
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            ui.execute(vec![Cmd::Suspend(Action::Run(account_a()))]);
+            ui.run()
+        };
+        let exit = fx.finish(ending);
+        assert_eq!(
+            (exit.code, exit.report.as_deref()),
+            (143, Some("out line\nerr line\n"))
+        );
+    }
+
+    #[test]
+    fn a_refusal_banner_is_no_lane_death_and_the_next_good_read_clears_it() {
+        use crate::state::BannerKind;
+        let fx = Fixture::new(quick(), |_| idle());
+        fx.keys.stuck.store(true, Ordering::SeqCst);
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            ui.state.banner = Some("usage was not collected: earlier".into());
+            ui.state.banner_from = Some(BannerKind::Collect);
+            ui.execute(vec![Cmd::Suspend(Action::Run(account_a()))]);
+            assert!(ui.state.banner.is_some());
+            assert_eq!(ui.state.banner_from, None, "it owns no read's lifetime");
+            let r#gen = ui.state.gens.accounts;
+            let snapshot = crate::testutil::snapshot(crate::testutil::many(1));
+            ui.apply(Msg::Accounts {
+                r#gen,
+                result: Ok(snapshot),
+            });
+            assert_eq!(ui.state.banner, None, "a good read clears it (R18)");
+            assert!(ui.ending.is_none() && ui.state.quitting.is_none());
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn a_foreground_action_that_asks_for_the_terminal_again_is_a_failure_not_a_loop() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let fx = Fixture::new(quick(), move |_| Scripted {
+            act: never(),
+            foreground: Box::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                ActionOutcome::NeedsTerminal
+            }),
+        });
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            let run = Action::Run(account_a());
+            ui.state.running = Some(run.clone());
+            ui.execute(vec![Cmd::Suspend(run)]);
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "run once, not again");
+            assert!(ui.state.running.is_none() && ui.ending.is_none());
             fx.key('q');
             ui.run()
         };

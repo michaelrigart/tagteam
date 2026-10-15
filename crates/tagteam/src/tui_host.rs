@@ -161,7 +161,9 @@ impl Host for CliHost {
                 prompter: &mut prompter,
             },
         );
-        if prompter.needs_terminal {
+        // Once the shutdown has begun nothing is handed the terminal: the captured outcome
+        // (the CLI's interrupted one) stands.
+        if prompter.needs_terminal && self.inside.env.cancel.requested().is_none() {
             return ActionOutcome::NeedsTerminal;
         }
         ActionOutcome::Done {

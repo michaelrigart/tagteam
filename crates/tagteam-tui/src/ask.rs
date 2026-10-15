@@ -12,7 +12,7 @@ use crate::msg::{Answer, Msg, Prompt, PromptKind};
 /// How long the lane waits for an answer before it looks at the shutdown token again.
 const SLICE: Duration = Duration::from_millis(100);
 
-/// Task 11's runtime builds one for each action; until then only the tests do.
+/// The runtime builds one for each action its actions lane runs.
 pub(crate) struct ChannelAsk {
     tx: Sender<Msg>,
     shutdown: Cancel,

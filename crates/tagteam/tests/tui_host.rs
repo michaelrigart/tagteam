@@ -505,6 +505,21 @@ fn a_locked_keychain_hands_the_action_to_the_terminal_with_nothing_written() {
 }
 
 #[test]
+fn a_locked_keychain_after_the_shutdown_began_is_the_clis_own_outcome_not_a_hand_over() {
+    // Spec §10.2: with the shutdown begun nothing is handed the terminal; the outcome the
+    // command captured stands.
+    let home = Home::with_two();
+    home.kc.set_locked(true);
+    let (host, shutdown) = home.host();
+    shutdown.request(libc::SIGINT);
+    let mut dialogs = Dialogs::watching(&shutdown, &[]);
+    let (exit, _, _) = done(host.act(&Action::Switch(home.at(1)), &mut dialogs));
+    assert_ne!(exit, 0);
+    assert_eq!(home.kc.unlock_attempts(), 0);
+    assert_eq!(live_email(home.root()), "b@x.co");
+}
+
+#[test]
 fn a_shutdown_before_the_prompt_declines_it_unshown_and_the_command_is_interrupted() {
     // Spec §10.2 step 3, §11: the shutdown begins just before the offer would show.
     let home = Home::with_unmanaged_login();

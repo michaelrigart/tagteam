@@ -5,6 +5,7 @@
 //! loop's tests can use a `TestBackend` instead.
 
 use std::io;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, Once, PoisonError};
 
@@ -187,8 +188,12 @@ pub(crate) trait Tty {
 }
 
 /// The process's terminal, on stdout.
+///
+/// ratatui's `Terminal` is never dropped: its drop shows the cursor outside our lock and
+/// `eprintln!`s when that write fails, which panics on a hung-up terminal and would turn a
+/// SIGHUP's 129 into 1. Restoring (`give_back`) shows the cursor already, under the lock.
 pub(crate) struct RealTty {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: ManuallyDrop<Terminal<CrosstermBackend<io::Stdout>>>,
 }
 
 impl RealTty {
@@ -200,7 +205,9 @@ impl RealTty {
             take()?;
             let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
             repaint(&mut terminal)?;
-            Ok(RealTty { terminal })
+            Ok(RealTty {
+                terminal: ManuallyDrop::new(terminal),
+            })
         })
     }
 }
@@ -209,7 +216,7 @@ impl Tty for RealTty {
     type B = CrosstermBackend<io::Stdout>;
 
     fn draw(&mut self, render: impl FnOnce(&mut Frame)) -> io::Result<bool> {
-        let terminal = &mut self.terminal;
+        let terminal = &mut *self.terminal;
         TERMINAL
             .while_entered(|| terminal.draw(render).map(|_| ()))
             .map_or(Ok(false), |drawn| drawn.map(|()| true))
@@ -228,7 +235,7 @@ impl Tty for RealTty {
     }
 
     fn reclaim(&mut self) -> io::Result<()> {
-        let terminal = &mut self.terminal;
+        let terminal = &mut *self.terminal;
         TERMINAL.enter_with(|| {
             take()?;
             repaint(terminal)
@@ -240,15 +247,6 @@ impl Tty for RealTty {
         // Without job control the signal is discarded, and the TUI simply carries on.
         let _ = tagteam_provider::term::stop_self();
         self.reclaim()
-    }
-}
-
-impl Drop for RealTty {
-    /// ratatui's `Terminal` shows the cursor as it is dropped, when it hid it: a write like any
-    /// other, so it is made here, under the lock, and the drop that follows writes nothing.
-    fn drop(&mut self) {
-        let _held = TERMINAL.hold();
-        let _ = self.terminal.show_cursor();
     }
 }
 
@@ -404,6 +402,13 @@ mod tests {
         let given = Cell::new(false);
         own.restore_with(|| given.set(true));
         assert!(given.get(), "the poisoned lock still serializes");
+    }
+
+    #[test]
+    fn dropping_a_real_tty_runs_no_drop_so_ratatuis_cursor_write_never_happens() {
+        // ratatui's `Terminal::drop` retries a failed `show_cursor` and `eprintln!`s, which
+        // panics on a hung-up terminal; `RealTty` has no drop glue at all.
+        assert!(!std::mem::needs_drop::<RealTty>());
     }
 
     #[test]
