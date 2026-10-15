@@ -489,7 +489,9 @@ impl Engine {
     own profile. The launch reservation has just proved that directory writable. The write is
     atomic: a temp file beside it, then a rename. The file has the profile marker's shape: a
     format tag, a version, the provider, the account, `startedAt` (ms) and `endedAt` (ms or
-    null).
+    null). A file that cannot be read or does not parse, but whose name gives
+    `<started_at ms>-<pid>` as two integers, stands for a launch of the profile's account,
+    open from that start; every reader takes it so.
   - The poller removes the file once the launch is recorded. While the launch is unrecorded,
     it writes the file again if that write failed.
   - At the close, a recorded launch's file is removed. An unrecorded launch's file is written
@@ -538,9 +540,12 @@ written record, or one whose process is gone, is skipped.
 Before it closes launches, the scan reads the pending launch files (§6.1) in each profile. It
 records each launch open from its `startedAt`, closes it at its `endedAt` if it has one, then
 removes the file, unless the file changed since the scan read it: `run` may have replaced it
-with a newer one, which the next scan records. A file that does not parse, or names another provider or another account than
-its profile, is skipped and kept. So is a file that cannot be read. A temp file, which is not
-`*.json`, is ignored.
+with a newer one, which the next scan records. A file that cannot be read or does not parse is
+recorded as the open launch its name stands for (§6.1), and removed the same way: its end, if
+it had one, is lost, and the launch closes once the scan finds the profile idle. A file that
+names another provider or another account than its profile, or whose content cannot be used
+and whose name gives no start, is skipped and kept. A temp file, which is not `*.json`, is
+ignored.
 
 ### 6.3 Statusline
 
@@ -621,9 +626,9 @@ unattributed.
 - From the epoch (`token_epoch`, when the store migrated to step 3) on, coverage is complete:
   `run` records each launch, in the store or in a pending file (§6.1), from a start planned
   before its child starts. A report reads each pending file the store does not hold as a
-  launch, open when it has no `endedAt`. It only reads: it never writes or removes one. It
-  reads the usage first, then the pending files, then the stored launches, each read begun
-  after the one before.
+  launch, open when it has no `endedAt` or stands for one by its name alone (§6.1). It only
+  reads: it never writes or removes one. It reads the usage first, then the pending files,
+  then the stored launches, each read begun after the one before.
 - Before the epoch, coverage comes from the seeded launches (§4). It is complete only after
   the provider's last `remove` event before the epoch. An account removed before then may have
   had a profile that left no trace.
@@ -1038,10 +1043,10 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
   - Every deleter of a profile but a purge records the profile's pending launches (§6.1) first,
     as the scan does: `remove`, an `add` over an occupant, and the bootstrap that deletes a
     profile whose login is invalid. `remove` and `add` record before they delete anything, the
-    vault entry included. A store that refuses the record stops the delete with everything as
-    it was. So does a pending file that cannot be read, or a pending directory that cannot be
-    listed: it may hold a launch, and the error names it. A file that reads but is not a launch
-    of the profile is skipped, as the scan skips it. The bootstrap's launch is refused with the
+    vault entry included. Each file is recorded as the scan records it (§6.2), so one that
+    cannot be read or does not parse never stops the delete. A store that refuses the record
+    stops the delete with everything as it was, and so does a pending directory that cannot be
+    listed, naming it: no file's name can be seen. The bootstrap's launch is refused with the
     error.
   - A purge records nothing. It deletes the profiles it covers, and their pending files with
     them, and empties the launch table; a table that cannot be written never leaves an account
@@ -1100,8 +1105,9 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
       the poller or by a scan; its `endedAt` set at the close when the profile is idle and null
       while it is in use; the warnings only when neither accepts it;
     - a pending file recorded by `sight_sessions` open, or closed at its `endedAt`, and removed;
-      one replaced during the scan kept; one that does not parse, names another account or
-      cannot be read left in place; a temp file ignored;
+      one replaced during the scan kept; one that names another account left in place; one
+      that cannot be read or does not parse recorded open from its name's start; a temp file
+      ignored;
     - seeding of idle and in-use profiles at migration;
     - `active_history` rows from switches, from `add`, and from `remove` setting NULL.
   - Attribution end to end:
@@ -1109,7 +1115,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
     - an unsighted response with and without a covering launch, before and after the epoch,
       and before and after a pre-epoch `remove`;
     - an unsighted response inside a pending launch, unattributed before the next scan, with
-      the file written, or moved to the store by a scan, while the report reads;
+      the file written, or moved to the store by a scan, while the report reads, and with a
+      file that cannot be read;
     - a session sighted in two homes at once;
     - a session resumed in another home, with either home unsighted;
     - a removed account, with and without switches, and a removed profile.
@@ -1117,8 +1124,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
     `changed_at_ms` moving on new evidence alone.
   - Migration from a version-2 store, with profiles to seed.
   - `purge` and `remove`, `remove` and the bootstrap recording a profile's pending launches
-    before they delete it, a pending file that cannot be read stopping a `remove`, and a purge
-    forgetting them.
+    before they delete it, one that cannot be read recorded by its name, a pending directory
+    that cannot be listed stopping a `remove`, and a purge forgetting them.
 - **CLI.** Snapshot tests of the human, `--json` and `--csv` output (core §13.2). `tokens` joins
   core §15.3's byte-identity test.
 - **Budgets.**
