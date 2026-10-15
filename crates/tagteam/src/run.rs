@@ -215,16 +215,17 @@ fn close_launch(
         return;
     };
     let mut recorded = tracked.recorded.load(Ordering::Relaxed);
+    let mut refused = None;
     if !recorded {
         match engine.record_launch(&tracked.id) {
             Ok(()) => recorded = true,
-            Err(e) => tracing::warn!(
-                kind = e.kind(),
-                "could not record the session's launch for the token report"
-            ),
+            Err(e) => refused = Some(e.kind()),
         }
     }
     let end = engine.close_launch(&tracked.id, profile, seen, exited_at_ms, recorded);
+    if let Some(kind) = refused {
+        log_unrecorded(kind, end.kept);
+    }
     if recorded {
         if let Err(e) = end.stored {
             let _ = writeln!(
@@ -232,12 +233,26 @@ fn close_launch(
                 "warning: the token report could not record this session's end: {e}"
             );
         }
-    } else if end.kept {
-        tracing::debug!("the session's launch is kept in a pending file for the next scan");
-    } else if child_ran {
+    } else if !end.kept && child_ran {
         let _ = writeln!(
             err,
             "warning: the token report could not record this session's launch, in the store or in its profile, so its usage may be credited to the default login's account"
+        );
+    }
+}
+
+/// Logs a launch the store refused: at debug while its pending file holds it, as a warning only
+/// when neither does (the stderr warning's condition).
+fn log_unrecorded(kind: &str, kept: bool) {
+    if kept {
+        tracing::debug!(
+            kind,
+            "the store refused the session's launch; it is kept in a pending file"
+        );
+    } else {
+        tracing::warn!(
+            kind,
+            "could not record the session's launch for the token report"
         );
     }
 }
@@ -263,7 +278,9 @@ fn wait_polling<T>(
     let id = &launch.id;
     let poller = |stop: &AtomicBool| {
         let mut pid_attached = false;
-        let mut record_logged = false;
+        // The refused record is logged once at each level: debug while a pending file holds
+        // the launch, a warning when it does not.
+        let mut record_logged = [false; 2];
         let mut next = Instant::now();
         let (mut check_logged, mut write_logged) = (false, false);
         let mut reported = None;
@@ -283,17 +300,15 @@ fn wait_polling<T>(
                     match engine.record_launch(id) {
                         Ok(()) => launch.recorded.store(true, Ordering::Relaxed),
                         Err(e) => {
-                            if !record_logged {
-                                tracing::warn!(
-                                    kind = e.kind(),
-                                    "could not record the session's launch for the token report"
-                                );
-                                record_logged = true;
-                            }
                             if !launch.kept.load(Ordering::Relaxed)
                                 && engine.keep_pending_launch(id, profile, None).is_ok()
                             {
                                 launch.kept.store(true, Ordering::Relaxed);
+                            }
+                            let kept = launch.kept.load(Ordering::Relaxed);
+                            if !record_logged[usize::from(kept)] {
+                                log_unrecorded(e.kind(), kept);
+                                record_logged[usize::from(kept)] = true;
                             }
                             pause_point("launch-retry-failed");
                         }
