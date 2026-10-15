@@ -212,6 +212,7 @@ fn run_sights_the_child_session() {
     let out = home.out("sighting");
     let hold = home.root().join("hold");
     let pause = home.root().join("pause");
+    let confirmed = home.root().join("confirmed");
     fs::create_dir_all(&pause).unwrap();
     let _release = Release(hold.clone());
     let _resume = Release(pause.join("resume"));
@@ -221,6 +222,7 @@ fn run_sights_the_child_session() {
         .env("FAKE_CLAUDE_RECORD", "interactive")
         .env("TAGTEAM_TEST_PAUSE_AT", "after-exit")
         .env("TAGTEAM_TEST_PAUSE_DIR", &pause)
+        .env("TAGTEAM_TEST_CONFIRMED_AT", &confirmed)
         .spawn()
         .unwrap();
     let session = running(&out);
@@ -256,8 +258,16 @@ fn run_sights_the_child_session() {
         "the launch is recorded before the spawn: {launches:?}, record {record}"
     );
     // The checks go on confirming the session while it runs; a write extends the sighting at
-    // most once a minute, so only the close can carry its end past this first write's.
-    thread::sleep(Duration::from_millis(300));
+    // most once a minute, so only the close can carry its end past this first write's. The
+    // child is let go once a check after that write has confirmed it.
+    wait_for("a check after the first write", || {
+        fs::read_to_string(&confirmed)
+            .ok()?
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .filter(|&at| at > seen.last_at)
+    });
     fs::write(&hold, b"").unwrap();
     wait_for("the run's exit handling", || {
         pause.join("paused").exists().then_some(())
