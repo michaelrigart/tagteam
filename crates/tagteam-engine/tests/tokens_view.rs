@@ -691,6 +691,74 @@ fn a_pending_launch_leaves_an_unsighted_response_unattributed_without_the_scan()
     );
 }
 
+/// For the races below: b is the default home's login, and an unsighted response of `s-2` at
+/// T0+5h lies inside a launch of a's profile from T0+4h, which only a pending file holds yet.
+/// Returns the profile and that launch, not yet written.
+#[cfg(feature = "test-hooks")]
+fn unsighted_inside_a_pending_launch(v: &View) -> (std::path::PathBuf, PendingLaunch) {
+    v.event(T0 - D, "switch", None, Some(&v.b));
+    v.index(&[v.usage("s-2", T0 + 5 * H, "model-a", 2, 0)]);
+    let cc_provider = v.engine.provider(&cc()).unwrap();
+    let profile = v.fx.make_profile_for(cc_provider.as_ref(), &v.a);
+    let launch = PendingLaunch {
+        provider: cc(),
+        account_id: v.a.clone(),
+        started_at_ms: T0 + 4 * H,
+        ended_at_ms: Some(T0 + 6 * H),
+    };
+    (profile, launch)
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_pending_file_written_after_the_report_read_the_usage_still_covers_its_responses() {
+    // Spec §7.2: the report reads the usage, then the pending files. `run` keeps the launch in
+    // its file before it spawns the child, so the launch of every response the usage holds is
+    // in the store or a file by the time the files are read. The file appears right after the
+    // usage read here; read the other way round, the response goes to b.
+    let v = View::new();
+    let (profile, launch) = unsighted_inside_a_pending_launch(&v);
+    v.engine.on_point(
+        "report-usage-read",
+        Box::new(move || launch.write(&profile, 4242).unwrap()),
+    );
+
+    let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::Account));
+
+    assert_eq!(keys(&r), ["day:2026-09-01|account:unattributed"]);
+    assert_eq!(r.total.by_basis[2], (Basis::Unattributed, 2));
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_pending_launch_a_scan_stores_while_the_report_reads_still_covers_its_responses() {
+    // Spec §7.2: the report reads the stored launches after the pending files, and a scan
+    // removes a file only once its launch is stored (spec §6.2). A scan that moves the launch
+    // between the two reads leaves it in one of them; read the other way round, the report
+    // would miss it in both and credit the response to b.
+    let v = View::new();
+    let (profile, launch) = unsighted_inside_a_pending_launch(&v);
+    launch.write(&profile, 4242).unwrap();
+    let scan = v.fx.engine_with_settings(settings());
+    v.engine.on_point(
+        "report-pending-read",
+        Box::new(move || {
+            scan.sight_sessions(&cc()).unwrap();
+        }),
+    );
+
+    let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::Account));
+
+    let stored = v.store.launches(&cc()).unwrap();
+    assert_eq!(stored.len(), 1, "the premise: the scan stored it");
+    assert!(
+        PendingLaunch::read_all(&profile).is_empty(),
+        "and removed its file"
+    );
+    assert_eq!(keys(&r), ["day:2026-09-01|account:unattributed"]);
+    assert_eq!(r.total.by_basis[2], (Basis::Unattributed, 2));
+}
+
 #[test]
 fn a_remove_before_the_epoch_leaves_earlier_unsighted_responses_unattributed() {
     let v = View::new();

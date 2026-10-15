@@ -17,6 +17,7 @@ use tagteam_provider::Provider;
 
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::hooks;
 use crate::store::{Store, StoreError};
 
 /// What a report row spans (spec §10).
@@ -340,6 +341,15 @@ impl Engine {
     /// reads only: it never refreshes the index (spec §5) and never creates the store, without
     /// which the report is empty. A block report reports each block that meets the range
     /// whole, and its total is its rows'.
+    ///
+    /// Spec §7.2: the usage is read first, then the pending launch files, then the stored
+    /// launches, each read begun after the one before. `run` has its launch in the store or in
+    /// a pending file before it spawns the child, and a file goes only once its launch is
+    /// stored. So every response the usage holds has its launch in a file when the files are
+    /// read, or in the store when the store is. In another order a launch can be in neither
+    /// read: one kept in a file written after the files were read, or one a scan moved from its
+    /// file to the store between the two launch reads. Its responses would then go to the
+    /// default home's account.
     pub fn token_report(&self, q: &TokenQuery) -> Result<TokenReport, EngineError> {
         let p = provider_with_transcripts(self, &q.provider)?;
         let table = p.price_table();
@@ -369,13 +379,27 @@ impl Engine {
         {
             return Ok(report);
         }
-        // Spec §7.2: launches `run` kept in a pending file count as stored ones, read only.
+        // The usage, the pending files, then the stored launches (in `group`), as the doc says.
+        // Each store read is a statement of its own: a transaction opened before the files are
+        // read would fix the launches' snapshot there. A test stops after each read.
+        let usage = group::usage(q, &store)?;
+        hooks::point(self, "report-usage-read")?;
+        // Launches `run` kept in a pending file count as stored ones, read only.
         let pending: Vec<_> = self
             .pending_launches(p.as_ref())
             .into_iter()
             .map(|(_, launch)| launch)
             .collect();
-        let grouped = group::group(q, p.as_ref(), &store, &pending, &prices, self.now_ms())?;
+        hooks::point(self, "report-pending-read")?;
+        let grouped = group::group(
+            q,
+            p.as_ref(),
+            &store,
+            &usage,
+            &pending,
+            &prices,
+            self.now_ms(),
+        )?;
         report.rows = grouped.rows;
         report.total = grouped.total;
         report.unpriced_models = grouped.unpriced_models;
