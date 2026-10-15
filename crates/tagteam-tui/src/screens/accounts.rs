@@ -30,6 +30,9 @@ pub const RUN_SHELL: &str = "inside a `tagteam run` session: account changes are
 /// A gauge's width, in cells, and the narrowest the ACCOUNT column is cut to.
 const GAUGE: usize = 6;
 const ACCOUNT_MIN: usize = 12;
+/// The room the notes after a row's cells are given at least, when columns or the ACCOUNT
+/// column give way for them: the longest note, up to this many columns.
+const NOTES_ROOM: usize = 36;
 /// The detail pane's least height: a rule, four windows, the reading's age, and its trouble.
 const DETAIL_MIN: u16 = 7;
 /// The detail pane's lines besides its windows' own: the rule, the reading's age, and its
@@ -321,6 +324,7 @@ struct Table<'a> {
     gauges: bool,
     sessions: bool,
     this: Option<&'a AccountId>,
+    width: usize,
 }
 
 impl<'a> Table<'a> {
@@ -343,6 +347,7 @@ impl<'a> Table<'a> {
             gauges: false,
             sessions,
             this,
+            width,
         };
         let heads: Vec<usize> = table.heads().iter().map(|h| width_of(h)).collect();
         let widths: Vec<usize> = heads
@@ -360,8 +365,8 @@ impl<'a> Table<'a> {
             .iter()
             .map(|v| width_of(&words::account_cell(&v.row)))
             .fold(width_of("ACCOUNT"), usize::max);
-        let fixed =
-            5 + if sessions { 2 } else { 0 } + 2 + widths.iter().map(|w| w + 2).sum::<usize>();
+        let mut widths = widths;
+        let base = 5 + if sessions { 2 } else { 0 } + 2;
         // The notes after a row's cells (its status in words, `disabled`, `this`) must still
         // fit beside the gauges: they say more than a gauge does.
         let notes_w = accounts
@@ -375,6 +380,23 @@ impl<'a> Table<'a> {
             })
             .max()
             .unwrap_or(0);
+        // Notes get room of their own: when even a minimal ACCOUNT column leaves them too
+        // little, window columns give way, scoped ones first, then spend; 5H and 7D stay. The
+        // dropped windows stay in the detail pane.
+        let room = notes_w.min(NOTES_ROOM);
+        loop {
+            let fixed = base + widths.iter().map(|w| w + 2).sum::<usize>();
+            if fixed + account_w.min(ACCOUNT_MIN) + room <= width {
+                break;
+            }
+            let kind = |k| table.cols.iter().rposition(|c| c.kind == k);
+            let Some(i) = kind(WindowKind::Scoped).or_else(|| kind(WindowKind::Spend)) else {
+                break;
+            };
+            table.cols.remove(i);
+            widths.remove(i);
+        }
+        let fixed = base + widths.iter().map(|w| w + 2).sum::<usize>();
         let gauge_w = table.gauge_columns() * (GAUGE + 1);
         table.widths = widths;
         if fixed + account_w + gauge_w + notes_w <= width {
@@ -386,7 +408,7 @@ impl<'a> Table<'a> {
                 }
             }
         } else {
-            table.account_w = account_w.min(width.saturating_sub(fixed).max(ACCOUNT_MIN));
+            table.account_w = account_w.min(width.saturating_sub(fixed + room).max(ACCOUNT_MIN));
         }
         table
     }
@@ -500,8 +522,13 @@ impl<'a> Table<'a> {
             }
         }
         let this = self.this == Some(&v.row.id);
-        for note in words::row_notes(v, this, now_s) {
-            spans.push(Span::raw(format!("  {note}")));
+        let notes: String = words::row_notes(v, this, now_s)
+            .iter()
+            .map(|note| format!("  {note}"))
+            .collect();
+        if !notes.is_empty() {
+            let used: usize = spans.iter().map(|s| width_of(&s.content)).sum();
+            spans.push(Span::raw(fit(&notes, self.width.saturating_sub(used))));
         }
         Line::from(spans)
     }
@@ -724,7 +751,11 @@ fn detail(
         Some(age) => status.push(format!("fetched {} ago", words::duration(age))),
         None => status.push("never fetched".to_owned()),
     }
-    if let Some(at) = v.usage.next_poll_at.filter(|&at| at > now_s) {
+    if let Some(at) = v
+        .usage
+        .next_poll_at
+        .filter(|&at| v.usage.status == UsageStatus::Ok && at > now_s)
+    {
         status.push(format!("next poll in {}", words::countdown(at, now_s)));
     }
     if let Some(at_ms) = row.login_expires_at {
@@ -1617,5 +1648,93 @@ mod tests {
         let lines = draw(&loaded(vec![key, off]), 80, 24);
         assert!(lines[2].ends_with("api key"), "{}", lines[2]);
         assert!(lines[3].ends_with("disabled"), "{}", lines[3]);
+    }
+
+    #[test]
+    fn the_detail_pane_announces_no_poll_the_status_rules_out() {
+        // A quarantined account keeps its stored plan, but no poll comes (core §8.3).
+        let mut accounts = three();
+        accounts[2].usage.next_poll_at = Some(NOW_S + 180);
+        let mut state = loaded(accounts);
+        update(&mut state, ch('G'), NOW_MS);
+        let lines = draw(&state, 80, 24);
+        assert_eq!(lines[24 - 1 - 7 + 1], " never fetched");
+        assert!(!lines.iter().any(|l| l.contains("next poll")), "{lines:?}");
+        // A backoff later than the plan: the usage line's retry is the only time given.
+        let mut backed_off = read(120, 9.0, 77.0, false);
+        backed_off.status = UsageStatus::Unavailable;
+        backed_off.error = Some("http-429".into());
+        backed_off.retry_at = Some(NOW_S + 900);
+        backed_off.next_poll_at = Some(NOW_S + 120);
+        let lines = draw(&loaded(vec![account(1, "a@x.co", backed_off)]), 80, 24);
+        assert!(!lines.iter().any(|l| l.contains("next poll")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == " usage: unavailable (http-429, retry 15m)"),
+            "{lines:?}"
+        );
+    }
+
+    /// A spend, a scoped model window, a disabled row and a failing one: more than 80 columns
+    /// hold with their notes.
+    fn crowded(error: &str) -> Vec<AccountView> {
+        let mut usage = with_windows(&["Claude Sonnet 4.5"]);
+        let spend = window("spend", "spend", WindowKind::Spend, 61.7, Some(1_209_630));
+        usage
+            .windows
+            .as_mut()
+            .unwrap()
+            .push((spend, Pace::default()));
+        let mut off = account(2, "b@x.co", usage.clone());
+        off.row.disabled = true;
+        let mut failing = usage.clone();
+        failing.status = UsageStatus::Unavailable;
+        failing.error = Some(error.into());
+        failing.retry_at = Some(NOW_S + 900);
+        vec![
+            account(1, "a@x.co", usage),
+            off,
+            account(3, "c@x.co", failing),
+        ]
+    }
+
+    #[test]
+    fn columns_give_way_to_the_notes_at_80_columns() {
+        let lines = draw(&loaded(crowded("http-429")), 80, 24);
+        assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
+        let head = &lines[1];
+        assert!(head.contains("5H") && head.contains("7D"), "{head}");
+        assert!(head.ends_with("AGE"), "{head}");
+        assert!(!head.contains("SONNET"), "{head}");
+        assert!(lines[3].ends_with("disabled"), "{}", lines[3]);
+        assert!(
+            lines[4].ends_with("unavailable (http-429, retry 15m)"),
+            "{}",
+            lines[4]
+        );
+        // At 120 columns every column and every note fit.
+        let wide = draw(&loaded(crowded("http-429")), 120, 40);
+        assert!(wide[1].contains("CLAUDE SONNET 4.5"), "{}", wide[1]);
+        assert!(
+            wide[1].contains("SPEND") && wide[1].ends_with("AGE"),
+            "{}",
+            wide[1]
+        );
+        assert!(wide[3].ends_with("disabled"), "{}", wide[3]);
+        assert!(
+            wide[4].ends_with("unavailable (http-429, retry 15m)"),
+            "{}",
+            wide[4]
+        );
+    }
+
+    #[test]
+    fn a_note_too_long_for_its_room_ends_in_an_ellipsis() {
+        let long = "x".repeat(70);
+        let lines = draw(&loaded(crowded(&long)), 80, 24);
+        assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
+        assert!(lines[4].ends_with('…'), "{}", lines[4]);
+        assert!(lines[4].contains("unavailable (xxx"), "{}", lines[4]);
     }
 }
