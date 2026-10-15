@@ -99,14 +99,15 @@ CREATE TRIGGER active_history_update AFTER UPDATE OF account_id ON active_accoun
 END;
 
 CREATE TABLE token_state (
-  provider          TEXT PRIMARY KEY,
-  refreshed_at      INTEGER,
-  changed_at        INTEGER,
-  files             INTEGER NOT NULL DEFAULT 0,
-  responses         INTEGER NOT NULL DEFAULT 0,
-  skipped_lines     INTEGER NOT NULL DEFAULT 0,
-  unreadable_files  INTEGER NOT NULL DEFAULT 0,
-  pruned_at         INTEGER
+  provider              TEXT PRIMARY KEY,
+  refreshed_at          INTEGER,
+  changed_at            INTEGER,
+  files                 INTEGER NOT NULL DEFAULT 0,
+  responses             INTEGER NOT NULL DEFAULT 0,
+  skipped_lines         INTEGER NOT NULL DEFAULT 0,
+  pending_skipped_lines INTEGER NOT NULL DEFAULT 0,
+  unreadable_files      INTEGER NOT NULL DEFAULT 0,
+  pruned_at             INTEGER
 );
 
 CREATE TABLE token_epoch (

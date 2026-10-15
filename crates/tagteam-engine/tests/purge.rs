@@ -2256,7 +2256,7 @@ fn plant_token_rows(fx: &Fx, provider: &ProviderId) {
     };
     let epoch = store.begin_token_refresh(provider, now).unwrap();
     store
-        .commit_token_batch(provider, epoch, &[usage], &[file], &[], now)
+        .commit_token_batch(provider, epoch, &[usage], &[file], &[], 0, now)
         .unwrap();
     let seen = SightingRow {
         session_id: "s-1".into(),
