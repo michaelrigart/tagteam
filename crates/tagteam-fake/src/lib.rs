@@ -7,6 +7,7 @@
 mod paths;
 mod provider;
 mod shape;
+mod transcripts;
 mod usage;
 
 use std::fs;
@@ -18,6 +19,7 @@ use tagteam_provider::Env;
 pub use paths::FakePaths;
 pub use provider::FakeAgent;
 pub use shape::{DEVICE, KIND_STATIC, KIND_TOKEN, KINDS};
+pub use transcripts::{FakeUsage, append_transcript, usage_line_json};
 
 pub const FAKE_AGENT: &str = "fake-agent";
 

@@ -16,6 +16,8 @@ pub struct FakePaths {
     pub credential: PathBuf,
     /// FakeAgent's one live lock, a `mkdir` lock.
     pub lock: PathBuf,
+    /// Its transcripts, `*.jsonl` in one flat directory (token report spec §3.2).
+    pub transcripts: PathBuf,
 }
 
 impl FakePaths {
@@ -29,6 +31,7 @@ impl FakePaths {
             identity: dir.join("identity.json"),
             credential: dir.join("credential.json"),
             lock: dir.join(".live.lock"),
+            transcripts: dir.join("transcripts"),
             dir,
         }
     }
