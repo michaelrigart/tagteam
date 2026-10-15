@@ -242,7 +242,7 @@ fn a_full_purge_deletes_everything_but_the_settings_the_locks_and_the_live_login
     let store = Store::open_existing(&fx.env.data_dir().join("tagteam.db"))
         .unwrap()
         .unwrap();
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), 3);
     assert!(store.all_accounts().unwrap().is_empty());
     assert!(store.events().unwrap().is_empty());
     assert!(store.displaced_rows().unwrap().is_empty());

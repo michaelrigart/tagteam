@@ -1,13 +1,15 @@
 mod common;
 
-use common::{add, cc, identity};
+use common::{Fx, add, cc, identity};
 use serde_json::json;
+use std::cell::Cell;
 use std::os::unix::fs::PermissionsExt;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{
-    Activation, AutoRecord, DisplacedRow, EventRow, JournalRow, LoginMeta, NewAccount, Store,
-    StoreError,
+    Activation, AutoRecord, DisplacedRow, EventRow, JournalRow, LoginMeta, NewAccount, SeedLaunch,
+    Store, StoreError,
 };
 use tagteam_provider::{Identity, ProcessStamp};
 
@@ -27,10 +29,10 @@ fn opening_migrates_once_and_open_existing_never_creates() {
     assert!(Store::open_existing(&path).unwrap().is_none());
     assert!(!path.parent().unwrap().exists());
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 2);
+    assert_eq!(s.schema_version().unwrap(), 3);
     drop(s);
     let s = Store::open(&path).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 2);
+    assert_eq!(s.schema_version().unwrap(), 3);
     assert!(Store::open_existing(&path).unwrap().is_some());
 }
 
@@ -218,18 +220,18 @@ fn a_newer_schema_version_is_refused_and_the_database_is_untouched() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("t.db");
     {
-        // A file as a hypothetical newer tagteam would leave it: schema v3, still in
+        // A file as a hypothetical newer tagteam would leave it: schema v4, still in
         // whatever journal mode it was created with, never touched by this build's
         // `connect`/`migrate`. Using a raw connection (rather than `Store::open` followed by
         // bumping `user_version`) means the file starts in the default `delete` journal mode,
         // so switching it to WAL is a real, detectable mutation, not a no-op.
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE accounts (id TEXT PRIMARY KEY); PRAGMA user_version = 3;")
+        conn.execute_batch("CREATE TABLE accounts (id TEXT PRIMARY KEY); PRAGMA user_version = 4;")
             .unwrap();
     }
     assert!(matches!(
         Store::open(&path),
-        Err(StoreError::UnsupportedSchema(3))
+        Err(StoreError::UnsupportedSchema(4))
     ));
     // Refusing must not have touched the database at all: same version, same journal mode
     // (never switched to WAL), same table set (no re-migration, no half-applied schema).
@@ -237,7 +239,7 @@ fn a_newer_schema_version_is_refused_and_the_database_is_untouched() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     assert_eq!(journal_mode(&path), "delete");
     let tables: Vec<String> = conn
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
@@ -257,7 +259,7 @@ fn every_open_path_leaves_the_store_in_wal_mode() {
     let s = Store::open(&path).unwrap();
     assert_eq!(journal_mode(&path), "wal");
     drop(s);
-    // Reopening an already-migrated (v2) file still calls through to set WAL; a no-op there.
+    // Reopening an already-migrated (v3) file still calls through to set WAL; a no-op there.
     let s = Store::open(&path).unwrap();
     assert_eq!(journal_mode(&path), "wal");
     drop(s);
@@ -312,7 +314,7 @@ fn concurrent_first_opens_all_succeed() {
             })
             .collect();
         for h in handles {
-            assert_eq!(h.join().unwrap().unwrap(), 2);
+            assert_eq!(h.join().unwrap().unwrap(), 3);
         }
     }
 }
@@ -746,9 +748,10 @@ fn active_row(path: &std::path::Path, provider: &str) -> Option<(Option<String>,
 
 #[test]
 fn a_version_1_store_is_migrated_with_its_activation_epochs_filled() {
-    // Decision 1: `schema.sql` is the frozen v1 DDL, so a v1 file runs only the v2 step. The
-    // backfill takes the live store as current (§12.5): each named account's activation epoch
-    // is its current `login_epoch`. A journal row keeps a NULL `to_epoch` (§9.6).
+    // Decision 1: `schema.sql` is the frozen v1 DDL, so a v1 file runs only the steps above
+    // it. The backfill takes the live store as current (§12.5): each named account's
+    // activation epoch is its current `login_epoch`. A journal row keeps a NULL `to_epoch`
+    // (§9.6).
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("t.db");
     {
@@ -772,7 +775,7 @@ fn a_version_1_store_is_migrated_with_its_activation_epochs_filled() {
 
     let s = Store::open(&path).unwrap();
 
-    assert_eq!(s.schema_version().unwrap(), 2);
+    assert_eq!(s.schema_version().unwrap(), 3);
     let a = AccountId::from_string("a");
     assert_eq!(
         s.activation(&cc()).unwrap(),
@@ -796,7 +799,7 @@ fn a_version_1_store_is_migrated_with_its_activation_epochs_filled() {
     );
     assert_eq!(journal_mode(&path), "wal");
     // Reopening runs nothing more: the file is already at the build's version.
-    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 2);
+    assert_eq!(Store::open(&path).unwrap().schema_version().unwrap(), 3);
 }
 
 #[test]
@@ -1259,7 +1262,7 @@ fn emptying_the_store_keeps_its_schema_and_leaves_no_row() {
             .unwrap();
         assert_eq!(n, 0, "{table}");
     }
-    assert_eq!(s.schema_version().unwrap(), 2);
+    assert_eq!(s.schema_version().unwrap(), 3);
     assert!(other.all_accounts().unwrap().is_empty());
     add(&other, &cc(), "b", "b@x.co", 1);
     assert_eq!(
@@ -1490,4 +1493,491 @@ fn a_read_only_open_of_a_store_with_only_one_of_its_wal_files_opens_nothing_and_
         assert_eq!(names_in(d.path()), before, "nothing was created");
         assert!(!before.iter().any(|n| n.ends_with(absent)), "{before:?}");
     }
+}
+
+// ---- Token report Task 11: migration step 3 (token report spec §4) ----
+
+/// The DDL that version 2 adds to `schema.sql`, as `MIGRATION_V2` holds it.
+const MIGRATION_V2_DDL: &str = "ALTER TABLE active_accounts ADD COLUMN login_epoch INTEGER;
+ALTER TABLE switch_journal ADD COLUMN to_epoch INTEGER;";
+
+/// A version-2 store at `path`, as the release before the token report leaves it: two
+/// claude-code accounts with `a` active, and fake-agent with no active account.
+fn version_2_store(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.execute_batch(include_str!("../src/store/schema.sql"))
+        .unwrap();
+    conn.execute_batch(MIGRATION_V2_DDL).unwrap();
+    conn.execute_batch(
+        "INSERT INTO accounts
+           (id, provider, position, identity_key, label, kind, identity_json, login_epoch, added_at)
+           VALUES ('a', 'claude-code', 1, 'a@x.co', 'a@x.co', 'oauth', '{}', 3, 1),
+                  ('b', 'claude-code', 2, 'b@x.co', 'b@x.co', 'oauth', '{}', 0, 1);
+         INSERT INTO active_accounts (provider, account_id, login_epoch)
+           VALUES ('claude-code', 'a', 3), ('fake-agent', NULL, NULL);
+         PRAGMA user_version = 2;",
+    )
+    .unwrap();
+}
+
+/// No session profile: what a seed closure lists on a machine that never ran `run`.
+fn no_profiles() -> Option<Vec<SeedLaunch>> {
+    Some(Vec::new())
+}
+
+/// The epoch the seeded opens below record: the fixtures' clock (`Fx`'s `FakeClock`).
+const NOW: i64 = 1_790_000_000_000;
+
+/// The wall clock in epoch ms, which a raw open and the triggers read (token report spec §4).
+fn wall_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// The file's `user_version`, read without migrating it.
+fn raw_version(path: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn has_table(path: &std::path::Path, name: &str) -> bool {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// `token_epoch`: `(at, seeded)` per row.
+fn epoch_rows(path: &std::path::Path) -> Vec<(i64, i64)> {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .prepare("SELECT at, seeded FROM token_epoch ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// `active_history`: `(provider, at, account_id, recorded_at)` per row, in insertion order.
+fn history_rows(path: &std::path::Path) -> Vec<(String, i64, Option<String>, i64)> {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .prepare("SELECT provider, at, account_id, recorded_at FROM active_history ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+type LaunchCols = (String, String, i64, Option<i64>, Option<i64>, i64);
+
+/// `run_launches`: `(provider, account_id, started_at, ended_at, pid, recorded_at)` per row,
+/// by provider and account.
+fn launch_rows(path: &std::path::Path) -> Vec<LaunchCols> {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .prepare(
+            "SELECT provider, account_id, started_at, ended_at, pid, recorded_at FROM run_launches \
+             ORDER BY provider, account_id",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn launch(account: &str, started: i64, ended: Option<i64>, recorded: i64) -> LaunchCols {
+    (
+        "claude-code".into(),
+        account.into(),
+        started,
+        ended,
+        None,
+        recorded,
+    )
+}
+
+#[test]
+fn a_version_2_store_migrates_to_3_with_epoch_and_active_history() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    version_2_store(&path);
+    let s = Store::open_seeded(&path, &|| NOW, &no_profiles).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 3);
+    assert_eq!(
+        s.activation(&cc()).unwrap(),
+        Some(Activation {
+            account: AccountId::from_string("a"),
+            epoch: Some(3)
+        }),
+        "version 2's rows are kept"
+    );
+    drop(s);
+
+    assert_eq!(
+        epoch_rows(&path),
+        [(NOW, 1)],
+        "the epoch is the caller's clock"
+    );
+    // The account active at the epoch, per provider, at the epoch itself (spec §7.3).
+    assert_eq!(
+        history_rows(&path),
+        [
+            ("claude-code".to_owned(), NOW, Some("a".to_owned()), NOW),
+            ("fake-agent".to_owned(), NOW, None, NOW),
+        ]
+    );
+    assert!(launch_rows(&path).is_empty(), "no profile to seed");
+    for table in [
+        "token_files",
+        "token_sessions",
+        "token_models",
+        "token_usage",
+        "session_sightings",
+        "token_state",
+    ] {
+        assert!(has_table(&path, table), "{table}");
+    }
+    // Reopening runs nothing more, and never asks for profiles.
+    let s = Store::open_seeded(&path, &|| NOW + 1, &|| panic!("step 3 ran twice")).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 3);
+    drop(s);
+    assert_eq!(epoch_rows(&path), [(NOW, 1)]);
+    assert_eq!(history_rows(&path).len(), 2);
+}
+
+#[test]
+fn seeding_records_profiles_idle_closed_in_use_open() {
+    // Spec §4 Seeding: an idle profile's launch ends at the epoch; one in use stays open for
+    // §6.1 to close. Its birth time is its start, 0 when the filesystem reports none.
+    let seed = || {
+        Some(vec![
+            SeedLaunch {
+                provider: cc(),
+                account_id: "idle".into(),
+                started_at_ms: 1_700_000_000_000,
+                in_use: false,
+            },
+            SeedLaunch {
+                provider: cc(),
+                account_id: "busy".into(),
+                started_at_ms: 0,
+                in_use: true,
+            },
+        ])
+    };
+    let d = tempfile::tempdir().unwrap();
+    for (name, older) in [("v2.db", true), ("fresh.db", false)] {
+        let path = d.path().join(name);
+        if older {
+            version_2_store(&path);
+        }
+        Store::open_seeded(&path, &|| NOW, &seed).unwrap();
+        assert_eq!(epoch_rows(&path), [(NOW, 1)], "{name}");
+        assert_eq!(
+            launch_rows(&path),
+            [
+                launch("busy", 0, None, NOW),
+                launch("idle", 1_700_000_000_000, Some(NOW), NOW),
+            ],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn a_raw_open_records_unseeded() {
+    // Ruling R1: an open that lists no profile cannot say pre-epoch coverage is complete. A
+    // raw open takes the system clock as the epoch.
+    let d = tempfile::tempdir().unwrap();
+    let fresh = d.path().join("fresh.db");
+    let before = wall_ms();
+    Store::open(&fresh).unwrap();
+    let older = d.path().join("v2.db");
+    version_2_store(&older);
+    Store::open_existing(&older).unwrap().unwrap();
+    let after = wall_ms();
+    for path in [fresh, older] {
+        let [(at, 0)] = epoch_rows(&path)[..] else {
+            panic!("{}: {:?}", path.display(), epoch_rows(&path));
+        };
+        assert!((before..=after).contains(&at), "{before} {at} {after}");
+        assert!(launch_rows(&path).is_empty());
+    }
+}
+
+#[test]
+fn a_seed_that_cannot_list_every_profile_records_unseeded() {
+    // Ruling R1: a profile may have gone unlisted, so pre-epoch coverage is not complete.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    version_2_store(&path);
+    Store::open_seeded(&path, &|| NOW, &|| None).unwrap();
+    assert_eq!(epoch_rows(&path), [(NOW, 0)]);
+    assert!(launch_rows(&path).is_empty());
+    assert_eq!(
+        history_rows(&path).len(),
+        2,
+        "the active account is still recorded"
+    );
+}
+
+#[test]
+fn the_seed_closure_runs_only_when_step_3_applies() {
+    // The clock too: it dates the epoch, and step 3 alone records one.
+    let calls = Cell::new(0);
+    let seed = || {
+        calls.set(calls.get() + 1);
+        Some(Vec::new())
+    };
+    let reads = Cell::new(0);
+    let clock = || {
+        reads.set(reads.get() + 1);
+        NOW
+    };
+    let d = tempfile::tempdir().unwrap();
+    let missing = d.path().join("missing.db");
+    assert!(
+        Store::open_existing_seeded(&missing, &clock, &seed)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!((calls.get(), reads.get()), (0, 0), "no store, no migration");
+
+    let fresh = d.path().join("fresh.db");
+    Store::open_seeded(&fresh, &clock, &seed).unwrap();
+    assert_eq!(
+        (calls.get(), reads.get()),
+        (1, 1),
+        "a fresh store runs every step"
+    );
+    Store::open_seeded(&fresh, &clock, &seed).unwrap();
+    Store::open_existing_seeded(&fresh, &clock, &seed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (calls.get(), reads.get()),
+        (1, 1),
+        "a version-3 store runs none"
+    );
+
+    let older = d.path().join("v2.db");
+    version_2_store(&older);
+    Store::open_existing_seeded(&older, &clock, &seed)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (calls.get(), reads.get()),
+        (2, 2),
+        "a version-2 store runs step 3"
+    );
+    Store::open_seeded(&older, &clock, &seed).unwrap();
+    assert_eq!((calls.get(), reads.get()), (2, 2));
+}
+
+#[test]
+fn the_epoch_is_read_once_the_migration_holds_the_write_lock() {
+    // An older process may switch accounts while this one waits for the write lock: the epoch,
+    // and the active account the seed records as of it, are read only once the lock is held.
+    // The clock probes the lock itself: while the migration's IMMEDIATE transaction is open, a
+    // second connection cannot begin one, even with no wait.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    version_2_store(&path);
+    let probes = std::cell::RefCell::new(Vec::new());
+    Store::open_seeded(
+        &path,
+        &|| {
+            let probe = rusqlite::Connection::open(&path).unwrap();
+            probe.busy_timeout(std::time::Duration::ZERO).unwrap();
+            let busy = matches!(
+                probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;"),
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy
+            );
+            probes.borrow_mut().push(busy);
+            NOW
+        },
+        &no_profiles,
+    )
+    .unwrap();
+    assert_eq!(
+        *probes.borrow(),
+        [true],
+        "the clock is read once, with the migration's write lock held"
+    );
+}
+
+#[test]
+fn active_history_triggers_on_switch_add_and_remove() {
+    // Spec §4: every change of the active account, and only a change, adds a row at SQLite's
+    // now; a removal that clears the row through `ON DELETE SET NULL` records no account.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    let s = Store::open(&path).unwrap();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    assert!(
+        history_rows(&path).is_empty(),
+        "nothing was active at the epoch"
+    );
+    let before = wall_ms();
+    s.set_active(&cc(), Some(&a), Some(0)).unwrap(); // the first account: an insert
+    s.set_active(&cc(), Some(&a), Some(1)).unwrap(); // the same account: no change
+    s.commit_switch(&cc(), &b, 0, &switch_event_to(&b), None)
+        .unwrap(); // a switch: an update
+    s.delete_account(&b).unwrap(); // a removal: SET NULL
+    s.set_active(&cc(), Some(&a), Some(0)).unwrap(); // from none to a
+    let after = wall_ms();
+    let rows = history_rows(&path);
+    assert_eq!(
+        rows.iter()
+            .map(|(p, _, account, _)| (p.as_str(), account.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("claude-code", Some("a")),
+            ("claude-code", Some("b")),
+            ("claude-code", None),
+            ("claude-code", Some("a")),
+        ]
+    );
+    for (_, at, _, recorded_at) in &rows {
+        assert!(
+            (before - 1..=after + 1).contains(at),
+            "{before} {at} {after}"
+        );
+        assert_eq!(at, recorded_at);
+    }
+}
+
+#[test]
+fn a_failed_seed_rolls_back_the_whole_migration() {
+    // Spec §4: step 3 lands with the version or not at all.
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("t.db");
+    version_2_store(&path);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Store::open_seeded(&path, &|| NOW, &|| panic!("the seed failed"))
+    }));
+    assert!(failed.is_err());
+    assert_eq!(raw_version(&path), 2);
+    assert!(!has_table(&path, "token_epoch"));
+    assert!(!has_table(&path, "active_history"));
+
+    // A step whose SQL fails takes the rest with it, before any profile is listed.
+    let blocked = d.path().join("blocked.db");
+    version_2_store(&blocked);
+    rusqlite::Connection::open(&blocked)
+        .unwrap()
+        .execute_batch("CREATE TABLE token_files (x);")
+        .unwrap();
+    let calls = Cell::new(0);
+    let err = Store::open_seeded(&blocked, &|| NOW, &|| {
+        calls.set(calls.get() + 1);
+        Some(Vec::new())
+    })
+    .err()
+    .expect("refused");
+    assert!(matches!(err, StoreError::Sqlite(_)), "{err:?}");
+    assert_eq!(calls.get(), 0);
+    assert_eq!(raw_version(&blocked), 2);
+    assert!(!has_table(&blocked, "token_epoch"));
+
+    // The first store migrates once its seed succeeds.
+    let s = Store::open_seeded(&path, &|| NOW, &no_profiles).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 3);
+}
+
+/// `dir`'s birth time in epoch ms, or 0 where the filesystem reports none.
+fn born_ms(dir: &std::path::Path) -> i64 {
+    std::fs::metadata(dir)
+        .unwrap()
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+#[test]
+fn an_engine_opened_store_is_seeded() {
+    // Spec §4 Seeding through the engine: each directory under `sessions/`, of the provider its
+    // marker names or, with none, of each provider with sessions; in use as §12.6 judges it.
+    let fx = Fx::new();
+    let idle = fx.make_profile_for(fx.cc.as_ref(), &AccountId::from_string("idle"));
+    let busy = fx.make_profile_for(fx.cc.as_ref(), &AccountId::from_string("busy"));
+    fx.live_record(&busy, 4242, "interactive");
+    let bare = fx.env.data_dir().join("sessions/bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    std::fs::write(fx.env.data_dir().join("sessions/notes.txt"), "x").unwrap();
+    let path = fx.env.data_dir().join("tagteam.db");
+    version_2_store(&path);
+
+    let store = fx.engine.existing_store().unwrap().expect("a store");
+    assert_eq!(store.schema_version().unwrap(), 3);
+    drop(store);
+    let at = fx.engine.now_ms();
+    assert_eq!(
+        epoch_rows(&path),
+        [(at, 1)],
+        "the epoch is the engine's clock"
+    );
+    assert_eq!(
+        launch_rows(&path),
+        [
+            launch("bare", born_ms(&bare), Some(at), at),
+            launch("busy", born_ms(&busy), None, at),
+            launch("idle", born_ms(&idle), Some(at), at),
+        ]
+    );
+
+    // A fresh store is seeded the same way.
+    let fresh = Fx::new();
+    let only = fresh.make_profile_for(fresh.cc.as_ref(), &AccountId::from_string("only"));
+    fresh.engine.store().unwrap();
+    let fresh_path = fresh.env.data_dir().join("tagteam.db");
+    let at = fresh.engine.now_ms();
+    assert_eq!(epoch_rows(&fresh_path), [(at, 1)]);
+    assert_eq!(
+        launch_rows(&fresh_path),
+        [launch("only", born_ms(&only), Some(at), at)]
+    );
+}
+
+#[test]
+fn an_engine_that_cannot_list_the_profiles_records_unseeded() {
+    // Ruling R1: `sessions/` exists but cannot be listed, so a profile may have gone unseeded.
+    // Root reads it whatever its mode, so the case cannot be made as root.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let fx = Fx::new();
+    fx.make_profile_for(fx.cc.as_ref(), &AccountId::from_string("hidden"));
+    let sessions = fx.env.data_dir().join("sessions");
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let opened = fx.engine.store().map(drop);
+    std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+    opened.unwrap();
+    let path = fx.env.data_dir().join("tagteam.db");
+    assert_eq!(epoch_rows(&path), [(fx.engine.now_ms(), 0)]);
+    assert!(launch_rows(&path).is_empty());
 }

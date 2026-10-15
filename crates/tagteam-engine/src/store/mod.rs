@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tagteam_core::autoswitch::{AutoState, Departure, Trigger};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::atomic::ensure_private_dir;
-use tagteam_provider::{Identity, ProcessStamp};
+use tagteam_provider::{Clock, Identity, ProcessStamp, SystemClock};
 
 mod usage;
 
@@ -35,13 +35,20 @@ UPDATE active_accounts SET login_epoch =
   (SELECT login_epoch FROM accounts WHERE accounts.id = active_accounts.account_id)
   WHERE account_id IS NOT NULL;";
 
+/// Version 3 (token report spec §4): the token index, the session evidence and the epoch.
+/// `migrate` follows it, in the same transaction, with `seed_tokens_step`.
+const MIGRATION_V3: &str = include_str!("schema_v3.sql");
+
 /// The migration ladder: step `n` takes a file from version `n` to `n + 1`. A fresh file runs
 /// every step, and an older one only the steps above its version.
-const MIGRATIONS: [&str; 2] = [SCHEMA_V1, MIGRATION_V2];
+const MIGRATIONS: [&str; 3] = [SCHEMA_V1, MIGRATION_V2, MIGRATION_V3];
+
+/// The step of `MIGRATIONS` that adds the token tables, which `seed_tokens_step` completes.
+const TOKENS_STEP: usize = 2;
 
 /// The `PRAGMA user_version` this build knows how to read and write. A stored version above
 /// this is a store written by a newer tagteam; `migrate` refuses it rather than guessing.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const _: () = assert!(MIGRATIONS.len() as i64 == SCHEMA_VERSION);
 
@@ -95,6 +102,63 @@ impl StoreError {
             _ => None,
         }
     }
+}
+
+/// A session profile found when the store migrates to version 3 (token report spec §4
+/// Seeding): its directory's name is the account, `started_at_ms` its birth time (0 when the
+/// filesystem reports none), and `in_use` whether a session owns it (core §12.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedLaunch {
+    pub provider: ProviderId,
+    pub account_id: String,
+    pub started_at_ms: i64,
+    pub in_use: bool,
+}
+
+/// The session profiles to seed: `None` when they cannot all be listed.
+type Seed<'a> = &'a dyn Fn() -> Option<Vec<SeedLaunch>>;
+
+/// What a migration to version 3 records (token report spec §4): the clock that dates the
+/// epoch, and the profiles to seed, both asked only when step 3 runs. A raw `Store::open` has
+/// no seed.
+struct Epoch<'a> {
+    now: &'a dyn Fn() -> i64,
+    seed: Option<Seed<'a>>,
+}
+
+/// The rows step 3 adds beside its SQL, in the ladder's transaction (token report spec §4):
+/// the epoch, the active account of each provider as of that same instant, and one launch per
+/// listed profile, closed at the epoch unless it is in use. The clock is read once, here,
+/// under the transaction's write lock, so no switch another process commits while this one
+/// waits for the lock falls after the epoch the seeded history dates. Unless every profile
+/// was listed, the epoch records `seeded = 0` (ruling R1).
+fn seed_tokens_step(c: &Connection, epoch: &Epoch<'_>) -> Result<(), StoreError> {
+    let now = (epoch.now)();
+    let launches = epoch.seed.and_then(|seed| seed());
+    c.execute(
+        "INSERT INTO token_epoch (at, seeded) VALUES (?1, ?2)",
+        params![now, launches.is_some()],
+    )?;
+    c.execute(
+        "INSERT INTO active_history (provider, at, account_id, recorded_at) \
+         SELECT provider, ?1, account_id, ?1 FROM active_accounts",
+        [now],
+    )?;
+    let mut insert = c.prepare(
+        "INSERT OR IGNORE INTO run_launches \
+         (provider, account_id, started_at, ended_at, pid, recorded_at) \
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+    )?;
+    for launch in launches.unwrap_or_default() {
+        insert.execute(params![
+            launch.provider.as_str(),
+            launch.account_id,
+            launch.started_at_ms,
+            (!launch.in_use).then_some(now),
+            now,
+        ])?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -626,7 +690,38 @@ fn create_private(path: &Path) -> io::Result<()> {
 }
 
 impl Store {
+    /// `open_seeded` without a seed: a migration to version 3 takes the system clock as the
+    /// epoch, lists no profile and records `token_epoch.seeded = 0` (ruling R1). The engine
+    /// always seeds.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::create_and_open(
+            path,
+            &Epoch {
+                now: &|| SystemClock.now_ms(),
+                seed: None,
+            },
+        )
+    }
+
+    /// Opens the store, creating it (and its directory, 0700) when needed. When this open
+    /// applies migration step 3, `now` dates the epoch, read once under the migration's write
+    /// lock, and `seed` lists the session profiles inside its transaction (token report spec
+    /// §4 Seeding); neither is called otherwise.
+    pub fn open_seeded(
+        path: &Path,
+        now: &dyn Fn() -> i64,
+        seed: &dyn Fn() -> Option<Vec<SeedLaunch>>,
+    ) -> Result<Self, StoreError> {
+        Self::create_and_open(
+            path,
+            &Epoch {
+                now,
+                seed: Some(seed),
+            },
+        )
+    }
+
+    fn create_and_open(path: &Path, epoch: &Epoch<'_>) -> Result<Self, StoreError> {
         if let Some(dir) = path.parent() {
             ensure_private_dir(dir)?;
         }
@@ -635,7 +730,7 @@ impl Store {
         let store = Self {
             conn: Mutex::new(conn),
         };
-        store.migrate()?;
+        store.migrate(epoch)?;
         Ok(store)
     }
 
@@ -649,6 +744,32 @@ impl Store {
     /// process simply cannot read (wrong permissions, a stale root-owned file, ...) is reported
     /// as an error instead of silently treated as "no store".
     pub fn open_existing(path: &Path) -> Result<Option<Self>, StoreError> {
+        Self::open_existing_with(
+            path,
+            &Epoch {
+                now: &|| SystemClock.now_ms(),
+                seed: None,
+            },
+        )
+    }
+
+    /// `open_existing`, dating the epoch and seeding as `open_seeded` does when the open
+    /// applies step 3.
+    pub fn open_existing_seeded(
+        path: &Path,
+        now: &dyn Fn() -> i64,
+        seed: &dyn Fn() -> Option<Vec<SeedLaunch>>,
+    ) -> Result<Option<Self>, StoreError> {
+        Self::open_existing_with(
+            path,
+            &Epoch {
+                now,
+                seed: Some(seed),
+            },
+        )
+    }
+
+    fn open_existing_with(path: &Path, epoch: &Epoch<'_>) -> Result<Option<Self>, StoreError> {
         if !path.try_exists()? {
             return Ok(None);
         }
@@ -665,7 +786,7 @@ impl Store {
         let store = Self {
             conn: Mutex::new(conn),
         };
-        store.migrate()?;
+        store.migrate(epoch)?;
         Ok(Some(store))
     }
 
@@ -737,8 +858,10 @@ impl Store {
     /// and the version bump commit together, so a file is never left between two versions. WAL
     /// mode is set only once every such check has passed and, when a step ran, only after that
     /// transaction has committed — WAL can't be switched from inside a transaction, and a file
-    /// this build ends up refusing must never have been touched at all.
-    fn migrate(&self) -> Result<(), StoreError> {
+    /// this build ends up refusing must never have been touched at all. Step 3's rows
+    /// (`seed_tokens_step`, which reads the clock and calls the seed) land in that same
+    /// transaction.
+    fn migrate(&self, epoch: &Epoch<'_>) -> Result<(), StoreError> {
         let mut c = self.lock();
         let version = user_version(&c)?;
         if version > SCHEMA_VERSION {
@@ -752,8 +875,11 @@ impl Store {
             }
             if version < SCHEMA_VERSION {
                 let done = usize::try_from(version).unwrap_or(0);
-                for step in &MIGRATIONS[done..] {
+                for (n, step) in MIGRATIONS.iter().enumerate().skip(done) {
                     tx.execute_batch(step)?;
+                    if n == TOKENS_STEP {
+                        seed_tokens_step(&tx, epoch)?;
+                    }
                 }
                 tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
             }
