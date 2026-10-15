@@ -18,7 +18,7 @@ use super::{
     AccountSel, ActiveBlock, Basis, Cost, PeriodKey, RowAccount, RowKey, TokenCounts,
     TokenGrouping, TokenPeriod, TokenQuery, TokenRow, TokenTotal,
 };
-use crate::store::{AccountRow, EventRow, Store, StoreError, UsageRow};
+use crate::store::{AccountRow, EventRow, LaunchRow, Store, StoreError, UsageRow};
 
 /// How far before `since` a block report reads (spec §9). A block that straddles `since` is
 /// then whole, and the chain of inferred blocks leading to it starts after a quiet gap of five
@@ -47,22 +47,30 @@ pub(super) fn usage(q: &TokenQuery, store: &Store) -> Result<Vec<UsageRow>, Stor
     }
 }
 
-/// The rows and totals of `q` (spec §10.1), from the responses `usage` read for it. `pending`
-/// are the launches `run` kept in pending files (spec §6.1), placed as stored ones; the stored
-/// launches are read here, after both (`Engine::token_report` says why). `now_ms` decides the
-/// active block.
+/// What `Engine::token_report` reads for `group`, in the order it reads it (spec §7.2).
+pub(super) struct Reads {
+    /// The responses `usage` read for the query.
+    pub(super) usage: Vec<UsageRow>,
+    /// The launches `run` kept in pending files (spec §6.1), placed as stored ones.
+    pub(super) pending: Vec<PendingLaunch>,
+    /// The stored launches.
+    pub(super) launches: Vec<LaunchRow>,
+}
+
+/// The rows and totals of `q` (spec §10.1), from what `token_report` read. `now_ms` decides
+/// the active block.
 pub(super) fn group(
     q: &TokenQuery,
     p: &dyn Provider,
     store: &Store,
-    usage: &[UsageRow],
-    pending: &[PendingLaunch],
+    reads: &Reads,
     prices: &Prices,
     now_ms: i64,
 ) -> Result<Grouped, StoreError> {
     let by_block = q.period == TokenPeriod::Block;
+    let usage = &reads.usage;
     let accounts = store.accounts(&q.provider)?;
-    let mut evidence = Evidence::load(store, &q.provider, &accounts, pending)?;
+    let mut evidence = Evidence::load(store, &q.provider, &accounts, reads)?;
     let mut t = Tables {
         slots: Slots::new(&accounts, q.accounts.as_deref()),
         models: Models::new(q.models.as_deref()),
@@ -204,7 +212,7 @@ impl Evidence {
         store: &Store,
         provider: &ProviderId,
         accounts: &[AccountRow],
-        pending: &[PendingLaunch],
+        reads: &Reads,
     ) -> Result<Self, StoreError> {
         let mut sightings: HashMap<String, Vec<Sighting>> = HashMap::new();
         for s in store.sightings(provider)? {
@@ -219,10 +227,10 @@ impl Evidence {
                 last_ms: s.last_at,
             });
         }
-        let stored = store.launches(provider)?;
+        let stored = &reads.launches;
         // A pending launch the store already holds is the store's: a scan that recorded it has
         // not yet removed the file, or `run` recorded it late.
-        let unstored = pending.iter().filter(|l| {
+        let unstored = reads.pending.iter().filter(|l| {
             !stored
                 .iter()
                 .any(|s| s.account_id == l.account_id.as_str() && s.started_at == l.started_at_ms)

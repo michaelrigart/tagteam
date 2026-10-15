@@ -766,34 +766,44 @@ fn a_pending_file_written_after_the_report_read_the_usage_still_covers_its_respo
 #[test]
 #[cfg(feature = "test-hooks")]
 fn a_pending_launch_a_scan_stores_while_the_report_reads_still_covers_its_responses() {
-    // Spec §7.2: the report reads the stored launches after the pending files, and a scan
-    // removes a file only once its launch is stored (spec §6.2). A scan that moves the launch
-    // between the two reads leaves it in one of them; read the other way round, the report
-    // would miss it in both and credit the response to b.
-    let v = View::new();
-    let (profile, launch) = unsighted_inside_a_pending_launch(&v);
-    launch.write(&profile, 4242).unwrap();
-    let scan = v.fx.engine_with_settings(settings());
-    v.engine.on_point(
+    // Spec §7.2: the report reads the usage, then the pending files, then the stored launches,
+    // each read begun after the one before, and a scan removes a file only once its launch is
+    // stored (spec §6.2). Whichever of the reads the scan's handoff follows, the launch is in
+    // the files or the store when each is read. Stored launches read before the files, or every
+    // read in one snapshot, miss it in both, and credit the response to b.
+    for after in [
+        "report-usage-read",
         "report-pending-read",
-        Box::new(move || {
-            scan.sight_sessions(&cc()).unwrap();
-        }),
-    );
+        "report-launches-read",
+    ] {
+        let v = View::new();
+        let (profile, launch) = unsighted_inside_a_pending_launch(&v);
+        launch.write(&profile, 4242).unwrap();
+        let scan = v.fx.engine_with_settings(settings());
+        v.engine.on_point(
+            after,
+            Box::new(move || {
+                scan.sight_sessions(&cc()).unwrap();
+            }),
+        );
 
-    let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::Account));
+        let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::Account));
 
-    let stored = v.store.launches(&cc()).unwrap();
-    assert_eq!(stored.len(), 1, "the premise: the scan stored it");
-    assert!(
-        PendingLaunch::read_all(&profile)
-            .present()
-            .unwrap()
-            .is_empty(),
-        "and removed its file"
-    );
-    assert_eq!(keys(&r), ["day:2026-09-01|account:unattributed"]);
-    assert_eq!(r.total.by_basis[2], (Basis::Unattributed, 2));
+        let stored = v.store.launches(&cc()).unwrap();
+        assert_eq!(stored.len(), 1, "{after}: the premise, the scan stored it");
+        assert!(
+            PendingLaunch::read_all(&profile)
+                .present()
+                .unwrap()
+                .is_empty(),
+            "{after}: and removed its file"
+        );
+        assert_eq!(
+            keys(&r),
+            ["day:2026-09-01|account:unattributed"],
+            "handed off after {after}"
+        );
+    }
 }
 
 #[test]

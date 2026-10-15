@@ -379,27 +379,26 @@ impl Engine {
         {
             return Ok(report);
         }
-        // The usage, the pending files, then the stored launches (in `group`), as the doc says.
-        // Each store read is a statement of its own: a transaction opened before the files are
-        // read would fix the launches' snapshot there. A test stops after each read.
+        // The usage, the pending files, then the stored launches, as the doc says. Each store
+        // read is a statement of its own: a transaction opened before the files are read would
+        // fix the launches' snapshot there. A test stops after each read.
         let usage = group::usage(q, &store)?;
         hooks::point(self, "report-usage-read")?;
         // Launches `run` kept in a pending file count as stored ones, read only.
-        let pending: Vec<_> = self
+        let pending = self
             .pending_launches(p.as_ref())
             .into_iter()
             .map(|(_, launch)| launch)
             .collect();
         hooks::point(self, "report-pending-read")?;
-        let grouped = group::group(
-            q,
-            p.as_ref(),
-            &store,
-            &usage,
-            &pending,
-            &prices,
-            self.now_ms(),
-        )?;
+        let launches = store.launches(&q.provider)?;
+        hooks::point(self, "report-launches-read")?;
+        let reads = group::Reads {
+            usage,
+            pending,
+            launches,
+        };
+        let grouped = group::group(q, p.as_ref(), &store, &reads, &prices, self.now_ms())?;
         report.rows = grouped.rows;
         report.total = grouped.total;
         report.unpriced_models = grouped.unpriced_models;
