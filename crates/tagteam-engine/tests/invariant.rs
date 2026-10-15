@@ -5,15 +5,20 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use common::{
-    Fx, HomeSnapshot, assert_journal_cleared, crashed_switch, splice_config_key,
-    write_target_credential,
+    Fx, HomeSnapshot, Recorded, assert_journal_cleared, crashed_switch, record_reading,
+    splice_config_key, usage_fixture, usage_window, write_target_credential,
 };
 use serde_json::json;
 use tagteam_cc::live::Platform;
+use tagteam_core::WindowKind;
+use tagteam_core::autoswitch::{AutoConfig, Decision, NoSwitchReason, Strategy};
 use tagteam_core::time::format_iso8601;
+use tagteam_engine::auto::TickOutcome;
+use tagteam_engine::collect::CollectMode;
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest};
 use tagteam_engine::tokens::{RefreshOutcome, TokenGrouping, TokenPeriod, TokenQuery, Wait};
 use tagteam_provider::liveness::FakeProcess;
+use tagteam_provider::{Clock, Provider};
 
 fn check(fx: &Fx, step: &str, op: impl FnOnce()) {
     let before = fx.snapshot();
@@ -453,6 +458,109 @@ fn every_m1_command_writes_only_the_identity_surface_through_symlinked_config_on
             .is_symlink(),
         "the credentials-file link itself must survive as a link"
     );
+}
+
+/// The fixture clock's start (`Fx`), in seconds.
+const T0: i64 = 1_790_000_000;
+
+/// D12, §15.3: what the daemon's provider job runs (D4.3), each step under the comparison.
+/// `daemon.lock` and the engine lock records live in tagteam's data directory, which the walk
+/// leaves out with the rest of tagteam's own data. The steps are:
+/// - a tick with the daemon's source that switches
+/// - a `collect` round that refreshes the live token (§7.5) and fetches
+/// - a tick over a login tagteam does not manage, then its `collect` round
+fn run_the_daemon_s_work_on(fx: &Fx) {
+    seed_realistic_state(fx);
+    login_with_extras(fx, "a@x.co", "rt-a");
+    let a = fx.engine.add_live(fx.add_options()).unwrap().account.id;
+    login_with_extras(fx, "b@x.co", "rt-b");
+    let b = fx.engine.add_live(fx.add_options()).unwrap().account.id;
+    let provider = fx.provider();
+    let cfg = AutoConfig {
+        threshold: 90.0,
+        hysteresis_pct: 10.0,
+        cooldown_s: 300,
+        interval_s: 60,
+        unhealthy_ticks: 3,
+        strategy: Strategy::Best,
+        include_api_key_accounts: false,
+        models: Vec::new(),
+        long_window: fx.cc.primary_long_window().map(str::to_owned),
+    };
+    let reading = |long: f64| {
+        vec![
+            usage_window("5h", WindowKind::Short, 10.0, T0 + 9_630),
+            usage_window("7d", WindowKind::Long, long, T0 + 291_630),
+        ]
+    };
+    record_reading(&fx.engine, &a, &reading(20.0), T0, T0 + 300);
+    record_reading(&fx.engine, &b, &reading(95.0), T0, T0 + 300);
+    let daemon = || {
+        fx.engine
+            .auto(&provider, cfg.clone(), false)
+            .unwrap()
+            .unwrap()
+            .with_source("daemon")
+    };
+    check(fx, "daemon tick that switches", || {
+        let (outcome, decision) = daemon().tick(&Recorded::default()).unwrap();
+        assert_eq!(outcome, TickOutcome::Switched, "{decision:?}");
+    });
+    assert_eq!(fx.live_email().as_deref(), Some("a@x.co"));
+    assert_extra_credential_keys_present(fx);
+
+    // `collect`: a, now live, is due and its access token expired, so §7.5 refreshes it before
+    // the fetch. The scripted usage reply repeats for the candidate.
+    fx.clock.advance_ms(400_000);
+    let mut live = fx.live_credential().unwrap();
+    live["claudeAiOauth"]["expiresAt"] = json!(fx.clock.now_ms());
+    fx.set_live_credential(live.to_string().as_bytes());
+    fx.script_refresh(Some("rt-a2"));
+    fx.script_usage(200, usage_fixture());
+    let collect = || CollectMode::Scheduled {
+        provider: provider.clone(),
+        threshold: 90.0,
+        models: Vec::new(),
+    };
+    check(
+        fx,
+        "daemon collect round with an active-token refresh",
+        || drop(fx.engine.collect_usage(collect()).unwrap()),
+    );
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-a2"));
+
+    // A login tagteam does not manage. The tick stops at §11.2 step 2, and its `collect` round
+    // collects the candidates (D4.3).
+    login_with_extras(fx, "stranger@x.co", "rt-stranger");
+    fx.clock.advance_ms(400_000);
+    check(
+        fx,
+        "daemon tick over an unmanaged login, then its collect round",
+        || {
+            let (_, decision) = daemon().tick(&Recorded::default()).unwrap();
+            assert!(
+                matches!(
+                    decision,
+                    Decision::NoSwitch {
+                        reason: NoSwitchReason::UnmanagedActiveAccount,
+                        ..
+                    }
+                ),
+                "{decision:?}"
+            );
+            drop(fx.engine.collect_usage(collect()).unwrap());
+        },
+    );
+}
+
+#[test]
+fn the_daemon_s_runs_write_only_the_identity_surface_on_macos() {
+    run_the_daemon_s_work_on(&Fx::with_platform(Platform::MacOs));
+}
+
+#[test]
+fn the_daemon_s_runs_write_only_the_identity_surface_on_linux() {
+    run_the_daemon_s_work_on(&Fx::with_platform(Platform::Linux));
 }
 
 #[test]

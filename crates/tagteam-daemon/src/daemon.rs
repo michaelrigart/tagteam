@@ -396,16 +396,24 @@ impl Job for SettingsJob {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
 
     use serde_json::json;
+    use tagteam_cc::ClaudeCode;
+    use tagteam_cc::live::Platform;
     use tagteam_core::AccountId;
     use tagteam_engine::auto::AutoEvent;
     use tagteam_engine::daemon::DaemonRecord;
     use tagteam_engine::settings::{NotifyEvent, config_path};
+    use tagteam_engine::vault::SERVICE;
+    use tagteam_provider::Provider;
     use tagteam_provider::process::Captured;
     use tagteam_provider::profile::ProfileMarker;
+    use tagteam_provider::splice::{remove_top_level, replace_top_level};
 
     // `super::*` already brings `Instant`, `NotifyInfo`, `FlockGuard`, `Read`, `RunShell`,
     // `ProgramStamp` and the lock-record functions.
@@ -466,6 +474,135 @@ mod tests {
         home.read_windows(&w, &windows(10.0, 20.0), T0, T0 + 300);
         home.read_windows(&a, &windows(10.0, a_long), T0, T0 + 300);
         home
+    }
+
+    /// Every file, directory and link under `dir` except under `skip`, by path: its kind, its
+    /// mode and what it holds, never following a link.
+    fn walk(dir: &Path, skip: &Path, out: &mut BTreeMap<PathBuf, (char, u32, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.starts_with(skip) {
+                continue;
+            }
+            let meta = fs::symlink_metadata(&path).unwrap();
+            let mode = meta.permissions().mode() & 0o7777;
+            let held = if meta.file_type().is_symlink() {
+                (
+                    'l',
+                    fs::read_link(&path)
+                        .unwrap()
+                        .as_os_str()
+                        .as_bytes()
+                        .to_vec(),
+                )
+            } else if meta.is_dir() {
+                walk(&path, skip, out);
+                ('d', Vec::new())
+            } else {
+                ('f', fs::read(&path).unwrap())
+            };
+            out.insert(path, (held.0, mode, held.1));
+        }
+    }
+
+    /// What a daemon run must leave byte-identical (D12, §3). That is every entry under HOME
+    /// except tagteam's data directory, and every Keychain item except the vault's. Claude
+    /// Code's identity surface is taken out: its JSON file without its declared keys, and its
+    /// credential files and items left out. The engine's pinned test holds what changes inside
+    /// them to §3.
+    #[allow(clippy::type_complexity)]
+    fn outside_the_surface(
+        home: &Fx,
+    ) -> (
+        BTreeMap<PathBuf, (char, u32, Vec<u8>)>,
+        BTreeMap<(String, String), Vec<u8>>,
+    ) {
+        let surface = ClaudeCode::new(home.kc.clone(), Platform::MacOs).identity_surface(&home.env);
+        let mut files = BTreeMap::new();
+        walk(&home.env.home, &home.env.data_dir(), &mut files);
+        for (path, keys) in &surface.json_keys {
+            if let Some((_, _, bytes)) = files.get_mut(path) {
+                for key in keys {
+                    *bytes = remove_top_level(bytes, key).unwrap();
+                }
+            }
+        }
+        for path in &surface.credential_files {
+            files.remove(path);
+        }
+        let items = home
+            .kc
+            .items()
+            .into_iter()
+            .filter(|(item, _)| {
+                item.0 != SERVICE
+                    && !surface.credential_items.contains(item)
+                    && !surface.owned_items.contains(item)
+            })
+            .collect();
+        (files, items)
+    }
+
+    #[test]
+    fn a_daemon_run_with_a_switch_writes_nothing_outside_the_identity_surface() {
+        // D12, §15.3: a run of the whole daemon (its lock, provider job, watches and
+        // notifier) that switches. Claude Code's other state stays byte-identical, as does
+        // `~/.claude.json` without its surface keys, among them a key of its own.
+        let home = two_at(95.0, Some("spare"));
+        let config = home.env.home.join(".claude.json");
+        let doc = fs::read(&config).unwrap();
+        fs::write(
+            &config,
+            replace_top_level(&doc, "userID", &json!("u")).unwrap(),
+        )
+        .unwrap();
+        let claude = home.env.home.join(".claude");
+        fs::create_dir_all(claude.join("projects/-work-app/memory")).unwrap();
+        fs::write(
+            claude.join("projects/-work-app/memory/MEMORY.md"),
+            "remember this\n",
+        )
+        .unwrap();
+        fs::write(claude.join("settings.json"), "{\"theme\":\"dark\"}\n").unwrap();
+        fs::write(claude.join("CLAUDE.md"), "instructions\n").unwrap();
+        fs::set_permissions(claude.join("CLAUDE.md"), fs::Permissions::from_mode(0o640)).unwrap();
+        home.kc.put("Other Service", "someone", b"unrelated");
+        let before = outside_the_surface(&home);
+        let opts = DaemonOptions {
+            backend: Some(Backend::Osascript),
+            ..options(&home)
+        };
+        let started = Daemon::start(&home.engine, opts, &mut |n| panic!("{n}")).unwrap();
+        let sink = Emitted::new(&home.clock);
+        assert_eq!(
+            started.serve(&sink, &stop_after(&home, 3), &mut || 0.0),
+            DaemonExit::Signal
+        );
+        assert!(
+            sink.events()
+                .iter()
+                .any(|(_, e)| matches!(e, DaemonEvent::Auto(AutoEvent::Switch { .. }))),
+            "the run switched: {:?}",
+            sink.events()
+        );
+        let after = outside_the_surface(&home);
+        assert_eq!(
+            before.1, after.1,
+            "a Keychain item outside the surface changed"
+        );
+        for (path, entry) in &after.0 {
+            assert_eq!(
+                before.0.get(path),
+                Some(entry),
+                "{} changed",
+                path.display()
+            );
+        }
+        assert_eq!(
+            before.0.len(),
+            after.0.len(),
+            "an entry outside the surface went away"
+        );
     }
 
     #[test]
