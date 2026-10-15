@@ -2893,7 +2893,8 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
     mode other than 0600, or a live daemon with no socket file → warn; a path too long to bind
     (daemon spec D5.1) → fail, once a daemon runs or a unit is installed, and not judged
     before
-  - `daemon.notify`: notifications on and no backend (`notify-send` missing) → warn
+  - `daemon.notify`: notifications on and no backend (`notify-send` missing) → warn, once a
+    daemon runs or a unit is installed, and not checked before
   - `launchctl`, `systemctl` or `loginctl` missing, hung or failing → warn, naming why; it
     never fails the run by itself
 - **Settings** (§6.4): an unparseable file → fail, since every command runs on the defaults;
