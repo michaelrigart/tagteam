@@ -594,8 +594,12 @@ program path and environment take effect at once (D9.2, D9.3).
   - `Environment=` assignments are double-quoted, with `\` and `"` escaped and `%` written
     `%%` (specifiers are expanded there). `$` is left alone: `Environment=` expands no
     variables.
-  - `ExecStart=`'s program path is double-quoted, with `\` and `"` escaped, `%` written `%%`
-    and `$` written `$$` (command lines expand both).
+  - `ExecStart=`'s program path is double-quoted, with `\` and `"` escaped and `%` written
+    `%%`. A program path holding `$` is refused: systemd starts the unexpanded first word, but
+    expands `$` in argv, argv[0] included, so `$$` would name a file that is not there and a
+    bare `$` would make argv[0] differ from the path the daemon's upgrade watch (D4.5) stats.
+    The error names the program path, never a value, and suggests installing tagteam at
+    another path, or `--print` and a hand edit. A plist carries `$` literally.
   - A value or path holding a newline or a NUL is refused.
 - **Loading:** `systemctl --user daemon-reload`, `systemctl --user enable tagteam.service`, then
   `systemctl --user restart tagteam.service`, which starts it when it is stopped and restarts
@@ -713,7 +717,7 @@ path is short enough for `sun_path`: macOS's `$TMPDIR` can push a socket path pa
   - `notify.enabled` and `notify.events` are honoured.
 - **Service units.** The plist and the systemd unit are snapshot tested, with recorded variables
   and quoting, including a value holding `$`, `%`, `"` and `\` that must reach the daemon
-  unchanged. A reinstall restarts a running daemon; `--no-start` starts and stops nothing. `install`, `uninstall` and `status` are run against a scripted spawner that checks
+  unchanged, and a systemd program path holding `$`, which is refused. A reinstall restarts a running daemon; `--no-start` starts and stops nothing. `install`, `uninstall` and `status` are run against a scripted spawner that checks
   `launchctl` and `systemctl` argv. A real launchd and systemd round trip is an `#[ignore]` test,
   run by hand.
 - **Concurrency** (in separate processes, §15.2):
@@ -785,5 +789,20 @@ design:
   permanent warning.
 - **D9.4:** `uninstall` asks the manager whether or not the unit file exists, so a loaded unit
   whose file is gone is still stopped; `--json` gains `stopped` for that case.
+- **D9.3:** a program path holding `$` is refused when the systemd unit is rendered, instead of
+  written `$$`: systemd runs the unexpanded first word of `ExecStart=` but expands `$` in
+  argv[0], so no spelling of it names the file that the daemon's upgrade watch (D4.5) stats.
+- **D10:** `daemon.socket` warns when the entry at `daemon.sock` is not a socket (a directory, a
+  file, a link), whether or not a daemon runs, since the daemon cannot bind over it; it is
+  checked before the mode and the liveness.
+- **D5.3:** a string `id` longer than 128 bytes is not usable: the request is a `bad-request`
+  with a null `id`, whose message does not repeat it. A reply echoes the id, so this keeps
+  every reply line under D5.2's 64 KiB; an integer id is at most 20 bytes, and the other
+  outgoing lines scale with the providers and jobs or hold positions and short strings. The
+  client's ids are integers.
+- **D6.2:** the notifier runs its program through a discard mode of the process port
+  (`run_discarded`): stdin, stdout and stderr are null, in the program's own process group and
+  under the same 5 s kill, so no output is buffered and no pipe is left for a descendant to
+  hold. The WARN-once/DEBUG logging is built from the exit status and the timeout only.
 - **D12, D14:** the perf daemon runs at the shortest auto-switch interval (15 s), since
   §6.4 allows nothing shorter.
