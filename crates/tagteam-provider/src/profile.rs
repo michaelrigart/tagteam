@@ -436,13 +436,12 @@ impl PendingLaunch {
         }
     }
 
-    /// Every `*.json` file in `profile`'s pending directory, sorted by name: a launch, a file
-    /// that is not one, or one that cannot be `stat`ed or read, which may hold a launch.
-    /// Anything else is ignored: a writer's temp file, a link, a directory, and a file gone
-    /// since the listing, which goes only once its launch is stored. A directory that is not
-    /// there, or a path that is not a directory, holds none; one that cannot be listed is
-    /// `Unreadable`. Each file is `stat`ed before it is read, so its `stamp` is never newer
-    /// than what was parsed.
+    /// Every `*.json` file in `profile`'s pending directory, sorted by name: a launch, or a
+    /// file whose content cannot be used, with the start its name gives. Anything else is
+    /// ignored: a writer's temp file, a link, a directory, and a file gone since the listing,
+    /// which goes only once its launch is stored. A directory that is not there, or a path that
+    /// is not a directory, holds none; one that cannot be listed is `Unreadable`. Each file is
+    /// `stat`ed before it is read, so its `stamp` is never newer than what was parsed.
     pub fn read_all(profile: &Path) -> Read<Vec<PendingEntry>> {
         let dir = profile.join(PENDING_LAUNCH_DIR);
         let unreadable =
@@ -470,12 +469,17 @@ impl PendingLaunch {
         paths.sort();
         let mut out = Vec::with_capacity(paths.len());
         for path in paths {
+            let unusable = |path: PathBuf, stamp, why: String| PendingEntry::Unusable {
+                started_at_ms: started_at_of(&path),
+                file: PendingFile { path, stamp },
+                why,
+            };
             let stamp = match fs::symlink_metadata(&path) {
                 Ok(meta) if meta.is_file() => FileStamp::of(&meta),
                 Ok(_) => continue,
                 Err(e) if gone(&e) => continue,
                 Err(e) => {
-                    out.push(PendingEntry::Unreadable(unreadable(&path, e)));
+                    out.push(unusable(path, None, format!("it cannot be stat-ed: {e}")));
                     continue;
                 }
             };
@@ -483,7 +487,11 @@ impl PendingLaunch {
                 Ok(bytes) => bytes,
                 Err(e) if gone(&e) => continue,
                 Err(e) => {
-                    out.push(PendingEntry::Unreadable(unreadable(&path, e)));
+                    out.push(unusable(
+                        path,
+                        Some(stamp),
+                        format!("it cannot be read: {e}"),
+                    ));
                     continue;
                 }
             };
@@ -492,12 +500,27 @@ impl PendingLaunch {
                 Err(_) => Err("it is not JSON".to_owned()),
             };
             out.push(match parsed {
-                Ok(launch) => PendingEntry::Launch(PendingFile { path, stamp }, launch),
-                Err(why) => PendingEntry::Invalid(path, why),
+                Ok(launch) => PendingEntry::Launch(
+                    PendingFile {
+                        path,
+                        stamp: Some(stamp),
+                    },
+                    launch,
+                ),
+                Err(why) => unusable(path, Some(stamp), why),
             });
         }
         Read::Present(out)
     }
+}
+
+/// The start a pending file's name gives, `<started_at_ms>-<run pid>.json` with both parts
+/// integers, as `PendingLaunch::path` names it.
+fn started_at_of(path: &Path) -> Option<i64> {
+    let stem = path.file_name()?.to_str()?.strip_suffix(".json")?;
+    let (started_at, pid) = stem.rsplit_once('-')?;
+    pid.parse::<u32>().ok()?;
+    started_at.parse().ok()
 }
 
 /// One `*.json` file of a profile's pending directory, as `PendingLaunch::read_all` found it.
@@ -505,26 +528,35 @@ impl PendingLaunch {
 pub enum PendingEntry {
     /// A pending launch, and its file as it was read.
     Launch(PendingFile, PendingLaunch),
-    /// A file that was read and is not a pending launch, and why, never quoting its bytes.
-    Invalid(PathBuf, String),
-    /// A file that could not be `stat`ed or read, named.
-    Unreadable(ReadError),
+    /// A file whose content cannot be used: it cannot be `stat`ed or read, or it is not a
+    /// pending launch. `started_at_ms` is the start its name gives, if it gives one (token
+    /// report spec §6.1); `why` never quotes its bytes.
+    Unusable {
+        file: PendingFile,
+        started_at_ms: Option<i64>,
+        why: String,
+    },
 }
 
-/// A pending launch file as `read_all` found it: where it is, and what it was.
+/// A pending launch file as `read_all` found it: where it is, and what it was. One that could
+/// not be `stat`ed has no stamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingFile {
     pub path: PathBuf,
-    stamp: FileStamp,
+    stamp: Option<FileStamp>,
 }
 
 impl PendingFile {
     /// Removes the file unless it is no longer the one that was read: `run` replaces a file by
     /// renaming a new one over it, so a changed file may hold a newer record (its `endedAt`)
-    /// that the reader never saw. Returns whether it was removed; one already gone counts.
+    /// that the reader never saw. One with no stamp cannot be told from a newer one, so it
+    /// stays. Returns whether it was removed; one already gone counts.
     pub fn remove_if_unchanged(&self) -> io::Result<bool> {
+        let Some(stamp) = self.stamp else {
+            return Ok(false);
+        };
         let removed = match fs::symlink_metadata(&self.path) {
-            Ok(meta) if FileStamp::of(&meta) == self.stamp => fs::remove_file(&self.path),
+            Ok(meta) if FileStamp::of(&meta) == stamp => fs::remove_file(&self.path),
             Ok(_) => return Ok(false),
             Err(e) => Err(e),
         };
@@ -1220,9 +1252,7 @@ mod tests {
         let names: Vec<_> = read
             .iter()
             .map(|e| match e {
-                PendingEntry::Launch(f, _) => &f.path,
-                PendingEntry::Invalid(path, _) => path,
-                PendingEntry::Unreadable(e) => panic!("{e}"),
+                PendingEntry::Launch(file, _) | PendingEntry::Unusable { file, .. } => &file.path,
             })
             .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
             .collect();
@@ -1231,7 +1261,16 @@ mod tests {
             matches!(&read[0], PendingEntry::Launch(_, l) if l == &closed),
             "replaced in place: {read:?}"
         );
-        assert!(matches!(read[1], PendingEntry::Invalid(..)), "{read:?}");
+        assert!(
+            matches!(
+                &read[1],
+                PendingEntry::Unusable {
+                    started_at_ms: None,
+                    ..
+                }
+            ),
+            "its name gives no start: {read:?}"
+        );
 
         PendingLaunch::remove(&profile, launch.started_at_ms, 42).unwrap();
         PendingLaunch::remove(&profile, launch.started_at_ms, 42).unwrap();
@@ -1251,7 +1290,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_file_that_cannot_be_read_is_named_and_a_path_that_is_no_directory_holds_none() {
+    fn a_pending_file_that_cannot_be_used_gives_its_name_s_start() {
         let d = tempfile::tempdir().unwrap();
         let launch = PendingLaunch {
             provider: ProviderId::new("claude-code"),
@@ -1262,14 +1301,57 @@ mod tests {
         launch.write(d.path(), 1).unwrap();
         let file = PendingLaunch::path(d.path(), 5, 1);
         fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
-        match PendingLaunch::read_all(d.path())
+        let dir = d.path().join(PENDING_LAUNCH_DIR);
+        for (name, content) in [
+            ("-7-2.json", "{ torn"),
+            ("x-3.json", "{ torn"),
+            ("8-x.json", "{ torn"),
+            ("9.json", "{}"),
+        ] {
+            fs::write(dir.join(name), content).unwrap();
+        }
+        let starts: Vec<_> = PendingLaunch::read_all(d.path())
             .present()
             .unwrap()
-            .as_slice()
-        {
-            [PendingEntry::Unreadable(e)] => assert_eq!(e.what, file.display().to_string()),
-            other => panic!("{other:?}"),
-        }
+            .into_iter()
+            .map(|e| match e {
+                PendingEntry::Unusable {
+                    file,
+                    started_at_ms,
+                    ..
+                } => (
+                    file.path.file_name().unwrap().to_str().unwrap().to_owned(),
+                    started_at_ms,
+                ),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let named = |n: &str, start| (n.to_owned(), start);
+        assert_eq!(
+            starts,
+            [
+                named("-7-2.json", Some(-7)),
+                named("5-1.json", Some(5)),
+                named("8-x.json", None),
+                named("9.json", None),
+                named("x-3.json", None),
+            ]
+        );
+
+        // Listed but not searchable: no file can be `stat`ed, so none has a stamp, and none is
+        // removed as the one read.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o400)).unwrap();
+        let entries = PendingLaunch::read_all(d.path()).present().unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let PendingEntry::Unusable {
+            file: unstamped, ..
+        } = &entries[1]
+        else {
+            panic!("{entries:?}");
+        };
+        assert_eq!(unstamped.path, file);
+        assert!(!unstamped.remove_if_unchanged().unwrap());
+        assert!(file.exists());
 
         let dir = d.path().join(PENDING_LAUNCH_DIR);
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();

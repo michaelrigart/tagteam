@@ -1818,16 +1818,17 @@ fn a_pending_launch_the_store_already_holds_changes_nothing() {
 
 #[test]
 fn a_scan_leaves_a_pending_file_that_is_not_a_launch_of_its_profile_where_it_is() {
-    // Spec §6.2: a file that does not parse, names another provider or another account than
-    // its profile, or cannot be read, is skipped and kept; a writer's temp file (not `*.json`)
-    // is ignored. The valid file beside them is recorded and removed all the same.
-    use std::os::unix::fs::PermissionsExt;
+    // Spec §6.2: a file that names another provider or another account than its profile, or
+    // whose content cannot be used and whose name gives no start, is skipped and kept; a
+    // writer's temp file (not `*.json`) is ignored. The valid file beside them is recorded and
+    // removed all the same.
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     let profile = fx.make_profile(&a);
     let dir = profile.join(PENDING_LAUNCH_DIR);
     let good = pending(&fx, &profile, &a, NOW - 5_000, Some(NOW - 4_000), 1);
-    fs::write(dir.join("1000-2.json"), "{ torn").unwrap();
+    let torn = dir.join("torn-2.json");
+    fs::write(&torn, "{ torn").unwrap();
     let other_account = pending(
         &fx,
         &profile,
@@ -1847,21 +1848,61 @@ fn a_scan_leaves_a_pending_file_that_is_not_a_launch_of_its_profile_where_it_is(
     .unwrap();
     let temp = dir.join(".4000-5.json.tagteam-5-0a1b2c3d");
     fs::write(&temp, fs::read(&good).unwrap()).unwrap();
-    let unreadable = pending(&fx, &profile, &a, 5_000, Some(6_000), 6);
-    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
 
     assert_eq!(sight(&fx), 1, "only the valid launch");
     assert_eq!(ended(&fx), [(a.to_string(), Some(NOW - 4_000))]);
     assert!(!good.exists());
-    for kept in [
-        dir.join("1000-2.json"),
-        other_account,
-        other_provider,
-        temp,
-        unreadable,
-    ] {
+    for kept in [torn, other_account, other_provider, temp] {
         assert!(kept.exists(), "{kept:?} is left in place");
     }
+}
+
+#[test]
+fn a_scan_records_a_pending_file_it_cannot_use_as_a_launch_open_from_its_name() {
+    // Spec §6.1, §6.2: a pending file that cannot be read, or does not parse, stands for a
+    // launch of its profile's account open from its name's start. The scan records it so and
+    // removes the file. The end the unreadable one held is lost: the launch stays open until the
+    // scan finds the profile idle, which over-covers.
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let in_use = FlockGuard::try_lock(&profile.join(LAUNCH_DIR).join("4242.lock"))
+        .unwrap()
+        .unwrap();
+    let unreadable = pending(&fx, &profile, &a, NOW - 9_000, Some(NOW - 8_000), 6);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    let torn = PendingLaunch::path(&profile, NOW - 5_000, 7);
+    fs::write(&torn, "{ torn").unwrap();
+
+    assert_eq!(sight(&fx), 2);
+    let starts: Vec<_> = launches(&fx)
+        .into_iter()
+        .map(|l| (l.account_id, l.started_at, l.ended_at))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            (a.to_string(), NOW - 9_000, None),
+            (a.to_string(), NOW - 5_000, None)
+        ]
+    );
+    assert_eq!(
+        pending_files(&profile),
+        Vec::<String>::new(),
+        "both removed"
+    );
+
+    drop(in_use);
+    fx.clock.advance_ms(1_000);
+    assert_eq!(sight(&fx), 2, "both closed once the profile is idle");
+    assert_eq!(
+        ended(&fx),
+        [
+            (a.to_string(), Some(NOW + 1_000)),
+            (a.to_string(), Some(NOW + 1_000))
+        ]
+    );
 }
 
 #[test]
@@ -1989,11 +2030,34 @@ fn remove_fails_before_deleting_anything_when_the_store_refuses_the_pending_laun
 }
 
 #[test]
-fn remove_fails_before_deleting_anything_when_a_pending_file_cannot_be_read() {
-    // Spec §13: a pending file that cannot be read, or a pending directory that cannot be
-    // listed, may hold a launch, so `remove` stops before it deletes anything, naming it. A file
-    // that reads but holds no launch never stops it: once the launch can be read, the remove
-    // records it and deletes the profile, the torn file with it.
+fn remove_records_a_pending_file_it_cannot_read_as_a_launch_open_from_its_name() {
+    // Spec §13: `remove` records a pending file whose content it cannot use as the scan does,
+    // open from its name's start, and goes on: no file stops the delete. A file whose name gives
+    // no start is skipped and goes with the profile.
+    use std::os::unix::fs::PermissionsExt;
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    fx.add("b@x.co", "rt-b"); // live
+    let profile = fx.make_profile(&a);
+    let file = pending(&fx, &profile, &a, NOW - 5_000, Some(NOW - 1_000), 4242);
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::write(profile.join(PENDING_LAUNCH_DIR).join("torn.json"), "{ torn").unwrap();
+
+    fx.engine.remove(&a).unwrap();
+
+    assert!(!profile.exists());
+    let recorded: Vec<_> = launches(&fx)
+        .into_iter()
+        .map(|l| (l.account_id, l.started_at, l.ended_at))
+        .collect();
+    assert_eq!(recorded, [(a.to_string(), NOW - 5_000, None)]);
+}
+
+#[test]
+fn remove_fails_before_deleting_anything_when_the_pending_directory_cannot_be_listed() {
+    // Spec §13: with no listing, no file's name can be seen, so `remove` stops before it deletes
+    // anything, naming the directory. Once it can be listed, the remove records the launch and
+    // deletes the profile.
     use std::os::unix::fs::PermissionsExt;
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
@@ -2001,27 +2065,22 @@ fn remove_fails_before_deleting_anything_when_a_pending_file_cannot_be_read() {
     let profile = fx.make_profile(&a);
     let dir = profile.join(PENDING_LAUNCH_DIR);
     let file = pending(&fx, &profile, &a, NOW - 5_000, Some(NOW - 1_000), 4242);
-    fs::write(dir.join("1000-2.json"), "{ torn").unwrap();
-    let chmod = |path: &Path, mode: u32| {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
-    };
+    let chmod = |mode: u32| fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
 
-    for (unreadable, mode) in [(&file, 0o600), (&dir, 0o700)] {
-        chmod(unreadable, 0o000);
-        let err = fx.engine.remove(&a).unwrap_err();
-        chmod(unreadable, mode);
+    chmod(0o000);
+    let err = fx.engine.remove(&a).unwrap_err();
+    chmod(0o700);
 
-        assert_eq!(err.kind(), "unreadable", "{err}");
-        assert!(
-            err.to_string()
-                .starts_with(&format!("{} is unreadable: ", unreadable.display())),
-            "names it: {err}"
-        );
-        assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
-        assert!(profile.exists() && file.exists(), "the profile is kept");
-        assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
-        assert!(launches(&fx).is_empty(), "nothing recorded");
-    }
+    assert_eq!(err.kind(), "unreadable", "{err}");
+    assert!(
+        err.to_string()
+            .starts_with(&format!("{} is unreadable: ", dir.display())),
+        "names it: {err}"
+    );
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-a"));
+    assert!(profile.exists() && file.exists(), "the profile is kept");
+    assert!(fx.engine.store().unwrap().account(&a).unwrap().is_some());
+    assert!(launches(&fx).is_empty(), "nothing recorded");
 
     fx.engine.remove(&a).unwrap();
     assert!(!profile.exists());
