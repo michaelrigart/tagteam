@@ -478,7 +478,7 @@ impl Engine {
         // and the next one begins a generation of its own.
         let epoch = store.begin_token_refresh(provider, self.now_ms())?;
         hooks::point(self, "refresh-tokens-locked")?;
-        let retention = i64::from(self.settings.tokens_retention_days).saturating_mul(DAY_MS);
+        let retention = i64::from(self.settings().tokens_retention_days).saturating_mul(DAY_MS);
         let cutoff_ms = self.now_ms().saturating_sub(retention);
         let (jobs, removed, unreadable) =
             self.token_jobs(p.as_ref(), store.token_files(provider)?)?;
