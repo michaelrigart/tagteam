@@ -520,9 +520,12 @@ environment. Stdin stays drained and ignored (core §13.5).
   is within the last minute, there is nothing to do.
 - **Otherwise it finds its execution.** It walks its ancestor processes (at most 8) to the
   first that has a record in the home's `sessions/`: the Claude Code process it runs under.
-  That record's `startedAt` is the execution, and its read dates the sighting. As the scan
-  does, the statusline continues the session's latest tenure there to the read, or begins one
-  at it (source `statusline`). With no such ancestor it records nothing.
+  That record's `startedAt` is the execution. As the scan does, the statusline continues the
+  session's latest tenure there, or begins one (source `statusline`). With no such ancestor it
+  records nothing.
+- **The date** is taken when the statusline begins its sighting, before the lookup and the
+  walk: its session comes from its environment, fixed when CC spawned it, and the record
+  proves only the execution.
 
   A sighting is only ever extended by the execution it belongs to, so a gap between two
   executions of a session is never bridged, nor, under A3 (§7.4), a gap within one (§6.4).
@@ -536,7 +539,7 @@ environment. Stdin stays drained and ignored (core §13.5).
   read that named the session in the execution, never at the record's `startedAt` or a file's
   mtime, and ends at the last read that named it. A read that shows no session confirms
   nothing and extends nothing. Each read is dated right after it is done, before the liveness
-  check and any write that follow it.
+  check and any write that follow it; the statusline's, when it begins (§6.3).
 - `run` keeps its tenures itself (§6.1). The scan and the statusline keep no state: a read
   continues the latest tenure of its session in the execution, or begins one at the read. It
   begins one too when the execution was seen naming another session at or after that tenure's

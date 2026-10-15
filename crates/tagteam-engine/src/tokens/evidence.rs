@@ -387,14 +387,17 @@ impl Engine {
     /// run shell's profile, or the default home. Nothing is done while the session's latest
     /// sighting there is under a minute old. Otherwise the Claude Code process the statusline
     /// runs under is found among its ancestors, by its record in the home: the session's latest
-    /// tenure in that execution goes on to that read, or one starts at it (spec §6.4). The write
-    /// waits at most `CACHE_WRITE_WAIT`, and a busy store skips it. The store is never created.
+    /// tenure in that execution goes on, or one starts. The sighting is dated when this call
+    /// starts: the session comes from the environment, fixed when Claude Code spawned the line,
+    /// and the record proves only the execution (spec §6.3, §6.4). The write waits at most
+    /// `CACHE_WRITE_WAIT`, and a busy store skips it. The store is never created.
     pub fn statusline_sighting(
         &self,
         provider: &ProviderId,
         session_id: &str,
         profile: Option<&Path>,
     ) -> Result<(), EngineError> {
+        let now = self.now_ms();
         let p = self.provider(provider)?;
         if !p.capabilities().transcripts {
             return Ok(());
@@ -414,22 +417,21 @@ impl Engine {
         let Some(store) = self.existing_store()? else {
             return Ok(());
         };
-        let now = self.now_ms();
         let fresh = store
             .latest_sighting(provider, session_id, &home)?
             .is_some_and(|s| s.last_at > now.saturating_sub(SIGHTING_GAP_MS));
         if fresh {
             return Ok(());
         }
-        let Some((started_at, read_at)) = self.execution_started_at(p.as_ref(), &records) else {
+        let Some(started_at) = self.execution_started_at(p.as_ref(), &records) else {
             return Ok(());
         };
         let row = SightingRow {
             session_id: session_id.to_owned(),
             home,
             started_at,
-            first_at: read_at,
-            last_at: read_at,
+            first_at: now,
+            last_at: now,
             source: SightingSource::Statusline,
             recorded_at: self.now_ms(),
         };
@@ -448,8 +450,8 @@ impl Engine {
 
     /// The `startedAt` of the first of this process's ancestors, at most `MAX_ANCESTORS` up,
     /// with a live record of its own in `records` (spec §6.3): the execution the statusline
-    /// runs under. With it, when that record was read, which dates the sighting (spec §6.4).
-    fn execution_started_at(&self, p: &dyn Provider, records: &Path) -> Option<(i64, i64)> {
+    /// runs under.
+    fn execution_started_at(&self, p: &dyn Provider, records: &Path) -> Option<i64> {
         let mut pid = std::process::id();
         for _ in 0..MAX_ANCESTORS {
             pid = self.process.parent_pid(pid).filter(|&parent| parent > 1)?;
@@ -457,12 +459,11 @@ impl Engine {
             let Ok(bytes) = fs::read(records.join(format!("{pid}.json"))) else {
                 continue;
             };
-            let read_at = self.now_ms();
             let Ok(r) = parse_session_record(&bytes) else {
                 continue;
             };
             if r.pid == pid && record_is_live(self.process.as_ref(), &r, p.launch_command()) {
-                return r.started_at_ms.map(|at| (at, read_at));
+                return r.started_at_ms;
             }
         }
         None

@@ -1574,9 +1574,11 @@ fn the_statusline_starts_a_tenure_at_its_read_and_continues_the_latest() {
 
 #[test]
 #[cfg(feature = "test-hooks")]
-fn the_statusline_dates_a_sighting_at_its_read() {
-    // Spec §6.3, §6.4: the line's read is of its ancestor's record, after the freshness lookup;
-    // the sighting is dated then, not when the line started. Here 5 s pass before that read.
+fn the_statusline_dates_a_sighting_when_it_starts() {
+    // Spec §6.3, §6.4: the line's session comes from its environment, fixed when Claude Code
+    // spawned it; the ancestor's record proves only the execution. So the sighting is dated
+    // when the line starts, before the freshness lookup and the walk, not at the record's read.
+    // Here 5 s pass before that read.
     let fx = Fx::new();
     let cc = fx.provider();
     fx.add("a@x.co", "rt-a");
@@ -1599,9 +1601,9 @@ fn the_statusline_dates_a_sighting_at_its_read() {
     fx.engine.statusline_sighting(&cc, "s-1", None).unwrap();
     let seen = sightings(&fx);
     assert_eq!(
-        (seen[0].first_at, seen[0].last_at),
-        (NOW + 5_000, NOW + 5_000),
-        "dated at the read: {seen:?}"
+        (seen[0].first_at, seen[0].last_at, seen[0].recorded_at),
+        (NOW, NOW, NOW + 5_000),
+        "dated when the line started, written later: {seen:?}"
     );
 }
 
