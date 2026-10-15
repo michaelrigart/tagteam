@@ -230,6 +230,38 @@ fn a_scan_starts_a_tenure_at_its_read_and_continues_the_latest() {
 }
 
 #[test]
+#[cfg(feature = "test-hooks")]
+fn a_scan_dates_a_sighting_at_its_read() {
+    // Spec §6.4: a sighting begins and ends at reads. The scan reads a home's records at once;
+    // what follows, the liveness check and the writes, takes time in which the session may
+    // leave, so the read's own time is the one written. Here 5 s pass right after the read.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    running(&fx, 101, None);
+    record(
+        &fx,
+        &fx.paths().config_home,
+        101,
+        "s-1",
+        NOW - 60_000,
+        "interactive",
+    );
+    let clock = fx.clock.clone();
+    fx.engine.on_point(
+        "scan-records-read",
+        Box::new(move || clock.advance_ms(5_000)),
+    );
+
+    assert_eq!(sight(&fx), 1);
+    let seen = sightings(&fx);
+    assert_eq!(
+        (seen[0].first_at, seen[0].last_at),
+        (NOW, NOW),
+        "dated at the read: {seen:?}"
+    );
+}
+
+#[test]
 fn a_scan_skips_dead_and_unreadable_records() {
     let fx = Fx::new();
     fx.add("a@x.co", "rt-a");
@@ -568,6 +600,39 @@ fn a_session_that_enters_a_running_process_is_sighted_from_the_read_that_first_n
                 switched
             ),
         ]
+    );
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn a_check_dates_a_tenure_at_its_read() {
+    // Spec §6.1: a tenure begins at the read that named its session, and a read confirms it at
+    // the read, not after the liveness check that follows. Here 5 s pass right after each read.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    running(&fx, 777, None);
+    let path = record(&fx, &profile, 777, "s-a", NOW + 500, "interactive");
+    set_mtime(&path, 1_790_000_000);
+    let clock = fx.clock.clone();
+    fx.engine.on_point(
+        "launch-record-read",
+        Box::new(move || clock.advance_ms(5_000)),
+    );
+    fx.clock.set(NOW + 1_000);
+    check(&fx, &id, &profile, &mut state);
+    let t = state.tenure.clone().unwrap();
+    assert_eq!((t.first_at, t.confirmed_at), (NOW + 1_000, NOW + 1_000));
+
+    set_mtime(&path, 1_790_000_001);
+    fx.clock.set(NOW + 9_000);
+    check(&fx, &id, &profile, &mut state);
+    assert_eq!(
+        state.tenure.as_ref().map(|t| (t.first_at, t.confirmed_at)),
+        Some((NOW + 1_000, NOW + 9_000))
     );
 }
 
@@ -1167,6 +1232,39 @@ fn the_statusline_starts_a_tenure_at_its_read_and_continues_the_latest() {
             seen("s-1", back, back),
             seen("s-2", cleared, cleared)
         ]
+    );
+}
+
+#[test]
+#[cfg(feature = "test-hooks")]
+fn the_statusline_dates_a_sighting_at_its_read() {
+    // Spec §6.3, §6.4: the line's read is of its ancestor's record, after the freshness lookup;
+    // the sighting is dated then, not when the line started. Here 5 s pass before that read.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    fx.add("a@x.co", "rt-a");
+    running(&fx, std::process::id(), Some(500));
+    running(&fx, 500, Some(1));
+    record(
+        &fx,
+        &fx.paths().config_home,
+        500,
+        "s-1",
+        NOW - 60_000,
+        "interactive",
+    );
+    let clock = fx.clock.clone();
+    fx.engine.on_point(
+        "statusline-ancestor",
+        Box::new(move || clock.advance_ms(5_000)),
+    );
+
+    fx.engine.statusline_sighting(&cc, "s-1", None).unwrap();
+    let seen = sightings(&fx);
+    assert_eq!(
+        (seen[0].first_at, seen[0].last_at),
+        (NOW + 5_000, NOW + 5_000),
+        "dated at the read: {seen:?}"
     );
 }
 

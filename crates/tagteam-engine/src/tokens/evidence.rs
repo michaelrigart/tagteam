@@ -84,6 +84,11 @@ impl Engine {
             let Read::Present(entries) = read_session_records(&dir) else {
                 continue;
             };
+            // The home's records were read now. A sighting is dated at its read, not after the
+            // liveness checks and the writes that follow, which take time in which the session
+            // may leave (spec §6.4).
+            let read_at = self.now_ms();
+            hooks::point(self, "scan-records-read")?;
             for entry in entries {
                 // An unreadable or partly written record, or one whose process is gone, is
                 // skipped (spec §6.2).
@@ -97,17 +102,16 @@ impl Engine {
                 if !record_is_live(self.process.as_ref(), &r, p.launch_command()) {
                     continue;
                 }
-                // The read names the session now, and says nothing of when it entered the
-                // execution: the latest tenure goes on, or one starts now (spec §6.4).
-                let now = self.now_ms();
+                // The read names the session then, and says nothing of when it entered the
+                // execution: the latest tenure goes on, or one starts at the read (spec §6.4).
                 let row = SightingRow {
                     session_id,
                     home: home.clone(),
                     started_at,
-                    first_at: now,
-                    last_at: now,
+                    first_at: read_at,
+                    last_at: read_at,
                     source: SightingSource::Scan,
-                    recorded_at: now,
+                    recorded_at: self.now_ms(),
                 };
                 if store.continue_sighting(&provider, &row, SIGHTING_GAP_MS)? {
                     changed += 1;
@@ -218,10 +222,10 @@ impl Engine {
     /// read that named the current tenure's session confirms that tenure now: Claude Code
     /// rewrites the record when its session changes (spec §7.4 A3). A moved mtime is read. This
     /// child's own record naming the tenure's session in the same execution confirms it; naming
-    /// another, it ends the tenure at its last confirmation and starts the next one now. Any
-    /// other read, of a record caught part-way through its write, of one that is not this
-    /// child's, or of none, confirms nothing, and its mtime is not remembered, so the next tick
-    /// reads it again.
+    /// another, it ends the tenure at its last confirmation and starts the next one. Each is
+    /// dated at the read, before the liveness check that follows it. Any other read, of a record
+    /// caught part-way through its write, of one that is not this child's, or of none, confirms
+    /// nothing, and its mtime is not remembered, so the next tick reads it again.
     pub fn observe_launch(
         &self,
         id: &LaunchId,
@@ -246,8 +250,10 @@ impl Engine {
         // Only this child's own execution: a record of its pid, started no earlier than the
         // launch, whose process still runs. One a crashed execution left behind under a reused
         // pid is skipped.
-        let named = fs::read(&record)
-            .ok()
+        let read = fs::read(&record).ok();
+        let read_at = self.now_ms();
+        hooks::point(self, "launch-record-read")?;
+        let named = read
             .and_then(|bytes| parse_session_record(&bytes).ok())
             .filter(|r| {
                 r.pid == pid
@@ -258,18 +264,17 @@ impl Engine {
         let Some((session_id, started_at)) = named else {
             return Ok(());
         };
-        let now = self.now_ms();
         state.last_mtime_ns = Some(mtime);
         match &mut state.tenure {
             Some(t) if t.session_id == session_id && t.started_at == started_at => {
-                t.confirmed_at = now;
+                t.confirmed_at = read_at;
             }
             current => {
                 let next = Tenure {
                     session_id,
                     started_at,
-                    first_at: now,
-                    confirmed_at: now,
+                    first_at: read_at,
+                    confirmed_at: read_at,
                 };
                 if let Some(ended) = current.replace(next) {
                     state.ended.push(ended);
@@ -373,8 +378,8 @@ impl Engine {
     /// run shell's profile, or the default home. Nothing is done while the session's latest
     /// sighting there is under a minute old. Otherwise the Claude Code process the statusline
     /// runs under is found among its ancestors, by its record in the home: the session's latest
-    /// tenure in that execution goes on to now, or one starts now (spec §6.4). The write waits
-    /// at most `CACHE_WRITE_WAIT`, and a busy store skips it. The store is never created.
+    /// tenure in that execution goes on to that read, or one starts at it (spec §6.4). The write
+    /// waits at most `CACHE_WRITE_WAIT`, and a busy store skips it. The store is never created.
     pub fn statusline_sighting(
         &self,
         provider: &ProviderId,
@@ -407,17 +412,17 @@ impl Engine {
         if fresh {
             return Ok(());
         }
-        let Some(started_at) = self.execution_started_at(p.as_ref(), &records) else {
+        let Some((started_at, read_at)) = self.execution_started_at(p.as_ref(), &records) else {
             return Ok(());
         };
         let row = SightingRow {
             session_id: session_id.to_owned(),
             home,
             started_at,
-            first_at: now,
-            last_at: now,
+            first_at: read_at,
+            last_at: read_at,
             source: SightingSource::Statusline,
-            recorded_at: now,
+            recorded_at: self.now_ms(),
         };
         // Evidence, not the line: a failed write leaves the session to the next run. SQLite's
         // result code only, never the error's text (§14.2).
@@ -434,19 +439,21 @@ impl Engine {
 
     /// The `startedAt` of the first of this process's ancestors, at most `MAX_ANCESTORS` up,
     /// with a live record of its own in `records` (spec §6.3): the execution the statusline
-    /// runs under.
-    fn execution_started_at(&self, p: &dyn Provider, records: &Path) -> Option<i64> {
+    /// runs under. With it, when that record was read, which dates the sighting (spec §6.4).
+    fn execution_started_at(&self, p: &dyn Provider, records: &Path) -> Option<(i64, i64)> {
         let mut pid = std::process::id();
         for _ in 0..MAX_ANCESTORS {
             pid = self.process.parent_pid(pid).filter(|&parent| parent > 1)?;
+            hooks::point(self, "statusline-ancestor").ok()?;
             let Ok(bytes) = fs::read(records.join(format!("{pid}.json"))) else {
                 continue;
             };
+            let read_at = self.now_ms();
             let Ok(r) = parse_session_record(&bytes) else {
                 continue;
             };
             if r.pid == pid && record_is_live(self.process.as_ref(), &r, p.launch_command()) {
-                return r.started_at_ms;
+                return r.started_at_ms.map(|at| (at, read_at));
             }
         }
         None
