@@ -30,8 +30,8 @@ test pins it.
   session, while your default login stays as it is. Sessions share your history, memory and
   settings.
 - **Switch automatically.** `tagteam auto` moves to a better account before the current one
-  reaches a threshold. The daemon does the same in the background, keeps every account's usage
-  fresh, and tells you when it switches.
+  reaches a threshold. The daemon does the same in the background, keeps the usage of the live
+  account and the switchable accounts fresh, and tells you when it switches.
 - **Keep refreshed tokens safe.** Every refresh-token successor tagteam receives is persisted:
   to the vault, to a rescue file if that write fails, or under `displaced/` if it belongs to
   another account. If every write fails, tagteam reports it.
@@ -135,9 +135,8 @@ token from stdin so it stays out of your shell history.
 Run `tagteam <command> --help` for the full options. Every command accepts `--provider`/`-p`
 (Claude Code is the only provider at present). Most commands accept `--json` and then print
 one JSON object on stdout. The exceptions: `auto --json` and `daemon --json` print one event
-per line,
-`run --json` covers only errors before Claude Code starts, and `statusline`, `shell-init`
-and `completions` refuse `--json`. A bare `tagteam` runs `list`.
+per line, `run --json` covers only errors before Claude Code starts, and `statusline`,
+`shell-init` and `completions` refuse `--json`. A bare `tagteam` runs `list`.
 
 | Command | What it does |
 |---|---|
@@ -189,8 +188,10 @@ tagteam daemon install
 
 From then on it starts when you log in, and restarts if it fails. While it runs, it:
 
-- keeps every account's usage fresh, on the same schedule and within the same request budget
-  as the commands, so `list` rarely has to fetch and `statusline` shows fresh numbers;
+- keeps the usage of the live account and the switchable accounts fresh, on the same schedule
+  and within the same request budget as the commands, so `list` rarely has to fetch and
+  `statusline` shows fresh numbers. Disabled accounts and accounts a session owns are left to
+  `list`;
 - switches accounts automatically, exactly as `tagteam auto` does, for every provider with at
   least two switchable accounts;
 - tells you about the events that matter (see below);
