@@ -6,7 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::actions::{self, Overlay};
 use crate::msg::{Cmd, Msg};
 use crate::screens;
-use crate::state::{REFRESH_MS, Screen, State};
+use crate::state::{BannerKind, REFRESH_MS, Screen, State};
 
 pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
     match msg {
@@ -31,11 +31,14 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             match result {
                 Ok(snapshot) => {
                     state.accounts.apply(snapshot);
-                    clear_read_error(state);
+                    clear_read_error(state, BannerKind::Accounts);
+                    if state.quitting.is_some() {
+                        return vec![];
+                    }
                     screens::history::on_accounts(state, now_ms)
                 }
                 Err(e) => {
-                    state.banner = Some(e.message);
+                    raise(state, BannerKind::Accounts, e.message);
                     vec![]
                 }
             }
@@ -48,9 +51,9 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             match result {
                 Ok(view) => {
                     state.history.apply(view);
-                    clear_read_error(state);
+                    clear_read_error(state, BannerKind::History);
                 }
-                Err(e) => state.banner = Some(e.message),
+                Err(e) => raise(state, BannerKind::History, e.message),
             }
             vec![]
         }
@@ -61,10 +64,11 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             state.dirty = true;
             match result {
                 Ok(summary) => {
+                    clear_read_error(state, BannerKind::Collect);
                     if let Some(first) = summary.warnings.first() {
                         state.toast(format!("warning: {first}"), now_ms);
                     }
-                    if summary.fetched == 0 {
+                    if summary.fetched == 0 || state.quitting.is_some() {
                         return vec![];
                     }
                     // Spec §6.2: a collection that fetched is read back at once.
@@ -75,7 +79,8 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                     cmds
                 }
                 Err(e) => {
-                    state.banner = Some(format!("usage was not collected: {}", e.message));
+                    let words = format!("usage was not collected: {}", e.message);
+                    raise(state, BannerKind::Collect, words);
                     vec![]
                 }
             }
@@ -91,7 +96,10 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
         }
         Msg::LaneDied { lane } => {
             state.dirty = true;
-            state.banner = Some(format!("the {lane} lane stopped unexpectedly"));
+            if state.banner_from != Some(BannerKind::Lane) {
+                let words = format!("the {lane} lane stopped unexpectedly");
+                raise(state, BannerKind::Lane, words);
+            }
             if state.quitting.is_some() {
                 return vec![];
             }
@@ -115,10 +123,18 @@ pub fn drawn(state: &mut State) -> Vec<Cmd> {
     vec![state.collect_due(shown)]
 }
 
-/// A read that succeeds clears the banner a failed one left (spec §10.4); a shutdown's never.
-fn clear_read_error(state: &mut State) {
-    if state.quitting.is_none() {
+/// A failed read's banner, remembering which kind raised it.
+fn raise(state: &mut State, kind: BannerKind, text: String) {
+    state.banner = Some(text);
+    state.banner_from = Some(kind);
+}
+
+/// A read that succeeds clears the banner a failed read of the same kind left (spec §10.4); a
+/// banner raised another way goes with any success. A shutdown's never goes.
+fn clear_read_error(state: &mut State, kind: BannerKind) {
+    if state.quitting.is_none() && state.banner_from.is_none_or(|from| from == kind) {
         state.banner = None;
+        state.banner_from = None;
     }
 }
 
@@ -593,6 +609,122 @@ mod tests {
                 account: id(1),
                 since_s: NOW_S - 7 * 86_400,
             }]
+        );
+    }
+
+    fn history_msg(r#gen: u64) -> Msg {
+        Msg::History {
+            r#gen,
+            result: Ok(history_of(
+                account(1, "a1@x.co", read(60, 1.0, 1.0, false)),
+                vec![],
+            )),
+        }
+    }
+
+    #[test]
+    fn a_read_clears_only_the_banner_its_own_kind_raised() {
+        let mut state = fresh(Screen::History);
+        state.start();
+        update(&mut state, accounts_msg(1, 1), NOW_MS);
+        let Cmd::LoadAccounts { r#gen: ag } = state.load_accounts() else {
+            unreachable!()
+        };
+        let Cmd::LoadHistory { r#gen: hg, .. } = state.load_history(id(1), 0) else {
+            unreachable!()
+        };
+        update(
+            &mut state,
+            Msg::Accounts {
+                r#gen: ag,
+                result: Err(failed("the run shell marker is unreadable")),
+            },
+            NOW_MS,
+        );
+        update(&mut state, history_msg(hg), NOW_MS);
+        assert_eq!(
+            state.banner.as_deref(),
+            Some("the run shell marker is unreadable"),
+            "a history read does not hide a failed accounts read"
+        );
+        let Cmd::LoadAccounts { r#gen: ag } = state.load_accounts() else {
+            unreachable!()
+        };
+        update(&mut state, accounts_msg(ag, 1), NOW_MS);
+        assert_eq!(state.banner, None);
+
+        // A collection's banner survives both reads and goes with the next good collection.
+        let Cmd::CollectDue { r#gen: cg, .. } = state.collect_due(vec![id(1)]) else {
+            unreachable!()
+        };
+        update(
+            &mut state,
+            Msg::Collected {
+                r#gen: cg,
+                result: Err(failed("locked")),
+            },
+            NOW_MS,
+        );
+        let Cmd::LoadAccounts { r#gen: ag } = state.load_accounts() else {
+            unreachable!()
+        };
+        update(&mut state, accounts_msg(ag, 1), NOW_MS);
+        let Cmd::LoadHistory { r#gen: hg, .. } = state.load_history(id(1), 0) else {
+            unreachable!()
+        };
+        update(&mut state, history_msg(hg), NOW_MS);
+        assert_eq!(
+            state.banner.as_deref(),
+            Some("usage was not collected: locked")
+        );
+        let Cmd::CollectDue { r#gen: cg, .. } = state.collect_due(vec![id(1)]) else {
+            unreachable!()
+        };
+        update(
+            &mut state,
+            Msg::Collected {
+                r#gen: cg,
+                result: Ok(CollectSummary {
+                    fetched: 0,
+                    warnings: vec![],
+                }),
+            },
+            NOW_MS,
+        );
+        assert_eq!(state.banner, None);
+    }
+
+    #[test]
+    fn nothing_is_read_once_the_shutdown_has_begun() {
+        let mut state = fresh(Screen::History);
+        state.start();
+        update(&mut state, accounts_msg(1, 1), NOW_MS);
+        let Cmd::CollectDue { r#gen, .. } = state.collect_due(vec![id(1)]) else {
+            unreachable!()
+        };
+        state.quitting = Some(0);
+        let fetched = Msg::Collected {
+            r#gen,
+            result: Ok(CollectSummary {
+                fetched: 1,
+                warnings: vec![],
+            }),
+        };
+        assert!(update(&mut state, fetched, NOW_MS).is_empty());
+        let Cmd::LoadAccounts { r#gen } = state.load_accounts() else {
+            unreachable!()
+        };
+        assert!(update(&mut state, accounts_msg(r#gen, 1), NOW_MS).is_empty());
+    }
+
+    #[test]
+    fn a_second_lane_death_keeps_the_first_ones_words() {
+        let mut state = fresh(Screen::Accounts);
+        update(&mut state, Msg::LaneDied { lane: "views" }, NOW_MS);
+        update(&mut state, Msg::LaneDied { lane: "actions" }, NOW_MS);
+        assert_eq!(
+            state.banner.as_deref(),
+            Some("the views lane stopped unexpectedly")
         );
     }
 }

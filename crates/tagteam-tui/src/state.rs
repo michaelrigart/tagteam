@@ -48,6 +48,8 @@ pub struct State {
     pub toast: Option<Toast>,
     /// A failed read's error, in the CLI's words (spec §10.4).
     pub banner: Option<String>,
+    /// Which read raised `banner`: only a success of that same kind clears it.
+    pub(crate) banner_from: Option<BannerKind>,
     /// The action running now, in the TUI or suspended (spec §7.2).
     pub running: Option<Action>,
     pub gens: Gens,
@@ -59,6 +61,15 @@ pub struct State {
     /// The second the screen was last drawn for: its countdowns change at most once a second
     /// (spec §5.2, "Countdowns tick").
     pub(crate) shown_s: i64,
+}
+
+/// What raised the banner (spec §10.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BannerKind {
+    Accounts,
+    History,
+    Collect,
+    Lane,
 }
 
 pub struct Toast {
@@ -89,6 +100,7 @@ impl State {
             overlay: None,
             toast: None,
             banner: None,
+            banner_from: None,
             running: None,
             gens: Gens::default(),
             refresh: Refresh {
