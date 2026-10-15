@@ -2,8 +2,6 @@
 //! its read starts, its whole lines chunk by chunk, and the checkpoint a batch commits. It owns
 //! no thread and touches no store.
 
-#![allow(dead_code)]
-
 use std::fs::{self, File, Metadata};
 use std::io;
 use std::os::unix::fs::{FileExt, MetadataExt};
