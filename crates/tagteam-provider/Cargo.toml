@@ -14,6 +14,9 @@ file-keychain = []
 real_keychain = []
 # A local std::net HTTP server for adapter and cross-process tests. Never in release builds.
 mock-server = []
+# A record of every `FlockGuard::try_lock` (so `lock` too), for tests that prove a code path takes
+# no lock. Never in release builds.
+lock-log = []
 
 [dependencies]
 tagteam-core.workspace = true

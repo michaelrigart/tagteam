@@ -34,7 +34,7 @@ uuid.workspace = true
 [dev-dependencies]
 tagteam-cc = { workspace = true, features = ["test-hooks"] }
 tagteam-fake.workspace = true
-tagteam-provider = { workspace = true, features = ["file-keychain", "mock-server"] }
+tagteam-provider = { workspace = true, features = ["file-keychain", "mock-server", "lock-log"] }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 

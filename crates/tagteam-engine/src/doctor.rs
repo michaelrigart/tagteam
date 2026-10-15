@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1370,7 +1370,8 @@ impl Run<'_> {
         (true, unit)
     }
 
-    /// `daemon.socket` (D5.1, D10): the socket file, against the daemon that should own it. A
+    /// `daemon.socket` (D5.1, D10): the socket file, against the daemon that should own it. An
+    /// entry that is not a socket warns first, since the daemon cannot bind over it. A
     /// path too long to bind matters once a daemon runs or a unit is installed: the daemon then
     /// runs, or would run, without its socket, and the check fails. With neither, the length is
     /// not judged.
@@ -1393,6 +1394,25 @@ impl Run<'_> {
             return;
         }
         let check = match fs::symlink_metadata(&path) {
+            Ok(m) if !m.file_type().is_socket() => {
+                let (what, remove) = if m.is_dir() {
+                    ("a directory", "rmdir")
+                } else if m.is_file() {
+                    ("a file", "rm")
+                } else if m.file_type().is_symlink() {
+                    ("a symbolic link", "rm")
+                } else {
+                    ("something else", "rm")
+                };
+                Check::warn(
+                    ID,
+                    format!(
+                        "{} is {what}, not a socket, so the daemon cannot listen there",
+                        path.display()
+                    ),
+                )
+                .fix(format!("remove it: {remove} {}", quoted(&path)))
+            }
             Ok(m) => {
                 let mode = m.permissions().mode() & 0o777;
                 if mode != 0o600 {

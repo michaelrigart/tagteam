@@ -10,6 +10,51 @@ use crate::cancel::Cancel;
 use crate::env::Env;
 use crate::mkdir_lock::{LockError, check_cancel};
 
+/// With the `lock-log` feature: every exclusive lock attempt, by canonical path. Without it,
+/// nothing is compiled.
+#[cfg(feature = "lock-log")]
+mod attempt_log {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static ATTEMPTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// `path`'s parent canonicalised, joined with its file name, as the file may not exist yet.
+    pub fn canonical(path: &Path) -> PathBuf {
+        match (path.parent().map(Path::canonicalize), path.file_name()) {
+            (Some(Ok(dir)), Some(name)) => dir.join(name),
+            _ => path.to_path_buf(),
+        }
+    }
+
+    pub fn record(path: &Path) {
+        ATTEMPTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(canonical(path));
+    }
+
+    pub fn under(dir: &Path) -> Vec<PathBuf> {
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        ATTEMPTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|p| p.starts_with(&dir))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Test support behind the `lock-log` feature: the canonical paths of the exclusive lock
+/// attempts (`FlockGuard::try_lock`, and so `lock` and `MutationGuard::acquire`) made so far
+/// in this process, whether or not they took the lock, under `dir`. A test filters by its own
+/// temporary directory, since tests run in parallel and the record is global.
+#[cfg(feature = "lock-log")]
+pub fn attempts_under(dir: &Path) -> Vec<PathBuf> {
+    attempt_log::under(dir)
+}
+
 /// An exclusive `flock` on a file, released by the kernel when the holder exits. The fd is
 /// `O_CLOEXEC` (std's default).
 #[derive(Debug)]
@@ -23,6 +68,8 @@ impl FlockGuard {
         if let Some(dir) = path.parent() {
             crate::atomic::ensure_private_dir(dir)?;
         }
+        #[cfg(feature = "lock-log")]
+        attempt_log::record(path);
         // A lock file is never truncated: a truncate here would race a concurrent
         // holder's read of it, and `create(true)` alone trips `suspicious_open_options`.
         let file = OpenOptions::new()
