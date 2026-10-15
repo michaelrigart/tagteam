@@ -169,6 +169,7 @@ fn run_records_a_launch_and_closes_it() {
         "{open:?}"
     );
     assert_eq!(home.launches().len(), 1);
+    let released_at = now_ms();
     fs::write(&hold, b"").unwrap();
     let output = finish(child);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
@@ -176,7 +177,10 @@ fn run_records_a_launch_and_closes_it() {
     assert_eq!(closed.len(), 1, "{closed:?}");
     assert_eq!(closed[0].started_at, open.started_at, "the same launch");
     let ended = closed[0].ended_at.expect("closed at the exit");
-    assert!(ended >= open.started_at, "{closed:?}");
+    assert!(
+        ended >= released_at,
+        "closed at the exit, after the child was let go at {released_at}: {closed:?}"
+    );
 }
 
 #[test]
@@ -225,6 +229,12 @@ fn run_sights_the_child_session() {
             record["startedAt"].as_i64().unwrap()
         ),
         "{seen:?}"
+    );
+    let launches = home.launches();
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    assert!(
+        launches[0].started_at <= record["startedAt"].as_i64().unwrap(),
+        "the launch is recorded before the spawn: {launches:?}, record {record}"
     );
     let released_at = now_ms();
     fs::write(&hold, b"").unwrap();
@@ -302,6 +312,11 @@ fn evidence_failures_never_change_the_exit_code() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("could not read the session's record"),
+        "a failed poll goes to the log, never to claude's stderr: {}",
+        stderr(&output)
+    );
     rusqlite::Connection::open(&db)
         .unwrap()
         .execute_batch("DROP TABLE run_launches")
@@ -327,4 +342,31 @@ fn evidence_failures_never_change_the_exit_code() {
             .any(|c| c.mode == "session" && c.exit == Some(7)),
         "the session ran: {calls:?}"
     );
+}
+
+#[test]
+fn a_spawn_that_fails_closes_its_launch_with_no_sighting() {
+    // Spec §6.1: the launch is recorded before the spawn; when no child ever ran it closes
+    // after exit handling, with nothing sighted.
+    let home = Home::new();
+    let out = home.out("gone");
+    let pause = home.root().join("pause");
+    fs::create_dir_all(&pause).unwrap();
+    let _resume = Release(pause.join("resume"));
+    let child = home
+        .run_a(&out)
+        .env("TAGTEAM_TEST_PAUSE_AT", "before-spawn")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause)
+        .spawn()
+        .unwrap();
+    wait_for("the spawn", || pause.join("paused").exists().then_some(()));
+    fs::remove_file(home.root().join("bin/claude")).unwrap();
+    fs::write(pause.join("resume"), b"").unwrap();
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let launches = home.launches();
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    assert!(launches[0].ended_at.is_some(), "{launches:?}");
+    assert_eq!(launches[0].pid, None, "no child ever ran: {launches:?}");
+    assert!(home.sightings().is_empty(), "{:?}", home.sightings());
 }
