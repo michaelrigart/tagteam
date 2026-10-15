@@ -221,7 +221,9 @@ fn wait_polling<T>(
 /// Runs `wait` on this thread while a scoped thread runs `poller` until its flag is set, and
 /// returns what `wait` returned with `stamp`, read on this thread as soon as `wait` returns:
 /// before the flag is set and the poller joined, so a poller blocked in a store write never
-/// delays it. The flag is set however `wait` ends, a panic included.
+/// delays it. The flag is set however `wait` ends, a panic included. A poller that cannot start
+/// or that panics loses evidence, never the run (spec §6.1): it is joined here, so the scope has
+/// no panic of its own to re-raise, and the failure is one warning in the log.
 fn beside<T>(
     poller: impl FnOnce(&AtomicBool) + Send,
     wait: impl FnOnce() -> T,
@@ -229,10 +231,23 @@ fn beside<T>(
 ) -> (T, i64) {
     let stop = AtomicBool::new(false);
     thread::scope(|s| {
-        s.spawn(|| poller(&stop));
-        let _stop = StopOnDrop(&stop);
+        let poller = thread::Builder::new()
+            .name("token-poll".into())
+            .spawn_scoped(s, || poller(&stop));
+        let poller = match poller {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                tracing::warn!("could not start the token report's poller: {e}");
+                None
+            }
+        };
+        let guard = StopOnDrop(&stop);
         let waited = wait();
         let at = stamp();
+        drop(guard);
+        if poller.is_some_and(|handle| handle.join().is_err()) {
+            tracing::warn!("the token report's poller panicked");
+        }
         (waited, at)
     })
 }
@@ -415,15 +430,39 @@ mod tests {
 
     #[test]
     fn the_stop_flag_is_set_however_the_wait_ends() {
-        let stop = AtomicBool::new(false);
+        // A poller that runs until the flag is set (5 s at most, so a regression fails rather
+        // than hangs) and a wait that panics: `beside` must unwind, with the poller stopped by
+        // the flag.
+        let stopped_by_flag = AtomicBool::new(false);
+        let poller = |stop: &AtomicBool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            stopped_by_flag.store(stop.load(Ordering::Relaxed), Ordering::SeqCst);
+        };
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _stop = StopOnDrop(&stop);
-            panic!("the wait failed");
+            beside(poller, || -> i32 { panic!("the wait failed") }, || 0)
         }));
         assert!(unwound.is_err());
         assert!(
-            stop.load(Ordering::Relaxed),
+            stopped_by_flag.load(Ordering::SeqCst),
             "a panicking wait still stops the poller"
+        );
+    }
+
+    #[test]
+    fn a_panicking_poller_loses_evidence_and_never_the_run() {
+        // Spec §6.1: the wait's result and the stamp come back as if the poller had finished.
+        let poller = |_stop: &AtomicBool| panic!("the poll failed");
+        assert_eq!(beside(poller, || 7, || 1), (7, 1));
+    }
+
+    #[test]
+    fn a_poller_that_ends_by_itself_is_no_trouble() {
+        assert_eq!(
+            beside(|_stop: &AtomicBool| {}, || "exited", || 3),
+            ("exited", 3)
         );
     }
 }

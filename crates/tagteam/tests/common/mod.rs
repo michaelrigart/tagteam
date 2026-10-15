@@ -505,7 +505,7 @@ if [ -n "$FAKE_CLAUDE_RECORD" ]; then
   if [ -n "$started" ]; then proc=",\"procStart\":\"$started\""; fi
   record="$home/sessions/$me.json"
   at=$(perl -MTime::HiRes=time -e 'printf "%d", time() * 1000' 2>/dev/null)
-  if [ -z "$at" ]; then at="$(date +%s)000"; fi
+  if [ -z "$at" ]; then at="$(( $(date +%s) + 1 ))000"; fi
   printf '{"pid":%s,"sessionId":"fake-%s","cwd":"%s","startedAt":%s,"kind":"%s"%s}\n' \
     "$me" "$me" "$(pwd -P)" "$at" "$FAKE_CLAUDE_RECORD" "$proc" > "$record"
 fi
