@@ -5,6 +5,8 @@
 pub mod auto;
 pub mod events;
 pub mod protocol;
+pub mod provider_job;
 pub mod scheduler;
+pub mod status;
 #[cfg(test)]
 mod testutil;

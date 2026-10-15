@@ -4,31 +4,38 @@
 
 use std::cell::RefCell;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
-use tagteam_cc::live::Platform;
+use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, ProviderId, Window, WindowKind};
 use tagteam_engine::lifecycle::AddOptions;
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
-use tagteam_engine::settings::Settings;
+use tagteam_engine::settings::{NotifyEvent, Settings};
 use tagteam_engine::store::{Eligibility, Reserve};
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::{Engine, EngineConfig};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::liveness::SystemProcessProbe;
+use tagteam_provider::process::ScriptedSpawner;
 use tagteam_provider::profile::RunShell;
-use tagteam_provider::{Env, FakeClock, FakeKeychain, ScriptedHttp};
+use tagteam_provider::{Clock, Env, FakeClock, FakeKeychain, ScriptedHttp};
 
+use crate::events::{DaemonEvent, DaemonSink, Mode, WaitingFor};
+use crate::provider_job::ProviderJobCtx;
 use crate::scheduler::Sleeper;
+use crate::status::{DaemonInfo, NotifyInfo, ProviderStatus, StatusBoard};
 
 /// The fixture clock's start, epoch seconds.
 pub(crate) const T0: i64 = 1_790_000_000;
 /// An access-token expiry no test reaches, so nothing is freshened unless a test says so.
 pub(crate) const FAR_MS: i64 = 4_102_444_800_000;
+/// Claude Code's usage endpoint (§8.1), as `ScriptedHttp` scripts it.
+pub(crate) const CC_USAGE: &str = "https://api.anthropic.com/api/oauth/usage";
 
 pub(crate) fn cc() -> ProviderId {
     ProviderId::new(CLAUDE_CODE)
@@ -36,6 +43,35 @@ pub(crate) fn cc() -> ProviderId {
 
 pub(crate) fn fake() -> ProviderId {
     ProviderId::new(FAKE_AGENT)
+}
+
+/// An engine on `env` with Claude Code and FakeAgent registered. Claude Code's live Keychain
+/// reads are retried without a wait (Appendix A.3), so a locked keychain costs a test no time.
+fn engine_on(
+    env: &Env,
+    kc: &Arc<FakeKeychain>,
+    clock: &Arc<FakeClock>,
+    http: &Arc<ScriptedHttp>,
+) -> Engine {
+    let claude = ClaudeCode::with_store(
+        LiveStore::new(kc.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO),
+    );
+    Engine::new(EngineConfig {
+        env: env.clone(),
+        registry: ProviderRegistry::new()
+            .with(Arc::new(claude))
+            .with(Arc::new(FakeAgent::new())),
+        vault: Vault::new(Box::new(KeychainVault::new(kc.clone()))),
+        oracle: Arc::new(NoOracle),
+        clock: clock.clone(),
+        http: http.clone(),
+        default_provider: cc(),
+        settings: Settings::default(),
+        process: Arc::new(SystemProcessProbe),
+        // Nothing here validates, and a scripted spawner never starts a process (§15.1).
+        spawner: Arc::new(ScriptedSpawner::new()),
+        run_shell: RunShell::Outside,
+    })
 }
 
 /// A home with Claude Code and FakeAgent registered, on a fake wall clock that starts at
@@ -57,22 +93,7 @@ impl Fx {
         let kc = Arc::new(FakeKeychain::new());
         let clock = Arc::new(FakeClock::new(T0 * 1000));
         let http = Arc::new(ScriptedHttp::new());
-        let engine = Engine::new(EngineConfig {
-            env: env.clone(),
-            registry: ProviderRegistry::new()
-                .with(Arc::new(ClaudeCode::new(kc.clone(), Platform::MacOs)))
-                .with(Arc::new(FakeAgent::new())),
-            vault: Vault::new(Box::new(KeychainVault::new(kc.clone()))),
-            oracle: Arc::new(NoOracle),
-            clock: clock.clone(),
-            http: http.clone(),
-            default_provider: cc(),
-            settings: Settings::default(),
-            process: Arc::new(SystemProcessProbe),
-            // Nothing here validates, and a scripted spawner never starts a process (§15.1).
-            spawner: Arc::new(tagteam_provider::process::ScriptedSpawner::new()),
-            run_shell: RunShell::Outside,
-        });
+        let engine = engine_on(&env, &kc, &clock, &http);
         Fx {
             _dir: dir,
             env,
@@ -83,8 +104,8 @@ impl Fx {
         }
     }
 
-    /// `claude /login` as `email`, then `tagteam add`: the login stays live.
-    pub(crate) fn add(&self, email: &str) -> AccountId {
+    /// `claude /login` as `email`: the live login's `oauthAccount` and its Keychain credential.
+    pub(crate) fn login(&self, email: &str) {
         let account = json!({"emailAddress": email, "organizationUuid": "", "accountUuid": format!("uuid-{email}")});
         fs::write(
             self.env.home.join(".claude.json"),
@@ -97,6 +118,11 @@ impl Fx {
             &keychain_account(&self.env),
             credential.to_string().as_bytes(),
         );
+    }
+
+    /// `claude /login` as `email`, then `tagteam add`: the login stays live.
+    pub(crate) fn add(&self, email: &str) -> AccountId {
+        self.login(email);
         self.add_live(cc())
     }
 
@@ -170,6 +196,11 @@ impl Fx {
     }
 }
 
+/// `b` at position 2 is the live login, `a` at position 1 a candidate.
+pub(crate) fn two(fx: &Fx) -> (AccountId, AccountId) {
+    (fx.add("a@x.co"), fx.add("b@x.co"))
+}
+
 /// The scheduler's sleep on the fixture's wall clock: each slice moves the clock on by its
 /// length, then `then` runs with the slice's number (from 0), to jump the clock, rewrite the
 /// settings or send a signal.
@@ -201,4 +232,109 @@ impl Sleeper for Slices<'_> {
         self.clock.advance_ms(d.as_millis() as i64);
         (self.then)(n);
     }
+}
+
+/// Every daemon event, with the fixture clock's time it was emitted at, in seconds after `T0`.
+pub(crate) struct Emitted<'a> {
+    clock: &'a FakeClock,
+    events: RefCell<Vec<(i64, DaemonEvent)>>,
+}
+
+impl<'a> Emitted<'a> {
+    pub(crate) fn new(clock: &'a FakeClock) -> Self {
+        Emitted {
+            clock,
+            events: RefCell::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn events(&self) -> Vec<(i64, DaemonEvent)> {
+        self.events.borrow().clone()
+    }
+
+    /// Each `mode` event of `of`: (seconds after `T0`, mode, waiting for, holder pid).
+    pub(crate) fn modes(
+        &self,
+        of: &ProviderId,
+    ) -> Vec<(i64, Mode, Option<WaitingFor>, Option<u32>)> {
+        self.events
+            .borrow()
+            .iter()
+            .filter_map(|(at, e)| match e {
+                DaemonEvent::Mode {
+                    provider,
+                    mode,
+                    waiting_for,
+                    holder_pid,
+                    ..
+                } if provider == of => Some((*at, *mode, *waiting_for, *holder_pid)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// When `of` polled: one per tick that reached §11.2 step 3.
+    pub(crate) fn polls(&self, of: &ProviderId) -> Vec<i64> {
+        self.events
+            .borrow()
+            .iter()
+            .filter_map(|(at, e)| match e {
+                DaemonEvent::Auto(tagteam_engine::auto::AutoEvent::Poll { provider, .. })
+                    if provider == of =>
+                {
+                    Some(*at)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl DaemonSink for Emitted<'_> {
+    fn emit(&self, e: &DaemonEvent) {
+        let at = self.clock.now_ms().div_euclid(1000) - T0;
+        self.events.borrow_mut().push((at, e.clone()));
+    }
+}
+
+/// A board for a daemon started at `T0`, with every notification on.
+pub(crate) fn board() -> Arc<StatusBoard> {
+    StatusBoard::new(
+        DaemonInfo {
+            pid: 4242,
+            version: "20261014.2045.0".into(),
+            started_at: T0,
+            socket: None,
+            log: PathBuf::from("/home/u/.local/state/tagteam/tagteam.log"),
+        },
+        NotifyInfo {
+            enabled: true,
+            backend: None,
+            events: vec![
+                NotifyEvent::Switch,
+                NotifyEvent::Quarantine,
+                NotifyEvent::Limit,
+            ],
+        },
+    )
+}
+
+/// A provider job's context as Linux gives it: no Keychain counts, and a store this build
+/// reads. Every test builds its context here, so a field added later is added once.
+pub(crate) fn job_ctx(board: &Arc<StatusBoard>) -> ProviderJobCtx {
+    ProviderJobCtx {
+        board: board.clone(),
+        keychain_counts: Vec::new(),
+        schema_newer: false,
+    }
+}
+
+/// `of`'s line of the board.
+pub(crate) fn status(board: &StatusBoard, of: &ProviderId) -> ProviderStatus {
+    board
+        .snapshot()
+        .providers
+        .into_iter()
+        .find(|p| &p.provider == of)
+        .expect("the provider job has run")
 }
