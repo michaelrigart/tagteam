@@ -129,6 +129,104 @@ struct Seen {
     login_epoch: i64,
 }
 
+/// Decision 6 (daemon plan A): §11.2 step 1's report of quarantine changes, shared by an
+/// engine's ticks and the daemon's `collect` rounds (D4.3). It keeps each account's quarantine
+/// as the previous call left it (Decision 10), so each change is reported once.
+#[derive(Debug, Default)]
+pub struct QuarantineWatch {
+    /// Each account's quarantine as the previous call left it; `None` before the first.
+    seen: Option<BTreeMap<AccountId, Seen>>,
+}
+
+impl QuarantineWatch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The releases this round made (`released`), and, against the previous call's map,
+    /// every quarantine another process set or cleared since (Decision 10): `account-replaced`
+    /// when the login epoch moved, else `credentials-replaced`. The first call has no previous
+    /// map, so it reports only the releases.
+    pub fn report(
+        &mut self,
+        provider: &ProviderId,
+        rows: &[AccountRow],
+        released: &[AccountId],
+        sink: &dyn EventSink,
+    ) {
+        let before = self.seen.take();
+        for row in rows {
+            let was = before.as_ref().and_then(|m| m.get(&row.id));
+            let reason = || {
+                match was {
+                    Some(s) if s.login_epoch != row.login_epoch => "account-replaced",
+                    _ => "credentials-replaced",
+                }
+                .to_owned()
+            };
+            let cleared = released.contains(&row.id)
+                || (was.is_some_and(|s| s.reason.is_some()) && row.quarantine_reason.is_none());
+            let set = before.is_some()
+                && row.quarantine_reason.is_some()
+                && was.is_none_or(|s| s.reason.is_none());
+            if cleared {
+                sink.emit(&AutoEvent::AccountUnquarantined {
+                    provider: provider.clone(),
+                    number: row.position,
+                    email: email_of(row),
+                    reason: reason(),
+                });
+            } else if set {
+                sink.emit(&AutoEvent::AccountQuarantined {
+                    provider: provider.clone(),
+                    number: row.position,
+                    email: email_of(row),
+                    reason: row.quarantine_reason.clone().unwrap_or_default(),
+                });
+            }
+        }
+        self.seen = Some(
+            rows.iter()
+                .map(|r| {
+                    let seen = Seen {
+                        reason: r.quarantine_reason.clone(),
+                        login_epoch: r.login_epoch,
+                    };
+                    (r.id.clone(), seen)
+                })
+                .collect(),
+        );
+    }
+
+    /// A quarantine this round's own work found (a collection's, or a tick's step 10
+    /// freshening), reported once: the next `report` already knows it.
+    pub fn note_quarantined(
+        &mut self,
+        provider: &ProviderId,
+        row: &AccountRow,
+        sink: &dyn EventSink,
+    ) {
+        let Some(reason) = row.quarantine_reason.clone() else {
+            return;
+        };
+        let seen = self.seen.get_or_insert_with(BTreeMap::new);
+        let entry = seen.entry(row.id.clone()).or_insert(Seen {
+            reason: None,
+            login_epoch: row.login_epoch,
+        });
+        if entry.reason.is_some() {
+            return;
+        }
+        entry.reason = Some(reason.clone());
+        sink.emit(&AutoEvent::AccountQuarantined {
+            provider: provider.clone(),
+            number: row.position,
+            email: email_of(row),
+            reason,
+        });
+    }
+}
+
 /// One account as a tick read it from the store: its row, its decision-grade windows under
 /// the tick's models (§8.4), when its reading was taken, as stored, and whether a session
 /// owns it (§12.5), read beside them.
@@ -145,12 +243,16 @@ pub struct AutoEngine<'e> {
     provider: ProviderId,
     cfg: AutoConfig,
     dry_run: bool,
-    /// The engine lock, held for this engine's life; `None` in dry-run.
-    _lock: Option<FlockGuard>,
+    /// What its switches, recoveries and quarantine releases record as `events.source`
+    /// (§6.1): `auto`, or the daemon's `daemon` (Decision 4).
+    source: &'static str,
+    /// The engine lock, held for this engine's life; `None` in dry-run. `Drop` empties its
+    /// record while it is still held (Decision 5).
+    lock: Option<FlockGuard>,
     /// Dry-run's `unhealthy_ticks`: it writes no auto-switch state (§11.1).
     unhealthy: Option<u32>,
     /// Decision 10: each account's quarantine as the previous tick left it.
-    seen: Option<BTreeMap<AccountId, Seen>>,
+    quarantines: QuarantineWatch,
     /// The `models` the model-name check last ran for (§11.2 step 3).
     checked_models: Option<Vec<String>>,
     /// The strategy the long-window check last ran for (§4.5).
@@ -264,14 +366,24 @@ impl Engine {
             provider: provider.clone(),
             cfg,
             dry_run,
-            _lock: lock,
+            source: "auto",
+            lock,
             unhealthy: None,
-            seen: None,
+            quarantines: QuarantineWatch::new(),
             checked_models: None,
             checked_strategy: None,
             judged: None,
             live: None,
         }))
+    }
+
+    /// The holder `provider`'s engine lock record names (§11.1), read without trying the
+    /// lock, as `doctor` reads it (§13.6): a try at the wrong instant would make a starting
+    /// `auto` fail (D4.3). `Absent` with no record: no engine has run, or the last one let the
+    /// lock go (Decision 5). Never proof that the holder runs: judge that by an exact pid and
+    /// start-time match (`ProcessStamp::liveness`).
+    pub fn engine_holder(&self, provider: &ProviderId) -> Read<ProcessStamp> {
+        read_holder(&engine_lock_path(&self.env, provider))
     }
 }
 
@@ -302,6 +414,18 @@ fn email_of(row: &AccountRow) -> String {
 }
 
 impl AutoEngine<'_> {
+    /// Decision 4: the source this engine's switches, recoveries and quarantine releases
+    /// record (§6.1). `Engine::auto` starts every engine at `auto`; the daemon passes `daemon`.
+    pub fn with_source(mut self, source: &'static str) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// The provider this engine drives.
+    pub fn provider(&self) -> &ProviderId {
+        &self.provider
+    }
+
     /// One §11.2 tick. `Err` only for an interruption (§14.1) or a store failure; every other
     /// failure is an `error` event and `TickOutcome::Error`. A switch that committed is
     /// `Switched` even when a signal arrived during its critical span: the token stays set for
@@ -355,14 +479,15 @@ impl AutoEngine<'_> {
             Vec::new()
         } else {
             self.engine
-                .release_unbound_quarantines(&self.provider, "auto")?
+                .release_unbound_quarantines(&self.provider, self.source)?
         };
         let store = self.engine.existing_store()?;
         let rows = match &store {
             Some(s) => s.accounts(&self.provider)?,
             None => Vec::new(),
         };
-        self.report_quarantines(&rows, &released, sink);
+        self.quarantines
+            .report(&self.provider, &rows, &released, sink);
         // Step 2: recovery first, then the live check.
         if let Some(refusal) = self.recover()? {
             return Ok(self.no_switch(
@@ -486,7 +611,8 @@ impl AutoEngine<'_> {
                 AutoFreshened::Ready => {}
                 AutoFreshened::Quarantined => {
                     if let Some(now) = t.store.account(id)? {
-                        self.note_quarantined(&now, sink);
+                        self.quarantines
+                            .note_quarantined(&self.provider, &now, sink);
                     }
                     continue;
                 }
@@ -501,7 +627,7 @@ impl AutoEngine<'_> {
                 provider: self.provider.clone(),
                 target: SwitchTarget::Account(id.clone()),
                 force: false,
-                source: "auto",
+                source: self.source,
                 auto: Some(AutoPerform {
                     expected_from: t.live.id.clone(),
                     trigger,
@@ -593,11 +719,12 @@ impl AutoEngine<'_> {
     }
 
     /// §11.2 step 2: an unresolved switch journal for the provider is recovered first, under
-    /// `MutationGuard`, its events carrying `source` = `auto` (§9.6). `Some` with recovery's
-    /// refusal while a row stays: one recovery could not decide, could not take the live
-    /// locks or found its agent writing, or the mutation lock was held past its timeout.
+    /// `MutationGuard`, its events carrying the engine's source (§9.6, Decision 4). `Some`
+    /// with recovery's refusal while a row stays: one recovery could not decide, could not
+    /// take the live locks or found its agent writing, or the mutation lock was held past its
+    /// timeout.
     fn recover(&self) -> Result<Option<EngineError>, EngineError> {
-        match self.engine.settle_or_refuse_as(&self.provider, "auto") {
+        match self.engine.settle_or_refuse_as(&self.provider, self.source) {
             Ok(()) => Ok(None),
             Err(e) if e.signal().is_some() => Err(e),
             Err(
@@ -688,82 +815,6 @@ impl AutoEngine<'_> {
             }))
     }
 
-    /// Step 1's quarantine report: this tick's own releases, and, against the previous tick's
-    /// map, every quarantine another process set or cleared since (Decision 10). The first
-    /// tick has no previous map, so it reports only its own releases.
-    fn report_quarantines(
-        &mut self,
-        rows: &[AccountRow],
-        released: &[AccountId],
-        sink: &dyn EventSink,
-    ) {
-        let before = self.seen.take();
-        for row in rows {
-            let was = before.as_ref().and_then(|m| m.get(&row.id));
-            let reason = || {
-                match was {
-                    Some(s) if s.login_epoch != row.login_epoch => "account-replaced",
-                    _ => "credentials-replaced",
-                }
-                .to_owned()
-            };
-            let cleared = released.contains(&row.id)
-                || (was.is_some_and(|s| s.reason.is_some()) && row.quarantine_reason.is_none());
-            let set = before.is_some()
-                && row.quarantine_reason.is_some()
-                && was.is_none_or(|s| s.reason.is_none());
-            if cleared {
-                self.emit(sink, |provider| AutoEvent::AccountUnquarantined {
-                    provider,
-                    number: row.position,
-                    email: email_of(row),
-                    reason: reason(),
-                });
-            } else if set {
-                self.emit(sink, |provider| AutoEvent::AccountQuarantined {
-                    provider,
-                    number: row.position,
-                    email: email_of(row),
-                    reason: row.quarantine_reason.clone().unwrap_or_default(),
-                });
-            }
-        }
-        self.seen = Some(
-            rows.iter()
-                .map(|r| {
-                    let seen = Seen {
-                        reason: r.quarantine_reason.clone(),
-                        login_epoch: r.login_epoch,
-                    };
-                    (r.id.clone(), seen)
-                })
-                .collect(),
-        );
-    }
-
-    /// A quarantine this tick's own work found (a collection's, or step 10's freshening),
-    /// reported once: the next tick's comparison already knows it.
-    fn note_quarantined(&mut self, row: &AccountRow, sink: &dyn EventSink) {
-        let Some(reason) = row.quarantine_reason.clone() else {
-            return;
-        };
-        let seen = self.seen.get_or_insert_with(BTreeMap::new);
-        let entry = seen.entry(row.id.clone()).or_insert(Seen {
-            reason: None,
-            login_epoch: row.login_epoch,
-        });
-        if entry.reason.is_some() {
-            return;
-        }
-        entry.reason = Some(reason.clone());
-        self.emit(sink, |provider| AutoEvent::AccountQuarantined {
-            provider,
-            number: row.position,
-            email: email_of(row),
-            reason,
-        });
-    }
-
     /// A collection's findings: the accounts it saw quarantined, and its warnings, each an
     /// `error` event that does not fail the tick (§8.3: a usage failure is never an error).
     fn report_collection(
@@ -774,7 +825,8 @@ impl AutoEngine<'_> {
     ) {
         for id in &report.quarantined {
             if let Some(a) = accounts.iter().find(|a| &a.row.id == id) {
-                self.note_quarantined(&a.row, sink);
+                self.quarantines
+                    .note_quarantined(&self.provider, &a.row, sink);
             }
         }
         for warning in &report.warnings {
@@ -952,6 +1004,31 @@ impl AutoEngine<'_> {
                 provider,
                 earliest_reset_at: *earliest_reset,
             });
+        }
+    }
+}
+
+/// Decision 5, D3 change 3: a dropped engine empties its lock file's holder record before the
+/// lock goes, so a process that lives on (a daemon that paused the provider, D4.3) is never
+/// named as its engine. `drop` runs before the fields drop, so the lock is still held while
+/// the record is emptied, through a second descriptor as `write_holder` writes it. A failure
+/// is logged and otherwise ignored. A dry-run engine holds no lock and touches nothing. A
+/// process killed by SIGKILL still leaves its record, which names a dead process.
+impl Drop for AutoEngine<'_> {
+    fn drop(&mut self) {
+        let Some(lock) = &self.lock else {
+            return;
+        };
+        let emptied = OpenOptions::new()
+            .write(true)
+            .open(lock.path())
+            .and_then(|file| file.set_len(0));
+        if let Err(e) = emptied {
+            tracing::warn!(
+                provider = %self.provider,
+                kind = %e.kind(),
+                "could not empty the engine lock's holder record"
+            );
         }
     }
 }
