@@ -26,6 +26,7 @@ use tagteam_provider::process::Liveness;
 use crate::auto::{AutoFlags, auto_config, no_switch};
 use crate::backoff::KeychainBackoff;
 use crate::events::{AutoEvents, DaemonEvent, DaemonSink, Mode, StopReason, WaitingFor};
+use crate::notify::NoticeQueue;
 use crate::scheduler::{Job, JobCx, Ran};
 use crate::status::{LastOutcome, LastSwitch, OutcomeKind, ProviderStatus, StatusBoard};
 
@@ -43,6 +44,8 @@ const JITTER_FRAC: f64 = 0.1;
 pub struct ProviderJobCtx {
     /// Where the job writes its line after each run (Decision 12).
     pub board: Arc<StatusBoard>,
+    /// Where the job queues D6.1's `limit` notice (Task 11); `None` when there is no notifier.
+    pub notices: Option<NoticeQueue>,
     /// The Keychain read counts the keychain backoff compares around each run (D4.1,
     /// Decision 7); empty where there is no Keychain.
     pub keychain_counts: Vec<Arc<ReadCounts>>,
@@ -640,10 +643,19 @@ impl<'e> ProviderJob<'e> {
         Ok(earliest)
     }
 
-    /// D6.1's `limit` notice is judged here, from the store, after each run that did work: in
-    /// `auto` after a tick that did not switch, in `collect` after every round. Notifications
-    /// are not wired yet, so it does nothing.
-    fn after_run_notices(&mut self, _cx: &mut JobCx<'_>, _switched: bool) {}
+    /// D6.1's `limit`, after a run that did work: judged only when the run did not switch
+    /// (`switched` is false after an `auto` tick that did not switch, and after every `collect`
+    /// round), and only when notices can be sent (`notify::after_run`).
+    fn after_run_notices(&mut self, cx: &mut JobCx<'_>, switched: bool) {
+        crate::notify::after_run(
+            cx.engine,
+            &self.provider,
+            &self.settings,
+            self.ctx.notices.as_ref(),
+            cx.sink,
+            switched,
+        );
+    }
 
     /// Decision 12: this job's line of the status board.
     fn publish(&self) {

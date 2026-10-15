@@ -5,6 +5,7 @@
 pub mod auto;
 pub mod backoff;
 pub mod events;
+pub mod notify;
 pub mod protocol;
 pub mod provider_job;
 pub mod scheduler;
