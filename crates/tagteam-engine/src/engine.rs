@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, UNIX_EPOCH};
 
 use tagteam_core::{AccountId, ProviderId};
@@ -58,7 +58,9 @@ pub struct Engine {
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) http: Arc<dyn Http>,
     pub(crate) default_provider: ProviderId,
-    pub(crate) settings: Settings,
+    /// `config.toml` as last read (§6.4): the command's read at first, then each
+    /// `reload_settings` (D3 change 1). Readers take a snapshot through `settings()`.
+    settings: RwLock<Arc<Settings>>,
     /// Judges session records (§12.6): `SystemProcessProbe` in production.
     pub(crate) process: Arc<dyn ProcessProbe>,
     pub(crate) spawner: Arc<dyn ProcessSpawner>,
@@ -82,7 +84,7 @@ impl Engine {
             clock: cfg.clock,
             http: cfg.http,
             default_provider: cfg.default_provider,
-            settings: cfg.settings,
+            settings: RwLock::new(Arc::new(cfg.settings)),
             process: cfg.process,
             spawner: cfg.spawner,
             run_shell: cfg.run_shell,
@@ -130,9 +132,28 @@ impl Engine {
         self.clock.now_ms()
     }
 
-    /// The settings this engine was built with (§6.4).
-    pub fn settings(&self) -> &Settings {
-        &self.settings
+    /// The settings as last read (§6.4), as a snapshot. A reload replaces what later calls
+    /// return, and leaves a snapshot already taken as it was. Bind it before borrowing from
+    /// it: `let settings = engine.settings();`.
+    pub fn settings(&self) -> Arc<Settings> {
+        self.settings
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// D3 change 1: reads `config.toml` again as `provider`'s commands read it (§6.4:
+    /// forgiving, the provider's own table first), makes it the engine's settings, and returns
+    /// the read's warnings. A missing or corrupt file gives the defaults, as at start-up. The
+    /// daemon reloads for the provider its command acts on, at start and whenever the file's
+    /// mtime changes (D4.2); the collector and the views read the result.
+    pub fn reload_settings(&self, provider: &ProviderId) -> Vec<String> {
+        let (settings, warnings) = Settings::load(&self.env, provider);
+        *self
+            .settings
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(settings);
+        warnings
     }
 
     /// The port providers send their requests through (§4.4).
@@ -686,7 +707,56 @@ mod tests {
             settings: settings.clone(),
             ..test_config(Env::for_test(d.path()))
         });
-        assert_eq!(engine.settings(), &settings);
+        assert_eq!(*engine.settings(), settings);
+    }
+
+    #[test]
+    fn a_reload_reads_config_toml_again_and_returns_its_warnings() {
+        // D3 change 1 (Decision 3): a daemon lives for days, so what the engine's readers see
+        // follows the file. A snapshot taken before a reload keeps the values it had.
+        let d = tempfile::tempdir().unwrap();
+        let env = Env::for_test(d.path());
+        let engine = test_engine(env.clone());
+        let cc = ProviderId::new("claude-code");
+        let before = engine.settings();
+        let path = crate::settings::config_path(&env);
+        std::fs::create_dir_all(env.config_dir()).unwrap();
+        std::fs::write(
+            &path,
+            "[autoswitch]\nmodels = [\"Fable\"]\n\n[usage]\nhistory_retention_days = 30\n\n\
+             [provider.claude-code.autoswitch]\nmodels = [\"Opus\"]\n",
+        )
+        .unwrap();
+
+        assert!(
+            engine
+                .reload_settings(&ProviderId::new("fake-agent"))
+                .is_empty()
+        );
+        assert_eq!(engine.settings().models, ["Fable"]);
+        assert!(engine.reload_settings(&cc).is_empty());
+        let after = engine.settings();
+        assert_eq!(
+            after.models,
+            ["Opus"],
+            "the provider's own table first (§6.4)"
+        );
+        assert_eq!(after.history_retention_days, 30);
+        assert_eq!(*before, Settings::default(), "a snapshot keeps its values");
+
+        // Forgiving (§6.4): an invalid value reads as its default, with one warning naming it,
+        // and the rest of the file applies; this file names no models any more.
+        std::fs::write(&path, "[usage]\nhistory_retention_days = 0\n").unwrap();
+        let warnings = engine.reload_settings(&cc);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("`usage.history_retention_days`"),
+            "{warnings:?}"
+        );
+        let invalid = engine.settings();
+        assert_eq!(invalid.history_retention_days, 180);
+        assert!(invalid.models.is_empty(), "{:?}", invalid.models);
+        assert_eq!(after.models, ["Opus"], "the earlier snapshot is untouched");
     }
 
     /// A journal row's `to_id` is foreign-keyed to `accounts`, so a test that installs one

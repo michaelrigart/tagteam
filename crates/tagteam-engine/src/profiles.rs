@@ -114,7 +114,7 @@ impl Engine {
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         };
         let mut report = SyncReport::default();
-        let wanted = allowlist(&policy, &self.settings.share_extra, &mut report.warnings);
+        let wanted = allowlist(&policy, &self.settings().share_extra, &mut report.warnings);
         let unknown = check(&policy, profile, &wanted, &before, joining)?;
         let mut record = before.clone();
         let applied = apply(&policy, profile, &wanted, joining, &mut record, &mut report);

@@ -693,7 +693,8 @@ impl Engine {
             }
         }
         let had_windows = !read.is_empty();
-        let models = &self.settings().models;
+        let settings = self.settings();
+        let models = &settings.models;
         let windows = read
             .into_iter()
             .filter(|(w, ..)| match window {

@@ -561,6 +561,26 @@ fn history_follows_the_configured_models() {
     );
 }
 
+#[test]
+fn history_follows_the_models_a_settings_reload_brings() {
+    // D3 change 1: the views read the engine's settings as they are now, not as they were
+    // when the engine was built.
+    let fx = Fx::new();
+    let a = with_history(&fx);
+    assert_eq!(keys(&fx.engine.history(&a, None, 0).unwrap()), ["5h", "7d"]);
+    fs::create_dir_all(fx.env.config_dir()).unwrap();
+    fs::write(
+        fx.env.config_dir().join("config.toml"),
+        "[autoswitch]\nmodels = [\"fable\"]\n",
+    )
+    .unwrap();
+    assert!(fx.engine.reload_settings(&fx.provider()).is_empty());
+    assert_eq!(
+        keys(&fx.engine.history(&a, None, 0).unwrap()),
+        ["5h", "7d", "scoped:Fable"]
+    );
+}
+
 /// `samples`' `(fetched_at, pct)` pairs.
 fn shown(w: &HistoryWindow) -> Vec<(i64, f64)> {
     w.samples.iter().map(|s| (s.fetched_at, s.pct)).collect()

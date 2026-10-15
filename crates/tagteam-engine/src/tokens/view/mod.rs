@@ -356,7 +356,8 @@ impl Engine {
         // The query provider's own overrides, whichever provider the settings were loaded for
         // (spec §8.2).
         let none = BTreeMap::new();
-        let overrides = self.settings().prices.get(&q.provider).unwrap_or(&none);
+        let settings = self.settings();
+        let overrides = settings.prices.get(&q.provider).unwrap_or(&none);
         let (prices, price_overrides) = Prices::new(table, overrides);
         let mut report = TokenReport {
             query: q.clone(),
