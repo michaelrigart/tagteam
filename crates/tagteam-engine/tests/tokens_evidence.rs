@@ -9,9 +9,12 @@ use std::time::{Duration, SystemTime};
 
 use common::{Fx, LSTART};
 use serde_json::json;
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{LaunchRow, SightingRow, SightingSource};
 use tagteam_engine::tokens::{LaunchId, LaunchPoll, Tenure};
-use tagteam_provider::{FakeProcess, FlockGuard, LAUNCH_DIR, parse_lstart};
+use tagteam_provider::{
+    FakeProcess, FlockGuard, LAUNCH_DIR, PENDING_LAUNCH_DIR, PendingLaunch, parse_lstart,
+};
 
 const NOW: i64 = 1_790_000_000_000;
 
@@ -1682,4 +1685,205 @@ fn the_statusline_never_waits_on_a_busy_store() {
             NOW
         )]
     );
+}
+
+/// A pending launch file (spec §6.1) of `account` in `profile`, written as `run` writes it.
+fn pending(
+    fx: &Fx,
+    profile: &Path,
+    account: &AccountId,
+    started_at_ms: i64,
+    ended_at_ms: Option<i64>,
+    run_pid: u32,
+) -> PathBuf {
+    PendingLaunch {
+        provider: fx.provider(),
+        account_id: account.clone(),
+        started_at_ms,
+        ended_at_ms,
+    }
+    .write(profile, run_pid)
+    .unwrap();
+    profile
+        .join(PENDING_LAUNCH_DIR)
+        .join(format!("{started_at_ms}-{run_pid}.json"))
+}
+
+/// What is in `profile`'s pending directory, by name.
+fn pending_files(profile: &Path) -> Vec<String> {
+    let Ok(listing) = fs::read_dir(profile.join(PENDING_LAUNCH_DIR)) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = listing
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_scan_records_a_pending_launch_open_and_removes_its_file() {
+    // Spec §6.2: a launch `run` kept in its profile because the store refused it is recorded
+    // from its own start, open while the profile is in use, and its file goes.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let _in_use = FlockGuard::try_lock(&profile.join(LAUNCH_DIR).join("4242.lock"))
+        .unwrap()
+        .unwrap();
+    let file = pending(&fx, &profile, &a, NOW - 5_000, None, 4242);
+
+    assert_eq!(sight(&fx), 1, "the launch recorded");
+    assert_eq!(
+        launches(&fx),
+        [LaunchRow {
+            account_id: a.to_string(),
+            started_at: NOW - 5_000,
+            ended_at: None,
+            pid: None,
+            recorded_at: NOW,
+        }]
+    );
+    assert!(!file.exists(), "{:?}", pending_files(&profile));
+    assert_eq!(sight(&fx), 0, "nothing more to record");
+}
+
+#[test]
+fn a_pending_launch_with_an_end_is_recorded_closed_at_it() {
+    // Spec §6.2: `endedAt` is the moment `run`'s close found the profile idle; the scan closes
+    // the launch there, not when it finds the file.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let file = pending(&fx, &profile, &a, NOW - 5_000, Some(NOW - 1_000), 4242);
+    fx.clock.advance_ms(10_000);
+
+    assert_eq!(sight(&fx), 1);
+    assert_eq!(ended(&fx), [(a.to_string(), Some(NOW - 1_000))]);
+    assert_eq!(launches(&fx)[0].recorded_at, NOW + 10_000);
+    assert!(!file.exists());
+}
+
+#[test]
+fn a_pending_launch_the_store_already_holds_changes_nothing() {
+    // Spec §6.2: both writes are idempotent. A launch `run` recorded late, whose file a failed
+    // removal left behind, keeps its stored end, and the file goes.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    fx.engine
+        .close_launch(&id, &profile, &LaunchPoll::default(), NOW)
+        .unwrap();
+    let stored = launches(&fx);
+    let file = pending(&fx, &profile, &a, id.started_at_ms, Some(NOW + 9_000), 4242);
+    fx.clock.advance_ms(10_000);
+
+    assert_eq!(sight(&fx), 0);
+    assert_eq!(launches(&fx), stored);
+    assert!(!file.exists());
+}
+
+#[test]
+fn a_scan_leaves_a_pending_file_that_is_not_a_launch_of_its_profile_where_it_is() {
+    // Spec §6.2: a file that does not parse, or names another provider or another account than
+    // its profile, is skipped and kept; a writer's temp file (not `*.json`) is ignored. The
+    // valid file beside them is recorded and removed all the same.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let dir = profile.join(PENDING_LAUNCH_DIR);
+    let good = pending(&fx, &profile, &a, NOW - 5_000, Some(NOW - 4_000), 1);
+    fs::write(dir.join("1000-2.json"), "{ torn").unwrap();
+    let other_account = pending(
+        &fx,
+        &profile,
+        &AccountId::from_string("someone-else"),
+        2_000,
+        None,
+        3,
+    );
+    let other_provider = dir.join("3000-4.json");
+    PendingLaunch {
+        provider: ProviderId::new("other-provider"),
+        account_id: a.clone(),
+        started_at_ms: 3_000,
+        ended_at_ms: None,
+    }
+    .write(&profile, 4)
+    .unwrap();
+    let temp = dir.join(".4000-5.json.tagteam-5-0a1b2c3d");
+    fs::write(&temp, fs::read(&good).unwrap()).unwrap();
+
+    assert_eq!(sight(&fx), 1, "only the valid launch");
+    assert_eq!(ended(&fx), [(a.to_string(), Some(NOW - 4_000))]);
+    assert!(!good.exists());
+    for kept in [dir.join("1000-2.json"), other_account, other_provider, temp] {
+        assert!(kept.exists(), "{kept:?} is left in place");
+    }
+}
+
+#[test]
+fn a_launch_kept_unrecorded_is_closed_with_the_close_time_and_dropped_once_recorded() {
+    // Spec §6.1: at the close an unrecorded launch is kept in its pending file, with the close
+    // time as `endedAt` once the profile is idle (the moment the store's close would have
+    // stored) and null while it is in use. A launch the caller says is recorded loses its file.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.plan_launch(&cc, &a);
+    fx.engine.keep_pending_launch(&id, &profile, None).unwrap();
+    let file = profile.join(PENDING_LAUNCH_DIR).join(format!(
+        "{}-{}.json",
+        id.started_at_ms,
+        std::process::id()
+    ));
+    let read = || {
+        let all = PendingLaunch::read_all(&profile);
+        assert_eq!(all.len(), 1, "{all:?}");
+        all.into_iter().next().unwrap().1.unwrap()
+    };
+    assert_eq!(read().ended_at_ms, None, "kept open while the child runs");
+
+    let in_use = FlockGuard::try_lock(&profile.join(LAUNCH_DIR).join("4242.lock"))
+        .unwrap()
+        .unwrap();
+    let closed = fx
+        .engine
+        .close_launch_kept(&id, &profile, &LaunchPoll::default(), NOW, false);
+    assert!(closed.kept, "{closed:?}");
+    assert_eq!(read().ended_at_ms, None, "the profile is in use");
+
+    drop(in_use);
+    fx.clock.advance_ms(3_000);
+    let closed = fx
+        .engine
+        .close_launch_kept(&id, &profile, &LaunchPoll::default(), NOW, false);
+    assert!(closed.kept, "{closed:?}");
+    assert_eq!(read().ended_at_ms, Some(NOW + 3_000));
+    assert!(launches(&fx).is_empty(), "nothing went to the store");
+
+    let closed = fx
+        .engine
+        .close_launch_kept(&id, &profile, &LaunchPoll::default(), NOW, true);
+    assert!(!closed.kept, "{closed:?}");
+    assert!(!file.exists(), "recorded: the file goes");
+}
+
+#[test]
+fn remove_records_the_pending_launches_of_the_profile_it_deletes() {
+    // Spec §13: `remove` records a profile's pending launches before it deletes the profile,
+    // as the scan does; the launch outlives the account.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    pending(&fx, &profile, &a, NOW - 5_000, Some(NOW - 1_000), 4242);
+
+    fx.engine.remove(&a).unwrap();
+
+    assert!(!profile.exists(), "the profile is gone");
+    assert_eq!(ended(&fx), [(a.to_string(), Some(NOW - 1_000))]);
 }

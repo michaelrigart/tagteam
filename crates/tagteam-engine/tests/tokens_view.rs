@@ -26,7 +26,7 @@ use tagteam_engine::tokens::{
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::{Engine, EngineConfig};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
-use tagteam_provider::{FakeProcess, Provider, RunShell, parse_lstart};
+use tagteam_provider::{FakeProcess, PendingLaunch, Provider, RunShell, parse_lstart};
 
 const MIN: i64 = 60_000;
 const H: i64 = 60 * MIN;
@@ -633,6 +633,60 @@ fn a_switch_places_an_unsighted_response_unless_a_launch_may_cover_it() {
             (Basis::Timeline, 1),
             (Basis::Unattributed, 2)
         ]
+    );
+}
+
+#[test]
+fn a_pending_launch_leaves_an_unsighted_response_unattributed_without_the_scan() {
+    // Spec §7.2: a launch `run` kept in a pending file counts as a stored one, so a report made
+    // before the next scan (`--no-refresh`) leaves a response inside it unattributed, where the
+    // default home's login would have been credited without it. The report only reads: the file
+    // stays, and the store gains no launch.
+    let v = View::new();
+    v.event(T0 - D, "switch", None, Some(&v.b));
+    v.index(&[v.usage("s-2", T0 + 5 * H, "model-a", 2, 0)]);
+    let q = v.query(TokenPeriod::Day, TokenGrouping::Account);
+
+    let r = v.report(&q);
+    assert_eq!(keys(&r), ["day:2026-09-01|account:acct-b"]);
+    assert_eq!(r.total.by_basis[1], (Basis::Timeline, 2));
+
+    let cc_provider = v.engine.provider(&cc()).unwrap();
+    let profile = v.fx.make_profile_for(cc_provider.as_ref(), &v.a);
+    PendingLaunch {
+        provider: cc(),
+        account_id: v.a.clone(),
+        started_at_ms: T0 + 4 * H,
+        ended_at_ms: None,
+    }
+    .write(&profile, 4242)
+    .unwrap();
+    let r = v.report(&q);
+    assert_eq!(keys(&r), ["day:2026-09-01|account:unattributed"]);
+    assert_eq!(
+        r.total.by_basis,
+        [
+            (Basis::Profile, 0),
+            (Basis::Timeline, 0),
+            (Basis::Unattributed, 2)
+        ]
+    );
+    assert_eq!(PendingLaunch::read_all(&profile).len(), 1, "the file stays");
+    assert!(v.store.launches(&cc()).unwrap().is_empty());
+
+    // A pending launch that ended before the response does not cover it.
+    PendingLaunch {
+        provider: cc(),
+        account_id: v.a.clone(),
+        started_at_ms: T0 + 4 * H,
+        ended_at_ms: Some(T0 + 5 * H - 1),
+    }
+    .write(&profile, 4242)
+    .unwrap();
+    assert_eq!(
+        keys(&v.report(&q)),
+        ["day:2026-09-01|account:acct-b"],
+        "its end bounds it"
     );
 }
 
