@@ -858,6 +858,170 @@ fn a_write_that_fails_keeps_what_it_did_not_store() {
     );
 }
 
+/// Fails every insert of `session`'s sightings while it exists: a store write of one tenure
+/// that fails, the others going through.
+fn fail_writes_of(fx: &Fx, session: &str) -> rusqlite::Connection {
+    let raw = rusqlite::Connection::open(fx.env.data_dir().join("tagteam.db")).unwrap();
+    raw.execute_batch(&format!(
+        "CREATE TRIGGER injected BEFORE INSERT ON session_sightings \
+         WHEN NEW.session_id = '{session}' BEGIN SELECT RAISE(ABORT, 'injected'); END;"
+    ))
+    .unwrap();
+    raw
+}
+
+#[test]
+fn a_write_stores_the_current_tenure_before_it_ends_any() {
+    // Spec §6.1, §6.4: a tenure leaves run's queue only once every later one is stored. Here
+    // the write of the current tenure, s-b, fails, so s-a's ended tenure stays queued. When a
+    // scan later continues s-a's tenure over the time s-a was away (s-b, which would have
+    // stopped it, is still not stored), the next write still ends it exactly.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    let started = NOW + 500;
+    let at = |ms: i64| NOW + ms;
+    running(&fx, 777, None);
+    let path = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&path, 1_790_000_000);
+    fx.clock.set(at(1_000));
+    poll(&fx, &id, &profile, &mut state);
+    fx.clock.set(at(1_050));
+    check(&fx, &id, &profile, &mut state);
+    record(&fx, &profile, 777, "s-b", started, "interactive");
+    set_mtime(&path, 1_790_000_001);
+    fx.clock.set(at(1_100));
+    check(&fx, &id, &profile, &mut state);
+
+    let raw = fail_writes_of(&fx, "s-b");
+    assert!(fx.engine.poll_launch(&id, &mut state).is_err());
+    let queued = |state: &LaunchPoll| {
+        state
+            .ended
+            .iter()
+            .map(|t| t.session_id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(queued(&state), ["s-a"], "s-a's end waits for s-b");
+    let run = SightingSource::Run;
+    let first = sighting(
+        "s-a",
+        a.as_str(),
+        started,
+        at(1_000),
+        at(1_000),
+        run,
+        at(1_000),
+    );
+    assert_eq!(sightings(&fx), [first]);
+
+    record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&path, 1_790_000_002);
+    fx.clock.set(at(1_200));
+    check(&fx, &id, &profile, &mut state);
+    fx.clock.set(at(62_000));
+    sight(&fx);
+    raw.execute_batch("DROP TRIGGER injected;").unwrap();
+    fx.clock.set(at(62_050));
+    poll(&fx, &id, &profile, &mut state);
+    let written = at(62_050);
+    assert_eq!(
+        sightings(&fx),
+        [
+            sighting(
+                "s-a",
+                a.as_str(),
+                started,
+                at(1_000),
+                at(1_050),
+                run,
+                written
+            ),
+            sighting("s-a", a.as_str(), started, at(1_200), written, run, written),
+            sighting(
+                "s-b",
+                a.as_str(),
+                started,
+                at(1_100),
+                at(1_100),
+                run,
+                written
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_write_ends_the_newest_tenure_first() {
+    // Spec §6.1: the tenures that ended since the last write are ended newest first, so an
+    // older one leaves the queue only after the ones that followed it. Here s-b's end fails:
+    // s-a's tenure, older, stays queued and its stored end untouched.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    let started = NOW + 500;
+    let at = |ms: i64| NOW + ms;
+    running(&fx, 777, None);
+    let path = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&path, 1_790_000_000);
+    fx.clock.set(at(1_000));
+    poll(&fx, &id, &profile, &mut state);
+    for (when, session, mtime) in [
+        (1_050, None, None),
+        (1_100, Some("s-b"), Some(1_790_000_001)),
+        (1_150, None, None),
+        (1_200, Some("s-c"), Some(1_790_000_002)),
+    ] {
+        if let (Some(session), Some(mtime)) = (session, mtime) {
+            record(&fx, &profile, 777, session, started, "interactive");
+            set_mtime(&path, mtime);
+        }
+        fx.clock.set(at(when));
+        check(&fx, &id, &profile, &mut state);
+    }
+
+    let _raw = fail_writes_of(&fx, "s-b");
+    assert!(fx.engine.poll_launch(&id, &mut state).is_err());
+    assert_eq!(
+        state
+            .ended
+            .iter()
+            .map(|t| t.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["s-a", "s-b"]
+    );
+    let run = SightingSource::Run;
+    assert_eq!(
+        sightings(&fx),
+        [
+            sighting(
+                "s-a",
+                a.as_str(),
+                started,
+                at(1_000),
+                at(1_000),
+                run,
+                at(1_000)
+            ),
+            sighting(
+                "s-c",
+                a.as_str(),
+                started,
+                at(1_200),
+                at(1_200),
+                run,
+                at(1_200)
+            ),
+        ]
+    );
+}
+
 #[test]
 fn a_scan_after_the_child_returns_to_a_session_never_bridges_its_absence() {
     // Spec §6.4: the child left s-a for s-b for over a minute, then came back. A scan that reads
