@@ -1161,7 +1161,8 @@ impl Run<'_> {
     ///   `systemctl --user show`, `loginctl show-user`.
     ///
     /// `service` is this platform's manager. Without one, the unit and the notifications are
-    /// not checked.
+    /// not checked, and the notifications are checked only while a daemon runs or a unit is
+    /// installed.
     fn daemon(&mut self, service: Option<ServiceKind>) {
         let live = self.daemon_running();
         let (installed, unit) = match service {
@@ -1169,7 +1170,11 @@ impl Run<'_> {
             None => (false, None),
         };
         self.daemon_socket(live, installed);
-        if let Some(kind) = service {
+        // Decision 12's gate, as `daemon.socket` has it: a machine that does not use the daemon
+        // carries no warning for its notifications.
+        if let Some(kind) = service
+            && (live || installed)
+        {
             self.daemon_notify(kind, unit.as_ref());
         }
     }
@@ -1442,9 +1447,10 @@ impl Run<'_> {
         self.push(None, check);
     }
 
-    /// `daemon.notify` (D6.2, D10): notifications that are on, with nothing to show them. macOS
-    /// always has `/usr/bin/osascript`. Linux needs `notify-send` on the daemon's `PATH`: the
-    /// one its unit records, when doctor can read the unit, else doctor's own.
+    /// `daemon.notify` (D6.2, D10): notifications that are on, with nothing to show them, while
+    /// a daemon runs or a unit is installed. macOS always has `/usr/bin/osascript`. Linux needs
+    /// `notify-send` on the daemon's `PATH`: the one its unit records, when doctor can read the
+    /// unit, else doctor's own.
     /// `notify.enabled` is read from `config.toml`, as the `auto` check reads its settings.
     fn daemon_notify(&mut self, kind: ServiceKind, unit: Option<&UnitContents>) {
         const ID: &str = "daemon.notify";

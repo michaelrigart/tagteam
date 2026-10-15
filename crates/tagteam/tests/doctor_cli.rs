@@ -182,7 +182,6 @@ fn the_json_shape_of_a_fixture_with_two_accounts() {
             own("daemon.running", "info"),
             own("daemon.service", "info"),
             own("daemon.socket", "ok"),
-            own("daemon.notify", "ok"),
             own("store.temp-files", "ok"),
             cc("accounts.vault", "ok"),
             cc("usage.state", "ok"),
@@ -331,23 +330,19 @@ fn doctor_runs_inside_a_run_shell_and_refuses_under_an_unreadable_marker() {
 
 #[test]
 fn the_daemon_s_checks_on_each_platform() {
-    // D10 through the binary, on a machine with no daemon: the four checks, as JSON, with the
-    // platform the test-support override names.
-    for (platform, noun, unit, notify) in [
+    // D10 through the binary, on a machine with no daemon: the three checks, as JSON, with the
+    // platform the test-support override names. `daemon.notify` waits for a daemon or a unit
+    // (Review m1), so a machine that does not use the daemon carries no warning for it.
+    for (platform, noun, unit) in [
         (
             "macos",
             "launchd agent",
             "home/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist",
-            json!({"id": "daemon.notify", "status": "ok",
-                   "message": "notifications are on, through osascript", "fix": null}),
         ),
         (
             "linux",
             "systemd user unit",
             "home/.config/systemd/user/tagteam.service",
-            json!({"id": "daemon.notify", "status": "warn",
-                   "message": "notifications are on, but notify-send is not on the daemon's PATH, so none is shown",
-                   "fix": "install notify-send (libnotify), or turn them off with `tagteam config set notify.enabled false`"}),
         ),
     ] {
         let d = tempfile::tempdir().unwrap();
@@ -378,7 +373,6 @@ fn the_daemon_s_checks_on_each_platform() {
                        "fix": null}),
                 json!({"id": "daemon.socket", "status": "ok",
                        "message": "no daemon runs, and none left a socket behind", "fix": null}),
-                notify,
             ],
             "{platform}"
         );

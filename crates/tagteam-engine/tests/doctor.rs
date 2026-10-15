@@ -3081,8 +3081,21 @@ fn a_socket_path_too_long_to_bind_fails_once_a_daemon_runs_or_is_installed() {
 
 #[test]
 fn notifications_that_are_on_with_nothing_to_show_them_warn() {
-    // D6.2, D10.
+    // D6.2, D10. Checked only while a daemon runs or a unit is installed (Review m1): a machine
+    // that does not use the daemon carries no warning for it.
     let (_short, fx) = daemon_fx(|_| {});
+    for kind in [ServiceKind::Launchd, ServiceKind::Systemd] {
+        let r = doctor_as(&fx, kind);
+        assert!(
+            r.checks.iter().all(|(_, c)| c.id != "daemon.notify"),
+            "{kind:?}: no daemon runs and no unit is installed"
+        );
+    }
+    daemon_lock_record(
+        &fx,
+        ProcessStamp::current().unwrap(),
+        env!("CARGO_PKG_VERSION"),
+    );
     let c = one(&doctor_as(&fx, ServiceKind::Launchd), "daemon.notify").clone();
     assert_eq!(
         (c.status, c.message.as_str()),
@@ -3147,6 +3160,18 @@ fn notifications_that_are_on_with_nothing_to_show_them_warn() {
             "notifications are off (notify.enabled is false)"
         )
     );
+
+    // The daemon stopped, its unit still installed: still checked. Neither: not checked.
+    fs::remove_file(daemon_lock_path(&fx.env)).unwrap();
+    let r = doctor_as(&fx, ServiceKind::Systemd);
+    assert_eq!(
+        one(&r, "daemon.notify").status,
+        CheckStatus::Info,
+        "an installed unit is enough"
+    );
+    fs::remove_file(unit_path(&fx.env, ServiceKind::Systemd)).unwrap();
+    let r = doctor_as(&fx, ServiceKind::Systemd);
+    assert!(r.checks.iter().all(|(_, c)| c.id != "daemon.notify"));
 }
 
 #[test]
