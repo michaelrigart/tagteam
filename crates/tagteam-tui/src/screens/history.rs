@@ -262,7 +262,12 @@ fn account_list(state: &State, rows: usize) -> Vec<Line<'static>> {
         })
         .unwrap_or_default();
     if groups.is_empty() {
-        return vec![head, Line::from(format!(" {NO_ACCOUNTS}"))];
+        let words = if state.accounts.snapshot().is_none() {
+            LOADING
+        } else {
+            NO_ACCOUNTS
+        };
+        return vec![head, Line::from(format!(" {words}"))];
     }
     let several = groups.len() > 1;
     let mut lines = Vec::new();
@@ -303,6 +308,7 @@ fn windows(state: &State, area: Rect, now_s: i64) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut more = String::new();
     match (&h.account, &h.view) {
+        (None, _) if state.accounts.snapshot().is_none() => lines.push(Line::from(LOADING)),
         (None, _) => lines.push(Line::from(NO_HISTORY)),
         (Some(_), None) => lines.push(Line::from(LOADING)),
         (Some(_), Some(view)) if view.windows.is_empty() => lines.push(Line::from(NO_HISTORY)),
@@ -881,6 +887,18 @@ mod tests {
         let shown = left(&long);
         assert_eq!(shown[0], " ACCOUNTS");
         assert_eq!(shown.last().unwrap(), "   35 a35@x.co", "{shown:?}");
+    }
+
+    #[test]
+    fn both_panels_say_loading_until_the_first_accounts_read() {
+        let mut state = fresh(Screen::History);
+        let lines = draw(&state, 80, 24);
+        assert_eq!(lines[1].trim_end(), " ACCOUNTS                  loading…");
+        assert_eq!(lines[2], " loading…");
+        state.accounts.apply(snapshot(vec![]));
+        let lines = draw(&state, 80, 24);
+        assert!(lines[1].ends_with(NO_HISTORY), "{lines:?}");
+        assert_eq!(lines[2], " No accounts yet.");
     }
 
     #[test]
