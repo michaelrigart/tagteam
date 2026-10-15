@@ -2,12 +2,13 @@ use std::io::Write as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::keychain::{
-    Keychain, KeychainError, LockState, empty_service_err, empty_service_read, locked_err,
+    Keychain, KeychainError, LockState, ReadCounts, empty_service_err, empty_service_read,
+    locked_err,
 };
 use crate::process::drain;
 use crate::read::{Read, ReadError};
@@ -292,6 +293,8 @@ fn disambiguation_failed(r: &RunResult) -> ReadError {
 pub struct SecurityCli {
     runner: Box<dyn Runner>,
     keychain_file: Option<PathBuf>,
+    /// D3 change 6: how this driver's secret reads ended (Decision 7).
+    counts: Arc<ReadCounts>,
 }
 
 impl SecurityCli {
@@ -299,6 +302,7 @@ impl SecurityCli {
         Self {
             runner: Box::new(ProcessRunner),
             keychain_file: None,
+            counts: ReadCounts::new(),
         }
     }
 
@@ -308,6 +312,7 @@ impl SecurityCli {
         Self {
             runner,
             keychain_file,
+            counts: ReadCounts::new(),
         }
     }
 
@@ -399,8 +404,11 @@ fn check_name(v: &str) -> Result<(), KeychainError> {
 }
 
 impl Keychain for SecurityCli {
+    /// A secret read (`-w`), counted by how it ended (D3 change 6): answered once it gives a
+    /// secret, locked on rc 36 or a timeout. An absent item (rc 44), which a locked keychain
+    /// still reports, and every other failure count as neither.
     fn find(&self, service: &str, account: &str) -> Read<Vec<u8>> {
-        match self.run(
+        let read = match self.run(
             s(&["find-generic-password", "-a", account, "-w", "-s", service]),
             None,
         ) {
@@ -415,8 +423,16 @@ impl Keychain for SecurityCli {
                 }
             }
             RunResult::Exited { code: 44, .. } => Read::Absent,
+            locked @ (RunResult::Exited { code: 36, .. } | RunResult::TimedOut) => {
+                self.counts.record_locked();
+                Read::Unreadable(unreadable(locked))
+            }
             other => Read::Unreadable(unreadable(other)),
+        };
+        if read.is_present() {
+            self.counts.record_answered();
         }
+        read
     }
 
     fn exists(&self, service: &str, account: &str) -> Read<()> {
@@ -557,11 +573,16 @@ impl Keychain for SecurityCli {
             RunResult::Exited { code: 0, .. }
         )
     }
+
+    fn read_counts(&self) -> Option<Arc<ReadCounts>> {
+        Some(self.counts.clone())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keychain::ReadTally;
     use std::collections::VecDeque;
     use std::fs;
     use std::io;
@@ -1307,5 +1328,112 @@ mod tests {
         let (pid, group) = pid_and_group(|args| ProcessRunner.run_attached("/bin/sh", &args));
         assert_ne!(group, pid);
         assert_eq!(group, own_group());
+    }
+
+    #[test]
+    fn secret_reads_are_counted_by_how_they_ended() {
+        // D3 change 6: answered (rc 0, a secret returned) and locked (rc 36, or a timeout).
+        // Absent (rc 44), any other rc and a spawn failure count as neither.
+        let s = Scripted::default()
+            .then(ok(b"{\"a\":1}\n"))
+            .then(rc(36))
+            .then(RunResult::TimedOut)
+            .then(rc(44))
+            .then(rc(1))
+            .then(RunResult::SpawnFailed("x".into()));
+        let k = cli(&s, None);
+        let counts = k.read_counts().expect("the security driver keeps counts");
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            let _ = k.find("svc", "acct");
+            seen.push(counts.tally());
+        }
+        let t = |answered, locked| ReadTally { answered, locked };
+        assert_eq!(seen, [t(1, 0), t(1, 1), t(1, 2), t(1, 2), t(1, 2), t(1, 2)]);
+    }
+
+    #[test]
+    fn an_answer_counts_once_the_read_gives_a_secret() {
+        // rc 0 whose hex-looking output `-g` confirms is one answered read; one whose `-g`
+        // fails gave no secret, so it counts as neither.
+        let data = [0xde, 0xad, 0xbe, 0xef];
+        let s = Scripted::default()
+            .then(ok(format!("{}\n", hex::encode(data)).as_bytes()))
+            .then(og_hex("DEADBEEF"))
+            .then(ok(b"cafe\n"))
+            .then(rc(1));
+        let k = cli(&s, None);
+        let counts = k.read_counts().unwrap();
+        assert!(k.find("svc", "acct").is_present());
+        assert_eq!(
+            counts.tally(),
+            ReadTally {
+                answered: 1,
+                locked: 0
+            }
+        );
+        assert!(matches!(k.find("svc", "acct"), Read::Unreadable(_)));
+        assert_eq!(
+            counts.tally(),
+            ReadTally {
+                answered: 1,
+                locked: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_writes_read_back_is_an_answered_secret_read() {
+        // A switch writes the live credential and reads it back: a run that switched read a
+        // secret (D4.1, D14).
+        let s = Scripted::default().then(ok(b"")).then(ok(b"{}\n"));
+        let k = cli(&s, None);
+        k.upsert("svc", "acct", b"{}").unwrap();
+        assert_eq!(
+            k.read_counts().unwrap().tally(),
+            ReadTally {
+                answered: 1,
+                locked: 0
+            }
+        );
+    }
+
+    #[test]
+    fn attribute_reads_the_lock_check_and_deletes_are_never_counted() {
+        // Only `find-generic-password -w` reads a secret (D3 change 6).
+        let s = Scripted::default()
+            .then(ok(b""))
+            .then(rc(36))
+            .then(rc(36))
+            .then(rc(36))
+            .then(rc(36));
+        let k = cli(&s, None);
+        assert!(k.exists("svc", "acct").is_present());
+        assert!(matches!(k.exists("svc", "acct"), Read::Unreadable(_)));
+        assert!(matches!(k.service_has_items("svc"), Read::Unreadable(_)));
+        assert_eq!(k.lock_state(), LockState::Locked);
+        assert!(k.delete("svc", "acct").is_err());
+        assert_eq!(k.read_counts().unwrap().tally(), ReadTally::default());
+    }
+
+    #[test]
+    fn a_locked_oauth_read_beside_an_absent_managed_key_still_looks_locked() {
+        // D4.1, D14: a locked keychain still reports an absent item (rc 44), which changes
+        // nothing; one answered read in the same run means the keychain is not locked.
+        let s = Scripted::default()
+            .then(rc(36))
+            .then(rc(44))
+            .then(rc(36))
+            .then(ok(b"sk-ant-api03-abc\n"));
+        let k = cli(&s, None);
+        let counts = k.read_counts().unwrap();
+        let before = counts.tally();
+        let _ = k.find("Claude Code-credentials", "me");
+        let _ = k.find("Claude Code", "me");
+        assert!(counts.tally().since(before).looks_locked());
+        let before = counts.tally();
+        let _ = k.find("Claude Code-credentials", "me");
+        let _ = k.find("Claude Code", "me");
+        assert!(!counts.tally().since(before).looks_locked());
     }
 }

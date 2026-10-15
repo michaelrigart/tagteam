@@ -53,7 +53,7 @@ pub use http::{
 };
 #[cfg(feature = "file-keychain")]
 pub use keychain::FileKeychain;
-pub use keychain::{FakeKeychain, Keychain, KeychainError, LockState};
+pub use keychain::{FakeKeychain, Keychain, KeychainError, LockState, ReadCounts, ReadTally};
 pub use liveness::{
     FakeProcess, FakeProcessProbe, ProcessProbe, RecordEntry, SessionRecord, SystemProcessProbe,
     parse_lstart, parse_session_record, read_session_records, read_session_records_dated,
