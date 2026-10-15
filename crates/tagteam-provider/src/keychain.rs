@@ -213,6 +213,7 @@ pub struct FakeKeychain {
     panic_delete: Mutex<BTreeSet<String>>,
     refuse_unlock: AtomicBool,
     unlock_attempts: AtomicUsize,
+    lock_state_calls: AtomicUsize,
     /// Decision 7: its secret reads, by how they ended.
     counts: Arc<ReadCounts>,
 }
@@ -270,6 +271,10 @@ impl FakeKeychain {
     }
     pub fn unlock_attempts(&self) -> usize {
         self.unlock_attempts.load(Ordering::SeqCst)
+    }
+    /// How often `lock_state` was asked, which a real keychain can block on (D4.1).
+    pub fn lock_state_calls(&self) -> usize {
+        self.lock_state_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -338,6 +343,7 @@ impl Keychain for FakeKeychain {
         Ok(())
     }
     fn lock_state(&self) -> LockState {
+        self.lock_state_calls.fetch_add(1, Ordering::SeqCst);
         if self.locked.load(Ordering::SeqCst) {
             LockState::Locked
         } else {
@@ -679,6 +685,7 @@ mod tests {
         assert!(k.unlock());
         assert_eq!(k.lock_state(), LockState::Unlocked);
         assert_eq!(k.unlock_attempts(), 2);
+        assert_eq!(k.lock_state_calls(), 4, "each lock_state ask is counted");
     }
 
     #[cfg(feature = "file-keychain")]

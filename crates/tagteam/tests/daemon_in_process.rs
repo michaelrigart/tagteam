@@ -92,4 +92,10 @@ fn daemon_without_a_terminal_runs_no_keychain_check_and_a_signal_stops_it_with_e
     assert!(lines.contains(&"mode idle"), "{out}");
     assert_eq!(lines.last(), Some(&"stopped"), "{out}");
     assert_eq!(kc.unlock_attempts(), 0);
+    // `lock_state` never prompts on the fake, but a real one can block on SecurityAgent.
+    assert_eq!(
+        kc.lock_state_calls(),
+        0,
+        "the daemon probed the keychain's lock state"
+    );
 }
