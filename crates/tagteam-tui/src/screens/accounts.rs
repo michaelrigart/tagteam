@@ -325,6 +325,14 @@ struct Table<'a> {
     sessions: bool,
     this: Option<&'a AccountId>,
     width: usize,
+    /// When the accounts were read: a reading's age grows from it (`age_now`).
+    read_at_s: i64,
+}
+
+/// A reading's age at `now_s`: its age when the accounts were read at `read_at_s`, and the
+/// time since. Never less than the age it had.
+fn age_now(age_s: i64, read_at_s: i64, now_s: i64) -> i64 {
+    age_s + (now_s - read_at_s).max(0)
 }
 
 impl<'a> Table<'a> {
@@ -335,6 +343,7 @@ impl<'a> Table<'a> {
         accounts: &[AccountView],
         this: Option<&'a AccountId>,
         width: usize,
+        read_at_s: i64,
         now_s: i64,
         color: bool,
     ) -> Self {
@@ -348,6 +357,7 @@ impl<'a> Table<'a> {
             sessions,
             this,
             width,
+            read_at_s,
         };
         let heads: Vec<usize> = table.heads().iter().map(|h| width_of(h)).collect();
         let widths: Vec<usize> = heads
@@ -455,11 +465,10 @@ impl<'a> Table<'a> {
                 }
             })
             .collect();
-        cells.push(Cell::plain(
-            v.usage
-                .age_s
-                .map_or_else(|| words::MISSING.to_owned(), words::duration),
-        ));
+        cells.push(Cell::plain(v.usage.age_s.map_or_else(
+            || words::MISSING.to_owned(),
+            |age| words::duration(age_now(age, self.read_at_s, now_s)),
+        )));
         Some(cells)
     }
 
@@ -556,7 +565,16 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     let sections = sections(st);
     let tables: Vec<Table<'_>> = sections
         .iter()
-        .map(|(_, accounts)| Table::new(accounts, snap.this.as_ref(), width, now_s, state.color))
+        .map(|(_, accounts)| {
+            Table::new(
+                accounts,
+                snap.this.as_ref(),
+                width,
+                snap.read_at_s,
+                now_s,
+                state.color,
+            )
+        })
         .collect();
     let lines = layout(st);
     let mut shown: Vec<Line<'static>> = Vec::new();
@@ -748,7 +766,10 @@ fn detail(
     }
     let mut status = Vec::new();
     match v.usage.age_s {
-        Some(age) => status.push(format!("fetched {} ago", words::duration(age))),
+        Some(age) => {
+            let age = age_now(age, snap.read_at_s, now_s);
+            status.push(format!("fetched {} ago", words::duration(age)));
+        }
         None => status.push("never fetched".to_owned()),
     }
     if let Some(at) = v
@@ -807,6 +828,36 @@ mod tests {
         let mut state = fresh(Screen::Accounts);
         state.accounts.apply(snapshot(accounts));
         state
+    }
+
+    #[test]
+    fn a_readings_age_advances_with_the_clock_between_reads() {
+        let state = loaded(three());
+        let at = |seconds: i64| draw_at(&state, 120, 24, NOW_MS + seconds * 1000);
+        let row_age = |lines: &[String]| {
+            let row = lines
+                .iter()
+                .find(|l| l.contains("michael@example.com") && l.contains('%'));
+            row.map(|l| l.split_whitespace().last().unwrap().to_owned())
+        };
+        let detail = |lines: &[String]| {
+            let line = lines.iter().find(|l| l.contains("fetched "));
+            line.map(|l| l.split(" ago").next().unwrap().to_owned())
+        };
+        let now = at(0);
+        assert_eq!(row_age(&now).as_deref(), Some("2m"), "{now:?}");
+        assert_eq!(detail(&now).as_deref(), Some(" fetched 2m"), "{now:?}");
+        let later = at(185);
+        assert_eq!(row_age(&later).as_deref(), Some("5m"), "{later:?}");
+        assert_eq!(detail(&later).as_deref(), Some(" fetched 5m"), "{later:?}");
+        // A clock behind the read never makes an age shorter than the reading's own.
+        let earlier = at(-500);
+        assert_eq!(row_age(&earlier).as_deref(), Some("2m"), "{earlier:?}");
+        assert_eq!(
+            detail(&earlier).as_deref(),
+            Some(" fetched 2m"),
+            "{earlier:?}"
+        );
     }
 
     #[test]
@@ -893,7 +944,7 @@ mod tests {
         // Once it has passed, a frame drawn before the next read says nothing of it.
         assert_eq!(
             draw_at(&state, 80, 24, NOW_MS + 60_000)[top + 3],
-            " fetched 2m ago · login expires in 5d23h"
+            " fetched 3m ago · login expires in 5d23h"
         );
     }
 
