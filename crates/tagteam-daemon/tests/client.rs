@@ -506,12 +506,12 @@ fn a_line_over_64_kib_is_a_protocol_error_wherever_its_newline_arrives() {
 
 #[test]
 fn a_kind_the_client_does_not_know_is_yielded_as_unknown() {
-    // D5.6, D5.7: an added kind (the token report's `token-index`, D13) reaches the caller as
+    // D5.6, D5.7: an added kind reaches the caller as
     // `Unknown`, whole, and the stream goes on.
     let dir = short_tempdir();
     let path = dir.path().join("fake.sock");
     let token_index =
-        json!({"schemaVersion":1,"event":"token-index","ts":"2026-09-21T14:13:20Z","files":3});
+        json!({"schemaVersion":1,"event":"some-future-kind","ts":"2026-09-21T14:13:20Z","files":3});
     let line = token_index.to_string();
     let daemon = fake(&path, move |mut f| {
         f.write(HELLO);
@@ -532,7 +532,7 @@ fn a_kind_the_client_does_not_know_is_yielded_as_unknown() {
         events,
         [
             Event::Unknown {
-                kind: "token-index".into(),
+                kind: "some-future-kind".into(),
                 raw: token_index,
             },
             Event::Changed,

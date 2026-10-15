@@ -310,6 +310,12 @@ impl<'e> Started<'e> {
         let upgrade = UpgradeWatch::new(opts.program.clone(), schema_newer, Arc::clone(&board))
             .with_period(opts.upgrade_watch_ms);
         scheduler.add(Box::new(upgrade), now);
+        // D13: the token report's jobs serve the same providers. After the watches (Decision 11's
+        // invariant holds: a tie runs in the order added), before the provider jobs.
+        let (sessions, index) =
+            crate::tokens::token_jobs(providers.clone(), Arc::clone(&board), schema_newer);
+        scheduler.add(Box::new(sessions), now);
+        scheduler.add(Box::new(index), now);
         for provider in providers {
             let ctx = ProviderJobCtx {
                 board: Arc::clone(&board),

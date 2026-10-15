@@ -181,7 +181,7 @@ impl DaemonSink for DaemonHuman<'_> {
             } => self
                 .auto
                 .line(now, provider, &usage_text(updated, fetch_errors)),
-            DaemonEvent::Changed => {}
+            DaemonEvent::Changed | DaemonEvent::TokenIndex { .. } => {}
             DaemonEvent::Stopping { reason } => self.auto.plain(now, stopping_text(*reason)),
         }
     }

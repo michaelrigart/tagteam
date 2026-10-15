@@ -16,4 +16,5 @@ pub mod service;
 pub mod status;
 #[cfg(test)]
 mod testutil;
+pub mod tokens;
 pub mod watch;

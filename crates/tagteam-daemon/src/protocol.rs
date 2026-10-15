@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 use tagteam_core::ProviderId;
 use tagteam_core::time::format_iso8601;
 use tagteam_engine::auto::AutoEvent;
+use tagteam_engine::tokens::IndexState;
 
 use crate::events::{Backoff, DaemonEvent};
 use crate::status::{DaemonInfo, JobStatus, ProviderStatus, StatusSnapshot};
@@ -177,8 +178,27 @@ pub fn daemon_event_json(e: &DaemonEvent, now_s: i64) -> Value {
             ("mode", Some(provider), f)
         }
         DaemonEvent::Stopping { reason } => ("stopping", None, json!({"reason": reason.as_str()})),
+        DaemonEvent::TokenIndex { provider, state } => {
+            ("token-index", Some(provider), index_state_json(state))
+        }
     };
     envelope(kind, provider, fields, now_s)
+}
+
+/// The fields of `token-index` (D5.5's reserved kind; token report spec §12): the index's state
+/// in camelCase, its times in ISO 8601 UTC, each null when the index has none.
+fn index_state_json(s: &IndexState) -> Value {
+    let iso = |ms: Option<i64>| ms.map(|ms| format_iso8601(ms.div_euclid(1000)));
+    json!({
+        "refreshedAt": iso(s.refreshed_at_ms),
+        "changedAt": iso(s.changed_at_ms),
+        "files": s.files,
+        "responses": s.responses,
+        "skippedLines": s.skipped_lines,
+        "unreadableFiles": s.unreadable_files,
+        "oldest": iso(s.oldest_ms),
+        "newest": iso(s.newest_ms),
+    })
 }
 
 /// §11.4's envelope around a daemon kind's `fields`, with `provider` when it concerns one.
@@ -534,6 +554,8 @@ pub enum Event {
     },
     /// The last event before the daemon closes: `signal`, `upgrade` or `schema`.
     Stopping { reason: String },
+    /// D5.5's `token-index`; `raw` is the whole object, whose fields token report §12 defines.
+    TokenIndex { provider: String, raw: Value },
     /// A kind this client does not know, or a known kind whose fields it cannot read (D5.6).
     Unknown { kind: String, raw: Value },
 }
@@ -590,6 +612,10 @@ fn typed_event(kind: &str, o: &Map<String, Value>, raw: &Value) -> Option<Event>
         },
         "stopping" => Event::Stopping {
             reason: o.get("reason")?.as_str()?.to_owned(),
+        },
+        "token-index" => Event::TokenIndex {
+            provider: provider()?,
+            raw: raw.clone(),
         },
         _ => return None,
     })
@@ -1604,13 +1630,12 @@ mod socket_protocol_tests {
     fn unknown_and_unreadable_events() {
         // D5.6: a kind this client does not know, and a known kind whose fields it cannot
         // read, are `Unknown`, whole; anything that is not an event object is no event.
-        let token =
-            json!({"schemaVersion":1,"event":"token-index","ts":"2026-09-21T14:13:20Z","files":3});
+        let future = json!({"schemaVersion":1,"event":"some-future-kind","ts":"2026-09-21T14:13:20Z","files":3});
         assert_eq!(
-            parse_event(&token),
+            parse_event(&future),
             Some(Event::Unknown {
-                kind: "token-index".into(),
-                raw: token.clone(),
+                kind: "some-future-kind".into(),
+                raw: future.clone(),
             })
         );
         for raw in [
