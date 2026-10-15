@@ -91,6 +91,12 @@ pub fn seed_home(env: &Env) {
 /// `oauthAccount`, and its credential in the Keychain item Claude Code reads. Logging in again
 /// with the same identity and a new `rt` is Claude Code rotating the credential.
 pub fn login(env: &Env, kc: &dyn Keychain, email: &str, org: &str, rt: &str) {
+    login_with_token(env, kc, email, org, "at", rt);
+}
+
+/// As `login`, with access token `at`. Tests that tell accounts' requests apart by their bearer
+/// token give each account its own.
+pub fn login_with_token(env: &Env, kc: &dyn Keychain, email: &str, org: &str, at: &str, rt: &str) {
     let path = env.home.join(".claude.json");
     let doc = fs::read(&path).unwrap();
     let acct = json!({"emailAddress": email, "organizationUuid": org, "accountUuid": format!("uuid-{email}-{org}")});
@@ -99,7 +105,7 @@ pub fn login(env: &Env, kc: &dyn Keychain, email: &str, org: &str, rt: &str) {
         replace_top_level(&doc, "oauthAccount", &acct).unwrap(),
     )
     .unwrap();
-    let cred = json!({"claudeAiOauth": {"accessToken": "at", "refreshToken": rt, "refreshTokenExpiresAt": 1_797_000_000_000i64}});
+    let cred = json!({"claudeAiOauth": {"accessToken": at, "refreshToken": rt, "refreshTokenExpiresAt": 1_797_000_000_000i64}});
     kc.upsert(
         &keychain_service(env, ItemKind::OAuth),
         &keychain_account(env),
@@ -401,6 +407,90 @@ impl Running {
             status,
             stdout: std::mem::take(&mut *self.out.lock().unwrap()),
             stderr: std::mem::take(&mut *self.err.lock().unwrap()),
+        }
+    }
+}
+
+/// A `Running` that is killed and reaped when it is dropped, so a test that fails part-way
+/// never leaves a daemon or an `auto` loop running behind it.
+pub struct Guarded(Option<Running>);
+
+impl Guarded {
+    pub fn spawn(cmd: std::process::Command) -> Self {
+        Guarded(Some(Running::spawn(cmd)))
+    }
+
+    fn running(&self) -> &Running {
+        self.0.as_ref().expect("still running")
+    }
+
+    fn running_mut(&mut self) -> &mut Running {
+        self.0.as_mut().expect("still running")
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.running().child.id()
+    }
+
+    pub fn stdout(&self) -> String {
+        self.running().stdout()
+    }
+
+    pub fn stderr(&self) -> String {
+        self.running().stderr()
+    }
+
+    pub fn signal(&self, signal: i32) {
+        self.running().signal(signal)
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        self.running_mut().child.try_wait().unwrap().is_none()
+    }
+
+    /// Polls every 10 ms until `ready` holds for its stdout so far. Fails the test, with what
+    /// it printed, if it exits first or `within` passes.
+    pub fn wait_for(&mut self, within: Duration, what: &str, ready: impl Fn(&str) -> bool) {
+        self.wait_for_output(within, what, |out, _| ready(out));
+    }
+
+    /// As `wait_for`, with its stdout and stderr so far.
+    pub fn wait_for_output(
+        &mut self,
+        within: Duration,
+        what: &str,
+        ready: impl Fn(&str, &str) -> bool,
+    ) {
+        let deadline = Instant::now() + within;
+        loop {
+            let r = self.running_mut();
+            let (out, err) = (r.stdout(), r.stderr());
+            if ready(&out, &err) {
+                return;
+            }
+            if let Some(status) = r.child.try_wait().unwrap() {
+                panic!("tagteam exited ({status}) before {what}\nstdout:\n{out}\nstderr:\n{err}");
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "tagteam never got to {what} within {within:?}\nstdout:\n{out}\nstderr:\n{err}"
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Its status and everything it printed, once it has exited (`Running::finish`).
+    pub fn finish(mut self, within: Duration) -> Output {
+        self.0.take().expect("still running").finish(within)
+    }
+}
+
+impl Drop for Guarded {
+    fn drop(&mut self) {
+        if let Some(mut r) = self.0.take() {
+            let _ = r.child.kill();
+            let _ = r.child.wait();
         }
     }
 }
