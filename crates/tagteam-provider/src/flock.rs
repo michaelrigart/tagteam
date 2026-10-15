@@ -10,8 +10,8 @@ use crate::cancel::Cancel;
 use crate::env::Env;
 use crate::mkdir_lock::{LockError, check_cancel};
 
-/// With the `lock-log` feature: every exclusive lock attempt, by canonical path. Without it,
-/// nothing is compiled.
+/// With the `lock-log` feature: every `flock` attempt, exclusive or shared, by canonical path.
+/// Without it, nothing is compiled.
 #[cfg(feature = "lock-log")]
 mod attempt_log {
     use std::path::{Path, PathBuf};
@@ -46,14 +46,25 @@ mod attempt_log {
     }
 }
 
-/// Test support behind the `lock-log` feature: the canonical paths of the exclusive lock
-/// attempts (`FlockGuard::try_lock`, and so `lock` and `MutationGuard::acquire`) made so far
-/// in this process, whether or not they took the lock, under `dir`. A test filters by its own
+/// Test support behind the `lock-log` feature: the canonical paths of the `flock` attempts made
+/// so far in this process, whether or not they took the lock, under `dir`. Every `flock` call
+/// in this crate records first: `FlockGuard::try_lock` (so `lock` and `MutationGuard::acquire`),
+/// `probe_lock` (the shared test of a reservation or lock file) and the reservation's own
+/// lock on its new temporary file. A test filters by its own
 /// temporary directory, since tests run in parallel and the record is global.
 #[cfg(feature = "lock-log")]
 pub fn attempts_under(dir: &Path) -> Vec<PathBuf> {
     attempt_log::under(dir)
 }
+
+/// Records an attempt on `path`; nothing without the `lock-log` feature.
+#[cfg(feature = "lock-log")]
+pub(crate) fn record_attempt(path: &Path) {
+    attempt_log::record(path);
+}
+
+#[cfg(not(feature = "lock-log"))]
+pub(crate) fn record_attempt(_path: &Path) {}
 
 /// An exclusive `flock` on a file, released by the kernel when the holder exits. The fd is
 /// `O_CLOEXEC` (std's default).
@@ -68,8 +79,7 @@ impl FlockGuard {
         if let Some(dir) = path.parent() {
             crate::atomic::ensure_private_dir(dir)?;
         }
-        #[cfg(feature = "lock-log")]
-        attempt_log::record(path);
+        record_attempt(path);
         // A lock file is never truncated: a truncate here would race a concurrent
         // holder's read of it, and `create(true)` alone trips `suspicious_open_options`.
         let file = OpenOptions::new()
@@ -133,6 +143,7 @@ pub enum LockProbe {
 /// before it returns. The test is a shared lock: a launcher holds an exclusive one, which it
 /// still sees, and two probes of one file never see each other as a holder.
 pub fn probe_lock(path: &Path) -> io::Result<LockProbe> {
+    record_attempt(path);
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(LockProbe::Missing),

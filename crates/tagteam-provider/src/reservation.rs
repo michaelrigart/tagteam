@@ -47,7 +47,7 @@ impl LaunchReservation {
         let name = format!("{pid}.lock");
         let path = dir.join(&name);
         let (temp, file) = create_temp(&dir, &name, pid)?;
-        let placed = lock(&file)
+        let placed = lock(&temp, &file)
             .and_then(|()| (&file).write_all(&contents(pid)))
             .and_then(|()| {
                 before_rename(&temp);
@@ -111,7 +111,8 @@ fn create_temp(dir: &Path, name: &str, pid: u32) -> io::Result<(PathBuf, File)> 
 
 /// Takes the reservation's lock. The file is new, so nothing else can hold it: a refusal is an
 /// error, never a wait (B.37).
-fn lock(file: &File) -> io::Result<()> {
+fn lock(path: &Path, file: &File) -> io::Result<()> {
+    crate::flock::record_attempt(path);
     // SAFETY: `file` owns a valid descriptor for the duration of the call.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         Ok(())
