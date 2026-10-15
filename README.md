@@ -190,7 +190,7 @@ tagteam daemon install
 From then on it starts when you log in, and restarts if it fails. While it runs, it:
 
 - keeps every account's usage fresh, on the same schedule and within the same request budget
-  as the commands, so `list` and `statusline` rarely have to fetch;
+  as the commands, so `list` rarely has to fetch and `statusline` shows fresh numbers;
 - switches accounts automatically, exactly as `tagteam auto` does, for every provider with at
   least two switchable accounts;
 - tells you about the events that matter (see below);

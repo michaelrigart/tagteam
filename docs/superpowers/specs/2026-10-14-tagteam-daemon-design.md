@@ -409,8 +409,8 @@ After the `ok` reply, the connection receives every event the daemon emits, one 
 `limit` is judged after the run, from the store, through engine change 5 (D3): the managed live
 account's decision-grade relevant windows under the provider's `autoswitch.models`. With no
 managed live account, or no decision-grade reading, nothing is notified. The binding window is
-the relevant window with the highest `pct`; its key and `resets_at` name the dedup marker
-(D6.3).
+the relevant window with the highest `pct`; its key names the dedup marker, and its
+`resets_at` sets the marker's expiry (D6.3).
 
 ### D6.2 Text and delivery
 
@@ -618,8 +618,8 @@ success, `1` on failure, and `2` for a usage error. JSON shapes:
 ## D10. Doctor
 
 New checks for §13.6, all read-only. `doctor` takes no lock and does not connect to the socket.
-It reads the service state with `launchctl print` or `systemctl --user show`, each bounded by a
-5 s timeout; neither changes anything.
+It reads the service state with `launchctl print`, `systemctl --user show` or `loginctl show-user`,
+each bounded by a 5 s timeout; none changes anything.
 
 | Check | Reports |
 |---|---|
@@ -766,15 +766,17 @@ design:
   daemon serves.
 - **D6.2:** the `limit` example no longer claims that no account is left to switch to, which
   the daemon cannot know, and writes durations as `list` does.
-- **D6.3:** the `limit` lease is named `notify:limit:<account id>:<window key>`, without the
+- **D6.1, D6.3:** the `limit` lease is named `notify:limit:<account id>:<window key>`, without the
   reset; its expiry bounds one window instance, since a provider can report a reset a second
-  apart between polls and a name that carried it would notify again.
+  apart between polls and a name that carried it would notify again. D6.1 says the same: the
+  window's key names the marker, and its `resets_at` sets the marker's expiry.
 - **D8.1:** a signal during the wait for `daemon.lock`, before the daemon serves, exits
   128 + n as an interrupted command.
 - **D9.1:** `CLAUDE_SECURESTORAGE_CONFIG_DIR` is recorded although `run` scrubs it; no
   variable that carries or points at a credential is.
 - **D10:** `PATH` is left out of the variable comparison; a lingering that cannot be told warns
   with its reason; a too-long socket path fails only once a daemon runs or a unit is installed;
-  a live daemon with no socket file warns.
+  a live daemon with no socket file warns; the intro names `loginctl show-user` among the
+  commands it reads.
 - **D12, D14:** the perf daemon runs at the shortest auto-switch interval (15 s), since
   §6.4 allows nothing shorter.
