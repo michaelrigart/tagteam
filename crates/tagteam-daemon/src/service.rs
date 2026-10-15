@@ -152,17 +152,45 @@ pub fn install(
     })
 }
 
+/// What `uninstall` found and did (D9.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Uninstalled {
+    /// The unit file was deleted, after the manager unloaded or stopped the unit.
+    Removed,
+    /// No unit file was left, but the manager had the unit loaded or running, and stopped it.
+    StoppedOnly,
+    /// No unit file and nothing loaded: nothing changed.
+    Nothing,
+}
+
+impl Uninstalled {
+    /// `--json`'s `removed`: the daemon's service is gone, whether or not its file was still
+    /// there to delete.
+    pub fn removed(self) -> bool {
+        !matches!(self, Self::Nothing)
+    }
+
+    /// `--json`'s `stopped`: the manager stopped a unit that had no file left.
+    pub fn stopped(self) -> bool {
+        matches!(self, Self::StoppedOnly)
+    }
+}
+
 /// D9: stops the daemon the unit runs, and removes the unit. On macOS that is `launchctl
 /// bootout`, then the file. On Linux it is `systemctl --user disable --now`, the file, then
-/// `daemon-reload`. With no unit installed, it runs nothing and returns false (D9.4).
+/// `daemon-reload`. The manager is asked whether or not the file exists, because an agent
+/// whose plist was deleted by hand, or that another shell's `XDG_CONFIG_HOME` hides, still
+/// runs: on macOS `bootout` always runs, and on Linux a best-effort `systemctl --user stop`
+/// does. The answer is `Removed` when the file was deleted, `StoppedOnly` when there was none
+/// but the manager stopped something, and `Nothing` otherwise (D9.4).
 pub fn uninstall(
     env: &Env,
     kind: ServiceKind,
     spawner: &dyn ProcessSpawner,
-) -> Result<bool, InstallError> {
+) -> Result<Uninstalled, InstallError> {
     let path = unit_path(env, kind);
     if !path.exists() {
-        return Ok(false);
+        return uninstall_without_file(env, kind, spawner);
     }
     match kind {
         ServiceKind::Launchd => {
@@ -189,13 +217,54 @@ pub fn uninstall(
         }
     }
     tracing::info!(kind = kind.as_str(), "removed the daemon's service unit");
-    Ok(true)
+    Ok(Uninstalled::Removed)
 }
 
-/// D9.2: stops and unloads the agent when it is loaded. An agent that is not loaded
-/// (`not_loaded`) is no error; any other failure is, because the agent then still runs.
-/// `install` and `uninstall` both unload through this.
-fn bootout(env: &Env, spawner: &dyn ProcessSpawner) -> Result<(), InstallError> {
+/// `uninstall` with no unit file: the manager may still run the daemon (Review I1). A manager
+/// that is not installed has nothing to stop. On launchd, any failure but "not loaded" is an
+/// error, as with a file, because the agent then still runs; on systemd the stop is best
+/// effort and its failure is logged.
+fn uninstall_without_file(
+    env: &Env,
+    kind: ServiceKind,
+    spawner: &dyn ProcessSpawner,
+) -> Result<Uninstalled, InstallError> {
+    let stopped = match kind {
+        ServiceKind::Launchd => match bootout(env, spawner) {
+            Ok(unloaded) => unloaded,
+            Err(InstallError::NoManager(_)) => false,
+            Err(e) => return Err(e),
+        },
+        ServiceKind::Systemd => {
+            let stop = ["--user", "stop", SYSTEMD_UNIT];
+            match run_manager(env, "systemctl", &stop, spawner, MANAGER_TIMEOUT) {
+                ManagerRun::Exited { code: 0, .. } => true,
+                ManagerRun::Exited { code, stderr, .. } => {
+                    tracing::debug!(code, stderr, "systemctl stop stopped nothing");
+                    false
+                }
+                ManagerRun::NoAnswer(reason) => {
+                    tracing::debug!(reason, "systemctl stop gave no answer");
+                    false
+                }
+                ManagerRun::Missing => false,
+            }
+        }
+    };
+    if stopped {
+        tracing::info!(
+            kind = kind.as_str(),
+            "stopped the daemon's service, which had no unit file"
+        );
+        return Ok(Uninstalled::StoppedOnly);
+    }
+    Ok(Uninstalled::Nothing)
+}
+
+/// D9.2: stops and unloads the agent when it is loaded, and says whether it was. An agent that
+/// is not loaded (`not_loaded`) is no error; any other failure is, because the agent then
+/// still runs. `install` and `uninstall` both unload through this.
+fn bootout(env: &Env, spawner: &dyn ProcessSpawner) -> Result<bool, InstallError> {
     const WHAT: &str = "launchctl bootout";
     let target = launchd_target();
     match run_manager(
@@ -205,13 +274,13 @@ fn bootout(env: &Env, spawner: &dyn ProcessSpawner) -> Result<(), InstallError> 
         spawner,
         MANAGER_TIMEOUT,
     ) {
-        ManagerRun::Exited { code: 0, .. } => Ok(()),
+        ManagerRun::Exited { code: 0, .. } => Ok(true),
         ManagerRun::Exited { code, stderr, .. } if not_loaded(code, &stderr) => {
             tracing::debug!(
                 code,
                 "launchctl bootout stopped nothing: the agent was not loaded"
             );
-            Ok(())
+            Ok(false)
         }
         ManagerRun::Exited { code, stderr, .. } => Err(refused(WHAT, code, stderr)),
         ManagerRun::NoAnswer(reason) => Err(InstallError::NoAnswer {
@@ -627,12 +696,31 @@ mod tests {
                     ]
                 }
             };
-            assert!(uninstall(&env, kind, &s).unwrap(), "{kind:?}");
-            assert!(!path.exists());
-            assert!(
-                !uninstall(&env, kind, &s).unwrap(),
-                "nothing installed: removed false"
+            assert_eq!(
+                uninstall(&env, kind, &s).unwrap(),
+                Uninstalled::Removed,
+                "{kind:?}"
             );
+            assert!(!path.exists());
+            // The second run finds no file; the manager is still asked, and has nothing.
+            let (nothing, extra) = match kind {
+                ServiceKind::Launchd => (
+                    exited(3, "", "Boot-out failed: 3: No such process\n"),
+                    words(&["launchctl", "bootout", launchd_target().as_str()]),
+                ),
+                ServiceKind::Systemd => (
+                    exited(5, "", "Unit tagteam.service not loaded.\n"),
+                    words(&["systemctl", "--user", "stop", "tagteam.service"]),
+                ),
+            };
+            s.push(nothing);
+            assert_eq!(
+                uninstall(&env, kind, &s).unwrap(),
+                Uninstalled::Nothing,
+                "nothing installed"
+            );
+            let mut expected = expected;
+            expected.push(extra);
             assert_eq!(
                 calls(&s.specs()),
                 expected,
@@ -651,6 +739,97 @@ mod tests {
             "{e:?}"
         );
         assert!(path.exists());
+    }
+
+    #[test]
+    fn uninstall_with_the_unit_file_absent_still_stops_what_the_manager_runs() {
+        // Review I1: a plist deleted by hand, or another shell's XDG_CONFIG_HOME, leaves the
+        // agent loaded. `uninstall` asks the manager whatever the file says, and reports
+        // `removed` when it stopped something.
+        let target = launchd_target();
+        let stop = words(&["systemctl", "--user", "stop", "tagteam.service"]);
+        let d = tempfile::tempdir().unwrap();
+        let env = env_with(d.path(), &ALL);
+        assert!(!unit_path(&env, ServiceKind::Launchd).exists());
+
+        // launchd: loaded without a file; bootout unloads it.
+        let s = ScriptedSpawner::new();
+        s.push(exited(0, "", ""));
+        assert_eq!(
+            uninstall(&env, ServiceKind::Launchd, &s).unwrap(),
+            Uninstalled::StoppedOnly
+        );
+        assert_eq!(
+            calls(&s.specs()),
+            vec![words(&["launchctl", "bootout", target.as_str()])]
+        );
+
+        // launchd: no file and not loaded (rc 3 here, 113 on newer macOS): nothing removed.
+        for (code, why) in [
+            (3, "Boot-out failed: 3: No such process\n"),
+            (
+                113,
+                "Boot-out failed: 113: Could not find specified service\n",
+            ),
+        ] {
+            let s = ScriptedSpawner::new();
+            s.push(exited(code, "", why));
+            assert_eq!(
+                uninstall(&env, ServiceKind::Launchd, &s).unwrap(),
+                Uninstalled::Nothing,
+                "{code}"
+            );
+        }
+
+        // launchd: any other failure still stops the command, file or not.
+        let s = ScriptedSpawner::new();
+        s.push(exited(5, "", "Boot-out failed: 5: Input/output error\n"));
+        let e = uninstall(&env, ServiceKind::Launchd, &s).unwrap_err();
+        assert!(matches!(&e, InstallError::Manager { .. }), "{e:?}");
+
+        // launchd: no launchctl and no file means there is nothing to do.
+        let bare = Env::for_test(d.path());
+        assert_eq!(
+            uninstall(&bare, ServiceKind::Launchd, &ScriptedSpawner::new()).unwrap(),
+            Uninstalled::Nothing
+        );
+
+        // systemd: a best-effort stop. It stopped something (rc 0): removed.
+        let s = ScriptedSpawner::new();
+        s.push(exited(0, "", ""));
+        assert_eq!(
+            uninstall(&env, ServiceKind::Systemd, &s).unwrap(),
+            Uninstalled::StoppedOnly
+        );
+        assert_eq!(calls(&s.specs()), vec![stop.clone()]);
+
+        // systemd: the unit is not loaded (rc 5), or the call fails: not removed, no error.
+        for reply in [
+            exited(
+                5,
+                "",
+                "Failed to stop tagteam.service: Unit tagteam.service not loaded.\n",
+            ),
+            Captured::TimedOut,
+        ] {
+            let s = ScriptedSpawner::new();
+            s.push(reply);
+            assert_eq!(
+                uninstall(&env, ServiceKind::Systemd, &s).unwrap(),
+                Uninstalled::Nothing
+            );
+            assert_eq!(
+                calls(&s.specs()),
+                vec![stop.clone()],
+                "no reload, no disable"
+            );
+        }
+
+        // systemd: no systemctl, no file: nothing to do.
+        assert_eq!(
+            uninstall(&bare, ServiceKind::Systemd, &ScriptedSpawner::new()).unwrap(),
+            Uninstalled::Nothing
+        );
     }
 
     #[test]
@@ -677,7 +856,10 @@ mod tests {
         );
         // An older macOS's "No such process" is "not loaded", as 113 is.
         s.push(exited(3, "", "Boot-out failed: 3: No such process\n"));
-        assert!(uninstall(&env, ServiceKind::Launchd, &s).unwrap());
+        assert_eq!(
+            uninstall(&env, ServiceKind::Launchd, &s).unwrap(),
+            Uninstalled::Removed
+        );
         assert!(!path.exists());
         // `install` unloads by the same rule: no bootstrap over a loaded old agent.
         s.push(failed());
@@ -759,7 +941,10 @@ mod tests {
             &s,
         )
         .unwrap();
-        assert!(uninstall(&env, ServiceKind::Systemd, &s).unwrap());
+        assert_eq!(
+            uninstall(&env, ServiceKind::Systemd, &s).unwrap(),
+            Uninstalled::Removed
+        );
         let seen = s.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 6);
         assert!(

@@ -557,7 +557,8 @@ pub enum DaemonAction {
     },
     /// Stop the daemon and remove its service
     ///
-    /// --json prints {schemaVersion, ok, removed}; removed is false when none was installed.
+    /// --json prints {schemaVersion, ok, removed, stopped}; removed is false when none was
+    /// installed, and stopped is true when the unit's file was gone but its service was stopped.
     Uninstall,
     /// Whether the daemon runs: its own status from its socket, else its lock and its service
     ///
