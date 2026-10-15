@@ -9,11 +9,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tagteam_core::ProviderId;
-use tagteam_daemon::events::{DaemonEvent, DaemonSink, Mode, StopReason, WaitingFor};
+use tagteam_daemon::daemon::{DaemonExit, Started};
+use tagteam_daemon::events::{DaemonEvent, DaemonSink, Fanout, Mode, StopReason, WaitingFor};
 use tagteam_daemon::notify::Notice;
 use tagteam_daemon::protocol::daemon_event_json;
+use tagteam_daemon::scheduler::{ThreadSleeper, uniform_jitter};
+use tagteam_daemon::server::Server;
+use tagteam_daemon::status::StatusBoard;
 use tagteam_daemon::watch::program_path;
 use tagteam_engine::auto::EventSink;
+use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_engine::settings::Settings;
 use tagteam_provider::keychain::ReadCounts;
 use tagteam_provider::{Cancel, Env, Keychain};
@@ -44,6 +49,38 @@ pub(crate) fn program(path_var: Option<&OsStr>) -> PathBuf {
     let argv0 = std::env::args_os().next().unwrap_or_default();
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(&argv0));
     program_path(&argv0, path_var, &exe)
+}
+
+/// D4.1 step 5, D5.1: the socket, bound once start-up holds `daemon.lock` and before the
+/// scheduler runs. A bind that fails is logged at ERROR, and the daemon runs without a socket:
+/// scheduling never depends on it.
+pub(crate) fn bind_socket(env: &Env, board: &Arc<StatusBoard>) -> Option<Server> {
+    let path = daemon_socket_path(env);
+    match Server::bind(&path, &env.home, Arc::clone(board), env.cancel.clone()) {
+        Ok(server) => {
+            board.set_socket(Some(path));
+            Some(server)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "the daemon runs without its socket");
+            None
+        }
+    }
+}
+
+/// D5.5, D8.1: the daemon's run, every event going to `sink` (the command's own output) and
+/// then, when the socket is bound, to its subscribers through the hub. The hub closes the
+/// socket when `stopping` reaches it, before `serve` lets `daemon.lock` go (D4.6).
+pub(crate) fn serve(
+    started: Started<'_>,
+    sink: &dyn DaemonSink,
+    server: Option<&Server>,
+) -> DaemonExit {
+    let mut sinks: Vec<&dyn DaemonSink> = vec![sink];
+    if let Some(server) = server {
+        sinks.push(server.hub());
+    }
+    started.serve(&Fanout(sinks), &ThreadSleeper, &mut uniform_jitter)
 }
 
 /// A mode line's text (D4.3). `paused` means the provider's `daemon.autoswitch` reads false.
@@ -387,5 +424,40 @@ mod tests {
         assert_eq!(keychain_counts([&one, &other]).len(), 2);
         let both = keychain_counts([&one, &other]);
         assert!(Arc::ptr_eq(&both[0], &one.read_counts().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use std::path::Path;
+
+    use tagteam_daemon::status::{DaemonInfo, NotifyInfo, StatusBoard};
+    use tagteam_provider::Env;
+
+    use super::bind_socket;
+
+    #[test]
+    fn a_socket_that_cannot_be_bound_leaves_the_daemon_running_without_one() {
+        // D5.1: scheduling never depends on the socket. A path past `sun_path` is not bound,
+        // nothing is created for it, and the board names no socket.
+        let mut env = Env::for_test(Path::new("/tmp/tagteam-unused"));
+        env.xdg_data_home = Some(Path::new("/tmp").join("d".repeat(120)));
+        let board = StatusBoard::new(
+            DaemonInfo {
+                pid: 1,
+                version: "v".into(),
+                started_at: 0,
+                socket: None,
+                log: env.log_file(),
+            },
+            NotifyInfo {
+                enabled: false,
+                backend: None,
+                events: Vec::new(),
+            },
+        );
+        assert!(bind_socket(&env, &board).is_none());
+        assert_eq!(board.snapshot().daemon.socket, None);
+        assert!(!env.data_dir().exists(), "nothing was created");
     }
 }
