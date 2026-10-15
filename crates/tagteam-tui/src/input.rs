@@ -46,6 +46,10 @@ pub(crate) trait Pause {
     /// stays asked for until `resume`.
     fn pause(&self) -> bool;
     fn resume(&self);
+    /// The terminal has hung up and is gone: the thread is asked to stop, and nothing waits for
+    /// it. crossterm's reader loops on a closed terminal and never looks at the control, so an
+    /// acknowledgment would only be waited for in vain, at full speed.
+    fn hang_up(&self);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +58,8 @@ enum Mode {
     PauseAsked,
     Paused,
     StopAsked,
+    /// A stop asked for after a hang-up: nothing waits for it, now or on drop.
+    HungUp,
     Stopped,
 }
 
@@ -131,7 +137,7 @@ fn read(control: &Control, mut events: impl Events, tx: &Sender<Msg>) {
                             .wait(mode)
                             .unwrap_or_else(PoisonError::into_inner);
                     }
-                    Mode::StopAsked | Mode::Stopped => {
+                    Mode::StopAsked | Mode::HungUp | Mode::Stopped => {
                         control.set(&mut mode, Mode::Stopped);
                         return;
                     }
@@ -181,17 +187,25 @@ impl Pause for Input {
             self.control.set(&mut mode, Mode::Reading);
         }
     }
+
+    fn hang_up(&self) {
+        let mut mode = self.control.lock();
+        if *mode != Mode::Stopped {
+            self.control.set(&mut mode, Mode::HungUp);
+        }
+    }
 }
 
 impl Drop for Input {
     /// Stops the thread before the terminal is given back, so it never reads the shell's
     /// input. The TUI is ending, so nothing waits beyond `ACK`: a thread held up longer stops
-    /// at its next look.
+    /// at its next look. After a hang-up there is no terminal to read, and nothing waits.
     fn drop(&mut self) {
         let mut mode = self.control.lock();
-        if *mode != Mode::Stopped {
-            self.control.set(&mut mode, Mode::StopAsked);
+        if matches!(*mode, Mode::HungUp | Mode::Stopped) {
+            return;
         }
+        self.control.set(&mut mode, Mode::StopAsked);
         let _ = self.control.wait_while(mode, Mode::StopAsked);
     }
 }
@@ -376,6 +390,45 @@ mod tests {
         thread::sleep(Duration::from_millis(200));
         assert_eq!(script.polls.load(Ordering::SeqCst), polls);
         assert!(!script.reading.load(Ordering::SeqCst));
+    }
+
+    /// A thread held up before its poll, as a closed terminal holds crossterm's reader.
+    fn stuck_input() -> (Input, Gate) {
+        let gate = Gate::default();
+        let (tx, _rx) = mpsc::channel();
+        let input = Input::spawn_with(tx, gate.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !gate.waiting.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the thread never reached its poll"
+            );
+            thread::yield_now();
+        }
+        (input, gate)
+    }
+
+    #[test]
+    fn a_hang_up_waits_for_no_acknowledgment_and_neither_does_the_drop_after_it() {
+        let (input, gate) = stuck_input();
+        let started = Instant::now();
+        input.hang_up();
+        drop(input);
+        assert!(
+            started.elapsed() < ACK / 4,
+            "no acknowledgment was waited for: {:?}",
+            started.elapsed()
+        );
+        gate.open();
+    }
+
+    #[test]
+    fn dropping_a_thread_held_up_waits_for_it_up_to_the_acknowledgment() {
+        let (input, gate) = stuck_input();
+        let started = Instant::now();
+        drop(input);
+        assert!(started.elapsed() >= ACK);
+        gate.open();
     }
 
     #[test]
