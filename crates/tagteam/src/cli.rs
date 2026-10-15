@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::builder::{PossibleValue, StringValueParser, TypedValueParser};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::aot::{Shell, generate};
 use tagteam_core::CLAUDE_CODE;
 use tagteam_engine::settings::KEYS;
@@ -154,6 +154,25 @@ pub enum Command {
         /// Print the raw samples as CSV
         #[arg(long)]
         csv: bool,
+    },
+    /// Token use and API cost per account, from Claude Code's transcripts
+    ///
+    /// Reads new transcript lines into tagteam's index first (not with --no-refresh), then
+    /// reports by day (the default), month, session or 5-hour block, a row per account unless
+    /// --by says otherwise. With no ACCOUNT, every account shows, and the usage no account can
+    /// be credited with as unattributed. The cost is the API list price of the tokens, not a
+    /// charge. --json prints {schemaVersion, provider, period, grouping, timeZone, since,
+    /// until, rows: [{key, period, account?, model?, accounts, models, tokens: {input, output,
+    /// cacheWrite5m, cacheWrite1h, cacheWrite, cacheRead, total, webSearch}, responses,
+    /// unfinalized, costUsd, costPartial}], total, index, unpricedModels, prices: {asOf,
+    /// overridden}}, with times in ISO 8601 UTC and dates in timeZone.
+    #[command(args_conflicts_with_subcommands = true)]
+    Tokens {
+        // Boxed: a period carries its own arguments, which would double every `Command`.
+        #[command(subcommand)]
+        period: Option<Box<TokensPeriod>>,
+        #[command(flatten)]
+        args: TokensArgs,
     },
     /// Map PATH (default: here) to ACCOUNT for its provider; with no arguments, list mappings
     ///
@@ -316,14 +335,99 @@ pub enum ShellArg {
     Fish,
 }
 
+/// `tokens`' period (token report spec §11.1): a subcommand, so an account alias spelled like
+/// one is never taken for it. A bare `tokens` is `tokens day`.
+#[derive(Subcommand)]
+pub enum TokensPeriod {
+    /// A row per calendar day (the default)
+    Day(TokensArgs),
+    /// A row per calendar month; --since defaults to twelve months
+    Month(TokensArgs),
+    /// A row per session, with its first and last times and its project
+    Session(TokensArgs),
+    /// A row per 5-hour block of each account
+    Block(TokensArgs),
+}
+
+/// `tokens`' arguments (token report spec §11.1), the same under every period.
+#[derive(Args)]
+pub struct TokensArgs {
+    /// Only these accounts: a position, alias or email (default: every account, and the
+    /// unattributed usage)
+    #[arg(value_name = "ACCOUNT")]
+    pub accounts: Vec<String>,
+    /// Also the usage no account can be credited with
+    #[arg(long)]
+    pub unattributed: bool,
+    /// Only models whose name contains M, in any case (repeatable)
+    #[arg(long, value_name = "M")]
+    pub model: Vec<String>,
+    /// From: a span back like 30d, 12h or 90m, a date YYYY-MM-DD, or an ISO 8601 time
+    /// (default: 30d; for month, twelve calendar months)
+    #[arg(long, value_name = "WHEN")]
+    pub since: Option<String>,
+    /// Until, not included: as --since takes it (default: now)
+    #[arg(long, value_name = "WHEN")]
+    pub until: Option<String>,
+    /// A row per account, model, account,model or none (default: account)
+    #[arg(
+        long,
+        value_name = "GROUPS",
+        value_parser = GroupingParser,
+        hide_possible_values = true
+    )]
+    pub by: Option<String>,
+    /// Days and months in this IANA time zone, or UTC (default: the system's)
+    #[arg(long, value_name = "ZONE")]
+    pub tz: Option<String>,
+    /// Print the rows as CSV
+    #[arg(long)]
+    pub csv: bool,
+    /// Report from the index as it is, reading no transcript
+    #[arg(long = "no-refresh")]
+    pub no_refresh: bool,
+}
+
+/// `tokens --by`. Any UTF-8 string parses, so the command refuses a bad value with its own
+/// usage error (token report spec §14), while completion offers the values; `account,model`
+/// is hidden from it, since a completion word holds no comma.
+#[derive(Clone)]
+pub struct GroupingParser;
+
+impl TypedValueParser for GroupingParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &OsStr,
+    ) -> Result<String, clap::Error> {
+        StringValueParser::new().parse_ref(cmd, arg, value)
+    }
+
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+        Some(Box::new(
+            [
+                PossibleValue::new("account"),
+                PossibleValue::new("model"),
+                PossibleValue::new("account,model").hide(true),
+                PossibleValue::new("none"),
+            ]
+            .into_iter(),
+        ))
+    }
+}
+
 impl Command {
     /// Whether the command reads or writes a Keychain item on macOS, and so runs the lock check
     /// first (Appendix A.3). `list` and `status` are not among them although they collect usage
     /// and may read Keychain items: by a plan ruling they degrade to `keychain_unavailable`
     /// rows rather than run the lock check, so a script gets rows, not a `keychain-locked`
-    /// failure. `history` and `statusline` read only the store and `~/.claude.json`, and the
-    /// rest need no Keychain item. A recovery under their mutation lock (Task 21) only reads the
-    /// Keychain, tri-state, and leaves what it cannot decide to the next command that checks.
+    /// failure. `history` and `statusline` read only the store and `~/.claude.json`, `tokens`
+    /// only the store and Claude Code's transcripts, and the rest need no Keychain item. A
+    /// recovery under their mutation lock (Task 21) only reads the Keychain, tri-state, and
+    /// leaves what it cannot decide to the next command that checks.
     /// `auto` checks before its first tick, a dry run too (§11.1): every tick reads its
     /// accounts' items, and a real one switches.
     /// `run` checks for itself, and only once it knows it launches a session: plain `claude`
@@ -637,9 +741,10 @@ fn fish_positional_lines(cmd: &clap::Command, path: &mut Vec<String>, script: &m
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use tagteam_engine::settings::parse_bool;
 
-    use super::BOOL_WORDS;
+    use super::{BOOL_WORDS, Cli, Command, TokensPeriod};
 
     /// Every string of `a-z0-9`, up to `max` characters.
     fn words_up_to(max: usize) -> Vec<String> {
@@ -675,5 +780,49 @@ mod tests {
                 "{word:?} is accepted but never completed"
             );
         }
+    }
+
+    /// `tagteam <args>` as `tokens`: the period's name (none when bare), and the ACCOUNTs and
+    /// `--by` of whichever level took them.
+    fn tokens(args: &[&str]) -> (Option<&'static str>, Vec<String>, Option<String>) {
+        let cli = Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied()))
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        let Some(Command::Tokens { period, args }) = cli.command else {
+            panic!("not tokens");
+        };
+        let (name, args) = match period.map(|p| *p) {
+            None => (None, args),
+            Some(TokensPeriod::Day(a)) => (Some("day"), a),
+            Some(TokensPeriod::Month(a)) => (Some("month"), a),
+            Some(TokensPeriod::Session(a)) => (Some("session"), a),
+            Some(TokensPeriod::Block(a)) => (Some("block"), a),
+        };
+        (name, args.accounts, args.by)
+    }
+
+    #[test]
+    fn tokens_takes_its_period_as_a_subcommand_and_is_day_when_bare() {
+        // Token report spec §11.1: the period is a subcommand, so an ACCOUNT spelled like one
+        // follows a period; a bare `tokens` takes the same arguments, as `day`.
+        let owned = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(tokens(&["tokens"]), (None, vec![], None));
+        assert_eq!(
+            tokens(&["tokens", "2", "--by", "model"]),
+            (None, owned(&["2"]), Some("model".to_owned()))
+        );
+        assert_eq!(
+            tokens(&["tokens", "month", "work", "1", "--by", "account,model"]),
+            (
+                Some("month"),
+                owned(&["work", "1"]),
+                Some("account,model".to_owned())
+            )
+        );
+        assert_eq!(
+            tokens(&["tokens", "block", "day"]),
+            (Some("block"), owned(&["day"]), None),
+            "an account named like a period, after one"
+        );
+        assert_eq!(tokens(&["tokens", "session"]).0, Some("session"));
     }
 }

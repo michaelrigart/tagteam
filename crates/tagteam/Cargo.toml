@@ -24,6 +24,7 @@ tagteam-engine.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 fastrand.workspace = true
+jiff.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
