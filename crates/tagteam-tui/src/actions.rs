@@ -809,7 +809,7 @@ fn panel_rows(text: &str, width: usize) -> Vec<String> {
 }
 
 /// A scrollable panel over most of `area`, its keys on its last line. Its text wraps at the
-/// panel's width (`panel_rows`), and its scroll stops at its last row at that width.
+/// panel's width (`panel_rows`), and its scroll stops at its last full page at that width and height.
 fn panel(frame: &mut Frame, area: Rect, title: &str, text: &str, scroll: u16, keys: &str) {
     let scroll = scroll.min(furthest(text, area.width, area.height));
     let rect = Rect::new(
