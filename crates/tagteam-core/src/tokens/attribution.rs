@@ -156,9 +156,9 @@ pub struct Timeline {
 
 impl Timeline {
     /// Token report §7.3. From `epoch_ms` on, the latest `history` row at or before a time.
-    /// Before it, from `events`: the latest switch's `to`; before the first switch, its `from`
-    /// from that account's earliest add; with no switch, the account `history` was seeded
-    /// with (its first row), from its earliest add. `added_at` stands in for an account with
+    /// Before it, from `events` before the epoch: the latest switch's `to`; before the first
+    /// switch, its `from` from that account's earliest add; with no such switch, the account
+    /// `history` was seeded with (its first row), from its earliest add. `added_at` stands in for an account with
     /// no add event. A remove of an account ends its segment.
     pub fn build(
         events: &[TimelineEvent],
@@ -178,7 +178,10 @@ impl Timeline {
         for e in events {
             match e {
                 TimelineEvent::Switch { at_ms, from, to } => {
-                    switches.push((*at_ms, from.as_ref(), to));
+                    // The `before` timeline reads only switches before the epoch.
+                    if *at_ms < epoch_ms {
+                        switches.push((*at_ms, from.as_ref(), to));
+                    }
                 }
                 TimelineEvent::Add { at_ms, account } => {
                     let first = adds.entry(account).or_insert(*at_ms);
@@ -605,6 +608,43 @@ mod tests {
         assert_eq!(t.account_at(10 * H), None);
         assert_eq!(t.account_at(35 * H), None);
         assert_eq!(t.account_at(41 * H), Some(id("b")));
+    }
+
+    #[test]
+    fn a_switch_after_the_epoch_leaves_the_pre_epoch_timeline_alone() {
+        // `a` is seeded at the epoch, then removed; the first switch ever goes to `b`.
+        let events = [
+            add(5 * H, "a"),
+            remove(32 * H, "a"),
+            add(33 * H, "b"),
+            switch(35 * H, None, "b"),
+        ];
+        let history = [
+            active(30 * H, Some("a")),
+            active(32 * H, None),
+            active(35 * H, Some("b")),
+        ];
+        let t = Timeline::build(&events, &history, 30 * H, &BTreeMap::new());
+        assert_eq!(t.account_at(4 * H), None, "before its add");
+        assert_eq!(t.account_at(10 * H), Some(id("a")));
+        assert_eq!(t.account_at(29 * H), Some(id("a")));
+        assert_eq!(t.account_at(34 * H), None);
+        assert_eq!(t.account_at(36 * H), Some(id("b")));
+
+        // One switch before the epoch and one after: the later one changes nothing before.
+        let events = [
+            add(H, "a"),
+            add(H, "b"),
+            switch(10 * H, Some("a"), "b"),
+            remove(32 * H, "b"),
+            switch(35 * H, Some("b"), "a"),
+        ];
+        let history = [active(30 * H, Some("b")), active(35 * H, Some("a"))];
+        let t = Timeline::build(&events, &history, 30 * H, &BTreeMap::new());
+        assert_eq!(t.account_at(5 * H), Some(id("a")));
+        assert_eq!(t.account_at(10 * H), Some(id("b")));
+        assert_eq!(t.account_at(29 * H), Some(id("b")));
+        assert_eq!(t.account_at(36 * H), Some(id("a")));
     }
 
     #[test]
