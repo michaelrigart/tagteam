@@ -269,9 +269,11 @@ SIGINT, SIGTERM and SIGHUP record their number in the cancel token (§14.1), as 
 command. The scheduler stops at its next cancellation point, after any critical span in flight
 has finished. A tick in progress therefore ends as an interrupted `auto` tick does (§11.4).
 The accept and connection threads poll with 1 s timeouts and stop too. Every subscriber gets a
-`stopping` event with reason `signal`. Then the daemon removes its socket, drops its engine
-locks (emptying their records), and releases `daemon.lock`. It exits 0, as `auto`'s loop
-does.
+`stopping` event with reason `signal`. As that event is sent, the daemon removes its socket,
+while it still holds `daemon.lock` and only if the file is still the socket this daemon bound;
+open connections write `stopping`, then close. Then the daemon drops its engine locks
+(emptying their records), and releases `daemon.lock`, emptying its record first. It exits 0,
+as `auto`'s loop does.
 
 ## D5. The socket protocol
 
@@ -284,7 +286,9 @@ This section is the contract the TUI and any other client depend on.
   settings read and no daemon asked, so a client finds the daemon of the store it uses. A
   missing file (`ENOENT`) or a stale one (`ECONNREFUSED`) fails at once.
 - **Mode.** The socket is created 0600, by setting the umask to `0177` around `bind`. That
-  happens before any thread starts, so the umask change affects nothing else. The data
+  happens before any thread that creates a file or a process starts. The notifier thread
+  exists by then but only waits on its queue, which nothing can fill before the daemon serves,
+  so the umask change affects nothing else. The data
   directory is 0700 (§5). The socket is never chmod'ed afterwards.
 - **Peer check.** The server closes, before its greeting, any connection whose peer uid
   (`getpeereid` on macOS, `SO_PEERCRED` on Linux) is not its own.
@@ -415,7 +419,11 @@ the relevant window with the highest `pct`; its key and `resets_at` name the ded
   organization name or a full email. Examples:
   - `Switched 1 · work → 2 · spare (5h at 92%)`
   - `2 · spare needs a new login (invalid_grant)`
-  - `1 · work: 7d at 93%, no account to switch to (resets in 1d 4h)`
+  - `1 · work: 7d at 93% (resets in 1d04h)`
+
+  The `limit` text does not say why the daemon did not switch (paused, a cooldown, every
+  account exhausted), since it is true for only some of those. Durations are written as `list`
+  writes them (`1d04h`). A binding window whose reset has already passed is not notified.
 - **macOS:** `/usr/bin/osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' -- <title> <body>`.
   The text travels as argv, so no account name can inject AppleScript. The notification shows
   as coming from Script Editor, which needs notification permission once (D15).
@@ -431,9 +439,11 @@ the relevant window with the highest `pct`; its key and `resets_at` name the ded
 
 - `switch` and `quarantine` are notified once per event.
 - `limit` is notified once per account, binding window and window instance. The marker is a
-  lease (§6.1) named `notify:limit:<account id>:<window key>:<resets_at>`, taken with §6.1's
-  single statement, whose expiry is the window's reset plus 60 s, or one hour from now when the
-  reset is unknown. The lease is taken before the notification is queued, so it also holds
+  lease (§6.1) named `notify:limit:<account id>:<window key>`, taken with §6.1's single
+  statement, whose expiry is the window's reset plus 60 s, or one hour from now when the reset
+  is unknown. That expiry is what bounds one window instance: a provider can report a window's
+  reset a second apart between polls (the codebase treats resets within ±60 s as one instance),
+  and a name that carried the reset would notify again. The lease is taken before the notification is queued, so it also holds
   across a restart and across two daemons on one store, which D4.1 rules out anyway.
 
 ### D6.4 Turning it off
@@ -478,7 +488,9 @@ others are not created.
   upgrade exit and start and stop. Errors and config warnings go to stderr, as `auto`'s do.
 - **`--json`:** every event as one JSONL object, exactly as `subscribe` delivers them (D5.5).
 - **Exit codes:**
-  - `0` after a signal (D4.6)
+  - `0` after a signal once the daemon serves (D4.6). A signal during the wait for
+    `daemon.lock` (D4.1), before the daemon serves, ends it as an interrupted command:
+    128 + the signal number, with the `interrupted` error (§14.1)
   - `75` to be restarted on a new binary or schema (D4.5)
   - `1` when it cannot start: as root, in a run shell, with a store it cannot open, or after a
     declined or failed keychain unlock on a terminal (D4.1)
@@ -533,7 +545,10 @@ program path and environment take effect at once (D9.2, D9.3).
   - `TAGTEAM_LOG`
   - `PATH`, which `notify-send` is found on
 
-  No other variable is recorded. In particular none that `run` scrubs (§12.5) is.
+  No other variable is recorded. Of the variables `run` scrubs from a session (§12.5), only
+  `CLAUDE_SECURESTORAGE_CONFIG_DIR` is: it carries no credential, but names where the live
+  login's credential is stored, which a switch must find exactly as the user's shell does. No
+  variable that carries a credential or points at one, the rest of §12.5's list, is recorded.
 - **The unit file** is created 0600 (`O_EXCL`, write, rename, as §5 does for secrets), because a
   proxy URL can carry a password.
 
@@ -609,8 +624,8 @@ It reads the service state with `launchctl print` or `systemctl --user show`, ea
 | Check | Reports |
 |---|---|
 | `daemon.running` | info: running, with the pid and version from `daemon.lock`'s record (judged live by an exact pid and start-time match, §12.6). warn: its version differs from this binary's, "restart it". info: not running |
-| `daemon.service` | info: installed and loaded, or not installed. fail: the unit's program path does not exist. warn: a recorded variable (D9.1) differs from doctor's own environment, so the daemon uses another store or home; the fix is `tagteam daemon install` again. info (Linux): lingering is off |
-| `daemon.socket` | info: a socket file with no live daemon (the next start replaces it). warn: its mode is not 0600. fail: its path is too long to bind (D5.1) |
+| `daemon.service` | info: installed and loaded, or not installed. fail: the unit's program path does not exist. warn: a recorded variable (D9.1) other than `PATH` differs from doctor's own environment, so the daemon uses another store or home; the fix is `tagteam daemon install` again. `PATH` places no store or home, and a version manager changes it in every directory, so it is not compared. info (Linux): lingering is off. warn (Linux): whether lingering is on cannot be told (`loginctl` missing, hung or failing), with the reason |
+| `daemon.socket` | info: a socket file with no live daemon (the next start replaces it). warn: its mode is not 0600, or a live daemon has no socket file (it runs without one, D5.1). fail: its path is too long to bind (D5.1), once a daemon runs or a unit is installed; until then the length is not judged, so `doctor` never fails for someone who does not use the daemon |
 | `daemon.notify` | warn: notifications are on but there is no backend (`notify-send` missing) |
 
 The existing auto-switch check ("an engine running", §13.6) says `the daemon (pid N)` when the
@@ -631,8 +646,8 @@ the daemon's only record.
   inside the per-identity budget. `list`, `status` and `switch` will mostly find readings
   younger than the 180 s floor, or not due, and fetch nothing.
 - **`statusline` and `list` p95.** The daemon is a separate process whose transactions are as
-  short as `auto`'s. `tests/perf.rs` gains runs with a fixture daemon ticking every second
-  (D14).
+  short as `auto`'s. `tests/perf.rs` gains runs with a fixture daemon at the shortest
+  auto-switch interval (15 s, §6.4), so it ticks while the runs are timed (D14).
 - **`doctor`'s engine check** keeps working from the engine lock records, which the daemon
   writes as `auto` does, and empties when it lets a lock go (D3 change 3).
 - **The local-state invariant** (§3). The daemon writes CC state only through the operations
@@ -712,7 +727,9 @@ path is short enough for `sun_path`: macOS's `$TMPDIR` can push a socket path pa
     binary is replaced
   - SIGTERM gives exit 0, no socket file, empty engine lock records and a free `daemon.lock`
 - **Doctor.** Each new check in each state, snapshot tested, with every file left byte-identical.
-- **Performance.** `tests/perf.rs`: `statusline` and `list` p95 with a fixture daemon running.
+- **Performance.** `tests/perf.rs`: `statusline` and `list` p95 with a fixture daemon running
+  at the shortest auto-switch interval (15 s, §6.4), at least one tick landing among the timed
+  runs.
 - **Provider neutrality.** The daemon's tests run against both providers (§15.2), with
   `FakeAgent`'s missing capabilities degrading as §4.5 says.
 
@@ -736,3 +753,28 @@ These are made in small hunks in the same branch:
 - **§11.1:** the daemon's line points to D4.3 and says that a released lock's record is emptied.
 - **§13.1:** add the `daemon` commands.
 - **§13.6:** add the daemon checks (D10).
+
+## Errata
+
+Found while planning the implementation, and corrected in place above. None changes the
+design:
+- **D4.6:** the socket is removed when `stopping` is sent, before `daemon.lock` is released,
+  and only if it is still the socket this daemon bound; `daemon.lock`'s record is emptied
+  before the lock goes.
+- **D5.1:** the umask is set before any thread that creates a file or a process starts; the
+  notifier thread exists by then but only waits on its queue, which nothing can fill before the
+  daemon serves.
+- **D6.2:** the `limit` example no longer claims that no account is left to switch to, which
+  the daemon cannot know, and writes durations as `list` does.
+- **D6.3:** the `limit` lease is named `notify:limit:<account id>:<window key>`, without the
+  reset; its expiry bounds one window instance, since a provider can report a reset a second
+  apart between polls and a name that carried it would notify again.
+- **D8.1:** a signal during the wait for `daemon.lock`, before the daemon serves, exits
+  128 + n as an interrupted command.
+- **D9.1:** `CLAUDE_SECURESTORAGE_CONFIG_DIR` is recorded although `run` scrubs it; no
+  variable that carries or points at a credential is.
+- **D10:** `PATH` is left out of the variable comparison; a lingering that cannot be told warns
+  with its reason; a too-long socket path fails only once a daemon runs or a unit is installed;
+  a live daemon with no socket file warns.
+- **D12, D14:** the perf daemon runs at the shortest auto-switch interval (15 s), since
+  §6.4 allows nothing shorter.

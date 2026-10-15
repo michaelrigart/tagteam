@@ -20,11 +20,31 @@ with the one before, so any release may contain breaking changes. Each section s
 - `tagteam run` and `tagteam statusline` now record which session runs under which account, for
   the token report. Neither changes what it prints or its exit code, and the status line stays
   within its time budget.
+- `tagteam daemon`: a background process that keeps every account's usage fresh and switches
+  accounts automatically, as `tagteam auto` does, for each provider with two or more switchable
+  accounts. Every command still works without it.
+- `tagteam daemon install`, `uninstall` and `status`. `install` sets up a LaunchAgent on macOS
+  or a systemd user unit on Linux, which starts the daemon at login and restarts it after a
+  failure or an upgrade. `install --print` prints the unit instead.
+- Notifications from the daemon when it switches accounts, when an account needs a new login,
+  and when the live account reaches the switch threshold and the daemon does not switch away
+  from it: through `osascript` on macOS and `notify-send` on Linux.
+- Settings `daemon.autoswitch` (pause the daemon's switching, per provider), `notify.enabled`
+  and `notify.events`.
+- A local socket, `daemon.sock` (mode 0600, your user only), that streams the daemon's events
+  and answers status requests, for the TUI and for scripts.
+- `tagteam doctor` reports the daemon, its service unit, its socket and its notifications.
+- The internal `tagteam-daemon` crate on crates.io.
 
 ### Changed
 
 - `tagteam purge` waits for a running token index refresh before it deletes a provider's data,
   and deletes the index with it. `tagteam remove` keeps a removed account's token usage.
+- `tagteam auto` runs on the daemon's scheduler. Its behaviour, output and exit codes are
+  unchanged. When the daemon already switches a provider, `auto` says so and names the command
+  that pauses it.
+- An auto-switch engine that stops now empties its lock file's record, so `tagteam doctor`
+  never names a process that no longer drives the provider.
 
 ## [20261014.2045.0] - 2026-10-14
 
