@@ -57,8 +57,10 @@ tagteam is public OSS under the MIT license, built for macOS and Linux.
 
 - **Windows.** Platform code sits behind traits so a port stays possible, but nothing is built
   or tested for Windows.
-- **Later sub-projects.** The daemon, socket API and notifications (#2), the TUI (#3) and the
-  menu bar (#4).
+- **Later sub-projects.** The TUI (#3) and the menu bar (#4). The daemon, its socket API and
+  notifications (#2) are specified in
+  [`2026-10-14-tagteam-daemon-design.md`](2026-10-14-tagteam-daemon-design.md), cited here as
+  "daemon spec D*n*".
 - **Migrating a cswap store.** Only cswap *export files* can be imported.
 - **Self-upgrade and update checks.** Package managers handle upgrades.
 - **Providers other than Claude Code.** Codex, Gemini CLI, Grok and others each get their own
@@ -126,7 +128,8 @@ A test pins this invariant (§15.3).
 | `tagteam-core` | Pure, provider-neutral domain types and policy: `ProviderId`, identities, generic usage windows, headroom, poll planning, backoff, pace and projection, outgoing-credential classification, and auto-switch `decide()` | None; time is passed in |
 | `tagteam-provider` | The `Provider` trait (§4.5) and the I/O primitives that providers share: `Read<T>` and provenance, `FreshCredential`, the atomic write-through-symlink writer, the span-preserving JSON splice, the `/usr/bin/security` driver, `mkdir` and `flock` lock helpers, pid liveness, and the `Http` and `Clock` ports | Primitives only |
 | `tagteam-cc` | `impl Provider for ClaudeCode`: everything whose shape CC dictates — path and store resolution, Keychain naming, reads and writes of the active credential (OAuth and managed-key axes), CC's `proper-lockfile` lock protocol, `~/.claude.json` handling, endpoints, poll budget, session records and profile handling | Yes, through `tagteam-provider` |
-| `tagteam-engine` | The SQLite store, the vault, the `ureq`-backed `Http` implementation, the provider registry, and the provider-generic operations: switch, refresh gate, usage collector, auto-switch loop, sessions, export/import, doctor | Yes |
+| `tagteam-engine` | The SQLite store, the vault, the `ureq`-backed `Http` implementation, the provider registry, and the provider-generic operations: switch, refresh gate, usage collector, the auto-switch engine and its tick, sessions, export/import, doctor, and the daemon's paths, lock record and service units (daemon spec D3) | Yes |
+| `tagteam-daemon` | The job scheduler that `auto` and the daemon run on, the daemon's provider jobs and watches, its socket server, the protocol types and their client, the notifier, and service install and uninstall (daemon spec D3) | Yes, through `tagteam-engine` |
 | `tagteam` | The CLI binary (clap), human and JSON rendering, and the prompts | Thin |
 | `tagteam-fake` | Test-only (`publish = false`): the `FakeAgent` provider (§15.2). It obeys the provider dependency rules below, so it also proves that a new provider is one crate plus one registry line | Its own fixture home only |
 
@@ -137,8 +140,8 @@ A test pins this invariant (§15.3).
   path, key or endpoint.
 - A future provider is one new crate, such as `tagteam-codex`, plus one line in the registry.
 
-Later sub-projects add crates that depend on `tagteam-engine`: `tagteam-daemon`, `tagteam-tui`
-and `tagteam-menubar`.
+`tagteam-daemon` (sub-project 2) depends on `tagteam-engine` and, like it, names no provider's
+paths, keys or endpoints. Later sub-projects add `tagteam-tui` and `tagteam-menubar`.
 
 ### 4.2 Engine surface
 
@@ -363,6 +366,9 @@ mode 0700, so a command that changes nothing creates nothing.
 | Auto-switch engine locks | `$XDG_DATA_HOME/tagteam/locks/autoswitch-<provider>.lock`, holding the engine's pid and start time (§11.1) |
 | Settings lock | `$XDG_DATA_HOME/tagteam/locks/config.lock` (§6.4) |
 | Displaced lock | `$XDG_DATA_HOME/tagteam/locks/displaced.lock` (§6.3) |
+| Daemon lock | `$XDG_DATA_HOME/tagteam/locks/daemon.lock`, held by the running daemon. It holds the daemon's pid, start time and version as `{"pid":N,"start":S,"version":"…"}`, and is emptied when the daemon stops (daemon spec D4.1, D4.6) |
+| Daemon socket | `$XDG_DATA_HOME/tagteam/daemon.sock`, mode 0600 (daemon spec D5.1) |
+| Service unit | macOS: `~/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist`, the one path outside XDG, because launchd reads agents only there. Linux: `$XDG_CONFIG_HOME/systemd/user/tagteam.service`. Written 0600 by `tagteam daemon install` (daemon spec D9) |
 | Log | `$XDG_STATE_HOME/tagteam/tagteam.log`, rotated to `.1` and `.2` (1 MiB × 3), with its rotation lock `tagteam.log.lock` (§14.2) |
 
 Every file that contains secrets is created with mode 0600 at creation time (`O_EXCL`, then
@@ -746,10 +752,16 @@ source}], unknown: [key]}`; `get` returns `{schemaVersion, key, provider, value,
 | `statusline.format` | `"{account} · 5h {5h}% · 7d {7d}%{stale}"` | placeholders listed in §13.5 only; `{model:<name>}` needs a trimmed, non-empty name without braces | yes |
 | `run.share_extra` | `[]` | entry names of the source home to share into profiles, besides the provider's allowlist (§12.2); known-private names are ignored with a warning | yes |
 | `ui.color` | `auto` | `auto`, `always`, `never` (`NO_COLOR` and `FORCE_COLOR` also honoured) | — |
+| `daemon.autoswitch` | true | bool | yes |
+| `notify.enabled` | true | bool | — |
+| `notify.events` | `["switch","quarantine","limit"]` | a list of `switch`, `quarantine` and `limit`; duplicates collapse; `''` is the empty list | yes |
+
+The `daemon.*` and `notify.*` keys are the daemon's (daemon spec D7). `daemon.autoswitch` set
+to false pauses the daemon's auto-switching for a provider. It does not affect `tagteam auto`.
 
 CLI flags override settings for a single invocation and are clamped to the same ranges. A
-running `auto` re-reads the file whenever its mtime changes (§11.4); its flags still win.
-Nothing else caches settings across commands.
+running `auto` or daemon re-reads the file whenever its mtime changes (§11.4, daemon spec
+D4.2); `auto`'s flags still win. Nothing else caches settings across commands.
 
 ## 7. Credentials and the refresh gate
 
@@ -1739,7 +1751,8 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
   `autoswitch_state` therefore has a single writer, so no unhealthy tick or departure snapshot
   is counted twice.
   - A loop skips a provider whose lock another process holds, with a warning. If it gets no
-    provider's lock at all, it exits 1, saying auto-switch already runs for them.
+    provider's lock at all, it exits 1, saying auto-switch already runs for them. When the
+    holder is the daemon, the message names it and says how to pause it (daemon spec D8.3).
   - `--once` reports `no-switch` with reason `engine-running` for such a provider (NO_ACTION).
   - `--dry-run` takes no engine lock and writes no auto-switch state: its state lives in
     memory, it releases no quarantine (§11.2 step 1), and it freshens and switches nothing
@@ -1747,12 +1760,17 @@ displaced, rescues, storeEmptied, failures: [{what, message}]}`.
     the recovery of an interrupted switch when it takes `MutationGuard` (§9.6): recovery
     repairs a switch that has already reached the live store, and decides nothing.
   - The daemon (sub-project 2) takes the same lock, so `auto` and the daemon never both drive
-    one provider.
+    one provider. When it takes the lock, and when it gives it up (pausing through
+    `daemon.autoswitch`), is daemon spec D4.3.
   - Once it holds the lock, the engine writes its pid and start time into the lock file, the
     start time taken as for the `switch_journal` holder (§12.6). The record is never used for
     exclusion. `doctor` reads it to tell whether an engine runs, by an exact pid and
     start-time match (§13.6), instead of trying the lock, which an `auto` starting at that
     instant would then find taken.
+  - An engine that ends empties the record before it releases the lock (daemon spec D3 change
+    3). A daemon that gives a provider up lives on, and a record left behind would name it as
+    that provider's engine. A process killed by SIGKILL still leaves its record, which names a
+    dead process.
 - **Where it runs.** Like every command that changes the live login, `auto` refuses inside a
   `tagteam run` shell (§9.2), except with `--dry-run`. On macOS it runs the Keychain lock check
   before its first tick (Appendix A.3).
@@ -2488,6 +2506,8 @@ exactly as it would without providers.
 | `switch [ACCOUNT] [--strategy best\|next-available [--model M]] [--force]` | §9 |
 | `add`, `add-token`, `remove` / `rm`, `disable`, `enable`, `alias`, `move` | §10 |
 | `auto` | §11 |
+| `daemon [--provider P]` | Runs the daemon in the foreground (daemon spec D8.1) |
+| `daemon install [--print] [--no-start]`, `daemon uninstall`, `daemon status` | Installs or removes the service unit that starts the daemon at login (daemon spec D9), and reports the daemon's state (D8.2) |
 | `run`, `map`, `unmap`, `shell-init` | §12 |
 | `history [ACCOUNT] [--window 5h\|7d\|spend\|<model>] [--since 14d] [--csv]` | §13.4 |
 | `tokens [day\|month\|session\|block] [ACCOUNT...] [--unattributed] [--model M]... [--since 30d\|DATE] [--until DATE] [--by account\|model\|account,model\|none] [--tz ZONE] [--csv] [--no-refresh]` | Token use and API cost per account, from Claude Code's transcripts ([token report spec] §11) |
@@ -2500,7 +2520,10 @@ exactly as it would without providers.
 | `completions bash\|zsh\|fish` | §13.7 |
 
 **Exit codes:** `0` OK · `1` error · `2` usage error · `130` interrupted by SIGINT (128 + the
-signal number for SIGTERM and SIGHUP, §14.1). `auto --once` uses 0–3.
+signal number for SIGTERM and SIGHUP, §14.1). `auto --once` uses 0–3. `daemon` exits `0`
+after a signal, `75` to be restarted on a new binary or schema, `1` when it cannot start and
+`2` for a usage error. `daemon status` exits `0` when the daemon runs, `3` when it does not, and
+`1` on an error (daemon spec D8).
 
 **`list` text layout.** One row per account, in position order:
 
@@ -2795,6 +2818,9 @@ in a home whose global config does not exist.
   doctor's first read, SQLite recreates an empty `-wal` and a `-shm` that holds only the WAL
   index, never a row. The next writer's close removes both.
 - It tests locks without waiting, and takes none that another process could wait on.
+- It never connects to the daemon's socket. It reads the daemon's service state with
+  `launchctl print`, or `systemctl --user show` and `loginctl show-user`, each bounded by 5 s,
+  and none of them changes anything (daemon spec D10).
 - It asks nothing. A locked Keychain is reported (Appendix A.3), never unlocked, and the
   checks that would read it are skipped with one `warn`. (Whether the lock check itself can
   raise the system's unlock dialog is §17 O3.)
@@ -2848,11 +2874,28 @@ for a check that is not a provider's, and `fix` is null when there is nothing to
   another user's recycled pid) → warn, naming the pid and its start time, with
   `tagteam switch --force` as the fix if no tagteam process is running.
 - **Auto-switch** (§11):
-  - an engine running → info, with its pid, from the engine lock's record (§11.1)
+  - an engine running → info, with its pid, from the engine lock's record (§11.1); `the
+    daemon (pid N)` when the record matches `daemon.lock`'s (daemon spec D10)
   - `unhealthy_ticks` above zero → warn
   - a `consume-first` strategy for a provider without a long window (§4.5) → warn
   - `autoswitch.models` naming a model that no account's last reading has → warn, as the
     tick's `config-warning` does
+- **Daemon** (daemon spec D10):
+  - `daemon.running`: a daemon running → info, with its pid and version from `daemon.lock`'s
+    record, judged live by an exact pid and start-time match (§12.6); its version differs from
+    this binary's → warn, naming the restart; none running → info
+  - `daemon.service`: the unit installed and loaded, or not installed → info; the unit's
+    program path missing → fail; a recorded variable (daemon spec D9.1) other than `PATH` that
+    differs from doctor's own environment → warn, because the daemon then uses another store
+    or home, with `tagteam daemon install` as the fix; on Linux, lingering off → info, and
+    lingering that cannot be told → warn, naming why
+  - `daemon.socket`: a socket file with no live daemon → info (the next start replaces it); a
+    mode other than 0600, or a live daemon with no socket file → warn; a path too long to bind
+    (daemon spec D5.1) → fail, once a daemon runs or a unit is installed, and not judged
+    before
+  - `daemon.notify`: notifications on and no backend (`notify-send` missing) → warn
+  - `launchctl`, `systemctl` or `loginctl` missing, hung or failing → warn, naming why; it
+    never fails the run by itself
 - **Settings** (§6.4): an unparseable file → fail, since every command runs on the defaults;
   an invalid value or an unknown key → warn, naming it.
 - **Log** (§14.2): its path and size → info; a log that cannot be written → warn.

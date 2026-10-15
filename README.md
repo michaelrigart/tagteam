@@ -30,7 +30,8 @@ test pins it.
   session, while your default login stays as it is. Sessions share your history, memory and
   settings.
 - **Switch automatically.** `tagteam auto` moves to a better account before the current one
-  reaches a threshold.
+  reaches a threshold. The daemon does the same in the background, keeps every account's usage
+  fresh, and tells you when it switches.
 - **Keep refreshed tokens safe.** Every refresh-token successor tagteam receives is persisted:
   to the vault, to a rescue file if that write fails, or under `displaced/` if it belongs to
   another account. If every write fails, tagteam reports it.
@@ -133,7 +134,8 @@ token from stdin so it stays out of your shell history.
 
 Run `tagteam <command> --help` for the full options. Every command accepts `--provider`/`-p`
 (Claude Code is the only provider at present). Most commands accept `--json` and then print
-one JSON object on stdout. The exceptions: `auto --json` prints one event per line,
+one JSON object on stdout. The exceptions: `auto --json` and `daemon --json` print one event
+per line,
 `run --json` covers only errors before Claude Code starts, and `statusline`, `shell-init`
 and `completions` refuse `--json`. A bare `tagteam` runs `list`.
 
@@ -145,6 +147,7 @@ and `completions` refuse `--json`. A bare `tagteam` runs `list`.
 | `alias`, `move` | Name an account, or change its position |
 | `switch` | Switch to the next account, to a named one, or to the one a strategy picks (`best`, `next-available`) |
 | `auto` | Switch automatically before a rate limit, until stopped. `--once` ticks once; `--dry-run` decides without switching |
+| `daemon` | Switch automatically and keep usage fresh in the background. `install` and `uninstall` its login service, show its `status`, or run it in the foreground |
 | `run`, `map`, `unmap`, `shell-init` | Run Claude Code as an account in a separate session, and map directories to accounts |
 | `history` | Usage history, burn rate, and when each window runs out |
 | `tokens` | Token use and API cost per account and model, by day, month, session or 5-hour block, from Claude Code's transcripts |
@@ -158,7 +161,9 @@ and `completions` refuse `--json`. A bare `tagteam` runs `list`.
 
 Exit codes: `0` success, `1` error, `2` usage error, and 128 plus the signal number when
 interrupted (`130` for Ctrl-C). `tagteam auto --once` uses `0` switched, `1` error, `2` no
-action and `3` blocked.
+action and `3` blocked. `tagteam daemon` exits `0` when a signal stops it and `75` when it
+must be restarted on a new version. `tagteam daemon status` exits `0` when the daemon runs
+and `3` when it does not.
 
 ### Automatic switching
 
@@ -171,9 +176,69 @@ least two switchable accounts. By default it switches away above 90% usage, chec
 seconds and waits 300 seconds between automatic switches. Change these with flags
 (`--threshold`, `--interval`, `--cooldown`, `--strategy`) or with the settings
 `autoswitch.threshold`, `autoswitch.interval_seconds`, `autoswitch.cooldown_seconds` and
-`autoswitch.strategy`, for example `tagteam config set autoswitch.threshold 85`. tagteam has
-no background service in this release, so keep `auto` running in a terminal multiplexer or
-under a process supervisor of your choice.
+`autoswitch.strategy`, for example `tagteam config set autoswitch.threshold 85`. To switch in
+the background, without a terminal, use the [daemon](#daemon), which reads the same settings.
+
+### Daemon
+
+The daemon runs tagteam in the background. Install it once:
+
+```sh
+tagteam daemon install
+```
+
+From then on it starts when you log in, and restarts if it fails. While it runs, it:
+
+- keeps every account's usage fresh, on the same schedule and within the same request budget
+  as the commands, so `list` and `statusline` rarely have to fetch;
+- switches accounts automatically, exactly as `tagteam auto` does, for every provider with at
+  least two switchable accounts;
+- tells you about the events that matter (see below);
+- serves a local socket that the TUI and scripts can read.
+
+The daemon switches accounts unattended, and `install` says so. To pause automatic switching
+and keep only the usage collection, change a setting. It takes effect within a few seconds,
+and lasts until you change it back:
+
+```sh
+tagteam config set daemon.autoswitch false   # pause
+tagteam config set daemon.autoswitch true    # resume
+```
+
+While the daemon switches a provider, `tagteam auto` refuses to run for it and says so. Pause
+the daemon first if you want `auto` in a terminal.
+
+`tagteam daemon status` shows whether the daemon runs, what it is doing for each provider, and
+the state of its service. `tagteam daemon uninstall` stops it and removes the service.
+
+**Notifications.** The daemon tells you when it switches accounts, when an account needs a new
+login, and when the live account reaches the switch threshold and the daemon does not switch
+away from it:
+
+```
+Switched 1 · work → 2 · spare (5h at 92%)
+```
+
+On macOS they come from `osascript` and show as Script Editor, which asks once for permission
+to send notifications. On Linux they need `notify-send`. Turn them off with
+`tagteam config set notify.enabled false`, or choose which ones you get with `notify.events`,
+for example `tagteam config set notify.events switch,quarantine`.
+
+**The service.** On macOS it is a LaunchAgent,
+`~/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist`, which needs you to be logged
+in to the desktop; over SSH alone, run `tagteam daemon` in the foreground instead. On Linux it
+is a systemd user unit, `~/.config/systemd/user/tagteam.service`. To keep it running after you
+log out, run `loginctl enable-linger`. The unit records the variables that decide which store,
+Claude Code home, proxy and log the daemon uses (`XDG_*`, `CLAUDE_CONFIG_DIR`,
+`CLAUDE_SECURESTORAGE_CONFIG_DIR`, the proxy variables, `TAGTEAM_LOG` and `PATH`), so run `tagteam daemon install` again after you change
+them. `install --print` prints the unit without installing anything, and `--no-start` installs
+it for your next login without starting it now.
+
+If the macOS login keychain is locked, the daemon waits for it, trying again after a minute and
+then less and less often, up to every 15 minutes. When you upgrade tagteam, the daemon notices
+within a minute, exits with code 75, and the service starts the new version. `tagteam daemon`
+runs it in the foreground, with a line per check as `auto` prints, for use under a process
+supervisor of your own.
 
 ### Running accounts side by side
 
@@ -245,6 +310,8 @@ set to absolute paths. Directories are created lazily with mode 0700.
 | Session profiles | `$XDG_DATA_HOME/tagteam/sessions/` |
 | Rescued and displaced credentials | `$XDG_DATA_HOME/tagteam/rescue/` and `displaced/` |
 | Log | `$XDG_STATE_HOME/tagteam/tagteam.log` (default `~/.local/state/tagteam/`) |
+| Daemon socket and lock | `$XDG_DATA_HOME/tagteam/daemon.sock` and `locks/daemon.lock` |
+| Daemon service unit | macOS: `~/Library/LaunchAgents/io.github.michaelrigart.tagteam.plist`; Linux: `$XDG_CONFIG_HOME/systemd/user/tagteam.service` |
 
 `tagteam config path` prints the settings file's location.
 
@@ -266,6 +333,9 @@ set to absolute paths. Directories are created lazily with mode 0700.
   keeps 365 days by default (`tokens.retention_days`), about 100 bytes a response: some 150 MB a
   year at a heavy user's rate. It outlives Claude Code's own 30-day transcript cleanup.
 - **The log** never contains an email, a token or any part of a credential.
+- **The daemon's socket** has mode 0600 and answers only your own user. No credential ever
+  crosses it. Its service unit has mode 0600 too, because a proxy URL it records can hold a
+  password.
 - **Exports** are encrypted with age by default, using a passphrase or recipient keys.
   `--plaintext` is an explicit opt-out. An OAuth export hands a login over rather than copying
   it: whichever machine refreshes the token first invalidates the other copy. To use one
@@ -278,6 +348,9 @@ set to absolute paths. Directories are created lazily with mode 0700.
 See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
 
 ## Uninstall and purge
+
+If you installed the daemon, remove it first: `tagteam daemon uninstall` stops it and deletes
+its service unit.
 
 `tagteam purge` deletes everything tagteam stores: the accounts and their vault entries
 (including the macOS Keychain items), session profiles, rescued and displaced credentials, the
