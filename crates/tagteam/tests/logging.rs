@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use common::{cmd, expire_vault, login, seed_home, std_cmd, two_fresh_accounts};
+use common::{
+    assistant_line, cc_timestamp, cmd, expire_vault, login, now_epoch_s, seed_home, std_cmd, turn,
+    two_fresh_accounts, write_transcript,
+};
 use serde_json::{Value, json};
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_provider::mock_server::{MockReply, MockServer};
@@ -533,6 +536,20 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
     run(&["move", "2", "1"]);
     run(&["history", "1"]);
     run(&["history", "2", "--csv"]);
+    // The token report (token report spec §11), over a transcript of one of this home's
+    // sessions: the index logs counts, paths and session ids, never an identity.
+    write_transcript(
+        root,
+        "zq-session",
+        &[turn(
+            "claude-opus-5-5",
+            now_epoch_s() * 1000 - 3_600_000,
+            [10, 20, 30, 40, 50],
+        )],
+    );
+    run(&["tokens"]);
+    run(&["tokens", "session", "--json"]);
+    run(&["tokens", "1", "--csv", "--no-refresh"]);
     run(&["statusline"]);
     // Claude Code rotated b in place, and a's access token is about to expire: `switch 1`
     // asks the oracle about b's new token, captures it, and refreshes a through the gate.
@@ -698,5 +715,59 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
                 "{part:?}, part of a secret, is in the log:\n{log}"
             );
         }
+    }
+}
+
+#[test]
+fn the_token_index_never_logs_content() {
+    // Token report spec §13: the index holds and logs counts, ids, times and paths, never a
+    // transcript's content: not at TRACE in the file, nor under --debug on stderr. The content
+    // is a string nothing else holds, in a response, a user's line, and an assistant line too
+    // broken to read, which the index skips and counts.
+    const CONTENT: &str = "zq-content-Rv8pXk3mQz7vTn2s";
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    let env = Env::for_test(root);
+    seed_home(&env);
+    let at = now_epoch_s() * 1000 - 3_600_000;
+    let response = turn("claude-opus-5-5", at, [10, 20, 30, 40, 50]);
+    let user = json!({"type": "user", "sessionId": "zq-s", "timestamp": cc_timestamp(at - 60_000),
+                      "message": {"role": "user", "content": CONTENT}});
+    let broken = json!({"type": "assistant", "sessionId": "zq-s", "timestamp": cc_timestamp(at),
+                        "message": {"id": "msg_zq_2", "content": CONTENT}});
+    let dir = env.home.join(".claude/projects/-w");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("zq-s.jsonl"),
+        format!(
+            "{user}\n{}\n{broken}\n",
+            assistant_line("zq-s", "msg_zq_1", "req_zq_1", &response, CONTENT)
+        ),
+    )
+    .unwrap();
+    let out = cmd(root)
+        .env(TAGTEAM_LOG, "trace")
+        .args(["tokens", "--json", "--debug"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["total"]["responses"], 1, "the response was indexed: {v}");
+    assert_eq!(
+        v["index"]["skippedLines"], 1,
+        "the broken line was counted: {v}"
+    );
+    let log = log_text(&state_dir(root));
+    assert!(
+        log.lines().any(|l| l.contains(" tagteam_engine::tokens")),
+        "the refresh logged its counts:\n{log}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for (what, text) in [("the log", log.as_str()), ("stderr", stderr.as_ref())] {
+        assert!(
+            !text.contains(CONTENT),
+            "{what} holds transcript content:\n{text}"
+        );
     }
 }

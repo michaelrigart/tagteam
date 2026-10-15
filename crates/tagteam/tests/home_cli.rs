@@ -20,13 +20,15 @@ const UNDER_ROOT: [&str; 3] = [
     "/.local/state/tagteam",
 ];
 /// Commands that read or write state under `HOME`. On a fresh machine `add-token` creates the
-/// store and the vault, so a fallback would show in the working directory.
-const COMMANDS: [&[&str]; 5] = [
+/// store and the vault, and `tokens` the store, so a fallback would show in the working
+/// directory.
+const COMMANDS: [&[&str]; 6] = [
     &["list"],
     &["status"],
     &["switch"],
     &["history"],
     &["add-token", "sk-ant-api03-key"],
+    &["tokens"],
 ];
 
 #[derive(Clone, Copy, Debug)]

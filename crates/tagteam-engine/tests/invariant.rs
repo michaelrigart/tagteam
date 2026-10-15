@@ -10,7 +10,10 @@ use common::{
 };
 use serde_json::json;
 use tagteam_cc::live::Platform;
+use tagteam_core::time::format_iso8601;
 use tagteam_engine::switch::{SwitchOutcome, SwitchRequest};
+use tagteam_engine::tokens::{RefreshOutcome, TokenGrouping, TokenPeriod, TokenQuery, Wait};
+use tagteam_provider::liveness::FakeProcess;
 
 fn check(fx: &Fx, step: &str, op: impl FnOnce()) {
     let before = fx.snapshot();
@@ -166,6 +169,77 @@ fn switch_and_verify(fx: &Fx, req: SwitchRequest) -> SwitchOutcome {
     outcome
 }
 
+/// Claude Code's line for one finished assistant response (token report spec §2.1): response
+/// `n` of the fixture's session, at `at_ms`, with "x" as its only content.
+fn transcript_line(n: u32, at_ms: i64) -> String {
+    let seconds = format_iso8601(at_ms.div_euclid(1000));
+    json!({
+        "type": "assistant",
+        "requestId": format!("req_inv_{n}"),
+        "sessionId": "inv-session",
+        "timestamp": format!("{}.000Z", seconds.trim_end_matches('Z')),
+        "cwd": "/work/app",
+        "isSidechain": false,
+        "message": {
+            "id": format!("msg_inv_{n}"),
+            "model": "claude-opus-5-5",
+            "content": [{"type": "text", "text": "x"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 30,
+            },
+        },
+    })
+    .to_string()
+}
+
+/// What `tokens` and `sight_sessions` read in the default home (token report spec §2.1, §2.4):
+/// a session's transcript in the fixture's project, with two responses in the hour before the
+/// fixture's clock, and the record of that session's live process.
+fn seed_a_session_and_its_transcript(fx: &Fx) {
+    let home = fx.paths().config_home;
+    let now = fx.engine.now_ms();
+    std::fs::write(
+        home.join("projects/-work-app/inv-session.jsonl"),
+        format!(
+            "{}\n{}\n",
+            transcript_line(1, now - 3_600_000),
+            transcript_line(2, now - 1_800_000)
+        ),
+    )
+    .unwrap();
+    let sessions = home.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let record = json!({"pid": 4242, "sessionId": "inv-session", "cwd": "/work/app",
+                        "startedAt": now - 7_200_000, "kind": "interactive"});
+    std::fs::write(sessions.join("4242.json"), record.to_string()).unwrap();
+    fx.process.set(
+        4242,
+        FakeProcess {
+            exists: Some(true),
+            ..FakeProcess::default()
+        },
+    );
+}
+
+/// The whole index, by day and account, in UTC.
+fn whole_index(fx: &Fx) -> TokenQuery {
+    TokenQuery {
+        provider: fx.provider(),
+        period: TokenPeriod::Day,
+        grouping: TokenGrouping::Account,
+        since_ms: None,
+        until_ms: None,
+        accounts: None,
+        models: None,
+        session: None,
+        tz: jiff::tz::TimeZone::UTC,
+    }
+}
+
 fn run_every_command(platform: Platform) {
     run_every_command_on(&Fx::with_platform(platform));
 }
@@ -283,6 +357,31 @@ fn run_every_command_on(fx: &Fx) {
     });
     check(fx, "statusline", || {
         drop(fx.engine.statusline(&fx.provider()).unwrap())
+    });
+
+    // The token report (token report spec §15: `tokens` joins §15.3's byte-identity test). A
+    // refresh reads the transcripts and the session records, and writes only tagteam's store.
+    seed_a_session_and_its_transcript(fx);
+    check(fx, "tokens", || {
+        let outcome = fx
+            .engine
+            .refresh_tokens(
+                &fx.provider(),
+                Wait::Wait,
+                None,
+                fx.engine.cancel(),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, RefreshOutcome::Done(report) if report.complete),
+            "{outcome:?}"
+        );
+        let report = fx.engine.token_report(&whole_index(fx)).unwrap();
+        assert_eq!(report.total.responses, 2, "the transcript was indexed");
+    });
+    check(fx, "sight_sessions", || {
+        fx.engine.sight_sessions(&fx.provider()).unwrap();
     });
 
     check(fx, "remove", || drop(fx.engine.remove(&k).unwrap()));
