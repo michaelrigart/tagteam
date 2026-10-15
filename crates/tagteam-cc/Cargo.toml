@@ -17,6 +17,7 @@ tagteam-provider.workspace = true
 fastrand.workspace = true
 hex.workspace = true
 libc.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
@@ -25,6 +26,7 @@ unicode-normalization.workspace = true
 
 [dev-dependencies]
 tagteam-provider = { workspace = true, features = ["file-keychain"] }
+proptest.workspace = true
 tempfile.workspace = true
 
 [lints]

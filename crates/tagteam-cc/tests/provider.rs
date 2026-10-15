@@ -693,7 +693,7 @@ fn claude_code_has_every_capability_and_the_kind_table() {
             api_keys: true,
             sessions: true,
             statusline: true,
-            transcripts: false,
+            transcripts: true,
         }
     );
     for kind in f.cc.credential_kinds() {
@@ -709,6 +709,32 @@ fn claude_code_has_every_capability_and_the_kind_table() {
         }
     );
     assert!(f.cc.kind_traits("oauth").refreshable);
+}
+
+#[test]
+fn claude_code_reads_transcripts_under_its_config_home() {
+    // Token report spec §2.1, §3.2 and ruling R2: the default home's `projects/` and
+    // `sessions/`, the parser of `tagteam_cc::transcripts` and the shipped price table.
+    let f = fx();
+    let home = f.env.home.join(".claude");
+    assert_eq!(
+        f.cc.default_session_records_dir(&f.env),
+        Some(home.join("sessions"))
+    );
+    assert!(std::ptr::eq(
+        f.cc.price_table(),
+        &tagteam_cc::prices::PRICES
+    ));
+    assert_eq!(
+        f.cc.transcript_files(&f.env).unwrap(),
+        Vec::<PathBuf>::new()
+    );
+    let session = home.join("projects/-w/s.jsonl");
+    fs::create_dir_all(session.parent().unwrap()).unwrap();
+    fs::write(&session, b"").unwrap();
+    assert_eq!(f.cc.transcript_files(&f.env).unwrap(), vec![session]);
+    assert_eq!(f.cc.parse_usage_line(br#"{"type":"user"}"#), Ok(None));
+    assert!(f.cc.parse_usage_line(br#"{"type":"assistant"}"#).is_err());
 }
 
 #[test]
