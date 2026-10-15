@@ -3270,9 +3270,13 @@ version = "20261014.2045.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "serde_json",
+ "tagteam-cc",
  "tagteam-core",
  "tagteam-engine",
+ "tagteam-fake",
  "tagteam-provider",
+ "tempfile",
  "unicode-width",
 ]
 

@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::Engine;
+use tagteam_engine::collect::{CollectMode, Collected};
 use tagteam_engine::error::EngineError;
-use tagteam_engine::views::{HistoryView, ProviderAccounts};
-
+use tagteam_engine::views::{HistoryView, ProviderAccounts, ShellAccount, StatusView};
+use tagteam_provider::RunShell;
 /// A read that failed, in the CLI's own words (`kind` is the JSON `error.type`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceError {
@@ -54,7 +55,6 @@ pub trait Source {
 pub type SourceFactory = Arc<dyn Fn() -> Box<dyn Source> + Send + Sync>;
 
 pub struct EngineSource {
-    #[allow(dead_code)]
     engine: Engine,
 }
 
@@ -65,16 +65,72 @@ impl EngineSource {
 }
 
 impl Source for EngineSource {
-    fn accounts(&self, _provider: Option<&ProviderId>) -> Result<AccountsSnapshot, SourceError> {
-        unimplemented!("EngineSource::accounts")
+    /// `list`'s view (`Engine::accounts`), with what the TUI shows around it: the run shell's
+    /// own account (`shell_account`), the live login when tagteam does not manage it
+    /// (`status`), whether this is a run shell, and the engine clock.
+    fn accounts(&self, provider: Option<&ProviderId>) -> Result<AccountsSnapshot, SourceError> {
+        let engine = &self.engine;
+        let providers = engine.accounts(provider)?;
+        let this = match engine.shell_account()? {
+            ShellAccount::Managed(row) => Some(row.id),
+            ShellAccount::NotInShell | ShellAccount::Unmanaged => None,
+        };
+        // Only a provider with no managed account active can have an unmanaged live login;
+        // asking `status` then reads its view once more. One it cannot read is no reason to
+        // fail the views: `list` shows no such login either.
+        let live = provider.unwrap_or(engine.default_provider());
+        let managed = providers
+            .iter()
+            .any(|p| &p.provider == live && p.active_position.is_some());
+        let unmanaged_live = match managed {
+            true => None,
+            false => match engine.status(live) {
+                Ok(StatusView::Unmanaged { email }) => Some(email),
+                Ok(StatusView::NoLogin | StatusView::Managed { .. }) | Err(_) => None,
+            },
+        };
+        Ok(AccountsSnapshot {
+            providers,
+            this,
+            unmanaged_live,
+            in_run_shell: matches!(engine.run_shell(), RunShell::Inside { .. }),
+            read_at_s: engine.now_ms().div_euclid(1000),
+        })
     }
 
-    fn history(&self, _account: &AccountId, _since_s: i64) -> Result<HistoryView, SourceError> {
-        unimplemented!("EngineSource::history")
+    /// `history`'s view (core §13.4) of every relevant window since `since_s`.
+    fn history(&self, account: &AccountId, since_s: i64) -> Result<HistoryView, SourceError> {
+        Ok(self.engine.history(account, None, since_s)?)
     }
 
-    fn collect_due(&self, _accounts: &[AccountId]) -> Result<CollectSummary, SourceError> {
-        unimplemented!("EngineSource::collect_due")
+    /// `list`'s on-demand collection (core §8.3): the collector fetches only what is due.
+    /// `fetched` counts the accounts whose stored usage changed.
+    fn collect_due(&self, accounts: &[AccountId]) -> Result<CollectSummary, SourceError> {
+        if accounts.is_empty() {
+            return Ok(CollectSummary {
+                fetched: 0,
+                warnings: vec![],
+            });
+        }
+        let report = self.engine.collect_usage(CollectMode::OnDemand {
+            accounts: accounts.to_vec(),
+        })?;
+        Ok(CollectSummary {
+            fetched: report.outcomes.iter().filter(|(_, c)| recorded(c)).count(),
+            warnings: report.warnings,
+        })
+    }
+}
+
+/// Whether one account's collection changed what the views show (`Collected`): a reading was
+/// recorded (`Recorded`), or a failure was (`Failed`, and `OverBudget`, which the store records
+/// as an `over-budget` failure). `Failed { kind: "error" }` recorded nothing, nor did
+/// `Ineligible`, `Dropped` or `Unsupported`.
+fn recorded(c: &Collected) -> bool {
+    match c {
+        Collected::Recorded | Collected::OverBudget { .. } => true,
+        Collected::Failed { kind } => kind != "error",
+        Collected::Ineligible(_) | Collected::Dropped | Collected::Unsupported => false,
     }
 }
 
