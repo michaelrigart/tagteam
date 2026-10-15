@@ -20,6 +20,8 @@ pub struct KeychainBackoff {
     level: u32,
     /// When the current delay ends, epoch ms.
     until_ms: Option<i64>,
+    /// The delay `until_ms` was set for, ms.
+    delay_ms: i64,
 }
 
 impl KeychainBackoff {
@@ -33,6 +35,7 @@ impl KeychainBackoff {
         if reads.answered > 0 {
             self.level = 0;
             self.until_ms = None;
+            self.delay_ms = 0;
             return None;
         }
         if reads.looks_locked() {
@@ -43,6 +46,7 @@ impl KeychainBackoff {
         }
         let delay = (START_MS << (self.level - 1).min(5)).min(CAP_MS);
         self.until_ms = Some(now_ms.saturating_add(delay));
+        self.delay_ms = delay;
         Some(delay)
     }
 
@@ -54,8 +58,17 @@ impl KeychainBackoff {
     }
 
     /// When the current delay ends, epoch ms.
+    #[cfg(test)]
     pub(crate) fn until_ms(&self) -> Option<i64> {
         self.until_ms
+    }
+
+    /// The most a job still has to wait, from `now_ms`: the time left to `until_ms`, never more
+    /// than the delay itself, since a wall clock set back would otherwise stretch the wait
+    /// (D4.2). `None` while not backing off.
+    pub(crate) fn wait_ms(&self, now_ms: i64) -> Option<i64> {
+        self.until_ms
+            .map(|until| until.saturating_sub(now_ms).clamp(0, self.delay_ms))
     }
 }
 
@@ -86,6 +99,7 @@ mod tests {
                 })
             );
             assert_eq!(b.until_ms(), Some(now + delay));
+            assert_eq!(b.wait_ms(now), Some(delay));
             delays.push(delay / 1000);
             now += delay;
         }
@@ -114,9 +128,23 @@ mod tests {
             locked: 3,
         };
         assert_eq!(b.after_run(mixed, NOW + 300_000), None);
-        assert_eq!((b.current(), b.until_ms()), (None, None));
+        assert_eq!(
+            (b.current(), b.until_ms(), b.wait_ms(NOW)),
+            (None, None, None)
+        );
         // The next locked run starts again from 60 s.
         assert_eq!(b.after_run(locked(), NOW + 360_000), Some(60_000));
+    }
+
+    #[test]
+    fn the_wait_left_never_exceeds_the_delay_whatever_the_clock_does() {
+        let mut b = KeychainBackoff::new();
+        b.after_run(locked(), NOW);
+        assert_eq!(b.wait_ms(NOW + 20_000), Some(40_000));
+        assert_eq!(b.wait_ms(NOW + 60_000), Some(0));
+        assert_eq!(b.wait_ms(NOW + 90_000), Some(0));
+        // A clock set back an hour: 60 s, not 3 660 s.
+        assert_eq!(b.wait_ms(NOW - 3_600_000), Some(60_000));
     }
 
     #[test]
