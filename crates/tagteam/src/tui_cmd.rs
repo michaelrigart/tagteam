@@ -91,12 +91,7 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
         }
     };
     let host = Arc::new(CliHost::new(&ctx, shutdown.clone(), exe));
-    let screen = match &cli.command {
-        Some(Command::Tui {
-            screen: Some(ScreenArg::History),
-        }) => Screen::History,
-        _ => Screen::Accounts,
-    };
+    let screen = screen_for(cli);
     let opts = TuiOptions {
         screen,
         color,
@@ -126,4 +121,38 @@ fn sources(ctx: Context, provider: Option<ProviderId>) -> SourceFactory {
             app::build_engine(ctx, registry, run_shell, env, provider.as_ref());
         Box::new(EngineSource::new(engine)) as Box<dyn Source>
     })
+}
+
+/// The screen `tui` opens on: the one it names, else Accounts. Every `ScreenArg` is matched, so
+/// a new one cannot open Accounts unnoticed.
+fn screen_for(cli: &Cli) -> Screen {
+    match &cli.command {
+        Some(Command::Tui {
+            screen: Some(arg), ..
+        }) => match arg {
+            ScreenArg::Accounts => Screen::Accounts,
+            ScreenArg::History => Screen::History,
+        },
+        _ => Screen::Accounts,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn tui_opens_on_the_screen_it_names_and_on_accounts_otherwise() {
+        for (args, screen) in [
+            (&["tagteam", "tui", "history"][..], Screen::History),
+            (&["tagteam", "tui", "accounts"], Screen::Accounts),
+            (&["tagteam", "tui"], Screen::Accounts),
+            (&["tagteam"], Screen::Accounts),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(screen_for(&cli), screen, "{args:?}");
+        }
+    }
 }
