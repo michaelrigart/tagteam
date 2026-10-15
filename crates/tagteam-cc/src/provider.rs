@@ -257,6 +257,7 @@ impl Provider for ClaudeCode {
             api_keys: true,
             sessions: true,
             statusline: true,
+            transcripts: false,
         }
     }
 

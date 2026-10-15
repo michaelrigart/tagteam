@@ -19,6 +19,7 @@ pub mod reservation;
 pub mod security;
 pub mod splice;
 pub mod term;
+pub mod transcript;
 
 /// Serialises the lib tests that fork a child or drop a flock and re-lock it: a child forked in
 /// that window briefly holds a duplicate of the lock's open file description, so the re-lock
@@ -81,3 +82,4 @@ pub use reservation::{LaunchReservation, remove_dead_reservations};
 pub use tagteam_core::pace::Pace;
 pub use tagteam_core::poll::PollBudget;
 pub use tagteam_core::usage::Window;
+pub use transcript::{LineError, UsageLine};

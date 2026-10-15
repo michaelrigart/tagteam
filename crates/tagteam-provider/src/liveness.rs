@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::read::{Read, ReadError};
 
-/// One `<config_home>/sessions/<pid>.json` (Appendix A.7), reduced to what liveness needs.
+/// One `<config_home>/sessions/<pid>.json` (Appendix A.7), reduced to what liveness and the
+/// token report's sightings need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
     pub pid: u32,
@@ -20,6 +21,8 @@ pub struct SessionRecord {
     /// `startedAt`, epoch ms.
     pub started_at_ms: Option<i64>,
     pub kind: Option<String>,
+    /// `sessionId`; `None` when absent or not text (token report spec §2.4).
+    pub session_id: Option<String>,
 }
 
 /// A record nested deeper than this is malformed (§12.6 "deep nesting").
@@ -83,6 +86,10 @@ pub fn parse_session_record(bytes: &[u8]) -> Result<SessionRecord, String> {
         proc_start,
         started_at_ms: o.get("startedAt").and_then(Value::as_i64),
         kind: o.get("kind").and_then(Value::as_str).map(str::to_owned),
+        session_id: o
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -256,6 +263,11 @@ pub trait ProcessProbe: Send + Sync {
     fn start_ticks(&self, pid: u32) -> Option<u64>;
     /// Whether the executable name or the arguments contain `needle`.
     fn mentions(&self, pid: u32, needle: &str) -> Option<bool>;
+    /// The parent's pid, for the statusline's walk to its session (token report spec §6.3,
+    /// ruling R3). `None` when it cannot be determined, or the process has no parent.
+    fn parent_pid(&self, _pid: u32) -> Option<u32> {
+        None
+    }
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -321,6 +333,10 @@ impl ProcessProbe for SystemProcessProbe {
             (Some(one), None) | (None, Some(one)) if contains(&one, needle) => Some(true),
             _ => None,
         }
+    }
+
+    fn parent_pid(&self, pid: u32) -> Option<u32> {
+        crate::process::parent_of(pid).ok()?
     }
 }
 
@@ -419,6 +435,8 @@ pub struct FakeProcess {
     pub start_ticks: Option<u64>,
     /// `mentions`' answer, whatever the needle.
     pub mentions_launch: Option<bool>,
+    /// `parent_pid`'s answer.
+    pub ppid: Option<u32>,
 }
 
 /// Tests only (no feature gate: it touches nothing). Unknown pids are `exists: Some(false)`.
@@ -466,6 +484,10 @@ impl ProcessProbe for FakeProcessProbe {
 
     fn mentions(&self, pid: u32, _needle: &str) -> Option<bool> {
         self.get(pid)?.mentions_launch
+    }
+
+    fn parent_pid(&self, pid: u32) -> Option<u32> {
+        self.get(pid)?.ppid
     }
 }
 
@@ -537,6 +559,7 @@ mod tests {
                 proc_start: Some("Thu Oct  1 12:34:56 2026".into()),
                 started_at_ms: Some(1_790_858_096_000),
                 kind: Some("bg".into()),
+                session_id: Some("s".into()),
             }
         );
         assert_eq!(
@@ -545,7 +568,8 @@ mod tests {
                 pid: 7,
                 proc_start: None,
                 started_at_ms: None,
-                kind: None
+                kind: None,
+                session_id: None,
             }
         );
     }
@@ -573,9 +597,30 @@ mod tests {
                 pid: 7,
                 proc_start: None,
                 started_at_ms: None,
-                kind: None
+                kind: None,
+                session_id: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_session_record_reads_session_id() {
+        // Token report spec §2.4: a record names its session; anything but text is no id.
+        let id = |v: Value| record(v).unwrap().session_id;
+        assert_eq!(
+            id(json!({"pid": 7, "sessionId": "0193-abc"})).as_deref(),
+            Some("0193-abc")
+        );
+        assert_eq!(id(json!({"pid": 7})), None);
+        for odd in [
+            json!(null),
+            json!(7),
+            json!(true),
+            json!({"id": "s"}),
+            json!(["s"]),
+        ] {
+            assert_eq!(id(json!({"pid": 7, "sessionId": odd})), None);
+        }
     }
 
     #[test]
@@ -798,6 +843,7 @@ mod tests {
             proc_start: proc_start.map(str::to_owned),
             started_at_ms,
             kind: Some("interactive".into()),
+            session_id: None,
         }
     }
 
@@ -948,6 +994,7 @@ mod tests {
                         start_time_s: known_start.then_some(start),
                         start_ticks: None,
                         mentions_launch: mentions,
+                        ppid: None,
                     },
                 );
                 assert_eq!(
@@ -958,6 +1005,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fake_probe_reports_its_ppid() {
+        let probe = FakeProcessProbe::new();
+        probe.set(
+            100,
+            FakeProcess {
+                ppid: Some(42),
+                ..running(STARTED)
+            },
+        );
+        probe.set(101, running(STARTED));
+        assert_eq!(probe.parent_pid(100), Some(42));
+        assert_eq!(probe.parent_pid(101), None, "unknown when not set");
+        assert_eq!(probe.parent_pid(102), None, "an unknown pid has no parent");
     }
 
     #[test]
@@ -1035,6 +1098,7 @@ mod tests {
             proc_start: Some(lstart_of(start)),
             started_at_ms: Some(start * 1000),
             kind: None,
+            session_id: None,
         };
         assert!(record_is_live(&p, &mine, stranger));
         let recycled = SessionRecord {
@@ -1076,6 +1140,7 @@ mod tests {
             proc_start: None,
             started_at_ms: None,
             kind: None,
+            session_id: None,
         };
         assert!(!record_is_live(&p, &gone, "claude"));
     }

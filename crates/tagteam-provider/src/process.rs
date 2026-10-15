@@ -56,9 +56,10 @@ pub enum Liveness {
     Unknown(String),
 }
 
-/// `/proc/<pid>/stat` field 22, counted after the last `)`.
+/// Field `n` (3 or later) of `/proc/<pid>/stat`, counted after the last `)`; `None` when no
+/// process has the pid.
 #[cfg(target_os = "linux")]
-pub(crate) fn start_of(pid: u32) -> io::Result<Option<u64>> {
+fn stat_field(pid: u32, n: usize) -> io::Result<Option<u64>> {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -68,18 +69,32 @@ pub(crate) fn start_of(pid: u32) -> io::Result<Option<u64>> {
         .rfind(')')
         .map(|i| &stat[i + 1..])
         .ok_or_else(|| io::Error::other("bad stat"))?;
-    // `after` starts at field 3; field 22 is the 20th item.
+    // `after` starts at field 3.
     after
         .split_whitespace()
-        .nth(19)
+        .nth(n - 3)
         .and_then(|f| f.parse().ok())
         .map(Some)
         .ok_or_else(|| io::Error::other("bad stat"))
 }
 
-/// `proc_pidinfo(PROC_PIDTBSDINFO)` start time, in microseconds.
-#[cfg(target_os = "macos")]
+/// `/proc/<pid>/stat` field 22.
+#[cfg(target_os = "linux")]
 pub(crate) fn start_of(pid: u32) -> io::Result<Option<u64>> {
+    stat_field(pid, 22)
+}
+
+/// `/proc/<pid>/stat` field 4. `None` when no process has the pid, or it has no parent.
+#[cfg(target_os = "linux")]
+pub(crate) fn parent_of(pid: u32) -> io::Result<Option<u32>> {
+    Ok(stat_field(pid, 4)?
+        .and_then(|p| u32::try_from(p).ok())
+        .filter(|p| *p > 0))
+}
+
+/// `proc_pidinfo(PROC_PIDTBSDINFO)`; `None` when no process has the pid.
+#[cfg(target_os = "macos")]
+fn bsd_info(pid: u32) -> io::Result<Option<libc::proc_bsdinfo>> {
     // SAFETY: `proc_bsdinfo` is a C struct of plain integers; the zeroed value is a valid
     // bit pattern for it and is fully overwritten by `proc_pidinfo` below on success.
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -95,9 +110,7 @@ pub(crate) fn start_of(pid: u32) -> io::Result<Option<u64>> {
         )
     };
     if n == size {
-        return Ok(Some(
-            info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
-        ));
+        return Ok(Some(info));
     }
     let e = io::Error::last_os_error();
     if e.raw_os_error() == Some(libc::ESRCH) {
@@ -105,6 +118,19 @@ pub(crate) fn start_of(pid: u32) -> io::Result<Option<u64>> {
     } else {
         Err(e)
     }
+}
+
+/// `proc_pidinfo(PROC_PIDTBSDINFO)` start time, in microseconds.
+#[cfg(target_os = "macos")]
+pub(crate) fn start_of(pid: u32) -> io::Result<Option<u64>> {
+    Ok(bsd_info(pid)?.map(|info| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec))
+}
+
+/// `pbi_ppid` of the same `proc_bsdinfo`. `None` when no process has the pid, or it has no
+/// parent.
+#[cfg(target_os = "macos")]
+pub(crate) fn parent_of(pid: u32) -> io::Result<Option<u32>> {
+    Ok(bsd_info(pid)?.map(|info| info.pbi_ppid).filter(|p| *p > 0))
 }
 
 /// What to run, and the environment and directory to run it in (§12.3 step 8, §12.5). The
@@ -470,6 +496,23 @@ mod tests {
         };
         assert_eq!(gone.liveness(), Liveness::Dead);
         assert!(!gone.is_live());
+    }
+
+    #[test]
+    fn parent_of_the_current_process_is_its_parent() {
+        use crate::liveness::{ProcessProbe, SystemProcessProbe};
+        let parent = std::os::unix::process::parent_id();
+        assert_eq!(parent_of(std::process::id()).unwrap(), Some(parent));
+        assert_eq!(
+            SystemProcessProbe.parent_pid(std::process::id()),
+            Some(parent)
+        );
+        assert_eq!(
+            parent_of(i32::MAX as u32).unwrap(),
+            None,
+            "no process has it"
+        );
+        assert_eq!(SystemProcessProbe.parent_pid(i32::MAX as u32), None);
     }
 
     #[test]
