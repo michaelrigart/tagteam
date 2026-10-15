@@ -239,6 +239,18 @@ fn merged_from_row(r: &Row<'_>) -> rusqlite::Result<Merged> {
     })
 }
 
+/// Spec §2.2's rule for a later line of a response already held: the earliest time, each
+/// count's maximum, the newer speed when it has one, and final once either line is. `into`
+/// keeps its session, project, model and sidechain flag, as the upsert does.
+pub(crate) fn merge_line(into: &mut UsageRow, row: &UsageRow) {
+    into.at_ms = into.at_ms.min(row.at_ms);
+    into.counts.merge_max(&row.counts);
+    if row.speed.is_some() {
+        into.speed = row.speed.clone();
+    }
+    into.finalized |= row.finalized;
+}
+
 /// `rows`, one per key: a key's later rows merge into its first by the rule of spec §2.2, and
 /// the first keeps its session, project, model and sidechain flag, as the upsert does.
 fn merge_batch(rows: &[UsageRow]) -> Vec<UsageRow> {
@@ -246,15 +258,7 @@ fn merge_batch(rows: &[UsageRow]) -> Vec<UsageRow> {
     let mut out: Vec<UsageRow> = Vec::with_capacity(rows.len());
     for row in rows {
         match at.get(&row.key) {
-            Some(&i) => {
-                let first = &mut out[i];
-                first.at_ms = first.at_ms.min(row.at_ms);
-                first.counts.merge_max(&row.counts);
-                if row.speed.is_some() {
-                    first.speed = row.speed.clone();
-                }
-                first.finalized |= row.finalized;
-            }
+            Some(&i) => merge_line(&mut out[i], row),
             None => {
                 at.insert(row.key, out.len());
                 out.push(row.clone());
@@ -642,15 +646,20 @@ impl Store {
     /// completes, so a prune stopped call after call still finishes. Stopped, the prune
     /// releases its lease and returns `complete: false`: the next call goes on. Another
     /// prune's lease, held or spent today, is nothing to do: `complete: true` with nothing
-    /// deleted.
+    /// deleted. Like a batch, it writes nothing and answers `TokenIndexPurged` when the
+    /// index's generation is no longer `epoch`, what `begin_token_refresh` gave the refresh;
+    /// checked in each chunk's transaction, and a lease it holds is released first.
     pub fn prune_tokens(
         &self,
         provider: &ProviderId,
+        epoch: i64,
         cutoff_ms: i64,
         holder: &str,
         now_ms: i64,
         stop: &dyn Fn() -> bool,
     ) -> Result<PruneOutcome, StoreError> {
+        // A prune of a purged index writes nothing, not even its lease or the state row.
+        same_generation(&self.lock(), epoch)?;
         let lease = prune_lease(provider);
         let taken = self.lock().execute(
             TAKE_LEASE_SQL,
@@ -680,6 +689,15 @@ impl Store {
             }
             let mut c = self.lock();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if let Err(e) = same_generation(&tx, epoch) {
+                drop(tx);
+                drop(c);
+                self.exec(
+                    "UPDATE leases SET expires_at = ?3 WHERE name = ?1 AND holder = ?2",
+                    &[&lease, &holder, &now_ms],
+                )?;
+                return Err(e);
+            }
             let n = if phase == 0 {
                 let n = prune_chunk(&tx, provider, cutoff_ms, now_ms)?;
                 deleted += n as u64;

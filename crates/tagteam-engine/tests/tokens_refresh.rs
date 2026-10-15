@@ -866,3 +866,140 @@ fn the_claude_code_fixture_tree_is_indexed() {
         "and nothing on the next"
     );
 }
+
+#[test]
+fn a_deleted_transcript_drops_its_file_row_and_keeps_its_usage() {
+    // Spec §5.2 step 2: the rows of files no longer found are removed; their usage stays. With
+    // nothing else to read, the removal is a commit of its own.
+    let ffx = FakeFx::new();
+    let (env, p) = (&ffx.fx.env, ffx.fake_provider());
+    let a = append_transcript(env, "a.jsonl", &line(&response("m1", 2, true)));
+    let b = append_transcript(env, "b.jsonl", &line(&response("m2", 3, true)));
+    refresh(&ffx.engine, &p);
+    assert_eq!(files(&ffx.engine, &p).len(), 2);
+    fs::remove_file(&b).unwrap();
+
+    let report = refresh(&ffx.engine, &p);
+    assert!(report.complete);
+    assert_eq!(
+        (
+            report.files_read,
+            report.responses_added,
+            report.skipped_lines
+        ),
+        (0, 0, 0)
+    );
+    let stored = files(&ffx.engine, &p);
+    assert_eq!(stored.len(), 1);
+    file(&stored, &a);
+    assert_eq!(rows(&ffx.engine, &p).len(), 2, "its usage stays");
+    assert_eq!(row(&ffx.engine, &p, "m2").counts.output, 3);
+    let stats = ffx
+        .engine
+        .store()
+        .unwrap()
+        .token_state(&p)
+        .unwrap()
+        .unwrap()
+        .stats;
+    assert_eq!(
+        (stats.files, stats.responses, stats.unreadable_files),
+        (1, 2, 0)
+    );
+}
+
+#[test]
+fn a_truncated_or_rewritten_transcript_is_read_again_from_the_start() {
+    // Spec §5.2 step 2: a file that shrank, or whose head no longer matches, is not resumed at
+    // its old offset: it is read from 0, and each response counts once.
+    let ffx = FakeFx::new();
+    let (env, p) = (&ffx.fx.env, ffx.fake_provider());
+    let path = append_transcript(
+        env,
+        "a.jsonl",
+        &[
+            line(&response("m1", 5, false)),
+            line(&response("m2", 7, true)),
+            line(&response("m3", 9, true)),
+        ]
+        .concat(),
+    );
+    refresh(&ffx.engine, &p);
+
+    // Truncated to a shorter file with other content.
+    let shorter = [
+        line(&response("m1", 40, true)),
+        line(&response("m4", 1, true)),
+    ]
+    .concat();
+    fs::write(&path, &shorter).unwrap();
+    let report = refresh(&ffx.engine, &p);
+    assert!(report.complete);
+    assert_eq!(
+        (
+            report.files_read,
+            report.responses_added,
+            report.responses_updated
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(rows(&ffx.engine, &p).len(), 4, "m1 to m4, each once");
+    assert_eq!(row(&ffx.engine, &p, "m1").counts.output, 40);
+    let len = fs::metadata(&path).unwrap().len();
+    let f = file(&files(&ffx.engine, &p), &path).clone();
+    assert_eq!((f.offset, f.size), (len, len as i64));
+
+    // Rewritten longer than before, with a new head.
+    let longer: String = (5..15)
+        .map(|i| line(&response(&format!("m{i}"), 1, true)))
+        .collect();
+    fs::write(&path, &longer).unwrap();
+    let report = refresh(&ffx.engine, &p);
+    assert_eq!((report.files_read, report.responses_added), (1, 10));
+    assert_eq!(rows(&ffx.engine, &p).len(), 14);
+    let len = fs::metadata(&path).unwrap().len();
+    let f = file(&files(&ffx.engine, &p), &path).clone();
+    assert_eq!((f.offset, f.size), (len, len as i64));
+}
+
+#[test]
+fn unreadable_files_do_not_use_up_a_spent_budget() {
+    // More unreadable files, sorted first, than workers: under a zero budget a worker's one
+    // guaranteed file is one it reads, so the readable file after them is still reached.
+    let ffx = FakeFx::new();
+    let (env, p) = (&ffx.fx.env, ffx.fake_provider());
+    let mut locked = Vec::new();
+    for i in 0..6 {
+        let path = append_transcript(env, &format!("a{i}.jsonl"), &line(&response("x", 1, true)));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        locked.push(path);
+    }
+    append_transcript(env, "z.jsonl", &line(&response("m1", 2, true)));
+    let restore = |locked: &[PathBuf]| {
+        for path in locked {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    };
+    if fs::File::open(&locked[0]).is_ok() {
+        // A privileged run reads files of mode 000: none can be made unreadable here.
+        restore(&locked);
+        return;
+    }
+
+    let outcome = ffx
+        .engine
+        .refresh_tokens(
+            &p,
+            Wait::Wait,
+            Some(Duration::ZERO),
+            &Cancel::new(),
+            &mut |_: &IndexProgress| {},
+        )
+        .unwrap();
+    restore(&locked);
+    let RefreshOutcome::Done(report) = outcome else {
+        panic!("nothing else refreshes");
+    };
+    assert_eq!(report.responses_added, 1, "z.jsonl was read");
+    assert_eq!(rows(&ffx.engine, &p).len(), 1);
+}
