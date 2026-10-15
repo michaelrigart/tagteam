@@ -2228,10 +2228,11 @@ death.
 
 **Token evidence** ([token report spec] §6.1). For a provider with `transcripts`, `run` records
 an open launch for the account just before step 7, and the child's pid once it is spawned. While
-the child runs, a scoped thread reads the child's session record every 2 s, when its mtime
-changed, and records the session it names as seen in the profile's home. After exit handling,
-`run` ends that sighting and closes the launch, unless the profile is still in use. None of this
-changes the exit code, and the plain-`claude` paths record nothing.
+the child runs, a scoped thread checks the child's session record every 50 ms, reading it when
+its mtime changed, and every 2 s records the session it names as seen in the profile's home.
+After exit handling, `run` ends that sighting at the last read that named it and closes the
+launch, unless the profile is still in use. None of this changes the exit code, and the
+plain-`claude` paths record nothing.
 
 **Signals** (§14.1 sets the general rules; these are `run`'s):
 - **Before the spawn**, every lock wait is a cancellation point, and so is the wait for the

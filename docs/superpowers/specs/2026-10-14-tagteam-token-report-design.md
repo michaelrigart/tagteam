@@ -29,7 +29,7 @@ Claude Code deletes transcripts after 30 days by default; this machine's span 20
 1. `tagteam tokens` totals per model equal an independent count over the same transcripts with
    the dedup rule of §2.2, to the token.
 2. Every response is attributed to an account, or shown as unattributed; no response is
-   counted twice. Under §7.4's two assumptions, none is attributed to an account it cannot
+   counted twice. Under §7.4's three assumptions, none is attributed to an account it cannot
    have used (§7).
 3. A cold index of this machine's 3.42 GB takes ≤ 10 s; a refresh with nothing new takes
    ≤ 100 ms; a 30-day report query takes ≤ 200 ms (release build, Apple silicon).
@@ -237,12 +237,15 @@ CREATE TABLE session_sightings (
   provider    TEXT NOT NULL,
   session_id  TEXT NOT NULL,
   home        TEXT NOT NULL,     -- '' for the default home, else the profile's account id
-  first_at    INTEGER NOT NULL,  -- epoch ms: the record's startedAt, or the first sighting (§6.3)
-  last_at     INTEGER NOT NULL,  -- epoch ms: the last time a source saw it there, alive
+  started_at  INTEGER NOT NULL,  -- epoch ms: the execution, its record's startedAt
+  first_at    INTEGER NOT NULL,  -- epoch ms: the first read that named the session in it
+  last_at     INTEGER NOT NULL,  -- epoch ms: the last read that named it there
   source      TEXT NOT NULL,     -- 'run' | 'scan' | 'statusline': the source that created it
   recorded_at INTEGER NOT NULL,  -- epoch ms of the last write
-  PRIMARY KEY (provider, session_id, home, first_at)
+  PRIMARY KEY (provider, session_id, home, started_at, first_at)
 ) WITHOUT ROWID;
+CREATE INDEX session_sightings_by_execution  -- an execution's tenures, of every session (§6.4)
+  ON session_sightings (provider, home, started_at);
 
 CREATE TABLE run_launches (
   provider    TEXT NOT NULL,
@@ -445,7 +448,8 @@ report (§11.3), as the first sign of transcript format drift (core §17 R2).
 ## 6. Session evidence
 
 Two kinds of evidence place a session:
-- A **sighting** says a session was seen alive in a home from `first_at` to `last_at`.
+- A **sighting** says a session was seen in one execution in a home, from the first read that
+  named it there (`first_at`) to the last (`last_at`).
 - A **launch** says `tagteam run` may have had a profile session running for an account over
   an interval.
 
@@ -470,19 +474,31 @@ impl Engine {
   child started may outlive it; then, as when `run` was killed, the next `sight_sessions` that
   finds the profile no longer in use closes the launch, at that moment. A late close
   over-covers, which can only leave a response unattributed, never misplace it.
-- **Poll.** While its child runs, `run` reads the child's record,
-  `<profile>/sessions/<child pid>.json`, every 2 seconds on a scoped thread, when its mtime
-  changed. For the `sessionId` it sees, it writes the sighting keyed by the record's
-  `startedAt` and sets its `last_at` to now (source `run`). When the child exits, it sets
-  `last_at` of the sighting it saw last to the exit time.
+- **Poll.** While its child runs, `run` checks the child's record,
+  `<profile>/sessions/<child pid>.json`, on every 50 ms tick of a scoped thread: a `stat`, and
+  a read only when its mtime moved since the read that named the current session.
+  - A read of this child's record (its pid, started no earlier than the launch, its process
+    live) that names a session begins a **tenure** at the read. An unchanged mtime, or a read
+    naming the same session under the same `startedAt`, confirms the tenure.
+  - A read naming another session, or another `startedAt`, ends the tenure at its last
+    confirmation and begins the next one.
+  - A read that shows no session (unreadable, not this child's, not live, or gone) confirms
+    nothing, and the next tick reads again.
+  - Every 2 seconds `run` writes what its checks saw (source `run`): the current tenure, to its
+    last confirmation, then each tenure that ended since, newest first, exactly to its last
+    confirmation. A write that fails keeps them for the next.
+- **Exit.** After exit handling, `run` ends the child's tenure at its last confirming read, not
+  at the exit: the child may have left its session after that read. It never ends past the
+  exit, since a check after it, of a record a crash left behind, confirms nothing.
 - A `run` that execs plain `claude` (core §12.1) records neither: §7.2 places that session.
 
 ### 6.2 Scan
 
 Every refresh, and the daemon on its own timer (§12), reads every `*.json` in the default
 home's `sessions/` and in each profile's (source `scan`). For a record whose process is alive
-(core §12.6), the scan writes the sighting `(sessionId, home, startedAt)` and sets `last_at` to
-now. An unreadable or partly written record, or one whose process is gone, is skipped.
+(core §12.6), the scan continues the latest tenure of `sessionId` in that execution
+(`home`, `startedAt`) to now, or begins one now (§6.4). An unreadable or partly written record,
+or one whose process is gone, is skipped.
 
 ### 6.3 Statusline
 
@@ -496,20 +512,29 @@ environment. Stdin stays drained and ignored (core §13.5).
 - **One indexed lookup** reads the session's latest sighting in that home. When its `last_at`
   is within the last minute, there is nothing to do.
 - **Otherwise it finds its execution.** It walks its ancestor processes (at most 8) to the
-  first that has a record in the home's `sessions/`: the Claude Code process it runs under. It
-  then writes the sighting keyed by that record's `startedAt`, as `run` and the scan do, with
-  `last_at` now (source `statusline`). With no such ancestor it records nothing.
+  first that has a record in the home's `sessions/`: the Claude Code process it runs under.
+  That record's `startedAt` is the execution. As the scan does, the statusline continues the
+  session's latest tenure there to now, or begins one now (source `statusline`). With no such
+  ancestor it records nothing.
 
   A sighting is only ever extended by the execution it belongs to, so a gap between two
-  executions of a session is never bridged.
+  executions of a session is never bridged, nor a gap within one (§6.4).
 - **The write** waits at most the 5 ms the live-identity cache already allows
   (`CACHE_WRITE_WAIT`). A busy store skips it; the line is never held up for it.
 
 ### 6.4 Writes
 
-- A sighting is one execution of a session in a home, keyed by the process record's
-  `startedAt`. Only that execution's observations extend it, at most once a minute per source,
-  except `run`'s exit write.
+- A sighting is one tenure of a session in one execution in a home: the reads of that
+  execution's record, keyed by its `startedAt`, that named the session. It begins at the first
+  read that named the session in the execution, never at the record's `startedAt` or a file's
+  mtime, and ends at the last read that named it. A read that shows no session confirms
+  nothing and extends nothing.
+- `run` keeps its tenures itself (§6.1). The scan and the statusline keep no state: a read
+  continues the latest tenure of its session in the execution, or begins one at the read. It
+  begins one too when the execution was seen naming another session at or after that tenure's
+  end: the session may have left in between, so the gap is never bridged.
+- A source extends a tenure at most once a minute. `run` sets a tenure's end exactly when it
+  ends.
 - Every write sets `recorded_at`, which moves `IndexState.changed_at_ms` (§10).
 
 ---
@@ -561,7 +586,7 @@ unattributed.
 
 ### 7.4 Assumptions and known limits
 
-The rules above place a response only where the evidence allows one home, under two
+The rules above place a response only where the evidence allows one home, under three
 assumptions:
 
 - **A1.** A session runs in one execution at a time. Two executions of one session in
@@ -570,23 +595,33 @@ assumptions:
 - **A2.** The default home's login changes only through tagteam. A login changed outside
   tagteam (CC's own `/login`) is credited to the account tagteam had active, until tagteam
   records the change.
+- **A3.** CC rewrites a session's record when its session changes (§17 T1), and between two
+  reads of one execution's record that name a session, with no read between them naming
+  another, the session stayed in that execution. A session that left an execution and came
+  back between two such reads, unseen, is credited to that home for the time it was away, unless
+  another home sighted it then. `run` reads every 50 ms; the scan and the statusline read far
+  less often.
 
 Known limits:
 
 - A response copied into another transcript file (a resume or fork copy, §2.2) keeps the
   session and sidechain flag of whichever batch committed it first, because the upsert never
-  changes them, and its session's project is the first one known. The counts converge whatever the read order. Session rows can show
-  such a response under either session. It is never attributed to an account it could not have
-  used: at worst it is unattributed. In the real tree 0.3% of responses have a copy under
-  another session id.
+  changes them, and its session's project is the first one known. The counts converge whatever
+  the read order. Session rows can show such a response under either session. It is never
+  attributed to an account it could not have used. Under its own session, its sightings are
+  where it ran. Under the copy's session it is never inside a sighting: that session is sighted
+  only from a read after the copy existed, later than the response, so §7.2 places it, and at
+  worst it is unattributed. In the real tree 0.3% of responses have a copy under another
+  session id.
 - A session CC spawns itself inside a profile writes no record. Its responses fall inside its
   parent's launch, so they are unattributed rather than misplaced.
-- `/clear` starts a new session in the same execution (§17 T1). CC rewrites the same record
-  under the same `startedAt` with the new `sessionId`, so `run`'s poll sights the new session
-  from the record's `startedAt`, before it existed, which covers none of its responses.
+- `/clear` starts a new session in the same execution (§17 T1), and `/resume` switches to
+  another. CC rewrites the same record under the same `startedAt` with the new `sessionId`, and
+  the new session is sighted from the read that first named it.
 - Unattributed usage is larger where evidence is thin: before the epoch while profiles
   existed, and for default-home sessions running alongside a `run` session with neither the
-  daemon nor the statusline sighting them.
+  daemon nor the statusline sighting them. The time before a session's first read in an
+  execution is unsighted too.
 
 ---
 
@@ -979,6 +1014,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
     moves `changed_at`.
   - Evidence:
     - sightings from all three sources, extended at most once a minute;
+    - a session entering a running execution (`/clear`, `/resume`), sighted from the read that
+      first named it and ended at its last confirming read, and a return to it never bridged;
     - the statusline finding its execution through its ancestors, recording nothing without
       one, and never extending another execution's sighting;
     - a launch recorded before the spawn and closed at exit;
