@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tagteam_core::ProviderId;
 use tagteam_daemon::events::{DaemonEvent, DaemonSink, Mode, StopReason, WaitingFor};
 use tagteam_daemon::protocol::{
-    MAX_LINE, RequestId, daemon_event_json, hello_json, ok_json, status_json,
+    MAX_ID_LEN, MAX_LINE, RequestId, daemon_event_json, hello_json, ok_json, status_json,
 };
 use tagteam_daemon::server::{
     BindError, Hub, IDLE, Limits, MAX_CONNECTIONS, MAX_SOCKET_PATH, QUEUE, Server, WRITE_TIMEOUT,
@@ -134,6 +134,38 @@ fn a_malformed_request_is_refused_and_the_connection_stays_open() {
     assert_eq!(unknown["error"]["type"], "unknown-op");
     peer.send(r#"{"id":3,"op":"status"}"#);
     assert_eq!(peer.line()["ok"], true);
+    server.shutdown();
+}
+
+#[test]
+fn a_string_id_over_128_bytes_is_refused_with_a_null_id_and_the_connection_stays_open() {
+    // D5.3: a reply echoes the id, so the longest usable one keeps every reply under
+    // `MAX_LINE`. A request whose id would push its reply over it is refused, id null.
+    let dir = short_tempdir();
+    let (server, _board) = start(dir.path());
+    let mut peer = Peer::greeted(&dir.path().join("daemon.sock"));
+    let at_limit = "i".repeat(MAX_ID_LEN);
+    peer.send(&format!(r#"{{"id":"{at_limit}","op":"status"}}"#));
+    let ok = peer.line();
+    assert_eq!(
+        (ok["ok"].clone(), ok["id"].clone()),
+        (true.into(), at_limit.into())
+    );
+    let over = "i".repeat(MAX_ID_LEN + 1);
+    peer.send(&format!(r#"{{"id":"{over}","op":"status"}}"#));
+    let refused = peer.line();
+    assert_eq!(refused["id"], Value::Null, "{refused}");
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"]["type"], "bad-request");
+    assert!(!refused.to_string().contains(&over));
+    // The largest line a client can have its id echoed in, just under the limit.
+    let long = "i".repeat(MAX_LINE - 40);
+    peer.send(&format!(r#"{{"id":"{long}","op":"status"}}"#));
+    let refused = peer.line();
+    assert_eq!(refused["id"], Value::Null);
+    assert!(refused.to_string().len() < MAX_LINE);
+    peer.send(r#"{"id":3,"op":"status"}"#);
+    assert_eq!(peer.line()["ok"], true, "the connection stays open");
     server.shutdown();
 }
 
