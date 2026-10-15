@@ -13,8 +13,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use common::{
-    assistant_line, cc_timestamp, cmd, expire_vault, login, now_epoch_s, seed_home, std_cmd, turn,
-    two_fresh_accounts, write_transcript,
+    Running, assistant_line, cc_timestamp, cmd, expire_vault, login, now_epoch_s, seed_home,
+    std_cmd, turn, two_fresh_accounts, write_transcript,
 };
 use serde_json::{Value, json};
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
@@ -617,6 +617,35 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
             String::from_utf8_lossy(&tick.stdout)
         );
     }
+    // The daemon (D11): one run at TRACE whose provider job ticks against the server, stopped
+    // by SIGTERM. Notifications are off, since the fixture says macOS, where they would run the
+    // real `osascript`. The notifier's own lines name no account (tagteam-daemon's notify
+    // tests).
+    run(&["config", "set", "notify.enabled", "false"]);
+    let mut daemon = Running::spawn({
+        let mut c = std_cmd(root);
+        c.env(TAGTEAM_LOG, "trace")
+            .env(API_BASE, server.base_url())
+            .args(["daemon", "--json"]);
+        c
+    });
+    daemon.wait_for(Duration::from_secs(20), "its first tick", |out| {
+        [
+            r#""event":"switch""#,
+            r#""event":"no-switch""#,
+            r#""event":"error""#,
+        ]
+        .iter()
+        .any(|kind| out.contains(kind))
+    });
+    daemon.signal(libc::SIGTERM);
+    let out = daemon.finish(Duration::from_secs(10));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     // M5b's commands. A plaintext export holds every token and is read back; an export to an
     // SSH key is opened with the key's file (§13.3). Neither the files' contents nor the key
     // may reach the log.
@@ -705,6 +734,10 @@ fn every_command_at_trace_leaves_no_identity_or_secret_in_the_log() {
         log.contains(" INFO tagteam_engine::store: ")
             && log.contains(" INFO tagteam_engine::vault: "),
         "the commands logged their state changes:\n{log}"
+    );
+    assert!(
+        log.contains(" INFO tagteam_daemon::daemon: "),
+        "the daemon logged its start and stop:\n{log}"
     );
     for line in log.lines() {
         let target = line.split(' ').nth(3).unwrap_or_default();
