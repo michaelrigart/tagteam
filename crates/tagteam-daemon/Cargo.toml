@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The engine's crash and cancellation points, for the scheduler's tests. Never enabled in
+# release builds; `tagteam/test-support` turns it on.
+test-hooks = ["tagteam-engine/test-hooks"]
+
 [dependencies]
 tagteam-core.workspace = true
 tagteam-provider.workspace = true
