@@ -4388,6 +4388,7 @@ git commit -m "Add the transcripts capability, usage lines, record session ids a
 - Create: `crates/tagteam-cc/src/transcripts.rs` (`discover`, the prefilter, `parse_usage_line`)
 - Create: `crates/tagteam-cc/src/prices.rs` (`PRICES`, empty; Task 9 fills it)
 - Create: `crates/tagteam-cc/tests/transcripts.rs`
+- Create: `crates/tagteam-cc/tests/parser_memory.rs` (its own test binary: a counting global allocator pins that a huge `iterations` array is skipped, not collected)
 - Create: `crates/tagteam-cc/tests/fixtures/transcripts/projects/-w-app/11111111-1111-4111-8111-111111111111.jsonl`, `crates/tagteam-cc/tests/fixtures/transcripts/projects/-w-app/11111111-1111-4111-8111-111111111111/subagents/agent-0123456789abcdef.jsonl`, `crates/tagteam-cc/tests/fixtures/transcripts/projects/-w-app/11111111-1111-4111-8111-111111111111/subagents/agent-0123456789abcdef.meta.json`, `crates/tagteam-cc/tests/fixtures/transcripts/projects/-w-app/22222222-2222-4222-8222-222222222222.jsonl`, `crates/tagteam-cc/tests/fixtures/transcripts/projects/-w-lib/33333333-3333-4333-8333-333333333333.jsonl` (synthetic fixture tree; every text field is `"x"`)
 - Modify: `crates/tagteam-core/src/time.rs` (`parse_iso8601` drops the fraction, so this task adds `parse_iso8601_ms`, sharing one parser, with its own tests)
 - Modify: `crates/tagteam-cc/Cargo.toml` (`serde.workspace = true`; dev-dependency `proptest.workspace = true`, already a workspace dependency)
@@ -5186,13 +5187,84 @@ fn the_fixture_tree_parses_to_known_responses() {
  }
 ```
 
+The memory bound needs its own test binary, because it installs a counting global allocator. Create `crates/tagteam-cc/tests/parser_memory.rs`:
+
+```rust
+//! Spec §5.2: a worker's memory stays bounded. Parsing one line holds only a small, fixed amount
+//! beyond the line itself, however long its `usage.iterations` array is (spec §2.2: only the
+//! first entry counts). Its own test binary, so the counting allocator sees nothing else.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use tagteam_cc::transcripts::parse_usage_line;
+
+struct Counting;
+
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: every call is forwarded unchanged to the system allocator; this only counts bytes.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract for `layout` is passed through to `System`.
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            let live = LIVE.fetch_add(layout.size(), Ordering::SeqCst) + layout.size();
+            PEAK.fetch_max(live, Ordering::SeqCst);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from `alloc` above with this `layout`.
+        unsafe { System.dealloc(ptr, layout) };
+        LIVE.fetch_sub(layout.size(), Ordering::SeqCst);
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+#[test]
+fn a_huge_iterations_array_is_skipped_not_collected() {
+    let mut line = String::from(concat!(
+        r#"{"type":"assistant","requestId":"r","sessionId":"s","#,
+        r#""timestamp":"2026-10-14T09:00:00.000Z","isSidechain":false,"#,
+        r#""message":{"id":"m","model":"claude-opus-5-5","stop_reason":"end_turn","#,
+        r#""usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"#,
+        r#""cache_read_input_tokens":0,"iterations":[{"input_tokens":7,"output_tokens":8}"#,
+    ));
+    for _ in 0..200_000 {
+        line.push_str(concat!(
+            r#",{"input_tokens":1,"output_tokens":1,"#,
+            r#""cache_creation_input_tokens":1,"cache_read_input_tokens":1}"#,
+        ));
+    }
+    line.push_str("]}}}");
+    let bytes = line.into_bytes();
+
+    let before = LIVE.load(Ordering::SeqCst);
+    PEAK.store(before, Ordering::SeqCst);
+    let parsed = parse_usage_line(&bytes).unwrap().unwrap();
+    let held = PEAK.load(Ordering::SeqCst) - before;
+
+    assert_eq!((parsed.counts.input, parsed.counts.output), (7, 8));
+    // Collecting the 200,001 entries would hold about 10 MB; skipping them holds a few KB.
+    assert!(
+        held < 64 * 1024,
+        "parsing held {held} bytes beyond the line"
+    );
+}
+```
+
 The prefilter's own unit tests sit at the end of `crates/tagteam-cc/src/transcripts.rs` (Step 3's file, `mod tests`), since the prefilter is private.
 
 - [ ] **Step 2: Run them and see them fail**
 
 ```
 cargo test -p tagteam-core --lib --locked time::
-cargo test -p tagteam-cc --locked --test transcripts --test provider
+cargo test -p tagteam-cc --locked --test transcripts --test provider --test parser_memory
 ```
 
 Expected: `tagteam-core` does not compile its tests: `error[E0425]: cannot find function `parse_iso8601_ms` in this scope`. `tagteam-cc` does not compile them: `error[E0432]: unresolved import `tagteam_cc::transcripts`` and `error[E0433]: failed to resolve: could not find `prices` in `tagteam_cc``.
@@ -5772,7 +5844,7 @@ Expected: no output from fmt; clippy finishes with no warning.
 - [ ] **Step 6: Commit**
 
 ```
-git add Cargo.toml Cargo.lock crates/tagteam-core/src/time.rs crates/tagteam-cc/Cargo.toml crates/tagteam-cc/src/lib.rs crates/tagteam-cc/src/provider.rs crates/tagteam-cc/src/transcripts.rs crates/tagteam-cc/src/prices.rs crates/tagteam-cc/tests/provider.rs crates/tagteam-cc/tests/transcripts.rs crates/tagteam-cc/tests/fixtures/transcripts
+git add Cargo.toml Cargo.lock crates/tagteam-core/src/time.rs crates/tagteam-cc/Cargo.toml crates/tagteam-cc/src/lib.rs crates/tagteam-cc/src/provider.rs crates/tagteam-cc/src/transcripts.rs crates/tagteam-cc/src/prices.rs crates/tagteam-cc/tests/provider.rs crates/tagteam-cc/tests/transcripts.rs crates/tagteam-cc/tests/parser_memory.rs crates/tagteam-cc/tests/fixtures/transcripts
 git commit -m "Read Claude Code transcripts: discovery and the usage line parser"
 ```
 
