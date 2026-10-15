@@ -279,6 +279,13 @@ pub struct IndexState {
 }
 
 impl TokenQuery {
+    /// The grouping the report applies (spec §10.1): the requested one, except that a block
+    /// report is always per account, so `none` becomes `account` and `model` becomes
+    /// `account,model`.
+    pub fn applied_grouping(&self) -> TokenGrouping {
+        group::effective_grouping(self.period, self.grouping)
+    }
+
     /// The query one level down from `row` (spec §10.1), or `None` at a session's per-model
     /// rows. From a day, month or block row: the sessions over its span, filtered to its
     /// account and model when grouped by them. A day or month row counts only what lies in the

@@ -90,7 +90,9 @@ One API response is written as one line per content block, with the same `messag
 its counts is the **maximum** over its lines; its time is the **earliest** line's. When a
 line's top-level counts are all zero and `iterations[0]` is not, the iteration's counts are
 used. `<synthetic>` lines are skipped. The maximum makes the result independent of the order
-in which lines and files are read, so an incremental or concurrent index converges.
+in which lines and files are read, so an incremental or concurrent index converges. A copy of
+a response in another file keeps the session, sidechain flag and project of the line indexed
+first (§7.4).
 
 ### 2.3 Subagent output is a lower bound
 
@@ -153,6 +155,8 @@ fn transcript_files(&self, env: &Env) -> io::Result<Vec<PathBuf>>;
 fn parse_usage_line(&self, line: &[u8]) -> Result<Option<UsageLine>, LineError>;
 /// The shipped price table and the date its prices were taken.
 fn price_table(&self) -> &'static PriceTable;
+/// The default home's `sessions/`, whose records the scan and the statusline read.
+fn default_session_records_dir(&self, env: &Env) -> Option<PathBuf>;
 
 pub struct UsageLine {
     pub message_id: String,
@@ -455,12 +459,15 @@ impl Engine {
 
 ### 6.1 `run`
 
-- **Launch.** Before it spawns its child, `tagteam run` records an open launch for the account
-  (`started_at` now, `ended_at` NULL), and once spawned it adds the child's pid. When the child
-  exits, it sets `ended_at` if the profile is no longer in use (core §12.6). A background
-  session the child started may outlive it; then, as when `run` was killed, the next
-  `sight_sessions` that finds the profile no longer in use closes the launch, at that moment.
-  A late close over-covers, which can only leave a response unattributed, never misplace it.
+- **Launch.** Before it spawns its child, `tagteam run` plans a launch for the account, with
+  `started_at` stamped then, and records it open (`ended_at` NULL); once spawned, it adds the
+  child's pid. A record that fails is tried again on each poll while the child runs, and once
+  more at the close; the launch keeps its planned start, so a late record covers the whole
+  session. After exit handling, which releases the reservation `run` itself holds, `run`
+  closes the launch if the profile is no longer in use (core §12.6). A background session the
+  child started may outlive it; then, as when `run` was killed, the next `sight_sessions` that
+  finds the profile no longer in use closes the launch, at that moment. A late close
+  over-covers, which can only leave a response unattributed, never misplace it.
 - **Poll.** While its child runs, `run` reads the child's record,
   `<profile>/sessions/<child pid>.json`, every 2 seconds on a scoped thread, when its mtime
   changed. For the `sessionId` it sees, it writes the sighting keyed by the record's
@@ -563,6 +570,12 @@ assumptions:
   records the change.
 
 Known limits:
+
+- A response copied into another transcript file (a resume or fork copy, §2.2) keeps the
+  session id, sidechain flag and project of whichever batch committed it first, because the
+  upsert never changes them. The counts converge whatever the read order. Session rows can show
+  such a response under either session. It is never attributed to an account it could not have
+  used: at worst it is unattributed. In the real tree 0.3% of responses are such copies.
 
 - A session CC spawns itself inside a profile writes no record. Its responses fall inside its
   parent's launch, so they are unattributed rather than misplaced.
@@ -996,9 +1009,11 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
 
 Small hunks, in the same branch:
 
-- **core §4.3:** `locks/tokens-<provider>.lock` is a leaf, except that a full purge holds every affected provider's at once (§5.1).
+- **core §4.3:** `locks/tokens-<provider>.lock` is a leaf, except that a full purge holds every
+  affected provider's at once (§5.1).
 - **core §10.5:** `purge` takes each affected provider's tokens lock while it deletes.
-- **core §4.5:** the `transcripts` capability and its three methods.
+- **core §4.5:** the `transcripts` capability and its four methods: `transcript_files`,
+  `parse_usage_line`, `price_table` and `default_session_records_dir`.
 - **core §6.1:** the tables and triggers of §4 and their retention.
 - **core §6.4:** `tokens.retention_days`, and the `[provider.<id>.prices]` tables.
 - **core §12.5:** `run` records its launch and polls its child's session record (§6.1).

@@ -846,6 +846,38 @@ fn session_and_block_columns() {
 }
 
 #[test]
+fn json_grouping_is_the_one_applied_not_the_one_requested() {
+    // Spec §10.1: blocks are per account, so a block report forces `none` to `account` and
+    // `model` to `account,model`; `--json` says what its rows carry. Other periods keep the
+    // requested grouping.
+    let f = fixture();
+    // The first report indexes the fixture's transcripts; the rest read the index.
+    json_in(&f, &["tokens", "day", "--json"]);
+    for (period, by, want) in [
+        ("block", "none", "account"),
+        ("block", "model", "account,model"),
+        ("block", "account", "account"),
+        ("block", "account,model", "account,model"),
+        ("day", "none", "none"),
+        ("session", "model", "model"),
+    ] {
+        let v = json_in(
+            &f,
+            &["tokens", period, "--by", by, "--json", "--no-refresh"],
+        );
+        assert_eq!(v["grouping"], want, "{period} --by {by}: {v}");
+    }
+    let v = json_in(
+        &f,
+        &["tokens", "block", "--by", "none", "--json", "--no-refresh"],
+    );
+    assert!(
+        v["rows"][0]["account"].is_object(),
+        "the rows carry the accounts the grouping names: {v}"
+    );
+}
+
+#[test]
 fn help_documents_the_json_shape() {
     // Core §13.2: a command's `--json` shape is documented in its `--help`.
     let d = tempfile::tempdir().unwrap();

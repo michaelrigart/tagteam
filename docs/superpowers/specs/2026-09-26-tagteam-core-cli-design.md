@@ -703,7 +703,9 @@ the same entry in every `config` command.
 API list prices, field by field ([token report spec] §8.2). They are read forgivingly like every
 setting, an invalid value keeping the shipped one with a warning, but they are not registry
 keys: `config set` refuses them and the user edits the file. `config list` and `doctor` do not
-report them as unknown.
+report a valid price field as unknown (a model's card fields, `web_search_per_1k`,
+`long_prompt_above`, and the card fields under `long_prompt` and `fast`); any other key under a
+price table is reported, like an unknown key anywhere else.
 
 **Commands.**
 - **`config list [--provider P]`** shows every key with its effective value for the provider

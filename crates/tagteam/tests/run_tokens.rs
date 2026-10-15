@@ -84,6 +84,14 @@ impl Home {
             .unwrap()
     }
 
+    /// The launches, or `None` while the table does not exist.
+    fn launches_if_any(&self) -> Option<Vec<LaunchRow>> {
+        self.store()
+            .launches(&ProviderId::new(CLAUDE_CODE))
+            .ok()
+            .filter(|l| !l.is_empty())
+    }
+
     fn sightings(&self) -> Vec<SightingRow> {
         self.store()
             .sightings(&ProviderId::new(CLAUDE_CODE))
@@ -296,7 +304,7 @@ fn evidence_failures_never_change_the_exit_code() {
     // Spec §6.1: evidence is never worth a session. With the sightings table gone every poll
     // fails, and with the launches table gone too the launch cannot be recorded; either way
     // the run exits with the session's code. A failed poll goes to the log; a launch that
-    // could not be recorded is a warning, before the session starts.
+    // could not be recorded is one warning, before the session starts.
     let home = Home::new();
     let db = Env::for_test(home.root()).data_dir().join("tagteam.db");
     rusqlite::Connection::open(&db)
@@ -329,10 +337,23 @@ fn evidence_failures_never_change_the_exit_code() {
         .unwrap();
     assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains(
-            "warning: the token report could not record this session's launch, so its usage may show as unattributed"
-        ),
+        stderr(&output)
+            .contains("warning: the token report could not record this session's launch yet"),
         "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        stderr(&output)
+            .matches("could not record this session's launch")
+            .count(),
+        2,
+        "the warning before the spawn, and one at the close, never one per retry: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output)
+            .contains("launch, so its usage may be credited to the default login's account"),
+        "the close says what a launch never recorded means: {}",
         stderr(&output)
     );
     let calls = fake_claude_calls(&out);
@@ -341,6 +362,73 @@ fn evidence_failures_never_change_the_exit_code() {
             .iter()
             .any(|c| c.mode == "session" && c.exit == Some(7)),
         "the session ran: {calls:?}"
+    );
+}
+
+#[test]
+fn a_launch_that_failed_to_record_is_recorded_later_with_its_original_start() {
+    // Spec §6.1: a launch that could not be recorded before the spawn is retried by the poller
+    // while the child runs. It keeps the start planned before the spawn, so attribution, which
+    // reads launches at query time, covers the whole session. The table is gone when the run
+    // plans its launch and back some seconds into the session.
+    let home = Home::new();
+    let db = Env::for_test(home.root()).data_dir().join("tagteam.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let schema: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'run_launches'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    conn.execute_batch("DROP TABLE run_launches").unwrap();
+    let out = home.out("late-record");
+    let hold = home.root().join("hold");
+    let _release = Release(hold.clone());
+    let planned_after = now_ms();
+    let child = home
+        .run_a(&out)
+        .env("FAKE_CLAUDE_HOLD", &hold)
+        .spawn()
+        .unwrap();
+    running(&out);
+    assert!(
+        home.launches_if_any().is_none(),
+        "nothing could be recorded yet"
+    );
+    thread::sleep(Duration::from_millis(1_500));
+    let restored_at = now_ms();
+    conn.execute_batch(&schema).unwrap();
+    let late = wait_for("the retried launch", || {
+        home.launches().into_iter().find(|l| l.pid.is_some())
+    });
+    assert!(
+        (planned_after..restored_at - 1_000).contains(&late.started_at),
+        "the launch keeps the start planned before the spawn, not the retry's: {late:?}, planned after {planned_after}, restored at {restored_at}"
+    );
+    assert_eq!(late.account_id, home.a);
+    fs::write(&hold, b"").unwrap();
+    let output = finish(child);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("could not record this session's launch yet"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        stderr(&output)
+            .matches("could not record this session's launch")
+            .count(),
+        1,
+        "a launch recorded late is not warned of again at the close: {}",
+        stderr(&output)
+    );
+    let closed = home.launches();
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0].started_at, late.started_at);
+    assert!(
+        closed[0].ended_at.is_some(),
+        "closed at the exit: {closed:?}"
     );
 }
 
