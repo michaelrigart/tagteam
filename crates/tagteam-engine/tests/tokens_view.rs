@@ -695,6 +695,36 @@ fn a_pending_launch_leaves_an_unsighted_response_unattributed_without_the_scan()
     );
 }
 
+#[test]
+fn a_pending_file_that_cannot_be_read_stands_for_a_launch_open_from_its_name() {
+    // Spec §6.1, §7.2: a pending file whose content cannot be used still names its launch's
+    // start, `<started_at ms>-<pid>.json`. The report takes it as a launch of the profile's
+    // account open from there, so the unsighted response inside it is unattributed rather than
+    // credited to b. The end in the file is not read, so the launch over-covers.
+    use std::os::unix::fs::PermissionsExt;
+    let v = View::new();
+    v.event(T0 - D, "switch", None, Some(&v.b));
+    v.index(&[v.usage("s-2", T0 + 5 * H, "model-a", 2, 0)]);
+    let cc_provider = v.engine.provider(&cc()).unwrap();
+    let profile = v.fx.make_profile_for(cc_provider.as_ref(), &v.a);
+    PendingLaunch {
+        provider: cc(),
+        account_id: v.a.clone(),
+        started_at_ms: T0 + 4 * H,
+        ended_at_ms: Some(T0 + 4 * H + MIN),
+    }
+    .write(&profile, 4242)
+    .unwrap();
+    let file = PendingLaunch::path(&profile, T0 + 4 * H, 4242);
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::Account));
+
+    assert_eq!(keys(&r), ["day:2026-09-01|account:unattributed"]);
+    assert!(file.exists(), "the report only reads");
+    assert!(v.store.launches(&cc()).unwrap().is_empty());
+}
+
 /// For the races below: b is the default home's login, and an unsighted response of `s-2` at
 /// T0+5h lies inside a launch of a's profile from T0+4h, which only a pending file holds yet.
 /// Returns the profile and that launch, not yet written.

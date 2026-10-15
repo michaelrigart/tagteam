@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::{
-    PendingEntry, PendingFile, PendingLaunch, ProfileMarker, Provider, Read, ReadError,
-    RecordEntry, parse_session_record, profile_path, read_session_records_dated, record_is_live,
+    PendingEntry, PendingFile, PendingLaunch, ProfileMarker, Provider, Read, RecordEntry,
+    parse_session_record, profile_path, read_session_records_dated, record_is_live,
 };
 
 use crate::engine::Engine;
@@ -188,10 +188,11 @@ impl Engine {
         homes
     }
 
-    /// The pending launch files in `p`'s profiles (spec §6.1), each with its path: those that
-    /// parse and name `p` and the account whose profile holds them. Any other file, one that
-    /// cannot be read included, is skipped and logged at debug, never removed, and so is a
-    /// directory that cannot be listed: one bad file never fails a scan or a report.
+    /// The pending launches in `p`'s profiles (spec §6.1), each with its file: those that name
+    /// `p` and the account whose profile holds them, and the open launch a file whose content
+    /// cannot be used stands for by its name (`launch_of`). Any other file is skipped and logged
+    /// at debug, never removed, and so is a directory that cannot be listed: one bad file never
+    /// fails a scan or a report.
     pub(crate) fn pending_launches(&self, p: &dyn Provider) -> Vec<(PendingFile, PendingLaunch)> {
         let provider = p.id();
         let mut found = Vec::new();
@@ -211,16 +212,11 @@ impl Engine {
                     continue;
                 }
             };
-            for entry in entries {
-                match launch_of(entry, &provider, &account) {
-                    Ok(Some(launch)) => found.push(launch),
-                    Ok(None) => {}
-                    Err(e) => tracing::debug!(
-                        "a pending launch file could not be read; skipped: {}",
-                        e.detail
-                    ),
-                }
-            }
+            found.extend(
+                entries
+                    .into_iter()
+                    .filter_map(|entry| launch_of(entry, &provider, &account)),
+            );
         }
         found
     }
@@ -252,11 +248,11 @@ impl Engine {
             )?;
         }
         // A file `run` replaced since it was read holds a newer record: it stays for the next
-        // scan.
+        // scan, as does one that could not be `stat`ed: it cannot be told from a replaced one.
         hooks::point(self, "scan-pending-recorded")?;
         match file.remove_if_unchanged() {
             Ok(true) => {}
-            Ok(false) => tracing::debug!("a pending launch file changed since it was read; kept"),
+            Ok(false) => tracing::debug!("a pending launch file may not be the one read; kept"),
             Err(e) => tracing::debug!("a recorded pending launch file was not removed: {e}"),
         }
         Ok(u64::from(stored.is_none_or(|l| {
@@ -265,11 +261,10 @@ impl Engine {
     }
 
     /// Spec §13: records the pending launches of `account`'s profile before `remove` deletes it,
-    /// as the scan does. The profile need not hold a marker; a file that does not parse, or
-    /// names another provider or account, is skipped. A file that cannot be read, or a pending
-    /// directory that cannot be listed, may hold a launch, so it fails the record before any is
-    /// written, naming it, and the caller deletes nothing. A provider with no transcripts has
-    /// none.
+    /// as the scan does, a file whose content cannot be used by its name (`launch_of`). The
+    /// profile need not hold a marker. A pending directory that cannot be listed shows no name,
+    /// so it fails the record, naming it, and the caller deletes nothing. A provider with no
+    /// transcripts has none.
     pub(crate) fn record_pending_launches_of(
         &self,
         p: &dyn Provider,
@@ -283,10 +278,10 @@ impl Engine {
             Read::Absent => return Ok(()),
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         };
-        let mut launches = Vec::new();
-        for entry in entries {
-            launches.extend(launch_of(entry, &p.id(), account).map_err(EngineError::Unreadable)?);
-        }
+        let launches: Vec<_> = entries
+            .into_iter()
+            .filter_map(|entry| launch_of(entry, &p.id(), account))
+            .collect();
         if launches.is_empty() {
             return Ok(());
         }
@@ -670,31 +665,45 @@ impl Engine {
     }
 }
 
-/// The pending launch `entry` holds for `account`'s profile (spec §6.1), or `None` for a file
-/// that holds none: one that does not parse, or names another provider or account than the
-/// profile's, logged at debug. A file that cannot be read may hold one: the caller skips it or
-/// refuses on it.
+/// The pending launch `entry` stands for in `account`'s profile (spec §6.1): the one it holds,
+/// if it names `provider` and `account`; for a file whose content cannot be used (unreadable,
+/// or not a pending launch), a launch of `account` open from its name's start. A file that
+/// names another provider or account, or whose name gives no start, stands for none; it is
+/// logged at debug.
 fn launch_of(
     entry: PendingEntry,
     provider: &ProviderId,
     account: &AccountId,
-) -> Result<Option<(PendingFile, PendingLaunch)>, ReadError> {
+) -> Option<(PendingFile, PendingLaunch)> {
     match entry {
         PendingEntry::Launch(file, pending)
             if &pending.provider == provider && &pending.account_id == account =>
         {
-            Ok(Some((file, pending)))
+            Some((file, pending))
         }
         PendingEntry::Launch(..) => {
             tracing::debug!(
                 "a pending launch file names another provider or account than its profile's; skipped"
             );
-            Ok(None)
+            None
         }
-        PendingEntry::Invalid(_, why) => {
+        PendingEntry::Unusable {
+            file,
+            started_at_ms: Some(started_at_ms),
+            why,
+        } => {
+            tracing::debug!("a pending launch file cannot be used ({why}); open from its name");
+            let pending = PendingLaunch {
+                provider: provider.clone(),
+                account_id: account.clone(),
+                started_at_ms,
+                ended_at_ms: None,
+            };
+            Some((file, pending))
+        }
+        PendingEntry::Unusable { why, .. } => {
             tracing::debug!("a pending launch file was skipped: {why}");
-            Ok(None)
+            None
         }
-        PendingEntry::Unreadable(e) => Err(e),
     }
 }
