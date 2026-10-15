@@ -1641,6 +1641,12 @@ If an email matches several orgs, or several providers, it is ambiguous:
 
 An empty alias never matches.
 
+The hidden global flag `--expect-account ID` is the TUI's guard (sub-project 3, §4.5). It is
+absent from `--help` and from the completion scripts. When it is given, an `ACCOUNT` that
+resolves to an account with another ID is refused with the error kind `stale-selection` (exit 1,
+"the selected account changed; nothing was done"), before anything is changed. It has no effect
+on a command that resolves no `ACCOUNT`.
+
 ### 10.5 `purge [--provider P | --keychain-orphans] [--yes]`
 
 Deletes tagteam's data: every account of the provider, or with no `--provider`, everything

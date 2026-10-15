@@ -99,10 +99,13 @@ const KIND_SERVICE: &str = "service";
 const KIND_NO_SERVICE_MANAGER: &str = "no-service-manager";
 /// `daemon status`: the daemon's socket answered something unusable, or nothing in time.
 const KIND_DAEMON: &str = "daemon";
+/// `--expect-account` named an account other than the one the reference resolved to (§10.4).
+pub const KIND_STALE_SELECTION: &str = "stale-selection";
 
 /// Appendix A.3. The default keychain is the login keychain, so the hint names its file.
 const UNLOCK_QUESTION: &str = "The login keychain is locked (common over SSH). Unlock it now?";
 const KEYCHAIN_LOCKED: &str = "the login keychain is locked (common over SSH); run `security unlock-keychain ~/Library/Keychains/login.keychain-db`, then retry";
+const STALE_SELECTION: &str = "the selected account changed; nothing was done";
 const CANCELLED: &str = "cancelled";
 const INTERRUPTED: &str = "interrupted";
 const TOKEN_MISSING: &str = "pass the token as an argument, or `-` to read it from stdin";
@@ -156,6 +159,7 @@ const TEST_API_BASE: &str = "TAGTEAM_TEST_API_BASE";
 #[cfg(any(test, feature = "test-support"))]
 const TEST_VAULT_KEYCHAIN: &str = "TAGTEAM_TEST_VAULT_KEYCHAIN";
 
+#[derive(Clone)]
 pub struct Context {
     pub env: Env,
     pub keychain: Arc<dyn Keychain>,
@@ -681,6 +685,8 @@ struct App<'a, 'b> {
     /// `--no-color`.
     no_color: bool,
     provider_flag: Option<ProviderId>,
+    /// `--expect-account`: the only account `resolve` may return (§10.4).
+    expect_account: Option<AccountId>,
     /// The settings warnings `run` printed from the engine's read (§6.4).
     settings_warnings: Vec<String>,
     /// The Keychain Appendix A.3's lock check asks: macOS only, since Linux has none.
@@ -815,6 +821,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
         force_color_env,
         no_color: cli.no_color,
         provider_flag,
+        expect_account: cli.expect_account.map(AccountId::from_string),
         settings_warnings: warnings,
         keychain,
         platform,
@@ -1202,9 +1209,11 @@ impl App<'_, '_> {
         ))
     }
 
-    /// §10.4, with a terminal prompt for an ambiguous email.
+    /// §10.4, with a terminal prompt for an ambiguous email. With `--expect-account`, the
+    /// account it resolves to must be that one: another is refused as `stale-selection`, before
+    /// the command has changed anything.
     fn resolve(&mut self, input: &str) -> Result<AccountRow, Failure> {
-        match self.engine.resolve(input, self.provider_flag.as_ref()) {
+        let row = match self.engine.resolve(input, self.provider_flag.as_ref()) {
             Err(EngineError::Ambiguous { .. }) if self.can_prompt() => {
                 let found = self.engine.candidates(input, self.provider_flag.as_ref())?;
                 let labels: Vec<String> = found
@@ -1215,9 +1224,16 @@ impl App<'_, '_> {
                 self.after_prompt()?;
                 choice
                     .and_then(|i| found.get(i).cloned())
-                    .ok_or_else(cancelled)
+                    .ok_or_else(cancelled)?
             }
-            other => Ok(other?),
+            other => other?,
+        };
+        match &self.expect_account {
+            Some(expected) if *expected != row.id => Err(Failure::Message(
+                KIND_STALE_SELECTION,
+                STALE_SELECTION.into(),
+            )),
+            _ => Ok(row),
         }
     }
 

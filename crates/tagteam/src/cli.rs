@@ -37,6 +37,9 @@ pub struct Cli {
         hide_possible_values = true
     )]
     pub provider: Option<String>,
+    /// The account the reference must resolve to (the TUI's guard, §10.4); hidden.
+    #[arg(long = "expect-account", global = true, hide = true, value_name = "ID")]
+    pub expect_account: Option<String>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }

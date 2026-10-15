@@ -387,15 +387,17 @@ struct Home {
     dir: tempfile::TempDir,
     /// Account `a`'s id.
     a: String,
+    /// Account `b`'s id.
+    b: String,
 }
 
 impl Home {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let (a, _b) = two_fresh_accounts(dir.path());
+        let (a, b) = two_fresh_accounts(dir.path());
         fake_claude(dir.path());
         fs::create_dir_all(dir.path().join("work")).unwrap();
-        Home { dir, a }
+        Home { dir, a, b }
     }
 
     fn root(&self) -> &Path {
@@ -658,6 +660,48 @@ fn a_missing_launch_command_fails_before_anything_is_written() {
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert_eq!(kind(&output.stdout), "launch-command-missing");
     assert!(!home.profile().exists(), "no profile, no reservation");
+}
+
+// ---- `--expect-account`, the TUI's guard (core §10.4) ----
+
+#[test]
+fn run_refuses_an_account_that_is_not_the_one_expected_and_launches_nothing() {
+    // A person who selected `b` at position 1 (a move since put `a` there) runs `run 1`.
+    let home = Home::new();
+    let out = home.out("stale");
+    let output = home
+        .tagteam(&out)
+        .args(["--provider", "claude-code", "--expect-account", &home.b])
+        .args(["--json", "run", "1", "--", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        v["error"],
+        json!({"type": "stale-selection",
+               "message": "the selected account changed; nothing was done"})
+    );
+    assert!(
+        fake_claude_calls(&out).is_empty(),
+        "claude never ran, not even its login check"
+    );
+    assert!(!home.profile().exists(), "no profile, no reservation");
+}
+
+#[test]
+fn run_launches_the_account_that_is_the_one_expected() {
+    let home = Home::new();
+    let out = home.out("matching");
+    let output = home
+        .tagteam(&out)
+        .args(["--provider", "claude-code", "--expect-account", &home.a])
+        .args(["run", "1", "--", "x"])
+        .env("FAKE_CLAUDE_EXIT", "7")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert!(session(&out).is_some(), "the session ran");
 }
 
 // ---- `--json` and the command line (§12.1, Decision 8, B.36) ----

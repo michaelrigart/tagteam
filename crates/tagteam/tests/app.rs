@@ -1763,3 +1763,179 @@ fn daemon_with_a_store_it_cannot_open_exits_1_and_lets_daemon_lock_go_empty() {
     assert_eq!(std::fs::read(&lock).unwrap(), b"");
     assert!(FlockGuard::try_lock(&lock).unwrap().is_some());
 }
+
+// ---- `--expect-account`, the TUI's guard (core §10.4) ----
+
+const STALE: &str = "the selected account changed; nothing was done";
+
+/// Every account as `(position, id, alias, disabled)`, and the live login's email: what a
+/// refused command must leave as it was.
+type Snapshot = (Vec<(u32, String, Option<String>, bool)>, String);
+
+fn snapshot(h: &H) -> Snapshot {
+    let store = Store::open_existing(&h.env.data_dir().join("tagteam.db"))
+        .unwrap()
+        .unwrap();
+    let rows = store
+        .accounts(&ProviderId::new(CLAUDE_CODE))
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.position, r.id.as_str().to_owned(), r.alias, r.disabled))
+        .collect();
+    (rows, common::live_email(h._dir.path()))
+}
+
+/// The ID of the account at `position`.
+fn id_at(snap: &Snapshot, position: u32) -> String {
+    snap.0.iter().find(|r| r.0 == position).unwrap().1.clone()
+}
+
+/// A person read the list as `a@x.co` at 1 and `b@x.co` at 2 (live), and selected `b@x.co`.
+/// Then a `move` elsewhere swapped the two, so position 2 holds `a@x.co`. Returns the harness,
+/// that person's expectation (`b@x.co`'s ID) and `a@x.co`'s ID. With `a_disabled`, `a@x.co` was
+/// disabled first, so that `enable 2` has something to undo.
+fn stale_selection(a_disabled: bool) -> (H, String, String) {
+    let h = two_logins();
+    if a_disabled {
+        h.ok(&["disable", "1"]);
+    }
+    let before = snapshot(&h);
+    let (a, b) = (id_at(&before, 1), id_at(&before, 2));
+    h.ok(&["move", "1", "2"]);
+    (h, b, a)
+}
+
+/// What the TUI runs: `--no-color --provider claude-code --expect-account ID <command>`.
+fn guarded<'a>(id: &'a str, command: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "--no-color",
+        "--provider",
+        CLAUDE_CODE,
+        "--expect-account",
+        id,
+    ];
+    args.extend_from_slice(command);
+    args
+}
+
+/// Each command that resolves an `ACCOUNT` and changes something, aimed at position 2, and
+/// whether `a@x.co` must be disabled for the change to show. `run` has its own tests in
+/// `run_cli.rs`, where a fake `claude` stands in for the real one.
+const ACCOUNT_COMMANDS: [(&[&str], bool); 6] = [
+    (&["switch", "2"], false),
+    (&["enable", "2"], true),
+    (&["disable", "2"], false),
+    (&["alias", "2", "--", "work"], false),
+    (&["move", "2", "1"], false),
+    (&["remove", "2"], false),
+];
+
+#[test]
+fn an_account_that_moved_is_refused_as_stale_and_nothing_changes() {
+    for (command, a_disabled) in ACCOUNT_COMMANDS {
+        let (h, expected, _) = stale_selection(a_disabled);
+        let before = snapshot(&h);
+        let (code, out, err) = h.run(&guarded(&expected, command), &mut Scripted::none());
+        assert_eq!(code, 1, "{command:?}: {err}");
+        assert_eq!(out, "", "{command:?}");
+        assert_eq!(err, format!("tagteam: {STALE}\n"), "{command:?}");
+        assert_eq!(snapshot(&h), before, "{command:?} changed something");
+    }
+}
+
+#[test]
+fn the_refusal_is_a_stale_selection_error_under_json_too() {
+    let (h, expected, _) = stale_selection(false);
+    let (code, out, _) = h.run(
+        &guarded(&expected, &["switch", "2", "--json"]),
+        &mut Scripted::none(),
+    );
+    assert_eq!(code, 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap(),
+        json!({"schemaVersion": 1, "error": {"type": "stale-selection", "message": STALE}})
+    );
+}
+
+#[test]
+fn the_guard_is_a_global_flag_so_it_may_follow_the_command() {
+    let (h, expected, _) = stale_selection(false);
+    let (code, _, err) = h.run(
+        &["switch", "2", "--expect-account", &expected],
+        &mut Scripted::none(),
+    );
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            1,
+            "tagteam: the selected account changed; nothing was done\n"
+        )
+    );
+}
+
+#[test]
+fn an_account_where_it_was_read_proceeds() {
+    for (command, a_disabled) in ACCOUNT_COMMANDS {
+        // `a@x.co` is at 2 now, and its ID is what this person expects there.
+        let (h, _, a) = stale_selection(a_disabled);
+        let (code, _, err) = h.run(&guarded(&a, command), &mut Scripted::none());
+        assert_eq!(code, 0, "{command:?}: {err}");
+        let (rows, live) = snapshot(&h);
+        let row = rows.iter().find(|r| r.1 == a);
+        match command[0] {
+            "switch" => assert_eq!(live, "a@x.co"),
+            "enable" => assert!(!row.unwrap().3, "enabled"),
+            "disable" => assert!(row.unwrap().3, "disabled"),
+            "alias" => assert_eq!(row.unwrap().2.as_deref(), Some("work")),
+            "move" => assert_eq!(row.unwrap().0, 1),
+            "remove" => assert!(row.is_none(), "removed"),
+            other => unreachable!("{other}"),
+        }
+    }
+}
+
+#[test]
+fn history_and_map_resolve_through_the_guard_too() {
+    let (h, expected, a) = stale_selection(false);
+    let dir = h._dir.path().to_str().unwrap().to_owned();
+    for command in [vec!["history", "2"], vec!["map", "2", dir.as_str()]] {
+        let (code, out, err) = h.run(&guarded(&expected, &command), &mut Scripted::none());
+        assert_eq!((code, out.as_str()), (1, ""), "{command:?}");
+        assert_eq!(err, format!("tagteam: {STALE}\n"), "{command:?}");
+        let (code, _, err) = h.run(&guarded(&a, &command), &mut Scripted::none());
+        assert_eq!(code, 0, "{command:?}: {err}");
+    }
+    assert_eq!(
+        h.ok(&["map"]).lines().count(),
+        1,
+        "only the matching map was made"
+    );
+}
+
+#[test]
+fn a_command_without_an_account_ignores_the_guard() {
+    // Nothing here resolves an ACCOUNT, so an ID that matches nothing is no reason to refuse.
+    let (h, _, _) = stale_selection(false);
+    for command in [
+        &["list"][..],
+        &["status"],
+        &["alias"],
+        &["history"],
+        &["switch"],
+    ] {
+        let (code, _, err) = h.run(&guarded("someone-else", command), &mut Scripted::none());
+        assert_eq!(code, 0, "{command:?}: {err}");
+    }
+}
+
+#[test]
+fn an_account_removed_elsewhere_is_not_found_rather_than_redirected() {
+    let h = two_logins();
+    let a = id_at(&snapshot(&h), 1);
+    h.ok(&["remove", "1"]);
+    let before = snapshot(&h);
+    let (code, _, err) = h.run(&guarded(&a, &["disable", "1"]), &mut Scripted::none());
+    assert_eq!(code, 1);
+    assert_eq!(err, "tagteam: no account matches \"1\"\n");
+    assert_eq!(snapshot(&h), before);
+}
