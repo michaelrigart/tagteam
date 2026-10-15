@@ -204,6 +204,10 @@ fn envelope(kind: &str, provider: Option<&ProviderId>, fields: Value, now_s: i64
 
 /// D5.2: the longest line either side sends, its newline left out.
 pub const MAX_LINE: usize = 64 * 1024;
+/// D5.3: the longest string `id` a request may carry, in bytes. A reply echoes the id, so this
+/// bounds every reply line under `MAX_LINE`: an integer id is at most 20 bytes, a status reply
+/// scales with the providers and jobs, and an event holds positions and short strings.
+pub const MAX_ID_LEN: usize = 128;
 /// D5.3's `error.type` for a request without a usable `id`, or without a string `op`.
 pub const BAD_REQUEST: &str = "bad-request";
 /// D5.3's `error.type` for an `op` this daemon does not know.
@@ -251,7 +255,7 @@ pub enum Parsed {
 
 /// Decision 1: one line from a client, its newline left out. A line over `MAX_LINE`, one that
 /// is not UTF-8, and JSON that is not an object close the connection. An object without a
-/// usable `id` (a string, or an integer that fits `i64`) or without a string `op` is a
+/// usable `id` (a string of at most `MAX_ID_LEN` bytes, or an integer that fits `i64`) or without a string `op` is a
 /// `bad-request`, which carries the id when it was usable. An op this daemon does not know is
 /// `unknown-op`. Unknown fields are ignored (D5.3). No message repeats the client's input.
 pub fn parse_request(line: &[u8]) -> Parsed {
@@ -272,6 +276,9 @@ pub fn parse_request(line: &[u8]) -> Parsed {
         })
     };
     let id = match request.get("id") {
+        Some(Value::String(s)) if s.len() > MAX_ID_LEN => {
+            return refuse(None, BAD_REQUEST, "the request id is longer than 128 bytes");
+        }
         Some(Value::String(s)) => Some(RequestId::Str(s.clone())),
         Some(Value::Number(n)) => n.as_i64().map(RequestId::Int),
         _ => None,
@@ -1082,6 +1089,21 @@ mod socket_protocol_tests {
         for line in closing {
             check(line, Err((None, "close")));
         }
+        // D5.3: a string id of 128 bytes is echoed, one of 129 is refused with a null id.
+        let with_id = |len: usize| format!(r#"{{"id":"{}","op":"status"}}"#, "i".repeat(len));
+        check(
+            with_id(MAX_ID_LEN).as_bytes(),
+            Ok(Request {
+                id: Str("i".repeat(MAX_ID_LEN)),
+                op: Op::Status,
+            }),
+        );
+        check(with_id(MAX_ID_LEN + 1).as_bytes(), Err((None, BAD_REQUEST)));
+        // Bytes, not characters: 65 two-byte characters are 130 bytes.
+        check(
+            format!(r#"{{"id":"{}","op":"status"}}"#, "é".repeat(65)).as_bytes(),
+            Err((None, BAD_REQUEST)),
+        );
         // The length limit leaves out the newline: a request padded to it is read, one byte
         // more closes.
         let padded = |len: usize| {
