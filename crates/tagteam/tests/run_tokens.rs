@@ -125,6 +125,15 @@ impl Home {
             .unwrap();
     }
 
+    /// The log file's text (spec §14), empty when there is none.
+    fn log(&self) -> String {
+        let dir = Env::for_test(self.root()).state_dir();
+        ["tagteam.log.1", "tagteam.log"]
+            .iter()
+            .map(|n| fs::read_to_string(dir.join(n)).unwrap_or_default())
+            .collect()
+    }
+
     fn sightings(&self) -> Vec<SightingRow> {
         self.store()
             .sightings(&ProviderId::new(CLAUDE_CODE))
@@ -419,6 +428,7 @@ fn a_launch_the_store_refused_throughout_is_kept_in_a_pending_file_until_a_scan_
         .run_a(&out)
         .env("FAKE_CLAUDE_EXIT", "7")
         .env("FAKE_CLAUDE_SLEEP", "2.5")
+        .env("TAGTEAM_LOG", "debug")
         .output()
         .unwrap();
     let closed_before = now_ms();
@@ -428,6 +438,15 @@ fn a_launch_the_store_refused_throughout_is_kept_in_a_pending_file_until_a_scan_
         Vec::<String>::new(),
         "{}",
         stderr(&output)
+    );
+    let log = home.log();
+    assert!(
+        log.contains("the store refused the session's launch; it is kept in a pending file"),
+        "debug: {log}"
+    );
+    assert!(
+        !log.contains("could not record the session's launch"),
+        "no warning in the log either: {log}"
     );
     let files = PendingLaunch::read_all(&home.profile());
     assert_eq!(files.len(), 1, "{files:?}");
@@ -494,6 +513,13 @@ fn a_launch_neither_the_store_nor_the_profile_keeps_is_warned_of_twice() {
     fs::write(pause.join("resume"), b"").unwrap();
     let output = finish(child);
     assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert!(
+        home.log().contains(
+            "WARN tagteam::run: could not record the session's launch for the token report"
+        ),
+        "warned in the log when nothing holds the launch: {}",
+        home.log()
+    );
     let w = warnings(&output);
     assert_eq!(w.len(), 2, "{}", stderr(&output));
     assert!(
