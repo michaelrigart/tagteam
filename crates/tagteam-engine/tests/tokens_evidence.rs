@@ -1345,6 +1345,50 @@ fn close_ends_the_tenure_at_its_last_read_and_never_moves_it_back() {
 }
 
 #[test]
+fn a_write_after_the_exit_is_capped_at_the_close() {
+    // Spec §6.1: the poller can finish one more tick after the exit was stamped. On a record a
+    // crash left behind, unchanged, its check confirms after the exit, and its write stores
+    // that (a minute after the first, so past the gap). The close caps the tenure at the exit:
+    // no sighting ends after the child did.
+    let fx = Fx::new();
+    let cc = fx.provider();
+    let a = fx.add("a@x.co", "rt-a");
+    let profile = fx.make_profile(&a);
+    let id = fx.engine.open_launch(&cc, &a).unwrap();
+    let mut state = LaunchPoll::default();
+    let started = NOW + 500;
+    running(&fx, 777, None);
+    let child = record(&fx, &profile, 777, "s-a", started, "interactive");
+    set_mtime(&child, 1_790_000_000);
+    fx.clock.advance_ms(1_000);
+    poll(&fx, &id, &profile, &mut state);
+    fx.clock.advance_ms(61_000);
+    let exit = fx.engine.now_ms();
+    gone(&fx, 777);
+    fx.clock.advance_ms(40);
+    poll(&fx, &id, &profile, &mut state);
+    assert_eq!(
+        sightings(&fx)[0].last_at,
+        exit + 40,
+        "the late write stored a check after the exit"
+    );
+
+    fx.engine.close_launch(&id, &profile, &state, exit).unwrap();
+    assert_eq!(
+        sightings(&fx),
+        [sighting(
+            "s-a",
+            a.as_str(),
+            started,
+            NOW + 1_000,
+            exit,
+            SightingSource::Run,
+            exit + 40
+        )]
+    );
+}
+
+#[test]
 fn a_check_after_the_exit_confirms_nothing() {
     // Spec §6.1: a crash leaves the child's record behind, unchanged, so a check after the
     // child exited still finds the mtime of the read that named its session. The close ends the

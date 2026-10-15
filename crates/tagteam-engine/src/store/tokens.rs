@@ -161,8 +161,10 @@ pub enum SightingEnd {
     /// To the given end, back as well as forward: a switch ended the tenure, so a later end
     /// stored on it is not a read of its session there.
     Exactly,
-    /// Forward only: every stored end is a read, and a later one already stored stands.
-    AtLeast,
+    /// Forward only, to the given end or a later one already stored (every stored end is a
+    /// read), but never past `until`: the tenure's execution ended then, so no read after it
+    /// confirms anything.
+    AtLeast { until: i64 },
 }
 
 /// A `run` launch (spec §6.1), or a profile seeded at the migration (spec §4). `ended_at` is
@@ -1004,20 +1006,26 @@ impl Store {
 
     /// `run`'s end of a tenure (spec §6.1, §6.4), in one `IMMEDIATE` transaction. The tenure
     /// `s`'s key names is stored if no write stored it yet, and its end moved to `s.last_at`, its
-    /// last confirming read, as `how` says; never before `first_at`. Then every other tenure of
-    /// the session in that execution and home that began by the end it now has, and runs past
-    /// it, is clamped to it: a scan or a statusline may have continued one over the time the
-    /// session was away, before `run`'s write stored the tenure that saw it go. Each row it
-    /// changes gets `s.recorded_at`.
+    /// last confirming read, as `how` says; never before `first_at`, nor past `how`'s `until`.
+    /// Then every other tenure of the session in that execution and home that began by the end
+    /// it now has, and runs past it, is clamped to it: a scan or a statusline may have continued
+    /// one over the time the session was away, before `run`'s write stored the tenure that saw it
+    /// go. Each row it changes gets `s.recorded_at`.
     pub fn end_sighting(
         &self,
         provider: &ProviderId,
         s: &SightingRow,
         how: SightingEnd,
     ) -> Result<(), StoreError> {
-        let moves = match how {
-            SightingEnd::Exactly => "session_sightings.last_at != excluded.last_at",
-            SightingEnd::AtLeast => "session_sightings.last_at < excluded.last_at",
+        // The end the tenure gets: `excluded.last_at` is `s.last_at`, capped at `until` (`?9`)
+        // and never before `first_at`.
+        let (end, until) = match how {
+            SightingEnd::Exactly => ("excluded.last_at", i64::MAX),
+            SightingEnd::AtLeast { until } => (
+                "max(session_sightings.first_at, \
+                 min(max(session_sightings.last_at, excluded.last_at), ?9))",
+                until,
+            ),
         };
         let mut c = self.lock();
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1032,9 +1040,10 @@ impl Store {
             &format!(
                 "INSERT INTO session_sightings \
                  (provider, session_id, home, started_at, first_at, last_at, source, recorded_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, max(?5, ?6), ?7, ?8) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, max(?5, min(?6, ?9)), ?7, ?8) \
                  ON CONFLICT(provider, session_id, home, started_at, first_at) DO UPDATE SET \
-                 last_at = excluded.last_at, recorded_at = excluded.recorded_at WHERE {moves}"
+                 last_at = {end}, recorded_at = excluded.recorded_at \
+                 WHERE session_sightings.last_at != {end}"
             ),
             params![
                 provider.as_str(),
@@ -1045,6 +1054,7 @@ impl Store {
                 s.last_at,
                 s.source.as_str(),
                 s.recorded_at,
+                until,
             ],
         )?;
         let end: i64 = tx.query_row(
