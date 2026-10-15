@@ -59,14 +59,16 @@ cargo test -p tagteam-engine --features real_keychain --test run_real_keychain -
 
 ### Test quirks
 
-- **Pty tests need a real terminal environment.** `tagteam`'s `prompt::tests` and
-  `tests/signals.rs` open a pseudo-terminal. They fail with `openpty: Operation not permitted`
+- **Pty tests need a real terminal environment.** `tagteam`'s `prompt::tests`,
+  `tests/signals.rs`, `tests/tui_pty.rs` and the TUI's first-frame timing in `tests/perf.rs`
+  open a pseudo-terminal. They fail with `openpty: Operation not permitted`
   inside a sandbox that denies it, such as an agent or container sandbox. Run them from an
   ordinary, unsandboxed terminal:
 
   ```sh
   cargo test -p tagteam --features tagteam/test-support --lib prompt::tests
   cargo test -p tagteam --features tagteam/test-support --test signals
+  cargo test -p tagteam --features tagteam/test-support --test tui_pty
   ```
 
 - **`real_keychain` tests need an unsandboxed terminal** on macOS, because they run

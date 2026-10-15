@@ -3,6 +3,8 @@
 //! them is not dead code overall.
 #![allow(dead_code)]
 
+pub mod pty;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
