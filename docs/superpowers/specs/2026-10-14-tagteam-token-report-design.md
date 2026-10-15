@@ -630,6 +630,10 @@ unattributed.
   launch, open when it has no `endedAt` or stands for one by its name alone (§6.1). It only
   reads: it never writes or removes one. It reads the usage first, then the pending files,
   then the stored launches, each read begun after the one before.
+- Launch evidence that cannot be read is never taken as absence. A profile whose pending
+  directory cannot be listed counts as launched at every time, and so does a directory under
+  `sessions/` whose marker cannot be read, as its name's account, whatever its provider. A
+  `sessions/` that cannot be listed leaves coverage incomplete at every time.
 - Before the epoch, coverage comes from the seeded launches (§4). It is complete only after
   the provider's last `remove` event before the epoch. An account removed before then may have
   had a profile that left no trace.
@@ -1118,6 +1122,8 @@ The daemon (sub-project 2) keeps the index current, so the TUI's queries are che
     - an unsighted response inside a pending launch, unattributed before the next scan, with
       the file written, or moved to the store by a scan, while the report reads, and with a
       file that cannot be read;
+    - an unsighted response unattributed at every time while a pending directory, a profile's
+      marker or `sessions/` cannot be read;
     - a session sighted in two homes at once;
     - a session resumed in another home, with either home unsighted;
     - a removed account, with and without switches, and a removed profile.

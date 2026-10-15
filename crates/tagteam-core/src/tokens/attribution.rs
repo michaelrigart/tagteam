@@ -40,14 +40,19 @@ pub struct Coverage {
     pub seeded: bool,
     /// The provider's last `remove` event before the epoch.
     pub last_pre_epoch_remove_ms: Option<i64>,
+    /// Whether launch evidence could not be read at all: the profiles could not be listed, so
+    /// any of them may hold a launch (token report §7.2).
+    pub unreadable: bool,
 }
 
 impl Coverage {
     /// Complete from the epoch on; before it, only from seeded launches, and only after the
     /// last `remove` before the epoch: a removed account may have had a profile that left no
-    /// trace.
+    /// trace. With evidence that could not be read, complete at no time.
     pub fn complete_at(&self, t: i64) -> bool {
-        t >= self.epoch_ms || (self.seeded && self.last_pre_epoch_remove_ms.is_none_or(|r| t >= r))
+        !self.unreadable
+            && (t >= self.epoch_ms
+                || (self.seeded && self.last_pre_epoch_remove_ms.is_none_or(|r| t >= r)))
     }
 }
 
@@ -326,6 +331,7 @@ mod tests {
             epoch_ms: 0,
             seeded: true,
             last_pre_epoch_remove_ms: None,
+            unreadable: false,
         }
     }
 
@@ -397,6 +403,7 @@ mod tests {
             epoch_ms: 1_000,
             seeded: false,
             last_pre_epoch_remove_ms: None,
+            unreadable: false,
         };
         for t in [9, 21] {
             assert_eq!(
@@ -480,6 +487,7 @@ mod tests {
             epoch_ms: EPOCH,
             seeded: false,
             last_pre_epoch_remove_ms: None,
+            unreadable: false,
         };
         assert!(!unseeded.complete_at(EPOCH - 1));
         assert!(
@@ -508,6 +516,16 @@ mod tests {
             place(&[], &none(), &removed, EPOCH - 9 * H),
             Placement::Home(Home::Default)
         );
+        let unreadable = Coverage {
+            unreadable: true,
+            ..seeded
+        };
+        for t in [0, EPOCH - 1, EPOCH, i64::MAX] {
+            assert!(
+                !unreadable.complete_at(t),
+                "evidence unread is never absence: {t}"
+            );
+        }
     }
 
     #[test]
@@ -736,7 +754,12 @@ mod tests {
             last_remove in prop::option::of(0..120i64),
             t in 0..130i64,
         ) {
-            let coverage = Coverage { epoch_ms, seeded, last_pre_epoch_remove_ms: last_remove };
+            let coverage = Coverage {
+                epoch_ms,
+                seeded,
+                last_pre_epoch_remove_ms: last_remove,
+                unreadable: false,
+            };
             let launches = Launches::new(launches);
             let homes: Vec<&Home> = sightings
                 .iter()

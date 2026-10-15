@@ -2173,3 +2173,27 @@ impl Fx {
 pub fn claude_bin() -> &'static Path {
     Path::new("/opt/claude/bin/claude")
 }
+
+/// `path` at `mode` until dropped, then back at the mode it had, so a test that makes a path
+/// unreadable leaves its temp directory removable whatever it asserts.
+pub struct Chmod {
+    path: PathBuf,
+    mode: u32,
+}
+
+impl Chmod {
+    pub fn new(path: &Path, mode: u32) -> Self {
+        let was = fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        Chmod {
+            path: path.to_owned(),
+            mode: was,
+        }
+    }
+}
+
+impl Drop for Chmod {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+    }
+}

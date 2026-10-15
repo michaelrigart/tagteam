@@ -10,7 +10,7 @@ use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use common::{FakeFx, Fx, LSTART, add, cc, record_reading, usage_window};
+use common::{Chmod, FakeFx, Fx, LSTART, add, cc, record_reading, usage_window};
 use jiff::civil::date;
 use jiff::tz::TimeZone;
 use serde_json::json;
@@ -26,7 +26,9 @@ use tagteam_engine::tokens::{
 use tagteam_engine::vault::{KeychainVault, Vault};
 use tagteam_engine::{Engine, EngineConfig};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
-use tagteam_provider::{FakeProcess, PendingLaunch, Provider, RunShell, parse_lstart};
+use tagteam_provider::{
+    FakeProcess, MARKER_FILE, PENDING_LAUNCH_DIR, PendingLaunch, Provider, RunShell, parse_lstart,
+};
 
 const MIN: i64 = 60_000;
 const H: i64 = 60 * MIN;
@@ -737,7 +739,6 @@ fn a_pending_file_that_cannot_be_read_stands_for_a_launch_open_from_its_name() {
 /// For the races below: b is the default home's login, and an unsighted response of `s-2` at
 /// T0+5h lies inside a launch of a's profile from T0+4h, which only a pending file holds yet.
 /// Returns the profile and that launch, not yet written.
-#[cfg(feature = "test-hooks")]
 fn unsighted_inside_a_pending_launch(v: &View) -> (std::path::PathBuf, PendingLaunch) {
     v.event(T0 - D, "switch", None, Some(&v.b));
     v.index(&[v.usage("s-2", T0 + 5 * H, "model-a", 2, 0)]);
@@ -750,6 +751,54 @@ fn unsighted_inside_a_pending_launch(v: &View) -> (std::path::PathBuf, PendingLa
         ended_at_ms: Some(T0 + 6 * H),
     };
     (profile, launch)
+}
+
+/// Spec §7.2: launch evidence that cannot be read is never taken as absence. `unsighted` is
+/// an unsighted response at T0+1h, before the pending launch from T0+4h that covers the one at
+/// T0+5h, whose file `hide` makes unreadable one way or another. Both responses are
+/// unattributed: nothing of the launch can be seen, so it may have run at any time.
+fn unattributed_while_hidden(hide: impl FnOnce(&View, &std::path::Path) -> Vec<Chmod>) {
+    let v = View::new();
+    let (profile, launch) = unsighted_inside_a_pending_launch(&v);
+    launch.write(&profile, 4242).unwrap();
+    v.index(&[v.usage("s-1", T0 + H, "model-a", 1, 0)]);
+    let q = v.query(TokenPeriod::Day, TokenGrouping::Account);
+    assert_eq!(
+        keys(&v.report(&q)),
+        [
+            "day:2026-09-01|account:acct-b",
+            "day:2026-09-01|account:unattributed"
+        ],
+        "seen, the launch covers T0+5h alone"
+    );
+
+    let _hidden = hide(&v, &profile);
+    let r = v.report(&q);
+
+    assert_eq!(keys(&r), ["day:2026-09-01|account:unattributed"]);
+    assert_eq!(r.total.by_basis[2], (Basis::Unattributed, 3));
+}
+
+#[test]
+fn a_pending_directory_that_cannot_be_listed_counts_as_launched_at_every_time() {
+    // `run` can still write and rename its file in a directory at 0300, but no one can list it.
+    unattributed_while_hidden(|_, profile| {
+        vec![Chmod::new(&profile.join(PENDING_LAUNCH_DIR), 0o300)]
+    });
+}
+
+#[test]
+fn a_profile_whose_marker_cannot_be_read_counts_as_launched_at_every_time() {
+    // Whose profile it is cannot be told, so it counts for every provider, as its directory's
+    // name's account.
+    unattributed_while_hidden(|_, profile| vec![Chmod::new(&profile.join(MARKER_FILE), 0o000)]);
+}
+
+#[test]
+fn a_profiles_directory_that_cannot_be_listed_leaves_coverage_incomplete_at_every_time() {
+    unattributed_while_hidden(|v, _| {
+        vec![Chmod::new(&v.fx.env.data_dir().join("sessions"), 0o300)]
+    });
 }
 
 #[test]

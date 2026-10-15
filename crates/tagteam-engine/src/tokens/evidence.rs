@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::{
-    PendingEntry, PendingFile, PendingLaunch, ProfileMarker, Provider, Read, RecordEntry,
-    parse_session_record, profile_path, read_session_records_dated, record_is_live,
+    MARKER_FILE, PendingEntry, PendingFile, PendingLaunch, ProfileMarker, Provider, Read,
+    RecordEntry, parse_session_record, profile_path, read_own_bytes, read_session_records_dated,
+    record_is_live,
 };
 
 use crate::engine::Engine;
@@ -43,6 +44,29 @@ pub struct LaunchClose {
     /// Whether the launch is in its profile's pending file, as `run` left it or as this close
     /// wrote it. Always false for a launch the caller says is recorded.
     pub kept: bool,
+}
+
+/// `p`'s profiles, as `Engine::profiles` tells them.
+#[derive(Default)]
+struct Profiles {
+    /// Each profile whose marker names `p`, by account, with its directory.
+    ours: Vec<(AccountId, PathBuf)>,
+    /// Each directory whose marker could not be read, by its name's account: it may be `p`'s.
+    unknown: Vec<AccountId>,
+    /// `sessions/` is there but could not be listed: any profile may be `p`'s.
+    unlisted: bool,
+}
+
+/// What `p`'s profiles hold of pending launches, as `Engine::pending_evidence` read it.
+#[derive(Debug, Default)]
+pub(crate) struct PendingEvidence {
+    /// The launches the files hold or stand for, each with its file.
+    pub(crate) launches: Vec<(PendingFile, PendingLaunch)>,
+    /// The accounts whose profile's pending files could not be seen: its marker, or its pending
+    /// directory, could not be read. Any of them may hold a launch at any time.
+    pub(crate) unseen: Vec<AccountId>,
+    /// The profiles could not be listed: no profile's pending files were seen.
+    pub(crate) unlisted: bool,
 }
 
 /// One tenure of the child's session (spec §6.1): the reads of one execution's record (its
@@ -133,8 +157,9 @@ impl Engine {
                 }
             }
         }
+        // What could not be read gives the scan nothing to record: it is skipped.
         let epoch_ms = store.token_epoch()?.map(|e| e.at);
-        for (file, pending) in self.pending_launches(p, epoch_ms) {
+        for (file, pending) in self.pending_evidence(p, epoch_ms).launches {
             changed += self.record_pending(&store, &file, &pending)?;
         }
         for launch in store.launches(&provider)? {
@@ -161,69 +186,110 @@ impl Engine {
     }
 
     /// The homes the scan reads (spec §6.2): the default home (`""`), then each of `p`'s
-    /// profiles under the data directory's `sessions/`, by its account. A profile whose marker
-    /// names another provider, or cannot be read, is not `p`'s to place.
+    /// profiles (`profiles`), by its account.
     fn homes(&self, p: &dyn Provider) -> Vec<(String, PathBuf)> {
         let mut homes = Vec::new();
         if let Some(dir) = p.default_session_records_dir(&self.env) {
             homes.push((String::new(), dir));
         }
-        if !p.capabilities().sessions {
-            return homes;
-        }
-        let Ok(listing) = fs::read_dir(self.env.data_dir().join("sessions")) else {
-            return homes;
-        };
-        for entry in listing.flatten() {
-            let Some(account) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let profile = entry.path();
-            let ours = entry.file_type().is_ok_and(|t| t.is_dir())
-                && matches!(ProfileMarker::read(&profile), Read::Present(m) if m.provider == p.id());
-            if ours {
-                homes.push((account, p.session_records_dir(&profile)));
-            }
+        for (account, profile) in self.profiles(p).ours {
+            homes.push((account.as_str().to_owned(), p.session_records_dir(&profile)));
         }
         homes.sort();
         homes
     }
 
-    /// The pending launches in `p`'s profiles (spec §6.1), each with its file: those that name
-    /// `p` and the account whose profile holds them, and the open launch a file whose content
-    /// cannot be used stands for by its name (`launch_of`). Any other file is skipped and logged
-    /// at debug, never removed, and so is a directory that cannot be listed: one bad file never
-    /// fails a scan or a report.
-    pub(crate) fn pending_launches(
+    /// `p`'s profiles under the data directory's `sessions/`, as far as they can be told. A
+    /// directory whose marker names another provider, or that has none or one that does not
+    /// parse, is not `p`'s. One whose marker cannot be read, or whose kind cannot be told, may
+    /// be; so may any, when `sessions/` is there but cannot be listed (spec §7.2).
+    fn profiles(&self, p: &dyn Provider) -> Profiles {
+        let mut found = Profiles::default();
+        if !p.capabilities().sessions {
+            return found;
+        }
+        let listing = match fs::read_dir(self.env.data_dir().join("sessions")) {
+            Ok(listing) => listing,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return found;
+            }
+            Err(_) => {
+                found.unlisted = true;
+                return found;
+            }
+        };
+        for entry in listing {
+            let Ok(entry) = entry else {
+                found.unlisted = true;
+                continue;
+            };
+            let Some(account) = entry.file_name().to_str().map(AccountId::from_string) else {
+                continue;
+            };
+            let profile = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    found.unknown.push(account);
+                    continue;
+                }
+            }
+            match ProfileMarker::read(&profile) {
+                Read::Present(m) if m.provider == p.id() => found.ours.push((account, profile)),
+                Read::Present(_) | Read::Absent => {}
+                // A marker that reads but does not parse names no provider.
+                Read::Unreadable(_) => {
+                    if matches!(read_own_bytes(&profile, MARKER_FILE), Read::Unreadable(_)) {
+                        found.unknown.push(account);
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// What `p`'s profiles hold of pending launches (spec §6.1, §7.2): the launches their files
+    /// hold, or stand for by their names (`launch_of`), each with its file, and what could not
+    /// be read. A file that stands for none is skipped and logged at debug, never removed: one
+    /// bad file never fails a scan or a report. The scan records the launches alone; a report
+    /// never takes what it could not read for absence.
+    pub(crate) fn pending_evidence(
         &self,
         p: &dyn Provider,
         epoch_ms: Option<i64>,
-    ) -> Vec<(PendingFile, PendingLaunch)> {
+    ) -> PendingEvidence {
         let provider = p.id();
-        let mut found = Vec::new();
-        for (home, _) in self.homes(p) {
-            if home.is_empty() {
-                continue;
+        let profiles = self.profiles(p);
+        let mut evidence = PendingEvidence {
+            launches: Vec::new(),
+            unseen: profiles.unknown,
+            unlisted: profiles.unlisted,
+        };
+        for (account, profile) in profiles.ours {
+            match PendingLaunch::read_all(&profile) {
+                Read::Present(entries) => evidence.launches.extend(
+                    entries
+                        .into_iter()
+                        .filter_map(|entry| launch_of(entry, &provider, &account, epoch_ms)),
+                ),
+                Read::Absent => {}
+                Read::Unreadable(_) => evidence.unseen.push(account),
             }
-            let account = AccountId::from_string(home);
-            let entries = match PendingLaunch::read_all(&profile_path(&self.env, &account)) {
-                Read::Present(entries) => entries,
-                Read::Absent => continue,
-                Read::Unreadable(e) => {
-                    tracing::debug!(
-                        "a profile's pending launch files could not be listed; skipped: {}",
-                        e.detail
-                    );
-                    continue;
-                }
-            };
-            found.extend(
-                entries
-                    .into_iter()
-                    .filter_map(|entry| launch_of(entry, &provider, &account, epoch_ms)),
+        }
+        if evidence.unlisted || !evidence.unseen.is_empty() {
+            tracing::debug!(
+                profiles = evidence.unseen.len(),
+                all = evidence.unlisted,
+                "pending launches could not be read"
             );
         }
-        found
+        evidence
     }
 
     /// Spec §6.2: records the pending launch read from `file` open from its start, closes it at
