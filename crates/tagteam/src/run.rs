@@ -85,6 +85,7 @@ pub(crate) fn run_session(
             close_launch(
                 engine,
                 tracked.as_ref(),
+                false,
                 &profile,
                 &no_sighting,
                 engine.now_ms(),
@@ -119,7 +120,15 @@ pub(crate) fn run_session(
     notify(err, &engine.finish_run(launched, LaunchEnd::Exited(code)));
     // After exit handling, which unlinks this process's reservation: until then the profile
     // is in use by this very run, and the launch could never close here.
-    close_launch(engine, tracked.as_ref(), &profile, &seen, exited_at_ms, err);
+    close_launch(
+        engine,
+        tracked.as_ref(),
+        true,
+        &profile,
+        &seen,
+        exited_at_ms,
+        err,
+    );
     Ok(code)
 }
 
@@ -164,11 +173,17 @@ fn plan_launch(engine: &Engine, launched: &Launched, err: &mut dyn Write) -> Opt
 /// Token report spec §6.1, after exit handling: records the launch once more if it is still not
 /// recorded, ends the sighting the poll saw last at `exited_at_ms`, the child's exit, and closes
 /// the launch unless the profile is still in use, as by a background session the child left
-/// running. A launch that still cannot be recorded is logged and warned of on `err`, the child
-/// being gone, and the sighting's end is written all the same; a failure to close is a warning, and the next `sight_sessions` closes the launch then.
+/// running.
+///
+/// A launch that still cannot be recorded is logged, and warned of on `err` (the child being
+/// gone) when `child_ran`: with no child there is no usage to misplace. The close that follows
+/// fails for the same reason and is not warned of again, and the sighting's end is written all
+/// the same. Any other failure to close is a warning, and the next `sight_sessions` closes the
+/// launch then.
 fn close_launch(
     engine: &Engine,
     tracked: Option<&TrackedLaunch>,
+    child_ran: bool,
     profile: &Path,
     seen: &LaunchPoll,
     exited_at_ms: i64,
@@ -177,19 +192,26 @@ fn close_launch(
     let Some(tracked) = tracked else {
         return;
     };
+    let mut unrecorded = false;
     if !tracked.recorded.load(Ordering::Relaxed) {
         if let Err(e) = engine.record_launch(&tracked.id) {
+            unrecorded = true;
             tracing::warn!(
                 kind = e.kind(),
                 "could not record the session's launch for the token report"
             );
-            let _ = writeln!(
-                err,
-                "warning: the token report could not record this session's launch, so its usage may be credited to the default login's account: {e}"
-            );
+            if child_ran {
+                let _ = writeln!(
+                    err,
+                    "warning: the token report could not record this session's launch, so its usage may be credited to the default login's account: {e}"
+                );
+            }
         }
     }
     if let Err(e) = engine.close_launch(&tracked.id, profile, seen, exited_at_ms) {
+        if unrecorded {
+            return;
+        }
         let _ = writeln!(
             err,
             "warning: the token report could not record this session's end: {e}"
@@ -197,13 +219,13 @@ fn close_launch(
     }
 }
 
-/// Token report spec §6.1: runs `wait` on this thread while a scoped thread records the launch
-/// if it is not yet (every `RECORD_POLL`, until it is), then the child's pid, then reads the
-/// child's session record every `RECORD_POLL`, until `wait` returns. Returns what
-/// `wait` returned and the child's exit, stamped by `beside` before the poller is joined. The
-/// store writes are the poller's, so a busy store never delays the wait, the signals it
-/// forwards or the stamp. The poller never touches the cancel token or the terminal: a failure
-/// is logged, once, and the next poll tries again.
+/// Token report spec §6.1: runs `wait` on this thread while a scoped thread, every `RECORD_POLL`
+/// from its first tick until `wait` returns, records the launch if it is not yet, records the
+/// child's pid once it is, and reads the child's session record, whether or not the launch is
+/// recorded yet. Returns what `wait` returned and the child's exit, stamped by `beside` before
+/// the poller is joined. The store writes are the poller's, so a busy store never delays the
+/// wait, the signals it forwards or the stamp. The poller never touches the cancel token or the
+/// terminal: a failure is logged, once, and the next poll tries again.
 fn wait_polling<T>(
     engine: &Engine,
     launch: &TrackedLaunch,
@@ -223,14 +245,16 @@ fn wait_polling<T>(
                 if !launch.recorded.load(Ordering::Relaxed) {
                     match engine.record_launch(id) {
                         Ok(()) => launch.recorded.store(true, Ordering::Relaxed),
-                        Err(e) if !record_logged => {
-                            tracing::warn!(
-                                kind = e.kind(),
-                                "could not record the session's launch for the token report"
-                            );
-                            record_logged = true;
+                        Err(e) => {
+                            if !record_logged {
+                                tracing::warn!(
+                                    kind = e.kind(),
+                                    "could not record the session's launch for the token report"
+                                );
+                                record_logged = true;
+                            }
+                            pause_point("launch-retry-failed");
                         }
-                        Err(_) => {}
                     }
                 }
                 if launch.recorded.load(Ordering::Relaxed) && !pid_attached {
@@ -390,9 +414,10 @@ fn notify(err: &mut dyn Write, notices: &[String]) {
     }
 }
 
-/// A test-only stop at `name`: `before-spawn` is right after the token's last look, and
+/// A test-only stop at `name`: `before-spawn` is right after the token's last look,
 /// `after-exit` is between `claude`'s exit and its exit handling, while the reservation is still
-/// this process's. It parks through the engine's own protocol (`tagteam_engine::pause_at`), and
+/// this process's, and `launch-retry-failed` is in the poller, right after a retry of the launch
+/// record failed. It parks through the engine's own protocol (`tagteam_engine::pause_at`), and
 /// never looks at the token, so a signal sent meanwhile meets the run exactly where it would
 /// have.
 #[cfg(feature = "test-support")]
