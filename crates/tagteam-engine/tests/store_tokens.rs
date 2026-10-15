@@ -956,8 +956,9 @@ fn a_continued_sighting_never_bridges_a_read_of_another_session() {
 
 #[test]
 fn ending_a_tenure_sets_its_end_back_or_forward_by_its_full_key() {
-    // Spec §6.1: `run` ends a tenure at its last confirming read, below a later stamp too, and
-    // never before its first read. Only the tenure its full key names moves.
+    // Spec §6.1: run ends a tenure a switch ended exactly at its last confirmation, below a
+    // later stamp too, and never before its first read. Only the tenure its full key names
+    // moves.
     let (_d, s, _) = store();
     let ours = tenure("s1", "acct-a", T - 500, T, T + 10_000);
     let other_execution = tenure("s1", "acct-a", T - 400, T, T + 10_000);
@@ -973,37 +974,82 @@ fn ending_a_tenure_sets_its_end_back_or_forward_by_its_full_key() {
     let stored = |s: &Store| s.sightings(&cc()).unwrap();
     let with = |row: SightingRow| [row, other_execution.clone(), other_tenure.clone()];
 
-    s.set_sighting_last_at(&cc(), &end(T + 20_000, T + 20_001))
-        .unwrap();
+    s.end_sighting(&cc(), &end(T + 20_000, T + 20_001)).unwrap();
     assert_eq!(stored(&s), with(end(T + 20_000, T + 20_001)), "forward");
-    s.set_sighting_last_at(&cc(), &end(T + 9_000, T + 20_002))
-        .unwrap();
+    s.end_sighting(&cc(), &end(T + 9_000, T + 20_002)).unwrap();
     assert_eq!(
         stored(&s),
         with(end(T + 9_000, T + 20_002)),
         "back: a later stamp was not one of run's reads"
     );
-    s.set_sighting_last_at(&cc(), &end(T + 9_000, T + 20_003))
-        .unwrap();
+    s.end_sighting(&cc(), &end(T + 9_000, T + 20_003)).unwrap();
     assert_eq!(
         stored(&s),
         with(end(T + 9_000, T + 20_002)),
         "the same end writes nothing"
     );
-    s.set_sighting_last_at(&cc(), &end(T - 5_000, T + 20_004))
-        .unwrap();
+    s.end_sighting(&cc(), &end(T - 5_000, T + 20_004)).unwrap();
     assert_eq!(
         stored(&s),
         with(end(T, T + 20_004)),
         "an end before the first read clamps to it"
     );
-    s.set_sighting_last_at(&cc(), &tenure("s1", "acct-a", T - 600, T, T + 30_000))
-        .unwrap();
-    assert_eq!(
-        stored(&s),
-        with(end(T, T + 20_004)),
-        "a key that names no tenure writes nothing"
-    );
+}
+
+#[test]
+fn ending_a_tenure_stores_it_and_clamps_the_session_s_other_tenures_there() {
+    // Spec §6.1, §6.4: a tenure no write stored yet is stored by its end. Every other tenure of
+    // the session in that execution and home that began by the end and runs past it is clamped
+    // to it: a scan or a statusline may have continued one over the time the session was away.
+    // Tenures that began after the end, and other sessions, executions and homes, keep theirs.
+    let (_d, s, _) = store();
+    let started = T - 500;
+    let bridged = tenure("s1", "acct-a", started, T + 10, T + 90_000);
+    let inside = tenure("s1", "acct-a", started, T + 20, T + 5_000);
+    let later = tenure("s1", "acct-a", started, T + 30_000, T + 90_000);
+    let other_execution = tenure("s1", "acct-a", started + 1, T + 10, T + 90_000);
+    let other_home = tenure("s1", "", started, T + 10, T + 90_000);
+    let other_session = tenure("s2", "acct-a", started, T + 10, T + 90_000);
+    for row in [
+        &bridged,
+        &inside,
+        &later,
+        &other_execution,
+        &other_home,
+        &other_session,
+    ] {
+        s.record_sighting(&cc(), row, 0).unwrap();
+    }
+    let ours = SightingRow {
+        source: SightingSource::Run,
+        recorded_at: T + 95_000,
+        ..tenure("s1", "acct-a", started, T, T + 20_000)
+    };
+
+    s.end_sighting(&cc(), &ours).unwrap();
+    let clamped = SightingRow {
+        last_at: T + 20_000,
+        recorded_at: T + 95_000,
+        ..bridged
+    };
+    let mut want = vec![
+        ours,
+        other_home,
+        clamped,
+        other_execution,
+        inside,
+        later,
+        other_session,
+    ];
+    want.sort_by(|a, b| {
+        (&a.session_id, a.first_at, &a.home, a.started_at).cmp(&(
+            &b.session_id,
+            b.first_at,
+            &b.home,
+            b.started_at,
+        ))
+    });
+    assert_eq!(s.sightings(&cc()).unwrap(), want);
 }
 
 #[test]
