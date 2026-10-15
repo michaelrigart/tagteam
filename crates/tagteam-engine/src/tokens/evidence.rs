@@ -213,7 +213,7 @@ impl Engine {
         )?)
     }
 
-    /// Spec §6.1's check, on every 50 ms tick while the child runs; it reads the filesystem only.
+    /// Spec §6.1's check, on every 50 ms tick while the child runs; it never touches the store.
     /// The child's record, `<records dir>/<pid>.json`, is `stat`ed. An mtime unchanged since the
     /// read that named the current tenure's session confirms that tenure now: Claude Code
     /// rewrites the record when its session changes (spec §7.4 A3). A moved mtime is read. This
