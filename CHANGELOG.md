@@ -38,6 +38,12 @@ with the one before, so any release may contain breaking changes. Each section s
   and answers status requests, for the TUI and for scripts.
 - `tagteam doctor` reports the daemon, its service unit, its socket and its notifications.
 - The internal `tagteam-daemon` crate on crates.io.
+- `tagteam tui`, a terminal UI: the accounts table as `tagteam list` shows it, with gauges and
+  a detail pane for the selected account, and usage history with a sparkline per window. Its
+  keys run tagteam's own commands (switch, enable and disable, alias, move, remove, add and
+  doctor), and `R` runs a session as `tagteam run` does. It refreshes every 30 seconds, and
+  collects usage only when `list` would. On a terminal, a bare `tagteam` now opens it; in a
+  pipe, or with `--json`, it still runs `list`.
 
 ### Changed
 

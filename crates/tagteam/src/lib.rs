@@ -25,6 +25,7 @@ mod signals;
 mod statusline;
 mod tokens_cmd;
 mod transfer_cmd;
+mod tui_cmd;
 pub mod tui_host;
 
 const TEXT_UNDER_JSON: &str = "--help and --version print text; run them without --json";
@@ -68,6 +69,18 @@ fn status_bar_line(cli: &cli::Cli) -> bool {
             print_config: false
         })
     ) && !cli.json
+}
+
+/// TUI spec §3: whether this call opens the TUI. `tui` always does, and refuses for itself
+/// what it must; a bare `tagteam` does only for a person at a terminal (`terminal`: stdin and
+/// stdout are both terminals) and without `--json`, and runs `list` anywhere else, so scripts
+/// and pipes see no change.
+fn opens_tui(cli: &cli::Cli, terminal: bool) -> bool {
+    match cli.command {
+        Some(cli::Command::Tui { .. }) => true,
+        None => terminal && !cli.json,
+        Some(_) => false,
+    }
 }
 
 /// §5: the root refusal comes before anything is created, and logging creates the log's
@@ -136,6 +149,12 @@ where
         let stdin = std::io::stdin();
         statusline::drain(stdin.lock(), stdin.is_terminal());
     }
+    // TUI spec §3: `tui`, and a bare `tagteam` with a person at the terminal, open the TUI. Its
+    // log never writes to stderr, where the TUI draws (§10.3).
+    let tui = opens_tui(
+        &cli,
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+    );
     // §5: every default path derives from `HOME`, so an unusable one refuses the command here,
     // before any engine exists, and nothing is created under `/` or the working directory.
     let ctx = match app::Context::from_process() {
@@ -160,6 +179,7 @@ where
             logging::LogConfig {
                 debug: cli.debug,
                 color: !cli.no_color && !ctx.no_color_env,
+                stderr: !tui,
                 log_file: ctx.env.log_file(),
                 home: ctx.env.home.clone(),
                 filter: std::env::var_os(logging::TAGTEAM_LOG),
@@ -185,6 +205,9 @@ where
             std::io::stderr(),
             "warning: could not catch signals, so one stops tagteam where it lands: {e}"
         );
+    }
+    if tui {
+        return tui_cmd::run(&cli, ctx);
     }
     let mut prompter = prompt::TtyPrompter::new(ctx.env.cancel.clone());
     // Unlocked on purpose: each write locks for itself. Holding the locks across `run` would
@@ -255,5 +278,32 @@ mod tests {
         assert_eq!(code, None);
         assert!(inited.get());
         assert!(out.is_empty() && err.is_empty());
+    }
+
+    fn parsed(args: &[&str]) -> cli::Cli {
+        cli::Cli::try_parse_from(std::iter::once("tagteam").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn a_bare_tagteam_opens_the_tui_only_for_a_person_at_a_terminal() {
+        // TUI spec §3.
+        assert!(opens_tui(&parsed(&[]), true));
+        assert!(!opens_tui(&parsed(&[]), false), "a pipe gets `list`");
+        assert!(
+            !opens_tui(&parsed(&["--json"]), true),
+            "`--json` gets `list`"
+        );
+        assert!(
+            opens_tui(&parsed(&["--no-color", "--provider", "claude-code"]), true),
+            "the global flags apply as they would to `tui`"
+        );
+        assert!(!opens_tui(&parsed(&["list"]), true));
+    }
+
+    #[test]
+    fn tui_always_opens_the_tui_which_refuses_for_itself() {
+        assert!(opens_tui(&parsed(&["tui"]), false));
+        assert!(opens_tui(&parsed(&["tui", "--json"]), true));
+        assert!(opens_tui(&parsed(&["tui", "history"]), true));
     }
 }

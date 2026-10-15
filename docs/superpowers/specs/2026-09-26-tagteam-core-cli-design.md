@@ -2491,8 +2491,9 @@ command except `statusline` then refuses, naming the file; `statusline` prints n
 
 ### 13.1 Commands
 
-`tagteam [--json] [--debug] [--no-color] [--provider P | -p P] <command>`. A bare `tagteam` runs
-`list`, until the TUI lands in sub-project 3.
+`tagteam [--json] [--debug] [--no-color] [--provider P | -p P] <command>`. A bare `tagteam`
+opens the TUI (sub-project 3) when stdin and stdout are terminals and `--json` is not given;
+otherwise it runs `list`.
 
 **Which provider a command acts on:**
 1. an explicit `--provider`
@@ -2509,6 +2510,7 @@ exactly as it would without providers.
 |---|---|
 | `list` / `ls` | Every account with its 5h, 7d, spend and scoped usage, reset countdowns, markers (active, disabled, quarantined, in a session, ahead of pace) and data age. It fetches only when due (§8.3) |
 | `status` | The live account |
+| `tui [accounts\|tokens\|history]` | The terminal UI ([sub-project 3](2026-10-14-tagteam-tui-design.md)): the accounts, the token report and usage history, with the account actions. A bare `tagteam` on a terminal opens it |
 | `switch [ACCOUNT] [--strategy best\|next-available [--model M]] [--force]` | §9 |
 | `add`, `add-token`, `remove` / `rm`, `disable`, `enable`, `alias`, `move` | §10 |
 | `auto` | §11 |
@@ -3874,7 +3876,8 @@ Each is a one-liner, and each gets at least one test.
 | `config …` | `config …` | TOML instead of JSON; snake_case keys |
 | `export` / `import` | same | age-encrypted by default; imports cswap v1 exports |
 | `unclaimed [--purge ID]` | `displaced [--purge ID...]` | Rescued successors are adopted automatically |
-| `tui`, `watch`, `menubar` | — | Sub-projects 3 and 4 |
+| `tui`, `watch` | `tui` | One command for both ([sub-project 3](2026-10-14-tagteam-tui-design.md)) |
+| `menubar` | — | Sub-project 4 |
 | `upgrade`, update check | — | Dropped; package managers handle it |
 | `purge` | `purge [--provider P]` | Keeps `config.toml` (§10.5) |
 | — | `history`, `statusline`, `doctor`, `completions`, `shell-init`, `tokens` | New |

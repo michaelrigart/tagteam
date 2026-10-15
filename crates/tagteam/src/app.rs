@@ -273,7 +273,7 @@ pub struct Io<'a> {
 
 /// The providers this build registers (§4.5), over the context's Keychain and platform, with
 /// every endpoint under the test base when one is set.
-fn build_registry(ctx: &Context) -> ProviderRegistry {
+pub(crate) fn build_registry(ctx: &Context) -> ProviderRegistry {
     let mut cc = ClaudeCode::new(ctx.keychain.clone(), ctx.platform);
     if let Some(base) = &ctx.api_base {
         cc = cc.with_endpoints(Endpoints::with_base(base));
@@ -376,7 +376,7 @@ pub(crate) fn command_settings(
 /// `command_settings` chooses it): its own tables come first. `env` is the effective
 /// environment `locate` returned with `run_shell`. The HTTP adapter is built on its first
 /// request, never before (§13.5), and the oracle sends through the same one.
-fn build_engine(
+pub(crate) fn build_engine(
     ctx: Context,
     registry: ProviderRegistry,
     run_shell: RunShell,
@@ -644,7 +644,7 @@ pub(crate) fn env_flag(name: &str) -> bool {
 
 /// §13.1 and §6.4: `--no-color` and `NO_COLOR` always turn colour off, `FORCE_COLOR` turns it
 /// on, and otherwise `ui.color` decides, `auto` meaning "stdout is a terminal".
-fn color_enabled(
+pub(crate) fn color_enabled(
     flag_off: bool,
     no_color: bool,
     force_color: bool,
@@ -763,6 +763,17 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
             cli.provider,
             *print_config,
         ));
+    }
+    // TUI spec §3: the TUI runs only from the binary, on its terminal (`tui_cmd`). An
+    // in-process caller has none to hand over.
+    if let Some(Command::Tui { .. }) = &cli.command {
+        let message = if json {
+            crate::tui_cmd::TUI_UNDER_JSON
+        } else {
+            crate::tui_cmd::NEEDS_TERMINAL
+        };
+        fail(io, json, KIND_USAGE, message);
+        return Ended::Code(EXIT_USAGE);
     }
     // §12.8: the run shell is found through the registered providers, so the registry comes
     // first. Under a marker that cannot be read the outer home is unknown, and nothing runs.
@@ -886,6 +897,7 @@ fn command_name(command: &Command) -> &'static str {
     match command {
         Command::List => "list",
         Command::Status => "status",
+        Command::Tui { .. } => "tui",
         Command::Switch { .. } => "switch",
         Command::Add { .. } => "add",
         Command::AddToken { .. } => "add-token",
@@ -1410,6 +1422,7 @@ impl App<'_, '_> {
             Command::Statusline { .. } => unreachable!("run answers statusline before dispatch"),
             Command::ShellInit { .. } => unreachable!("run answers shell-init before dispatch"),
             Command::Run { .. } => unreachable!("run_command answers run before dispatch"),
+            Command::Tui { .. } => unreachable!("run_command answers tui before dispatch"),
             Command::Config { action } => self.config(action)?,
             Command::Displaced { purge, yes } => self.displaced(purge, yes)?,
             Command::Purge {
