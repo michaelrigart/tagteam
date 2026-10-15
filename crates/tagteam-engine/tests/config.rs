@@ -457,6 +457,13 @@ fn the_spec_s_ranges_and_spellings_hold_at_both_ends_and_nothing_is_clamped() {
             &["", "{bogus}", "{5h"],
         ),
         ("run.share_extra", &["hook-data", ""], &["a/b", ".."]),
+        ("daemon.autoswitch", &["no", "true"], &["paused", "2", ""]),
+        ("notify.enabled", &["false", "yes"], &["off"]),
+        (
+            "notify.events",
+            &["limit, switch", ""],
+            &["beep", "switch,,limit", "Switch"],
+        ),
     ];
     for (name, taken, refused) in cases {
         for raw in *refused {
@@ -480,6 +487,14 @@ fn the_spec_s_ranges_and_spellings_hold_at_both_ends_and_nothing_is_clamped() {
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(settings.threshold, 99.9);
     assert_eq!(settings.color, ColorMode::Never);
+    assert_eq!(
+        (
+            settings.daemon_autoswitch,
+            settings.notify_enabled,
+            settings.notify_events
+        ),
+        (true, true, Vec::new())
+    );
 }
 
 #[test]
@@ -519,6 +534,7 @@ fn sample(kind: &KeyKind) -> String {
         KeyKind::Format => "{account} · {7d}%".into(),
         KeyKind::ShareNames => "hook-data".into(),
         KeyKind::Provider => cc().to_string(),
+        KeyKind::NotifyEvents => "limit, switch".into(),
     }
 }
 
@@ -572,6 +588,7 @@ fn a_key_no_provider_table_may_hold_refuses_under_either_spelling() {
         ("usage.history_retention_days", "30"),
         ("tokens.retention_days", "90"),
         ("default_provider", "claude-code"),
+        ("notify.enabled", "false"),
     ] {
         let prefixed = format!("provider.claude-code.{name}");
         assert_eq!(

@@ -8,9 +8,9 @@ use tagteam_core::autoswitch::Strategy;
 use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_engine::settings::{
     self, COOLDOWN_SECONDS_RANGE, ColorMode, HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE,
-    Inspection, KEYS, Key, KeyKind, KeyState, STATUSLINE_PLACEHOLDERS, Settings, SettingsError,
-    Source, THRESHOLD_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect, is_statusline_placeholder,
-    parse_bool, resolve,
+    Inspection, KEYS, Key, KeyKind, KeyState, NotifyEvent, STATUSLINE_PLACEHOLDERS, Settings,
+    SettingsError, Source, THRESHOLD_RANGE, UNHEALTHY_TICKS_RANGE, Value, inspect,
+    is_statusline_placeholder, parse_bool, resolve,
 };
 use tagteam_provider::Env;
 
@@ -54,6 +54,9 @@ fn the_defaults_are_the_specs_table() {
     assert_eq!(d.color, ColorMode::Auto);
     assert!(d.share_extra.is_empty());
     assert!(d.prices.is_empty());
+    assert!(d.daemon_autoswitch);
+    assert!(d.notify_enabled);
+    assert_eq!(d.notify_events, NotifyEvent::ALL);
 }
 
 #[test]
@@ -109,6 +112,13 @@ share_extra = ["hook-data"]
 
 [provider.claude-code.prices."claude-opus-5-5"]
 input = 4.0
+
+[daemon]
+autoswitch = false
+
+[notify]
+enabled = false
+events = ["limit", "switch"]
 "#,
     );
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -142,6 +152,9 @@ input = 4.0
                     }
                 )])
             )]),
+            daemon_autoswitch: false,
+            notify_enabled: false,
+            notify_events: vec![NotifyEvent::Limit, NotifyEvent::Switch],
         }
     );
 }
@@ -1072,6 +1085,9 @@ fn the_registry_is_section_six_four_s_table_in_order() {
                 KeyKind::Choice(&["auto", "always", "never"]),
                 false
             ),
+            ("daemon.autoswitch", KeyKind::Bool, true),
+            ("notify.enabled", KeyKind::Bool, false),
+            ("notify.events", KeyKind::NotifyEvents, true),
         ]
     );
 }
@@ -1122,6 +1138,9 @@ fn every_key_reads_back_its_default_from_the_settings() {
             ),
             ("run.share_extra", list(&[])),
             ("ui.color", Value::Str("auto".into())),
+            ("daemon.autoswitch", Value::Bool(true)),
+            ("notify.enabled", Value::Bool(true)),
+            ("notify.events", list(&["switch", "quarantine", "limit"])),
         ]
     );
 }
@@ -1184,6 +1203,17 @@ fn each_key_says_what_a_valid_value_is() {
     assert_eq!(
         expect("ui.color"),
         "must be \"auto\", \"always\" or \"never\""
+    );
+    for name in ["daemon.autoswitch", "notify.enabled"] {
+        assert_eq!(
+            expect(name),
+            "must be true, false, 1, 0, yes or no",
+            "{name}"
+        );
+    }
+    assert_eq!(
+        expect("notify.events"),
+        "must be \"switch\", \"quarantine\" or \"limit\", or a list of them"
     );
 }
 
@@ -1739,7 +1769,7 @@ fn every_refusal_says_what_the_value_must_be() {
 }
 
 /// One command-line sample per registry key, in the registry's order.
-const SAMPLES: [(&str, &str); 14] = [
+const SAMPLES: [(&str, &str); 17] = [
     ("default_provider", "fake-agent"),
     ("autoswitch.threshold", "75.5"),
     ("autoswitch.interval_seconds", "120"),
@@ -1754,6 +1784,9 @@ const SAMPLES: [(&str, &str); 14] = [
     ("statusline.format", "{account} {5h}%"),
     ("run.share_extra", ""),
     ("ui.color", "always"),
+    ("daemon.autoswitch", "no"),
+    ("notify.enabled", "0"),
+    ("notify.events", "limit, switch"),
 ];
 
 /// A `config.toml` holding `value` at `key`'s global spot, written as `Value::to_item` stores it.
@@ -2243,4 +2276,191 @@ input = 4.0
     );
     assert!(i.warnings.is_empty(), "{:?}", i.warnings);
     assert_eq!(i.keys.len(), KEYS.len(), "a price table is no registry key");
+}
+
+#[test]
+fn the_daemon_and_notify_keys_are_read_from_their_tables_the_provider_s_first() {
+    // D7: `daemon.autoswitch` and `notify.events` are per provider, `notify.enabled` global.
+    let text = "[daemon]\nautoswitch = true\n[notify]\nenabled = \"no\"\nevents = [\"switch\", \"limit\"]\n\n\
+                [provider.claude-code.daemon]\nautoswitch = false\n\
+                [provider.claude-code.notify]\nevents = []\n";
+    let (s, warnings) = load(text);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        (s.daemon_autoswitch, s.notify_enabled, s.notify_events),
+        (false, false, Vec::new()),
+        "an empty list in the provider's table overrides the global one"
+    );
+    let (s, warnings) = load_as(text, "fake-agent");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        (s.daemon_autoswitch, s.notify_enabled, s.notify_events),
+        (true, false, vec![NotifyEvent::Switch, NotifyEvent::Limit]),
+        "another provider's table does not apply"
+    );
+}
+
+#[test]
+fn notify_enabled_is_global_and_no_provider_table_can_hold_it() {
+    // D7, like `ui.color`: a provider table's `notify.enabled` is an unknown key, never applied,
+    // and neither spelling of it resolves for `config`.
+    let i = inspect_as(
+        "[notify]\nenabled = true\n\
+         [provider.claude-code.notify]\nenabled = false\nevents = \"limit\"\n",
+        PROVIDER,
+    );
+    assert!(i.warnings.is_empty(), "{:?}", i.warnings);
+    let enabled = state(&i, "notify.enabled");
+    assert_eq!(
+        (&enabled.value, enabled.source),
+        (&Value::Bool(true), Source::Global)
+    );
+    let events = state(&i, "notify.events");
+    assert_eq!(
+        (&events.value, events.source),
+        (&list(&["limit"]), Source::Provider)
+    );
+    assert_eq!(i.unknown, ["provider.claude-code.notify.enabled"]);
+    let cc = ProviderId::new(PROVIDER);
+    for (name, flag) in [
+        ("provider.claude-code.notify.enabled", None),
+        ("notify.enabled", Some(&cc)),
+    ] {
+        assert!(
+            matches!(resolve(name, flag), Err(SettingsError::NotPerProvider(k)) if k == "notify.enabled"),
+            "{name}"
+        );
+    }
+    for name in [
+        "provider.claude-code.daemon.autoswitch",
+        "provider.claude-code.notify.events",
+    ] {
+        assert_eq!(
+            resolve(name, None).unwrap().provider,
+            Some(cc.clone()),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn notify_events_take_a_kind_or_a_list_and_collapse_repeats() {
+    use NotifyEvent::{Limit, Quarantine, Switch};
+    for (text, want) in [
+        ("\"limit\"", vec![Limit]),
+        ("[\"limit\", \"switch\", \"limit\"]", vec![Limit, Switch]),
+        ("[]", Vec::new()),
+        (
+            "[\"quarantine\", \"switch\", \"limit\", \"switch\"]",
+            vec![Quarantine, Switch, Limit],
+        ),
+    ] {
+        let (s, warnings) = load(&format!("[notify]\nevents = {text}\n"));
+        assert_eq!(s.notify_events, want, "{text}");
+        assert!(warnings.is_empty(), "{text}: {warnings:?}");
+    }
+    assert_eq!(
+        NotifyEvent::ALL.map(NotifyEvent::as_str),
+        ["switch", "quarantine", "limit"]
+    );
+    for e in NotifyEvent::ALL {
+        assert_eq!(NotifyEvent::parse(e.as_str()), Some(e));
+    }
+    for name in ["Switch", "quarantined", "", " limit", "all"] {
+        assert_eq!(NotifyEvent::parse(name), None, "{name:?}");
+    }
+}
+
+#[test]
+fn an_invalid_daemon_or_notify_value_falls_back_with_one_warning_naming_the_key() {
+    // §6.4's forgiving read, and Review Focus 1's premise: a `daemon.autoswitch` that cannot be
+    // read is its default, true, and says so.
+    const BOOL: &str = "must be true, false, 1, 0, yes or no";
+    const EVENTS: &str = "must be \"switch\", \"quarantine\" or \"limit\", or a list of them";
+    for (text, key, expect) in [
+        (
+            "[daemon]\nautoswitch = \"paused\"\n",
+            "daemon.autoswitch",
+            BOOL,
+        ),
+        ("[daemon]\nautoswitch = 2\n", "daemon.autoswitch", BOOL),
+        ("[notify]\nenabled = \"off\"\n", "notify.enabled", BOOL),
+        (
+            "[notify]\nevents = [\"switch\", \"beep\"]\n",
+            "notify.events",
+            EVENTS,
+        ),
+        (
+            "[notify]\nevents = [\"switch\", 3]\n",
+            "notify.events",
+            EVENTS,
+        ),
+        (
+            "[notify]\nevents = \"switch,limit\"\n",
+            "notify.events",
+            EVENTS,
+        ),
+        ("[notify]\nevents = \"\"\n", "notify.events", EVENTS),
+        ("[notify]\nevents = true\n", "notify.events", EVENTS),
+    ] {
+        let (s, warnings) = load(text);
+        assert_eq!(
+            (s.daemon_autoswitch, s.notify_enabled, s.notify_events),
+            (true, true, NotifyEvent::ALL.to_vec()),
+            "{text}"
+        );
+        assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
+        assert!(
+            warnings[0].ends_with(&format!("`{key}` {expect} (ignored)")),
+            "{warnings:?}"
+        );
+    }
+    // An invalid provider value warns, naming the provider's key, and the global one applies.
+    let (s, warnings) = load(
+        "[daemon]\nautoswitch = false\n[notify]\nevents = [\"limit\"]\n\
+         [provider.claude-code.daemon]\nautoswitch = \"off\"\n\
+         [provider.claude-code.notify]\nevents = [\"Switch\"]\n",
+    );
+    assert_eq!(
+        (s.daemon_autoswitch, s.notify_events),
+        (false, vec![NotifyEvent::Limit])
+    );
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    for key in ["daemon.autoswitch", "notify.events"] {
+        let named = format!("`provider.claude-code.{key}`");
+        assert!(warnings.iter().any(|w| w.contains(&named)), "{warnings:?}");
+    }
+}
+
+#[test]
+fn the_daemon_and_notify_keys_on_the_command_line_are_strict() {
+    // §6.4: `set` refuses what a read would only warn about.
+    for name in ["daemon.autoswitch", "notify.enabled"] {
+        let key = reg(name);
+        assert_eq!(key.parse_arg("no"), Ok(Value::Bool(false)), "{name}");
+        assert_eq!(key.parse_arg("paused"), Err(key.expect()), "{name}");
+    }
+    let events = reg("notify.events");
+    assert_eq!(
+        events.parse_arg("limit, switch"),
+        Ok(list(&["limit", "switch"]))
+    );
+    assert_eq!(
+        events.parse_arg("switch,switch,quarantine"),
+        Ok(list(&["switch", "quarantine"])),
+        "a repeat collapses into its first"
+    );
+    assert_eq!(events.parse_arg(""), Ok(list(&[])), "'' is the empty list");
+    for raw in ["beep", "Switch", "switch,all", "limits"] {
+        assert_eq!(events.parse_arg(raw), Err(events.expect()), "{raw:?}");
+    }
+    for raw in ["switch,,limit", " , ", "limit,"] {
+        assert!(
+            events
+                .parse_arg(raw)
+                .unwrap_err()
+                .starts_with("must be event names separated by commas, with no empty item"),
+            "{raw:?}"
+        );
+    }
 }

@@ -111,6 +111,36 @@ impl ColorMode {
     }
 }
 
+/// D6.1's notification kinds, as `notify.events` names them (D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NotifyEvent {
+    Switch,
+    Quarantine,
+    Limit,
+}
+
+impl NotifyEvent {
+    /// Every kind, in D7's order: `notify.events`' default.
+    pub const ALL: [NotifyEvent; 3] = [
+        NotifyEvent::Switch,
+        NotifyEvent::Quarantine,
+        NotifyEvent::Limit,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotifyEvent::Switch => "switch",
+            NotifyEvent::Quarantine => "quarantine",
+            NotifyEvent::Limit => "limit",
+        }
+    }
+
+    /// The kind `s` names, spelled exactly as `as_str` spells it.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|e| e.as_str() == s)
+    }
+}
+
 /// What a key holds: how it is read from the file, parsed from the command line and written.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum KeyKind {
@@ -133,6 +163,9 @@ pub enum KeyKind {
     /// `default_provider`: a well-formed provider id. Whether this build has that provider is
     /// the CLI's check.
     Provider,
+    /// `notify.events`: D6.1's kinds, as [`NotifyEvent`] spells them. A kind repeated collapses
+    /// into its first.
+    NotifyEvents,
 }
 
 /// One §6.4 key.
@@ -149,8 +182,8 @@ pub struct Key {
 const STRATEGIES: &[&str] = &["best", "consume-first"];
 const COLORS: &[&str] = &["auto", "always", "never"];
 
-/// Every §6.4 key, in the order of the spec's table. The auto-switch bounds are M3b's
-/// `*_RANGE` constants, which `auto` clamps its flags to.
+/// Every §6.4 key, in the order of the spec's table, then the daemon's three (D7). The
+/// auto-switch bounds are M3b's `*_RANGE` constants, which `auto` clamps its flags to.
 pub const KEYS: &[Key] = &[
     Key {
         name: "default_provider",
@@ -237,6 +270,21 @@ pub const KEYS: &[Key] = &[
         kind: KeyKind::Choice(COLORS),
         per_provider: false,
     },
+    Key {
+        name: "daemon.autoswitch",
+        kind: KeyKind::Bool,
+        per_provider: true,
+    },
+    Key {
+        name: "notify.enabled",
+        kind: KeyKind::Bool,
+        per_provider: false,
+    },
+    Key {
+        name: "notify.events",
+        kind: KeyKind::NotifyEvents,
+        per_provider: true,
+    },
 ];
 
 /// The registry's key called `name`, a dotted name without any `provider.<id>.` prefix.
@@ -293,6 +341,10 @@ impl Key {
                 "must be a provider id of lowercase letters, digits and dashes, such as \"claude-code\""
                     .to_owned()
             }
+            KeyKind::NotifyEvents => format!(
+                "must be {}, or a list of them",
+                one_of(&NotifyEvent::ALL.map(NotifyEvent::as_str))
+            ),
         }
     }
 
@@ -327,6 +379,7 @@ impl Key {
                 let s = item.as_str()?;
                 is_provider_id(s).then(|| Value::Str(s.to_owned()))
             }
+            KeyKind::NotifyEvents => notify_events_from_item(item).map(Value::List),
         }
     }
 
@@ -383,6 +436,12 @@ impl Key {
             }
             KeyKind::Provider if is_provider_id(raw) => Ok(Value::Str(raw.to_owned())),
             KeyKind::Provider => Err(self.expect()),
+            KeyKind::NotifyEvents => {
+                let names = list_arg(raw, "event names")?;
+                collapse_events(names)
+                    .map(Value::List)
+                    .ok_or_else(|| self.expect())
+            }
         }
     }
 }
@@ -446,6 +505,33 @@ fn collapse_models(names: Vec<String>) -> Option<Vec<String>> {
     }
     let mixed = unique.len() > 1 && unique.iter().any(|n| n.eq_ignore_ascii_case("all"));
     (!mixed).then_some(unique)
+}
+
+/// `notify.events` as the file holds it: a kind or a list of kinds. Any other value, or an item
+/// that is not a kind, makes the whole value invalid.
+fn notify_events_from_item(item: &Item) -> Option<Vec<String>> {
+    let names: Vec<String> = match item.as_str() {
+        Some(one) => vec![one.to_owned()],
+        None => item
+            .as_array()?
+            .iter()
+            .map(|v| v.as_str().map(str::to_owned))
+            .collect::<Option<_>>()?,
+    };
+    collapse_events(names)
+}
+
+/// D7's rule for `notify.events`, from the file or the command line alike: every item is a kind
+/// as [`NotifyEvent`] spells it, and a repeated kind collapses into its first.
+fn collapse_events(names: Vec<String>) -> Option<Vec<String>> {
+    let mut unique: Vec<String> = Vec::with_capacity(names.len());
+    for name in names {
+        NotifyEvent::parse(&name)?;
+        if !unique.contains(&name) {
+            unique.push(name);
+        }
+    }
+    Some(unique)
 }
 
 /// A non-empty format whose every `{…}` is one of §13.5's placeholders. The scan is the
@@ -723,6 +809,14 @@ pub struct Settings {
     /// field as read, one that is not valid dropped with a warning. Not a registry key:
     /// `config` neither lists nor writes it.
     pub prices: BTreeMap<ProviderId, BTreeMap<String, PriceOverride>>,
+    /// `daemon.autoswitch` (D7): whether the daemon switches this provider's accounts; false
+    /// pauses it (D4.3). `tagteam auto` ignores it. The provider's own table first.
+    pub daemon_autoswitch: bool,
+    /// `notify.enabled` (D7): every notification on or off. The same for every provider.
+    pub notify_enabled: bool,
+    /// `notify.events` (D7): the kinds the daemon notifies, in the order written. The provider's
+    /// own table first.
+    pub notify_events: Vec<NotifyEvent>,
 }
 
 impl Default for Settings {
@@ -743,6 +837,9 @@ impl Default for Settings {
             color: ColorMode::Auto,
             share_extra: Vec::new(),
             prices: BTreeMap::new(),
+            daemon_autoswitch: true,
+            notify_enabled: true,
+            notify_events: NotifyEvent::ALL.to_vec(),
         }
     }
 }
@@ -784,6 +881,14 @@ impl Settings {
             "statusline.format" => Value::Str(self.statusline_format.clone()),
             "run.share_extra" => Value::List(self.share_extra.clone()),
             "ui.color" => Value::Str(self.color.as_str().to_owned()),
+            "daemon.autoswitch" => Value::Bool(self.daemon_autoswitch),
+            "notify.enabled" => Value::Bool(self.notify_enabled),
+            "notify.events" => Value::List(
+                self.notify_events
+                    .iter()
+                    .map(|e| e.as_str().to_owned())
+                    .collect(),
+            ),
             other => unreachable!("`{other}` is not a registry key"),
         }
     }
@@ -817,6 +922,11 @@ impl Settings {
                     "never" => ColorMode::Never,
                     _ => ColorMode::Auto,
                 }
+            }
+            ("daemon.autoswitch", Value::Bool(b)) => self.daemon_autoswitch = b,
+            ("notify.enabled", Value::Bool(b)) => self.notify_enabled = b,
+            ("notify.events", Value::List(names)) => {
+                self.notify_events = names.iter().filter_map(|n| NotifyEvent::parse(n)).collect()
             }
             (name, value) => unreachable!("the registry never gives `{name}` {value:?}"),
         }
