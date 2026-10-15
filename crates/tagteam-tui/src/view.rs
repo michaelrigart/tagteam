@@ -219,7 +219,11 @@ fn banner_rows(text: &str, width: usize) -> Vec<String> {
 /// The toast's rows, when the footer shows it: not once the shutdown has begun.
 fn toast_rows(state: &State, width: usize) -> Option<Vec<String>> {
     let toast = state.toast.as_ref().filter(|_| state.quitting.is_none())?;
-    Some(wrap_rows(&toast.text, width, WRAP_ROWS))
+    let mut rows = wrap_rows(&toast.text, width, WRAP_ROWS);
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    Some(rows)
 }
 
 pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
@@ -681,5 +685,15 @@ mod tests {
             ["    no rate yet"],
             "a line with nothing past the indent takes its first part unseparated"
         );
+    }
+
+    #[test]
+    fn an_empty_toast_still_takes_the_footer_s_one_row() {
+        let mut state = fresh(Screen::Accounts);
+        state.toast("", NOW_MS);
+        let a = areas(&state, Rect::new(0, 0, 80, 24));
+        assert_eq!(a.footer.height, 1);
+        assert_eq!(a.body.height, 24 - 1 - 1);
+        assert_eq!(draw(&state, 80, 24)[23].trim_end(), "");
     }
 }

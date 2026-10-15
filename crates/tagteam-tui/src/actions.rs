@@ -787,6 +787,10 @@ fn panel_rows(text: &str, width: usize) -> Vec<String> {
         let body = line.trim_start_matches(' ');
         let indent = " ".repeat((line.len() - body.len()).min(width / 3));
         let room = width - indent.len();
+        if body.is_empty() {
+            rows.push(String::new());
+            continue;
+        }
         rows.extend(
             wrap(body, room)
                 .into_iter()
@@ -1417,6 +1421,47 @@ mod tests {
                 first_row(&state, 120).starts_with("29 word"),
                 "{action:?}: Up moves from what shows"
             );
+        }
+    }
+
+    #[test]
+    fn blank_output_lines_are_blank_rows_in_the_panels() {
+        let text = "claude-code\n  ok one\n\nfake-agent\n  ok two\n   \n2 ok";
+        for action in [
+            Action::Switch(sel(1)),
+            Action::Doctor {
+                provider: None,
+                online: false,
+            },
+        ] {
+            let mut state = loaded(1);
+            on_done(&mut state, action.clone(), done(1, text, ""), NOW_MS);
+            let drawn = draw(&state, 80, 24);
+            let inside = |l: &String| l.chars().skip(4).take(72).collect::<String>();
+            let rows: Vec<String> = drawn[2..9]
+                .iter()
+                .map(|l| inside(l).trim_end().to_owned())
+                .collect();
+            assert_eq!(
+                rows,
+                [
+                    "claude-code",
+                    "  ok one",
+                    "",
+                    "fake-agent",
+                    "  ok two",
+                    "",
+                    "2 ok"
+                ],
+                "{action:?}"
+            );
+            update(&mut state, key(KeyCode::End), NOW_MS);
+            let Some(Overlay::Result { scroll, .. } | Overlay::Doctor { scroll, .. }) =
+                &state.overlay
+            else {
+                panic!("{:?}", state.overlay);
+            };
+            assert_eq!(*scroll, 6, "{action:?}: the blank rows count");
         }
     }
 
