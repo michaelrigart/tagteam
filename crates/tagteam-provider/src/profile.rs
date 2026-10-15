@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -20,10 +21,13 @@ pub const MARKER_FILE: &str = ".tagteam-profile.json";
 pub const SEED_FILE: &str = ".tagteam-seed.json";
 pub const LINKS_FILE: &str = ".tagteam-links.json";
 pub const LAUNCH_DIR: &str = ".tagteam-launch";
+/// Token report spec §6.1: where `run` keeps a launch the store refused.
+pub const PENDING_LAUNCH_DIR: &str = ".tagteam-pending-launches";
 
 const MARKER_FORMAT: &str = "tagteam-profile";
 const SEED_FORMAT: &str = "tagteam-seed";
 const LINKS_FORMAT: &str = "tagteam-links";
+const PENDING_FORMAT: &str = "tagteam-pending-launch";
 const VERSION: i64 = 1;
 
 /// `<data_dir>/sessions/<id>` (§5).
@@ -349,6 +353,115 @@ impl LinksRecord {
             "notedUnknown": self.noted_unknown,
         });
         write_own_file(profile, LINKS_FILE, &v)
+    }
+}
+
+/// Token report spec §6.1: a launch `run` could not record in the store, kept in its profile
+/// until a scan, a report or `remove` finds it. Its file is
+/// `<profile>/.tagteam-pending-launches/<startedAt>-<run pid>.json`. It holds no secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingLaunch {
+    pub provider: ProviderId,
+    pub account_id: AccountId,
+    /// Epoch ms, stamped before the spawn.
+    pub started_at_ms: i64,
+    /// Epoch ms; `None` while the profile may still be in use.
+    pub ended_at_ms: Option<i64>,
+}
+
+impl PendingLaunch {
+    fn parse(v: &Value) -> Result<Self, String> {
+        check_envelope(v, PENDING_FORMAT, "pending launch")?;
+        let provider = non_empty(v, "provider", "it names no provider")?;
+        let account = non_empty(v, "accountId", "it names no account")?;
+        let started_at_ms = v["startedAt"]
+            .as_i64()
+            .ok_or_else(|| "it has no integer startedAt".to_owned())?;
+        let ended_at_ms = match v.get("endedAt") {
+            Some(Value::Null) => None,
+            Some(e) => Some(
+                e.as_i64()
+                    .ok_or_else(|| "its endedAt is neither an integer nor null".to_owned())?,
+            ),
+            None => return Err("it has no endedAt".into()),
+        };
+        Ok(Self {
+            provider: ProviderId::new(provider),
+            account_id: AccountId::from_string(account),
+            started_at_ms,
+            ended_at_ms,
+        })
+    }
+
+    fn file_name(started_at_ms: i64, run_pid: u32) -> String {
+        format!("{started_at_ms}-{run_pid}.json")
+    }
+
+    /// Writes the launch as `run_pid`'s file in `profile`: atomic, 0600, through a temp file in
+    /// the same directory, replacing what `run_pid` wrote before for this start. Creates the
+    /// directory 0700, never `profile` itself.
+    pub fn write(&self, profile: &Path, run_pid: u32) -> io::Result<()> {
+        let dir = profile.join(PENDING_LAUNCH_DIR);
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+            Err(e) => return Err(e),
+        }
+        let v = json!({
+            "format": PENDING_FORMAT,
+            "version": VERSION,
+            "provider": self.provider.as_str(),
+            "accountId": self.account_id.as_str(),
+            "startedAt": self.started_at_ms,
+            "endedAt": self.ended_at_ms,
+        });
+        let mut bytes = serde_json::to_vec_pretty(&v).expect("a Value always serializes");
+        bytes.push(b'\n');
+        write_atomic_private(
+            &dir.join(Self::file_name(self.started_at_ms, run_pid)),
+            &bytes,
+            0o600,
+        )
+    }
+
+    /// Removes `run_pid`'s file for the launch started at `started_at_ms`; one that is not
+    /// there is fine.
+    pub fn remove(profile: &Path, started_at_ms: i64, run_pid: u32) -> io::Result<()> {
+        remove_own_file(
+            &profile.join(PENDING_LAUNCH_DIR),
+            &Self::file_name(started_at_ms, run_pid),
+        )
+    }
+
+    /// Every `*.json` file in `profile`'s pending directory, sorted by name, each parsed or
+    /// with why it is not a pending launch (never quoting its bytes). Anything else is ignored:
+    /// a writer's temp file, a link, a directory. A directory that is not there, or cannot be
+    /// listed, holds none.
+    pub fn read_all(profile: &Path) -> Vec<(PathBuf, Result<PendingLaunch, String>)> {
+        let dir = profile.join(PENDING_LAUNCH_DIR);
+        let Ok(listing) = fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = listing
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let parsed = match fs::read(&path) {
+                    Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                        Ok(v) => Self::parse(&v),
+                        Err(_) => Err("it is not JSON".to_owned()),
+                    },
+                    Err(e) => Err(format!("it cannot be read: {}", e.kind())),
+                };
+                (path, parsed)
+            })
+            .collect()
     }
 }
 
@@ -981,5 +1094,50 @@ mod tests {
         write_own_json_with(dir, "f.json", &v, || Ok::<(), io::Error>(())).unwrap();
         assert_eq!(fs::read(dir.join("f.json")).unwrap(), b"{\n  \"a\": 1\n}\n");
         assert_eq!(mode(&dir.join("f.json")), 0o600);
+    }
+
+    #[test]
+    fn a_pending_launch_is_written_private_read_back_and_never_creates_its_profile() {
+        let d = tempfile::tempdir().unwrap();
+        let profile = d.path().join("p");
+        let launch = PendingLaunch {
+            provider: ProviderId::new("claude-code"),
+            account_id: AccountId::from_string("acct"),
+            started_at_ms: 1_790_000_000_000,
+            ended_at_ms: None,
+        };
+        assert!(launch.write(&profile, 42).is_err(), "no profile, no write");
+        assert!(!profile.exists());
+
+        fs::create_dir(&profile).unwrap();
+        launch.write(&profile, 42).unwrap();
+        let dir = profile.join(PENDING_LAUNCH_DIR);
+        let file = dir.join("1790000000000-42.json");
+        assert_eq!((mode(&dir), mode(&file)), (0o700, 0o600));
+        let v = file_json(&file);
+        assert_eq!(v["format"], "tagteam-pending-launch");
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["endedAt"], Value::Null);
+
+        let closed = PendingLaunch {
+            ended_at_ms: Some(1_790_000_005_000),
+            ..launch.clone()
+        };
+        closed.write(&profile, 42).unwrap();
+        fs::write(dir.join(".1-2.json.tagteam-2-0a1b2c3d"), "{}").unwrap();
+        fs::write(dir.join("torn.json"), "{ torn").unwrap();
+        fs::write(dir.join("7-7.txt"), "{}").unwrap();
+        let read = PendingLaunch::read_all(&profile);
+        let names: Vec<_> = read
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, ["1790000000000-42.json", "torn.json"]);
+        assert_eq!(read[0].1.as_ref().unwrap(), &closed, "replaced in place");
+        assert!(read[1].1.is_err());
+
+        PendingLaunch::remove(&profile, launch.started_at_ms, 42).unwrap();
+        PendingLaunch::remove(&profile, launch.started_at_ms, 42).unwrap();
+        assert!(!file.exists());
     }
 }
