@@ -2370,6 +2370,7 @@ dependencies = [
  "signal-hook",
  "tagteam-cc",
  "tagteam-core",
+ "tagteam-daemon",
  "tagteam-engine",
  "tagteam-fake",
  "tagteam-provider",
@@ -2408,6 +2409,24 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "tagteam-daemon"
+version = "20261014.2045.0"
+dependencies = [
+ "fastrand",
+ "libc",
+ "serde",
+ "serde_json",
+ "tagteam-cc",
+ "tagteam-core",
+ "tagteam-engine",
+ "tagteam-fake",
+ "tagteam-provider",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
 ]
 
 [[package]]
