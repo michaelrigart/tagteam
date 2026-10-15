@@ -281,7 +281,9 @@ CREATE TABLE token_state (       -- created by a provider's first refresh write,
                                      -- before one did
   files             INTEGER NOT NULL DEFAULT 0, -- as of the last completed refresh; 0 before
   responses         INTEGER NOT NULL DEFAULT 0,
-  skipped_lines     INTEGER NOT NULL DEFAULT 0, -- in the last completed refresh
+  skipped_lines     INTEGER NOT NULL DEFAULT 0, -- in the last completed refresh, over all its calls
+  pending_skipped_lines INTEGER NOT NULL DEFAULT 0, -- skipped by the calls since the last
+                                     -- completed refresh
   unreadable_files  INTEGER NOT NULL DEFAULT 0,
   pruned_at         INTEGER
 );
@@ -417,8 +419,11 @@ running, and is kept.
      size to −1, which no file matches, so the next refresh reads it again from the start.
    - A batch that adds or updates a response, or gives a session its first known project,
      sets `token_state.changed_at` in the same transaction.
+   - A batch adds the lines skipped by the chunks whose checkpoints it commits to
+     `token_state.pending_skipped_lines`. Skips alone never move `changed_at`.
    - A cancelled refresh stops at the next chunk, commits what it parsed, and loses nothing.
-5. On completion, set `token_state.refreshed_at` and the last refresh's statistics. Set
+5. On completion, set `token_state.refreshed_at` and the last refresh's statistics, with
+   `skipped_lines` taken from `pending_skipped_lines`, which is then zeroed. Set
    `token_epoch` to now if it has no row (after a full purge). Prune if due. The first refresh
    to complete also sets `changed_at`, because it ends the index's partial state (§14).
 
@@ -443,6 +448,10 @@ An assistant line that does not parse, or lacks a field the parser needs, is ski
 in `skipped_lines`. A refresh never fails on a line. A file that cannot be opened or read is
 skipped with a warning and retried on the next refresh. A non-zero skip count is shown with the
 report (§11.3), as the first sign of transcript format drift (core §17 R2).
+
+A skipped line is consumed, so no later call reads it again. The stored count covers every call
+of the refresh, and `IndexReport.skipped_lines` is the call's own. A file rewritten during the
+read is read again from 0, so a refresh that spans calls counts that file's earlier skips twice.
 
 ---
 
@@ -852,7 +861,7 @@ pub struct IndexState {
                                       // row's recorded_at (§6.4); it moves when a report may
     pub files: u64,                   // as of the last completed refresh
     pub responses: u64,
-    pub skipped_lines: u64,           // in the last completed refresh
+    pub skipped_lines: u64,           // in the last completed refresh, over all its calls
     pub unreadable_files: u64,
     pub oldest_ms: Option<i64>,
     pub newest_ms: Option<i64>,
