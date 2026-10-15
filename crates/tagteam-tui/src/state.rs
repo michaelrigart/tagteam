@@ -1,6 +1,6 @@
 //! Everything on screen (spec §4.2). `update` changes it, `view` draws it.
 
-use tagteam_core::ProviderId;
+use tagteam_core::{AccountId, ProviderId};
 
 use crate::actions::Overlay;
 use crate::host::Action;
@@ -111,6 +111,16 @@ impl State {
         self.gens.accounts += 1;
         Cmd::LoadAccounts {
             r#gen: self.gens.accounts,
+        }
+    }
+
+    /// A read of `account`'s history since `since_s`, under the next generation.
+    pub(crate) fn load_history(&mut self, account: AccountId, since_s: i64) -> Cmd {
+        self.gens.history += 1;
+        Cmd::LoadHistory {
+            r#gen: self.gens.history,
+            account,
+            since_s,
         }
     }
 
