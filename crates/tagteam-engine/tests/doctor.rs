@@ -2962,7 +2962,8 @@ fn the_socket_is_judged_against_the_daemon_that_should_own_it() {
         )
     );
     fs::create_dir_all(sock.parent().unwrap()).unwrap();
-    fs::write(&sock, "").unwrap();
+    // A socket file, left behind when its listener went away.
+    drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600)).unwrap();
     let c = socket(&fx);
     assert_eq!(
@@ -3028,6 +3029,51 @@ fn the_socket_is_judged_against_the_daemon_that_should_own_it() {
         fix(&c),
         "the log says why it could not bind; restart the daemon once that is fixed"
     );
+}
+
+#[test]
+fn something_that_is_not_a_socket_at_the_socket_path_warns_and_is_left_alone() {
+    // D5.1, D10: a directory or a file there makes the daemon's bind fail, whatever its mode
+    // and whether or not a daemon runs. Doctor says what is in the way and removes nothing.
+    let (_short, fx) = daemon_fx(|_| {});
+    let sock = daemon_socket_path(&fx.env);
+    fs::create_dir_all(sock.parent().unwrap()).unwrap();
+    // A directory with a live daemon: mode 0700 is no socket.
+    fs::create_dir(&sock).unwrap();
+    fs::set_permissions(&sock, fs::Permissions::from_mode(0o600)).unwrap();
+    daemon_lock_record(
+        &fx,
+        ProcessStamp::current().unwrap(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    let c = one(&doctor(&fx), "daemon.socket").clone();
+    assert_eq!(c.status, CheckStatus::Warn, "{c:#?}");
+    assert_eq!(
+        c.message,
+        format!(
+            "{} is a directory, not a socket, so the daemon cannot listen there",
+            sock.display()
+        )
+    );
+    assert_eq!(fix(&c), format!("remove it: rmdir '{}'", sock.display()));
+    assert!(sock.is_dir(), "doctor removes nothing");
+    fs::set_permissions(&sock, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir(&sock).unwrap();
+    fs::remove_file(daemon_lock_path(&fx.env)).unwrap();
+    // A regular file, no daemon.
+    fs::write(&sock, "").unwrap();
+    fs::set_permissions(&sock, fs::Permissions::from_mode(0o600)).unwrap();
+    let c = one(&doctor(&fx), "daemon.socket").clone();
+    assert_eq!(c.status, CheckStatus::Warn, "{c:#?}");
+    assert_eq!(
+        c.message,
+        format!(
+            "{} is a file, not a socket, so the daemon cannot listen there",
+            sock.display()
+        )
+    );
+    assert_eq!(fix(&c), format!("remove it: rm '{}'", sock.display()));
+    assert!(sock.is_file(), "doctor removes nothing");
 }
 
 #[test]
@@ -3201,6 +3247,18 @@ fn the_daemon_checks_change_no_byte_take_no_lock_and_never_connect() {
         plant_unit(&fx, kind, &existing_program(), &elsewhere);
     }
     let before = (tree(fx.dir.path()), tree(short.path()));
+    // The record of lock attempts sees this test's own, so a probe by doctor would add to it.
+    let attempts = || {
+        let mut all = tagteam_provider::flock::attempts_under(short.path());
+        all.extend(tagteam_provider::flock::attempts_under(fx.dir.path()));
+        all
+    };
+    let own = attempts();
+    assert_eq!(
+        own,
+        vec![daemon_lock_path(&fx.env).canonicalize().unwrap()],
+        "the record sees the lock this test took"
+    );
     fx.spawner
         .push(answered(0, "x = {\n\tstate = running\n}\n", ""));
     fx.spawner.push(answered(
@@ -3228,6 +3286,11 @@ fn the_daemon_checks_change_no_byte_take_no_lock_and_never_connect() {
     assert_eq!(
         changed(&before.1, &tree(short.path())),
         Vec::<PathBuf>::new()
+    );
+    assert_eq!(
+        attempts(),
+        own,
+        "doctor tried no lock under the data or home directory: not daemon.lock, an engine lock or the mutation lock"
     );
     assert!(
         matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
