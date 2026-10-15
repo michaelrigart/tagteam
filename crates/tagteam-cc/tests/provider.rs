@@ -693,6 +693,7 @@ fn claude_code_has_every_capability_and_the_kind_table() {
             api_keys: true,
             sessions: true,
             statusline: true,
+            transcripts: false,
         }
     );
     for kind in f.cc.credential_kinds() {

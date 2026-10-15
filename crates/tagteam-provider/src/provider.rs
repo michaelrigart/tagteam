@@ -9,6 +9,7 @@ use serde_json::Value;
 use tagteam_core::backoff::parse_retry_after;
 use tagteam_core::pace::Pace;
 use tagteam_core::poll::PollBudget;
+use tagteam_core::tokens::{EMPTY_PRICES, PriceTable};
 use tagteam_core::usage::Window;
 use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 
@@ -22,6 +23,7 @@ use crate::keychain::{KeychainError, LockState};
 use crate::mkdir_lock::LockError;
 use crate::process::ProcessSpawner;
 use crate::read::{Read, ReadError};
+use crate::transcript::{LineError, UsageLine};
 
 /// A login's identity. `raw` is the provider-owned object stored in `identity_json`
 /// (CC: the `oauthAccount` object).
@@ -204,6 +206,8 @@ pub struct Capabilities {
     pub api_keys: bool,
     pub sessions: bool,
     pub statusline: bool,
+    /// Reads its transcripts for the token report (token report spec §3.2).
+    pub transcripts: bool,
 }
 
 /// What the engine and the CLI need to know about one credential kind, so neither ever names a
@@ -721,6 +725,12 @@ pub trait Provider: Send + Sync {
     fn share_policy(&self, env: &Env) -> SharePolicy;
     /// Where the profile's session records live (CC: `<profile>/sessions`).
     fn session_records_dir(&self, profile: &Path) -> PathBuf;
+    /// Where the default home's session records live (CC: `<config_home>/sessions`), for the
+    /// token report's sightings (token report spec §6.2, ruling R2). `None` (the default) for a
+    /// provider without the `transcripts` capability.
+    fn default_session_records_dir(&self, _env: &Env) -> Option<PathBuf> {
+        None
+    }
     /// Where the profile's background supervisor records itself, for an agent whose supervisor
     /// writes no session record of its own (CC 2.1.292: `<profile>/daemon.lock`, §12.6). A live
     /// supervisor there makes the profile session-owned; one that cannot be read counts as
@@ -838,11 +848,36 @@ pub trait Provider: Send + Sync {
     fn keychain_lock_state(&self) -> Option<LockState> {
         None
     }
+
+    // Token report spec §3.2: the `transcripts` capability. A provider without it keeps these
+    // defaults, and the engine never calls them.
+    /// Every transcript file under the default home, in no particular order.
+    fn transcript_files(&self, _env: &Env) -> io::Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+    /// One line of a transcript: `None` for a line that carries no usage, `Err` for one that
+    /// should and cannot be read (spec §5.4).
+    fn parse_usage_line(&self, _line: &[u8]) -> Result<Option<UsageLine>, LineError> {
+        Ok(None)
+    }
+    /// The shipped price table and the date its prices were taken (spec §8.1).
+    fn price_table(&self) -> &'static PriceTable {
+        &EMPTY_PRICES
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_have_no_transcripts() {
+        // Token report spec §3.2: a provider reads transcripts only when it says so, and the
+        // default price table prices nothing.
+        assert!(!Capabilities::default().transcripts);
+        assert_eq!(EMPTY_PRICES.as_of, "");
+        assert!(EMPTY_PRICES.models.is_empty());
+    }
 
     #[test]
     fn identity_debug_shows_no_email_label_or_name() {
