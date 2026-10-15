@@ -10,14 +10,12 @@ use std::io::{self, Write};
 use std::ops::RangeInclusive;
 use std::time::Duration;
 
-use serde_json::{Value, json};
-use tagteam_cc::usage::format_iso8601;
-
 use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::{
     AutoConfig, Decision, NoSwitchReason, Strategy, announces_sleep, most_severe, next_delay,
     once_exit_code,
 };
+use tagteam_daemon::protocol::event_json;
 use tagteam_engine::auto::{AutoEngine, AutoEvent, EventSink, TickOutcome};
 use tagteam_engine::settings::{
     COOLDOWN_SECONDS_RANGE, INTERVAL_SECONDS_RANGE, Settings, THRESHOLD_RANGE,
@@ -457,127 +455,6 @@ impl EventSink for JsonSink<'_> {
         let mut out = self.out.borrow_mut();
         written(writeln!(out, "{line}"), &self.cancel);
     }
-}
-
-/// One event in §11.4's shape: the envelope `{"schemaVersion":1,"event":<kind>,"ts":"…Z"}`,
-/// the additive `provider` (§13.2), then the kind's fields in cswap's spelling. Accounts are
-/// keyed by position; times are ISO 8601 UTC. `fetchErrors` and `windowsPct` appear only when
-/// they hold something.
-pub fn event_json(e: &AutoEvent, now_s: i64) -> Value {
-    let (kind, provider, fields) = match e {
-        AutoEvent::Poll {
-            provider,
-            active,
-            headroom_pct,
-            threshold,
-            fetch_errors,
-            windows_pct,
-        } => {
-            let mut f = json!({
-                "active": active.as_ref().map(|(number, email)| json!({"number": number, "email": email})),
-                "headroomPct": by_position(headroom_pct, |h| json!(h)),
-                "threshold": threshold,
-            });
-            if !fetch_errors.is_empty() {
-                f["fetchErrors"] = by_position(fetch_errors, |kind| json!(kind));
-            }
-            if !windows_pct.is_empty() {
-                f["windowsPct"] = by_position(windows_pct, |w| json!(w));
-            }
-            ("poll", provider, f)
-        }
-        AutoEvent::Switch {
-            provider,
-            trigger,
-            from,
-            to,
-            warnings,
-            dry_run,
-        } => (
-            "switch",
-            provider,
-            json!({"trigger": trigger.as_str(), "from": from, "to": to, "warnings": warnings, "dryRun": dry_run}),
-        ),
-        AutoEvent::NoSwitch {
-            provider,
-            reason,
-            detail,
-        } => (
-            "no-switch",
-            provider,
-            json!({"reason": reason, "detail": detail}),
-        ),
-        AutoEvent::AccountQuarantined {
-            provider,
-            number,
-            email,
-            reason,
-        } => (
-            "account-quarantined",
-            provider,
-            json!({"number": number, "email": email, "reason": reason}),
-        ),
-        AutoEvent::AccountUnquarantined {
-            provider,
-            number,
-            email,
-            reason,
-        } => (
-            "account-unquarantined",
-            provider,
-            json!({"number": number, "email": email, "reason": reason}),
-        ),
-        AutoEvent::AllExhausted {
-            provider,
-            earliest_reset_at,
-        } => (
-            "all-exhausted",
-            provider,
-            json!({"earliestResetAt": earliest_reset_at.map(format_iso8601)}),
-        ),
-        AutoEvent::Sleep {
-            provider,
-            seconds,
-            until,
-        } => (
-            "sleep",
-            provider,
-            json!({"seconds": (seconds * 10.0).round() / 10.0, "until": format_iso8601(*until)}),
-        ),
-        AutoEvent::Error {
-            provider,
-            message,
-            transient,
-        } => (
-            "error",
-            provider,
-            json!({"message": message, "transient": transient}),
-        ),
-        AutoEvent::ConfigWarning { provider, message } => {
-            ("config-warning", provider, json!({"message": message}))
-        }
-    };
-    let mut o = json!({
-        "schemaVersion": 1,
-        "event": kind,
-        "ts": format_iso8601(now_s),
-        "provider": provider.as_str(),
-    });
-    if let Value::Object(fields) = fields {
-        for (k, v) in fields {
-            o[k] = v;
-        }
-    }
-    o
-}
-
-/// A map keyed by account position, as §11.4's objects key accounts.
-fn by_position<T>(m: &BTreeMap<u32, T>, value: impl Fn(&T) -> Value) -> Value {
-    Value::Object(
-        m.iter()
-            .map(|(position, v)| (position.to_string(), value(v)))
-            .collect(),
-    )
 }
 
 /// §11.4's human output. Each tick is one stdout line: the local time, the live account by
@@ -1789,124 +1666,6 @@ mod tests {
             reason: reason.into(),
             detail: detail.into(),
         }
-    }
-
-    #[test]
-    fn every_event_is_one_object_in_section_11_4_s_shape() {
-        let poll = AutoEvent::Poll {
-            provider: cc(),
-            active: Some((2, "b@x.co".into())),
-            headroom_pct: BTreeMap::from([(1, Some(80.0)), (2, None)]),
-            threshold: 90.0,
-            fetch_errors: BTreeMap::from([(2, "http-429".into())]),
-            windows_pct: BTreeMap::from([(1, BTreeMap::from([("5h".into(), 20.0)]))]),
-        };
-        let quiet = AutoEvent::Poll {
-            provider: cc(),
-            active: None,
-            headroom_pct: BTreeMap::new(),
-            threshold: 90.0,
-            fetch_errors: BTreeMap::new(),
-            windows_pct: BTreeMap::new(),
-        };
-        let cases = [
-            (
-                poll,
-                json!({"event": "poll", "active": {"number": 2, "email": "b@x.co"},
-                       "headroomPct": {"1": 80.0, "2": null}, "threshold": 90.0,
-                       "fetchErrors": {"2": "http-429"}, "windowsPct": {"1": {"5h": 20.0}}}),
-            ),
-            (
-                quiet,
-                json!({"event": "poll", "active": null, "headroomPct": {}, "threshold": 90.0}),
-            ),
-            (
-                AutoEvent::Switch {
-                    provider: cc(),
-                    trigger: tagteam_core::autoswitch::Trigger::Failover,
-                    from: 2,
-                    to: 1,
-                    warnings: vec!["w".into()],
-                    dry_run: true,
-                },
-                json!({"event": "switch", "trigger": "failover", "from": 2, "to": 1,
-                       "warnings": ["w"], "dryRun": true}),
-            ),
-            (
-                no_switch_event("cooldown", "3m"),
-                json!({"event": "no-switch", "reason": "cooldown", "detail": "3m"}),
-            ),
-            (
-                AutoEvent::AccountQuarantined {
-                    provider: cc(),
-                    number: 3,
-                    email: "w@corp.com".into(),
-                    reason: "invalid_grant".into(),
-                },
-                json!({"event": "account-quarantined", "number": 3, "email": "w@corp.com",
-                       "reason": "invalid_grant"}),
-            ),
-            (
-                AutoEvent::AccountUnquarantined {
-                    provider: cc(),
-                    number: 3,
-                    email: "w@corp.com".into(),
-                    reason: "account-replaced".into(),
-                },
-                json!({"event": "account-unquarantined", "number": 3, "email": "w@corp.com",
-                       "reason": "account-replaced"}),
-            ),
-            (
-                AutoEvent::AllExhausted {
-                    provider: cc(),
-                    earliest_reset_at: Some(T0 + 9_630),
-                },
-                json!({"event": "all-exhausted", "earliestResetAt": "2026-09-21T16:53:50Z"}),
-            ),
-            (
-                AutoEvent::AllExhausted {
-                    provider: cc(),
-                    earliest_reset_at: None,
-                },
-                json!({"event": "all-exhausted", "earliestResetAt": null}),
-            ),
-            (
-                AutoEvent::Sleep {
-                    provider: cc(),
-                    seconds: 600.0,
-                    until: T0 + 600,
-                },
-                json!({"event": "sleep", "seconds": 600.0, "until": "2026-09-21T14:23:20Z"}),
-            ),
-            (
-                AutoEvent::Error {
-                    provider: cc(),
-                    message: "m".into(),
-                    transient: true,
-                },
-                json!({"event": "error", "message": "m", "transient": true}),
-            ),
-            (
-                AutoEvent::ConfigWarning {
-                    provider: cc(),
-                    message: "m".into(),
-                },
-                json!({"event": "config-warning", "message": "m"}),
-            ),
-        ];
-        for (event, fields) in cases {
-            let mut want = json!({"schemaVersion": 1, "event": fields["event"],
-                                  "ts": "2026-09-21T14:13:20Z", "provider": "claude-code"});
-            for (k, v) in fields.as_object().unwrap() {
-                want[k] = v.clone();
-            }
-            assert_eq!(event_json(&event, T0), want);
-        }
-        let line = event_json(&no_switch_event("cooldown", ""), T0).to_string();
-        assert_eq!(
-            line,
-            r#"{"schemaVersion":1,"event":"no-switch","ts":"2026-09-21T14:13:20Z","provider":"claude-code","reason":"cooldown","detail":""}"#
-        );
     }
 
     /// The human sink at `T0` on a fixed clock, whose times read as seconds after `T0`.

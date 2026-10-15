@@ -24,6 +24,7 @@ The workspace has these crates under `crates/`:
 | `tagteam-provider` | The `Provider` trait and the I/O primitives providers share (Keychain, HTTP, locks, processes) |
 | `tagteam-cc` | The Claude Code provider |
 | `tagteam-engine` | The store, the vault and the provider-generic operations (switching, refresh, auto-switch, sessions) |
+| `tagteam-daemon` | The daemon: the scheduler that `tagteam auto` also runs on, its jobs and the socket protocol |
 | `tagteam-fake` | A test-only second provider that keeps the `Provider` trait provider-neutral |
 | `xtask` | Development tasks (`cargo xtask compat`) |
 
@@ -137,9 +138,10 @@ You do not need to write a spec for a bug fix or a small change.
 ## Releasing
 
 - Set the version to the UTC date and time of the release, `YYYYMMDD.HHMM.0`, with no leading
-  zeros in `HHMM` (09:05 is `905`). Change `version` in `[workspace.package]` and the four
+  zeros in `HHMM` (09:05 is `905`). Change `version` in `[workspace.package]` and the five
   internal `version = "…"` entries in `[workspace.dependencies]` (`tagteam-core`,
-  `tagteam-provider`, `tagteam-cc` and `tagteam-engine`) together, then refresh `Cargo.lock`.
+  `tagteam-provider`, `tagteam-cc`, `tagteam-engine` and `tagteam-daemon`) together, then
+  refresh `Cargo.lock`.
 - Add a dated section to the [changelog](CHANGELOG.md), with the version as its heading.
 - Tag the commit `v<version>` (for example `v20261013.2030.0`) and push the tag. The release
   publishes the GitHub archives, the Homebrew formula and the crates on crates.io. Prereleases

@@ -1,7 +1,7 @@
 name: Publish crates
 
 # Called by release.yml (dist's `publish-jobs`) after the GitHub Release is hosted. Publishes
-# the five crates to crates.io in dependency order. A crate whose version is already there is
+# the six crates to crates.io in dependency order. A crate whose version is already there is
 # skipped, so a run that failed part-way can be re-run.
 #
 # Authenticates with crates.io trusted publishing (GitHub OIDC): no stored secret. crates.io
@@ -54,7 +54,7 @@ jobs:
             | jq -r '.packages[] | select(.name == "tagteam") | .version')
           test -n "$VERSION"
           echo "Publishing version $VERSION"
-          for crate in tagteam-core tagteam-provider tagteam-cc tagteam-engine tagteam; do
+          for crate in tagteam-core tagteam-provider tagteam-cc tagteam-engine tagteam-daemon tagteam; do
             status=$(curl -sS --retry 3 -o /dev/null -w '%{http_code}' -A "$USER_AGENT" \
               "https://crates.io/api/v1/crates/$crate/$VERSION")
             case $status in
