@@ -273,7 +273,8 @@ CREATE TABLE token_state (       -- created by a provider's first refresh write,
   provider          TEXT PRIMARY KEY,
   refreshed_at      INTEGER,         -- the last completed refresh; NULL before one completes
   changed_at        INTEGER,         -- the last batch or prune that added, updated or deleted
-                                     -- a response; NULL before one did
+                                     -- a response, or gave a session its project; NULL
+                                     -- before one did
   files             INTEGER NOT NULL DEFAULT 0, -- as of the last completed refresh; 0 before
   responses         INTEGER NOT NULL DEFAULT 0,
   skipped_lines     INTEGER NOT NULL DEFAULT 0, -- in the last completed refresh
@@ -409,8 +410,8 @@ running, and is kept.
      fails, the file was rewritten during the read. Its rows still commit, because every line
      is a whole response and the upsert takes maxima. Its offset is reset to 0 and its stored
      size to −1, which no file matches, so the next refresh reads it again from the start.
-   - A batch that adds or updates a response sets `token_state.changed_at` in the same
-     transaction.
+   - A batch that adds or updates a response, or gives a session its first known project,
+     sets `token_state.changed_at` in the same transaction.
    - A cancelled refresh stops at the next chunk, commits what it parsed, and loses nothing.
 5. On completion, set `token_state.refreshed_at` and the last refresh's statistics. Set
    `token_epoch` to now if it has no row (after a full purge). Prune if due. The first refresh

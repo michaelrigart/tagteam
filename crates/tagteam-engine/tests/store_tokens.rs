@@ -1155,6 +1155,41 @@ fn a_session_takes_the_first_project_known_within_a_batch_and_across_batches() {
         vec![Some("/work/other".to_owned()); 3],
         "a later batch supplies it, and the first one known stays"
     );
+
+    // A later line of the same response: in the same batch, and in a later batch where it
+    // changes no count. Either one supplies the project, and the second moves `changed_at`.
+    let mut line = row(6, "s3", T, 1);
+    line.project = None;
+    let mut again = line.clone();
+    again.project = Some("/work/s3".into());
+    commit(&s, &[line.clone(), again.clone()], T);
+    assert_eq!(projects(&s, "s3"), [again.project.clone()], "same batch");
+
+    let mut line = row(7, "s4", T, 1);
+    line.project = None;
+    commit(&s, &[line.clone()], T);
+    let mut again = line.clone();
+    again.project = Some("/work/s4".into());
+    assert_eq!(
+        commit(&s, &[again.clone()], T + 50),
+        BatchOutcome::default(),
+        "no response changed"
+    );
+    assert_eq!(projects(&s, "s4"), [again.project.clone()], "later batch");
+    let state = s.token_state(&cc()).unwrap().unwrap();
+    assert_eq!(
+        state.changed_at,
+        Some(T + 50),
+        "a session's project changed"
+    );
+
+    // A copy of the response under another session supplies none to the session it keeps.
+    let mut line = row(8, "s5", T, 1);
+    line.project = None;
+    let mut copy = line.clone();
+    copy.session_id = "s6".into();
+    commit(&s, &[line, copy], T);
+    assert_eq!(projects(&s, "s5"), [None]);
 }
 
 #[test]
