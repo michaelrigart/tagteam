@@ -55,6 +55,12 @@ pub enum Action {
         provider: Option<ProviderId>,
         online: bool,
     },
+    /// The daemon's auto-switching for `provider`, on or paused (spec §7.4): its setting
+    /// `daemon.autoswitch` (D7).
+    Autoswitch {
+        provider: ProviderId,
+        on: bool,
+    },
 }
 
 impl Action {
@@ -123,12 +129,19 @@ impl Action {
                 }
                 args
             }
+            Action::Autoswitch { provider, on } => vec![
+                "--no-color".into(),
+                "config".into(),
+                "set".into(),
+                format!("provider.{provider}.daemon.autoswitch"),
+                on.to_string(),
+            ],
         }
     }
 
     /// The command's name as the CLI spells it: "switch", "enable", "disable", "alias", "move",
-    /// "remove", "add", "run", "doctor". The footer shows it while the action runs, and says
-    /// `busy: <name>` to a second action key (spec §7.2).
+    /// "remove", "add", "run", "doctor", "config". The footer shows it while the action runs,
+    /// and says `busy: <name>` to a second action key (spec §7.2).
     pub fn name(&self) -> &'static str {
         match self {
             Action::Switch(_) | Action::SwitchBy { .. } => "switch",
@@ -140,6 +153,7 @@ impl Action {
             Action::AddLive { .. } => "add",
             Action::Run(_) => "run",
             Action::Doctor { .. } => "doctor",
+            Action::Autoswitch { .. } => "config",
         }
     }
 
@@ -244,6 +258,32 @@ mod tests {
             }),
             "--no-color --provider claude-code add"
         );
+    }
+
+    #[test]
+    fn pausing_and_resuming_auto_switch_is_config_set_of_the_provider_s_daemon_setting() {
+        // Spec §7.4, D7: the socket stays read-only; the setting is written as the CLI writes
+        // it.
+        let set = |on| {
+            args(&Action::Autoswitch {
+                provider: provider(),
+                on,
+            })
+        };
+        assert_eq!(
+            set(false),
+            "--no-color config set provider.claude-code.daemon.autoswitch false"
+        );
+        assert_eq!(
+            set(true),
+            "--no-color config set provider.claude-code.daemon.autoswitch true"
+        );
+        let pause = Action::Autoswitch {
+            provider: provider(),
+            on: false,
+        };
+        assert_eq!(pause.name(), "config");
+        assert!(!pause.needs_terminal());
     }
 
     #[test]

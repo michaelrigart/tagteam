@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use tagteam_engine::words;
 
+use crate::daemon;
 use crate::host::{AccountRef, Action, ActionOutcome, Strategy};
 use crate::msg::{Answer, Cmd, Prompt, PromptKind};
 use crate::screens;
@@ -66,12 +67,16 @@ pub enum TextThen {
     Move(AccountRef),
 }
 
+/// `P` without a daemon to pause (spec §7.4).
+pub const NO_DAEMON_RUNNING: &str = "no daemon running";
+
 /// The help panel's keys (spec §5.6): everywhere, then the current screen's.
-const HELP_GLOBAL: [(&str, &str); 7] = [
+const HELP_GLOBAL: [(&str, &str); 8] = [
     ("1 2 3  Tab Shift-Tab", "screens"),
     ("j k  ↑ ↓", "move"),
     ("A", "add the current login"),
     ("D", "doctor"),
+    ("P", "pause or resume auto-switch"),
     ("?", "help"),
     ("q  Ctrl-C", "quit"),
     ("Ctrl-Z", "suspend"),
@@ -182,6 +187,7 @@ pub fn handle_action_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Optio
             ))
         }
         'r' => Some(refresh(state, now_ms)),
+        'P' => Some(pause(state, now_ms)),
         's' | 'b' | 'n' | 'e' | 'a' | 'm' | 'x' | 'R' if state.screen == Screen::Accounts => {
             Some(account_key(state, c, now_ms))
         }
@@ -207,6 +213,37 @@ fn refresh(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         cmds.push(state.collect_due(shown));
     }
     cmds
+}
+
+/// `P` (spec §7.4): pause the daemon's auto-switching for the provider the header follows, or
+/// resume it, as its last `status` says it is. A confirm dialog asks first, default no. Without a
+/// daemon (timer mode) it says so and changes nothing, and so for a provider the daemon runs no
+/// job for: the TUI changes no setting whose effect it cannot show.
+fn pause(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    if busy(state, now_ms) {
+        return vec![];
+    }
+    if !state.daemon.live() {
+        state.toast(NO_DAEMON_RUNNING, now_ms);
+        return vec![];
+    }
+    let provider = daemon::focus(state);
+    let Some(job) = state.daemon.job(&provider) else {
+        state.toast(format!("the daemon runs no job for {provider}"), now_ms);
+        return vec![];
+    };
+    let (verb, on) = if job.autoswitch {
+        ("Pause", false)
+    } else {
+        ("Resume", true)
+    };
+    state.overlay = Some(Overlay::Confirm {
+        question: format!("{verb} auto-switch for {provider}?"),
+        default_yes: false,
+        choice: false,
+        then: ConfirmThen::Run(Action::Autoswitch { provider, on }),
+    });
+    vec![]
 }
 
 fn account_key(state: &mut State, c: char, now_ms: i64) -> Vec<Cmd> {
@@ -555,6 +592,11 @@ pub fn on_done(state: &mut State, action: Action, outcome: ActionOutcome, now_ms
     state.dirty = true;
     if state.quitting.is_some() {
         return vec![];
+    }
+    // Spec §7.4: a pause need not change the daemon's mode, so no event may follow; its
+    // `status` is fetched again once it has applied the setting.
+    if matches!(action, Action::Autoswitch { .. }) {
+        daemon::recheck(state, now_ms);
     }
     let text = [out.trim_end(), err.trim_end()]
         .into_iter()
@@ -1824,5 +1866,292 @@ mod tests {
                 }
             ]
         );
+    }
+
+    /// Claude Code's job in `mode`, with `autoswitch`.
+    fn job_in(mode: &str, autoswitch: bool) -> tagteam_daemon::protocol::Status {
+        daemon_status(vec![daemon_job("claude-code", mode, autoswitch)], vec![])
+    }
+
+    /// The confirm dialog's question, its default, and the action a yes runs.
+    fn asked(state: &State) -> (&str, bool, &Action) {
+        match &state.overlay {
+            Some(Overlay::Confirm {
+                question,
+                default_yes,
+                then: ConfirmThen::Run(action),
+                ..
+            }) => (question.as_str(), *default_yes, action),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn p_asks_to_pause_the_daemon_s_auto_switch_and_a_yes_sets_it_through_the_cli() {
+        // Spec §7.4: from the effective `autoswitch` in `status`; default no.
+        let mut state = loaded(2);
+        go_live(&mut state, job_in("auto", true));
+        assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
+        let pause = Action::Autoswitch {
+            provider: cc(),
+            on: false,
+        };
+        assert_eq!(
+            asked(&state),
+            ("Pause auto-switch for claude-code?", false, &pause)
+        );
+        let drawn = draw(&state, 80, 24);
+        assert!(
+            drawn
+                .iter()
+                .any(|l| l.contains("Pause auto-switch for claude-code?")),
+            "{drawn:?}"
+        );
+        assert!(
+            update(&mut state, key(KeyCode::Enter), NOW_MS).is_empty(),
+            "no"
+        );
+        assert!(state.overlay.is_none() && state.running.is_none());
+        update(&mut state, ch('P'), NOW_MS);
+        assert_eq!(
+            update(&mut state, ch('y'), NOW_MS),
+            [Cmd::Act(pause.clone())]
+        );
+        assert_eq!(state.running, Some(pause));
+        assert_eq!(draw(&state, 80, 24)[23], "⠋ config…");
+    }
+
+    #[test]
+    fn p_asks_to_resume_auto_switch_that_is_paused() {
+        let mut state = loaded(2);
+        go_live(&mut state, job_in("collect", false));
+        update(&mut state, ch('P'), NOW_MS);
+        let resume = Action::Autoswitch {
+            provider: cc(),
+            on: true,
+        };
+        assert_eq!(
+            asked(&state),
+            ("Resume auto-switch for claude-code?", false, &resume)
+        );
+    }
+
+    #[test]
+    fn p_without_a_daemon_says_so_and_changes_nothing() {
+        // Spec §7.4: in timer mode `P` shows `no daemon running`, also while the first
+        // `status` is still to come; and so for a provider the daemon runs no job for.
+        let mut state = loaded(1);
+        assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
+        assert_eq!(state.toast.as_ref().unwrap().text, NO_DAEMON_RUNNING);
+        assert!(state.overlay.is_none());
+        update(
+            &mut state,
+            Msg::Live(crate::live::Live::Up { link: 1 }),
+            NOW_MS,
+        );
+        update(&mut state, ch('P'), NOW_MS);
+        assert_eq!(state.toast.as_ref().unwrap().text, NO_DAEMON_RUNNING);
+        let mut state = loaded(1);
+        let other = daemon_status(vec![daemon_job("fake-agent", "auto", true)], vec![]);
+        go_live(&mut state, other);
+        assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
+        assert_eq!(
+            state.toast.as_ref().unwrap().text,
+            "the daemon runs no job for claude-code"
+        );
+        assert!(state.overlay.is_none());
+    }
+
+    #[test]
+    fn p_acts_on_the_selected_account_s_provider() {
+        // Spec §7.4: with several providers.
+        let fake = tagteam_core::ProviderId::new("fake-agent");
+        let mut third = account(3, "c@x.co", read(60, 10.0, 20.0, false));
+        third.row.provider = fake.clone();
+        let mut snap = snapshot(many(1));
+        snap.providers
+            .push(tagteam_engine::views::ProviderAccounts {
+                provider: fake.clone(),
+                active_position: None,
+                accounts: vec![third],
+            });
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snap);
+        let status = daemon_status(
+            vec![
+                daemon_job("claude-code", "auto", true),
+                daemon_job("fake-agent", "collect", false),
+            ],
+            vec![],
+        );
+        go_live(&mut state, status);
+        update(&mut state, ch('j'), NOW_MS);
+        update(&mut state, ch('P'), NOW_MS);
+        let resume = Action::Autoswitch {
+            provider: fake,
+            on: true,
+        };
+        assert_eq!(
+            asked(&state),
+            ("Resume auto-switch for fake-agent?", false, &resume)
+        );
+    }
+
+    #[test]
+    fn p_while_an_action_runs_is_busy() {
+        let mut state = loaded(2);
+        go_live(&mut state, job_in("auto", true));
+        update(&mut state, ch('s'), NOW_MS);
+        assert!(update(&mut state, ch('P'), NOW_MS).is_empty());
+        assert_eq!(state.toast.as_ref().unwrap().text, "busy: switch");
+        assert!(state.overlay.is_none());
+    }
+
+    #[test]
+    fn two_seconds_after_p_the_status_is_read_and_the_header_says_paused_with_no_event() {
+        // Spec §7.4, §11: with one switchable account the job is `collect` before and after,
+        // so no `mode` event follows; the fetch 2 s later shows the pause.
+        let mut state = loaded(1);
+        let link = go_live(&mut state, job_in("collect", true));
+        update(&mut state, Msg::Tick, NOW_MS + 250);
+        assert!(draw(&state, 80, 24)[0].ends_with("● live · auto off (one account)"));
+        update(&mut state, ch('P'), NOW_MS);
+        let cmds = update(&mut state, ch('y'), NOW_MS);
+        let [Cmd::Act(pause)] = cmds.as_slice() else {
+            panic!("{cmds:?}");
+        };
+        let set = "Set provider.claude-code.daemon.autoswitch = false in ~/.config/tagteam/config.toml.\n";
+        let cmds = update(
+            &mut state,
+            Msg::ActionDone {
+                action: pause.clone(),
+                outcome: done(0, set, ""),
+            },
+            NOW_MS + 500,
+        );
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::LoadAccounts { .. }]),
+            "{cmds:?}"
+        );
+        assert_eq!(state.toast.as_ref().unwrap().text, set.trim_end());
+        let fetch = |cmds: Vec<Cmd>| cmds.contains(&Cmd::FetchStatus { link });
+        assert!(!fetch(update(&mut state, Msg::Tick, NOW_MS + 2_499)));
+        assert!(fetch(update(&mut state, Msg::Tick, NOW_MS + 2_500)));
+        assert!(
+            !fetch(update(&mut state, Msg::Tick, NOW_MS + 2_750)),
+            "once"
+        );
+        let reply = Msg::DaemonStatus {
+            link,
+            result: Ok(job_in("collect", false)),
+        };
+        update(&mut state, reply, NOW_MS + 2_800);
+        assert!(draw(&state, 80, 24)[0].ends_with("● live · auto paused   ? help"));
+    }
+
+    #[test]
+    fn p_s_fetch_of_the_status_outlives_a_link_change() {
+        // C-R21: the link changes after the setting is written. The new link's own fetch can
+        // come before the daemon applies the setting (D4.2), so the fetch 2 s after `P` is
+        // still made, on the new link.
+        let mut state = loaded(1);
+        go_live(&mut state, job_in("collect", true));
+        update(&mut state, ch('P'), NOW_MS);
+        let cmds = update(&mut state, ch('y'), NOW_MS);
+        let [Cmd::Act(pause)] = cmds.as_slice() else {
+            panic!("{cmds:?}");
+        };
+        let set = "Set provider.claude-code.daemon.autoswitch = false in ~/.config/tagteam/config.toml.\n";
+        let written = Msg::ActionDone {
+            action: pause.clone(),
+            outcome: done(0, set, ""),
+        };
+        update(&mut state, written, NOW_MS + 500);
+        update(&mut state, Msg::Live(crate::live::Live::Down), NOW_MS + 600);
+        let up = update(
+            &mut state,
+            Msg::Live(crate::live::Live::Up { link: 2 }),
+            NOW_MS + 700,
+        );
+        assert_eq!(up, [Cmd::FetchStatus { link: 2 }]);
+        let early = Msg::DaemonStatus {
+            link: 2,
+            result: Ok(job_in("collect", true)),
+        };
+        update(&mut state, early, NOW_MS + 800);
+        assert!(
+            draw(&state, 80, 24)[0].ends_with("● live · auto off (one account)"),
+            "read before the daemon applied it"
+        );
+        let fetch = |cmds: Vec<Cmd>| cmds.contains(&Cmd::FetchStatus { link: 2 });
+        assert!(!fetch(update(&mut state, Msg::Tick, NOW_MS + 2_499)));
+        assert!(fetch(update(&mut state, Msg::Tick, NOW_MS + 2_500)));
+        let applied = Msg::DaemonStatus {
+            link: 2,
+            result: Ok(job_in("collect", false)),
+        };
+        update(&mut state, applied, NOW_MS + 2_600);
+        assert!(draw(&state, 80, 24)[0].ends_with("● live · auto paused   ? help"));
+    }
+
+    #[test]
+    fn p_s_fetch_of_the_status_is_kept_when_its_outcome_comes_with_no_link_up() {
+        // C-R21: the link drops before the setting's outcome arrives. The fetch 2 s after the
+        // outcome is still owed. A link up before then fetches at the 2 s; one up only after
+        // them fetches once, at once, which is after the daemon applied the setting.
+        let set = "Set provider.claude-code.daemon.autoswitch = false in ~/.config/tagteam/config.toml.\n";
+        let fetches = |cmds: &[Cmd]| {
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::FetchStatus { .. }))
+                .count()
+        };
+        for up_at in [NOW_MS + 1_500, NOW_MS + 4_000] {
+            let mut state = loaded(1);
+            go_live(&mut state, job_in("collect", true));
+            update(&mut state, ch('P'), NOW_MS);
+            let cmds = update(&mut state, ch('y'), NOW_MS);
+            let [Cmd::Act(pause)] = cmds.as_slice() else {
+                panic!("{cmds:?}");
+            };
+            update(&mut state, Msg::Live(crate::live::Live::Down), NOW_MS + 100);
+            let written = Msg::ActionDone {
+                action: pause.clone(),
+                outcome: done(0, set, ""),
+            };
+            update(&mut state, written, NOW_MS + 500);
+            let down = update(&mut state, Msg::Tick, NOW_MS + 1_000);
+            assert_eq!(fetches(&down), 0, "no link to fetch on");
+            let up = update(
+                &mut state,
+                Msg::Live(crate::live::Live::Up { link: 2 }),
+                up_at,
+            );
+            assert_eq!(up, [Cmd::FetchStatus { link: 2 }], "{up_at}");
+            let applied = up_at >= NOW_MS + 2_500;
+            let first = Msg::DaemonStatus {
+                link: 2,
+                result: Ok(job_in("collect", !applied)),
+            };
+            update(&mut state, first, up_at + 100);
+            if !applied {
+                let early = update(&mut state, Msg::Tick, NOW_MS + 2_499);
+                assert_eq!(fetches(&early), 0, "{up_at}");
+                let due = update(&mut state, Msg::Tick, NOW_MS + 2_500);
+                assert_eq!(fetches(&due), 1, "{up_at}");
+                let paused = Msg::DaemonStatus {
+                    link: 2,
+                    result: Ok(job_in("collect", false)),
+                };
+                update(&mut state, paused, NOW_MS + 2_600);
+            }
+            assert!(
+                draw(&state, 80, 24)[0].ends_with("● live · auto paused   ? help"),
+                "{up_at}"
+            );
+            let later = update(&mut state, Msg::Tick, up_at + 250);
+            assert_eq!(fetches(&later), 0, "owed once: {up_at}");
+            let later = update(&mut state, Msg::Tick, NOW_MS + 6_000);
+            assert_eq!(fetches(&later), 0, "owed once: {up_at}");
+        }
     }
 }
