@@ -2284,6 +2284,52 @@ mod tests {
     }
 
     #[test]
+    fn the_worst_live_stack_at_80_by_24_keeps_three_table_rows_and_scrolls_to_a_2000_column_model_line()
+     {
+        // A 2-row header, the activity line, a 3-row banner and a 3-row toast leave a 15-row
+        // body; the table keeps three rows, and J/K reach the model line, the footnote's last.
+        let long = format!("claude-{}", "x".repeat(1993));
+        let mut big = realistic();
+        big.models = vec![long.clone(), "claude-sonnet-5-5".into()];
+        let mut rows = vec![big];
+        rows.extend((1..=9).map(|n| session(&format!("s-{n}"), row_account(1))));
+        let mut state = showing_after("pp", rows);
+        state.tokens.models = Some(vec![long.clone()]);
+        if let Some(report) = state.tokens.levels[0].report.as_mut() {
+            report.unpriced_models = vec![long.clone()];
+        }
+        let mut locked = daemon_job("claude-code", "auto", true);
+        locked.backoff = Some(tagteam_daemon::protocol::StatusBackoff {
+            reason: "keychain".into(),
+            until: "2026-09-21T15:05:00Z".into(),
+        });
+        go_live(&mut state, daemon_status(vec![locked], vec![]));
+        let ev = tagteam_daemon::protocol::Event::Auto {
+            kind: "error".into(),
+            provider: "claude-code".into(),
+            raw: serde_json::json!({"event": "error", "ts": "2026-09-21T14:04:00Z", "message": "x".repeat(300)}),
+        };
+        update(&mut state, Msg::Live(crate::live::Live::Event(ev)), NOW_MS);
+        let words = "the store could not be opened because another tagteam holds its lock";
+        state.banner = Some([words; 3].join("; "));
+        state.toast([words; 3].join("; "), NOW_MS);
+        let lines = draw(&state, 80, 24);
+        assert_eq!(lines.len(), 24, "{lines:?}");
+        assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
+        let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
+        let head = lines
+            .iter()
+            .position(|l| l.starts_with(" SESSION"))
+            .unwrap();
+        assert_eq!(total - head - 1, 3, "the table keeps three rows: {lines:?}");
+        let seen = scrolled_below(&mut state);
+        assert!(
+            reads(&seen, &format!("{long}, claude-sonnet-5-5")),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
     fn j_scrolls_through_a_footnote_longer_than_three_rows_to_its_last_name() {
         // B29: text below the total scrolls, so it wraps in full. A footnote naming twenty
         // unpriced models runs past three rows, and J reaches its last name and its reason.
