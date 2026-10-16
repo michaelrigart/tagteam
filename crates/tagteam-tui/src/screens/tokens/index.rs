@@ -760,6 +760,49 @@ mod tests {
     }
 
     #[test]
+    fn a_follow_up_query_asked_on_tokens_is_not_sent_once_tokens_is_left() {
+        // B2: a query asked for while one runs follows it, but only while Tokens is open.
+        let mut state = on_tokens();
+        update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+        let first = tick(&mut state, NOW_MS + 60_000);
+        let reports: Vec<Cmd> = first
+            .into_iter()
+            .filter(|c| matches!(c, Cmd::LoadReport { .. }))
+            .collect();
+        assert_eq!(reports.len(), 1);
+        for accounts in [many(1), many(2)] {
+            state.gens.accounts += 1;
+            let r#gen = state.gens.accounts;
+            let cmds = update(
+                &mut state,
+                Msg::Accounts {
+                    r#gen,
+                    result: Ok(snapshot(accounts)),
+                },
+                NOW_MS + 60_100,
+            );
+            assert!(token_cmds(cmds).is_empty(), "one is on the lane already");
+        }
+        assert!(state.tokens.again, "a follow-up is asked for");
+        update(&mut state, ch('1'), NOW_MS + 60_300);
+        let [Cmd::LoadReport { r#gen, query }] = reports.as_slice() else {
+            unreachable!()
+        };
+        let mut report = token_report(query.clone(), vec![]);
+        report.index.changed_at_ms = Some(NOW_MS - 60_000);
+        let after = update(
+            &mut state,
+            Msg::TokenReport {
+                r#gen: *r#gen,
+                result: Ok(report),
+            },
+            NOW_MS + 61_000,
+        );
+        assert!(token_cmds(after).is_empty(), "off Tokens nothing is read");
+        assert!(!state.tokens.again);
+    }
+
+    #[test]
     fn a_failed_check_says_so_and_the_next_good_one_clears_it() {
         let mut state = on_tokens();
         let check = tick(&mut state, NOW_MS + 1_000);

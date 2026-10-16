@@ -347,7 +347,8 @@ pub(crate) fn on_report(
     if state.screen == Screen::Tokens {
         state.dirty = true;
     }
-    if std::mem::take(&mut state.tokens.again) && state.quitting.is_none() {
+    let again = std::mem::take(&mut state.tokens.again);
+    if again && state.screen == Screen::Tokens && state.quitting.is_none() {
         return requery(state, now_ms);
     }
     vec![]
