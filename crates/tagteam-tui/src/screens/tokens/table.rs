@@ -807,8 +807,9 @@ fn crumbs(t: &TokensState, now_ms: i64) -> Option<String> {
 ///    there whole; else on a row of their own, the filter cut first, to `FILTER_LEAST`, then
 ///    the drill-down, each with `…`. The filter's dialog shows it whole, and the detail the
 ///    rows;
-/// 3. the zone and the index's state, `catching up` while the index is partial, and `updating…`
-///    while the report on screen is read again, cut with `…` past the row.
+/// 3. the zone and the index's state, `catching up` while the index is partial and no refresh
+///    shows its progress instead, and `updating…` while the report on screen is read again, cut
+///    with `…` past the row.
 fn header(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
     let t = &state.tokens;
     let mut tabs = vec![Span::raw(" ")];
@@ -882,7 +883,7 @@ fn header(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
     } else if let Some(at) = index.and_then(|i| i.refreshed_at_ms) {
         status.push(format!("refreshed {}", clock(at, tz, now_ms)));
     }
-    if index.is_some_and(|i| i.refreshed_at_ms.is_none()) {
+    if t.watch.refreshing().is_none() && index.is_some_and(|i| i.refreshed_at_ms.is_none()) {
         status.push("catching up".to_owned());
     }
     if t.pending && t.report().is_some() {
@@ -1535,6 +1536,44 @@ mod tests {
             r.index.refreshed_at_ms = Some(YESTERDAY + HOUR_MS)
         });
         assert_eq!(draw(&state, 80, 24)[3], " UTC · refreshed 2026-09-20 01:00");
+    }
+
+    #[test]
+    fn a_cold_catch_up_shows_its_progress_whole_at_80_columns_without_saying_catching_up() {
+        let mut state = fresh(Screen::Tokens);
+        state.tokens = crate::screens::tokens::TokensState::new(
+            cc(),
+            jiff::tz::TimeZone::get("Europe/Brussels").unwrap(),
+        );
+        let cmds = state.start();
+        let [_, Cmd::LoadReport { r#gen, query }] = cmds.as_slice() else {
+            panic!("{cmds:?}");
+        };
+        let mut report = token_report(query.clone(), days());
+        report.time_zone = "Europe/Brussels".into();
+        report.index.refreshed_at_ms = None;
+        let result = Ok(report);
+        update(
+            &mut state,
+            Msg::TokenReport {
+                r#gen: *r#gen,
+                result,
+            },
+            NOW_MS,
+        );
+        assert_eq!(draw(&state, 80, 24)[3], " Europe/Brussels · catching up");
+        crate::update::drawn(&mut state);
+        let progress = IndexProgress {
+            bytes_done: 12_300_000_000,
+            bytes_total: 33_300_000_000,
+            ..IndexProgress::default()
+        };
+        update(&mut state, Msg::IndexProgress(progress), NOW_MS);
+        crate::screens::tokens::requery(&mut state, NOW_MS);
+        assert_eq!(
+            draw(&state, 80, 24)[3],
+            " Europe/Brussels · indexing transcripts 12.3 GB / 33.3 GB · updating…"
+        );
     }
 
     #[test]
