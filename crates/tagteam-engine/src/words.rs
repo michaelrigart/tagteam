@@ -312,6 +312,14 @@ pub fn unreadable_transcripts(n: u64) -> String {
     )
 }
 
+/// Transcript lines the token index skipped, so its totals may be low (token report §11.2).
+pub fn skipped_transcript_lines(n: u64) -> String {
+    format!(
+        "{} could not be read, so these totals may be low.",
+        plural(n, "transcript line")
+    )
+}
+
 /// The token report's footnotes (token report §11.2), one sentence each: unpriced models,
 /// responses whose output is a lower bound (token report §2.3), skipped lines, the transcript
 /// files the last refresh could not read when `unreadable` asks for them, and the price
@@ -332,10 +340,7 @@ pub fn token_footnotes(report: &TokenReport, mark: &str, unreadable: bool) -> Ve
         ));
     }
     if report.index.skipped_lines > 0 {
-        notes.push(format!(
-            "{} could not be read, so these totals may be low.",
-            plural(report.index.skipped_lines, "transcript line")
-        ));
+        notes.push(skipped_transcript_lines(report.index.skipped_lines));
     }
     if unreadable && report.index.unreadable_files > 0 {
         notes.push(format!(
