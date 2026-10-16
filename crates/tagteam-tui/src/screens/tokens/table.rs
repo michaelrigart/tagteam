@@ -1132,6 +1132,25 @@ fn highlight(row: Line<'static>, width: usize) -> Line<'static> {
     Line::from(spans).style(selected())
 }
 
+/// What explains an empty report (TR §11.3): the lines and the files the index could not read,
+/// in the footnotes' words, wrapped at `width`.
+fn empty_warnings(index: &tagteam_engine::tokens::IndexState, width: usize) -> Vec<Line<'static>> {
+    let mut notes = Vec::new();
+    if index.skipped_lines > 0 {
+        notes.push(words::skipped_transcript_lines(index.skipped_lines));
+    }
+    if index.unreadable_files > 0 {
+        notes.push(format!(
+            "{}.",
+            words::unreadable_transcripts(index.unreadable_files)
+        ));
+    }
+    notes
+        .into_iter()
+        .flat_map(|note| laid_out(vec![Span::raw(" ")], &[note], " ", 1, width))
+        .collect()
+}
+
 pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     let width = usize::from(area.width);
     let t = &state.tokens;
@@ -1152,6 +1171,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             words::NO_TOKEN_USAGE
         };
         lines.push(Line::from(format!(" {none}")));
+        lines.extend(empty_warnings(&report.index, width));
         frame.render_widget(Paragraph::new(lines), area);
         return;
     }
@@ -1679,6 +1699,32 @@ mod tests {
         assert_eq!(lines[5], "");
         let built = showing(vec![], |_| {});
         assert_eq!(draw(&built, 80, 24)[4], " No token usage in this range.");
+    }
+
+    #[test]
+    fn an_empty_report_still_shows_the_warnings_that_explain_it() {
+        let state = showing(vec![], |r| {
+            r.index.skipped_lines = 12;
+            r.index.unreadable_files = 3;
+        });
+        let lines = draw(&state, 80, 24);
+        assert_eq!(lines[4], " No token usage in this range.");
+        assert_eq!(
+            lines[5..7],
+            [
+                " 12 transcript lines could not be read, so these totals may be low.",
+                " 3 transcript files could not be read; the next refresh tries again.",
+            ]
+        );
+        assert_eq!(lines[7], "");
+    }
+
+    #[test]
+    fn an_empty_report_without_warnings_shows_only_the_empty_message() {
+        let state = showing(vec![], |_| {});
+        let lines = draw(&state, 80, 24);
+        assert_eq!(lines[4], " No token usage in this range.");
+        assert!(lines[5..23].iter().all(|l| l.is_empty()), "{lines:?}");
     }
 
     #[test]
