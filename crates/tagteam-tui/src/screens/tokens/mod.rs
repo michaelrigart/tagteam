@@ -281,10 +281,12 @@ pub(crate) fn load(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     let t = &mut state.tokens;
     t.pending = true;
     t.again = false;
-    vec![Cmd::LoadReport {
+    let cmd = Cmd::LoadReport {
         r#gen: state.gens.report,
         query: t.query(now_ms),
-    }]
+    };
+    index::on_load(state, now_ms);
+    vec![cmd]
 }
 
 /// The same query again (spec §6.4's triggers). One already on the lane is let finish, so a
