@@ -94,7 +94,8 @@ fn quick(first_ms: u64, most_ms: u64, mismatch_ms: u64) -> Backoff {
 }
 
 /// The live thread on `path`, with a reader that takes its queue at each wake, as the UI
-/// thread does, and passes on each thing it took with when it took it.
+/// thread does, and passes on each thing it took with when it took it: the time is read after
+/// the take, so nothing is stamped earlier than it was pushed.
 fn live(path: &Path, backoff: Backoff) -> (Receiver<(Instant, Live)>, Arc<LiveQueue>) {
     let (wake, woken) = mpsc::channel();
     let queue = Arc::new(LiveQueue::new(256, move || wake.send(()).is_ok()));
@@ -103,8 +104,9 @@ fn live(path: &Path, backoff: Backoff) -> (Receiver<(Instant, Live)>, Arc<LiveQu
     let reader = Arc::clone(&queue);
     thread::spawn(move || {
         while woken.recv().is_ok() {
+            let taken = reader.take();
             let at = Instant::now();
-            for l in reader.take() {
+            for l in taken {
                 if tx.send((at, l)).is_err() {
                     return;
                 }
