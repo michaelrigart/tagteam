@@ -10,19 +10,18 @@ use jiff::tz::TimeZone;
 use serde_json::{Map, Value, json};
 use tagteam_core::ProviderId;
 use tagteam_core::time::{format_iso8601, parse_iso8601_ms};
-use tagteam_core::tokens::{day_bounds_ms, month_bounds_ms, month_of};
+use tagteam_core::tokens::day_bounds_ms;
 use tagteam_engine::tokens::{
     ActiveBlock, Basis, Cost, IndexProgress, IndexState, PeriodKey, RowAccount, TokenCounts,
-    TokenGrouping, TokenPeriod, TokenReport, TokenRow, TokenTotal, Wait,
+    TokenGrouping, TokenPeriod, TokenReport, TokenRow, TokenTotal, Wait, default_since_ms,
 };
+use tagteam_engine::words::{self, dollars, plural, scaled};
 use tagteam_engine::{Engine, EngineError};
 
 use crate::cli::TokensArgs;
 use crate::history;
 use crate::render::{self, MISSING};
 
-/// Spec §11.1: how far back `--since` defaults to, for every period but `month`.
-const DEFAULT_SINCE_MS: i64 = 30 * 86_400_000;
 /// Spec §11.2: a refresh shows progress only once it has run this long.
 const PROGRESS_AFTER: Duration = Duration::from_secs(1);
 
@@ -32,7 +31,6 @@ const BAD_UNTIL: &str =
     "--until takes a span like 30d, 12h or 90m, a date YYYY-MM-DD, or an ISO 8601 time";
 const BAD_BY: &str = "--by takes account, model, account,model or none";
 const PARTIAL_INDEX: &str = "the token index has not completed its first refresh, so this report is partial; run `tagteam tokens` without --no-refresh to complete it";
-const NO_USAGE: &str = "No token usage in this range.\n";
 
 /// What `tokens`' flags ask for (spec §11.1), each checked before the index is touched.
 pub(crate) struct Flags {
@@ -121,19 +119,6 @@ fn date(s: &str) -> Option<jiff::civil::Date> {
     };
     let (year, month, day) = (part(0..4)?, part(5..7)?, part(8..10)?);
     jiff::civil::Date::new(year, i8::try_from(month).ok()?, i8::try_from(day).ok()?).ok()
-}
-
-/// Spec §11.1's default `--since`, a function of the time and the zone alone: 30 days back, or
-/// for `month` the first day of the eleventh month before `now_ms`'s, at midnight in `tz`, so
-/// the report spans twelve calendar months with this one.
-pub(crate) fn default_since_ms(period: &TokenPeriod, now_ms: i64, tz: &TimeZone) -> i64 {
-    if !matches!(period, TokenPeriod::Month) {
-        return now_ms.saturating_sub(DEFAULT_SINCE_MS);
-    }
-    let (year, month) = month_of(now_ms, tz);
-    let index = i32::from(year) * 12 + i32::from(month) - 1 - 11;
-    let (year, month) = (index.div_euclid(12), index.rem_euclid(12) + 1);
-    month_bounds_ms(year as i16, month as i8, tz).0
 }
 
 /// `--model` (spec §11.1): each pattern names every indexed model that contains it, ignoring
@@ -281,19 +266,11 @@ pub(crate) fn notices(report: &TokenReport, no_refresh: bool) -> Vec<String> {
     }
     if index.unreadable_files > 0 {
         out.push(format!(
-            "warning: {} could not be read; the next refresh tries again",
-            plural(index.unreadable_files, "transcript file")
+            "warning: {}",
+            words::unreadable_transcripts(index.unreadable_files)
         ));
     }
     out
-}
-
-fn plural(n: u64, noun: &str) -> String {
-    if n == 1 {
-        format!("1 {noun}")
-    } else {
-        format!("{n} {noun}s")
-    }
 }
 
 /// A time as JSON and CSV spell it: ISO 8601 UTC, to the second.
@@ -594,7 +571,7 @@ const fn right(head: &'static str) -> Col {
 /// note. Times are in the report's zone.
 pub(crate) fn human(report: &TokenReport) -> String {
     if report.rows.is_empty() {
-        return NO_USAGE.to_owned();
+        return format!("{}\n", words::NO_TOKEN_USAGE);
     }
     let q = &report.query;
     let by_model = report.rows.iter().any(|r| r.model.is_some());
@@ -789,34 +766,6 @@ fn cost_cell(cost: Option<&Cost>, mark: bool) -> String {
     }
 }
 
-/// A token count as the table shows it (spec §11.2): as is below 1,000, else to one decimal
-/// in thousands, millions, billions or trillions (`12.4M`), rounded half up.
-pub(crate) fn scaled(n: u64) -> String {
-    const UNITS: [(u128, char); 4] = [
-        (1_000, 'K'),
-        (1_000_000, 'M'),
-        (1_000_000_000, 'B'),
-        (1_000_000_000_000, 'T'),
-    ];
-    if n < 1_000 {
-        return n.to_string();
-    }
-    let tenths = |unit: u128| (u128::from(n) * 10 + unit / 2) / unit;
-    let (unit, suffix) = UNITS
-        .iter()
-        .copied()
-        .find(|&(unit, _)| tenths(unit) < 10_000)
-        .unwrap_or(UNITS[3]);
-    let t = tenths(unit);
-    format!("{}.{}{suffix}", t / 10, t % 10)
-}
-
-/// Nano-dollars as dollars and cents (`$312.40`), rounded half up.
-pub(crate) fn dollars(nanos: u64) -> String {
-    let cents = (u128::from(nanos) + 5_000_000) / 10_000_000;
-    format!("${}.{:02}", cents / 100, cents % 100)
-}
-
 /// A block row's note (spec §11.2): `observed` for a block a reset time placed (spec §9), and
 /// for the active block its time left, burn rate and projection.
 pub(crate) fn block_note(observed: bool, active: Option<&ActiveBlock>) -> String {
@@ -840,37 +789,13 @@ pub(crate) fn block_note(observed: bool, active: Option<&ActiveBlock>) -> String
 }
 
 /// Spec §11.2's footnotes, after a blank line: unpriced models, responses whose output is a
-/// lower bound (spec §2.3), skipped lines, and the date of the price table.
+/// lower bound (spec §2.3), skipped lines, and the date of the price table. Unreadable files
+/// are warned of on stderr instead (spec §11.3).
 fn footnotes(report: &TokenReport) -> String {
-    let mut notes = Vec::new();
-    if !report.unpriced_models.is_empty() {
-        notes.push(format!(
-            "No price for {}: counted without cost (* marks a partial cost).",
-            report.unpriced_models.join(", ")
-        ));
-    }
-    if report.total.unfinalized > 0 {
-        notes.push(format!(
-            "Output is a lower bound for {}.",
-            plural(report.total.unfinalized, "subagent response")
-        ));
-    }
-    if report.index.skipped_lines > 0 {
-        notes.push(format!(
-            "{} could not be read, so these totals may be low.",
-            plural(report.index.skipped_lines, "transcript line")
-        ));
-    }
-    notes.push(if report.price_overrides.is_empty() {
-        format!("API cost at list prices as of {}.", report.prices_as_of)
-    } else {
-        format!(
-            "API cost at list prices as of {}, with config.toml's for {}.",
-            report.prices_as_of,
-            report.price_overrides.join(", ")
-        )
-    });
-    format!("\n{}\n", notes.join("\n"))
+    format!(
+        "\n{}\n",
+        words::token_footnotes(report, "*", false).join("\n")
+    )
 }
 
 #[cfg(test)]
@@ -878,33 +803,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counts_scale_to_one_decimal_from_a_thousand() {
-        for (n, text) in [
-            (0, "0"),
-            (999, "999"),
-            (1_000, "1.0K"),
-            (1_234, "1.2K"),
-            (1_250, "1.3K"),
-            (51_000, "51.0K"),
-            (999_949, "999.9K"),
-            (999_950, "1.0M"),
-            (12_400_000, "12.4M"),
-            (3_100_000_000, "3.1B"),
-            (999_950_000_000, "1.0T"),
-            (u64::MAX, "18446744.1T"),
-        ] {
-            assert_eq!(scaled(n), text, "{n}");
-        }
-    }
-
-    #[test]
-    fn costs_are_dollars_and_cents_rounded_half_up() {
-        assert_eq!(dollars(0), "$0.00");
-        assert_eq!(dollars(4_999_999), "$0.00");
-        assert_eq!(dollars(5_000_000), "$0.01");
-        assert_eq!(dollars(622_016_000), "$0.62");
-        assert_eq!(dollars(312_400_000_000), "$312.40");
-        assert_eq!(dollars(u64::MAX), "$18446744073.71");
+    fn a_partial_cost_is_starred_and_a_whole_one_keeps_the_cents_in_line() {
         let partial = Cost {
             usd_nanos: 97_000_000,
             partial: true,
@@ -980,59 +879,6 @@ mod tests {
         assert_eq!(
             day(Some("Mars/Olympus_Mons"), None).err().as_deref(),
             Some("unknown time zone \"Mars/Olympus_Mons\"")
-        );
-    }
-
-    /// `s`, an ISO 8601 time, in epoch ms.
-    fn at(s: &str) -> i64 {
-        parse_iso8601_ms(s).unwrap()
-    }
-
-    #[test]
-    fn default_ranges_follow_the_zones_calendar() {
-        // Spec §11.1, at fixed instants: 30 days back for every period but month, and for
-        // month the first of the eleventh month back, at midnight where the report's days are.
-        let utc = TimeZone::UTC;
-        let brussels = TimeZone::get("Europe/Brussels").unwrap();
-        let since = |period: TokenPeriod, now: &str, tz: &TimeZone| {
-            iso(default_since_ms(&period, at(now), tz))
-        };
-        let now = "2026-09-21T14:13:20Z";
-        assert_eq!(since(TokenPeriod::Day, now, &utc), "2026-08-22T14:13:20Z");
-        assert_eq!(
-            since(TokenPeriod::Block, now, &brussels),
-            "2026-08-22T14:13:20Z",
-            "30 days of 24 hours, whatever the zone"
-        );
-        assert_eq!(since(TokenPeriod::Month, now, &utc), "2025-10-01T00:00:00Z");
-        // Across the turn of a month and of a year.
-        assert_eq!(
-            since(TokenPeriod::Month, "2026-02-28T23:59:59.999Z", &utc),
-            "2025-03-01T00:00:00Z"
-        );
-        assert_eq!(
-            since(TokenPeriod::Month, "2026-03-01T00:00:00Z", &utc),
-            "2025-04-01T00:00:00Z"
-        );
-        assert_eq!(
-            since(TokenPeriod::Month, "2026-01-15T12:00:00Z", &utc),
-            "2025-02-01T00:00:00Z"
-        );
-        // 23:30 UTC on 31 October is already 1 November in Brussels, on winter time (UTC+1):
-        // the range starts on 1 December 2025 at its midnight there.
-        assert_eq!(
-            since(TokenPeriod::Month, "2026-10-31T23:30:00Z", &brussels),
-            "2025-11-30T23:00:00Z"
-        );
-        assert_eq!(
-            since(TokenPeriod::Month, "2026-10-31T23:30:00Z", &utc),
-            "2025-11-01T00:00:00Z",
-            "still October in UTC"
-        );
-        // From late March 2026, eleven months back is April 2025, on summer time (UTC+2).
-        assert_eq!(
-            since(TokenPeriod::Month, "2026-03-29T12:00:00Z", &brussels),
-            "2025-03-31T22:00:00Z"
         );
     }
 
