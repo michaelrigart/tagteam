@@ -36,9 +36,10 @@ pub struct IndexWatch {
     refreshing: Option<IndexProgress>,
     /// The last refresh returned `Busy`: another process is catching up (spec §5.3).
     busy: bool,
-    /// The index's `refreshed_at_ms` when that refresh returned: a check that sees it move on
-    /// finds the other process done, and ends `busy`.
-    busy_after: Option<i64>,
+    /// The index's `refreshed_at_ms` as the first check after `Busy` read it, once one has: a
+    /// later check that sees it move on finds the other process done, and ends `busy`. Not the
+    /// last report's value, which may be old, or none.
+    busy_after: Option<Option<i64>>,
     /// The first refresh has been asked for (B5).
     started: bool,
     /// The last refresh's failure, in words.
@@ -157,7 +158,7 @@ pub(crate) fn on_refreshed(
         }
         Ok(RefreshOutcome::Busy) => {
             watch.busy = true;
-            watch.busy_after = watch.state.and_then(|s| s.refreshed_at_ms);
+            watch.busy_after = None;
             watch.error = None;
         }
         Err(e) => {
@@ -201,8 +202,12 @@ pub(crate) fn on_index_state(
     }
     let shown = state.tokens.report().map(|r| r.index.changed_at_ms);
     let watch = &mut state.tokens.watch;
-    if watch.busy && index.refreshed_at_ms > watch.busy_after {
-        watch.busy = false;
+    if watch.busy {
+        match watch.busy_after {
+            None => watch.busy_after = Some(index.refreshed_at_ms),
+            Some(after) if index.refreshed_at_ms > after => watch.busy = false,
+            Some(_) => {}
+        }
     }
     watch.state = Some(index);
     let moved = shown.is_some_and(|shown| index.changed_at_ms > shown);
@@ -582,6 +587,72 @@ mod tests {
                 .all(|c| !matches!(c, Cmd::LoadIndexState { .. })),
             "nothing left to check: {later:?}"
         );
+    }
+
+    /// Answers the check among `cmds` with an index refreshed at `refreshed_ms`, at `at_ms`.
+    fn answer_check(state: &mut State, cmds: &[Cmd], refreshed_ms: i64, at_ms: i64) {
+        let r#gen = cmds
+            .iter()
+            .find_map(|c| match c {
+                Cmd::LoadIndexState { r#gen, .. } => Some(*r#gen),
+                _ => None,
+            })
+            .expect("a check was asked for");
+        let index = IndexState {
+            refreshed_at_ms: Some(refreshed_ms),
+            changed_at_ms: Some(NOW_MS - 3_600_000),
+            ..IndexState::default()
+        };
+        let msg = Msg::IndexState {
+            r#gen,
+            result: Ok(index),
+        };
+        update(state, msg, at_ms);
+    }
+
+    #[test]
+    fn busy_returned_before_any_read_stays_while_the_other_refresh_runs() {
+        // The first refresh can return `Busy` before the first report: the index's last
+        // completed refresh, which the first check reads, is not the other process finishing.
+        let mut state = fresh(Screen::Tokens);
+        state.start();
+        assert_eq!(drawn(&mut state), [Cmd::RefreshIndex { provider: cc() }]);
+        assert!(state.tokens.watch().state().is_none());
+        let busy = Ok(RefreshOutcome::Busy);
+        let cmds = update(&mut state, Msg::Refreshed { result: busy }, NOW_MS + 100);
+        answer_check(&mut state, &cmds, NOW_MS - 3_600_000, NOW_MS + 200);
+        assert!(
+            state.tokens.watch().busy(),
+            "the first check is the baseline"
+        );
+        let cmds = tick(&mut state, NOW_MS + 5_300);
+        answer_check(&mut state, &cmds, NOW_MS - 3_600_000, NOW_MS + 5_400);
+        assert!(state.tokens.watch().busy(), "nothing has advanced");
+        let cmds = tick(&mut state, NOW_MS + 10_500);
+        answer_check(&mut state, &cmds, NOW_MS + 10_000, NOW_MS + 10_600);
+        assert!(!state.tokens.watch().busy(), "it finished");
+    }
+
+    #[test]
+    fn busy_is_judged_from_the_first_check_after_it_and_not_from_an_older_report() {
+        // The report on screen was read up to 60 s before `Busy` came back: the other process
+        // may have finished one refresh and started another since. The first check, not that
+        // report, is what a later one is compared with.
+        let mut state = on_tokens();
+        update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+        let busy = Ok(RefreshOutcome::Busy);
+        let cmds = update(&mut state, Msg::Refreshed { result: busy }, NOW_MS + 60_000);
+        answer_check(&mut state, &cmds, NOW_MS + 30_000, NOW_MS + 60_100);
+        assert!(
+            state.tokens.watch().busy(),
+            "a refresh finished before the check; the next one runs"
+        );
+        let cmds = tick(&mut state, NOW_MS + 65_200);
+        answer_check(&mut state, &cmds, NOW_MS + 30_000, NOW_MS + 65_300);
+        assert!(state.tokens.watch().busy(), "still the same refresh");
+        let cmds = tick(&mut state, NOW_MS + 70_400);
+        answer_check(&mut state, &cmds, NOW_MS + 70_000, NOW_MS + 70_500);
+        assert!(!state.tokens.watch().busy(), "it finished");
     }
 
     #[test]
