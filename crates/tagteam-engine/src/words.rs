@@ -1,10 +1,12 @@
-//! The words `list`, `status` and `history` print, shared with the TUI so that both say the
-//! same things (TUI spec §5.2). They moved here from the CLI's `render.rs` and `history.rs`
-//! with their bodies unchanged; the CLI adds its ANSI colours around them.
+//! The words `list`, `status`, `history` and `tokens` print, shared with the TUI so that both
+//! say the same things (TUI spec §5.2, §5.3). They moved here from the CLI's `render.rs`,
+//! `history.rs` and `tokens_cmd.rs` with their bodies unchanged; the CLI adds its ANSI colours
+//! around them.
 
 use tagteam_core::{Window, WindowKind};
 
 use crate::store::AccountRow;
+use crate::tokens::TokenReport;
 use crate::views::{AccountView, HistoryWindow, NO_DATA, UsageStatus, UsageView};
 
 /// A window a reading does not have, or an age that is not known.
@@ -260,6 +262,97 @@ pub fn projection_text(hw: &HistoryWindow, now_s: i64) -> String {
         _ => "no projection".to_owned(),
     };
     format!("{} pts/h · {eta}{method}", rate_signed(rate))
+}
+
+/// What a token report with no rows says (token report §11.2).
+pub const NO_TOKEN_USAGE: &str = "No token usage in this range.";
+
+/// `1 noun`, or `n nouns`.
+pub fn plural(n: u64, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// A token count as the report shows it (token report §11.2): as is below 1,000, else to one
+/// decimal in thousands, millions, billions or trillions (`12.4M`), rounded half up.
+pub fn scaled(n: u64) -> String {
+    const UNITS: [(u128, char); 4] = [
+        (1_000, 'K'),
+        (1_000_000, 'M'),
+        (1_000_000_000, 'B'),
+        (1_000_000_000_000, 'T'),
+    ];
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let tenths = |unit: u128| (u128::from(n) * 10 + unit / 2) / unit;
+    let (unit, suffix) = UNITS
+        .iter()
+        .copied()
+        .find(|&(unit, _)| tenths(unit) < 10_000)
+        .unwrap_or(UNITS[3]);
+    let t = tenths(unit);
+    format!("{}.{}{suffix}", t / 10, t % 10)
+}
+
+/// Nano-dollars as dollars and cents (`$312.40`), rounded half up.
+pub fn dollars(nanos: u64) -> String {
+    let cents = (u128::from(nanos) + 5_000_000) / 10_000_000;
+    format!("${}.{:02}", cents / 100, cents % 100)
+}
+
+/// Transcript files the token index's last refresh could not read (token report §11.3).
+pub fn unreadable_transcripts(n: u64) -> String {
+    format!(
+        "{} could not be read; the next refresh tries again",
+        plural(n, "transcript file")
+    )
+}
+
+/// The token report's footnotes (token report §11.2), one sentence each: unpriced models,
+/// responses whose output is a lower bound (token report §2.3), skipped lines, the transcript
+/// files the last refresh could not read when `unreadable` asks for them, and the price
+/// table's date. `mark` is what marks a partial cost: `*` in the CLI, `≥` in the TUI (TUI spec
+/// §5.3).
+pub fn token_footnotes(report: &TokenReport, mark: &str, unreadable: bool) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !report.unpriced_models.is_empty() {
+        notes.push(format!(
+            "No price for {}: counted without cost ({mark} marks a partial cost).",
+            report.unpriced_models.join(", ")
+        ));
+    }
+    if report.total.unfinalized > 0 {
+        notes.push(format!(
+            "Output is a lower bound for {}.",
+            plural(report.total.unfinalized, "subagent response")
+        ));
+    }
+    if report.index.skipped_lines > 0 {
+        notes.push(format!(
+            "{} could not be read, so these totals may be low.",
+            plural(report.index.skipped_lines, "transcript line")
+        ));
+    }
+    if unreadable && report.index.unreadable_files > 0 {
+        notes.push(format!(
+            "{}.",
+            unreadable_transcripts(report.index.unreadable_files)
+        ));
+    }
+    notes.push(if report.price_overrides.is_empty() {
+        format!("API cost at list prices as of {}.", report.prices_as_of)
+    } else {
+        format!(
+            "API cost at list prices as of {}, with config.toml's for {}.",
+            report.prices_as_of,
+            report.price_overrides.join(", ")
+        )
+    });
+    notes
 }
 
 #[cfg(test)]
@@ -832,5 +925,98 @@ mod tests {
             with(saturated, None),
             "+0.01 pts/h · won't run out within a year (regression)"
         );
+    }
+
+    #[test]
+    fn counts_scale_to_one_decimal_from_a_thousand() {
+        for (n, text) in [
+            (0, "0"),
+            (999, "999"),
+            (1_000, "1.0K"),
+            (1_234, "1.2K"),
+            (1_250, "1.3K"),
+            (51_000, "51.0K"),
+            (999_949, "999.9K"),
+            (999_950, "1.0M"),
+            (12_400_000, "12.4M"),
+            (3_100_000_000, "3.1B"),
+            (999_950_000_000, "1.0T"),
+            (u64::MAX, "18446744.1T"),
+        ] {
+            assert_eq!(scaled(n), text, "{n}");
+        }
+    }
+
+    #[test]
+    fn costs_are_dollars_and_cents_rounded_half_up() {
+        assert_eq!(dollars(0), "$0.00");
+        assert_eq!(dollars(4_999_999), "$0.00");
+        assert_eq!(dollars(5_000_000), "$0.01");
+        assert_eq!(dollars(622_016_000), "$0.62");
+        assert_eq!(dollars(312_400_000_000), "$312.40");
+        assert_eq!(dollars(u64::MAX), "$18446744073.71");
+    }
+
+    fn report() -> TokenReport {
+        use crate::tokens::{IndexState, TokenGrouping, TokenPeriod, TokenQuery, TokenTotal};
+        TokenReport {
+            query: TokenQuery {
+                provider: ProviderId::new(CLAUDE_CODE),
+                period: TokenPeriod::Day,
+                grouping: TokenGrouping::Account,
+                since_ms: None,
+                until_ms: None,
+                accounts: None,
+                models: None,
+                session: None,
+                tz: jiff::tz::TimeZone::UTC,
+            },
+            time_zone: "UTC".into(),
+            rows: vec![],
+            total: TokenTotal::default(),
+            index: IndexState::default(),
+            unpriced_models: vec![],
+            prices_as_of: "2026-10-01",
+            price_overrides: vec![],
+        }
+    }
+
+    #[test]
+    fn the_token_footnotes_name_what_the_report_leaves_out_and_mark_partial_costs_as_asked() {
+        let plain = report();
+        assert_eq!(
+            token_footnotes(&plain, "*", true),
+            ["API cost at list prices as of 2026-10-01."]
+        );
+        let mut every = report();
+        every.unpriced_models = vec!["claude-test-9".into(), "claude-x".into()];
+        every.total.unfinalized = 1;
+        every.index.skipped_lines = 12;
+        every.index.unreadable_files = 3;
+        every.price_overrides = vec!["claude-opus-5-5".into()];
+        assert_eq!(
+            token_footnotes(&every, "≥", true),
+            [
+                "No price for claude-test-9, claude-x: counted without cost (≥ marks a partial cost).",
+                "Output is a lower bound for 1 subagent response.",
+                "12 transcript lines could not be read, so these totals may be low.",
+                "3 transcript files could not be read; the next refresh tries again.",
+                "API cost at list prices as of 2026-10-01, with config.toml's for claude-opus-5-5.",
+            ]
+        );
+        assert_eq!(
+            token_footnotes(&every, "*", false)[0],
+            "No price for claude-test-9, claude-x: counted without cost (* marks a partial cost)."
+        );
+        assert_eq!(
+            token_footnotes(&every, "*", false).len(),
+            4,
+            "the CLI warns of unreadable files on stderr instead (token report §11.3)"
+        );
+        assert_eq!(
+            unreadable_transcripts(1),
+            "1 transcript file could not be read; the next refresh tries again"
+        );
+        assert_eq!(plural(2, "subagent response"), "2 subagent responses");
     }
 }

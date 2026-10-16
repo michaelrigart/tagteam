@@ -11,7 +11,7 @@ use std::sync::Arc;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
 pub use tagteam_core::tokens::{Basis, TokenCounts};
-use tagteam_core::tokens::{Prices, day_bounds_ms, month_bounds_ms};
+use tagteam_core::tokens::{Prices, day_bounds_ms, month_bounds_ms, month_of};
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::Provider;
 
@@ -193,7 +193,9 @@ impl RowAccount {
 pub struct RowKey(String);
 
 impl RowKey {
-    fn new(period: &PeriodKey, account: Option<&RowAccount>, model: Option<&str>) -> Self {
+    /// The key of the row for `period`, `account` and `model`: what the report keys its rows
+    /// by, public so that a renderer's fixtures key their rows as the report does.
+    pub fn new(period: &PeriodKey, account: Option<&RowAccount>, model: Option<&str>) -> Self {
         let mut key = match period {
             PeriodKey::Day { date } => format!("day:{date}"),
             PeriodKey::Month { year, month } => format!("month:{year:04}-{month:02}"),
@@ -336,6 +338,23 @@ impl TokenQuery {
     }
 }
 
+/// Spec §11.1: how far back a report's range starts by default, for every period but `month`.
+const DEFAULT_SINCE_MS: i64 = 30 * 86_400_000;
+
+/// Spec §11.1's default `since_ms`, a function of the time and the zone alone: 30 days back, or
+/// for `month` the first day of the eleventh month before `now_ms`'s, at midnight in `tz`, so
+/// the report spans twelve calendar months with this one. `tagteam tokens` and the TUI both
+/// take it (TUI spec §5.3).
+pub fn default_since_ms(period: &TokenPeriod, now_ms: i64, tz: &TimeZone) -> i64 {
+    if !matches!(period, TokenPeriod::Month) {
+        return now_ms.saturating_sub(DEFAULT_SINCE_MS);
+    }
+    let (year, month) = month_of(now_ms, tz);
+    let index = i32::from(year) * 12 + i32::from(month) - 1 - 11;
+    let (year, month) = (index.div_euclid(12), index.rem_euclid(12) + 1);
+    month_bounds_ms(year as i16, month as i8, tz).0
+}
+
 impl Engine {
     /// Spec §10: the report `q` asks for, from the index and the evidence as they stand. It
     /// reads only: it never refreshes the index (spec §5) and never creates the store, without
@@ -446,4 +465,69 @@ fn index_state(store: &Store, provider: &ProviderId) -> Result<IndexState, Store
         oldest_ms,
         newest_ms,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use tagteam_core::time::{format_iso8601, parse_iso8601_ms};
+
+    use super::*;
+
+    /// `ms` as an ISO 8601 UTC time, to the second.
+    fn iso(ms: i64) -> String {
+        format_iso8601(ms.div_euclid(1000))
+    }
+
+    /// `s`, an ISO 8601 time, in epoch ms.
+    fn at(s: &str) -> i64 {
+        parse_iso8601_ms(s).unwrap()
+    }
+
+    #[test]
+    fn default_ranges_follow_the_zones_calendar() {
+        // Spec §11.1, at fixed instants: 30 days back for every period but month, and for
+        // month the first of the eleventh month back, at midnight where the report's days are.
+        let utc = TimeZone::UTC;
+        let brussels = TimeZone::get("Europe/Brussels").unwrap();
+        let since = |period: TokenPeriod, now: &str, tz: &TimeZone| {
+            iso(default_since_ms(&period, at(now), tz))
+        };
+        let now = "2026-09-21T14:13:20Z";
+        assert_eq!(since(TokenPeriod::Day, now, &utc), "2026-08-22T14:13:20Z");
+        assert_eq!(
+            since(TokenPeriod::Block, now, &brussels),
+            "2026-08-22T14:13:20Z",
+            "30 days of 24 hours, whatever the zone"
+        );
+        assert_eq!(since(TokenPeriod::Month, now, &utc), "2025-10-01T00:00:00Z");
+        // Across the turn of a month and of a year.
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-02-28T23:59:59.999Z", &utc),
+            "2025-03-01T00:00:00Z"
+        );
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-03-01T00:00:00Z", &utc),
+            "2025-04-01T00:00:00Z"
+        );
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-01-15T12:00:00Z", &utc),
+            "2025-02-01T00:00:00Z"
+        );
+        // 23:30 UTC on 31 October is already 1 November in Brussels, on winter time (UTC+1):
+        // the range starts on 1 December 2025 at its midnight there.
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-10-31T23:30:00Z", &brussels),
+            "2025-11-30T23:00:00Z"
+        );
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-10-31T23:30:00Z", &utc),
+            "2025-11-01T00:00:00Z",
+            "still October in UTC"
+        );
+        // From late March 2026, eleven months back is April 2025, on summer time (UTC+2).
+        assert_eq!(
+            since(TokenPeriod::Month, "2026-03-29T12:00:00Z", &brussels),
+            "2025-03-31T22:00:00Z"
+        );
+    }
 }
