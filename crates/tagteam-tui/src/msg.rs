@@ -4,11 +4,13 @@
 use std::sync::mpsc::Sender;
 
 use tagteam_core::{AccountId, ProviderId};
+use tagteam_daemon::protocol::Status;
 use tagteam_engine::tokens::{IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport};
 use tagteam_engine::views::HistoryView;
 
 use crate::host::{Action, ActionOutcome};
 use crate::lanes::Coalesce;
+use crate::live::Live;
 use crate::source::{AccountsSnapshot, CollectSummary, SourceError};
 
 /// The views lane's requests: store-served reads, no network (spec §4.3).
@@ -62,6 +64,13 @@ pub enum IndexReq {
     Refresh { provider: ProviderId },
 }
 
+/// The daemon lane's requests: the daemon's `status`, over a connection of its own (spec §4.3,
+/// §8). `link` is the link it is asked for (C-R21).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonReq {
+    Status { link: u64 },
+}
+
 impl Coalesce for ViewsReq {
     /// Any two of the same kind: only the newest read is worth making.
     fn same_as(&self, other: &Self) -> bool {
@@ -89,6 +98,14 @@ impl Coalesce for IndexReq {
     /// A refresh queued behind the running one is one refresh.
     fn same_as(&self, other: &Self) -> bool {
         self == other
+    }
+}
+
+impl Coalesce for DaemonReq {
+    /// Any two: a burst of events costs one request, and the newest link's is the one made
+    /// (spec §8).
+    fn same_as(&self, _other: &Self) -> bool {
+        true
     }
 }
 
@@ -150,6 +167,16 @@ pub enum Msg {
     },
     LaneDied {
         lane: &'static str,
+    },
+    /// What the live thread learned (spec §8). The runtime makes these from the live queue.
+    Live(Live),
+    /// The live queue has something: the runtime takes it all, and applies each as `Live`
+    /// (C-R17).
+    LiveReady,
+    /// The daemon's `status`, from the daemon lane, for link `link` (spec §8, C-R21).
+    DaemonStatus {
+        link: u64,
+        result: Result<Status, String>,
     },
 }
 
@@ -213,6 +240,15 @@ pub enum Cmd {
     },
     /// Ctrl-Z (spec §10.1).
     Stop,
+    /// The daemon's `status` for link `link`, on the daemon lane (spec §8, C-R21).
+    FetchStatus {
+        link: u64,
+    },
+    /// End link `link`, which no longer works, if the live thread still holds it; it connects
+    /// again (C-R19, C-R21).
+    DropLink {
+        link: u64,
+    },
 }
 
 #[cfg(test)]
@@ -290,5 +326,13 @@ mod tests {
         assert!(!act().same_as(&act()));
         assert!(!collect(1).same_as(&act()));
         assert!(!act().same_as(&collect(1)));
+    }
+
+    #[test]
+    fn status_requests_always_coalesce() {
+        // Spec §8: a burst of events costs one request; the lane keeps the newest link's.
+        let status = |link| DaemonReq::Status { link };
+        assert!(status(1).same_as(&status(1)));
+        assert!(status(1).same_as(&status(2)));
     }
 }

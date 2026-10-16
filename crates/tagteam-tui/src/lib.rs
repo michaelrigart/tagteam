@@ -5,6 +5,7 @@
 
 pub mod actions;
 mod ask;
+pub mod daemon;
 pub mod host;
 mod input;
 pub mod lanes;

@@ -4,6 +4,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{self, Overlay};
+use crate::daemon;
 use crate::msg::{Cmd, Msg};
 use crate::screens;
 use crate::state::{BannerKind, REFRESH_MS, Screen, State};
@@ -126,20 +127,26 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             }
             quit(state, 1)
         }
+        Msg::Live(live) => daemon::on_live(state, live, now_ms),
+        // The runtime takes the live queue at each wake, and applies what it holds as `Live`.
+        Msg::LiveReady => vec![],
+        Msg::DaemonStatus { link, result } => daemon::on_status(state, link, result, now_ms),
     }
 }
 
 /// Spec §6.1: the TUI collects after drawing. The runtime calls this after each frame it
 /// draws. The first frame asks for the token index's first refresh (B5). The first frame that
-/// shows accounts asks for the first collection of them, once no action holds the actions lane
-/// (spec §7.2); until a collection has been asked for, `gens.collect` is 0. The timer collects
-/// from then on (§6.2).
+/// shows accounts nothing else collects for (§6.3) asks for the first collection of them, once
+/// no action holds the actions lane (spec §7.2), and once the TUI knows whether a daemon
+/// collects for them (C-R20); until a collection has been asked for, `gens.collect` is 0. The
+/// timer collects from then on (§6.2).
 pub fn drawn(state: &mut State) -> Vec<Cmd> {
     let mut cmds = screens::tokens::index::first_refresh(state);
-    if state.gens.collect > 0 || state.quitting.is_some() || state.running.is_some() {
+    let waits = state.running.is_some() || !state.daemon.settled();
+    if state.gens.collect > 0 || state.quitting.is_some() || waits {
         return cmds;
     }
-    let shown = state.accounts.shown_ids();
+    let shown = daemon::to_collect(state);
     if !shown.is_empty() {
         cmds.push(state.collect_due(shown));
     }
@@ -251,19 +258,25 @@ fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     }
     // Spec §6.4: the token index's own timers, while Tokens is open.
     let mut cmds = screens::tokens::index::on_tick(state, now_ms);
+    // Spec §6.3, §8: the daemon's link.
+    cmds.extend(daemon::on_tick(state, now_ms));
     if state.quitting.is_some() || now_ms < state.refresh.next_ms {
         return cmds;
     }
     // Spec §6.2: every 30 s the views are re-read, and the shown accounts offered to the
-    // collector, unless an action holds the actions lane (spec §7.2).
+    // collector, unless an action holds the actions lane (spec §7.2). In live mode the views
+    // are read on the daemon's events and every 60 s instead, and the collector is offered
+    // only the accounts nothing else collects for (§6.3).
     state.refresh.next_ms = now_ms + REFRESH_MS;
-    cmds.push(state.load_accounts());
-    if state.screen == Screen::History {
-        cmds.extend(screens::history::reload(state, now_ms));
+    if !state.daemon.live() {
+        cmds.push(state.load_accounts());
+        if state.screen == Screen::History {
+            cmds.extend(screens::history::reload(state, now_ms));
+        }
     }
-    let shown = state.accounts.shown_ids();
-    if state.running.is_none() && !shown.is_empty() {
-        cmds.push(state.collect_due(shown));
+    let due = daemon::to_collect(state);
+    if state.running.is_none() && !due.is_empty() {
+        cmds.push(state.collect_due(due));
     }
     cmds
 }

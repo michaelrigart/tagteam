@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use tagteam_core::ProviderId;
 use tagteam_engine::EngineError;
+use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_provider::Cancel;
 use tagteam_provider::profile::RunShell;
 use tagteam_tui::source::{EngineSource, Source, SourceFactory};
@@ -77,6 +78,8 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
     let tokens_provider = provider
         .clone()
         .unwrap_or_else(|| probe.default_provider().clone());
+    // Spec §8: the daemon of the store the TUI reads, found from the environment alone (D5.1).
+    let daemon = daemon_socket_path(probe.env());
     drop(probe);
     let tz = jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC);
     // §7.3: Ctrl-\ belongs to a foreground session, and the TUI survives it for its whole life.
@@ -106,6 +109,7 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
         tz,
         signal: ctx.env.cancel.clone(),
         shutdown,
+        daemon: Some(daemon),
     };
     let exit = tagteam_tui::run(opts, sources(inside, provider), host);
     if let Some(report) = &exit.report {

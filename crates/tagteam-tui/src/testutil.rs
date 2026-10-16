@@ -2,12 +2,17 @@
 //! the engine's public types, keys, and a `TestBackend` read back as text.
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use jiff::tz::TimeZone;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::{Buffer, CellWidth};
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Sample, Window, WindowKind};
+use tagteam_daemon::protocol::{
+    Status, StatusDaemon, StatusJob, StatusNotifications, StatusProvider,
+};
 use tagteam_engine::store::AccountRow;
 use tagteam_engine::tokens::{
     Cost, IndexState, PeriodKey, RowAccount, RowKey, TokenCounts, TokenGrouping, TokenPeriod,
@@ -18,7 +23,8 @@ use tagteam_engine::views::{
 };
 use tagteam_provider::KindTraits;
 
-use crate::msg::Msg;
+use crate::live::Live;
+use crate::msg::{Cmd, Msg};
 use crate::screens::tokens::TokensState;
 use crate::source::AccountsSnapshot;
 use crate::state::{Screen, State};
@@ -379,4 +385,56 @@ pub(crate) fn token_report(query: TokenQuery, rows: Vec<TokenRow>) -> TokenRepor
         prices_as_of: "2026-10-01",
         price_overrides: vec![],
     }
+}
+
+/// The fixture daemon's `status` (D5.4): pid 4242, notifications off, with `providers` and
+/// `jobs`.
+pub(crate) fn daemon_status(providers: Vec<StatusProvider>, jobs: Vec<StatusJob>) -> Status {
+    Status {
+        daemon: StatusDaemon {
+            pid: 4242,
+            version: "20261014.2045.0".into(),
+            protocol: 1,
+            started_at: "2026-09-21T14:13:20Z".into(),
+            socket: Some("~/.local/share/tagteam/daemon.sock".into()),
+            log: "~/.local/state/tagteam/tagteam.log".into(),
+        },
+        notifications: StatusNotifications {
+            enabled: false,
+            backend: None,
+            events: vec![],
+        },
+        providers,
+        jobs,
+        subscribers: 1,
+    }
+}
+
+/// `provider`'s job in `mode` (D4.3), with `autoswitch`, waiting for nothing, with no backoff.
+pub(crate) fn daemon_job(provider: &str, mode: &str, autoswitch: bool) -> StatusProvider {
+    StatusProvider {
+        provider: provider.into(),
+        mode: mode.into(),
+        autoswitch,
+        waiting_for: None,
+        holder_pid: None,
+        backoff: None,
+        last_tick_at: None,
+        next_tick_at: None,
+        last_outcome: None,
+        last_switch: None,
+    }
+}
+
+/// Links `state` to the daemon at `NOW_MS`, by a link of its own, and answers the `status` it
+/// asks for: live mode. The re-read the link asks for is still to come. Returns the link.
+pub(crate) fn go_live(state: &mut State, status: Status) -> u64 {
+    static LINKS: AtomicU64 = AtomicU64::new(100);
+    let link = LINKS.fetch_add(1, Ordering::Relaxed);
+    let cmds = crate::update::update(state, Msg::Live(Live::Up { link }), NOW_MS);
+    assert_eq!(cmds, [Cmd::FetchStatus { link }]);
+    let result = Ok(status);
+    crate::update::update(state, Msg::DaemonStatus { link, result }, NOW_MS);
+    assert!(state.daemon.live());
+    link
 }
