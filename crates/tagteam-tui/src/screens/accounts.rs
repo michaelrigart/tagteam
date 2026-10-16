@@ -1148,9 +1148,6 @@ mod tests {
             lines[label + 2].starts_with(&format!(" {:26}   40%  resets in 3d09h", "")),
             "{lines:?}"
         );
-        assert!(lines[label + 1].starts_with(" Claude Claude"), "{lines:?}");
-        assert!(lines[label + 2].contains("40%"), "{lines:?}");
-        assert!(lines[label + 2].contains("resets in 3d09h"), "{lines:?}");
         let rest = lines[label + 2..].join(" ");
         assert!(rest.contains("▲ ahead of pace (expected 20%)"), "{lines:?}");
         assert!(
