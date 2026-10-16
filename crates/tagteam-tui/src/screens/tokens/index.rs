@@ -238,6 +238,7 @@ pub(crate) fn on_load(state: &mut State, now_ms: i64) {
     let ended = state.tokens.report().and_then(active_end);
     let watch = &mut state.tokens.watch;
     watch.next_query_ms = now_ms + REQUERY_MS;
+    watch.live_due = false;
     if let Some(end) = ended.filter(|end| now_ms >= *end) {
         watch.ended = Some(end);
     }
@@ -259,6 +260,11 @@ pub(crate) fn on_report(state: &mut State, now_ms: i64) {
 /// index changes.
 pub(crate) fn on_daemon_index(state: &mut State) {
     state.tokens.watch.busy = false;
+}
+
+/// The link is down: a `token-index` event that waited for `LIVE_REQUERY_MS` is forgotten.
+pub(crate) fn on_link_down(state: &mut State) {
+    state.tokens.watch.live_due = false;
 }
 
 /// Spec §6.4 in live mode, §8: the daemon's `token-index` event for `provider`. While Tokens shows
@@ -1252,5 +1258,88 @@ mod tests {
         update(&mut state, ch('r'), NOW_MS + 8_000);
         update(&mut state, busy(), NOW_MS + 8_000);
         assert!(!state.tokens.watch().busy(), "a person's `r` too");
+    }
+
+    /// `live_on_tokens`, then a `token-index` event read at once and a second that waits for
+    /// `LIVE_REQUERY_MS`. Returns the state, the time of the first, and the link.
+    fn with_a_waiting_event() -> (State, i64) {
+        let mut state = live_on_tokens(with_index_job(None));
+        let at = NOW_MS + 1_000;
+        let first = token_cmds(update(
+            &mut state,
+            token_index("claude-code", Some(NOW_MS)),
+            at,
+        ));
+        answer(&mut state, &first, vec![], NOW_MS, at);
+        let waits = update(
+            &mut state,
+            token_index("claude-code", Some(NOW_MS + 1_000)),
+            at + 1_000,
+        );
+        assert!(token_cmds(waits).is_empty());
+        (state, at)
+    }
+
+    #[test]
+    fn a_daemon_waiting_for_the_schema_keeps_no_index() {
+        // C-R8: a job waiting for a newer binary runs no index job, whatever its `status` says.
+        let job = StatusJob {
+            name: "token-index".into(),
+            last_run_at: None,
+            next_run_at: None,
+            last_error: None,
+        };
+        let mut waiting = daemon_job("claude-code", "waiting", true);
+        waiting.waiting_for = Some("schema".into());
+        let mut state = live_on_tokens(daemon_status(vec![waiting], vec![job]));
+        assert!(refreshes(&tick(&mut state, NOW_MS + 60_000)));
+    }
+
+    #[test]
+    fn a_store_error_of_any_wording_leaves_the_timer_on() {
+        for error in [
+            "the store holds invalid data: row 3",
+            "database is locked",
+            "claude-code transcript unreadable",
+        ] {
+            let mut state = live_on_tokens(with_index_job(Some(error)));
+            assert!(refreshes(&tick(&mut state, NOW_MS + 60_000)), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_status_that_stops_covering_brings_the_timer_back() {
+        let mut state = on_tokens();
+        update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+        let link = go_live(&mut state, with_index_job(None));
+        let again = tick(&mut state, NOW_MS + 250);
+        answer(&mut state, &again, vec![], NOW_MS - 60_000, NOW_MS + 250);
+        assert!(!refreshes(&tick(&mut state, NOW_MS + 30_000)));
+        let failing = with_index_job(Some("claude-code: a transcript could not be read"));
+        update(
+            &mut state,
+            Msg::DaemonStatus {
+                link,
+                result: Ok(failing),
+            },
+            NOW_MS + 31_000,
+        );
+        assert!(refreshes(&tick(&mut state, NOW_MS + 60_000)));
+    }
+
+    #[test]
+    fn a_waiting_event_is_forgotten_when_the_link_goes() {
+        let (mut state, at) = with_a_waiting_event();
+        update(&mut state, Msg::Live(Live::Down), at + 2_000);
+        assert!(token_cmds(tick(&mut state, at + 5_250)).is_empty());
+    }
+
+    #[test]
+    fn a_waiting_event_is_forgotten_when_tokens_opens() {
+        let (mut state, at) = with_a_waiting_event();
+        update(&mut state, ch('1'), at + 2_000);
+        let open = token_cmds(update(&mut state, ch('2'), at + 3_000));
+        answer(&mut state, &open, vec![], NOW_MS + 1_000, at + 3_000);
+        assert!(token_cmds(tick(&mut state, at + 5_250)).is_empty());
     }
 }
