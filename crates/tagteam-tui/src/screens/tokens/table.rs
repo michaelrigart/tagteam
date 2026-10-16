@@ -2316,6 +2316,29 @@ mod tests {
         let lines = draw(&state, 80, 24);
         assert_eq!(lines.len(), 24, "{lines:?}");
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
+        // The stack: header (2 rows), banner (3), a 15-row body, the activity line, the toast (3).
+        assert!(
+            lines[1].contains("● live · auto on · keychain locked until 15:05"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2..5]
+                .iter()
+                .all(|l| l.contains("the store could not be opened")
+                    || l.contains("be opened because another tagteam holds its lock")),
+            "{lines:?}"
+        );
+        assert!(
+            lines[5].starts_with(" Day Month"),
+            "the body starts at row 5: {lines:?}"
+        );
+        assert!(lines[20].starts_with(" 14:04 error: xxx"), "{lines:?}");
+        assert!(
+            lines[21..]
+                .iter()
+                .all(|l| l.contains("lock") || l.contains("tagteam")),
+            "{lines:?}"
+        );
         let total = lines.iter().position(|l| l.starts_with(" TOTAL")).unwrap();
         let head = lines
             .iter()
