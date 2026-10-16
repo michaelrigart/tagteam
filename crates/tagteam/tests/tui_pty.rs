@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use common::pty::{Finished, Pty, Screen};
 use common::{
-    FakeCall, cmd, fake_claude, fake_claude_calls, live_email, login, path_with, seed_home,
-    std_cmd, two_fresh_accounts,
+    FakeCall, cmd, fake_claude, fake_claude_calls, live_email, login, now_epoch_s, path_with,
+    seed_home, std_cmd, turn, two_fresh_accounts, write_transcript,
 };
 use tagteam_core::AccountId;
 use tagteam_provider::{Env, FileKeychain, MARKER_FILE, profile_path};
@@ -106,6 +106,26 @@ fn assert_restored(f: &Finished) {
     );
 }
 
+/// One Claude Code response a minute ago, of 100 input, 20 output and 1,000 cache-read tokens:
+/// 1.1K tokens in all.
+fn one_response(home: &Home) {
+    let at_ms = now_epoch_s() * 1000 - 60_000;
+    let counts = [100, 20, 0, 0, 1_000];
+    write_transcript(
+        home.root(),
+        "s-1",
+        &[turn("claude-opus-5-5", at_ms, counts)],
+    );
+}
+
+/// The Tokens screen, its report read from an index that has completed a refresh.
+fn token_report(s: &Screen) -> bool {
+    s.on_alt()
+        && s.contains("[Day] Month Session Block")
+        && s.contains("refreshed ")
+        && s.contains("1.1K")
+}
+
 /// Waits for the session `R` started to be running.
 fn wait_for_session(home: &Home, tui: &mut Pty) {
     tui.wait_until(LONG, "the session", || {
@@ -150,6 +170,36 @@ fn three_shows_history_and_one_the_accounts_again() {
     tui.wait_for(LONG, "the accounts table again", |s| {
         accounts(s) && !s.contains("No usage history.")
     });
+    tui.type_keys(b"q");
+    assert_eq!(tui.finish(LONG).status.code(), Some(0));
+}
+
+#[test]
+fn two_shows_the_token_report_and_one_the_accounts_again() {
+    // Spec §5.3, §6.4: the index is refreshed after the first frame, and the report read from
+    // it on the report lane.
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = home.tui(&["tui"]);
+    tui.wait_for(LONG, "the accounts table", accounts);
+    tui.type_keys(b"2");
+    tui.wait_for(LONG, "the token report", token_report);
+    tui.type_keys(b"1");
+    tui.wait_for(LONG, "the accounts table again", |s| {
+        accounts(s) && !s.contains("[Day]")
+    });
+    tui.type_keys(b"q");
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    assert_restored(&f);
+}
+
+#[test]
+fn tui_tokens_opens_on_the_token_report() {
+    let home = Home::new();
+    one_response(&home);
+    let mut tui = home.tui(&["tui", "tokens"]);
+    tui.wait_for(LONG, "the token report", token_report);
     tui.type_keys(b"q");
     assert_eq!(tui.finish(LONG).status.code(), Some(0));
 }
@@ -340,6 +390,49 @@ fn under_r_ctrl_c_ends_the_session_and_the_tui_carries_on() {
     );
     tui.type_keys(b"\r");
     tui.wait_for(LONG, "the accounts table again", accounts);
+    tui.type_keys(b"q");
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    assert_restored(&f);
+}
+
+#[test]
+fn under_r_ctrl_c_ends_the_session_and_a_running_index_refresh_goes_on() {
+    // Spec §7.3, §11: the lanes watch only the shutdown token, so the terminal's Ctrl-C for the
+    // session leaves the index's catch-up running, parked here with its lock held; it then
+    // completes, and the report shows it.
+    let home = Home::new();
+    one_response(&home);
+    let pause = home.root().join("pause");
+    fs::create_dir(&pause).unwrap();
+    let mut c = home.command(&["tui"]);
+    c.env("TAGTEAM_TEST_PAUSE_AT", "refresh-tokens-locked")
+        .env("TAGTEAM_TEST_PAUSE_DIR", &pause);
+    let mut tui = Pty::spawn(c, true);
+    tui.wait_for(LONG, "the accounts table", accounts);
+    tui.wait_until(LONG, "the index's refresh, parked", || {
+        pause.join("paused").exists()
+    });
+    tui.type_keys(b"R");
+    wait_for_session(&home, &mut tui);
+    tui.type_keys(b"\x03");
+    tui.wait_for(LONG, "the wait for Enter", returning);
+    tui.type_keys(b"\r");
+    tui.wait_for(LONG, "the accounts table again", accounts);
+    let db = Env::for_test(home.root()).data_dir().join("tagteam.db");
+    let parked: Option<i64> = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT refreshed_at FROM token_state", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(parked, None, "the refresh was parked when Ctrl-C was sent");
+    fs::write(pause.join("resume"), b"").unwrap();
+    tui.type_keys(b"2");
+    let shown = tui.wait_for(LONG, "the token report", token_report);
+    assert!(
+        !shown.contains("not refreshed"),
+        "the refresh was not interrupted: {}",
+        shown.text()
+    );
     tui.type_keys(b"q");
     let f = tui.finish(LONG);
     assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());

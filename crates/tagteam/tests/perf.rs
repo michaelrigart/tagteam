@@ -1,9 +1,10 @@
 //! §1.1's timing targets through the real binary: `statusline` within 10 ms p95, `list` within
 //! 50 ms p95 when no usage fetch is due, alone and while a daemon runs against the same store
 //! (D1.1 criterion 3, D12), and the TUI's first frame within 50 ms p95 under the same
-//! conditions (TUI spec §1.1). Timings mean something only in an optimized build on an idle
-//! machine, so this file exists only in release builds and its tests are ignored by default.
-//! The TUI's opens a pseudo-terminal, so run them outside a sandbox:
+//! conditions (TUI spec §1.1), with the token index caught up or not. Timings mean something
+//! only in an optimized build on an idle machine, so this file exists only in release builds
+//! and its tests are ignored by default. The TUI's opens a pseudo-terminal, so run them
+//! outside a sandbox:
 //! `cargo test --release -p tagteam --features test-support --test perf -- --ignored`
 //! (add `--nocapture` to see each measured p95).
 #![cfg(all(feature = "test-support", not(debug_assertions)))]
@@ -18,8 +19,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use common::pty::{Pty, Screen};
 use common::{
-    Guarded, bloat_claude_json, cc_profile, hold_launch, now_epoch_s, record_history,
-    short_tempdir, std_cmd, two_fresh_accounts, usage_window,
+    Guarded, Turn, bloat_claude_json, cc_profile, hold_launch, now_epoch_s, record_history,
+    short_tempdir, std_cmd, turn, two_fresh_accounts, usage_window, write_transcript,
 };
 use tagteam_core::{Window, WindowKind};
 use tagteam_provider::Env;
@@ -94,6 +95,21 @@ fn nothing_due(root: &Path) -> (String, String) {
     }
     bloat_claude_json(root, CLAUDE_JSON_BYTES);
     (a, b)
+}
+
+/// `sessions` transcripts of `turns` Claude Code responses each, a minute apart, back from now:
+/// with the defaults below, some 7 MB that a cold token index reads.
+fn transcripts(root: &Path, sessions: usize, turns: usize) {
+    let now_ms = now_epoch_s() * 1000;
+    for s in 0..sessions {
+        let all: Vec<Turn> = (0..turns)
+            .map(|t| {
+                let ago = (s * turns + t) as i64 * 60_000;
+                turn("claude-opus-5-5", now_ms - ago, [100, 20, 30, 40, 1_000])
+            })
+            .collect();
+        write_transcript(root, &format!("s-{s}"), &all);
+    }
 }
 
 /// The wall time of each of `RUNS` runs of `args`, after `WARM_UP` untimed ones, with every
@@ -301,6 +317,51 @@ fn tui_first_frame_p95_is_within_50_ms_when_nothing_is_due() {
     assert!(
         p <= Duration::from_millis(50),
         "tui first frame p95 {p:?} over {RUNS} runs: {runs:?}"
+    );
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn tui_first_frame_p95_is_within_50_ms_while_the_index_catches_up() {
+    // TUI spec §1.1 criterion 2 with a cold token index: its catch-up starts after the first
+    // frame (B5), so the transcripts it reads never delay it. Before each run the index forgets
+    // every file it has read, so each run catches up anew; `q` stops the catch-up (§9).
+    let _one_at_a_time = serial();
+    let d = tempfile::tempdir().unwrap();
+    nothing_due(d.path());
+    transcripts(d.path(), 50, 200);
+    let db = Env::for_test(d.path()).data_dir().join("tagteam.db");
+    let server = MockServer::start();
+    let shown = |s: &Screen| s.on_alt() && s.contains("a@x.co");
+    let run = || {
+        let forget = rusqlite::Connection::open(&db).unwrap();
+        forget.execute("DELETE FROM token_files", []).unwrap();
+        drop(forget);
+        let mut c = std_cmd(d.path());
+        c.env("TAGTEAM_TEST_API_BASE", server.base_url()).arg("tui");
+        let mut tui = Pty::spawn(c, true);
+        tui.wait_for(Duration::from_secs(10), "the accounts table", shown);
+        let took = tui.first_shown(shown).unwrap() - tui.started;
+        tui.type_keys(b"q");
+        let f = tui.finish(Duration::from_secs(10));
+        assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+        took
+    };
+    for _ in 0..WARM_UP {
+        run();
+    }
+    let runs: Vec<Duration> = (0..RUNS).map(|_| run()).collect();
+    let p = p95(&runs);
+    eprintln!("tui first frame while the index catches up p95 {p:?} over {RUNS} runs");
+    assert_eq!(server.requests().len(), 0, "a fetch was due");
+    let read: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT count(*) FROM token_files", [], |r| r.get(0))
+        .unwrap();
+    assert!(read > 0, "the catch-up never read a transcript");
+    assert!(
+        p <= Duration::from_millis(50),
+        "tui first frame while the index catches up p95 {p:?} over {RUNS} runs: {runs:?}"
     );
 }
 

@@ -123,9 +123,9 @@ tagteam switch work     # switch to an account by position, alias or email
 tagteam switch --strategy best   # switch to the account with the most headroom
 ```
 
-On a terminal, `tagteam` on its own opens a terminal UI with the same accounts, their usage
-history, and keys for these commands (`?` lists them, `q` quits). `tagteam tui history` opens
-it on the history.
+On a terminal, `tagteam` on its own opens a terminal UI with the same accounts, the token
+report, their usage history, and keys for these commands (`?` lists them, `q` quits).
+`tagteam tui tokens` opens it on the token report, and `tagteam tui history` on the history.
 
 A running Claude Code session picks up the new login within about 30 seconds on macOS, and on
 the next message on Linux. If an API-key account is on either side of the switch, restart
@@ -146,7 +146,7 @@ terminal, and runs `list` anywhere else (in a pipe, or with `--json`).
 | Command | What it does |
 |---|---|
 | `list` (`ls`), `status` | Show the stored accounts with usage, or only the live account |
-| `tui` | A terminal UI: the accounts with their usage and pace, usage history, and keys for switching, enabling, aliasing, moving, removing, adding, running a session and `doctor` |
+| `tui` | A terminal UI: the accounts with their usage and pace, the token report, usage history, and keys for switching, enabling, aliasing, moving, removing, adding, running a session and `doctor` |
 | `add`, `add-token` | Store the current Claude Code login, or an API key or setup token |
 | `remove` (`rm`), `disable`, `enable` | Delete an account (never the live login), or hold it out of automatic selection |
 | `alias`, `move` | Name an account, or change its position |

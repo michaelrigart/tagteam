@@ -51,7 +51,7 @@ pub enum Command {
     List,
     /// Show the live account
     Status,
-    /// Open the terminal UI: accounts with their usage, usage history, and the account actions
+    /// Open the terminal UI: accounts with their usage, the token report, usage history, and the account actions
     ///
     /// A bare `tagteam` opens it too, when stdin and stdout are terminals and --json is not
     /// given. q quits; ? lists the keys.
@@ -477,11 +477,13 @@ impl TypedValueParser for GroupingParser {
     }
 }
 
-/// The screen `tui` opens on (TUI spec §3). Part B adds `tokens`.
+/// The screen `tui` opens on (TUI spec §3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ScreenArg {
     /// The accounts table (the default)
     Accounts,
+    /// The token report
+    Tokens,
     /// Usage history
     History,
 }

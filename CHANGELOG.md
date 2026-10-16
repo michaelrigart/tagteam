@@ -44,6 +44,11 @@ with the one before, so any release may contain breaking changes. Each section s
   doctor), and `R` runs a session as `tagteam run` does. It refreshes every 30 seconds, and
   collects usage only when `list` would. On a terminal, a bare `tagteam` now opens it; in a
   pipe, or with `--json`, it still runs `list`.
+- The TUI's Tokens screen (`2`, or `tagteam tui tokens`) shows the token report by day,
+  month, session or 5-hour block, grouped and filtered by account and model, with drill-down
+  from a period to its sessions and from a session to its models, and the active block's remaining
+  time, burn rate and projection. It brings the token index up to date in the background, and reads the
+  report again as the index, the accounts or the clock move.
 
 ### Changed
 
