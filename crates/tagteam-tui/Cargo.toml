@@ -16,12 +16,12 @@ crossterm.workspace = true
 jiff.workspace = true
 libc.workspace = true
 ratatui.workspace = true
+serde_json.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
 tagteam-cc.workspace = true
 tagteam-fake.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]

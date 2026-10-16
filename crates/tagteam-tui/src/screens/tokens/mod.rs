@@ -148,6 +148,11 @@ impl TokensState {
         &self.provider
     }
 
+    /// The zone the screen's days and months are in (B6), which the TUI's other times use too.
+    pub fn tz(&self) -> &TimeZone {
+        &self.tz
+    }
+
     pub fn period(&self) -> TokenPeriod {
         self.period
     }

@@ -1,8 +1,14 @@
 //! Live mode (spec §6.3, §8): the daemon's link as the state machine sees it. What the live
 //! thread learns, and the daemon lane's `status` replies, arrive as messages; what they ask for
 //! leaves as commands. The store stays the source of truth: an event is a reason to read the
-//! views again, and only `status` says what the daemon does (§7.4, §8).
+//! views again, and only `status` says what the daemon does (§7.4, §8). An event's words show
+//! on the activity line (§5.1).
 
+pub mod words;
+
+use std::collections::BTreeMap;
+
+use serde_json::Value;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_daemon::protocol::{Event, Status, StatusProvider};
 
@@ -34,6 +40,14 @@ const VIEW_KINDS: [&str; 4] = [
     "account-unquarantined",
 ];
 
+/// The activity line (spec §5.1): the daemon's latest event, when it happened, and whose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Activity {
+    pub at_ms: i64,
+    pub provider: Option<String>,
+    pub text: String,
+}
+
 /// The daemon as the TUI knows it (spec §8).
 #[derive(Default)]
 pub struct DaemonState {
@@ -64,6 +78,11 @@ pub struct DaemonState {
     /// C-R20: until when the first collection waits to know who collects: no daemon, or the
     /// daemon's first `status`. `None` once known, and for a TUI that follows no daemon.
     unsettled_until: Option<i64>,
+    /// The latest event the activity line shows.
+    activity: Option<Activity>,
+    /// Each provider's last `poll` on this link, whose windows a `switch` of the same tick
+    /// names. A link can miss events before it, so a new one starts with none (C-R21).
+    polls: BTreeMap<String, Value>,
 }
 
 impl DaemonState {
@@ -106,6 +125,22 @@ impl DaemonState {
     pub(crate) fn await_daemon(&mut self, now_ms: i64) {
         self.unsettled_until = Some(now_ms + SETTLE_MS);
     }
+
+    /// The daemon's latest event, for the activity line, which only live mode shows (§5.1).
+    pub fn activity(&self) -> Option<&Activity> {
+        self.activity.as_ref()
+    }
+}
+
+/// The provider the header follows and `P` acts on (spec §7.4): the selected account's, else
+/// `--provider`'s, else the default, which Tokens reports on.
+pub(crate) fn focus(state: &State) -> ProviderId {
+    state
+        .accounts
+        .selected()
+        .map(|a| a.provider)
+        .or_else(|| state.provider.clone())
+        .unwrap_or_else(|| state.tokens.provider().clone())
 }
 
 /// What the live thread learned (spec §8).
@@ -136,6 +171,7 @@ fn up(state: &mut State, link: u64, now_ms: i64) -> Vec<Cmd> {
     d.status = None;
     d.status_due_ms = None;
     d.status_again = false;
+    d.polls.clear();
     d.stopping = None;
     d.mismatch = None;
     d.next_poll_ms = now_ms + POLL_MS;
@@ -202,6 +238,7 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
     if state.daemon.link.is_none() || state.quitting.is_some() {
         return vec![];
     }
+    note(state, &event, now_ms);
     match event {
         Event::Auto { kind, .. } => {
             let views = VIEW_KINDS.contains(&kind.as_str());
@@ -220,6 +257,39 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
         Event::TokenIndex { .. } | Event::Unknown { .. } => {}
     }
     vec![]
+}
+
+/// The activity line's record of `event` (spec §5.1): its words, and its `ts`, or now for a kind
+/// whose typed form carries none. A `poll` is kept for the `switch` of its tick.
+fn note(state: &mut State, event: &Event, now_ms: i64) {
+    let (provider, raw) = match event {
+        Event::Auto { provider, raw, .. } | Event::TokenIndex { provider, raw } => {
+            (Some(provider.clone()), Some(raw))
+        }
+        Event::Usage { provider, .. } => (Some(provider.clone()), None),
+        _ => (None, None),
+    };
+    let d = &mut state.daemon;
+    let poll = provider.as_ref().and_then(|p| d.polls.get(p));
+    if let Some(text) = words::activity(event, poll, state.tokens.tz()) {
+        let ts = raw.and_then(|r| r["ts"].as_str()).and_then(words::iso_ms);
+        d.activity = Some(Activity {
+            at_ms: ts.unwrap_or(now_ms),
+            provider,
+            text,
+        });
+        state.dirty = true;
+    }
+    if let Event::Auto {
+        kind,
+        provider,
+        raw,
+    } = event
+    {
+        if kind == "poll" {
+            d.polls.insert(provider.clone(), raw.clone());
+        }
+    }
 }
 
 /// What an event asks for is read `REREAD_MS` from the first event that asks, once for every
