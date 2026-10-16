@@ -9,6 +9,7 @@ use tagteam_engine::words::Severity;
 use unicode_width::UnicodeWidthStr;
 
 use crate::actions;
+use crate::daemon::words;
 use crate::screens;
 use crate::state::{Screen, State};
 
@@ -16,8 +17,10 @@ use crate::state::{Screen, State};
 pub const MIN_WIDTH: u16 = 80;
 pub const MIN_HEIGHT: u16 = 24;
 pub const TOO_SMALL: &str = "terminal too small (80×24 needed)";
-/// The header's mode in timer mode (spec §5.1); part C adds live mode.
+/// The header's mode in timer mode (spec §5.1); live mode's is `daemon::words::mode`'s.
 pub const MODE_TIMER: &str = "○ refresh 30s";
+/// The header's hint at the help panel, which gives way first when the mode needs the room.
+const HELP_HINT: &str = "? help ";
 /// The spinner's frames, one per tick while an action runs.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -47,37 +50,40 @@ pub(crate) struct Areas {
     pub(crate) header: Rect,
     pub(crate) banner: Option<Rect>,
     pub(crate) body: Rect,
+    /// The activity line, in live mode only (§5.1).
+    pub(crate) activity: Option<Rect>,
     pub(crate) footer: Rect,
 }
 
-/// The header on the first row, the banner (when there is one) below it, the footer on the
-/// last rows, and the body between. The banner, and a toast in the footer, take as many rows as
-/// their words need at the width, `WRAP_ROWS` at most, from the body, which keeps a row at
-/// least. Part A has no activity line: timer mode hides it (§5.1).
+/// The header on the first row, or two when its mode needs a row of its own; the banner (when
+/// there is one) below it; the footer on the last rows, with the activity line above it in live
+/// mode; and the body between. The banner, and a toast in the footer, take as many rows as their
+/// words need at the width, `WRAP_ROWS` at most, from the body, which keeps a row at least.
 pub(crate) fn areas(state: &State, area: Rect) -> Areas {
     let width = usize::from(area.width);
-    let spare = area.height.saturating_sub(3);
     let rows = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+    let head = rows(header(state, area.width).len()).min(area.height);
+    let activity = u16::from(state.daemon.live()).min(area.height.saturating_sub(head));
+    let spare = area.height.saturating_sub(head + activity + 2);
     let banner = banner(state).map_or(0, |(text, _)| rows(banner_rows(&text, width).len()));
     let banner = banner.min(spare);
     let footer = toast_rows(state, width).map_or(1, |t| rows(t.len()));
-    let footer = footer.min(spare - banner + 1).min(area.height);
-    let top = area.y + 1.min(area.height) + banner;
+    let footer = footer
+        .min(spare - banner + 1)
+        .min(area.height.saturating_sub(head + activity));
+    let top = area.y + head + banner;
+    let bottom = area.y + area.height.saturating_sub(footer);
     Areas {
-        header: Rect::new(area.x, area.y, area.width, 1.min(area.height)),
-        banner: (banner > 0).then(|| Rect::new(area.x, area.y + 1, area.width, banner)),
+        header: Rect::new(area.x, area.y, area.width, head),
+        banner: (banner > 0).then(|| Rect::new(area.x, area.y + head, area.width, banner)),
         body: Rect::new(
             area.x,
             top,
             area.width,
-            area.height.saturating_sub(top - area.y + footer),
+            bottom.saturating_sub(activity).saturating_sub(top),
         ),
-        footer: Rect::new(
-            area.x,
-            area.y + area.height.saturating_sub(footer),
-            area.width,
-            footer,
-        ),
+        activity: (activity > 0).then(|| Rect::new(area.x, bottom - activity, area.width, 1)),
+        footer: Rect::new(area.x, bottom, area.width, footer),
     }
 }
 
@@ -239,6 +245,9 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
     }
     let areas = areas(state, area);
     frame.render_widget(Paragraph::new(header(state, area.width)), areas.header);
+    if let Some(rect) = areas.activity {
+        frame.render_widget(Paragraph::new(activity(state, area.width)), rect);
+    }
     if let (Some(rect), Some((text, error))) = (areas.banner, banner(state)) {
         // An error takes the critical severity's style, anything else the warning's.
         let severity = if error {
@@ -265,28 +274,70 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
     actions::render_overlay(state, frame, now_ms);
 }
 
-/// ` tagteam  [1 Accounts]  2 Tokens  3 History` on the left, the mode and `? help` on the
-/// right.
-fn header(state: &State, width: u16) -> Line<'static> {
-    let mut spans = vec![Span::styled(" tagteam", bold())];
+/// ` tagteam  [1 Accounts]  2 Tokens  3 History` on the left, the mode (`daemon::words::mode`)
+/// and `? help` on the right. A mode too wide for the row drops `? help`; one too wide even
+/// then takes a second row of its own, right-aligned, cut to the width (R20).
+fn header(state: &State, width: u16) -> Vec<Line<'static>> {
+    let mut tabs = vec![Span::styled(" tagteam", bold())];
     for (screen, label) in [
         (Screen::Accounts, "1 Accounts"),
         (Screen::Tokens, "2 Tokens"),
         (Screen::History, "3 History"),
     ] {
-        spans.push(Span::raw("  "));
+        tabs.push(Span::raw("  "));
         if screen == state.screen {
-            spans.push(Span::styled(format!("[{label}]"), bold()));
+            tabs.push(Span::styled(format!("[{label}]"), bold()));
         } else {
-            spans.push(Span::raw(label));
+            tabs.push(Span::raw(label));
         }
     }
-    let right = format!("{MODE_TIMER}   ? help ");
-    let used: usize = spans.iter().map(|s| width_of(&s.content)).sum();
-    let gap = usize::from(width).saturating_sub(used + width_of(&right));
+    let (width, mode) = (usize::from(width), words::mode(state));
+    let used: usize = tabs.iter().map(|s| width_of(&s.content)).sum();
+    let fits = |right: &str| used + 1 + width_of(right) <= width;
+    for right in [format!("{mode}   {HELP_HINT}"), format!("{mode} ")] {
+        if fits(&right) {
+            return vec![right_aligned(tabs, used, right, width)];
+        }
+    }
+    let first = if fits(HELP_HINT) {
+        right_aligned(tabs, used, HELP_HINT.to_owned(), width)
+    } else {
+        Line::from(tabs)
+    };
+    let mode = format!("{} ", fit(&mode, width.saturating_sub(2)));
+    let pad = " ".repeat(width.saturating_sub(width_of(&mode)));
+    vec![first, Line::from(format!("{pad}{mode}"))]
+}
+
+/// `spans`, `used` columns wide, then `right` against the right edge of `width`.
+fn right_aligned(
+    mut spans: Vec<Span<'static>>,
+    used: usize,
+    right: String,
+    width: usize,
+) -> Line<'static> {
+    let gap = width.saturating_sub(used + width_of(&right));
     spans.push(Span::raw(" ".repeat(gap.max(1))));
     spans.push(Span::raw(right));
     Line::from(spans)
+}
+
+/// The activity line (spec §5.1): the daemon's latest event, at its time in the TUI's zone,
+/// naming its provider when the TUI shows several. Blank until the first event.
+fn activity(state: &State, width: u16) -> Line<'static> {
+    let Some(a) = state.daemon.activity() else {
+        return Line::default();
+    };
+    let time = words::clock(a.at_ms, state.tokens.tz());
+    let several = state
+        .accounts
+        .snapshot()
+        .is_some_and(|s| s.providers.len() > 1);
+    let text = match &a.provider {
+        Some(provider) if several => format!(" {time} {provider}  {}", a.text),
+        _ => format!(" {time} {}", a.text),
+    };
+    Line::from(fit(&text, usize::from(width)))
 }
 
 /// The footer: `finishing <action>…` once the shutdown has begun, else the toast (on as many
@@ -716,5 +767,243 @@ mod tests {
         assert_eq!(a.footer.height, 1);
         assert_eq!(a.body.height, 24 - 1 - 1);
         assert_eq!(draw(&state, 80, 24)[23].trim_end(), "");
+    }
+
+    /// Claude Code's job in `mode`, with `autoswitch`.
+    fn one_job(mode: &str, autoswitch: bool) -> tagteam_daemon::protocol::Status {
+        daemon_status(vec![daemon_job("claude-code", mode, autoswitch)], vec![])
+    }
+
+    fn live_event(e: tagteam_daemon::protocol::Event) -> Msg {
+        Msg::Live(crate::live::Live::Event(e))
+    }
+
+    #[test]
+    fn in_live_mode_the_header_says_the_daemon_s_state_from_its_status_alone() {
+        // Spec §5.1, §7.4, §8: `● live` and the provider's state; an event's fields never
+        // reach the header.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(1)));
+        let link = go_live(&mut state, one_job("collect", false));
+        let paused = draw(&state, 80, 24);
+        assert!(
+            paused[0].ends_with("3 History       ● live · auto paused   ? help"),
+            "{}",
+            paused[0]
+        );
+        let mode = tagteam_daemon::protocol::Event::Mode {
+            provider: "claude-code".into(),
+            mode: "idle".into(),
+            waiting_for: None,
+            holder_pid: None,
+            backoff: None,
+        };
+        update(&mut state, live_event(mode), NOW_MS);
+        assert_eq!(
+            draw(&state, 80, 24)[0],
+            paused[0],
+            "until the status says so"
+        );
+        let reply = Msg::DaemonStatus {
+            link,
+            result: Ok(one_job("idle", true)),
+        };
+        update(&mut state, reply, NOW_MS);
+        assert!(draw(&state, 80, 24)[0].ends_with("● live · daemon idle   ? help"));
+    }
+
+    #[test]
+    fn with_several_providers_the_header_follows_the_selected_account_s() {
+        // Spec §7.4.
+        let mut state = fresh(Screen::Accounts);
+        let fake = tagteam_core::ProviderId::new("fake-agent");
+        let mut third = account(3, "c@x.co", read(60, 10.0, 20.0, false));
+        third.row.provider = fake.clone();
+        let mut snap = snapshot(many(1));
+        snap.providers
+            .push(tagteam_engine::views::ProviderAccounts {
+                provider: fake,
+                active_position: None,
+                accounts: vec![third],
+            });
+        state.accounts.apply(snap);
+        let mut waiting = daemon_job("fake-agent", "waiting", true);
+        waiting.waiting_for = Some("engine-lock".into());
+        waiting.holder_pid = Some(77);
+        let status = daemon_status(
+            vec![daemon_job("claude-code", "auto", true), waiting],
+            vec![],
+        );
+        go_live(&mut state, status);
+        assert!(draw(&state, 80, 24)[0].ends_with("● live · auto on   ? help"));
+        update(&mut state, ch('j'), NOW_MS);
+        assert!(
+            draw(&state, 80, 24)[0].ends_with("● live · auto in pid 77   ? help"),
+            "{}",
+            draw(&state, 80, 24)[0]
+        );
+    }
+
+    #[test]
+    fn a_mode_too_wide_for_the_row_drops_help_and_then_takes_a_row_of_its_own() {
+        // R20: at 80 columns nothing the header says is lost.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(1)));
+        go_live(&mut state, one_job("collect", true));
+        let lines = draw(&state, 80, 24);
+        assert_eq!(
+            lines[0],
+            " tagteam  [1 Accounts]  2 Tokens  3 History     ● live · auto off (one account)"
+        );
+        assert!(draw(&state, 120, 40)[0].ends_with("● live · auto off (one account)   ? help"));
+        let mut locked = daemon_job("claude-code", "auto", true);
+        locked.backoff = Some(tagteam_daemon::protocol::StatusBackoff {
+            reason: "keychain".into(),
+            until: "2026-09-21T15:05:00Z".into(),
+        });
+        go_live(&mut state, daemon_status(vec![locked], vec![]));
+        let lines = draw(&state, 80, 24);
+        assert!(lines[0].ends_with("? help"), "{}", lines[0]);
+        assert_eq!(
+            lines[1],
+            format!(
+                "{}● live · auto on · keychain locked until 15:05",
+                " ".repeat(33)
+            )
+        );
+        assert_eq!(areas(&state, Rect::new(0, 0, 80, 24)).body.y, 2);
+        assert!(
+            lines[2].contains("ACCOUNT"),
+            "the table under it: {lines:?}"
+        );
+        assert!(draw(&state, 120, 40)[0].ends_with("keychain locked until 15:05   ? help"));
+    }
+
+    #[test]
+    fn timer_mode_says_when_the_daemon_stopped_or_speaks_another_protocol() {
+        // Spec §8.
+        let mut state = fresh(Screen::Accounts);
+        go_live(&mut state, one_job("auto", true));
+        let stopping = tagteam_daemon::protocol::Event::Stopping {
+            reason: "upgrade".into(),
+        };
+        update(&mut state, live_event(stopping), NOW_MS);
+        update(&mut state, Msg::Live(crate::live::Live::Down), NOW_MS);
+        assert_eq!(
+            draw(&state, 80, 24)[0],
+            format!(
+                " tagteam  [1 Accounts]  2 Tokens  3 History{}○ daemon stopping (upgrade)",
+                " ".repeat(9)
+            ),
+            "no room for `? help` at 80 columns"
+        );
+        assert!(draw(&state, 120, 40)[0].ends_with("○ daemon stopping (upgrade)   ? help"));
+        update(&mut state, Msg::Tick, NOW_MS + 30_000);
+        assert!(draw(&state, 80, 24)[0].ends_with("○ refresh 30s   ? help"));
+        let mismatch = crate::live::Live::Mismatch { server: 2 };
+        update(&mut state, Msg::Live(mismatch), NOW_MS);
+        assert!(
+            draw(&state, 80, 24)[0].ends_with("○ daemon protocol 2 unsupported"),
+            "{}",
+            draw(&state, 80, 24)[0]
+        );
+    }
+
+    #[test]
+    fn the_activity_line_shows_the_latest_event_above_the_footer_in_live_mode_only() {
+        // Spec §5.1: hidden in timer mode; in live mode it takes a row from the body.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(1)));
+        let timer = areas(&state, Rect::new(0, 0, 80, 24));
+        assert!(timer.activity.is_none());
+        go_live(&mut state, one_job("auto", true));
+        let live = areas(&state, Rect::new(0, 0, 80, 24));
+        assert_eq!(live.activity, Some(Rect::new(0, 22, 80, 1)));
+        assert_eq!(live.body.height, timer.body.height - 1);
+        assert_eq!(draw(&state, 80, 24)[22], "", "blank until an event");
+        let switch = tagteam_daemon::protocol::Event::Auto {
+            kind: "switch".into(),
+            provider: "claude-code".into(),
+            raw: serde_json::json!({"event": "switch", "ts": "2026-09-21T14:04:00Z", "trigger": "proactive", "from": 1, "to": 2, "dryRun": false}),
+        };
+        update(&mut state, live_event(switch), NOW_MS);
+        let lines = draw(&state, 80, 24);
+        assert_eq!(
+            lines[22], " 14:04 auto: 1 → 2 (proactive)",
+            "at the event's own ts"
+        );
+        assert!(lines[23].starts_with("s switch"), "the footer below it");
+        // A kind it leaves out keeps the last; `usage` has no `ts` of its own: now.
+        update(
+            &mut state,
+            live_event(tagteam_daemon::protocol::Event::Changed),
+            NOW_MS,
+        );
+        assert_eq!(draw(&state, 80, 24)[22], " 14:04 auto: 1 → 2 (proactive)");
+        let usage = tagteam_daemon::protocol::Event::Usage {
+            provider: "claude-code".into(),
+            updated: vec![1],
+            fetch_errors: Default::default(),
+        };
+        update(&mut state, live_event(usage), NOW_MS);
+        assert_eq!(draw(&state, 80, 24)[22], " 14:13 collected 1");
+        update(&mut state, Msg::Live(crate::live::Live::Down), NOW_MS);
+        assert!(areas(&state, Rect::new(0, 0, 80, 24)).activity.is_none());
+        assert_eq!(draw(&state, 80, 24)[22], "", "hidden again");
+    }
+
+    #[test]
+    fn a_switch_names_its_window_only_from_a_poll_of_its_own_link() {
+        // C-R21: a link can come up after events were missed (a link dropped, a queue that
+        // overflowed), so a `switch` names its window only from a `poll` the same link carried.
+        let mut state = fresh(Screen::Accounts);
+        state.accounts.apply(snapshot(many(2)));
+        go_live(&mut state, one_job("auto", true));
+        let auto = |kind: &str, raw| tagteam_daemon::protocol::Event::Auto {
+            kind: kind.into(),
+            provider: "claude-code".into(),
+            raw,
+        };
+        let poll = auto(
+            "poll",
+            serde_json::json!({"event": "poll", "ts": "2026-09-21T14:03:00Z", "active": {"number": 1}, "headroomPct": {"1": 5.0}, "windowsPct": {"1": {"5h": 95.0}}}),
+        );
+        let switch = auto(
+            "switch",
+            serde_json::json!({"event": "switch", "ts": "2026-09-21T14:04:00Z", "trigger": "proactive", "from": 1, "to": 2, "dryRun": false}),
+        );
+        update(&mut state, live_event(poll), NOW_MS);
+        update(&mut state, live_event(switch.clone()), NOW_MS);
+        assert_eq!(draw(&state, 80, 24)[22], " 14:04 auto: 1 → 2 (5h at 95%)");
+        update(&mut state, Msg::Live(crate::live::Live::Down), NOW_MS);
+        go_live(&mut state, one_job("auto", true));
+        update(&mut state, live_event(switch), NOW_MS);
+        assert_eq!(
+            draw(&state, 80, 24)[22],
+            " 14:04 auto: 1 → 2 (proactive)",
+            "the poll was the last link's"
+        );
+    }
+
+    #[test]
+    fn with_several_providers_the_activity_line_names_the_event_s_provider() {
+        let mut state = fresh(Screen::Accounts);
+        let fake = tagteam_core::ProviderId::new("fake-agent");
+        let mut snap = snapshot(many(1));
+        snap.providers
+            .push(tagteam_engine::views::ProviderAccounts {
+                provider: fake,
+                active_position: None,
+                accounts: vec![],
+            });
+        state.accounts.apply(snap);
+        go_live(&mut state, one_job("auto", true));
+        let usage = tagteam_daemon::protocol::Event::Usage {
+            provider: "fake-agent".into(),
+            updated: vec![1],
+            fetch_errors: Default::default(),
+        };
+        update(&mut state, live_event(usage), NOW_MS);
+        assert_eq!(draw(&state, 80, 24)[22], " 14:13 fake-agent  collected 1");
     }
 }
