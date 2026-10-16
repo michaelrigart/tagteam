@@ -1,6 +1,7 @@
 //! `EngineSource` over a real engine (spec §4.4, §11 "Source over a real engine"): a fixture
 //! home with Claude Code and FakeAgent registered, a fake Keychain, a scripted HTTP port and a
-//! fake clock. Nothing reaches the real HOME, the network or the Keychain (core §15.1).
+//! fake clock, and FakeAgent's transcripts for the token report (§9). Nothing reaches the real
+//! HOME, the network or the Keychain (core §15.1).
 
 use std::fs;
 use std::path::PathBuf;
@@ -15,14 +16,18 @@ use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::{Eligibility, NewAccount, Reserve, Store};
+use tagteam_engine::tokens::{
+    PeriodKey, RefreshOutcome, RowAccount, TokenGrouping, TokenPeriod, TokenQuery, tokens_lock_path,
+};
 use tagteam_engine::vault::{KeychainVault, SERVICE, Vault};
 use tagteam_engine::{Engine, EngineConfig};
-use tagteam_fake::{FAKE_AGENT, FakeAgent};
+use tagteam_fake::{FAKE_AGENT, FakeAgent, FakeUsage, append_transcript, usage_line_json};
 use tagteam_provider::http::Method;
 use tagteam_provider::liveness::FakeProcessProbe;
 use tagteam_provider::process::ScriptedSpawner;
 use tagteam_provider::{
-    Env, FakeClock, FakeKeychain, Identity, ProfileMarker, RunShell, ScriptedHttp,
+    Cancel, Env, FakeClock, FakeKeychain, FlockGuard, Identity, ProfileMarker, RunShell,
+    ScriptedHttp,
 };
 use tagteam_tui::source::{EngineSource, Source};
 
@@ -55,8 +60,13 @@ impl Home {
 
     /// An engine as the binary builds one for `list` (`build_engine`), over the fixture's ports.
     fn engine_in(&self, run_shell: RunShell) -> Engine {
+        self.engine_with(self.env.clone(), run_shell)
+    }
+
+    /// `engine_in`, over `env`.
+    fn engine_with(&self, env: Env, run_shell: RunShell) -> Engine {
         Engine::new(EngineConfig {
-            env: self.env.clone(),
+            env,
             registry: ProviderRegistry::new()
                 .with(Arc::new(ClaudeCode::new(self.kc.clone(), Platform::MacOs)))
                 .with(Arc::new(FakeAgent::new())),
@@ -74,6 +84,22 @@ impl Home {
 
     fn source(&self) -> EngineSource {
         EngineSource::new(self.engine_in(RunShell::Outside))
+    }
+
+    /// A source whose engine takes `shutdown` as its cancel token, as every lane's does (§4.3).
+    fn source_under(&self, shutdown: &Cancel) -> EngineSource {
+        let mut env = self.env.clone();
+        env.cancel = shutdown.clone();
+        EngineSource::new(self.engine_with(env, RunShell::Outside))
+    }
+
+    /// `usage`, appended to FakeAgent's transcript `name`, a line each.
+    fn transcript(&self, name: &str, usage: &[FakeUsage]) {
+        let text: String = usage
+            .iter()
+            .map(|u| format!("{}\n", usage_line_json(u)))
+            .collect();
+        append_transcript(&self.env, name, &text);
     }
 
     fn db(&self) -> PathBuf {
@@ -324,4 +350,133 @@ fn collect_due_counts_the_readings_and_failures_it_recorded() {
     // Nothing is due a moment later: a reading is fresh, a failure backs off.
     let again = source.collect_due(&[read, missing, fresh]).unwrap();
     assert_eq!(again.fetched, 0);
+}
+
+fn fake() -> ProviderId {
+    ProviderId::new(FAKE_AGENT)
+}
+
+/// FakeAgent's report by day and account, over all time, in UTC.
+fn by_day() -> TokenQuery {
+    TokenQuery {
+        provider: fake(),
+        period: TokenPeriod::Day,
+        grouping: TokenGrouping::Account,
+        since_ms: None,
+        until_ms: None,
+        accounts: None,
+        models: None,
+        session: None,
+        tz: jiff::tz::TimeZone::UTC,
+    }
+}
+
+/// A second response, a minute after the first, in session `session`.
+fn another(session: &str) -> FakeUsage {
+    FakeUsage {
+        message_id: "m2".into(),
+        request_id: "r2".into(),
+        session_id: session.into(),
+        at_ms: FakeUsage::default().at_ms + 60_000,
+        ..FakeUsage::default()
+    }
+}
+
+#[test]
+fn the_index_refresh_reads_the_transcripts_and_the_report_shows_them() {
+    let home = Home::new();
+    home.transcript("s1.jsonl", &[FakeUsage::default(), another("s1")]);
+    let source = home.source();
+    let mut seen = Vec::new();
+    let outcome = source
+        .refresh_tokens(&fake(), &mut |p| seen.push(*p))
+        .unwrap();
+    let RefreshOutcome::Done(done) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(done.complete);
+    assert_eq!(done.responses_added, 2);
+    assert_eq!(
+        seen.last().map(|p| (p.files_done, p.files_total)),
+        Some((1, 1)),
+        "progress names the files"
+    );
+    let state = source.token_index_state(&fake()).unwrap();
+    assert!(state.refreshed_at_ms.is_some());
+    let report = source.token_report(&by_day()).unwrap();
+    assert_eq!(report.index, state, "the report carries the index's state");
+    assert_eq!(report.rows.len(), 1);
+    let row = &report.rows[0];
+    assert_eq!(row.account, Some(RowAccount::Unattributed));
+    assert_eq!((row.responses, row.counts.total()), (2, 2 * 15));
+}
+
+#[test]
+fn a_refresh_another_process_holds_is_busy_at_once() {
+    // Spec §9: the TUI always tries (`Wait::Try`).
+    let home = Home::new();
+    home.transcript("s1.jsonl", &[FakeUsage::default()]);
+    let _held = FlockGuard::try_lock(&tokens_lock_path(&home.env, &fake()))
+        .unwrap()
+        .unwrap();
+    let source = home.source();
+    let outcome = source.refresh_tokens(&fake(), &mut |_| {}).unwrap();
+    assert_eq!(outcome, RefreshOutcome::Busy);
+    let state = source.token_index_state(&fake()).unwrap();
+    assert_eq!(
+        (state.refreshed_at_ms, state.responses),
+        (None, 0),
+        "it read nothing"
+    );
+}
+
+#[test]
+fn a_refresh_under_the_shutdown_token_stops_and_says_it_was_interrupted() {
+    // Spec §9: a refresh cancelled by the shutdown token stops at its next chunk.
+    let home = Home::new();
+    home.transcript("s1.jsonl", &[FakeUsage::default()]);
+    let shutdown = Cancel::new();
+    shutdown.request(2);
+    let e = home
+        .source_under(&shutdown)
+        .refresh_tokens(&fake(), &mut |_| {})
+        .unwrap_err();
+    assert_eq!(e.kind, "interrupted");
+    let state = home.source().token_index_state(&fake()).unwrap();
+    assert_eq!(state.refreshed_at_ms, None, "no refresh completed");
+}
+
+#[test]
+fn a_day_drills_to_its_sessions_and_a_session_to_its_models_whose_keys_hold() {
+    // Spec §5.3: `TokenQuery::drill`, and `RowKey`s stable across a re-query.
+    let home = Home::new();
+    home.transcript("s1.jsonl", &[FakeUsage::default()]);
+    home.transcript("s2.jsonl", &[another("s2")]);
+    let source = home.source();
+    source.refresh_tokens(&fake(), &mut |_| {}).unwrap();
+    let days = source.token_report(&by_day()).unwrap();
+    assert_eq!(days.rows.len(), 1);
+    let sessions = source
+        .token_report(&days.query.drill(&days.rows[0]).unwrap())
+        .unwrap();
+    let ids: Vec<&str> = sessions
+        .rows
+        .iter()
+        .map(|r| match &r.period {
+            PeriodKey::Session { session_id, .. } => session_id.as_str(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(ids, ["s2", "s1"], "newest first");
+    let models = source
+        .token_report(&sessions.query.drill(&sessions.rows[1]).unwrap())
+        .unwrap();
+    assert_eq!(models.rows.len(), 1);
+    assert_eq!(models.rows[0].model.as_deref(), Some("fake-1"));
+    assert_eq!(models.query.drill(&models.rows[0]), None, "the bottom");
+    let again = source.token_report(&sessions.query).unwrap();
+    let keys = |r: &tagteam_engine::tokens::TokenReport| {
+        r.rows.iter().map(|row| row.key.clone()).collect::<Vec<_>>()
+    };
+    assert_eq!(keys(&again), keys(&sessions));
 }
