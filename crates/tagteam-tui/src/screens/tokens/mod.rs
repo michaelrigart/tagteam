@@ -1,6 +1,9 @@
 //! The Tokens screen (spec §5.3): the token report (token report §10) by day, month, session or
 //! 5-hour block, grouped and filtered, with drill-down from a period to its sessions and from a
-//! session to its models. Every query runs on the report lane (§4.3), never on the UI thread.
+//! session to its models. Every query runs on the report lane (§4.3), never on the UI thread,
+//! and the index's catch-up on the index lane (`index`).
+
+pub mod index;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use jiff::tz::TimeZone;
@@ -12,6 +15,7 @@ use tagteam_engine::tokens::{
     default_since_ms,
 };
 
+use self::index::IndexWatch;
 use crate::msg::Cmd;
 use crate::source::SourceError;
 use crate::state::{Screen, State};
@@ -99,6 +103,8 @@ pub struct TokensState {
     again: bool,
     /// A failed read's words, the banner while Tokens is open (spec §10.4, B12).
     error: Option<String>,
+    /// The index's state, its refresh, and the timers that read the report again (§6.4).
+    watch: IndexWatch,
 }
 
 impl TokensState {
@@ -117,6 +123,7 @@ impl TokensState {
             pending: false,
             again: false,
             error: None,
+            watch: IndexWatch::default(),
         }
     }
 
@@ -156,9 +163,15 @@ impl TokensState {
         self.pending
     }
 
-    /// A failed read's words, for the banner (B12).
+    /// A failed read's words, for the banner (B12): a report's or a check's, else the last
+    /// refresh's.
     pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        self.error.as_deref().or_else(|| self.watch.error())
+    }
+
+    /// The index's state and the TUI's refresh of it.
+    pub fn watch(&self) -> &IndexWatch {
+        &self.watch
     }
 
     /// The shown level's query at `now_ms`: the top's from the settings, its range ending now;
@@ -309,6 +322,7 @@ pub(crate) fn on_report(
         }
         Err(e) => t.error = Some(e.message),
     }
+    index::on_report(state, now_ms);
     if state.screen == Screen::Tokens {
         state.dirty = true;
     }
@@ -331,6 +345,7 @@ pub fn footer_keys(state: &TokensState) -> Vec<(&'static str, &'static str)> {
         ("g", "group"),
         ("[ ]", "range"),
         ("Esc", "back"),
+        ("r", "refresh"),
     ]);
     keys
 }
@@ -788,6 +803,7 @@ mod tests {
             "range: 7, 30 or 90 days, or all",
             "drill down: sessions, then models",
             "back up a level",
+            "refresh the token index",
         ] {
             assert!(lines.iter().any(|l| l.contains(what)), "{what}: {lines:?}");
         }
@@ -798,7 +814,7 @@ mod tests {
         let mut state = showing_days();
         assert_eq!(
             draw(&state, 80, 24)[23],
-            "Enter sessions  p period  g group  [ ] range  Esc back"
+            "Enter sessions  p period  g group  [ ] range  Esc back  r refresh"
         );
         let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
         answer(&mut state, &down, vec![session("s1", 1)]);

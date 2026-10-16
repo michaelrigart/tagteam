@@ -86,12 +86,13 @@ const HELP_ACCOUNTS: [(&str, &str); 11] = [
     ("Enter", "history of the account"),
     ("J K", "scroll the detail's windows"),
 ];
-const HELP_TOKENS: [(&str, &str); 5] = [
+const HELP_TOKENS: [(&str, &str); 6] = [
     ("p", "period: day, month, session or block"),
     ("g", "group: none, account, model, or both"),
     ("[ ]", "range: 7, 30 or 90 days, or all"),
     ("Enter", "drill down: sessions, then models"),
     ("Esc  Backspace", "back up a level"),
+    ("r", "refresh the token index"),
 ];
 const HELP_HISTORY: [(&str, &str); 3] = [
     ("[ ]", "range: 1, 7, 14 or 30 days"),
@@ -183,8 +184,12 @@ pub fn handle_action_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Optio
     }
 }
 
-/// `r` (spec §7.1): the views re-read, and the shown accounts offered to the collector at once.
+/// `r` (spec §7.1): the views re-read, and the shown accounts offered to the collector at once;
+/// on Tokens, a refresh of the token index, on its own lane.
 fn refresh(state: &mut State, now_ms: i64) -> Vec<Cmd> {
+    if state.screen == Screen::Tokens {
+        return screens::tokens::index::refresh_now(state, now_ms);
+    }
     if busy(state, now_ms) {
         return vec![];
     }

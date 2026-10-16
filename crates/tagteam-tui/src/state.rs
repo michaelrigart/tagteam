@@ -90,6 +90,7 @@ pub struct Gens {
     pub history: u64,
     pub collect: u64,
     pub report: u64,
+    pub index: u64,
 }
 
 pub struct Refresh {

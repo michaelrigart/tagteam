@@ -485,7 +485,10 @@ mod tests {
                 " ".repeat(14)
             )
         );
-        assert_eq!(tokens[23], "p period  g group  [ ] range  Esc back");
+        assert_eq!(
+            tokens[23],
+            "p period  g group  [ ] range  Esc back  r refresh"
+        );
     }
 
     #[test]

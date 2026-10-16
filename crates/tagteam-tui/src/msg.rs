@@ -3,8 +3,8 @@
 
 use std::sync::mpsc::Sender;
 
-use tagteam_core::AccountId;
-use tagteam_engine::tokens::{TokenQuery, TokenReport};
+use tagteam_core::{AccountId, ProviderId};
+use tagteam_engine::tokens::{IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport};
 use tagteam_engine::views::HistoryView;
 
 use crate::host::{Action, ActionOutcome};
@@ -36,10 +36,19 @@ pub enum ActionsReq {
     },
 }
 
-/// The report lane's requests: the token report, which reads the index only (spec §4.3).
+/// The report lane's requests: the token report, which reads the index only, and the index's
+/// state (spec §4.3, §6.4).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReportReq {
     Report { r#gen: u64, query: TokenQuery },
+    IndexState { r#gen: u64, provider: ProviderId },
+}
+
+/// The index lane's requests: the token index's catch-up, which can run for minutes on a cold
+/// index (spec §4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexReq {
+    Refresh { provider: ProviderId },
 }
 
 impl Coalesce for ViewsReq {
@@ -59,7 +68,15 @@ impl Coalesce for ReportReq {
         matches!(
             (self, other),
             (ReportReq::Report { .. }, ReportReq::Report { .. })
+                | (ReportReq::IndexState { .. }, ReportReq::IndexState { .. })
         )
+    }
+}
+
+impl Coalesce for IndexReq {
+    /// A refresh queued behind the running one is one refresh.
+    fn same_as(&self, other: &Self) -> bool {
+        self == other
     }
 }
 
@@ -98,6 +115,16 @@ pub enum Msg {
     TokenReport {
         r#gen: u64,
         result: Result<TokenReport, SourceError>,
+    },
+    IndexState {
+        r#gen: u64,
+        result: Result<IndexState, SourceError>,
+    },
+    /// How far the TUI's refresh of the index has come, at most every 250 ms.
+    IndexProgress(IndexProgress),
+    /// The TUI's refresh of the index returned.
+    Refreshed {
+        result: Result<RefreshOutcome, SourceError>,
     },
     Prompt(Prompt),
     ActionDone {
@@ -145,6 +172,15 @@ pub enum Cmd {
     LoadReport {
         r#gen: u64,
         query: TokenQuery,
+    },
+    /// The index's state, on the report lane (spec §6.4).
+    LoadIndexState {
+        r#gen: u64,
+        provider: ProviderId,
+    },
+    /// A refresh of the index, on the index lane (spec §6.4).
+    RefreshIndex {
+        provider: ProviderId,
     },
     Act(Action),
     /// Run `action` with the terminal handed back (spec §7.3).
@@ -199,6 +235,16 @@ mod tests {
             query: query(days),
         };
         assert!(report(1, 7).same_as(&report(2, 30)));
+        let state = |g| ReportReq::IndexState {
+            r#gen: g,
+            provider: ProviderId::new("claude-code"),
+        };
+        assert!(state(1).same_as(&state(2)));
+        assert!(!state(1).same_as(&report(1, 7)));
+        let refresh = |p: &str| IndexReq::Refresh {
+            provider: ProviderId::new(p),
+        };
+        assert!(refresh("claude-code").same_as(&refresh("claude-code")));
     }
 
     #[test]

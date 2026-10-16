@@ -16,7 +16,7 @@ use crate::ask::ChannelAsk;
 use crate::host::{Action, ActionOutcome, Host};
 use crate::input::{Input, Pause};
 use crate::lanes::Lane;
-use crate::msg::{ActionsReq, Cmd, Msg, ReportReq, ViewsReq};
+use crate::msg::{ActionsReq, Cmd, IndexReq, Msg, ReportReq, ViewsReq};
 use crate::screens::tokens::TokensState;
 use crate::source::{Source, SourceFactory};
 use crate::state::{Screen, State};
@@ -28,6 +28,8 @@ use crate::view::view;
 const WAKE: Duration = Duration::from_millis(250);
 /// How long the first frame waits for the first `accounts` (§6.1).
 const FIRST_FRAME: Duration = Duration::from_millis(100);
+/// The index lane passes on a refresh's progress at most this often: the loop's own pace.
+const PROGRESS_EVERY: Duration = WAKE;
 /// Why a hand-over of the terminal was refused (§7.3 step 1): the input thread could still read
 /// keys typed for the terminal's next owner.
 const NOT_PAUSED: &str = "the TUI's key reader did not pause in time; try again";
@@ -180,11 +182,12 @@ fn now_ms() -> i64 {
 }
 
 /// The engine lanes (§4.3): views (`accounts`, `history`, store-served), report (the token
-/// report, which reads the index only) and actions (the collector and every `Host` action, one
-/// at a time).
+/// report, which reads the index only), index (the token index's catch-up) and actions (the
+/// collector and every `Host` action, one at a time).
 pub(crate) struct Lanes {
     views: Lane<ViewsReq>,
     report: Lane<ReportReq>,
+    index: Lane<IndexReq>,
     actions: Lane<ActionsReq>,
 }
 
@@ -236,11 +239,37 @@ impl Lanes {
                             r#gen,
                             result: source.token_report(&query),
                         },
+                        ReportReq::IndexState { r#gen, provider } => Msg::IndexState {
+                            r#gen,
+                            result: source.token_index_state(&provider),
+                        },
                     };
                     let _ = out.send(msg);
                 },
                 move || {
                     let _ = died.send(Msg::LaneDied { lane: "report" });
+                },
+            )
+        };
+        let index = {
+            let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
+            Lane::spawn(
+                "index",
+                move || make(),
+                move |source: &mut Box<dyn Source>, req: IndexReq| {
+                    let IndexReq::Refresh { provider } = req;
+                    // The engine reports progress per chunk; the loop is told at its own pace.
+                    let mut told: Option<Instant> = None;
+                    let result = source.refresh_tokens(&provider, &mut |progress| {
+                        if told.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
+                            told = Some(Instant::now());
+                            let _ = out.send(Msg::IndexProgress(*progress));
+                        }
+                    });
+                    let _ = out.send(Msg::Refreshed { result });
+                },
+                move || {
+                    let _ = died.send(Msg::LaneDied { lane: "index" });
                 },
             )
         };
@@ -274,15 +303,18 @@ impl Lanes {
         Lanes {
             views,
             report,
+            index,
             actions,
         }
     }
 
     /// §10.2 step 2: nothing more is taken, what is queued is dropped, and an idle lane wakes
-    /// and returns.
+    /// and returns. A refresh the index lane runs stops at its next chunk: its engine takes
+    /// the shutdown token, which step 1 set (§9).
     fn close(&self) {
         self.views.close();
         self.report.close();
+        self.index.close();
         self.actions.close();
     }
 
@@ -294,6 +326,9 @@ impl Lanes {
         }
         if self.report.join().is_err() {
             died.push("report");
+        }
+        if self.index.join().is_err() {
+            died.push("index");
         }
         if self.actions.join().is_err() {
             died.push("actions");
@@ -479,6 +514,13 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
                 }
                 Cmd::LoadReport { r#gen, query } => {
                     let _ = self.lanes.report.submit(ReportReq::Report { r#gen, query });
+                }
+                Cmd::LoadIndexState { r#gen, provider } => {
+                    let req = ReportReq::IndexState { r#gen, provider };
+                    let _ = self.lanes.report.submit(req);
+                }
+                Cmd::RefreshIndex { provider } => {
+                    let _ = self.lanes.index.submit(IndexReq::Refresh { provider });
                 }
                 Cmd::Act(action) => {
                     let _ = self.lanes.actions.submit(ActionsReq::Act { action });
@@ -681,7 +723,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use tagteam_core::AccountId;
     use tagteam_engine::tokens::{
-        IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport,
+        IndexProgress, IndexState, RefreshOutcome, TokenPeriod, TokenQuery, TokenReport,
     };
     use tagteam_engine::views::HistoryView;
 
@@ -976,6 +1018,62 @@ mod tests {
         })
     }
 
+    /// A source with one account whose index refresh runs until the shutdown token is set,
+    /// telling its progress every 5 ms and logging `refresh` and `stopped` in `log`, while its
+    /// report answers at once with no rows.
+    struct CatchingUp {
+        shutdown: Cancel,
+        log: Log,
+    }
+
+    impl Source for CatchingUp {
+        fn accounts(&self, _: Option<&ProviderId>) -> Result<AccountsSnapshot, SourceError> {
+            Ok(crate::testutil::snapshot(crate::testutil::many(1)))
+        }
+        fn history(&self, _: &AccountId, _: i64) -> Result<HistoryView, SourceError> {
+            Err(no_tokens())
+        }
+        fn collect_due(&self, _: &[AccountId]) -> Result<CollectSummary, SourceError> {
+            Ok(CollectSummary {
+                fetched: 0,
+                warnings: Vec::new(),
+            })
+        }
+        fn refresh_tokens(
+            &self,
+            _: &ProviderId,
+            progress: &mut dyn FnMut(&IndexProgress),
+        ) -> Result<RefreshOutcome, SourceError> {
+            self.log.push("refresh");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.shutdown.requested().is_none() && Instant::now() < deadline {
+                progress(&IndexProgress::default());
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.log.push("stopped");
+            Err(SourceError {
+                kind: "interrupted".into(),
+                message: "interrupted".into(),
+            })
+        }
+        fn token_report(&self, query: &TokenQuery) -> Result<TokenReport, SourceError> {
+            Ok(crate::testutil::token_report(query.clone(), vec![]))
+        }
+        fn token_index_state(&self, _: &ProviderId) -> Result<IndexState, SourceError> {
+            Ok(IndexState::default())
+        }
+    }
+
+    fn catching_up(shutdown: &Cancel, log: &Log) -> SourceFactory {
+        let (shutdown, log) = (shutdown.clone(), log.clone());
+        Arc::new(move || {
+            Box::new(CatchingUp {
+                shutdown: shutdown.clone(),
+                log: log.clone(),
+            }) as Box<dyn Source>
+        })
+    }
+
     /// Waits up to 5 s for `frames` to see `what`; whether it did.
     fn seen_within(frames: &Log, what: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1217,7 +1315,7 @@ mod tests {
         assert_eq!((exit.code, exit.report), (0, None));
         assert_eq!(
             drops.load(Ordering::SeqCst),
-            3,
+            4,
             "every lane ended before the TUI returned"
         );
         assert_eq!(
@@ -1250,6 +1348,87 @@ mod tests {
             ui.run()
         };
         assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn a_report_asked_for_while_the_index_catches_up_is_answered_and_q_stops_the_catch_up() {
+        // Spec §4.3, §11: the index has a lane of its own, so a report asked for while a
+        // catch-up runs is answered before the catch-up ends; the shutdown token then stops the
+        // catch-up, and its lane is joined (§9, §10.2).
+        let opts = TuiOptions {
+            screen: Screen::Tokens,
+            ..options()
+        };
+        let shutdown = opts.shutdown.clone();
+        let log = Log::default();
+        let fx = Fixture::with(opts, catching_up(&shutdown, &log), |_| idle());
+        let started = Instant::now();
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            assert!(seen_within(&log, "refresh"), "the first frame started it");
+            // Asked for only now that the catch-up runs: `p` reads the months.
+            ui.apply(Msg::Key(KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::NONE,
+            )));
+            let asked = ui.state.gens.report;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let msg = fx.rx.recv_timeout(left);
+                let msg = msg.expect("the report lane answered while the catch-up ran");
+                let answer = matches!(&msg, Msg::TokenReport { r#gen, .. } if *r#gen == asked);
+                ui.deliver(msg);
+                if answer {
+                    break;
+                }
+            }
+            assert_eq!(
+                ui.state.tokens.report().map(|r| r.query.period),
+                Some(TokenPeriod::Month)
+            );
+            assert_eq!(log.seen(), ["refresh"], "the catch-up still runs");
+            assert!(ui.state.tokens.watch().refreshing().is_some());
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+        assert_eq!(log.seen(), ["refresh", "stopped"]);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_refresh_tells_the_loop_its_progress_at_most_every_250_ms() {
+        let opts = options();
+        let shutdown = opts.shutdown.clone();
+        let log = Log::default();
+        let fx = Fixture::with(opts, catching_up(&shutdown, &log), |_| idle());
+        let provider = ProviderId::new("claude-code");
+        assert!(fx.lanes.index.submit(IndexReq::Refresh { provider }));
+        let started = Instant::now();
+        let mut told = 0;
+        while started.elapsed() < Duration::from_millis(600) {
+            if let Ok(Msg::IndexProgress(_)) = fx.rx.recv_timeout(Duration::from_millis(10)) {
+                told += 1;
+            }
+        }
+        assert!(
+            (2..=4).contains(&told),
+            "{told} in 600 ms, of a call every 5 ms"
+        );
+        shutdown.request(libc::SIGINT);
+        let ending = Ending {
+            code: 0,
+            fatal: None,
+            report: String::new(),
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+        assert_eq!(log.seen(), ["refresh", "stopped"]);
     }
 
     #[test]
@@ -1881,7 +2060,7 @@ mod tests {
             || {},
         );
         assert_eq!((exit.code, exit.report), (1, None));
-        assert_eq!(drops.load(Ordering::SeqCst), 3, "every lane was joined");
+        assert_eq!(drops.load(Ordering::SeqCst), 4, "every lane was joined");
         assert_eq!(shutdown.requested(), Some(libc::SIGINT));
     }
 }
