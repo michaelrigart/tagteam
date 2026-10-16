@@ -139,6 +139,7 @@ fn screen_for(cli: &Cli) -> Screen {
             screen: Some(arg), ..
         }) => match arg {
             ScreenArg::Accounts => Screen::Accounts,
+            ScreenArg::Tokens => Screen::Tokens,
             ScreenArg::History => Screen::History,
         },
         _ => Screen::Accounts,
@@ -155,6 +156,7 @@ mod tests {
     fn tui_opens_on_the_screen_it_names_and_on_accounts_otherwise() {
         for (args, screen) in [
             (&["tagteam", "tui", "history"][..], Screen::History),
+            (&["tagteam", "tui", "tokens"], Screen::Tokens),
             (&["tagteam", "tui", "accounts"], Screen::Accounts),
             (&["tagteam", "tui"], Screen::Accounts),
             (&["tagteam"], Screen::Accounts),

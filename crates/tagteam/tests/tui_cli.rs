@@ -92,15 +92,25 @@ fn tui_off_a_terminal_is_a_usage_error_and_creates_nothing() {
 }
 
 #[test]
-fn tui_opens_on_accounts_or_history_and_nothing_else_yet() {
-    // Part B adds `tokens`.
+fn tui_accepts_accounts_tokens_and_history_and_refuses_any_other_screen() {
     let d = tempfile::tempdir().unwrap();
     fs::create_dir_all(d.path().join("home")).unwrap();
+    for screen in ["accounts", "tokens", "history"] {
+        cmd(d.path())
+            .args(["tui", screen])
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(NEEDS_TERMINAL);
+    }
     cmd(d.path())
-        .args(["tui", "tokens"])
+        .args(["tui", "bogus"])
         .assert()
         .code(2)
-        .stdout("");
+        .stdout("")
+        .stderr(predicates::str::contains(
+            "one of the values isn't valid for an argument",
+        ));
 }
 
 #[test]

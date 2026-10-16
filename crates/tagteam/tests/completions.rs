@@ -422,7 +422,7 @@ fn fish_completes_a_positional_only_in_its_place() {
     );
     let keys: BTreeSet<&str> = names.iter().map(String::as_str).collect();
     let shells = BTreeSet::from(["bash", "zsh", "fish"]);
-    let screens = BTreeSet::from(["accounts", "history"]);
+    let screens = BTreeSet::from(["accounts", "tokens", "history"]);
     let nothing = BTreeSet::new();
     for (line, offered) in [
         ("tagteam shell-init", &shells),
