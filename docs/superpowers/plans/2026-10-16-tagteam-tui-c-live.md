@@ -26,7 +26,7 @@
 - Part C adds `tagteam-daemon` (spec §4.1, §12) to `tagteam-tui`'s dependencies, and moves `serde_json` from its dev-dependencies to its dependencies: the events' fields are JSON (D5.7).
 - Tests: the daemon's own socket server (`tagteam_daemon::server::Server` over a `StatusBoard`) and fake daemons on Unix sockets (`crates/tagteam-tui/tests/live.rs`); ratatui's `TestBackend`; `openpty` beside a real `tagteam daemon` (`tests/tui_pty.rs`); `tests/perf.rs`.
 
-**Spec:** `docs/superpowers/specs/2026-10-14-tagteam-tui-design.md` (In progress: part A implemented, part B approved). "D*n*" cites `docs/superpowers/specs/2026-10-14-tagteam-daemon-design.md` (Implemented), and D5 is the authority on the protocol. Read before any task:
+**Spec:** `docs/superpowers/specs/2026-10-14-tagteam-tui-design.md` (In progress: part A implemented, part B executed and reviewed). "D*n*" cites `docs/superpowers/specs/2026-10-14-tagteam-daemon-design.md` (Implemented), and D5 is the authority on the protocol. Read before any task:
 - the TUI spec: §1.1 (criteria 2, 3, 4 and 6), §4.1, §4.3, §5.1, §5.6, §6.3, §6.4, §7.1, §7.2, §7.4, §8, §10.2, §10.4, §11 ("Daemon client", "End to end", "Performance") and §13 (T2, T3);
 - the daemon spec: D4.2 (a setting applies within about a second), D4.3 (the modes), D5 (all of it), D7 (`daemon.autoswitch`), D13, and the errata on D5.3 and D13;
 - part A's plan, `docs/superpowers/plans/2026-10-14-tagteam-tui-a-core.md`, and part B's, `docs/superpowers/plans/2026-10-16-tagteam-tui-b-tokens.md`: their rulings R1–R22 and B1–B29, which stay in force, and their Interface Contracts, which this plan extends.
@@ -40,12 +40,12 @@
 
 **Parts.** The TUI spec is implemented in three plans:
 - **A, the core TUI,** is implemented on `tui`.
-- **B, the Tokens screen,** is on `tui`, approved.
+- **B, the Tokens screen,** is on `tui`, executed and reviewed.
 - **C (this plan)** implements §8 (the socket client), §6.3 (live mode), the live-mode parts of §6.4, §7.4 (`P`), the daemon lane and the live thread of §4.3, the activity line and the live header of §5.1, `P` in §5.6, §10.2's shutdown as it applies to the live thread and the daemon lane, §11's tests for these, and §12's dependency on `tagteam-daemon`. With it the spec is implemented.
 
 ## Execution notes
 
-- **Where:** worktree `~/Code/tagteam-tui`, branch `tui`, from part B's head. This plan was verified on `941d245`: part A and part B's seven approved tasks on main `d6c2e2e`. When execution starts, set this plan's `**Status:**` to `In progress` in one commit.
+- **Where:** worktree `~/Code/tagteam-tui`, branch `tui`, from part B's head. This plan was verified on `3575c3b`: part A on main `d6c2e2e`, part B as executed and reviewed, and this plan's own commit. When execution starts, set this plan's `**Status:**` to `In progress` in one commit.
 - **No new crates:** `tagteam-daemon` is the workspace's own crate, and `serde_json` is the workspace's. Task 1's build adds `tagteam-daemon` to `tagteam-tui`'s entry in `Cargo.lock`, offline.
 - **Outside the sandbox:** binding a Unix socket and `openpty` fail with EPERM inside it. Run these there:
   - `cargo test -p tagteam-tui --test live` (Task 1's socket tests);
@@ -65,17 +65,17 @@
 
 ### Integration notes
 
-Each task below was applied as written, in order, in a fresh scratch clone of `tui` at `941d245`, part B's approved head, and committed as its steps say. A script applied every `replace`, `Create` and `put this above` block to the clone exactly as the plan prints it, checked that each `replace` text occurred once, and compared each task's commit with the reference tree byte for byte. After every task:
+Each task below was applied as written, in order, in a fresh scratch clone of `tui` at `3575c3b`, part B's head as executed and reviewed, and committed as its steps say. A script applied every `replace`, `Create` and `put this above` block to the clone exactly as the plan prints it, checked that each `replace` text occurred once, and compared each task's commit with the reference tree byte for byte. After every task:
 - Step 2's run failed as the step says (Task 6's passed, as it says);
 - its own tests, `cargo fmt --all --check` and both clippy runs passed.
 
-The tasks were first written and verified the same way on `0ed49bc`, part B before its review rounds. They were then rebased onto `941d245` and verified again. They then took the four findings of the first review round, the two of the second with their class, and the one of the third, each test first and in the task that owns it, and were verified from a fresh clone after each round. The pty suite ran after Tasks 2 and 6, and the workspace suite at the end.
+The tasks were first written and verified the same way on `0ed49bc`, part B before its review rounds. They were then rebased onto `941d245` and verified again. They then took the four findings of the first review round, the two of the second with their class, and the one of the third, each test first and in the task that owns it, and were verified from a fresh clone after each round. Last, they were moved onto `3575c3b` and verified once more. The pty suite ran after Tasks 2 and 6, and the workspace suite at the end.
 
 **Totals:**
-- The workspace suite at the end: 3778/3778, part B's 3708 and 70 new (the two new timing tests build only in a release build). The sandbox refuses 103 of those, which pass outside it: the 85 part B lists, the three new pty tests, 13 of the 16 in `tagteam-tui`'s `tests/live.rs`, the runtime's test of the suspension's order, and the daemon client's new test (Task 6's Step 4 lists them).
+- The workspace suite at the end: 3792/3792, part B's 3722 at `3575c3b` and 70 new (the two new timing tests build only in a release build). The sandbox refuses 103 of those, which pass outside it: the 85 part B lists, the three new pty tests, 13 of the 16 in `tagteam-tui`'s `tests/live.rs`, the runtime's test of the suspension's order, and the daemon client's new test (Task 6's Step 4 lists them).
 - `tests/tui_pty.rs`: 22/22, three runs in a row (after Task 2: 19/19).
-- `tagteam-tui`'s `tests/live.rs`: 16/16, and its library 283/283, three runs in a row each; `tagteam-daemon`'s `tests/client.rs`: 16/16.
-- The first frame, release build, 50 runs each, after round 3, at a load average of 8 falling to 4: all four within 50 ms in two runs: 23.0 and 24.8 ms with nothing due, 23.6 and 22.3 ms beside a running daemon, 23.3 and 24.5 ms beside a socket that accepts and never answers, and 21.1 and 23.6 ms for part B's catch-up test. After round 2 the catch-up test once measured 53.1 ms, in a burst of slow samples; run alternately three times with round 1's head at a load average of 35 falling to 5, round 2 kept all four within 50 ms (41.0 ms at most), and round 1's head measured the catch-up at 59.6 ms once: load, not the change. Round 1 measured the four at 30.0, 34.1, 41.1 and 33.1 ms, and before review at 18.3, 23.2, 10.7 and 18.3 ms.
+- `tagteam-tui`'s `tests/live.rs`: 16/16, and its library 297/297, three runs in a row each; `tagteam-daemon`'s `tests/client.rs`: 16/16.
+- The first frame, release build, 50 runs each, on `3575c3b`, at a load average of 10 falling to 6: all four within 50 ms in two runs: 11.0 and 11.8 ms with nothing due, 10.5 and 10.5 ms beside a running daemon, 10.5 and 11.0 ms beside a socket that accepts and never answers, and 10.3 and 10.7 ms for part B's catch-up test. Before the move, after round 3: 21.1 to 24.8 ms. After round 2 the catch-up test once measured 53.1 ms, in a burst of slow samples; run alternately three times with round 1's head at a load average of 35 falling to 5, round 2 kept all four within 50 ms (41.0 ms at most), and round 1's head measured the catch-up at 59.6 ms once: load, not the change. Round 1 measured the four at 30.0, 34.1, 41.1 and 33.1 ms, and before review at 18.3, 23.2, 10.7 and 18.3 ms.
 
 What verification and review found and changed in the drafted tasks, one line each:
 
@@ -90,6 +90,11 @@ What verification and review found and changed in the drafted tasks, one line ea
 - **Review round 2, the class (Tasks 2, 3, 5):** the sweep of what else the UI applies by link (C-R21) found `Up`, `Down`, `Mismatch` and the events safe, being one thread's messages in one queue, and two things a link kept from the one before. A `poll` from an earlier link named the window of a later link's `switch` (Task 3: `a_switch_names_its_window_only_from_a_poll_of_its_own_link`). `P`'s fetch 2 s after the setting was dropped by a link change, though the new link's own fetch can read the daemon before it applies the setting (Task 5: `p_s_fetch_of_the_status_outlives_a_link_change`). Each test failed first.
 - **Review round 3, P2 (Task 5):** `P`'s fetch was still lost when the link dropped before the setting's outcome arrived: `recheck` kept no deadline with no link up, and the next link's own fetch could read the daemon before it applied the setting. The deadline is now kept whatever the link; at it, `status` is fetched on whichever link is up, and a link that comes up only after it fetches once, at once, which serves (C-R21). Test first, both orders: `p_s_fetch_of_the_status_is_kept_when_its_outcome_comes_with_no_link_up` (`Down` → outcome → `Up`, the link up before the deadline and after it) beside `p_s_fetch_of_the_status_outlives_a_link_change` (outcome → `Down` → `Up`). It failed first at the fetch due 2 s after the outcome; with the deadline kept but a late link's fetch not counted, it failed at a second fetch.
 - **Review round 2, knock-on:** every `Up` in the tests names its link, and `go_live` gives each its own. `a_status_that_fails_or_never_comes_ends_the_link` sends the `status` it fails.
+- **The move onto `3575c3b`** (part B as executed and reviewed): Tasks 1 to 3 and 6 rebased without conflict. Two conflicts were context only, and every line the tasks add is as it was:
+  - Task 4, `on_refreshed`: part B's `Busy` arm now also resets `busy_after`, beside Task 4's `watch.busy = !keeps`; and the test module's end, where both added tests.
+  - Task 5, `HELP_GLOBAL`: part B's screens key is now `1 2 3  Tab Shift-Tab`, beside Task 5's `P` line. Part B's `every_help_line_shows_whole_on_every_screen_at_80_columns` passes with `P`'s line in the help.
+
+  Part B's other changes need nothing of these tasks: the index check's `CHECK_FAILED`, `on_load`, the time triggers skipped while a report is pending (`token-index`'s debounced read is not one of them, and while a report is pending it asks for the follow-up B2 makes), the table, the filter, and Task 7's fixes. The code blocks moved with their context, and only the counts changed.
 - **The move onto `941d245`:** the rebase met no conflict, and every code block generated from the rebased commits was byte for byte the one verified on `0ed49bc`. Part B's review changed none of the text these tasks replace, and only the counts moved.
 - **Task 2 (found by Task 6's pty test of `P`):** the header said `● live · daemon idle` for a daemon whose first tick was still running. `status` is a snapshot the scheduler updates when a job's run ends (D5.4), after the run's events, so `mode`'s own fetch had read the board from before the run, and nothing fetched it again for a minute. Every event of a provider job's run now also fetches `status`, in the debounced read (C-R5).
 - **Task 2:** an accessor for the link, used only by tests, failed clippy's dead-code lint, so the tests take the link from `go_live`.
@@ -4271,7 +4276,7 @@ with:
 - [ ] **Step 4: Run the tests and see them pass**
 
 Run:
-- Outside the sandbox: `cargo test -p tagteam-tui --lib` — Expected: `257 passed` (23 new: 16 in `daemon`, 6 in `runtime`, 1 in `msg`). Inside it, `runtime::tests::a_failure_judged_after_the_live_thread_replaced_its_link_leaves_the_new_link_alone` fails with `PermissionDenied`, and the rest pass.
+- Outside the sandbox: `cargo test -p tagteam-tui --lib` — Expected: `271 passed` (23 new: 16 in `daemon`, 6 in `runtime`, 1 in `msg`). Inside it, `runtime::tests::a_failure_judged_after_the_live_thread_replaced_its_link_leaves_the_new_link_alone` fails with `PermissionDenied`, and the rest pass.
 - `cargo test -p tagteam --features test-support --lib tui_cmd` — Expected: `1 passed`.
 - Outside the sandbox: `cargo test -p tagteam --features test-support --test tui_pty` — Expected: `19 passed`: with no daemon, the live thread finds none, and the TUI is in timer mode as before.
 
@@ -5662,7 +5667,7 @@ workspace = true
 
 Run, outside the sandbox: `cargo test -p tagteam-tui --lib`
 
-Expected: `268 passed` (11 new: 4 in `daemon::words`, 7 in `view`).
+Expected: `282 passed` (11 new: 4 in `daemon::words`, 7 in `view`).
 
 - [ ] **Step 5: Format and lint**
 
@@ -5749,8 +5754,8 @@ mod tests {
 In `crates/tagteam-tui/src/screens/tokens/index.rs`, replace:
 
 ```rust
-        update(&mut state, ch('r'), NOW_MS);
-        update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+            NOW_MS + 6_100,
+        );
         assert_eq!(state.tokens.error(), None);
     }
 }
@@ -5759,8 +5764,8 @@ In `crates/tagteam-tui/src/screens/tokens/index.rs`, replace:
 with:
 
 ```rust
-        update(&mut state, ch('r'), NOW_MS);
-        update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+            NOW_MS + 6_100,
+        );
         assert_eq!(state.tokens.error(), None);
     }
 
@@ -5995,7 +6000,7 @@ with:
 
 Run: `cargo test -p tagteam-tui --lib`
 
-Expected: FAIL: the build passes, and outside the sandbox `test result: FAILED. 269 passed; 5 failed`: five of the six new tests in `screens::tokens::index`. The timer still refreshes beside the daemon, a `token-index` event reads nothing, and a `Busy` sticks (`assertion failed: !state.tokens.watch().busy()`). The sixth, `a_daemon_that_runs_another_provider_only_leaves_the_timer_on`, passes already: it pins the timer that a `keeps_index` blind to the provider would stop.
+Expected: FAIL: the build passes, and outside the sandbox `test result: FAILED. 283 passed; 5 failed`: five of the six new tests in `screens::tokens::index`. The timer still refreshes beside the daemon, a `token-index` event reads nothing, and a `Busy` sticks (`assertion failed: !state.tokens.watch().busy()`). The sixth, `a_daemon_that_runs_another_provider_only_leaves_the_timer_on`, passes already: it pins the timer that a `keeps_index` blind to the provider would stop.
 
 - [ ] **Step 3: Write the code**
 
@@ -6039,8 +6044,8 @@ use crate::state::{Screen, State};
 In `crates/tagteam-tui/src/screens/tokens/index.rs`, replace:
 
 ```rust
-/// in as its batches commit.
-pub const CHECK_MS: i64 = 5_000;
+/// What a failed check of the index's state is shown as, before the engine's words.
+const CHECK_FAILED: &str = "the token index's state was not read: ";
 /// `r` while the TUI's own refresh runs.
 pub const ALREADY: &str = "the token index is already being refreshed";
 
@@ -6052,8 +6057,8 @@ type AccountKey = (AccountId, u32, String, Option<String>);
 with:
 
 ```rust
-/// in as its batches commit.
-pub const CHECK_MS: i64 = 5_000;
+/// What a failed check of the index's state is shown as, before the engine's words.
+const CHECK_FAILED: &str = "the token index's state was not read: ";
 /// `r` while the TUI's own refresh runs.
 pub const ALREADY: &str = "the token index is already being refreshed";
 /// Spec §6.4 in live mode: the daemon's `token-index` events read the report again at most this
@@ -6140,10 +6145,10 @@ In `crates/tagteam-tui/src/screens/tokens/index.rs`, replace:
         }
         Ok(RefreshOutcome::Busy) => {
             watch.busy = true;
+            watch.busy_after = None;
             watch.error = None;
         }
         Err(e) => {
-            watch.busy = false;
 ```
 
 with:
@@ -6166,10 +6171,10 @@ with:
         // of things, and its events say when the index changes.
         Ok(RefreshOutcome::Busy) => {
             watch.busy = !keeps;
+            watch.busy_after = None;
             watch.error = None;
         }
         Err(e) => {
-            watch.busy = false;
 ```
 
 In `crates/tagteam-tui/src/screens/tokens/index.rs`, replace:
@@ -6436,7 +6441,7 @@ pub(crate) fn keeps_index(state: &State) -> bool {
 
 Run, outside the sandbox: `cargo test -p tagteam-tui --lib`
 
-Expected: `274 passed` (6 new, in `screens::tokens::index`).
+Expected: `288 passed` (6 new, in `screens::tokens::index`).
 
 - [ ] **Step 5: Format and lint**
 
@@ -7041,7 +7046,7 @@ In `crates/tagteam-tui/src/actions.rs`, replace:
 
 /// The help panel's keys (spec §5.6): everywhere, then the current screen's.
 const HELP_GLOBAL: [(&str, &str); 7] = [
-    ("1 2 3  Tab  Shift-Tab", "screens"),
+    ("1 2 3  Tab Shift-Tab", "screens"),
     ("j k  ↑ ↓", "move"),
     ("A", "add the current login"),
     ("D", "doctor"),
@@ -7063,7 +7068,7 @@ pub const NO_DAEMON_RUNNING: &str = "no daemon running";
 
 /// The help panel's keys (spec §5.6): everywhere, then the current screen's.
 const HELP_GLOBAL: [(&str, &str); 8] = [
-    ("1 2 3  Tab  Shift-Tab", "screens"),
+    ("1 2 3  Tab Shift-Tab", "screens"),
     ("j k  ↑ ↓", "move"),
     ("A", "add the current login"),
     ("D", "doctor"),
@@ -7378,7 +7383,7 @@ with:
 - [ ] **Step 4: Run the tests and see them pass**
 
 Run:
-- Outside the sandbox: `cargo test -p tagteam-tui --lib` — Expected: `283 passed` (9 new: 8 in `actions`, 1 in `host`).
+- Outside the sandbox: `cargo test -p tagteam-tui --lib` — Expected: `297 passed` (9 new: 8 in `actions`, 1 in `host`).
 - `cargo test -p tagteam --features test-support --test tui_host` — Expected: `23 passed` (1 new).
 
 - [ ] **Step 5: Format and lint**
@@ -7859,8 +7864,8 @@ In `CHANGELOG.md`, replace:
 
 ```markdown
   month, session or 5-hour block, grouped and filtered by account and model, with drill-down
-  from a period to its sessions and from a session to its models, and the active block's burn
-  rate counting down. It brings the token index up to date in the background, and reads the
+  from a period to its sessions and from a session to its models, and the active block's remaining
+  time, burn rate and projection. It brings the token index up to date in the background, and reads the
   report again as the index, the accounts or the clock move.
 
 ### Changed
@@ -7872,8 +7877,8 @@ with:
 
 ```markdown
   month, session or 5-hour block, grouped and filtered by account and model, with drill-down
-  from a period to its sessions and from a session to its models, and the active block's burn
-  rate counting down. It brings the token index up to date in the background, and reads the
+  from a period to its sessions and from a session to its models, and the active block's remaining
+  time, burn rate and projection. It brings the token index up to date in the background, and reads the
   report again as the index, the accounts or the clock move.
 - With the daemon running, the TUI follows it live. The header shows what the daemon does for
   the selected account's provider (`● live · auto on`, `auto paused`, …), the line above the
@@ -7922,7 +7927,7 @@ the daemon first if you want `auto` in a terminal.
 Run:
 - Outside the sandbox: `cargo test -p tagteam --features test-support --test tui_pty` — Expected: `22 passed`.
 - Outside the sandbox, on an idle machine: `cargo test --release -p tagteam --features test-support --test perf -- --ignored --nocapture tui_first_frame` — Expected: `4 passed`, each printing its p95 within 50 ms.
-- The workspace suite: `cargo test --workspace --features tagteam/test-support --no-fail-fast` — Expected: 3778 of 3778 pass: 3675 in the sandbox, and outside it the 103 it refuses (`tagteam`'s library 10, `tests/daemon_cli.rs` 4, `tests/daemon_procs.rs` 5, `tests/signals.rs` 1, `tests/tui_pty.rs` 21, `tagteam-daemon`'s `client` 14, `server` 17 and `umask` 1, the engine's `tests/doctor.rs` 2, `xtask`'s compat tests 14, `tagteam-tui`'s `tests/live.rs` 13 and its library 1).
+- The workspace suite: `cargo test --workspace --features tagteam/test-support --no-fail-fast` — Expected: 3792 of 3792 pass: 3689 in the sandbox, and outside it the 103 it refuses (`tagteam`'s library 10, `tests/daemon_cli.rs` 4, `tests/daemon_procs.rs` 5, `tests/signals.rs` 1, `tests/tui_pty.rs` 21, `tagteam-daemon`'s `client` 14, `server` 17 and `umask` 1, the engine's `tests/doctor.rs` 2, `xtask`'s compat tests 14, `tagteam-tui`'s `tests/live.rs` 13 and its library 1).
 
 - [ ] **Step 5: Format and lint**
 
