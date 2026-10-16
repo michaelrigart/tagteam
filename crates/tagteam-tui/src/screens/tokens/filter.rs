@@ -286,10 +286,14 @@ pub(crate) fn render(state: &State, dialog: &FilterDialog, frame: &mut Frame) {
         );
     }
     let Some(choices) = &dialog.choices else {
-        let mut lines: Vec<Line<'static>> = wrap_rows(LOADING, inner, CHOICE_ROWS)
-            .into_iter()
-            .map(Line::from)
-            .collect();
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if dialog.error.is_none() {
+            lines.extend(
+                wrap_rows(LOADING, inner, CHOICE_ROWS)
+                    .into_iter()
+                    .map(Line::from),
+            );
+        }
         lines.extend(tail);
         lines.push(Line::from("Esc cancel"));
         boxed(frame, area, " Filter ", lines, w);
@@ -649,6 +653,10 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("the choices could not be read: the store is locked")),
             "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains(LOADING)),
+            "a failed read is not still loading: {lines:?}"
         );
     }
 
