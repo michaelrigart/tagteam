@@ -33,11 +33,17 @@ const BAR: usize = 8;
 const TABLE_MIN: usize = 3;
 /// The filter gives way to the drill-down on their row down to this many columns (B29).
 const FILTER_LEAST: usize = 20;
-/// The account and model columns are cut no narrower than this while a more compact period can
-/// make room (B24)...
+/// The account column is cut no narrower than this while a more compact period can make room
+/// (B24)...
 const TEXT_MIN: usize = 6;
-/// ... and the project column no narrower than this.
+/// ... and the project column no narrower than this, else it is left out.
 const PROJECT_MIN: usize = 4;
+/// The model column keeps its whole value up to this many columns before it is cut: a realistic
+/// Claude model ID (`claude-sonnet-4-5-20250929` is 26) with a suffix such as `[1m]`.
+const MODEL_KEEP: usize = 30;
+/// Where nothing else fits, the account keeps its position and an ellipsis (`1 …`) before the
+/// model is cut.
+const ACCOUNT_LEAST: usize = 3;
 /// How many ways a session's or a block's span can be written (`span`).
 const SPAN_LEVELS: usize = 4;
 /// The active block's figures start this far in.
@@ -277,6 +283,8 @@ struct Table<'a> {
     report: &'a TokenReport,
     widths: &'a Widths,
     cols: Vec<(Col, usize)>,
+    /// The column whose total line cell says `TOTAL`: the first.
+    lead: Col,
     /// How compact the period's spans are (`span`).
     level: usize,
     /// The largest row cost, for the bar.
@@ -288,7 +296,8 @@ struct Table<'a> {
 impl<'a> Table<'a> {
     /// The columns `report` takes at `width` (spec §5.3): period, account, input, output, total
     /// and cost always, with the project for sessions, the kind for blocks and the model when
-    /// grouped by it. From `WIDE` columns, the cache write (split into 5-minute and 1-hour when
+    /// grouped by it; but not the period and the project for one session's models, whose rows all
+    /// share them, and which the header's drill-down and the detail say. From `WIDE` columns, the cache write (split into 5-minute and 1-hour when
     /// that still fits), the cache read, the responses and the bar. Text columns share the rest.
     fn new(
         report: &'a TokenReport,
@@ -298,12 +307,17 @@ impl<'a> Table<'a> {
         now_ms: i64,
     ) -> Table<'a> {
         let q = &report.query;
-        let mut cols = vec![Col::Period];
-        match q.period {
-            TokenPeriod::Block => cols.push(Col::Kind),
-            TokenPeriod::Session => cols.push(Col::Project),
-            TokenPeriod::Day | TokenPeriod::Month => {}
+        let one_session = q.session.is_some();
+        let mut cols = Vec::new();
+        if !one_session {
+            cols.push(Col::Period);
+            match q.period {
+                TokenPeriod::Block => cols.push(Col::Kind),
+                TokenPeriod::Session => cols.push(Col::Project),
+                TokenPeriod::Day | TokenPeriod::Month => {}
+            }
         }
+        let lead = cols.first().copied().unwrap_or(Col::Account);
         cols.push(Col::Account);
         if matches!(
             q.applied_grouping(),
@@ -334,6 +348,7 @@ impl<'a> Table<'a> {
             report,
             widths,
             cols: cols.into_iter().map(|c| (c, 0)).collect(),
+            lead,
             level: 0,
             most,
             color,
@@ -402,47 +417,91 @@ impl<'a> Table<'a> {
 
     /// Lays the columns out in `width` (B17, B24). The numbers take their widest and are never
     /// cut. The period takes the fullest form of its spans that leaves each text column its
-    /// least (`TEXT_MIN`, `PROJECT_MIN`, or its own width when that is less). The text columns
-    /// share what is left, each its own width or an equal share of the rest, narrowest first,
-    /// and are cut by display width. Where even the most compact period leaves the text columns
-    /// no column each, the period is cut too; a number never is.
+    /// least: the model its whole value up to `MODEL_KEEP`, the account `TEXT_MIN` and the
+    /// project `PROJECT_MIN` (or its own width when that is less). Where no form does, the
+    /// project gives way first and is left out. Where still none does, the most compact period
+    /// is used, and the account gives way to `ACCOUNT_LEAST` and the model to one column, and
+    /// the period itself is cut when that leaves the text columns no more. What is left over then
+    /// goes, in turn, to the model up to `MODEL_KEEP`, the account, the project, and the model
+    /// beyond `MODEL_KEEP`, and the text columns are cut by display width to what they got. A
+    /// number is never cut.
     fn fit(&mut self, width: usize) {
-        let gaps = 1 + 2 * self.cols.len().saturating_sub(1);
-        let fixed: usize = self
-            .cols
-            .iter()
-            .filter(|(c, _)| !c.text() && *c != Col::Period)
-            .map(|(c, _)| self.widest(*c))
-            .sum();
-        let texts: Vec<usize> = (0..self.cols.len())
-            .filter(|&i| self.cols[i].0.text())
-            .collect();
-        let least: usize = texts
+        let periods = self.found().periods;
+        let period_on = self.cols.iter().any(|(c, _)| *c == Col::Period);
+        let least = |t: &Table, col: Col| match col {
+            Col::Model => t.widest(col).min(MODEL_KEEP),
+            Col::Project => t.widest(col).min(PROJECT_MIN),
+            _ => t.widest(col).min(TEXT_MIN),
+        };
+        let squeezed = |t: &Table, col: Col| match col {
+            Col::Model => t.widest(col).min(1),
+            _ => t.widest(col).min(ACCOUNT_LEAST),
+        };
+        let (level, tight, gaps, fixed, texts, floors) = loop {
+            let gaps = 1 + 2 * self.cols.len().saturating_sub(1);
+            let fixed: usize = self
+                .cols
+                .iter()
+                .filter(|(c, _)| !c.text() && *c != Col::Period)
+                .map(|(c, _)| self.widest(*c))
+                .sum();
+            let texts: Vec<usize> = (0..self.cols.len())
+                .filter(|&i| self.cols[i].0.text())
+                .collect();
+            let wanted: usize = texts.iter().map(|&i| least(self, self.cols[i].0)).sum();
+            let level = (0..SPAN_LEVELS).find(|&l| {
+                let period = if period_on { periods[l] } else { 0 };
+                fixed + gaps + period + wanted <= width
+            });
+            match (
+                level,
+                self.cols.iter().position(|(c, _)| *c == Col::Project),
+            ) {
+                (None, Some(at)) => {
+                    self.cols.remove(at);
+                }
+                (Some(level), _) => break (level, false, gaps, fixed, texts, wanted),
+                (None, None) => {
+                    let squeezed = texts.iter().map(|&i| squeezed(self, self.cols[i].0)).sum();
+                    break (SPAN_LEVELS - 1, true, gaps, fixed, texts, squeezed);
+                }
+            }
+        };
+        self.level = level;
+        let period = if period_on {
+            periods[level].min(width.saturating_sub(fixed + gaps + floors))
+        } else {
+            0
+        };
+        let mut room = width.saturating_sub(fixed + gaps + period);
+        let mut got: Vec<usize> = texts
             .iter()
             .map(|&i| {
                 let col = self.cols[i].0;
-                let floor = if col == Col::Project {
-                    PROJECT_MIN
+                if tight {
+                    squeezed(self, col)
                 } else {
-                    TEXT_MIN
-                };
-                self.widest(col).min(floor)
+                    least(self, col)
+                }
             })
-            .sum();
-        let periods = self.found().periods;
-        self.level = (0..SPAN_LEVELS)
-            .find(|&l| fixed + gaps + periods[l] + least <= width)
-            .unwrap_or(SPAN_LEVELS - 1);
-        let period = periods[self.level].min(width.saturating_sub(fixed + gaps + texts.len()));
-        let mut room = width.saturating_sub(fixed + gaps + period);
-        let mut order = texts.clone();
-        order.sort_by_key(|&i| self.widest(self.cols[i].0));
-        let mut left = order.len();
-        for i in order {
-            let w = self.widest(self.cols[i].0).min(room / left.max(1));
-            self.cols[i].1 = w;
-            room -= w;
-            left -= 1;
+            .collect();
+        room = room.saturating_sub(got.iter().sum());
+        let steps = [
+            (Col::Model, MODEL_KEEP),
+            (Col::Account, usize::MAX),
+            (Col::Project, usize::MAX),
+            (Col::Model, usize::MAX),
+        ];
+        for (col, up_to) in steps {
+            if let Some(n) = texts.iter().position(|&i| self.cols[i].0 == col) {
+                let want = self.widest(col).min(up_to);
+                let add = want.saturating_sub(got[n]).min(room);
+                got[n] += add;
+                room -= add;
+            }
+        }
+        for (n, &i) in texts.iter().enumerate() {
+            self.cols[i].1 = got[n];
         }
         for i in 0..self.cols.len() {
             let col = self.cols[i].0;
@@ -526,7 +585,7 @@ impl<'a> Table<'a> {
     fn total_cell(&self, col: Col) -> Cell {
         let t = &self.report.total;
         match col {
-            Col::Period => Cell::plain("TOTAL"),
+            _ if col == self.lead => Cell::plain("TOTAL"),
             Col::Kind | Col::Project | Col::Account | Col::Model | Col::Bar => Cell::plain(""),
             Col::Cost => self.cost_cell(t.cost.as_ref()),
             _ => self.counts_cell(col, &t.counts, t.unfinalized, t.responses),
@@ -1687,6 +1746,116 @@ mod tests {
         );
     }
 
+    /// Answers the report query among `cmds` with `rows`.
+    fn answer_with(state: &mut State, cmds: &[Cmd], rows: Vec<TokenRow>) {
+        let [Cmd::LoadReport { r#gen, query }] = cmds else {
+            panic!("{cmds:?}");
+        };
+        let result = Ok(token_report(query.clone(), rows));
+        update(
+            state,
+            Msg::TokenReport {
+                r#gen: *r#gen,
+                result,
+            },
+            NOW_MS,
+        );
+    }
+
+    /// Real-format model IDs, the longest 26 columns.
+    const MODELS: [&str; 3] = [
+        "claude-opus-4-5-20251101",
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5-20251001",
+    ];
+
+    fn me() -> RowAccount {
+        RowAccount::Account {
+            id: id(1),
+            position: 1,
+            label: "michael@example.com".into(),
+            alias: None,
+        }
+    }
+
+    fn work_session() -> PeriodKey {
+        PeriodKey::Session {
+            session_id: "3f2a9c1d-7e44-4b1a-9c55-0d1e2f3a4b5c".into(),
+            project: Some("/Users/michael/Code/tagteam".into()),
+            first_ms: YESTERDAY + 9 * HOUR_MS + 12 * 60_000,
+            last_ms: YESTERDAY + 11 * HOUR_MS + 40 * 60_000,
+        }
+    }
+
+    /// One row of `work_session` for each of `MODELS`.
+    fn work_models() -> Vec<TokenRow> {
+        MODELS
+            .iter()
+            .map(|m| {
+                let counts = counts(400_000, 100_000, 30_000_000);
+                token_row(
+                    work_session(),
+                    Some(me()),
+                    Some(m),
+                    counts,
+                    Some(13_000_000_000),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_sessions_models_read_whole_at_80_columns_without_the_period_and_the_project() {
+        let counts = counts(1_200_000, 310_000, 88_000_000);
+        let day_row = token_row(day(1), Some(me()), None, counts, Some(41_200_000_000));
+        let mut state = showing(vec![day_row], |_| {});
+        for rows in [
+            vec![token_row(work_session(), Some(me()), None, counts, None)],
+            work_models(),
+        ] {
+            let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+            answer_with(&mut state, &down, rows);
+        }
+        assert_eq!(state.tokens.depth(), 2);
+        let lines = draw(&state, 80, 24);
+        assert!(
+            lines[4].starts_with(" ACCOUNT"),
+            "the period and the project are the same on every row: {lines:?}"
+        );
+        for model in MODELS {
+            assert!(
+                lines.iter().any(|l| l.contains(&format!("  {model}  "))),
+                "{model} whole: {lines:?}"
+            );
+        }
+        assert!(lines[8].starts_with(" TOTAL"), "{lines:?}");
+        assert!(lines[8].contains("1.2M"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_sessions_by_account_and_model_keep_their_models_apart_at_80_columns() {
+        // The project gives way before the account, and the account before the model is cut.
+        let mut state = fresh(Screen::Tokens);
+        state.start();
+        let mut last = vec![];
+        for c in "ppgg".chars() {
+            last = update(&mut state, ch(c), NOW_MS);
+        }
+        answer_with(&mut state, &last, work_models());
+        let lines = draw(&state, 80, 24);
+        assert!(
+            !lines[4].contains("PROJECT"),
+            "the project gave way first: {lines:?}"
+        );
+        for model in MODELS {
+            assert!(
+                lines[5..8].iter().any(|l| l.contains(model)),
+                "{model} whole: {lines:?}"
+            );
+        }
+        assert!(lines[5].contains(" 1 mich…  "), "{lines:?}");
+    }
+
     #[test]
     fn the_cache_write_is_one_column_where_its_halves_do_not_fit() {
         let mut rows = days();
@@ -1805,8 +1974,9 @@ mod tests {
     #[test]
     fn every_required_value_shows_whole_at_80_columns_in_the_widest_report() {
         // Spec §5.3 at 80 columns: the period, account, model, input, output, total and cost
-        // always show. The numbers are never cut; the span compacts (B24), and the names give
-        // way, cut by display width.
+        // show. The numbers are never cut; the span compacts to its start and the project goes
+        // (the detail has both), the account gives way to its position, and the model, which
+        // is cut last, by display width (B24).
         let state = widest();
         let lines = draw(&state, 80, 24);
         let head = lines
@@ -1815,37 +1985,35 @@ mod tests {
             .unwrap();
         assert_eq!(
             lines[head],
-            " SESSION               PROJE…  ACCOU…  MODEL   INPUT  OUTPUT  TOTAL         COST"
+            " SESSION      AC…  MODEL                       INPUT  OUTPUT  TOTAL         COST"
         );
         let big = &lines[head + 1];
-        for value in [
-            "09-20 09:12–11:40+1d",
-            "9.9B",
-            "≥1.2B",
-            "16.7B",
-            "≥$123456.79",
-        ] {
+        for value in ["09-20 09:12", "9.9B", "≥1.2B", "16.7B", "≥$123456.79"] {
             assert!(big.contains(value), "{value} in {big:?}");
         }
         assert!(
-            big.contains(" 3 山…"),
+            big.contains(" 3 …"),
             "the account by position, cut: {big:?}"
         );
-        assert!(big.contains("claud…"), "the model, cut: {big:?}");
-        assert!(big.contains("…nuals"), "the project keeps its end: {big:?}");
+        assert!(
+            big.contains("claude-opus-5-5-with-a-ve…"),
+            "the model, cut last: {big:?}"
+        );
+        assert!(!lines[head].contains("PROJ"), "the project gave way first");
         let small = &lines[head + 2];
-        assert!(small.contains("09-20 09:00–10:00"), "{small:?}");
+        assert!(small.contains("09-20 09:00"), "{small:?}");
         let total = &lines[head + 3];
         for value in ["9.9B", "≥1.2B", "16.7B", "≥$123456.80"] {
             assert!(total.contains(value), "{value} in {total:?}");
         }
-        // At 120 the cache, the responses and the bar take room, and the span drops its years;
-        // wider still, it shows them.
+        // At 120 the cache, the responses and the bar take room, and the span is cut to its
+        // start, with the model whole to 30 columns; wider still, it shows the span and the years.
         let at_120 = draw(&state, 120, 40);
         assert!(
             at_120
                 .iter()
-                .any(|l| l.contains(" 09-20 09:12–09-21 11:40  ")),
+                .any(|l| l.contains(" 09-20 09:12  3 ")
+                    && l.contains("claude-opus-5-5-with-a-very-l…")),
             "{at_120:?}"
         );
         let at_160 = draw(&state, 160, 40);
@@ -2048,7 +2216,10 @@ mod tests {
                 " UTC · refreshed 14:12",
             ]
         );
-        assert!(lines[4].starts_with(" SESSION"), "{lines:?}");
+        assert!(
+            lines[4].starts_with(" ACCOUNT"),
+            "one session's models share the period and the project, which the rows leave out: {lines:?}"
+        );
     }
 
     #[test]
