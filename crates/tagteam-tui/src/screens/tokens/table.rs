@@ -703,7 +703,8 @@ fn figures(row: &TokenRow, now_ms: i64) -> Option<Vec<String>> {
 enum Item {
     /// A report row; `repeat` when its period is the row's before it.
     Row { repeat: bool },
-    /// A line of the active block's figures under its row.
+    /// A line of the active block's figures under its row; a block's rows by model have them
+    /// under the first only.
     Figures(Line<'static>),
 }
 
@@ -715,7 +716,8 @@ fn items(report: &TokenReport, width: usize, now_ms: i64) -> (Vec<(usize, Item)>
         starts.push(items.len());
         let repeat = index > 0 && report.rows[index - 1].period == row.period;
         items.push((index, Item::Row { repeat }));
-        if let Some(parts) = figures(row, now_ms) {
+        let parts = figures(row, now_ms).filter(|_| !repeat);
+        if let Some(parts) = parts {
             let head = vec![Span::raw(" ".repeat(FIGURES_INDENT))];
             for line in laid_out(head, &parts, " · ", FIGURES_INDENT, width) {
                 items.push((index, Item::Figures(line)));
@@ -1408,6 +1410,24 @@ mod tests {
             " TOTAL                                   400.0K   50.0K   5.5M  $5.00",
             "no longer active, until the query its end asks for returns"
         );
+    }
+
+    #[test]
+    fn the_active_blocks_figures_show_once_under_the_first_of_its_model_rows() {
+        let mut rows = vec![block(NOON, true), block(NOON, true)];
+        rows[0].model = Some("claude-opus-4-5-20251101".into());
+        rows[1].model = Some("claude-sonnet-4-5-20250929".into());
+        let state = showing_after("pppg", rows);
+        let lines = draw(&state, 80, 24);
+        let at = |f: fn(&String) -> bool| -> Vec<usize> {
+            (0..lines.len()).filter(|&i| f(&lines[i])).collect()
+        };
+        let figures = at(|l| l.starts_with("   active"));
+        let rows = at(|l| l.contains("400.0K"));
+        assert_eq!(rows.len(), 2, "{lines:?}");
+        assert_eq!(figures.len(), 1, "once for the block: {lines:?}");
+        assert_eq!(figures[0], rows[0] + 1, "under the first row: {lines:?}");
+        assert!(rows[1] > figures[0], "{lines:?}");
     }
 
     #[test]
