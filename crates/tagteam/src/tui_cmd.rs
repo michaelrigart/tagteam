@@ -72,7 +72,13 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
         probe.settings().color,
         true,
     );
+    // Spec §5.3: Tokens reports on `--provider`'s provider, else the default, in the system
+    // zone, which is read here so that the UI thread reads no zone file (B6).
+    let tokens_provider = provider
+        .clone()
+        .unwrap_or_else(|| probe.default_provider().clone());
     drop(probe);
+    let tz = jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC);
     // §7.3: Ctrl-\ belongs to a foreground session, and the TUI survives it for its whole life.
     if let Err(e) = signals::survive_quit() {
         let _ = writeln!(
@@ -96,6 +102,8 @@ pub(crate) fn run(cli: &Cli, ctx: Context) -> i32 {
         screen,
         color,
         provider: provider.clone(),
+        tokens_provider,
+        tz,
         signal: ctx.env.cancel.clone(),
         shutdown,
     };

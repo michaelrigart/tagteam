@@ -183,12 +183,17 @@ pub(crate) fn furthest_scroll(heights: &[usize], rows: usize) -> usize {
     from.min(heights.len().saturating_sub(1))
 }
 
-/// The banner's text, and whether it is an error: a failed read (spec §10.4) first, else what
-/// the accounts view has to say (a run shell, an unmanaged live login).
+/// The banner's text, and whether it is an error: a failed read (spec §10.4) first, then on
+/// Tokens a failed token read (B12), else what the accounts view has to say (a run shell, an
+/// unmanaged live login).
 pub(crate) fn banner(state: &State) -> Option<(String, bool)> {
-    match &state.banner {
-        Some(error) => Some((error.clone(), true)),
-        None => screens::accounts::banner(&state.accounts).map(|text| (text, false)),
+    let tokens = (state.screen == Screen::Tokens)
+        .then(|| state.tokens.error())
+        .flatten();
+    match (&state.banner, tokens) {
+        (Some(error), _) => Some((error.clone(), true)),
+        (None, Some(error)) => Some((error.to_owned(), true)),
+        (None, None) => screens::accounts::banner(&state.accounts).map(|text| (text, false)),
     }
 }
 
@@ -250,6 +255,7 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
     }
     match state.screen {
         Screen::Accounts => screens::accounts::render(state, frame, areas.body, now_ms),
+        Screen::Tokens => screens::tokens::render(state, frame, areas.body, now_ms),
         Screen::History => screens::history::render(state, frame, areas.body, now_ms),
     }
     frame.render_widget(
@@ -259,11 +265,13 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
     actions::render_overlay(state, frame, now_ms);
 }
 
-/// ` tagteam  [1 Accounts]  3 History` on the left, the mode and `? help` on the right.
+/// ` tagteam  [1 Accounts]  2 Tokens  3 History` on the left, the mode and `? help` on the
+/// right.
 fn header(state: &State, width: u16) -> Line<'static> {
     let mut spans = vec![Span::styled(" tagteam", bold())];
     for (screen, label) in [
         (Screen::Accounts, "1 Accounts"),
+        (Screen::Tokens, "2 Tokens"),
         (Screen::History, "3 History"),
     ] {
         spans.push(Span::raw("  "));
@@ -302,9 +310,10 @@ fn footer(state: &State, width: u16, now_ms: i64) -> Vec<Line<'static>> {
         let frame = SPINNER[(now_ms.div_euclid(250)).rem_euclid(10) as usize];
         return vec![Line::from(format!("{frame} {}…", action.name()))];
     }
-    let keys: &[(&str, &str)] = match state.screen {
-        Screen::Accounts => &ACCOUNTS_KEYS,
-        Screen::History => &HISTORY_KEYS,
+    let keys: Vec<(&str, &str)> = match state.screen {
+        Screen::Accounts => ACCOUNTS_KEYS.to_vec(),
+        Screen::Tokens => screens::tokens::footer_keys(&state.tokens),
+        Screen::History => HISTORY_KEYS.to_vec(),
     };
     let mut text = String::new();
     for (key, what) in keys {
@@ -441,12 +450,12 @@ mod tests {
     fn the_header_shows_the_tabs_and_the_mode_and_the_footer_the_screens_keys() {
         let state = fresh(Screen::Accounts);
         let lines = draw(&state, 80, 24);
-        // 33 columns of tabs, 24 of gap, and the mode and `? help` up to the last column.
+        // 43 columns of tabs, 14 of gap, and the mode and `? help` up to the last column.
         assert_eq!(
             lines[0],
             format!(
-                " tagteam  [1 Accounts]  3 History{}○ refresh 30s   ? help",
-                " ".repeat(24)
+                " tagteam  [1 Accounts]  2 Tokens  3 History{}○ refresh 30s   ? help",
+                " ".repeat(14)
             )
         );
         assert_eq!(
@@ -463,11 +472,20 @@ mod tests {
         assert_eq!(
             history[0],
             format!(
-                " tagteam  1 Accounts  [3 History]{}○ refresh 30s   ? help",
-                " ".repeat(24)
+                " tagteam  1 Accounts  2 Tokens  [3 History]{}○ refresh 30s   ? help",
+                " ".repeat(14)
             )
         );
         assert_eq!(history[23], "j/k account  [ ] range  r refresh  1 accounts");
+        let tokens = draw(&fresh(Screen::Tokens), 80, 24);
+        assert_eq!(
+            tokens[0],
+            format!(
+                " tagteam  1 Accounts  [2 Tokens]  3 History{}○ refresh 30s   ? help",
+                " ".repeat(14)
+            )
+        );
+        assert_eq!(tokens[23], "p period  g group  [ ] range  Esc back");
     }
 
     #[test]
