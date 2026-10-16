@@ -7,6 +7,8 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+## [20261016.2230.0] - 2026-10-16
+
 ### Added
 
 - `tagteam tokens`: token use and its API-equivalent cost from Claude Code's transcripts, by
@@ -138,7 +140,8 @@ First release. tagteam is a multi-account switcher for Claude Code on macOS and 
   `tagteam` crate on crates.io (`cargo install tagteam --locked`) with the internal
   `tagteam-*` crates it depends on.
 
-[Unreleased]: https://github.com/michaelrigart/tagteam/compare/v20261014.2045.0...HEAD
+[Unreleased]: https://github.com/michaelrigart/tagteam/compare/v20261016.2230.0...HEAD
+[20261016.2230.0]: https://github.com/michaelrigart/tagteam/compare/v20261014.2045.0...v20261016.2230.0
 [20261014.2045.0]: https://github.com/michaelrigart/tagteam/compare/v20261014.1500.0...v20261014.2045.0
 [20261014.1500.0]: https://github.com/michaelrigart/tagteam/compare/v20261013.2030.0...v20261014.1500.0
 [20261013.2030.0]: https://github.com/michaelrigart/tagteam/releases/tag/v20261013.2030.0
