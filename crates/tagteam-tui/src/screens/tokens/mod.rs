@@ -3,6 +3,7 @@
 //! session to its models. Every query runs on the report lane (§4.3), never on the UI thread,
 //! and the index's catch-up on the index lane (`index`).
 
+pub mod filter;
 pub mod index;
 mod table;
 
@@ -363,6 +364,7 @@ pub fn footer_keys(state: &TokensState) -> Vec<(&'static str, &'static str)> {
     keys.extend([
         ("p", "period"),
         ("g", "group"),
+        ("f", "filter"),
         ("[ ]", "range"),
         ("Esc", "back"),
         ("r", "refresh"),
@@ -370,9 +372,9 @@ pub fn footer_keys(state: &TokensState) -> Vec<(&'static str, &'static str)> {
     keys
 }
 
-/// The Tokens screen's keys (spec §5.6): `p` period, `g` group, `[` `]` range, `Enter` down a
-/// level, `Esc`/`Backspace` up one, the rows, which keep the selected one in view, and `J`/`K`,
-/// which scroll what lies below the total (B25).
+/// The Tokens screen's keys (spec §5.6): `p` period, `g` group, `f` filter, `[` `]` range,
+/// `Enter` down a level, `Esc`/`Backspace` up one, the rows, which keep the selected one in view,
+/// and `J`/`K`, which scroll what lies below the total (B25).
 pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     let body = crate::view::body_at(state);
     let page = table::page(state, body, now_ms).max(1) as isize;
@@ -414,6 +416,7 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
             t.reset();
             return load(state, now_ms);
         }
+        KeyCode::Char('f') => return filter::open(state),
         KeyCode::Char('J') | KeyCode::Char('K') => {
             let by = if key.code == KeyCode::Char('J') {
                 1
@@ -833,6 +836,7 @@ mod tests {
             "back up a level",
             "refresh the token index",
             "scroll the detail and the notes",
+            "filter accounts and models",
         ] {
             assert!(lines.iter().any(|l| l.contains(what)), "{what}: {lines:?}");
         }
@@ -843,7 +847,7 @@ mod tests {
         let mut state = showing_days();
         assert_eq!(
             draw(&state, 80, 24)[23],
-            "Enter sessions  p period  g group  [ ] range  Esc back  r refresh"
+            "Enter sessions  p period  g group  f filter  [ ] range  Esc back  r refresh"
         );
         let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
         answer(&mut state, &down, vec![session("s1", 1)]);

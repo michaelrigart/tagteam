@@ -243,6 +243,10 @@ impl Lanes {
                             r#gen,
                             result: source.token_index_state(&provider),
                         },
+                        ReportReq::Inventory { r#gen, query } => Msg::Inventory {
+                            r#gen,
+                            result: source.token_report(&query),
+                        },
                     };
                     let _ = out.send(msg);
                 },
@@ -521,6 +525,10 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
                 }
                 Cmd::RefreshIndex { provider } => {
                     let _ = self.lanes.index.submit(IndexReq::Refresh { provider });
+                }
+                Cmd::LoadInventory { r#gen, query } => {
+                    let req = ReportReq::Inventory { r#gen, query };
+                    let _ = self.lanes.report.submit(req);
                 }
                 Cmd::Act(action) => {
                     let _ = self.lanes.actions.submit(ActionsReq::Act { action });
