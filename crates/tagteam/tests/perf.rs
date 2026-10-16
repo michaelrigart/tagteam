@@ -1,7 +1,8 @@
 //! §1.1's timing targets through the real binary: `statusline` within 10 ms p95, `list` within
 //! 50 ms p95 when no usage fetch is due, alone and while a daemon runs against the same store
 //! (D1.1 criterion 3, D12), and the TUI's first frame within 50 ms p95 under the same
-//! conditions (TUI spec §1.1), with the token index caught up or not. Timings mean something
+//! conditions (TUI spec §1.1), with the token index caught up or not, and beside a daemon that
+//! answers or one that never does. Timings mean something
 //! only in an optimized build on an idle machine, so this file exists only in release builds
 //! and its tests are ignored by default. The TUI's opens a pseudo-terminal, so run them
 //! outside a sandbox:
@@ -12,9 +13,11 @@
 mod common;
 
 use std::fs::File;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use common::pty::{Pty, Screen};
@@ -23,6 +26,7 @@ use common::{
     short_tempdir, std_cmd, turn, two_fresh_accounts, usage_window, write_transcript,
 };
 use tagteam_core::{Window, WindowKind};
+use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_provider::Env;
 use tagteam_provider::mock_server::MockServer;
 
@@ -555,5 +559,77 @@ fn list_p95_is_within_50_ms_when_nothing_is_due_while_a_daemon_runs() {
     assert!(
         p <= Duration::from_millis(50),
         "list p95 while a daemon runs {p:?} over {RUNS} runs: {runs:?}"
+    );
+}
+
+/// The TUI's first frame, from the spawn to the arrival of the bytes that first put the
+/// accounts table on the screen, through a pty, over `RUNS` runs after `WARM_UP` untimed ones,
+/// with every endpoint pointed at `base`.
+fn first_frames(root: &Path, base: &str) -> Vec<Duration> {
+    let shown = |s: &Screen| s.on_alt() && s.contains("a@x.co");
+    let run = || {
+        let mut c = std_cmd(root);
+        c.env("TAGTEAM_TEST_API_BASE", base).arg("tui");
+        let mut tui = Pty::spawn(c, true);
+        tui.wait_for(Duration::from_secs(10), "the accounts table", shown);
+        let took = tui.first_shown(shown).unwrap() - tui.started;
+        tui.type_keys(b"q");
+        let f = tui.finish(Duration::from_secs(10));
+        assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+        took
+    };
+    for _ in 0..WARM_UP {
+        run();
+    }
+    (0..RUNS).map(|_| run()).collect()
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn tui_first_frame_p95_is_within_50_ms_while_a_daemon_runs() {
+    // TUI spec §1.1 criterion 2, §8: the live thread connects and subscribes beside the first
+    // frame, which never waits for it; the TUI goes live after it.
+    let _one_at_a_time = serial();
+    let d = short_tempdir();
+    nothing_due(d.path());
+    let server = MockServer::start();
+    let daemon = start_daemon(d.path(), &server.base_url());
+    let runs = first_frames(d.path(), &server.base_url());
+    stop(daemon);
+    let p = p95(&runs);
+    eprintln!("tui first frame while a daemon runs p95 {p:?} over {RUNS} runs");
+    assert_eq!(server.requests().len(), 0, "a fetch was due");
+    assert!(
+        p <= Duration::from_millis(50),
+        "tui first frame while a daemon runs p95 {p:?} over {RUNS} runs: {runs:?}"
+    );
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn tui_first_frame_p95_is_within_50_ms_beside_a_daemon_that_never_answers() {
+    // TUI spec §1.1 criteria 2 and 3: a socket that accepts and never greets holds the live
+    // thread for the 250 ms greeting bound (D5.7), never the first frame.
+    let _one_at_a_time = serial();
+    let d = short_tempdir();
+    nothing_due(d.path());
+    let listener = UnixListener::bind(daemon_socket_path(&Env::for_test(d.path()))).unwrap();
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            match stream {
+                Ok(stream) => held.push(stream),
+                Err(_) => return,
+            }
+        }
+    });
+    let server = MockServer::start();
+    let runs = first_frames(d.path(), &server.base_url());
+    let p = p95(&runs);
+    eprintln!("tui first frame beside a silent daemon p95 {p:?} over {RUNS} runs");
+    assert_eq!(server.requests().len(), 0, "a fetch was due");
+    assert!(
+        p <= Duration::from_millis(50),
+        "tui first frame beside a silent daemon p95 {p:?} over {RUNS} runs: {runs:?}"
     );
 }

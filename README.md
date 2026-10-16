@@ -213,6 +213,9 @@ tagteam config set daemon.autoswitch false   # pause
 tagteam config set daemon.autoswitch true    # resume
 ```
 
+In the TUI, `P` pauses or resumes it for the selected account's provider, and the header says
+`auto paused` or `auto on`.
+
 While the daemon switches a provider, `tagteam auto` refuses to run for it and says so. Pause
 the daemon first if you want `auto` in a terminal.
 
