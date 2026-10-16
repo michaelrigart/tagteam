@@ -634,6 +634,9 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use tagteam_core::AccountId;
+    use tagteam_engine::tokens::{
+        IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport,
+    };
     use tagteam_engine::views::HistoryView;
 
     use super::*;
@@ -790,6 +793,30 @@ mod tests {
                 warnings: Vec::new(),
             })
         }
+
+        fn refresh_tokens(
+            &self,
+            _provider: &ProviderId,
+            _progress: &mut dyn FnMut(&IndexProgress),
+        ) -> Result<RefreshOutcome, SourceError> {
+            Ok(RefreshOutcome::Busy)
+        }
+
+        fn token_report(&self, _query: &TokenQuery) -> Result<TokenReport, SourceError> {
+            Err(no_tokens())
+        }
+
+        fn token_index_state(&self, _provider: &ProviderId) -> Result<IndexState, SourceError> {
+            Ok(IndexState::default())
+        }
+    }
+
+    /// What a test source with no token report answers a report query with.
+    fn no_tokens() -> SourceError {
+        SourceError {
+            kind: "test".into(),
+            message: "no token report in this test".into(),
+        }
     }
 
     fn sources(delay: Duration, panics: bool, drops: &Arc<AtomicUsize>) -> SourceFactory {
@@ -837,6 +864,22 @@ mod tests {
                 warnings: Vec::new(),
             })
         }
+
+        fn refresh_tokens(
+            &self,
+            _provider: &ProviderId,
+            _progress: &mut dyn FnMut(&IndexProgress),
+        ) -> Result<RefreshOutcome, SourceError> {
+            Ok(RefreshOutcome::Busy)
+        }
+
+        fn token_report(&self, _query: &TokenQuery) -> Result<TokenReport, SourceError> {
+            Err(no_tokens())
+        }
+
+        fn token_index_state(&self, _provider: &ProviderId) -> Result<IndexState, SourceError> {
+            Ok(IndexState::default())
+        }
     }
 
     fn one_account(delay: Duration, frames: &Log) -> SourceFactory {
@@ -868,6 +911,19 @@ mod tests {
                 }
                 fn collect_due(&self, _: &[AccountId]) -> Result<CollectSummary, SourceError> {
                     unreachable!("nothing is collected")
+                }
+                fn refresh_tokens(
+                    &self,
+                    _: &ProviderId,
+                    _: &mut dyn FnMut(&IndexProgress),
+                ) -> Result<RefreshOutcome, SourceError> {
+                    unreachable!("the token index is refreshed after the first frame")
+                }
+                fn token_report(&self, _: &TokenQuery) -> Result<TokenReport, SourceError> {
+                    unreachable!("no token report is read")
+                }
+                fn token_index_state(&self, _: &ProviderId) -> Result<IndexState, SourceError> {
+                    unreachable!("no token index state is read")
                 }
             }
             Box::new(Signalled(signal.clone())) as Box<dyn Source>

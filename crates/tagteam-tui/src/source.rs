@@ -1,5 +1,5 @@
 //! The read port (TUI spec §4.4): what the screens show, read from the engine on a lane's own
-//! thread, never on the UI thread.
+//! thread, never on the UI thread, and the token index's catch-up (§6.4).
 
 use std::sync::Arc;
 
@@ -7,6 +7,9 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::Engine;
 use tagteam_engine::collect::{CollectMode, Collected};
 use tagteam_engine::error::EngineError;
+use tagteam_engine::tokens::{
+    IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport, Wait,
+};
 use tagteam_engine::views::{HistoryView, ProviderAccounts, ShellAccount, StatusView};
 use tagteam_provider::RunShell;
 /// A read that failed, in the CLI's own words (`kind` is the JSON `error.type`).
@@ -48,6 +51,18 @@ pub trait Source {
     fn accounts(&self, provider: Option<&ProviderId>) -> Result<AccountsSnapshot, SourceError>;
     fn history(&self, account: &AccountId, since_s: i64) -> Result<HistoryView, SourceError>;
     fn collect_due(&self, accounts: &[AccountId]) -> Result<CollectSummary, SourceError>;
+    /// The token index's catch-up (token report §5), on the index lane: `Busy` at once while
+    /// another process refreshes, and stopped at its next chunk by the shutdown token (§9).
+    fn refresh_tokens(
+        &self,
+        provider: &ProviderId,
+        progress: &mut dyn FnMut(&IndexProgress),
+    ) -> Result<RefreshOutcome, SourceError>;
+    /// The token report (token report §10), on the report lane. It only reads.
+    fn token_report(&self, query: &TokenQuery) -> Result<TokenReport, SourceError>;
+    /// The index's state alone (token report §10): a few small reads, for deciding whether to
+    /// query again (§6.4).
+    fn token_index_state(&self, provider: &ProviderId) -> Result<IndexState, SourceError>;
 }
 
 /// Builds one `Source` inside the thread that will use it, so neither `Engine` nor the
@@ -120,6 +135,25 @@ impl Source for EngineSource {
             warnings: report.warnings,
         })
     }
+
+    /// `Engine::refresh_tokens` as spec §9 has the TUI call it: `Wait::Try` and no budget, with
+    /// the engine's own cancel token, which is the shutdown token (§4.3).
+    fn refresh_tokens(
+        &self,
+        provider: &ProviderId,
+        progress: &mut dyn FnMut(&IndexProgress),
+    ) -> Result<RefreshOutcome, SourceError> {
+        let engine = &self.engine;
+        Ok(engine.refresh_tokens(provider, Wait::Try, None, engine.cancel(), progress)?)
+    }
+
+    fn token_report(&self, query: &TokenQuery) -> Result<TokenReport, SourceError> {
+        Ok(self.engine.token_report(query)?)
+    }
+
+    fn token_index_state(&self, provider: &ProviderId) -> Result<IndexState, SourceError> {
+        Ok(self.engine.token_index_state(provider)?)
+    }
 }
 
 /// Whether one account's collection changed what the views show (`Collected`): a reading was
@@ -177,6 +211,25 @@ mod tests {
             Ok(CollectSummary {
                 fetched: 0,
                 warnings: vec![self.0.into()],
+            })
+        }
+        fn refresh_tokens(
+            &self,
+            _: &ProviderId,
+            _: &mut dyn FnMut(&IndexProgress),
+        ) -> Result<RefreshOutcome, SourceError> {
+            Ok(RefreshOutcome::Busy)
+        }
+        fn token_report(&self, _: &TokenQuery) -> Result<TokenReport, SourceError> {
+            Err(SourceError {
+                kind: "token_report".into(),
+                message: self.0.into(),
+            })
+        }
+        fn token_index_state(&self, _: &ProviderId) -> Result<IndexState, SourceError> {
+            Err(SourceError {
+                kind: "token_index_state".into(),
+                message: self.0.into(),
             })
         }
     }
