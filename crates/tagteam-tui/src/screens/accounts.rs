@@ -1148,6 +1148,54 @@ mod tests {
             lines[label + 2].starts_with(&format!(" {:26}   40%  resets in 3d09h", "")),
             "{lines:?}"
         );
+        assert!(lines[label + 1].starts_with(" Claude Claude"), "{lines:?}");
+        assert!(lines[label + 2].contains("40%"), "{lines:?}");
+        assert!(lines[label + 2].contains("resets in 3d09h"), "{lines:?}");
+        let rest = lines[label + 2..].join(" ");
+        assert!(rest.contains("▲ ahead of pace (expected 20%)"), "{lines:?}");
+        assert!(
+            rest.contains("+1.5 pts/h · runs out in 1d00h (average)"),
+            "{lines:?}"
+        );
+        assert!(rest.contains(" usage: unavailable (http-429)"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_worst_live_stack_at_80_by_24_still_shows_a_long_labelled_window_whole() {
+        // A 2-row header, the activity line, a 3-row banner and a 3-row toast leave a 15-row
+        // body; the window's label, value, reset, pace, rate and trouble all fit in what is left.
+        let mut usage = with_windows(&["Opus"]);
+        usage.status = UsageStatus::Unavailable;
+        usage.error = Some("http-429".into());
+        usage.windows.as_mut().unwrap()[2].0.label = thousand();
+        let mut state = loaded(vec![account(1, "a@x.co", usage)]);
+        let mut locked = daemon_job("claude-code", "auto", true);
+        locked.backoff = Some(tagteam_daemon::protocol::StatusBackoff {
+            reason: "keychain".into(),
+            until: "2026-09-21T15:05:00Z".into(),
+        });
+        go_live(&mut state, daemon_status(vec![locked], vec![]));
+        let ev = tagteam_daemon::protocol::Event::Auto {
+            kind: "error".into(),
+            provider: "claude-code".into(),
+            raw: serde_json::json!({"event": "error", "ts": "2026-09-21T14:04:00Z", "message": "x".repeat(300)}),
+        };
+        update(&mut state, Msg::Live(crate::live::Live::Event(ev)), NOW_MS);
+        state.banner = Some(["the store could not be read"; 12].join("; "));
+        state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
+        for _ in 0..3 {
+            update(&mut state, ch('J'), NOW_MS);
+        }
+        let lines = draw(&state, 80, 24);
+        assert_eq!(lines.len(), 24, "{lines:?}");
+        assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
+        let label = lines
+            .iter()
+            .position(|l| l.starts_with(" Claude Claude"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(lines[label + 1].starts_with(" Claude Claude"), "{lines:?}");
+        assert!(lines[label + 2].contains("40%"), "{lines:?}");
+        assert!(lines[label + 2].contains("resets in 3d09h"), "{lines:?}");
         let rest = lines[label + 2..].join(" ");
         assert!(rest.contains("▲ ahead of pace (expected 20%)"), "{lines:?}");
         assert!(
