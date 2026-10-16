@@ -65,7 +65,7 @@ pub enum TextThen {
 
 /// The help panel's keys (spec §5.6): everywhere, then the current screen's.
 const HELP_GLOBAL: [(&str, &str); 7] = [
-    ("1 2 3  Tab  Shift-Tab", "screens"),
+    ("1 2 3  Tab Shift-Tab", "screens"),
     ("j k  ↑ ↓", "move"),
     ("A", "add the current login"),
     ("D", "doctor"),
@@ -849,6 +849,26 @@ mod tests {
     use crate::msg::Msg;
     use crate::testutil::*;
     use crate::update::update;
+
+    #[test]
+    fn every_help_line_shows_whole_on_every_screen_at_80_columns() {
+        // R21: the key column and the description both fit the help box.
+        for (screen, keys) in [
+            (Screen::Accounts, &HELP_ACCOUNTS[..]),
+            (Screen::Tokens, &HELP_TOKENS[..]),
+            (Screen::History, &HELP_HISTORY[..]),
+        ] {
+            let mut state = fresh(screen);
+            update(&mut state, ch('?'), NOW_MS);
+            let lines = draw(&state, 80, 24);
+            for (key, what) in HELP_GLOBAL.iter().chain(keys) {
+                assert!(
+                    lines.iter().any(|l| l.contains(key) && l.contains(what)),
+                    "{screen:?}: {key} {what}: {lines:?}"
+                );
+            }
+        }
+    }
 
     fn loaded(n: u32) -> State {
         let mut state = fresh(Screen::Accounts);
