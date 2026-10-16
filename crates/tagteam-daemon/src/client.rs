@@ -3,6 +3,7 @@
 //! whether a daemon is there and speaks this protocol (D1.1 criterion 5).
 
 use std::io::{self, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -204,6 +205,25 @@ impl Client {
 pub struct Events {
     lines: Lines,
     done: bool,
+}
+
+impl Events {
+    /// A handle that ends this stream from another thread: the iterator then ends, as when the
+    /// daemon closes the connection. Its read waits for as long as the daemon is silent, so a
+    /// caller that finds the daemon no longer answers (the TUI, by `status`) ends it this way.
+    pub fn closer(&self) -> io::Result<Closer> {
+        self.lines.stream.try_clone().map(Closer)
+    }
+}
+
+/// Ends an `Events` stream from another thread (`Events::closer`).
+#[derive(Debug)]
+pub struct Closer(UnixStream);
+
+impl Closer {
+    pub fn close(&self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
 }
 
 impl Iterator for Events {

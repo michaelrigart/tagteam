@@ -11,6 +11,7 @@ repository.workspace = true
 tagteam-core.workspace = true
 tagteam-provider.workspace = true
 tagteam-engine.workspace = true
+tagteam-daemon.workspace = true
 crossterm.workspace = true
 jiff.workspace = true
 libc.workspace = true
