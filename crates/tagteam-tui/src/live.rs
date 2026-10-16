@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -79,6 +80,7 @@ pub enum Delivery {
 pub struct LiveQueue {
     inner: Mutex<Inner>,
     cap: usize,
+    closed: AtomicBool,
     wake: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
@@ -95,6 +97,7 @@ impl LiveQueue {
                 link: None,
             }),
             cap: cap.max(1),
+            closed: AtomicBool::new(false),
             wake: Box::new(wake),
         }
     }
@@ -107,6 +110,9 @@ impl LiveQueue {
     /// Queues `live` for the UI thread, or, when the queue is full, drops what it holds for a
     /// single `Down`.
     pub fn push(&self, live: Live) -> Delivery {
+        if self.closed.load(Ordering::SeqCst) {
+            return Delivery::Gone;
+        }
         let mut inner = self.lock();
         let woken = inner.items.is_empty();
         let delivery = if inner.items.len() >= self.cap {
@@ -119,9 +125,16 @@ impl LiveQueue {
         };
         drop(inner);
         if woken && !(self.wake)() {
+            self.close();
             return Delivery::Gone;
         }
         delivery
+    }
+
+    /// The TUI no longer listens: every later push says `Gone`, whatever the queue holds, and the
+    /// live thread returns.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
     }
 
     /// Everything waiting, oldest first; the UI thread takes it at each wake.
@@ -228,7 +241,14 @@ fn attempt(path: &Path, queue: &LiveQueue, links: &mut u64) -> Attempt {
             Ok(events) => {
                 *links += 1;
                 let link = *links;
-                queue.hold(events.closer().ok().map(|closer| (link, closer)));
+                let Ok(closer) = events.closer() else {
+                    *links -= 1;
+                    return match queue.push(Live::Down) {
+                        Delivery::Gone => Attempt::Gone,
+                        Delivery::Taken | Delivery::Full => Attempt::Failed,
+                    };
+                };
+                queue.hold(Some((link, closer)));
                 let attempt = linked(events, link, queue);
                 queue.hold(None);
                 return attempt;
