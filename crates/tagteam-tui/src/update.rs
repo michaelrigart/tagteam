@@ -35,7 +35,9 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                     if state.quitting.is_some() {
                         return vec![];
                     }
-                    screens::history::on_accounts(state, now_ms)
+                    let mut cmds = screens::history::on_accounts(state, now_ms);
+                    cmds.extend(screens::tokens::index::on_accounts(state, now_ms));
+                    cmds
                 }
                 Err(e) => {
                     raise(state, BannerKind::Accounts, e.message);
@@ -92,6 +94,14 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
         Msg::TokenReport { r#gen, result } => {
             screens::tokens::on_report(state, r#gen, result, now_ms)
         }
+        Msg::IndexState { r#gen, result } => {
+            screens::tokens::index::on_index_state(state, r#gen, result, now_ms)
+        }
+        Msg::IndexProgress(progress) => {
+            screens::tokens::index::on_progress(state, progress);
+            vec![]
+        }
+        Msg::Refreshed { result } => screens::tokens::index::on_refreshed(state, result, now_ms),
         Msg::Prompt(prompt) => {
             state.dirty = true;
             actions::on_prompt(state, prompt);
@@ -116,18 +126,20 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
 }
 
 /// Spec §6.1: the TUI collects after drawing. The runtime calls this after each frame it
-/// draws. The first frame that shows accounts asks for the first collection of them, once no
-/// action holds the actions lane (spec §7.2); until a collection has been asked for,
-/// `gens.collect` is 0. The timer collects from then on (§6.2).
+/// draws. The first frame asks for the token index's first refresh (B5). The first frame that
+/// shows accounts asks for the first collection of them, once no action holds the actions lane
+/// (spec §7.2); until a collection has been asked for, `gens.collect` is 0. The timer collects
+/// from then on (§6.2).
 pub fn drawn(state: &mut State) -> Vec<Cmd> {
+    let mut cmds = screens::tokens::index::first_refresh(state);
     if state.gens.collect > 0 || state.quitting.is_some() || state.running.is_some() {
-        return vec![];
+        return cmds;
     }
     let shown = state.accounts.shown_ids();
-    if shown.is_empty() {
-        return vec![];
+    if !shown.is_empty() {
+        cmds.push(state.collect_due(shown));
     }
-    vec![state.collect_due(shown)]
+    cmds
 }
 
 /// A failed read's banner, remembering which kind raised it.
@@ -233,13 +245,15 @@ fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         state.shown_s = now_s;
         state.dirty = true;
     }
+    // Spec §6.4: the token index's own timers, while Tokens is open.
+    let mut cmds = screens::tokens::index::on_tick(state, now_ms);
     if state.quitting.is_some() || now_ms < state.refresh.next_ms {
-        return vec![];
+        return cmds;
     }
     // Spec §6.2: every 30 s the views are re-read, and the shown accounts offered to the
     // collector, unless an action holds the actions lane (spec §7.2).
     state.refresh.next_ms = now_ms + REFRESH_MS;
-    let mut cmds = vec![state.load_accounts()];
+    cmds.push(state.load_accounts());
     if state.screen == Screen::History {
         cmds.extend(screens::history::reload(state, now_ms));
     }
@@ -624,10 +638,15 @@ mod tests {
 
     #[test]
     fn the_first_frame_that_shows_accounts_asks_for_one_collection() {
-        // Spec §6.1: the TUI collects after drawing, not a timer's 30 s later.
+        // Spec §6.1: the TUI collects after drawing, not a timer's 30 s later. The first frame
+        // starts the token index's catch-up whatever it shows (B5).
         let mut state = fresh(Screen::Accounts);
         state.start();
-        assert!(drawn(&mut state).is_empty(), "`loading…` shows no accounts");
+        assert_eq!(
+            drawn(&mut state),
+            [Cmd::RefreshIndex { provider: cc() }],
+            "`loading…` shows no accounts"
+        );
         update(&mut state, accounts_msg(1, 0), NOW_MS);
         assert!(drawn(&mut state).is_empty(), "nor does the empty state");
         let Cmd::LoadAccounts { r#gen } = state.load_accounts() else {
@@ -652,6 +671,7 @@ mod tests {
         let mut state = fresh(Screen::Accounts);
         state.collect_due(vec![id(1)]);
         update(&mut state, accounts_msg(0, 1), NOW_MS);
+        assert_eq!(drawn(&mut state), [Cmd::RefreshIndex { provider: cc() }]);
         assert!(drawn(&mut state).is_empty());
     }
 
