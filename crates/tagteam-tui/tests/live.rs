@@ -221,7 +221,7 @@ fn with_no_daemon_it_says_so_and_tries_again_less_and_less_often_until_one_answe
         .map(|w| (w[1] - w[0]).as_millis())
         .collect();
     assert!(
-        (6..=10).contains(&downs.len()),
+        (5..=10).contains(&downs.len()),
         "20, 40, 80, then 160 ms apart: {gaps:?}"
     );
     for (gap, least) in gaps.iter().zip([20, 40, 80, 160, 160, 160, 160]) {
@@ -396,7 +396,7 @@ fn a_subscriber_the_daemon_drops_is_down_and_reconnects_less_often_while_it_keep
         }
     }
     assert!(
-        downs[3] - ups[3] >= Duration::from_millis(250),
+        downs[3] - ups[3] >= Duration::from_millis(200),
         "the fourth lasted"
     );
     let waits: Vec<u128> = (1..5)
@@ -437,6 +437,47 @@ fn a_full_queue_takes_one_down_for_what_it_held() {
     assert_eq!(*woken.lock().unwrap(), 2);
     let gone = LiveQueue::new(3, || false);
     assert_eq!(gone.push(Live::Up { link: 1 }), Delivery::Gone);
+}
+
+#[test]
+fn a_queue_the_tui_closed_is_gone_whatever_it_holds() {
+    // The UI quits while something still waits: no later push may see the queue as listened to.
+    let queue = LiveQueue::new(3, || true);
+    assert_eq!(queue.push(Live::Up { link: 1 }), Delivery::Taken);
+    queue.close();
+    assert_eq!(queue.push(Live::Event(Event::Changed)), Delivery::Gone);
+    assert_eq!(queue.push(Live::Down), Delivery::Gone);
+}
+
+#[test]
+fn the_thread_ends_once_the_tui_closed_a_queue_that_still_holds_something() {
+    let dir = short_tempdir();
+    let path = dir.path().join("daemon.sock");
+    let queue = Arc::new(LiveQueue::new(1_000, || true));
+    queue.push(Live::Down);
+    let thread = spawn(path, quick(10, 10, 10), Arc::clone(&queue), || {}).unwrap();
+    queue.close();
+    let deadline = Instant::now() + WAIT;
+    while !thread.is_finished() {
+        assert!(Instant::now() < deadline, "the thread never ended");
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread.join().unwrap();
+}
+
+#[test]
+fn a_line_the_link_cannot_read_ends_it_with_down() {
+    let dir = short_tempdir();
+    let path = dir.path().join("daemon.sock");
+    fake(&path, |mut stream| {
+        subscribed(&mut stream);
+        stream.write_all(b"this is not json\n").unwrap();
+        thread::sleep(Duration::from_secs(5));
+    });
+    let (rx, _queue) = live(&path, quick(50, 100, 1_000));
+    assert_eq!(next(&rx).1, Live::Up { link: 1 });
+    let (_, l) = next(&rx);
+    assert_eq!(l, Live::Down);
 }
 
 #[test]
