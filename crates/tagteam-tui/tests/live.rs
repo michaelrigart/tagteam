@@ -205,27 +205,48 @@ fn a_daemon_brings_the_link_up_and_its_events_through_in_order() {
 
 #[test]
 fn with_no_daemon_it_says_so_and_tries_again_less_and_less_often_until_one_answers() {
-    // Spec §8: backoff from `first` up to `most`, never a busy loop.
+    // Spec §8: backoff from `first` up to `most`, never a busy loop. The exact waits are
+    // `live::tests`; here only what a loaded machine cannot break: every `Down` comes no sooner
+    // than the waits before it add up to (the reader stamps late, never early), no more come in
+    // the window than the waits allow, and the first daemon to answer brings the link up.
     let dir = short_tempdir();
     let path = dir.path().join("daemon.sock");
-    let (rx, _queue) = live(&path, quick(20, 160, 1_000));
     let started = Instant::now();
-    let mut downs = Vec::new();
-    while started.elapsed() < Duration::from_millis(800) {
-        let (at, l) = next(&rx);
-        assert_eq!(l, Live::Down);
-        downs.push(at);
+    let (rx, _queue) = live(&path, quick(20, 160, 1_000));
+    let window = started + Duration::from_millis(800);
+    let mut downs = vec![next(&rx)];
+    while let Some(left) = window.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok(got) => downs.push(got),
+            Err(_) => break,
+        }
     }
-    let gaps: Vec<u128> = downs
-        .windows(2)
-        .map(|w| (w[1] - w[0]).as_millis())
-        .collect();
     assert!(
-        (5..=10).contains(&downs.len()),
-        "20, 40, 80, then 160 ms apart: {gaps:?}"
+        downs.iter().all(|(_, l)| *l == Live::Down),
+        "never anything but Down: {downs:?}"
     );
-    for (gap, least) in gaps.iter().zip([20, 40, 80, 160, 160, 160, 160]) {
-        assert!(*gap >= least, "{gaps:?}");
+    // 0, 20, 60, 140, 300, 460, 620, 780 ms at the soonest, and 940 ms next.
+    assert!(
+        downs.len() <= 10,
+        "a busy loop: {} Downs in 800 ms",
+        downs.len()
+    );
+    let mut soonest = Duration::ZERO;
+    for (i, ((at, _), wait)) in downs
+        .iter()
+        .zip(
+            [0, 20, 40, 80, 160]
+                .into_iter()
+                .chain(std::iter::repeat(160)),
+        )
+        .enumerate()
+    {
+        soonest += Duration::from_millis(wait);
+        assert!(
+            *at - started >= soonest,
+            "Down {i} came after {:?}, the waits make it {soonest:?}",
+            *at - started
+        );
     }
     let server = serve(&path);
     up_again(&rx, "the daemon that came");
@@ -234,18 +255,25 @@ fn with_no_daemon_it_says_so_and_tries_again_less_and_less_often_until_one_answe
 
 #[test]
 fn a_daemon_of_another_protocol_is_a_mismatch_tried_again_after_its_own_wait() {
-    // Spec §8, D5.6: in case the daemon restarts on this version.
+    // Spec §8, D5.6: in case the daemon restarts on this version. The wait is measured between
+    // the fake's own accepts, which load cannot move closer together.
     let dir = short_tempdir();
     let path = dir.path().join("daemon.sock");
-    fake(&path, |mut stream| {
+    let accepts = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&accepts);
+    fake(&path, move |mut stream| {
+        seen.lock().unwrap().push(Instant::now());
         stream.write_all(hello(2).as_bytes()).unwrap();
     });
     let (rx, _queue) = live(&path, quick(10, 20, 150));
-    let (first, said) = next(&rx);
-    assert_eq!(said, Live::Mismatch { server: 2 });
-    let (second, said) = next(&rx);
-    assert_eq!(said, Live::Mismatch { server: 2 }, "never Down in between");
-    assert!(second - first >= Duration::from_millis(150));
+    assert_eq!(next(&rx).1, Live::Mismatch { server: 2 });
+    assert_eq!(
+        next(&rx).1,
+        Live::Mismatch { server: 2 },
+        "never Down in between"
+    );
+    let accepts = accepts.lock().unwrap();
+    assert!(accepts[1] - accepts[0] >= Duration::from_millis(150));
 }
 
 #[test]
@@ -338,15 +366,19 @@ fn end_link_ends_a_link_gone_quiet_and_the_thread_connects_again() {
 
 /// A fake daemon that takes each subscription, then drops the subscriber after the next of
 /// `holds` (popped from its end), as the real one drops a subscriber whose queue is full
-/// (D5.5: it shuts the socket down).
-fn dropping(path: &Path, holds: Vec<Duration>) {
+/// (D5.5: it shuts the socket down). It returns when it accepted each connection.
+fn dropping(path: &Path, holds: Vec<Duration>) -> Arc<Mutex<Vec<Instant>>> {
     let holds = Mutex::new(holds);
+    let accepts = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&accepts);
     fake(path, move |mut stream| {
+        seen.lock().unwrap().push(Instant::now());
         subscribed(&mut stream);
         let hold = holds.lock().unwrap().pop().unwrap_or_default();
         thread::sleep(hold);
         let _ = stream.shutdown(Shutdown::Both);
     });
+    accepts
 }
 
 #[test]
@@ -371,45 +403,32 @@ fn end_link_ends_only_the_link_it_names() {
 #[test]
 fn a_subscriber_the_daemon_drops_is_down_and_reconnects_less_often_while_it_keeps_dropping() {
     // Spec §8: a full queue is a disconnect, and the TUI reconnects with backoff. Links dropped
-    // at once double the wait; one that lasted `most` starts the waits over.
+    // at once double the wait (`live::tests` has the exact waits and the reset after a link that
+    // lasted `most`). Here, in what load cannot break: each link is `Up` then `Down`, never a
+    // mismatch, and the fake's own accepts are no closer than the hold and the wait between them.
     let dir = short_tempdir();
     let path = dir.path().join("daemon.sock");
     let at_once = Duration::ZERO;
-    // The fourth link lasts 250 ms; the others are dropped at once.
-    dropping(
-        &path,
-        vec![
-            at_once,
-            Duration::from_millis(250),
-            at_once,
-            at_once,
-            at_once,
-        ],
-    );
+    let long = Duration::from_millis(800);
+    // The fourth link lasts well over `most`; the others are dropped at once.
+    let accepts = dropping(&path, vec![at_once, long, at_once, at_once, at_once]);
     let (rx, _queue) = live(&path, quick(30, 200, 1_000));
-    let (mut ups, mut downs) = (Vec::new(), Vec::new());
-    while ups.len() < 5 {
-        match next(&rx) {
-            (at, Live::Up { .. }) => ups.push(at),
-            (at, Live::Down) => downs.push(at),
-            other => panic!("{other:?}"),
+    for link in 1..=5 {
+        assert_eq!(next(&rx).1, Live::Up { link }, "link {link} up");
+        if link < 5 {
+            assert_eq!(next(&rx).1, Live::Down, "link {link} down");
         }
     }
-    assert!(
-        downs[3] - ups[3] >= Duration::from_millis(200),
-        "the fourth lasted"
-    );
-    let waits: Vec<u128> = (1..5)
-        .map(|i| (ups[i] - downs[i - 1]).as_millis())
-        .collect();
-    assert!(
-        waits[0] >= 30 && waits[1] >= 60 && waits[2] >= 120,
-        "doubling: {waits:?}"
-    );
-    assert!(
-        waits[3] >= 30 && waits[3] < waits[2],
-        "after the link that lasted, the first wait again: {waits:?}"
-    );
+    let accepts = accepts.lock().unwrap();
+    let least = [30, 60, 120, 800 + 30].map(Duration::from_millis);
+    for (i, least) in least.into_iter().enumerate() {
+        let gap = accepts[i + 1] - accepts[i];
+        assert!(
+            gap >= least,
+            "accepts {i} and {}: {gap:?} < {least:?}",
+            i + 1
+        );
+    }
 }
 
 #[test]
@@ -475,9 +494,11 @@ fn a_line_the_link_cannot_read_ends_it_with_down() {
         thread::sleep(Duration::from_secs(5));
     });
     let (rx, _queue) = live(&path, quick(50, 100, 1_000));
-    assert_eq!(next(&rx).1, Live::Up { link: 1 });
-    let (_, l) = next(&rx);
+    let (up, l) = next(&rx);
+    assert_eq!(l, Live::Up { link: 1 });
+    let (down, l) = next(&rx);
     assert_eq!(l, Live::Down);
+    assert!(down - up < Duration::from_secs(1), "{:?}", down - up);
 }
 
 #[test]
