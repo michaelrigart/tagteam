@@ -1,6 +1,7 @@
 //! The TUI through the real binary on a pseudo-terminal (TUI spec §11 "End to end"): what it
-//! shows, how it leaves the terminal, and how it treats signals with and without a foreground
-//! session. `openpty` fails inside a sandbox that denies it, so run these outside one:
+//! shows, how it leaves the terminal, how it treats signals with and without a foreground
+//! session, and how it follows a real daemon. `openpty` fails inside a sandbox that denies it,
+//! and so does the daemon's socket, so run these outside one:
 //! `cargo test -p tagteam --features test-support --test tui_pty`.
 #![cfg(feature = "test-support")]
 
@@ -8,14 +9,14 @@ mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 use common::pty::{Finished, Pty, Screen};
 use common::{
-    FakeCall, cmd, fake_claude, fake_claude_calls, live_email, login, now_epoch_s, path_with,
-    seed_home, std_cmd, turn, two_fresh_accounts, write_transcript,
+    FakeCall, Guarded, cmd, fake_claude, fake_claude_calls, live_email, login, now_epoch_s,
+    path_with, seed_home, short_tempdir, std_cmd, turn, two_fresh_accounts, write_transcript,
 };
 use tagteam_core::AccountId;
 use tagteam_provider::{Env, FileKeychain, MARKER_FILE, profile_path};
@@ -35,11 +36,37 @@ struct Home {
 
 impl Home {
     fn new() -> Home {
-        let dir = tempfile::tempdir().unwrap();
+        Home::in_dir(tempfile::tempdir().unwrap())
+    }
+
+    /// `new`, in a directory short enough for the daemon's socket (D5.1), with the daemon's
+    /// notifications off, so that it starts no `osascript`.
+    fn for_daemon() -> Home {
+        let home = Home::in_dir(short_tempdir());
+        cmd(home.root())
+            .args(["config", "set", "notify.enabled", "false"])
+            .assert()
+            .success();
+        home
+    }
+
+    fn in_dir(dir: tempfile::TempDir) -> Home {
         let (a, _b) = two_fresh_accounts(dir.path());
         fake_claude(dir.path());
         fs::create_dir_all(dir.path().join("work")).unwrap();
         Home { dir, a }
+    }
+
+    /// `tagteam daemon --json` on this home, as a service runs it (stdin closed), once it
+    /// switches Claude Code's two accounts (`auto`). It is killed if the test fails.
+    fn daemon(&self) -> Guarded {
+        let mut c = std_cmd(self.root());
+        c.args(["daemon", "--json"]).stdin(Stdio::null());
+        let mut daemon = Guarded::spawn(c);
+        daemon.wait_for(LONG, "the daemon in auto mode", |out| {
+            out.contains(r#""event":"mode""#) && out.contains(r#""mode":"auto""#)
+        });
+        daemon
     }
 
     fn root(&self) -> &Path {
@@ -124,6 +151,23 @@ fn token_report(s: &Screen) -> bool {
         && s.contains("[Day] Month Session Block")
         && s.contains("refreshed ")
         && s.contains("1.1K")
+}
+
+/// The accounts table, with the TUI following the daemon, which switches automatically.
+fn live(s: &Screen) -> bool {
+    accounts(s) && s.contains("● live · auto on")
+}
+
+/// SIGTERM, and the daemon's exit 0 (D4.6).
+fn stop(daemon: Guarded) {
+    daemon.signal(libc::SIGTERM);
+    let out = daemon.finish(LONG);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Waits for the session `R` started to be running.
@@ -569,4 +613,72 @@ fn a_lane_that_panics_restores_the_terminal_before_the_panic_shows_and_exits_1()
         "{}",
         f.screen.text()
     );
+}
+
+#[test]
+fn under_r_ctrl_c_ends_the_session_and_the_daemon_connection_stays_live() {
+    // Spec §7.3, §11: the live thread watches no token, so the session's Ctrl-C leaves the
+    // daemon connection as it was.
+    let home = Home::for_daemon();
+    let daemon = home.daemon();
+    let mut tui = home.tui(&["tui"]);
+    tui.wait_for(LONG, "live mode", live);
+    tui.type_keys(b"R");
+    wait_for_session(&home, &mut tui);
+    tui.type_keys(b"\x03");
+    tui.wait_for(LONG, "the wait for Enter", returning);
+    tui.type_keys(b"\r");
+    tui.wait_for(LONG, "the accounts table, still live", live);
+    tui.type_keys(b"q");
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    assert_restored(&f);
+    stop(daemon);
+}
+
+#[test]
+fn p_pauses_the_daemon_s_auto_switch_and_resumes_it() {
+    // Spec §7.4: through `config set`; the header turns as the daemon's `status` does.
+    let home = Home::for_daemon();
+    let daemon = home.daemon();
+    let mut tui = home.tui(&["tui"]);
+    tui.wait_for(LONG, "live mode", live);
+    tui.type_keys(b"P");
+    tui.wait_for(LONG, "the question", |s| {
+        s.contains("Pause auto-switch for claude-code?")
+    });
+    tui.type_keys(b"y");
+    tui.wait_for(LONG, "the pause", |s| s.contains("● live · auto paused"));
+    let config = fs::read_to_string(home.root().join("home/.config/tagteam/config.toml")).unwrap();
+    assert!(config.contains("autoswitch = false"), "{config}");
+    tui.type_keys(b"P");
+    tui.wait_for(LONG, "the question", |s| {
+        s.contains("Resume auto-switch for claude-code?")
+    });
+    tui.type_keys(b"y");
+    tui.wait_for(LONG, "auto-switch again", live);
+    tui.type_keys(b"q");
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    stop(daemon);
+}
+
+#[test]
+fn a_daemon_that_stops_leaves_the_tui_on_its_timer_until_the_next_one_answers() {
+    // Spec §8: `stopping` names its reason; the TUI refreshes on its own timer, and reconnects
+    // with backoff, reading every view again.
+    let home = Home::for_daemon();
+    let daemon = home.daemon();
+    let mut tui = home.tui(&["tui"]);
+    tui.wait_for(LONG, "live mode", live);
+    stop(daemon);
+    tui.wait_for(LONG, "timer mode", |s| {
+        accounts(s) && s.contains("○ daemon stopping (signal)")
+    });
+    let daemon = home.daemon();
+    tui.wait_for(LONG, "live mode again", live);
+    tui.type_keys(b"q");
+    let f = tui.finish(LONG);
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+    stop(daemon);
 }

@@ -49,6 +49,13 @@ with the one before, so any release may contain breaking changes. Each section s
   from a period to its sessions and from a session to its models, and the active block's remaining
   time, burn rate and projection. It brings the token index up to date in the background, and reads the
   report again as the index, the accounts or the clock move.
+- With the daemon running, the TUI follows it live. The header shows what the daemon does for
+  the selected account's provider (`● live · auto on`, `auto paused`, …), the line above the
+  footer shows its latest event, and the TUI reads its views again as the daemon's events come
+  in. It leaves collecting usage, and keeping the token index current, to the daemon. `P`
+  pauses or resumes the daemon's auto-switching for that provider, as
+  `tagteam config set provider.<id>.daemon.autoswitch` does. Without a daemon, or once it
+  stops, the TUI refreshes on its own timer, and it connects again when a daemon is back.
 
 ### Changed
 
