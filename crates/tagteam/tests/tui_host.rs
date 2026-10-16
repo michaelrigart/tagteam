@@ -509,6 +509,31 @@ fn add_stores_the_live_login() {
 }
 
 #[test]
+fn p_writes_the_daemon_s_autoswitch_setting_through_config_set_as_the_cli_does() {
+    // Spec §7.4, §11: the socket stays read-only (T3); the setting persists in config.toml.
+    let home = Home::with_two();
+    let (host, _) = home.host();
+    let file = home.env.config_dir().join("config.toml");
+    let key = "provider.claude-code.daemon.autoswitch";
+    for on in [false, true] {
+        let action = Action::Autoswitch {
+            provider: ProviderId::new(CLAUDE_CODE),
+            on,
+        };
+        assert_eq!(
+            done(host.act(&action, &mut Dialogs::none())),
+            (
+                0,
+                format!("Set {key} = {on} in {}.\n", file.display()),
+                String::new()
+            ),
+        );
+        let (code, value, _) = home.cli_run(&["config", "get", key]);
+        assert_eq!((code, value), (0, format!("{on}\n")));
+    }
+}
+
+#[test]
 fn an_account_moved_elsewhere_is_refused_as_stale_and_nothing_changes() {
     // Spec §4.5: another process moved `a` after the TUI read it; position 1 now holds `b`.
     let home = Home::with_two();

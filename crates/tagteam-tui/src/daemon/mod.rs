@@ -32,6 +32,9 @@ pub const STATUS_WAIT_MS: i64 = 5_000;
 /// C-R20: the first collection waits at most this long for the daemon's first `status`, no
 /// longer than the daemon lane's own bound.
 pub const SETTLE_MS: i64 = 2_000;
+/// Spec §7.4: `status` is fetched again this long after `P`'s setting was written. The daemon
+/// applies a setting within about a second (D4.2).
+pub const RECHECK_MS: i64 = 2_000;
 
 /// §8: the auto kinds that say an account's reading or state changed.
 const VIEW_KINDS: [&str; 4] = [
@@ -63,6 +66,11 @@ pub struct DaemonState {
     mismatch: Option<u32>,
     /// When the next 60 s fetch of `status` is due.
     next_poll_ms: i64,
+    /// When `P`'s fetch of `status` is due, whether or not a link was up when the setting was
+    /// written. It is made on whichever link is up then: a new link's own fetch can come before
+    /// the daemon applies the setting. A link that comes up after it fetches at once, which
+    /// serves (C-R21).
+    recheck_ms: Option<i64>,
     /// When the reads the last events asked for are made, all at once.
     reread_ms: Option<i64>,
     /// They read the views: an account's reading or state changed.
@@ -176,6 +184,10 @@ fn up(state: &mut State, link: u64, now_ms: i64) -> Vec<Cmd> {
     d.stopping = None;
     d.mismatch = None;
     d.next_poll_ms = now_ms + POLL_MS;
+    // The link's own fetch comes after `P`'s, if that is due, and serves for it (C-R21).
+    if d.recheck_ms.is_some_and(|at| now_ms >= at) {
+        d.recheck_ms = None;
+    }
     d.reread_ms = Some(now_ms + REREAD_MS);
     d.reread_views = true;
     d.reread_all = true;
@@ -206,6 +218,12 @@ fn down(state: &mut State) {
     d.reread_all = false;
     d.reread_status = false;
     state.dirty = true;
+}
+
+/// Spec §7.4: `P`'s setting was written; `status` is fetched `RECHECK_MS` from now, whether or
+/// not a link is up now (C-R21).
+pub(crate) fn recheck(state: &mut State, now_ms: i64) {
+    state.daemon.recheck_ms = Some(now_ms + RECHECK_MS);
 }
 
 /// `status`, on the daemon lane, for this link. One is out at a time (C-R22): one asked for
@@ -377,10 +395,10 @@ fn names_another_provider(error: &str, provider: &ProviderId) -> bool {
     })
 }
 
-/// Spec §6.3 and §8 on the UI's tick: the end of `stopping`'s words, and of the first
+/// Spec §6.3, §7.4 and §8 on the UI's tick: the end of `stopping`'s words, and of the first
 /// collection's wait (C-R20); a link whose `status` did not come (C-R19); the events' debounced
-/// reads; and every 60 s, `status`, and in live mode `accounts` (and `history` when History is
-/// open).
+/// reads; `P`'s fetch of `status`; and every 60 s, `status`, and in live mode `accounts` (and
+/// `history` when History is open).
 pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     let d = &mut state.daemon;
     if d.stopping
@@ -406,6 +424,10 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
         views = std::mem::take(&mut d.reread_views);
         all = std::mem::take(&mut d.reread_all);
         fetch_now = std::mem::take(&mut d.reread_status);
+    }
+    if d.recheck_ms.is_some_and(|at| now_ms >= at) {
+        d.recheck_ms = None;
+        fetch_now = true;
     }
     if now_ms >= d.next_poll_ms {
         d.next_poll_ms = now_ms + POLL_MS;
