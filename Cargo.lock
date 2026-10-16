@@ -3275,6 +3275,7 @@ dependencies = [
  "serde_json",
  "tagteam-cc",
  "tagteam-core",
+ "tagteam-daemon",
  "tagteam-engine",
  "tagteam-fake",
  "tagteam-provider",

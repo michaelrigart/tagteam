@@ -540,3 +540,30 @@ fn a_kind_the_client_does_not_know_is_yielded_as_unknown() {
     );
     daemon.join().unwrap();
 }
+
+#[test]
+fn a_closer_ends_a_stream_that_another_thread_is_reading() {
+    // A subscriber that finds the daemon no longer answers (the TUI's live thread, whose read
+    // waits for as long as the daemon is silent) ends its stream from another thread.
+    let dir = short_tempdir();
+    let path = dir.path().join("daemon.sock");
+    let server = serve(&path);
+    let events = connected(connect_at(&path)).subscribe().unwrap();
+    let closer = events.closer().unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(events.count());
+    });
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        rx.try_recv().is_err(),
+        "the reader waits on a silent daemon"
+    );
+    closer.close();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)),
+        Ok(0),
+        "the iterator ended, with no event"
+    );
+    server.shutdown();
+}
