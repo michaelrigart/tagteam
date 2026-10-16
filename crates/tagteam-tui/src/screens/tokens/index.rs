@@ -36,6 +36,9 @@ pub struct IndexWatch {
     refreshing: Option<IndexProgress>,
     /// The last refresh returned `Busy`: another process is catching up (spec §5.3).
     busy: bool,
+    /// The index's `refreshed_at_ms` when that refresh returned: a check that sees it move on
+    /// finds the other process done, and ends `busy`.
+    busy_after: Option<i64>,
     /// The first refresh has been asked for (B5).
     started: bool,
     /// The last refresh's failure, in words.
@@ -57,6 +60,7 @@ impl Default for IndexWatch {
             state: None,
             refreshing: None,
             busy: false,
+            busy_after: None,
             started: false,
             error: None,
             next_refresh_ms: 0,
@@ -153,6 +157,7 @@ pub(crate) fn on_refreshed(
         }
         Ok(RefreshOutcome::Busy) => {
             watch.busy = true;
+            watch.busy_after = watch.state.and_then(|s| s.refreshed_at_ms);
             watch.error = None;
         }
         Err(e) => {
@@ -195,7 +200,11 @@ pub(crate) fn on_index_state(
         state.tokens.error = None;
     }
     let shown = state.tokens.report().map(|r| r.index.changed_at_ms);
-    state.tokens.watch.state = Some(index);
+    let watch = &mut state.tokens.watch;
+    if watch.busy && index.refreshed_at_ms > watch.busy_after {
+        watch.busy = false;
+    }
+    watch.state = Some(index);
     let moved = shown.is_some_and(|shown| index.changed_at_ms > shown);
     if moved && state.screen == Screen::Tokens && state.quitting.is_none() {
         return requery(state, now_ms);
@@ -529,6 +538,50 @@ mod tests {
             NOW_MS + 61_000,
         );
         assert!(!state.tokens.watch().busy());
+    }
+
+    #[test]
+    fn busy_ends_when_a_check_sees_the_other_process_finish() {
+        // The other process's refresh finished when the index's `refreshed_at_ms` moved on: the
+        // header stops saying it is catching up, and the checks stop, without waiting for
+        // our own next refresh.
+        let mut state = on_tokens();
+        let busy = Ok(RefreshOutcome::Busy);
+        update(&mut state, Msg::Refreshed { result: busy }, NOW_MS + 1_000);
+        let checked = |state: &mut State, at_ms: i64, index: IndexState| {
+            let cmds = tick(state, at_ms);
+            let [Cmd::LoadIndexState { r#gen, .. }] = cmds.as_slice() else {
+                panic!("{cmds:?}");
+            };
+            let msg = Msg::IndexState {
+                r#gen: *r#gen,
+                result: Ok(index),
+            };
+            update(state, msg, at_ms + 100)
+        };
+        let unchanged = IndexState {
+            refreshed_at_ms: Some(NOW_MS - 60_000),
+            changed_at_ms: Some(NOW_MS - 60_000),
+            ..IndexState::default()
+        };
+        assert!(checked(&mut state, NOW_MS + 7_000, unchanged).is_empty());
+        assert!(state.tokens.watch().busy(), "it has not finished");
+        assert!(
+            token_cmds(checked(
+                &mut state,
+                NOW_MS + 12_000,
+                index_changed_at(NOW_MS - 60_000)
+            ))
+            .is_empty()
+        );
+        assert!(!state.tokens.watch().busy(), "it finished");
+        let later = tick(&mut state, NOW_MS + 20_000);
+        assert!(
+            later
+                .iter()
+                .all(|c| !matches!(c, Cmd::LoadIndexState { .. })),
+            "nothing left to check: {later:?}"
+        );
     }
 
     #[test]
