@@ -26,8 +26,8 @@ pub const POLL_MS: i64 = 60_000;
 /// Spec §8: after `stopping`, the header names its reason this long, unless a link comes up.
 pub const STOPPING_MS: i64 = 30_000;
 /// C-R19: a `status` asked for and not answered this long after is given up on, and the link
-/// with it: more than the daemon lane's own 2.25 s bound (D5.7), with another link's fetch
-/// queued behind it.
+/// with it. The daemon lane bounds one fetch at 2.25 s (D5.7), and another link's fetch may sit
+/// in the lane ahead of this one, so the wait covers two of them (2 x 2.25 s).
 pub const STATUS_WAIT_MS: i64 = 5_000;
 /// C-R20: the first collection waits at most this long for the daemon's first `status`, no
 /// longer than the daemon lane's own bound.
