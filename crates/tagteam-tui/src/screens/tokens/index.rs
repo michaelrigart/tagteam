@@ -1,11 +1,14 @@
-//! The token index on the Tokens screen (spec §5.3 "Indexing", §6.4 in timer mode): the TUI's
-//! own catch-up on the index lane, the index's state for the header, and when the report on
-//! screen is read again.
+//! The token index on the Tokens screen (spec §5.3 "Indexing", §6.4): the TUI's own catch-up on
+//! the index lane, the index's state for the header, and when the report on screen is read
+//! again. A daemon that keeps the index current (live mode) takes the timer's place, and its
+//! `token-index` events say when the index changed.
 
+use serde_json::Value;
 use tagteam_core::AccountId;
 use tagteam_engine::tokens::{IndexProgress, IndexState, PeriodKey, RefreshOutcome, TokenReport};
 
 use super::requery;
+use crate::daemon::{self, words};
 use crate::msg::Cmd;
 use crate::source::SourceError;
 use crate::state::{Screen, State};
@@ -23,6 +26,9 @@ pub const CHECK_MS: i64 = 5_000;
 const CHECK_FAILED: &str = "the token index's state was not read: ";
 /// `r` while the TUI's own refresh runs.
 pub const ALREADY: &str = "the token index is already being refreshed";
+/// Spec §6.4 in live mode: the daemon's `token-index` events read the report again at most this
+/// often, the 5 s of a refresh's checks. During a cold catch-up they come about once a second.
+pub const LIVE_REQUERY_MS: i64 = 5_000;
 
 /// An account as the report's rows name it (`RowAccount::Account`): its ID, position, label
 /// and alias.
@@ -51,6 +57,10 @@ pub struct IndexWatch {
     accounts: Option<Vec<AccountKey>>,
     /// The end of the active block the report was last read again for.
     ended: Option<i64>,
+    /// When a `token-index` event may next read the report again (`LIVE_REQUERY_MS`).
+    live_next_ms: i64,
+    /// One came sooner: the report is read again at `live_next_ms`.
+    live_due: bool,
 }
 
 impl Default for IndexWatch {
@@ -69,6 +79,8 @@ impl Default for IndexWatch {
             next_check_ms: 0,
             accounts: None,
             ended: None,
+            live_next_ms: 0,
+            live_due: false,
         }
     }
 }
@@ -148,6 +160,7 @@ pub(crate) fn on_refreshed(
     result: Result<RefreshOutcome, SourceError>,
     now_ms: i64,
 ) -> Vec<Cmd> {
+    let keeps = daemon::keeps_index(state);
     let watch = &mut state.tokens.watch;
     watch.refreshing = None;
     watch.next_refresh_ms = now_ms + REFRESH_MS;
@@ -156,8 +169,10 @@ pub(crate) fn on_refreshed(
             watch.busy = false;
             watch.error = None;
         }
+        // With a daemon that keeps the index, another process catching up is the usual state
+        // of things, and its events say when the index changes.
         Ok(RefreshOutcome::Busy) => {
-            watch.busy = true;
+            watch.busy = !keeps;
             watch.busy_after = None;
             watch.error = None;
         }
@@ -239,6 +254,45 @@ pub(crate) fn on_report(state: &mut State, now_ms: i64) {
     }
 }
 
+/// Spec §6.4: the daemon keeps the index current (`daemon::keeps_index`). A `Busy` the TUI's
+/// last refresh met is no longer news: the daemon's events, not the 5 s checks, say when the
+/// index changes.
+pub(crate) fn on_daemon_index(state: &mut State) {
+    state.tokens.watch.busy = false;
+}
+
+/// Spec §6.4 in live mode, §8: the daemon's `token-index` event for `provider`. While Tokens shows
+/// that provider's report, a `changedAt` newer than the report's reads it again, at most every
+/// `LIVE_REQUERY_MS`: an event that comes sooner waits for then, and the report read then has
+/// every change since. `changedAt` is to the second, so a change in the second the report's
+/// was in counts as newer.
+pub(crate) fn on_token_index(
+    state: &mut State,
+    provider: &str,
+    raw: &Value,
+    now_ms: i64,
+) -> Vec<Cmd> {
+    let ours = provider == state.tokens.provider().as_str();
+    if !ours || state.screen != Screen::Tokens || state.quitting.is_some() {
+        return vec![];
+    }
+    let Some(changed_ms) = raw["changedAt"].as_str().and_then(words::iso_ms) else {
+        return vec![];
+    };
+    let shown = state.tokens.report().and_then(|r| r.index.changed_at_ms);
+    if shown.is_some_and(|shown| changed_ms + 1_000 <= shown) {
+        return vec![];
+    }
+    let watch = &mut state.tokens.watch;
+    if now_ms < watch.live_next_ms {
+        watch.live_due = true;
+        return vec![];
+    }
+    watch.live_next_ms = now_ms + LIVE_REQUERY_MS;
+    watch.live_due = false;
+    requery(state, now_ms)
+}
+
 /// The Tokens provider's accounts in `state`'s last `accounts` read.
 fn account_keys(state: &State) -> Vec<AccountKey> {
     let Some(snap) = state.accounts.snapshot() else {
@@ -290,17 +344,25 @@ fn active_end(report: &TokenReport) -> Option<i64> {
         .min()
 }
 
-/// Spec §6.4 on the UI's tick, while Tokens is open: the refresh every 60 s; the index's state
-/// every 5 s while a refresh runs here or elsewhere (`Busy`); and the report again every 60 s,
-/// and once at the active block's end.
+/// Spec §6.4 on the UI's tick, while Tokens is open: the refresh every 60 s, unless the daemon
+/// keeps the index current; the index's state every 5 s while a refresh runs here or elsewhere
+/// (`Busy`); the report again every 60 s, once at the active block's end, and when a
+/// `token-index` event waited for `LIVE_REQUERY_MS`.
 pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     if state.screen != Screen::Tokens || state.quitting.is_some() {
         return vec![];
     }
     let mut cmds = Vec::new();
+    let keeps = daemon::keeps_index(state);
     let watch = &state.tokens.watch;
-    if watch.refreshing.is_none() && now_ms >= watch.next_refresh_ms {
+    if watch.refreshing.is_none() && now_ms >= watch.next_refresh_ms && !keeps {
         cmds.extend(refresh(state));
+    }
+    let watch = &mut state.tokens.watch;
+    if watch.live_due && now_ms >= watch.live_next_ms {
+        watch.live_due = false;
+        watch.live_next_ms = now_ms + LIVE_REQUERY_MS;
+        cmds.extend(requery(state, now_ms));
     }
     let watch = &state.tokens.watch;
     if (watch.refreshing.is_some() || watch.busy) && now_ms >= watch.next_check_ms {
@@ -326,9 +388,12 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    use tagteam_daemon::protocol::{Event, Status, StatusJob};
     use tagteam_engine::tokens::{ActiveBlock, IndexReport, TokenPeriod, TokenRow};
 
     use super::*;
+    use crate::live::Live;
     use crate::msg::Msg;
     use crate::testutil::*;
     use crate::update::{drawn, update};
@@ -962,5 +1027,230 @@ mod tests {
             NOW_MS + 6_100,
         );
         assert_eq!(state.tokens.error(), None);
+    }
+
+    /// The fixture daemon switching Claude Code's accounts, with the index job (D13), whose last
+    /// run failed with `error`, when `error` is given.
+    fn with_index_job(error: Option<&str>) -> Status {
+        let job = StatusJob {
+            name: "token-index".into(),
+            last_run_at: None,
+            next_run_at: None,
+            last_error: error.map(str::to_owned),
+        };
+        daemon_status(vec![daemon_job("claude-code", "auto", true)], vec![job])
+    }
+
+    /// `on_tokens`, its first refresh returned at `NOW_MS`, then live on a daemon whose
+    /// `status` is `status`, and the report the link reads again answered: changed a minute
+    /// before `NOW_MS`, as before.
+    fn live_on_tokens(status: Status) -> State {
+        let mut state = on_tokens();
+        update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+        go_live(&mut state, status);
+        let again = tick(&mut state, NOW_MS + 250);
+        answer(&mut state, &again, vec![], NOW_MS - 60_000, NOW_MS + 250);
+        state
+    }
+
+    /// The daemon's `token-index` event for `provider`, its index changed at `changed_ms`.
+    fn token_index(provider: &str, changed_ms: Option<i64>) -> Msg {
+        let changed =
+            changed_ms.map(|ms| jiff::Timestamp::from_millisecond(ms).unwrap().to_string());
+        let raw = json!({"event": "token-index", "provider": provider, "changedAt": changed});
+        Msg::Live(Live::Event(Event::TokenIndex {
+            provider: provider.into(),
+            raw,
+        }))
+    }
+
+    fn refreshes(cmds: &[Cmd]) -> bool {
+        cmds.contains(&Cmd::RefreshIndex { provider: cc() })
+    }
+
+    /// `tick` on a live TUI whose daemon answers each `status` it asks for with the last one,
+    /// as a working daemon does (C-R19 drops a link whose `status` does not come).
+    fn live_tick(state: &mut State, at_ms: i64) -> Vec<Cmd> {
+        let cmds = update(state, Msg::Tick, at_ms);
+        for c in &cmds {
+            if let (Cmd::FetchStatus { link }, Some(status)) = (c, state.daemon.status()) {
+                let result = Ok(status.clone());
+                update(
+                    state,
+                    Msg::DaemonStatus {
+                        link: *link,
+                        result,
+                    },
+                    at_ms,
+                );
+            }
+        }
+        token_cmds(cmds)
+    }
+
+    #[test]
+    fn a_daemon_that_keeps_the_index_takes_the_timer_s_place_and_r_still_refreshes() {
+        // Spec §6.4: in live mode with the index job, no refresh on a timer; `r` is a person's
+        // request. Without the link, the timer is back.
+        let mut state = live_on_tokens(with_index_job(None));
+        assert!(!refreshes(&live_tick(&mut state, NOW_MS + 60_000)));
+        assert!(!refreshes(&live_tick(&mut state, NOW_MS + 180_000)));
+        assert!(state.daemon.live(), "the daemon answered throughout");
+        assert_eq!(
+            update(&mut state, ch('r'), NOW_MS + 181_000),
+            [Cmd::RefreshIndex { provider: cc() }]
+        );
+        update(
+            &mut state,
+            Msg::Refreshed { result: done() },
+            NOW_MS + 182_000,
+        );
+        update(&mut state, Msg::Live(Live::Down), NOW_MS + 250_000);
+        assert!(
+            refreshes(&tick(&mut state, NOW_MS + 250_250)),
+            "60 s after the last returned"
+        );
+    }
+
+    #[test]
+    fn a_daemon_that_runs_another_provider_only_leaves_the_timer_on() {
+        // C-R12: the index job serves the providers the daemon runs (D13); a daemon started
+        // with `--provider fake-agent` keeps no Claude Code index, however well its job runs.
+        let job = StatusJob {
+            name: "token-index".into(),
+            last_run_at: None,
+            next_run_at: None,
+            last_error: None,
+        };
+        let other = daemon_status(vec![daemon_job("fake-agent", "auto", true)], vec![job]);
+        let mut state = live_on_tokens(other);
+        assert!(refreshes(&tick(&mut state, NOW_MS + 60_000)));
+    }
+
+    #[test]
+    fn without_the_index_job_or_with_one_that_fails_here_the_timer_refreshes() {
+        // Spec §6.4: a daemon without that job leaves the TUI refreshing as in timer mode; one
+        // whose job fails for this provider, or for the store, too.
+        for (status, timer) in [
+            (
+                daemon_status(vec![daemon_job("claude-code", "auto", true)], vec![]),
+                true,
+            ),
+            (
+                with_index_job(Some("claude-code: a transcript could not be read")),
+                true,
+            ),
+            (
+                with_index_job(Some("store error: database is locked")),
+                true,
+            ),
+            (
+                with_index_job(Some("fake-agent: a transcript could not be read")),
+                false,
+            ),
+            (with_index_job(None), false),
+        ] {
+            let errors = status.jobs.first().and_then(|j| j.last_error.clone());
+            let mut state = live_on_tokens(status);
+            assert_eq!(
+                refreshes(&tick(&mut state, NOW_MS + 60_000)),
+                timer,
+                "{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_index_event_newer_than_the_report_on_screen_reads_it_again() {
+        // Spec §6.4, §8. `changedAt` is to the second: one in the report's own second counts as
+        // newer.
+        let shown = NOW_MS - 60_000;
+        let mut state = live_on_tokens(with_index_job(None));
+        let at = NOW_MS + 1_000;
+        for (msg, why) in [
+            (token_index("claude-code", Some(shown - 1_000)), "older"),
+            (token_index("claude-code", None), "never changed"),
+            (
+                token_index("fake-agent", Some(NOW_MS)),
+                "another provider's",
+            ),
+        ] {
+            assert!(token_cmds(update(&mut state, msg, at)).is_empty(), "{why}");
+        }
+        let again = token_cmds(update(
+            &mut state,
+            token_index("claude-code", Some(shown)),
+            at,
+        ));
+        assert!(
+            matches!(again.as_slice(), [Cmd::LoadReport { .. }]),
+            "{again:?}"
+        );
+        answer(&mut state, &again, vec![], NOW_MS + 500, at);
+        // Off Tokens the event reads nothing; opening Tokens reads it again anyway (B19).
+        update(&mut state, ch('1'), at + 10_000);
+        let later = token_index("claude-code", Some(NOW_MS + 9_000));
+        assert!(token_cmds(update(&mut state, later, at + 10_000)).is_empty());
+    }
+
+    #[test]
+    fn a_catch_up_s_stream_of_events_reads_the_report_every_5_s_and_reads_the_last_change() {
+        // During a cold catch-up `changedAt` moves about once a second: the report lane is
+        // asked at most every `LIVE_REQUERY_MS`, and the change that came last is read.
+        let mut state = live_on_tokens(with_index_job(None));
+        let mut read_at = Vec::new();
+        let mut changed = NOW_MS;
+        let mut serve = |state: &mut State, cmds: Vec<Cmd>, at: i64, changed: i64| {
+            if !cmds.is_empty() {
+                answer(state, &cmds, vec![], changed, at);
+                read_at.push(at - NOW_MS);
+            }
+        };
+        for s in 1..=12 {
+            let at = NOW_MS + s * 1_000;
+            changed = at;
+            let cmds = token_cmds(update(&mut state, token_index("claude-code", Some(at)), at));
+            serve(&mut state, cmds, at, changed);
+            for quarter in 1..4 {
+                let cmds = tick(&mut state, at + quarter * 250);
+                serve(&mut state, cmds, at + quarter * 250, changed);
+            }
+        }
+        for quarter in 1..=72 {
+            let at = NOW_MS + 12_750 + quarter * 250;
+            let cmds = tick(&mut state, at);
+            serve(&mut state, cmds, at, changed);
+        }
+        assert_eq!(read_at, [1_000, 6_000, 11_000, 16_000]);
+        assert_eq!(
+            state.tokens.report().and_then(|r| r.index.changed_at_ms),
+            Some(NOW_MS + 12_000),
+            "the last change is on screen"
+        );
+    }
+
+    #[test]
+    fn a_busy_refresh_is_not_news_while_the_daemon_keeps_the_index() {
+        // B10's `catching up elsewhere` and its 5 s checks are timer mode's: with a daemon that
+        // keeps the index, its events say when the index changes.
+        let mut state = on_tokens();
+        let busy = || Msg::Refreshed {
+            result: Ok(RefreshOutcome::Busy),
+        };
+        update(&mut state, busy(), NOW_MS);
+        assert!(state.tokens.watch().busy());
+        go_live(&mut state, with_index_job(None));
+        assert!(!state.tokens.watch().busy());
+        let shown = draw(&state, 80, 24).join("\n");
+        assert!(!shown.contains("catching up elsewhere"), "{shown}");
+        let checks = |cmds: Vec<Cmd>| {
+            cmds.iter()
+                .filter(|c| matches!(c, Cmd::LoadIndexState { .. }))
+                .count()
+        };
+        assert_eq!(checks(tick(&mut state, NOW_MS + 7_000)), 0);
+        update(&mut state, ch('r'), NOW_MS + 8_000);
+        update(&mut state, busy(), NOW_MS + 8_000);
+        assert!(!state.tokens.watch().busy(), "a person's `r` too");
     }
 }

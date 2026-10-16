@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_daemon::protocol::{Event, Status, StatusProvider};
+use tagteam_daemon::tokens::TOKEN_INDEX;
 
 use crate::live::Live;
 use crate::msg::Cmd;
@@ -254,7 +255,10 @@ fn on_event(state: &mut State, event: Event, now_ms: i64) -> Vec<Cmd> {
             state.daemon.stopping = Some((reason, now_ms + STOPPING_MS));
             state.dirty = true;
         }
-        Event::TokenIndex { .. } | Event::Unknown { .. } => {}
+        Event::TokenIndex { provider, raw } => {
+            return screens::tokens::index::on_token_index(state, &provider, &raw, now_ms);
+        }
+        Event::Unknown { .. } => {}
     }
     vec![]
 }
@@ -321,6 +325,9 @@ pub(crate) fn on_status(
             d.status = Some(status);
             d.unsettled_until = None;
             state.dirty = true;
+            if keeps_index(state) {
+                screens::tokens::index::on_daemon_index(state);
+            }
             if !std::mem::take(&mut state.daemon.status_again) {
                 return vec![];
             }
@@ -328,6 +335,30 @@ pub(crate) fn on_status(
         }
         Err(_) => broken(state, link),
     }
+}
+
+/// Spec §6.4, C-R12: whether the daemon keeps the Tokens provider's index current. In live
+/// mode, the daemon runs a job for that provider (its index job serves the providers it runs,
+/// D13, which `status` names in `providers`), and its `status.jobs` has the index job, whose
+/// last run did not fail for this provider or for the store (its `lastError` names one or the
+/// other, as `<provider>: …` or `store…`). A daemon that runs other providers only, or whose job
+/// fails, leaves the TUI to refresh on its timer, which shows its own refresh's failure.
+pub(crate) fn keeps_index(state: &State) -> bool {
+    let provider = state.tokens.provider();
+    let Some(status) = state.daemon.status() else {
+        return false;
+    };
+    if state.daemon.job(provider).is_none() {
+        return false;
+    }
+    let ours = format!("{provider}: ");
+    status.jobs.iter().any(|job| {
+        job.name == TOKEN_INDEX
+            && job
+                .last_error
+                .as_deref()
+                .is_none_or(|e| !(e.starts_with(&ours) || e.starts_with("store")))
+    })
 }
 
 /// Spec §6.3 and §8 on the UI's tick: the end of `stopping`'s words, and of the first
