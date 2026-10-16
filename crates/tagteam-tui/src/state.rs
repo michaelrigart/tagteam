@@ -91,6 +91,7 @@ pub struct Gens {
     pub collect: u64,
     pub report: u64,
     pub index: u64,
+    pub inventory: u64,
 }
 
 pub struct Refresh {

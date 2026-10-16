@@ -13,6 +13,7 @@ use tagteam_engine::words;
 use crate::host::{AccountRef, Action, ActionOutcome, Strategy};
 use crate::msg::{Answer, Cmd, Prompt, PromptKind};
 use crate::screens;
+use crate::screens::tokens::filter::{self, FilterDialog};
 use crate::state::{Screen, State};
 use crate::view::{bold, centered, pad, scrolled_windows, selected, width_of, wrap, wrap_rows};
 
@@ -46,6 +47,8 @@ pub enum Overlay {
         scroll: u16,
         online: bool,
     },
+    /// Tokens' filter (spec §5.3).
+    Filter(FilterDialog),
 }
 
 /// What a confirm dialog's answer goes to: a waiting CLI prompt, or the TUI's own question
@@ -86,9 +89,10 @@ const HELP_ACCOUNTS: [(&str, &str); 11] = [
     ("Enter", "history of the account"),
     ("J K", "scroll the detail's windows"),
 ];
-const HELP_TOKENS: [(&str, &str); 7] = [
+const HELP_TOKENS: [(&str, &str); 8] = [
     ("p", "period: day, month, session or block"),
     ("g", "group: none, account, model, or both"),
+    ("f", "filter accounts and models"),
     ("[ ]", "range: 7, 30 or 90 days, or all"),
     ("Enter", "drill down: sessions, then models"),
     ("Esc  Backspace", "back up a level"),
@@ -102,7 +106,7 @@ const HELP_HISTORY: [(&str, &str); 3] = [
 ];
 
 /// The rows a choice takes, at most (R21): a CLI's `<provider> #<n> <name> [<org>]` fits.
-const CHOICE_ROWS: usize = 3;
+pub(crate) const CHOICE_ROWS: usize = 3;
 
 /// The rows a dialog's question takes on a terminal `height` rows tall: a third of it at most,
 /// so its buttons, choices or input always show (R21).
@@ -452,6 +456,7 @@ fn overlay_key(
                 )
             }
         },
+        Overlay::Filter(dialog) => filter::handle_key(state, dialog, key, now_ms),
     }
 }
 
@@ -726,6 +731,7 @@ pub fn render_overlay(state: &State, frame: &mut Frame, now_ms: i64) {
                 "o online · Esc close · ↑ ↓ scroll",
             );
         }
+        Overlay::Filter(dialog) => filter::render(state, dialog, frame),
     }
 }
 
@@ -765,7 +771,7 @@ fn help_line(key: &str, what: &str) -> Line<'static> {
 }
 
 /// `lines` in a bordered box `w` wide, as tall as they need, in the middle of `area`.
-fn boxed(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, w: u16) {
+pub(crate) fn boxed(frame: &mut Frame, area: Rect, title: &str, lines: Vec<Line<'static>>, w: u16) {
     let h = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);

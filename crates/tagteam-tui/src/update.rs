@@ -102,6 +102,10 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             vec![]
         }
         Msg::Refreshed { result } => screens::tokens::index::on_refreshed(state, result, now_ms),
+        Msg::Inventory { r#gen, result } => {
+            screens::tokens::filter::on_inventory(state, r#gen, result);
+            vec![]
+        }
         Msg::Prompt(prompt) => {
             state.dirty = true;
             actions::on_prompt(state, prompt);

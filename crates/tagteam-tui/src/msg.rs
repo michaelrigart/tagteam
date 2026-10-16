@@ -40,8 +40,19 @@ pub enum ActionsReq {
 /// state (spec §4.3, §6.4).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReportReq {
-    Report { r#gen: u64, query: TokenQuery },
-    IndexState { r#gen: u64, provider: ProviderId },
+    Report {
+        r#gen: u64,
+        query: TokenQuery,
+    },
+    IndexState {
+        r#gen: u64,
+        provider: ProviderId,
+    },
+    /// The filter's inventory: an unfiltered report (spec §5.3).
+    Inventory {
+        r#gen: u64,
+        query: TokenQuery,
+    },
 }
 
 /// The index lane's requests: the token index's catch-up, which can run for minutes on a cold
@@ -69,6 +80,7 @@ impl Coalesce for ReportReq {
             (self, other),
             (ReportReq::Report { .. }, ReportReq::Report { .. })
                 | (ReportReq::IndexState { .. }, ReportReq::IndexState { .. })
+                | (ReportReq::Inventory { .. }, ReportReq::Inventory { .. })
         )
     }
 }
@@ -126,6 +138,11 @@ pub enum Msg {
     Refreshed {
         result: Result<RefreshOutcome, SourceError>,
     },
+    /// The filter's inventory (spec §5.3).
+    Inventory {
+        r#gen: u64,
+        result: Result<TokenReport, SourceError>,
+    },
     Prompt(Prompt),
     ActionDone {
         action: Action,
@@ -181,6 +198,11 @@ pub enum Cmd {
     /// A refresh of the index, on the index lane (spec §6.4).
     RefreshIndex {
         provider: ProviderId,
+    },
+    /// The filter's inventory, on the report lane (spec §5.3).
+    LoadInventory {
+        r#gen: u64,
+        query: TokenQuery,
     },
     Act(Action),
     /// Run `action` with the terminal handed back (spec §7.3).
@@ -241,6 +263,12 @@ mod tests {
         };
         assert!(state(1).same_as(&state(2)));
         assert!(!state(1).same_as(&report(1, 7)));
+        let inventory = |g| ReportReq::Inventory {
+            r#gen: g,
+            query: query(0),
+        };
+        assert!(inventory(1).same_as(&inventory(2)));
+        assert!(!inventory(1).same_as(&report(1, 0)));
         let refresh = |p: &str| IndexReq::Refresh {
             provider: ProviderId::new(p),
         };
