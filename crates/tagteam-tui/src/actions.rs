@@ -86,13 +86,14 @@ const HELP_ACCOUNTS: [(&str, &str); 11] = [
     ("Enter", "history of the account"),
     ("J K", "scroll the detail's windows"),
 ];
-const HELP_TOKENS: [(&str, &str); 6] = [
+const HELP_TOKENS: [(&str, &str); 7] = [
     ("p", "period: day, month, session or block"),
     ("g", "group: none, account, model, or both"),
     ("[ ]", "range: 7, 30 or 90 days, or all"),
     ("Enter", "drill down: sessions, then models"),
     ("Esc  Backspace", "back up a level"),
     ("r", "refresh the token index"),
+    ("J K", "scroll the detail and the notes"),
 ];
 const HELP_HISTORY: [(&str, &str); 3] = [
     ("[ ]", "range: 1, 7, 14 or 30 days"),

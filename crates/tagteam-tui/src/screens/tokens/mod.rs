@@ -4,11 +4,10 @@
 //! and the index's catch-up on the index lane (`index`).
 
 pub mod index;
+mod table;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use jiff::tz::TimeZone;
-use ratatui::Frame;
-use ratatui::layout::Rect;
 use tagteam_core::ProviderId;
 use tagteam_engine::tokens::{
     AccountSel, RowKey, TokenGrouping, TokenPeriod, TokenQuery, TokenReport, TokenRow,
@@ -16,6 +15,7 @@ use tagteam_engine::tokens::{
 };
 
 use self::index::IndexWatch;
+pub use self::table::render;
 use crate::msg::Cmd;
 use crate::source::SourceError;
 use crate::state::{Screen, State};
@@ -71,14 +71,24 @@ struct Level {
     query: Option<TokenQuery>,
     report: Option<TokenReport>,
     selected: Option<RowKey>,
+    /// The first table line shown; clamped where it is used (R22).
+    offset: usize,
+    /// The report's column widths, found when it is first drawn.
+    widths: table::Widths,
 }
 
 impl Level {
     fn top() -> Level {
+        Level::with(None)
+    }
+
+    fn with(query: Option<TokenQuery>) -> Level {
         Level {
-            query: None,
+            query,
             report: None,
             selected: None,
+            offset: 0,
+            widths: table::Widths::default(),
         }
     }
 }
@@ -105,6 +115,10 @@ pub struct TokensState {
     error: Option<String>,
     /// The index's state, its refresh, and the timers that read the report again (§6.4).
     watch: IndexWatch,
+    /// How far what lies below the total is scrolled (`J`/`K`, B25), and for which row: another
+    /// row's starts at its top.
+    below_from: usize,
+    below_for: Option<RowKey>,
 }
 
 impl TokensState {
@@ -124,6 +138,8 @@ impl TokensState {
             again: false,
             error: None,
             watch: IndexWatch::default(),
+            below_from: 0,
+            below_for: None,
         }
     }
 
@@ -250,6 +266,7 @@ impl TokensState {
             level.selected = Some(report.rows[at].key.clone());
         }
         level.report = Some(report);
+        level.widths = table::Widths::default();
     }
 
     /// Moves the selection `by` rows, stopping at either end.
@@ -271,6 +288,7 @@ impl TokensState {
     fn reset(&mut self) {
         self.levels.truncate(1);
         self.levels[0].report = None;
+        self.levels[0].widths = table::Widths::default();
     }
 }
 
@@ -353,12 +371,17 @@ pub fn footer_keys(state: &TokensState) -> Vec<(&'static str, &'static str)> {
 }
 
 /// The Tokens screen's keys (spec §5.6): `p` period, `g` group, `[` `]` range, `Enter` down a
-/// level, `Esc`/`Backspace` up one, and the rows.
+/// level, `Esc`/`Backspace` up one, the rows, which keep the selected one in view, and `J`/`K`,
+/// which scroll what lies below the total (B25).
 pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
+    let body = crate::view::body_at(state);
+    let page = table::page(state, body, now_ms).max(1) as isize;
     let t = &mut state.tokens;
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => t.step(1),
         KeyCode::Char('k') | KeyCode::Up => t.step(-1),
+        KeyCode::PageDown => t.step(page),
+        KeyCode::PageUp => t.step(-page),
         KeyCode::Home => t.step(isize::MIN / 2),
         KeyCode::End => t.step(isize::MAX / 2),
         KeyCode::Char('p') => {
@@ -391,10 +414,20 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
             t.reset();
             return load(state, now_ms);
         }
+        KeyCode::Char('J') | KeyCode::Char('K') => {
+            let by = if key.code == KeyCode::Char('J') {
+                1
+            } else {
+                -1
+            };
+            table::scroll_below(state, body, now_ms, by);
+            return vec![];
+        }
         KeyCode::Enter => return drill(state, now_ms),
         KeyCode::Esc | KeyCode::Backspace => return up(state, now_ms),
-        _ => {}
+        _ => return vec![],
     }
+    table::follow(state, body, now_ms);
     vec![]
 }
 
@@ -408,11 +441,7 @@ fn drill(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     let Some(query) = report.query.drill(row) else {
         return vec![];
     };
-    t.levels.push(Level {
-        query: Some(query),
-        report: None,
-        selected: None,
-    });
+    t.levels.push(Level::with(Some(query)));
     load(state, now_ms)
 }
 
@@ -425,9 +454,6 @@ fn up(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     state.tokens.levels.pop();
     load(state, now_ms)
 }
-
-/// Stands in for the report's table until it is drawn.
-pub fn render(_state: &State, _frame: &mut Frame, _area: Rect, _now_ms: i64) {}
 
 #[cfg(test)]
 mod tests {
@@ -806,6 +832,7 @@ mod tests {
             "drill down: sessions, then models",
             "back up a level",
             "refresh the token index",
+            "scroll the detail and the notes",
         ] {
             assert!(lines.iter().any(|l| l.contains(what)), "{what}: {lines:?}");
         }
