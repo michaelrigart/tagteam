@@ -801,8 +801,8 @@ fn crumbs(t: &TokensState, now_ms: i64) -> Option<String> {
 }
 
 /// The screen's own header (spec §5.3), three rows at most (B29):
-/// 1. the periods with the shown one bracketed, the range, and the grouping the report applies
-///    (blocks are per account): 60 columns at the widest;
+/// 1. the periods with the top level's bracketed, its range, and the grouping its report applies
+///    (blocks are per account), whatever level is shown: 60 columns at the widest;
 /// 2. the filter and the rows the drill-down came through, on the first row when they fit
 ///    there whole; else on a row of their own, the filter cut first, to `FILTER_LEAST`, then
 ///    the drill-down, each with `…`. The filter's dialog shows it whole, and the detail the
@@ -831,7 +831,7 @@ fn header(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
             tabs.push(Span::raw(name));
         }
     }
-    let applied = t.query(now_ms).applied_grouping();
+    let applied = t.top_query(now_ms).applied_grouping();
     tabs.push(Span::raw(format!(
         "  {}  group: {}",
         t.range.label(t.period),
@@ -1627,6 +1627,43 @@ mod tests {
         assert_eq!(
             lines[2],
             " filter: all accounts · all models  › 2026-09-20 1 a1@x.co"
+        );
+    }
+
+    #[test]
+    fn the_header_names_the_top_levels_grouping_at_every_depth() {
+        // `g` changes the top level's grouping; a drilled level's own is not what it sets.
+        let mut state = showing_after("g", days());
+        assert_eq!(
+            draw(&state, 80, 24)[1],
+            " [Day] Month Session Block  30 days  group: model"
+        );
+        for rows in [
+            vec![session("3f2a9c1d", row_account(1))],
+            vec![session("3f2a9c1d", row_account(1))],
+        ] {
+            let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+            let [Cmd::LoadReport { r#gen, query }] = down.as_slice() else {
+                panic!("{down:?}");
+            };
+            let result = Ok(token_report(query.clone(), rows));
+            update(
+                &mut state,
+                Msg::TokenReport {
+                    r#gen: *r#gen,
+                    result,
+                },
+                NOW_MS,
+            );
+        }
+        assert_eq!(state.tokens.depth(), 2);
+        assert_eq!(
+            state.tokens.report().map(|r| r.query.grouping),
+            Some(TokenGrouping::AccountModel)
+        );
+        assert_eq!(
+            draw(&state, 80, 24)[1],
+            " [Day] Month Session Block  30 days  group: model"
         );
     }
 
