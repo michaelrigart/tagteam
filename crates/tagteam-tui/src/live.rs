@@ -216,20 +216,29 @@ fn run(path: &Path, backoff: Backoff, queue: &LiveQueue) {
     let mut wait = backoff.first;
     let mut links = 0;
     loop {
-        let pause = match attempt(path, queue, &mut links) {
-            Attempt::Gone => return,
-            Attempt::Mismatch => backoff.mismatch,
-            Attempt::Lost { lasted } if lasted >= backoff.most => {
-                wait = (backoff.first * 2).min(backoff.most);
-                backoff.first
-            }
-            Attempt::Lost { .. } | Attempt::Failed => {
-                let pause = wait;
-                wait = (wait * 2).min(backoff.most);
-                pause
-            }
-        };
-        thread::sleep(pause);
+        let tried = attempt(path, queue, &mut links);
+        if matches!(tried, Attempt::Gone) {
+            return;
+        }
+        thread::sleep(pause(&mut wait, &tried, backoff));
+    }
+}
+
+/// How long to wait after `tried`, and `wait` moved on for the one after: a mismatch waits
+/// `mismatch` and leaves `wait` alone; a link that lasted at least `most` waits `first` and
+/// starts the doubling over; any other failure waits `wait` and doubles it, up to `most`.
+fn pause(wait: &mut Duration, tried: &Attempt, backoff: Backoff) -> Duration {
+    match tried {
+        Attempt::Mismatch => backoff.mismatch,
+        Attempt::Lost { lasted } if *lasted >= backoff.most => {
+            *wait = (backoff.first * 2).min(backoff.most);
+            backoff.first
+        }
+        Attempt::Lost { .. } | Attempt::Failed | Attempt::Gone => {
+            let now = *wait;
+            *wait = (now * 2).min(backoff.most);
+            now
+        }
     }
 }
 
@@ -305,5 +314,79 @@ pub fn fetch_status(path: &Path) -> Result<Status, String> {
         Ok(Connect::NoDaemon) => Err(NO_DAEMON.to_owned()),
         Ok(Connect::Mismatch { server, .. }) => Err(format!("the daemon speaks protocol {server}")),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn backoff() -> Backoff {
+        Backoff {
+            first: ms(20),
+            most: ms(160),
+            mismatch: ms(1_000),
+        }
+    }
+
+    #[test]
+    fn failures_wait_first_then_twice_as_long_up_to_most() {
+        let b = backoff();
+        let mut wait = b.first;
+        let waits: Vec<Duration> = (0..7)
+            .map(|_| pause(&mut wait, &Attempt::Failed, b))
+            .collect();
+        assert_eq!(waits, [20, 40, 80, 160, 160, 160, 160].map(ms));
+    }
+
+    #[test]
+    fn a_link_that_goes_down_within_most_doubles_the_wait_like_a_failure() {
+        let b = backoff();
+        let mut wait = b.first;
+        let lost = Attempt::Lost { lasted: ms(159) };
+        let waits: Vec<Duration> = (0..4).map(|_| pause(&mut wait, &lost, b)).collect();
+        assert_eq!(waits, [20, 40, 80, 160].map(ms));
+    }
+
+    #[test]
+    fn a_link_that_lasted_most_waits_first_and_starts_the_doubling_over() {
+        let b = backoff();
+        let mut wait = b.first;
+        for _ in 0..5 {
+            pause(&mut wait, &Attempt::Failed, b);
+        }
+        assert_eq!(wait, b.most);
+        let lasted = Attempt::Lost { lasted: b.most };
+        assert_eq!(pause(&mut wait, &lasted, b), b.first);
+        assert_eq!(pause(&mut wait, &Attempt::Failed, b), ms(40));
+        assert_eq!(pause(&mut wait, &Attempt::Failed, b), ms(80));
+    }
+
+    #[test]
+    fn a_mismatch_waits_its_own_time_and_leaves_the_wait_as_it_was() {
+        let b = backoff();
+        let mut wait = ms(80);
+        assert_eq!(pause(&mut wait, &Attempt::Mismatch, b), b.mismatch);
+        assert_eq!(wait, ms(80));
+        assert_eq!(pause(&mut wait, &Attempt::Failed, b), ms(80));
+    }
+
+    #[test]
+    fn the_doubling_never_passes_most_when_first_is_longer_than_half_of_it() {
+        let b = Backoff {
+            first: ms(100),
+            most: ms(150),
+            mismatch: ms(1),
+        };
+        let mut wait = b.first;
+        assert_eq!(pause(&mut wait, &Attempt::Failed, b), ms(100));
+        assert_eq!(pause(&mut wait, &Attempt::Failed, b), ms(150));
+        let lasted = Attempt::Lost { lasted: b.most };
+        assert_eq!(pause(&mut wait, &lasted, b), ms(100));
+        assert_eq!(wait, ms(150));
     }
 }
