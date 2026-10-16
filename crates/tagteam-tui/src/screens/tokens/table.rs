@@ -24,6 +24,9 @@ use crate::view::{bold, fit, selected, severity_style, width_of, wrap};
 pub const WIDE: usize = 120;
 /// Drawn while a query for a report not yet read runs.
 pub const LOADING: &str = "loading…";
+/// What an empty report says while the index has never completed a refresh: the usage is not
+/// missing from the range, it is not read in yet.
+const NOT_INDEXED: &str = "No token usage indexed yet.";
 /// The cost bar's cells.
 const BAR: usize = 8;
 /// The table keeps this many rows at least; the detail and the notes below it scroll (B25).
@@ -1080,7 +1083,13 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
         return;
     };
     if report.rows.is_empty() {
-        lines.push(Line::from(format!(" {}", words::NO_TOKEN_USAGE)));
+        let unbuilt = t.watch.state().is_some_and(|i| i.refreshed_at_ms.is_none());
+        let none = if unbuilt {
+            NOT_INDEXED
+        } else {
+            words::NO_TOKEN_USAGE
+        };
+        lines.push(Line::from(format!(" {none}")));
         frame.render_widget(Paragraph::new(lines), area);
         return;
     }
@@ -1537,6 +1546,21 @@ mod tests {
         let lines = draw(&empty, 80, 24);
         assert_eq!(lines[4], " No token usage in this range.");
         assert_eq!(lines[5], "");
+    }
+
+    #[test]
+    fn an_empty_report_of_an_index_not_built_yet_says_so() {
+        let unbuilt = IndexState {
+            refreshed_at_ms: None,
+            ..IndexState::default()
+        };
+        let state = showing(vec![], |r| r.index = unbuilt);
+        let lines = draw(&state, 80, 24);
+        assert_eq!(lines[3], " UTC · catching up");
+        assert_eq!(lines[4], " No token usage indexed yet.");
+        assert_eq!(lines[5], "");
+        let built = showing(vec![], |_| {});
+        assert_eq!(draw(&built, 80, 24)[4], " No token usage in this range.");
     }
 
     #[test]
