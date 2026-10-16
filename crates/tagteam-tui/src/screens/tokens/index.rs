@@ -19,6 +19,8 @@ pub const REQUERY_MS: i64 = 60_000;
 /// ... and while a refresh runs, the index's state is checked this often, so the table fills
 /// in as its batches commit.
 pub const CHECK_MS: i64 = 5_000;
+/// What a failed check of the index's state is shown as, before the engine's words.
+const CHECK_FAILED: &str = "the token index's state was not read: ";
 /// `r` while the TUI's own refresh runs.
 pub const ALREADY: &str = "the token index is already being refreshed";
 
@@ -180,10 +182,18 @@ pub(crate) fn on_index_state(
     let index = match result {
         Ok(index) => index,
         Err(e) => {
-            state.tokens.error = Some(e.message);
+            state.tokens.error = Some(format!("{CHECK_FAILED}{}", e.message));
             return vec![];
         }
     };
+    if state
+        .tokens
+        .error
+        .as_deref()
+        .is_some_and(|e| e.starts_with(CHECK_FAILED))
+    {
+        state.tokens.error = None;
+    }
     let shown = state.tokens.report().map(|r| r.index.changed_at_ms);
     state.tokens.watch.state = Some(index);
     let moved = shown.is_some_and(|shown| index.changed_at_ms > shown);
@@ -191,6 +201,17 @@ pub(crate) fn on_index_state(
         return requery(state, now_ms);
     }
     vec![]
+}
+
+/// A query goes out (it was asked for, or Tokens opened): the 60 s re-query counts from now, and
+/// an active block that has already ended is covered by it.
+pub(crate) fn on_load(state: &mut State, now_ms: i64) {
+    let ended = state.tokens.report().and_then(active_end);
+    let watch = &mut state.tokens.watch;
+    watch.next_query_ms = now_ms + REQUERY_MS;
+    if let Some(end) = ended.filter(|end| now_ms >= *end) {
+        watch.ended = Some(end);
+    }
 }
 
 /// A report arrived, or failed: the 60 s re-query counts from now, and a report's index state
@@ -270,6 +291,9 @@ pub(crate) fn on_tick(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     let watch = &state.tokens.watch;
     if (watch.refreshing.is_some() || watch.busy) && now_ms >= watch.next_check_ms {
         cmds.extend(check(state, now_ms));
+    }
+    if state.tokens.pending() {
+        return cmds;
     }
     let ended = state
         .tokens
@@ -653,6 +677,123 @@ mod tests {
         );
         update(&mut state, ch('r'), NOW_MS);
         update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+        assert_eq!(state.tokens.error(), None);
+    }
+
+    #[test]
+    fn returning_to_tokens_after_a_while_reads_the_report_once() {
+        let mut state = on_tokens();
+        update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+        update(&mut state, ch('1'), NOW_MS + 1_000);
+        let cmds = token_cmds(update(&mut state, ch('2'), NOW_MS + 300_000));
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::LoadReport { .. }]),
+            "{cmds:?}"
+        );
+        let ticked = tick(&mut state, NOW_MS + 300_250);
+        assert!(
+            ticked.iter().all(|c| !matches!(c, Cmd::LoadReport { .. })),
+            "{ticked:?}"
+        );
+        let rest = {
+            let [Cmd::LoadReport { r#gen, query }] = cmds.as_slice() else {
+                unreachable!()
+            };
+            let mut report = token_report(query.clone(), vec![]);
+            report.index.changed_at_ms = Some(NOW_MS - 60_000);
+            update(
+                &mut state,
+                Msg::TokenReport {
+                    r#gen: *r#gen,
+                    result: Ok(report),
+                },
+                NOW_MS + 300_300,
+            )
+        };
+        assert!(
+            token_cmds(rest).is_empty(),
+            "a second read after the first returns"
+        );
+    }
+
+    #[test]
+    fn returning_to_tokens_past_an_active_blocks_end_reads_the_report_once() {
+        let mut state = on_tokens();
+        update(&mut state, Msg::Refreshed { result: done() }, NOW_MS);
+        update(&mut state, ch('p'), NOW_MS);
+        update(&mut state, ch('p'), NOW_MS);
+        let blocks = update(&mut state, ch('p'), NOW_MS);
+        let end = NOW_MS + 30_000;
+        let rows = vec![block(end - 5 * 3_600_000, end, true)];
+        answer(&mut state, &blocks, rows, NOW_MS - 60_000, NOW_MS);
+        update(&mut state, ch('1'), NOW_MS + 1_000);
+        let later = end + 10_000;
+        let cmds = token_cmds(update(&mut state, ch('2'), later));
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::LoadReport { .. }]),
+            "{cmds:?}"
+        );
+        let ticked = tick(&mut state, later + 250);
+        assert!(
+            ticked.iter().all(|c| !matches!(c, Cmd::LoadReport { .. })),
+            "{ticked:?}"
+        );
+        let [Cmd::LoadReport { r#gen, query }] = cmds.as_slice() else {
+            unreachable!()
+        };
+        let mut report = token_report(query.clone(), vec![block(end - 5 * 3_600_000, end, true)]);
+        report.index.changed_at_ms = Some(NOW_MS - 60_000);
+        let rest = update(
+            &mut state,
+            Msg::TokenReport {
+                r#gen: *r#gen,
+                result: Ok(report),
+            },
+            later + 300,
+        );
+        assert!(token_cmds(rest).is_empty(), "a second read after the first");
+        assert!(
+            tick(&mut state, later + 500)
+                .iter()
+                .all(|c| !matches!(c, Cmd::LoadReport { .. }))
+        );
+    }
+
+    #[test]
+    fn a_failed_check_says_so_and_the_next_good_one_clears_it() {
+        let mut state = on_tokens();
+        let check = tick(&mut state, NOW_MS + 1_000);
+        let [Cmd::LoadIndexState { r#gen, .. }] = check.as_slice() else {
+            panic!("{check:?}");
+        };
+        let failed = Err(SourceError {
+            kind: "store".into(),
+            message: "the store is locked".into(),
+        });
+        update(
+            &mut state,
+            Msg::IndexState {
+                r#gen: *r#gen,
+                result: failed,
+            },
+            NOW_MS + 1_100,
+        );
+        assert_eq!(
+            state.tokens.error(),
+            Some("the token index's state was not read: the store is locked")
+        );
+        let check = tick(&mut state, NOW_MS + 6_000);
+        let [Cmd::LoadIndexState { r#gen, .. }] = check.as_slice() else {
+            panic!("{check:?}");
+        };
+        update(
+            &mut state,
+            Msg::IndexState {
+                r#gen: *r#gen,
+                result: Ok(index_changed_at(NOW_MS - 60_000)),
+            },
+            NOW_MS + 6_100,
+        );
         assert_eq!(state.tokens.error(), None);
     }
 }
