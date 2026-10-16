@@ -89,6 +89,9 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                 }
             }
         }
+        Msg::TokenReport { r#gen, result } => {
+            screens::tokens::on_report(state, r#gen, result, now_ms)
+        }
         Msg::Prompt(prompt) => {
             state.dirty = true;
             actions::on_prompt(state, prompt);
@@ -186,6 +189,7 @@ fn on_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     match key.code {
         KeyCode::Char('q') => quit(state, 0),
         KeyCode::Char('1') => show(state, Screen::Accounts, now_ms),
+        KeyCode::Char('2') => show(state, Screen::Tokens, now_ms),
         KeyCode::Char('3') => show(state, Screen::History, now_ms),
         KeyCode::Tab => show(state, state.screen.next(), now_ms),
         KeyCode::BackTab => show(state, state.screen.prev(), now_ms),
@@ -197,13 +201,15 @@ fn on_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
             Some(cmds) => cmds,
             None => match state.screen {
                 Screen::Accounts => screens::accounts::handle_key(state, key, now_ms),
+                Screen::Tokens => screens::tokens::handle_key(state, key, now_ms),
                 Screen::History => screens::history::handle_key(state, key, now_ms),
             },
         },
     }
 }
 
-/// Switches to `screen`; History reads its account's history as it opens.
+/// Switches to `screen`; Tokens reads its report and History its account's history as they
+/// open.
 pub(crate) fn show(state: &mut State, screen: Screen, now_ms: i64) -> Vec<Cmd> {
     if state.screen == screen {
         return vec![];
@@ -211,6 +217,7 @@ pub(crate) fn show(state: &mut State, screen: Screen, now_ms: i64) -> Vec<Cmd> {
     state.screen = screen;
     match screen {
         Screen::Accounts => vec![],
+        Screen::Tokens => screens::tokens::on_enter(state, now_ms),
         Screen::History => screens::history::on_enter(state, now_ms),
     }
 }
@@ -259,26 +266,23 @@ mod tests {
     }
 
     #[test]
-    fn the_screen_keys_switch_screens_and_two_waits_for_part_b() {
+    fn the_screen_keys_switch_screens_in_their_numbers_order() {
         let mut state = fresh(Screen::Accounts);
         update(&mut state, ch('3'), NOW_MS);
         assert_eq!(state.screen, Screen::History);
         update(&mut state, ch('2'), NOW_MS);
-        assert_eq!(
-            state.screen,
-            Screen::History,
-            "2 is the Tokens screen, part B's"
-        );
+        assert_eq!(state.screen, Screen::Tokens);
         update(&mut state, ch('1'), NOW_MS);
         assert_eq!(state.screen, Screen::Accounts);
-        update(&mut state, key(KeyCode::Tab), NOW_MS);
-        assert_eq!(state.screen, Screen::History);
-        update(
-            &mut state,
-            Msg::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
-            NOW_MS,
-        );
-        assert_eq!(state.screen, Screen::Accounts);
+        let back_tab = || Msg::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        for screen in [Screen::Tokens, Screen::History, Screen::Accounts] {
+            update(&mut state, key(KeyCode::Tab), NOW_MS);
+            assert_eq!(state.screen, screen);
+        }
+        for screen in [Screen::History, Screen::Tokens, Screen::Accounts] {
+            update(&mut state, back_tab(), NOW_MS);
+            assert_eq!(state.screen, screen);
+        }
     }
 
     #[test]
@@ -469,6 +473,7 @@ mod tests {
                     ),
                     "{cmds:?}"
                 ),
+                Screen::Tokens => unreachable!("not among the screens this test opens"),
             }
             assert!(state.toast.is_none() && state.banner.is_none());
             // A failure of the older run says nothing and reads nothing.

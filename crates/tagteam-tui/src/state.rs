@@ -7,6 +7,7 @@ use crate::host::Action;
 use crate::msg::Cmd;
 use crate::screens::accounts::AccountsState;
 use crate::screens::history::HistoryState;
+use crate::screens::tokens::TokensState;
 
 /// Timer mode re-reads and collects this often (spec §6.2).
 pub const REFRESH_MS: i64 = 30_000;
@@ -16,14 +17,16 @@ pub const TOAST_MS: i64 = 5_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Accounts,
+    Tokens,
     History,
-} // part B inserts Tokens between them
+}
 
 impl Screen {
-    /// `Tab`'s order.
+    /// `Tab`'s order: the screens' numbers (spec §5.6).
     pub(crate) fn next(self) -> Screen {
         match self {
-            Screen::Accounts => Screen::History,
+            Screen::Accounts => Screen::Tokens,
+            Screen::Tokens => Screen::History,
             Screen::History => Screen::Accounts,
         }
     }
@@ -32,7 +35,8 @@ impl Screen {
     pub(crate) fn prev(self) -> Screen {
         match self {
             Screen::Accounts => Screen::History,
-            Screen::History => Screen::Accounts,
+            Screen::Tokens => Screen::Accounts,
+            Screen::History => Screen::Tokens,
         }
     }
 }
@@ -43,6 +47,7 @@ pub struct State {
     pub color: bool,
     pub provider: Option<ProviderId>,
     pub accounts: AccountsState,
+    pub tokens: TokensState,
     pub history: HistoryState,
     pub overlay: Option<Overlay>,
     pub toast: Option<Toast>,
@@ -61,6 +66,8 @@ pub struct State {
     /// The second the screen was last drawn for: its countdowns change at most once a second
     /// (spec §5.2, "Countdowns tick").
     pub(crate) shown_s: i64,
+    /// When the state was made: the time the first reads are asked for at (`start`).
+    pub(crate) started_ms: i64,
 }
 
 /// What raised the banner (spec §10.4).
@@ -82,6 +89,7 @@ pub struct Gens {
     pub accounts: u64,
     pub history: u64,
     pub collect: u64,
+    pub report: u64,
 }
 
 pub struct Refresh {
@@ -89,13 +97,20 @@ pub struct Refresh {
 }
 
 impl State {
-    pub fn new(screen: Screen, color: bool, provider: Option<ProviderId>, now_ms: i64) -> State {
+    pub fn new(
+        screen: Screen,
+        color: bool,
+        provider: Option<ProviderId>,
+        tokens: TokensState,
+        now_ms: i64,
+    ) -> State {
         State {
             screen,
             size: (0, 0),
             color,
             provider,
             accounts: AccountsState::default(),
+            tokens,
             history: HistoryState::default(),
             overlay: None,
             toast: None,
@@ -109,13 +124,19 @@ impl State {
             quitting: None,
             dirty: true,
             shown_s: now_ms.div_euclid(1000),
+            started_ms: now_ms,
         }
     }
 
-    /// The first `Cmd`s: load `accounts` (gen 1). History needs an account, which only the
-    /// first `accounts` result names, so a TUI started on History loads it once that arrives.
+    /// The first `Cmd`s: load `accounts` (gen 1), and on Tokens its report. History needs an
+    /// account, which only the first `accounts` result names, so a TUI started on History loads
+    /// it once that arrives.
     pub fn start(&mut self) -> Vec<Cmd> {
-        vec![self.load_accounts()]
+        let mut cmds = vec![self.load_accounts()];
+        if self.screen == Screen::Tokens {
+            cmds.extend(crate::screens::tokens::on_enter(self, self.started_ms));
+        }
+        cmds
     }
 
     /// A read of `accounts` under the next generation: any read still in flight is stale.

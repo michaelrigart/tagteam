@@ -4,6 +4,7 @@
 use std::sync::mpsc::Sender;
 
 use tagteam_core::AccountId;
+use tagteam_engine::tokens::{TokenQuery, TokenReport};
 use tagteam_engine::views::HistoryView;
 
 use crate::host::{Action, ActionOutcome};
@@ -35,6 +36,12 @@ pub enum ActionsReq {
     },
 }
 
+/// The report lane's requests: the token report, which reads the index only (spec §4.3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReportReq {
+    Report { r#gen: u64, query: TokenQuery },
+}
+
 impl Coalesce for ViewsReq {
     /// Any two of the same kind: only the newest read is worth making.
     fn same_as(&self, other: &Self) -> bool {
@@ -42,6 +49,16 @@ impl Coalesce for ViewsReq {
             (self, other),
             (ViewsReq::Accounts { .. }, ViewsReq::Accounts { .. })
                 | (ViewsReq::History { .. }, ViewsReq::History { .. })
+        )
+    }
+}
+
+impl Coalesce for ReportReq {
+    /// Any two of the same kind: only the newest query is worth making.
+    fn same_as(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (ReportReq::Report { .. }, ReportReq::Report { .. })
         )
     }
 }
@@ -78,6 +95,10 @@ pub enum Msg {
         r#gen: u64,
         result: Result<CollectSummary, SourceError>,
     },
+    TokenReport {
+        r#gen: u64,
+        result: Result<TokenReport, SourceError>,
+    },
     Prompt(Prompt),
     ActionDone {
         action: Action,
@@ -106,7 +127,7 @@ pub enum Answer {
     Choose(Option<usize>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     LoadAccounts {
         r#gen: u64,
@@ -119,6 +140,11 @@ pub enum Cmd {
     CollectDue {
         r#gen: u64,
         accounts: Vec<AccountId>,
+    },
+    /// The token report `query` asks for, on the report lane (spec §4.3).
+    LoadReport {
+        r#gen: u64,
+        query: TokenQuery,
     },
     Act(Action),
     /// Run `action` with the terminal handed back (spec §7.3).
@@ -153,6 +179,26 @@ mod tests {
         assert!(history(1, "a").same_as(&history(2, "b")));
         assert!(!accounts(1).same_as(&history(1, "a")));
         assert!(!history(1, "a").same_as(&accounts(1)));
+    }
+
+    #[test]
+    fn report_queries_coalesce_whatever_they_ask() {
+        let query = |days: i64| TokenQuery {
+            provider: ProviderId::new("claude-code"),
+            period: tagteam_engine::tokens::TokenPeriod::Day,
+            grouping: tagteam_engine::tokens::TokenGrouping::Account,
+            since_ms: Some(-days),
+            until_ms: None,
+            accounts: None,
+            models: None,
+            session: None,
+            tz: jiff::tz::TimeZone::UTC,
+        };
+        let report = |g, days| ReportReq::Report {
+            r#gen: g,
+            query: query(days),
+        };
+        assert!(report(1, 7).same_as(&report(2, 30)));
     }
 
     #[test]

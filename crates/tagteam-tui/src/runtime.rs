@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use jiff::tz::TimeZone;
 use tagteam_core::ProviderId;
 use tagteam_provider::Cancel;
 
@@ -15,7 +16,8 @@ use crate::ask::ChannelAsk;
 use crate::host::{Action, ActionOutcome, Host};
 use crate::input::{Input, Pause};
 use crate::lanes::Lane;
-use crate::msg::{ActionsReq, Cmd, Msg, ViewsReq};
+use crate::msg::{ActionsReq, Cmd, Msg, ReportReq, ViewsReq};
+use crate::screens::tokens::TokensState;
 use crate::source::{Source, SourceFactory};
 use crate::state::{Screen, State};
 use crate::term::{self, RealTty, Tty};
@@ -35,6 +37,11 @@ pub struct TuiOptions {
     pub screen: Screen,
     pub color: bool,
     pub provider: Option<ProviderId>,
+    /// The provider Tokens reports on: `--provider`'s, else the default (spec §5.3).
+    pub tokens_provider: ProviderId,
+    /// The zone of Tokens' days and months: the system zone (spec §5.3), read by the binary
+    /// before the terminal is touched, so the UI thread reads no zone file (B6).
+    pub tz: TimeZone,
     /// The process's signal token: the CLI's handlers record SIGINT, SIGTERM and SIGHUP in it.
     pub signal: Cancel,
     /// The shutdown token. The binary has already built every lane's engine, and the host's
@@ -172,15 +179,17 @@ fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-/// Part A's engine lanes (§4.3): views (`accounts`, `history`, store-served) and actions (the
-/// collector and every `Host` action, one at a time).
+/// The engine lanes (§4.3): views (`accounts`, `history`, store-served), report (the token
+/// report, which reads the index only) and actions (the collector and every `Host` action, one
+/// at a time).
 pub(crate) struct Lanes {
     views: Lane<ViewsReq>,
+    report: Lane<ReportReq>,
     actions: Lane<ActionsReq>,
 }
 
 impl Lanes {
-    /// Spawns both. Each builds its own `Source` in its own thread (R4), and a lane that panics
+    /// Spawns them. Each builds its own `Source` in its own thread (R4), and a lane that panics
     /// says so on `tx` (§4.3, §10.4).
     pub(crate) fn spawn(
         provider: Option<ProviderId>,
@@ -216,6 +225,25 @@ impl Lanes {
                 },
             )
         };
+        let report = {
+            let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
+            Lane::spawn(
+                "report",
+                move || make(),
+                move |source: &mut Box<dyn Source>, req: ReportReq| {
+                    let msg = match req {
+                        ReportReq::Report { r#gen, query } => Msg::TokenReport {
+                            r#gen,
+                            result: source.token_report(&query),
+                        },
+                    };
+                    let _ = out.send(msg);
+                },
+                move || {
+                    let _ = died.send(Msg::LaneDied { lane: "report" });
+                },
+            )
+        };
         let actions = {
             let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
             let (host, shutdown) = (Arc::clone(host), shutdown.clone());
@@ -243,21 +271,29 @@ impl Lanes {
                 },
             )
         };
-        Lanes { views, actions }
+        Lanes {
+            views,
+            report,
+            actions,
+        }
     }
 
     /// §10.2 step 2: nothing more is taken, what is queued is dropped, and an idle lane wakes
     /// and returns.
     fn close(&self) {
         self.views.close();
+        self.report.close();
         self.actions.close();
     }
 
-    /// §10.2 step 5: joins both lanes, and names those that panicked.
+    /// §10.2 step 5: joins every lane, and names those that panicked.
     fn join(self) -> Vec<&'static str> {
         let mut died = Vec::new();
         if self.views.join().is_err() {
             died.push("views");
+        }
+        if self.report.join().is_err() {
+            died.push("report");
         }
         if self.actions.join().is_err() {
             died.push("actions");
@@ -308,8 +344,15 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         lanes: &'a Lanes,
         host: &'a dyn Host,
     ) -> Self {
+        let tokens = TokensState::new(opts.tokens_provider.clone(), opts.tz.clone());
         Ui {
-            state: State::new(opts.screen, opts.color, opts.provider.clone(), now_ms()),
+            state: State::new(
+                opts.screen,
+                opts.color,
+                opts.provider.clone(),
+                tokens,
+                now_ms(),
+            ),
             tty,
             input,
             rx,
@@ -433,6 +476,9 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
                         .lanes
                         .actions
                         .submit(ActionsReq::Collect { r#gen, accounts });
+                }
+                Cmd::LoadReport { r#gen, query } => {
+                    let _ = self.lanes.report.submit(ReportReq::Report { r#gen, query });
                 }
                 Cmd::Act(action) => {
                     let _ = self.lanes.actions.submit(ActionsReq::Act { action });
@@ -983,6 +1029,8 @@ mod tests {
             screen: Screen::Accounts,
             color: false,
             provider: None,
+            tokens_provider: ProviderId::new("claude-code"),
+            tz: TimeZone::UTC,
             signal: Cancel::new(),
             shutdown: Cancel::new(),
         }
@@ -1169,14 +1217,39 @@ mod tests {
         assert_eq!((exit.code, exit.report), (0, None));
         assert_eq!(
             drops.load(Ordering::SeqCst),
-            2,
-            "both lanes ended before the TUI returned"
+            3,
+            "every lane ended before the TUI returned"
         );
         assert_eq!(
             shutdown.requested(),
             Some(libc::SIGINT),
             "§10.2 step 1: SIGINT for q"
         );
+    }
+
+    #[test]
+    fn tokens_reads_its_report_on_the_report_lane() {
+        let opts = TuiOptions {
+            screen: Screen::Tokens,
+            ..options()
+        };
+        let fx = Fixture::with(opts, quick(), |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            // The first frame waited for the accounts only; the report may come after it.
+            while ui.state.tokens.error().is_none() {
+                let msg = fx.rx.recv_timeout(Duration::from_secs(5));
+                ui.deliver(msg.expect("the report lane answered"));
+            }
+            assert_eq!(
+                ui.state.tokens.error(),
+                Some("no token report in this test")
+            );
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
     }
 
     #[test]
@@ -1808,7 +1881,7 @@ mod tests {
             || {},
         );
         assert_eq!((exit.code, exit.report), (1, None));
-        assert_eq!(drops.load(Ordering::SeqCst), 2, "both lanes were joined");
+        assert_eq!(drops.load(Ordering::SeqCst), 3, "every lane was joined");
         assert_eq!(shutdown.requested(), Some(libc::SIGINT));
     }
 }

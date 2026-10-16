@@ -3,17 +3,23 @@
 #![allow(dead_code)]
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use jiff::tz::TimeZone;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::{Buffer, CellWidth};
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Sample, Window, WindowKind};
 use tagteam_engine::store::AccountRow;
+use tagteam_engine::tokens::{
+    Cost, IndexState, PeriodKey, RowAccount, RowKey, TokenCounts, TokenGrouping, TokenPeriod,
+    TokenQuery, TokenReport, TokenRow, TokenTotal,
+};
 use tagteam_engine::views::{
     AccountView, HistoryView, HistoryWindow, ProviderAccounts, UsageStatus, UsageView,
 };
 use tagteam_provider::KindTraits;
 
 use crate::msg::Msg;
+use crate::screens::tokens::TokensState;
 use crate::source::AccountsSnapshot;
 use crate::state::{Screen, State};
 
@@ -158,9 +164,11 @@ pub(crate) fn many(n: u32) -> Vec<AccountView> {
         .collect()
 }
 
-/// A State on `screen` at 80×24, without colour, nothing loaded yet.
+/// A State on `screen` at 80×24, without colour, nothing loaded yet. Tokens reports on Claude
+/// Code in UTC.
 pub(crate) fn fresh(screen: Screen) -> State {
-    let mut state = State::new(screen, false, None, NOW_MS);
+    let tokens = TokensState::new(cc(), TimeZone::UTC);
+    let mut state = State::new(screen, false, None, tokens, NOW_MS);
     state.size = (80, 24);
     state
 }
@@ -262,5 +270,113 @@ pub(crate) fn history_of(account: AccountView, windows: Vec<HistoryWindow>) -> H
         account,
         windows,
         unmatched_window: false,
+    }
+}
+
+/// Fixture account `position` as a report row names it.
+pub(crate) fn row_account(position: u32) -> RowAccount {
+    RowAccount::Account {
+        id: id(position),
+        position,
+        label: format!("a{position}@x.co"),
+        alias: None,
+    }
+}
+
+/// The day `days_ago` days before `NOW_MS`'s, in UTC.
+pub(crate) fn day(days_ago: i64) -> PeriodKey {
+    let at = jiff::Timestamp::from_millisecond(NOW_MS - days_ago * 24 * HOUR * 1000).unwrap();
+    PeriodKey::Day {
+        date: at.to_zoned(TimeZone::UTC).date(),
+    }
+}
+
+/// `input` and `output` tokens, and `cache_read` read from the cache.
+pub(crate) fn counts(input: u64, output: u64, cache_read: u64) -> TokenCounts {
+    TokenCounts {
+        input,
+        output,
+        cache_read,
+        ..TokenCounts::default()
+    }
+}
+
+/// A row of `period`, grouped by `account` and `model` when they are given, of one response
+/// counting `counts`, costing `cost` nano-dollars (or nothing), keyed as the report keys it.
+pub(crate) fn token_row(
+    period: PeriodKey,
+    account: Option<RowAccount>,
+    model: Option<&str>,
+    counts: TokenCounts,
+    cost: Option<u64>,
+) -> TokenRow {
+    TokenRow {
+        key: RowKey::new(&period, account.as_ref(), model),
+        accounts: account.iter().cloned().collect(),
+        models: model.iter().map(|m| (*m).to_owned()).collect(),
+        period,
+        account,
+        model: model.map(str::to_owned),
+        counts,
+        responses: 1,
+        unfinalized: 0,
+        cost: cost.map(|usd_nanos| Cost {
+            usd_nanos,
+            partial: false,
+        }),
+    }
+}
+
+/// Claude Code's report by `period`, grouped by account, over the 30 days to `NOW_MS`, in UTC.
+pub(crate) fn token_query(period: TokenPeriod) -> TokenQuery {
+    TokenQuery {
+        provider: cc(),
+        period,
+        grouping: TokenGrouping::Account,
+        since_ms: Some(NOW_MS - 30 * 24 * HOUR * 1000),
+        until_ms: None,
+        accounts: None,
+        models: None,
+        session: None,
+        tz: TimeZone::UTC,
+    }
+}
+
+/// The report `query` asked for, holding `rows`: its total is theirs, and its index was
+/// refreshed and last changed a minute before `NOW_MS`.
+pub(crate) fn token_report(query: TokenQuery, rows: Vec<TokenRow>) -> TokenReport {
+    let mut total = TokenTotal::default();
+    for row in &rows {
+        let (t, c) = (&mut total.counts, &row.counts);
+        t.input += c.input;
+        t.output += c.output;
+        t.cache_write_5m += c.cache_write_5m;
+        t.cache_write_1h += c.cache_write_1h;
+        t.cache_read += c.cache_read;
+        total.responses += row.responses;
+        total.unfinalized += row.unfinalized;
+        total.cost = match (total.cost, row.cost) {
+            (None, cost) | (cost, None) => cost,
+            (Some(a), Some(b)) => Some(Cost {
+                usd_nanos: a.usd_nanos + b.usd_nanos,
+                partial: a.partial || b.partial,
+            }),
+        };
+    }
+    TokenReport {
+        query,
+        time_zone: "UTC".into(),
+        rows,
+        total,
+        index: IndexState {
+            refreshed_at_ms: Some(NOW_MS - 60_000),
+            changed_at_ms: Some(NOW_MS - 60_000),
+            files: 3,
+            responses: 3,
+            ..IndexState::default()
+        },
+        unpriced_models: vec![],
+        prices_as_of: "2026-10-01",
+        price_overrides: vec![],
     }
 }

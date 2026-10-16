@@ -65,7 +65,7 @@ pub enum TextThen {
 
 /// The help panel's keys (spec §5.6): everywhere, then the current screen's.
 const HELP_GLOBAL: [(&str, &str); 7] = [
-    ("1 3  Tab  Shift-Tab", "screens"),
+    ("1 2 3  Tab  Shift-Tab", "screens"),
     ("j k  ↑ ↓", "move"),
     ("A", "add the current login"),
     ("D", "doctor"),
@@ -85,6 +85,13 @@ const HELP_ACCOUNTS: [(&str, &str); 11] = [
     ("r", "refresh"),
     ("Enter", "history of the account"),
     ("J K", "scroll the detail's windows"),
+];
+const HELP_TOKENS: [(&str, &str); 5] = [
+    ("p", "period: day, month, session or block"),
+    ("g", "group: none, account, model, or both"),
+    ("[ ]", "range: 7, 30 or 90 days, or all"),
+    ("Enter", "drill down: sessions, then models"),
+    ("Esc  Backspace", "back up a level"),
 ];
 const HELP_HISTORY: [(&str, &str); 3] = [
     ("[ ]", "range: 1, 7, 14 or 30 days"),
@@ -581,12 +588,14 @@ pub fn render_overlay(state: &State, frame: &mut Frame, now_ms: i64) {
         Overlay::Help => {
             let keys: &[(&str, &str)] = match state.screen {
                 Screen::Accounts => &HELP_ACCOUNTS,
+                Screen::Tokens => &HELP_TOKENS,
                 Screen::History => &HELP_HISTORY,
             };
             let mut lines = vec![Line::from(Span::styled("Everywhere", bold()))];
             lines.extend(HELP_GLOBAL.iter().map(|(k, what)| help_line(k, what)));
             let title = match state.screen {
                 Screen::Accounts => "Accounts",
+                Screen::Tokens => "Tokens",
                 Screen::History => "History",
             };
             lines.push(Line::from(Span::styled(title, bold())));
