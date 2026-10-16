@@ -355,7 +355,8 @@ pub(crate) fn on_report(
 }
 
 /// The footer's keys (spec §5.6), in the order they give way at the end of a narrow line.
-/// `Enter` names what the selected row opens, and is left out where it opens nothing.
+/// `Enter` names what the selected row opens, and is left out where it opens nothing; `Esc` is
+/// left out at the top, where it does nothing.
 pub fn footer_keys(state: &TokensState) -> Vec<(&'static str, &'static str)> {
     let mut keys: Vec<(&'static str, &'static str)> = state
         .drill_to()
@@ -367,9 +368,11 @@ pub fn footer_keys(state: &TokensState) -> Vec<(&'static str, &'static str)> {
         ("g", "group"),
         ("f", "filter"),
         ("[ ]", "range"),
-        ("Esc", "back"),
-        ("r", "refresh"),
     ]);
+    if state.depth() > 0 {
+        keys.push(("Esc", "back"));
+    }
+    keys.push(("r", "refresh"));
     keys
 }
 
@@ -848,10 +851,21 @@ mod tests {
         let mut state = showing_days();
         assert_eq!(
             draw(&state, 80, 24)[23],
-            "Enter sessions  p period  g group  f filter  [ ] range  Esc back  r refresh"
+            "Enter sessions  p period  g group  f filter  [ ] range  r refresh",
+            "Esc does nothing at the top, so the footer leaves it out"
         );
         let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
         answer(&mut state, &down, vec![session("s1", 1)]);
-        assert!(draw(&state, 80, 24)[23].starts_with("Enter models  p period"));
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            "Enter models  p period  g group  f filter  [ ] range  Esc back  r refresh"
+        );
+        let down = update(&mut state, key(KeyCode::Enter), NOW_MS);
+        answer(&mut state, &down, vec![session("s1", 1)]);
+        assert_eq!(state.tokens.depth(), 2);
+        assert_eq!(
+            draw(&state, 80, 24)[23],
+            "p period  g group  f filter  [ ] range  Esc back  r refresh"
+        );
     }
 }

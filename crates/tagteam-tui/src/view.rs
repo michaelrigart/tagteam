@@ -487,7 +487,7 @@ mod tests {
         );
         assert_eq!(
             tokens[23],
-            "p period  g group  f filter  [ ] range  Esc back  r refresh"
+            "p period  g group  f filter  [ ] range  r refresh"
         );
     }
 

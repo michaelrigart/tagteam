@@ -1238,7 +1238,7 @@ mod tests {
         assert_eq!(lines[12], " API cost at list prices as of 2026-10-01.");
         assert_eq!(
             lines[23],
-            "Enter sessions  p period  g group  f filter  [ ] range  Esc back  r refresh"
+            "Enter sessions  p period  g group  f filter  [ ] range  r refresh"
         );
     }
 
