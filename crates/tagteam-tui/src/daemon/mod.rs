@@ -187,6 +187,7 @@ fn up(state: &mut State, link: u64, now_ms: i64) -> Vec<Cmd> {
 /// The link is down, or none came up: timer mode (spec §8), and the TUI knows who collects
 /// (C-R20). A mismatch seen before is gone too, since no daemon answered this time.
 fn down(state: &mut State) {
+    screens::tokens::index::on_link_down(state);
     let d = &mut state.daemon;
     if d.mismatch.take().is_some() {
         state.dirty = true;
@@ -348,16 +349,31 @@ pub(crate) fn keeps_index(state: &State) -> bool {
     let Some(status) = state.daemon.status() else {
         return false;
     };
-    if state.daemon.job(provider).is_none() {
+    // C-R8: a job waiting for a newer binary (`schema`) runs no index job.
+    let Some(job) = state.daemon.job(provider) else {
+        return false;
+    };
+    if job.mode == "waiting" && job.waiting_for.as_deref() == Some("schema") {
         return false;
     }
-    let ours = format!("{provider}: ");
     status.jobs.iter().any(|job| {
         job.name == TOKEN_INDEX
             && job
                 .last_error
                 .as_deref()
-                .is_none_or(|e| !(e.starts_with(&ours) || e.starts_with("store")))
+                .is_none_or(|e| names_another_provider(e, provider))
+    })
+}
+
+/// Whether the index job's `lastError` begins `<p>: ` for a provider `p` other than `provider`.
+/// Any other wording, a store error among them, is not known to leave this provider's index
+/// current.
+fn names_another_provider(error: &str, provider: &ProviderId) -> bool {
+    error.split_once(": ").is_some_and(|(p, _)| {
+        !p.is_empty()
+            && p != provider.as_str()
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     })
 }
 
