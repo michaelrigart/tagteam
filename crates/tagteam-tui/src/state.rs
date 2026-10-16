@@ -3,6 +3,7 @@
 use tagteam_core::{AccountId, ProviderId};
 
 use crate::actions::Overlay;
+use crate::daemon::DaemonState;
 use crate::host::Action;
 use crate::msg::Cmd;
 use crate::screens::accounts::AccountsState;
@@ -49,6 +50,8 @@ pub struct State {
     pub accounts: AccountsState,
     pub tokens: TokensState,
     pub history: HistoryState,
+    /// The daemon's link, and what it says (spec §8).
+    pub daemon: DaemonState,
     pub overlay: Option<Overlay>,
     pub toast: Option<Toast>,
     /// A failed read's error, in the CLI's words (spec §10.4).
@@ -114,6 +117,7 @@ impl State {
             accounts: AccountsState::default(),
             tokens,
             history: HistoryState::default(),
+            daemon: DaemonState::default(),
             overlay: None,
             toast: None,
             banner: None,

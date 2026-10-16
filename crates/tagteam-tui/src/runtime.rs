@@ -4,19 +4,22 @@
 
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use jiff::tz::TimeZone;
 use tagteam_core::ProviderId;
+use tagteam_daemon::protocol::Status;
 use tagteam_provider::Cancel;
 
 use crate::ask::ChannelAsk;
 use crate::host::{Action, ActionOutcome, Host};
 use crate::input::{Input, Pause};
 use crate::lanes::Lane;
-use crate::msg::{ActionsReq, Cmd, IndexReq, Msg, ReportReq, ViewsReq};
+use crate::live::{self, Backoff, LIVE_QUEUE, LiveQueue};
+use crate::msg::{ActionsReq, Cmd, DaemonReq, IndexReq, Msg, ReportReq, ViewsReq};
 use crate::screens::tokens::TokensState;
 use crate::source::{Source, SourceFactory};
 use crate::state::{Screen, State};
@@ -28,6 +31,9 @@ use crate::view::view;
 const WAKE: Duration = Duration::from_millis(250);
 /// How long the first frame waits for the first `accounts` (§6.1).
 const FIRST_FRAME: Duration = Duration::from_millis(100);
+/// C-R17: the most messages a wake applies before the loop draws, so a burst is one frame and
+/// the frames still come under a stream that never ends.
+const BATCH: usize = 256;
 /// The index lane passes on a refresh's progress at most this often: the loop's own pace.
 const PROGRESS_EVERY: Duration = WAKE;
 /// Why a hand-over of the terminal was refused (§7.3 step 1): the input thread could still read
@@ -49,6 +55,9 @@ pub struct TuiOptions {
     /// The shutdown token. The binary has already built every lane's engine, and the host's
     /// in-TUI context, with it.
     pub shutdown: Cancel,
+    /// The socket of the daemon of the store the TUI reads (`daemon_socket_path`, D5.1), which
+    /// it follows (spec §8); `None` for timer mode alone.
+    pub daemon: Option<PathBuf>,
 }
 
 /// How the TUI ended.
@@ -82,8 +91,25 @@ pub(crate) fn run_with<T: Tty, P: Pause>(
 ) -> TuiExit {
     let _restored = Restore(restore);
     let (tx, rx) = mpsc::channel();
-    // The lanes build their engines while the terminal is set up (§6.1).
-    let lanes = Lanes::spawn(opts.provider.clone(), &sources, &host, &tx, &opts.shutdown);
+    // The lanes build their engines while the terminal is set up (§6.1), and the live thread
+    // connects meanwhile. Neither is waited for: the TUI starts in timer mode (§8).
+    let status = opts
+        .daemon
+        .clone()
+        .map(|path| -> StatusFetch { Arc::new(move || live::fetch_status(&path)) });
+    let lanes = Lanes::spawn(
+        opts.provider.clone(),
+        &sources,
+        &host,
+        &tx,
+        &opts.shutdown,
+        status,
+    );
+    if let Some(path) = opts.daemon.clone() {
+        let died = lanes.stray_death("live", &tx);
+        // A thread that cannot start leaves the TUI in timer mode.
+        let _ = live::spawn(path, Backoff::default(), Arc::clone(&lanes.live), died);
+    }
     let driven = panic::catch_unwind(AssertUnwindSafe(|| {
         let tty = match enter() {
             Ok(tty) => tty,
@@ -181,26 +207,41 @@ fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-/// The engine lanes (§4.3): views (`accounts`, `history`, store-served), report (the token
-/// report, which reads the index only), index (the token index's catch-up) and actions (the
-/// collector and every `Host` action, one at a time).
+/// What fetches the daemon's `status` on the daemon lane: `live::fetch_status` on its socket.
+pub(crate) type StatusFetch = Arc<dyn Fn() -> Result<Status, String> + Send + Sync>;
+
+/// The lanes (§4.3). The engine lanes: views (`accounts`, `history`, store-served), report
+/// (the token report, which reads the index only), index (the token index's catch-up) and
+/// actions (the collector and every `Host` action, one at a time). And the daemon lane, which
+/// fetches the daemon's `status` and has no engine.
 pub(crate) struct Lanes {
     views: Lane<ViewsReq>,
     report: Lane<ReportReq>,
     index: Lane<IndexReq>,
     actions: Lane<ActionsReq>,
+    /// When the TUI follows a daemon.
+    daemon: Option<Lane<DaemonReq>>,
+    /// The threads that are let go rather than joined, the daemon lane and the live thread,
+    /// that died: named in the report as a joined lane that panicked is (§10.4).
+    strays: Arc<Mutex<Vec<&'static str>>>,
+    /// What the live thread passes on, bounded; a `Msg::LiveReady` says it has something
+    /// (C-R17).
+    pub(crate) live: Arc<LiveQueue>,
 }
 
 impl Lanes {
-    /// Spawns them. Each builds its own `Source` in its own thread (R4), and a lane that panics
-    /// says so on `tx` (§4.3, §10.4).
+    /// Spawns them. Each engine lane builds its own `Source` in its own thread (R4), and a lane
+    /// that panics says so on `tx` (§4.3, §10.4). The daemon lane is spawned when `status` is
+    /// given.
     pub(crate) fn spawn(
         provider: Option<ProviderId>,
         sources: &SourceFactory,
         host: &Arc<dyn Host>,
         tx: &Sender<Msg>,
         shutdown: &Cancel,
+        status: Option<StatusFetch>,
     ) -> Lanes {
+        let strays = Arc::default();
         let views = {
             let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
             Lane::spawn(
@@ -304,12 +345,43 @@ impl Lanes {
                 },
             )
         };
+        let daemon = status.map(|fetch| {
+            let out = tx.clone();
+            let died = stray_death(&strays, "daemon", tx);
+            Lane::spawn(
+                "daemon",
+                || (),
+                move |_: &mut (), req: DaemonReq| {
+                    let DaemonReq::Status { link } = req;
+                    let result = fetch();
+                    let _ = out.send(Msg::DaemonStatus { link, result });
+                },
+                died,
+            )
+        });
+        let wake = tx.clone();
+        let live = Arc::new(LiveQueue::new(LIVE_QUEUE, move || {
+            wake.send(Msg::LiveReady).is_ok()
+        }));
         Lanes {
             views,
             report,
             index,
             actions,
+            daemon,
+            strays,
+            live,
         }
+    }
+
+    /// What a thread that is let go rather than joined runs if it panics: it is named in the
+    /// report, and the loop is told, which ends the TUI (§10.4).
+    pub(crate) fn stray_death(
+        &self,
+        name: &'static str,
+        tx: &Sender<Msg>,
+    ) -> impl FnOnce() + Send + 'static {
+        stray_death(&self.strays, name, tx)
     }
 
     /// §10.2 step 2: nothing more is taken, what is queued is dropped, and an idle lane wakes
@@ -320,9 +392,16 @@ impl Lanes {
         self.report.close();
         self.index.close();
         self.actions.close();
+        if let Some(daemon) = &self.daemon {
+            daemon.close();
+        }
+        // The loop stops listening to the live thread: its next push says `Gone`, whatever the
+        // queue holds, and it returns.
+        self.live.close();
     }
 
-    /// §10.2 step 5: joins every lane, and names those that panicked.
+    /// §10.2 step 5: joins every engine lane, lets the daemon lane go (§4.3: it touches no
+    /// store, and a `status` it waits for may take 2 s), and names the lanes that panicked.
     fn join(self) -> Vec<&'static str> {
         let mut died = Vec::new();
         if self.views.join().is_err() {
@@ -337,8 +416,28 @@ impl Lanes {
         if self.actions.join().is_err() {
             died.push("actions");
         }
+        drop(self.daemon);
+        died.extend(lock(&self.strays).iter());
         died
     }
+}
+
+/// `stray_death` over the list it adds to.
+fn stray_death(
+    strays: &Arc<Mutex<Vec<&'static str>>>,
+    name: &'static str,
+    tx: &Sender<Msg>,
+) -> impl FnOnce() + Send + 'static {
+    let (strays, tx) = (Arc::clone(strays), tx.clone());
+    move || {
+        lock(&strays).push(name);
+        let _ = tx.send(Msg::LaneDied { lane: name });
+    }
+}
+
+/// The list of dead strays, whatever a panic left it as: it only holds names.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// How the loop ended (§10.2's table): the exit code, a fatal error's message, and what an
@@ -384,14 +483,14 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         host: &'a dyn Host,
     ) -> Self {
         let tokens = TokensState::new(opts.tokens_provider.clone(), opts.tz.clone());
+        let now = now_ms();
+        let mut state = State::new(opts.screen, opts.color, opts.provider.clone(), tokens, now);
+        if opts.daemon.is_some() {
+            // C-R20: the first collection waits to know who collects.
+            state.daemon.await_daemon(now);
+        }
         Ui {
-            state: State::new(
-                opts.screen,
-                opts.color,
-                opts.provider.clone(),
-                tokens,
-                now_ms(),
-            ),
+            state,
             tty,
             input,
             rx,
@@ -432,9 +531,9 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
     }
 
     /// §4.3, until a shutdown begins. Each wake looks at the signal token before anything else
-    /// (§10.2): before the wait, and again before the message or the tick that ended it. It
-    /// redraws when the state changed, takes one message, and ticks every 250 ms whatever
-    /// arrives.
+    /// (§10.2): before the wait, and again before each message or the tick that ended it. It
+    /// redraws when the state changed, applies every message waiting (`BATCH` at most, C-R17),
+    /// and ticks every 250 ms whatever arrives.
     pub(crate) fn run(&mut self) -> Ending {
         loop {
             self.shutting_down();
@@ -446,7 +545,10 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
             }
             let wait = self.next_tick.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(wait) {
-                Ok(msg) => self.deliver(msg),
+                Ok(msg) => {
+                    self.deliver(msg);
+                    self.drain();
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => self.begin_shutdown(
                     1,
@@ -472,10 +574,31 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         self.ending.is_some()
     }
 
+    /// C-R17: the messages already waiting, after the one that woke the loop, up to `BATCH` in
+    /// all, so that a burst is drawn once and a key behind it waits for no frame of its own.
+    fn drain(&mut self) {
+        for _ in 1..BATCH {
+            if self.ending.is_some() {
+                return;
+            }
+            match self.rx.try_recv() {
+                Ok(msg) => self.deliver(msg),
+                Err(_) => return,
+            }
+        }
+    }
+
     /// Applies `msg`, after a look at the signal token: a signal that arrived with it comes
     /// first, and so does a shutdown already begun. Then `msg` is not applied; an action's
-    /// outcome in it still goes into the report (§10.2 step 6).
+    /// outcome in it still goes into the report (§10.2 step 6). `LiveReady` applies everything
+    /// in the live queue, each thing as a message of its own (C-R17).
     fn deliver(&mut self, msg: Msg) {
+        if let Msg::LiveReady = msg {
+            for live in self.lanes.live.take() {
+                self.deliver(Msg::Live(live));
+            }
+            return;
+        }
         if !self.shutting_down() {
             self.apply(msg);
         } else if let Some(ending) = &mut self.ending {
@@ -536,6 +659,12 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
                 Cmd::Suspend(action) => self.suspend(action),
                 Cmd::Quit { code } => self.begin_shutdown(code, libc::SIGINT, None),
                 Cmd::Stop => self.stop(),
+                Cmd::FetchStatus { link } => {
+                    if let Some(daemon) = &self.lanes.daemon {
+                        let _ = daemon.submit(DaemonReq::Status { link });
+                    }
+                }
+                Cmd::DropLink { link } => self.lanes.live.end_link(link),
             }
         }
     }
@@ -737,6 +866,7 @@ mod tests {
 
     use super::*;
     use crate::host::{AccountRef, Ask};
+    use crate::live::Live;
     use crate::source::{AccountsSnapshot, CollectSummary, SourceError};
     use crate::term::repaint;
 
@@ -1139,6 +1269,7 @@ mod tests {
             tz: TimeZone::UTC,
             signal: Cancel::new(),
             shutdown: Cancel::new(),
+            daemon: None,
         }
     }
 
@@ -1174,9 +1305,33 @@ mod tests {
             sources: SourceFactory,
             host: impl FnOnce(&TuiOptions) -> Scripted,
         ) -> Fixture {
+            Fixture::build(opts, sources, host, None)
+        }
+
+        /// A TUI that follows a daemon (`TuiOptions::daemon`), with `host`, and a daemon lane
+        /// whose `status` is `status`'s answer (spec §8). No live thread runs: a test puts what
+        /// it would pass on in the lanes' live queue.
+        fn with_daemon(
+            sources: SourceFactory,
+            host: impl FnOnce(&TuiOptions) -> Scripted,
+            status: StatusFetch,
+        ) -> Fixture {
+            let opts = TuiOptions {
+                daemon: Some(PathBuf::from("/nonexistent/daemon.sock")),
+                ..options()
+            };
+            Fixture::build(opts, sources, host, Some(status))
+        }
+
+        fn build(
+            opts: TuiOptions,
+            sources: SourceFactory,
+            host: impl FnOnce(&TuiOptions) -> Scripted,
+            status: Option<StatusFetch>,
+        ) -> Fixture {
             let host: Arc<dyn Host> = Arc::new(host(&opts));
             let (tx, rx) = mpsc::channel();
-            let lanes = Lanes::spawn(None, &sources, &host, &tx, &opts.shutdown);
+            let lanes = Lanes::spawn(None, &sources, &host, &tx, &opts.shutdown, status);
             let log = Log::default();
             Fixture {
                 opts,
@@ -2070,5 +2225,372 @@ mod tests {
         assert_eq!((exit.code, exit.report), (1, None));
         assert_eq!(drops.load(Ordering::SeqCst), 4, "every lane was joined");
         assert_eq!(shutdown.requested(), Some(libc::SIGINT));
+    }
+
+    /// Claude Code's job switching accounts, after `wait`; `started` is set when it begins.
+    fn slow_status(wait: Duration, started: &Arc<AtomicBool>) -> StatusFetch {
+        let started = Arc::clone(started);
+        Arc::new(move || {
+            started.store(true, Ordering::SeqCst);
+            thread::sleep(wait);
+            Ok(crate::testutil::daemon_status(
+                vec![crate::testutil::daemon_job("claude-code", "auto", true)],
+                vec![],
+            ))
+        })
+    }
+
+    /// Waits up to 5 s for `flag`.
+    fn raised(flag: &AtomicBool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::SeqCst) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    #[test]
+    fn the_first_frame_never_waits_for_the_daemon_and_its_status_starts_live_mode() {
+        // Spec §6.1, §8: the TUI starts in timer mode and switches once the first `status`
+        // arrives, however long the daemon takes.
+        let started = Arc::new(AtomicBool::new(false));
+        let status = slow_status(Duration::from_millis(400), &started);
+        let fx = Fixture::with_daemon(quick(), |_| idle(), status);
+        // The live thread subscribed before the TUI's first read returned.
+        fx.tx.send(Msg::Live(Live::Up { link: 1 })).unwrap();
+        let ending = {
+            let mut ui = fx.ui();
+            let begun = Instant::now();
+            ui.start();
+            assert!(
+                begun.elapsed() < Duration::from_millis(300),
+                "{:?}",
+                begun.elapsed()
+            );
+            assert!(
+                ui.state.accounts.snapshot().is_some(),
+                "drawn with the accounts"
+            );
+            assert!(raised(&started), "the status was asked for at once");
+            assert!(!ui.state.daemon.live(), "timer mode until it comes");
+            while !ui.state.daemon.live() {
+                let msg = fx.rx.recv_timeout(Duration::from_secs(5));
+                ui.deliver(msg.expect("the daemon lane answered"));
+            }
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn q_never_waits_for_a_status_the_daemon_lane_still_waits_for() {
+        // Spec §4.3, §10.2: the daemon lane is not joined. Its `status` from a daemon that
+        // never answers takes 2 s (D5.7); the shutdown does not wait for it.
+        let started = Arc::new(AtomicBool::new(false));
+        let status = slow_status(Duration::from_secs(3), &started);
+        let fx = Fixture::with_daemon(quick(), |_| idle(), status);
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            ui.execute(vec![Cmd::FetchStatus { link: 1 }]);
+            assert!(raised(&started), "the fetch began");
+            fx.key('q');
+            ui.run()
+        };
+        let joining = Instant::now();
+        let exit = fx.finish(ending);
+        assert!(
+            joining.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            joining.elapsed()
+        );
+        assert_eq!((exit.code, exit.report), (0, None));
+    }
+
+    #[test]
+    fn a_daemon_lane_that_panics_ends_the_tui_with_1_and_says_so() {
+        let status: StatusFetch = Arc::new(|| panic!("the daemon lane's fetch panicked"));
+        let fx = Fixture::with_daemon(quick(), |_| idle(), status);
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            ui.execute(vec![Cmd::FetchStatus { link: 1 }]);
+            ui.run()
+        };
+        let exit = fx.finish(ending);
+        assert_eq!(exit.code, 1);
+        assert_eq!(
+            exit.report.as_deref(),
+            Some("tagteam: the TUI's daemon lane panicked; the log has the details\n")
+        );
+    }
+
+    /// The messages waiting on `rx`, applied as the loop applies them, until `done` holds; at
+    /// most 5 s. How many of them woke the loop for the live queue.
+    fn pump(
+        ui: &mut Ui<'_, FakeTty, Keys>,
+        rx: &Receiver<Msg>,
+        done: impl Fn(&State) -> bool,
+    ) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut wakes = 0;
+        while !done(&ui.state) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let msg = rx
+                .recv_timeout(left)
+                .expect("a message before the deadline");
+            wakes += usize::from(matches!(msg, Msg::LiveReady));
+            ui.deliver(msg);
+        }
+        wakes
+    }
+
+    #[test]
+    fn a_flood_during_a_suspension_stays_within_the_queue_and_a_snapshot_recovers_it() {
+        // C-R17: while `R`'s session has the terminal the loop takes no messages, and the live
+        // thread goes on. Its backlog never passes `LIVE_QUEUE`, and it wakes the loop once. The
+        // overflow is a disconnect; the next link's snapshot brings live mode back.
+        let queue: Arc<std::sync::OnceLock<Arc<LiveQueue>>> = Arc::default();
+        let flooding = Arc::clone(&queue);
+        let started = Arc::new(AtomicBool::new(false));
+        let status = slow_status(Duration::ZERO, &started);
+        let fx = Fixture::with_daemon(
+            quick(),
+            move |_| Scripted {
+                act: never(),
+                // The live thread, while the session runs: a flood until the queue is full, which
+                // drops the link; then the next link and its first events.
+                foreground: Box::new(move |_| {
+                    let q = flooding.get().expect("the queue is set");
+                    let changed = || Live::Event(tagteam_daemon::protocol::Event::Changed);
+                    let mut pushed = 0;
+                    while q.push(changed()) == crate::live::Delivery::Taken {
+                        pushed += 1;
+                        assert!(q.len() <= LIVE_QUEUE, "{}", q.len());
+                    }
+                    assert_eq!(pushed, LIVE_QUEUE);
+                    let up = q.push(Live::Up { link: 2 });
+                    assert_eq!(up, crate::live::Delivery::Taken);
+                    for _ in 0..10 {
+                        assert_eq!(q.push(changed()), crate::live::Delivery::Taken);
+                    }
+                    assert!(q.len() <= LIVE_QUEUE);
+                    done(0, "", "")
+                }),
+            },
+            status,
+        );
+        queue.set(Arc::clone(&fx.lanes.live)).ok();
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            let up = fx.lanes.live.push(Live::Up { link: 1 });
+            assert_eq!(up, crate::live::Delivery::Taken);
+            pump(&mut ui, &fx.rx, |s| s.daemon.live());
+            let run = Action::Run(account_a());
+            ui.state.running = Some(run.clone());
+            ui.execute(vec![Cmd::Suspend(run)]);
+            assert_eq!(
+                fx.lanes.live.len(),
+                12,
+                "a Down, then the next link's Up and 10 events"
+            );
+            assert!(
+                ui.state.daemon.live(),
+                "no message was taken while suspended"
+            );
+            let wakes = pump(&mut ui, &fx.rx, |s| !s.daemon.live());
+            assert_eq!(wakes, 1, "one wake for the whole flood");
+            assert!(fx.lanes.live.is_empty(), "taken whole");
+            pump(&mut ui, &fx.rx, |s| s.daemon.live());
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    /// A daemon on `path` that greets each connection and takes its subscription, and counts
+    /// them. It closes the first when `close_first` is sent to, and holds the others open.
+    fn daemon_at(path: &std::path::Path) -> (Sender<()>, Arc<AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let listener = UnixListener::bind(path).unwrap();
+        let (close_first, closing) = mpsc::channel::<()>();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let hello = "{\"schemaVersion\":1,\"event\":\"hello\",\"protocol\":1,\"version\":\"20261014.2045.0\",\"pid\":4242,\"startedAt\":\"2026-09-21T14:13:20Z\"}\n";
+                stream.write_all(hello.as_bytes()).unwrap();
+                let mut request = String::new();
+                BufReader::new(&stream).read_line(&mut request).unwrap();
+                let ok = "{\"schemaVersion\":1,\"id\":1,\"ok\":true,\"result\":{}}\n";
+                stream.write_all(ok.as_bytes()).unwrap();
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let _ = closing.recv();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                } else {
+                    held.push(stream);
+                }
+            }
+        });
+        (close_first, accepted)
+    }
+
+    #[test]
+    fn a_failure_judged_after_the_live_thread_replaced_its_link_leaves_the_new_link_alone() {
+        // C-R21, in the order a suspension (§7.3) leaves it: while the loop takes no messages,
+        // link 1's `status` fails, and the live thread then loses link 1 and brings link 2 up.
+        // On resume the failure ends link 1 by name; the live thread holds link 2, which carries
+        // on: no third connection, and no Down.
+        let dir = tempfile::Builder::new()
+            .prefix("tt")
+            .tempdir_in("/tmp")
+            .or_else(|_| tempfile::Builder::new().prefix("tt").tempdir())
+            .unwrap();
+        let path = dir.path().join("daemon.sock");
+        let (close_first, accepted) = daemon_at(&path);
+        // The daemon lane: the second `status` fails once `fail` is sent to; the others answer.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (fail, failing) = mpsc::channel::<()>();
+        let failing = Mutex::new(failing);
+        let counted = Arc::clone(&calls);
+        let status: StatusFetch = Arc::new(move || {
+            if counted.fetch_add(1, Ordering::SeqCst) == 1 {
+                let _ = failing.lock().unwrap().recv();
+                return Err("the daemon closed the connection".into());
+            }
+            Ok(crate::testutil::daemon_status(
+                vec![crate::testutil::daemon_job("claude-code", "auto", true)],
+                vec![],
+            ))
+        });
+        let fx = Fixture::with_daemon(quick(), |_| idle(), status);
+        let backoff = Backoff {
+            first: Duration::from_millis(20),
+            most: Duration::from_millis(100),
+            mismatch: Duration::from_secs(1),
+        };
+        crate::live::spawn(path.clone(), backoff, Arc::clone(&fx.lanes.live), || {}).unwrap();
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            pump(&mut ui, &fx.rx, |s| s.daemon.live());
+            // An event asks for `status` again, and the lane takes it.
+            let mode = tagteam_daemon::protocol::Event::Mode {
+                provider: "claude-code".into(),
+                mode: "collect".into(),
+                waiting_for: None,
+                holder_pid: None,
+                backoff: None,
+            };
+            fx.lanes.live.push(Live::Event(mode));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while calls.load(Ordering::SeqCst) < 2 {
+                assert!(Instant::now() < deadline, "the second status was asked for");
+                if let Ok(msg) = fx.rx.recv_timeout(Duration::from_millis(10)) {
+                    ui.deliver(msg);
+                }
+            }
+            // Suspended: the failure is queued, then link 1 goes and link 2 comes.
+            fail.send(()).unwrap();
+            let mut held = Vec::new();
+            loop {
+                let msg = fx
+                    .rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the failure");
+                let failed = matches!(msg, Msg::DaemonStatus { result: Err(_), .. });
+                held.push(msg);
+                if failed {
+                    break;
+                }
+            }
+            close_first.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fx.lanes.live.len() < 2 {
+                assert!(Instant::now() < deadline, "link 2 came up");
+                thread::sleep(Duration::from_millis(5));
+            }
+            // Resumed, in that order.
+            for msg in held {
+                ui.deliver(msg);
+            }
+            pump(&mut ui, &fx.rx, |s| s.daemon.live());
+            thread::sleep(Duration::from_millis(300));
+            assert_eq!(accepted.load(Ordering::SeqCst), 2, "link 2 carried on");
+            assert!(fx.lanes.live.is_empty(), "no Down");
+            assert!(ui.state.daemon.live());
+            fx.key('q');
+            ui.run()
+        };
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn the_live_thread_ends_after_the_shutdown_though_its_queue_still_holds_events() {
+        // The shutdown stops listening to the live queue, which then says `Gone` whatever it
+        // holds, so the live thread returns instead of waiting on a queue nobody takes.
+        let path = PathBuf::from("/nonexistent/daemon.sock");
+        let fx = Fixture::with_daemon(quick(), |_| idle(), Arc::new(|| Err("none".into())));
+        let backoff = Backoff {
+            first: Duration::from_millis(10),
+            most: Duration::from_millis(20),
+            mismatch: Duration::from_secs(1),
+        };
+        let handle = crate::live::spawn(path, backoff, Arc::clone(&fx.lanes.live), || {}).unwrap();
+        let live = Arc::clone(&fx.lanes.live);
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while live.is_empty() {
+                assert!(Instant::now() < deadline, "the thread pushed a Down");
+                thread::sleep(Duration::from_millis(5));
+            }
+            fx.key('q');
+            ui.run()
+        };
+        // The loop's receiver is still there: only the queue's own closing can end the thread.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(Instant::now() < deadline, "the live thread ended");
+            thread::sleep(Duration::from_millis(5));
+        }
+        handle.join().unwrap();
+        assert_eq!(fx.finish(ending).code, 0);
+    }
+
+    #[test]
+    fn a_key_queued_behind_a_burst_is_handled_within_one_frame() {
+        // C-R17: the loop applies every message waiting before it draws, so a burst costs one
+        // frame, not one a message, and a key behind it waits for none of them.
+        let fx = Fixture::new(quick(), |_| idle());
+        let ending = {
+            let mut ui = fx.ui();
+            ui.start();
+            fx.frames.take();
+            for width in 0..200 {
+                let resize = Msg::Resize {
+                    width: 100 + width % 20,
+                    height: 40,
+                };
+                fx.tx.send(resize).unwrap();
+            }
+            fx.key('q');
+            ui.run()
+        };
+        assert!(
+            fx.frames.seen().len() <= 1,
+            "{} frames for 201 messages",
+            fx.frames.seen().len()
+        );
+        assert_eq!(fx.finish(ending).code, 0);
     }
 }
