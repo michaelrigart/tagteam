@@ -113,6 +113,7 @@ fn write_text_line(keychain: &Path, service: &str, account: &str, text: &str) ->
         &["-i".to_owned()],
         Some(line.as_bytes()),
         Duration::from_secs(5),
+        None,
     ) {
         RunResult::Exited {
             code: 0, stderr, ..

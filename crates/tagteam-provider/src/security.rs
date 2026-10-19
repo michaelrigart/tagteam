@@ -1,16 +1,15 @@
-use std::io::Write as _;
-use std::os::unix::process::CommandExt as _;
+use std::ffi::OsString;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, mpsc};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
 
+use crate::cancel::{self, Cancel};
 use crate::keychain::{
     Keychain, KeychainError, LockState, ReadCounts, empty_service_err, empty_service_read,
     locked_err,
 };
-use crate::process::drain;
+use crate::process::{self, Captured, DRAIN_GRACE, Output, SpawnSpec};
 use crate::read::{Read, ReadError};
 
 pub const SECURITY: &str = "/usr/bin/security";
@@ -29,9 +28,11 @@ pub enum RunResult {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
-    /// The process did not finish in time: it hung (and was killed if it could be), or it exited but never
-    /// closed its output pipes within the grace period.
+    /// The process did not finish in time: it hung (and its group was killed if it could be), or it
+    /// exited but never closed its output pipes within the grace period.
     TimedOut,
+    /// The cancel token was set: the child's group was killed, or it was never spawned (H4).
+    Interrupted(i32),
     SpawnFailed(String),
 }
 
@@ -49,6 +50,7 @@ impl std::fmt::Debug for RunResult {
                 .field("stderr", &format_args!("<{} bytes>", stderr.len()))
                 .finish(),
             RunResult::TimedOut => f.write_str("TimedOut"),
+            RunResult::Interrupted(signal) => f.debug_tuple("Interrupted").field(signal).finish(),
             RunResult::SpawnFailed(e) => f.debug_tuple("SpawnFailed").field(e).finish(),
         }
     }
@@ -56,14 +58,17 @@ impl std::fmt::Debug for RunResult {
 
 pub trait Runner: Send + Sync {
     /// Runs without the terminal: stdin piped (`stdin` given) or null, stdout and stderr
-    /// captured, killed after `timeout`. The child leads a process group of its own (§14.1),
-    /// so a Ctrl-C at the terminal never reaches it and never cuts a Keychain write short.
+    /// captured. The child leads a process group of its own (§14.1), so a Ctrl-C at the terminal
+    /// never reaches it and never cuts a Keychain write short. After `timeout` its whole group is
+    /// killed (`TimedOut`); once `cancel` is set it is killed the same way (`Interrupted`), and a
+    /// token already set runs nothing (H4).
     fn run(
         &self,
         program: &str,
         args: &[String],
         stdin: Option<&[u8]>,
         timeout: Duration,
+        cancel: Option<&Cancel>,
     ) -> RunResult;
     /// Runs with the terminal attached: stdin and stderr inherited, the child's stdout sent to
     /// stderr (stdout is reserved for command output, §14). No timeout, because a person is
@@ -72,121 +77,39 @@ pub trait Runner: Send + Sync {
     fn run_attached(&self, program: &str, args: &[String]) -> RunResult;
 }
 
-/// How long `run` waits for the output pipes to close once the child has exited. A grandchild
-/// that inherited a pipe keeps it open after the child is gone; without a bound, `run` would
-/// wait for that grandchild too (L343).
-const DRAIN_GRACE: Duration = Duration::from_secs(2);
-
 pub struct ProcessRunner;
 
-/// What `wait_for` needs from a child process, so its failure paths are testable.
-trait Waitable {
-    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>>;
-    fn kill(&mut self) -> std::io::Result<()>;
-    fn wait(&mut self) -> std::io::Result<ExitStatus>;
-}
-
-impl Waitable for Child {
-    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        Child::try_wait(self)
-    }
-    fn kill(&mut self) -> std::io::Result<()> {
-        Child::kill(self)
-    }
-    fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        Child::wait(self)
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Waited {
-    Exited(i32),
-    TimedOut,
-    Failed(String),
-}
-
-/// Polls until the child exits or `deadline` passes. A timeout and a failed poll both kill and
-/// reap the child, so neither leaves a process running (L343), unless the kill itself fails.
-fn wait_for(child: &mut dyn Waitable, deadline: Instant) -> Waited {
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Waited::Exited(status.code().unwrap_or(-1)),
-            Ok(None) if Instant::now() >= deadline => {
-                reap(child);
-                return Waited::TimedOut;
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(10)),
-            Err(e) => {
-                reap(child);
-                return Waited::Failed(e.to_string());
-            }
-        }
-    }
-}
-
-/// Kills the child and waits for it. A kill that fails leaves the child running, and `wait`
-/// would block for as long as it does, so then it returns without waiting.
-fn reap(child: &mut dyn Waitable) {
-    if child.kill().is_ok() {
-        let _ = child.wait();
-    }
-}
-
-/// The drained bytes, or `None` when the pipe had not closed by `until`.
-fn collect(rx: &mpsc::Receiver<Vec<u8>>, until: Instant) -> Option<Vec<u8>> {
-    rx.recv_timeout(until.saturating_duration_since(Instant::now()))
-        .ok()
-}
-
 impl ProcessRunner {
-    fn run_bounded(
+    /// `process::bounded` (H4, the one bounded runner) with its ending as a `RunResult`. The
+    /// environment is inherited and no directory is set. A signal's end is rc -1.
+    fn bounded(
         program: &str,
         args: &[String],
         stdin: Option<&[u8]>,
         timeout: Duration,
+        cancel: Option<&Cancel>,
         grace: Duration,
     ) -> RunResult {
-        let mut child = match Command::new(program)
-            .args(args)
-            // §14.1: a group of its own, so a Ctrl-C at the terminal reaches tagteam alone and
-            // never kills a Keychain write midway. Its stdin is a pipe or null and its output is
-            // piped, so the background group never stops it for touching the terminal.
-            .process_group(0)
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => return RunResult::SpawnFailed(e.to_string()),
+        let spec = SpawnSpec {
+            program: program.into(),
+            args: args.iter().map(OsString::from).collect(),
+            ..SpawnSpec::default()
         };
-        if let (Some(data), Some(mut pipe)) = (stdin, child.stdin.take()) {
-            let data = data.to_vec();
-            thread::spawn(move || {
-                let _ = pipe.write_all(&data);
-            });
-        }
-        let out = drain(child.stdout.take());
-        let err = drain(child.stderr.take());
-        match wait_for(&mut child, Instant::now() + timeout) {
-            Waited::Exited(code) => {
-                let until = Instant::now() + grace;
-                match (collect(&out, until), collect(&err, until)) {
-                    (Some(stdout), Some(stderr)) => RunResult::Exited {
-                        code,
-                        stdout,
-                        stderr,
-                    },
-                    // Never hand back half an output as a whole one.
-                    _ => RunResult::TimedOut,
-                }
-            }
-            Waited::TimedOut => RunResult::TimedOut,
-            Waited::Failed(e) => RunResult::SpawnFailed(e),
+        let stdin = stdin.map(<[u8]>::to_vec);
+        match process::bounded(&spec, stdin, Output::Pipe, timeout, cancel, grace) {
+            Captured::Exited {
+                code,
+                stdout,
+                stderr,
+                ..
+            } => RunResult::Exited {
+                code: code.unwrap_or(-1),
+                stdout,
+                stderr,
+            },
+            Captured::TimedOut => RunResult::TimedOut,
+            Captured::Interrupted(signal) => RunResult::Interrupted(signal),
+            Captured::SpawnFailed(e) => RunResult::SpawnFailed(e),
         }
     }
 }
@@ -198,8 +121,9 @@ impl Runner for ProcessRunner {
         args: &[String],
         stdin: Option<&[u8]>,
         timeout: Duration,
+        cancel: Option<&Cancel>,
     ) -> RunResult {
-        Self::run_bounded(program, args, stdin, timeout, DRAIN_GRACE)
+        Self::bounded(program, args, stdin, timeout, cancel, DRAIN_GRACE)
     }
 
     fn run_attached(&self, program: &str, args: &[String]) -> RunResult {
@@ -281,11 +205,13 @@ fn confirm_password(stderr: &[u8], raw: &[u8]) -> Option<Vec<u8>> {
 /// `-g`'s stderr, unlike `describe()`/`unreadable()`: `-g`'s stderr is the channel
 /// `security` prints the secret on. A timeout and a failure to run are different causes,
 /// and say so (§14); a spawn failure's text is the operating system's, never `security`'s.
+/// An interruption is the read's, as at the `-w` call (H4).
 fn disambiguation_failed(r: &RunResult) -> ReadError {
     let detail = match r {
         RunResult::Exited { code, .. } => format!("rc {code}: the -g disambiguation call failed"),
         RunResult::TimedOut => "the -g disambiguation call did not finish in time".to_owned(),
         RunResult::SpawnFailed(e) => format!("the -g disambiguation call could not run: {e}"),
+        RunResult::Interrupted(signal) => return ReadError::interrupted("keychain", *signal),
     };
     ReadError::new("keychain", detail)
 }
@@ -322,7 +248,10 @@ impl SecurityCli {
                 args.push(f.to_string_lossy().into_owned());
             }
         }
-        self.runner.run(SECURITY, &args, stdin, TIMEOUT)
+        // H4: the token of this thread's scope, if any. A write's scope has none.
+        let scope = cancel::scoped();
+        self.runner
+            .run(SECURITY, &args, stdin, TIMEOUT, scope.as_ref())
     }
 
     fn tail(&self) -> String {
@@ -376,16 +305,25 @@ fn describe(r: &RunResult) -> (Option<i32>, String) {
             "security did not finish in time (it hung or kept its output open)".to_owned(),
         ),
         RunResult::SpawnFailed(e) => (None, format!("could not run security: {e}")),
+        RunResult::Interrupted(signal) => (None, format!("interrupted by signal {signal}")),
     }
 }
 
+/// A failed read: rc 36 is the locked keychain's refusal, and a cancel is an interruption (H4).
 fn unreadable(r: RunResult) -> ReadError {
+    if let RunResult::Interrupted(signal) = r {
+        return ReadError::interrupted("keychain", signal);
+    }
     let (rc, message) = describe(&r);
     let detail = match rc {
         Some(code) => format!("rc {code}: {message}"),
         None => message,
     };
-    ReadError::new("keychain", detail)
+    if rc == Some(36) {
+        ReadError::locked("keychain", detail)
+    } else {
+        ReadError::new("keychain", detail)
+    }
 }
 
 fn failed(r: RunResult) -> KeychainError {
@@ -467,7 +405,9 @@ impl Keychain for SecurityCli {
         }
     }
 
+    /// Never a cancellation point, its verify read included (H4, §14.1).
     fn upsert(&self, service: &str, account: &str, data: &[u8]) -> Result<(), KeychainError> {
+        let _write = cancel::uninterruptible();
         check_name(service)?;
         check_name(account)?;
         let hex = hex::encode(data);
@@ -513,7 +453,9 @@ impl Keychain for SecurityCli {
         }
     }
 
+    /// Never a cancellation point (H4, §14.1).
     fn delete(&self, service: &str, account: &str) -> Result<(), KeychainError> {
+        let _write = cancel::uninterruptible();
         match self.run(
             s(&["delete-generic-password", "-a", account, "-s", service]),
             None,
@@ -534,8 +476,10 @@ impl Keychain for SecurityCli {
     /// Appendix A.3's delete by service: `delete-generic-password -s <service>` without `-a`
     /// deletes one item of the service per call and returns rc 44 once none is left. It is
     /// repeated until then, at most `DELETE_SERVICE_LIMIT` times, and the attributes-only probe
-    /// must then find none. A locked keychain (rc 36) stops it, named as such.
+    /// must then find none. A locked keychain (rc 36) stops it, named as such. Never a
+    /// cancellation point, its probe included (H4, §14.1).
     fn delete_service(&self, service: &str) -> Result<u32, KeychainError> {
+        let _write = cancel::uninterruptible();
         if service.is_empty() {
             return Err(empty_service_err());
         }
@@ -607,8 +551,10 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::io;
-    use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Instant;
 
     type Call = (String, Vec<String>, Option<Vec<u8>>);
 
@@ -616,6 +562,8 @@ mod tests {
     struct Scripted {
         calls: Arc<Mutex<Vec<Call>>>,
         results: Arc<Mutex<VecDeque<RunResult>>>,
+        /// Whether each `run` was handed a cancel token.
+        scoped: Arc<Mutex<Vec<bool>>>,
     }
 
     impl Scripted {
@@ -626,6 +574,9 @@ mod tests {
         fn calls(&self) -> Vec<Call> {
             self.calls.lock().unwrap().clone()
         }
+        fn scoped(&self) -> Vec<bool> {
+            self.scoped.lock().unwrap().clone()
+        }
     }
 
     impl Runner for Scripted {
@@ -635,12 +586,18 @@ mod tests {
             args: &[String],
             stdin: Option<&[u8]>,
             _t: Duration,
+            cancel: Option<&Cancel>,
         ) -> RunResult {
             self.calls.lock().unwrap().push((
                 program.into(),
                 args.to_vec(),
                 stdin.map(<[u8]>::to_vec),
             ));
+            self.scoped.lock().unwrap().push(cancel.is_some());
+            // As a real spawn does: a token already set runs nothing.
+            if let Some(n) = cancel.and_then(Cancel::requested) {
+                return RunResult::Interrupted(n);
+            }
             self.results
                 .lock()
                 .unwrap()
@@ -1149,98 +1106,15 @@ mod tests {
         );
     }
 
-    /// A child whose `try_wait` answers are scripted, counting the kills and reaps.
-    struct FakeChild {
-        polls: VecDeque<io::Result<Option<ExitStatus>>>,
-        kills: usize,
-        waits: usize,
-        kill_fails: bool,
-    }
-
-    impl FakeChild {
-        fn new(polls: Vec<io::Result<Option<ExitStatus>>>) -> Self {
-            Self {
-                polls: polls.into(),
-                kills: 0,
-                waits: 0,
-                kill_fails: false,
-            }
-        }
-
-        fn unkillable(mut self) -> Self {
-            self.kill_fails = true;
-            self
-        }
-    }
-
-    impl Waitable for FakeChild {
-        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-            self.polls.pop_front().expect("unexpected extra poll")
-        }
-        fn kill(&mut self) -> io::Result<()> {
-            self.kills += 1;
-            if self.kill_fails {
-                return Err(io::Error::other("not permitted"));
-            }
-            Ok(())
-        }
-        fn wait(&mut self) -> io::Result<ExitStatus> {
-            self.waits += 1;
-            Ok(ExitStatus::from_raw(0))
-        }
-    }
-
-    #[test]
-    fn a_failed_try_wait_kills_and_reaps_the_child() {
-        // L343: the child used to be left running, and never reaped.
-        let mut child = FakeChild::new(vec![Err(io::Error::other("boom"))]);
-        let waited = wait_for(&mut child, Instant::now() + Duration::from_secs(60));
-        assert!(
-            matches!(&waited, Waited::Failed(m) if m.contains("boom")),
-            "{waited:?}"
-        );
-        assert_eq!((child.kills, child.waits), (1, 1));
-    }
-
-    #[test]
-    fn a_child_past_its_deadline_is_killed_and_reaped() {
-        let mut child = FakeChild::new(vec![Ok(None)]);
-        assert_eq!(wait_for(&mut child, Instant::now()), Waited::TimedOut);
-        assert_eq!((child.kills, child.waits), (1, 1));
-    }
-
-    #[test]
-    fn a_child_that_cannot_be_killed_is_not_waited_for() {
-        // `wait` on a child that is still running would block for as long as it runs.
-        let mut past = FakeChild::new(vec![Ok(None)]).unkillable();
-        assert_eq!(wait_for(&mut past, Instant::now()), Waited::TimedOut);
-        assert_eq!((past.kills, past.waits), (1, 0));
-
-        let mut failed = FakeChild::new(vec![Err(io::Error::other("boom"))]).unkillable();
-        let waited = wait_for(&mut failed, Instant::now() + Duration::from_secs(60));
-        assert!(
-            matches!(&waited, Waited::Failed(m) if m.contains("boom")),
-            "{waited:?}"
-        );
-        assert_eq!((failed.kills, failed.waits), (1, 0));
-    }
-
-    #[test]
-    fn a_child_that_exits_in_time_is_left_alone() {
-        let mut child = FakeChild::new(vec![Ok(None), Ok(Some(ExitStatus::from_raw(3 << 8)))]);
-        let waited = wait_for(&mut child, Instant::now() + Duration::from_secs(60));
-        assert_eq!(waited, Waited::Exited(3));
-        assert_eq!((child.kills, child.waits), (0, 0));
-    }
-
     #[test]
     fn a_real_process_reports_its_code_and_both_streams() {
         let _fork = crate::fork_guard();
-        let r = ProcessRunner::run_bounded(
+        let r = ProcessRunner::bounded(
             "/bin/sh",
             &s(&["-c", "printf out; printf err >&2; exit 3"]),
             None,
             Duration::from_secs(5),
+            None,
             Duration::from_secs(1),
         );
         match r {
@@ -1263,11 +1137,12 @@ mod tests {
         // EOF. `run` used to join them and wait the full 8 s.
         let _fork = crate::fork_guard();
         let started = Instant::now();
-        let r = ProcessRunner::run_bounded(
+        let r = ProcessRunner::bounded(
             "/bin/sh",
             &s(&["-c", "sleep 8 & echo done"]),
             None,
             Duration::from_secs(5),
+            None,
             Duration::from_millis(200),
         );
         assert!(matches!(r, RunResult::TimedOut), "{r:?}");
@@ -1327,11 +1202,12 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (pid, group) = pid_and_group(|args| {
-            ProcessRunner::run_bounded(
+            ProcessRunner::bounded(
                 "/bin/sh",
                 &args,
                 None,
                 Duration::from_secs(5),
+                None,
                 Duration::from_secs(1),
             )
         });
@@ -1456,6 +1332,168 @@ mod tests {
         let _ = k.find("Claude Code-credentials", "me");
         let _ = k.find("Claude Code", "me");
         assert!(!counts.tally().since(before).looks_locked());
+    }
+
+    #[test]
+    fn reads_take_the_scope_s_token_and_nothing_takes_one_outside_a_scope() {
+        let s = Scripted::default()
+            .then(ok(b"cafe\n"))
+            .then(og_verbatim("cafe")) // find, and its -g
+            .then(ok(b""))
+            .then(ok(b""))
+            .then(ok(b"")) // exists, lock_state, service_has_items
+            .then(ok(b"{}\n"))
+            .then(ok(b""))
+            .then(ok(b""))
+            .then(ok(b""));
+        let k = cli(&s, None);
+        let token = Cancel::new();
+        {
+            let _scope = cancel::interruptible(&token);
+            assert!(k.find("svc", "acct").is_present());
+            assert!(k.exists("svc", "acct").is_present());
+            assert_eq!(k.lock_state(), LockState::Unlocked);
+            assert!(matches!(k.service_has_items("svc"), Read::Present(true)));
+        }
+        assert!(k.find("svc", "acct").is_present());
+        assert!(k.exists("svc", "acct").is_present());
+        assert_eq!(k.lock_state(), LockState::Unlocked);
+        assert!(matches!(k.service_has_items("svc"), Read::Present(true)));
+        assert_eq!(
+            s.scoped(),
+            [true, true, true, true, true, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn a_read_whose_scope_holds_a_signal_is_interrupted_and_counted_as_neither() {
+        // H4, §14.1. Nothing is scripted: a call that ran would panic.
+        let s = Scripted::default();
+        let k = cli(&s, None);
+        let token = Cancel::new();
+        token.request(15);
+        let _scope = cancel::interruptible(&token);
+        let Read::Unreadable(e) = k.find("svc", "acct") else {
+            panic!("not interrupted")
+        };
+        assert_eq!((e.interruption(), e.is_locked()), (Some(15), false));
+        assert!(
+            matches!(k.exists("svc", "acct"), Read::Unreadable(e) if e.interruption() == Some(15))
+        );
+        assert_eq!(k.lock_state(), LockState::Unknown);
+        assert_eq!(k.read_counts().unwrap().tally(), ReadTally::default());
+    }
+
+    #[test]
+    fn a_cancel_set_before_a_write_stops_neither_the_write_nor_its_verify() {
+        // H4, H14: upsert (its verify read included), delete and delete_service never take the
+        // token, and the scope is whole again after each.
+        let s = Scripted::default()
+            .then(ok(b""))
+            .then(ok(b"{}\n")) // upsert's -i line, its verify read
+            .then(rc(44)) // delete
+            .then(ok(b""))
+            .then(rc(44))
+            .then(rc(44)); // delete_service: one, none left, the probe
+        let k = cli(&s, None);
+        let token = Cancel::new();
+        token.request(15);
+        let _scope = cancel::interruptible(&token);
+        k.upsert("svc", "acct", b"{}").unwrap();
+        k.delete("svc", "acct").unwrap();
+        assert_eq!(k.delete_service("svc").unwrap(), 1);
+        assert_eq!(s.scoped()[..], [false; 6]);
+        assert!(
+            matches!(k.find("svc", "acct"), Read::Unreadable(e) if e.interruption() == Some(15)),
+            "the next read is in the scope again"
+        );
+    }
+
+    #[test]
+    fn rc_36_is_a_locked_read_and_a_timeout_or_any_other_rc_is_not() {
+        let s = Scripted::default()
+            .then(rc(36))
+            .then(RunResult::TimedOut)
+            .then(rc(1));
+        let k = cli(&s, None);
+        let locked = |r: Read<Vec<u8>>| match r {
+            Read::Unreadable(e) => e.is_locked(),
+            other => panic!("{other:?}"),
+        };
+        assert!(locked(k.find("s", "a")));
+        assert!(!locked(k.find("s", "a")));
+        assert!(!locked(k.find("s", "a")));
+    }
+
+    /// A shell that leaves a grandchild writing `marker` a second later, then waits 30 s.
+    fn with_grandchild(marker: &Path) -> Vec<String> {
+        s(&[
+            "-c",
+            &format!("(sleep 1; echo alive > '{}') & sleep 30", marker.display()),
+        ])
+    }
+
+    #[test]
+    fn a_timeout_or_a_cancel_kills_a_security_child_s_whole_group() {
+        // H4: `security`'s own runner killed the child alone and never saw the token.
+        let _fork = crate::fork_guard();
+        let d = tempfile::tempdir().unwrap();
+        let (timed, cancelled) = (d.path().join("timed"), d.path().join("cancelled"));
+        let r = ProcessRunner.run(
+            "/bin/sh",
+            &with_grandchild(&timed),
+            None,
+            Duration::from_millis(200),
+            None,
+        );
+        assert!(matches!(r, RunResult::TimedOut), "{r:?}");
+        let token = Cancel::new();
+        let signaller = token.clone();
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            signaller.request(15);
+        });
+        let started = Instant::now();
+        let r = ProcessRunner.run(
+            "/bin/sh",
+            &with_grandchild(&cancelled),
+            None,
+            Duration::from_secs(30),
+            Some(&token),
+        );
+        sender.join().unwrap();
+        assert!(matches!(r, RunResult::Interrupted(15)), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !timed.exists() && !cancelled.exists(),
+            "both grandchildren died with their groups"
+        );
+    }
+
+    #[test]
+    fn stdin_reaches_a_security_child_and_a_signal_s_end_is_rc_minus_one() {
+        let _fork = crate::fork_guard();
+        let line = b"add-generic-password -U -a \"acct\" -s \"svc\" -X \"00\"\n";
+        let r = ProcessRunner.run(
+            "/bin/sh",
+            &s(&["-c", "cat"]),
+            Some(line),
+            Duration::from_secs(5),
+            None,
+        );
+        assert!(
+            matches!(&r, RunResult::Exited { code: 0, stdout, .. } if stdout == line),
+            "{r:?}"
+        );
+        let r = ProcessRunner.run(
+            "/bin/sh",
+            &s(&["-c", "kill -KILL $$"]),
+            None,
+            Duration::from_secs(5),
+            None,
+        );
+        assert!(matches!(r, RunResult::Exited { code: -1, .. }), "{r:?}");
     }
 
     #[test]

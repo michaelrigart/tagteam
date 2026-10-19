@@ -717,6 +717,7 @@ mod tests {
                 args: &[String],
                 _stdin: Option<&[u8]>,
                 _timeout: Duration,
+                _cancel: Option<&tagteam_provider::Cancel>,
             ) -> RunResult {
                 self.0.lock().unwrap().push(args.to_vec());
                 RunResult::Exited {

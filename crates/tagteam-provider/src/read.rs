@@ -25,14 +25,57 @@ impl<T> fmt::Debug for Read<T> {
 pub struct ReadError {
     pub what: String,
     pub detail: String,
+    cause: Cause,
+}
+
+/// Why a read failed, where a caller acts on it: a locked keychain is not retried, and an
+/// interrupted read is no failure at all (H4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cause {
+    Other,
+    Locked,
+    Interrupted(i32),
 }
 
 impl ReadError {
+    /// A read that failed for any reason but a lock or an interruption.
     pub fn new(what: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::with(what, detail, Cause::Other)
+    }
+
+    /// A read the locked keychain refused (rc 36).
+    pub fn locked(what: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self::with(what, detail, Cause::Locked)
+    }
+
+    /// A read a signal cut short, or never started, inside an interruptible scope (H4, §14.1).
+    pub fn interrupted(what: impl Into<String>, signal: i32) -> Self {
+        Self::with(
+            what,
+            format!("interrupted by signal {signal}"),
+            Cause::Interrupted(signal),
+        )
+    }
+
+    fn with(what: impl Into<String>, detail: impl Into<String>, cause: Cause) -> Self {
         Self {
             what: what.into(),
             detail: detail.into(),
+            cause,
         }
+    }
+
+    /// The signal that interrupted the read, if one did.
+    pub fn interruption(&self) -> Option<i32> {
+        match self.cause {
+            Cause::Interrupted(signal) => Some(signal),
+            Cause::Other | Cause::Locked => None,
+        }
+    }
+
+    /// Whether the locked keychain refused the read.
+    pub fn is_locked(&self) -> bool {
+        self.cause == Cause::Locked
     }
 }
 
@@ -101,5 +144,19 @@ mod tests {
             Ok::<Read<Vec<u8>>, ()>(Read::Present(b"sk".to_vec()))
         );
         assert!(wrapped.contains("Present(..)"), "{wrapped}");
+    }
+
+    #[test]
+    fn an_error_says_whether_it_was_a_lock_or_an_interruption() {
+        let plain = ReadError::new("keychain", "rc 1");
+        assert_eq!((plain.is_locked(), plain.interruption()), (false, None));
+        let locked = ReadError::locked("keychain", "rc 36: the keychain is locked");
+        assert_eq!((locked.is_locked(), locked.interruption()), (true, None));
+        let cut = ReadError::interrupted("keychain", 15);
+        assert_eq!((cut.is_locked(), cut.interruption()), (false, Some(15)));
+        assert_eq!(
+            cut.to_string(),
+            "keychain is unreadable: interrupted by signal 15"
+        );
     }
 }
