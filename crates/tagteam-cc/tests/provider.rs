@@ -172,7 +172,8 @@ fn hashed(prefix: &str, dir: &str) -> String {
 /// `CLAUDE_CONFIG_DIR=~/.claude`, beside the two inert former fallback items (Appendix A.2).
 fn plant_every_entry(f: &Fx) -> Env {
     let mut env = f.env.clone();
-    env.claude_config_dir = Some(env.home.join(".claude").into_os_string());
+    let default_home = env.home.join(".claude").into_os_string();
+    tagteam_cc::env::set_config_dir(&mut env, Some(default_home));
     let paths = CcPaths::resolve(&env);
     let acct = keychain_account(&env);
     let entry = json!({"claudeAiOauth": {"refreshToken": "rt-item"}, "mcpOAuth": {"m": 1}});
@@ -624,7 +625,7 @@ fn identity_surface_lists_the_one_item_per_axis_of_the_exported_spelling() {
     let link = f.env.home.join("link-profile");
     std::os::unix::fs::symlink(&target_dir, &link).unwrap();
     let mut env = f.env.clone();
-    env.claude_config_dir = Some(link.clone().into_os_string());
+    tagteam_cc::env::set_config_dir(&mut env, Some(link.clone().into_os_string()));
 
     let s = f.cc.identity_surface(&env);
     let acct = keychain_account(&env);
@@ -1037,7 +1038,7 @@ fn claude_code_s_budget_rendering_and_live_identity_source() {
     );
     let mut env = f.env.clone();
     let dir = f.env.home.join("cfg");
-    env.claude_config_dir = Some(dir.clone().into_os_string());
+    tagteam_cc::env::set_config_dir(&mut env, Some(dir.clone().into_os_string()));
     assert_eq!(
         f.cc.live_identity_source(&env),
         Some(CcPaths::resolve(&env).global_config),

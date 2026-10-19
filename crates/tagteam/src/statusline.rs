@@ -285,11 +285,11 @@ pub(crate) fn sighting_home(shell: &RunShell, env: &Env) -> SightingHome {
         RunShell::Inside { profile, .. } => SightingHome::Profile(profile.clone()),
         RunShell::Unreadable { .. } => SightingHome::Elsewhere,
         RunShell::Outside => {
-            let Some(dir) = env.claude_config_dir.as_deref().filter(|d| !d.is_empty()) else {
+            let Some(dir) = tagteam_cc::env::config_dir(env).filter(|d| !d.is_empty()) else {
                 return SightingHome::Default;
             };
             let mut plain = env.clone();
-            plain.claude_config_dir = None;
+            tagteam_cc::env::set_config_dir(&mut plain, None);
             if same_dir(Path::new(dir), &CcPaths::resolve(&plain).config_home) {
                 SightingHome::Default
             } else {
@@ -622,15 +622,18 @@ mod tests {
         std::fs::create_dir_all(&default).unwrap();
         let outside = |env: &Env| sighting_home(&RunShell::Outside, env);
         assert_eq!(outside(&env), SightingHome::Default, "unset");
-        env.claude_config_dir = Some(OsString::new());
+        tagteam_cc::env::set_config_dir(&mut env, Some(OsString::new()));
         assert_eq!(outside(&env), SightingHome::Default, "empty, as unset");
-        env.claude_config_dir = Some(default.clone().into_os_string());
+        tagteam_cc::env::set_config_dir(&mut env, Some(default.clone().into_os_string()));
         assert_eq!(outside(&env), SightingHome::Default, "the default, by name");
         let link = dir.path().join("claude-link");
         std::os::unix::fs::symlink(&default, &link).unwrap();
-        env.claude_config_dir = Some(link.into_os_string());
+        tagteam_cc::env::set_config_dir(&mut env, Some(link.into_os_string()));
         assert_eq!(outside(&env), SightingHome::Default, "through a link");
-        env.claude_config_dir = Some(dir.path().join("elsewhere").into_os_string());
+        tagteam_cc::env::set_config_dir(
+            &mut env,
+            Some(dir.path().join("elsewhere").into_os_string()),
+        );
         assert_eq!(outside(&env), SightingHome::Elsewhere);
         let profile = dir.path().join("profile");
         let inside = RunShell::Inside {
@@ -779,7 +782,7 @@ mod tests {
         let profile = dir.path().join("profile");
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(profile.join(MARKER_FILE), "not json").unwrap();
-        env.claude_config_dir = Some(profile.clone().into_os_string());
+        tagteam_cc::env::set_config_dir(&mut env, Some(profile.clone().into_os_string()));
         let (built, _, http, keychain) = engine(context(env), None);
         assert!(
             matches!(built.run_shell(), RunShell::Unreadable { marker, .. } if *marker == profile.join(MARKER_FILE)),
@@ -894,7 +897,7 @@ mod tests {
         .write(&profile)
         .unwrap();
         let mut inside = env.clone();
-        inside.claude_config_dir = Some(spelling.into());
+        tagteam_cc::env::set_config_dir(&mut inside, Some(spelling.into()));
         inside
     }
 
@@ -943,7 +946,8 @@ mod tests {
         assert_eq!((keychain.calls(), http.is_built()), (0, false));
 
         let corrupt = in_profile(&outside, &AccountId::from_string("0192-corrupt"));
-        let marker = PathBuf::from(corrupt.claude_config_dir.clone().unwrap()).join(MARKER_FILE);
+        let marker =
+            PathBuf::from(tagteam_cc::env::config_dir(&corrupt).unwrap()).join(MARKER_FILE);
         std::fs::write(&marker, b"{\"format\": \"tagteam-profile\", ").unwrap();
         let (built, provider, http, keychain) = engine(context(corrupt.clone()), None);
         assert!(matches!(built.run_shell(), RunShell::Unreadable { .. }));

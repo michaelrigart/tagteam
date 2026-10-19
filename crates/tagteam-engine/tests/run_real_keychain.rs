@@ -186,8 +186,8 @@ impl Real {
     /// The hashed item Claude Code names from `spelling` (Appendix A.2).
     fn profile_item(&self, spelling: &str) -> (String, String) {
         let mut env = self.env.clone();
-        env.claude_config_dir = Some(spelling.into());
-        env.claude_securestorage_config_dir = None;
+        tagteam_cc::env::set_config_dir(&mut env, Some(spelling.into()));
+        tagteam_cc::env::set_securestorage_dir(&mut env, None);
         (
             keychain_service(&env, ItemKind::OAuth),
             keychain_account(&env),

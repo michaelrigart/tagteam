@@ -244,6 +244,7 @@ impl Context {
         // process boundary and never in `run`, so a hand-built `Context` carries exactly the
         // `vars` its test set (§15.1). Building the registry touches no Keychain item.
         let registry = build_registry(&ctx);
+        ctx.env.capture_homes(&home_vars(&registry));
         let names = session_vars(&registry);
         ctx.env.capture_vars(&names);
         // Decision 18: which of the variables a session scrubs are set here, for the launch's
@@ -257,8 +258,9 @@ impl Context {
         }
         // D9.1, D10: the variables a service unit records, as this process has them, for
         // `daemon install` and for doctor's comparison with an installed unit. They come after
-        // the presence markers above. `CLAUDE_SECURESTORAGE_CONFIG_DIR` is among both: its
-        // value, a directory the Env already holds raw, replaces its marker and keeps it present.
+        // the presence markers above. A provider's home variable can be among both: its value,
+        // a directory the Env already holds raw in `homes`, replaces its marker and keeps it
+        // present.
         ctx.env.capture_vars(RECORDED_VARS);
         Ok(ctx)
     }
@@ -278,6 +280,18 @@ pub(crate) fn build_registry(ctx: &Context) -> ProviderRegistry {
         cc = cc.with_endpoints(Endpoints::with_base(base));
     }
     ProviderRegistry::new().with(Arc::new(cc))
+}
+
+/// The variables `Context::from_process` captures into `Env.homes`: every provider's
+/// `vars().homes`, in registration order, each once.
+pub(crate) fn home_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = Vec::new();
+    for name in registry.all().iter().flat_map(|p| p.vars().homes) {
+        if !names.contains(name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// The variables `Context::from_process` captures into `Env.vars` (Decision 5): every variable
@@ -2845,6 +2859,29 @@ mod tests {
             "auto-switch already runs for Claude Code (the daemon, pid 4242; pause it with tagteam config set daemon.autoswitch false)"
         );
         assert_eq!(refusal(None), "auto-switch already runs for Claude Code");
+    }
+
+    #[test]
+    fn the_process_boundary_captures_each_provider_s_home_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context {
+            env: Env::for_test(dir.path()),
+            keychain: Arc::new(FakeKeychain::new()),
+            vault_keychain: None,
+            platform: Platform::MacOs,
+            api_base: None,
+            stdout_terminal: false,
+            no_color_env: false,
+            force_color_env: false,
+        };
+        assert_eq!(
+            home_vars(&build_registry(&ctx)),
+            ["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"]
+        );
+        assert!(
+            ctx.env.homes.is_empty(),
+            "only the process boundary captures"
+        );
     }
 
     #[test]

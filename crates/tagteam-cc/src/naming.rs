@@ -12,12 +12,10 @@ pub enum ItemKind {
 /// The directory string whose hash suffixes the item, or `None` for the default items
 /// (Appendix A.2: `useDefault`).
 pub(crate) fn suffix_source(env: &Env) -> Option<String> {
-    match &env.claude_securestorage_config_dir {
+    match crate::env::securestorage_dir(env) {
         Some(v) if v.is_empty() => None,
         Some(v) => Some(nfc(v)),
-        None => env
-            .claude_config_dir
-            .as_deref()
+        None => crate::env::config_dir(env)
             .filter(|v| !v.is_empty())
             .map(nfc),
     }
@@ -82,22 +80,22 @@ mod tests {
         );
         let mut e = env();
         assert_eq!(cc.live_item_spelling(&e), None, "the default items");
-        e.claude_config_dir = Some("/cfg/e\u{301}".into());
+        crate::env::set_config_dir(&mut e, Some("/cfg/e\u{301}".into()));
         assert_eq!(
             cc.live_item_spelling(&e).as_deref(),
             Some("/cfg/\u{e9}"),
             "NFC"
         );
-        e.claude_securestorage_config_dir = Some("/secure".into());
+        crate::env::set_securestorage_dir(&mut e, Some("/secure".into()));
         assert_eq!(
             cc.live_item_spelling(&e).as_deref(),
             Some("/secure"),
             "first"
         );
-        e.claude_securestorage_config_dir = Some("".into());
+        crate::env::set_securestorage_dir(&mut e, Some("".into()));
         assert_eq!(cc.live_item_spelling(&e), None, "empty counts as unset");
-        e.claude_securestorage_config_dir = None;
-        e.claude_config_dir = Some("".into());
+        crate::env::set_securestorage_dir(&mut e, None);
+        crate::env::set_config_dir(&mut e, Some("".into()));
         assert_eq!(cc.live_item_spelling(&e), None);
     }
 
@@ -116,7 +114,7 @@ mod tests {
     #[test]
     fn a_config_dir_suffixes_with_the_raw_string_hash() {
         let mut e = env();
-        e.claude_config_dir = Some("/home/tester/profile".into());
+        crate::env::set_config_dir(&mut e, Some("/home/tester/profile".into()));
         assert_eq!(
             keychain_service(&e, ItemKind::OAuth),
             "Claude Code-credentials-535fa96b"
@@ -125,12 +123,12 @@ mod tests {
             keychain_service(&e, ItemKind::ManagedKey),
             "Claude Code-535fa96b"
         );
-        e.claude_config_dir = Some("/home/tester/profile/".into());
+        crate::env::set_config_dir(&mut e, Some("/home/tester/profile/".into()));
         assert_eq!(
             keychain_service(&e, ItemKind::OAuth),
             "Claude Code-credentials-2c60625b"
         );
-        e.claude_config_dir = Some("".into());
+        crate::env::set_config_dir(&mut e, Some("".into()));
         assert_eq!(
             keychain_service(&e, ItemKind::OAuth),
             "Claude Code-credentials"
@@ -140,7 +138,7 @@ mod tests {
     #[test]
     fn names_are_nfc_normalized() {
         let mut e = env();
-        e.claude_config_dir = Some("/home/tester/cafe\u{301}".into()); // NFD
+        crate::env::set_config_dir(&mut e, Some("/home/tester/cafe\u{301}".into())); // NFD
         assert_eq!(
             keychain_service(&e, ItemKind::OAuth),
             "Claude Code-credentials-3f2ee927"
@@ -150,14 +148,14 @@ mod tests {
     #[test]
     fn a_defined_secure_storage_dir_decides_alone() {
         let mut e = env();
-        e.claude_config_dir = Some("/home/tester/profile".into());
-        e.claude_securestorage_config_dir = Some("".into());
+        crate::env::set_config_dir(&mut e, Some("/home/tester/profile".into()));
+        crate::env::set_securestorage_dir(&mut e, Some("".into()));
         assert_eq!(
             keychain_service(&e, ItemKind::OAuth),
             "Claude Code-credentials"
         );
-        e.claude_config_dir = None;
-        e.claude_securestorage_config_dir = Some("/home/tester/profile".into());
+        crate::env::set_config_dir(&mut e, None);
+        crate::env::set_securestorage_dir(&mut e, Some("/home/tester/profile".into()));
         assert_eq!(
             keychain_service(&e, ItemKind::OAuth),
             "Claude Code-credentials-535fa96b"
@@ -168,7 +166,7 @@ mod tests {
     fn an_explicit_default_config_dir_names_only_its_suffixed_items() {
         // Appendix A.2 (2.1.286): no fallback to the unsuffixed items for `~/.claude`.
         let mut e = env();
-        e.claude_config_dir = Some("/home/tester/.claude".into());
+        crate::env::set_config_dir(&mut e, Some("/home/tester/.claude".into()));
         assert_eq!(
             keychain_service(&e, ItemKind::OAuth),
             "Claude Code-credentials-b2e2cf9d"
@@ -187,7 +185,7 @@ mod tests {
         let link = d.path().join("link");
         std::os::unix::fs::symlink("real", &link).unwrap();
         let mut e = env();
-        e.claude_config_dir = Some(link.clone().into_os_string());
+        crate::env::set_config_dir(&mut e, Some(link.clone().into_os_string()));
         let hash = |p: &Path| {
             hex::encode(Sha256::digest(p.to_str().unwrap().as_bytes()).as_slice())[..8].to_owned()
         };
@@ -217,7 +215,7 @@ mod tests {
     #[test]
     fn the_r1_spike_hash_is_pinned() {
         let mut e = env();
-        e.claude_config_dir = Some("/tmp/tagteam-r1-spike".into());
+        crate::env::set_config_dir(&mut e, Some("/tmp/tagteam-r1-spike".into()));
         assert_eq!(
             keychain_service(&e, ItemKind::OAuth),
             "Claude Code-credentials-ba6c431d"

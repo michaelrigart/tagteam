@@ -1361,10 +1361,10 @@ fn an_orphan_naming_the_live_config_dir_never_deletes_the_live_login() {
     let fx = Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
         let parent = fs::canonicalize(e.home.parent().unwrap()).unwrap();
         let live = parent.join(e.home.file_name().unwrap()).join(".claude");
-        e.claude_config_dir = Some(live.into_os_string());
+        tagteam_cc::env::set_config_dir(e, Some(live.into_os_string()));
     });
     fx.add("a@x.co", "rt-a");
-    let live_dir = PathBuf::from(fx.env.claude_config_dir.clone().unwrap());
+    let live_dir = PathBuf::from(tagteam_cc::env::config_dir(&fx.env).unwrap());
     let live_item = fx.live_item(tagteam_cc::ItemKind::OAuth);
     fx.kc.put(&live_item.0, &live_item.1, b"the live login");
     let link = fx.env.data_dir().join("sessions/live-link");
@@ -1560,7 +1560,7 @@ fn an_orphan_named_by_the_secure_storage_override_never_deletes_the_live_login()
         let orphan = canonical_root
             .join(e.data_dir().strip_prefix(&root).unwrap())
             .join("sessions/secure");
-        e.claude_securestorage_config_dir = Some(orphan.into_os_string());
+        tagteam_cc::env::set_securestorage_dir(e, Some(orphan.into_os_string()));
     });
     let orphan = fx.env.data_dir().join("sessions/secure");
     fs::create_dir_all(&orphan).unwrap();
@@ -1663,11 +1663,11 @@ fn live_config_fixture() -> (Fx, AccountId, PathBuf, LiveItems) {
     let fx = Fx::with(Platform::MacOs, |e| {
         let parent = fs::canonicalize(e.home.parent().unwrap()).unwrap();
         let live = parent.join(e.home.file_name().unwrap()).join(".claude");
-        e.claude_config_dir = Some(live.into_os_string());
+        tagteam_cc::env::set_config_dir(e, Some(live.into_os_string()));
     });
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
-    let live_dir = PathBuf::from(fx.env.claude_config_dir.clone().unwrap());
+    let live_dir = PathBuf::from(tagteam_cc::env::config_dir(&fx.env).unwrap());
     fs::create_dir_all(&live_dir).unwrap();
     fs::write(live_dir.join("settings.json"), b"{}").unwrap();
     let items = [
@@ -1749,7 +1749,7 @@ fn live_login_inside(id: &str) -> (Fx, PathBuf, PathBuf) {
         fs::create_dir_all(&dir).unwrap();
         let mut spelled = fs::canonicalize(&dir).unwrap().into_os_string();
         spelled.push("/.");
-        e.claude_securestorage_config_dir = Some(spelled);
+        tagteam_cc::env::set_securestorage_dir(e, Some(spelled));
     });
     let dir = fx.env.data_dir().join("sessions").join(id.as_str());
     fx.write_marker(&dir, &id, &fx.env);
@@ -1952,7 +1952,10 @@ fn live_login_in_a_case_alias(id: &str) -> (Fx, AccountId, PathBuf, PathBuf) {
         let dir = tagteam_provider::profile::profile_path(e, &aid);
         fs::create_dir_all(&dir).unwrap();
         let sessions = fs::canonicalize(dir.parent().unwrap()).unwrap();
-        e.claude_securestorage_config_dir = Some(sessions.join(id.to_uppercase()).into_os_string());
+        tagteam_cc::env::set_securestorage_dir(
+            e,
+            Some(sessions.join(id.to_uppercase()).into_os_string()),
+        );
     });
     let dir = fx.profile_dir(&aid);
     fx.write_marker(&dir, &aid, &fx.env);
@@ -2055,9 +2058,9 @@ fn live_config_under_data(under: &str) -> (Fx, PathBuf, [PathBuf; 4]) {
     let fx = Fx::with(Platform::Linux, |e| {
         let live = e.data_dir().join(&under).join("live");
         fs::create_dir_all(&live).unwrap();
-        e.claude_config_dir = Some(live.into_os_string());
+        tagteam_cc::env::set_config_dir(e, Some(live.into_os_string()));
     });
-    let live = PathBuf::from(fx.env.claude_config_dir.clone().unwrap());
+    let live = PathBuf::from(tagteam_cc::env::config_dir(&fx.env).unwrap());
     fs::write(live.join(".claude.json"), b"{\"oauthAccount\":{}}").unwrap();
     fs::write(live.join(".credentials.json"), b"the live login").unwrap();
     let log = plant_log(&fx);
@@ -2203,7 +2206,7 @@ fn a_displaced_directory_that_is_a_link_to_the_live_config_refuses_a_full_purge(
     fs::create_dir_all(&live_dir).unwrap();
     let config = live_dir.clone();
     let fx = Fx::with(Platform::Linux, move |e| {
-        e.claude_config_dir = Some(config.into_os_string());
+        tagteam_cc::env::set_config_dir(e, Some(config.into_os_string()));
     });
     fs::write(live_dir.join(".credentials.json"), b"the live login").unwrap();
     fs::write(live_dir.join(".claude.json"), b"{}").unwrap();

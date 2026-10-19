@@ -39,7 +39,7 @@ pub struct CcPaths {
 
 impl CcPaths {
     pub fn resolve(env: &Env) -> Self {
-        let config_dir = set_dir(env.claude_config_dir.as_deref());
+        let config_dir = set_dir(crate::env::config_dir(env));
         let config_home = config_dir
             .clone()
             .unwrap_or_else(|| env.home.join(".claude"));
@@ -51,7 +51,7 @@ impl CcPaths {
                 .unwrap_or_else(|| env.home.clone())
                 .join(".claude.json")
         };
-        let secure_storage_dir = match env.claude_securestorage_config_dir.as_deref() {
+        let secure_storage_dir = match crate::env::securestorage_dir(env) {
             Some(v) if v.is_empty() => env.home.join(".claude"),
             Some(v) => PathBuf::from(nfc(v)),
             None => config_home.clone(),
@@ -115,15 +115,15 @@ mod tests {
     }
 
     #[test]
-    fn claude_config_dir_moves_home_and_config_but_empty_means_unset() {
+    fn config_dir_moves_home_and_config_but_empty_means_unset() {
         let d = tempfile::tempdir().unwrap();
         let mut e = env(d.path());
-        e.claude_config_dir = Some("/p".into());
+        crate::env::set_config_dir(&mut e, Some("/p".into()));
         let p = CcPaths::resolve(&e);
         assert_eq!(p.config_home, Path::new("/p"));
         assert_eq!(p.global_config, Path::new("/p/.claude.json"));
         assert_eq!(p.credentials_file, Path::new("/p/.credentials.json"));
-        e.claude_config_dir = Some("".into());
+        crate::env::set_config_dir(&mut e, Some("".into()));
         assert_eq!(
             CcPaths::resolve(&e).config_home,
             d.path().join("home/.claude")
@@ -134,15 +134,15 @@ mod tests {
     fn secure_storage_dir_anchors_credentials_and_locks() {
         let d = tempfile::tempdir().unwrap();
         let mut e = env(d.path());
-        e.claude_config_dir = Some("/p".into());
-        e.claude_securestorage_config_dir = Some("".into());
+        crate::env::set_config_dir(&mut e, Some("/p".into()));
+        crate::env::set_securestorage_dir(&mut e, Some("".into()));
         let p = CcPaths::resolve(&e);
         assert_eq!(p.secure_storage_dir, d.path().join("home/.claude"));
         assert_eq!(
             p.credentials_file,
             d.path().join("home/.claude/.credentials.json")
         );
-        e.claude_securestorage_config_dir = Some("/s".into());
+        crate::env::set_securestorage_dir(&mut e, Some("/s".into()));
         let p = CcPaths::resolve(&e);
         assert_eq!(p.refresh_lock, Path::new("/s/.oauth_refresh.lock"));
         assert_eq!(p.legacy_lock(), Path::new("/s.lock"));
@@ -176,8 +176,8 @@ mod tests {
             d.path().join("home/.claude/.storage-write")
         );
         let mut e = env(d.path());
-        e.claude_config_dir = Some("/p".into());
-        e.claude_securestorage_config_dir = Some("/s".into());
+        crate::env::set_config_dir(&mut e, Some("/p".into()));
+        crate::env::set_securestorage_dir(&mut e, Some("/s".into()));
         assert_eq!(
             CcPaths::resolve(&e).storage_write_lock,
             Path::new("/s/.storage-write")

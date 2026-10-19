@@ -540,3 +540,34 @@ fn an_offline_refresh_before_a_switch_warns_once_and_still_switches() {
     assert!(!stderr.contains("rt-a"), "never a token: {stderr}");
     assert_eq!(live_email(d.path()), "a@x.co");
 }
+
+#[test]
+fn the_binary_names_the_live_item_from_the_secure_storage_dir_it_was_started_with() {
+    // Review refactor §5.1: `Context::from_process` fills `Env.homes` for every provider's home
+    // variables, so the live item is named from CLAUDE_SECURESTORAGE_CONFIG_DIR (Appendix A.2).
+    let d = tempfile::tempdir().unwrap();
+    let secure = d.path().join("secure");
+    std::fs::create_dir_all(&secure).unwrap();
+    let mut env = Env::for_test(d.path());
+    tagteam_cc::env::set_securestorage_dir(&mut env, Some(secure.clone().into_os_string()));
+    seed_home(&env);
+    login(
+        &env,
+        &FileKeychain::new(d.path().join("keychain")),
+        "a@x.co",
+        "",
+        "rt-a",
+    );
+    cmd(d.path())
+        .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", &secure)
+        .arg("add")
+        .assert()
+        .success();
+    cmd(d.path())
+        .arg("add")
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains(
+            "there is no live login to add; log in with `claude` first",
+        ));
+}

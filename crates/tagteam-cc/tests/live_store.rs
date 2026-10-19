@@ -26,7 +26,10 @@ const INERT_MANAGED: &str = "Claude Code";
 
 /// A fixture with an explicit `CLAUDE_CONFIG_DIR=~/.claude`.
 fn explicit_default() -> Fx {
-    fx_with(|e| e.claude_config_dir = Some(e.home.join(".claude").into_os_string()))
+    fx_with(|e| {
+        let dir = e.home.join(".claude").into_os_string();
+        tagteam_cc::env::set_config_dir(e, Some(dir));
+    })
 }
 
 struct Fx {
@@ -335,9 +338,9 @@ fn a_symlinked_config_dir_is_read_and_cleared_only_under_the_link_s_spelling() {
     let link = f.env.home.join("link-profile");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let mut by_link = f.env.clone();
-    by_link.claude_config_dir = Some(link.into_os_string());
+    tagteam_cc::env::set_config_dir(&mut by_link, Some(link.into_os_string()));
     let mut by_target = f.env.clone();
-    by_target.claude_config_dir = Some(real.into_os_string());
+    tagteam_cc::env::set_config_dir(&mut by_target, Some(real.into_os_string()));
     let s = store(&f, Platform::MacOs);
     let acct = keychain_account(&f.env);
     let link_item = keychain_service(&by_link, ItemKind::OAuth);

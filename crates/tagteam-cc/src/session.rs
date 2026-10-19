@@ -21,6 +21,7 @@ use tagteam_provider::{
 };
 
 use crate::config::read_bytes;
+use crate::env::{CONFIG_DIR, SECURE_STORAGE_DIR, set_config_dir, set_securestorage_dir};
 use crate::locks;
 use crate::paths::CcPaths;
 use crate::provider::CONFIG_REMEDY;
@@ -91,12 +92,9 @@ pub(crate) const CC_PRIVATE: &[&str] = &[
     ".tagteam-*",
 ];
 
-const CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
-const SECURE_STORAGE_DIR: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
-
 /// One variable as the record keeps it: its text, or `null` when undefined. A value that is not
 /// UTF-8 is kept as the same lossy text Keychain naming already hashes (Appendix A.2).
-fn recorded(v: Option<&OsString>) -> Value {
+fn recorded(v: Option<&OsStr>) -> Value {
     v.map_or(Value::Null, |s| {
         Value::String(s.to_string_lossy().into_owned())
     })
@@ -106,13 +104,13 @@ fn recorded(v: Option<&OsString>) -> Value {
 /// null means undefined; "" is kept (defined-but-empty, Appendix A.1).
 pub(crate) fn outer_home(env: &Env) -> Value {
     json!({
-        CONFIG_DIR: recorded(env.claude_config_dir.as_ref()),
-        SECURE_STORAGE_DIR: recorded(env.claude_securestorage_config_dir.as_ref()),
+        CONFIG_DIR: recorded(crate::env::config_dir(env)),
+        SECURE_STORAGE_DIR: recorded(crate::env::securestorage_dir(env)),
     })
 }
 
-/// `env` with both variables as `outer` records them. Anything but a string or `null` under
-/// each key is refused: the outer home would be a guess. A variable `env.vars` captured
+/// `env` with both variables as `outer` records them in `homes`. Anything but a string or `null`
+/// under each key is refused: the outer home would be a guess. A variable `env.vars` captured
 /// (Decision 5: `CLAUDE_CONFIG_DIR` is the session variable) follows the restored value, and is
 /// dropped where `outer` records it undefined, so nothing reading `vars` still finds the
 /// profile.
@@ -125,31 +123,34 @@ pub(crate) fn apply_outer_home(env: &Env, outer: &Value) -> Result<Env, Provider
         ))),
     };
     let mut out = env.clone();
-    out.claude_config_dir = restored(CONFIG_DIR)?;
-    out.claude_securestorage_config_dir = restored(SECURE_STORAGE_DIR)?;
+    let config_dir = restored(CONFIG_DIR)?;
+    let secure_storage_dir = restored(SECURE_STORAGE_DIR)?;
     for (key, value) in [
-        (CONFIG_DIR, &out.claude_config_dir),
-        (SECURE_STORAGE_DIR, &out.claude_securestorage_config_dir),
+        (CONFIG_DIR, config_dir.clone()),
+        (SECURE_STORAGE_DIR, secure_storage_dir.clone()),
     ] {
         if out.vars.contains_key(key) {
             match value {
-                Some(v) => out.vars.insert(key.to_owned(), v.clone()),
+                Some(v) => out.vars.insert(key.to_owned(), v),
                 None => out.vars.remove(key),
             };
         }
     }
+    set_config_dir(&mut out, config_dir);
+    set_securestorage_dir(&mut out, secure_storage_dir);
     Ok(out)
 }
 
-/// The profile `Env`: `claude_config_dir = Some(spelling)`, `claude_securestorage_config_dir = None`.
+/// The profile `Env`: `CLAUDE_CONFIG_DIR` is `spelling` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` is
+/// undefined.
 /// It is the session environment's view of the profile (§12.5 scrubs the secure-storage dir),
 /// so the profile's Keychain items, named from the recorded spelling (§12.2), resolve from it.
 /// Its files resolve from it only while `spelling` still names where the profile is; a read
 /// finds them with `profile_paths` (Decision 19).
 pub(crate) fn profile_env(env: &Env, spelling: &str) -> Env {
     let mut out = env.clone();
-    out.claude_config_dir = Some(OsString::from(spelling));
-    out.claude_securestorage_config_dir = None;
+    set_config_dir(&mut out, Some(OsString::from(spelling)));
+    set_securestorage_dir(&mut out, None);
     out
 }
 
@@ -159,8 +160,8 @@ pub(crate) fn profile_env(env: &Env, spelling: &str) -> Env {
 /// the data directory has moved (§12.2).
 pub(crate) fn profile_paths(env: &Env, dir: &Path) -> CcPaths {
     let mut at = env.clone();
-    at.claude_config_dir = Some(dir.as_os_str().to_owned());
-    at.claude_securestorage_config_dir = None;
+    set_config_dir(&mut at, Some(dir.as_os_str().to_owned()));
+    set_securestorage_dir(&mut at, None);
     CcPaths::resolve(&at)
 }
 

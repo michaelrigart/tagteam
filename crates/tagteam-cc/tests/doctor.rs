@@ -169,7 +169,7 @@ fn auth_status_runs_in_the_outer_home_s_environment() {
     let mut f = fx();
     f.install_claude();
     let outer = f.env.home.join("elsewhere");
-    f.env.claude_config_dir = Some(outer.clone().into_os_string());
+    tagteam_cc::env::set_config_dir(&mut f.env, Some(outer.clone().into_os_string()));
     f.started();
     f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
     f.spawner.push(logged_in("a@x.co", "org-1"));
@@ -225,7 +225,7 @@ fn a_named_config_dir_with_no_global_config_is_not_asked_either() {
         if made {
             fs::create_dir_all(&named).unwrap();
         }
-        f.env.claude_config_dir = Some(named.clone().into_os_string());
+        tagteam_cc::env::set_config_dir(&mut f.env, Some(named.clone().into_os_string()));
         f.spawner.push(exited(0, "2.1.286 (Claude Code)\n"));
         let checks = f.checks();
         let c = one(&checks, "cc.auth");
@@ -398,7 +398,7 @@ fn the_account_name_fallback_is_information() {
 fn items_under_a_former_fallback_name_are_information_found_by_attributes_alone() {
     let mut f = fx();
     let default_home = f.env.home.join(".claude");
-    f.env.claude_config_dir = Some(default_home.into_os_string());
+    tagteam_cc::env::set_config_dir(&mut f.env, Some(default_home.into_os_string()));
     let acct = keychain_account(&f.env);
     f.kc.put("Claude Code-credentials", &acct, b"{}");
     f.kc.set_locked(true);
@@ -424,9 +424,12 @@ fn a_symlinked_config_dir_s_target_item_is_information() {
     fs::create_dir_all(&target).unwrap();
     let link = f.d.path().join("link-claude");
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    f.env.claude_config_dir = Some(link.into_os_string());
+    tagteam_cc::env::set_config_dir(&mut f.env, Some(link.into_os_string()));
     let mut by_target = f.env.clone();
-    by_target.claude_config_dir = Some(fs::canonicalize(&target).unwrap().into_os_string());
+    tagteam_cc::env::set_config_dir(
+        &mut by_target,
+        Some(fs::canonicalize(&target).unwrap().into_os_string()),
+    );
     let acct = keychain_account(&f.env);
     let former = keychain_service(&by_target, ItemKind::OAuth);
     f.kc.put(&former, &acct, b"{}");
@@ -438,7 +441,7 @@ fn a_symlinked_config_dir_s_target_item_is_information() {
 #[test]
 fn variables_that_redirect_the_login_warn_each_by_name() {
     let mut f = fx();
-    f.env.claude_config_dir = Some(OsString::new());
+    tagteam_cc::env::set_config_dir(&mut f.env, Some(OsString::new()));
     for name in [
         "ANTHROPIC_API_KEY",
         "CLAUDE_CODE_GATEWAY_TOKEN",
@@ -555,7 +558,7 @@ fn a_lock_directory_that_cannot_be_read_warns_and_is_never_ok() {
 fn a_former_item_the_probe_cannot_read_warns() {
     let mut f = fx();
     let default_home = f.env.home.join(".claude");
-    f.env.claude_config_dir = Some(default_home.into_os_string());
+    tagteam_cc::env::set_config_dir(&mut f.env, Some(default_home.into_os_string()));
     let acct = keychain_account(&f.env);
     f.kc.put("Claude Code-credentials", &acct, b"{}");
     f.kc.set_unreadable("Claude Code-credentials", &acct, true);
@@ -748,7 +751,7 @@ fn the_auth_fixes_say_where_to_run_claude_auth_status() {
 fn the_unreadable_item_fixes_do_not_claim_an_attributes_probe_shows_why() {
     let mut f = fx();
     let default_home = f.env.home.join(".claude");
-    f.env.claude_config_dir = Some(default_home.into_os_string());
+    tagteam_cc::env::set_config_dir(&mut f.env, Some(default_home.into_os_string()));
     let acct = keychain_account(&f.env);
     f.kc.put("Claude Code-credentials", &acct, b"{}");
     f.kc.set_unreadable("Claude Code-credentials", &acct, true);

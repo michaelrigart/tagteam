@@ -43,6 +43,19 @@ pub fn home_from(value: Option<OsString>) -> Result<PathBuf, EnvError> {
     Ok(home)
 }
 
+fn capture_into(target: &mut BTreeMap<String, OsString>, names: &[&str]) {
+    for name in names {
+        match std::env::var_os(name) {
+            Some(v) => {
+                target.insert((*name).to_owned(), v);
+            }
+            None => {
+                target.remove(*name);
+            }
+        }
+    }
+}
+
 /// Everything tagteam resolves paths from (§15.1). Tests build one with `for_test`.
 #[derive(Clone)]
 pub struct Env {
@@ -51,21 +64,22 @@ pub struct Env {
     pub xdg_config_home: Option<PathBuf>,
     pub xdg_data_home: Option<PathBuf>,
     pub xdg_state_home: Option<PathBuf>,
-    /// The raw string, never canonicalized; `None` when unset.
-    pub claude_config_dir: Option<OsString>,
-    /// `None` when undefined; `Some("")` when defined but empty (Appendix A.1).
-    pub claude_securestorage_config_dir: Option<OsString>,
+    /// The effective values of the variables a provider locates its homes with, raw and never
+    /// canonicalized, captured by `capture_homes`. An absent key is undefined; `""` is defined
+    /// but empty (Appendix A.1). Empty in `from_process` and `for_test`.
+    pub homes: BTreeMap<String, OsString>,
     /// The process's cancel token (§14.1). Clones share it, so every engine and lock built
     /// from one Env sees the same signal; each `for_test` Env has a token of its own.
     pub cancel: Cancel,
-    /// Provider-owned variables the registry asked for (§4.5 `session_dir_var`, `CLAUDECODE`),
-    /// captured by `capture_vars`. Empty in `from_process` and `for_test`.
+    /// Provider-owned variables the registry asked for (§4.5 `session_dir_var`), captured by
+    /// `capture_vars`. Empty in `from_process` and `for_test`.
     pub vars: BTreeMap<String, OsString>,
     forbidden_root: Option<PathBuf>,
 }
 
 /// `vars` shows its names and never its values: a value may be a proxy URL carrying a password
-/// or a login (§14.2), and nothing that holds an `Env` may leak it through `{:?}`.
+/// or a login (§14.2), and nothing that holds an `Env` may leak it through `{:?}`. `homes` holds
+/// directories, and shows both.
 impl std::fmt::Debug for Env {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Env")
@@ -74,11 +88,7 @@ impl std::fmt::Debug for Env {
             .field("xdg_config_home", &self.xdg_config_home)
             .field("xdg_data_home", &self.xdg_data_home)
             .field("xdg_state_home", &self.xdg_state_home)
-            .field("claude_config_dir", &self.claude_config_dir)
-            .field(
-                "claude_securestorage_config_dir",
-                &self.claude_securestorage_config_dir,
-            )
+            .field("homes", &self.homes)
             .field("cancel", &self.cancel)
             .field("vars", &self.vars.keys().collect::<Vec<_>>())
             .field("forbidden_root", &self.forbidden_root)
@@ -100,8 +110,7 @@ impl Env {
             xdg_config_home: abs("XDG_CONFIG_HOME"),
             xdg_data_home: abs("XDG_DATA_HOME"),
             xdg_state_home: abs("XDG_STATE_HOME"),
-            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR"),
-            claude_securestorage_config_dir: std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+            homes: BTreeMap::new(),
             cancel: Cancel::new(),
             vars: BTreeMap::new(),
             forbidden_root: None,
@@ -123,8 +132,7 @@ impl Env {
             xdg_config_home: None,
             xdg_data_home: None,
             xdg_state_home: None,
-            claude_config_dir: None,
-            claude_securestorage_config_dir: None,
+            homes: BTreeMap::new(),
             cancel: Cancel::new(),
             vars: BTreeMap::new(),
             forbidden_root: Some(real_home),
@@ -134,16 +142,13 @@ impl Env {
     /// Reads each named variable from the process environment into `vars` (absent: not
     /// inserted, and any earlier value dropped).
     pub fn capture_vars(&mut self, names: &[&str]) {
-        for name in names {
-            match std::env::var_os(name) {
-                Some(v) => {
-                    self.vars.insert((*name).to_owned(), v);
-                }
-                None => {
-                    self.vars.remove(*name);
-                }
-            }
-        }
+        capture_into(&mut self.vars, names);
+    }
+
+    /// Reads each named variable from the process environment into `homes`, an empty value
+    /// as it is (absent: not inserted, and any earlier value dropped).
+    pub fn capture_homes(&mut self, names: &[&str]) {
+        capture_into(&mut self.homes, names);
     }
 
     pub fn var(&self, name: &str) -> Option<&OsStr> {
@@ -302,6 +307,42 @@ mod tests {
             "a variable gone from the process is dropped"
         );
         assert!(Env::from_process().unwrap().vars.is_empty());
+    }
+
+    #[test]
+    fn provider_homes_are_captured_only_when_asked_for() {
+        const NEVER: &str = "TAGTEAM_TEST_NEVER_SET_7F3B";
+        let mut env = Env::for_test(Path::new("/tmp/fixture"));
+        assert!(env.homes.is_empty());
+        env.capture_homes(&["HOME", NEVER]);
+        assert_eq!(
+            env.homes.get("HOME").map(OsString::as_os_str),
+            std::env::var_os("HOME").as_deref()
+        );
+        assert!(
+            !env.homes.contains_key(NEVER),
+            "an unset variable is not inserted"
+        );
+        env.homes.insert(NEVER.into(), "stale".into());
+        env.capture_homes(&[NEVER]);
+        assert!(
+            !env.homes.contains_key(NEVER),
+            "a variable gone from the process is dropped"
+        );
+        assert!(
+            Env::from_process().unwrap().homes.is_empty(),
+            "from_process names no provider's variable"
+        );
+    }
+
+    #[test]
+    fn debug_shows_homes_with_their_values() {
+        let mut env = Env::for_test(Path::new("/tmp/fixture"));
+        env.homes.insert("AGENT_HOME".into(), "/p".into());
+        assert!(
+            format!("{env:?}").contains(r#"homes: {"AGENT_HOME": "/p"}"#),
+            "{env:?}"
+        );
     }
 
     #[test]

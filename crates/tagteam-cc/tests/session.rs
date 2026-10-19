@@ -61,8 +61,8 @@ fn profile(f: &Fx, id: &str) -> (PathBuf, String) {
 
 fn with_vars(env: &Env, config: Option<&str>, secure: Option<&str>) -> Env {
     let mut e = env.clone();
-    e.claude_config_dir = config.map(OsString::from);
-    e.claude_securestorage_config_dir = secure.map(OsString::from);
+    tagteam_cc::env::set_config_dir(&mut e, config.map(OsString::from));
+    tagteam_cc::env::set_securestorage_dir(&mut e, secure.map(OsString::from));
     e
 }
 
@@ -221,12 +221,12 @@ fn the_outer_home_round_trips_undefined_set_and_defined_but_empty() {
         let restored = f.cc.apply_outer_home(&inside, &outer).unwrap();
         assert_eq!(
             (
-                restored.claude_config_dir.clone(),
-                restored.claude_securestorage_config_dir.clone()
+                tagteam_cc::env::config_dir(&restored),
+                tagteam_cc::env::securestorage_dir(&restored)
             ),
             (
-                outer_env.claude_config_dir.clone(),
-                outer_env.claude_securestorage_config_dir.clone()
+                tagteam_cc::env::config_dir(&outer_env),
+                tagteam_cc::env::securestorage_dir(&outer_env)
             ),
             "{config:?}, {secure:?}"
         );
@@ -241,6 +241,63 @@ fn the_outer_home_round_trips_undefined_set_and_defined_but_empty() {
             "a variable never captured is not added"
         );
         assert_eq!(restored.home, inside.home, "nothing else moves");
+    }
+}
+
+#[test]
+fn apply_outer_home_restores_homes_always_and_vars_only_where_tracked() {
+    const CONFIG: &str = "CLAUDE_CONFIG_DIR";
+    const SECURE: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
+    let f = fx();
+    let inside = with_vars(&f.env, Some("/data/sessions/0192"), None);
+    let rows: [(&str, Option<&str>, bool); 12] = [
+        (CONFIG, Some("/outer"), true),
+        (CONFIG, Some("/outer"), false),
+        (CONFIG, Some(""), true),
+        (CONFIG, Some(""), false),
+        (CONFIG, None, true),
+        (CONFIG, None, false),
+        (SECURE, Some("/outer-secure"), true),
+        (SECURE, Some("/outer-secure"), false),
+        (SECURE, Some(""), true),
+        (SECURE, Some(""), false),
+        (SECURE, None, true),
+        (SECURE, None, false),
+    ];
+    for (var, value, tracked) in rows {
+        let other = if var == CONFIG { SECURE } else { CONFIG };
+        let mut shell = inside.clone();
+        if tracked {
+            let marker = if var == CONFIG {
+                "/data/sessions/0192"
+            } else {
+                ""
+            };
+            shell.vars.insert(var.into(), marker.into());
+        }
+        let outer = json!({var: value, other: null});
+        let restored = f.cc.apply_outer_home(&shell, &outer).unwrap();
+        let label = format!("{var}={value:?}, tracked={tracked}");
+        assert_eq!(
+            restored.homes.get(var).map(OsString::as_os_str),
+            value.map(OsStr::new),
+            "{label}: homes follows the outer record unconditionally"
+        );
+        let in_vars = if tracked { value.map(OsStr::new) } else { None };
+        assert_eq!(
+            restored.vars.get(var).map(OsString::as_os_str),
+            in_vars,
+            "{label}: vars follows only a tracked name"
+        );
+        assert_eq!(
+            restored.var(var).is_some(),
+            in_vars.is_some(),
+            "{label}: the presence launch.rs reads"
+        );
+        assert!(!restored.homes.contains_key(other), "{label}: homes[other]");
+        assert!(!restored.vars.contains_key(other), "{label}: vars[other]");
+        assert!(restored.var(other).is_none(), "{label}: presence of other");
+        assert_eq!(restored.home, inside.home, "{label}: nothing else moves");
     }
 }
 

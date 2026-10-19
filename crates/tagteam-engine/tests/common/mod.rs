@@ -259,7 +259,8 @@ impl Fx {
     /// another spelling's items, which no command may touch.
     pub fn with_explicit_default_config_dir() -> Self {
         Self::with(Platform::MacOs, |e| {
-            e.claude_config_dir = Some(e.home.join(".claude").into_os_string())
+            let dir = e.home.join(".claude").into_os_string();
+            tagteam_cc::env::set_config_dir(e, Some(dir));
         })
     }
 
@@ -1795,8 +1796,8 @@ impl Fx {
     /// (§12.5); everything else is the fixture's.
     pub fn shell_env(&self, profile: &Path) -> Env {
         let mut env = self.env.clone();
-        env.claude_config_dir = Some(profile.as_os_str().to_owned());
-        env.claude_securestorage_config_dir = None;
+        tagteam_cc::env::set_config_dir(&mut env, Some(profile.as_os_str().to_owned()));
+        tagteam_cc::env::set_securestorage_dir(&mut env, None);
         env
     }
 
@@ -1850,8 +1851,8 @@ impl Fx {
     /// `spelling` (Appendix A.2), in the profile's environment: secure storage undefined.
     pub fn item_for_spelling(&self, spelling: &str) -> (String, String) {
         let mut env = self.env.clone();
-        env.claude_config_dir = Some(spelling.into());
-        env.claude_securestorage_config_dir = None;
+        tagteam_cc::env::set_config_dir(&mut env, Some(spelling.into()));
+        tagteam_cc::env::set_securestorage_dir(&mut env, None);
         (
             keychain_service(&env, ItemKind::OAuth),
             keychain_account(&env),

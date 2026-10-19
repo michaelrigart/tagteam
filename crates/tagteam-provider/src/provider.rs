@@ -211,6 +211,14 @@ pub struct Capabilities {
     pub transcripts: bool,
 }
 
+/// The process variables a provider reads, which the binary captures into `Env` at its boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderVars {
+    /// The variables the provider locates its homes and Keychain items with; their effective
+    /// values live in `Env.homes`.
+    pub homes: &'static [&'static str],
+}
+
 /// What the engine and the CLI need to know about one credential kind, so neither ever names a
 /// provider's kind strings (§4.5 "Kind traits").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -712,6 +720,8 @@ pub trait Provider: Send + Sync {
     fn session_dir_var(&self) -> Option<&'static str>;
     /// The directory `env` points this provider at, if set and non-empty.
     fn session_dir(&self, env: &Env) -> Option<PathBuf>;
+    /// The process variables this provider reads (CC: its two home variables).
+    fn vars(&self) -> &'static ProviderVars;
     /// The spelling the live login's Keychain item name is derived from in `env` (§12.2), when
     /// that name is derived from one: the string `profile_spelling` gives a profile whose item
     /// it would be. Purge compares it with an orphaned profile's, so it never deletes the live
