@@ -57,6 +57,10 @@ impl TempKeychain {
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.keychain");
+        // Built before create and unlock run: a panic after `create-keychain` succeeded (an
+        // unlock that fails) still drops `Self`, which deletes the keychain and restores the
+        // search list. Built afterwards, the panic would leave it in the user's search list.
+        let kc = Self(path, dir, snapshot, guard);
         let run = |args: &[&str]| {
             assert!(
                 Command::new("/usr/bin/security")
@@ -66,9 +70,9 @@ impl TempKeychain {
                     .success()
             )
         };
-        run(&["create-keychain", "-p", "pw", path.to_str().unwrap()]);
-        run(&["unlock-keychain", "-p", "pw", path.to_str().unwrap()]);
-        Self(path, dir, snapshot, guard)
+        run(&["create-keychain", "-p", "pw", kc.0.to_str().unwrap()]);
+        run(&["unlock-keychain", "-p", "pw", kc.0.to_str().unwrap()]);
+        kc
     }
 }
 
@@ -272,4 +276,24 @@ fn a_w_text_line_with_dash_u_updates_an_existing_item_in_place() {
         1,
         "one item, updated in place"
     );
+}
+
+#[test]
+fn upsert_writes_every_text_case_and_reads_it_back_byte_for_byte() {
+    let kc = TempKeychain::new();
+    let k = SecurityCli::with_runner(Box::new(ProcessRunner), Some(kc.0.clone()));
+    let mut cases = text_cases();
+    cases.push(("full-line", full_line_text(&kc.0)));
+    cases.push((
+        "over-the-limit",
+        format!("{{\"pad\":\"{}\\\"\"}}", "y".repeat(5000)),
+    ));
+    for (account, text) in &cases {
+        k.upsert(W_SERVICE, account, text.as_bytes()).unwrap(); // `upsert` verifies by reading back
+        assert_eq!(
+            k.find(W_SERVICE, account).present().unwrap(),
+            text.as_bytes(),
+            "{account}"
+        );
+    }
 }
