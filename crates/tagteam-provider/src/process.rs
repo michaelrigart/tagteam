@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -146,7 +146,7 @@ pub struct SpawnSpec {
     pub cwd: Option<PathBuf>,
 }
 
-/// How a captured child ended (`run_captured`).
+/// How a captured child ended (`run_captured`, `run_bounded`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Captured {
     /// It exited, and both its pipes closed. `code` is its exit code, or `signal` the signal
@@ -195,11 +195,89 @@ impl From<Captured> for Discarded {
     }
 }
 
-/// How often a captured child's wait looks at its exit, the deadline and the token.
-const POLL: Duration = Duration::from_millis(10);
-/// How long `run_captured` waits for the output pipes to close once the child has exited, as
-/// `security`'s runner does: a grandchild that inherited a pipe keeps it open after the child.
-const DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// How often a wait under a cancel token looks at it (today's cancel latency). The exit itself
+/// wakes the wait at once.
+const SLICE: Duration = Duration::from_millis(10);
+/// How long a bounded run waits for the output pipes to close once the child has exited: a
+/// grandchild that inherited a pipe keeps it open after the child.
+pub(crate) const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// What an `ExitWatch` has seen of its child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Watched {
+    /// The child has exited and is still unreaped: its pid names its zombie, and the process
+    /// group it leads, until its owner reaps it.
+    Exited,
+    /// It has not exited yet.
+    Pending,
+    /// The watch could not tell: `waitid` failed, or its thread could not start or ended without
+    /// an answer.
+    Failed(String),
+}
+
+/// A child's exit, noticed at once without polling (H4): a thread blocks in
+/// `waitid(WEXITED | WNOWAIT)` on its pid and reports when it returns. `WNOWAIT` leaves the child
+/// unreaped, so its pid cannot be recycled, and a `killpg` of it cannot reach another group, until
+/// the owner reaps it. The owner reaps only once `wait` has answered `Exited` or `Failed`, so the
+/// thread never waits on a reaped pid.
+#[derive(Debug)]
+pub struct ExitWatch {
+    rx: mpsc::Receiver<Result<(), String>>,
+    answer: Option<Watched>,
+}
+
+impl ExitWatch {
+    /// Starts watching `pid`, an unreaped child of this process.
+    pub fn start(pid: u32) -> ExitWatch {
+        let (tx, rx) = mpsc::channel();
+        let answer = thread::Builder::new()
+            .name("exit-watch".into())
+            .spawn(move || {
+                let _ = tx.send(exited(pid));
+            })
+            .err()
+            .map(|e| Watched::Failed(format!("could not start the exit watch: {e}")));
+        ExitWatch { rx, answer }
+    }
+
+    /// Waits up to `timeout` for the exit. `Exited` and `Failed` are final, and are answered
+    /// again at once. `Duration::MAX` waits until the answer comes.
+    pub fn wait(&mut self, timeout: Duration) -> Watched {
+        if let Some(answer) = &self.answer {
+            return answer.clone();
+        }
+        let answer = match self.rx.recv_timeout(timeout) {
+            Ok(Ok(())) => Watched::Exited,
+            Ok(Err(e)) => Watched::Failed(e),
+            Err(RecvTimeoutError::Timeout) => return Watched::Pending,
+            Err(RecvTimeoutError::Disconnected) => {
+                Watched::Failed("the exit watch ended without an answer".into())
+            }
+        };
+        self.answer = Some(answer.clone());
+        answer
+    }
+}
+
+/// Blocks until `pid`, a child of this process, has exited, and leaves it unreaped.
+fn exited(pid: u32) -> Result<(), String> {
+    let pid: libc::id_t = pid;
+    loop {
+        // SAFETY: `info` is a zeroed `siginfo_t` that `waitid` fills in; WNOWAIT leaves the child
+        // waitable, so its owner still reaps it.
+        let rc = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT)
+        };
+        if rc == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e.to_string());
+        }
+    }
+}
 
 /// The `Command` for `spec`: its program, arguments, environment and directory.
 fn command(spec: &SpawnSpec) -> Command {
@@ -218,75 +296,22 @@ fn command(spec: &SpawnSpec) -> Command {
 }
 
 /// Non-interactive: its own process group, stdin null, stdout and stderr captured, the group
-/// killed (`killpg`) on `timeout` or when `cancel` is set (polled every 10 ms). A token already
-/// set spawns nothing (§12.5: the wait for the login check is a cancellation point).
+/// killed (`killpg`) on `timeout` or when `cancel` is set (looked at every 10 ms while it waits;
+/// the exit is noticed at once). A token already set spawns nothing (§12.5: the wait for the
+/// login check is a cancellation point).
 pub fn run_captured(spec: &SpawnSpec, timeout: Duration, cancel: &Cancel) -> Captured {
-    capture(spec, timeout, cancel, DRAIN_GRACE)
+    run_bounded(spec, None, timeout, Some(cancel))
 }
 
-/// `run_captured`, with the drain grace a parameter so the tests need not wait 2 s.
-fn capture(spec: &SpawnSpec, timeout: Duration, cancel: &Cancel, grace: Duration) -> Captured {
-    if let Some(signal) = cancel.requested() {
-        return Captured::Interrupted(signal);
-    }
-    let mut cmd = command(spec);
-    // §14.1: a group of its own, so a Ctrl-C at the terminal never reaches it, and a timeout
-    // or a cancel kills whatever it started too. Its stdin is null and its output is piped, so
-    // the background group never stops it for touching the terminal.
-    cmd.process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return Captured::SpawnFailed(e.to_string()),
-    };
-    let out = drain(child.stdout.take());
-    let err = drain(child.stderr.take());
-    let status = match wait_for(&mut child, timeout, cancel) {
-        Ok(status) => status,
-        Err(ended) => return ended,
-    };
-    // The child is reaped now, so its group id may name another group once its last member
-    // goes: whatever still holds a pipe is left alone rather than killed by a stale id.
-    let until = Instant::now() + grace;
-    let output =
-        collect(&out, until, cancel).and_then(|stdout| Ok((stdout, collect(&err, until, cancel)?)));
-    match output {
-        Ok((stdout, stderr)) => Captured::Exited {
-            code: status.code(),
-            signal: status.signal(),
-            stdout,
-            stderr,
-        },
-        Err(Unfinished::Late) => Captured::TimedOut,
-        Err(Unfinished::Interrupted(signal)) => Captured::Interrupted(signal),
-    }
-}
-
-/// Waits for `child` to exit, polling its exit, the deadline and the token. On the deadline or
-/// the token its whole group is killed and the child reaped; `Err` is then how the run ended.
-fn wait_for(child: &mut Child, timeout: Duration, cancel: &Cancel) -> Result<ExitStatus, Captured> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {}
-            Err(e) => {
-                kill_group(child);
-                return Err(Captured::SpawnFailed(e.to_string()));
-            }
-        }
-        if let Some(signal) = cancel.requested() {
-            kill_group(child);
-            return Err(Captured::Interrupted(signal));
-        }
-        if Instant::now() >= deadline {
-            kill_group(child);
-            return Err(Captured::TimedOut);
-        }
-        thread::sleep(POLL);
-    }
+/// `run_captured` with an optional stdin, written to the child on a thread of its own, and an
+/// optional cancel token: without one, only the exit or the deadline ends the wait.
+pub fn run_bounded(
+    spec: &SpawnSpec,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
+    cancel: Option<&Cancel>,
+) -> Captured {
+    bounded(spec, stdin, Output::Pipe, timeout, cancel, DRAIN_GRACE)
 }
 
 /// `run_captured` for a child whose output nobody wants (D6.2): stdin, stdout and stderr are all
@@ -294,41 +319,180 @@ fn wait_for(child: &mut Child, timeout: Duration, cancel: &Cancel) -> Result<Exi
 /// no pipe. Its own process group, and the kill of that group on `timeout` or when `cancel`
 /// is set, are `run_captured`'s. A token already set spawns nothing.
 pub fn run_discarded(spec: &SpawnSpec, timeout: Duration, cancel: &Cancel) -> Discarded {
-    if let Some(signal) = cancel.requested() {
-        return Discarded::Interrupted(signal);
+    bounded(spec, None, Output::Null, timeout, Some(cancel), DRAIN_GRACE).into()
+}
+
+/// Where a bounded child's stdout and stderr go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Output {
+    /// Piped, drained on threads, and returned once both close within the grace.
+    Pipe,
+    /// `/dev/null`: nothing is drained or returned.
+    Null,
+}
+
+/// The one bounded runner (H4). A token already set spawns nothing. The child leads a process
+/// group of its own; its stdin is `stdin`'s bytes, written on a detached thread, or null. On
+/// `timeout`, or when `cancel` is set, the whole group is killed and the child reaped. With
+/// `Output::Pipe`, both pipes must then close within `grace`, or the run is `TimedOut`: half an
+/// output is never returned.
+pub(crate) fn bounded(
+    spec: &SpawnSpec,
+    stdin: Option<Vec<u8>>,
+    output: Output,
+    timeout: Duration,
+    cancel: Option<&Cancel>,
+    grace: Duration,
+) -> Captured {
+    if let Some(signal) = cancel.and_then(Cancel::requested) {
+        return Captured::Interrupted(signal);
     }
+    let out = || match output {
+        Output::Pipe => Stdio::piped(),
+        Output::Null => Stdio::null(),
+    };
     let mut cmd = command(spec);
+    // §14.1: a group of its own, so a Ctrl-C at the terminal never reaches it, and a timeout
+    // or a cancel kills whatever it started too. Its stdin is null or a pipe and its output is
+    // piped or null, so the background group never stops it for touching the terminal.
     cmd.process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(out())
+        .stderr(out());
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return Discarded::SpawnFailed(e.to_string()),
+        Err(e) => return Captured::SpawnFailed(e.to_string()),
     };
-    match wait_for(&mut child, timeout, cancel) {
-        Ok(status) => Discarded::Exited {
-            code: status.code(),
-            signal: status.signal(),
-        },
-        Err(ended) => ended.into(),
+    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // A child that stops reading fails the write (`EPIPE`); the pipe closes either way.
+        thread::spawn(move || {
+            let _ = pipe.write_all(&bytes);
+        });
+    }
+    let pipes = match output {
+        Output::Pipe => Some((drain(child.stdout.take()), drain(child.stderr.take()))),
+        Output::Null => None,
+    };
+    let exit = ExitWatch::start(child.id());
+    let status = match wait_running(&mut Spawned { child, exit }, timeout, cancel) {
+        Ok(status) => status,
+        Err(ended) => return ended,
+    };
+    let (stdout, stderr) = match pipes {
+        None => (Vec::new(), Vec::new()),
+        Some((out, err)) => {
+            // The child is reaped now, so its group id may name another group once its last
+            // member goes: whatever still holds a pipe is left alone rather than killed by a
+            // stale id.
+            let until = Instant::now() + grace;
+            let both = collect(&out, until, cancel)
+                .and_then(|stdout| Ok((stdout, collect(&err, until, cancel)?)));
+            match both {
+                Ok(both) => both,
+                Err(Unfinished::Late) => return Captured::TimedOut,
+                Err(Unfinished::Interrupted(signal)) => return Captured::Interrupted(signal),
+            }
+        }
+    };
+    Captured::Exited {
+        code: status.code(),
+        signal: status.signal(),
+        stdout,
+        stderr,
     }
 }
 
-/// Kills the child's whole group, then reaps the child. The child leads the group
-/// (`process_group(0)`) and is not reaped yet, so its pid still names that group and no other.
-/// `killpg` can fail with the child already gone: on macOS it fails (`EPERM`) once the leader
-/// has exited and nothing else is left in its group. Then the child alone is killed, which
-/// succeeds on an exited child too, and it is reaped. Only when both fail may the child still
-/// run, and `wait` would block for as long as it does, so then it returns without waiting (as
-/// `security`'s runner does).
-fn kill_group(child: &mut Child) {
+/// What `wait_running` needs from a running child, so its paths are testable.
+trait Running {
+    /// The exit watch's answer within `timeout`.
+    fn watch(&mut self, timeout: Duration) -> Watched;
+    /// Whether a kill of the child's group, or of the child alone, was sent.
+    fn kill_group(&mut self) -> bool;
+    /// Reaps the child, which has exited or been killed.
+    fn reap(&mut self) -> io::Result<ExitStatus>;
+}
+
+/// A spawned child and the watch on its exit.
+struct Spawned {
+    child: Child,
+    exit: ExitWatch,
+}
+
+impl Running for Spawned {
+    fn watch(&mut self, timeout: Duration) -> Watched {
+        self.exit.wait(timeout)
+    }
+
+    fn kill_group(&mut self) -> bool {
+        kill_group(&mut self.child)
+    }
+
+    fn reap(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait()
+    }
+}
+
+/// Waits for the child to exit, or for the deadline or the token. Without a token it is one wait
+/// to the deadline, which the exit ends early; with one, the wait looks at it every `SLICE`. On
+/// the deadline or the token, its whole group is killed and, once the watch has seen the child
+/// go, the child is reaped; `Err` is then how the run ended. A failed watch kills and reaps the
+/// same way and is a `SpawnFailed`. Nothing is reaped before the watch has answered, so its
+/// thread never waits on a reaped, recycled pid.
+fn wait_running(
+    run: &mut dyn Running,
+    timeout: Duration,
+    cancel: Option<&Cancel>,
+) -> Result<ExitStatus, Captured> {
+    let deadline = Instant::now() + timeout;
+    let ended = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let slice = if cancel.is_some() {
+            left.min(SLICE)
+        } else {
+            left
+        };
+        match run.watch(slice) {
+            Watched::Exited => return run.reap().map_err(|e| Captured::SpawnFailed(e.to_string())),
+            Watched::Failed(why) => {
+                if run.kill_group() {
+                    let _ = run.reap();
+                }
+                return Err(Captured::SpawnFailed(why));
+            }
+            Watched::Pending => {}
+        }
+        if let Some(signal) = cancel.and_then(Cancel::requested) {
+            break Captured::Interrupted(signal);
+        }
+        if Instant::now() >= deadline {
+            break Captured::TimedOut;
+        }
+    };
+    // The killed leader becomes a zombie, which the watch sees. Only when no kill could be sent
+    // may the child still run, and both waits would block for as long as it does, so then it
+    // returns at once; the watch's thread ends by itself when the child exits.
+    if run.kill_group() {
+        run.watch(Duration::MAX);
+        let _ = run.reap();
+    }
+    Err(ended)
+}
+
+/// Kills the child's whole group, without reaping it, and says whether a kill was sent. The
+/// child leads the group (`process_group(0)`) and is not reaped yet, so its pid still names that
+/// group and no other. `killpg` can fail with the child already gone: on macOS it fails
+/// (`EPERM`) once the leader has exited and nothing else is left in its group. Then the child
+/// alone is killed, which succeeds on an exited child too. Only when both fail may the child
+/// still run.
+fn kill_group(child: &mut Child) -> bool {
     let group = child.id() as libc::pid_t;
     // SAFETY: killpg(2) takes two integers and touches no memory of ours.
     let sent = unsafe { libc::killpg(group, libc::SIGKILL) } == 0;
-    if sent || child.kill().is_ok() {
-        let _ = child.wait();
-    }
+    sent || child.kill().is_ok()
 }
 
 #[cfg(test)]
@@ -359,16 +523,21 @@ enum Unfinished {
     Interrupted(i32),
 }
 
-/// The drained bytes, once the pipe closes by `until`. The wait is sliced, so the token is
-/// checked here as in the child's own wait.
+/// The drained bytes, once the pipe closes by `until`. Under a token the wait is sliced, so the
+/// token is checked here as in the child's own wait; without one it is a single wait.
 fn collect(
     rx: &mpsc::Receiver<Vec<u8>>,
     until: Instant,
-    cancel: &Cancel,
+    cancel: Option<&Cancel>,
 ) -> Result<Vec<u8>, Unfinished> {
+    let Some(cancel) = cancel else {
+        return rx
+            .recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|_| Unfinished::Late);
+    };
     loop {
         let left = until.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(left.min(POLL)) {
+        match rx.recv_timeout(left.min(SLICE)) {
             Ok(bytes) => return Ok(bytes),
             Err(RecvTimeoutError::Disconnected) => return Err(Unfinished::Late),
             Err(RecvTimeoutError::Timeout) => {}
@@ -891,6 +1060,324 @@ mod tests {
         sender.join().unwrap();
         assert_eq!(got, Captured::Interrupted(1));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The runner as `capture` was, with its grace a parameter; the tests above call it.
+    fn capture(spec: &SpawnSpec, timeout: Duration, cancel: &Cancel, grace: Duration) -> Captured {
+        bounded(spec, None, Output::Pipe, timeout, Some(cancel), grace)
+    }
+
+    /// `pid`, a child of this process, is not reaped yet (running, or a zombie): `waitid` answers
+    /// for it, and fails with ECHILD once it is reaped.
+    fn unreaped(pid: u32) -> bool {
+        // SAFETY: `info` is a zeroed siginfo_t that waitid fills in; WNOHANG and WNOWAIT make it
+        // return at once and reap nothing.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == 0
+        }
+    }
+
+    /// `f`'s result from a thread of its own, or a panic once `limit` has passed: a wait that only
+    /// a tick or a deadline would end fails here instead of hanging.
+    fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit).expect("it did not return in time")
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Did {
+        Watch(Duration),
+        Kill,
+        Reap,
+    }
+
+    /// A child whose exit-watch answers are scripted, recording what the wait did to it (the role
+    /// `security.rs`'s `FakeChild` had).
+    struct FakeRun {
+        answers: VecDeque<Watched>,
+        killable: bool,
+        did: Vec<Did>,
+    }
+
+    impl FakeRun {
+        fn new(answers: Vec<Watched>) -> Self {
+            Self {
+                answers: answers.into(),
+                killable: true,
+                did: Vec::new(),
+            }
+        }
+        fn unkillable(mut self) -> Self {
+            self.killable = false;
+            self
+        }
+    }
+
+    impl Running for FakeRun {
+        fn watch(&mut self, timeout: Duration) -> Watched {
+            self.did.push(Did::Watch(timeout));
+            self.answers.pop_front().expect("unexpected extra watch")
+        }
+        fn kill_group(&mut self) -> bool {
+            self.did.push(Did::Kill);
+            self.killable
+        }
+        fn reap(&mut self) -> io::Result<ExitStatus> {
+            self.did.push(Did::Reap);
+            Ok(ExitStatus::from_raw(3 << 8))
+        }
+    }
+
+    #[test]
+    fn an_exit_watch_sees_the_exit_and_leaves_the_child_unreaped() {
+        let _fork = fork_guard();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut watch = ExitWatch::start(pid);
+        assert_eq!(watch.wait(Duration::from_secs(10)), Watched::Exited);
+        assert!(
+            unreaped(pid),
+            "WNOWAIT: the pid still names the zombie, and its group"
+        );
+        assert_eq!(
+            watch.wait(Duration::ZERO),
+            Watched::Exited,
+            "Exited stays Exited"
+        );
+        assert_eq!(
+            child.wait().unwrap().code(),
+            Some(3),
+            "the owner reaps it, status and all"
+        );
+        assert!(!unreaped(pid));
+    }
+
+    #[test]
+    fn an_exit_watch_on_a_running_child_is_pending_until_it_ends() {
+        let _fork = fork_guard();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let mut watch = ExitWatch::start(child.id());
+        assert_eq!(watch.wait(Duration::from_millis(50)), Watched::Pending);
+        child.kill().unwrap();
+        assert_eq!(watch.wait(Duration::from_secs(10)), Watched::Exited);
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn an_exit_watch_on_a_pid_that_is_not_a_child_fails() {
+        // waitid: ECHILD. This process is not its own child.
+        let mut watch = ExitWatch::start(std::process::id());
+        assert!(matches!(
+            watch.wait(Duration::from_secs(10)),
+            Watched::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn without_a_token_the_wait_asks_the_watch_once_for_the_whole_timeout() {
+        // H4: no polling sleep; the exit wakes the one wait.
+        let mut run = FakeRun::new(vec![Watched::Exited]);
+        let status = wait_running(&mut run, Duration::from_secs(60), None).unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert!(
+            matches!(run.did.as_slice(), [Did::Watch(d), Did::Reap] if *d > Duration::from_secs(59)),
+            "{:?}",
+            run.did
+        );
+    }
+
+    #[test]
+    fn under_a_token_the_wait_looks_at_it_every_10_ms_and_never_kills_a_child_that_exits() {
+        // Replaces security.rs's `a_child_that_exits_in_time_is_left_alone`.
+        let mut run = FakeRun::new(vec![Watched::Pending, Watched::Pending, Watched::Exited]);
+        let status = wait_running(&mut run, Duration::from_secs(60), Some(&Cancel::new())).unwrap();
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(run.did.len(), 4, "{:?}", run.did);
+        assert!(
+            run.did[..3]
+                .iter()
+                .all(|d| matches!(d, Did::Watch(t) if *t <= SLICE))
+        );
+        assert_eq!(run.did[3], Did::Reap);
+    }
+
+    #[test]
+    fn a_set_token_kills_the_group_then_waits_for_the_watch_then_reaps() {
+        let cancel = Cancel::new();
+        cancel.request(15);
+        let mut run = FakeRun::new(vec![Watched::Pending, Watched::Exited]);
+        assert_eq!(
+            wait_running(&mut run, Duration::from_secs(60), Some(&cancel)).unwrap_err(),
+            Captured::Interrupted(15)
+        );
+        assert_eq!(
+            run.did[1..],
+            [Did::Kill, Did::Watch(Duration::MAX), Did::Reap]
+        );
+    }
+
+    #[test]
+    fn a_deadline_kills_the_group_then_waits_for_the_watch_then_reaps() {
+        // Replaces security.rs's `a_child_past_its_deadline_is_killed_and_reaped`.
+        let mut run = FakeRun::new(vec![Watched::Pending, Watched::Exited]);
+        assert_eq!(
+            wait_running(&mut run, Duration::ZERO, None).unwrap_err(),
+            Captured::TimedOut
+        );
+        assert_eq!(
+            run.did,
+            [
+                Did::Watch(Duration::ZERO),
+                Did::Kill,
+                Did::Watch(Duration::MAX),
+                Did::Reap
+            ]
+        );
+    }
+
+    #[test]
+    fn a_child_no_kill_reaches_is_neither_waited_for_nor_reaped() {
+        // Replaces security.rs's `a_child_that_cannot_be_killed_is_not_waited_for`: a wait or a
+        // reap would block for as long as the child runs.
+        let mut past = FakeRun::new(vec![Watched::Pending]).unkillable();
+        assert_eq!(
+            wait_running(&mut past, Duration::ZERO, None).unwrap_err(),
+            Captured::TimedOut
+        );
+        assert_eq!(past.did, [Did::Watch(Duration::ZERO), Did::Kill]);
+        let mut failed = FakeRun::new(vec![Watched::Failed("boom".into())]).unkillable();
+        let got = wait_running(&mut failed, Duration::from_secs(60), None);
+        assert!(
+            matches!(&got, Err(Captured::SpawnFailed(m)) if m.contains("boom")),
+            "{got:?}"
+        );
+        assert_eq!(failed.did[1..], [Did::Kill]);
+    }
+
+    #[test]
+    fn a_failed_watch_kills_and_reaps_the_child_and_is_a_spawn_failure() {
+        // Replaces security.rs's `a_failed_try_wait_kills_and_reaps_the_child`.
+        let mut run = FakeRun::new(vec![Watched::Failed("boom".into())]);
+        let got = wait_running(&mut run, Duration::from_secs(60), None);
+        assert!(
+            matches!(&got, Err(Captured::SpawnFailed(m)) if m.contains("boom")),
+            "{got:?}"
+        );
+        assert_eq!(run.did[1..], [Did::Kill, Did::Reap]);
+    }
+
+    #[test]
+    fn a_child_s_exit_ends_a_bounded_run_without_waiting_out_its_timeout() {
+        // H4: with no token the one wait is to the deadline, an hour away; the exit ends it.
+        let _fork = fork_guard();
+        let got = within(Duration::from_secs(10), || {
+            run_bounded(&sh("exit 4"), None, Duration::from_secs(3600), None)
+        });
+        assert!(
+            matches!(got, Captured::Exited { code: Some(4), .. }),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn stdin_reaches_a_bounded_child_whole() {
+        // 200 KB, past a pipe's buffer: the writer and the drains run beside the wait.
+        let _fork = fork_guard();
+        let input: Vec<u8> = (0..200_000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let got = run_bounded(
+            &sh("cat"),
+            Some(input.clone()),
+            Duration::from_secs(10),
+            None,
+        );
+        let Captured::Exited {
+            code: Some(0),
+            stdout,
+            ..
+        } = got
+        else {
+            panic!("cat did not run")
+        };
+        assert!(stdout == input, "{} bytes came back", stdout.len());
+    }
+
+    #[test]
+    fn a_cancel_interrupts_a_bounded_run_fed_on_stdin_and_kills_its_group() {
+        let _fork = fork_guard();
+        let d = tempfile::tempdir().unwrap();
+        let marker = d.path().join("alive");
+        let cancel = Cancel::new();
+        let signaller = cancel.clone();
+        let sender = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            signaller.request(15);
+        });
+        let started = Instant::now();
+        let got = run_bounded(
+            &with_grandchild(&marker),
+            Some(b"never read".to_vec()),
+            Duration::from_secs(30),
+            Some(&cancel),
+        );
+        sender.join().unwrap();
+        assert_eq!(got, Captured::Interrupted(15));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(1500));
+        assert!(!marker.exists(), "the grandchild died with its group");
+    }
+
+    #[test]
+    fn a_child_killed_at_its_deadline_is_reaped_before_the_run_returns() {
+        let _fork = fork_guard();
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("pid");
+        let script = sh(&format!("echo $$ > '{}'; sleep 30", file.display()));
+        assert_eq!(
+            run_bounded(&script, None, Duration::from_millis(500), None),
+            Captured::TimedOut
+        );
+        assert!(!unreaped(pid_in(&file) as u32), "no zombie is left behind");
+    }
+
+    #[test]
+    fn a_zombie_leader_s_group_is_killed_through_the_kill_fallback() {
+        // H4, H14: the leader has exited and nothing else is in its group. macOS refuses killpg
+        // (EPERM); the kill of the zombie is what goes, and the child is still reaped with its code.
+        let _fork = fork_guard();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert_eq!(
+            ExitWatch::start(pid).wait(Duration::from_secs(10)),
+            Watched::Exited
+        );
+        #[cfg(target_os = "macos")]
+        // SAFETY: killpg(2) with signal 0 only checks; `pid` is an unreaped child of this process.
+        assert_eq!(
+            unsafe { libc::killpg(pid as libc::pid_t, 0) },
+            -1,
+            "killpg alone fails here"
+        );
+        assert!(kill_group(&mut child), "the kill fallback was sent");
+        assert_eq!(child.wait().unwrap().code(), Some(0));
     }
 
     #[test]
