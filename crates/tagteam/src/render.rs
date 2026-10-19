@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 use tagteam_cc::shape::KIND_API_KEY;
-use tagteam_cc::usage::format_iso8601;
+use tagteam_core::time::format_iso8601;
 use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind, printable};
 use tagteam_engine::store::{AccountRow, Mapping};
 use tagteam_engine::switch::SwitchOutcome;

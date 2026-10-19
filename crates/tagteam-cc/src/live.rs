@@ -157,21 +157,7 @@ impl Ledger {
 /// operation wrote it, so putting back what it held before could lose that write.
 const CHANGED_SINCE: &str = "changed since tagteam wrote it; left as it is";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Platform {
-    MacOs,
-    Linux,
-}
-
-impl Platform {
-    pub fn current() -> Self {
-        if cfg!(target_os = "macos") {
-            Platform::MacOs
-        } else {
-            Platform::Linux
-        }
-    }
-}
+pub use tagteam_provider::Platform;
 
 /// How much of one auth axis a change destroys (§9.4 step 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

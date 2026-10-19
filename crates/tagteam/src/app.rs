@@ -7,7 +7,6 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::endpoints::Endpoints;
-use tagteam_cc::live::Platform;
 use tagteam_core::autoswitch::Strategy;
 use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Window};
 use tagteam_daemon::auto::{self, AutoError, AutoFlags, AutoRun};
@@ -48,7 +47,7 @@ use tagteam_provider::profile::RunShell;
 #[cfg(feature = "test-support")]
 use tagteam_provider::security::ProcessRunner;
 use tagteam_provider::security::SecurityCli;
-use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, Read, SystemClock};
+use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, Platform, Read, SystemClock};
 
 use crate::auto::{HumanSink, JsonSink};
 use crate::cli::{
