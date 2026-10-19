@@ -11,6 +11,7 @@ pub mod liveness;
 pub mod mkdir_lock;
 #[cfg(feature = "mock-server")]
 pub mod mock_server;
+pub mod platform;
 pub mod process;
 pub mod profile;
 pub mod provider;
@@ -68,6 +69,7 @@ pub use liveness::{
 pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 #[cfg(feature = "mock-server")]
 pub use mock_server::{MockReply, MockRequest, MockServer};
+pub use platform::Platform;
 #[cfg(any(test, feature = "test-doubles"))]
 pub use process::ScriptedSpawner;
 pub use process::{

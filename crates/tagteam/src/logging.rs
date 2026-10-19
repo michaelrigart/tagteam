@@ -7,7 +7,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tagteam_cc::usage::format_iso8601;
+use tagteam_core::time::format_iso8601;
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter, Targets};
