@@ -11,6 +11,7 @@ pub mod liveness;
 pub mod mkdir_lock;
 #[cfg(feature = "mock-server")]
 pub mod mock_server;
+pub mod passwd;
 pub mod platform;
 pub mod process;
 pub mod profile;

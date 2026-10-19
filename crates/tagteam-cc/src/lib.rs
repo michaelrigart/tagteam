@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #[cfg(test)]
 mod compat;
 pub mod config;
