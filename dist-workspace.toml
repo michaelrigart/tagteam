@@ -21,13 +21,18 @@ publish-jobs = ["homebrew", "./publish-crates"]
 include = ["NOTICE"]
 # Local artifacts jobs to run in CI after dist's own, before the release is hosted
 global-artifacts-jobs = ["./release-smoke"]
+# No Actions cache in release builds (spec H3)
+cache-builds = false
+# Attest the release artifacts when the release is hosted, which happens on tags only
+github-attestations = true
+github-attestations-phase = "host"
 
-# Third-party actions pinned to commits: checkout v7.0.1, upload-artifact v7.0.1, download-artifact v8.0.1, rust-cache v2.9.2
+# Third-party actions pinned to commits: checkout v7.0.1, upload-artifact v7.0.1, download-artifact v8.0.1, attest v4.2.2
 [dist.github-action-commits]
 "actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 "actions/upload-artifact" = "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 "actions/download-artifact" = "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
-"swatinem/rust-cache" = "6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
+"actions/attest" = "1e69f48acb82d1966a394da916b4c1698aa569d6"
 
 # The publish-crates job checks out the tagged commit (contents) and gets a crates.io token
 # through trusted publishing (id-token)

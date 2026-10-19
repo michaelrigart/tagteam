@@ -1,0 +1,14 @@
+# cargo-deny: advisories only (spec H3). ci.yml's `deny` job runs `cargo deny check advisories`.
+
+[advisories]
+# A vulnerability advisory always fails the check, for any crate in the graph.
+# An unsound advisory fails it for any crate in the graph too.
+unsound = "all"
+# An unmaintained notice fails it only for the workspace's direct dependencies: the
+# transitive trees under ratatui and age are not tagteam's to replace.
+unmaintained = "workspace"
+# A yanked version warns.
+yanked = "warn"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "age's `ssh` feature pulls in `rsa`, whose RSA decryption has a timing side channel. tagteam refuses RSA identity files and `ssh-rsa` recipients (`parse_identity_file` and `parse_recipient` in crates/tagteam-engine/src/transfer.rs), so it never decrypts with an RSA key." },
+]
