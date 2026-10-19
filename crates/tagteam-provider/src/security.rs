@@ -343,10 +343,6 @@ fn check_name(v: &str) -> Result<(), KeychainError> {
 
 /// A credential as the text of a `security -i` `-w "…"` word (H5.1): `None` unless it is UTF-8
 /// with no NUL, CR or LF; `\` is written `\\` and `"` written `\"`, nothing else is touched.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "upsert writes -w text from Task 7")
-)]
 pub(crate) fn escape_text(credential: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(credential).ok()?;
     if text.contains(['\0', '\r', '\n']) {
@@ -410,14 +406,32 @@ impl Keychain for SecurityCli {
         let _write = cancel::uninterruptible();
         check_name(service)?;
         check_name(account)?;
-        let hex = hex::encode(data);
+        // The credential as `-w` text when `escape_text` accepts it, else as hex. Past the line
+        // limit argv carries that same encoding: the hex line is never shorter than the text
+        // line, so there is nothing to gain by switching (H5.1).
+        let text = escape_text(data);
+        let value = match &text {
+            Some(escaped) => format!("-w \"{escaped}\""),
+            None => format!("-X \"{}\"", hex::encode(data)),
+        };
         let line = format!(
-            "add-generic-password -U -a \"{account}\" -s \"{service}\" -X \"{hex}\"{}\n",
+            "add-generic-password -U -a \"{account}\" -s \"{service}\" {value}{}\n",
             self.tail()
         );
         let result = if line.len() <= LINE_LIMIT {
             self.run(s(&["-i"]), Some(line.as_bytes()))
         } else {
+            tracing::warn!(
+                service = %service,
+                account = %account,
+                bytes = data.len(),
+                "a Keychain value is too long for security -i, so it goes on security's command line"
+            );
+            // argv needs no quoting: text goes as is, never as `escape_text`'s output.
+            let (flag, arg) = match text {
+                Some(_) => ("-w", String::from_utf8_lossy(data).into_owned()),
+                None => ("-X", hex::encode(data)),
+            };
             self.run(
                 s(&[
                     "add-generic-password",
@@ -426,8 +440,8 @@ impl Keychain for SecurityCli {
                     account,
                     "-s",
                     service,
-                    "-X",
-                    &hex,
+                    flag,
+                    &arg,
                 ]),
                 None,
             )
@@ -1001,26 +1015,180 @@ mod tests {
         assert!(calls[2].1.contains(&"-g".to_string()));
     }
 
+    /// Keeps a second dispatcher registered for the process. `tracing` caches each callsite's
+    /// interest from every registered dispatcher; with only one, it asks just the subscriber of
+    /// the thread that reaches the callsite first, and tests on threads with no capture could
+    /// cache the upsert WARN as never wanted, losing the event of a capture (as the engine's
+    /// `capture_logs` does with `ALWAYS_TWO`).
+    static ALWAYS_TWO: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+
+    /// The `tracing` lines `f` sends on this thread, level first, without times.
+    fn logged(f: impl FnOnce()) -> Vec<String> {
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Lines {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Lines {
+            type Writer = Lines;
+            fn make_writer(&'a self) -> Lines {
+                self.clone()
+            }
+        }
+        ALWAYS_TWO
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        let lines = Lines::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(lines.clone())
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let text = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        text.lines().map(str::to_owned).collect()
+    }
+
     #[test]
-    fn long_writes_fall_back_to_argv() {
-        let data = vec![b'x'; 2100]; // 4200 hex digits: over the 4032-byte line limit
+    fn a_text_credential_is_written_as_escaped_w_text_through_interactive_mode() {
+        let data = r#"{"k":"a\"b\\c é"}"#.as_bytes(); // not `br`: byte literals are ASCII-only
+        let s = Scripted::default().then(ok(b"")).then(ok(data));
+        cli(&s, Some("/tmp/t.keychain"))
+            .upsert("svc", "acct", data)
+            .unwrap();
+        let calls = s.calls();
+        assert_eq!(calls.len(), 2, "the write, then its verify read");
+        assert_eq!(calls[0].1, vec!["-i".to_string()]);
+        assert_eq!(
+            calls[0].2.as_deref().unwrap(),
+            [
+                r#"add-generic-password -U -a "acct" -s "svc" -w "{\"k\":\"a\\\"b\\\\c é\"}" "/tmp/t.keychain""#,
+                "\n"
+            ]
+            .concat()
+            .as_bytes()
+        );
+    }
+
+    #[test]
+    fn bytes_with_nul_cr_or_lf_or_that_are_not_utf8_keep_the_hex_line() {
+        for data in [&b"a\0b"[..], b"a\rb", b"a\nb", &[0xff, 0xfe]] {
+            let hex = hex::encode(data);
+            let s = Scripted::default()
+                .then(ok(b""))
+                .then(ok(format!("{hex}\n").as_bytes()))
+                .then(og_hex(&hex.to_uppercase()));
+            cli(&s, None).upsert("svc", "acct", data).unwrap();
+            assert_eq!(
+                s.calls()[0].2.as_deref().unwrap(),
+                format!("add-generic-password -U -a \"acct\" -s \"svc\" -X \"{hex}\"\n").as_bytes(),
+                "{data:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_text_line_of_exactly_the_limit_stays_on_standard_input() {
+        // The line, newline included, is LINE_LIMIT bytes; one more byte takes argv.
+        let fixed = "add-generic-password -U -a \"acct\" -s \"svc\" -w \"\"\n".len();
+        let at_limit = "x".repeat(LINE_LIMIT - fixed);
+        let s = Scripted::default()
+            .then(ok(b""))
+            .then(ok(at_limit.as_bytes()));
+        cli(&s, None)
+            .upsert("svc", "acct", at_limit.as_bytes())
+            .unwrap();
+        assert_eq!(s.calls()[0].2.as_ref().unwrap().len(), LINE_LIMIT);
+        let over = format!("{at_limit}x");
+        let s = Scripted::default().then(ok(b"")).then(ok(over.as_bytes()));
+        cli(&s, None)
+            .upsert("svc", "acct", over.as_bytes())
+            .unwrap();
+        assert!(s.calls()[0].2.is_none(), "argv");
+    }
+
+    #[test]
+    fn an_over_long_text_credential_goes_on_argv_as_raw_w_text_with_a_warn() {
+        let data = format!(
+            r#"{{"k":"a\"b\\c","s":"SENTINEL","pad":"{}"}}"#,
+            "x".repeat(4100)
+        );
+        let s = Scripted::default().then(ok(b"")).then(ok(data.as_bytes()));
+        let lines = logged(|| {
+            cli(&s, None)
+                .upsert("svc", "acct", data.as_bytes())
+                .unwrap()
+        });
+        let (_, args, stdin) = &s.calls()[0];
+        assert!(stdin.is_none());
+        // argv needs no quoting: the text goes unescaped, never through `escape_text`'s output.
+        assert_eq!(
+            args,
+            &argv(
+                &[
+                    "add-generic-password",
+                    "-U",
+                    "-a",
+                    "acct",
+                    "-s",
+                    "svc",
+                    "-w",
+                    &data
+                ],
+                None
+            )
+        );
+        let warns: Vec<&String> = lines.iter().filter(|l| l.contains("WARN")).collect();
+        assert_eq!(warns.len(), 1, "{lines:#?}");
+        assert!(
+            warns[0].contains(&format!("service=svc account=acct bytes={}", data.len())),
+            "{}",
+            warns[0]
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("SENTINEL")),
+            "never the value"
+        );
+    }
+
+    #[test]
+    fn an_over_long_binary_credential_goes_on_argv_as_hex_with_a_warn() {
+        // Replaces `long_writes_fall_back_to_argv`: 2100 bytes of `x` now fit as text.
+        let data = vec![0xff; 2100]; // 4200 hex digits: over the line limit
         let s = Scripted::default().then(ok(b"")).then(ok(&data));
-        cli(&s, None).upsert("svc", "acct", &data).unwrap();
+        let lines = logged(|| cli(&s, None).upsert("svc", "acct", &data).unwrap());
         let (_, args, stdin) = &s.calls()[0];
         assert!(stdin.is_none());
         assert_eq!(
-            &args[..7],
-            [
-                "add-generic-password",
-                "-U",
-                "-a",
-                "acct",
-                "-s",
-                "svc",
-                "-X"
-            ]
+            args,
+            &argv(
+                &[
+                    "add-generic-password",
+                    "-U",
+                    "-a",
+                    "acct",
+                    "-s",
+                    "svc",
+                    "-X",
+                    &hex::encode(&data)
+                ],
+                None
+            )
         );
-        assert_eq!(args[7], hex::encode(&data));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("WARN") && l.contains("bytes=2100"))
+                .count(),
+            1,
+            "{lines:#?}"
+        );
     }
 
     #[test]
