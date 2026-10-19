@@ -330,11 +330,11 @@ fn live_config_fixture() -> (Fx, AccountId, std::path::PathBuf, LiveItems) {
     let fx = Fx::with(tagteam_cc::live::Platform::MacOs, |e| {
         let parent = fs::canonicalize(e.home.parent().unwrap()).unwrap();
         let live = parent.join(e.home.file_name().unwrap()).join(".claude");
-        e.claude_config_dir = Some(live.into_os_string());
+        tagteam_cc::env::set_config_dir(e, Some(live.into_os_string()));
     });
     let a = fx.add("a@x.co", "rt-a");
     fx.add("b@x.co", "rt-b");
-    let live_dir = std::path::PathBuf::from(fx.env.claude_config_dir.clone().unwrap());
+    let live_dir = std::path::PathBuf::from(tagteam_cc::env::config_dir(&fx.env).unwrap());
     fs::create_dir_all(&live_dir).unwrap();
     fs::write(live_dir.join("settings.json"), b"{}").unwrap();
     let items = [
@@ -412,7 +412,7 @@ fn remove_of_a_profile_holding_the_live_login_s_files_refuses_with_nothing_delet
         fs::create_dir_all(&dir).unwrap();
         let mut spelled = fs::canonicalize(&dir).unwrap().into_os_string();
         spelled.push("/.");
-        e.claude_securestorage_config_dir = Some(spelled);
+        tagteam_cc::env::set_securestorage_dir(e, Some(spelled));
     });
     let dir = fx.profile_dir(&id);
     fx.write_marker(&dir, &id, &fx.env);
@@ -586,7 +586,10 @@ fn remove_of_a_profile_the_live_login_is_in_under_another_case_refuses() {
         let dir = tagteam_provider::profile::profile_path(e, &id);
         fs::create_dir_all(&dir).unwrap();
         let sessions = fs::canonicalize(dir.parent().unwrap()).unwrap();
-        e.claude_securestorage_config_dir = Some(sessions.join("0192-CASE-ALIAS").into_os_string());
+        tagteam_cc::env::set_securestorage_dir(
+            e,
+            Some(sessions.join("0192-CASE-ALIAS").into_os_string()),
+        );
     });
     let dir = fx.profile_dir(&id);
     fx.write_marker(&dir, &id, &fx.env);

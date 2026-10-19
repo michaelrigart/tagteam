@@ -354,7 +354,7 @@ fn a_custom_outer_home_is_restored_as_the_marker_records_it() {
     let bin = fx.fake_bin("claude");
     let custom = fx.dir.path().join("custom-home");
     let mut outer = fx.env.clone();
-    outer.claude_config_dir = Some(custom.clone().into_os_string());
+    tagteam_cc::env::set_config_dir(&mut outer, Some(custom.clone().into_os_string()));
     let profile = fx.profile_dir(&a);
     fx.write_marker(&profile, &a, &outer);
     let engine = fx.engine_located(Fx::with_path(&fx.shell_env(&profile), &bin));
@@ -383,8 +383,8 @@ fn an_empty_outer_config_dir_is_unset_never_exported() {
     let a = two_accounts(&fx);
     let bin = fx.fake_bin("claude");
     let mut outer = fx.env.clone();
-    outer.claude_config_dir = Some(OsString::new());
-    outer.claude_securestorage_config_dir = Some(OsString::new());
+    tagteam_cc::env::set_config_dir(&mut outer, Some(OsString::new()));
+    tagteam_cc::env::set_securestorage_dir(&mut outer, Some(OsString::new()));
     let profile = fx.profile_dir(&a);
     fx.write_marker(&profile, &a, &outer);
     let engine = fx.engine_located(Fx::with_path(&fx.shell_env(&profile), &bin));

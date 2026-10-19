@@ -125,7 +125,7 @@ fn stow(fx: &Fx, name: &str) -> PathBuf {
 /// `CLAUDE_CONFIG_DIR=<home>` records it.
 fn point_marker_at(fx: &Fx, profile: &Path, home: &Path) {
     let mut env = fx.env.clone();
-    env.claude_config_dir = Some(home.as_os_str().to_owned());
+    tagteam_cc::env::set_config_dir(&mut env, Some(home.as_os_str().to_owned()));
     let Read::Present(marker) = ProfileMarker::read(profile) else {
         panic!("the marker reads");
     };

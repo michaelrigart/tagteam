@@ -4,6 +4,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
@@ -107,7 +108,11 @@ fn a_marker_outside_sessions_is_a_run_shell() {
             marker
         }
     );
-    assert_eq!(effective.claude_config_dir, None, "the outer home set none");
+    assert_eq!(
+        tagteam_cc::env::config_dir(&effective),
+        None,
+        "the outer home set none"
+    );
     assert_eq!(
         effective.var("CLAUDE_CONFIG_DIR"),
         None,
@@ -126,7 +131,8 @@ fn a_profile_path_without_a_marker_is_not_a_run_shell() {
     let (shell, effective) = detect_run_shell(&env, &registry(&fx));
     assert_eq!(shell, RunShell::Outside);
     assert_eq!(
-        effective.claude_config_dir, env.claude_config_dir,
+        tagteam_cc::env::config_dir(&effective),
+        tagteam_cc::env::config_dir(&env),
         "unchanged"
     );
 }
@@ -180,8 +186,11 @@ fn the_engine_runs_on_the_outer_home_the_marker_records() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");
     let mut outer = fx.env.clone();
-    outer.claude_config_dir = Some(fx.env.home.join("custom-claude").into_os_string());
-    outer.claude_securestorage_config_dir = Some("".into());
+    tagteam_cc::env::set_config_dir(
+        &mut outer,
+        Some(fx.env.home.join("custom-claude").into_os_string()),
+    );
+    tagteam_cc::env::set_securestorage_dir(&mut outer, Some("".into()));
     let profile = fx.profile_dir(&a);
     fx.write_marker(&profile, &a, &outer);
     // The CLI captures the provider's variable, which names the profile here (Decision 5).
@@ -190,13 +199,19 @@ fn the_engine_runs_on_the_outer_home_the_marker_records() {
         .vars
         .insert("CLAUDE_CONFIG_DIR".into(), profile.clone().into_os_string());
     let (_, effective) = detect_run_shell(&shell, &registry(&fx));
-    assert_eq!(effective.claude_config_dir, outer.claude_config_dir);
+    assert_eq!(
+        tagteam_cc::env::config_dir(&effective),
+        tagteam_cc::env::config_dir(&outer)
+    );
     assert_eq!(
         effective.var("CLAUDE_CONFIG_DIR"),
-        outer.claude_config_dir.as_deref(),
+        tagteam_cc::env::config_dir(&outer),
         "the captured variable names the outer home too"
     );
-    assert_eq!(effective.claude_securestorage_config_dir, Some("".into()));
+    assert_eq!(
+        tagteam_cc::env::securestorage_dir(&effective),
+        Some(OsStr::new(""))
+    );
     assert_eq!(effective.home, fx.env.home);
     assert_eq!(effective.data_dir(), fx.env.data_dir());
 }
@@ -218,7 +233,10 @@ fn an_unreadable_marker_leaves_the_environment_alone_and_names_the_file() {
             panic!("{}: {shell:?}", String::from_utf8_lossy(bad))
         };
         assert_eq!(marker, dir.join(MARKER_FILE));
-        assert_eq!(effective.claude_config_dir, env.claude_config_dir);
+        assert_eq!(
+            tagteam_cc::env::config_dir(&effective),
+            tagteam_cc::env::config_dir(&env)
+        );
     }
 }
 
@@ -242,7 +260,10 @@ fn a_marker_that_is_a_link_to_nothing_is_unreadable() {
             "{}: {shell:?}",
             target.display()
         );
-        assert_eq!(effective.claude_config_dir, env.claude_config_dir);
+        assert_eq!(
+            tagteam_cc::env::config_dir(&effective),
+            tagteam_cc::env::config_dir(&env)
+        );
         let engine = fx.engine_located(env);
         assert_eq!(
             kind(engine.switch(fx.switch_request(&a, false))),
@@ -310,7 +331,7 @@ fn the_first_registered_provider_with_a_marker_decides() {
     let cc_marker = ffx
         .fx
         .write_marker(&cc_profile, &AccountId::from_string("cc-1"), &ffx.fx.env);
-    env.claude_config_dir = Some(cc_profile.clone().into_os_string());
+    tagteam_cc::env::set_config_dir(&mut env, Some(cc_profile.clone().into_os_string()));
     let (shell, _) = detect_run_shell(&env, &registry);
     assert_eq!(
         shell,

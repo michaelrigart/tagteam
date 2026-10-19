@@ -475,7 +475,7 @@ fn remove_refuses_to_delete_what_the_live_login_lives_in() {
     let a = home.at(1);
     let (_profile, spelling) = cc_profile(home.root(), a.id.as_str());
     let mut ctx = home.context();
-    ctx.env.claude_securestorage_config_dir = Some(spelling.into());
+    tagteam_cc::env::set_securestorage_dir(&mut ctx.env, Some(spelling.into()));
     let host = CliHost::new(&ctx, Cancel::new(), PathBuf::from("/nonexistent/tagteam"));
     assert_eq!(
         done(host.act(&Action::Remove(a.clone()), &mut Dialogs::none())),

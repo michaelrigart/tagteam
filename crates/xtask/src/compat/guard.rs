@@ -77,8 +77,8 @@ pub fn cc_env(spelling: &str, home: &Path, user: Option<&str>) -> Env {
     let mut env = Env::for_test(home).with_forbidden_root(home.join(".claude"));
     env.home = home.to_path_buf();
     env.user = user.map(str::to_owned);
-    env.claude_config_dir = Some(spelling.into());
-    env.claude_securestorage_config_dir = None;
+    tagteam_cc::env::set_config_dir(&mut env, Some(spelling.into()));
+    tagteam_cc::env::set_securestorage_dir(&mut env, None);
     env
 }
 

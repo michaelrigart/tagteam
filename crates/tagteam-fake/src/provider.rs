@@ -23,8 +23,9 @@ use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, EntryKind, Env,
     FreshCredential, Identity, IdentitySurface, KindTraits, LineError, LiveAuth, LiveChange,
     LiveLockSet, LiveLocks, LockError, MergeReport, MkdirLock, MkdirLockSpec, MustShare,
-    MutationGuard, Pace, PollBudget, Provider, ProviderError, Read, ReadError, SecretStore,
-    SessionEnv, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, Validity, Window, Written,
+    MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, Read, ReadError,
+    SecretStore, SessionEnv, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, Validity,
+    Window, Written,
 };
 
 use crate::FAKE_AGENT;
@@ -260,6 +261,8 @@ fn showable_token(bytes: &[u8], now_ms: i64) -> Option<String> {
         .filter(|t| !t.is_empty())
         .map(str::to_owned)
 }
+
+static VARS: ProviderVars = ProviderVars { homes: &[] };
 
 impl Provider for FakeAgent {
     fn id(&self) -> ProviderId {
@@ -733,6 +736,10 @@ impl Provider for FakeAgent {
         env.var(HOME_VAR)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
+    }
+
+    fn vars(&self) -> &'static ProviderVars {
+        &VARS
     }
 
     /// FakeAgent names a profile's item (when it keeps one) from its one home variable, so the

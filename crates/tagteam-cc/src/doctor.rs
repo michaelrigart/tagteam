@@ -15,6 +15,10 @@ use tagteam_provider::process::{Captured, ProcessSpawner, SpawnSpec, find_on_pat
 use tagteam_provider::{Cancel, Check, Env, Keychain, LockState, Read};
 
 use crate::config;
+use crate::env::{
+    CONFIG_DIR, SECURE_STORAGE_DIR, config_dir, securestorage_dir, set_config_dir,
+    set_securestorage_dir,
+};
 use crate::live::{LiveStore, Platform};
 use crate::locks::{CONFIG_STALE, CRED_STALE, STORAGE_WRITE_STALE};
 use crate::naming::{ItemKind, keychain_account, keychain_service};
@@ -31,8 +35,6 @@ const NON_PRODUCTION_OAUTH: &[&str] = &[
     "USE_LOCAL_OAUTH",
     "USE_STAGING_OAUTH",
 ];
-const CONFIG_DIR: &str = "CLAUDE_CONFIG_DIR";
-const SECURE_STORAGE_DIR: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
 /// Appendix A.2's account name when `$USER` and the passwd name are both unusable.
 const FALLBACK_ACCOUNT: &str = "claude-code-user";
 
@@ -99,8 +101,8 @@ fn names_default_home(env: &Env, dir: &OsStr) -> bool {
 /// from `dir` is named (Appendix A.2).
 fn named_from(env: &Env, dir: &Path) -> Env {
     let mut at = env.clone();
-    at.claude_config_dir = Some(dir.as_os_str().to_owned());
-    at.claude_securestorage_config_dir = None;
+    set_config_dir(&mut at, Some(dir.as_os_str().to_owned()));
+    set_securestorage_dir(&mut at, None);
     at
 }
 
@@ -329,17 +331,17 @@ fn keychain(kc: &dyn Keychain, env: &Env, acct: &str, out: &mut Vec<Check>) -> L
 /// `CLAUDE_CONFIG_DIR` names the default home, and the items named from a symlinked config
 /// dir's resolved target. None differs from what Claude Code now reads.
 fn former_items(env: &Env) -> Vec<String> {
-    if env.claude_securestorage_config_dir.is_some() {
+    if securestorage_dir(env).is_some() {
         return Vec::new();
     }
-    let Some(dir) = env.claude_config_dir.as_deref().filter(|d| !d.is_empty()) else {
+    let Some(dir) = config_dir(env).filter(|d| !d.is_empty()) else {
         return Vec::new();
     };
     let kinds = [ItemKind::OAuth, ItemKind::ManagedKey];
     let mut names = Vec::new();
     if names_default_home(env, dir) {
         let mut default = env.clone();
-        default.claude_config_dir = None;
+        set_config_dir(&mut default, None);
         names.extend(kinds.map(|k| keychain_service(&default, k)));
     }
     let link = Path::new(dir);
@@ -357,7 +359,7 @@ fn former_items(env: &Env) -> Vec<String> {
 /// The variables a `claude` started from this shell inherits (Appendix A.1, A.7, §12.5).
 fn environment(env: &Env, out: &mut Vec<Check>) {
     let before = out.len();
-    match env.claude_config_dir.as_deref() {
+    match config_dir(env) {
         Some(v) if v.is_empty() => out.push(
             Check::warn(
                 "cc.env.config-dir",
@@ -391,7 +393,7 @@ fn environment(env: &Env, out: &mut Vec<Check>) {
             );
         }
     }
-    if let Some(dir) = &env.claude_securestorage_config_dir {
+    if let Some(dir) = securestorage_dir(env) {
         out.push(
             Check::warn(
                 "cc.env.scrubbed",
@@ -498,11 +500,11 @@ fn auth(
         ..SpawnSpec::default()
     };
     for (name, value) in [
-        (CONFIG_DIR, &env.claude_config_dir),
-        (SECURE_STORAGE_DIR, &env.claude_securestorage_config_dir),
+        (CONFIG_DIR, config_dir(env)),
+        (SECURE_STORAGE_DIR, securestorage_dir(env)),
     ] {
         match value {
-            Some(v) => spec.set.push((OsString::from(name), v.clone())),
+            Some(v) => spec.set.push((OsString::from(name), v.to_owned())),
             None => spec.remove.push(OsString::from(name)),
         }
     }

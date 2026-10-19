@@ -618,7 +618,9 @@ fn its_session_facts_are_deliberately_unlike_claude_code_s() {
     );
     let mut cc_shaped = with_home(&f, "/p/0193");
     cc_shaped.vars.insert("CLAUDECODE".into(), "1".into());
-    cc_shaped.claude_config_dir = Some("/p/0193".into());
+    cc_shaped
+        .homes
+        .insert("CLAUDE_CONFIG_DIR".into(), "/p/0193".into());
     assert!(!f.fake.invoked_by(&cc_shaped));
     assert_eq!(
         f.fake.share_policy(&f.env),

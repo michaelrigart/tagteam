@@ -16,14 +16,15 @@ use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, Check, CredLocks, Credential, DoomedEntry, Env,
     FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LineError, LiveAuth,
     LiveChange, LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare,
-    MutationGuard, Pace, PollBudget, Provider, ProviderError, Read, SessionEnv, SharePolicy,
-    StoredLogin, Undo, UsageLine, UsageResult, Validity, Window, Written,
+    MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, Read, SessionEnv,
+    SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, Validity, Window, Written,
 };
 
 use crate::config;
 use crate::crash;
 use crate::doctor;
 use crate::endpoints::Endpoints;
+use crate::env;
 use crate::live::{self, Extent, Fence, LiveStore, Platform, Snapshot};
 use crate::locks;
 use crate::naming::{ItemKind, keychain_account, keychain_service};
@@ -247,6 +248,10 @@ impl ClaudeCode {
         }
     }
 }
+
+static VARS: ProviderVars = ProviderVars {
+    homes: &[env::CONFIG_DIR, env::SECURE_STORAGE_DIR],
+};
 
 impl Provider for ClaudeCode {
     fn id(&self) -> ProviderId {
@@ -623,10 +628,13 @@ impl Provider for ClaudeCode {
 
     /// Appendix A.1: an empty `CLAUDE_CONFIG_DIR` counts as unset.
     fn session_dir(&self, env: &Env) -> Option<PathBuf> {
-        env.claude_config_dir
-            .as_deref()
+        crate::env::config_dir(env)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
+    }
+
+    fn vars(&self) -> &'static ProviderVars {
+        &VARS
     }
 
     /// Appendix A.2: the live items are named from `CLAUDE_SECURESTORAGE_CONFIG_DIR` when it is

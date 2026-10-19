@@ -5,6 +5,7 @@ pub mod config;
 mod crash;
 mod doctor;
 pub mod endpoints;
+pub mod env;
 pub mod live;
 pub mod locks;
 pub mod naming;
