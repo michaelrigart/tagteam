@@ -618,7 +618,7 @@ fn managed_keys_record_approval_and_never_leave_a_shadowing_item() {
     f.kc.set_fail_delete(&managed.0, true);
     assert!(matches!(
         s.write_managed_key(&f.env, &f.paths, other, &open, &mut save_nothing),
-        Err(ProviderError::ShadowingItem(_))
+        Err(ProviderError::ShadowingItem { .. })
     ));
     f.kc.set_fail_write(&managed.0, false);
     f.kc.set_fail_delete(&managed.0, false);
@@ -652,15 +652,17 @@ fn a_managed_key_item_that_will_not_delete_is_reported_as_a_removal_not_a_file_w
     let err = s
         .clear_managed_key(&f.env, &f.paths, &open)
         .expect_err("the item cannot be verified gone");
-    let ProviderError::ShadowingItem(name) = &err else {
+    let ProviderError::ShadowingItem { item: name, agent } = &err else {
         panic!("expected ShadowingItem, got {err:?}");
     };
+    assert_eq!(*agent, "Claude Code");
     let shown = err.to_string();
-    assert!(shown.contains(name.as_str()), "{shown}");
-    assert!(shown.contains("could not be verified gone"), "{shown}");
-    assert!(
-        shown.contains("so Claude Code may still read it"),
-        "the consequence, not a write: {shown}"
+    assert_eq!(
+        shown,
+        format!(
+            "the Keychain item {name} could not be verified gone, so Claude Code may still read it"
+        ),
+        "the consequence, not a write"
     );
     assert!(!shown.contains("written to the file"), "{shown}");
     assert!(!shown.contains("what tagteam wrote"), "{shown}");
@@ -1592,7 +1594,7 @@ fn times_out<T: std::fmt::Debug>(
 ) {
     let start = Instant::now();
     match write() {
-        Err(ProviderError::Lock(LockError::Timeout(path))) => assert_eq!(path, lock, "{what}"),
+        Err(ProviderError::Lock(LockError::Timeout(t))) => assert_eq!(t.path, lock, "{what}"),
         other => panic!("{what}: expected a timeout on the storage-write lock, got {other:?}"),
     }
     assert!(

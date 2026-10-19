@@ -680,7 +680,10 @@ impl LiveStore {
         let gone = self.delete_verified(&svc, &acct, fence)?;
         self.settle_item(env, kind, &svc, None, gone);
         if !gone {
-            return Err(ProviderError::ShadowingItem(svc));
+            return Err(ProviderError::ShadowingItem {
+                item: svc,
+                agent: crate::provider::DISPLAY_NAME,
+            });
         }
         Ok(())
     }
@@ -1048,7 +1051,10 @@ impl LiveStore {
                 None => self.delete_verified(&svc, &acct, &owned)?,
             };
             if !gone {
-                return Err(ProviderError::ShadowingItem(svc));
+                return Err(ProviderError::ShadowingItem {
+                    item: svc,
+                    agent: crate::provider::DISPLAY_NAME,
+                });
             }
         }
         Ok(())

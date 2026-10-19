@@ -35,6 +35,8 @@ use crate::shape::{self, KIND_API_KEY, KINDS, MACHINE_SHARED_KEYS};
 use crate::transcripts;
 use crate::usage;
 
+pub(crate) const DISPLAY_NAME: &str = "Claude Code";
+
 /// A live read that is too stale or unreliable to compose from, but that isn't itself an
 /// `Unreadable`/parse error with its own detail worth keeping (§9.4 step 3, §3).
 const LIVE_NOT_FRESH: &str =
@@ -252,7 +254,7 @@ impl Provider for ClaudeCode {
     }
 
     fn display_name(&self) -> &'static str {
-        "Claude Code"
+        DISPLAY_NAME
     }
 
     fn capabilities(&self) -> Capabilities {

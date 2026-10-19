@@ -486,7 +486,7 @@ fn deleting_a_profile_credential_removes_and_verifies_both_items_of_its_spelling
     f.kc.put(&oauth, &acct, ENTRY);
     f.kc.set_fail_delete(&oauth, true);
     match f.cc.delete_profile_credential(&f.env, &dir, &spelling) {
-        Err(ProviderError::ShadowingItem(svc)) => assert_eq!(svc, oauth),
+        Err(ProviderError::ShadowingItem { item, .. }) => assert_eq!(item, oauth),
         other => panic!("{other:?}"),
     }
     assert!(
@@ -686,7 +686,7 @@ fn a_held_profile_credential_lock_makes_the_delete_wait_then_time_out() {
     fs::create_dir(&paths.refresh_lock).unwrap(); // the session's agent holds it, freshly
 
     match cc.delete_profile_credential(&f.env, &dir, &spelling) {
-        Err(ProviderError::Lock(LockError::Timeout(path))) => assert_eq!(path, paths.refresh_lock),
+        Err(ProviderError::Lock(LockError::Timeout(t))) => assert_eq!(t.path, paths.refresh_lock),
         other => panic!("expected a timeout, got {other:?}"),
     }
     assert_eq!(f.kc.get(&oauth, &acct).unwrap(), ENTRY, "nothing deleted");
@@ -790,7 +790,7 @@ fn a_held_storage_write_lock_makes_a_profile_credential_delete_wait_then_time_ou
     fs::create_dir(&lock).unwrap(); // a daemon holds it, freshly
 
     match cc.delete_profile_credential(&f.env, &dir, &spelling) {
-        Err(ProviderError::Lock(LockError::Timeout(path))) => assert_eq!(path, lock),
+        Err(ProviderError::Lock(LockError::Timeout(t))) => assert_eq!(t.path, lock),
         other => panic!("{other:?}"),
     }
     assert_eq!(f.kc.get(&oauth, &acct).unwrap(), ENTRY, "nothing deleted");

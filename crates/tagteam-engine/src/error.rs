@@ -543,7 +543,9 @@ mod tests {
                 "config-unsplicable",
             ),
             (
-                EngineError::Provider(ProviderError::Lock(LockError::Timeout(PathBuf::from("x")))),
+                EngineError::Provider(ProviderError::Lock(LockError::Timeout(
+                    PathBuf::from("x").into(),
+                ))),
                 "lock-timeout",
             ),
             (
@@ -558,7 +560,7 @@ mod tests {
                 "provider",
             ),
             (
-                EngineError::Lock(LockError::Timeout(PathBuf::from("x"))),
+                EngineError::Lock(LockError::Timeout(PathBuf::from("x").into())),
                 "lock-timeout",
             ),
             (
@@ -811,7 +813,9 @@ mod tests {
                 "settings-unreadable",
             ),
             (
-                EngineError::Settings(SettingsError::Lock(LockError::Timeout(PathBuf::from("x")))),
+                EngineError::Settings(SettingsError::Lock(LockError::Timeout(
+                    PathBuf::from("x").into(),
+                ))),
                 "lock-timeout",
             ),
             (
@@ -904,7 +908,7 @@ mod tests {
     fn the_settings_lock_has_the_engine_lock_s_kinds() {
         let failures = || {
             vec![
-                LockError::Timeout(PathBuf::from("x")),
+                LockError::Timeout(PathBuf::from("x").into()),
                 LockError::Compromised(PathBuf::from("x")),
                 LockError::Io(io::Error::other("x")),
                 LockError::Interrupted {
@@ -934,7 +938,7 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            EngineError::Lock(LockError::Timeout(PathBuf::from("x"))).signal(),
+            EngineError::Lock(LockError::Timeout(PathBuf::from("x").into())).signal(),
             None
         );
         assert_eq!(

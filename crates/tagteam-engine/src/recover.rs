@@ -144,10 +144,10 @@ impl Engine {
         let accounts = self.lock_accounts(&ids)?;
         // The provider is busy, or a crash left its lock behind: a retry recovers the row.
         let locks = p.lock_live(&self.env, guard).map_err(|e| match e {
-            ProviderError::Lock(LockError::Timeout(lock)) => EngineError::RecoveryBlocked {
+            ProviderError::Lock(LockError::Timeout(t)) => EngineError::RecoveryBlocked {
                 provider: row.provider.to_string(),
                 app: p.display_name(),
-                lock,
+                lock: t.path,
             },
             e => e.into(),
         })?;
