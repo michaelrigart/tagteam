@@ -403,6 +403,27 @@ fn check_name(v: &str) -> Result<(), KeychainError> {
     Ok(())
 }
 
+/// A credential as the text of a `security -i` `-w "…"` word (H5.1): `None` unless it is UTF-8
+/// with no NUL, CR or LF; `\` is written `\\` and `"` written `\"`, nothing else is touched.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "upsert writes -w text from Task 7")
+)]
+pub(crate) fn escape_text(credential: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(credential).ok()?;
+    if text.contains(['\0', '\r', '\n']) {
+        return None;
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '\\' || c == '"' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    Some(out)
+}
+
 impl Keychain for SecurityCli {
     /// A secret read (`-w`), counted by how it ended (D3 change 6): answered once it gives a
     /// secret, locked on rc 36 or a timeout. An absent item (rc 44), which a locked keychain
@@ -1435,5 +1456,30 @@ mod tests {
         let _ = k.find("Claude Code-credentials", "me");
         let _ = k.find("Claude Code", "me");
         assert!(!counts.tally().since(before).looks_locked());
+    }
+
+    #[test]
+    fn escape_text_escapes_only_backslashes_and_quotes() {
+        assert_eq!(
+            escape_text(br#"{"a":"b\c"}"#).as_deref(),
+            Some(r#"{\"a\":\"b\\c\"}"#)
+        );
+        // A JSON escape sequence is two characters of text; its backslash is escaped like any other.
+        assert_eq!(
+            escape_text(br#""x\n\u00e9""#).as_deref(),
+            Some(r#"\"x\\n\\u00e9\""#)
+        );
+        let untouched = "é 日本 🔑 # $ % ' \t end";
+        assert_eq!(
+            escape_text(untouched.as_bytes()).as_deref(),
+            Some(untouched)
+        );
+    }
+
+    #[test]
+    fn escape_text_refuses_nul_cr_lf_and_bytes_that_are_not_utf8() {
+        for bytes in [&b"a\0b"[..], b"a\rb", b"a\nb", &[0xff, 0xfe], &[0xc3]] {
+            assert_eq!(escape_text(bytes), None, "{bytes:?}");
+        }
     }
 }
