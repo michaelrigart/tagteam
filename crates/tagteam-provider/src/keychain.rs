@@ -104,6 +104,8 @@ impl std::ops::Add for ReadTally {
 
 /// Generic-password items keyed by (service, account). Appendix A.3 semantics.
 pub trait Keychain: Send + Sync {
+    /// The secret. A read inside a scope whose token is set (`cancel::interruptible`) may
+    /// answer `Unreadable` with an interruption instead (H4, §14.1).
     fn find(&self, service: &str, account: &str) -> Read<Vec<u8>>;
     /// Attributes only: never prompts and never returns the secret.
     fn exists(&self, service: &str, account: &str) -> Read<()>;
@@ -174,7 +176,10 @@ impl<K: Keychain + ?Sized> Keychain for Arc<K> {
 }
 
 fn locked_read<T>() -> Read<T> {
-    Read::Unreadable(ReadError::new("keychain", "rc 36: the keychain is locked"))
+    Read::Unreadable(ReadError::locked(
+        "keychain",
+        "rc 36: the keychain is locked",
+    ))
 }
 
 pub(crate) fn locked_err() -> KeychainError {
@@ -279,10 +284,15 @@ impl FakeKeychain {
 }
 
 impl Keychain for FakeKeychain {
-    /// A locked fake refuses every secret read, counted as locked. An item marked unreadable
-    /// is an injected failure: refused the same way, and not counted. A secret returned is
-    /// counted as answered; an absent item is not counted.
+    /// Inside a scope whose token holds a signal, every secret read is interrupted, as the
+    /// `security` driver's is, and counted as neither (H4). A locked fake refuses every secret
+    /// read, counted as locked. An item marked unreadable is an injected failure: refused the
+    /// same way, and not counted. A secret returned is counted as answered; an absent item is
+    /// not counted.
     fn find(&self, s: &str, a: &str) -> Read<Vec<u8>> {
+        if let Some(signal) = crate::cancel::scoped().and_then(|c| c.requested()) {
+            return Read::Unreadable(ReadError::interrupted("keychain", signal));
+        }
         if self.locked.load(Ordering::SeqCst) {
             self.counts.record_locked();
             return locked_read();
@@ -815,6 +825,34 @@ mod tests {
             ReadTally::default(),
             "each instance counts its own"
         );
+    }
+
+    #[test]
+    fn a_fake_secret_read_honours_the_interruptible_scope_as_the_security_driver_does() {
+        let k = FakeKeychain::new();
+        k.put("svc", "acct", b"secret");
+        let token = crate::cancel::Cancel::new();
+        token.request(2);
+        assert!(
+            k.find("svc", "acct").is_present(),
+            "no scope, no interruption"
+        );
+        {
+            let _scope = crate::cancel::interruptible(&token);
+            assert!(
+                matches!(k.find("svc", "acct"), Read::Unreadable(e) if e.interruption() == Some(2))
+            );
+            k.upsert("svc", "acct", b"next").unwrap();
+        }
+        assert_eq!(
+            k.read_counts().unwrap().tally(),
+            ReadTally {
+                answered: 1,
+                locked: 0
+            }
+        );
+        k.set_locked(true);
+        assert!(matches!(k.find("svc", "acct"), Read::Unreadable(e) if e.is_locked()));
     }
 
     #[cfg(feature = "file-keychain")]

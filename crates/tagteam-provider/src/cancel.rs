@@ -1,5 +1,7 @@
 //! §14.1's cancel token: what a caught signal leaves for the next cancellation point.
 
+use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -75,6 +77,54 @@ impl Cancel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("interrupted by signal {0}")]
 pub struct Interrupted(pub i32);
+
+thread_local! {
+    /// The token of the innermost scope on this thread: `None` outside any scope, and inside an
+    /// `uninterruptible` one.
+    static SCOPE: RefCell<Option<Cancel>> = const { RefCell::new(None) };
+}
+
+/// H4, §14.1: a scope on this thread, alive until the guard is dropped. A Keychain read on this
+/// thread is a cancellation point only while an `interruptible` scope lives; a write never is,
+/// because it runs inside an `uninterruptible` one. Dropping the guard puts back the scope it
+/// replaced, so nested guards dropped in reverse order, as `let` bindings are, restore each one.
+/// It never leaves its thread.
+#[must_use]
+pub struct Interruptible {
+    replaced: Option<Cancel>,
+    _thread: PhantomData<*const ()>,
+}
+
+/// Opens a scope in which this thread's Keychain reads take `cancel` (the same shared token).
+pub fn interruptible(cancel: &Cancel) -> Interruptible {
+    enter(Some(cancel.clone()))
+}
+
+/// Opens a scope with no token: nothing inside it is a cancellation point, whatever scope
+/// encloses it. Keychain writes run in one.
+pub(crate) fn uninterruptible() -> Interruptible {
+    enter(None)
+}
+
+/// The token of the innermost scope on this thread, if it has one.
+pub fn scoped() -> Option<Cancel> {
+    SCOPE.with(|s| s.borrow().clone())
+}
+
+fn enter(token: Option<Cancel>) -> Interruptible {
+    Interruptible {
+        replaced: SCOPE.with(|s| s.replace(token)),
+        _thread: PhantomData,
+    }
+}
+
+impl Drop for Interruptible {
+    fn drop(&mut self) {
+        let replaced = self.replaced.take();
+        // Only a guard dropped while this thread's locals are torn down finds the slot gone.
+        let _ = SCOPE.try_with(|s| s.replace(replaced));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -165,5 +215,46 @@ mod tests {
     #[test]
     fn an_interruption_names_its_signal() {
         assert_eq!(Interrupted(15).to_string(), "interrupted by signal 15");
+    }
+
+    #[test]
+    fn a_scope_sets_this_thread_s_token_until_it_is_dropped() {
+        let token = Cancel::new();
+        assert!(scoped().is_none());
+        {
+            let _scope = interruptible(&token);
+            token.request(2);
+            assert_eq!(
+                scoped().and_then(|c| c.requested()),
+                Some(2),
+                "the token itself, shared"
+            );
+        }
+        assert!(scoped().is_none());
+    }
+
+    #[test]
+    fn nested_scopes_restore_the_one_they_replaced() {
+        let (outer, inner) = (Cancel::new(), Cancel::new());
+        outer.request(1);
+        inner.request(15);
+        let _a = interruptible(&outer);
+        {
+            let _b = interruptible(&inner);
+            assert_eq!(scoped().and_then(|c| c.requested()), Some(15));
+            {
+                let _w = uninterruptible();
+                assert!(scoped().is_none(), "a write sees no token");
+            }
+            assert_eq!(scoped().and_then(|c| c.requested()), Some(15));
+        }
+        assert_eq!(scoped().and_then(|c| c.requested()), Some(1));
+    }
+
+    #[test]
+    fn a_scope_belongs_to_the_thread_that_set_it() {
+        let token = Cancel::new();
+        let _scope = interruptible(&token);
+        assert!(std::thread::spawn(|| scoped().is_none()).join().unwrap());
     }
 }
