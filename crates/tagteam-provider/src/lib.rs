@@ -63,9 +63,9 @@ pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 #[cfg(feature = "mock-server")]
 pub use mock_server::{MockReply, MockRequest, MockServer};
 pub use process::{
-    Captured, Discarded, Liveness, ProcessSpawner, ProcessStamp, ScriptedSpawner, SpawnSpec,
-    SystemSpawner, current_uid, exec_command, exit_code, find_on_path, run_captured, run_discarded,
-    spawn_session,
+    Captured, Discarded, ExitWatch, Liveness, ProcessSpawner, ProcessStamp, ScriptedSpawner,
+    SpawnSpec, SystemSpawner, Watched, current_uid, exec_command, exit_code, find_on_path,
+    run_bounded, run_captured, run_discarded, spawn_session,
 };
 pub use profile::{
     LAUNCH_DIR, LINKS_FILE, LinksRecord, MARKER_FILE, PENDING_LAUNCH_DIR, PendingEntry,
