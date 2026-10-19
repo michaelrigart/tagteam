@@ -3,11 +3,12 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::cancel::Cancel;
+use crate::poison::lock_unpoisoned;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
@@ -317,7 +318,7 @@ impl MkdirLock {
         // can clean up after, not a panic.
         let heartbeat = thread::Builder::new()
             .spawn(move || {
-                let mut stop = st.stop.lock().unwrap();
+                let mut stop = lock_unpoisoned(&st.stop);
                 loop {
                     // The standard condvar predicate loop: `wait_timeout_while` checks `*stop`
                     // immediately, under the same lock `Drop` sets it under, before ever
@@ -326,14 +327,16 @@ impl MkdirLock {
                     // notify has nothing waiting to wake, and the plain `wait_timeout` used to
                     // block regardless for the full `every`, even though `*stop` was already
                     // true by the time it acquired the lock.
-                    let (guard, _) = st.wake.wait_timeout_while(stop, every, |s| !*s).unwrap();
+                    let (guard, _) = st.wake
+                        .wait_timeout_while(stop, every, |s| !*s)
+                        .unwrap_or_else(PoisonError::into_inner);
                     stop = guard;
                     if *stop {
                         return;
                     }
                     // Check and touch as one step under the mutex, so a concurrent check
                     // never compares a stale timestamp with the heartbeat's fresh one.
-                    let mut last = st.last_set.lock().unwrap();
+                    let mut last = lock_unpoisoned(&st.last_set);
                     #[cfg(test)]
                     let _ = seam::run(&path, seam::Point::BeatBeforeCheck);
                     if check_with(&path, &st, *last).is_ok() {
@@ -380,7 +383,7 @@ impl MkdirLock {
 }
 
 fn check(path: &Path, st: &State) -> Result<(), LockError> {
-    let last = st.last_set.lock().unwrap(); // held across the stat
+    let last = lock_unpoisoned(&st.last_set); // held across the stat
     check_with(path, st, *last)
 }
 
@@ -400,7 +403,7 @@ fn check_with(path: &Path, st: &State, last: SystemTime) -> Result<(), LockError
 
 impl Drop for MkdirLock {
     fn drop(&mut self) {
-        *self.state.stop.lock().unwrap() = true;
+        *lock_unpoisoned(&self.state.stop) = true;
         self.state.wake.notify_all();
         if let Some(h) = self.heartbeat.take() {
             let _ = h.join();
@@ -663,6 +666,28 @@ mod tests {
         assert_eq!(LockError::Timeout(p.clone()).signal(), None);
         assert_eq!(LockError::Compromised(p).signal(), None);
         assert_eq!(LockError::Io(io::Error::other("x")).signal(), None);
+    }
+
+    #[test]
+    fn a_poisoned_timestamp_lock_neither_stops_the_heartbeat_nor_fails_the_check() {
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 100, 20);
+        let l = MkdirLock::acquire(&s).unwrap();
+        let state = l.state.clone();
+        let _ = std::thread::spawn(move || {
+            let _held = state.last_set.lock().unwrap();
+            panic!("poisoned on purpose");
+        })
+        .join();
+        assert!(l.state.last_set.is_poisoned());
+        let before = mtime(&s.path);
+        assert!(
+            eventually(Duration::from_secs(5), || mtime(&s.path) > before),
+            "the heartbeat still beats"
+        );
+        assert!(l.check_owned().is_ok());
+        drop(l);
+        assert!(!s.path.exists(), "released as ever");
     }
 
     #[test]

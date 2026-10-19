@@ -11,7 +11,7 @@ use tagteam_provider::atomic::{
 };
 use tagteam_provider::{
     BeforeFallback, Cancel, Credential, DoomedEntry, Env, Keychain, LiveLockSet, ProviderError,
-    Read, ReadError, SecretStore, cancel,
+    Read, ReadError, SecretStore, cancel, poison::lock_unpoisoned,
 };
 
 use crate::config::{self, read_bytes};
@@ -391,7 +391,7 @@ impl LiveStore {
     /// each credential entry.
     pub(crate) fn end_operation(&self) {
         self.unpin_file_mode();
-        *self.seen.lock().unwrap() = Ledger::default();
+        *lock_unpoisoned(&self.seen) = Ledger::default();
     }
 
     /// CC's storage-write lock, for one entry's write (§9.1), waited for under `cancel`.
@@ -439,7 +439,7 @@ impl LiveStore {
         kind: ItemKind,
         places: &[(String, Option<Vec<u8>>)],
     ) -> Result<(), ProviderError> {
-        let mut seen = self.seen.lock().unwrap();
+        let mut seen = lock_unpoisoned(&self.seen);
         let seen = seen.entry(kind);
         match places
             .iter()
@@ -453,7 +453,7 @@ impl LiveStore {
     /// Records, before a write, that this operation writes `bytes` (`None`: deletes) at `place`
     /// of `kind`'s entry (§9.1): a later write or restore of the operation may find it there.
     fn intend(&self, kind: ItemKind, place: &str, bytes: Option<&[u8]>) {
-        let mut seen = self.seen.lock().unwrap();
+        let mut seen = lock_unpoisoned(&self.seen);
         let entry = seen.entry(kind);
         if let Some(places) = &mut entry.places {
             places
@@ -496,7 +496,7 @@ impl LiveStore {
     /// place held just before is kept for a restore; when that is unknown, a restore must leave
     /// the place.
     fn settled(&self, kind: ItemKind, place: &str, after: Held) {
-        let mut seen = self.seen.lock().unwrap();
+        let mut seen = lock_unpoisoned(&self.seen);
         let entry = seen.entry(kind);
         let before = entry
             .held
@@ -516,7 +516,7 @@ impl LiveStore {
     /// write whose outcome was unknown and that never landed left its place as it was. Returns
     /// every place a restore must leave.
     fn observe(&self, kind: ItemKind, places: &[(String, Option<Vec<u8>>)]) -> Vec<String> {
-        let mut seen = self.seen.lock().unwrap();
+        let mut seen = lock_unpoisoned(&self.seen);
         let seen = seen.entry(kind);
         for (place, value) in places {
             let now = Held::Known(value.clone());
@@ -816,7 +816,7 @@ impl LiveStore {
     /// absent (§9.1): `snapshot` found nothing, and nothing was written since. `false` when the
     /// operation never read the entry.
     fn read_absent(&self, kind: ItemKind) -> bool {
-        let mut seen = self.seen.lock().unwrap();
+        let mut seen = lock_unpoisoned(&self.seen);
         seen.entry(kind)
             .places
             .as_ref()
@@ -1081,7 +1081,7 @@ impl LiveStore {
         };
         let mut oauth = places(&snap.oauth_items);
         oauth.insert(file_place(paths), vec![snap.credentials_file.clone()]);
-        let mut seen = self.seen.lock().unwrap();
+        let mut seen = lock_unpoisoned(&self.seen);
         seen.oauth.places = Some(oauth);
         seen.managed.places = Some(places(&snap.managed_items));
         drop(seen);
@@ -1185,7 +1185,7 @@ impl LiveStore {
             let at = start;
             start += items.len();
             // What each place this operation changed held just before its first change there.
-            let first = self.seen.lock().unwrap().entry(kind).first.clone();
+            let first = lock_unpoisoned(&self.seen).entry(kind).first.clone();
             if first.is_empty() {
                 continue;
             }
@@ -1273,5 +1273,33 @@ impl LiveStore {
         } else {
             Err(ProviderError::Incomplete { failed })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tagteam_provider::FakeKeychain;
+
+    #[test]
+    fn a_poisoned_ledger_still_ends_the_operation() {
+        let store = LiveStore::new(Arc::new(FakeKeychain::new()), Platform::MacOs);
+        let _ = std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut held = store.seen.lock().unwrap();
+                held.oauth.places = Some(BTreeMap::new());
+                held.oauth.leave.insert("place".to_string());
+                held.managed.held.insert("place".to_string(), Held::Unknown);
+                panic!("poisoned on purpose");
+            })
+            .join()
+        });
+        assert!(store.seen.is_poisoned());
+        store.end_operation();
+        store.end_operation();
+        let seen = lock_unpoisoned(&store.seen);
+        assert!(seen.oauth.places.is_none());
+        assert!(seen.oauth.leave.is_empty());
+        assert!(seen.managed.held.is_empty());
     }
 }
