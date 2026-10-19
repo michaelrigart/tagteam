@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! D5: the daemon's socket. Start-up binds it once `daemon.lock` is held (D4.1 step 5). It
 //! serves protocol 1 to at most sixteen connections of this user: the greeting, `status` from
 //! the board, and every event to the subscribers (D5.2–D5.5). One thread accepts, and each
@@ -404,7 +405,7 @@ impl Drop for Slot {
     }
 }
 
-fn own_uid() -> u32 {
+pub(crate) fn own_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() }
 }

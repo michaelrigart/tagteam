@@ -1,6 +1,7 @@
 //! The terminal, descriptor and job-control calls that the development harness (`xtask`) and
-//! the TUI (`tagteam-tui`) need, as safe functions: the workspace allows `unsafe` only here and
-//! in `tagteam`, so both forbid it and call these.
+//! the TUI (`tagteam-tui`) need, as safe functions. Both crates forbid `unsafe` and call these.
+//! Only `tagteam-provider`, the `tagteam` binary and the daemon's `server.rs` may use `unsafe`;
+//! every other crate forbids it, and the daemon denies it everywhere else.
 
 use std::io;
 use std::os::fd::RawFd;

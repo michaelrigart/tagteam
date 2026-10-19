@@ -2,6 +2,8 @@
 //! both run on, the daemon's jobs, and the socket protocol (D3). Like the engine, it names no
 //! provider's paths, keys or endpoints, and reaches providers through the engine only.
 
+#![deny(unsafe_code)]
+
 pub mod auto;
 pub mod backoff;
 pub mod client;

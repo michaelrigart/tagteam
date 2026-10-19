@@ -14,7 +14,7 @@ use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_provider::Env;
 
 use crate::protocol::{Event, Hello, MAX_LINE, PROTOCOL, Status, parse_event};
-use crate::server::{MAX_SOCKET_PATH, peer_uid};
+use crate::server::{MAX_SOCKET_PATH, own_uid, peer_uid};
 
 /// D5.7: how long `connect` waits for the greeting.
 pub const GREETING_TIMEOUT: Duration = Duration::from_millis(250);
@@ -69,8 +69,7 @@ pub fn connect_at(path: &Path) -> Result<Connect, ClientError> {
         Err(e) if no_daemon(&e) => return Ok(Connect::NoDaemon),
         Err(e) => return Err(e.into()),
     };
-    // SAFETY: geteuid(2) only reads the process's effective user id; it cannot fail.
-    let own = unsafe { libc::geteuid() };
+    let own = own_uid();
     match peer_uid(&stream) {
         Ok(uid) if serves_us(uid, own) => {}
         Ok(uid) => {
@@ -372,6 +371,6 @@ mod tests {
     fn the_uid_of_a_peer_in_this_process_is_ours() {
         // A uid mismatch cannot be made without root; this pins the plumbing instead.
         let (a, _b) = UnixStream::pair().unwrap();
-        assert!(serves_us(peer_uid(&a).unwrap(), unsafe { libc::geteuid() }));
+        assert!(serves_us(peer_uid(&a).unwrap(), own_uid()));
     }
 }
