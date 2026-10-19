@@ -14,6 +14,14 @@ pub const CONFIG_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(12);
 /// CC's storage-write lock goes stale after 15 s (§9.1, Appendix A.1).
 pub const STORAGE_WRITE_STALE: Duration = Duration::from_secs(15);
 
+const REFRESH_ROLE: &str = "Claude Code's refresh lock";
+const CREDENTIAL_ROLE: &str = "Claude Code's credential lock";
+const CONFIG_ROLE: &str = "Claude Code's config lock";
+const STORAGE_WRITE_ROLE: &str = "Claude Code's storage-write lock";
+/// The config lock may be one CC left behind after a short command, which frees itself once
+/// stale (10 s, plus up to 1 s that its mtime can lie in the future, §9.1).
+const CONFIG_HINT: &str = "Claude Code may have left it behind after a short command, and it frees itself within about 11 s, so retry";
+
 /// CC's credential locks (§9.1): the refresh lock, then the legacy lock. Fields drop in
 /// declaration order, so the legacy lock is released first and the refresh lock last.
 pub struct CcCredSet {
@@ -53,15 +61,17 @@ pub fn acquire_credentials(
     loop {
         let refresh = MkdirLock::acquire(
             &MkdirLockSpec::new(paths.refresh_lock.clone(), CRED_STALE, remaining())
+                .with_role(REFRESH_ROLE)
                 .with_cancel(cancel),
         )?;
-        let legacy_spec = MkdirLockSpec::new(paths.legacy_lock(), CRED_STALE, Duration::ZERO);
+        let legacy_spec = MkdirLockSpec::new(paths.legacy_lock(), CRED_STALE, Duration::ZERO)
+            .with_role(CREDENTIAL_ROLE);
         match MkdirLock::try_acquire(&legacy_spec)? {
             Some(legacy) => return Ok(CcCredSet { legacy, refresh }),
             None => {
                 drop(refresh);
                 if Instant::now() >= deadline {
-                    return Err(LockError::Timeout(legacy_spec.path));
+                    return Err(LockError::Timeout(legacy_spec.path.into()));
                 }
                 thread::sleep(Duration::from_millis(fastrand::u64(250..=500)).min(remaining()));
                 if let Some(signal) = cancel.requested() {
@@ -95,7 +105,10 @@ fn acquire_config_stale(
 ) -> Result<CcConfigSet, LockError> {
     Ok(CcConfigSet {
         config: MkdirLock::acquire(
-            &MkdirLockSpec::new(paths.config_lock.clone(), stale, timeout).with_cancel(cancel),
+            &MkdirLockSpec::new(paths.config_lock.clone(), stale, timeout)
+                .with_role(CONFIG_ROLE)
+                .with_timeout_hint(CONFIG_HINT)
+                .with_cancel(cancel),
         )?,
     })
 }
@@ -118,7 +131,10 @@ fn wait_config_idle_stale(
     cancel: &Cancel,
 ) -> Result<(), LockError> {
     MkdirLock::wait_idle(
-        &MkdirLockSpec::new(paths.config_lock.clone(), stale, timeout).with_cancel(cancel),
+        &MkdirLockSpec::new(paths.config_lock.clone(), stale, timeout)
+            .with_role(CONFIG_ROLE)
+            .with_timeout_hint(CONFIG_HINT)
+            .with_cancel(cancel),
     )
 }
 
@@ -156,6 +172,7 @@ pub fn acquire_storage_write(
             STORAGE_WRITE_STALE,
             timeout,
         )
+        .with_role(STORAGE_WRITE_ROLE)
         .with_cancel(cancel),
     )?;
     let v2 = MkdirLock::acquire(
@@ -164,6 +181,7 @@ pub fn acquire_storage_write(
             STORAGE_WRITE_STALE,
             deadline.saturating_duration_since(Instant::now()),
         )
+        .with_role(STORAGE_WRITE_ROLE)
         .with_cancel(cancel),
     )?;
     Ok(CcStorageWrite { v2, v1 })
@@ -179,6 +197,66 @@ mod tests {
         let env = Env::for_test(root);
         fs::create_dir_all(env.home.join(".claude")).unwrap();
         CcPaths::resolve(&env)
+    }
+
+    #[test]
+    fn each_lock_names_its_role_and_only_the_config_lock_says_it_frees_itself() {
+        let timed_out = |r: Result<(), LockError>| match r {
+            Err(LockError::Timeout(t)) => t.to_string(),
+            other => panic!("expected a timeout, got {other:?}"),
+        };
+        for legacy in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let p0 = paths(d.path());
+            if legacy {
+                fs::write(p0.config_home.join(".config.json"), "{}").unwrap();
+            }
+            let p = CcPaths::resolve(&Env::for_test(d.path()));
+            let cancel = Cancel::new();
+            let creds = acquire_credentials(&p, ACQUIRE_TIMEOUT, &cancel).unwrap();
+            assert_eq!(
+                (creds.refresh.role(), creds.legacy.role()),
+                (
+                    "Claude Code's refresh lock",
+                    "Claude Code's credential lock"
+                )
+            );
+            assert_eq!(
+                timed_out(acquire_credentials(&p, Duration::ZERO, &cancel).map(drop)),
+                format!(
+                    "timed out waiting for the lock {}",
+                    p.refresh_lock.display()
+                )
+            );
+            drop(creds);
+            let config = acquire_config(&p, ACQUIRE_TIMEOUT, &cancel).unwrap();
+            assert_eq!(
+                config.config.role(),
+                "Claude Code's config lock",
+                "legacy {legacy}"
+            );
+            let frees = format!(
+                "timed out waiting for the lock {}; Claude Code may have left it behind after a short command, and it frees itself within about 11 s, so retry",
+                p.config_lock.display()
+            );
+            assert_eq!(
+                timed_out(acquire_config(&p, Duration::ZERO, &cancel).map(drop)),
+                frees
+            );
+            assert_eq!(
+                timed_out(wait_config_idle(&p, Duration::ZERO, &cancel)),
+                frees
+            );
+            drop(config);
+            let sw = acquire_storage_write(&p, ACQUIRE_TIMEOUT, &cancel).unwrap();
+            assert_eq!(
+                (sw.v1.role(), sw.v2.role()),
+                (
+                    "Claude Code's storage-write lock",
+                    "Claude Code's storage-write lock"
+                )
+            );
+        }
     }
 
     #[test]
@@ -531,7 +609,7 @@ mod tests {
                 }
             });
             match acquire_storage_write(&p, Duration::from_millis(500), &Cancel::new()) {
-                Err(LockError::Timeout(path)) => assert_eq!(path, p.storage_write_lock_v2),
+                Err(LockError::Timeout(t)) => assert_eq!(t.path, p.storage_write_lock_v2),
                 other => panic!("expected a timeout on the second, got {:?}", other.err()),
             }
         });
@@ -559,7 +637,7 @@ mod tests {
             fs::create_dir(cc).unwrap(); // CC holds it, freshly
             let start = Instant::now();
             match acquire_storage_write(&p, Duration::from_millis(500), &Cancel::new()) {
-                Err(LockError::Timeout(path)) => assert_eq!(&path, cc),
+                Err(LockError::Timeout(t)) => assert_eq!(&t.path, cc),
                 res => panic!("expected a timeout, got {:?}", res.err()),
             }
             assert!(start.elapsed() >= Duration::from_millis(500));

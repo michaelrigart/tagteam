@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{self, File};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
@@ -12,8 +13,8 @@ use crate::poison::lock_unpoisoned;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
-    #[error("{}", timeout_text(.0))]
-    Timeout(PathBuf),
+    #[error("{0}")]
+    Timeout(TimedOut),
     #[error("the lock {0} was taken over while held")]
     Compromised(PathBuf),
     #[error("lock I/O failed: {0}")]
@@ -23,21 +24,26 @@ pub enum LockError {
     Interrupted { path: PathBuf, signal: i32 },
 }
 
-/// A timeout's message. CC's config lock (`<global config>.lock`) may be one CC left behind
-/// after a short command, which frees itself once stale (10 s, plus up to 1 s that its mtime
-/// can lie in the future, §9.1), so its message says so.
-fn timeout_text(path: &Path) -> String {
-    let base = format!("timed out waiting for the lock {}", path.display());
-    let config = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(".json.lock"));
-    if config {
-        format!(
-            "{base}; Claude Code may have left it behind after a short command, and it frees itself within about 11 s, so retry"
-        )
-    } else {
-        base
+/// A lock wait that ran out: the lock's path, and the hint its spec carries, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedOut {
+    pub path: PathBuf,
+    pub hint: Option<&'static str>,
+}
+
+impl fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "timed out waiting for the lock {}", self.path.display())?;
+        match self.hint {
+            Some(hint) => write!(f, "; {hint}"),
+            None => Ok(()),
+        }
+    }
+}
+
+impl From<PathBuf> for TimedOut {
+    fn from(path: PathBuf) -> Self {
+        Self { path, hint: None }
     }
 }
 
@@ -69,6 +75,11 @@ pub struct MkdirLockSpec {
     pub stale: Duration,
     pub acquire_timeout: Duration,
     pub touch_every: Duration,
+    /// What a log line calls this lock instead of its path, which may sit under a home its
+    /// user named after themselves (§14.2).
+    pub role: &'static str,
+    /// Appended to this lock's timeout message, when a wait on it is worth explaining.
+    pub timeout_hint: Option<&'static str>,
     /// Checked before every attempt `MkdirLock::acquire` makes (§14.1). `new` gives a token
     /// nothing sets; `with_cancel` shares the caller's.
     pub cancel: Cancel,
@@ -81,7 +92,22 @@ impl MkdirLockSpec {
             stale,
             acquire_timeout,
             touch_every: Duration::from_secs(3),
+            role: "a lock directory",
+            timeout_hint: None,
             cancel: Cancel::new(),
+        }
+    }
+
+    /// The same lock, named `role` in log lines.
+    pub fn with_role(self, role: &'static str) -> Self {
+        Self { role, ..self }
+    }
+
+    /// The same lock, whose timeout message ends with `hint`.
+    pub fn with_timeout_hint(self, hint: &'static str) -> Self {
+        Self {
+            timeout_hint: Some(hint),
+            ..self
         }
     }
 
@@ -105,7 +131,7 @@ fn touch(dir: &File, t: SystemTime) -> io::Result<SystemTime> {
 /// trusted to be the one `mkdir` made: four fifths of the staleness. Within it the directory
 /// cannot have looked stale to anyone, so nobody could have taken it over. The fifth held back
 /// covers a taker whose filesystem keeps mtimes to the second, which can make the directory
-/// look up to 1 s older: 2 s for CC's 10 s config lock, 12 s for its 60 s credential locks.
+/// look up to 1 s older: 2 s for a 10 s lock, 12 s for a 60 s one.
 fn trusted_span(stale: Duration) -> Duration {
     stale - stale / 5
 }
@@ -115,37 +141,23 @@ fn trusted_span(stale: Duration) -> Duration {
 /// fails after the directory was established as its own; the caller still holds the fd, so the
 /// inode cannot have been reused. A directory that cannot be removed holds the lock until it
 /// goes stale: logged at WARN with its cause (§14), as the caller reports its own failure.
-fn remove_if_ours(path: &Path, id: DirId, set: Option<SystemTime>) {
+fn remove_if_ours(path: &Path, role: &str, id: DirId, set: Option<SystemTime>) {
     let ours = fs::symlink_metadata(path)
         .is_ok_and(|m| DirId::of(&m) == id && set.is_none_or(|t| m.modified().ok() == Some(t)));
     if ours {
-        warn_if_left(path, fs::remove_dir(path));
+        warn_if_left(role, fs::remove_dir(path));
     }
 }
 
 /// §14: a lock directory this holder made and could not remove is a contained error, logged
-/// at WARN with its cause; Claude Code waits on it until it goes stale (§9.1). One already
+/// at WARN with its cause; other holders wait on it until it goes stale (§9.1). One already
 /// gone was not left.
-fn warn_if_left(path: &Path, removed: io::Result<()>) {
+fn warn_if_left(role: &str, removed: io::Result<()>) {
     match removed {
         Err(e) if e.kind() != io::ErrorKind::NotFound => tracing::warn!(
-            "could not remove {}, which this process made, so it holds the lock until it goes stale: {e}",
-            lock_role(path)
+            "could not remove {role}, which this process made, so it holds the lock until it goes stale: {e}"
         ),
         _ => {}
-    }
-}
-
-/// Which lock a directory is, by the name Claude Code gives each of its locks (§9.1): what a
-/// log line names instead of the path. The path is under a Claude Code home, which the user may
-/// have named after themselves (`CLAUDE_CONFIG_DIR`), and §14.2 keeps such names out of the log.
-fn lock_role(path: &Path) -> &'static str {
-    match path.file_name().and_then(|n| n.to_str()) {
-        Some(".oauth_refresh.lock") => "Claude Code's refresh lock",
-        Some(".storage-write" | ".storage-write.lock") => "Claude Code's storage-write lock",
-        Some(".claude.json.lock" | ".config.json.lock") => "Claude Code's config lock",
-        Some(name) if name.ends_with(".lock") => "Claude Code's credential lock",
-        _ => "a lock directory",
     }
 }
 
@@ -172,6 +184,7 @@ struct State {
     dir: File,
     /// `dir`'s device and inode, read once when the lock was taken.
     id: DirId,
+    role: &'static str,
     last_set: Mutex<SystemTime>,
     compromised: AtomicBool,
     stop: Mutex<bool>,
@@ -245,7 +258,10 @@ impl MkdirLock {
                 return Ok(lock);
             }
             if Instant::now() >= deadline {
-                return Err(LockError::Timeout(spec.path.clone()));
+                return Err(LockError::Timeout(TimedOut {
+                    path: spec.path.clone(),
+                    hint: spec.timeout_hint,
+                }));
             }
             thread::sleep(Duration::from_millis(fastrand::u64(250..=500)));
         }
@@ -270,7 +286,10 @@ impl MkdirLock {
                 Err(e) => return Err(e.into()),
             }
             if Instant::now() >= deadline {
-                return Err(LockError::Timeout(spec.path.clone()));
+                return Err(LockError::Timeout(TimedOut {
+                    path: spec.path.clone(),
+                    hint: spec.timeout_hint,
+                }));
             }
             thread::sleep(Duration::from_millis(fastrand::u64(250..=500)));
         }
@@ -297,18 +316,19 @@ impl MkdirLock {
         }
         // Ours from here. A failure removes the directory rather than block CC for the whole
         // staleness window, but only while the path still names it (`remove_if_ours`).
-        let set =
-            touch(&dir, SystemTime::now()).inspect_err(|_| remove_if_ours(&spec.path, id, None))?;
+        let set = touch(&dir, SystemTime::now())
+            .inspect_err(|_| remove_if_ours(&spec.path, spec.role, id, None))?;
         let state = Arc::new(State {
             dir,
             id,
+            role: spec.role,
             last_set: Mutex::new(set),
             compromised: AtomicBool::new(false),
             stop: Mutex::new(false),
             wake: Condvar::new(),
         });
         let abandon = |e: io::Error| {
-            remove_if_ours(&spec.path, id, Some(set));
+            remove_if_ours(&spec.path, spec.role, id, Some(set));
             LockError::from(e)
         };
         #[cfg(test)]
@@ -350,7 +370,7 @@ impl MkdirLock {
                                 // §14: the holder's next check reports the loss, not its cause.
                                 tracing::warn!(
                                     "could not touch {}, which this process holds, so the lock counts as lost: {e}",
-                                    lock_role(&path)
+                                    st.role
                                 );
                                 st.compromised.store(true, Ordering::SeqCst);
                             }
@@ -368,6 +388,10 @@ impl MkdirLock {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn role(&self) -> &'static str {
+        self.state.role
     }
 
     pub fn is_compromised(&self) -> bool {
@@ -411,7 +435,7 @@ impl Drop for MkdirLock {
         // The check and the `rmdir` are two steps: a takeover between them needs this holder
         // to stall for the whole staleness window inside that gap, as with `proper-lockfile`.
         if self.check_owned().is_ok() {
-            warn_if_left(&self.path, fs::remove_dir(&self.path));
+            warn_if_left(self.state.role, fs::remove_dir(&self.path));
         }
     }
 }
@@ -573,6 +597,8 @@ mod tests {
             stale: Duration::from_millis(stale_ms),
             acquire_timeout: Duration::from_millis(timeout_ms),
             touch_every: Duration::from_millis(touch_ms),
+            role: "the test lock",
+            timeout_hint: None,
             cancel: Cancel::new(),
         }
     }
@@ -663,7 +689,7 @@ mod tests {
             e.to_string(),
             "interrupted while waiting for the lock /x.lock"
         );
-        assert_eq!(LockError::Timeout(p.clone()).signal(), None);
+        assert_eq!(LockError::Timeout(p.clone().into()).signal(), None);
         assert_eq!(LockError::Compromised(p).signal(), None);
         assert_eq!(LockError::Io(io::Error::other("x")).signal(), None);
     }
@@ -761,7 +787,7 @@ mod tests {
         fs::create_dir(&s.path).unwrap();
         assert!(matches!(
             MkdirLock::wait_idle(&s),
-            Err(LockError::Timeout(p)) if p == s.path
+            Err(LockError::Timeout(t)) if t.path == s.path
         ));
     }
 
@@ -775,30 +801,33 @@ mod tests {
     }
 
     #[test]
-    fn both_spellings_of_the_global_config_s_lock_are_the_config_lock() {
-        for name in [".claude.json.lock", ".config.json.lock"] {
-            assert_eq!(
-                lock_role(&PathBuf::from("/h").join(name)),
-                "Claude Code's config lock"
-            );
+    fn a_timeout_carries_its_lock_s_hint_and_only_that() {
+        let hinted = TimedOut {
+            path: PathBuf::from("/h/x.lock"),
+            hint: Some("it frees itself"),
+        };
+        assert_eq!(
+            LockError::Timeout(hinted).to_string(),
+            "timed out waiting for the lock /h/x.lock; it frees itself"
+        );
+        assert_eq!(
+            LockError::Timeout(PathBuf::from("/h/y.lock").into()).to_string(),
+            "timed out waiting for the lock /h/y.lock"
+        );
+        let d = tempfile::tempdir().unwrap();
+        let s = spec(d.path(), 60_000, 0, 3_000).with_timeout_hint("it frees itself");
+        let _held = MkdirLock::acquire(&s).unwrap();
+        match MkdirLock::acquire(&s) {
+            Err(LockError::Timeout(t)) => assert_eq!(
+                t,
+                TimedOut {
+                    path: s.path.clone(),
+                    hint: Some("it frees itself")
+                }
+            ),
+            Err(e) => panic!("expected a timeout, got {e:?}"),
+            Ok(_) => panic!("acquired a lock another holder has"),
         }
-        assert_eq!(
-            lock_role(Path::new("/h/.claude.lock")),
-            "Claude Code's credential lock"
-        );
-    }
-
-    #[test]
-    fn a_config_lock_timeout_says_it_frees_itself_and_other_locks_do_not() {
-        let config = LockError::Timeout(PathBuf::from("/h/.claude.json.lock")).to_string();
-        assert_eq!(
-            config,
-            "timed out waiting for the lock /h/.claude.json.lock; Claude Code may have left it behind after a short command, and it frees itself within about 11 s, so retry"
-        );
-        assert_eq!(
-            LockError::Timeout(PathBuf::from("/h/.oauth_refresh.lock")).to_string(),
-            "timed out waiting for the lock /h/.oauth_refresh.lock"
-        );
     }
 
     #[test]
@@ -1106,7 +1135,7 @@ mod tests {
     #[test]
     fn a_released_lock_directory_that_cannot_be_removed_is_logged_with_its_cause() {
         // §14: a contained error is logged, never discarded. The directory holds the lock until
-        // it goes stale, so Claude Code waits on it; the line says why.
+        // it goes stale, so others wait on it; the line says why.
         let d = tempfile::tempdir().unwrap();
         let s = spec(d.path(), 60_000, 100, 3_000);
         let lock = MkdirLock::acquire(&s).unwrap();
@@ -1116,26 +1145,13 @@ mod tests {
         let warnings: Vec<&String> = logs.iter().filter(|l| l.contains("WARN")).collect();
         assert_eq!(warnings.len(), 1, "{logs:?}");
         assert!(
-            warnings[0].contains("could not remove Claude Code's credential lock")
+            warnings[0].contains("could not remove the test lock")
                 && warnings[0].contains("ermission denied"),
             "{}",
             warnings[0]
         );
         // The role, never the path: a Claude Code home may carry its user's name (§14.2).
         assert!(!warnings[0].contains(&d.path().display().to_string()));
-        assert_eq!(
-            lock_role(Path::new("/h/.oauth_refresh.lock")),
-            "Claude Code's refresh lock"
-        );
-        assert_eq!(
-            lock_role(Path::new("/h/.storage-write")),
-            "Claude Code's storage-write lock"
-        );
-        assert_eq!(
-            lock_role(Path::new("/h/.storage-write.lock")),
-            "Claude Code's storage-write lock",
-            "CC 2.1.292's spelling is no generic credential lock"
-        );
     }
 
     #[test]
@@ -1153,7 +1169,7 @@ mod tests {
         let warnings: Vec<&String> = logs.iter().filter(|l| l.contains("WARN")).collect();
         assert_eq!(warnings.len(), 1, "{logs:?}");
         assert!(
-            warnings[0].contains("could not remove Claude Code's credential lock")
+            warnings[0].contains("could not remove the test lock")
                 && !warnings[0].contains(&d.path().display().to_string()),
             "{}",
             warnings[0]

@@ -371,10 +371,10 @@ pub enum ProviderError {
     ConfigUnsplicable { path: PathBuf, remedy: &'static str },
     /// A Keychain item `remove_item` could not verify gone: after a file fallback, after a
     /// managed-key fallback, when a managed key is removed, or when a profile's credential is
-    /// deleted. Claude Code may still read it (L397); the wording holds for a removal as much
-    /// as for a write.
-    #[error("the Keychain item {0} could not be verified gone, so Claude Code may still read it")]
-    ShadowingItem(String),
+    /// deleted. The agent may still read it; the wording holds for a removal as much as for a
+    /// write.
+    #[error("the Keychain item {item} could not be verified gone, so {agent} may still read it")]
+    ShadowingItem { item: String, agent: &'static str },
     /// A write failed part-way and restoring the previous state failed too: the live state is
     /// partial, and only journal recovery may settle it.
     #[error("{cause}; restoring the previous state also failed: {restore}")]
@@ -875,6 +875,18 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shadowing_item_names_the_agent_that_may_still_read_it() {
+        let e = ProviderError::ShadowingItem {
+            item: "Svc-credentials".into(),
+            agent: "Agent",
+        };
+        assert_eq!(
+            e.to_string(),
+            "the Keychain item Svc-credentials could not be verified gone, so Agent may still read it"
+        );
+    }
 
     #[test]
     fn defaults_have_no_transcripts() {

@@ -116,7 +116,7 @@ impl FlockGuard {
                 return Ok(g);
             }
             if Instant::now() >= deadline {
-                return Err(LockError::Timeout(path.to_path_buf()));
+                return Err(LockError::Timeout(path.to_path_buf().into()));
             }
             thread::sleep(Duration::from_millis(100));
         }

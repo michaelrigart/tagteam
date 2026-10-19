@@ -68,6 +68,7 @@ pub use liveness::{
     parse_session_record, read_session_records, read_session_records_dated, read_supervisor_lock,
     record_is_live,
 };
+pub use mkdir_lock::TimedOut;
 pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 #[cfg(feature = "mock-server")]
 pub use mock_server::{MockReply, MockRequest, MockServer};
