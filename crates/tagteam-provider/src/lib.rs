@@ -13,6 +13,7 @@ pub mod mkdir_lock;
 pub mod mock_server;
 pub mod passwd;
 pub mod platform;
+pub mod poison;
 pub mod process;
 pub mod profile;
 pub mod provider;
