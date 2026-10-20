@@ -285,12 +285,14 @@ impl Run<'_> {
         }
         if let Some(e) = stale_unread {
             found.push(
-                warn_restore(self.engine,
+                warn_restore(
+                    self.engine,
                     Id::ACCOUNTS_LIVE_STALE,
                     format!(
                         "whether {} still runs a login an explicit command replaced cannot be told: the active account cannot be read ({e})",
                         p.display_name()
-                    )),
+                    ),
+                ),
             );
         }
         for check in found {
@@ -392,12 +394,14 @@ impl Run<'_> {
                     ),
                     Ok(_) => {}
                     Err(e) => found.push(
-                        warn_restore(self.engine,
+                        warn_restore(
+                            self.engine,
                             Id::USAGE_BUDGET,
                             format!(
                                 "account {}'s usage requests of the past hour cannot be counted: {e}",
                                 row.position
-                            )),
+                            ),
+                        ),
                     ),
                 }
             }
@@ -503,9 +507,11 @@ impl Run<'_> {
                 ),
                 Ok(_) => None,
                 Err(e) => Some(
-                    warn_restore(self.engine,
+                    warn_restore(
+                        self.engine,
                         Id::AUTO_UNHEALTHY,
-                        format!("the auto-switch state cannot be read: {e}")),
+                        format!("the auto-switch state cannot be read: {e}"),
+                    ),
                 ),
             };
             if let Some(check) = unhealthy {
