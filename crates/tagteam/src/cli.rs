@@ -2,13 +2,16 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::builder::{PossibleValue, StringValueParser, TypedValueParser};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::aot::{Shell, generate};
-use tagteam_core::CLAUDE_CODE;
 use tagteam_engine::settings::KEYS;
 use tagteam_engine::tokens::TokenPeriod;
+use tagteam_provider::Platform;
+
+use crate::statusline::NoKeychain;
 
 /// No `Debug`: `add-token` carries a secret, and a derived `Debug` would print it.
 #[derive(Parser)]
@@ -592,8 +595,15 @@ pub enum DaemonAction {
     Status,
 }
 
-/// The providers this build registers, as completion offers them (§13.7).
-pub(crate) const COMPLETED_PROVIDERS: &[&str] = &[CLAUDE_CODE];
+/// The providers this build registers, as completion offers them (§13.7): the ids of
+/// `app::registry`, over a Keychain that is never asked.
+pub(crate) fn completed_providers() -> Vec<String> {
+    crate::app::registry(Arc::new(NoKeychain::default()), Platform::current(), None)
+        .all()
+        .iter()
+        .map(|p| p.id().to_string())
+        .collect()
+}
 
 /// A `config` command's KEY. Any UTF-8 string parses, so a key the registry does not know reaches
 /// the engine's `invalid-input` (§6.4) rather than a usage error, while completion offers every
@@ -615,7 +625,7 @@ impl TypedValueParser for ConfigKeyParser {
 
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
         let bare = KEYS.iter().map(|k| k.name.to_owned());
-        let prefixed = COMPLETED_PROVIDERS.iter().flat_map(|provider| {
+        let prefixed = completed_providers().into_iter().flat_map(|provider| {
             KEYS.iter()
                 .filter(|k| k.per_provider)
                 .map(move |k| format!("provider.{provider}.{}", k.name))
@@ -643,7 +653,7 @@ impl TypedValueParser for ProviderParser {
 
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
         Some(Box::new(
-            COMPLETED_PROVIDERS.iter().map(|p| PossibleValue::new(*p)),
+            completed_providers().into_iter().map(PossibleValue::new),
         ))
     }
 }

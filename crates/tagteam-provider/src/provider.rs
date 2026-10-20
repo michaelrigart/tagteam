@@ -819,6 +819,10 @@ pub trait Provider: Send + Sync {
     ) -> Result<(), ProviderError>;
     /// §13.5: whether `env` is a process this agent started (CC: `CLAUDECODE` or `CLAUDE_CONFIG_DIR`).
     fn invoked_by(&self, env: &Env) -> bool;
+    /// Where and what to write so the agent shows tagteam's statusline; `None` if unsupported.
+    fn statusline_setup(&self, _env: &Env, _command: &str) -> Option<(PathBuf, String)> {
+        None
+    }
     // Seed and merge-back find the profile's files by `dir`, its actual directory, never by its
     // recorded spelling, which names the old path once the data directory has moved (Decision 22).
     /// §12.4: seeds the profile's config in `dir` from the outer home (`env`), for `identity`;

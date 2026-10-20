@@ -757,6 +757,17 @@ impl Provider for ClaudeCode {
         env.var("CLAUDECODE").is_some_and(|v| v == "1") || self.session_dir(env).is_some()
     }
 
+    fn statusline_setup(&self, env: &Env, command: &str) -> Option<(PathBuf, String)> {
+        let snippet = serde_json::json!({"statusLine": {"type": "command", "command": command}});
+        Some((
+            CcPaths::resolve(env).config_home.join("settings.json"),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&snippet).expect("a JSON value always serializes")
+            ),
+        ))
+    }
+
     fn seed_profile(
         &self,
         env: &Env,
