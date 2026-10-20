@@ -1,7 +1,8 @@
 //! The Tokens screen drawn (spec §5.3): its header, the report's table at the terminal's width,
 //! the total line, the selected row's detail, and the footnotes. It reads nothing but the state.
 
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
+use std::rc::Rc;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -724,14 +725,14 @@ fn laid_out(
     lines
 }
 
-/// The active block's figures (spec §5.3, §6.4) at `now_ms`: its elapsed and remaining time,
-/// which count on between queries from its start and end, its burn rate and its projection.
-/// `None` once it has ended: the row is no longer active.
-fn figures(row: &TokenRow, now_ms: i64) -> Option<Vec<String>> {
+/// What of `row`'s figures depends on the time: the elapsed and remaining seconds, which count
+/// on between queries from the block's start and end, while it is active. `None` when `row` is
+/// not a block, has no `active`, or has ended.
+fn figures_clock(row: &TokenRow, now_ms: i64) -> Option<(i64, i64)> {
     let PeriodKey::Block {
         start_ms,
         end_ms,
-        active: Some(a),
+        active: Some(_),
         ..
     } = &row.period
     else {
@@ -740,8 +741,19 @@ fn figures(row: &TokenRow, now_ms: i64) -> Option<Vec<String>> {
     if now_ms >= *end_ms {
         return None;
     }
-    let elapsed = (now_ms - start_ms).max(0) / 1000;
-    let left = (end_ms - now_ms) / 1000;
+    Some(((now_ms - start_ms).max(0) / 1000, (end_ms - now_ms) / 1000))
+}
+
+/// The active block's figures (spec §5.3, §6.4) at `now_ms`: its elapsed and remaining time,
+/// its burn rate and its projection. `None` once it has ended: the row is no longer active.
+fn figures(row: &TokenRow, now_ms: i64) -> Option<Vec<String>> {
+    let (elapsed, left) = figures_clock(row, now_ms)?;
+    let PeriodKey::Block {
+        active: Some(a), ..
+    } = &row.period
+    else {
+        return None;
+    };
     Some(vec![
         "active".to_owned(),
         format!("{} elapsed", words::duration(elapsed)),
@@ -768,23 +780,94 @@ enum Item {
     Figures(Line<'static>),
 }
 
-/// The table's lines at `width`, and the line each row starts at.
-fn items(report: &TokenReport, width: usize, now_ms: i64) -> (Vec<(usize, Item)>, Vec<usize>) {
-    let mut items = Vec::new();
-    let mut starts = Vec::with_capacity(report.rows.len());
-    for (index, row) in report.rows.iter().enumerate() {
-        starts.push(items.len());
-        let repeat = index > 0 && report.rows[index - 1].period == row.period;
-        items.push((index, Item::Row { repeat }));
-        let parts = figures(row, now_ms).filter(|_| !repeat);
-        if let Some(parts) = parts {
-            let head = vec![Span::raw(" ".repeat(FIGURES_INDENT))];
-            for line in laid_out(head, &parts, " · ", FIGURES_INDENT, width) {
-                items.push((index, Item::Figures(line)));
+/// The table's lines and the line each row starts at (PERF-R-10b).
+pub(super) struct Rows {
+    items: Vec<(usize, Item)>,
+    starts: Vec<usize>,
+}
+
+impl Rows {
+    /// The table's lines at `width`.
+    fn build(report: &TokenReport, width: usize, now_ms: i64) -> Rows {
+        let mut items = Vec::new();
+        let mut starts = Vec::with_capacity(report.rows.len());
+        for (index, row) in report.rows.iter().enumerate() {
+            starts.push(items.len());
+            let repeat = index > 0 && report.rows[index - 1].period == row.period;
+            items.push((index, Item::Row { repeat }));
+            let parts = figures(row, now_ms).filter(|_| !repeat);
+            if let Some(parts) = parts {
+                let head = vec![Span::raw(" ".repeat(FIGURES_INDENT))];
+                for line in laid_out(head, &parts, " · ", FIGURES_INDENT, width) {
+                    items.push((index, Item::Figures(line)));
+                }
             }
         }
+        Rows { items, starts }
     }
-    (items, starts)
+}
+
+/// What `Layout` holds: the rows, for the width and the clocks of the active blocks' rows.
+struct Laid {
+    width: usize,
+    /// The report's rows that are a block with `active`, and their `figures_clock` when laid out.
+    active: Vec<(usize, Option<(i64, i64)>)>,
+    rows: Rc<Rows>,
+}
+
+/// `Rows` for the level's report, kept while the width and the active blocks' clocks stay: the
+/// time reaches the rows only through `figures`, so a frame lays them out anew once a second at
+/// most, and a report with no active block once per width.
+#[derive(Default)]
+pub(super) struct Layout {
+    laid: RefCell<Option<Laid>>,
+    #[cfg(test)]
+    builds: std::cell::Cell<usize>,
+}
+
+impl Layout {
+    /// The rows of `report` at `width` and `now_ms`: the kept ones while they read the same.
+    pub(super) fn rows(&self, report: &TokenReport, width: usize, now_ms: i64) -> Rc<Rows> {
+        let mut laid = self.laid.borrow_mut();
+        if let Some(l) = laid.as_ref().filter(|l| {
+            l.width == width
+                && l.active
+                    .iter()
+                    .all(|&(i, clock)| figures_clock(&report.rows[i], now_ms) == clock)
+        }) {
+            return Rc::clone(&l.rows);
+        }
+        let active = report
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                matches!(
+                    row.period,
+                    PeriodKey::Block {
+                        active: Some(_),
+                        ..
+                    }
+                )
+            })
+            .map(|(i, row)| (i, figures_clock(row, now_ms)))
+            .collect();
+        let rows = Rc::new(Rows::build(report, width, now_ms));
+        #[cfg(test)]
+        self.builds.set(self.builds.get() + 1);
+        *laid = Some(Laid {
+            width,
+            active,
+            rows: Rc::clone(&rows),
+        });
+        rows
+    }
+
+    /// How many times the rows were laid out.
+    #[cfg(test)]
+    pub(super) fn builds(&self) -> usize {
+        self.builds.get()
+    }
 }
 
 /// The grouping's words in the header.
@@ -1110,7 +1193,11 @@ pub(super) fn follow(state: &mut State, area: Rect, now_ms: i64) {
     let (Some(report), Some(at)) = (t.report(), t.selected_index()) else {
         return;
     };
-    let (items, starts) = items(report, usize::from(area.width), now_ms);
+    let laid = t
+        .level()
+        .layout
+        .rows(report, usize::from(area.width), now_ms);
+    let (items, starts) = (&laid.items, &laid.starts);
     let last = starts.get(at + 1).copied().unwrap_or(items.len()) - 1;
     let offset = keep_visible(t.level().offset, starts[at], last, rows, items.len());
     state.tokens.level_mut().offset = offset;
@@ -1161,7 +1248,8 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     }
     let table = Table::new(report, &t.level().widths, width, state.theme, now_ms);
     lines.push(table.header());
-    let (items, starts) = items(report, width, now_ms);
+    let laid = t.level().layout.rows(report, width, now_ms);
+    let (items, starts) = (&laid.items, &laid.starts);
     let selected_at = t.selected_index();
     let offset = match selected_at {
         Some(at) => {
@@ -1170,17 +1258,17 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
         }
         None => t.level().offset.min(items.len().saturating_sub(plan.rows)),
     };
-    for (n, (index, item)) in items.into_iter().skip(offset).take(plan.rows).enumerate() {
+    for (n, (index, item)) in items.iter().skip(offset).take(plan.rows).enumerate() {
         lines.push(match item {
             Item::Row { repeat } => {
-                let row = table.row(&report.rows[index], repeat && n > 0);
-                if Some(index) == selected_at {
+                let row = table.row(&report.rows[*index], *repeat && n > 0);
+                if Some(*index) == selected_at {
                     highlight(row, width, state.theme)
                 } else {
                     row
                 }
             }
-            Item::Figures(line) => line,
+            Item::Figures(line) => line.clone(),
         });
     }
     lines.push(table.total());
@@ -2490,6 +2578,80 @@ mod tests {
         assert_eq!(found(&state), None, "a new report is measured anew");
         draw(&state, 80, 24);
         assert!(found(&state).is_some_and(|w| w != first));
+    }
+
+    /// The shown level's layout builds so far.
+    fn builds(state: &State) -> usize {
+        state.tokens.level().layout.builds()
+    }
+
+    #[test]
+    fn the_table_is_laid_out_once_per_report_width_and_clock() {
+        // PERF-R-10b: a frame reads the lines it shows from the layout, and lays them out
+        // anew only for a new width or a new clock of an active block.
+        let base = NOW_MS - NOW_MS.rem_euclid(1000);
+        let mut state = showing(many_days(60), |_| {});
+        state.size = (120, 40);
+        assert_eq!(builds(&state), 0, "not drawn yet");
+        draw_at(&state, 120, 40, base + 100);
+        assert_eq!(builds(&state), 1);
+        update(&mut state, ch('j'), base + 100);
+        assert_eq!(builds(&state), 1, "following the selection reads it");
+        draw_at(&state, 120, 40, base + 5_100);
+        assert_eq!(builds(&state), 1, "no block, so no clock");
+        state.size = (80, 24);
+        draw_at(&state, 80, 24, base + 5_100);
+        assert_eq!(builds(&state), 2, "a new width");
+
+        let again = crate::screens::tokens::requery(&mut state, base);
+        let [Cmd::LoadReport { r#gen, query }] = again.as_slice() else {
+            panic!("{again:?}");
+        };
+        let result = Ok(token_report(query.clone(), days()));
+        update(
+            &mut state,
+            Msg::TokenReport {
+                r#gen: *r#gen,
+                result,
+            },
+            base,
+        );
+        assert_eq!(builds(&state), 0, "a new report has a new layout");
+        draw_at(&state, 80, 24, base);
+        assert_eq!(builds(&state), 1);
+    }
+
+    #[test]
+    fn an_active_block_s_countdown_changes_when_it_did() {
+        // R-5: the text is the one a frame at that millisecond has drawn, and the layout is
+        // built again only where the countdown's seconds change.
+        let base = NOW_MS - NOW_MS.rem_euclid(1000);
+        let fresh = || showing_after("ppp", vec![block(base - 17_940_000, true)]);
+        let state = fresh();
+        let figures = |at: i64| draw_at(&state, 80, 24, at)[6].clone();
+        for (at, builds_so_far) in [
+            (base, 1),
+            (base + 100, 2),
+            (base + 150, 2),
+            (base + 60_000, 3),
+        ] {
+            let lines = draw_at(&state, 80, 24, at);
+            assert_eq!(lines, draw_at(&fresh(), 80, 24, at), "at {}", at - base);
+            assert_eq!(builds(&state), builds_so_far, "at {}", at - base);
+        }
+        assert!(figures(base).contains("1m left"), "{}", figures(base));
+        assert!(figures(base + 100).contains("<1m left"));
+        assert!(figures(base + 60_000).starts_with(" TOTAL"));
+    }
+
+    #[test]
+    fn a_new_width_in_the_same_second_draws_like_a_fresh_layout() {
+        let base = NOW_MS - NOW_MS.rem_euclid(1000);
+        let build = || showing_after("ppp", vec![block(base - 17_940_000, true)]);
+        let state = build();
+        draw_at(&state, 120, 40, base + 100);
+        let buffer = draw_buffer(&state, 80, 24, base + 100);
+        assert_eq!(buffer, draw_buffer(&build(), 80, 24, base + 100));
     }
 
     #[test]
