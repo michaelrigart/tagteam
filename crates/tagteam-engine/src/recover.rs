@@ -263,11 +263,7 @@ impl Engine {
         source: &'static str,
     ) -> Result<Option<Identity>, EngineError> {
         let Recovery {
-            row,
-            accounts: _,
-            locks,
-            live,
-            hints: _,
+            row, locks, live, ..
         } = *rec;
         let to = store
             .account(&row.to_id)?
