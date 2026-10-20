@@ -51,8 +51,8 @@ use tagteam_provider::{Clock, Env, EnvError, Keychain, LockState, Platform, Read
 
 use crate::auto::{HumanSink, JsonSink};
 use crate::cli::{
-    AutoStrategyArg, Cli, Command, ConfigAction, DaemonAction, ShellArg, StrategyArg, TokensArgs,
-    TokensPeriod,
+    AutoStrategyArg, Cli, Command, CompletionShell, ConfigAction, DaemonAction, ShellArg,
+    StrategyArg, TokensArgs, TokensPeriod,
 };
 use crate::prompt::Prompter;
 use crate::shell_init::Wrapped;
@@ -501,6 +501,7 @@ fn cancelled() -> Failure {
 fn or_inactive(active: Result<bool, EngineError>, position: u32, id: &AccountId) -> bool {
     active.unwrap_or_else(|e| {
         tracing::warn!(
+            target: "tagteam::app",
             position,
             account = %id,
             kind = e.kind(),
@@ -807,13 +808,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     // TUI spec §3: the TUI runs only from the binary, on its terminal (`tui_cmd`). An
     // in-process caller has none to hand over.
     if let Some(Command::Tui { .. }) = &cli.command {
-        let message = if json {
-            crate::tui_cmd::TUI_UNDER_JSON
-        } else {
-            crate::tui_cmd::NEEDS_TERMINAL
-        };
-        fail(io, json, KIND_USAGE, message);
-        return Ended::Code(EXIT_USAGE);
+        return refuse_tui(io, json);
     }
     // §12.8: the run shell is found through the registered providers, so the registry comes
     // first. Under a marker that cannot be read the outer home is unknown, and nothing runs.
@@ -842,12 +837,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     // Keychain, so it warns about nothing and creates nothing. After the marker check: an
     // unreadable marker refuses every command but `statusline` (§12.8).
     if let Some(Command::Completions { shell }) = &cli.command {
-        if json {
-            fail(io, true, KIND_USAGE, COMPLETIONS_UNDER_JSON);
-            return Ended::Code(EXIT_USAGE);
-        }
-        let _ = io.out.write_all(&shell.script());
-        return Ended::Code(0);
+        return answer_completions(io, json, *shell);
     }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
@@ -1066,6 +1056,28 @@ fn run_statusline(
             EXIT_USAGE
         }
     }
+}
+
+/// The TUI runs only from the binary, on its terminal (`tui_cmd`); in-process there is none to
+/// hand over, so the answer is a usage refusal.
+fn refuse_tui(io: &mut Io<'_>, json: bool) -> Ended {
+    let message = if json {
+        crate::tui_cmd::TUI_UNDER_JSON
+    } else {
+        crate::tui_cmd::NEEDS_TERMINAL
+    };
+    fail(io, json, KIND_USAGE, message);
+    Ended::Code(EXIT_USAGE)
+}
+
+/// §13.7's `completions`: the script, or a usage refusal under `--json`.
+fn answer_completions(io: &mut Io<'_>, json: bool, shell: CompletionShell) -> Ended {
+    if json {
+        fail(io, true, KIND_USAGE, COMPLETIONS_UNDER_JSON);
+        return Ended::Code(EXIT_USAGE);
+    }
+    let _ = io.out.write_all(&shell.script());
+    Ended::Code(0)
 }
 
 /// §12.7's `shell-init`, answered before the engine is built: one wrapper per registered
@@ -1303,51 +1315,8 @@ impl App<'_, '_> {
     /// Runs `command` and returns its exit code: 0, except for `auto` (§11.4).
     fn dispatch(&mut self, command: Command) -> Result<i32, Failure> {
         match command {
-            Command::List => {
-                // §8.3: every listed account is offered to the collector, which fetches only
-                // those that are due; the views are then read with whatever it recorded.
-                let listed = self.engine.accounts(self.provider_flag.as_ref())?;
-                let ids: Vec<AccountId> = listed
-                    .iter()
-                    .flat_map(|l| l.accounts.iter().map(|v| v.row.id.clone()))
-                    .collect();
-                self.collect(ids)?;
-                let lists = self.engine.accounts(self.provider_flag.as_ref())?;
-                let this = self.this_account();
-                let (now_s, color) = (self.now_s(), self.color());
-                let engine = &self.engine;
-                let names = |id: &str| {
-                    engine
-                        .provider(&ProviderId::new(id))
-                        .map_or_else(|_| id.to_owned(), |p| p.display_name().to_owned())
-                };
-                let launch = engine.provider(&self.provider())?.launch_command();
-                let human = render::list_human(&lists, this.as_ref(), &names, launch, now_s, color);
-                let json = render::list_json(&lists, &self.provider(), &render_usage(engine));
-                self.print(&human, json);
-            }
-            Command::Status => {
-                let provider = self.provider();
-                // §8.3: `status` collects the live account only.
-                if let StatusView::Managed { account, .. } = self.engine.status(&provider)? {
-                    self.collect(vec![account.row.id])?;
-                }
-                let s = self.engine.status(&provider)?;
-                let session = self.session_account(&provider)?;
-                let login = match session {
-                    ShellAccount::Unmanaged => self.session_login(),
-                    ShellAccount::NotInShell | ShellAccount::Managed(_) => None,
-                };
-                let (now_s, color) = (self.now_s(), self.color());
-                let human = render::status_human(&s, &session, login.as_deref(), now_s, color);
-                let json = render::status_json(
-                    &s,
-                    &session,
-                    provider.as_str(),
-                    &render_usage(&self.engine),
-                );
-                self.print(&human, json);
-            }
+            Command::List => self.list()?,
+            Command::Status => self.status()?,
             Command::Switch {
                 account,
                 force,
@@ -1365,35 +1334,8 @@ impl App<'_, '_> {
                 email,
                 alias,
                 yes,
-            } => {
-                let token = self.token(token)?;
-                let provider = self.provider();
-                let out = self.confirming(yes, |engine, yes| {
-                    engine.add_token(AddTokenOptions {
-                        provider: provider.clone(),
-                        token: token.clone(),
-                        position,
-                        email: email.clone(),
-                        alias: alias.clone(),
-                        yes,
-                    })
-                })?;
-                self.added(out.account, out.created);
-            }
-            Command::Remove { account } => {
-                let row = self.resolve(&account)?;
-                // Decided before the row is gone. Removal never touches the live login
-                // (§10.3), so this also says whether the removed login is still the live one.
-                let active = self.is_active(&row)?;
-                let row = self.engine.remove(&row.id)?;
-                let human = format!(
-                    "Removed {} (position {}).\n",
-                    render::name(&row),
-                    row.position
-                );
-                let view = self.engine.account_view(row, active);
-                self.print_view(&human, view, None);
-            }
+            } => self.add_token(token, position, email, alias, yes)?,
+            Command::Remove { account } => self.remove(&account)?,
             Command::Disable { account } => {
                 let row = self.resolve(&account)?;
                 let row = self.engine.set_disabled(&row.id, true)?;
@@ -1408,56 +1350,8 @@ impl App<'_, '_> {
                 account,
                 name,
                 unset,
-            } => match (account, name, unset) {
-                (None, None, false) => {
-                    let lists = self.engine.accounts(self.provider_flag.as_ref())?;
-                    let rows: Vec<&AccountRow> = lists
-                        .iter()
-                        .flat_map(|l| l.accounts.iter().map(|v| &v.row))
-                        .filter(|r| r.alias.is_some())
-                        .collect();
-                    let human: String = rows
-                        .iter()
-                        .map(|r| {
-                            format!(
-                                "{}  {}  {}\n",
-                                r.alias.as_deref().unwrap_or_default(),
-                                r.position,
-                                render::email(r)
-                            )
-                        })
-                        .collect();
-                    let aliases: Vec<Value> = rows
-                        .iter()
-                        .map(|r| json!({"alias": r.alias, "number": r.position, "provider": r.provider.as_str()}))
-                        .collect();
-                    self.print(&human, json!({"schemaVersion": 1, "aliases": aliases}));
-                }
-                (Some(account), Some(name), false) => {
-                    let row = self.resolve(&account)?;
-                    let row = self.engine.set_alias(&row.id, Some(&name))?;
-                    let alias = row.alias.clone().unwrap_or_default();
-                    let human = format!("Position {} is now {alias}.\n", row.position);
-                    self.print_account(&human, row, None);
-                }
-                (Some(account), None, true) => {
-                    let row = self.resolve(&account)?;
-                    let row = self.engine.set_alias(&row.id, None)?;
-                    let human = format!("Position {} has no alias now.\n", row.position);
-                    self.print_account(&human, row, None);
-                }
-                _ => return Err(Failure::Usage(ALIAS_USAGE.into())),
-            },
-            Command::Move { account, position } => {
-                let row = self.resolve(&account)?;
-                let row = self.engine.move_to(&row.id, position)?;
-                let human = format!(
-                    "{} is now at position {}.\n",
-                    render::email(&row),
-                    row.position
-                );
-                self.print_account(&human, row, None);
-            }
+            } => self.alias(account, name, unset)?,
+            Command::Move { account, position } => self.move_account(&account, position)?,
             Command::History {
                 account,
                 window,
@@ -1494,16 +1388,7 @@ impl App<'_, '_> {
                 identity,
             } => return self.import(&file, force, &identity),
             // §13.6: read-only, so no Keychain check precedes it; it exits 1 when a check fails.
-            Command::Doctor { online } => {
-                let report = self.engine.doctor(DoctorOptions {
-                    online,
-                    provider: self.provider_flag.clone(),
-                    service: Some(self.service()),
-                })?;
-                let human = doctor_cmd::human(&report, &|p| display_name(&self.engine, p));
-                self.print(&human, doctor_cmd::json(&report));
-                return Ok(if report.ok() { 0 } else { EXIT_ERROR });
-            }
+            Command::Doctor { online } => return self.doctor(online),
             Command::Completions { .. } => unreachable!("run answers completions before dispatch"),
             Command::Auto {
                 once,
@@ -1523,12 +1408,7 @@ impl App<'_, '_> {
                     model,
                     include_api_key_accounts,
                 )?;
-                return self.auto(AutoRun {
-                    provider: self.provider_flag.clone(),
-                    flags,
-                    once,
-                    dry_run,
-                });
+                return self.auto_command(once, dry_run, flags);
             }
             Command::Daemon { action: None } => return self.daemon(),
             // D8, D9: the service commands. Root is refused for every command already.
@@ -1537,6 +1417,177 @@ impl App<'_, '_> {
             } => return self.daemon_action(action),
         }
         Ok(0)
+    }
+
+    fn list(&mut self) -> Result<(), Failure> {
+        // §8.3: every listed account is offered to the collector, which fetches only
+        // those that are due; the views are then read with whatever it recorded.
+        let listed = self.engine.accounts(self.provider_flag.as_ref())?;
+        let ids: Vec<AccountId> = listed
+            .iter()
+            .flat_map(|l| l.accounts.iter().map(|v| v.row.id.clone()))
+            .collect();
+        self.collect(ids)?;
+        let lists = self.engine.accounts(self.provider_flag.as_ref())?;
+        let this = self.this_account();
+        let (now_s, color) = (self.now_s(), self.color());
+        let engine = &self.engine;
+        let names = |id: &str| {
+            engine
+                .provider(&ProviderId::new(id))
+                .map_or_else(|_| id.to_owned(), |p| p.display_name().to_owned())
+        };
+        let launch = engine.provider(&self.provider())?.launch_command();
+        let human = render::list_human(&lists, this.as_ref(), &names, launch, now_s, color);
+        let json = render::list_json(&lists, &self.provider(), &render_usage(engine));
+        self.print(&human, json);
+        Ok(())
+    }
+
+    fn status(&mut self) -> Result<(), Failure> {
+        let provider = self.provider();
+        // §8.3: `status` collects the live account only.
+        if let StatusView::Managed { account, .. } = self.engine.status(&provider)? {
+            self.collect(vec![account.row.id])?;
+        }
+        let s = self.engine.status(&provider)?;
+        let session = self.session_account(&provider)?;
+        let login = match session {
+            ShellAccount::Unmanaged => self.session_login(),
+            ShellAccount::NotInShell | ShellAccount::Managed(_) => None,
+        };
+        let (now_s, color) = (self.now_s(), self.color());
+        let human = render::status_human(&s, &session, login.as_deref(), now_s, color);
+        let json =
+            render::status_json(&s, &session, provider.as_str(), &render_usage(&self.engine));
+        self.print(&human, json);
+        Ok(())
+    }
+
+    fn add_token(
+        &mut self,
+        token: Option<String>,
+        position: Option<u32>,
+        email: Option<String>,
+        alias: Option<String>,
+        yes: bool,
+    ) -> Result<(), Failure> {
+        let token = self.token(token)?;
+        let provider = self.provider();
+        let out = self.confirming(yes, |engine, yes| {
+            engine.add_token(AddTokenOptions {
+                provider: provider.clone(),
+                token: token.clone(),
+                position,
+                email: email.clone(),
+                alias: alias.clone(),
+                yes,
+            })
+        })?;
+        self.added(out.account, out.created);
+        Ok(())
+    }
+
+    fn remove(&mut self, account: &str) -> Result<(), Failure> {
+        let row = self.resolve(account)?;
+        // Decided before the row is gone. Removal never touches the live login
+        // (§10.3), so this also says whether the removed login is still the live one.
+        let active = self.is_active(&row)?;
+        let row = self.engine.remove(&row.id)?;
+        let human = format!(
+            "Removed {} (position {}).\n",
+            render::name(&row),
+            row.position
+        );
+        let view = self.engine.account_view(row, active);
+        self.print_view(&human, view, None);
+        Ok(())
+    }
+
+    fn alias(
+        &mut self,
+        account: Option<String>,
+        name: Option<String>,
+        unset: bool,
+    ) -> Result<(), Failure> {
+        match (account, name, unset) {
+            (None, None, false) => {
+                let lists = self.engine.accounts(self.provider_flag.as_ref())?;
+                let rows: Vec<&AccountRow> = lists
+                    .iter()
+                    .flat_map(|l| l.accounts.iter().map(|v| &v.row))
+                    .filter(|r| r.alias.is_some())
+                    .collect();
+                let human: String = rows
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "{}  {}  {}\n",
+                            r.alias.as_deref().unwrap_or_default(),
+                            r.position,
+                            render::email(r)
+                        )
+                    })
+                    .collect();
+                let aliases: Vec<Value> = rows
+                    .iter()
+                    .map(|r| json!({"alias": r.alias, "number": r.position, "provider": r.provider.as_str()}))
+                    .collect();
+                self.print(&human, json!({"schemaVersion": 1, "aliases": aliases}));
+            }
+            (Some(account), Some(name), false) => {
+                let row = self.resolve(&account)?;
+                let row = self.engine.set_alias(&row.id, Some(&name))?;
+                let alias = row.alias.clone().unwrap_or_default();
+                let human = format!("Position {} is now {alias}.\n", row.position);
+                self.print_account(&human, row, None);
+            }
+            (Some(account), None, true) => {
+                let row = self.resolve(&account)?;
+                let row = self.engine.set_alias(&row.id, None)?;
+                let human = format!("Position {} has no alias now.\n", row.position);
+                self.print_account(&human, row, None);
+            }
+            _ => return Err(Failure::Usage(ALIAS_USAGE.into())),
+        }
+        Ok(())
+    }
+
+    fn move_account(&mut self, account: &str, position: u32) -> Result<(), Failure> {
+        let row = self.resolve(account)?;
+        let row = self.engine.move_to(&row.id, position)?;
+        let human = format!(
+            "{} is now at position {}.\n",
+            render::email(&row),
+            row.position
+        );
+        self.print_account(&human, row, None);
+        Ok(())
+    }
+
+    fn doctor(&mut self, online: bool) -> Result<i32, Failure> {
+        let report = self.engine.doctor(DoctorOptions {
+            online,
+            provider: self.provider_flag.clone(),
+            service: Some(self.service()),
+        })?;
+        let human = doctor_cmd::human(&report, &|p| display_name(&self.engine, p));
+        self.print(&human, doctor_cmd::json(&report));
+        Ok(if report.ok() { 0 } else { EXIT_ERROR })
+    }
+
+    fn auto_command(
+        &mut self,
+        once: bool,
+        dry_run: bool,
+        flags: AutoFlags,
+    ) -> Result<i32, Failure> {
+        self.auto(AutoRun {
+            provider: self.provider_flag.clone(),
+            flags,
+            once,
+            dry_run,
+        })
     }
 
     /// §13.3: `export`. The destination and the encryption are settled before any account is
