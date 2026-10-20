@@ -69,8 +69,9 @@ pub(crate) struct Wait {
     waker: Arc<mio::Waker>,
     /// The fd has hung up. Its event comes once, so it is remembered.
     closed: bool,
-    /// A SIGWINCH `closed` took, for the next `wait` to report.
+    /// A SIGWINCH and a wake `closed` took, for the next `wait` to report.
     resized: bool,
+    woken: bool,
 }
 
 impl Wait {
@@ -90,16 +91,17 @@ impl Wait {
             waker,
             closed: false,
             resized: false,
+            woken: false,
         })
     }
 
     /// `Events::wait` on `fd`. Of several at once, a hang-up is reported first, then a resize,
-    /// after which the thread reads the terminal anyway, then bytes.
+    /// after which the thread reads the terminal anyway, then bytes, then a wake.
     pub(crate) fn wait(&mut self) -> io::Result<Ready> {
-        let mut ready = Ready::Woken;
-        if !self.closed && !self.resized {
+        let mut input = false;
+        if !self.closed && !self.resized && !self.woken {
             match self.poll.poll(&mut self.events, None) {
-                Ok(()) => ready = self.take(),
+                Ok(()) => input = self.take(),
                 // A signal handled on this thread: the thread looks at its control again.
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
@@ -112,11 +114,14 @@ impl Wait {
             self.signals.pending().for_each(drop);
             return Ok(Ready::Resized);
         }
-        Ok(ready)
+        // A wake that comes with bytes is spent too: the thread looks at its control before
+        // every call into the terminal.
+        self.woken = false;
+        Ok(if input { Ready::Input } else { Ready::Woken })
     }
 
-    /// Without blocking: whether `fd` has hung up. Once seen it stays true. A SIGWINCH this
-    /// poll takes is kept, and the next `wait` returns `Resized` at once.
+    /// Without blocking: whether `fd` has hung up. Once seen it stays true. A SIGWINCH or a
+    /// wake this poll takes is kept, and the next `wait` returns `Resized` or `Woken` at once.
     pub(crate) fn closed(&mut self) -> io::Result<bool> {
         if !self.closed {
             loop {
@@ -141,19 +146,20 @@ impl Wait {
         })
     }
 
-    /// Notes what the events a poll took say: a hang-up and a SIGWINCH are kept. Returns
-    /// `Input` if the fd has bytes, else `Woken`.
-    fn take(&mut self) -> Ready {
-        let mut ready = Ready::Woken;
+    /// Notes what the events a poll took say: a hang-up, a SIGWINCH and a wake are kept.
+    /// Returns whether the fd has bytes.
+    fn take(&mut self) -> bool {
+        let mut input = false;
         for event in &self.events {
             match event.token() {
                 FD if event.is_read_closed() || event.is_error() => self.closed = true,
-                FD => ready = Ready::Input,
+                FD => input = true,
                 RESIZE => self.resized = true,
+                WAKE => self.woken = true,
                 _ => {}
             }
         }
-        ready
+        input
     }
 }
 
@@ -431,8 +437,8 @@ mod tests {
     /// What a script holds for the thread.
     #[derive(Default)]
     struct Held {
-        /// What `next` returns, in order, and `Empty` once it runs out. After a `Closed` it
-        /// returns `Closed` for good, and `wait` does too.
+        /// What `next` returns, in order, and `Empty` once it runs out. After a `Closed`, or a
+        /// `hang_up`, `next` and `wait` both return `Closed` for good.
         queue: VecDeque<Next>,
         closed: bool,
         /// A SIGWINCH no `wait` has reported yet, and the size `size` reports.
@@ -440,11 +446,14 @@ mod tests {
         size: (u16, u16),
         /// The waker was called since a `wait` last reported it.
         woken: bool,
+        /// Every `next` fails, or every `wait` does.
+        next_fails: bool,
+        wait_fails: bool,
     }
 
-    /// A terminal in a script. Its `wait` blocks until something is queued, a resize arrives
-    /// or the waker is called. `reading` is set while the thread is inside `next` or `wait`,
-    /// and `nexts` and `waits` count its calls.
+    /// A terminal in a script. Its `wait` blocks until something is queued, a resize arrives,
+    /// the waker is called or the terminal hangs up. `reading` is set while the thread is
+    /// inside `next` or `wait`, and `nexts` and `waits` count its calls.
     #[derive(Clone, Default)]
     struct Script {
         held: Arc<(Mutex<Held>, Condvar)>,
@@ -477,6 +486,23 @@ mod tests {
             self.held.1.notify_all();
         }
 
+        /// The terminal hangs up, seen by the `wait` the thread may be in.
+        fn hang_up(&self) {
+            self.hold().closed = true;
+            self.held.1.notify_all();
+        }
+
+        /// From now on every `next` fails.
+        fn fail_next(&self) {
+            self.hold().next_fails = true;
+        }
+
+        /// From now on every `wait` fails.
+        fn fail_wait(&self) {
+            self.hold().wait_fails = true;
+            self.held.1.notify_all();
+        }
+
         /// Its `next`s and `wait`s so far.
         fn calls(&self) -> usize {
             self.nexts.load(Ordering::SeqCst) + self.waits.load(Ordering::SeqCst)
@@ -498,17 +524,20 @@ mod tests {
             self.reading.store(true, Ordering::SeqCst);
             let mut held = self.hold();
             let ready = loop {
+                if held.wait_fails {
+                    break Err(io::Error::other("the wait fails"));
+                }
                 if held.closed {
-                    break Ready::Closed;
+                    break Ok(Ready::Closed);
                 }
                 if mem::take(&mut held.resized) {
-                    break Ready::Resized;
+                    break Ok(Ready::Resized);
                 }
                 if !held.queue.is_empty() {
-                    break Ready::Input;
+                    break Ok(Ready::Input);
                 }
                 if mem::take(&mut held.woken) {
-                    break Ready::Woken;
+                    break Ok(Ready::Woken);
                 }
                 held = self
                     .held
@@ -518,22 +547,24 @@ mod tests {
             };
             drop(held);
             self.reading.store(false, Ordering::SeqCst);
-            Ok(ready)
+            ready
         }
 
         fn next(&mut self) -> io::Result<Next> {
             self.nexts.fetch_add(1, Ordering::SeqCst);
             self.reading.store(true, Ordering::SeqCst);
             let mut held = self.hold();
-            let next = if held.closed {
-                Next::Closed
+            let next = if held.next_fails {
+                Err(io::Error::other("the read fails"))
+            } else if held.closed {
+                Ok(Next::Closed)
             } else {
-                held.queue.pop_front().unwrap_or(Next::Empty)
+                Ok(held.queue.pop_front().unwrap_or(Next::Empty))
             };
-            held.closed = matches!(next, Next::Closed);
+            held.closed |= matches!(next, Ok(Next::Closed));
             drop(held);
             self.reading.store(false, Ordering::SeqCst);
-            Ok(next)
+            next
         }
 
         fn size(&mut self) -> io::Result<(u16, u16)> {
@@ -846,6 +877,45 @@ mod tests {
             ));
         }
         assert_stopped(&input, &script, 4, 1);
+
+        // The wait, idle.
+        let script = Script::default();
+        let (tx, _rx) = mpsc::channel();
+        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        script.idle(1);
+        script.hang_up();
+        assert_stopped(&input, &script, 1, 1);
+    }
+
+    #[test]
+    fn a_terminal_that_fails_is_tried_again_a_slice_later() {
+        // A slice apart, 200 ms holds about 4 tries; with no back-off, hundreds of thousands.
+        let tries = 2..=10;
+
+        // Reading fails, while the terminal says it has bytes.
+        let script = Script::default();
+        script.fail_next();
+        script.push(Event::Key(key('x')));
+        let (tx, _rx) = mpsc::channel();
+        let input = Input::spawn_with(tx, script.clone()).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let nexts = script.nexts.load(Ordering::SeqCst);
+        assert!(tries.contains(&nexts), "{nexts} reads in 200 ms");
+        drop(input);
+
+        // The wait fails.
+        let script = Script::default();
+        script.fail_wait();
+        let (tx, _rx) = mpsc::channel();
+        let _input = Input::spawn_with(tx, script.clone()).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let waits = script.waits.load(Ordering::SeqCst);
+        assert!(tries.contains(&waits), "{waits} waits in 200 ms");
+        assert_eq!(
+            script.nexts.load(Ordering::SeqCst),
+            1,
+            "the drain at startup"
+        );
     }
 
     #[test]
@@ -933,5 +1003,21 @@ mod tests {
             drop(ours);
         });
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(Ready::Resized));
+    }
+
+    #[test]
+    fn a_wake_the_hang_up_check_takes_is_kept_for_the_wait() {
+        let _alone = alone();
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let mut wait = Wait::on(ours.as_raw_fd()).unwrap();
+        wait.waker()();
+        assert!(!wait.closed().unwrap());
+        // The poll above took the wake: `wait` returns at once from what it kept.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(wait.wait().unwrap());
+            drop(ours);
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_millis(50)), Ok(Ready::Woken));
     }
 }
