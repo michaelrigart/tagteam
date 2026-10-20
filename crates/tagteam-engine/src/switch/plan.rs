@@ -30,7 +30,8 @@ pub(super) struct Plan {
     pub(super) self_switch: bool,
     pub(super) hint: Option<OracleHint>,
     /// The live account the plan was made against: a usage strategy's pick stands under the
-    /// locks only while it still is, since the network is not used under the locks.
+    /// locks only while it still is. No network is used under the locks, so the ranking is not
+    /// recomputed there; otherwise planning runs again from the store's readings.
     pub(super) anchor: Option<AccountId>,
     /// A rotation's accounts the walk read and passed over before its pick (§9.3). Empty for a
     /// direct target and a usage strategy.
