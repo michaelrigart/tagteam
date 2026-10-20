@@ -14,16 +14,17 @@ use std::time::{Duration, Instant};
 use tagteam_engine::launch::{LaunchEnd, Launched};
 use tagteam_engine::tokens::{LaunchId, LaunchPoll};
 use tagteam_engine::{Engine, EngineError};
-use tagteam_provider::Cancel;
 use tagteam_provider::process::{SpawnSpec, exit_code, spawn_session};
+use tagteam_provider::{Cancel, ExitWatch, Watched};
 
 use crate::signals;
 
-/// How often the wait loop looks at `claude` and at the cancel token (Decision 1).
-const POLL: Duration = Duration::from_millis(50);
+/// How often `run` forwards what the cancel token recorded (Decision 1) and checks the child's
+/// session record (H9). The child's exit wakes the wait at once, so a tick never delays it.
+const TICK: Duration = Duration::from_millis(250);
 
 /// Token report spec §6.1: how often `run` writes what its checks of the child's session record
-/// saw. It checks the record on every `POLL` tick.
+/// saw. It checks the record on every `TICK`.
 const RECORD_POLL: Duration = Duration::from_secs(2);
 
 /// `run`'s exit code when it lost track of `claude`'s status, which only a failing `waitpid`
@@ -99,7 +100,7 @@ pub(crate) fn run_session(
     let pid = child.id();
     // The first look forwards anything, SIGINT included: what arrived while `claude` was being
     // spawned, the terminal could not deliver to it.
-    forward(pid, cancel.take(), true);
+    forward(pid, cancel.take(), true, &mut kill_child);
     let mut seen = LaunchPoll::default();
     // Token report spec §6.1: the child's exit, stamped as soon as the wait returns, bounds its
     // sighting: a check after it confirms nothing.
@@ -258,7 +259,7 @@ fn log_unrecorded(kind: &str, kept: bool) {
 }
 
 /// Token report spec §6.1: runs `wait` on this thread while a scoped thread, until `wait`
-/// returns, checks the child's session record on every `POLL` tick, and every `RECORD_POLL` from
+/// returns, checks the child's session record on every `TICK`, and every `RECORD_POLL` from
 /// its first tick records the launch if it is not yet, records the child's pid once it is, and
 /// writes what the checks saw, whether or not the launch is recorded yet. A launch the store
 /// still refuses is kept in its pending file meanwhile, written again if that write failed, and
@@ -342,7 +343,7 @@ fn wait_polling<T>(
                 }
                 next = Instant::now() + RECORD_POLL;
             }
-            thread::sleep(POLL);
+            thread::park_timeout(TICK);
         }
     };
     beside(poller, wait, || engine.now_ms())
@@ -351,9 +352,10 @@ fn wait_polling<T>(
 /// Runs `wait` on this thread while a scoped thread runs `poller` until its flag is set, and
 /// returns what `wait` returned with `stamp`, read on this thread as soon as `wait` returns:
 /// before the flag is set and the poller joined, so a poller blocked in a store write never
-/// delays it. The flag is set however `wait` ends, a panic included. A poller that cannot start
-/// or that panics loses evidence, never the run (spec §6.1): it is joined here, so the scope has
-/// no panic of its own to re-raise, and the failure is one warning in the log.
+/// delays it. The flag is set however `wait` ends, a panic included, and the poller is unparked
+/// then, so it does not sleep out the rest of its tick before it sees the flag. A poller that
+/// cannot start or that panics loses evidence, never the run (spec §6.1): it is joined here, so
+/// the scope has no panic of its own to re-raise, and the failure is one warning in the log.
 fn beside<T>(
     poller: impl FnOnce(&AtomicBool) + Send,
     wait: impl FnOnce() -> T,
@@ -371,7 +373,10 @@ fn beside<T>(
                 None
             }
         };
-        let guard = StopOnDrop(&stop);
+        let guard = StopOnDrop {
+            stop: &stop,
+            poller: poller.as_ref().map(|handle| handle.thread().clone()),
+        };
         let waited = wait();
         let at = stamp();
         drop(guard);
@@ -382,13 +387,20 @@ fn beside<T>(
     })
 }
 
-/// Sets its flag when dropped, so the poller ends however the wait does, a panic included,
-/// and the scope never waits on it forever.
-struct StopOnDrop<'a>(&'a AtomicBool);
+/// Sets its flag when dropped, then unparks the poller, so it ends however the wait does, a
+/// panic included, and at once: an unpark before its park is kept, so it cannot sleep through
+/// the flag. The scope never waits on it forever.
+struct StopOnDrop<'a> {
+    stop: &'a AtomicBool,
+    poller: Option<thread::Thread>,
+}
 
 impl Drop for StopOnDrop<'_> {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(poller) = &self.poller {
+            poller.unpark();
+        }
     }
 }
 
@@ -438,13 +450,24 @@ pub(crate) fn forwarded(signal: i32, first: bool) -> bool {
     }
 }
 
-/// Sends `signal`, when `forwarded` says so, to the child `pid`. Returns the signal when it
-/// was one to forward.
-fn forward(pid: u32, signal: Option<i32>, first: bool) -> Option<i32> {
+/// Sends `signal`, when `forwarded` says so, to the child `pid` through `send`. Returns the
+/// signal when it was one to forward.
+fn forward(
+    pid: u32,
+    signal: Option<i32>,
+    first: bool,
+    send: &mut dyn FnMut(u32, i32),
+) -> Option<i32> {
     let signal = signal.filter(|&s| forwarded(s, first))?;
+    send(pid, signal);
+    Some(signal)
+}
+
+/// Sends `signal` to the child `pid`, with a warning when it cannot.
+fn kill_child(pid: u32, signal: i32) {
     // SAFETY: kill(2) reads no memory of ours. `pid` is this process's child, which only
-    // `wait` reaps, and nothing is sent once it has: the pid names the child or its zombie,
-    // never a process that reused the number.
+    // `wait_every` reaps, and nothing is sent once it has: the pid names the child or its
+    // zombie, never a process that reused the number.
     let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
     if rc != 0 {
         tracing::warn!(
@@ -453,24 +476,40 @@ fn forward(pid: u32, signal: Option<i32>, first: bool) -> Option<i32> {
             io::Error::last_os_error()
         );
     }
-    Some(signal)
 }
 
 /// Waits for the child, forwarding what the token records meanwhile (Decision 1), and returns
 /// its status with the last signal forwarded to it. `run`'s wait for `claude`, and the TUI's for
 /// the `tagteam run` it starts (TUI spec §7.3). Nothing here waits on a lock (B.37).
 pub(crate) fn wait(child: &mut Child, cancel: &Cancel) -> (io::Result<ExitStatus>, Option<i32>) {
+    wait_every(child, cancel, TICK, &mut kill_child)
+}
+
+/// `wait` with its tick and its sender given. The child's exit wakes the wait at once; every
+/// `tick` until then, and once more after the exit, the token is taken and what it holds goes to
+/// `send`. This thread is the only one that reaps, and it sends nothing once it has, so the pid
+/// names the child or its zombie, never a process that reused the number. A signal pending as the
+/// child exits is thus sent to its zombie and never after the reap. The TUI's `tagteam run` is
+/// waited on the same way (TUI spec §7.3). If the exit watch fails there is nothing to tick on:
+/// the child is waited out, with no more forwarding.
+fn wait_every(
+    child: &mut Child,
+    cancel: &Cancel,
+    tick: Duration,
+    send: &mut dyn FnMut(u32, i32),
+) -> (io::Result<ExitStatus>, Option<i32>) {
     let pid = child.id();
+    let mut exit = ExitWatch::start(pid);
     let mut last = None;
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return (Ok(status), last),
-            Ok(None) => {}
-            // No status to poll for: wait it out; it is still the child's exit that ends the run.
-            Err(_) => return (child.wait(), last),
+        let watched = exit.wait(tick);
+        if matches!(watched, Watched::Failed(_)) {
+            return (child.wait(), last);
         }
-        thread::sleep(POLL);
-        last = forward(pid, cancel.take(), false).or(last);
+        last = forward(pid, cancel.take(), false, send).or(last);
+        if watched == Watched::Exited {
+            return (child.wait(), last);
+        }
     }
 }
 
@@ -617,6 +656,152 @@ mod tests {
         assert_eq!(
             beside(|_stop: &AtomicBool| {}, || "exited", || 3),
             ("exited", 3)
+        );
+    }
+
+    /// `pid`, a child of this process, is not reaped yet: waitid answers for it (running or a
+    /// zombie), and fails with ECHILD once it is reaped.
+    fn unreaped(pid: u32) -> bool {
+        // SAFETY: a zeroed siginfo_t that waitid fills in; WNOHANG|WNOWAIT reap nothing.
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            ) == 0
+        }
+    }
+
+    /// `f`'s result from a thread of its own; a panic once `limit` has passed, so a wait that only
+    /// a tick would end fails instead of hanging.
+    fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(limit).expect("it did not return in time")
+    }
+
+    #[test]
+    fn a_signal_pending_as_the_child_exits_is_forwarded_while_it_is_unreaped_never_after() {
+        // Review Focus 3, H9: the child has exited, unreaped, when the wait first reads the token.
+        let cancel = Cancel::new();
+        let token = cancel.clone();
+        let ((status, last), sends, pid) = within(Duration::from_secs(10), move || {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 3"])
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            assert_eq!(
+                ExitWatch::start(pid).wait(Duration::from_secs(5)),
+                Watched::Exited
+            );
+            token.request(libc::SIGTERM);
+            let mut sends = Vec::new();
+            let waited = wait_every(
+                &mut child,
+                &token,
+                Duration::from_secs(3600),
+                &mut |p, s| sends.push((s, unreaped(p))),
+            );
+            (waited, sends, pid)
+        });
+        assert_eq!(status.unwrap().code(), Some(3));
+        assert_eq!(last, Some(libc::SIGTERM));
+        assert_eq!(
+            sends,
+            [(libc::SIGTERM, true)],
+            "sent to the zombie, before the reap"
+        );
+        assert!(
+            !unreaped(pid),
+            "reaped before the wait returned, so nothing can follow"
+        );
+        assert_eq!(cancel.requested(), None, "taken once");
+    }
+
+    #[test]
+    fn a_signal_while_the_child_runs_reaches_it_within_a_tick_and_only_while_unreaped() {
+        let d = tempfile::tempdir().unwrap();
+        let started = d.path().join("started");
+        let script = format!(
+            "trap 'exit 7' TERM; : > '{}'; i=0; while [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done",
+            started.display()
+        );
+        let cancel = Cancel::new();
+        let (token, signaller) = (cancel.clone(), cancel.clone());
+        let sender = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !started.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            signaller.request(libc::SIGTERM);
+        });
+        let ((status, last), sends) = within(Duration::from_secs(10), move || {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .spawn()
+                .unwrap();
+            let mut sends = Vec::new();
+            let waited = wait_every(
+                &mut child,
+                &token,
+                Duration::from_millis(20),
+                &mut |p, s| {
+                    sends.push((s, unreaped(p)));
+                    kill_child(p, s); // deliver it, as `wait` does: the trap's exit 7 is the proof
+                },
+            );
+            (waited, sends)
+        });
+        sender.join().unwrap();
+        assert_eq!(
+            status.unwrap().code(),
+            Some(7),
+            "the forwarded SIGTERM ended it"
+        );
+        assert_eq!(last, Some(libc::SIGTERM));
+        assert_eq!(sends, [(libc::SIGTERM, true)]);
+    }
+
+    #[test]
+    fn the_child_s_exit_is_reported_without_waiting_for_a_tick() {
+        // H14: an hour's tick; the exit wakes the wait.
+        let ((status, last), sends) = within(Duration::from_secs(10), || {
+            let mut child = std::process::Command::new("/bin/sh")
+                .args(["-c", "sleep 0.1; exit 5"])
+                .spawn()
+                .unwrap();
+            let mut sends = 0;
+            let waited = wait_every(
+                &mut child,
+                &Cancel::new(),
+                Duration::from_secs(3600),
+                &mut |_, _| sends += 1,
+            );
+            (waited, sends)
+        });
+        assert_eq!(status.unwrap().code(), Some(5));
+        assert_eq!((last, sends), (None, 0));
+    }
+
+    #[test]
+    fn the_poller_is_woken_as_soon_as_the_wait_returns() {
+        // H9: the poller sleeps a 250 ms tick, and `run` never waits it out at exit.
+        let poller = |stop: &AtomicBool| {
+            while !stop.load(Ordering::Relaxed) {
+                thread::park_timeout(Duration::from_secs(20));
+            }
+        };
+        let started = Instant::now();
+        assert_eq!(beside(poller, || "exited", || 1), ("exited", 1));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
         );
     }
 }

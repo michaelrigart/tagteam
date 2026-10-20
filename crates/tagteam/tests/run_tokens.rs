@@ -248,7 +248,7 @@ fn run_records_a_launch_and_closes_it() {
 
 #[test]
 fn run_sights_the_child_session() {
-    // Spec §6.1: while the child runs, `run` checks its record every 50 ms and writes every
+    // Spec §6.1: while the child runs, `run` checks its record every 250 ms and writes every
     // 2 s: the session it names is sighted in the profile's home, in the execution of the
     // record's `startedAt`, from the read that first named it. The sighting ends at the last
     // check that confirmed it, never past the child's exit; the launch closes after exit
