@@ -19,7 +19,7 @@ use tagteam_engine::words::{self, Severity};
 use super::TokensState;
 use crate::state::State;
 use crate::theme::Theme;
-use crate::view::{fit, width_of, wrap};
+use crate::view::{fit, highlight, keep_visible, width_of, wrap};
 
 /// From this width the table adds the cache, the response count and a cost bar (spec §5.3).
 pub const WIDE: usize = 120;
@@ -787,20 +787,6 @@ fn items(report: &TokenReport, width: usize, now_ms: i64) -> (Vec<(usize, Item)>
     (items, starts)
 }
 
-/// The first line to show so that lines `first..=last` show, moving as little as it can, and
-/// never past the last full page (R22).
-fn keep_visible(offset: usize, first: usize, last: usize, rows: usize, lines: usize) -> usize {
-    let rows = rows.max(1);
-    let offset = if first < offset {
-        first
-    } else if last >= offset + rows {
-        (last + 1 - rows).min(first)
-    } else {
-        offset
-    };
-    offset.min(lines.saturating_sub(rows))
-}
-
 /// The grouping's words in the header.
 fn grouping_text(g: TokenGrouping) -> &'static str {
     match g {
@@ -1130,14 +1116,6 @@ pub(super) fn follow(state: &mut State, area: Rect, now_ms: i64) {
     state.tokens.level_mut().offset = offset;
 }
 
-/// The selected row in reverse video across the whole width.
-fn highlight(theme: Theme, row: Line<'static>, width: usize) -> Line<'static> {
-    let used: usize = row.spans.iter().map(|s| width_of(&s.content)).sum();
-    let mut spans = row.spans;
-    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    Line::from(spans).style(theme.selection())
-}
-
 /// What explains an empty report (TR §11.3): the lines and the files the index could not read,
 /// in the footnotes' words, wrapped at `width`.
 fn empty_warnings(index: &tagteam_engine::tokens::IndexState, width: usize) -> Vec<Line<'static>> {
@@ -1197,7 +1175,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             Item::Row { repeat } => {
                 let row = table.row(&report.rows[index], repeat && n > 0);
                 if Some(index) == selected_at {
-                    highlight(state.theme, row, width)
+                    highlight(row, width, state.theme)
                 } else {
                     row
                 }
