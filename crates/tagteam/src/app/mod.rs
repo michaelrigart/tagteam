@@ -6,7 +6,6 @@ use tagteam_engine::purge::KEYCHAIN_ORPHANS_WITH_PROVIDER;
 use tagteam_engine::service::ServiceKind;
 use tagteam_engine::{Engine, EngineError};
 use tagteam_provider::keychain::ReadCounts;
-use tagteam_provider::profile::RunShell;
 use tagteam_provider::{Keychain, LockState, Platform};
 
 use crate::cli::{Cli, Command};
@@ -326,14 +325,18 @@ impl App<'_, '_> {
             if *keychain_orphans && self.provider_flag.is_some() {
                 return Err(Failure::Usage(KEYCHAIN_ORPHANS_WITH_PROVIDER.into()));
             }
-            if matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
-                return Err(EngineError::InsideRunShell.into());
-            }
+            self.refuse_in_run_shell()?;
         }
         if command.touches_keychain_only_with_a_store() && self.engine.existing_store()?.is_none() {
             return Ok(());
         }
         self.ensure_unlocked()
+    }
+
+    /// §12.8: the engine's refusal inside a run shell, shared by every command that changes
+    /// accounts or the live login.
+    fn refuse_in_run_shell(&self) -> Result<(), Failure> {
+        Ok(self.engine.refuse_inside_run_shell()?)
     }
 
     /// Appendix A.3, before the command touches anything. On a terminal, a locked keychain is
