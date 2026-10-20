@@ -8,11 +8,10 @@ use tagteam_daemon::notify::Backend;
 use tagteam_daemon::scheduler::{ThreadSleeper, uniform_jitter};
 use tagteam_daemon::service::{self as daemon_service, InstallError, MANAGER_TIMEOUT};
 use tagteam_daemon::watch::{ProgramStamp, UPGRADE_WATCH_MS};
+use tagteam_engine::Engine;
 use tagteam_engine::daemon::{daemon_lock_path, read_daemon_record};
 use tagteam_engine::service::{recorded_env, render_unit, service_state, unit_path};
 use tagteam_engine::settings::parse_bool;
-use tagteam_engine::{Engine, EngineError};
-use tagteam_provider::profile::RunShell;
 use tagteam_provider::{Platform, Read};
 
 use crate::auto::{HumanSink, JsonSink};
@@ -150,8 +149,8 @@ impl App<'_, '_> {
     /// shell, except with `--dry-run` (§11.1); `run_command` has run the Keychain check. Events
     /// go to stdout as human lines or JSONL (§11.4), warnings and errors to stderr.
     fn auto(&mut self, run: AutoRun) -> Result<i32, Failure> {
-        if !run.dry_run && matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
-            return Err(EngineError::InsideRunShell.into());
+        if !run.dry_run {
+            self.refuse_in_run_shell()?;
         }
         let several = auto::providers(&self.engine, run.provider.as_ref())?.len() > 1;
         let color = self.color();
@@ -186,9 +185,7 @@ impl App<'_, '_> {
     /// It refuses inside a run shell, whose environment is a session's, not the one the daemon
     /// should keep: `--print` too, since what it prints would record that environment.
     fn daemon_install(&mut self, print: bool, no_start: bool) -> Result<i32, Failure> {
-        if matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
-            return Err(EngineError::InsideRunShell.into());
-        }
+        self.refuse_in_run_shell()?;
         let env = self.engine.env().clone();
         let kind = self.service();
         let program = service_cmd::install_program(&env).map_err(|e| {
@@ -228,9 +225,7 @@ impl App<'_, '_> {
     /// nothing and succeeds; with no file but a unit still loaded, it stops that (D9.4). It
     /// refuses inside a run shell, as `install` does.
     fn daemon_uninstall(&mut self) -> Result<i32, Failure> {
-        if matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
-            return Err(EngineError::InsideRunShell.into());
-        }
+        self.refuse_in_run_shell()?;
         let env = self.engine.env().clone();
         let kind = self.service();
         let spawner = self.engine.spawner();
@@ -282,9 +277,7 @@ impl App<'_, '_> {
             daemon_cmd::program(self.engine.env().var("PATH")),
             &hook,
         ));
-        if matches!(self.engine.run_shell(), RunShell::Inside { .. }) {
-            return Err(EngineError::InsideRunShell.into());
-        }
+        self.refuse_in_run_shell()?;
         if self.io.prompter.interactive() {
             self.ensure_unlocked()?;
         }

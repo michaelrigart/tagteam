@@ -317,8 +317,8 @@ impl Engine {
     }
 
     /// §12.8: commands that change accounts or the live login refuse inside a run shell, and
-    /// under a marker that cannot be read, which the refusal names.
-    pub(crate) fn refuse_inside_run_shell(&self) -> Result<(), EngineError> {
+    /// under a marker that cannot be read, which the refusal names. The CLI's commands call it.
+    pub fn refuse_inside_run_shell(&self) -> Result<(), EngineError> {
         match &self.run_shell {
             RunShell::Inside { .. } => Err(EngineError::InsideRunShell),
             RunShell::Outside | RunShell::Unreadable { .. } => self.refuse_unreadable_run_shell(),

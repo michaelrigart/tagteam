@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use tagteam_engine::EngineError;
 use tagteam_engine::export::ExportRequest;
 use tagteam_engine::transfer::{self, Encryption, Need, Recipient, SecretString};
-use tagteam_provider::profile::RunShell;
 
 use crate::{prompt, transfer_cmd};
 
@@ -168,9 +167,7 @@ impl App<'_, '_> {
         force: bool,
         identity: &[PathBuf],
     ) -> Result<i32, Failure> {
-        if let RunShell::Inside { .. } = self.engine.run_shell() {
-            return Err(EngineError::InsideRunShell.into());
-        }
+        self.refuse_in_run_shell()?;
         let input = if file == "-" {
             if std::io::stdin().is_terminal() {
                 return Err(Failure::Usage(IMPORT_FROM_TERMINAL.into()));
