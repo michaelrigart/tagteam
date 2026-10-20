@@ -219,6 +219,41 @@ fn three_shows_history_and_one_the_accounts_again() {
 }
 
 #[test]
+fn a_burst_of_keys_in_one_write_is_handled_whole() {
+    // crossterm reads both keys at once and hands them out one by one: the second waits in
+    // its queue, where no wait on the terminal sees it.
+    let home = Home::new();
+    let mut tui = home.tui(&["tui"]);
+    tui.wait_for(LONG, "the accounts table", accounts);
+    tui.type_keys(b"23");
+    tui.wait_for(Duration::from_secs(2), "History", |s| {
+        s.on_alt() && s.contains("No usage history.")
+    });
+    tui.type_keys(b"q");
+    assert_eq!(tui.finish(LONG).status.code(), Some(0));
+}
+
+#[test]
+fn a_resize_while_idle_redraws_at_the_new_size() {
+    let home = Home::new();
+    let mut tui = home.tui(&["tui"]);
+    tui.wait_for(LONG, "the accounts table", accounts);
+    tui.resize(100, 30);
+    tui.wait_for(
+        Duration::from_secs(2),
+        "the footer on the new last row",
+        |s| {
+            s.text()
+                .split('\n')
+                .nth(29)
+                .is_some_and(|row| row.starts_with("s switch"))
+        },
+    );
+    tui.type_keys(b"q");
+    assert_eq!(tui.finish(LONG).status.code(), Some(0));
+}
+
+#[test]
 fn two_shows_the_token_report_and_one_the_accounts_again() {
     // Spec §5.3, §6.4: the index is refreshed after the first frame, and the report read from
     // it on the report lane.

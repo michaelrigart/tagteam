@@ -15,14 +15,17 @@ tagteam-daemon.workspace = true
 crossterm.workspace = true
 jiff.workspace = true
 libc.workspace = true
+mio.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
+signal-hook-mio.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
 tagteam-provider = { workspace = true, features = ["test-doubles"] }
 tagteam-cc.workspace = true
 tagteam-fake.workspace = true
+signal-hook.workspace = true
 tempfile.workspace = true
 
 [lints]
