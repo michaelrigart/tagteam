@@ -21,7 +21,6 @@ use crate::refresh::{
 use crate::rescue::{RescueEntry, RescueFile};
 use crate::store::AccountRow;
 use crate::switch::{Held, OracleHint, answer_for, refuse_unreadable};
-use tagteam_provider::security::hold_warnings;
 
 /// §7.5 step 5: how long the token request may take while CC's credential locks are held
 /// (§4.3's second bounded exception).
@@ -350,11 +349,6 @@ impl Engine {
                 let owned = cred.check_owned().is_ok();
                 // Task 11's shared step: the vault, else `rescue/`, else reported as lost.
                 let persisted = self.persist_received(p, row, lock, &mut received);
-                // When neither store took it, the live write below is the successor's last
-                // durable copy, and it exists only in memory until that write lands: the argv
-                // fallback's WARN is held across it (§7.3 step 6, §7.5 step 5). Declared before
-                // `pending`, so a panic records the loss first and then releases it.
-                let publish_hold = (persisted == Persisted::Unpersisted).then(hold_warnings);
                 // `persist_received` disarmed `received`. When neither store took the
                 // successor, the live write below is its last home, so the loss stays armed
                 // until that write lands: a panic in between still records it (§7.3 step 6).
@@ -378,7 +372,6 @@ impl Engine {
                 };
                 // Settled below either way: published, or recorded by `record_loss`.
                 pending.armed = false;
-                drop(publish_hold);
                 // A loss takes precedence over everything else (§7.3 step 6). But a successor
                 // the live store holds is not lost: CC has it, and the next pass adopts it into
                 // the vault (§7.5 step 3). Only one held nowhere is recorded, as the gate
