@@ -2,10 +2,11 @@
 //! prompts, and what an action's outcome shows.
 
 use crossterm::event::{KeyCode, KeyEvent};
+use tagteam_engine::switch::UsageStrategy;
 use tagteam_engine::words;
 
 use crate::daemon;
-use crate::host::{Action, ActionOutcome, Strategy};
+use crate::host::{Action, ActionOutcome};
 use crate::msg::{Answer, AnswerTo, Cmd, Prompt, PromptKind};
 use crate::overlay::{ConfirmThen, Overlay, TextThen};
 use crate::screens;
@@ -149,9 +150,9 @@ fn account_key(state: &mut State, c: char, now_ms: i64) -> Vec<Cmd> {
         's' => start(state, Action::Switch(account), now_ms),
         'b' | 'n' => {
             let strategy = if c == 'b' {
-                Strategy::Best
+                UsageStrategy::Best
             } else {
-                Strategy::NextAvailable
+                UsageStrategy::NextAvailable
             };
             start(state, Action::SwitchBy { provider, strategy }, now_ms)
         }
@@ -333,14 +334,14 @@ mod tests {
                 'b',
                 Action::SwitchBy {
                     provider: cc(),
-                    strategy: Strategy::Best,
+                    strategy: UsageStrategy::Best,
                 },
             ),
             (
                 'n',
                 Action::SwitchBy {
                     provider: cc(),
-                    strategy: Strategy::NextAvailable,
+                    strategy: UsageStrategy::NextAvailable,
                 },
             ),
             ('e', Action::Disable(sel(1))),

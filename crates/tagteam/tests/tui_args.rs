@@ -4,7 +4,8 @@
 use clap::{CommandFactory, Parser};
 use tagteam::cli::{Cli, Command, StrategyArg};
 use tagteam_core::{AccountId, ProviderId};
-use tagteam_tui::host::{AccountRef, Action, Strategy};
+use tagteam_engine::switch::UsageStrategy;
+use tagteam_tui::host::{AccountRef, Action};
 
 const ID: &str = "0192-abc";
 
@@ -59,8 +60,8 @@ fn switch_enable_disable_and_remove_parse_to_their_commands_at_the_position() {
 #[test]
 fn a_strategy_switch_names_no_account_and_no_guard() {
     for (strategy, expected) in [
-        (Strategy::Best, "best"),
-        (Strategy::NextAvailable, "next-available"),
+        (UsageStrategy::Best, "best"),
+        (UsageStrategy::NextAvailable, "next-available"),
     ] {
         let cli = parse(&Action::SwitchBy {
             provider: provider(),
@@ -80,8 +81,8 @@ fn a_strategy_switch_names_no_account_and_no_guard() {
         assert!(
             matches!(
                 (parsed, strategy),
-                (StrategyArg::Best, Strategy::Best)
-                    | (StrategyArg::NextAvailable, Strategy::NextAvailable)
+                (StrategyArg::Best, UsageStrategy::Best)
+                    | (StrategyArg::NextAvailable, UsageStrategy::NextAvailable)
             ),
             "{expected}"
         );
@@ -202,7 +203,7 @@ fn every_action_name_is_a_subcommand_of_the_cli() {
         Action::Switch(account(1)),
         Action::SwitchBy {
             provider: provider(),
-            strategy: Strategy::Best,
+            strategy: UsageStrategy::Best,
         },
         Action::Enable(account(1)),
         Action::Disable(account(1)),
