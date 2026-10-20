@@ -19,22 +19,20 @@ use tagteam_provider::process::{Captured, ProcessSpawner, SpawnSpec, current_uid
 use tagteam_provider::{Cancel, Env};
 
 use crate::daemon::find_on_path;
+use crate::engine::Engine;
+use crate::registry::ProviderRegistry;
 
 /// D9.2: the agent's label, and its plist's name.
 pub const LAUNCHD_LABEL: &str = "io.github.michaelrigart.tagteam";
 /// D9.3: the user unit's name.
 pub const SYSTEMD_UNIT: &str = "tagteam.service";
 
-/// D9.1: the variables a unit records, in this order, each only when it is set at install time.
-/// They make the daemon resolve the same store, Claude Code home, proxy and log as the shell
-/// that installed it. `PATH` is where it finds `notify-send` (D6.2). No other variable is
-/// recorded.
-pub const RECORDED_VARS: &[&str] = &[
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+/// D9.1: the variables a unit records, in this order, each only when it is set at install time:
+/// the XDG ones, each provider's homes, then the proxies, the log and `PATH`. They make the
+/// daemon resolve the same store, provider homes, proxy and log as the shell that installed it.
+/// `PATH` is where it finds `notify-send` (D6.2). No other variable is recorded.
+const XDG_VARS: [&str; 3] = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"];
+const TAIL_VARS: [&str; 10] = [
     "HTTPS_PROXY",
     "https_proxy",
     "HTTP_PROXY",
@@ -46,6 +44,31 @@ pub const RECORDED_VARS: &[&str] = &[
     "TAGTEAM_LOG",
     "PATH",
 ];
+
+/// D9.1's list for `registry`: `XDG_VARS`, each provider's `vars().unit` in registration order,
+/// each name once, then `TAIL_VARS`.
+pub fn recorded_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
+    let units: Vec<&[&'static str]> = registry.all().iter().map(|p| p.vars().unit).collect();
+    recorded_vars_of(&units)
+}
+
+fn recorded_vars_of(units: &[&[&'static str]]) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = XDG_VARS.to_vec();
+    for name in units.iter().copied().flatten().copied() {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.extend(TAIL_VARS);
+    names
+}
+
+impl Engine {
+    /// D9.1's list for this engine's providers.
+    pub fn recorded_vars(&self) -> Vec<&'static str> {
+        recorded_vars(&self.registry)
+    }
+}
 
 /// What an error calls the program path. A variable is called by its name. Neither error ever
 /// shows the value, because a proxy URL can carry a password.
@@ -143,13 +166,14 @@ pub enum UnitError {
     DollarInProgram(String),
 }
 
-/// D9.1: the variables of `RECORDED_VARS` that `var` finds set, in that order, each with its
-/// value as set, an empty one included. A value that is not UTF-8 cannot go into a unit.
+/// D9.1: the variables of `names` that `var` finds set, in that order, each with its value as
+/// set, an empty one included. A value that is not UTF-8 cannot go into a unit.
 pub fn recorded_env(
+    names: &[&str],
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Vec<(String, String)>, UnitError> {
     let mut recorded = Vec::new();
-    for name in RECORDED_VARS {
+    for name in names {
         if let Some(value) = var(name) {
             let value = value
                 .into_string()
@@ -643,6 +667,7 @@ mod tests {
     use std::fs;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
 
     use tagteam_provider::ScriptedSpawner;
 
@@ -970,8 +995,22 @@ mod tests {
     }
 
     #[test]
+    fn each_provider_s_unit_variables_come_once_between_tagteam_s_own() {
+        assert_eq!(
+            recorded_vars_of(&[&["A", "B"], &["B", "C"]]),
+            [&XDG_VARS[..], &["A", "B", "C"], &TAIL_VARS[..]].concat()
+        );
+    }
+
+    #[test]
     fn recorded_env_keeps_the_list_s_order_and_only_what_is_set() {
         // D9.1: XDG first, then Claude Code's, the proxies, the log and PATH; nothing else.
+        let cc = recorded_vars(&ProviderRegistry::new().with(Arc::new(
+            tagteam_cc::ClaudeCode::new(
+                Arc::new(tagteam_provider::FakeKeychain::new()),
+                tagteam_provider::Platform::MacOs,
+            ),
+        )));
         let set: BTreeMap<&str, OsString> = [
             ("PATH", "/usr/bin"),
             ("HTTPS_PROXY", "http://p:3128"),
@@ -990,7 +1029,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            recorded_env(&|k| set.get(k).cloned()).unwrap(),
+            recorded_env(&cc, &|k| set.get(k).cloned()).unwrap(),
             pairs(&[
                 ("XDG_DATA_HOME", "/d"),
                 ("HTTPS_PROXY", "http://p:3128"),
@@ -999,14 +1038,14 @@ mod tests {
                 ("PATH", "/usr/bin"),
             ])
         );
-        assert_eq!(recorded_env(&|_| None).unwrap(), Vec::new());
+        assert_eq!(recorded_env(&cc, &|_| None).unwrap(), Vec::new());
         let bad = OsString::from_vec(vec![b'/', 0xff]);
         assert_eq!(
-            recorded_env(&|k| (k == "XDG_STATE_HOME").then(|| bad.clone())),
+            recorded_env(&cc, &|k| (k == "XDG_STATE_HOME").then(|| bad.clone())),
             Err(UnitError::NotUtf8("XDG_STATE_HOME".into()))
         );
         assert_eq!(
-            RECORDED_VARS,
+            cc,
             [
                 "XDG_CONFIG_HOME",
                 "XDG_DATA_HOME",

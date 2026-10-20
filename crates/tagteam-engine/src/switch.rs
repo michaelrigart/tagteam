@@ -141,6 +141,9 @@ pub struct SwitchOutcome {
     /// not a stored account held it. CC keeps that key for the life of its process (Appendix
     /// A.7), so the human output says to restart it.
     pub managed_key_replaced: bool,
+    /// What the provider says activates this switch (its `ProviderWords`), chosen from the kinds
+    /// on either side and where the secret went; `None` when nothing was switched.
+    pub activation_hint: Option<&'static str>,
 }
 
 /// §9.4 step 1: after this many lock acquisitions that each found the plan outdated, abort.
@@ -208,6 +211,30 @@ fn noop(
         stored_in: None,
         unmanaged_email,
         managed_key_replaced: false,
+        activation_hint: None,
+    }
+}
+
+/// How a switch reaches the provider's running sessions: a change on the managed-key axis, on
+/// either side or to a live key no account held, reaches only a new process, whichever store the
+/// credential went to; otherwise the store decides.
+fn activation_hint(
+    p: &dyn Provider,
+    from_kind: Option<&str>,
+    to_kind: &str,
+    stored_in: &SecretStore,
+    managed_key_replaced: bool,
+) -> &'static str {
+    let words = p.words();
+    let managed = [from_kind, Some(to_kind)]
+        .into_iter()
+        .flatten()
+        .any(|kind| p.kind_traits(kind).managed_key_axis)
+        || managed_key_replaced;
+    match stored_in {
+        _ if managed => words.after_switch_managed_key,
+        SecretStore::File(_) | SecretStore::Fallback(_) => words.after_switch_file,
+        SecretStore::Keychain => words.after_switch_keychain,
     }
 }
 
@@ -2197,6 +2224,13 @@ impl Engine {
             "Switched to {}",
             target.alias.as_deref().unwrap_or(&target.label)
         );
+        let activation_hint = Some(activation_hint(
+            p,
+            outgoing.as_ref().map(|r| r.kind.as_str()),
+            &target.kind,
+            &stored_in,
+            managed_key_replaced,
+        ));
         Ok(SwitchOutcome {
             switched,
             from: outgoing,
@@ -2208,6 +2242,7 @@ impl Engine {
             stored_in: Some(stored_in),
             unmanaged_email: None,
             managed_key_replaced,
+            activation_hint,
         })
     }
 
@@ -2461,5 +2496,59 @@ impl Engine {
             record.as_ref(),
         )?;
         Ok(stored_in)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{path::PathBuf, sync::Arc};
+
+    #[test]
+    fn the_hint_matrix_is_the_one_the_renderer_used_to_hold() {
+        let cc = tagteam_cc::ClaudeCode::new(
+            Arc::new(tagteam_provider::FakeKeychain::new()),
+            tagteam_provider::Platform::MacOs,
+        );
+        let w = cc.words();
+        let stores = [
+            SecretStore::Keychain,
+            SecretStore::File(PathBuf::from("/c.json")),
+            SecretStore::Fallback(PathBuf::from("/c.json")),
+        ];
+        for store in &stores {
+            for (from, to) in [
+                (Some("oauth"), "api_key"),
+                (Some("api_key"), "oauth"),
+                (Some("api_key"), "api_key"),
+                (None, "api_key"),
+                (Some("setup_token"), "api_key"),
+            ] {
+                assert_eq!(
+                    activation_hint(&cc, from, to, store, false),
+                    w.after_switch_managed_key,
+                    "{from:?} -> {to} via {store:?}"
+                );
+            }
+            assert_eq!(
+                activation_hint(&cc, None, "oauth", store, true),
+                w.after_switch_managed_key,
+                "a live key no account holds, via {store:?}"
+            );
+        }
+        assert_eq!(
+            activation_hint(&cc, Some("oauth"), "setup_token", &stores[0], false),
+            w.after_switch_keychain
+        );
+        assert_eq!(
+            activation_hint(&cc, Some("oauth"), "oauth", &stores[1], false),
+            w.after_switch_file
+        );
+        assert_eq!(
+            activation_hint(&cc, Some("oauth"), "oauth", &stores[2], false),
+            w.after_switch_file
+        );
+        assert_eq!(w.after_switch_managed_key, "Restart Claude Code to apply.");
+        assert_eq!(w.after_switch_file, "Active on your next message.");
     }
 }

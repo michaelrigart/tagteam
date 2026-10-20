@@ -16,8 +16,8 @@ use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, Check, CredLocks, Credential, DoomedEntry, Env,
     FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LineError, LiveAuth,
     LiveChange, LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare,
-    MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, Read, SessionEnv,
-    SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, Validity, Window, Written,
+    MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, ProviderWords, Read,
+    SessionEnv, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, Validity, Window, Written,
 };
 
 use crate::config;
@@ -251,6 +251,21 @@ impl ClaudeCode {
 
 static VARS: ProviderVars = ProviderVars {
     homes: &[env::CONFIG_DIR, env::SECURE_STORAGE_DIR],
+    captured: &["CLAUDECODE", "CLAUDE_CODE_SESSION_ID"],
+    unit: &[env::CONFIG_DIR, env::SECURE_STORAGE_DIR],
+    session_id: Some("CLAUDE_CODE_SESSION_ID"),
+};
+
+static WORDS: ProviderWords = ProviderWords {
+    // Claude Code reloads a credentials-file change on its next message (Appendix A.3).
+    after_switch_file: "Active on your next message.",
+    // Claude Code caches Keychain reads for 30 s (Appendix A.3).
+    after_switch_keychain: "Claude Code picks this up within about 30 s; restart it to apply now.",
+    // Claude Code reads its managed API key once and keeps it for the life of the process
+    // (Appendix A.7), so a switch to or from an API-key account reaches only a new one.
+    after_switch_managed_key: "Restart Claude Code to apply.",
+    supervisor: Some("a Claude Code background daemon"),
+    supervisor_stop: Some("claude daemon stop --any"),
 };
 
 impl Provider for ClaudeCode {
@@ -635,6 +650,10 @@ impl Provider for ClaudeCode {
 
     fn vars(&self) -> &'static ProviderVars {
         &VARS
+    }
+
+    fn words(&self) -> &'static ProviderWords {
+        &WORDS
     }
 
     /// Appendix A.2: the live items are named from `CLAUDE_SECURESTORAGE_CONFIG_DIR` when it is

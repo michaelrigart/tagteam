@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{
-    API_KEY, Fx, OTHER_API_KEY, STRAY_API_KEY, capture_logs, credential, mutation_lock_free,
-    token_requests, usage_fixture,
+    API_KEY, FakeFx, Fx, OTHER_API_KEY, STRAY_API_KEY, capture_logs, credential,
+    mutation_lock_free, token_requests, usage_fixture,
 };
 use serde_json::json;
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
@@ -1904,5 +1904,58 @@ fn forcing_a_switch_to_the_live_account_with_a_pre_branch_vault_item_displaces_n
         !out.warnings.iter().any(|w| w.contains("displaced/")),
         "{:?}",
         out.warnings
+    );
+}
+
+#[test]
+fn the_activation_hint_is_the_provider_s_words_for_the_axis_and_the_store() {
+    const KEYCHAIN: &str = "Claude Code picks this up within about 30 s; restart it to apply now.";
+    const MANAGED: &str = "Restart Claude Code to apply.";
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live
+    let k = fx.add_api_key(API_KEY);
+    assert_eq!(
+        switch(&fx, to(&a), false).unwrap().activation_hint,
+        Some(KEYCHAIN)
+    );
+    assert_eq!(
+        switch(&fx, to(&k), false).unwrap().activation_hint,
+        Some(MANAGED),
+        "to an API key"
+    );
+    assert_eq!(
+        switch(&fx, to(&b), false).unwrap().activation_hint,
+        Some(MANAGED),
+        "from an API key"
+    );
+    fx.put_managed_key(STRAY_API_KEY.as_bytes());
+    assert_eq!(
+        switch(&fx, to(&a), false).unwrap().activation_hint,
+        Some(MANAGED),
+        "a live key no account holds"
+    );
+    assert_eq!(
+        switch(&fx, to(&a), false).unwrap().activation_hint,
+        None,
+        "already active: nothing switched"
+    );
+    let linux = Fx::with_platform(tagteam_cc::live::Platform::Linux);
+    let c = linux.add("c@x.co", "rt-c");
+    linux.add("d@x.co", "rt-d");
+    assert_eq!(
+        switch(&linux, to(&c), false).unwrap().activation_hint,
+        Some("Active on your next message.")
+    );
+}
+
+#[test]
+fn a_fake_agent_switch_takes_its_hint_from_fake_agent() {
+    let f = FakeFx::new();
+    let x = f.fake_add("x", "tok-x", "renew-x");
+    f.fake_add("y", "tok-y", "renew-y");
+    assert_eq!(
+        f.switch_fake(&x).activation_hint,
+        Some("FakeAgent reads the new login when it next starts.")
     );
 }

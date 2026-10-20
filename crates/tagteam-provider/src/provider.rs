@@ -217,6 +217,27 @@ pub struct ProviderVars {
     /// The variables the provider locates its homes and Keychain items with; their effective
     /// values live in `Env.homes`.
     pub homes: &'static [&'static str],
+    /// Variables the binary captures into `Env.vars` at start-up.
+    pub captured: &'static [&'static str],
+    /// Variables a service unit records (D9.1), beside tagteam's own.
+    pub unit: &'static [&'static str],
+    /// The variable a running session exports with its session id, if any.
+    pub session_id: Option<&'static str>,
+}
+
+/// The sentences a provider contributes to tagteam's output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderWords {
+    /// What a switch tells the user when the login lives in a file.
+    pub after_switch_file: &'static str,
+    /// What a switch tells the user when the login lives in the Keychain.
+    pub after_switch_keychain: &'static str,
+    /// What a switch tells the user when it changes the managed API key.
+    pub after_switch_managed_key: &'static str,
+    /// The provider's background supervisor, as a sentence names it, article included.
+    pub supervisor: Option<&'static str>,
+    /// The command that stops it.
+    pub supervisor_stop: Option<&'static str>,
 }
 
 /// What the engine and the CLI need to know about one credential kind, so neither ever names a
@@ -722,6 +743,8 @@ pub trait Provider: Send + Sync {
     fn session_dir(&self, env: &Env) -> Option<PathBuf>;
     /// The process variables this provider reads (CC: its two home variables).
     fn vars(&self) -> &'static ProviderVars;
+    /// The sentences this provider contributes to tagteam's output.
+    fn words(&self) -> &'static ProviderWords;
     /// The spelling the live login's Keychain item name is derived from in `env` (§12.2), when
     /// that name is derived from one: the string `profile_spelling` gives a profile whose item
     /// it would be. Purge compares it with an orphaned profile's, so it never deletes the live
