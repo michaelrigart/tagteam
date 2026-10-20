@@ -156,14 +156,12 @@ impl TokensState {
         &self.tz
     }
 
-    pub fn period(&self) -> TokenPeriod {
-        self.period
-    }
-
+    #[cfg(test)]
     pub fn grouping(&self) -> TokenGrouping {
         self.grouping
     }
 
+    #[cfg(test)]
     pub fn range(&self) -> Range {
         self.range
     }
@@ -195,6 +193,7 @@ impl TokensState {
     }
 
     /// The index's state and the TUI's refresh of it.
+    #[cfg(test)]
     pub fn watch(&self) -> &IndexWatch {
         &self.watch
     }

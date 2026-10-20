@@ -25,7 +25,6 @@ pub enum Overlay {
     Help,
     Confirm {
         question: String,
-        default_yes: bool,
         choice: bool,
         then: ConfirmThen,
     },

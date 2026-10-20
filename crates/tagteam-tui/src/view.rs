@@ -703,7 +703,6 @@ mod tests {
         let mut state = fresh(Screen::Accounts);
         state.overlay = Some(Overlay::Confirm {
             question: "Remove 2 b@x.co?".into(),
-            default_yes: false,
             choice: false,
             then: ConfirmThen::Reply(AnswerTo(1)),
         });
