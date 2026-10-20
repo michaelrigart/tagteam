@@ -125,8 +125,7 @@ The TUI is an Elm-style loop.
 - **The UI thread** owns the terminal. It blocks on one `Msg` channel with a 250 ms timeout,
   checks the signal token on every wake (§10.2), runs `update`, executes the returned commands,
   and redraws only when the state changed.
-- **The input thread** turns crossterm events into `Msg`s. It polls with a short timeout, so it
-  can be paused and acknowledge the pause before the terminal is handed back (§7.3).
+- **The input thread** turns crossterm events into `Msg`s. It waits on the terminal, on SIGWINCH and on a waker the UI thread uses to pause, resume or stop it, so it makes no wake-up while idle and acknowledges a pause at once (§7.3). *(Amended by the TUI redesign spec §14, PERF-R-9.)*
 - **Five lanes.** The four engine lanes each own an `Engine` that the binary's factory builds
   from the same `Context`, so `Engine` never needs to be `Sync`. Each lane's engine takes the shutdown token
   as its cancel token, never the signal token (§2). A Ctrl-C meant for a foreground action
