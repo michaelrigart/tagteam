@@ -40,8 +40,10 @@ impl App<'_, '_> {
         self.ensure_unlocked()?;
         let (launched, launch) = match self.engine.launch(&account, &launch, &cwd) {
             Ok(launched) => (launched, launch),
-            // The target changed under the launch's locks (§12.5 step 1). Plan once more and act
-            // on that plan; a second change is this command's error, never a loop.
+            // The target changed under the launch's locks (§12.5 step 1). `launch` cannot run
+            // plain `claude` itself (it knows neither `--require-session` nor the plain spec), so
+            // plan once more and act on that plan; a second change is this command's error, never
+            // a loop.
             Err(EngineError::TargetChanged { why }) => {
                 self.io.warn(&why);
                 match self.engine.plan_run(&request)? {

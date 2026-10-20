@@ -78,7 +78,7 @@ enum Ended {
 /// Runs one command and returns its exit code (§13.1). A signal the command met at a
 /// cancellation point ends it with 128 + the signal and the `interrupted` error;
 /// one it never met leaves its output and exit code alone and is reported on stderr as too
-/// late. `run` ends with its child's code once the child has run.
+/// late (§14.1). `run` ends with its child's code once the child has run.
 pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     let json = cli.json;
     let name = cli.command.as_ref().map_or("list", command_name);

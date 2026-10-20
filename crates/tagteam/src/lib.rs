@@ -108,8 +108,8 @@ fn refuse_then_init_logging(
 /// Parses the command line, or returns the exit code of a usage error, help or the version.
 fn parse_args(args: &[OsString]) -> Result<cli::Cli, i32> {
     // B.36: `--json` promises one JSON object, but only tagteam's own flag does. An argument
-    // after `--` belongs to the agent `run` launches, since nothing after it is tagteam's, and
-    // is never the flag.
+    // after `--` belongs to the agent `run` launches, since clap hands everything after it to
+    // the agent (`last = true`), and is never the flag.
     let json = args
         .iter()
         .take_while(|a| *a != "--")
