@@ -19,9 +19,10 @@ const COMPLETIONS_UNDER_JSON: &str = "completions prints a script; run it withou
 /// §13.5's fast path, taken before `build_engine`: no lock check, no settings warnings (a status
 /// bar has nowhere to show them), and an engine walled off from the Keychain and the network
 /// (`statusline::engine`), which detects the run shell itself and resolves the provider in
-/// Decision 13's order. An unreadable marker shows nothing and exits 0 (§12.8). Once the line
-/// is out, it records its session as evidence for the token report (token report spec §6.3).
-/// `main_with_args` has already drained stdin.
+/// the statusline's order (`--provider`, the run shell's marker, the provider that says it
+/// started this process, then the default; §13.5). An unreadable marker shows nothing and
+/// exits 0 (§12.8). Once the line is out, it records its session as evidence for the token
+/// report (token report spec §6.3). `main_with_args` has already drained stdin.
 pub(super) fn run_statusline(
     ctx: Context,
     io: &mut Io<'_>,

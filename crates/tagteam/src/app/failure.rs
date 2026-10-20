@@ -30,7 +30,8 @@ pub(super) const KIND_UNSUPPORTED: &str = "unsupported";
 pub(super) const KIND_ENGINE_RUNNING: &str = "engine-running";
 /// `auto` found no provider with two switchable accounts.
 pub(super) const KIND_NO_CANDIDATES: &str = "no-candidates";
-/// §14.1, Decision 4: every interruption, whichever carrier holds its signal.
+/// §14.1: every interruption, whichever carrier holds its signal (a lock wait, another
+/// cancellation point, or a provider's lock error).
 pub(crate) const KIND_INTERRUPTED: &str = "interrupted";
 /// A deletion that needs a person's yes, or `--yes` (§6.3).
 pub(super) const KIND_NEEDS_CONFIRMATION: &str = "needs-confirmation";

@@ -40,7 +40,7 @@ impl App<'_, '_> {
         self.ensure_unlocked()?;
         let (launched, launch) = match self.engine.launch(&account, &launch, &cwd) {
             Ok(launched) => (launched, launch),
-            // Decision 14: the target changed under the launch's locks. Plan once more and act
+            // The target changed under the launch's locks (§12.5 step 1). Plan once more and act
             // on that plan; a second change is this command's error, never a loop.
             Err(EngineError::TargetChanged { why }) => {
                 self.io.warn(&why);
@@ -53,7 +53,7 @@ impl App<'_, '_> {
             }
             Err(e) => return Err(e.into()),
         };
-        // Decision 18: the environment warnings are among them, computed by the engine.
+        // The environment warnings are among them, computed by the engine (§12.5).
         for w in &launched.warnings {
             self.io.warn(w);
         }
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn run_hands_everything_after_the_double_dash_to_the_agent() {
         use clap::Parser;
-        // Decision 8: tagteam's options come before `--`, and nothing after it is tagteam's.
+        // Tagteam's options come before `--`, and nothing after it is tagteam's.
         let cli = Cli::try_parse_from([
             "tagteam",
             "run",

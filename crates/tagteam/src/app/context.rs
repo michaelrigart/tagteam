@@ -37,8 +37,8 @@ const TEST_KEYCHAIN_DIR: &str = "TAGTEAM_TEST_KEYCHAIN_DIR";
 const TEST_PLATFORM: &str = "TAGTEAM_TEST_PLATFORM";
 #[cfg(any(test, feature = "test-support"))]
 const TEST_API_BASE: &str = "TAGTEAM_TEST_API_BASE";
-/// A keychain file for the vault alone (Decision 16): `cargo xtask compat` keeps its test
-/// account's vault there while Claude Code's items stay in the login keychain.
+/// A keychain file for the vault alone, and for nothing else: `cargo xtask compat` keeps its
+/// test account's vault there while Claude Code's items stay in the login keychain.
 #[cfg(any(test, feature = "test-support"))]
 const TEST_VAULT_KEYCHAIN: &str = "TAGTEAM_TEST_VAULT_KEYCHAIN";
 
@@ -123,15 +123,16 @@ impl Context {
             no_color_env: env_flag(NO_COLOR),
             force_color_env: env_flag(FORCE_COLOR),
         };
-        // Decision 5: the variables this build's providers asked for, captured here at the
-        // process boundary and never in `run`, so a hand-built `Context` carries exactly the
+        // The variables this build's providers asked for, captured here at the process
+        // boundary and never in `run`, so a hand-built `Context` carries exactly the
         // `vars` its test set (§15.1). Building the registry touches no Keychain item.
         let registry = build_registry(&ctx);
         ctx.env.capture_homes(&home_vars(&registry));
         let names = session_vars(&registry);
         ctx.env.capture_vars(&names);
-        // Decision 18: which of the variables a session scrubs are set here, for the launch's
-        // warnings (§12.5). Only their presence is kept, never a value: a value may be a login.
+        // Which of the variables a session scrubs are set here, for the launch's warnings
+        // (§12.5), which the engine computes from this record. Only their presence is kept,
+        // never a value: a value may be a login.
         // `Env`'s `Debug` prints `vars`' names only, so a later capture of values (the proxy
         // URLs below) cannot leak through `{:?}`.
         for name in scrubbed_vars(&registry) {
@@ -216,10 +217,10 @@ pub(crate) fn home_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
     names
 }
 
-/// The variables `Context::from_process` captures into `Env.vars` (Decision 5): every variable
-/// `registry`'s providers name a profile with (§4.5 `session_dir_var`), then each provider's
-/// `vars().captured`, then `PATH`, which `plan_run` looks the launch command up on (§12.1). Each
-/// name comes once.
+/// The variables `Context::from_process` captures into `Env.vars`, at the process boundary
+/// alone: every variable `registry`'s providers name a profile with (§4.5 `session_dir_var`),
+/// then each provider's `vars().captured`, then `PATH`, which `plan_run` looks the launch
+/// command up on (§12.1). Each name comes once.
 pub(crate) fn session_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
     let mut names: Vec<&'static str> = Vec::new();
     let named = registry.all().iter().filter_map(|p| p.session_dir_var());
@@ -236,7 +237,7 @@ pub(crate) fn session_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
 }
 
 /// The variables a session of `registry`'s providers scrubs (§12.5), by name: the names whose
-/// presence `Context::from_process` records for the launch's warnings (Decision 18). Claude
+/// presence `Context::from_process` records for the launch's warnings (§12.5). Claude
 /// Code's `CLAUDE_CODE_*_FILE_DESCRIPTOR` names are among them as this process's environment
 /// holds them, since `session_env` expands the pattern against it. A name that is not UTF-8
 /// cannot be a key of `Env.vars`, so it is left out: it is still scrubbed, without a warning.
@@ -244,7 +245,7 @@ pub(crate) fn session_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
 /// Inside a run shell, the run shell's detection rewrites a recorded
 /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` to the outer home's record, or drops it where the outer
 /// home had none, so the launch warns about that variable as the outer home set it. That is
-/// accepted: `run` launches as from the outer home (Decision 13), and the variable names a
+/// accepted: `run` launches as from the outer home, and the variable names a
 /// directory, never a login.
 pub(crate) fn scrubbed_vars(registry: &ProviderRegistry) -> Vec<String> {
     registry
@@ -257,8 +258,8 @@ pub(crate) fn scrubbed_vars(registry: &ProviderRegistry) -> Vec<String> {
 }
 
 /// §12.8: where this process stands. The marker decides the run shell and the environment the
-/// engine runs on (Decision 6). It only detects: the variables are already in `env.vars`,
-/// captured at the process boundary (`Context::from_process`).
+/// engine runs on, detected once at construction. It only detects: the variables are already
+/// in `env.vars`, captured at the process boundary (`Context::from_process`).
 pub(crate) fn locate(env: Env, registry: &ProviderRegistry) -> (RunShell, Env) {
     detect_run_shell(&env, registry)
 }
@@ -306,15 +307,15 @@ pub(crate) fn engine_for(
 pub(crate) struct CommandSettings {
     /// The provider the command acts on. Its own tables came first.
     pub(crate) provider: ProviderId,
-    /// `default_provider` when this build has it, else the registry's first provider (§13.1,
-    /// Decision 2).
+    /// `default_provider` when this build has it, else the registry's first provider (§13.1;
+    /// a provider this build lacks warns and falls back).
     pub(crate) default: ProviderId,
     pub(crate) settings: Settings,
     /// The settings warnings, then the CLI's own for a `default_provider` this build lacks.
     pub(crate) warnings: Vec<String>,
 }
 
-/// §13.1's rule 3 and Decision 2: without `--provider`, a command acts on `default_provider`
+/// §13.1's rule 3: without `--provider`, a command acts on `default_provider`
 /// when `registered` has it, and on `fallback`, the registry's first provider, otherwise: with a
 /// warning when the file names one this build lacks. `choose` is given that default and names
 /// the provider the command acts on. `default_provider` sits at the top level, so any provider's
@@ -753,7 +754,7 @@ mod tests {
 
     #[test]
     fn the_process_boundary_captures_every_session_variable_and_claudecode() {
-        // Decision 5: `Context::from_process` captures these names, and only it does, so a
+        // `Context::from_process` captures these names, and only it does, so a
         // hand-built `Context` carries exactly the `vars` its test set (§15.1).
         let dir = tempfile::tempdir().unwrap();
         let ctx = Context {
@@ -783,7 +784,7 @@ mod tests {
 
     #[test]
     fn the_boundary_records_the_variables_a_session_scrubs_and_never_its_home() {
-        // Decision 18: the names `Context::from_process` records the presence of, for the
+        // The names `Context::from_process` records the presence of, for the
         // launch's environment warnings (§12.5).
         let dir = tempfile::tempdir().unwrap();
         let ctx = Context {

@@ -240,8 +240,8 @@ impl App<'_, '_> {
 
     /// D8.2: the daemon's own `status` from its socket, else what its lock and its service
     /// say. It exits 0 when a daemon runs, 3 when none does, and 1 on an error. `--json`
-    /// prints its object either way (plan B Decision 6). It is read-only, so it answers inside
-    /// a run shell too.
+    /// prints its object either way, with the same exit codes. It is read-only, so it answers
+    /// inside a run shell too.
     fn daemon_status(&mut self) -> Result<i32, Failure> {
         let env = self.engine.env().clone();
         let kind = self.service();
@@ -261,18 +261,18 @@ impl App<'_, '_> {
         })
     }
 
-    /// D8.1: `tagteam daemon` in the foreground. It stamps its program file first (Decision
-    /// 17). Like `auto`, it refuses inside a run shell (D4.1 step 1). On a terminal it runs
-    /// Appendix A.3's check and offers to unlock, as `auto` does. Without a terminal it runs
-    /// none: a service has nobody to answer, and the check can block on a SecurityAgent dialog
-    /// (D4.1 step 3, Decision 14). It exits 0 once a signal stops it, and 75 once a newer
-    /// tagteam must take over (D4.5).
+    /// D8.1: `tagteam daemon` in the foreground. It stamps its program file first, before
+    /// anything that can wait. Like `auto`, it refuses inside a run shell (D4.1 step 1). On a
+    /// terminal it runs Appendix A.3's check and offers to unlock, as `auto` does. Without a
+    /// terminal it runs none: a service has nobody to answer, and the check can block on a
+    /// SecurityAgent dialog (D4.1 step 3). It exits 0 once a signal stops it, and 75 once a
+    /// newer tagteam must take over (D4.5).
     pub(in crate::app) fn daemon(&mut self) -> Result<i32, Failure> {
         // A test-support build's hooks; a release build ignores them.
         let hook = |k: &str| std::env::var_os(k);
-        // D4.5, Decision 17: before anything that can wait (the unlock offer, the
-        // `daemon.lock` wait), so a binary replaced meanwhile is an upgrade at the upgrade
-        // watch's first run, never this daemon's own baseline.
+        // D4.5: the upgrade watch's baseline is stamped first, before anything that can wait
+        // (the unlock offer, the `daemon.lock` wait), so a binary replaced meanwhile is an
+        // upgrade at the upgrade watch's first run, never this daemon's own baseline.
         let program = ProgramStamp::take(daemon_cmd::test_program(
             daemon_cmd::program(self.engine.env().var("PATH")),
             &hook,

@@ -85,9 +85,9 @@ impl App<'_, '_> {
     }
 
     /// The login the run shell's profile holds, as its provider reads it in the profile's
-    /// directory, where the marker was found (Decision 19): its email, else its label. Only
-    /// `status`'s text asks, for an account tagteam does not manage; §13.2's JSON has
-    /// `session: null`, and `statusline` never parses a profile (§13.5).
+    /// directory, where the marker was found, not under the spelling it records: its email, else
+    /// its label. Only `status`'s text asks, for an account tagteam does not manage; §13.2's
+    /// JSON has `session: null`, and `statusline` never parses a profile (§13.5).
     fn session_login(&self) -> Option<String> {
         let RunShell::Inside { profile, marker } = self.engine.run_shell() else {
             return None;
@@ -393,7 +393,7 @@ impl App<'_, '_> {
 
     /// §9: a direct switch to ACCOUNT, a bare rotation, or a usage strategy (§9.3) with its
     /// `--model` override. clap has already refused `--strategy` with an ACCOUNT and `--model`
-    /// without `--strategy` (Decision 7).
+    /// without `--strategy` (both are usage errors, exit 2).
     pub(in crate::app) fn switch(
         &mut self,
         account: Option<String>,
