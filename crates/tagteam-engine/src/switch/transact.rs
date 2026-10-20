@@ -59,10 +59,10 @@ struct Preflight {
 }
 
 /// What `apply` activates: the target and its login, and the outgoing account it names.
-pub(super) struct ApplyStep<'a> {
-    pub(super) target: &'a AccountRow,
-    pub(super) login: &'a StoredLogin,
-    pub(super) outgoing: Option<&'a AccountRow>,
+struct ApplyStep<'a> {
+    target: &'a AccountRow,
+    login: &'a StoredLogin,
+    outgoing: Option<&'a AccountRow>,
 }
 
 /// What `rederive` found under the locks.

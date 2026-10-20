@@ -155,11 +155,11 @@ pub(super) fn attributed<'i>(
 /// saved secret may be attributed to.
 pub(crate) struct Settle<'a> {
     pub(crate) p: &'a dyn Provider,
-    pub(crate) provider: &'a ProviderId,
+    pub(super) provider: &'a ProviderId,
     pub(crate) held: Held,
-    pub(crate) force: bool,
-    pub(crate) live_identity: Option<&'a Identity>,
-    pub(crate) own_secret: Option<&'a [u8]>,
+    pub(super) force: bool,
+    pub(super) live_identity: Option<&'a Identity>,
+    pub(super) own_secret: Option<&'a [u8]>,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -217,7 +217,7 @@ impl<'a> Settle<'a> {
     /// carries nothing account-scoped: an entry holding only machine-shared keys loses nothing,
     /// since those are carried over. The error is the failed save; whether it aborts is the
     /// caller's call (B.5: it does, except under --force).
-    pub(crate) fn displace_live(
+    pub(super) fn displace_live(
         &mut self,
         engine: &Engine,
         bytes: &[u8],

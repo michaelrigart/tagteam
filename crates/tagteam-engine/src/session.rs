@@ -208,7 +208,8 @@ impl Engine {
     /// with sessions when it has no readable marker. It started at the directory's birth time,
     /// or 0 when the filesystem reports none, and is in use as core §12.6 judges it. `None`
     /// when `sessions/` or an entry of it cannot be read: a profile may have gone unlisted, so
-    /// the epoch records `seeded = 0` (ruling R1). No `sessions/` at all is no profile.
+    /// the epoch records `seeded = 0` (the token report's ruling R1). No `sessions/` at all is
+    /// no profile.
     pub(crate) fn seed_launches(&self) -> Option<Vec<SeedLaunch>> {
         let entries = match fs::read_dir(self.env.data_dir().join("sessions")) {
             Ok(entries) => entries,
