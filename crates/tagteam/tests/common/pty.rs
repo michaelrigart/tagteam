@@ -30,6 +30,8 @@ pub struct Pty {
     master: File,
     slave: OwnedFd,
     written: Arc<Mutex<Written>>,
+    /// Its size now, in columns and rows: `COLS`×`ROWS` until `resize`.
+    size: Mutex<(u16, u16)>,
 }
 
 /// What the program wrote, and when each chunk of it was read.
@@ -115,12 +117,21 @@ impl Pty {
             master,
             slave,
             written,
+            size: Mutex::new((COLS, ROWS)),
         }
     }
 
     /// Types `keys` at the terminal.
     pub fn type_keys(&self, keys: &[u8]) {
         (&self.master).write_all(keys).unwrap();
+    }
+
+    /// Resizes the terminal to `cols`×`rows`, as a terminal emulator does when its window
+    /// changes size: the kernel sends SIGWINCH to the foreground process group. `screen` then
+    /// emulates at the new size.
+    pub fn resize(&self, cols: u16, rows: u16) {
+        set_size(&self.master, cols, rows);
+        *self.size.lock().unwrap() = (cols, rows);
     }
 
     /// Sends `signal` to the program alone, as `kill` does.
@@ -133,7 +144,8 @@ impl Pty {
 
     /// What the terminal shows now.
     pub fn screen(&self) -> Screen {
-        Screen::of(&self.written.lock().unwrap().bytes, COLS, ROWS)
+        let (cols, rows) = *self.size.lock().unwrap();
+        Screen::of(&self.written.lock().unwrap().bytes, cols, rows)
     }
 
     /// Everything the program has written so far.
@@ -292,16 +304,22 @@ fn open_pty() -> (OwnedFd, OwnedFd) {
         let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
         assert_eq!(rc, 0, "fcntl: {}", std::io::Error::last_os_error());
     }
+    set_size(&master, COLS, ROWS);
+    (master, slave)
+}
+
+/// Sets the size of the pty whose master is `master`. Once it has a foreground process group,
+/// the kernel sends that group SIGWINCH.
+fn set_size(master: &impl AsRawFd, cols: u16, rows: u16) {
     let size = libc::winsize {
-        ws_row: ROWS,
-        ws_col: COLS,
+        ws_row: rows,
+        ws_col: cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
     // SAFETY: `size` is one valid winsize, which ioctl(2) reads for the duration of the call.
     let rc = unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ as _, &size) };
     assert_eq!(rc, 0, "TIOCSWINSZ: {}", std::io::Error::last_os_error());
-    (master, slave)
 }
 
 /// A terminal's two screens as a small emulator reads what a program wrote: text, cursor moves,
