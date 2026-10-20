@@ -22,13 +22,14 @@ Only the latest release receives security fixes.
 
 ## Verifying a release
 
-Tagged releases carry GitHub artifact attestations for every release file. To check a file you
+Releases after 20261016.2230.0 carry GitHub artifact attestations for every release file;
+earlier releases were built before the attestation workflow and have none. To check a file you
 downloaded:
 
     gh attestation verify <file> --repo michaelrigart/tagteam
 
-It confirms that the file was built by this repository's release workflow. A file that fails
-the check should not be run; report it as described above.
+It confirms that the file was built by this repository's release workflow. A file from a later
+release that fails the check should not be run; report it as described above.
 
 ## What tagteam stores and protects
 
@@ -97,10 +98,11 @@ and 14).
   mount.
 - **Purge.** `tagteam purge` deletes the data, the Keychain items and the log, and empties the
   store with `secure_delete` on and a `VACUUM`.
-- **Dependencies.** CI runs `cargo deny check advisories` on every push and pull request and
-  once a week, and fails on a RustSec advisory against a locked crate (a vulnerability or an
-  unsound advisory anywhere in the graph; an unmaintained crate among tagteam's direct
-  dependencies). The one advisory it ignores, and each reason, is recorded in `deny.toml`.
+- **Dependencies.** CI runs `cargo deny check advisories` on every push to main, every pull
+  request, and once a week, and fails on a RustSec advisory against a locked crate (a
+  vulnerability or an unsound advisory anywhere in the graph; an unmaintained crate among
+  tagteam's direct dependencies). The one advisory it ignores, and each reason, is recorded in
+  `deny.toml`.
 
 Anyone who can read your user account's files, or unlock your login Keychain, can read your
 stored credentials, as they can read Claude Code's own. tagteam does not defend against that.
