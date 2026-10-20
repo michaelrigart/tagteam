@@ -1,8 +1,6 @@
 //! What reaches the state machine (`Msg`), what it asks for (`Cmd`), and the lanes' requests
 //! (spec §4.2, §4.3).
 
-use std::sync::mpsc::Sender;
-
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_daemon::protocol::Status;
 use tagteam_engine::tokens::{IndexProgress, IndexState, RefreshOutcome, TokenQuery, TokenReport};
@@ -190,11 +188,16 @@ pub enum Msg {
     },
 }
 
+/// Which waiting CLI prompt an answer is for (spec §7.2): the runtime holds the prompt's sender
+/// and `State` holds only this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnswerTo(pub u64);
+
 /// A question from the CLI path, and where its answer goes (spec §7.2).
 pub struct Prompt {
     pub question: String,
     pub kind: PromptKind,
-    pub reply: Sender<Answer>,
+    pub to: AnswerTo,
 }
 
 pub enum PromptKind {
@@ -258,6 +261,11 @@ pub enum Cmd {
     /// again (C-R19, C-R21).
     DropLink {
         link: u64,
+    },
+    /// Answers the CLI prompt `to` names (spec §7.2); the runtime holds its sender.
+    Answer {
+        to: AnswerTo,
+        answer: Answer,
     },
 }
 

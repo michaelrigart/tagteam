@@ -502,7 +502,7 @@ mod tests {
     use super::*;
     use crate::actions::{ConfirmThen, Overlay};
     use crate::host::Action;
-    use crate::msg::{Answer, Msg};
+    use crate::msg::{Answer, AnswerTo, Cmd, Msg};
     use crate::state::BannerKind;
     use crate::testutil::*;
     use crate::theme::Theme;
@@ -700,13 +700,12 @@ mod tests {
     /// answer still reaches the lane waiting for it.
     #[test]
     fn a_dialog_survives_a_resize_below_the_minimum_and_back() {
-        let (reply, answer) = std::sync::mpsc::channel::<Answer>();
         let mut state = fresh(Screen::Accounts);
         state.overlay = Some(Overlay::Confirm {
             question: "Remove 2 b@x.co?".into(),
             default_yes: false,
             choice: false,
-            then: ConfirmThen::Reply(reply),
+            then: ConfirmThen::Reply(AnswerTo(1)),
         });
         let drawn = draw(&state, 80, 24);
         assert!(
@@ -735,8 +734,13 @@ mod tests {
             back.iter().any(|l| l.contains("Remove 2 b@x.co?")),
             "{back:?}"
         );
-        update(&mut state, key(KeyCode::Char('y')), NOW_MS);
-        assert_eq!(answer.try_recv(), Ok(Answer::Confirm(true)));
+        assert_eq!(
+            update(&mut state, key(KeyCode::Char('y')), NOW_MS),
+            [Cmd::Answer {
+                to: AnswerTo(1),
+                answer: Answer::Confirm(true)
+            }]
+        );
         assert!(state.overlay.is_none());
     }
 

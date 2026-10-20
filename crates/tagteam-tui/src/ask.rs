@@ -1,27 +1,83 @@
 //! The bridge's `Ask` (spec §7.2, §10.2 step 3): a CLI prompt on the actions lane becomes a
 //! dialog on the UI thread, and the lane waits for its answer in slices it can leave.
 
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::collections::BTreeMap;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tagteam_provider::Cancel;
 
 use crate::host::Ask;
-use crate::msg::{Answer, Msg, Prompt, PromptKind};
+use crate::msg::{Answer, AnswerTo, Msg, Prompt, PromptKind};
 
 /// How long the lane waits for an answer before it looks at the shutdown token again.
 const SLICE: Duration = Duration::from_millis(100);
+
+/// The senders of the prompts still waiting, shared by the runtime and the actions lane. `State`
+/// holds an `AnswerTo`, never a sender (spec §7.2).
+#[derive(Clone, Default)]
+pub(crate) struct Answers(Arc<Mutex<Waiting>>);
+
+#[derive(Default)]
+struct Waiting {
+    next: u64,
+    senders: BTreeMap<u64, Sender<Answer>>,
+}
+
+impl Answers {
+    fn lock(&self) -> MutexGuard<'_, Waiting> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keeps `reply` until the prompt is answered, declined or forgotten.
+    pub(crate) fn keep(&self, reply: Sender<Answer>) -> AnswerTo {
+        let mut waiting = self.lock();
+        let id = waiting.next;
+        waiting.next += 1;
+        waiting.senders.insert(id, reply);
+        AnswerTo(id)
+    }
+
+    /// Sends `answer` once and forgets the sender; an id no longer waiting gets nothing.
+    pub(crate) fn answer(&self, to: AnswerTo, answer: Answer) {
+        let sender = self.lock().senders.remove(&to.0);
+        if let Some(sender) = sender {
+            let _ = sender.send(answer);
+        }
+    }
+
+    pub(crate) fn forget(&self, to: AnswerTo) {
+        self.lock().senders.remove(&to.0);
+    }
+
+    /// Drops every sender (spec §10.2 step 3): each waiting lane sees a decline at once.
+    pub(crate) fn decline_all(&self) {
+        self.lock().senders.clear();
+    }
+
+    #[cfg(test)]
+    fn waiting(&self) -> usize {
+        self.lock().senders.len()
+    }
+}
 
 /// The runtime builds one for each action its actions lane runs.
 pub(crate) struct ChannelAsk {
     tx: Sender<Msg>,
     shutdown: Cancel,
+    answers: Answers,
 }
 
 impl ChannelAsk {
-    /// Prompts go to the UI thread on `tx`; once `shutdown` is set, every prompt is declined.
-    pub(crate) fn new(tx: Sender<Msg>, shutdown: Cancel) -> Self {
-        ChannelAsk { tx, shutdown }
+    /// Prompts go to the UI thread on `tx`, their senders wait in `answers`; once `shutdown` is
+    /// set, every prompt is declined.
+    pub(crate) fn new(tx: Sender<Msg>, shutdown: Cancel, answers: Answers) -> Self {
+        ChannelAsk {
+            tx,
+            shutdown,
+            answers,
+        }
     }
 
     /// The answer to `question`, or `None` for a decline: the shutdown has begun (before the
@@ -31,12 +87,21 @@ impl ChannelAsk {
             return None;
         }
         let (reply, answer) = mpsc::channel();
+        let to = self.answers.keep(reply);
         let prompt = Prompt {
             question: question.to_owned(),
             kind,
-            reply,
+            to,
         };
-        self.tx.send(Msg::Prompt(prompt)).ok()?;
+        let answered = match self.tx.send(Msg::Prompt(prompt)) {
+            Ok(()) => self.wait(&answer),
+            Err(_) => None,
+        };
+        self.answers.forget(to);
+        answered
+    }
+
+    fn wait(&self, answer: &Receiver<Answer>) -> Option<Answer> {
         loop {
             match answer.recv_timeout(SLICE) {
                 Ok(a) if self.shutdown.requested().is_none() => return Some(a),
@@ -96,7 +161,8 @@ mod tests {
     fn an_answer_reaches_the_waiting_lane() {
         let (tx, rx) = mpsc::channel();
         let shutdown = Cancel::new();
-        let mut ask = ChannelAsk::new(tx.clone(), shutdown.clone());
+        let answers = Answers::default();
+        let mut ask = ChannelAsk::new(tx.clone(), shutdown.clone(), answers.clone());
         let lane = thread::spawn(move || ask.confirm("Add it?", true));
         let prompt = next_prompt(&rx, WAIT).unwrap();
         assert_eq!(prompt.question, "Add it?");
@@ -104,17 +170,17 @@ mod tests {
             prompt.kind,
             PromptKind::Confirm { default_yes: true }
         ));
-        prompt.reply.send(Answer::Confirm(true)).unwrap();
+        answers.answer(prompt.to, Answer::Confirm(true));
         assert!(lane.join().unwrap());
 
-        let mut ask = ChannelAsk::new(tx, shutdown);
+        let mut ask = ChannelAsk::new(tx, shutdown, answers.clone());
         let lane = thread::spawn(move || ask.choose("Which?", &["a".into(), "b".into()]));
         let prompt = next_prompt(&rx, WAIT).unwrap();
         let PromptKind::Choose { options } = &prompt.kind else {
             panic!("a choice");
         };
         assert_eq!(options, &["a", "b"]);
-        prompt.reply.send(Answer::Choose(Some(1))).unwrap();
+        answers.answer(prompt.to, Answer::Choose(Some(1)));
         assert_eq!(lane.join().unwrap(), Some(1));
     }
 
@@ -123,7 +189,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let shutdown = Cancel::new();
         shutdown.request(SIGINT);
-        let mut ask = ChannelAsk::new(tx, shutdown);
+        let mut ask = ChannelAsk::new(tx, shutdown, Answers::default());
         assert!(!ask.confirm("Add it?", true));
         assert_eq!(ask.choose("Which?", &["a".into()]), None);
         assert!(next_prompt(&rx, Duration::from_millis(50)).is_none());
@@ -133,7 +199,8 @@ mod tests {
     fn a_shutdown_while_waiting_declines_within_one_slice() {
         let (tx, rx) = mpsc::channel();
         let shutdown = Cancel::new();
-        let mut ask = ChannelAsk::new(tx, shutdown.clone());
+        let answers = Answers::default();
+        let mut ask = ChannelAsk::new(tx, shutdown.clone(), answers.clone());
         let lane = thread::spawn(move || ask.confirm("Add it?", true));
         let prompt = next_prompt(&rx, WAIT).unwrap();
         let set = Instant::now();
@@ -141,15 +208,39 @@ mod tests {
         assert!(!lane.join().unwrap());
         assert!(set.elapsed() < SLICE * 3, "{:?}", set.elapsed());
         // The dialog's answer, should it still come, goes nowhere.
-        let _ = prompt.reply.send(Answer::Confirm(true));
+        answers.answer(prompt.to, Answer::Confirm(true));
     }
 
     #[test]
-    fn a_dialog_dropped_unanswered_declines() {
+    fn declining_every_prompt_frees_its_lane_before_the_slice_ends() {
         let (tx, rx) = mpsc::channel();
-        let mut ask = ChannelAsk::new(tx, Cancel::new());
+        let answers = Answers::default();
+        let mut ask = ChannelAsk::new(tx, Cancel::new(), answers.clone());
         let lane = thread::spawn(move || ask.choose("Which?", &["a".into()]));
-        drop(next_prompt(&rx, WAIT).unwrap());
+        let _prompt = next_prompt(&rx, WAIT).unwrap();
+        let declined = Instant::now();
+        answers.decline_all();
         assert_eq!(lane.join().unwrap(), None);
+        assert!(
+            declined.elapsed() < SLICE / 2,
+            "{:?}, with the shutdown token never set",
+            declined.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_prompt_that_stopped_waiting_is_forgotten() {
+        let (tx, rx) = mpsc::channel();
+        let shutdown = Cancel::new();
+        let answers = Answers::default();
+        let mut ask = ChannelAsk::new(tx, shutdown.clone(), answers.clone());
+        let lane = thread::spawn(move || ask.confirm("Add it?", true));
+        let prompt = next_prompt(&rx, WAIT).unwrap();
+        assert_eq!(answers.waiting(), 1);
+        shutdown.request(SIGINT);
+        assert!(!lane.join().unwrap());
+        assert_eq!(answers.waiting(), 0);
+        answers.answer(prompt.to, Answer::Confirm(true));
+        assert_eq!(answers.waiting(), 0);
     }
 }
