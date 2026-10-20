@@ -237,10 +237,13 @@ pub(crate) fn engine_for(ctx: Context, provider: Option<&ProviderId>) -> Result<
 ```
 
 - [ ] **Step 1: Implement it.** It runs `build_registry(ctx)`, then `locate(ctx.env.clone(), &registry)`, and turns `RunShell::Unreadable { marker, detail }` into `EngineError::RunShellUnreadable { marker, detail }`. `locate`, `build_registry` and `build_engine` keep their signatures for the held callers.
-- [ ] **Step 2: Use both in `run_command`.**
-  - **Stage two** (the unreadable-marker refusal, `shell-init` and `completions`) calls `locate_run_shell(&ctx)`. On `Err(e)` it fails exactly as today, with `e.kind()` and `e.to_string()` through `fail`. `shell-init` uses `located.registry`.
-  - **Stage three** builds the engine with `engine_for(ctx, provider_flag.as_ref())`, after copying out the `ctx` fields it copies today. Its `Err` arm is unreachable in practice, but if a marker became unreadable in between, it is reported the same way.
-  - `engine_for` locates the run shell a second time from the same `ctx`. That is a pure, cheap read of the environment and the marker file, and it gives the same `Located`.
+- [ ] **Step 2: Use both in `run_command`, locating the run shell exactly once per invocation.** `detect_run_shell` reads the marker from disk, so a second lookup could see a different marker.
+  - **`shell-init` and `completions`** call `locate_run_shell(&ctx)`. On `Err(e)` they fail exactly as today, with `e.kind()` and `e.to_string()` through `fail`. `shell-init` uses `located.registry`. Both return without an engine.
+  - **Every other command** goes straight to `engine_for(ctx, provider_flag.as_ref())`, after copying out the `ctx` fields it copies today. On `Err(e)`, the unreadable marker, it fails exactly as the refusal did, before the `--provider` check and dispatch, as today.
+  - **The order of answers stays as it is:**
+    - `statusline` and `tui`, before any lookup;
+    - the refusal of an unreadable marker before anything else runs;
+    - `shell-init` and `completions` before any engine.
 - [ ] **Step 3: Verify.** Run the `tagteam` focused command (the unreadable-marker tests in `tests/cli.rs`) and both clippy variants.
 - [ ] **Step 4: Commit** "Find the run shell through one locate_run_shell".
 
@@ -613,7 +616,10 @@ These are rulings inside the spec's intent. Each one is recorded under "Rulings"
 1. **The exhaustive dispatch is decided by Task 0's spike**, under §7.1's own rule.
    - **The expected outcome** is the fallback. clap orders subcommands by insertion, and `flatten` inserts a group where its variant sits. The five early commands are interleaved: `Tui` is 3rd, `ShellInit`, `Statusline` and `Run` are 18th–20th, and `Completions` is 27th.
    - **Either way,** the PR records the observed result.
-2. **`run_command` uses both bootstrap functions.** `locate_run_shell` serves the early stage, which needs the registry before any engine exists. `engine_for` builds the engine, locating the run shell a second time from the same `ctx`; that read is pure and cheap. The held TUI files keep their own sequence (§7.2).
+2. **`run_command` uses both bootstrap functions,** and each invocation locates the run shell once.
+   - `shell-init` and `completions` need the registry but no engine, so they call `locate_run_shell`.
+   - Every engine-backed command calls `engine_for`.
+   - The held TUI files keep their own sequence (§7.2).
 3. **`Failure::report` takes `json`.** The spec's `Output` type does not exist; `Io` is the output and carries no `json` flag.
 4. **`auto_command` takes `(once, dry_run, flags)`.** The `Auto` arm keeps building `AutoFlags` through `auto_flags`, which therefore becomes `pub(in crate::app)`. That keeps the method within clippy's limit.
 5. **`AddToken` becomes a method as well,** so `confirming` and `added` stay private to `commands/accounts.rs`. §7.1 does not list it, but the move would otherwise widen their visibility. `Disable` and `Enable` stay inline.
