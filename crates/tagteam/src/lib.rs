@@ -7,6 +7,7 @@ use clap::{CommandFactory, Parser};
 pub mod app;
 pub mod auto;
 pub mod cli;
+mod completions;
 mod config_cmd;
 mod daemon_cmd;
 mod displaced_cmd;
