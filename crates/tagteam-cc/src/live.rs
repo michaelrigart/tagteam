@@ -11,7 +11,7 @@ use tagteam_provider::atomic::{
 };
 use tagteam_provider::{
     BeforeFallback, Cancel, Credential, DoomedEntry, Env, Keychain, LiveLockSet, ProviderError,
-    Read, SecretStore,
+    Read, ReadError, SecretStore, cancel,
 };
 
 use crate::config::{self, read_bytes};
@@ -575,14 +575,21 @@ impl LiveStore {
     }
 
     /// `read`, retried twice `retry_delay` apart while it is unreadable (Appendix A.3: active
-    /// reads retry the Keychain).
+    /// reads retry the Keychain). Two reads are never retried (H4): a locked one, since rc 36
+    /// will not change within the delays and the daemon's `KeychainBackoff` waits instead, and
+    /// an interrupted one. Inside a `cancel::interruptible` scope whose token holds a signal
+    /// after a delay, the read ends there as interrupted, without reading again.
     fn retrying<T>(&self, read: impl Fn() -> Read<T>) -> Read<T> {
         let mut r = read();
         for _ in 0..2 {
-            if !matches!(r, Read::Unreadable(_)) {
+            let Read::Unreadable(e) = &r else { break };
+            if e.is_locked() || e.interruption().is_some() {
                 break;
             }
             thread::sleep(self.retry_delay);
+            if let Some(signal) = cancel::scoped().and_then(|token| token.requested()) {
+                return Read::Unreadable(ReadError::interrupted("keychain", signal));
+            }
             r = read();
         }
         r
@@ -600,6 +607,8 @@ impl LiveStore {
         match self.retrying(|| self.keychain.find(&svc, &acct)) {
             Read::Present(b) => Read::Present(Credential::fresh(b)),
             Read::Absent => read_bytes(&paths.credentials_file).map(Credential::fresh),
+            // H4: an interrupted read is no failure the file may cover.
+            Read::Unreadable(e) if e.interruption().is_some() => Read::Unreadable(e),
             Read::Unreadable(e) => match read_bytes(&paths.credentials_file) {
                 Read::Present(b) => Read::Present(Credential::degraded(b)),
                 _ => Read::Unreadable(e),

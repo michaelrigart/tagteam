@@ -1304,6 +1304,7 @@ fn a_ticks_collection_plans_for_the_ticks_threshold_not_the_settings() {
 #[cfg(feature = "test-hooks")]
 mod hooks {
     use super::*;
+    use tagteam_provider::ReadTally;
 
     #[test]
     fn a_second_process_finds_the_lease_taken_while_the_first_fetches() {
@@ -1848,6 +1849,32 @@ mod hooks {
         let cancel = fx.engine.cancel().clone();
         fx.engine
             .on_point(point, Box::new(move || cancel.request(libc::SIGINT)));
+    }
+
+    #[test]
+    fn a_vault_read_the_signal_interrupts_records_nothing_and_is_no_usage_failure() {
+        // Review Focus 5, H4, §14.1: the stored token's vault read is a cancellation point. An
+        // interrupted read is not `keychain-unavailable`: nothing is recorded, the slot goes back.
+        let fx = Fx::new();
+        let a = two_accounts(&fx);
+        fx.script_usage(200, usage_fixture());
+        let reads = fx.kc.read_counts().unwrap().tally();
+        signal_at(&fx, "usage-reserved");
+
+        assert_interrupted(collect_result(&fx, &a));
+
+        assert_eq!(
+            fx.kc.read_counts().unwrap().tally().since(reads),
+            ReadTally::default(),
+            "the vault read was interrupted: never answered, never counted locked"
+        );
+        assert_eq!(
+            fx.usage_state(&a),
+            None,
+            "no failure, no backoff: nothing is recorded"
+        );
+        assert!(fx.http.requests().is_empty());
+        assert_eq!(usage_requests(&fx), 0, "the reserved slot went back");
     }
 
     #[test]
