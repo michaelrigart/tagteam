@@ -200,13 +200,14 @@ impl Pty {
     }
 
     /// When what `ready` holds of was first on the terminal: the arrival of the chunk that put
-    /// it there.
+    /// it there. Each chunk is emulated at the size `screen` uses.
     pub fn first_shown(&self, ready: impl Fn(&Screen) -> bool) -> Option<Instant> {
+        let (cols, rows) = *self.size.lock().unwrap();
         let written = self.written.lock().unwrap();
         written
             .chunks
             .iter()
-            .find(|(_, end)| ready(&Screen::of(&written.bytes[..*end], COLS, ROWS)))
+            .find(|(_, end)| ready(&Screen::of(&written.bytes[..*end], cols, rows)))
             .map(|(at, _)| *at)
     }
 
