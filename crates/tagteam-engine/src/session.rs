@@ -5,6 +5,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use tagteam_provider::flock::LockProbe;
 use tagteam_provider::liveness::{
@@ -18,7 +19,7 @@ use tagteam_provider::{Env, Provider, Read};
 use crate::engine::Engine;
 use crate::error::{EngineError, SessionOwner};
 use crate::registry::ProviderRegistry;
-use crate::store::AccountRow;
+use crate::store::{AccountRow, SeedLaunch};
 
 fn unreadable_marker(dir: &Path, env: &Env, detail: String) -> (RunShell, Env) {
     (
@@ -200,6 +201,56 @@ impl Engine {
     /// step 6 asks it of a profile that no store account owns. `p` judges its session records.
     pub(crate) fn session_state_at(&self, p: &dyn Provider, profile: &Path) -> SessionState {
         self.session_state_leaving_out(p, profile, None)
+    }
+
+    /// Token report spec §4 Seeding, asked only by the migration to version 3: each directory
+    /// under `sessions/` as a launch of the provider its marker names, or of every provider
+    /// with sessions when it has no readable marker. It started at the directory's birth time,
+    /// or 0 when the filesystem reports none, and is in use as core §12.6 judges it. `None`
+    /// when `sessions/` or an entry of it cannot be read: a profile may have gone unlisted, so
+    /// the epoch records `seeded = 0` (ruling R1). No `sessions/` at all is no profile.
+    pub(crate) fn seed_launches(&self) -> Option<Vec<SeedLaunch>> {
+        let entries = match fs::read_dir(self.env.data_dir().join("sessions")) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(Vec::new()),
+            Err(_) => return None,
+        };
+        let mut seeds = Vec::new();
+        for entry in entries {
+            let dir = entry.ok()?.path();
+            let meta = match fs::metadata(&dir) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            let Some(account) = dir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !meta.is_dir() {
+                continue;
+            }
+            let started_at_ms = meta
+                .created()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+            let named = match ProfileMarker::read(&dir) {
+                Read::Present(m) => Some(m.provider),
+                Read::Absent | Read::Unreadable(_) => None,
+            };
+            for p in self.registry.all() {
+                if !p.capabilities().sessions || named.as_ref().is_some_and(|id| *id != p.id()) {
+                    continue;
+                }
+                seeds.push(SeedLaunch {
+                    provider: p.id(),
+                    account_id: account.to_owned(),
+                    started_at_ms,
+                    in_use: self.session_state_at(p.as_ref(), &dir).owned(),
+                });
+            }
+        }
+        Some(seeds)
     }
 
     /// The body of all three, for the profile at `profile` (for an account,
