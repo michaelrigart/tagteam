@@ -105,8 +105,7 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
         }
         Msg::Prompt(prompt) => {
             state.dirty = true;
-            actions::on_prompt(state, prompt);
-            vec![]
+            actions::on_prompt(state, prompt)
         }
         Msg::ActionDone { action, outcome } => {
             state.dirty = true;
@@ -166,8 +165,8 @@ pub fn drawn(state: &mut State) -> Vec<Cmd> {
     cmds
 }
 
-/// Starts the shutdown (spec §10.2) with `code`. An open dialog is dropped with it, so the
-/// action waiting on its answer is declined.
+/// Starts the shutdown (spec §10.2) with `code`. An open dialog is dropped with it, and the
+/// runtime declines the prompt waiting on it when the shutdown begins.
 pub(crate) fn quit(state: &mut State, code: i32) -> Vec<Cmd> {
     state.quitting = Some(code);
     state.overlay = None;

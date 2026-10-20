@@ -1,8 +1,6 @@
 //! Actions in the TUI (spec §5.5, §7): the action keys, the dialogs and panels, the CLI's
 //! prompts, and what an action's outcome shows.
 
-use std::sync::mpsc::Sender;
-
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -12,7 +10,7 @@ use tagteam_engine::words;
 
 use crate::daemon;
 use crate::host::{AccountRef, Action, ActionOutcome, Strategy};
-use crate::msg::{Answer, Cmd, Prompt, PromptKind};
+use crate::msg::{Answer, AnswerTo, Cmd, Prompt, PromptKind};
 use crate::screens;
 use crate::screens::tokens::filter::{self, FilterDialog};
 use crate::state::{Screen, State};
@@ -31,7 +29,7 @@ pub enum Overlay {
         question: String,
         options: Vec<String>,
         selected: usize,
-        reply: Sender<Answer>,
+        reply: AnswerTo,
     },
     Text {
         prompt: String,
@@ -56,7 +54,7 @@ pub enum Overlay {
 /// before an action (`Remove`'s).
 #[derive(Debug)]
 pub enum ConfirmThen {
-    Reply(Sender<Answer>),
+    Reply(AnswerTo),
     Run(Action),
 }
 
@@ -370,8 +368,8 @@ fn overlay_key(
                 _ => digit.filter(|d| *d <= last).map(Some),
             };
             if let Some(answer) = answer {
-                let _ = reply.send(Answer::Choose(answer));
-                return (None, vec![]);
+                let answer = Answer::Choose(answer);
+                return (None, vec![Cmd::Answer { to: reply, answer }]);
             }
             let selected = match key.code {
                 KeyCode::Up | KeyCode::Char('k') => selected.saturating_sub(1),
@@ -497,10 +495,10 @@ fn overlay_key(
 /// A confirm dialog's answer: sent to the prompt waiting for it, or a yes starts the action.
 fn confirmed(state: &mut State, then: ConfirmThen, yes: bool, now_ms: i64) -> Vec<Cmd> {
     match then {
-        ConfirmThen::Reply(reply) => {
-            let _ = reply.send(Answer::Confirm(yes));
-            vec![]
-        }
+        ConfirmThen::Reply(to) => vec![Cmd::Answer {
+            to,
+            answer: Answer::Confirm(yes),
+        }],
         ConfirmThen::Run(action) if yes => start(state, action, now_ms),
         ConfirmThen::Run(_) => vec![],
     }
@@ -542,31 +540,51 @@ fn scrolled(scroll: u16, code: KeyCode, text: &str, (width, height): (u16, u16))
     to.min(last)
 }
 
-/// A CLI prompt from the actions lane (spec §7.2) opens a dialog bound to its reply. During a
-/// shutdown it is dropped, which declines it.
-pub fn on_prompt(state: &mut State, prompt: Prompt) {
+/// A CLI prompt from the actions lane (spec §7.2) opens a dialog bound to its id. During a
+/// shutdown it opens nothing and is declined; a dialog it replaces is declined first.
+pub fn on_prompt(state: &mut State, prompt: Prompt) -> Vec<Cmd> {
+    let Prompt { question, kind, to } = prompt;
     if state.quitting.is_some() {
-        return;
+        return vec![declined(to, &kind)];
     }
-    let Prompt {
-        question,
-        kind,
-        reply,
-    } = prompt;
+    let replaced = match &state.overlay {
+        Some(Overlay::Confirm {
+            then: ConfirmThen::Reply(to),
+            ..
+        }) => Some(Cmd::Answer {
+            to: *to,
+            answer: Answer::Confirm(false),
+        }),
+        Some(Overlay::Choose { reply, .. }) => Some(Cmd::Answer {
+            to: *reply,
+            answer: Answer::Choose(None),
+        }),
+        _ => None,
+    };
     state.overlay = Some(match kind {
         PromptKind::Confirm { default_yes } => Overlay::Confirm {
             question,
             default_yes,
             choice: default_yes,
-            then: ConfirmThen::Reply(reply),
+            then: ConfirmThen::Reply(to),
         },
         PromptKind::Choose { options } => Overlay::Choose {
             question,
             options,
             selected: 0,
-            reply,
+            reply: to,
         },
     });
+    replaced.into_iter().collect()
+}
+
+/// The decline of a prompt of `kind` that was never shown.
+fn declined(to: AnswerTo, kind: &PromptKind) -> Cmd {
+    let answer = match kind {
+        PromptKind::Confirm { .. } => Answer::Confirm(false),
+        PromptKind::Choose { .. } => Answer::Choose(None),
+    };
+    Cmd::Answer { to, answer }
 }
 
 /// An action's outcome (spec §7.2): a command that needs the terminal is run again suspended
@@ -888,8 +906,6 @@ fn panel(frame: &mut Frame, area: Rect, title: &str, text: &str, scroll: u16, ke
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
-
     use crossterm::event::KeyCode;
 
     use super::*;
@@ -1207,121 +1223,123 @@ mod tests {
         );
     }
 
+    fn confirm_prompt(to: u64) -> Msg {
+        Msg::Prompt(Prompt {
+            question: "Add it?".into(),
+            kind: PromptKind::Confirm { default_yes: true },
+            to: AnswerTo(to),
+        })
+    }
+
+    fn choose_prompt(to: u64, options: &[&str]) -> Prompt {
+        Prompt {
+            question: "Which account?".into(),
+            kind: PromptKind::Choose {
+                options: options.iter().map(|o| (*o).to_owned()).collect(),
+            },
+            to: AnswerTo(to),
+        }
+    }
+
+    fn answer(to: u64, answer: Answer) -> [Cmd; 1] {
+        [Cmd::Answer {
+            to: AnswerTo(to),
+            answer,
+        }]
+    }
+
     #[test]
     fn a_cli_prompt_opens_a_dialog_bound_to_its_reply() {
         let mut state = loaded(1);
-        let (reply, answer) = mpsc::channel();
-        update(
-            &mut state,
-            Msg::Prompt(Prompt {
-                question: "Add it?".into(),
-                kind: PromptKind::Confirm { default_yes: true },
-                reply,
-            }),
-            NOW_MS,
-        );
+        assert_eq!(update(&mut state, confirm_prompt(1), NOW_MS), []);
         assert!(matches!(
             state.overlay,
             Some(Overlay::Confirm { choice: true, .. })
         ));
         update(&mut state, key(KeyCode::Right), NOW_MS);
-        update(&mut state, key(KeyCode::Enter), NOW_MS);
-        assert_eq!(answer.try_recv(), Ok(Answer::Confirm(false)));
-
-        let (reply, answer) = mpsc::channel();
-        update(
-            &mut state,
-            Msg::Prompt(Prompt {
-                question: "Which account?".into(),
-                kind: PromptKind::Choose {
-                    options: vec!["one".into(), "two".into(), "three".into()],
-                },
-                reply,
-            }),
-            NOW_MS,
+        assert_eq!(
+            update(&mut state, key(KeyCode::Enter), NOW_MS),
+            answer(1, Answer::Confirm(false))
         );
+
+        let prompt = choose_prompt(2, &["one", "two", "three"]);
+        assert_eq!(update(&mut state, Msg::Prompt(prompt), NOW_MS), []);
         let drawn = draw(&state, 80, 24);
         assert!(drawn.iter().any(|l| l.contains("1. one")), "{drawn:?}");
         update(&mut state, key(KeyCode::Down), NOW_MS);
         update(&mut state, key(KeyCode::Down), NOW_MS);
         update(&mut state, key(KeyCode::Down), NOW_MS);
-        update(&mut state, key(KeyCode::Enter), NOW_MS);
-        assert_eq!(answer.try_recv(), Ok(Answer::Choose(Some(2))));
+        assert_eq!(
+            update(&mut state, key(KeyCode::Enter), NOW_MS),
+            answer(2, Answer::Choose(Some(2)))
+        );
 
         for (code, want) in [
             (KeyCode::Esc, Answer::Choose(None)),
             (KeyCode::Char('2'), Answer::Choose(Some(1))),
         ] {
-            let (reply, answer) = mpsc::channel();
-            actions_prompt_choose(&mut state, reply);
-            update(&mut state, key(code), NOW_MS);
-            assert_eq!(answer.try_recv(), Ok(want));
+            assert_eq!(on_prompt(&mut state, choose_prompt(3, &["a", "b"])), []);
+            assert_eq!(update(&mut state, key(code), NOW_MS), answer(3, want));
         }
-        let (reply, answer) = mpsc::channel();
-        on_prompt(
-            &mut state,
-            Prompt {
-                question: "Sure?".into(),
-                kind: PromptKind::Confirm { default_yes: true },
-                reply,
-            },
-        );
-        update(&mut state, key(KeyCode::Esc), NOW_MS);
+        let prompt = Prompt {
+            question: "Sure?".into(),
+            kind: PromptKind::Confirm { default_yes: true },
+            to: AnswerTo(4),
+        };
+        assert_eq!(on_prompt(&mut state, prompt), []);
         assert_eq!(
-            answer.try_recv(),
-            Ok(Answer::Confirm(false)),
+            update(&mut state, key(KeyCode::Esc), NOW_MS),
+            answer(4, Answer::Confirm(false)),
             "Esc declines"
         );
     }
 
-    fn actions_prompt_choose(state: &mut State, reply: Sender<Answer>) {
-        on_prompt(
-            state,
-            Prompt {
-                question: "Which?".into(),
-                kind: PromptKind::Choose {
-                    options: vec!["a".into(), "b".into()],
-                },
-                reply,
-            },
+    #[test]
+    fn a_second_prompt_declines_the_dialog_it_replaces() {
+        let mut state = loaded(1);
+        assert_eq!(update(&mut state, confirm_prompt(1), NOW_MS), []);
+        let second = choose_prompt(2, &["one", "two"]);
+        assert_eq!(
+            update(&mut state, Msg::Prompt(second), NOW_MS),
+            answer(1, Answer::Confirm(false))
         );
+        assert!(matches!(
+            state.overlay,
+            Some(Overlay::Choose {
+                reply: AnswerTo(2),
+                ..
+            })
+        ));
+        let drawn = draw(&state, 80, 24);
+        assert!(drawn.iter().any(|l| l.contains("1. one")), "{drawn:?}");
     }
 
     #[test]
     fn a_prompt_during_a_shutdown_is_declined_unshown() {
         let mut state = loaded(1);
         state.quitting = Some(0);
-        let (reply, answer) = mpsc::channel();
-        update(
-            &mut state,
-            Msg::Prompt(Prompt {
-                question: "Add it?".into(),
-                kind: PromptKind::Confirm { default_yes: true },
-                reply,
-            }),
-            NOW_MS,
+        assert_eq!(
+            update(&mut state, confirm_prompt(1), NOW_MS),
+            answer(1, Answer::Confirm(false))
         );
         assert!(state.overlay.is_none());
-        assert_eq!(answer.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        let choice = choose_prompt(2, &["one"]);
+        assert_eq!(
+            update(&mut state, Msg::Prompt(choice), NOW_MS),
+            answer(2, Answer::Choose(None))
+        );
+        assert!(state.overlay.is_none());
     }
 
     #[test]
     fn quitting_with_a_dialog_open_declines_it() {
         let mut state = loaded(1);
-        let (reply, answer) = mpsc::channel();
-        on_prompt(
-            &mut state,
-            Prompt {
-                question: "Add it?".into(),
-                kind: PromptKind::Confirm { default_yes: true },
-                reply,
-            },
-        );
+        assert_eq!(update(&mut state, confirm_prompt(1), NOW_MS), []);
         assert_eq!(
             update(&mut state, ctrl('c'), NOW_MS),
             [Cmd::Quit { code: 0 }]
         );
-        assert_eq!(answer.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+        assert!(state.overlay.is_none(), "the runtime declines its prompt");
     }
 
     #[test]
@@ -1697,7 +1715,6 @@ mod tests {
     #[test]
     fn a_long_choice_wraps_under_its_text_and_is_selected_whole() {
         let mut state = loaded(1);
-        let (reply, _answer) = mpsc::channel();
         let long =
             "claude-code #2 averyveryverylongname.with.a.long.tail@example.com [Example Org]";
         update(
@@ -1707,7 +1724,7 @@ mod tests {
                 kind: PromptKind::Choose {
                     options: vec!["claude-code #1 a@x.co".into(), long.into()],
                 },
-                reply,
+                to: AnswerTo(1),
             }),
             NOW_MS,
         );
@@ -1745,7 +1762,6 @@ mod tests {
     #[test]
     fn a_1000_character_choice_takes_three_rows_and_every_choice_stays_reachable() {
         let mut state = loaded(1);
-        let (reply, _answer) = mpsc::channel();
         let long = "Claude ".repeat(143).trim_end().to_owned();
         let options: Vec<String> = [long]
             .into_iter()
@@ -1756,7 +1772,7 @@ mod tests {
             Msg::Prompt(Prompt {
                 question: "Which account?".into(),
                 kind: PromptKind::Choose { options },
-                reply,
+                to: AnswerTo(1),
             }),
             NOW_MS,
         );
@@ -1798,14 +1814,13 @@ mod tests {
     #[test]
     fn a_long_question_is_cut_so_the_dialog_keeps_its_buttons() {
         let mut state = loaded(1);
-        let (reply, _answer) = mpsc::channel();
         let question = format!("{}?", "Claude ".repeat(286).trim_end());
         update(
             &mut state,
             Msg::Prompt(Prompt {
                 question,
                 kind: PromptKind::Confirm { default_yes: false },
-                reply,
+                to: AnswerTo(1),
             }),
             NOW_MS,
         );

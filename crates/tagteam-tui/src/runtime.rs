@@ -14,7 +14,7 @@ use tagteam_core::ProviderId;
 use tagteam_daemon::protocol::Status;
 use tagteam_provider::Cancel;
 
-use crate::ask::ChannelAsk;
+use crate::ask::{Answers, ChannelAsk};
 use crate::host::{Action, ActionOutcome, Host};
 use crate::input::{Input, Pause};
 use crate::lanes::Lane;
@@ -98,12 +98,14 @@ pub(crate) fn run_with<T: Tty, P: Pause>(
         .daemon
         .clone()
         .map(|path| -> StatusFetch { Arc::new(move || live::fetch_status(&path)) });
+    let answers = Answers::default();
     let lanes = Lanes::spawn(
         opts.provider.clone(),
         &sources,
         &host,
         &tx,
         &opts.shutdown,
+        &answers,
         status,
     );
     if let Some(path) = opts.daemon.clone() {
@@ -126,7 +128,7 @@ pub(crate) fn run_with<T: Tty, P: Pause>(
                 ));
             }
         };
-        let mut ui = Ui::new(&opts, tty, input, &rx, &lanes, host.as_ref());
+        let mut ui = Ui::new(&opts, tty, input, &rx, &lanes, host.as_ref(), &answers);
         ui.start();
         ui.run()
     }));
@@ -240,6 +242,7 @@ impl Lanes {
         host: &Arc<dyn Host>,
         tx: &Sender<Msg>,
         shutdown: &Cancel,
+        answers: &Answers,
         status: Option<StatusFetch>,
     ) -> Lanes {
         let strays = Arc::default();
@@ -321,7 +324,7 @@ impl Lanes {
         };
         let actions = {
             let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
-            let (host, shutdown) = (Arc::clone(host), shutdown.clone());
+            let (host, shutdown, answers) = (Arc::clone(host), shutdown.clone(), answers.clone());
             Lane::spawn(
                 "actions",
                 move || make(),
@@ -334,7 +337,8 @@ impl Lanes {
                         ActionsReq::Act { action } => {
                             // Its prompts become dialogs, declined once the shutdown begins
                             // (§7.2, §10.2 step 3).
-                            let mut ask = ChannelAsk::new(out.clone(), shutdown.clone());
+                            let mut ask =
+                                ChannelAsk::new(out.clone(), shutdown.clone(), answers.clone());
                             let outcome = host.act(&action, &mut ask);
                             Msg::ActionDone { action, outcome }
                         }
@@ -474,6 +478,8 @@ pub(crate) struct Ui<'a, T: Tty, P: Pause> {
     host: &'a dyn Host,
     signal: Cancel,
     shutdown: Cancel,
+    /// The senders of the CLI prompts still waiting; `State` holds only their ids.
+    answers: Answers,
     /// Set when the shutdown begins.
     ending: Option<Ending>,
     next_tick: Instant,
@@ -491,6 +497,7 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         rx: &'a Receiver<Msg>,
         lanes: &'a Lanes,
         host: &'a dyn Host,
+        answers: &Answers,
     ) -> Self {
         let tokens = TokensState::new(opts.tokens_provider.clone(), opts.tz.clone());
         let now = now_ms();
@@ -514,6 +521,7 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
             host,
             signal: opts.signal.clone(),
             shutdown: opts.shutdown.clone(),
+            answers: answers.clone(),
             ending: None,
             next_tick: Instant::now() + WAKE,
             #[cfg(test)]
@@ -687,6 +695,7 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
                     }
                 }
                 Cmd::DropLink { link } => self.lanes.live.end_link(link),
+                Cmd::Answer { to, answer } => self.answers.answer(to, answer),
             }
         }
     }
@@ -729,6 +738,7 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
             return;
         }
         self.shutdown.request(signal);
+        self.answers.decline_all();
         self.lanes.close();
         self.apply(Msg::ShutdownBegan { code });
         self.ending = Some(Ending {
@@ -1312,6 +1322,7 @@ mod tests {
         rx: Receiver<Msg>,
         lanes: Lanes,
         host: Arc<dyn Host>,
+        answers: Answers,
         log: Log,
         frames: Log,
         keys: Keys,
@@ -1353,7 +1364,8 @@ mod tests {
         ) -> Fixture {
             let host: Arc<dyn Host> = Arc::new(host(&opts));
             let (tx, rx) = mpsc::channel();
-            let lanes = Lanes::spawn(None, &sources, &host, &tx, &opts.shutdown, status);
+            let answers = Answers::default();
+            let lanes = Lanes::spawn(None, &sources, &host, &tx, &opts.shutdown, &answers, status);
             let log = Log::default();
             Fixture {
                 opts,
@@ -1361,6 +1373,7 @@ mod tests {
                 rx,
                 lanes,
                 host,
+                answers,
                 keys: Keys {
                     log: log.clone(),
                     stuck: Arc::default(),
@@ -1378,6 +1391,7 @@ mod tests {
                 &self.rx,
                 &self.lanes,
                 self.host.as_ref(),
+                &self.answers,
             )
         }
 
@@ -2019,6 +2033,7 @@ mod tests {
             &fx.rx,
             &fx.lanes,
             fx.host.as_ref(),
+            &fx.answers,
         );
         ui.state.dirty = true;
         ui.draw();
@@ -2064,9 +2079,35 @@ mod tests {
             &fx.rx,
             &fx.lanes,
             fx.host.as_ref(),
+            &fx.answers,
         );
         ui.execute(vec![Cmd::Stop]);
         ui.ending.take().expect("the failed stop began a shutdown")
+    }
+
+    #[test]
+    fn a_shutdown_declines_a_waiting_prompt_at_once() {
+        let fx = Fixture::new(quick(), |_| idle());
+        let (tx, rx) = mpsc::channel();
+        let ending = {
+            let mut ui = fx.ui();
+            ui.answers.keep(tx);
+            ui.execute(vec![Cmd::Quit { code: 0 }]);
+            assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+            ui.ending.take().expect("q began the shutdown")
+        };
+        fx.finish(ending);
+
+        let fx = Fixture::new(quick(), |_| idle());
+        let (tx, rx) = mpsc::channel();
+        let ending = {
+            let mut ui = fx.ui();
+            ui.answers.keep(tx);
+            ui.begin_shutdown(143, libc::SIGTERM, None);
+            assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
+            ui.ending.take().expect("a signal began the shutdown")
+        };
+        fx.finish(ending);
     }
 
     #[test]
