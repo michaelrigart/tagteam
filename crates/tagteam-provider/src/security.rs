@@ -407,8 +407,9 @@ impl Keychain for SecurityCli {
         check_name(service)?;
         check_name(account)?;
         // The credential as `-w` text when `escape_text` accepts it, else as hex. Past the line
-        // limit argv carries that same encoding: the hex line is never shorter than the text
-        // line, so there is nothing to gain by switching (H5.1).
+        // limit argv uses the same flag: `-w` with the credential's own (unescaped) text, or
+        // `-X` with hex. The hex line is never shorter than the text line, so there is nothing
+        // to gain by switching (H5.1).
         let text = escape_text(data);
         let value = match &text {
             Some(escaped) => format!("-w \"{escaped}\""),
@@ -429,7 +430,12 @@ impl Keychain for SecurityCli {
             );
             // argv needs no quoting: text goes as is, never as `escape_text`'s output.
             let (flag, arg) = match text {
-                Some(_) => ("-w", String::from_utf8_lossy(data).into_owned()),
+                Some(_) => (
+                    "-w",
+                    std::str::from_utf8(data)
+                        .expect("escape_text accepts only UTF-8")
+                        .to_owned(),
+                ),
                 None => ("-X", hex::encode(data)),
             };
             self.run(

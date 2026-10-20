@@ -3543,7 +3543,8 @@ since 2.1.283.
   tab through; JSON costs about 1.1 bytes per byte this way, against 2 for hex.
   - If the chosen line exceeds 4032 bytes (the 4096-byte `-i` line limit minus 64), use argv
     instead, with the same flag: `-w` followed by the credential's own text, unescaped (argv
-    needs no quoting), or `-X <hex>`. Log a WARN that names the service, the account ID and the
+    needs no quoting), or `-X <hex>`. Log a WARN that names the Keychain item's service and account (a
+    tagteam account ID for a vault item, the login name for Claude Code's own item) and the
     byte length, never the value. Claude Code does the same.
     An over-long `-i` line truncates silently and leaves the old entry.
   - `-U` updates the item in place and preserves its access control.

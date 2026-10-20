@@ -47,8 +47,8 @@ Keychain, crash points and an injectable lock timeout. It is never part of a rel
 `tagteam-provider`'s in-memory doubles (`FakeKeychain`, `FakeClock`, `ScriptedHttp`, `FakeProcessProbe`,
 `ScriptedSpawner`) sit behind its `test-doubles` feature, which only dev-dependencies may enable.
 
-CI also runs `cargo deny check advisories` (the `deny` job, on Linux only). It runs in the cloud
-rather than through `cargo` locally.
+CI also runs `cargo deny check advisories` (the `deny` job, on Linux only). CI is where it runs,
+because `cargo-deny` is not a project tool.
 
 On macOS, CI also runs the tests that use the real `/usr/bin/security` against a throwaway
 keychain file (never your login keychain):
@@ -176,7 +176,7 @@ You do not need to write a spec for a bug fix or a small change.
 - **Keep it focused.** One concern per pull request, in small commits with imperative-mood
   messages (for example, "Refuse an empty alias"). Match the surrounding code and style.
 - **CI must be green.** That means `cargo fmt`, `clippy` with `-D warnings` (both with and
-  without `tagteam/test-support`), and the tests, on macOS and Linux, and the `deny` job.
+  without `tagteam/test-support`), the tests on macOS and Linux, and the `deny` job.
 - **Add tests** for new behaviour and for each bug you fix. Tests must use the fake Keychain,
   scratch directories and `tagteam-fake`; they must never touch a real account, your login
   keychain or your real Claude Code home.

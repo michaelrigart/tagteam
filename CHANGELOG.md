@@ -7,6 +7,34 @@ with the one before, so any release may contain breaking changes. Each section s
 
 ## [Unreleased]
 
+### Added
+
+- Release files carry GitHub artifact attestations; check one with `gh attestation verify`.
+- CI checks RustSec advisories with `cargo-deny`.
+- A WARN when an API key is written into a `~/.claude.json` that other users can read.
+- `tagteam add-token <TOKEN>` prints a one-line warning on stderr that the token was visible on
+  the command line; `tagteam add-token -` and the prompt avoid that.
+
+### Changed
+
+- `--full` exports no longer carry the machine-shared keys (Claude Code's MCP OAuth tokens and
+  plugin secrets); they stay on the machine, as default exports already did.
+- `tagteam add-token -` on a terminal no longer echoes the token.
+- Human output replaces control characters in text tagteam did not write (transcript paths,
+  unmanaged emails, the token endpoint's error text) with U+FFFD. `--json` and CSV are
+  unchanged.
+- Keychain writes send the credential as text on `security`'s standard input, which roughly
+  doubles what fits before the command-line fallback; that fallback now logs a WARN.
+- A refreshed token is written to `rescue/` before the vault write, so a kill during the vault
+  write no longer loses it.
+- The daemon and `tagteam run` wake far less often when idle. A 12-month token report is about
+  twice as fast and uses less than half the memory.
+
+### Security
+
+- The daemon client refuses a socket served by another user.
+- rustls is updated to 0.23.46 (RUSTSEC-2026-0346 to RUSTSEC-2026-0349).
+
 ## [20261016.2230.0] - 2026-10-16
 
 ### Added
