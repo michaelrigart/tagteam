@@ -278,6 +278,34 @@ mod tests {
     }
 
     #[test]
+    fn every_mode_is_listed_in_all() {
+        fn listed(v: Mode) {
+            match v {
+                Mode::Auto | Mode::Collect | Mode::Waiting | Mode::Idle => {
+                    assert!(Mode::ALL.contains(&v), "{v:?} is missing from ALL")
+                }
+            }
+        }
+        listed(Mode::Auto);
+        listed(Mode::Collect);
+        listed(Mode::Waiting);
+        listed(Mode::Idle);
+    }
+
+    #[test]
+    fn every_waiting_for_is_listed_in_all() {
+        fn listed(v: WaitingFor) {
+            match v {
+                WaitingFor::EngineLock | WaitingFor::Schema => {
+                    assert!(WaitingFor::ALL.contains(&v), "{v:?} is missing from ALL")
+                }
+            }
+        }
+        listed(WaitingFor::EngineLock);
+        listed(WaitingFor::Schema);
+    }
+
+    #[test]
     fn auto_events_hands_each_engine_event_on_as_an_auto_kind_with_the_tick_s_end() {
         let log = RefCell::new(Vec::new());
         let daemon = Tagged {

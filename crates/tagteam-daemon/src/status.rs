@@ -240,6 +240,24 @@ mod tests {
     }
 
     #[test]
+    fn every_outcome_kind_is_listed_in_all() {
+        fn listed(v: OutcomeKind) {
+            match v {
+                OutcomeKind::Switch
+                | OutcomeKind::NoSwitch
+                | OutcomeKind::Collect
+                | OutcomeKind::Error => {
+                    assert!(OutcomeKind::ALL.contains(&v), "{v:?} is missing from ALL")
+                }
+            }
+        }
+        listed(OutcomeKind::Switch);
+        listed(OutcomeKind::NoSwitch);
+        listed(OutcomeKind::Collect);
+        listed(OutcomeKind::Error);
+    }
+
+    #[test]
     fn a_new_board_holds_the_daemon_and_its_notifications_and_nothing_else() {
         let board = StatusBoard::new(daemon(), notify());
         assert_eq!(

@@ -42,13 +42,6 @@ pub enum Trigger {
 }
 
 impl Trigger {
-    pub const ALL: [Self; 4] = [
-        Trigger::Proactive,
-        Trigger::AtLimit,
-        Trigger::Failover,
-        Trigger::ConsumeFirst,
-    ];
-
     pub fn as_str(self) -> &'static str {
         match self {
             Trigger::Proactive => "proactive",
@@ -57,6 +50,13 @@ impl Trigger {
             Trigger::ConsumeFirst => "consume-first",
         }
     }
+
+    pub const ALL: [Self; 4] = [
+        Trigger::Proactive,
+        Trigger::AtLimit,
+        Trigger::Failover,
+        Trigger::ConsumeFirst,
+    ];
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
@@ -1110,7 +1110,71 @@ mod tests {
         for trigger in Trigger::ALL {
             assert_eq!(Trigger::parse(trigger.as_str()), Some(trigger));
         }
-        assert_eq!(Trigger::ALL.len(), 4);
+    }
+
+    #[test]
+    fn every_no_switch_reason_is_listed_in_all() {
+        fn listed(v: NoSwitchReason) {
+            match v {
+                NoSwitchReason::UnmanagedActiveAccount
+                | NoSwitchReason::NoActiveAccount
+                | NoSwitchReason::ActiveApiKey
+                | NoSwitchReason::BelowThreshold
+                | NoSwitchReason::ActiveUsageUnknown
+                | NoSwitchReason::Cooldown
+                | NoSwitchReason::NoCandidates
+                | NoSwitchReason::NoComparison
+                | NoSwitchReason::ResetUnknown
+                | NoSwitchReason::AlreadyConsumingSoonest
+                | NoSwitchReason::NoQualifyingCandidate
+                | NoSwitchReason::StaleUsage
+                | NoSwitchReason::AllExhausted
+                | NoSwitchReason::EngineRunning
+                | NoSwitchReason::InterruptedSwitch
+                | NoSwitchReason::LiveChanged
+                | NoSwitchReason::NoViableTarget => {
+                    assert!(
+                        NoSwitchReason::ALL.contains(&v),
+                        "{v:?} is missing from ALL"
+                    )
+                }
+            }
+        }
+        listed(NoSwitchReason::UnmanagedActiveAccount);
+        listed(NoSwitchReason::NoActiveAccount);
+        listed(NoSwitchReason::ActiveApiKey);
+        listed(NoSwitchReason::BelowThreshold);
+        listed(NoSwitchReason::ActiveUsageUnknown);
+        listed(NoSwitchReason::Cooldown);
+        listed(NoSwitchReason::NoCandidates);
+        listed(NoSwitchReason::NoComparison);
+        listed(NoSwitchReason::ResetUnknown);
+        listed(NoSwitchReason::AlreadyConsumingSoonest);
+        listed(NoSwitchReason::NoQualifyingCandidate);
+        listed(NoSwitchReason::StaleUsage);
+        listed(NoSwitchReason::AllExhausted);
+        listed(NoSwitchReason::EngineRunning);
+        listed(NoSwitchReason::InterruptedSwitch);
+        listed(NoSwitchReason::LiveChanged);
+        listed(NoSwitchReason::NoViableTarget);
+    }
+
+    #[test]
+    fn every_trigger_is_listed_in_all() {
+        fn listed(v: Trigger) {
+            match v {
+                Trigger::Proactive
+                | Trigger::AtLimit
+                | Trigger::Failover
+                | Trigger::ConsumeFirst => {
+                    assert!(Trigger::ALL.contains(&v), "{v:?} is missing from ALL")
+                }
+            }
+        }
+        listed(Trigger::Proactive);
+        listed(Trigger::AtLimit);
+        listed(Trigger::Failover);
+        listed(Trigger::ConsumeFirst);
     }
 
     #[test]
