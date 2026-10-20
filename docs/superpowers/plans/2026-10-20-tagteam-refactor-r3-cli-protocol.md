@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/25
 **Goal:** Split `crates/tagteam/src/app.rs` into `app/`, give the CLI one bootstrap and one way to report, warn and refuse, tidy its small duplications, and give the daemon protocol typed, additive accessors, with one user-visible change: `tagteam completions` exits non-zero when it cannot write.
 **Architecture:**
 - **Moves and edits.** Edits that shape `app.rs`'s pieces (dispatch arms becoming methods, the log target pin) land first, inside `app.rs`. The move to `app/` then comes from a deterministic generator script, so it can be regenerated after the hardening rebase. After that come the new helpers in `app/` and the small items.
