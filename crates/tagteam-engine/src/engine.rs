@@ -1,13 +1,11 @@
-use std::fs;
-use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::liveness::ProcessProbe;
 use tagteam_provider::process::ProcessSpawner;
-use tagteam_provider::profile::{ProfileMarker, RunShell};
+use tagteam_provider::profile::RunShell;
 use tagteam_provider::{Cancel, Clock, Env, Http, MutationGuard, Provider, ProviderError, Read};
 
 use crate::account_lock::AccountLock;
@@ -16,7 +14,7 @@ use crate::hooks;
 use crate::oracle::Oracle;
 use crate::registry::ProviderRegistry;
 use crate::settings::Settings;
-use crate::store::{JournalRow, SeedLaunch, Store, StoreError};
+use crate::store::{JournalRow, Store, StoreError};
 use crate::vault::Vault;
 
 /// How a holder of an account lock treats a pending replacement it cannot install (§12.5).
@@ -229,56 +227,6 @@ impl Engine {
             }
             None => Ok(None),
         }
-    }
-
-    /// Token report spec §4 Seeding, asked only by the migration to version 3: each directory
-    /// under `sessions/` as a launch of the provider its marker names, or of every provider
-    /// with sessions when it has no readable marker. It started at the directory's birth time,
-    /// or 0 when the filesystem reports none, and is in use as core §12.6 judges it. `None`
-    /// when `sessions/` or an entry of it cannot be read: a profile may have gone unlisted, so
-    /// the epoch records `seeded = 0` (ruling R1). No `sessions/` at all is no profile.
-    fn seed_launches(&self) -> Option<Vec<SeedLaunch>> {
-        let entries = match fs::read_dir(self.env.data_dir().join("sessions")) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(Vec::new()),
-            Err(_) => return None,
-        };
-        let mut seeds = Vec::new();
-        for entry in entries {
-            let dir = entry.ok()?.path();
-            let meta = match fs::metadata(&dir) {
-                Ok(meta) => meta,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(_) => return None,
-            };
-            let Some(account) = dir.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !meta.is_dir() {
-                continue;
-            }
-            let started_at_ms = meta
-                .created()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-            let named = match ProfileMarker::read(&dir) {
-                Read::Present(m) => Some(m.provider),
-                Read::Absent | Read::Unreadable(_) => None,
-            };
-            for p in self.registry.all() {
-                if !p.capabilities().sessions || named.as_ref().is_some_and(|id| *id != p.id()) {
-                    continue;
-                }
-                seeds.push(SeedLaunch {
-                    provider: p.id(),
-                    account_id: account.to_owned(),
-                    started_at_ms,
-                    in_use: self.session_state_at(p.as_ref(), &dir).owned(),
-                });
-            }
-        }
-        Some(seeds)
     }
 
     pub fn provider(&self, id: &ProviderId) -> Result<Arc<dyn Provider>, EngineError> {
