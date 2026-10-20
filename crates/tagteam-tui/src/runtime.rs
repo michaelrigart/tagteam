@@ -652,6 +652,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use tagteam_core::AccountId;
+    use tagteam_daemon::client::ClientError;
     use tagteam_engine::tokens::{
         IndexProgress, IndexState, RefreshOutcome, TokenPeriod, TokenQuery, TokenReport,
     };
@@ -659,6 +660,7 @@ mod tests {
 
     use super::*;
     use crate::host::{AccountRef, Ask};
+    use crate::live::StatusError;
     use crate::live::{LIVE_QUEUE, Live, LiveQueue};
     use crate::source::{AccountsSnapshot, CollectSummary, Source, SourceError};
     use crate::state::BannerKind;
@@ -2288,7 +2290,9 @@ mod tests {
         let status: StatusFetch = Arc::new(move || {
             if counted.fetch_add(1, Ordering::SeqCst) == 1 {
                 let _ = failing.lock().unwrap().recv();
-                return Err("the daemon closed the connection".into());
+                return Err(StatusError::Client(ClientError::Protocol(
+                    "the daemon closed the connection".into(),
+                )));
             }
             Ok(crate::testutil::daemon_status(
                 vec![crate::testutil::daemon_job("claude-code", "auto", true)],
@@ -2362,7 +2366,7 @@ mod tests {
         // The shutdown stops listening to the live queue, which then says `Gone` whatever it
         // holds, so the live thread returns instead of waiting on a queue nobody takes.
         let path = PathBuf::from("/nonexistent/daemon.sock");
-        let fx = Fixture::with_daemon(quick(), |_| idle(), Arc::new(|| Err("none".into())));
+        let fx = Fixture::with_daemon(quick(), |_| idle(), Arc::new(|| Err(StatusError::NoDaemon)));
         let backoff = Backoff {
             first: Duration::from_millis(10),
             most: Duration::from_millis(20),

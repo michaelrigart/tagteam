@@ -13,7 +13,7 @@ use tagteam_core::{AccountId, ProviderId};
 use tagteam_daemon::protocol::{Event, Status, StatusProvider};
 use tagteam_daemon::tokens::TOKEN_INDEX;
 
-use crate::live::Live;
+use crate::live::{Live, StatusError};
 use crate::msg::Cmd;
 use crate::screens;
 use crate::state::{Screen, State};
@@ -331,7 +331,7 @@ fn reread(state: &mut State, now_ms: i64, views: bool, status: bool) {
 pub(crate) fn on_status(
     state: &mut State,
     link: u64,
-    result: Result<Status, String>,
+    result: Result<Status, StatusError>,
     now_ms: i64,
 ) -> Vec<Cmd> {
     let d = &mut state.daemon;
@@ -480,6 +480,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use serde_json::json;
+    use tagteam_daemon::client::ClientError;
     use tagteam_engine::views::ProviderAccounts;
 
     use super::*;
@@ -914,7 +915,7 @@ mod tests {
         assert_eq!(asked, [Cmd::FetchStatus { link }]);
         let failed = Msg::DaemonStatus {
             link,
-            result: Err("the daemon did not answer in time".into()),
+            result: Err(StatusError::Client(ClientError::Timeout)),
         };
         assert_eq!(
             update(&mut state, failed, NOW_MS + 1_000),
@@ -955,7 +956,9 @@ mod tests {
         assert_eq!(asked, [Cmd::FetchStatus { link: 1 }]);
         let failed = Msg::DaemonStatus {
             link: 1,
-            result: Err("the daemon closed the connection".into()),
+            result: Err(StatusError::Client(ClientError::Protocol(
+                "the daemon closed the connection".into(),
+            ))),
         };
         let at = NOW_MS + 60_000;
         assert_eq!(update(&mut state, failed, at), [Cmd::DropLink { link: 1 }]);
@@ -968,7 +971,7 @@ mod tests {
         };
         update(&mut state, answered, at);
         assert!(state.daemon.live(), "link 2 is followed");
-        for result in [Err("late".to_owned()), Ok(auto_on())] {
+        for result in [Err(StatusError::NoDaemon), Ok(auto_on())] {
             let late = Msg::DaemonStatus { link: 1, result };
             assert!(update(&mut state, late, at + 1).is_empty());
             assert!(state.daemon.live());

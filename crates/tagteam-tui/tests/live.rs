@@ -17,13 +17,16 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tagteam_core::ProviderId;
+use tagteam_daemon::client::ClientError;
 use tagteam_daemon::events::{DaemonEvent, DaemonSink, Mode, StopReason};
 use tagteam_daemon::protocol::Event;
 use tagteam_daemon::server::Server;
 use tagteam_daemon::status::{DaemonInfo, NotifyInfo, ProviderStatus, StatusBoard};
 use tagteam_engine::tokens::IndexState;
 use tagteam_provider::Cancel;
-use tagteam_tui::live::{Backoff, Delivery, Live, LiveQueue, NO_DAEMON, fetch_status, spawn};
+use tagteam_tui::live::{
+    Backoff, Delivery, Live, LiveQueue, NO_DAEMON, StatusError, fetch_status, spawn,
+};
 
 /// How long anything here may take before it counts as stuck.
 const WAIT: Duration = Duration::from_secs(10);
@@ -609,14 +612,15 @@ fn status_with_no_daemon_or_another_protocol_fails_at_once() {
     let dir = short_tempdir();
     let path = dir.path().join("daemon.sock");
     let started = Instant::now();
-    assert_eq!(fetch_status(&path).unwrap_err(), NO_DAEMON);
+    let err = fetch_status(&path).unwrap_err();
+    assert!(matches!(err, StatusError::NoDaemon));
+    assert_eq!(err.to_string(), NO_DAEMON);
     fake(&path, |mut stream| {
         stream.write_all(hello(2).as_bytes()).unwrap();
     });
-    assert_eq!(
-        fetch_status(&path).unwrap_err(),
-        "the daemon speaks protocol 2"
-    );
+    let err = fetch_status(&path).unwrap_err();
+    assert!(matches!(err, StatusError::Mismatch { server: 2 }));
+    assert_eq!(err.to_string(), "the daemon speaks protocol 2");
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
@@ -634,7 +638,8 @@ fn a_daemon_that_never_answers_status_is_given_up_on_after_2_s() {
     let started = Instant::now();
     let error = fetch_status(&path).unwrap_err();
     let took = started.elapsed();
-    assert_eq!(error, "the daemon did not answer in time");
+    assert!(matches!(error, StatusError::Client(ClientError::Timeout)));
+    assert_eq!(error.to_string(), "the daemon did not answer in time");
     assert!(
         took >= Duration::from_secs(2) && took < Duration::from_secs(4),
         "{took:?}"

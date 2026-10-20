@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use tagteam_daemon::client::{Closer, Connect, Events, connect_at};
+use tagteam_daemon::client::{ClientError, Closer, Connect, Events, connect_at};
 use tagteam_daemon::protocol::{Event, Status};
 
 /// What the live thread passes on (spec §8).
@@ -305,15 +305,45 @@ fn linked(events: Events, link: u64, queue: &LiveQueue) -> Attempt {
     }
 }
 
+/// Why the daemon's `status` could not be read (CC-O-23c).
+#[derive(Debug)]
+pub enum StatusError {
+    /// Nothing answers on the socket.
+    NoDaemon,
+    /// The daemon speaks protocol `server`, which this client does not.
+    Mismatch { server: u32 },
+    /// The connection or the reply failed.
+    Client(ClientError),
+}
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StatusError::NoDaemon => f.write_str(NO_DAEMON),
+            StatusError::Mismatch { server } => write!(f, "the daemon speaks protocol {server}"),
+            StatusError::Client(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for StatusError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StatusError::Client(e) => Some(e),
+            StatusError::NoDaemon | StatusError::Mismatch { .. } => None,
+        }
+    }
+}
+
 /// Spec §8: the daemon's `status`, over a short-lived connection of its own, since the live
 /// thread's is the event stream's. It waits 250 ms at most for the greeting and 2 s for the
 /// reply (D5.7).
-pub fn fetch_status(path: &Path) -> Result<Status, String> {
+pub fn fetch_status(path: &Path) -> Result<Status, StatusError> {
     match connect_at(path) {
-        Ok(Connect::Connected(mut client)) => client.status().map_err(|e| e.to_string()),
-        Ok(Connect::NoDaemon) => Err(NO_DAEMON.to_owned()),
-        Ok(Connect::Mismatch { server, .. }) => Err(format!("the daemon speaks protocol {server}")),
-        Err(e) => Err(e.to_string()),
+        Ok(Connect::Connected(mut client)) => client.status().map_err(StatusError::Client),
+        Ok(Connect::NoDaemon) => Err(StatusError::NoDaemon),
+        Ok(Connect::Mismatch { server, .. }) => Err(StatusError::Mismatch { server }),
+        Err(e) => Err(StatusError::Client(e)),
     }
 }
 
