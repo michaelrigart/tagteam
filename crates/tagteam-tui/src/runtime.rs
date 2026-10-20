@@ -22,7 +22,7 @@ use crate::live::{self, Backoff, LIVE_QUEUE, LiveQueue};
 use crate::msg::{ActionsReq, Cmd, DaemonReq, IndexReq, Msg, ReportReq, ViewsReq};
 use crate::screens::tokens::TokensState;
 use crate::source::{Source, SourceFactory};
-use crate::state::{Screen, State};
+use crate::state::{BannerKind, Screen, State};
 use crate::term::{self, RealTty, Tty};
 use crate::theme::Theme;
 use crate::update::{drawn, update};
@@ -768,8 +768,8 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
             return true;
         }
         self.input.resume();
-        self.state.banner = Some(format!("{refused}: {NOT_PAUSED}"));
-        self.state.banner_from = None;
+        self.state
+            .raise_banner(BannerKind::Refusal, format!("{refused}: {NOT_PAUSED}"));
         self.state.dirty = true;
         false
     }
@@ -1919,7 +1919,7 @@ mod tests {
             ui.execute(vec![Cmd::Stop]);
             assert_eq!(fx.log.take(), ["pause", "resume"], "never stopped");
             assert_eq!(
-                ui.state.banner.as_deref(),
+                ui.state.banner_text(),
                 Some(
                     "Ctrl-Z did not suspend: the TUI's key reader did not pause in time; try again"
                 )
@@ -2156,24 +2156,27 @@ mod tests {
 
     #[test]
     fn a_refusal_banner_is_no_lane_death_and_the_next_good_read_clears_it() {
-        use crate::state::BannerKind;
         let fx = Fixture::new(quick(), |_| idle());
         fx.keys.stuck.store(true, Ordering::SeqCst);
         let ending = {
             let mut ui = fx.ui();
             ui.start();
-            ui.state.banner = Some("usage was not collected: earlier".into());
-            ui.state.banner_from = Some(BannerKind::Collect);
+            ui.state
+                .raise_banner(BannerKind::Collect, "usage was not collected: earlier");
             ui.execute(vec![Cmd::Suspend(Action::Run(account_a()))]);
             assert!(ui.state.banner.is_some());
-            assert_eq!(ui.state.banner_from, None, "it owns no read's lifetime");
+            assert_eq!(
+                ui.state.banner.as_ref().map(|b| b.kind),
+                Some(BannerKind::Refusal),
+                "it owns no read's lifetime"
+            );
             let r#gen = ui.state.gens.accounts;
             let snapshot = crate::testutil::snapshot(crate::testutil::many(1));
             ui.apply(Msg::Accounts {
                 r#gen,
                 result: Ok(snapshot),
             });
-            assert_eq!(ui.state.banner, None, "a good read clears it (R18)");
+            assert!(ui.state.banner.is_none(), "a good read clears it (R18)");
             assert!(ui.ending.is_none() && ui.state.quitting.is_none());
             fx.key('q');
             ui.run()
