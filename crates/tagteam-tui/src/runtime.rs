@@ -22,7 +22,7 @@ use crate::live::{self, Backoff, LIVE_QUEUE, LiveQueue};
 use crate::msg::{ActionsReq, Cmd, DaemonReq, IndexReq, Msg, ReportReq, ViewsReq};
 use crate::screens::tokens::TokensState;
 use crate::source::{Source, SourceFactory};
-use crate::state::{BannerKind, Screen, State};
+use crate::state::{Screen, State};
 use crate::term::{self, RealTty, Tty};
 use crate::theme::Theme;
 use crate::update::{drawn, update};
@@ -730,8 +730,7 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         }
         self.shutdown.request(signal);
         self.lanes.close();
-        self.state.quitting = Some(code);
-        self.state.dirty = true;
+        self.apply(Msg::ShutdownBegan { code });
         self.ending = Some(Ending {
             code,
             fatal,
@@ -762,23 +761,23 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
 
     /// §7.3 step 1, before the terminal is handed over: true once the input thread has said it
     /// reads no more. Otherwise the pause is withdrawn, the terminal kept, and the banner says
-    /// that `refused`, and why.
-    fn paused(&mut self, refused: &str) -> bool {
+    /// that `action` did not start, or, for `None`, that Ctrl-Z did not suspend, and why.
+    fn paused(&mut self, action: Option<&Action>) -> bool {
         if self.input.pause() {
             return true;
         }
         self.input.resume();
-        self.state
-            .raise_banner(BannerKind::Refusal, format!("{refused}: {NOT_PAUSED}"));
-        self.state.dirty = true;
+        self.apply(Msg::SuspendRefused {
+            action: action.cloned(),
+            why: NOT_PAUSED,
+        });
         false
     }
 
     /// §7.3: runs `action` with the terminal handed back, then takes the terminal again. When
     /// the input thread does not pause, nothing runs and the TUI keeps the terminal.
     fn suspend(&mut self, action: Action) {
-        if !self.paused(&format!("{} did not start", action.name())) {
-            self.state.running = None;
+        if !self.paused(Some(&action)) {
             return;
         }
         self.tty.release();
@@ -833,7 +832,7 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
     /// again, and redrawn, once it is continued. Refused, as a suspension is, when the input
     /// thread does not pause.
     fn stop(&mut self) {
-        if !self.paused("Ctrl-Z did not suspend") {
+        if !self.paused(None) {
             return;
         }
         match self.tty.stop() {
@@ -890,6 +889,7 @@ mod tests {
     use crate::host::{AccountRef, Ask};
     use crate::live::Live;
     use crate::source::{AccountsSnapshot, CollectSummary, SourceError};
+    use crate::state::BannerKind;
     use crate::term::repaint;
 
     /// What the fake terminal and input were asked to do, in order.

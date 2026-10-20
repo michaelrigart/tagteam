@@ -127,6 +127,23 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
         // The runtime takes the live queue at each wake, and applies what it holds as `Live`.
         Msg::LiveReady => vec![],
         Msg::DaemonStatus { link, result } => daemon::on_status(state, link, result, now_ms),
+        Msg::ShutdownBegan { code } => {
+            state.quitting = Some(code);
+            state.dirty = true;
+            vec![]
+        }
+        Msg::SuspendRefused { action, why } => {
+            let words = match &action {
+                Some(action) => format!("{} did not start: {why}", action.name()),
+                None => format!("Ctrl-Z did not suspend: {why}"),
+            };
+            state.raise_banner(BannerKind::Refusal, words);
+            if action.is_some() {
+                state.running = None;
+            }
+            state.dirty = true;
+            vec![]
+        }
     }
 }
 
@@ -371,6 +388,62 @@ mod tests {
         );
         assert!(update(&mut state, Msg::LaneDied { lane: "actions" }, NOW_MS).is_empty());
         assert_eq!(state.quitting, Some(1));
+    }
+
+    #[test]
+    fn the_runtime_s_shutdown_sets_the_exit_code_and_leaves_the_dialog() {
+        let mut state = fresh(Screen::Accounts);
+        update(&mut state, ch('?'), NOW_MS);
+        state.dirty = false;
+        assert!(update(&mut state, Msg::ShutdownBegan { code: 143 }, NOW_MS).is_empty());
+        assert_eq!(state.quitting, Some(143));
+        assert!(state.dirty);
+        assert!(matches!(state.overlay, Some(Overlay::Help)));
+    }
+
+    #[test]
+    fn a_refused_hand_over_raises_a_refusal_and_frees_only_its_own_action() {
+        let account = || crate::host::AccountRef {
+            id: id(1),
+            provider: cc(),
+            position: 1,
+        };
+        let mut state = fresh(Screen::Accounts);
+        let run = crate::host::Action::Run(account());
+        state.running = Some(run.clone());
+        state.dirty = false;
+        let cmds = update(
+            &mut state,
+            Msg::SuspendRefused {
+                action: Some(run.clone()),
+                why: "w",
+            },
+            NOW_MS,
+        );
+        assert!(cmds.is_empty() && state.dirty);
+        assert_eq!(
+            state.banner_text(),
+            Some(format!("{} did not start: w", run.name()).as_str())
+        );
+        assert_eq!(
+            state.banner.as_ref().map(|b| b.kind),
+            Some(BannerKind::Refusal)
+        );
+        assert_eq!(state.running, None);
+
+        let switch = crate::host::Action::Switch(account());
+        state.running = Some(switch.clone());
+        let cmds = update(
+            &mut state,
+            Msg::SuspendRefused {
+                action: None,
+                why: "w",
+            },
+            NOW_MS,
+        );
+        assert!(cmds.is_empty());
+        assert_eq!(state.banner_text(), Some("Ctrl-Z did not suspend: w"));
+        assert_eq!(state.running, Some(switch));
     }
 
     #[test]
