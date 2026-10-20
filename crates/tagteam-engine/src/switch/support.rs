@@ -1,6 +1,9 @@
-use tagteam_core::ProviderId;
-use tagteam_provider::{DoomedEntry, Identity, LiveAuth, Provenance, Provider, Read, ReadError};
+use tagteam_core::{AccountId, ProviderId};
+use tagteam_provider::{
+    DoomedEntry, Identity, LiveAuth, Provenance, Provider, ProviderError, Read, ReadError,
+};
 
+use crate::displace::displace;
 use crate::engine::Engine;
 use crate::error::EngineError;
 use crate::session::{SessionState, session_owned_error};
@@ -147,6 +150,114 @@ pub(super) fn attributed<'i>(
     live_identity.filter(|_| own_secret == Some(bytes))
 }
 
+/// What a change that overwrites or deletes live entries carries while it saves them (§9.4
+/// steps 2, 4 and 7): the generations already kept, the warnings the saves raise, and whom a
+/// saved secret may be attributed to.
+pub(crate) struct Settle<'a> {
+    pub(crate) p: &'a dyn Provider,
+    pub(crate) provider: &'a ProviderId,
+    pub(crate) held: Held,
+    pub(crate) force: bool,
+    pub(crate) live_identity: Option<&'a Identity>,
+    pub(crate) own_secret: Option<&'a [u8]>,
+    pub(crate) warnings: Vec<String>,
+}
+
+impl<'a> Settle<'a> {
+    /// `force` false, no live identity or own secret, nothing held.
+    pub(crate) fn new(
+        p: &'a dyn Provider,
+        provider: &'a ProviderId,
+        warnings: Vec<String>,
+    ) -> Self {
+        Self {
+            p,
+            provider,
+            held: Held::default(),
+            force: false,
+            live_identity: None,
+            own_secret: None,
+            warnings,
+        }
+    }
+
+    /// Records the generations `id`'s vault holds, current and `.prev`. One that cannot be read
+    /// is left out, so what it may hold is saved rather than assumed kept.
+    pub(crate) fn hold_vault(&mut self, engine: &Engine, id: &AccountId) {
+        for bytes in [engine.vault.read(id), engine.vault.read_prev(id)]
+            .into_iter()
+            .filter_map(Read::present)
+        {
+            self.held.hold(self.p, &bytes);
+        }
+    }
+
+    /// §9.4 step 7: saves `bytes`, a live entry a change is about to overwrite or delete, unless
+    /// it holds nothing account-scoped or a generation `held` already keeps. Either way the
+    /// generation is held from then on, so no entry of it is saved twice. A failed save aborts,
+    /// except under `force` (B.5). The row names `live_identity` only when `bytes` is
+    /// `own_secret`, the live login's own (§6.3, Decision 13). A secret on the other auth axis
+    /// gets no identity.
+    pub(crate) fn save_unheld(&mut self, engine: &Engine, bytes: &[u8]) -> Result<(), EngineError> {
+        match self.p.fingerprint(bytes) {
+            Some(fp) if self.held.insert(fp.as_str()) => {
+                let saved = self.displace_live(
+                    engine,
+                    bytes,
+                    "displaced-live-login",
+                    attributed(self.live_identity, self.own_secret, bytes),
+                );
+                unless_forced(saved, self.force, &mut self.warnings)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Saves a live secret the switch is about to overwrite or clear (§6.3, B.5), unless it
+    /// carries nothing account-scoped: an entry holding only machine-shared keys loses nothing,
+    /// since those are carried over. The error is the failed save; whether it aborts is the
+    /// caller's call (B.5: it does, except under --force).
+    pub(crate) fn displace_live(
+        &mut self,
+        engine: &Engine,
+        bytes: &[u8],
+        reason: &str,
+        identity: Option<&Identity>,
+    ) -> Result<(), EngineError> {
+        let Some(fp) = self.p.fingerprint(bytes) else {
+            return Ok(());
+        };
+        let id = displace(
+            engine,
+            self.provider,
+            bytes,
+            Some(&fp),
+            reason,
+            identity.map(|i| &i.raw),
+        )?;
+        self.warnings.push(format!(
+            "the previous live credential was saved as displaced/{id}.json"
+        ));
+        Ok(())
+    }
+
+    /// What the provider calls before its Keychain fallback deletes an entry: saves it unless
+    /// a generation already kept holds it.
+    pub(crate) fn before_fallback(
+        &mut self,
+        engine: &Engine,
+        bytes: &[u8],
+    ) -> Result<(), ProviderError> {
+        self.save_unheld(engine, bytes).map_err(fallback_save_error)
+    }
+}
+
+fn fallback_save_error(e: EngineError) -> ProviderError {
+    ProviderError::Invalid(format!(
+        "could not save a credential the Keychain fallback would delete: {e}"
+    ))
+}
+
 /// The pre-lock oracle answer (§9.4 "Before locking"). It is about exact live bytes, not
 /// about an account: it counts only while the live secret is still those bytes (§9.4 step 4),
 /// and is attributed to an account only through `verdict` (§7.6).
@@ -251,5 +362,20 @@ impl Engine {
             None => None,
         };
         Ok((live, row))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_fallback_save_names_the_credential_it_protects() {
+        let e = EngineError::NoSuchAccount("work".into());
+        let own = e.to_string();
+        assert_eq!(
+            fallback_save_error(e).to_string(),
+            format!("could not save a credential the Keychain fallback would delete: {own}")
+        );
     }
 }

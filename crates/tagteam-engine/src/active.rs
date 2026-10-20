@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use tagteam_core::{AccountId, Fingerprint, OracleVerdict, ProviderId};
 use tagteam_provider::{
-    Cancel, CredLocks, Credential, LiveChange, Provenance, Provider, ProviderError, Read,
-    RefreshResult, StoredLogin,
+    Cancel, CredLocks, Credential, LiveChange, Provenance, Provider, Read, RefreshResult,
+    StoredLogin,
 };
 
 use crate::account_lock::AccountLock;
@@ -20,7 +20,7 @@ use crate::refresh::{
 };
 use crate::rescue::{RescueEntry, RescueFile};
 use crate::store::AccountRow;
-use crate::switch::{Held, OracleHint, answer_for, refuse_unreadable};
+use crate::switch::{OracleHint, Settle, answer_for, refuse_unreadable};
 
 /// §7.5 step 5: how long the token request may take while CC's credential locks are held
 /// (§4.3's second bounded exception).
@@ -653,22 +653,12 @@ impl Engine {
         if let Err(e) = refuse_unreadable(&doomed) {
             return not_published(e);
         }
-        let mut held = Held::default();
-        held.hold(p, secret);
-        self.hold_vault(p, &mut held, &row.id);
-        let mut warnings = Vec::new();
+        let mut cx = Settle::new(p, &row.provider, Vec::new());
+        cx.held.hold(p, secret);
+        cx.hold_vault(self, &row.id);
         for entry in &doomed {
             if let Read::Present(bytes) = &entry.bytes {
-                if let Err(e) = self.save_unheld(
-                    p,
-                    &row.provider,
-                    bytes,
-                    &mut held,
-                    false,
-                    None,
-                    None,
-                    &mut warnings,
-                ) {
+                if let Err(e) = cx.save_unheld(self, bytes) {
                     return not_published(e);
                 }
             }
@@ -679,29 +669,13 @@ impl Engine {
             identity: p.parse_identity(&row.identity_json)?,
         };
         let written = {
-            let mut before_fallback = |bytes: &[u8]| {
-                self.save_unheld(
-                    p,
-                    &row.provider,
-                    bytes,
-                    &mut held,
-                    false,
-                    None,
-                    None,
-                    &mut warnings,
-                )
-                .map_err(|e| {
-                    ProviderError::Invalid(format!(
-                        "could not save a credential the Keychain fallback would delete: {e}"
-                    ))
-                })
-            };
+            let mut before_fallback = |bytes: &[u8]| cx.before_fallback(self, bytes);
             // The undo is dropped, never run: it would write the consumed generation back. The
             // storage-write wait honours `cancel`, as the config-lock wait did (§9.1, §14.1).
             p.write_credential(&env, &locks, &login, &mut before_fallback)
                 .map(|_| ())
         };
-        for w in &warnings {
+        for w in &cx.warnings {
             tracing::warn!(
                 position = row.position,
                 account = %row.id,
