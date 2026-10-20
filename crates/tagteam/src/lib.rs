@@ -28,6 +28,9 @@ mod transfer_cmd;
 mod tui_cmd;
 pub mod tui_host;
 
+/// The `schemaVersion` every `--json` object carries.
+pub(crate) const SCHEMA_VERSION: u32 = 1;
+
 const TEXT_UNDER_JSON: &str = "--help and --version print text; run them without --json";
 
 /// A usage error without the command-line values clap would repeat: any argument may be a

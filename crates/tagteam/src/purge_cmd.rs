@@ -4,6 +4,8 @@
 use serde_json::{Value, json};
 use tagteam_engine::purge::{PurgePlan, PurgeReport};
 
+use crate::SCHEMA_VERSION;
+
 /// `n` and the noun, which takes an `s` unless `n` is 1.
 fn count(n: usize, noun: &str) -> String {
     if n == 1 {
@@ -115,7 +117,7 @@ pub(crate) fn json(report: &PurgeReport, provider: Option<&str>) -> Value {
         .map(|(what, message)| json!({"what": what, "message": message}))
         .collect();
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "ok": report.failures.is_empty(),
         "provider": provider,
         "accounts": accounts,

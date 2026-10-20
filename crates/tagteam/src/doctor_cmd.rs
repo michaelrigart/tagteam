@@ -7,6 +7,8 @@ use tagteam_core::ProviderId;
 use tagteam_engine::doctor::DoctorReport;
 use tagteam_provider::CheckStatus;
 
+use crate::SCHEMA_VERSION;
+
 /// The heading of tagteam's own checks, when the report is headed at all.
 const OWN: &str = "tagteam";
 
@@ -80,7 +82,7 @@ pub(crate) fn json(report: &DoctorReport) -> Value {
             })
         })
         .collect();
-    json!({"schemaVersion": 1, "ok": report.ok(), "checks": checks})
+    json!({"schemaVersion": SCHEMA_VERSION, "ok": report.ok(), "checks": checks})
 }
 
 #[cfg(test)]

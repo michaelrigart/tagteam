@@ -4,6 +4,7 @@ use serde_json::json;
 use tagteam_engine::EngineError;
 use tagteam_engine::store::{Mapping, StoreError};
 
+use crate::SCHEMA_VERSION;
 use crate::{displaced_cmd, render};
 
 use crate::app::App;
@@ -114,7 +115,7 @@ impl App<'_, '_> {
             row.position
         );
         let mapping = render::mapping_json(&mapping, &row);
-        let json = json!({"schemaVersion": 1, "ok": true, "mapping": mapping});
+        let json = json!({"schemaVersion": SCHEMA_VERSION, "ok": true, "mapping": mapping});
         self.print(&human, json);
         Ok(())
     }
@@ -134,7 +135,8 @@ impl App<'_, '_> {
         } else {
             format!("Unmapped {path}.\n")
         };
-        let json = json!({"schemaVersion": 1, "ok": true, "path": path, "removed": removed});
+        let json =
+            json!({"schemaVersion": SCHEMA_VERSION, "ok": true, "path": path, "removed": removed});
         self.print(&human, json);
         Ok(())
     }

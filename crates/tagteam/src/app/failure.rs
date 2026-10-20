@@ -5,6 +5,7 @@ use tagteam_daemon::daemon::DaemonError;
 use tagteam_engine::EngineError;
 use tagteam_engine::displace::PurgeError;
 
+use crate::SCHEMA_VERSION;
 use crate::displaced_cmd;
 
 use super::Ended;
@@ -112,7 +113,7 @@ pub(super) fn cancelled() -> Failure {
 
 /// §13.2: the one object `--json` prints for any error.
 pub(crate) fn error_json(kind: &str, message: &str) -> Value {
-    json!({"schemaVersion": 1, "error": {"type": kind, "message": message}})
+    json!({"schemaVersion": SCHEMA_VERSION, "error": {"type": kind, "message": message}})
 }
 
 /// `error_json` for a purge that stopped part way, with `deleted` added beside `error`.

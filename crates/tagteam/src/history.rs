@@ -7,6 +7,8 @@ use tagteam_core::time::format_iso8601;
 use tagteam_engine::views::{HistoryView, HistoryWindow};
 use tagteam_engine::words;
 
+use crate::SCHEMA_VERSION;
+
 const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 /// The widest sparkline. A longer history is bucketed, and each bucket shows its peak.
 const SPARK_WIDTH: usize = 60;
@@ -124,7 +126,7 @@ pub(crate) fn json(view: &HistoryView, provider: &str) -> Value {
     let row = &view.account.row;
     let windows: Vec<Value> = view.windows.iter().map(window_json).collect();
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "provider": provider,
         "account": {"number": row.position, "id": row.id.as_str(), "email": words::email(row)},
         "windows": windows,
