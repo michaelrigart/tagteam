@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::Strategy;
-use tagteam_core::rank::span;
+use tagteam_core::fmt::span;
 use tagteam_core::trust::is_future_stamped;
 use tagteam_core::usage::WindowKind;
 use tagteam_core::{ProvenanceVerdict, provenance};

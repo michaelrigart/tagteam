@@ -48,7 +48,7 @@ pub fn account_cell(r: &AccountRow) -> String {
 
 // A span of time as `list` and `status` show it: `3d09h`, `2h40m`, `45m`, or `<1m`. The usage
 // strategies' messages state a reset in the same words, so there is one formatter.
-pub use tagteam_core::rank::span as duration;
+pub use tagteam_core::fmt::span as duration;
 
 /// The time left until `at`, or `reset` once it has passed: the reading predates the window's
 /// reset, so its pct no longer applies.

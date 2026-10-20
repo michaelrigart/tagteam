@@ -2,8 +2,9 @@
 
 use std::cmp::Ordering;
 
+use crate::fmt::span;
 use crate::ids::AccountId;
-use crate::rank::{binding_window, blocked_until, span};
+use crate::rank::{binding_window, blocked_until};
 use crate::usage::{Window, headroom};
 
 /// `autoswitch.strategy` (§6.4).

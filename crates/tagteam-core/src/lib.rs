@@ -4,6 +4,7 @@ pub mod autoswitch;
 pub mod backoff;
 pub mod classify;
 pub mod fingerprint;
+pub mod fmt;
 pub mod ids;
 pub mod merge;
 pub mod pace;

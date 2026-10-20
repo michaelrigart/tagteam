@@ -11,7 +11,7 @@ use tagteam_core::autoswitch::{
     AccountSnapshot, AutoConfig, AutoState, Decision, Live, NoSwitchReason, Outcome, Phase,
     Snapshot, Strategy, Trigger, decide, departure,
 };
-use tagteam_core::rank::span;
+use tagteam_core::fmt::span;
 use tagteam_core::usage::headroom;
 use tagteam_core::{AccountId, Fingerprint, ProviderId, Window, WindowKind};
 use tagteam_provider::{Env, FlockGuard, LockError, ProcessStamp, Provider, Read, ReadError};
