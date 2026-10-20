@@ -25,8 +25,6 @@ use tagteam_provider::{Clock, Env, EnvError, Keychain, Platform, SystemClock};
 
 use crate::prompt::Prompter;
 
-use super::failure::fail_to;
-
 const NO_COLOR: &str = "NO_COLOR";
 const FORCE_COLOR: &str = "FORCE_COLOR";
 
@@ -163,10 +161,6 @@ impl Io<'_> {
 
     pub(crate) fn note(&mut self, note: &str) {
         note_to(self.err, note);
-    }
-
-    pub(crate) fn fail(&mut self, json: bool, kind: &str, message: &str) -> i32 {
-        fail_to(self.out, self.err, json, kind, message)
     }
 }
 

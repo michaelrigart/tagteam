@@ -19,7 +19,7 @@ pub(crate) const HAND_OFF: &str = "this export hands its OAuth logins over rathe
 
 /// The export's file while it is made (§13.3): a temporary file created 0600 with `O_EXCL`
 /// beside the destination before any account is read, so a destination that cannot be written
-/// refuses first (Review Focus 5). `publish` renames it into place; dropped unpublished, it is
+/// refuses first. `publish` renames it into place; dropped unpublished, it is
 /// removed.
 pub(crate) struct ExportFile {
     temp: PathBuf,

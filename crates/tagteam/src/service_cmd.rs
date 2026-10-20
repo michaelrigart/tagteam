@@ -692,7 +692,7 @@ mod tests {
 
     #[test]
     fn a_daemon_that_holds_its_lock_but_does_not_greet_is_running() {
-        // D8.2: a listener that never greets is a daemon there but hung (Task 3's Timeout).
+        // D8.2: a listener that never greets is a daemon there but hung (`ClientError::Timeout`).
         // With a live holder of daemon.lock it runs, with the lock's pid. Without one, whatever
         // listens is no daemon tagteam knows, and that is an error.
         let short = tempfile::Builder::new()

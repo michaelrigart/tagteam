@@ -119,15 +119,11 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     }
     // §13.5: the status bar's fast path, before anything else is built.
     if let Some(Command::Statusline { print_config }) = &cli.command {
-        let color = ColorEnv {
-            stdout_terminal: true,
-            ..ColorEnv::of(&ctx, cli.no_color)
-        };
         return Ended::Code(run_statusline(
             ctx,
             io,
             json,
-            color,
+            cli.no_color,
             cli.provider,
             *print_config,
         ));
@@ -138,8 +134,8 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
         return refuse_tui(io, json);
     }
     // §12.7: the wrapper needs only the registered providers, so it reads no store and no
-    // settings. It comes after the marker check: under a marker that cannot be read it refuses,
-    // as every command but `statusline` does (§12.8).
+    // settings. Its first action is the marker check (`locate_run_shell`): under a marker that
+    // cannot be read it refuses, as every command but `statusline` does (§12.8).
     if let Some(Command::ShellInit { shell }) = &cli.command {
         return Ended::Code(match locate_run_shell(&ctx) {
             Ok(located) => {
@@ -149,8 +145,9 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
         });
     }
     // §13.7: a script from the command definitions alone. It reads no settings, no store and no
-    // Keychain, so it warns about nothing and creates nothing. After the marker check: an
-    // unreadable marker refuses every command but `statusline` (§12.8).
+    // Keychain, so it warns about nothing and creates nothing. Its first action is the marker
+    // check (`locate_run_shell`): an unreadable marker refuses every command but `statusline`
+    // (§12.8).
     if let Some(Command::Completions { shell }) = &cli.command {
         return match locate_run_shell(&ctx) {
             Ok(_) => answer_completions(io, json, *shell),

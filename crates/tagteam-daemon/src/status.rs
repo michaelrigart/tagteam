@@ -1,5 +1,5 @@
 //! D5.4: the daemon's status, as a snapshot its jobs keep current (Decision 12). The
-//! scheduler's jobs write it after each run; plan B's server reads it and fills in
+//! scheduler's jobs write it after each run; the socket server reads it and fills in
 //! `subscribers` and `socket`. Reading it never touches the store and never waits for a job.
 
 use std::path::PathBuf;
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn the_server_s_fields_are_kept_beside_the_jobs_lines() {
-        // Decision 12: plan B's server sets the subscribers and the socket; the notifier's
+        // Decision 12: the socket server sets the subscribers and the socket; the notifier's
         // state may change. None of it touches what the jobs wrote.
         let board = StatusBoard::new(daemon(), notify());
         board.set_provider(provider("claude-code", Mode::Auto));

@@ -1253,7 +1253,7 @@ mod tests {
 
     #[test]
     fn a_live_login_tagteam_does_not_manage_is_never_acted_on() {
-        // Review Focus 5: `claude /login` with a new account. Whatever the state, every tick
+        // `claude /login` with a new account. Whatever the state, every tick
         // stops at step 2 and leaves the counter alone.
         let accounts = vec![at(1, 100.0), at(2, 20.0)];
         let unmanaged = Snapshot {
@@ -2393,7 +2393,7 @@ mod tests {
 
     #[test]
     fn every_account_at_its_limit_for_days_never_flaps_and_sleeps_at_most_600_s() {
-        // Review Focus 4: the weekly window is spent everywhere. 2 recovers first, in a day.
+        // The weekly window is spent everywhere. 2 recovers first, in a day.
         let spent = |p, back| reset(at(p, 100.0), "7d", Some(back));
         let day = 86_400;
         let accounts = vec![

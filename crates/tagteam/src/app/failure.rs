@@ -141,6 +141,12 @@ pub(crate) fn fail_to(
     EXIT_ERROR
 }
 
+impl Io<'_> {
+    pub(crate) fn fail(&mut self, json: bool, kind: &str, message: &str) -> i32 {
+        fail_to(self.out, self.err, json, kind, message)
+    }
+}
+
 /// A purge's failure after it deleted something: the human form lists each deletion before the
 /// error, and `--json` carries them as `deleted` beside `error`.
 fn fail_purge(io: &mut Io<'_>, json: bool, e: &PurgeError) -> i32 {

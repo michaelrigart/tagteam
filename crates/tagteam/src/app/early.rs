@@ -27,7 +27,7 @@ pub(super) fn run_statusline(
     ctx: Context,
     io: &mut Io<'_>,
     json: bool,
-    color: ColorEnv,
+    no_color: bool,
     provider: Option<String>,
     print_config: bool,
 ) -> i32 {
@@ -35,6 +35,12 @@ pub(super) fn run_statusline(
         io.fail(true, KIND_USAGE, STATUSLINE_UNDER_JSON);
         return EXIT_USAGE;
     }
+    // The line goes to Claude Code, which renders ANSI colour but is never a terminal, so
+    // `auto` colours it: the same rule as `list`, with the terminal test taken as met.
+    let color = ColorEnv {
+        stdout_terminal: true,
+        ..ColorEnv::of(&ctx, no_color)
+    };
     let (engine, provider) = statusline::engine(ctx, provider.as_deref());
     let session_id = engine
         .provider(&provider)
@@ -59,8 +65,6 @@ pub(super) fn run_statusline(
         }
         let view = engine.statusline(&provider)?;
         let settings = engine.settings();
-        // The line goes to Claude Code, which renders ANSI colour but is never a terminal, so
-        // `auto` colours it: the same rule as `list`, with the terminal test taken as met.
         let colour = color.enabled(settings.color);
         Ok(statusline::line(
             &view,
