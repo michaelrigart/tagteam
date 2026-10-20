@@ -420,6 +420,7 @@ mod hooks {
     use tagteam_cc::{ItemKind, keychain_service};
     use tagteam_engine::EngineError;
 
+    use super::common::capture_logs_with_targets;
     use super::*;
 
     #[test]
@@ -458,6 +459,24 @@ mod hooks {
         );
         no_email(&logs);
         no_token(&logs);
+    }
+
+    #[test]
+    fn a_rolled_back_switch_logs_under_the_switch_target() {
+        let _serial = one_at_a_time();
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        fx.add("b@x.co", "rt-b");
+        fx.engine.fail_at(Some("after-credential"));
+        let (err, logs) = capture_logs_with_targets(|| fx.switch_to(&a, false).unwrap_err());
+        assert!(matches!(err, EngineError::RolledBack(_)), "{err}");
+        let found = at(&logs, "WARN", "rolled back a switch");
+        assert_eq!(found.len(), 1, "{logs:#?}");
+        assert!(
+            found[0].contains(" tagteam_engine::switch: "),
+            "{}",
+            found[0]
+        );
     }
 
     #[test]
