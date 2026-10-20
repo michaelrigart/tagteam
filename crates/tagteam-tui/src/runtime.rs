@@ -130,11 +130,15 @@ pub(crate) fn run_with<T: Tty, P: Pause>(
         ui.run()
     }));
     // A panic on the UI thread: the hook has restored the terminal and logged it (§10.1), and
-    // the lanes still drain (§10.2).
-    let ending = driven.unwrap_or(Ending {
-        code: 1,
-        fatal: None,
-        report: String::new(),
+    // the lanes still drain (§10.2). `begin_shutdown` never ran, so a prompt still waiting is
+    // declined here (§10.2 step 3); on every other path it already was.
+    let ending = driven.unwrap_or_else(|_| {
+        answers.decline_all();
+        Ending {
+            code: 1,
+            fatal: None,
+            report: String::new(),
+        }
     });
     finish(lanes, &opts.shutdown, &rx, ending, restore)
 }
