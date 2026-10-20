@@ -122,8 +122,9 @@ fn a_rotated_profile_is_captured_when_its_token_expires_earlier() {
     let GateOutcome::AlreadyFresh(bytes) = outcome else {
         panic!("{outcome:?}")
     };
-    assert_eq!(bytes, rotated);
-    assert_eq!(fx.vault_bytes(&a).unwrap(), rotated);
+    let kept = fx.cc.vault_form(&rotated).into_owned();
+    assert_eq!(bytes, kept);
+    assert_eq!(fx.vault_bytes(&a).unwrap(), kept);
     assert_eq!(prev_refresh_token(&fx, &a).as_deref(), Some("rt-a"));
     assert_eq!(seed_of(&dir).seed_fp, fp(&fx, "rt-a2"));
     assert_eq!(token_requests(&fx), 0);
@@ -189,8 +190,9 @@ fn a_rotated_profile_is_still_captured_after_the_data_directory_moved() {
         let GateOutcome::AlreadyFresh(bytes) = outcome else {
             panic!("{platform:?}: {outcome:?}")
         };
-        assert_eq!(bytes, rotated, "{platform:?}");
-        assert_eq!(fx.vault_bytes(&a).unwrap(), rotated, "{platform:?}");
+        let kept = fx.cc.vault_form(&rotated).into_owned();
+        assert_eq!(bytes, kept, "{platform:?}");
+        assert_eq!(fx.vault_bytes(&a).unwrap(), kept, "{platform:?}");
         assert_eq!(token_requests(&fx), 0, "{platform:?}");
         assert_eq!(seed_of(&dir).seed_fp, fp(&fx, "rt-a2"), "{platform:?}");
         assert_eq!(

@@ -1,14 +1,15 @@
 mod common;
 
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use common::{Fx, block_rescue, due, quarantine_of, unblock_rescue, vault_fp};
+use common::{Fx, block_rescue, due, quarantine_of, rescue_files, unblock_rescue, vault_fp};
 use serde_json::{Value, json};
 use tagteam_core::AccountId;
 use tagteam_engine::refresh::GateOutcome;
 use tagteam_engine::vault::{KeychainVault, SERVICE, Vault, VaultBackend, VaultError};
-use tagteam_provider::Read;
 use tagteam_provider::http::Method;
+use tagteam_provider::{Clock, Read, ReadError};
 
 fn refresh(fx: &Fx, id: &AccountId, snapshot: &[u8]) -> GateOutcome {
     fx.engine
@@ -164,6 +165,60 @@ fn a_response_without_a_refresh_token_keeps_the_lineage() {
     );
     let stored: Value = serde_json::from_slice(&fx.vault_bytes(&a).unwrap()).unwrap();
     assert_eq!(stored["claudeAiOauth"]["accessToken"], "at-same");
+}
+
+/// A vault whose first read of `target` after writing it fails: a read-back that could not
+/// confirm a write that landed.
+struct ReadBackFailsOnce {
+    inner: KeychainVault,
+    target: String,
+    armed: AtomicBool,
+}
+
+impl VaultBackend for ReadBackFailsOnce {
+    fn read(&self, key: &str) -> Read<Vec<u8>> {
+        if key == self.target && self.armed.swap(false, Ordering::SeqCst) {
+            return Read::Unreadable(ReadError::new("vault", "the read-back failed"));
+        }
+        self.inner.read(key)
+    }
+    fn write(&self, key: &str, bytes: &[u8]) -> Result<(), VaultError> {
+        self.inner.write(key, bytes)?;
+        if key == self.target {
+            self.armed.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+    fn delete(&self, key: &str) -> Result<(), VaultError> {
+        self.inner.delete(key)
+    }
+}
+
+#[test]
+fn a_landed_write_whose_read_back_failed_loses_nothing_when_the_successor_has_machine_shared_keys()
+{
+    // H5.3: `persist_received` compares the vault form of what it received. The vault still
+    // holds a pre-branch item, so the successor (built from it) carries `mcpOAuth`.
+    let fx = Fx::new();
+    let a = due(&fx);
+    let mut old = Fx::credential_json("a@x.co", "rt-a");
+    old["claudeAiOauth"]["expiresAt"] = json!(fx.clock.now_ms() + 60_000);
+    fx.put_vault(&a, old.to_string().as_bytes());
+    let snapshot = fx.vault_bytes(&a).unwrap();
+    fx.script_refresh(Some("rt-a2"));
+    let engine = fx.engine_with_vault(Vault::new(Box::new(ReadBackFailsOnce {
+        inner: KeychainVault::new(fx.kc.clone()),
+        target: a.to_string(),
+        armed: AtomicBool::new(false),
+    })));
+    let out = engine
+        .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
+        .unwrap();
+    assert!(matches!(out, GateOutcome::Refreshed(_)), "{out:?}");
+    let stored: Value = serde_json::from_slice(&fx.vault_bytes(&a).unwrap()).unwrap();
+    assert_eq!(stored["claudeAiOauth"]["refreshToken"], "rt-a2");
+    assert!(stored.get("mcpOAuth").is_none(), "the vault form");
+    assert_eq!(rescue_files(&fx), 0, "nothing was kept outside the vault");
 }
 
 #[cfg(feature = "test-hooks")]

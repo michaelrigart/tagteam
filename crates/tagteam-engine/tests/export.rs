@@ -91,7 +91,8 @@ fn an_idle_account_is_exported_slim_from_the_vault_and_the_live_one_from_where_i
         .unwrap();
     assert_eq!(
         envelope(&full)[0]["credential"],
-        Fx::credential_json("a@x.co", "rt-a")
+        json!({"claudeAiOauth": Fx::credential_json("a@x.co", "rt-a")["claudeAiOauth"]}),
+        "full: every account-scoped key and no machine-shared one (H5.3)"
     );
 }
 
@@ -567,4 +568,31 @@ fn a_session_with_no_seed_exports_the_vault_only_when_its_credential_is_the_vaul
             ),
         }
     }
+}
+
+#[test]
+fn a_full_export_carries_no_machine_shared_key_from_the_live_login_or_a_session_profile() {
+    let full = ExportRequest {
+        full: true,
+        ..ExportRequest::default()
+    };
+    let keys = |c: &Value| c.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    // Live-sourced: Claude Code rotated b's token since the capture (`transfer::newest_live`).
+    let fx = Fx::new();
+    two_accounts(&fx);
+    fx.rotate_live("rt-b2");
+    let r = fx.engine.export(&full).unwrap();
+    assert_eq!(sources(&r)[1], (2, Source::Live, true));
+    assert_eq!(keys(&envelope(&r)[1]["credential"]), ["claudeAiOauth"]);
+    assert_eq!(
+        envelope(&r)[1]["credential"]["claudeAiOauth"]["refreshToken"],
+        "rt-b2"
+    );
+    // Profile-sourced: a running session's profile rotated a's token.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let _session = running(&fx, &a, "rt-a", "rt-a2");
+    let r = fx.engine.export(&full).unwrap();
+    assert_eq!(sources(&r)[0], (1, Source::Profile, true));
+    assert_eq!(keys(&envelope(&r)[0]["credential"]), ["claudeAiOauth"]);
 }

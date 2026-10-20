@@ -41,7 +41,7 @@ fn login(cc: &ClaudeCode, kind: &str, secret: &[u8], email: &str) -> StoredLogin
 }
 
 #[test]
-fn a_slim_export_keeps_only_claude_ai_oauth_and_a_full_one_keeps_everything() {
+fn a_slim_export_keeps_only_claude_ai_oauth_and_a_full_one_keeps_every_account_scoped_key() {
     let cc = cc();
     let l = login(
         &cc,
@@ -55,7 +55,11 @@ fn a_slim_export_keeps_only_claude_ai_oauth_and_a_full_one_keeps_everything() {
         json!({"claudeAiOauth": stored("rt-1")["claudeAiOauth"]})
     );
     let (_, full) = cc.export_login(&l, true).unwrap();
-    assert_eq!(full, stored("rt-1"));
+    assert_eq!(
+        full,
+        json!({"claudeAiOauth": stored("rt-1")["claudeAiOauth"],
+            "trustedDeviceToken": "device-bound", "designOauth": {"t": 1}})
+    );
     assert_eq!(
         identity,
         json!({"email": "a@x.co", "accountUuid": "uuid-a@x.co", "organizationUuid": "org-1",

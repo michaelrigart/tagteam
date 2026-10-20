@@ -2031,7 +2031,7 @@ impl Engine {
         let mut held = Held::default();
         let target_secret = match outgoing.as_ref().filter(|_| !req.force) {
             // Step 2, the direct branch: displace whatever is live on either axis unless it is
-            // byte-identical to the target.
+            // identical to the target in vault form (H5.3).
             None => {
                 let secret = self.read_target(&target)?;
                 let reason = if req.force {
@@ -2040,7 +2040,10 @@ impl Engine {
                     "displaced-live-login"
                 };
                 for axis in Axis::BOTH {
-                    if let Some(bytes) = axis.live_secret(&live).filter(|b| *b != secret) {
+                    if let Some(bytes) = axis
+                        .live_secret(&live)
+                        .filter(|b| *p.vault_form(b) != *p.vault_form(&secret))
+                    {
                         let identity =
                             attributed(live_identity.as_ref(), own_secret.as_deref(), &bytes);
                         let saved = self.displace_live(
@@ -2268,7 +2271,7 @@ impl Engine {
                     .iter()
                     .find(|l| l.id() == &out.id)
                     .expect("the outgoing account is locked");
-                self.vault.store(lock, &bytes, &|b| p.fingerprint(b))?;
+                self.vault.store(lock, &bytes, p)?;
                 let identity = p.parse_identity(&out.identity_json)?;
                 store.update_login(
                     &out.id,

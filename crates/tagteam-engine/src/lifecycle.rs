@@ -737,7 +737,6 @@ impl Engine {
                 .find(|l| l.id() == id)
                 .expect("every written account is locked")
         };
-        let fp = |b: &[u8]| p.fingerprint(b);
         let key = p.identity_key(identity);
         match &prep.existing {
             Some(row) => {
@@ -764,7 +763,7 @@ impl Engine {
                 };
                 // §12.5 step 1, with the default home's evidence in the same transaction.
                 store.begin_replacement(&row.id, &new_fp, &meta, source.live_names_account)?;
-                if let Err(e) = self.vault.store(lock_for(&row.id), secret, &fp) {
+                if let Err(e) = self.vault.store(lock_for(&row.id), secret, p) {
                     // The write never landed: reconcile in process rather than leaving the
                     // marker dangling for the next lock holder to find (Task 18's review,
                     // item 6). `reconcile_replacement` reads the vault fresh, sees it still
@@ -796,7 +795,7 @@ impl Engine {
                     login_expires_at: p.login_expires_at(secret),
                     added_at: source.added_at.unwrap_or_else(|| self.now_ms()),
                 })?;
-                if let Err(e) = self.vault.store(lock_for(&prep.id), secret, &fp) {
+                if let Err(e) = self.vault.store(lock_for(&prep.id), secret, p) {
                     // The write may have landed and failed only its read-back. A new account
                     // has no earlier generation to keep, so whatever it left goes with the row:
                     // no secret outlives its account (§5, L444). A failure is logged by a fixed

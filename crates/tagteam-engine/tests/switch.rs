@@ -1821,3 +1821,88 @@ fn a_forced_switch_to_a_replaced_live_login_clears_the_stale_mark() {
     assert_eq!(displaced.len(), 1);
     assert!(String::from_utf8_lossy(&displaced[0]).contains("rt-a2"));
 }
+
+#[test]
+fn an_outgoing_live_entry_that_carries_machine_shared_keys_the_vault_lacks_is_ours() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live, `mcpOAuth` included; the vault copy has none
+    let stored = fx.vault_bytes(&b).unwrap();
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&stored)
+            .unwrap()
+            .get("mcpOAuth")
+            .is_none()
+    );
+    let (out, logs) = capture_logs(|| switch(&fx, to(&a), false).unwrap());
+    assert!(out.switched);
+    assert!(
+        !logs
+            .iter()
+            .any(|l| l.contains("stored a credential in the vault") && l.contains(b.as_str())),
+        "classified Ours, never captured: {logs:#?}"
+    );
+    assert_eq!(fx.vault_bytes(&b).unwrap(), stored);
+    assert_eq!(displaced_files(&fx), 0);
+}
+
+#[test]
+fn a_vault_item_stored_before_this_branch_still_classifies_and_switches() {
+    // Review Focus line 2: full bytes, machine-shared keys included, byte-identical to live.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let old = credential("b@x.co", "rt-b");
+    fx.put_vault(&b, &old);
+    switch(&fx, to(&a), false).unwrap();
+    assert_eq!(
+        fx.vault_bytes(&b).unwrap(),
+        old,
+        "Ours: nothing captured, nothing migrated"
+    );
+    assert_eq!(displaced_files(&fx), 0);
+    switch(&fx, to(&b), false).unwrap();
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+    assert_eq!(
+        fx.live_credential().unwrap()["mcpOAuth"],
+        json!({"srv": {"token": "machine-shared"}})
+    );
+}
+
+#[test]
+fn forcing_a_switch_to_the_live_account_displaces_nothing() {
+    // Ruling R1: the direct branch compares the live entry and the vault in vault form, so the
+    // live entry's machine-shared keys, which the vault lacks, displace nothing.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b"); // live, `mcpOAuth` included; the vault copy has none
+    assert!(fx.live_credential().unwrap().get("mcpOAuth").is_some());
+    let out = switch(&fx, to(&b), true).unwrap();
+    assert_eq!(out.reason, SwitchReason::Activated);
+    assert_eq!(displaced_files(&fx), 0);
+    assert!(
+        !out.warnings.iter().any(|w| w.contains("displaced/")),
+        "{:?}",
+        out.warnings
+    );
+}
+
+#[test]
+fn forcing_a_switch_to_the_live_account_with_a_pre_branch_vault_item_displaces_nothing() {
+    // Ruling R1, Review Focus line 2: a vault item written before this branch holds the live
+    // entry's full bytes, machine-shared keys included.
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let b = fx.add("b@x.co", "rt-b");
+    let (svc, acct) = fx.live_item(ItemKind::OAuth);
+    let live = fx.kc.get(&svc, &acct).unwrap();
+    fx.put_vault(&b, &live);
+    let out = switch(&fx, to(&b), true).unwrap();
+    assert_eq!(out.reason, SwitchReason::Activated);
+    assert_eq!(displaced_files(&fx), 0);
+    assert!(
+        !out.warnings.iter().any(|w| w.contains("displaced/")),
+        "{:?}",
+        out.warnings
+    );
+}

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -366,6 +367,10 @@ impl Provider for FakeAgent {
 
     fn fingerprint(&self, secret: &[u8]) -> Option<Fingerprint> {
         shape::fingerprint(secret)
+    }
+
+    fn vault_form<'a>(&self, credential: &'a [u8]) -> Cow<'a, [u8]> {
+        shape::vault_form(credential)
     }
 
     fn has_refresh_token(&self, secret: &[u8]) -> bool {

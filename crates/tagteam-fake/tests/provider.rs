@@ -1127,7 +1127,7 @@ fn its_export_payload_is_its_own_shape_with_no_claude_code_field() {
         slim,
         json!({"fa": {"token": "tok-a", "renew": "renew-a", "expires": 9}})
     );
-    assert_eq!(full, credential_json("tok-a", Some("renew-a"), Some(9)));
+    assert_eq!(full, slim);
     for payload in [&identity, &slim, &full] {
         let text = payload.to_string();
         for cc_field in ["email", "claudeAiOauth", "oauthAccount", "organizationUuid"] {

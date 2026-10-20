@@ -116,8 +116,9 @@ fn a_fake_agent_account_has_no_claude_code_shaped_field() {
     let stored: Value = serde_json::from_slice(&ffx.fx.vault_bytes(&alice).unwrap()).unwrap();
     assert_eq!(
         stored,
-        credential_json("tok-a", Some("renew-a"), Some(LOGIN_EXPIRES))
+        json!({"fa": credential_json("tok-a", Some("renew-a"), Some(LOGIN_EXPIRES))["fa"]})
     );
+    assert!(stored.get("device").is_none(), "the vault form (H5.3)");
     assert!(stored.get("claudeAiOauth").is_none());
     assert!(row.identity_json.get("emailAddress").is_none());
 }

@@ -3,9 +3,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tagteam_core::{AccountId, Fingerprint};
+use tagteam_core::AccountId;
 use tagteam_provider::atomic::{ensure_private_dir, write_atomic_private};
-use tagteam_provider::{Keychain, Read, ReadError};
+use tagteam_provider::{Keychain, Provider, Read, ReadError};
 
 use crate::account_lock::AccountLock;
 
@@ -122,8 +122,8 @@ impl VaultBackend for FileVault {
     }
 }
 
-/// The source of truth for credential bytes. It never parses what it stores; lineage comes
-/// from the caller's fingerprint function.
+/// The source of truth for credential bytes. It never parses what it stores: lineage and the
+/// stored form come from the caller's provider (`fingerprint`, and `vault_form`, H5.3).
 pub struct Vault {
     backend: Box<dyn VaultBackend>,
 }
@@ -145,32 +145,34 @@ impl Vault {
         self.backend.read(&prev_key(id))
     }
 
-    /// Writes under the account lock. The current generation moves to `.prev` only when the
-    /// fingerprint changes; the write is verified by reading back. A verified write is logged
-    /// at INFO (§14.2, Decision 10): the account's ID, and the generation's fingerprint as its
-    /// first 12 hex digits.
+    /// Writes `bytes` in `p`'s vault form (H5.3) under the account lock. The current generation
+    /// moves to `.prev`, in vault form too, only when the fingerprint changes; the write is
+    /// verified by reading back the form written. A verified write is logged at INFO (§14.2,
+    /// Decision 10): the account's ID, and the generation's fingerprint as its first 12 hex
+    /// digits.
     pub fn store(
         &self,
         lock: &AccountLock,
         bytes: &[u8],
-        fingerprint: &dyn Fn(&[u8]) -> Option<Fingerprint>,
+        p: &dyn Provider,
     ) -> Result<(), VaultError> {
         let id = lock.id();
-        let fp = fingerprint(bytes);
+        let form = p.vault_form(bytes);
+        let fp = p.fingerprint(&form);
         let new_generation = match self.backend.read(id.as_str()) {
             Read::Present(old) => {
-                let changed = fingerprint(&old) != fp;
+                let changed = p.fingerprint(&old) != fp;
                 if changed {
-                    self.backend.write(&prev_key(id), &old)?;
+                    self.backend.write(&prev_key(id), &p.vault_form(&old))?;
                 }
                 changed
             }
             Read::Absent => true,
             Read::Unreadable(e) => return Err(VaultError::Unreadable(e)),
         };
-        self.backend.write(id.as_str(), bytes)?;
+        self.backend.write(id.as_str(), &form)?;
         match self.backend.read(id.as_str()) {
-            Read::Present(v) if v == bytes => {}
+            Read::Present(v) if v == *form => {}
             _ => return Err(VaultError::Verify),
         }
         tracing::info!(

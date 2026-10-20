@@ -286,7 +286,7 @@ pub enum Command {
         /// Export only this account (repeatable)
         #[arg(long)]
         account: Vec<String>,
-        /// Keep the whole credential, this machine's keys included
+        /// Keep every account-scoped key, device-bound ones included; machine-shared keys stay here
         #[arg(long)]
         full: bool,
         /// Encrypt to this age1… or ssh-ed25519 public key (repeatable)
