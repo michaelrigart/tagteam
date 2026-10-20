@@ -123,22 +123,11 @@ fn fish_global_option_values(cmd: &clap::Command, script: &mut Vec<u8>) {
         .get_arguments()
         .filter(|a| a.is_global_set() && !a.is_positional() && a.get_action().takes_values())
     {
-        let values: Vec<String> = arg
-            .get_possible_values()
-            .into_iter()
-            .filter(|v| !v.is_hide_set())
-            .map(|v| v.get_name().to_owned())
-            .collect();
+        let values = visible_values(arg);
         if values.is_empty() {
             continue;
         }
-        let shorts = arg.get_short_and_visible_aliases().unwrap_or_default();
-        let longs = arg.get_long_and_visible_aliases().unwrap_or_default();
-        let spellings: Vec<String> = shorts
-            .into_iter()
-            .map(|s| format!("-{s}"))
-            .chain(longs.into_iter().map(|l| format!("--{l}")))
-            .collect();
+        let names = spellings(arg);
         let name = arg.get_id().as_str().replace('-', "_");
         let _ = write!(
             script,
@@ -149,7 +138,7 @@ function __fish_tagteam_after_{name}
 end
 complete -c tagteam -n "__fish_tagteam_after_{name}" -f -a "{}"
 "#,
-            spellings.join(" "),
+            names.join(" "),
             values.join(" ")
         );
     }
@@ -161,10 +150,7 @@ fn options_taking_values(cmd: &clap::Command, valued: &mut BTreeSet<String>) {
         .get_arguments()
         .filter(|a| !a.is_positional() && !a.is_hide_set() && a.get_action().takes_values())
     {
-        let shorts = arg.get_short_and_visible_aliases().unwrap_or_default();
-        let longs = arg.get_long_and_visible_aliases().unwrap_or_default();
-        valued.extend(shorts.into_iter().map(|s| format!("-{s}")));
-        valued.extend(longs.into_iter().map(|l| format!("--{l}")));
+        valued.extend(spellings(arg));
     }
     for sub in cmd.get_subcommands() {
         options_taking_values(sub, valued);
@@ -181,12 +167,7 @@ fn fish_positional_lines(cmd: &clap::Command, path: &mut Vec<String>, script: &m
             _ => format!("({})", names.join("|")),
         });
         for (before, arg) in sub.get_positionals().enumerate() {
-            let values: Vec<String> = arg
-                .get_possible_values()
-                .into_iter()
-                .filter(|v| !v.is_hide_set())
-                .map(|v| v.get_name().to_owned())
-                .collect();
+            let values = visible_values(arg);
             if values.is_empty() {
                 continue;
             }
@@ -208,4 +189,24 @@ fn fish_positional_lines(cmd: &clap::Command, path: &mut Vec<String>, script: &m
         fish_positional_lines(sub, path, script);
         path.pop();
     }
+}
+
+/// The names of the possible values of `arg` that its help shows.
+fn visible_values(arg: &clap::Arg) -> Vec<String> {
+    arg.get_possible_values()
+        .into_iter()
+        .filter(|v| !v.is_hide_set())
+        .map(|v| v.get_name().to_owned())
+        .collect()
+}
+
+/// Every spelling of `arg` on the command line: its shorts as `-x`, then its longs as `--long`.
+fn spellings(arg: &clap::Arg) -> Vec<String> {
+    let shorts = arg.get_short_and_visible_aliases().unwrap_or_default();
+    let longs = arg.get_long_and_visible_aliases().unwrap_or_default();
+    shorts
+        .into_iter()
+        .map(|s| format!("-{s}"))
+        .chain(longs.into_iter().map(|l| format!("--{l}")))
+        .collect()
 }

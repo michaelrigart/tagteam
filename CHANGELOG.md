@@ -50,6 +50,8 @@ with the one before, so any release may contain breaking changes. Each section s
 - `tagteam --help` and each command's help describe what works for every provider without
   naming Claude Code. The help for the statusline and the shell wrapper, which only Claude
   Code has, still names it.
+- `tagteam completions` exits with an error when it cannot write the script, rather than exiting 0
+  with a partial one; a reader that closes the pipe early is still not an error.
 
 ### Security
 

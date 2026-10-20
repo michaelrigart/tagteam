@@ -103,14 +103,18 @@ pub(super) fn refuse_tui(io: &mut Io<'_>, json: bool) -> Ended {
     Ended::Code(EXIT_USAGE)
 }
 
-/// §13.7's `completions`: the script, or a usage refusal under `--json`.
+/// §13.7's `completions`: the script, or a usage refusal under `--json`; a script that cannot be
+/// written is an `io` error, except to a reader that closed the pipe early.
 pub(super) fn answer_completions(io: &mut Io<'_>, json: bool, shell: CompletionShell) -> Ended {
     if json {
         io.fail(true, KIND_USAGE, COMPLETIONS_UNDER_JSON);
         return Ended::Code(EXIT_USAGE);
     }
-    let _ = io.out.write_all(&shell.script());
-    Ended::Code(0)
+    match io.out.write_all(&shell.script()) {
+        Ok(()) => Ended::Code(0),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ended::Code(0),
+        Err(e) => Failure::from(EngineError::from(e)).report(io, json, true),
+    }
 }
 
 /// §12.7's `shell-init`, answered before the engine is built: one wrapper per registered
@@ -152,5 +156,77 @@ fn statusline_supported(engine: &Engine, provider: &ProviderId) -> Result<(), Fa
     match statusline::unsupported(p.capabilities(), p.display_name()) {
         Some(message) => Err(Failure::Message(KIND_UNSUPPORTED, message)),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use crate::prompt::Prompter;
+
+    use super::super::failure::EXIT_ERROR;
+    use super::*;
+
+    struct NoPrompts;
+
+    impl Prompter for NoPrompts {
+        fn interactive(&self) -> bool {
+            false
+        }
+        fn confirm(&mut self, question: &str, _default_yes: bool) -> bool {
+            panic!("unexpected prompt: {question}");
+        }
+        fn choose(&mut self, question: &str, _options: &[String]) -> Option<usize> {
+            panic!("unexpected prompt: {question}");
+        }
+        fn secret(&mut self, question: &str) -> Option<String> {
+            panic!("unexpected prompt: {question}");
+        }
+    }
+
+    struct Unwritable(io::ErrorKind);
+
+    impl io::Write for Unwritable {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "disk full"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_completions_script_that_cannot_be_written_is_an_io_error() {
+        let mut err = Vec::new();
+        let ended = answer_completions(
+            &mut Io {
+                out: &mut Unwritable(io::ErrorKind::Other),
+                err: &mut err,
+                prompter: &mut NoPrompts,
+            },
+            false,
+            CompletionShell::Bash,
+        );
+        assert!(matches!(ended, Ended::Code(EXIT_ERROR)));
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.starts_with("tagteam: "), "{err}");
+        assert!(err.contains("disk full"), "{err}");
+    }
+
+    #[test]
+    fn a_completions_script_whose_reader_left_is_not_an_error() {
+        let mut err = Vec::new();
+        let ended = answer_completions(
+            &mut Io {
+                out: &mut Unwritable(io::ErrorKind::BrokenPipe),
+                err: &mut err,
+                prompter: &mut NoPrompts,
+            },
+            false,
+            CompletionShell::Bash,
+        );
+        assert!(matches!(ended, Ended::Code(0)));
+        assert!(err.is_empty(), "{err:?}");
     }
 }
