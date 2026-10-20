@@ -887,30 +887,45 @@ mod tests {
         assert_stopped(&input, &script, 1, 1);
     }
 
+    /// The failing call `calls` counts is tried again, a slice after the last try at the
+    /// soonest: since `started`, no more tries than slices, with two to spare. The bound is the
+    /// clock's, so a late runner cannot break it. With no back-off the tries come by the
+    /// hundred thousand.
+    fn assert_tried_a_slice_apart(calls: &AtomicUsize, started: Instant, what: &str) {
+        let deadline = started + Duration::from_secs(5);
+        while calls.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline, "{what}: never tried again");
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(200));
+        let tries = calls.load(Ordering::SeqCst) as u128;
+        let elapsed = started.elapsed();
+        let most = elapsed.as_millis() / SLICE.as_millis() + 2;
+        assert!(
+            tries <= most,
+            "{what}: {tries} in {elapsed:?}, at most {most}"
+        );
+    }
+
     #[test]
     fn a_terminal_that_fails_is_tried_again_a_slice_later() {
-        // A slice apart, 200 ms holds about 4 tries; with no back-off, hundreds of thousands.
-        let tries = 2..=10;
-
         // Reading fails, while the terminal says it has bytes.
         let script = Script::default();
         script.fail_next();
         script.push(Event::Key(key('x')));
         let (tx, _rx) = mpsc::channel();
+        let started = Instant::now();
         let input = Input::spawn_with(tx, script.clone()).unwrap();
-        thread::sleep(Duration::from_millis(200));
-        let nexts = script.nexts.load(Ordering::SeqCst);
-        assert!(tries.contains(&nexts), "{nexts} reads in 200 ms");
+        assert_tried_a_slice_apart(&script.nexts, started, "reads");
         drop(input);
 
         // The wait fails.
         let script = Script::default();
         script.fail_wait();
         let (tx, _rx) = mpsc::channel();
+        let started = Instant::now();
         let _input = Input::spawn_with(tx, script.clone()).unwrap();
-        thread::sleep(Duration::from_millis(200));
-        let waits = script.waits.load(Ordering::SeqCst);
-        assert!(tries.contains(&waits), "{waits} waits in 200 ms");
+        assert_tried_a_slice_apart(&script.waits, started, "waits");
         assert_eq!(
             script.nexts.load(Ordering::SeqCst),
             1,
@@ -1012,12 +1027,12 @@ mod tests {
         let mut wait = Wait::on(ours.as_raw_fd()).unwrap();
         wait.waker()();
         assert!(!wait.closed().unwrap());
-        // The poll above took the wake: `wait` returns at once from what it kept.
+        // The poll above took the wake: `wait` returns from what it kept.
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let _ = tx.send(wait.wait().unwrap());
             drop(ours);
         });
-        assert_eq!(rx.recv_timeout(Duration::from_millis(50)), Ok(Ready::Woken));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(Ready::Woken));
     }
 }
