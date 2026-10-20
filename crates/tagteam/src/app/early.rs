@@ -110,7 +110,11 @@ pub(super) fn answer_completions(io: &mut Io<'_>, json: bool, shell: CompletionS
         io.fail(true, KIND_USAGE, COMPLETIONS_UNDER_JSON);
         return Ended::Code(EXIT_USAGE);
     }
-    match io.out.write_all(&shell.script()) {
+    let written = io
+        .out
+        .write_all(&shell.script())
+        .and_then(|()| io.out.flush());
+    match written {
         Ok(()) => Ended::Code(0),
         Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ended::Code(0),
         Err(e) => Failure::from(EngineError::from(e)).report(io, json, true),
@@ -185,48 +189,87 @@ mod tests {
         }
     }
 
-    struct Unwritable(io::ErrorKind);
+    /// Fails the write, or only the flush, with `kind` and `message`.
+    struct Unwritable {
+        kind: io::ErrorKind,
+        message: &'static str,
+        at_flush: bool,
+    }
+
+    impl Unwritable {
+        fn error(&self) -> io::Error {
+            io::Error::new(self.kind, self.message)
+        }
+    }
 
     impl io::Write for Unwritable {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            Err(io::Error::new(self.0, "disk full"))
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.at_flush {
+                Ok(buf.len())
+            } else {
+                Err(self.error())
+            }
         }
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            if self.at_flush {
+                Err(self.error())
+            } else {
+                Ok(())
+            }
         }
+    }
+
+    fn complete_into(out: &mut Unwritable) -> (Ended, String) {
+        let mut err = Vec::new();
+        let ended = answer_completions(
+            &mut Io {
+                out,
+                err: &mut err,
+                prompter: &mut NoPrompts,
+            },
+            false,
+            CompletionShell::Bash,
+        );
+        (ended, String::from_utf8(err).unwrap())
     }
 
     #[test]
     fn a_completions_script_that_cannot_be_written_is_an_io_error() {
-        let mut err = Vec::new();
-        let ended = answer_completions(
-            &mut Io {
-                out: &mut Unwritable(io::ErrorKind::Other),
-                err: &mut err,
-                prompter: &mut NoPrompts,
-            },
-            false,
-            CompletionShell::Bash,
-        );
+        let mut out = Unwritable {
+            kind: io::ErrorKind::Other,
+            message: "disk full",
+            at_flush: false,
+        };
+        let (ended, err) = complete_into(&mut out);
         assert!(matches!(ended, Ended::Code(EXIT_ERROR)));
-        let err = String::from_utf8(err).unwrap();
-        assert!(err.starts_with("tagteam: "), "{err}");
-        assert!(err.contains("disk full"), "{err}");
+        let expected = EngineError::from(io::Error::other("disk full"));
+        assert_eq!(err, format!("tagteam: {expected}\n"));
+    }
+
+    #[test]
+    fn a_completions_script_that_cannot_be_flushed_is_an_io_error() {
+        let mut out = Unwritable {
+            kind: io::ErrorKind::Other,
+            message: "disk full",
+            at_flush: true,
+        };
+        let (ended, err) = complete_into(&mut out);
+        assert!(matches!(ended, Ended::Code(EXIT_ERROR)));
+        let expected = EngineError::from(io::Error::other("disk full"));
+        assert_eq!(err, format!("tagteam: {expected}\n"));
     }
 
     #[test]
     fn a_completions_script_whose_reader_left_is_not_an_error() {
-        let mut err = Vec::new();
-        let ended = answer_completions(
-            &mut Io {
-                out: &mut Unwritable(io::ErrorKind::BrokenPipe),
-                err: &mut err,
-                prompter: &mut NoPrompts,
-            },
-            false,
-            CompletionShell::Bash,
-        );
-        assert!(matches!(ended, Ended::Code(0)));
-        assert!(err.is_empty(), "{err:?}");
+        for at_flush in [false, true] {
+            let mut out = Unwritable {
+                kind: io::ErrorKind::BrokenPipe,
+                message: "reader closed",
+                at_flush,
+            };
+            let (ended, err) = complete_into(&mut out);
+            assert!(matches!(ended, Ended::Code(0)));
+            assert!(err.is_empty(), "{err:?}");
+        }
     }
 }
