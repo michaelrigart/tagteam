@@ -211,6 +211,13 @@ pub enum Answer {
     Choose(Option<usize>),
 }
 
+impl Answer {
+    /// A declined confirm (spec §10.2 step 3).
+    pub(crate) const CONFIRM_DECLINED: Answer = Answer::Confirm(false);
+    /// A declined choice.
+    pub(crate) const CHOOSE_DECLINED: Answer = Answer::Choose(None);
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     LoadAccounts {
