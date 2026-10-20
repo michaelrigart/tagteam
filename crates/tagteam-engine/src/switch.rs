@@ -544,10 +544,11 @@ pub(crate) enum AutoFreshened {
     Skip,
 }
 
-pub(crate) fn needs_relogin(target: &AccountRow) -> EngineError {
+pub(crate) fn needs_relogin(p: &dyn Provider, target: &AccountRow) -> EngineError {
     EngineError::NeedsRelogin {
         position: target.position,
         label: target.label.clone(),
+        launch: p.launch_command(),
     }
 }
 
@@ -564,8 +565,8 @@ pub(crate) fn works_until_expiry(target: &AccountRow) -> String {
 
 /// §9.2's session-owned refusal, for a target a session took after planning: it names what
 /// owns the profile in `state`, as every other refusal does (§12.6).
-fn session_owned(target: &AccountRow, state: &SessionState) -> EngineError {
-    session_owned_error(target, state)
+fn session_owned(p: &dyn Provider, target: &AccountRow, state: &SessionState) -> EngineError {
+    session_owned_error(p, target, state)
 }
 
 /// §9.2's refusal for a target whose profile and vault both moved (§12.5).
@@ -1190,7 +1191,7 @@ impl Engine {
             Some("it needs a new login".to_owned())
         } else if state.owned() {
             // The same words as `session-owned`'s refusal: every owner and every file.
-            Some(SessionOwner::of(&state).reason("it"))
+            Some(SessionOwner::of(&state, p).reason("it"))
         } else if !self.has_login(&target)? {
             Some("it has no stored credential".to_owned())
         } else {
@@ -1415,7 +1416,7 @@ impl Engine {
             return match (due, chosen) {
                 (false, _) => Ok(Freshened::Go(vec![works_until_expiry(target)])),
                 (true, true) => Ok(Freshened::Replan),
-                (true, false) => Err(needs_relogin(target)),
+                (true, false) => Err(needs_relogin(p, target)),
             };
         }
         if !due {
@@ -1437,7 +1438,7 @@ impl Engine {
                 Freshened::Go(vec![])
             }
             GateOutcome::Dead(_) if chosen => Freshened::Replan,
-            GateOutcome::Dead(_) => return Err(needs_relogin(target)),
+            GateOutcome::Dead(_) => return Err(needs_relogin(p, target)),
             GateOutcome::Transient { rescued: true, .. } => {
                 return Err(pending(
                     "the refresh succeeded, but the vault could not be written; the new token is in rescue/".into(),
@@ -1473,7 +1474,7 @@ impl Engine {
             }
             // The successor is lost and the vault's generation is spent (§7.3 step 6): no
             // retry helps, and activating would hand CC a used refresh token.
-            GateOutcome::Unpersisted => return Err(needs_relogin(target)),
+            GateOutcome::Unpersisted => return Err(needs_relogin(p, target)),
             // A journal row names it. The gate cannot tell a switch still in progress from an
             // interrupted one, so this does not refuse: with `--force` the switch supersedes
             // the row, and without it `guard_or_refuse` decides under the mutation lock (it
@@ -1500,7 +1501,7 @@ impl Engine {
             // The gate answers only "a session"; the state is read again to name a daemon.
             GateOutcome::Owned(OwnedBy::Session) => {
                 let state = self.session_state(p, target)?;
-                return Err(session_owned(target, &state));
+                return Err(session_owned(p, target, &state));
             }
             GateOutcome::Conflict => return Err(profile_conflict(target)),
         })
@@ -1788,13 +1789,15 @@ impl Engine {
         if spliced.is_ok() && intact() {
             tracing::info!(
                 provider = self.registered_id(provider),
-                "a starting Claude Code had overwritten the switched account's identity, which was spliced again"
+                "a starting {} had overwritten the switched account's identity, which was spliced again",
+                p.display_name()
             );
             return None;
         }
         tracing::warn!(
             provider = self.registered_id(provider),
-            "a starting Claude Code may have overwritten the switched account's identity"
+            "a starting {} may have overwritten the switched account's identity",
+            p.display_name()
         );
         Some(format!(
             "a starting {} may have overwritten the account's identity in its config; run `tagteam switch` again to restore it",
@@ -1891,7 +1894,7 @@ impl Engine {
             return if req.target.chosen() {
                 Ok(Rederived::Replan)
             } else {
-                Err(session_owned(&target, &state))
+                Err(session_owned(p, &target, &state))
             };
         }
         // The rotation decision, recomputed from the store and each candidate's session state
@@ -1921,7 +1924,7 @@ impl Engine {
             if (!self_switch || req.force) && p.kind_traits(&target.kind).refreshable {
                 let vault = self.read_target(&target)?;
                 if self.due(p, &vault) {
-                    return Err(needs_relogin(&target));
+                    return Err(needs_relogin(p, &target));
                 }
                 let warning = works_until_expiry(&target);
                 if !plan.warnings.contains(&warning) {

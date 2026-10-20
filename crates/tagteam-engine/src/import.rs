@@ -287,7 +287,7 @@ impl Engine {
             warnings.push(format!(
                 "position {} {}; whatever runs there keeps its login until it exits, and the next `run` starts with the imported one",
                 account.position,
-                SessionOwner::of(&state).who()
+                SessionOwner::of(&state, p).who()
             ));
         }
         let message = if quarantined {

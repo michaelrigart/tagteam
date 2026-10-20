@@ -2,7 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use tagteam_provider::doctor::quoted;
-use tagteam_provider::{LockError, ProviderError, ReadError};
+use tagteam_provider::{LockError, Provider, ProviderError, ReadError};
 
 use crate::session::{Damaged, DamagedKind, SessionState};
 use crate::settings::SettingsError;
@@ -46,8 +46,8 @@ pub enum EngineError {
     /// Every command but `statusline` refuses, naming it.
     #[error("the run-shell marker {} cannot be read ({detail})", marker.display())]
     RunShellUnreadable { marker: PathBuf, detail: String },
-    #[error("there is no live login to add; log in with `claude` first")]
-    NoLiveLogin,
+    #[error("there is no live login to add; log in with `{launch}` first")]
+    NoLiveLogin { launch: &'static str },
     #[error("the live login is a managed API key; add it with `tagteam add-token`")]
     LiveApiKey,
     #[error(
@@ -69,9 +69,13 @@ pub enum EngineError {
     /// quarantined), or spent by a refresh whose successor could be stored nowhere (§7.3
     /// step 6, `Unpersisted`). Only a new login brings it back.
     #[error(
-        "{label} (position {position}) needs a new login: its stored refresh token can no longer be used; log in with `claude`, then run `tagteam add`"
+        "{label} (position {position}) needs a new login: its stored refresh token can no longer be used; log in with `{launch}`, then run `tagteam add`"
     )]
-    NeedsRelogin { position: u32, label: String },
+    NeedsRelogin {
+        position: u32,
+        label: String,
+        launch: &'static str,
+    },
     #[error("{0}")]
     InvalidInput(String),
     #[error("no account matches {0:?}")]
@@ -289,16 +293,30 @@ fn split_message(profile: &Path, shared: &Path, cause: SplitCause) -> String {
     }
 }
 
-/// How to end a Claude Code background daemon that owns `profile` (§12.6, Appendix A.7), by the
-/// profile path where tagteam found its `daemon.lock`. If the pid in the lock was reused by an
-/// unrelated `claude`, the daemon is not running and only the lock is left, which Claude Code's
-/// own advice has the user delete.
-pub(crate) fn daemon_advice(profile: &Path) -> String {
-    format!(
-        "stop it with `claude daemon stop --any` run with CLAUDE_CONFIG_DIR set to {}; if nothing is running at that pid, delete {}",
-        quoted(profile),
-        quoted(&profile.join("daemon.lock"))
-    )
+/// How to end `p`'s background supervisor that owns `profile` (§12.6, Appendix A.7), by the
+/// profile path where tagteam found its supervisor lock. If the pid in the lock was reused by
+/// an unrelated process, the supervisor is not running and only the lock is left, which the
+/// agent's own advice has the user delete.
+pub(crate) fn daemon_advice(p: &dyn Provider, profile: &Path) -> String {
+    let mut out = "stop it".to_owned();
+    if let Some(stop) = p.words().supervisor_stop {
+        out.push_str(&format!(" with `{stop}`"));
+    }
+    if let Some(var) = p.session_dir_var() {
+        out.push_str(&format!(" run with {var} set to {}", quoted(profile)));
+    }
+    if let Some(lock) = p.supervisor_lock(profile) {
+        out.push_str(&format!(
+            "; if nothing is running at that pid, delete {}",
+            quoted(&lock)
+        ));
+    }
+    out
+}
+
+/// `p`'s background supervisor as a sentence names it, article included.
+pub(crate) fn supervisor_name(p: &dyn Provider) -> &'static str {
+    p.words().supervisor.unwrap_or("a background supervisor")
 }
 
 /// What owns a profile that is session-owned (§12.5, §12.6): every live owner and every
@@ -308,15 +326,26 @@ pub(crate) fn daemon_advice(profile: &Path) -> String {
 pub struct SessionOwner {
     /// A `tagteam run` session, or any live owner that is not a background daemon.
     pub session: bool,
-    /// A Claude Code background daemon owns it, in this profile.
+    /// A background supervisor owns it, in this profile.
     pub daemon: Option<PathBuf>,
     /// Every input that could not be read.
     pub damaged: Vec<Damaged>,
+    /// The agent's `display_name()`, for the supervisor lock's repair.
+    pub app: &'static str,
+    /// `supervisor_name(p)`.
+    pub supervisor: &'static str,
+    /// `daemon_advice(p, profile)` when `daemon` is set.
+    pub stop: Option<String>,
 }
 
 impl SessionOwner {
-    /// The owners and unreadable inputs `state` found.
-    pub fn of(state: &SessionState) -> Self {
+    /// The owners and unreadable inputs `state` found, worded for `p`.
+    pub fn of(state: &SessionState, p: &dyn Provider) -> Self {
+        let named = Self {
+            app: p.display_name(),
+            supervisor: supervisor_name(p),
+            ..Self::default()
+        };
         match state {
             SessionState::Owned {
                 profile,
@@ -327,12 +356,14 @@ impl SessionOwner {
                 session: *session,
                 daemon: daemon.then(|| profile.clone()),
                 damaged: damaged.clone(),
+                stop: daemon.then(|| daemon_advice(p, profile)),
+                ..named
             },
             SessionState::Unreadable { damaged, .. } => Self {
                 damaged: damaged.clone(),
-                ..Self::default()
+                ..named
             },
-            _ => Self::default(),
+            _ => named,
         }
     }
 
@@ -350,20 +381,21 @@ impl SessionOwner {
             .join("; ")
     }
 
-    /// Who owns it, as a predicate: "is in use by a `tagteam run` session and by a Claude Code
-    /// background daemon", and "also" the unreadable inputs, or, with nothing live, that it
-    /// "counts as in use because" of them.
+    /// Who owns it, as a predicate: "is in use by a `tagteam run` session and by" the agent's
+    /// supervisor, and "also" the unreadable inputs, or, with nothing live, that it "counts as
+    /// in use because" of them.
     pub fn who(&self) -> String {
         let live = match (self.session, self.daemon.is_some()) {
-            (true, true) => {
-                "is in use by a `tagteam run` session and by a Claude Code background daemon"
-            }
-            (true, false) => "is in use by a `tagteam run` session",
-            (false, true) => "is in use by a Claude Code background daemon",
-            (false, false) => "",
+            (true, true) => format!(
+                "is in use by a `tagteam run` session and by {}",
+                self.supervisor
+            ),
+            (true, false) => "is in use by a `tagteam run` session".to_owned(),
+            (false, true) => format!("is in use by {}", self.supervisor),
+            (false, false) => String::new(),
         };
         match (self.live(), self.damaged.is_empty()) {
-            (true, true) => live.to_owned(),
+            (true, true) => live,
             (true, false) => format!("{live}, and also {}", self.damaged_list()),
             (false, false) => format!("counts as in use because {}", self.damaged_list()),
             (false, true) => "is in use by a `tagteam run` session".to_owned(),
@@ -375,16 +407,17 @@ impl SessionOwner {
         let mut out: Vec<String> = Vec::new();
         for d in &self.damaged {
             let r = match d.kind {
-                DamagedKind::SupervisorLock => {
-                    "if nothing runs as Claude Code for that profile, delete the lock"
-                }
-                DamagedKind::Record => "repair or remove that record",
+                DamagedKind::SupervisorLock => format!(
+                    "if nothing runs as {} for that profile, delete the lock",
+                    self.app
+                ),
+                DamagedKind::Record => "repair or remove that record".to_owned(),
                 DamagedKind::Profile | DamagedKind::Reservations | DamagedKind::RecordsDir => {
-                    "make it readable again"
+                    "make it readable again".to_owned()
                 }
             };
-            if !out.iter().any(|o| o == r) {
-                out.push(r.to_owned());
+            if !out.contains(&r) {
+                out.push(r);
             }
         }
         out
@@ -396,8 +429,8 @@ impl SessionOwner {
         if self.session || (!self.live() && self.damaged.is_empty()) {
             out.push("exit that session".to_owned());
         }
-        if let Some(profile) = &self.daemon {
-            out.push(daemon_advice(profile));
+        if let Some(stop) = &self.stop {
+            out.push(stop.clone());
         }
         out.extend(self.repairs());
         out
@@ -445,7 +478,7 @@ impl EngineError {
             EngineError::UnknownProvider(_) => "unknown-provider",
             EngineError::InsideRunShell => "inside-run-shell",
             EngineError::RunShellUnreadable { .. } => "run-shell-unreadable",
-            EngineError::NoLiveLogin => "no-live-login",
+            EngineError::NoLiveLogin { .. } => "no-live-login",
             EngineError::LiveApiKey => "live-api-key",
             EngineError::DegradedRead => "degraded-read",
             EngineError::OwnerMismatch { .. } => "owner-mismatch",
@@ -589,7 +622,10 @@ mod tests {
                 },
                 "run-shell-unreadable",
             ),
-            (EngineError::NoLiveLogin, "no-live-login"),
+            (
+                EngineError::NoLiveLogin { launch: "claude" },
+                "no-live-login",
+            ),
             (EngineError::LiveApiKey, "live-api-key"),
             (EngineError::DegradedRead, "degraded-read"),
             (
@@ -615,6 +651,7 @@ mod tests {
                 EngineError::NeedsRelogin {
                     position: 1,
                     label: "a@b.co".into(),
+                    launch: "claude",
                 },
                 "relogin-required",
             ),
@@ -949,5 +986,41 @@ mod tests {
             None
         );
         assert_eq!(EngineError::LiveMoved.signal(), None);
+    }
+
+    #[test]
+    fn the_ownership_texts_name_the_provider_s_supervisor_and_launch_command() {
+        let cc = tagteam_cc::ClaudeCode::new(
+            std::sync::Arc::new(tagteam_provider::FakeKeychain::new()),
+            tagteam_provider::Platform::MacOs,
+        );
+        let state = SessionState::Owned {
+            profile: PathBuf::from("/p"),
+            session: true,
+            daemon: true,
+            damaged: vec![Damaged {
+                kind: DamagedKind::SupervisorLock,
+                file: PathBuf::from("/p/daemon.lock"),
+                detail: "torn".into(),
+            }],
+        };
+        assert_eq!(
+            SessionOwner::of(&state, &cc).reason("position 1 (a@x.co)"),
+            "position 1 (a@x.co) is in use by a `tagteam run` session and by a Claude Code background daemon, and also '/p/daemon.lock' cannot be read (torn); exit that session; stop it with `claude daemon stop --any` run with CLAUDE_CONFIG_DIR set to '/p'; if nothing is running at that pid, delete '/p/daemon.lock'; if nothing runs as Claude Code for that profile, delete the lock, then retry"
+        );
+        let daemon_only = SessionState::Owned {
+            profile: PathBuf::from("/p"),
+            session: false,
+            daemon: true,
+            damaged: vec![],
+        };
+        assert_eq!(
+            SessionOwner::of(&daemon_only, &cc).who(),
+            "is in use by a Claude Code background daemon"
+        );
+        assert_eq!(
+            EngineError::NoLiveLogin { launch: "claude" }.to_string(),
+            "there is no live login to add; log in with `claude` first"
+        );
     }
 }

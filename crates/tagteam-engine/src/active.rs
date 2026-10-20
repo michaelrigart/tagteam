@@ -427,7 +427,9 @@ impl Engine {
     ) -> Result<(AccountRow, Vec<u8>), EngineError> {
         let identity = self
             .read_live_identity(p)?
-            .ok_or(EngineError::NoLiveLogin)?;
+            .ok_or(EngineError::NoLiveLogin {
+                launch: p.launch_command(),
+            })?;
         let row = match self.existing_store()? {
             Some(store) => {
                 store.find_by_identity_key(provider, p.identity_key(&identity).as_str())?
@@ -451,7 +453,11 @@ impl Engine {
                 return Err(EngineError::DegradedRead);
             }
             Read::Present(c) if !c.is_empty() => c.bytes().to_vec(),
-            Read::Present(_) | Read::Absent => return Err(EngineError::NoLiveLogin),
+            Read::Present(_) | Read::Absent => {
+                return Err(EngineError::NoLiveLogin {
+                    launch: p.launch_command(),
+                });
+            }
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         };
         Ok((row, bytes))
@@ -494,6 +500,7 @@ impl Engine {
         let relogin = || EngineError::NeedsRelogin {
             position: row.position,
             label: row.label.clone(),
+            launch: p.launch_command(),
         };
         let live_fp = fp(live).ok_or_else(relogin)?;
         let vault = match self.vault.read(&row.id) {
