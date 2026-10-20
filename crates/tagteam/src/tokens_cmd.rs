@@ -18,6 +18,7 @@ use tagteam_engine::tokens::{
 use tagteam_engine::words::{self, dollars, plural, scaled};
 use tagteam_engine::{Engine, EngineError};
 
+use crate::SCHEMA_VERSION;
 use crate::cli::TokensArgs;
 use crate::history;
 use crate::render::{self, MISSING};
@@ -323,7 +324,7 @@ pub(crate) fn json(report: &TokenReport) -> Value {
     let q = &report.query;
     let rows: Vec<Value> = report.rows.iter().map(row_json).collect();
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "provider": q.provider.as_str(),
         "period": period_name(&q.period),
         "grouping": grouping_name(&q.applied_grouping()),

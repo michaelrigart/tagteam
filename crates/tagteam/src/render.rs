@@ -10,6 +10,8 @@ use tagteam_engine::words::{
     AHEAD, IN_SESSION, Severity, WindowColumn, account_cell, countdown, row_notes, severity,
     spend_text, usage_words, window_columns,
 };
+
+use crate::SCHEMA_VERSION;
 // `app` and `transfer_cmd` still spell these `render::email` and `render::name`.
 pub use tagteam_engine::words::{email, name};
 // `tokens_cmd` still spells these `render::MISSING` and `render::duration`.
@@ -101,7 +103,7 @@ pub fn list_json(
         .find(|l| &l.provider == provider)
         .and_then(|l| l.active_position);
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "activeAccountNumber": active,
         "activeByProvider": active_by,
         "accounts": rows,
@@ -353,17 +355,17 @@ pub fn status_json(
 ) -> Value {
     let mut v = match s {
         StatusView::NoLogin => {
-            json!({"schemaVersion": 1, "provider": provider, "active": null})
+            json!({"schemaVersion": SCHEMA_VERSION, "provider": provider, "active": null})
         }
         StatusView::Unmanaged { email } => json!({
-            "schemaVersion": 1,
+            "schemaVersion": SCHEMA_VERSION,
             "provider": provider,
             "active": {"email": email, "provider": provider, "managed": false},
         }),
         StatusView::Managed { account, total } => {
             let mut row = row_json(account, usage);
             row["managed"] = json!(true);
-            json!({"schemaVersion": 1, "provider": provider, "active": row, "totalManagedAccounts": total})
+            json!({"schemaVersion": SCHEMA_VERSION, "provider": provider, "active": row, "totalManagedAccounts": total})
         }
     };
     match session {
@@ -464,7 +466,7 @@ pub fn status_human(
 
 pub fn switch_json(o: &SwitchOutcome, provider: &str) -> Value {
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "provider": provider,
         "switched": o.switched,
         "from": o.from.as_ref().map(|r| r.position),
@@ -516,7 +518,8 @@ pub fn switch_human(o: &SwitchOutcome) -> String {
 
 /// An account command's result: the row as `list` shows it, `active` and usage included.
 pub fn account_json(account: &AccountView, created: Option<bool>, usage: RenderUsage<'_>) -> Value {
-    let mut v = json!({"schemaVersion": 1, "ok": true, "account": row_json(account, usage)});
+    let mut v =
+        json!({"schemaVersion": SCHEMA_VERSION, "ok": true, "account": row_json(account, usage)});
     if let Some(c) = created {
         v["created"] = json!(c);
     }
@@ -543,7 +546,7 @@ pub fn mapping_json(m: &Mapping, account: &AccountRow) -> Value {
 /// `map`'s list.
 pub fn mappings_json(rows: &[(Mapping, AccountRow)]) -> Value {
     let mappings: Vec<Value> = rows.iter().map(|(m, a)| mapping_json(m, a)).collect();
-    json!({"schemaVersion": 1, "mappings": mappings})
+    json!({"schemaVersion": SCHEMA_VERSION, "mappings": mappings})
 }
 
 /// `map`'s list in text: one line per mapping, in path order. The provider shows only when the

@@ -16,6 +16,8 @@ use tagteam_engine::daemon::{daemon_lock_path, daemon_socket_path, read_daemon_r
 use tagteam_engine::service::{ServiceKind, ServiceState};
 use tagteam_provider::{Env, ProcessStamp, Read};
 
+use crate::SCHEMA_VERSION;
+
 /// D8.2: the LSB status convention's "not running".
 pub(crate) const EXIT_NOT_RUNNING: i32 = 3;
 
@@ -38,7 +40,7 @@ fn service_value(kind: ServiceKind, path: &Path) -> Value {
 
 /// `install --print --json`: the unit, as a string, beside where it would go.
 pub(crate) fn print_json(kind: ServiceKind, path: &Path, unit: &str) -> Value {
-    json!({"schemaVersion": 1, "service": service_value(kind, path), "unit": unit})
+    json!({"schemaVersion": SCHEMA_VERSION, "service": service_value(kind, path), "unit": unit})
 }
 
 pub(crate) fn install_human(r: &InstallReport) -> String {
@@ -57,7 +59,7 @@ pub(crate) fn install_human(r: &InstallReport) -> String {
 /// D9.4: `{schemaVersion, ok, service: {kind, path, label}, started, warnings}`.
 pub(crate) fn install_json(r: &InstallReport) -> Value {
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "ok": true,
         "service": service_value(r.kind, &r.path),
         "started": r.started,
@@ -85,7 +87,7 @@ pub(crate) fn uninstall_human(kind: ServiceKind, path: &Path, found: Uninstalled
 /// D9.4: `{schemaVersion, ok, removed, stopped}`. `removed` is true unless nothing was found;
 /// `stopped` is true when the manager stopped a unit whose file was already gone.
 pub(crate) fn uninstall_json(found: Uninstalled) -> Value {
-    json!({"schemaVersion": 1, "ok": true, "removed": found.removed(), "stopped": found.stopped()})
+    json!({"schemaVersion": SCHEMA_VERSION, "ok": true, "removed": found.removed(), "stopped": found.stopped()})
 }
 
 /// What `daemon status` found (D8.2).
@@ -178,7 +180,7 @@ pub(crate) fn status_json(
     state: &ServiceState,
 ) -> Value {
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "running": found.running(),
         "pid": found.pid(),
         "daemon": match found {

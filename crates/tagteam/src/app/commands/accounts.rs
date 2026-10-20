@@ -8,6 +8,7 @@ use tagteam_engine::views::{AccountView, ShellAccount, StatusView};
 use tagteam_engine::{Engine, EngineError};
 use tagteam_provider::profile::RunShell;
 
+use crate::SCHEMA_VERSION;
 use crate::cli::StrategyArg;
 use crate::render;
 
@@ -269,7 +270,10 @@ impl App<'_, '_> {
                     .iter()
                     .map(|r| json!({"alias": r.alias, "number": r.position, "provider": r.provider.as_str()}))
                     .collect();
-                self.print(&human, json!({"schemaVersion": 1, "aliases": aliases}));
+                self.print(
+                    &human,
+                    json!({"schemaVersion": SCHEMA_VERSION, "aliases": aliases}),
+                );
             }
             (Some(account), Some(name), false) => {
                 let row = self.resolve(&account)?;

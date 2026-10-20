@@ -11,6 +11,7 @@ use tagteam_engine::import::ImportReport;
 use tagteam_engine::store::AccountRow;
 use tagteam_provider::atomic::sync_parent;
 
+use crate::SCHEMA_VERSION;
 use crate::render;
 
 /// §13.3: whenever the file holds an OAuth account, export says that it hands logins over.
@@ -179,7 +180,7 @@ pub(crate) fn export_json(r: &ExportResult, file: Option<&Path>, encrypted: bool
         })
         .collect();
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "ok": true,
         "file": file.map(|f| f.display().to_string()),
         "encrypted": encrypted,
@@ -223,7 +224,7 @@ pub(crate) fn import_json(r: &ImportReport) -> Value {
         })
         .collect();
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "ok": !r.any_failed(),
         "accounts": accounts,
         "warnings": r.warnings,

@@ -8,6 +8,7 @@ use tagteam_engine::Engine;
 use tagteam_engine::displace::{DisplacedEntry, DisplacedList};
 use tagteam_engine::words::MISSING;
 
+use crate::SCHEMA_VERSION;
 use crate::render;
 
 const EMPTY: &str = "No displaced credentials.\n";
@@ -137,7 +138,7 @@ pub(crate) fn json(list: &DisplacedList) -> Value {
             })
         })
         .collect();
-    json!({"schemaVersion": 1, "dir": list.dir.to_string_lossy(), "displaced": displaced})
+    json!({"schemaVersion": SCHEMA_VERSION, "dir": list.dir.to_string_lossy(), "displaced": displaced})
 }
 
 /// The question `--purge` asks on a terminal (§6.3), for `n` entries. Its default is no.
@@ -159,7 +160,7 @@ pub(crate) fn purged_human(deleted: &[String]) -> String {
 
 /// `{schemaVersion, ok, deleted: [id]}`.
 pub(crate) fn purged_json(deleted: &[String]) -> Value {
-    json!({"schemaVersion": 1, "ok": true, "deleted": deleted})
+    json!({"schemaVersion": SCHEMA_VERSION, "ok": true, "deleted": deleted})
 }
 
 #[cfg(test)]
