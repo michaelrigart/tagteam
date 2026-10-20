@@ -68,9 +68,20 @@ fn names(path: &Path) -> impl Iterator<Item = OsString> + '_ {
     })
 }
 
-/// `(device, inode)`: what a file is, whatever it is called.
-pub(crate) fn identity(meta: &fs::Metadata) -> (u64, u64) {
-    (meta.dev(), meta.ino())
+/// What a file is, whatever it is called: its device and inode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FileId {
+    dev: u64,
+    ino: u64,
+}
+
+impl FileId {
+    pub(crate) fn of(meta: &fs::Metadata) -> FileId {
+        FileId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
 }
 
 /// Whether `e` says the path is not there (or has a non-directory in the way).
@@ -180,5 +191,13 @@ mod tests {
         symlink(r.join("one"), r.join("two")).unwrap();
         assert!(trace_path(&r.join("one")).is_err());
         assert!(trace_path(Path::new("a/b")).is_err());
+    }
+
+    #[test]
+    fn a_file_id_compares_device_and_inode() {
+        let id = FileId { dev: 1, ino: 5 };
+        assert_eq!(id, FileId { dev: 1, ino: 5 });
+        assert_ne!(id, FileId { dev: 2, ino: 5 });
+        assert_ne!(id, FileId { dev: 1, ino: 6 });
     }
 }

@@ -10,7 +10,7 @@ use tagteam_provider::{Credential, Identity, Provenance, Provider, Read};
 use crate::account_lock::AccountLock;
 use crate::engine::{Engine, Reconcile};
 use crate::error::EngineError;
-use crate::fsutil::{absent, identity, trace_path};
+use crate::fsutil::{FileId, absent, trace_path};
 use crate::rescue::RescueUnlisted;
 use crate::store::{AccountRow, EventRow, LoginMeta, NewAccount, Store, StoreError};
 
@@ -416,10 +416,10 @@ impl Engine {
         let mut doomed = Vec::new();
         match fs::symlink_metadata(&location) {
             Ok(meta) => {
-                doomed.push(identity(&meta));
+                doomed.push(FileId::of(&meta));
                 if !meta.file_type().is_symlink() {
                     match fs::metadata(&location) {
-                        Ok(followed) => doomed.push(identity(&followed)),
+                        Ok(followed) => doomed.push(FileId::of(&followed)),
                         Err(e) if absent(&e) => return Ok(()),
                         Err(_) => return Err(unresolved()),
                     }
@@ -441,7 +441,7 @@ impl Engine {
                 // the path at it or under it. A missing ancestor ends that walk.
                 for ancestor in path.ancestors() {
                     match fs::symlink_metadata(ancestor) {
-                        Ok(meta) => inside |= doomed.contains(&identity(&meta)),
+                        Ok(meta) => inside |= doomed.contains(&FileId::of(&meta)),
                         Err(e) if absent(&e) => break,
                         Err(_) => return Err(unresolved()),
                     }

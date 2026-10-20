@@ -22,7 +22,7 @@ use crate::auto::{engine_lock_path, read_holder};
 use crate::displace::PurgeError;
 use crate::engine::Engine;
 use crate::error::{EngineError, SessionOwner};
-use crate::fsutil::{absent, identity, trace_path};
+use crate::fsutil::{FileId, absent, trace_path};
 use crate::hooks;
 use crate::lifecycle::{PendingLaunches, UnlistedRescues};
 use crate::rescue::RescueUnlisted;
@@ -929,7 +929,7 @@ impl Engine {
         // The roots are every directory purge deletes in, by what each RESOLVES to
         // (`metadata` follows links): `vault/`, `displaced/` and `sessions/` may be links to
         // somewhere else entirely, and the rescue path is whatever it is.
-        let mut walls: Vec<(u64, u64)> = Vec::new();
+        let mut walls: Vec<FileId> = Vec::new();
         let data = self.env.data_dir();
         let mut wall_dirs = vec![
             data.clone(),
@@ -946,7 +946,7 @@ impl Engine {
         }
         for dir in &wall_dirs {
             match fs::metadata(dir) {
-                Ok(meta) => walls.push(identity(&meta)),
+                Ok(meta) => walls.push(FileId::of(&meta)),
                 Err(e) if absent(&e) => {}
                 Err(_) => return Err(unresolved()),
             }
@@ -962,8 +962,8 @@ impl Engine {
         // What the purge leaves alone: the profiles of the accounts it does not affect, and the
         // directories above each, which a path passes through to reach one.
         let affected: BTreeSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-        let mut spared: Vec<(u64, u64)> = Vec::new();
-        let mut on_the_way: Vec<(u64, u64)> = Vec::new();
+        let mut spared: Vec<FileId> = Vec::new();
+        let mut on_the_way: Vec<FileId> = Vec::new();
         if let Some(store) = store {
             for row in store.all_accounts()? {
                 if affected.contains(row.id.as_str()) {
@@ -971,16 +971,16 @@ impl Engine {
                 }
                 let profile = profile_path(&self.env, &row.id);
                 match fs::symlink_metadata(&profile) {
-                    Ok(meta) => spared.push(identity(&meta)),
+                    Ok(meta) => spared.push(FileId::of(&meta)),
                     Err(e) if absent(&e) => continue,
                     Err(_) => return Err(unresolved()),
                 }
                 if let Ok(meta) = fs::metadata(&profile) {
-                    spared.push(identity(&meta));
+                    spared.push(FileId::of(&meta));
                 }
                 for above in profile.ancestors().skip(1) {
                     match fs::metadata(above) {
-                        Ok(meta) => on_the_way.push(identity(&meta)),
+                        Ok(meta) => on_the_way.push(FileId::of(&meta)),
                         Err(e) if absent(&e) => break,
                         Err(_) => return Err(unresolved()),
                     }
@@ -1000,12 +1000,12 @@ impl Engine {
                     let mut chain = Vec::new();
                     for ancestor in touched.ancestors() {
                         match fs::symlink_metadata(ancestor) {
-                            Ok(meta) => chain.push(identity(&meta)),
+                            Ok(meta) => chain.push(FileId::of(&meta)),
                             Err(e) if absent(&e) => break,
                             Err(_) => return Err(unresolved()),
                         }
                         if let Ok(meta) = fs::metadata(ancestor) {
-                            chain.push(identity(&meta));
+                            chain.push(FileId::of(&meta));
                         }
                     }
                     let inside = chain.iter().any(|id| walls.contains(id));
