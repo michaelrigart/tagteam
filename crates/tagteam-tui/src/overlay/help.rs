@@ -3,8 +3,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
-use super::{Overlay, boxed};
-use crate::msg::Cmd;
+use super::{KeyOutcome, boxed};
 use crate::state::{Screen, State};
 use crate::view::pad;
 
@@ -48,10 +47,10 @@ const HELP_HISTORY: [(&str, &str); 3] = [
     ("J K", "scroll the windows"),
 ];
 
-pub(super) fn key(key: KeyEvent) -> (Option<Overlay>, Vec<Cmd>) {
+pub(super) fn key(key: KeyEvent) -> KeyOutcome {
     match key.code {
-        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => (None, vec![]),
-        _ => (Some(Overlay::Help), vec![]),
+        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => KeyOutcome::Close,
+        _ => KeyOutcome::Keep,
     }
 }
 

@@ -3,44 +3,37 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
-use super::{CHOICE_ROWS, Overlay, boxed, question_rows};
+use super::{CHOICE_ROWS, KeyOutcome, boxed, question_rows};
 use crate::msg::{Answer, AnswerTo, Cmd};
 use crate::state::State;
 use crate::view::{pad, scrolled_windows, width_of, wrap_rows};
 
 pub(super) fn key(
-    question: String,
-    options: Vec<String>,
-    selected: usize,
+    options: &[String],
+    selected: &mut usize,
     reply: AnswerTo,
     key: KeyEvent,
-) -> (Option<Overlay>, Vec<Cmd>) {
+) -> KeyOutcome {
     let last = options.len().saturating_sub(1);
     let digit = match key.code {
         KeyCode::Char(c @ '1'..='9') => Some(c as usize - '1' as usize),
         _ => None,
     };
     let answer = match key.code {
-        KeyCode::Enter if !options.is_empty() => Some(Some(selected)),
+        KeyCode::Enter if !options.is_empty() => Some(Some(*selected)),
         KeyCode::Esc => Some(None),
         _ => digit.filter(|d| *d <= last).map(Some),
     };
     if let Some(answer) = answer {
         let answer = Answer::Choose(answer);
-        return (None, vec![Cmd::Answer { to: reply, answer }]);
+        return KeyOutcome::CloseWith(vec![Cmd::Answer { to: reply, answer }]);
     }
-    let selected = match key.code {
-        KeyCode::Up | KeyCode::Char('k') => selected.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => (selected + 1).min(last),
-        _ => selected,
-    };
-    let kept = Overlay::Choose {
-        question,
-        options,
-        selected,
-        reply,
-    };
-    (Some(kept), vec![])
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => *selected = selected.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => *selected = (*selected + 1).min(last),
+        _ => {}
+    }
+    KeyOutcome::Keep
 }
 
 pub(super) fn render(

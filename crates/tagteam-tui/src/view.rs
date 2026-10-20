@@ -271,7 +271,7 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
         Paragraph::new(footer(state, area.width, now_ms)),
         areas.footer,
     );
-    overlay::render(state, frame, now_ms);
+    overlay::render(state, frame);
 }
 
 /// ` tagteam  [1 Accounts]  2 Tokens  3 History` on the left, the mode (`daemon::words::mode`)

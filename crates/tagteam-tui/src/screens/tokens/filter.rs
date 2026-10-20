@@ -14,7 +14,7 @@ use tagteam_engine::tokens::{
 use super::table::account_name;
 use super::{TokensState, load};
 use crate::msg::Cmd;
-use crate::overlay::{CHOICE_ROWS, Overlay, boxed};
+use crate::overlay::{CHOICE_ROWS, KeyOutcome, Overlay, boxed};
 use crate::source::SourceError;
 use crate::state::State;
 use crate::view::{scrolled_windows, wrap_rows};
@@ -205,15 +205,15 @@ fn selection<T>(choices: &[&Choice], pick: impl Fn(&Kind) -> Option<T>) -> Optio
 /// empty list matches nothing).
 pub(crate) fn handle_key(
     state: &mut State,
-    mut dialog: FilterDialog,
+    dialog: &mut FilterDialog,
     key: KeyEvent,
     now_ms: i64,
-) -> (Option<Overlay>, Vec<Cmd>) {
+) -> KeyOutcome {
     if key.code == KeyCode::Esc {
-        return (None, vec![]);
+        return KeyOutcome::Close;
     }
     let Some(choices) = dialog.choices.as_mut() else {
-        return (Some(Overlay::Filter(dialog)), vec![]);
+        return KeyOutcome::Keep;
     };
     let last = choices.len().saturating_sub(1);
     match key.code {
@@ -246,7 +246,7 @@ pub(crate) fn handle_key(
                     NO_MODEL
                 };
                 dialog.error = Some(refusal.to_owned());
-                return (Some(Overlay::Filter(dialog)), vec![]);
+                return KeyOutcome::Keep;
             }
             let accounts = selection(&accounts, |k| match k {
                 Kind::Account(s) => Some(s.clone()),
@@ -260,11 +260,11 @@ pub(crate) fn handle_key(
             t.accounts = accounts;
             t.models = models;
             t.reset();
-            return (None, load(state, now_ms));
+            return KeyOutcome::CloseWith(load(state, now_ms));
         }
         _ => {}
     }
-    (Some(Overlay::Filter(dialog)), vec![])
+    KeyOutcome::Keep
 }
 
 /// The dialog (B7, B27, B29): the accounts, then the models, each `[x]` when chosen and wrapped

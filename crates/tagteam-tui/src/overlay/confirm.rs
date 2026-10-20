@@ -3,44 +3,38 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
-use super::{ConfirmThen, Overlay, boxed, question_rows};
+use super::{ConfirmThen, KeyOutcome, boxed, question_rows};
 use crate::actions::start;
 use crate::msg::{Answer, Cmd};
 use crate::state::State;
 
 pub(super) fn key(
     state: &mut State,
-    question: String,
-    default_yes: bool,
-    choice: bool,
-    then: ConfirmThen,
+    choice: &mut bool,
+    then: &ConfirmThen,
     key: KeyEvent,
     now_ms: i64,
-) -> (Option<Overlay>, Vec<Cmd>) {
+) -> KeyOutcome {
     let answer = match key.code {
         KeyCode::Char('y' | 'Y') => Some(true),
         KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
-        KeyCode::Enter => Some(choice),
+        KeyCode::Enter => Some(*choice),
         _ => None,
     };
     match answer {
-        Some(yes) => (None, confirmed(state, then, yes, now_ms)),
+        Some(yes) => KeyOutcome::CloseWith(confirmed(state, then, yes, now_ms)),
         None => {
-            let choice = match key.code {
+            if matches!(
+                key.code,
                 KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Tab
-                | KeyCode::BackTab
-                | KeyCode::Char('h' | 'l') => !choice,
-                _ => choice,
-            };
-            let kept = Overlay::Confirm {
-                question,
-                default_yes,
-                choice,
-                then,
-            };
-            (Some(kept), vec![])
+                    | KeyCode::Right
+                    | KeyCode::Tab
+                    | KeyCode::BackTab
+                    | KeyCode::Char('h' | 'l')
+            ) {
+                *choice = !*choice;
+            }
+            KeyOutcome::Keep
         }
     }
 }
@@ -70,13 +64,13 @@ pub(super) fn render(state: &State, frame: &mut Frame, area: Rect, question: &st
 }
 
 /// A confirm dialog's answer: sent to the prompt waiting for it, or a yes starts the action.
-fn confirmed(state: &mut State, then: ConfirmThen, yes: bool, now_ms: i64) -> Vec<Cmd> {
+fn confirmed(state: &mut State, then: &ConfirmThen, yes: bool, now_ms: i64) -> Vec<Cmd> {
     match then {
         ConfirmThen::Reply(to) => vec![Cmd::Answer {
-            to,
+            to: *to,
             answer: Answer::Confirm(yes),
         }],
-        ConfirmThen::Run(action) if yes => start(state, action, now_ms),
+        ConfirmThen::Run(action) if yes => start(state, action.clone(), now_ms),
         ConfirmThen::Run(_) => vec![],
     }
 }
