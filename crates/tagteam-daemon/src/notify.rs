@@ -12,7 +12,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use tagteam_core::autoswitch::Trigger;
-use tagteam_core::rank::{binding_window, span};
+use tagteam_core::fmt::span;
+use tagteam_core::rank::binding_window;
 use tagteam_core::{ProviderId, Window};
 use tagteam_engine::auto::AutoEvent;
 use tagteam_engine::daemon::find_on_path;

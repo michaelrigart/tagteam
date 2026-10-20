@@ -1,8 +1,8 @@
 use tagteam_core::autoswitch::{Departure, Trigger};
+use tagteam_core::fmt::span;
 use tagteam_core::poll::replan_for_role;
 use tagteam_core::rank::{
     BestOrder, Candidate, NextAvailable, best_order, binding_window, blocked_until, next_available,
-    span,
 };
 use tagteam_core::usage::headroom;
 use tagteam_core::{
