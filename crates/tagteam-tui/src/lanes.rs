@@ -3,8 +3,21 @@
 //! and stops taking requests once it is closed or has died.
 
 use std::collections::VecDeque;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use tagteam_core::ProviderId;
+use tagteam_daemon::protocol::Status;
+use tagteam_provider::Cancel;
+
+use crate::ask::{Answers, ChannelAsk};
+use crate::host::Host;
+use crate::live::{LIVE_QUEUE, LiveQueue};
+use crate::msg::{ActionsReq, DaemonReq, IndexReq, Msg, ReportReq, ViewsReq};
+use crate::runtime::WAKE;
+use crate::source::{Source, SourceFactory};
 
 /// Whether a queued request is replaced by a newer one (spec §4.3, "Coalescing").
 pub trait Coalesce {
@@ -147,6 +160,244 @@ impl<Req: Coalesce + Send + 'static> Drop for Lane<Req> {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// The index lane passes on a refresh's progress at most this often: the loop's own pace.
+const PROGRESS_EVERY: Duration = WAKE;
+
+/// What fetches the daemon's `status` on the daemon lane: `live::fetch_status` on its socket.
+pub(crate) type StatusFetch = Arc<dyn Fn() -> Result<Status, String> + Send + Sync>;
+
+/// The lanes (§4.3). The engine lanes: views (`accounts`, `history`, store-served), report
+/// (the token report, which reads the index only), index (the token index's catch-up) and
+/// actions (the collector and every `Host` action, one at a time). And the daemon lane, which
+/// fetches the daemon's `status` and has no engine.
+pub(crate) struct Lanes {
+    pub(crate) views: Lane<ViewsReq>,
+    pub(crate) report: Lane<ReportReq>,
+    pub(crate) index: Lane<IndexReq>,
+    pub(crate) actions: Lane<ActionsReq>,
+    /// When the TUI follows a daemon.
+    pub(crate) daemon: Option<Lane<DaemonReq>>,
+    /// The threads that are let go rather than joined, the daemon lane and the live thread,
+    /// that died: named in the report as a joined lane that panicked is (§10.4).
+    strays: Arc<Mutex<Vec<&'static str>>>,
+    /// What the live thread passes on, bounded; a `Msg::LiveReady` says it has something
+    /// (C-R17).
+    pub(crate) live: Arc<LiveQueue>,
+}
+
+impl Lanes {
+    /// Spawns them. Each engine lane builds its own `Source` in its own thread (R4), and a lane
+    /// that panics says so on `tx` (§4.3, §10.4). The daemon lane is spawned when `status` is
+    /// given.
+    pub(crate) fn spawn(
+        provider: Option<ProviderId>,
+        sources: &SourceFactory,
+        host: &Arc<dyn Host>,
+        tx: &Sender<Msg>,
+        shutdown: &Cancel,
+        answers: &Answers,
+        status: Option<StatusFetch>,
+    ) -> Lanes {
+        let strays = Arc::default();
+        let views = {
+            let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
+            Lane::spawn(
+                "views",
+                move || make(),
+                move |source: &mut Box<dyn Source>, req: ViewsReq| {
+                    let msg = match req {
+                        ViewsReq::Accounts { r#gen } => Msg::Accounts {
+                            r#gen,
+                            result: source.accounts(provider.as_ref()),
+                        },
+                        ViewsReq::History {
+                            r#gen,
+                            account,
+                            since_s,
+                        } => Msg::History {
+                            r#gen,
+                            result: source.history(&account, since_s),
+                        },
+                    };
+                    let _ = out.send(msg);
+                },
+                move || {
+                    let _ = died.send(Msg::LaneDied { lane: "views" });
+                },
+            )
+        };
+        let report = {
+            let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
+            Lane::spawn(
+                "report",
+                move || make(),
+                move |source: &mut Box<dyn Source>, req: ReportReq| {
+                    let msg = match req {
+                        ReportReq::Report { r#gen, query } => Msg::TokenReport {
+                            r#gen,
+                            result: source.token_report(&query),
+                        },
+                        ReportReq::IndexState { r#gen, provider } => Msg::IndexState {
+                            r#gen,
+                            result: source.token_index_state(&provider),
+                        },
+                        ReportReq::Inventory { r#gen, query } => Msg::Inventory {
+                            r#gen,
+                            result: source.token_report(&query),
+                        },
+                    };
+                    let _ = out.send(msg);
+                },
+                move || {
+                    let _ = died.send(Msg::LaneDied { lane: "report" });
+                },
+            )
+        };
+        let index = {
+            let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
+            Lane::spawn(
+                "index",
+                move || make(),
+                move |source: &mut Box<dyn Source>, req: IndexReq| {
+                    let IndexReq::Refresh { provider } = req;
+                    // The engine reports progress per chunk; the loop is told at its own pace.
+                    let mut told: Option<Instant> = None;
+                    let result = source.refresh_tokens(&provider, &mut |progress| {
+                        if told.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
+                            told = Some(Instant::now());
+                            let _ = out.send(Msg::IndexProgress(*progress));
+                        }
+                    });
+                    let _ = out.send(Msg::Refreshed { result });
+                },
+                move || {
+                    let _ = died.send(Msg::LaneDied { lane: "index" });
+                },
+            )
+        };
+        let actions = {
+            let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
+            let (host, shutdown, answers) = (Arc::clone(host), shutdown.clone(), answers.clone());
+            Lane::spawn(
+                "actions",
+                move || make(),
+                move |source: &mut Box<dyn Source>, req: ActionsReq| {
+                    let msg = match req {
+                        ActionsReq::Collect { r#gen, accounts } => Msg::Collected {
+                            r#gen,
+                            result: source.collect_due(&accounts),
+                        },
+                        ActionsReq::Act { action } => {
+                            // Its prompts become dialogs, declined once the shutdown begins
+                            // (§7.2, §10.2 step 3).
+                            let mut ask =
+                                ChannelAsk::new(out.clone(), shutdown.clone(), answers.clone());
+                            let outcome = host.act(&action, &mut ask);
+                            Msg::ActionDone { action, outcome }
+                        }
+                    };
+                    let _ = out.send(msg);
+                },
+                move || {
+                    let _ = died.send(Msg::LaneDied { lane: "actions" });
+                },
+            )
+        };
+        let daemon = status.map(|fetch| {
+            let out = tx.clone();
+            let died = stray_death(&strays, "daemon", tx);
+            Lane::spawn(
+                "daemon",
+                || (),
+                move |_: &mut (), req: DaemonReq| {
+                    let DaemonReq::Status { link } = req;
+                    let result = fetch();
+                    let _ = out.send(Msg::DaemonStatus { link, result });
+                },
+                died,
+            )
+        });
+        let wake = tx.clone();
+        let live = Arc::new(LiveQueue::new(LIVE_QUEUE, move || {
+            wake.send(Msg::LiveReady).is_ok()
+        }));
+        Lanes {
+            views,
+            report,
+            index,
+            actions,
+            daemon,
+            strays,
+            live,
+        }
+    }
+
+    /// What a thread that is let go rather than joined runs if it panics: it is named in the
+    /// report, and the loop is told, which ends the TUI (§10.4).
+    pub(crate) fn stray_death(
+        &self,
+        name: &'static str,
+        tx: &Sender<Msg>,
+    ) -> impl FnOnce() + Send + 'static {
+        stray_death(&self.strays, name, tx)
+    }
+
+    /// §10.2 step 2: nothing more is taken, what is queued is dropped, and an idle lane wakes
+    /// and returns. A refresh the index lane runs stops at its next chunk: its engine takes
+    /// the shutdown token, which step 1 set (§9).
+    pub(crate) fn close(&self) {
+        self.views.close();
+        self.report.close();
+        self.index.close();
+        self.actions.close();
+        if let Some(daemon) = &self.daemon {
+            daemon.close();
+        }
+        // The loop stops listening to the live thread: its next push says `Gone`, whatever the
+        // queue holds, and it returns.
+        self.live.close();
+    }
+
+    /// §10.2 step 5: joins every engine lane, lets the daemon lane go (§4.3: it touches no
+    /// store, and a `status` it waits for may take 2 s), and names the lanes that panicked.
+    pub(crate) fn join(self) -> Vec<&'static str> {
+        let mut died = Vec::new();
+        if self.views.join().is_err() {
+            died.push("views");
+        }
+        if self.report.join().is_err() {
+            died.push("report");
+        }
+        if self.index.join().is_err() {
+            died.push("index");
+        }
+        if self.actions.join().is_err() {
+            died.push("actions");
+        }
+        drop(self.daemon);
+        died.extend(lock(&self.strays).iter());
+        died
+    }
+}
+
+/// `stray_death` over the list it adds to.
+fn stray_death(
+    strays: &Arc<Mutex<Vec<&'static str>>>,
+    name: &'static str,
+    tx: &Sender<Msg>,
+) -> impl FnOnce() + Send + 'static {
+    let (strays, tx) = (Arc::clone(strays), tx.clone());
+    move || {
+        lock(&strays).push(name);
+        let _ = tx.send(Msg::LaneDied { lane: name });
+    }
+}
+
+/// The list of dead strays, whatever a panic left it as: it only holds names.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(test)]
