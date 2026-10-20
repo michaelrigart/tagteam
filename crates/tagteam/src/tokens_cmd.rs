@@ -252,7 +252,7 @@ impl<'w> Progress<'w> {
 /// Spec §11.3, §14: what goes to stderr beside the report. A `--no-refresh` report of an
 /// index that never completed a refresh is partial, and says so; skipped lines and unreadable
 /// files are the first sign of transcript format drift.
-pub(crate) fn notices(report: &TokenReport, no_refresh: bool) -> Vec<String> {
+pub(crate) fn notices(report: &TokenReport, no_refresh: bool, app: &str) -> Vec<String> {
     let index = &report.index;
     let mut out = Vec::new();
     if no_refresh && index.refreshed_at_ms.is_none() {
@@ -260,7 +260,7 @@ pub(crate) fn notices(report: &TokenReport, no_refresh: bool) -> Vec<String> {
     }
     if index.skipped_lines > 0 {
         out.push(format!(
-            "warning: {} could not be read in the last refresh of the token index; Claude Code's transcript format may have changed",
+            "warning: {} could not be read in the last refresh of the token index; {app}'s transcript format may have changed",
             plural(index.skipped_lines, "transcript line")
         ));
     }
@@ -1024,13 +1024,13 @@ mod tests {
             refreshed_at_ms: Some(1),
             ..IndexState::default()
         };
-        assert!(notices(&report_with(refreshed), true).is_empty());
+        assert!(notices(&report_with(refreshed), true, "Claude Code").is_empty());
         assert_eq!(
-            notices(&report_with(IndexState::default()), true),
+            notices(&report_with(IndexState::default()), true, "Claude Code"),
             [format!("note: {PARTIAL_INDEX}")]
         );
         assert!(
-            notices(&report_with(IndexState::default()), false).is_empty(),
+            notices(&report_with(IndexState::default()), false, "Claude Code").is_empty(),
             "a refresh that ran says nothing of being partial"
         );
         let drift = IndexState {
@@ -1039,18 +1039,22 @@ mod tests {
             ..refreshed
         };
         assert_eq!(
-            notices(&report_with(drift), false),
+            notices(&report_with(drift), false, "Claude Code"),
             [
                 "warning: 1 transcript line could not be read in the last refresh of the token index; Claude Code's transcript format may have changed",
                 "warning: 3 transcript files could not be read; the next refresh tries again",
             ]
+        );
+        assert!(
+            notices(&report_with(drift), false, "FakeAgent")[0]
+                .ends_with("FakeAgent's transcript format may have changed")
         );
         let many = IndexState {
             skipped_lines: 12,
             unreadable_files: 1,
             ..refreshed
         };
-        let out = notices(&report_with(many), false);
+        let out = notices(&report_with(many), false, "Claude Code");
         assert!(out[0].starts_with("warning: 12 transcript lines could not be read"));
         assert!(out[1].starts_with("warning: 1 transcript file could not be read"));
     }

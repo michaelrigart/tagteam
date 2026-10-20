@@ -17,7 +17,6 @@ pub(crate) use tagteam_engine::words::{MISSING, duration};
 use tagteam_provider::SecretStore;
 use unicode_width::UnicodeWidthStr;
 
-const NO_ACCOUNTS: &str = "No accounts yet. Log in with `claude`, then run `tagteam add`.\n";
 const NO_MAPPINGS: &str = "No mappings yet. Map a directory with `tagteam map ACCOUNT [PATH]`.\n";
 
 /// §13.5's severities, which `list` and `status` share: ≥ 90 critical, ≥ 70 warning.
@@ -312,6 +311,10 @@ fn table(accounts: &[AccountView], this: Option<&AccountId>, now_s: i64, color: 
     out
 }
 
+fn no_accounts(launch: &str) -> String {
+    format!("No accounts yet. Log in with `{launch}`, then run `tagteam add`.\n")
+}
+
 /// §13.1's `list`: one table per provider that has accounts, headed by its name when there
 /// is more than one. `this` is the run shell's own account (§12.8), noted `this`; `now_s`
 /// measures the countdowns; `color` colours percentages.
@@ -319,11 +322,12 @@ pub fn list_human(
     lists: &[ProviderAccounts],
     this: Option<&AccountId>,
     display_names: &dyn Fn(&str) -> String,
+    launch: &str,
     now_s: i64,
     color: bool,
 ) -> String {
     if lists.iter().all(|l| l.accounts.is_empty()) {
-        return NO_ACCOUNTS.into();
+        return no_accounts(launch);
     }
     let shown: Vec<&ProviderAccounts> = lists.iter().filter(|l| !l.accounts.is_empty()).collect();
     let mut s = String::new();
@@ -860,6 +864,33 @@ mod tests {
     }
 
     #[test]
+    fn the_empty_list_names_the_provider_s_launch_command() {
+        let names = |id: &str| id.to_owned();
+        assert_eq!(
+            list_human(
+                &[accounts(CLAUDE_CODE, None)],
+                None,
+                &names,
+                "claude",
+                NOW,
+                false
+            ),
+            "No accounts yet. Log in with `claude`, then run `tagteam add`.\n"
+        );
+        assert_eq!(
+            list_human(
+                &[accounts("fake-agent", None)],
+                None,
+                &names,
+                "fakeagent",
+                NOW,
+                false
+            ),
+            "No accounts yet. Log in with `fakeagent`, then run `tagteam add`.\n"
+        );
+    }
+
+    #[test]
     fn a_usage_strategy_outcome_renders_its_strategy_reason_and_warnings() {
         let message =
             "every candidate is at its limit: a@x.co (7d at 100%); the earliest reset is in 3d09h";
@@ -958,7 +989,14 @@ mod tests {
             unread(UsageStatus::ApiKey, None, None),
         );
         assert_eq!(
-            list_human(&one(vec![live, spare, work, key]), None, &names, NOW, false),
+            list_human(
+                &one(vec![live, spare, work, key]),
+                None,
+                &names,
+                "claude",
+                NOW,
+                false
+            ),
             concat!(
                 "    #  ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
                 " *  1  michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",
@@ -994,7 +1032,7 @@ mod tests {
             setup,
         ];
         assert_eq!(
-            list_human(&one(rows), None, &names, NOW, false),
+            list_human(&one(rows), None, &names, "claude", NOW, false),
             concat!(
                 "    #  ACCOUNT                    5H           7D           SPEND  AGE\n",
                 "    1  a@x.co                      50%  reset   60%  3d09h  —      1h06m  unavailable (http-429, retry 5m)\n",
@@ -1015,6 +1053,7 @@ mod tests {
                 &one(vec![view(1, "a@x.co", OAUTH, locked)]),
                 None,
                 &names,
+                "claude",
                 NOW,
                 false
             ),
@@ -1032,7 +1071,8 @@ mod tests {
             spent.pct = pct;
             view(1, "a@x.co", OAUTH, read(0, 9.0, 12.0, false, vec![spent]))
         };
-        let table = |pct, color| list_human(&one(vec![rows(pct)]), None, &names, NOW, color);
+        let table =
+            |pct, color| list_human(&one(vec![rows(pct)]), None, &names, "claude", NOW, color);
         assert!(table(95.0, true).contains("\x1b[31m€19 of €20\x1b[0m"));
         assert!(table(75.0, true).contains("\x1b[33m€15 of €20\x1b[0m"));
         assert!(table(10.0, true).contains("  €2 of €20"));
@@ -1069,6 +1109,7 @@ mod tests {
             ]),
             None,
             &names,
+            "claude",
             NOW,
             false,
         );
@@ -1095,13 +1136,13 @@ mod tests {
             )])
         };
         assert_eq!(
-            list_human(&rows(), None, &names, NOW, true),
+            list_human(&rows(), None, &names, "claude", NOW, true),
             concat!(
                 "    #  ACCOUNT  5H           7D           SPEND  AGE\n",
                 "    1  a@x.co    \x1b[31m95%\x1b[0m  2h40m   \x1b[33m77%\x1b[0m  3d09h  —      <1m\n",
             )
         );
-        assert!(!list_human(&rows(), None, &names, NOW, false).contains('\x1b'));
+        assert!(!list_human(&rows(), None, &names, "claude", NOW, false).contains('\x1b'));
     }
 
     #[test]
@@ -1180,7 +1221,7 @@ mod tests {
         a.active = true;
         a.row.quarantine_reason = Some("invalid_grant".into());
         assert_eq!(
-            list_human(&one(vec![a.clone()]), None, &names, NOW, false),
+            list_human(&one(vec![a.clone()]), None, &names, "claude", NOW, false),
             "    #  ACCOUNT\n *  1  a@x.co   relogin required\n"
         );
         assert_eq!(
@@ -1391,7 +1432,7 @@ mod tests {
         let elsewhere = AccountId::from_string("0192-unmanaged");
         for this in [None, Some(&elsewhere)] {
             assert_eq!(
-                list_human(&one(pinned_rows()), this, &names, NOW, false),
+                list_human(&one(pinned_rows()), this, &names, "claude", NOW, false),
                 PINNED
             );
         }
@@ -1405,7 +1446,14 @@ mod tests {
         rows[1].in_session = true;
         let spare = rows[1].row.id.clone();
         assert_eq!(
-            list_human(&one(rows.clone()), Some(&spare), &names, NOW, false),
+            list_human(
+                &one(rows.clone()),
+                Some(&spare),
+                &names,
+                "claude",
+                NOW,
+                false
+            ),
             concat!(
                 "    #    ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
                 " *  1    michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",
@@ -1416,7 +1464,7 @@ mod tests {
         );
         // Outside a run shell the same session shows, without the note.
         assert_eq!(
-            list_human(&one(rows), None, &names, NOW, false),
+            list_human(&one(rows), None, &names, "claude", NOW, false),
             concat!(
                 "    #    ACCOUNT                5H           7D                   SPEND      FABLE        AGE\n",
                 " *  1    michael@example.com      9%  2h40m   77%  3d09h  ▲ pace  €0 of €20    0%  3d09h  2m\n",

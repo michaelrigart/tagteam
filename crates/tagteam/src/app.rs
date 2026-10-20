@@ -110,8 +110,6 @@ const CANCELLED: &str = "cancelled";
 const INTERRUPTED: &str = "interrupted";
 const TOKEN_MISSING: &str = "pass the token as an argument, or `-` to read it from stdin";
 const ALIAS_USAGE: &str = "alias takes ACCOUNT NAME, ACCOUNT --unset, or no arguments";
-const NO_LIVE_LOGIN: &str =
-    "there is no live login; name an account, or log in with `claude` first";
 const CSV_AND_JSON: &str = "--csv and --json are two output formats; pass one";
 const BAD_SINCE: &str = "--since takes a span like 14d, 12h or 30m";
 const STATUSLINE_UNDER_JSON: &str = "statusline prints a line of text; run it without --json";
@@ -568,6 +566,10 @@ fn auto_flags(
 }
 
 /// A provider's display name, or its ID for one this build does not register.
+fn no_live_login(launch: &str) -> String {
+    format!("there is no live login; name an account, or log in with `{launch}` first")
+}
+
 fn display_name(engine: &Engine, provider: &ProviderId) -> String {
     engine
         .provider(provider)
@@ -1284,7 +1286,8 @@ impl App<'_, '_> {
                         .provider(&ProviderId::new(id))
                         .map_or_else(|_| id.to_owned(), |p| p.display_name().to_owned())
                 };
-                let human = render::list_human(&lists, this.as_ref(), &names, now_s, color);
+                let launch = engine.provider(&self.provider())?.launch_command();
+                let human = render::list_human(&lists, this.as_ref(), &names, launch, now_s, color);
                 let json = render::list_json(&lists, &self.provider(), &render_usage(engine));
                 self.print(&human, json);
             }
@@ -2306,6 +2309,7 @@ impl App<'_, '_> {
                 format!("{} has no transcripts", p.display_name()),
             ));
         }
+        let app = p.display_name().to_owned();
         let mut accounts: Vec<AccountSel> = named
             .into_iter()
             .map(|row| AccountSel::Account(row.id))
@@ -2337,7 +2341,7 @@ impl App<'_, '_> {
             session: None,
             tz: flags.tz,
         })?;
-        for notice in tokens_cmd::notices(&report, args.no_refresh) {
+        for notice in tokens_cmd::notices(&report, args.no_refresh, &app) {
             let _ = writeln!(self.io.err, "{notice}");
         }
         if args.csv {
@@ -2472,7 +2476,10 @@ impl App<'_, '_> {
                     "the live login ({email}) is not managed by tagteam; name an account, or run `tagteam add` first"
                 ),
             )),
-            StatusView::NoLogin => Err(Failure::Message(KIND_NO_LIVE_LOGIN, NO_LIVE_LOGIN.into())),
+            StatusView::NoLogin => {
+                let launch = self.engine.provider(&self.provider())?.launch_command();
+                Err(Failure::Message(KIND_NO_LIVE_LOGIN, no_live_login(launch)))
+            }
         }
     }
 }
@@ -2524,6 +2531,14 @@ mod tests {
     use tagteam_provider::FakeKeychain;
 
     use super::*;
+
+    #[test]
+    fn no_live_login_names_the_launch_command() {
+        assert_eq!(
+            no_live_login("claude"),
+            "there is no live login; name an account, or log in with `claude` first"
+        );
+    }
 
     /// An environment that sets every test override.
     fn all_set(k: &str) -> Option<OsString> {
