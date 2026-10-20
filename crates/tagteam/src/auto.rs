@@ -312,7 +312,8 @@ impl EventSink for HumanSink<'_> {
     }
 }
 
-/// Epoch seconds as the local time of day, `HH:MM:SS`; UTC should the zone be unreadable.
+/// Epoch seconds as the local time of day, `HH:MM:SS`; UTC should the zone be unreadable or the
+/// time lie outside the years jiff reads (about ±9999).
 pub fn local_time(epoch_s: i64) -> String {
     let zoned = jiff::Timestamp::from_second(epoch_s)
         .map(|ts| ts.to_zoned(jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC)));
@@ -665,7 +666,9 @@ mod tests {
 
     #[test]
     fn local_time_of_an_out_of_range_epoch_still_reads_as_a_time() {
-        assert_eq!(local_time(i64::MAX).len(), 8);
+        // Out of jiff's range the zone is never read, so the UTC time of day is exact.
+        assert_eq!(local_time(i64::MAX), "15:30:07");
+        assert_eq!(local_time(i64::MIN), "08:29:52");
     }
 
     #[test]
