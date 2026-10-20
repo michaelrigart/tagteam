@@ -46,7 +46,7 @@ pub(super) struct LockedSwitch<'a, 'g> {
     pub(super) locks: &'a LiveLocks<'g>,
 }
 
-/// What `preflight` read under the locks.
+/// The rows `rederive` locked and what `preflight` read under the locks.
 struct Preflight {
     target_identity: Identity,
     live: LiveAuth,
@@ -58,7 +58,7 @@ struct Preflight {
     locked_warnings: Vec<String>,
 }
 
-/// What `apply` writes: the target, its login and the outgoing account.
+/// What `apply` activates: the target and its login, and the outgoing account it names.
 pub(super) struct ApplyStep<'a> {
     pub(super) target: &'a AccountRow,
     pub(super) login: &'a StoredLogin,
@@ -270,6 +270,7 @@ impl Engine {
         self.hold_doomed(&mut cx, &pf)?;
 
         let prior = self.journal_row(p, ls, req, &pf, &target_secret)?;
+        // Steps 7–10.
         let mut tx = Rollback {
             undos: Vec::new(),
             locks: ls.locks,
@@ -281,7 +282,6 @@ impl Engine {
             in_flight: false,
             armed: true,
         };
-        // Steps 7–10.
         let target_login = StoredLogin {
             kind: pf.target.kind.clone(),
             secret: target_secret,
@@ -414,7 +414,7 @@ impl Engine {
         })
     }
 
-    /// Step 7's rule: holds the vaults and saves the entries the write destroys.
+    /// Holds the vaults and saves the entries the write destroys.
     fn hold_doomed(&self, cx: &mut Settle<'_>, pf: &Preflight) -> Result<(), EngineError> {
         // Step 7's rule: every entry the write destroys is saved first, unless a vault of
         // either account, or steps 2 and 4, already hold its generation. A Keychain-refusal
@@ -441,6 +441,7 @@ impl Engine {
         target_secret: &[u8],
     ) -> Result<Option<Box<JournalRow>>, EngineError> {
         let provider = &req.provider;
+        // Step 6.
         let from_secret = pf
             .outgoing
             .as_ref()
