@@ -832,6 +832,79 @@ fn samples_filter_by_window_and_time() {
     assert!(times(Some("scoped:Fable"), 0).is_empty());
 }
 
+/// `id`'s sample of `window` fetched at `at`, written directly.
+fn sample(path: &Path, id: &AccountId, window: &str, at: i64) {
+    raw(path)
+        .execute(
+            "INSERT INTO usage_samples (account_id, window, fetched_at, pct, resets_at) \
+             VALUES (?1, ?2, ?3, 1.0, NULL)",
+            params![id.as_str(), window, at],
+        )
+        .unwrap();
+}
+
+/// The order of the former single all-windows query, which the per-window merge must keep.
+#[test]
+fn every_windows_samples_merge_by_time_then_key() {
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    for (window, at) in [
+        ("7d", T),
+        ("5h", T),
+        ("spend", T + 300),
+        ("7d_opus", T + 300),
+        ("5h", T + 600),
+        ("7d", T + 600),
+        ("7d", T - 100),
+    ] {
+        sample(&path, &a, window, at);
+    }
+    sample(&path, &b, "5h", T + 50);
+    let got: Vec<(String, i64)> = s
+        .usage_samples(&a, None, T)
+        .unwrap()
+        .into_iter()
+        .map(|(k, x)| (k, x.fetched_at))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("5h".to_owned(), T),
+            ("7d".to_owned(), T),
+            ("7d_opus".to_owned(), T + 300),
+            ("spend".to_owned(), T + 300),
+            ("5h".to_owned(), T + 600),
+            ("7d".to_owned(), T + 600)
+        ],
+        "by time, then key; the account's own; none before since"
+    );
+}
+
+#[test]
+fn window_keys_list_every_window_an_account_has_samples_of() {
+    let (_d, path, s) = open();
+    let a = add(&s, &cc(), "a", "a@x.co", 1);
+    let b = add(&s, &cc(), "b", "b@x.co", 2);
+    let c = add(&s, &cc(), "c", "c@x.co", 3);
+    let r = reserved(&s, &a, T_MS);
+    assert!(s.record_usage(&r, &windows(), T, &plan(), 180).unwrap());
+    // The latest reading has the short window alone; the others keep their samples.
+    assert!(
+        s.record_usage(&r, &windows()[..1], T + 600, &plan(), 180)
+            .unwrap()
+    );
+    sample(&path, &a, "7d_opus", T - 86_400);
+    sample(&path, &b, "zz", T);
+    assert_eq!(
+        s.usage_window_keys(&a).unwrap(),
+        ["5h", "7d", "7d_opus", "spend"],
+        "every key with a sample, however old, in byte order"
+    );
+    assert_eq!(s.usage_window_keys(&b).unwrap(), ["zz"]);
+    assert!(s.usage_window_keys(&c).unwrap().is_empty());
+}
+
 #[test]
 fn an_empty_reading_is_stored_as_no_windows_with_its_fetch_time() {
     let (_d, _path, s) = open();

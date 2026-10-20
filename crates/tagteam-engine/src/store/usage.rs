@@ -205,9 +205,15 @@ pub struct LiveIdentityCacheRow {
 const SAMPLES_OF_WINDOW: &str = "SELECT window, fetched_at, pct, resets_at FROM usage_samples \
      WHERE account_id = ?1 AND window = ?2 AND fetched_at >= ?3 ORDER BY fetched_at";
 
-/// Every window's samples since a time.
-const SAMPLES_OF_ALL: &str = "SELECT window, fetched_at, pct, resets_at FROM usage_samples \
-     WHERE account_id = ?1 AND fetched_at >= ?2 ORDER BY fetched_at, window";
+/// An account's window keys, ascending: a skip-scan of the primary key (account, window,
+/// time), one seek per key, so no scan of the account's samples and no sort. It finds every
+/// key with a sample, including windows the latest reading no longer has.
+const WINDOW_KEYS: &str = "WITH RECURSIVE keys(window) AS ( \
+     SELECT (SELECT window FROM usage_samples WHERE account_id = ?1 ORDER BY window LIMIT 1) \
+     UNION ALL \
+     SELECT (SELECT window FROM usage_samples WHERE account_id = ?1 AND window > keys.window \
+     ORDER BY window LIMIT 1) FROM keys WHERE keys.window IS NOT NULL) \
+     SELECT window FROM keys WHERE window IS NOT NULL";
 
 pub(super) fn lease_name(id: &AccountId) -> String {
     format!("usage:{id}")
@@ -656,15 +662,16 @@ impl Store {
     }
 
     /// The account's samples fetched at or after `since_s`, ascending by `fetched_at` (then
-    /// window key); `window = None` means every window. One window is read along the primary
-    /// key (account, window, time), never by scanning the account's samples.
+    /// window key). One window is read along the primary key (account, window, time), never by
+    /// scanning the account's samples. `window = None` reads the keys `usage_window_keys`
+    /// lists, each along the primary key, merged by time then key in one read transaction.
     pub fn usage_samples(
         &self,
         id: &AccountId,
         window: Option<&str>,
         since_s: i64,
     ) -> Result<Vec<(String, Sample)>, StoreError> {
-        let c = self.lock();
+        let mut c = self.lock();
         let map = |r: &rusqlite::Row<'_>| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -680,12 +687,31 @@ impl Store {
                 .prepare(SAMPLES_OF_WINDOW)?
                 .query_map(params![id.as_str(), w, since_s], map)?
                 .collect::<Result<Vec<_>, _>>()?,
-            None => c
-                .prepare(SAMPLES_OF_ALL)?
-                .query_map(params![id.as_str(), since_s], map)?
-                .collect::<Result<Vec<_>, _>>()?,
+            None => {
+                let tx = c.transaction_with_behavior(TransactionBehavior::Deferred)?;
+                let keys = window_keys(&tx, id)?;
+                let mut rows = Vec::new();
+                {
+                    let mut stmt = tx.prepare(SAMPLES_OF_WINDOW)?;
+                    for key in &keys {
+                        for row in stmt.query_map(params![id.as_str(), key, since_s], map)? {
+                            rows.push(row?);
+                        }
+                    }
+                }
+                tx.commit()?;
+                rows.sort_unstable_by(|(ka, a), (kb, b)| {
+                    (a.fetched_at, ka).cmp(&(b.fetched_at, kb))
+                });
+                rows
+            }
         };
         Ok(rows)
+    }
+
+    /// Every window key the account has a sample of, however old, ascending in byte order.
+    pub fn usage_window_keys(&self, id: &AccountId) -> Result<Vec<String>, StoreError> {
+        window_keys(&self.lock(), id)
     }
 
     /// Whether another fetch holds the account's lease at `now_ms` (§8.4's extended trust).
@@ -782,6 +808,12 @@ impl Store {
     }
 }
 
+fn window_keys(c: &Connection, id: &AccountId) -> Result<Vec<String>, StoreError> {
+    Ok(c.prepare(WINDOW_KEYS)?
+        .query_map([id.as_str()], |r| r.get(0))?
+        .collect::<Result<_, _>>()?)
+}
+
 fn put_live_identity_cache(c: &Connection, row: &LiveIdentityCacheRow) -> Result<(), StoreError> {
     c.execute(
         "INSERT INTO live_identity_cache \
@@ -825,5 +857,40 @@ mod tests {
         assert!(plan.contains("SEARCH usage_samples"), "{plan}");
         assert!(!plan.contains("SCAN"), "{plan}");
         assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        assert!(
+            plan.contains(
+                "SEARCH usage_samples USING PRIMARY KEY (account_id=? AND window=? AND fetched_at>?)"
+            ),
+            "{plan}"
+        );
+    }
+
+    #[test]
+    fn window_keys_are_listed_by_a_skip_scan_of_the_primary_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        let c = store.lock();
+        let mut stmt = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {WINDOW_KEYS}"))
+            .unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(params!["a"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let reads: Vec<&str> = plan
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.contains("usage_samples"))
+            .collect();
+        assert_eq!(
+            reads,
+            [
+                "SEARCH usage_samples USING PRIMARY KEY (account_id=?)",
+                "SEARCH usage_samples USING PRIMARY KEY (account_id=? AND window>?)"
+            ],
+            "one seek per key, never a scan: {plan:?}"
+        );
+        assert!(!plan.iter().any(|l| l.contains("TEMP B-TREE")), "{plan:?}");
     }
 }
