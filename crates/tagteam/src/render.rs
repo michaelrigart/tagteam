@@ -10,14 +10,14 @@ use tagteam_engine::words::{
     AHEAD, IN_SESSION, Severity, WindowColumn, account_cell, countdown, row_notes, severity,
     spend_text, usage_words, window_columns,
 };
-
-use crate::SCHEMA_VERSION;
 // `app` and `transfer_cmd` still spell these `render::email` and `render::name`.
 pub use tagteam_engine::words::{email, name};
 // `tokens_cmd` still spells these `render::MISSING` and `render::duration`.
 pub(crate) use tagteam_engine::words::{MISSING, duration};
 use tagteam_provider::SecretStore;
 use unicode_width::UnicodeWidthStr;
+
+use crate::SCHEMA_VERSION;
 
 const NO_MAPPINGS: &str = "No mappings yet. Map a directory with `tagteam map ACCOUNT [PATH]`.\n";
 
