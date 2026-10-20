@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/24
 **Goal:** Split `switch.rs` and `doctor.rs` into modules, give the engine one guard entry point, replace ten of its eleven `too_many_arguments` allows with context structs, and move four helpers to where they belong, with every output byte-identical.
 **Architecture:**
 - **Moves.** Pure moves land first, each in its own commit, so `git diff --color-moved` shows them as moved. Edits follow in their own commits.
