@@ -7,12 +7,13 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 use tagteam_core::ProviderId;
+use tagteam_core::autoswitch::{NoSwitchReason, Trigger};
 use tagteam_core::time::format_iso8601;
 use tagteam_engine::auto::AutoEvent;
 use tagteam_engine::tokens::IndexState;
 
-use crate::events::{Backoff, DaemonEvent};
-use crate::status::{DaemonInfo, JobStatus, ProviderStatus, StatusSnapshot};
+use crate::events::{Backoff, DaemonEvent, Mode, WaitingFor};
+use crate::status::{DaemonInfo, JobStatus, OutcomeKind, ProviderStatus, StatusSnapshot};
 
 /// D5.6: the protocol's version. New ops, kinds and fields are additive and keep it.
 pub const PROTOCOL: u32 = 1;
@@ -221,6 +222,57 @@ fn envelope(kind: &str, provider: Option<&ProviderId>, fields: Value, now_s: i64
 
 // Protocol 1's requests, replies and status (D5.2–D5.4), and their typed mirror for the
 // client (D5.7).
+
+/// A closed set of wire spellings: each value has one, and `parse` reads it back exactly.
+pub trait Spelled: Sized + Copy {
+    fn parse(s: &str) -> Option<Self>;
+    fn as_str(self) -> &'static str;
+}
+
+macro_rules! spelled {
+    ($($t:ty),*) => {$(
+        impl Spelled for $t {
+            fn parse(s: &str) -> Option<Self> {
+                <$t>::parse(s)
+            }
+
+            fn as_str(self) -> &'static str {
+                <$t>::as_str(self)
+            }
+        }
+    )*};
+}
+
+spelled!(Mode, WaitingFor, OutcomeKind, NoSwitchReason, Trigger);
+
+/// A value as the wire spells it: one this client knows, or the spelling of one a later daemon
+/// added (D5.6), kept as it came.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wire<T> {
+    Known(T),
+    Other(String),
+}
+
+impl<T: Spelled> Wire<T> {
+    pub fn from_wire(s: &str) -> Self {
+        T::parse(s).map_or_else(|| Wire::Other(s.to_owned()), Wire::Known)
+    }
+
+    /// The spelling, whether or not this client knows it.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Wire::Known(v) => v.as_str(),
+            Wire::Other(s) => s,
+        }
+    }
+
+    pub fn known(&self) -> Option<T> {
+        match self {
+            Wire::Known(v) => Some(*v),
+            Wire::Other(_) => None,
+        }
+    }
+}
 
 /// D5.2: the longest line either side sends, its newline left out.
 pub const MAX_LINE: usize = 64 * 1024;
@@ -493,6 +545,35 @@ pub struct StatusProvider {
     pub last_switch: Option<StatusSwitch>,
 }
 
+impl StatusProvider {
+    /// The mode as a typed value, or its spelling when this client does not know it.
+    pub fn mode(&self) -> Wire<Mode> {
+        Wire::from_wire(&self.mode)
+    }
+
+    pub fn waiting_for(&self) -> Option<Wire<WaitingFor>> {
+        self.waiting_for.as_deref().map(Wire::from_wire)
+    }
+
+    /// The daemon job collects usage for this provider itself: `auto`, `collect`, or `waiting`
+    /// for `engine-lock`. False for anything else, an unknown value included.
+    pub fn collects_for_itself(&self) -> bool {
+        match self.mode().known() {
+            Some(Mode::Auto | Mode::Collect) => true,
+            Some(Mode::Waiting) => {
+                self.waiting_for().and_then(|w| w.known()) == Some(WaitingFor::EngineLock)
+            }
+            Some(Mode::Idle) | None => false,
+        }
+    }
+
+    /// The job waits for a newer binary (`waiting` for `schema`). False for anything else.
+    pub fn waits_for_upgrade(&self) -> bool {
+        self.mode().known() == Some(Mode::Waiting)
+            && self.waiting_for().and_then(|w| w.known()) == Some(WaitingFor::Schema)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusBackoff {
@@ -508,6 +589,12 @@ pub struct StatusOutcome {
     pub kind: String,
     pub reason: Option<String>,
     pub at: String,
+}
+
+impl StatusOutcome {
+    pub fn kind(&self) -> Wire<OutcomeKind> {
+        Wire::from_wire(&self.kind)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -558,6 +645,24 @@ pub enum Event {
     TokenIndex { provider: String, raw: Value },
     /// A kind this client does not know, or a known kind whose fields it cannot read (D5.6).
     Unknown { kind: String, raw: Value },
+}
+
+impl Event {
+    /// `Some` only for `Event::Mode`.
+    pub fn mode(&self) -> Option<Wire<Mode>> {
+        match self {
+            Event::Mode { mode, .. } => Some(Wire::from_wire(mode)),
+            _ => None,
+        }
+    }
+
+    /// `Some` only for an `Event::Mode` that names what it waits for.
+    pub fn waiting_for(&self) -> Option<Wire<WaitingFor>> {
+        match self {
+            Event::Mode { waiting_for, .. } => waiting_for.as_deref().map(Wire::from_wire),
+            _ => None,
+        }
+    }
 }
 
 /// §11.4's kinds: what `auto --json` prints, carried unchanged on the socket (D5.5).
@@ -1688,5 +1793,122 @@ mod socket_protocol_tests {
         ] {
             assert_eq!(parse_event(&not_an_event), None, "{not_an_event}");
         }
+    }
+
+    fn status_provider(mode: &str, waiting_for: Option<&str>) -> StatusProvider {
+        StatusProvider {
+            provider: "claude-code".into(),
+            mode: mode.into(),
+            autoswitch: true,
+            waiting_for: waiting_for.map(str::to_owned),
+            holder_pid: None,
+            backoff: None,
+            last_tick_at: None,
+            next_tick_at: None,
+            last_outcome: None,
+            last_switch: None,
+        }
+    }
+
+    #[test]
+    fn a_wire_value_keeps_an_unknown_spelling() {
+        let other = Wire::<Mode>::from_wire("paused");
+        assert_eq!(other, Wire::Other("paused".into()));
+        assert_eq!(other.as_str(), "paused");
+        assert_eq!(other.known(), None);
+        let known = Wire::<Mode>::from_wire("auto");
+        assert_eq!(known, Wire::Known(Mode::Auto));
+        assert_eq!(known.as_str(), "auto");
+        assert_eq!(known.known(), Some(Mode::Auto));
+        assert_eq!(
+            Wire::<Mode>::from_wire("Auto"),
+            Wire::Other("Auto".into()),
+            "a spelling is exact"
+        );
+        for reason in NoSwitchReason::ALL {
+            assert_eq!(
+                Wire::<NoSwitchReason>::from_wire(reason.as_str()),
+                Wire::Known(reason)
+            );
+        }
+        assert_eq!(
+            Wire::<Trigger>::from_wire("at-limit"),
+            Wire::Known(Trigger::AtLimit)
+        );
+    }
+
+    #[test]
+    fn the_mode_predicates_default_to_false_for_unknown_values() {
+        // (mode, waitingFor, collects_for_itself, waits_for_upgrade)
+        let table = [
+            ("auto", None, true, false),
+            ("auto", Some("engine-lock"), true, false),
+            ("auto", Some("schema"), true, false),
+            ("auto", Some("later"), true, false),
+            ("collect", None, true, false),
+            ("collect", Some("engine-lock"), true, false),
+            ("collect", Some("schema"), true, false),
+            ("collect", Some("later"), true, false),
+            ("waiting", Some("engine-lock"), true, false),
+            ("waiting", Some("schema"), false, true),
+            ("waiting", Some("later"), false, false),
+            ("waiting", None, false, false),
+            ("idle", None, false, false),
+            ("idle", Some("engine-lock"), false, false),
+            ("idle", Some("schema"), false, false),
+            ("idle", Some("later"), false, false),
+            ("paused", None, false, false),
+            ("paused", Some("engine-lock"), false, false),
+            ("paused", Some("schema"), false, false),
+            ("paused", Some("later"), false, false),
+        ];
+        for (mode, waiting_for, collects, upgrade) in table {
+            let p = status_provider(mode, waiting_for);
+            assert_eq!(p.collects_for_itself(), collects, "{mode} {waiting_for:?}");
+            assert_eq!(p.waits_for_upgrade(), upgrade, "{mode} {waiting_for:?}");
+        }
+    }
+
+    #[test]
+    fn the_typed_accessors_read_the_strings_a_daemon_wrote() {
+        let p = status_provider("waiting", Some("engine-lock"));
+        assert_eq!(p.mode(), Wire::Known(Mode::Waiting));
+        assert_eq!(p.waiting_for(), Some(Wire::Known(WaitingFor::EngineLock)));
+        let p = status_provider("paused", Some("later"));
+        assert_eq!(p.mode(), Wire::Other("paused".into()));
+        assert_eq!(p.waiting_for(), Some(Wire::Other("later".into())));
+        assert_eq!(status_provider("auto", None).waiting_for(), None);
+
+        let outcome = |kind: &str| StatusOutcome {
+            kind: kind.into(),
+            reason: None,
+            at: iso(T),
+        };
+        assert_eq!(
+            outcome("no-switch").kind(),
+            Wire::Known(OutcomeKind::NoSwitch)
+        );
+        assert_eq!(outcome("rested").kind(), Wire::Other("rested".into()));
+
+        let mode_event = |mode: &str, waiting_for: Option<&str>| Event::Mode {
+            provider: "claude-code".into(),
+            mode: mode.into(),
+            waiting_for: waiting_for.map(str::to_owned),
+            holder_pid: None,
+            backoff: None,
+        };
+        let e = mode_event("waiting", Some("schema"));
+        assert_eq!(e.mode(), Some(Wire::Known(Mode::Waiting)));
+        assert_eq!(e.waiting_for(), Some(Wire::Known(WaitingFor::Schema)));
+        let e = mode_event("paused", None);
+        assert_eq!(e.mode(), Some(Wire::Other("paused".into())));
+        assert_eq!(e.waiting_for(), None);
+        assert_eq!(Event::Changed.mode(), None);
+        assert_eq!(Event::Changed.waiting_for(), None);
+        let stopping = Event::Stopping {
+            reason: "signal".into(),
+        };
+        assert_eq!(stopping.mode(), None);
+        assert_eq!(stopping.waiting_for(), None);
     }
 }

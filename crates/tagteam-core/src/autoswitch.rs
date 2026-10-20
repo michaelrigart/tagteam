@@ -42,6 +42,13 @@ pub enum Trigger {
 }
 
 impl Trigger {
+    pub const ALL: [Self; 4] = [
+        Trigger::Proactive,
+        Trigger::AtLimit,
+        Trigger::Failover,
+        Trigger::ConsumeFirst,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Trigger::Proactive => "proactive",
@@ -200,6 +207,30 @@ impl NoSwitchReason {
             NoSwitchReason::LiveChanged => "live-changed",
             NoSwitchReason::NoViableTarget => "no-viable-target",
         }
+    }
+
+    pub const ALL: [Self; 17] = [
+        NoSwitchReason::UnmanagedActiveAccount,
+        NoSwitchReason::NoActiveAccount,
+        NoSwitchReason::ActiveApiKey,
+        NoSwitchReason::BelowThreshold,
+        NoSwitchReason::ActiveUsageUnknown,
+        NoSwitchReason::Cooldown,
+        NoSwitchReason::NoCandidates,
+        NoSwitchReason::NoComparison,
+        NoSwitchReason::ResetUnknown,
+        NoSwitchReason::AlreadyConsumingSoonest,
+        NoSwitchReason::NoQualifyingCandidate,
+        NoSwitchReason::StaleUsage,
+        NoSwitchReason::AllExhausted,
+        NoSwitchReason::EngineRunning,
+        NoSwitchReason::InterruptedSwitch,
+        NoSwitchReason::LiveChanged,
+        NoSwitchReason::NoViableTarget,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
     }
 
     /// §11.2 and §11.4: what each reason does to `--once`'s exit code, the engine-reported
@@ -1036,28 +1067,10 @@ mod tests {
 
     #[test]
     fn every_no_switch_reason_is_spelled_in_kebab_case() {
-        let spelled: Vec<&str> = [
-            UnmanagedActiveAccount,
-            NoActiveAccount,
-            ActiveApiKey,
-            BelowThreshold,
-            ActiveUsageUnknown,
-            Cooldown,
-            NoCandidates,
-            NoComparison,
-            ResetUnknown,
-            AlreadyConsumingSoonest,
-            NoQualifyingCandidate,
-            StaleUsage,
-            AllExhausted,
-            EngineRunning,
-            InterruptedSwitch,
-            LiveChanged,
-            NoViableTarget,
-        ]
-        .into_iter()
-        .map(NoSwitchReason::as_str)
-        .collect();
+        let spelled: Vec<&str> = NoSwitchReason::ALL
+            .into_iter()
+            .map(NoSwitchReason::as_str)
+            .collect();
         assert_eq!(
             spelled,
             [
@@ -1080,6 +1093,24 @@ mod tests {
                 "no-viable-target",
             ]
         );
+    }
+
+    #[test]
+    fn every_no_switch_reason_parses_from_its_own_spelling() {
+        for reason in NoSwitchReason::ALL {
+            assert_eq!(NoSwitchReason::parse(reason.as_str()), Some(reason));
+        }
+        assert_eq!(NoSwitchReason::parse("Cooldown"), None, "case-sensitive");
+        assert_eq!(NoSwitchReason::parse("paused"), None);
+        assert_eq!(NoSwitchReason::parse(""), None);
+    }
+
+    #[test]
+    fn every_trigger_parses_from_its_own_spelling() {
+        for trigger in Trigger::ALL {
+            assert_eq!(Trigger::parse(trigger.as_str()), Some(trigger));
+        }
+        assert_eq!(Trigger::ALL.len(), 4);
     }
 
     #[test]

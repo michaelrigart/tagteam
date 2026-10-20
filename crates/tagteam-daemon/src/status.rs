@@ -80,6 +80,17 @@ impl OutcomeKind {
             OutcomeKind::Error => "error",
         }
     }
+
+    pub const ALL: [Self; 4] = [
+        OutcomeKind::Switch,
+        OutcomeKind::NoSwitch,
+        OutcomeKind::Collect,
+        OutcomeKind::Error,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
 }
 
 /// A run's outcome. `reason` is the kebab-case reason of a `no-switch`, or the message of an
@@ -217,6 +228,15 @@ mod tests {
             next_run_at: Some(at + 2),
             last_error: None,
         }
+    }
+
+    #[test]
+    fn every_outcome_kind_parses_from_its_own_spelling() {
+        for kind in OutcomeKind::ALL {
+            assert_eq!(OutcomeKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(OutcomeKind::parse("No-Switch"), None, "case-sensitive");
+        assert_eq!(OutcomeKind::parse("noswitch"), None);
     }
 
     #[test]
