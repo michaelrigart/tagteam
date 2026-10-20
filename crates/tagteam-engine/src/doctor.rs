@@ -47,8 +47,8 @@ use crate::profiles::{Held, allowlist, held, is_private, resolved};
 use crate::provenance::identity_drifted;
 use crate::recover::Direction;
 use crate::service::{
-    LAUNCHD_LABEL, RECORDED_VARS, SYSTEMD_UNIT, ServiceKind, ServiceState, UnitContents, lingering,
-    parse_unit, service_state, unit_path,
+    LAUNCHD_LABEL, SYSTEMD_UNIT, ServiceKind, ServiceState, UnitContents, lingering, parse_unit,
+    service_state, unit_path,
 };
 use crate::session::SessionState;
 use crate::settings::{self, Settings};
@@ -1312,7 +1312,7 @@ impl Run<'_> {
                 // PATH is left out: it places no store or home, and a version manager changes
                 // it in every directory it enters.
                 let mut differ = Vec::new();
-                for name in RECORDED_VARS.iter().copied().filter(|n| *n != "PATH") {
+                for name in self.engine.recorded_vars().into_iter().filter(|n| *n != "PATH") {
                     let recorded = u
                         .env
                         .iter()

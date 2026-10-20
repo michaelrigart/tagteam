@@ -1,5 +1,4 @@
 use serde_json::{Value, json};
-use tagteam_cc::shape::KIND_API_KEY;
 use tagteam_core::time::format_iso8601;
 use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind, printable};
 use tagteam_engine::store::{AccountRow, Mapping};
@@ -20,13 +19,6 @@ use unicode_width::UnicodeWidthStr;
 
 const NO_ACCOUNTS: &str = "No accounts yet. Log in with `claude`, then run `tagteam add`.\n";
 const NO_MAPPINGS: &str = "No mappings yet. Map a directory with `tagteam map ACCOUNT [PATH]`.\n";
-/// Claude Code reloads a credentials-file change on its next message (Appendix A.3).
-const FILE_STORE_HINT: &str = "Active on your next message.";
-/// Claude Code caches Keychain reads for 30 s (Appendix A.3).
-const KEYCHAIN_HINT: &str = "Claude Code picks this up within about 30 s; restart it to apply now.";
-/// Claude Code reads its managed API key once and keeps it for the life of the process
-/// (Appendix A.7), so a switch to or from an API-key account reaches only a new one.
-const API_KEY_HINT: &str = "Restart Claude Code to apply.";
 
 /// §13.5's severities, which `list` and `status` share: ≥ 90 critical, ≥ 70 warning.
 pub(crate) const CRITICAL: &str = "\x1b[31m";
@@ -504,18 +496,12 @@ pub fn fallback_notice(o: &SwitchOutcome) -> Option<String> {
 pub fn switch_human(o: &SwitchOutcome) -> String {
     match (&o.to, o.switched) {
         (Some(to), true) => {
-            let api_key = [o.from.as_ref(), Some(to)]
-                .into_iter()
-                .flatten()
-                .any(|r| r.kind == KIND_API_KEY)
-                || o.managed_key_replaced;
-            let hint = match o.stored_in {
-                _ if api_key => API_KEY_HINT,
-                Some(SecretStore::File(_) | SecretStore::Fallback(_)) => FILE_STORE_HINT,
-                Some(SecretStore::Keychain) | None => KEYCHAIN_HINT,
-            };
+            let hint = o
+                .activation_hint
+                .map(|h| format!("{h}\n"))
+                .unwrap_or_default();
             format!(
-                "Switched to {} (position {}).\n{hint}\n",
+                "Switched to {} (position {}).\n{hint}",
                 name(to),
                 to.position
             )
@@ -762,6 +748,7 @@ mod tests {
             stored_in,
             unmanaged_email: None,
             managed_key_replaced: false,
+            activation_hint: None,
         }
     }
 
@@ -840,59 +827,17 @@ mod tests {
     }
 
     #[test]
-    fn a_switch_to_or_from_an_api_key_account_says_to_restart_claude_code() {
-        // Appendix A.7: CC caches the managed key for the life of its process, whichever
-        // store the credential went to.
-        for store in [
-            SecretStore::Keychain,
-            SecretStore::File(PathBuf::from("/c.json")),
-            SecretStore::Fallback(PathBuf::from("/c.json")),
-        ] {
-            for (from, to) in [
-                (Some("oauth"), "api_key"),
-                (Some("api_key"), "oauth"),
-                (Some("api_key"), "api_key"),
-                (None, "api_key"),
-                (Some("setup_token"), "api_key"),
-            ] {
-                assert_eq!(
-                    switch_human(&switched(from, to, store.clone())),
-                    "Switched to x@x.co (position 2).\nRestart Claude Code to apply.\n",
-                    "{from:?} -> {to} via {store:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_switch_that_replaces_a_live_managed_key_no_account_holds_says_to_restart_too() {
-        // No `from` row: the key was a login tagteam does not store.
-        let o = SwitchOutcome {
-            managed_key_replaced: true,
-            ..switched(None, "oauth", SecretStore::Keychain)
+    fn switch_human_prints_the_engine_s_hint_under_the_line() {
+        let hinted = SwitchOutcome {
+            activation_hint: Some("Hint."),
+            ..switched(Some("oauth"), "oauth", SecretStore::Keychain)
         };
         assert_eq!(
-            switch_human(&o),
-            "Switched to x@x.co (position 2).\nRestart Claude Code to apply.\n"
+            switch_human(&hinted),
+            "Switched to x@x.co (position 2).\nHint.\n"
         );
-    }
-
-    #[test]
-    fn a_switch_between_other_kinds_keeps_the_store_s_hint() {
-        let keychain = switched(Some("oauth"), "setup_token", SecretStore::Keychain);
-        assert_eq!(
-            switch_human(&keychain),
-            format!("Switched to x@x.co (position 2).\n{KEYCHAIN_HINT}\n")
-        );
-        let file = switched(
-            Some("oauth"),
-            "oauth",
-            SecretStore::File(PathBuf::from("/c.json")),
-        );
-        assert_eq!(
-            switch_human(&file),
-            format!("Switched to x@x.co (position 2).\n{FILE_STORE_HINT}\n")
-        );
+        let bare = switched(Some("oauth"), "oauth", SecretStore::Keychain);
+        assert_eq!(switch_human(&bare), "Switched to x@x.co (position 2).\n");
     }
 
     /// A renderer that only says how many windows it was handed.

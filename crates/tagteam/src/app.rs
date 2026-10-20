@@ -28,7 +28,7 @@ use tagteam_engine::purge::{KEYCHAIN_ORPHANS_WITH_PROVIDER, PurgePlan};
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::run::{RunPlan, RunRequest};
 use tagteam_engine::service::{
-    RECORDED_VARS, ServiceKind, recorded_env, render_unit, service_state, unit_path,
+    ServiceKind, recorded_env, recorded_vars, render_unit, service_state, unit_path,
 };
 use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{self, ColorMode, Settings, parse_bool};
@@ -141,11 +141,6 @@ const PURGE_DATA_NEEDS_YES: &str =
 
 const NO_COLOR: &str = "NO_COLOR";
 const FORCE_COLOR: &str = "FORCE_COLOR";
-/// Set to `1` in every process Claude Code starts (§13.5, Appendix A.7).
-const CLAUDECODE: &str = "CLAUDECODE";
-/// The session's id, in every process Claude Code starts, its statusline command among them
-/// (token report spec §6.3).
-const CLAUDE_CODE_SESSION_ID: &str = "CLAUDE_CODE_SESSION_ID";
 
 /// Honoured only with the `test-support` feature: a release build never reads them.
 #[cfg(any(test, feature = "test-support"))]
@@ -261,7 +256,7 @@ impl Context {
         // the presence markers above. A provider's home variable can be among both: its value,
         // a directory the Env already holds raw in `homes`, replaces its marker and keeps it
         // present.
-        ctx.env.capture_vars(RECORDED_VARS);
+        ctx.env.capture_vars(&recorded_vars(&registry));
         Ok(ctx)
     }
 }
@@ -295,18 +290,21 @@ pub(crate) fn home_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
 }
 
 /// The variables `Context::from_process` captures into `Env.vars` (Decision 5): every variable
-/// `registry`'s providers name a profile with (§4.5 `session_dir_var`), then `CLAUDECODE`
-/// (§13.5), then `CLAUDE_CODE_SESSION_ID`, the session the statusline records (token report
-/// spec §6.3), then `PATH`, which `plan_run` looks the launch command up on (§12.1).
+/// `registry`'s providers name a profile with (§4.5 `session_dir_var`), then each provider's
+/// `vars().captured`, then `PATH`, which `plan_run` looks the launch command up on (§12.1). Each
+/// name comes once.
 pub(crate) fn session_vars(registry: &ProviderRegistry) -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = registry
+    let mut names: Vec<&'static str> = Vec::new();
+    let named = registry.all().iter().filter_map(|p| p.session_dir_var());
+    let captured = registry
         .all()
         .iter()
-        .filter_map(|p| p.session_dir_var())
-        .collect();
-    names.push(CLAUDECODE);
-    names.push(CLAUDE_CODE_SESSION_ID);
-    names.push("PATH");
+        .flat_map(|p| p.vars().captured.iter().copied());
+    for name in named.chain(captured).chain(["PATH"]) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
     names
 }
 
@@ -982,13 +980,15 @@ fn run_statusline(
         return EXIT_USAGE;
     }
     let (no_color_env, force_color_env) = (ctx.no_color_env, ctx.force_color_env);
-    let session_id = ctx
-        .env
-        .var(CLAUDE_CODE_SESSION_ID)
+    let (engine, provider, _http, _keychain) = statusline::engine(ctx, provider.as_deref());
+    let session_id = engine
+        .provider(&provider)
+        .ok()
+        .and_then(|p| p.vars().session_id)
+        .and_then(|name| engine.env().var(name))
         .and_then(OsStr::to_str)
         .filter(|id| !id.is_empty())
         .map(str::to_owned);
-    let (engine, provider, _http, _keychain) = statusline::engine(ctx, provider.as_deref());
     let result = statusline_supported(&engine, &provider).and_then(|()| {
         if print_config {
             let _ = writeln!(io.err, "{}", statusline::config_hint(engine.env()));
@@ -1795,8 +1795,10 @@ impl App<'_, '_> {
                 format!("this tagteam's own path cannot be read: {e}"),
             )
         })?;
-        let recorded = recorded_env(&|name| env.var(name).map(OsStr::to_os_string))
-            .map_err(|e| Failure::Message(KIND_INVALID_INPUT, e.to_string()))?;
+        let recorded = recorded_env(&self.engine.recorded_vars(), &|name| {
+            env.var(name).map(OsStr::to_os_string)
+        })
+        .map_err(|e| Failure::Message(KIND_INVALID_INPUT, e.to_string()))?;
         if print {
             let unit = render_unit(kind, &program, &recorded)
                 .map_err(|e| Failure::Message(KIND_INVALID_INPUT, e.to_string()))?;

@@ -23,9 +23,9 @@ use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, CredLocks, Credential, DoomedEntry, EntryKind, Env,
     FreshCredential, Identity, IdentitySurface, KindTraits, LineError, LiveAuth, LiveChange,
     LiveLockSet, LiveLocks, LockError, MergeReport, MkdirLock, MkdirLockSpec, MustShare,
-    MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, Read, ReadError,
-    SecretStore, SessionEnv, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, Validity,
-    Window, Written,
+    MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, ProviderWords, Read,
+    ReadError, SecretStore, SessionEnv, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult,
+    Validity, Window, Written,
 };
 
 use crate::FAKE_AGENT;
@@ -262,7 +262,20 @@ fn showable_token(bytes: &[u8], now_ms: i64) -> Option<String> {
         .map(str::to_owned)
 }
 
-static VARS: ProviderVars = ProviderVars { homes: &[] };
+static VARS: ProviderVars = ProviderVars {
+    homes: &[],
+    captured: &[],
+    unit: &[],
+    session_id: None,
+};
+
+static WORDS: ProviderWords = ProviderWords {
+    after_switch_file: "FakeAgent reads the new login when it next starts.",
+    after_switch_keychain: "FakeAgent keeps no Keychain item.",
+    after_switch_managed_key: "FakeAgent has no managed key.",
+    supervisor: None,
+    supervisor_stop: None,
+};
 
 impl Provider for FakeAgent {
     fn id(&self) -> ProviderId {
@@ -740,6 +753,10 @@ impl Provider for FakeAgent {
 
     fn vars(&self) -> &'static ProviderVars {
         &VARS
+    }
+
+    fn words(&self) -> &'static ProviderWords {
+        &WORDS
     }
 
     /// FakeAgent names a profile's item (when it keeps one) from its one home variable, so the

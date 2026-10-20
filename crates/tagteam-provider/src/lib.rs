@@ -86,13 +86,13 @@ pub use profile::{
     entry_matches, has_own_file, launch_reservations, profile_path, read_own_bytes,
     refuse_linked_credential, refuse_linked_file, remove_own_file, write_own_json_with,
 };
-pub use provider::ProviderVars;
 pub use provider::{
     BeforeFallback, Capabilities, CapturedLogin, CredLocks, DeadReason, DoomedEntry, EntryKind,
     Identity, IdentitySurface, KindTraits, LiveAuth, LiveChange, LiveLockSet, LiveLocks,
     MergeReport, MustShare, Provider, ProviderError, RefreshResult, SecretStore, SessionEnv,
     SharePolicy, StoredLogin, TransientKind, Undo, UsageResult, Validity, Written,
 };
+pub use provider::{ProviderVars, ProviderWords};
 pub use read::{Read, ReadError};
 pub use reservation::{LaunchReservation, remove_dead_reservations};
 pub use tagteam_core::pace::Pace;
