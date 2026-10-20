@@ -28,6 +28,65 @@ pub(crate) enum Reconcile {
     Removing,
 }
 
+/// How a guard recovers the interrupted switches whose holders died (§9.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryMode {
+    /// Every row, read strictly; the oracle is asked before the lock is taken (§7.6).
+    Oracle,
+    /// Every row, read strictly, from fingerprints alone: no network call (§7.6, §9.6).
+    FingerprintsOnly,
+    /// Each row decoded on its own, one that does not decode left out of recovery (`purge`,
+    /// §10.5 step 5); the oracle is asked as for `Oracle`.
+    DecodableOnly,
+}
+
+/// The rows a guard's recovery could not settle, by provider: `RecoveryBlocked` for a row
+/// whose recovery could not take its provider's live locks, `RecoveryMoved` for one whose
+/// entry its agent wrote meanwhile.
+pub(crate) type Blocked = Vec<(ProviderId, EngineError)>;
+
+/// What `Engine::guard` takes the mutation lock for.
+pub(crate) struct GuardRequest<'a> {
+    /// The providers whose interrupted switch refuses the guard, when `refuse_interrupted`.
+    pub(crate) providers: &'a [ProviderId],
+    /// How long the lock is waited for.
+    pub(crate) timeout: Duration,
+    pub(crate) recovery: RecoveryMode,
+    /// Refuse, once recovery has run under the lock, for the first of `providers` whose
+    /// interrupted switch is still unresolved (§9.6).
+    pub(crate) refuse_interrupted: bool,
+    /// What each switch it recovers is recorded with (§9.4 step 9: `cli`, or `auto` for an
+    /// auto-switch engine, §11.2 step 2).
+    pub(crate) source: &'static str,
+}
+
+impl Default for GuardRequest<'_> {
+    fn default() -> Self {
+        GuardRequest {
+            providers: &[],
+            timeout: MutationGuard::TIMEOUT,
+            recovery: RecoveryMode::Oracle,
+            refuse_interrupted: false,
+            source: "cli",
+        }
+    }
+}
+
+impl<'a> GuardRequest<'a> {
+    /// A guard refused for `providers`, for account-changing work.
+    pub(crate) fn refusing(providers: &'a [ProviderId]) -> Self {
+        GuardRequest {
+            providers,
+            refuse_interrupted: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn refusing_one(provider: &'a ProviderId) -> Self {
+        Self::refusing(std::slice::from_ref(provider))
+    }
+}
+
 pub struct EngineConfig {
     pub env: Env,
     pub registry: ProviderRegistry,
@@ -294,72 +353,13 @@ impl Engine {
         &self,
         provider: &ProviderId,
     ) -> Result<MutationGuard, EngineError> {
-        self.guard_or_refuse_as(provider, "cli")
+        self.guard(&GuardRequest::refusing_one(provider))
+            .map(|(guard, _)| guard)
     }
 
-    /// `guard_or_refuse`, recording each switch it recovers with `source` (§9.4 step 9: `cli`,
-    /// or `auto` for an auto-switch engine, §11.2 step 2).
-    pub(crate) fn guard_or_refuse_as(
-        &self,
-        provider: &ProviderId,
-        source: &'static str,
-    ) -> Result<MutationGuard, EngineError> {
-        self.guard_or_refuse_for(provider, source, MutationGuard::TIMEOUT)
-    }
-
-    /// `guard_or_refuse`, waiting up to `timeout` for the lock. `run`'s launch waits 30 s
-    /// (§9.1), because another launch may hold it through a bootstrap's validation.
-    pub(crate) fn guard_or_refuse_within(
-        &self,
-        provider: &ProviderId,
-        timeout: Duration,
-    ) -> Result<MutationGuard, EngineError> {
-        self.guard_or_refuse_for(provider, "cli", timeout)
-    }
-
-    /// `guard_or_refuse_as`, waiting up to `timeout` for the lock.
-    fn guard_or_refuse_for(
-        &self,
-        provider: &ProviderId,
-        source: &'static str,
-        timeout: Duration,
-    ) -> Result<MutationGuard, EngineError> {
-        self.guard_or_refuse_each_within(std::slice::from_ref(provider), source, timeout)
-    }
-
-    /// `guard_or_refuse_as` for several providers under one mutation lock (`import`, §13.3):
-    /// refused for the first of `providers` whose interrupted switch is still unresolved once
-    /// recovery has run under it.
-    pub(crate) fn guard_or_refuse_each(
-        &self,
-        providers: &[ProviderId],
-        source: &'static str,
-    ) -> Result<MutationGuard, EngineError> {
-        self.guard_or_refuse_each_within(providers, source, MutationGuard::TIMEOUT)
-    }
-
-    /// `guard_or_refuse_each`, waiting up to `timeout` for the lock.
-    fn guard_or_refuse_each_within(
-        &self,
-        providers: &[ProviderId],
-        source: &'static str,
-        timeout: Duration,
-    ) -> Result<MutationGuard, EngineError> {
-        let (guard, mut blocked) = self.guard_recovering(true, source, timeout)?;
-        for provider in providers {
-            if self.interrupted(provider)? {
-                return Err(match blocked.iter().position(|(p, _)| p == provider) {
-                    Some(i) => blocked.swap_remove(i).1,
-                    None => EngineError::InterruptedSwitch(provider.to_string()),
-                });
-            }
-        }
-        Ok(guard)
-    }
-
-    /// Run before any planning or validation: if an interrupted switch is on record, take the
-    /// mutation lock once (which recovers what it can, §9.6), then refuse if it is still
-    /// unresolved. Creates nothing when there is no store.
+    /// Run before any planning or validation: if an interrupted switch is on record for one of
+    /// `r`'s providers, take the mutation lock once (which recovers what it can, §9.6), then
+    /// refuse if it is still unresolved. Creates nothing when there is no store.
     ///
     /// The final check runs while the guard from this same call is still held, and only then
     /// is the guard dropped: otherwise, between releasing it and re-checking, another process
@@ -367,19 +367,13 @@ impl Engine {
     /// misreport as an interrupted switch (pointing the user at `--force` for a switch that is
     /// simply in progress elsewhere). That ordering can't be exercised deterministically by a
     /// test without a pause hook between acquiring the guard and running the check, which does
-    /// not exist yet; it is verified by reading `guard_or_refuse` instead.
-    pub(crate) fn settle_or_refuse(&self, provider: &ProviderId) -> Result<(), EngineError> {
-        self.settle_or_refuse_as(provider, "cli")
-    }
-
-    /// `settle_or_refuse`, recording each switch it recovers with `source`.
-    pub(crate) fn settle_or_refuse_as(
-        &self,
-        provider: &ProviderId,
-        source: &'static str,
-    ) -> Result<(), EngineError> {
-        if self.interrupted(provider)? {
-            drop(self.guard_or_refuse_as(provider, source)?);
+    /// not exist yet; it is verified by reading `guard` instead.
+    pub(crate) fn settle_or_refuse(&self, r: &GuardRequest) -> Result<(), EngineError> {
+        for provider in r.providers {
+            if self.interrupted(provider)? {
+                drop(self.guard(r)?);
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -387,33 +381,18 @@ impl Engine {
     /// tagteam's mutation lock. Before returning it, recovers every interrupted switch whose
     /// holder has died (§9.6). The oracle is asked before the lock is taken (§7.6).
     pub fn mutation_guard(&self) -> Result<MutationGuard, EngineError> {
-        Ok(self
-            .guard_recovering(true, "cli", MutationGuard::TIMEOUT)?
-            .0)
+        Ok(self.guard(&GuardRequest::default())?.0)
     }
 
     /// The mutation lock for commands that change only store metadata (`alias`, `disable`,
     /// `enable`, `move`): recovery still runs, but from fingerprints alone, so these commands
     /// never make a network call (§7.6).
     pub(crate) fn metadata_guard(&self) -> Result<MutationGuard, EngineError> {
-        Ok(self
-            .guard_recovering(false, "cli", MutationGuard::TIMEOUT)?
-            .0)
-    }
-
-    /// `mutation_guard`, with the refusal for each row whose recovery could not take its
-    /// provider's live locks or whose entry its agent wrote meanwhile (`RecoveryBlocked`,
-    /// `RecoveryMoved`), by provider. With `ask_oracle` false the
-    /// rows are recovered from fingerprints alone: no network call (§7.6, §9.6). A recovery
-    /// interrupted at one of its lock waits ends the command with that interruption (§14.1).
-    /// Each recovered switch is recorded with `source`. The lock is waited for up to `timeout`.
-    fn guard_recovering(
-        &self,
-        ask_oracle: bool,
-        source: &'static str,
-        timeout: Duration,
-    ) -> Result<(MutationGuard, Vec<(ProviderId, EngineError)>), EngineError> {
-        self.guard_recovering_from(ask_oracle, source, timeout, Self::dead_journals)
+        let request = GuardRequest {
+            recovery: RecoveryMode::FingerprintsOnly,
+            ..GuardRequest::default()
+        };
+        Ok(self.guard(&request)?.0)
     }
 
     /// `MutationGuard`, taken after §9.1's pre-wait: each provider's config lock is waited for,
@@ -435,39 +414,45 @@ impl Engine {
         Ok(MutationGuard::acquire(&self.env, timeout)?)
     }
 
-    /// `guard_recovering` over the rows `journals` gives, read before the lock and again under
-    /// it. `purge_guard` passes `dead_decodable_journals`, so a row that does not decode is
-    /// left for it to delete (§10.5 step 5) rather than ending it; every other caller reads
-    /// them all, strictly.
-    fn guard_recovering_from(
-        &self,
-        ask_oracle: bool,
-        source: &'static str,
-        timeout: Duration,
-        journals: fn(&Self) -> Result<Vec<JournalRow>, EngineError>,
-    ) -> Result<(MutationGuard, Vec<(ProviderId, EngineError)>), EngineError> {
+    /// `MutationGuard`, refused for each row whose recovery could not take its provider's live
+    /// locks or whose entry its agent wrote meanwhile (`RecoveryBlocked`, `RecoveryMoved`), by
+    /// provider. Under `FingerprintsOnly` the rows are recovered from fingerprints alone: no
+    /// network call (§7.6, §9.6). A recovery interrupted at one of its lock waits ends the
+    /// command with that interruption (§14.1). Each recovered switch is recorded with
+    /// `r.source`. The lock is waited for up to `r.timeout`. The rows are read before the lock
+    /// and again under it; `DecodableOnly` (`purge`) reads them with `dead_decodable_journals`,
+    /// so a row that does not decode is left for it to delete (§10.5 step 5) rather than
+    /// ending it; every other mode reads them all, strictly.
+    ///
+    /// With `r.refuse_interrupted`, an interrupted switch still on record for one of
+    /// `r.providers` once recovery has run under the lock refuses the guard.
+    pub(crate) fn guard(&self, r: &GuardRequest) -> Result<(MutationGuard, Blocked), EngineError> {
+        let journals: fn(&Self) -> Result<Vec<JournalRow>, EngineError> = match r.recovery {
+            RecoveryMode::DecodableOnly => Self::dead_decodable_journals,
+            RecoveryMode::Oracle | RecoveryMode::FingerprintsOnly => Self::dead_journals,
+        };
         let hints: Vec<_> = journals(self)?
             .into_iter()
             .map(|row| {
-                let hint = if ask_oracle {
-                    self.recovery_hints(&row)?
-                } else {
+                let hint = if r.recovery == RecoveryMode::FingerprintsOnly {
                     Vec::new()
+                } else {
+                    self.recovery_hints(&row)?
                 };
                 Ok((row, hint))
             })
             .collect::<Result<_, EngineError>>()?;
         hooks::point(self, "before-mutation-lock")?;
-        let guard = self.acquire_guard(timeout)?;
+        let guard = self.acquire_guard(r.timeout)?;
         // Enumerated again under the lock: a switch may have died while this command waited,
         // and its row is recovered now too, without a hint.
         let mut blocked = Vec::new();
         for row in journals(self)? {
             let hint = hints
                 .iter()
-                .find(|(r, _)| *r == row)
+                .find(|(seen, _)| *seen == row)
                 .map_or(&[][..], |(_, h)| h.as_slice());
-            if let Err(e) = self.recover_one(&guard, &row, hint, source) {
+            if let Err(e) = self.recover_one(&guard, &row, hint, r.source) {
                 // CC wrote the entry recovery was clearing: nothing was cleared, the row stays,
                 // and a plain retry settles it.
                 let e = match e {
@@ -502,6 +487,16 @@ impl Engine {
                 }
             }
         }
+        if r.refuse_interrupted {
+            for provider in r.providers {
+                if self.interrupted(provider)? {
+                    return Err(match blocked.iter().position(|(p, _)| p == provider) {
+                        Some(i) => blocked.swap_remove(i).1,
+                        None => EngineError::InterruptedSwitch(provider.to_string()),
+                    });
+                }
+            }
+        }
         Ok((guard, blocked))
     }
 
@@ -510,13 +505,11 @@ impl Engine {
     /// for `purge_leftover_journals`, which runs once step 6's refusals have passed: a refused
     /// purge deletes nothing, so the next guarded command still finds the interrupted switch.
     pub(crate) fn purge_guard(&self) -> Result<MutationGuard, EngineError> {
-        let (guard, _blocked) = self.guard_recovering_from(
-            true,
-            "cli",
-            MutationGuard::TIMEOUT,
-            Self::dead_decodable_journals,
-        )?;
-        Ok(guard)
+        let request = GuardRequest {
+            recovery: RecoveryMode::DecodableOnly,
+            ..GuardRequest::default()
+        };
+        Ok(self.guard(&request)?.0)
     }
 
     /// §10.5 step 5 (Decision 7), after step 6: a journal row of an affected provider that is
@@ -823,7 +816,11 @@ mod tests {
         let engine = test_engine(env);
         let provider = ProviderId::new("p");
 
-        assert!(engine.settle_or_refuse(&provider).is_ok());
+        assert!(
+            engine
+                .settle_or_refuse(&GuardRequest::refusing_one(&provider))
+                .is_ok()
+        );
         assert!(
             !engine.env().data_dir().exists(),
             "no journal on record: nothing is created (§5)"
@@ -837,9 +834,33 @@ mod tests {
             .insert_journal(&unresolved_journal(&provider, &to_id))
             .unwrap();
         assert!(matches!(
-            engine.settle_or_refuse(&provider),
+            engine.settle_or_refuse(&GuardRequest::refusing_one(&provider)),
             Err(EngineError::InterruptedSwitch(_))
         ));
+    }
+
+    #[test]
+    fn a_purge_guard_steps_over_an_undecodable_journal_row() {
+        let d = tempfile::tempdir().unwrap();
+        let engine = test_engine(Env::for_test(d.path()));
+        let provider = ProviderId::new("p");
+        let to_id = AccountId::from_string("acc");
+        seed_account(&engine, &provider, &to_id);
+        engine
+            .store()
+            .unwrap()
+            .insert_journal(&unresolved_journal(&provider, &to_id))
+            .unwrap();
+        rusqlite::Connection::open(engine.env().data_dir().join("tagteam.db"))
+            .unwrap()
+            .execute("UPDATE switch_journal SET prior = 'not json'", [])
+            .unwrap();
+
+        drop(engine.purge_guard().unwrap());
+        assert!(
+            engine.mutation_guard().is_err(),
+            "every other guard reads the rows strictly"
+        );
     }
 
     #[test]

@@ -10,7 +10,7 @@ use tagteam_core::validate::normalize_alias;
 use tagteam_core::{AccountId, IdentityKey, ProviderId};
 use tagteam_provider::{Provider, Read, StoredLogin};
 
-use crate::engine::Engine;
+use crate::engine::{Engine, GuardRequest};
 use crate::error::{EngineError, SessionOwner};
 use crate::lifecycle::{LoginSource, Prepared, check_identity_conflict};
 use crate::store::{AccountRow, Store, StoreError};
@@ -116,7 +116,7 @@ impl Engine {
             valid.iter().map(|v| v.record.provider.clone()).collect();
         providers.sort();
         providers.dedup();
-        let _guard = self.guard_or_refuse_each(&providers, "cli")?;
+        let _guard = self.guard(&GuardRequest::refusing(&providers))?.0;
         let store = self.store()?;
         let mut report = ImportReport::default();
         for v in &valid {

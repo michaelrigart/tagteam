@@ -8,7 +8,7 @@ use tagteam_provider::profile::{ProfileMarker, canonical_profile_path, profile_p
 use tagteam_provider::{Credential, Identity, Provenance, Provider, Read};
 
 use crate::account_lock::AccountLock;
-use crate::engine::{Engine, Reconcile};
+use crate::engine::{Engine, GuardRequest, Reconcile};
 use crate::error::EngineError;
 use crate::fsutil::{FileId, absent, trace_path};
 use crate::rescue::RescueUnlisted;
@@ -762,7 +762,7 @@ impl Engine {
     /// §10.1: captures the live login.
     pub fn add_live(&self, opts: AddOptions) -> Result<AddOutcome, EngineError> {
         self.refuse_inside_run_shell()?;
-        self.settle_or_refuse(&opts.provider)?;
+        self.settle_or_refuse(&GuardRequest::refusing_one(&opts.provider))?;
         let p = self.provider(&opts.provider)?;
         let alias = alias_arg(opts.alias.as_deref())?;
         // Validated before anything exists (§5); `prepare` re-checks under the lock.
@@ -900,7 +900,7 @@ impl Engine {
     /// that can be checked without the lock is checked before anything is created (§5).
     pub fn add_token(&self, opts: AddTokenOptions) -> Result<AddOutcome, EngineError> {
         self.refuse_inside_run_shell()?;
-        self.settle_or_refuse(&opts.provider)?;
+        self.settle_or_refuse(&GuardRequest::refusing_one(&opts.provider))?;
         let p = self.provider(&opts.provider)?;
         let alias = alias_arg(opts.alias.as_deref())?;
         if opts.token.trim().is_empty() {
@@ -1011,7 +1011,7 @@ impl Engine {
     pub fn remove(&self, id: &AccountId) -> Result<AccountRow, EngineError> {
         self.refuse_inside_run_shell()?;
         let provider = self.managed_row(id)?.provider;
-        self.settle_or_refuse(&provider)?;
+        self.settle_or_refuse(&GuardRequest::refusing_one(&provider))?;
         let _guard = self.guard_or_refuse(&provider)?;
         let row = self.managed_row(id)?;
         // Not `lock_account`: its strict reconciliation refuses a replacement that cannot be

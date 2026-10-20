@@ -18,7 +18,7 @@ use tagteam_provider::{
 use crate::account_lock::AccountLock;
 use crate::collect::{CollectMode, jitter};
 use crate::displace::displace;
-use crate::engine::Engine;
+use crate::engine::{Engine, GuardRequest};
 use crate::error::{EngineError, SessionOwner};
 use crate::hooks;
 use crate::oracle::verdict;
@@ -1477,7 +1477,7 @@ impl Engine {
             GateOutcome::Unpersisted => return Err(needs_relogin(p, target)),
             // A journal row names it. The gate cannot tell a switch still in progress from an
             // interrupted one, so this does not refuse: with `--force` the switch supersedes
-            // the row, and without it `guard_or_refuse` decides under the mutation lock (it
+            // the row, and without it `guard` decides under the mutation lock (it
             // waits for a live holder, and recovers or refuses a dead one with the right
             // message).
             GateOutcome::Owned(OwnedBy::Journal) => Freshened::Go(vec![cannot_refresh(
@@ -1666,7 +1666,10 @@ impl Engine {
         let provider = self.provider(&req.provider)?;
         let p = provider.as_ref();
         if !req.force {
-            self.settle_or_refuse_as(&req.provider, req.source)?;
+            self.settle_or_refuse(&GuardRequest {
+                source: req.source,
+                ..GuardRequest::refusing_one(&req.provider)
+            })?;
         }
         let Some(store) = self.existing_store()? else {
             return self.without_store(p, &req);
@@ -1701,7 +1704,11 @@ impl Engine {
         let guard = if req.force {
             self.mutation_guard()?
         } else {
-            self.guard_or_refuse_as(&req.provider, req.source)?
+            self.guard(&GuardRequest {
+                source: req.source,
+                ..GuardRequest::refusing_one(&req.provider)
+            })?
+            .0
         };
         for attempt in 1..=ATTEMPTS {
             if attempt > 1 {
