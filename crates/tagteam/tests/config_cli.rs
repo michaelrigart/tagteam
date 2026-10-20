@@ -718,3 +718,17 @@ mod set_and_unset {
         }
     }
 }
+
+#[test]
+fn an_unknown_default_provider_names_the_ones_this_build_has() {
+    let d = tempfile::tempdir().unwrap();
+    fs::create_dir_all(d.path().join("home")).unwrap();
+    cmd(d.path())
+        .args(["config", "set", "default_provider", "codex"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(
+            "tagteam: unknown provider \"codex\"; name one this build has, such as claude-code\n",
+        );
+}

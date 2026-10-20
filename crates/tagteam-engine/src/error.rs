@@ -517,7 +517,7 @@ impl EngineError {
                 | SettingsError::NotPerProvider(_)
                 | SettingsError::ProviderMismatch { .. }
                 | SettingsError::Invalid { .. }
-                | SettingsError::UnknownProvider(_),
+                | SettingsError::UnknownProvider { .. },
             ) => "invalid-input",
             EngineError::Settings(SettingsError::Corrupt { .. }) => "settings-unreadable",
             EngineError::Settings(SettingsError::Io(_)) => "io",
@@ -839,7 +839,10 @@ mod tests {
                 "invalid-input",
             ),
             (
-                EngineError::Settings(SettingsError::UnknownProvider("p".into())),
+                EngineError::Settings(SettingsError::UnknownProvider {
+                    id: "p".into(),
+                    known: vec!["claude-code".into()],
+                }),
                 "invalid-input",
             ),
             (

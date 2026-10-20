@@ -338,8 +338,7 @@ impl Key {
             ),
             KeyKind::ShareNames => "must be an entry name or a list of entry names".to_owned(),
             KeyKind::Provider => {
-                "must be a provider id of lowercase letters, digits and dashes, such as \"claude-code\""
-                    .to_owned()
+                "must be a provider id of lowercase letters, digits and dashes".to_owned()
             }
             KeyKind::NotifyEvents => format!(
                 "must be {}, or a list of them",
@@ -758,8 +757,8 @@ pub enum SettingsError {
     #[error("`{key}` {reason}")]
     Invalid { key: String, reason: String },
     /// A `default_provider` value naming a provider this build does not have (Decision 2).
-    #[error("unknown provider {0:?}; name one this build has, such as claude-code")]
-    UnknownProvider(String),
+    #[error("unknown provider {id:?}; name one this build has, such as {}", known.join(", "))]
+    UnknownProvider { id: String, known: Vec<String> },
     /// `set` and `unset` never edit a file that is not valid TOML (§6.4).
     #[error("{} is not valid TOML ({detail}); fix it, then retry", path.display())]
     Corrupt { path: PathBuf, detail: String },
