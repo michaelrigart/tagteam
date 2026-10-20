@@ -122,8 +122,8 @@ fn purge_error_json(kind: &str, message: &str, deleted: &[String]) -> Value {
     v
 }
 
-/// `error_json` on `out` under `--json`, else `tagteam: message` on `err`: the one error form, for
-/// the sites that run before an `Io` exists.
+/// `error_json` on `out` under `--json`, else `tagteam: message` on `err`: the one error form.
+/// `Io::fail` writes through it, and so do the sites that run before an `Io` exists.
 pub(crate) fn fail_to(
     out: &mut dyn Write,
     err: &mut dyn Write,
