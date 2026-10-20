@@ -72,6 +72,7 @@ pub struct HistoryState {
 }
 
 impl HistoryState {
+    #[cfg(test)]
     pub fn account(&self) -> Option<&AccountId> {
         self.account.as_ref()
     }

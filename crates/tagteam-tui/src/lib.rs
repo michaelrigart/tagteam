@@ -3,23 +3,23 @@
 //! library with no stable API.
 #![forbid(unsafe_code)]
 
-pub mod actions;
+pub(crate) mod actions;
 mod ask;
-pub mod daemon;
+pub(crate) mod daemon;
 pub mod host;
 mod input;
-pub mod lanes;
+pub(crate) mod lanes;
 pub mod live;
-pub mod msg;
-pub mod overlay;
+pub(crate) mod msg;
+pub(crate) mod overlay;
 mod runtime;
-pub mod screens;
+pub(crate) mod screens;
 pub mod source;
-pub mod state;
+pub(crate) mod state;
 mod term;
 mod theme;
-pub mod update;
-pub mod view;
+pub(crate) mod update;
+pub(crate) mod view;
 
 pub use runtime::{TuiExit, TuiOptions, run};
 pub use state::Screen;

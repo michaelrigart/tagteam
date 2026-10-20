@@ -18,7 +18,7 @@ enum Tier {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Theme {
+pub(crate) struct Theme {
     tier: Tier,
 }
 

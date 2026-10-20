@@ -128,7 +128,6 @@ fn pause(state: &mut State, now_ms: i64) -> Vec<Cmd> {
     };
     state.overlay = Some(Overlay::Confirm {
         question: format!("{verb} auto-switch for {provider}?"),
-        default_yes: false,
         choice: false,
         then: ConfirmThen::Run(Action::Autoswitch { provider, on }),
     });
@@ -179,7 +178,6 @@ fn account_key(state: &mut State, c: char, now_ms: i64) -> Vec<Cmd> {
                 question: format!(
                     "Remove {named}? Its stored login is deleted; Claude Code is not changed."
                 ),
-                default_yes: false,
                 choice: false,
                 then: ConfirmThen::Run(Action::Remove(account)),
             });
@@ -214,7 +212,6 @@ pub fn on_prompt(state: &mut State, prompt: Prompt) -> Vec<Cmd> {
     state.overlay = Some(match kind {
         PromptKind::Confirm { default_yes } => Overlay::Confirm {
             question,
-            default_yes,
             choice: default_yes,
             then: ConfirmThen::Reply(to),
         },
@@ -439,10 +436,7 @@ mod tests {
         update(&mut state, ch('j'), NOW_MS);
         assert!(update(&mut state, ch('x'), NOW_MS).is_empty());
         let Some(Overlay::Confirm {
-            question,
-            default_yes,
-            choice,
-            ..
+            question, choice, ..
         }) = &state.overlay
         else {
             panic!("{:?}", state.overlay);
@@ -451,7 +445,7 @@ mod tests {
             question,
             "Remove 2 a2@x.co? Its stored login is deleted; Claude Code is not changed."
         );
-        assert!(!default_yes && !choice);
+        assert!(!choice);
         let drawn = draw(&state, 80, 24);
         assert!(
             drawn
@@ -1248,10 +1242,10 @@ mod tests {
         match &state.overlay {
             Some(Overlay::Confirm {
                 question,
-                default_yes,
+                choice,
                 then: ConfirmThen::Run(action),
                 ..
-            }) => (question.as_str(), *default_yes, action),
+            }) => (question.as_str(), *choice, action),
             other => panic!("{other:?}"),
         }
     }
