@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde_json::json;
-use tagteam_cc::{CcPaths, ClaudeCode};
 use tagteam_core::{ProviderId, Window, WindowKind, printable};
 use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::oracle::NoOracle;
@@ -21,8 +19,8 @@ use tagteam_engine::{Engine, EngineConfig};
 use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::SystemSpawner;
 use tagteam_provider::{
-    Capabilities, Env, Http, Keychain, KeychainError, LockState, NoHttp, Read, ReadError, RunShell,
-    SystemClock,
+    Capabilities, Env, Http, Keychain, KeychainError, LockState, NoHttp, Provider, Read, ReadError,
+    RunShell, SystemClock,
 };
 
 use crate::app::{Context, command_settings};
@@ -179,23 +177,17 @@ fn stale(fetched_at: Option<i64>, now_s: i64) -> String {
     }
 }
 
-/// `--print-config`'s snippet for Claude Code's `settings.json`. tagteam never edits that file
-/// (§3); the user pastes this into it.
-pub(crate) fn config_snippet() -> String {
-    let v = json!({"statusLine": {"type": "command", "command": COMMAND}});
-    format!(
-        "{}\n",
-        serde_json::to_string_pretty(&v).expect("a JSON value always serializes")
-    )
-}
-
-/// Where the snippet goes. It is printed on stderr, so stdout stays the snippet alone.
-pub(crate) fn config_hint(env: &Env) -> String {
-    let path = CcPaths::resolve(env).config_home.join("settings.json");
-    format!(
-        "Add this to {}; tagteam never edits Claude Code's settings.",
-        path.display()
-    )
+/// `--print-config`: where the snippet goes, and the snippet, from the provider's own setup. The
+/// hint goes on stderr, so stdout stays the snippet alone. tagteam never edits the agent's
+/// settings (§3); the user pastes the snippet into them. `None` when the provider has no setup.
+pub(crate) fn print_config(p: &dyn Provider, env: &Env) -> Option<(String, String)> {
+    let (path, snippet) = p.statusline_setup(env, COMMAND)?;
+    let hint = format!(
+        "Add this to {}; tagteam never edits {}'s settings.",
+        path.display(),
+        p.display_name()
+    );
+    Some((hint, snippet))
 }
 
 /// Decision 13 (§13.5): `--provider`; else the run shell's marker provider; else the first
@@ -231,18 +223,46 @@ pub(crate) fn resolve_provider(
 /// which serves the other commands over the full registry; the variables Decision 13's third
 /// step reads were captured into `ctx.env` by `Context::from_process`. The settings are that
 /// provider's, and their warnings are dropped, since a status bar has nowhere to show them.
-/// Returns the engine, the provider, and the walls, so a test can prove nothing reached them.
-pub(crate) fn engine(
-    ctx: Context,
-    flag: Option<&str>,
-) -> (Engine, ProviderId, Arc<LazyHttp>, Arc<NoKeychain>) {
+/// Returns the engine and the provider.
+pub(crate) fn engine(ctx: Context, flag: Option<&str>) -> (Engine, ProviderId) {
     let keychain = Arc::new(NoKeychain::default());
     let http = Arc::new(LazyHttp::new(|| Arc::new(NoHttp) as Arc<dyn Http>));
-    let registry =
-        ProviderRegistry::new().with(Arc::new(ClaudeCode::new(keychain.clone(), ctx.platform)));
+    assemble(ctx, flag, keychain, http)
+}
+
+/// The walls `engine` builds over, kept by a test to prove nothing reached them.
+#[cfg(test)]
+pub(crate) struct Walls {
+    http: Arc<LazyHttp>,
+    keychain: Arc<NoKeychain>,
+}
+
+#[cfg(test)]
+impl Walls {
+    pub(crate) fn untouched(&self) -> bool {
+        !self.http.is_built() && self.keychain.calls() == 0
+    }
+}
+
+#[cfg(test)]
+fn walled(ctx: Context, flag: Option<&str>) -> (Engine, ProviderId, Walls) {
+    let keychain = Arc::new(NoKeychain::default());
+    let http = Arc::new(LazyHttp::new(|| Arc::new(NoHttp) as Arc<dyn Http>));
+    let (engine, provider) = assemble(ctx, flag, keychain.clone(), http.clone());
+    (engine, provider, Walls { http, keychain })
+}
+
+fn assemble(
+    ctx: Context,
+    flag: Option<&str>,
+    keychain: Arc<NoKeychain>,
+    http: Arc<LazyHttp>,
+) -> (Engine, ProviderId) {
+    let registry = crate::app::registry(keychain.clone(), ctx.platform, None);
     let (run_shell, env) = detect_run_shell(&ctx.env, &registry);
     // `ctx.env` is the process's own, not the effective `env`: inside a run shell the latter is
-    // the outer home, where `CLAUDE_CONFIG_DIR` is gone and `invoked_by` would lose its signal.
+    // the outer home, where the provider's home variable is gone and `invoked_by` would lose its
+    // signal.
     let chosen = command_settings(&env, &|p| registry.get(p).is_some(), |default| {
         resolve_provider(flag, &run_shell, &registry, &ctx.env, default)
     });
@@ -251,7 +271,7 @@ pub(crate) fn engine(
         vault: Vault::new(Box::new(KeychainVault::new(keychain.clone()))),
         oracle: Arc::new(NoOracle),
         clock: Arc::new(SystemClock),
-        http: http.clone(),
+        http,
         default_provider: chosen.default,
         settings: chosen.settings,
         env,
@@ -262,7 +282,7 @@ pub(crate) fn engine(
         spawner: Arc::new(SystemSpawner),
         run_shell,
     });
-    (engine, chosen.provider, http, keychain)
+    (engine, chosen.provider)
 }
 
 /// Where the line's session runs, for its sighting (token report spec §6.3).
@@ -278,19 +298,22 @@ pub(crate) enum SightingHome {
 }
 
 /// Token report spec §6.3: in a run shell, the marker's profile; otherwise the default home,
-/// when `CLAUDE_CONFIG_DIR` is unset, empty or names it; otherwise `Elsewhere`. `env` is the
-/// engine's, which outside a run shell is the process's own.
-pub(crate) fn sighting_home(shell: &RunShell, env: &Env) -> SightingHome {
+/// when the provider's home variable is unset, empty or names it; otherwise `Elsewhere`. `env`
+/// is the engine's, which outside a run shell is the process's own.
+pub(crate) fn sighting_home(shell: &RunShell, env: &Env, p: &dyn Provider) -> SightingHome {
     match shell {
         RunShell::Inside { profile, .. } => SightingHome::Profile(profile.clone()),
         RunShell::Unreadable { .. } => SightingHome::Elsewhere,
         RunShell::Outside => {
-            let Some(dir) = tagteam_cc::env::config_dir(env).filter(|d| !d.is_empty()) else {
+            let Some(dir) = p.session_dir(env) else {
                 return SightingHome::Default;
             };
             let mut plain = env.clone();
-            tagteam_cc::env::set_config_dir(&mut plain, None);
-            if same_dir(Path::new(dir), &CcPaths::resolve(&plain).config_home) {
+            if let Some(var) = p.session_dir_var() {
+                plain.homes.remove(var);
+                plain.vars.remove(var);
+            }
+            if same_dir(&dir, &p.share_policy(&plain).source) {
                 SightingHome::Default
             } else {
                 SightingHome::Elsewhere
@@ -316,13 +339,13 @@ pub(crate) fn record_session(engine: &Engine, provider: &ProviderId, session_id:
     let Some(session_id) = session_id else {
         return;
     };
-    if !engine
-        .provider(provider)
-        .is_ok_and(|p| p.capabilities().transcripts)
-    {
+    let Ok(p) = engine.provider(provider) else {
+        return;
+    };
+    if !p.capabilities().transcripts {
         return;
     }
-    let profile = match sighting_home(engine.run_shell(), engine.env()) {
+    let profile = match sighting_home(engine.run_shell(), engine.env(), p.as_ref()) {
         SightingHome::Default => None,
         SightingHome::Profile(profile) => Some(profile),
         SightingHome::Elsewhere => return,
@@ -394,8 +417,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use clap::Parser;
+    use serde_json::json;
     use tagteam_cc::live::Platform;
-    use tagteam_cc::{ItemKind, keychain_account, keychain_service};
+    use tagteam_cc::{ClaudeCode, ItemKind, keychain_account, keychain_service};
     use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan};
     use tagteam_engine::settings::DEFAULT_STATUSLINE_FORMAT;
     use tagteam_engine::store::{Eligibility, Reserve, Store};
@@ -584,19 +608,27 @@ mod tests {
         assert_eq!(drain(Untouchable, true), 0);
     }
 
+    fn claude_code() -> ClaudeCode {
+        ClaudeCode::new(Arc::new(FakeKeychain::new()), Platform::MacOs)
+    }
+
     #[test]
     fn print_config_is_claude_codes_settings_snippet() {
-        assert_eq!(
-            config_snippet(),
-            "{\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"tagteam statusline\"\n  }\n}\n"
-        );
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            config_hint(&Env::for_test(dir.path())),
-            format!(
-                "Add this to {}; tagteam never edits Claude Code's settings.",
-                dir.path().join("home/.claude/settings.json").display()
-            )
+            print_config(&claude_code(), &Env::for_test(dir.path())),
+            Some((
+                format!(
+                    "Add this to {}; tagteam never edits Claude Code's settings.",
+                    dir.path().join("home/.claude/settings.json").display()
+                ),
+                "{\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"tagteam statusline\"\n  }\n}\n"
+                    .to_owned(),
+            ))
+        );
+        assert_eq!(
+            print_config(&FakeAgent::new(), &Env::for_test(dir.path())),
+            None
         );
     }
 
@@ -620,7 +652,8 @@ mod tests {
         let mut env = Env::for_test(dir.path());
         let default = env.home.join(".claude");
         std::fs::create_dir_all(&default).unwrap();
-        let outside = |env: &Env| sighting_home(&RunShell::Outside, env);
+        let cc = claude_code();
+        let outside = |env: &Env| sighting_home(&RunShell::Outside, env, &cc);
         assert_eq!(outside(&env), SightingHome::Default, "unset");
         tagteam_cc::env::set_config_dir(&mut env, Some(OsString::new()));
         assert_eq!(outside(&env), SightingHome::Default, "empty, as unset");
@@ -635,6 +668,14 @@ mod tests {
             Some(dir.path().join("elsewhere").into_os_string()),
         );
         assert_eq!(outside(&env), SightingHome::Elsewhere);
+        let other = dir.path().join("other-home");
+        std::fs::create_dir_all(&other).unwrap();
+        tagteam_cc::env::set_config_dir(&mut env, Some(other.into_os_string()));
+        assert_eq!(
+            outside(&env),
+            SightingHome::Elsewhere,
+            "an existing directory other than the default"
+        );
         let profile = dir.path().join("profile");
         let inside = RunShell::Inside {
             profile: profile.clone(),
@@ -645,12 +686,18 @@ mod tests {
                 outer: json!({}),
             },
         };
-        assert_eq!(sighting_home(&inside, &env), SightingHome::Profile(profile));
+        assert_eq!(
+            sighting_home(&inside, &env, &cc),
+            SightingHome::Profile(profile)
+        );
         let unreadable = RunShell::Unreadable {
             marker: dir.path().join(MARKER_FILE),
             detail: "torn".into(),
         };
-        assert_eq!(sighting_home(&unreadable, &env), SightingHome::Elsewhere);
+        assert_eq!(
+            sighting_home(&unreadable, &env, &cc),
+            SightingHome::Elsewhere
+        );
     }
 
     #[test]
@@ -783,14 +830,13 @@ mod tests {
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(profile.join(MARKER_FILE), "not json").unwrap();
         tagteam_cc::env::set_config_dir(&mut env, Some(profile.clone().into_os_string()));
-        let (built, _, http, keychain) = engine(context(env), None);
+        let (built, _, walls) = walled(context(env), None);
         assert!(
             matches!(built.run_shell(), RunShell::Unreadable { marker, .. } if *marker == profile.join(MARKER_FILE)),
             "{:?}",
             built.run_shell()
         );
-        assert!(!http.is_built());
-        assert_eq!(keychain.calls(), 0);
+        assert!(walls.untouched());
     }
 
     #[test]
@@ -804,7 +850,7 @@ mod tests {
         )
         .unwrap();
         let format_for = |provider: &str| {
-            let (built, _, _, _) = engine(context(env.clone()), Some(provider));
+            let (built, _) = engine(context(env.clone()), Some(provider));
             built.settings().statusline_format.clone()
         };
         assert_eq!(format_for(CLAUDE_CODE), "{5h}");
@@ -833,7 +879,7 @@ mod tests {
             no_color_env: false,
             force_color_env: false,
         };
-        let (built, provider, _, _) = engine(ctx, None);
+        let (built, provider) = engine(ctx, None);
         assert_eq!(provider.as_str(), CLAUDE_CODE);
         assert_eq!(built.default_provider().as_str(), CLAUDE_CODE);
         assert_eq!(
@@ -846,10 +892,12 @@ mod tests {
     fn the_engine_reaches_neither_the_keychain_nor_the_network() {
         // §13.5: the walls count what reaches them, so none of this may.
         let (_dir, env) = managed_home();
-        let (built, provider, http, keychain) = engine(context(env), None);
+        let (built, provider, walls) = walled(context(env), None);
         assert_eq!(shown(&built, &provider), "a · 5h 9% · 7d 77%\n");
-        assert!(!http.is_built(), "the HTTP adapter was built");
-        assert_eq!(keychain.calls(), 0, "the Keychain was asked");
+        assert!(
+            walls.untouched(),
+            "the HTTP adapter was built or the Keychain was asked"
+        );
     }
 
     /// A context over `env`, with a Keychain the walled engine never uses. Nothing is captured
@@ -921,19 +969,21 @@ mod tests {
     #[test]
     fn in_a_run_shell_the_line_is_the_markers_account_and_reaches_nothing_else() {
         let (_dir, outside, a) = session_home();
-        let (built, provider, _, _) = engine(context(outside.clone()), None);
+        let (built, provider) = engine(context(outside.clone()), None);
         assert_eq!(
             shown(&built, &provider),
             "s@x.co\n",
             "outside: the live login"
         );
 
-        let (built, provider, http, keychain) = engine(context(in_profile(&outside, &a)), None);
+        let (built, provider, walls) = walled(context(in_profile(&outside, &a)), None);
         assert!(matches!(built.run_shell(), RunShell::Inside { .. }));
         assert_eq!(provider.as_str(), CLAUDE_CODE, "the marker's provider");
         assert_eq!(shown(&built, &provider), "a · 5h 9% · 7d 77%\n");
-        assert!(!http.is_built(), "the HTTP adapter was built");
-        assert_eq!(keychain.calls(), 0, "the Keychain was asked");
+        assert!(
+            walls.untouched(),
+            "the HTTP adapter was built or the Keychain was asked"
+        );
     }
 
     #[test]
@@ -941,18 +991,18 @@ mod tests {
         // Review Focus 4, at the unit level: never the live login's line, and no wall reached.
         let (_dir, outside, _a) = session_home();
         let gone = in_profile(&outside, &AccountId::from_string("0192-removed"));
-        let (built, provider, http, keychain) = engine(context(gone), None);
+        let (built, provider, walls) = walled(context(gone), None);
         assert_eq!(shown(&built, &provider), "");
-        assert_eq!((keychain.calls(), http.is_built()), (0, false));
+        assert!(walls.untouched());
 
         let corrupt = in_profile(&outside, &AccountId::from_string("0192-corrupt"));
         let marker =
             PathBuf::from(tagteam_cc::env::config_dir(&corrupt).unwrap()).join(MARKER_FILE);
         std::fs::write(&marker, b"{\"format\": \"tagteam-profile\", ").unwrap();
-        let (built, provider, http, keychain) = engine(context(corrupt.clone()), None);
+        let (built, provider, walls) = walled(context(corrupt.clone()), None);
         assert!(matches!(built.run_shell(), RunShell::Unreadable { .. }));
         assert_eq!(shown(&built, &provider), "");
-        assert_eq!((keychain.calls(), http.is_built()), (0, false));
+        assert!(walls.untouched());
 
         // Through the command itself: exit 0, and nothing on either stream.
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -1060,7 +1110,7 @@ mod tests {
             resolve_provider(None, &RunShell::Outside, &registry, &process_env, &fake).as_str(),
             CLAUDE_CODE
         );
-        let (_, provider, _, _) = engine(context(process_env), None);
+        let (_, provider) = engine(context(process_env), None);
         assert_eq!(provider.as_str(), CLAUDE_CODE);
     }
 }

@@ -265,14 +265,24 @@ pub struct Io<'a> {
     pub prompter: &'a mut dyn Prompter,
 }
 
-/// The providers this build registers (§4.5), over the context's Keychain and platform, with
-/// every endpoint under the test base when one is set.
-pub(crate) fn build_registry(ctx: &Context) -> ProviderRegistry {
-    let mut cc = ClaudeCode::new(ctx.keychain.clone(), ctx.platform);
-    if let Some(base) = &ctx.api_base {
+/// The providers this build registers (§4.5): the one place that names them. Every registry is
+/// built here, over the given Keychain and platform, with every endpoint under the test base
+/// when one is set.
+pub(crate) fn registry(
+    keychain: Arc<dyn Keychain>,
+    platform: Platform,
+    api_base: Option<&str>,
+) -> ProviderRegistry {
+    let mut cc = ClaudeCode::new(keychain, platform);
+    if let Some(base) = api_base {
         cc = cc.with_endpoints(Endpoints::with_base(base));
     }
     ProviderRegistry::new().with(Arc::new(cc))
+}
+
+/// The providers this build registers, over the context's Keychain and platform.
+pub(crate) fn build_registry(ctx: &Context) -> ProviderRegistry {
+    registry(ctx.keychain.clone(), ctx.platform, ctx.api_base.as_deref())
 }
 
 /// The variables `Context::from_process` captures into `Env.homes`: every provider's
@@ -982,7 +992,7 @@ fn run_statusline(
         return EXIT_USAGE;
     }
     let (no_color_env, force_color_env) = (ctx.no_color_env, ctx.force_color_env);
-    let (engine, provider, _http, _keychain) = statusline::engine(ctx, provider.as_deref());
+    let (engine, provider) = statusline::engine(ctx, provider.as_deref());
     let session_id = engine
         .provider(&provider)
         .ok()
@@ -993,8 +1003,16 @@ fn run_statusline(
         .map(str::to_owned);
     let result = statusline_supported(&engine, &provider).and_then(|()| {
         if print_config {
-            let _ = writeln!(io.err, "{}", statusline::config_hint(engine.env()));
-            return Ok(statusline::config_snippet());
+            let p = engine.provider(&provider)?;
+            let (hint, snippet) =
+                statusline::print_config(p.as_ref(), engine.env()).ok_or_else(|| {
+                    Failure::Message(
+                        KIND_UNSUPPORTED,
+                        format!("{} has no statusline", p.display_name()),
+                    )
+                })?;
+            let _ = writeln!(io.err, "{hint}");
+            return Ok(snippet);
         }
         let view = engine.statusline(&provider)?;
         let settings = engine.settings();
@@ -2700,10 +2718,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_offers_only_providers_this_build_registers() {
-        // §13.7: the provider IDs completion offers are static. They are exactly the ones this
-        // build registers: none it lacks, and none it has left out.
-        use std::collections::BTreeSet;
+    fn the_statusline_builds_the_registry_every_other_command_builds() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = Context {
             env: Env::for_test(dir.path()),
@@ -2715,13 +2730,17 @@ mod tests {
             no_color_env: false,
             force_color_env: false,
         };
-        let registered: BTreeSet<ProviderId> =
+        let registered: Vec<ProviderId> =
             build_registry(&ctx).all().iter().map(|p| p.id()).collect();
-        let completed: BTreeSet<ProviderId> = crate::cli::COMPLETED_PROVIDERS
-            .iter()
-            .map(|id| ProviderId::new(*id))
-            .collect();
-        assert_eq!(completed, registered);
+        let (statusline, _) = statusline::engine(ctx, None);
+        assert_eq!(statusline.provider_ids(), registered);
+        assert_eq!(
+            crate::cli::completed_providers(),
+            registered
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
