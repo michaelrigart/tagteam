@@ -14,7 +14,7 @@ use tagteam_provider::Cancel;
 
 use crate::ask::{Answers, ChannelAsk};
 use crate::host::Host;
-use crate::live::{LIVE_QUEUE, LiveQueue};
+use crate::live::{LIVE_QUEUE, LiveQueue, StatusError};
 use crate::msg::{ActionsReq, DaemonReq, IndexReq, Msg, ReportReq, ViewsReq};
 use crate::runtime::WAKE;
 use crate::source::{Source, SourceFactory};
@@ -166,7 +166,7 @@ impl<Req: Coalesce + Send + 'static> Drop for Lane<Req> {
 const PROGRESS_EVERY: Duration = WAKE;
 
 /// What fetches the daemon's `status` on the daemon lane: `live::fetch_status` on its socket.
-pub(crate) type StatusFetch = Arc<dyn Fn() -> Result<Status, String> + Send + Sync>;
+pub(crate) type StatusFetch = Arc<dyn Fn() -> Result<Status, StatusError> + Send + Sync>;
 
 /// The lanes (§4.3). The engine lanes: views (`accounts`, `history`, store-served), report
 /// (the token report, which reads the index only), index (the token index's catch-up) and

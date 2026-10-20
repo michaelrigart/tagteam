@@ -8,7 +8,7 @@ use tagteam_engine::views::HistoryView;
 
 use crate::host::{Action, ActionOutcome};
 use crate::lanes::Coalesce;
-use crate::live::Live;
+use crate::live::{Live, StatusError};
 use crate::source::{AccountsSnapshot, CollectSummary, SourceError};
 
 /// The views lane's requests: store-served reads, no network (spec §4.3).
@@ -174,7 +174,7 @@ pub enum Msg {
     /// The daemon's `status`, from the daemon lane, for link `link` (spec §8, C-R21).
     DaemonStatus {
         link: u64,
-        result: Result<Status, String>,
+        result: Result<Status, StatusError>,
     },
     /// The runtime began the shutdown (spec §10.2 step 1); it exits with `code`.
     ShutdownBegan {
