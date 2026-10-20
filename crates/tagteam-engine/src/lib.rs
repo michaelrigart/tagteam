@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod engine;
 pub mod error;
 pub mod export;
+mod fsutil;
 mod hooks;
 pub mod import;
 pub mod launch;
