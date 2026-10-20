@@ -7,7 +7,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -46,8 +46,6 @@ const NOTIFY_SEND_ARGS: [&str; 2] = ["--app-name=tagteam", "--"];
 const QUEUE: usize = 32;
 /// D6.2: one delivery's bound.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
-/// How often an idle notifier thread looks for a stop.
-const POLL: Duration = Duration::from_millis(100);
 /// D6.3: a `limit` marker outlives its window's reset by this much…
 const AFTER_RESET_MS: i64 = 60_000;
 /// …and lives this long when the reset is unknown.
@@ -106,14 +104,21 @@ pub struct Notice {
 /// Where notices wait for the notifier. Every holder sends from the scheduler's thread.
 #[derive(Clone)]
 pub struct NoticeQueue {
-    tx: SyncSender<Notice>,
+    tx: SyncSender<Message>,
+}
+
+/// What the notifier thread waits for: a notice to deliver, or the stop `Notifier::drop` sends
+/// to wake it (H8).
+enum Message {
+    Notice(Notice),
+    Stop,
 }
 
 impl NoticeQueue {
     /// Queues `n` and never blocks (D4). A full queue drops it, and so does a notifier that
     /// has stopped.
     pub fn send(&self, n: Notice) {
-        match self.tx.try_send(n) {
+        match self.tx.try_send(Message::Notice(n)) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(_)) => {
                 tracing::debug!("the notification queue is full; a notification was dropped");
@@ -123,15 +128,32 @@ impl NoticeQueue {
 
     /// A queue whose notices a test reads from the receiver, with the notifier's capacity.
     #[cfg(test)]
-    pub(crate) fn for_test() -> (NoticeQueue, Receiver<Notice>) {
+    pub(crate) fn for_test() -> (NoticeQueue, Queued) {
         let (tx, rx) = mpsc::sync_channel(QUEUE);
-        (NoticeQueue { tx }, rx)
+        (NoticeQueue { tx }, Queued(rx))
     }
 }
 
-/// The notifier thread (D4, D6.2). Dropping it stops it, as `stop` does.
+/// What a test reads queued notices from.
+#[cfg(test)]
+pub(crate) struct Queued(Receiver<Message>);
+
+#[cfg(test)]
+impl Queued {
+    /// The notices waiting, in order.
+    pub(crate) fn try_iter(&self) -> impl Iterator<Item = Notice> + '_ {
+        self.0.try_iter().filter_map(|m| match m {
+            Message::Notice(n) => Some(n),
+            Message::Stop => None,
+        })
+    }
+}
+
+/// The notifier thread (D4, D6.2). It blocks until a notice or the stop message that dropping
+/// the `Notifier` sends (H8); dropping it stops it, as `stop` does.
 pub struct Notifier {
     stop: Arc<AtomicBool>,
+    tx: SyncSender<Message>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -150,6 +172,7 @@ impl Notifier {
         });
         let notifier = Notifier {
             stop,
+            tx: tx.clone(),
             thread: Some(thread),
         };
         (notifier, NoticeQueue { tx })
@@ -165,28 +188,32 @@ impl Notifier {
 impl Drop for Notifier {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // The queue beside the notifier may outlive it, so the thread would never see the
+        // channel close: this message wakes it. The send blocks on a full queue until the
+        // delivery in flight ends, which the join waits for anyway; `Err` means the thread has
+        // gone.
+        let _ = self.tx.send(Message::Stop);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
     }
 }
 
-/// The notifier thread's loop: each notice in turn, until a stop is asked for or every queue
-/// holder has gone.
+/// The notifier thread's loop: each notice in turn, until the stop message arrives, a stop is
+/// flagged or every queue holder has gone. The flag decides: a notice queued ahead of the stop
+/// is not delivered once it is set (D6.2).
 fn deliver_until_stopped(
     backend: &Backend,
     spawner: &dyn ProcessSpawner,
-    rx: &Receiver<Notice>,
+    rx: &Receiver<Message>,
     stop: &AtomicBool,
 ) {
     let mut warned = false;
     loop {
-        match rx.recv_timeout(POLL) {
+        match rx.recv() {
             Ok(_) if stop.load(Ordering::SeqCst) => return,
-            Ok(notice) => deliver(backend, spawner, &notice, &mut warned),
-            Err(RecvTimeoutError::Timeout) if stop.load(Ordering::SeqCst) => return,
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return,
+            Ok(Message::Notice(notice)) => deliver(backend, spawner, &notice, &mut warned),
+            Ok(Message::Stop) | Err(_) => return,
         }
     }
 }
@@ -513,7 +540,7 @@ mod tests {
     use crate::provider_job::{ProviderJob, ProviderJobCtx};
     use crate::scheduler::{Job, JobCx};
     use crate::testutil::{
-        Emitted, Fx, LONG_RESETS, T0, board, capture_logs, cc, job_ctx, windows,
+        Emitted, Fx, LONG_RESETS, T0, board, capture_logs, cc, job_ctx, windows, within,
     };
 
     /// What no notice of the fixture may carry (D6.2): either email whole, their domain, the
@@ -751,6 +778,27 @@ mod tests {
         queue.send(notice("too late"));
         thread::sleep(Duration::from_millis(200));
         assert!(spawner.specs().is_empty());
+    }
+
+    #[test]
+    fn a_notifier_dropped_while_its_queue_lives_stops_at_once() {
+        // H8, D6: the thread blocks in `recv`, and `Notifier::drop` wakes it with its stop
+        // message. `Started` drops its `Notifier` before the queue beside it (`daemon.rs:247`), so
+        // each queue is held across its notifier's drop. Ten drops took about a second while the
+        // thread polled every 100 ms.
+        let took = within("ten notifiers dropped", || {
+            let spawner = Arc::new(ScriptedSpawner::new());
+            let mut took = Duration::ZERO;
+            for _ in 0..10 {
+                let (notifier, queue) = Notifier::start(Backend::Osascript, spawner.clone());
+                let started = Instant::now();
+                drop(notifier);
+                took += started.elapsed();
+                drop(queue);
+            }
+            took
+        });
+        assert!(took < Duration::from_millis(500), "{took:?} for ten drops");
     }
 
     #[test]

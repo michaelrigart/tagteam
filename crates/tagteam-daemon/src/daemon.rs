@@ -426,7 +426,7 @@ mod tests {
     use super::*;
     use crate::events::{Mode, WaitingFor};
     use crate::notify::Notice;
-    use crate::testutil::{Emitted, Fx, Slices, T0, capture_logs, cc, fake, windows};
+    use crate::testutil::{Emitted, Fx, Slices, T0, capture_logs, cc, fake, windows, within};
 
     const VERSION: &str = "20261014.2045.0";
     const SIGTERM: i32 = 15;
@@ -1078,5 +1078,31 @@ mod tests {
             !home.engine.settings().notify_enabled,
             "the engine's settings were read again"
         );
+    }
+
+    #[test]
+    fn a_start_dropped_without_serving_ends_its_notifier_with_notices_off() {
+        // H8, D6.2: on macOS the notifier starts whatever `notify.enabled` says (unchanged); idle,
+        // it now costs no wakeup. A `Started` dropped without `serve` drops the `Notifier` before
+        // the `NoticeQueue` it holds, so only the stop message can end the thread.
+        within("a start dropped without serving", || {
+            let home = Fx::new();
+            home.settings("[notify]\nenabled = false\n", 1);
+            let opts = DaemonOptions {
+                backend: Some(Backend::Osascript),
+                ..options(&home)
+            };
+            let started = Daemon::start(&home.engine, opts, &mut |n| panic!("{n}")).unwrap();
+            assert!(!home.engine.settings().notify_enabled);
+            assert!(
+                started.notifier.is_some(),
+                "the notifier starts with notices off"
+            );
+            drop(started);
+            assert!(
+                record(&home).is_empty(),
+                "the rest of the start was let go too"
+            );
+        });
     }
 }
