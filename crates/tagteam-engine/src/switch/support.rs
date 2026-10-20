@@ -139,9 +139,9 @@ pub(super) fn unless_forced(
     }
 }
 
-/// §6.3, Decision 13: the live identity names only the live login's own secret,
-/// `own_secret`. A secret on the other auth axis is never attributed to the login beside it,
-/// so its row names no identity.
+/// §6.3: a displaced row is attributed only to the live login's own secret, `own_secret`, so
+/// the live identity names that secret and no other. A secret on the other auth axis is never
+/// attributed to the login beside it, so its row names no identity.
 pub(super) fn attributed<'i>(
     live_identity: Option<&'i Identity>,
     own_secret: Option<&[u8]>,
@@ -196,7 +196,7 @@ impl<'a> Settle<'a> {
     /// it holds nothing account-scoped or a generation `held` already keeps. Either way the
     /// generation is held from then on, so no entry of it is saved twice. A failed save aborts,
     /// except under `force` (B.5). The row names `live_identity` only when `bytes` is
-    /// `own_secret`, the live login's own (§6.3, Decision 13). A secret on the other auth axis
+    /// `own_secret`, the live login's own (§6.3). A secret on the other auth axis
     /// gets no identity.
     pub(crate) fn save_unheld(&mut self, engine: &Engine, bytes: &[u8]) -> Result<(), EngineError> {
         match self.p.fingerprint(bytes) {
