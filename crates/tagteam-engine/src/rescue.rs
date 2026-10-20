@@ -203,15 +203,30 @@ impl Engine {
         }
     }
 
-    /// Deletes a rescue the vault already holds (H6's landed rule), and says so at DEBUG.
-    pub(crate) fn delete_landed(&self, row: &AccountRow, path: &Path) -> Result<(), EngineError> {
-        self.delete_rescue(path)?;
-        tracing::debug!(
-            position = row.position,
-            account = %row.id,
-            "deleted a rescue the vault already holds"
-        );
-        Ok(())
+    /// Deletes a rescue the vault already holds (H6's landed rule), best effort: DEBUG when it
+    /// went, WARN when it could not. Either way the caller skips it, never adopts or publishes
+    /// it; one left behind is harmless, since the vault holds its generation. Returns whether
+    /// it was deleted.
+    pub(crate) fn delete_landed(&self, row: &AccountRow, path: &Path) -> bool {
+        match self.delete_rescue(path) {
+            Ok(()) => {
+                tracing::debug!(
+                    position = row.position,
+                    account = %row.id,
+                    "deleted a rescue the vault already holds"
+                );
+                true
+            }
+            Err(err) => {
+                tracing::warn!(
+                    position = row.position,
+                    account = %row.id,
+                    kind = err.kind(),
+                    "a rescue the vault already holds could not be deleted"
+                );
+                false
+            }
+        }
     }
 
     /// §6.2 "Pending rescues before activation", and §7.3 step 3's adoption. A rescue that
@@ -255,17 +270,10 @@ impl Engine {
         let mut unlanded = Vec::new();
         for r in rescues {
             let RescueFile::Entry(e) = r else { continue };
-            if !e.landed(p, current.as_ref()) {
+            if e.landed(p, current.as_ref()) {
+                self.delete_landed(row, &e.path);
+            } else {
                 unlanded.push(e);
-                continue;
-            }
-            if let Err(err) = self.delete_landed(row, &e.path) {
-                tracing::warn!(
-                    position = row.position,
-                    account = %row.id,
-                    kind = err.kind(),
-                    "a rescue the vault already holds could not be deleted"
-                );
             }
         }
         for e in unlanded {

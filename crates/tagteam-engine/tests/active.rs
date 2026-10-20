@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    Fx, block_rescue, failed, prev_refresh_token, quarantine_of, rescue_files, token_requests,
-    unblock_rescue,
+    Fx, block_rescue, capture_logs, failed, prev_refresh_token, quarantine_of, rescue_files,
+    token_requests, unblock_rescue,
 };
 
 use serde_json::{Value, json};
@@ -548,6 +548,57 @@ fn an_expired_recovered_generation_is_published_before_it_is_refreshed() {
     assert_eq!(prev_refresh_token(&fx, &a).as_deref(), Some("rt-b"));
     assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-c"));
     assert_eq!(token_requests(&fx), 1);
+}
+
+/// `unpublished_b`, plus the rescue that pass wrote ahead of its vault write and never got to
+/// delete: it holds B, the vault's current generation, so the landed rule applies to it.
+fn unpublished_b_with_its_write_ahead(fx: &Fx, a: &AccountId) {
+    unpublished_b(fx, a, fx.clock.now_ms() + 3_600_000);
+    let b = fx.vault_bytes(a).unwrap();
+    fx.plant_rescue(a, &fp(fx, &cred("a@x.co", "rt-a")), &b);
+}
+
+#[test]
+fn the_prev_row_deletes_a_landed_rescue_and_still_publishes_the_vault() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    unpublished_b_with_its_write_ahead(&fx, &a);
+
+    let out = active(&fx, ActiveTrigger::Expired).unwrap();
+
+    assert_eq!(out, ActiveOutcome::NotNeeded { reconciled: true });
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-b"));
+    assert_eq!(rescue_files(&fx), 0);
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[test]
+fn a_landed_rescue_that_cannot_be_deleted_never_stops_the_prev_row_s_publish() {
+    // The landed rule is best effort: the vault already holds the rescue's generation, so
+    // skipping it is safe, and CC's live store is still repaired from the vault.
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    unpublished_b_with_its_write_ahead(&fx, &a);
+    block_rescue(&fx);
+
+    let (out, logs) = capture_logs(|| active(&fx, ActiveTrigger::Expired));
+    unblock_rescue(&fx);
+
+    assert_eq!(out.unwrap(), ActiveOutcome::NotNeeded { reconciled: true });
+    assert_eq!(fx.live_refresh_token().as_deref(), Some("rt-b"));
+    assert_eq!(fx.vault_refresh_token(&a).as_deref(), Some("rt-b"));
+    assert_eq!(
+        rescue_files(&fx),
+        1,
+        "the delete failed; the rescue is skipped"
+    );
+    assert!(
+        logs.iter().any(|l| l.contains("WARN")
+            && l.contains("a rescue the vault already holds could not be deleted")),
+        "{logs:#?}"
+    );
+    assert_eq!(token_requests(&fx), 0);
 }
 
 #[test]

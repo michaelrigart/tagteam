@@ -525,13 +525,15 @@ impl Engine {
         // H6's landed rule before the table, against the vault's fingerprint: a rescue whose own
         // generation the vault already holds (an earlier pass's write-ahead that outlived its
         // vault write, or a reply that kept the refresh token) is deleted, never adopted or
-        // published.
+        // published. Best effort, as `settle_rescues` does it: one that cannot be deleted is
+        // skipped, so the rows below, the `.prev` self-heal included, still run.
         let vault_fp = vault.as_deref().and_then(fp);
         let (landed, rescues): (Vec<RescueEntry>, Vec<RescueEntry>) = rescues
             .into_iter()
             .partition(|r| r.landed(p, vault_fp.as_ref()));
+        let mut deleted_any = false;
         for r in &landed {
-            self.delete_landed(row, &r.path)?;
+            deleted_any |= self.delete_landed(row, &r.path);
         }
         let is_live = |b: &[u8]| fp(b).as_ref() == Some(&live_fp);
 
@@ -553,13 +555,14 @@ impl Engine {
             return Ok(Reconciled {
                 current: live.to_vec(),
                 publish: false,
-                changed: !landed.is_empty(),
+                changed: deleted_any,
                 retire: vec![],
             });
         }
 
         // The vault's `.prev`: an earlier pass reached the vault but not the live store. A
-        // rescue of the vault's generation went with the landed rule above.
+        // rescue of the vault's generation was settled by the landed rule above, deleted or
+        // skipped.
         if let (Some(v), Some(pr)) = (&vault, &prev) {
             if is_live(pr) {
                 return Ok(Reconciled {
