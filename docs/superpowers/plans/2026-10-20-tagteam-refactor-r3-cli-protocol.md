@@ -89,7 +89,7 @@ Further pins added on the way:
 | Spec | Tasks |
 |---|---|
 | §7.1, `app.rs` becomes `app/` | 1, 2, 15 |
-| §7.1, exhaustive dispatch | the ruling in "Spec deltas" (no task) |
+| §7.1, exhaustive dispatch | 0 (the spike and §7.1's decision rule) |
 | §7.2, bootstrap | 3 |
 | §7.3, `Failure::report`, `Io::warn/note/fail`, the pre-`Io` sites | 4 |
 | §7.3, `refuse_in_run_shell` | 5 |
@@ -114,9 +114,31 @@ Every task compiles the `tagteam` crate, so tasks run one at a time, in order.
 
 ---
 
-### Task 1: Make the dispatch's inline arms methods and pin `or_inactive`'s log target
+### Task 0: Spike the flattened command enum (no commit)
 
 **Depends on:** none.
+
+**Files:** none committed. The spike edits `crates/tagteam/src/cli.rs` and the callers it breaks in the working tree, records what it observes, and reverts. `git -C <repo> status` must be clean at the end.
+
+- [ ] **Step 1: Record the baseline.** At HEAD, build `cargo build -p tagteam --locked --features test-support`. Save `target/debug/tagteam --help` and `tagteam completions bash`, `zsh` and `fish` to files under the plan workspace.
+- [ ] **Step 2: The spike.**
+  - Split `Command` with `#[command(flatten)]` into stage groups, so each of `run_command`'s three early stages and `dispatch` can match exhaustively (§7.1):
+    - one group for `Statusline` and `Tui`;
+    - one for `ShellInit` and `Completions`;
+    - `Run`;
+    - the rest.
+  - Fix only what the compiler requires to build, the held `tui_cmd.rs:142` pattern included.
+  - Rebuild. Diff the four outputs against the baseline. Run `cargo test -p tagteam --locked --features test-support --test completions --test tui_args`.
+- [ ] **Step 3: Record and revert.**
+  - Write to the report: whether help order changed, whether any completions script changed (with the first differing lines), whether `tui_args` passed, and which held-file lines the spike had to touch.
+  - Revert every change. `git status` must be clean.
+- [ ] **Step 4: The decision**, by §7.1's rule:
+  - **If help order, any completions script or `tui_args` changed**, keep the single enum and its `unreachable!` arms. The controller records the observed differences under "Rulings" in the PR, and the plan continues at Task 1 unchanged.
+  - **If none changed**, stop and report. The controller then adds a task for the flatten before Task 1, with only a minimal compile fix in the held `tui_cmd.rs` (§3.4).
+
+### Task 1: Make the dispatch's inline arms methods and pin `or_inactive`'s log target
+
+**Depends on:** Task 0 (its decision).
 
 **Files:**
 - Modify: `crates/tagteam/src/app.rs` (the arms in `dispatch`, `:1306-1532`; `run_command`'s tui and completions answers, `:807-851`; `or_inactive`'s `tracing::warn!`, `:503`)
@@ -129,7 +151,8 @@ Every task compiles the `tagteam` crate, so tasks run one at a time, in order.
   - `fn alias(&mut self, account: Option<String>, name: Option<String>, unset: bool) -> Result<(), Failure>`;
   - `fn move_account(&mut self, account: &str, position: u32) -> Result<(), Failure>`;
   - `fn doctor(&mut self, online: bool) -> Result<i32, Failure>`;
-  - `fn auto_command(&mut self, once: bool, dry_run: bool, flags: AutoFlags) -> Result<i32, Failure>`.
+  - `fn auto_command(&mut self, once: bool, dry_run: bool, flags: AutoFlags) -> Result<i32, Failure>`;
+  - `fn add_token(&mut self, token: Option<String>, position: Option<u32>, email: Option<String>, alias: Option<String>, yes: bool) -> Result<(), Failure>`. Its arm calls `token`, `confirming` and `added`; as a method beside them, it keeps them private to `commands/accounts.rs` after Task 2.
 - Produces two free functions:
   - `fn refuse_tui(io: &mut Io<'_>, json: bool) -> Ended`, the tui refusal;
   - `fn answer_completions(io: &mut Io<'_>, json: bool, shell: CompletionShell) -> Ended`, the completions answer, with its `let _ = io.out.write_all(..)` unchanged. Task 8 changes it.
@@ -140,7 +163,7 @@ Facts: `app.md` §4 and §7.1.
   - Move each named arm's body into its method, unchanged.
   - The `Alias` arm keeps its runtime usage check and `ALIAS_USAGE` (C-10).
   - The `Auto` arm keeps building `flags` with `auto_flags(...)?` and passes `(once, dry_run, flags)`, which keeps `auto_command` within clippy's limit of seven parameters.
-  - `AddToken`, `Disable` and `Enable` stay inline (§7.1 does not list them).
+  - `AddToken` becomes a method too, so the helpers it calls stay private to the file they land in. `Disable` and `Enable` stay inline, and call only `print_account`.
   - `Move`'s method is `move_account`, because `move` is a keyword.
 - [ ] **Step 2: Extract the two `run_command` answers** into `refuse_tui` and `answer_completions`, called from the same places in the same order.
 - [ ] **Step 3: Pin the target.** Add `target: "tagteam::app",` as the first argument of `or_inactive`'s `tracing::warn!`. Task 2 moves it into `commands/accounts.rs`, which would otherwise change its target.
@@ -179,7 +202,13 @@ Facts: `app.md` §1–§3 and §7.
   - `auto_command` goes to `commands/daemon.rs`;
   - `refuse_tui` and `answer_completions` go to `early.rs`.
 
-  `resolve` goes to `commands/accounts.rs`, as §7.1's table has it, at `pub(in crate::app)`. Then run `cargo fmt --all`.
+  `add_token` also goes to `commands/accounts.rs`. `resolve` goes there as well, as §7.1's table has it, at `pub(in crate::app)`.
+
+  Beyond `app.md` §2's list of raises:
+  - `add_token` becomes `pub(in crate::app)`, because `dispatch` calls it;
+  - `auto_flags` becomes `pub(in crate::app)`, because the `Auto` arm in `dispatch.rs` still calls it. `dispatch.rs` imports it.
+
+  `confirming` and `added` stay private, because only `add_token` and `add` call them. Any other raise the compiler requires is the minimum that compiles, and is listed in the report. Then run `cargo fmt --all`.
 - [ ] **Step 4: Verify.**
   - Run the `tagteam` focused command, both clippy variants, and `cargo build -p tagteam --locked` without features. The `#[cfg(feature = "test-support")]` items moved to `context.rs` must build both ways.
   - Run `cargo test -p tagteam-fake --locked --test neutrality`.
@@ -203,10 +232,15 @@ pub(crate) struct Located {
     pub(crate) env: Env,
 }
 pub(crate) fn locate_run_shell(ctx: &Context) -> Result<Located, EngineError>;
+pub(crate) fn engine_for(ctx: Context, provider: Option<&ProviderId>) -> Result<(Engine, Vec<String>), EngineError>;
+// = let l = locate_run_shell(&ctx)?; Ok(build_engine(ctx, l.registry, l.run_shell, l.env, provider))
 ```
 
 - [ ] **Step 1: Implement it.** It runs `build_registry(ctx)`, then `locate(ctx.env.clone(), &registry)`, and turns `RunShell::Unreadable { marker, detail }` into `EngineError::RunShellUnreadable { marker, detail }`. `locate`, `build_registry` and `build_engine` keep their signatures for the held callers.
-- [ ] **Step 2: Use it in `run_command`.** It replaces the registry, `locate` and refusal block. On `Err(e)`, it fails exactly as today: `e.kind()` and `e.to_string()`, through `fail`. `shell-init` then uses `located.registry`, and `build_engine` takes `located`'s three parts.
+- [ ] **Step 2: Use both in `run_command`.**
+  - **Stage two** (the unreadable-marker refusal, `shell-init` and `completions`) calls `locate_run_shell(&ctx)`. On `Err(e)` it fails exactly as today, with `e.kind()` and `e.to_string()` through `fail`. `shell-init` uses `located.registry`.
+  - **Stage three** builds the engine with `engine_for(ctx, provider_flag.as_ref())`, after copying out the `ctx` fields it copies today. Its `Err` arm is unreachable in practice, but if a marker became unreadable in between, it is reported the same way.
+  - `engine_for` locates the run shell a second time from the same `ctx`. That is a pure, cheap read of the environment and the marker file, and it gives the same `Located`.
 - [ ] **Step 3: Verify.** Run the `tagteam` focused command (the unreadable-marker tests in `tests/cli.rs`) and both clippy variants.
 - [ ] **Step 4: Commit** "Find the run shell through one locate_run_shell".
 
@@ -576,17 +610,13 @@ impl Event {
 
 These are rulings inside the spec's intent. Each one is recorded under "Rulings" in the PR.
 
-1. **The single command enum stays, with its five `unreachable!` arms.** §7.1 says to keep them if a `#[command(flatten)]` split changes help order, completions output or `tests/tui_args.rs`.
-   - **Why it would.** clap orders subcommands by insertion, and `flatten` inserts a group's subcommands where its variant sits. The five early commands are interleaved: `Tui` is 3rd, `ShellInit`, `Statusline` and `Run` are 18th–20th, and `Completions` is 27th. Stage groups would therefore reorder `--help` and the order of names in every completions script, because `clap_complete` walks `get_subcommands()`. `display_order` fixes help only, not the scripts.
-   - **The held file.** The split would also change `Command::Tui`'s path, which the held `tui_cmd.rs:142` matches.
-   - **No experiment.** The evidence comes from clap's documented ordering and the enum's own order, so no spike was run.
-2. **`engine_for` waits for its first caller.**
-   - R3 has none. `run_command` needs the registry for `shell-init` before it builds the engine, and the held TUI files keep their own sequence (§7.2).
-   - An unused `pub(crate)` function fails `-D warnings`.
-   - §7.2 already has the TUI redesign moving the held callers onto `engine_for`, so it adds `engine_for` beside `locate_run_shell` then.
+1. **The exhaustive dispatch is decided by Task 0's spike**, under §7.1's own rule.
+   - **The expected outcome** is the fallback. clap orders subcommands by insertion, and `flatten` inserts a group where its variant sits. The five early commands are interleaved: `Tui` is 3rd, `ShellInit`, `Statusline` and `Run` are 18th–20th, and `Completions` is 27th.
+   - **Either way,** the PR records the observed result.
+2. **`run_command` uses both bootstrap functions.** `locate_run_shell` serves the early stage, which needs the registry before any engine exists. `engine_for` builds the engine, locating the run shell a second time from the same `ctx`; that read is pure and cheap. The held TUI files keep their own sequence (§7.2).
 3. **`Failure::report` takes `json`.** The spec's `Output` type does not exist; `Io` is the output and carries no `json` flag.
-4. **`auto_command` takes `(once, dry_run, flags)`.** The `Auto` arm keeps building `AutoFlags`, so the method stays within clippy's limit.
-5. **`AddToken`, `Disable` and `Enable` stay inline in `dispatch`.** §7.1 lists the arms that become methods, and these are not among them.
+4. **`auto_command` takes `(once, dry_run, flags)`.** The `Auto` arm keeps building `AutoFlags` through `auto_flags`, which therefore becomes `pub(in crate::app)`. That keeps the method within clippy's limit.
+5. **`AddToken` becomes a method as well,** so `confirming` and `added` stay private to `commands/accounts.rs`. §7.1 does not list it, but the move would otherwise widen their visibility. `Disable` and `Enable` stay inline.
 6. **`or_inactive`'s log target is pinned before the move** (Task 1), as R2 did for the switch.
 7. **The `SCHEMA_VERSION` path is `crate::SCHEMA_VERSION`** (`u32`, in `lib.rs`), named apart from the engine's store `SCHEMA_VERSION` by its crate. Test-module literals stay literals, because they pin the wire.
 8. **`Io::warn` and `Io::note` cover the twelve `warning:` and two `note:` sites in the app.** The writers in `run.rs` and `prompt.rs` (hardening's files), `logging.rs`, `lib.rs`'s signal handler and `tokens_cmd.rs`'s pre-formatted notices take bare writers or pre-built text, so they stay.
