@@ -166,20 +166,22 @@ impl Wait {
     }
 }
 
-/// How many replies to a terminal's queries crossterm can keep back from one read of it: a
-/// read is at most 1024 bytes (`TTY_BUFFER_SIZE` in crossterm 0.29.0's
-/// `src/event/source/unix/mio.rs`), and the shortest reply, the primary device attributes
-/// `ESC [ ? c`, is 4 bytes. The workspace pins crossterm at `=0.29.0`.
-const REPLIES: usize = 1024 / 4;
+/// How many replies to a terminal's queries one drain looks past: a key behind up to 32
+/// replies read at once is drained at once. A key behind more waits for the next byte, a
+/// resize or a wake, as it did before the drain looked past any. One read could hold 256
+/// (1024 bytes, `TTY_BUFFER_SIZE` in crossterm 0.29.0, over the 4 of `ESC [ ? c`), but each
+/// look past one costs two zero-timeout kevents once crossterm holds nothing: a drain's end
+/// took about 8 ms in a release build at 256, and about 1 ms at 32.
+const REPLIES: usize = 32;
 
 /// `Terminal::next` over crossterm's calls, `closed` before each one.
 ///
 /// crossterm's zero-timeout `poll` hands out one parsed event a call. When that event is a
 /// reply it keeps to itself (a cursor position, the keyboard enhancement flags, the primary
 /// device attributes), it says no, though keys may wait behind it. What it holds comes from
-/// one read, so a key waits behind at most `REPLIES` of them, and `REPLIES + 1` noes in a row
-/// say it holds nothing more. A read of newer bytes within those noes takes bytes whose
-/// arrival `Wait::closed` keeps, or the wait has yet to see: the next wait drains again.
+/// one read, so `REPLIES + 1` noes in a row say it holds no key behind up to `REPLIES` of them.
+/// A read of newer bytes within those noes takes bytes whose arrival `Wait::closed` keeps, or
+/// the wait has yet to see: the next wait drains again.
 fn next_of(
     mut closed: impl FnMut() -> io::Result<bool>,
     mut poll: impl FnMut() -> io::Result<bool>,
@@ -1106,7 +1108,7 @@ mod tests {
 
     #[test]
     fn a_key_behind_the_replies_crossterm_keeps_is_read() {
-        // Up to as many as one read holds.
+        // Up to as many as a drain looks past.
         for replies in [0, 1, 2, REPLIES] {
             let (next, closeds, polls) = next_behind(replies, true, None);
             assert!(
