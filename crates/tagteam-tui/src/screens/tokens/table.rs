@@ -815,9 +815,10 @@ struct Laid {
     rows: Rc<Rows>,
 }
 
-/// `Rows` for the level's report, kept while the width and the active blocks' clocks stay: the
-/// time reaches the rows only through `figures`, so a frame lays them out anew once a second at
-/// most, and a report with no active block once per width.
+/// `Rows` for the level's report, kept while the width, the number of rows and the active
+/// blocks' clocks stay: the time reaches the rows only through `figures`, so a report with no
+/// active block is laid out once per width, and one with an active block whenever a clock of
+/// its figures changes.
 #[derive(Default)]
 pub(super) struct Layout {
     laid: RefCell<Option<Laid>>,
@@ -831,9 +832,13 @@ impl Layout {
         let mut laid = self.laid.borrow_mut();
         if let Some(l) = laid.as_ref().filter(|l| {
             l.width == width
-                && l.active
-                    .iter()
-                    .all(|&(i, clock)| figures_clock(&report.rows[i], now_ms) == clock)
+                && l.rows.starts.len() == report.rows.len()
+                && l.active.iter().all(|&(i, clock)| {
+                    report
+                        .rows
+                        .get(i)
+                        .is_some_and(|row| figures_clock(row, now_ms) == clock)
+                })
         }) {
             return Rc::clone(&l.rows);
         }
@@ -2642,6 +2647,23 @@ mod tests {
         assert!(figures(base).contains("1m left"), "{}", figures(base));
         assert!(figures(base + 100).contains("<1m left"));
         assert!(figures(base + 60_000).starts_with(" TOTAL"));
+    }
+
+    #[test]
+    fn a_layout_asked_for_a_shorter_report_is_built_anew() {
+        let base = NOW_MS - NOW_MS.rem_euclid(1000);
+        let mut long_rows = many_days(3);
+        long_rows.push(block(base - 17_940_000, true));
+        let (long, short) = (showing(long_rows, |_| {}), showing(many_days(2), |_| {}));
+        let (long, short) = (
+            long.tokens.level().report.as_ref().unwrap(),
+            short.tokens.level().report.as_ref().unwrap(),
+        );
+        let layout = Layout::default();
+        let first = layout.rows(long, 80, base);
+        assert_eq!((first.starts.len(), layout.builds()), (4, 1));
+        let second = layout.rows(short, 80, base);
+        assert_eq!((second.starts.len(), layout.builds()), (2, 2));
     }
 
     #[test]

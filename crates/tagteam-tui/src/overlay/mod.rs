@@ -15,7 +15,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::host::{AccountRef, Action};
-use crate::msg::{AnswerTo, Cmd};
+use crate::msg::{Answer, AnswerTo, Cmd};
 use crate::screens::tokens::filter::{self, FilterDialog};
 use crate::state::State;
 use crate::view::{centered, wrap_rows};
@@ -51,6 +51,35 @@ pub enum Overlay {
     },
     /// Tokens' filter (spec §5.3).
     Filter(FilterDialog),
+}
+
+impl Overlay {
+    /// The answer that declines the CLI prompt this overlay shows, when it shows one. Every kind
+    /// is named, so that a new one is classified before it compiles.
+    pub(crate) fn decline(&self) -> Option<Cmd> {
+        match self {
+            Overlay::Confirm {
+                then: ConfirmThen::Reply(to),
+                ..
+            } => Some(Cmd::Answer {
+                to: *to,
+                answer: Answer::CONFIRM_DECLINED,
+            }),
+            Overlay::Choose { reply, .. } => Some(Cmd::Answer {
+                to: *reply,
+                answer: Answer::CHOOSE_DECLINED,
+            }),
+            Overlay::Confirm {
+                then: ConfirmThen::Run(_),
+                ..
+            }
+            | Overlay::Help
+            | Overlay::Text { .. }
+            | Overlay::Result { .. }
+            | Overlay::Doctor { .. }
+            | Overlay::Filter(_) => None,
+        }
+    }
 }
 
 /// What a confirm dialog's answer goes to: a waiting CLI prompt, or the TUI's own question

@@ -195,20 +195,7 @@ pub fn on_prompt(state: &mut State, prompt: Prompt) -> Vec<Cmd> {
     if state.quitting.is_some() {
         return vec![declined(to, &kind)];
     }
-    let replaced = match &state.overlay {
-        Some(Overlay::Confirm {
-            then: ConfirmThen::Reply(to),
-            ..
-        }) => Some(Cmd::Answer {
-            to: *to,
-            answer: Answer::Confirm(false),
-        }),
-        Some(Overlay::Choose { reply, .. }) => Some(Cmd::Answer {
-            to: *reply,
-            answer: Answer::Choose(None),
-        }),
-        _ => None,
-    };
+    let replaced = state.overlay.as_ref().and_then(Overlay::decline);
     state.overlay = Some(match kind {
         PromptKind::Confirm { default_yes } => Overlay::Confirm {
             question,
@@ -228,8 +215,8 @@ pub fn on_prompt(state: &mut State, prompt: Prompt) -> Vec<Cmd> {
 /// The decline of a prompt of `kind` that was never shown.
 fn declined(to: AnswerTo, kind: &PromptKind) -> Cmd {
     let answer = match kind {
-        PromptKind::Confirm { .. } => Answer::Confirm(false),
-        PromptKind::Choose { .. } => Answer::Choose(None),
+        PromptKind::Confirm { .. } => Answer::CONFIRM_DECLINED,
+        PromptKind::Choose { .. } => Answer::CHOOSE_DECLINED,
     };
     Cmd::Answer { to, answer }
 }
