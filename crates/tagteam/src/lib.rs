@@ -178,6 +178,8 @@ fn boundary(cli: &cli::Cli) -> Result<(bool, app::Context), i32> {
     Ok((tui, ctx))
 }
 
+/// Installs the signal handlers on `ctx`'s cancel token. `main_with_args` calls it after
+/// `boundary`, whose stdin drain must come first.
 fn install_signals(ctx: &app::Context) {
     // §14.1, at the process boundary like the drain above: in-process tests drive `run` with
     // tokens of their own, and must never change the test runner's signal dispositions. After
