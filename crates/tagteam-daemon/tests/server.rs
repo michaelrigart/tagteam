@@ -9,8 +9,8 @@ use std::io;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -561,9 +561,10 @@ fn stopping_removes_the_socket_at_once_and_subscribers_still_read_it() {
 
 #[test]
 fn a_signal_stops_new_connections_but_subscribers_still_hear_stopping() {
-    // D4.6, Review Focus 1: on the signal the accept thread goes and drops the listener, so
-    // a new connect is refused at once. Open connections are still served until `shutdown`,
-    // which comes after `serve` has emitted `stopping`.
+    // D4.6, Review Focus 1: after the signal the accept thread goes at its first wake (here the
+    // first connect, which it admits) and drops the listener, so the connects after it are
+    // refused at once. Open connections are still served until `shutdown`, which comes after
+    // `serve` has emitted `stopping`.
     let dir = short_tempdir();
     let path = dir.path().join("daemon.sock");
     let cancel = Cancel::new();
@@ -601,4 +602,159 @@ fn the_hub_can_be_shared_between_threads() {
     // The scheduler emits on the main thread while connection threads subscribe.
     fn shared<T: Send + Sync>() {}
     shared::<Hub>();
+}
+
+/// Runs `f` on a thread of its own and waits up to 10 s for it, so a thread that never wakes
+/// fails the test instead of stalling the run. A panic in `f` is the test's.
+fn within<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(value) => {
+            let _ = handle.join();
+            value
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => match handle.join() {
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(()) => panic!("{what}: the thread ended without a result"),
+        },
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("not within 10 s: {what}"),
+    }
+}
+
+#[test]
+fn shutdown_wakes_the_accept_thread_and_a_connection_at_once() {
+    // H8: the accept thread waits in `poll` on the listener and the hub's wake pipe, and a
+    // connection on its socket and the server-stop pipe, all with no timeout. `shutdown`
+    // writes both pipes (the hub's through `close_socket`). Ten shutdowns, each with a
+    // greeted connection, took about a second under the 100 ms polls.
+    let dir = short_tempdir();
+    let took = within("ten shutdowns", move || {
+        let path = dir.path().join("daemon.sock");
+        let mut took = Duration::ZERO;
+        for _ in 0..10 {
+            let (server, _board) = start(dir.path());
+            let mut peer = Peer::greeted(&path);
+            let started = Instant::now();
+            server.shutdown();
+            took += started.elapsed();
+            assert!(peer.next_line().is_none());
+        }
+        took
+    });
+    assert!(
+        took < Duration::from_millis(500),
+        "{took:?} for ten shutdowns"
+    );
+}
+
+#[test]
+fn an_event_reaches_a_subscriber_at_once() {
+    // H8: `Hub::queue` writes the subscriber's wake pipe after each `try_send`. One event at a
+    // time, each emitted once the last has arrived: under the 100 ms read timeout each waited
+    // about 100 ms, so twenty took about two seconds.
+    let dir = short_tempdir();
+    let (server, _board) = start(dir.path());
+    let mut peer = Peer::subscribed(&dir.path().join("daemon.sock"), "s");
+    let started = Instant::now();
+    for n in 0..20 {
+        server.hub().emit(&burst_event(n));
+        assert_eq!(
+            peer.line()["message"].as_str().unwrap()[..6],
+            format!("{n:06}")
+        );
+    }
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(1), "{took:?} for twenty events");
+    server.shutdown();
+}
+
+#[test]
+fn shutdown_with_a_full_queue_and_sixteen_connections_ends_every_thread_and_the_rest_read_stopping()
+{
+    // Review Focus 4, Decision 9, H8: sixteen connections. One subscriber never reads, ten
+    // read, and five only greeted. A burst fills the stalled one's queue. With no read timeout
+    // left, only descriptors end the threads:
+    // - the stalled one waits for room under a 60 s write timeout until the hub shuts its
+    //   socket on the full queue
+    // - the rest end on the server-stop pipe; the greeted ones would otherwise wait out 30 s
+    //   idle, and the readers forever
+    const READERS: usize = 10;
+    const BATCH: usize = 32;
+    let dir = short_tempdir();
+    let path = dir.path().join("daemon.sock");
+    // A write may wait a minute for room: the full queue, not the write timeout, drops it.
+    let (server, board) = start_with(
+        dir.path(),
+        Limits {
+            idle: IDLE,
+            write_timeout: Duration::from_secs(60),
+        },
+    );
+    let mut stalled = Peer::subscribed(&path, "stalled");
+    let read: Vec<Arc<AtomicUsize>> = (0..READERS).map(|_| Arc::default()).collect();
+    let readers: Vec<_> = read
+        .iter()
+        .enumerate()
+        .map(|(n, count)| {
+            let mut peer = Peer::subscribed(&path, &format!("reader-{n}"));
+            let count = Arc::clone(count);
+            thread::spawn(move || {
+                let mut seen = Vec::new();
+                loop {
+                    let event = peer.line();
+                    if event["event"] == "stopping" {
+                        return (seen, peer.next_line());
+                    }
+                    seen.push(event["message"].as_str().unwrap()[..6].to_owned());
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        })
+        .collect();
+    let mut greeted: Vec<Peer> = (0..MAX_CONNECTIONS - READERS - 1)
+        .map(|_| Peer::greeted(&path))
+        .collect();
+    assert_eq!(board.snapshot().subscribers, READERS + 1);
+
+    // On until the stalled one is dropped, however much its socket buffers hold. Each batch
+    // waits until the readers have read every event so far, so only the stalled one can fall
+    // behind.
+    let mut emitted = 0;
+    while board.snapshot().subscribers == READERS + 1 {
+        assert!(
+            emitted < 16 * QUEUE,
+            "the stalled subscriber was never dropped"
+        );
+        for _ in 0..BATCH {
+            server.hub().emit(&burst_event(emitted));
+            emitted += 1;
+        }
+        wait_until("the readers to read the batch", || {
+            read.iter().all(|c| c.load(Ordering::SeqCst) == emitted)
+        });
+    }
+
+    server.hub().emit(&DaemonEvent::Stopping {
+        reason: StopReason::Signal,
+    });
+    let took = within("shutdown", move || {
+        let started = Instant::now();
+        server.shutdown();
+        started.elapsed()
+    });
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    let want: Vec<String> = (0..emitted).map(|n| format!("{n:06}")).collect();
+    for reader in readers {
+        let (seen, after) = reader.join().unwrap();
+        assert_eq!(seen, want);
+        assert!(after.is_none(), "{after:?} after `stopping`");
+    }
+    for peer in &mut greeted {
+        assert!(peer.rest().is_empty());
+    }
+    assert!(stalled.rest().len() < emitted);
+    assert_eq!(board.snapshot().subscribers, 0);
 }

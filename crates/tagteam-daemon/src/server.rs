@@ -2,14 +2,17 @@
 //! serves protocol 1 to at most sixteen connections of this user: the greeting, `status` from
 //! the board, and every event to the subscribers (D5.2–D5.5). One thread accepts, and each
 //! connection has a thread that reads its requests and writes its replies and events
-//! (Decision 2). The scheduler only hands events to the hub, which never waits on a client
-//! (D4). The hub closes the socket when `stopping` passes through it, while the daemon still
-//! holds `daemon.lock` (D4.6, Decision 9).
+//! (Decision 2). The threads block in `poll` on their descriptors and wake pipes (H8, which
+//! supersedes Decision 2's 100 ms read): the accept thread on the listener and the hub's pipe,
+//! a connection on its socket, the server-stop pipe and, once subscribed, its own pipe, which
+//! the hub writes for each event it queues. The scheduler only hands events to the hub, which
+//! never waits on a client (D4). The hub closes the socket when `stopping` passes through it,
+//! while the daemon still holds `daemon.lock` (D4.6, Decision 9).
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, PipeReader, PipeWriter, Read, Write};
 use std::net::Shutdown;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -45,9 +48,9 @@ pub const IDLE: Duration = Duration::from_secs(30);
 /// reading, and its connection is closed, so `shutdown` never waits on it for longer.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Decision 2: how long a connection's read waits before it looks at its queue again. D4.6:
-/// how long the accept thread waits before it looks at the cancel token again.
-const POLL: Duration = Duration::from_millis(100);
+/// How long the accept thread waits after a failed poll or accept before it tries again: a
+/// listener with a connection it cannot accept stays readable, so an unbounded poll would spin.
+const RETRY: Duration = Duration::from_millis(100);
 
 /// The umask is the process's: binds in one process take turns, so one never puts back a mask
 /// another narrowed.
@@ -58,7 +61,7 @@ static UMASK: Mutex<()> = Mutex::new(());
 pub struct Limits {
     /// D5.2's idle timeout, before a subscribe.
     pub idle: Duration,
-    /// How long one write to a client may block (`WRITE_TIMEOUT`).
+    /// How long a write to a client waits for room in its socket (`WRITE_TIMEOUT`).
     pub write_timeout: Duration,
 }
 
@@ -99,6 +102,8 @@ struct Shared {
     limits: Limits,
     /// Set by `shutdown`: each connection writes what it holds, then closes.
     stop: AtomicBool,
+    /// Written once `stop` is set, and never drained, so every connection's `poll` wakes.
+    stop_wake: Wake,
     /// Connections being served, for D5.1's limit.
     open: AtomicUsize,
     /// The connection threads; finished ones are let go at each accept.
@@ -128,17 +133,21 @@ impl Server {
         if path.as_os_str().as_bytes().len() > MAX_SOCKET_PATH {
             return Err(BindError::TooLong(path.to_path_buf()));
         }
+        // Made before the bind, so a failure leaves no socket file.
+        let stop_wake = Wake::new()?;
+        let closed_wake = Wake::new()?;
         let listener = bind_private(path)?;
         let bound = identity(path).map(|identity| Bound {
             path: path.to_path_buf(),
             identity,
         });
         let shared = Arc::new(Shared {
-            hub: Hub::new(Arc::clone(&board), bound),
+            hub: Hub::new(Arc::clone(&board), bound, closed_wake),
             board,
             home: home.to_path_buf(),
             limits,
             stop: AtomicBool::new(false),
+            stop_wake,
             open: AtomicUsize::new(0),
             threads: Mutex::new(Vec::new()),
         });
@@ -175,6 +184,7 @@ impl Server {
 
     fn close(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
+        self.shared.stop_wake.wake();
         self.shared.hub.close_socket();
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
@@ -224,21 +234,27 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
     fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
-/// D5.1, D4.6: accepts until a signal, `stopping` or `shutdown`, looking at each every `POLL`.
-/// Returning drops the listener, so a later connect is refused at once: a client finds no
-/// daemon, never one that does not greet (Review Focus 1).
+/// D5.1, D4.6, H8: accepts until `stopping` or `shutdown` wakes it through the hub's pipe, or
+/// until its first wake after a signal: a connection, which it admits, or `stopping`, which the
+/// scheduler emits within its 1 s slice. Returning drops the listener, so a later connect is
+/// refused at once: a client finds no daemon, never one that does not greet (Review Focus 1).
 fn accept_loop(listener: UnixListener, shared: &Arc<Shared>, cancel: &Cancel) {
     while !shared.stop.load(Ordering::SeqCst)
         && shared.hub.accepting()
         && cancel.requested().is_none()
     {
-        match pending(&listener, POLL) {
-            Ok(true) => accept_pending(&listener, shared),
-            Ok(false) => {}
+        let mut fds = [
+            pollfd(listener.as_raw_fd(), libc::POLLIN),
+            pollfd(shared.hub.closed_wake.fd(), libc::POLLIN),
+        ];
+        match poll(&mut fds, None) {
+            Ok(_) if ready(&fds[1]) => {}
+            Ok(_) if ready(&fds[0]) => accept_pending(&listener, shared),
+            Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => {
                 tracing::debug!(error = %e, "the socket could not be polled");
-                thread::sleep(POLL);
+                thread::sleep(RETRY);
             }
         }
     }
@@ -254,28 +270,91 @@ fn accept_pending(listener: &UnixListener, shared: &Arc<Shared>) {
             Err(e) => {
                 // Out of descriptors, say: the next poll tries again.
                 tracing::debug!(error = %e, "a connection could not be accepted");
-                thread::sleep(POLL);
+                thread::sleep(RETRY);
                 return;
             }
         }
     }
 }
 
-/// Whether a connection waits on `listener`, after at most `timeout`.
-fn pending(listener: &UnixListener, timeout: Duration) -> io::Result<bool> {
-    let mut fd = libc::pollfd {
-        fd: listener.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
-    // SAFETY: `fd` is one writable `pollfd`, and its descriptor stays open while `listener`
-    // lives.
-    match unsafe { libc::poll(&mut fd, 1, ms) } {
-        -1 => Err(io::Error::last_os_error()),
-        0 => Ok(false),
-        _ => Ok(true),
+/// H8: a pipe that wakes a thread waiting in `poll` on its read end. Both ends are
+/// non-blocking and close-on-exec. Each subscriber has one, beside the server's two latches
+/// (the stop and the hub's close): two descriptors each, so at most 36 for the pipes.
+struct Wake {
+    read: PipeReader,
+    write: PipeWriter,
+}
+
+impl Wake {
+    fn new() -> io::Result<Wake> {
+        let (read, write) = io::pipe()?;
+        set_nonblocking(read.as_fd())?;
+        set_nonblocking(write.as_fd())?;
+        Ok(Wake { read, write })
     }
+
+    /// One byte. A full pipe is ignored, as is any error: its reader is already due to wake.
+    fn wake(&self) {
+        let _ = (&self.write).write(&[1]);
+    }
+
+    /// Takes every byte waiting, so the next `poll` waits for the next `wake`.
+    fn drain(&self) {
+        let mut bytes = [0u8; 64];
+        while let Ok(1..) = (&self.read).read(&mut bytes) {}
+    }
+
+    /// The read end, which `poll` watches.
+    fn fd(&self) -> RawFd {
+        self.read.as_raw_fd()
+    }
+}
+
+fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let fd = fd.as_raw_fd();
+    // SAFETY: fcntl(2) with F_GETFL and F_SETFL only reads and sets the status flags of a
+    // descriptor that `fd` keeps open.
+    let rc = unsafe {
+        match libc::fcntl(fd, libc::F_GETFL) {
+            -1 => -1,
+            flags => libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK),
+        }
+    };
+    if rc == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// `fd` watched for `events`. A negative `fd` is ignored by `poll`.
+fn pollfd(fd: RawFd, events: libc::c_short) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    }
+}
+
+/// poll(2) on `fds`: how many are ready. `None` waits with no bound; a timeout is rounded up
+/// to a whole millisecond, so a wait never spins. `EINTR` is `ErrorKind::Interrupted`.
+fn poll(fds: &mut [libc::pollfd], timeout: Option<Duration>) -> io::Result<usize> {
+    let ms = timeout.map_or(-1, |t| {
+        libc::c_int::try_from(t.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX)
+    });
+    let len = libc::nfds_t::try_from(fds.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
+    // SAFETY: `fds` is a writable slice of `pollfd`s, and the callers keep each descriptor in
+    // it open for the call; a negative one is ignored.
+    match unsafe { libc::poll(fds.as_mut_ptr(), len, ms) } {
+        -1 => Err(io::Error::last_os_error()),
+        n => Ok(usize::try_from(n).unwrap_or(0)),
+    }
+}
+
+/// Whether `poll` found `fd` readable, or at its end, or in error: each makes the next read
+/// return at once.
+fn ready(fd: &libc::pollfd) -> bool {
+    fd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
 /// D5.1, Decision 3: another user's connection, and one past the limit, are closed before the
@@ -385,6 +464,8 @@ pub struct Hub {
     file: Mutex<Option<Bound>>,
     /// Set by `close_socket`: the accept thread returns, dropping the listener.
     closed: AtomicBool,
+    /// Written once `closed` is set, and never drained, so the accept thread's `poll` wakes.
+    closed_wake: Wake,
 }
 
 /// The socket file `bind` created: its path, and its device and inode then.
@@ -398,16 +479,19 @@ struct Subscriber {
     queue: SyncSender<Arc<str>>,
     /// Its connection's socket, shut down when the hub drops the subscriber.
     socket: UnixStream,
+    /// Written after each event queued, so its connection's `poll` wakes to write it.
+    wake: Arc<Wake>,
 }
 
 impl Hub {
-    fn new(board: Arc<StatusBoard>, file: Option<Bound>) -> Self {
+    fn new(board: Arc<StatusBoard>, file: Option<Bound>, closed_wake: Wake) -> Self {
         Self {
             board,
             subscribers: Mutex::new(Vec::new()),
             next: AtomicU64::new(0),
             file: Mutex::new(file),
             closed: AtomicBool::new(false),
+            closed_wake,
         }
     }
 
@@ -423,6 +507,7 @@ impl Hub {
     /// first call removes anything.
     fn close_socket(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        self.closed_wake.wake();
         let Some(bound) = lock(&self.file).take() else {
             return;
         };
@@ -447,7 +532,10 @@ impl Hub {
         let line: Arc<str> = format!("{}\n", daemon_event_json(e, now_s)).into();
         let before = subscribers.len();
         subscribers.retain(|s| match s.queue.try_send(Arc::clone(&line)) {
-            Ok(()) => true,
+            Ok(()) => {
+                s.wake.wake();
+                true
+            }
             Err(TrySendError::Full(_)) => {
                 tracing::debug!(
                     queue = QUEUE,
@@ -463,12 +551,18 @@ impl Hub {
         }
     }
 
-    /// A new subscriber on `socket`'s connection: the id `unsubscribe` takes, and its queue.
-    fn subscribe(&self, socket: UnixStream) -> (u64, Receiver<Arc<str>>) {
+    /// A new subscriber on `socket`'s connection, woken through `wake`: the id `unsubscribe`
+    /// takes, and its queue.
+    fn subscribe(&self, socket: UnixStream, wake: Arc<Wake>) -> (u64, Receiver<Arc<str>>) {
         let (queue, events) = sync_channel(QUEUE);
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let mut subscribers = lock(&self.subscribers);
-        subscribers.push(Subscriber { id, queue, socket });
+        subscribers.push(Subscriber {
+            id,
+            queue,
+            socket,
+            wake,
+        });
         self.board.set_subscribers(subscribers.len());
         (id, events)
     }
@@ -513,17 +607,17 @@ struct Connection<'s> {
     pending: Vec<u8>,
     /// When the client last sent anything (D5.2's idle timeout).
     heard: Instant,
-    /// Its id at the hub and its queue, once it has subscribed.
-    subscription: Option<(u64, Receiver<Arc<str>>)>,
+    /// Its id at the hub, its queue and the pipe the hub wakes it through, once it has
+    /// subscribed.
+    subscription: Option<(u64, Receiver<Arc<str>>, Arc<Wake>)>,
 }
 
 impl<'s> Connection<'s> {
     fn new(stream: UnixStream, shared: &'s Shared) -> io::Result<Self> {
-        // On macOS an accepted socket inherits the listener's O_NONBLOCK; the timeouts below
-        // need a blocking one.
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(POLL))?;
-        stream.set_write_timeout(Some(shared.limits.write_timeout))?;
+        // The socket is non-blocking (on macOS an accepted one inherits the listener's
+        // O_NONBLOCK, on Linux not), so the thread waits only in `poll`: a read finds what
+        // `poll` saw or nothing, and a write waits there for room (H8).
+        stream.set_nonblocking(true)?;
         Ok(Self {
             shared,
             stream,
@@ -552,8 +646,34 @@ impl<'s> Connection<'s> {
             if stopping {
                 return "the daemon stopped";
             }
-            if self.subscription.is_none() && self.heard.elapsed() >= self.shared.limits.idle {
-                return "it was idle";
+            // D5.2's idle timeout bounds the wait before a subscribe; after it, nothing does.
+            let timeout = if self.subscription.is_some() {
+                None
+            } else {
+                let left = self.shared.limits.idle.saturating_sub(self.heard.elapsed());
+                if left.is_zero() {
+                    return "it was idle";
+                }
+                Some(left)
+            };
+            let wake = self.subscription.as_ref().map(|(_, _, wake)| wake);
+            let mut fds = [
+                pollfd(self.stream.as_raw_fd(), libc::POLLIN),
+                pollfd(self.shared.stop_wake.fd(), libc::POLLIN),
+                pollfd(wake.map_or(-1, |wake| wake.fd()), libc::POLLIN),
+            ];
+            match poll(&mut fds, timeout) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return "its socket could not be polled",
+            }
+            // Drained before the next `flush`, so an event queued after this leaves a byte for
+            // the next `poll`, and no wake is lost.
+            if let Some(wake) = wake.filter(|_| ready(&fds[2])) {
+                wake.drain();
+            }
+            if !ready(&fds[0]) {
+                continue;
             }
             match self.stream.read(&mut chunk) {
                 Ok(0) => return "the client closed it",
@@ -567,9 +687,7 @@ impl<'s> Connection<'s> {
                 Err(e)
                     if matches!(
                         e.kind(),
-                        io::ErrorKind::WouldBlock
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::Interrupted
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) => {}
                 Err(_) => return "a read failed",
             }
@@ -604,7 +722,9 @@ impl<'s> Connection<'s> {
                     .stream
                     .try_clone()
                     .map_err(|_| "its socket could not be shared with the hub")?;
-                self.subscription = Some(self.shared.hub.subscribe(socket));
+                let wake = Arc::new(Wake::new().map_err(|_| "its wake pipe could not be made")?);
+                let (id, events) = self.shared.hub.subscribe(socket, Arc::clone(&wake));
+                self.subscription = Some((id, events, wake));
                 // D5.5: the `ok` comes before any event, so it goes ahead of the new queue.
                 self.send(&ok_json(&r.id, json!({})))
                     .map_err(|_| "a reply could not be written")
@@ -620,9 +740,9 @@ impl<'s> Connection<'s> {
 
     /// Writes every event queued for this subscriber.
     fn flush(&self) -> io::Result<()> {
-        if let Some((_, queue)) = &self.subscription {
+        if let Some((_, queue, _)) = &self.subscription {
             while let Ok(line) = queue.try_recv() {
-                (&self.stream).write_all(line.as_bytes())?;
+                self.write_all(line.as_bytes())?;
             }
         }
         Ok(())
@@ -632,13 +752,42 @@ impl<'s> Connection<'s> {
     fn send(&self, v: &Value) -> io::Result<()> {
         let mut line = v.to_string();
         line.push('\n');
-        (&self.stream).write_all(line.as_bytes())
+        self.write_all(line.as_bytes())
+    }
+
+    /// `bytes`, whole. Whenever the socket has no room, the write waits in `poll` for at most
+    /// the write timeout from then: `TimedOut` after it. It never waits on the stop pipe, so a
+    /// connection writes what it holds before it closes (Decision 9). A subscriber the hub
+    /// dropped ends sooner: the hub's shutdown of its socket wakes the `poll`, and the write
+    /// then fails.
+    fn write_all(&self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            match (&self.stream).write(bytes) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => bytes = &bytes[n..],
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let (started, timeout) = (Instant::now(), self.shared.limits.write_timeout);
+                    loop {
+                        let mut fds = [pollfd(self.stream.as_raw_fd(), libc::POLLOUT)];
+                        match poll(&mut fds, Some(timeout.saturating_sub(started.elapsed()))) {
+                            Ok(0) => return Err(io::ErrorKind::TimedOut.into()),
+                            Ok(_) => break,
+                            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for Connection<'_> {
     fn drop(&mut self) {
-        if let Some((id, _)) = self.subscription.take() {
+        if let Some((id, _, _)) = self.subscription.take() {
             self.shared.hub.unsubscribe(id);
         }
         let _ = self.stream.shutdown(Shutdown::Both);
