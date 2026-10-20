@@ -471,6 +471,55 @@ mod hooked {
     }
 
     #[test]
+    fn a_failed_write_ahead_is_logged_only_after_the_vault_write() {
+        // §7.3 step 6: while the write-ahead has failed, the successor is only in memory, so
+        // nothing, its WARN included, comes before the vault write; whether the vault then
+        // takes it or not, the WARN follows, once.
+        for vault_fails in [false, true] {
+            let fx = Fx::new();
+            let a = due(&fx);
+            let snapshot = fx.vault_bytes(&a).unwrap();
+            fx.script_refresh(Some("rt-a2"));
+            fx.engine.on_point(
+                "gate-before-vault-write",
+                Box::new(|| tracing::info!("marker: the vault write starts")),
+            );
+            block_rescue(&fx);
+            fx.kc.set_fail_write(SERVICE, vault_fails);
+            let (out, logs) = capture_logs(|| refresh(&fx, &a, &snapshot));
+            fx.kc.set_fail_write(SERVICE, false);
+            unblock_rescue(&fx);
+            let lines = |text: &str| -> Vec<usize> {
+                logs.iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.contains(text))
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            let (marker, warn) = (
+                lines("marker: the vault write starts"),
+                lines("could not write a refreshed token ahead to rescue/"),
+            );
+            assert_eq!(
+                (marker.len(), warn.len()),
+                (1, 1),
+                "{vault_fails}: {logs:#?}"
+            );
+            assert!(marker[0] < warn[0], "{vault_fails}: {logs:#?}");
+            assert!(
+                logs[warn[0]].contains("WARN"),
+                "{vault_fails}: {}",
+                logs[warn[0]]
+            );
+            if vault_fails {
+                assert!(matches!(out, GateOutcome::Unpersisted), "{out:?}");
+            } else {
+                assert!(matches!(out, GateOutcome::Refreshed(_)), "{out:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_foreign_successor_is_never_written_ahead() {
         let fx = Fx::new();
         let a = due(&fx);

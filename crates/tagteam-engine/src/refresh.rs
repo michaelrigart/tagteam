@@ -141,15 +141,20 @@ pub(crate) struct Received<'e> {
     /// The envelope written ahead of the vault write (H6); `None` for a foreign successor, and
     /// when the write-ahead failed.
     ahead: Option<PathBuf>,
+    /// The `kind()` of the write-ahead's error, logged only once the successor is in the vault
+    /// (`landed`) or `keep` has tried to write it: until then it is only in memory, and
+    /// nothing, a log write included, may come first (§7.3 step 6).
+    ahead_failed: Option<&'static str>,
     armed: bool,
 }
 
 impl<'e> Received<'e> {
     /// Arms the guard and, for an own successor, writes it ahead to `rescue/` (H6), best
-    /// effort: a failure is logged and changes nothing else. Build it the moment the response
-    /// is parsed, before any fallible step. `foreign` is the response's owner when
-    /// `names_another_account` says it is not this account; it is fixed here, so no later path
-    /// can store the successor as this account's, and nothing is written ahead for it.
+    /// effort: a failure changes nothing else, and is logged only once the successor is in the
+    /// vault (`landed`) or `keep` has run. Build it the moment the response is parsed, before
+    /// any fallible step. `foreign` is the response's owner when `names_another_account` says
+    /// it is not this account; it is fixed here, so no later path can store the successor as
+    /// this account's, and nothing is written ahead for it.
     pub(crate) fn new(
         engine: &'e Engine,
         p: &'e dyn Provider,
@@ -161,30 +166,24 @@ impl<'e> Received<'e> {
         let fp = p
             .fingerprint(&bytes)
             .unwrap_or_else(|| Fingerprint::of_secret(&bytes));
-        // Write first, then log (§7.3 step 6): nothing between receiving the successor and
-        // having it on disk may block, a log write included.
+        // §7.3 step 6: nothing between receiving the successor and having it on disk may
+        // block, a log write included. A written-ahead envelope is on disk, so its DEBUG line
+        // follows at once. A failed write-ahead leaves the successor only in memory until the
+        // vault takes it or `keep` writes it, so its WARN waits for `landed` or `keep`.
         let written = foreign
             .is_none()
             .then(|| engine.write_rescue(p, &row.id, row.login_epoch, predecessor_fp, &bytes, &fp));
-        let ahead = match written {
-            None => None,
+        let (ahead, ahead_failed) = match written {
+            None => (None, None),
             Some(Ok(path)) => {
                 tracing::debug!(
                     account = %row.id,
                     fp = %fp.short12(),
                     "wrote a refreshed token ahead to rescue/ until the vault takes it"
                 );
-                Some(path)
+                (Some(path), None)
             }
-            Some(Err(e)) => {
-                tracing::warn!(
-                    position = row.position,
-                    account = %row.id,
-                    kind = e.kind(),
-                    "could not write a refreshed token ahead to rescue/; the vault write goes on without it"
-                );
-                None
-            }
+            Some(Err(e)) => (None, Some(e.kind())),
         };
         Self {
             engine,
@@ -195,6 +194,7 @@ impl<'e> Received<'e> {
             fp,
             foreign,
             ahead,
+            ahead_failed,
             armed: true,
         }
     }
@@ -206,40 +206,47 @@ impl<'e> Received<'e> {
 
     /// One attempt to keep the successor outside the vault: `rescue/`, or `displaced/` when it
     /// belongs to another account (§7.3 step 6). The envelope written ahead is the rescue, so
-    /// `rescue/` is written here only when the write-ahead failed (H6). It disarms whatever the
-    /// result, so `Drop` never repeats it.
+    /// `rescue/` is written here only when the write-ahead failed (H6); that failure is logged
+    /// after this write, whatever its result. It disarms whatever the result, so `Drop` never
+    /// repeats it.
     pub(crate) fn keep(&mut self) -> Result<(), EngineError> {
         self.armed = false;
-        match &self.foreign {
-            Some(owner) => self
+        if let Some(owner) = &self.foreign {
+            return self
                 .engine
-                .keep_foreign(&self.row, &self.bytes, Some(&self.fp), owner),
-            None => {
-                if self.ahead.is_none() {
-                    self.engine.write_rescue(
-                        self.provider,
-                        &self.row.id,
-                        self.row.login_epoch,
-                        &self.predecessor_fp,
-                        &self.bytes,
-                        &self.fp,
-                    )?;
-                }
-                tracing::info!(
-                    account = %self.row.id,
-                    fp = %self.fp.short12(),
-                    "kept a refreshed token in rescue/ until the vault takes it"
-                );
-                Ok(())
-            }
+                .keep_foreign(&self.row, &self.bytes, Some(&self.fp), owner);
         }
+        let kept = match self.ahead {
+            Some(_) => Ok(()),
+            None => self
+                .engine
+                .write_rescue(
+                    self.provider,
+                    &self.row.id,
+                    self.row.login_epoch,
+                    &self.predecessor_fp,
+                    &self.bytes,
+                    &self.fp,
+                )
+                .map(drop),
+        };
+        self.log_failed_write_ahead();
+        if kept.is_ok() {
+            tracing::info!(
+                account = %self.row.id,
+                fp = %self.fp.short12(),
+                "kept a refreshed token in rescue/ until the vault takes it"
+            );
+        }
+        kept
     }
 
-    /// The vault took the successor: disarms, and deletes the envelope written ahead, best
-    /// effort. One left behind is harmless: the vault holds its generation, so the landed rule
-    /// deletes it on the account's next settle (H6).
+    /// The vault took the successor: disarms, logs a failed write-ahead, and deletes the
+    /// envelope written ahead, best effort. One left behind is harmless: the vault holds its
+    /// generation, so the landed rule deletes it on the account's next settle (H6).
     fn landed(&mut self) {
         self.armed = false;
+        self.log_failed_write_ahead();
         let Some(path) = self.ahead.take() else {
             return;
         };
@@ -249,6 +256,19 @@ impl<'e> Received<'e> {
                 account = %self.row.id,
                 kind = e.kind(),
                 "a rescue written ahead could not be deleted after the vault took its token"
+            );
+        }
+    }
+
+    /// The WARN for a failed write-ahead, at most once. Only `landed` and `keep` call it, after
+    /// the successor reached the vault or `keep`'s own write was tried (§7.3 step 6).
+    fn log_failed_write_ahead(&mut self) {
+        if let Some(kind) = self.ahead_failed.take() {
+            tracing::warn!(
+                position = self.row.position,
+                account = %self.row.id,
+                kind,
+                "could not write a refreshed token ahead to rescue/; the vault write goes on without it"
             );
         }
     }
