@@ -9,8 +9,9 @@ use serde_json::{Value, json};
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{CcPaths, ItemKind, config, keychain_account, keychain_service};
 use tagteam_provider::{
-    Env, FakeKeychain, Keychain, KeychainError, LiveLockSet, LiveLocks, LockError, LockState,
-    MutationGuard, Provenance, ProviderError, Read, SecretStore, Undo,
+    Cancel, Env, FakeKeychain, Keychain, KeychainError, LiveLockSet, LiveLocks, LockError,
+    LockState, MutationGuard, Provenance, ProviderError, Read, ReadError, SecretStore, Undo,
+    cancel,
 };
 
 /// A fallback hook for a test that saves nothing: every entry a fallback reports goes.
@@ -2449,4 +2450,106 @@ fn a_restore_puts_each_place_back_byte_for_byte() {
         fs::read(&f.paths.credentials_file).unwrap(),
         cc_login("rt-0", "file")
     );
+}
+
+/// Secret reads that fail as a timeout does (not locked) `fails` times, then answer `bytes`;
+/// the first read sets `token`, when there is one. Only `find` is ever called.
+struct Flaky {
+    fails: usize,
+    bytes: Vec<u8>,
+    token: Option<Cancel>,
+    finds: AtomicUsize,
+}
+
+impl Flaky {
+    fn new(fails: usize, bytes: &[u8], token: Option<Cancel>) -> Self {
+        Self {
+            fails,
+            bytes: bytes.to_vec(),
+            token,
+            finds: AtomicUsize::new(0),
+        }
+    }
+    fn finds(&self) -> usize {
+        self.finds.load(Ordering::SeqCst)
+    }
+}
+
+impl Keychain for Flaky {
+    fn find(&self, _s: &str, _a: &str) -> Read<Vec<u8>> {
+        let n = self.finds.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            if let Some(t) = &self.token {
+                t.request(15);
+            }
+        }
+        if n < self.fails {
+            Read::Unreadable(ReadError::new(
+                "keychain",
+                "security did not finish in time",
+            ))
+        } else {
+            Read::Present(self.bytes.clone())
+        }
+    }
+    fn exists(&self, _s: &str, _a: &str) -> Read<()> {
+        unreachable!()
+    }
+    fn upsert(&self, _s: &str, _a: &str, _d: &[u8]) -> Result<(), KeychainError> {
+        unreachable!()
+    }
+    fn delete(&self, _s: &str, _a: &str) -> Result<(), KeychainError> {
+        unreachable!()
+    }
+    fn lock_state(&self) -> LockState {
+        unreachable!()
+    }
+    fn unlock(&self) -> bool {
+        unreachable!()
+    }
+}
+
+#[test]
+fn a_locked_keychain_read_is_not_retried() {
+    // H4, A.3: rc 36 will not change within 600 ms; the daemon's KeychainBackoff waits instead.
+    let f = fx();
+    f.kc.set_locked(true);
+    let r = store(&f, Platform::MacOs).read_credential(&f.env, &f.paths);
+    assert!(matches!(r, Read::Unreadable(e) if e.is_locked()));
+    assert_eq!(
+        f.kc.read_counts().unwrap().tally().locked,
+        1,
+        "one read, no retry"
+    );
+}
+
+#[test]
+fn any_other_unreadable_read_is_still_retried_twice() {
+    let f = fx();
+    let kc = Arc::new(Flaky::new(2, br#"{"claudeAiOauth":{}}"#, None));
+    let s = LiveStore::new(kc.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
+    assert!(s.read_credential(&f.env, &f.paths).is_present());
+    assert_eq!(kc.finds(), 3);
+}
+
+#[test]
+fn a_token_set_inside_the_scope_ends_the_retries_and_no_file_covers_the_read() {
+    // H4: inside usage collection's scope, a set token stops the read between attempts, and an
+    // interrupted read is never `Degraded` from the credentials file.
+    let f = fx();
+    fs::write(
+        &f.paths.credentials_file,
+        br#"{"claudeAiOauth":{"refreshToken":"file"}}"#,
+    )
+    .unwrap();
+    let token = Cancel::new();
+    let kc = Arc::new(Flaky::new(3, b"unused", Some(token.clone())));
+    let s = LiveStore::new(kc.clone(), Platform::MacOs).with_retry_delay(Duration::ZERO);
+    let _scope = cancel::interruptible(&token);
+    let r = s.read_credential(&f.env, &f.paths);
+    assert!(
+        matches!(&r, Read::Unreadable(e) if e.interruption() == Some(15)),
+        "{r:?}"
+    );
+    assert_eq!(kc.finds(), 1);
 }

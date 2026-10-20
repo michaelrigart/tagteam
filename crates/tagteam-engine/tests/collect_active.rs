@@ -617,6 +617,7 @@ mod hooks {
     use std::time::{Instant, SystemTime};
 
     use super::*;
+    use tagteam_provider::Keychain;
 
     #[test]
     fn a_live_login_that_moves_during_active_refresh_records_nothing_and_gives_the_slot_back() {
@@ -785,6 +786,58 @@ mod hooks {
             ),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn a_live_read_the_signal_interrupts_records_nothing_and_no_file_covers_it() {
+        // Review Focus 5: the live credential's read is a cancellation point; the credentials file,
+        // which would make it a `Degraded` read and a `keychain-unavailable` failure, is not read.
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        fs::write(fx.paths().credentials_file, credential("a@x.co", "rt-a")).unwrap();
+        fx.script_usage(200, usage_fixture());
+        let reads = fx.kc.read_counts().unwrap().tally();
+        signal_at(&fx.engine, "usage-live-identity-read");
+
+        assert_interrupted(&fx.engine, &a);
+
+        assert_eq!(
+            fx.kc.read_counts().unwrap().tally().since(reads).answered,
+            0
+        );
+        assert_eq!(fx.usage_state(&a), None, "nothing is recorded");
+        assert!(fx.http.requests().is_empty());
+        assert_eq!(usage_requests(&fx), 0, "the slot went back");
+    }
+
+    #[test]
+    fn a_signal_inside_active_token_refresh_never_interrupts_its_keychain_reads() {
+        // Review Focus 5, §14.1: §7.5 is a critical span. Its reads run outside the scope; only
+        // the live read after it is a cancellation point.
+        let fx = Fx::new();
+        let a = fx.add("a@x.co", "rt-a");
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        fx.script_usage(200, usage_fixture());
+        signal_at(&fx.engine, "active-after-response");
+
+        assert_interrupted(&fx.engine, &a);
+
+        assert_eq!(
+            fx.live_refresh_token().as_deref(),
+            Some("rt-a2"),
+            "published"
+        );
+        assert_eq!(
+            fx.vault_refresh_token(&a).as_deref(),
+            Some("rt-a2"),
+            "stored"
+        );
+        assert_eq!(common::rescue_files(&fx), 0, "never diverted to rescue/");
+        assert_eq!(quarantine_of(&fx, &a), (None, None));
+        assert_eq!(methods(&fx), [Method::Post], "no usage request");
+        assert_eq!(fx.usage_state(&a), None);
+        assert_eq!(usage_requests(&fx), 0);
     }
 
     #[test]

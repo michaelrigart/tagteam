@@ -18,7 +18,7 @@ use tagteam_core::usage::{earliest_relevant_reset, max_relevant_pct};
 use tagteam_core::{AccountId, PollBudget, PollInputs, PollPlan, ProviderId, Window};
 use tagteam_provider::profile::ProfileMarker;
 use tagteam_provider::provider::UsageResult;
-use tagteam_provider::{Credential, LockError, Provenance, Provider, Read, TransientKind};
+use tagteam_provider::{Credential, LockError, Provenance, Provider, Read, TransientKind, cancel};
 
 use crate::active::{ActiveOutcome, ActiveTrigger};
 use crate::engine::Engine;
@@ -863,10 +863,19 @@ impl Collection<'_> {
     /// The vault's token for an inactive account, refreshed through the gate first when it
     /// has expired or the server refused it. One that cannot be refreshed ends the fetch.
     fn stored_token(&mut self) -> Result<Vec<u8>, Stop> {
-        let bytes = match self.engine.vault.read(&self.row.id) {
+        let read = {
+            // H4, §14.1: a cancellation point. The gate below is not inside it.
+            let _scope = cancel::interruptible(self.engine.cancel());
+            self.engine.vault.read(&self.row.id)
+        };
+        let bytes = match read {
             Read::Present(b) if !b.is_empty() => b,
             Read::Present(_) | Read::Absent => return Err(failed("vault-absent")),
-            Read::Unreadable(_) => return Err(failed("keychain-unavailable")),
+            Read::Unreadable(e) => {
+                return Err(e
+                    .interruption()
+                    .map_or_else(|| failed("keychain-unavailable"), Stop::Interrupted));
+            }
         };
         if self.usable(&bytes) {
             return Ok(bytes);
@@ -931,6 +940,7 @@ impl Collection<'_> {
     /// identity, which both identity checks would pass. `guard_or_refuse`'s refusal becomes a
     /// warning, since nothing else on `list` says so: a retry when recovery could not take the
     /// provider's live locks, `--force` only for a row recovery could not decide.
+    /// The credential read is a cancellation point (H4, §14.1); the guard and §7.5 are not.
     /// Residual: a login changed by Claude Code itself, outside tagteam's lock, between the
     /// credential read and the second identity read (its credential written, its `oauthAccount`
     /// not yet) passes both checks and can misattribute that one reading.
@@ -953,7 +963,10 @@ impl Collection<'_> {
         };
         self.live_names_this_account()?;
         hooks::point(self.engine, "usage-live-identity-read")?;
-        let credential = self.p.read_live_auth(&self.engine.env).credential;
+        let credential = {
+            let _scope = cancel::interruptible(self.engine.cancel());
+            self.p.read_live_auth(&self.engine.env).credential
+        };
         self.live_names_this_account()?;
         drop(guard);
         match credential {
@@ -962,7 +975,9 @@ impl Collection<'_> {
             }
             Read::Present(c) if !c.is_empty() => Ok(c.bytes().to_vec()),
             Read::Present(_) | Read::Absent => Err(failed("no-access-token")),
-            Read::Unreadable(_) => Err(failed("keychain-unavailable")),
+            Read::Unreadable(e) => Err(e
+                .interruption()
+                .map_or_else(|| failed("keychain-unavailable"), Stop::Interrupted)),
         }
     }
 
