@@ -30,7 +30,7 @@ pub struct Cli {
     /// Disable colour
     #[arg(long = "no-color", global = true)]
     pub no_color: bool,
-    /// The agent CLI to act on (default: the default_provider setting, else claude-code)
+    /// The agent CLI to act on (default: the default_provider setting, else this build's first provider)
     #[arg(
         short = 'p',
         long,
@@ -75,7 +75,7 @@ pub enum Command {
         #[arg(long, requires = "strategy")]
         model: Option<String>,
     },
-    /// Store the current Claude Code login
+    /// Store the current live login
     Add {
         #[arg(long)]
         position: Option<u32>,
@@ -183,7 +183,7 @@ pub enum Command {
         #[arg(long)]
         csv: bool,
     },
-    /// Token use and API cost per account, from Claude Code's transcripts
+    /// Token use and API cost per account, from the agent's transcripts
     ///
     /// Reads new transcript lines into tagteam's index first (not with --no-refresh), then
     /// reports by day (the default), month, session or 5-hour block, a row per account unless
@@ -539,7 +539,7 @@ pub enum ConfigAction {
     List,
     /// One setting's value
     Get {
-        /// A setting, such as autoswitch.threshold or provider.claude-code.autoswitch.models
+        /// A setting, such as autoswitch.threshold or provider.<id>.autoswitch.models
         #[arg(value_parser = ConfigKeyParser, hide_possible_values = true)]
         key: String,
     },
@@ -571,7 +571,7 @@ pub enum DaemonAction {
     /// Install the service that runs the daemon at login, and start it
     ///
     /// macOS: a launchd agent in ~/Library/LaunchAgents. Linux: a systemd user unit. The unit
-    /// records this tagteam's path, and the variables that place its store, Claude Code's
+    /// records this tagteam's path, and the variables that place its store, each agent's
     /// home, a proxy and the log. Running it again replaces the unit and restarts the daemon.
     /// --json prints {schemaVersion, ok, service: {kind, path, label}, started, warnings}.
     Install {
@@ -903,6 +903,40 @@ mod tests {
     use tagteam_engine::tokens::TokenPeriod;
 
     use super::{BOOL_WORDS, Cli, Command, TokensPeriod};
+
+    #[test]
+    fn help_for_what_every_provider_does_names_no_provider() {
+        // The statusline and the shell wrapper are Claude Code's alone, so their help may name it.
+        fn texts(cmd: &clap::Command, out: &mut Vec<String>) {
+            if matches!(cmd.get_name(), "statusline" | "shell-init") {
+                return;
+            }
+            out.extend(
+                [cmd.get_about(), cmd.get_long_about()]
+                    .into_iter()
+                    .flatten()
+                    .map(|s| s.to_string()),
+            );
+            for a in cmd.get_arguments() {
+                out.extend(
+                    [a.get_help(), a.get_long_help()]
+                        .into_iter()
+                        .flatten()
+                        .map(|s| s.to_string()),
+                );
+            }
+            for s in cmd.get_subcommands() {
+                texts(s, out);
+            }
+        }
+        let mut all = Vec::new();
+        texts(&<Cli as clap::CommandFactory>::command(), &mut all);
+        let named: Vec<&String> = all
+            .iter()
+            .filter(|t| t.to_lowercase().contains("claude"))
+            .collect();
+        assert!(named.is_empty(), "{named:#?}");
+    }
 
     /// Every string of `a-z0-9`, up to `max` characters.
     fn words_up_to(max: usize) -> Vec<String> {
