@@ -6,6 +6,7 @@ pub mod doctor;
 pub mod env;
 pub mod flock;
 pub mod http;
+pub mod import;
 pub mod keychain;
 pub mod liveness;
 pub mod mkdir_lock;
@@ -56,6 +57,8 @@ pub use flock::{FlockGuard, LockProbe, MutationGuard, holders_of, probe_lock};
 pub use http::{Http, HttpError, HttpRequest, HttpResponse, Method, NoHttp};
 #[cfg(any(test, feature = "test-doubles"))]
 pub use http::{RecordedRequest, ScriptedHttp};
+pub use import::FormatError;
+pub use import::ImportRecord;
 #[cfg(any(test, feature = "test-doubles"))]
 pub use keychain::FakeKeychain;
 #[cfg(feature = "file-keychain")]
