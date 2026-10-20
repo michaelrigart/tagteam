@@ -13,7 +13,8 @@ pub struct AccountRef {
     pub position: u32,
 }
 
-/// `switch --strategy`'s values (core §9.3). Not `UsageStrategy::as_str`: that names `switch --json`'s.
+/// `switch --strategy`'s values (core §9.3). Not `UsageStrategy::as_str`: that names
+/// `switch --json`'s.
 fn strategy_arg(strategy: UsageStrategy) -> &'static str {
     match strategy {
         UsageStrategy::Best => "best",

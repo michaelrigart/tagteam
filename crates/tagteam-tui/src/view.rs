@@ -505,7 +505,6 @@ mod tests {
     use crate::overlay::{ConfirmThen, Overlay};
     use crate::state::BannerKind;
     use crate::testutil::*;
-    use crate::theme::Theme;
     use crate::update::update;
 
     #[test]

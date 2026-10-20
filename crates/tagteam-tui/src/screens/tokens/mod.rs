@@ -76,7 +76,8 @@ struct Level {
     offset: usize,
     /// The report's column widths, found when it is first drawn.
     widths: table::Widths,
-    /// The report's table lines, laid out again once a second at most while a block is active.
+    /// The report's table lines, kept while the width, the row count and the active blocks'
+    /// clocks stay the same.
     layout: table::Layout,
 }
 

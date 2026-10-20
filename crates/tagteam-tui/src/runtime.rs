@@ -2294,9 +2294,10 @@ mod tests {
         let status: StatusFetch = Arc::new(move || {
             if counted.fetch_add(1, Ordering::SeqCst) == 1 {
                 let _ = failing.lock().unwrap().recv();
-                return Err(StatusError::Client(ClientError::Protocol(
-                    "the daemon closed the connection".into(),
-                )));
+                return Err(StatusError::Client(ClientError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the daemon closed the connection",
+                ))));
             }
             Ok(crate::testutil::daemon_status(
                 vec![crate::testutil::daemon_job("claude-code", "auto", true)],
