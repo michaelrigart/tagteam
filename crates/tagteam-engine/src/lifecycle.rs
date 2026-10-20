@@ -186,6 +186,25 @@ pub(crate) struct LoginSource {
     pub(crate) added_at: Option<i64>,
 }
 
+/// What `prepare` validates: the identity being added and where it should land.
+struct AddRequest<'a> {
+    identity: &'a Identity,
+    claimed_uuid: Option<&'a str>,
+    position: Option<u32>,
+    alias: Option<&'a str>,
+    yes: bool,
+}
+
+/// What `commit_login` writes: the login and where it should land.
+pub(crate) struct LoginWrite<'a> {
+    pub(crate) identity: &'a Identity,
+    pub(crate) kind: &'a str,
+    pub(crate) secret: &'a [u8],
+    pub(crate) position: Option<u32>,
+    pub(crate) alias: Option<&'a str>,
+    pub(crate) source: LoginSource,
+}
+
 /// The Keychain item `remove_profile` names for a profile directory (see `Engine::profile_item`).
 enum ProfileItem {
     /// The spelling its trusted marker records.
@@ -582,18 +601,20 @@ impl Engine {
 
     /// Pure validation, no mutation: which account is written, which occupant it would
     /// replace, and whether that is allowed.
-    #[allow(clippy::too_many_arguments)]
     fn prepare(
         &self,
         store: &Store,
         p: &dyn Provider,
         provider: &ProviderId,
-        identity: &Identity,
-        claimed_uuid: Option<&str>,
-        position: Option<u32>,
-        alias: Option<&str>,
-        yes: bool,
+        req: &AddRequest<'_>,
     ) -> Result<Prepared, EngineError> {
+        let AddRequest {
+            identity,
+            claimed_uuid,
+            position,
+            alias,
+            yes,
+        } = *req;
         let existing = store.find_by_identity_key(provider, p.identity_key(identity).as_str())?;
         check_identity_conflict(existing.as_ref(), claimed_uuid, &identity.label)?;
         let mut occupant = None;
@@ -642,7 +663,6 @@ impl Engine {
     /// Writes the login under the locks `prep` names. The replacement is persisted before the
     /// occupant it displaces is removed, so a failure never loses the occupant. `source` is the
     /// evidence a replacement records for the default home (§12.5).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_login(
         &self,
         store: &Store,
@@ -650,13 +670,16 @@ impl Engine {
         provider: &ProviderId,
         prep: &Prepared,
         locks: &[AccountLock],
-        identity: &Identity,
-        kind: &str,
-        secret: &[u8],
-        position: Option<u32>,
-        alias: Option<&str>,
-        source: LoginSource,
+        w: &LoginWrite<'_>,
     ) -> Result<(AccountRow, bool), EngineError> {
+        let LoginWrite {
+            identity,
+            kind,
+            secret,
+            position,
+            alias,
+            source,
+        } = *w;
         let lock_for = |id: &AccountId| {
             locks
                 .iter()
@@ -825,11 +848,13 @@ impl Engine {
             &store,
             p.as_ref(),
             &opts.provider,
-            &identity,
-            claimed_uuid,
-            opts.position,
-            alias.as_deref(),
-            opts.yes,
+            &AddRequest {
+                identity: &identity,
+                claimed_uuid,
+                position: opts.position,
+                alias: alias.as_deref(),
+                yes: opts.yes,
+            },
         )?;
         let accounts = self.lock_prepared(&prep)?;
         // Reconciling a pending replacement under the account lock just taken (§12.5) may
@@ -871,17 +896,19 @@ impl Engine {
             &opts.provider,
             &prep,
             &accounts,
-            &identity,
-            &kind,
-            now.bytes(),
-            opts.position,
-            alias.as_deref(),
-            // `add`'s login is the live one, verified just above under the live locks.
-            LoginSource {
-                from_live: true,
-                live_names_account: true,
-                event: "add",
-                added_at: None,
+            &LoginWrite {
+                identity: &identity,
+                kind: &kind,
+                secret: now.bytes(),
+                position: opts.position,
+                alias: alias.as_deref(),
+                // `add`'s login is the live one, verified just above under the live locks.
+                source: LoginSource {
+                    from_live: true,
+                    live_names_account: true,
+                    event: "add",
+                    added_at: None,
+                },
             },
         )?;
         drop(live_locks);
@@ -937,11 +964,13 @@ impl Engine {
             &store,
             p.as_ref(),
             &opts.provider,
-            &identity,
-            claimed_uuid,
-            opts.position,
-            alias.as_deref(),
-            opts.yes,
+            &AddRequest {
+                identity: &identity,
+                claimed_uuid,
+                position: opts.position,
+                alias: alias.as_deref(),
+                yes: opts.yes,
+            },
         )?;
         let accounts = self.lock_prepared(&prep)?;
         // The different-kind collision (§10.2) is decided only now: taking the account lock
@@ -978,16 +1007,18 @@ impl Engine {
             &opts.provider,
             &prep,
             &accounts,
-            &identity,
-            &kind,
-            &secret,
-            opts.position,
-            alias.as_deref(),
-            LoginSource {
-                from_live: false,
-                live_names_account,
-                event: "add",
-                added_at: None,
+            &LoginWrite {
+                identity: &identity,
+                kind: &kind,
+                secret: &secret,
+                position: opts.position,
+                alias: alias.as_deref(),
+                source: LoginSource {
+                    from_live: false,
+                    live_names_account,
+                    event: "add",
+                    added_at: None,
+                },
             },
         )?;
         Ok(AddOutcome {

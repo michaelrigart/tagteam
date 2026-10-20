@@ -12,7 +12,7 @@ use tagteam_provider::{Provider, Read, StoredLogin};
 
 use crate::engine::{Engine, GuardRequest};
 use crate::error::{EngineError, SessionOwner};
-use crate::lifecycle::{LoginSource, Prepared, check_identity_conflict};
+use crate::lifecycle::{LoginSource, LoginWrite, Prepared, check_identity_conflict};
 use crate::store::{AccountRow, Store, StoreError};
 use crate::transfer::ImportRecord;
 
@@ -262,16 +262,18 @@ impl Engine {
             &row.provider,
             &prep,
             std::slice::from_ref(&lock),
-            identity,
-            &v.login.kind,
-            &v.login.secret,
-            None,
-            None,
-            LoginSource {
-                from_live: false,
-                live_names_account,
-                event: "import",
-                added_at: None,
+            &LoginWrite {
+                identity,
+                kind: &v.login.kind,
+                secret: &v.login.secret,
+                position: None,
+                alias: None,
+                source: LoginSource {
+                    from_live: false,
+                    live_names_account,
+                    event: "import",
+                    added_at: None,
+                },
             },
         )?;
         if store.live_store_stale(&account)? {
@@ -335,16 +337,18 @@ impl Engine {
             provider,
             &prep,
             std::slice::from_ref(&lock),
-            &v.login.identity,
-            &v.login.kind,
-            &v.login.secret,
-            position,
-            alias.as_deref(),
-            LoginSource {
-                from_live: false,
-                live_names_account: false,
-                event: "import",
-                added_at: v.record.added_at,
+            &LoginWrite {
+                identity: &v.login.identity,
+                kind: &v.login.kind,
+                secret: &v.login.secret,
+                position,
+                alias: alias.as_deref(),
+                source: LoginSource {
+                    from_live: false,
+                    live_names_account: false,
+                    event: "import",
+                    added_at: v.record.added_at,
+                },
             },
         )?;
         if v.record.disabled {
