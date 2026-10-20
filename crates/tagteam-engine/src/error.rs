@@ -199,7 +199,7 @@ pub enum EngineError {
     #[error("the launch command could not be started: {detail}")]
     LaunchUnreachable { detail: String },
     /// §12.5 launch step 4: a live `<pid>.lock` holds this launch's reservation, left by an
-    /// orphaned session of an earlier process with this pid (Task 4). `detail` names the file.
+    /// orphaned session of an earlier process with this pid. `detail` names the file.
     /// Its kind is `launch-unreachable`, as the launch command's own failure: nothing started.
     #[error(
         "the profile could not be reserved for this launch: {detail}, whose session may still be running; run it again, as a new process with a pid of its own"

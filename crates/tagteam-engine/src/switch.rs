@@ -1870,9 +1870,8 @@ impl Engine {
             return Ok(Rederived::Replan);
         };
         let self_switch = again.as_ref().is_some_and(|r| r.id == target.id);
-        // M1's Review Focus 3, and M3a's Review Focus 4 for a usage strategy: another process
-        // landed exactly this plan's pick while this one waited for the mutation lock (a
-        // double-fired `switch`). That was this command's work; moving on from there would
+        // Another process landed exactly this plan's pick while this one waited for the mutation
+        // lock (a double-fired `switch`). That was this command's work; moving on from there would
         // switch twice. A direct target needs no such rule: planning again finds the
         // self-switch no-op.
         if req.target.chosen() && self_switch && !plan.self_switch {

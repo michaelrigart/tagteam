@@ -591,11 +591,12 @@ fn auto_flags(
     })
 }
 
-/// A provider's display name, or its ID for one this build does not register.
+/// The refusal for a command that needs a live login, naming the provider's `launch` command.
 fn no_live_login(launch: &str) -> String {
     format!("there is no live login; name an account, or log in with `{launch}` first")
 }
 
+/// A provider's display name, or its ID for one this build does not register.
 fn display_name(engine: &Engine, provider: &ProviderId) -> String {
     engine
         .provider(provider)
@@ -1539,7 +1540,7 @@ impl App<'_, '_> {
     }
 
     /// §13.3: `export`. The destination and the encryption are settled before any account is
-    /// read: a destination that cannot be written refuses first (Review Focus 5), and the
+    /// read: a destination that cannot be written refuses first, and the
     /// passphrase is asked for, and recipients parsed, before any lock is taken. The Keychain
     /// check comes next (Appendix A.3), then the engine. Encryption and the write run once the
     /// engine has released every lock.
@@ -1917,7 +1918,7 @@ impl App<'_, '_> {
     /// (D4.1 step 3, Decision 14). It exits 0 once a signal stops it, and 75 once a newer
     /// tagteam must take over (D4.5).
     fn daemon(&mut self) -> Result<i32, Failure> {
-        // Plan B Decision 7: a test-support build's hooks; a release build ignores them.
+        // Decision 7: a test-support build's hooks; a release build ignores them.
         let hook = |k: &str| std::env::var_os(k);
         // D4.5, Decision 17: before anything that can wait (the unlock offer, the
         // `daemon.lock` wait), so a binary replaced meanwhile is an upgrade at the upgrade
@@ -2247,7 +2248,7 @@ impl App<'_, '_> {
             let _ = writeln!(self.io.err, "warning: {w}");
         }
         let cancel = self.engine.cancel();
-        // §12.3 "Every launch is checked"; a launch that bootstrapped skips it (Task 11). A
+        // §12.3 "Every launch is checked"; a launch that bootstrapped skips it. A
         // refused or interrupted check spends any pending signal on the exit handling
         // (`abandon`), which then runs to completion. An interruption exits 128 + n, and a
         // refusal keeps its own error.

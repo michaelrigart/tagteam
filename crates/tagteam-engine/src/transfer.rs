@@ -1,8 +1,9 @@
 //! §13.3's export file (Decision 10): the envelope inside the encryption, its age encryption,
 //! and the formats `import` detects: armored or binary age, tagteam's plaintext envelope, and a
-//! foreign export a provider reads (`Provider::foreign_export`, Decision 14). Pure: nothing here reads the store, the vault, a lock
-//! or the network. The engine owns the envelope's own fields; each account's `identity` and
-//! `credential` are its provider's (`Provider::export_login`, B.45).
+//! foreign export a provider reads (`Provider::foreign_export`, Decision 14). Pure: nothing here
+//! reads the store, the vault, a lock or the network. The engine owns the envelope's own fields;
+//! each account's `identity` and `credential` are its provider's (`Provider::export_login`,
+//! B.45).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -451,8 +452,8 @@ pub struct Decoded {
 
 /// §13.3's detection: armored or binary age, decrypted with `ask`'s passphrase when the file
 /// is encrypted to one, else with `identities`; then tagteam's plaintext envelope, or the foreign
-/// export the first of `registry`'s providers to detect it reads. `ask` is called only when the file needs what it asks for, and `None`
-/// from it refuses with the need named.
+/// export the first of `registry`'s providers to detect it reads. `ask` is called only when the
+/// file needs what it asks for, and `None` from it refuses with the need named.
 pub fn decode(
     input: &[u8],
     identities: &[IdentityFile],

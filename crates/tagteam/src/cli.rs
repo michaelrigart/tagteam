@@ -500,7 +500,7 @@ impl Command {
     /// rows rather than run the lock check, so a script gets rows, not a `keychain-locked`
     /// failure. `history` and `statusline` read only the store and `~/.claude.json`, `tokens`
     /// only the store and Claude Code's transcripts, and the rest need no Keychain item. A
-    /// recovery under their mutation lock (Task 21) only reads the Keychain, tri-state, and
+    /// recovery under their mutation lock only reads the Keychain, tri-state, and
     /// leaves what it cannot decide to the next command that checks.
     /// `auto` checks before its first tick, a dry run too (§11.1): every tick reads its
     /// accounts' items, and a real one switches.

@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn debug_shows_the_names_of_vars_and_never_their_values() {
-        // Review I2: `vars` holds proxy URLs, which can carry a password.
+        // §14.2: `vars` holds proxy URLs, which can carry a password.
         let mut env = Env::for_test(Path::new("/tmp/fixture"));
         env.vars
             .insert("HTTPS_PROXY".into(), "http://user:secret@proxy".into());

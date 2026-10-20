@@ -243,7 +243,7 @@ impl Engine {
     /// aborts with the profile and its baseline as they were: a seed over them would drop the
     /// session's changes, and its baseline write could follow a link at the baseline's path.
     /// The merge-back takes the outer home's config lock alone (§4.3), and only after
-    /// `MutationGuard` and the account lock. The launch (Task 10) runs it before the marker when
+    /// `MutationGuard` and the account lock. The launch runs it before the marker when
     /// the profile has one; this keeps every seed and bootstrap behind the same rule. Returns
     /// §12.4 step 3's summary, for the launch's warnings; `merge_summary` has logged it already,
     /// so a launch that aborts later still reports it.
@@ -464,7 +464,7 @@ impl Engine {
 
 #[cfg(feature = "test-hooks")]
 impl Engine {
-    /// Tests only (Task 9, before `launch` exists): what a quiescent launch runs between its
+    /// Tests only: what a quiescent launch runs between its
     /// locks and its reservation, provenance aside. That is the marker, the link sync, then a
     /// bootstrap for a §12.3 trigger, else the seed, under `MutationGuard` (30 s) and the
     /// account lock. Returns the trigger that applied. With no plan to resolve it, the

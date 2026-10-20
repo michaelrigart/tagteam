@@ -1154,7 +1154,7 @@ impl Engine {
         unfinished: usize,
         report: &mut PurgeReport,
     ) -> Result<(), EngineError> {
-        // R-T4-purgeerror: `purge_displaced` stops at its first failure, and the entries before
+        // `purge_displaced` stops at its first failure, and the entries before
         // it stay deleted, so they count; the failure is reported with its cause.
         match self.displaced_of(provider) {
             Ok(ids) if ids.is_empty() => {}

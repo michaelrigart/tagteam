@@ -58,7 +58,7 @@ fn shown((a, b, c): Version) -> String {
 
 /// `tested-cc-version`'s version: its one line that is neither blank nor a `#` comment, which
 /// must be `MAJOR.MINOR.PATCH`. Two such lines are no version. The one reader of the file in
-/// Rust: `compat.rs`'s pinning test (Task 12) reads it through this too.
+/// Rust: `compat.rs`'s pinning test reads it through this too.
 pub(crate) fn tested_version(text: &str) -> Option<Version> {
     let mut entries = text
         .lines()

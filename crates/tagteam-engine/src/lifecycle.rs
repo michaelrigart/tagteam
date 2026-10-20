@@ -746,8 +746,8 @@ impl Engine {
             Some(row) => {
                 // The metadata travels with the marker: if this process dies after the vault
                 // write, the next lock holder installs it (§12.5). A secret with no
-                // fingerprint is refused outright rather than recorded as an empty one
-                // (Task 18's review, item 7): every caller already guarantees a fingerprint
+                // fingerprint is refused outright rather than recorded as an empty one:
+                // every caller already guarantees a fingerprint
                 // exists by this point, so this is defensive, not a path any test reaches.
                 let new_fp = p
                     .fingerprint(secret)
@@ -769,8 +769,8 @@ impl Engine {
                 store.begin_replacement(&row.id, &new_fp, &meta, source.live_names_account)?;
                 if let Err(e) = self.vault.store(lock_for(&row.id), secret, p) {
                     // The write never landed: reconcile in process rather than leaving the
-                    // marker dangling for the next lock holder to find (Task 18's review,
-                    // item 6). `reconcile_replacement` reads the vault fresh, sees it still
+                    // marker dangling for the next lock holder to find.
+                    // `reconcile_replacement` reads the vault fresh, sees it still
                     // holds the old generation, and rolls the marker back. A failure here is
                     // logged, by its kind (§14.2), and not returned: the write's error is the
                     // one to report, and the next lock acquisition retries the reconciliation.
@@ -802,7 +802,7 @@ impl Engine {
                 if let Err(e) = self.vault.store(lock_for(&prep.id), secret, p) {
                     // The write may have landed and failed only its read-back. A new account
                     // has no earlier generation to keep, so whatever it left goes with the row:
-                    // no secret outlives its account (§5, L444). A failure is logged by a fixed
+                    // no secret outlives its account (§5). A failure is logged by a fixed
                     // phrase (§14.2): a vault error carries the Keychain's message or a path.
                     if self.vault.delete(lock_for(&prep.id)).is_err() {
                         tracing::error!(
@@ -859,7 +859,7 @@ impl Engine {
         let auth = p.read_live_auth(&self.env);
         no_live_api_key(&auth.managed_key)?;
         let cred = live_fresh(p.as_ref(), auth.credential)?;
-        // Task 13's review: `classify` falls through to `setup_token` for any bytes it does
+        // `classify` falls through to `setup_token` for any bytes it does
         // not recognise, a wiped credential included, so it has no "unrecognised" answer of
         // its own. Bytes with no fingerprint (which a wiped credential always is: neither
         // token is present) are refused here, before classification ever sees them.
@@ -870,7 +870,7 @@ impl Engine {
         }
         // 3.2 Ownership, advisory and before any lock: never refreshes, never blocks on failure.
         // §7.6: an oracle answer with no non-empty uuid of its own is treated as unresolved,
-        // exactly like no answer at all (Task 18's review, item 3) — never compared by email.
+        // exactly like no answer at all — never compared by email.
         let mut notices = Vec::new();
         let resolved = oracle_resolved(self.oracle.resolve(p.as_ref(), &cred));
         match &resolved {
@@ -889,7 +889,7 @@ impl Engine {
         // The most authoritative uuid known for this login: the oracle's, when it resolved
         // one, else the self-reported one — so a self-reported identity with no uuid of its
         // own still benefits from an oracle-confirmed one when checking for a conflict with
-        // a stored account (Task 18's review, item 3).
+        // a stored account.
         let claimed_uuid = resolved
             .as_ref()
             .and_then(|o| o.account_uuid.as_deref())
@@ -912,7 +912,7 @@ impl Engine {
         let accounts = self.lock_prepared(&prep)?;
         // Reconciling a pending replacement under the account lock just taken (§12.5) may
         // have installed a uuid the pre-lock check in `prepare` never saw: re-run it now
-        // that the row is authoritative (Task 18's review, item 1).
+        // that the row is authoritative.
         check_identity_conflict(
             store.account(&prep.id)?.as_ref(),
             claimed_uuid,
@@ -928,9 +928,8 @@ impl Engine {
         // recovery may have moved it while this command waited for the locks.
         // The complete identity is compared, not just its key: an `accountUuid` or any other
         // `oauthAccount` field that changed means this is not the login that was verified. An
-        // identity that becomes unreadable is reported as such, not collapsed into `LiveMoved`
-        // (Task 18's review, item 9): only its absence — the login disappearing outright —
-        // reads as "moved".
+        // identity that becomes unreadable is reported as such, not collapsed into `LiveMoved`:
+        // only its absence — the login disappearing outright — reads as "moved".
         let now_identity = match p.live_identity(&self.env) {
             Read::Present(i) => Some(i),
             Read::Absent => None,
@@ -1025,7 +1024,7 @@ impl Engine {
         let accounts = self.lock_prepared(&prep)?;
         // The different-kind collision (§10.2) is decided only now: taking the account lock
         // may have finished a pending replacement and changed the account's kind. The uuid
-        // conflict check is re-run here too, for the same reason (Task 18's review, item 1) —
+        // conflict check is re-run here too, for the same reason —
         // a no-op today since a token identity never claims a uuid, but it keeps the two
         // rechecks in one place rather than only one of them surviving the next change.
         let current = store.account(&prep.id)?;
