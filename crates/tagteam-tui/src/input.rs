@@ -166,22 +166,23 @@ impl Wait {
     }
 }
 
-/// How many replies to a terminal's queries one drain looks past: a key behind up to 32
-/// replies read at once is drained at once. A key behind more waits for the next byte, a
-/// resize or a wake, as it did before the drain looked past any. One read could hold 256
-/// (1024 bytes, `TTY_BUFFER_SIZE` in crossterm 0.29.0, over the 4 of `ESC [ ? c`), but each
-/// look past one costs two zero-timeout kevents once crossterm holds nothing: a drain's end
-/// took about 8 ms in a release build at 256, and about 1 ms at 32.
+/// How many replies to a terminal's queries one drain looks past: a key with up to 32 replies
+/// in all ahead of it, however they arrived, is drained at once. A key behind more waits for
+/// the next byte, a resize or a wake, as it did before the drain looked past any. One read
+/// could hold 256 (1024 bytes, `TTY_BUFFER_SIZE` in crossterm 0.29.0, over the 4 of
+/// `ESC [ ? c`), but each look past one costs two zero-timeout kevents once crossterm holds
+/// nothing: a drain's end took about 8 ms in a release build at 256, and about 1 ms at 32.
 const REPLIES: usize = 32;
 
 /// `Terminal::next` over crossterm's calls, `closed` before each one.
 ///
 /// crossterm's zero-timeout `poll` hands out one parsed event a call. When that event is a
 /// reply it keeps to itself (a cursor position, the keyboard enhancement flags, the primary
-/// device attributes), it says no, though keys may wait behind it. What it holds comes from
-/// one read, so `REPLIES + 1` noes in a row say it holds no key behind up to `REPLIES` of them.
-/// A read of newer bytes within those noes takes bytes whose arrival `Wait::closed` keeps, or
-/// the wait has yet to see: the next wait drains again.
+/// device attributes), it says no, though keys may wait behind it. Each no before a key it
+/// holds takes one reply ahead of that key, so `REPLIES + 1` noes in a row say it holds no key
+/// with up to `REPLIES` replies in all ahead of it. Bytes a read takes within those noes came
+/// after the wait last looked: `Wait::closed` keeps their arrival, or the wait has yet to see
+/// it, and the next wait drains again.
 fn next_of(
     mut closed: impl FnMut() -> io::Result<bool>,
     mut poll: impl FnMut() -> io::Result<bool>,
@@ -1077,13 +1078,22 @@ mod tests {
         theirs.write_all(b"x").unwrap();
         assert!(!wait.closed().unwrap());
         // The poll above took the bytes' event, and nothing read them: `wait` returns from
-        // what it kept.
+        // what it kept, once.
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(wait.wait().unwrap());
+            for _ in 0..2 {
+                if tx.send(wait.wait().unwrap()).is_err() {
+                    break;
+                }
+            }
             drop(ours);
         });
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(Ready::Input));
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the byte is still unread and nothing else came"
+        );
+        // The hang-up ends the second wait.
         drop(theirs);
     }
 
