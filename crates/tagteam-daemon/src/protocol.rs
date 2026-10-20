@@ -1,6 +1,6 @@
 //! D5's wire format. Every event is one JSON object in §11.4's envelope, and `tagteam auto
 //! --json`, `tagteam daemon --json` and the socket all write it from here (D3), so they never
-//! differ. Plan B adds the requests, the replies and the greeting.
+//! differ. It holds the requests, the replies and the greeting too.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -116,18 +116,7 @@ pub fn event_json(e: &AutoEvent, now_s: i64) -> Value {
             ("config-warning", provider, json!({"message": message}))
         }
     };
-    let mut o = json!({
-        "schemaVersion": 1,
-        "event": kind,
-        "ts": format_iso8601(now_s),
-        "provider": provider.as_str(),
-    });
-    if let Value::Object(fields) = fields {
-        for (k, v) in fields {
-            o[k] = v;
-        }
-    }
-    o
+    envelope(kind, Some(provider), fields, now_s)
 }
 
 /// A map keyed by account position, as §11.4's objects key accounts.
@@ -663,6 +652,167 @@ impl Event {
             _ => None,
         }
     }
+
+    /// `Some` only for an `Event::Auto` of kind `poll` whose object parses.
+    pub fn poll(&self) -> Option<PollPayload> {
+        self.auto_raw("poll").and_then(parse_poll)
+    }
+
+    /// `Some` only for an `Event::Auto` of kind `switch` that names `from` and `to`.
+    pub fn switch(&self) -> Option<SwitchPayload> {
+        self.auto_raw("switch").and_then(parse_switch)
+    }
+
+    /// `Some` only for an `Event::Auto` of kind `no-switch`.
+    pub fn no_switch(&self) -> Option<NoSwitchPayload> {
+        self.auto_raw("no-switch").and_then(parse_no_switch)
+    }
+
+    fn auto_raw(&self, want: &str) -> Option<&Value> {
+        match self {
+            Event::Auto { kind, raw, .. } if kind == want => Some(raw),
+            _ => None,
+        }
+    }
+}
+
+/// A `poll`'s active account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveAccount {
+    pub number: u32,
+    pub email: String,
+}
+
+/// A `poll` event's fields (§11.4), read as leniently as the TUI reads them: a key the daemon
+/// left out is empty, never an error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PollPayload {
+    pub active: Option<ActiveAccount>,
+    /// Headroom by position; `None` where the daemon had no reading.
+    pub headroom_pct: BTreeMap<u32, Option<f64>>,
+    pub threshold: Option<f64>,
+    pub fetch_errors: BTreeMap<u32, String>,
+    /// Each position's windows and their usage, in the order the wire gives them.
+    pub windows_pct: BTreeMap<u32, Vec<(String, f64)>>,
+}
+
+/// The window that bound an account at a poll, and the usage it was at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingWindow {
+    pub window: String,
+    pub used_pct: i64,
+}
+
+/// How near a window's usage must be to the account's own to be its binding window, in
+/// percentage points. Strictly less than.
+const BINDING_TOLERANCE: f64 = 0.05;
+
+impl PollPayload {
+    /// The window that bound `position`: its relevant usage is 100 less its headroom, and the
+    /// binding window is the first of its `windows_pct`, in wire order, within the tolerance of
+    /// that usage. `None` when the headroom is unknown or no window is that near.
+    pub fn binding(&self, position: u32) -> Option<BindingWindow> {
+        let headroom = (*self.headroom_pct.get(&position)?)?;
+        let usage = 100.0 - headroom;
+        let (window, _) = self
+            .windows_pct
+            .get(&position)?
+            .iter()
+            .find(|(_, pct)| (pct - usage).abs() < BINDING_TOLERANCE)?;
+        Some(BindingWindow {
+            window: window.clone(),
+            used_pct: usage.round() as i64,
+        })
+    }
+}
+
+/// A `switch` event's fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchPayload {
+    pub trigger: Wire<Trigger>,
+    pub from: u32,
+    pub to: u32,
+    pub warnings: Vec<String>,
+    pub dry_run: bool,
+}
+
+/// A `no-switch` event's fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoSwitchPayload {
+    pub reason: Wire<NoSwitchReason>,
+    pub detail: String,
+}
+
+/// A `poll` object's fields. `None` only for a value that is not an object.
+pub fn parse_poll(raw: &Value) -> Option<PollPayload> {
+    let o = raw.as_object()?;
+    let by_position = |key: &str| {
+        o.get(key)
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter_map(|(position, v)| Some((position.parse::<u32>().ok()?, v)))
+    };
+    Some(PollPayload {
+        active: o.get("active").and_then(Value::as_object).and_then(|a| {
+            Some(ActiveAccount {
+                number: u32::try_from(a.get("number")?.as_u64()?).ok()?,
+                email: a
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            })
+        }),
+        headroom_pct: by_position("headroomPct")
+            .map(|(position, v)| (position, v.as_f64()))
+            .collect(),
+        threshold: o.get("threshold").and_then(Value::as_f64),
+        fetch_errors: by_position("fetchErrors")
+            .filter_map(|(position, v)| Some((position, v.as_str()?.to_owned())))
+            .collect(),
+        windows_pct: by_position("windowsPct")
+            .filter_map(|(position, v)| {
+                let windows = v
+                    .as_object()?
+                    .iter()
+                    .filter_map(|(window, pct)| Some((window.clone(), pct.as_f64()?)))
+                    .collect();
+                Some((position, windows))
+            })
+            .collect(),
+    })
+}
+
+/// A `switch` object's fields. `None` without a `from` and a `to`; a missing `trigger` reads as
+/// empty, `warnings` as none and `dryRun` as false.
+pub fn parse_switch(raw: &Value) -> Option<SwitchPayload> {
+    let o = raw.as_object()?;
+    let position = |key: &str| u32::try_from(o.get(key)?.as_u64()?).ok();
+    Some(SwitchPayload {
+        trigger: Wire::from_wire(o.get("trigger").and_then(Value::as_str).unwrap_or_default()),
+        from: position("from")?,
+        to: position("to")?,
+        warnings: o
+            .get("warnings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|w| Some(w.as_str()?.to_owned()))
+            .collect(),
+        dry_run: o.get("dryRun").and_then(Value::as_bool) == Some(true),
+    })
+}
+
+/// A `no-switch` object's fields. `None` only for a value that is not an object; a missing
+/// `reason` or `detail` reads as empty.
+pub fn parse_no_switch(raw: &Value) -> Option<NoSwitchPayload> {
+    let o = raw.as_object()?;
+    let text = |key: &str| o.get(key).and_then(Value::as_str).unwrap_or_default();
+    Some(NoSwitchPayload {
+        reason: Wire::from_wire(text("reason")),
+        detail: text("detail").to_owned(),
+    })
 }
 
 /// §11.4's kinds: what `auto --json` prints, carried unchanged on the socket (D5.5).
@@ -1035,6 +1185,165 @@ mod tests {
     }
 
     #[test]
+    fn each_auto_payload_parses_from_event_json_s_own_output() {
+        let mut seen = [false; 3];
+        for (event, _) in auto_lines() {
+            let raw = event_json(&event, T0);
+            let typed = parse_event(&raw).unwrap();
+            match &event {
+                AutoEvent::Poll {
+                    active,
+                    headroom_pct,
+                    threshold,
+                    fetch_errors,
+                    windows_pct,
+                    ..
+                } => {
+                    seen[0] = true;
+                    let want = PollPayload {
+                        active: active.as_ref().map(|(number, email)| ActiveAccount {
+                            number: *number,
+                            email: email.clone(),
+                        }),
+                        headroom_pct: headroom_pct.clone(),
+                        threshold: Some(*threshold),
+                        fetch_errors: fetch_errors.clone(),
+                        windows_pct: windows_pct
+                            .iter()
+                            .map(|(position, w)| {
+                                (*position, w.iter().map(|(k, v)| (k.clone(), *v)).collect())
+                            })
+                            .collect(),
+                    };
+                    assert_eq!(parse_poll(&raw), Some(want.clone()));
+                    assert_eq!(typed.poll(), Some(want));
+                    assert_eq!(typed.switch(), None);
+                    assert_eq!(typed.no_switch(), None);
+                }
+                AutoEvent::Switch {
+                    trigger,
+                    from,
+                    to,
+                    warnings,
+                    dry_run,
+                    ..
+                } => {
+                    seen[1] = true;
+                    let want = SwitchPayload {
+                        trigger: Wire::Known(*trigger),
+                        from: *from,
+                        to: *to,
+                        warnings: warnings.clone(),
+                        dry_run: *dry_run,
+                    };
+                    assert_eq!(parse_switch(&raw), Some(want.clone()));
+                    assert_eq!(typed.switch(), Some(want));
+                    assert_eq!(typed.poll(), None);
+                    assert_eq!(typed.no_switch(), None);
+                }
+                AutoEvent::NoSwitch { reason, detail, .. } => {
+                    seen[2] = true;
+                    let want = NoSwitchPayload {
+                        reason: Wire::from_wire(reason),
+                        detail: detail.clone(),
+                    };
+                    assert_eq!(parse_no_switch(&raw), Some(want.clone()));
+                    assert_eq!(typed.no_switch(), Some(want));
+                    assert_eq!(typed.poll(), None);
+                    assert_eq!(typed.switch(), None);
+                }
+                _ => {
+                    assert_eq!(typed.poll(), None);
+                    assert_eq!(typed.switch(), None);
+                    assert_eq!(typed.no_switch(), None);
+                }
+            }
+        }
+        assert_eq!(seen, [true; 3]);
+    }
+
+    #[test]
+    fn an_auto_payload_reads_as_leniently_as_the_tui_does() {
+        let switch = parse_switch(&json!({"from": 2, "to": 1})).unwrap();
+        assert_eq!(switch.trigger, Wire::Other(String::new()));
+        assert!(switch.warnings.is_empty());
+        assert!(!switch.dry_run);
+        assert_eq!(parse_switch(&json!({"from": 2})), None);
+        assert_eq!(parse_switch(&json!({"to": 1})), None);
+        let newer = parse_switch(&json!({"trigger": "later", "from": 1, "to": 2})).unwrap();
+        assert_eq!(newer.trigger, Wire::Other("later".into()));
+
+        let bare = parse_no_switch(&json!({})).unwrap();
+        assert_eq!(bare.reason, Wire::Other(String::new()));
+        assert_eq!(bare.detail, "");
+        let newer = parse_no_switch(&json!({"reason": "later", "detail": "d"})).unwrap();
+        assert_eq!(newer.reason, Wire::Other("later".into()));
+        assert_eq!(newer.reason.as_str(), "later");
+        assert_eq!(newer.detail, "d");
+
+        let poll = parse_poll(&json!({"headroomPct": {"1": null, "2": 30.5}})).unwrap();
+        assert_eq!(poll.active, None);
+        assert_eq!(
+            poll.headroom_pct,
+            BTreeMap::from([(1, None), (2, Some(30.5))])
+        );
+        assert_eq!(poll.threshold, None);
+        assert!(poll.fetch_errors.is_empty());
+        assert!(poll.windows_pct.is_empty());
+        assert_eq!(parse_poll(&json!("poll")), None);
+    }
+
+    #[test]
+    fn the_binding_window_is_the_first_within_the_tolerance() {
+        let poll = |headroom: Value, windows: Value| {
+            let mut raw = json!({"event": "poll", "headroomPct": {"1": headroom}});
+            if !windows.is_null() {
+                raw["windowsPct"] = json!({"1": windows});
+            }
+            parse_poll(&raw).unwrap()
+        };
+        let bound = |window: &str, used_pct| {
+            Some(BindingWindow {
+                window: window.into(),
+                used_pct,
+            })
+        };
+
+        // Two windows within the tolerance: the first in the wire's key order, not the nearer.
+        let both = poll(json!(60.0), json!({"7d": 40.04, "5h": 40.0}));
+        assert_eq!(both.binding(1), bound("7d", 40));
+        let both = poll(json!(60.0), json!({"5h": 40.0, "7d": 40.04}));
+        assert_eq!(both.binding(1), bound("5h", 40));
+
+        // 0.049 away matches, 0.051 does not, on either side.
+        assert_eq!(
+            poll(json!(60.0), json!({"5h": 40.049})).binding(1),
+            bound("5h", 40)
+        );
+        assert_eq!(
+            poll(json!(60.0), json!({"5h": 39.951})).binding(1),
+            bound("5h", 40)
+        );
+        assert_eq!(poll(json!(60.0), json!({"5h": 40.051})).binding(1), None);
+        assert_eq!(poll(json!(60.0), json!({"5h": 39.949})).binding(1), None);
+
+        // A window further off is skipped for one that matches.
+        let skipped = poll(json!(60.0), json!({"5h": 10.0, "7d": 40.0}));
+        assert_eq!(skipped.binding(1), bound("7d", 40));
+
+        // The used percentage is the usage, rounded.
+        assert_eq!(
+            poll(json!(59.6), json!({"5h": 40.4})).binding(1),
+            bound("5h", 40)
+        );
+
+        // An unknown headroom, a missing windowsPct, and another position bind nothing.
+        assert_eq!(poll(Value::Null, json!({"5h": 40.0})).binding(1), None);
+        assert_eq!(poll(json!(60.0), Value::Null).binding(1), None);
+        assert_eq!(poll(json!(60.0), json!({"5h": 40.0})).binding(2), None);
+    }
+
+    #[test]
     fn each_daemon_kind_is_one_object_in_the_envelope_and_leaves_out_what_it_lacks() {
         let mode = |mode, waiting_for, holder_pid, backoff| DaemonEvent::Mode {
             provider: cc(),
@@ -1278,7 +1587,7 @@ mod socket_protocol_tests {
 
     #[test]
     fn request_ids_round_trip_through_a_value() {
-        // The client reads a reply's id through a `Value` (Task 3), and so does this.
+        // The client reads a reply's id through a `Value`, and so does this.
         assert_eq!(serde_json::to_value(RequestId::Int(7)).unwrap(), json!(7));
         assert_eq!(
             serde_json::to_value(RequestId::Str("a".into())).unwrap(),
@@ -1610,7 +1919,7 @@ mod socket_protocol_tests {
 
     #[test]
     fn every_daemon_kind_reads_back_from_daemon_event_json() {
-        // D5.5's daemon kinds, through the function the hub writes them with (Task 2).
+        // D5.5's daemon kinds, through the function the hub writes them with.
         let cc = || ProviderId::new("claude-code");
         let errors = BTreeMap::from([(2, "rate-limited".to_owned())]);
         let cases = vec![
