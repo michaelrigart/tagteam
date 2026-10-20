@@ -582,8 +582,8 @@ mod tests {
 
     #[test]
     fn a_long_delay_is_announced_with_a_sleep_event() {
-        // Review Focus 4, the loop's half: every candidate exhausted sleeps until the earliest
-        // recovery plus 60 s, capped at 600 s, and says so.
+        // Every candidate exhausted sleeps until the earliest recovery plus 60 s, capped at 600 s,
+        // and says so.
         let fx = Fx::new();
         let (a, b) = two(&fx);
         fx.read(&a, 100.0, 50.0, T0, T0 + 300);
@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn a_suspend_past_the_deadline_ticks_on_waking_and_never_on_the_old_readings() {
-        // Review Focus 2. The laptop sleeps for an hour during the first slice after a tick.
+        // The laptop sleeps for an hour during the first slice after a tick.
         // The loop's deadline is wall clock, so it ticks the moment it wakes, not 59 s of
         // awake time later. The readings are then over an hour old: past even §8.4's extended
         // trust. The tick fetches each account once, finds nothing (every request fails here),
@@ -850,7 +850,8 @@ mod tests {
 
     #[test]
     fn a_loop_skips_a_provider_whose_engine_runs_elsewhere_and_fails_when_none_is_left() {
-        // Review Focus 3, the loop's half (§11.1).
+        // A provider whose engine runs elsewhere reports `engine-running` and is never polled; with
+        // none left to run, the loop fails (§11.1).
         let fx = Fx::new();
         let (a, b) = two(&fx);
         let (alice, bob) = (fx.add_fake("alice"), fx.add_fake("bob"));

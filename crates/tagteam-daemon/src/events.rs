@@ -120,7 +120,7 @@ pub enum DaemonEvent {
 }
 
 /// Where the scheduler's jobs send their events: the CLI's human or JSON output, the socket's
-/// subscribers (plan B), the notifier (D6).
+/// subscribers, the notifier (D6).
 pub trait DaemonSink {
     fn emit(&self, e: &DaemonEvent);
     /// The end of a tick of `provider`'s engine, as `EventSink::tick_done` has it.
