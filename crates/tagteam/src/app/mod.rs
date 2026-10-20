@@ -23,8 +23,8 @@ mod failure;
 
 pub use context::{Context, Io};
 pub(crate) use context::{
-    build_engine, build_registry, color_enabled, command_settings, fallback_provider, locate,
-    registry,
+    build_engine, build_registry, color_enabled, command_settings, engine_for, fallback_provider,
+    locate, locate_run_shell, registry,
 };
 pub use failure::KIND_STALE_SELECTION;
 pub(crate) use failure::{EXIT_ERROR, EXIT_USAGE, KIND_ROOT, KIND_USAGE, error_json};
@@ -139,34 +139,25 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     if let Some(Command::Tui { .. }) = &cli.command {
         return refuse_tui(io, json);
     }
-    // §12.8: the run shell is found through the registered providers, so the registry comes
-    // first. Under a marker that cannot be read the outer home is unknown, and nothing runs.
-    let registry = build_registry(&ctx);
-    let (run_shell, env) = locate(ctx.env.clone(), &registry);
-    if let RunShell::Unreadable { marker, detail } = &run_shell {
-        let e = EngineError::RunShellUnreadable {
-            marker: marker.clone(),
-            detail: detail.clone(),
-        };
-        return Ended::Code(fail(io, json, e.kind(), &e.to_string()));
-    }
     // §12.7: the wrapper needs only the registered providers, so it reads no store and no
     // settings. It comes after the marker check: under a marker that cannot be read it refuses,
     // as every command but `statusline` does (§12.8, Decision 19).
     if let Some(Command::ShellInit { shell }) = &cli.command {
-        return Ended::Code(run_shell_init(
-            &registry,
-            io,
-            json,
-            cli.provider.as_deref(),
-            *shell,
-        ));
+        return Ended::Code(match locate_run_shell(&ctx) {
+            Ok(located) => {
+                run_shell_init(&located.registry, io, json, cli.provider.as_deref(), *shell)
+            }
+            Err(e) => fail(io, json, e.kind(), &e.to_string()),
+        });
     }
     // §13.7: a script from the command definitions alone. It reads no settings, no store and no
     // Keychain, so it warns about nothing and creates nothing. After the marker check: an
     // unreadable marker refuses every command but `statusline` (§12.8).
     if let Some(Command::Completions { shell }) = &cli.command {
-        return answer_completions(io, json, *shell);
+        return match locate_run_shell(&ctx) {
+            Ok(_) => answer_completions(io, json, *shell),
+            Err(e) => Ended::Code(fail(io, json, e.kind(), &e.to_string())),
+        };
     }
     let command = cli.command.unwrap_or(Command::List);
     let keychain = (ctx.platform == Platform::MacOs).then(|| ctx.keychain.clone());
@@ -180,7 +171,11 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     let (stdout_terminal, no_color_env, force_color_env) =
         (ctx.stdout_terminal, ctx.no_color_env, ctx.force_color_env);
     let provider_flag = cli.provider.map(ProviderId::new);
-    let (engine, warnings) = build_engine(ctx, registry, run_shell, env, provider_flag.as_ref());
+    // §12.8: under a marker that cannot be read the outer home is unknown, and nothing runs.
+    let (engine, warnings) = match engine_for(ctx, provider_flag.as_ref()) {
+        Ok(built) => built,
+        Err(e) => return Ended::Code(fail(io, json, e.kind(), &e.to_string())),
+    };
     for w in &warnings {
         let _ = writeln!(io.err, "warning: {w}");
     }
