@@ -233,6 +233,31 @@ fn a_burst_of_keys_in_one_write_is_handled_whole() {
     assert_eq!(tui.finish(LONG).status.code(), Some(0));
 }
 
+/// Types `replies` and then `q` in one write, as a late answer to a foreground program's query
+/// arrives just ahead of a key: the TUI quits within 2 s. crossterm keeps the replies to
+/// itself, and the key waits in its queue behind them.
+fn quits_behind(replies: &[u8]) {
+    let home = Home::new();
+    let mut tui = home.tui(&["tui"]);
+    tui.wait_for(LONG, "the accounts table", accounts);
+    tui.type_keys(&[replies, b"q"].concat());
+    let f = tui.finish(Duration::from_secs(2));
+    assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
+}
+
+#[test]
+fn a_key_behind_a_terminal_reply_is_handled() {
+    // A cursor position report.
+    quits_behind(b"\x1b[1;1R");
+}
+
+#[test]
+fn a_key_behind_several_terminal_replies_is_handled() {
+    // Each kind crossterm keeps: a cursor position, the keyboard enhancement flags and the
+    // primary device attributes, and a second cursor position.
+    quits_behind(b"\x1b[1;1R\x1b[?1u\x1b[?62;22c\x1b[1;1R");
+}
+
 #[test]
 fn a_resize_while_idle_redraws_at_the_new_size() {
     let home = Home::new();

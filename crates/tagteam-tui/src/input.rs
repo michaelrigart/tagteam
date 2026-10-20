@@ -52,8 +52,8 @@ pub(crate) trait Events: Send + 'static {
     /// waker was called or a signal interrupted the wait (`Woken`), or the terminal hung up
     /// (`Closed`).
     fn wait(&mut self) -> io::Result<Ready>;
-    /// An event crossterm has read and parsed, without blocking. `Closed` once the terminal
-    /// has hung up, and then crossterm is not called.
+    /// An event crossterm has read and parsed, without blocking, and `Empty` once it holds
+    /// none. `Closed` once the terminal has hung up, and then crossterm is not called.
     fn next(&mut self) -> io::Result<Next>;
     /// The terminal's size now, for a resize.
     fn size(&mut self) -> io::Result<(u16, u16)>;
@@ -69,8 +69,10 @@ pub(crate) struct Wait {
     waker: Arc<mio::Waker>,
     /// The fd has hung up. Its event comes once, so it is remembered.
     closed: bool,
-    /// A SIGWINCH and a wake `closed` took, for the next `wait` to report.
+    /// A SIGWINCH, bytes and a wake `closed` took, for the next `wait` to report: each event
+    /// comes once.
     resized: bool,
+    input: bool,
     woken: bool,
 }
 
@@ -91,6 +93,7 @@ impl Wait {
             waker,
             closed: false,
             resized: false,
+            input: false,
             woken: false,
         })
     }
@@ -98,10 +101,9 @@ impl Wait {
     /// `Events::wait` on `fd`. Of several at once, a hang-up is reported first, then a resize,
     /// after which the thread reads the terminal anyway, then bytes, then a wake.
     pub(crate) fn wait(&mut self) -> io::Result<Ready> {
-        let mut input = false;
-        if !self.closed && !self.resized && !self.woken {
+        if !(self.closed || self.resized || self.input || self.woken) {
             match self.poll.poll(&mut self.events, None) {
-                Ok(()) => input = self.take(),
+                Ok(()) => self.take(),
                 // A signal handled on this thread: the thread looks at its control again.
                 Err(e) if e.kind() == ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
@@ -117,11 +119,15 @@ impl Wait {
         // A wake that comes with bytes is spent too: the thread looks at its control before
         // every call into the terminal.
         self.woken = false;
-        Ok(if input { Ready::Input } else { Ready::Woken })
+        if mem::take(&mut self.input) {
+            Ok(Ready::Input)
+        } else {
+            Ok(Ready::Woken)
+        }
     }
 
-    /// Without blocking: whether `fd` has hung up. Once seen it stays true. A SIGWINCH or a
-    /// wake this poll takes is kept, and the next `wait` returns `Resized` or `Woken` at once.
+    /// Without blocking: whether `fd` has hung up. Once seen it stays true. Whatever else this
+    /// poll takes, a SIGWINCH, bytes or a wake, is kept, and the next `wait` returns it at once.
     pub(crate) fn closed(&mut self) -> io::Result<bool> {
         if !self.closed {
             loop {
@@ -146,21 +152,49 @@ impl Wait {
         })
     }
 
-    /// Notes what the events a poll took say: a hang-up, a SIGWINCH and a wake are kept.
-    /// Returns whether the fd has bytes.
-    fn take(&mut self) -> bool {
-        let mut input = false;
+    /// Keeps what the events a poll took say: a hang-up, a SIGWINCH, bytes and a wake.
+    fn take(&mut self) {
         for event in &self.events {
             match event.token() {
                 FD if event.is_read_closed() || event.is_error() => self.closed = true,
-                FD => input = true,
+                FD => self.input = true,
                 RESIZE => self.resized = true,
                 WAKE => self.woken = true,
                 _ => {}
             }
         }
-        input
     }
+}
+
+/// How many replies to a terminal's queries crossterm can keep back from one read of it: a
+/// read is at most 1024 bytes (`TTY_BUFFER_SIZE` in crossterm 0.29.0's
+/// `src/event/source/unix/mio.rs`), and the shortest reply, the primary device attributes
+/// `ESC [ ? c`, is 4 bytes. The workspace pins crossterm at `=0.29.0`.
+const REPLIES: usize = 1024 / 4;
+
+/// `Terminal::next` over crossterm's calls, `closed` before each one.
+///
+/// crossterm's zero-timeout `poll` hands out one parsed event a call. When that event is a
+/// reply it keeps to itself (a cursor position, the keyboard enhancement flags, the primary
+/// device attributes), it says no, though keys may wait behind it. What it holds comes from
+/// one read, so a key waits behind at most `REPLIES` of them, and `REPLIES + 1` noes in a row
+/// say it holds nothing more. A read of newer bytes within those noes takes bytes whose
+/// arrival `Wait::closed` keeps, or the wait has yet to see: the next wait drains again.
+fn next_of(
+    mut closed: impl FnMut() -> io::Result<bool>,
+    mut poll: impl FnMut() -> io::Result<bool>,
+    read: impl FnOnce() -> io::Result<Event>,
+) -> io::Result<Next> {
+    for _ in 0..=REPLIES {
+        // crossterm's read loops forever on a terminal that has hung up.
+        if closed()? {
+            return Ok(Next::Closed);
+        }
+        if poll()? {
+            return read().map(Next::Event);
+        }
+    }
+    Ok(Next::Empty)
 }
 
 /// The process's terminal: fd 0 through `Wait`. Its events come through crossterm
@@ -185,15 +219,12 @@ impl Events for Terminal {
     }
 
     fn next(&mut self) -> io::Result<Next> {
-        // crossterm's read loops forever on a terminal that has hung up.
-        if self.wait.closed()? {
-            return Ok(Next::Closed);
-        }
-        if crossterm::event::poll(Duration::ZERO)? {
-            crossterm::event::read().map(Next::Event)
-        } else {
-            Ok(Next::Empty)
-        }
+        let wait = &mut self.wait;
+        next_of(
+            || wait.closed(),
+            || crossterm::event::poll(Duration::ZERO),
+            crossterm::event::read,
+        )
     }
 
     fn size(&mut self) -> io::Result<(u16, u16)> {
@@ -1034,5 +1065,73 @@ mod tests {
             drop(ours);
         });
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(Ready::Woken));
+    }
+
+    #[test]
+    fn bytes_the_hang_up_check_takes_are_kept_for_the_wait() {
+        let _alone = alone();
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        let mut wait = Wait::on(ours.as_raw_fd()).unwrap();
+        theirs.write_all(b"x").unwrap();
+        assert!(!wait.closed().unwrap());
+        // The poll above took the bytes' event, and nothing read them: `wait` returns from
+        // what it kept.
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(wait.wait().unwrap());
+            drop(ours);
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(Ready::Input));
+        drop(theirs);
+    }
+
+    /// `next_of` over a crossterm that holds `replies` it keeps to itself and then `q`, or
+    /// nothing after them: what it returns, and how many `closed`s and `poll`s it made.
+    fn next_behind(replies: usize, then_q: bool, closes_at: Option<usize>) -> (Next, usize, usize) {
+        let (mut closeds, mut polls) = (0, 0);
+        let next = next_of(
+            || {
+                closeds += 1;
+                Ok(closes_at == Some(closeds))
+            },
+            || {
+                polls += 1;
+                Ok(then_q && polls > replies)
+            },
+            || Ok(Event::Key(key('q'))),
+        )
+        .unwrap();
+        (next, closeds, polls)
+    }
+
+    #[test]
+    fn a_key_behind_the_replies_crossterm_keeps_is_read() {
+        // Up to as many as one read holds.
+        for replies in [0, 1, 2, REPLIES] {
+            let (next, closeds, polls) = next_behind(replies, true, None);
+            assert!(
+                matches!(next, Next::Event(Event::Key(k)) if k.code == KeyCode::Char('q')),
+                "behind {replies} replies"
+            );
+            assert_eq!(
+                (closeds, polls),
+                (replies + 1, replies + 1),
+                "a hang-up check each"
+            );
+        }
+    }
+
+    #[test]
+    fn only_enough_noes_in_a_row_say_crossterm_holds_nothing() {
+        let (next, closeds, polls) = next_behind(REPLIES + 1, false, None);
+        assert!(matches!(next, Next::Empty));
+        assert_eq!((closeds, polls), (REPLIES + 1, REPLIES + 1));
+    }
+
+    #[test]
+    fn a_hang_up_between_the_noes_ends_them_before_crossterm_is_called_again() {
+        let (next, closeds, polls) = next_behind(REPLIES, true, Some(5));
+        assert!(matches!(next, Next::Closed));
+        assert_eq!((closeds, polls), (5, 4));
     }
 }
