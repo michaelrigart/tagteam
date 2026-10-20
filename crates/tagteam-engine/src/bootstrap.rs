@@ -26,7 +26,8 @@ use crate::provenance::identity_drifted;
 use crate::store::AccountRow;
 
 /// What a quiescent profile's bootstrap runs against: the account's row and profile, the
-/// `cwd` and `program` its validation spawns, and the `guard` and `lock` the caller holds.
+/// `program` its validation spawns and the `cwd` it runs in, and the `guard` and `lock` the
+/// caller holds.
 pub(crate) struct ProfileCtx<'a> {
     pub(crate) row: &'a AccountRow,
     pub(crate) profile: &'a Path,
