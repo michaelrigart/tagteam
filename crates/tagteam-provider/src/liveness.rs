@@ -1,10 +1,12 @@
 //! §12.6: session records and whether the process that wrote one still lives. Reservations are
 //! judged by their lock alone (§12.5, `flock::probe_lock`); this is the record side.
 
+#[cfg(any(test, feature = "test-doubles"))]
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "test-doubles"))]
 use std::sync::{Mutex, PoisonError};
 
 use serde_json::Value;
@@ -445,6 +447,7 @@ fn parse_procargs(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
 
 /// One process as `FakeProcessProbe` answers for it. Every field defaults to `None`, "cannot be
 /// determined"; `exists: None` therefore makes a record live whatever else is set.
+#[cfg(any(test, feature = "test-doubles"))]
 #[derive(Debug, Clone, Default)]
 pub struct FakeProcess {
     pub exists: Option<bool>,
@@ -456,12 +459,14 @@ pub struct FakeProcess {
     pub ppid: Option<u32>,
 }
 
-/// Tests only (no feature gate: it touches nothing). Unknown pids are `exists: Some(false)`.
+/// Tests only: behind the `test-doubles` feature. Unknown pids are `exists: Some(false)`.
+#[cfg(any(test, feature = "test-doubles"))]
 #[derive(Default)]
 pub struct FakeProcessProbe {
     procs: Mutex<BTreeMap<u32, FakeProcess>>,
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl FakeProcessProbe {
     pub fn new() -> Self {
         Self::default()
@@ -483,6 +488,7 @@ impl FakeProcessProbe {
     }
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl ProcessProbe for FakeProcessProbe {
     fn exists(&self, pid: u32) -> Option<bool> {
         match self.get(pid) {

@@ -36,7 +36,7 @@ unicode-width.workspace = true
 
 [dev-dependencies]
 tagteam-fake.workspace = true
-tagteam-provider = { workspace = true, features = ["file-keychain", "mock-server"] }
+tagteam-provider = { workspace = true, features = ["file-keychain", "mock-server", "test-doubles"] }
 assert_cmd.workspace = true
 predicates.workspace = true
 rusqlite.workspace = true

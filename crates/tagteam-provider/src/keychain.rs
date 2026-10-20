@@ -1,7 +1,12 @@
+#[cfg(any(test, feature = "test-doubles"))]
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-doubles"))]
+use std::sync::Mutex;
+#[cfg(any(test, feature = "test-doubles"))]
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::read::{Read, ReadError};
 
@@ -175,6 +180,7 @@ impl<K: Keychain + ?Sized> Keychain for Arc<K> {
     }
 }
 
+#[cfg(any(test, feature = "test-doubles", feature = "file-keychain"))]
 fn locked_read<T>() -> Read<T> {
     Read::Unreadable(ReadError::locked(
         "keychain",
@@ -205,9 +211,11 @@ pub(crate) fn empty_service_read<T>() -> Read<T> {
     ))
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 type Key = (String, String);
 
 /// In-memory Keychain for tests, with failure injection.
+#[cfg(any(test, feature = "test-doubles"))]
 #[derive(Default)]
 pub struct FakeKeychain {
     items: Mutex<BTreeMap<Key, Vec<u8>>>,
@@ -223,10 +231,12 @@ pub struct FakeKeychain {
     counts: Arc<ReadCounts>,
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 fn key(s: &str, a: &str) -> Key {
     (s.to_owned(), a.to_owned())
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 fn toggle(set: &Mutex<BTreeSet<String>>, s: &str, on: bool) {
     let mut g = set.lock().unwrap();
     if on {
@@ -236,6 +246,7 @@ fn toggle(set: &Mutex<BTreeSet<String>>, s: &str, on: bool) {
     }
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl FakeKeychain {
     pub fn new() -> Self {
         Self::default()
@@ -283,6 +294,7 @@ impl FakeKeychain {
     }
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl Keychain for FakeKeychain {
     /// Inside a scope whose token holds a signal, every secret read is interrupted, as the
     /// `security` driver's is, and counted as neither (H4). A locked fake refuses every secret

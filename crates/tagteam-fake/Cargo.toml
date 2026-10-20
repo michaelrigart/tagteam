@@ -14,6 +14,7 @@ tagteam-provider.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+tagteam-provider = { workspace = true, features = ["test-doubles"] }
 tempfile.workspace = true
 
 [lints]

@@ -17,6 +17,10 @@ mock-server = []
 # A record of every `FlockGuard::try_lock` (so `lock` too), for tests that prove a code path takes
 # no lock. Never in release builds.
 lock-log = []
+# The in-memory doubles other crates' tests use: FakeClock, FakeKeychain, RecordedRequest,
+# ScriptedHttp, FakeProcess, FakeProcessProbe, ScriptedSpawner. Only dev-dependencies may enable
+# it: dist builds the whole workspace, so a feature a normal dependency enables ships.
+test-doubles = []
 
 [dependencies]
 tagteam-core.workspace = true

@@ -43,29 +43,37 @@ pub(crate) fn fork_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 pub use cancel::{Cancel, Interrupted};
-pub use clock::{Clock, FakeClock, SystemClock};
+#[cfg(any(test, feature = "test-doubles"))]
+pub use clock::FakeClock;
+pub use clock::{Clock, SystemClock};
 pub use credential::{Credential, FreshCredential, Provenance};
 pub use doctor::{Check, CheckStatus};
 pub use env::{Env, EnvError};
 pub use flock::{FlockGuard, LockProbe, MutationGuard, holders_of, probe_lock};
-pub use http::{
-    Http, HttpError, HttpRequest, HttpResponse, Method, NoHttp, RecordedRequest, ScriptedHttp,
-};
+pub use http::{Http, HttpError, HttpRequest, HttpResponse, Method, NoHttp};
+#[cfg(any(test, feature = "test-doubles"))]
+pub use http::{RecordedRequest, ScriptedHttp};
+#[cfg(any(test, feature = "test-doubles"))]
+pub use keychain::FakeKeychain;
 #[cfg(feature = "file-keychain")]
 pub use keychain::FileKeychain;
-pub use keychain::{FakeKeychain, Keychain, KeychainError, LockState, ReadCounts, ReadTally};
+pub use keychain::{Keychain, KeychainError, LockState, ReadCounts, ReadTally};
+#[cfg(any(test, feature = "test-doubles"))]
+pub use liveness::{FakeProcess, FakeProcessProbe};
 pub use liveness::{
-    FakeProcess, FakeProcessProbe, ProcessProbe, RecordEntry, SessionRecord, SystemProcessProbe,
-    parse_lstart, parse_session_record, read_session_records, read_session_records_dated,
-    read_supervisor_lock, record_is_live,
+    ProcessProbe, RecordEntry, SessionRecord, SystemProcessProbe, parse_lstart,
+    parse_session_record, read_session_records, read_session_records_dated, read_supervisor_lock,
+    record_is_live,
 };
 pub use mkdir_lock::{LockError, MkdirLock, MkdirLockSpec};
 #[cfg(feature = "mock-server")]
 pub use mock_server::{MockReply, MockRequest, MockServer};
+#[cfg(any(test, feature = "test-doubles"))]
+pub use process::ScriptedSpawner;
 pub use process::{
-    Captured, Discarded, ExitWatch, Liveness, ProcessSpawner, ProcessStamp, ScriptedSpawner,
-    SpawnSpec, SystemSpawner, Watched, current_uid, exec_command, exit_code, find_on_path,
-    run_bounded, run_captured, run_discarded, spawn_session,
+    Captured, Discarded, ExitWatch, Liveness, ProcessSpawner, ProcessStamp, SpawnSpec,
+    SystemSpawner, Watched, current_uid, exec_command, exit_code, find_on_path, run_bounded,
+    run_captured, run_discarded, spawn_session,
 };
 pub use profile::{
     LAUNCH_DIR, LINKS_FILE, LinksRecord, MARKER_FILE, PENDING_LAUNCH_DIR, PendingEntry,

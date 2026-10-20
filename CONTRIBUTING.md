@@ -44,6 +44,9 @@ These are the checks CI runs on macOS and Linux (`.github/workflows/ci.yml`), an
 needs all of them to pass. The `test-support` feature gives the tests a file-backed fake
 Keychain, crash points and an injectable lock timeout. It is never part of a release build.
 
+`tagteam-provider`'s in-memory doubles (`FakeKeychain`, `FakeClock`, `ScriptedHttp`, `FakeProcessProbe`,
+`ScriptedSpawner`) sit behind its `test-doubles` feature, which only dev-dependencies may enable.
+
 CI also runs `cargo deny check advisories` (the `deny` job, on Linux only). It runs in the cloud
 rather than through `cargo` locally.
 
