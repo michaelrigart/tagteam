@@ -486,6 +486,20 @@ impl TransientKind {
             TransientKind::BadResponse => "bad-response".into(),
         }
     }
+
+    /// `token`'s inverse: `Some` only for a spelling `token` writes (`http-0401` is `None`).
+    pub fn parse(s: &str) -> Option<TransientKind> {
+        match s {
+            "pre-send" => Some(TransientKind::PreSend),
+            "ambiguous" => Some(TransientKind::Ambiguous),
+            "bad-response" => Some(TransientKind::BadResponse),
+            _ => s
+                .strip_prefix("http-")
+                .and_then(|code| code.parse::<u16>().ok())
+                .filter(|code| format!("http-{code}") == s)
+                .map(TransientKind::Http),
+        }
+    }
 }
 
 /// The provider's verdict on one token request (§7.3 steps 5 and 7). The engine owns what
@@ -1305,5 +1319,30 @@ mod tests {
             verdict(reply(503, &[("retry-after", "7")], b"")),
             failed(TransientKind::Http(503), Some(7.0))
         );
+    }
+
+    #[test]
+    fn a_transient_kind_parses_only_the_tokens_it_writes() {
+        for k in [
+            TransientKind::PreSend,
+            TransientKind::Ambiguous,
+            TransientKind::BadResponse,
+            TransientKind::Http(100),
+            TransientKind::Http(429),
+            TransientKind::Http(65535),
+        ] {
+            assert_eq!(TransientKind::parse(&k.token()), Some(k));
+        }
+        for s in [
+            "http-0401",
+            "http-",
+            "http-+5",
+            "http-70000",
+            "http-401 ",
+            "Pre-Send",
+            "",
+        ] {
+            assert_eq!(TransientKind::parse(s), None, "{s:?}");
+        }
     }
 }
