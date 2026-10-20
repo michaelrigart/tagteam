@@ -84,6 +84,8 @@ pub enum Command {
     },
     /// Store an API key or a setup token (`-` reads it from stdin)
     AddToken {
+        /// The token. Pass `-` to read it from stdin, or omit it to be prompted without echo; a token
+        /// given here is visible to other local users and kept in shell history
         token: Option<String>,
         #[arg(long)]
         position: Option<u32>,

@@ -9,7 +9,7 @@ use common::{LOCKED, login, seed_home};
 use serde_json::{Value, json};
 use tagteam::app::{self, Context, Io};
 use tagteam::cli::Cli;
-use tagteam::prompt::Prompter;
+use tagteam::prompt::{ARGV_TOKEN_WARNING, Prompter};
 use tagteam_cc::live::Platform;
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{CLAUDE_CODE, ProviderId, WindowKind};
@@ -684,10 +684,30 @@ fn declining_add_token_over_an_occupied_position_cancels_and_keeps_the_occupant(
     );
     assert_eq!(
         (code, out.as_str(), err.as_str()),
-        (1, "", "tagteam: cancelled\n")
+        (
+            1,
+            "",
+            format!("{ARGV_TOKEN_WARNING}\ntagteam: cancelled\n").as_str()
+        )
     );
     assert_eq!(no.asked, [REPLACE_A]);
     assert_eq!(h.ok(&["list"]), LIVE_A_OFFLINE);
+}
+
+#[test]
+fn a_token_on_the_command_line_warns_on_stderr_and_one_from_the_prompt_does_not() {
+    let h = H::new();
+    let (code, _, err) = h.run(&["add-token", "sk-ant-api03-key"], &mut Scripted::none());
+    assert_eq!(
+        (code, err.as_str()),
+        (0, format!("{ARGV_TOKEN_WARNING}\n").as_str())
+    );
+    // The prompt path (`Scripted` answers `secret`): stderr stays empty.
+    let (code, _, err) = h.run(
+        &["add-token", "--position", "2"],
+        &mut Scripted::answering(&["sk-ant-api03-key2"]),
+    );
+    assert_eq!((code, err.as_str()), (0, ""));
 }
 
 #[test]
@@ -1300,7 +1320,14 @@ fn ctrl_c_at_a_choice_or_a_replacement_question_interrupts() {
         &mut ctrl_c,
         &cancel,
     );
-    assert_eq!((code, out.as_str(), err.as_str()), (143, "", INTERRUPTED));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            143,
+            "",
+            format!("{ARGV_TOKEN_WARNING}\n{INTERRUPTED}").as_str()
+        )
+    );
     assert_eq!(ctrl_c.asked, [REPLACE_A]);
     assert_eq!(h.ok(&["list"]), LIVE_A_OFFLINE);
 }

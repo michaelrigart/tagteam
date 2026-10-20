@@ -254,20 +254,35 @@ fn declined(e: &io::Error) -> Option<String> {
     None
 }
 
-/// One line from the terminal stdin is, for `add-token -`: read as a prompt reads one, in slices
-/// the token ends, so Ctrl-C does not wait for Enter (the handler restarts a plain read). `None`
-/// once a signal ended it; end of input reads as an empty line, as a plain read would.
+/// One line from the terminal stdin is, for `add-token -`: read as a prompt reads a secret, with
+/// the echo off, in slices the token ends, so Ctrl-C does not wait for Enter (the handler
+/// restarts a plain read). `None` once a signal ended it; end of input reads as an empty line,
+/// as a plain read would.
 pub fn read_terminal_line(cancel: &Cancel) -> io::Result<Option<String>> {
     let tty = open_prompt_terminal()?;
-    match read_line(&tty, cancel)? {
-        LineRead::Line(line) => Ok(Some(line)),
-        LineRead::End => Ok(Some(String::new())),
-        LineRead::Interrupted => {
-            // The terminal echoed no newline: end the line the `^C` is on.
-            ask("\n");
-            Ok(None)
-        }
-    }
+    read_terminal_line_on(&tty, cancel)
+}
+
+/// `read_terminal_line` on the terminal `tty`. The Enter typed was not echoed, nor was the
+/// `^C` of an interruption: the line is ended here whichever way the read returns.
+fn read_terminal_line_on(tty: &File, cancel: &Cancel) -> io::Result<Option<String>> {
+    let read = read_secret(tty, cancel)?;
+    let _ = (&*tty).write_all(b"\n");
+    Ok(match read {
+        LineRead::Line(line) => Some(line),
+        LineRead::End => Some(String::new()),
+        LineRead::Interrupted => None,
+    })
+}
+
+/// What `add-token` prints to stderr when the token came on the command line (§10.2).
+pub const ARGV_TOKEN_WARNING: &str = "warning: the token was passed on the command line, where other local users can see it and your shell history keeps it; use `tagteam add-token -` or run `tagteam add-token` for a prompt instead";
+
+/// Passes `token`, a token given on the command line, on after the warning to `err`. A failed
+/// write is ignored, as for the other warnings.
+pub fn note_argv_token(err: &mut dyn Write, token: String) -> String {
+    let _ = writeln!(err, "{ARGV_TOKEN_WARNING}");
+    token
 }
 
 /// One line from stdin when it is not a terminal (`add-token -`), without changing fd 0's file
@@ -964,5 +979,59 @@ mod tests {
             (&pty.master).write_all(&[4]).unwrap(); // Ctrl-D on an empty line
             assert_eq!(read(&tty, &Cancel::new()).unwrap(), LineRead::End, "{name}");
         }
+    }
+
+    #[test]
+    fn a_terminal_line_is_read_with_the_echo_off_and_ended_with_a_newline_of_our_own() {
+        let pty = pty();
+        let tty = pty.open();
+        let before = flags(&pty.slave);
+        let watch = pty.slave.try_clone().unwrap();
+        let reader = thread::spawn(move || read_terminal_line_on(&tty, &Cancel::new()));
+        // Type only once the read has turned the echo off; typed earlier, the terminal echoes it.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while flags(&watch).3 & libc::ECHO != 0 {
+            assert!(Instant::now() < deadline, "the echo was never turned off");
+            thread::sleep(Duration::from_millis(10));
+        }
+        (&pty.master).write_all(b"sk-ant-oat01-secret\n").unwrap();
+        assert_eq!(
+            reader.join().unwrap().unwrap(),
+            Some("sk-ant-oat01-secret".to_owned())
+        );
+        let screen = shown(&pty.master);
+        assert!(
+            !String::from_utf8_lossy(&screen).contains("sk-ant"),
+            "echoed: {screen:?}"
+        );
+        assert!(
+            screen.contains(&b'\n'),
+            "the line was not ended: {screen:?}"
+        );
+        assert_eq!(flags(&pty.slave), before, "the terminal is as it was");
+    }
+
+    #[test]
+    fn a_signal_ends_a_terminal_line_read_with_the_terminal_restored_and_the_line_ended() {
+        let pty = pty();
+        let tty = pty.open();
+        let before = flags(&pty.slave);
+        let cancel = Cancel::new();
+        let setter = set_after(&cancel, Duration::from_millis(150), libc::SIGINT);
+        assert_eq!(read_terminal_line_on(&tty, &cancel).unwrap(), None);
+        setter.join().unwrap();
+        assert_eq!(flags(&pty.slave), before);
+        assert!(shown(&pty.master).contains(&b'\n'));
+    }
+
+    #[test]
+    fn a_token_on_the_command_line_is_returned_with_the_warning_on_the_error_stream() {
+        let mut err = Vec::new();
+        assert_eq!(
+            note_argv_token(&mut err, "sk-ant-api03-key".into()),
+            "sk-ant-api03-key"
+        );
+        assert_eq!(err, format!("{ARGV_TOKEN_WARNING}\n").into_bytes());
+        assert!(!ARGV_TOKEN_WARNING.contains("sk-ant"));
     }
 }

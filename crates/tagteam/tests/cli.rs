@@ -11,6 +11,7 @@ use assert_cmd::assert::OutputAssertExt;
 use common::{LOCKED, cmd, expire_vault, live_email, login, seed_home, std_cmd, two_accounts};
 use predicates::prelude::PredicateBooleanExt;
 use serde_json::{Value, json};
+use tagteam::prompt::ARGV_TOKEN_WARNING;
 use tagteam_core::AccountId;
 use tagteam_engine::store::Store;
 use tagteam_provider::mock_server::{MockReply, MockServer};
@@ -196,7 +197,8 @@ fn add_token_reads_a_line_from_stdin() {
         .args(["add-token", "-"])
         .write_stdin("sk-ant-api03-from-stdin\n")
         .assert()
-        .success();
+        .success()
+        .stderr("");
     let out = cmd(d.path())
         .args(["list", "--json"])
         .assert()
@@ -206,6 +208,17 @@ fn add_token_reads_a_line_from_stdin() {
         .clone();
     let v: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["accounts"][0]["usageStatus"], "api_key");
+}
+
+#[test]
+fn add_token_with_the_token_on_argv_prints_the_warning() {
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(d.path().join("home")).unwrap();
+    cmd(d.path())
+        .args(["add-token", "sk-ant-api03-key"])
+        .assert()
+        .success()
+        .stderr(format!("{ARGV_TOKEN_WARNING}\n"));
 }
 
 #[test]
