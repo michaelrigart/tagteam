@@ -259,9 +259,13 @@ Spec §6.5's `engine/fsutil.rs` names this crate's root, like its `engine/vault.
 **Interfaces:**
 - Produces: in `fsutil.rs`, `pub(crate) struct FileId { dev: u64, ino: u64 }` with `pub(crate) fn of(meta: &fs::Metadata) -> FileId`. It derives `Clone, Copy, Debug, PartialEq, Eq`, plus `Hash` only if a set needs it. `fsutil::identity` is gone.
 
-- [ ] **Step 1: The test** (Review Focus 5), unless an existing purge test already pins it; the report then names that test.
-  - Write `a_hard_link_to_a_protected_file_is_still_refused`: purge must refuse a path that is a hard link to a file its envelope protects, exactly as it refuses that file's own path.
-  - Run it. Expected: PASS on today's code, because this is a regression pin. Then confirm it can fail: temporarily make the comparison look at `ino` only, see the test fail, and revert.
+- [ ] **Step 1: The tests** (Review Focus 5).
+  - **The hard link.** Write `a_hard_link_to_a_protected_file_is_still_refused`, unless an existing purge test already pins it (the report then names that test).
+    - Purge must refuse a path that is a hard link to a file its envelope protects, exactly as it refuses that file's own path.
+    - Run it. Expected: PASS on today's code, because this is a regression pin.
+    - Confirm it can fail: temporarily make purge compare the paths themselves in place of their file identities, see the test fail, and revert. A hard link shares both device and inode, so it cannot tell the two fields apart.
+  - **Both fields.** After Step 2, add `a_file_id_compares_device_and_inode` to `fsutil.rs`'s test module.
+    - Assert that `FileId { dev: 1, ino: 5 }` is not equal to `FileId { dev: 2, ino: 5 }`, nor to `FileId { dev: 1, ino: 6 }`, and is equal to itself.
 - [ ] **Step 2: The rename.**
   - `identity(&meta)` becomes `FileId::of(&meta)` everywhere: `lifecycle.rs` 497, 500 and 522, and `purge.rs` 948-1007.
   - `Vec<(u64, u64)>` becomes `Vec<FileId>` at `purge.rs:931`, `:964` and `:965`.
@@ -345,14 +349,16 @@ Facts: `.superpowers/research/r2-facts/guard-args-placement.md` §1 and §2.
     - Setup: an interrupted switch whose recovery is blocked, for provider A.
     - Assert: guarding A through `guard_or_refuse` returns `EngineError::RecoveryBlocked`, or `RecoveryMoved` as the row dictates, not `InterruptedSwitch`.
   - Run them. Expected: PASS on today's code, as regression pins. Confirm each can fail by temporarily breaking the line it pins, then revert.
-- [ ] **Step 2: Implement `guard`.** Fold `guard_recovering_from` and `guard_or_refuse_each_within` into it, keeping their logic and order:
-  1. `acquire_guard(r.timeout)`.
-  2. Recover each dead journal. Read the rows with `Self::dead_decodable_journals` for `DecodableOnly`, else `Self::dead_journals`. Ask the oracle for every mode but `FingerprintsOnly`. Collect `RecoveryBlocked | RecoveryMoved` rows into the `Blocked` list.
-  3. If `r.refuse_interrupted`, check each of `r.providers` in order: `self.interrupted(p)?`. If it is interrupted, return the blocked error for `p` (`swap_remove`), else `EngineError::InterruptedSwitch`.
-  4. Return `(guard, blocked)`.
+- [ ] **Step 2: Implement `guard`.** It is `guard_recovering_from`'s body followed by `guard_or_refuse_each_within`'s check, with their order and comments kept (`engine.rs:494-560` and `:394-421`). The journal reader is `Self::dead_decodable_journals` for `DecodableOnly`, else `Self::dead_journals`. The sequence:
+  1. **Hints, before any lock.** Read the journal rows. For every mode but `FingerprintsOnly`, ask the oracle for each row's hints (`self.recovery_hints(&row)?`); `FingerprintsOnly` gives each row no hints. No network call is made while the guard is held.
+  2. **The hook.** `hooks::point(self, "before-mutation-lock")?`.
+  3. **The lock.** `self.acquire_guard(r.timeout)?`.
+  4. **Recovery, under the lock.** Read the journal rows again, because a switch may have died meanwhile. Recover each row with the hints step 1 found for an equal row, or none. Map `EntryMoved` to `RecoveryMoved`. Return at once on an error that carries a signal. Log the rest, and collect `RecoveryBlocked | RecoveryMoved` into `Blocked`. All of this is exactly as today.
+  5. **The refusal.** If `r.refuse_interrupted`, check each of `r.providers` in order: `self.interrupted(p)?`. If it is interrupted, return the blocked error for `p` (`swap_remove`), else `EngineError::InterruptedSwitch`.
+  6. **The result.** Return `(guard, blocked)`.
 - [ ] **Step 3: The wrappers.**
   - `guard_or_refuse(provider)` is `self.guard(&GuardRequest::refusing_one(provider)).map(|(g, _)| g)`.
-  - `settle_or_refuse(r)` keeps today's conditional: for each of `r.providers`, if `self.interrupted(p)?`, it takes `self.guard(r)?` and drops it. With no store, nothing is interrupted and no lock is taken.
+  - `settle_or_refuse(r)` keeps today's conditional. It checks `r.providers` in order with `self.interrupted(p)?`. On the first one that is interrupted, it takes `self.guard(r)?` once, drops it, and returns. With no store, nothing is interrupted and no lock is taken.
   - `mutation_guard` is `guard(&GuardRequest::default())`. `metadata_guard` uses `recovery: FingerprintsOnly`. `purge_guard` uses `recovery: DecodableOnly`. Each drops `Blocked`.
 - [ ] **Step 4: The call sites.**
   - `switch.rs:1669` (`settle_or_refuse_as(&req.provider, req.source)`) becomes `self.settle_or_refuse(&GuardRequest { source: req.source, ..GuardRequest::refusing_one(&req.provider) })`. `auto.rs:727` changes the same way, with `self.provider` and `self.source`.
@@ -658,6 +664,14 @@ Facts: `.superpowers/research/r2-facts/switch.md` §6.
   - Run `rg -n 'Decision [0-9]' crates/tagteam-engine/src/switch crates/tagteam-engine/src/doctor`. Expected: no hits.
   - Run `cargo fmt --all --check`.
 - [ ] **Step 3: Commit** "Rewrite the switch's Decision references as the rules they stood for".
+
+## Final verification (the controller, before the PR)
+
+Spec §3.1 asks for tests on macOS and on Linux before R2 is reported done.
+
+- **macOS, outside the sandbox:** `cargo fmt --all --check`, both clippy commands, and `cargo test --workspace --locked --no-fail-fast --features tagteam/test-support`. Report the totals as passed/total.
+- **Linux:** the same `cargo test` command, in `CONTRIBUTING.md`'s Docker reproduction (`rust:1.88`, run as a non-root user with a passwd entry, `HOME` outside `/tmp`), against the branch head.
+- **The allow count:** `rg -c 'too_many_arguments' crates/tagteam-engine/src` reports only `store/tokens.rs`.
 
 ## Spec deltas found while planning
 
