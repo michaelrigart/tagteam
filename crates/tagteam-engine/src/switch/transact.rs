@@ -166,7 +166,7 @@ impl Engine {
         let same_pick = match req.target {
             SwitchTarget::Account(_) => true,
             SwitchTarget::Rotation => self.rotation_pick_stands(p, store, plan, again.as_ref())?,
-            // Decision 11: no network under the locks, so the ranking is not recomputed. The
+            // No network under the locks, so the ranking is not recomputed. The
             // pick stands while it is still a candidate and the live login is the account it
             // was ranked against; otherwise planning again ranks from the store's readings.
             SwitchTarget::Usage { .. } => {
@@ -212,7 +212,7 @@ impl Engine {
     /// are settled (§6.2). A quiescent profile that rotated since its seed is adopted into the
     /// vault, so the activation that follows reads its generation. A conflict refuses, since the
     /// vault's generation may be consumed. A profile that cannot be read refuses as an
-    /// unreadable vault does, naming the account (Decision 9).
+    /// unreadable vault does, naming the account, rather than guessing at its credential.
     pub(super) fn settle_profile(
         &self,
         p: &dyn Provider,
@@ -252,7 +252,7 @@ impl Engine {
         warnings.extend(plan.warnings.iter().cloned());
         warnings.extend(std::mem::take(&mut pf.locked_warnings));
         // The live login's own secret, the only one the live identity names when a secret is
-        // displaced (§6.3, Decision 13): the live secret on a stored account's own axis, or the
+        // displaced (§6.3): the live secret on a stored account's own axis, or the
         // credential entry's for an unmanaged login, which `oauthAccount` names. Unlike step 6's
         // `from_secret`, it never falls back to the other axis.
         let own_secret = match &pf.outgoing {

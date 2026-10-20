@@ -308,8 +308,9 @@ impl Engine {
     }
 
     /// §9.3, before a usage strategy plans: quarantines that no longer bind are released
-    /// (§7.4, Decision 9), then the managed live account and every candidate are collected on
-    /// demand (§8.3, Decision 8). Returns the collector's warnings. Other targets do neither,
+    /// (§7.4), each under its account's lock and try-only, so a busy lock leaves the quarantine
+    /// for the next caller. Then the managed live account and every rotation candidate are
+    /// collected on demand (§8.3). Returns the collector's warnings. Other targets do neither,
     /// and neither does a usage strategy over an unmanaged live login without --force:
     /// planning reports that no-op (§9.2), and the network is not used for it.
     pub(super) fn prepare_usage(
