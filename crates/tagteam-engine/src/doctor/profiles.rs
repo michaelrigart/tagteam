@@ -13,7 +13,7 @@ use crate::settings::Settings;
 use crate::store::AccountRow;
 
 use super::files::{entries, readable, subdirs};
-use super::{Run, Secrets, command};
+use super::{Id, Run, Secrets, command};
 
 /// `sessions.reservation` for a reservation `path` still held after its tagteam `parent` died.
 /// `holders` is `holders_of`'s answer; `None` means either that this OS cannot tell, or (when
@@ -29,7 +29,7 @@ fn held_reservation(
 ) -> Check {
     if holders.is_none() && !still_there {
         return Check::info(
-            "sessions.reservation",
+            Id::SESSIONS_RESERVATION,
             format!(
                 "{} was held although its tagteam (pid {parent}) is gone, but the lock went away while doctor looked, so account {n}'s state is not known to have stayed the same",
                 path.display()
@@ -49,7 +49,7 @@ fn held_reservation(
         None => "this OS cannot tell which process holds it".to_owned(),
     };
     Check::info(
-        "sessions.reservation",
+        Id::SESSIONS_RESERVATION,
         format!(
             "{} is still held although its tagteam (pid {parent}) is gone ({holders}): a process its `{launch}` started still runs, so account {n} stays in a session",
             path.display()
@@ -95,7 +95,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::warn(
-                        "sessions.profiles",
+                        Id::SESSIONS_PROFILES,
                         format!(
                             "{} cannot be listed ({}), so no session profile is checked",
                             dir.display(),
@@ -122,7 +122,7 @@ impl Run<'_> {
             match marker {
                 Read::Unreadable(e) => found.push(
                     Check::warn(
-                        "sessions.marker",
+                        Id::SESSIONS_MARKER,
                         format!(
                             "the profile marker {} cannot be read ({}), so whose profile {} is cannot be told",
                             e.what,
@@ -136,7 +136,7 @@ impl Run<'_> {
                     if only.is_none() {
                         found.push(
                             Check::warn(
-                                "sessions.orphan",
+                                Id::SESSIONS_ORPHAN,
                                 format!(
                                     "{} is a profile of {}, which this tagteam does not have",
                                     dir.display(),
@@ -153,7 +153,7 @@ impl Run<'_> {
                     if only.is_none() {
                         found.push(
                             Check::warn(
-                                "sessions.orphan",
+                                Id::SESSIONS_ORPHAN,
                                 format!(
                                     "{} is a profile of {}, which has no account in this store",
                                     dir.display(),
@@ -169,7 +169,7 @@ impl Run<'_> {
                 Read::Present(_) => {}
                 Read::Absent => found.push(
                     Check::warn(
-                        "sessions.orphan",
+                        Id::SESSIONS_ORPHAN,
                         format!(
                             "{} has no profile marker and names no account",
                             dir.display()
@@ -205,7 +205,7 @@ impl Run<'_> {
             Some(Ok(outer)) => self.splits(p, &outer, dir, found),
             Some(Err(e)) => found.push(
                 Check::warn(
-                    "sessions.marker",
+                    Id::SESSIONS_MARKER,
                     format!("account {n}'s profile marker records an outer home that cannot be read: {e}"),
                 )
                 .fix(format!("nothing to do: account {n}'s next `tagteam run` records it again")),
@@ -222,7 +222,7 @@ impl Run<'_> {
         if quiescent && p.has_baseline(dir) {
             found.push(
                 Check::info(
-                    "sessions.baseline",
+                    Id::SESSIONS_BASELINE,
                     format!("account {n}'s profile has a config baseline awaiting merge-back"),
                 )
                 .fix(format!(
@@ -239,14 +239,18 @@ impl Run<'_> {
                     "needs a bootstrap: its last login check found it invalid"
                 };
                 found.push(
-                    Check::info("sessions.bootstrap", format!("account {n}'s profile {why}")).fix(
-                        format!("nothing to do: account {n}'s next `tagteam run` bootstraps it"),
-                    ),
+                    Check::info(
+                        Id::SESSIONS_BOOTSTRAP,
+                        format!("account {n}'s profile {why}"),
+                    )
+                    .fix(format!(
+                        "nothing to do: account {n}'s next `tagteam run` bootstraps it"
+                    )),
                 );
             }
             Read::Unreadable(e) => found.push(
                 Check::warn(
-                    "sessions.seed",
+                    Id::SESSIONS_SEED,
                     format!(
                         "account {n}'s profile seed {} cannot be read: {}",
                         e.what, e.detail
@@ -269,7 +273,7 @@ impl Run<'_> {
         let held = match p.read_profile_credential(env, dir, &marker.config_dir) {
             Read::Unreadable(e) => {
                 found.push(
-                    Check::warn("sessions.credential", format!("{cannot}: {e}"))
+                    Check::warn(Id::SESSIONS_CREDENTIAL, format!("{cannot}: {e}"))
                         .fix("make it readable again (on macOS, unlock the login keychain)"),
                 );
                 return;
@@ -277,7 +281,7 @@ impl Run<'_> {
             Read::Present(c) if c.provenance() == Provenance::Degraded => {
                 found.push(
                     Check::warn(
-                        "sessions.credential",
+                        Id::SESSIONS_CREDENTIAL,
                         format!("{cannot}: only its file could be read, which may be out of date"),
                     )
                     .fix("make its Keychain item readable again (unlock the login keychain)"),
@@ -292,7 +296,7 @@ impl Run<'_> {
             return;
         }
         // §12.5: only a login that names another account is drift, which is ignored. An absent
-        // identity decides nothing: the table runs, and only a rotation needs one (Decision 9).
+        // identity decides nothing: the table runs, and only a rotation needs one, as `apply_provenance` has it.
         let identity_absent = match p.profile_identity(env, dir) {
             Read::Present(login) if !identity_drifted(&login, row) => false,
             Read::Present(_) => return,
@@ -300,7 +304,7 @@ impl Run<'_> {
             Read::Unreadable(e) => {
                 found.push(
                     Check::warn(
-                        "sessions.provenance",
+                        Id::SESSIONS_PROVENANCE,
                         format!(
                             "whether account {n}'s profile and the vault both moved cannot be told: the profile's identity cannot be read ({e})"
                         ),
@@ -333,7 +337,7 @@ impl Run<'_> {
         match provenance(p_fp.as_str(), v_fp.as_str(), &seed.seed_fp, stale) {
             ProvenanceVerdict::Conflict => found.push(
                 Check::fail(
-                    "sessions.provenance",
+                    Id::SESSIONS_PROVENANCE,
                     format!(
                         "account {n}'s profile and the vault both moved since they last agreed: nothing is captured, refreshed or launched for the account"
                     ),
@@ -341,10 +345,10 @@ impl Run<'_> {
                 .fix(replace),
             ),
             // The profile rotated the vault's generation, but names no identity that says the
-            // rotation is the account's: no holder of its lock captures it (Decision 9).
+            // rotation is the account's: no holder of its lock captures it, so it warns.
             ProvenanceVerdict::Capture if identity_absent => found.push(
                 Check::warn(
-                    "sessions.provenance",
+                    Id::SESSIONS_PROVENANCE,
                     format!(
                         "account {n}'s profile holds a login it rotated but names no identity, so it cannot be told to be the account's and is not captured"
                     ),
@@ -371,7 +375,7 @@ impl Run<'_> {
                 if now != marker.config_dir {
                     found.push(
                         Check::warn(
-                            "sessions.spelling",
+                            Id::SESSIONS_SPELLING,
                             format!(
                                 "account {n}'s profile is recorded as {} but is now {now}: the data directory moved",
                                 marker.config_dir
@@ -383,7 +387,7 @@ impl Run<'_> {
             }
             Err(e) => found.push(
                 Check::warn(
-                    "sessions.spelling",
+                    Id::SESSIONS_SPELLING,
                     format!(
                         "whether account {n}'s profile is still at {} cannot be told: {} cannot be resolved ({})",
                         marker.config_dir,
@@ -406,7 +410,7 @@ impl Run<'_> {
             let (src, dst) = (policy.source.join(&w.name), dir.join(&w.name));
             let untold = |path: &Path, e: io::Error| {
                 Check::warn(
-                    "sessions.split",
+                    Id::SESSIONS_SPLIT,
                     format!(
                         "whether {} is split from {} cannot be told: {} cannot be read ({})",
                         dst.display(),
@@ -444,7 +448,7 @@ impl Run<'_> {
             }
             found.push(if w.must.is_some() {
                 Check::fail(
-                    "sessions.split",
+                    Id::SESSIONS_SPLIT,
                     format!(
                         "{} is not the link to {} it must be: memory or history is split, and `tagteam run` refuses the account",
                         dst.display(),
@@ -459,7 +463,7 @@ impl Run<'_> {
                 ))
             } else {
                 Check::warn(
-                    "sessions.split",
+                    Id::SESSIONS_SPLIT,
                     format!(
                         "{} is a real copy where {} should be linked: the two have split",
                         dst.display(),
@@ -527,7 +531,7 @@ impl Run<'_> {
             Err(e) => {
                 found.push(
                     Check::warn(
-                        "sessions.unknown-entries",
+                        Id::SESSIONS_UNKNOWN_ENTRIES,
                         format!(
                             "{} cannot be listed ({}), so whether it holds entries on no share list cannot be told",
                             policy.source.display(),
@@ -547,7 +551,7 @@ impl Run<'_> {
             .collect();
         if unknown.is_empty() {
             found.push(Check::ok(
-                "sessions.unknown-entries",
+                Id::SESSIONS_UNKNOWN_ENTRIES,
                 format!(
                     "every entry of {} is on a share list",
                     policy.source.display()
@@ -557,7 +561,7 @@ impl Run<'_> {
         }
         found.push(
             Check::warn(
-                "sessions.unknown-entries",
+                Id::SESSIONS_UNKNOWN_ENTRIES,
                 format!(
                     "{} holds entries on none of {}'s share lists, so each profile keeps its own: {}",
                     policy.source.display(),

@@ -16,8 +16,8 @@ use crate::store::{
 use crate::vault::SERVICE;
 
 use super::files::{entries, readable};
-use super::store::restore;
-use super::{Run, Secrets, command};
+use super::store::warn_restore;
+use super::{Id, Run, Secrets, command};
 
 /// `login_expires_at` this close is reported (§13.6).
 const EXPIRY_NOTICE_MS: i64 = 7 * 86_400_000;
@@ -33,15 +33,15 @@ fn engine_record_check(pid: u32, liveness: Liveness, daemon: bool) -> Check {
     };
     match liveness {
         Liveness::Live if daemon => {
-            Check::info("auto.engine", format!("auto-switch runs in {who}"))
+            Check::info(Id::AUTO_ENGINE, format!("auto-switch runs in {who}"))
         }
-        Liveness::Live => Check::info("auto.engine", format!("auto-switch runs as {who}")),
+        Liveness::Live => Check::info(Id::AUTO_ENGINE, format!("auto-switch runs as {who}")),
         Liveness::Dead => Check::ok(
-            "auto.engine",
+            Id::AUTO_ENGINE,
             format!("auto-switch is not running (its last engine, {who}, has exited)"),
         ),
         Liveness::Unknown(e) => Check::warn(
-            "auto.engine",
+            Id::AUTO_ENGINE,
             format!(
                 "whether auto-switch runs as {who} cannot be told: the process's start time cannot be read ({e})"
             ),
@@ -91,7 +91,7 @@ impl Run<'_> {
                     self.push(
                         None,
                         Check::warn(
-                            "accounts.orphans",
+                            Id::ACCOUNTS_ORPHANS,
                             format!(
                                 "{} cannot be listed ({}), so whether every vault file names an account cannot be told",
                                 dir.display(),
@@ -106,14 +106,14 @@ impl Run<'_> {
             if orphans.is_empty() {
                 self.push(
                     None,
-                    Check::ok("accounts.orphans", "every vault file names an account"),
+                    Check::ok(Id::ACCOUNTS_ORPHANS, "every vault file names an account"),
                 );
             }
             for path in orphans {
                 self.push(
                     None,
                     Check::warn(
-                        "accounts.orphans",
+                        Id::ACCOUNTS_ORPHANS,
                         format!("{} names no account of this store", path.display()),
                     )
                     .fix(format!(
@@ -132,18 +132,18 @@ impl Run<'_> {
         }
         let check = match keychain.service_has_items(SERVICE) {
             Read::Present(true) => Check::warn(
-                "accounts.orphans",
+                Id::ACCOUNTS_ORPHANS,
                 format!(
                     "the Keychain holds items of service `{SERVICE}` while this store has no account; they may belong to another tagteam data directory on this Mac"
                 ),
             )
             .fix("once no other tagteam data directory uses them, `tagteam purge --keychain-orphans` deletes them"),
             Read::Present(false) | Read::Absent => Check::ok(
-                "accounts.orphans",
+                Id::ACCOUNTS_ORPHANS,
                 format!("the Keychain holds no item of service `{SERVICE}`"),
             ),
             Read::Unreadable(e) => Check::warn(
-                "accounts.orphans",
+                Id::ACCOUNTS_ORPHANS,
                 format!("whether the Keychain holds items of service `{SERVICE}` cannot be told: {e}"),
             )
             .fix("run `tagteam doctor` again; if it persists, `security show-keychain-info` shows the Keychain's state"),
@@ -161,11 +161,11 @@ impl Run<'_> {
         let rows = match store.accounts(&id) {
             Ok(rows) => rows,
             Err(e) => {
-                let check = Check::warn(
-                    "accounts.vault",
+                let check = warn_restore(
+                    self.engine,
+                    Id::ACCOUNTS_VAULT,
                     format!("the store's accounts cannot be read: {e}"),
-                )
-                .fix(restore(self.engine));
+                );
                 self.push(Some(&id), check);
                 return;
             }
@@ -182,7 +182,7 @@ impl Run<'_> {
                         broken += 1;
                         found.push(
                             Check::fail(
-                                "accounts.vault",
+                                Id::ACCOUNTS_VAULT,
                                 format!(
                                     "account {} has no vault entry, as a purge that stopped part way leaves one; it can never be switched to, refreshed or launched",
                                     row.position
@@ -195,7 +195,7 @@ impl Run<'_> {
                         broken += 1;
                         found.push(
                             Check::fail(
-                                "accounts.vault",
+                                Id::ACCOUNTS_VAULT,
                                 format!("account {}'s vault entry cannot be read: {e}", row.position),
                             )
                             .fix(format!(
@@ -207,7 +207,7 @@ impl Run<'_> {
             }
             if broken == 0 && !rows.is_empty() {
                 found.push(Check::ok(
-                    "accounts.vault",
+                    Id::ACCOUNTS_VAULT,
                     format!("the vault holds every account's login ({})", rows.len()),
                 ));
             }
@@ -222,7 +222,7 @@ impl Run<'_> {
             if let Some(reason) = &row.quarantine_reason {
                 found.push(
                     Check::warn(
-                        "accounts.quarantined",
+                        Id::ACCOUNTS_QUARANTINED,
                         format!(
                             "account {} is quarantined ({reason}): {}",
                             row.position,
@@ -245,7 +245,7 @@ impl Run<'_> {
                     };
                     found.push(
                         Check::warn(
-                            "accounts.login-expiry",
+                            Id::ACCOUNTS_LOGIN_EXPIRY,
                             format!("account {}'s login {when}", row.position),
                         )
                         .fix(format!(
@@ -261,7 +261,7 @@ impl Run<'_> {
             match store.live_store_stale(row) {
                 Ok(true) => found.push(
                     Check::warn(
-                        "accounts.live-stale",
+                        Id::ACCOUNTS_LIVE_STALE,
                         format!(
                             "{} still runs the login an explicit command replaced for account {}",
                             p.display_name(),
@@ -285,14 +285,12 @@ impl Run<'_> {
         }
         if let Some(e) = stale_unread {
             found.push(
-                Check::warn(
-                    "accounts.live-stale",
+                warn_restore(self.engine,
+                    Id::ACCOUNTS_LIVE_STALE,
                     format!(
                         "whether {} still runs a login an explicit command replaced cannot be told: the active account cannot be read ({e})",
                         p.display_name()
-                    ),
-                )
-                .fix(restore(self.engine)),
+                    )),
             );
         }
         for check in found {
@@ -314,7 +312,7 @@ impl Run<'_> {
             Ok(meta) => meta.is_none_or(|m| replacing_meta_parses(&m)),
             Err(e) => {
                 return Check::warn(
-                    "accounts.replacement",
+                    Id::ACCOUNTS_REPLACEMENT,
                     format!(
                         "a replacement of account {} was interrupted, and the login details recorded with it cannot be read from the store ({e})",
                         row.position
@@ -335,7 +333,7 @@ impl Run<'_> {
         };
         match (landed, parses) {
             (Some(true), false) => Check::fail(
-                "accounts.replacement",
+                Id::ACCOUNTS_REPLACEMENT,
                 format!(
                     "account {}'s replacement reached the vault, but the login details recorded with it cannot be read, so every command but `remove` and `purge` refuses the account",
                     row.position
@@ -343,7 +341,7 @@ impl Run<'_> {
             )
             .fix(format!("`{remove}`, then add the account again")),
             (None, false) => Check::warn(
-                "accounts.replacement",
+                Id::ACCOUNTS_REPLACEMENT,
                 format!(
                     "a replacement of account {} was interrupted and the login details recorded with it cannot be read; whether it reached the vault cannot be read now",
                     row.position
@@ -353,7 +351,7 @@ impl Run<'_> {
                 "run `tagteam doctor` again once the vault can be read; if it reached the vault, `{remove}` is the way out"
             )),
             _ => Check::warn(
-                "accounts.replacement",
+                Id::ACCOUNTS_REPLACEMENT,
                 format!("a replacement of account {} was interrupted", row.position),
             )
             .fix(format!(
@@ -384,7 +382,7 @@ impl Run<'_> {
                 match store.usage_request_count(&id, &row.identity_key, since) {
                     Ok(n) if n >= budget.hourly_requests => found.push(
                         Check::warn(
-                            "usage.budget",
+                            Id::USAGE_BUDGET,
                             format!(
                                 "account {} has used all {} usage requests of the past hour",
                                 row.position, budget.hourly_requests
@@ -394,14 +392,12 @@ impl Run<'_> {
                     ),
                     Ok(_) => {}
                     Err(e) => found.push(
-                        Check::warn(
-                            "usage.budget",
+                        warn_restore(self.engine,
+                            Id::USAGE_BUDGET,
                             format!(
                                 "account {}'s usage requests of the past hour cannot be counted: {e}",
                                 row.position
-                            ),
-                        )
-                        .fix(restore(self.engine)),
+                            )),
                     ),
                 }
             }
@@ -409,13 +405,11 @@ impl Run<'_> {
                 Ok(Some(state)) => state,
                 Ok(None) => continue,
                 Err(e) => {
-                    found.push(
-                        Check::warn(
-                            "usage.state",
-                            format!("account {}'s usage state cannot be read: {e}", row.position),
-                        )
-                        .fix(restore(self.engine)),
-                    );
+                    found.push(warn_restore(
+                        self.engine,
+                        Id::USAGE_STATE,
+                        format!("account {}'s usage state cannot be read: {e}", row.position),
+                    ));
                     continue;
                 }
             };
@@ -425,7 +419,7 @@ impl Run<'_> {
             {
                 found.push(
                     Check::info(
-                        "usage.backoff",
+                        Id::USAGE_BACKOFF,
                         format!(
                             "account {}'s usage is backed off after {}; the next try is in {}",
                             row.position,
@@ -456,7 +450,7 @@ impl Run<'_> {
             for (what, at) in skewed {
                 found.push(
                     Check::warn(
-                        "usage.clock-skew",
+                        Id::USAGE_CLOCK_SKEW,
                         format!(
                             "account {}'s {what} is stamped {} ahead of now: the clock is, or was, skewed",
                             row.position,
@@ -469,7 +463,7 @@ impl Run<'_> {
         }
         if found.is_empty() && !rows.is_empty() {
             found.push(Check::ok(
-                "usage.state",
+                Id::USAGE_STATE,
                 "no account is backed off, over its budget or stamped by a skewed clock",
             ));
         }
@@ -484,12 +478,12 @@ impl Run<'_> {
         let id = p.id();
         let lock = engine_lock_path(&self.engine.env, &id);
         let running = match read_holder(&lock) {
-            Read::Absent => Check::ok("auto.engine", "auto-switch is not running"),
+            Read::Absent => Check::ok(Id::AUTO_ENGINE, "auto-switch is not running"),
             Read::Present(stamp) => {
                 engine_record_check(stamp.pid, stamp.liveness(), self.held_by_daemon(&stamp))
             }
             Read::Unreadable(e) => Check::warn(
-                "auto.engine",
+                Id::AUTO_ENGINE,
                 format!("whether auto-switch runs cannot be told: {e}"),
             )
             .fix(readable(&lock)),
@@ -499,7 +493,7 @@ impl Run<'_> {
             let unhealthy = match store.autoswitch_state(&id) {
                 Ok(state) if state.unhealthy_ticks > 0 => Some(
                     Check::warn(
-                        "auto.unhealthy",
+                        Id::AUTO_UNHEALTHY,
                         format!(
                             "the last {} auto-switch tick(s) could not read the live account's usage",
                             state.unhealthy_ticks
@@ -509,11 +503,9 @@ impl Run<'_> {
                 ),
                 Ok(_) => None,
                 Err(e) => Some(
-                    Check::warn(
-                        "auto.unhealthy",
-                        format!("the auto-switch state cannot be read: {e}"),
-                    )
-                    .fix(restore(self.engine)),
+                    warn_restore(self.engine,
+                        Id::AUTO_UNHEALTHY,
+                        format!("the auto-switch state cannot be read: {e}")),
                 ),
             };
             if let Some(check) = unhealthy {
@@ -525,7 +517,7 @@ impl Run<'_> {
             self.push(
                 Some(&id),
                 Check::warn(
-                    "auto.strategy",
+                    Id::AUTO_STRATEGY,
                     format!(
                         "autoswitch.strategy is consume-first, but {} has no long usage window to rank by, so auto-switch runs best",
                         p.display_name()
@@ -577,13 +569,13 @@ impl Run<'_> {
             }
         }
         if let Some((n, e)) = unread {
-            let check = Check::warn(
-                "auto.models",
+            let check = warn_restore(
+                self.engine,
+                Id::AUTO_MODELS,
                 format!(
                     "whether autoswitch.models names a model no account's usage reports cannot be told: account {n}'s usage state cannot be read ({e})"
                 ),
-            )
-            .fix(restore(self.engine));
+            );
             self.push(Some(&id), check);
             return;
         }
@@ -599,7 +591,7 @@ impl Run<'_> {
             self.push(
                 Some(&id),
                 Check::warn(
-                    "auto.models",
+                    Id::AUTO_MODELS,
                     format!(
                         "autoswitch.models names {name:?}, but no account's usage reports a window for that model"
                     ),

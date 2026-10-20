@@ -6,8 +6,8 @@ use crate::recover::Direction;
 use crate::store::{JournalRow, Store};
 
 use super::files::entries;
-use super::store::restore;
-use super::{Run, Secrets, Stored, command};
+use super::store::warn_restore;
+use super::{Id, Run, Secrets, Stored, command};
 
 impl Run<'_> {
     /// §13.6 Pending storage, `rescue/` (§6.3): a path that is not a listable directory fails;
@@ -21,7 +21,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::fail(
-                        "pending.rescue-dir",
+                        Id::PENDING_RESCUE_DIR,
                         format!(
                             "{} is not a directory tagteam can list ({e}), so every account's rescues are unknown: `remove` refuses, and no account can be activated safely",
                             dir.display()
@@ -57,7 +57,7 @@ impl Run<'_> {
                     self.push(
                         Some(&provider),
                         Check::warn(
-                            "pending.rescue",
+                            Id::PENDING_RESCUE,
                             format!(
                                 "account {} has a refreshed login in {} that is not in the vault yet",
                                 row.position,
@@ -70,7 +70,7 @@ impl Run<'_> {
                 None => self.push(
                     None,
                     Check::warn(
-                        "pending.rescue-orphan",
+                        Id::PENDING_RESCUE_ORPHAN,
                         format!("{} belongs to no account of this store", path.display()),
                     )
                     .fix(format!(
@@ -95,7 +95,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::warn(
-                        "pending.displaced",
+                        Id::PENDING_DISPLACED,
                         format!("the displaced credentials cannot be listed: {e}"),
                     )
                     .fix(format!(
@@ -122,7 +122,7 @@ impl Run<'_> {
             self.push(
                 Some(&p),
                 Check::info(
-                    "pending.displaced",
+                    Id::PENDING_DISPLACED,
                     format!(
                         "{n} displaced credential(s) in {}: logins a command overwrote, kept for a manual restore",
                         list.dir.display()
@@ -140,7 +140,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::info(
-                        "pending.displaced-unrecorded",
+                        Id::PENDING_DISPLACED_UNRECORDED,
                         format!("{} has no row in the store", file.display()),
                     )
                     .fix(format!("`tagteam displaced --purge {}` deletes it", e.id)),
@@ -149,7 +149,7 @@ impl Run<'_> {
                 self.push(
                     e.provider.as_ref(),
                     Check::info(
-                        "pending.displaced-missing",
+                        Id::PENDING_DISPLACED_MISSING,
                         format!("the displaced entry {} has a row but no file", e.id),
                     )
                     .fix(format!(
@@ -174,11 +174,11 @@ impl Run<'_> {
             Err(e) => {
                 self.push(
                     Some(&id),
-                    Check::warn(
-                        "switch.interrupted",
+                    warn_restore(
+                        self.engine,
+                        Id::SWITCH_INTERRUPTED,
                         format!("the switch journal cannot be read: {e}"),
-                    )
-                    .fix(restore(self.engine)),
+                    ),
                 );
                 return;
             }
@@ -194,11 +194,11 @@ impl Run<'_> {
             let holder = format!("pid {}, started {}", row.holder.pid, row.holder.start);
             found.push(match row.holder.liveness() {
                 Liveness::Live => Check::info(
-                    "switch.interrupted",
+                    Id::SWITCH_INTERRUPTED,
                     format!("a switch to account {position} is under way ({holder})"),
                 ),
                 Liveness::Unknown(e) => Check::warn(
-                    "switch.interrupted",
+                    Id::SWITCH_INTERRUPTED,
                     format!(
                         "a switch to account {position} is journaled by {holder}, which reads as live but may be another user's recycled pid ({e})"
                     ),
@@ -208,7 +208,10 @@ impl Run<'_> {
             });
         }
         if rows.is_empty() {
-            found.push(Check::ok("switch.interrupted", "no switch was interrupted"));
+            found.push(Check::ok(
+                Id::SWITCH_INTERRUPTED,
+                "no switch was interrupted",
+            ));
         }
         for check in found {
             self.push(Some(&id), check);
@@ -230,7 +233,7 @@ impl Run<'_> {
         let retry = command(self.engine, &p.id(), &format!("switch {position}"));
         if self.provider_secrets(p) != Secrets::Readable {
             return Check::warn(
-                "switch.interrupted",
+                Id::SWITCH_INTERRUPTED,
                 format!(
                     "a switch to account {position} was interrupted; whether it can be recovered cannot be read while the Keychain is locked"
                 ),
@@ -242,7 +245,7 @@ impl Run<'_> {
         // undecidable switch, which `direction` would make of it.
         if let Err(e) = crate::switch::refuse_unsafe_live_reads(&live) {
             return Check::warn(
-                "switch.interrupted",
+                Id::SWITCH_INTERRUPTED,
                 format!(
                     "a switch to account {position} was interrupted, and the live login cannot be read to judge it: {e}"
                 ),
@@ -253,21 +256,21 @@ impl Run<'_> {
         }
         match self.engine.direction(p, store, row, &live, &[]) {
             Ok(Direction::Undecidable) => Check::fail(
-                "switch.interrupted",
+                Id::SWITCH_INTERRUPTED,
                 format!(
                     "a switch to account {position} was interrupted, and the live login cannot tell whether it landed: commands that change accounts refuse until it is settled"
                 ),
             )
             .fix(format!("`{force}` settles it by activating the account you name")),
             Ok(_) => Check::warn(
-                "switch.interrupted",
+                Id::SWITCH_INTERRUPTED,
                 format!("a switch to account {position} was interrupted"),
             )
             .fix(format!(
                 "`{retry}` recovers it, then makes the switch it was making"
             )),
             Err(e) => Check::warn(
-                "switch.interrupted",
+                Id::SWITCH_INTERRUPTED,
                 format!("a switch to account {position} was interrupted, and cannot be judged: {e}"),
             )
             .fix(format!("`{retry}` recovers it if it can")),

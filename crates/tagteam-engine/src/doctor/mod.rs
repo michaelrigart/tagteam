@@ -1,12 +1,12 @@
 //! §13.6 `tagteam doctor`: tagteam's own state and its interop with each provider. Doctor is
 //! read-only (B.67): it writes nothing and creates nothing itself. It takes no `MutationGuard`
-//! and no account lock, and runs no recovery (Decision 4). It opens the store read-only and
-//! never migrates it (Decision 3). It tests locks without waiting, reads the vault only when
-//! the Keychain is unlocked, and creates no data directory, store, log or lock file. The
-//! `claude` it runs (`--version`, `auth status`) may make Claude Code's own start-up writes in
-//! the home it starts in, as any `claude` start does (Appendix A.7); doctor does not run
-//! `claude auth status` in a home whose global config does not exist. Every finding names its
-//! fix. The daemon's checks (D10) read `daemon.lock`'s record without trying the lock. They
+//! and no account lock, and runs no recovery, so it takes no lock that anyone waits on. It
+//! opens the store read-only and never migrates it. It tests locks without waiting, reads the
+//! vault only when the Keychain is unlocked, and creates no data directory, store, log or lock
+//! file. The `claude` it runs (`--version`, `auth status`) may make Claude Code's own start-up
+//! writes in the home it starts in, as any `claude` start does (Appendix A.7); doctor does not
+//! run `claude auth status` in a home whose global config does not exist. Every finding names
+//! its fix. The daemon's checks (D10) read `daemon.lock`'s record without trying the lock. They
 //! look at its socket without connecting to it, and ask `launchctl`, `systemctl` or
 //! `loginctl` only to describe its service, each within 5 s.
 
@@ -304,6 +304,65 @@ fn skipped(vault: bool, provider: bool) -> String {
     } else {
         format!("{} and {last}", parts.join(", "))
     }
+}
+
+/// The check IDs `doctor` reports, which `--json` and the exit code's callers match on.
+struct Id;
+
+impl Id {
+    pub(super) const ACCOUNTS_LIVE_STALE: &str = "accounts.live-stale";
+    pub(super) const ACCOUNTS_LOGIN_EXPIRY: &str = "accounts.login-expiry";
+    pub(super) const ACCOUNTS_ORPHANS: &str = "accounts.orphans";
+    pub(super) const ACCOUNTS_QUARANTINED: &str = "accounts.quarantined";
+    pub(super) const ACCOUNTS_REPLACEMENT: &str = "accounts.replacement";
+    pub(super) const ACCOUNTS_VAULT: &str = "accounts.vault";
+    pub(super) const AUTO_ENGINE: &str = "auto.engine";
+    pub(super) const AUTO_MODELS: &str = "auto.models";
+    pub(super) const AUTO_STRATEGY: &str = "auto.strategy";
+    pub(super) const AUTO_UNHEALTHY: &str = "auto.unhealthy";
+    pub(super) const DAEMON_NOTIFY: &str = "daemon.notify";
+    pub(super) const DAEMON_RUNNING: &str = "daemon.running";
+    pub(super) const DAEMON_SERVICE: &str = "daemon.service";
+    pub(super) const DAEMON_SOCKET: &str = "daemon.socket";
+    pub(super) const KEYCHAIN_LOCKED: &str = "keychain.locked";
+    pub(super) const LOG_FILE: &str = "log.file";
+    pub(super) const LOG_WRITABLE: &str = "log.writable";
+    pub(super) const ONLINE_REACH: &str = "online.reach";
+    pub(super) const PENDING_DISPLACED: &str = "pending.displaced";
+    pub(super) const PENDING_DISPLACED_MISSING: &str = "pending.displaced-missing";
+    pub(super) const PENDING_DISPLACED_UNRECORDED: &str = "pending.displaced-unrecorded";
+    pub(super) const PENDING_RESCUE: &str = "pending.rescue";
+    pub(super) const PENDING_RESCUE_DIR: &str = "pending.rescue-dir";
+    pub(super) const PENDING_RESCUE_ORPHAN: &str = "pending.rescue-orphan";
+    pub(super) const SESSIONS_BASELINE: &str = "sessions.baseline";
+    pub(super) const SESSIONS_BOOTSTRAP: &str = "sessions.bootstrap";
+    pub(super) const SESSIONS_CREDENTIAL: &str = "sessions.credential";
+    pub(super) const SESSIONS_DAEMON: &str = "sessions.daemon";
+    pub(super) const SESSIONS_MARKER: &str = "sessions.marker";
+    pub(super) const SESSIONS_ORPHAN: &str = "sessions.orphan";
+    pub(super) const SESSIONS_PROFILES: &str = "sessions.profiles";
+    pub(super) const SESSIONS_PROVENANCE: &str = "sessions.provenance";
+    pub(super) const SESSIONS_RESERVATION: &str = "sessions.reservation";
+    pub(super) const SESSIONS_SEED: &str = "sessions.seed";
+    pub(super) const SESSIONS_SPELLING: &str = "sessions.spelling";
+    pub(super) const SESSIONS_SPLIT: &str = "sessions.split";
+    pub(super) const SESSIONS_STATE: &str = "sessions.state";
+    pub(super) const SESSIONS_UNKNOWN_ENTRIES: &str = "sessions.unknown-entries";
+    pub(super) const SETTINGS_FILE: &str = "settings.file";
+    pub(super) const SETTINGS_UNKNOWN: &str = "settings.unknown";
+    pub(super) const SETTINGS_VALUE: &str = "settings.value";
+    pub(super) const STORE_ACCOUNTS: &str = "store.accounts";
+    pub(super) const STORE_INTEGRITY: &str = "store.integrity";
+    pub(super) const STORE_MODE: &str = "store.mode";
+    pub(super) const STORE_PRESENT: &str = "store.present";
+    pub(super) const STORE_SCHEMA: &str = "store.schema";
+    pub(super) const STORE_SKIPPED: &str = "store.skipped";
+    pub(super) const STORE_TEMP_FILES: &str = "store.temp-files";
+    pub(super) const SWITCH_INTERRUPTED: &str = "switch.interrupted";
+    pub(super) const USAGE_BACKOFF: &str = "usage.backoff";
+    pub(super) const USAGE_BUDGET: &str = "usage.budget";
+    pub(super) const USAGE_CLOCK_SKEW: &str = "usage.clock-skew";
+    pub(super) const USAGE_STATE: &str = "usage.state";
 }
 
 #[cfg(test)]
