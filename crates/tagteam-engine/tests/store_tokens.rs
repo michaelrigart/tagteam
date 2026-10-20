@@ -10,8 +10,9 @@ use common::{add, cc};
 use tagteam_core::ProviderId;
 use tagteam_core::tokens::TokenCounts;
 use tagteam_engine::store::{
-    BatchOutcome, EpochRow, LaunchRow, PruneOutcome, RefreshStats, SightingEnd, SightingRow,
-    SightingSource, Store, StoreError, TokenFileRow, TokenStateRow, UsageRow, usage_key,
+    BatchOutcome, EpochRow, LaunchRow, PruneOutcome, RefreshStats, ReportSession, ReportUsage,
+    SightingEnd, SightingRow, SightingSource, Store, StoreError, TokenFileRow, TokenStateRow,
+    UsageRow, usage_key,
 };
 
 /// The fixtures' clock (`Fx`'s `FakeClock`).
@@ -1479,6 +1480,104 @@ fn reads_are_per_provider_by_range_and_session() {
         s.token_span(&ProviderId::new("none")).unwrap(),
         (None, None)
     );
+}
+
+/// What a report reads of a response, with `token_usage`'s strings.
+type Read = (
+    String,
+    Option<String>,
+    i64,
+    String,
+    TokenCounts,
+    Option<String>,
+    bool,
+);
+
+fn as_read(rows: &[UsageRow]) -> Vec<Read> {
+    rows.iter()
+        .map(|u| {
+            (
+                u.session_id.clone(),
+                u.project.clone(),
+                u.at_ms,
+                u.model.clone(),
+                u.counts,
+                u.speed.clone(),
+                u.finalized,
+            )
+        })
+        .collect()
+}
+
+/// `r`'s rows with their ids resolved through its tables.
+fn resolved(r: &ReportUsage) -> Vec<Read> {
+    r.rows
+        .iter()
+        .map(|e| {
+            let s = &r.sessions[e.session as usize];
+            (
+                s.session_id.clone(),
+                s.project.clone(),
+                e.at_ms,
+                r.models[e.model as usize].clone(),
+                e.counts,
+                e.speed.map(|i| r.speeds[i as usize].clone()),
+                e.finalized,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_report_read_names_each_session_model_and_speed_once() {
+    let (_d, s, _) = store();
+    let mut first = row(1, "s1", T, 1);
+    first.model = "m-b".into();
+    let mut second = row(2, "s2", T + 10, 2);
+    second.model = "m-a".into();
+    second.project = None;
+    second.speed = Some("fast".into());
+    second.finalized = true;
+    let mut third = row(3, "s1", T + 20, 3);
+    third.model = "m-b".into();
+    third.speed = Some("standard".into());
+    commit(&s, &[third, first, second], T);
+    let mut theirs = row(9, "s9", T + 5, 1);
+    theirs.model = "m-z".into();
+    s.commit_token_batch(&fake(), generation(&s), &[theirs], &[], &[], 0, T)
+        .unwrap();
+
+    let r = s.token_report_usage(&cc(), None, None, None).unwrap();
+    assert_eq!(
+        r.sessions,
+        [
+            ReportSession {
+                session_id: "s1".into(),
+                project: Some("/work/app".into())
+            },
+            ReportSession {
+                session_id: "s2".into(),
+                project: None
+            },
+        ],
+        "each session once, in the order its first response is read"
+    );
+    assert_eq!(r.models, ["m-b", "m-a"]);
+    assert_eq!(r.speeds, ["fast", "standard"]);
+    for (since, until, session) in [
+        (None, None, None),
+        (Some(T + 10), None, None),
+        (None, Some(T + 10), None),
+        (None, None, Some("s1")),
+        (Some(T + 10), None, Some("s1")),
+        (None, None, Some("nope")),
+    ] {
+        assert_eq!(
+            resolved(&s.token_report_usage(&cc(), since, until, session).unwrap()),
+            as_read(&s.token_usage(&cc(), since, until, session).unwrap()),
+            "{since:?} {until:?} {session:?}"
+        );
+    }
 }
 
 #[test]

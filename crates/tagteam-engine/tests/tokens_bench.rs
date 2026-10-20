@@ -1,8 +1,10 @@
 //! Token report spec §1.1's budgets for the index and the report, over synthetic transcripts in
 //! Claude Code's format (spec §15 "Budgets"): a cold index of 500 MB, scaled from 10 s for this
-//! machine's 3.42 GB; a refresh that finds nothing new, 100 ms; and a 30-day report of a
-//! month's responses, 200 ms. Timings mean something only in an optimized build on an idle
-//! machine, so this file exists only in release builds and its tests are ignored by default:
+//! machine's 3.42 GB; a refresh that finds nothing new, 100 ms; a 30-day report of a month's
+//! responses, 200 ms; and a 12-month `month` report at the same rate, 1 s (review-hardening
+//! spec H10.1), whose peak resident memory it prints. Timings mean something only in an
+//! optimized build on an idle machine, so this file exists only in release builds and its tests
+//! are ignored by default:
 //! `cargo test --release -p tagteam-engine --test tokens_bench -- --ignored --nocapture`
 //! (`--nocapture` prints each timing).
 #![cfg(not(debug_assertions))]
@@ -17,9 +19,10 @@ use std::time::{Duration, Instant};
 
 use common::Fx;
 use tagteam_core::time::format_iso8601;
-use tagteam_engine::store::{SightingRow, SightingSource};
+use tagteam_core::tokens::TokenCounts;
+use tagteam_engine::store::{SightingRow, SightingSource, UsageRow, usage_key};
 use tagteam_engine::tokens::{
-    IndexReport, RefreshOutcome, TokenGrouping, TokenPeriod, TokenQuery, Wait,
+    IndexReport, RefreshOutcome, TokenGrouping, TokenPeriod, TokenQuery, Wait, default_since_ms,
 };
 
 const MIB: u64 = 1 << 20;
@@ -30,6 +33,14 @@ const NOTHING_NEW: Duration = Duration::from_millis(100);
 const QUERY: Duration = Duration::from_millis(200);
 /// Spec §4 "Size": this machine's responses in 30 days, what a 30-day report reads.
 const MONTH_RESPONSES: u64 = 127_000;
+/// Review-hardening H10.1: a 12-month report (the `month` default, token §11.1) in 1 s.
+const YEAR_QUERY: Duration = Duration::from_millis(1_000);
+/// Twelve months at spec §4's rate: 1,524,000 responses.
+const YEAR_RESPONSES: u64 = 12 * MONTH_RESPONSES;
+/// A thousand sessions a month, as the 30-day case's thousand transcripts.
+const YEAR_SESSIONS: u64 = 12_000;
+/// How long a generated session runs.
+const SESSION_SPAN_MS: i64 = 4 * 3_600_000;
 const MODELS: [&str; 4] = [
     "claude-opus-5-5",
     "claude-sonnet-5-5",
@@ -348,4 +359,126 @@ fn a_30_day_report_query_is_within_200_ms() {
         );
         assert!(took <= QUERY, "a 30-day {name} report took {took:?}");
     }
+}
+
+/// The process's peak resident set in bytes (`ru_maxrss` is bytes on macOS, KiB on Linux).
+fn peak_rss() -> u64 {
+    // SAFETY: getrusage writes only into the zeroed struct it is given.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) }, 0);
+    let n = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+    if cfg!(target_os = "macos") {
+        n
+    } else {
+        n * 1024
+    }
+}
+
+/// `YEAR_RESPONSES` light responses from `since_ms` to `now_ms`, committed to the store as an
+/// index commits them: `YEAR_SESSIONS` sessions, each one's responses within
+/// `SESSION_SPAN_MS` of its start and committed together. Returns how many the store added.
+fn a_year_of_responses(fx: &Fx, since_ms: i64, now_ms: i64) -> u64 {
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let (store, provider) = (fx.engine.store().unwrap(), fx.provider());
+    let generation = store.begin_token_refresh(&provider, now_ms).unwrap();
+    let starts = (now_ms - SESSION_SPAN_MS - since_ms) as u64;
+    let mut batch: Vec<UsageRow> = Vec::new();
+    let mut added = 0;
+    for file in 0..YEAR_SESSIONS {
+        let start = since_ms + rng.below(starts) as i64;
+        let mut times: Vec<i64> = (0..YEAR_RESPONSES / YEAR_SESSIONS)
+            .map(|_| start + rng.below(SESSION_SPAN_MS as u64) as i64)
+            .collect();
+        times.sort_unstable();
+        for (n, at_ms) in times.into_iter().enumerate() {
+            batch.push(UsageRow {
+                key: usage_key(
+                    &provider,
+                    &format!("msg_{file}_{n}"),
+                    &format!("req_{file}_{n}"),
+                ),
+                session_id: session_of(file),
+                project: Some(format!("/work/p{}", file / 20)),
+                at_ms,
+                model: MODELS[rng.below(MODELS.len() as u64) as usize].to_owned(),
+                sidechain: file % 10 == 9,
+                counts: TokenCounts {
+                    input: rng.below(5_000),
+                    output: 40 + rng.below(400),
+                    cache_write_5m: rng.below(20_000),
+                    cache_write_1h: 0,
+                    cache_read: rng.below(200_000),
+                    web_search: 0,
+                },
+                speed: None,
+                finalized: file % 10 != 9,
+            });
+        }
+        if batch.len() >= 10_000 || file + 1 == YEAR_SESSIONS {
+            added += store
+                .commit_token_batch(&provider, generation, &batch, &[], &[], 0, now_ms)
+                .unwrap()
+                .added;
+            batch.clear();
+        }
+    }
+    added
+}
+
+#[test]
+#[ignore = "timing: run with --release on an idle machine"]
+fn a_12_month_report_query_is_within_1_s() {
+    let _one_at_a_time = serial();
+    let fx = Fx::new();
+    let now = fx.engine.now_ms();
+    let since = default_since_ms(&TokenPeriod::Month, now, &jiff::tz::TimeZone::UTC);
+    let responses = a_year_of_responses(&fx, since, now);
+    assert_eq!(responses, YEAR_RESPONSES);
+    // As the 30-day case: one session in ten sighted in a profile over the whole range.
+    let store = fx.engine.store().unwrap();
+    for file in (0..YEAR_SESSIONS).step_by(10) {
+        let sighting = SightingRow {
+            session_id: session_of(file),
+            home: "0192-bench-profile".into(),
+            started_at: since,
+            first_at: since,
+            last_at: now,
+            source: SightingSource::Run,
+            recorded_at: now,
+        };
+        store
+            .record_sighting(&fx.provider(), &sighting, 60_000)
+            .unwrap();
+    }
+    let query = || TokenQuery {
+        provider: fx.provider(),
+        period: TokenPeriod::Month,
+        grouping: TokenGrouping::Account,
+        since_ms: Some(since),
+        until_ms: None,
+        accounts: None,
+        models: None,
+        session: None,
+        tz: jiff::tz::TimeZone::UTC,
+    };
+    let before = peak_rss();
+    let report = fx.engine.token_report(&query()).unwrap();
+    let after = peak_rss();
+    assert_eq!(report.total.responses, responses);
+    let runs: Vec<Duration> = (0..5)
+        .map(|_| {
+            let started = Instant::now();
+            fx.engine.token_report(&query()).unwrap();
+            started.elapsed()
+        })
+        .collect();
+    let took = median(runs.clone());
+    eprintln!(
+        "12-month month report: median {took:?} over {responses} responses, {} rows: \
+         {runs:?}; peak RSS {:.0} MiB before the first report, {:.0} MiB after",
+        report.rows.len(),
+        mib(before),
+        mib(after)
+    );
+    assert!(took <= YEAR_QUERY, "a 12-month month report took {took:?}");
 }
