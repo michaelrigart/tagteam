@@ -234,20 +234,24 @@ impl EventSink for HumanSink<'_> {
                 reason,
                 detail,
             } => {
-                if reason == NoSwitchReason::EngineRunning.as_str() {
-                    let name = (self.names)(provider);
-                    let text = format!(
-                        "auto-switch already runs for {name} in another process; skipping it"
-                    );
-                    self.err_line(now, provider, "warning", &text);
-                } else if reason != NoSwitchReason::AllExhausted.as_str() {
+                match NoSwitchReason::parse(reason) {
+                    Some(NoSwitchReason::EngineRunning) => {
+                        let name = (self.names)(provider);
+                        let text = format!(
+                            "auto-switch already runs for {name} in another process; skipping it"
+                        );
+                        self.err_line(now, provider, "warning", &text);
+                    }
                     // `all-exhausted` has its line at the event that follows, with its time.
-                    let text = if detail.is_empty() {
-                        format!("no switch: {reason}")
-                    } else {
-                        format!("no switch: {reason} ({detail})")
-                    };
-                    self.tick(now, provider, &text);
+                    Some(NoSwitchReason::AllExhausted) => {}
+                    _ => {
+                        let text = if detail.is_empty() {
+                            format!("no switch: {reason}")
+                        } else {
+                            format!("no switch: {reason} ({detail})")
+                        };
+                        self.tick(now, provider, &text);
+                    }
                 }
             }
             AutoEvent::AllExhausted {
@@ -662,6 +666,21 @@ mod tests {
              t+0  <claude-code>  #2 b@x.co  \x1b[33m75%\x1b[0m  no switch: below-threshold\n\
              t+0  <claude-code>  #2 b@x.co  50%  no switch: below-threshold\n"
         );
+    }
+
+    #[test]
+    fn an_unknown_no_switch_reason_is_still_printed() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let now = || T0 * 1000;
+        let names = |p: &ProviderId| format!("<{p}>");
+        let sink = human(&mut out, &mut err, &now, &names, false, false);
+        sink.emit(&no_switch_event("some-new-reason", ""));
+        drop(sink);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "t+0  no switch: some-new-reason\n"
+        );
+        assert_eq!(String::from_utf8(err).unwrap(), "");
     }
 
     #[test]
