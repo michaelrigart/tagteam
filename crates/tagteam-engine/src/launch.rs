@@ -12,7 +12,7 @@ use tagteam_provider::{MutationGuard, Provider, Read, ReadError};
 
 use crate::account_lock::AccountLock;
 use crate::bootstrap::{Trigger, refusal, refuse_linked_profile};
-use crate::engine::Engine;
+use crate::engine::{Engine, GuardRequest};
 use crate::error::{EngineError, SessionOwner};
 use crate::hooks;
 use crate::provenance::ProfileCheck;
@@ -122,15 +122,19 @@ impl Engine {
         if !p.capabilities().sessions {
             return Err(no_sessions(p));
         }
-        self.settle_or_refuse(&account.provider)?;
+        self.settle_or_refuse(&GuardRequest::refusing_one(&account.provider))?;
         hooks::point(self, "launch-before-freshen")?;
         let Freshened {
             mut warnings,
             refusal,
         } = self.freshen_for_launch(p, account)?;
         hooks::point(self, "launch-before-locks")?;
-        let guard =
-            self.guard_or_refuse_within(&account.provider, MutationGuard::BOOTSTRAP_TIMEOUT)?;
+        let guard = self
+            .guard(&GuardRequest {
+                timeout: MutationGuard::BOOTSTRAP_TIMEOUT,
+                ..GuardRequest::refusing_one(&account.provider)
+            })?
+            .0;
         let lock = self.lock_account(&account.id)?;
         // 1.
         let row = self.relocked_target(p, account)?;

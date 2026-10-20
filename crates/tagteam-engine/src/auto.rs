@@ -17,7 +17,7 @@ use tagteam_core::{AccountId, Fingerprint, ProviderId, Window, WindowKind};
 use tagteam_provider::{Env, FlockGuard, LockError, ProcessStamp, Provider, Read, ReadError};
 
 use crate::collect::{CollectMode, CollectReport, Collected};
-use crate::engine::Engine;
+use crate::engine::{Engine, GuardRequest};
 use crate::error::EngineError;
 use crate::store::{AccountRow, Store, backoff_holds};
 use crate::switch::{AutoFreshened, AutoPerform, SwitchReason, SwitchRequest, SwitchTarget};
@@ -724,7 +724,10 @@ impl AutoEngine<'_> {
     /// take the live locks or found its agent writing, or the mutation lock was held past its
     /// timeout.
     fn recover(&self) -> Result<Option<EngineError>, EngineError> {
-        match self.engine.settle_or_refuse_as(&self.provider, self.source) {
+        match self.engine.settle_or_refuse(&GuardRequest {
+            source: self.source,
+            ..GuardRequest::refusing_one(&self.provider)
+        }) {
             Ok(()) => Ok(None),
             Err(e) if e.signal().is_some() => Err(e),
             Err(
