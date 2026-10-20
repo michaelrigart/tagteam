@@ -1,7 +1,7 @@
 use tagteam_core::{AccountId, OutgoingAction, OutgoingClass, OutgoingFacts, decide_outgoing};
 use tagteam_provider::{
-    BeforeFallback, Identity, LiveAuth, LiveChange, LiveLocks, ProcessStamp, Provider, Read,
-    ReadError, SecretStore, StoredLogin,
+    BeforeFallback, DoomedEntry, Identity, LiveAuth, LiveChange, LiveLocks, ProcessStamp, Provider,
+    Read, ReadError, SecretStore, StoredLogin,
 };
 
 use crate::account_lock::AccountLock;
@@ -37,6 +37,32 @@ pub(super) struct Locked {
     outgoing: Option<AccountRow>,
     /// What the locked re-read decided to tell the user (§9.4 step 1).
     warnings: Vec<String>,
+}
+
+/// What a switch holds while it runs under every lock.
+pub(super) struct LockedSwitch<'a, 'g> {
+    pub(super) store: &'a Store,
+    pub(super) account_locks: &'a [AccountLock],
+    pub(super) locks: &'a LiveLocks<'g>,
+}
+
+/// What `preflight` read under the locks.
+struct Preflight {
+    target_identity: Identity,
+    live: LiveAuth,
+    managed_key_replaced: bool,
+    doomed: Vec<DoomedEntry>,
+    live_identity: Option<Identity>,
+    target: AccountRow,
+    outgoing: Option<AccountRow>,
+    locked_warnings: Vec<String>,
+}
+
+/// What `apply` writes: the target, its login and the outgoing account.
+pub(super) struct ApplyStep<'a> {
+    pub(super) target: &'a AccountRow,
+    pub(super) login: &'a StoredLogin,
+    pub(super) outgoing: Option<&'a AccountRow>,
 }
 
 /// What `rederive` found under the locks.
@@ -210,175 +236,65 @@ impl Engine {
     }
 
     /// Steps 2–10, under every lock. Everything here uses the rows read under the locks.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn transact(
         &self,
         p: &dyn Provider,
-        store: &Store,
         plan: &Plan,
         locked: Locked,
-        account_locks: &[AccountLock],
-        locks: &LiveLocks<'_>,
+        ls: &LockedSwitch<'_, '_>,
         req: &SwitchRequest,
     ) -> Result<SwitchOutcome, EngineError> {
-        let Locked {
-            live_identity,
-            target,
-            outgoing,
-            warnings: locked_warnings,
-        } = locked;
         let provider = &req.provider;
-        let target_identity = p.parse_identity(&target.identity_json)?;
-        let live = p.read_live_auth(&self.env);
-        refuse_unsafe_live_reads(&live)?;
-        let managed_key_replaced = matches!(&live.managed_key, Read::Present(k) if !k.is_empty());
-        let doomed = p.doomed(&self.env, locks, LiveChange::Write(&target.kind));
-        refuse_unreadable(&doomed)?;
-
-        // §6.2 "Pending rescues before activation": a rescue has already spent the vault's
-        // generation. It is settled here, under the target's account lock and before anything
-        // is written, so neither branch below reads the spent generation (§9.4 steps 2 and 5).
-        // A rescue that cannot be read or adopted refuses the switch before its journal row
-        // exists, so there is nothing to roll back.
-        let target_lock = account_locks
-            .iter()
-            .find(|l| l.id() == &target.id)
-            .expect("the target is locked");
-        self.settle_rescues(p, &target, target_lock)?;
-        // §9.2 lazy capture, after the rescues and before either branch reads the target's
-        // vault: a rotation the profile holds is the generation composed and written below. A
-        // conflict or an unreadable profile refuses before the journal row exists, so there is
-        // nothing to roll back.
-        self.settle_profile(p, &target, target_lock)?;
+        let mut pf = self.preflight(p, locked, ls)?;
+        self.settle_pre(p, ls, &pf.target)?;
 
         let mut warnings = plan.notes.clone();
         warnings.extend(plan.warnings.iter().cloned());
-        warnings.extend(locked_warnings);
+        warnings.extend(std::mem::take(&mut pf.locked_warnings));
         // The live login's own secret, the only one the live identity names when a secret is
         // displaced (§6.3, Decision 13): the live secret on a stored account's own axis, or the
         // credential entry's for an unmanaged login, which `oauthAccount` names. Unlike step 6's
         // `from_secret`, it never falls back to the other axis.
-        let own_secret = match &outgoing {
-            Some(o) => Axis::of(p, &o.kind).live_secret(&live),
-            None => Axis::Entry.live_secret(&live),
+        let own_secret = match &pf.outgoing {
+            Some(o) => Axis::of(p, &o.kind).live_secret(&pf.live),
+            None => Axis::Entry.live_secret(&pf.live),
         };
         // What steps 2 and 4 settle, and the vaults below: step 7's rule never saves it again.
         let mut cx = Settle {
             force: req.force,
-            live_identity: live_identity.as_ref(),
+            live_identity: pf.live_identity.as_ref(),
             own_secret: own_secret.as_deref(),
             ..Settle::new(p, provider, warnings)
         };
-        let target_secret = match outgoing.as_ref().filter(|_| !req.force) {
-            // Step 2, the direct branch: displace whatever is live on either axis unless it is
-            // identical to the target in vault form (H5.3).
-            None => {
-                let secret = self.read_target(&target)?;
-                let reason = if req.force {
-                    "forced-activation"
-                } else {
-                    "displaced-live-login"
-                };
-                for axis in Axis::BOTH {
-                    if let Some(bytes) = axis
-                        .live_secret(&live)
-                        .filter(|b| *p.vault_form(b) != *p.vault_form(&secret))
-                    {
-                        let identity = attributed(cx.live_identity, cx.own_secret, &bytes);
-                        let saved = cx.displace_live(self, &bytes, reason, identity);
-                        cx.held.hold(p, &bytes);
-                        unless_forced(saved, req.force, &mut cx.warnings)?;
-                    }
-                }
-                secret
-            }
-            Some(out) => {
-                self.settle_outgoing(
-                    &mut cx,
-                    store,
-                    out,
-                    &live,
-                    plan.hint.as_ref(),
-                    account_locks,
-                    req.source,
-                )?;
-                // Step 4 settled the outgoing generation: kept, captured or displaced.
-                if let Some(bytes) = Axis::of(p, &out.kind).live_secret(&live) {
-                    cx.held.hold(p, &bytes);
-                }
-                // Read only now: settling a self-switch may have captured a newer live
-                // generation into this very account, and that is the one to activate.
-                self.read_target(&target)?
-            }
-        };
-        // Step 7's rule: every entry the write destroys is saved first, unless a vault of
-        // either account, or steps 2 and 4, already hold its generation. A Keychain-refusal
-        // fallback reports what it deletes to `before_fallback` too, which finds it held.
-        for id in outgoing.iter().map(|o| &o.id).chain([&target.id]) {
-            cx.hold_vault(self, id);
-        }
-        for entry in &doomed {
-            if let Read::Present(bytes) = &entry.bytes {
-                cx.save_unheld(self, bytes)?;
-            }
-        }
+        let target_secret = self.settle_branch(&mut cx, ls, plan, req, &pf)?;
+        self.hold_doomed(&mut cx, &pf)?;
 
-        // Step 6.
-        let from_secret = outgoing
-            .as_ref()
-            .and_then(|o| Axis::of(p, &o.kind).live_secret(&live))
-            .or_else(|| Axis::Entry.live_secret(&live));
-        // A forced switch may supersede an undecidable row; it is carried along, so a forced
-        // switch that never lands puts it back instead of forgetting it (§9.6).
-        let prior = if req.force {
-            store.journal(provider)?.map(Box::new)
-        } else {
-            None
-        };
-        store.insert_journal(&JournalRow {
-            provider: provider.clone(),
-            holder: ProcessStamp::current()?,
-            from_id: outgoing.as_ref().map(|o| o.id.clone()),
-            to_id: target.id.clone(),
-            from_fp: from_secret
-                .as_deref()
-                .and_then(|b| p.fingerprint(b))
-                .map(|f| f.as_str().to_owned()),
-            from_identity: live_identity.as_ref().map(|i| i.raw.clone()),
-            to_fp: p
-                .fingerprint(&target_secret)
-                .map(|f| f.as_str().to_owned())
-                .unwrap_or_default(),
-            // §9.4 step 6: read under the target's account lock, so it cannot move before
-            // the commit; a forward recovery records it (§9.6).
-            to_epoch: Some(target.login_epoch),
-            started_at: self.now_ms(),
-            prior: prior.clone(),
-        })?;
-
-        // Steps 7–10.
-        let target_login = StoredLogin {
-            kind: target.kind.clone(),
-            secret: target_secret,
-            identity: target_identity,
-        };
+        let prior = self.journal_row(p, ls, req, &pf, &target_secret)?;
         let mut tx = Rollback {
             undos: Vec::new(),
-            locks,
-            store,
+            locks: ls.locks,
+            store: ls.store,
             provider,
-            from: outgoing.as_ref().map(|o| o.id.clone()),
-            to: target.id.clone(),
+            from: pf.outgoing.as_ref().map(|o| o.id.clone()),
+            to: pf.target.id.clone(),
             prior,
             in_flight: false,
             armed: true,
         };
+        // Steps 7–10.
+        let target_login = StoredLogin {
+            kind: pf.target.kind.clone(),
+            secret: target_secret,
+            identity: pf.target_identity.clone(),
+        };
         let mut before_fallback = |bytes: &[u8]| cx.before_fallback(self, bytes);
         let stored_in = match self.apply(
             p,
-            &target,
-            &target_login,
-            outgoing.as_ref(),
+            ApplyStep {
+                target: &pf.target,
+                login: &target_login,
+                outgoing: pf.outgoing.as_ref(),
+            },
             req,
             &mut tx,
             &mut before_fallback,
@@ -390,6 +306,191 @@ impl Engine {
             Err(cause) => return Err(tx.fail(cause)),
         };
 
+        let warnings = cx.warnings;
+        Ok(self.outcome(p, plan, pf, stored_in, warnings))
+    }
+
+    /// The target's identity, the live login and what the write destroys, read under every
+    /// lock. Nothing is written, so a refusal here has nothing to roll back.
+    fn preflight(
+        &self,
+        p: &dyn Provider,
+        locked: Locked,
+        ls: &LockedSwitch<'_, '_>,
+    ) -> Result<Preflight, EngineError> {
+        let Locked {
+            live_identity,
+            target,
+            outgoing,
+            warnings: locked_warnings,
+        } = locked;
+        let target_identity = p.parse_identity(&target.identity_json)?;
+        let live = p.read_live_auth(&self.env);
+        refuse_unsafe_live_reads(&live)?;
+        let managed_key_replaced = matches!(&live.managed_key, Read::Present(k) if !k.is_empty());
+        let doomed = p.doomed(&self.env, ls.locks, LiveChange::Write(&target.kind));
+        refuse_unreadable(&doomed)?;
+        Ok(Preflight {
+            target_identity,
+            live,
+            managed_key_replaced,
+            doomed,
+            live_identity,
+            target,
+            outgoing,
+            locked_warnings,
+        })
+    }
+
+    /// Settles the target's pending rescues and its session profile.
+    fn settle_pre(
+        &self,
+        p: &dyn Provider,
+        ls: &LockedSwitch<'_, '_>,
+        target: &AccountRow,
+    ) -> Result<(), EngineError> {
+        // §6.2 "Pending rescues before activation": a rescue has already spent the vault's
+        // generation. It is settled here, under the target's account lock and before anything
+        // is written, so neither branch below reads the spent generation (§9.4 steps 2 and 5).
+        // A rescue that cannot be read or adopted refuses the switch before its journal row
+        // exists, so there is nothing to roll back.
+        let target_lock = ls
+            .account_locks
+            .iter()
+            .find(|l| l.id() == &target.id)
+            .expect("the target is locked");
+        self.settle_rescues(p, target, target_lock)?;
+        // §9.2 lazy capture, after the rescues and before either branch reads the target's
+        // vault: a rotation the profile holds is the generation composed and written below. A
+        // conflict or an unreadable profile refuses before the journal row exists, so there is
+        // nothing to roll back.
+        self.settle_profile(p, target, target_lock)
+    }
+
+    /// Steps 2 and 4: settles the live login and returns the target's secret to activate.
+    fn settle_branch(
+        &self,
+        cx: &mut Settle<'_>,
+        ls: &LockedSwitch<'_, '_>,
+        plan: &Plan,
+        req: &SwitchRequest,
+        pf: &Preflight,
+    ) -> Result<Vec<u8>, EngineError> {
+        let p = cx.p;
+        let live = &pf.live;
+        Ok(match pf.outgoing.as_ref().filter(|_| !req.force) {
+            // Step 2, the direct branch: displace whatever is live on either axis unless it is
+            // identical to the target in vault form (H5.3).
+            None => {
+                let secret = self.read_target(&pf.target)?;
+                let reason = if req.force {
+                    "forced-activation"
+                } else {
+                    "displaced-live-login"
+                };
+                for axis in Axis::BOTH {
+                    if let Some(bytes) = axis
+                        .live_secret(live)
+                        .filter(|b| *p.vault_form(b) != *p.vault_form(&secret))
+                    {
+                        let identity = attributed(cx.live_identity, cx.own_secret, &bytes);
+                        let saved = cx.displace_live(self, &bytes, reason, identity);
+                        cx.held.hold(p, &bytes);
+                        unless_forced(saved, req.force, &mut cx.warnings)?;
+                    }
+                }
+                secret
+            }
+            Some(out) => {
+                self.settle_outgoing(cx, ls, out, live, plan.hint.as_ref(), req.source)?;
+                // Step 4 settled the outgoing generation: kept, captured or displaced.
+                if let Some(bytes) = Axis::of(p, &out.kind).live_secret(live) {
+                    cx.held.hold(p, &bytes);
+                }
+                // Read only now: settling a self-switch may have captured a newer live
+                // generation into this very account, and that is the one to activate.
+                self.read_target(&pf.target)?
+            }
+        })
+    }
+
+    /// Step 7's rule: holds the vaults and saves the entries the write destroys.
+    fn hold_doomed(&self, cx: &mut Settle<'_>, pf: &Preflight) -> Result<(), EngineError> {
+        // Step 7's rule: every entry the write destroys is saved first, unless a vault of
+        // either account, or steps 2 and 4, already hold its generation. A Keychain-refusal
+        // fallback reports what it deletes to `before_fallback` too, which finds it held.
+        for id in pf.outgoing.iter().map(|o| &o.id).chain([&pf.target.id]) {
+            cx.hold_vault(self, id);
+        }
+        for entry in &pf.doomed {
+            if let Read::Present(bytes) = &entry.bytes {
+                cx.save_unheld(self, bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Step 6: writes the journal row. Returns the row a forced switch superseded, which the
+    /// caller's `Rollback` must carry; nothing fallible may sit between the two.
+    fn journal_row(
+        &self,
+        p: &dyn Provider,
+        ls: &LockedSwitch<'_, '_>,
+        req: &SwitchRequest,
+        pf: &Preflight,
+        target_secret: &[u8],
+    ) -> Result<Option<Box<JournalRow>>, EngineError> {
+        let provider = &req.provider;
+        let from_secret = pf
+            .outgoing
+            .as_ref()
+            .and_then(|o| Axis::of(p, &o.kind).live_secret(&pf.live))
+            .or_else(|| Axis::Entry.live_secret(&pf.live));
+        // A forced switch may supersede an undecidable row; it is carried along, so a forced
+        // switch that never lands puts it back instead of forgetting it (§9.6).
+        let prior = if req.force {
+            ls.store.journal(provider)?.map(Box::new)
+        } else {
+            None
+        };
+        ls.store.insert_journal(&JournalRow {
+            provider: provider.clone(),
+            holder: ProcessStamp::current()?,
+            from_id: pf.outgoing.as_ref().map(|o| o.id.clone()),
+            to_id: pf.target.id.clone(),
+            from_fp: from_secret
+                .as_deref()
+                .and_then(|b| p.fingerprint(b))
+                .map(|f| f.as_str().to_owned()),
+            from_identity: pf.live_identity.as_ref().map(|i| i.raw.clone()),
+            to_fp: p
+                .fingerprint(target_secret)
+                .map(|f| f.as_str().to_owned())
+                .unwrap_or_default(),
+            // §9.4 step 6: read under the target's account lock, so it cannot move before
+            // the commit; a forward recovery records it (§9.6).
+            to_epoch: Some(pf.target.login_epoch),
+            started_at: self.now_ms(),
+            prior: prior.clone(),
+        })?;
+        Ok(prior)
+    }
+
+    /// The switch's result, taking the rows once nothing borrows them.
+    fn outcome(
+        &self,
+        p: &dyn Provider,
+        plan: &Plan,
+        pf: Preflight,
+        stored_in: SecretStore,
+        warnings: Vec<String>,
+    ) -> SwitchOutcome {
+        let Preflight {
+            managed_key_replaced,
+            target,
+            outgoing,
+            ..
+        } = pf;
         let (reason, switched) = if plan.self_switch {
             (SwitchReason::Activated, true)
         } else {
@@ -409,36 +510,35 @@ impl Engine {
             &stored_in,
             managed_key_replaced,
         ));
-        Ok(SwitchOutcome {
+        SwitchOutcome {
             switched,
             from: outgoing,
             to: Some(target),
             strategy: plan.strategy,
             reason,
             message,
-            warnings: cx.warnings,
+            warnings,
             stored_in: Some(stored_in),
             unmanaged_email: None,
             managed_key_replaced,
             activation_hint,
-        })
+        }
     }
 
     /// Step 4: classify the outgoing credential and act on it. A capture's write changes the
     /// vault's fingerprint (it is never `Ours`), so it clears a quarantine (§7.4) and records
     /// the clear with the switch's `source`.
-    #[allow(clippy::too_many_arguments)]
     fn settle_outgoing(
         &self,
         cx: &mut Settle<'_>,
-        store: &Store,
+        ls: &LockedSwitch<'_, '_>,
         out: &AccountRow,
         live: &LiveAuth,
         hint: Option<&OracleHint>,
-        account_locks: &[AccountLock],
         source: &str,
     ) -> Result<(), EngineError> {
         let p = cx.p;
+        let store = ls.store;
         let Some(bytes) = Axis::of(p, &out.kind).live_secret(live) else {
             return Ok(());
         };
@@ -479,7 +579,8 @@ impl Engine {
         match action {
             OutgoingAction::Nothing => {}
             OutgoingAction::CaptureToVault { backfill_uuid } => {
-                let lock = account_locks
+                let lock = ls
+                    .account_locks
                     .iter()
                     .find(|l| l.id() == &out.id)
                     .expect("the outgoing account is locked");
@@ -539,17 +640,19 @@ impl Engine {
     }
 
     /// Steps 7–9, keeping an undo for each write.
-    #[allow(clippy::too_many_arguments)]
     fn apply<'a>(
         &self,
         p: &dyn Provider,
-        target: &AccountRow,
-        target_login: &StoredLogin,
-        outgoing: Option<&AccountRow>,
+        step: ApplyStep<'_>,
         req: &SwitchRequest,
         tx: &mut Rollback<'a, '_>,
         before_fallback: BeforeFallback<'_>,
     ) -> Result<SecretStore, EngineError> {
+        let ApplyStep {
+            target,
+            login: target_login,
+            outgoing,
+        } = step;
         let locks = tx.locks;
         hooks::point(self, "after-journal")?;
         // Steps 7–10 are a critical span (§14.1): the write's storage-write wait is not a

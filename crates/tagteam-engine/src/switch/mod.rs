@@ -10,7 +10,7 @@ use crate::hooks;
 use crate::store::{AccountRow, Store};
 
 use plan::{Ask, Planned};
-use transact::Rederived;
+use transact::{LockedSwitch, Rederived};
 
 mod freshen;
 mod plan;
@@ -332,8 +332,12 @@ impl Engine {
             let locks = p.lock_live(&self.env, &guard)?;
             match self.rederive(p, store, req, &plan, outgoing.as_ref())? {
                 Rederived::Go(locked) => {
-                    let mut outcome =
-                        self.transact(p, store, &plan, locked, &accounts, &locks, req)?;
+                    let ls = LockedSwitch {
+                        store,
+                        account_locks: &accounts,
+                        locks: &locks,
+                    };
+                    let mut outcome = self.transact(p, &plan, locked, &ls, req)?;
                     drop(locks);
                     drop(accounts);
                     // §9.1 (amended): with CC's locks released, `oauthAccount` is read again.
