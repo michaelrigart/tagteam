@@ -2,10 +2,10 @@
 
 use tagteam_core::{AccountId, ProviderId};
 
-use crate::actions::Overlay;
 use crate::daemon::DaemonState;
 use crate::host::Action;
 use crate::msg::Cmd;
+use crate::overlay::Overlay;
 use crate::screens::accounts::AccountsState;
 use crate::screens::history::HistoryState;
 use crate::screens::tokens::TokensState;

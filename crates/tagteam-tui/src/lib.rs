@@ -11,6 +11,7 @@ mod input;
 pub mod lanes;
 pub mod live;
 pub mod msg;
+pub mod overlay;
 mod runtime;
 pub mod screens;
 pub mod source;

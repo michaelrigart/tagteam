@@ -3,9 +3,10 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::actions::{self, Overlay};
+use crate::actions;
 use crate::daemon;
 use crate::msg::{Cmd, Msg};
+use crate::overlay::{self, Overlay};
 use crate::screens;
 use crate::state::{BannerKind, REFRESH_MS, Screen, State};
 
@@ -204,7 +205,7 @@ fn on_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     }
     // A dialog or panel takes every other key: a text dialog must be able to type `q`.
     if state.overlay.is_some() {
-        return actions::handle_overlay_key(state, key, now_ms);
+        return overlay::handle_key(state, key, now_ms);
     }
     match key.code {
         KeyCode::Char('q') => quit(state, 0),

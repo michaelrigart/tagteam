@@ -7,8 +7,8 @@ use ratatui::widgets::Paragraph;
 use tagteam_engine::words::Severity;
 use unicode_width::UnicodeWidthStr;
 
-use crate::actions;
 use crate::daemon::words;
+use crate::overlay;
 use crate::screens;
 use crate::state::{Screen, State};
 use crate::theme::Theme;
@@ -271,7 +271,7 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
         Paragraph::new(footer(state, area.width, now_ms)),
         areas.footer,
     );
-    actions::render_overlay(state, frame, now_ms);
+    overlay::render(state, frame, now_ms);
 }
 
 /// ` tagteam  [1 Accounts]  2 Tokens  3 History` on the left, the mode (`daemon::words::mode`)
@@ -500,9 +500,9 @@ mod tests {
     use ratatui::style::{Color, Modifier};
 
     use super::*;
-    use crate::actions::{ConfirmThen, Overlay};
     use crate::host::Action;
     use crate::msg::{Answer, AnswerTo, Cmd, Msg};
+    use crate::overlay::{ConfirmThen, Overlay};
     use crate::state::BannerKind;
     use crate::testutil::*;
     use crate::theme::Theme;
