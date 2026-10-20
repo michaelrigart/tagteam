@@ -76,6 +76,8 @@ struct Level {
     offset: usize,
     /// The report's column widths, found when it is first drawn.
     widths: table::Widths,
+    /// The report's table lines, laid out again once a second at most while a block is active.
+    layout: table::Layout,
 }
 
 impl Level {
@@ -90,6 +92,7 @@ impl Level {
             selected: None,
             offset: 0,
             widths: table::Widths::default(),
+            layout: table::Layout::default(),
         }
     }
 }
@@ -273,6 +276,7 @@ impl TokensState {
         }
         level.report = Some(report);
         level.widths = table::Widths::default();
+        level.layout = table::Layout::default();
     }
 
     /// Moves the selection `by` rows, stopping at either end.
@@ -295,6 +299,7 @@ impl TokensState {
         self.levels.truncate(1);
         self.levels[0].report = None;
         self.levels[0].widths = table::Widths::default();
+        self.levels[0].layout = table::Layout::default();
     }
 }
 
