@@ -90,7 +90,7 @@ fn accounts_lists_every_provider_with_accounts() {
 
 #[test]
 fn each_provider_s_view_carries_its_own_settings_and_names() {
-    use tagteam_core::autoswitch::Strategy;
+    use tagteam_core::autoswitch::AutoStrategy;
     use tagteam_engine::views::ProviderNames;
 
     let ffx = FakeFx::new();
@@ -103,7 +103,7 @@ fn each_provider_s_view_carries_its_own_settings_and_names() {
     .unwrap();
     ffx.fx.add("a@b.co", "rt-a");
     ffx.fake_add("alice", "tok-a", "renew-a");
-    let seen = |ffx: &FakeFx| -> Vec<(f64, Strategy, ProviderNames)> {
+    let seen = |ffx: &FakeFx| -> Vec<(f64, AutoStrategy, ProviderNames)> {
         ffx.engine
             .accounts(None)
             .unwrap()
@@ -116,7 +116,7 @@ fn each_provider_s_view_carries_its_own_settings_and_names() {
         vec![
             (
                 80.0,
-                Strategy::Best,
+                AutoStrategy::Best,
                 ProviderNames {
                     display_name: "Claude Code",
                     launch_command: "claude"
@@ -124,7 +124,7 @@ fn each_provider_s_view_carries_its_own_settings_and_names() {
             ),
             (
                 95.0,
-                Strategy::ConsumeFirst,
+                AutoStrategy::ConsumeFirst,
                 ProviderNames {
                     display_name: "FakeAgent",
                     launch_command: "fakeagent"

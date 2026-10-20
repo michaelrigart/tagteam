@@ -8,8 +8,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use tagteam_core::autoswitch::{
-    AccountSnapshot, AutoConfig, AutoState, Decision, Live, NoSwitchReason, Outcome, Phase,
-    Snapshot, Strategy, Trigger, decide, departure,
+    AccountSnapshot, AutoConfig, AutoState, AutoStrategy, Decision, Live, NoSwitchReason, Outcome,
+    Phase, Snapshot, Trigger, decide, departure,
 };
 use tagteam_core::fmt::span;
 use tagteam_core::usage::headroom;
@@ -256,7 +256,7 @@ pub struct AutoEngine<'e> {
     /// The `models` the model-name check last ran for (§11.2 step 3).
     checked_models: Option<Vec<String>>,
     /// The strategy the long-window check last ran for (§4.5).
-    checked_strategy: Option<Strategy>,
+    checked_strategy: Option<AutoStrategy>,
     /// The live account whose ticks `unhealthy_ticks` last counted (Decision 4).
     judged: Option<AccountId>,
     /// The managed live account as the last tick left it.

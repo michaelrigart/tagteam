@@ -148,8 +148,8 @@ fn settings() -> impl Strategy<Value = AutoConfig> {
         prop_oneof![Just(15i64), Just(60), Just(300)],
         1u32..=5,
         prop_oneof![
-            Just(autoswitch::Strategy::Best),
-            Just(autoswitch::Strategy::ConsumeFirst)
+            Just(autoswitch::AutoStrategy::Best),
+            Just(autoswitch::AutoStrategy::ConsumeFirst)
         ],
         any::<bool>(),
         prop_oneof![4 => Just(Some("7d".to_owned())), 1 => Just(None)],

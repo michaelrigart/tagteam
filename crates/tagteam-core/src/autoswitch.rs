@@ -9,23 +9,23 @@ use crate::usage::{Window, headroom};
 
 /// `autoswitch.strategy` (§6.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Strategy {
+pub enum AutoStrategy {
     Best,
     ConsumeFirst,
 }
 
-impl Strategy {
+impl AutoStrategy {
     pub fn as_str(self) -> &'static str {
         match self {
-            Strategy::Best => "best",
-            Strategy::ConsumeFirst => "consume-first",
+            AutoStrategy::Best => "best",
+            AutoStrategy::ConsumeFirst => "consume-first",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "best" => Some(Strategy::Best),
-            "consume-first" => Some(Strategy::ConsumeFirst),
+            "best" => Some(AutoStrategy::Best),
+            "consume-first" => Some(AutoStrategy::ConsumeFirst),
             _ => None,
         }
     }
@@ -77,7 +77,7 @@ pub struct AutoConfig {
     pub interval_s: i64,
     pub unhealthy_ticks: u32,
     /// As configured.
-    pub strategy: Strategy,
+    pub strategy: AutoStrategy,
     pub include_api_key_accounts: bool,
     /// §8.2 relevance (`autoswitch.models`).
     pub models: Vec<String>,
@@ -87,9 +87,9 @@ pub struct AutoConfig {
 
 impl AutoConfig {
     /// The strategy that actually runs: `Best` when consume-first has no long window.
-    pub fn effective_strategy(&self) -> Strategy {
+    pub fn effective_strategy(&self) -> AutoStrategy {
         match (self.strategy, &self.long_window) {
-            (Strategy::ConsumeFirst, None) => Strategy::Best,
+            (AutoStrategy::ConsumeFirst, None) => AutoStrategy::Best,
             (strategy, _) => strategy,
         }
     }
@@ -525,8 +525,8 @@ fn triggered(active: &Rated, st: &AutoState, cfg: &AutoConfig) -> Result<Trigger
     match active.headroom {
         Some(h) if at_limit(h) => go(Trigger::AtLimit, 0),
         Some(h) if below_threshold(h, cfg.threshold) => match cfg.effective_strategy() {
-            Strategy::Best => Err(no_switch(NoSwitchReason::BelowThreshold, String::new(), 0)),
-            Strategy::ConsumeFirst => go(Trigger::ConsumeFirst, 0),
+            AutoStrategy::Best => Err(no_switch(NoSwitchReason::BelowThreshold, String::new(), 0)),
+            AutoStrategy::ConsumeFirst => go(Trigger::ConsumeFirst, 0),
         },
         Some(_) => go(Trigger::Proactive, 0),
         None => {
@@ -960,7 +960,7 @@ mod tests {
             cooldown_s: 300,
             interval_s: 60,
             unhealthy_ticks: 3,
-            strategy: Strategy::Best,
+            strategy: AutoStrategy::Best,
             include_api_key_accounts: false,
             models: vec![],
             long_window: Some("7d".into()),
@@ -969,7 +969,7 @@ mod tests {
 
     fn consume_first() -> AutoConfig {
         AutoConfig {
-            strategy: Strategy::ConsumeFirst,
+            strategy: AutoStrategy::ConsumeFirst,
             ..cfg()
         }
     }
@@ -1115,16 +1115,19 @@ mod tests {
 
     #[test]
     fn consume_first_without_a_long_window_runs_best() {
-        assert_eq!(cfg().effective_strategy(), Strategy::Best);
-        assert_eq!(consume_first().effective_strategy(), Strategy::ConsumeFirst);
+        assert_eq!(cfg().effective_strategy(), AutoStrategy::Best);
+        assert_eq!(
+            consume_first().effective_strategy(),
+            AutoStrategy::ConsumeFirst
+        );
         let no_long = AutoConfig {
             long_window: None,
             ..consume_first()
         };
-        assert_eq!(no_long.effective_strategy(), Strategy::Best);
+        assert_eq!(no_long.effective_strategy(), AutoStrategy::Best);
         assert_eq!(
             no_long.strategy,
-            Strategy::ConsumeFirst,
+            AutoStrategy::ConsumeFirst,
             "the setting is kept"
         );
         let s = snap(1, vec![at(1, 40.0), at(2, 10.0)]);
@@ -1218,7 +1221,7 @@ mod tests {
         assert_eq!(switched(&d), (Trigger::Proactive, vec![2]));
         assert_eq!(d.unhealthy_ticks, 1, "step 5 is not reached");
         let consuming = AutoConfig {
-            strategy: Strategy::ConsumeFirst,
+            strategy: AutoStrategy::ConsumeFirst,
             ..with_keys()
         };
         assert_eq!(switched(&run(&s, &st, &consuming)).0, Trigger::Proactive);

@@ -11,7 +11,7 @@ use common::{
 use serde_json::json;
 use tagteam_cc::live::Platform;
 use tagteam_core::WindowKind;
-use tagteam_core::autoswitch::{AutoConfig, Decision, NoSwitchReason, Strategy};
+use tagteam_core::autoswitch::{AutoConfig, AutoStrategy, Decision, NoSwitchReason};
 use tagteam_core::time::format_iso8601;
 use tagteam_engine::auto::TickOutcome;
 use tagteam_engine::collect::CollectMode;
@@ -482,7 +482,7 @@ fn run_the_daemon_s_work_on(fx: &Fx) {
         cooldown_s: 300,
         interval_s: 60,
         unhealthy_ticks: 3,
-        strategy: Strategy::Best,
+        strategy: AutoStrategy::Best,
         include_api_key_accounts: false,
         models: Vec::new(),
         long_window: fx.cc.primary_long_window().map(str::to_owned),

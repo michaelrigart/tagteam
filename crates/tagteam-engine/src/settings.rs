@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use tagteam_core::ProviderId;
-use tagteam_core::autoswitch::Strategy;
+use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_provider::{Env, LockError};
 use toml_edit::{DocumentMut, Item, TableLike};
@@ -789,7 +789,7 @@ pub struct Settings {
     /// `autoswitch.hysteresis_pct`: 0–50. The provider's own table first.
     pub hysteresis_pct: f64,
     /// `autoswitch.strategy`: `best` or `consume-first`. The provider's own table first.
-    pub strategy: Strategy,
+    pub strategy: AutoStrategy,
     /// `autoswitch.include_api_key_accounts`. The provider's own table first.
     pub include_api_key_accounts: bool,
     /// `autoswitch.unhealthy_ticks`: 1–100. The provider's own table first.
@@ -832,7 +832,7 @@ impl Default for Settings {
             interval_seconds: DEFAULT_INTERVAL_SECONDS,
             cooldown_seconds: DEFAULT_COOLDOWN_SECONDS,
             hysteresis_pct: DEFAULT_HYSTERESIS_PCT,
-            strategy: Strategy::Best,
+            strategy: AutoStrategy::Best,
             include_api_key_accounts: false,
             unhealthy_ticks: DEFAULT_UNHEALTHY_TICKS,
             models: Vec::new(),
@@ -914,7 +914,7 @@ impl Settings {
             ("autoswitch.cooldown_seconds", Value::Int(n)) => self.cooldown_seconds = n,
             ("autoswitch.hysteresis_pct", Value::Float(n)) => self.hysteresis_pct = n,
             ("autoswitch.strategy", Value::Str(s)) => {
-                self.strategy = Strategy::parse(&s).unwrap_or(Strategy::Best)
+                self.strategy = AutoStrategy::parse(&s).unwrap_or(AutoStrategy::Best)
             }
             ("autoswitch.include_api_key_accounts", Value::Bool(b)) => {
                 self.include_api_key_accounts = b

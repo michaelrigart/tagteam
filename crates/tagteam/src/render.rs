@@ -859,7 +859,7 @@ mod tests {
             active_position: active,
             accounts: vec![],
             threshold: 90.0,
-            strategy: tagteam_core::autoswitch::Strategy::Best,
+            strategy: tagteam_core::autoswitch::AutoStrategy::Best,
             names: tagteam_engine::views::ProviderNames {
                 display_name: "Claude Code",
                 launch_command: "claude",
@@ -934,7 +934,7 @@ mod tests {
             active_position: None,
             accounts,
             threshold: 90.0,
-            strategy: tagteam_core::autoswitch::Strategy::Best,
+            strategy: tagteam_core::autoswitch::AutoStrategy::Best,
             names: tagteam_engine::views::ProviderNames {
                 display_name: "Claude Code",
                 launch_command: "claude",

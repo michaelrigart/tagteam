@@ -174,7 +174,7 @@ pub(crate) fn snapshot(accounts: Vec<AccountView>) -> AccountsSnapshot {
             active_position: accounts.iter().find(|v| v.active).map(|v| v.row.position),
             accounts,
             threshold: 90.0,
-            strategy: tagteam_core::autoswitch::Strategy::Best,
+            strategy: tagteam_core::autoswitch::AutoStrategy::Best,
             names: CC_NAMES,
         }],
         this: None,

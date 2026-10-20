@@ -11,7 +11,7 @@ use common::{
     FakeFx, Fx, Recorded, crashed_switch, record_reading, usage_window, write_target_credential,
 };
 use serde_json::{Value, json};
-use tagteam_core::autoswitch::{AutoConfig, AutoState, Decision, NoSwitchReason, Strategy};
+use tagteam_core::autoswitch::{AutoConfig, AutoState, AutoStrategy, Decision, NoSwitchReason};
 use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
 use tagteam_engine::EngineError;
 use tagteam_engine::auto::{AutoEvent, QuarantineWatch, TickOutcome};
@@ -27,7 +27,7 @@ fn cfg(p: &dyn Provider) -> AutoConfig {
         cooldown_s: 300,
         interval_s: 60,
         unhealthy_ticks: 3,
-        strategy: Strategy::Best,
+        strategy: AutoStrategy::Best,
         include_api_key_accounts: false,
         models: Vec::new(),
         long_window: p.primary_long_window().map(str::to_owned),

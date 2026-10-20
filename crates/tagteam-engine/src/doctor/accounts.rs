@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use tagteam_core::autoswitch::Strategy;
+use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_core::fmt::span;
 use tagteam_core::trust::is_future_stamped;
 use tagteam_core::usage::WindowKind;
@@ -519,7 +519,7 @@ impl Run<'_> {
             }
         }
         let (settings, _) = Settings::load(&self.engine.env, &id);
-        if settings.strategy == Strategy::ConsumeFirst && p.primary_long_window().is_none() {
+        if settings.strategy == AutoStrategy::ConsumeFirst && p.primary_long_window().is_none() {
             self.push(
                 Some(&id),
                 Check::warn(

@@ -9,7 +9,7 @@ use std::ops::RangeInclusive;
 
 use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::{
-    AutoConfig, Decision, NoSwitchReason, Strategy, announces_sleep, most_severe, next_delay,
+    AutoConfig, AutoStrategy, Decision, NoSwitchReason, announces_sleep, most_severe, next_delay,
     once_exit_code,
 };
 use tagteam_engine::auto::{AutoEngine, AutoEvent, EventSink, TickOutcome};
@@ -31,7 +31,7 @@ pub struct AutoFlags {
     pub threshold: Option<f64>,
     pub interval_s: Option<i64>,
     pub cooldown_s: Option<i64>,
-    pub strategy: Option<Strategy>,
+    pub strategy: Option<AutoStrategy>,
     pub models: Option<Vec<String>>,
     pub include_api_key_accounts: Option<bool>,
 }
@@ -150,7 +150,7 @@ pub fn run_loop(
     }
     // §4.5: from the settings, or with no `--provider`, such a provider's engine runs `best`
     // with a `config-warning` instead.
-    if let (Some(p), Some(Strategy::ConsumeFirst)) = (&run.provider, run.flags.strategy) {
+    if let (Some(p), Some(AutoStrategy::ConsumeFirst)) = (&run.provider, run.flags.strategy) {
         if engine.provider(p)?.primary_long_window().is_none() {
             return Err(AutoError::NoLongWindow(p.clone()));
         }
@@ -416,7 +416,7 @@ mod tests {
             interval_seconds: 120,
             cooldown_seconds: 600,
             hysteresis_pct: 5.0,
-            strategy: Strategy::ConsumeFirst,
+            strategy: AutoStrategy::ConsumeFirst,
             include_api_key_accounts: true,
             unhealthy_ticks: 7,
             models: vec!["Fable".into()],
@@ -431,7 +431,7 @@ mod tests {
                 cooldown_s: 600,
                 interval_s: 120,
                 unhealthy_ticks: 7,
-                strategy: Strategy::ConsumeFirst,
+                strategy: AutoStrategy::ConsumeFirst,
                 include_api_key_accounts: true,
                 models: vec!["Fable".into()],
                 long_window: Some("7d".into()),
@@ -441,7 +441,7 @@ mod tests {
             threshold: Some(120.0),
             interval_s: Some(5),
             cooldown_s: Some(-1),
-            strategy: Some(Strategy::Best),
+            strategy: Some(AutoStrategy::Best),
             models: Some(Vec::new()),
             include_api_key_accounts: Some(false),
         };
@@ -452,7 +452,7 @@ mod tests {
                 threshold: 99.9,
                 cooldown_s: 0,
                 interval_s: 15,
-                strategy: Strategy::Best,
+                strategy: AutoStrategy::Best,
                 include_api_key_accounts: false,
                 models: Vec::new(),
                 long_window: None,
@@ -988,7 +988,7 @@ mod tests {
         let named = AutoRun {
             provider: Some(fake()),
             flags: AutoFlags {
-                strategy: Some(Strategy::ConsumeFirst),
+                strategy: Some(AutoStrategy::ConsumeFirst),
                 ..AutoFlags::default()
             },
             ..looping()
@@ -1068,7 +1068,7 @@ mod tests {
         fx.settings("", 2);
         let flagged = AutoRun {
             flags: AutoFlags {
-                strategy: Some(Strategy::ConsumeFirst),
+                strategy: Some(AutoStrategy::ConsumeFirst),
                 ..AutoFlags::default()
             },
             ..once
