@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use tagteam_cc::shape::KIND_API_KEY;
 use tagteam_cc::usage::format_iso8601;
-use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, Pace, ProviderId, Window, WindowKind, printable};
 use tagteam_engine::store::{AccountRow, Mapping};
 use tagteam_engine::switch::SwitchOutcome;
 use tagteam_engine::views::{
@@ -428,7 +428,9 @@ pub fn status_human(
 ) -> String {
     let mut out = match s {
         StatusView::NoLogin => "No live login.\n".to_owned(),
-        StatusView::Unmanaged { email } => format!("Live: {email} (not managed by tagteam)\n"),
+        StatusView::Unmanaged { email } => {
+            format!("Live: {} (not managed by tagteam)\n", printable(email))
+        }
         StatusView::Managed { account, total } => {
             let marker = if account.row.quarantine_reason.is_some() {
                 ", relogin required"
@@ -454,9 +456,10 @@ pub fn status_human(
             row.position
         )),
         ShellAccount::Unmanaged => match session_login {
-            Some(login) => {
-                out.push_str(&format!("This session: {login} (not managed by tagteam)\n"))
-            }
+            Some(login) => out.push_str(&format!(
+                "This session: {} (not managed by tagteam)\n",
+                printable(login)
+            )),
             None => out.push_str("This session: not managed by tagteam\n"),
         },
     }
@@ -760,6 +763,30 @@ mod tests {
             unmanaged_email: None,
             managed_key_replaced: false,
         }
+    }
+
+    #[test]
+    fn an_unmanaged_login_is_printable_in_status() {
+        let live = StatusView::Unmanaged {
+            email: "a\u{1b}[31m@x.co".into(),
+        };
+        assert_eq!(
+            status_human(&live, &ShellAccount::NotInShell, None, NOW, false),
+            "Live: a\u{fffd}[31m@x.co (not managed by tagteam)\n"
+        );
+        let human = status_human(
+            &live,
+            &ShellAccount::Unmanaged,
+            Some("b\u{9b}@x.co"),
+            NOW,
+            false,
+        );
+        assert_eq!(
+            human.lines().last(),
+            Some("This session: b\u{fffd}@x.co (not managed by tagteam)")
+        );
+        let json = status_json(&live, &ShellAccount::NotInShell, CLAUDE_CODE, &count);
+        assert_eq!(json["active"]["email"], "a\u{1b}[31m@x.co");
     }
 
     #[test]

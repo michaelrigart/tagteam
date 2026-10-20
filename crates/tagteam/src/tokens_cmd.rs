@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use jiff::tz::TimeZone;
 use serde_json::{Map, Value, json};
-use tagteam_core::ProviderId;
 use tagteam_core::time::{format_iso8601, parse_iso8601_ms};
 use tagteam_core::tokens::day_bounds_ms;
+use tagteam_core::{ProviderId, printable};
 use tagteam_engine::tokens::{
     ActiveBlock, Basis, Cost, IndexProgress, IndexState, PeriodKey, RowAccount, TokenCounts,
     TokenGrouping, TokenPeriod, TokenReport, TokenRow, TokenTotal, Wait, default_since_ms,
@@ -618,7 +618,11 @@ pub(crate) fn human(report: &TokenReport) -> String {
         cells.push(cost_cell(row.cost.as_ref(), mark));
         match &row.period {
             PeriodKey::Session { project, .. } => {
-                cells.push(project.clone().unwrap_or_else(|| MISSING.to_owned()));
+                cells.push(
+                    project
+                        .as_deref()
+                        .map_or_else(|| MISSING.to_owned(), |p| printable(p).into_owned()),
+                );
             }
             PeriodKey::Block {
                 observed, active, ..
@@ -800,6 +804,8 @@ fn footnotes(report: &TokenReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use tagteam_engine::tokens::RowKey;
+
     use super::*;
 
     #[test]
@@ -1047,5 +1053,37 @@ mod tests {
         let out = notices(&report_with(many), false);
         assert!(out[0].starts_with("warning: 12 transcript lines could not be read"));
         assert!(out[1].starts_with("warning: 1 transcript file could not be read"));
+    }
+
+    #[test]
+    fn a_session_rows_project_is_printable_in_the_table_and_raw_in_json_and_csv() {
+        let raw = "/tmp/\u{1b}[2J\u{7}evil";
+        let period = PeriodKey::Session {
+            session_id: "s1".to_owned(),
+            project: Some(raw.to_owned()),
+            first_ms: 1_790_000_000_000,
+            last_ms: 1_790_000_060_000,
+        };
+        let row = TokenRow {
+            key: RowKey::new(&period, None, None),
+            period,
+            account: None,
+            model: None,
+            accounts: vec![],
+            models: vec![],
+            counts: TokenCounts::default(),
+            responses: 1,
+            unfinalized: 0,
+            cost: None,
+        };
+        let mut report = report_with(IndexState::default());
+        report.query.period = TokenPeriod::Session;
+        report.rows = vec![row.clone()];
+
+        let table = human(&report);
+        assert!(table.contains("/tmp/\u{fffd}[2J\u{fffd}evil"), "{table:?}");
+        assert!(!table.contains('\u{1b}'), "{table:?}");
+        assert_eq!(row_json(&row)["period"]["project"], raw);
+        assert!(csv(&report).contains(raw), "{:?}", csv(&report));
     }
 }
