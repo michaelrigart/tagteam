@@ -1579,6 +1579,22 @@ pub fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     (result, text.lines().map(str::to_owned).collect())
 }
 
+/// `capture_logs` with each line's target kept: level, then target, then the message.
+pub fn capture_logs_with_targets<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    ALWAYS_TWO.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    let buffer = LogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buffer.clone())
+        .with_ansi(false)
+        .without_time()
+        .with_target(true)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let text = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+    (result, text.lines().map(str::to_owned).collect())
+}
+
 /// The thread `cc_holds_storage_write_from` starts; it returns the instant just before CC let go
 /// of its storage-write lock.
 #[cfg(feature = "test-hooks")]

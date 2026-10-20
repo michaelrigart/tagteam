@@ -630,6 +630,7 @@ impl<'a> Rollback<'a, '_> {
         let from = self.from.as_ref().map(tracing::field::display);
         if failed.is_empty() {
             tracing::warn!(
+                target: "tagteam_engine::switch",
                 provider = %self.provider,
                 from_account = from,
                 to_account = %self.to,
@@ -641,6 +642,7 @@ impl<'a> Rollback<'a, '_> {
             // A count (§14.2): each entry names a Keychain service or a file path, and an
             // error's text.
             tracing::error!(
+                target: "tagteam_engine::switch",
                 provider = %self.provider,
                 from_account = from,
                 to_account = %self.to,
@@ -688,11 +690,12 @@ impl Drop for Rollback<'_, '_> {
         }
         let failed = self.roll_back(Vec::new());
         if failed.is_empty() {
-            tracing::warn!("an unwinding switch was rolled back");
+            tracing::warn!(target: "tagteam_engine::switch", "an unwinding switch was rolled back");
         } else {
             // A count (§14.2): each entry names a Keychain service or a file path, and an
             // error's text.
             tracing::error!(
+                target: "tagteam_engine::switch",
                 failed = failed.len(),
                 "an unwinding switch was not fully rolled back; its journal row stays for recovery"
             );
@@ -1538,6 +1541,7 @@ impl Engine {
                 // error that names the account.
                 Err(EngineError::RescuePending { .. }) => {
                     tracing::warn!(
+                        target: "tagteam_engine::switch",
                         position = row.position,
                         account = %row.id,
                         "a pending rescue could not be settled; the target is passed over"
@@ -1551,6 +1555,7 @@ impl Engine {
                 Ok(ProfileCheck::Conflict) => return Ok(AutoFreshened::Skip),
                 Ok(ProfileCheck::Unreadable(_)) => {
                     tracing::warn!(
+                        target: "tagteam_engine::switch",
                         position = row.position,
                         account = %row.id,
                         "the session profile could not be read; the target is passed over"
@@ -2331,6 +2336,7 @@ impl Engine {
                 }
                 if class == OutgoingClass::Unresolved {
                     tracing::warn!(
+                        target: "tagteam_engine::switch",
                         position = out.position,
                         account = %out.id,
                         "captured an unverified live credential into the vault; .prev keeps the previous generation"
