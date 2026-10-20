@@ -541,13 +541,18 @@ fn short_resets(
 ) -> Result<Vec<i64>, StoreError> {
     let since_s = from_ms.saturating_sub(2 * BLOCK_MS).div_euclid(1000);
     let mut resets = Vec::new();
-    for (key, sample) in store.usage_samples(id, None, since_s)? {
-        let is_short = *short.entry(key).or_insert_with_key(|key| {
+    for key in store.usage_window_keys(id)? {
+        let is_short = *short.entry(key.clone()).or_insert_with_key(|key| {
             p.describe_window(key)
                 .is_some_and(|w| w.kind == WindowKind::Short)
         });
-        if let Some(reset) = sample.resets_at.filter(|_| is_short) {
-            resets.push(reset.saturating_mul(1000));
+        if !is_short {
+            continue;
+        }
+        for (_, sample) in store.usage_samples(id, Some(&key), since_s)? {
+            if let Some(reset) = sample.resets_at {
+                resets.push(reset.saturating_mul(1000));
+            }
         }
     }
     resets.sort_unstable();
