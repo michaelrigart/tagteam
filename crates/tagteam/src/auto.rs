@@ -314,21 +314,18 @@ impl EventSink for HumanSink<'_> {
 
 /// Epoch seconds as the local time of day, `HH:MM:SS`; UTC should the zone be unreadable.
 pub fn local_time(epoch_s: i64) -> String {
-    let t = epoch_s as libc::time_t;
-    // SAFETY: an all-zero `tm` is valid storage for `localtime_r` to fill.
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // SAFETY: both pointers are valid for the call; `localtime_r` is reentrant and keeps
-    // neither.
-    let filled = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
-    let (h, m, s) = if filled {
-        (
-            i64::from(tm.tm_hour),
-            i64::from(tm.tm_min),
-            i64::from(tm.tm_sec),
-        )
-    } else {
-        let s = epoch_s.rem_euclid(86_400);
-        (s / 3600, s % 3600 / 60, s % 60)
+    let zoned = jiff::Timestamp::from_second(epoch_s)
+        .map(|ts| ts.to_zoned(jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC)));
+    let (h, m, s) = match zoned {
+        Ok(z) => (
+            i64::from(z.hour()),
+            i64::from(z.minute()),
+            i64::from(z.second()),
+        ),
+        Err(_) => {
+            let s = epoch_s.rem_euclid(86_400);
+            (s / 3600, s % 3600 / 60, s % 60)
+        }
     };
     format!("{h:02}:{m:02}:{s:02}")
 }
@@ -664,6 +661,11 @@ mod tests {
              t+0  <claude-code>  #2 b@x.co  \x1b[33m75%\x1b[0m  no switch: below-threshold\n\
              t+0  <claude-code>  #2 b@x.co  50%  no switch: below-threshold\n"
         );
+    }
+
+    #[test]
+    fn local_time_of_an_out_of_range_epoch_still_reads_as_a_time() {
+        assert_eq!(local_time(i64::MAX).len(), 8);
     }
 
     #[test]
