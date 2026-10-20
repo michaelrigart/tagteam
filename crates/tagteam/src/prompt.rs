@@ -117,6 +117,17 @@ fn terminal_path() -> PathBuf {
 /// How long one `poll(2)` waits before the token is looked at again (Decision 5).
 const SLICE_MS: libc::c_int = 100;
 
+/// What a test runs once in `wait_for_input`, after an early poll's sleep and before the token
+/// is looked at again (Decision 5). A thread-local, so that tests on other threads never see it.
+#[cfg(test)]
+type AfterSleepHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SLEEP: std::cell::RefCell<Option<AfterSleepHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Waits until `input` (an open descriptor, or a number poll reports as `POLLNVAL`) has
 /// something to read, or until `cancel` holds a signal: `true` to go on and read, `false` when
 /// interrupted. The handler restarts interrupted syscalls (Decision 2), so a blocked read would
@@ -147,6 +158,10 @@ fn wait_for_input(input: RawFd, cancel: &Cancel) -> bool {
             || (ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted);
         if returned_early {
             std::thread::sleep(std::time::Duration::from_millis(SLICE_MS as u64));
+            #[cfg(test)]
+            if let Some(hook) = AFTER_SLEEP.with(|slot| slot.borrow_mut().take()) {
+                hook();
+            }
             return cancel.requested().is_none();
         }
     }
@@ -604,10 +619,13 @@ mod tests {
                 && waited < Duration::from_millis(400),
             "no sooner than about one slice: {waited:?}"
         );
-        // A signal during that sleep is still seen at once: interrupted, not ready.
-        let setter = set_after(&cancel, Duration::from_millis(30), libc::SIGINT);
+        // A signal during that sleep is still seen at once: interrupted, not ready. The hook puts
+        // it after the sleep and before the look, where a timed thread could land either side.
+        let signalled = cancel.clone();
+        AFTER_SLEEP.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || signalled.request(libc::SIGINT)));
+        });
         assert!(!wait_for_input(fd, &cancel), "the token is looked at again");
-        setter.join().unwrap();
     }
 
     #[test]
