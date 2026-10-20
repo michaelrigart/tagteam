@@ -14,7 +14,7 @@ use tagteam_engine::daemon::daemon_socket_path;
 use tagteam_provider::Env;
 
 use crate::protocol::{Event, Hello, MAX_LINE, PROTOCOL, Status, parse_event};
-use crate::server::MAX_SOCKET_PATH;
+use crate::server::{MAX_SOCKET_PATH, peer_uid};
 
 /// D5.7: how long `connect` waits for the greeting.
 pub const GREETING_TIMEOUT: Duration = Duration::from_millis(250);
@@ -25,8 +25,9 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub enum Connect {
     Connected(Client),
-    /// No socket file, a path too long to bind, a refused connection, or the end of it before
-    /// the greeting: no daemon serves this data directory, and the caller works without one.
+    /// No socket file, a path too long to bind, a refused connection, a socket served by
+    /// another user, or the end of it before the greeting: no daemon serves this data
+    /// directory, and the caller works without one.
     NoDaemon,
     /// The daemon speaks another protocol (D5.6). The connection is closed, and the caller
     /// works without the daemon until it restarts on this binary (D4.5).
@@ -56,7 +57,9 @@ pub fn connect(env: &Env) -> Result<Connect, ClientError> {
 /// D5.7: the daemon at `path`, greeted within `GREETING_TIMEOUT`. A greeting that does not come
 /// in time is `Timeout`: something accepted and said nothing, so a daemon is there but does
 /// not answer (D8.2). A path over `MAX_SOCKET_PATH` is `NoDaemon` without a connect: no daemon
-/// can have bound it (D5.1), and the operating system would answer `InvalidInput`.
+/// can have bound it (D5.1), and the operating system would answer `InvalidInput`. A server
+/// owned by another user, or whose owner cannot be read, is `NoDaemon` too, before anything is
+/// sent or read.
 pub fn connect_at(path: &Path) -> Result<Connect, ClientError> {
     if path.as_os_str().as_bytes().len() > MAX_SOCKET_PATH {
         return Ok(Connect::NoDaemon);
@@ -66,7 +69,27 @@ pub fn connect_at(path: &Path) -> Result<Connect, ClientError> {
         Err(e) if no_daemon(&e) => return Ok(Connect::NoDaemon),
         Err(e) => return Err(e.into()),
     };
+    // SAFETY: geteuid(2) only reads the process's effective user id; it cannot fail.
+    let own = unsafe { libc::geteuid() };
+    match peer_uid(&stream) {
+        Ok(uid) if serves_us(uid, own) => {}
+        Ok(uid) => {
+            tracing::warn!(
+                "the daemon socket is served by another user, so it is not used: server uid {uid}, ours {own}"
+            );
+            return Ok(Connect::NoDaemon);
+        }
+        Err(e) => {
+            tracing::warn!("could not tell who serves the daemon socket, so it is not used: {e}");
+            return Ok(Connect::NoDaemon);
+        }
+    }
     greet(stream)
+}
+
+/// Whether a server running as `peer` is one this process, running as `own`, may talk to.
+fn serves_us(peer: u32, own: u32) -> bool {
+    peer == own
 }
 
 /// The half of `connect_at` after the connection: the greeting, read and checked.
@@ -336,5 +359,19 @@ mod tests {
         let (client, server) = UnixStream::pair().unwrap();
         drop(server);
         assert!(matches!(greet(client), Ok(Connect::NoDaemon)));
+    }
+
+    #[test]
+    fn only_a_server_with_our_uid_is_ours() {
+        assert!(serves_us(501, 501));
+        assert!(!serves_us(0, 501));
+        assert!(!serves_us(502, 501));
+    }
+
+    #[test]
+    fn the_uid_of_a_peer_in_this_process_is_ours() {
+        // A uid mismatch cannot be made without root; this pins the plumbing instead.
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert!(serves_us(peer_uid(&a).unwrap(), unsafe { libc::geteuid() }));
     }
 }
