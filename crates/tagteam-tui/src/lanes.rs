@@ -1,6 +1,6 @@
 //! Worker lanes (spec §4.3): one thread each, serving its requests in order. A lane builds its
 //! own state inside its thread (R4), merges a queued request with a newer one of the same kind,
-//! and stops taking requests once it is closed or has died.
+//! and stops taking requests once it is closed or has died. `Lanes` is the set the TUI runs.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
@@ -201,89 +201,59 @@ impl Lanes {
         status: Option<StatusFetch>,
     ) -> Lanes {
         let strays = Arc::default();
-        let views = {
-            let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
-            Lane::spawn(
-                "views",
-                move || make(),
-                move |source: &mut Box<dyn Source>, req: ViewsReq| {
-                    let msg = match req {
-                        ViewsReq::Accounts { r#gen } => Msg::Accounts {
-                            r#gen,
-                            result: source.accounts(provider.as_ref()),
-                        },
-                        ViewsReq::History {
-                            r#gen,
-                            account,
-                            since_s,
-                        } => Msg::History {
-                            r#gen,
-                            result: source.history(&account, since_s),
-                        },
-                    };
-                    let _ = out.send(msg);
+        let views = spawn_lane("views", sources, tx, move |source, req: ViewsReq, out| {
+            let msg = match req {
+                ViewsReq::Accounts { r#gen } => Msg::Accounts {
+                    r#gen,
+                    result: source.accounts(provider.as_ref()),
                 },
-                move || {
-                    let _ = died.send(Msg::LaneDied { lane: "views" });
+                ViewsReq::History {
+                    r#gen,
+                    account,
+                    since_s,
+                } => Msg::History {
+                    r#gen,
+                    result: source.history(&account, since_s),
                 },
-            )
-        };
-        let report = {
-            let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
-            Lane::spawn(
-                "report",
-                move || make(),
-                move |source: &mut Box<dyn Source>, req: ReportReq| {
-                    let msg = match req {
-                        ReportReq::Report { r#gen, query } => Msg::TokenReport {
-                            r#gen,
-                            result: source.token_report(&query),
-                        },
-                        ReportReq::IndexState { r#gen, provider } => Msg::IndexState {
-                            r#gen,
-                            result: source.token_index_state(&provider),
-                        },
-                        ReportReq::Inventory { r#gen, query } => Msg::Inventory {
-                            r#gen,
-                            result: source.token_report(&query),
-                        },
-                    };
-                    let _ = out.send(msg);
+            };
+            let _ = out.send(msg);
+        });
+        let report = spawn_lane("report", sources, tx, |source, req: ReportReq, out| {
+            let msg = match req {
+                ReportReq::Report { r#gen, query } => Msg::TokenReport {
+                    r#gen,
+                    result: source.token_report(&query),
                 },
-                move || {
-                    let _ = died.send(Msg::LaneDied { lane: "report" });
+                ReportReq::IndexState { r#gen, provider } => Msg::IndexState {
+                    r#gen,
+                    result: source.token_index_state(&provider),
                 },
-            )
-        };
-        let index = {
-            let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
-            Lane::spawn(
-                "index",
-                move || make(),
-                move |source: &mut Box<dyn Source>, req: IndexReq| {
-                    let IndexReq::Refresh { provider } = req;
-                    // The engine reports progress per chunk; the loop is told at its own pace.
-                    let mut told: Option<Instant> = None;
-                    let result = source.refresh_tokens(&provider, &mut |progress| {
-                        if told.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
-                            told = Some(Instant::now());
-                            let _ = out.send(Msg::IndexProgress(*progress));
-                        }
-                    });
-                    let _ = out.send(Msg::Refreshed { result });
+                ReportReq::Inventory { r#gen, query } => Msg::Inventory {
+                    r#gen,
+                    result: source.token_report(&query),
                 },
-                move || {
-                    let _ = died.send(Msg::LaneDied { lane: "index" });
-                },
-            )
-        };
+            };
+            let _ = out.send(msg);
+        });
+        let index = spawn_lane("index", sources, tx, |source, req: IndexReq, out| {
+            let IndexReq::Refresh { provider } = req;
+            // The engine reports progress per chunk; the loop is told at its own pace.
+            let mut told: Option<Instant> = None;
+            let result = source.refresh_tokens(&provider, &mut |progress| {
+                if told.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY) {
+                    told = Some(Instant::now());
+                    let _ = out.send(Msg::IndexProgress(*progress));
+                }
+            });
+            let _ = out.send(Msg::Refreshed { result });
+        });
         let actions = {
-            let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
             let (host, shutdown, answers) = (Arc::clone(host), shutdown.clone(), answers.clone());
-            Lane::spawn(
+            spawn_lane(
                 "actions",
-                move || make(),
-                move |source: &mut Box<dyn Source>, req: ActionsReq| {
+                sources,
+                tx,
+                move |source, req: ActionsReq, out| {
                     let msg = match req {
                         ActionsReq::Collect { r#gen, accounts } => Msg::Collected {
                             r#gen,
@@ -299,9 +269,6 @@ impl Lanes {
                         }
                     };
                     let _ = out.send(msg);
-                },
-                move || {
-                    let _ = died.send(Msg::LaneDied { lane: "actions" });
                 },
             )
         };
@@ -380,6 +347,26 @@ impl Lanes {
         died.extend(lock(&self.strays).iter());
         died
     }
+}
+
+/// An engine lane (spec §4.3): it builds its own `Source` from `sources` on its thread, and
+/// hands `handle` each request with the sender its results go to. A panic sends
+/// `Msg::LaneDied { lane: name }`.
+fn spawn_lane<Req: Coalesce + Send + 'static>(
+    name: &'static str,
+    sources: &SourceFactory,
+    tx: &Sender<Msg>,
+    mut handle: impl FnMut(&mut Box<dyn Source>, Req, &Sender<Msg>) + Send + 'static,
+) -> Lane<Req> {
+    let (make, out, died) = (Arc::clone(sources), tx.clone(), tx.clone());
+    Lane::spawn(
+        name,
+        move || make(),
+        move |source: &mut Box<dyn Source>, req: Req| handle(source, req, &out),
+        move || {
+            let _ = died.send(Msg::LaneDied { lane: name });
+        },
+    )
 }
 
 /// `stray_death` over the list it adds to.
