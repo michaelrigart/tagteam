@@ -29,7 +29,6 @@ const PROFILE_CONFLICT: &str =
 const NO_LIVE_CREDENTIAL: &str = "the live login it names has no credential";
 const DEGRADED_LIVE: &str =
     "the live credential could be read only from its file, which may be out of date";
-const WIPED: &str = "Claude Code wiped the copy in use after its login was rejected";
 const NO_PROFILE_MARKER: &str = "its session profile's marker cannot be read";
 const NO_PROFILE_CREDENTIAL: &str = "its running session holds no credential";
 const DEGRADED_PROFILE: &str =
@@ -112,6 +111,13 @@ enum One {
     Gone,
     Exported(Box<(Exported, EnvelopeAccount)>),
     Broken(Box<(AccountRow, EngineError)>),
+}
+
+fn wiped(p: &dyn Provider) -> String {
+    format!(
+        "{} wiped the copy in use after its login was rejected",
+        p.display_name()
+    )
 }
 
 fn broken<T>(row: &AccountRow, reason: impl Into<String>) -> Result<T, EngineError> {
@@ -439,7 +445,7 @@ impl Engine {
         drop(held);
         let live = fresh_copy(row, live, NO_LIVE_CREDENTIAL, DEGRADED_LIVE)?;
         let Some(live_fp) = p.fingerprint(&live).filter(|_| !p.is_wiped(&live)) else {
-            return broken(row, WIPED);
+            return broken(row, wiped(p));
         };
         let vault = self.export_vault_generation(row)?;
         let Some(vault_fp) = p.fingerprint(&vault) else {
@@ -527,7 +533,7 @@ impl Engine {
             p.fingerprint(&held).filter(|_| !p.is_wiped(&held)),
             p.fingerprint(&vault),
         ) else {
-            return broken(row, WIPED);
+            return broken(row, wiped(p));
         };
         if !p.has_refresh_token(&held) && p.has_refresh_token(&vault) {
             return broken(row, PROFILE_LACKS_REFRESH);

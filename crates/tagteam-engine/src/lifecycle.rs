@@ -86,14 +86,18 @@ fn no_live_api_key(r: &Read<Vec<u8>>) -> Result<(), EngineError> {
     }
 }
 
-fn live_fresh(r: Read<Credential>) -> Result<Credential, EngineError> {
+fn live_fresh(p: &dyn Provider, r: Read<Credential>) -> Result<Credential, EngineError> {
     match r {
         Read::Present(c) if c.provenance() == Provenance::Degraded => {
             Err(EngineError::DegradedRead)
         }
-        Read::Present(c) if c.is_empty() => Err(EngineError::NoLiveLogin),
+        Read::Present(c) if c.is_empty() => Err(EngineError::NoLiveLogin {
+            launch: p.launch_command(),
+        }),
         Read::Present(c) => Ok(c),
-        Read::Absent => Err(EngineError::NoLiveLogin),
+        Read::Absent => Err(EngineError::NoLiveLogin {
+            launch: p.launch_command(),
+        }),
         Read::Unreadable(e) => Err(EngineError::Unreadable(e)),
     }
 }
@@ -844,19 +848,25 @@ impl Engine {
         // 1. The live identity, read once.
         let identity = match p.live_identity(&self.env) {
             Read::Present(i) => i,
-            Read::Absent => return Err(EngineError::NoLiveLogin),
+            Read::Absent => {
+                return Err(EngineError::NoLiveLogin {
+                    launch: p.launch_command(),
+                });
+            }
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         };
         // 2. The live credential, from the store CC would use; a degraded read is refused.
         let auth = p.read_live_auth(&self.env);
         no_live_api_key(&auth.managed_key)?;
-        let cred = live_fresh(auth.credential)?;
+        let cred = live_fresh(p.as_ref(), auth.credential)?;
         // Task 13's review: `classify` falls through to `setup_token` for any bytes it does
         // not recognise, a wiped credential included, so it has no "unrecognised" answer of
         // its own. Bytes with no fingerprint (which a wiped credential always is: neither
         // token is present) are refused here, before classification ever sees them.
         if p.fingerprint(cred.bytes()).is_none() {
-            return Err(EngineError::NoLiveLogin);
+            return Err(EngineError::NoLiveLogin {
+                launch: p.launch_command(),
+            });
         }
         // 3.2 Ownership, advisory and before any lock: never refreshes, never blocks on failure.
         // §7.6: an oracle answer with no non-empty uuid of its own is treated as unresolved,
@@ -928,7 +938,7 @@ impl Engine {
         };
         let now_auth = p.read_live_auth(&self.env);
         no_live_api_key(&now_auth.managed_key)?;
-        let now = live_fresh(now_auth.credential)?;
+        let now = live_fresh(p.as_ref(), now_auth.credential)?;
         if now_identity.as_ref().map(|i| &i.raw) != Some(&identity.raw)
             || p.fingerprint(now.bytes()) != p.fingerprint(cred.bytes())
         {

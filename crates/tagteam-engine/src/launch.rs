@@ -170,7 +170,7 @@ impl Engine {
             warnings.push(format!(
                 "a session of position {} may be running ({}), so this launch joins it as it is",
                 row.position,
-                SessionOwner::of(&state).damaged_list()
+                SessionOwner::of(&state, p).damaged_list()
             ));
         }
         // A marker naming another account refuses first: that profile is neither merged back
@@ -310,7 +310,7 @@ impl Engine {
             GateOutcome::Dead(_) => Freshened::default(),
             // Spent, its successor lost (§7.3 step 6). The gate's `successor_lost` quarantine is
             // best effort, so the refusal itself is carried (fix round 2).
-            GateOutcome::Unpersisted => refused(needs_relogin(row)),
+            GateOutcome::Unpersisted => refused(needs_relogin(p, row)),
             GateOutcome::Transient { rescued: true, .. } => refused(pending(
                 "the refresh succeeded, but the vault could not be written; the new token is in rescue/",
             )),
@@ -388,7 +388,7 @@ impl Engine {
             return Ok(None);
         }
         if self.due(p, &vault) {
-            return Err(needs_relogin(row));
+            return Err(needs_relogin(p, row));
         }
         Ok(Some(works_until_expiry(row)))
     }

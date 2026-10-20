@@ -492,7 +492,7 @@ impl Engine {
                 );
             }
             if state.owned() {
-                return Err(session_owned_error(row, &state));
+                return Err(session_owned_error(p.as_ref(), row, &state));
             }
         }
         Ok(())
@@ -659,7 +659,7 @@ impl Engine {
             if state.owned() {
                 return Err(EngineError::OrphanSessionRunning {
                     profile: profile.to_path_buf(),
-                    owner: Box::new(SessionOwner::of(&state)),
+                    owner: Box::new(SessionOwner::of(&state, p.as_ref())),
                 });
             }
         }

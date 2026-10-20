@@ -1136,9 +1136,10 @@ impl Collection<'_> {
     /// replacement.
     fn warn_replaced(&mut self) {
         self.warnings.push(format!(
-            "{label} (position {n})'s login was replaced while Claude Code kept the old one; run `tagteam switch {n} --force` to activate the replacement",
+            "{label} (position {n})'s login was replaced while {app} kept the old one; run `tagteam switch {n} --force` to activate the replacement",
             label = self.row.label,
-            n = self.row.position
+            n = self.row.position,
+            app = self.p.display_name()
         ));
     }
 

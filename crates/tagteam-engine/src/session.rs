@@ -320,7 +320,7 @@ impl Engine {
             );
         }
         if state.owned() {
-            return Err(session_owned_error(row, &state));
+            return Err(session_owned_error(p, row, &state));
         }
         Ok(())
     }
@@ -328,10 +328,14 @@ impl Engine {
 
 /// The `session-owned` refusal for `row`, whose profile is in `state`: it names every owner
 /// found and, for state that could not be read, the file and its repair.
-pub(crate) fn session_owned_error(row: &AccountRow, state: &SessionState) -> EngineError {
+pub(crate) fn session_owned_error(
+    p: &dyn Provider,
+    row: &AccountRow,
+    state: &SessionState,
+) -> EngineError {
     EngineError::SessionOwned {
         position: row.position,
         label: row.label.clone(),
-        owner: Box::new(SessionOwner::of(state)),
+        owner: Box::new(SessionOwner::of(state, p)),
     }
 }

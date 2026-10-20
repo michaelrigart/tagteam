@@ -42,7 +42,7 @@ use crate::daemon::{
     read_daemon_record,
 };
 use crate::engine::Engine;
-use crate::error::{EngineError, SessionOwner, daemon_advice};
+use crate::error::{EngineError, SessionOwner, daemon_advice, supervisor_name};
 use crate::profiles::{Held, allowlist, held, is_private, resolved};
 use crate::provenance::identity_drifted;
 use crate::recover::Direction;
@@ -2529,14 +2529,14 @@ impl Run<'_> {
         }
     }
 
-    /// §13.6: a live background-daemon supervisor in `profile` (`daemon.lock`, §12.6), found at
+    /// §13.6: a live background supervisor in `profile` (its supervisor lock, §12.6), found at
     /// that path, as the refusal names it. `whose` finishes "runs in ...".
-    fn daemon_check(profile: &Path, whose: &str) -> Check {
+    fn daemon_check(p: &dyn Provider, profile: &Path, whose: &str) -> Check {
         Check::info(
             "sessions.daemon",
-            format!("a Claude Code background daemon runs in {whose} until it stops"),
+            format!("{} runs in {whose} until it stops", supervisor_name(p)),
         )
-        .fix(daemon_advice(profile))
+        .fix(daemon_advice(p, profile))
     }
 
     /// What `state` says about ownership of the profile `whose` names, from the whole aggregate
@@ -2544,6 +2544,7 @@ impl Run<'_> {
     /// its repair, and the daemon, if one is live (§12.6). Nothing is filtered, so the account
     /// checks and the orphan checks report alike. `consequence` finishes the warning.
     fn ownership(
+        p: &dyn Provider,
         state: &SessionState,
         whose: &str,
         runs_in: &str,
@@ -2551,7 +2552,7 @@ impl Run<'_> {
     ) -> Vec<Check> {
         let mut out = Vec::new();
         if !state.damaged().is_empty() {
-            let owner = SessionOwner::of(state);
+            let owner = SessionOwner::of(state, p);
             out.push(
                 Check::warn(
                     "sessions.state",
@@ -2565,6 +2566,7 @@ impl Run<'_> {
         }
         if let Some(profile) = state.daemon_profile() {
             out.push(Self::daemon_check(
+                p,
                 profile,
                 &format!("{runs_in}, so it is session-owned"),
             ));
@@ -2602,18 +2604,21 @@ impl Run<'_> {
                         let whose = format!("account {n}'s");
                         let runs_in = format!("account {n}'s profile");
                         let consequence = "so the account counts as in a session: commands that change it refuse, and its baseline and provenance are not checked";
-                        let checks =
-                            match self.engine.session_state(p.as_ref(), row) {
-                                Ok(state) => Self::ownership(&state, &whose, &runs_in, consequence),
-                                Err(e) => vec![Check::warn(
+                        let checks = match self.engine.session_state(p.as_ref(), row) {
+                            Ok(state) => {
+                                Self::ownership(p.as_ref(), &state, &whose, &runs_in, consequence)
+                            }
+                            Err(e) => {
+                                vec![Check::warn(
                                 "sessions.state",
                                 format!(
                                     "{whose} session state cannot be read ({}), {consequence}",
                                     e.kind()
                                 ),
                             )
-                            .fix("make what it names readable again")],
-                            };
+                            .fix("make what it names readable again")]
+                            }
+                        };
                         found.extend(checks.into_iter().map(|c| (Some(row.provider.clone()), c)));
                     }
                     Some(_) => {}
@@ -2664,6 +2669,7 @@ impl Run<'_> {
         for p in judges.iter().filter(|p| p.capabilities().sessions) {
             let state = self.engine.session_state_at(p.as_ref(), dir);
             for c in Self::ownership(
+                p.as_ref(),
                 &state,
                 &whose,
                 &runs_in,
@@ -2711,7 +2717,7 @@ impl Run<'_> {
             self.engine.session_state(p, row),
             Ok(SessionState::Quiescent { .. })
         );
-        self.reservations(dir, n, found);
+        self.reservations(p, dir, n, found);
         if quiescent && p.has_baseline(dir) {
             found.push(
                 Check::info(
@@ -2969,7 +2975,7 @@ impl Run<'_> {
 
     /// §12.5: a reservation whose `tagteam` is gone but whose lock is still held, with the
     /// processes that hold it where the OS can tell. Probed, never waited on, never created.
-    fn reservations(&self, dir: &Path, n: u32, found: &mut Vec<Check>) {
+    fn reservations(&self, p: &dyn Provider, dir: &Path, n: u32, found: &mut Vec<Check>) {
         let list = match launch_reservations(dir) {
             Read::Present(list) => list,
             // The session state reads the same reservations, and `sessions.state` reports
@@ -2992,7 +2998,14 @@ impl Run<'_> {
             }
             let holders = holders_of(&path);
             let still_there = holders.is_some() || path.try_exists().unwrap_or(true);
-            found.push(held_reservation(&path, parent, n, holders, still_there));
+            found.push(held_reservation(
+                &path,
+                parent,
+                n,
+                p.launch_command(),
+                holders,
+                still_there,
+            ));
         }
     }
 
@@ -3203,6 +3216,7 @@ fn held_reservation(
     path: &Path,
     parent: u32,
     n: u32,
+    launch: &str,
     holders: Option<Vec<u32>>,
     still_there: bool,
 ) -> Check {
@@ -3230,7 +3244,7 @@ fn held_reservation(
     Check::info(
         "sessions.reservation",
         format!(
-            "{} is still held although its tagteam (pid {parent}) is gone ({holders}): a process its `claude` started still runs, so account {n} stays in a session",
+            "{} is still held although its tagteam (pid {parent}) is gone ({holders}): a process its `{launch}` started still runs, so account {n} stays in a session",
             path.display()
         ),
     )
@@ -3255,20 +3269,55 @@ mod tests {
     #[test]
     fn a_reservation_whose_lock_went_away_is_not_reported_as_unknowable() {
         let path = Path::new("/d/.tagteam-launch/42.lock");
-        let gone = held_reservation(path, 42, 1, None, false);
+        let gone = held_reservation(path, 42, 1, "claude", None, false);
         assert!(gone.message.contains("lock went away"), "{}", gone.message);
         assert_eq!(gone.fix.as_deref(), Some("run `tagteam doctor` again"));
-        let blind = held_reservation(path, 42, 1, None, true);
+        let blind = held_reservation(path, 42, 1, "claude", None, true);
         assert!(
             blind.message.contains("this OS cannot tell"),
             "{}",
             blind.message
         );
-        let seen = held_reservation(path, 42, 1, Some(vec![7, 9]), true);
+        let seen = held_reservation(path, 42, 1, "claude", Some(vec![7, 9]), true);
         assert!(
             seen.message.contains("held by pid 7, 9"),
             "{}",
             seen.message
+        );
+    }
+
+    #[test]
+    fn the_daemon_check_and_a_held_reservation_name_the_agent() {
+        let cc = tagteam_cc::ClaudeCode::new(
+            Arc::new(tagteam_provider::FakeKeychain::new()),
+            tagteam_provider::Platform::MacOs,
+        );
+        let c = Run::daemon_check(
+            &cc,
+            Path::new("/p"),
+            "account 1's profile, so it is session-owned",
+        );
+        assert_eq!(
+            c.message,
+            "a Claude Code background daemon runs in account 1's profile, so it is session-owned until it stops"
+        );
+        assert_eq!(
+            c.fix.as_deref(),
+            Some(
+                "stop it with `claude daemon stop --any` run with CLAUDE_CONFIG_DIR set to '/p'; if nothing is running at that pid, delete '/p/daemon.lock'"
+            )
+        );
+        let held = held_reservation(
+            Path::new("/d/.tagteam-launch/42.lock"),
+            42,
+            1,
+            "claude",
+            Some(vec![7, 9]),
+            true,
+        );
+        assert_eq!(
+            held.message,
+            "/d/.tagteam-launch/42.lock is still held although its tagteam (pid 42) is gone (held by pid 7, 9): a process its `claude` started still runs, so account 1 stays in a session"
         );
     }
 

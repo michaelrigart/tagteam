@@ -117,7 +117,7 @@ fn add_refuses_what_it_cannot_safely_capture() {
     let fx = Fx::new();
     assert!(matches!(
         fx.engine.add_live(add_opts(&fx)),
-        Err(EngineError::NoLiveLogin)
+        Err(EngineError::NoLiveLogin { .. })
     ));
     assert!(!fx.env.data_dir().exists());
 
@@ -169,7 +169,7 @@ fn add_refuses_a_wiped_live_credential() {
     );
     assert!(matches!(
         fx.engine.add_live(add_opts(&fx)),
-        Err(EngineError::NoLiveLogin)
+        Err(EngineError::NoLiveLogin { .. })
     ));
     assert!(
         fx.engine
