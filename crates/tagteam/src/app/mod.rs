@@ -58,8 +58,8 @@ struct App<'a, 'b> {
     keychain: Option<Arc<dyn Keychain>>,
     /// `Context::platform`: the daemon's notification backend depends on it (D6.2).
     platform: Platform,
-    /// Decision 7: the read counts of the command's Keychains, which the daemon's keychain
-    /// backoff compares (D4.1). Empty on Linux, which has no Keychain to back off for.
+    /// The read counts of each Keychain instance the command uses, which the daemon's
+    /// keychain backoff compares (D4.1). Empty on Linux, which has no Keychain to back off for.
     keychain_counts: Vec<Arc<ReadCounts>>,
     io: &'a mut Io<'b>,
 }
@@ -76,9 +76,9 @@ enum Ended {
 }
 
 /// Runs one command and returns its exit code (§13.1). A signal the command met at a
-/// cancellation point ends it with 128 + the signal and the `interrupted` error (Decision 4);
+/// cancellation point ends it with 128 + the signal and the `interrupted` error;
 /// one it never met leaves its output and exit code alone and is reported on stderr as too
-/// late (Decision 6). `run` ends with its child's code once the child has run.
+/// late. `run` ends with its child's code once the child has run.
 pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     let json = cli.json;
     let name = cli.command.as_ref().map_or("list", command_name);
@@ -139,7 +139,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     }
     // §12.7: the wrapper needs only the registered providers, so it reads no store and no
     // settings. It comes after the marker check: under a marker that cannot be read it refuses,
-    // as every command but `statusline` does (§12.8, Decision 19).
+    // as every command but `statusline` does (§12.8).
     if let Some(Command::ShellInit { shell }) = &cli.command {
         return Ended::Code(match locate_run_shell(&ctx) {
             Ok(located) => {
@@ -228,7 +228,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     }
 }
 
-/// The command's name in its canonical spelling, for the late notice (Decision 6).
+/// The command's name in its canonical spelling, for the late notice.
 fn command_name(command: &Command) -> &'static str {
     match command {
         Command::List => "list",
@@ -273,7 +273,7 @@ impl App<'_, '_> {
         !self.json && self.io.prompter.interactive()
     }
 
-    /// §14.1, Decision 5: a prompt is a cancellation point. One a signal cut short has
+    /// §14.1: a prompt is a cancellation point. One a signal cut short has
     /// answered as a decline, but whatever it answered, the command stops here, interrupted.
     fn after_prompt(&self) -> Result<(), Failure> {
         match self.engine.cancel().requested() {
