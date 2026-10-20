@@ -34,6 +34,8 @@ with the one before, so any release may contain breaking changes. Each section s
 
 - The daemon client refuses a socket served by another user.
 - rustls is updated to 0.23.46 (RUSTSEC-2026-0346 to RUSTSEC-2026-0349).
+- rustls-webpki is updated to 0.103.16, and webpki-roots and webpki-root-certs to 1.0.10
+  (RUSTSEC-2026-0381 to RUSTSEC-2026-0383).
 
 ## [20261016.2230.0] - 2026-10-16
 
