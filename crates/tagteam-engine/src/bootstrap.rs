@@ -12,7 +12,7 @@ use tagteam_provider::atomic::ensure_private_dir;
 #[cfg(feature = "test-hooks")]
 use tagteam_provider::profile::profile_path;
 use tagteam_provider::profile::{ProfileMarker, Seed, canonical_profile_path};
-use tagteam_provider::provider::Validity;
+use tagteam_provider::provider::{ValidateRequest, Validity};
 use tagteam_provider::{MutationGuard, Provenance, Provider, Read, ReadError};
 
 use crate::account_lock::AccountLock;
@@ -433,11 +433,13 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let identity = p.parse_identity(&row.identity_json)?;
         let validity = p.validate_profile(
-            &self.env,
-            spelling,
-            cwd,
-            program,
-            &identity,
+            &ValidateRequest {
+                env: &self.env,
+                spelling,
+                cwd,
+                program,
+                expect: &identity,
+            },
             self.spawner.as_ref(),
             self.cancel(),
         );

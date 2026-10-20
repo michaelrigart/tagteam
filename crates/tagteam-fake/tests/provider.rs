@@ -11,7 +11,7 @@ use tagteam_fake::{
     identity_json, login,
 };
 use tagteam_provider::http::{HttpError, HttpResponse, Method, RecordedRequest, ScriptedHttp};
-use tagteam_provider::provider::TransientKind;
+use tagteam_provider::provider::{TransientKind, ValidateRequest};
 use tagteam_provider::{
     Capabilities, Credential, EntryKind, Env, LiveChange, LockError, MustShare, MutationGuard,
     Pace, PollBudget, Provenance, Provider, ProviderError, Read, SecretStore, SharePolicy,
@@ -1049,11 +1049,13 @@ mod validation {
         };
         let check = |who: &str, cancel: &Cancel| {
             f.fake.validate_profile(
-                &f.env,
-                spelling,
-                &profile,
-                Path::new("/opt/fakeagent/bin/fakeagent"),
-                &identity(who),
+                &ValidateRequest {
+                    env: &f.env,
+                    spelling,
+                    cwd: &profile,
+                    program: Path::new("/opt/fakeagent/bin/fakeagent"),
+                    expect: &identity(who),
+                },
                 &spawner,
                 cancel,
             )
@@ -1090,13 +1092,16 @@ mod validation {
         for bytes in [&br#"{"fa": {"renew": "renew-p"}}"#[..], b"{}"] {
             fs::write(profile.join("credential.json"), bytes).unwrap();
             let got = f.fake.validate_profile(
-                &f.env,
-                spelling,
-                &profile,
-                Path::new("/opt/fakeagent/bin/fakeagent"),
-                &f.fake
-                    .parse_identity(&identity_json("bob", "ws2", "uid-bob"))
-                    .unwrap(),
+                &ValidateRequest {
+                    env: &f.env,
+                    spelling,
+                    cwd: &profile,
+                    program: Path::new("/opt/fakeagent/bin/fakeagent"),
+                    expect: &f
+                        .fake
+                        .parse_identity(&identity_json("bob", "ws2", "uid-bob"))
+                        .unwrap(),
+                },
                 &ScriptedSpawner::new(),
                 &Cancel::new(),
             );

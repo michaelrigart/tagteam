@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use tagteam_provider::profile::{LAUNCH_DIR, Seed, profile_path};
-use tagteam_provider::provider::{MergeReport, SessionEnv, Validity};
+use tagteam_provider::provider::{MergeReport, SessionEnv, ValidateRequest, Validity};
 use tagteam_provider::reservation::{LaunchReservation, remove_dead_reservations};
 use tagteam_provider::{MutationGuard, Provider, Read, ReadError};
 
@@ -471,11 +471,13 @@ impl Engine {
         let p = self.provider(&row.provider)?;
         let identity = p.parse_identity(&row.identity_json)?;
         let validity = p.validate_profile(
-            &self.env,
-            &launched.spelling,
-            cwd,
-            program,
-            &identity,
+            &ValidateRequest {
+                env: &self.env,
+                spelling: &launched.spelling,
+                cwd,
+                program,
+                expect: &identity,
+            },
             self.spawner.as_ref(),
             self.cancel(),
         );
