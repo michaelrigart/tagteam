@@ -458,6 +458,11 @@ impl Ending {
     }
 }
 
+/// What a test runs once inside `Ui::start`'s first wait, after the token was looked at and
+/// before the wait begins (§6.1).
+#[cfg(test)]
+type FirstWaitHook = Box<dyn FnOnce()>;
+
 /// The UI thread's loop and what it owns (§4.3).
 pub(crate) struct Ui<'a, T: Tty, P: Pause> {
     state: State,
@@ -471,6 +476,10 @@ pub(crate) struct Ui<'a, T: Tty, P: Pause> {
     /// Set when the shutdown begins.
     ending: Option<Ending>,
     next_tick: Instant,
+    /// Run once, in the first wait, so that a test puts a signal exactly between the token's
+    /// look and the wait.
+    #[cfg(test)]
+    before_first_wait: Option<FirstWaitHook>,
 }
 
 impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
@@ -500,6 +509,8 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
             shutdown: opts.shutdown.clone(),
             ending: None,
             next_tick: Instant::now() + WAKE,
+            #[cfg(test)]
+            before_first_wait: None,
         }
     }
 
@@ -512,6 +523,10 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
         self.execute(cmds);
         let deadline = Instant::now() + FIRST_FRAME;
         while !self.shutting_down() {
+            #[cfg(test)]
+            if let Some(hook) = self.before_first_wait.take() {
+                hook();
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             let Ok(msg) = self.rx.recv_timeout(left) else {
                 break;
@@ -2098,12 +2113,8 @@ mod tests {
         let signal = fx.opts.signal.clone();
         let ending = {
             let mut ui = fx.ui();
-            let sender = thread::spawn(move || {
-                thread::sleep(Duration::from_millis(30));
-                signal.request(libc::SIGTERM);
-            });
+            ui.before_first_wait = Some(Box::new(move || signal.request(libc::SIGTERM)));
             ui.start();
-            sender.join().unwrap();
             assert!(ui.ending.is_some(), "the timeout looked at the token");
             ui.run()
         };
