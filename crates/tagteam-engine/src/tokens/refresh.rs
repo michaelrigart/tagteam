@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use tagteam_core::ProviderId;
 use tagteam_provider::{Cancel, FlockGuard, LockError, Provider, UsageLine};
+use tracing::Level;
 
 use super::reader::{Checkpoint, Limits, LineReader, Step, Stop, open_at, past, unchanged};
 use super::{lock_until_free, tokens_lock_path};
@@ -539,6 +540,7 @@ impl Engine {
         })?;
         let tally = writer.tally;
         let mut complete = tally.files_done == jobs.len() as u64;
+        let mut pruned = 0;
         if complete {
             // Step 5. The prune stops with the budget or the cancel token, as reading does, and
             // a prune left unfinished leaves the refresh incomplete, so the next call goes on.
@@ -546,9 +548,10 @@ impl Engine {
             // some or completes (spec §5.2 Budget).
             let holder = uuid::Uuid::now_v7().to_string();
             let stop = || past(deadline) || cancel.requested().is_some();
-            complete = store
-                .prune_tokens(provider, epoch, cutoff_ms, &holder, self.now_ms(), &stop)?
-                .complete;
+            let outcome =
+                store.prune_tokens(provider, epoch, cutoff_ms, &holder, self.now_ms(), &stop)?;
+            complete = outcome.complete;
+            pruned = outcome.deleted;
         }
         if complete {
             // The store keeps `responses` and the pass's skipped lines itself, each batch counting
@@ -570,16 +573,32 @@ impl Engine {
             evidence_changed,
             took_ms: u64::try_from(self.now_ms().saturating_sub(started_ms)).unwrap_or(0),
         };
-        tracing::info!(
-            provider = self.registered_id(provider),
-            complete,
-            files = report.files_read,
-            added = report.responses_added,
-            updated = report.responses_updated,
-            skipped = report.skipped_lines,
-            took_ms = report.took_ms,
-            "refreshed the token index"
-        );
+        let provider_id = self.registered_id(provider);
+        if level(&report, pruned) == Level::INFO {
+            tracing::info!(
+                provider = provider_id,
+                complete,
+                files = report.files_read,
+                added = report.responses_added,
+                updated = report.responses_updated,
+                pruned,
+                skipped = report.skipped_lines,
+                took_ms = report.took_ms,
+                "refreshed the token index"
+            );
+        } else {
+            tracing::debug!(
+                provider = provider_id,
+                complete,
+                files = report.files_read,
+                added = report.responses_added,
+                updated = report.responses_updated,
+                pruned,
+                skipped = report.skipped_lines,
+                took_ms = report.took_ms,
+                "refreshed the token index"
+            );
+        }
         Ok((
             RefreshOutcome::Done(report),
             work.peak.load(Ordering::Relaxed),
@@ -632,6 +651,22 @@ impl Engine {
     }
 }
 
+/// INFO when the pass changed something the person could see in a report (`pruned` is the rows
+/// its prune deleted, which `IndexReport` does not carry); DEBUG for a pass that found nothing.
+fn level(report: &IndexReport, pruned: u64) -> Level {
+    if !report.complete
+        || report.files_read > 0
+        || report.responses_added > 0
+        || report.responses_updated > 0
+        || report.evidence_changed > 0
+        || pruned > 0
+    {
+        Level::INFO
+    } else {
+        Level::DEBUG
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -677,6 +712,51 @@ mod tests {
 
     fn other(pad: &str) -> String {
         format!("{}\n", serde_json::json!({"t": "other", "pad": pad}))
+    }
+
+    #[test]
+    fn a_pass_that_changed_nothing_is_debug_and_anything_else_is_info() {
+        let quiet = IndexReport {
+            complete: true,
+            ..IndexReport::default()
+        };
+        assert_eq!(level(&quiet, 0), Level::DEBUG);
+        assert_eq!(
+            level(
+                &IndexReport {
+                    skipped_lines: 3,
+                    took_ms: 40,
+                    ..quiet
+                },
+                0
+            ),
+            Level::DEBUG
+        );
+        for changed in [
+            IndexReport {
+                complete: false,
+                ..quiet
+            },
+            IndexReport {
+                files_read: 1,
+                ..quiet
+            },
+            IndexReport {
+                responses_added: 1,
+                ..quiet
+            },
+            IndexReport {
+                responses_updated: 1,
+                ..quiet
+            },
+            IndexReport {
+                evidence_changed: 1,
+                ..quiet
+            },
+        ] {
+            assert_eq!(level(&changed, 0), Level::INFO, "{changed:?}");
+        }
+        assert_eq!(level(&quiet, 2), Level::INFO, "a prune that deleted rows");
     }
 
     #[test]

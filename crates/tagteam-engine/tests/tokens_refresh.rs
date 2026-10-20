@@ -198,6 +198,38 @@ fn a_second_refresh_reads_nothing_new() {
 }
 
 #[test]
+fn refresh_logs_at_info_only_while_something_changes() {
+    const MSG: &str = "refreshed the token index";
+    let ffx = FakeFx::new();
+    let (env, p) = (&ffx.fx.env, ffx.fake_provider());
+    append_transcript(
+        env,
+        "a.jsonl",
+        &[
+            line(&response("m1", 2, true)),
+            line(&response("m2", 3, true)),
+        ]
+        .concat(),
+    );
+    let with = |logs: &[String], level: &str| {
+        logs.iter()
+            .filter(|l| l.starts_with(level) && l.contains(MSG))
+            .count()
+    };
+
+    let (_, logs) = common::capture_logs(|| refresh(&ffx.engine, &p));
+    assert_eq!(with(&logs, " INFO"), 1, "{logs:?}");
+
+    let (_, logs) = common::capture_logs(|| refresh(&ffx.engine, &p));
+    assert_eq!(with(&logs, " INFO"), 0, "{logs:?}");
+    assert_eq!(with(&logs, "DEBUG"), 1, "{logs:?}");
+
+    append_transcript(env, "a.jsonl", &line(&response("m3", 4, true)));
+    let (_, logs) = common::capture_logs(|| refresh(&ffx.engine, &p));
+    assert_eq!(with(&logs, " INFO"), 1, "{logs:?}");
+}
+
+#[test]
 fn appended_lines_are_picked_up() {
     let ffx = FakeFx::new();
     let (env, p) = (&ffx.fx.env, ffx.fake_provider());
