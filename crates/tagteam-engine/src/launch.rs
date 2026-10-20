@@ -11,7 +11,7 @@ use tagteam_provider::reservation::{LaunchReservation, remove_dead_reservations}
 use tagteam_provider::{MutationGuard, Provider, Read, ReadError};
 
 use crate::account_lock::AccountLock;
-use crate::bootstrap::{Trigger, refusal, refuse_linked_profile};
+use crate::bootstrap::{ProfileCtx, Trigger, refusal, refuse_linked_profile};
 use crate::engine::{Engine, GuardRequest};
 use crate::error::{EngineError, SessionOwner};
 use crate::hooks;
@@ -195,8 +195,17 @@ impl Engine {
         let bootstrapped = if joining {
             false
         } else {
-            let (bootstrapped, summary) =
-                self.prepare_quiescent(p, &row, &profile, cwd, program, &guard, &lock)?;
+            let (bootstrapped, summary) = self.prepare_quiescent(
+                p,
+                &ProfileCtx {
+                    row: &row,
+                    profile: &profile,
+                    cwd,
+                    program,
+                    guard: &guard,
+                    lock: &lock,
+                },
+            )?;
             // A baseline that had no marker beside it is merged back by the seed or the
             // bootstrap, and its summary is this launch's too.
             warnings.extend(summary);
@@ -408,47 +417,41 @@ impl Engine {
     /// Any other §12.3 trigger bootstraps too; otherwise the profile is seeded (§12.4).
     /// Returns whether it bootstrapped, and the summary of a merge-back the seed or the bootstrap
     /// ran (§12.4 step 3). A bootstrap validates in `cwd`, spawning `program`.
-    #[allow(clippy::too_many_arguments)]
     fn prepare_quiescent(
         &self,
         p: &dyn Provider,
-        row: &AccountRow,
-        profile: &Path,
-        cwd: &Path,
-        program: &Path,
-        guard: &MutationGuard,
-        lock: &AccountLock,
+        cx: &ProfileCtx<'_>,
     ) -> Result<(bool, Option<String>), EngineError> {
-        self.settle_rescues(p, row, lock)?;
-        let why = match self.apply_provenance(p, row, lock)? {
+        self.settle_rescues(p, cx.row, cx.lock)?;
+        let why = match self.apply_provenance(p, cx.row, cx.lock)? {
             ProfileCheck::Conflict => {
                 return Err(EngineError::ProfileConflict {
-                    position: row.position,
-                    label: row.label.clone(),
+                    position: cx.row.position,
+                    label: cx.row.label.clone(),
                 });
             }
             ProfileCheck::Unreadable(detail) => {
                 return Err(EngineError::Unreadable(ReadError::new(
-                    profile.display().to_string(),
+                    cx.profile.display().to_string(),
                     detail,
                 )));
             }
             ProfileCheck::VaultMovedOn => Some("vault-moved-on"),
             ProfileCheck::ReplacementWins => Some("replacement-wins"),
             ProfileCheck::InStep | ProfileCheck::Captured | ProfileCheck::NotApplicable => self
-                .bootstrap_trigger(p, row, profile)?
+                .bootstrap_trigger(p, cx.row, cx.profile)?
                 .map(Trigger::as_str),
         };
         let Some(why) = why else {
-            return Ok((false, self.seed_of(p, row, profile)?));
+            return Ok((false, self.seed_of(p, cx.row, cx.profile)?));
         };
         tracing::info!(
-            position = row.position,
-            account = %row.id,
+            position = cx.row.position,
+            account = %cx.row.id,
             why,
             "bootstrapping the session profile"
         );
-        let summary = self.bootstrap_profile(p, row, profile, cwd, program, guard, lock)?;
+        let summary = self.bootstrap_profile(p, cx)?;
         Ok((true, summary))
     }
 

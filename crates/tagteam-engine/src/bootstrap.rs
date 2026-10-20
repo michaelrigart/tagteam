@@ -25,6 +25,17 @@ use crate::lifecycle::PendingLaunches;
 use crate::provenance::identity_drifted;
 use crate::store::AccountRow;
 
+/// What a quiescent profile's bootstrap runs against: the account's row and profile, the
+/// `cwd` and `program` its validation spawns, and the `guard` and `lock` the caller holds.
+pub(crate) struct ProfileCtx<'a> {
+    pub(crate) row: &'a AccountRow,
+    pub(crate) profile: &'a Path,
+    pub(crate) cwd: &'a Path,
+    pub(crate) program: &'a Path,
+    pub(crate) guard: &'a MutationGuard,
+    pub(crate) lock: &'a AccountLock,
+}
+
 /// Why a quiescent profile needs a bootstrap (§12.3's opening list), in the order
 /// `bootstrap_trigger` checks them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,61 +291,59 @@ impl Engine {
     /// which the validation spawns (Decision 20). A profile that is not a real directory
     /// refuses, and a waiting baseline is merged back (§12.4), before anything is written.
     /// Returns that merge-back's summary, if it has one, for the launch's warnings.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bootstrap_profile(
         &self,
         p: &dyn Provider,
-        row: &AccountRow,
-        profile: &Path,
-        cwd: &Path,
-        program: &Path,
-        guard: &MutationGuard,
-        lock: &AccountLock,
+        cx: &ProfileCtx<'_>,
     ) -> Result<Option<String>, EngineError> {
-        debug_assert_eq!(lock.id(), &row.id, "the caller holds this account's lock");
+        debug_assert_eq!(
+            cx.lock.id(),
+            &cx.row.id,
+            "the caller holds this account's lock"
+        );
         // Only into a profile that is a real directory, as M4a's `is_real_dir` decides it: the
         // step 4 write resolves the profile from its canonical spelling, so through a link at
         // the profile path it would take the locks, and write the vault's account keys, at the
         // link's target. (The provider refuses a link at the credential file itself.)
-        if !fs::symlink_metadata(profile).is_ok_and(|m| m.is_dir()) {
-            return Err(not_its_own_directory(profile));
+        if !fs::symlink_metadata(cx.profile).is_ok_and(|m| m.is_dir()) {
+            return Err(not_its_own_directory(cx.profile));
         }
         // §12.4: before anything touches the profile, so a failure leaves it as it was.
-        let summary = self.merge_back_waiting(p, row, profile)?;
+        let summary = self.merge_back_waiting(p, cx.row, cx.profile)?;
         // §6.2 "Pending rescues before activation": a rescue consumed the vault's generation.
-        self.settle_rescues(p, row, lock)?;
-        let vault = self.vault_generation(row)?;
+        self.settle_rescues(p, cx.row, cx.lock)?;
+        let vault = self.vault_generation(cx.row)?;
         let v_fp = p.fingerprint(&vault).ok_or_else(|| {
             EngineError::InvalidInput(format!(
                 "position {}'s stored credential has no generation to start a session from",
-                row.position
+                cx.row.position
             ))
         })?;
-        let marker = self.own_marker(row, profile)?.ok_or_else(|| {
-            EngineError::InvalidInput(format!("{} has no profile marker", profile.display()))
+        let marker = self.own_marker(cx.row, cx.profile)?.ok_or_else(|| {
+            EngineError::InvalidInput(format!("{} has no profile marker", cx.profile.display()))
         })?;
         let recorded = marker.config_dir.clone();
-        let current = current_spelling(p, profile)?;
+        let current = current_spelling(p, cx.profile)?;
         // 2. As the profile holds it: the recorded spelling's item, then the file where the
         //    profile is now (Decision 22).
-        let held = self.read_held(p, profile, &recorded)?;
+        let held = self.read_held(p, cx.profile, &recorded)?;
         // 3.
         if let Some(bytes) = &held {
-            self.displace_held(p, row, profile, bytes, &v_fp)?;
+            self.displace_held(p, cx.row, cx.profile, bytes, &v_fp)?;
         }
         // 4. Account-scoped keys from the vault, machine-shared ones from the profile's own. The
         //    write takes the profile's credential locks and storage-write lock, under the
         //    current spelling, and releases them before it returns: step 5 takes them again.
         let composed = p.compose_profile_credential(&vault, held.as_deref())?;
-        p.write_profile_credential(&self.env, &current, guard, &composed)?;
+        p.write_profile_credential(&self.env, &current, cx.guard, &composed)?;
         hooks::point(self, "bootstrap-after-credential-write")?;
         // 5. Always, whatever the reason: an item left behind stays authoritative over the file.
-        p.delete_profile_credential(&self.env, profile, &current)?;
+        p.delete_profile_credential(&self.env, cx.profile, &current)?;
         if recorded != current {
-            p.delete_profile_credential(&self.env, profile, &recorded)?;
+            p.delete_profile_credential(&self.env, cx.profile, &recorded)?;
         }
         // 6. What Claude Code will read now must be the vault's current generation.
-        let effective = self.read_held(p, profile, &current)?;
+        let effective = self.read_held(p, cx.profile, &current)?;
         let in_step = effective.as_deref().is_some_and(|e| {
             p.fingerprint(e).as_ref() == Some(&v_fp)
                 && p.access_fingerprint(e) == p.access_fingerprint(&vault)
@@ -342,26 +351,26 @@ impl Engine {
         if !in_step {
             return Err(EngineError::InvalidInput(format!(
                 "the credential a session of position {} would read is not the vault's current generation, so it was not started",
-                row.position
+                cx.row.position
             )));
         }
         Seed {
-            login_epoch: row.login_epoch,
+            login_epoch: cx.row.login_epoch,
             seed_fp: v_fp.as_str().to_owned(),
             needs_bootstrap: false,
         }
-        .write(profile)?;
+        .write(cx.profile)?;
         if recorded != current {
             ProfileMarker {
                 config_dir: current.clone(),
                 ..marker
             }
-            .write(profile)?;
+            .write(cx.profile)?;
         }
         // 7. Its own merge-back finds the baseline gone, unless something wrote one since.
-        let seeded = self.seed_of(p, row, profile)?;
+        let seeded = self.seed_of(p, cx.row, cx.profile)?;
         // 8.
-        self.validate_bootstrap(p, row, &current, cwd, program)?;
+        self.validate_bootstrap(p, cx.row, &current, cx.cwd, cx.program)?;
         Ok(summary.or(seeded))
     }
 
@@ -489,7 +498,17 @@ impl Engine {
         let trigger = self.bootstrap_trigger(p, &row, &profile)?;
         let program = Path::new(p.launch_command());
         match trigger {
-            Some(_) => self.bootstrap_profile(p, &row, &profile, cwd, program, &guard, &lock)?,
+            Some(_) => self.bootstrap_profile(
+                p,
+                &ProfileCtx {
+                    row: &row,
+                    profile: &profile,
+                    cwd,
+                    program,
+                    guard: &guard,
+                    lock: &lock,
+                },
+            )?,
             None => self.seed_of(p, &row, &profile)?,
         };
         Ok(trigger)
@@ -534,12 +553,14 @@ mod tests {
             .engine
             .bootstrap_profile(
                 p.as_ref(),
-                &row,
-                &profile,
-                &t.env.home,
-                Path::new("claude"),
-                &guard,
-                &lock,
+                &ProfileCtx {
+                    row: &row,
+                    profile: &profile,
+                    cwd: &t.env.home,
+                    program: Path::new("claude"),
+                    guard: &guard,
+                    lock: &lock,
+                },
             )
             .unwrap_err();
 
