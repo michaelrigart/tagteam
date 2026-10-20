@@ -2,6 +2,7 @@
 //! dispatch, so every action says and does what the same command does on the command line.
 
 use tagteam_core::{AccountId, ProviderId};
+use tagteam_engine::switch::UsageStrategy;
 
 /// The selected account as the TUI last read it: the position names it to the CLI, and the ID
 /// guards the position (`--expect-account`, core §10.4).
@@ -12,19 +13,11 @@ pub struct AccountRef {
     pub position: u32,
 }
 
-/// `switch --strategy`'s values (core §9.3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Strategy {
-    Best,
-    NextAvailable,
-}
-
-impl Strategy {
-    fn arg(self) -> &'static str {
-        match self {
-            Strategy::Best => "best",
-            Strategy::NextAvailable => "next-available",
-        }
+/// `switch --strategy`'s values (core §9.3). Not `UsageStrategy::as_str`: that names `switch --json`'s.
+fn strategy_arg(strategy: UsageStrategy) -> &'static str {
+    match strategy {
+        UsageStrategy::Best => "best",
+        UsageStrategy::NextAvailable => "next-available",
     }
 }
 
@@ -33,7 +26,7 @@ pub enum Action {
     Switch(AccountRef),
     SwitchBy {
         provider: ProviderId,
-        strategy: Strategy,
+        strategy: UsageStrategy,
     },
     Enable(AccountRef),
     Disable(AccountRef),
@@ -91,7 +84,7 @@ impl Action {
                 provider.to_string(),
                 "switch".into(),
                 "--strategy".into(),
-                strategy.arg().into(),
+                strategy_arg(*strategy).into(),
             ],
             Action::Enable(a) => account(a, &["enable", &a.position.to_string()]),
             Action::Disable(a) => account(a, &["disable", &a.position.to_string()]),
@@ -241,14 +234,14 @@ mod tests {
         assert_eq!(
             args(&Action::SwitchBy {
                 provider: provider(),
-                strategy: Strategy::Best
+                strategy: UsageStrategy::Best
             }),
             "--no-color --provider claude-code switch --strategy best"
         );
         assert_eq!(
             args(&Action::SwitchBy {
                 provider: provider(),
-                strategy: Strategy::NextAvailable
+                strategy: UsageStrategy::NextAvailable
             }),
             "--no-color --provider claude-code switch --strategy next-available"
         );
@@ -331,7 +324,7 @@ mod tests {
             (
                 Action::SwitchBy {
                     provider: provider(),
-                    strategy: Strategy::Best,
+                    strategy: UsageStrategy::Best,
                 },
                 "switch",
             ),
