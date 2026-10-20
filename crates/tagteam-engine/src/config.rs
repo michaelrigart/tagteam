@@ -116,7 +116,15 @@ impl Engine {
         match (&entry.key.kind, value) {
             (KeyKind::Provider, Value::Str(id)) => {
                 if self.registry.get(&ProviderId::new(id.as_str())).is_none() {
-                    return Err(SettingsError::UnknownProvider(id.clone()));
+                    return Err(SettingsError::UnknownProvider {
+                        id: id.clone(),
+                        known: self
+                            .registry
+                            .all()
+                            .iter()
+                            .map(|p| p.id().to_string())
+                            .collect(),
+                    });
                 }
             }
             (KeyKind::ShareNames, Value::List(names)) => {

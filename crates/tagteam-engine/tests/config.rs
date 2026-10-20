@@ -692,10 +692,17 @@ fn a_provider_this_engine_does_not_register_refuses() {
             "{name} {flag:?}"
         );
     }
-    assert!(matches!(
-        fx.engine.config_set("default_provider", None, "fake-agent"),
-        Err(EngineError::Settings(SettingsError::UnknownProvider(id))) if id == "fake-agent"
-    ));
+    let err = fx
+        .engine
+        .config_set("default_provider", None, "fake-agent")
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::Settings(SettingsError::UnknownProvider { id, .. }) if id == "fake-agent")
+    );
+    assert_eq!(
+        err.to_string(),
+        "unknown provider \"fake-agent\"; name one this build has, such as claude-code"
+    );
     assert_eq!(
         refusal(&fx, "default_provider", None, "fake-agent"),
         "invalid-input"

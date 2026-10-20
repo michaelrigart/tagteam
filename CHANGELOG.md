@@ -44,6 +44,9 @@ with the one before, so any release may contain breaking changes. Each section s
   when a new one cannot be read.
 - `tagteam tui`'s Accounts screen no longer binds `g` and `G`, and `q` closes an open overlay
   before it quits.
+- `tagteam config`'s description of `default_provider`, and its warning for an invalid value, no
+  longer give `claude-code` as an example: they read "must be a provider id of lowercase
+  letters, digits and dashes".
 
 ### Security
 

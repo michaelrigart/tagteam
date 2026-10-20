@@ -1150,7 +1150,7 @@ fn each_key_says_what_a_valid_value_is() {
     let expect = |name: &str| reg(name).expect();
     assert_eq!(
         expect("default_provider"),
-        "must be a provider id of lowercase letters, digits and dashes, such as \"claude-code\""
+        "must be a provider id of lowercase letters, digits and dashes"
     );
     assert_eq!(
         expect("autoswitch.threshold"),
