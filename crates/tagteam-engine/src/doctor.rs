@@ -3287,7 +3287,7 @@ mod tests {
     }
 
     #[test]
-    fn the_daemon_check_and_a_held_reservation_name_the_agent() {
+    fn the_daemon_check_names_the_agent() {
         let cc = tagteam_cc::ClaudeCode::new(
             Arc::new(tagteam_provider::FakeKeychain::new()),
             tagteam_provider::Platform::MacOs,
@@ -3307,6 +3307,10 @@ mod tests {
                 "stop it with `claude daemon stop --any` run with CLAUDE_CONFIG_DIR set to '/p'; if nothing is running at that pid, delete '/p/daemon.lock'"
             )
         );
+    }
+
+    #[test]
+    fn a_held_reservation_names_the_agent() {
         let held = held_reservation(
             Path::new("/d/.tagteam-launch/42.lock"),
             42,
