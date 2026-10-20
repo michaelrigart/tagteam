@@ -374,7 +374,7 @@ Facts: `bootstrap-reporting-small.md` §2.a–§2.c.
   - Run it. Expected: FAIL, because the result is `Ended::Code(0)` today.
 - [ ] **Step 2: Handle the write.**
   - `answer_completions` reports a failed `write_all` like any command's output write: `Failure::from(EngineError::from(e)).report(io, json, true)`, as `export -` does.
-  - Do not special-case a broken pipe. It reports as `export -` does today.
+  - A broken pipe (`ErrorKind::BrokenPipe`) is the exception: it still ends with exit 0 and nothing on stderr, as the closed-stdout test in `tests/cli.rs` pins (see delta 9).
 - [ ] **Step 3: Extract the collectors.** Use `visible_values` and `spellings` at the four sites (`bootstrap-reporting-small.md` §3.a). The scripts stay byte-identical.
 - [ ] **Step 4: The changelog.** Add an entry under `Unreleased`: "`tagteam completions` exits with an error when it cannot write the script, rather than exiting 0 with a partial one."
 - [ ] **Step 5: Verify.** Run the Step 1 test (expected: PASS), `--test completions`, the `tagteam` focused command, and both clippy variants.
@@ -626,7 +626,7 @@ These are rulings inside the spec's intent. Each one is recorded under "Rulings"
 6. **`or_inactive`'s log target is pinned before the move** (Task 1), as R2 did for the switch.
 7. **The `SCHEMA_VERSION` path is `crate::SCHEMA_VERSION`** (`u32`, in `lib.rs`), named apart from the engine's store `SCHEMA_VERSION` by its crate. Test-module literals stay literals, because they pin the wire.
 8. **`Io::warn` and `Io::note` cover the twelve `warning:` and two `note:` sites in the app.** The writers in `run.rs` and `prompt.rs` (hardening's files), `logging.rs`, `lib.rs`'s signal handler and `tokens_cmd.rs`'s pre-formatted notices take bare writers or pre-built text, so they stay.
-9. **A completions write that fails reports like `export -`,** a broken pipe included.
+9. **A completions write that fails reports like `export -`, except a broken pipe.** A reader that closes the pipe early still exits 0, as `tests/cli.rs`'s closed-stdout test pins for `list` and `completions` alike. This was ruled during execution, superseding the first wording, "a broken pipe included".
 10. **`Wire<T>` parses through a local `Spelled` trait,** implemented for the four enums and `Trigger`. `ALL` is a `[Self; N]` array.
 11. **`Event`'s mode accessors return `Option`,** being `None` for other variants. `StatusOutcome` gets only `kind()`, as the spec lists.
 12. **The payload parsers are as lenient as the TUI's reader today.** `windows_pct` keeps wire key order, because the binding rule takes the first match.
