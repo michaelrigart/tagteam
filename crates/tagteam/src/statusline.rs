@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::json;
 use tagteam_cc::{CcPaths, ClaudeCode};
-use tagteam_core::{ProviderId, Window, WindowKind};
+use tagteam_core::{ProviderId, Window, WindowKind, printable};
 use tagteam_engine::lazy_http::LazyHttp;
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
@@ -56,7 +56,7 @@ pub(crate) fn unsupported(caps: Capabilities, provider_name: &str) -> Option<Str
 pub(crate) fn line(view: &StatuslineView, format: &str, now_s: i64, colour: bool) -> String {
     match view {
         StatuslineView::NoLogin => String::new(),
-        StatuslineView::Unmanaged { email } => format!("{email}\n"),
+        StatuslineView::Unmanaged { email } => format!("{}\n", printable(email)),
         StatuslineView::Managed { account } => {
             format!("{}\n", expand(format, account, now_s, colour))
         }
@@ -411,6 +411,17 @@ mod tests {
     use crate::cli::Cli;
     use crate::prompt::Prompter;
     use crate::render::testutil::{NOW, OAUTH, fable, read, spend, unread, view};
+
+    #[test]
+    fn an_unmanaged_email_is_printable() {
+        let view = StatuslineView::Unmanaged {
+            email: "a\u{1b}[31m@x.co".into(),
+        };
+        assert_eq!(
+            line(&view, DEFAULT_STATUSLINE_FORMAT, NOW, false),
+            "a\u{fffd}[31m@x.co\n"
+        );
+    }
 
     /// 5h at 9 % resetting in 2h40m, 7d at 77 % in 3d09h, €3.50 of €20 spent (17.5 %), and
     /// Fable at 0 %, read `age_s` ago.

@@ -404,6 +404,14 @@ fn both_client_refusal_shapes_are_systemic_and_quote_the_server() {
         "invalid_client",
         "an empty description is no message"
     );
+    // Control characters in the server's words never reach the terminal.
+    assert_eq!(
+        systemic(
+            400,
+            json!({"error": "invalid_client", "error_description": "bad\u{1b}[2J client\n"})
+        ),
+        "bad\u{fffd}[2J client\u{fffd}"
+    );
     // The endpoint's own shape: a 400 with a nested `invalid_request_error`.
     let nested = |message: Option<&str>| {
         let mut error = json!({"type": "invalid_request_error"});
@@ -417,6 +425,10 @@ fn both_client_refusal_shapes_are_systemic_and_quote_the_server() {
         "Client with id x not found"
     );
     assert_eq!(systemic(400, nested(None)), "invalid_request_error");
+    assert_eq!(
+        systemic(400, nested(Some("Client\u{7} with id x"))),
+        "Client\u{fffd} with id x"
+    );
     // Only a 400 carrying that exact nested type is a client refusal; everything else keeps
     // its old row.
     let transient =

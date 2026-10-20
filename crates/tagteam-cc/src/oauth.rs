@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tagteam_core::printable;
 use tagteam_provider::Identity;
 use tagteam_provider::http::{HttpError, HttpRequest, HttpResponse};
 use tagteam_provider::provider::{DeadReason, RefreshResult, TransientKind};
@@ -120,11 +121,12 @@ fn seconds(v: &Value) -> Option<i64> {
 /// The server's own words for a refusal: `error_description` (RFC 6749) or the nested
 /// `error.message`, else `fallback` (the error code), so the text is never empty.
 fn refusal_message(body: Option<&Value>, fallback: &str) -> String {
-    body.and_then(|b| {
+    match body.and_then(|b| {
         non_empty(&b["error_description"]).or_else(|| non_empty(&b["error"]["message"]))
-    })
-    .unwrap_or(fallback)
-    .to_owned()
+    }) {
+        Some(message) => printable(message).into_owned(),
+        None => fallback.to_owned(),
+    }
 }
 
 /// §7.3 step 7, the provider's half, and Appendix A.5's reply handling.
