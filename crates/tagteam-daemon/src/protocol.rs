@@ -1294,6 +1294,43 @@ mod tests {
     }
 
     #[test]
+    fn a_poll_reads_what_it_can_and_skips_the_rest() {
+        let no_email = parse_poll(&json!({"active": {"number": 2}})).unwrap();
+        assert_eq!(
+            no_email.active,
+            Some(ActiveAccount {
+                number: 2,
+                email: String::new()
+            })
+        );
+
+        let text = parse_poll(&json!({"threshold": "90"})).unwrap();
+        assert_eq!(text.threshold, None);
+
+        let poll = parse_poll(&json!({
+            "fetchErrors": {"1": "http-429", "x": "http-500", "2": 7, "3": "timeout"},
+            "windowsPct": {
+                "1": {"5h": 20.0, "7d": "high", "30d": 5.0},
+                "y": {"5h": 1.0},
+                "2": "none",
+                "3": {"5h": 3.0}
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            poll.fetch_errors,
+            BTreeMap::from([(1, "http-429".to_owned()), (3, "timeout".to_owned())])
+        );
+        assert_eq!(
+            poll.windows_pct,
+            BTreeMap::from([
+                (1, vec![("5h".to_owned(), 20.0), ("30d".to_owned(), 5.0)]),
+                (3, vec![("5h".to_owned(), 3.0)]),
+            ])
+        );
+    }
+
+    #[test]
     fn the_binding_window_is_the_first_within_the_tolerance() {
         let poll = |headroom: Value, windows: Value| {
             let mut raw = json!({"event": "poll", "headroomPct": {"1": headroom}});
@@ -1335,6 +1372,10 @@ mod tests {
         assert_eq!(
             poll(json!(59.6), json!({"5h": 40.4})).binding(1),
             bound("5h", 40)
+        );
+        assert_eq!(
+            poll(json!(59.4), json!({"5h": 40.6})).binding(1),
+            bound("5h", 41)
         );
 
         // An unknown headroom, a missing windowsPct, and another position bind nothing.
