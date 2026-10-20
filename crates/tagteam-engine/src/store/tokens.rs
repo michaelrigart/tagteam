@@ -5,9 +5,11 @@
 //! stored as `i64::MAX`.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+use rusqlite::types::FromSqlError;
+use rusqlite::{Connection, OptionalExtension, Row, Rows, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use tagteam_core::ProviderId;
 use tagteam_core::tokens::TokenCounts;
@@ -66,7 +68,7 @@ pub struct TokenFileRow {
 }
 
 /// One response (spec §2.2): `key` is its `usage_key`, and its counts, time and flags are
-/// merged over its lines.
+/// merged over its lines. It is the indexer's row; a report reads `ReportUsage` instead.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageRow {
     pub key: i64,
@@ -78,6 +80,35 @@ pub struct UsageRow {
     pub counts: TokenCounts,
     pub speed: Option<String>,
     pub finalized: bool,
+}
+
+/// One response as a report reads it (review-hardening H10.1): `session`, `model` and `speed`
+/// are indices into its `ReportUsage`'s tables, so no row owns a string.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReportResponse {
+    pub session: u32,
+    pub model: u32,
+    pub speed: Option<u32>,
+    pub at_ms: i64,
+    pub counts: TokenCounts,
+    pub finalized: bool,
+}
+
+/// A session a report's responses belong to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportSession {
+    pub session_id: String,
+    pub project: Option<String>,
+}
+
+/// The responses a report reads, by time, and the tables their ids index. Each table lists
+/// its entries once, in the order the rows first meet them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReportUsage {
+    pub rows: Vec<ReportResponse>,
+    pub sessions: Vec<ReportSession>,
+    pub models: Vec<String>,
+    pub speeds: Vec<String>,
 }
 
 /// What one batch did to the index: responses it added, and stored ones it changed.
@@ -331,6 +362,24 @@ const SESSIONS_OF: &str = "SELECT id FROM token_sessions WHERE provider = ?1";
 const USAGE_COLUMNS: &str = "u.key, s.session_id, s.project, u.at, m.name, u.sidechain, \
      u.input, u.output, u.cw_5m, u.cw_1h, u.cache_read, u.web_search, u.speed, u.finalized";
 
+/// A provider's responses in `[?2, ?3)`, by time, then the order they were first indexed
+/// in. The time index gives that order, so nothing is sorted (review-hardening H10.1);
+/// without the hint SQLite starts from the provider's sessions and sorts every row.
+const USAGE_IN_RANGE: &str = "FROM token_usage u INDEXED BY token_usage_by_at \
+     JOIN token_sessions s ON s.id = u.session JOIN token_models m ON m.id = u.model \
+     WHERE s.provider = ?1 AND u.at >= ?2 AND u.at < ?3 ORDER BY u.at, u.id";
+
+/// Session `?4`'s responses in `[?2, ?3)`, in the same order, along its session index.
+const USAGE_OF_SESSION: &str = "FROM token_sessions s \
+     JOIN token_usage u ON u.session = s.id JOIN token_models m ON m.id = u.model \
+     WHERE s.provider = ?1 AND s.session_id = ?4 AND u.at >= ?2 AND u.at < ?3 \
+     ORDER BY u.at, u.id";
+
+/// What a report reads of a response: its session's and model's ids beside their
+/// strings, which are copied only the first time an id is met, and what `group` sums.
+const REPORT_COLUMNS: &str = "u.session, s.session_id, s.project, u.model, m.name, u.at, \
+     u.input, u.output, u.cw_5m, u.cw_1h, u.cache_read, u.web_search, u.speed, u.finalized";
+
 fn usage_from_row(r: &Row<'_>) -> rusqlite::Result<UsageRow> {
     Ok(UsageRow {
         key: r.get(0)?,
@@ -350,6 +399,76 @@ fn usage_from_row(r: &Row<'_>) -> rusqlite::Result<UsageRow> {
         speed: r.get(12)?,
         finalized: r.get::<_, i64>(13)? != 0,
     })
+}
+
+/// Column `idx` as `get::<Option<String>>` reads it, and failing as that does, but borrowed.
+fn str_or_null<'r>(r: &'r Row<'_>, idx: usize) -> rusqlite::Result<Option<&'r str>> {
+    let value = r.get_ref(idx)?;
+    value.as_str_or_null().map_err(|e| match e {
+        FromSqlError::Utf8Error(e) => rusqlite::Error::Utf8Error(idx, e),
+        _ => rusqlite::Error::InvalidColumnType(
+            idx,
+            r.as_ref().column_name(idx).unwrap_or_default().to_owned(),
+            value.data_type(),
+        ),
+    })
+}
+
+/// Entry `i` of a report's table as a row holds it: a table has at most one entry per row.
+fn table_index(i: usize) -> u32 {
+    u32::try_from(i).expect("a report reads fewer than 2^32 responses")
+}
+
+/// A `REPORT_COLUMNS` statement's rows. A session's or model's strings are copied the first
+/// time its id is met, and a speed's the first time its text is; no row allocates.
+fn report_usage(mut rows: Rows<'_>) -> rusqlite::Result<ReportUsage> {
+    let mut usage = ReportUsage::default();
+    let mut sessions: HashMap<i64, u32> = HashMap::new();
+    let mut models: HashMap<i64, u32> = HashMap::new();
+    while let Some(r) = rows.next()? {
+        let session = match sessions.entry(r.get(0)?) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let session = *e.insert(table_index(usage.sessions.len()));
+                usage.sessions.push(ReportSession {
+                    session_id: r.get(1)?,
+                    project: r.get(2)?,
+                });
+                session
+            }
+        };
+        let model = match models.entry(r.get(3)?) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let model = *e.insert(table_index(usage.models.len()));
+                usage.models.push(r.get(4)?);
+                model
+            }
+        };
+        let speed = str_or_null(r, 12)?.map(|text| {
+            let i = usage.speeds.iter().position(|s| s == text);
+            table_index(i.unwrap_or_else(|| {
+                usage.speeds.push(text.to_owned());
+                usage.speeds.len() - 1
+            }))
+        });
+        usage.rows.push(ReportResponse {
+            session,
+            model,
+            speed,
+            at_ms: r.get(5)?,
+            counts: TokenCounts {
+                input: from_sql(r.get(6)?),
+                output: from_sql(r.get(7)?),
+                cache_write_5m: from_sql(r.get(8)?),
+                cache_write_1h: from_sql(r.get(9)?),
+                cache_read: from_sql(r.get(10)?),
+                web_search: from_sql(r.get(11)?),
+            },
+            finalized: r.get::<_, i64>(13)? != 0,
+        });
+    }
+    Ok(usage)
 }
 
 const SIGHTING_COLUMNS: &str =
@@ -889,24 +1008,41 @@ impl Store {
         let until = until_ms.unwrap_or(i64::MAX);
         let rows = match session {
             Some(id) => c
-                .prepare(&format!(
-                    "SELECT {USAGE_COLUMNS} FROM token_sessions s \
-                     JOIN token_usage u ON u.session = s.id JOIN token_models m ON m.id = u.model \
-                     WHERE s.provider = ?1 AND s.session_id = ?4 AND u.at >= ?2 AND u.at < ?3 \
-                     ORDER BY u.at, u.id"
-                ))?
+                .prepare(&format!("SELECT {USAGE_COLUMNS} {USAGE_OF_SESSION}"))?
                 .query_map(params![provider.as_str(), since, until, id], usage_from_row)?
                 .collect::<Result<Vec<_>, _>>()?,
             None => c
-                .prepare(&format!(
-                    "SELECT {USAGE_COLUMNS} FROM token_usage u \
-                     JOIN token_sessions s ON s.id = u.session JOIN token_models m ON m.id = u.model \
-                     WHERE s.provider = ?1 AND u.at >= ?2 AND u.at < ?3 ORDER BY u.at, u.id"
-                ))?
+                .prepare(&format!("SELECT {USAGE_COLUMNS} {USAGE_IN_RANGE}"))?
                 .query_map(params![provider.as_str(), since, until], usage_from_row)?
                 .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(rows)
+    }
+
+    /// `token_usage`'s responses, in its order, as a report reads them (review-hardening
+    /// H10.1): each session, model and speed once, in a table its rows index. One statement,
+    /// so one snapshot.
+    pub fn token_report_usage(
+        &self,
+        provider: &ProviderId,
+        since_ms: Option<i64>,
+        until_ms: Option<i64>,
+        session: Option<&str>,
+    ) -> Result<ReportUsage, StoreError> {
+        let c = self.lock();
+        let since = since_ms.unwrap_or(i64::MIN);
+        let until = until_ms.unwrap_or(i64::MAX);
+        let from = if session.is_some() {
+            USAGE_OF_SESSION
+        } else {
+            USAGE_IN_RANGE
+        };
+        let mut stmt = c.prepare(&format!("SELECT {REPORT_COLUMNS} {from}"))?;
+        let rows = match session {
+            Some(id) => stmt.query(params![provider.as_str(), since, until, id])?,
+            None => stmt.query(params![provider.as_str(), since, until])?,
+        };
+        Ok(report_usage(rows)?)
     }
 
     /// Every provider with a row in a token or evidence table, sorted. A full purge takes the
@@ -1222,5 +1358,92 @@ impl Store {
             .query_map([provider.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::types::Type;
+
+    use super::*;
+
+    /// `sql`'s query plan on a fresh store, one line per step.
+    fn plan(sql: &str, p: impl rusqlite::Params) -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        let c = store.lock();
+        let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        stmt.query_map(p, |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn a_report_reads_a_range_along_the_time_index_without_a_sort() {
+        let range = plan(
+            &format!("SELECT {REPORT_COLUMNS} {USAGE_IN_RANGE}"),
+            params!["claude-code", 0, i64::MAX],
+        );
+        assert_eq!(
+            range.first().map(String::as_str),
+            Some("SEARCH u USING INDEX token_usage_by_at (at>? AND at<?)"),
+            "{range:?}"
+        );
+        assert!(
+            !range.iter().any(|l| l.contains("TEMP B-TREE")),
+            "{range:?}"
+        );
+        let one = plan(
+            &format!("SELECT {REPORT_COLUMNS} {USAGE_OF_SESSION}"),
+            params!["claude-code", 0, i64::MAX, "s"],
+        );
+        assert!(!one.iter().any(|l| l.contains("TEMP B-TREE")), "{one:?}");
+    }
+
+    #[test]
+    fn a_report_read_fails_on_a_stored_speed_as_token_usage_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("t.db")).unwrap();
+        let provider = ProviderId::new("claude-code");
+        let generation = store.begin_token_refresh(&provider, 0).unwrap();
+        let row = UsageRow {
+            key: 1,
+            session_id: "s".into(),
+            project: None,
+            at_ms: 0,
+            model: "m".into(),
+            sidechain: false,
+            counts: TokenCounts::default(),
+            speed: None,
+            finalized: false,
+        };
+        store
+            .commit_token_batch(&provider, generation, &[row], &[], &[], 0, 0)
+            .unwrap();
+        // Stores `speed` as the response's, then reads it both ways: the report's read fails as
+        // `token_usage`'s does, which this returns.
+        let fails = |speed: &str| {
+            store
+                .lock()
+                .execute(&format!("UPDATE token_usage SET speed = {speed}"), [])
+                .unwrap();
+            let theirs = store.token_usage(&provider, None, None, None).unwrap_err();
+            let ours = store
+                .token_report_usage(&provider, None, None, None)
+                .unwrap_err();
+            assert_eq!(format!("{ours:?}"), format!("{theirs:?}"), "{speed}");
+            theirs
+        };
+        let not_utf8 = fails("CAST(x'ff' AS TEXT)");
+        let StoreError::Sqlite(rusqlite::Error::Utf8Error(12, _)) = &not_utf8 else {
+            panic!("{not_utf8:?}");
+        };
+        let blob = fails("x'00'");
+        let StoreError::Sqlite(rusqlite::Error::InvalidColumnType(12, name, Type::Blob)) = &blob
+        else {
+            panic!("{blob:?}");
+        };
+        assert_eq!(name, "speed");
     }
 }

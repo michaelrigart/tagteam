@@ -1618,3 +1618,27 @@ fn price_overrides_follow_the_report_provider() {
     let r = engine.token_report(&day_query(cc())).unwrap();
     assert_eq!(r.price_overrides, ["model-a"]);
 }
+
+#[test]
+fn a_fast_response_of_a_model_without_a_fast_card_is_unpriced() {
+    // Spec §8.3: the speed a response was stored with reaches its price; model-a has no
+    // fast card, so its fast response has no price while its others do.
+    let v = View::new();
+    v.sight("s-a", "acct-a", T0, T0 + 3 * D);
+    let mut standard = v.usage("s-a", T0 + H, "model-a", 10, 20);
+    standard.speed = Some("standard".into());
+    let unset = v.usage("s-a", T0 + 2 * H, "model-a", 5, 0);
+    let mut fast = v.usage("s-a", T0 + D + H, "model-a", 10, 20);
+    fast.speed = Some("fast".into());
+    v.index(&[standard, unset, fast]);
+
+    let r = v.report(&v.query(TokenPeriod::Day, TokenGrouping::None));
+    assert_eq!(keys(&r), ["day:2026-09-02", "day:2026-09-01"]);
+    // 10 × 1,000 + 20 × 2,000 + 5 × 1,000 nano-dollars.
+    let priced = Cost {
+        usd_nanos: 55_000,
+        partial: false,
+    };
+    assert_eq!((r.rows[0].cost, r.rows[1].cost), (None, Some(priced)));
+    assert_eq!(r.unpriced_models, ["model-a"]);
+}

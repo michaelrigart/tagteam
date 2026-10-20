@@ -18,7 +18,10 @@ use super::{
     AccountSel, ActiveBlock, Basis, Cost, PeriodKey, RowAccount, RowKey, TokenCounts,
     TokenGrouping, TokenPeriod, TokenQuery, TokenRow, TokenTotal,
 };
-use crate::store::{AccountRow, EpochRow, EventRow, LaunchRow, Store, StoreError, UsageRow};
+use crate::store::{
+    AccountRow, EpochRow, EventRow, LaunchRow, ReportResponse, ReportSession, ReportUsage, Store,
+    StoreError,
+};
 use crate::tokens::evidence::PendingEvidence;
 
 /// How far before `since` a block report reads (spec §9). A block that straddles `since` is
@@ -35,16 +38,16 @@ pub(super) struct Grouped {
 
 /// The responses `q` reads. A block is a span of its account's whole usage (spec §9), so a
 /// block report resolves every response it reads; the filters only choose which of them count.
-pub(super) fn usage(q: &TokenQuery, store: &Store) -> Result<Vec<UsageRow>, StoreError> {
+pub(super) fn usage(q: &TokenQuery, store: &Store) -> Result<ReportUsage, StoreError> {
     if q.period == TokenPeriod::Block {
-        store.token_usage(
+        store.token_report_usage(
             &q.provider,
             q.since_ms.map(|s| s.saturating_sub(BLOCK_LOOKBACK_MS)),
             q.until_ms.map(|u| u.saturating_add(BLOCK_MS)),
             None,
         )
     } else {
-        store.token_usage(&q.provider, q.since_ms, q.until_ms, q.session.as_deref())
+        store.token_report_usage(&q.provider, q.since_ms, q.until_ms, q.session.as_deref())
     }
 }
 
@@ -52,8 +55,8 @@ pub(super) fn usage(q: &TokenQuery, store: &Store) -> Result<Vec<UsageRow>, Stor
 pub(super) struct Reads {
     /// The epoch (spec §7.2); `None` after a full purge, before the next refresh begins.
     pub(super) epoch: Option<EpochRow>,
-    /// The responses `usage` read for the query.
-    pub(super) usage: Vec<UsageRow>,
+    /// The responses `usage` read for the query, with the tables its ids index.
+    pub(super) usage: ReportUsage,
     /// The launches `run` kept in pending files (spec §6.1), placed as stored ones, and what
     /// of them could not be read.
     pub(super) pending: PendingEvidence,
@@ -77,19 +80,23 @@ pub(super) fn group(
     let mut evidence = Evidence::load(store, &q.provider, &accounts, reads)?;
     let mut t = Tables {
         slots: Slots::new(&accounts, q.accounts.as_deref()),
-        models: Models::new(q.models.as_deref()),
-        sessions: Sessions::default(),
+        models: Models::new(&usage.models, q.models.as_deref()),
+        sessions: Sessions::new(&usage.sessions, &mut evidence.sightings),
         blocks: Vec::new(),
     };
-    let mut resolved = Vec::with_capacity(usage.len());
-    for (i, row) in usage.iter().enumerate() {
-        let model = t.models.intern(&row.model);
-        let chosen =
-            t.models.allowed[model] && q.session.as_deref().is_none_or(|s| s == row.session_id);
+    // The query's session filter, per session: only a block report's read is unfiltered.
+    let session_chosen: Vec<bool> = usage
+        .sessions
+        .iter()
+        .map(|s| q.session.as_deref().is_none_or(|id| id == s.session_id))
+        .collect();
+    let mut resolved = Vec::with_capacity(usage.rows.len());
+    for (i, row) in usage.rows.iter().enumerate() {
+        let (model, session) = (row.model as usize, row.session as usize);
+        let chosen = t.models.allowed[model] && session_chosen[session];
         if !chosen && !by_block {
             continue;
         }
-        let session = t.sessions.intern(row, &mut evidence.sightings);
         let (account, basis) = evidence.account_of(&t.sessions.list[session].sightings, row.at_ms);
         let slot = t.slots.of(account);
         let wanted = chosen && t.slots.allowed[slot];
@@ -105,7 +112,7 @@ pub(super) fn group(
         }
     }
     let block_of = if by_block {
-        let (blocks, block_of) = series_blocks(p, store, &t.slots, usage, &resolved)?;
+        let (blocks, block_of) = series_blocks(p, store, &t.slots, &usage.rows, &resolved)?;
         t.blocks = blocks;
         block_of
     } else {
@@ -124,7 +131,7 @@ pub(super) fn group(
         if !r.wanted {
             continue;
         }
-        let row = &usage[r.row];
+        let row = &usage.rows[r.row];
         let period = match q.period {
             TokenPeriod::Day | TokenPeriod::Month => calendar.period(row.at_ms),
             TokenPeriod::Session => Period::Session(r.session),
@@ -136,7 +143,11 @@ pub(super) fn group(
                 Period::Block(b)
             }
         };
-        let cost = prices.cost_nanos(&row.model, &row.counts, row.speed.as_deref());
+        let cost = prices.cost_nanos(
+            &t.models.names[r.model],
+            &row.counts,
+            row.speed.map(|s| usage.speeds[s as usize].as_str()),
+        );
         if cost.is_none() {
             t.models.unpriced[r.model] = true;
         }
@@ -204,7 +215,7 @@ fn basis_index(basis: Basis) -> usize {
 
 /// What places a response (spec §7), read once per report.
 struct Evidence {
-    /// By session; each session's are taken out when the report first meets it.
+    /// By session; `Sessions::new` takes out those of each session the report read.
     sightings: HashMap<String, Vec<Sighting>>,
     launches: Launches,
     coverage: Coverage,
@@ -349,7 +360,7 @@ struct Resolved {
 /// What the indices of a report's rows point at.
 struct Tables<'q> {
     slots: Slots<'q>,
-    models: Models<'q>,
+    models: Models,
     sessions: Sessions,
     blocks: Vec<Block>,
 }
@@ -410,47 +421,31 @@ impl<'q> Slots<'q> {
     }
 }
 
-/// The models a report's responses name.
-struct Models<'q> {
+/// The models a report's responses name, by the indices of the read's table.
+struct Models {
     names: Vec<String>,
-    by_name: HashMap<String, usize>,
-    filter: Option<&'q [String]>,
     /// Whether the query's model filter selects it.
     allowed: Vec<bool>,
     /// Whether a response of it that counts has no price (spec §8.3).
     unpriced: Vec<bool>,
 }
 
-impl<'q> Models<'q> {
-    fn new(filter: Option<&'q [String]>) -> Self {
+impl Models {
+    fn new(names: &[String], filter: Option<&[String]>) -> Self {
         Models {
-            names: Vec::new(),
-            by_name: HashMap::new(),
-            filter,
-            allowed: Vec::new(),
-            unpriced: Vec::new(),
+            names: names.to_vec(),
+            allowed: names
+                .iter()
+                .map(|name| filter.is_none_or(|f| f.contains(name)))
+                .collect(),
+            unpriced: vec![false; names.len()],
         }
-    }
-
-    fn intern(&mut self, name: &str) -> usize {
-        if let Some(&model) = self.by_name.get(name) {
-            return model;
-        }
-        let model = self.names.len();
-        self.names.push(name.to_owned());
-        self.by_name.insert(name.to_owned(), model);
-        self.allowed
-            .push(self.filter.is_none_or(|f| f.iter().any(|m| m == name)));
-        self.unpriced.push(false);
-        model
     }
 }
 
-/// The sessions a report's responses belong to.
-#[derive(Default)]
+/// The sessions a report's responses belong to, by the indices of the read's table.
 struct Sessions {
     list: Vec<Session>,
-    by_id: HashMap<String, usize>,
 }
 
 struct Session {
@@ -462,21 +457,19 @@ struct Session {
 }
 
 impl Sessions {
-    fn intern(&mut self, row: &UsageRow, sightings: &mut HashMap<String, Vec<Sighting>>) -> usize {
-        if let Some(&session) = self.by_id.get(row.session_id.as_str()) {
-            return session;
+    /// One per session the read names, each with its sightings taken out of `sightings`.
+    fn new(sessions: &[ReportSession], sightings: &mut HashMap<String, Vec<Sighting>>) -> Self {
+        Sessions {
+            list: sessions
+                .iter()
+                .map(|s| Session {
+                    id: s.session_id.clone(),
+                    project: s.project.clone(),
+                    sightings: sightings.remove(&s.session_id).unwrap_or_default(),
+                    last_ms: i64::MIN,
+                })
+                .collect(),
         }
-        let session = self.list.len();
-        self.list.push(Session {
-            id: row.session_id.clone(),
-            project: row.project.clone(),
-            sightings: sightings
-                .remove(row.session_id.as_str())
-                .unwrap_or_default(),
-            last_ms: i64::MIN,
-        });
-        self.by_id.insert(row.session_id.clone(), session);
-        session
     }
 }
 
@@ -496,7 +489,7 @@ fn series_blocks(
     p: &dyn Provider,
     store: &Store,
     slots: &Slots<'_>,
-    usage: &[UsageRow],
+    usage: &[ReportResponse],
     resolved: &[Resolved],
 ) -> Result<(Vec<Block>, Vec<usize>), StoreError> {
     let mut series: Vec<Vec<usize>> = vec![Vec::new(); slots.accounts.len()];
@@ -635,7 +628,7 @@ impl Acc {
         }
     }
 
-    fn add(&mut self, row: &UsageRow, cost: Option<u64>, slot: usize, model: usize) {
+    fn add(&mut self, row: &ReportResponse, cost: Option<u64>, slot: usize, model: usize) {
         self.counts.add(&row.counts);
         self.responses += 1;
         self.unfinalized += u64::from(!row.finalized);
