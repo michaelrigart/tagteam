@@ -25,6 +25,8 @@ use tagteam_provider::{Clock, Env, EnvError, Keychain, Platform, SystemClock};
 
 use crate::prompt::Prompter;
 
+use super::failure::fail_to;
+
 const NO_COLOR: &str = "NO_COLOR";
 const FORCE_COLOR: &str = "FORCE_COLOR";
 
@@ -151,6 +153,25 @@ pub struct Io<'a> {
     pub out: &'a mut dyn Write,
     pub err: &'a mut dyn Write,
     pub prompter: &'a mut dyn Prompter,
+}
+
+impl Io<'_> {
+    pub(crate) fn warn(&mut self, warning: &str) {
+        let _ = writeln!(self.err, "warning: {warning}");
+    }
+
+    pub(crate) fn note(&mut self, note: &str) {
+        note_to(self.err, note);
+    }
+
+    pub(crate) fn fail(&mut self, json: bool, kind: &str, message: &str) -> i32 {
+        fail_to(self.out, self.err, json, kind, message)
+    }
+}
+
+/// `Io::note` for a site that holds `err` apart from the rest of `Io`.
+pub(crate) fn note_to(err: &mut dyn Write, note: &str) {
+    let _ = writeln!(err, "note: {note}");
 }
 
 /// The providers this build registers (§4.5): the one place that names them. Every registry is
@@ -423,13 +444,14 @@ mod tests {
     use tagteam_cc::CLAUDE_CODE;
     use tagteam_provider::FakeKeychain;
 
+    use crate::prompt::Prompter;
     use crate::statusline;
 
     use super::{
-        Arc, ClaudeCode, ColorMode, Context, Env, OsString, Platform, ProviderId, ProviderRegistry,
-        TEST_API_BASE, TEST_KEYCHAIN_DIR, TEST_PLATFORM, TEST_VAULT_KEYCHAIN, build_registry,
-        color_enabled, command_settings, fallback_provider, home_vars, is_set, scrubbed_vars,
-        session_vars, settings, test_overrides,
+        Arc, ClaudeCode, ColorMode, Context, Env, Io, OsString, Platform, ProviderId,
+        ProviderRegistry, TEST_API_BASE, TEST_KEYCHAIN_DIR, TEST_PLATFORM, TEST_VAULT_KEYCHAIN,
+        build_registry, color_enabled, command_settings, fallback_provider, home_vars, is_set,
+        scrubbed_vars, session_vars, settings, test_overrides,
     };
 
     #[test]
@@ -763,5 +785,37 @@ mod tests {
             ctx.env.vars.is_empty(),
             "only the process boundary records them"
         );
+    }
+
+    /// Answers no prompt: the reporting helpers ask none.
+    struct NoPrompts;
+
+    impl Prompter for NoPrompts {
+        fn interactive(&self) -> bool {
+            false
+        }
+        fn confirm(&mut self, question: &str, _default_yes: bool) -> bool {
+            panic!("unexpected prompt: {question}");
+        }
+        fn choose(&mut self, question: &str, _options: &[String]) -> Option<usize> {
+            panic!("unexpected prompt: {question}");
+        }
+        fn secret(&mut self, question: &str) -> Option<String> {
+            panic!("unexpected prompt: {question}");
+        }
+    }
+
+    #[test]
+    fn io_warn_and_note_write_one_prefixed_line_each() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut io = Io {
+            out: &mut out,
+            err: &mut err,
+            prompter: &mut NoPrompts,
+        };
+        io.warn("x");
+        io.note("y");
+        assert_eq!(err, b"warning: x\nnote: y\n");
+        assert!(out.is_empty());
     }
 }

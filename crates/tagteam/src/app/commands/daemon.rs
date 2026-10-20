@@ -20,7 +20,7 @@ use crate::cli::{AutoStrategyArg, DaemonAction};
 use crate::{daemon_cmd, service_cmd};
 
 use super::accounts::model_list;
-use crate::app::context::Io;
+use crate::app::context::{Io, note_to};
 use crate::app::failure::{
     Failure, KIND_DAEMON, KIND_ENGINE_RUNNING, KIND_INVALID_INPUT, KIND_IO, KIND_NO_CANDIDATES,
     KIND_NO_SERVICE_MANAGER, KIND_SERVICE,
@@ -214,7 +214,7 @@ impl App<'_, '_> {
                 .map_err(install_failure)?;
         if !self.json {
             for w in &report.warnings {
-                let _ = writeln!(self.io.err, "warning: {w}");
+                self.io.warn(w);
             }
         }
         self.print(
@@ -304,7 +304,7 @@ impl App<'_, '_> {
         let names = |p: &ProviderId| display_name(engine, p);
         let Io { out, err, .. } = &mut *self.io;
         let started = Daemon::start(engine, opts, &mut |notice| {
-            let _ = writeln!(err, "note: {notice}");
+            note_to(err, notice);
         })?;
         // D4.1 step 5: the socket, once `daemon.lock` is held and before the scheduler runs.
         let server = daemon_cmd::bind_socket(engine.env(), &started.board());

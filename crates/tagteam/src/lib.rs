@@ -95,12 +95,7 @@ fn refuse_then_init_logging(
     err: &mut impl Write,
 ) -> Option<i32> {
     if let Err(message) = refuse() {
-        if json {
-            let _ = writeln!(out, "{}", app::error_json(app::KIND_ROOT, &message));
-        } else {
-            let _ = writeln!(err, "tagteam: {message}");
-        }
-        return Some(app::EXIT_ERROR);
+        return Some(app::fail_to(out, err, json, app::KIND_ROOT, &message));
     }
     init_logging();
     None
@@ -130,8 +125,13 @@ where
             } else {
                 TEXT_UNDER_JSON.to_owned()
             };
-            let error = app::error_json(app::KIND_USAGE, &message);
-            let _ = writeln!(std::io::stdout(), "{error}");
+            app::fail_to(
+                &mut std::io::stdout(),
+                &mut std::io::sink(),
+                true,
+                app::KIND_USAGE,
+                &message,
+            );
             return app::EXIT_USAGE;
         }
         Err(e) => {
@@ -161,13 +161,13 @@ where
         Ok(ctx) => ctx,
         Err(_) if status_bar_line(&cli) => return 0,
         Err(e) => {
-            if cli.json {
-                let error = app::error_json(e.kind(), &e.to_string());
-                let _ = writeln!(std::io::stdout(), "{error}");
-            } else {
-                let _ = writeln!(std::io::stderr(), "tagteam: {e}");
-            }
-            return app::EXIT_ERROR;
+            return app::fail_to(
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+                cli.json,
+                e.kind(),
+                &e.to_string(),
+            );
         }
     };
     // §14.2, Decision 5: logging is a process concern, set up here once and never by

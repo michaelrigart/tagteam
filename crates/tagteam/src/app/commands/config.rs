@@ -108,7 +108,7 @@ impl App<'_, '_> {
             .iter()
             .filter(|w| !self.settings_warnings.contains(w))
         {
-            let _ = writeln!(self.io.err, "warning: {w}");
+            self.io.warn(w);
         }
     }
 
@@ -143,7 +143,7 @@ impl App<'_, '_> {
         }
         let report = self.engine.purge(&plan)?;
         for w in &report.warnings {
-            let _ = writeln!(self.io.err, "warning: {w}");
+            self.io.warn(w);
         }
         if !self.json {
             for (what, message) in &report.failures {
