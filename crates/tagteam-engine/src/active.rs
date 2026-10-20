@@ -522,6 +522,17 @@ impl Engine {
                 }
             }
         }
+        // H6's landed rule before the table, against the vault's fingerprint: a rescue whose own
+        // generation the vault already holds (an earlier pass's write-ahead that outlived its
+        // vault write, or a reply that kept the refresh token) is deleted, never adopted or
+        // published.
+        let vault_fp = vault.as_deref().and_then(fp);
+        let (landed, rescues): (Vec<RescueEntry>, Vec<RescueEntry>) = rescues
+            .into_iter()
+            .partition(|r| r.landed(p, vault_fp.as_ref()));
+        for r in &landed {
+            self.delete_landed(row, &r.path)?;
+        }
         let is_live = |b: &[u8]| fp(b).as_ref() == Some(&live_fp);
 
         // In step with the vault. A rescue that succeeds this generation is published: the
@@ -539,12 +550,6 @@ impl Engine {
                     retire: vec![r.path.clone()],
                 });
             }
-            // A rescue of exactly this generation has landed everywhere.
-            let landed: Vec<&RescueEntry> =
-                rescues.iter().filter(|r| is_live(&r.credential)).collect();
-            for r in &landed {
-                self.delete_rescue(&r.path)?;
-            }
             return Ok(Reconciled {
                 current: live.to_vec(),
                 publish: false,
@@ -553,20 +558,15 @@ impl Engine {
             });
         }
 
-        // The vault's `.prev`: an earlier pass reached the vault but not the live store.
+        // The vault's `.prev`: an earlier pass reached the vault but not the live store. A
+        // rescue of the vault's generation went with the landed rule above.
         if let (Some(v), Some(pr)) = (&vault, &prev) {
             if is_live(pr) {
-                let vault_fp = fp(v);
-                let retire = rescues
-                    .iter()
-                    .filter(|r| vault_fp.is_some() && fp(&r.credential) == vault_fp)
-                    .map(|r| r.path.clone())
-                    .collect();
                 return Ok(Reconciled {
                     current: v.clone(),
                     publish: true,
                     changed: true,
-                    retire,
+                    retire: vec![],
                 });
             }
         }

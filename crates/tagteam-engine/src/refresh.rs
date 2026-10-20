@@ -2,6 +2,7 @@
 //! adoption and the switch (§6.2, §7.4).
 
 use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use tagteam_core::{AccountId, Fingerprint};
@@ -122,7 +123,10 @@ pub(crate) fn names_another_account(owner: &Identity, row: &AccountRow) -> bool 
 
 /// A successor a refresh has received and not yet persisted: the gate's (§7.3) and the
 /// active-token refresh's (§7.5, Task 16). §7.3's rule is that it is never discarded: dropped
-/// while still armed, by a panic or an early return, it keeps itself (`keep`). It holds a
+/// while still armed, by a panic or an early return, it keeps itself (`keep`). An own
+/// successor is also written to `rescue/` the moment it is built, ahead of any vault write
+/// (H6), so a kill before the vault takes it still leaves it on disk; that envelope is deleted
+/// once the vault write verifies (`landed`), and is the rescue when it does not. It holds a
 /// secret, so it has no `Debug`.
 pub(crate) struct Received<'e> {
     engine: &'e Engine,
@@ -134,13 +138,18 @@ pub(crate) struct Received<'e> {
     /// The owner the response named, when it is another account (§7.4). Such a successor is
     /// kept in `displaced/`, never in this account's vault or in `rescue/`.
     foreign: Option<Identity>,
+    /// The envelope written ahead of the vault write (H6); `None` for a foreign successor, and
+    /// when the write-ahead failed.
+    ahead: Option<PathBuf>,
     armed: bool,
 }
 
 impl<'e> Received<'e> {
-    /// Arms the guard. Build it the moment the response is parsed, before any fallible step.
-    /// `foreign` is the response's owner when `names_another_account` says it is not this
-    /// account; it is fixed here, so no later path can store the successor as this account's.
+    /// Arms the guard and, for an own successor, writes it ahead to `rescue/` (H6), best
+    /// effort: a failure is logged and changes nothing else. Build it the moment the response
+    /// is parsed, before any fallible step. `foreign` is the response's owner when
+    /// `names_another_account` says it is not this account; it is fixed here, so no later path
+    /// can store the successor as this account's, and nothing is written ahead for it.
     pub(crate) fn new(
         engine: &'e Engine,
         p: &'e dyn Provider,
@@ -152,6 +161,31 @@ impl<'e> Received<'e> {
         let fp = p
             .fingerprint(&bytes)
             .unwrap_or_else(|| Fingerprint::of_secret(&bytes));
+        // Write first, then log (§7.3 step 6): nothing between receiving the successor and
+        // having it on disk may block, a log write included.
+        let written = foreign
+            .is_none()
+            .then(|| engine.write_rescue(p, &row.id, row.login_epoch, predecessor_fp, &bytes, &fp));
+        let ahead = match written {
+            None => None,
+            Some(Ok(path)) => {
+                tracing::debug!(
+                    account = %row.id,
+                    fp = %fp.short12(),
+                    "wrote a refreshed token ahead to rescue/ until the vault takes it"
+                );
+                Some(path)
+            }
+            Some(Err(e)) => {
+                tracing::warn!(
+                    position = row.position,
+                    account = %row.id,
+                    kind = e.kind(),
+                    "could not write a refreshed token ahead to rescue/; the vault write goes on without it"
+                );
+                None
+            }
+        };
         Self {
             engine,
             provider: p,
@@ -160,6 +194,7 @@ impl<'e> Received<'e> {
             bytes,
             fp,
             foreign,
+            ahead,
             armed: true,
         }
     }
@@ -170,30 +205,52 @@ impl<'e> Received<'e> {
     }
 
     /// One attempt to keep the successor outside the vault: `rescue/`, or `displaced/` when it
-    /// belongs to another account (§7.3 step 6). It disarms whatever the result, so `Drop`
-    /// never repeats it.
+    /// belongs to another account (§7.3 step 6). The envelope written ahead is the rescue, so
+    /// `rescue/` is written here only when the write-ahead failed (H6). It disarms whatever the
+    /// result, so `Drop` never repeats it.
     pub(crate) fn keep(&mut self) -> Result<(), EngineError> {
         self.armed = false;
         match &self.foreign {
             Some(owner) => self
                 .engine
                 .keep_foreign(&self.row, &self.bytes, Some(&self.fp), owner),
-            None => self
-                .engine
-                .write_rescue(
-                    self.provider,
-                    &self.row.id,
-                    self.row.login_epoch,
-                    &self.predecessor_fp,
-                    &self.bytes,
-                    &self.fp,
-                )
-                .map(drop),
+            None => {
+                if self.ahead.is_none() {
+                    self.engine.write_rescue(
+                        self.provider,
+                        &self.row.id,
+                        self.row.login_epoch,
+                        &self.predecessor_fp,
+                        &self.bytes,
+                        &self.fp,
+                    )?;
+                }
+                tracing::info!(
+                    account = %self.row.id,
+                    fp = %self.fp.short12(),
+                    "kept a refreshed token in rescue/ until the vault takes it"
+                );
+                Ok(())
+            }
         }
     }
 
-    fn disarm(&mut self) {
+    /// The vault took the successor: disarms, and deletes the envelope written ahead, best
+    /// effort. One left behind is harmless: the vault holds its generation, so the landed rule
+    /// deletes it on the account's next settle (H6).
+    fn landed(&mut self) {
         self.armed = false;
+        let Some(path) = self.ahead.take() else {
+            return;
+        };
+        if let Err(e) = self.engine.delete_rescue(&path) {
+            tracing::warn!(
+                position = self.row.position,
+                account = %self.row.id,
+                kind = e.kind(),
+                "a rescue written ahead could not be deleted after the vault took its token"
+            );
+        }
     }
 }
 
@@ -555,13 +612,16 @@ impl Engine {
         })
     }
 
-    /// §7.3 step 6 and §7.5 step 5: the received successor goes to the vault, or to `rescue/`
-    /// when the vault cannot take it. A failed `persist_generation` whose vault write landed is
-    /// no loss: the metadata failure is logged and the result is `Vault`. `received` is
-    /// disarmed whatever the result, so its `Drop` never writes a second copy. `Unpersisted` is
-    /// not yet a loss: the gate records one at once (`lose`); active-token refresh only when the
-    /// live store did not take the successor either (§7.5 step 5). A successor that belongs to
-    /// another account never comes here: its caller keeps it with `Received::keep` (§7.4).
+    /// §7.3 step 6 and §7.5 step 5: the received successor goes to the vault, or stays in
+    /// `rescue/` when the vault cannot take it. Its envelope was written ahead (H6): once the
+    /// vault write verifies it is deleted (`Received::landed`), and when the vault fails it is
+    /// the rescue, so `keep` writes one only if the write-ahead failed. A failed
+    /// `persist_generation` whose vault write landed is no loss: the metadata failure is logged,
+    /// the envelope deleted, and the result is `Vault`. `received` is disarmed whatever the
+    /// result, so its `Drop` never writes a second copy. `Unpersisted` is not yet a loss: the
+    /// gate records one at once (`lose`); active-token refresh only when the live store did
+    /// not take the successor either (§7.5 step 5). A successor that belongs to another account
+    /// never comes here: its caller keeps it with `Received::keep` (§7.4).
     pub(crate) fn persist_received(
         &self,
         p: &dyn Provider,
@@ -574,7 +634,7 @@ impl Engine {
             "a foreign successor is never stored"
         );
         let Err(e) = self.persist_generation(p, row, lock, &received.bytes) else {
-            received.disarm();
+            received.landed();
             return Persisted::Vault;
         };
         // The vault write may have landed before recording it failed; then nothing is lost. The
@@ -589,7 +649,7 @@ impl Engine {
                 kind = e.kind(),
                 "a refreshed token was stored, but recording it failed"
             );
-            received.disarm();
+            received.landed();
             return Persisted::Vault;
         }
         // Keep the successor first, then log (§7.3 step 6): nothing between receiving it and

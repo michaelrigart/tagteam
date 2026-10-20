@@ -190,6 +190,50 @@ fn an_idle_account_s_pending_rescue_is_settled_first() {
 }
 
 #[test]
+fn a_landed_rescue_is_skipped_by_the_live_session_and_idle_export_paths() {
+    let landed = |fx: &Fx, id: &AccountId, email: &str, rt: &str| {
+        let mut same = Fx::credential_json(email, rt);
+        same["claudeAiOauth"]["accessToken"] = json!("at-crash");
+        fx.plant_rescue(id, &fp_of(fx, email, rt), same.to_string().as_bytes());
+    };
+    let at = |r: &ExportResult, position: u32| {
+        envelope(r)
+            .iter()
+            .find(|a| a["position"] == position)
+            .unwrap()["credential"]["claudeAiOauth"]["accessToken"]
+            .clone()
+    };
+    // The live login: `transfer::newest_live` picks the vault and leaves the file (pickers only read).
+    let fx = Fx::new();
+    two_accounts(&fx);
+    let b = fx.engine.resolve("2", None).unwrap().id;
+    landed(&fx, &b, "b@x.co", "rt-b");
+    let r = all(&fx);
+    assert_eq!(
+        (sources(&r)[1], at(&r, 2)),
+        ((2, Source::Vault, true), json!("at-rt-b"))
+    );
+    assert_eq!(rescue_files(&fx), 1);
+    // A session-owned account: `transfer::successor`.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    let _session = running(&fx, &a, "rt-a", "rt-a");
+    landed(&fx, &a, "a@x.co", "rt-a");
+    let r = all(&fx);
+    assert_eq!(
+        (sources(&r)[0], at(&r, 1)),
+        ((1, Source::Vault, true), json!("at-rt-a"))
+    );
+    assert_eq!(rescue_files(&fx), 1);
+    // An idle account: `settle_rescues`, an adopter, deletes it before the vault is exported.
+    let fx = Fx::new();
+    let a = two_accounts(&fx);
+    landed(&fx, &a, "a@x.co", "rt-a");
+    assert_eq!(at(&all(&fx), 1), "at-rt-a");
+    assert_eq!(rescue_files(&fx), 0);
+}
+
+#[test]
 fn a_quiescent_profile_that_rotated_is_captured_first() {
     // Lazy capture (§12.5), as every holder of the account lock does it.
     let fx = Fx::new();
