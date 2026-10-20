@@ -220,15 +220,22 @@ pub(crate) fn resolve_provider(
 /// nothing even if it were built. The run shell is detected over that walled registry (§12.8),
 /// which reads the marker file alone, and the provider is resolved in Decision 13's order by
 /// `resolve_provider`, whose last step is the default `app::command_settings` chooses:
-/// `default_provider` when this build has it, else the registry's first provider. This is not `app::locate`,
-/// which serves the other commands over the full registry; the variables Decision 13's third
-/// step reads were captured into `ctx.env` by `Context::from_process`. The settings are that
-/// provider's, and their warnings are dropped, since a status bar has nowhere to show them.
-/// Returns the engine and the provider.
+/// `default_provider` when this build has it, else the registry's first provider. This is not
+/// `app::locate`, which serves the other commands over the full registry; the variables
+/// Decision 13's third step reads were captured into `ctx.env` by `Context::from_process`. The
+/// settings are that provider's, and their warnings are dropped, since a status bar has nowhere
+/// to show them. Returns the engine and the provider.
 pub(crate) fn engine(ctx: Context, flag: Option<&str>) -> (Engine, ProviderId) {
+    let (engine, provider, _, _) = built(ctx, flag);
+    (engine, provider)
+}
+
+/// `engine`, with the walls it was built over, so a test can prove nothing reached them.
+fn built(ctx: Context, flag: Option<&str>) -> (Engine, ProviderId, Arc<LazyHttp>, Arc<NoKeychain>) {
     let keychain = Arc::new(NoKeychain::default());
     let http = Arc::new(LazyHttp::new(|| Arc::new(NoHttp) as Arc<dyn Http>));
-    assemble(ctx, flag, keychain, http)
+    let (engine, provider) = assemble(ctx, flag, keychain.clone(), http.clone());
+    (engine, provider, http, keychain)
 }
 
 /// The walls `engine` builds over, kept by a test to prove nothing reached them.
@@ -240,16 +247,15 @@ pub(crate) struct Walls {
 
 #[cfg(test)]
 impl Walls {
-    pub(crate) fn untouched(&self) -> bool {
-        !self.http.is_built() && self.keychain.calls() == 0
+    pub(crate) fn assert_untouched(&self) {
+        assert!(!self.http.is_built(), "the HTTP adapter was built");
+        assert_eq!(self.keychain.calls(), 0, "the Keychain was asked");
     }
 }
 
 #[cfg(test)]
 fn walled(ctx: Context, flag: Option<&str>) -> (Engine, ProviderId, Walls) {
-    let keychain = Arc::new(NoKeychain::default());
-    let http = Arc::new(LazyHttp::new(|| Arc::new(NoHttp) as Arc<dyn Http>));
-    let (engine, provider) = assemble(ctx, flag, keychain.clone(), http.clone());
+    let (engine, provider, http, keychain) = built(ctx, flag);
     (engine, provider, Walls { http, keychain })
 }
 
@@ -841,7 +847,7 @@ mod tests {
             "{:?}",
             built.run_shell()
         );
-        assert!(walls.untouched());
+        walls.assert_untouched();
     }
 
     #[test]
@@ -899,10 +905,7 @@ mod tests {
         let (_dir, env) = managed_home();
         let (built, provider, walls) = walled(context(env), None);
         assert_eq!(shown(&built, &provider), "a · 5h 9% · 7d 77%\n");
-        assert!(
-            walls.untouched(),
-            "the HTTP adapter was built or the Keychain was asked"
-        );
+        walls.assert_untouched();
     }
 
     /// A context over `env`, with a Keychain the walled engine never uses. Nothing is captured
@@ -985,10 +988,7 @@ mod tests {
         assert!(matches!(built.run_shell(), RunShell::Inside { .. }));
         assert_eq!(provider.as_str(), CLAUDE_CODE, "the marker's provider");
         assert_eq!(shown(&built, &provider), "a · 5h 9% · 7d 77%\n");
-        assert!(
-            walls.untouched(),
-            "the HTTP adapter was built or the Keychain was asked"
-        );
+        walls.assert_untouched();
     }
 
     #[test]
@@ -998,7 +998,7 @@ mod tests {
         let gone = in_profile(&outside, &AccountId::from_string("0192-removed"));
         let (built, provider, walls) = walled(context(gone), None);
         assert_eq!(shown(&built, &provider), "");
-        assert!(walls.untouched());
+        walls.assert_untouched();
 
         let corrupt = in_profile(&outside, &AccountId::from_string("0192-corrupt"));
         let marker =
@@ -1007,7 +1007,7 @@ mod tests {
         let (built, provider, walls) = walled(context(corrupt.clone()), None);
         assert!(matches!(built.run_shell(), RunShell::Unreadable { .. }));
         assert_eq!(shown(&built, &provider), "");
-        assert!(walls.untouched());
+        walls.assert_untouched();
 
         // Through the command itself: exit 0, and nothing on either stream.
         let (mut out, mut err) = (Vec::new(), Vec::new());

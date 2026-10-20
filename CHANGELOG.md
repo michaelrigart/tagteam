@@ -44,9 +44,9 @@ with the one before, so any release may contain breaking changes. Each section s
   when a new one cannot be read.
 - `tagteam tui`'s Accounts screen no longer binds `g` and `G`, and `q` closes an open overlay
   before it quits.
-- `tagteam config`'s description of `default_provider`, and its warning for an invalid value, no
-  longer give `claude-code` as an example: they read "must be a provider id of lowercase
-  letters, digits and dashes".
+- `tagteam config set default_provider` refusing an invalid id, and the warning for an invalid
+  `default_provider` in config.toml, no longer give `claude-code` as an example: they read "must
+  be a provider id of lowercase letters, digits and dashes".
 - `tagteam --help` and each command's help describe what works for every provider without
   naming Claude Code. The help for the statusline and the shell wrapper, which only Claude
   Code has, still names it.

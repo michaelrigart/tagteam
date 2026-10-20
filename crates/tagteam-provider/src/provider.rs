@@ -225,8 +225,9 @@ pub struct Capabilities {
 /// The process variables a provider reads, which the binary captures into `Env` at its boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderVars {
-    /// The variables the provider locates its homes and Keychain items with; their effective
-    /// values live in `Env.homes`.
+    /// The variables whose effective value, restored across a run shell, locates the provider's
+    /// homes and Keychain items; those values live in `Env.homes`. A provider lists only such
+    /// variables here, and may list none (a provider that locates its home through `vars`).
     pub homes: &'static [&'static str],
     /// Variables the binary captures into `Env.vars` at start-up.
     pub captured: &'static [&'static str],

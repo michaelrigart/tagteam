@@ -30,7 +30,8 @@ pub struct Cli {
     /// Disable colour
     #[arg(long = "no-color", global = true)]
     pub no_color: bool,
-    /// The agent CLI to act on (default: the default_provider setting, else this build's first provider)
+    /// The agent CLI to act on (default: the default_provider setting, else this build's first
+    /// provider)
     #[arg(
         short = 'p',
         long,
@@ -496,10 +497,10 @@ pub enum ScreenArg {
 impl Command {
     /// Whether the command reads or writes a Keychain item on macOS, and so runs the lock check
     /// first (Appendix A.3). `list` and `status` are not among them although they collect usage
-    /// and may read Keychain items: by a plan ruling they degrade to `keychain_unavailable`
-    /// rows rather than run the lock check, so a script gets rows, not a `keychain-locked`
-    /// failure. `history` and `statusline` read only the store and `~/.claude.json`, `tokens`
-    /// only the store and Claude Code's transcripts, and the rest need no Keychain item. A
+    /// and may read Keychain items: they degrade to `keychain_unavailable` rows rather than run
+    /// the lock check, so a script gets rows, not a `keychain-locked` failure. `history` and
+    /// `statusline` read only the store and `~/.claude.json`, `tokens` only the store and Claude
+    /// Code's transcripts, and the rest need no Keychain item. A
     /// recovery under their mutation lock only reads the Keychain, tri-state, and
     /// leaves what it cannot decide to the next command that checks.
     /// `auto` checks before its first tick, a dry run too (§11.1): every tick reads its

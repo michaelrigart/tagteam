@@ -506,7 +506,7 @@ fn wait_every(
         if let Watched::Failed(why) = &watched {
             tracing::warn!(
                 reason = %why,
-                "the exit watch failed, so signals are no longer forwarded to claude"
+                "the exit watch failed, so signals are no longer forwarded to the session"
             );
             return (child.wait(), last);
         }
