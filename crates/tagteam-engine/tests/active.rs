@@ -203,6 +203,63 @@ fn row_a_cc_rotation_after_a_published_rescue_is_adopted_and_retires_the_rescue(
 }
 
 #[test]
+fn a_same_generation_rescue_of_the_live_login_is_deleted_and_never_published() {
+    let fx = Fx::new();
+    let a = fx.add("a@x.co", "rt-a");
+    let vault = fx.vault_bytes(&a).unwrap();
+    let mut same = Fx::credential_json("a@x.co", "rt-a");
+    same["claudeAiOauth"]["accessToken"] = json!("at-crash");
+    fx.plant_rescue(&a, &fp(&fx, &vault), &bytes(&same));
+    let out = active(&fx, ActiveTrigger::Expired).unwrap();
+    assert_eq!(out, ActiveOutcome::NotNeeded { reconciled: true });
+    assert_eq!(rescue_files(&fx), 0);
+    assert_eq!(
+        fx.live_credential().unwrap()["claudeAiOauth"]["accessToken"],
+        "at-rt-a",
+        "never published"
+    );
+    assert_eq!(fx.vault_bytes(&a).unwrap(), vault, "never adopted");
+    assert_eq!(token_requests(&fx), 0);
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_active_refresh_interrupted_after_its_write_ahead_leaves_a_rescue_the_next_pass_deletes() {
+    let fx = Fx::new();
+    fx.add("a@x.co", "rt-a");
+    let rejected = fx
+        .cc
+        .access_fingerprint(&cred("a@x.co", "rt-a"))
+        .unwrap()
+        .as_str()
+        .to_owned();
+    fx.script_refresh(None); // same generation, `at-same`
+    fx.engine.fail_at(Some("active-after-response"));
+    assert!(
+        active(
+            &fx,
+            ActiveTrigger::Rejected {
+                access_fp: rejected
+            }
+        )
+        .is_err()
+    );
+    fx.engine.fail_at(None);
+    assert_eq!(
+        rescue_files(&fx),
+        1,
+        "the write-ahead; `keep` wrote no second copy"
+    );
+    let out = active(&fx, ActiveTrigger::Expired).unwrap();
+    assert_eq!(out, ActiveOutcome::NotNeeded { reconciled: true });
+    assert_eq!(rescue_files(&fx), 0);
+    assert_eq!(
+        fx.live_credential().unwrap()["claudeAiOauth"]["accessToken"],
+        "at-rt-a"
+    );
+}
+
+#[test]
 fn row_a_cc_rotation_is_adopted_then_refreshed_when_expired() {
     let fx = Fx::new();
     let a = fx.add("a@x.co", "rt-a");

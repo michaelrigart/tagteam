@@ -6,6 +6,7 @@
 mod common;
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::Path;
 use std::process::{Child, Stdio};
 use std::thread;
@@ -15,7 +16,7 @@ use common::{cmd, expire_vault, live_email, std_cmd, two_accounts};
 use serde_json::{Value, json};
 use tagteam_engine::vault::SERVICE;
 use tagteam_provider::mock_server::{MockReply, MockServer};
-use tagteam_provider::{FileKeychain, Keychain};
+use tagteam_provider::{Env, FileKeychain, Keychain};
 
 const API_BASE: &str = "TAGTEAM_TEST_API_BASE";
 const TOKEN: &str = "/v1/oauth/token";
@@ -153,6 +154,46 @@ fn a_switch_that_finds_the_target_refreshing_waits_and_activates_its_successor()
         reasons,
         BTreeSet::from(["already-active".to_owned(), "switched".to_owned()])
     );
+}
+
+#[test]
+fn a_kill_after_the_write_ahead_leaves_the_successor_in_rescue_and_the_next_switch_adopts_it() {
+    // H1.1 criterion 3 with a real kill: `TAGTEAM_TEST_CRASH_AT` exits there with 137, so no
+    // destructor, `Received::drop` included, runs. Only the write-ahead can have kept the token.
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    let a = expiring_target(root);
+    let server = MockServer::start();
+    server.on("POST", TOKEN, token_reply("rt-a2"));
+    cmd(root)
+        .env(API_BASE, server.base_url())
+        .env("TAGTEAM_TEST_CRASH_AT", "gate-before-vault-write")
+        .args(["switch", "1", "--json"])
+        .assert()
+        .code(137);
+    assert_eq!(vault_refresh_token(root, &a), "rt-a");
+    let dir = Env::for_test(root).data_dir().join("rescue");
+    let files: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1);
+    let envelope: Value = serde_json::from_slice(&fs::read(&files[0]).unwrap()).unwrap();
+    let kept: Value = serde_json::from_str(envelope["credential"].as_str().unwrap()).unwrap();
+    assert_eq!(kept["claudeAiOauth"]["refreshToken"], "rt-a2");
+    cmd(root)
+        .env(API_BASE, server.base_url())
+        .args(["switch", "1", "--json"])
+        .assert()
+        .success();
+    assert_eq!(
+        server.hits("POST", TOKEN),
+        1,
+        "adopted, never requested again"
+    );
+    assert_eq!(vault_refresh_token(root, &a), "rt-a2");
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    assert_eq!(live_email(root), "a@x.co");
 }
 
 #[test]

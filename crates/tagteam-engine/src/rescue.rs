@@ -1,6 +1,6 @@
-//! §6.3 `rescue/`: a received successor whose vault write failed, in a 0600 envelope that
-//! records which generation it succeeds; and §6.2's rule that pending rescues settle before any
-//! activation.
+//! §6.3 `rescue/`: a received successor, written ahead of its vault write and kept when that
+//! write fails (H6), in a 0600 envelope that records which generation it succeeds; and §6.2's
+//! rule that pending rescues settle before any activation.
 
 use std::fs;
 use std::io;
@@ -25,6 +25,16 @@ pub(crate) struct RescueEntry {
     /// The generation that was sent: this rescue succeeds it.
     pub predecessor_fp: String,
     pub credential: Vec<u8>,
+}
+
+impl RescueEntry {
+    /// H6's landed rule: the vault, whose current fingerprint is `vault`, already holds this
+    /// rescue's own generation. Claude Code's fingerprint hashes the refresh token, so the
+    /// vault then holds a valid generation with the same refresh token, and the rescue can hold
+    /// at most an access token that refresh token re-obtains.
+    pub(crate) fn landed(&self, p: &dyn Provider, vault: Option<&Fingerprint>) -> bool {
+        vault.is_some_and(|v| p.fingerprint(&self.credential).as_ref() == Some(v))
+    }
 }
 
 pub(crate) enum RescueFile {
@@ -82,7 +92,9 @@ impl Engine {
     /// never a Keychain item, created beside its final name and renamed into place (§6.3). The
     /// directory is created 0700 on first use. The credential is stored in `p`'s vault form
     /// (H5.3), what the vault would keep, as a UTF-8 string, which every provider's credential
-    /// is. `displaced/` is never written here: it keeps what it saves verbatim.
+    /// is. `displaced/` is never written here: it keeps what it saves verbatim. It logs
+    /// nothing: its callers say why it was written, ahead of the vault (`Received::new`, H6) or
+    /// kept because the vault failed (`Received::keep`).
     pub(crate) fn write_rescue(
         &self,
         p: &dyn Provider,
@@ -115,11 +127,6 @@ impl Engine {
             &serde_json::to_vec(&envelope).expect("a Value always serializes"),
             0o600,
         )?;
-        tracing::info!(
-            account = %id,
-            fp = %successor_fp.short12(),
-            "kept a refreshed token in rescue/ until the vault takes it"
-        );
         Ok(path)
     }
 
@@ -196,12 +203,27 @@ impl Engine {
         }
     }
 
-    /// §6.2 "Pending rescues before activation", and §7.3 step 3's adoption. A rescue whose
+    /// Deletes a rescue the vault already holds (H6's landed rule), and says so at DEBUG.
+    pub(crate) fn delete_landed(&self, row: &AccountRow, path: &Path) -> Result<(), EngineError> {
+        self.delete_rescue(path)?;
+        tracing::debug!(
+            position = row.position,
+            account = %row.id,
+            "deleted a rescue the vault already holds"
+        );
+        Ok(())
+    }
+
+    /// §6.2 "Pending rescues before activation", and §7.3 step 3's adoption. A rescue that
+    /// cannot be read might hold the only live successor, so it refuses. Then H6's landed rule:
+    /// a rescue whose own generation the vault already holds (its fingerprint is the vault's:
+    /// a crash after the vault write, or a reply that kept the refresh token) is deleted and
+    /// never adopted, since adopting it could only put an older access token over the vault's;
+    /// a failed delete is logged and the rescue is still skipped. Of the rest, a rescue whose
     /// predecessor is the vault's current generation holds the only live successor: it is
-    /// written to the vault (verified), and then its file is deleted. A rescue that cannot be
-    /// read might be that one, so it refuses, as does a failed adoption. A rescue whose
-    /// predecessor is any other generation is superseded and left alone. The caller holds
-    /// `lock`.
+    /// written to the vault (verified), and then its file is deleted; a failed adoption
+    /// refuses. A rescue whose predecessor is any other generation is superseded and left
+    /// alone. The caller holds `lock`.
     pub(crate) fn settle_rescues(
         &self,
         p: &dyn Provider,
@@ -226,21 +248,37 @@ impl Engine {
             return Err(pending(e));
         }
         let current = match self.vault.read(&row.id) {
-            Read::Present(b) => p.fingerprint(&b).map(|f| f.as_str().to_owned()),
+            Read::Present(b) => p.fingerprint(&b),
             Read::Absent => None,
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         };
+        let mut unlanded = Vec::new();
         for r in rescues {
             let RescueFile::Entry(e) = r else { continue };
-            if current.as_deref() != Some(e.predecessor_fp.as_str()) {
+            if !e.landed(p, current.as_ref()) {
+                unlanded.push(e);
+                continue;
+            }
+            if let Err(err) = self.delete_landed(row, &e.path) {
+                tracing::warn!(
+                    position = row.position,
+                    account = %row.id,
+                    kind = err.kind(),
+                    "a rescue the vault already holds could not be deleted"
+                );
+            }
+        }
+        for e in unlanded {
+            if current.as_ref().map(Fingerprint::as_str) != Some(e.predecessor_fp.as_str()) {
                 continue;
             }
             self.persist_generation(p, row, lock, &e.credential)
                 .map_err(|err| {
                     pending(format!("{} could not be adopted: {err}", e.path.display()))
                 })?;
-            // Once adopted it is superseded, so a failed delete is harmless: the next pass
-            // sees its predecessor is no longer current and leaves it alone.
+            // Once adopted the vault holds its generation, so a failed delete is harmless: the
+            // next pass deletes it by the landed rule, or, once the vault has moved on, finds
+            // its predecessor is no longer current and leaves it alone.
             if let Err(err) = self.delete_rescue(&e.path) {
                 tracing::warn!(
                     position = row.position,
@@ -472,6 +510,59 @@ mod tests {
         }
         assert_eq!(err.kind(), "rescue-pending");
         assert_eq!(t.vault_rt(&row.id, false).as_deref(), Some("rt-1"));
+    }
+
+    fn same_generation(rt: &str) -> Vec<u8> {
+        json!({"claudeAiOauth": {"accessToken": "at-other", "refreshToken": rt, "expiresAt": 1,
+            "refreshTokenExpiresAt": 5}})
+        .to_string()
+        .into_bytes()
+    }
+
+    /// A rescue of the vault's own generation (H6's landed rule), written as a gate whose
+    /// write-ahead outlived its vault write would leave it.
+    fn landed_rescue(t: &T, row: &AccountRow, vault: &[u8]) -> PathBuf {
+        let same = same_generation("rt-1");
+        t.engine
+            .write_rescue(
+                t.cc.as_ref(),
+                &row.id,
+                0,
+                &t.fp(vault),
+                &same,
+                &t.cc.fingerprint(&same).unwrap(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_rescue_the_vault_already_holds_is_deleted_never_adopted() {
+        let t = T::new();
+        let row = t.account("a@x.co", &cred("rt-1", 5));
+        let vault = t.kc.get(SERVICE, row.id.as_str()).unwrap();
+        let path = landed_rescue(&t, &row, &vault);
+        let lock = t.lock(&row.id);
+        t.engine.settle_rescues(t.cc.as_ref(), &row, &lock).unwrap();
+        assert!(!path.exists());
+        assert_eq!(t.kc.get(SERVICE, row.id.as_str()).unwrap(), vault);
+        assert_eq!(t.vault_rt(&row.id, true), None, "no .prev");
+    }
+
+    #[test]
+    fn a_landed_rescue_that_cannot_be_deleted_is_still_never_adopted() {
+        let t = T::new();
+        let row = t.account("a@x.co", &cred("rt-1", 5));
+        let vault = t.kc.get(SERVICE, row.id.as_str()).unwrap();
+        let path = landed_rescue(&t, &row, &vault);
+        let dir = path.parent().unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let lock = t.lock(&row.id);
+        let settled = t.engine.settle_rescues(t.cc.as_ref(), &row, &lock);
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        settled.unwrap();
+        assert!(path.exists(), "the delete failed");
+        assert_eq!(t.kc.get(SERVICE, row.id.as_str()).unwrap(), vault);
+        assert_eq!(t.vault_rt(&row.id, true), None, "no .prev");
     }
 
     #[test]

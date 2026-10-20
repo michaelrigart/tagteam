@@ -779,18 +779,28 @@ pub enum Pick {
 pub const LIVE_LACKS_REFRESH: &str =
     "its live credential has no refresh token, so the newest generation cannot be told";
 
+/// H6's landed rule: the vault, at generation `vault`, already holds the rescue's own
+/// generation, so the rescue holds nothing newer (at most an access token the vault's refresh
+/// token re-obtains). A picker skips it; an adopter deletes it.
+fn landed(rescue: &PendingRescue, vault: &Fingerprint) -> bool {
+    rescue.fp.as_ref() == Some(vault)
+}
+
 /// The pending rescue that succeeds the vault's generation `vault`, if any: it consumed that
-/// generation (§6.2), so it is the newer one.
+/// generation (§6.2), so it is the newer one. One the vault already holds is skipped (H6).
 pub fn successor(vault: &Fingerprint, rescues: &[PendingRescue]) -> Option<usize> {
-    rescues.iter().position(|r| r.predecessor == vault.as_str())
+    rescues
+        .iter()
+        .position(|r| r.predecessor == vault.as_str() && !landed(r, vault))
 }
 
 /// §13.3's choice for the live login: the generation §7.5 step 3 would settle on among the
 /// live credential, the vault, its `.prev` and the pending rescues, decided without writing
 /// anything. The live credential at the vault's generation or its `.prev` is the vault's, or
 /// the rescue that succeeds it; at a rescue's generation, that rescue's; any other full token
-/// pair is Claude Code's rotation, the newest. Expiry never decides (B.48). `active.rs`'s own
-/// reconciliation writes as it decides, so it cannot serve here.
+/// pair is Claude Code's rotation, the newest. Expiry never decides (B.48). A rescue the vault
+/// already holds is never picked (H6's landed rule), as §7.5 step 3 deletes it before its
+/// table. `active.rs`'s own reconciliation writes as it decides, so it cannot serve here.
 pub fn newest_live(
     live: &Generation,
     vault: &Fingerprint,
@@ -800,7 +810,10 @@ pub fn newest_live(
     if &live.fp == vault || prev == Some(&live.fp) {
         return successor(vault, rescues).map_or(Pick::Vault, Pick::Rescue);
     }
-    if let Some(i) = rescues.iter().position(|r| r.fp.as_ref() == Some(&live.fp)) {
+    if let Some(i) = rescues
+        .iter()
+        .position(|r| !landed(r, vault) && r.fp.as_ref() == Some(&live.fp))
+    {
         return Pick::Rescue(i);
     }
     if live.full {
@@ -919,6 +932,21 @@ mod tests {
         ];
         for (live, prev, rescues, want) in rows {
             assert_eq!(newest_live(&live, &v, prev, rescues), want, "{live:?}");
+        }
+    }
+
+    #[test]
+    fn a_rescue_the_vault_already_holds_is_never_picked() {
+        let v = fp("v");
+        let landed = rescue("v", "v"); // its own generation is the vault's
+        assert_eq!(successor(&v, std::slice::from_ref(&landed)), None);
+        assert_eq!(successor(&v, &[landed.clone(), rescue("r", "v")]), Some(1));
+        for live in [generation("v", true), generation("prev", true)] {
+            assert_eq!(
+                newest_live(&live, &v, Some(&fp("prev")), std::slice::from_ref(&landed)),
+                Pick::Vault,
+                "{live:?}"
+            );
         }
     }
 }
