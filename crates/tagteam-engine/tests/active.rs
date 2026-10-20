@@ -392,6 +392,67 @@ fn when_both_writes_fail_but_the_live_store_takes_it_nothing_is_lost() {
     assert_eq!(token_requests(&fx), 1);
 }
 
+#[cfg(feature = "test-hooks")]
+#[test]
+fn the_argv_warn_is_held_across_the_live_write_only_when_neither_store_took_the_successor() {
+    // §7.3 step 6, §7.5 step 5: when the vault and rescue/ both fail, the live write is the
+    // successor's last durable copy, so the Keychain writer's argv-fallback WARN waits until it
+    // settles. When the vault took it, the live write runs after the successor is durable and
+    // the WARN is logged at once. The FakeKeychain never reaches the real argv fallback, so a
+    // hook at `active-before-publish` makes one over-long upsert through a real `SecurityCli`
+    // on this thread, just before the live write; a marker inside the live write
+    // (`active-before-config-lock`) shows on which side of it the WARN fell.
+    for (neither_store, expect) in [
+        (true, ActiveOutcome::PublishedOnly),
+        (false, ActiveOutcome::Refreshed),
+    ] {
+        let fx = Fx::new();
+        fx.add("a@x.co", "rt-a");
+        expire_live(&fx);
+        fx.script_refresh(Some("rt-a2"));
+        if neither_store {
+            fx.kc.set_fail_write(SERVICE, true);
+            block_rescue(&fx);
+        }
+        let cli = common::argv_cli();
+        fx.engine.on_point(
+            "active-before-publish",
+            Box::new(move || common::argv_upsert(&cli, "acct")),
+        );
+        fx.engine.also_on_point(
+            "active-before-config-lock",
+            Box::new(|| tracing::info!("marker: the live write starts")),
+        );
+
+        let (out, logs) = capture_logs(|| active(&fx, ActiveTrigger::Expired).unwrap());
+        fx.kc.set_fail_write(SERVICE, false);
+        unblock_rescue(&fx);
+
+        assert_eq!(out, expect, "{neither_store}: {logs:#?}");
+        let at = |text: &str| -> Vec<usize> {
+            logs.iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains(text))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let (marker, warn) = (
+            at("marker: the live write starts"),
+            at("a Keychain value is too long for security -i"),
+        );
+        assert_eq!(
+            (marker.len(), warn.len()),
+            (1, 1),
+            "{neither_store}: {logs:#?}"
+        );
+        assert_eq!(
+            warn[0] > marker[0],
+            neither_store,
+            "{neither_store}: {logs:#?}"
+        );
+    }
+}
+
 /// A 200 token reply whose owner is another account (§7.4).
 fn reply_for_someone_else(fx: &Fx) {
     fx.http.push_json(
