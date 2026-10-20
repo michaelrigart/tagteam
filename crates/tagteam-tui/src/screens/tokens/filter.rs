@@ -13,8 +13,8 @@ use tagteam_engine::tokens::{
 
 use super::table::account_name;
 use super::{TokensState, load};
-use crate::actions::{CHOICE_ROWS, Overlay, boxed};
 use crate::msg::Cmd;
+use crate::overlay::{CHOICE_ROWS, Overlay, boxed};
 use crate::source::SourceError;
 use crate::state::State;
 use crate::view::{scrolled_windows, wrap_rows};
