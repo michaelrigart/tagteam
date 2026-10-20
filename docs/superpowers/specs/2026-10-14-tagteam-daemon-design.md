@@ -268,8 +268,12 @@ the missing program (D10).
 SIGINT, SIGTERM and SIGHUP record their number in the cancel token (§14.1), as for every
 command. The scheduler stops at its next cancellation point, after any critical span in flight
 has finished. A tick in progress therefore ends as an interrupted `auto` tick does (§11.4).
-The accept and connection threads poll with 1 s timeouts and stop too. Every subscriber gets a
-`stopping` event with reason `signal`. As that event is sent, the daemon removes its socket,
+The accept and connection threads block on their descriptors and on wake pipes that the stop
+writes, and stop too. After a signal, the accept thread ends at its next wake: a connection, or
+the socket's close at `stopping`. (This supersedes daemon-b plan Decision 2's 100 ms read
+timeout; a connection's 30 s pre-subscribe idle timeout and 2 s write timeout stay.) Every
+subscriber gets a `stopping` event with reason `signal`. As that event is sent, the daemon
+removes its socket,
 while it still holds `daemon.lock` and only if the file is still the socket this daemon bound;
 open connections write `stopping`, then close. Then the daemon drops its engine locks
 (emptying their records), and releases `daemon.lock`, emptying its record first. It exits 0,
@@ -429,6 +433,8 @@ the relevant window with the highest `pct`; its key names the dedup marker, and 
   as coming from Script Editor, which needs notification permission once (D15).
 - **Linux:** `notify-send --app-name=tagteam -- <title> <body>`, when `notify-send` is on `PATH`.
   Without it there is no backend.
+- **The notifier thread** blocks until a notice arrives or its stop message does; it never
+  wakes to check a flag. Dropping the `Notifier` sends the stop message.
 - **Each delivery** runs on the notifier thread through the engine's `ProcessSpawner` port,
   with a 5 s timeout, in its own process group (§14.1). Its stdin, stdout and stderr are
   closed.

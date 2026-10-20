@@ -579,3 +579,28 @@ Made in small hunks in the same branch, as D16 did.
   token that the next refresh supersedes). Decision 4 accepted it.
 - **Merge order:** this branch merges first; `review-refactor` rebases onto it. The two
   out-of-ownership touches (H1.2) are listed in the MR.
+
+## Errata
+
+Found while planning and building; each is listed in the MR.
+
+- **H1.2:** the branch touches `switch.rs` a third time: one line at the direct branch of
+  step 2 (`switch.rs:2043`) compares the live entry and the target's vault bytes both in
+  vault form, or `switch --force` onto the live account would displace its own entry (H5.3).
+- **H5.1:** the hex line is never shorter than the text line, so `-X` is used only for bytes
+  that cannot be text; past the limit, argv carries the encoding the line would have used.
+- **H6:** `export.rs:494-550` is the session-owned export path; an idle account's export goes
+  through `settle_rescues`. All three paths apply the landed rule.
+- **H6:** the WARN for a failed write-ahead is logged only after the vault write settles,
+  never while the successor exists only in memory (§7.3 step 6); and `reconcile_active`
+  deletes landed rescues best effort, so a rescue it cannot delete never stops the live
+  repair.
+- **H8:** the wake pipes add up to 36 descriptors, not 32: two shared pipes beside the 16
+  connections' own.
+- **H10.1:** compact rows alone missed the 1 s budget; the range read also names its index
+  (`INDEXED BY token_usage_by_at`), pinned by an EXPLAIN test. Measured on a 12-month report
+  of about 1.52M responses: 1.41 s median and 451 MiB peak before; 0.75 s and 194 MiB after
+  (release build, Apple silicon, loaded machine); the 30-day case stayed within its 200 ms
+  budget.
+- **H11.4:** `render.rs:456-458` (the run shell's unmanaged session login) is sanitized
+  beside `render.rs:431`.

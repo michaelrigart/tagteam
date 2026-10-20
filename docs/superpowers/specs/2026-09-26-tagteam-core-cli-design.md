@@ -573,9 +573,12 @@ only.
 | macOS | Keychain generic password, service `tagteam`, account `<id>` | account `<id>.prev` |
 | Linux | `vault/<id>.json` (0600, directory 0700) | `vault/<id>.prev.json` |
 
-- **Contents.** The bytes are stored raw, in whatever form the provider defines. For CC that is
-  the credential JSON, or an `sk-ant-api…` string for API-key accounts. The vault is
-  provider-agnostic: it never parses what it stores.
+- **Contents.** The bytes are stored in the provider's vault form, which the provider produces
+  and the vault never parses. For CC that is the credential JSON without the five
+  machine-shared keys (Appendix A.4), every other key kept in its order, or an `sk-ant-api…`
+  string for API-key accounts. A credential that is not a JSON object is stored unchanged. A
+  vault item written before this rule keeps its bytes until its next store; nothing migrates
+  it.
 - **Account locks.** Every write or delete of an account's vault entries holds that account's
   lock: `flock(LOCK_EX)` on `locks/<id>.lock`, fd `O_CLOEXEC`, released by the kernel when the
   holder exits. Each writer compares and replaces inside one hold, so no writer can overwrite a
@@ -602,8 +605,9 @@ only.
   generation, whether a switch in either branch or a profile bootstrap, first settles that
   account's `rescue/` entries under its account lock. A rescue has consumed the vault's
   generation, so activating the vault alone would hand CC a used refresh token.
-  - A rescue whose `predecessorFp` is the vault's current fingerprint is adopted, as §7.3 step 3
-    adopts it, and the adopted generation is the one activated.
+  - A rescue whose own fingerprint is the vault's current fingerprint is deleted first (the
+    landed rule, §6.3). A rescue whose `predecessorFp` is the vault's current fingerprint is
+    adopted, as §7.3 step 3 adopts it, and the adopted generation is the one activated.
   - If a rescue file for the account (named by its filename, §5) cannot be read or parsed, or
     its adoption fails, the activation is refused.
 - **Deletes are strict.** Both generations are deleted on both backends. Errors propagate, and
@@ -617,12 +621,23 @@ only.
 These are always plain files with mode 0600, never Keychain items. Their writes must not share
 the Keychain's failure modes.
 
-- **`rescue/`** holds a refreshed successor whose vault write failed. The next pass of the
-  refresh gate for that account adopts it automatically (§7.3), and the file is deleted only
-  after a verified vault write.
+- **`rescue/`** holds a refreshed successor. It is written ahead of the vault write (§7.3 step
+  6, §7.5 step 5) and deleted after a verified vault write, so a file that outlives its refresh
+  is a vault write that failed or a process that was killed. The next pass of the refresh gate
+  for that account adopts it automatically (§7.3), and the file is deleted only after a
+  verified vault write. A successor that belongs to another account is never written ahead; it
+  goes to `displaced/` only.
+  - **Landed rule.** Before it adopts anything, every code path that settles an account's
+    rescues (the gate's pass, activation's settling in §6.2, and §7.5 step 3) deletes a rescue
+    whose own (successor) fingerprint equals the vault's current fingerprint. CC's fingerprint
+    hashes the refresh token, so the vault then already holds a valid generation with that
+    refresh token, and deleting the rescue loses at most an access token that refresh token
+    re-obtains. This covers a crash after the vault write landed and before the delete, and a
+    same-generation successor (a reply without a new refresh token keeps the fingerprint). A
+    reader that only picks a rescue (export, §13.3) skips such a rescue.
   - Each file is a JSON envelope: `{"format": "tagteam-rescue", "version": 1, "accountId",
     "loginEpoch", "predecessorFp", "credential"}`. `credential` holds the credential bytes
-    verbatim, as a UTF-8 string. `predecessorFp` is the fingerprint of the generation that was
+    in vault form (§6.2), as a UTF-8 string. `predecessorFp` is the fingerprint of the generation that was
     sent, which is how the gate tells that a rescue succeeds the vault's current generation.
     The filename's `<fp12>` is the successor's fingerprint.
   - A rescue file that cannot be read or parsed makes the gate return `Transient` with kind
@@ -817,24 +832,32 @@ This procedure is the only place a stored refresh token is ever sent to the toke
      removed).
    - If a `rescue/` entry for this account holds a successor of the current fingerprint (its
      `predecessorFp`, §6.3), adopt it: write it to the vault, verify, delete the rescue file,
-     and use it.
+     and use it. A rescue whose own fingerprint is the vault's current one has landed and is
+     deleted instead (§6.3).
    - If the account's profile is quiescent, apply its provenance (§12.5). If the profile
      rotated since its seed, adopt its generation into the vault first. If provenance reports a
      conflict, return `Conflict` without making a request.
 4. **Check whether someone already refreshed.** If the vault's access token differs from the
    caller's snapshot and is not expired, return it without making a request.
 5. **POST** to the token endpoint (Appendix A.5), with a 10 s timeout.
-6. **Persist, compare-and-swap style.** Re-read the vault. With every writer under the account
-   lock this comparison cannot fail; it stays as a defence.
+6. **Write ahead, then persist, compare-and-swap style.** In this order:
+   1. As soon as a received successor is known to belong to this account, before anything else
+      in this step, write its rescue envelope (§6.3, vault form) with the fsynced 0600 writer.
+      This is best effort: a failure is logged and the step goes on.
+   2. Re-read the vault and compare. With every writer under the account lock this comparison
+      cannot fail; it stays as a defence.
+   3. Persist to the vault and verify the write.
+   4. Only then delete the envelope.
    - If the response names another account (§7.4 `identity_conflict`), the successor is not
      this account's. It is displaced (reason `identity-conflict`), never written to the vault
      or to `rescue/`. The account is quarantined, bound to the fingerprint that was sent.
-   - If the fingerprint moved since step 3, write the new successor to `rescue/`, log at ERROR,
-     and return the vault's newer credential.
+   - If the fingerprint moved since step 3, keep the written-ahead envelope as the rescue, log
+     at ERROR, and return the vault's newer credential.
    - Otherwise write the vault (the old generation becomes `.prev`) and update
      `login_expires_at`.
-   - If the vault write fails, write to `rescue/` and return `Transient { credential, rescued:
-     true }`. **The caller must not activate a credential in this state.**
+   - If the vault write fails, the written-ahead envelope is the rescue (no second copy is
+     written; if the write-ahead itself failed, write it now) and return `Transient {
+     credential, rescued: true }`. **The caller must not activate a credential in this state.**
    - If the rescue write (or the displacement) also fails, return `Unpersisted`, log at ERROR,
      and print a stderr notice naming the account position. The vault's generation has been
      consumed, so the account is also quarantined (`successor_lost`), bound to the fingerprint
@@ -909,9 +932,12 @@ locally (a sibling machine revoked it). The procedure:
    so the live store is where the lineage advances. Access-token expiry says nothing about
    which generation is newest, and is never used to decide it.
 
+   The landed rule (§6.3) comes first: a rescue whose own fingerprint equals the vault's
+   current fingerprint is deleted before any row below applies, so the rows see no such rescue.
+
    | Live credential | Meaning | Action |
    |---|---|---|
-   | The vault's generation | In step, unless a rescue is pending | If a rescue succeeds this generation, publish it: vault, then live store |
+   | The vault's generation | In step, unless a rescue is pending | If a rescue that survived the landed rule succeeds this generation, publish it: vault, then live store |
    | The vault's `.prev` | An earlier pass persisted to the vault but failed the live write | Self-heal: write the vault generation to the live store |
    | A rescue's generation | Published, but the vault write failed | Write the rescue to the vault |
    | Any other full token pair | CC rotated it: this is the newest generation | Adopt it into the vault, expired access token or not; retire any rescue, which it supersedes |
@@ -923,9 +949,10 @@ locally (a sibling machine revoked it). The procedure:
 4. **Refresh only when still needed.** A request is made only if, after reconciliation, the
    live access token is expired, or is exactly the token the server rejected with 401
    (`rejected_fp`, §8.1).
-5. Otherwise revalidate CC's locks (§9.1) and POST, bounded at 6 s. Persist the successor to
-   the vault first, or to `rescue/` if that fails. Then write it to the live store in either
-   case, so CC always holds the newest generation; the config lock is taken only around the
+5. Otherwise revalidate CC's locks (§9.1) and POST, bounded at 6 s. Write the successor's
+   rescue envelope ahead (§7.3 step 6), then persist it to the vault and delete the envelope
+   once that verifies; if the vault write fails the envelope stays as the rescue. Then write it
+   to the live store in either case, so CC always holds the newest generation; the config lock is taken only around the
    live write, and the storage-write lock around the credential entry's write (§9.1). If CC's
    locks turn out to be compromised when the response arrives, the
    successor is still persisted to tagteam's own storage, but the live store is not written;
@@ -2252,7 +2279,7 @@ death.
 
 **Token evidence** ([token report spec] §6.1). For a provider with `transcripts`, `run` records
 an open launch for the account just before step 7, and the child's pid once it is spawned. While
-the child runs, a scoped thread checks the child's session record every 50 ms, reading it when
+the child runs, a scoped thread checks the child's session record every 250 ms, reading it when
 its mtime changed, and every 2 s records the session it names as seen in the profile's home.
 After exit handling, `run` ends that sighting at the last read that named it and closes the
 launch, unless the profile is still in use. None of this changes the exit code, and the
@@ -2267,7 +2294,10 @@ plain-`claude` paths record nothing.
   spawned: the terminal cannot deliver it to a process that did not exist yet.
 - **While `claude` runs**, the parent ignores SIGINT and SIGQUIT (the child owns the terminal,
   and the terminal sends them to the child too) and forwards SIGTERM and SIGHUP to the child.
-  None of these cancels the exit handling below: the child's exit starts it.
+  None of these cancels the exit handling below: the child's exit starts it. The parent learns
+  of the child's exit at once, from a thread that waits for it without reaping it; it checks
+  the cancel token, and forwards a signal it holds, every 250 ms. Only the parent reaps, so a
+  forwarded signal never reaches a recycled pid.
 - **After `claude` exits**, a new SIGINT, SIGTERM or SIGHUP cancels the exit handling at its
   next cancellation point, a lock wait. Its writes (the capture, the merge-back's splice and
   the reservation's unlink) are critical spans. Exit handling that is cancelled or fails prints
@@ -2712,7 +2742,9 @@ written.
   provider (`export_login` / `import_login`), so a new provider needs no new format version.
 - **Default contents are slim.** For Claude Code the credential is reduced to
   `{claudeAiOauth}`: the machine-shared keys and the device-bound `trustedDeviceToken` stay on
-  the source machine. `--full` keeps everything.
+  the source machine. `--full` keeps every account-scoped key (`trustedDeviceToken` included) and
+  no machine-shared one, whatever the credential's source (the live login, a session profile or
+  the vault).
 - **Nothing machine-local is exported:** no account ID, login epoch, activation epoch,
   quarantine, usage state or `rejected_fp`. `active` gives the live login's position per
   provider, for information only; import ignores it.
@@ -2997,19 +3029,24 @@ handler only records the signal in the engine's cancel token (§4.2), which test
   - each iteration of a lock wait: the mutation lock, account locks, and the provider's live
     locks, CC's storage-write lock included;
   - before reserving or sending a usage request;
+  - a Keychain read inside usage collection that comes before any request (the stored token's
+    vault read and the active account's live-credential read). Keychain writes, and every read
+    inside a critical span below, are never cancellation points;
   - at a prompt;
   - in `auto`'s sleep, and between its ticks.
 
   Unwinding runs every `Drop`. Locks are released, so CC's lock directories are removed, temp
   files are deleted, and a switch that has not journaled has written nothing. An interrupted
-  usage fetch is not a usage failure: it records nothing and gives its slot back (§8.3).
+  usage fetch is not a usage failure, nor is an interrupted Keychain read there: it records
+  nothing and gives its slot back (§8.3).
 - **Critical spans run to completion.** No cancellation point lies inside:
   - the switch transaction, from its journal row to its commit or rollback (§9.4 steps 6–10);
   - recovery's writes (§9.6);
   - the refresh gate (§7.3) and active-token refresh (§7.5), from sending the token request
     to persisting the successor;
   - an explicit replacement's three steps (§12.5);
-  - any vault, rescue or atomic write.
+  - any vault, rescue or atomic write, and the Keychain reads they make (a write's verify
+    read, the gate's compare-and-swap read, the switch's and recovery's reads).
 
   These spans are bounded by their request timeouts and local I/O. A signal that arrives
   inside one, or a repeated signal, takes effect at the next cancellation point. A command
@@ -3498,8 +3535,13 @@ since 2.1.283.
     keychain). The argv/new-item versus `-i`/`-U` write difference does not change the item's
     ACL (both use the same binary).
 - **Write:** `security -i`, with the stdin line `add-generic-password -U -a "<acct>" -s "<svc>"
-  -X "<hex>"`.
-  - If the line exceeds 4032 bytes (the 4096-byte `-i` line limit minus 64), use argv instead.
+  -w "<text>"` when the credential bytes are UTF-8 with no NUL, CR or LF, `<text>` being the
+  credential with `\` written `\\` and `"` written `\"`; any other credential is written as
+  `-X "<hex>"`. `security -i` unescapes `\"` and `\\` and passes non-ASCII, `#`, `$`, `%` and
+  tab through; JSON costs about 1.1 bytes per byte this way, against 2 for hex.
+  - If the chosen line exceeds 4032 bytes (the 4096-byte `-i` line limit minus 64), use argv
+    instead, with the same encoding (`-w <text>` or `-X <hex>`), and log a WARN that names the
+    service, the account ID and the byte length, never the value. Claude Code does the same.
     An over-long `-i` line truncates silently and leaves the old entry.
   - `-U` updates the item in place and preserves its access control.
 - **Delete:** `delete-generic-password -a <acct> -s <svc>`. rc 44 counts as success.
@@ -3530,8 +3572,9 @@ since 2.1.283.
   - **Otherwise** (no terminal, `--json`, declined, or a failed unlock), the command fails
     before touching anything: exit 1, `keychain-locked`, naming
     `security unlock-keychain ~/Library/Keychains/login.keychain-db`.
-- **Active reads** retry the Keychain twice, 300 ms apart. CC caches Keychain reads for 30 s and
-  serves its stale cache on a read failure.
+- **Active reads** retry the Keychain twice, 300 ms apart, except after rc 36 (locked), which
+  will not change within the retry window. CC caches Keychain reads for 30 s and serves its
+  stale cache on a read failure.
 - **CC's read precedence.** CC reads the Keychain first and `.credentials.json` only as a
   fallback. Its default read treats *any* Keychain failure as absent and falls through to the
   file. *2.1.286:* its refresh and every secure-storage write read the Keychain strictly, so an
@@ -3570,6 +3613,9 @@ since 2.1.283.
 - **Machine-shared keys** (taken from the live credential on activation, and from the
   profile's own credential at a profile bootstrap, §12.3):
   `mcpOAuth, mcpOAuthClientConfig, mcpXaaIdp, mcpXaaIdpConfig, pluginSecrets`.
+  tagteam never keeps them in its own copies: the vault and `rescue/` hold the credential
+  without them (§6.2), and `--full` exports (§13.3) omit them. `displaced/` files stay verbatim,
+  since they keep exactly what was not tagteam's to keep.
 - **Account-scoped keys:** `claudeAiOauth, trustedDeviceToken`. Unknown sibling keys are treated
   as account-scoped. *2.1.286* also stores `designOauth`, `gatewayTrust` and
   `enterpriseGateway` in the entry; tagteam treats them as unknown keys, so account-scoped
