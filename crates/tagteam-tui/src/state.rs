@@ -152,6 +152,16 @@ impl State {
         cmds
     }
 
+    /// The views re-read: `accounts`, and on History the account shown, each under a new
+    /// generation.
+    pub(crate) fn reload_views(&mut self, now_ms: i64) -> Vec<Cmd> {
+        let mut cmds = vec![self.load_accounts()];
+        if self.screen == Screen::History {
+            cmds.extend(crate::screens::history::reload(self, now_ms));
+        }
+        cmds
+    }
+
     /// A read of `accounts` under the next generation: any read still in flight is stale.
     pub(crate) fn load_accounts(&mut self) -> Cmd {
         self.gens.accounts += 1;
