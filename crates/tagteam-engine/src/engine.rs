@@ -748,7 +748,7 @@ mod tests {
         assert_eq!(
             engine.provider_ids(),
             [
-                ProviderId::new(tagteam_core::CLAUDE_CODE),
+                ProviderId::new(tagteam_cc::CLAUDE_CODE),
                 ProviderId::new(tagteam_fake::FAKE_AGENT)
             ]
         );

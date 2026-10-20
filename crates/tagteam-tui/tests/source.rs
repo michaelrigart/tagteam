@@ -8,10 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::Platform;
-use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Window, WindowKind};
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;

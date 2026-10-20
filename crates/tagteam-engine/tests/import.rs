@@ -9,9 +9,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::live::Platform;
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::export::ExportRequest;
 use tagteam_engine::import::{ImportReport, Outcome};
 use tagteam_engine::registry::ProviderRegistry;

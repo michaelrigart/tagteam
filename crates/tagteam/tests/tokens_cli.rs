@@ -10,8 +10,9 @@ use std::path::Path;
 
 use common::{Turn, cmd, now_epoch_s, turn, two_fresh_accounts, write_transcript};
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_core::time::format_iso8601;
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{NewAccount, SightingRow, SightingSource, Store};
 use tagteam_fake::FAKE_AGENT;
 use tagteam_provider::{Env, Identity};

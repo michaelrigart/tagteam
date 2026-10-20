@@ -13,8 +13,9 @@ use common::{
     usage_fixture, usage_requests,
 };
 use serde_json::json;
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::live::Platform;
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::collect::{CollectMode, Collected};
 use tagteam_engine::store::UsageStateRow;

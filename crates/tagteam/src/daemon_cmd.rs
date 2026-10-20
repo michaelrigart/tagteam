@@ -287,7 +287,7 @@ pub(crate) fn test_upgrade_watch_ms(
 mod tests {
     use std::fs;
 
-    use tagteam_core::CLAUDE_CODE;
+    use tagteam_cc::CLAUDE_CODE;
     use tagteam_daemon::events::Backoff;
     use tagteam_engine::auto::AutoEvent;
     use tagteam_provider::FakeKeychain;

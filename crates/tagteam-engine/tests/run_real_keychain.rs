@@ -14,10 +14,11 @@ use std::time::Duration;
 
 use common::{CLAUDE_JSON, FixedOracle, claude_bin, splice_oauth_account};
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::launch::LaunchEnd;
 use tagteam_engine::lifecycle::AddOptions;
 use tagteam_engine::refresh::GateOutcome;

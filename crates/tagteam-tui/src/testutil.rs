@@ -11,7 +11,8 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::{Buffer, Cell, CellWidth};
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProviderId, Sample, Window, WindowKind};
+use tagteam_cc::CLAUDE_CODE;
+use tagteam_core::{AccountId, Pace, ProviderId, Sample, Window, WindowKind};
 use tagteam_daemon::protocol::{
     Status, StatusDaemon, StatusJob, StatusNotifications, StatusProvider,
 };

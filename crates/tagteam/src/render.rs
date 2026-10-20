@@ -567,7 +567,8 @@ pub fn mappings_human(rows: &[(Mapping, AccountRow)]) -> String {
 
 #[cfg(test)]
 pub(crate) mod testutil {
-    use tagteam_core::{AccountId, CLAUDE_CODE};
+    use tagteam_cc::CLAUDE_CODE;
+    use tagteam_core::AccountId;
     use tagteam_provider::KindTraits;
 
     use super::*;
@@ -733,7 +734,7 @@ pub(crate) mod testutil {
 mod tests {
     use std::path::PathBuf;
 
-    use tagteam_core::CLAUDE_CODE;
+    use tagteam_cc::CLAUDE_CODE;
     use tagteam_engine::switch::SwitchReason;
     use tagteam_engine::views::NO_DATA;
 

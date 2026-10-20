@@ -36,7 +36,7 @@ fn models(names: &[&str]) -> Vec<String> {
 #[test]
 fn the_defaults_are_the_specs_table() {
     let d = Settings::default();
-    assert_eq!(d.default_provider, ProviderId::new("claude-code"));
+    assert_eq!(d.default_provider, None);
     assert_eq!(d.threshold, 90.0);
     assert_eq!(d.interval_seconds, 60);
     assert_eq!(d.cooldown_seconds, 300);
@@ -125,7 +125,7 @@ events = ["limit", "switch"]
     assert_eq!(
         settings,
         Settings {
-            default_provider: ProviderId::new("fake-agent"),
+            default_provider: Some(ProviderId::new("fake-agent")),
             threshold: 75.5,
             interval_seconds: 120,
             cooldown_seconds: 0,
@@ -996,7 +996,7 @@ fn inspect_as(text: &str, provider: &str) -> Inspection {
     let env = Env::for_test(dir.path());
     fs::create_dir_all(env.config_dir()).unwrap();
     fs::write(settings::config_path(&env), text).unwrap();
-    inspect(&env, &ProviderId::new(provider))
+    inspect(&env, &ProviderId::new(provider), &ProviderId::new(PROVIDER))
 }
 
 /// The registry's key `name`.
@@ -1121,7 +1121,7 @@ fn every_key_reads_back_its_default_from_the_settings() {
     assert_eq!(
         defaults,
         vec![
-            ("default_provider", Value::Str("claude-code".into())),
+            ("default_provider", Value::Str(String::new())),
             ("autoswitch.threshold", Value::Float(90.0)),
             ("autoswitch.interval_seconds", Value::Int(60)),
             ("autoswitch.cooldown_seconds", Value::Int(300)),
@@ -1365,7 +1365,7 @@ fn default_provider_is_read_from_the_top_level_alone() {
         let (s, warnings) = load_as("default_provider = \"fake-agent\"\n", reader);
         assert_eq!(
             s.default_provider,
-            ProviderId::new("fake-agent"),
+            Some(ProviderId::new("fake-agent")),
             "{reader}"
         );
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -1411,7 +1411,7 @@ fn a_malformed_default_provider_falls_back_to_claude_code_with_a_warning() {
         "[\"claude-code\"]",
     ] {
         let (s, warnings) = load(&format!("default_provider = {text}\n"));
-        assert_eq!(s.default_provider, ProviderId::new("claude-code"), "{text}");
+        assert_eq!(s.default_provider, None, "{text}");
         assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
         assert!(
             warnings[0].contains("`default_provider` must be a provider id"),
@@ -1487,7 +1487,7 @@ fn inspect_and_load_read_every_key_alike() {
     .unwrap();
     let provider = ProviderId::new(PROVIDER);
     let (loaded, warnings) = Settings::load(&env, &provider);
-    let i = inspect(&env, &provider);
+    let i = inspect(&env, &provider, &ProviderId::new(PROVIDER));
     assert_eq!(i.warnings, warnings);
     for s in &i.keys {
         assert_eq!(s.value, loaded.value(s.key), "{}", s.key.name);
@@ -1576,7 +1576,7 @@ fn a_known_table_of_the_wrong_type_warns_and_is_not_unknown() {
 fn inspecting_a_missing_file_gives_every_default_and_creates_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let env = Env::for_test(dir.path());
-    let i = inspect(&env, &ProviderId::new(PROVIDER));
+    let i = inspect(&env, &ProviderId::new(PROVIDER), &ProviderId::new(PROVIDER));
     assert_eq!(i.path, env.config_dir().join("config.toml"));
     assert_eq!(settings::config_path(&env), i.path);
     assert!(!i.exists);
@@ -1840,7 +1840,7 @@ fn every_key_s_written_value_is_stored_in_the_settings_it_loads_into() {
         let (loaded, warnings) = Settings::load(&env, &provider);
         assert!(warnings.is_empty(), "{name}: {text:?}: {warnings:?}");
         assert_eq!(loaded.value(key), value, "{name}: {text:?}");
-        let i = inspect(&env, &provider);
+        let i = inspect(&env, &provider, &ProviderId::new(PROVIDER));
         let s = state(&i, name);
         assert_eq!((&s.value, s.source), (&value, Source::Global), "{name}");
     }

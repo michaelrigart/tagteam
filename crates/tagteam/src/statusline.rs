@@ -263,9 +263,12 @@ fn assemble(
     // `ctx.env` is the process's own, not the effective `env`: inside a run shell the latter is
     // the outer home, where the provider's home variable is gone and `invoked_by` would lose its
     // signal.
-    let chosen = command_settings(&env, &|p| registry.get(p).is_some(), |default| {
-        resolve_provider(flag, &run_shell, &registry, &ctx.env, default)
-    });
+    let chosen = command_settings(
+        &env,
+        &crate::app::fallback_provider(&registry),
+        &|p| registry.get(p).is_some(),
+        |default| resolve_provider(flag, &run_shell, &registry, &ctx.env, default),
+    );
     let engine = Engine::new(EngineConfig {
         registry,
         vault: Vault::new(Box::new(KeychainVault::new(keychain.clone()))),
@@ -418,9 +421,10 @@ mod tests {
 
     use clap::Parser;
     use serde_json::json;
+    use tagteam_cc::CLAUDE_CODE;
     use tagteam_cc::live::Platform;
     use tagteam_cc::{ClaudeCode, ItemKind, keychain_account, keychain_service};
-    use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan};
+    use tagteam_core::{AccountId, PollBudget, PollPlan};
     use tagteam_engine::settings::DEFAULT_STATUSLINE_FORMAT;
     use tagteam_engine::store::{Eligibility, Reserve, Store};
     use tagteam_engine::views::{UsageStatus, UsageView};

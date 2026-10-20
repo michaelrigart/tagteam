@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::live::{LiveStore, Platform};
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::http::NoHttp;
 use tagteam_provider::profile::RunShell;
 use tagteam_provider::{Env, FakeClock, FakeKeychain, Identity, Provider};

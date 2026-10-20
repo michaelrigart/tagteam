@@ -10,7 +10,8 @@ use std::path::Path;
 
 use common::{cmd, login, now_epoch_s, record_reading, seed_home, usage_window};
 use serde_json::{Value, json};
-use tagteam_core::{CLAUDE_CODE, ProviderId, Window, WindowKind};
+use tagteam_cc::CLAUDE_CODE;
+use tagteam_core::{ProviderId, Window, WindowKind};
 use tagteam_engine::store::Store;
 use tagteam_provider::{Env, FileKeychain};
 

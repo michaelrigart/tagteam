@@ -14,7 +14,8 @@ use common::{
     usage_window,
 };
 use serde_json::{Value, json};
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, WindowKind};
+use tagteam_cc::CLAUDE_CODE;
+use tagteam_core::{AccountId, ProviderId, WindowKind};
 use tagteam_engine::store::{SightingRow, SightingSource, Store};
 use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Env, FileKeychain};

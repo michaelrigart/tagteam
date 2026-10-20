@@ -470,7 +470,8 @@ pub fn short_name(position: u32, alias: Option<&str>, email_or_label: &str) -> S
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use tagteam_core::{AccountId, CLAUDE_CODE, Pace, ProjectionMethod, ProviderId};
+    use tagteam_cc::CLAUDE_CODE;
+    use tagteam_core::{AccountId, Pace, ProjectionMethod, ProviderId};
     use tagteam_provider::KindTraits;
 
     use super::*;

@@ -175,7 +175,7 @@ impl DaemonSink for Fanout<'_> {
 mod tests {
     use std::cell::RefCell;
 
-    use tagteam_core::CLAUDE_CODE;
+    use tagteam_cc::CLAUDE_CODE;
 
     use super::*;
 

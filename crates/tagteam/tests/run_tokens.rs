@@ -16,7 +16,8 @@ use common::{
     two_fresh_accounts,
 };
 use serde_json::Value;
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_cc::CLAUDE_CODE;
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::{LaunchRow, SightingRow, SightingSource, Store};
 use tagteam_provider::{Env, PENDING_LAUNCH_DIR, PendingEntry, PendingLaunch, profile_path};
 

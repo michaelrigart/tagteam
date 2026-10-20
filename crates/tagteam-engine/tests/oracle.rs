@@ -9,10 +9,11 @@ use std::time::{Duration, Instant};
 
 use common::{Fx, crash_row, mutation_lock_free};
 use serde_json::json;
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::{LiveStore, Platform};
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::net::UreqHttp;
 use tagteam_engine::oracle::{CachingOracle, HttpOracle, Oracle};

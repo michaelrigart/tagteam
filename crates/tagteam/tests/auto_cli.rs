@@ -16,9 +16,10 @@ use common::{
     usage_window,
 };
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::CcPaths;
 use tagteam_core::autoswitch::AutoState;
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
 use tagteam_engine::store::Store;
 use tagteam_provider::profile::{ProfileMarker, canonical_profile_path};
 use tagteam_provider::{Env, FlockGuard, ProcessStamp};

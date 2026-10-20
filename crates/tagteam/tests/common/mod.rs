@@ -18,9 +18,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use assert_cmd::Command;
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::live::Platform;
 use tagteam_cc::{ClaudeCode, ItemKind, keychain_account, keychain_service};
-use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Window, WindowKind};
 use tagteam_engine::daemon::{MAX_SOCKET_PATH, daemon_socket_path};
 use tagteam_engine::store::{Eligibility, Reserve, Store};
 use tagteam_engine::vault::SERVICE;

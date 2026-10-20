@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use common::{Fx, capture_logs, crashed_switch, due, vault_fp, write_target_credential};
 use serde_json::json;
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_cc::CLAUDE_CODE;
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::active::{ActiveOutcome, ActiveTrigger};
 use tagteam_engine::export::ExportRequest;

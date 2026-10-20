@@ -20,7 +20,7 @@ pub mod validate;
 
 pub use classify::{OracleVerdict, OutgoingAction, OutgoingClass, OutgoingFacts, decide_outgoing};
 pub use fingerprint::Fingerprint;
-pub use ids::{AccountId, CLAUDE_CODE, IdentityKey, ProviderId};
+pub use ids::{AccountId, IdentityKey, ProviderId};
 pub use pace::{Pace, ProjectionMethod, Sample};
 pub use poll::{PollBudget, PollInputs, PollPlan};
 pub use provenance::{ProvenanceVerdict, provenance};

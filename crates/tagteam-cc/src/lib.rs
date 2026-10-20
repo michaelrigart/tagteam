@@ -19,6 +19,8 @@ pub mod shape;
 pub mod transcripts;
 pub mod usage;
 
+pub const CLAUDE_CODE: &str = "claude-code";
+
 pub use naming::{ItemKind, keychain_account, keychain_service};
 pub use paths::CcPaths;
 pub use provider::ClaudeCode;

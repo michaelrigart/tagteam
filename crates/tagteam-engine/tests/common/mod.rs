@@ -9,11 +9,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::endpoints::Endpoints;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::shape::compose;
 use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
-use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Window, WindowKind};
 use tagteam_engine::auto::{AutoEvent, EventSink};
 use tagteam_engine::lifecycle::{AddOptions, AddTokenOptions};
 use tagteam_engine::oracle::Oracle;

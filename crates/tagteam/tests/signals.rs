@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use common::{Running, live_email, std_cmd, two_fresh_accounts};
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_engine::store::Store;
 use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Env, FileKeychain, Keychain};
