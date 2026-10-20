@@ -241,7 +241,7 @@ fn quits_behind(replies: &[u8]) {
     let mut tui = home.tui(&["tui"]);
     tui.wait_for(LONG, "the accounts table", accounts);
     tui.type_keys(&[replies, b"q"].concat());
-    let f = tui.finish(Duration::from_secs(2));
+    let f = tui.finish(LONG);
     assert_eq!(f.status.code(), Some(0), "{}", f.screen.text());
 }
 
