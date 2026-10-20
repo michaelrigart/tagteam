@@ -2136,6 +2136,36 @@ fn a_live_credential_that_links_to_an_accounts_vault_file_refuses_a_provider_pur
 }
 
 #[test]
+fn a_hard_link_to_a_protected_file_is_still_refused() {
+    // A hard link shares the device and the inode with the vault file but not its path, so only
+    // the file identity tells the live credential from an unrelated file.
+    let fx = Fx::with(Platform::Linux, |_| {});
+    let id = add(
+        &fx.engine.store().unwrap(),
+        &fx.provider(),
+        "0192-hard-linked",
+        "a@x.co",
+        1,
+    );
+    fx.put_vault(&id, b"the live login");
+    let vault_file = fx.env.data_dir().join("vault/0192-hard-linked.json");
+    let live = fx.paths().credentials_file;
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    fs::hard_link(&vault_file, &live).unwrap();
+
+    let plan = fx.engine.purge_plan(Some(&fx.provider())).unwrap();
+    let err = fx.engine.purge(&plan).unwrap_err();
+
+    assert!(
+        err.to_string().contains("live login's files are inside"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&live).unwrap(), b"the live login");
+    assert!(fx.vault_bytes(&id).is_some());
+    assert!(fx.engine.store().unwrap().account(&id).unwrap().is_some());
+}
+
+#[test]
 fn a_provider_purge_leaves_alone_another_providers_live_login_in_its_own_profile() {
     // The exception: provider Q's live login resolves into Q's own profile, an account
     // `--provider P` leaves untouched, so it is not refused.
