@@ -787,6 +787,7 @@ mod tests {
 
     use super::*;
     use crate::msg::Msg;
+    use crate::state::BannerKind;
     use crate::testutil::*;
     use crate::theme::Theme;
     use crate::update::update;
@@ -1111,7 +1112,10 @@ mod tests {
         usage.error = Some("http-429".into());
         usage.windows.as_mut().unwrap()[2].0.label = thousand();
         let mut state = loaded(vec![account(1, "a@x.co", usage)]);
-        state.banner = Some(["the store could not be read"; 12].join("; "));
+        state.raise_banner(
+            BannerKind::Refusal,
+            ["the store could not be read"; 12].join("; "),
+        );
         state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
         for _ in 0..3 {
             update(&mut state, ch('J'), NOW_MS);
@@ -1160,7 +1164,10 @@ mod tests {
             raw: serde_json::json!({"event": "error", "ts": "2026-09-21T14:04:00Z", "message": "x".repeat(300)}),
         };
         update(&mut state, Msg::Live(crate::live::Live::Event(ev)), NOW_MS);
-        state.banner = Some(["the store could not be read"; 12].join("; "));
+        state.raise_banner(
+            BannerKind::Refusal,
+            ["the store could not be read"; 12].join("; "),
+        );
         state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
         for _ in 0..3 {
             update(&mut state, ch('J'), NOW_MS);
@@ -1245,7 +1252,10 @@ mod tests {
         usage.error = Some("http-429".into());
         usage.windows.as_mut().unwrap().push((w, p));
         let mut state = loaded(vec![account(1, "a@x.co", usage)]);
-        state.banner = Some(["the store could not be read"; 12].join("; "));
+        state.raise_banner(
+            BannerKind::Refusal,
+            ["the store could not be read"; 12].join("; "),
+        );
         state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
         for _ in 0..2 {
             update(&mut state, ch('J'), NOW_MS);
@@ -1712,7 +1722,7 @@ mod tests {
             draw(&state, 80, 24)[1],
             " inside a `tagteam run` session: account changes are refused here"
         );
-        state.banner = Some("the store is locked".into());
+        state.raise_banner(BannerKind::Refusal, "the store is locked");
         assert_eq!(draw(&state, 80, 24)[1], " the store is locked");
     }
 

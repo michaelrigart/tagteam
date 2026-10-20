@@ -402,6 +402,7 @@ mod tests {
 
     use super::*;
     use crate::msg::{Cmd, Msg};
+    use crate::state::BannerKind;
     use crate::state::Screen;
     use crate::testutil::*;
     use crate::theme::Theme;
@@ -660,7 +661,10 @@ mod tests {
                 history_window(wide, vec![sample(HOUR, 95.0)], pace),
             ],
         ));
-        state.banner = Some(["the store could not be read"; 12].join("; "));
+        state.raise_banner(
+            BannerKind::Refusal,
+            ["the store could not be read"; 12].join("; "),
+        );
         state.toast(["Switched to a@x.co (position 1)"; 8].join(" "), NOW_MS);
         let lines = draw(&state, 80, 24);
         let right: Vec<String> = lines[4..20]

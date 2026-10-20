@@ -32,7 +32,7 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             match result {
                 Ok(snapshot) => {
                     state.accounts.apply(snapshot);
-                    clear_read_error(state, BannerKind::Accounts);
+                    state.clear_banner(BannerKind::Accounts);
                     if state.quitting.is_some() {
                         return vec![];
                     }
@@ -41,7 +41,7 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                     cmds
                 }
                 Err(e) => {
-                    raise(state, BannerKind::Accounts, e.message);
+                    state.raise_banner(BannerKind::Accounts, e.message);
                     vec![]
                 }
             }
@@ -54,9 +54,9 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
             match result {
                 Ok(view) => {
                     state.history.apply(view);
-                    clear_read_error(state, BannerKind::History);
+                    state.clear_banner(BannerKind::History);
                 }
-                Err(e) => raise(state, BannerKind::History, e.message),
+                Err(e) => state.raise_banner(BannerKind::History, e.message),
             }
             vec![]
         }
@@ -68,7 +68,7 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                 Ok(summary) => {
                     if !stale {
                         state.dirty = true;
-                        clear_read_error(state, BannerKind::Collect);
+                        state.clear_banner(BannerKind::Collect);
                         if let Some(first) = summary.warnings.first() {
                             state.toast(format!("warning: {first}"), now_ms);
                         }
@@ -87,7 +87,7 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
                 Err(e) => {
                     state.dirty = true;
                     let words = format!("usage was not collected: {}", e.message);
-                    raise(state, BannerKind::Collect, words);
+                    state.raise_banner(BannerKind::Collect, words);
                     vec![]
                 }
             }
@@ -118,9 +118,9 @@ pub fn update(state: &mut State, msg: Msg, now_ms: i64) -> Vec<Cmd> {
         }
         Msg::LaneDied { lane } => {
             state.dirty = true;
-            if state.banner_from != Some(BannerKind::Lane) {
+            if state.banner.as_ref().map(|b| b.kind) != Some(BannerKind::Lane) {
                 let words = format!("the {lane} lane stopped unexpectedly");
-                raise(state, BannerKind::Lane, words);
+                state.raise_banner(BannerKind::Lane, words);
             }
             if state.quitting.is_some() {
                 return vec![];
@@ -151,21 +151,6 @@ pub fn drawn(state: &mut State) -> Vec<Cmd> {
         cmds.push(state.collect_due(shown));
     }
     cmds
-}
-
-/// A failed read's banner, remembering which kind raised it.
-fn raise(state: &mut State, kind: BannerKind, text: String) {
-    state.banner = Some(text);
-    state.banner_from = Some(kind);
-}
-
-/// A read that succeeds clears the banner a failed read of the same kind left (spec §10.4); a
-/// banner raised another way goes with any success. A shutdown's never goes.
-fn clear_read_error(state: &mut State, kind: BannerKind) {
-    if state.quitting.is_none() && state.banner_from.is_none_or(|from| from == kind) {
-        state.banner = None;
-        state.banner_from = None;
-    }
 }
 
 /// Starts the shutdown (spec §10.2) with `code`. An open dialog is dropped with it, so the
@@ -388,7 +373,7 @@ mod tests {
         let cmds = update(&mut state, Msg::LaneDied { lane: "views" }, NOW_MS);
         assert_eq!(quit_code(&cmds), Some(1));
         assert_eq!(
-            state.banner.as_deref(),
+            state.banner_text(),
             Some("the views lane stopped unexpectedly")
         );
         assert!(update(&mut state, Msg::LaneDied { lane: "actions" }, NOW_MS).is_empty());
@@ -615,7 +600,7 @@ mod tests {
         assert!(drawn[3].contains("a1@x.co"), "{drawn:?}");
         // The next good read clears it.
         update(&mut state, accounts_msg(r#gen, 2), NOW_MS);
-        assert_eq!(state.banner, None);
+        assert!(state.banner.is_none());
     }
 
     #[test]
@@ -633,7 +618,7 @@ mod tests {
             NOW_MS,
         );
         assert_eq!(
-            state.banner.as_deref(),
+            state.banner_text(),
             Some("usage was not collected: the store is locked")
         );
         update(
@@ -762,7 +747,7 @@ mod tests {
         );
         update(&mut state, history_msg(hg), NOW_MS);
         assert_eq!(
-            state.banner.as_deref(),
+            state.banner_text(),
             Some("the run shell marker is unreadable"),
             "a history read does not hide a failed accounts read"
         );
@@ -770,7 +755,7 @@ mod tests {
             unreachable!()
         };
         update(&mut state, accounts_msg(ag, 1), NOW_MS);
-        assert_eq!(state.banner, None);
+        assert!(state.banner.is_none());
 
         // A collection's banner survives both reads and goes with the next good collection.
         let Cmd::CollectDue { r#gen: cg, .. } = state.collect_due(vec![id(1)]) else {
@@ -792,10 +777,7 @@ mod tests {
             unreachable!()
         };
         update(&mut state, history_msg(hg), NOW_MS);
-        assert_eq!(
-            state.banner.as_deref(),
-            Some("usage was not collected: locked")
-        );
+        assert_eq!(state.banner_text(), Some("usage was not collected: locked"));
         let Cmd::CollectDue { r#gen: cg, .. } = state.collect_due(vec![id(1)]) else {
             unreachable!()
         };
@@ -810,7 +792,7 @@ mod tests {
             },
             NOW_MS,
         );
-        assert_eq!(state.banner, None);
+        assert!(state.banner.is_none());
     }
 
     #[test]
@@ -842,7 +824,7 @@ mod tests {
         update(&mut state, Msg::LaneDied { lane: "views" }, NOW_MS);
         update(&mut state, Msg::LaneDied { lane: "actions" }, NOW_MS);
         assert_eq!(
-            state.banner.as_deref(),
+            state.banner_text(),
             Some("the views lane stopped unexpectedly")
         );
     }

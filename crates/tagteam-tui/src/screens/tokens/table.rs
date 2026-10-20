@@ -1196,6 +1196,7 @@ mod tests {
 
     use super::*;
     use crate::msg::{Cmd, Msg};
+    use crate::state::BannerKind;
     use crate::state::Screen;
     use crate::testutil::*;
     use crate::theme::Theme;
@@ -2137,7 +2138,7 @@ mod tests {
             report.price_overrides = vec!["claude-opus-5-5".into(), "claude-sonnet-5-5".into()];
         }
         let words = "the store could not be opened because another tagteam holds its lock";
-        state.banner = Some([words; 3].join("; "));
+        state.raise_banner(BannerKind::Refusal, [words; 3].join("; "));
         state.toast([words; 3].join("; "), NOW_MS);
         let notes = [
             "No price for claude-test-1, claude-test-2, claude-test-3, claude-test-4, claude-test-5, claude-test-6, claude-test-7, claude-test-8, claude-test-9, claude-test-10, claude-test-11, claude-test-12: counted without cost (≥ marks a partial cost).",
@@ -2274,7 +2275,7 @@ mod tests {
             report.unpriced_models = vec![long.clone()];
         }
         let words = "the store could not be opened because another tagteam holds its lock";
-        state.banner = Some([words; 3].join("; "));
+        state.raise_banner(BannerKind::Refusal, [words; 3].join("; "));
         state.toast([words; 3].join("; "), NOW_MS);
         let lines = draw(&state, 80, 24);
         assert!(lines.iter().all(|l| width_of(l) <= 80), "{lines:?}");
@@ -2342,7 +2343,7 @@ mod tests {
         };
         update(&mut state, Msg::Live(crate::live::Live::Event(ev)), NOW_MS);
         let words = "the store could not be opened because another tagteam holds its lock";
-        state.banner = Some([words; 3].join("; "));
+        state.raise_banner(BannerKind::Refusal, [words; 3].join("; "));
         state.toast([words; 3].join("; "), NOW_MS);
         let lines = draw(&state, 80, 24);
         assert_eq!(lines.len(), 24, "{lines:?}");

@@ -196,8 +196,8 @@ pub(crate) fn banner(state: &State) -> Option<(String, bool)> {
     let tokens = (state.screen == Screen::Tokens)
         .then(|| state.tokens.error())
         .flatten();
-    match (&state.banner, tokens) {
-        (Some(error), _) => Some((error.clone(), true)),
+    match (state.banner_text(), tokens) {
+        (Some(error), _) => Some((error.to_owned(), true)),
         (None, Some(error)) => Some((error.to_owned(), true)),
         (None, None) => screens::accounts::banner(&state.accounts).map(|text| (text, false)),
     }
@@ -503,6 +503,7 @@ mod tests {
     use crate::actions::{ConfirmThen, Overlay};
     use crate::host::Action;
     use crate::msg::{Answer, Msg};
+    use crate::state::BannerKind;
     use crate::testutil::*;
     use crate::theme::Theme;
     use crate::update::update;
@@ -616,7 +617,7 @@ mod tests {
         // Spec §5.1: 80×24 is enough, so nothing a banner says may be lost at 80 columns.
         let mut state = fresh(Screen::Accounts);
         let words = "the store could not be opened because another tagteam holds its lock";
-        state.banner = Some(format!("{words}; {words}"));
+        state.raise_banner(BannerKind::Refusal, format!("{words}; {words}"));
         let lines = draw(&state, 80, 24);
         assert_eq!(
             lines[1..3],
@@ -630,7 +631,7 @@ mod tests {
             Rect::new(0, 3, 80, 20),
             "two rows, then the body"
         );
-        state.banner = Some([words; 5].join("; "));
+        state.raise_banner(BannerKind::Refusal, [words; 5].join("; "));
         let lines = draw(&state, 80, 24);
         assert!(lines[3].ends_with('…'), "{lines:?}");
         assert_eq!(width_of(&lines[3]), 80);
@@ -666,7 +667,7 @@ mod tests {
         for color in [true, false] {
             let mut state = fresh(Screen::Accounts);
             state.theme = Theme::new(color);
-            state.banner = Some("the store is locked".into());
+            state.raise_banner(BannerKind::Refusal, "the store is locked");
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
             let lines = text_of(&buf);
             assert_eq!(lines[1], " the store is locked");

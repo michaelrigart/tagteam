@@ -56,9 +56,7 @@ pub struct State {
     pub overlay: Option<Overlay>,
     pub toast: Option<Toast>,
     /// A failed read's error, in the CLI's words (spec §10.4).
-    pub banner: Option<String>,
-    /// Which read raised `banner`: only a success of that same kind clears it.
-    pub(crate) banner_from: Option<BannerKind>,
+    pub(crate) banner: Option<Banner>,
     /// The action running now, in the TUI or suspended (spec §7.2).
     pub running: Option<Action>,
     pub gens: Gens,
@@ -74,6 +72,13 @@ pub struct State {
     pub(crate) started_ms: i64,
 }
 
+/// A banner's words, and what raised them: only a success of that same kind clears it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Banner {
+    pub(crate) text: String,
+    pub(crate) kind: BannerKind,
+}
+
 /// What raised the banner (spec §10.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BannerKind {
@@ -81,6 +86,8 @@ pub(crate) enum BannerKind {
     History,
     Collect,
     Lane,
+    /// A hand-over the input thread did not allow (spec §7.3): any successful read clears it.
+    Refusal,
 }
 
 pub struct Toast {
@@ -122,7 +129,6 @@ impl State {
             overlay: None,
             toast: None,
             banner: None,
-            banner_from: None,
             running: None,
             gens: Gens::default(),
             refresh: Refresh {
@@ -173,6 +179,30 @@ impl State {
         }
     }
 
+    /// A failed read's banner, remembering which kind raised it.
+    pub(crate) fn raise_banner(&mut self, kind: BannerKind, text: impl Into<String>) {
+        self.banner = Some(Banner {
+            text: text.into(),
+            kind,
+        });
+    }
+
+    /// A read of `kind` succeeded: clears a banner of that kind, or a refusal, which no read
+    /// owns. Never while quitting.
+    pub(crate) fn clear_banner(&mut self, kind: BannerKind) {
+        let owned = self
+            .banner
+            .as_ref()
+            .is_some_and(|b| b.kind == kind || b.kind == BannerKind::Refusal);
+        if self.quitting.is_none() && owned {
+            self.banner = None;
+        }
+    }
+
+    pub(crate) fn banner_text(&self) -> Option<&str> {
+        self.banner.as_ref().map(|b| b.text.as_str())
+    }
+
     /// Shows `text` in place of the footer for `TOAST_MS`.
     pub(crate) fn toast(&mut self, text: impl Into<String>, now_ms: i64) {
         self.toast = Some(Toast {
@@ -180,5 +210,31 @@ impl State {
             until_ms: now_ms + TOAST_MS,
         });
         self.dirty = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil;
+
+    #[test]
+    fn a_banner_clears_for_its_own_kind_or_a_refusal_and_never_while_quitting() {
+        let mut state = testutil::fresh(Screen::Accounts);
+
+        state.raise_banner(BannerKind::Collect, "usage was not collected");
+        state.clear_banner(BannerKind::Accounts);
+        assert_eq!(state.banner_text(), Some("usage was not collected"));
+        state.clear_banner(BannerKind::Collect);
+        assert_eq!(state.banner_text(), None);
+
+        state.raise_banner(BannerKind::Refusal, "no");
+        state.clear_banner(BannerKind::History);
+        assert!(state.banner.is_none());
+
+        state.raise_banner(BannerKind::Accounts, "locked");
+        state.quitting = Some(0);
+        state.clear_banner(BannerKind::Accounts);
+        assert_eq!(state.banner_text(), Some("locked"));
     }
 }
