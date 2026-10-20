@@ -293,6 +293,7 @@ impl Engine {
         self.registry.all().iter().map(|p| p.id()).collect()
     }
 
+    /// The registry of every provider this build registers.
     pub fn registry(&self) -> &ProviderRegistry {
         &self.registry
     }

@@ -121,7 +121,7 @@ impl MkdirLockSpec {
 }
 
 /// Sets the mtime through `dir`, the held directory fd (`futimens`), and reads back what the
-/// filesystem stored through the same fd. Never by path (§9.1, L356).
+/// filesystem stored through the same fd. Never by path (§9.1).
 fn touch(dir: &File, t: SystemTime) -> io::Result<SystemTime> {
     dir.set_modified(t)?;
     dir.metadata()?.modified()
@@ -363,7 +363,7 @@ impl MkdirLock {
                         #[cfg(test)]
                         let _ = seam::run(&path, seam::Point::BeatBeforeTouch);
                         // Through the held fd: a directory that replaced ours between the check
-                        // and this touch is never touched (L356).
+                        // and this touch is never touched (§9.1).
                         match touch(&st.dir, SystemTime::now()) {
                             Ok(t) => *last = t,
                             Err(e) => {
@@ -511,7 +511,7 @@ mod tests {
 
     /// Replaces the directory at `path` with a new one that carries `mtime`: another process's
     /// takeover. Carrying the holder's own mtime, it is what the old touch-by-path left after
-    /// adopting a replacement (L356).
+    /// adopting a replacement (§9.1).
     fn replace_with_mtime(path: &Path, mtime: SystemTime) {
         fs::remove_dir(path).unwrap();
         fs::create_dir(path).unwrap();
@@ -951,7 +951,7 @@ mod tests {
         assert!(!s.path.exists());
     }
 
-    /// L356, Review Focus 5: a holder suspended past the staleness window resumes to find its
+    /// §9.1: a holder suspended past the staleness window resumes to find its
     /// directory replaced, and the replacement carries the very mtime it last set. Only the
     /// device and inode tell them apart. Its check fails, so the write it protects is aborted,
     /// and it never removes the replacement.
@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(mtime(&s.path), ours);
     }
 
-    /// L356: a beat's own check refuses a directory that replaced the holder's before the beat,
+    /// §9.1: a beat's own check refuses a directory that replaced the holder's before the beat,
     /// even one carrying the holder's mtime, so the beat never touches it.
     #[test]
     fn the_heartbeat_never_touches_a_directory_that_replaced_its_own() {
@@ -1000,7 +1000,7 @@ mod tests {
         );
     }
 
-    /// L356 itself: the beat's check passed, and the directory is replaced before its touch.
+    /// §9.1's rule itself: the beat's check passed, and the directory is replaced before its touch.
     /// The touch goes through the fd held since `mkdir`, so it reaches the holder's own
     /// (now unlinked) directory and never the replacement; the next check refuses.
     #[test]

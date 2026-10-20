@@ -1,5 +1,5 @@
-//! §12.5 "Launch": a session's start under `MutationGuard` and the account lock (Task 10),
-//! §12.3's per-launch login check, and §12.5's exit handling once `claude` exits (Task 11).
+//! §12.5 "Launch": a session's start under `MutationGuard` and the account lock,
+//! §12.3's per-launch login check, and §12.5's exit handling once `claude` exits.
 
 use std::ffi::OsStr;
 use std::io;
@@ -42,7 +42,7 @@ struct Freshened {
     /// vault's generation is consumed, or the profile conflicts with it. The gate gets that far
     /// only for an account no session owns (§7.3 step 2), but a session can start before this
     /// launch takes its locks. So it refuses a quiescent launch there, before anything is
-    /// written, and a join, which touches no credential, goes on (§12.5 step 3; fix round 2).
+    /// written, and a join, which touches no credential, goes on (§12.5 step 3).
     refusal: Option<EngineError>,
 }
 
@@ -306,10 +306,10 @@ impl Engine {
             // The vault's generation is dead, and the gate has quarantined the account. It
             // answers a quarantine before it asks who owns the account, so this may be a
             // join's: `locked_login` refuses a quiescent launch on the row it reads under the
-            // locks (fix round 1).
+            // locks.
             GateOutcome::Dead(_) => Freshened::default(),
             // Spent, its successor lost (§7.3 step 6). The gate's `successor_lost` quarantine is
-            // best effort, so the refusal itself is carried (fix round 2).
+            // best effort, so the refusal itself is carried.
             GateOutcome::Unpersisted => refused(needs_relogin(p, row)),
             GateOutcome::Transient { rescued: true, .. } => refused(pending(
                 "the refresh succeeded, but the vault could not be written; the new token is in rescue/",
@@ -727,14 +727,14 @@ fn target_removed(planned: &AccountRow) -> EngineError {
     }
 }
 
-/// The reservation calls report I/O errors without a path (Task 4), so the refusal names the
+/// The reservation calls report I/O errors without a path, so the refusal names the
 /// reservation directory, `dir`.
 fn reservation_io(dir: &Path, e: io::Error) -> EngineError {
     EngineError::Io(io::Error::new(e.kind(), format!("{}: {e}", dir.display())))
 }
 
 /// Interface Contract: `create` refuses a `<pid>.lock` that is live, the reservation of an
-/// orphaned `claude` of an earlier process with this pid (Task 4). Replacing it would hide a
+/// orphaned `claude` of an earlier process with this pid. Replacing it would hide a
 /// running session, so the launch is refused, naming the file, as `launch-unreachable`; a later
 /// `run` gets a new pid. Once `dir` is a directory only that check reports `AlreadyExists`, and
 /// its message names the file. Any other failure, a file where `dir` belongs included, names

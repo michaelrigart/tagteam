@@ -1,6 +1,7 @@
-//! `tagteam statusline` (§13.5): one line for Claude Code's status bar, from the stored
-//! reading. It never fetches, never touches the Keychain, and never builds the HTTP adapter.
-//! Once the line is out, it records the session it serves (token report spec §6.3).
+//! `tagteam statusline` (§13.5): one line for a provider's status bar (Claude Code's `statusLine`
+//! setting runs it), from the stored reading. It never fetches, never touches the Keychain, and
+//! never builds the HTTP adapter. Once the line is out, it records the session it serves (token
+//! report spec §6.3).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -219,7 +220,7 @@ pub(crate) fn resolve_provider(
 /// nothing even if it were built. The run shell is detected over that walled registry (§12.8),
 /// which reads the marker file alone, and the provider is resolved in Decision 13's order by
 /// `resolve_provider`, whose last step is the default `app::command_settings` chooses:
-/// `default_provider` when this build has it, else claude-code. This is not `app::locate`,
+/// `default_provider` when this build has it, else the registry's first provider. This is not `app::locate`,
 /// which serves the other commands over the full registry; the variables Decision 13's third
 /// step reads were captured into `ctx.env` by `Context::from_process`. The settings are that
 /// provider's, and their warnings are dropped, since a status bar has nowhere to show them.
@@ -295,7 +296,7 @@ pub(crate) enum SightingHome {
     Default,
     /// The run shell's profile.
     Profile(PathBuf),
-    /// Neither: a `CLAUDE_CONFIG_DIR` naming another directory, or a marker that cannot be
+    /// Neither: a provider's home variable naming another directory, or a marker that cannot be
     /// read. Nothing is recorded.
     Elsewhere,
 }
@@ -907,7 +908,7 @@ mod tests {
     /// A context over `env`, with a Keychain the walled engine never uses. Nothing is captured
     /// from the test process (§15.1): `env.vars` holds exactly what a test put there, and that
     /// is all Decision 13's third step (`Provider::invoked_by`) sees. `Context::from_process`,
-    /// which captures the registered providers' variables and `CLAUDECODE` (Task 8), is not
+    /// which captures the registered providers' variables and `CLAUDECODE`, is not
     /// involved.
     fn context(env: Env) -> Context {
         Context {
@@ -992,7 +993,7 @@ mod tests {
 
     #[test]
     fn a_run_shell_whose_account_is_gone_or_whose_marker_is_corrupt_prints_nothing() {
-        // Review Focus 4, at the unit level: never the live login's line, and no wall reached.
+        // Never the live login's line, and no wall reached.
         let (_dir, outside, _a) = session_home();
         let gone = in_profile(&outside, &AccountId::from_string("0192-removed"));
         let (built, provider, walls) = walled(context(gone), None);
@@ -1086,7 +1087,7 @@ mod tests {
 
     #[test]
     fn the_invoking_agent_is_asked_with_the_process_environment_not_the_outer_one() {
-        // Controller note (Task 8): inside a run shell the engine's `Env` is the outer home, where
+        // Inside a run shell the engine's `Env` is the outer home, where
         // `CLAUDE_CONFIG_DIR` is gone and Claude Code's `invoked_by` (which tests `session_dir`)
         // is false. `engine` must hand `resolve_provider` the process's own `Env`, as it was
         // before detection.

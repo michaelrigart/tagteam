@@ -211,7 +211,7 @@ fn is_damage(e: &crate::store::StoreError) -> bool {
 
 /// `PRAGMA quick_check` run once more before it fails the store: an immutable open reads the
 /// file while a writer that began after the probe may be checkpointing it, which can show a
-/// torn page that a second run does not (R-T9). Two failures stand.
+/// torn page that a second run does not. Two failures stand.
 fn settled_quick_check(
     first: Result<Vec<String>, crate::store::StoreError>,
     again: impl FnOnce() -> Result<Vec<String>, crate::store::StoreError>,
@@ -226,7 +226,7 @@ fn settled_quick_check(
 }
 
 /// `auto.engine` for an engine lock record naming `pid`: an undetermined liveness is an input
-/// doctor could not read, so a warning (R-T9-liveness), as for `switch.interrupted`. `daemon`
+/// doctor could not read, so a warning, as for `switch.interrupted`. `daemon`
 /// means the record matches `daemon.lock`'s, so the engine is the daemon's (D10).
 fn engine_record_check(pid: u32, liveness: Liveness, daemon: bool) -> Check {
     let who = if daemon {
@@ -297,7 +297,7 @@ fn daemon_record_check(r: &DaemonRecord, liveness: Liveness) -> Check {
 
 /// `daemon.service`'s finding for an installed unit, from what its manager says (D10). A
 /// manager that is missing, hangs or fails is a warning with its reason, never a failure
-/// (Review Focus 5).
+/// (§13.6).
 fn service_state_check(kind: ServiceKind, path: &Path, state: &ServiceState) -> Check {
     const ID: &str = "daemon.service";
     let unit = format!(
@@ -1355,7 +1355,7 @@ impl Run<'_> {
                     )
                     .fix(format!("`loginctl enable-linger {user}` keeps it running")),
                 ),
-                // Review Focus 5: a `loginctl` missing, hung or failing is a warning with its
+                // A `loginctl` missing, hung or failing is a warning with its
                 // reason, never silence and never a failure.
                 Err(why) => self.push(
                     None,
@@ -1744,7 +1744,7 @@ impl Run<'_> {
     fn replacement(&self, p: &dyn Provider, store: &Store, row: &AccountRow, fp: &str) -> Check {
         let id = p.id();
         let remove = command(self.engine, &id, &format!("remove {}", row.position));
-        // A NULL `replacing_meta` is cleared, never refused (§12.5, Task 2): only recorded
+        // A NULL `replacing_meta` is cleared, never refused (§12.5): only recorded
         // details that do not parse block. A column that cannot be read is a check whose input
         // cannot be read (§13.6).
         let parses = match store.replacing_meta(&row.id) {
@@ -3211,7 +3211,7 @@ fn skipped(vault: bool, provider: bool) -> String {
 /// `sessions.reservation` for a reservation `path` still held after its tagteam `parent` died.
 /// `holders` is `holders_of`'s answer; `None` means either that this OS cannot tell, or (when
 /// `still_there` is false) that the lock file went away between the probe and the scan. (The
-/// scan's `stat` of the file could hang on a stalled NFS mount; parked, R-T10.)
+/// scan's `stat` of the file could hang on a stalled NFS mount; a known gap.)
 fn held_reservation(
     path: &Path,
     parent: u32,

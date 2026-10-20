@@ -816,9 +816,8 @@ impl Collection<'_> {
     /// `PublishedOnly` and `NotNeeded` go on; `send` still refuses a token that is expired or
     /// refused. `Dead` has quarantined the account (`relogin_required`). `Replaced` is
     /// `live-replaced` (Decision 10: `unavailable`), with a warning naming the forced switch
-    /// that activates the replacement (§7.5 step 2). Any other outcome, and any error, is a failure with a warning, never a command error (M2a Task 16's
-    /// carry-over), except a live credential the oracle gives to another identity, which has a
-    /// status of its own, and §14.1's interruption: no refresh starts once the token is set,
+    /// that activates the replacement (§7.5 step 2). Any other outcome, and any error, is a failure with a warning, never a command error, except a live credential the oracle gives to another identity,
+    /// which has a status of its own, and §14.1's interruption: no refresh starts once the token is set,
     /// and a lock wait inside §7.5 that meets it stops the fetch without a record. A kind that
     /// does not refresh never reaches §7.5, which would refuse it: its expired token is
     /// `token-expired`, and its refused one `http-401`, as on the inactive path (Decision 11:
@@ -1005,7 +1004,7 @@ impl Collection<'_> {
     }
 
     /// Stamps `rejected_fp` with the token the server just refused, so it is never sent again
-    /// until it changes (§8.1). The stamp is fenced by the lease (Task 8): a holder that lost
+    /// until it changes (§8.1). The stamp is fenced by the lease: a holder that lost
     /// it stops here, recording nothing.
     fn reject(&mut self, bytes: &[u8]) -> Result<(), Stop> {
         if let Some(fp) = self.access_fp(bytes) {

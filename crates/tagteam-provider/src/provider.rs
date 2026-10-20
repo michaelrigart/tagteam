@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn identity_debug_shows_no_email_label_or_name() {
-        // L370, §4.4: logs identify accounts by position and ID, never by email.
+        // §14.2, §4.4: logs identify accounts by position and ID, never by email.
         let id = Identity {
             label: "who@example.com".into(),
             email: Some("who@example.com".into()),

@@ -323,13 +323,13 @@ impl Engine {
         match p.refresh(&*self.http, &fresh, now, ACTIVE_REFRESH_TIMEOUT) {
             RefreshResult::Refreshed { successor, owner } => {
                 // §7.4: a successor the response says belongs to another account is marked
-                // first (Task 11's rule): it is displaced, never stored or published.
+                // first: it is displaced, never stored or published.
                 let foreign = owner.filter(|o| names_another_account(o, row));
                 // From here on the successor is never discarded (§7.3): `received` keeps it if
                 // anything below unwinds before it is stored.
                 let mut received = Received::new(self, p, row, sent_fp, successor, foreign);
                 if let Err(e) = hooks::point(self, "active-after-response") {
-                    // As the gate does (Task 11): keep it and return the error, or record the
+                    // As the gate does: keep it and return the error, or record the
                     // loss and report it, never the error.
                     return match self.abandon(row, sent_fp, &mut received, e) {
                         Abandoned::Kept(e) => Err(e),
@@ -337,7 +337,7 @@ impl Engine {
                     };
                 }
                 if received.is_foreign() {
-                    // Task 11's shared path: displaced and quarantined `identity_conflict`; a
+                    // The shared path: displaced and quarantined `identity_conflict`; a
                     // successor that could not even be displaced is reported first (§7.3 step 6).
                     return Ok(match self.displace_received(row, sent_fp, &mut received)? {
                         Displacement::Kept => {
@@ -347,7 +347,7 @@ impl Engine {
                     });
                 }
                 let owned = cred.check_owned().is_ok();
-                // Task 11's shared step: the vault, else `rescue/`, else reported as lost.
+                // The shared step: the vault, else `rescue/`, else reported as lost.
                 let persisted = self.persist_received(p, row, lock, &mut received);
                 // `persist_received` disarmed `received`. When neither store took the
                 // successor, the live write below is its last home, so the loss stays armed

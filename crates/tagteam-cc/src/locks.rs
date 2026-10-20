@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn a_held_refresh_lock_times_out_without_touching_it() {
-        // Review Focus 1 (M1): CC is mid-refresh.
+        // CC is mid-refresh.
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
         fs::create_dir(&p.refresh_lock).unwrap();
@@ -531,7 +531,7 @@ mod tests {
 
     #[test]
     fn a_token_set_while_cc_holds_the_refresh_lock_ends_the_wait() {
-        // Review Focus 1: CC is mid-refresh.
+        // CC is mid-refresh.
         let d = tempfile::tempdir().unwrap();
         let p = paths(d.path());
         fs::create_dir(&p.refresh_lock).unwrap();

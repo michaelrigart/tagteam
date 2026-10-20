@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn debug_of_a_parsed_unit_names_its_variables_and_never_their_values() {
-        // Review I2: a recorded proxy URL can carry a password.
+        // §14.2: a recorded proxy URL can carry a password.
         let env = vec![(
             "HTTPS_PROXY".to_owned(),
             "http://user:secret@proxy".to_owned(),
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn unit_files_carry_a_program_path_with_spaces_and_unicode() {
-        // Review Focus 3: the path a person's tools put tagteam at, which both units must
+        // The path a person's tools put tagteam at, which both units must
         // carry so the service starts that very file.
         let program =
             Path::new("/Users/Zoë Ångström/Library/Application Support/tagteam bin/tagteam");
@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn lingering_is_read_from_loginctl_and_says_why_it_cannot_be() {
-        // Review Focus 5: a `loginctl` that is missing, hangs, fails or answers nothing usable
+        // A `loginctl` that is missing, hangs, fails or answers nothing usable
         // leaves lingering unknown, with the reason, for doctor's warning.
         let d = tempfile::tempdir().unwrap();
         let env = with_managers(d.path(), &["loginctl"]);
