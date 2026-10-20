@@ -13,7 +13,7 @@ use tagteam_engine::service::recorded_vars;
 use tagteam_engine::session::detect_run_shell;
 use tagteam_engine::settings::{self, ColorMode, Settings};
 use tagteam_engine::vault::{FileVault, KeychainVault, Vault};
-use tagteam_engine::{Engine, EngineConfig};
+use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_provider::http::Http;
 use tagteam_provider::liveness::SystemProcessProbe;
 use tagteam_provider::process::SystemSpawner;
@@ -240,6 +240,45 @@ pub(crate) fn scrubbed_vars(registry: &ProviderRegistry) -> Vec<String> {
 /// captured at the process boundary (`Context::from_process`).
 pub(crate) fn locate(env: Env, registry: &ProviderRegistry) -> (RunShell, Env) {
     detect_run_shell(&env, registry)
+}
+
+/// What one lookup of the run shell found: the registry it went through, the run shell
+/// (never `RunShell::Unreadable`) and the effective environment.
+pub(crate) struct Located {
+    pub(crate) registry: ProviderRegistry,
+    pub(crate) run_shell: RunShell,
+    pub(crate) env: Env,
+}
+
+/// §12.8: the run shell is found through the registered providers, so the registry comes
+/// first. Under a marker that cannot be read the outer home is unknown, and nothing runs. The
+/// marker is read from disk on every call, so a command calls this once.
+pub(crate) fn locate_run_shell(ctx: &Context) -> Result<Located, EngineError> {
+    let registry = build_registry(ctx);
+    let (run_shell, env) = locate(ctx.env.clone(), &registry);
+    if let RunShell::Unreadable { marker, detail } = run_shell {
+        return Err(EngineError::RunShellUnreadable { marker, detail });
+    }
+    Ok(Located {
+        registry,
+        run_shell,
+        env,
+    })
+}
+
+/// The engine for one command and its settings warnings, after the one lookup of the run shell.
+pub(crate) fn engine_for(
+    ctx: Context,
+    provider: Option<&ProviderId>,
+) -> Result<(Engine, Vec<String>), EngineError> {
+    let located = locate_run_shell(&ctx)?;
+    Ok(build_engine(
+        ctx,
+        located.registry,
+        located.run_shell,
+        located.env,
+        provider,
+    ))
 }
 
 /// The settings one command runs with (§6.4), and the providers it was read for.
