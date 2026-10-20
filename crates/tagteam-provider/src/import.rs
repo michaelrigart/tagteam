@@ -42,6 +42,16 @@ impl fmt::Debug for ImportRecord {
     }
 }
 
+/// An export format of another tool, which a provider reads as its own accounts.
+pub struct ForeignFormat {
+    /// What the format is called; `Decoded.foreign` carries it.
+    pub name: &'static str,
+    /// Whether a parsed file is in this format.
+    pub detect: fn(&Value) -> bool,
+    /// The file's accounts, as records for this provider.
+    pub read: fn(&Value) -> Result<Vec<ImportRecord>, FormatError>,
+}
+
 /// What one account of a file failed, naming the field and the type it must have.
 pub fn field_error(account: usize, field: &str, must_be: &str) -> FormatError {
     FormatError(format!("account {account}: {field} must be {must_be}"))

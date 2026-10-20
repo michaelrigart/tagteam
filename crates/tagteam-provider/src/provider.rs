@@ -20,6 +20,7 @@ use crate::doctor::Check;
 use crate::env::Env;
 use crate::flock::MutationGuard;
 use crate::http::{Http, HttpError, HttpResponse};
+use crate::import::ForeignFormat;
 use crate::keychain::{KeychainError, LockState};
 use crate::mkdir_lock::LockError;
 use crate::process::ProcessSpawner;
@@ -819,6 +820,10 @@ pub trait Provider: Send + Sync {
     ) -> Result<(), ProviderError>;
     /// §13.5: whether `env` is a process this agent started (CC: `CLAUDECODE` or `CLAUDE_CONFIG_DIR`).
     fn invoked_by(&self, env: &Env) -> bool;
+    /// An export format of another tool that this provider can import.
+    fn foreign_export(&self) -> Option<&'static ForeignFormat> {
+        None
+    }
     /// Where and what to write so the agent shows tagteam's statusline; `None` if unsupported.
     fn statusline_setup(&self, _env: &Env, _command: &str) -> Option<(PathBuf, String)> {
         None

@@ -293,6 +293,10 @@ impl Engine {
         self.registry.all().iter().map(|p| p.id()).collect()
     }
 
+    pub fn registry(&self) -> &ProviderRegistry {
+        &self.registry
+    }
+
     /// `id` as a log line's field, only when this build registers it (§14.2): an ID read from a
     /// marker or a store column is otherwise any text, an email among it.
     pub(crate) fn registered_id<'a>(

@@ -14,8 +14,8 @@ use tagteam_provider::profile::refuse_linked_credential;
 use tagteam_provider::provider::{DeadReason, RefreshResult};
 use tagteam_provider::{
     BeforeFallback, Cancel, Capabilities, Check, CredLocks, Credential, DoomedEntry, Env,
-    FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LineError, LiveAuth,
-    LiveChange, LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare,
+    ForeignFormat, FreshCredential, Identity, IdentitySurface, Keychain, KindTraits, LineError,
+    LiveAuth, LiveChange, LiveLockSet, LiveLocks, LockError, LockState, MergeReport, MustShare,
     MutationGuard, Pace, PollBudget, Provider, ProviderError, ProviderVars, ProviderWords, Read,
     SessionEnv, SharePolicy, StoredLogin, Undo, UsageLine, UsageResult, ValidateRequest, Validity,
     Window, Written,
@@ -755,6 +755,10 @@ impl Provider for ClaudeCode {
 
     fn invoked_by(&self, env: &Env) -> bool {
         env.var("CLAUDECODE").is_some_and(|v| v == "1") || self.session_dir(env).is_some()
+    }
+
+    fn foreign_export(&self) -> Option<&'static ForeignFormat> {
+        Some(&crate::cswap::CSWAP)
     }
 
     fn statusline_setup(&self, env: &Env, command: &str) -> Option<(PathBuf, String)> {

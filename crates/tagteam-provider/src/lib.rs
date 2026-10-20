@@ -57,6 +57,7 @@ pub use flock::{FlockGuard, LockProbe, MutationGuard, holders_of, probe_lock};
 pub use http::{Http, HttpError, HttpRequest, HttpResponse, Method, NoHttp};
 #[cfg(any(test, feature = "test-doubles"))]
 pub use http::{RecordedRequest, ScriptedHttp};
+pub use import::ForeignFormat;
 pub use import::FormatError;
 pub use import::ImportRecord;
 #[cfg(any(test, feature = "test-doubles"))]
