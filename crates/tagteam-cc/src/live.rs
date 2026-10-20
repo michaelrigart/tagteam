@@ -949,6 +949,12 @@ impl LiveStore {
             )?;
         }
         let in_primary = |fence: Fence<'_>| {
+            if let Some(mode) = config::group_or_other_mode(&paths.global_config) {
+                tracing::warn!(
+                    mode = %format_args!("{mode:04o}"),
+                    "primaryApiKey is going into a Claude Code config file that other users can read; run `chmod 600 ~/.claude.json` (the file in CLAUDE_CONFIG_DIR if that is set) to close it"
+                );
+            }
             config::splice_key(
                 &paths.global_config,
                 "primaryApiKey",
