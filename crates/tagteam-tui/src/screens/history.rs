@@ -13,10 +13,7 @@ use tagteam_engine::words;
 
 use crate::msg::Cmd;
 use crate::state::{Screen, State};
-use crate::view::{
-    bold, fit, flow, furthest_scroll, pad, scrolled_windows, selected, severity_style, width_of,
-    wrap_rows,
-};
+use crate::view::{fit, flow, furthest_scroll, pad, scrolled_windows, width_of, wrap_rows};
 
 pub const NO_HISTORY: &str = "No usage history.";
 pub const NO_ACCOUNTS: &str = "No accounts yet.";
@@ -250,7 +247,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
 /// the shown account stays in view.
 fn account_list(state: &State, rows: usize) -> Vec<Line<'static>> {
     let w = usize::from(LIST_W);
-    let head = Line::from(Span::styled(" ACCOUNTS", bold()));
+    let head = Line::from(Span::styled(" ACCOUNTS", state.theme.strong()));
     let groups: Vec<_> = state
         .accounts
         .snapshot()
@@ -276,7 +273,7 @@ fn account_list(state: &State, rows: usize) -> Vec<Line<'static>> {
         if several {
             lines.push(Line::from(Span::styled(
                 format!(" {}", group.provider),
-                bold(),
+                state.theme.strong(),
             )));
         }
         for v in &group.accounts {
@@ -287,7 +284,7 @@ fn account_list(state: &State, rows: usize) -> Vec<Line<'static>> {
             ));
             if state.history.account.as_ref() == Some(&v.row.id) {
                 shown_at = lines.len();
-                lines.push(line.style(selected()));
+                lines.push(line.style(state.theme.selection()));
             } else {
                 lines.push(line);
             }
@@ -373,7 +370,7 @@ fn window_lines(
     let w = &hw.window;
     let since = state.history.since_s(now_s);
     let pct = w.pct.round() as i64;
-    let style = severity_style(state.color, words::severity(pct));
+    let style = state.theme.severity(words::severity(pct));
     let mut lines: Vec<Line<'static>> = Vec::new();
     let label = if width_of(&w.label) > label_w {
         let rows = wrap_rows(&w.label, width, LABEL_ROWS);
@@ -407,6 +404,7 @@ mod tests {
     use crate::msg::{Cmd, Msg};
     use crate::state::Screen;
     use crate::testutil::*;
+    use crate::theme::Theme;
     use crate::update::update;
 
     fn on_history(accounts: Vec<AccountView>) -> State {
@@ -839,7 +837,7 @@ mod tests {
     #[test]
     fn the_latest_pct_takes_its_severity() {
         let mut state = on_history(many(1));
-        state.color = true;
+        state.theme = Theme::new(true);
         state.history.select(id(1));
         state
             .history
@@ -847,7 +845,7 @@ mod tests {
         let buf = draw_buffer(&state, 80, 24, NOW_MS);
         let (x, y) = locate(&buf, "95%").unwrap();
         assert_eq!(buf[(x, y)].fg, Color::Red);
-        state.color = false;
+        state.theme = Theme::new(false);
         let buf = draw_buffer(&state, 80, 24, NOW_MS);
         assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
     }

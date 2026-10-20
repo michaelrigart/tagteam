@@ -18,7 +18,8 @@ use tagteam_engine::words::{self, Severity};
 
 use super::TokensState;
 use crate::state::State;
-use crate::view::{bold, fit, selected, severity_style, width_of, wrap};
+use crate::theme::Theme;
+use crate::view::{fit, width_of, wrap};
 
 /// From this width the table adds the cache, the response count and a cost bar (spec §5.3).
 pub const WIDE: usize = 120;
@@ -289,7 +290,7 @@ struct Table<'a> {
     level: usize,
     /// The largest row cost, for the bar.
     most: u64,
-    color: bool,
+    theme: Theme,
     now_ms: i64,
 }
 
@@ -303,7 +304,7 @@ impl<'a> Table<'a> {
         report: &'a TokenReport,
         widths: &'a Widths,
         width: usize,
-        color: bool,
+        theme: Theme,
         now_ms: i64,
     ) -> Table<'a> {
         let q = &report.query;
@@ -351,7 +352,7 @@ impl<'a> Table<'a> {
             lead,
             level: 0,
             most,
-            color,
+            theme,
             now_ms,
         };
         let split = [Col::CacheWrite5m, Col::CacheWrite1h];
@@ -514,7 +515,7 @@ impl<'a> Table<'a> {
     }
 
     fn counts_cell(&self, col: Col, c: &TokenCounts, unfinalized: u64, responses: u64) -> Cell {
-        let warning = severity_style(self.color, Severity::Warning);
+        let warning = self.theme.severity(Severity::Warning);
         match col {
             Col::Input => Cell::plain(words::scaled(c.input)),
             Col::Output if unfinalized > 0 => Cell {
@@ -534,7 +535,7 @@ impl<'a> Table<'a> {
 
     fn cost_cell(&self, cost: Option<&Cost>) -> Cell {
         let style = match cost {
-            Some(c) if c.partial => severity_style(self.color, Severity::Warning),
+            Some(c) if c.partial => self.theme.severity(Severity::Warning),
             _ => Style::new(),
         };
         Cell {
@@ -627,7 +628,7 @@ impl<'a> Table<'a> {
             .iter()
             .map(|(c, _)| Cell::plain(c.head(period)))
             .collect();
-        self.line(cells, false, false).style(bold())
+        self.line(cells, false, false).style(self.theme.strong())
     }
 
     fn row(&self, row: &TokenRow, blank: bool) -> Line<'static> {
@@ -642,7 +643,7 @@ impl<'a> Table<'a> {
 
     fn total(&self) -> Line<'static> {
         let cells = self.cols.iter().map(|(c, _)| self.total_cell(*c)).collect();
-        self.line(cells, false, false).style(bold())
+        self.line(cells, false, false).style(self.theme.strong())
     }
 }
 
@@ -887,7 +888,7 @@ fn header(state: &State, width: usize, now_ms: i64) -> Vec<Line<'static>> {
             tabs.push(Span::raw(" "));
         }
         if period == t.period {
-            tabs.push(Span::styled(format!("[{name}]"), bold()));
+            tabs.push(Span::styled(format!("[{name}]"), state.theme.strong()));
         } else {
             tabs.push(Span::raw(name));
         }
@@ -1052,7 +1053,12 @@ fn below_rows(lines: usize, header: usize, height: usize) -> usize {
 
 /// The lines that show of `lines` in `rows` rows from line `from` (clamped, R22), with a last row
 /// that says which when they do not all fit; and the furthest `from` goes.
-fn window(lines: Vec<Line<'static>>, from: usize, rows: usize) -> (Vec<Line<'static>>, usize) {
+fn window(
+    theme: Theme,
+    lines: Vec<Line<'static>>,
+    from: usize,
+    rows: usize,
+) -> (Vec<Line<'static>>, usize) {
     let total = lines.len();
     if total <= rows {
         return (lines, 0);
@@ -1063,7 +1069,7 @@ fn window(lines: Vec<Line<'static>>, from: usize, rows: usize) -> (Vec<Line<'sta
     let mut out: Vec<Line<'static>> = lines.into_iter().skip(from).take(shown).collect();
     if rows >= 2 {
         let hint = format!(" J K: lines {}–{} of {total}", from + 1, from + shown);
-        out.push(Line::from(Span::styled(hint, bold())));
+        out.push(Line::from(Span::styled(hint, theme.strong())));
     }
     (out, furthest)
 }
@@ -1083,7 +1089,7 @@ fn plan(state: &State, area: Rect, now_ms: i64) -> Plan {
     let header = header(state, width, now_ms);
     let lines = below(state, width, now_ms);
     let rows = below_rows(lines.len(), header.len(), height);
-    let (below, _) = window(lines, below_from(&state.tokens), rows);
+    let (below, _) = window(state.theme, lines, below_from(&state.tokens), rows);
     let table = height.saturating_sub(header.len() + 2 + below.len());
     Plan {
         header,
@@ -1099,7 +1105,7 @@ pub(super) fn scroll_below(state: &mut State, area: Rect, now_ms: i64, by: isize
     let lines = below(state, width, now_ms);
     let rows = below_rows(lines.len(), header, usize::from(area.height));
     let from = below_from(&state.tokens);
-    let (_, furthest) = window(lines, from, rows);
+    let (_, furthest) = window(state.theme, lines, from, rows);
     let from = from.min(furthest) as isize;
     let t = &mut state.tokens;
     t.below_from = (from + by).clamp(0, furthest as isize) as usize;
@@ -1125,11 +1131,11 @@ pub(super) fn follow(state: &mut State, area: Rect, now_ms: i64) {
 }
 
 /// The selected row in reverse video across the whole width.
-fn highlight(row: Line<'static>, width: usize) -> Line<'static> {
+fn highlight(theme: Theme, row: Line<'static>, width: usize) -> Line<'static> {
     let used: usize = row.spans.iter().map(|s| width_of(&s.content)).sum();
     let mut spans = row.spans;
     spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    Line::from(spans).style(selected())
+    Line::from(spans).style(theme.selection())
 }
 
 /// What explains an empty report (TR §11.3): the lines and the files the index could not read,
@@ -1175,7 +1181,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
         frame.render_widget(Paragraph::new(lines), area);
         return;
     }
-    let table = Table::new(report, &t.level().widths, width, state.color, now_ms);
+    let table = Table::new(report, &t.level().widths, width, state.theme, now_ms);
     lines.push(table.header());
     let (items, starts) = items(report, width, now_ms);
     let selected_at = t.selected_index();
@@ -1191,7 +1197,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             Item::Row { repeat } => {
                 let row = table.row(&report.rows[index], repeat && n > 0);
                 if Some(index) == selected_at {
-                    highlight(row, width)
+                    highlight(state.theme, row, width)
                 } else {
                     row
                 }
@@ -1214,6 +1220,7 @@ mod tests {
     use crate::msg::{Cmd, Msg};
     use crate::state::Screen;
     use crate::testutil::*;
+    use crate::theme::Theme;
     use crate::update::update;
 
     /// 2026-09-20T00:00:00Z, the day before `NOW_MS`'s.
@@ -1550,7 +1557,7 @@ mod tests {
         });
         for color in [true, false] {
             let mut state = showing(rows.clone(), |_| {});
-            state.color = color;
+            state.theme = Theme::new(color);
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
             let lines = text_of(&buf);
             assert_eq!(

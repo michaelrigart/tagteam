@@ -15,11 +15,9 @@ use crate::host::AccountRef;
 use crate::msg::Cmd;
 use crate::source::AccountsSnapshot;
 use crate::state::{Screen, State};
+use crate::theme::Theme;
 use crate::update;
-use crate::view::{
-    bold, fit, flow, furthest_scroll, pad, scrolled_windows, selected, severity_style, width_of,
-    wrap_rows,
-};
+use crate::view::{fit, flow, furthest_scroll, pad, scrolled_windows, width_of, wrap_rows};
 
 /// Spec §10.4's empty state: no store, or no accounts.
 pub const NO_ACCOUNTS: &str = "No accounts yet. Log in with claude, then press A to add the login.";
@@ -345,7 +343,7 @@ impl<'a> Table<'a> {
         width: usize,
         read_at_s: i64,
         now_s: i64,
-        color: bool,
+        theme: Theme,
     ) -> Self {
         let cols = words::window_columns(accounts);
         let sessions = accounts.iter().any(|v| v.in_session);
@@ -366,7 +364,7 @@ impl<'a> Table<'a> {
             .map(|(i, head)| {
                 accounts
                     .iter()
-                    .filter_map(|v| table.cells(v, now_s, color))
+                    .filter_map(|v| table.cells(v, now_s, theme))
                     .map(|cells| cells[i].width())
                     .fold(*head, usize::max)
             })
@@ -381,7 +379,7 @@ impl<'a> Table<'a> {
         // fit beside the gauges: they say more than a gauge does.
         let notes_w = accounts
             .iter()
-            .filter(|v| table.cells(v, now_s, color).is_some())
+            .filter(|v| table.cells(v, now_s, theme).is_some())
             .map(|v| {
                 words::row_notes(v, this == Some(&v.row.id), now_s)
                     .iter()
@@ -439,18 +437,18 @@ impl<'a> Table<'a> {
             .collect()
     }
 
-    fn header(&self) -> Line<'static> {
+    fn header(&self, theme: Theme) -> Line<'static> {
         let gap = if self.sessions { "    " } else { "  " };
         let mut text = format!("    #{gap}{}", pad("ACCOUNT", self.account_w));
         for (head, w) in self.heads().iter().zip(&self.widths) {
             text.push_str("  ");
             text.push_str(&pad(head, *w));
         }
-        Line::from(Span::styled(text.trim_end().to_owned(), bold()))
+        Line::from(Span::styled(text.trim_end().to_owned(), theme.strong()))
     }
 
     /// A row's window cells and AGE, when it has a reading with windows.
-    fn cells(&self, v: &AccountView, now_s: i64, color: bool) -> Option<Vec<Cell>> {
+    fn cells(&self, v: &AccountView, now_s: i64, theme: Theme) -> Option<Vec<Cell>> {
         let ws = v.usage.windows.as_deref().filter(|ws| !ws.is_empty())?;
         let mut cells: Vec<Cell> = self
             .cols
@@ -460,7 +458,7 @@ impl<'a> Table<'a> {
                     .iter()
                     .find(|(w, _)| c.key.as_deref() == Some(w.key.as_str()))
                 {
-                    Some((w, p)) => self.window_cell(w, p, now_s, color),
+                    Some((w, p)) => self.window_cell(w, p, now_s, theme),
                     None => self.missing(c),
                 }
             })
@@ -473,8 +471,8 @@ impl<'a> Table<'a> {
     }
 
     /// `list`'s cell (`  9%  2h40m  ▲ pace`, or the spend amounts), after a gauge.
-    fn window_cell(&self, w: &Window, p: &Pace, now_s: i64, color: bool) -> Cell {
-        let style = severity_style(color, words::severity(w.pct.round() as i64));
+    fn window_cell(&self, w: &Window, p: &Pace, now_s: i64, theme: Theme) -> Cell {
+        let style = theme.severity(words::severity(w.pct.round() as i64));
         let mut cell = Cell { spans: vec![] };
         match words::spend_text(w) {
             Some(spend) => cell.push(spend, style),
@@ -509,7 +507,7 @@ impl<'a> Table<'a> {
         }
     }
 
-    fn row(&self, v: &AccountView, now_s: i64, color: bool) -> Line<'static> {
+    fn row(&self, v: &AccountView, now_s: i64, theme: Theme) -> Line<'static> {
         let session = match (self.sessions, v.in_session) {
             (false, _) => String::new(),
             (true, true) => format!(" {}", words::IN_SESSION),
@@ -518,11 +516,11 @@ impl<'a> Table<'a> {
         let marker = if v.active { "*" } else { " " };
         let mut spans = vec![
             Span::raw(" "),
-            Span::styled(marker, bold()),
+            Span::styled(marker, theme.strong()),
             Span::raw(format!(" {:>2}{session}  ", v.row.position)),
             Span::raw(pad(&words::account_cell(&v.row), self.account_w)),
         ];
-        if let Some(cells) = self.cells(v, now_s, color) {
+        if let Some(cells) = self.cells(v, now_s, theme) {
             for (cell, w) in cells.into_iter().zip(&self.widths) {
                 let fill = w.saturating_sub(cell.width());
                 spans.push(Span::raw("  "));
@@ -572,26 +570,28 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
                 width,
                 snap.read_at_s,
                 now_s,
-                state.color,
+                state.theme,
             )
         })
         .collect();
     let lines = layout(st);
     let mut shown: Vec<Line<'static>> = Vec::new();
     if tables.len() == 1 {
-        shown.push(tables[0].header());
+        shown.push(tables[0].header(state.theme));
     }
     let rows = visible_rows(st, area, now_s);
     let at = line_of(st);
     let offset = keep_visible(st.offset, at, rows, lines.len());
     for line in lines.iter().skip(offset).take(rows) {
         shown.push(match line {
-            TableLine::Provider(p) => Line::from(Span::styled(format!(" {p}"), bold())),
-            TableLine::Header(i) => tables[*i].header(),
+            TableLine::Provider(p) => {
+                Line::from(Span::styled(format!(" {p}"), state.theme.strong()))
+            }
+            TableLine::Header(i) => tables[*i].header(state.theme),
             TableLine::Account(i, v) => {
-                let row = tables[*i].row(v, now_s, state.color);
+                let row = tables[*i].row(v, now_s, state.theme);
                 if st.selected.as_ref() == Some(&v.row.id) {
-                    highlight(row, width)
+                    highlight(state.theme, row, width)
                 } else {
                     row
                 }
@@ -605,18 +605,18 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             rows: window_rows(st, v, area, now_s),
         };
         frame.render_widget(
-            Paragraph::new(detail(v, snap, shown, width, now_s, state.color)),
+            Paragraph::new(detail(v, snap, shown, width, now_s, state.theme)),
             pane,
         );
     }
 }
 
 /// The selected row in reverse video across the whole width.
-fn highlight(row: Line<'static>, width: usize) -> Line<'static> {
+fn highlight(theme: Theme, row: Line<'static>, width: usize) -> Line<'static> {
     let used: usize = row.spans.iter().map(|s| width_of(&s.content)).sum();
     let mut spans = row.spans;
     spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    Line::from(spans).style(selected())
+    Line::from(spans).style(theme.selection())
 }
 
 /// Where the detail pane's windows are scrolled to (`from`, a window), and how many lines they
@@ -634,7 +634,7 @@ fn window_blocks(
     v: &AccountView,
     width: usize,
     now_s: i64,
-    color: bool,
+    theme: Theme,
 ) -> Vec<Vec<Line<'static>>> {
     let windows = windows_of(v);
     let label_w = windows
@@ -645,13 +645,13 @@ fn window_blocks(
         .min(width / 3);
     windows
         .iter()
-        .map(|(w, p)| window_lines(w, p, label_w, width, now_s, color))
+        .map(|(w, p)| window_lines(w, p, label_w, width, now_s, theme))
         .collect()
 }
 
 /// How many lines each of `v`'s windows takes in the detail pane at `width`.
 fn window_heights(v: &AccountView, width: usize, now_s: i64) -> Vec<usize> {
-    window_blocks(v, width, now_s, false)
+    window_blocks(v, width, now_s, Theme::new(false))
         .iter()
         .map(Vec::len)
         .collect()
@@ -663,9 +663,9 @@ fn window_lines(
     label_w: usize,
     width: usize,
     now_s: i64,
-    color: bool,
+    theme: Theme,
 ) -> Vec<Line<'static>> {
-    let style = severity_style(color, words::severity(w.pct.round() as i64));
+    let style = theme.severity(words::severity(w.pct.round() as i64));
     let value = words::spend_text(w)
         .unwrap_or_else(|| format!("{:>4}", format!("{}%", w.pct.round() as i64)));
     // A label wider than the column takes rows of its own, above its value: `LABEL_ROWS` at
@@ -720,7 +720,7 @@ fn detail(
     shown: Shown,
     width: usize,
     now_s: i64,
-    color: bool,
+    theme: Theme,
 ) -> Vec<Line<'static>> {
     let row = &v.row;
     let mut facts = vec![
@@ -738,7 +738,7 @@ fn detail(
     if row.disabled {
         facts.push("disabled".into());
     }
-    let blocks = window_blocks(v, width, now_s, color);
+    let blocks = window_blocks(v, width, now_s, theme);
     let heights: Vec<usize> = blocks.iter().map(Vec::len).collect();
     let range = scrolled_windows(&heights, shown.from, shown.rows);
     let more = if range != (0..blocks.len()) {
@@ -759,7 +759,7 @@ fn detail(
     let rule = "─".repeat(width.saturating_sub(width_of(&title) + width_of(&more)));
     let mut lines = vec![Line::from(Span::styled(
         format!("{title}{rule}{more}"),
-        bold(),
+        theme.strong(),
     ))];
     for block in blocks.into_iter().take(range.end).skip(range.start) {
         lines.extend(block);
@@ -807,6 +807,7 @@ mod tests {
     use super::*;
     use crate::msg::Msg;
     use crate::testutil::*;
+    use crate::theme::Theme;
     use crate::update::update;
 
     /// §13.1's fixture: an active account ahead of pace, a stale spare, a quarantined alias.
@@ -1249,7 +1250,7 @@ mod tests {
             will_last_to_reset: Some(false),
         };
         for width in [80, 120] {
-            let lines = window_lines(&w, &p, width / 3, width, NOW_S, false);
+            let lines = window_lines(&w, &p, width / 3, width, NOW_S, Theme::new(false));
             assert!(lines.len() <= 7, "{width}: {} rows", lines.len());
             for line in &lines {
                 let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -1444,7 +1445,7 @@ mod tests {
         let hot = account(1, "a@x.co", read(60, 95.0, 77.0, false));
         for color in [true, false] {
             let mut state = loaded(vec![hot.clone()]);
-            state.color = color;
+            state.theme = Theme::new(color);
             let buf = draw_buffer(&state, 120, 40, NOW_MS);
             let (x, y) = locate(&buf, "95%").unwrap();
             let (gx, gy) = locate(&buf, "██████").unwrap();

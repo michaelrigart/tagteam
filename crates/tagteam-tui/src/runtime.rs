@@ -24,6 +24,7 @@ use crate::screens::tokens::TokensState;
 use crate::source::{Source, SourceFactory};
 use crate::state::{Screen, State};
 use crate::term::{self, RealTty, Tty};
+use crate::theme::Theme;
 use crate::update::{drawn, update};
 use crate::view::view;
 
@@ -493,7 +494,13 @@ impl<'a, T: Tty, P: Pause> Ui<'a, T, P> {
     ) -> Self {
         let tokens = TokensState::new(opts.tokens_provider.clone(), opts.tz.clone());
         let now = now_ms();
-        let mut state = State::new(opts.screen, opts.color, opts.provider.clone(), tokens, now);
+        let mut state = State::new(
+            opts.screen,
+            Theme::new(opts.color),
+            opts.provider.clone(),
+            tokens,
+            now,
+        );
         if opts.daemon.is_some() {
             // C-R20: the first collection waits to know who collects.
             state.daemon.await_daemon(now);

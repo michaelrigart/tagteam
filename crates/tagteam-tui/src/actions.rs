@@ -16,7 +16,7 @@ use crate::msg::{Answer, Cmd, Prompt, PromptKind};
 use crate::screens;
 use crate::screens::tokens::filter::{self, FilterDialog};
 use crate::state::{Screen, State};
-use crate::view::{bold, centered, pad, scrolled_windows, selected, width_of, wrap, wrap_rows};
+use crate::view::{centered, pad, scrolled_windows, width_of, wrap, wrap_rows};
 
 #[derive(Debug)]
 pub enum Overlay {
@@ -644,14 +644,14 @@ pub fn render_overlay(state: &State, frame: &mut Frame, now_ms: i64) {
                 Screen::Tokens => &HELP_TOKENS,
                 Screen::History => &HELP_HISTORY,
             };
-            let mut lines = vec![Line::from(Span::styled("Everywhere", bold()))];
+            let mut lines = vec![Line::from(Span::styled("Everywhere", state.theme.strong()))];
             lines.extend(HELP_GLOBAL.iter().map(|(k, what)| help_line(k, what)));
             let title = match state.screen {
                 Screen::Accounts => "Accounts",
                 Screen::Tokens => "Tokens",
                 Screen::History => "History",
             };
-            lines.push(Line::from(Span::styled(title, bold())));
+            lines.push(Line::from(Span::styled(title, state.theme.strong())));
             lines.extend(keys.iter().map(|(k, what)| help_line(k, what)));
             boxed(frame, area, " Help ", lines, 64);
         }
@@ -668,7 +668,7 @@ pub fn render_overlay(state: &State, frame: &mut Frame, now_ms: i64) {
             let button = |label: &str, on: bool| {
                 let text = format!("[ {label} ]");
                 if on {
-                    Span::styled(text, selected())
+                    Span::styled(text, state.theme.selection())
                 } else {
                     Span::raw(text)
                 }
@@ -718,7 +718,7 @@ pub fn render_overlay(state: &State, frame: &mut Frame, now_ms: i64) {
                 for row in block {
                     let line = Line::from(row);
                     lines.push(if i == *at {
-                        line.style(selected())
+                        line.style(state.theme.selection())
                     } else {
                         line
                     });
@@ -737,7 +737,7 @@ pub fn render_overlay(state: &State, frame: &mut Frame, now_ms: i64) {
             let shown = tail(input, inner.saturating_sub(1));
             lines.push(Line::from(vec![
                 Span::raw(shown),
-                Span::styled(" ", selected()),
+                Span::styled(" ", state.theme.selection()),
             ]));
             lines.push(Line::from("Enter · Esc cancel"));
             boxed(frame, area, " Input ", lines, w);

@@ -9,6 +9,7 @@ use crate::msg::Cmd;
 use crate::screens::accounts::AccountsState;
 use crate::screens::history::HistoryState;
 use crate::screens::tokens::TokensState;
+use crate::theme::Theme;
 
 /// Timer mode re-reads and collects this often (spec §6.2).
 pub const REFRESH_MS: i64 = 30_000;
@@ -45,7 +46,7 @@ impl Screen {
 pub struct State {
     pub screen: Screen,
     pub size: (u16, u16),
-    pub color: bool,
+    pub theme: Theme,
     pub provider: Option<ProviderId>,
     pub accounts: AccountsState,
     pub tokens: TokensState,
@@ -104,7 +105,7 @@ pub struct Refresh {
 impl State {
     pub fn new(
         screen: Screen,
-        color: bool,
+        theme: Theme,
         provider: Option<ProviderId>,
         tokens: TokensState,
         now_ms: i64,
@@ -112,7 +113,7 @@ impl State {
         State {
             screen,
             size: (0, 0),
-            color,
+            theme,
             provider,
             accounts: AccountsState::default(),
             tokens,

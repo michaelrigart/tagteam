@@ -28,6 +28,7 @@ use crate::msg::{Cmd, Msg};
 use crate::screens::tokens::TokensState;
 use crate::source::AccountsSnapshot;
 use crate::state::{Screen, State};
+use crate::theme::Theme;
 
 /// Any fixed instant: every reading, reset and sample below is placed relative to it.
 pub(crate) const NOW_S: i64 = 1_790_000_000;
@@ -174,7 +175,7 @@ pub(crate) fn many(n: u32) -> Vec<AccountView> {
 /// Code in UTC.
 pub(crate) fn fresh(screen: Screen) -> State {
     let tokens = TokensState::new(cc(), TimeZone::UTC);
-    let mut state = State::new(screen, false, None, tokens, NOW_MS);
+    let mut state = State::new(screen, Theme::new(false), None, tokens, NOW_MS);
     state.size = (80, 24);
     state
 }
