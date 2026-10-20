@@ -142,7 +142,7 @@ pub struct SwitchOutcome {
     /// A.7), so the human output says to restart it.
     pub managed_key_replaced: bool,
     /// What the provider says activates this switch (its `ProviderWords`), chosen from the kinds
-    /// on either side and where the secret went; `None` when nothing was switched.
+    /// on either side and where the secret went; `None` for a no-op.
     pub activation_hint: Option<&'static str>,
 }
 

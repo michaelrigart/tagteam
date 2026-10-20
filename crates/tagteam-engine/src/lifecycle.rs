@@ -802,7 +802,7 @@ impl Engine {
                 if let Err(e) = self.vault.store(lock_for(&prep.id), secret, p) {
                     // The write may have landed and failed only its read-back. A new account
                     // has no earlier generation to keep, so whatever it left goes with the row:
-                    // no secret outlives its account (§5). A failure is logged by a fixed
+                    // no secret outlives its account (§13.6). A failure is logged by a fixed
                     // phrase (§14.2): a vault error carries the Keychain's message or a path.
                     if self.vault.delete(lock_for(&prep.id)).is_err() {
                         tracing::error!(

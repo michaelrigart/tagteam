@@ -228,7 +228,8 @@ fn only_the_composition_root_names_tagteam_cc_in_the_binary() {
         }
         let text = fs::read_to_string(&file).unwrap();
         for (line, body) in production(&text) {
-            if !(body.contains("tagteam_cc") || body.contains("ClaudeCode")) {
+            let lower = body.to_lowercase();
+            if !LEAKS.iter().any(|w| lower.contains(w)) {
                 continue;
             }
             if BINARY_ALLOWED
@@ -242,7 +243,7 @@ fn only_the_composition_root_names_tagteam_cc_in_the_binary() {
     }
     assert!(
         hits.is_empty(),
-        "only {COMPOSITION_ROOT} may name tagteam-cc:\n{}",
+        "only {COMPOSITION_ROOT} may name tagteam-cc or Claude Code:\n{}",
         hits.join("\n")
     );
     let root_text = fs::read_to_string(root.join(COMPOSITION_ROOT)).unwrap();

@@ -1918,7 +1918,7 @@ impl App<'_, '_> {
     /// (D4.1 step 3, Decision 14). It exits 0 once a signal stops it, and 75 once a newer
     /// tagteam must take over (D4.5).
     fn daemon(&mut self) -> Result<i32, Failure> {
-        // Decision 7: a test-support build's hooks; a release build ignores them.
+        // A test-support build's hooks; a release build ignores them.
         let hook = |k: &str| std::env::var_os(k);
         // D4.5, Decision 17: before anything that can wait (the unlock offer, the
         // `daemon.lock` wait), so a binary replaced meanwhile is an upgrade at the upgrade
@@ -2583,6 +2583,25 @@ mod tests {
             no_live_login("claude"),
             "there is no live login; name an account, or log in with `claude` first"
         );
+    }
+
+    #[test]
+    fn the_fallback_provider_is_the_registrys_first() {
+        use tagteam_fake::{FAKE_AGENT, FakeAgent};
+        let cc = || {
+            Arc::new(ClaudeCode::new(
+                Arc::new(FakeKeychain::default()),
+                Platform::MacOs,
+            ))
+        };
+        let fake_first = ProviderRegistry::new()
+            .with(Arc::new(FakeAgent::new()))
+            .with(cc());
+        assert_eq!(fallback_provider(&fake_first).as_str(), FAKE_AGENT);
+        let cc_first = ProviderRegistry::new()
+            .with(cc())
+            .with(Arc::new(FakeAgent::new()));
+        assert_eq!(fallback_provider(&cc_first).as_str(), CLAUDE_CODE);
     }
 
     /// An environment that sets every test override.
