@@ -1,9 +1,7 @@
-use tagteam_core::{
-    AccountId, OutgoingAction, OutgoingClass, OutgoingFacts, ProviderId, decide_outgoing,
-};
+use tagteam_core::{AccountId, OutgoingAction, OutgoingClass, OutgoingFacts, decide_outgoing};
 use tagteam_provider::{
-    BeforeFallback, Identity, LiveAuth, LiveChange, LiveLocks, ProcessStamp, Provider,
-    ProviderError, Read, ReadError, SecretStore, StoredLogin,
+    BeforeFallback, Identity, LiveAuth, LiveChange, LiveLocks, ProcessStamp, Provider, Read,
+    ReadError, SecretStore, StoredLogin,
 };
 
 use crate::account_lock::AccountLock;
@@ -18,7 +16,7 @@ use crate::store::{AccountRow, AutoRecord, CREDENTIALS_REPLACED, EventRow, Journ
 use super::plan::Plan;
 use super::rollback::Rollback;
 use super::support::{
-    Axis, Held, OracleHint, answer_for, attributed, needs_relogin, profile_conflict,
+    Axis, OracleHint, Settle, answer_for, attributed, needs_relogin, profile_conflict,
     refuse_unreadable, refuse_unsafe_live_reads, same_generation, session_owned, unless_forced,
     works_until_expiry,
 };
@@ -265,7 +263,12 @@ impl Engine {
             None => Axis::Entry.live_secret(&live),
         };
         // What steps 2 and 4 settle, and the vaults below: step 7's rule never saves it again.
-        let mut held = Held::default();
+        let mut cx = Settle {
+            force: req.force,
+            live_identity: live_identity.as_ref(),
+            own_secret: own_secret.as_deref(),
+            ..Settle::new(p, provider, warnings)
+        };
         let target_secret = match outgoing.as_ref().filter(|_| !req.force) {
             // Step 2, the direct branch: displace whatever is live on either axis unless it is
             // identical to the target in vault form (H5.3).
@@ -281,37 +284,27 @@ impl Engine {
                         .live_secret(&live)
                         .filter(|b| *p.vault_form(b) != *p.vault_form(&secret))
                     {
-                        let identity =
-                            attributed(live_identity.as_ref(), own_secret.as_deref(), &bytes);
-                        let saved = self.displace_live(
-                            p,
-                            provider,
-                            &bytes,
-                            reason,
-                            identity,
-                            &mut warnings,
-                        );
-                        held.hold(p, &bytes);
-                        unless_forced(saved, req.force, &mut warnings)?;
+                        let identity = attributed(cx.live_identity, cx.own_secret, &bytes);
+                        let saved = cx.displace_live(self, &bytes, reason, identity);
+                        cx.held.hold(p, &bytes);
+                        unless_forced(saved, req.force, &mut cx.warnings)?;
                     }
                 }
                 secret
             }
             Some(out) => {
                 self.settle_outgoing(
-                    p,
+                    &mut cx,
                     store,
                     out,
                     &live,
                     plan.hint.as_ref(),
                     account_locks,
-                    live_identity.as_ref(),
                     req.source,
-                    &mut warnings,
                 )?;
                 // Step 4 settled the outgoing generation: kept, captured or displaced.
                 if let Some(bytes) = Axis::of(p, &out.kind).live_secret(&live) {
-                    held.hold(p, &bytes);
+                    cx.held.hold(p, &bytes);
                 }
                 // Read only now: settling a self-switch may have captured a newer live
                 // generation into this very account, and that is the one to activate.
@@ -322,20 +315,11 @@ impl Engine {
         // either account, or steps 2 and 4, already hold its generation. A Keychain-refusal
         // fallback reports what it deletes to `before_fallback` too, which finds it held.
         for id in outgoing.iter().map(|o| &o.id).chain([&target.id]) {
-            self.hold_vault(p, &mut held, id);
+            cx.hold_vault(self, id);
         }
         for entry in &doomed {
             if let Read::Present(bytes) = &entry.bytes {
-                self.save_unheld(
-                    p,
-                    provider,
-                    bytes,
-                    &mut held,
-                    req.force,
-                    live_identity.as_ref(),
-                    own_secret.as_deref(),
-                    &mut warnings,
-                )?;
+                cx.save_unheld(self, bytes)?;
             }
         }
 
@@ -389,23 +373,7 @@ impl Engine {
             in_flight: false,
             armed: true,
         };
-        let mut before_fallback = |bytes: &[u8]| {
-            self.save_unheld(
-                p,
-                provider,
-                bytes,
-                &mut held,
-                req.force,
-                live_identity.as_ref(),
-                own_secret.as_deref(),
-                &mut warnings,
-            )
-            .map_err(|e| {
-                ProviderError::Invalid(format!(
-                    "could not save a credential the Keychain fallback would delete: {e}"
-                ))
-            })
-        };
+        let mut before_fallback = |bytes: &[u8]| cx.before_fallback(self, bytes);
         let stored_in = match self.apply(
             p,
             &target,
@@ -448,7 +416,7 @@ impl Engine {
             strategy: plan.strategy,
             reason,
             message,
-            warnings,
+            warnings: cx.warnings,
             stored_in: Some(stored_in),
             unmanaged_email: None,
             managed_key_replaced,
@@ -462,16 +430,15 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn settle_outgoing(
         &self,
-        p: &dyn Provider,
+        cx: &mut Settle<'_>,
         store: &Store,
         out: &AccountRow,
         live: &LiveAuth,
         hint: Option<&OracleHint>,
         account_locks: &[AccountLock],
-        live_identity: Option<&Identity>,
         source: &str,
-        warnings: &mut Vec<String>,
     ) -> Result<(), EngineError> {
+        let p = cx.p;
         let Some(bytes) = Axis::of(p, &out.kind).live_secret(live) else {
             return Ok(());
         };
@@ -541,7 +508,7 @@ impl Engine {
                 }
             }
             OutgoingAction::Displace => {
-                let identity = resolved.or(live_identity).map(|i| &i.raw);
+                let identity = resolved.or(cx.live_identity).map(|i| &i.raw);
                 let id = displace(
                     self,
                     &out.provider,
@@ -550,7 +517,7 @@ impl Engine {
                     "displaced-live-login",
                     identity,
                 )?;
-                warnings.push(if class == OutgoingClass::Foreign {
+                cx.warnings.push(if class == OutgoingClass::Foreign {
                     format!(
                         "the live credential did not belong to position {}; it was saved as displaced/{id}.json",
                         out.position
@@ -569,81 +536,6 @@ impl Engine {
             }
         }
         Ok(())
-    }
-
-    /// Saves a live secret the switch is about to overwrite or clear (§6.3, B.5), unless it
-    /// carries nothing account-scoped: an entry holding only machine-shared keys loses nothing,
-    /// since those are carried over. The error is the failed save; whether it aborts is the
-    /// caller's call (B.5: it does, except under --force).
-    fn displace_live(
-        &self,
-        p: &dyn Provider,
-        provider: &ProviderId,
-        bytes: &[u8],
-        reason: &str,
-        live_identity: Option<&Identity>,
-        warnings: &mut Vec<String>,
-    ) -> Result<(), EngineError> {
-        let Some(fp) = p.fingerprint(bytes) else {
-            return Ok(());
-        };
-        let id = displace(
-            self,
-            provider,
-            bytes,
-            Some(&fp),
-            reason,
-            live_identity.map(|i| &i.raw),
-        )?;
-        warnings.push(format!(
-            "the previous live credential was saved as displaced/{id}.json"
-        ));
-        Ok(())
-    }
-
-    /// Records the generations `id`'s vault holds, current and `.prev`. One that cannot be read
-    /// is left out, so what it may hold is saved rather than assumed kept.
-    pub(crate) fn hold_vault(&self, p: &dyn Provider, held: &mut Held, id: &AccountId) {
-        for bytes in [self.vault.read(id), self.vault.read_prev(id)]
-            .into_iter()
-            .filter_map(Read::present)
-        {
-            held.hold(p, &bytes);
-        }
-    }
-
-    /// §9.4 step 7: saves `bytes`, a live entry a change is about to overwrite or delete, unless
-    /// it holds nothing account-scoped or a generation `held` already keeps. Either way the
-    /// generation is held from then on, so no entry of it is saved twice. A failed save aborts,
-    /// except under `force` (B.5). The row names `live_identity` only when `bytes` is
-    /// `own_secret`, the live login's own (§6.3, Decision 13). A secret on the other auth axis
-    /// gets no identity.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn save_unheld(
-        &self,
-        p: &dyn Provider,
-        provider: &ProviderId,
-        bytes: &[u8],
-        held: &mut Held,
-        force: bool,
-        live_identity: Option<&Identity>,
-        own_secret: Option<&[u8]>,
-        warnings: &mut Vec<String>,
-    ) -> Result<(), EngineError> {
-        match p.fingerprint(bytes) {
-            Some(fp) if held.insert(fp.as_str()) => {
-                let saved = self.displace_live(
-                    p,
-                    provider,
-                    bytes,
-                    "displaced-live-login",
-                    attributed(live_identity, own_secret, bytes),
-                    warnings,
-                );
-                unless_forced(saved, force, warnings)
-            }
-            _ => Ok(()),
-        }
     }
 
     /// Steps 7–9, keeping an undo for each write.

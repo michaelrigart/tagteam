@@ -12,8 +12,19 @@ use crate::hooks;
 use crate::oracle::verdict;
 use crate::store::{AccountRow, EventRow, JournalRow, Store};
 use crate::switch::{
-    Axis, Held, OracleHint, answer_for, refuse_unreadable, refuse_unsafe_live_reads,
+    Axis, OracleHint, Settle, answer_for, refuse_unreadable, refuse_unsafe_live_reads,
 };
+
+/// What a recovery holds while it finishes one interrupted switch: the row, the account locks
+/// of both accounts it names, CC's live locks, the live read under them, and the pre-lock
+/// oracle hints.
+struct Recovery<'a, 'g> {
+    row: &'a JournalRow,
+    accounts: &'a [AccountLock],
+    locks: &'a LiveLocks<'g>,
+    live: &'a LiveAuth,
+    hints: &'a [OracleHint],
+}
 
 /// Which way an interrupted switch went, as the live credential decides it (§9.6), with the
 /// fingerprint of the generation established as the chosen account's.
@@ -162,7 +173,14 @@ impl Engine {
         );
         let activated = match direction {
             Direction::Forward(fp) => {
-                self.finish_forward(p, &store, row, &accounts, &locks, &live, hints, &fp, source)?
+                let rec = Recovery {
+                    row,
+                    accounts: &accounts,
+                    locks: &locks,
+                    live: &live,
+                    hints,
+                };
+                self.finish_forward(p, &store, &rec, &fp, source)?
             }
             Direction::Backward(fp) => {
                 self.finish_backward(p, &store, row, &locks, &live, &fp)?;
@@ -236,19 +254,21 @@ impl Engine {
     /// The switch landed: clear the other auth axis (§9.4 step 7, saving first whatever the
     /// clear destroys that no vault holds), splice the target's `oauthAccount`, and commit
     /// (step 9).
-    #[allow(clippy::too_many_arguments)]
     fn finish_forward(
         &self,
         p: &dyn Provider,
         store: &Store,
-        row: &JournalRow,
-        accounts: &[AccountLock],
-        locks: &LiveLocks<'_>,
-        live: &LiveAuth,
-        hints: &[OracleHint],
+        rec: &Recovery<'_, '_>,
         established: &str,
         source: &'static str,
     ) -> Result<Option<Identity>, EngineError> {
+        let Recovery {
+            row,
+            accounts: _,
+            locks,
+            live,
+            hints: _,
+        } = *rec;
         let to = store
             .account(&row.to_id)?
             .ok_or_else(|| EngineError::NoSuchAccount(row.to_id.to_string()))?;
@@ -262,7 +282,6 @@ impl Engine {
             return Ok(None);
         };
         let identity = p.parse_identity(&to.identity_json)?;
-        let mut warnings = Vec::new();
         // §9.4 step 7's rule, before the other axis is cleared: every entry the clear destroys
         // is kept first, unless its generation is held already. Held are the target's live
         // generation, the vaults of both accounts the row names, and the outgoing generation
@@ -271,13 +290,13 @@ impl Engine {
         // it to the outgoing account, and saved to `displaced/` otherwise.
         let doomed = p.doomed(&self.env, locks, LiveChange::ClearOther(&to.kind));
         refuse_unreadable(&doomed)?;
-        let mut held = Held::default();
-        held.hold(p, &target_secret);
+        let mut cx = Settle::new(p, &row.provider, Vec::new());
+        cx.held.hold(p, &target_secret);
         if let Some(fp) = &row.from_fp {
-            held.insert(fp);
+            cx.held.insert(fp);
         }
         for id in row.from_id.iter().chain([&to.id]) {
-            self.hold_vault(p, &mut held, id);
+            cx.hold_vault(self, id);
         }
         // §9.6 (amended): an entry holding a generation no set above holds is the outgoing
         // account's only when the pre-lock oracle attributed exactly those bytes to it. It is
@@ -291,26 +310,15 @@ impl Engine {
                 continue;
             };
             if let Some(from) = &from {
-                if self
-                    .capture_rotated_outgoing(p, store, from, bytes, hints, accounts, &mut held)?
-                {
+                if self.capture_rotated_outgoing(&mut cx, store, rec, from, bytes)? {
                     continue;
                 }
             }
             // Every entry cleared here sits on the other auth axis, and §9.6 never takes the
             // live identity as evidence of whose it is: attributed to no one (§6.3).
-            self.save_unheld(
-                p,
-                &row.provider,
-                bytes,
-                &mut held,
-                false,
-                None,
-                None,
-                &mut warnings,
-            )?;
+            cx.save_unheld(self, bytes)?;
         }
-        for w in &warnings {
+        for w in &cx.warnings {
             tracing::warn!(
                 provider = self.registered_id(&row.provider),
                 "recovering an interrupted switch: {w}"
@@ -359,24 +367,22 @@ impl Engine {
     /// (`Axis::live_secret`), so a degraded read can never be captured, and §6.2's
     /// refresh-token bound and §12.5's stale mark apply through `decide_outgoing`. Returns
     /// whether the entry was captured, and so is held now.
-    #[allow(clippy::too_many_arguments)]
     fn capture_rotated_outgoing(
         &self,
-        p: &dyn Provider,
+        cx: &mut Settle<'_>,
         store: &Store,
+        rec: &Recovery<'_, '_>,
         from: &AccountRow,
         bytes: &[u8],
-        hints: &[OracleHint],
-        accounts: &[AccountLock],
-        held: &mut Held,
     ) -> Result<bool, EngineError> {
+        let p = cx.p;
         let Some(fp) = p.fingerprint(bytes) else {
             return Ok(false);
         };
-        if held.contains(fp.as_str()) {
+        if cx.held.contains(fp.as_str()) {
             return Ok(false);
         }
-        let resolved = hints.iter().find_map(|h| answer_for(Some(h), bytes));
+        let resolved = rec.hints.iter().find_map(|h| answer_for(Some(h), bytes));
         let oracle = verdict(resolved, from);
         if oracle != OracleVerdict::ThisAccount {
             return Ok(false);
@@ -403,7 +409,8 @@ impl Engine {
         let OutgoingAction::CaptureToVault { .. } = decide_outgoing(&facts).1 else {
             return Ok(false);
         };
-        let lock = accounts
+        let lock = rec
+            .accounts
             .iter()
             .find(|l| l.id() == &from.id)
             .expect("recovery locks both accounts the row names");
@@ -411,7 +418,7 @@ impl Engine {
         if let Some(uuid) = resolved.and_then(|i| i.account_uuid.as_deref()) {
             store.backfill_account_uuid(&from.id, uuid)?;
         }
-        held.insert(fp.as_str());
+        cx.held.insert(fp.as_str());
         Ok(true)
     }
 
