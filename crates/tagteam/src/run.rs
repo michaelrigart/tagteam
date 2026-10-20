@@ -503,7 +503,11 @@ fn wait_every(
     let mut last = None;
     loop {
         let watched = exit.wait(tick);
-        if matches!(watched, Watched::Failed(_)) {
+        if let Watched::Failed(why) = &watched {
+            tracing::warn!(
+                reason = %why,
+                "the exit watch failed, so signals are no longer forwarded to claude"
+            );
             return (child.wait(), last);
         }
         last = forward(pid, cancel.take(), false, send).or(last);

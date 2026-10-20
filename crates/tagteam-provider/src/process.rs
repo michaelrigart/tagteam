@@ -149,8 +149,9 @@ pub struct SpawnSpec {
     pub cwd: Option<PathBuf>,
 }
 
-/// How a captured child ended (`run_captured`, `run_bounded`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How a captured child ended (`run_captured`, `run_bounded`). A captured output can hold a
+/// secret (`find -w`'s), so `Debug` shows lengths only.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Captured {
     /// It exited, and both its pipes closed. `code` is its exit code, or `signal` the signal
     /// that ended it.
@@ -167,6 +168,28 @@ pub enum Captured {
     Interrupted(i32),
     /// It could not be spawned, or its wait failed.
     SpawnFailed(String),
+}
+
+impl std::fmt::Debug for Captured {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Captured::Exited {
+                code,
+                signal,
+                stdout,
+                stderr,
+            } => f
+                .debug_struct("Exited")
+                .field("code", code)
+                .field("signal", signal)
+                .field("stdout", &format_args!("<{} bytes>", stdout.len()))
+                .field("stderr", &format_args!("<{} bytes>", stderr.len()))
+                .finish(),
+            Captured::TimedOut => f.write_str("TimedOut"),
+            Captured::Interrupted(signal) => f.debug_tuple("Interrupted").field(signal).finish(),
+            Captured::SpawnFailed(why) => f.debug_tuple("SpawnFailed").field(why).finish(),
+        }
+    }
 }
 
 /// How a child run with its output discarded ended (`run_discarded`). It has no output to hold,
@@ -371,7 +394,9 @@ pub(crate) fn bounded(
         Err(e) => return Captured::SpawnFailed(e.to_string()),
     };
     if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
-        // A child that stops reading fails the write (`EPIPE`); the pipe closes either way.
+        // A child that stops reading fails the write (`EPIPE`), and one that exits closes the
+        // pipe. A descendant that inherits stdin and never reads leaves the writer parked on a
+        // full pipe: it costs one thread, as `drain`'s doc accepts.
         thread::spawn(move || {
             let _ = pipe.write_all(&bytes);
         });
@@ -450,9 +475,12 @@ fn wait_running(
     timeout: Duration,
     cancel: Option<&Cancel>,
 ) -> Result<ExitStatus, Captured> {
-    let deadline = Instant::now() + timeout;
+    // A timeout too long to add to the clock is no deadline at all.
+    let deadline = Instant::now().checked_add(timeout);
     let ended = loop {
-        let left = deadline.saturating_duration_since(Instant::now());
+        let left = deadline.map_or(Duration::MAX, |at| {
+            at.saturating_duration_since(Instant::now())
+        });
         let slice = if cancel.is_some() {
             left.min(SLICE)
         } else {
@@ -471,7 +499,7 @@ fn wait_running(
         if let Some(signal) = cancel.and_then(Cancel::requested) {
             break Captured::Interrupted(signal);
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|at| Instant::now() >= at) {
             break Captured::TimedOut;
         }
     };
@@ -1285,6 +1313,18 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(run.did[1..], [Did::Kill, Did::Reap]);
+    }
+
+    #[test]
+    fn a_timeout_too_long_for_the_clock_is_no_deadline() {
+        let _fork = fork_guard();
+        let got = within(Duration::from_secs(10), || {
+            run_bounded(&sh("exit 0"), None, Duration::MAX, None)
+        });
+        assert!(
+            matches!(got, Captured::Exited { code: Some(0), .. }),
+            "{got:?}"
+        );
     }
 
     #[test]

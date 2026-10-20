@@ -47,10 +47,12 @@ and 14).
   `/usr/bin/security` on standard input (`security -i`), not on its command line. When a
   credential exceeds about 3.8 KB, `security` receives it on its command line instead, which
   macOS shows only to the same user and root but which exec-auditing tools record. Claude
-  Code's own Keychain writes do the same. tagteam logs a WARN when it happens (the service,
-  the account ID and the length, never the value). The vault and `rescue/` copies hold no
-  machine-shared key (MCP OAuth tokens, plugin secrets), which keeps nearly every credential
-  well below that size.
+  Code's own Keychain writes do the same. tagteam logs a WARN when it happens (the Keychain
+  item's service and account, which is a tagteam account ID for a vault item and the login
+  name for Claude Code's own item, and the byte length, never the value). The vault and
+  `rescue/` copies hold no machine-shared key (MCP OAuth tokens, plugin secrets), which keeps
+  nearly every credential well below that size; items stored before this change keep theirs
+  until their next store or settle.
 - **Passing a token.** `tagteam add-token <TOKEN>` puts the token on the command line, where
   other local users can see it and your shell history keeps it; tagteam prints a warning.
   Use `tagteam add-token -` (it reads standard input, with no echo on a terminal) or

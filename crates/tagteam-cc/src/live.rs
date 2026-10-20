@@ -595,7 +595,8 @@ impl LiveStore {
         r
     }
 
-    /// Keychain first, retried twice 300 ms apart; the file covers an absent item. A failed
+    /// Keychain first, through `retrying` (an unreadable read is retried; a locked or
+    /// interrupted one is not); the file covers an absent item. A failed
     /// Keychain read covered by the file is `Degraded` (§4.3). The one item `env` names is the
     /// only one read (Appendix A.2): no other spelling's item is ever consulted.
     pub fn read_credential(&self, env: &Env, paths: &CcPaths) -> Read<Credential> {

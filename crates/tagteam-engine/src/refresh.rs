@@ -268,7 +268,7 @@ impl<'e> Received<'e> {
                 position = self.row.position,
                 account = %self.row.id,
                 kind,
-                "could not write a refreshed token ahead to rescue/; the vault write goes on without it"
+                "could not write a refreshed token ahead to rescue/"
             );
         }
     }
