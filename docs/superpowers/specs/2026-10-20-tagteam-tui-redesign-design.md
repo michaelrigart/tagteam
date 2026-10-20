@@ -1237,10 +1237,11 @@ its user-visible changes, and records rulings under "Rulings".
 ## 18. Amendments to other specs
 
 Applied in this branch, as small hunks, without rewriting point-in-time facts:
-- **TUI spec:** §4.3 (the input thread, §14), §5.1 (colour, selection, chrome rows), §5.2 (the table, the cards, "same words as
-  `list`" meaning words), §5.3 (the control bar, headline, column words), §5.4 (the timeline),
-  §5.5 (overlays, help), §5.6 (keys), §7.2 (outcomes), §7.4 (the header table), §8 (what each event
-  does, the auto line), §11 (the tests). Each hunk points to the section here.
+- **TUI spec:** §4.3 (the input thread, §14), §5.1 (colour, selection, chrome rows), §5.2 (the
+  table, the cards, "same words as `list`" meaning words), §5.3 (the control bar, headline,
+  column words), §5.4 (the timeline), §5.5 (overlays, help), §5.6 (keys), §7.2 (outcomes), §7.4
+  (the header table), §8 (what each event does, the auto line), §11 (the tests). Each hunk points
+  to the section here.
 - **Core spec:** §13.1 (`list`'s words and the `UPDATED` head), §13.4 (`history`'s projection
   words), the `events` kind list, and §11's `auto` human output.
 - **Daemon spec:** D4.2 records pauses and resumes as events.

@@ -956,9 +956,10 @@ mod tests {
         assert_eq!(asked, [Cmd::FetchStatus { link: 1 }]);
         let failed = Msg::DaemonStatus {
             link: 1,
-            result: Err(StatusError::Client(ClientError::Protocol(
-                "the daemon closed the connection".into(),
-            ))),
+            result: Err(StatusError::Client(ClientError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the daemon closed the connection",
+            )))),
         };
         let at = NOW_MS + 60_000;
         assert_eq!(update(&mut state, failed, at), [Cmd::DropLink { link: 1 }]);

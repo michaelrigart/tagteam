@@ -433,6 +433,7 @@ mod tests {
 
         let switch = crate::host::Action::Switch(account());
         state.running = Some(switch.clone());
+        state.dirty = false;
         let cmds = update(
             &mut state,
             Msg::SuspendRefused {
@@ -441,8 +442,12 @@ mod tests {
             },
             NOW_MS,
         );
-        assert!(cmds.is_empty());
+        assert!(cmds.is_empty() && state.dirty);
         assert_eq!(state.banner_text(), Some("Ctrl-Z did not suspend: w"));
+        assert_eq!(
+            state.banner.as_ref().map(|b| b.kind),
+            Some(BannerKind::Refusal)
+        );
         assert_eq!(state.running, Some(switch));
     }
 

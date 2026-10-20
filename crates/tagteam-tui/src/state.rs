@@ -72,7 +72,8 @@ pub struct State {
     pub(crate) started_ms: i64,
 }
 
-/// A banner's words, and what raised them: only a success of that same kind clears it.
+/// A banner's words, and what raised them: a success of that same kind clears it, and a refusal
+/// is cleared by any success.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Banner {
     pub(crate) text: String,
@@ -198,7 +199,7 @@ impl State {
     }
 
     /// A read of `kind` succeeded: clears a banner of that kind, or a refusal, which no read
-    /// owns. Never while quitting.
+    /// owns (spec §10.4). Never while quitting.
     pub(crate) fn clear_banner(&mut self, kind: BannerKind) {
         let owned = self
             .banner

@@ -51,7 +51,7 @@ impl Default for Backoff {
     }
 }
 
-/// What `fetch_status` says when no daemon answers.
+/// What `StatusError::NoDaemon` says: no daemon answers.
 pub const NO_DAEMON: &str = "no daemon answers";
 /// C-R17: the most the live thread's queue holds, as the daemon's own queue for a subscriber
 /// (D5.5).
@@ -329,7 +329,9 @@ impl std::fmt::Display for StatusError {
 impl std::error::Error for StatusError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            StatusError::Client(e) => Some(e),
+            // `Display` already prints the client's error, so its cause is the next link, as a
+            // transparent wrapper's would be.
+            StatusError::Client(e) => e.source(),
             StatusError::NoDaemon | StatusError::Mismatch { .. } => None,
         }
     }
