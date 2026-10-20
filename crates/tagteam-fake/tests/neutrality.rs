@@ -11,7 +11,7 @@ const NEUTRAL: [&str; 5] = [
     "tagteam-daemon",
     "tagteam-tui",
 ];
-const LEAKS: [&str; 2] = ["claude", "anthropic"];
+const LEAKS: [&str; 3] = ["claude", "anthropic", "tagteam_cc"];
 /// Held for the TUI redesign, pinned by file and text. Each must still match, so an entry goes
 /// once its line does.
 const ALLOWED: [(&str, &str); 0] = [];
@@ -176,6 +176,27 @@ fn no_neutral_crate_names_claude_code() {
     );
 }
 
+/// The lines of a manifest's non-dev dependency sections (any `dependencies` header, with or
+/// without a target, and a trailing comment) that name `tagteam-cc`, whether renamed or as a
+/// `[dependencies.tagteam-cc]` table.
+fn cc_dependencies(manifest: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    let mut in_scope = false;
+    for line in manifest.lines() {
+        let text = line.trim();
+        if text.starts_with('[') {
+            let header = text.split('#').next().unwrap().trim();
+            in_scope = header.contains("dependencies") && !header.contains("dev-dependencies");
+            if in_scope && header.ends_with(".tagteam-cc]") {
+                hits.push(text.to_owned());
+            }
+        } else if in_scope && !text.starts_with('#') && text.contains("tagteam-cc") {
+            hits.push(text.to_owned());
+        }
+    }
+    hits
+}
+
 #[test]
 fn no_neutral_crate_depends_on_tagteam_cc() {
     let root = workspace();
@@ -183,16 +204,11 @@ fn no_neutral_crate_depends_on_tagteam_cc() {
     for krate in NEUTRAL {
         let manifest =
             fs::read_to_string(root.join("crates").join(krate).join("Cargo.toml")).unwrap();
-        let mut in_dependencies = false;
-        for line in manifest.lines() {
-            if line.trim() == "[dependencies]" {
-                in_dependencies = true;
-            } else if line.starts_with('[') {
-                in_dependencies = false;
-            } else if in_dependencies && line.trim().starts_with("tagteam-cc") {
-                hits.push(format!("{krate}: {}", line.trim()));
-            }
-        }
+        hits.extend(
+            cc_dependencies(&manifest)
+                .into_iter()
+                .map(|l| format!("{krate}: {l}")),
+        );
     }
     assert!(
         hits.is_empty(),
@@ -233,5 +249,41 @@ fn only_the_composition_root_names_tagteam_cc_in_the_binary() {
     assert!(
         root_text.contains("ClaudeCode"),
         "{COMPOSITION_ROOT} no longer names ClaudeCode: the composition root has moved"
+    );
+}
+
+#[test]
+fn the_dependency_check_sees_every_form_and_skips_dev_dependencies() {
+    let manifest = "\
+[package]
+name = \"x\"
+
+[dependencies]  # runtime
+tagteam-core.workspace = true
+cc = { package = \"tagteam-cc\", workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+tagteam-cc.workspace = true
+
+[build-dependencies.tagteam-cc]
+workspace = true
+
+[dependencies.tagteam-cc]
+workspace = true
+
+[dev-dependencies]
+tagteam-cc.workspace = true
+
+[dev-dependencies.tagteam-cc]
+workspace = true
+";
+    assert_eq!(
+        cc_dependencies(manifest),
+        [
+            "cc = { package = \"tagteam-cc\", workspace = true }",
+            "tagteam-cc.workspace = true",
+            "[build-dependencies.tagteam-cc]",
+            "[dependencies.tagteam-cc]",
+        ]
     );
 }
