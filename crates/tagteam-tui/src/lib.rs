@@ -16,6 +16,7 @@ pub mod screens;
 pub mod source;
 pub mod state;
 mod term;
+mod theme;
 pub mod update;
 pub mod view;
 

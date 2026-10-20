@@ -2,7 +2,6 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tagteam_engine::words::Severity;
@@ -255,7 +254,7 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
         } else {
             Severity::Warning
         };
-        let style = severity_style(state.color, severity);
+        let style = state.theme.severity(severity);
         let rows: Vec<Line<'static>> = banner_rows(&text, usize::from(area.width))
             .into_iter()
             .map(|row| Line::from(Span::styled(row, style)))
@@ -278,7 +277,7 @@ pub fn view(state: &State, frame: &mut Frame, now_ms: i64) {
 /// and `? help` on the right. A mode too wide for the row drops `? help`; one too wide even
 /// then takes a second row of its own, right-aligned, cut to the width (R20).
 fn header(state: &State, width: u16) -> Vec<Line<'static>> {
-    let mut tabs = vec![Span::styled(" tagteam", bold())];
+    let mut tabs = vec![Span::styled(" tagteam", state.theme.strong())];
     for (screen, label) in [
         (Screen::Accounts, "1 Accounts"),
         (Screen::Tokens, "2 Tokens"),
@@ -286,7 +285,7 @@ fn header(state: &State, width: u16) -> Vec<Line<'static>> {
     ] {
         tabs.push(Span::raw("  "));
         if screen == state.screen {
-            tabs.push(Span::styled(format!("[{label}]"), bold()));
+            tabs.push(Span::styled(format!("[{label}]"), state.theme.strong()));
         } else {
             tabs.push(Span::raw(label));
         }
@@ -349,12 +348,12 @@ fn footer(state: &State, width: u16, now_ms: i64) -> Vec<Line<'static>> {
             Some(action) => format!("finishing {}…", action.name()),
             None => "finishing…".to_owned(),
         };
-        return vec![Line::from(Span::styled(text, bold()))];
+        return vec![Line::from(Span::styled(text, state.theme.strong()))];
     }
     if let Some(rows) = toast_rows(state, usize::from(width)) {
         return rows
             .into_iter()
-            .map(|row| Line::from(Span::styled(row, bold())))
+            .map(|row| Line::from(Span::styled(row, state.theme.strong())))
             .collect();
     }
     if let Some(action) = &state.running {
@@ -466,35 +465,17 @@ pub(crate) fn centered(area: Rect, w: u16, h: u16) -> Rect {
     )
 }
 
-pub(crate) fn bold() -> Style {
-    Style::new().add_modifier(Modifier::BOLD)
-}
-
-/// The selection: reverse video, which reads on any terminal, coloured or not (spec §5.1).
-pub(crate) fn selected() -> Style {
-    Style::new().add_modifier(Modifier::REVERSED)
-}
-
-/// Core §13.5's severities: yellow and red with colour, bold without (spec §5.1).
-pub(crate) fn severity_style(color: bool, severity: Severity) -> Style {
-    match (severity, color) {
-        (Severity::Normal, _) => Style::new(),
-        (Severity::Warning, true) => Style::new().fg(Color::Yellow),
-        (Severity::Critical, true) => Style::new().fg(Color::Red),
-        (Severity::Warning | Severity::Critical, false) => bold(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyCode;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier};
 
     use super::*;
     use crate::actions::{ConfirmThen, Overlay};
     use crate::host::Action;
     use crate::msg::{Answer, Msg};
     use crate::testutil::*;
+    use crate::theme::Theme;
     use crate::update::update;
 
     #[test]
@@ -638,7 +619,7 @@ mod tests {
     fn an_error_banner_is_red_with_colour_and_bold_without() {
         for color in [true, false] {
             let mut state = fresh(Screen::Accounts);
-            state.color = color;
+            state.theme = Theme::new(color);
             state.banner = Some("the store is locked".into());
             let buf = draw_buffer(&state, 80, 24, NOW_MS);
             let lines = text_of(&buf);

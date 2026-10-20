@@ -17,7 +17,7 @@ use crate::actions::{CHOICE_ROWS, Overlay, boxed};
 use crate::msg::Cmd;
 use crate::source::SourceError;
 use crate::state::State;
-use crate::view::{bold, scrolled_windows, selected, severity_style, wrap_rows};
+use crate::view::{scrolled_windows, wrap_rows};
 
 /// Shown until the inventory arrives.
 pub const LOADING: &str = "loading the accounts and models the index holds…";
@@ -278,7 +278,9 @@ pub(crate) fn render(state: &State, dialog: &FilterDialog, frame: &mut Frame) {
     let inner = usize::from(w).saturating_sub(4).max(1);
     let mut tail: Vec<Line<'static>> = Vec::new();
     if let Some(error) = &dialog.error {
-        let style = severity_style(state.color, tagteam_engine::words::Severity::Critical);
+        let style = state
+            .theme
+            .severity(tagteam_engine::words::Severity::Critical);
         tail.extend(
             wrap_rows(error, inner, CHOICE_ROWS)
                 .into_iter()
@@ -312,7 +314,7 @@ pub(crate) fn render(state: &State, dialog: &FilterDialog, frame: &mut Frame) {
         let mut block = Vec::new();
         if i == 0 || matches!(choices[i - 1].kind, Kind::Account(_)) != account {
             let heading = if account { "Accounts" } else { "Models" };
-            block.push(Line::from(Span::styled(heading, bold())));
+            block.push(Line::from(Span::styled(heading, state.theme.strong())));
         }
         let mark = if c.on { "[x] " } else { "[ ] " };
         for (n, row) in wrap_rows(&c.label, inner.saturating_sub(4).max(1), CHOICE_ROWS)
@@ -322,7 +324,7 @@ pub(crate) fn render(state: &State, dialog: &FilterDialog, frame: &mut Frame) {
             let lead = if n == 0 { mark } else { "    " };
             let line = Line::from(format!("{lead}{row}"));
             block.push(if i == dialog.cursor {
-                line.style(selected())
+                line.style(state.theme.selection())
             } else {
                 line
             });
