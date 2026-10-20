@@ -242,11 +242,13 @@ impl Run<'_> {
                 Err(e) => {
                     self.push(
                         None,
-                        warn_restore(self.engine,
+                        warn_restore(
+                            self.engine,
                             Id::STORE_ACCOUNTS,
                             format!(
                                 "the store's accounts cannot be read ({e}), so orphaned vault files, rescue files, session profiles and which providers have accounts are not checked"
-                            )),
+                            ),
+                        ),
                     );
                     None
                 }

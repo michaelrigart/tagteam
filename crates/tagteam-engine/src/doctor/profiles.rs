@@ -296,7 +296,8 @@ impl Run<'_> {
             return;
         }
         // §12.5: only a login that names another account is drift, which is ignored. An absent
-        // identity decides nothing: the table runs, and only a rotation needs one, as `apply_provenance` has it.
+        // identity decides nothing: the table runs, and only a rotation needs one, as
+        // `apply_provenance` has it.
         let identity_absent = match p.profile_identity(env, dir) {
             Read::Present(login) if !identity_drifted(&login, row) => false,
             Read::Present(_) => return,

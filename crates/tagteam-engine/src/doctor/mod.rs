@@ -1,6 +1,6 @@
 //! §13.6 `tagteam doctor`: tagteam's own state and its interop with each provider. Doctor is
 //! read-only (B.67): it writes nothing and creates nothing itself. It takes no `MutationGuard`
-//! and no account lock, and runs no recovery, so it takes no lock that anyone waits on. It
+//! and no account lock, runs no recovery, and takes no lock that anyone waits on. It
 //! opens the store read-only and never migrates it. It tests locks without waiting, reads the
 //! vault only when the Keychain is unlocked, and creates no data directory, store, log or lock
 //! file. The `claude` it runs (`--version`, `auth status`) may make Claude Code's own start-up
@@ -306,7 +306,7 @@ fn skipped(vault: bool, provider: bool) -> String {
     }
 }
 
-/// The check IDs `doctor` reports, which `--json` and the exit code's callers match on.
+/// The check IDs `doctor` reports; `--json` consumers match on them.
 struct Id;
 
 impl Id {
