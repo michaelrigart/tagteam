@@ -13,9 +13,9 @@ use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use tagteam_core::ProviderId;
 use tagteam_core::autoswitch::Strategy;
 use tagteam_core::tokens::{CardOverride, PriceOverride};
-use tagteam_core::{CLAUDE_CODE, ProviderId};
 use tagteam_provider::{Env, LockError};
 use toml_edit::{DocumentMut, Item, TableLike};
 
@@ -681,10 +681,15 @@ pub fn config_path(env: &Env) -> PathBuf {
 }
 
 /// The file as `provider`'s commands read it: forgiving, and read exactly as `Settings::load`
-/// reads it. Never creates anything.
-pub fn inspect(env: &Env, provider: &ProviderId) -> Inspection {
-    let read = read_file(env, provider);
-    let defaults = Settings::default();
+/// reads it. Never creates anything. An unset `default_provider` shows as `fallback`.
+pub fn inspect(env: &Env, provider: &ProviderId, fallback: &ProviderId) -> Inspection {
+    let mut read = read_file(env, provider);
+    let mut defaults = Settings::default();
+    for settings in [&mut read.settings, &mut defaults] {
+        settings
+            .default_provider
+            .get_or_insert_with(|| fallback.clone());
+    }
     let keys = KEYS
         .iter()
         .zip(read.sources)
@@ -771,9 +776,10 @@ pub enum SettingsError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
-    /// `default_provider`, read from the top level only. Whether this build has it is the
-    /// CLI's to check; it falls back to claude-code.
-    pub default_provider: ProviderId,
+    /// `default_provider`, read from the top level only. `None` when the file names none, or
+    /// names it invalidly; the CLI falls back to the registry's first provider (C-3). Whether
+    /// this build has the one it names is the CLI's to check.
+    pub default_provider: Option<ProviderId>,
     /// `autoswitch.threshold`: 50–99.9. The provider's own table first.
     pub threshold: f64,
     /// `autoswitch.interval_seconds`: 15–3600. The provider's own table first.
@@ -821,7 +827,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            default_provider: ProviderId::new(CLAUDE_CODE),
+            default_provider: None,
             threshold: DEFAULT_THRESHOLD,
             interval_seconds: DEFAULT_INTERVAL_SECONDS,
             cooldown_seconds: DEFAULT_COOLDOWN_SECONDS,
@@ -866,7 +872,11 @@ impl Settings {
     /// `key`'s value, as `config` shows it.
     pub fn value(&self, key: &Key) -> Value {
         match key.name {
-            "default_provider" => Value::Str(self.default_provider.to_string()),
+            "default_provider" => Value::Str(
+                self.default_provider
+                    .as_ref()
+                    .map_or_else(String::new, ToString::to_string),
+            ),
             "autoswitch.threshold" => Value::Float(self.threshold),
             "autoswitch.interval_seconds" => Value::Int(self.interval_seconds),
             "autoswitch.cooldown_seconds" => Value::Int(self.cooldown_seconds),
@@ -896,7 +906,9 @@ impl Settings {
     /// below the only one that can occur.
     fn apply(&mut self, key: &Key, value: Value) {
         match (key.name, value) {
-            ("default_provider", Value::Str(id)) => self.default_provider = ProviderId::new(id),
+            ("default_provider", Value::Str(id)) => {
+                self.default_provider = Some(ProviderId::new(id))
+            }
             ("autoswitch.threshold", Value::Float(n)) => self.threshold = n,
             ("autoswitch.interval_seconds", Value::Int(n)) => self.interval_seconds = n,
             ("autoswitch.cooldown_seconds", Value::Int(n)) => self.cooldown_seconds = n,

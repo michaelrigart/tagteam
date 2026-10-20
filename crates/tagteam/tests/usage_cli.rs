@@ -8,8 +8,9 @@ use std::path::Path;
 
 use common::{cmd, login, now_epoch_s, seed_home};
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::usage::format_iso8601;
-use tagteam_core::{CLAUDE_CODE, PollBudget, ProviderId};
+use tagteam_core::{PollBudget, ProviderId};
 use tagteam_engine::store::{Eligibility, Reserve, SendGrant, Store};
 use tagteam_provider::mock_server::{MockReply, MockServer};
 use tagteam_provider::{Env, FileKeychain};

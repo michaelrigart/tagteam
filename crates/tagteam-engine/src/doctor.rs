@@ -959,7 +959,7 @@ impl Run<'_> {
         };
         let (mut warnings, mut unknown) = (Vec::new(), Vec::new());
         for id in &ids {
-            let found = settings::inspect(&self.engine.env, id);
+            let found = settings::inspect(&self.engine.env, id, &self.engine.default_provider);
             for w in found.warnings {
                 if !warnings.contains(&w) {
                     warnings.push(w);

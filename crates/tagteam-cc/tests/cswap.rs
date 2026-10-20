@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::cswap::read_cswap_v1;
 use tagteam_cc::live::Platform;
-use tagteam_core::CLAUDE_CODE;
 use tagteam_provider::{FakeKeychain, Provider};
 
 const API_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";

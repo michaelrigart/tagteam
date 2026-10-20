@@ -341,9 +341,10 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
+    use tagteam_cc::CLAUDE_CODE;
     use tagteam_cc::live::Platform;
     use tagteam_cc::{ClaudeCode, ItemKind, keychain_account, keychain_service};
-    use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, Window, WindowKind};
+    use tagteam_core::{AccountId, PollBudget, PollPlan, Window, WindowKind};
     use tagteam_daemon::auto::{AutoRun, run_loop};
     use tagteam_daemon::scheduler::Sleeper;
     use tagteam_engine::lifecycle::AddOptions;

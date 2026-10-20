@@ -19,7 +19,8 @@ use common::{
     Running, cmd, now_epoch_s, record_reading, std_cmd, two_fresh_accounts, usage_window,
 };
 use serde_json::{Value, json};
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, WindowKind};
+use tagteam_cc::CLAUDE_CODE;
+use tagteam_core::{AccountId, ProviderId, WindowKind};
 use tagteam_provider::Env;
 use tagteam_provider::profile::{ProfileMarker, canonical_profile_path};
 

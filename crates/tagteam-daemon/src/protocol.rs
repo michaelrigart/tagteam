@@ -665,7 +665,7 @@ fn read_by_position(v: Option<&Value>) -> Option<BTreeMap<u32, String>> {
 
 #[cfg(test)]
 mod tests {
-    use tagteam_core::CLAUDE_CODE;
+    use tagteam_cc::CLAUDE_CODE;
     use tagteam_core::autoswitch::Trigger;
 
     use super::*;

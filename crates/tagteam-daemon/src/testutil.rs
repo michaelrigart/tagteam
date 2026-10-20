@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::json;
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::live::{LiveStore, Platform};
 use tagteam_cc::{ClaudeCode, ItemKind, keychain_account, keychain_service};
-use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, PollPlan, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, PollBudget, PollPlan, ProviderId, Window, WindowKind};
 use tagteam_engine::lifecycle::AddOptions;
 use tagteam_engine::oracle::NoOracle;
 use tagteam_engine::registry::ProviderRegistry;

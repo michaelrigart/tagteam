@@ -1,7 +1,5 @@
 use std::fmt;
 
-pub const CLAUDE_CODE: &str = "claude-code";
-
 macro_rules! string_id {
     ($name:ident, $ctor:ident) => {
         #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -35,7 +33,7 @@ mod tests {
 
     #[test]
     fn ids_round_trip_their_strings() {
-        assert_eq!(ProviderId::new(CLAUDE_CODE).as_str(), "claude-code");
+        assert_eq!(ProviderId::new("claude-code").as_str(), "claude-code");
         assert_eq!(AccountId::from_string("0192").to_string(), "0192");
         assert_eq!(IdentityKey::new("a@b.co\n").as_str(), "a@b.co\n");
     }

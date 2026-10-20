@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 use tagteam_core::tokens::PriceTable;
-use tagteam_core::{CLAUDE_CODE, Fingerprint, IdentityKey, ProviderId};
+use tagteam_core::{Fingerprint, IdentityKey, ProviderId};
 use tagteam_provider::http::Http;
 use tagteam_provider::process::{ProcessSpawner, SpawnSpec};
 use tagteam_provider::profile::refuse_linked_credential;
@@ -21,6 +21,7 @@ use tagteam_provider::{
     Window, Written,
 };
 
+use crate::CLAUDE_CODE;
 use crate::config;
 use crate::crash;
 use crate::doctor;

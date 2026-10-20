@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::live::Platform;
-use tagteam_core::{CLAUDE_CODE, ProviderId};
+use tagteam_core::ProviderId;
 use tagteam_daemon::events::{DaemonEvent, DaemonSink, StopReason};
 use tagteam_daemon::protocol::{Event, daemon_event_json, parse_event};
 use tagteam_daemon::scheduler::{Job, JobCx, Ran};

@@ -20,8 +20,9 @@ use common::{
     two_fresh_accounts, usage_window,
 };
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::usage::format_iso8601;
-use tagteam_core::{AccountId, CLAUDE_CODE, PollBudget, ProviderId, Window, WindowKind};
+use tagteam_core::{AccountId, PollBudget, ProviderId, Window, WindowKind};
 use tagteam_daemon::client::{Client, Connect, connect_at};
 use tagteam_daemon::protocol::{Event, Status};
 use tagteam_engine::daemon::{daemon_lock_path, daemon_socket_path, read_daemon_record};

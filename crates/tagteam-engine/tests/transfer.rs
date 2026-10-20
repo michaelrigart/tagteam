@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use age::secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::live::Platform;
-use tagteam_core::{CLAUDE_CODE, ProviderId};
+use tagteam_core::ProviderId;
 use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::transfer::{
     Decoded, Encryption, EnvelopeAccount, IdentityFile, Need, TransferError, decode, encrypt,

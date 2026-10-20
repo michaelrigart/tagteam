@@ -683,7 +683,7 @@ pub fn newest_live(
 
 #[cfg(test)]
 mod tests {
-    use tagteam_core::CLAUDE_CODE;
+    use tagteam_cc::CLAUDE_CODE;
 
     use super::*;
 

@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use common::{cmd, two_fresh_accounts};
 use serde_json::{Value, json};
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+use tagteam_cc::CLAUDE_CODE;
+use tagteam_core::{AccountId, ProviderId};
 use tagteam_provider::Env;
 use tagteam_provider::profile::{MARKER_FILE, ProfileMarker, canonical_profile_path};
 

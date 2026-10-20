@@ -39,9 +39,10 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
+    use tagteam_cc::CLAUDE_CODE;
     use tagteam_cc::ClaudeCode;
     use tagteam_cc::live::{LiveStore, Platform};
-    use tagteam_core::{CLAUDE_CODE, ProviderId};
+    use tagteam_core::ProviderId;
     use tagteam_provider::http::{Method, NoHttp, ScriptedHttp};
     use tagteam_provider::profile::RunShell;
     use tagteam_provider::{Clock, Env, FakeClock, FakeKeychain};

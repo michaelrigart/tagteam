@@ -940,7 +940,8 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use tagteam_core::{CLAUDE_CODE, WindowKind};
+    use tagteam_cc::CLAUDE_CODE;
+    use tagteam_core::WindowKind;
 
     use super::*;
 

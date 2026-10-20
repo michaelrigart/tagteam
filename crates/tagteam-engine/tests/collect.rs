@@ -16,10 +16,11 @@ use common::{
     usage_requests,
 };
 use serde_json::{Value, json};
+use tagteam_cc::CLAUDE_CODE;
 use tagteam_cc::ItemKind;
 use tagteam_cc::usage::normalize;
 use tagteam_core::backoff::failure_backoff_s;
-use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId, WindowKind};
+use tagteam_core::{AccountId, ProviderId, WindowKind};
 use tagteam_engine::account_lock::AccountLock;
 use tagteam_engine::collect::{CollectMode, CollectReport, Collected};
 use tagteam_engine::store::{Ineligible, UsageStateRow};

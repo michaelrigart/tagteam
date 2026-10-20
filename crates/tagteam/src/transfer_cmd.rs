@@ -342,7 +342,8 @@ mod tests {
     }
 
     fn exported(position: u32, kind: &str, in_use: bool, refreshes: bool) -> Exported {
-        use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
+        use tagteam_cc::CLAUDE_CODE;
+        use tagteam_core::{AccountId, ProviderId};
         let email = format!("u{position}@x.co");
         Exported {
             row: AccountRow {
@@ -405,7 +406,8 @@ mod tests {
 
     #[test]
     fn an_import_report_reads_one_line_per_account_and_a_failure_is_not_ok() {
-        use tagteam_core::{CLAUDE_CODE, ProviderId};
+        use tagteam_cc::CLAUDE_CODE;
+        use tagteam_core::ProviderId;
         use tagteam_engine::import::{Imported, Outcome};
 
         let empty = ImportReport::default();

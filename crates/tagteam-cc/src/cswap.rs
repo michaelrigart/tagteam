@@ -1,10 +1,12 @@
 use serde_json::{Value, json};
+use tagteam_core::ProviderId;
 use tagteam_core::time::parse_iso8601;
-use tagteam_core::{CLAUDE_CODE, ProviderId};
 use tagteam_provider::ForeignFormat;
 use tagteam_provider::import::{
     FormatError, ImportRecord, accounts, disabled, field_error, optional_string, position,
 };
+
+use crate::CLAUDE_CODE;
 
 /// Decision 14: a cswap version 1 export (cswap inventory §8.1), as records for Claude Code,
 /// the provider cswap drives. `version` must be 1 and `encrypted` false; either is refused by
