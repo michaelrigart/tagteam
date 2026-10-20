@@ -1657,16 +1657,17 @@ impl App<'_, '_> {
         let can_ask = !self.json && self.io.prompter.reaches_terminal();
         let what = if file == "-" { "the export" } else { file };
         let prompter = &mut *self.io.prompter;
-        let decoded = transfer::decode(&input, &keys, &mut |need: &Need| {
-            if !can_ask {
-                return None;
-            }
-            let question = match need {
-                Need::Passphrase => format!("Passphrase for {what}: "),
-                Need::KeyPassphrase(key) => format!("Passphrase for the SSH key {key}: "),
-            };
-            prompter.secret(&question).map(SecretString::from)
-        });
+        let decoded =
+            transfer::decode(&input, &keys, self.engine.registry(), &mut |need: &Need| {
+                if !can_ask {
+                    return None;
+                }
+                let question = match need {
+                    Need::Passphrase => format!("Passphrase for {what}: "),
+                    Need::KeyPassphrase(key) => format!("Passphrase for the SSH key {key}: "),
+                };
+                prompter.secret(&question).map(SecretString::from)
+            });
         self.after_prompt()?;
         let decoded = decoded.map_err(EngineError::from)?;
         self.ensure_unlocked()?;

@@ -11,12 +11,21 @@ use tagteam::app::{self, Context, Io};
 use tagteam::cli::Cli;
 use tagteam::prompt::{ARGV_TOKEN_WARNING, Prompter};
 use tagteam_cc::live::Platform;
-use tagteam_cc::{CcPaths, ItemKind, keychain_account, keychain_service};
+use tagteam_cc::{CcPaths, ClaudeCode, ItemKind, keychain_account, keychain_service};
 use tagteam_core::{CLAUDE_CODE, ProviderId, WindowKind};
+use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::settings::Settings;
 use tagteam_engine::store::Store;
 use tagteam_engine::transfer;
 use tagteam_provider::{Cancel, Env, FakeKeychain, FlockGuard};
+
+/// Claude Code, the provider an import file is read for.
+fn registry() -> ProviderRegistry {
+    ProviderRegistry::new().with(Arc::new(ClaudeCode::new(
+        Arc::new(FakeKeychain::new()),
+        Platform::MacOs,
+    )))
+}
 
 const UNLOCK: &str = "The login keychain is locked (common over SSH). Unlock it now?";
 
@@ -1619,7 +1628,7 @@ fn an_export_asks_its_passphrase_twice_and_seals_the_file_with_it() {
         std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    let opened = transfer::decode(&file, &[], &mut |_: &transfer::Need| {
+    let opened = transfer::decode(&file, &[], &registry(), &mut |_: &transfer::Need| {
         Some(transfer::SecretString::from("pw-1"))
     })
     .unwrap();

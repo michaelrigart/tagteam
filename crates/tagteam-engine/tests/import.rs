@@ -6,14 +6,27 @@ mod common;
 use common::{FakeFx, Fx, crashed_switch, credential, quiescent, two_accounts};
 use std::os::unix::fs::PermissionsExt;
 
+use std::sync::Arc;
+
 use serde_json::{Value, json};
+use tagteam_cc::ClaudeCode;
+use tagteam_cc::live::Platform;
 use tagteam_core::{AccountId, CLAUDE_CODE, ProviderId};
 use tagteam_engine::export::ExportRequest;
 use tagteam_engine::import::{ImportReport, Outcome};
+use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::store::{AccountRow, Activation};
 use tagteam_engine::transfer::{ImportRecord, decode, read_envelope};
 use tagteam_provider::profile::Seed;
-use tagteam_provider::{Provider, Read};
+use tagteam_provider::{FakeKeychain, Provider, Read};
+
+/// Claude Code, the provider an import file is read for.
+fn registry() -> ProviderRegistry {
+    ProviderRegistry::new().with(Arc::new(ClaudeCode::new(
+        Arc::new(FakeKeychain::new()),
+        Platform::MacOs,
+    )))
+}
 
 /// A Claude Code record for `email`'s login with refresh token `rt`.
 fn record(position: u32, email: &str, rt: &str) -> ImportRecord {
@@ -374,7 +387,7 @@ fn an_export_imports_into_another_home_with_its_positions_aliases_and_flags() {
     let a = two_accounts(&from);
     from.engine.set_alias(&a, Some("main")).unwrap();
     let exported = from.engine.export(&ExportRequest::default()).unwrap();
-    let decoded = decode(&exported.envelope, &[], &mut |_| None).unwrap();
+    let decoded = decode(&exported.envelope, &[], &registry(), &mut |_| None).unwrap();
 
     let to = Fx::new();
     let report = import(&to, decoded.records, false);

@@ -3,6 +3,7 @@
 mod compat;
 pub mod config;
 mod crash;
+pub mod cswap;
 mod doctor;
 pub mod endpoints;
 pub mod env;

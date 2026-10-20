@@ -8,12 +8,16 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use common::{cc_profile, cmd, seed_home, std_cmd, two_accounts};
 use serde_json::{Value, json};
+use tagteam_cc::ClaudeCode;
+use tagteam_cc::live::Platform;
+use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::transfer::{self, Decoded, IdentityFile, Need};
 use tagteam_engine::vault::SERVICE;
-use tagteam_provider::{Env, FileKeychain, Keychain};
+use tagteam_provider::{Env, FakeKeychain, FileKeychain, Keychain};
 
 /// age's own ssh-ed25519 test key pair (age 0.12.1, `src/ssh`).
 const SSH_PK: &str =
@@ -38,9 +42,17 @@ fn json_of(out: &[u8]) -> Value {
     serde_json::from_slice(out).unwrap()
 }
 
+/// Claude Code, the provider an import file is read for.
+fn registry() -> ProviderRegistry {
+    ProviderRegistry::new().with(Arc::new(ClaudeCode::new(
+        Arc::new(FakeKeychain::new()),
+        Platform::MacOs,
+    )))
+}
+
 /// What an export file holds, opened with `keys` and never a passphrase.
 fn opened(bytes: &[u8], keys: &[IdentityFile]) -> Decoded {
-    transfer::decode(bytes, keys, &mut |_: &Need| None).unwrap()
+    transfer::decode(bytes, keys, &registry(), &mut |_: &Need| None).unwrap()
 }
 
 /// `(position, refresh token)` of each account an export file holds.

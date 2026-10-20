@@ -9,11 +9,12 @@ use serde_json::{Value, json};
 use tagteam_cc::ClaudeCode;
 use tagteam_cc::live::Platform;
 use tagteam_core::{CLAUDE_CODE, ProviderId};
+use tagteam_engine::registry::ProviderRegistry;
 use tagteam_engine::transfer::{
     Decoded, Encryption, EnvelopeAccount, IdentityFile, Need, TransferError, decode, encrypt,
-    envelope, parse_identity_file, parse_recipient, parse_recipients, read_cswap_v1, read_envelope,
+    envelope, parse_identity_file, parse_recipient, parse_recipients, read_envelope,
 };
-use tagteam_provider::{FakeKeychain, Provider};
+use tagteam_provider::FakeKeychain;
 
 /// age's own ssh-ed25519 test key (age 0.12.1, `src/ssh/recipient.rs` and
 /// `src/ssh/identity.rs`): the public key, the private key unencrypted, and the same key
@@ -74,13 +75,21 @@ fn plaintext() -> Vec<u8> {
     )
 }
 
+/// Claude Code, the one provider whose cswap format `decode` reads.
+fn registry() -> ProviderRegistry {
+    ProviderRegistry::new().with(Arc::new(ClaudeCode::new(
+        Arc::new(FakeKeychain::new()),
+        Platform::MacOs,
+    )))
+}
+
 /// `ask` for a file that must not need anything.
 fn ask_nothing(need: &Need) -> Option<SecretString> {
     panic!("nothing should be asked, but {need:?} was")
 }
 
 fn decoded(input: &[u8], keys: &[IdentityFile]) -> Decoded {
-    decode(input, keys, &mut ask_nothing).unwrap()
+    decode(input, keys, &registry(), &mut ask_nothing).unwrap()
 }
 
 /// The two records `plaintext` holds, as import reads them back.
@@ -97,7 +106,7 @@ fn assert_round_trip(d: &Decoded) {
     assert_eq!(r[0].added_at, Some(1_756_713_600_000), "to the second");
     assert_eq!(r[0].identity["oauthAccount"], oauth_account("a@x.co"));
     assert_eq!(r[0].credential, credential("rt-a-SENTINEL"));
-    assert!(!d.cswap);
+    assert_eq!(d.foreign, None);
 }
 
 #[test]
@@ -154,7 +163,7 @@ fn a_passphrase_export_is_armored_ascii_and_opens_with_that_passphrase_only() {
     assert!(!String::from_utf8_lossy(&file).contains("SENTINEL"));
 
     let mut asked = Vec::new();
-    let d = decode(&file, &[], &mut |need: &Need| {
+    let d = decode(&file, &[], &registry(), &mut |need: &Need| {
         asked.push(need.clone());
         Some(SecretString::from("correct horse"))
     })
@@ -163,7 +172,7 @@ fn a_passphrase_export_is_armored_ascii_and_opens_with_that_passphrase_only() {
     assert!(d.encrypted);
     assert_round_trip(&d);
 
-    let wrong = decode(&file, &[], &mut |_: &Need| {
+    let wrong = decode(&file, &[], &registry(), &mut |_: &Need| {
         Some(SecretString::from("wrong"))
     })
     .unwrap_err();
@@ -172,7 +181,7 @@ fn a_passphrase_export_is_armored_ascii_and_opens_with_that_passphrase_only() {
         wrong.to_string(),
         "the passphrase is wrong, or the file is damaged"
     );
-    let none = decode(&file, &[], &mut |_: &Need| None).unwrap_err();
+    let none = decode(&file, &[], &registry(), &mut |_: &Need| None).unwrap_err();
     assert!(matches!(none, TransferError::NeedsPassphrase), "{none}");
 }
 
@@ -196,7 +205,7 @@ fn an_x25519_export_opens_with_its_identity_file_and_never_asks() {
     let other = age::x25519::Identity::generate();
     let other =
         parse_identity_file("other.txt", other.to_string().expose_secret().as_bytes()).unwrap();
-    let err = decode(&file, &[other], &mut ask_nothing).unwrap_err();
+    let err = decode(&file, &[other], &registry(), &mut ask_nothing).unwrap_err();
     assert_eq!(
         (err.kind(), err.to_string().as_str()),
         (
@@ -204,7 +213,7 @@ fn an_x25519_export_opens_with_its_identity_file_and_never_asks() {
             "none of the --identity keys can decrypt this file"
         )
     );
-    let err = decode(&file, &[], &mut ask_nothing).unwrap_err();
+    let err = decode(&file, &[], &registry(), &mut ask_nothing).unwrap_err();
     assert!(matches!(err, TransferError::NeedsIdentity), "{err}");
 }
 
@@ -220,7 +229,7 @@ fn an_ssh_ed25519_export_opens_with_the_key_and_asks_only_an_encrypted_key_s_pas
 
     let locked = || parse_identity_file("id_ed25519", SSH_SK_ENCRYPTED.as_bytes()).unwrap();
     let mut asked = Vec::new();
-    let d = decode(&file, &[locked()], &mut |need: &Need| {
+    let d = decode(&file, &[locked()], &registry(), &mut |need: &Need| {
         asked.push(need.clone());
         Some(SecretString::from("passphrase"))
     })
@@ -228,13 +237,13 @@ fn an_ssh_ed25519_export_opens_with_the_key_and_asks_only_an_encrypted_key_s_pas
     assert_eq!(asked, [Need::KeyPassphrase("id_ed25519".into())]);
     assert_round_trip(&d);
 
-    let wrong = decode(&file, &[locked()], &mut |_: &Need| {
+    let wrong = decode(&file, &[locked()], &registry(), &mut |_: &Need| {
         Some(SecretString::from("nope"))
     })
     .unwrap_err();
     assert_eq!(wrong.kind(), "decrypt-failed");
     assert!(wrong.to_string().starts_with("id_ed25519: "), "{wrong}");
-    let none = decode(&file, &[locked()], &mut |_: &Need| None).unwrap_err();
+    let none = decode(&file, &[locked()], &registry(), &mut |_: &Need| None).unwrap_err();
     assert_eq!(
         none.to_string(),
         "id_ed25519 is an encrypted SSH key, and its passphrase needs a terminal to type it"
@@ -344,7 +353,7 @@ fn every_field_is_type_checked_and_a_refusal_names_it_without_quoting_a_value() 
         ),
     ];
     for (edit, want) in cases {
-        let err = decode(&edited(edit), &[], &mut ask_nothing).unwrap_err();
+        let err = decode(&edited(edit), &[], &registry(), &mut ask_nothing).unwrap_err();
         assert_eq!(
             (err.kind(), err.to_string().as_str()),
             ("invalid-input", want)
@@ -371,7 +380,7 @@ fn a_file_that_is_no_export_is_refused() {
         b"{\"format\": \"other\"}",
         b"",
     ] {
-        let err = decode(input, &[], &mut ask_nothing).unwrap_err();
+        let err = decode(input, &[], &registry(), &mut ask_nothing).unwrap_err();
         assert_eq!(
             (err.kind(), err.to_string().as_str()),
             ("invalid-input", not)
@@ -386,105 +395,39 @@ fn a_file_that_is_no_export_is_refused() {
     );
 }
 
-const API_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz";
-const SETUP_TOKEN: &str = "sk-ant-oat01-setup";
-
-/// A cswap version 1 export (inventory §8.1) of `accounts`.
-fn cswap(accounts: Value) -> Value {
-    json!({"version": 1, "exportedAt": "2026-09-20T10:00:00Z", "exportedFrom": "macos",
-        "swapVersion": "0.27.0b1", "encrypted": false, "activeAccountNumber": 1,
-        "accounts": accounts})
-}
-
-/// The token-account identity cswap records (inventory §2.2).
-fn token_account(email: &str) -> Value {
-    json!({"emailAddress": email, "accountUuid": "", "organizationUuid": null, "organizationName": null})
-}
-
-/// An OAuth account, an API-key account and a setup-token account, as cswap exports them.
-fn cswap_three() -> Value {
-    cswap(json!([
-        {"number": 1, "email": "a@x.co", "uuid": "uuid-a", "organizationUuid": "org-1",
-         "organizationName": "Acme", "added": "2026-09-01T08:00:00.123456+00:00",
-         "credentials": credential("rt-a"),
-         "config": {"oauthAccount": {"emailAddress": "a@x.co", "accountUuid": "uuid-a",
-            "organizationUuid": "org-1", "organizationName": "Acme"}},
-         "alias": "main"},
-        {"number": 2, "email": "api-key-2@token.local", "uuid": "", "organizationUuid": null,
-         "organizationName": null, "added": "2026-09-02T08:00:00", "credentials": API_KEY,
-         "config": {"oauthAccount": token_account("api-key-2@token.local")}, "kind": "api_key"},
-        {"number": 5, "email": "setup-token-5@token.local", "uuid": "", "organizationUuid": null,
-         "organizationName": null,
-         "credentials": {"claudeAiOauth": {"accessToken": SETUP_TOKEN, "scopes": ["user:inference"]}},
-         "config": {"oauthAccount": token_account("setup-token-5@token.local")}}
-    ]))
-}
-
 #[test]
-fn a_cswap_export_maps_its_oauth_api_key_and_setup_token_accounts_to_claude_code() {
-    let records = read_cswap_v1(&cswap_three()).unwrap();
-    assert_eq!(records.len(), 3);
-    for r in &records {
-        assert_eq!(r.provider.as_str(), CLAUDE_CODE);
-    }
-    let positions: Vec<u32> = records.iter().map(|r| r.position).collect();
-    assert_eq!(positions, [1, 2, 5]);
-    let kinds: Vec<Option<&str>> = records.iter().map(|r| r.kind.as_deref()).collect();
-    assert_eq!(kinds, [None, Some("api_key"), None]);
-    assert_eq!(records[0].alias.as_deref(), Some("main"));
-    assert_eq!(records[0].added_at, Some(1_788_249_600_000));
+fn a_cswap_export_is_read_by_the_provider_that_names_its_format() {
+    let file = serde_json::to_vec(
+        &json!({"version": 1, "swapVersion": "0.27.0b1", "encrypted": false, "accounts": [
+        {"number": 1, "email": "a@x.co", "credentials": credential("rt-a"),
+         "config": {"oauthAccount": {"emailAddress": "a@x.co"}}}]}),
+    )
+    .unwrap();
+    let d = decode(&file, &[], &registry(), &mut ask_nothing).unwrap();
     assert_eq!(
-        records[1].added_at, None,
-        "a time with no offset is dropped"
+        (d.foreign, d.encrypted, d.records.len()),
+        (Some("cswap"), false, 1)
     );
-    assert_eq!(
-        records[0].identity,
-        json!({"email": "a@x.co", "accountUuid": "uuid-a", "organizationUuid": "org-1",
-            "organizationName": "Acme", "oauthAccount": {"emailAddress": "a@x.co",
-            "accountUuid": "uuid-a", "organizationUuid": "org-1", "organizationName": "Acme"}})
-    );
-    assert_eq!(records[1].credential, json!(API_KEY));
-
-    // Claude Code's own validation tells the three kinds apart (§7.1).
-    let cc = ClaudeCode::new(Arc::new(FakeKeychain::new()), Platform::MacOs);
-    let imported: Vec<String> = records
-        .iter()
-        .map(|r| cc.import_login(&r.identity, &r.credential).unwrap().kind)
-        .collect();
-    assert_eq!(imported, ["oauth", "api_key", "setup_token"]);
-
-    let d = decoded(&serde_json::to_vec(&cswap_three()).unwrap(), &[]);
-    assert!(d.cswap && !d.encrypted);
-    assert_eq!(d.records.len(), 3);
-}
-
-#[test]
-fn a_cswap_export_that_is_encrypted_or_not_version_1_is_refused_by_name() {
-    let mut encrypted = cswap_three();
-    encrypted["encrypted"] = json!(true);
-    let err = read_cswap_v1(&encrypted).unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "the cswap export is encrypted (encrypted: true), which tagteam cannot read"
-    );
-    let mut v2 = cswap_three();
+    assert_eq!(d.records[0].provider.as_str(), "claude-code");
+    let mut v2: Value = serde_json::from_slice(&file).unwrap();
     v2["version"] = json!(2);
-    let err = decode(&serde_json::to_vec(&v2).unwrap(), &[], &mut ask_nothing).unwrap_err();
+    let err = decode(
+        &serde_json::to_vec(&v2).unwrap(),
+        &[],
+        &registry(),
+        &mut ask_nothing,
+    )
+    .unwrap_err();
     assert_eq!(
         err.to_string(),
         "the cswap export's version is 2; tagteam reads version 1"
     );
-    let mut no_config = cswap_three();
-    no_config["accounts"][1]
-        .as_object_mut()
-        .unwrap()
-        .remove("config");
-    let err = read_cswap_v1(&no_config).unwrap_err();
+    let fake_only = ProviderRegistry::new().with(Arc::new(tagteam_fake::FakeAgent::new()));
+    let err = decode(&file, &[], &fake_only, &mut ask_nothing).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "account 2: config.oauthAccount must be a JSON object"
+        "the file is not a tagteam export, an age-encrypted one, or a cswap version 1 export"
     );
-    assert!(!err.to_string().contains(API_KEY));
 }
 
 #[test]
@@ -497,7 +440,7 @@ fn an_armored_export_with_leading_whitespace_decrypts() {
     .unwrap();
     let mut padded = b"\n \r\n".to_vec();
     padded.extend_from_slice(&file);
-    let d = decode(&padded, &[], &mut |_: &Need| {
+    let d = decode(&padded, &[], &registry(), &mut |_: &Need| {
         Some(SecretString::from("correct horse"))
     })
     .unwrap();
@@ -527,7 +470,13 @@ fn damaged_ssh_stanza_file() -> Vec<u8> {
 #[test]
 fn a_key_that_fails_to_open_a_file_does_not_blame_a_passphrase() {
     let plain = parse_identity_file("id_plain", SSH_SK.as_bytes()).unwrap();
-    let err = decode(&damaged_ssh_stanza_file(), &[plain], &mut ask_nothing).unwrap_err();
+    let err = decode(
+        &damaged_ssh_stanza_file(),
+        &[plain],
+        &registry(),
+        &mut ask_nothing,
+    )
+    .unwrap_err();
     assert_eq!(err.kind(), "decrypt-failed");
     assert_eq!(
         err.to_string(),
@@ -541,7 +490,7 @@ fn an_encrypted_ssh_key_is_not_asked_for_when_the_file_has_no_ssh_ed25519_stanza
     let to = parse_recipient(&key.to_public().to_string()).unwrap();
     let file = encrypt(&plaintext(), &Encryption::Recipients(vec![to])).unwrap();
     let locked = parse_identity_file("id_ed25519", SSH_SK_ENCRYPTED.as_bytes()).unwrap();
-    let err = decode(&file, &[locked], &mut ask_nothing).unwrap_err();
+    let err = decode(&file, &[locked], &registry(), &mut ask_nothing).unwrap_err();
     assert_eq!(
         (err.kind(), err.to_string().as_str()),
         (
@@ -726,7 +675,7 @@ fn an_encrypted_rsa_private_section_under_an_ed25519_header_is_refused_once_unlo
         &Encryption::Recipients(vec![parse_recipient(SSH_PK).unwrap()]),
     )
     .unwrap();
-    let err = decode(&file, &[locked], &mut |_: &Need| {
+    let err = decode(&file, &[locked], &registry(), &mut |_: &Need| {
         Some(SecretString::from("pw"))
     })
     .unwrap_err();

@@ -345,6 +345,7 @@ agent-specific facts.
 
 This trait is internal API, not a public plugin interface. It is expected to change when the
 second provider lands (§17, R7).
+The review refactor adds `vars`, `words`, `statusline_setup` and `foreign_export` ([review refactor §5.2](2026-10-19-tagteam-review-refactor-design.md)).
 
 ## 5. Platforms and paths
 
