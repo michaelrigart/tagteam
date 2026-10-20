@@ -383,7 +383,7 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::{Color, Modifier};
     use tagteam_core::ProviderId;
-    use tagteam_core::autoswitch::Strategy;
+    use tagteam_core::autoswitch::AutoStrategy;
     use tagteam_daemon::protocol::{Event, Status, StatusBackoff, StatusSwitch};
 
     use super::*;
@@ -474,7 +474,7 @@ mod tests {
         let consume_first = || {
             let mut state = fresh(Screen::Accounts);
             let mut snap = snapshot(many(1));
-            snap.providers[0].strategy = Strategy::ConsumeFirst;
+            snap.providers[0].strategy = AutoStrategy::ConsumeFirst;
             state.accounts.apply(snap);
             go_live(&mut state, one_job("auto", true));
             state
@@ -709,7 +709,7 @@ mod tests {
                 active_position: None,
                 accounts: vec![third],
                 threshold: 75.0,
-                strategy: Strategy::Best,
+                strategy: AutoStrategy::Best,
                 names: tagteam_engine::views::ProviderNames {
                     display_name: "FakeAgent",
                     launch_command: "fakeagent",
@@ -777,7 +777,7 @@ mod tests {
         // A wide state too long for the room at 120 columns takes its 80-column form, whole.
         let consume_first = {
             let mut snap = snapshot(many(1));
-            snap.providers[0].strategy = Strategy::ConsumeFirst;
+            snap.providers[0].strategy = AutoStrategy::ConsumeFirst;
             snap
         };
         for (case, mode, autoswitch, pid, snap) in [

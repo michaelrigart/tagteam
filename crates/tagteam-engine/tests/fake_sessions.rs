@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use common::{FakeFx, LSTART, Recorded, record_json, record_reading, usage_window};
 use serde_json::{Value, json};
-use tagteam_core::autoswitch::{AutoConfig, Decision, Strategy, Trigger};
+use tagteam_core::autoswitch::{AutoConfig, AutoStrategy, Decision, Trigger};
 use tagteam_core::{AccountId, Window, WindowKind};
 use tagteam_engine::auto::TickOutcome;
 use tagteam_engine::collect::{CollectMode, Collected};
@@ -643,7 +643,7 @@ fn a_tick_never_targets_a_fakeagent_candidate_a_session_owns() {
         cooldown_s: 300,
         interval_s: 60,
         unhealthy_ticks: 3,
-        strategy: Strategy::Best,
+        strategy: AutoStrategy::Best,
         include_api_key_accounts: false,
         models: Vec::new(),
         long_window: ffx.fake.primary_long_window().map(str::to_owned),

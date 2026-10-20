@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 
 use tagteam_core::ProviderId;
-use tagteam_core::autoswitch::Strategy;
+use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_daemon::auto::{self, AutoError, AutoFlags, AutoRun};
 use tagteam_daemon::daemon::{Daemon, DaemonExit, DaemonOptions};
 use tagteam_daemon::notify::Backend;
@@ -54,8 +54,8 @@ pub(in crate::app) fn auto_flags(
         interval_s: interval,
         cooldown_s: cooldown,
         strategy: strategy.map(|s| match s {
-            AutoStrategyArg::Best => Strategy::Best,
-            AutoStrategyArg::ConsumeFirst => Strategy::ConsumeFirst,
+            AutoStrategyArg::Best => AutoStrategy::Best,
+            AutoStrategyArg::ConsumeFirst => AutoStrategy::ConsumeFirst,
         }),
         models: model.as_deref().map(model_list),
         include_api_key_accounts,

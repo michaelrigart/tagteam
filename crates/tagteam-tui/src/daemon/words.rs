@@ -4,7 +4,7 @@
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use tagteam_core::ProviderId;
-use tagteam_core::autoswitch::Strategy;
+use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_daemon::protocol::StatusProvider;
 use tagteam_engine::words::{MISSING, threshold};
 
@@ -84,10 +84,10 @@ fn job_state(
     let mut pieces = match (job.mode.as_str(), job.waiting_for.as_deref()) {
         ("auto", _) => {
             let rest = view.map(|v| match (v.strategy, wide) {
-                (Strategy::ConsumeFirst, true) => "uses the soonest reset first".to_owned(),
-                (Strategy::ConsumeFirst, false) => "soonest reset".to_owned(),
-                (Strategy::Best, true) => format!("switches at {}", threshold(v.threshold)),
-                (Strategy::Best, false) => format!("at {}", threshold(v.threshold)),
+                (AutoStrategy::ConsumeFirst, true) => "uses the soonest reset first".to_owned(),
+                (AutoStrategy::ConsumeFirst, false) => "soonest reset".to_owned(),
+                (AutoStrategy::Best, true) => format!("switches at {}", threshold(v.threshold)),
+                (AutoStrategy::Best, false) => format!("at {}", threshold(v.threshold)),
             });
             said("●", Role::Accent, "auto on", rest.as_deref())
         }

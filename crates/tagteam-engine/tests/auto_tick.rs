@@ -15,7 +15,7 @@ use common::{
 };
 use tagteam_cc::{ItemKind, keychain_account, keychain_service};
 use tagteam_core::autoswitch::{
-    AutoConfig, AutoState, Decision, NoSwitchReason, Outcome, Strategy, Trigger,
+    AutoConfig, AutoState, AutoStrategy, Decision, NoSwitchReason, Outcome, Trigger,
 };
 use tagteam_core::{AccountId, ProviderId, Window, WindowKind};
 use tagteam_engine::Engine;
@@ -39,7 +39,7 @@ fn cfg(p: &dyn Provider) -> AutoConfig {
         cooldown_s: 300,
         interval_s: 60,
         unhealthy_ticks: 3,
-        strategy: Strategy::Best,
+        strategy: AutoStrategy::Best,
         include_api_key_accounts: false,
         models: Vec::new(),
         long_window: p.primary_long_window().map(str::to_owned),
@@ -382,7 +382,7 @@ fn consume_first_runs_best_on_a_provider_without_a_long_window() {
     read(&ffx.engine, &t.a, &reading(true, 10.0, 10.0));
     read(&ffx.engine, &t.b, &reading(true, 20.0, 50.0));
     let config = AutoConfig {
-        strategy: Strategy::ConsumeFirst,
+        strategy: AutoStrategy::ConsumeFirst,
         ..t.config
     };
     assert_eq!(config.long_window, None);
@@ -435,7 +435,7 @@ fn consume_first_switches_to_the_sooner_long_reset_after_a_re_check() {
     read(&fx.engine, &a, &soon);
     read(&fx.engine, &b, &reading(false, 10.0, 50.0));
     let config = AutoConfig {
-        strategy: Strategy::ConsumeFirst,
+        strategy: AutoStrategy::ConsumeFirst,
         ..cfg(fx.cc.as_ref())
     };
     let sink = Recorded::default();
@@ -487,7 +487,7 @@ fn a_re_check_that_cannot_refresh_a_reading_is_stale_usage() {
         T0 + 100,
     );
     let config = AutoConfig {
-        strategy: Strategy::ConsumeFirst,
+        strategy: AutoStrategy::ConsumeFirst,
         ..cfg(fx.cc.as_ref())
     };
     let sink = Recorded::default();
@@ -552,7 +552,7 @@ fn a_reading_the_re_check_skipped_stays_fresh_for_the_decision_after_it() {
         }),
     );
     let config = AutoConfig {
-        strategy: Strategy::ConsumeFirst,
+        strategy: AutoStrategy::ConsumeFirst,
         ..cfg(fx.cc.as_ref())
     };
     let sink = Recorded::default();
@@ -597,7 +597,7 @@ fn a_target_the_re_check_left_stale_is_never_switched_to() {
     read(&fx.engine, &c, &reading(false, 10.0, 50.0));
     fx.expire_access(&a);
     let config = AutoConfig {
-        strategy: Strategy::ConsumeFirst,
+        strategy: AutoStrategy::ConsumeFirst,
         ..cfg(fx.cc.as_ref())
     };
     let sink = Recorded::default();

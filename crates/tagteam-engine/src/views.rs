@@ -145,7 +145,7 @@ pub struct ProviderAccounts {
     pub accounts: Vec<AccountView>,
     /// The effective `autoswitch.threshold` and `autoswitch.strategy`, the provider's own table first.
     pub threshold: f64,
-    pub strategy: tagteam_core::autoswitch::Strategy,
+    pub strategy: tagteam_core::autoswitch::AutoStrategy,
     pub names: ProviderNames,
 }
 

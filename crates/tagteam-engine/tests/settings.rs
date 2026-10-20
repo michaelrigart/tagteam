@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::json;
 use tagteam_core::ProviderId;
-use tagteam_core::autoswitch::Strategy;
+use tagteam_core::autoswitch::AutoStrategy;
 use tagteam_core::tokens::{CardOverride, PriceOverride};
 use tagteam_engine::settings::{
     self, COOLDOWN_SECONDS_RANGE, ColorMode, HYSTERESIS_PCT_RANGE, INTERVAL_SECONDS_RANGE,
@@ -41,7 +41,7 @@ fn the_defaults_are_the_specs_table() {
     assert_eq!(d.interval_seconds, 60);
     assert_eq!(d.cooldown_seconds, 300);
     assert_eq!(d.hysteresis_pct, 10.0);
-    assert_eq!(d.strategy, Strategy::Best);
+    assert_eq!(d.strategy, AutoStrategy::Best);
     assert!(!d.include_api_key_accounts);
     assert_eq!(d.unhealthy_ticks, 3);
     assert_eq!(d.models, Vec::<String>::new());
@@ -130,7 +130,7 @@ events = ["limit", "switch"]
             interval_seconds: 120,
             cooldown_seconds: 0,
             hysteresis_pct: 12.5,
-            strategy: Strategy::ConsumeFirst,
+            strategy: AutoStrategy::ConsumeFirst,
             include_api_key_accounts: true,
             unhealthy_ticks: 5,
             models: models(&["Fable", "Opus"]),
@@ -839,10 +839,10 @@ fn a_boolean_reads_only_true_false_one_zero_yes_and_no() {
 
 #[test]
 fn the_strategy_reads_best_and_consume_first_by_their_names() {
-    assert_eq!(Strategy::Best.as_str(), "best");
-    assert_eq!(Strategy::ConsumeFirst.as_str(), "consume-first");
-    for strategy in [Strategy::Best, Strategy::ConsumeFirst] {
-        assert_eq!(Strategy::parse(strategy.as_str()), Some(strategy));
+    assert_eq!(AutoStrategy::Best.as_str(), "best");
+    assert_eq!(AutoStrategy::ConsumeFirst.as_str(), "consume-first");
+    for strategy in [AutoStrategy::Best, AutoStrategy::ConsumeFirst] {
+        assert_eq!(AutoStrategy::parse(strategy.as_str()), Some(strategy));
         let (settings, warnings) = load(&format!(
             "[autoswitch]\nstrategy = \"{}\"\n",
             strategy.as_str()
@@ -851,7 +851,7 @@ fn the_strategy_reads_best_and_consume_first_by_their_names() {
         assert!(warnings.is_empty(), "{warnings:?}");
     }
     for name in ["Best", "consume_first", "", " best"] {
-        assert_eq!(Strategy::parse(name), None, "{name:?}");
+        assert_eq!(AutoStrategy::parse(name), None, "{name:?}");
     }
 }
 
@@ -871,7 +871,7 @@ fn a_providers_autoswitch_table_comes_first_for_every_key() {
             settings.include_api_key_accounts,
             settings.unhealthy_ticks
         ),
-        (30, 0, 20.0, Strategy::Best, false, 1)
+        (30, 0, 20.0, AutoStrategy::Best, false, 1)
     );
 
     // An invalid override warns, naming the provider's key, and the global value applies.
@@ -881,7 +881,7 @@ fn a_providers_autoswitch_table_comes_first_for_every_key() {
     let (settings, warnings) = load(&text);
     assert_eq!(
         (settings.interval_seconds, settings.strategy),
-        (120, Strategy::ConsumeFirst)
+        (120, AutoStrategy::ConsumeFirst)
     );
     assert_eq!(warnings.len(), 2, "{warnings:?}");
     for key in ["interval_seconds", "strategy"] {
@@ -892,7 +892,7 @@ fn a_providers_autoswitch_table_comes_first_for_every_key() {
     let (other, warnings) = load_as(&text, "fake-agent");
     assert_eq!(
         (other.interval_seconds, other.strategy),
-        (120, Strategy::ConsumeFirst)
+        (120, AutoStrategy::ConsumeFirst)
     );
     assert!(warnings.is_empty(), "{warnings:?}");
 }
@@ -1295,13 +1295,13 @@ fn the_auto_switch_keys_are_read_from_the_provider_s_table_first() {
             s.include_api_key_accounts,
             s.unhealthy_ticks
         ),
-        (30, 600, 5.0, Strategy::ConsumeFirst, true, 2),
+        (30, 600, 5.0, AutoStrategy::ConsumeFirst, true, 2),
         "a whole number reads as a float key's value"
     );
     let (s, _) = load_as(text, "fake-agent");
     assert_eq!(
         (s.interval_seconds, s.strategy, s.include_api_key_accounts),
-        (120, Strategy::Best, false),
+        (120, AutoStrategy::Best, false),
         "another provider's table does not apply"
     );
 }
@@ -1342,7 +1342,7 @@ fn the_strategy_and_the_colour_read_their_values_exactly() {
             "[autoswitch]\nstrategy = \"consume-first\"\n\
              [provider.claude-code.autoswitch]\nstrategy = {text}\n"
         ));
-        assert_eq!(s.strategy, Strategy::ConsumeFirst, "{text}");
+        assert_eq!(s.strategy, AutoStrategy::ConsumeFirst, "{text}");
         assert_eq!(warnings.len(), 1, "{text}: {warnings:?}");
         assert!(
             warnings[0].contains(

@@ -1076,7 +1076,7 @@ fn auto_config(fx: &Fx) -> tagteam_core::autoswitch::AutoConfig {
         cooldown_s: 300,
         interval_s: 60,
         unhealthy_ticks: 3,
-        strategy: tagteam_core::autoswitch::Strategy::Best,
+        strategy: tagteam_core::autoswitch::AutoStrategy::Best,
         include_api_key_accounts: false,
         models: Vec::new(),
         long_window: fx.cc.primary_long_window().map(str::to_owned),
