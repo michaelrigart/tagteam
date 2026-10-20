@@ -29,6 +29,7 @@ with the one before, so any release may contain breaking changes. Each section s
   write no longer loses it.
 - The daemon and `tagteam run` wake far less often when idle. A 12-month token report is about
   twice as fast and uses less than half the memory.
+- `tagteam tui` no longer wakes up 20 times a second while it waits for a key.
 
 ### Security
 
