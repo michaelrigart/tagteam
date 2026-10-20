@@ -2138,7 +2138,7 @@ fn a_live_credential_that_links_to_an_accounts_vault_file_refuses_a_provider_pur
 #[test]
 fn a_hard_link_to_a_protected_file_is_still_refused() {
     // A hard link shares the device and the inode with the vault file but not its path, so only
-    // the file identity tells the live credential from an unrelated file.
+    // the file identity shows that the live credential is the vault file under another name.
     let fx = Fx::with(Platform::Linux, |_| {});
     let id = add(
         &fx.engine.store().unwrap(),
