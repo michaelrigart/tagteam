@@ -1977,7 +1977,7 @@ impl App<'_, '_> {
                 self.after_prompt()?;
                 line.ok_or_else(cancelled)
             }
-            Some(t) => Ok(t),
+            Some(t) => Ok(prompt::note_argv_token(&mut *self.io.err, t)),
             None if self.can_prompt() => {
                 let token = self.io.prompter.secret("Token: ");
                 self.after_prompt()?;

@@ -445,6 +445,62 @@ fn ctrl_c_while_add_token_reads_a_terminal_stdin_exits_130_without_waiting_for_e
 }
 
 #[test]
+fn add_token_dash_on_a_terminal_does_not_echo_the_token() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    two_fresh_accounts(root);
+    let (master, slave) = open_pty();
+    let watch = slave.try_clone().unwrap();
+
+    let child = std_cmd(root)
+        .args(["add-token", "-"])
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Type only once the read has turned the echo off; typed earlier, the terminal echoes it.
+    let echo_on = || {
+        let mut t = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `watch` is an open terminal, and `t` is writable for one termios.
+        assert_eq!(
+            unsafe { libc::tcgetattr(watch.as_raw_fd(), t.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: tcgetattr returned 0, so `t` is initialised.
+        unsafe { t.assume_init() }.c_lflag & libc::ECHO != 0
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while echo_on() {
+        assert!(Instant::now() < deadline, "the echo was never turned off");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut master = std::fs::File::from(master);
+    master.write_all(b"sk-ant-api03-typed-secret\n").unwrap();
+    let out = finish(child, Duration::from_secs(5));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+
+    // What the terminal showed, without blocking: until nothing more is there.
+    // SAFETY: fcntl on a descriptor `master` owns, with flags it just read.
+    unsafe {
+        let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let (mut shown, mut chunk) = (Vec::new(), [0u8; 256]);
+    while let Ok(n @ 1..) = master.read(&mut chunk) {
+        shown.extend_from_slice(&chunk[..n]);
+    }
+    assert!(
+        !String::from_utf8_lossy(&shown).contains("typed-secret"),
+        "echoed: {shown:?}"
+    );
+    assert!(!stderr.contains("command line"), "{stderr}");
+}
+
+#[test]
 fn a_signal_while_add_token_reads_a_pipe_that_stays_open_exits_with_it_and_the_interrupted_envelope()
  {
     // `add-token -` from a pipe whose writer keeps it open without a newline: a plain read_line
