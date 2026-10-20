@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-use tagteam_provider::atomic::{remove_target, write_atomic_with};
+use tagteam_provider::atomic::{remove_target, resolve_target, write_atomic_with};
 use tagteam_provider::splice::{self, render_nested};
 use tagteam_provider::{Identity, LiveLocks, ProviderError, Read, ReadError, Undo};
 
@@ -77,6 +77,16 @@ impl Undo for ConfigUndo {
     fn what(&self) -> String {
         format!("restore {}", self.path.display())
     }
+}
+
+/// The permission bits of the config file `path` resolves to when group or others can read or
+/// write it (as `splice_key` resolves a symlink); `None` for 0600 or tighter, an absent or
+/// dangling target, or any error.
+pub fn group_or_other_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let target = resolve_target(path).ok()?;
+    let mode = fs::metadata(target).ok()?.permissions().mode();
+    (mode & 0o077 != 0).then_some(mode & 0o777)
 }
 
 /// §9.5: replaces (`Some`) or removes (`None`) one top-level key, changing no other byte.

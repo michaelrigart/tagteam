@@ -2553,3 +2553,70 @@ fn a_token_set_inside_the_scope_ends_the_retries_and_no_file_covers_the_read() {
     );
     assert_eq!(kc.finds(), 1);
 }
+
+#[test]
+fn a_config_file_others_can_read_is_reported_with_its_mode_and_a_tight_one_is_not() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let f = d.path().join(".claude.json");
+    for (mode, expected) in [
+        (0o644, Some(0o644)),
+        (0o640, Some(0o640)),
+        (0o604, Some(0o604)),
+        (0o600, None),
+        (0o400, None),
+    ] {
+        fs::write(&f, "{}").unwrap();
+        fs::set_permissions(&f, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(config::group_or_other_mode(&f), expected, "{mode:o}");
+    }
+    assert_eq!(config::group_or_other_mode(&d.path().join("absent")), None);
+}
+
+#[test]
+fn a_symlinked_config_is_judged_by_its_target() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let d = tempfile::tempdir().unwrap();
+    let open_file = d.path().join("open.json");
+    let tight_file = d.path().join("tight.json");
+    fs::write(&open_file, "{}").unwrap();
+    fs::write(&tight_file, "{}").unwrap();
+    fs::set_permissions(&open_file, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&tight_file, fs::Permissions::from_mode(0o600)).unwrap();
+    let to_open = d.path().join("to-open");
+    let to_tight = d.path().join("to-tight");
+    let dangling = d.path().join("dangling");
+    symlink(&open_file, &to_open).unwrap();
+    symlink(&tight_file, &to_tight).unwrap();
+    symlink(d.path().join("nowhere"), &dangling).unwrap();
+    assert_eq!(config::group_or_other_mode(&to_open), Some(0o644));
+    assert_eq!(config::group_or_other_mode(&to_tight), None);
+    assert_eq!(config::group_or_other_mode(&dangling), None);
+}
+
+#[test]
+fn linux_stores_a_managed_key_in_a_readable_config_without_refusing_or_chmodding() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let s = store(&f, Platform::Linux);
+    fs::write(&f.paths.global_config, "{\n  \"userID\": \"u\"\n}\n").unwrap();
+    fs::set_permissions(&f.paths.global_config, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        s.write_managed_key(
+            &f.env,
+            &f.paths,
+            b"sk-ant-api03-readable",
+            &open,
+            &mut save_nothing
+        )
+        .unwrap(),
+        SecretStore::File(f.paths.global_config.clone())
+    );
+    assert!(
+        config::get_key(&f.paths.global_config, "primaryApiKey")
+            .present()
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(mode_of(&f.paths.global_config), 0o644);
+}
