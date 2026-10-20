@@ -578,7 +578,8 @@ only.
   machine-shared keys (Appendix A.4), every other key kept in its order, or an `sk-ant-api…`
   string for API-key accounts. A credential that is not a JSON object is stored unchanged. A
   vault item written before this rule keeps its bytes until its next store; nothing migrates
-  it.
+  it. A rescue written before this rule likewise keeps its full bytes until it is settled,
+  which stores the vault form.
 - **Account locks.** Every write or delete of an account's vault entries holds that account's
   lock: `flock(LOCK_EX)` on `locks/<id>.lock`, fd `O_CLOEXEC`, released by the kernel when the
   holder exits. Each writer compares and replaces inside one hold, so no writer can overwrite a
@@ -637,9 +638,9 @@ the Keychain's failure modes.
     reader that only picks a rescue (export, §13.3) skips such a rescue.
   - Each file is a JSON envelope: `{"format": "tagteam-rescue", "version": 1, "accountId",
     "loginEpoch", "predecessorFp", "credential"}`. `credential` holds the credential bytes
-    in vault form (§6.2), as a UTF-8 string. `predecessorFp` is the fingerprint of the generation that was
-    sent, which is how the gate tells that a rescue succeeds the vault's current generation.
-    The filename's `<fp12>` is the successor's fingerprint.
+    in vault form (§6.2), as a UTF-8 string. `predecessorFp` is the fingerprint of the
+    generation that was sent, which is how the gate tells that a rescue succeeds the vault's
+    current generation. The filename's `<fp12>` is the successor's fingerprint.
   - A rescue file that cannot be read or parsed makes the gate return `Transient` with kind
     `rescue-unreadable`, without sending a request. It also blocks activating the account
     until it is settled (§6.2).
@@ -843,7 +844,8 @@ This procedure is the only place a stored refresh token is ever sent to the toke
 6. **Write ahead, then persist, compare-and-swap style.** In this order:
    1. As soon as a received successor is known to belong to this account, before anything else
       in this step, write its rescue envelope (§6.3, vault form) with the fsynced 0600 writer.
-      This is best effort: a failure is logged and the step goes on.
+      This is best effort: a failure is logged once the vault write settles, and the step goes
+      on.
    2. Re-read the vault and compare. With every writer under the account lock this comparison
       cannot fail; it stays as a defence.
    3. Persist to the vault and verify the write.
@@ -3540,8 +3542,9 @@ since 2.1.283.
   `-X "<hex>"`. `security -i` unescapes `\"` and `\\` and passes non-ASCII, `#`, `$`, `%` and
   tab through; JSON costs about 1.1 bytes per byte this way, against 2 for hex.
   - If the chosen line exceeds 4032 bytes (the 4096-byte `-i` line limit minus 64), use argv
-    instead, with the same encoding (`-w <text>` or `-X <hex>`), and log a WARN that names the
-    service, the account ID and the byte length, never the value. Claude Code does the same.
+    instead, with the same flag: `-w` followed by the credential's own text, unescaped (argv
+    needs no quoting), or `-X <hex>`. Log a WARN that names the service, the account ID and the
+    byte length, never the value. Claude Code does the same.
     An over-long `-i` line truncates silently and leaves the old entry.
   - `-U` updates the item in place and preserves its access control.
 - **Delete:** `delete-generic-password -a <acct> -s <svc>`. rc 44 counts as success.
@@ -3614,8 +3617,9 @@ since 2.1.283.
   profile's own credential at a profile bootstrap, §12.3):
   `mcpOAuth, mcpOAuthClientConfig, mcpXaaIdp, mcpXaaIdpConfig, pluginSecrets`.
   tagteam never keeps them in its own copies: the vault and `rescue/` hold the credential
-  without them (§6.2), and `--full` exports (§13.3) omit them. `displaced/` files stay verbatim,
-  since they keep exactly what was not tagteam's to keep.
+  without them (§6.2), and `--full` exports (§13.3) omit them. (A vault item or rescue written
+  before that rule keeps its full bytes until its next store or settle.) `displaced/` files
+  stay verbatim, since they keep exactly what was not tagteam's to keep.
 - **Account-scoped keys:** `claudeAiOauth, trustedDeviceToken`. Unknown sibling keys are treated
   as account-scoped. *2.1.286* also stores `designOauth`, `gatewayTrust` and
   `enterpriseGateway` in the entry; tagteam treats them as unknown keys, so account-scoped

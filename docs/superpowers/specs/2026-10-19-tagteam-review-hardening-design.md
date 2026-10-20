@@ -588,7 +588,9 @@ Found while planning and building; each is listed in the MR.
   step 2 (`switch.rs:2043`) compares the live entry and the target's vault bytes both in
   vault form, or `switch --force` onto the live account would displace its own entry (H5.3).
 - **H5.1:** the hex line is never shorter than the text line, so `-X` is used only for bytes
-  that cannot be text; past the limit, argv carries the encoding the line would have used.
+  that cannot be text; past the limit, argv uses the same flag as the line would have: `-w`
+  with the credential's own text, unescaped (argv needs no quoting, so the line's escaping
+  does not apply), or `-X` with the hex.
 - **H6:** `export.rs:494-550` is the session-owned export path; an idle account's export goes
   through `settle_rescues`. All three paths apply the landed rule.
 - **H6:** the WARN for a failed write-ahead is logged only after the vault write settles,
