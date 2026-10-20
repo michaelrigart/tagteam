@@ -15,7 +15,7 @@ const LEAKS: [&str; 3] = ["claude", "anthropic", "tagteam_cc"];
 /// Held for the TUI redesign, pinned by file and text. Each must still match, so an entry goes
 /// once its line does.
 const ALLOWED: [(&str, &str); 0] = [];
-const COMPOSITION_ROOT: &str = "crates/tagteam/src/app/mod.rs";
+const COMPOSITION_ROOT: &str = "crates/tagteam/src/app/context.rs";
 const BINARY_ALLOWED: [(&str, &str); 2] = [
     ("crates/tagteam/src/logging.rs", "tagteam_cc=info"),
     ("crates/tagteam/src/logging.rs", "tagteam_cc=debug"),
