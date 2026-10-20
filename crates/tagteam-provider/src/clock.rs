@@ -1,3 +1,4 @@
+#[cfg(any(test, feature = "test-doubles"))]
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,9 +18,11 @@ impl Clock for SystemClock {
     }
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 #[derive(Debug)]
 pub struct FakeClock(AtomicI64);
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl FakeClock {
     pub fn new(ms: i64) -> Self {
         Self(AtomicI64::new(ms))
@@ -34,6 +37,7 @@ impl FakeClock {
     }
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl Clock for FakeClock {
     fn now_ms(&self) -> i64 {
         self.0.load(Ordering::SeqCst)

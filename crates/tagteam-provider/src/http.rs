@@ -1,9 +1,12 @@
 //! The `Http` port (§4.4): one blocking request, with its own timeout. The engine's `ureq`
-//! adapter is the production implementation; `ScriptedHttp` is the tests'. A provider builds
+//! adapter is the production implementation; `ScriptedHttp` (behind the `test-doubles` feature) is
+//! the tests'. A provider builds
 //! every request and parses every response; the engine owns everything around them.
 
+#[cfg(any(test, feature = "test-doubles"))]
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+#[cfg(any(test, feature = "test-doubles"))]
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -177,6 +180,7 @@ impl Http for NoHttp {
 }
 
 /// A request as `ScriptedHttp` saw it. `Debug` redacts like `HttpRequest`'s.
+#[cfg(any(test, feature = "test-doubles"))]
 #[derive(Clone)]
 pub struct RecordedRequest {
     pub method: Method,
@@ -185,6 +189,7 @@ pub struct RecordedRequest {
     pub body: Option<Vec<u8>>,
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl fmt::Debug for RecordedRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RecordedRequest")
@@ -202,17 +207,20 @@ impl fmt::Debug for RecordedRequest {
     }
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 type Reply = Result<HttpResponse, HttpError>;
 
 /// The tests' `Http`: replies queued per `(method, url)` and served first in, first out; the
 /// last reply queued for a route repeats once it is the only one left. An unscripted route is
 /// `PreSend`, as an unreachable host would be. Every request is recorded, scripted or not.
+#[cfg(any(test, feature = "test-doubles"))]
 #[derive(Default)]
 pub struct ScriptedHttp {
     routes: Mutex<HashMap<(Method, String), VecDeque<Reply>>>,
     log: Mutex<Vec<RecordedRequest>>,
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl ScriptedHttp {
     pub fn new() -> Self {
         Self::default()
@@ -258,6 +266,7 @@ impl ScriptedHttp {
     }
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl Http for ScriptedHttp {
     fn send(&self, req: &HttpRequest) -> Result<HttpResponse, HttpError> {
         self.log

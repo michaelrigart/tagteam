@@ -1,3 +1,4 @@
+#[cfg(any(test, feature = "test-doubles"))]
 use std::collections::VecDeque;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs;
@@ -7,8 +8,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(any(test, feature = "test-doubles"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+#[cfg(any(test, feature = "test-doubles"))]
 use std::sync::{Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -676,6 +679,7 @@ impl ProcessSpawner for SystemSpawner {
 /// Tests: replies in order (a discarded run's too), recording each spec. A token already set answers `Interrupted`, as
 /// a real spawn does, and leaves the next reply queued; with no reply left the spawn fails, as
 /// a missing launch command would.
+#[cfg(any(test, feature = "test-doubles"))]
 #[derive(Default)]
 pub struct ScriptedSpawner {
     replies: Mutex<VecDeque<Captured>>,
@@ -683,6 +687,7 @@ pub struct ScriptedSpawner {
     discards: AtomicUsize,
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl ScriptedSpawner {
     pub fn new() -> Self {
         Self::default()
@@ -708,6 +713,7 @@ impl ScriptedSpawner {
     }
 }
 
+#[cfg(any(test, feature = "test-doubles"))]
 impl ProcessSpawner for ScriptedSpawner {
     fn run_captured(&self, spec: &SpawnSpec, _timeout: Duration, cancel: &Cancel) -> Captured {
         self.specs

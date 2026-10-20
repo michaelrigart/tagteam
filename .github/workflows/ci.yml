@@ -57,3 +57,25 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories
+
+  # No Swatinem/rust-cache here, for the same reason as deny: a poisoned cache must not be able to
+  # make this job pass
+  feature-graph:
+    name: feature graph (test-doubles)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: test-doubles is not in the normal-dependency graph
+        run: |
+          tree=$(cargo tree --workspace -e normal,features -i tagteam-provider --locked)
+          printf '%s\n' "$tree"
+          grep -q '^tagteam-provider ' <<<"$tree"
+          if grep -F 'feature "test-doubles"' <<<"$tree"; then
+            echo "::error::a normal dependency enables tagteam-provider's test-doubles feature"
+            exit 1
+          fi
