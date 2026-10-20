@@ -1,6 +1,6 @@
 # tagteam — review hardening: security and performance
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/23
 **Date:** 2026-10-19
 **Scope:** The security and performance findings of the codebase review of 2026-10-19, run
 on `main` at 683b266. The reports are not in the repository; this spec carries everything a
