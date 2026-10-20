@@ -13,7 +13,6 @@ use tagteam_core::autoswitch::NoSwitchReason;
 use tagteam_core::{AccountId, ProviderId};
 use tagteam_daemon::protocol::{Event, Status, StatusProvider};
 use tagteam_daemon::tokens::TOKEN_INDEX;
-use tagteam_engine::words::NO_SWITCH_REASONS;
 
 use crate::live::{Live, StatusError};
 use crate::msg::Cmd;
@@ -368,7 +367,7 @@ fn note(state: &mut State, event: &Event, now_ms: i64) {
 
 /// The reason a `no-switch` spells `code` (T2-27); none for one this TUI does not know.
 pub(crate) fn no_switch_reason(code: &str) -> Option<NoSwitchReason> {
-    NO_SWITCH_REASONS.into_iter().find(|r| r.as_str() == code)
+    NoSwitchReason::ALL.into_iter().find(|r| r.as_str() == code)
 }
 
 /// The usage of the account in use at `poll`: 100 less its `headroomPct`.

@@ -28,6 +28,12 @@ impl Mode {
             Mode::Idle => "idle",
         }
     }
+
+    pub const ALL: [Self; 4] = [Mode::Auto, Mode::Collect, Mode::Waiting, Mode::Idle];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
+    }
 }
 
 /// D4.3: what a `waiting` job waits for.
@@ -45,6 +51,12 @@ impl WaitingFor {
             WaitingFor::EngineLock => "engine-lock",
             WaitingFor::Schema => "schema",
         }
+    }
+
+    pub const ALL: [Self; 2] = [WaitingFor::EngineLock, WaitingFor::Schema];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.as_str() == s)
     }
 }
 
@@ -245,6 +257,24 @@ mod tests {
             [StopReason::Signal, StopReason::Upgrade, StopReason::Schema].map(StopReason::as_str),
             ["signal", "upgrade", "schema"]
         );
+    }
+
+    #[test]
+    fn every_mode_parses_from_its_own_spelling() {
+        for mode in Mode::ALL {
+            assert_eq!(Mode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(Mode::parse("Auto"), None, "case-sensitive");
+        assert_eq!(Mode::parse("paused"), None);
+    }
+
+    #[test]
+    fn every_waiting_for_parses_from_its_own_spelling() {
+        for waiting_for in WaitingFor::ALL {
+            assert_eq!(WaitingFor::parse(waiting_for.as_str()), Some(waiting_for));
+        }
+        assert_eq!(WaitingFor::parse("Schema"), None, "case-sensitive");
+        assert_eq!(WaitingFor::parse("upgrade"), None);
     }
 
     #[test]

@@ -361,27 +361,6 @@ pub fn token_footnotes(report: &TokenReport, mark: &str, unreadable: bool) -> Ve
     notes
 }
 
-/// Every `NoSwitchReason`, until R3's `NoSwitchReason::ALL` (T2-27).
-pub const NO_SWITCH_REASONS: [NoSwitchReason; 17] = [
-    NoSwitchReason::UnmanagedActiveAccount,
-    NoSwitchReason::NoActiveAccount,
-    NoSwitchReason::ActiveApiKey,
-    NoSwitchReason::BelowThreshold,
-    NoSwitchReason::ActiveUsageUnknown,
-    NoSwitchReason::Cooldown,
-    NoSwitchReason::NoCandidates,
-    NoSwitchReason::NoComparison,
-    NoSwitchReason::ResetUnknown,
-    NoSwitchReason::AlreadyConsumingSoonest,
-    NoSwitchReason::NoQualifyingCandidate,
-    NoSwitchReason::StaleUsage,
-    NoSwitchReason::AllExhausted,
-    NoSwitchReason::EngineRunning,
-    NoSwitchReason::InterruptedSwitch,
-    NoSwitchReason::LiveChanged,
-    NoSwitchReason::NoViableTarget,
-];
-
 /// What a `no-switch` sentence says besides its reason (spec §11.3).
 #[derive(Debug, Clone, Copy)]
 pub struct NoSwitchFacts<'a> {
@@ -1192,8 +1171,8 @@ mod tests {
                 "every target failed; trying again next check",
             ),
         ];
-        assert_eq!(expected.len(), NO_SWITCH_REASONS.len());
-        for reason in NO_SWITCH_REASONS {
+        assert_eq!(expected.len(), NoSwitchReason::ALL.len());
+        for reason in NoSwitchReason::ALL {
             let detail = match reason {
                 Cooldown => "4m",
                 ActiveUsageUnknown => "2/3",
@@ -1268,7 +1247,7 @@ mod tests {
             }
         }
         assert_eq!(
-            NO_SWITCH_REASONS.map(index),
+            NoSwitchReason::ALL.map(index),
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
     }
