@@ -99,7 +99,7 @@ impl App<'_, '_> {
 
     fn notices(&mut self, notices: &[String]) {
         for n in notices {
-            let _ = writeln!(self.io.err, "note: {n}");
+            self.io.note(n);
         }
     }
 
@@ -122,7 +122,7 @@ impl App<'_, '_> {
             Err(e) => vec![format!("usage was not collected: {e}")],
         };
         for w in warnings {
-            let _ = writeln!(self.io.err, "warning: {w}");
+            self.io.warn(&w);
         }
         Ok(())
     }
@@ -445,12 +445,12 @@ impl App<'_, '_> {
             outcome = self.engine.switch(req())?;
         }
         for w in &outcome.warnings {
-            let _ = writeln!(self.io.err, "warning: {w}");
+            self.io.warn(w);
         }
         // As the engine reports it for this write: a file that is the platform's only store is
         // routine and says nothing.
         if let Some(notice) = render::fallback_notice(&outcome) {
-            let _ = writeln!(self.io.err, "warning: {notice}");
+            self.io.warn(&notice);
         }
         self.print(
             &render::switch_human(&outcome),

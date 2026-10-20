@@ -43,7 +43,7 @@ impl App<'_, '_> {
             // Decision 14: the target changed under the launch's locks. Plan once more and act
             // on that plan; a second change is this command's error, never a loop.
             Err(EngineError::TargetChanged { why }) => {
-                let _ = writeln!(self.io.err, "warning: {why}");
+                self.io.warn(&why);
                 match self.engine.plan_run(&request)? {
                     RunPlan::Plain { spec, warning } => return self.run_plain(&spec, warning),
                     RunPlan::Session {
@@ -55,7 +55,7 @@ impl App<'_, '_> {
         };
         // Decision 18: the environment warnings are among them, computed by the engine.
         for w in &launched.warnings {
-            let _ = writeln!(self.io.err, "warning: {w}");
+            self.io.warn(w);
         }
         let cancel = self.engine.cancel();
         // §12.3 "Every launch is checked"; a launch that bootstrapped skips it. A
@@ -82,7 +82,7 @@ impl App<'_, '_> {
     /// failed.
     fn run_plain(&mut self, spec: &SpawnSpec, warning: Option<String>) -> Result<i32, Failure> {
         if let Some(w) = warning {
-            let _ = writeln!(self.io.err, "warning: {w}");
+            self.io.warn(&w);
         }
         if let Some(signal) = self.engine.cancel().requested() {
             return Err(EngineError::Interrupted(signal).into());

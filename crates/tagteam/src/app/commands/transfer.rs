@@ -103,7 +103,7 @@ impl App<'_, '_> {
             full,
         })?;
         for w in transfer_cmd::export_warnings(&result) {
-            let _ = writeln!(self.io.err, "warning: {w}");
+            self.io.warn(&w);
         }
         if result.accounts.is_empty() {
             return Err(Failure::Message(
@@ -207,7 +207,7 @@ impl App<'_, '_> {
         self.ensure_unlocked()?;
         let report = self.engine.import(decoded.records, force)?;
         for w in &report.warnings {
-            let _ = writeln!(self.io.err, "warning: {w}");
+            self.io.warn(w);
         }
         self.print(
             &transfer_cmd::import_human(&report),

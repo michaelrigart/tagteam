@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use serde_json::{Value, json};
 use tagteam_daemon::daemon::DaemonError;
 use tagteam_engine::EngineError;
@@ -5,6 +7,7 @@ use tagteam_engine::displace::PurgeError;
 
 use crate::displaced_cmd;
 
+use super::Ended;
 use super::context::Io;
 
 /// §13.1.
@@ -80,6 +83,29 @@ impl From<DaemonError> for Failure {
     }
 }
 
+impl Failure {
+    /// Writes the failure and says how the command ended. With `signals`, one a signal caused is
+    /// an interruption, which `run` reports; without, it is an error like any other
+    /// (`statusline`'s).
+    pub(super) fn report(self, io: &mut Io<'_>, json: bool, signals: bool) -> Ended {
+        match self {
+            Failure::Engine(e) => match e.signal().filter(|_| signals) {
+                Some(signal) => Ended::Interrupted(signal),
+                None => Ended::Code(io.fail(json, e.kind(), &e.to_string())),
+            },
+            Failure::Purge(e) => match e.signal().filter(|_| signals) {
+                Some(signal) => Ended::Interrupted(signal),
+                None => Ended::Code(fail_purge(io, json, &e)),
+            },
+            Failure::Message(kind, m) => Ended::Code(io.fail(json, kind, &m)),
+            Failure::Usage(m) => {
+                io.fail(json, KIND_USAGE, &m);
+                Ended::Code(EXIT_USAGE)
+            }
+        }
+    }
+}
+
 pub(super) fn cancelled() -> Failure {
     Failure::Message(KIND_CANCELLED, CANCELLED.into())
 }
@@ -96,18 +122,26 @@ fn purge_error_json(kind: &str, message: &str, deleted: &[String]) -> Value {
     v
 }
 
-pub(super) fn fail(io: &mut Io<'_>, json: bool, kind: &str, message: &str) -> i32 {
+/// `error_json` on `out` under `--json`, else `tagteam: message` on `err`: the one error form, for
+/// the sites that run before an `Io` exists.
+pub(crate) fn fail_to(
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    json: bool,
+    kind: &str,
+    message: &str,
+) -> i32 {
     if json {
-        let _ = writeln!(io.out, "{}", error_json(kind, message));
+        let _ = writeln!(out, "{}", error_json(kind, message));
     } else {
-        let _ = writeln!(io.err, "tagteam: {message}");
+        let _ = writeln!(err, "tagteam: {message}");
     }
     EXIT_ERROR
 }
 
 /// A purge's failure after it deleted something: the human form lists each deletion before the
 /// error, and `--json` carries them as `deleted` beside `error`.
-pub(super) fn fail_purge(io: &mut Io<'_>, json: bool, e: &PurgeError) -> i32 {
+fn fail_purge(io: &mut Io<'_>, json: bool, e: &PurgeError) -> i32 {
     if json {
         let _ = writeln!(
             io.out,

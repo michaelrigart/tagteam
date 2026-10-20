@@ -13,7 +13,7 @@ use crate::cli::{Cli, Command};
 use crate::{daemon_cmd, root_guard};
 
 use early::{answer_completions, refuse_tui, run_shell_init, run_statusline};
-use failure::{Failure, KIND_INTERRUPTED, KIND_KEYCHAIN_LOCKED, fail, fail_purge};
+use failure::{Failure, KIND_INTERRUPTED, KIND_KEYCHAIN_LOCKED};
 
 mod commands;
 mod context;
@@ -27,7 +27,7 @@ pub(crate) use context::{
     locate, locate_run_shell, registry,
 };
 pub use failure::KIND_STALE_SELECTION;
-pub(crate) use failure::{EXIT_ERROR, EXIT_USAGE, KIND_ROOT, KIND_USAGE, error_json};
+pub(crate) use failure::{EXIT_ERROR, EXIT_USAGE, KIND_ROOT, KIND_USAGE, error_json, fail_to};
 
 /// §13.1: an interrupted command exits 128 + the signal (130 after SIGINT).
 const EXIT_SIGNAL_BASE: i32 = 128;
@@ -97,7 +97,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
     let cancel = ctx.env.cancel.clone();
     match run_command(cli, ctx, io) {
         Ended::Interrupted(signal) => {
-            fail(io, json, KIND_INTERRUPTED, INTERRUPTED);
+            io.fail(json, KIND_INTERRUPTED, INTERRUPTED);
             EXIT_SIGNAL_BASE + signal
         }
         Ended::Code(code) => {
@@ -121,7 +121,7 @@ pub fn run(cli: Cli, ctx: Context, io: &mut Io<'_>) -> i32 {
 fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     let json = cli.json;
     if let Err(msg) = root_guard::refuse_root() {
-        return Ended::Code(fail(io, json, KIND_ROOT, &msg));
+        return Ended::Code(io.fail(json, KIND_ROOT, &msg));
     }
     // §13.5: the status bar's fast path, before anything else is built.
     if let Some(Command::Statusline { print_config }) = &cli.command {
@@ -147,7 +147,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
             Ok(located) => {
                 run_shell_init(&located.registry, io, json, cli.provider.as_deref(), *shell)
             }
-            Err(e) => fail(io, json, e.kind(), &e.to_string()),
+            Err(e) => io.fail(json, e.kind(), &e.to_string()),
         });
     }
     // §13.7: a script from the command definitions alone. It reads no settings, no store and no
@@ -156,7 +156,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     if let Some(Command::Completions { shell }) = &cli.command {
         return match locate_run_shell(&ctx) {
             Ok(_) => answer_completions(io, json, *shell),
-            Err(e) => Ended::Code(fail(io, json, e.kind(), &e.to_string())),
+            Err(e) => Ended::Code(io.fail(json, e.kind(), &e.to_string())),
         };
     }
     let command = cli.command.unwrap_or(Command::List);
@@ -174,10 +174,10 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     // §12.8: under a marker that cannot be read the outer home is unknown, and nothing runs.
     let (engine, warnings) = match engine_for(ctx, provider_flag.as_ref()) {
         Ok(built) => built,
-        Err(e) => return Ended::Code(fail(io, json, e.kind(), &e.to_string())),
+        Err(e) => return Ended::Code(io.fail(json, e.kind(), &e.to_string())),
     };
     for w in &warnings {
-        let _ = writeln!(io.err, "warning: {w}");
+        io.warn(w);
     }
     let mut app = App {
         engine,
@@ -203,7 +203,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
         .filter(|_| !matches!(command, Command::Purge { .. }))
     {
         if let Err(e) = app.engine.provider(p) {
-            return Ended::Code(fail(app.io, json, e.kind(), &e.to_string()));
+            return Ended::Code(app.io.fail(json, e.kind(), &e.to_string()));
         }
     }
     let result = match command {
@@ -230,19 +230,7 @@ fn run_command(cli: Cli, ctx: Context, io: &mut Io<'_>) -> Ended {
     };
     match result {
         Ok(ended) => ended,
-        Err(Failure::Engine(e)) => match e.signal() {
-            Some(signal) => Ended::Interrupted(signal),
-            None => Ended::Code(fail(app.io, json, e.kind(), &e.to_string())),
-        },
-        Err(Failure::Purge(e)) => match e.signal() {
-            Some(signal) => Ended::Interrupted(signal),
-            None => Ended::Code(fail_purge(app.io, json, &e)),
-        },
-        Err(Failure::Message(kind, m)) => Ended::Code(fail(app.io, json, kind, &m)),
-        Err(Failure::Usage(m)) => {
-            fail(app.io, json, KIND_USAGE, &m);
-            Ended::Code(EXIT_USAGE)
-        }
+        Err(failure) => failure.report(app.io, json, true),
     }
 }
 

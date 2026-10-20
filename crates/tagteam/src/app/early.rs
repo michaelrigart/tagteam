@@ -10,7 +10,7 @@ use crate::{shell_init, statusline};
 
 use super::Ended;
 use super::context::{Context, Io, color_enabled};
-use super::failure::{EXIT_USAGE, Failure, KIND_UNSUPPORTED, KIND_USAGE, fail, fail_purge};
+use super::failure::{EXIT_USAGE, Failure, KIND_UNSUPPORTED, KIND_USAGE};
 
 const STATUSLINE_UNDER_JSON: &str = "statusline prints a line of text; run it without --json";
 const SHELL_INIT_UNDER_JSON: &str = "shell-init prints shell code; run it without --json";
@@ -31,7 +31,7 @@ pub(super) fn run_statusline(
     print_config: bool,
 ) -> i32 {
     if json {
-        fail(io, true, KIND_USAGE, STATUSLINE_UNDER_JSON);
+        io.fail(true, KIND_USAGE, STATUSLINE_UNDER_JSON);
         return EXIT_USAGE;
     }
     let (no_color_env, force_color_env) = (ctx.no_color_env, ctx.force_color_env);
@@ -84,13 +84,10 @@ pub(super) fn run_statusline(
             }
             0
         }
-        Err(Failure::Engine(e)) => fail(io, false, e.kind(), &e.to_string()),
-        Err(Failure::Purge(e)) => fail_purge(io, false, &e),
-        Err(Failure::Message(kind, m)) => fail(io, false, kind, &m),
-        Err(Failure::Usage(m)) => {
-            fail(io, false, KIND_USAGE, &m);
-            EXIT_USAGE
-        }
+        Err(failure) => match failure.report(io, false, false) {
+            Ended::Code(code) => code,
+            Ended::Interrupted(_) | Ended::Child(_) => unreachable!("no signals, no child"),
+        },
     }
 }
 
@@ -102,14 +99,14 @@ pub(super) fn refuse_tui(io: &mut Io<'_>, json: bool) -> Ended {
     } else {
         crate::tui_cmd::NEEDS_TERMINAL
     };
-    fail(io, json, KIND_USAGE, message);
+    io.fail(json, KIND_USAGE, message);
     Ended::Code(EXIT_USAGE)
 }
 
 /// §13.7's `completions`: the script, or a usage refusal under `--json`.
 pub(super) fn answer_completions(io: &mut Io<'_>, json: bool, shell: CompletionShell) -> Ended {
     if json {
-        fail(io, true, KIND_USAGE, COMPLETIONS_UNDER_JSON);
+        io.fail(true, KIND_USAGE, COMPLETIONS_UNDER_JSON);
         return Ended::Code(EXIT_USAGE);
     }
     let _ = io.out.write_all(&shell.script());
@@ -127,13 +124,13 @@ pub(super) fn run_shell_init(
     shell: ShellArg,
 ) -> i32 {
     if json {
-        fail(io, true, KIND_USAGE, SHELL_INIT_UNDER_JSON);
+        io.fail(true, KIND_USAGE, SHELL_INIT_UNDER_JSON);
         return EXIT_USAGE;
     }
     if let Some(id) = provider {
         if registry.get(&ProviderId::new(id)).is_none() {
             let e = EngineError::UnknownProvider(id.to_owned());
-            return fail(io, false, e.kind(), &e.to_string());
+            return io.fail(false, e.kind(), &e.to_string());
         }
     }
     let wrapped: Vec<Wrapped> = registry
