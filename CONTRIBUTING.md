@@ -35,6 +35,7 @@ The workspace has these crates under `crates/`:
 ```sh
 cargo build -p tagteam
 cargo fmt --all --check
+cargo clippy --workspace --locked -- -D warnings
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo clippy --workspace --all-targets --locked --features tagteam/test-support -- -D warnings
 cargo test --workspace --locked --no-fail-fast --features tagteam/test-support
@@ -175,8 +176,9 @@ You do not need to write a spec for a bug fix or a small change.
   design. Small fixes and documentation changes can go straight to a pull request.
 - **Keep it focused.** One concern per pull request, in small commits with imperative-mood
   messages (for example, "Refuse an empty alias"). Match the surrounding code and style.
-- **CI must be green.** That means `cargo fmt`, `clippy` with `-D warnings` (both with and
-  without `tagteam/test-support`), the tests on macOS and Linux, and the `deny` job.
+- **CI must be green.** That means `cargo fmt`, `clippy` with `-D warnings` (the shipped
+  shape, then all targets both with and without `tagteam/test-support`), the tests on macOS and
+  Linux, the `deny` job and the `feature-graph` job.
 - **Add tests** for new behaviour and for each bug you fix. Tests must use the fake Keychain,
   scratch directories and `tagteam-fake`; they must never touch a real account, your login
   keychain or your real Claude Code home.

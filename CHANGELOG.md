@@ -20,9 +20,9 @@ with the one before, so any release may contain breaking changes. Each section s
 - `--full` exports no longer carry the machine-shared keys (Claude Code's MCP OAuth tokens and
   plugin secrets); they stay on the machine, as default exports already did.
 - `tagteam add-token -` on a terminal no longer echoes the token.
-- Human output replaces control characters in text tagteam did not write (transcript paths,
-  unmanaged emails, the token endpoint's error text) with U+FFFD. `--json` and CSV are
-  unchanged.
+- Human output replaces control characters with U+FFFD in a session's project directory and in
+  unmanaged login emails; `--json` and CSV keep both raw. The token endpoint's error text is
+  sanitized wherever it appears, `--json` warnings included.
 - Keychain writes send the credential as text on `security`'s standard input, which roughly
   doubles what fits before the command-line fallback; that fallback now logs a WARN.
 - A refreshed token is written to `rescue/` before the vault write, so a kill during the vault
