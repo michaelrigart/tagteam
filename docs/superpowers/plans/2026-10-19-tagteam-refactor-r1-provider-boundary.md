@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Status:** Approved
+**Status:** Implemented — https://github.com/michaelrigart/tagteam/pull/22
 **Goal:** Move every Claude Code fact out of the neutral crates and the binary's non-root modules into `tagteam-cc` or provider-supplied data, give the binary one composition root, and add a test that keeps both, with Claude Code's output byte-identical except §11's two R1 changes.
 **Architecture:** Neutral code reaches provider facts through four new `Provider` methods: `vars()` and `words()` (two static data structs), `statusline_setup()` and `foreign_export()`. It also gets a neutral `Env.homes` map, which `tagteam-cc` reads and writes through its own accessors. `app::registry` is the only code that names `ClaudeCode`, and the statusline and completions build their registries through it. `tagteam-fake/tests/neutrality.rs` scans production source text so none of this can regress.
 **Tech Stack:** Rust 1.88 (edition 2024), cargo workspace; clap, serde_json, thiserror; tests with the workspace's fakes.
