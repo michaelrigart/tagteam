@@ -11,6 +11,7 @@ use crate::actions;
 use crate::daemon::words;
 use crate::screens;
 use crate::state::{Screen, State};
+use crate::theme::Theme;
 
 /// Below this the body is replaced by `TOO_SMALL` (spec §5.1).
 pub const MIN_WIDTH: u16 = 80;
@@ -465,6 +466,34 @@ pub(crate) fn centered(area: Rect, w: u16, h: u16) -> Rect {
     )
 }
 
+/// The first line to show so that lines `first..=last` show, moving as little as it can, and
+/// never past the last full page (R22).
+pub(crate) fn keep_visible(
+    offset: usize,
+    first: usize,
+    last: usize,
+    rows: usize,
+    lines: usize,
+) -> usize {
+    let rows = rows.max(1);
+    let offset = if first < offset {
+        first
+    } else if last >= offset + rows {
+        (last + 1 - rows).min(first)
+    } else {
+        offset
+    };
+    offset.min(lines.saturating_sub(rows))
+}
+
+/// The selected row in reverse video across the whole width.
+pub(crate) fn highlight(row: Line<'static>, width: usize, theme: Theme) -> Line<'static> {
+    let used: usize = row.spans.iter().map(|s| width_of(&s.content)).sum();
+    let mut spans = row.spans;
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    Line::from(spans).style(theme.selection())
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyCode;
@@ -477,6 +506,23 @@ mod tests {
     use crate::testutil::*;
     use crate::theme::Theme;
     use crate::update::update;
+
+    #[test]
+    fn keep_visible_shows_the_whole_item_and_moves_as_little_as_it_can() {
+        assert_eq!(keep_visible(0, 5, 5, 3, 10), 3);
+        assert_eq!(keep_visible(4, 2, 2, 3, 10), 2);
+        assert_eq!(keep_visible(0, 9, 9, 3, 10), 7);
+        assert_eq!(
+            keep_visible(0, 4, 8, 3, 20),
+            4,
+            "a tall item keeps its first line"
+        );
+        assert_eq!(
+            keep_visible(8, 9, 9, 3, 10),
+            7,
+            "never past the last full page"
+        );
+    }
 
     #[test]
     fn the_header_shows_the_tabs_and_the_mode_and_the_footer_the_screens_keys() {

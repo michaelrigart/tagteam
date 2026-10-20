@@ -17,7 +17,9 @@ use crate::source::AccountsSnapshot;
 use crate::state::{Screen, State};
 use crate::theme::Theme;
 use crate::update;
-use crate::view::{fit, flow, furthest_scroll, pad, scrolled_windows, width_of, wrap_rows};
+use crate::view::{
+    fit, flow, furthest_scroll, highlight, keep_visible, pad, scrolled_windows, width_of, wrap_rows,
+};
 
 /// Spec §10.4's empty state: no store, or no accounts.
 pub const NO_ACCOUNTS: &str = "No accounts yet. Log in with claude, then press A to add the login.";
@@ -174,7 +176,7 @@ pub fn handle_key(state: &mut State, key: KeyEvent, now_ms: i64) -> Vec<Cmd> {
     let lines = layout(&state.accounts).len();
     let at = line_of(&state.accounts);
     let rows = visible_rows(&state.accounts, body, now_s);
-    state.accounts.offset = keep_visible(state.accounts.offset, at, rows, lines);
+    state.accounts.offset = keep_visible(state.accounts.offset, at, at, rows, lines);
     vec![]
 }
 
@@ -228,19 +230,6 @@ fn window_rows(state: &AccountsState, v: &AccountView, body: Rect, now_s: i64) -
 fn visible_rows(state: &AccountsState, body: Rect, now_s: i64) -> usize {
     let pinned = sections(state).len() == 1;
     usize::from(split(state, body, now_s).0.height).saturating_sub(usize::from(pinned))
-}
-
-/// The first line to show so that line `at` is visible, moving as little as it can.
-fn keep_visible(offset: usize, at: usize, rows: usize, lines: usize) -> usize {
-    let rows = rows.max(1);
-    let offset = if at < offset {
-        at
-    } else if at >= offset + rows {
-        at + 1 - rows
-    } else {
-        offset
-    };
-    offset.min(lines.saturating_sub(rows))
 }
 
 /// One line of the scrolling part of the table.
@@ -581,7 +570,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
     }
     let rows = visible_rows(st, area, now_s);
     let at = line_of(st);
-    let offset = keep_visible(st.offset, at, rows, lines.len());
+    let offset = keep_visible(st.offset, at, at, rows, lines.len());
     for line in lines.iter().skip(offset).take(rows) {
         shown.push(match line {
             TableLine::Provider(p) => {
@@ -591,7 +580,7 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             TableLine::Account(i, v) => {
                 let row = tables[*i].row(v, now_s, state.theme);
                 if st.selected.as_ref() == Some(&v.row.id) {
-                    highlight(state.theme, row, width)
+                    highlight(row, width, state.theme)
                 } else {
                     row
                 }
@@ -609,14 +598,6 @@ pub fn render(state: &State, frame: &mut Frame, area: Rect, now_ms: i64) {
             pane,
         );
     }
-}
-
-/// The selected row in reverse video across the whole width.
-fn highlight(theme: Theme, row: Line<'static>, width: usize) -> Line<'static> {
-    let used: usize = row.spans.iter().map(|s| width_of(&s.content)).sum();
-    let mut spans = row.spans;
-    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
-    Line::from(spans).style(theme.selection())
 }
 
 /// Where the detail pane's windows are scrolled to (`from`, a window), and how many lines they
