@@ -6,6 +6,7 @@
 use tagteam_core::autoswitch::{NoSwitchReason, Trigger};
 use tagteam_core::{Window, WindowKind};
 
+use crate::failure::FailureKind;
 use crate::store::AccountRow;
 use crate::tokens::TokenReport;
 use crate::views::{AccountView, HistoryWindow, NO_DATA, UsageStatus, UsageView};
@@ -123,8 +124,10 @@ pub fn usage_words(u: &UsageView, now_s: i64) -> String {
         UsageStatus::Unsupported => ("usage unsupported", None),
         UsageStatus::Unavailable => match u.error.as_deref() {
             None | Some(NO_DATA) => ("no data yet", None),
-            Some("over-budget") => ("over budget", None),
-            Some(e) => ("unavailable", Some(e.to_owned())),
+            Some(e) => match FailureKind::parse(e) {
+                FailureKind::OverBudget => ("over budget", None),
+                _ => ("unavailable", Some(e.to_owned())),
+            },
         },
     };
     let retry = u
@@ -762,6 +765,21 @@ mod tests {
         assert_eq!(
             words_of(UsageStatus::Unavailable, Some("http-429"), None),
             "unavailable (http-429)"
+        );
+    }
+
+    #[test]
+    fn an_unknown_failure_token_is_unavailable_in_its_own_spelling() {
+        assert_eq!(
+            usage_words(
+                &unread(
+                    UsageStatus::Unavailable,
+                    Some("a-token-from-a-newer-build"),
+                    None
+                ),
+                NOW
+            ),
+            "unavailable (a-token-from-a-newer-build)"
         );
     }
 

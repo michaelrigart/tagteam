@@ -10,6 +10,7 @@ use tagteam_provider::{Identity, KindTraits, Provider, Read, RunShell};
 
 use crate::engine::Engine;
 use crate::error::EngineError;
+use crate::failure::FailureKind;
 use crate::settings::Settings;
 use crate::store::{
     AccountRow, LiveIdentityCacheRow, Store, UsageStateRow, backoff_is_skewed, plan_is_skewed,
@@ -192,11 +193,11 @@ fn usage_status(
     let failing = state
         .filter(|s| s.consecutive_failures > 0)
         .and_then(|s| s.last_error.as_deref());
-    match failing {
-        Some("foreign-credential") => UsageStatus::ForeignCredential,
-        Some("keychain-unavailable") => UsageStatus::KeychainUnavailable,
-        Some("no-access-token" | "vault-absent") => UsageStatus::NoCredentials,
-        Some("token-expired") => UsageStatus::TokenExpired,
+    match failing.map(FailureKind::parse) {
+        Some(FailureKind::ForeignCredential) => UsageStatus::ForeignCredential,
+        Some(FailureKind::KeychainUnavailable) => UsageStatus::KeychainUnavailable,
+        Some(FailureKind::NoAccessToken | FailureKind::VaultAbsent) => UsageStatus::NoCredentials,
+        Some(FailureKind::TokenExpired) => UsageStatus::TokenExpired,
         Some(_) => UsageStatus::Unavailable,
         None if state.is_some_and(|s| s.fetched_at.is_some()) => UsageStatus::Ok,
         None => UsageStatus::Unavailable,
@@ -1068,6 +1069,17 @@ mod tests {
             Unavailable
         );
         assert_eq!(status(true, OAUTH, false, None), Unavailable);
+    }
+
+    #[test]
+    fn an_unknown_last_error_reads_as_unavailable() {
+        for e in ["a-token-from-a-newer-build", "http-0401", "error", ""] {
+            assert_eq!(
+                usage_status(true, &OAUTH, &row(false), Some(&state(1, Some(e), true))),
+                UsageStatus::Unavailable,
+                "{e:?}"
+            );
+        }
     }
 
     #[test]
