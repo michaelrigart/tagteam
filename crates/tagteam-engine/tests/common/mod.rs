@@ -734,7 +734,7 @@ impl Fx {
             .begin_replacement(id, fp.as_str(), &meta, self.live_names(id))
             .unwrap();
         self.fixture_vault()
-            .store(&lock, new_bytes, &|b| self.cc.fingerprint(b))
+            .store(&lock, new_bytes, self.cc.as_ref())
             .unwrap();
         store.finish_replacement(id, self.clock.now_ms()).unwrap();
     }

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde_json::{Map, Value};
 use tagteam_core::Fingerprint;
 use tagteam_provider::{Identity, KindTraits, ProviderError};
@@ -125,17 +127,29 @@ pub(crate) fn compose(
     Ok(serde_json::to_vec(&Value::Object(out)).expect("a Value always serializes"))
 }
 
-/// §13.3's credential payload in FakeAgent's shape: the stored object, without the
-/// machine-shared `device` key unless `full`.
-pub(crate) fn export_credential(secret: &[u8], full: bool) -> Result<Value, ProviderError> {
+/// H5.3: the credential as tagteam keeps it, in the vault and `rescue/`: every key but the
+/// machine-shared `device`, in its order. Bytes that are not a JSON object, and an object
+/// without `device`, are the bytes themselves, never re-serialized.
+pub(crate) fn vault_form(bytes: &[u8]) -> Cow<'_, [u8]> {
+    let Ok(Value::Object(mut o)) = serde_json::from_slice::<Value>(bytes) else {
+        return Cow::Borrowed(bytes);
+    };
+    if o.shift_remove(DEVICE).is_none() {
+        return Cow::Borrowed(bytes);
+    }
+    Cow::Owned(serde_json::to_vec(&Value::Object(o)).expect("a Value always serializes"))
+}
+
+/// §13.3's credential payload in FakeAgent's shape: the stored object without the
+/// machine-shared `device` key, `full` or not. `full` keeps every account-scoped key and no
+/// machine-shared one (§13.3 as amended by H13); FakeAgent's slim payload already does.
+pub(crate) fn export_credential(secret: &[u8], _full: bool) -> Result<Value, ProviderError> {
     let Ok(Value::Object(mut root)) = serde_json::from_slice::<Value>(secret) else {
         return Err(ProviderError::Invalid(
             "the stored FakeAgent credential is not a JSON object".into(),
         ));
     };
-    if !full {
-        root.shift_remove(DEVICE);
-    }
+    root.shift_remove(DEVICE);
     Ok(Value::Object(root))
 }
 
@@ -173,6 +187,28 @@ mod tests {
         let out: Value =
             serde_json::from_slice(&compose(target.to_string().as_bytes(), None).unwrap()).unwrap();
         assert_eq!(out, json!({"fa": {"token": "t"}}));
+    }
+
+    #[test]
+    fn the_vault_form_drops_only_the_device_key() {
+        let full = serde_json::to_vec(&crate::credential_json("t", Some("r"), Some(9))).unwrap();
+        assert_eq!(
+            vault_form(&full).as_ref(),
+            json!({"fa": {"token": "t", "renew": "r", "expires": 9}})
+                .to_string()
+                .as_bytes()
+        );
+        let slim = json!({"fa": {"token": "t"}}).to_string().into_bytes();
+        assert!(matches!(vault_form(&slim), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_full_export_drops_the_device_key_too() {
+        let full = serde_json::to_vec(&crate::credential_json("t", Some("r"), None)).unwrap();
+        assert_eq!(
+            export_credential(&full, true).unwrap(),
+            json!({"fa": {"token": "t", "renew": "r"}})
+        );
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde_json::{Map, Value, json};
 use tagteam_core::Fingerprint;
 use tagteam_core::validate::is_valid_email;
@@ -213,6 +215,22 @@ pub fn compose(target: &[u8], live: Option<&Map<String, Value>>) -> Result<Vec<u
     Ok(serde_json::to_vec(&Value::Object(out)).expect("a Value always serializes"))
 }
 
+/// H5.3: the credential as tagteam keeps it, in the vault and `rescue/`: every key but the
+/// machine-shared ones, in its order. Bytes that are not a JSON object (an API key), and an
+/// object that holds none of those keys, are the bytes themselves, never re-serialized.
+pub fn vault_form(bytes: &[u8]) -> Cow<'_, [u8]> {
+    let Ok(Value::Object(mut o)) = serde_json::from_slice::<Value>(bytes) else {
+        return Cow::Borrowed(bytes);
+    };
+    if !MACHINE_SHARED_KEYS.iter().any(|k| o.contains_key(*k)) {
+        return Cow::Borrowed(bytes);
+    }
+    for k in MACHINE_SHARED_KEYS {
+        o.shift_remove(k);
+    }
+    Cow::Owned(serde_json::to_vec(&Value::Object(o)).expect("a Value always serializes"))
+}
+
 pub fn machine_shared_only(live: &Map<String, Value>) -> Map<String, Value> {
     live.iter()
         .filter(|(k, _)| MACHINE_SHARED_KEYS.contains(&k.as_str()))
@@ -274,8 +292,10 @@ pub fn export_identity(id: &Identity) -> Value {
 }
 
 /// §13.3's credential payload: an API key as its string, any other credential as its JSON
-/// object, reduced to `{claudeAiOauth}` unless `full`. A stored credential without a
-/// `claudeAiOauth` object is not one this provider exports.
+/// object, reduced to `{claudeAiOauth}` unless `full`. `full` keeps every account-scoped key,
+/// `trustedDeviceToken` included, and no machine-shared one, whatever the credential's source
+/// (§13.3 as amended by H13). A stored credential without a `claudeAiOauth` object is not one
+/// this provider exports.
 pub fn export_credential(secret: &[u8], full: bool) -> Result<Value, ProviderError> {
     if is_api_key(secret) {
         return Ok(Value::String(
@@ -289,6 +309,9 @@ pub fn export_credential(secret: &[u8], full: bool) -> Result<Value, ProviderErr
         return Err(invalid("the stored credential has no claudeAiOauth object"));
     }
     if full {
+        for k in MACHINE_SHARED_KEYS {
+            root.shift_remove(k);
+        }
         return Ok(Value::Object(root));
     }
     let oauth = root.remove(OAUTH_KEY).expect("checked above");
@@ -360,6 +383,8 @@ pub fn import_credential(v: &Value) -> Result<Vec<u8>, ProviderError> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
     use serde_json::json;
 
@@ -442,6 +467,56 @@ mod tests {
         let out: Value =
             serde_json::from_slice(&compose(target.to_string().as_bytes(), None).unwrap()).unwrap();
         assert_eq!(out, json!({"claudeAiOauth": {"refreshToken": "t"}}));
+    }
+
+    #[test]
+    fn the_vault_form_drops_exactly_the_machine_shared_keys_and_keeps_the_order() {
+        let full = json!({"claudeAiOauth": {"refreshToken": "rt"}, "mcpOAuth": {"s": 1},
+            "trustedDeviceToken": "d", "mcpOAuthClientConfig": {}, "designOauth": {"t": 1},
+            "mcpXaaIdp": {}, "mcpXaaIdpConfig": {}, "pluginSecrets": {"p": "s"}, "futureKey": 1})
+        .to_string()
+        .into_bytes();
+        let kept = json!({"claudeAiOauth": {"refreshToken": "rt"}, "trustedDeviceToken": "d",
+            "designOauth": {"t": 1}, "futureKey": 1})
+        .to_string();
+        assert_eq!(vault_form(&full).as_ref(), kept.as_bytes());
+        assert_eq!(
+            fingerprint(&vault_form(&full)),
+            fingerprint(&full),
+            "the lineage is unchanged"
+        );
+    }
+
+    #[test]
+    fn the_vault_form_of_anything_else_is_the_bytes_themselves() {
+        // No machine-shared key (byte-identical, spacing included), an API key, not JSON, not an
+        // object.
+        for bytes in [
+            &br#"{ "claudeAiOauth": {"refreshToken": "rt"} }"#[..],
+            b" sk-ant-api03-k\n",
+            b"garbage",
+            b"[1]",
+        ] {
+            assert!(
+                matches!(vault_form(bytes), Cow::Borrowed(b) if b == bytes),
+                "{bytes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_export_keeps_every_account_scoped_key_and_no_machine_shared_one() {
+        let stored = json!({"claudeAiOauth": {"refreshToken": "rt"}, "mcpOAuth": {"s": 1},
+            "trustedDeviceToken": "d", "pluginSecrets": {"p": "s"}, "designOauth": {"t": 1}});
+        assert_eq!(
+            export_credential(stored.to_string().as_bytes(), true).unwrap(),
+            json!({"claudeAiOauth": {"refreshToken": "rt"}, "trustedDeviceToken": "d",
+                "designOauth": {"t": 1}})
+        );
+        assert_eq!(
+            export_credential(b"sk-ant-api03-k", true).unwrap(),
+            json!("sk-ant-api03-k")
+        );
     }
 
     #[test]

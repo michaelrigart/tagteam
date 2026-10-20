@@ -145,6 +145,39 @@ mod tests {
     }
 
     #[test]
+    fn a_live_credential_that_differs_from_the_vault_only_by_machine_shared_keys_keeps_its_action()
+    {
+        // H5.3: the vault drops machine-shared keys, so `bytes_equal_vault` turns false whenever the
+        // live entry carries them. A token-bearing credential stays `Ours` through its fingerprint;
+        // a tokenless one turns `Wiped`, with the same action.
+        let token_bearing = OutgoingFacts {
+            fp_equal_vault: true,
+            ..facts()
+        };
+        assert_eq!(
+            decide_outgoing(&token_bearing),
+            (OutgoingClass::Ours, OutgoingAction::Nothing)
+        );
+        let tokenless_before = OutgoingFacts {
+            bytes_equal_vault: true,
+            tokenless: true,
+            ..facts()
+        };
+        let tokenless_after = OutgoingFacts {
+            tokenless: true,
+            ..facts()
+        };
+        assert_eq!(
+            decide_outgoing(&tokenless_before),
+            (OutgoingClass::Ours, OutgoingAction::Nothing)
+        );
+        assert_eq!(
+            decide_outgoing(&tokenless_after),
+            (OutgoingClass::Wiped, OutgoingAction::Nothing)
+        );
+    }
+
+    #[test]
     fn a_live_generation_the_vault_superseded_is_left_alone() {
         // §9.4 step 4 `Superseded`: an active-token refresh stored a newer generation it could
         // not publish. Capturing the live one would put a consumed token back, whatever the

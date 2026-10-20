@@ -126,6 +126,7 @@ pub(crate) fn names_another_account(owner: &Identity, row: &AccountRow) -> bool 
 /// secret, so it has no `Debug`.
 pub(crate) struct Received<'e> {
     engine: &'e Engine,
+    provider: &'e dyn Provider,
     row: AccountRow,
     predecessor_fp: String,
     bytes: Vec<u8>,
@@ -142,7 +143,7 @@ impl<'e> Received<'e> {
     /// account; it is fixed here, so no later path can store the successor as this account's.
     pub(crate) fn new(
         engine: &'e Engine,
-        p: &dyn Provider,
+        p: &'e dyn Provider,
         row: &AccountRow,
         predecessor_fp: &str,
         bytes: Vec<u8>,
@@ -153,6 +154,7 @@ impl<'e> Received<'e> {
             .unwrap_or_else(|| Fingerprint::of_secret(&bytes));
         Self {
             engine,
+            provider: p,
             row: row.clone(),
             predecessor_fp: predecessor_fp.to_owned(),
             bytes,
@@ -179,6 +181,7 @@ impl<'e> Received<'e> {
             None => self
                 .engine
                 .write_rescue(
+                    self.provider,
                     &self.row.id,
                     self.row.login_epoch,
                     &self.predecessor_fp,
@@ -345,7 +348,7 @@ impl Engine {
             Read::Absent => None,
             Read::Unreadable(e) => return Err(EngineError::Unreadable(e)),
         };
-        self.vault.store(lock, bytes, &|b| p.fingerprint(b))?;
+        self.vault.store(lock, bytes, p)?;
         self.store()?
             .set_login_expires_at(&row.id, p.login_expires_at(bytes))?;
         if p.fingerprint(bytes) != before {
@@ -574,8 +577,12 @@ impl Engine {
             received.disarm();
             return Persisted::Vault;
         };
-        // The vault write may have landed before recording it failed; then nothing is lost.
-        if matches!(self.vault.read(&row.id), Read::Present(b) if b == received.bytes) {
+        // The vault write may have landed before recording it failed; then nothing is lost. The
+        // vault holds the vault form of what was received (H5.3).
+        if matches!(
+            self.vault.read(&row.id),
+            Read::Present(b) if *b == *p.vault_form(&received.bytes)
+        ) {
             tracing::error!(
                 position = row.position,
                 account = %row.id,

@@ -80,17 +80,20 @@ impl Engine {
 
     /// Writes a received successor to `rescue/<id>-<epoch>-<fp12>.json` (§5): a plain 0600 file,
     /// never a Keychain item, created beside its final name and renamed into place (§6.3). The
-    /// directory is created 0700 on first use. The credential is stored verbatim as a UTF-8
-    /// string, which every provider's credential is.
+    /// directory is created 0700 on first use. The credential is stored in `p`'s vault form
+    /// (H5.3), what the vault would keep, as a UTF-8 string, which every provider's credential
+    /// is. `displaced/` is never written here: it keeps what it saves verbatim.
     pub(crate) fn write_rescue(
         &self,
+        p: &dyn Provider,
         id: &AccountId,
         login_epoch: i64,
         predecessor_fp: &str,
         successor: &[u8],
         successor_fp: &Fingerprint,
     ) -> Result<PathBuf, EngineError> {
-        let credential = std::str::from_utf8(successor).map_err(|_| {
+        let successor = p.vault_form(successor);
+        let credential = std::str::from_utf8(&successor).map_err(|_| {
             EngineError::Io(io::Error::other("the refreshed credential is not UTF-8"))
         })?;
         let envelope = json!({
@@ -287,7 +290,7 @@ mod tests {
         let pred = t.fp(&cred("rt-1", 9));
         let path = t
             .engine
-            .write_rescue(&id, 3, &pred, &succ, &succ_fp)
+            .write_rescue(t.cc.as_ref(), &id, 3, &pred, &succ, &succ_fp)
             .unwrap();
         assert_eq!(
             path,
@@ -322,6 +325,25 @@ mod tests {
     }
 
     #[test]
+    fn a_rescue_envelope_holds_the_vault_form() {
+        let t = T::new();
+        let id = AccountId::from_string("acct");
+        let mut full: Value = serde_json::from_slice(&cred("rt-2", 9)).unwrap();
+        full["mcpOAuth"] = json!({"srv": {"token": "machine-shared"}});
+        let full = full.to_string().into_bytes();
+        let fp = t.cc.fingerprint(&full).unwrap();
+        let path = t
+            .engine
+            .write_rescue(t.cc.as_ref(), &id, 0, &t.fp(&cred("rt-1", 9)), &full, &fp)
+            .unwrap();
+        let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["credential"].as_str().unwrap().as_bytes(),
+            cred("rt-2", 9)
+        );
+    }
+
+    #[test]
     fn looking_never_creates_the_directory() {
         let t = T::new();
         assert!(
@@ -340,7 +362,9 @@ mod tests {
         let succ = cred("rt-2", 9);
         let fp = t.cc.fingerprint(&succ).unwrap();
         let pred = t.fp(&cred("rt-1", 9));
-        t.engine.write_rescue(&other, 0, &pred, &succ, &fp).unwrap();
+        t.engine
+            .write_rescue(t.cc.as_ref(), &other, 0, &pred, &succ, &fp)
+            .unwrap();
         let dir = t.env.data_dir().join("rescue");
         fs::write(
             dir.join("acct-0-truncated.json"),
@@ -380,7 +404,14 @@ mod tests {
         let pred = t.fp(&cred("rt-1", 5));
         let path = t
             .engine
-            .write_rescue(&row.id, 0, &pred, &succ, &t.cc.fingerprint(&succ).unwrap())
+            .write_rescue(
+                t.cc.as_ref(),
+                &row.id,
+                0,
+                &pred,
+                &succ,
+                &t.cc.fingerprint(&succ).unwrap(),
+            )
             .unwrap();
         let lock = t.lock(&row.id);
         t.engine
@@ -402,6 +433,7 @@ mod tests {
         let path = t
             .engine
             .write_rescue(
+                t.cc.as_ref(),
                 &row.id,
                 0,
                 &t.fp(&cred("rt-1", 5)),
@@ -450,6 +482,7 @@ mod tests {
         let path = t
             .engine
             .write_rescue(
+                t.cc.as_ref(),
                 &row.id,
                 0,
                 &t.fp(&cred("rt-1", 5)),

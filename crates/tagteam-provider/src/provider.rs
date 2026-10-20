@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
@@ -569,6 +570,11 @@ pub trait Provider: Send + Sync {
 
     fn classify(&self, secret: &[u8]) -> String;
     fn fingerprint(&self, secret: &[u8]) -> Option<Fingerprint>;
+    /// The credential as tagteam keeps it, in the vault and `rescue/` (H5.3): what is not the
+    /// account's to keep is dropped. The default keeps every byte.
+    fn vault_form<'a>(&self, credential: &'a [u8]) -> Cow<'a, [u8]> {
+        Cow::Borrowed(credential)
+    }
     fn has_refresh_token(&self, secret: &[u8]) -> bool;
     fn is_wiped(&self, secret: &[u8]) -> bool;
     fn login_expires_at(&self, secret: &[u8]) -> Option<i64>;
