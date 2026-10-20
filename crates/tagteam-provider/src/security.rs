@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::ffi::OsString;
+use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -358,6 +360,97 @@ pub(crate) fn escape_text(credential: &[u8]) -> Option<String> {
     Some(out)
 }
 
+/// One argv-fallback notice: names and a length, never the value.
+struct ArgvNotice {
+    service: String,
+    account: String,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct Held {
+    /// How many `HeldWarnings` guards are alive on this thread.
+    depth: usize,
+    notices: Vec<ArgvNotice>,
+}
+
+thread_local! {
+    static HELD: RefCell<Held> = RefCell::new(Held::default());
+}
+
+/// Holds the argv-fallback WARN on this thread until the guard is dropped (§7.3 step 6): a log
+/// write can block, and while a refreshed successor exists only in memory nothing that can
+/// block may come before it is on disk. While a guard lives, `upsert` records its notice
+/// instead of logging it; the outermost guard's drop emits them, in order, with the same text
+/// and fields. With no guard a notice is logged at once. It never leaves its thread.
+#[must_use]
+pub struct HeldWarnings {
+    _thread: PhantomData<*const ()>,
+}
+
+/// Opens a scope in which this thread holds the argv-fallback WARN (see `HeldWarnings`).
+pub fn hold_warnings() -> HeldWarnings {
+    HELD.with(|h| h.borrow_mut().depth += 1);
+    HeldWarnings {
+        _thread: PhantomData,
+    }
+}
+
+impl HeldWarnings {
+    /// Ends the hold now: emits what was held if this is the outermost guard.
+    pub fn release(self) {}
+}
+
+impl Drop for HeldWarnings {
+    fn drop(&mut self) {
+        // Only a guard dropped while this thread's locals are torn down finds the slot gone.
+        let held = HELD
+            .try_with(|h| {
+                let mut h = h.borrow_mut();
+                h.depth -= 1;
+                if h.depth == 0 {
+                    std::mem::take(&mut h.notices)
+                } else {
+                    Vec::new()
+                }
+            })
+            .unwrap_or_default();
+        for n in held {
+            emit_argv_fallback(&n);
+        }
+    }
+}
+
+/// Logs the notice, or records it while this thread holds warnings.
+fn argv_fallback_notice(service: &str, account: &str, bytes: usize) {
+    let notice = ArgvNotice {
+        service: service.to_owned(),
+        account: account.to_owned(),
+        bytes,
+    };
+    let rest = HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        if h.depth > 0 {
+            h.notices.push(notice);
+            None
+        } else {
+            Some(notice)
+        }
+    });
+    if let Some(n) = rest {
+        emit_argv_fallback(&n);
+    }
+}
+
+fn emit_argv_fallback(n: &ArgvNotice) {
+    tracing::warn!(
+        service = %n.service,
+        account = %n.account,
+        bytes = n.bytes,
+        "a Keychain value is too long for security -i, so it goes on security's command line"
+    );
+}
+
 impl Keychain for SecurityCli {
     /// A secret read (`-w`), counted by how it ended (D3 change 6): answered once it gives a
     /// secret, locked on rc 36 or a timeout. An absent item (rc 44), which a locked keychain
@@ -422,12 +515,7 @@ impl Keychain for SecurityCli {
         let result = if line.len() <= LINE_LIMIT {
             self.run(s(&["-i"]), Some(line.as_bytes()))
         } else {
-            tracing::warn!(
-                service = %service,
-                account = %account,
-                bytes = data.len(),
-                "a Keychain value is too long for security -i, so it goes on security's command line"
-            );
+            argv_fallback_notice(service, account, data.len());
             // argv needs no quoting: text goes as is, never as `escape_text`'s output.
             let (flag, arg) = match text {
                 Some(_) => (
@@ -1195,6 +1283,117 @@ mod tests {
             1,
             "{lines:#?}"
         );
+    }
+
+    /// An over-long text credential, so `upsert` takes the argv fallback.
+    fn long_text() -> String {
+        "x".repeat(LINE_LIMIT + 100)
+    }
+
+    fn argv_warns(lines: &[String]) -> Vec<&String> {
+        lines.iter().filter(|l| l.contains("WARN")).collect()
+    }
+
+    #[test]
+    fn a_held_argv_warn_is_logged_only_when_the_guard_drops() {
+        let data = long_text();
+        let s = Scripted::default().then(ok(b"")).then(ok(data.as_bytes()));
+        let mut before = vec![];
+        let lines = logged(|| {
+            let held = hold_warnings();
+            cli(&s, None)
+                .upsert("svc", "acct", data.as_bytes())
+                .unwrap();
+            assert_eq!(s.calls().len(), 2, "the write ran");
+            before.push(HELD.with(|h| h.borrow().notices.len()));
+            drop(held);
+        });
+        assert_eq!(before, [1], "recorded, not logged, while the guard lived");
+        let warns = argv_warns(&lines);
+        assert_eq!(warns.len(), 1, "{lines:#?}");
+        assert!(
+            warns[0].contains(&format!("service=svc account=acct bytes={}", data.len())),
+            "{}",
+            warns[0]
+        );
+        assert!(
+            warns[0].contains(
+                "a Keychain value is too long for security -i, so it goes on security's command line"
+            ),
+            "{}",
+            warns[0]
+        );
+    }
+
+    #[test]
+    fn nothing_is_logged_while_a_guard_lives() {
+        let data = long_text();
+        let s = Scripted::default().then(ok(b"")).then(ok(data.as_bytes()));
+        let mut during = vec![];
+        let lines = logged(|| {
+            let held = hold_warnings();
+            during = logged(|| {
+                cli(&s, None)
+                    .upsert("svc", "acct", data.as_bytes())
+                    .unwrap();
+            });
+            held.release();
+        });
+        assert!(during.is_empty(), "{during:#?}");
+        assert_eq!(argv_warns(&lines).len(), 1, "{lines:#?}");
+    }
+
+    #[test]
+    fn nested_guards_emit_once_when_the_outermost_drops_in_order() {
+        let data = long_text();
+        let s = Scripted::default()
+            .then(ok(b""))
+            .then(ok(data.as_bytes()))
+            .then(ok(b""))
+            .then(ok(data.as_bytes()));
+        let lines = logged(|| {
+            let outer = hold_warnings();
+            {
+                let inner = hold_warnings();
+                cli(&s, None)
+                    .upsert("svc", "first", data.as_bytes())
+                    .unwrap();
+                inner.release();
+            }
+            cli(&s, None)
+                .upsert("svc", "second", data.as_bytes())
+                .unwrap();
+            assert_eq!(
+                HELD.with(|h| h.borrow().notices.len()),
+                2,
+                "the inner release emitted nothing"
+            );
+            drop(outer);
+        });
+        let warns = argv_warns(&lines);
+        assert_eq!(warns.len(), 2, "{lines:#?}");
+        assert!(warns[0].contains("account=first"), "{}", warns[0]);
+        assert!(warns[1].contains("account=second"), "{}", warns[1]);
+    }
+
+    #[test]
+    fn holding_is_per_thread_and_ends_with_the_guard() {
+        let held = hold_warnings();
+        // Another thread has no guard, so it logs at once.
+        let other = std::thread::spawn(|| {
+            let data = long_text();
+            let s = Scripted::default().then(ok(b"")).then(ok(data.as_bytes()));
+            logged(|| {
+                cli(&s, None)
+                    .upsert("svc", "acct", data.as_bytes())
+                    .unwrap();
+            })
+        })
+        .join()
+        .unwrap();
+        assert_eq!(argv_warns(&other).len(), 1, "{other:#?}");
+        drop(held);
+        assert_eq!(HELD.with(|h| h.borrow().depth), 0);
     }
 
     #[test]

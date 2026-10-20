@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use tagteam_core::{AccountId, Fingerprint};
 use tagteam_provider::provider::{DeadReason, RefreshResult};
+use tagteam_provider::security::{HeldWarnings, hold_warnings};
 use tagteam_provider::{Credential, Identity, Provider, Read};
 
 use crate::account_lock::AccountLock;
@@ -145,6 +146,10 @@ pub(crate) struct Received<'e> {
     /// (`landed`) or `keep` has tried to write it: until then it is only in memory, and
     /// nothing, a log write included, may come first (§7.3 step 6).
     ahead_failed: Option<&'static str>,
+    /// Holds the Keychain writer's argv-fallback WARN from `new` until the successor is stored
+    /// (`landed`) or kept (`keep`): a vault write that reaches it logs nothing while the
+    /// successor is only in memory (§7.3 step 6). `None` once released.
+    held: Option<HeldWarnings>,
     armed: bool,
 }
 
@@ -163,6 +168,7 @@ impl<'e> Received<'e> {
         bytes: Vec<u8>,
         foreign: Option<Identity>,
     ) -> Self {
+        let held = Some(hold_warnings());
         let fp = p
             .fingerprint(&bytes)
             .unwrap_or_else(|| Fingerprint::of_secret(&bytes));
@@ -195,6 +201,7 @@ impl<'e> Received<'e> {
             foreign,
             ahead,
             ahead_failed,
+            held,
             armed: true,
         }
     }
@@ -208,8 +215,15 @@ impl<'e> Received<'e> {
     /// belongs to another account (§7.3 step 6). The envelope written ahead is the rescue, so
     /// `rescue/` is written here only when the write-ahead failed (H6); that failure is logged
     /// after this write, whatever its result. It disarms whatever the result, so `Drop` never
-    /// repeats it.
+    /// repeats it. The hold on the argv-fallback WARN ends after the attempt.
     pub(crate) fn keep(&mut self) -> Result<(), EngineError> {
+        let kept = self.keep_outside_the_vault();
+        // The attempt is over, whatever its result: what a vault write held back may be logged.
+        self.release_warnings();
+        kept
+    }
+
+    fn keep_outside_the_vault(&mut self) -> Result<(), EngineError> {
         self.armed = false;
         if let Some(owner) = &self.foreign {
             return self
@@ -247,16 +261,25 @@ impl<'e> Received<'e> {
     fn landed(&mut self) {
         self.armed = false;
         self.log_failed_write_ahead();
-        let Some(path) = self.ahead.take() else {
-            return;
-        };
-        if let Err(e) = self.engine.delete_rescue(&path) {
-            tracing::warn!(
-                position = self.row.position,
-                account = %self.row.id,
-                kind = e.kind(),
-                "a rescue written ahead could not be deleted after the vault took its token"
-            );
+        if let Some(path) = self.ahead.take() {
+            if let Err(e) = self.engine.delete_rescue(&path) {
+                tracing::warn!(
+                    position = self.row.position,
+                    account = %self.row.id,
+                    kind = e.kind(),
+                    "a rescue written ahead could not be deleted after the vault took its token"
+                );
+            }
+        }
+        self.release_warnings();
+    }
+
+    /// Ends the hold on the argv-fallback WARN, emitting what a vault write held back. Only
+    /// `landed` and `keep` call it, after the successor reached the vault or `keep`'s attempt
+    /// was made (§7.3 step 6).
+    fn release_warnings(&mut self) {
+        if let Some(held) = self.held.take() {
+            held.release();
         }
     }
 

@@ -597,6 +597,9 @@ Found while planning and building; each is listed in the MR.
   never while the successor exists only in memory (§7.3 step 6); and `reconcile_active`
   deletes landed rescues best effort, so a rescue it cannot delete never stops the live
   repair.
+- **H5.2/H6:** while a refreshed successor is being persisted, the argv-fallback WARN is held
+  until the successor is stored or kept in `rescue/`, so no log write sits between receiving
+  it and having it on disk (§7.3 step 6).
 - **H8:** the wake pipes add up to 36 descriptors, not 32: two shared pipes beside the 16
   connections' own.
 - **H10.1:** compact rows alone missed the 1 s budget; the range read also names its index

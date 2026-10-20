@@ -28,11 +28,13 @@ use tagteam_engine::vault::{FileVault, KeychainVault, SERVICE, Vault, VaultBacke
 use tagteam_engine::{Engine, EngineConfig, EngineError};
 use tagteam_fake::{FAKE_AGENT, FakeAgent};
 use tagteam_provider::http::Method;
+use tagteam_provider::keychain::Keychain;
 use tagteam_provider::liveness::{FakeProcess, FakeProcessProbe, parse_lstart};
 use tagteam_provider::process::{Captured, ProcessSpawner, ScriptedSpawner};
 use tagteam_provider::profile::{
     LAUNCH_DIR, ProfileMarker, RunShell, Seed, canonical_profile_path, profile_path,
 };
+use tagteam_provider::security::{LINE_LIMIT, RunResult, Runner, SecurityCli};
 use tagteam_provider::splice::{get_top_level, remove_top_level, replace_top_level};
 use tagteam_provider::{
     Cancel, Clock, Credential, Env, FakeClock, FakeKeychain, FlockGuard, Identity, IdentitySurface,
@@ -2196,4 +2198,53 @@ impl Drop for Chmod {
     fn drop(&mut self) {
         let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
     }
+}
+
+/// A runner that stands in for `/usr/bin/security`: an `add-generic-password` on argv stores its
+/// `-w` text, and a `find-generic-password` returns what was stored.
+#[derive(Default)]
+pub struct EchoSecurity(Mutex<Vec<u8>>);
+
+impl Runner for EchoSecurity {
+    fn run(
+        &self,
+        _program: &str,
+        args: &[String],
+        _stdin: Option<&[u8]>,
+        _timeout: Duration,
+        _cancel: Option<&Cancel>,
+    ) -> RunResult {
+        let mut stored = self.0.lock().unwrap();
+        let mut stdout = vec![];
+        if args.first().map(String::as_str) == Some("add-generic-password") {
+            let w = args.iter().position(|a| a == "-w").unwrap();
+            *stored = args[w + 1].clone().into_bytes();
+        } else {
+            stdout = [stored.as_slice(), b"\n"].concat();
+        }
+        RunResult::Exited {
+            code: 0,
+            stdout,
+            stderr: vec![],
+        }
+    }
+    fn run_attached(&self, _program: &str, _args: &[String]) -> RunResult {
+        RunResult::SpawnFailed("not used".into())
+    }
+}
+
+/// The byte length of the value `argv_upsert` writes: past the `security -i` line limit.
+pub const ARGV_BYTES: usize = LINE_LIMIT + 100;
+
+/// A real `SecurityCli` over `EchoSecurity`: its `upsert` takes the argv fallback, and so logs
+/// (or holds) the argv WARN, for a value past the line limit. The engine tests' FakeKeychain
+/// never goes through `SecurityCli`, so this stands in for a Keychain writer that does.
+pub fn argv_cli() -> SecurityCli {
+    SecurityCli::with_runner(Box::<EchoSecurity>::default(), None)
+}
+
+/// One over-long upsert through `cli`: the argv WARN, with `bytes = ARGV_BYTES`.
+pub fn argv_upsert(cli: &SecurityCli, account: &str) {
+    cli.upsert("tagteam-test", account, "x".repeat(ARGV_BYTES).as_bytes())
+        .expect("the stand-in security accepts the write");
 }

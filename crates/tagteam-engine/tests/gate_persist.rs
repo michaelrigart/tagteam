@@ -313,7 +313,9 @@ mod hooked {
     use std::thread;
     use std::time::Duration;
 
+    use crate::common::{ARGV_BYTES, argv_cli, argv_upsert};
     use tagteam_engine::EngineError;
+    use tagteam_provider::security::SecurityCli;
 
     /// `(path, inode, envelope)` of every file in `rescue/`, by path (a type alias keeps clippy's
     /// `type_complexity` quiet).
@@ -516,6 +518,132 @@ mod hooked {
             } else {
                 assert!(matches!(out, GateOutcome::Refreshed(_)), "{out:?}");
             }
+        }
+    }
+
+    /// A vault whose every write also upserts an over-long value through the real `SecurityCli`
+    /// (over a stand-in for `security`), so the writer takes its argv fallback and reaches the
+    /// WARN, as a vault holding a credential past the `security -i` line limit does; then it
+    /// writes the real bytes. A marker follows the write, so a test sees on which side of it
+    /// the WARN was logged. (The engine tests' FakeKeychain never goes through `SecurityCli`.)
+    struct ArgvVault {
+        inner: KeychainVault,
+        cli: SecurityCli,
+    }
+
+    impl VaultBackend for ArgvVault {
+        fn read(&self, key: &str) -> Read<Vec<u8>> {
+            self.inner.read(key)
+        }
+        fn write(&self, key: &str, bytes: &[u8]) -> Result<(), VaultError> {
+            argv_upsert(&self.cli, key);
+            let written = self.inner.write(key, bytes);
+            tracing::info!("marker: the vault write settled");
+            written
+        }
+        fn delete(&self, key: &str) -> Result<(), VaultError> {
+            self.inner.delete(key)
+        }
+    }
+
+    #[test]
+    fn an_argv_fallback_warn_is_logged_only_after_the_successor_is_stored_or_kept() {
+        // §7.3 step 6: the WARN of the Keychain writer's argv fallback is a log write, so while
+        // the successor is only in memory (the write-ahead failed) it waits until the vault
+        // took the successor or `keep` tried to write it, whichever way the vault write ends.
+        for vault_fails in [false, true] {
+            let fx = Fx::new();
+            let a = due(&fx);
+            let snapshot = fx.vault_bytes(&a).unwrap();
+            fx.script_refresh(Some("rt-a2"));
+            let engine = fx.engine_with_vault(Vault::new(Box::new(ArgvVault {
+                inner: KeychainVault::new(fx.kc.clone()),
+                cli: argv_cli(),
+            })));
+            block_rescue(&fx);
+            fx.kc.set_fail_write(SERVICE, vault_fails);
+            let (out, logs) = capture_logs(|| {
+                engine
+                    .refresh_stored(fx.cc.as_ref(), &a, &snapshot)
+                    .unwrap()
+            });
+            fx.kc.set_fail_write(SERVICE, false);
+            unblock_rescue(&fx);
+            let at = |text: &str| -> Vec<usize> {
+                logs.iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.contains(text))
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            let (settled, argv, ahead) = (
+                at("marker: the vault write settled"),
+                at("a Keychain value is too long for security -i"),
+                at("could not write a refreshed token ahead to rescue/"),
+            );
+            assert!(!settled.is_empty(), "{vault_fails}: {logs:#?}");
+            assert!(!argv.is_empty(), "{vault_fails}: {logs:#?}");
+            assert_eq!(ahead.len(), 1, "{vault_fails}: {logs:#?}");
+            let last_settled = *settled.last().unwrap();
+            assert!(
+                argv.iter().all(|&i| i > last_settled && i > ahead[0]),
+                "{vault_fails}: the WARN waits for the vault write and the keep: {logs:#?}"
+            );
+            assert!(
+                argv.iter().all(|&i| logs[i].contains("WARN")
+                    && logs[i].contains("service=tagteam-test")
+                    && logs[i].contains(&format!("bytes={ARGV_BYTES}"))),
+                "{vault_fails}: {logs:#?}"
+            );
+            if vault_fails {
+                assert!(matches!(out, GateOutcome::Unpersisted), "{out:?}");
+            } else {
+                assert!(matches!(out, GateOutcome::Refreshed(_)), "{out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_argv_fallback_warn_held_while_a_successor_is_received_is_released_by_keep() {
+        // Every way out that keeps the successor outside the vault releases the hold after the
+        // keep: `abandon` (an error) and `Drop` (a panic).
+        for fault in ["gate-after-response", "panic:gate-after-response"] {
+            let fx = Fx::new();
+            let a = due(&fx);
+            let snapshot = fx.vault_bytes(&a).unwrap();
+            fx.script_refresh(Some("rt-a2"));
+            let cli = argv_cli();
+            fx.engine.on_point(
+                "gate-after-response",
+                Box::new(move || {
+                    argv_upsert(&cli, "acct");
+                    tracing::info!("marker: the argv write ran");
+                }),
+            );
+            fx.engine.fail_at(Some(fault));
+            let (_, logs) = capture_logs(|| {
+                catch_unwind(AssertUnwindSafe(|| {
+                    fx.engine.refresh_stored(fx.cc.as_ref(), &a, &snapshot)
+                }))
+            });
+            let at = |text: &str| -> Vec<usize> {
+                logs.iter()
+                    .enumerate()
+                    .filter(|(_, l)| l.contains(text))
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            let (ran, kept, warn) = (
+                at("marker: the argv write ran"),
+                at("kept a refreshed token in rescue/"),
+                at("a Keychain value is too long for security -i"),
+            );
+            assert_eq!(
+                (ran.len(), kept.len(), warn.len()),
+                (1, 1, 1),
+                "{fault}: {logs:#?}"
+            );
+            assert!(ran[0] < kept[0] && kept[0] < warn[0], "{fault}: {logs:#?}");
         }
     }
 
