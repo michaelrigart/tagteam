@@ -178,6 +178,16 @@ pub enum Msg {
         link: u64,
         result: Result<Status, String>,
     },
+    /// The runtime began the shutdown (spec §10.2 step 1); it exits with `code`.
+    ShutdownBegan {
+        code: i32,
+    },
+    /// The input thread did not pause, so the terminal was not handed over (§7.3): `action` did
+    /// not start, or, for `None`, Ctrl-Z did not suspend.
+    SuspendRefused {
+        action: Option<Action>,
+        why: &'static str,
+    },
 }
 
 /// A question from the CLI path, and where its answer goes (spec §7.2).
