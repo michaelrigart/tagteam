@@ -51,6 +51,7 @@ pub(crate) struct GuardRequest<'a> {
     pub(crate) providers: &'a [ProviderId],
     /// How long the lock is waited for.
     pub(crate) timeout: Duration,
+    /// How the journal rows are read and recovered.
     pub(crate) recovery: RecoveryMode,
     /// Refuse, once recovery has run under the lock, for the first of `providers` whose
     /// interrupted switch is still unresolved (§9.6).
@@ -82,6 +83,7 @@ impl<'a> GuardRequest<'a> {
         }
     }
 
+    /// A guard refused for the one `provider`.
     pub(crate) fn refusing_one(provider: &'a ProviderId) -> Self {
         Self::refusing(std::slice::from_ref(provider))
     }
@@ -418,9 +420,10 @@ impl Engine {
         Ok(MutationGuard::acquire(&self.env, timeout)?)
     }
 
-    /// `MutationGuard`, refused for each row whose recovery could not take its provider's live
-    /// locks or whose entry its agent wrote meanwhile (`RecoveryBlocked`, `RecoveryMoved`), by
-    /// provider. Under `FingerprintsOnly` the rows are recovered from fingerprints alone: no
+    /// `MutationGuard`, with the rows whose recovery could not take its provider's live locks
+    /// or whose entry its agent wrote meanwhile (`RecoveryBlocked`, `RecoveryMoved`) collected
+    /// by provider as `Blocked`. The call refuses only when `r.refuse_interrupted` is set and a
+    /// provider named in `r.providers` is still interrupted. Under `FingerprintsOnly` the rows are recovered from fingerprints alone: no
     /// network call (§7.6, §9.6). A recovery interrupted at one of its lock waits ends the
     /// command with that interruption (§14.1). Each recovered switch is recorded with
     /// `r.source`. The lock is waited for up to `r.timeout`. The rows are read before the lock
