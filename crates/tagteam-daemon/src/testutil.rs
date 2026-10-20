@@ -548,3 +548,23 @@ pub(crate) fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     let text = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
     (result, text.lines().map(str::to_owned).collect())
 }
+
+/// Runs `f` on a thread of its own and waits 10 s for it: a timeout panics, and a panic in `f`
+/// is resumed here. A thread that never wakes fails the test instead of stalling the run.
+pub(crate) fn within<T: Send + 'static>(what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(value) => {
+            let _ = handle.join();
+            value
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match handle.join() {
+            Err(payload) => std::panic::resume_unwind(payload),
+            Ok(()) => panic!("{what}: the thread ended without a result"),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("not within 10 s: {what}"),
+    }
+}
