@@ -422,14 +422,13 @@ impl Engine {
 
     /// `MutationGuard`, with the rows whose recovery could not take its provider's live locks
     /// or whose entry its agent wrote meanwhile (`RecoveryBlocked`, `RecoveryMoved`) collected
-    /// by provider as `Blocked`. The call refuses only when `r.refuse_interrupted` is set and a
-    /// provider named in `r.providers` is still interrupted. Under `FingerprintsOnly` the rows are recovered from fingerprints alone: no
-    /// network call (§7.6, §9.6). A recovery interrupted at one of its lock waits ends the
-    /// command with that interruption (§14.1). Each recovered switch is recorded with
-    /// `r.source`. The lock is waited for up to `r.timeout`. The rows are read before the lock
-    /// and again under it; `DecodableOnly` (`purge`) reads them with `dead_decodable_journals`,
-    /// so a row that does not decode is left for it to delete (§10.5 step 5) rather than
-    /// ending it; every other mode reads them all, strictly.
+    /// by provider as `Blocked`, not refused. Under `FingerprintsOnly` the rows are recovered
+    /// from fingerprints alone: no network call (§7.6, §9.6). A recovery interrupted at one of
+    /// its lock waits ends the command with that interruption (§14.1). Each recovered switch is
+    /// recorded with `r.source`. The lock is waited for up to `r.timeout`. The rows are read
+    /// before the lock and again under it; `DecodableOnly` (`purge`) reads them with
+    /// `dead_decodable_journals`, so a row that does not decode is left for it to delete
+    /// (§10.5 step 5) rather than ending it; every other mode reads them all, strictly.
     ///
     /// With `r.refuse_interrupted`, an interrupted switch still on record for one of
     /// `r.providers` once recovery has run under the lock refuses the guard.
