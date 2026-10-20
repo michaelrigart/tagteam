@@ -5,7 +5,7 @@ use tagteam_provider::{Check, Provider};
 
 use crate::error::EngineError;
 
-use super::{Run, Secrets, skipped, state_of, worst};
+use super::{Id, Run, Secrets, skipped, state_of, worst};
 
 /// How long `--online` waits for each host (§13.6).
 const ONLINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -36,13 +36,13 @@ impl Run<'_> {
         let id = p.id();
         for (url, reply) in replies {
             let check = match reply {
-                Ok(status) => Check::ok("online.reach", format!("{url} answers (HTTP {status})")),
+                Ok(status) => Check::ok(Id::ONLINE_REACH, format!("{url} answers (HTTP {status})")),
                 Err(HttpError::PreSend(e)) => {
-                    Check::fail("online.reach", format!("{url} cannot be reached: {e}"))
+                    Check::fail(Id::ONLINE_REACH, format!("{url} cannot be reached: {e}"))
                         .fix("check the network, any proxy (HTTPS_PROXY) and the TLS trust store")
                 }
                 Err(HttpError::Ambiguous(e)) => Check::warn(
-                    "online.reach",
+                    Id::ONLINE_REACH,
                     format!("{url} took the request but gave no answer: {e}"),
                 )
                 .fix("try again; if it persists, check the network and any proxy"),
@@ -76,7 +76,7 @@ impl Run<'_> {
         let provider_now = worst(providers.iter().map(|p| self.provider_secrets(p.as_ref())));
         let check = if vault_now == provider_now {
             Check::warn(
-                "keychain.locked",
+                Id::KEYCHAIN_LOCKED,
                 format!(
                     "{}, so the checks that read it were skipped: {}",
                     state_of("the login keychain", state),
@@ -92,7 +92,7 @@ impl Run<'_> {
                 clauses.push(state_of("the login keychain", p));
             }
             Check::warn(
-                "keychain.locked",
+                Id::KEYCHAIN_LOCKED,
                 format!(
                     "{}, so the checks that read {} were skipped: {}",
                     clauses.join(", and "),

@@ -7,7 +7,7 @@ use crate::engine::Engine;
 use crate::store::{SCHEMA_VERSION, Store};
 
 use super::files::readable;
-use super::{Run, Stored};
+use super::{Id, Run, Stored};
 
 /// Whether SQLite found the store itself damaged: pages it cannot read as a database
 /// (`SQLITE_CORRUPT`), or a file that is no database (`SQLITE_NOTADB`). Any other error keeps
@@ -49,7 +49,7 @@ fn restore_backup(path: &Path) -> String {
 /// never a failure of its integrity, which cannot be told.
 fn out_of_reach(path: &Path, e: &crate::store::StoreError) -> Check {
     Check::warn(
-        "store.integrity",
+        Id::STORE_INTEGRITY,
         format!(
             "{} cannot be opened ({e}), so its integrity cannot be told",
             path.display()
@@ -62,10 +62,22 @@ fn out_of_reach(path: &Path, e: &crate::store::StoreError) -> Check {
 }
 
 /// The fix for store rows that cannot be read, in a store that passed `quick_check`.
-pub(super) fn restore(engine: &Engine) -> String {
+fn restore(engine: &Engine) -> String {
     format!(
         "run `tagteam doctor` again; if it persists, restore {} from a backup",
         quoted(&engine.env.data_dir().join("tagteam.db"))
+    )
+}
+
+/// A warning for store rows that cannot be read, with the fix that goes with it.
+pub(super) fn warn_restore(engine: &Engine, id: &str, message: impl Into<String>) -> Check {
+    Check::warn(id, message).fix(restore(engine))
+}
+
+fn store_skipped(why: &str) -> Check {
+    Check::info(
+        Id::STORE_SKIPPED,
+        format!("the checks that read the store's rows were skipped: {why}"),
     )
 }
 
@@ -81,7 +93,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::info(
-                        "store.present",
+                        Id::STORE_PRESENT,
                         format!(
                             "tagteam has no state yet: {} does not exist",
                             data.display()
@@ -95,7 +107,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::warn(
-                        "store.present",
+                        Id::STORE_PRESENT,
                         format!(
                             "whether tagteam has any state cannot be told: {} cannot be read ({})",
                             data.display(),
@@ -104,13 +116,7 @@ impl Run<'_> {
                     )
                     .fix(readable(&data)),
                 );
-                self.push(
-                    None,
-                    Check::info(
-                        "store.skipped",
-                        "the checks that read the store's rows were skipped: the store cannot be read",
-                    ),
-                );
+                self.push(None, store_skipped("the store cannot be read"));
                 return;
             }
         }
@@ -120,7 +126,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::info(
-                        "store.present",
+                        Id::STORE_PRESENT,
                         format!(
                             "tagteam has no store yet: {} does not exist",
                             path.display()
@@ -133,7 +139,7 @@ impl Run<'_> {
                 self.stored = Stored::Unusable;
                 let check = if let crate::store::StoreError::LopsidedWal { .. } = e {
                     Check::warn(
-                        "store.integrity",
+                        Id::STORE_INTEGRITY,
                         format!(
                             "{} has a write-ahead log doctor cannot read without writing, so its integrity cannot be told ({e})",
                             path.display()
@@ -142,7 +148,7 @@ impl Run<'_> {
                     .fix("run any tagteam command, such as `tagteam list`: it recovers the log, then `tagteam doctor` again")
                 } else if is_damage(&e) {
                     Check::fail(
-                        "store.integrity",
+                        Id::STORE_INTEGRITY,
                         format!("{} cannot be opened: {e}", path.display()),
                     )
                     .fix(restore_backup(&path))
@@ -150,13 +156,7 @@ impl Run<'_> {
                     out_of_reach(&path, &e)
                 };
                 self.push(None, check);
-                self.push(
-                    None,
-                    Check::info(
-                        "store.skipped",
-                        "the checks that read the store's rows were skipped: the store cannot be read",
-                    ),
-                );
+                self.push(None, store_skipped("the store cannot be read"));
                 return;
             }
         };
@@ -165,7 +165,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::ok(
-                        "store.integrity",
+                        Id::STORE_INTEGRITY,
                         format!("{} passes PRAGMA quick_check", path.display()),
                     ),
                 );
@@ -180,7 +180,7 @@ impl Run<'_> {
                             Err(e) => e.to_string(),
                         };
                         Check::fail(
-                            "store.integrity",
+                            Id::STORE_INTEGRITY,
                             format!("{} fails PRAGMA quick_check: {detail}", path.display()),
                         )
                         .fix(restore_backup(&path))
@@ -195,7 +195,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::fail(
-                        "store.schema",
+                        Id::STORE_SCHEMA,
                         format!(
                             "the store's schema is v{v}, newer than this tagteam's v{SCHEMA_VERSION}: a newer tagteam wrote it, and this one refuses it"
                         ),
@@ -208,7 +208,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::info(
-                        "store.schema",
+                        Id::STORE_SCHEMA,
                         format!(
                             "the store's schema is v{v}, older than this tagteam's v{SCHEMA_VERSION}; the next tagteam command that opens it migrates it"
                         ),
@@ -220,18 +220,18 @@ impl Run<'_> {
             Ok(v) => {
                 self.push(
                     None,
-                    Check::ok("store.schema", format!("the store's schema is v{v}")),
+                    Check::ok(Id::STORE_SCHEMA, format!("the store's schema is v{v}")),
                 );
                 true
             }
             Err(e) => {
                 self.push(
                     None,
-                    Check::warn(
-                        "store.schema",
+                    warn_restore(
+                        self.engine,
+                        Id::STORE_SCHEMA,
                         format!("the store's schema version cannot be read: {e}"),
-                    )
-                    .fix(restore(self.engine)),
+                    ),
                 );
                 false
             }
@@ -242,13 +242,11 @@ impl Run<'_> {
                 Err(e) => {
                     self.push(
                         None,
-                        Check::warn(
-                            "store.accounts",
+                        warn_restore(self.engine,
+                            Id::STORE_ACCOUNTS,
                             format!(
                                 "the store's accounts cannot be read ({e}), so orphaned vault files, rescue files, session profiles and which providers have accounts are not checked"
-                            ),
-                        )
-                        .fix(restore(self.engine)),
+                            )),
                     );
                     None
                 }
@@ -257,10 +255,7 @@ impl Run<'_> {
         } else {
             self.push(
                 None,
-                Check::info(
-                    "store.skipped",
-                    "the checks that read the store's rows were skipped: the store is not one this tagteam can read",
-                ),
+                store_skipped("the store is not one this tagteam can read"),
             );
             Stored::Unusable
         };

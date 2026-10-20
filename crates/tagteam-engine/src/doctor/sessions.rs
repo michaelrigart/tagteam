@@ -7,7 +7,7 @@ use tagteam_provider::{Check, Provider, Read};
 use crate::error::{SessionOwner, daemon_advice, supervisor_name};
 use crate::session::SessionState;
 
-use super::{Run, command};
+use super::{Id, Run, command};
 
 impl Run<'_> {
     /// §13.6 Session profiles, for `p`: each profile whose marker names `p`, and the entries of
@@ -46,7 +46,7 @@ impl Run<'_> {
                 let n = row.position;
                 found.push(
                     Check::warn(
-                        "sessions.marker",
+                        Id::SESSIONS_MARKER,
                         format!(
                             "account {n}'s profile marker {why}, so its recorded spelling and outer home are unknown: its credential and provenance are not checked"
                         ),
@@ -72,7 +72,7 @@ impl Run<'_> {
             {
                 Some(row) => found.push(
                     Check::warn(
-                        "sessions.marker",
+                        Id::SESSIONS_MARKER,
                         format!(
                             "{} holds the marker of account {}'s profile, which lives elsewhere",
                             dir.display(),
@@ -84,7 +84,7 @@ impl Run<'_> {
                 None => {
                     found.push(
                         Check::warn(
-                            "sessions.orphan",
+                            Id::SESSIONS_ORPHAN,
                             format!(
                                 "{} is a profile of an account this store no longer has",
                                 dir.display()
@@ -108,7 +108,7 @@ impl Run<'_> {
     /// that path, as the refusal names it. `whose` finishes "runs in ...".
     fn daemon_check(p: &dyn Provider, profile: &Path, whose: &str) -> Check {
         Check::info(
-            "sessions.daemon",
+            Id::SESSIONS_DAEMON,
             format!("{} runs in {whose} until it stops", supervisor_name(p)),
         )
         .fix(daemon_advice(p, profile))
@@ -130,7 +130,7 @@ impl Run<'_> {
             let owner = SessionOwner::of(state, p);
             out.push(
                 Check::warn(
-                    "sessions.state",
+                    Id::SESSIONS_STATE,
                     format!(
                         "{whose} session state cannot be read ({}), {consequence}",
                         owner.damaged_list()
@@ -185,7 +185,7 @@ impl Run<'_> {
                             }
                             Err(e) => {
                                 vec![Check::warn(
-                                "sessions.state",
+                                Id::SESSIONS_STATE,
                                 format!(
                                     "{whose} session state cannot be read ({}), {consequence}",
                                     e.kind()

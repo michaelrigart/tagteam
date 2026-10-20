@@ -13,7 +13,7 @@ use tagteam_provider::{Check, Provider};
 
 use crate::settings;
 
-use super::Run;
+use super::{Id, Run};
 
 /// `path`'s permission bits; `None` when it does not exist, which is not checked.
 fn mode_of(path: &Path) -> io::Result<Option<u32>> {
@@ -75,7 +75,7 @@ impl Run<'_> {
         let mut found = Vec::new();
         let unlisted = |dir: &Path, e: io::Error| {
             Check::warn(
-                "store.mode",
+                Id::STORE_MODE,
                 format!(
                     "{} cannot be listed ({}), so the modes of what it holds are not checked",
                     dir.display(),
@@ -109,7 +109,7 @@ impl Run<'_> {
                 match mode_of(&path) {
                     Ok(Some(mode)) if mode != want => found.push(
                         Check::warn(
-                            "store.mode",
+                            Id::STORE_MODE,
                             format!(
                                 "{} has mode {mode:o}, not {want:o}: other users may read it",
                                 path.display()
@@ -120,7 +120,7 @@ impl Run<'_> {
                     Ok(_) => {}
                     Err(e) => found.push(
                         Check::warn(
-                            "store.mode",
+                            Id::STORE_MODE,
                             format!(
                                 "the mode of {} cannot be read ({})",
                                 path.display(),
@@ -134,7 +134,7 @@ impl Run<'_> {
         }
         if found.is_empty() {
             found.push(Check::ok(
-                "store.mode",
+                Id::STORE_MODE,
                 "the store, the vault and tagteam's directories are private",
             ));
         }
@@ -200,14 +200,14 @@ impl Run<'_> {
         if found.is_empty() && unlisted.is_empty() && undecided.is_empty() {
             self.push(
                 None,
-                Check::ok("store.temp-files", "no write left a temp file behind"),
+                Check::ok(Id::STORE_TEMP_FILES, "no write left a temp file behind"),
             );
         }
         for (dir, e) in unlisted {
             self.push(
                 None,
                 Check::warn(
-                    "store.temp-files",
+                    Id::STORE_TEMP_FILES,
                     format!(
                         "{} cannot be listed ({}), so a temp file a killed write left in it cannot be found",
                         dir.display(),
@@ -221,7 +221,7 @@ impl Run<'_> {
             self.push(
                 None,
                 Check::warn(
-                    "store.temp-files",
+                    Id::STORE_TEMP_FILES,
                     format!(
                         "{} is a temp file a write by pid {pid} left when it was killed; it may hold a secret, and is safe to delete",
                         path.display()
@@ -234,7 +234,7 @@ impl Run<'_> {
             self.push(
                 None,
                 Check::warn(
-                    "store.temp-files",
+                    Id::STORE_TEMP_FILES,
                     format!(
                         "{} is a temp file of a write by pid {pid}, and whether that process is still running cannot be told; it may hold a secret",
                         path.display()
@@ -258,7 +258,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::ok(
-                        "settings.file",
+                        Id::SETTINGS_FILE,
                         format!(
                             "there is no settings file at {}; the defaults apply",
                             path.display()
@@ -271,7 +271,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::warn(
-                        "settings.file",
+                        Id::SETTINGS_FILE,
                         format!(
                             "{} cannot be read ({}), so every command runs on the defaults",
                             path.display(),
@@ -286,7 +286,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::fail(
-                        "settings.file",
+                        Id::SETTINGS_FILE,
                         format!(
                             "{} is not valid TOML, so every command runs on the defaults",
                             path.display()
@@ -301,7 +301,7 @@ impl Run<'_> {
             }
             Ok(_) => self.push(
                 None,
-                Check::ok("settings.file", format!("{} parses", path.display())),
+                Check::ok(Id::SETTINGS_FILE, format!("{} parses", path.display())),
             ),
         }
         let ids: Vec<ProviderId> = match only {
@@ -325,7 +325,7 @@ impl Run<'_> {
         for w in warnings {
             self.push(
                 None,
-                Check::warn("settings.value", w)
+                Check::warn(Id::SETTINGS_VALUE, w)
                     .fix("correct it with `tagteam config set`, or remove it with `tagteam config unset`"),
             );
         }
@@ -333,7 +333,7 @@ impl Run<'_> {
             self.push(
                 None,
                 Check::warn(
-                    "settings.unknown",
+                    Id::SETTINGS_UNKNOWN,
                     format!("{} has a key tagteam does not know: {key}", path.display()),
                 )
                 .fix(format!(
@@ -367,7 +367,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::info(
-                        "log.file",
+                        Id::LOG_FILE,
                         format!(
                             "the log is {}: {} bytes, and {rotated} more in its rotations",
                             log.display(),
@@ -379,7 +379,7 @@ impl Run<'_> {
                     self.push(
                         None,
                         Check::warn(
-                            "log.file",
+                            Id::LOG_FILE,
                             format!(
                                 "the log's rotation {} cannot be read ({}), so its size is not counted",
                                 path.display(),
@@ -393,14 +393,17 @@ impl Run<'_> {
             Err(e) if e.kind() == ErrorKind::NotFound => self.push(
                 None,
                 Check::info(
-                    "log.file",
+                    Id::LOG_FILE,
                     format!("nothing is logged yet; the log will be {}", log.display()),
                 ),
             ),
             Err(e) => self.push(
                 None,
-                Check::warn("log.file", format!("{} cannot be read: {e}", log.display()))
-                    .fix(readable(&log)),
+                Check::warn(
+                    Id::LOG_FILE,
+                    format!("{} cannot be read: {e}", log.display()),
+                )
+                .fix(readable(&log)),
             ),
         }
         let mut at = log.clone();
@@ -415,7 +418,7 @@ impl Run<'_> {
                     self.push(
                         None,
                         Check::warn(
-                            "log.writable",
+                            Id::LOG_WRITABLE,
                             format!(
                                 "whether {} can be written cannot be told: {} cannot be read ({})",
                                 log.display(),
@@ -436,7 +439,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::warn(
-                        "log.writable",
+                        Id::LOG_WRITABLE,
                         format!(
                             "whether {} can be written cannot be told: {} cannot be read ({})",
                             log.display(),
@@ -463,7 +466,7 @@ impl Run<'_> {
             self.push(
                 None,
                 Check::warn(
-                    "log.writable",
+                    Id::LOG_WRITABLE,
                     format!(
                         "{} cannot be written: {} {what}, so tagteam logs nothing",
                         log.display(),
@@ -477,12 +480,15 @@ impl Run<'_> {
         match writable(&at) {
             Ok(true) => self.push(
                 None,
-                Check::ok("log.writable", format!("{} can be written", log.display())),
+                Check::ok(
+                    Id::LOG_WRITABLE,
+                    format!("{} can be written", log.display()),
+                ),
             ),
             Ok(false) => self.push(
                 None,
                 Check::warn(
-                    "log.writable",
+                    Id::LOG_WRITABLE,
                     format!(
                         "{} cannot be written, so tagteam logs nothing",
                         log.display()
@@ -493,7 +499,7 @@ impl Run<'_> {
             Err(e) => self.push(
                 None,
                 Check::warn(
-                    "log.writable",
+                    Id::LOG_WRITABLE,
                     format!(
                         "whether {} can be written cannot be told: {e}",
                         log.display()

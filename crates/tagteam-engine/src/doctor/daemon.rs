@@ -19,7 +19,7 @@ use crate::service::{
 use crate::settings::Settings;
 
 use super::files::readable;
-use super::{Run, and_list};
+use super::{Id, Run, and_list};
 
 /// D10: how long `launchctl print`, `systemctl --user show` and `loginctl show-user` may take.
 const MANAGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -27,15 +27,14 @@ const MANAGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// `daemon.running` for `daemon.lock`'s record (D4.1): a live daemon of another version is told
 /// to restart (D10).
 fn daemon_record_check(r: &DaemonRecord, liveness: Liveness) -> Check {
-    const ID: &str = "daemon.running";
     let this = env!("CARGO_PKG_VERSION");
     match liveness {
         Liveness::Live if r.version == this => Check::info(
-            ID,
+            Id::DAEMON_RUNNING,
             format!("the daemon runs (pid {}, version {})", r.pid, r.version),
         ),
         Liveness::Live => Check::warn(
-            ID,
+            Id::DAEMON_RUNNING,
             format!(
                 "the daemon runs (pid {}) on version {}, not this tagteam's {this}",
                 r.pid, r.version
@@ -43,14 +42,14 @@ fn daemon_record_check(r: &DaemonRecord, liveness: Liveness) -> Check {
         )
         .fix("restart it: a daemon restarts by itself within a minute of an upgrade; if this one has not, `tagteam daemon install` restarts the service's daemon, and a foreground one restarts once you stop it (Ctrl-C) and start it again"),
         Liveness::Dead => Check::info(
-            ID,
+            Id::DAEMON_RUNNING,
             format!(
                 "the daemon is not running (its last run, pid {}, has exited)",
                 r.pid
             ),
         ),
         Liveness::Unknown(e) => Check::warn(
-            ID,
+            Id::DAEMON_RUNNING,
             format!(
                 "whether the daemon runs as pid {} cannot be told: the process's start time cannot be read ({e})",
                 r.pid
@@ -67,7 +66,6 @@ fn daemon_record_check(r: &DaemonRecord, liveness: Liveness) -> Check {
 /// manager that is missing, hangs or fails is a warning with its reason, never a failure
 /// (§13.6).
 fn service_state_check(kind: ServiceKind, path: &Path, state: &ServiceState) -> Check {
-    const ID: &str = "daemon.service";
     let unit = format!(
         "the daemon's {} is installed at {}",
         kind.noun(),
@@ -83,20 +81,25 @@ fn service_state_check(kind: ServiceKind, path: &Path, state: &ServiceState) -> 
             }
         };
         return Check::warn(
-            ID,
+            Id::DAEMON_SERVICE,
             format!("{unit}, but whether it is loaded cannot be told: {why}"),
         )
         .fix(fix);
     }
     match (state.loaded, state.running, state.last_exit_status) {
-        (Some(true), Some(true), _) => Check::info(ID, format!("{unit}, loaded and running")),
+        (Some(true), Some(true), _) => {
+            Check::info(Id::DAEMON_SERVICE, format!("{unit}, loaded and running"))
+        }
         (Some(true), _, Some(code)) => Check::info(
-            ID,
+            Id::DAEMON_SERVICE,
             format!("{unit}, loaded but not running (its last exit status was {code})"),
         ),
-        (Some(true), _, None) => Check::info(ID, format!("{unit}, loaded but not running")),
+        (Some(true), _, None) => Check::info(
+            Id::DAEMON_SERVICE,
+            format!("{unit}, loaded but not running"),
+        ),
         _ => Check::info(
-            ID,
+            Id::DAEMON_SERVICE,
             format!("{unit} but not loaded, so it starts at the next login"),
         )
         .fix("`tagteam daemon install` loads and starts it now"),
@@ -121,8 +124,8 @@ impl Run<'_> {
             None => (false, None),
         };
         self.daemon_socket(live, installed);
-        // Decision 12's gate, as `daemon.socket` has it: a machine that does not use the daemon
-        // carries no warning for its notifications.
+        // The gate `daemon.socket` has: a machine that does not use the daemon carries no
+        // warning for its notifications.
         if let Some(kind) = service
             && (live || installed)
         {
@@ -137,7 +140,7 @@ impl Run<'_> {
         let lock = daemon_lock_path(&self.engine.env);
         let (check, live) = match read_daemon_record(&lock) {
             Read::Absent => (
-                Check::info("daemon.running", "the daemon is not running"),
+                Check::info(Id::DAEMON_RUNNING, "the daemon is not running"),
                 false,
             ),
             Read::Present(r) => {
@@ -151,7 +154,7 @@ impl Run<'_> {
             }
             Read::Unreadable(e) => (
                 Check::warn(
-                    "daemon.running",
+                    Id::DAEMON_RUNNING,
                     format!("whether the daemon runs cannot be told: {e}"),
                 )
                 .fix(readable(&lock)),
@@ -178,9 +181,9 @@ impl Run<'_> {
     /// - on Linux, lingering (D9.3)
     ///
     /// The manager is asked only about a unit that is there. It returns whether one is
-    /// installed, and the unit as read when tagteam wrote it as it stands (Decision 5).
+    /// installed, and the unit as read when tagteam wrote it as it stands. A unit tagteam did
+    /// not write reads as installed with its environment unknown, never as an error.
     fn daemon_service(&mut self, kind: ServiceKind) -> (bool, Option<UnitContents>) {
-        const ID: &str = "daemon.service";
         let engine = self.engine;
         let env = &engine.env;
         let path = unit_path(env, kind);
@@ -190,7 +193,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::info(
-                        ID,
+                        Id::DAEMON_SERVICE,
                         format!(
                             "the daemon's {} is not installed ({})",
                             kind.noun(),
@@ -204,7 +207,7 @@ impl Run<'_> {
                 self.push(
                     None,
                     Check::warn(
-                        ID,
+                        Id::DAEMON_SERVICE,
                         format!(
                             "the daemon's {} at {} cannot be read ({})",
                             kind.noun(),
@@ -224,7 +227,7 @@ impl Run<'_> {
             None => self.push(
                 None,
                 Check::info(
-                    ID,
+                    Id::DAEMON_SERVICE,
                     format!(
                         "{} was not written by tagteam as it stands, so the program it starts and its environment are not checked",
                         path.display()
@@ -237,7 +240,7 @@ impl Run<'_> {
                     Ok(false) => self.push(
                         None,
                         Check::fail(
-                            ID,
+                            Id::DAEMON_SERVICE,
                             format!(
                                 "{} starts {}, which does not exist, so the service cannot start the daemon",
                                 path.display(),
@@ -249,7 +252,7 @@ impl Run<'_> {
                     Err(e) => self.push(
                         None,
                         Check::warn(
-                            ID,
+                            Id::DAEMON_SERVICE,
                             format!(
                                 "whether {}, which {} starts, exists cannot be told ({})",
                                 u.program.display(),
@@ -277,7 +280,7 @@ impl Run<'_> {
                     self.push(
                         None,
                         Check::warn(
-                            ID,
+                            Id::DAEMON_SERVICE,
                             format!(
                                 "{} records {} differently from this environment, so the daemon may use another store, home, proxy or log level",
                                 path.display(),
@@ -299,7 +302,7 @@ impl Run<'_> {
                 Ok(false) => self.push(
                     None,
                     Check::info(
-                        ID,
+                        Id::DAEMON_SERVICE,
                         format!(
                             "lingering is off for {user}, so systemd stops the daemon when you log out"
                         ),
@@ -311,7 +314,7 @@ impl Run<'_> {
                 Err(why) => self.push(
                     None,
                     Check::warn(
-                        ID,
+                        Id::DAEMON_SERVICE,
                         format!("whether lingering is on for {user} cannot be told: {why}"),
                     )
                     .fix(format!("`loginctl show-user {user} -p Linger` shows it")),
@@ -327,14 +330,13 @@ impl Run<'_> {
     /// runs, or would run, without its socket, and the check fails. With neither, the length is
     /// not judged.
     fn daemon_socket(&mut self, live: bool, installed: bool) {
-        const ID: &str = "daemon.socket";
         let path = daemon_socket_path(&self.engine.env);
         let len = path.as_os_str().len();
         if len > MAX_SOCKET_PATH && (live || installed) {
             self.push(
                 None,
                 Check::fail(
-                    ID,
+                    Id::DAEMON_SOCKET,
                     format!(
                         "{} is {len} bytes, too long for a socket here (at most {MAX_SOCKET_PATH}), so the daemon runs without it and nothing can reach it",
                         path.display()
@@ -356,7 +358,7 @@ impl Run<'_> {
                     ("something else", "rm")
                 };
                 Check::warn(
-                    ID,
+                    Id::DAEMON_SOCKET,
                     format!(
                         "{} is {what}, not a socket, so the daemon cannot listen there",
                         path.display()
@@ -376,7 +378,7 @@ impl Run<'_> {
                         format!("rm {}", quoted(&path))
                     };
                     Check::warn(
-                        ID,
+                        Id::DAEMON_SOCKET,
                         format!(
                             "{} has mode {mode:o}, not 600: another user may reach the daemon through it",
                             path.display()
@@ -384,10 +386,13 @@ impl Run<'_> {
                     )
                     .fix(fix)
                 } else if live {
-                    Check::ok(ID, format!("the daemon listens on {}", path.display()))
+                    Check::ok(
+                        Id::DAEMON_SOCKET,
+                        format!("the daemon listens on {}", path.display()),
+                    )
                 } else {
                     Check::info(
-                        ID,
+                        Id::DAEMON_SOCKET,
                         format!(
                             "{} is left from a daemon that is not running; the next one to start replaces it",
                             path.display()
@@ -398,7 +403,7 @@ impl Run<'_> {
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 if live {
                     Check::warn(
-                        ID,
+                        Id::DAEMON_SOCKET,
                         format!(
                             "the daemon runs without its socket ({} does not exist), so `tagteam daemon status` and the TUI cannot reach it",
                             path.display()
@@ -406,11 +411,14 @@ impl Run<'_> {
                     )
                     .fix("the log says why it could not bind; restart the daemon once that is fixed")
                 } else {
-                    Check::ok(ID, "no daemon runs, and none left a socket behind")
+                    Check::ok(
+                        Id::DAEMON_SOCKET,
+                        "no daemon runs, and none left a socket behind",
+                    )
                 }
             }
             Err(e) => Check::warn(
-                ID,
+                Id::DAEMON_SOCKET,
                 format!("{} cannot be read ({})", path.display(), e.kind()),
             )
             .fix(readable(&path)),
@@ -424,25 +432,29 @@ impl Run<'_> {
     /// unit, else doctor's own.
     /// `notify.enabled` is read from `config.toml`, as the `auto` check reads its settings.
     fn daemon_notify(&mut self, kind: ServiceKind, unit: Option<&UnitContents>) {
-        const ID: &str = "daemon.notify";
         let engine = self.engine;
         let (settings, _) = Settings::load(&engine.env, engine.default_provider());
         let check = if !settings.notify_enabled {
-            Check::info(ID, "notifications are off (notify.enabled is false)")
+            Check::info(
+                Id::DAEMON_NOTIFY,
+                "notifications are off (notify.enabled is false)",
+            )
         } else {
             match kind {
-                ServiceKind::Launchd => Check::ok(ID, "notifications are on, through osascript"),
+                ServiceKind::Launchd => {
+                    Check::ok(Id::DAEMON_NOTIFY, "notifications are on, through osascript")
+                }
                 ServiceKind::Systemd => {
                     let recorded = unit
                         .and_then(|u| u.env.iter().find(|(k, _)| k == "PATH"))
                         .map(|(_, v)| OsStr::new(v.as_str()));
                     match find_on_path("notify-send", recorded.or_else(|| engine.env.var("PATH"))) {
                         Some(bin) => Check::ok(
-                            ID,
+                            Id::DAEMON_NOTIFY,
                             format!("notifications are on, through {}", bin.display()),
                         ),
                         None => Check::warn(
-                            ID,
+                            Id::DAEMON_NOTIFY,
                             "notifications are on, but notify-send is not on the daemon's PATH, so none is shown",
                         )
                         .fix("install notify-send (libnotify), or turn them off with `tagteam config set notify.enabled false`"),
