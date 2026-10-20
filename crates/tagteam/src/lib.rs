@@ -105,20 +105,15 @@ fn refuse_then_init_logging(
     None
 }
 
-/// Runs the CLI and returns the process exit code.
-pub fn main_with_args<I, T>(args: I) -> i32
-where
-    I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
-{
-    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+/// Parses the command line, or returns the exit code of a usage error, help or the version.
+fn parse_args(args: &[OsString]) -> Result<cli::Cli, i32> {
     // B.36: `--json` promises one JSON object, but only tagteam's own flag does. An argument
     // after `--` belongs to the agent `run` launches (Decision 8), and is never the flag.
     let json = args
         .iter()
         .take_while(|a| *a != "--")
         .any(|a| a == "--json");
-    let cli = match cli::Cli::try_parse_from(&args) {
+    let cli = match cli::Cli::try_parse_from(args) {
         Ok(c) => c,
         // `--json` promises exactly one JSON object on stdout (B.36), so under it a usage
         // error, and a request for help or the version (which are text), is a JSON usage
@@ -136,43 +131,80 @@ where
                 app::KIND_USAGE,
                 &message,
             );
-            return app::EXIT_USAGE;
+            return Err(app::EXIT_USAGE);
         }
         Err(e) => {
             let code = if e.use_stderr() { app::EXIT_USAGE } else { 0 };
             let _ = without_argument_values(e).print();
-            return code;
+            return Err(code);
         }
     };
+    Ok(cli)
+}
+
+/// The process-boundary setup: drains the status bar's stdin, decides whether the TUI opens and
+/// builds the context from the process environment.
+fn boundary(cli: &cli::Cli) -> Result<(bool, app::Context), i32> {
     // §13.5: Claude Code pipes its session JSON into the status bar command. It is drained
     // here, at the process boundary, rather than in `app::run`: in-process tests drive `run`,
     // and must never read the test runner's stdin. Only a line that will be printed needs it:
     // `--print-config` and the refused `--json` return without Claude Code's JSON ever being
     // read, so a pipe that never closes must not hang them.
-    if status_bar_line(&cli) {
+    if status_bar_line(cli) {
         let stdin = std::io::stdin();
         statusline::drain(stdin.lock(), stdin.is_terminal());
     }
     // TUI spec §3: `tui`, and a bare `tagteam` with a person at the terminal, open the TUI. Its
     // log never writes to stderr, where the TUI draws (§10.3).
     let tui = opens_tui(
-        &cli,
+        cli,
         std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
     );
     // §5: every default path derives from `HOME`, so an unusable one refuses the command here,
     // before any engine exists, and nothing is created under `/` or the working directory.
     let ctx = match app::Context::from_process() {
         Ok(ctx) => ctx,
-        Err(_) if status_bar_line(&cli) => return 0,
+        Err(_) if status_bar_line(cli) => return Err(0),
         Err(e) => {
-            return app::fail_to(
+            return Err(app::fail_to(
                 &mut std::io::stdout(),
                 &mut std::io::stderr(),
                 cli.json,
                 e.kind(),
                 &e.to_string(),
-            );
+            ));
         }
+    };
+    Ok((tui, ctx))
+}
+
+fn install_signals(ctx: &app::Context) {
+    // §14.1, at the process boundary like the drain above: in-process tests drive `run` with
+    // tokens of their own, and must never change the test runner's signal dispositions. After
+    // the drain, so a status bar command stuck on a pipe that never closes still dies on
+    // SIGTERM.
+    if let Err(e) = signals::install(&ctx.env.cancel) {
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: could not catch signals, so one stops tagteam where it lands: {e}"
+        );
+    }
+}
+
+/// Runs the CLI and returns the process exit code.
+pub fn main_with_args<I, T>(args: I) -> i32
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let cli = match parse_args(&args) {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
+    let (tui, ctx) = match boundary(&cli) {
+        Ok(b) => b,
+        Err(code) => return code,
     };
     // §14.2, Decision 5: logging is a process concern, set up here once and never by
     // `app::run`, which in-process tests drive. After the HOME check, since the log's path
@@ -200,16 +232,7 @@ where
     ) {
         return code;
     }
-    // §14.1, at the process boundary like the drain above: in-process tests drive `run` with
-    // tokens of their own, and must never change the test runner's signal dispositions. After
-    // the drain, so a status bar command stuck on a pipe that never closes still dies on
-    // SIGTERM.
-    if let Err(e) = signals::install(&ctx.env.cancel) {
-        let _ = writeln!(
-            std::io::stderr(),
-            "warning: could not catch signals, so one stops tagteam where it lands: {e}"
-        );
-    }
+    install_signals(&ctx);
     if tui {
         return tui_cmd::run(&cli, ctx);
     }
